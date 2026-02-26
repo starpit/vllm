@@ -11,6 +11,7 @@
 
 pub mod attention;
 pub mod gemma2;
+pub mod kv_block_pool;
 pub mod llama;
 pub mod qwen2;
 pub mod registry;
@@ -20,6 +21,7 @@ use candle_core::Tensor;
 use vllm_model::ModelResult;
 
 // Re-export for convenience.
+pub use kv_block_pool::KvBlockPool;
 pub use registry::ModelRegistry;
 pub use sampler::Sampler;
 

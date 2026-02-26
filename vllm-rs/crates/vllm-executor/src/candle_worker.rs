@@ -17,7 +17,7 @@ use vllm_common::SamplingParams;
 use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_engine::executor::ModelRunnerOutput;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
-use vllm_models::{KvCache, Model, ModelRegistry, Sampler};
+use vllm_models::{KvBlockPool, KvCache, Model, ModelRegistry, Sampler};
 
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::worker::Worker;
@@ -45,6 +45,10 @@ pub struct CandleWorkerConfig {
 
     /// Optional cache directory for downloaded models.
     pub cache_dir: Option<String>,
+
+    /// KV cache block size in tokens (must match the scheduler's block size).
+    /// Defaults to 16 if not set.
+    pub block_size: usize,
 }
 
 impl CandleWorkerConfig {
@@ -87,8 +91,18 @@ pub struct CandleWorker {
     token_buffers: HashMap<String, Vec<u32>>,
     /// Per-request sampling params, stored on first scheduling.
     sampling_params_map: HashMap<String, SamplingParams>,
-    /// Per-request KV cache: req_id → per-layer KV tensors.
+    /// Global paged KV cache block pool (created by `initialize_cache`).
+    kv_block_pool: Option<KvBlockPool>,
+    /// Per-request block table: req_id → ordered list of block arena indices.
+    req_block_tables: HashMap<String, Vec<usize>>,
+    /// Per-request count of tokens already written to the block pool.
+    req_tokens_in_pool: HashMap<String, usize>,
+    /// Per-request KV cache (legacy, used when block pool is not available).
     kv_caches: HashMap<String, KvCache>,
+    /// Model KV head count (set after load_model).
+    num_kv_heads: usize,
+    /// Model head dimension (set after load_model).
+    head_dim: usize,
 }
 
 impl CandleWorker {
@@ -106,7 +120,12 @@ impl CandleWorker {
             is_shutdown: false,
             token_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
+            kv_block_pool: None,
+            req_block_tables: HashMap::new(),
+            req_tokens_in_pool: HashMap::new(),
             kv_caches: HashMap::new(),
+            num_kv_heads: 0,
+            head_dim: 0,
         }
     }
 
@@ -303,6 +322,8 @@ impl Worker for CandleWorker {
         let model = factory(&weights, &hf_config, dtype, device)
             .map_err(|e| ExecutorError::WorkerInit(format!("failed to construct model: {e}")))?;
 
+        self.num_kv_heads = hf_config.num_kv_heads().unwrap_or(0);
+        self.head_dim = hf_config.head_dim().unwrap_or(0);
         self.model_dir = Some(model_dir);
         self.hf_config = Some(hf_config);
         self.resolved_dtype = Some(dtype);
@@ -321,6 +342,36 @@ impl Worker for CandleWorker {
     ) -> ExecutorResult<()> {
         self.num_gpu_blocks = num_gpu_blocks;
         self.num_cpu_blocks = num_cpu_blocks;
+
+        // Create the paged KV block pool if model dimensions are known.
+        let num_layers = self.model.as_ref().map(|m| m.num_layers()).unwrap_or(0);
+        if num_layers > 0 && self.num_kv_heads > 0 && self.head_dim > 0 && num_gpu_blocks > 0 {
+            let dtype = self.resolved_dtype.unwrap_or(DType::F32);
+            let device = self.device.as_ref().cloned().unwrap_or(Device::Cpu);
+            let pool = KvBlockPool::new(
+                num_gpu_blocks,
+                num_layers,
+                self.num_kv_heads,
+                self.head_dim,
+                self.config.block_size,
+                dtype,
+                &device,
+            )
+            .map_err(|e| {
+                ExecutorError::WorkerInit(format!("failed to create KV block pool: {e}"))
+            })?;
+            info!(
+                "CandleWorker: KV block pool created (blocks={}, layers={}, kv_heads={}, head_dim={}, block_size={}, dtype={:?})",
+                num_gpu_blocks,
+                num_layers,
+                self.num_kv_heads,
+                self.head_dim,
+                self.config.block_size,
+                dtype
+            );
+            self.kv_block_pool = Some(pool);
+        }
+
         info!(
             "CandleWorker: cache initialized (gpu_blocks={}, cpu_blocks={})",
             num_gpu_blocks, num_cpu_blocks
@@ -348,12 +399,15 @@ impl Worker for CandleWorker {
             .ok_or_else(|| ExecutorError::WorkerExecution("device not initialized".to_string()))?;
 
         let num_layers = model.num_layers();
+        let use_paged = self.kv_block_pool.is_some();
 
         // Clean up buffers for finished requests.
         for req_id in &scheduler_output.finished_req_ids {
             self.token_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.kv_caches.remove(req_id);
+            self.req_block_tables.remove(req_id);
+            self.req_tokens_in_pool.remove(req_id);
         }
 
         // Collect requests to process: (req_id, token_ids, positions, is_prefill).
@@ -389,9 +443,17 @@ impl Worker for CandleWorker {
                     .insert(new_req.req_id.clone(), params.clone());
             }
 
-            // Create an empty KV cache for this request.
-            self.kv_caches
-                .insert(new_req.req_id.clone(), vec![None; num_layers]);
+            if use_paged {
+                // Store block IDs from the scheduler (group 0).
+                let block_ids = new_req.block_ids.first().cloned().unwrap_or_default();
+                self.req_block_tables
+                    .insert(new_req.req_id.clone(), block_ids);
+                self.req_tokens_in_pool.insert(new_req.req_id.clone(), 0);
+            } else {
+                // Legacy: per-request contiguous KV cache.
+                self.kv_caches
+                    .insert(new_req.req_id.clone(), vec![None; num_layers]);
+            }
 
             // Build positions: 0..num_tokens (offset by num_computed_tokens).
             let pos_offset = new_req.num_computed_tokens;
@@ -415,13 +477,35 @@ impl Worker for CandleWorker {
             .iter()
             .map(|r| r.req_id.as_str())
             .collect();
-        for req_id in scheduler_output.num_scheduled_tokens.keys() {
+
+        for (i, req_id) in scheduler_output
+            .scheduled_cached_reqs
+            .req_ids
+            .iter()
+            .enumerate()
+        {
             if new_req_ids.contains(req_id.as_str()) {
-                continue; // Already handled as a new request.
+                continue;
             }
-            let num_tokens = scheduler_output.num_scheduled_tokens[req_id];
+            let num_tokens = scheduler_output
+                .num_scheduled_tokens
+                .get(req_id)
+                .copied()
+                .unwrap_or(0);
             if num_tokens == 0 {
                 continue;
+            }
+
+            // Update block tables for paged mode.
+            // The scheduler's allocate_slots returns the FULL block list
+            // for the request (not just new blocks), so we replace rather
+            // than extend to avoid accumulating duplicates.
+            if use_paged
+                && let Some(Some(new_blocks)) =
+                    scheduler_output.scheduled_cached_reqs.new_block_ids.get(i)
+                && let Some(group0) = new_blocks.first()
+            {
+                self.req_block_tables.insert(req_id.clone(), group0.clone());
             }
 
             if let Some(buf) = self.token_buffers.get(req_id) {
@@ -429,6 +513,35 @@ impl Worker for CandleWorker {
                 let last_token = *buf.last().unwrap_or(&0);
                 let position = (buf.len() - 1) as u32;
 
+                req_inputs.push(ReqInput {
+                    req_id: req_id.clone(),
+                    token_ids: vec![last_token],
+                    positions: vec![position],
+                    is_prefill: false,
+                });
+            } else {
+                warn!("No token buffer for continuing request {}", req_id);
+            }
+        }
+
+        // Also handle any requests in num_scheduled_tokens not yet processed
+        // (backward compat: some tests put decode requests only in
+        // num_scheduled_tokens without cached_reqs).
+        for req_id in scheduler_output.num_scheduled_tokens.keys() {
+            if new_req_ids.contains(req_id.as_str()) {
+                continue;
+            }
+            // Skip if already collected via cached_reqs.
+            if req_inputs.iter().any(|r| r.req_id == *req_id) {
+                continue;
+            }
+            let num_tokens = scheduler_output.num_scheduled_tokens[req_id];
+            if num_tokens == 0 {
+                continue;
+            }
+            if let Some(buf) = self.token_buffers.get(req_id) {
+                let last_token = *buf.last().unwrap_or(&0);
+                let position = (buf.len() - 1) as u32;
                 req_inputs.push(ReqInput {
                     req_id: req_id.clone(),
                     token_ids: vec![last_token],
@@ -457,14 +570,68 @@ impl Worker for CandleWorker {
             let positions = Tensor::new(req_input.positions.as_slice(), device)
                 .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
 
-            // Get this request's KV cache (or None for uncached forward).
-            let kv_cache = self.kv_caches.get_mut(&req_input.req_id);
+            let logits = if use_paged {
+                // --- Paged KV cache path ---
+                let pool = self.kv_block_pool.as_ref().unwrap();
+                let block_ids = self
+                    .req_block_tables
+                    .get(&req_input.req_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let tokens_before = self
+                    .req_tokens_in_pool
+                    .get(&req_input.req_id)
+                    .copied()
+                    .unwrap_or(0);
 
-            let logits = model
-                .forward(&input_ids, &positions, kv_cache)
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
-                })?;
+                // Gather: assemble a contiguous KvCache from the block pool.
+                let mut kv_cache: KvCache = Vec::with_capacity(num_layers);
+                for layer in 0..num_layers {
+                    if tokens_before > 0 {
+                        let (k, v) =
+                            pool.gather_kv(layer, &block_ids, tokens_before)
+                                .map_err(|e| {
+                                    ExecutorError::WorkerExecution(format!("gather error: {e}"))
+                                })?;
+                        kv_cache.push(Some((k, v)));
+                    } else {
+                        kv_cache.push(None);
+                    }
+                }
+
+                // Forward pass: model reads/writes the gathered KV cache.
+                let logits = model
+                    .forward(&input_ids, &positions, Some(&mut kv_cache))
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
+                    })?;
+
+                // Scatter: write newly computed K/V tokens back into block pool.
+                let pool = self.kv_block_pool.as_mut().unwrap();
+                for layer in 0..num_layers {
+                    if let Some(Some((k, v))) = kv_cache.get(layer) {
+                        pool.scatter_new_kv(layer, &block_ids, tokens_before, k, v)
+                            .map_err(|e| {
+                                ExecutorError::WorkerExecution(format!("scatter error: {e}"))
+                            })?;
+                    }
+                }
+
+                // Update tokens-in-pool count.
+                let new_total = tokens_before + req_input.token_ids.len();
+                self.req_tokens_in_pool
+                    .insert(req_input.req_id.clone(), new_total);
+
+                logits
+            } else {
+                // --- Legacy per-request KV cache path ---
+                let kv_cache = self.kv_caches.get_mut(&req_input.req_id);
+                model
+                    .forward(&input_ids, &positions, kv_cache)
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
+                    })?
+            };
 
             // Take logits at the last position and sample.
             let last_pos = req_input.token_ids.len() - 1;
@@ -614,6 +781,7 @@ mod tests {
             dtype: "f32".to_string(),
             hf_token: None,
             cache_dir: None,
+            block_size: 16,
         }
     }
 

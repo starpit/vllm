@@ -1,0 +1,30 @@
+[package]
+name = "vllm-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Worker/process management and distributed coordination for vLLM Rust port"
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-core/accelerate"]
+
+[dependencies]
+vllm-common = { workspace = true }
+vllm-config = { workspace = true }
+vllm-core = { workspace = true }
+vllm-engine = { workspace = true }
+vllm-model = { workspace = true }
+vllm-models = { workspace = true }
+candle-core = { workspace = true }
+hf-hub = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+safetensors = { workspace = true }

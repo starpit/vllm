@@ -1,0 +1,34 @@
+[package]
+name = "vllm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI binary for vLLM Rust inference engine"
+
+[features]
+default = []
+metal = ["vllm-executor/metal", "vllm-kernels/metal"]
+
+[[bin]]
+name = "vllm"
+path = "src/main.rs"
+
+[dependencies]
+vllm-common = { workspace = true }
+vllm-config = { workspace = true }
+vllm-core = { workspace = true }
+vllm-engine = { workspace = true }
+vllm-serve = { workspace = true }
+vllm-executor = { workspace = true }
+vllm-model = { workspace = true }
+vllm-models = { workspace = true }
+vllm-kernels = { workspace = true }
+candle-core = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+tokenizers = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

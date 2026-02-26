@@ -1,0 +1,1404 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright contributors to the vLLM project
+
+//! Main scheduler implementation, ported from `vllm/v1/core/sched/scheduler.py`.
+//!
+//! The scheduler is responsible for deciding which requests to process at each
+//! scheduling step and how many tokens to allocate to each request. It manages
+//! the request lifecycle through waiting, running, and finished states.
+//!
+//! This initial Rust port simplifies the KV cache interaction by tracking a
+//! simple block counter rather than full block allocation. A trait
+//! [`KVCacheManagerOps`] is defined so that the real KV cache manager (built
+//! by another agent) can be plugged in later.
+
+use std::collections::{HashMap, HashSet};
+
+use tracing::warn;
+use vllm_common::{Request, RequestStatus};
+use vllm_config::{SchedulerConfig, SchedulerPolicy};
+
+use super::interface::{PauseState, SchedulerInterface};
+use super::output::{CachedRequestData, NewRequestData, SchedulerOutput};
+use super::request_queue::{create_request_queue, RequestQueue, SchedulingPolicy};
+
+// ---------------------------------------------------------------------------
+// KVCacheManagerOps -- trait for KV cache interaction
+// ---------------------------------------------------------------------------
+
+/// Trait that abstracts the KV cache manager operations needed by the
+/// scheduler.
+///
+/// The real `KVCacheManager` (in the `kv_cache_manager` module) will
+/// implement this trait. For testing and initial bring-up, a simple
+/// block-counting implementation is provided.
+pub trait KVCacheManagerOps: Send {
+    /// Try to allocate blocks for a request.
+    ///
+    /// Returns the block IDs (one `Vec<usize>` per KV cache group) if
+    /// allocation succeeded, or `None` if there are insufficient free
+    /// blocks.
+    fn allocate_slots(
+        &mut self,
+        request: &Request,
+        num_new_tokens: usize,
+        num_lookahead_tokens: usize,
+    ) -> Option<Vec<Vec<usize>>>;
+
+    /// Free all blocks held by a request.
+    fn free(&mut self, request_id: &str);
+
+    /// Get the block IDs currently assigned to a request.
+    fn get_blocks(&self, request_id: &str) -> Vec<Vec<usize>>;
+
+    /// Get the number of computed tokens from prefix cache for a new
+    /// request.
+    ///
+    /// Returns `(num_computed_tokens, block_ids)` where `block_ids` are
+    /// the cached blocks.
+    fn get_computed_blocks(&self, request: &Request) -> (u32, Vec<Vec<usize>>);
+
+    /// Notify the KV cache manager that a new scheduling step is starting.
+    fn new_step_starts(&mut self);
+
+    /// Reset the prefix cache. Returns `true` if successful.
+    fn reset_prefix_cache(&mut self) -> bool;
+
+    /// Number of free blocks available.
+    fn num_free_blocks(&self) -> usize;
+
+    /// Block size (tokens per block).
+    fn block_size(&self) -> usize;
+}
+
+// ---------------------------------------------------------------------------
+// SimpleBlockTracker -- a minimal KV cache manager for initial bring-up
+// ---------------------------------------------------------------------------
+
+/// A minimal block tracker that satisfies [`KVCacheManagerOps`].
+///
+/// Instead of managing actual block tables, it tracks a simple counter of
+/// free blocks and assigns monotonically increasing block IDs. This is
+/// sufficient for testing the scheduler logic.
+pub struct SimpleBlockTracker {
+    #[allow(dead_code)]
+    total_blocks: usize,
+    free_blocks: usize,
+    block_size: usize,
+    next_block_id: usize,
+    /// request_id -> (block_ids, num_blocks_held)
+    allocations: HashMap<String, (Vec<Vec<usize>>, usize)>,
+}
+
+impl SimpleBlockTracker {
+    /// Create a new block tracker with the given number of GPU blocks and
+    /// block size.
+    pub fn new(num_gpu_blocks: usize, block_size: usize) -> Self {
+        Self {
+            total_blocks: num_gpu_blocks,
+            free_blocks: num_gpu_blocks,
+            block_size,
+            next_block_id: 0,
+            allocations: HashMap::new(),
+        }
+    }
+
+    /// Compute how many blocks a request needs for the given number of tokens.
+    fn blocks_needed(num_tokens: usize, block_size: usize) -> usize {
+        if num_tokens == 0 {
+            return 0;
+        }
+        num_tokens.div_ceil(block_size)
+    }
+}
+
+impl KVCacheManagerOps for SimpleBlockTracker {
+    fn allocate_slots(
+        &mut self,
+        request: &Request,
+        num_new_tokens: usize,
+        num_lookahead_tokens: usize,
+    ) -> Option<Vec<Vec<usize>>> {
+        let total_tokens =
+            request.num_computed_tokens as usize + num_new_tokens + num_lookahead_tokens;
+        let needed = Self::blocks_needed(total_tokens, self.block_size);
+
+        // How many blocks does this request already hold?
+        let currently_held = self
+            .allocations
+            .get(&request.request_id)
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+
+        let additional = needed.saturating_sub(currently_held);
+        if additional > self.free_blocks {
+            return None;
+        }
+
+        // Allocate new blocks.
+        let mut new_block_ids = Vec::with_capacity(additional);
+        for _ in 0..additional {
+            new_block_ids.push(self.next_block_id);
+            self.next_block_id += 1;
+            self.free_blocks -= 1;
+        }
+
+        // Merge with existing allocation.
+        let entry = self
+            .allocations
+            .entry(request.request_id.clone())
+            .or_insert_with(|| (vec![Vec::new()], 0));
+        entry.0[0].extend(new_block_ids.iter().copied());
+        entry.1 = needed;
+
+        // Return all block IDs for this request (single KV cache group).
+        Some(entry.0.clone())
+    }
+
+    fn free(&mut self, request_id: &str) {
+        if let Some((_, num_blocks)) = self.allocations.remove(request_id) {
+            self.free_blocks += num_blocks;
+        }
+    }
+
+    fn get_blocks(&self, request_id: &str) -> Vec<Vec<usize>> {
+        self.allocations
+            .get(request_id)
+            .map(|(blocks, _)| blocks.clone())
+            .unwrap_or_else(|| vec![Vec::new()])
+    }
+
+    fn get_computed_blocks(&self, _request: &Request) -> (u32, Vec<Vec<usize>>) {
+        // No prefix caching in the simple tracker.
+        (0, vec![Vec::new()])
+    }
+
+    fn new_step_starts(&mut self) {
+        // Nothing to do for the simple tracker.
+    }
+
+    fn reset_prefix_cache(&mut self) -> bool {
+        // No prefix cache to reset.
+        true
+    }
+
+    fn num_free_blocks(&self) -> usize {
+        self.free_blocks
+    }
+
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler
+// ---------------------------------------------------------------------------
+
+/// The main scheduler implementation.
+///
+/// Ported from `vllm.v1.core.sched.scheduler.Scheduler`.
+///
+/// The scheduling algorithm works in two phases:
+/// 1. Schedule RUNNING requests -- assign tokens and handle preemption when
+///    blocks are exhausted.
+/// 2. Schedule WAITING requests -- compute cached blocks, assign tokens, and
+///    allocate new blocks.
+///
+/// The output is a [`SchedulerOutput`] that tells the model runner exactly
+/// which requests to process and how many tokens each should get.
+pub struct Scheduler {
+    // -- Configuration --
+    /// Maximum number of requests that can be in the running state.
+    max_num_running_reqs: usize,
+    /// Maximum number of tokens to schedule in a single step.
+    max_num_scheduled_tokens: usize,
+    /// Maximum context length supported by the model.
+    max_model_len: usize,
+    /// Whether chunked prefill is enabled.
+    enable_chunked_prefill: bool,
+    /// Prefills longer than this threshold are split across steps.
+    long_prefill_token_threshold: usize,
+    /// Number of speculative lookahead tokens (0 = no speculation).
+    num_lookahead_tokens: usize,
+
+    // -- Request state --
+    /// All tracked requests: `req_id -> Request`.
+    requests: HashMap<String, Request>,
+    /// Queue of requests waiting to be scheduled.
+    waiting: Box<dyn RequestQueue>,
+    /// Requests currently in the running state.
+    running: Vec<Request>,
+    /// Request IDs finished between the previous and current steps.
+    finished_req_ids: HashSet<String>,
+    /// Scheduling pause state.
+    pause_state: PauseState,
+
+    // -- KV cache --
+    /// The KV cache manager (abstracted via trait).
+    kv_cache: Box<dyn KVCacheManagerOps>,
+}
+
+impl Scheduler {
+    /// Create a new scheduler with a `SchedulerConfig` and a KV cache
+    /// manager.
+    pub fn new(
+        scheduler_config: &SchedulerConfig,
+        max_model_len: usize,
+        kv_cache: Box<dyn KVCacheManagerOps>,
+    ) -> Self {
+        let policy = match &scheduler_config.policy {
+            SchedulerPolicy::Fcfs => SchedulingPolicy::Fcfs,
+            SchedulerPolicy::Priority => SchedulingPolicy::Priority,
+        };
+
+        let max_num_scheduled_tokens = scheduler_config
+            .max_num_scheduled_tokens
+            .unwrap_or(scheduler_config.max_num_batched_tokens);
+
+        Self {
+            max_num_running_reqs: scheduler_config.max_num_seqs,
+            max_num_scheduled_tokens,
+            max_model_len,
+            enable_chunked_prefill: scheduler_config.enable_chunked_prefill,
+            long_prefill_token_threshold: scheduler_config.long_prefill_token_threshold,
+            num_lookahead_tokens: 0,
+
+            requests: HashMap::new(),
+            waiting: create_request_queue(policy),
+            running: Vec::new(),
+            finished_req_ids: HashSet::new(),
+            pause_state: PauseState::Unpaused,
+
+            kv_cache,
+        }
+    }
+
+    /// Convenience constructor using a [`SimpleBlockTracker`].
+    ///
+    /// Useful for testing.
+    pub fn with_simple_blocks(
+        scheduler_config: &SchedulerConfig,
+        max_model_len: usize,
+        num_gpu_blocks: usize,
+        block_size: usize,
+    ) -> Self {
+        let kv_cache = Box::new(SimpleBlockTracker::new(num_gpu_blocks, block_size));
+        Self::new(scheduler_config, max_model_len, kv_cache)
+    }
+
+    // -- Internal helpers --
+
+    /// Preempt a request: free its KV cache blocks, mark it as preempted,
+    /// and move it back to the waiting queue.
+    fn preempt_request(&mut self, request: &mut Request) {
+        assert_eq!(
+            request.status,
+            RequestStatus::Running,
+            "Only running requests can be preempted"
+        );
+        self.kv_cache.free(&request.request_id);
+        request.status = RequestStatus::Preempted;
+        request.num_computed_tokens = 0;
+        request.spec_token_ids.clear();
+        request.num_preemptions += 1;
+    }
+
+    /// Build `CachedRequestData` for running + resumed requests.
+    fn make_cached_request_data(
+        &self,
+        running_reqs: &[Request],
+        resumed_reqs: &[Request],
+        _num_scheduled_tokens: &HashMap<String, usize>,
+        req_to_new_blocks: &HashMap<String, Vec<Vec<usize>>>,
+    ) -> CachedRequestData {
+        let mut req_ids = Vec::new();
+        let mut resumed_req_ids = HashSet::new();
+        let new_token_ids = Vec::new(); // PP not implemented yet.
+        let mut new_block_ids = Vec::new();
+        let mut num_computed_tokens_vec = Vec::new();
+        let mut num_output_tokens_vec = Vec::new();
+
+        for (idx, req) in running_reqs.iter().chain(resumed_reqs.iter()).enumerate() {
+            let req_id = &req.request_id;
+            req_ids.push(req_id.clone());
+
+            if idx >= running_reqs.len() {
+                resumed_req_ids.insert(req_id.clone());
+            }
+
+            // Block IDs: convert to the output format.
+            let blocks = req_to_new_blocks.get(req_id).cloned();
+            new_block_ids.push(blocks);
+
+            num_computed_tokens_vec.push(req.num_computed_tokens);
+            num_output_tokens_vec.push(
+                req.num_output_tokens() as u32 + req.num_output_placeholders,
+            );
+        }
+
+        CachedRequestData {
+            req_ids,
+            resumed_req_ids,
+            new_token_ids,
+            new_block_ids,
+            num_computed_tokens: num_computed_tokens_vec,
+            num_output_tokens: num_output_tokens_vec,
+        }
+    }
+
+    /// Update computed token counts after scheduling and clear finished IDs.
+    fn update_after_schedule(&mut self, output: &SchedulerOutput) {
+        for (req_id, &num_tokens) in &output.num_scheduled_tokens {
+            if let Some(request) = self.requests.get_mut(req_id) {
+                request.num_computed_tokens += num_tokens as u32;
+                request.is_prefill_chunk = (request.num_computed_tokens as usize)
+                    < request.num_tokens() + request.num_output_placeholders as usize;
+            }
+        }
+
+        // Sync the running list with the authoritative requests map.
+        for running_req in &mut self.running {
+            if let Some(canonical) = self.requests.get(&running_req.request_id) {
+                running_req.num_computed_tokens = canonical.num_computed_tokens;
+                running_req.is_prefill_chunk = canonical.is_prefill_chunk;
+            }
+        }
+
+        // Clear finished request IDs -- they are now captured in the output.
+        self.finished_req_ids = HashSet::new();
+    }
+
+    /// Try to finish a single request. Returns the `(req_id, client_index)`
+    /// if the request was found and not already finished.
+    fn finish_single_request(
+        &mut self,
+        request_id: &str,
+        status: RequestStatus,
+    ) -> Option<(String, u32)> {
+        // Check if the request exists.
+        let request = self.requests.get(request_id)?;
+        if request.status.is_finished() {
+            return None;
+        }
+        let client_index = request.client_index;
+        let req_id = request.request_id.clone();
+
+        // Remove from running queue.
+        if let Some(pos) = self
+            .running
+            .iter()
+            .position(|r| r.request_id == request_id)
+        {
+            let mut request = self.running.remove(pos);
+            self.kv_cache.free(&request.request_id);
+            request.status = status;
+            self.requests.insert(request.request_id.clone(), request);
+        } else {
+            // Remove from waiting queue.
+            self.waiting.remove_request(request_id);
+            if let Some(r) = self.requests.get_mut(request_id) {
+                r.status = status;
+            }
+        }
+
+        self.finished_req_ids.insert(req_id.clone());
+        Some((req_id, client_index))
+    }
+
+    // -- Request accessors (used by EngineCore for stop criteria) --
+
+    /// Get a reference to a request by ID.
+    pub fn get_request(&self, request_id: &str) -> Option<&Request> {
+        self.requests.get(request_id)
+    }
+
+    /// Get a mutable reference to a request by ID.
+    pub fn get_request_mut(&mut self, request_id: &str) -> Option<&mut Request> {
+        self.requests.get_mut(request_id)
+    }
+
+    /// Append output token IDs to a request, updating both the canonical
+    /// `requests` map and the `running` list.
+    pub fn append_output_tokens(&mut self, request_id: &str, token_ids: &[u32]) {
+        if let Some(request) = self.requests.get_mut(request_id) {
+            request.append_output_token_ids(token_ids);
+        }
+        // Also update the running list copy.
+        if let Some(running_req) = self.running.iter_mut().find(|r| r.request_id == request_id) {
+            running_req.append_output_token_ids(token_ids);
+        }
+    }
+}
+
+impl SchedulerInterface for Scheduler {
+    fn schedule(&mut self) -> SchedulerOutput {
+        // The scheduling algorithm, ported from Python's Scheduler.schedule():
+        //
+        // 1. Schedule RUNNING requests first: assign tokens, handle preemption
+        //    when blocks run out.
+        // 2. Schedule WAITING requests next: compute prefix cache hits,
+        //    assign tokens, allocate blocks.
+        // 3. Build and return SchedulerOutput.
+
+        let mut scheduled_new_reqs: Vec<Request> = Vec::new();
+        let mut scheduled_resumed_reqs: Vec<Request> = Vec::new();
+        let mut scheduled_running_reqs: Vec<Request> = Vec::new();
+        let mut preempted_reqs: Vec<Request> = Vec::new();
+
+        let mut req_to_new_blocks: HashMap<String, Vec<Vec<usize>>> = HashMap::new();
+        let mut num_scheduled_tokens: HashMap<String, usize> = HashMap::new();
+        let mut token_budget = self.max_num_scheduled_tokens;
+        let mut scheduled_spec_decode_tokens: HashMap<String, Vec<u32>> = HashMap::new();
+
+        if self.pause_state == PauseState::PausedAll {
+            token_budget = 0;
+        }
+
+        self.kv_cache.new_step_starts();
+
+        // ---------------------------------------------------------------
+        // Phase 1: Schedule RUNNING requests
+        // ---------------------------------------------------------------
+        let mut req_index = 0;
+        while req_index < self.running.len() && token_budget > 0 {
+            let request = &self.running[req_index];
+
+            // How many tokens does this request need computed?
+            let num_new_tokens_raw = request
+                .num_tokens_with_spec()
+                .saturating_add(request.num_output_placeholders as usize)
+                .saturating_sub(request.num_computed_tokens as usize);
+
+            let mut num_new_tokens = num_new_tokens_raw;
+
+            // Apply long-prefill threshold.
+            if self.long_prefill_token_threshold > 0
+                && num_new_tokens > self.long_prefill_token_threshold
+            {
+                num_new_tokens = self.long_prefill_token_threshold;
+            }
+
+            // Respect token budget.
+            num_new_tokens = num_new_tokens.min(token_budget);
+
+            // Ensure we don't exceed max model length.
+            let max_remaining =
+                self.max_model_len.saturating_sub(1 + request.num_computed_tokens as usize);
+            num_new_tokens = num_new_tokens.min(max_remaining);
+
+            if num_new_tokens == 0 {
+                req_index += 1;
+                continue;
+            }
+
+            // Try to allocate blocks. If allocation fails, preempt the
+            // lowest-priority running request and retry.
+            let request_clone = self.running[req_index].clone();
+            let new_blocks = self.kv_cache.allocate_slots(
+                &request_clone,
+                num_new_tokens,
+                self.num_lookahead_tokens,
+            );
+
+            if let Some(blocks) = new_blocks {
+                // Successfully allocated.
+                scheduled_running_reqs.push(self.running[req_index].clone());
+                let request_id = self.running[req_index].request_id.clone();
+
+                // Handle speculative decode tokens.
+                if !self.running[req_index].spec_token_ids.is_empty() {
+                    let num_scheduled_spec = num_new_tokens
+                        .saturating_add(self.running[req_index].num_computed_tokens as usize)
+                        .saturating_sub(self.running[req_index].num_tokens());
+                    if num_scheduled_spec > 0 {
+                        let spec_ids = &self.running[req_index].spec_token_ids;
+                        let truncated: Vec<u32> = spec_ids
+                            .iter()
+                            .take(num_scheduled_spec)
+                            .copied()
+                            .collect();
+                        scheduled_spec_decode_tokens
+                            .insert(request_id.clone(), truncated);
+                    }
+                    // Clear spec tokens for next step.
+                    self.running[req_index].spec_token_ids.clear();
+                }
+
+                req_to_new_blocks.insert(request_id.clone(), blocks);
+                num_scheduled_tokens.insert(request_id, num_new_tokens);
+                token_budget -= num_new_tokens;
+                req_index += 1;
+            } else {
+                // Allocation failed -- preempt the last running request.
+                // (FCFS: preempt from the back; Priority would pick the
+                // lowest-priority request, but for simplicity we always
+                // preempt from the back.)
+                if self.running.len() <= 1 {
+                    // Can't preempt -- the only running request is this one.
+                    break;
+                }
+
+                // Preempt the last request (lowest priority in FCFS order).
+                let preempt_idx = self.running.len() - 1;
+                if preempt_idx == req_index {
+                    // The request we're trying to schedule is the last one;
+                    // preempt it.
+                    let mut preempted = self.running.remove(preempt_idx);
+                    self.preempt_request(&mut preempted);
+
+                    // Remove from scheduled lists if it was already scheduled.
+                    let pid = preempted.request_id.clone();
+                    if let Some(tokens) = num_scheduled_tokens.remove(&pid) {
+                        token_budget += tokens;
+                    }
+                    req_to_new_blocks.remove(&pid);
+                    scheduled_spec_decode_tokens.remove(&pid);
+                    scheduled_running_reqs.retain(|r| r.request_id != pid);
+
+                    self.waiting.prepend_request(preempted.clone());
+                    preempted_reqs.push(preempted);
+                    break;
+                } else {
+                    let mut preempted = self.running.remove(preempt_idx);
+                    self.preempt_request(&mut preempted);
+
+                    // Restore budget if this request was scheduled.
+                    let pid = preempted.request_id.clone();
+                    if let Some(tokens) = num_scheduled_tokens.remove(&pid) {
+                        token_budget += tokens;
+                    }
+                    req_to_new_blocks.remove(&pid);
+                    scheduled_spec_decode_tokens.remove(&pid);
+                    scheduled_running_reqs.retain(|r| r.request_id != pid);
+
+                    self.waiting.prepend_request(preempted.clone());
+                    preempted_reqs.push(preempted);
+                    // Retry the current request.
+                    continue;
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Phase 2: Schedule WAITING requests
+        // ---------------------------------------------------------------
+        if preempted_reqs.is_empty() && self.pause_state == PauseState::Unpaused {
+            while !self.waiting.is_empty() && token_budget > 0 {
+                if self.running.len() >= self.max_num_running_reqs {
+                    break;
+                }
+
+                // Peek at the next waiting request.
+                let request = match self.waiting.peek_request() {
+                    Some(r) => r.clone(),
+                    None => break,
+                };
+                let request_id = request.request_id.clone();
+
+                // Get computed blocks from prefix cache.
+                let (num_cached_tokens, _cached_blocks) =
+                    self.kv_cache.get_computed_blocks(&request);
+
+                let num_computed_tokens = num_cached_tokens;
+
+                // How many tokens need to be scheduled.
+                let total_tokens = request.num_tokens();
+                let num_new_tokens_raw =
+                    total_tokens.saturating_sub(num_computed_tokens as usize);
+
+                let mut num_new_tokens = num_new_tokens_raw;
+
+                // Apply long-prefill threshold.
+                if self.long_prefill_token_threshold > 0
+                    && num_new_tokens > self.long_prefill_token_threshold
+                {
+                    num_new_tokens = self.long_prefill_token_threshold;
+                }
+
+                // If chunked prefill is disabled, skip if the request
+                // doesn't fit in the remaining budget.
+                if !self.enable_chunked_prefill && num_new_tokens > token_budget {
+                    break;
+                }
+
+                num_new_tokens = num_new_tokens.min(token_budget);
+                if num_new_tokens == 0 {
+                    break;
+                }
+
+                // Allocate slots for the effective lookahead. For new
+                // requests that haven't been computed yet, we use 0
+                // lookahead tokens (matches Python: only running requests
+                // get lookahead).
+                let effective_lookahead = if request.num_computed_tokens == 0 {
+                    0
+                } else {
+                    self.num_lookahead_tokens
+                };
+
+                // We need to create a temporary request with the computed
+                // tokens set to allow proper block allocation.
+                let mut alloc_request = request.clone();
+                alloc_request.num_computed_tokens = num_computed_tokens;
+
+                let new_blocks = self.kv_cache.allocate_slots(
+                    &alloc_request,
+                    num_new_tokens,
+                    effective_lookahead,
+                );
+
+                match new_blocks {
+                    Some(blocks) => {
+                        // Pop from waiting queue (we peeked earlier).
+                        let mut request = self.waiting.pop_request().unwrap();
+
+                        // Move to running.
+                        self.running.push(request.clone());
+
+                        if request.status == RequestStatus::Waiting {
+                            request.status = RequestStatus::Running;
+                            request.num_computed_tokens = num_computed_tokens;
+                            if request.num_cached_tokens < 0 {
+                                request.num_cached_tokens = num_computed_tokens as i32;
+                            }
+                            scheduled_new_reqs.push(request.clone());
+                        } else if request.status == RequestStatus::Preempted {
+                            request.status = RequestStatus::Running;
+                            request.num_computed_tokens = num_computed_tokens;
+                            scheduled_resumed_reqs.push(request.clone());
+                        } else {
+                            warn!(
+                                "Unexpected request status {:?} for {}",
+                                request.status, request.request_id
+                            );
+                            request.status = RequestStatus::Running;
+                        }
+
+                        // Update the running list entry.
+                        if let Some(running_req) = self
+                            .running
+                            .iter_mut()
+                            .rev()
+                            .find(|r| r.request_id == request_id)
+                        {
+                            running_req.status = RequestStatus::Running;
+                            running_req.num_computed_tokens = num_computed_tokens;
+                            if running_req.num_cached_tokens < 0 {
+                                running_req.num_cached_tokens =
+                                    num_computed_tokens as i32;
+                            }
+                        }
+
+                        req_to_new_blocks
+                            .insert(request_id.clone(), blocks);
+                        num_scheduled_tokens
+                            .insert(request_id.clone(), num_new_tokens);
+                        token_budget -= num_new_tokens;
+
+                        // Update the requests map.
+                        if let Some(r) = self.requests.get_mut(&request_id) {
+                            r.status = RequestStatus::Running;
+                            r.num_computed_tokens = num_computed_tokens;
+                            if r.num_cached_tokens < 0 {
+                                r.num_cached_tokens = num_computed_tokens as i32;
+                            }
+                        }
+                    }
+                    None => {
+                        // Cannot allocate -- stop scheduling waiting requests.
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Phase 3: Build SchedulerOutput
+        // ---------------------------------------------------------------
+        let total_num_scheduled_tokens: usize =
+            num_scheduled_tokens.values().sum();
+
+        // Build NewRequestData for newly scheduled requests.
+        let new_reqs_data: Vec<NewRequestData> = scheduled_new_reqs
+            .iter()
+            .map(|req| {
+                let blocks = req_to_new_blocks
+                    .get(&req.request_id)
+                    .cloned()
+                    .unwrap_or_else(|| vec![Vec::new()]);
+                NewRequestData::new(
+                    req.request_id.clone(),
+                    Some(req.prompt_token_ids.clone()),
+                    blocks,
+                    req.num_computed_tokens,
+                    Some(req.sampling_params.clone()),
+                )
+            })
+            .collect();
+
+        // Build CachedRequestData.
+        let cached_reqs_data = self.make_cached_request_data(
+            &scheduled_running_reqs,
+            &scheduled_resumed_reqs,
+            &num_scheduled_tokens,
+            &req_to_new_blocks,
+        );
+
+        let preempted_req_ids: HashSet<String> = preempted_reqs
+            .iter()
+            .map(|r| r.request_id.clone())
+            .collect();
+
+        let output = SchedulerOutput {
+            scheduled_new_reqs: new_reqs_data,
+            scheduled_cached_reqs: cached_reqs_data,
+            num_scheduled_tokens,
+            total_num_scheduled_tokens,
+            scheduled_spec_decode_tokens,
+            scheduled_encoder_inputs: HashMap::new(),
+            num_common_prefix_blocks: Vec::new(),
+            finished_req_ids: self.finished_req_ids.clone(),
+            free_encoder_mm_hashes: Vec::new(),
+            preempted_req_ids: if preempted_req_ids.is_empty() {
+                None
+            } else {
+                Some(preempted_req_ids)
+            },
+        };
+
+        // Post-schedule updates.
+        self.update_after_schedule(&output);
+
+        output
+    }
+
+    fn add_request(&mut self, request: Request) {
+        let request_id = request.request_id.clone();
+        self.requests.insert(request_id, request.clone());
+        self.waiting.add_request(request);
+    }
+
+    fn finish_requests(
+        &mut self,
+        request_ids: &[&str],
+        finished_status: RequestStatus,
+    ) -> Vec<(String, u32)> {
+        let mut result = Vec::new();
+        for &req_id in request_ids {
+            if let Some(pair) = self.finish_single_request(req_id, finished_status) {
+                result.push(pair);
+            }
+        }
+        result
+    }
+
+    fn get_num_unfinished_requests(&self) -> usize {
+        self.running.len() + self.waiting.len()
+    }
+
+    fn has_finished_requests(&self) -> bool {
+        !self.finished_req_ids.is_empty()
+    }
+
+    fn pause_state(&self) -> PauseState {
+        self.pause_state
+    }
+
+    fn set_pause_state(&mut self, state: PauseState) {
+        self.pause_state = state;
+    }
+
+    fn reset_prefix_cache(&mut self) -> bool {
+        if !self.running.is_empty() {
+            return false;
+        }
+        self.kv_cache.reset_prefix_cache()
+    }
+
+    fn get_request_counts(&self) -> (usize, usize) {
+        (self.running.len(), self.waiting.len())
+    }
+
+    fn shutdown(&mut self) {
+        // Free all running requests.
+        let running_ids: Vec<String> = self
+            .running
+            .iter()
+            .map(|r| r.request_id.clone())
+            .collect();
+        for id in &running_ids {
+            self.kv_cache.free(id);
+        }
+        self.running.clear();
+
+        // Drain waiting queue.
+        self.waiting.drain_all();
+
+        self.requests.clear();
+        self.finished_req_ids.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vllm_common::SamplingParams;
+    use vllm_config::SchedulerConfig;
+
+    // Helper: create a default scheduler config for testing.
+    fn test_scheduler_config() -> SchedulerConfig {
+        SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 4,
+            enable_chunked_prefill: true,
+            long_prefill_token_threshold: 0,
+            ..Default::default()
+        }
+    }
+
+    // Helper: create a test request.
+    fn make_request(id: &str, num_prompt_tokens: usize) -> Request {
+        let prompt: Vec<u32> = (0..num_prompt_tokens as u32).collect();
+        Request::new(
+            id.into(),
+            prompt,
+            SamplingParams {
+                max_tokens: Some(100),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        )
+    }
+
+    fn make_priority_request(
+        id: &str,
+        num_prompt_tokens: usize,
+        priority: i32,
+        arrival: f64,
+    ) -> Request {
+        let prompt: Vec<u32> = (0..num_prompt_tokens as u32).collect();
+        Request::new(
+            id.into(),
+            prompt,
+            SamplingParams {
+                max_tokens: Some(100),
+                ..Default::default()
+            },
+            arrival,
+            0,
+            priority,
+            None,
+        )
+    }
+
+    // ----- Basic scheduling tests -----
+
+    #[test]
+    fn test_empty_schedule() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        let output = sched.schedule();
+        assert_eq!(output.total_num_scheduled_tokens, 0);
+        assert!(output.scheduled_new_reqs.is_empty());
+        assert_eq!(output.scheduled_cached_reqs.num_reqs(), 0);
+    }
+
+    #[test]
+    fn test_add_and_schedule_single_request() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        let req = make_request("r1", 10);
+        sched.add_request(req);
+
+        assert_eq!(sched.get_num_unfinished_requests(), 1);
+        assert!(sched.has_unfinished_requests());
+        assert_eq!(sched.get_request_counts(), (0, 1));
+
+        let output = sched.schedule();
+        assert_eq!(output.scheduled_new_reqs.len(), 1);
+        assert_eq!(output.scheduled_new_reqs[0].req_id, "r1");
+        assert_eq!(
+            *output.num_scheduled_tokens.get("r1").unwrap(),
+            10
+        );
+        assert_eq!(output.total_num_scheduled_tokens, 10);
+        assert_eq!(sched.get_request_counts(), (1, 0));
+    }
+
+    #[test]
+    fn test_schedule_multiple_requests() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.add_request(make_request("r2", 20));
+        sched.add_request(make_request("r3", 30));
+
+        let output = sched.schedule();
+        assert_eq!(output.scheduled_new_reqs.len(), 3);
+        assert_eq!(output.total_num_scheduled_tokens, 60);
+    }
+
+    #[test]
+    fn test_max_num_seqs_limit() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 1024,
+            max_num_seqs: 2,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.add_request(make_request("r2", 10));
+        sched.add_request(make_request("r3", 10));
+
+        let output = sched.schedule();
+        // Only 2 requests should be scheduled due to max_num_seqs=2.
+        assert_eq!(output.scheduled_new_reqs.len(), 2);
+        assert_eq!(sched.get_request_counts(), (2, 1));
+    }
+
+    #[test]
+    fn test_token_budget_limit() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 25,
+            max_num_seqs: 10,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.add_request(make_request("r2", 10));
+        sched.add_request(make_request("r3", 10));
+
+        let output = sched.schedule();
+        // Total budget is 25. r1 (10) + r2 (10) = 20. r3 needs 10 but only
+        // 5 remain. With chunked prefill, r3 gets 5.
+        assert_eq!(output.total_num_scheduled_tokens, 25);
+        assert_eq!(output.scheduled_new_reqs.len(), 3);
+    }
+
+    #[test]
+    fn test_chunked_prefill_disabled() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 25,
+            max_num_seqs: 10,
+            enable_chunked_prefill: false,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.add_request(make_request("r2", 10));
+        sched.add_request(make_request("r3", 10));
+
+        let output = sched.schedule();
+        // With chunked prefill disabled, r3 (10 tokens) doesn't fit in
+        // the remaining budget (5), so only r1 and r2 are scheduled.
+        assert_eq!(output.total_num_scheduled_tokens, 20);
+        assert_eq!(output.scheduled_new_reqs.len(), 2);
+    }
+
+    // ----- Request lifecycle tests -----
+
+    #[test]
+    fn test_request_lifecycle() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        // Add request.
+        sched.add_request(make_request("r1", 10));
+        assert_eq!(sched.get_num_unfinished_requests(), 1);
+
+        // Schedule it.
+        let _output = sched.schedule();
+        assert_eq!(sched.get_request_counts(), (1, 0));
+
+        // Finish it.
+        let finished = sched.finish_requests(
+            &["r1"],
+            RequestStatus::FinishedStopped,
+        );
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].0, "r1");
+        assert_eq!(sched.get_num_unfinished_requests(), 0);
+        assert!(sched.has_finished_requests());
+
+        // The next schedule call should report the finished request.
+        let output = sched.schedule();
+        assert!(output.finished_req_ids.contains("r1"));
+    }
+
+    #[test]
+    fn test_finish_nonexistent_request() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        let finished = sched.finish_requests(
+            &["nonexistent"],
+            RequestStatus::FinishedAborted,
+        );
+        assert!(finished.is_empty());
+    }
+
+    #[test]
+    fn test_finish_waiting_request() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+
+        // Finish before scheduling.
+        let finished = sched.finish_requests(
+            &["r1"],
+            RequestStatus::FinishedAborted,
+        );
+        assert_eq!(finished.len(), 1);
+        assert_eq!(sched.get_num_unfinished_requests(), 0);
+    }
+
+    // ----- Preemption tests -----
+
+    #[test]
+    fn test_preemption_when_blocks_exhausted() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 10,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        // Only 4 blocks of size 16 = 64 tokens total.
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 4, 16);
+
+        // Add requests that together need more than 4 blocks.
+        sched.add_request(make_request("r1", 16)); // 1 block
+        sched.add_request(make_request("r2", 16)); // 1 block
+        sched.add_request(make_request("r3", 16)); // 1 block
+        sched.add_request(make_request("r4", 16)); // 1 block
+        sched.add_request(make_request("r5", 16)); // would need 5th block
+
+        let output = sched.schedule();
+
+        // Not all 5 can be scheduled. At most 4 blocks available.
+        assert!(output.total_num_scheduled_tokens <= 64);
+        let total_scheduled = output.scheduled_new_reqs.len()
+            + output.scheduled_cached_reqs.num_reqs();
+        // At most 4 requests can be scheduled.
+        assert!(total_scheduled <= 4);
+    }
+
+    #[test]
+    fn test_running_request_preemption() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 10,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        // Very limited blocks: only 2 blocks of size 16 = 32 tokens.
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 2, 16);
+
+        // First step: schedule r1 (16 tokens, 1 block).
+        sched.add_request(make_request("r1", 16));
+        let output1 = sched.schedule();
+        assert_eq!(output1.scheduled_new_reqs.len(), 1);
+        assert_eq!(output1.scheduled_new_reqs[0].req_id, "r1");
+
+        // Simulate r1 generating an output token.
+        if let Some(r) = sched.running.iter_mut().find(|r| r.request_id == "r1") {
+            r.append_output_token_ids(&[99]);
+        }
+        if let Some(r) = sched.requests.get_mut("r1") {
+            r.append_output_token_ids(&[99]);
+        }
+
+        // Second step: r1 is running (needs 1 token), schedule it.
+        let output2 = sched.schedule();
+        // r1 should be in cached_reqs (already scheduled before).
+        assert!(output2.num_scheduled_tokens.contains_key("r1"));
+    }
+
+    // ----- Pause state tests -----
+
+    #[test]
+    fn test_pause_all() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.set_pause_state(PauseState::PausedAll);
+
+        let output = sched.schedule();
+        assert_eq!(output.total_num_scheduled_tokens, 0);
+        assert!(output.scheduled_new_reqs.is_empty());
+    }
+
+    #[test]
+    fn test_pause_new() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        // Schedule r1 normally first.
+        sched.add_request(make_request("r1", 10));
+        let _output1 = sched.schedule();
+        assert_eq!(sched.get_request_counts(), (1, 0));
+
+        // Simulate r1 producing a token.
+        if let Some(r) = sched.running.iter_mut().find(|r| r.request_id == "r1") {
+            r.append_output_token_ids(&[99]);
+        }
+        if let Some(r) = sched.requests.get_mut("r1") {
+            r.append_output_token_ids(&[99]);
+        }
+
+        // Now pause new requests and add r2.
+        sched.add_request(make_request("r2", 10));
+        sched.set_pause_state(PauseState::PausedNew);
+
+        let output2 = sched.schedule();
+        // r1 (running) should still be scheduled, but r2 (waiting) should not.
+        assert!(output2.num_scheduled_tokens.contains_key("r1"));
+        assert!(!output2.num_scheduled_tokens.contains_key("r2"));
+    }
+
+    // ----- Shutdown test -----
+
+    #[test]
+    fn test_shutdown() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.add_request(make_request("r2", 20));
+        let _output = sched.schedule();
+
+        sched.shutdown();
+        assert_eq!(sched.get_num_unfinished_requests(), 0);
+        assert!(!sched.has_unfinished_requests());
+    }
+
+    // ----- Reset prefix cache test -----
+
+    #[test]
+    fn test_reset_prefix_cache_with_running_requests() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        let _output = sched.schedule();
+
+        // Should fail because there are running requests.
+        assert!(!sched.reset_prefix_cache());
+    }
+
+    #[test]
+    fn test_reset_prefix_cache_without_running_requests() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        // No running requests -- should succeed.
+        assert!(sched.reset_prefix_cache());
+    }
+
+    // ----- Long prefill threshold test -----
+
+    #[test]
+    fn test_long_prefill_threshold() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 1024,
+            max_num_seqs: 10,
+            enable_chunked_prefill: true,
+            long_prefill_token_threshold: 50,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        // Request with 200 prompt tokens.
+        sched.add_request(make_request("r1", 200));
+
+        let output = sched.schedule();
+        // Should schedule at most 50 tokens due to the threshold.
+        assert_eq!(
+            *output.num_scheduled_tokens.get("r1").unwrap(),
+            50
+        );
+    }
+
+    // ----- Multiple scheduling steps test -----
+
+    #[test]
+    fn test_multi_step_scheduling() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 20,
+            max_num_seqs: 10,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        // Request with 50 prompt tokens -- needs multiple steps.
+        sched.add_request(make_request("r1", 50));
+
+        // Step 1: schedule up to 20 tokens.
+        let output1 = sched.schedule();
+        assert_eq!(
+            *output1.num_scheduled_tokens.get("r1").unwrap(),
+            20
+        );
+
+        // Step 2: schedule next chunk. The request is now running.
+        let output2 = sched.schedule();
+        assert_eq!(
+            *output2.num_scheduled_tokens.get("r1").unwrap(),
+            20
+        );
+
+        // Step 3: schedule remaining 10 tokens.
+        let output3 = sched.schedule();
+        assert_eq!(
+            *output3.num_scheduled_tokens.get("r1").unwrap(),
+            10
+        );
+    }
+
+    // ----- has_requests / has_finished tests -----
+
+    #[test]
+    fn test_has_requests_with_finished() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        let _output = sched.schedule();
+
+        // Finish r1.
+        sched.finish_requests(&["r1"], RequestStatus::FinishedStopped);
+
+        // No unfinished, but has finished.
+        assert!(!sched.has_unfinished_requests());
+        assert!(sched.has_finished_requests());
+        assert!(sched.has_requests());
+
+        // After a schedule step, finished IDs are flushed.
+        let _output = sched.schedule();
+        assert!(!sched.has_requests());
+    }
+
+    // ----- Priority scheduling tests -----
+
+    #[test]
+    fn test_priority_scheduling_order() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 2,
+            enable_chunked_prefill: true,
+            policy: SchedulerPolicy::Priority,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        // Add a low-priority request first, then a high-priority one.
+        sched.add_request(make_priority_request("r_low", 10, 10, 1.0));
+        sched.add_request(make_priority_request("r_high", 10, -1, 2.0));
+
+        let output = sched.schedule();
+        assert_eq!(output.scheduled_new_reqs.len(), 2);
+
+        // Both should be scheduled since max_num_seqs=2,
+        // but r_high should come first in the new_reqs list because the
+        // priority queue pops it first.
+        let scheduled_ids: Vec<&str> = output
+            .scheduled_new_reqs
+            .iter()
+            .map(|r| r.req_id.as_str())
+            .collect();
+        assert_eq!(scheduled_ids[0], "r_high");
+        assert_eq!(scheduled_ids[1], "r_low");
+    }
+
+    #[test]
+    fn test_priority_scheduling_with_limited_seqs() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 1, // Only 1 seq at a time.
+            enable_chunked_prefill: true,
+            policy: SchedulerPolicy::Priority,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        // The high-priority request should be scheduled first.
+        sched.add_request(make_priority_request("r_low", 10, 10, 1.0));
+        sched.add_request(make_priority_request("r_high", 10, -1, 2.0));
+
+        let output = sched.schedule();
+        assert_eq!(output.scheduled_new_reqs.len(), 1);
+        assert_eq!(output.scheduled_new_reqs[0].req_id, "r_high");
+    }
+
+    // -- Request accessor tests --
+
+    #[test]
+    fn test_get_request() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 5));
+        assert!(sched.get_request("r1").is_some());
+        assert_eq!(sched.get_request("r1").unwrap().request_id, "r1");
+        assert!(sched.get_request("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_get_request_mut() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 5));
+        if let Some(req) = sched.get_request_mut("r1") {
+            req.max_tokens = 42;
+        }
+        assert_eq!(sched.get_request("r1").unwrap().max_tokens, 42);
+    }
+
+    #[test]
+    fn test_append_output_tokens() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 5));
+
+        // Schedule to move from waiting to running.
+        let _ = sched.schedule();
+
+        // Append output tokens.
+        sched.append_output_tokens("r1", &[100, 101]);
+
+        let req = sched.get_request("r1").unwrap();
+        assert_eq!(req.output_token_ids, vec![100, 101]);
+        assert_eq!(req.num_output_tokens(), 2);
+        // all_token_ids should be prompt + output.
+        assert_eq!(req.all_token_ids.len(), 7); // 5 prompt + 2 output
+    }
+
+    #[test]
+    fn test_append_output_tokens_nonexistent() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        // Appending to a nonexistent request should not panic.
+        sched.append_output_tokens("nonexistent", &[1, 2, 3]);
+    }
+}

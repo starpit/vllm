@@ -1,0 +1,88 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vllm-rs/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'vllm-rs/**'
+
+defaults:
+  run:
+    working-directory: vllm-rs
+
+env:
+  CARGO_TERM_COLOR: always
+  # Required for PyO3 with Python 3.14+
+  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vllm-rs
+      - run: cargo check --workspace
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vllm-rs
+      - run: cargo test --workspace --exclude vllm-pyo3
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vllm-rs
+      - run: cargo clippy --workspace --exclude vllm-pyo3 -- -D warnings
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  pyo3:
+    name: PyO3 Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vllm-rs
+      - run: pip install maturin
+      - run: cargo check -p vllm-pyo3
+
+  docker-cpu:
+    name: Docker CPU Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f vllm-rs/Dockerfile.cpu vllm-rs/

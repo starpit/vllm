@@ -1,0 +1,20 @@
+[package]
+name = "vllm-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire formats: msgpack, serialization, ZMQ for vLLM Rust port"
+
+[dependencies]
+vllm-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zeromq = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

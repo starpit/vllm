@@ -1,0 +1,16 @@
+[package]
+name = "vllm-pyo3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PyO3 bridge module for vLLM Rust port (temporary, shrinks over time)"
+
+[lib]
+name = "vllm_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+vllm-common = { workspace = true }
+vllm-config = { workspace = true }
+vllm-core = { workspace = true }
+pyo3 = { workspace = true }

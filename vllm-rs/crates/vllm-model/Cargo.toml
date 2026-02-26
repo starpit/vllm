@@ -1,0 +1,22 @@
+[package]
+name = "vllm-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model loading, weight management, and tensor abstractions for vLLM Rust port"
+
+[dependencies]
+vllm-common = { workspace = true }
+vllm-config = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+candle-core = { workspace = true }
+safetensors = { workspace = true }
+half = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+tempfile = { workspace = true }

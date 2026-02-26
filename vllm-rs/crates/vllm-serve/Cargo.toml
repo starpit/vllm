@@ -1,0 +1,29 @@
+[package]
+name = "vllm-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP (axum) and gRPC (tonic) serving layer for vLLM Rust port"
+
+[dependencies]
+vllm-common = { workspace = true }
+vllm-config = { workspace = true }
+vllm-engine = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tower = { workspace = true }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+uuid = { version = "1", features = ["v4"] }
+http = "1"
+tokenizers = { workspace = true }
+minijinja = { workspace = true }
+prometheus = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+http-body-util = "0.1"

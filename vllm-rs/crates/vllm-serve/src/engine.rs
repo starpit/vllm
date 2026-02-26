@@ -10,14 +10,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, error};
 use uuid::Uuid;
-use vllm_common::{
-    EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, StopReason,
-};
+use vllm_common::{EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, StopReason};
 use vllm_engine::core_client::EngineCoreClient;
 
 use crate::chat_template::{ChatTemplate, TemplateMessage};
@@ -35,8 +33,7 @@ struct RequestState {
     /// Accumulated generated token IDs.
     generated_token_ids: Vec<u32>,
 
-    /// Number of prompt tokens (stored for diagnostics; usage is computed by callers).
-    #[allow(dead_code)]
+    /// Number of prompt tokens.
     num_prompt_tokens: u32,
 
     /// Number of cached prompt tokens.
@@ -56,6 +53,17 @@ struct RequestState {
 
     /// Position in response choices (for n>1 / multi-prompt support).
     choice_index: u32,
+
+    /// When this request was submitted (for TTFT calculation).
+    submit_time: Instant,
+    /// When the first output token was received (None until first token).
+    first_token_time: Option<Instant>,
+    /// When the last output token was received (for ITL calculation).
+    last_token_time: Option<Instant>,
+    /// Number of inter-token intervals observed (for computing avg ITL).
+    itl_count: u32,
+    /// Sum of inter-token latencies in seconds (for computing avg ITL).
+    itl_sum: f64,
 }
 
 /// A delta sent to a streaming response.
@@ -310,9 +318,7 @@ impl AsyncEngine {
             },
         };
 
-        Ok(protocol::ChatCompletionResponse::new(
-            model, choices, usage,
-        ))
+        Ok(protocol::ChatCompletionResponse::new(model, choices, usage))
     }
 
     /// Add a streaming chat completion request.
@@ -419,7 +425,9 @@ impl AsyncEngine {
         let total_prompt_tokens: u32 = prompts.iter().map(|p| p.len() as u32).sum();
         let metrics = crate::metrics::VllmMetrics::global();
         metrics.requests_total.inc();
-        metrics.prompt_tokens_total.inc_by(total_prompt_tokens as u64);
+        metrics
+            .prompt_tokens_total
+            .inc_by(total_prompt_tokens as u64);
 
         // Submit all child requests.
         let mut child_ids: Vec<(String, u32)> = Vec::with_capacity(total);
@@ -662,14 +670,19 @@ impl AsyncEngine {
                     stream_tx,
                     detokenizer,
                     choice_index,
+                    submit_time: Instant::now(),
+                    first_token_time: None,
+                    last_token_time: None,
+                    itl_count: 0,
+                    itl_sum: 0.0,
                 },
             );
         }
 
         // Send to the step loop via channel (non-blocking, no mutex).
-        self.request_tx.send(ec_request).map_err(|_| {
-            ServeError::Engine("engine step loop shut down".to_string())
-        })?;
+        self.request_tx
+            .send(ec_request)
+            .map_err(|_| ServeError::Engine("engine step loop shut down".to_string()))?;
 
         Ok(())
     }
@@ -708,10 +721,7 @@ impl AsyncEngine {
     /// Process an engine output for a single request.
     fn process_output(requests: &mut HashMap<String, RequestState>, output: EngineCoreOutput) {
         let Some(req_state) = requests.get_mut(&output.request_id) else {
-            debug!(
-                "Output for unknown request {}, ignoring",
-                output.request_id
-            );
+            debug!("Output for unknown request {}, ignoring", output.request_id);
             return;
         };
 
@@ -720,6 +730,24 @@ impl AsyncEngine {
         metrics
             .output_tokens_total
             .inc_by(output.new_token_ids.len() as u64);
+
+        // --- TTFT / ITL timing ---
+        let now = Instant::now();
+        if !output.new_token_ids.is_empty() {
+            if req_state.first_token_time.is_none() {
+                // First token: record TTFT.
+                req_state.first_token_time = Some(now);
+                let ttft = now.duration_since(req_state.submit_time).as_secs_f64();
+                metrics.time_to_first_token_seconds.observe(ttft);
+            } else if let Some(last) = req_state.last_token_time {
+                // Subsequent token: record inter-token latency.
+                let itl = now.duration_since(last).as_secs_f64();
+                metrics.inter_token_latency_seconds.observe(itl);
+                req_state.itl_count += 1;
+                req_state.itl_sum += itl;
+            }
+            req_state.last_token_time = Some(now);
+        }
 
         // Accumulate tokens.
         req_state.generated_token_ids.extend(&output.new_token_ids);
@@ -770,12 +798,34 @@ impl AsyncEngine {
         // Update request state finish/stop reason.
         if is_finished && req_state.finish_reason.is_none() {
             req_state.finish_reason = delta_finish_reason;
-            req_state.stop_reason =
-                delta_stop_reason.or(output.stop_reason);
+            req_state.stop_reason = delta_stop_reason.or(output.stop_reason);
         }
 
-        // Close streaming channel when done.
+        // Log and clean up when done.
         if is_finished {
+            let total_latency = now.duration_since(req_state.submit_time).as_secs_f64();
+            let ttft_ms = req_state
+                .first_token_time
+                .map(|t| t.duration_since(req_state.submit_time).as_secs_f64() * 1000.0);
+            let avg_itl_ms = if req_state.itl_count > 0 {
+                Some(req_state.itl_sum / req_state.itl_count as f64 * 1000.0)
+            } else {
+                None
+            };
+            let prompt_tokens = req_state.num_prompt_tokens;
+            let completion_tokens = req_state.generated_token_ids.len() as u32;
+
+            tracing::info!(
+                request_id = %output.request_id,
+                prompt_tokens = prompt_tokens,
+                completion_tokens = completion_tokens,
+                latency_ms = format!("{:.1}", total_latency * 1000.0),
+                ttft_ms = ttft_ms.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
+                avg_itl_ms = avg_itl_ms.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
+                "request finished"
+            );
+
+            metrics.request_latency_seconds.observe(total_latency);
             req_state.stream_tx.take();
             metrics.requests_active.dec();
             metrics.requests_success_total.inc();
@@ -937,11 +987,7 @@ impl AsyncEngine {
     ///
     /// - If `None`, sets it to the remaining capacity.
     /// - If `Some(val)`, caps it at the remaining capacity.
-    fn resolve_max_tokens(
-        &self,
-        sampling_params: &mut SamplingParams,
-        num_prompt_tokens: usize,
-    ) {
+    fn resolve_max_tokens(&self, sampling_params: &mut SamplingParams, num_prompt_tokens: usize) {
         let remaining = self.max_model_len.saturating_sub(num_prompt_tokens);
         match sampling_params.max_tokens {
             None => sampling_params.max_tokens = Some(remaining as u32),
@@ -1283,6 +1329,11 @@ mod tests {
                 stream_tx: None,
                 detokenizer: None,
                 choice_index: 0,
+                submit_time: Instant::now(),
+                first_token_time: None,
+                last_token_time: None,
+                itl_count: 0,
+                itl_sum: 0.0,
             },
         );
 
@@ -1335,6 +1386,11 @@ mod tests {
                 stream_tx: Some(tx),
                 detokenizer: None,
                 choice_index: 0,
+                submit_time: Instant::now(),
+                first_token_time: None,
+                last_token_time: None,
+                itl_count: 0,
+                itl_sum: 0.0,
             },
         );
 
@@ -1386,14 +1442,8 @@ mod tests {
         let full_ids = tok.encode(&full_text, false).unwrap();
         let output_ids = full_ids[prompt_ids.len()..].to_vec();
 
-        let detok = IncrementalDetokenizer::new(
-            Arc::clone(&tok),
-            &prompt_ids,
-            vec![],
-            0,
-            false,
-            false,
-        );
+        let detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut requests = HashMap::new();
@@ -1408,6 +1458,11 @@ mod tests {
                 stream_tx: Some(tx),
                 detokenizer: Some(detok),
                 choice_index: 0,
+                submit_time: Instant::now(),
+                first_token_time: None,
+                last_token_time: None,
+                itl_count: 0,
+                itl_sum: 0.0,
             },
         );
 
@@ -1454,7 +1509,9 @@ mod tests {
         assert!(params.include_stop_str_in_output);
     }
 
-    fn make_completion_request(prompt: Option<protocol::CompletionPrompt>) -> protocol::CompletionRequest {
+    fn make_completion_request(
+        prompt: Option<protocol::CompletionPrompt>,
+    ) -> protocol::CompletionRequest {
         protocol::CompletionRequest {
             model: None,
             prompt,
@@ -1526,9 +1583,8 @@ mod tests {
         let engine = Arc::new(make_test_engine());
         engine.spawn_step_loop();
 
-        let request = make_completion_request(
-            Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])),
-        );
+        let request =
+            make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])));
         let response = engine.completion(request).await.unwrap();
 
         assert_eq!(response.choices.len(), 1);
@@ -1541,9 +1597,8 @@ mod tests {
         let engine = Arc::new(make_test_engine());
         engine.spawn_step_loop();
 
-        let mut request = make_completion_request(
-            Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])),
-        );
+        let mut request =
+            make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![1, 2, 3])));
         request.n = 3;
         let response = engine.completion(request).await.unwrap();
 
@@ -1562,12 +1617,11 @@ mod tests {
         let engine = Arc::new(make_test_engine());
         engine.spawn_step_loop();
 
-        let request = make_completion_request(
-            Some(protocol::CompletionPrompt::MultipleTokenIds(vec![
+        let request =
+            make_completion_request(Some(protocol::CompletionPrompt::MultipleTokenIds(vec![
                 vec![1, 2],
                 vec![3, 4, 5],
-            ])),
-        );
+            ])));
         let response = engine.completion(request).await.unwrap();
 
         assert_eq!(response.choices.len(), 2);
@@ -1582,12 +1636,11 @@ mod tests {
         let engine = Arc::new(make_test_engine());
         engine.spawn_step_loop();
 
-        let mut request = make_completion_request(
-            Some(protocol::CompletionPrompt::MultipleTokenIds(vec![
+        let mut request =
+            make_completion_request(Some(protocol::CompletionPrompt::MultipleTokenIds(vec![
                 vec![1, 2],
                 vec![3, 4, 5],
-            ])),
-        );
+            ])));
         request.n = 2;
         let response = engine.completion(request).await.unwrap();
 
@@ -1610,10 +1663,7 @@ mod tests {
         request.n = 2;
         request.stream = true;
 
-        let (_request_id, _model, mut rx) = engine
-            .chat_completion_stream(request)
-            .await
-            .unwrap();
+        let (_request_id, _model, mut rx) = engine.chat_completion_stream(request).await.unwrap();
 
         // Collect all deltas.
         let mut seen_indices = std::collections::HashSet::new();
@@ -1622,16 +1672,22 @@ mod tests {
         }
 
         // Both choice indices should appear.
-        assert!(seen_indices.contains(&0), "Missing index 0 in stream deltas");
-        assert!(seen_indices.contains(&1), "Missing index 1 in stream deltas");
+        assert!(
+            seen_indices.contains(&0),
+            "Missing index 0 in stream deltas"
+        );
+        assert!(
+            seen_indices.contains(&1),
+            "Missing index 1 in stream deltas"
+        );
     }
 
     #[test]
     fn test_tokenize_completion_prompts_single() {
         let engine = make_test_engine();
-        let request = make_completion_request(
-            Some(protocol::CompletionPrompt::Single("hello".to_string())),
-        );
+        let request = make_completion_request(Some(protocol::CompletionPrompt::Single(
+            "hello".to_string(),
+        )));
         let prompts = engine.tokenize_completion_prompts(&request).unwrap();
         assert_eq!(prompts.len(), 1);
         // Without tokenizer, byte values of "hello".
@@ -1641,12 +1697,10 @@ mod tests {
     #[test]
     fn test_tokenize_completion_prompts_multiple() {
         let engine = make_test_engine();
-        let request = make_completion_request(
-            Some(protocol::CompletionPrompt::Multiple(vec![
-                "foo".to_string(),
-                "bar".to_string(),
-            ])),
-        );
+        let request = make_completion_request(Some(protocol::CompletionPrompt::Multiple(vec![
+            "foo".to_string(),
+            "bar".to_string(),
+        ])));
         let prompts = engine.tokenize_completion_prompts(&request).unwrap();
         assert_eq!(prompts.len(), 2);
     }
@@ -1654,9 +1708,8 @@ mod tests {
     #[test]
     fn test_tokenize_completion_prompts_token_ids() {
         let engine = make_test_engine();
-        let request = make_completion_request(
-            Some(protocol::CompletionPrompt::TokenIds(vec![10, 20, 30])),
-        );
+        let request =
+            make_completion_request(Some(protocol::CompletionPrompt::TokenIds(vec![10, 20, 30])));
         let prompts = engine.tokenize_completion_prompts(&request).unwrap();
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0], vec![10, 20, 30]);
@@ -1686,6 +1739,11 @@ mod tests {
                 stream_tx: Some(tx),
                 detokenizer: None,
                 choice_index: 7,
+                submit_time: Instant::now(),
+                first_token_time: None,
+                last_token_time: None,
+                itl_count: 0,
+                itl_sum: 0.0,
             },
         );
 

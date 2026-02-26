@@ -9,9 +9,8 @@
 use std::sync::OnceLock;
 
 use prometheus::{
-    Histogram, HistogramOpts, IntCounter, IntGauge, Registry,
-    register_histogram_with_registry, register_int_counter_with_registry,
-    register_int_gauge_with_registry,
+    Histogram, HistogramOpts, IntCounter, IntGauge, Registry, register_histogram_with_registry,
+    register_int_counter_with_registry, register_int_gauge_with_registry,
 };
 
 static METRICS: OnceLock<VllmMetrics> = OnceLock::new();
@@ -36,6 +35,8 @@ pub struct VllmMetrics {
     pub request_latency_seconds: Histogram,
     /// Time to first token in seconds.
     pub time_to_first_token_seconds: Histogram,
+    /// Inter-token latency in seconds.
+    pub inter_token_latency_seconds: Histogram,
 
     // -- Token counters --
     /// Total number of output tokens generated.
@@ -111,6 +112,18 @@ impl VllmMetrics {
             )
             .unwrap();
 
+            let inter_token_latency_seconds = register_histogram_with_registry!(
+                HistogramOpts::new(
+                    "inter_token_latency_seconds",
+                    "Inter-token latency in seconds",
+                )
+                .buckets(vec![
+                    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+                ]),
+                registry
+            )
+            .unwrap();
+
             let output_tokens_total = register_int_counter_with_registry!(
                 "output_tokens_total",
                 "Total number of output tokens generated",
@@ -154,6 +167,7 @@ impl VllmMetrics {
                 requests_active,
                 request_latency_seconds,
                 time_to_first_token_seconds,
+                inter_token_latency_seconds,
                 output_tokens_total,
                 prompt_tokens_total,
                 gpu_cache_usage,

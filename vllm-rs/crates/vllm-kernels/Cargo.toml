@@ -11,7 +11,7 @@ default = []
 # Requires nvcc and CUDA toolkit.
 cuda = []
 # Enable Metal GPU compute on Apple Silicon.
-metal = ["candle-core/metal", "candle-core/accelerate"]
+metal = ["candle-core/metal"]
 
 [dependencies]
 vllm-common = { workspace = true }

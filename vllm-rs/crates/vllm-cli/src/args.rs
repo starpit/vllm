@@ -48,8 +48,9 @@ pub struct ServeArgs {
     #[arg(long, default_value = "auto")]
     pub device: String,
 
-    /// Weight dtype: "f32", "f16", "bf16".
-    #[arg(long, default_value = "f32")]
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    /// "auto" reads torch_dtype from config.json (default).
+    #[arg(long, default_value = "auto")]
     pub dtype: String,
 
     /// Maximum model context length (overrides config.json).
@@ -108,8 +109,8 @@ pub struct BenchArgs {
     #[arg(long, default_value = "auto")]
     pub device: String,
 
-    /// Weight dtype.
-    #[arg(long, default_value = "f32")]
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
     pub dtype: String,
 
     /// Number of requests to send.

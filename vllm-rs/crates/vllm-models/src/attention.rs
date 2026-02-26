@@ -74,6 +74,8 @@ pub fn scaled_dot_product_attention(
     // Apply causal mask if needed.
     // Single-token decode (q_len == 1): the token can attend to all kv_len
     // positions, so no masking is needed.
+    let input_dtype = scores_scaled.dtype();
+
     if q_len > 1 {
         let mask =
             create_causal_mask(q_len, kv_len, scores_scaled.dtype(), scores_scaled.device())?;
@@ -81,15 +83,49 @@ pub fn scaled_dot_product_attention(
             .broadcast_add(&mask)
             .map_err(ModelError::Candle)?;
 
-        let attn_weights = softmax_last_dim(&scores_masked)?;
+        // Upcast to f32 for softmax numerical stability, then cast back.
+        let scores_for_softmax = if needs_upcast(input_dtype) {
+            scores_masked
+                .to_dtype(DType::F32)
+                .map_err(ModelError::Candle)?
+        } else {
+            scores_masked
+        };
+        let attn_weights = softmax_last_dim(&scores_for_softmax)?;
+        let attn_weights = if needs_upcast(input_dtype) {
+            attn_weights
+                .to_dtype(input_dtype)
+                .map_err(ModelError::Candle)?
+        } else {
+            attn_weights
+        };
         let output = attn_weights.matmul(&v_t).map_err(ModelError::Candle)?;
         output.transpose(0, 1).map_err(ModelError::Candle)
     } else {
         // Single token: no masking needed.
-        let attn_weights = softmax_last_dim(&scores_scaled)?;
+        let scores_for_softmax = if needs_upcast(input_dtype) {
+            scores_scaled
+                .to_dtype(DType::F32)
+                .map_err(ModelError::Candle)?
+        } else {
+            scores_scaled
+        };
+        let attn_weights = softmax_last_dim(&scores_for_softmax)?;
+        let attn_weights = if needs_upcast(input_dtype) {
+            attn_weights
+                .to_dtype(input_dtype)
+                .map_err(ModelError::Candle)?
+        } else {
+            attn_weights
+        };
         let output = attn_weights.matmul(&v_t).map_err(ModelError::Candle)?;
         output.transpose(0, 1).map_err(ModelError::Candle)
     }
+}
+
+/// Returns `true` if the dtype should be upcast to f32 for reduction ops.
+fn needs_upcast(dtype: DType) -> bool {
+    matches!(dtype, DType::F16 | DType::BF16)
 }
 
 /// Repeat KV heads to match the number of query heads (for GQA).
@@ -329,5 +365,36 @@ mod tests {
         // Higher logit = higher probability.
         assert!(vals[2] > vals[1]);
         assert!(vals[1] > vals[0]);
+    }
+
+    #[test]
+    fn test_attention_f16() {
+        let seq_len = 3;
+        let num_heads = 2;
+        let head_dim = 4;
+
+        let q = Tensor::ones(&[seq_len, num_heads, head_dim], DType::F16, &Device::Cpu).unwrap();
+        let k = Tensor::ones(&[seq_len, num_heads, head_dim], DType::F16, &Device::Cpu).unwrap();
+        let v = Tensor::ones(&[seq_len, num_heads, head_dim], DType::F16, &Device::Cpu).unwrap();
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let out = scaled_dot_product_attention(&q, &k, &v, scale).unwrap();
+        assert_eq!(out.dims(), &[seq_len, num_heads, head_dim]);
+        assert_eq!(out.dtype(), DType::F16);
+    }
+
+    #[test]
+    fn test_attention_f16_decode() {
+        let num_heads = 2;
+        let head_dim = 4;
+
+        let q = Tensor::ones(&[1, num_heads, head_dim], DType::F16, &Device::Cpu).unwrap();
+        let k = Tensor::ones(&[4, num_heads, head_dim], DType::F16, &Device::Cpu).unwrap();
+        let v = Tensor::ones(&[4, num_heads, head_dim], DType::F16, &Device::Cpu).unwrap();
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let out = scaled_dot_product_attention(&q, &k, &v, scale).unwrap();
+        assert_eq!(out.dims(), &[1, num_heads, head_dim]);
+        assert_eq!(out.dtype(), DType::F16);
     }
 }

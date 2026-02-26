@@ -7,7 +7,7 @@ description = "Worker/process management and distributed coordination for vLLM R
 
 [features]
 default = []
-metal = ["candle-core/metal", "candle-core/accelerate"]
+metal = ["candle-core/metal"]
 
 [dependencies]
 vllm-common = { workspace = true }

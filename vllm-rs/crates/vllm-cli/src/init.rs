@@ -19,6 +19,8 @@ use vllm_serve::chat_template::ChatTemplate;
 use vllm_serve::engine::AsyncEngine;
 use vllm_serve::tokenizer::Tokenizer;
 
+use candle_core::DType;
+
 use crate::args::ServeArgs;
 
 /// Fully initialized stack ready to serve requests.
@@ -91,7 +93,8 @@ pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
         .context("failed to determine available memory")?;
 
     let block_size = args.block_size;
-    let num_gpu_blocks = compute_num_blocks(available_memory, block_size, &hf_config);
+    let model_dtype = worker.resolved_dtype().unwrap_or(DType::F32);
+    let num_gpu_blocks = compute_num_blocks(available_memory, block_size, &hf_config, model_dtype);
     info!(
         "Available memory: {:.1} GB, num_gpu_blocks={}",
         available_memory as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -216,14 +219,16 @@ fn compute_num_blocks(
     available_bytes: usize,
     block_size: usize,
     hf_config: &HfModelConfig,
+    dtype: DType,
 ) -> usize {
     let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
     let num_kv_heads = hf_config.num_kv_heads().unwrap_or(0);
     let head_dim = hf_config.head_dim().unwrap_or(0);
 
     // Each block holds block_size tokens of KV for all layers.
-    // KV per token per layer = 2 * num_kv_heads * head_dim * sizeof(f32)
-    let bytes_per_token_per_layer = 2 * num_kv_heads * head_dim * 4; // f32
+    // KV per token per layer = 2 * num_kv_heads * head_dim * sizeof(dtype)
+    let elem_bytes = vllm_model::tensor::dtype_size(dtype);
+    let bytes_per_token_per_layer = 2 * num_kv_heads * head_dim * elem_bytes;
     let bytes_per_block = block_size * num_layers * bytes_per_token_per_layer;
 
     if bytes_per_block == 0 {
@@ -285,14 +290,31 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config);
+        let blocks = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F32);
         assert!(blocks >= 16);
+    }
+
+    #[test]
+    fn test_compute_num_blocks_f16_more_blocks() {
+        // F16 uses half the bytes per element → should yield ~2x as many blocks.
+        let config = HfModelConfig {
+            num_hidden_layers: Some(32),
+            num_attention_heads: Some(32),
+            num_key_value_heads: Some(8),
+            hidden_size: Some(4096),
+            ..Default::default()
+        };
+        let blocks_f32 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F32);
+        let blocks_f16 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16);
+        assert!(blocks_f16 > blocks_f32);
+        // F16 should give approximately 2x the blocks.
+        assert!((blocks_f16 as f64 / blocks_f32 as f64 - 2.0).abs() < 0.1);
     }
 
     #[test]
     fn test_compute_num_blocks_zero_dim() {
         let config = HfModelConfig::default();
-        let blocks = compute_num_blocks(1024, 16, &config);
+        let blocks = compute_num_blocks(1024, 16, &config, DType::F32);
         // Should fall back to 1024.
         assert_eq!(blocks, 1024);
     }

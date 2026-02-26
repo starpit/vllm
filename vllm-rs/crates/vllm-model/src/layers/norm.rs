@@ -10,6 +10,15 @@ use crate::tensor;
 use crate::weight::ModelWeights;
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if the dtype should be upcast to f32 for reduction ops.
+fn needs_upcast(dtype: DType) -> bool {
+    matches!(dtype, DType::F16 | DType::BF16)
+}
+
+// ---------------------------------------------------------------------------
 // RmsNorm
 // ---------------------------------------------------------------------------
 
@@ -65,15 +74,22 @@ impl RmsNorm {
 
 impl Module for RmsNorm {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        // x: [..., hidden_size]
-        // 1. Compute variance = mean(x^2) over last dim
-        let x_sq = x.sqr()?;
-        let variance = x_sq.mean_keepdim(candle_core::D::Minus1)?;
-        // 2. Normalize: x * rsqrt(variance + eps)
-        let rsqrt = (variance + self.eps)?.sqrt()?.recip()?;
-        let normed = x.broadcast_mul(&rsqrt)?;
-        // 3. Scale by weight
-        normed.broadcast_mul(&self.weight)
+        let input_dtype = x.dtype();
+        if needs_upcast(input_dtype) {
+            // Upcast only for the variance reduction (f16/bf16 lack precision
+            // for sqr→mean→sqrt). The rsqrt is shape [.., 1] — tiny to cast.
+            // Keep x in native dtype to avoid 2 full-tensor copies.
+            let x_f32 = x.to_dtype(DType::F32)?;
+            let variance = x_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+            let rsqrt = (variance + self.eps)?.sqrt()?.recip()?;
+            let rsqrt = rsqrt.to_dtype(input_dtype)?; // tiny: [batch, 1]
+            x.broadcast_mul(&rsqrt)?.broadcast_mul(&self.weight)
+        } else {
+            let x_sq = x.sqr()?;
+            let variance = x_sq.mean_keepdim(candle_core::D::Minus1)?;
+            let rsqrt = (variance + self.eps)?.sqrt()?.recip()?;
+            x.broadcast_mul(&rsqrt)?.broadcast_mul(&self.weight)
+        }
     }
 }
 
@@ -135,16 +151,20 @@ impl GemmaRmsNorm {
 
 impl Module for GemmaRmsNorm {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        // x: [..., hidden_size]
-        // 1. Compute variance = mean(x^2) over last dim
-        let x_sq = x.sqr()?;
-        let variance = x_sq.mean_keepdim(candle_core::D::Minus1)?;
-        // 2. Normalize: x * rsqrt(variance + eps)
-        let rsqrt = (variance + self.eps)?.sqrt()?.recip()?;
-        let normed = x.broadcast_mul(&rsqrt)?;
-        // 3. Scale by (1 + weight)
+        let input_dtype = x.dtype();
         let effective_weight = (&self.weight + 1.0)?;
-        normed.broadcast_mul(&effective_weight)
+        if needs_upcast(input_dtype) {
+            let x_f32 = x.to_dtype(DType::F32)?;
+            let variance = x_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+            let rsqrt = (variance + self.eps)?.sqrt()?.recip()?;
+            let rsqrt = rsqrt.to_dtype(input_dtype)?;
+            x.broadcast_mul(&rsqrt)?.broadcast_mul(&effective_weight)
+        } else {
+            let x_sq = x.sqr()?;
+            let variance = x_sq.mean_keepdim(candle_core::D::Minus1)?;
+            let rsqrt = (variance + self.eps)?.sqrt()?.recip()?;
+            x.broadcast_mul(&rsqrt)?.broadcast_mul(&effective_weight)
+        }
     }
 }
 
@@ -306,5 +326,46 @@ mod tests {
         let weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
         let norm = GemmaRmsNorm::load(&weights, "norm", 1e-5, DType::F32).unwrap();
         assert_eq!(norm.hidden_size(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // F16 dtype tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rms_norm_f16_output_dtype() {
+        // F16 input should produce F16 output.
+        let weight = Tensor::ones(&[4], DType::F16, &Device::Cpu).unwrap();
+        let norm = RmsNorm::new(weight, 1e-5);
+
+        let x = Tensor::ones(&[2, 4], DType::F16, &Device::Cpu).unwrap();
+        let y = norm.forward(&x).unwrap();
+        assert_eq!(y.dtype(), DType::F16);
+        assert_eq!(y.dims(), &[2, 4]);
+    }
+
+    #[test]
+    fn test_rms_norm_f16_values() {
+        // Verify numerical correctness: weight=1, input=[1,1,1,1] → output=[1,1,1,1].
+        let weight = Tensor::ones(&[4], DType::F16, &Device::Cpu).unwrap();
+        let norm = RmsNorm::new(weight, 1e-5);
+
+        let x = Tensor::ones(&[1, 4], DType::F16, &Device::Cpu).unwrap();
+        let y = norm.forward(&x).unwrap();
+        let y_f32 = y.to_dtype(DType::F32).unwrap();
+        let vals = y_f32.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for v in vals {
+            assert!((v - 1.0).abs() < 0.01, "expected ~1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_gemma_rms_norm_f16_output_dtype() {
+        let weight = Tensor::zeros(&[4], DType::F16, &Device::Cpu).unwrap();
+        let norm = GemmaRmsNorm::new(weight, 1e-5);
+
+        let x = Tensor::ones(&[2, 4], DType::F16, &Device::Cpu).unwrap();
+        let y = norm.forward(&x).unwrap();
+        assert_eq!(y.dtype(), DType::F16);
     }
 }

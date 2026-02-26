@@ -615,7 +615,9 @@ impl crate::Model for LlamaForCausalLM {
         kv_cache: Option<&mut crate::KvCache>,
     ) -> ModelResult<Tensor> {
         let hidden_states = self.model.forward(input_ids, positions, kv_cache)?;
-        self.compute_logits(&hidden_states)
+        let logits = self.compute_logits(&hidden_states)?;
+        // Cast logits to f32 for sampling (sampler expects f32).
+        logits.to_dtype(DType::F32).map_err(ModelError::Candle)
     }
 
     fn num_layers(&self) -> usize {

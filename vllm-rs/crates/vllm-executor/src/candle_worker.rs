@@ -36,7 +36,8 @@ pub struct CandleWorkerConfig {
     /// Device string: "cpu", "cuda:N", "metal", or "auto".
     pub device_str: String,
 
-    /// Data type for model weights: "f32", "f16", "bf16".
+    /// Data type for model weights: "auto", "f32", "f16", "bf16", etc.
+    /// "auto" resolves from config.json `torch_dtype` at load time.
     pub dtype: String,
 
     /// Optional HuggingFace token for gated models.
@@ -48,11 +49,14 @@ pub struct CandleWorkerConfig {
 
 impl CandleWorkerConfig {
     /// Parse the dtype string to a candle DType.
-    pub fn candle_dtype(&self) -> ExecutorResult<DType> {
+    ///
+    /// Returns `None` for "auto" — the caller must resolve from config.json.
+    pub fn candle_dtype(&self) -> ExecutorResult<Option<DType>> {
         match self.dtype.as_str() {
-            "f32" | "float32" => Ok(DType::F32),
-            "f16" | "float16" => Ok(DType::F16),
-            "bf16" | "bfloat16" => Ok(DType::BF16),
+            "auto" => Ok(None),
+            "f32" | "float32" => Ok(Some(DType::F32)),
+            "f16" | "float16" => Ok(Some(DType::F16)),
+            "bf16" | "bfloat16" => Ok(Some(DType::BF16)),
             other => Err(ExecutorError::Config(format!("unsupported dtype: {other}"))),
         }
     }
@@ -71,6 +75,8 @@ pub struct CandleWorker {
     model_dir: Option<PathBuf>,
     /// Parsed HuggingFace config.json.
     hf_config: Option<HfModelConfig>,
+    /// Resolved model dtype (after auto-detection).
+    resolved_dtype: Option<DType>,
     /// KV cache block counts (stored for reference).
     num_gpu_blocks: usize,
     num_cpu_blocks: usize,
@@ -94,6 +100,7 @@ impl CandleWorker {
             model: None,
             model_dir: None,
             hf_config: None,
+            resolved_dtype: None,
             num_gpu_blocks: 0,
             num_cpu_blocks: 0,
             is_shutdown: false,
@@ -111,6 +118,11 @@ impl CandleWorker {
     /// Get the parsed HfModelConfig (after `load_model` has been called).
     pub fn hf_config(&self) -> Option<&HfModelConfig> {
         self.hf_config.as_ref()
+    }
+
+    /// Get the resolved model dtype (after `load_model` has been called).
+    pub fn resolved_dtype(&self) -> Option<DType> {
+        self.resolved_dtype
     }
 
     /// Resolve a model path to a local directory.
@@ -236,7 +248,7 @@ impl Worker for CandleWorker {
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerInit("device not initialized".to_string()))?;
 
-        let dtype = self.config.candle_dtype()?;
+        let explicit_dtype = self.config.candle_dtype()?;
 
         // 1. Resolve model directory (local or HF download).
         let model_dir = self.resolve_model_path()?;
@@ -245,6 +257,22 @@ impl Worker for CandleWorker {
         // 2. Parse config.json.
         let hf_config = HfModelConfig::from_dir(&model_dir)
             .map_err(|e| ExecutorError::WorkerInit(format!("failed to parse config.json: {e}")))?;
+
+        // Resolve "auto" dtype: read torch_dtype from config.json, fall back to F16.
+        let dtype = if let Some(dt) = explicit_dtype {
+            dt
+        } else {
+            let resolved = hf_config
+                .torch_dtype
+                .as_deref()
+                .and_then(|s| vllm_model::tensor::dtype_from_str(s).ok())
+                .unwrap_or(DType::F16);
+            info!(
+                "CandleWorker: auto dtype resolved to {}",
+                vllm_model::tensor::dtype_to_str(resolved)
+            );
+            resolved
+        };
 
         // 3. Look up architecture in the registry.
         let arch = hf_config
@@ -277,8 +305,12 @@ impl Worker for CandleWorker {
 
         self.model_dir = Some(model_dir);
         self.hf_config = Some(hf_config);
+        self.resolved_dtype = Some(dtype);
         self.model = Some(model);
-        info!("CandleWorker: model loaded (arch={arch})");
+        info!(
+            "CandleWorker: model loaded (arch={arch}, dtype={:?})",
+            dtype
+        );
         Ok(())
     }
 
@@ -588,11 +620,19 @@ mod tests {
     #[test]
     fn test_config_dtype_parsing() {
         let mut cfg = make_config();
-        assert_eq!(cfg.candle_dtype().unwrap(), DType::F32);
+        assert_eq!(cfg.candle_dtype().unwrap(), Some(DType::F32));
         cfg.dtype = "f16".to_string();
-        assert_eq!(cfg.candle_dtype().unwrap(), DType::F16);
+        assert_eq!(cfg.candle_dtype().unwrap(), Some(DType::F16));
         cfg.dtype = "bf16".to_string();
-        assert_eq!(cfg.candle_dtype().unwrap(), DType::BF16);
+        assert_eq!(cfg.candle_dtype().unwrap(), Some(DType::BF16));
+        cfg.dtype = "auto".to_string();
+        assert_eq!(cfg.candle_dtype().unwrap(), None);
+        cfg.dtype = "float16".to_string();
+        assert_eq!(cfg.candle_dtype().unwrap(), Some(DType::F16));
+        cfg.dtype = "bfloat16".to_string();
+        assert_eq!(cfg.candle_dtype().unwrap(), Some(DType::BF16));
+        cfg.dtype = "float32".to_string();
+        assert_eq!(cfg.candle_dtype().unwrap(), Some(DType::F32));
         cfg.dtype = "invalid".to_string();
         assert!(cfg.candle_dtype().is_err());
     }

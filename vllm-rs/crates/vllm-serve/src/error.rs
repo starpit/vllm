@@ -3,9 +3,9 @@
 
 //! Error types for the serving layer.
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
 use crate::protocol::ErrorResponse;
 

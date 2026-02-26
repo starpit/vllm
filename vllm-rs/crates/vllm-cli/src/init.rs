@@ -46,9 +46,7 @@ pub struct InitializedStack {
 /// 9. Create AsyncEngine
 /// 10. Return InitializedStack
 pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
-    let model_path = args
-        .resolved_model()
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let model_path = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
 
     // 1. Build worker config.
     let worker_config = CandleWorkerConfig {
@@ -108,19 +106,16 @@ pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
 
     // 7. Build engine config and create InprocClient.
     //    Extract EOS token ID from model config if available.
-    let eos_token_id = hf_config
-        .extra
-        .get("eos_token_id")
-        .and_then(|v| {
-            // eos_token_id can be a single int or an array — take the first.
-            if let Some(id) = v.as_u64() {
-                Some(id as u32)
-            } else if let Some(arr) = v.as_array() {
-                arr.first().and_then(|v| v.as_u64()).map(|id| id as u32)
-            } else {
-                None
-            }
-        });
+    let eos_token_id = hf_config.extra.get("eos_token_id").and_then(|v| {
+        // eos_token_id can be a single int or an array — take the first.
+        if let Some(id) = v.as_u64() {
+            Some(id as u32)
+        } else if let Some(arr) = v.as_array() {
+            arr.first().and_then(|v| v.as_u64()).map(|id| id as u32)
+        } else {
+            None
+        }
+    });
     if let Some(eos) = eos_token_id {
         info!("EOS token ID: {}", eos);
     }
@@ -273,10 +268,7 @@ mod tests {
 
     #[test]
     fn test_extract_model_name_local_path() {
-        assert_eq!(
-            extract_model_name("/home/user/models/my-model"),
-            "my-model"
-        );
+        assert_eq!(extract_model_name("/home/user/models/my-model"), "my-model");
     }
 
     #[test]

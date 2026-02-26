@@ -37,7 +37,12 @@ impl Linear {
         let in_features = weight.dim(1).unwrap_or(0);
         // Pre-transpose + contiguous so forward is a single matmul.
         let weight_t = weight.t().unwrap().contiguous().unwrap();
-        Self { weight: weight_t, bias, out_features, in_features }
+        Self {
+            weight: weight_t,
+            bias,
+            out_features,
+            in_features,
+        }
     }
 
     /// Load a linear layer from model weights.
@@ -58,7 +63,12 @@ impl Linear {
     }
 
     /// Create a zero-initialized linear layer (for testing).
-    pub fn zeros(in_features: usize, out_features: usize, dtype: DType, device: &Device) -> ModelResult<Self> {
+    pub fn zeros(
+        in_features: usize,
+        out_features: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> ModelResult<Self> {
         let weight = tensor::zeros(&[out_features, in_features], dtype, device)?;
         Ok(Self::new(weight, None))
     }
@@ -281,11 +291,7 @@ mod tests {
         let linear = Linear::new(weight, None);
 
         // Batch of 3
-        let x = Tensor::new(
-            &[[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]],
-            &Device::Cpu,
-        )
-        .unwrap();
+        let x = Tensor::new(&[[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]], &Device::Cpu).unwrap();
         let y = linear.forward(&x).unwrap();
         assert_eq!(y.dims(), &[3, 2]);
     }
@@ -312,10 +318,7 @@ mod tests {
             .iter()
             .flat_map(|f| f.to_le_bytes())
             .collect();
-        let b_data: Vec<u8> = [0.5f32, 0.5]
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let b_data: Vec<u8> = [0.5f32, 0.5].iter().flat_map(|f| f.to_le_bytes()).collect();
 
         crate::weight::tests_helper::create_safetensors_file(
             &path,

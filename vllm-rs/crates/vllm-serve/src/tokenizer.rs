@@ -32,9 +32,8 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Load a tokenizer from a `tokenizer.json` file.
     pub fn from_file(path: impl AsRef<Path>) -> ServeResult<Self> {
-        let inner = HfTokenizer::from_file(path).map_err(|e| {
-            ServeError::Engine(format!("Failed to load tokenizer: {e}"))
-        })?;
+        let inner = HfTokenizer::from_file(path)
+            .map_err(|e| ServeError::Engine(format!("Failed to load tokenizer: {e}")))?;
         Ok(Self::from_hf_tokenizer(inner))
     }
 
@@ -53,26 +52,19 @@ impl Tokenizer {
     }
 
     /// Encode text into token IDs.
-    pub fn encode(
-        &self,
-        text: &str,
-        add_special_tokens: bool,
-    ) -> ServeResult<Vec<u32>> {
-        let encoding = self.inner.encode(text, add_special_tokens).map_err(|e| {
-            ServeError::Engine(format!("Tokenization failed: {e}"))
-        })?;
+    pub fn encode(&self, text: &str, add_special_tokens: bool) -> ServeResult<Vec<u32>> {
+        let encoding = self
+            .inner
+            .encode(text, add_special_tokens)
+            .map_err(|e| ServeError::Engine(format!("Tokenization failed: {e}")))?;
         Ok(encoding.get_ids().to_vec())
     }
 
     /// Decode token IDs back into text.
-    pub fn decode(
-        &self,
-        ids: &[u32],
-        skip_special_tokens: bool,
-    ) -> ServeResult<String> {
-        self.inner.decode(ids, skip_special_tokens).map_err(|e| {
-            ServeError::Engine(format!("Detokenization failed: {e}"))
-        })
+    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> ServeResult<String> {
+        self.inner
+            .decode(ids, skip_special_tokens)
+            .map_err(|e| ServeError::Engine(format!("Detokenization failed: {e}")))
     }
 
     /// Get the string representation of a single token ID.

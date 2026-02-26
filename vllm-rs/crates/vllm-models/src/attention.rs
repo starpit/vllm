@@ -45,17 +45,23 @@ pub fn scaled_dot_product_attention(
     };
 
     // Transpose to [num_heads, seq_len, head_dim] for batched matmul.
-    let q_t = q.transpose(0, 1).map_err(ModelError::Candle)?;    // [num_q_heads, q_len, head_dim]
+    let q_t = q.transpose(0, 1).map_err(ModelError::Candle)?; // [num_q_heads, q_len, head_dim]
     let k_t = k_expanded.transpose(0, 1).map_err(ModelError::Candle)?; // [num_q_heads, kv_len, head_dim]
-    let v_t = v_expanded.transpose(0, 1).map_err(ModelError::Candle)?
-        .contiguous().map_err(ModelError::Candle)?;
+    let v_t = v_expanded
+        .transpose(0, 1)
+        .map_err(ModelError::Candle)?
+        .contiguous()
+        .map_err(ModelError::Candle)?;
 
     // Attention scores: Q * K^T * scale → [num_q_heads, q_len, kv_len]
     // Make tensors contiguous after transpose — required by Accelerate BLAS
     // and Metal matmul kernels which do not support strided inputs.
     let q_t = q_t.contiguous().map_err(ModelError::Candle)?;
-    let k_tr = k_t.transpose(1, 2).map_err(ModelError::Candle)?
-        .contiguous().map_err(ModelError::Candle)?;
+    let k_tr = k_t
+        .transpose(1, 2)
+        .map_err(ModelError::Candle)?
+        .contiguous()
+        .map_err(ModelError::Candle)?;
     let scores = q_t.matmul(&k_tr).map_err(ModelError::Candle)?;
     let scores_scaled = (scores * scale).map_err(ModelError::Candle)?;
 
@@ -63,8 +69,11 @@ pub fn scaled_dot_product_attention(
     // Single-token decode (q_len == 1): the token can attend to all kv_len
     // positions, so no masking is needed.
     if q_len > 1 {
-        let mask = create_causal_mask(q_len, kv_len, scores_scaled.dtype(), scores_scaled.device())?;
-        let scores_masked = scores_scaled.broadcast_add(&mask).map_err(ModelError::Candle)?;
+        let mask =
+            create_causal_mask(q_len, kv_len, scores_scaled.dtype(), scores_scaled.device())?;
+        let scores_masked = scores_scaled
+            .broadcast_add(&mask)
+            .map_err(ModelError::Candle)?;
 
         let attn_weights = softmax_last_dim(&scores_masked)?;
         let output = attn_weights.matmul(&v_t).map_err(ModelError::Candle)?;
@@ -283,7 +292,7 @@ mod tests {
     #[test]
     fn test_repeat_kv() {
         let x = Tensor::new(
-            &[[[1.0f32, 2.0], [3.0, 4.0]]],  // [1, 2, 2]
+            &[[[1.0f32, 2.0], [3.0, 4.0]]], // [1, 2, 2]
             &Device::Cpu,
         )
         .unwrap();

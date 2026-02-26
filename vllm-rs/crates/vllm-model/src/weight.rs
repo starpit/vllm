@@ -16,8 +16,8 @@ use candle_core::{DType, Device, Tensor};
 use safetensors::SafeTensors;
 use serde::{Deserialize, Serialize};
 
-use crate::tensor::{self, TensorInfo};
 use crate::error::{ModelError, ModelResult};
+use crate::tensor::{self, TensorInfo};
 
 // ---------------------------------------------------------------------------
 // SafeTensors file reader
@@ -67,7 +67,8 @@ impl SafeTensorsFile {
             .map_err(|e| ModelError::SafeTensors(format!("{}: {}", self.path.display(), e)))?;
         let mut infos = Vec::new();
         for name in st.names() {
-            let view = st.tensor(name)
+            let view = st
+                .tensor(name)
                 .map_err(|e| ModelError::SafeTensors(format!("{}: {}", name, e)))?;
             let dtype = safetensors_dtype_to_candle(view.dtype())?;
             infos.push(TensorInfo {
@@ -83,7 +84,8 @@ impl SafeTensorsFile {
     pub fn load_tensor(&self, name: &str, device: &Device) -> ModelResult<Tensor> {
         let st = SafeTensors::deserialize(&self.data)
             .map_err(|e| ModelError::SafeTensors(format!("{}: {}", self.path.display(), e)))?;
-        let view = st.tensor(name)
+        let view = st
+            .tensor(name)
             .map_err(|e| ModelError::SafeTensors(format!("{}: {}", name, e)))?;
         let dtype = safetensors_dtype_to_candle(view.dtype())?;
         tensor::from_raw_bytes(view.data(), view.shape(), dtype, device)
@@ -110,7 +112,8 @@ impl SafeTensorsFile {
             .map_err(|e| ModelError::SafeTensors(format!("{}: {}", self.path.display(), e)))?;
         let mut tensors = Vec::new();
         for name in st.names() {
-            let view = st.tensor(name)
+            let view = st
+                .tensor(name)
                 .map_err(|e| ModelError::SafeTensors(format!("{}: {}", name, e)))?;
             let dtype = safetensors_dtype_to_candle(view.dtype())?;
             let tensor = tensor::from_raw_bytes(view.data(), view.shape(), dtype, device)?;
@@ -289,10 +292,13 @@ impl ModelWeights {
 
     /// Total size in bytes of all loaded tensors.
     pub fn total_size_bytes(&self) -> usize {
-        self.tensors.values().map(|t| {
-            let elements: usize = t.dims().iter().product();
-            elements * tensor::dtype_size(t.dtype())
-        }).sum()
+        self.tensors
+            .values()
+            .map(|t| {
+                let elements: usize = t.dims().iter().product();
+                elements * tensor::dtype_size(t.dtype())
+            })
+            .sum()
     }
 
     /// Remove a tensor from the loaded set (e.g., after loading into a layer).
@@ -394,12 +400,11 @@ impl HfModelConfig {
 
     /// Effective head dimension.
     pub fn head_dim(&self) -> Option<usize> {
-        self.head_dim.or_else(|| {
-            match (self.hidden_size, self.num_attention_heads) {
+        self.head_dim
+            .or_else(|| match (self.hidden_size, self.num_attention_heads) {
                 (Some(h), Some(n)) if n > 0 => Some(h / n),
                 _ => None,
-            }
-        })
+            })
     }
 
     /// Effective number of KV heads (defaults to num_attention_heads for MHA).
@@ -409,9 +414,7 @@ impl HfModelConfig {
 
     /// Effective norm epsilon.
     pub fn norm_eps(&self) -> f64 {
-        self.rms_norm_eps
-            .or(self.layer_norm_eps)
-            .unwrap_or(1e-5)
+        self.rms_norm_eps.or(self.layer_norm_eps).unwrap_or(1e-5)
     }
 }
 
@@ -457,7 +460,10 @@ pub mod tests_helper {
             .iter()
             .map(|(name, shape, dtype, data)| {
                 let st_dtype = candle_dtype_to_safetensors(*dtype);
-                (*name, TensorView::new(st_dtype, shape.clone(), data).unwrap())
+                (
+                    *name,
+                    TensorView::new(st_dtype, shape.clone(), data).unwrap(),
+                )
             })
             .collect();
 
@@ -499,10 +505,7 @@ mod tests {
             .iter()
             .flat_map(|f| f.to_le_bytes())
             .collect();
-        let data2: Vec<u8> = [5.0f32, 6.0]
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let data2: Vec<u8> = [5.0f32, 6.0].iter().flat_map(|f| f.to_le_bytes()).collect();
 
         create_safetensors_file(
             &path,
@@ -545,15 +548,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.safetensors");
 
-        let data: Vec<u8> = [1.0f32, 2.0]
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let data: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|f| f.to_le_bytes()).collect();
 
         create_safetensors_file(&path, &[("x", vec![2], DType::F32, &data)]);
 
         let file = SafeTensorsFile::open(&path).unwrap();
-        let tensor = file.load_tensor_cast("x", DType::F64, &Device::Cpu).unwrap();
+        let tensor = file
+            .load_tensor_cast("x", DType::F64, &Device::Cpu)
+            .unwrap();
         assert_eq!(tensor.dtype(), DType::F64);
         let vals = tensor.to_vec1::<f64>().unwrap();
         assert!((vals[0] - 1.0).abs() < 1e-6);
@@ -645,10 +647,7 @@ mod tests {
             .iter()
             .flat_map(|f| f.to_le_bytes())
             .collect();
-        let data2: Vec<u8> = [5.0f32, 6.0]
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let data2: Vec<u8> = [5.0f32, 6.0].iter().flat_map(|f| f.to_le_bytes()).collect();
 
         create_safetensors_file(
             &path,
@@ -692,11 +691,7 @@ mod tests {
                 "w2": "model-00002-of-00002.safetensors"
             }
         }"#;
-        std::fs::write(
-            dir.path().join("model.safetensors.index.json"),
-            index_json,
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"), index_json).unwrap();
 
         let weights = ModelWeights::from_dir(dir.path(), &Device::Cpu).unwrap();
         assert_eq!(weights.len(), 2);
@@ -832,9 +827,21 @@ mod tests {
 
     #[test]
     fn test_safetensors_dtype_conversion() {
-        assert_eq!(safetensors_dtype_to_candle(safetensors::Dtype::F16).unwrap(), DType::F16);
-        assert_eq!(safetensors_dtype_to_candle(safetensors::Dtype::BF16).unwrap(), DType::BF16);
-        assert_eq!(safetensors_dtype_to_candle(safetensors::Dtype::F32).unwrap(), DType::F32);
-        assert_eq!(safetensors_dtype_to_candle(safetensors::Dtype::U8).unwrap(), DType::U8);
+        assert_eq!(
+            safetensors_dtype_to_candle(safetensors::Dtype::F16).unwrap(),
+            DType::F16
+        );
+        assert_eq!(
+            safetensors_dtype_to_candle(safetensors::Dtype::BF16).unwrap(),
+            DType::BF16
+        );
+        assert_eq!(
+            safetensors_dtype_to_candle(safetensors::Dtype::F32).unwrap(),
+            DType::F32
+        );
+        assert_eq!(
+            safetensors_dtype_to_candle(safetensors::Dtype::U8).unwrap(),
+            DType::U8
+        );
     }
 }

@@ -8,9 +8,9 @@
 //!
 //! Port of: `vllm/model_executor/model_loader/` and `vllm/model_executor/layers/`
 
+pub mod layers;
 pub mod tensor;
 pub mod weight;
-pub mod layers;
 
 // The error module is defined in tensor.rs and re-exported here for convenience.
 pub use tensor::error;

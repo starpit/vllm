@@ -66,7 +66,9 @@ impl Gemma2Config {
         let num_attention_heads = config
             .num_attention_heads
             .ok_or_else(|| ModelError::Other("missing num_attention_heads".into()))?;
-        let head_dim = config.head_dim().unwrap_or(hidden_size / num_attention_heads);
+        let head_dim = config
+            .head_dim()
+            .unwrap_or(hidden_size / num_attention_heads);
 
         // Gemma2-specific config fields from `extra`.
         let query_pre_attn_scalar = config
@@ -291,22 +293,13 @@ impl Gemma2Attention {
         let q_size = config.num_attention_heads * config.head_dim;
         let kv_size = config.num_kv_heads * config.head_dim;
 
-        let q_proj = ColumnParallelLinear::new(
-            Linear::zeros(hidden, q_size, dtype, device)?,
-            false,
-        );
-        let k_proj = ColumnParallelLinear::new(
-            Linear::zeros(hidden, kv_size, dtype, device)?,
-            false,
-        );
-        let v_proj = ColumnParallelLinear::new(
-            Linear::zeros(hidden, kv_size, dtype, device)?,
-            false,
-        );
-        let o_proj = RowParallelLinear::new(
-            Linear::zeros(q_size, hidden, dtype, device)?,
-            true,
-        );
+        let q_proj =
+            ColumnParallelLinear::new(Linear::zeros(hidden, q_size, dtype, device)?, false);
+        let k_proj =
+            ColumnParallelLinear::new(Linear::zeros(hidden, kv_size, dtype, device)?, false);
+        let v_proj =
+            ColumnParallelLinear::new(Linear::zeros(hidden, kv_size, dtype, device)?, false);
+        let o_proj = RowParallelLinear::new(Linear::zeros(q_size, hidden, dtype, device)?, true);
 
         let rotary_emb = RotaryEmbedding::new(
             config.head_dim,
@@ -339,9 +332,18 @@ impl Gemma2Attention {
     ) -> ModelResult<Tensor> {
         let num_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
 
-        let q = self.q_proj.forward(hidden_states).map_err(ModelError::Candle)?;
-        let k = self.k_proj.forward(hidden_states).map_err(ModelError::Candle)?;
-        let v = self.v_proj.forward(hidden_states).map_err(ModelError::Candle)?;
+        let q = self
+            .q_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
+        let k = self
+            .k_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
+        let v = self
+            .v_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
 
         let q = q
             .reshape((num_tokens, self.num_q_heads, self.head_dim))
@@ -422,13 +424,7 @@ impl Gemma2DecoderLayer {
             rank,
             world_size,
         )?;
-        let mlp = Gemma2MLP::load(
-            weights,
-            &format!("{}.mlp", prefix),
-            dtype,
-            rank,
-            world_size,
-        )?;
+        let mlp = Gemma2MLP::load(weights, &format!("{}.mlp", prefix), dtype, rank, world_size)?;
         let input_layernorm = GemmaRmsNorm::load(
             weights,
             &format!("{}.input_layernorm", prefix),
@@ -527,8 +523,7 @@ impl Gemma2Model {
         rank: usize,
         world_size: usize,
     ) -> ModelResult<Self> {
-        let embed_tokens =
-            Embedding::load(weights, &format!("{}.embed_tokens", prefix), dtype)?;
+        let embed_tokens = Embedding::load(weights, &format!("{}.embed_tokens", prefix), dtype)?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
@@ -614,8 +609,7 @@ impl Gemma2ForCausalLM {
         rank: usize,
         world_size: usize,
     ) -> ModelResult<Self> {
-        let model =
-            Gemma2Model::load(weights, "model", config, dtype, device, rank, world_size)?;
+        let model = Gemma2Model::load(weights, "model", config, dtype, device, rank, world_size)?;
 
         // Gemma always uses tied embeddings.
         let lm_head = Linear::new(model.embed_tokens.weight().clone(), None);
@@ -629,7 +623,10 @@ impl Gemma2ForCausalLM {
 
     /// Compute logits from hidden states, with optional soft capping.
     pub fn compute_logits(&self, hidden_states: &Tensor) -> ModelResult<Tensor> {
-        let logits = self.lm_head.forward(hidden_states).map_err(ModelError::Candle)?;
+        let logits = self
+            .lm_head
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
 
         // Apply soft capping: logits = cap * tanh(logits / cap)
         if let Some(cap) = self.final_logit_softcapping {
@@ -762,8 +759,7 @@ mod tests {
         let attn = Gemma2Attention::zeros(&config, DType::F32, &Device::Cpu).unwrap();
 
         let num_tokens = 4;
-        let x =
-            Tensor::ones(&[num_tokens, config.hidden_size], DType::F32, &Device::Cpu).unwrap();
+        let x = Tensor::ones(&[num_tokens, config.hidden_size], DType::F32, &Device::Cpu).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2, 3], &Device::Cpu).unwrap();
 
         let out = attn.forward(&x, &positions, None).unwrap();
@@ -776,8 +772,7 @@ mod tests {
         let attn = Gemma2Attention::zeros(&config, DType::F32, &Device::Cpu).unwrap();
 
         let num_tokens = 3;
-        let x =
-            Tensor::ones(&[num_tokens, config.hidden_size], DType::F32, &Device::Cpu).unwrap();
+        let x = Tensor::ones(&[num_tokens, config.hidden_size], DType::F32, &Device::Cpu).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2], &Device::Cpu).unwrap();
 
         let out = attn.forward(&x, &positions, None).unwrap();
@@ -795,8 +790,10 @@ mod tests {
         let mut tensor_specs: Vec<(&str, Vec<usize>)> = Vec::new();
 
         // Embedding.
-        tensor_specs
-            .push(("model.embed_tokens.weight", vec![config.vocab_size, config.hidden_size]));
+        tensor_specs.push((
+            "model.embed_tokens.weight",
+            vec![config.vocab_size, config.hidden_size],
+        ));
 
         // Layers.
         for i in 0..config.num_hidden_layers {
@@ -840,21 +837,15 @@ mod tests {
                 vec![config.hidden_size],
             ));
             tensor_specs.push((
-                Box::leak(
-                    format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str(),
-                ),
+                Box::leak(format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str()),
                 vec![config.hidden_size],
             ));
             tensor_specs.push((
-                Box::leak(
-                    format!("{}.pre_feedforward_layernorm.weight", prefix).into_boxed_str(),
-                ),
+                Box::leak(format!("{}.pre_feedforward_layernorm.weight", prefix).into_boxed_str()),
                 vec![config.hidden_size],
             ));
             tensor_specs.push((
-                Box::leak(
-                    format!("{}.post_feedforward_layernorm.weight", prefix).into_boxed_str(),
-                ),
+                Box::leak(format!("{}.post_feedforward_layernorm.weight", prefix).into_boxed_str()),
                 vec![config.hidden_size],
             ));
         }

@@ -8,11 +8,11 @@
 //!
 //! Port of: kernel functions declared in `csrc/ops.h` and `csrc/cache.h`
 
-pub mod error;
+pub mod activation;
 pub mod attention;
 pub mod cache;
+pub mod error;
 pub mod norm;
-pub mod activation;
 pub mod rotary;
 
 pub use error::{KernelError, KernelResult};

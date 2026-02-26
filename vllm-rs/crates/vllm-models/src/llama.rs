@@ -68,7 +68,9 @@ impl LlamaConfig {
             max_position_embeddings: config.max_position_embeddings.unwrap_or(4096),
             rms_norm_eps: config.norm_eps(),
             rope_theta: config.rope_theta.unwrap_or(10000.0),
-            head_dim: config.head_dim().unwrap_or(hidden_size / num_attention_heads),
+            head_dim: config
+                .head_dim()
+                .unwrap_or(hidden_size / num_attention_heads),
             tie_word_embeddings: config.tie_word_embeddings.unwrap_or(false),
         })
     }
@@ -252,31 +254,18 @@ impl LlamaAttention {
     }
 
     /// Create with zero weights (for testing).
-    pub fn zeros(
-        config: &LlamaConfig,
-        dtype: DType,
-        device: &Device,
-    ) -> ModelResult<Self> {
+    pub fn zeros(config: &LlamaConfig, dtype: DType, device: &Device) -> ModelResult<Self> {
         let hidden = config.hidden_size;
         let q_size = config.num_attention_heads * config.head_dim;
         let kv_size = config.num_kv_heads * config.head_dim;
 
-        let q_proj = ColumnParallelLinear::new(
-            Linear::zeros(hidden, q_size, dtype, device)?,
-            false,
-        );
-        let k_proj = ColumnParallelLinear::new(
-            Linear::zeros(hidden, kv_size, dtype, device)?,
-            false,
-        );
-        let v_proj = ColumnParallelLinear::new(
-            Linear::zeros(hidden, kv_size, dtype, device)?,
-            false,
-        );
-        let o_proj = RowParallelLinear::new(
-            Linear::zeros(q_size, hidden, dtype, device)?,
-            true,
-        );
+        let q_proj =
+            ColumnParallelLinear::new(Linear::zeros(hidden, q_size, dtype, device)?, false);
+        let k_proj =
+            ColumnParallelLinear::new(Linear::zeros(hidden, kv_size, dtype, device)?, false);
+        let v_proj =
+            ColumnParallelLinear::new(Linear::zeros(hidden, kv_size, dtype, device)?, false);
+        let o_proj = RowParallelLinear::new(Linear::zeros(q_size, hidden, dtype, device)?, true);
 
         let rotary_emb = RotaryEmbedding::new(
             config.head_dim,
@@ -317,9 +306,18 @@ impl LlamaAttention {
         let num_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
 
         // Q/K/V projections.
-        let q = self.q_proj.forward(hidden_states).map_err(ModelError::Candle)?;
-        let k = self.k_proj.forward(hidden_states).map_err(ModelError::Candle)?;
-        let v = self.v_proj.forward(hidden_states).map_err(ModelError::Candle)?;
+        let q = self
+            .q_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
+        let k = self
+            .k_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
+        let v = self
+            .v_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
 
         // Reshape to [num_tokens, num_heads, head_dim].
         let q = q
@@ -409,13 +407,7 @@ impl LlamaDecoderLayer {
             rank,
             world_size,
         )?;
-        let mlp = LlamaMLP::load(
-            weights,
-            &format!("{}.mlp", prefix),
-            dtype,
-            rank,
-            world_size,
-        )?;
+        let mlp = LlamaMLP::load(weights, &format!("{}.mlp", prefix), dtype, rank, world_size)?;
         let input_layernorm = RmsNorm::load(
             weights,
             &format!("{}.input_layernorm", prefix),
@@ -496,8 +488,7 @@ impl LlamaModel {
         rank: usize,
         world_size: usize,
     ) -> ModelResult<Self> {
-        let embed_tokens =
-            Embedding::load(weights, &format!("{}.embed_tokens", prefix), dtype)?;
+        let embed_tokens = Embedding::load(weights, &format!("{}.embed_tokens", prefix), dtype)?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
@@ -513,8 +504,12 @@ impl LlamaModel {
             layers.push(layer);
         }
 
-        let norm =
-            RmsNorm::load(weights, &format!("{}.norm", prefix), config.rms_norm_eps, dtype)?;
+        let norm = RmsNorm::load(
+            weights,
+            &format!("{}.norm", prefix),
+            config.rms_norm_eps,
+            dtype,
+        )?;
 
         Ok(Self {
             embed_tokens,
@@ -596,7 +591,9 @@ impl LlamaForCausalLM {
 
     /// Compute logits from hidden states.
     pub fn compute_logits(&self, hidden_states: &Tensor) -> ModelResult<Tensor> {
-        self.lm_head.forward(hidden_states).map_err(ModelError::Candle)
+        self.lm_head
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)
     }
 
     /// Access the underlying model backbone.
@@ -703,9 +700,13 @@ mod tests {
     #[test]
     fn test_llama_mlp_forward_zeros() {
         let config = test_config();
-        let mlp =
-            LlamaMLP::zeros(config.hidden_size, config.intermediate_size, DType::F32, &Device::Cpu)
-                .unwrap();
+        let mlp = LlamaMLP::zeros(
+            config.hidden_size,
+            config.intermediate_size,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
 
         let x = Tensor::ones(&[3, config.hidden_size], DType::F32, &Device::Cpu).unwrap();
         let out = mlp.forward(&x).unwrap();
@@ -764,7 +765,10 @@ mod tests {
         let mut tensor_specs: Vec<(&str, Vec<usize>)> = Vec::new();
 
         // Embeddings.
-        tensor_specs.push(("model.embed_tokens.weight", vec![config.vocab_size, config.hidden_size]));
+        tensor_specs.push((
+            "model.embed_tokens.weight",
+            vec![config.vocab_size, config.hidden_size],
+        ));
 
         // Layers.
         for i in 0..config.num_hidden_layers {
@@ -772,24 +776,54 @@ mod tests {
             let q_size = config.num_attention_heads * config.head_dim;
             let kv_size = config.num_kv_heads * config.head_dim;
 
-            tensor_specs.push((Box::leak(format!("{}.self_attn.q_proj.weight", prefix).into_boxed_str()), vec![q_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.k_proj.weight", prefix).into_boxed_str()), vec![kv_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.v_proj.weight", prefix).into_boxed_str()), vec![kv_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.o_proj.weight", prefix).into_boxed_str()), vec![config.hidden_size, q_size]));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.q_proj.weight", prefix).into_boxed_str()),
+                vec![q_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.k_proj.weight", prefix).into_boxed_str()),
+                vec![kv_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.v_proj.weight", prefix).into_boxed_str()),
+                vec![kv_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.o_proj.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size, q_size],
+            ));
 
-            tensor_specs.push((Box::leak(format!("{}.mlp.gate_proj.weight", prefix).into_boxed_str()), vec![config.intermediate_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.mlp.up_proj.weight", prefix).into_boxed_str()), vec![config.intermediate_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.mlp.down_proj.weight", prefix).into_boxed_str()), vec![config.hidden_size, config.intermediate_size]));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.gate_proj.weight", prefix).into_boxed_str()),
+                vec![config.intermediate_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.up_proj.weight", prefix).into_boxed_str()),
+                vec![config.intermediate_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.down_proj.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size, config.intermediate_size],
+            ));
 
-            tensor_specs.push((Box::leak(format!("{}.input_layernorm.weight", prefix).into_boxed_str()), vec![config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str()), vec![config.hidden_size]));
+            tensor_specs.push((
+                Box::leak(format!("{}.input_layernorm.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size],
+            ));
         }
 
         // Final norm.
         tensor_specs.push(("model.norm.weight", vec![config.hidden_size]));
 
         // LM head.
-        tensor_specs.push(("lm_head.weight", vec![config.vocab_size, config.hidden_size]));
+        tensor_specs.push((
+            "lm_head.weight",
+            vec![config.vocab_size, config.hidden_size],
+        ));
 
         // Create safetensors file with small random-ish weights.
         create_test_weights(&path, &tensor_specs);
@@ -818,24 +852,54 @@ mod tests {
         let dtype = DType::F32;
 
         let mut tensor_specs: Vec<(&str, Vec<usize>)> = Vec::new();
-        tensor_specs.push(("model.embed_tokens.weight", vec![config.vocab_size, config.hidden_size]));
+        tensor_specs.push((
+            "model.embed_tokens.weight",
+            vec![config.vocab_size, config.hidden_size],
+        ));
 
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{}", i);
             let q_size = config.num_attention_heads * config.head_dim;
             let kv_size = config.num_kv_heads * config.head_dim;
 
-            tensor_specs.push((Box::leak(format!("{}.self_attn.q_proj.weight", prefix).into_boxed_str()), vec![q_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.k_proj.weight", prefix).into_boxed_str()), vec![kv_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.v_proj.weight", prefix).into_boxed_str()), vec![kv_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.o_proj.weight", prefix).into_boxed_str()), vec![config.hidden_size, q_size]));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.q_proj.weight", prefix).into_boxed_str()),
+                vec![q_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.k_proj.weight", prefix).into_boxed_str()),
+                vec![kv_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.v_proj.weight", prefix).into_boxed_str()),
+                vec![kv_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.o_proj.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size, q_size],
+            ));
 
-            tensor_specs.push((Box::leak(format!("{}.mlp.gate_proj.weight", prefix).into_boxed_str()), vec![config.intermediate_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.mlp.up_proj.weight", prefix).into_boxed_str()), vec![config.intermediate_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.mlp.down_proj.weight", prefix).into_boxed_str()), vec![config.hidden_size, config.intermediate_size]));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.gate_proj.weight", prefix).into_boxed_str()),
+                vec![config.intermediate_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.up_proj.weight", prefix).into_boxed_str()),
+                vec![config.intermediate_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.down_proj.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size, config.intermediate_size],
+            ));
 
-            tensor_specs.push((Box::leak(format!("{}.input_layernorm.weight", prefix).into_boxed_str()), vec![config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str()), vec![config.hidden_size]));
+            tensor_specs.push((
+                Box::leak(format!("{}.input_layernorm.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size],
+            ));
         }
 
         tensor_specs.push(("model.norm.weight", vec![config.hidden_size]));
@@ -866,23 +930,56 @@ mod tests {
         let device = Device::Cpu;
 
         let mut tensor_specs: Vec<(&str, Vec<usize>)> = Vec::new();
-        tensor_specs.push(("model.embed_tokens.weight", vec![config.vocab_size, config.hidden_size]));
+        tensor_specs.push((
+            "model.embed_tokens.weight",
+            vec![config.vocab_size, config.hidden_size],
+        ));
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{}", i);
             let q_size = config.num_attention_heads * config.head_dim;
             let kv_size = config.num_kv_heads * config.head_dim;
-            tensor_specs.push((Box::leak(format!("{}.self_attn.q_proj.weight", prefix).into_boxed_str()), vec![q_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.k_proj.weight", prefix).into_boxed_str()), vec![kv_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.v_proj.weight", prefix).into_boxed_str()), vec![kv_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.o_proj.weight", prefix).into_boxed_str()), vec![config.hidden_size, q_size]));
-            tensor_specs.push((Box::leak(format!("{}.mlp.gate_proj.weight", prefix).into_boxed_str()), vec![config.intermediate_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.mlp.up_proj.weight", prefix).into_boxed_str()), vec![config.intermediate_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.mlp.down_proj.weight", prefix).into_boxed_str()), vec![config.hidden_size, config.intermediate_size]));
-            tensor_specs.push((Box::leak(format!("{}.input_layernorm.weight", prefix).into_boxed_str()), vec![config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str()), vec![config.hidden_size]));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.q_proj.weight", prefix).into_boxed_str()),
+                vec![q_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.k_proj.weight", prefix).into_boxed_str()),
+                vec![kv_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.v_proj.weight", prefix).into_boxed_str()),
+                vec![kv_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.o_proj.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size, q_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.gate_proj.weight", prefix).into_boxed_str()),
+                vec![config.intermediate_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.up_proj.weight", prefix).into_boxed_str()),
+                vec![config.intermediate_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.down_proj.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size, config.intermediate_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.input_layernorm.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size],
+            ));
         }
         tensor_specs.push(("model.norm.weight", vec![config.hidden_size]));
-        tensor_specs.push(("lm_head.weight", vec![config.vocab_size, config.hidden_size]));
+        tensor_specs.push((
+            "lm_head.weight",
+            vec![config.vocab_size, config.hidden_size],
+        ));
         create_test_weights(&path, &tensor_specs);
 
         let hf_config: HfModelConfig = serde_json::from_str(&format!(
@@ -942,7 +1039,9 @@ mod tests {
         let x_decode = Tensor::ones(&[1, config.hidden_size], DType::F32, &Device::Cpu).unwrap();
         let pos_decode = Tensor::new(&[4u32], &Device::Cpu).unwrap();
 
-        let out_decode = attn.forward(&x_decode, &pos_decode, Some(&mut cache)).unwrap();
+        let out_decode = attn
+            .forward(&x_decode, &pos_decode, Some(&mut cache))
+            .unwrap();
         assert_eq!(out_decode.dims(), &[1, config.hidden_size]);
 
         // Cache should now hold K/V of length 5.
@@ -961,23 +1060,56 @@ mod tests {
         let dtype = DType::F32;
 
         let mut tensor_specs: Vec<(&str, Vec<usize>)> = Vec::new();
-        tensor_specs.push(("model.embed_tokens.weight", vec![config.vocab_size, config.hidden_size]));
+        tensor_specs.push((
+            "model.embed_tokens.weight",
+            vec![config.vocab_size, config.hidden_size],
+        ));
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{}", i);
             let q_size = config.num_attention_heads * config.head_dim;
             let kv_size = config.num_kv_heads * config.head_dim;
-            tensor_specs.push((Box::leak(format!("{}.self_attn.q_proj.weight", prefix).into_boxed_str()), vec![q_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.k_proj.weight", prefix).into_boxed_str()), vec![kv_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.v_proj.weight", prefix).into_boxed_str()), vec![kv_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.o_proj.weight", prefix).into_boxed_str()), vec![config.hidden_size, q_size]));
-            tensor_specs.push((Box::leak(format!("{}.mlp.gate_proj.weight", prefix).into_boxed_str()), vec![config.intermediate_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.mlp.up_proj.weight", prefix).into_boxed_str()), vec![config.intermediate_size, config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.mlp.down_proj.weight", prefix).into_boxed_str()), vec![config.hidden_size, config.intermediate_size]));
-            tensor_specs.push((Box::leak(format!("{}.input_layernorm.weight", prefix).into_boxed_str()), vec![config.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str()), vec![config.hidden_size]));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.q_proj.weight", prefix).into_boxed_str()),
+                vec![q_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.k_proj.weight", prefix).into_boxed_str()),
+                vec![kv_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.v_proj.weight", prefix).into_boxed_str()),
+                vec![kv_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.o_proj.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size, q_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.gate_proj.weight", prefix).into_boxed_str()),
+                vec![config.intermediate_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.up_proj.weight", prefix).into_boxed_str()),
+                vec![config.intermediate_size, config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.down_proj.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size, config.intermediate_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.input_layernorm.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str()),
+                vec![config.hidden_size],
+            ));
         }
         tensor_specs.push(("model.norm.weight", vec![config.hidden_size]));
-        tensor_specs.push(("lm_head.weight", vec![config.vocab_size, config.hidden_size]));
+        tensor_specs.push((
+            "lm_head.weight",
+            vec![config.vocab_size, config.hidden_size],
+        ));
         create_test_weights(&path, &tensor_specs);
 
         let weights = ModelWeights::from_single_file(&path, &device).unwrap();
@@ -987,12 +1119,15 @@ mod tests {
         let mut kv_cache: crate::KvCache = vec![None; model.model().num_layers()];
         let input_ids = Tensor::new(&[1u32, 5, 10], &device).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2], &device).unwrap();
-        let logits = crate::Model::forward(&model, &input_ids, &positions, Some(&mut kv_cache)).unwrap();
+        let logits =
+            crate::Model::forward(&model, &input_ids, &positions, Some(&mut kv_cache)).unwrap();
         assert_eq!(logits.dims(), &[3, config.vocab_size]);
 
         // All layers should have caches populated.
         for (i, entry) in kv_cache.iter().enumerate() {
-            let (k, v) = entry.as_ref().unwrap_or_else(|| panic!("layer {i} cache empty"));
+            let (k, v) = entry
+                .as_ref()
+                .unwrap_or_else(|| panic!("layer {i} cache empty"));
             assert_eq!(k.dim(0).unwrap(), 3, "layer {i} K length");
             assert_eq!(v.dim(0).unwrap(), 3, "layer {i} V length");
         }
@@ -1000,7 +1135,8 @@ mod tests {
         // Decode: 1 token at position 3.
         let decode_ids = Tensor::new(&[15u32], &device).unwrap();
         let decode_pos = Tensor::new(&[3u32], &device).unwrap();
-        let logits2 = crate::Model::forward(&model, &decode_ids, &decode_pos, Some(&mut kv_cache)).unwrap();
+        let logits2 =
+            crate::Model::forward(&model, &decode_ids, &decode_pos, Some(&mut kv_cache)).unwrap();
         assert_eq!(logits2.dims(), &[1, config.vocab_size]);
 
         // Caches should now have length 4.

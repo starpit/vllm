@@ -180,19 +180,10 @@ mod tests {
     #[test]
     fn test_parse_serve_positional_model() {
         // Python-compatible: `vllm serve meta-llama/Llama-3.2-1B`
-        let cli = Cli::parse_from([
-            "vllm",
-            "serve",
-            "meta-llama/Llama-3.2-1B",
-            "--port",
-            "9000",
-        ]);
+        let cli = Cli::parse_from(["vllm", "serve", "meta-llama/Llama-3.2-1B", "--port", "9000"]);
         match cli.command {
             Commands::Serve(args) => {
-                assert_eq!(
-                    args.resolved_model().unwrap(),
-                    "meta-llama/Llama-3.2-1B"
-                );
+                assert_eq!(args.resolved_model().unwrap(), "meta-llama/Llama-3.2-1B");
                 assert_eq!(args.port, 9000);
             }
             _ => panic!("expected Serve command"),
@@ -212,10 +203,7 @@ mod tests {
         ]);
         match cli.command {
             Commands::Serve(args) => {
-                assert_eq!(
-                    args.resolved_model().unwrap(),
-                    "meta-llama/Llama-3.2-1B"
-                );
+                assert_eq!(args.resolved_model().unwrap(), "meta-llama/Llama-3.2-1B");
                 assert_eq!(args.device, "cpu");
             }
             _ => panic!("expected Serve command"),
@@ -224,13 +212,7 @@ mod tests {
 
     #[test]
     fn test_serve_positional_takes_precedence() {
-        let cli = Cli::parse_from([
-            "vllm",
-            "serve",
-            "positional-model",
-            "--model",
-            "flag-model",
-        ]);
+        let cli = Cli::parse_from(["vllm", "serve", "positional-model", "--model", "flag-model"]);
         match cli.command {
             Commands::Serve(args) => {
                 // Positional wins.
@@ -253,13 +235,7 @@ mod tests {
 
     #[test]
     fn test_parse_bench_positional_model() {
-        let cli = Cli::parse_from([
-            "vllm",
-            "bench",
-            "/path/to/model",
-            "--num-requests",
-            "5",
-        ]);
+        let cli = Cli::parse_from(["vllm", "bench", "/path/to/model", "--num-requests", "5"]);
         match cli.command {
             Commands::Bench(args) => {
                 assert_eq!(args.resolved_model().unwrap(), "/path/to/model");
@@ -271,12 +247,7 @@ mod tests {
 
     #[test]
     fn test_parse_bench_flag_model() {
-        let cli = Cli::parse_from([
-            "vllm",
-            "bench",
-            "--model",
-            "/path/to/model",
-        ]);
+        let cli = Cli::parse_from(["vllm", "bench", "--model", "/path/to/model"]);
         match cli.command {
             Commands::Bench(args) => {
                 assert_eq!(args.resolved_model().unwrap(), "/path/to/model");
@@ -288,14 +259,7 @@ mod tests {
     #[test]
     fn test_parse_convert_args() {
         let cli = Cli::parse_from([
-            "vllm",
-            "convert",
-            "--input",
-            "/in",
-            "--output",
-            "/out",
-            "--dtype",
-            "bf16",
+            "vllm", "convert", "--input", "/in", "--output", "/out", "--dtype", "bf16",
         ]);
         match cli.command {
             Commands::Convert(args) => {

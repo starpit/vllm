@@ -96,9 +96,7 @@ impl ParallelConfig {
     /// World size is `pipeline_parallel_size * tensor_parallel_size *
     /// prefill_context_parallel_size`.
     pub fn world_size(&self) -> usize {
-        self.pipeline_parallel_size
-            * self.tensor_parallel_size
-            * self.prefill_context_parallel_size
+        self.pipeline_parallel_size * self.tensor_parallel_size * self.prefill_context_parallel_size
     }
 
     /// World size including data parallelism: `world_size * data_parallel_size`.
@@ -113,11 +111,7 @@ impl ParallelConfig {
 
     /// Number of micro-batches when ubatching is enabled.
     pub fn num_ubatches(&self) -> usize {
-        if self.enable_dbo {
-            2
-        } else {
-            self.ubatch_size
-        }
+        if self.enable_dbo { 2 } else { self.ubatch_size }
     }
 }
 

@@ -40,7 +40,10 @@ pub fn make_block_hash_with_group_id(
 /// # Panics
 /// Panics if `key` has fewer than 4 bytes.
 pub fn get_block_hash(key: &BlockHashWithGroupId) -> BlockHash {
-    assert!(key.len() >= 4, "BlockHashWithGroupId must be at least 4 bytes");
+    assert!(
+        key.len() >= 4,
+        "BlockHashWithGroupId must be at least 4 bytes"
+    );
     key[..key.len() - 4].to_vec()
 }
 

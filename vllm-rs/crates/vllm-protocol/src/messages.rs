@@ -330,10 +330,7 @@ mod tests {
         let encoded = encode(&out).unwrap();
         let decoded: UtilityOutput = decode(&encoded).unwrap();
         assert_eq!(decoded.call_id, 7);
-        assert_eq!(
-            decoded.result,
-            Some(serde_json::json!({"key": "value"}))
-        );
+        assert_eq!(decoded.result, Some(serde_json::json!({"key": "value"})));
     }
 
     #[test]

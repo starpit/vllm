@@ -160,14 +160,10 @@ impl ResolvedParallelConfig {
         let pp_rank = rank / tp_size;
 
         // TP group: all ranks in the same PP stage.
-        let tp_ranks: Vec<usize> = (0..tp_size)
-            .map(|tp| pp_rank * tp_size + tp)
-            .collect();
+        let tp_ranks: Vec<usize> = (0..tp_size).map(|tp| pp_rank * tp_size + tp).collect();
 
         // PP group: all ranks with the same TP rank.
-        let pp_ranks: Vec<usize> = (0..pp_size)
-            .map(|pp| pp * tp_size + tp_rank)
-            .collect();
+        let pp_ranks: Vec<usize> = (0..pp_size).map(|pp| pp * tp_size + tp_rank).collect();
 
         Self {
             world_size,

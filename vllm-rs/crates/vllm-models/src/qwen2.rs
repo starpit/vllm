@@ -135,7 +135,10 @@ mod tests {
         let device = Device::Cpu;
 
         let mut tensor_specs: Vec<(&str, Vec<usize>)> = Vec::new();
-        tensor_specs.push(("model.embed_tokens.weight", vec![c.vocab_size, c.hidden_size]));
+        tensor_specs.push((
+            "model.embed_tokens.weight",
+            vec![c.vocab_size, c.hidden_size],
+        ));
 
         for i in 0..c.num_hidden_layers {
             let prefix = format!("model.layers.{}", i);
@@ -143,20 +146,56 @@ mod tests {
             let kv_size = c.num_kv_heads * c.head_dim;
 
             // Qwen2 has bias on Q/K/V projections.
-            tensor_specs.push((Box::leak(format!("{}.self_attn.q_proj.weight", prefix).into_boxed_str()), vec![q_size, c.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.q_proj.bias", prefix).into_boxed_str()), vec![q_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.k_proj.weight", prefix).into_boxed_str()), vec![kv_size, c.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.k_proj.bias", prefix).into_boxed_str()), vec![kv_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.v_proj.weight", prefix).into_boxed_str()), vec![kv_size, c.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.v_proj.bias", prefix).into_boxed_str()), vec![kv_size]));
-            tensor_specs.push((Box::leak(format!("{}.self_attn.o_proj.weight", prefix).into_boxed_str()), vec![c.hidden_size, q_size]));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.q_proj.weight", prefix).into_boxed_str()),
+                vec![q_size, c.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.q_proj.bias", prefix).into_boxed_str()),
+                vec![q_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.k_proj.weight", prefix).into_boxed_str()),
+                vec![kv_size, c.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.k_proj.bias", prefix).into_boxed_str()),
+                vec![kv_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.v_proj.weight", prefix).into_boxed_str()),
+                vec![kv_size, c.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.v_proj.bias", prefix).into_boxed_str()),
+                vec![kv_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.self_attn.o_proj.weight", prefix).into_boxed_str()),
+                vec![c.hidden_size, q_size],
+            ));
 
-            tensor_specs.push((Box::leak(format!("{}.mlp.gate_proj.weight", prefix).into_boxed_str()), vec![c.intermediate_size, c.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.mlp.up_proj.weight", prefix).into_boxed_str()), vec![c.intermediate_size, c.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.mlp.down_proj.weight", prefix).into_boxed_str()), vec![c.hidden_size, c.intermediate_size]));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.gate_proj.weight", prefix).into_boxed_str()),
+                vec![c.intermediate_size, c.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.up_proj.weight", prefix).into_boxed_str()),
+                vec![c.intermediate_size, c.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.mlp.down_proj.weight", prefix).into_boxed_str()),
+                vec![c.hidden_size, c.intermediate_size],
+            ));
 
-            tensor_specs.push((Box::leak(format!("{}.input_layernorm.weight", prefix).into_boxed_str()), vec![c.hidden_size]));
-            tensor_specs.push((Box::leak(format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str()), vec![c.hidden_size]));
+            tensor_specs.push((
+                Box::leak(format!("{}.input_layernorm.weight", prefix).into_boxed_str()),
+                vec![c.hidden_size],
+            ));
+            tensor_specs.push((
+                Box::leak(format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str()),
+                vec![c.hidden_size],
+            ));
         }
 
         tensor_specs.push(("model.norm.weight", vec![c.hidden_size]));

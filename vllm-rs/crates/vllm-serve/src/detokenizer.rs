@@ -49,7 +49,6 @@ pub struct IncrementalDetokenizer {
     last_output_text_offset: usize,
 
     // -- Stop string handling --
-
     /// Stop strings from sampling params.
     stop_strings: Vec<String>,
 
@@ -120,11 +119,7 @@ impl IncrementalDetokenizer {
     /// `stop_terminated` indicates whether the engine already decided to
     /// stop (e.g., due to a stop token ID match). When true, we skip
     /// stop-string checking since the engine has already handled it.
-    pub fn update(
-        &mut self,
-        new_token_ids: &[u32],
-        stop_terminated: bool,
-    ) -> Option<String> {
+    pub fn update(&mut self, new_token_ids: &[u32], stop_terminated: bool) -> Option<String> {
         if new_token_ids.is_empty() {
             return None;
         }
@@ -330,10 +325,7 @@ mod tests {
     use super::*;
     use crate::tokenizer::make_test_tokenizer;
 
-    fn make_detokenizer(
-        prompt: &str,
-        stop_strings: Vec<String>,
-    ) -> IncrementalDetokenizer {
+    fn make_detokenizer(prompt: &str, stop_strings: Vec<String>) -> IncrementalDetokenizer {
         let tok = Arc::new(make_test_tokenizer());
         let prompt_ids = tok.encode(prompt, false).unwrap();
         IncrementalDetokenizer::new(
@@ -414,18 +406,14 @@ mod tests {
         let prompt = "Hello";
         let prompt_ids = tok.encode(prompt, false).unwrap();
 
-        let mut detok = IncrementalDetokenizer::new(
-            Arc::clone(&tok),
-            &prompt_ids,
-            vec![],
-            0,
-            false,
-            false,
-        );
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
 
         // Encode some continuation text and feed it token by token.
         let continuation = " world";
-        let cont_ids = tok.encode(&format!("{prompt}{continuation}"), false).unwrap();
+        let cont_ids = tok
+            .encode(&format!("{prompt}{continuation}"), false)
+            .unwrap();
         let new_ids = &cont_ids[prompt_ids.len()..];
 
         let stop = detok.update(new_ids, false);
@@ -446,14 +434,8 @@ mod tests {
         let prompt = "Hi";
         let prompt_ids = tok.encode(prompt, false).unwrap();
 
-        let mut detok = IncrementalDetokenizer::new(
-            Arc::clone(&tok),
-            &prompt_ids,
-            vec![],
-            0,
-            false,
-            false,
-        );
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
 
         // Feed tokens in two batches.
         let full = tok.encode(&format!("{prompt} ab cd"), false).unwrap();
@@ -471,10 +453,7 @@ mod tests {
             let combined = format!("{text1}{text2}");
             let full_text = detok.get_next_output_text(true, false);
             // The cumulative text should contain the delta texts.
-            assert!(
-                !full_text.is_empty(),
-                "Expected non-empty output text"
-            );
+            assert!(!full_text.is_empty(), "Expected non-empty output text");
             // The combined delta texts should equal the full text minus any
             // stop buffer effects (no stop strings here).
             assert_eq!(
@@ -500,7 +479,9 @@ mod tests {
         );
 
         // Encode text that contains the stop string.
-        let full = tok.encode(&format!("{prompt} hello STOP bye"), false).unwrap();
+        let full = tok
+            .encode(&format!("{prompt} hello STOP bye"), false)
+            .unwrap();
         let new_ids = &full[prompt_ids.len()..];
 
         let result = detok.update(new_ids, false);
@@ -509,7 +490,10 @@ mod tests {
             assert_eq!(stop_str, "STOP");
             // Output text should not contain STOP (include_stop_str_in_output=false).
             let text = detok.get_next_output_text(true, false);
-            assert!(!text.contains("STOP"), "Stop string should be excluded: {text:?}");
+            assert!(
+                !text.contains("STOP"),
+                "Stop string should be excluded: {text:?}"
+            );
         }
         // If the tokenizer doesn't produce exactly "STOP", the test still
         // passes because the stop string check requires exact text match.
@@ -530,14 +514,19 @@ mod tests {
             false,
         );
 
-        let full = tok.encode(&format!("{prompt} hello STOP bye"), false).unwrap();
+        let full = tok
+            .encode(&format!("{prompt} hello STOP bye"), false)
+            .unwrap();
         let new_ids = &full[prompt_ids.len()..];
 
         let result = detok.update(new_ids, false);
         if let Some(stop_str) = result {
             assert_eq!(stop_str, "STOP");
             let text = detok.get_next_output_text(true, false);
-            assert!(text.contains("STOP"), "Stop string should be included: {text:?}");
+            assert!(
+                text.contains("STOP"),
+                "Stop string should be included: {text:?}"
+            );
         }
     }
 
@@ -588,7 +577,10 @@ mod tests {
         let full = tok.encode(&format!("{prompt} B C"), false).unwrap();
         let new_ids = &full[prompt_ids.len()..];
         let result = detok.update(new_ids, false);
-        assert!(result.is_none(), "Stop string should not trigger before min_tokens");
+        assert!(
+            result.is_none(),
+            "Stop string should not trigger before min_tokens"
+        );
     }
 
     #[test]

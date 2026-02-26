@@ -133,10 +133,8 @@ pub fn from_raw_bytes(
             Tensor::from_slice(doubles, Shape::from_dims(shape), &Device::Cpu)
                 .map_err(ModelError::Candle)?
         }
-        DType::U8 => {
-            Tensor::from_slice(data, Shape::from_dims(shape), &Device::Cpu)
-                .map_err(ModelError::Candle)?
-        }
+        DType::U8 => Tensor::from_slice(data, Shape::from_dims(shape), &Device::Cpu)
+            .map_err(ModelError::Candle)?,
         DType::U32 => {
             let uints: &[u32] =
                 bytemuck_cast_slice(data).ok_or(ModelError::ByteCastError("u32"))?;
@@ -144,8 +142,7 @@ pub fn from_raw_bytes(
                 .map_err(ModelError::Candle)?
         }
         DType::I64 => {
-            let ints: &[i64] =
-                bytemuck_cast_slice(data).ok_or(ModelError::ByteCastError("i64"))?;
+            let ints: &[i64] = bytemuck_cast_slice(data).ok_or(ModelError::ByteCastError("i64"))?;
             Tensor::from_slice(ints, Shape::from_dims(shape), &Device::Cpu)
                 .map_err(ModelError::Candle)?
         }
@@ -262,7 +259,9 @@ pub mod error {
         #[error("byte cast error for type {0}: alignment or size mismatch")]
         ByteCastError(&'static str),
 
-        #[error("sharding error: dim {dim} of size {dim_size} not divisible by world_size {world_size}")]
+        #[error(
+            "sharding error: dim {dim} of size {dim_size} not divisible by world_size {world_size}"
+        )]
         ShardingError {
             dim: usize,
             dim_size: usize,

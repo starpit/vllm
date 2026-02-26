@@ -24,7 +24,7 @@ pub mod scheduler;
 
 pub use block_pool::BlockPool;
 pub use kv_cache_block::{
-    get_block_hash, get_group_id, make_block_hash_with_group_id, BlockHash, BlockHashWithGroupId,
-    KVCacheBlock,
+    BlockHash, BlockHashWithGroupId, KVCacheBlock, get_block_hash, get_group_id,
+    make_block_hash_with_group_id,
 };
 pub use kv_cache_manager::KVCacheManager;

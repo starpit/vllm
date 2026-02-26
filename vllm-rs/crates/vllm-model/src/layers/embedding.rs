@@ -37,7 +37,12 @@ impl Embedding {
     }
 
     /// Create with zeros (for testing).
-    pub fn zeros(vocab_size: usize, hidden_size: usize, dtype: DType, device: &Device) -> ModelResult<Self> {
+    pub fn zeros(
+        vocab_size: usize,
+        hidden_size: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> ModelResult<Self> {
         let weight = tensor::zeros(&[vocab_size, hidden_size], dtype, device)?;
         Ok(Self { weight })
     }

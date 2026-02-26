@@ -11,14 +11,14 @@
 //!
 //! Port of: `vllm/model_executor/layers/`
 
-pub mod linear;
-pub mod norm;
 pub mod activation;
 pub mod embedding;
+pub mod linear;
+pub mod norm;
 pub mod rotary;
 
-pub use linear::{Linear, ColumnParallelLinear, RowParallelLinear};
-pub use norm::{RmsNorm, GemmaRmsNorm};
-pub use activation::{Activation, silu, gelu, relu};
+pub use activation::{Activation, gelu, relu, silu};
 pub use embedding::Embedding;
+pub use linear::{ColumnParallelLinear, Linear, RowParallelLinear};
+pub use norm::{GemmaRmsNorm, RmsNorm};
 pub use rotary::RotaryEmbedding;

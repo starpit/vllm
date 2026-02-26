@@ -7,8 +7,8 @@
 //! Provides FCFS (first-come-first-served) and priority-based queues for
 //! managing waiting requests in the scheduler.
 
-use std::collections::{BinaryHeap, VecDeque};
 use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 
 use vllm_common::Request;
 
@@ -115,11 +115,7 @@ impl RequestQueue for FCFSRequestQueue {
     }
 
     fn remove_request(&mut self, request_id: &str) -> bool {
-        if let Some(pos) = self
-            .inner
-            .iter()
-            .position(|r| r.request_id == request_id)
-        {
+        if let Some(pos) = self.inner.iter().position(|r| r.request_id == request_id) {
             self.inner.remove(pos);
             true
         } else {

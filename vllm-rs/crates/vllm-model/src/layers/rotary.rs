@@ -82,9 +82,7 @@ impl RotaryEmbedding {
         let inv_freq_2d = inv_freq_tensor
             .reshape((1, half_dim))
             .map_err(ModelError::Candle)?;
-        let freqs = pos_2d
-            .matmul(&inv_freq_2d)
-            .map_err(ModelError::Candle)?; // [max_position, half_dim]
+        let freqs = pos_2d.matmul(&inv_freq_2d).map_err(ModelError::Candle)?; // [max_position, half_dim]
 
         // Duplicate freqs for full head_dim: [max_position, head_dim]
         let freqs_full = Tensor::cat(&[&freqs, &freqs], 1).map_err(ModelError::Candle)?;
@@ -164,15 +162,8 @@ impl RotaryEmbedding {
 ///
 /// `x` shape: `[seq_len, num_heads, head_dim]`
 /// `cos`/`sin` shape: `[seq_len, head_dim]`
-fn apply_rotary_to_tensor(
-    x: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-) -> ModelResult<Tensor> {
-    let half_dim = x
-        .dim(candle_core::D::Minus1)
-        .map_err(ModelError::Candle)?
-        / 2;
+fn apply_rotary_to_tensor(x: &Tensor, cos: &Tensor, sin: &Tensor) -> ModelResult<Tensor> {
+    let half_dim = x.dim(candle_core::D::Minus1).map_err(ModelError::Candle)? / 2;
 
     // Split x into first half and second half along last dim.
     let x1 = x
@@ -203,7 +194,11 @@ fn apply_rotary_to_tensor(
     };
 
     let result = (x.broadcast_mul(&cos_b).map_err(ModelError::Candle)?)
-        .add(&x_rotated.broadcast_mul(&sin_b).map_err(ModelError::Candle)?)
+        .add(
+            &x_rotated
+                .broadcast_mul(&sin_b)
+                .map_err(ModelError::Candle)?,
+        )
         .map_err(ModelError::Candle)?;
 
     Ok(result)
@@ -277,19 +272,27 @@ mod tests {
         let rope = RotaryEmbedding::new(4, 10, 10000.0, DType::F32, &Device::Cpu).unwrap();
 
         // cos(0) should be 1 for all frequencies
-        let cos_row0 = rope.cos_cache()
-            .narrow(0, 0, 1).unwrap()
-            .flatten_all().unwrap()
-            .to_vec1::<f32>().unwrap();
+        let cos_row0 = rope
+            .cos_cache()
+            .narrow(0, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         for v in &cos_row0 {
             assert!((v - 1.0).abs() < 1e-5, "cos(0) should be 1, got {}", v);
         }
 
         // sin(0) should be 0 for all frequencies
-        let sin_row0 = rope.sin_cache()
-            .narrow(0, 0, 1).unwrap()
-            .flatten_all().unwrap()
-            .to_vec1::<f32>().unwrap();
+        let sin_row0 = rope
+            .sin_cache()
+            .narrow(0, 0, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         for v in &sin_row0 {
             assert!(v.abs() < 1e-5, "sin(0) should be 0, got {}", v);
         }

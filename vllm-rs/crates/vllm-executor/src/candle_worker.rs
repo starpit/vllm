@@ -175,9 +175,7 @@ impl CandleWorker {
         if let Ok(index_path) = repo.get("model.safetensors.index.json") {
             info!("Downloading sharded model weights...");
             let index = vllm_model::weight::SafeTensorsIndex::from_file(&index_path)
-                .map_err(|e| {
-                    ExecutorError::WorkerInit(format!("failed to parse index: {e}"))
-                })?;
+                .map_err(|e| ExecutorError::WorkerInit(format!("failed to parse index: {e}")))?;
 
             let sorted_shards = index.shard_files();
             let total = sorted_shards.len();
@@ -204,10 +202,7 @@ impl CandleWorker {
                             })
                         })
                         .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().unwrap())
-                        .collect()
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
                 });
 
                 for result in results {
@@ -227,7 +222,10 @@ impl CandleWorker {
 impl Worker for CandleWorker {
     fn init_device(&mut self) -> ExecutorResult<()> {
         let device = parse_device(&self.config.device_str)?;
-        info!("CandleWorker: initialized device {:?}", self.config.device_str);
+        info!(
+            "CandleWorker: initialized device {:?}",
+            self.config.device_str
+        );
         self.device = Some(device);
         Ok(())
     }
@@ -245,9 +243,8 @@ impl Worker for CandleWorker {
         info!("CandleWorker: loading model from {}", model_dir.display());
 
         // 2. Parse config.json.
-        let hf_config = HfModelConfig::from_dir(&model_dir).map_err(|e| {
-            ExecutorError::WorkerInit(format!("failed to parse config.json: {e}"))
-        })?;
+        let hf_config = HfModelConfig::from_dir(&model_dir)
+            .map_err(|e| ExecutorError::WorkerInit(format!("failed to parse config.json: {e}")))?;
 
         // 3. Look up architecture in the registry.
         let arch = hf_config
@@ -266,9 +263,8 @@ impl Worker for CandleWorker {
         })?;
 
         // 4. Load weights.
-        let weights = ModelWeights::from_dir(&model_dir, device).map_err(|e| {
-            ExecutorError::WorkerInit(format!("failed to load weights: {e}"))
-        })?;
+        let weights = ModelWeights::from_dir(&model_dir, device)
+            .map_err(|e| ExecutorError::WorkerInit(format!("failed to load weights: {e}")))?;
         info!(
             "CandleWorker: loaded {} tensors ({:.1} MB)",
             weights.names().len(),
@@ -276,9 +272,8 @@ impl Worker for CandleWorker {
         );
 
         // 5. Construct the model.
-        let model = factory(&weights, &hf_config, dtype, device).map_err(|e| {
-            ExecutorError::WorkerInit(format!("failed to construct model: {e}"))
-        })?;
+        let model = factory(&weights, &hf_config, dtype, device)
+            .map_err(|e| ExecutorError::WorkerInit(format!("failed to construct model: {e}")))?;
 
         self.model_dir = Some(model_dir);
         self.hf_config = Some(hf_config);
@@ -311,12 +306,14 @@ impl Worker for CandleWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
-        let model = self.model.as_ref().ok_or_else(|| {
-            ExecutorError::WorkerExecution("model not loaded".to_string())
-        })?;
-        let device = self.device.as_ref().ok_or_else(|| {
-            ExecutorError::WorkerExecution("device not initialized".to_string())
-        })?;
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerExecution("model not loaded".to_string()))?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerExecution("device not initialized".to_string()))?;
 
         let num_layers = model.num_layers();
 
@@ -438,36 +435,35 @@ impl Worker for CandleWorker {
                 .narrow(0, last_pos, 1)
                 .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
 
-            let sampled = if let Some(params) =
-                self.sampling_params_map.get(req_input.req_id.as_str())
-            {
-                let temp = params.temperature as f32;
-                let top_k = params.top_k.max(0) as usize;
-                let top_p = params.top_p as f32;
+            let sampled =
+                if let Some(params) = self.sampling_params_map.get(req_input.req_id.as_str()) {
+                    let temp = params.temperature as f32;
+                    let top_k = params.top_k.max(0) as usize;
+                    let top_p = params.top_p as f32;
 
-                if temp < 1e-5 {
-                    sampler.greedy(&req_logits).map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("greedy error: {e}"))
-                    })?
-                } else if top_k > 0 || top_p < 1.0 {
-                    sampler
-                        .sample_top_k_top_p(&req_logits, temp, top_k, top_p)
-                        .map_err(|e| {
+                    if temp < 1e-5 {
+                        sampler.greedy(&req_logits).map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("greedy error: {e}"))
+                        })?
+                    } else if top_k > 0 || top_p < 1.0 {
+                        sampler
+                            .sample_top_k_top_p(&req_logits, temp, top_k, top_p)
+                            .map_err(|e| {
+                                ExecutorError::WorkerExecution(format!("sampling error: {e}"))
+                            })?
+                    } else {
+                        sampler.sample(&req_logits, temp).map_err(|e| {
                             ExecutorError::WorkerExecution(format!("sampling error: {e}"))
                         })?
+                    }
                 } else {
-                    sampler.sample(&req_logits, temp).map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("sampling error: {e}"))
-                    })?
-                }
-            } else {
-                let indices = req_logits
-                    .argmax(candle_core::D::Minus1)
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("argmax error: {e}")))?;
-                indices
-                    .to_vec1::<u32>()
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?
-            };
+                    let indices = req_logits.argmax(candle_core::D::Minus1).map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("argmax error: {e}"))
+                    })?;
+                    indices
+                        .to_vec1::<u32>()
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?
+                };
 
             // Update the token buffer with the new sampled token(s).
             if let Some(buf) = self.token_buffers.get_mut(req_input.req_id.as_str()) {
@@ -523,9 +519,8 @@ pub fn parse_device(device_str: &str) -> ExecutorResult<Device> {
             let ordinal = if s == "cuda" {
                 0
             } else if let Some(n) = s.strip_prefix("cuda:") {
-                n.parse::<usize>().map_err(|_| {
-                    ExecutorError::Config(format!("invalid CUDA ordinal: {n}"))
-                })?
+                n.parse::<usize>()
+                    .map_err(|_| ExecutorError::Config(format!("invalid CUDA ordinal: {n}")))?
             } else {
                 return Err(ExecutorError::Config(format!("invalid device: {s}")));
             };
@@ -537,9 +532,8 @@ pub fn parse_device(device_str: &str) -> ExecutorResult<Device> {
             let ordinal = if s == "metal" {
                 0
             } else if let Some(n) = s.strip_prefix("metal:") {
-                n.parse::<usize>().map_err(|_| {
-                    ExecutorError::Config(format!("invalid Metal ordinal: {n}"))
-                })?
+                n.parse::<usize>()
+                    .map_err(|_| ExecutorError::Config(format!("invalid Metal ordinal: {n}")))?
             } else {
                 return Err(ExecutorError::Config(format!("invalid device: {s}")));
             };
@@ -706,10 +700,7 @@ mod tests {
                 Tensor::randn(0f32, 1.0, &[vocab_size, hidden_size], &Device::Cpu).unwrap();
             let lm_head =
                 Tensor::randn(0f32, 1.0, &[vocab_size, hidden_size], &Device::Cpu).unwrap();
-            Self {
-                embedding,
-                lm_head,
-            }
+            Self { embedding, lm_head }
         }
     }
 
@@ -728,7 +719,12 @@ mod tests {
             // hidden: [num_tokens, hidden_size]
             // logits = hidden @ lm_head^T → [num_tokens, vocab_size]
             let logits = hidden
-                .matmul(&self.lm_head.t().map_err(vllm_model::error::ModelError::Candle)?)
+                .matmul(
+                    &self
+                        .lm_head
+                        .t()
+                        .map_err(vllm_model::error::ModelError::Candle)?,
+                )
                 .map_err(vllm_model::error::ModelError::Candle)?;
             Ok(logits)
         }

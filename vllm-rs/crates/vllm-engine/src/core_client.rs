@@ -221,9 +221,7 @@ mod tests {
         let mut client = InprocClient::new(config, executor);
 
         // Add a request.
-        client
-            .add_request(make_ec_request("req-1", 10))
-            .unwrap();
+        client.add_request(make_ec_request("req-1", 10)).unwrap();
 
         // Get output (triggers a step).
         let outputs = client.get_output().unwrap();
@@ -247,16 +245,10 @@ mod tests {
         let executor = Box::new(NoopExecutor::new(1024));
         let mut client = InprocClient::new(config, executor);
 
-        client
-            .add_request(make_ec_request("req-1", 10))
-            .unwrap();
-        client
-            .add_request(make_ec_request("req-2", 10))
-            .unwrap();
+        client.add_request(make_ec_request("req-1", 10)).unwrap();
+        client.add_request(make_ec_request("req-2", 10)).unwrap();
 
-        client
-            .abort_requests(&["req-1".to_string()])
-            .unwrap();
+        client.abort_requests(&["req-1".to_string()]).unwrap();
 
         assert_eq!(client.engine().num_unfinished_requests(), 1);
     }
@@ -301,9 +293,7 @@ mod tests {
         let executor = Box::new(NoopExecutor::new(1024));
         let mut client = InprocClient::new(config, executor);
 
-        client
-            .add_request(make_ec_request("req-1", 10))
-            .unwrap();
+        client.add_request(make_ec_request("req-1", 10)).unwrap();
 
         // First step should produce output.
         let outputs = client.get_output().unwrap();
@@ -337,12 +327,9 @@ mod tests {
         // Ensure InprocClient can be used as a trait object.
         let config = make_test_config();
         let executor = Box::new(NoopExecutor::new(1024));
-        let mut client: Box<dyn EngineCoreClient> =
-            Box::new(InprocClient::new(config, executor));
+        let mut client: Box<dyn EngineCoreClient> = Box::new(InprocClient::new(config, executor));
 
-        client
-            .add_request(make_ec_request("req-1", 10))
-            .unwrap();
+        client.add_request(make_ec_request("req-1", 10)).unwrap();
         let outputs = client.get_output().unwrap();
         assert!(!outputs.outputs.is_empty());
         client.shutdown().unwrap();

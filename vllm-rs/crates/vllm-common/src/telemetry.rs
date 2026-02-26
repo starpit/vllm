@@ -18,8 +18,8 @@ static INIT: Once = Once::new();
 /// Safe to call multiple times — only the first call takes effect.
 pub fn init_tracing(log_level: &str) {
     INIT.call_once(|| {
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(log_level));
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
         tracing_subscriber::fmt()
             .with_env_filter(filter)

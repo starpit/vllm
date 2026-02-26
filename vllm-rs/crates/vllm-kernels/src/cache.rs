@@ -100,7 +100,13 @@ mod tests {
 
         // Should not error.
         kernels
-            .reshape_and_cache(&key, &value, &mut key_cache, &mut value_cache, &slot_mapping)
+            .reshape_and_cache(
+                &key,
+                &value,
+                &mut key_cache,
+                &mut value_cache,
+                &slot_mapping,
+            )
             .unwrap();
     }
 

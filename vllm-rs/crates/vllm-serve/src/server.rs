@@ -20,12 +20,12 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
-use tracing::{info, Span};
+use tracing::{Span, info};
 
 use crate::engine::{AsyncEngine, StreamDelta};
 use crate::protocol;
@@ -127,7 +127,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
     let router = build_router(state.clone());
     let listener = tokio::net::TcpListener::bind(&state.config.bind_address).await?;
-    info!("vLLM Rust server listening on {}", state.config.bind_address);
+    info!(
+        "vLLM Rust server listening on {}",
+        state.config.bind_address
+    );
     axum::serve(listener, router).await?;
     Ok(())
 }
@@ -395,8 +398,12 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         // Missing required field "messages" → 422
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY,
-            "actual status: {}", response.status());
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "actual status: {}",
+            response.status()
+        );
     }
 
     #[tokio::test]

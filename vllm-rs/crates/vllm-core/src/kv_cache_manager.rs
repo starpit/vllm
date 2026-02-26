@@ -205,12 +205,9 @@ impl KVCacheManager {
 
         let block_size = self.block_sizes[0];
 
-        let num_computed_tokens =
-            request.num_computed_tokens as usize + num_new_computed_tokens;
-        let num_tokens_need_slot = std::cmp::min(
-            num_computed_tokens + num_new_tokens,
-            self.max_model_len,
-        );
+        let num_computed_tokens = request.num_computed_tokens as usize + num_new_computed_tokens;
+        let num_tokens_need_slot =
+            std::cmp::min(num_computed_tokens + num_new_tokens, self.max_model_len);
 
         // Initialize per-request tracking if this is the first allocation.
         let req_blocks = self
@@ -220,10 +217,7 @@ impl KVCacheManager {
 
         // Append the new prefix-cached blocks and update the cached-blocks
         // counter so we never try to re-hash them.
-        let num_new_cached = new_computed_blocks
-            .first()
-            .map(|g| g.len())
-            .unwrap_or(0);
+        let num_new_cached = new_computed_blocks.first().map(|g| g.len()).unwrap_or(0);
         for (group_idx, cached) in new_computed_blocks.iter().enumerate() {
             req_blocks[group_idx].extend_from_slice(cached);
         }
@@ -278,15 +272,15 @@ impl KVCacheManager {
                 .entry(request.request_id.clone())
                 .or_insert(0);
 
-            let num_tokens_to_cache = std::cmp::min(
-                num_computed_tokens + num_new_tokens,
-                request.num_tokens(),
-            );
+            let num_tokens_to_cache =
+                std::cmp::min(num_computed_tokens + num_new_tokens, request.num_tokens());
             let num_full_blocks = num_tokens_to_cache / block_size;
 
             if num_full_blocks > num_cached_blocks {
                 let all_blocks = &self.req_to_blocks[&request.request_id];
-                for (group_idx, group_blocks) in all_blocks.iter().enumerate().take(self.num_kv_cache_groups) {
+                for (group_idx, group_blocks) in
+                    all_blocks.iter().enumerate().take(self.num_kv_cache_groups)
+                {
                     self.block_pool.cache_full_blocks(
                         request_block_hashes,
                         group_blocks,
@@ -502,8 +496,7 @@ mod tests {
         let req2 = make_request("r2", &prompt2);
         let hashes2 = make_block_hashes(5);
 
-        let (computed_blocks, num_computed_tokens) =
-            mgr.get_computed_blocks(&req2, &hashes2);
+        let (computed_blocks, num_computed_tokens) = mgr.get_computed_blocks(&req2, &hashes2);
 
         // max_cache_hit_length = 80 - 1 = 79 => max 4 blocks (79/16 = 4)
         // We should hit 4 cached blocks.
@@ -529,8 +522,7 @@ mod tests {
         let req2 = make_request("r2", &prompt2);
         let hashes2 = make_block_hashes(4);
 
-        let (computed_blocks, num_computed_tokens) =
-            mgr.get_computed_blocks(&req2, &hashes2);
+        let (computed_blocks, num_computed_tokens) = mgr.get_computed_blocks(&req2, &hashes2);
 
         assert_eq!(num_computed_tokens, 32); // only 2 blocks hit
         assert_eq!(computed_blocks[0].len(), 2);
@@ -554,8 +546,7 @@ mod tests {
         let req2 = make_request("r2", &prompt2);
         let hashes2 = make_block_hashes(3);
 
-        let (computed_blocks, num_computed_tokens) =
-            mgr.get_computed_blocks(&req2, &hashes2);
+        let (computed_blocks, num_computed_tokens) = mgr.get_computed_blocks(&req2, &hashes2);
         assert_eq!(num_computed_tokens, 32);
 
         // Now allocate, passing the prefix blocks.

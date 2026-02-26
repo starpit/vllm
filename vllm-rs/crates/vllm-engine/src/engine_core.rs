@@ -297,8 +297,7 @@ impl EngineCore {
             }
 
             // Check stop criteria against the updated request state.
-            let (finish_reason, stop_reason) =
-                self.check_stop_criteria(req_id, &new_token_ids);
+            let (finish_reason, stop_reason) = self.check_stop_criteria(req_id, &new_token_ids);
 
             if let Some(reason) = finish_reason {
                 let status = match reason {
@@ -336,20 +335,18 @@ impl EngineCore {
 
         // Finish requests that hit stop criteria.
         for (req_id, status) in &finished_ids {
-            self.scheduler
-                .finish_requests(&[req_id.as_str()], *status);
+            self.scheduler.finish_requests(&[req_id.as_str()], *status);
         }
 
         // Include already-finished request IDs from the scheduler (e.g. aborts).
         if !scheduler_output.finished_req_ids.is_empty() {
-            let engine_outputs =
-                client_outputs
-                    .entry(0)
-                    .or_insert_with(|| EngineCoreOutputs {
-                        engine_index: self.engine_index,
-                        outputs: Vec::new(),
-                        timestamp,
-                    });
+            let engine_outputs = client_outputs
+                .entry(0)
+                .or_insert_with(|| EngineCoreOutputs {
+                    engine_index: self.engine_index,
+                    outputs: Vec::new(),
+                    timestamp,
+                });
 
             for req_id in &scheduler_output.finished_req_ids {
                 // Only add if not already included from the loop above.
@@ -403,18 +400,12 @@ impl EngineCore {
                 && let Some(eos_id) = self.eos_token_id
                 && token_id == eos_id
             {
-                return (
-                    Some(FinishReason::Stop),
-                    Some(StopReason::Token(token_id)),
-                );
+                return (Some(FinishReason::Stop), Some(StopReason::Token(token_id)));
             }
 
             // 3. Check stop_token_ids.
             if params.stop_token_ids.contains(&token_id) {
-                return (
-                    Some(FinishReason::Stop),
-                    Some(StopReason::Token(token_id)),
-                );
+                return (Some(FinishReason::Stop), Some(StopReason::Token(token_id)));
             }
         }
 
@@ -553,15 +544,7 @@ mod tests {
             max_tokens: Some(16),
             ..Default::default()
         };
-        Request::new(
-            id.to_string(),
-            prompt_token_ids,
-            params,
-            0.0,
-            0,
-            0,
-            None,
-        )
+        Request::new(id.to_string(), prompt_token_ids, params, 0.0, 0, 0, None)
     }
 
     #[test]

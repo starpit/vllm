@@ -264,7 +264,7 @@ mod tests {
         let mut arena: Vec<KVCacheBlock> = (0..n).map(KVCacheBlock::new).collect();
         // Sentinel blocks with special IDs.
         arena.push(KVCacheBlock::new(usize::MAX - 1)); // head sentinel
-        arena.push(KVCacheBlock::new(usize::MAX));     // tail sentinel
+        arena.push(KVCacheBlock::new(usize::MAX)); // tail sentinel
         (arena, head_idx, tail_idx)
     }
 

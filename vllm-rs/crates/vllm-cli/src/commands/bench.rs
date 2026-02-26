@@ -20,7 +20,10 @@ pub async fn run_bench(args: BenchArgs) -> Result<()> {
     let model = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
 
     info!("vLLM Rust — benchmark mode");
-    info!("Model: {}, device: {}, dtype: {}", model, args.device, args.dtype);
+    info!(
+        "Model: {}, device: {}, dtype: {}",
+        model, args.device, args.dtype
+    );
     info!(
         "Requests: {}, prompt_len: {}, max_tokens: {}",
         args.num_requests, args.prompt_len, args.max_tokens
@@ -86,7 +89,10 @@ pub async fn run_bench(args: BenchArgs) -> Result<()> {
     println!("Total tokens:  {total_tokens}");
     println!("Elapsed:       {:.3}s", bench_elapsed.as_secs_f64());
     println!("Throughput:    {throughput:.1} tokens/s");
-    println!("Latency (avg): {:.3}ms/request", bench_elapsed.as_millis() as f64 / args.num_requests as f64);
+    println!(
+        "Latency (avg): {:.3}ms/request",
+        bench_elapsed.as_millis() as f64 / args.num_requests as f64
+    );
 
     worker.shutdown();
     Ok(())

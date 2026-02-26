@@ -23,7 +23,7 @@
 //! buffer support will be added here.
 
 use bytes::{Bytes, BytesMut};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// Errors that can occur during encoding or decoding.
 #[derive(Debug, thiserror::Error)]
@@ -70,11 +70,7 @@ impl MsgpackEncoder {
 
     /// Encode a value into an existing buffer, returning the number of
     /// bytes written.
-    pub fn encode_into<T: Serialize>(
-        &self,
-        value: &T,
-        buf: &mut BytesMut,
-    ) -> CodecResult<usize> {
+    pub fn encode_into<T: Serialize>(&self, value: &T, buf: &mut BytesMut) -> CodecResult<usize> {
         let data = rmp_serde::to_vec_named(value)?;
         let len = data.len();
         buf.extend_from_slice(&data);

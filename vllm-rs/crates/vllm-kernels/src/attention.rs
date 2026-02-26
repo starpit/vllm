@@ -89,7 +89,15 @@ impl AttentionKernels for CpuAttentionKernels {
         block_size: usize,
     ) -> KernelResult<Tensor> {
         // V2 falls back to V1 for CPU.
-        self.paged_attention_v1(query, key_cache, value_cache, block_tables, seq_lens, scale, block_size)
+        self.paged_attention_v1(
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            seq_lens,
+            scale,
+            block_size,
+        )
     }
 }
 

@@ -22,6 +22,5 @@ pub use self::core::Scheduler;
 pub use interface::{PauseState, SchedulerInterface};
 pub use output::{CachedRequestData, NewRequestData, SchedulerOutput};
 pub use request_queue::{
-    create_request_queue, FCFSRequestQueue, PriorityRequestQueue, RequestQueue,
-    SchedulingPolicy,
+    FCFSRequestQueue, PriorityRequestQueue, RequestQueue, SchedulingPolicy, create_request_queue,
 };

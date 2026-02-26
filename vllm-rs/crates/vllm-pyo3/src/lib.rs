@@ -77,7 +77,7 @@ impl RustScheduler {
             other => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Unknown scheduling policy: {other}"
-                )))
+                )));
             }
         };
 
@@ -91,12 +91,8 @@ impl RustScheduler {
             ..Default::default()
         };
 
-        let sched = Scheduler::with_simple_blocks(
-            &config,
-            max_model_len,
-            num_gpu_blocks,
-            block_size,
-        );
+        let sched =
+            Scheduler::with_simple_blocks(&config, max_model_len, num_gpu_blocks, block_size);
 
         Ok(Self { inner: sched })
     }
@@ -164,11 +160,7 @@ impl RustScheduler {
 
     /// Abort/finish requests by ID.
     #[pyo3(signature = (request_ids, status = "abort"))]
-    fn finish_requests(
-        &mut self,
-        request_ids: Vec<String>,
-        status: &str,
-    ) -> Vec<(String, u32)> {
+    fn finish_requests(&mut self, request_ids: Vec<String>, status: &str) -> Vec<(String, u32)> {
         let rs_status = match status {
             "abort" => RequestStatus::FinishedAborted,
             "stopped" => RequestStatus::FinishedStopped,
@@ -215,7 +207,7 @@ impl RustScheduler {
             other => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Invalid pause state: {other}"
-                )))
+                )));
             }
         };
         self.inner.set_pause_state(ps);

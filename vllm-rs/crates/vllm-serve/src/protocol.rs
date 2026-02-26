@@ -270,7 +270,6 @@ pub struct ChatCompletionRequest {
     pub user: Option<String>,
 
     // -- vLLM-specific extensions --
-
     /// Top-k sampling parameter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<i32>,
@@ -409,7 +408,6 @@ pub struct CompletionRequest {
     pub user: Option<String>,
 
     // -- vLLM-specific extensions --
-
     /// Top-k sampling.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<i32>,
@@ -549,7 +547,11 @@ pub struct ChatCompletionResponse {
 
 impl ChatCompletionResponse {
     /// Create a new response with default id and timestamp.
-    pub fn new(model: String, choices: Vec<ChatCompletionResponseChoice>, usage: UsageInfo) -> Self {
+    pub fn new(
+        model: String,
+        choices: Vec<ChatCompletionResponseChoice>,
+        usage: UsageInfo,
+    ) -> Self {
         Self {
             id: format!("chatcmpl-{}", random_uuid()),
             object: "chat.completion".to_string(),
@@ -701,11 +703,7 @@ pub struct CompletionStreamResponse {
 
 impl CompletionStreamResponse {
     /// Create a new streaming chunk.
-    pub fn new(
-        id: String,
-        model: String,
-        choices: Vec<CompletionResponseStreamChoice>,
-    ) -> Self {
+    pub fn new(id: String, model: String, choices: Vec<CompletionResponseStreamChoice>) -> Self {
         Self {
             id,
             object: "text_completion".to_string(),
@@ -891,10 +889,7 @@ mod tests {
         let parsed: UsageInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.prompt_tokens, 10);
         assert_eq!(parsed.completion_tokens, Some(20));
-        assert_eq!(
-            parsed.prompt_tokens_details.unwrap().cached_tokens,
-            Some(5)
-        );
+        assert_eq!(parsed.prompt_tokens_details.unwrap().cached_tokens, Some(5));
     }
 
     // -- Chat completion request --
@@ -1042,7 +1037,9 @@ mod tests {
             "max_tokens": 10
         }"#;
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
-        assert!(matches!(req.prompt, Some(CompletionPrompt::TokenIds(ref ids)) if ids == &[1, 2, 3, 4]));
+        assert!(
+            matches!(req.prompt, Some(CompletionPrompt::TokenIds(ref ids)) if ids == &[1, 2, 3, 4])
+        );
     }
 
     // -- Completion response --

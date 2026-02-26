@@ -22,8 +22,8 @@
 //! The executor broadcasts scheduler outputs to all workers and collects
 //! responses from the output rank (TP rank 0 of the last PP stage).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
@@ -257,26 +257,25 @@ impl MultiprocExecutor {
             ));
         }
 
-        tokio::task::block_in_place(|| self.runtime.block_on(async {
-            let mut response_futures = Vec::with_capacity(self.workers.len());
-            for handle in &self.workers {
-                response_futures.push(handle.rpc(make_request()));
-            }
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                let mut response_futures = Vec::with_capacity(self.workers.len());
+                for handle in &self.workers {
+                    response_futures.push(handle.rpc(make_request()));
+                }
 
-            let mut responses = Vec::with_capacity(response_futures.len());
-            for future in response_futures {
-                responses.push(future.await?);
-            }
-            Ok(responses)
-        }))
+                let mut responses = Vec::with_capacity(response_futures.len());
+                for future in response_futures {
+                    responses.push(future.await?);
+                }
+                Ok(responses)
+            })
+        })
     }
 
     /// Send a request to the output rank only and get the response.
     #[allow(dead_code)]
-    fn rpc_output_rank_blocking(
-        &self,
-        request: WorkerRequest,
-    ) -> ExecutorResult<WorkerResponse> {
+    fn rpc_output_rank_blocking(&self, request: WorkerRequest) -> ExecutorResult<WorkerResponse> {
         if self.is_failed() {
             return Err(ExecutorError::Communication(
                 "executor has failed".to_string(),
@@ -287,9 +286,7 @@ impl MultiprocExecutor {
             .workers
             .iter()
             .find(|w| w.is_output_rank)
-            .ok_or_else(|| {
-                ExecutorError::Config("no output rank worker found".to_string())
-            })?;
+            .ok_or_else(|| ExecutorError::Config("no output rank worker found".to_string()))?;
 
         tokio::task::block_in_place(|| self.runtime.block_on(output_handle.rpc(request)))
     }
@@ -301,9 +298,11 @@ impl Executor for MultiprocExecutor {
         scheduler_output: &SchedulerOutput,
     ) -> EngineResult<ModelRunnerOutput> {
         // Broadcast to all workers, collect from output rank.
-        let responses =
-            self.collective_rpc_blocking(|| WorkerRequest::ExecuteModel(Box::new(scheduler_output.clone())))
-                .map_err(|e| vllm_engine::error::EngineError::Executor(e.to_string()))?;
+        let responses = self
+            .collective_rpc_blocking(|| {
+                WorkerRequest::ExecuteModel(Box::new(scheduler_output.clone()))
+            })
+            .map_err(|e| vllm_engine::error::EngineError::Executor(e.to_string()))?;
 
         // Only the output rank's response matters.
         let output_response = responses
@@ -316,8 +315,9 @@ impl Executor for MultiprocExecutor {
             })?;
 
         match output_response {
-            WorkerResponse::ModelOutput(result) => result
-                .map_err(|e| vllm_engine::error::EngineError::Executor(e.to_string())),
+            WorkerResponse::ModelOutput(result) => {
+                result.map_err(|e| vllm_engine::error::EngineError::Executor(e.to_string()))
+            }
             other => Err(vllm_engine::error::EngineError::Executor(format!(
                 "unexpected response: {other:?}"
             ))),
@@ -327,11 +327,7 @@ impl Executor for MultiprocExecutor {
     fn max_concurrent_batches(&self) -> usize {
         // PP requires PP-size concurrent batches to fill the pipeline.
         let pp_size = self.parallel_config.pp_group.world_size;
-        if pp_size > 1 {
-            pp_size
-        } else {
-            1
-        }
+        if pp_size > 1 { pp_size } else { 1 }
     }
 
     fn initialize_cache(
@@ -449,7 +445,10 @@ impl Executor for MultiprocExecutor {
         if self.is_shutdown {
             return;
         }
-        info!("MultiprocExecutor: shutting down {} workers", self.workers.len());
+        info!(
+            "MultiprocExecutor: shutting down {} workers",
+            self.workers.len()
+        );
 
         // Send shutdown to all workers (fire-and-forget).
         let _ = self.collective_rpc_blocking(|| WorkerRequest::Shutdown);

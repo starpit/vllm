@@ -13,7 +13,7 @@ use tracing::warn;
 
 use crate::free_block_queue::FreeKVCacheBlockQueue;
 use crate::kv_cache_block::{
-    make_block_hash_with_group_id, BlockHash, BlockHashWithGroupId, KVCacheBlock,
+    BlockHash, BlockHashWithGroupId, KVCacheBlock, make_block_hash_with_group_id,
 };
 
 // ---------------------------------------------------------------------------
@@ -40,21 +40,14 @@ impl BlockHashToBlockMap {
 
     /// Insert a block index under the given hash key.
     pub fn insert(&mut self, key: BlockHashWithGroupId, block_idx: usize) {
-        self.cache
-            .entry(key)
-            .or_default()
-            .push(block_idx);
+        self.cache.entry(key).or_default().push(block_idx);
     }
 
     /// Remove `block_idx` from the entry for `key`.
     ///
     /// Returns `Some(block_idx)` if found and removed, `None` otherwise.
     /// If the entry becomes empty after removal it is deleted from the map.
-    pub fn pop(
-        &mut self,
-        key: &BlockHashWithGroupId,
-        block_idx: usize,
-    ) -> Option<usize> {
+    pub fn pop(&mut self, key: &BlockHashWithGroupId, block_idx: usize) -> Option<usize> {
         let entry = self.cache.get_mut(key)?;
         if let Some(pos) = entry.iter().position(|&idx| idx == block_idx) {
             let removed = entry.swap_remove(pos);
@@ -145,7 +138,7 @@ impl BlockPool {
         // Build arena: real blocks + 2 sentinels.
         let mut blocks: Vec<KVCacheBlock> = (0..num_gpu_blocks).map(KVCacheBlock::new).collect();
         blocks.push(KVCacheBlock::new(usize::MAX - 1)); // head sentinel
-        blocks.push(KVCacheBlock::new(usize::MAX));     // tail sentinel
+        blocks.push(KVCacheBlock::new(usize::MAX)); // tail sentinel
 
         // Initialize the free-block queue with all real blocks.
         let mut free_block_queue = FreeKVCacheBlockQueue::new(
@@ -302,7 +295,9 @@ impl BlockPool {
             self.get_num_free_blocks(),
         );
 
-        let indices = self.free_block_queue.popleft_n(&mut self.blocks, num_blocks);
+        let indices = self
+            .free_block_queue
+            .popleft_n(&mut self.blocks, num_blocks);
 
         for &idx in &indices {
             if self.enable_caching {

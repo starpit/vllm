@@ -130,10 +130,8 @@ impl ModelRunnerOutput {
             .enumerate()
             .map(|(i, id)| (id.clone(), i))
             .collect();
-        let sampled_token_ids: Vec<Vec<u32>> = req_ids
-            .iter()
-            .map(|id| token_map[id].clone())
-            .collect();
+        let sampled_token_ids: Vec<Vec<u32>> =
+            req_ids.iter().map(|id| token_map[id].clone()).collect();
 
         Self {
             req_ids,
@@ -161,7 +159,10 @@ pub trait Executor: Send {
     /// Execute the model with the given scheduler output.
     ///
     /// Returns the model runner output containing generated tokens.
-    fn execute_model(&mut self, scheduler_output: &SchedulerOutput) -> EngineResult<ModelRunnerOutput>;
+    fn execute_model(
+        &mut self,
+        scheduler_output: &SchedulerOutput,
+    ) -> EngineResult<ModelRunnerOutput>;
 
     /// Get the maximum number of concurrent batches.
     ///
@@ -242,7 +243,10 @@ impl NoopExecutor {
 }
 
 impl Executor for NoopExecutor {
-    fn execute_model(&mut self, scheduler_output: &SchedulerOutput) -> EngineResult<ModelRunnerOutput> {
+    fn execute_model(
+        &mut self,
+        scheduler_output: &SchedulerOutput,
+    ) -> EngineResult<ModelRunnerOutput> {
         let mut token_map = HashMap::new();
 
         // Generate one token per scheduled request.

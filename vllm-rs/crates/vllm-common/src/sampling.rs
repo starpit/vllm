@@ -234,9 +234,7 @@ impl SamplingParams {
             ));
         }
         if !self.stop.is_empty() && !self.detokenize {
-            return Err(
-                "stop strings are only supported when detokenize is true".into(),
-            );
+            return Err("stop strings are only supported when detokenize is true".into());
         }
         if self.stop.iter().any(|s| s.is_empty()) {
             return Err("stop cannot contain an empty string".into());

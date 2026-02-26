@@ -23,8 +23,8 @@ pub mod telemetry;
 // instead of `use vllm_common::sampling::SamplingParams;`.
 
 pub use engine_io::{
-    EngineCoreEvent, EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs,
-    EngineCoreRequest, FinishReason, StopReason,
+    EngineCoreEvent, EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
+    FinishReason, StopReason,
 };
 pub use error::{VllmError, VllmResult};
 pub use request::{Request, RequestStatus};

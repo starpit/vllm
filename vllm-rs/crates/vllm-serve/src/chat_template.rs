@@ -78,15 +78,11 @@ impl ChatTemplate {
             return Ok(None);
         }
 
-        let data = std::fs::read_to_string(path).map_err(|e| {
-            ServeError::Internal(format!("failed to read {}: {e}", path.display()))
-        })?;
+        let data = std::fs::read_to_string(path)
+            .map_err(|e| ServeError::Internal(format!("failed to read {}: {e}", path.display())))?;
 
         let config: TokenizerConfig = serde_json::from_str(&data).map_err(|e| {
-            ServeError::Internal(format!(
-                "failed to parse {}: {e}",
-                path.display()
-            ))
+            ServeError::Internal(format!("failed to parse {}: {e}", path.display()))
         })?;
 
         let template_str = match config.chat_template {
@@ -154,9 +150,9 @@ impl ChatTemplate {
         env.add_template("chat", &self.template_str)
             .map_err(|e| ServeError::Internal(format!("invalid chat template: {e}")))?;
 
-        let tmpl = env.get_template("chat").map_err(|e| {
-            ServeError::Internal(format!("failed to get template: {e}"))
-        })?;
+        let tmpl = env
+            .get_template("chat")
+            .map_err(|e| ServeError::Internal(format!("failed to get template: {e}")))?;
 
         // Build the context.
         let ctx = minijinja::context! {
@@ -166,9 +162,9 @@ impl ChatTemplate {
             eos_token => self.eos_token.as_deref().unwrap_or(""),
         };
 
-        let rendered = tmpl.render(ctx).map_err(|e| {
-            ServeError::Internal(format!("chat template render failed: {e}"))
-        })?;
+        let rendered = tmpl
+            .render(ctx)
+            .map_err(|e| ServeError::Internal(format!("chat template render failed: {e}")))?;
 
         Ok(rendered)
     }
@@ -185,11 +181,10 @@ impl ChatTemplate {
 fn extract_token_string(value: &Option<serde_json::Value>) -> Option<String> {
     match value {
         Some(serde_json::Value::String(s)) => Some(s.clone()),
-        Some(serde_json::Value::Object(obj)) => {
-            obj.get("content")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        }
+        Some(serde_json::Value::Object(obj)) => obj
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         _ => None,
     }
 }
@@ -217,12 +212,10 @@ mod tests {
             "{% for message in messages %}{{ message.role }}: {{ message.content }}\n{% endfor %}{% if add_generation_prompt %}assistant: {% endif %}".to_string(),
         );
 
-        let messages = vec![
-            TemplateMessage {
-                role: "user".to_string(),
-                content: "Hello!".to_string(),
-            },
-        ];
+        let messages = vec![TemplateMessage {
+            role: "user".to_string(),
+            content: "Hello!".to_string(),
+        }];
 
         let result = tpl.apply(&messages, true).unwrap();
         assert!(result.contains("user: Hello!"));

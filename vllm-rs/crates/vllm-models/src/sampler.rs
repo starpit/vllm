@@ -52,11 +52,7 @@ impl Sampler {
     /// `temperature` — temperature for softmax (0 = greedy, >0 = random)
     ///
     /// Returns one sampled token ID per row.
-    pub fn sample(
-        &mut self,
-        logits: &Tensor,
-        temperature: f32,
-    ) -> ModelResult<Vec<u32>> {
+    pub fn sample(&mut self, logits: &Tensor, temperature: f32) -> ModelResult<Vec<u32>> {
         if temperature < 1e-5 {
             return self.greedy(logits);
         }
@@ -68,7 +64,9 @@ impl Sampler {
         let max_vals = scaled
             .max_keepdim(candle_core::D::Minus1)
             .map_err(ModelError::Candle)?;
-        let shifted = scaled.broadcast_sub(&max_vals).map_err(ModelError::Candle)?;
+        let shifted = scaled
+            .broadcast_sub(&max_vals)
+            .map_err(ModelError::Candle)?;
         let exp = shifted.exp().map_err(ModelError::Candle)?;
         let sum = exp
             .sum_keepdim(candle_core::D::Minus1)
@@ -223,11 +221,7 @@ mod tests {
     #[test]
     fn test_temperature_zero_is_greedy() {
         let mut sampler = Sampler::new();
-        let logits = Tensor::new(
-            &[[0.1f32, 0.9, 0.0], [0.0, 0.1, 0.9]],
-            &Device::Cpu,
-        )
-        .unwrap();
+        let logits = Tensor::new(&[[0.1f32, 0.9, 0.0], [0.0, 0.1, 0.9]], &Device::Cpu).unwrap();
 
         let ids = sampler.sample(&logits, 0.0).unwrap();
         assert_eq!(ids, vec![1, 2]);
@@ -238,11 +232,7 @@ mod tests {
         let mut sampler = Sampler::new();
 
         // High-confidence logits: one value much larger than others.
-        let logits = Tensor::new(
-            &[[0.0f32, 100.0, 0.0, 0.0]],
-            &Device::Cpu,
-        )
-        .unwrap();
+        let logits = Tensor::new(&[[0.0f32, 100.0, 0.0, 0.0]], &Device::Cpu).unwrap();
 
         // Even with temperature=1.0, the dominant logit should almost always win.
         let ids = sampler.sample(&logits, 1.0).unwrap();
@@ -254,11 +244,7 @@ mod tests {
         let mut sampler = Sampler::new();
 
         // Logits with a clear winner.
-        let logits = Tensor::new(
-            &[[0.0f32, 100.0, 0.0, 0.0]],
-            &Device::Cpu,
-        )
-        .unwrap();
+        let logits = Tensor::new(&[[0.0f32, 100.0, 0.0, 0.0]], &Device::Cpu).unwrap();
 
         let ids = sampler.sample_top_k_top_p(&logits, 1.0, 2, 1.0).unwrap();
         assert_eq!(ids[0], 1);
@@ -269,11 +255,7 @@ mod tests {
         let mut sampler = Sampler::new();
 
         // Logits with a clear winner.
-        let logits = Tensor::new(
-            &[[0.0f32, 100.0, 0.0, 0.0]],
-            &Device::Cpu,
-        )
-        .unwrap();
+        let logits = Tensor::new(&[[0.0f32, 100.0, 0.0, 0.0]], &Device::Cpu).unwrap();
 
         let ids = sampler.sample_top_k_top_p(&logits, 1.0, 0, 0.9).unwrap();
         assert_eq!(ids[0], 1);

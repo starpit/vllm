@@ -279,10 +279,7 @@ mod tests {
 
     #[test]
     fn test_stop_reason_serde_roundtrip() {
-        let cases = vec![
-            StopReason::Token(123),
-            StopReason::String("END".into()),
-        ];
+        let cases = vec![StopReason::Token(123), StopReason::String("END".into())];
         for sr in cases {
             let json = serde_json::to_string(&sr).unwrap();
             let sr2: StopReason = serde_json::from_str(&json).unwrap();
@@ -433,10 +430,7 @@ mod tests {
                 finish_reason: None,
                 stop_reason: None,
                 num_cached_tokens: 0,
-                events: Some(vec![EngineCoreEvent::new(
-                    EngineCoreEventType::Queued,
-                    0.5,
-                )]),
+                events: Some(vec![EngineCoreEvent::new(EngineCoreEventType::Queued, 0.5)]),
             }],
             timestamp: 42.0,
         };

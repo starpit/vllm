@@ -9,12 +9,12 @@
 //!
 //! Port of: `vllm/model_executor/models/`
 
-pub mod registry;
-pub mod sampler;
 pub mod attention;
+pub mod gemma2;
 pub mod llama;
 pub mod qwen2;
-pub mod gemma2;
+pub mod registry;
+pub mod sampler;
 
 use candle_core::Tensor;
 use vllm_model::ModelResult;

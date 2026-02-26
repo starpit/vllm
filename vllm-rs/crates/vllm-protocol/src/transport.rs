@@ -35,8 +35,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use zeromq::{
-    DealerSocket, PullSocket, PushSocket, RouterSocket, Socket, SocketRecv, SocketSend,
-    ZmqMessage,
+    DealerSocket, PullSocket, PushSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage,
 };
 
 use crate::codec::{self, CodecError, MsgpackDecoder, MsgpackEncoder};
@@ -113,9 +112,7 @@ impl EngineInputSocket {
 
         let type_frame = &frames[0];
         if type_frame.is_empty() {
-            return Err(TransportError::InvalidMessage(
-                "empty type frame".into(),
-            ));
+            return Err(TransportError::InvalidMessage("empty type frame".into()));
         }
 
         let request_type = EngineCoreRequestType::from_byte(type_frame[0]).ok_or_else(|| {
@@ -260,9 +257,7 @@ impl FrontendOutputSocket {
     /// Receive and decode an output message.
     ///
     /// Returns `None` if the engine-dead sentinel is received.
-    pub async fn recv<T: serde::de::DeserializeOwned>(
-        &mut self,
-    ) -> TransportResult<Option<T>> {
+    pub async fn recv<T: serde::de::DeserializeOwned>(&mut self) -> TransportResult<Option<T>> {
         let msg = self.socket.recv().await?;
         let frames: Vec<Bytes> = msg.into_vec();
         if frames.is_empty() {
@@ -305,15 +300,11 @@ pub fn build_request_message<T: serde::Serialize>(
 /// Parse the request type from the first frame of a multipart message.
 pub fn parse_request_type(frames: &[Bytes]) -> TransportResult<EngineCoreRequestType> {
     if frames.is_empty() {
-        return Err(TransportError::InvalidMessage(
-            "empty message".into(),
-        ));
+        return Err(TransportError::InvalidMessage("empty message".into()));
     }
     let type_frame = &frames[0];
     if type_frame.is_empty() {
-        return Err(TransportError::InvalidMessage(
-            "empty type frame".into(),
-        ));
+        return Err(TransportError::InvalidMessage("empty type frame".into()));
     }
     EngineCoreRequestType::from_byte(type_frame[0]).ok_or_else(|| {
         TransportError::InvalidMessage(format!("unknown request type: 0x{:02x}", type_frame[0]))
@@ -330,11 +321,8 @@ mod tests {
 
     #[test]
     fn test_build_request_message() {
-        let msg = build_request_message(
-            EngineCoreRequestType::Abort,
-            &vec!["req-1", "req-2"],
-        )
-        .unwrap();
+        let msg =
+            build_request_message(EngineCoreRequestType::Abort, &vec!["req-1", "req-2"]).unwrap();
 
         let frames: Vec<Bytes> = msg.into_vec();
         assert_eq!(frames.len(), 2);
@@ -343,10 +331,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_type() {
-        let frames = vec![
-            Bytes::from_static(&[0x00]),
-            Bytes::from_static(b"payload"),
-        ];
+        let frames = vec![Bytes::from_static(&[0x00]), Bytes::from_static(b"payload")];
         let req_type = parse_request_type(&frames).unwrap();
         assert_eq!(req_type, EngineCoreRequestType::Add);
     }

@@ -62,12 +62,7 @@ impl RotaryKernels for CpuRotaryKernels {
 
 /// Apply rotary to a flat [num_tokens, dim] tensor.
 /// Only rotates the first `2 * half` dimensions, leaving the rest unchanged.
-fn apply_rotary_1d(
-    x: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    half: usize,
-) -> KernelResult<Tensor> {
+fn apply_rotary_1d(x: &Tensor, cos: &Tensor, sin: &Tensor, half: usize) -> KernelResult<Tensor> {
     let dim = x.dim(1)?;
     let rot_dim = 2 * half;
 
@@ -128,7 +123,9 @@ mod tests {
         let q = Tensor::new(&[[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]], &Device::Cpu).unwrap();
         let k = q.clone();
 
-        let (q_rot, _k_rot) = kernels.rotary_embedding(&positions, &q, &k, &cache, true).unwrap();
+        let (q_rot, _k_rot) = kernels
+            .rotary_embedding(&positions, &q, &k, &cache, true)
+            .unwrap();
         assert_eq!(q_rot.dims(), &[1, 8]);
 
         // At position 0, cos=1, sin=0 -> output = input
@@ -151,7 +148,9 @@ mod tests {
         let q = Tensor::ones(&[4, 8], DType::F32, &Device::Cpu).unwrap();
         let k = Tensor::ones(&[4, 8], DType::F32, &Device::Cpu).unwrap();
 
-        let (q_rot, k_rot) = kernels.rotary_embedding(&positions, &q, &k, &cache, true).unwrap();
+        let (q_rot, k_rot) = kernels
+            .rotary_embedding(&positions, &q, &k, &cache, true)
+            .unwrap();
         assert_eq!(q_rot.dims(), &[4, 8]);
         assert_eq!(k_rot.dims(), &[4, 8]);
     }
@@ -165,7 +164,9 @@ mod tests {
         let q = Tensor::new(&[[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]], &Device::Cpu).unwrap();
         let k = q.clone();
 
-        let (q_rot, _) = kernels.rotary_embedding(&positions, &q, &k, &cache, true).unwrap();
+        let (q_rot, _) = kernels
+            .rotary_embedding(&positions, &q, &k, &cache, true)
+            .unwrap();
         assert_eq!(q_rot.dims(), &[1, 8]);
 
         // Last 4 dims should be unchanged (pass-through).

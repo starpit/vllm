@@ -15,12 +15,7 @@ pub trait NormKernels: Send + Sync {
     /// RMS normalization: `out = input / rms(input) * weight`
     ///
     /// Port of: `void rms_norm(out, input, weight, epsilon)`
-    fn rms_norm(
-        &self,
-        input: &Tensor,
-        weight: &Tensor,
-        epsilon: f64,
-    ) -> KernelResult<Tensor>;
+    fn rms_norm(&self, input: &Tensor, weight: &Tensor, epsilon: f64) -> KernelResult<Tensor>;
 
     /// Fused add + RMS normalization.
     ///
@@ -41,12 +36,7 @@ pub trait NormKernels: Send + Sync {
 pub struct CpuNormKernels;
 
 impl NormKernels for CpuNormKernels {
-    fn rms_norm(
-        &self,
-        input: &Tensor,
-        weight: &Tensor,
-        epsilon: f64,
-    ) -> KernelResult<Tensor> {
+    fn rms_norm(&self, input: &Tensor, weight: &Tensor, epsilon: f64) -> KernelResult<Tensor> {
         // x^2 -> mean over last dim -> sqrt -> recip -> multiply
         let x_sq = input.sqr()?;
         let variance = x_sq.mean_keepdim(candle_core::D::Minus1)?;

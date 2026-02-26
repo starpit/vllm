@@ -20,7 +20,7 @@ use vllm_config::{SchedulerConfig, SchedulerPolicy};
 
 use super::interface::{PauseState, SchedulerInterface};
 use super::output::{CachedRequestData, NewRequestData, SchedulerOutput};
-use super::request_queue::{create_request_queue, RequestQueue, SchedulingPolicy};
+use super::request_queue::{RequestQueue, SchedulingPolicy, create_request_queue};
 
 // ---------------------------------------------------------------------------
 // KVCacheManagerOps -- trait for KV cache interaction
@@ -332,9 +332,8 @@ impl Scheduler {
             new_block_ids.push(blocks);
 
             num_computed_tokens_vec.push(req.num_computed_tokens);
-            num_output_tokens_vec.push(
-                req.num_output_tokens() as u32 + req.num_output_placeholders,
-            );
+            num_output_tokens_vec
+                .push(req.num_output_tokens() as u32 + req.num_output_placeholders);
         }
 
         CachedRequestData {
@@ -385,11 +384,7 @@ impl Scheduler {
         let req_id = request.request_id.clone();
 
         // Remove from running queue.
-        if let Some(pos) = self
-            .running
-            .iter()
-            .position(|r| r.request_id == request_id)
-        {
+        if let Some(pos) = self.running.iter().position(|r| r.request_id == request_id) {
             let mut request = self.running.remove(pos);
             self.kv_cache.free(&request.request_id);
             request.status = status;
@@ -483,8 +478,9 @@ impl SchedulerInterface for Scheduler {
             num_new_tokens = num_new_tokens.min(token_budget);
 
             // Ensure we don't exceed max model length.
-            let max_remaining =
-                self.max_model_len.saturating_sub(1 + request.num_computed_tokens as usize);
+            let max_remaining = self
+                .max_model_len
+                .saturating_sub(1 + request.num_computed_tokens as usize);
             num_new_tokens = num_new_tokens.min(max_remaining);
 
             if num_new_tokens == 0 {
@@ -513,13 +509,9 @@ impl SchedulerInterface for Scheduler {
                         .saturating_sub(self.running[req_index].num_tokens());
                     if num_scheduled_spec > 0 {
                         let spec_ids = &self.running[req_index].spec_token_ids;
-                        let truncated: Vec<u32> = spec_ids
-                            .iter()
-                            .take(num_scheduled_spec)
-                            .copied()
-                            .collect();
-                        scheduled_spec_decode_tokens
-                            .insert(request_id.clone(), truncated);
+                        let truncated: Vec<u32> =
+                            spec_ids.iter().take(num_scheduled_spec).copied().collect();
+                        scheduled_spec_decode_tokens.insert(request_id.clone(), truncated);
                     }
                     // Clear spec tokens for next step.
                     self.running[req_index].spec_token_ids.clear();
@@ -604,8 +596,7 @@ impl SchedulerInterface for Scheduler {
 
                 // How many tokens need to be scheduled.
                 let total_tokens = request.num_tokens();
-                let num_new_tokens_raw =
-                    total_tokens.saturating_sub(num_computed_tokens as usize);
+                let num_new_tokens_raw = total_tokens.saturating_sub(num_computed_tokens as usize);
 
                 let mut num_new_tokens = num_new_tokens_raw;
 
@@ -685,15 +676,12 @@ impl SchedulerInterface for Scheduler {
                             running_req.status = RequestStatus::Running;
                             running_req.num_computed_tokens = num_computed_tokens;
                             if running_req.num_cached_tokens < 0 {
-                                running_req.num_cached_tokens =
-                                    num_computed_tokens as i32;
+                                running_req.num_cached_tokens = num_computed_tokens as i32;
                             }
                         }
 
-                        req_to_new_blocks
-                            .insert(request_id.clone(), blocks);
-                        num_scheduled_tokens
-                            .insert(request_id.clone(), num_new_tokens);
+                        req_to_new_blocks.insert(request_id.clone(), blocks);
+                        num_scheduled_tokens.insert(request_id.clone(), num_new_tokens);
                         token_budget -= num_new_tokens;
 
                         // Update the requests map.
@@ -716,8 +704,7 @@ impl SchedulerInterface for Scheduler {
         // ---------------------------------------------------------------
         // Phase 3: Build SchedulerOutput
         // ---------------------------------------------------------------
-        let total_num_scheduled_tokens: usize =
-            num_scheduled_tokens.values().sum();
+        let total_num_scheduled_tokens: usize = num_scheduled_tokens.values().sum();
 
         // Build NewRequestData for newly scheduled requests.
         let new_reqs_data: Vec<NewRequestData> = scheduled_new_reqs
@@ -822,11 +809,7 @@ impl SchedulerInterface for Scheduler {
 
     fn shutdown(&mut self) {
         // Free all running requests.
-        let running_ids: Vec<String> = self
-            .running
-            .iter()
-            .map(|r| r.request_id.clone())
-            .collect();
+        let running_ids: Vec<String> = self.running.iter().map(|r| r.request_id.clone()).collect();
         for id in &running_ids {
             self.kv_cache.free(id);
         }
@@ -927,10 +910,7 @@ mod tests {
         let output = sched.schedule();
         assert_eq!(output.scheduled_new_reqs.len(), 1);
         assert_eq!(output.scheduled_new_reqs[0].req_id, "r1");
-        assert_eq!(
-            *output.num_scheduled_tokens.get("r1").unwrap(),
-            10
-        );
+        assert_eq!(*output.num_scheduled_tokens.get("r1").unwrap(), 10);
         assert_eq!(output.total_num_scheduled_tokens, 10);
         assert_eq!(sched.get_request_counts(), (1, 0));
     }
@@ -1027,10 +1007,7 @@ mod tests {
         assert_eq!(sched.get_request_counts(), (1, 0));
 
         // Finish it.
-        let finished = sched.finish_requests(
-            &["r1"],
-            RequestStatus::FinishedStopped,
-        );
+        let finished = sched.finish_requests(&["r1"], RequestStatus::FinishedStopped);
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0].0, "r1");
         assert_eq!(sched.get_num_unfinished_requests(), 0);
@@ -1046,10 +1023,7 @@ mod tests {
         let cfg = test_scheduler_config();
         let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
 
-        let finished = sched.finish_requests(
-            &["nonexistent"],
-            RequestStatus::FinishedAborted,
-        );
+        let finished = sched.finish_requests(&["nonexistent"], RequestStatus::FinishedAborted);
         assert!(finished.is_empty());
     }
 
@@ -1061,10 +1035,7 @@ mod tests {
         sched.add_request(make_request("r1", 10));
 
         // Finish before scheduling.
-        let finished = sched.finish_requests(
-            &["r1"],
-            RequestStatus::FinishedAborted,
-        );
+        let finished = sched.finish_requests(&["r1"], RequestStatus::FinishedAborted);
         assert_eq!(finished.len(), 1);
         assert_eq!(sched.get_num_unfinished_requests(), 0);
     }
@@ -1093,8 +1064,8 @@ mod tests {
 
         // Not all 5 can be scheduled. At most 4 blocks available.
         assert!(output.total_num_scheduled_tokens <= 64);
-        let total_scheduled = output.scheduled_new_reqs.len()
-            + output.scheduled_cached_reqs.num_reqs();
+        let total_scheduled =
+            output.scheduled_new_reqs.len() + output.scheduled_cached_reqs.num_reqs();
         // At most 4 requests can be scheduled.
         assert!(total_scheduled <= 4);
     }
@@ -1230,10 +1201,7 @@ mod tests {
 
         let output = sched.schedule();
         // Should schedule at most 50 tokens due to the threshold.
-        assert_eq!(
-            *output.num_scheduled_tokens.get("r1").unwrap(),
-            50
-        );
+        assert_eq!(*output.num_scheduled_tokens.get("r1").unwrap(), 50);
     }
 
     // ----- Multiple scheduling steps test -----
@@ -1253,24 +1221,15 @@ mod tests {
 
         // Step 1: schedule up to 20 tokens.
         let output1 = sched.schedule();
-        assert_eq!(
-            *output1.num_scheduled_tokens.get("r1").unwrap(),
-            20
-        );
+        assert_eq!(*output1.num_scheduled_tokens.get("r1").unwrap(), 20);
 
         // Step 2: schedule next chunk. The request is now running.
         let output2 = sched.schedule();
-        assert_eq!(
-            *output2.num_scheduled_tokens.get("r1").unwrap(),
-            20
-        );
+        assert_eq!(*output2.num_scheduled_tokens.get("r1").unwrap(), 20);
 
         // Step 3: schedule remaining 10 tokens.
         let output3 = sched.schedule();
-        assert_eq!(
-            *output3.num_scheduled_tokens.get("r1").unwrap(),
-            10
-        );
+        assert_eq!(*output3.num_scheduled_tokens.get("r1").unwrap(), 10);
     }
 
     // ----- has_requests / has_finished tests -----

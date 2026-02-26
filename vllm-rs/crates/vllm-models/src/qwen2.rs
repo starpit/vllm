@@ -134,9 +134,9 @@ mod tests {
         let path = dir.path().join("model.safetensors");
         let device = Device::Cpu;
 
-        let mut tensor_specs: Vec<(&str, Vec<usize>)> = Vec::new();
+        let mut tensor_specs: Vec<(String, Vec<usize>)> = Vec::new();
         tensor_specs.push((
-            "model.embed_tokens.weight",
+            "model.embed_tokens.weight".to_string(),
             vec![c.vocab_size, c.hidden_size],
         ));
 
@@ -147,59 +147,53 @@ mod tests {
 
             // Qwen2 has bias on Q/K/V projections.
             tensor_specs.push((
-                Box::leak(format!("{}.self_attn.q_proj.weight", prefix).into_boxed_str()),
+                format!("{}.self_attn.q_proj.weight", prefix),
                 vec![q_size, c.hidden_size],
             ));
+            tensor_specs.push((format!("{}.self_attn.q_proj.bias", prefix), vec![q_size]));
             tensor_specs.push((
-                Box::leak(format!("{}.self_attn.q_proj.bias", prefix).into_boxed_str()),
-                vec![q_size],
-            ));
-            tensor_specs.push((
-                Box::leak(format!("{}.self_attn.k_proj.weight", prefix).into_boxed_str()),
+                format!("{}.self_attn.k_proj.weight", prefix),
                 vec![kv_size, c.hidden_size],
             ));
+            tensor_specs.push((format!("{}.self_attn.k_proj.bias", prefix), vec![kv_size]));
             tensor_specs.push((
-                Box::leak(format!("{}.self_attn.k_proj.bias", prefix).into_boxed_str()),
-                vec![kv_size],
-            ));
-            tensor_specs.push((
-                Box::leak(format!("{}.self_attn.v_proj.weight", prefix).into_boxed_str()),
+                format!("{}.self_attn.v_proj.weight", prefix),
                 vec![kv_size, c.hidden_size],
             ));
+            tensor_specs.push((format!("{}.self_attn.v_proj.bias", prefix), vec![kv_size]));
             tensor_specs.push((
-                Box::leak(format!("{}.self_attn.v_proj.bias", prefix).into_boxed_str()),
-                vec![kv_size],
-            ));
-            tensor_specs.push((
-                Box::leak(format!("{}.self_attn.o_proj.weight", prefix).into_boxed_str()),
+                format!("{}.self_attn.o_proj.weight", prefix),
                 vec![c.hidden_size, q_size],
             ));
 
             tensor_specs.push((
-                Box::leak(format!("{}.mlp.gate_proj.weight", prefix).into_boxed_str()),
+                format!("{}.mlp.gate_proj.weight", prefix),
                 vec![c.intermediate_size, c.hidden_size],
             ));
             tensor_specs.push((
-                Box::leak(format!("{}.mlp.up_proj.weight", prefix).into_boxed_str()),
+                format!("{}.mlp.up_proj.weight", prefix),
                 vec![c.intermediate_size, c.hidden_size],
             ));
             tensor_specs.push((
-                Box::leak(format!("{}.mlp.down_proj.weight", prefix).into_boxed_str()),
+                format!("{}.mlp.down_proj.weight", prefix),
                 vec![c.hidden_size, c.intermediate_size],
             ));
 
             tensor_specs.push((
-                Box::leak(format!("{}.input_layernorm.weight", prefix).into_boxed_str()),
+                format!("{}.input_layernorm.weight", prefix),
                 vec![c.hidden_size],
             ));
             tensor_specs.push((
-                Box::leak(format!("{}.post_attention_layernorm.weight", prefix).into_boxed_str()),
+                format!("{}.post_attention_layernorm.weight", prefix),
                 vec![c.hidden_size],
             ));
         }
 
-        tensor_specs.push(("model.norm.weight", vec![c.hidden_size]));
-        tensor_specs.push(("lm_head.weight", vec![c.vocab_size, c.hidden_size]));
+        tensor_specs.push(("model.norm.weight".to_string(), vec![c.hidden_size]));
+        tensor_specs.push((
+            "lm_head.weight".to_string(),
+            vec![c.vocab_size, c.hidden_size],
+        ));
 
         create_test_weights(&path, &tensor_specs);
 
@@ -223,7 +217,7 @@ mod tests {
     // Test helper
     // -----------------------------------------------------------------------
 
-    fn create_test_weights(path: &std::path::Path, specs: &[(&str, Vec<usize>)]) {
+    fn create_test_weights(path: &std::path::Path, specs: &[(String, Vec<usize>)]) {
         use safetensors::tensor::TensorView;
 
         let mut all_data: Vec<Vec<u8>> = Vec::new();
@@ -237,7 +231,7 @@ mod tests {
 
         // Override norm weights with 1.0.
         for (i, (name, shape)) in specs.iter().enumerate() {
-            if name.contains("layernorm") || (*name == "model.norm.weight") {
+            if name.contains("layernorm") || (name.as_str() == "model.norm.weight") {
                 let num_elements: usize = shape.iter().product();
                 all_data[i] = (0..num_elements)
                     .flat_map(|_| 1.0f32.to_le_bytes())
@@ -250,7 +244,7 @@ mod tests {
             .zip(all_data.iter())
             .map(|((name, shape), data)| {
                 (
-                    *name,
+                    name.as_str(),
                     TensorView::new(safetensors::Dtype::F32, shape.clone(), data).unwrap(),
                 )
             })

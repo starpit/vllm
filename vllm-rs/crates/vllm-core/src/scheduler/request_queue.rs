@@ -201,23 +201,6 @@ impl RequestQueue for PriorityRequestQueue {
     }
 
     fn iter(&self) -> Box<dyn Iterator<Item = &Request> + '_> {
-        // Iterate in priority order by cloning the heap and popping.
-        // We collect into a Vec first since we need a stable iterator.
-        let mut heap_copy: BinaryHeap<Reverse<Request>> = self.heap.clone();
-        let mut ordered = Vec::with_capacity(heap_copy.len());
-        while let Some(Reverse(r)) = heap_copy.pop() {
-            ordered.push(r);
-        }
-        // We need to return references into owned data. Store in a Vec and
-        // return an iterator over indices. But since the trait requires
-        // references to the *queue's* data, we iterate over the heap's
-        // internal storage in arbitrary order instead.
-        // For correct priority-order iteration we'd need a different design.
-        // Here we use the sorted order for correctness.
-        //
-        // Actually, we need to return references with lifetime tied to `self`.
-        // The cleanest approach: iterate the internal vec (unordered).
-        // Users who need priority order should pop.
         Box::new(self.heap.iter().map(|Reverse(r)| r))
     }
 

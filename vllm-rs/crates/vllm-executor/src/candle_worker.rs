@@ -7,7 +7,7 @@
 //! architecture via `vllm-models`, and runs forward passes using candle
 //! tensors. HuggingFace Hub models are downloaded on demand via `hf-hub`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -258,7 +258,7 @@ impl Worker for CandleWorker {
         let factory = registry.get(&arch).ok_or_else(|| {
             ExecutorError::WorkerInit(format!(
                 "unsupported architecture: {arch}. Supported: {:?}",
-                registry.architectures()
+                registry.architectures().collect::<Vec<_>>()
             ))
         })?;
 
@@ -319,9 +319,9 @@ impl Worker for CandleWorker {
 
         // Clean up buffers for finished requests.
         for req_id in &scheduler_output.finished_req_ids {
-            self.token_buffers.remove(req_id.as_str());
-            self.sampling_params_map.remove(req_id.as_str());
-            self.kv_caches.remove(req_id.as_str());
+            self.token_buffers.remove(req_id);
+            self.sampling_params_map.remove(req_id);
+            self.kv_caches.remove(req_id);
         }
 
         // Collect requests to process: (req_id, token_ids, positions, is_prefill).
@@ -378,8 +378,13 @@ impl Worker for CandleWorker {
         // --- Process cached/continuing requests (decode) ---
         // With KV cache, we only feed the last token; previous tokens' K/V
         // are already cached. This makes decode O(1) per token instead of O(n).
+        let new_req_ids: HashSet<&str> = scheduler_output
+            .scheduled_new_reqs
+            .iter()
+            .map(|r| r.req_id.as_str())
+            .collect();
         for req_id in scheduler_output.num_scheduled_tokens.keys() {
-            if req_inputs.iter().any(|r| r.req_id == *req_id) {
+            if new_req_ids.contains(req_id.as_str()) {
                 continue; // Already handled as a new request.
             }
             let num_tokens = scheduler_output.num_scheduled_tokens[req_id];
@@ -435,38 +440,37 @@ impl Worker for CandleWorker {
                 .narrow(0, last_pos, 1)
                 .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
 
-            let sampled =
-                if let Some(params) = self.sampling_params_map.get(req_input.req_id.as_str()) {
-                    let temp = params.temperature as f32;
-                    let top_k = params.top_k.max(0) as usize;
-                    let top_p = params.top_p as f32;
+            let sampled = if let Some(params) = self.sampling_params_map.get(&req_input.req_id) {
+                let temp = params.temperature as f32;
+                let top_k = params.top_k.max(0) as usize;
+                let top_p = params.top_p as f32;
 
-                    if temp < 1e-5 {
-                        sampler.greedy(&req_logits).map_err(|e| {
-                            ExecutorError::WorkerExecution(format!("greedy error: {e}"))
-                        })?
-                    } else if top_k > 0 || top_p < 1.0 {
-                        sampler
-                            .sample_top_k_top_p(&req_logits, temp, top_k, top_p)
-                            .map_err(|e| {
-                                ExecutorError::WorkerExecution(format!("sampling error: {e}"))
-                            })?
-                    } else {
-                        sampler.sample(&req_logits, temp).map_err(|e| {
+                if temp < 1e-5 {
+                    sampler
+                        .greedy(&req_logits)
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("greedy error: {e}")))?
+                } else if top_k > 0 || top_p < 1.0 {
+                    sampler
+                        .sample_top_k_top_p(&req_logits, temp, top_k, top_p)
+                        .map_err(|e| {
                             ExecutorError::WorkerExecution(format!("sampling error: {e}"))
                         })?
-                    }
                 } else {
-                    let indices = req_logits.argmax(candle_core::D::Minus1).map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("argmax error: {e}"))
-                    })?;
-                    indices
-                        .to_vec1::<u32>()
-                        .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?
-                };
+                    sampler.sample(&req_logits, temp).map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("sampling error: {e}"))
+                    })?
+                }
+            } else {
+                let indices = req_logits
+                    .argmax(candle_core::D::Minus1)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("argmax error: {e}")))?;
+                indices
+                    .to_vec1::<u32>()
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?
+            };
 
             // Update the token buffer with the new sampled token(s).
-            if let Some(buf) = self.token_buffers.get_mut(req_input.req_id.as_str()) {
+            if let Some(buf) = self.token_buffers.get_mut(&req_input.req_id) {
                 buf.extend_from_slice(&sampled);
             }
 
@@ -475,7 +479,7 @@ impl Worker for CandleWorker {
                 req_input.req_id,
                 sampled,
                 self.token_buffers
-                    .get(req_input.req_id.as_str())
+                    .get(&req_input.req_id)
                     .map(|b| b.len())
                     .unwrap_or(0),
                 req_input.is_prefill,

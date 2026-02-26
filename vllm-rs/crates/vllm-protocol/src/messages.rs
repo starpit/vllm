@@ -15,6 +15,8 @@
 //! This mirrors the Python `EngineCoreRequestType` enum and the multipart
 //! send/recv patterns in `vllm/v1/engine/core.py`.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -66,6 +68,20 @@ impl EngineCoreRequestType {
     pub fn as_bytes(self) -> [u8; 1] {
         [self as u8]
     }
+
+    /// Return a static byte slice for the request type tag.
+    ///
+    /// Each variant maps to a distinct 1-byte static slice so callers can use
+    /// `Bytes::from_static` and avoid a heap allocation.
+    pub fn as_static_bytes(self) -> &'static [u8] {
+        match self {
+            Self::Add => &[0x00],
+            Self::Abort => &[0x01],
+            Self::StartDpWave => &[0x02],
+            Self::Utility => &[0x03],
+            Self::ExecutorFailed => &[0x04],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +91,7 @@ impl EngineCoreRequestType {
 /// Status sent during the engine-core startup handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeHello {
-    pub status: String,
+    pub status: Cow<'static, str>,
     pub local: bool,
     pub headless: bool,
 }
@@ -83,7 +99,7 @@ pub struct HandshakeHello {
 impl HandshakeHello {
     pub fn new(local: bool, headless: bool) -> Self {
         Self {
-            status: "HELLO".into(),
+            status: Cow::Borrowed("HELLO"),
             local,
             headless,
         }
@@ -93,7 +109,7 @@ impl HandshakeHello {
 /// Ready message sent after engine-core initialization completes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeReady {
-    pub status: String,
+    pub status: Cow<'static, str>,
     pub local: bool,
     pub headless: bool,
     pub num_gpu_blocks: usize,
@@ -104,7 +120,7 @@ pub struct HandshakeReady {
 impl HandshakeReady {
     pub fn new(local: bool, headless: bool, num_gpu_blocks: usize) -> Self {
         Self {
-            status: "READY".into(),
+            status: Cow::Borrowed("READY"),
             local,
             headless,
             num_gpu_blocks,

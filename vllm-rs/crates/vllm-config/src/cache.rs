@@ -4,6 +4,8 @@
 //! KV cache configuration types, ported from `vllm/config/cache.py` and
 //! `vllm/v1/kv_cache_interface.py`.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -121,11 +123,11 @@ pub struct CacheConfig {
 
     /// Data type for the Mamba cache (conv + ssm state).
     #[serde(default = "default_mamba_dtype")]
-    pub mamba_cache_dtype: String,
+    pub mamba_cache_dtype: Cow<'static, str>,
 
     /// Data type for the Mamba SSM state only.
     #[serde(default = "default_mamba_dtype")]
-    pub mamba_ssm_cache_dtype: String,
+    pub mamba_ssm_cache_dtype: Cow<'static, str>,
 
     /// Cache strategy for Mamba layers.
     #[serde(default)]
@@ -155,7 +157,7 @@ pub struct CacheConfig {
 
     /// Backend for KV cache offloading.
     #[serde(default = "default_kv_offloading_backend")]
-    pub kv_offloading_backend: String,
+    pub kv_offloading_backend: Cow<'static, str>,
 }
 
 fn default_gpu_memory_utilization() -> f64 {
@@ -170,12 +172,12 @@ fn bool_true() -> bool {
     true
 }
 
-fn default_mamba_dtype() -> String {
-    "auto".to_string()
+fn default_mamba_dtype() -> Cow<'static, str> {
+    Cow::Borrowed("auto")
 }
 
-fn default_kv_offloading_backend() -> String {
-    "native".to_string()
+fn default_kv_offloading_backend() -> Cow<'static, str> {
+    Cow::Borrowed("native")
 }
 
 impl Default for CacheConfig {
@@ -195,15 +197,15 @@ impl Default for CacheConfig {
             cpu_kvcache_space_bytes: None,
             mamba_page_size_padded: None,
             mamba_block_size: None,
-            mamba_cache_dtype: "auto".to_string(),
-            mamba_ssm_cache_dtype: "auto".to_string(),
+            mamba_cache_dtype: Cow::Borrowed("auto"),
+            mamba_ssm_cache_dtype: Cow::Borrowed("auto"),
             mamba_cache_mode: MambaCacheMode::default(),
             num_gpu_blocks: None,
             num_cpu_blocks: None,
             kv_sharing_fast_prefill: false,
             kv_cache_memory_bytes: None,
             kv_offloading_size: None,
-            kv_offloading_backend: "native".to_string(),
+            kv_offloading_backend: Cow::Borrowed("native"),
         }
     }
 }
@@ -268,14 +270,14 @@ pub enum KVCacheSpecType {
         /// Shapes of the Mamba state tensors.
         shapes: Vec<Vec<usize>>,
         #[serde(default = "default_mamba_type")]
-        mamba_type: String,
+        mamba_type: Cow<'static, str>,
         #[serde(default)]
         mamba_cache_mode: MambaCacheMode,
     },
 }
 
-fn default_mamba_type() -> String {
-    "mamba2".to_string()
+fn default_mamba_type() -> Cow<'static, str> {
+    Cow::Borrowed("mamba2")
 }
 
 /// A single KV cache spec for a group of layers.

@@ -43,7 +43,7 @@ use crate::worker::Worker;
 #[derive(Debug)]
 pub enum WorkerRequest {
     /// Execute the model with the given scheduler output.
-    ExecuteModel(Box<SchedulerOutput>),
+    ExecuteModel(Arc<SchedulerOutput>),
     /// Initialize KV cache.
     InitializeCache {
         num_gpu_blocks: usize,
@@ -298,10 +298,10 @@ impl Executor for MultiprocExecutor {
         scheduler_output: &SchedulerOutput,
     ) -> EngineResult<ModelRunnerOutput> {
         // Broadcast to all workers, collect from output rank.
+        // Wrap in Arc so each worker gets a cheap clone instead of a full copy.
+        let shared = Arc::new(scheduler_output.clone());
         let responses = self
-            .collective_rpc_blocking(|| {
-                WorkerRequest::ExecuteModel(Box::new(scheduler_output.clone()))
-            })
+            .collective_rpc_blocking(|| WorkerRequest::ExecuteModel(Arc::clone(&shared)))
             .map_err(|e| vllm_engine::error::EngineError::Executor(e.to_string()))?;
 
         // Only the output rank's response matters.

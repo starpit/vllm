@@ -124,15 +124,15 @@ impl ModelRunnerOutput {
     ///
     /// Useful for testing and for simple executor implementations.
     pub fn from_token_map(token_map: HashMap<String, Vec<u32>>) -> Self {
-        let req_ids: Vec<String> = token_map.keys().cloned().collect();
-        let req_id_to_index: HashMap<String, usize> = req_ids
-            .iter()
-            .enumerate()
-            .map(|(i, id)| (id.clone(), i))
-            .collect();
-        let sampled_token_ids: Vec<Vec<u32>> =
-            req_ids.iter().map(|id| token_map[id].clone()).collect();
-
+        let mut req_ids = Vec::with_capacity(token_map.len());
+        let mut req_id_to_index = HashMap::with_capacity(token_map.len());
+        let mut sampled_token_ids = Vec::with_capacity(token_map.len());
+        for (id, tokens) in token_map {
+            let idx = req_ids.len();
+            req_id_to_index.insert(id.clone(), idx);
+            req_ids.push(id);
+            sampled_token_ids.push(tokens);
+        }
         Self {
             req_ids,
             req_id_to_index,
@@ -247,15 +247,24 @@ impl Executor for NoopExecutor {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> EngineResult<ModelRunnerOutput> {
-        let mut token_map = HashMap::new();
-
-        // Generate one token per scheduled request.
-        for req_id in scheduler_output.num_scheduled_tokens.keys() {
-            token_map.insert(req_id.clone(), vec![self.next_token_id]);
+        let n = scheduler_output.num_scheduled_tokens.len();
+        let mut req_ids = Vec::with_capacity(n);
+        let mut req_id_to_index = HashMap::with_capacity(n);
+        let mut sampled_token_ids = Vec::with_capacity(n);
+        for (i, req_id) in scheduler_output.num_scheduled_tokens.keys().enumerate() {
+            req_id_to_index.insert(req_id.clone(), i);
+            req_ids.push(req_id.clone());
+            sampled_token_ids.push(vec![self.next_token_id]);
             self.next_token_id += 1;
         }
-
-        Ok(ModelRunnerOutput::from_token_map(token_map))
+        Ok(ModelRunnerOutput {
+            req_ids,
+            req_id_to_index,
+            sampled_token_ids,
+            logprobs: None,
+            prompt_logprobs_dict: HashMap::new(),
+            draft_token_ids: None,
+        })
     }
 
     fn initialize_cache(

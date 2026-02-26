@@ -809,9 +809,9 @@ impl ModelList {
 // ---------------------------------------------------------------------------
 
 /// Health check response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
-    pub status: String,
+    pub status: &'static str,
 }
 
 /// Version information response.

@@ -38,8 +38,9 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
 
     // 4. Build server config and serve.
     let bind_address = format!("{}:{}", host, port);
+    info!("Serving on http://{}", bind_address);
     let server_config = ServerConfig {
-        bind_address: bind_address.clone(),
+        bind_address,
         version: format!("0.1.0-rust ({})", stack.model_name),
         cors_enabled: true,
         metrics_enabled: enable_metrics,
@@ -49,8 +50,6 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         engine: stack.engine,
         config: server_config,
     });
-
-    info!("Serving on http://{}", bind_address);
     vllm_serve::server::serve(app_state)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;

@@ -148,7 +148,7 @@ impl EngineCore {
 
     /// Abort requests by ID.
     pub fn abort_requests(&mut self, request_ids: &[String]) {
-        let id_refs: Vec<&str> = request_ids.iter().map(|s| s.as_str()).collect();
+        let id_refs: Vec<&str> = request_ids.iter().map(String::as_str).collect();
         self.scheduler
             .finish_requests(&id_refs, RequestStatus::FinishedAborted);
     }
@@ -286,18 +286,17 @@ impl EngineCore {
 
         // Process each request that was scheduled.
         for req_id in scheduler_output.num_scheduled_tokens.keys() {
-            let new_token_ids = model_output
-                .get_tokens(req_id)
-                .map(|t| t.to_vec())
-                .unwrap_or_default();
+            let new_token_ids_slice: &[u32] = model_output.get_tokens(req_id).unwrap_or_default();
 
             // Append new tokens to the request's state in the scheduler.
-            if !new_token_ids.is_empty() {
-                self.scheduler.append_output_tokens(req_id, &new_token_ids);
+            if !new_token_ids_slice.is_empty() {
+                self.scheduler
+                    .append_output_tokens(req_id, new_token_ids_slice);
             }
 
             // Check stop criteria against the updated request state.
-            let (finish_reason, stop_reason) = self.check_stop_criteria(req_id, &new_token_ids);
+            let (finish_reason, stop_reason) =
+                self.check_stop_criteria(req_id, new_token_ids_slice);
 
             if let Some(reason) = finish_reason {
                 let status = match reason {
@@ -315,7 +314,7 @@ impl EngineCore {
             // Build the output for this request.
             let output = EngineCoreOutput {
                 request_id: req_id.clone(),
-                new_token_ids,
+                new_token_ids: new_token_ids_slice.to_vec(),
                 finish_reason,
                 stop_reason,
                 num_cached_tokens: 0,

@@ -165,50 +165,54 @@ impl SamplingParams {
     /// Validate the sampling parameters, returning an error message on failure.
     ///
     /// This mirrors the `_verify_args` logic from the Python implementation.
-    pub fn validate(&self) -> Result<(), String> {
+    /// Uses `Cow<'static, str>` so static error messages don't allocate.
+    pub fn validate(&self) -> Result<(), std::borrow::Cow<'static, str>> {
         if self.n < 1 {
-            return Err(format!("n must be at least 1, got {}", self.n));
+            return Err(format!("n must be at least 1, got {}", self.n).into());
         }
         if !(-2.0..=2.0).contains(&self.presence_penalty) {
             return Err(format!(
                 "presence_penalty must be in [-2, 2], got {}",
                 self.presence_penalty
-            ));
+            )
+            .into());
         }
         if !(-2.0..=2.0).contains(&self.frequency_penalty) {
             return Err(format!(
                 "frequency_penalty must be in [-2, 2], got {}",
                 self.frequency_penalty
-            ));
+            )
+            .into());
         }
         if self.repetition_penalty <= 0.0 {
             return Err(format!(
                 "repetition_penalty must be > 0, got {}",
                 self.repetition_penalty
-            ));
+            )
+            .into());
         }
         if self.temperature < 0.0 {
-            return Err(format!(
-                "temperature must be non-negative, got {}",
-                self.temperature
-            ));
+            return Err(
+                format!("temperature must be non-negative, got {}", self.temperature).into(),
+            );
         }
         if !(0.0 < self.top_p && self.top_p <= 1.0) {
-            return Err(format!("top_p must be in (0, 1], got {}", self.top_p));
+            return Err(format!("top_p must be in (0, 1], got {}", self.top_p).into());
         }
         if self.top_k < -1 {
             return Err(format!(
                 "top_k must be 0 (disable), or at least 1, got {}",
                 self.top_k
-            ));
+            )
+            .into());
         }
         if !(0.0..=1.0).contains(&self.min_p) {
-            return Err(format!("min_p must be in [0, 1], got {}", self.min_p));
+            return Err(format!("min_p must be in [0, 1], got {}", self.min_p).into());
         }
         if let Some(max) = self.max_tokens
             && max < 1
         {
-            return Err(format!("max_tokens must be at least 1, got {max}"));
+            return Err(format!("max_tokens must be at least 1, got {max}").into());
         }
         if self.min_tokens > 0
             && let Some(max) = self.max_tokens
@@ -217,21 +221,20 @@ impl SamplingParams {
             return Err(format!(
                 "min_tokens ({}) must be <= max_tokens ({max})",
                 self.min_tokens
-            ));
+            )
+            .into());
         }
         if let Some(lp) = self.logprobs
             && lp != -1
             && lp < 0
         {
-            return Err(format!("logprobs must be non-negative or -1, got {lp}"));
+            return Err(format!("logprobs must be non-negative or -1, got {lp}").into());
         }
         if let Some(plp) = self.prompt_logprobs
             && plp != -1
             && plp < 0
         {
-            return Err(format!(
-                "prompt_logprobs must be non-negative or -1, got {plp}"
-            ));
+            return Err(format!("prompt_logprobs must be non-negative or -1, got {plp}").into());
         }
         if !self.stop.is_empty() && !self.detokenize {
             return Err("stop strings are only supported when detokenize is true".into());
@@ -241,10 +244,7 @@ impl SamplingParams {
         }
         // Greedy-specific check.
         if self.temperature < SAMPLING_EPS && self.n > 1 {
-            return Err(format!(
-                "n must be 1 when using greedy sampling, got {}",
-                self.n
-            ));
+            return Err(format!("n must be 1 when using greedy sampling, got {}", self.n).into());
         }
         Ok(())
     }

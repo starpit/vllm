@@ -8,6 +8,8 @@
 //! `ModelConfig` is extremely large and depends on HuggingFace / PyTorch types
 //! that have no direct Rust equivalent.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 /// Model data type selection (mirrors the Python `ModelDType` literal).
@@ -48,7 +50,7 @@ pub enum AttnType {
 pub struct ModelConfig {
     /// Name or path of the Hugging Face model.
     #[serde(default = "default_model_name")]
-    pub model: String,
+    pub model: Cow<'static, str>,
 
     /// Model context length (prompt + output).
     pub max_model_len: usize,
@@ -106,8 +108,8 @@ pub struct ModelConfig {
     pub attn_type: AttnType,
 }
 
-fn default_model_name() -> String {
-    "Qwen/Qwen3-0.6B".to_string()
+fn default_model_name() -> Cow<'static, str> {
+    Cow::Borrowed("Qwen/Qwen3-0.6B")
 }
 
 fn default_max_logprobs() -> i32 {
@@ -117,7 +119,7 @@ fn default_max_logprobs() -> i32 {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
-            model: default_model_name(),
+            model: Cow::Borrowed("Qwen/Qwen3-0.6B"),
             max_model_len: 8192,
             max_logprobs: 20,
             is_encoder_decoder: false,
@@ -152,7 +154,7 @@ mod tests {
     #[test]
     fn test_model_config_roundtrip() {
         let cfg = ModelConfig {
-            model: "meta-llama/Llama-3-8B".to_string(),
+            model: Cow::Borrowed("meta-llama/Llama-3-8B"),
             max_model_len: 4096,
             is_encoder_decoder: true,
             max_logprobs: -1,

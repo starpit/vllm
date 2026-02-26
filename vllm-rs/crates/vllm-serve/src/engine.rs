@@ -237,10 +237,6 @@ impl AsyncEngine {
             let mut sp = sampling_params.clone();
             sp.seed = sp.seed.map(|s| s.wrapping_add(i as u64));
 
-            let mut ec_req = ec_request.clone();
-            ec_req.request_id = child_id.clone();
-            ec_req.sampling_params = Some(sp.clone());
-
             let detokenizer = self.tokenizer.as_ref().map(|tok| {
                 IncrementalDetokenizer::new(
                     Arc::clone(tok),
@@ -251,6 +247,10 @@ impl AsyncEngine {
                     sp.skip_special_tokens,
                 )
             });
+
+            let mut ec_req = ec_request.clone();
+            ec_req.request_id = child_id.clone();
+            ec_req.sampling_params = Some(sp);
 
             self.submit_request(
                 child_id.clone(),
@@ -366,10 +366,6 @@ impl AsyncEngine {
             let mut sp = sampling_params.clone();
             sp.seed = sp.seed.map(|s| s.wrapping_add(i as u64));
 
-            let mut ec_req = ec_request.clone();
-            ec_req.request_id = child_id.clone();
-            ec_req.sampling_params = Some(sp.clone());
-
             let detokenizer = self.tokenizer.as_ref().map(|tok| {
                 IncrementalDetokenizer::new(
                     Arc::clone(tok),
@@ -380,6 +376,10 @@ impl AsyncEngine {
                     sp.skip_special_tokens,
                 )
             });
+
+            let mut ec_req = ec_request.clone();
+            ec_req.request_id = child_id.clone();
+            ec_req.sampling_params = Some(sp);
 
             self.submit_request(
                 child_id,
@@ -768,11 +768,8 @@ impl AsyncEngine {
 
         // Determine finish/stop reason. Detokenizer stop takes priority.
         let is_finished = output.finish_reason.is_some() || detokenizer_stop.is_some();
-        let (delta_finish_reason, delta_stop_reason) = if let Some(stop_str) = &detokenizer_stop {
-            (
-                Some(FinishReason::Stop),
-                Some(StopReason::String(stop_str.clone())),
-            )
+        let (delta_finish_reason, delta_stop_reason) = if let Some(stop_str) = detokenizer_stop {
+            (Some(FinishReason::Stop), Some(StopReason::String(stop_str)))
         } else {
             (output.finish_reason, output.stop_reason.clone())
         };
@@ -1065,11 +1062,12 @@ impl AsyncEngine {
 
 /// Generate placeholder text from token IDs (used when no tokenizer is available).
 fn placeholder_text(token_ids: &[u32]) -> String {
-    token_ids
-        .iter()
-        .map(|id| format!("<token_{id}>"))
-        .collect::<Vec<_>>()
-        .join("")
+    use std::fmt::Write;
+    let mut s = String::new();
+    for id in token_ids {
+        let _ = write!(s, "<token_{id}>");
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------

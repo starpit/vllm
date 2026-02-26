@@ -65,7 +65,20 @@ impl RequestStatus {
 impl std::fmt::Display for RequestStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Match Python's `__str__` which returns the variant name.
-        write!(f, "{:?}", self)
+        // Use write_str with a match to avoid Debug formatter overhead.
+        f.write_str(match self {
+            Self::Waiting => "Waiting",
+            Self::WaitingForFsm => "WaitingForFsm",
+            Self::WaitingForRemoteKvs => "WaitingForRemoteKvs",
+            Self::WaitingForStreamingReq => "WaitingForStreamingReq",
+            Self::Running => "Running",
+            Self::Preempted => "Preempted",
+            Self::FinishedStopped => "FinishedStopped",
+            Self::FinishedLengthCapped => "FinishedLengthCapped",
+            Self::FinishedAborted => "FinishedAborted",
+            Self::FinishedIgnored => "FinishedIgnored",
+            Self::FinishedError => "FinishedError",
+        })
     }
 }
 
@@ -157,7 +170,6 @@ impl Request {
     ) -> Self {
         let num_prompt_tokens = prompt_token_ids.len() as u32;
         let max_tokens = sampling_params.max_tokens.unwrap_or(u32::MAX);
-        let all_token_ids = prompt_token_ids.clone();
 
         Self {
             request_id,
@@ -167,9 +179,9 @@ impl Request {
             arrival_time,
             status: RequestStatus::Waiting,
             max_tokens,
+            all_token_ids: prompt_token_ids.clone(),
             prompt_token_ids,
             output_token_ids: Vec::new(),
-            all_token_ids,
             spec_token_ids: Vec::new(),
             num_computed_tokens: 0,
             num_prompt_tokens,

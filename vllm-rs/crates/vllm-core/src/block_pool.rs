@@ -338,8 +338,8 @@ impl BlockPool {
         }
 
         // Second pass: collect blocks with ref_cnt == 0 that should go back
-        // to the free list.
-        let to_free: Vec<usize> = block_indices
+        // to the free list. Use SmallVec to avoid heap allocation for typical cases.
+        let to_free: SmallVec<[usize; 16]> = block_indices
             .iter()
             .copied()
             .filter(|&idx| self.blocks[idx].ref_cnt == 0 && !self.blocks[idx].is_null)

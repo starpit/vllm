@@ -54,7 +54,7 @@ pub enum TransportError {
 
     /// Invalid message format.
     #[error("invalid message: {0}")]
-    InvalidMessage(String),
+    InvalidMessage(std::borrow::Cow<'static, str>),
 
     /// Connection timeout.
     #[error("connection timeout after {0:?}")]
@@ -102,7 +102,7 @@ impl EngineInputSocket {
     /// Returns the request type and the raw payload frames (not yet decoded).
     pub async fn recv_typed(&mut self) -> TransportResult<(EngineCoreRequestType, Vec<Bytes>)> {
         let msg = self.socket.recv().await?;
-        let frames: Vec<Bytes> = msg.into_vec();
+        let mut frames: Vec<Bytes> = msg.into_vec();
 
         if frames.is_empty() {
             return Err(TransportError::InvalidMessage(
@@ -116,10 +116,12 @@ impl EngineInputSocket {
         }
 
         let request_type = EngineCoreRequestType::from_byte(type_frame[0]).ok_or_else(|| {
-            TransportError::InvalidMessage(format!("unknown request type: 0x{:02x}", type_frame[0]))
+            TransportError::InvalidMessage(
+                format!("unknown request type: 0x{:02x}", type_frame[0]).into(),
+            )
         })?;
 
-        let data_frames = frames[1..].to_vec();
+        let data_frames = frames.split_off(1);
         Ok((request_type, data_frames))
     }
 
@@ -135,6 +137,7 @@ impl EngineInputSocket {
                 "no data frames in message".into(),
             ));
         }
+
         let value: T = self.decoder.decode(&data_frames[0])?;
         Ok((req_type, value))
     }
@@ -214,22 +217,22 @@ impl FrontendInputSocket {
     ) -> TransportResult<()> {
         let payload = self.encoder.encode(value)?;
         let mut msg = ZmqMessage::from(Bytes::copy_from_slice(identity));
-        msg.push_back(Bytes::from(request_type.as_bytes().to_vec()));
+        msg.push_back(Bytes::from_static(request_type.as_static_bytes()));
         msg.push_back(payload);
         self.socket.send(msg).await?;
         Ok(())
     }
 
     /// Receive a registration message from an engine.
-    pub async fn recv_registration(&mut self) -> TransportResult<Vec<u8>> {
+    pub async fn recv_registration(&mut self) -> TransportResult<Bytes> {
         let msg = self.socket.recv().await?;
-        let frames: Vec<Bytes> = msg.into_vec();
+        let mut frames: Vec<Bytes> = msg.into_vec();
         if frames.is_empty() {
             return Err(TransportError::InvalidMessage(
                 "empty registration message".into(),
             ));
         }
-        Ok(frames[0].to_vec())
+        Ok(frames.remove(0))
     }
 }
 
@@ -292,7 +295,7 @@ pub fn build_request_message<T: serde::Serialize>(
     value: &T,
 ) -> TransportResult<ZmqMessage> {
     let payload = codec::encode(value)?;
-    let mut msg = ZmqMessage::from(Bytes::from(request_type.as_bytes().to_vec()));
+    let mut msg = ZmqMessage::from(Bytes::from_static(request_type.as_static_bytes()));
     msg.push_back(payload);
     Ok(msg)
 }
@@ -307,7 +310,9 @@ pub fn parse_request_type(frames: &[Bytes]) -> TransportResult<EngineCoreRequest
         return Err(TransportError::InvalidMessage("empty type frame".into()));
     }
     EngineCoreRequestType::from_byte(type_frame[0]).ok_or_else(|| {
-        TransportError::InvalidMessage(format!("unknown request type: 0x{:02x}", type_frame[0]))
+        TransportError::InvalidMessage(
+            format!("unknown request type: 0x{:02x}", type_frame[0]).into(),
+        )
     })
 }
 

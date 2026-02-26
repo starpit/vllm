@@ -193,9 +193,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<protocol::Model
 
 /// GET /health
 async fn health() -> Json<protocol::HealthResponse> {
-    Json(protocol::HealthResponse {
-        status: "ok".to_string(),
-    })
+    Json(protocol::HealthResponse { status: "ok" })
 }
 
 /// GET /version
@@ -225,12 +223,12 @@ fn stream_chat_response(
 
         // Use detokenized text if available, otherwise fall back to placeholders.
         let text = delta.text.unwrap_or_else(|| {
-            delta
-                .new_token_ids
-                .iter()
-                .map(|id| format!("<token_{id}>"))
-                .collect::<Vec<_>>()
-                .join("")
+            use std::fmt::Write;
+            let mut s = String::new();
+            for id in &delta.new_token_ids {
+                let _ = write!(s, "<token_{id}>");
+            }
+            s
         });
 
         let chunk = protocol::ChatCompletionStreamResponse::new(
@@ -324,8 +322,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let parsed: protocol::HealthResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed.status, "ok");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["status"], "ok");
     }
 
     #[tokio::test]

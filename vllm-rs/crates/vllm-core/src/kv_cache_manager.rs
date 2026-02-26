@@ -153,7 +153,9 @@ impl KVCacheManager {
         let max_cache_hit_length = request.num_tokens().saturating_sub(1);
         let max_cache_hit_blocks = max_cache_hit_length / block_size;
 
-        let kv_cache_group_ids: Vec<u32> = (0..self.num_kv_cache_groups as u32).collect();
+        // Use a stack-allocated SmallVec for the common single-group case.
+        let kv_cache_group_ids: smallvec::SmallVec<[u32; 4]> =
+            (0..self.num_kv_cache_groups as u32).collect();
 
         let mut computed_blocks: Vec<Vec<usize>> =
             (0..self.num_kv_cache_groups).map(|_| Vec::new()).collect();
@@ -296,10 +298,14 @@ impl KVCacheManager {
         }
 
         // Build the return value: only the *new* blocks.
-        let new_blocks_per_group: Vec<Vec<usize>> = (0..self.num_kv_cache_groups)
+        // For the common single-group case, move instead of clone.
+        if self.num_kv_cache_groups == 1 {
+            return Some(vec![new_block_indices]);
+        }
+        let mut new_blocks_per_group: Vec<Vec<usize>> = (0..self.num_kv_cache_groups - 1)
             .map(|_| new_block_indices.clone())
             .collect();
-
+        new_blocks_per_group.push(new_block_indices); // move the last one
         Some(new_blocks_per_group)
     }
 
@@ -312,7 +318,9 @@ impl KVCacheManager {
         if let Some(groups) = self.req_to_blocks.remove(request_id) {
             for group in &groups {
                 // Free in reverse order for LRU eviction.
-                let reversed: Vec<usize> = group.iter().copied().rev().collect();
+                // Use SmallVec to avoid heap allocation for typical block counts.
+                let reversed: smallvec::SmallVec<[usize; 16]> =
+                    group.iter().copied().rev().collect();
                 self.block_pool.free_blocks(&reversed);
             }
         }

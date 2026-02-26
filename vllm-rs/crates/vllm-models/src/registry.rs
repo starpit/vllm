@@ -63,8 +63,8 @@ impl ModelRegistry {
     }
 
     /// List all registered architecture names.
-    pub fn architectures(&self) -> Vec<&'static str> {
-        self.models.keys().copied().collect()
+    pub fn architectures(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.models.keys().copied()
     }
 }
 
@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn test_registry_architectures() {
         let registry = ModelRegistry::default_registry();
-        let archs = registry.architectures();
+        let archs: Vec<&'static str> = registry.architectures().collect();
         assert!(archs.contains(&"LlamaForCausalLM"));
         assert!(archs.contains(&"MistralForCausalLM"));
     }

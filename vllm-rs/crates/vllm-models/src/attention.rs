@@ -35,19 +35,25 @@ pub fn scaled_dot_product_attention(
     let (kv_len, num_kv_heads, _head_dim_k) = k.dims3().map_err(ModelError::Candle)?;
 
     // Handle GQA: repeat KV heads to match Q heads.
-    let (k_expanded, v_expanded) = if num_kv_heads < num_q_heads {
+    let k_expanded;
+    let v_expanded;
+    let k_for_attn: &Tensor;
+    let v_for_attn: &Tensor;
+    if num_kv_heads < num_q_heads {
         let repeats = num_q_heads / num_kv_heads;
-        let k_exp = repeat_kv(k, repeats)?;
-        let v_exp = repeat_kv(v, repeats)?;
-        (k_exp, v_exp)
+        k_expanded = repeat_kv(k, repeats)?;
+        v_expanded = repeat_kv(v, repeats)?;
+        k_for_attn = &k_expanded;
+        v_for_attn = &v_expanded;
     } else {
-        (k.clone(), v.clone())
+        k_for_attn = k;
+        v_for_attn = v;
     };
 
     // Transpose to [num_heads, seq_len, head_dim] for batched matmul.
     let q_t = q.transpose(0, 1).map_err(ModelError::Candle)?; // [num_q_heads, q_len, head_dim]
-    let k_t = k_expanded.transpose(0, 1).map_err(ModelError::Candle)?; // [num_q_heads, kv_len, head_dim]
-    let v_t = v_expanded
+    let k_t = k_for_attn.transpose(0, 1).map_err(ModelError::Candle)?; // [num_q_heads, kv_len, head_dim]
+    let v_t = v_for_attn
         .transpose(0, 1)
         .map_err(ModelError::Candle)?
         .contiguous()

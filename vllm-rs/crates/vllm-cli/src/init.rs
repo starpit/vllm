@@ -48,9 +48,14 @@ pub struct InitializedStack {
 pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
     let model_path = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
 
+    // Extract model name before moving model_path into the worker config.
+    // .into_owned() converts Cow<'_, str> to String, consuming the borrow of
+    // model_path so it can be moved into the worker config below.
+    let model_name = extract_model_name(&model_path).into_owned();
+
     // 1. Build worker config.
     let worker_config = CandleWorkerConfig {
-        model_path: model_path.clone(),
+        model_path,
         device_str: args.device.clone(),
         dtype: args.dtype.clone(),
         hf_token: args.hf_token.clone(),
@@ -69,8 +74,6 @@ pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
         .hf_config()
         .context("model config not available after load")?
         .clone();
-
-    let model_name = extract_model_name(&model_path);
     let max_model_len = args
         .max_model_len
         .or(hf_config.max_position_embeddings)
@@ -236,17 +239,19 @@ fn compute_num_blocks(
 }
 
 /// Extract a human-friendly model name from a path or HF ID.
-fn extract_model_name(model_path: &str) -> String {
+fn extract_model_name(model_path: &str) -> std::borrow::Cow<'_, str> {
     // For HF IDs like "meta-llama/Llama-3.2-1B", return the full ID.
     // For local paths, return the last directory component.
     if model_path.contains('/') && !model_path.starts_with('/') {
-        // Looks like an HF model ID.
-        model_path.to_string()
+        // Looks like an HF model ID — borrow directly, no allocation needed.
+        std::borrow::Cow::Borrowed(model_path)
     } else {
-        std::path::Path::new(model_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| model_path.to_string())
+        std::borrow::Cow::Owned(
+            std::path::Path::new(model_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| model_path.to_string()),
+        )
     }
 }
 

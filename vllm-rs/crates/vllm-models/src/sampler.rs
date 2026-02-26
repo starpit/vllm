@@ -136,33 +136,32 @@ impl Sampler {
         };
         indexed.truncate(k);
 
-        // Softmax on the remaining entries.
+        // Softmax on the remaining entries (in-place).
         let max_logit = indexed[0].1;
-        let mut probs: Vec<(usize, f32)> = indexed
-            .iter()
-            .map(|&(idx, logit)| (idx, (logit - max_logit).exp()))
-            .collect();
-        let sum: f32 = probs.iter().map(|(_, p)| p).sum();
-        for entry in &mut probs {
+        for entry in &mut indexed {
+            entry.1 = (entry.1 - max_logit).exp();
+        }
+        let sum: f32 = indexed.iter().map(|(_, p)| p).sum();
+        for entry in &mut indexed {
             entry.1 /= sum;
         }
 
         // Apply top-p: keep tokens until cumulative probability exceeds top_p.
         if top_p > 0.0 && top_p < 1.0 {
             let mut cumsum = 0.0;
-            let mut cutoff = probs.len();
-            for (i, &(_, p)) in probs.iter().enumerate() {
+            let mut cutoff = indexed.len();
+            for (i, &(_, p)) in indexed.iter().enumerate() {
                 cumsum += p;
                 if cumsum > top_p {
                     cutoff = i + 1;
                     break;
                 }
             }
-            probs.truncate(cutoff);
+            indexed.truncate(cutoff);
 
             // Re-normalize.
-            let new_sum: f32 = probs.iter().map(|(_, p)| p).sum();
-            for entry in &mut probs {
+            let new_sum: f32 = indexed.iter().map(|(_, p)| p).sum();
+            for entry in &mut indexed {
                 entry.1 /= new_sum;
             }
         }
@@ -170,13 +169,13 @@ impl Sampler {
         // Sample from the filtered distribution.
         let r: f32 = self.rng.r#gen();
         let mut cumsum = 0.0;
-        for &(idx, p) in &probs {
+        for &(idx, p) in &indexed {
             cumsum += p;
             if cumsum > r {
                 return idx as u32;
             }
         }
-        probs.last().map(|&(idx, _)| idx as u32).unwrap_or(0)
+        indexed.last().map(|&(idx, _)| idx as u32).unwrap_or(0)
     }
 }
 

@@ -120,8 +120,8 @@ impl ChatTemplate {
             return Ok(None);
         }
 
-        let bos_token = extract_token_string(&config.bos_token);
-        let eos_token = extract_token_string(&config.eos_token);
+        let bos_token = extract_token_string(config.bos_token);
+        let eos_token = extract_token_string(config.eos_token);
 
         let mut tpl = ChatTemplate::new(template_str);
         if let Some(bos) = bos_token {
@@ -178,13 +178,13 @@ impl ChatTemplate {
 /// Extract a token string from the `bos_token` / `eos_token` field in
 /// tokenizer_config.json. These can be either a plain string or an object
 /// with a `content` field.
-fn extract_token_string(value: &Option<serde_json::Value>) -> Option<String> {
+fn extract_token_string(value: Option<serde_json::Value>) -> Option<String> {
     match value {
-        Some(serde_json::Value::String(s)) => Some(s.clone()),
-        Some(serde_json::Value::Object(obj)) => obj
-            .get("content")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        Some(serde_json::Value::String(s)) => Some(s),
+        Some(serde_json::Value::Object(mut obj)) => obj.remove("content").and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            _ => None,
+        }),
         _ => None,
     }
 }
@@ -329,18 +329,18 @@ mod tests {
     #[test]
     fn test_extract_token_string_plain() {
         let val = Some(serde_json::Value::String("<s>".to_string()));
-        assert_eq!(extract_token_string(&val), Some("<s>".to_string()));
+        assert_eq!(extract_token_string(val), Some("<s>".to_string()));
     }
 
     #[test]
     fn test_extract_token_string_object() {
         let obj = serde_json::json!({"content": "</s>", "lstrip": false});
         let val = Some(obj);
-        assert_eq!(extract_token_string(&val), Some("</s>".to_string()));
+        assert_eq!(extract_token_string(val), Some("</s>".to_string()));
     }
 
     #[test]
     fn test_extract_token_string_none() {
-        assert_eq!(extract_token_string(&None), None);
+        assert_eq!(extract_token_string(None), None);
     }
 }

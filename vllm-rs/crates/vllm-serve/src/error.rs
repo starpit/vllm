@@ -58,7 +58,7 @@ impl ServeError {
 impl IntoResponse for ServeError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        let error_type = self.error_type().to_string();
+        let error_type = self.error_type();
         let message = self.to_string();
 
         let body = ErrorResponse::new(message, error_type, status.as_u16());

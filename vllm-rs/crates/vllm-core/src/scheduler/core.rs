@@ -320,16 +320,18 @@ impl Scheduler {
         let mut num_output_tokens_vec = Vec::new();
 
         for (idx, req) in running_reqs.iter().chain(resumed_reqs.iter()).enumerate() {
-            let req_id = &req.request_id;
-            req_ids.push(req_id.clone());
+            let is_resumed = idx >= running_reqs.len();
+            let req_id = req.request_id.clone();
 
-            if idx >= running_reqs.len() {
+            if is_resumed {
                 resumed_req_ids.insert(req_id.clone());
             }
 
-            // Block IDs: convert to the output format.
-            let blocks = req_to_new_blocks.get(req_id).cloned();
+            // Block IDs: convert to the output format. Look up before moving req_id.
+            let blocks = req_to_new_blocks.get(&req_id).cloned();
             new_block_ids.push(blocks);
+
+            req_ids.push(req_id);
 
             num_computed_tokens_vec.push(req.num_computed_tokens);
             num_output_tokens_vec
@@ -364,8 +366,7 @@ impl Scheduler {
             }
         }
 
-        // Clear finished request IDs -- they are now captured in the output.
-        self.finished_req_ids = HashSet::new();
+        // finished_req_ids already moved into the output via mem::take.
     }
 
     /// Try to finish a single request. Returns the `(req_id, client_index)`
@@ -488,8 +489,9 @@ impl SchedulerInterface for Scheduler {
                 continue;
             }
 
-            // Try to allocate blocks. If allocation fails, preempt the
-            // lowest-priority running request and retry.
+            // Try to allocate blocks. We need to clone the request because
+            // allocate_slots takes &Request but we also need &mut self.kv_cache.
+            // TODO: Refactor allocate_slots to take minimal fields to avoid this clone.
             let request_clone = self.running[req_index].clone();
             let new_blocks = self.kv_cache.allocate_slots(
                 &request_clone,
@@ -548,6 +550,7 @@ impl SchedulerInterface for Scheduler {
                     scheduled_spec_decode_tokens.remove(&pid);
                     scheduled_running_reqs.retain(|r| r.request_id != pid);
 
+                    // Clone the request for the waiting queue; move into preempted list.
                     self.waiting.prepend_request(preempted.clone());
                     preempted_reqs.push(preempted);
                     break;
@@ -581,9 +584,9 @@ impl SchedulerInterface for Scheduler {
                     break;
                 }
 
-                // Peek at the next waiting request.
-                let request = match self.waiting.peek_request() {
-                    Some(r) => r.clone(),
+                // Pop from the waiting queue directly to avoid peek+clone.
+                let mut request = match self.waiting.pop_request() {
+                    Some(r) => r,
                     None => break,
                 };
                 let request_id = request.request_id.clone();
@@ -610,11 +613,15 @@ impl SchedulerInterface for Scheduler {
                 // If chunked prefill is disabled, skip if the request
                 // doesn't fit in the remaining budget.
                 if !self.enable_chunked_prefill && num_new_tokens > token_budget {
+                    // Put the request back.
+                    self.waiting.prepend_request(request);
                     break;
                 }
 
                 num_new_tokens = num_new_tokens.min(token_budget);
                 if num_new_tokens == 0 {
+                    // Put the request back.
+                    self.waiting.prepend_request(request);
                     break;
                 }
 
@@ -628,57 +635,37 @@ impl SchedulerInterface for Scheduler {
                     self.num_lookahead_tokens
                 };
 
-                // We need to create a temporary request with the computed
-                // tokens set to allow proper block allocation.
-                let mut alloc_request = request.clone();
-                alloc_request.num_computed_tokens = num_computed_tokens;
+                // Set num_computed_tokens for proper block allocation.
+                let orig_computed = request.num_computed_tokens;
+                request.num_computed_tokens = num_computed_tokens;
 
-                let new_blocks = self.kv_cache.allocate_slots(
-                    &alloc_request,
-                    num_new_tokens,
-                    effective_lookahead,
-                );
+                let new_blocks =
+                    self.kv_cache
+                        .allocate_slots(&request, num_new_tokens, effective_lookahead);
 
                 match new_blocks {
                     Some(blocks) => {
-                        // Pop from waiting queue (we peeked earlier).
-                        let mut request = self.waiting.pop_request().unwrap();
+                        // Mutate request to running state.
+                        let was_waiting = request.status == RequestStatus::Waiting;
+                        let was_preempted = request.status == RequestStatus::Preempted;
 
-                        // Move to running.
-                        self.running.push(request.clone());
+                        request.status = RequestStatus::Running;
+                        request.num_computed_tokens = num_computed_tokens;
+                        if request.num_cached_tokens < 0 {
+                            request.num_cached_tokens = num_computed_tokens as i32;
+                        }
 
-                        if request.status == RequestStatus::Waiting {
-                            request.status = RequestStatus::Running;
-                            request.num_computed_tokens = num_computed_tokens;
-                            if request.num_cached_tokens < 0 {
-                                request.num_cached_tokens = num_computed_tokens as i32;
-                            }
+                        // One clone goes to scheduled list, original goes to running.
+                        if was_waiting {
                             scheduled_new_reqs.push(request.clone());
-                        } else if request.status == RequestStatus::Preempted {
-                            request.status = RequestStatus::Running;
-                            request.num_computed_tokens = num_computed_tokens;
+                        } else if was_preempted {
                             scheduled_resumed_reqs.push(request.clone());
                         } else {
-                            warn!(
-                                "Unexpected request status {:?} for {}",
-                                request.status, request.request_id
-                            );
-                            request.status = RequestStatus::Running;
+                            warn!("Unexpected request status for {}", request.request_id);
                         }
 
-                        // Update the running list entry.
-                        if let Some(running_req) = self
-                            .running
-                            .iter_mut()
-                            .rev()
-                            .find(|r| r.request_id == request_id)
-                        {
-                            running_req.status = RequestStatus::Running;
-                            running_req.num_computed_tokens = num_computed_tokens;
-                            if running_req.num_cached_tokens < 0 {
-                                running_req.num_cached_tokens = num_computed_tokens as i32;
-                            }
-                        }
+                        // Move to running list (no extra clone).
+                        self.running.push(request);
 
                         req_to_new_blocks.insert(request_id.clone(), blocks);
                         num_scheduled_tokens.insert(request_id.clone(), num_new_tokens);
@@ -694,7 +681,9 @@ impl SchedulerInterface for Scheduler {
                         }
                     }
                     None => {
-                        // Cannot allocate -- stop scheduling waiting requests.
+                        // Cannot allocate -- put request back and stop.
+                        request.num_computed_tokens = orig_computed;
+                        self.waiting.prepend_request(request);
                         break;
                     }
                 }
@@ -707,19 +696,20 @@ impl SchedulerInterface for Scheduler {
         let total_num_scheduled_tokens: usize = num_scheduled_tokens.values().sum();
 
         // Build NewRequestData for newly scheduled requests.
+        // Use into_iter() to move fields out instead of cloning.
         let new_reqs_data: Vec<NewRequestData> = scheduled_new_reqs
-            .iter()
+            .into_iter()
             .map(|req| {
                 let blocks = req_to_new_blocks
                     .get(&req.request_id)
                     .cloned()
                     .unwrap_or_else(|| vec![Vec::new()]);
                 NewRequestData::new(
-                    req.request_id.clone(),
-                    Some(req.prompt_token_ids.clone()),
+                    req.request_id,
+                    Some(req.prompt_token_ids),
                     blocks,
                     req.num_computed_tokens,
-                    Some(req.sampling_params.clone()),
+                    Some(req.sampling_params),
                 )
             })
             .collect();
@@ -732,10 +722,8 @@ impl SchedulerInterface for Scheduler {
             &req_to_new_blocks,
         );
 
-        let preempted_req_ids: HashSet<String> = preempted_reqs
-            .iter()
-            .map(|r| r.request_id.clone())
-            .collect();
+        let preempted_req_ids: HashSet<String> =
+            preempted_reqs.into_iter().map(|r| r.request_id).collect();
 
         let output = SchedulerOutput {
             scheduled_new_reqs: new_reqs_data,
@@ -745,7 +733,7 @@ impl SchedulerInterface for Scheduler {
             scheduled_spec_decode_tokens,
             scheduled_encoder_inputs: HashMap::new(),
             num_common_prefix_blocks: Vec::new(),
-            finished_req_ids: self.finished_req_ids.clone(),
+            finished_req_ids: std::mem::take(&mut self.finished_req_ids),
             free_encoder_mm_hashes: Vec::new(),
             preempted_req_ids: if preempted_req_ids.is_empty() {
                 None
@@ -761,8 +749,8 @@ impl SchedulerInterface for Scheduler {
     }
 
     fn add_request(&mut self, request: Request) {
-        let request_id = request.request_id.clone();
-        self.requests.insert(request_id, request.clone());
+        self.requests
+            .insert(request.request_id.clone(), request.clone());
         self.waiting.add_request(request);
     }
 
@@ -808,12 +796,10 @@ impl SchedulerInterface for Scheduler {
     }
 
     fn shutdown(&mut self) {
-        // Free all running requests.
-        let running_ids: Vec<String> = self.running.iter().map(|r| r.request_id.clone()).collect();
-        for id in &running_ids {
-            self.kv_cache.free(id);
+        // Free all running requests via drain to avoid intermediate Vec<String>.
+        for req in self.running.drain(..) {
+            self.kv_cache.free(&req.request_id);
         }
-        self.running.clear();
 
         // Drain waiting queue.
         self.waiting.drain_all();

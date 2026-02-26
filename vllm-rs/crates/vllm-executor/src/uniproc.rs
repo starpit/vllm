@@ -33,7 +33,7 @@ pub struct UniProcExecutor {
     /// Whether the executor is sleeping.
     is_sleeping: bool,
     /// Sleeping resource tags.
-    sleeping_tags: Vec<String>,
+    sleeping_tags: Vec<&'static str>,
     /// Whether the executor has been shut down.
     is_shutdown: bool,
 }
@@ -136,7 +136,7 @@ impl Executor for UniProcExecutor {
         self.worker
             .sleep(level)
             .map_err(|e| vllm_engine::error::EngineError::Executor(e.to_string()))?;
-        self.sleeping_tags = vec!["weights".to_string(), "kv_cache".to_string()];
+        self.sleeping_tags = vec!["weights", "kv_cache"];
         self.is_sleeping = true;
         Ok(())
     }
@@ -150,7 +150,8 @@ impl Executor for UniProcExecutor {
             .map_err(|e| vllm_engine::error::EngineError::Executor(e.to_string()))?;
 
         if let Some(tags) = tags {
-            self.sleeping_tags.retain(|t| !tags.contains(t));
+            self.sleeping_tags
+                .retain(|t| !tags.iter().any(|s| s.as_str() == *t));
         } else {
             self.sleeping_tags.clear();
         }

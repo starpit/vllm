@@ -22,7 +22,7 @@
 //! the transition). When the executor is ported (Phase 4+), zero-copy
 //! buffer support will be added here.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Serialize, de::DeserializeOwned};
 
 /// Errors that can occur during encoding or decoding.
@@ -71,10 +71,12 @@ impl MsgpackEncoder {
     /// Encode a value into an existing buffer, returning the number of
     /// bytes written.
     pub fn encode_into<T: Serialize>(&self, value: &T, buf: &mut BytesMut) -> CodecResult<usize> {
-        let data = rmp_serde::to_vec_named(value)?;
-        let len = data.len();
-        buf.extend_from_slice(&data);
-        Ok(len)
+        let before = buf.len();
+        {
+            let mut writer = buf.writer();
+            rmp_serde::encode::write_named(&mut writer, value)?;
+        }
+        Ok(buf.len() - before)
     }
 
     /// Encode a value into a Vec<u8>.

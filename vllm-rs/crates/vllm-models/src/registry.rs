@@ -5,7 +5,19 @@
 
 use std::collections::HashMap;
 
+use candle_core::Device;
+use vllm_model::ModelResult;
+use vllm_model::gguf::GgufFile;
+use vllm_model::weight::HfModelConfig;
+
 use crate::ModelFactory;
+
+/// Factory function type for constructing a model from a GGUF file.
+pub type GgufModelFactory = fn(
+    gguf: &mut GgufFile,
+    config: &HfModelConfig,
+    device: &Device,
+) -> ModelResult<Box<dyn crate::Model>>;
 
 /// Registry that maps HuggingFace architecture names to model factory functions.
 ///
@@ -13,6 +25,8 @@ use crate::ModelFactory;
 /// e.g., `"LlamaForCausalLM"`, `"MistralForCausalLM"`.
 pub struct ModelRegistry {
     models: HashMap<&'static str, ModelFactory>,
+    /// GGUF model factories, keyed by GGUF `general.architecture` value.
+    gguf_models: HashMap<&'static str, GgufModelFactory>,
 }
 
 impl ModelRegistry {
@@ -20,6 +34,7 @@ impl ModelRegistry {
     pub fn new() -> Self {
         Self {
             models: HashMap::new(),
+            gguf_models: HashMap::new(),
         }
     }
 
@@ -32,6 +47,8 @@ impl ModelRegistry {
 
     /// Register all built-in model architectures.
     fn register_builtins(&mut self) {
+        // --- SafeTensors factories ---
+
         // LLaMA family
         self.register("LlamaForCausalLM", crate::llama::create_llama);
         // LLaMA 2/3 use the same architecture name
@@ -45,6 +62,10 @@ impl ModelRegistry {
         // Gemma 2 — GELU activation, GemmaRMSNorm, 4 norms per layer,
         // attention/logit soft capping, embedding normalization
         self.register("Gemma2ForCausalLM", crate::gemma2::create_gemma2);
+
+        // --- GGUF factories (keyed by GGUF general.architecture value) ---
+        self.register_gguf("llama", crate::quantized_llama::create_llama_gguf);
+        // Mistral/Phi GGUF files use "llama" architecture internally.
     }
 
     /// Register a model factory for the given architecture name.
@@ -52,9 +73,19 @@ impl ModelRegistry {
         self.models.insert(arch, factory);
     }
 
+    /// Register a GGUF model factory for the given GGUF architecture.
+    pub fn register_gguf(&mut self, arch: &'static str, factory: GgufModelFactory) {
+        self.gguf_models.insert(arch, factory);
+    }
+
     /// Look up a model factory by architecture name.
     pub fn get(&self, arch: &str) -> Option<&ModelFactory> {
         self.models.get(arch)
+    }
+
+    /// Look up a GGUF model factory by GGUF architecture name.
+    pub fn get_gguf(&self, arch: &str) -> Option<&GgufModelFactory> {
+        self.gguf_models.get(arch)
     }
 
     /// Check if an architecture is supported.
@@ -62,9 +93,19 @@ impl ModelRegistry {
         self.models.contains_key(arch)
     }
 
+    /// Check if a GGUF architecture is supported.
+    pub fn contains_gguf(&self, arch: &str) -> bool {
+        self.gguf_models.contains_key(arch)
+    }
+
     /// List all registered architecture names.
     pub fn architectures(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.models.keys().copied()
+    }
+
+    /// List all registered GGUF architecture names.
+    pub fn gguf_architectures(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.gguf_models.keys().copied()
     }
 }
 
@@ -103,5 +144,26 @@ mod tests {
         let registry = ModelRegistry::default_registry();
         assert!(registry.get("LlamaForCausalLM").is_some());
         assert!(registry.get("NonexistentModel").is_none());
+    }
+
+    #[test]
+    fn test_gguf_registry_default() {
+        let registry = ModelRegistry::default_registry();
+        assert!(registry.contains_gguf("llama"));
+        assert!(!registry.contains_gguf("nonexistent"));
+    }
+
+    #[test]
+    fn test_gguf_registry_get() {
+        let registry = ModelRegistry::default_registry();
+        assert!(registry.get_gguf("llama").is_some());
+        assert!(registry.get_gguf("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_gguf_architectures() {
+        let registry = ModelRegistry::default_registry();
+        let archs: Vec<&'static str> = registry.gguf_architectures().collect();
+        assert!(archs.contains(&"llama"));
     }
 }

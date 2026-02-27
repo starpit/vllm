@@ -76,6 +76,11 @@ pub struct ServeArgs {
     /// KV cache block size in tokens.
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    /// Example: --gguf-file llama-2-7b-chat.Q4_K_M.gguf
+    #[arg(long)]
+    pub gguf_file: Option<String>,
 }
 
 impl ServeArgs {
@@ -132,6 +137,10 @@ pub struct BenchArgs {
     /// Log level.
     #[arg(long, default_value = "info")]
     pub log_level: String,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
 }
 
 impl BenchArgs {

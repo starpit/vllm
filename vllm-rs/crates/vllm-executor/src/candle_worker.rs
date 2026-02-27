@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 use vllm_common::SamplingParams;
 use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_engine::executor::ModelRunnerOutput;
+use vllm_model::gguf::{self, GgufFile};
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 use vllm_models::{KvBlockPool, KvCache, KvCacheStorage, Model, ModelRegistry, Sampler};
 
@@ -49,6 +50,10 @@ pub struct CandleWorkerConfig {
     /// KV cache block size in tokens (must match the scheduler's block size).
     /// Defaults to 16 if not set.
     pub block_size: usize,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    /// When set, only this file is downloaded instead of safetensors weights.
+    pub gguf_file: Option<String>,
 }
 
 impl CandleWorkerConfig {
@@ -144,6 +149,270 @@ impl CandleWorker {
         self.resolved_dtype
     }
 
+    /// Check if the model path points to a GGUF file, resolving HF downloads
+    /// if `--gguf-file` was specified.
+    ///
+    /// Returns `Some(path)` if a `.gguf` file was found or downloaded.
+    /// Returns `None` if this is a safetensors model.
+    fn resolve_gguf_path(&self) -> ExecutorResult<Option<PathBuf>> {
+        let path = Path::new(&self.config.model_path);
+
+        // Case 1: Direct local .gguf file path.
+        if path.is_file()
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
+            return Ok(Some(path.to_path_buf()));
+        }
+
+        // Case 2: Local directory containing a .gguf file.
+        if path.is_dir() {
+            if let Some(gguf) = find_gguf_in_dir(path) {
+                return Ok(Some(gguf));
+            }
+            // Directory exists but no GGUF — fall through to safetensors.
+            return Ok(None);
+        }
+
+        // Case 3: HF model ID with --gguf-file specified or auto-detected.
+        // Build HF API client for cases 3 and 4.
+        let is_hf_id =
+            self.config.model_path.contains('/') && !Path::new(&self.config.model_path).exists();
+
+        if is_hf_id {
+            let gguf_filename = if let Some(ref f) = self.config.gguf_file {
+                // Explicit --gguf-file flag.
+                Some(f.clone())
+            } else {
+                // Case 4: Auto-detect GGUF repo by listing files.
+                self.auto_detect_gguf_file()?
+            };
+
+            if let Some(gguf_file) = gguf_filename {
+                info!(
+                    "Downloading GGUF file '{}' from HuggingFace Hub: {}",
+                    gguf_file, self.config.model_path
+                );
+                let api = self.build_hf_api()?;
+                let repo = api.model(self.config.model_path.clone());
+
+                let gguf_path = repo.get(&gguf_file).map_err(|e| {
+                    ExecutorError::WorkerInit(format!(
+                        "failed to download GGUF file '{}' from {}: {e}",
+                        gguf_file, self.config.model_path
+                    ))
+                })?;
+
+                // Try to download tokenizer files from the GGUF repo first,
+                // then fall back to the base model repo (GGUF repos often
+                // don't include tokenizer files).
+                let mut got_tokenizer = false;
+                if let Ok(p) = repo.get("tokenizer.json") {
+                    info!("Downloaded tokenizer.json to {}", p.display());
+                    got_tokenizer = true;
+                }
+                if let Ok(p) = repo.get("tokenizer_config.json") {
+                    info!("Downloaded tokenizer_config.json to {}", p.display());
+                    let _ = p;
+                }
+
+                // If the GGUF repo didn't have a tokenizer, try the base
+                // model repo (e.g. "user/Model-GGUF" → "user/Model").
+                if !got_tokenizer {
+                    self.try_download_tokenizer_from_base_repo(&api, &gguf_path);
+                }
+
+                return Ok(Some(gguf_path));
+            }
+        }
+
+        // Not a GGUF model.
+        Ok(None)
+    }
+
+    /// Build an HF Hub API client from config.
+    fn build_hf_api(&self) -> ExecutorResult<hf_hub::api::sync::Api> {
+        let mut builder = hf_hub::api::sync::ApiBuilder::new();
+        if let Some(token) = &self.config.hf_token {
+            builder = builder.with_token(Some(token.clone()));
+        }
+        if let Some(cache_dir) = &self.config.cache_dir {
+            builder = builder.with_cache_dir(PathBuf::from(cache_dir));
+        }
+        builder
+            .build()
+            .map_err(|e| ExecutorError::WorkerInit(format!("failed to create HF API: {e}")))
+    }
+
+    /// Auto-detect a GGUF file from a HuggingFace repo by listing repo files.
+    ///
+    /// Returns the filename of a GGUF file to download, preferring Q4_K_M
+    /// quantization. Returns `None` if the repo has no GGUF files.
+    fn auto_detect_gguf_file(&self) -> ExecutorResult<Option<String>> {
+        let api = self.build_hf_api()?;
+        let repo = api.model(self.config.model_path.clone());
+
+        // Query repo info to list all files.
+        let repo_info = match repo.info() {
+            Ok(info) => info,
+            Err(_) => return Ok(None), // Can't reach API; fall through to safetensors path.
+        };
+
+        let mut gguf_files: Vec<String> = repo_info
+            .siblings
+            .iter()
+            .filter(|s| s.rfilename.ends_with(".gguf"))
+            .map(|s| s.rfilename.clone())
+            .collect();
+
+        if gguf_files.is_empty() {
+            return Ok(None);
+        }
+
+        // Sort for deterministic selection.
+        gguf_files.sort();
+
+        // Prefer Q4_K_M (good quality/size trade-off), then Q4_K_S, then Q8_0.
+        let preferred = ["Q4_K_M", "Q4_K_S", "Q8_0", "Q5_K_M", "Q6_K"];
+        for pref in &preferred {
+            if let Some(f) = gguf_files.iter().find(|f| f.contains(pref)) {
+                info!(
+                    "Auto-selected GGUF file: {} (from {} available)",
+                    f,
+                    gguf_files.len()
+                );
+                return Ok(Some(f.clone()));
+            }
+        }
+
+        // No preferred quant found — just pick the first .gguf file.
+        let selected = gguf_files.first().unwrap().clone();
+        info!(
+            "Auto-selected GGUF file: {} (from {} available)",
+            selected,
+            gguf_files.len()
+        );
+        Ok(Some(selected))
+    }
+
+    /// Try to download tokenizer files from the base model repo.
+    ///
+    /// GGUF repos (e.g. `user/Model-GGUF`) typically don't include tokenizer
+    /// files. The tokenizer lives in the base model repo (e.g. `user/Model`).
+    /// This method tries common base repo name patterns and downloads
+    /// `tokenizer.json` + `tokenizer_config.json` into the same directory
+    /// as the GGUF file.
+    fn try_download_tokenizer_from_base_repo(
+        &self,
+        api: &hf_hub::api::sync::Api,
+        gguf_path: &Path,
+    ) {
+        let model_dir = match gguf_path.parent() {
+            Some(d) => d,
+            None => return,
+        };
+
+        // Derive candidate base repo names.
+        let model_id = &self.config.model_path;
+        let candidates = derive_base_repo_candidates(model_id);
+
+        if candidates.is_empty() {
+            info!(
+                "No tokenizer in GGUF repo and couldn't derive base model name from '{}'",
+                model_id
+            );
+            return;
+        }
+
+        for candidate in &candidates {
+            info!("Trying to download tokenizer from base repo: {candidate}");
+            let base_repo = api.model(candidate.clone());
+
+            match base_repo.get("tokenizer.json") {
+                Ok(src) => {
+                    // Copy into the GGUF model directory so init.rs can find it.
+                    let dst = model_dir.join("tokenizer.json");
+                    if !dst.exists() {
+                        if let Err(e) = std::fs::copy(&src, &dst) {
+                            warn!("Failed to copy tokenizer.json: {e}");
+                        } else {
+                            info!("Tokenizer downloaded from {candidate}");
+                        }
+                    }
+
+                    // Also grab tokenizer_config.json for chat templates.
+                    if let Ok(src2) = base_repo.get("tokenizer_config.json") {
+                        let dst2 = model_dir.join("tokenizer_config.json");
+                        if !dst2.exists() {
+                            let _ = std::fs::copy(&src2, &dst2);
+                        }
+                    }
+                    return;
+                }
+                Err(_) => continue,
+            }
+        }
+
+        info!(
+            "Could not find tokenizer in any base repo candidate: {:?}",
+            candidates
+        );
+    }
+
+    /// Load a model from a GGUF file.
+    fn load_model_gguf(&mut self, gguf_path: &Path, device: &Device) -> ExecutorResult<()> {
+        info!(
+            "CandleWorker: loading GGUF model from {}",
+            gguf_path.display()
+        );
+
+        let mut gguf = GgufFile::open(gguf_path)
+            .map_err(|e| ExecutorError::WorkerInit(format!("failed to open GGUF: {e}")))?;
+
+        info!("CandleWorker: GGUF file has {} tensors", gguf.num_tensors());
+
+        // Extract model config from GGUF metadata.
+        let hf_config = gguf::gguf_model_config(&gguf).map_err(|e| {
+            ExecutorError::WorkerInit(format!("failed to extract GGUF config: {e}"))
+        })?;
+
+        let arch = gguf
+            .get_metadata_string("general.architecture")
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Look up GGUF factory in the registry.
+        let registry = ModelRegistry::default();
+        let factory = registry.get_gguf(&arch).ok_or_else(|| {
+            ExecutorError::WorkerInit(format!(
+                "unsupported GGUF architecture: {arch}. Supported: {:?}",
+                registry.gguf_architectures().collect::<Vec<_>>()
+            ))
+        })?;
+
+        // Build the model.
+        let model = factory(&mut gguf, &hf_config, device).map_err(|e| {
+            ExecutorError::WorkerInit(format!("failed to construct GGUF model: {e}"))
+        })?;
+
+        // For GGUF, KV cache is always f32.
+        let dtype = DType::F32;
+
+        self.num_kv_heads = hf_config.num_kv_heads().unwrap_or(0);
+        self.head_dim = hf_config.head_dim().unwrap_or(0);
+        // Set model_dir to the parent of the GGUF file (for tokenizer lookup).
+        self.model_dir = gguf_path.parent().map(|p| p.to_path_buf());
+        self.hf_config = Some(hf_config);
+        self.resolved_dtype = Some(dtype);
+        self.model = Some(model);
+        info!(
+            "CandleWorker: GGUF model loaded (arch={arch}, kv_dtype={:?})",
+            dtype
+        );
+        Ok(())
+    }
+
     /// Resolve a model path to a local directory.
     ///
     /// If the path is a local directory, returns it directly.
@@ -159,16 +428,7 @@ impl CandleWorker {
             "Downloading model from HuggingFace Hub: {}",
             self.config.model_path
         );
-        let mut builder = hf_hub::api::sync::ApiBuilder::new();
-        if let Some(token) = &self.config.hf_token {
-            builder = builder.with_token(Some(token.clone()));
-        }
-        if let Some(cache_dir) = &self.config.cache_dir {
-            builder = builder.with_cache_dir(PathBuf::from(cache_dir));
-        }
-        let api = builder
-            .build()
-            .map_err(|e| ExecutorError::WorkerInit(format!("failed to create HF API: {e}")))?;
+        let api = self.build_hf_api()?;
         let repo = api.model(self.config.model_path.clone());
 
         // Download config.json first (required).
@@ -264,10 +524,20 @@ impl Worker for CandleWorker {
     fn load_model(&mut self) -> ExecutorResult<()> {
         let device = self
             .device
-            .as_ref()
+            .clone()
             .ok_or_else(|| ExecutorError::WorkerInit("device not initialized".to_string()))?;
 
         let explicit_dtype = self.config.candle_dtype()?;
+
+        // Check if this is a GGUF model path.
+        let gguf_path = self.resolve_gguf_path()?;
+
+        if let Some(gguf_path) = gguf_path {
+            // ---- GGUF loading path ----
+            return self.load_model_gguf(&gguf_path, &device);
+        }
+
+        // ---- SafeTensors loading path ----
 
         // 1. Resolve model directory (local or HF download).
         let model_dir = self.resolve_model_path()?;
@@ -310,7 +580,7 @@ impl Worker for CandleWorker {
         })?;
 
         // 4. Load weights.
-        let weights = ModelWeights::from_dir(&model_dir, device)
+        let weights = ModelWeights::from_dir(&model_dir, &device)
             .map_err(|e| ExecutorError::WorkerInit(format!("failed to load weights: {e}")))?;
         info!(
             "CandleWorker: loaded {} tensors ({:.1} MB)",
@@ -319,7 +589,7 @@ impl Worker for CandleWorker {
         );
 
         // 5. Construct the model.
-        let model = factory(&weights, &hf_config, dtype, device)
+        let model = factory(&weights, &hf_config, dtype, &device)
             .map_err(|e| ExecutorError::WorkerInit(format!("failed to construct model: {e}")))?;
 
         self.num_kv_heads = hf_config.num_kv_heads().unwrap_or(0);
@@ -615,11 +885,9 @@ impl Worker for CandleWorker {
                             ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
                         })?
                 } else {
-                    model
-                        .forward(&input_ids, &positions, None)
-                        .map_err(|e| {
-                            ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
-                        })?
+                    model.forward(&input_ids, &positions, None).map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
+                    })?
                 }
             };
 
@@ -703,6 +971,70 @@ impl Worker for CandleWorker {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Look for a `.gguf` file in a directory. Returns the first one found.
+fn find_gguf_in_dir(dir: &Path) -> Option<PathBuf> {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Derive candidate base model repo names from a GGUF repo ID.
+///
+/// E.g. `"unsloth/Llama-3.1-8B-Instruct-GGUF"` → `["unsloth/Llama-3.1-8B-Instruct"]`
+///      `"bartowski/Meta-Llama-3-8B-Instruct-GGUF"` → `["bartowski/Meta-Llama-3-8B-Instruct", "meta-llama/Meta-Llama-3-8B-Instruct"]`
+fn derive_base_repo_candidates(model_id: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    // Strip common GGUF suffixes (case-insensitive).
+    let suffixes = ["-GGUF", "-gguf", "_GGUF", "_gguf"];
+    let mut base_name = None;
+    for suffix in &suffixes {
+        if let Some(stripped) = model_id.strip_suffix(suffix) {
+            base_name = Some(stripped);
+            break;
+        }
+    }
+
+    if let Some(base) = base_name {
+        // Same org, stripped name.
+        candidates.push(base.to_string());
+
+        // Also try common original-model orgs for well-known re-quantizers.
+        // E.g. bartowski/Llama-3.1-8B-Instruct-GGUF → meta-llama/Llama-3.1-8B-Instruct
+        if let Some(slash) = base.find('/') {
+            let model_name = &base[slash + 1..];
+            let org = &base[..slash];
+
+            // Don't duplicate if same org.
+            let alt_orgs = [
+                "meta-llama",
+                "mistralai",
+                "Qwen",
+                "google",
+                "microsoft",
+                "unsloth",
+            ];
+            for alt_org in &alt_orgs {
+                if *alt_org != org {
+                    candidates.push(format!("{alt_org}/{model_name}"));
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
 /// Parse a device string ("cpu", "cuda:0", "metal", "auto") into a candle Device.
 pub fn parse_device(device_str: &str) -> ExecutorResult<Device> {
     match device_str {
@@ -772,6 +1104,7 @@ mod tests {
             hf_token: None,
             cache_dir: None,
             block_size: 16,
+            gguf_file: None,
         }
     }
 
@@ -885,6 +1218,81 @@ mod tests {
         worker.shutdown();
         assert!(worker.is_shutdown);
         assert!(worker.model.is_none());
+    }
+
+    #[test]
+    fn test_resolve_gguf_path_not_gguf() {
+        let worker = CandleWorker::new(make_config());
+        // A non-existent path that doesn't end in .gguf and isn't a dir → None.
+        let result = worker.resolve_gguf_path().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_gguf_path_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let gguf_path = dir.path().join("model.gguf");
+        std::fs::write(&gguf_path, b"fake gguf data").unwrap();
+
+        let mut config = make_config();
+        config.model_path = gguf_path.to_string_lossy().to_string();
+        let worker = CandleWorker::new(config);
+
+        let result = worker.resolve_gguf_path().unwrap();
+        assert_eq!(result, Some(gguf_path));
+    }
+
+    #[test]
+    fn test_resolve_gguf_path_dir_with_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        let gguf_path = dir.path().join("model-Q4_K_M.gguf");
+        std::fs::write(&gguf_path, b"fake gguf data").unwrap();
+
+        let mut config = make_config();
+        config.model_path = dir.path().to_string_lossy().to_string();
+        let worker = CandleWorker::new(config);
+
+        let result = worker.resolve_gguf_path().unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().extension().unwrap() == "gguf");
+    }
+
+    #[test]
+    fn test_resolve_gguf_path_dir_no_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        // Empty dir — no .gguf files.
+        let mut config = make_config();
+        config.model_path = dir.path().to_string_lossy().to_string();
+        let worker = CandleWorker::new(config);
+
+        let result = worker.resolve_gguf_path().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_derive_base_repo_gguf_suffix() {
+        let candidates = derive_base_repo_candidates("unsloth/Llama-3.1-8B-Instruct-GGUF");
+        assert!(candidates.contains(&"unsloth/Llama-3.1-8B-Instruct".to_string()));
+    }
+
+    #[test]
+    fn test_derive_base_repo_lowercase_suffix() {
+        let candidates = derive_base_repo_candidates("user/model-gguf");
+        assert!(candidates.contains(&"user/model".to_string()));
+    }
+
+    #[test]
+    fn test_derive_base_repo_no_suffix() {
+        let candidates = derive_base_repo_candidates("meta-llama/Llama-3.1-8B-Instruct");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_derive_base_repo_cross_org() {
+        let candidates = derive_base_repo_candidates("bartowski/Llama-3.1-8B-Instruct-GGUF");
+        // Should include same-org stripped name + cross-org candidates.
+        assert!(candidates.contains(&"bartowski/Llama-3.1-8B-Instruct".to_string()));
+        assert!(candidates.contains(&"meta-llama/Llama-3.1-8B-Instruct".to_string()));
     }
 
     // -- Integration test using a tiny stub model --

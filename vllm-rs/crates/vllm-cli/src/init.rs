@@ -63,6 +63,7 @@ pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
         hf_token: args.hf_token.clone(),
         cache_dir: None,
         block_size: args.block_size,
+        gguf_file: args.gguf_file.clone(),
     };
 
     // 2. Create worker, init device, load model.

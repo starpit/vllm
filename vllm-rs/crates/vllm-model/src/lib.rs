@@ -8,6 +8,7 @@
 //!
 //! Port of: `vllm/model_executor/model_loader/` and `vllm/model_executor/layers/`
 
+pub mod gguf;
 pub mod layers;
 pub mod tensor;
 pub mod weight;

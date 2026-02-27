@@ -13,6 +13,7 @@ pub mod attention;
 pub mod gemma2;
 pub mod kv_block_pool;
 pub mod llama;
+pub mod quantized_llama;
 pub mod qwen2;
 pub mod registry;
 pub mod sampler;

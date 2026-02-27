@@ -37,6 +37,7 @@ pub async fn run_bench(args: BenchArgs) -> Result<()> {
         hf_token: args.hf_token,
         cache_dir: None,
         block_size: 16,
+        gguf_file: args.gguf_file,
     };
 
     let mut worker = CandleWorker::new(worker_config);

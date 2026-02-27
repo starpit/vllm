@@ -1043,9 +1043,7 @@ mod tests {
         let pos_decode = Tensor::new(&[4u32], &Device::Cpu).unwrap();
 
         let handle = crate::LayerKvHandle::Contiguous(&mut cache);
-        let out_decode = attn
-            .forward(&x_decode, &pos_decode, Some(handle))
-            .unwrap();
+        let out_decode = attn.forward(&x_decode, &pos_decode, Some(handle)).unwrap();
         assert_eq!(out_decode.dims(), &[1, config.hidden_size]);
 
         // Cache should now hold K/V of length 5.

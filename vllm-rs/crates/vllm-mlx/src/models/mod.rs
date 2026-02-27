@@ -89,6 +89,9 @@ impl MlxModelRegistry {
             "Qwen2ForCausalLM",
             quantized_llama::create_mlx_quantized_llama,
         );
+        // Gemma v1
+        registry.register("GemmaForCausalLM", gemma2::create_mlx_gemma);
+        registry.register_quantized("GemmaForCausalLM", gemma2::create_mlx_quantized_gemma);
         // Gemma2
         registry.register("Gemma2ForCausalLM", gemma2::create_mlx_gemma2);
         registry.register_quantized("Gemma2ForCausalLM", gemma2::create_mlx_quantized_gemma2);
@@ -156,6 +159,7 @@ mod tests {
         assert!(registry.contains("LlamaForCausalLM"));
         assert!(registry.contains("MistralForCausalLM"));
         assert!(registry.contains("Qwen2ForCausalLM"));
+        assert!(registry.contains("GemmaForCausalLM"));
         assert!(registry.contains("Gemma2ForCausalLM"));
         assert!(registry.contains("Phi3ForCausalLM"));
         assert!(registry.contains_quantized("Gemma2ForCausalLM"));

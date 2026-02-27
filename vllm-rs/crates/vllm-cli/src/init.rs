@@ -19,6 +19,9 @@ use vllm_serve::chat_template::ChatTemplate;
 use vllm_serve::engine::AsyncEngine;
 use vllm_serve::tokenizer::Tokenizer;
 
+#[cfg(feature = "metal")]
+use vllm_mlx::worker::{MlxWorker, MlxWorkerConfig};
+
 use candle_core::DType;
 
 use crate::args::ServeArgs;
@@ -34,10 +37,108 @@ pub struct InitializedStack {
     pub max_model_len: usize,
 }
 
+/// Check if the metal (MLX) feature is active and the device allows it.
+#[cfg(feature = "metal")]
+fn should_use_mlx(device: &str) -> bool {
+    matches!(device, "auto" | "metal")
+}
+
+/// Result of worker creation: the worker plus metadata needed for init.
+type WorkerCreationResult = (
+    Box<dyn Worker>,
+    HfModelConfig,
+    Option<std::path::PathBuf>,
+    DType,
+);
+
+/// Create the appropriate worker based on backend selection.
+///
+/// Returns `(worker, hf_config, model_dir, dtype)`.
+fn create_worker(args: &ServeArgs, model_path: String) -> Result<WorkerCreationResult> {
+    // Try MLX backend first when metal feature is enabled.
+    #[cfg(feature = "metal")]
+    if should_use_mlx(&args.device) {
+        info!("Using MLX backend (Apple Silicon GPU)");
+        let mlx_config = MlxWorkerConfig {
+            model_path: model_path.clone(),
+            dtype: args.dtype.clone(),
+            hf_token: args.hf_token.clone(),
+            cache_dir: None,
+            block_size: args.block_size,
+        };
+
+        let mut worker = MlxWorker::new(mlx_config);
+        worker
+            .init_device()
+            .context("failed to initialize MLX device")?;
+        worker.load_model().context("failed to load MLX model")?;
+
+        let hf_config = worker
+            .hf_config()
+            .context("model config not available after MLX load")?
+            .clone();
+        let model_dir = worker.model_dir().map(|p| p.to_path_buf());
+
+        // Map MLX dtype to candle DType for compute_num_blocks.
+        // We resolve via the string representation to avoid depending on mlx_rs directly.
+        let model_dtype = match args.dtype.as_str() {
+            "f32" | "float32" => DType::F32,
+            "bf16" | "bfloat16" => DType::BF16,
+            _ => DType::F16, // Default: f16 for Metal
+        };
+
+        return Ok((Box::new(worker), hf_config, model_dir, model_dtype));
+    }
+
+    // Candle backend (CPU/CUDA/candle-Metal).
+    info!("Using Candle backend");
+    let worker_config = CandleWorkerConfig {
+        model_path,
+        device_str: args.device.clone(),
+        dtype: args.dtype.clone(),
+        hf_token: args.hf_token.clone(),
+        cache_dir: None,
+        block_size: args.block_size,
+        gguf_file: args.gguf_file.clone(),
+    };
+
+    let mut worker = CandleWorker::new(worker_config);
+    worker
+        .init_device()
+        .context("failed to initialize device")?;
+    worker.load_model().context("failed to load model")?;
+
+    let hf_config = worker
+        .hf_config()
+        .context("model config not available after load")?
+        .clone();
+    let model_dir = worker.model_dir().map(|p| p.to_path_buf());
+    let model_dtype = worker.resolved_dtype().unwrap_or(DType::F32);
+
+    Ok((Box::new(worker), hf_config, model_dir, model_dtype))
+}
+
+/// Initialize cache on the worker and compute block counts.
+fn init_cache(
+    mut worker: Box<dyn Worker>,
+    block_size: usize,
+    hf_config: &HfModelConfig,
+    model_dtype: DType,
+) -> Result<(Box<dyn Worker>, usize, usize)> {
+    let available_memory = worker
+        .determine_available_memory()
+        .context("failed to determine available memory")?;
+    let num_gpu_blocks = compute_num_blocks(available_memory, block_size, hf_config, model_dtype);
+    worker
+        .initialize_cache(num_gpu_blocks, 0)
+        .context("failed to initialize cache")?;
+    Ok((worker, available_memory, num_gpu_blocks))
+}
+
 /// Initialize the full vLLM stack from CLI arguments.
 ///
 /// Sequence:
-/// 1. Create CandleWorkerConfig from args
+/// 1. Create worker config from args
 /// 2. Init device, load model
 /// 3. Read HfModelConfig for max_position_embeddings, num_layers, etc.
 /// 4. Determine available memory, compute num_gpu_blocks
@@ -51,33 +152,11 @@ pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
     let model_path = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
 
     // Extract model name before moving model_path into the worker config.
-    // .into_owned() converts Cow<'_, str> to String, consuming the borrow of
-    // model_path so it can be moved into the worker config below.
     let model_name = extract_model_name(&model_path).into_owned();
 
-    // 1. Build worker config.
-    let worker_config = CandleWorkerConfig {
-        model_path,
-        device_str: args.device.clone(),
-        dtype: args.dtype.clone(),
-        hf_token: args.hf_token.clone(),
-        cache_dir: None,
-        block_size: args.block_size,
-        gguf_file: args.gguf_file.clone(),
-    };
+    // Decide backend: MLX (Metal) or Candle (CPU/CUDA).
+    let (worker, hf_config, model_dir, model_dtype) = create_worker(args, model_path)?;
 
-    // 2. Create worker, init device, load model.
-    let mut worker = CandleWorker::new(worker_config);
-    worker
-        .init_device()
-        .context("failed to initialize device")?;
-    worker.load_model().context("failed to load model")?;
-
-    // 3. Read model config.
-    let hf_config = worker
-        .hf_config()
-        .context("model config not available after load")?
-        .clone();
     let max_model_len = args
         .max_model_len
         .or(hf_config.max_position_embeddings)
@@ -89,28 +168,17 @@ pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
         model_name, max_model_len, num_layers
     );
 
-    // 4. Determine memory and compute blocks.
-    let available_memory = worker
-        .determine_available_memory()
-        .context("failed to determine available memory")?;
+    let (worker, available_memory, num_gpu_blocks) =
+        init_cache(worker, args.block_size, &hf_config, model_dtype)?;
 
-    let block_size = args.block_size;
-    let model_dtype = worker.resolved_dtype().unwrap_or(DType::F32);
-    let num_gpu_blocks = compute_num_blocks(available_memory, block_size, &hf_config, model_dtype);
     info!(
         "Available memory: {:.1} GB, num_gpu_blocks={}",
         available_memory as f64 / (1024.0 * 1024.0 * 1024.0),
         num_gpu_blocks
     );
 
-    // 5. Initialize cache.
-    worker
-        .initialize_cache(num_gpu_blocks, 0)
-        .context("failed to initialize cache")?;
-
     // 6. Wrap in UniProcExecutor (pre-initialized — skip init sequence).
-    let model_dir = worker.model_dir().map(|p| p.to_path_buf());
-    let executor = UniProcExecutor::new_pre_initialized(Box::new(worker));
+    let executor = UniProcExecutor::new_pre_initialized(worker);
 
     // 7. Build engine config and create InprocClient.
     //    Extract EOS token ID from model config if available.
@@ -138,7 +206,7 @@ pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
         },
         max_model_len,
         num_gpu_blocks,
-        block_size,
+        block_size: args.block_size,
         engine_index: 0,
         async_scheduling: false,
         use_spec_decode: false,

@@ -104,18 +104,26 @@ impl Module for RmsNorm {
 /// effective scale is `(1 + weight)`, which biases the initial effective
 /// weight towards identity.
 ///
+/// The effective weight `(1 + weight)` is precomputed at construction time
+/// to avoid a per-forward dispatch.
+///
 /// Formula: `y = x / sqrt(mean(x^2) + eps) * (1 + weight)`
 ///
 /// Port of: `vllm/model_executor/layers/layernorm.py::GemmaRMSNorm`
 pub struct GemmaRmsNorm {
-    weight: Tensor,
+    /// Precomputed (weight + 1.0) to avoid per-forward dispatch.
+    effective_weight: Tensor,
     eps: f64,
 }
 
 impl GemmaRmsNorm {
     /// Create from an explicit weight tensor.
-    pub fn new(weight: Tensor, eps: f64) -> Self {
-        Self { weight, eps }
+    pub fn new(weight: Tensor, eps: f64) -> candle_core::Result<Self> {
+        let effective_weight = (&weight + 1.0)?;
+        Ok(Self {
+            effective_weight,
+            eps,
+        })
     }
 
     /// Load from model weights.
@@ -124,13 +132,13 @@ impl GemmaRmsNorm {
     pub fn load(weights: &ModelWeights, prefix: &str, eps: f64, dtype: DType) -> ModelResult<Self> {
         let weight_name = format!("{}.weight", prefix);
         let weight = weights.get_cast(&weight_name, dtype)?;
-        Ok(Self { weight, eps })
+        Ok(Self::new(weight, eps)?)
     }
 
     /// Create with zeros (so effective weight = 1, for testing).
     pub fn zeros(hidden_size: usize, eps: f64, dtype: DType, device: &Device) -> ModelResult<Self> {
         let weight = tensor::zeros(&[hidden_size], dtype, device)?;
-        Ok(Self { weight, eps })
+        Ok(Self::new(weight, eps)?)
     }
 
     /// The epsilon value.
@@ -138,32 +146,33 @@ impl GemmaRmsNorm {
         self.eps
     }
 
-    /// The weight tensor (before +1).
+    /// The effective weight tensor (weight + 1).
     pub fn weight(&self) -> &Tensor {
-        &self.weight
+        &self.effective_weight
     }
 
     /// Hidden size.
     pub fn hidden_size(&self) -> usize {
-        self.weight.dim(0).unwrap_or(0)
+        self.effective_weight.dim(0).unwrap_or(0)
     }
 }
 
 impl Module for GemmaRmsNorm {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let input_dtype = x.dtype();
-        let effective_weight = (&self.weight + 1.0)?;
         if needs_upcast(input_dtype) {
             let x_f32 = x.to_dtype(DType::F32)?;
             let variance = x_f32.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
             let rsqrt = (variance + self.eps)?.sqrt()?.recip()?;
             let rsqrt = rsqrt.to_dtype(input_dtype)?;
-            x.broadcast_mul(&rsqrt)?.broadcast_mul(&effective_weight)
+            x.broadcast_mul(&rsqrt)?
+                .broadcast_mul(&self.effective_weight)
         } else {
             let x_sq = x.sqr()?;
             let variance = x_sq.mean_keepdim(candle_core::D::Minus1)?;
             let rsqrt = (variance + self.eps)?.sqrt()?.recip()?;
-            x.broadcast_mul(&rsqrt)?.broadcast_mul(&effective_weight)
+            x.broadcast_mul(&rsqrt)?
+                .broadcast_mul(&self.effective_weight)
         }
     }
 }
@@ -277,7 +286,7 @@ mod tests {
         // weight = [1, 1, 1, 1] → effective weight = [2, 2, 2, 2]
         // input = [1, 1, 1, 1], RMS = 1 → output = [2, 2, 2, 2]
         let weight = Tensor::ones(&[4], DType::F32, &Device::Cpu).unwrap();
-        let norm = GemmaRmsNorm::new(weight, 1e-5);
+        let norm = GemmaRmsNorm::new(weight, 1e-5).unwrap();
 
         let x = Tensor::ones(&[1, 4], DType::F32, &Device::Cpu).unwrap();
         let y = norm.forward(&x).unwrap();
@@ -292,7 +301,7 @@ mod tests {
         // When Gemma weight = w, effective is (1+w).
         // When standard weight = (1+w), they should produce the same output.
         let gemma_w = Tensor::new(&[0.5f32, 0.5, 0.5, 0.5], &Device::Cpu).unwrap();
-        let gemma_norm = GemmaRmsNorm::new(gemma_w, 1e-5);
+        let gemma_norm = GemmaRmsNorm::new(gemma_w, 1e-5).unwrap();
 
         let std_w = Tensor::new(&[1.5f32, 1.5, 1.5, 1.5], &Device::Cpu).unwrap();
         let std_norm = RmsNorm::new(std_w, 1e-5);
@@ -362,7 +371,7 @@ mod tests {
     #[test]
     fn test_gemma_rms_norm_f16_output_dtype() {
         let weight = Tensor::zeros(&[4], DType::F16, &Device::Cpu).unwrap();
-        let norm = GemmaRmsNorm::new(weight, 1e-5);
+        let norm = GemmaRmsNorm::new(weight, 1e-5).unwrap();
 
         let x = Tensor::ones(&[2, 4], DType::F16, &Device::Cpu).unwrap();
         let y = norm.forward(&x).unwrap();

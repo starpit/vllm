@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Model loading, weight management, and tensor abstractions for vLLM Rust port"
 
+[features]
+default = []
+metal = ["candle-core/metal"]
+
 [dependencies]
 vllm-common = { workspace = true }
 vllm-config = { workspace = true }

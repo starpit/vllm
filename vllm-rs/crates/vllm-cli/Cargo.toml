@@ -7,7 +7,8 @@ description = "CLI binary for vLLM Rust inference engine"
 
 [features]
 default = []
-metal = ["vllm-executor/metal", "vllm-kernels/metal"]
+metal = ["vllm-mlx"]
+candle-metal = ["vllm-executor/metal", "vllm-kernels/metal", "vllm-models/metal"]
 
 [[bin]]
 name = "vllm"
@@ -24,6 +25,7 @@ vllm-model = { workspace = true }
 vllm-models = { workspace = true }
 vllm-kernels = { workspace = true }
 candle-core = { workspace = true }
+vllm-mlx = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

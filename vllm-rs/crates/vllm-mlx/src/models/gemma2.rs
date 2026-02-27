@@ -136,15 +136,24 @@ fn assign_gemma_norm_weight(norm: &mut nn::RmsNorm, weights: &HashMap<String, Ar
 // MlxGemma2MLP
 // ---------------------------------------------------------------------------
 
-/// Gemma2 MLP (GELU-gated feed-forward network) using MLX.
+/// Gemma MLP (GELU-gated feed-forward network) using MLX.
+///
+/// - Gemma v1: exact GELU (erf-based, `hidden_act: "gelu"`)
+/// - Gemma2: approximate GELU (tanh-based, `hidden_act: "gelu_pytorch_tanh"`)
 struct MlxGemma2MLP {
     gate_proj: nn::Linear,
     up_proj: nn::Linear,
     down_proj: nn::Linear,
+    /// true → gelu_approximate (Gemma2), false → exact gelu (Gemma v1)
+    approximate_gelu: bool,
 }
 
 impl MlxGemma2MLP {
-    fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self, Exception> {
+    fn new(
+        hidden_size: i32,
+        intermediate_size: i32,
+        approximate_gelu: bool,
+    ) -> Result<Self, Exception> {
         Ok(Self {
             gate_proj: nn::LinearBuilder::new(hidden_size, intermediate_size)
                 .bias(false)
@@ -155,6 +164,7 @@ impl MlxGemma2MLP {
             down_proj: nn::LinearBuilder::new(intermediate_size, hidden_size)
                 .bias(false)
                 .build()?,
+            approximate_gelu,
         })
     }
 
@@ -176,10 +186,13 @@ impl MlxGemma2MLP {
         );
     }
 
-    /// Forward: gate_proj(x) → GELU_approx → * up_proj(x) → down_proj
     fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = nn::gelu_approximate(&gate)?;
+        let gate = if self.approximate_gelu {
+            nn::gelu_approximate(&gate)?
+        } else {
+            nn::gelu(&gate)?
+        };
         let up = self.up_proj.forward(x)?;
         let hidden = gate.multiply(&up)?;
         self.down_proj.forward(&hidden)
@@ -339,7 +352,11 @@ impl MlxGemma2DecoderLayer {
     fn new(config: &MlxGemma2Config) -> Result<Self, Exception> {
         Ok(Self {
             self_attn: MlxGemma2Attention::new(config)?,
-            mlp: MlxGemma2MLP::new(config.hidden_size as i32, config.intermediate_size as i32)?,
+            mlp: MlxGemma2MLP::new(
+                config.hidden_size as i32,
+                config.intermediate_size as i32,
+                true,
+            )?,
             input_layernorm: nn::RmsNormBuilder::new(config.hidden_size as i32)
                 .eps(config.rms_norm_eps)
                 .build()?,
@@ -513,10 +530,16 @@ struct MlxQuantizedGemma2MLP {
     gate_proj: nn::QuantizedLinear,
     up_proj: nn::QuantizedLinear,
     down_proj: nn::QuantizedLinear,
+    approximate_gelu: bool,
 }
 
 impl MlxQuantizedGemma2MLP {
-    fn from_weights(weights: &HashMap<String, Array>, prefix: &str, qc: &QuantConfig) -> Self {
+    fn from_weights(
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        qc: &QuantConfig,
+        approximate_gelu: bool,
+    ) -> Self {
         Self {
             gate_proj: make_quantized_linear(
                 weights,
@@ -536,12 +559,17 @@ impl MlxQuantizedGemma2MLP {
                 qc.group_size,
                 qc.bits,
             ),
+            approximate_gelu,
         }
     }
 
     fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = nn::gelu_approximate(&gate)?;
+        let gate = if self.approximate_gelu {
+            nn::gelu_approximate(&gate)?
+        } else {
+            nn::gelu(&gate)?
+        };
         let up = self.up_proj.forward(x)?;
         let hidden = gate.multiply(&up)?;
         self.down_proj.forward(&hidden)
@@ -722,7 +750,7 @@ impl MlxQuantizedGemma2DecoderLayer {
                 config,
                 qc,
             ),
-            mlp: MlxQuantizedGemma2MLP::from_weights(weights, &format!("{prefix}.mlp"), qc),
+            mlp: MlxQuantizedGemma2MLP::from_weights(weights, &format!("{prefix}.mlp"), qc, true),
             input_layernorm,
             post_attention_layernorm,
             pre_feedforward_layernorm,
@@ -886,7 +914,11 @@ impl MlxGemmaDecoderLayer {
     fn new(config: &MlxGemma2Config) -> Result<Self, Exception> {
         Ok(Self {
             self_attn: MlxGemma2Attention::new(config)?,
-            mlp: MlxGemma2MLP::new(config.hidden_size as i32, config.intermediate_size as i32)?,
+            mlp: MlxGemma2MLP::new(
+                config.hidden_size as i32,
+                config.intermediate_size as i32,
+                false,
+            )?,
             input_layernorm: nn::RmsNormBuilder::new(config.hidden_size as i32)
                 .eps(config.rms_norm_eps)
                 .build()?,
@@ -1053,7 +1085,7 @@ impl MlxQuantizedGemmaDecoderLayer {
                 config,
                 qc,
             ),
-            mlp: MlxQuantizedGemma2MLP::from_weights(weights, &format!("{prefix}.mlp"), qc),
+            mlp: MlxQuantizedGemma2MLP::from_weights(weights, &format!("{prefix}.mlp"), qc, false),
             input_layernorm,
             post_attention_layernorm,
         })
@@ -1264,7 +1296,7 @@ mod tests {
 
     #[test]
     fn test_gemma2_mlp_forward() {
-        let mut mlp = MlxGemma2MLP::new(32, 64).unwrap();
+        let mut mlp = MlxGemma2MLP::new(32, 64, true).unwrap();
         let x = mlx_rs::ops::ones::<f32>(&[3, 32]).unwrap();
         let out = mlp.forward(&x).unwrap();
         out.eval().unwrap();

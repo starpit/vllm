@@ -49,6 +49,42 @@ pub type KvCache = Vec<Option<LayerKvCache>>;
 // KvCacheStorage — unified cache abstraction
 // ---------------------------------------------------------------------------
 
+/// A deferred write operation for paged KV cache.
+///
+/// Attention layers produce these during forward; they are flushed to the
+/// block pool after the forward pass completes.
+pub enum PendingWrite {
+    /// Full scatter (prefill or legacy decode): write all new tokens from
+    /// a contiguous K/V tensor.
+    FullScatter {
+        layer: usize,
+        k_full: Tensor,
+        v_full: Tensor,
+    },
+    /// Single-token write (paged decode): write one new K/V token.
+    /// The tensors have shape `[num_kv_heads, head_dim]`.
+    NewToken {
+        layer: usize,
+        k_token: Tensor,
+        v_token: Tensor,
+    },
+}
+
+/// References to paged KV block tensors for direct-read attention.
+///
+/// Returned by `LayerKvHandle::paged_block_refs()` so that attention can
+/// read K/V directly from blocks without gathering into a contiguous tensor.
+pub struct PagedKvBlockRefs<'a> {
+    /// K block tensors in sequence order, each `[block_size, num_kv_heads, head_dim]`.
+    pub k_blocks: Vec<&'a Tensor>,
+    /// V block tensors in sequence order, each `[block_size, num_kv_heads, head_dim]`.
+    pub v_blocks: Vec<&'a Tensor>,
+    /// Total number of cached tokens across all blocks.
+    pub num_tokens: usize,
+    /// Number of token slots per block.
+    pub block_size: usize,
+}
+
 /// KV cache storage passed to `Model::forward`.
 ///
 /// Abstracts over legacy contiguous per-request caches and the paged block pool.
@@ -61,13 +97,13 @@ pub enum KvCacheStorage<'a> {
     /// Legacy contiguous per-request cache.
     Contiguous(&'a mut KvCache),
     /// Paged: reads K/V from the block pool during forward, defers writes
-    /// to `pending_scatters` which are flushed after forward.
+    /// to `pending_writes` which are flushed after forward.
     Paged {
         pool: &'a mut KvBlockPool,
         block_ids: &'a [usize],
         tokens_before: usize,
-        /// Deferred scatter operations: `(layer, k_full, v_full)`.
-        pending_scatters: Vec<(usize, Tensor, Tensor)>,
+        /// Deferred write operations flushed after forward.
+        pending_writes: Vec<PendingWrite>,
     },
 }
 
@@ -78,7 +114,7 @@ impl<'a> KvCacheStorage<'a> {
             pool,
             block_ids,
             tokens_before,
-            pending_scatters: Vec::new(),
+            pending_writes: Vec::new(),
         }
     }
 
@@ -90,18 +126,18 @@ impl<'a> KvCacheStorage<'a> {
                 pool,
                 block_ids,
                 tokens_before,
-                pending_scatters,
+                pending_writes,
             } => LayerKvHandle::Paged {
                 pool,
                 block_ids,
                 tokens_before: *tokens_before,
                 layer,
-                pending_scatters,
+                pending_writes,
             },
         }
     }
 
-    /// Flush deferred scatter operations to the block pool.
+    /// Flush deferred write operations to the block pool.
     ///
     /// Must be called after `Model::forward()` for paged storage.
     /// No-op for contiguous storage.
@@ -110,11 +146,38 @@ impl<'a> KvCacheStorage<'a> {
             pool,
             block_ids,
             tokens_before,
-            pending_scatters,
+            pending_writes,
         } = self
         {
-            for (layer, k, v) in pending_scatters.drain(..) {
-                pool.scatter_new_kv(layer, block_ids, *tokens_before, &k, &v)?;
+            for pw in pending_writes.drain(..) {
+                match pw {
+                    PendingWrite::FullScatter {
+                        layer,
+                        k_full,
+                        v_full,
+                    } => {
+                        pool.scatter_new_kv(layer, block_ids, *tokens_before, &k_full, &v_full)?;
+                    }
+                    PendingWrite::NewToken {
+                        layer,
+                        k_token,
+                        v_token,
+                    } => {
+                        // Write the single new token to the next slot.
+                        let global_pos = *tokens_before;
+                        let block_offset = global_pos / pool.block_size();
+                        let position_in_block = global_pos % pool.block_size();
+                        if block_offset < block_ids.len() {
+                            let bid = block_ids[block_offset];
+                            pool.write_kv(layer, bid, position_in_block, &k_token, &v_token)?;
+                            // Update tokens_in_block for the affected block.
+                            let new_fill = position_in_block + 1;
+                            if new_fill > pool.tokens_stored(bid) {
+                                pool.set_tokens_stored(bid, new_fill);
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -133,13 +196,13 @@ impl<'a> KvCacheStorage<'a> {
 pub enum LayerKvHandle<'a> {
     /// Legacy contiguous slot.
     Contiguous(&'a mut Option<LayerKvCache>),
-    /// Paged: reads from pool, defers writes to pending_scatters.
+    /// Paged: reads from pool, defers writes to pending_writes.
     Paged {
         pool: &'a KvBlockPool,
         block_ids: &'a [usize],
         tokens_before: usize,
         layer: usize,
-        pending_scatters: &'a mut Vec<(usize, Tensor, Tensor)>,
+        pending_writes: &'a mut Vec<PendingWrite>,
     },
 }
 
@@ -169,10 +232,50 @@ impl LayerKvHandle<'_> {
         }
     }
 
-    /// Store the full K/V tensors after attention.
+    /// Get read-only references to paged KV block tensors for direct-read attention.
+    ///
+    /// Returns `Some(PagedKvBlockRefs)` when this is a paged handle with
+    /// `tokens_before > 0` (i.e., there are cached tokens to read).
+    /// Returns `None` for contiguous handles or when there are no cached tokens.
+    pub fn paged_block_refs(&self) -> Option<PagedKvBlockRefs<'_>> {
+        match self {
+            LayerKvHandle::Contiguous(_) => None,
+            LayerKvHandle::Paged {
+                pool,
+                block_ids,
+                tokens_before,
+                layer,
+                ..
+            } => {
+                if *tokens_before == 0 {
+                    return None;
+                }
+                let block_size = pool.block_size();
+                let mut k_blocks = Vec::new();
+                let mut v_blocks = Vec::new();
+                let mut remaining = *tokens_before;
+                for &bid in block_ids.iter() {
+                    if remaining == 0 {
+                        break;
+                    }
+                    k_blocks.push(pool.k_block(*layer, bid));
+                    v_blocks.push(pool.v_block(*layer, bid));
+                    remaining = remaining.saturating_sub(block_size);
+                }
+                Some(PagedKvBlockRefs {
+                    k_blocks,
+                    v_blocks,
+                    num_tokens: *tokens_before,
+                    block_size,
+                })
+            }
+        }
+    }
+
+    /// Store the full K/V tensors after attention (legacy/prefill path).
     ///
     /// - **Contiguous**: stores the tensors in the cache slot immediately.
-    /// - **Paged**: defers the scatter to `pending_scatters`. Call
+    /// - **Paged**: defers the scatter to `pending_writes`. Call
     ///   `KvCacheStorage::flush()` after forward to write to the block pool.
     pub fn store(&mut self, k_full: Tensor, v_full: Tensor) -> ModelResult<()> {
         match self {
@@ -182,10 +285,39 @@ impl LayerKvHandle<'_> {
             }
             LayerKvHandle::Paged {
                 layer,
-                pending_scatters,
+                pending_writes,
                 ..
             } => {
-                pending_scatters.push((*layer, k_full, v_full));
+                pending_writes.push(PendingWrite::FullScatter {
+                    layer: *layer,
+                    k_full,
+                    v_full,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Store a single new K/V token (paged decode path).
+    ///
+    /// The tensors should have shape `[num_kv_heads, head_dim]`.
+    /// For contiguous handles, this falls back to the full store path
+    /// (caller must provide the full concatenated tensors via `store` instead).
+    pub fn store_new_token(&mut self, k_token: Tensor, v_token: Tensor) -> ModelResult<()> {
+        match self {
+            LayerKvHandle::Contiguous(_) => Err(vllm_model::error::ModelError::Other(
+                "store_new_token not supported for contiguous cache".into(),
+            )),
+            LayerKvHandle::Paged {
+                layer,
+                pending_writes,
+                ..
+            } => {
+                pending_writes.push(PendingWrite::NewToken {
+                    layer: *layer,
+                    k_token,
+                    v_token,
+                });
                 Ok(())
             }
         }

@@ -104,6 +104,30 @@ impl KvBlockPool {
         self.num_layers
     }
 
+    /// DType of block tensors.
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    /// Device of block tensors.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Read-only reference to a K block tensor for a given layer and block index.
+    ///
+    /// Shape: `[block_size, num_kv_heads, head_dim]`.
+    pub fn k_block(&self, layer: usize, block_idx: usize) -> &Tensor {
+        &self.k_blocks[layer][block_idx]
+    }
+
+    /// Read-only reference to a V block tensor for a given layer and block index.
+    ///
+    /// Shape: `[block_size, num_kv_heads, head_dim]`.
+    pub fn v_block(&self, layer: usize, block_idx: usize) -> &Tensor {
+        &self.v_blocks[layer][block_idx]
+    }
+
     /// How many token slots are filled in a block.
     pub fn tokens_stored(&self, block_idx: usize) -> usize {
         self.tokens_in_block[block_idx]

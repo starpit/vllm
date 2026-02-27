@@ -20,7 +20,7 @@ use vllm_model::layers::{
 };
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
-use crate::attention::scaled_dot_product_attention;
+use crate::attention::attention_with_cache;
 
 // ---------------------------------------------------------------------------
 // LlamaConfig
@@ -333,25 +333,8 @@ impl LlamaAttention {
         // Apply RoPE.
         let (q, k) = self.rotary_emb.apply(&q, &k, positions)?;
 
-        // Merge with KV cache via LayerKvHandle.
-        let (k_full, v_full) = if let Some(mut handle) = kv_cache {
-            if let Some((cached_k, cached_v)) = handle.take_cached()? {
-                let k_cat = Tensor::cat(&[&cached_k, &k], 0).map_err(ModelError::Candle)?;
-                let v_cat = Tensor::cat(&[&cached_v, &v], 0).map_err(ModelError::Candle)?;
-                handle.store(k_cat.clone(), v_cat.clone())?;
-                (k_cat, v_cat)
-            } else {
-                // First call (prefill): populate the cache.
-                handle.store(k.clone(), v.clone())?;
-                (k, v)
-            }
-        } else {
-            // No caching requested.
-            (k, v)
-        };
-
-        // Scaled dot-product attention (handles q_len != kv_len).
-        let attn_output = scaled_dot_product_attention(&q, &k_full, &v_full, self.scale)?;
+        // Cache-merge + attention (paged decode reads blocks directly).
+        let attn_output = attention_with_cache(&q, &k, &v, self.scale, kv_cache)?;
 
         // Reshape back to [num_tokens, num_q_heads * head_dim].
         let attn_output = attn_output

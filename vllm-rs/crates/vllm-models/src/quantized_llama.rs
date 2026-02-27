@@ -13,7 +13,7 @@ use vllm_model::gguf::GgufFile;
 use vllm_model::layers::{Embedding, QuantizedLinear, RmsNorm};
 use vllm_model::weight::HfModelConfig;
 
-use crate::attention::scaled_dot_product_attention;
+use crate::attention::attention_with_cache;
 use crate::llama::LlamaConfig;
 
 // ---------------------------------------------------------------------------
@@ -234,23 +234,8 @@ impl QuantizedLlamaAttention {
         let q = apply_interleaved_rope(&q, &self.cos, &self.sin, positions)?;
         let k = apply_interleaved_rope(&k, &self.cos, &self.sin, positions)?;
 
-        // Merge with KV cache.
-        let (k_full, v_full) = if let Some(mut handle) = kv_cache {
-            if let Some((cached_k, cached_v)) = handle.take_cached()? {
-                let k_cat = Tensor::cat(&[&cached_k, &k], 0).map_err(ModelError::Candle)?;
-                let v_cat = Tensor::cat(&[&cached_v, &v], 0).map_err(ModelError::Candle)?;
-                handle.store(k_cat.clone(), v_cat.clone())?;
-                (k_cat, v_cat)
-            } else {
-                handle.store(k.clone(), v.clone())?;
-                (k, v)
-            }
-        } else {
-            (k, v)
-        };
-
-        // Scaled dot-product attention.
-        let attn_output = scaled_dot_product_attention(&q, &k_full, &v_full, self.scale)?;
+        // Cache-merge + attention (paged decode reads blocks directly).
+        let attn_output = attention_with_cache(&q, &k, &v, self.scale, kv_cache)?;
 
         // Reshape and output projection.
         let attn_output = attn_output

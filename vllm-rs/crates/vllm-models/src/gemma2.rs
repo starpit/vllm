@@ -28,7 +28,7 @@ use vllm_model::layers::{
 };
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
-use crate::attention::scaled_dot_product_attention;
+use crate::attention::attention_with_cache;
 
 // ---------------------------------------------------------------------------
 // Gemma2Config
@@ -357,24 +357,9 @@ impl Gemma2Attention {
 
         let (q, k) = self.rotary_emb.apply(&q, &k, positions)?;
 
-        // Merge with KV cache via LayerKvHandle.
-        let (k_full, v_full) = if let Some(mut handle) = kv_cache {
-            if let Some((cached_k, cached_v)) = handle.take_cached()? {
-                let k_cat = Tensor::cat(&[&cached_k, &k], 0).map_err(ModelError::Candle)?;
-                let v_cat = Tensor::cat(&[&cached_v, &v], 0).map_err(ModelError::Candle)?;
-                handle.store(k_cat.clone(), v_cat.clone())?;
-                (k_cat, v_cat)
-            } else {
-                handle.store(k.clone(), v.clone())?;
-                (k, v)
-            }
-        } else {
-            (k, v)
-        };
-
-        // Use our existing attention implementation (soft capping is TODO for GPU kernels).
+        // Cache-merge + attention (paged decode reads blocks directly).
         let _ = self.attn_logit_softcapping; // Reserved for GPU kernel integration
-        let attn_output = scaled_dot_product_attention(&q, &k_full, &v_full, self.scale)?;
+        let attn_output = attention_with_cache(&q, &k, &v, self.scale, kv_cache)?;
 
         let attn_output = attn_output
             .reshape((num_tokens, self.num_q_heads * self.head_dim))

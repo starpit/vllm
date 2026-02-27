@@ -152,10 +152,154 @@ impl RotaryEmbedding {
         &self.cos_cache
     }
 
+    /// Create a YaRN-scaled RoPE (used by DeepSeek V2/V3).
+    ///
+    /// YaRN applies frequency-dependent corrections: low-frequency dimensions
+    /// are scaled by the factor, high-frequency dimensions are kept, and
+    /// middle-range dimensions are interpolated.
+    ///
+    /// * `head_dim` — dimension per attention head (must be even)
+    /// * `max_position` — max sequence length to cache cos/sin for
+    /// * `base` — base for the frequency computation (typically 10000.0)
+    /// * `scaling_factor` — NTK scaling factor
+    /// * `beta_fast` — boundary for high-frequency (unscaled) dimensions
+    /// * `beta_slow` — boundary for low-frequency (fully scaled) dimensions
+    /// * `mscale` — magnitude scaling (mscale_all_dim param from config)
+    /// * `original_max_pos` — original max_position_embeddings before scaling
+    /// * `dtype` — compute dtype for cos/sin
+    /// * `device` — target device
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_yarn(
+        head_dim: usize,
+        max_position: usize,
+        base: f64,
+        scaling_factor: f64,
+        beta_fast: f64,
+        beta_slow: f64,
+        mscale_all_dim: f64,
+        original_max_pos: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> ModelResult<Self> {
+        if !head_dim.is_multiple_of(2) {
+            return Err(ModelError::Other(format!(
+                "RoPE head_dim must be even, got {}",
+                head_dim
+            )));
+        }
+
+        let half_dim = head_dim / 2;
+
+        // Standard inverse frequencies.
+        let inv_freq_base: Vec<f64> = (0..half_dim)
+            .map(|i| 1.0 / base.powf(2.0 * i as f64 / head_dim as f64))
+            .collect();
+
+        // Compute YaRN frequency corrections.
+        // low/high dimension boundaries for interpolation.
+        let low = (original_max_pos as f64 / (beta_fast / 2.0 * std::f64::consts::PI))
+            .floor()
+            .max(1.0);
+        let high = (original_max_pos as f64 / (beta_slow / 2.0 * std::f64::consts::PI))
+            .ceil()
+            .max(1.0);
+
+        let inv_freq: Vec<f32> = inv_freq_base
+            .iter()
+            .enumerate()
+            .map(|(i, &freq)| {
+                // Wavelength of this frequency dimension.
+                let wavelength = 2.0 * std::f64::consts::PI / freq;
+                // Normalized position in the dim range [0, 1].
+                let dim_pos = 2.0 * i as f64 / head_dim as f64;
+                let _ = dim_pos;
+                // Ramp function: 0 for low dims (high freq), 1 for high dims (low freq).
+                let ramp = if high == low {
+                    0.0
+                } else {
+                    let r = (wavelength - low) / (high - low);
+                    r.clamp(0.0, 1.0)
+                };
+                // Interpolate: ramp=0 → keep original, ramp=1 → scale by factor.
+                let scaled_freq = freq / scaling_factor;
+                let corrected = (1.0 - ramp) * freq + ramp * scaled_freq;
+                corrected as f32
+            })
+            .collect();
+
+        let inv_freq_tensor =
+            Tensor::from_slice(&inv_freq, half_dim, device).map_err(ModelError::Candle)?;
+
+        // Position indices.
+        let positions: Vec<f32> = (0..max_position).map(|p| p as f32).collect();
+        let pos_tensor =
+            Tensor::from_slice(&positions, max_position, device).map_err(ModelError::Candle)?;
+
+        let pos_2d = pos_tensor
+            .reshape((max_position, 1))
+            .map_err(ModelError::Candle)?;
+        let inv_freq_2d = inv_freq_tensor
+            .reshape((1, half_dim))
+            .map_err(ModelError::Candle)?;
+        let freqs = pos_2d.matmul(&inv_freq_2d).map_err(ModelError::Candle)?;
+
+        let freqs_full = Tensor::cat(&[&freqs, &freqs], 1).map_err(ModelError::Candle)?;
+
+        // YaRN mscale: magnitude correction for attention scaling.
+        let mscale = if mscale_all_dim > 0.0 {
+            let m = yarn_get_mscale(scaling_factor, mscale_all_dim);
+            m as f32
+        } else {
+            1.0f32
+        };
+
+        let cos_cache = (freqs_full.cos().map_err(ModelError::Candle)? * mscale as f64)
+            .map_err(ModelError::Candle)?
+            .to_dtype(dtype)
+            .map_err(ModelError::Candle)?;
+        let sin_cache = (freqs_full.sin().map_err(ModelError::Candle)? * mscale as f64)
+            .map_err(ModelError::Candle)?
+            .to_dtype(dtype)
+            .map_err(ModelError::Candle)?;
+
+        Ok(Self {
+            cos_cache,
+            sin_cache,
+            head_dim,
+            max_position,
+        })
+    }
+
+    /// Apply RoPE to a single tensor (just Q or just K).
+    ///
+    /// Useful for MLA where Q and K have different dimensions.
+    pub fn apply_one(&self, x: &Tensor, positions: &Tensor) -> ModelResult<Tensor> {
+        let cos = self
+            .cos_cache
+            .index_select(positions, 0)
+            .map_err(ModelError::Candle)?;
+        let sin = self
+            .sin_cache
+            .index_select(positions, 0)
+            .map_err(ModelError::Candle)?;
+
+        apply_rotary_to_tensor(x, &cos, &sin)
+    }
+
     /// Access the sin cache.
     pub fn sin_cache(&self) -> &Tensor {
         &self.sin_cache
     }
+}
+
+/// YaRN magnitude scaling function.
+///
+/// From DeepSeek V2: `mscale = 0.1 * ln(factor) + 1.0` when `mscale_all_dim > 0`.
+fn yarn_get_mscale(scaling_factor: f64, mscale_all_dim: f64) -> f64 {
+    if scaling_factor <= 1.0 {
+        return 1.0;
+    }
+    0.1 * mscale_all_dim * scaling_factor.ln() + 1.0
 }
 
 /// Apply rotary embedding to a single tensor.
@@ -265,6 +409,113 @@ mod tests {
         let (q_rot, k_rot) = rope.apply(&q, &k, &positions).unwrap();
         assert_eq!(q_rot.dims(), &[4, 2, 8]);
         assert_eq!(k_rot.dims(), &[4, 2, 8]);
+    }
+
+    #[test]
+    fn test_yarn_rope_creation() {
+        let rope = RotaryEmbedding::new_yarn(
+            64,   // head_dim
+            4096, // max_position
+            10000.0,
+            40.0, // scaling_factor
+            32.0, // beta_fast
+            1.0,  // beta_slow
+            0.1,  // mscale_all_dim
+            4096, // original_max_pos
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        assert_eq!(rope.head_dim(), 64);
+        assert_eq!(rope.max_position(), 4096);
+        assert_eq!(rope.cos_cache().dims(), &[4096, 64]);
+        assert_eq!(rope.sin_cache().dims(), &[4096, 64]);
+    }
+
+    #[test]
+    fn test_yarn_rope_differs_from_standard() {
+        let standard = RotaryEmbedding::new(64, 1024, 10000.0, DType::F32, &Device::Cpu).unwrap();
+        let yarn = RotaryEmbedding::new_yarn(
+            64,
+            1024,
+            10000.0,
+            40.0,
+            32.0,
+            1.0,
+            0.1,
+            4096,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        // At position 1, the cos values should differ due to different frequencies.
+        let std_cos = standard
+            .cos_cache()
+            .narrow(0, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let yarn_cos = yarn
+            .cos_cache()
+            .narrow(0, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        // They should not be identical (YaRN modifies frequencies + applies mscale).
+        let mut any_different = false;
+        for (a, b) in std_cos.iter().zip(yarn_cos.iter()) {
+            if (a - b).abs() > 1e-6 {
+                any_different = true;
+                break;
+            }
+        }
+        assert!(
+            any_different,
+            "YaRN RoPE should produce different cos values than standard RoPE"
+        );
+    }
+
+    #[test]
+    fn test_yarn_rope_apply() {
+        let rope = RotaryEmbedding::new_yarn(
+            8,
+            128,
+            10000.0,
+            4.0,
+            32.0,
+            1.0,
+            0.1,
+            128,
+            DType::F32,
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        let q = Tensor::ones(&[4, 2, 8], DType::F32, &Device::Cpu).unwrap();
+        let k = Tensor::ones(&[4, 2, 8], DType::F32, &Device::Cpu).unwrap();
+        let positions = Tensor::new(&[0u32, 1, 2, 3], &Device::Cpu).unwrap();
+
+        let (q_rot, k_rot) = rope.apply(&q, &k, &positions).unwrap();
+        assert_eq!(q_rot.dims(), &[4, 2, 8]);
+        assert_eq!(k_rot.dims(), &[4, 2, 8]);
+    }
+
+    #[test]
+    fn test_apply_one() {
+        let rope = RotaryEmbedding::new(8, 128, 10000.0, DType::F32, &Device::Cpu).unwrap();
+
+        let x = Tensor::ones(&[3, 2, 8], DType::F32, &Device::Cpu).unwrap();
+        let positions = Tensor::new(&[0u32, 1, 2], &Device::Cpu).unwrap();
+
+        let x_rot = rope.apply_one(&x, &positions).unwrap();
+        assert_eq!(x_rot.dims(), &[3, 2, 8]);
     }
 
     #[test]

@@ -159,6 +159,10 @@ pub struct MlxLlamaAttention {
     k_proj: nn::Linear,
     v_proj: nn::Linear,
     o_proj: nn::Linear,
+    /// Optional per-head Q norm (Qwen3 uses this).
+    q_norm: Option<nn::RmsNorm>,
+    /// Optional per-head K norm (Qwen3 uses this).
+    k_norm: Option<nn::RmsNorm>,
     rope: nn::Rope,
     num_heads: usize,
     num_kv_heads: usize,
@@ -182,6 +186,8 @@ impl MlxLlamaAttention {
                 .bias(false)
                 .build()?,
             o_proj: nn::LinearBuilder::new(q_size, hidden).bias(false).build()?,
+            q_norm: None,
+            k_norm: None,
             rope: {
                 let mut r = nn::Rope::new(config.head_dim as i32);
                 r.base = config.rope_theta;
@@ -227,6 +233,22 @@ impl MlxLlamaAttention {
                 proj.bias.value = Some(b.clone());
             }
         }
+
+        // Optional QK norms (Qwen3 has per-head q_norm and k_norm).
+        if let Some(w) = weights.get(&format!("{prefix}.q_norm.weight")) {
+            let head_dim = w.dim(0);
+            if let Ok(mut norm) = nn::RmsNormBuilder::new(head_dim).eps(1e-6).build() {
+                norm.weight.value = w.clone();
+                self.q_norm = Some(norm);
+            }
+        }
+        if let Some(w) = weights.get(&format!("{prefix}.k_norm.weight")) {
+            let head_dim = w.dim(0);
+            if let Ok(mut norm) = nn::RmsNormBuilder::new(head_dim).eps(1e-6).build() {
+                norm.weight.value = w.clone();
+                self.k_norm = Some(norm);
+            }
+        }
     }
 
     /// Forward pass.
@@ -247,15 +269,26 @@ impl MlxLlamaAttention {
         let k = self.k_proj.forward(hidden_states)?;
         let v = self.v_proj.forward(hidden_states)?;
 
-        // Reshape: [seq, hidden] -> [1, heads, seq, head_dim]
-        let q = q
-            .reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?
-            .transpose_axes(&[1, 0, 2])?
-            .expand_dims(0)?;
-        let mut k = k
-            .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
-            .transpose_axes(&[1, 0, 2])?
-            .expand_dims(0)?;
+        // Reshape: [seq, hidden] -> [seq, heads, head_dim]
+        let q = q.reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?;
+        let k = k.reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
+
+        // Apply optional per-head QK norms (Qwen3).
+        // RmsNorm normalizes the last dimension, so [seq, heads, head_dim] → per-head norm.
+        let q = if let Some(ref mut norm) = self.q_norm {
+            norm.forward(&q)?
+        } else {
+            q
+        };
+        let k = if let Some(ref mut norm) = self.k_norm {
+            norm.forward(&k)?
+        } else {
+            k
+        };
+
+        // [seq, heads, head_dim] -> [1, heads, seq, head_dim]
+        let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
         let mut v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?

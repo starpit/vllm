@@ -7,6 +7,7 @@
 //! architectures, and [`MlxModelRegistry`] — maps HuggingFace architecture
 //! names to MLX model constructors.
 
+pub mod deepseek_v2;
 pub mod gemma2;
 pub mod llama;
 pub mod phi3;
@@ -76,6 +77,7 @@ impl MlxModelRegistry {
         registry.register("LlamaForCausalLM", llama::create_mlx_llama);
         registry.register("MistralForCausalLM", llama::create_mlx_llama);
         registry.register("Qwen2ForCausalLM", llama::create_mlx_llama);
+        registry.register("Qwen3ForCausalLM", llama::create_mlx_llama);
         // Quantized (same archs, different factories).
         registry.register_quantized(
             "LlamaForCausalLM",
@@ -89,6 +91,10 @@ impl MlxModelRegistry {
             "Qwen2ForCausalLM",
             quantized_llama::create_mlx_quantized_llama,
         );
+        registry.register_quantized(
+            "Qwen3ForCausalLM",
+            quantized_llama::create_mlx_quantized_llama,
+        );
         // Gemma v1
         registry.register("GemmaForCausalLM", gemma2::create_mlx_gemma);
         registry.register_quantized("GemmaForCausalLM", gemma2::create_mlx_quantized_gemma);
@@ -98,6 +104,8 @@ impl MlxModelRegistry {
         // Phi-3 (fused qkv_proj + gate_up_proj)
         registry.register("Phi3ForCausalLM", phi3::create_mlx_phi3);
         registry.register_quantized("Phi3ForCausalLM", phi3::create_mlx_quantized_phi3);
+        // DeepSeek V2/V3 (MLA attention + MoE)
+        registry.register("DeepseekV2ForCausalLM", deepseek_v2::create_mlx_deepseek_v2);
         registry
     }
 

@@ -304,6 +304,10 @@ pub struct MlxQuantizedLlamaAttention {
     k_proj: nn::QuantizedLinear,
     v_proj: nn::QuantizedLinear,
     o_proj: nn::QuantizedLinear,
+    /// Optional per-head Q norm (Qwen3 uses this).
+    q_norm: Option<nn::RmsNorm>,
+    /// Optional per-head K norm (Qwen3 uses this).
+    k_norm: Option<nn::RmsNorm>,
     rope: nn::Rope,
     num_heads: usize,
     num_kv_heads: usize,
@@ -319,6 +323,24 @@ impl MlxQuantizedLlamaAttention {
         config: &LlamaConfig,
         qc: &QuantConfig,
     ) -> Self {
+        // Optional QK norms (Qwen3 has per-head q_norm and k_norm).
+        let q_norm = weights
+            .get(&format!("{prefix}.q_norm.weight"))
+            .and_then(|w| {
+                let head_dim = w.dim(0);
+                let mut norm = nn::RmsNormBuilder::new(head_dim).eps(1e-6).build().ok()?;
+                norm.weight.value = w.clone();
+                Some(norm)
+            });
+        let k_norm = weights
+            .get(&format!("{prefix}.k_norm.weight"))
+            .and_then(|w| {
+                let head_dim = w.dim(0);
+                let mut norm = nn::RmsNormBuilder::new(head_dim).eps(1e-6).build().ok()?;
+                norm.weight.value = w.clone();
+                Some(norm)
+            });
+
         Self {
             q_proj: make_quantized_linear(
                 weights,
@@ -344,6 +366,8 @@ impl MlxQuantizedLlamaAttention {
                 qc.group_size,
                 qc.bits,
             ),
+            q_norm,
+            k_norm,
             rope: {
                 let mut r = nn::Rope::new(config.head_dim as i32);
                 r.base = config.rope_theta;
@@ -370,15 +394,25 @@ impl MlxQuantizedLlamaAttention {
         let k = self.k_proj.forward(hidden_states)?;
         let v = self.v_proj.forward(hidden_states)?;
 
-        // Reshape: [seq, hidden] -> [1, heads, seq, head_dim]
-        let q = q
-            .reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?
-            .transpose_axes(&[1, 0, 2])?
-            .expand_dims(0)?;
-        let mut k = k
-            .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
-            .transpose_axes(&[1, 0, 2])?
-            .expand_dims(0)?;
+        // Reshape: [seq, hidden] -> [seq, heads, head_dim]
+        let q = q.reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?;
+        let k = k.reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
+
+        // Apply optional per-head QK norms (Qwen3).
+        let q = if let Some(ref mut norm) = self.q_norm {
+            norm.forward(&q)?
+        } else {
+            q
+        };
+        let k = if let Some(ref mut norm) = self.k_norm {
+            norm.forward(&k)?
+        } else {
+            k
+        };
+
+        // [seq, heads, head_dim] -> [1, heads, seq, head_dim]
+        let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
         let mut v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
@@ -691,6 +725,8 @@ mod tests {
                     .bits(qc.bits)
                     .bias(false)
                     .build()?,
+                q_norm: None,
+                k_norm: None,
                 rope: {
                     let mut r = nn::Rope::new(config.head_dim as i32);
                     r.base = config.rope_theta;

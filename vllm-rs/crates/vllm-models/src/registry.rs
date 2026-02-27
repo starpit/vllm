@@ -57,11 +57,18 @@ impl ModelRegistry {
         // Qwen2 — architecturally identical to LLaMA but with QKV bias
         // and different rope_theta default
         self.register("Qwen2ForCausalLM", crate::qwen2::create_qwen2);
+        // Qwen3 — same as Qwen2/LLaMA (no attention bias)
+        self.register("Qwen3ForCausalLM", crate::llama::create_llama);
         // Phi-3 inherits directly from LLaMA in Python vLLM
         self.register("Phi3ForCausalLM", crate::llama::create_llama);
         // Gemma 2 — GELU activation, GemmaRMSNorm, 4 norms per layer,
         // attention/logit soft capping, embedding normalization
         self.register("Gemma2ForCausalLM", crate::gemma2::create_gemma2);
+        // DeepSeek V2/V3 — MLA attention + MoE + YaRN RoPE
+        self.register(
+            "DeepseekV2ForCausalLM",
+            crate::deepseek_v2::create_deepseek_v2,
+        );
 
         // --- GGUF factories (keyed by GGUF general.architecture value) ---
         self.register_gguf("llama", crate::quantized_llama::create_llama_gguf);

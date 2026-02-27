@@ -73,8 +73,8 @@ pub struct EngineCore {
     #[allow(dead_code)]
     use_spec_decode: bool,
 
-    /// EOS token ID for stop criteria.
-    eos_token_id: Option<u32>,
+    /// EOS token IDs for stop criteria (primary + additional from config).
+    eos_token_ids: Vec<u32>,
 }
 
 /// Configuration for creating an EngineCore.
@@ -93,8 +93,10 @@ pub struct EngineCoreConfig {
     pub async_scheduling: bool,
     /// Whether speculative decoding is enabled.
     pub use_spec_decode: bool,
-    /// EOS token ID (for stop criteria). `None` disables EOS-based stopping.
-    pub eos_token_id: Option<u32>,
+    /// EOS token IDs for stop criteria. Empty disables EOS-based stopping.
+    /// Supports models with multiple EOS tokens (e.g. LLaMA 3:
+    /// `<|end_of_text|>`, `<|eom_id|>`, `<|eot_id|>`).
+    pub eos_token_ids: Vec<u32>,
 }
 
 /// Output from a single engine step, grouped by client index.
@@ -111,8 +113,8 @@ impl EngineCore {
         );
 
         info!(
-            "EngineCore initialized: max_model_len={}, num_gpu_blocks={}, block_size={}",
-            config.max_model_len, config.num_gpu_blocks, config.block_size
+            "EngineCore initialized: max_model_len={}, num_gpu_blocks={}, block_size={}, eos_token_ids={:?}",
+            config.max_model_len, config.num_gpu_blocks, config.block_size, config.eos_token_ids
         );
 
         Self {
@@ -124,7 +126,7 @@ impl EngineCore {
             aborts_queue: VecDeque::new(),
             async_scheduling: config.async_scheduling,
             use_spec_decode: config.use_spec_decode,
-            eos_token_id: config.eos_token_id,
+            eos_token_ids: config.eos_token_ids,
         }
     }
 
@@ -394,11 +396,10 @@ impl EngineCore {
 
         // Check each new token against stop conditions.
         for &token_id in new_token_ids {
-            // 2. Check EOS token (unless ignore_eos is set).
-            if !params.ignore_eos
-                && let Some(eos_id) = self.eos_token_id
-                && token_id == eos_id
-            {
+            // 2. Check EOS tokens (unless ignore_eos is set).
+            //    Supports multiple EOS token IDs (e.g. LLaMA 3 has
+            //    <|end_of_text|>, <|eom_id|>, <|eot_id|>).
+            if !params.ignore_eos && self.eos_token_ids.contains(&token_id) {
                 return (Some(FinishReason::Stop), Some(StopReason::Token(token_id)));
             }
 
@@ -533,7 +534,7 @@ mod tests {
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,
-            eos_token_id: None,
+            eos_token_ids: vec![],
         }
     }
 
@@ -792,9 +793,9 @@ mod tests {
     #[test]
     fn test_eos_token_stop() {
         let mut config = make_test_config();
-        // NoopExecutor generates incrementing token IDs starting from 1.
-        // Set EOS to 1 so the first decode step triggers it.
-        config.eos_token_id = Some(1);
+        // NoopExecutor generates incrementing token IDs starting from 1000.
+        // Set EOS to 1000 so the first decode step triggers it.
+        config.eos_token_ids = vec![1000];
         let executor = Box::new(NoopExecutor::new(1024));
         let mut engine = EngineCore::new(config, executor);
 
@@ -805,7 +806,7 @@ mod tests {
         let req = Request::new("req-1".to_string(), vec![10, 20], params, 0.0, 0, 0, None);
         engine.add_request(req);
 
-        // Step — the first generated token should be 1 (EOS).
+        // Step — the first generated token should be 1000 (EOS).
         let (outputs, _) = engine.step().unwrap();
         let client_out = outputs.get(&0).unwrap();
         let req_out = client_out
@@ -814,11 +815,9 @@ mod tests {
             .find(|o| o.request_id == "req-1")
             .unwrap();
 
-        // With NoopExecutor, the first generated token is 1 → EOS.
-        if req_out.new_token_ids.contains(&1) {
-            assert_eq!(req_out.finish_reason, Some(FinishReason::Stop));
-            assert_eq!(req_out.stop_reason, Some(StopReason::Token(1)));
-        }
+        assert!(req_out.new_token_ids.contains(&1000));
+        assert_eq!(req_out.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(req_out.stop_reason, Some(StopReason::Token(1000)));
     }
 
     #[test]
@@ -827,10 +826,10 @@ mod tests {
         let executor = Box::new(NoopExecutor::new(1024));
         let mut engine = EngineCore::new(config, executor);
 
-        // Set stop_token_ids to include 1 (NoopExecutor generates 1 first).
+        // Set stop_token_ids to include 1000 (NoopExecutor starts there).
         let params = SamplingParams {
             max_tokens: Some(100),
-            stop_token_ids: vec![1],
+            stop_token_ids: vec![1000],
             ..Default::default()
         };
         let req = Request::new("req-1".to_string(), vec![10, 20], params, 0.0, 0, 0, None);
@@ -844,16 +843,15 @@ mod tests {
             .find(|o| o.request_id == "req-1")
             .unwrap();
 
-        if req_out.new_token_ids.contains(&1) {
-            assert_eq!(req_out.finish_reason, Some(FinishReason::Stop));
-            assert_eq!(req_out.stop_reason, Some(StopReason::Token(1)));
-        }
+        assert!(req_out.new_token_ids.contains(&1000));
+        assert_eq!(req_out.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(req_out.stop_reason, Some(StopReason::Token(1000)));
     }
 
     #[test]
     fn test_ignore_eos() {
         let mut config = make_test_config();
-        config.eos_token_id = Some(1);
+        config.eos_token_ids = vec![1000];
         let executor = Box::new(NoopExecutor::new(1024));
         let mut engine = EngineCore::new(config, executor);
 
@@ -866,7 +864,7 @@ mod tests {
         let req = Request::new("req-1".to_string(), vec![10, 20], params, 0.0, 0, 0, None);
         engine.add_request(req);
 
-        // Step — even if token 1 is generated, it shouldn't stop.
+        // Step — even though token 1000 (EOS) is generated, it shouldn't stop.
         let (outputs, _) = engine.step().unwrap();
         let client_out = outputs.get(&0).unwrap();
         let req_out = client_out
@@ -875,14 +873,51 @@ mod tests {
             .find(|o| o.request_id == "req-1")
             .unwrap();
 
+        // Token 1000 should be generated.
+        assert!(req_out.new_token_ids.contains(&1000));
         // With ignore_eos, the EOS token should NOT trigger a stop.
-        if req_out.new_token_ids.contains(&1) {
-            // finish_reason should be None (unless max_tokens was reached).
-            assert!(
-                req_out.finish_reason.is_none()
-                    || req_out.finish_reason == Some(FinishReason::Length),
-                "EOS should be ignored when ignore_eos is set"
-            );
+        assert!(
+            req_out.finish_reason.is_none(),
+            "EOS should be ignored when ignore_eos is set"
+        );
+    }
+
+    #[test]
+    fn test_multiple_eos_token_ids() {
+        // Simulate a model with multiple EOS tokens (e.g. LLaMA 3:
+        // 128001=<|end_of_text|>, 128008=<|eom_id|>, 128009=<|eot_id|>).
+        // NoopExecutor generates token IDs starting from 1000, so use 1002
+        // as a secondary EOS (hit on the 3rd decode step).
+        let mut config = make_test_config();
+        config.eos_token_ids = vec![9999, 1002, 8888]; // 1002 should trigger.
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        let params = SamplingParams {
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+        let req = Request::new("req-1".to_string(), vec![100, 200], params, 0.0, 0, 0, None);
+        engine.add_request(req);
+
+        // Step until the request finishes. NoopExecutor generates 1000, 1001,
+        // 1002, ... so token 1002 (a secondary EOS) should trigger stop.
+        let mut finished = false;
+        for _ in 0..10 {
+            let (outputs, _) = engine.step().unwrap();
+            if let Some(client_out) = outputs.get(&0) {
+                for out in &client_out.outputs {
+                    if out.request_id == "req-1" && out.finish_reason.is_some() {
+                        assert_eq!(out.finish_reason, Some(FinishReason::Stop));
+                        assert_eq!(out.stop_reason, Some(StopReason::Token(1002)));
+                        finished = true;
+                    }
+                }
+            }
+            if finished {
+                break;
+            }
         }
+        assert!(finished, "Request should stop on secondary EOS token ID");
     }
 }

@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, Dtype};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use vllm_common::SamplingParams;
 use vllm_core::scheduler::output::SchedulerOutput;
@@ -570,7 +570,6 @@ impl Worker for MlxWorker {
                 .or_insert_with(|| cache::empty_kv_cache(num_layers));
 
             // Forward pass — builds lazy compute graph (no eval yet).
-            let graph_start = Instant::now();
             let logits = model
                 .forward(&input_ids, &positions, kv_cache)
                 .map_err(|e| {
@@ -587,19 +586,16 @@ impl Worker for MlxWorker {
             } else {
                 logits
             };
-            let graph_ms = graph_start.elapsed().as_secs_f64() * 1000.0;
 
             // Sample — the eval() inside greedy_sample/sample_with_temperature
             // materializes the ENTIRE fused graph (forward + sampling) as
             // minimal Metal command buffers. One eval instead of two.
-            let sample_start = Instant::now();
             let sampled = if let Some(params) = self.sampling_params_map.get(&req_input.req_id) {
                 let temp = params.temperature as f32;
                 Self::sample_with_temperature(&req_logits, temp)?
             } else {
                 Self::greedy_sample(&req_logits)?
             };
-            let sample_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
 
             let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -618,33 +614,7 @@ impl Worker for MlxWorker {
                 self.total_decode_ms += step_ms;
             }
 
-            debug!(
-                "Request {}: sampled {:?} (buf_len={}, prefill={}, graph={:.2}ms, sample={:.2}ms, total={:.2}ms)",
-                req_input.req_id,
-                sampled,
-                self.token_buffers
-                    .get(&req_input.req_id)
-                    .map(|b| b.len())
-                    .unwrap_or(0),
-                req_input.is_prefill,
-                graph_ms,
-                sample_ms,
-                step_ms,
-            );
-
             token_map.insert(req_input.req_id.clone(), sampled);
-        }
-
-        // Periodic summary every 50 steps.
-        if self.step_count > 0 && self.step_count.is_multiple_of(50) {
-            info!(
-                "MlxWorker stats (step {}): prefill avg={:.2}ms ({} steps), decode avg={:.2}ms ({} steps)",
-                self.step_count,
-                self.avg_prefill_ms(),
-                self.prefill_count,
-                self.avg_decode_ms(),
-                self.decode_count,
-            );
         }
 
         Ok(ModelRunnerOutput::from_token_map(token_map))

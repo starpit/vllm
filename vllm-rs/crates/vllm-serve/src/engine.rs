@@ -220,6 +220,15 @@ impl AsyncEngine {
         // Resolve max_tokens: None → remaining capacity, Some(v) → min(v, remaining).
         self.resolve_max_tokens(&mut sampling_params, prompt_token_ids.len());
 
+        debug!(
+            request_id = %base_id,
+            prompt_tokens = num_prompt_tokens,
+            max_tokens = ?sampling_params.max_tokens,
+            max_model_len = self.max_model_len,
+            temperature = sampling_params.temperature,
+            "chat completion request"
+        );
+
         // Per-HTTP-request metrics (once, not per child).
         let metrics = crate::metrics::VllmMetrics::global();
         metrics.requests_total.inc();
@@ -812,10 +821,25 @@ impl AsyncEngine {
             let prompt_tokens = req_state.num_prompt_tokens;
             let completion_tokens = req_state.generated_token_ids.len() as u32;
 
+            let finish_str = req_state
+                .finish_reason
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let stop_str = req_state
+                .stop_reason
+                .as_ref()
+                .map(|sr| match sr {
+                    StopReason::Token(id) => format!("token:{id}"),
+                    StopReason::String(s) => format!("string:{s}"),
+                })
+                .unwrap_or_default();
+
             tracing::info!(
                 request_id = %output.request_id,
                 prompt_tokens = prompt_tokens,
                 completion_tokens = completion_tokens,
+                finish_reason = finish_str,
+                stop_reason = stop_str,
                 latency_ms = format!("{:.1}", total_latency * 1000.0),
                 ttft_ms = ttft_ms.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
                 avg_itl_ms = avg_itl_ms.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
@@ -1107,7 +1131,7 @@ mod tests {
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,
-            eos_token_id: None,
+            eos_token_ids: vec![],
         }
     }
 

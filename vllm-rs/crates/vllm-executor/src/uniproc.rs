@@ -338,7 +338,7 @@ mod tests {
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,
-            eos_token_id: None,
+            eos_token_ids: vec![],
         };
 
         let mut engine = EngineCore::new(config, Box::new(exec));

@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use vllm_common::SamplingParams;
 use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_engine::executor::ModelRunnerOutput;
@@ -694,12 +694,10 @@ impl Worker for CandleWorker {
             self.req_tokens_in_pool.remove(req_id);
         }
 
-        // Collect requests to process: (req_id, token_ids, positions, is_prefill).
         struct ReqInput {
             req_id: String,
             token_ids: Vec<u32>,
             positions: Vec<u32>,
-            is_prefill: bool,
         }
         let mut req_inputs: Vec<ReqInput> = Vec::new();
 
@@ -749,7 +747,6 @@ impl Worker for CandleWorker {
                 req_id: new_req.req_id.clone(),
                 token_ids: tokens_to_use.to_vec(),
                 positions,
-                is_prefill: true,
             });
         }
 
@@ -801,7 +798,6 @@ impl Worker for CandleWorker {
                     req_id: req_id.clone(),
                     token_ids: vec![last_token],
                     positions: vec![position],
-                    is_prefill: false,
                 });
             } else {
                 warn!("No token buffer for continuing request {}", req_id);
@@ -830,7 +826,6 @@ impl Worker for CandleWorker {
                     req_id: req_id.clone(),
                     token_ids: vec![last_token],
                     positions: vec![position],
-                    is_prefill: false,
                 });
             } else {
                 warn!("No token buffer for continuing request {}", req_id);
@@ -944,17 +939,6 @@ impl Worker for CandleWorker {
             if let Some(buf) = self.token_buffers.get_mut(&req_input.req_id) {
                 buf.extend_from_slice(&sampled);
             }
-
-            debug!(
-                "Request {}: sampled {:?} (buf_len={}, prefill={})",
-                req_input.req_id,
-                sampled,
-                self.token_buffers
-                    .get(&req_input.req_id)
-                    .map(|b| b.len())
-                    .unwrap_or(0),
-                req_input.is_prefill,
-            );
 
             token_map.insert(req_input.req_id.clone(), sampled);
         }

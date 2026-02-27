@@ -182,18 +182,27 @@ pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
 
     // 7. Build engine config and create InprocClient.
     //    Extract EOS token ID from model config if available.
-    let eos_token_id = hf_config.extra.get("eos_token_id").and_then(|v| {
-        // eos_token_id can be a single int or an array — take the first.
-        if let Some(id) = v.as_u64() {
-            Some(id as u32)
-        } else if let Some(arr) = v.as_array() {
-            arr.first().and_then(|v| v.as_u64()).map(|id| id as u32)
-        } else {
-            None
-        }
-    });
-    if let Some(eos) = eos_token_id {
-        info!("EOS token ID: {}", eos);
+    // Parse all EOS token IDs from config.json. Models like LLaMA 3 have
+    // multiple: [128001 (<|end_of_text|>), 128008 (<|eom_id|>), 128009 (<|eot_id|>)].
+    // Python vLLM checks the primary via eos_token_id and adds the rest to
+    // stop_token_ids; we check all of them in check_stop_criteria.
+    let eos_token_ids: Vec<u32> = hf_config
+        .extra
+        .get("eos_token_id")
+        .map(|v| {
+            if let Some(id) = v.as_u64() {
+                vec![id as u32]
+            } else if let Some(arr) = v.as_array() {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|id| id as u32))
+                    .collect()
+            } else {
+                vec![]
+            }
+        })
+        .unwrap_or_default();
+    if !eos_token_ids.is_empty() {
+        info!("EOS token IDs: {:?}", eos_token_ids);
     }
 
     let engine_config = EngineCoreConfig {
@@ -210,7 +219,7 @@ pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
         engine_index: 0,
         async_scheduling: false,
         use_spec_decode: false,
-        eos_token_id,
+        eos_token_ids,
     };
 
     let client = Box::new(InprocClient::new(engine_config, Box::new(executor)));

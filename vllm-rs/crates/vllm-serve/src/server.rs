@@ -145,8 +145,8 @@ async fn chat_completions(
     Json(request): Json<protocol::ChatCompletionRequest>,
 ) -> Response {
     info!(
-        "POST /v1/chat/completions: model={:?}, max_tokens={:?}, stream={}",
-        request.model, request.max_tokens, request.stream
+        "POST /v1/chat/completions: model={:?}, max_tokens={:?}, max_completion_tokens={:?}, stream={}",
+        request.model, request.max_tokens, request.max_completion_tokens, request.stream
     );
     if request.stream {
         match state.engine.chat_completion_stream(request).await {
@@ -296,7 +296,7 @@ mod tests {
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,
-            eos_token_id: None,
+            eos_token_ids: vec![],
         };
         let executor = Box::new(NoopExecutor::new(1024));
         let client = Box::new(InprocClient::new(engine_config, executor));
@@ -438,7 +438,7 @@ mod tests {
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,
-            eos_token_id: None,
+            eos_token_ids: vec![],
         };
         let executor = Box::new(NoopExecutor::new(1024));
         let client = Box::new(InprocClient::new(engine_config, executor));

@@ -823,9 +823,16 @@ impl AsyncEngine {
             );
 
             metrics.request_latency_seconds.observe(total_latency);
-            req_state.stream_tx.take();
+            // Drop stream sender; capture whether this was a streaming request.
+            let was_streaming = req_state.stream_tx.take().is_some();
             metrics.requests_active.dec();
             metrics.requests_success_total.inc();
+
+            // Streaming requests are cleaned up here — there's no poll_until_done
+            // consumer. Non-streaming requests stay for poll_until_done to remove.
+            if was_streaming {
+                requests.remove(&output.request_id);
+            }
         }
     }
 
@@ -1426,8 +1433,8 @@ mod tests {
         assert_eq!(delta.new_token_ids, vec![12]);
         assert_eq!(delta.finish_reason, Some(FinishReason::Length));
 
-        // Stream channel should be closed.
-        assert!(requests.get("req-1").unwrap().stream_tx.is_none());
+        // Finished streaming request should be removed from the map.
+        assert!(requests.get("req-1").is_none());
     }
 
     #[test]

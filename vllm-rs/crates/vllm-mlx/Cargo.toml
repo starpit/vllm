@@ -19,6 +19,7 @@ vllm-model = { workspace = true }
 mlx-rs = { workspace = true, optional = true }
 tracing = { workspace = true }
 hf-hub = { workspace = true }
+indicatif = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }

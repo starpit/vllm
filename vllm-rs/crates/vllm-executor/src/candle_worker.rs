@@ -9,7 +9,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use candle_core::{DType, Device, Tensor};
 use tracing::{debug, info, warn};
@@ -470,34 +469,49 @@ impl CandleWorker {
 
             let sorted_shards = index.shard_files();
             let total = sorted_shards.len();
-            info!("Downloading {total} shard files (up to 8 in parallel)");
 
-            const MAX_PARALLEL: usize = 8;
-            let counter = AtomicUsize::new(0);
-            let repo = &repo;
+            // Filter out shards already present in the cache.
+            let needed: Vec<&String> = sorted_shards
+                .iter()
+                .filter(|s| !model_dir.join(s).exists())
+                .collect();
 
-            for chunk in sorted_shards.chunks(MAX_PARALLEL) {
-                let results: Vec<ExecutorResult<()>> = std::thread::scope(|s| {
-                    let handles: Vec<_> = chunk
-                        .iter()
-                        .map(|shard| {
-                            let counter = &counter;
-                            s.spawn(move || {
-                                let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                                info!("  [{n}/{total}] {shard}");
-                                repo.get(shard).map(|_| ()).map_err(|e| {
-                                    ExecutorError::WorkerInit(format!(
-                                        "failed to download {shard}: {e}"
-                                    ))
+            if needed.is_empty() {
+                info!("All {total} shard files already cached");
+            } else {
+                info!(
+                    "Downloading {} of {total} shard files (up to 8 in parallel)",
+                    needed.len()
+                );
+
+                let multi = indicatif::MultiProgress::new();
+                const MAX_PARALLEL: usize = 8;
+                let repo = &repo;
+                let multi = &multi;
+
+                for chunk in needed.chunks(MAX_PARALLEL) {
+                    let results: Vec<ExecutorResult<()>> = std::thread::scope(|s| {
+                        let handles: Vec<_> = chunk
+                            .iter()
+                            .map(|shard| {
+                                let bar = multi.add(indicatif::ProgressBar::new(0));
+                                s.spawn(move || {
+                                    repo.download_with_progress(shard, bar).map(|_| ()).map_err(
+                                        |e| {
+                                            ExecutorError::WorkerInit(format!(
+                                                "failed to download {shard}: {e}"
+                                            ))
+                                        },
+                                    )
                                 })
                             })
-                        })
-                        .collect();
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
+                            .collect();
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
 
-                for result in results {
-                    result?;
+                    for result in results {
+                        result?;
+                    }
                 }
             }
 

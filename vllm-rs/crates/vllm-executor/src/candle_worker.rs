@@ -17,7 +17,7 @@ use vllm_common::SamplingParams;
 use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_engine::executor::ModelRunnerOutput;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
-use vllm_models::{KvBlockPool, KvCache, Model, ModelRegistry, Sampler};
+use vllm_models::{KvBlockPool, KvCache, KvCacheStorage, Model, ModelRegistry, Sampler};
 
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::worker::Worker;
@@ -572,7 +572,8 @@ impl Worker for CandleWorker {
 
             let logits = if use_paged {
                 // --- Paged KV cache path ---
-                let pool = self.kv_block_pool.as_ref().unwrap();
+                // Gathers happen lazily per-layer inside forward.
+                // Scatters are deferred and flushed in batch after forward.
                 let block_ids = self
                     .req_block_tables
                     .get(&req_input.req_id)
@@ -584,38 +585,19 @@ impl Worker for CandleWorker {
                     .copied()
                     .unwrap_or(0);
 
-                // Gather: assemble a contiguous KvCache from the block pool.
-                let mut kv_cache: KvCache = Vec::with_capacity(num_layers);
-                for layer in 0..num_layers {
-                    if tokens_before > 0 {
-                        let (k, v) =
-                            pool.gather_kv(layer, &block_ids, tokens_before)
-                                .map_err(|e| {
-                                    ExecutorError::WorkerExecution(format!("gather error: {e}"))
-                                })?;
-                        kv_cache.push(Some((k, v)));
-                    } else {
-                        kv_cache.push(None);
-                    }
-                }
+                let pool = self.kv_block_pool.as_mut().unwrap();
+                let mut storage = KvCacheStorage::paged(pool, &block_ids, tokens_before);
 
-                // Forward pass: model reads/writes the gathered KV cache.
                 let logits = model
-                    .forward(&input_ids, &positions, Some(&mut kv_cache))
+                    .forward(&input_ids, &positions, Some(&mut storage))
                     .map_err(|e| {
                         ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
                     })?;
 
-                // Scatter: write newly computed K/V tokens back into block pool.
-                let pool = self.kv_block_pool.as_mut().unwrap();
-                for layer in 0..num_layers {
-                    if let Some(Some((k, v))) = kv_cache.get(layer) {
-                        pool.scatter_new_kv(layer, &block_ids, tokens_before, k, v)
-                            .map_err(|e| {
-                                ExecutorError::WorkerExecution(format!("scatter error: {e}"))
-                            })?;
-                    }
-                }
+                // Flush deferred scatters to the block pool.
+                storage.flush().map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
+                })?;
 
                 // Update tokens-in-pool count.
                 let new_total = tokens_before + req_input.token_ids.len();
@@ -625,12 +607,20 @@ impl Worker for CandleWorker {
                 logits
             } else {
                 // --- Legacy per-request KV cache path ---
-                let kv_cache = self.kv_caches.get_mut(&req_input.req_id);
-                model
-                    .forward(&input_ids, &positions, kv_cache)
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
-                    })?
+                if let Some(kv_cache) = self.kv_caches.get_mut(&req_input.req_id) {
+                    let mut storage = KvCacheStorage::Contiguous(kv_cache);
+                    model
+                        .forward(&input_ids, &positions, Some(&mut storage))
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
+                        })?
+                } else {
+                    model
+                        .forward(&input_ids, &positions, None)
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
+                        })?
+                }
             };
 
             // Take logits at the last position and sample.
@@ -921,7 +911,7 @@ mod tests {
             &self,
             input_ids: &Tensor,
             _positions: &Tensor,
-            _kv_cache: Option<&mut vllm_models::KvCache>,
+            _kv_cache: Option<&mut vllm_models::KvCacheStorage<'_>>,
         ) -> vllm_model::ModelResult<Tensor> {
             // input_ids: [num_tokens] (1D)
             let hidden = self

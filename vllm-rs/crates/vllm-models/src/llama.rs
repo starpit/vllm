@@ -292,16 +292,16 @@ impl LlamaAttention {
     ///
     /// * `hidden_states` — shape `[num_tokens, hidden_size]`
     /// * `positions` — shape `[num_tokens]`
-    /// * `kv_cache` — optional `(cached_key, cached_value)` for this layer.
-    ///   When `Some`, new K/V are concatenated with the cache and the cache
-    ///   is updated in-place. The attention then uses the full KV sequence.
+    /// * `kv_cache` — optional per-layer KV handle. When `Some`, new K/V
+    ///   are concatenated with the cache and stored back. Supports both
+    ///   contiguous and paged block pool storage.
     ///
     /// Returns shape `[num_tokens, hidden_size]`.
     pub fn forward(
         &self,
         hidden_states: &Tensor,
         positions: &Tensor,
-        kv_cache: Option<&mut Option<(Tensor, Tensor)>>,
+        kv_cache: Option<crate::LayerKvHandle<'_>>,
     ) -> ModelResult<Tensor> {
         let num_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
 
@@ -333,16 +333,16 @@ impl LlamaAttention {
         // Apply RoPE.
         let (q, k) = self.rotary_emb.apply(&q, &k, positions)?;
 
-        // Merge with KV cache: concatenate cached K/V with new K/V.
-        let (k_full, v_full) = if let Some(cache_slot) = kv_cache {
-            if let Some((cached_k, cached_v)) = cache_slot.take() {
+        // Merge with KV cache via LayerKvHandle.
+        let (k_full, v_full) = if let Some(mut handle) = kv_cache {
+            if let Some((cached_k, cached_v)) = handle.take_cached()? {
                 let k_cat = Tensor::cat(&[&cached_k, &k], 0).map_err(ModelError::Candle)?;
                 let v_cat = Tensor::cat(&[&cached_v, &v], 0).map_err(ModelError::Candle)?;
-                *cache_slot = Some((k_cat.clone(), v_cat.clone()));
+                handle.store(k_cat.clone(), v_cat.clone())?;
                 (k_cat, v_cat)
             } else {
                 // First call (prefill): populate the cache.
-                *cache_slot = Some((k.clone(), v.clone()));
+                handle.store(k.clone(), v.clone())?;
                 (k, v)
             }
         } else {
@@ -433,14 +433,14 @@ impl LlamaDecoderLayer {
     ///
     /// * `hidden_states` — shape `[num_tokens, hidden_size]`
     /// * `positions` — shape `[num_tokens]`
-    /// * `kv_cache` — optional KV cache entry for this layer's attention
+    /// * `kv_cache` — optional per-layer KV handle for this layer's attention
     ///
     /// Returns hidden_states of same shape.
     pub fn forward(
         &self,
         hidden_states: &Tensor,
         positions: &Tensor,
-        kv_cache: Option<&mut Option<(Tensor, Tensor)>>,
+        kv_cache: Option<crate::LayerKvHandle<'_>>,
     ) -> ModelResult<Tensor> {
         // Pre-attention layernorm + attention + residual.
         let normed = self
@@ -522,14 +522,14 @@ impl LlamaModel {
     ///
     /// * `input_ids` — shape `[num_tokens]`
     /// * `positions` — shape `[num_tokens]`
-    /// * `kv_cache` — optional per-layer KV cache
+    /// * `kv_cache` — optional KV cache storage (contiguous or paged)
     ///
     /// Returns hidden states of shape `[num_tokens, hidden_size]`.
     pub fn forward(
         &self,
         input_ids: &Tensor,
         positions: &Tensor,
-        mut kv_cache: Option<&mut crate::KvCache>,
+        mut kv_cache: Option<&mut crate::KvCacheStorage<'_>>,
     ) -> ModelResult<Tensor> {
         let mut hidden_states = self
             .embed_tokens
@@ -537,8 +537,8 @@ impl LlamaModel {
             .map_err(ModelError::Candle)?;
 
         for (i, layer) in self.layers.iter().enumerate() {
-            let layer_cache = kv_cache.as_deref_mut().map(|c| &mut c[i]);
-            hidden_states = layer.forward(&hidden_states, positions, layer_cache)?;
+            let layer_handle = kv_cache.as_mut().map(|s| s.layer_handle(i));
+            hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
         }
 
         self.norm
@@ -612,7 +612,7 @@ impl crate::Model for LlamaForCausalLM {
         &self,
         input_ids: &Tensor,
         positions: &Tensor,
-        kv_cache: Option<&mut crate::KvCache>,
+        kv_cache: Option<&mut crate::KvCacheStorage<'_>>,
     ) -> ModelResult<Tensor> {
         let hidden_states = self.model.forward(input_ids, positions, kv_cache)?;
         let logits = self.compute_logits(&hidden_states)?;
@@ -1029,7 +1029,8 @@ mod tests {
         let positions = Tensor::new(&[0u32, 1, 2, 3], &Device::Cpu).unwrap();
         let mut cache: Option<(Tensor, Tensor)> = None;
 
-        let out = attn.forward(&x, &positions, Some(&mut cache)).unwrap();
+        let handle = crate::LayerKvHandle::Contiguous(&mut cache);
+        let out = attn.forward(&x, &positions, Some(handle)).unwrap();
         assert_eq!(out.dims(), &[4, config.hidden_size]);
 
         // Cache should now hold K/V of length 4.
@@ -1041,8 +1042,9 @@ mod tests {
         let x_decode = Tensor::ones(&[1, config.hidden_size], DType::F32, &Device::Cpu).unwrap();
         let pos_decode = Tensor::new(&[4u32], &Device::Cpu).unwrap();
 
+        let handle = crate::LayerKvHandle::Contiguous(&mut cache);
         let out_decode = attn
-            .forward(&x_decode, &pos_decode, Some(&mut cache))
+            .forward(&x_decode, &pos_decode, Some(handle))
             .unwrap();
         assert_eq!(out_decode.dims(), &[1, config.hidden_size]);
 
@@ -1121,8 +1123,10 @@ mod tests {
         let mut kv_cache: crate::KvCache = vec![None; model.model().num_layers()];
         let input_ids = Tensor::new(&[1u32, 5, 10], &device).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2], &device).unwrap();
+        let mut storage = crate::KvCacheStorage::Contiguous(&mut kv_cache);
         let logits =
-            crate::Model::forward(&model, &input_ids, &positions, Some(&mut kv_cache)).unwrap();
+            crate::Model::forward(&model, &input_ids, &positions, Some(&mut storage)).unwrap();
+        drop(storage);
         assert_eq!(logits.dims(), &[3, config.vocab_size]);
 
         // All layers should have caches populated.
@@ -1137,8 +1141,10 @@ mod tests {
         // Decode: 1 token at position 3.
         let decode_ids = Tensor::new(&[15u32], &device).unwrap();
         let decode_pos = Tensor::new(&[3u32], &device).unwrap();
+        let mut storage = crate::KvCacheStorage::Contiguous(&mut kv_cache);
         let logits2 =
-            crate::Model::forward(&model, &decode_ids, &decode_pos, Some(&mut kv_cache)).unwrap();
+            crate::Model::forward(&model, &decode_ids, &decode_pos, Some(&mut storage)).unwrap();
+        drop(storage);
         assert_eq!(logits2.dims(), &[1, config.vocab_size]);
 
         // Caches should now have length 4.

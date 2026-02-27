@@ -328,7 +328,7 @@ impl Gemma2Attention {
         &self,
         hidden_states: &Tensor,
         positions: &Tensor,
-        kv_cache: Option<&mut Option<(Tensor, Tensor)>>,
+        kv_cache: Option<crate::LayerKvHandle<'_>>,
     ) -> ModelResult<Tensor> {
         let num_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
 
@@ -357,15 +357,15 @@ impl Gemma2Attention {
 
         let (q, k) = self.rotary_emb.apply(&q, &k, positions)?;
 
-        // Merge with KV cache.
-        let (k_full, v_full) = if let Some(cache_slot) = kv_cache {
-            if let Some((cached_k, cached_v)) = cache_slot.take() {
+        // Merge with KV cache via LayerKvHandle.
+        let (k_full, v_full) = if let Some(mut handle) = kv_cache {
+            if let Some((cached_k, cached_v)) = handle.take_cached()? {
                 let k_cat = Tensor::cat(&[&cached_k, &k], 0).map_err(ModelError::Candle)?;
                 let v_cat = Tensor::cat(&[&cached_v, &v], 0).map_err(ModelError::Candle)?;
-                *cache_slot = Some((k_cat.clone(), v_cat.clone()));
+                handle.store(k_cat.clone(), v_cat.clone())?;
                 (k_cat, v_cat)
             } else {
-                *cache_slot = Some((k.clone(), v.clone()));
+                handle.store(k.clone(), v.clone())?;
                 (k, v)
             }
         } else {
@@ -465,7 +465,7 @@ impl Gemma2DecoderLayer {
         &self,
         hidden_states: &Tensor,
         positions: &Tensor,
-        kv_cache: Option<&mut Option<(Tensor, Tensor)>>,
+        kv_cache: Option<crate::LayerKvHandle<'_>>,
     ) -> ModelResult<Tensor> {
         // Pre-attention norm + attention.
         let normed = self
@@ -559,7 +559,7 @@ impl Gemma2Model {
         &self,
         input_ids: &Tensor,
         positions: &Tensor,
-        mut kv_cache: Option<&mut crate::KvCache>,
+        mut kv_cache: Option<&mut crate::KvCacheStorage<'_>>,
     ) -> ModelResult<Tensor> {
         let mut hidden_states = self
             .embed_tokens
@@ -570,8 +570,8 @@ impl Gemma2Model {
         hidden_states = (hidden_states * self.normalizer).map_err(ModelError::Candle)?;
 
         for (i, layer) in self.layers.iter().enumerate() {
-            let layer_cache = kv_cache.as_deref_mut().map(|c| &mut c[i]);
-            hidden_states = layer.forward(&hidden_states, positions, layer_cache)?;
+            let layer_handle = kv_cache.as_mut().map(|s| s.layer_handle(i));
+            hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
         }
 
         self.norm
@@ -644,7 +644,7 @@ impl crate::Model for Gemma2ForCausalLM {
         &self,
         input_ids: &Tensor,
         positions: &Tensor,
-        kv_cache: Option<&mut crate::KvCache>,
+        kv_cache: Option<&mut crate::KvCacheStorage<'_>>,
     ) -> ModelResult<Tensor> {
         let hidden_states = self.model.forward(input_ids, positions, kv_cache)?;
         let logits = self.compute_logits(&hidden_states)?;

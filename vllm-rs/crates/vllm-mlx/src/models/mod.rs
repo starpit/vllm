@@ -7,7 +7,9 @@
 //! architectures, and [`MlxModelRegistry`] — maps HuggingFace architecture
 //! names to MLX model constructors.
 
+pub mod gemma2;
 pub mod llama;
+pub mod phi3;
 pub mod quantized_llama;
 
 use std::collections::HashMap;
@@ -87,6 +89,12 @@ impl MlxModelRegistry {
             "Qwen2ForCausalLM",
             quantized_llama::create_mlx_quantized_llama,
         );
+        // Gemma2
+        registry.register("Gemma2ForCausalLM", gemma2::create_mlx_gemma2);
+        registry.register_quantized("Gemma2ForCausalLM", gemma2::create_mlx_quantized_gemma2);
+        // Phi-3 (fused qkv_proj + gate_up_proj)
+        registry.register("Phi3ForCausalLM", phi3::create_mlx_phi3);
+        registry.register_quantized("Phi3ForCausalLM", phi3::create_mlx_quantized_phi3);
         registry
     }
 
@@ -148,6 +156,10 @@ mod tests {
         assert!(registry.contains("LlamaForCausalLM"));
         assert!(registry.contains("MistralForCausalLM"));
         assert!(registry.contains("Qwen2ForCausalLM"));
+        assert!(registry.contains("Gemma2ForCausalLM"));
+        assert!(registry.contains("Phi3ForCausalLM"));
+        assert!(registry.contains_quantized("Gemma2ForCausalLM"));
+        assert!(registry.contains_quantized("Phi3ForCausalLM"));
         assert!(!registry.contains("GPT2ForCausalLM"));
     }
 

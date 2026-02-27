@@ -81,7 +81,11 @@ impl LlamaConfig {
 // ---------------------------------------------------------------------------
 
 /// Look up a weight by name and assign it. Logs a warning if not found.
-fn assign_weight(target: &mut Param<Array>, weights: &HashMap<String, Array>, name: &str) {
+pub(crate) fn assign_weight(
+    target: &mut Param<Array>,
+    weights: &HashMap<String, Array>,
+    name: &str,
+) {
     if let Some(w) = weights.get(name) {
         target.value = w.clone();
     } else {
@@ -212,6 +216,17 @@ impl MlxLlamaAttention {
             weights,
             &format!("{prefix}.o_proj.weight"),
         );
+        // Optional bias (Qwen2 has attention bias, LLaMA/Mistral do not).
+        for (proj, name) in [
+            (&mut self.q_proj, "q_proj"),
+            (&mut self.k_proj, "k_proj"),
+            (&mut self.v_proj, "v_proj"),
+            (&mut self.o_proj, "o_proj"),
+        ] {
+            if let Some(b) = weights.get(&format!("{prefix}.{name}.bias")) {
+                proj.bias.value = Some(b.clone());
+            }
+        }
     }
 
     /// Forward pass.

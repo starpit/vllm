@@ -64,7 +64,7 @@ impl QuantConfig {
 
 /// Construct a `QuantizedLinear` directly from loaded weight arrays.
 /// Avoids the builder's wasteful random-init + quantize step.
-fn make_quantized_linear(
+pub(crate) fn make_quantized_linear(
     weights: &HashMap<String, Array>,
     prefix: &str,
     group_size: i32,
@@ -105,7 +105,7 @@ fn make_quantized_linear(
 }
 
 /// Construct a `QuantizedEmbedding` directly from loaded weight arrays.
-fn make_quantized_embedding(
+pub(crate) fn make_quantized_embedding(
     weights: &HashMap<String, Array>,
     prefix: &str,
     group_size: i32,
@@ -145,11 +145,106 @@ fn make_quantized_embedding(
 }
 
 /// Look up a weight by name and assign it.
-fn assign_weight(target: &mut Param<Array>, weights: &HashMap<String, Array>, name: &str) {
+pub(crate) fn assign_weight(
+    target: &mut Param<Array>,
+    weights: &HashMap<String, Array>,
+    name: &str,
+) {
     if let Some(w) = weights.get(name) {
         target.value = w.clone();
     } else {
         tracing::warn!("Weight not found: {name}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MlxEmbedTokens / MlxLmHead — handle mixed quantized/float weights
+// ---------------------------------------------------------------------------
+
+/// Embedding that may or may not be quantized.
+///
+/// mlx-community quantized models often leave the embedding layer as float16
+/// (no scales/biases). This enum dispatches to the right implementation.
+pub(crate) enum MlxEmbedTokens {
+    Quantized(nn::QuantizedEmbedding),
+    Float(nn::Embedding),
+}
+
+impl MlxEmbedTokens {
+    /// Create from loaded weights. Uses `QuantizedEmbedding` if `{prefix}.scales`
+    /// exists, otherwise falls back to a regular float `Embedding`.
+    pub(crate) fn from_weights(
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+    ) -> Self {
+        if weights.contains_key(&format!("{prefix}.scales")) {
+            Self::Quantized(make_quantized_embedding(weights, prefix, group_size, bits))
+        } else if let Some(w) = weights.get(&format!("{prefix}.weight")) {
+            tracing::info!("Embedding at {prefix} is not quantized, using float");
+            let mut emb =
+                nn::Embedding::new(w.dim(0), w.dim(1)).expect("failed to create Embedding");
+            emb.weight.value = w.clone();
+            Self::Float(emb)
+        } else {
+            tracing::warn!("Embedding weights not found at {prefix}, creating quantized stub");
+            Self::Quantized(make_quantized_embedding(weights, prefix, group_size, bits))
+        }
+    }
+
+    pub(crate) fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Quantized(emb) => emb.forward(x),
+            Self::Float(emb) => emb.forward(x),
+        }
+    }
+
+    pub(crate) fn as_linear(&self, x: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Quantized(emb) => emb.as_linear(x),
+            Self::Float(emb) => emb.as_linear(x),
+        }
+    }
+}
+
+/// LM head that may or may not be quantized.
+///
+/// Same rationale as `MlxEmbedTokens` — some quantized models leave lm_head
+/// as float.
+pub(crate) enum MlxLmHead {
+    Quantized(nn::QuantizedLinear),
+    Float(nn::Linear),
+}
+
+impl MlxLmHead {
+    /// Create from loaded weights. Uses `QuantizedLinear` if `{prefix}.scales`
+    /// exists, otherwise falls back to a regular float `Linear`.
+    pub(crate) fn from_weights(
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+    ) -> Self {
+        if weights.contains_key(&format!("{prefix}.scales")) {
+            Self::Quantized(make_quantized_linear(weights, prefix, group_size, bits))
+        } else if let Some(w) = weights.get(&format!("{prefix}.weight")) {
+            tracing::info!("LM head at {prefix} is not quantized, using float");
+            Self::Float(nn::Linear {
+                weight: Param::new(w.clone()),
+                bias: Param::new(None),
+            })
+        } else {
+            tracing::warn!("LM head weights not found at {prefix}, creating quantized stub");
+            Self::Quantized(make_quantized_linear(weights, prefix, group_size, bits))
+        }
+    }
+
+    pub(crate) fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Quantized(lin) => lin.forward(x),
+            Self::Float(lin) => lin.forward(x),
+        }
     }
 }
 
@@ -398,13 +493,13 @@ impl MlxQuantizedLlamaDecoderLayer {
 
 /// Quantized LLaMA for causal language modeling using MLX.
 ///
-/// Uses `nn::QuantizedLinear` for projections and MLP,
-/// `nn::QuantizedEmbedding` for token embedding (and tied lm_head).
+/// Uses `nn::QuantizedLinear` for projections and MLP.
+/// Embedding and lm_head may be float if the quantized model didn't quantize them.
 pub struct MlxQuantizedLlamaForCausalLM {
-    embed_tokens: nn::QuantizedEmbedding,
+    embed_tokens: MlxEmbedTokens,
     layers: Vec<MlxQuantizedLlamaDecoderLayer>,
     norm: nn::RmsNorm,
-    lm_head: Option<nn::QuantizedLinear>,
+    lm_head: Option<MlxLmHead>,
     tie_word_embeddings: bool,
     #[allow(dead_code)]
     config: LlamaConfig,
@@ -420,9 +515,9 @@ impl MlxQuantizedLlamaForCausalLM {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let weights = load_safetensors_weights(model_dir)?;
 
-        // Build embedding.
+        // Build embedding (auto-detects quantized vs float).
         let embed_tokens =
-            make_quantized_embedding(&weights, "model.embed_tokens", qc.group_size, qc.bits);
+            MlxEmbedTokens::from_weights(&weights, "model.embed_tokens", qc.group_size, qc.bits);
 
         // Build decoder layers.
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -441,11 +536,11 @@ impl MlxQuantizedLlamaForCausalLM {
             .build()?;
         assign_weight(&mut norm.weight, &weights, "model.norm.weight");
 
-        // Build lm_head.
+        // Build lm_head (auto-detects quantized vs float).
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(make_quantized_linear(
+            Some(MlxLmHead::from_weights(
                 &weights,
                 "lm_head",
                 qc.group_size,
@@ -561,11 +656,12 @@ mod tests {
         config: &LlamaConfig,
         qc: &QuantConfig,
     ) -> Result<MlxQuantizedLlamaForCausalLM, Exception> {
-        let embed_tokens =
+        let embed_tokens = MlxEmbedTokens::Quantized(
             nn::QuantizedEmbeddingBuilder::new(config.vocab_size as i32, config.hidden_size as i32)
                 .group_size(qc.group_size)
                 .bits(qc.bits)
-                .build()?;
+                .build()?,
+        );
 
         let hidden = config.hidden_size as i32;
         let intermediate = config.intermediate_size as i32;

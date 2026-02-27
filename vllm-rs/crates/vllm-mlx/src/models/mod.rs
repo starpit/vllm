@@ -7,6 +7,7 @@
 //! architectures, and [`MlxModelRegistry`] — maps HuggingFace architecture
 //! names to MLX model constructors.
 
+pub mod commandr;
 pub mod deepseek_v2;
 pub mod gemma2;
 pub mod llama;
@@ -106,6 +107,10 @@ impl MlxModelRegistry {
         registry.register_quantized("Phi3ForCausalLM", phi3::create_mlx_quantized_phi3);
         // DeepSeek V2/V3 (MLA attention + MoE)
         registry.register("DeepseekV2ForCausalLM", deepseek_v2::create_mlx_deepseek_v2);
+        // Command R (Cohere) — CohereLayerNorm, parallel attn+MLP, logit scaling,
+        // interleaved RoPE
+        registry.register("CohereForCausalLM", commandr::create_mlx_commandr);
+        registry.register_quantized("CohereForCausalLM", commandr::create_mlx_quantized_commandr);
         registry
     }
 

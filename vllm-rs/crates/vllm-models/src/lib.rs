@@ -10,6 +10,7 @@
 //! Port of: `vllm/model_executor/models/`
 
 pub mod attention;
+pub mod commandr;
 pub mod deepseek_v2;
 pub mod gemma2;
 pub mod kv_block_pool;

@@ -69,6 +69,9 @@ impl ModelRegistry {
             "DeepseekV2ForCausalLM",
             crate::deepseek_v2::create_deepseek_v2,
         );
+        // Command R (Cohere) — CohereLayerNorm, parallel attn+MLP, logit scaling,
+        // interleaved RoPE
+        self.register("CohereForCausalLM", crate::commandr::create_commandr);
 
         // --- GGUF factories (keyed by GGUF general.architecture value) ---
         self.register_gguf("llama", crate::quantized_llama::create_llama_gguf);

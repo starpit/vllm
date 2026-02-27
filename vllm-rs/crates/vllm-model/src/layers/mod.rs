@@ -21,6 +21,6 @@ pub mod rotary;
 pub use activation::{Activation, gelu, relu, silu};
 pub use embedding::Embedding;
 pub use linear::{ColumnParallelLinear, Linear, RowParallelLinear};
-pub use norm::{GemmaRmsNorm, RmsNorm};
+pub use norm::{CohereLayerNorm, GemmaRmsNorm, RmsNorm};
 pub use quantized_linear::QuantizedLinear;
 pub use rotary::RotaryEmbedding;

@@ -77,10 +77,10 @@ struct QuantizedLlamaAttention {
     scale: f64,
 }
 
-/// Precompute cos/sin tables for interleaved RoPE (GGML convention).
+/// Precompute cos/sin tables for interleaved RoPE (GGML / Cohere convention).
 ///
 /// Returns (cos, sin) each of shape `[max_position, head_dim/2]`.
-fn precompute_freqs_cis(
+pub(crate) fn precompute_freqs_cis(
     head_dim: usize,
     max_position: usize,
     rope_theta: f64,
@@ -115,7 +115,9 @@ fn precompute_freqs_cis(
 /// Interleaved means adjacent pairs (x[2i], x[2i+1]) are rotated together:
 ///   y[2i]   = x[2i]*cos[i] - x[2i+1]*sin[i]
 ///   y[2i+1] = x[2i]*sin[i] + x[2i+1]*cos[i]
-fn apply_interleaved_rope(
+///
+/// Used by GGUF models (GGML convention) and Cohere Command R.
+pub(crate) fn apply_interleaved_rope(
     x: &Tensor,
     cos: &Tensor,
     sin: &Tensor,

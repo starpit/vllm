@@ -462,7 +462,7 @@ impl super::MlxModel for MlxLlamaForCausalLM {
 // ---------------------------------------------------------------------------
 
 /// Load all safetensors weights from a model directory into a flat HashMap.
-fn load_safetensors_weights(
+pub fn load_safetensors_weights(
     model_dir: &Path,
 ) -> Result<HashMap<String, Array>, Box<dyn std::error::Error + Send + Sync>> {
     let single_path = model_dir.join("model.safetensors");

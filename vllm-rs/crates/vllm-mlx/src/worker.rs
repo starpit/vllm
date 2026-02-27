@@ -353,6 +353,13 @@ impl Worker for MlxWorker {
             resolved
         };
 
+        // Detect quantization from config.json.
+        let is_quantized = hf_config.extra.contains_key("quantization");
+        if is_quantized {
+            let qinfo = hf_config.extra.get("quantization").unwrap();
+            info!("MlxWorker: detected quantized model: {qinfo}");
+        }
+
         // Look up architecture in the MLX registry.
         let arch = hf_config
             .architectures
@@ -362,7 +369,7 @@ impl Worker for MlxWorker {
             })?
             .clone();
         let registry = MlxModelRegistry::default_registry();
-        let factory = registry.get(&arch).ok_or_else(|| {
+        let factory = registry.get_factory(&arch, is_quantized).ok_or_else(|| {
             ExecutorError::WorkerInit(format!(
                 "unsupported MLX architecture: {arch}. Supported: {:?}",
                 registry.architectures().collect::<Vec<_>>()
@@ -378,7 +385,8 @@ impl Worker for MlxWorker {
         self.hf_config = Some(hf_config);
         self.resolved_dtype = Some(dtype);
         self.model = Some(model);
-        info!("MlxWorker: model loaded (arch={arch}, dtype={dtype:?})");
+        let quant_str = if is_quantized { ", quantized" } else { "" };
+        info!("MlxWorker: model loaded (arch={arch}, dtype={dtype:?}{quant_str})");
         Ok(())
     }
 

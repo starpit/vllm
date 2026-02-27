@@ -8,6 +8,7 @@
 //! names to MLX model constructors.
 
 pub mod llama;
+pub mod quantized_llama;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -52,6 +53,9 @@ pub type MlxModelFactory =
 /// Registry mapping HuggingFace architecture names to MLX model constructors.
 pub struct MlxModelRegistry {
     models: HashMap<String, MlxModelFactory>,
+    /// Separate map for quantized model factories (checked first when config has
+    /// a `"quantization"` field). Mirrors the candle `gguf_models` pattern.
+    quantized_models: HashMap<String, MlxModelFactory>,
 }
 
 impl MlxModelRegistry {
@@ -59,15 +63,30 @@ impl MlxModelRegistry {
     pub fn new() -> Self {
         Self {
             models: HashMap::new(),
+            quantized_models: HashMap::new(),
         }
     }
 
     /// Create the default registry with built-in model architectures.
     pub fn default_registry() -> Self {
         let mut registry = Self::new();
+        // Non-quantized.
         registry.register("LlamaForCausalLM", llama::create_mlx_llama);
         registry.register("MistralForCausalLM", llama::create_mlx_llama);
         registry.register("Qwen2ForCausalLM", llama::create_mlx_llama);
+        // Quantized (same archs, different factories).
+        registry.register_quantized(
+            "LlamaForCausalLM",
+            quantized_llama::create_mlx_quantized_llama,
+        );
+        registry.register_quantized(
+            "MistralForCausalLM",
+            quantized_llama::create_mlx_quantized_llama,
+        );
+        registry.register_quantized(
+            "Qwen2ForCausalLM",
+            quantized_llama::create_mlx_quantized_llama,
+        );
         registry
     }
 
@@ -76,17 +95,38 @@ impl MlxModelRegistry {
         self.models.insert(arch.to_string(), factory);
     }
 
+    /// Register a quantized model factory for an architecture name.
+    pub fn register_quantized(&mut self, arch: &str, factory: MlxModelFactory) {
+        self.quantized_models.insert(arch.to_string(), factory);
+    }
+
     /// Look up a model factory by architecture name.
+    ///
+    /// If `quantized` is true, checks the quantized registry first, falling
+    /// back to the non-quantized registry.
+    pub fn get_factory(&self, arch: &str, quantized: bool) -> Option<MlxModelFactory> {
+        if quantized && let Some(f) = self.quantized_models.get(arch) {
+            return Some(*f);
+        }
+        self.models.get(arch).copied()
+    }
+
+    /// Look up a non-quantized model factory by architecture name.
     pub fn get(&self, arch: &str) -> Option<MlxModelFactory> {
         self.models.get(arch).copied()
     }
 
-    /// Check if an architecture is supported.
+    /// Check if an architecture is supported (quantized or not).
     pub fn contains(&self, arch: &str) -> bool {
-        self.models.contains_key(arch)
+        self.models.contains_key(arch) || self.quantized_models.contains_key(arch)
     }
 
-    /// Iterate over supported architecture names.
+    /// Check if a quantized factory exists for an architecture.
+    pub fn contains_quantized(&self, arch: &str) -> bool {
+        self.quantized_models.contains_key(arch)
+    }
+
+    /// Iterate over supported architecture names (non-quantized).
     pub fn architectures(&self) -> impl Iterator<Item = &str> {
         self.models.keys().map(|s| s.as_str())
     }

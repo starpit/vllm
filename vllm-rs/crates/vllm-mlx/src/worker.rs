@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, Dtype};
@@ -92,6 +93,13 @@ pub struct MlxWorker {
     sampling_params_map: HashMap<String, SamplingParams>,
     /// Per-request KV cache (simple contiguous, no paging).
     kv_caches: HashMap<String, MlxKvCache>,
+
+    // Timing instrumentation.
+    step_count: usize,
+    prefill_count: usize,
+    decode_count: usize,
+    total_prefill_ms: f64,
+    total_decode_ms: f64,
 }
 
 impl MlxWorker {
@@ -108,6 +116,11 @@ impl MlxWorker {
             token_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
             kv_caches: HashMap::new(),
+            step_count: 0,
+            prefill_count: 0,
+            decode_count: 0,
+            total_prefill_ms: 0.0,
+            total_decode_ms: 0.0,
         }
     }
 
@@ -124,6 +137,39 @@ impl MlxWorker {
     /// Get the resolved model dtype.
     pub fn resolved_dtype(&self) -> Option<Dtype> {
         self.resolved_dtype
+    }
+
+    /// Total execute_model steps processed.
+    pub fn step_count(&self) -> usize {
+        self.step_count
+    }
+
+    /// Number of prefill steps processed.
+    pub fn prefill_count(&self) -> usize {
+        self.prefill_count
+    }
+
+    /// Number of decode steps processed.
+    pub fn decode_count(&self) -> usize {
+        self.decode_count
+    }
+
+    /// Average prefill latency in milliseconds, or 0 if none.
+    pub fn avg_prefill_ms(&self) -> f64 {
+        if self.prefill_count == 0 {
+            0.0
+        } else {
+            self.total_prefill_ms / self.prefill_count as f64
+        }
+    }
+
+    /// Average decode latency in milliseconds, or 0 if none.
+    pub fn avg_decode_ms(&self) -> f64 {
+        if self.decode_count == 0 {
+            0.0
+        } else {
+            self.total_decode_ms / self.decode_count as f64
+        }
     }
 
     /// Build an HF Hub API client from config.
@@ -484,6 +530,8 @@ impl Worker for MlxWorker {
 
         // Run a separate forward pass per request (each has its own KV cache).
         for req_input in &req_inputs {
+            let step_start = Instant::now();
+
             let input_ids = Array::from_iter(
                 req_input.token_ids.iter().map(|&t| t as i32),
                 &[req_input.token_ids.len() as i32],
@@ -499,23 +547,17 @@ impl Worker for MlxWorker {
                 .entry(req_input.req_id.clone())
                 .or_insert_with(|| cache::empty_kv_cache(num_layers));
 
-            // Forward pass — builds lazy compute graph.
+            // Forward pass — builds lazy compute graph (no eval yet).
+            let graph_start = Instant::now();
             let logits = model
                 .forward(&input_ids, &positions, kv_cache)
                 .map_err(|e| {
                     ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
                 })?;
 
-            // eval() — materializes the ENTIRE forward pass graph as minimal
-            // Metal command buffers. This is where the perf win comes from.
-            logits
-                .eval()
-                .map_err(|e| ExecutorError::WorkerExecution(format!("eval failed: {e}")))?;
-
-            // Take logits at the last position and sample.
+            // Take logits at the last position (still lazy — no eval).
             let last_pos = req_input.token_ids.len() - 1;
-            let seq_len = logits.dim(0) as usize;
-            let req_logits = if seq_len > 1 {
+            let req_logits = if req_input.token_ids.len() > 1 {
                 logits
                     .index(last_pos as i32)
                     .expand_dims(0)
@@ -523,22 +565,39 @@ impl Worker for MlxWorker {
             } else {
                 logits
             };
+            let graph_ms = graph_start.elapsed().as_secs_f64() * 1000.0;
 
-            // Sample.
+            // Sample — the eval() inside greedy_sample/sample_with_temperature
+            // materializes the ENTIRE fused graph (forward + sampling) as
+            // minimal Metal command buffers. One eval instead of two.
+            let sample_start = Instant::now();
             let sampled = if let Some(params) = self.sampling_params_map.get(&req_input.req_id) {
                 let temp = params.temperature as f32;
                 Self::sample_with_temperature(&req_logits, temp)?
             } else {
                 Self::greedy_sample(&req_logits)?
             };
+            let sample_ms = sample_start.elapsed().as_secs_f64() * 1000.0;
+
+            let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
             // Update token buffer.
             if let Some(buf) = self.token_buffers.get_mut(&req_input.req_id) {
                 buf.extend_from_slice(&sampled);
             }
 
+            // Timing bookkeeping.
+            self.step_count += 1;
+            if req_input.is_prefill {
+                self.prefill_count += 1;
+                self.total_prefill_ms += step_ms;
+            } else {
+                self.decode_count += 1;
+                self.total_decode_ms += step_ms;
+            }
+
             debug!(
-                "Request {}: sampled {:?} (buf_len={}, prefill={})",
+                "Request {}: sampled {:?} (buf_len={}, prefill={}, graph={:.2}ms, sample={:.2}ms, total={:.2}ms)",
                 req_input.req_id,
                 sampled,
                 self.token_buffers
@@ -546,9 +605,24 @@ impl Worker for MlxWorker {
                     .map(|b| b.len())
                     .unwrap_or(0),
                 req_input.is_prefill,
+                graph_ms,
+                sample_ms,
+                step_ms,
             );
 
             token_map.insert(req_input.req_id.clone(), sampled);
+        }
+
+        // Periodic summary every 50 steps.
+        if self.step_count > 0 && self.step_count.is_multiple_of(50) {
+            info!(
+                "MlxWorker stats (step {}): prefill avg={:.2}ms ({} steps), decode avg={:.2}ms ({} steps)",
+                self.step_count,
+                self.avg_prefill_ms(),
+                self.prefill_count,
+                self.avg_decode_ms(),
+                self.decode_count,
+            );
         }
 
         Ok(ModelRunnerOutput::from_token_map(token_map))
@@ -570,5 +644,77 @@ impl Worker for MlxWorker {
 
     fn is_driver_worker(&self) -> bool {
         true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_worker() -> MlxWorker {
+        MlxWorker::new(MlxWorkerConfig {
+            model_path: "/nonexistent".to_string(),
+            dtype: "f16".to_string(),
+            hf_token: None,
+            cache_dir: None,
+            block_size: 16,
+        })
+    }
+
+    #[test]
+    fn test_timing_fields_initial() {
+        let w = make_worker();
+        assert_eq!(w.step_count(), 0);
+        assert_eq!(w.prefill_count(), 0);
+        assert_eq!(w.decode_count(), 0);
+        assert_eq!(w.avg_prefill_ms(), 0.0);
+        assert_eq!(w.avg_decode_ms(), 0.0);
+    }
+
+    #[test]
+    fn test_avg_latency_zero_division() {
+        // avg should return 0.0 when no steps have been run, not panic.
+        let w = make_worker();
+        assert_eq!(w.avg_prefill_ms(), 0.0);
+        assert_eq!(w.avg_decode_ms(), 0.0);
+    }
+
+    #[test]
+    fn test_execute_model_no_model_loaded() {
+        // Without a loaded model, execute_model returns an error.
+        let mut w = make_worker();
+        let sched = SchedulerOutput::make_empty();
+        let result = w.execute_model(&sched);
+        assert!(result.is_err());
+        // Timing counters should not be updated on error.
+        assert_eq!(w.step_count(), 0);
+    }
+
+    #[test]
+    fn test_mlx_worker_config_dtype_parsing() {
+        let config = MlxWorkerConfig {
+            model_path: String::new(),
+            dtype: "auto".to_string(),
+            hf_token: None,
+            cache_dir: None,
+            block_size: 16,
+        };
+        assert!(config.mlx_dtype().unwrap().is_none());
+
+        let config_f16 = MlxWorkerConfig {
+            dtype: "f16".to_string(),
+            ..config.clone()
+        };
+        assert_eq!(config_f16.mlx_dtype().unwrap(), Some(Dtype::Float16));
+
+        let config_bad = MlxWorkerConfig {
+            dtype: "int8".to_string(),
+            ..config
+        };
+        assert!(config_bad.mlx_dtype().is_err());
     }
 }

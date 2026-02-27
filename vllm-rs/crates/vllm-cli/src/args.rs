@@ -130,6 +130,10 @@ pub struct BenchArgs {
     #[arg(long, default_value_t = 64)]
     pub max_tokens: usize,
 
+    /// Number of warmup requests before timing.
+    #[arg(long, default_value_t = 2)]
+    pub warmup: usize,
+
     /// HuggingFace token.
     #[arg(long, env = "HF_TOKEN")]
     pub hf_token: Option<String>,

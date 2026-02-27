@@ -77,6 +77,10 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,
 
+    /// Fraction of GPU memory to use for KV cache (0.0–1.0).
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
+
     /// Specific GGUF filename to download from a HuggingFace repo.
     /// Example: --gguf-file llama-2-7b-chat.Q4_K_M.gguf
     #[arg(long)]
@@ -141,6 +145,10 @@ pub struct BenchArgs {
     /// Log level.
     #[arg(long, default_value = "info")]
     pub log_level: String,
+
+    /// Fraction of GPU memory to use for KV cache (0.0–1.0).
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
 
     /// Specific GGUF filename to download from a HuggingFace repo.
     #[arg(long)]

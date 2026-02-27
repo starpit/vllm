@@ -50,6 +50,9 @@ prometheus = "0.13"
 thiserror = "2"
 anyhow = "1"
 
+# System info
+sysinfo = "0.33"
+
 # Collections / utilities
 indexmap = { version = "2", features = ["serde"] }
 hashbrown = "0.15"

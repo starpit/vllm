@@ -124,11 +124,18 @@ fn init_cache(
     block_size: usize,
     hf_config: &HfModelConfig,
     model_dtype: DType,
+    gpu_memory_utilization: f64,
 ) -> Result<(Box<dyn Worker>, usize, usize)> {
     let available_memory = worker
         .determine_available_memory()
         .context("failed to determine available memory")?;
-    let num_gpu_blocks = compute_num_blocks(available_memory, block_size, hf_config, model_dtype);
+    let num_gpu_blocks = compute_num_blocks(
+        available_memory,
+        block_size,
+        hf_config,
+        model_dtype,
+        gpu_memory_utilization,
+    );
     worker
         .initialize_cache(num_gpu_blocks, 0)
         .context("failed to initialize cache")?;
@@ -168,12 +175,18 @@ pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
         model_name, max_model_len, num_layers
     );
 
-    let (worker, available_memory, num_gpu_blocks) =
-        init_cache(worker, args.block_size, &hf_config, model_dtype)?;
+    let (worker, available_memory, num_gpu_blocks) = init_cache(
+        worker,
+        args.block_size,
+        &hf_config,
+        model_dtype,
+        args.gpu_memory_utilization,
+    )?;
 
     info!(
-        "Available memory: {:.1} GB, num_gpu_blocks={}",
+        "Available memory: {:.1} GB, gpu_memory_utilization={}, num_gpu_blocks={}",
         available_memory as f64 / (1024.0 * 1024.0 * 1024.0),
+        args.gpu_memory_utilization,
         num_gpu_blocks
     );
 
@@ -299,6 +312,7 @@ fn compute_num_blocks(
     block_size: usize,
     hf_config: &HfModelConfig,
     dtype: DType,
+    gpu_memory_utilization: f64,
 ) -> usize {
     let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
     let num_kv_heads = hf_config.num_kv_heads().unwrap_or(0);
@@ -314,8 +328,8 @@ fn compute_num_blocks(
         return 1024; // Fallback.
     }
 
-    // Use 90% of available memory for KV cache.
-    let cache_memory = (available_bytes as f64 * 0.9) as usize;
+    let utilization = gpu_memory_utilization.clamp(0.0, 1.0);
+    let cache_memory = (available_bytes as f64 * utilization) as usize;
     let num_blocks = cache_memory / bytes_per_block;
 
     // At least 16 blocks.
@@ -369,7 +383,7 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F32);
+        let blocks = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F32, 0.9);
         assert!(blocks >= 16);
     }
 
@@ -383,8 +397,8 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks_f32 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F32);
-        let blocks_f16 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16);
+        let blocks_f32 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F32, 0.9);
+        let blocks_f16 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9);
         assert!(blocks_f16 > blocks_f32);
         // F16 should give approximately 2x the blocks.
         assert!((blocks_f16 as f64 / blocks_f32 as f64 - 2.0).abs() < 0.1);
@@ -393,8 +407,24 @@ mod tests {
     #[test]
     fn test_compute_num_blocks_zero_dim() {
         let config = HfModelConfig::default();
-        let blocks = compute_num_blocks(1024, 16, &config, DType::F32);
+        let blocks = compute_num_blocks(1024, 16, &config, DType::F32, 0.9);
         // Should fall back to 1024.
         assert_eq!(blocks, 1024);
+    }
+
+    #[test]
+    fn test_compute_num_blocks_utilization_half() {
+        let config = HfModelConfig {
+            num_hidden_layers: Some(32),
+            num_attention_heads: Some(32),
+            num_key_value_heads: Some(8),
+            hidden_size: Some(4096),
+            ..Default::default()
+        };
+        let blocks_90 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9);
+        let blocks_50 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.5);
+        // 0.5 should produce roughly 0.5/0.9 ≈ 55% of the blocks from 0.9.
+        let ratio = blocks_50 as f64 / blocks_90 as f64;
+        assert!(ratio > 0.5 && ratio < 0.65, "ratio was {ratio}");
     }
 }

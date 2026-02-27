@@ -418,9 +418,18 @@ impl Worker for MlxWorker {
     }
 
     fn determine_available_memory(&mut self) -> ExecutorResult<usize> {
-        // Report system memory as available. MLX uses unified memory.
-        // Default to 8 GiB.
-        Ok(8 * 1024 * 1024 * 1024)
+        // Apple Silicon uses unified memory — GPU and CPU share the same pool.
+        // Report total physical memory (not just "available") since MLX manages
+        // its own memory pool and the OS will page out inactive data as needed.
+        use sysinfo::System;
+        let sys = System::new_with_specifics(
+            sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
+        );
+        let total = sys.total_memory() as usize;
+        if total == 0 {
+            return Ok(8 * 1024 * 1024 * 1024);
+        }
+        Ok(total)
     }
 
     fn execute_model(

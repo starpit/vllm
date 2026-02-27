@@ -664,9 +664,16 @@ impl Worker for CandleWorker {
     }
 
     fn determine_available_memory(&mut self) -> ExecutorResult<usize> {
-        // For CPU, report a reasonable default. CUDA would query device memory.
-        // Default to 4 GiB for CPU mode.
-        Ok(4 * 1024 * 1024 * 1024)
+        use sysinfo::System;
+        let sys = System::new_with_specifics(
+            sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
+        );
+        let available = sys.available_memory() as usize;
+        // Sanity: if sysinfo reports 0 (shouldn't happen), fall back to 4 GiB.
+        if available == 0 {
+            return Ok(4 * 1024 * 1024 * 1024);
+        }
+        Ok(available)
     }
 
     fn execute_model(

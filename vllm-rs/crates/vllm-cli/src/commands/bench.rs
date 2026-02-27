@@ -23,6 +23,24 @@ use crate::args::BenchArgs;
 // Backend-polymorphic worker creation
 // ---------------------------------------------------------------------------
 
+/// Initialize cache using real memory detection.
+fn init_bench_cache(worker: &mut dyn Worker, gpu_memory_utilization: f64) -> Result<()> {
+    let available = worker.determine_available_memory()?;
+    // Simple heuristic for bench: allocate blocks based on available memory.
+    // Use 1 MiB per block as a rough estimate (actual size depends on model config).
+    let utilization = gpu_memory_utilization.clamp(0.0, 1.0);
+    let cache_bytes = (available as f64 * utilization) as usize;
+    let num_blocks = (cache_bytes / (1024 * 1024)).clamp(16, 4096);
+    info!(
+        "Bench cache: available={:.1} GB, utilization={}, blocks={}",
+        available as f64 / (1024.0 * 1024.0 * 1024.0),
+        utilization,
+        num_blocks
+    );
+    worker.initialize_cache(num_blocks, 0)?;
+    Ok(())
+}
+
 #[cfg(feature = "metal")]
 fn create_bench_worker(args: &BenchArgs, model: String) -> Result<Box<dyn Worker>> {
     use vllm_mlx::worker::{MlxWorker, MlxWorkerConfig};
@@ -38,7 +56,7 @@ fn create_bench_worker(args: &BenchArgs, model: String) -> Result<Box<dyn Worker
     let mut worker = MlxWorker::new(config);
     worker.init_device()?;
     worker.load_model()?;
-    worker.initialize_cache(1024, 0)?;
+    init_bench_cache(&mut worker, args.gpu_memory_utilization)?;
     Ok(Box::new(worker))
 }
 
@@ -59,7 +77,7 @@ fn create_bench_worker(args: &BenchArgs, model: String) -> Result<Box<dyn Worker
     let mut worker = CandleWorker::new(config);
     worker.init_device()?;
     worker.load_model()?;
-    worker.initialize_cache(1024, 0)?;
+    init_bench_cache(&mut worker, args.gpu_memory_utilization)?;
     Ok(Box::new(worker))
 }
 

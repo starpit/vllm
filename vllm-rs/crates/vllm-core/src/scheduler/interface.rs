@@ -93,6 +93,9 @@ pub trait SchedulerInterface {
     /// Returns `(num_running_reqs, num_waiting_reqs)`.
     fn get_request_counts(&self) -> (usize, usize);
 
+    /// KV cache usage as a fraction in `[0.0, 1.0]`.
+    fn kv_cache_usage(&self) -> f64;
+
     /// Shut down the scheduler.
     fn shutdown(&mut self);
 }

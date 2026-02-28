@@ -69,6 +69,9 @@ pub trait KVCacheManagerOps: Send {
 
     /// Block size (tokens per block).
     fn block_size(&self) -> usize;
+
+    /// KV cache usage as a fraction in `[0.0, 1.0]`.
+    fn usage(&self) -> f64;
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +192,13 @@ impl KVCacheManagerOps for SimpleBlockTracker {
     fn block_size(&self) -> usize {
         self.block_size
     }
+
+    fn usage(&self) -> f64 {
+        if self.total_blocks == 0 {
+            return 0.0;
+        }
+        1.0 - self.free_blocks as f64 / self.total_blocks as f64
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +295,11 @@ impl Scheduler {
     ) -> Self {
         let kv_cache = Box::new(SimpleBlockTracker::new(num_gpu_blocks, block_size));
         Self::new(scheduler_config, max_model_len, kv_cache)
+    }
+
+    /// KV cache usage as a fraction in `[0.0, 1.0]`.
+    pub fn kv_cache_usage(&self) -> f64 {
+        self.kv_cache.usage()
     }
 
     // -- Internal helpers --
@@ -793,6 +808,10 @@ impl SchedulerInterface for Scheduler {
 
     fn get_request_counts(&self) -> (usize, usize) {
         (self.running.len(), self.waiting.len())
+    }
+
+    fn kv_cache_usage(&self) -> f64 {
+        self.kv_cache.usage()
     }
 
     fn shutdown(&mut self) {
@@ -1345,5 +1364,55 @@ mod tests {
 
         // Appending to a nonexistent request should not panic.
         sched.append_output_tokens("nonexistent", &[1, 2, 3]);
+    }
+
+    // ----- KV cache usage tests -----
+
+    #[test]
+    fn test_simple_block_tracker_usage_empty() {
+        let tracker = SimpleBlockTracker::new(100, 16);
+        assert!((tracker.usage() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_simple_block_tracker_usage_zero_blocks() {
+        let tracker = SimpleBlockTracker::new(0, 16);
+        assert!((tracker.usage() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_simple_block_tracker_usage_after_alloc() {
+        let mut tracker = SimpleBlockTracker::new(100, 16);
+        // Allocate a request needing 2 blocks (32 tokens / 16 block_size).
+        let req = make_request("r1", 32);
+        tracker.allocate_slots(&req, 32, 0);
+        // 2 out of 100 blocks used = 0.02
+        assert!((tracker.usage() - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_simple_block_tracker_usage_after_free() {
+        let mut tracker = SimpleBlockTracker::new(100, 16);
+        let req = make_request("r1", 32);
+        tracker.allocate_slots(&req, 32, 0);
+        tracker.free("r1");
+        assert!((tracker.usage() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_scheduler_kv_cache_usage() {
+        let cfg = test_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        // Initially empty.
+        assert!((sched.kv_cache_usage() - 0.0).abs() < f64::EPSILON);
+
+        // Add and schedule a request to trigger block allocation.
+        let req = make_request("r1", 32);
+        sched.add_request(req);
+        sched.schedule();
+
+        // After scheduling, some blocks should be allocated.
+        assert!(sched.kv_cache_usage() > 0.0);
     }
 }

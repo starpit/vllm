@@ -9,8 +9,9 @@
 use std::sync::OnceLock;
 
 use prometheus::{
-    Histogram, HistogramOpts, IntCounter, IntGauge, Registry, register_histogram_with_registry,
-    register_int_counter_with_registry, register_int_gauge_with_registry,
+    Gauge, Histogram, HistogramOpts, IntCounter, IntGauge, Registry, register_gauge_with_registry,
+    register_histogram_with_registry, register_int_counter_with_registry,
+    register_int_gauge_with_registry,
 };
 
 static METRICS: OnceLock<VllmMetrics> = OnceLock::new();
@@ -44,9 +45,15 @@ pub struct VllmMetrics {
     /// Total number of prompt tokens processed.
     pub prompt_tokens_total: IntCounter,
 
+    // -- Scheduler gauges --
+    /// Number of requests currently running.
+    pub num_requests_running: Gauge,
+    /// Number of requests waiting to be scheduled.
+    pub num_requests_waiting: Gauge,
+
     // -- Cache gauges --
-    /// GPU KV cache usage ratio (0.0 - 1.0 scaled to 0-100).
-    pub gpu_cache_usage: IntGauge,
+    /// KV cache usage as a fraction (0.0 - 1.0).
+    pub kv_cache_usage_perc: Gauge,
     /// Number of GPU KV cache blocks in use.
     pub gpu_cache_blocks_used: IntGauge,
     /// Total number of GPU KV cache blocks.
@@ -138,9 +145,23 @@ impl VllmMetrics {
             )
             .unwrap();
 
-            let gpu_cache_usage = register_int_gauge_with_registry!(
-                "gpu_cache_usage_percent",
-                "GPU KV cache usage percentage (0-100)",
+            let num_requests_running = register_gauge_with_registry!(
+                "num_requests_running",
+                "Number of requests currently running",
+                registry
+            )
+            .unwrap();
+
+            let num_requests_waiting = register_gauge_with_registry!(
+                "num_requests_waiting",
+                "Number of requests waiting to be scheduled",
+                registry
+            )
+            .unwrap();
+
+            let kv_cache_usage_perc = register_gauge_with_registry!(
+                "gpu_cache_usage_perc",
+                "KV cache usage as a fraction (0.0 - 1.0)",
                 registry
             )
             .unwrap();
@@ -170,7 +191,9 @@ impl VllmMetrics {
                 inter_token_latency_seconds,
                 output_tokens_total,
                 prompt_tokens_total,
-                gpu_cache_usage,
+                num_requests_running,
+                num_requests_waiting,
+                kv_cache_usage_perc,
                 gpu_cache_blocks_used,
                 gpu_cache_blocks_total,
             }

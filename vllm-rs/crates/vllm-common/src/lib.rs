@@ -24,7 +24,7 @@ pub mod telemetry;
 
 pub use engine_io::{
     EngineCoreEvent, EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
-    FinishReason, StopReason,
+    FinishReason, SchedulerStats, StopReason,
 };
 pub use error::{VllmError, VllmResult};
 pub use request::{Request, RequestStatus};

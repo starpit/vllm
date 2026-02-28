@@ -25,7 +25,8 @@ use std::time::Instant;
 
 use tracing::{debug, error, info};
 use vllm_common::{
-    EngineCoreOutput, EngineCoreOutputs, FinishReason, Request, RequestStatus, StopReason,
+    EngineCoreOutput, EngineCoreOutputs, FinishReason, Request, RequestStatus, SchedulerStats,
+    StopReason,
 };
 use vllm_config::SchedulerConfig;
 use vllm_core::scheduler::output::SchedulerOutput;
@@ -265,7 +266,18 @@ impl EngineCore {
         self.process_aborts_queue();
 
         // 4. Update scheduler state and build outputs.
-        let outputs = self.update_from_output(&scheduler_output, &model_output);
+        let mut outputs = self.update_from_output(&scheduler_output, &model_output);
+
+        // 5. Attach scheduler stats to outputs.
+        let (num_running, num_waiting) = self.scheduler.get_request_counts();
+        let stats = SchedulerStats {
+            num_running_reqs: num_running,
+            num_waiting_reqs: num_waiting,
+            kv_cache_usage: self.scheduler.kv_cache_usage(),
+        };
+        for engine_outputs in outputs.values_mut() {
+            engine_outputs.scheduler_stats = Some(stats);
+        }
 
         Ok((outputs, model_executed))
     }
@@ -343,6 +355,7 @@ impl EngineCore {
                     engine_index: self.engine_index,
                     outputs: Vec::new(),
                     timestamp,
+                    scheduler_stats: None,
                 });
             engine_outputs.outputs.push(output);
         }
@@ -360,6 +373,7 @@ impl EngineCore {
                     engine_index: self.engine_index,
                     outputs: Vec::new(),
                     timestamp,
+                    scheduler_stats: None,
                 });
 
             for req_id in &scheduler_output.finished_req_ids {

@@ -2,7 +2,7 @@
 
 ## Implementation Progress
 
-> **Last updated**: 2026-02-27 (Sampling gaps DONE — min_p, penalties, logprobs, logit_bias wired end-to-end)
+> **Last updated**: 2026-02-28 (ORCA metrics DONE — scheduler stats gauges, endpoint-load-metrics headers)
 
 | Phase | Status | Details |
 |-------|--------|---------|
@@ -56,6 +56,7 @@
 | **12a. Tool calling protocol** | **DONE** | Rich JSON messages + `tools`/`tool_choice` passed to chat templates via `apply()`. `tool_calls` arguments auto-parsed from string→object. `tool_choice: "none"` suppresses tools. `date_string` template variable. minijinja `json` feature for `tojson`. 4 new template tests. (633 tests) |
 | **12b. Tool call response parsing** | **DONE** | `ToolCallParser` trait + `StreamingToolParserState` trait. HermesToolParser (`<tool_call>` tags) + LlamaJsonToolParser (raw JSON / `<|python_tag|>`). Partial JSON helper for incomplete arguments. Non-streaming: full text extraction → structured `ToolCall` objects. Streaming: per-request state machine with delta diffing for incremental argument fragments. `--tool-call-parser hermes\|llama3_json` CLI flag. Wired into `AsyncEngine` (non-streaming + streaming) and `server.rs` SSE. 18 new tests. (651 tests) |
 | **12c. Structured output / constrained decoding** | **DONE** | `response_format` (`json_object`, `json_schema`) via `outlines-core` (pure Rust, default-features=false). `GuidedGrammar` enum in `vllm-common`; `GrammarGuide` wraps `outlines_core::Index` + FSM state. Schema → regex → FSM compiled per request; grammar vocabulary built once from `tokenizer.json`. `apply_grammar_mask()` sets disallowed logits to -inf before penalties/temperature. Per-request grammar state in CandleWorker + MlxWorker. `parse_response_format()` in engine.rs. 14 new tests. (665 tests) |
+| **12d. ORCA metrics** | **DONE** | `KVCacheManagerOps::usage()` trait method, `SchedulerStats` piggybacked on `EngineCoreOutputs`, `num_requests_running`/`num_requests_waiting`/`kv_cache_usage_perc` Prometheus gauges updated per step, ORCA `endpoint-load-metrics` response header (TEXT+JSON) for non-streaming chat/completion endpoints. New `orca.rs` module. 22 new tests. (687 tests) |
 | 9c. Metal Tier 2 (legacy candle) | Superseded | Custom MSL fused kernels approach superseded by MLX backend. Use `--features candle-metal` for legacy path |
 | 9d. Metal Tier 3 | Partially superseded | UMA-aware KV cache, memory pressure handling. Zero-copy weight loading and quantization are handled natively by MLX backend (Phase 10d) |
 
@@ -91,7 +92,9 @@
 | 8g | ~450 | 10 mod | 12 | 629 | Sampling gaps (min_p, penalties, logprobs, logit_bias) |
 | 12a | ~120 | 3 mod | 4 | 633 | Tool calling protocol: rich messages + tools to templates |
 | 12b | ~700 | 1 new + 5 mod | 18 | 651 | Tool call response parsing: Hermes + LLaMA JSON parsers, streaming |
-| **Total** | **~32,800** | **96 files** | **651** | **651** | **0 clippy errors** |
+| 12c | ~400 | 3 mod | 14 | 665 | Structured output: json_object + json_schema via outlines-core |
+| 12d | ~300 | 1 new + 7 mod | 22 | 687 | ORCA metrics: scheduler stats gauges, endpoint-load-metrics headers |
+| **Total** | **~33,500** | **98 files** | **687** | **687** | **0 clippy errors** |
 
 ### Known limitations / follow-ups
 - **MLX YaRN RoPE**: The MLX backend uses `nn::Rope` which doesn't apply YaRN frequency corrections. Models with `rope_scaling` (e.g., Qwen3 with YaRN factor=4.0, DeepSeek V2 with factor=40.0) will generate correctly within the original context window but won't have correct positional encoding beyond it. Fix: either implement a custom MLX RoPE that pre-applies YaRN corrections, or upstream YaRN support to mlx-rs `nn::Rope`.

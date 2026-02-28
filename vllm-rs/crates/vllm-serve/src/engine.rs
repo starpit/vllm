@@ -729,7 +729,15 @@ impl AsyncEngine {
 
                 match step_result {
                     Ok(outputs) => {
-                        // 4. Route outputs to requests (brief lock).
+                        // 4. Update scheduler gauges from stats.
+                        if let Some(stats) = &outputs.scheduler_stats {
+                            let m = crate::metrics::VllmMetrics::global();
+                            m.num_requests_running.set(stats.num_running_reqs as f64);
+                            m.num_requests_waiting.set(stats.num_waiting_reqs as f64);
+                            m.kv_cache_usage_perc.set(stats.kv_cache_usage);
+                        }
+
+                        // 5. Route outputs to requests (brief lock).
                         if !outputs.outputs.is_empty() {
                             let mut reqs = requests.lock().await;
                             for output in outputs.outputs {

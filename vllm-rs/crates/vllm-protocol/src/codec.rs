@@ -225,6 +225,7 @@ mod tests {
                 },
             ],
             timestamp: 1234.5,
+            scheduler_stats: None,
         };
 
         let encoded = encode(&outputs).unwrap();

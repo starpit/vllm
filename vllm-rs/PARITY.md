@@ -1,6 +1,6 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (627+38 tests, 0 clippy errors)
+> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (649+38 tests, 0 clippy errors)
 
 ### Legend
 
@@ -41,9 +41,9 @@
 | [Structured Output](#structured-output--guided-decoding) | &#x1F535; | &#x1F7E1; | `███████░░░` 3/4 |
 | [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x1F535; | `██████████` 7/7 |
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/4 |
-| [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F7E1; | `█████████░` 6/7 |
+| [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | `██████████` 14/15 |
-| | | **Total** | `█████░░░░░` **97/199** |
+| | | **Total** | `█████░░░░░` **98/199** |
 
 ---
 
@@ -391,7 +391,7 @@
 | Latency histograms | &#x1F535; | &#x1F535; | |
 | Structured logging (tracing) | &#x1F535; | &#x1F535; | |
 | OpenTelemetry tracing | &#x1F535; | &#x1F534; | P2 |
-| ORCA metrics | &#x1F535; | &#x1F534; | P1 |
+| ORCA metrics (endpoint-load-metrics header) | &#x1F535; | &#x1F535; | |
 | MLX per-step timing (prefill/decode ms) | N/A | &#x1F535; | |
 | Benchmark CLI (`vllm bench`) | &#x1F535; | &#x1F535; | |
 
@@ -431,5 +431,5 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Test count | ~948 test files | 665 passing tests (627+38 MLX) |
+| Test count | ~948 test files | 687 passing tests (649+38 MLX) |
 | Crate count | N/A | 13 crates |

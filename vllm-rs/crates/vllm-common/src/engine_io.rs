@@ -175,6 +175,22 @@ impl EngineCoreOutput {
 }
 
 // ---------------------------------------------------------------------------
+// SchedulerStats
+// ---------------------------------------------------------------------------
+
+/// Scheduler statistics piggybacked on engine-core outputs so the serving
+/// layer can update Prometheus gauges without direct access to the engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerStats {
+    /// Number of requests currently running.
+    pub num_running_reqs: usize,
+    /// Number of requests waiting to be scheduled.
+    pub num_waiting_reqs: usize,
+    /// KV cache usage as a fraction in `[0.0, 1.0]`.
+    pub kv_cache_usage: f64,
+}
+
+// ---------------------------------------------------------------------------
 // EngineCoreOutputs
 // ---------------------------------------------------------------------------
 
@@ -193,6 +209,10 @@ pub struct EngineCoreOutputs {
 
     /// Monotonic timestamp of when the step completed.
     pub timestamp: f64,
+
+    /// Scheduler statistics from the most recent step.
+    #[serde(skip)]
+    pub scheduler_stats: Option<SchedulerStats>,
 }
 
 impl Default for EngineCoreOutputs {
@@ -201,6 +221,7 @@ impl Default for EngineCoreOutputs {
             engine_index: 0,
             outputs: Vec::new(),
             timestamp: 0.0,
+            scheduler_stats: None,
         }
     }
 }
@@ -398,6 +419,7 @@ mod tests {
         assert_eq!(outs.engine_index, 0);
         assert!(outs.outputs.is_empty());
         assert_eq!(outs.timestamp, 0.0);
+        assert!(outs.scheduler_stats.is_none());
     }
 
     #[test]
@@ -425,10 +447,33 @@ mod tests {
                 },
             ],
             timestamp: 1234.5,
+            scheduler_stats: None,
         };
         assert_eq!(outs.outputs.len(), 2);
         assert_eq!(outs.engine_index, 2);
         assert_eq!(outs.timestamp, 1234.5);
+    }
+
+    // -- SchedulerStats tests --
+
+    #[test]
+    fn test_scheduler_stats_default() {
+        let stats = SchedulerStats::default();
+        assert_eq!(stats.num_running_reqs, 0);
+        assert_eq!(stats.num_waiting_reqs, 0);
+        assert!((stats.kv_cache_usage - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_scheduler_stats_construction() {
+        let stats = SchedulerStats {
+            num_running_reqs: 5,
+            num_waiting_reqs: 3,
+            kv_cache_usage: 0.42,
+        };
+        assert_eq!(stats.num_running_reqs, 5);
+        assert_eq!(stats.num_waiting_reqs, 3);
+        assert!((stats.kv_cache_usage - 0.42).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -445,6 +490,7 @@ mod tests {
                 new_logprobs: None,
             }],
             timestamp: 42.0,
+            scheduler_stats: None,
         };
         let json = serde_json::to_string(&outs).unwrap();
         let outs2: EngineCoreOutputs = serde_json::from_str(&json).unwrap();

@@ -16,6 +16,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -28,6 +29,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{Span, info};
 
 use crate::engine::{AsyncEngine, StreamDelta};
+use crate::orca;
 use crate::protocol;
 
 // ---------------------------------------------------------------------------
@@ -142,6 +144,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
 /// POST /v1/chat/completions
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<protocol::ChatCompletionRequest>,
 ) -> Response {
     info!(
@@ -149,6 +152,7 @@ async fn chat_completions(
         request.model, request.max_tokens, request.max_completion_tokens, request.stream
     );
     if request.stream {
+        // Streaming responses skip ORCA headers (consistent with Python vLLM).
         match state.engine.chat_completion_stream(request).await {
             Ok((request_id, model, rx)) => {
                 stream_chat_response(request_id, model, rx).into_response()
@@ -157,7 +161,7 @@ async fn chat_completions(
         }
     } else {
         match state.engine.chat_completion(request).await {
-            Ok(response) => Json(response).into_response(),
+            Ok(response) => attach_orca_header(&headers, Json(response).into_response()),
             Err(e) => e.into_response(),
         }
     }
@@ -166,19 +170,18 @@ async fn chat_completions(
 /// POST /v1/completions
 async fn completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<protocol::CompletionRequest>,
 ) -> Response {
     if request.stream {
-        // Streaming completions: similar pattern to chat, simplified.
-        // For now, return non-streaming even when stream=true.
-        // TODO: Implement streaming completions.
+        // Streaming completions skip ORCA headers.
         match state.engine.completion(request).await {
             Ok(response) => Json(response).into_response(),
             Err(e) => e.into_response(),
         }
     } else {
         match state.engine.completion(request).await {
-            Ok(response) => Json(response).into_response(),
+            Ok(response) => attach_orca_header(&headers, Json(response).into_response()),
             Err(e) => e.into_response(),
         }
     }
@@ -206,6 +209,26 @@ async fn version(State(state): State<Arc<AppState>>) -> Json<protocol::VersionRe
 /// GET /metrics — Prometheus metrics endpoint.
 async fn metrics() -> String {
     crate::metrics::VllmMetrics::global().encode()
+}
+
+// ---------------------------------------------------------------------------
+// ORCA header helper
+// ---------------------------------------------------------------------------
+
+/// If the request includes the ORCA opt-in header, attach the load-metrics
+/// response header. Otherwise return the response unchanged.
+fn attach_orca_header(request_headers: &HeaderMap, mut response: Response) -> Response {
+    if let Some(format_value) = request_headers.get(orca::ORCA_REQUEST_HEADER)
+        && let Ok(format_str) = format_value.to_str()
+        && let Some((name, value)) = orca::orca_header(format_str)
+        && let Ok(hv) = axum::http::HeaderValue::from_str(&value)
+    {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).expect("valid header name"),
+            hv,
+        );
+    }
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -574,5 +597,69 @@ mod tests {
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -- ORCA header attachment tests --
+
+    #[test]
+    fn test_attach_orca_header_with_text_format() {
+        use axum::http::{HeaderMap, HeaderValue};
+        use axum::response::IntoResponse;
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            "endpoint-load-metrics-format",
+            HeaderValue::from_static("TEXT"),
+        );
+
+        let response = "test body".into_response();
+        let response = attach_orca_header(&request_headers, response);
+
+        assert!(
+            response.headers().contains_key("endpoint-load-metrics"),
+            "Response should contain ORCA header when TEXT format requested"
+        );
+        let val = response.headers()["endpoint-load-metrics"]
+            .to_str()
+            .unwrap();
+        assert!(val.contains("kv_cache_usage_perc="));
+        assert!(val.contains("num_requests_waiting="));
+    }
+
+    #[test]
+    fn test_attach_orca_header_with_json_format() {
+        use axum::http::{HeaderMap, HeaderValue};
+        use axum::response::IntoResponse;
+
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            "endpoint-load-metrics-format",
+            HeaderValue::from_static("JSON"),
+        );
+
+        let response = "test body".into_response();
+        let response = attach_orca_header(&request_headers, response);
+
+        assert!(response.headers().contains_key("endpoint-load-metrics"));
+        let val = response.headers()["endpoint-load-metrics"]
+            .to_str()
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(val).unwrap();
+        assert!(parsed["named_metrics"]["kv_cache_usage_perc"].is_number());
+    }
+
+    #[test]
+    fn test_attach_orca_header_absent_when_not_requested() {
+        use axum::http::HeaderMap;
+        use axum::response::IntoResponse;
+
+        let request_headers = HeaderMap::new(); // No ORCA header.
+        let response = "test body".into_response();
+        let response = attach_orca_header(&request_headers, response);
+
+        assert!(
+            !response.headers().contains_key("endpoint-load-metrics"),
+            "Response should NOT contain ORCA header when not requested"
+        );
     }
 }

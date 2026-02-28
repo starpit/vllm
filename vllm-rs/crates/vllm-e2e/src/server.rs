@@ -121,7 +121,7 @@ impl TestServerBuilder {
         };
 
         // Wait for the server to become healthy.
-        if let Err(e) = wait_for_health(&server.base_url, self.startup_timeout).await {
+        if let Err(e) = wait_for_health(&server.base_url, self.startup_timeout, &mut server.child).await {
             // Kill on failure so we don't leak processes.
             let _ = server.child.kill();
             let _ = server.child.wait();
@@ -183,8 +183,8 @@ fn which_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Poll the /health endpoint until it returns 200 or we time out.
-async fn wait_for_health(base_url: &str, timeout: Duration) -> Result<()> {
+/// Poll the /health endpoint until it returns 200, the child exits, or we time out.
+async fn wait_for_health(base_url: &str, timeout: Duration, child: &mut Child) -> Result<()> {
     let client = reqwest::Client::new();
     let health_url = format!("{base_url}/health");
     let start = Instant::now();
@@ -195,6 +195,19 @@ async fn wait_for_health(base_url: &str, timeout: Duration) -> Result<()> {
                 "Server did not become healthy within {}s",
                 timeout.as_secs()
             );
+        }
+
+        // Check if the child process has exited (non-blocking).
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                bail!(
+                    "Server process exited before becoming healthy (exit status: {status})"
+                );
+            }
+            Ok(None) => {} // still running
+            Err(e) => {
+                bail!("Failed to check server process status: {e}");
+            }
         }
 
         match client.get(&health_url).send().await {

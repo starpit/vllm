@@ -107,45 +107,31 @@ pub fn from_raw_bytes(
         });
     }
 
+    // Helper macro: try zero-copy cast first, fall back to aligned copy.
+    macro_rules! cast_or_copy {
+        ($ty:ty, $label:expr) => {{
+            if let Some(slice) = bytemuck_cast_slice::<$ty>(data) {
+                Tensor::from_slice(slice, Shape::from_dims(shape), &Device::Cpu)
+                    .map_err(ModelError::Candle)?
+            } else {
+                let aligned =
+                    copy_to_aligned::<$ty>(data).ok_or(ModelError::ByteCastError($label))?;
+                Tensor::from_slice(&aligned, Shape::from_dims(shape), &Device::Cpu)
+                    .map_err(ModelError::Candle)?
+            }
+        }};
+    }
+
     // Build on CPU from the raw bytes then move to target device.
     let cpu_tensor = match dtype {
-        DType::F32 => {
-            let floats: &[f32] =
-                bytemuck_cast_slice(data).ok_or(ModelError::ByteCastError("f32"))?;
-            Tensor::from_slice(floats, Shape::from_dims(shape), &Device::Cpu)
-                .map_err(ModelError::Candle)?
-        }
-        DType::F16 => {
-            let halfs: &[half::f16] =
-                bytemuck_cast_slice(data).ok_or(ModelError::ByteCastError("f16"))?;
-            Tensor::from_slice(halfs, Shape::from_dims(shape), &Device::Cpu)
-                .map_err(ModelError::Candle)?
-        }
-        DType::BF16 => {
-            let bf16s: &[half::bf16] =
-                bytemuck_cast_slice(data).ok_or(ModelError::ByteCastError("bf16"))?;
-            Tensor::from_slice(bf16s, Shape::from_dims(shape), &Device::Cpu)
-                .map_err(ModelError::Candle)?
-        }
-        DType::F64 => {
-            let doubles: &[f64] =
-                bytemuck_cast_slice(data).ok_or(ModelError::ByteCastError("f64"))?;
-            Tensor::from_slice(doubles, Shape::from_dims(shape), &Device::Cpu)
-                .map_err(ModelError::Candle)?
-        }
+        DType::F32 => cast_or_copy!(f32, "f32"),
+        DType::F16 => cast_or_copy!(half::f16, "f16"),
+        DType::BF16 => cast_or_copy!(half::bf16, "bf16"),
+        DType::F64 => cast_or_copy!(f64, "f64"),
         DType::U8 => Tensor::from_slice(data, Shape::from_dims(shape), &Device::Cpu)
             .map_err(ModelError::Candle)?,
-        DType::U32 => {
-            let uints: &[u32] =
-                bytemuck_cast_slice(data).ok_or(ModelError::ByteCastError("u32"))?;
-            Tensor::from_slice(uints, Shape::from_dims(shape), &Device::Cpu)
-                .map_err(ModelError::Candle)?
-        }
-        DType::I64 => {
-            let ints: &[i64] = bytemuck_cast_slice(data).ok_or(ModelError::ByteCastError("i64"))?;
-            Tensor::from_slice(ints, Shape::from_dims(shape), &Device::Cpu)
-                .map_err(ModelError::Candle)?
-        }
+        DType::U32 => cast_or_copy!(u32, "u32"),
+        DType::I64 => cast_or_copy!(i64, "i64"),
         _ => {
             return Err(ModelError::UnsupportedDType(format!(
                 "from_raw_bytes does not support {:?}",
@@ -173,6 +159,23 @@ fn bytemuck_cast_slice<T: Copy>(data: &[u8]) -> Option<&[T]> {
     let len = data.len() / elem_size;
     // SAFETY: we checked alignment and length.
     Some(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const T, len) })
+}
+
+/// Copy bytes into an aligned Vec<T> when the source data isn't properly aligned.
+/// This is needed because safetensors data within a file may not be aligned to the
+/// element type's alignment (e.g. u32 tensors at odd offsets).
+fn copy_to_aligned<T: Copy>(data: &[u8]) -> Option<Vec<T>> {
+    let elem_size = std::mem::size_of::<T>();
+    if elem_size == 0 || !data.len().is_multiple_of(elem_size) {
+        return None;
+    }
+    let len = data.len() / elem_size;
+    let mut aligned = vec![unsafe { std::mem::zeroed::<T>() }; len];
+    // SAFETY: we copy exactly `data.len()` bytes into a properly-aligned buffer.
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), aligned.as_mut_ptr() as *mut u8, data.len());
+    }
+    Some(aligned)
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +365,35 @@ mod tests {
         let bytes = vec![0u8; 10]; // not a valid f32 buffer for shape [2, 3]
         let result = from_raw_bytes(&bytes, &[2, 3], DType::F32, &Device::Cpu);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_raw_bytes_unaligned_u32() {
+        // Simulate unaligned data by embedding u32 bytes at an odd offset in a buffer.
+        let values: Vec<u32> = vec![42, 100, 200];
+        let raw_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        // Create a buffer with 1 byte padding to force misalignment.
+        let mut padded = vec![0u8; raw_bytes.len() + 1];
+        padded[1..].copy_from_slice(&raw_bytes);
+        let unaligned = &padded[1..]; // data pointer is now misaligned for u32
+
+        let t = from_raw_bytes(unaligned, &[3], DType::U32, &Device::Cpu).unwrap();
+        assert_eq!(t.dims(), &[3]);
+        let result = t.to_vec1::<u32>().unwrap();
+        assert_eq!(result, values);
+    }
+
+    #[test]
+    fn test_from_raw_bytes_unaligned_f32() {
+        let values: Vec<f32> = vec![1.0, 2.5, 3.75];
+        let raw_bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let mut padded = vec![0u8; raw_bytes.len() + 1];
+        padded[1..].copy_from_slice(&raw_bytes);
+        let unaligned = &padded[1..];
+
+        let t = from_raw_bytes(unaligned, &[3], DType::F32, &Device::Cpu).unwrap();
+        let result = t.to_vec1::<f32>().unwrap();
+        assert_eq!(result, values);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (749 tests: 696 unit + 53 e2e, 0 clippy errors)
+> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (751 tests: 698 unit + 53 e2e, 0 clippy errors)
 
 ### Legend
 
@@ -27,7 +27,7 @@
 | **Unit** | Number of unit tests (`#[test]` / `#[tokio::test]`) covering this feature |
 | **E2E** | Number of end-to-end tests (in `vllm-e2e` crate) covering this feature |
 
-> Test counts reflect tests that **directly** exercise each feature. ~166 additional unit tests cover cross-cutting infrastructure (layers, weight loading, tensor ops, protocol codec, engine core, config, errors) and are not attributed to individual rows.
+> Test counts reflect tests that **directly** exercise each feature. ~168 additional unit tests cover cross-cutting infrastructure (layers, weight loading, tensor ops, protocol codec, engine core, config, errors) and are not attributed to individual rows.
 
 ---
 
@@ -456,6 +456,6 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Unit tests | ~948 test files | 696 passing (658 non-MLX + 38 MLX) |
+| Unit tests | ~948 test files | 698 passing (660 non-MLX + 38 MLX) |
 | E2E tests | — | 53 passing (24 basic serving + 21 chat/sampling + 8 streaming) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

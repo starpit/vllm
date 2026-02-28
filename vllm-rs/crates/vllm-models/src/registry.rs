@@ -64,6 +64,9 @@ impl ModelRegistry {
         // Gemma 2 — GELU activation, GemmaRMSNorm, 4 norms per layer,
         // attention/logit soft capping, embedding normalization
         self.register("Gemma2ForCausalLM", crate::gemma2::create_gemma2);
+        // Gemma 3 — like Gemma2 but with per-head QK norms, per-layer RoPE theta,
+        // sliding_window_pattern, and no softcapping
+        self.register("Gemma3ForCausalLM", crate::gemma3::create_gemma3);
         // DeepSeek V2/V3 — MLA attention + MoE + YaRN RoPE
         self.register(
             "DeepseekV2ForCausalLM",

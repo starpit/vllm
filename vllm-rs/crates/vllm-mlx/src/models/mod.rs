@@ -10,6 +10,7 @@
 pub mod commandr;
 pub mod deepseek_v2;
 pub mod gemma2;
+pub mod gemma3;
 pub mod llama;
 pub mod phi3;
 pub mod quantized_llama;
@@ -103,6 +104,9 @@ impl MlxModelRegistry {
         // Gemma2
         registry.register("Gemma2ForCausalLM", gemma2::create_mlx_gemma2);
         registry.register_quantized("Gemma2ForCausalLM", gemma2::create_mlx_quantized_gemma2);
+        // Gemma3 (per-head QK norms, per-layer RoPE theta, no softcapping)
+        registry.register("Gemma3ForCausalLM", gemma3::create_mlx_gemma3);
+        registry.register_quantized("Gemma3ForCausalLM", gemma3::create_mlx_quantized_gemma3);
         // Phi-3 (fused qkv_proj + gate_up_proj)
         registry.register("Phi3ForCausalLM", phi3::create_mlx_phi3);
         registry.register_quantized("Phi3ForCausalLM", phi3::create_mlx_quantized_phi3);

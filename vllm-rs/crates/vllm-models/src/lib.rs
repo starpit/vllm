@@ -13,6 +13,7 @@ pub mod attention;
 pub mod commandr;
 pub mod deepseek_v2;
 pub mod gemma2;
+pub mod gemma3;
 pub mod grammar;
 pub mod kv_block_pool;
 pub mod llama;

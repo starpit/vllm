@@ -2,7 +2,7 @@
 
 ## Implementation Progress
 
-> **Last updated**: 2026-02-28 (Kimi K2.5 text-only support)
+> **Last updated**: 2026-02-28 (Gemma 3 text-only support)
 
 | Phase | Status | Details |
 |-------|--------|---------|
@@ -61,6 +61,7 @@
 | **10f. MLX quantized DeepSeek V2** | **DONE** | Quantized MLA attention (`nn::QuantizedLinear` projections, float norms/RoPE), quantized MoE (float gate, fused 3D `switch_mlp` tensors sliced per-expert, `MlxQuantizedLlamaMLP` experts), `MlxQuantizedDeepSeekV2ForCausalLM` with `MlxEmbedTokens`/`MlxLmHead` auto-detect. `register_quantized("DeepseekV2ForCausalLM", ...)`. E2E tests enabled. (701 + 53 E2E tests) |
 | **6g. Qwen3 MoE / Qwen2 MoE** | **DONE** | Candle + MLX (float + quantized). MoE routing (gate → softmax → top-k) + sigmoid-gated shared expert. `decoder_sparse_step` + `mlp_only_layers` for dense/MoE layer selection. Reuses `LlamaAttention`/`LlamaMLP` for attention and experts. `MlxGate` enum auto-detects quantized vs float router gates with bit-width inference from packed weight shapes. Both `Qwen3MoeForCausalLM` and `Qwen2MoeForCausalLM` registered. 12 unit + 4 E2E tests. |
 | **10g. Kimi K2.5 text-only** | **DONE** | `KimiK25ForCausalLM` → DeepSeek V2 alias (candle + MLX float + quantized). `HfModelConfig::resolve_text_config()` unwraps composite `kimi_k25` configs (text_config extraction). `ModelWeights::strip_prefix()` for `language_model.` weight prefix. MLX `create_mlx_kimi_k25` / `create_mlx_quantized_kimi_k25` factories with prefix stripping. `KimiK2ToolParser` (non-streaming + streaming) for `<\|tool_calls_section_begin\|>` format; registered as `"kimi_k2"`. `TestServerBuilder::with_tool_call_parser()` for E2E. 15 unit + 5 E2E tests. |
+| **6h. Gemma 3 text-only** | **DONE** | `Gemma3ForCausalLM` (candle + MLX float + quantized). Like Gemma2 but: per-head QK norms (GemmaRmsNorm +1 offset), `sliding_window_pattern` → per-layer local/global, per-layer RoPE theta (`rope_theta` vs `rope_local_base_freq`), no softcapping. Falls back to `layer_types` array when `sliding_window_pattern` absent. 14 unit + 4 E2E tests. Model: `mlx-community/gemma-3-270m-it-qat-4bit` (~900 MB). |
 | **E0. E2E test infrastructure** | **DONE** | New `vllm-e2e` crate with `TestServer` (in-process stack via `initialize_stack()`, random port, health-check polling, kill-on-drop, `with_tool_call_parser()`), `Client` (reqwest wrapper with typed chat/completion/stream methods, SSE parsing), assertion helpers. Feature-gated (`--features e2e`) + `#[ignore]`. 61 E2E tests across 4 test files (E1 basic serving, E2 chat completions, E3 streaming, E5 kimi_k2 tool parser). All 61 passing on MLX backend. |
 | 9c. Metal Tier 2 (legacy candle) | Superseded | Custom MSL fused kernels approach superseded by MLX backend. Use `--features candle-metal` for legacy path |
 | 9d. Metal Tier 3 | Partially superseded | UMA-aware KV cache, memory pressure handling. Zero-copy weight loading and quantization are handled natively by MLX backend (Phase 10d) |
@@ -103,13 +104,14 @@
 | 8b+ | ~5 | 3 mod | 0 | 697 | Chat template pycompat (minijinja-contrib) |
 | E0 | ~750 | 8 new + 1 mod | 52 (E2E) | 697 + 52 E2E | E2E infrastructure + E1/E2/E3 tests |
 | 10f | ~400 | 3 mod | 3 | 700 + 53 E2E | MLX quantized DeepSeek V2 (switch_mlp, float gate) |
-| **Total** | **~34,850** | **108 files** | **700 + 53 E2E** | **753** | **0 clippy errors** |
+| 6h | ~1,600 | 2 new + 5 mod | 14 + 4 E2E | 714 + 57 E2E | Gemma 3 text-only (candle+MLX float+quantized) |
+| **Total** | **~36,450** | **110 files** | **714 + 57 E2E** | **771** | **0 clippy errors** |
 
 ### Known limitations / follow-ups
 - **MLX YaRN RoPE**: The MLX backend uses `nn::Rope` which doesn't apply YaRN frequency corrections. Models with `rope_scaling` (e.g., Qwen3 with YaRN factor=4.0, DeepSeek V2 with factor=40.0) will generate correctly within the original context window but won't have correct positional encoding beyond it. Fix: either implement a custom MLX RoPE that pre-applies YaRN corrections, or upstream YaRN support to mlx-rs `nn::Rope`.
 - **DeepSeek V2 MoE**: Token-by-token expert routing is a correct reference implementation but serializes expert execution. For production, batch tokens by expert assignment to maximize GPU utilization (expert parallelism).
 - **DeepSeek V2 latent KV caching**: Currently caches full expanded K/V after kv_b_proj. Could instead cache the compressed `[kv_lora_rank + qk_rope_head_dim]` latent per token — much smaller KV cache at the cost of re-expanding during decode. This is how the Python vLLM optimizes it.
-- **Qwen3 QK norms**: Optional per-head q_norm/k_norm (RMSNorm on [head_dim]) auto-detected from safetensors weight presence. Applied after Q/K projection and reshape, before RoPE. Both float and quantized MLX LLaMA attention paths support this. The candle LLaMA path does not yet have QK norm support (would need similar changes if running Qwen3 on candle).
+- **Qwen3 QK norms**: Optional per-head q_norm/k_norm (RMSNorm on [head_dim]) auto-detected from safetensors weight presence. Applied after Q/K projection and reshape, before RoPE. Both float and quantized MLX LLaMA attention paths support this. The candle LLaMA path does not yet have QK norm support (would need similar changes if running Qwen3 on candle). Gemma3 uses the same QK norm pattern but with GemmaRmsNorm (+1 offset) — fully implemented in both candle and MLX backends.
 - **Qwen3/Qwen2 MoE**: Token-by-token expert routing (same as DeepSeek V2). Shared expert gate uses sigmoid (vs DeepSeek V2 direct addition). `MlxGate` auto-detects quantized vs float router gates and infers bit-width from packed tensor shapes (handles mixed 4-bit model / 8-bit gate). `Qwen3NextForCausalLM` (hybrid linear/full attention) is a separate architecture not yet implemented.
 
 ### Phase 10d plan: MLX quantized models

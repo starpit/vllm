@@ -26,6 +26,9 @@ impl TestModels {
     // Tier 2: Small (<1 GB) — run on every PR
     pub const LLAMA_3_2_1B_4BIT: &str = "mlx-community/Llama-3.2-1B-Instruct-4bit";
 
+    // Tier 2: Small (<1 GB) — run on every PR
+    pub const GEMMA3_270M_4BIT: &str = "mlx-community/gemma-3-270m-it-qat-4bit";
+
     // Tier 3: Medium (1–3 GB) — nightly only
     pub const GEMMA2_2B_4BIT: &str = "mlx-community/gemma-2-2b-it-4bit";
     pub const PHI3_5_MINI_4BIT: &str = "mlx-community/Phi-3.5-mini-instruct-4bit";

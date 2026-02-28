@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! Gemma 2 model architecture for MLX.
+//! Gemma 3 text-only model architecture for MLX.
 //!
-//! Key differences from LLaMA:
-//! - GemmaRmsNorm: adds 1.0 to weight before applying (`y = (1 + w) * normed`)
-//! - GELU approximate activation instead of SiLU
-//! - 4 norms per layer: input, post-attention, pre-feedforward, post-feedforward
-//! - `query_pre_attn_scalar` for attention scaling (not `1/sqrt(head_dim)`)
-//! - Embedding multiplied by `sqrt(hidden_size)` after lookup
-//! - Always tied embeddings
-//! - `final_logit_softcapping`: `cap * tanh(logits / cap)`
+//! Key differences from Gemma 2:
+//! - No `attn_logit_softcapping` (removed)
+//! - No `final_logit_softcapping` (removed)
+//! - Per-head `q_norm` + `k_norm` (GemmaRmsNorm with +1 offset)
+//! - `sliding_window_pattern: N` instead of explicit `layer_types` array
+//! - Per-layer RoPE theta: `rope_theta` (global) vs `rope_local_base_freq` (local/sliding)
+//! - Everything else identical: 4 norms, GemmaRmsNorm, GELU tanh, embed*sqrt(H), tied embeddings
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,17 +23,18 @@ use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
 use crate::cache::MlxKvCache;
+use crate::models::gemma2::assign_gemma_norm_weight;
 use crate::models::llama::{assign_weight, load_safetensors_weights};
 use crate::models::quantized_llama::{MlxEmbedTokens, QuantConfig, make_quantized_linear};
 use vllm_model::weight::HfModelConfig;
 
 // ---------------------------------------------------------------------------
-// MlxGemma2Config
+// MlxGemma3Config
 // ---------------------------------------------------------------------------
 
-/// Parsed configuration for a Gemma 2 model.
+/// Parsed configuration for a Gemma 3 model.
 #[derive(Debug, Clone)]
-pub struct MlxGemma2Config {
+pub struct MlxGemma3Config {
     pub hidden_size: usize,
     pub num_attention_heads: usize,
     pub num_kv_heads: usize,
@@ -44,22 +44,24 @@ pub struct MlxGemma2Config {
     pub max_position_embeddings: usize,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
+    /// RoPE theta for local/sliding-window layers.
+    pub rope_local_base_freq: f32,
     pub head_dim: usize,
-    /// Scaling factor for query before attention (replaces 1/sqrt(head_dim)).
+    /// Scaling factor for query before attention.
     pub query_pre_attn_scalar: f32,
-    /// Soft cap for attention logits. None = no capping.
+    /// Optional soft cap for attention logits (None for Gemma3).
     pub attn_logit_softcapping: Option<f32>,
-    /// Soft cap for final logits. None = no capping.
+    /// Optional soft cap for final logits (None for Gemma3).
     pub final_logit_softcapping: Option<f32>,
     /// Whether attention projections use bias.
     pub attention_bias: bool,
-    /// Sliding window size for "sliding_attention" layers. None if not set.
+    /// Sliding window size for local layers. None if not set.
     pub sliding_window: Option<usize>,
-    /// Per-layer attention type: `true` = sliding attention, `false` = full attention.
+    /// Per-layer: `true` = sliding/local, `false` = global/full.
     pub layer_is_sliding: Vec<bool>,
 }
 
-impl MlxGemma2Config {
+impl MlxGemma3Config {
     /// Parse from a HuggingFace config.json.
     pub fn from_hf_config(config: &HfModelConfig) -> Result<Self, String> {
         let hidden_size = config
@@ -102,23 +104,42 @@ impl MlxGemma2Config {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
-        let layer_is_sliding =
-            if let Some(layer_types) = config.extra.get("layer_types").and_then(|v| v.as_array()) {
-                layer_types
-                    .iter()
-                    .map(|v| v.as_str() == Some("sliding_attention"))
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let rope_theta = config.rope_theta.unwrap_or(10000.0) as f32;
+
+        let rope_local_base_freq = config
+            .extra
+            .get("rope_local_base_freq")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(10000.0) as f32;
+
+        let num_hidden_layers = config
+            .num_hidden_layers
+            .ok_or_else(|| "missing num_hidden_layers".to_string())?;
+
+        // Gemma3 uses `sliding_window_pattern` to determine local vs global layers.
+        let layer_is_sliding = if let Some(pattern) = config
+            .extra
+            .get("sliding_window_pattern")
+            .and_then(|v| v.as_u64())
+        {
+            (0..num_hidden_layers)
+                .map(|i| (i + 1) % (pattern as usize) != 0)
+                .collect()
+        } else if let Some(layer_types) = config.extra.get("layer_types").and_then(|v| v.as_array())
+        {
+            layer_types
+                .iter()
+                .map(|v| v.as_str() == Some("sliding_attention"))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         Ok(Self {
             hidden_size,
             num_attention_heads,
             num_kv_heads: config.num_kv_heads().unwrap_or(num_attention_heads),
-            num_hidden_layers: config
-                .num_hidden_layers
-                .ok_or_else(|| "missing num_hidden_layers".to_string())?,
+            num_hidden_layers,
             intermediate_size: config
                 .intermediate_size
                 .ok_or_else(|| "missing intermediate_size".to_string())?,
@@ -127,7 +148,8 @@ impl MlxGemma2Config {
                 .ok_or_else(|| "missing vocab_size".to_string())?,
             max_position_embeddings: config.max_position_embeddings.unwrap_or(8192),
             rms_norm_eps: config.norm_eps() as f32,
-            rope_theta: config.rope_theta.unwrap_or(10000.0) as f32,
+            rope_theta,
+            rope_local_base_freq,
             head_dim,
             query_pre_attn_scalar,
             attn_logit_softcapping,
@@ -137,50 +159,30 @@ impl MlxGemma2Config {
             layer_is_sliding,
         })
     }
-}
 
-// ---------------------------------------------------------------------------
-// GemmaRmsNorm helper: load weight with +1 offset
-// ---------------------------------------------------------------------------
-
-/// Assign a Gemma RMS norm weight: `norm.weight = loaded_weight + 1.0`.
-///
-/// Standard RmsNorm computes `weight * normed`. Gemma wants `(1 + weight) * normed`,
-/// so we store `weight + 1` in the norm's weight parameter.
-pub(crate) fn assign_gemma_norm_weight(
-    norm: &mut nn::RmsNorm,
-    weights: &HashMap<String, Array>,
-    name: &str,
-) {
-    if let Some(w) = weights.get(name) {
-        norm.weight.value = w.add(Array::from_f32(1.0)).unwrap();
-    } else {
-        tracing::warn!("Weight not found: {name}");
+    /// Returns the RoPE theta for a given layer.
+    fn rope_theta_for_layer(&self, layer_idx: usize) -> f32 {
+        if layer_idx < self.layer_is_sliding.len() && self.layer_is_sliding[layer_idx] {
+            self.rope_local_base_freq
+        } else {
+            self.rope_theta
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// MlxGemma2MLP
+// MlxGemma3MLP
 // ---------------------------------------------------------------------------
 
-/// Gemma MLP (GELU-gated feed-forward network) using MLX.
-///
-/// - Gemma v1: exact GELU (erf-based, `hidden_act: "gelu"`)
-/// - Gemma2: approximate GELU (tanh-based, `hidden_act: "gelu_pytorch_tanh"`)
-struct MlxGemma2MLP {
+/// Gemma3 MLP (GELU-gated feed-forward) using MLX.
+struct MlxGemma3MLP {
     gate_proj: nn::Linear,
     up_proj: nn::Linear,
     down_proj: nn::Linear,
-    /// true → gelu_approximate (Gemma2), false → exact gelu (Gemma v1)
-    approximate_gelu: bool,
 }
 
-impl MlxGemma2MLP {
-    fn new(
-        hidden_size: i32,
-        intermediate_size: i32,
-        approximate_gelu: bool,
-    ) -> Result<Self, Exception> {
+impl MlxGemma3MLP {
+    fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self, Exception> {
         Ok(Self {
             gate_proj: nn::LinearBuilder::new(hidden_size, intermediate_size)
                 .bias(false)
@@ -191,7 +193,6 @@ impl MlxGemma2MLP {
             down_proj: nn::LinearBuilder::new(intermediate_size, hidden_size)
                 .bias(false)
                 .build()?,
-            approximate_gelu,
         })
     }
 
@@ -215,11 +216,7 @@ impl MlxGemma2MLP {
 
     fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = if self.approximate_gelu {
-            nn::gelu_approximate(&gate)?
-        } else {
-            nn::gelu(&gate)?
-        };
+        let gate = nn::gelu_approximate(&gate)?;
         let up = self.up_proj.forward(x)?;
         let hidden = gate.multiply(&up)?;
         self.down_proj.forward(&hidden)
@@ -227,29 +224,30 @@ impl MlxGemma2MLP {
 }
 
 // ---------------------------------------------------------------------------
-// MlxGemma2Attention
+// MlxGemma3Attention
 // ---------------------------------------------------------------------------
 
-/// Gemma2 multi-head attention with custom query scaling and optional RoPE.
-struct MlxGemma2Attention {
+/// Gemma3 attention with per-head QK norms and per-layer RoPE theta.
+struct MlxGemma3Attention {
     q_proj: nn::Linear,
     k_proj: nn::Linear,
     v_proj: nn::Linear,
     o_proj: nn::Linear,
+    q_norm: nn::RmsNorm,
+    k_norm: nn::RmsNorm,
     rope: nn::Rope,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     scale: f32,
-    #[allow(dead_code)]
-    attn_logit_softcapping: Option<f32>,
-    /// Per-layer sliding window. `Some(w)` for sliding-attention layers, `None` for full.
+    /// Per-layer sliding window.
     sliding_window: Option<usize>,
 }
 
-impl MlxGemma2Attention {
+impl MlxGemma3Attention {
     fn new(
-        config: &MlxGemma2Config,
+        config: &MlxGemma3Config,
+        layer_idx: usize,
         layer_sliding_window: Option<usize>,
     ) -> Result<Self, Exception> {
         let hidden = config.hidden_size as i32;
@@ -269,16 +267,21 @@ impl MlxGemma2Attention {
             o_proj: nn::LinearBuilder::new(q_size, hidden)
                 .bias(config.attention_bias)
                 .build()?,
+            q_norm: nn::RmsNormBuilder::new(config.head_dim as i32)
+                .eps(config.rms_norm_eps)
+                .build()?,
+            k_norm: nn::RmsNormBuilder::new(config.head_dim as i32)
+                .eps(config.rms_norm_eps)
+                .build()?,
             rope: {
                 let mut r = nn::Rope::new(config.head_dim as i32);
-                r.base = config.rope_theta;
+                r.base = config.rope_theta_for_layer(layer_idx);
                 r
             },
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             scale: config.query_pre_attn_scalar.powf(-0.5),
-            attn_logit_softcapping: config.attn_logit_softcapping,
             sliding_window: layer_sliding_window,
         })
     }
@@ -304,6 +307,17 @@ impl MlxGemma2Attention {
             weights,
             &format!("{prefix}.o_proj.weight"),
         );
+        // QK norms with GemmaRmsNorm +1 offset.
+        assign_gemma_norm_weight(
+            &mut self.q_norm,
+            weights,
+            &format!("{prefix}.q_norm.weight"),
+        );
+        assign_gemma_norm_weight(
+            &mut self.k_norm,
+            weights,
+            &format!("{prefix}.k_norm.weight"),
+        );
     }
 
     fn forward(
@@ -318,15 +332,17 @@ impl MlxGemma2Attention {
         let k = self.k_proj.forward(hidden_states)?;
         let v = self.v_proj.forward(hidden_states)?;
 
-        // Reshape: [seq, hidden] -> [1, heads, seq, head_dim]
-        let q = q
-            .reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?
-            .transpose_axes(&[1, 0, 2])?
-            .expand_dims(0)?;
-        let mut k = k
-            .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
-            .transpose_axes(&[1, 0, 2])?
-            .expand_dims(0)?;
+        // Reshape: [seq, hidden] -> [seq, heads, head_dim]
+        let q = q.reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?;
+        let k = k.reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
+
+        // Per-head QK norms (GemmaRmsNorm normalizes last dim = head_dim).
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
+
+        // Transpose to [1, heads, seq, head_dim] for RoPE + SDPA.
+        let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
         let mut v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
@@ -346,10 +362,9 @@ impl MlxGemma2Attention {
             k = concatenate_axis(&[ck, k], 2)?;
             v = concatenate_axis(&[cv, v], 2)?;
         }
-        // Store the full cache (for future steps).
         *cache = Some((k.clone(), v.clone()));
 
-        // Sliding window: trim K/V to only the last `w` positions.
+        // Sliding window: trim K/V to last `w` positions.
         if let Some(w) = self.sliding_window {
             let kv_len = k.dim(2) as usize;
             if kv_len > w {
@@ -380,31 +395,28 @@ impl MlxGemma2Attention {
 }
 
 // ---------------------------------------------------------------------------
-// MlxGemma2DecoderLayer
+// MlxGemma3DecoderLayer
 // ---------------------------------------------------------------------------
 
-/// A single Gemma2 decoder layer with 4 norms.
-struct MlxGemma2DecoderLayer {
-    self_attn: MlxGemma2Attention,
-    mlp: MlxGemma2MLP,
+/// A single Gemma3 decoder layer with 4 norms.
+struct MlxGemma3DecoderLayer {
+    self_attn: MlxGemma3Attention,
+    mlp: MlxGemma3MLP,
     input_layernorm: nn::RmsNorm,
     post_attention_layernorm: nn::RmsNorm,
     pre_feedforward_layernorm: nn::RmsNorm,
     post_feedforward_layernorm: nn::RmsNorm,
 }
 
-impl MlxGemma2DecoderLayer {
+impl MlxGemma3DecoderLayer {
     fn new(
-        config: &MlxGemma2Config,
+        config: &MlxGemma3Config,
+        layer_idx: usize,
         layer_sliding_window: Option<usize>,
     ) -> Result<Self, Exception> {
         Ok(Self {
-            self_attn: MlxGemma2Attention::new(config, layer_sliding_window)?,
-            mlp: MlxGemma2MLP::new(
-                config.hidden_size as i32,
-                config.intermediate_size as i32,
-                true,
-            )?,
+            self_attn: MlxGemma3Attention::new(config, layer_idx, layer_sliding_window)?,
+            mlp: MlxGemma3MLP::new(config.hidden_size as i32, config.intermediate_size as i32)?,
             input_layernorm: nn::RmsNormBuilder::new(config.hidden_size as i32)
                 .eps(config.rms_norm_eps)
                 .build()?,
@@ -467,24 +479,22 @@ impl MlxGemma2DecoderLayer {
 }
 
 // ---------------------------------------------------------------------------
-// MlxGemma2ForCausalLM
+// MlxGemma3ForCausalLM (float)
 // ---------------------------------------------------------------------------
 
-/// Gemma2 for causal language modeling using MLX (float weights).
-pub struct MlxGemma2ForCausalLM {
+/// Gemma3 for causal language modeling using MLX (float weights).
+pub struct MlxGemma3ForCausalLM {
     embed_tokens: nn::Embedding,
-    layers: Vec<MlxGemma2DecoderLayer>,
+    layers: Vec<MlxGemma3DecoderLayer>,
     norm: nn::RmsNorm,
-    /// sqrt(hidden_size) — multiply embeddings after lookup.
     normalizer: f32,
-    /// Soft cap for final logits.
     final_logit_softcapping: Option<f32>,
     #[allow(dead_code)]
-    config: MlxGemma2Config,
+    config: MlxGemma3Config,
 }
 
-impl MlxGemma2ForCausalLM {
-    fn new(config: &MlxGemma2Config) -> Result<Self, Exception> {
+impl MlxGemma3ForCausalLM {
+    fn new(config: &MlxGemma3Config) -> Result<Self, Exception> {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let layer_sliding_window =
@@ -493,7 +503,7 @@ impl MlxGemma2ForCausalLM {
                 } else {
                     None
                 };
-            layers.push(MlxGemma2DecoderLayer::new(config, layer_sliding_window)?);
+            layers.push(MlxGemma3DecoderLayer::new(config, i, layer_sliding_window)?);
         }
 
         Ok(Self {
@@ -522,7 +532,7 @@ impl MlxGemma2ForCausalLM {
 
     fn load(
         model_dir: &Path,
-        config: &MlxGemma2Config,
+        config: &MlxGemma3Config,
         _dtype: Dtype,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut model = Self::new(config)?;
@@ -540,14 +550,13 @@ impl MlxGemma2ForCausalLM {
     }
 }
 
-impl super::MlxModel for MlxGemma2ForCausalLM {
+impl super::MlxModel for MlxGemma3ForCausalLM {
     fn forward(
         &mut self,
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
     ) -> mlx_rs::error::Result<Array> {
-        // Embed and normalize by sqrt(hidden_size).
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
 
@@ -557,10 +566,9 @@ impl super::MlxModel for MlxGemma2ForCausalLM {
 
         hidden_states = self.norm.forward(&hidden_states)?;
 
-        // Tied embeddings: embed_tokens.as_linear.
+        // Tied embeddings.
         let logits = self.embed_tokens.as_linear(&hidden_states)?;
 
-        // Final logit softcapping.
         let logits = if let Some(cap) = self.final_logit_softcapping {
             Self::apply_softcap(&logits, cap)?
         } else {
@@ -576,24 +584,18 @@ impl super::MlxModel for MlxGemma2ForCausalLM {
 }
 
 // ---------------------------------------------------------------------------
-// Quantized Gemma2
+// Quantized Gemma3
 // ---------------------------------------------------------------------------
 
-/// Quantized Gemma2 MLP using QuantizedLinear.
-struct MlxQuantizedGemma2MLP {
+/// Quantized Gemma3 MLP using QuantizedLinear.
+struct MlxQuantizedGemma3MLP {
     gate_proj: nn::QuantizedLinear,
     up_proj: nn::QuantizedLinear,
     down_proj: nn::QuantizedLinear,
-    approximate_gelu: bool,
 }
 
-impl MlxQuantizedGemma2MLP {
-    fn from_weights(
-        weights: &HashMap<String, Array>,
-        prefix: &str,
-        qc: &QuantConfig,
-        approximate_gelu: bool,
-    ) -> Self {
+impl MlxQuantizedGemma3MLP {
+    fn from_weights(weights: &HashMap<String, Array>, prefix: &str, qc: &QuantConfig) -> Self {
         Self {
             gate_proj: make_quantized_linear(
                 weights,
@@ -613,49 +615,54 @@ impl MlxQuantizedGemma2MLP {
                 qc.group_size,
                 qc.bits,
             ),
-            approximate_gelu,
         }
     }
 
     fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = if self.approximate_gelu {
-            nn::gelu_approximate(&gate)?
-        } else {
-            nn::gelu(&gate)?
-        };
+        let gate = nn::gelu_approximate(&gate)?;
         let up = self.up_proj.forward(x)?;
         let hidden = gate.multiply(&up)?;
         self.down_proj.forward(&hidden)
     }
 }
 
-/// Quantized Gemma2 attention.
-struct MlxQuantizedGemma2Attention {
+/// Quantized Gemma3 attention.
+struct MlxQuantizedGemma3Attention {
     q_proj: nn::QuantizedLinear,
     k_proj: nn::QuantizedLinear,
     v_proj: nn::QuantizedLinear,
     o_proj: nn::QuantizedLinear,
+    q_norm: nn::RmsNorm,
+    k_norm: nn::RmsNorm,
     rope: nn::Rope,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     scale: f32,
-    #[allow(dead_code)]
-    attn_logit_softcapping: Option<f32>,
-    /// Per-layer sliding window. `Some(w)` for sliding-attention layers, `None` for full.
     sliding_window: Option<usize>,
 }
 
-impl MlxQuantizedGemma2Attention {
+impl MlxQuantizedGemma3Attention {
     fn from_weights(
         weights: &HashMap<String, Array>,
         prefix: &str,
-        config: &MlxGemma2Config,
+        config: &MlxGemma3Config,
         qc: &QuantConfig,
+        layer_idx: usize,
         layer_sliding_window: Option<usize>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Exception> {
+        // QK norms stay float (GemmaRmsNorm with +1 offset).
+        let mut q_norm = nn::RmsNormBuilder::new(config.head_dim as i32)
+            .eps(config.rms_norm_eps)
+            .build()?;
+        let mut k_norm = nn::RmsNormBuilder::new(config.head_dim as i32)
+            .eps(config.rms_norm_eps)
+            .build()?;
+        assign_gemma_norm_weight(&mut q_norm, weights, &format!("{prefix}.q_norm.weight"));
+        assign_gemma_norm_weight(&mut k_norm, weights, &format!("{prefix}.k_norm.weight"));
+
+        Ok(Self {
             q_proj: make_quantized_linear(
                 weights,
                 &format!("{prefix}.q_proj"),
@@ -680,18 +687,19 @@ impl MlxQuantizedGemma2Attention {
                 qc.group_size,
                 qc.bits,
             ),
+            q_norm,
+            k_norm,
             rope: {
                 let mut r = nn::Rope::new(config.head_dim as i32);
-                r.base = config.rope_theta;
+                r.base = config.rope_theta_for_layer(layer_idx);
                 r
             },
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             scale: config.query_pre_attn_scalar.powf(-0.5),
-            attn_logit_softcapping: config.attn_logit_softcapping,
             sliding_window: layer_sliding_window,
-        }
+        })
     }
 
     fn forward(
@@ -706,14 +714,17 @@ impl MlxQuantizedGemma2Attention {
         let k = self.k_proj.forward(hidden_states)?;
         let v = self.v_proj.forward(hidden_states)?;
 
-        let q = q
-            .reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?
-            .transpose_axes(&[1, 0, 2])?
-            .expand_dims(0)?;
-        let mut k = k
-            .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
-            .transpose_axes(&[1, 0, 2])?
-            .expand_dims(0)?;
+        // Reshape to [seq, heads, head_dim].
+        let q = q.reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?;
+        let k = k.reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
+
+        // Per-head QK norms.
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
+
+        // Transpose to [1, heads, seq, head_dim].
+        let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
         let mut v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
@@ -731,10 +742,8 @@ impl MlxQuantizedGemma2Attention {
             k = concatenate_axis(&[ck, k], 2)?;
             v = concatenate_axis(&[cv, v], 2)?;
         }
-        // Store the full cache (for future steps).
         *cache = Some((k.clone(), v.clone()));
 
-        // Sliding window: trim K/V to only the last `w` positions.
         if let Some(w) = self.sliding_window {
             let kv_len = k.dim(2) as usize;
             if kv_len > w {
@@ -762,22 +771,23 @@ impl MlxQuantizedGemma2Attention {
     }
 }
 
-/// A single quantized Gemma2 decoder layer with 4 norms.
-struct MlxQuantizedGemma2DecoderLayer {
-    self_attn: MlxQuantizedGemma2Attention,
-    mlp: MlxQuantizedGemma2MLP,
+/// A single quantized Gemma3 decoder layer with 4 norms.
+struct MlxQuantizedGemma3DecoderLayer {
+    self_attn: MlxQuantizedGemma3Attention,
+    mlp: MlxQuantizedGemma3MLP,
     input_layernorm: nn::RmsNorm,
     post_attention_layernorm: nn::RmsNorm,
     pre_feedforward_layernorm: nn::RmsNorm,
     post_feedforward_layernorm: nn::RmsNorm,
 }
 
-impl MlxQuantizedGemma2DecoderLayer {
+impl MlxQuantizedGemma3DecoderLayer {
     fn from_weights(
         weights: &HashMap<String, Array>,
         prefix: &str,
-        config: &MlxGemma2Config,
+        config: &MlxGemma3Config,
         qc: &QuantConfig,
+        layer_idx: usize,
         layer_sliding_window: Option<usize>,
     ) -> Result<Self, Exception> {
         let mut input_layernorm = nn::RmsNormBuilder::new(config.hidden_size as i32)
@@ -815,14 +825,15 @@ impl MlxQuantizedGemma2DecoderLayer {
         );
 
         Ok(Self {
-            self_attn: MlxQuantizedGemma2Attention::from_weights(
+            self_attn: MlxQuantizedGemma3Attention::from_weights(
                 weights,
                 &format!("{prefix}.self_attn"),
                 config,
                 qc,
+                layer_idx,
                 layer_sliding_window,
-            ),
-            mlp: MlxQuantizedGemma2MLP::from_weights(weights, &format!("{prefix}.mlp"), qc, true),
+            )?,
+            mlp: MlxQuantizedGemma3MLP::from_weights(weights, &format!("{prefix}.mlp"), qc),
             input_layernorm,
             post_attention_layernorm,
             pre_feedforward_layernorm,
@@ -848,21 +859,21 @@ impl MlxQuantizedGemma2DecoderLayer {
     }
 }
 
-/// Quantized Gemma2 for causal language modeling using MLX.
-pub struct MlxQuantizedGemma2ForCausalLM {
+/// Quantized Gemma3 for causal language modeling using MLX.
+pub struct MlxQuantizedGemma3ForCausalLM {
     embed_tokens: MlxEmbedTokens,
-    layers: Vec<MlxQuantizedGemma2DecoderLayer>,
+    layers: Vec<MlxQuantizedGemma3DecoderLayer>,
     norm: nn::RmsNorm,
     normalizer: f32,
     final_logit_softcapping: Option<f32>,
     #[allow(dead_code)]
-    config: MlxGemma2Config,
+    config: MlxGemma3Config,
 }
 
-impl MlxQuantizedGemma2ForCausalLM {
+impl MlxQuantizedGemma3ForCausalLM {
     fn load(
         model_dir: &Path,
-        config: &MlxGemma2Config,
+        config: &MlxGemma3Config,
         qc: &QuantConfig,
         _dtype: Dtype,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -879,11 +890,12 @@ impl MlxQuantizedGemma2ForCausalLM {
                 } else {
                     None
                 };
-            layers.push(MlxQuantizedGemma2DecoderLayer::from_weights(
+            layers.push(MlxQuantizedGemma3DecoderLayer::from_weights(
                 &weights,
                 &format!("model.layers.{i}"),
                 config,
                 qc,
+                i,
                 layer_sliding_window,
             )?);
         }
@@ -906,7 +918,7 @@ impl MlxQuantizedGemma2ForCausalLM {
     }
 }
 
-impl super::MlxModel for MlxQuantizedGemma2ForCausalLM {
+impl super::MlxModel for MlxQuantizedGemma3ForCausalLM {
     fn forward(
         &mut self,
         input_ids: &Array,
@@ -925,7 +937,7 @@ impl super::MlxModel for MlxQuantizedGemma2ForCausalLM {
         let logits = self.embed_tokens.as_linear(&hidden_states)?;
 
         let logits = if let Some(cap) = self.final_logit_softcapping {
-            MlxGemma2ForCausalLM::apply_softcap(&logits, cap)?
+            MlxGemma3ForCausalLM::apply_softcap(&logits, cap)?
         } else {
             logits
         };
@@ -942,355 +954,33 @@ impl super::MlxModel for MlxQuantizedGemma2ForCausalLM {
 // Factory functions
 // ---------------------------------------------------------------------------
 
-/// Factory function for creating a float MLX Gemma2 model.
-pub fn create_mlx_gemma2(
+/// Factory function for creating a float MLX Gemma3 model.
+pub fn create_mlx_gemma3(
     model_dir: &Path,
     config: &HfModelConfig,
     dtype: Dtype,
 ) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
-    let gemma2_config = MlxGemma2Config::from_hf_config(config)
+    let gemma3_config = MlxGemma3Config::from_hf_config(config)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-    let model = MlxGemma2ForCausalLM::load(model_dir, &gemma2_config, dtype)?;
+    let model = MlxGemma3ForCausalLM::load(model_dir, &gemma3_config, dtype)?;
     Ok(Box::new(model))
 }
 
-/// Factory function for creating a quantized MLX Gemma2 model.
-pub fn create_mlx_quantized_gemma2(
+/// Factory function for creating a quantized MLX Gemma3 model.
+pub fn create_mlx_quantized_gemma3(
     model_dir: &Path,
     config: &HfModelConfig,
     dtype: Dtype,
 ) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
-    let gemma2_config = MlxGemma2Config::from_hf_config(config)
+    let gemma3_config = MlxGemma3Config::from_hf_config(config)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let qc = QuantConfig::from_hf_config(config).unwrap_or_default();
     tracing::info!(
-        "Loading quantized MLX Gemma2 (group_size={}, bits={})",
+        "Loading quantized MLX Gemma3 (group_size={}, bits={})",
         qc.group_size,
         qc.bits
     );
-    let model = MlxQuantizedGemma2ForCausalLM::load(model_dir, &gemma2_config, &qc, dtype)?;
-    Ok(Box::new(model))
-}
-
-// ===========================================================================
-// Gemma v1 — same as Gemma2 but with 2 norms per layer (no pre/post-ff norms,
-// no softcapping, no query_pre_attn_scalar). Reuses MlxGemma2Config (those
-// fields default to None/head_dim when absent in config.json).
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// MlxGemmaDecoderLayer (2 norms)
-// ---------------------------------------------------------------------------
-
-struct MlxGemmaDecoderLayer {
-    self_attn: MlxGemma2Attention,
-    mlp: MlxGemma2MLP,
-    input_layernorm: nn::RmsNorm,
-    post_attention_layernorm: nn::RmsNorm,
-}
-
-impl MlxGemmaDecoderLayer {
-    fn new(config: &MlxGemma2Config) -> Result<Self, Exception> {
-        Ok(Self {
-            self_attn: MlxGemma2Attention::new(config, None)?, // Gemma v1: no sliding window
-            mlp: MlxGemma2MLP::new(
-                config.hidden_size as i32,
-                config.intermediate_size as i32,
-                false,
-            )?,
-            input_layernorm: nn::RmsNormBuilder::new(config.hidden_size as i32)
-                .eps(config.rms_norm_eps)
-                .build()?,
-            post_attention_layernorm: nn::RmsNormBuilder::new(config.hidden_size as i32)
-                .eps(config.rms_norm_eps)
-                .build()?,
-        })
-    }
-
-    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) {
-        self.self_attn
-            .load_weights(weights, &format!("{prefix}.self_attn"));
-        self.mlp.load_weights(weights, &format!("{prefix}.mlp"));
-        assign_gemma_norm_weight(
-            &mut self.input_layernorm,
-            weights,
-            &format!("{prefix}.input_layernorm.weight"),
-        );
-        assign_gemma_norm_weight(
-            &mut self.post_attention_layernorm,
-            weights,
-            &format!("{prefix}.post_attention_layernorm.weight"),
-        );
-    }
-
-    fn forward(
-        &mut self,
-        hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
-    ) -> Result<Array, Exception> {
-        let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
-        let hidden_states = hidden_states.add(&attn_output)?;
-
-        let normed = self.post_attention_layernorm.forward(&hidden_states)?;
-        let mlp_output = self.mlp.forward(&normed)?;
-        hidden_states.add(&mlp_output)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// MlxGemmaForCausalLM (float)
-// ---------------------------------------------------------------------------
-
-pub struct MlxGemmaForCausalLM {
-    embed_tokens: nn::Embedding,
-    layers: Vec<MlxGemmaDecoderLayer>,
-    norm: nn::RmsNorm,
-    normalizer: f32,
-    #[allow(dead_code)]
-    config: MlxGemma2Config,
-}
-
-impl MlxGemmaForCausalLM {
-    fn new(config: &MlxGemma2Config) -> Result<Self, Exception> {
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for _ in 0..config.num_hidden_layers {
-            layers.push(MlxGemmaDecoderLayer::new(config)?);
-        }
-
-        Ok(Self {
-            embed_tokens: nn::Embedding::new(config.vocab_size as i32, config.hidden_size as i32)?,
-            layers,
-            norm: nn::RmsNormBuilder::new(config.hidden_size as i32)
-                .eps(config.rms_norm_eps)
-                .build()?,
-            normalizer: (config.hidden_size as f32).sqrt(),
-            config: config.clone(),
-        })
-    }
-
-    fn load_weights(&mut self, weights: &HashMap<String, Array>) {
-        assign_weight(
-            &mut self.embed_tokens.weight,
-            weights,
-            "model.embed_tokens.weight",
-        );
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            layer.load_weights(weights, &format!("model.layers.{i}"));
-        }
-        assign_gemma_norm_weight(&mut self.norm, weights, "model.norm.weight");
-    }
-
-    fn load(
-        model_dir: &Path,
-        config: &MlxGemma2Config,
-        _dtype: Dtype,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let mut model = Self::new(config)?;
-        let weights = load_safetensors_weights(model_dir)?;
-        model.load_weights(&weights);
-        mlx_rs::transforms::eval(weights.values())?;
-        Ok(model)
-    }
-}
-
-impl super::MlxModel for MlxGemmaForCausalLM {
-    fn forward(
-        &mut self,
-        input_ids: &Array,
-        positions: &Array,
-        kv_cache: &mut MlxKvCache,
-    ) -> mlx_rs::error::Result<Array> {
-        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
-        hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
-
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
-        }
-
-        hidden_states = self.norm.forward(&hidden_states)?;
-
-        // Gemma v1 always uses tied embeddings.
-        let logits = self.embed_tokens.as_linear(&hidden_states)?;
-        logits.as_dtype(Dtype::Float32)
-    }
-
-    fn num_layers(&self) -> usize {
-        self.layers.len()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// MlxQuantizedGemmaForCausalLM
-// ---------------------------------------------------------------------------
-
-struct MlxQuantizedGemmaDecoderLayer {
-    self_attn: MlxQuantizedGemma2Attention,
-    mlp: MlxQuantizedGemma2MLP,
-    input_layernorm: nn::RmsNorm,
-    post_attention_layernorm: nn::RmsNorm,
-}
-
-impl MlxQuantizedGemmaDecoderLayer {
-    fn from_weights(
-        weights: &HashMap<String, Array>,
-        prefix: &str,
-        config: &MlxGemma2Config,
-        qc: &QuantConfig,
-    ) -> Result<Self, Exception> {
-        let mut input_layernorm = nn::RmsNormBuilder::new(config.hidden_size as i32)
-            .eps(config.rms_norm_eps)
-            .build()?;
-        let mut post_attention_layernorm = nn::RmsNormBuilder::new(config.hidden_size as i32)
-            .eps(config.rms_norm_eps)
-            .build()?;
-
-        assign_gemma_norm_weight(
-            &mut input_layernorm,
-            weights,
-            &format!("{prefix}.input_layernorm.weight"),
-        );
-        assign_gemma_norm_weight(
-            &mut post_attention_layernorm,
-            weights,
-            &format!("{prefix}.post_attention_layernorm.weight"),
-        );
-
-        Ok(Self {
-            self_attn: MlxQuantizedGemma2Attention::from_weights(
-                weights,
-                &format!("{prefix}.self_attn"),
-                config,
-                qc,
-                None, // Gemma v1 does not use sliding window
-            ),
-            mlp: MlxQuantizedGemma2MLP::from_weights(weights, &format!("{prefix}.mlp"), qc, false),
-            input_layernorm,
-            post_attention_layernorm,
-        })
-    }
-
-    fn forward(
-        &mut self,
-        hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
-    ) -> Result<Array, Exception> {
-        let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
-        let hidden_states = hidden_states.add(&attn_output)?;
-
-        let normed = self.post_attention_layernorm.forward(&hidden_states)?;
-        let mlp_output = self.mlp.forward(&normed)?;
-        hidden_states.add(&mlp_output)
-    }
-}
-
-pub struct MlxQuantizedGemmaForCausalLM {
-    embed_tokens: MlxEmbedTokens,
-    layers: Vec<MlxQuantizedGemmaDecoderLayer>,
-    norm: nn::RmsNorm,
-    normalizer: f32,
-    #[allow(dead_code)]
-    config: MlxGemma2Config,
-}
-
-impl MlxQuantizedGemmaForCausalLM {
-    fn load(
-        model_dir: &Path,
-        config: &MlxGemma2Config,
-        qc: &QuantConfig,
-        _dtype: Dtype,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let weights = load_safetensors_weights(model_dir)?;
-
-        let embed_tokens =
-            MlxEmbedTokens::from_weights(&weights, "model.embed_tokens", qc.group_size, qc.bits);
-
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for i in 0..config.num_hidden_layers {
-            layers.push(MlxQuantizedGemmaDecoderLayer::from_weights(
-                &weights,
-                &format!("model.layers.{i}"),
-                config,
-                qc,
-            )?);
-        }
-
-        let mut norm = nn::RmsNormBuilder::new(config.hidden_size as i32)
-            .eps(config.rms_norm_eps)
-            .build()?;
-        assign_gemma_norm_weight(&mut norm, &weights, "model.norm.weight");
-
-        mlx_rs::transforms::eval(weights.values())?;
-
-        Ok(Self {
-            embed_tokens,
-            layers,
-            norm,
-            normalizer: (config.hidden_size as f32).sqrt(),
-            config: config.clone(),
-        })
-    }
-}
-
-impl super::MlxModel for MlxQuantizedGemmaForCausalLM {
-    fn forward(
-        &mut self,
-        input_ids: &Array,
-        positions: &Array,
-        kv_cache: &mut MlxKvCache,
-    ) -> mlx_rs::error::Result<Array> {
-        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
-        hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
-
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
-        }
-
-        hidden_states = self.norm.forward(&hidden_states)?;
-
-        let logits = self.embed_tokens.as_linear(&hidden_states)?;
-        logits.as_dtype(Dtype::Float32)
-    }
-
-    fn num_layers(&self) -> usize {
-        self.layers.len()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Gemma v1 factory functions
-// ---------------------------------------------------------------------------
-
-/// Factory function for creating a float MLX Gemma v1 model.
-pub fn create_mlx_gemma(
-    model_dir: &Path,
-    config: &HfModelConfig,
-    dtype: Dtype,
-) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
-    let gemma_config = MlxGemma2Config::from_hf_config(config)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-    let model = MlxGemmaForCausalLM::load(model_dir, &gemma_config, dtype)?;
-    Ok(Box::new(model))
-}
-
-/// Factory function for creating a quantized MLX Gemma v1 model.
-pub fn create_mlx_quantized_gemma(
-    model_dir: &Path,
-    config: &HfModelConfig,
-    dtype: Dtype,
-) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
-    let gemma_config = MlxGemma2Config::from_hf_config(config)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-    let qc = QuantConfig::from_hf_config(config).unwrap_or_default();
-    tracing::info!(
-        "Loading quantized MLX Gemma (group_size={}, bits={})",
-        qc.group_size,
-        qc.bits
-    );
-    let model = MlxQuantizedGemmaForCausalLM::load(model_dir, &gemma_config, &qc, dtype)?;
+    let model = MlxQuantizedGemma3ForCausalLM::load(model_dir, &gemma3_config, &qc, dtype)?;
     Ok(Box::new(model))
 }
 
@@ -1301,10 +991,10 @@ pub fn create_mlx_quantized_gemma(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_rs::ops::indexing::IndexOp;
+    use crate::models::MlxModel;
 
-    fn test_config() -> MlxGemma2Config {
-        MlxGemma2Config {
+    fn test_config() -> MlxGemma3Config {
+        MlxGemma3Config {
             hidden_size: 32,
             num_attention_heads: 4,
             num_kv_heads: 4,
@@ -1313,72 +1003,63 @@ mod tests {
             vocab_size: 100,
             max_position_embeddings: 128,
             rms_norm_eps: 1e-6,
-            rope_theta: 10000.0,
+            rope_theta: 1000000.0,
+            rope_local_base_freq: 10000.0,
             head_dim: 8,
             query_pre_attn_scalar: 8.0,
-            attn_logit_softcapping: Some(50.0),
-            final_logit_softcapping: Some(30.0),
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
             attention_bias: false,
-            sliding_window: None,
-            layer_is_sliding: Vec::new(),
+            sliding_window: Some(512),
+            layer_is_sliding: vec![true, false],
         }
     }
 
     #[test]
-    fn test_gemma2_config_from_hf() {
+    fn test_gemma3_config_from_hf() {
         let hf_config: HfModelConfig = serde_json::from_str(
             r#"{
-                "architectures": ["Gemma2ForCausalLM"],
+                "architectures": ["Gemma3ForCausalLM"],
                 "hidden_size": 2304,
                 "num_attention_heads": 8,
                 "num_key_value_heads": 4,
                 "num_hidden_layers": 26,
                 "intermediate_size": 9216,
-                "vocab_size": 256000,
-                "max_position_embeddings": 8192,
+                "vocab_size": 262144,
+                "max_position_embeddings": 32768,
                 "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
+                "rope_theta": 1000000.0,
+                "rope_local_base_freq": 10000.0,
                 "head_dim": 256,
                 "query_pre_attn_scalar": 256,
-                "attn_logit_softcapping": 50.0,
-                "final_logit_softcapping": 30.0,
+                "sliding_window": 512,
+                "sliding_window_pattern": 2,
                 "attention_bias": false
             }"#,
         )
         .unwrap();
 
-        let config = MlxGemma2Config::from_hf_config(&hf_config).unwrap();
+        let config = MlxGemma3Config::from_hf_config(&hf_config).unwrap();
         assert_eq!(config.hidden_size, 2304);
         assert_eq!(config.num_attention_heads, 8);
         assert_eq!(config.num_kv_heads, 4);
         assert_eq!(config.head_dim, 256);
         assert!((config.query_pre_attn_scalar - 256.0).abs() < 1.0);
-        assert!((config.attn_logit_softcapping.unwrap() - 50.0).abs() < 1.0);
-        assert!((config.final_logit_softcapping.unwrap() - 30.0).abs() < 1.0);
+        assert!(config.attn_logit_softcapping.is_none());
+        assert!(config.final_logit_softcapping.is_none());
         assert!(!config.attention_bias);
+        assert_eq!(config.sliding_window, Some(512));
+        assert!((config.rope_theta - 1000000.0).abs() < 1.0);
+        assert!((config.rope_local_base_freq - 10000.0).abs() < 1.0);
+        // sliding_window_pattern=2: alternating sliding/global
+        assert_eq!(config.layer_is_sliding.len(), 26);
+        assert!(config.layer_is_sliding[0]); // (0+1)%2=1 -> sliding
+        assert!(!config.layer_is_sliding[1]); // (1+1)%2=0 -> global
     }
 
     #[test]
-    fn test_gemma_norm_offset() {
-        // Verify assign_gemma_norm_weight produces weight + 1.0.
-        let mut norm = nn::RmsNormBuilder::new(4).eps(1e-6).build().unwrap();
-        let mut weights = HashMap::new();
-        let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[4]);
-        weights.insert("test.weight".to_string(), w);
-        assign_gemma_norm_weight(&mut norm, &weights, "test.weight");
-        norm.weight.value.eval().unwrap();
-        let vals: Vec<f32> = (0..4)
-            .map(|i| norm.weight.value.index(i).item::<f32>())
-            .collect();
-        assert!((vals[0] - 1.1).abs() < 1e-5);
-        assert!((vals[1] - 1.2).abs() < 1e-5);
-        assert!((vals[2] - 1.3).abs() < 1e-5);
-        assert!((vals[3] - 1.4).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_gemma2_mlp_forward() {
-        let mut mlp = MlxGemma2MLP::new(32, 64, true).unwrap();
+    fn test_gemma3_mlp_forward() {
+        let mut mlp = MlxGemma3MLP::new(32, 64).unwrap();
         let x = mlx_rs::ops::ones::<f32>(&[3, 32]).unwrap();
         let out = mlp.forward(&x).unwrap();
         out.eval().unwrap();
@@ -1386,9 +1067,9 @@ mod tests {
     }
 
     #[test]
-    fn test_gemma2_attention_forward() {
+    fn test_gemma3_attention_forward() {
         let config = test_config();
-        let mut attn = MlxGemma2Attention::new(&config, None).unwrap();
+        let mut attn = MlxGemma3Attention::new(&config, 0, None).unwrap();
 
         let x = mlx_rs::ops::ones::<f32>(&[4, 32]).unwrap();
         let positions = Array::from_iter(0..4i32, &[4]);
@@ -1401,159 +1082,25 @@ mod tests {
     }
 
     #[test]
-    fn test_gemma2_model_forward() {
+    fn test_gemma3_model_forward() {
         let config = test_config();
-        let mut model = MlxGemma2ForCausalLM::new(&config).unwrap();
+        let mut model = MlxGemma3ForCausalLM::new(&config).unwrap();
 
-        let input_ids = Array::from_iter(vec![1i32, 5, 10], &[3]);
+        let input_ids = Array::from_iter(0..3i32, &[3]);
         let positions = Array::from_iter(0..3i32, &[3]);
-        let mut kv_cache = crate::cache::empty_kv_cache(config.num_hidden_layers);
+        let mut kv_cache: MlxKvCache = vec![None; config.num_hidden_layers];
 
-        let logits = <MlxGemma2ForCausalLM as crate::models::MlxModel>::forward(
-            &mut model,
-            &input_ids,
-            &positions,
-            &mut kv_cache,
-        )
-        .unwrap();
+        let logits = model
+            .forward(&input_ids, &positions, &mut kv_cache)
+            .unwrap();
         logits.eval().unwrap();
         assert_eq!(logits.shape(), &[3, config.vocab_size as i32]);
     }
 
     #[test]
-    fn test_gemma2_prefill_and_decode() {
-        let config = test_config();
-        let mut model = MlxGemma2ForCausalLM::new(&config).unwrap();
-        let mut kv_cache = crate::cache::empty_kv_cache(config.num_hidden_layers);
-
-        // Prefill: 3 tokens
-        let input_ids = Array::from_iter(vec![1i32, 5, 10], &[3]);
-        let positions = Array::from_iter(0..3i32, &[3]);
-        let logits = <MlxGemma2ForCausalLM as crate::models::MlxModel>::forward(
-            &mut model,
-            &input_ids,
-            &positions,
-            &mut kv_cache,
-        )
-        .unwrap();
-        logits.eval().unwrap();
-        assert_eq!(logits.shape(), &[3, config.vocab_size as i32]);
-
-        for entry in &kv_cache {
-            assert!(entry.is_some());
-        }
-
-        // Decode: 1 token at position 3
-        let decode_ids = Array::from_iter(vec![15i32], &[1]);
-        let decode_pos = Array::from_iter(vec![3i32], &[1]);
-        let logits2 = <MlxGemma2ForCausalLM as crate::models::MlxModel>::forward(
-            &mut model,
-            &decode_ids,
-            &decode_pos,
-            &mut kv_cache,
-        )
-        .unwrap();
-        logits2.eval().unwrap();
-        assert_eq!(logits2.shape(), &[1, config.vocab_size as i32]);
-    }
-
-    #[test]
-    fn test_gemma2_logit_softcapping() {
-        // Verify cap * tanh(logits / cap) bounds output.
-        let cap = 30.0f32;
-        let logits = Array::from_slice(&[100.0f32, -100.0, 0.0, 15.0], &[1, 4]);
-        let capped = MlxGemma2ForCausalLM::apply_softcap(&logits, cap).unwrap();
-        capped.eval().unwrap();
-
-        let vals: Vec<f32> = (0..4).map(|i| capped.index((0, i)).item::<f32>()).collect();
-        // 100/30 -> tanh -> ~1.0 -> *30 -> ~30
-        assert!((vals[0] - 30.0).abs() < 0.1);
-        // -100/30 -> tanh -> ~-1.0 -> *30 -> ~-30
-        assert!((vals[1] - (-30.0)).abs() < 0.1);
-        // 0 -> tanh -> 0 -> 0
-        assert!(vals[2].abs() < 0.01);
-        // 15/30 = 0.5 -> tanh(0.5) -> ~0.462 -> *30 -> ~13.86
-        assert!((vals[3] - 13.86).abs() < 0.1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Gemma v1 tests
-    // -----------------------------------------------------------------------
-
-    fn gemma_v1_config() -> MlxGemma2Config {
-        MlxGemma2Config {
-            hidden_size: 32,
-            num_attention_heads: 4,
-            num_kv_heads: 2, // GQA
-            num_hidden_layers: 2,
-            intermediate_size: 64,
-            vocab_size: 100,
-            max_position_embeddings: 128,
-            rms_norm_eps: 1e-6,
-            rope_theta: 10000.0,
-            head_dim: 8,
-            query_pre_attn_scalar: 8.0, // defaults to head_dim when absent
-            attn_logit_softcapping: None,
-            final_logit_softcapping: None,
-            attention_bias: false,
-            sliding_window: None,
-            layer_is_sliding: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn test_gemma_v1_model_forward() {
-        let config = gemma_v1_config();
-        let mut model = MlxGemmaForCausalLM::new(&config).unwrap();
-
-        let input_ids = Array::from_iter(vec![1i32, 5, 10], &[3]);
-        let positions = Array::from_iter(0..3i32, &[3]);
-        let mut kv_cache = crate::cache::empty_kv_cache(config.num_hidden_layers);
-
-        let logits = <MlxGemmaForCausalLM as crate::models::MlxModel>::forward(
-            &mut model,
-            &input_ids,
-            &positions,
-            &mut kv_cache,
-        )
-        .unwrap();
-        logits.eval().unwrap();
-        assert_eq!(logits.shape(), &[3, config.vocab_size as i32]);
-    }
-
-    #[test]
-    fn test_gemma_v1_prefill_and_decode() {
-        let config = gemma_v1_config();
-        let mut model = MlxGemmaForCausalLM::new(&config).unwrap();
-        let mut kv_cache = crate::cache::empty_kv_cache(config.num_hidden_layers);
-
-        // Prefill
-        let input_ids = Array::from_iter(vec![1i32, 5, 10], &[3]);
-        let positions = Array::from_iter(0..3i32, &[3]);
-        let logits = <MlxGemmaForCausalLM as crate::models::MlxModel>::forward(
-            &mut model,
-            &input_ids,
-            &positions,
-            &mut kv_cache,
-        )
-        .unwrap();
-        logits.eval().unwrap();
-
-        for entry in &kv_cache {
-            assert!(entry.is_some());
-        }
-
-        // Decode
-        let decode_ids = Array::from_iter(vec![15i32], &[1]);
-        let decode_pos = Array::from_iter(vec![3i32], &[1]);
-        let logits2 = <MlxGemmaForCausalLM as crate::models::MlxModel>::forward(
-            &mut model,
-            &decode_ids,
-            &decode_pos,
-            &mut kv_cache,
-        )
-        .unwrap();
-        logits2.eval().unwrap();
-        assert_eq!(logits2.shape(), &[1, config.vocab_size as i32]);
+    fn test_gemma3_registry() {
+        let registry = super::super::MlxModelRegistry::default_registry();
+        assert!(registry.contains("Gemma3ForCausalLM"));
+        assert!(registry.contains_quantized("Gemma3ForCausalLM"));
     }
 }

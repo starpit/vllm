@@ -1,6 +1,6 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (754 tests: 701 unit + 53 e2e, 0 clippy errors)
+> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (772 tests: 715 unit + 57 e2e, 0 clippy errors)
 
 ### Legend
 
@@ -35,7 +35,7 @@
 
 | Feature Group | Python | Rust | Unit | E2E | Parity |
 |---|:---:|:---:|---:|---:|---|
-| [Model Architectures](#model-architectures) | &#x1F535; | &#x1F7E1; | 76 | 21 | `███░░░░░░░` 9/36 |
+| [Model Architectures](#model-architectures) | &#x1F535; | &#x1F7E1; | 90 | 25 | `███░░░░░░░` 10/36 |
 | [Quantization](#quantization) | &#x1F535; | &#x1F7E1; | 13 | 0 | `█░░░░░░░░░` 1/11 |
 | [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | 96 | 18 | `██████░░░░` 14/25 |
 | [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | 49 | 12 | `████████░░` 18/21 |
@@ -52,7 +52,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/6 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | 15 | 0 | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | 14 | 0 | `██████████` 14/15 |
-| | | **Total** | **536** | **53** | `█████░░░░░` **99/199** |
+| | | **Total** | **550** | **57** | `█████░░░░░` **100/199** |
 
 ---
 
@@ -87,7 +87,7 @@
 | OPT | &#x1F535; | &#x1F534; | — | — | P1 |
 | Phi-1 / Phi-2 | &#x1F535; | &#x1F534; | — | — | P1 |
 | Phi-4 | &#x1F535; | &#x1F534; | — | — | P3 |
-| Gemma 3 / 3n | &#x1F535; | &#x1F534; | — | — | P4 |
+| Gemma 3 (text-only) | &#x1F535; | &#x1F535; | 9 | 0 | |
 | ChatGLM / GLM-4 | &#x1F535; | &#x1F534; | — | — | P2 |
 | Baichuan | &#x1F535; | &#x1F534; | — | — | P1 |
 | DBRX | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -127,6 +127,8 @@
 | Qwen3 MoE (float) | N/A | &#x1F535; | 4 | 0 | |
 | Quantized Qwen3 MoE (4/8-bit) | N/A | &#x1F535; | 0 | 4 | |
 | Qwen2 MoE (float + quantized) | N/A | &#x1F535; | 0 | 0 | |
+| Gemma 3 (text-only) | N/A | &#x1F535; | 5 | 4 | |
+| Quantized Gemma 3 (4-bit) | N/A | &#x1F535; | 0 | 4 | |
 | Kimi K2.5 text-only (via DeepSeek V2) | N/A | &#x1F535; | 0 | 0 | |
 | Quantized Kimi K2.5 text-only (4-bit) | N/A | &#x1F535; | 0 | 0 | |
 
@@ -462,11 +464,11 @@
 
 | Metric | Python | Rust |
 |---|---|---|
-| Model architectures | ~248 | 9 candle + 9 MLX (+ quantized variants) |
+| Model architectures | ~248 | 10 candle + 10 MLX (+ quantized variants) |
 | Quantization methods | ~14 | 2 (GGUF + MLX native 4-bit) |
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Unit tests | ~948 test files | 701 passing (660 non-MLX + 41 MLX) |
-| E2E tests | — | 53 passing (24 basic serving + 21 chat/sampling + 8 streaming) |
+| Unit tests | ~948 test files | 715 passing (665 non-MLX + 50 MLX) |
+| E2E tests | — | 57 passing (28 basic serving + 21 chat/sampling + 8 streaming) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

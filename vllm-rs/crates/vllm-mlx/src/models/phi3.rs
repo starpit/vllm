@@ -18,6 +18,7 @@ use mlx_rs::error::Exception;
 use mlx_rs::module::Module;
 use mlx_rs::nn;
 use mlx_rs::ops::concatenate_axis;
+use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
 use crate::cache::MlxKvCache;
@@ -87,6 +88,7 @@ struct MlxPhi3Attention {
     scale: f32,
     q_size: usize,
     kv_size: usize,
+    sliding_window: Option<usize>,
 }
 
 impl MlxPhi3Attention {
@@ -114,6 +116,7 @@ impl MlxPhi3Attention {
             scale: 1.0 / (config.head_dim as f32).sqrt(),
             q_size,
             kv_size,
+            sliding_window: config.sliding_window,
         })
     }
 
@@ -174,7 +177,19 @@ impl MlxPhi3Attention {
             k = concatenate_axis(&[ck, k], 2)?;
             v = concatenate_axis(&[cv, v], 2)?;
         }
+        // Store the full cache (for future steps).
         *cache = Some((k.clone(), v.clone()));
+
+        // Sliding window: trim K/V to only the last `w` positions.
+        if let Some(w) = self.sliding_window {
+            let kv_len = k.dim(2) as usize;
+            if kv_len > w {
+                let start = (kv_len - w) as i32;
+                let end = kv_len as i32;
+                k = k.try_index((.., .., start..end, ..))?;
+                v = v.try_index((.., .., start..end, ..))?;
+            }
+        }
 
         // SDPA
         let mask = if seq_len > 1 {
@@ -404,6 +419,7 @@ struct MlxQuantizedPhi3Attention {
     scale: f32,
     q_size: usize,
     kv_size: usize,
+    sliding_window: Option<usize>,
 }
 
 impl MlxQuantizedPhi3Attention {
@@ -437,6 +453,7 @@ impl MlxQuantizedPhi3Attention {
             scale: 1.0 / (config.head_dim as f32).sqrt(),
             q_size: config.num_attention_heads * config.head_dim,
             kv_size: config.num_kv_heads * config.head_dim,
+            sliding_window: config.sliding_window,
         }
     }
 
@@ -479,7 +496,19 @@ impl MlxQuantizedPhi3Attention {
             k = concatenate_axis(&[ck, k], 2)?;
             v = concatenate_axis(&[cv, v], 2)?;
         }
+        // Store the full cache (for future steps).
         *cache = Some((k.clone(), v.clone()));
+
+        // Sliding window: trim K/V to only the last `w` positions.
+        if let Some(w) = self.sliding_window {
+            let kv_len = k.dim(2) as usize;
+            if kv_len > w {
+                let start = (kv_len - w) as i32;
+                let end = kv_len as i32;
+                k = k.try_index((.., .., start..end, ..))?;
+                v = v.try_index((.., .., start..end, ..))?;
+            }
+        }
 
         let mask = if seq_len > 1 {
             Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
@@ -793,5 +822,38 @@ mod tests {
         .unwrap();
         logits2.eval().unwrap();
         assert_eq!(logits2.shape(), &[1, config.vocab_size as i32]);
+    }
+
+    #[test]
+    fn test_phi3_sliding_window_trims_kv() {
+        let config = LlamaConfig {
+            sliding_window: Some(3),
+            ..test_config()
+        };
+        let mut attn = MlxPhi3Attention::new(&config).unwrap();
+        let mut cache = None;
+
+        // Prefill 5 tokens → cache has 5 KV entries.
+        let x = mlx_rs::ops::ones::<f32>(&[5, 32]).unwrap();
+        let positions = Array::from_iter(0..5i32, &[5]);
+        let _ = attn.forward(&x, &positions, &mut cache).unwrap();
+
+        // Full cache should still store all 5 tokens.
+        let (ck, _) = cache.as_ref().unwrap();
+        ck.eval().unwrap();
+        assert_eq!(ck.dim(2), 5, "cache should store all 5 tokens");
+
+        // Decode one more token → cache has 6 KV entries.
+        let x2 = mlx_rs::ops::ones::<f32>(&[1, 32]).unwrap();
+        let pos2 = Array::from_iter(vec![5i32], &[1]);
+        let out = attn.forward(&x2, &pos2, &mut cache).unwrap();
+        out.eval().unwrap();
+
+        // Full cache should still store all 6 tokens.
+        let (ck2, _) = cache.as_ref().unwrap();
+        ck2.eval().unwrap();
+        assert_eq!(ck2.dim(2), 6, "cache should store all 6 tokens");
+        // Output shape should be correct.
+        assert_eq!(out.shape(), &[1, 32]);
     }
 }

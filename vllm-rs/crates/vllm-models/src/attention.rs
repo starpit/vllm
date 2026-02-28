@@ -1370,4 +1370,29 @@ mod tests {
         let config2 = LlamaConfig::from_hf_config(&hf_config2).unwrap();
         assert_eq!(config2.sliding_window, None);
     }
+
+    #[test]
+    fn test_sliding_window_array_format() {
+        // Newer Mistral models (3.x) use array-format sliding_window:
+        // [null, 4096, null, 4096, ...]
+        use crate::llama::LlamaConfig;
+        use vllm_model::weight::HfModelConfig;
+
+        let hf_config: HfModelConfig = serde_json::from_str(
+            r#"{
+                "architectures": ["MistralForCausalLM"],
+                "hidden_size": 4096,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "num_hidden_layers": 4,
+                "intermediate_size": 14336,
+                "vocab_size": 32000,
+                "sliding_window": [null, 4096, null, 4096]
+            }"#,
+        )
+        .unwrap();
+
+        let config = LlamaConfig::from_hf_config(&hf_config).unwrap();
+        assert_eq!(config.sliding_window, Some(4096));
+    }
 }

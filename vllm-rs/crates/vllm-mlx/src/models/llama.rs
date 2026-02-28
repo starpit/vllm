@@ -57,19 +57,54 @@ impl LlamaConfig {
             .ok_or_else(|| "missing num_attention_heads".to_string())?;
 
         // Parse sliding_window from config.json extras (used by Mistral, Qwen2, Phi-3, etc.).
-        let sliding_window = config
+        // Handles both scalar (4096) and array ([null, 4096, null, 4096, ...]) formats.
+        // The array format is used by newer Mistral models (3.x) — we extract the first
+        // non-null value as the scalar sliding window size.
+        let sliding_window = config.extra.get("sliding_window").and_then(|v| {
+            if let Some(n) = v.as_u64() {
+                Some(n as usize)
+            } else if let Some(arr) = v.as_array() {
+                arr.iter()
+                    .find_map(|item| item.as_u64())
+                    .map(|n| n as usize)
+            } else {
+                None
+            }
+        });
+
+        let num_hidden_layers = config
+            .num_hidden_layers
+            .ok_or_else(|| "missing num_hidden_layers".to_string())?;
+
+        // Validate Qwen2 max_window_layers: if set and < num_hidden_layers, the model
+        // wants partial-layer sliding window (only top layers). We don't support
+        // that — disable sliding window and warn.
+        let sliding_window = if let Some(max_window_layers) = config
             .extra
-            .get("sliding_window")
+            .get("max_window_layers")
             .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
+            .map(|v| v as usize)
+        {
+            if max_window_layers < num_hidden_layers {
+                tracing::warn!(
+                    "config has max_window_layers={} < num_hidden_layers={}: \
+                     partial-layer sliding window not supported, disabling sliding window",
+                    max_window_layers,
+                    num_hidden_layers
+                );
+                None
+            } else {
+                sliding_window
+            }
+        } else {
+            sliding_window
+        };
 
         Ok(Self {
             hidden_size,
             num_attention_heads,
             num_kv_heads: config.num_kv_heads().unwrap_or(num_attention_heads),
-            num_hidden_layers: config
-                .num_hidden_layers
-                .ok_or_else(|| "missing num_hidden_layers".to_string())?,
+            num_hidden_layers,
             intermediate_size: config
                 .intermediate_size
                 .ok_or_else(|| "missing intermediate_size".to_string())?,

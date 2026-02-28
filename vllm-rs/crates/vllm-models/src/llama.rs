@@ -56,11 +56,21 @@ impl LlamaConfig {
             .ok_or_else(|| ModelError::Other("missing num_attention_heads".into()))?;
 
         // Parse sliding_window from config.json extras (used by Mistral, Qwen2, Phi-3, etc.).
-        let sliding_window = config
-            .extra
-            .get("sliding_window")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
+        // Handles both scalar (4096) and array ([null, 4096, null, 4096, ...]) formats.
+        // The array format is used by newer Mistral models (3.x) — we extract the first
+        // non-null value as the scalar sliding window size, matching Python vLLM's
+        // _remap_mistral_sliding_window() behavior.
+        let sliding_window = config.extra.get("sliding_window").and_then(|v| {
+            if let Some(n) = v.as_u64() {
+                Some(n as usize)
+            } else if let Some(arr) = v.as_array() {
+                arr.iter()
+                    .find_map(|item| item.as_u64())
+                    .map(|n| n as usize)
+            } else {
+                None
+            }
+        });
 
         Ok(Self {
             hidden_size,

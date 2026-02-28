@@ -39,7 +39,7 @@
 | [Quantization](#quantization) | &#x1F535; | &#x1F7E1; | 13 | 0 | `█░░░░░░░░░` 1/11 |
 | [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | 96 | 18 | `██████░░░░` 14/25 |
 | [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | 49 | 12 | `████████░░` 18/21 |
-| [KV Cache & Attention](#kv-cache--attention) | &#x1F535; | &#x1F7E1; | 90 | 0 | `█████░░░░░` 9/19 |
+| [KV Cache & Attention](#kv-cache--attention) | &#x1F535; | &#x1F7E1; | 96 | 0 | `█████░░░░░` 9/19 |
 | [Scheduling](#scheduling) | &#x1F535; | &#x1F7E1; | 67 | 0 | `████████░░` 8/10 |
 | [Hardware Backends](#hardware-backends) | &#x1F535; | &#x1F7E1; | 28 | 2 | `████░░░░░░` 3/8 |
 | [Parallelism & Distribution](#parallelism--distribution) | &#x1F535; | &#x1F7E1; | 33 | 0 | `███░░░░░░░` 3/10 |
@@ -52,7 +52,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/6 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | 15 | 0 | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | 14 | 0 | `██████████` 14/15 |
-| | | **Total** | **530** | **53** | `█████░░░░░` **99/199** |
+| | | **Total** | **536** | **53** | `█████░░░░░` **99/199** |
 
 ---
 
@@ -230,10 +230,10 @@
 | FlexAttention | &#x1F535; | &#x1F534; | — | — | P1 |
 | xFormers | &#x1F535; | &#x1F534; | — | — | P1 |
 | MLA (Multi-head Latent Attention) | &#x1F535; | &#x1F535; | 4 | 0 | |
-| Sliding window attention | &#x1F535; | &#x1F535; | 7 | 0 | |
+| Sliding window attention | &#x1F535; | &#x1F535; | 13 | 0 | |
 | Tree attention | &#x1F535; | &#x1F534; | — | — | P1 |
 
-> Unit counts: `block_pool.rs` (19), `free_block_queue.rs` (16), `kv_cache_manager.rs` (13), `kv_cache_block.rs` (11), `kv_block_pool.rs` (13), `attention.rs` (24), MLX `cache.rs` (1). Per-row counts reflect the primary feature each test targets; some tests cross-cut multiple rows. Total section: 97 unit tests.
+> Unit counts: `block_pool.rs` (19), `free_block_queue.rs` (16), `kv_cache_manager.rs` (13), `kv_cache_block.rs` (11), `kv_block_pool.rs` (13), `attention.rs` (25), MLX `cache.rs` (1). Sliding window: 7 attention.rs + 2 gemma2.rs interleaved + 2 qwen2.rs max_window_layers + 1 MLX phi3 trim + 1 array-format parsing = 13. Per-row counts reflect the primary feature each test targets; some tests cross-cut multiple rows. Total section: 103 unit tests.
 
 ---
 

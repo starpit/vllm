@@ -447,10 +447,14 @@ Run a standard prompt ("Explain what a compiler does in one sentence.") across a
 | `test_gemma2_4_norms` | Gemma2 4-norm architecture works correctly |
 | `test_deepseek_moe` | DeepSeek V2 MoE routing produces coherent output (weekly) |
 | `test_qwen2_sliding_window` | Qwen2.5-0.5B with prompt exceeding sliding window size → coherent output, no crash |
+| `test_qwen2_max_window_layers` | Qwen2 config with `max_window_layers < num_hidden_layers` → sliding window correctly disabled, model still generates (nightly) |
 | `test_phi3_sliding_window` | Phi-3.5-mini with long prompt near/beyond sliding window → correct generation (nightly) |
+| `test_phi3_mlx_sliding_window` | MLX Phi-3 quantized model with sliding window config → output matches non-windowed for short prompts, no crash on long prompts (nightly, `--features metal`) |
 | `test_mistral_sliding_window` | Mistral-7B with >4096 token context → handles gracefully (weekly) |
+| `test_mistral_array_sliding_window` | Mistral 3.x model with array-format `sliding_window: [null, 4096, ...]` → config parsed correctly, model generates (nightly) |
+| `test_gemma2_interleaved_sliding_window` | Gemma2 model with `layer_types` interleaved pattern → sliding window applied only to alternating layers, correct generation (nightly) |
 
-**Deliverables**: ~15 cross-architecture tests.
+**Deliverables**: ~18 cross-architecture tests.
 
 ---
 
@@ -538,7 +542,7 @@ Validate the server handles concurrent requests correctly.
 | E5. Tool Calling | ~18 | Llama-3.2-1B / Qwen2.5-0.5B | Every PR | 3 min |
 | E6. Structured Output | ~14 | SmolLM-135M | Every PR | 2 min |
 | E7. Sampling Features | ~10 | SmolLM-135M | Every PR | 2 min |
-| E8. Multi-Architecture | ~15 | All tiers | PR / nightly / weekly | 5 min (Tier 1+2) |
+| E8. Multi-Architecture | ~18 | All tiers | PR / nightly / weekly | 5 min (Tier 1+2) |
 | E9. Concurrency | ~6 | SmolLM-135M | Every PR | 2 min |
 | E10. Observability | ~6 | SmolLM-135M | Every PR | 1 min |
 | E11. CLI & Config | ~10 | SmolLM-135M | Every PR | 2 min |

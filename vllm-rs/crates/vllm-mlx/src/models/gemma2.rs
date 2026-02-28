@@ -20,6 +20,7 @@ use mlx_rs::error::Exception;
 use mlx_rs::module::Module;
 use mlx_rs::nn;
 use mlx_rs::ops::concatenate_axis;
+use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
 use crate::cache::MlxKvCache;
@@ -52,6 +53,10 @@ pub struct MlxGemma2Config {
     pub final_logit_softcapping: Option<f32>,
     /// Whether attention projections use bias.
     pub attention_bias: bool,
+    /// Sliding window size for "sliding_attention" layers. None if not set.
+    pub sliding_window: Option<usize>,
+    /// Per-layer attention type: `true` = sliding attention, `false` = full attention.
+    pub layer_is_sliding: Vec<bool>,
 }
 
 impl MlxGemma2Config {
@@ -91,6 +96,22 @@ impl MlxGemma2Config {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let sliding_window = config
+            .extra
+            .get("sliding_window")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        let layer_is_sliding =
+            if let Some(layer_types) = config.extra.get("layer_types").and_then(|v| v.as_array()) {
+                layer_types
+                    .iter()
+                    .map(|v| v.as_str() == Some("sliding_attention"))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
         Ok(Self {
             hidden_size,
             num_attention_heads,
@@ -112,6 +133,8 @@ impl MlxGemma2Config {
             attn_logit_softcapping,
             final_logit_softcapping,
             attention_bias,
+            sliding_window,
+            layer_is_sliding,
         })
     }
 }
@@ -216,10 +239,15 @@ struct MlxGemma2Attention {
     scale: f32,
     #[allow(dead_code)]
     attn_logit_softcapping: Option<f32>,
+    /// Per-layer sliding window. `Some(w)` for sliding-attention layers, `None` for full.
+    sliding_window: Option<usize>,
 }
 
 impl MlxGemma2Attention {
-    fn new(config: &MlxGemma2Config) -> Result<Self, Exception> {
+    fn new(
+        config: &MlxGemma2Config,
+        layer_sliding_window: Option<usize>,
+    ) -> Result<Self, Exception> {
         let hidden = config.hidden_size as i32;
         let q_size = (config.num_attention_heads * config.head_dim) as i32;
         let kv_size = (config.num_kv_heads * config.head_dim) as i32;
@@ -247,6 +275,7 @@ impl MlxGemma2Attention {
             head_dim: config.head_dim,
             scale: config.query_pre_attn_scalar.powf(-0.5),
             attn_logit_softcapping: config.attn_logit_softcapping,
+            sliding_window: layer_sliding_window,
         })
     }
 
@@ -313,7 +342,19 @@ impl MlxGemma2Attention {
             k = concatenate_axis(&[ck, k], 2)?;
             v = concatenate_axis(&[cv, v], 2)?;
         }
+        // Store the full cache (for future steps).
         *cache = Some((k.clone(), v.clone()));
+
+        // Sliding window: trim K/V to only the last `w` positions.
+        if let Some(w) = self.sliding_window {
+            let kv_len = k.dim(2) as usize;
+            if kv_len > w {
+                let start = (kv_len - w) as i32;
+                let end = kv_len as i32;
+                k = k.try_index((.., .., start..end, ..))?;
+                v = v.try_index((.., .., start..end, ..))?;
+            }
+        }
 
         // Fused SDPA
         let mask = if seq_len > 1 {
@@ -349,9 +390,12 @@ struct MlxGemma2DecoderLayer {
 }
 
 impl MlxGemma2DecoderLayer {
-    fn new(config: &MlxGemma2Config) -> Result<Self, Exception> {
+    fn new(
+        config: &MlxGemma2Config,
+        layer_sliding_window: Option<usize>,
+    ) -> Result<Self, Exception> {
         Ok(Self {
-            self_attn: MlxGemma2Attention::new(config)?,
+            self_attn: MlxGemma2Attention::new(config, layer_sliding_window)?,
             mlp: MlxGemma2MLP::new(
                 config.hidden_size as i32,
                 config.intermediate_size as i32,
@@ -438,8 +482,14 @@ pub struct MlxGemma2ForCausalLM {
 impl MlxGemma2ForCausalLM {
     fn new(config: &MlxGemma2Config) -> Result<Self, Exception> {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for _ in 0..config.num_hidden_layers {
-            layers.push(MlxGemma2DecoderLayer::new(config)?);
+        for i in 0..config.num_hidden_layers {
+            let layer_sliding_window =
+                if i < config.layer_is_sliding.len() && config.layer_is_sliding[i] {
+                    config.sliding_window
+                } else {
+                    None
+                };
+            layers.push(MlxGemma2DecoderLayer::new(config, layer_sliding_window)?);
         }
 
         Ok(Self {
@@ -589,6 +639,8 @@ struct MlxQuantizedGemma2Attention {
     scale: f32,
     #[allow(dead_code)]
     attn_logit_softcapping: Option<f32>,
+    /// Per-layer sliding window. `Some(w)` for sliding-attention layers, `None` for full.
+    sliding_window: Option<usize>,
 }
 
 impl MlxQuantizedGemma2Attention {
@@ -597,6 +649,7 @@ impl MlxQuantizedGemma2Attention {
         prefix: &str,
         config: &MlxGemma2Config,
         qc: &QuantConfig,
+        layer_sliding_window: Option<usize>,
     ) -> Self {
         Self {
             q_proj: make_quantized_linear(
@@ -633,6 +686,7 @@ impl MlxQuantizedGemma2Attention {
             head_dim: config.head_dim,
             scale: config.query_pre_attn_scalar.powf(-0.5),
             attn_logit_softcapping: config.attn_logit_softcapping,
+            sliding_window: layer_sliding_window,
         }
     }
 
@@ -673,7 +727,19 @@ impl MlxQuantizedGemma2Attention {
             k = concatenate_axis(&[ck, k], 2)?;
             v = concatenate_axis(&[cv, v], 2)?;
         }
+        // Store the full cache (for future steps).
         *cache = Some((k.clone(), v.clone()));
+
+        // Sliding window: trim K/V to only the last `w` positions.
+        if let Some(w) = self.sliding_window {
+            let kv_len = k.dim(2) as usize;
+            if kv_len > w {
+                let start = (kv_len - w) as i32;
+                let end = kv_len as i32;
+                k = k.try_index((.., .., start..end, ..))?;
+                v = v.try_index((.., .., start..end, ..))?;
+            }
+        }
 
         let mask = if seq_len > 1 {
             Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
@@ -708,6 +774,7 @@ impl MlxQuantizedGemma2DecoderLayer {
         prefix: &str,
         config: &MlxGemma2Config,
         qc: &QuantConfig,
+        layer_sliding_window: Option<usize>,
     ) -> Result<Self, Exception> {
         let mut input_layernorm = nn::RmsNormBuilder::new(config.hidden_size as i32)
             .eps(config.rms_norm_eps)
@@ -749,6 +816,7 @@ impl MlxQuantizedGemma2DecoderLayer {
                 &format!("{prefix}.self_attn"),
                 config,
                 qc,
+                layer_sliding_window,
             ),
             mlp: MlxQuantizedGemma2MLP::from_weights(weights, &format!("{prefix}.mlp"), qc, true),
             input_layernorm,
@@ -801,11 +869,18 @@ impl MlxQuantizedGemma2ForCausalLM {
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
+            let layer_sliding_window =
+                if i < config.layer_is_sliding.len() && config.layer_is_sliding[i] {
+                    config.sliding_window
+                } else {
+                    None
+                };
             layers.push(MlxQuantizedGemma2DecoderLayer::from_weights(
                 &weights,
                 &format!("model.layers.{i}"),
                 config,
                 qc,
+                layer_sliding_window,
             )?);
         }
 
@@ -913,7 +988,7 @@ struct MlxGemmaDecoderLayer {
 impl MlxGemmaDecoderLayer {
     fn new(config: &MlxGemma2Config) -> Result<Self, Exception> {
         Ok(Self {
-            self_attn: MlxGemma2Attention::new(config)?,
+            self_attn: MlxGemma2Attention::new(config, None)?, // Gemma v1: no sliding window
             mlp: MlxGemma2MLP::new(
                 config.hidden_size as i32,
                 config.intermediate_size as i32,
@@ -1084,6 +1159,7 @@ impl MlxQuantizedGemmaDecoderLayer {
                 &format!("{prefix}.self_attn"),
                 config,
                 qc,
+                None, // Gemma v1 does not use sliding window
             ),
             mlp: MlxQuantizedGemma2MLP::from_weights(weights, &format!("{prefix}.mlp"), qc, false),
             input_layernorm,
@@ -1239,6 +1315,8 @@ mod tests {
             attn_logit_softcapping: Some(50.0),
             final_logit_softcapping: Some(30.0),
             attention_bias: false,
+            sliding_window: None,
+            layer_is_sliding: Vec::new(),
         }
     }
 
@@ -1414,6 +1492,8 @@ mod tests {
             attn_logit_softcapping: None,
             final_logit_softcapping: None,
             attention_bias: false,
+            sliding_window: None,
+            layer_is_sliding: Vec::new(),
         }
     }
 

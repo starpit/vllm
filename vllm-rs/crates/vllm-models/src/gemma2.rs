@@ -55,6 +55,12 @@ pub struct Gemma2Config {
     pub final_logit_softcapping: Option<f64>,
     /// Whether attention projections use bias.
     pub attention_bias: bool,
+    /// Sliding window size for "sliding_attention" layers. None if not set.
+    pub sliding_window: Option<usize>,
+    /// Per-layer attention type: `true` = sliding attention, `false` = full attention.
+    /// Generated from the `layer_types` config field (Gemma2 interleaved pattern).
+    /// Empty means all layers use full attention.
+    pub layer_is_sliding: Vec<bool>,
 }
 
 impl Gemma2Config {
@@ -93,13 +99,34 @@ impl Gemma2Config {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let sliding_window = config
+            .extra
+            .get("sliding_window")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        let num_hidden_layers = config
+            .num_hidden_layers
+            .ok_or_else(|| ModelError::Other("missing num_hidden_layers".into()))?;
+
+        // Parse layer_types: ["full_attention", "sliding_attention", ...].
+        // Gemma2 uses an interleaved pattern where even layers are typically
+        // "full_attention" and odd layers are "sliding_attention".
+        let layer_is_sliding =
+            if let Some(layer_types) = config.extra.get("layer_types").and_then(|v| v.as_array()) {
+                layer_types
+                    .iter()
+                    .map(|v| v.as_str() == Some("sliding_attention"))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
         Ok(Self {
             hidden_size,
             num_attention_heads,
             num_kv_heads: config.num_kv_heads().unwrap_or(num_attention_heads),
-            num_hidden_layers: config
-                .num_hidden_layers
-                .ok_or_else(|| ModelError::Other("missing num_hidden_layers".into()))?,
+            num_hidden_layers,
             intermediate_size: config
                 .intermediate_size
                 .ok_or_else(|| ModelError::Other("missing intermediate_size".into()))?,
@@ -114,6 +141,8 @@ impl Gemma2Config {
             attn_logit_softcapping,
             final_logit_softcapping,
             attention_bias,
+            sliding_window,
+            layer_is_sliding,
         })
     }
 }
@@ -216,10 +245,15 @@ pub struct Gemma2Attention {
     scale: f64,
     /// Optional soft cap for attention logits.
     attn_logit_softcapping: Option<f64>,
+    /// Per-layer sliding window. `Some(w)` for sliding-attention layers, `None` for full.
+    pub(crate) sliding_window: Option<usize>,
 }
 
 impl Gemma2Attention {
     /// Load attention weights.
+    ///
+    /// Sliding window is initialized to `None`; set `self.sliding_window` after
+    /// construction for sliding-attention layers.
     pub fn load(
         weights: &ModelWeights,
         prefix: &str,
@@ -284,10 +318,13 @@ impl Gemma2Attention {
             head_dim: config.head_dim,
             scale: config.query_pre_attn_scalar.powf(-0.5),
             attn_logit_softcapping: config.attn_logit_softcapping,
+            sliding_window: None,
         })
     }
 
     /// Create with zero weights (for testing).
+    ///
+    /// Sliding window is initialized to `None`; set `self.sliding_window` after.
     pub fn zeros(config: &Gemma2Config, dtype: DType, device: &Device) -> ModelResult<Self> {
         let hidden = config.hidden_size;
         let q_size = config.num_attention_heads * config.head_dim;
@@ -320,6 +357,7 @@ impl Gemma2Attention {
             head_dim: config.head_dim,
             scale: config.query_pre_attn_scalar.powf(-0.5),
             attn_logit_softcapping: config.attn_logit_softcapping,
+            sliding_window: None,
         })
     }
 
@@ -359,7 +397,8 @@ impl Gemma2Attention {
 
         // Cache-merge + attention (paged decode reads blocks directly).
         let _ = self.attn_logit_softcapping; // Reserved for GPU kernel integration
-        let attn_output = attention_with_cache(&q, &k, &v, self.scale, kv_cache, None)?;
+        let attn_output =
+            attention_with_cache(&q, &k, &v, self.scale, kv_cache, self.sliding_window)?;
 
         let attn_output = attn_output
             .reshape((num_tokens, self.num_q_heads * self.head_dim))
@@ -381,7 +420,7 @@ impl Gemma2Attention {
 /// - input_layernorm → attention → post_attention_layernorm
 /// - pre_feedforward_layernorm → MLP → post_feedforward_layernorm
 pub struct Gemma2DecoderLayer {
-    self_attn: Gemma2Attention,
+    pub(crate) self_attn: Gemma2Attention,
     mlp: Gemma2MLP,
     input_layernorm: GemmaRmsNorm,
     post_attention_layernorm: GemmaRmsNorm,
@@ -512,7 +551,7 @@ impl Gemma2Model {
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            let layer = Gemma2DecoderLayer::load(
+            let mut layer = Gemma2DecoderLayer::load(
                 weights,
                 &format!("{}.layers.{}", prefix, i),
                 config,
@@ -521,6 +560,10 @@ impl Gemma2Model {
                 rank,
                 world_size,
             )?;
+            // Apply per-layer sliding window from layer_is_sliding.
+            if i < config.layer_is_sliding.len() && config.layer_is_sliding[i] {
+                layer.self_attn.sliding_window = config.sliding_window;
+            }
             layers.push(layer);
         }
 
@@ -678,6 +721,8 @@ mod tests {
             attn_logit_softcapping: Some(50.0),
             final_logit_softcapping: Some(30.0),
             attention_bias: false,
+            sliding_window: None,
+            layer_is_sliding: Vec::new(),
         }
     }
 
@@ -892,6 +937,50 @@ mod tests {
     fn test_gemma2_registry() {
         let registry = crate::ModelRegistry::default_registry();
         assert!(registry.contains("Gemma2ForCausalLM"));
+    }
+
+    #[test]
+    fn test_gemma2_config_layer_types_parsing() {
+        let hf_config: HfModelConfig = serde_json::from_str(
+            r#"{
+                "architectures": ["Gemma2ForCausalLM"],
+                "model_type": "gemma2",
+                "hidden_size": 2304,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "num_hidden_layers": 4,
+                "intermediate_size": 9216,
+                "vocab_size": 256000,
+                "head_dim": 256,
+                "query_pre_attn_scalar": 256,
+                "sliding_window": 4096,
+                "layer_types": ["full_attention", "sliding_attention", "full_attention", "sliding_attention"]
+            }"#,
+        )
+        .unwrap();
+
+        let config = Gemma2Config::from_hf_config(&hf_config).unwrap();
+        assert_eq!(config.sliding_window, Some(4096));
+        assert_eq!(config.layer_is_sliding, vec![false, true, false, true]);
+    }
+
+    #[test]
+    fn test_gemma2_interleaved_sliding_window() {
+        // Layer 0 = full attention (no sliding window), layer 1 = sliding window.
+        let config = Gemma2Config {
+            sliding_window: Some(3),
+            layer_is_sliding: vec![false, true],
+            ..test_config()
+        };
+
+        // Full attention layer (default from zeros).
+        let attn_full = Gemma2Attention::zeros(&config, DType::F32, &Device::Cpu).unwrap();
+        assert!(attn_full.sliding_window.is_none());
+
+        // Sliding attention layer (set after construction).
+        let mut attn_sliding = Gemma2Attention::zeros(&config, DType::F32, &Device::Cpu).unwrap();
+        attn_sliding.sliding_window = config.sliding_window;
+        assert_eq!(attn_sliding.sliding_window, Some(3));
     }
 
     // -----------------------------------------------------------------------

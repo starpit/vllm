@@ -34,12 +34,35 @@ pub struct Qwen2Config(pub LlamaConfig);
 
 impl Qwen2Config {
     /// Parse from a HuggingFace config.json, using Qwen2 defaults.
+    ///
+    /// Qwen2 supports `max_window_layers`: when set and less than `num_hidden_layers`,
+    /// only the top layers use sliding window attention. We currently only support
+    /// uniform sliding window (all layers), so we warn and disable sliding window
+    /// if `max_window_layers < num_hidden_layers`.
     pub fn from_hf_config(config: &HfModelConfig) -> ModelResult<Self> {
         let mut llama_config = LlamaConfig::from_hf_config(config)?;
         // Qwen2 defaults to rope_theta = 1M if not specified.
         if config.rope_theta.is_none() {
             llama_config.rope_theta = 1_000_000.0;
         }
+
+        // Validate max_window_layers: if set and < num_hidden_layers, the model
+        // wants partial-layer sliding window (only top layers). We don't support
+        // that — disable sliding window and warn.
+        if config
+            .extra
+            .get("max_window_layers")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|mwl| (mwl as usize) < llama_config.num_hidden_layers)
+        {
+            eprintln!(
+                "WARN: Qwen2 config has max_window_layers < num_hidden_layers={}: \
+                 partial-layer sliding window not supported, disabling sliding window",
+                llama_config.num_hidden_layers
+            );
+            llama_config.sliding_window = None;
+        }
+
         Ok(Self(llama_config))
     }
 }
@@ -122,6 +145,50 @@ mod tests {
 
         let config = Qwen2Config::from_hf_config(&hf_config).unwrap();
         assert!((config.0.rope_theta - 1_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_qwen2_max_window_layers_full() {
+        // max_window_layers == num_hidden_layers → sliding window preserved.
+        let hf_config: HfModelConfig = serde_json::from_str(
+            r#"{
+                "architectures": ["Qwen2ForCausalLM"],
+                "hidden_size": 32,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 4,
+                "intermediate_size": 64,
+                "vocab_size": 100,
+                "sliding_window": 4096,
+                "max_window_layers": 4
+            }"#,
+        )
+        .unwrap();
+
+        let config = Qwen2Config::from_hf_config(&hf_config).unwrap();
+        assert_eq!(config.0.sliding_window, Some(4096));
+    }
+
+    #[test]
+    fn test_qwen2_max_window_layers_partial() {
+        // max_window_layers < num_hidden_layers → sliding window disabled.
+        let hf_config: HfModelConfig = serde_json::from_str(
+            r#"{
+                "architectures": ["Qwen2ForCausalLM"],
+                "hidden_size": 32,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 4,
+                "intermediate_size": 64,
+                "vocab_size": 100,
+                "sliding_window": 4096,
+                "max_window_layers": 2
+            }"#,
+        )
+        .unwrap();
+
+        let config = Qwen2Config::from_hf_config(&hf_config).unwrap();
+        assert_eq!(config.0.sliding_window, None);
     }
 
     #[test]

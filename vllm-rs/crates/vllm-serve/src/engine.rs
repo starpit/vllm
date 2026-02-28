@@ -72,6 +72,10 @@ struct RequestState {
     /// Accumulated per-token log-probabilities (if requested).
     logprobs: Vec<vllm_common::LogprobsOutput>,
 
+    /// Per-prompt-token log-probabilities (if requested). Set once during prefill.
+    /// Position 0 is None (no prior context); positions 1..n are Some.
+    prompt_logprobs: Option<Vec<Option<vllm_common::LogprobsOutput>>>,
+
     /// Streaming tool parser state (if tool parsing is active for this request).
     tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
 
@@ -375,6 +379,43 @@ impl AsyncEngine {
                     (Some(text), None, finish_reason_str)
                 };
 
+            // Build prompt logprobs if available.
+            let prompt_logprobs_content = state.prompt_logprobs.as_ref().map(|plps| {
+                plps.iter()
+                    .map(|opt_lp| {
+                        opt_lp.as_ref().map(|lp| {
+                            let token_str = self
+                                .tokenizer
+                                .as_ref()
+                                .and_then(|tok| tok.decode(&[lp.sampled.token_id], false).ok())
+                                .unwrap_or_else(|| format!("<token_{}>", lp.sampled.token_id));
+                            let top_logprobs: Vec<protocol::ChatCompletionLogProb> = lp
+                                .top_logprobs
+                                .iter()
+                                .map(|tlp| {
+                                    let t = self
+                                        .tokenizer
+                                        .as_ref()
+                                        .and_then(|tok| tok.decode(&[tlp.token_id], false).ok())
+                                        .unwrap_or_else(|| format!("<token_{}>", tlp.token_id));
+                                    protocol::ChatCompletionLogProb {
+                                        token: t,
+                                        logprob: tlp.logprob as f64,
+                                        bytes: None,
+                                    }
+                                })
+                                .collect();
+                            protocol::ChatCompletionLogProbsContent {
+                                token: token_str,
+                                logprob: lp.sampled.logprob as f64,
+                                bytes: None,
+                                top_logprobs,
+                            }
+                        })
+                    })
+                    .collect()
+            });
+
             choices.push(protocol::ChatCompletionResponseChoice {
                 index: i as u32,
                 message: protocol::ChatMessage {
@@ -390,6 +431,7 @@ impl AsyncEngine {
                     StopReason::Token(id) => serde_json::Value::Number(id.into()),
                     StopReason::String(s) => serde_json::Value::String(s),
                 }),
+                prompt_logprobs: prompt_logprobs_content,
             });
         }
 
@@ -623,6 +665,19 @@ impl AsyncEngine {
                 ))
             };
 
+            // Build prompt logprobs for completion response if available.
+            let prompt_lps = state.prompt_logprobs.as_ref().and_then(|plps| {
+                // Convert Option<LogprobsOutput> entries (skipping the None for pos 0)
+                // into a flat Vec for build_completion_logprobs.
+                let flat: Vec<vllm_common::LogprobsOutput> =
+                    plps.iter().filter_map(|opt| opt.clone()).collect();
+                if flat.is_empty() {
+                    None
+                } else {
+                    Some(build_completion_logprobs(&flat, self.tokenizer.as_deref()))
+                }
+            });
+
             choices.push(protocol::CompletionResponseChoice {
                 index: *choice_index,
                 text,
@@ -632,6 +687,7 @@ impl AsyncEngine {
                     StopReason::Token(id) => serde_json::Value::Number(id.into()),
                     StopReason::String(s) => serde_json::Value::String(s),
                 }),
+                prompt_logprobs: prompt_lps,
             });
         }
 
@@ -804,6 +860,7 @@ impl AsyncEngine {
                     itl_count: 0,
                     itl_sum: 0.0,
                     logprobs: Vec::new(),
+                    prompt_logprobs: None,
                     tool_parser_state,
                     accumulated_text: String::new(),
                     tool_calls_emitted: false,
@@ -886,6 +943,9 @@ impl AsyncEngine {
         req_state.generated_token_ids.extend(&output.new_token_ids);
         if let Some(lps) = &output.new_logprobs {
             req_state.logprobs.extend(lps.iter().cloned());
+        }
+        if let Some(plps) = output.new_prompt_logprobs {
+            req_state.prompt_logprobs = Some(plps);
         }
         let step_logprobs = output.new_logprobs.clone();
 
@@ -1313,6 +1373,7 @@ impl AsyncEngine {
             include_stop_str_in_output: request.include_stop_str_in_output,
             skip_special_tokens: request.skip_special_tokens,
             logprobs,
+            prompt_logprobs: request.prompt_logprobs.map(|n| n as i32),
             logit_bias: parse_logit_bias(&request.logit_bias),
             guided_grammar,
             ..Default::default()
@@ -1357,6 +1418,7 @@ impl AsyncEngine {
             include_stop_str_in_output: request.include_stop_str_in_output,
             skip_special_tokens: request.skip_special_tokens,
             logprobs,
+            prompt_logprobs: request.prompt_logprobs.map(|n| n as i32),
             logit_bias: parse_logit_bias(&request.logit_bias),
             guided_grammar,
             ..Default::default()
@@ -1587,6 +1649,7 @@ mod tests {
             itl_count: 0,
             itl_sum: 0.0,
             logprobs: Vec::new(),
+            prompt_logprobs: None,
             tool_parser_state: None,
             accumulated_text: String::new(),
             tool_calls_emitted: false,
@@ -1651,6 +1714,7 @@ mod tests {
             logit_bias: None,
             logprobs: None,
             top_logprobs: None,
+            prompt_logprobs: None,
             seed: Some(42),
             response_format: None,
             tools: None,
@@ -1740,6 +1804,7 @@ mod tests {
             presence_penalty: None,
             logit_bias: None,
             logprobs: None,
+            prompt_logprobs: None,
             suffix: None,
             seed: None,
             user: None,
@@ -1788,6 +1853,7 @@ mod tests {
             presence_penalty: None,
             logit_bias: None,
             logprobs: None,
+            prompt_logprobs: None,
             suffix: None,
             seed: None,
             user: None,
@@ -1827,6 +1893,7 @@ mod tests {
             num_cached_tokens: 0,
             events: None,
             new_logprobs: None,
+            new_prompt_logprobs: None,
         };
         // Should not panic.
         AsyncEngine::process_output(&mut requests, output);
@@ -1848,6 +1915,7 @@ mod tests {
                 num_cached_tokens: 0,
                 events: None,
                 new_logprobs: None,
+                new_prompt_logprobs: None,
             },
         );
 
@@ -1862,6 +1930,7 @@ mod tests {
                 num_cached_tokens: 3,
                 events: None,
                 new_logprobs: None,
+                new_prompt_logprobs: None,
             },
         );
 
@@ -1889,6 +1958,7 @@ mod tests {
                 num_cached_tokens: 0,
                 events: None,
                 new_logprobs: None,
+                new_prompt_logprobs: None,
             },
         );
 
@@ -1908,6 +1978,7 @@ mod tests {
                 num_cached_tokens: 0,
                 events: None,
                 new_logprobs: None,
+                new_prompt_logprobs: None,
             },
         );
 
@@ -1951,6 +2022,7 @@ mod tests {
                 num_cached_tokens: 0,
                 events: None,
                 new_logprobs: None,
+                new_prompt_logprobs: None,
             },
         );
 
@@ -2003,6 +2075,7 @@ mod tests {
             presence_penalty: None,
             logit_bias: None,
             logprobs: None,
+            prompt_logprobs: None,
             suffix: None,
             seed: None,
             user: None,
@@ -2222,6 +2295,7 @@ mod tests {
                 num_cached_tokens: 0,
                 events: None,
                 new_logprobs: None,
+                new_prompt_logprobs: None,
             },
         );
 

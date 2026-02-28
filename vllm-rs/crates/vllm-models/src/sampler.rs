@@ -399,7 +399,7 @@ fn apply_logit_bias(logits: &mut [f32], logit_bias: &HashMap<u32, f32>) {
 /// `logits` — temperature-scaled logits (pre-softmax, full vocab).
 /// `sampled_token_id` — the token that was sampled.
 /// `top_n` — number of top alternatives to return.
-fn compute_logprobs(logits: &[f32], sampled_token_id: u32, top_n: usize) -> LogprobsOutput {
+pub fn compute_logprobs(logits: &[f32], sampled_token_id: u32, top_n: usize) -> LogprobsOutput {
     // Compute log-softmax.
     let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let log_sum_exp: f32 = logits.iter().map(|&l| (l - max_logit).exp()).sum();
@@ -758,5 +758,85 @@ mod tests {
         let (token, _) = sampler.sample_one(&logits, &params, &[], Some(&allowed));
         // Only token 2 is allowed.
         assert_eq!(token, 2);
+    }
+
+    // ---------------------------------------------------------------
+    // Tests for prompt logprobs (compute_logprobs used for known tokens)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_compute_logprobs_for_prompt_token() {
+        // Simulate prompt logprobs: given logits at position i,
+        // the "sampled" token is the actual prompt token at position i+1.
+        let logits = vec![1.0f32, 2.0, 10.0, 0.5];
+        // If the actual prompt token is 1 (not the highest-logit token):
+        let result = compute_logprobs(&logits, 1, 3);
+
+        // Sampled token should be 1 (the prompt token, not the argmax).
+        assert_eq!(result.sampled.token_id, 1);
+        // Rank should be 2 (token 2 has higher logit).
+        assert_eq!(result.sampled.rank, 2);
+        // Logprob should be negative (not the most likely token).
+        assert!(result.sampled.logprob < 0.0);
+        // Top 3 should still be ordered by probability descending.
+        assert_eq!(result.top_logprobs.len(), 3);
+        assert_eq!(result.top_logprobs[0].token_id, 2); // highest logit
+    }
+
+    #[test]
+    fn test_prompt_logprobs_sequence() {
+        // Simulate a 4-token prompt: [A, B, C, D]
+        // logits[0] predicts B, logits[1] predicts C, logits[2] predicts D.
+        let prompt_tokens = vec![10u32, 20, 30, 40];
+        let logits_per_position = vec![
+            vec![0.0f32; 50], // position 0 → predicts token 20
+            vec![0.0f32; 50], // position 1 → predicts token 30
+            vec![0.0f32; 50], // position 2 → predicts token 40
+        ];
+
+        // Set high logits for the actual next tokens to verify correctness.
+        let mut logits0 = logits_per_position[0].clone();
+        logits0[20] = 10.0;
+        let mut logits1 = logits_per_position[1].clone();
+        logits1[30] = 10.0;
+        let mut logits2 = logits_per_position[2].clone();
+        logits2[40] = 10.0;
+
+        // Build prompt logprobs the same way the worker does.
+        let mut plps = Vec::new();
+        for (i, logits) in [logits0, logits1, logits2].iter().enumerate() {
+            let actual_token = prompt_tokens[i + 1];
+            plps.push(compute_logprobs(logits, actual_token, 2));
+        }
+
+        assert_eq!(plps.len(), 3);
+        assert_eq!(plps[0].sampled.token_id, 20);
+        assert_eq!(plps[0].sampled.rank, 1); // highest logit
+        assert_eq!(plps[1].sampled.token_id, 30);
+        assert_eq!(plps[1].sampled.rank, 1);
+        assert_eq!(plps[2].sampled.token_id, 40);
+        assert_eq!(plps[2].sampled.rank, 1);
+    }
+
+    #[test]
+    fn test_prompt_logprobs_with_none_for_first_position() {
+        // Simulate the full prompt_logprobs output format:
+        // Position 0: None (no prior context)
+        // Position 1+: Some(LogprobsOutput)
+        let logits = vec![1.0f32, 5.0, 3.0];
+        let prompt_tokens = vec![0u32, 1, 2]; // 3-token prompt
+
+        let mut result: Vec<Option<LogprobsOutput>> = Vec::new();
+        result.push(None); // position 0
+        for i in 0..prompt_tokens.len() - 1 {
+            result.push(Some(compute_logprobs(&logits, prompt_tokens[i + 1], 2)));
+        }
+
+        assert_eq!(result.len(), 3);
+        assert!(result[0].is_none());
+        assert!(result[1].is_some());
+        assert_eq!(result[1].as_ref().unwrap().sampled.token_id, 1);
+        assert!(result[2].is_some());
+        assert_eq!(result[2].as_ref().unwrap().sampled.token_id, 2);
     }
 }

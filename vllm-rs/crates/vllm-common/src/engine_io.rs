@@ -165,6 +165,14 @@ pub struct EngineCoreOutput {
     /// Skipped during serialization (only used in-process).
     #[serde(skip)]
     pub new_logprobs: Option<Vec<LogprobsOutput>>,
+
+    /// Per-position log-probabilities for the prompt tokens.
+    /// Only populated on the prefill step when `SamplingParams.prompt_logprobs`
+    /// is set. Position 0 is `None` (no prior context); positions 1..n have
+    /// `Some(LogprobsOutput)` where `.sampled` is the actual prompt token.
+    /// Skipped during serialization (only used in-process).
+    #[serde(skip)]
+    pub new_prompt_logprobs: Option<Vec<Option<LogprobsOutput>>>,
 }
 
 impl EngineCoreOutput {
@@ -369,6 +377,7 @@ mod tests {
             num_cached_tokens: 10,
             events: None,
             new_logprobs: None,
+            new_prompt_logprobs: None,
         };
         assert!(!out.finished());
     }
@@ -386,6 +395,7 @@ mod tests {
                 EngineCoreEvent::new(EngineCoreEventType::Scheduled, 2.0),
             ]),
             new_logprobs: None,
+            new_prompt_logprobs: None,
         };
         assert!(out.finished());
         assert_eq!(out.finish_reason, Some(FinishReason::Stop));
@@ -402,6 +412,7 @@ mod tests {
             num_cached_tokens: 5,
             events: None,
             new_logprobs: None,
+            new_prompt_logprobs: None,
         };
         let json = serde_json::to_string(&out).unwrap();
         let out2: EngineCoreOutput = serde_json::from_str(&json).unwrap();
@@ -435,6 +446,7 @@ mod tests {
                     num_cached_tokens: 0,
                     events: None,
                     new_logprobs: None,
+                    new_prompt_logprobs: None,
                 },
                 EngineCoreOutput {
                     request_id: "b".into(),
@@ -444,6 +456,7 @@ mod tests {
                     num_cached_tokens: 3,
                     events: None,
                     new_logprobs: None,
+                    new_prompt_logprobs: None,
                 },
             ],
             timestamp: 1234.5,
@@ -488,6 +501,7 @@ mod tests {
                 num_cached_tokens: 0,
                 events: Some(vec![EngineCoreEvent::new(EngineCoreEventType::Queued, 0.5)]),
                 new_logprobs: None,
+                new_prompt_logprobs: None,
             }],
             timestamp: 42.0,
             scheduler_stats: None,

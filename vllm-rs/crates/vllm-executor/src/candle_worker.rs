@@ -960,6 +960,8 @@ impl Worker for CandleWorker {
         let mut sampler = Sampler::new();
         let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
         let mut logprobs_map: HashMap<String, Vec<vllm_common::LogprobsOutput>> = HashMap::new();
+        let mut prompt_logprobs_map: HashMap<String, Vec<vllm_common::LogprobsOutput>> =
+            HashMap::new();
         let any_logprobs_requested = req_inputs.iter().any(|r| {
             self.sampling_params_map
                 .get(&r.req_id)
@@ -1025,6 +1027,34 @@ impl Worker for CandleWorker {
                     })?
                 }
             };
+
+            // Compute prompt logprobs if requested and this is a prefill
+            // (more than 1 input token). logits[i] predicts token_ids[i+1].
+            if req_input.token_ids.len() > 1
+                && let Some(params) = self.sampling_params_map.get(&req_input.req_id)
+                && let Some(top_n) = params.prompt_logprobs
+            {
+                let top_n = top_n.max(0) as usize;
+                let num_positions = req_input.token_ids.len() - 1;
+                // Extract logits for positions 0..n-1 → predict tokens 1..n
+                let prefix_logits = logits
+                    .narrow(0, 0, num_positions)
+                    .and_then(|t| t.to_dtype(DType::F32))
+                    .and_then(|t| t.to_vec2::<f32>())
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("prompt logprobs tensor error: {e}"))
+                    })?;
+                let mut plps = Vec::with_capacity(num_positions);
+                for (i, row) in prefix_logits.iter().enumerate() {
+                    let actual_token = req_input.token_ids[i + 1];
+                    plps.push(vllm_models::sampler::compute_logprobs(
+                        row,
+                        actual_token,
+                        top_n,
+                    ));
+                }
+                prompt_logprobs_map.insert(req_input.req_id.clone(), plps);
+            }
 
             // Take logits at the last position and sample.
             let last_pos = req_input.token_ids.len() - 1;
@@ -1100,6 +1130,7 @@ impl Worker for CandleWorker {
                 .collect();
             output.logprobs = Some(logprobs_vec);
         }
+        output.prompt_logprobs_dict = prompt_logprobs_map;
         Ok(output)
     }
 

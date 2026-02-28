@@ -187,6 +187,7 @@ mod tests {
                 EngineCoreEvent::new(EngineCoreEventType::Scheduled, 1.5),
             ]),
             new_logprobs: None,
+            new_prompt_logprobs: None,
         };
 
         let encoded = encode(&out).unwrap();
@@ -213,6 +214,7 @@ mod tests {
                     num_cached_tokens: 0,
                     events: None,
                     new_logprobs: None,
+                    new_prompt_logprobs: None,
                 },
                 EngineCoreOutput {
                     request_id: "b".into(),
@@ -222,6 +224,7 @@ mod tests {
                     num_cached_tokens: 10,
                     events: None,
                     new_logprobs: None,
+                    new_prompt_logprobs: None,
                 },
             ],
             timestamp: 1234.5,
@@ -248,6 +251,7 @@ mod tests {
             num_cached_tokens: 0,
             events: None,
             new_logprobs: None,
+            new_prompt_logprobs: None,
         };
 
         let encoded = encode(&out).unwrap();

@@ -249,6 +249,10 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_logprobs: Option<u32>,
 
+    /// Number of per-prompt-token log-probabilities to return (vLLM extension).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_logprobs: Option<u32>,
+
     /// Random seed for deterministic generation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
@@ -399,6 +403,10 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<u32>,
 
+    /// Number of per-prompt-token log-probabilities to return (vLLM extension).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_logprobs: Option<u32>,
+
     /// Text to append after the completion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suffix: Option<String>,
@@ -538,6 +546,9 @@ pub struct ChatCompletionResponseChoice {
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<serde_json::Value>,
+    /// Per-prompt-token log-probabilities (vLLM extension).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_logprobs: Option<Vec<Option<ChatCompletionLogProbsContent>>>,
 }
 
 /// Chat completion response.
@@ -654,6 +665,9 @@ pub struct CompletionResponseChoice {
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<serde_json::Value>,
+    /// Per-prompt-token log-probabilities (vLLM extension).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_logprobs: Option<CompletionLogProbs>,
 }
 
 /// Completion response.
@@ -982,6 +996,7 @@ mod tests {
                 logprobs: None,
                 finish_reason: Some("stop".to_string()),
                 stop_reason: None,
+                prompt_logprobs: None,
             }],
             UsageInfo {
                 prompt_tokens: 5,
@@ -1062,6 +1077,7 @@ mod tests {
                 logprobs: None,
                 finish_reason: Some("stop".to_string()),
                 stop_reason: None,
+                prompt_logprobs: None,
             }],
             UsageInfo {
                 prompt_tokens: 3,

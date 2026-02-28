@@ -38,7 +38,7 @@
 | [Model Architectures](#model-architectures) | &#x1F535; | &#x1F7E1; | 100 | 25 | `███░░░░░░░` 11/36 |
 | [Quantization](#quantization) | &#x1F535; | &#x1F7E1; | 13 | 0 | `█░░░░░░░░░` 1/11 |
 | [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | 96 | 18 | `██████░░░░` 14/25 |
-| [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | 49 | 12 | `████████░░` 18/21 |
+| [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | 53 | 13 | `█████████░` 19/21 |
 | [KV Cache & Attention](#kv-cache--attention) | &#x1F535; | &#x1F7E1; | 96 | 0 | `█████░░░░░` 9/19 |
 | [Scheduling](#scheduling) | &#x1F535; | &#x1F7E1; | 67 | 0 | `████████░░` 8/10 |
 | [Hardware Backends](#hardware-backends) | &#x1F535; | &#x1F7E1; | 28 | 2 | `████░░░░░░` 3/8 |
@@ -52,7 +52,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/6 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | 15 | 0 | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | 14 | 0 | `██████████` 14/15 |
-| | | **Total** | **560** | **57** | `█████░░░░░` **101/199** |
+| | | **Total** | **564** | **58** | `█████░░░░░` **102/199** |
 
 ---
 
@@ -205,7 +205,7 @@
 | Frequency penalty | &#x1F535; | &#x1F535; | 2 | 1 | |
 | Presence penalty | &#x1F535; | &#x1F535; | 2 | 1 | |
 | Logprobs | &#x1F535; | &#x1F535; | 5 | 1 | |
-| Prompt logprobs | &#x1F535; | &#x1F534; | — | — | P3 |
+| Prompt logprobs | &#x1F535; | &#x1F535; | 4 | 1 | |
 | Logit bias | &#x1F535; | &#x1F535; | 3 | 0 | |
 | Beam search | &#x1F535; | &#x1F534; | — | — | P1 |
 | `best_of` | &#x1F535; | &#x1F534; | — | — | P2 |
@@ -218,7 +218,7 @@
 | Seed (reproducible sampling) | &#x1F535; | &#x1F535; | 2 | 1 | |
 | Guided decoding (grammar/regex/JSON) | &#x1F535; | &#x1F535; | 6 | 0 | P4 |
 
-> Unit counts drawn from `sampling.rs` (27 tests — validation, serde, types) and `sampler.rs` (21 tests — greedy, temperature, top-k/p, min-p, penalties, logprobs, grammar mask). Guided decoding unit tests count API-level resolve/conflict tests in `engine.rs`; grammar engine tests are in the [Structured Output](#structured-output--guided-decoding) section.
+> Unit counts drawn from `sampling.rs` (27 tests — validation, serde, types) and `sampler.rs` (24 tests — greedy, temperature, top-k/p, min-p, penalties, logprobs, prompt logprobs, grammar mask), plus 1 engine propagation test. Guided decoding unit tests count API-level resolve/conflict tests in `engine.rs`; grammar engine tests are in the [Structured Output](#structured-output--guided-decoding) section.
 
 ---
 

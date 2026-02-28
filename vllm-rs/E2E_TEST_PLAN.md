@@ -200,6 +200,7 @@ Deep testing of the `/v1/chat/completions` endpoint using SmolLM-135M (fastest m
 | `test_chat_stop_token` | stop_token_ids with EOS → output stops |
 | `test_chat_seed` | seed=42 → deterministic across calls |
 | `test_chat_logprobs` | logprobs=true, top_logprobs=5 → logprobs in response |
+| **`test_chat_prompt_logprobs`** | **DONE** — prompt_logprobs=3 → per-prompt-token logprobs in response, position 0 is None |
 | `test_chat_logit_bias` | logit_bias suppresses specific token → token doesn't appear |
 | `test_chat_frequency_penalty` | frequency_penalty=2.0 → less repetition |
 | `test_chat_presence_penalty` | presence_penalty=2.0 → output is valid |
@@ -407,6 +408,7 @@ Validate sampling parameters work end-to-end with real models.
 | `test_logprobs_top_5` | top_logprobs=5 → each token has 5 top alternatives |
 | `test_logprobs_stream` | stream + logprobs → logprobs in each chunk |
 | `test_logprobs_completion` | completions + logprobs → logprobs in response |
+| **`test_logprobs_prompt`** | **DONE** — prompt_logprobs=3 → per-prompt-token logprobs, first is None (see `test_chat_prompt_logprobs` in E2) |
 
 ### E7b. Determinism
 

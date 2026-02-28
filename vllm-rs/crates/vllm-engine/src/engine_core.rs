@@ -337,6 +337,19 @@ impl EngineCore {
                 })
                 .and_then(|opt| opt.clone());
 
+            // Extract prompt logprobs for this request if available.
+            let new_prompt_logprobs = model_output.prompt_logprobs_dict.get(req_id).map(|plp| {
+                // Wrap in Option: first position is None (no prior context),
+                // rest are Some.
+                let mut result: Vec<Option<vllm_common::LogprobsOutput>> =
+                    Vec::with_capacity(plp.len() + 1);
+                result.push(None); // position 0
+                for lp in plp {
+                    result.push(Some(lp.clone()));
+                }
+                result
+            });
+
             // Build the output for this request.
             let output = EngineCoreOutput {
                 request_id: req_id.clone(),
@@ -346,6 +359,7 @@ impl EngineCore {
                 num_cached_tokens: 0,
                 events: None,
                 new_logprobs,
+                new_prompt_logprobs,
             };
 
             // Route to client_index 0 (default for single-client mode).
@@ -387,6 +401,7 @@ impl EngineCore {
                         num_cached_tokens: 0,
                         events: None,
                         new_logprobs: None,
+                        new_prompt_logprobs: None,
                     });
                 }
             }
@@ -947,5 +962,73 @@ mod tests {
             }
         }
         assert!(finished, "Request should stop on secondary EOS token ID");
+    }
+
+    #[test]
+    fn test_prompt_logprobs_propagation() {
+        use vllm_common::sampling::{LogprobsOutput, TokenLogprob};
+
+        // Simulate a ModelRunnerOutput with prompt_logprobs_dict populated.
+        let mut prompt_logprobs_dict = std::collections::HashMap::new();
+        prompt_logprobs_dict.insert(
+            "req-1".to_string(),
+            vec![
+                LogprobsOutput {
+                    sampled: TokenLogprob {
+                        token_id: 20,
+                        logprob: -0.5,
+                        rank: 1,
+                    },
+                    top_logprobs: vec![],
+                },
+                LogprobsOutput {
+                    sampled: TokenLogprob {
+                        token_id: 30,
+                        logprob: -1.2,
+                        rank: 2,
+                    },
+                    top_logprobs: vec![],
+                },
+            ],
+        );
+
+        let model_output = ModelRunnerOutput {
+            req_ids: vec!["req-1".to_string()],
+            req_id_to_index: [("req-1".to_string(), 0)].into_iter().collect(),
+            sampled_token_ids: vec![vec![42]],
+            logprobs: None,
+            prompt_logprobs_dict,
+            draft_token_ids: None,
+        };
+
+        // Set up engine.
+        let config = make_test_config();
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        // Add a request so the scheduler has it.
+        let req = make_request("req-1", 10);
+        engine.add_request(req);
+
+        // Schedule it.
+        let scheduler_output = engine.scheduler.schedule();
+
+        // Manually call update_from_output with our test model_output.
+        let outputs = engine.update_from_output(&scheduler_output, &model_output);
+
+        // Check that prompt logprobs are propagated.
+        let client_out = outputs.get(&0).unwrap();
+        let req_out = client_out
+            .outputs
+            .iter()
+            .find(|o| o.request_id == "req-1")
+            .unwrap();
+
+        let plps = req_out.new_prompt_logprobs.as_ref().unwrap();
+        // Position 0 is None, positions 1-2 are Some.
+        assert_eq!(plps.len(), 3);
+        assert!(plps[0].is_none());
+        assert_eq!(plps[1].as_ref().unwrap().sampled.token_id, 20);
+        assert_eq!(plps[2].as_ref().unwrap().sampled.token_id, 30);
     }
 }

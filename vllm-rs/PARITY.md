@@ -30,11 +30,11 @@
 | [Speculative Decoding](#speculative-decoding) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/5 |
 | [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F535; | &#x2795; | `░░░░░░░░░░` 0/10 |
 | [Structured Output](#structured-output--guided-decoding) | &#x1F535; | &#x1F7E1; | `███████░░░` 3/4 |
-| [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x1F7E1; | `█████░░░░░` 5/6 |
+| [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x1F535; | `██████████` 7/7 |
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/4 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F7E1; | `█████████░` 6/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | `██████████` 14/15 |
-| | | **Total** | `█████░░░░░` **95/198** |
+| | | **Total** | `█████░░░░░` **97/199** |
 
 ---
 
@@ -354,9 +354,10 @@
 | Model-emitted tool call parsing | &#x1F535; | &#x1F535; |
 | `tool_calls` in response | &#x1F535; | &#x1F535; |
 | Streaming tool call deltas | &#x1F535; | &#x1F535; |
-| Parallel tool calls | &#x1F535; | &#x2795; |
+| Parallel tool calls | &#x1F535; | &#x1F535; |
+| `tool_choice: {function: {name}}` validation | &#x1F535; | &#x1F535; |
 
-> Tool calling is fully functional end-to-end (Phases 12a+12b). Chat templates pass tool definitions to models; HermesToolParser (`<tool_call>` tags) and LlamaJsonToolParser (raw JSON / `<|python_tag|>`) extract structured `ToolCall` objects from model output. Streaming tool call deltas supported. Use `--tool-call-parser hermes|llama3_json`. Parallel tool calls (multiple tool calls in one response) work; forced single-tool choice (`tool_choice: {function: {name}}`) validation is not yet implemented.
+> Tool calling is fully functional end-to-end (Phases 12a+12b). Chat templates pass tool definitions to models; HermesToolParser (`<tool_call>` tags) and LlamaJsonToolParser (raw JSON / `<|python_tag|>`) extract structured `ToolCall` objects from model output. Streaming tool call deltas supported. Use `--tool-call-parser hermes|llama3_json`. Parallel tool calls (multiple tool calls in one response) work. Forced single-tool choice (`tool_choice: {function: {name}}`) filters extracted tool calls by function name in both streaming and non-streaming paths.
 
 ---
 

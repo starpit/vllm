@@ -80,6 +80,9 @@ struct RequestState {
 
     /// Whether any tool call deltas have been emitted (for setting finish_reason).
     tool_calls_emitted: bool,
+
+    /// Forced function name from `tool_choice: {function: {name}}` (for filtering).
+    forced_function_name: Option<String>,
 }
 
 /// A delta sent to a streaming response.
@@ -297,6 +300,7 @@ impl AsyncEngine {
                 detokenizer,
                 i as u32,
                 None, // no streaming tool parser for non-streaming requests
+                None,
             )
             .await?;
 
@@ -340,11 +344,27 @@ impl AsyncEngine {
                     if request.tools.is_some() && !is_tool_choice_none(&request.tool_choice) {
                         let extracted = parser.extract_tool_calls(&text);
                         if extracted.tools_called {
-                            (
-                                extracted.content,
-                                Some(extracted.tool_calls),
-                                "tool_calls".to_string(),
-                            )
+                            // Filter by forced function name if tool_choice specifies one.
+                            let tool_calls = if let Some(forced) =
+                                get_tool_choice_function_name(&request.tool_choice)
+                            {
+                                extracted
+                                    .tool_calls
+                                    .into_iter()
+                                    .filter(|tc| tc.function.name == forced)
+                                    .collect::<Vec<_>>()
+                            } else {
+                                extracted.tool_calls
+                            };
+                            if tool_calls.is_empty() {
+                                (Some(text), None, finish_reason_str)
+                            } else {
+                                (
+                                    extracted.content,
+                                    Some(tool_calls),
+                                    "tool_calls".to_string(),
+                                )
+                            }
                         } else {
                             (Some(text), None, finish_reason_str)
                         }
@@ -426,6 +446,8 @@ impl AsyncEngine {
             && request.tools.is_some()
             && !is_tool_choice_none(&request.tool_choice);
 
+        let forced_fn = get_tool_choice_function_name(&request.tool_choice);
+
         // All n children share one channel.
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -471,6 +493,7 @@ impl AsyncEngine {
                 detokenizer,
                 i as u32,
                 tool_state,
+                forced_fn.clone(),
             )
             .await?;
         }
@@ -563,6 +586,7 @@ impl AsyncEngine {
                     detokenizer,
                     choice_index,
                     None, // no tool parsing for completions
+                    None,
                 )
                 .await?;
 
@@ -747,6 +771,7 @@ impl AsyncEngine {
         detokenizer: Option<IncrementalDetokenizer>,
         choice_index: u32,
         tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
+        forced_function_name: Option<String>,
     ) -> ServeResult<()> {
         let metrics = crate::metrics::VllmMetrics::global();
         metrics.requests_active.inc();
@@ -774,6 +799,7 @@ impl AsyncEngine {
                     tool_parser_state,
                     accumulated_text: String::new(),
                     tool_calls_emitted: false,
+                    forced_function_name,
                 },
             );
         }
@@ -917,17 +943,33 @@ impl AsyncEngine {
                             let _ = tx.send(delta);
                         }
                         ToolParserDelta::ToolCalls(tool_deltas) => {
-                            req_state.tool_calls_emitted = true;
-                            let delta = StreamDelta {
-                                index: req_state.choice_index,
-                                new_token_ids: output.new_token_ids.clone(),
-                                text: None,
-                                finish_reason: None,
-                                stop_reason: None,
-                                logprobs: step_logprobs.clone(),
-                                tool_call_deltas: Some(tool_deltas),
-                            };
-                            let _ = tx.send(delta);
+                            // Filter by forced function name if specified.
+                            let tool_deltas =
+                                if let Some(ref forced) = req_state.forced_function_name {
+                                    tool_deltas
+                                        .into_iter()
+                                        .filter(|d| {
+                                            d.function_name.as_ref().is_none_or(|n| n == forced)
+                                        })
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    tool_deltas
+                                };
+                            if tool_deltas.is_empty() {
+                                // Filtered out — don't emit.
+                            } else {
+                                req_state.tool_calls_emitted = true;
+                                let delta = StreamDelta {
+                                    index: req_state.choice_index,
+                                    new_token_ids: output.new_token_ids.clone(),
+                                    text: None,
+                                    finish_reason: None,
+                                    stop_reason: None,
+                                    logprobs: step_logprobs.clone(),
+                                    tool_call_deltas: Some(tool_deltas),
+                                };
+                                let _ = tx.send(delta);
+                            }
                         }
                         ToolParserDelta::None => {
                             // Buffering, don't send anything yet.
@@ -1455,6 +1497,16 @@ fn is_tool_choice_none(tool_choice: &Option<serde_json::Value>) -> bool {
     tool_choice.as_ref().and_then(|v| v.as_str()) == Some("none")
 }
 
+/// Extract the forced function name from `tool_choice`, if it specifies one.
+///
+/// OpenAI format: `{"type": "function", "function": {"name": "get_weather"}}`
+fn get_tool_choice_function_name(tool_choice: &Option<serde_json::Value>) -> Option<String> {
+    let val = tool_choice.as_ref()?;
+    let obj = val.as_object()?;
+    let func = obj.get("function")?.as_object()?;
+    func.get("name")?.as_str().map(|s| s.to_string())
+}
+
 /// Generate placeholder text from token IDs (used when no tokenizer is available).
 fn placeholder_text(token_ids: &[u32]) -> String {
     use std::fmt::Write;
@@ -1499,6 +1551,7 @@ mod tests {
             tool_parser_state: None,
             accumulated_text: String::new(),
             tool_calls_emitted: false,
+            forced_function_name: None,
         }
     }
 
@@ -2202,5 +2255,55 @@ mod tests {
         };
         let result = parse_response_format(&Some(rf));
         assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // tool_choice helper tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_is_tool_choice_none_with_none_value() {
+        assert!(!is_tool_choice_none(&None));
+    }
+
+    #[test]
+    fn test_is_tool_choice_none_with_none_string() {
+        assert!(is_tool_choice_none(&Some(serde_json::json!("none"))));
+    }
+
+    #[test]
+    fn test_is_tool_choice_none_with_auto() {
+        assert!(!is_tool_choice_none(&Some(serde_json::json!("auto"))));
+    }
+
+    #[test]
+    fn test_get_tool_choice_function_name_none() {
+        assert_eq!(get_tool_choice_function_name(&None), None);
+    }
+
+    #[test]
+    fn test_get_tool_choice_function_name_auto() {
+        assert_eq!(
+            get_tool_choice_function_name(&Some(serde_json::json!("auto"))),
+            None
+        );
+    }
+
+    #[test]
+    fn test_get_tool_choice_function_name_object() {
+        let tc = serde_json::json!({
+            "type": "function",
+            "function": {"name": "get_weather"}
+        });
+        assert_eq!(
+            get_tool_choice_function_name(&Some(tc)),
+            Some("get_weather".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_tool_choice_function_name_missing_name() {
+        let tc = serde_json::json!({"type": "function", "function": {}});
+        assert_eq!(get_tool_choice_function_name(&Some(tc)), None);
     }
 }

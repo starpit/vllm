@@ -975,7 +975,7 @@ The model generates tool calls as text (JSON blocks, special tokens, or model-sp
 - [x] Streaming: route through `process_delta()` state machine; emit content or tool call deltas; set `finish_reason: "tool_calls"` on completion
 - [x] `server.rs`: convert `DeltaToolCall` to OpenAI protocol JSON; suppress content when tool calls active
 - [x] When `tool_choice: "none"`, skip tool parsing entirely
-- [ ] When `tool_choice: { function: { name } }`, validate that the parsed tool call matches the requested function (not yet implemented)
+- [x] When `tool_choice: { function: { name } }`, validate that the parsed tool call matches the requested function — non-streaming filters extracted tool calls, streaming filters deltas by function name
 
 **Key files (Python reference)**: `vllm/entrypoints/openai/tool_parsers/` — contains Hermes, Mistral, LLaMA, Jamba, and other model-specific parsers. The streaming logic in Python is complex; start with non-streaming, then add streaming.
 

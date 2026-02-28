@@ -14,7 +14,7 @@ use std::path::Path;
 
 use mlx_rs::builder::Builder;
 use mlx_rs::error::Exception;
-use mlx_rs::module::Module;
+use mlx_rs::module::{Module, Param};
 use mlx_rs::nn;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::ops::indexing::TryIndexOp;
@@ -22,6 +22,9 @@ use mlx_rs::{Array, Dtype};
 
 use crate::cache::MlxKvCache;
 use crate::models::llama::{MlxLlamaMLP, assign_weight, load_safetensors_weights};
+use crate::models::quantized_llama::{
+    MlxEmbedTokens, MlxLmHead, MlxQuantizedLlamaMLP, QuantConfig, make_quantized_linear,
+};
 use vllm_model::weight::HfModelConfig;
 
 // ---------------------------------------------------------------------------
@@ -738,6 +741,633 @@ pub fn create_mlx_deepseek_v2(
     Ok(Box::new(model))
 }
 
+// ===========================================================================
+// Quantized variant
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// MlxQuantizedDeepSeekV2Attention (MLA, quantized)
+// ---------------------------------------------------------------------------
+
+/// Quantized DeepSeek V2 Multi-head Latent Attention for MLX.
+struct MlxQuantizedDeepSeekV2Attention {
+    // Q path.
+    q_a_proj: Option<nn::QuantizedLinear>,
+    q_a_layernorm: Option<nn::RmsNorm>,
+    q_b_proj: Option<nn::QuantizedLinear>,
+    q_proj: Option<nn::QuantizedLinear>,
+
+    // KV path.
+    kv_a_proj_with_mqa: nn::QuantizedLinear,
+    kv_a_layernorm: nn::RmsNorm,
+    kv_b_proj: nn::QuantizedLinear,
+
+    // Output.
+    o_proj: nn::QuantizedLinear,
+
+    // RoPE for the rope dimensions only.
+    rope: nn::Rope,
+
+    // Dimensions.
+    num_heads: usize,
+    qk_nope_head_dim: usize,
+    qk_rope_head_dim: usize,
+    qk_head_dim: usize,
+    v_head_dim: usize,
+    kv_lora_rank: usize,
+    scale: f32,
+}
+
+impl MlxQuantizedDeepSeekV2Attention {
+    fn from_weights(
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        config: &MlxDeepSeekV2Config,
+        qc: &QuantConfig,
+    ) -> Result<Self, Exception> {
+        let num_heads = config.num_attention_heads;
+        let qk_nope_head_dim = config.qk_nope_head_dim;
+        let qk_rope_head_dim = config.qk_rope_head_dim;
+        let v_head_dim = config.v_head_dim;
+        let kv_lora_rank = config.kv_lora_rank;
+        let qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+
+        let (q_a_proj, q_a_layernorm, q_b_proj, q_proj) = if let Some(q_lora_rank) =
+            config.q_lora_rank
+        {
+            let q_a = make_quantized_linear(
+                weights,
+                &format!("{prefix}.q_a_proj"),
+                qc.group_size,
+                qc.bits,
+            );
+            let mut q_a_ln = nn::RmsNormBuilder::new(q_lora_rank as i32)
+                .eps(config.rms_norm_eps)
+                .build()?;
+            if let Some(w) = weights.get(&format!("{prefix}.q_a_layernorm.weight")) {
+                q_a_ln.weight.value = w.clone();
+            }
+            let q_b = make_quantized_linear(
+                weights,
+                &format!("{prefix}.q_b_proj"),
+                qc.group_size,
+                qc.bits,
+            );
+            (Some(q_a), Some(q_a_ln), Some(q_b), None)
+        } else {
+            let q =
+                make_quantized_linear(weights, &format!("{prefix}.q_proj"), qc.group_size, qc.bits);
+            (None, None, None, Some(q))
+        };
+
+        let kv_a_proj_with_mqa = make_quantized_linear(
+            weights,
+            &format!("{prefix}.kv_a_proj_with_mqa"),
+            qc.group_size,
+            qc.bits,
+        );
+        let mut kv_a_layernorm = nn::RmsNormBuilder::new(kv_lora_rank as i32)
+            .eps(config.rms_norm_eps)
+            .build()?;
+        if let Some(w) = weights.get(&format!("{prefix}.kv_a_layernorm.weight")) {
+            kv_a_layernorm.weight.value = w.clone();
+        }
+        let kv_b_proj = make_quantized_linear(
+            weights,
+            &format!("{prefix}.kv_b_proj"),
+            qc.group_size,
+            qc.bits,
+        );
+
+        let o_proj =
+            make_quantized_linear(weights, &format!("{prefix}.o_proj"), qc.group_size, qc.bits);
+
+        let rope = {
+            let mut r = nn::Rope::new(qk_rope_head_dim as i32);
+            r.base = config.rope_theta;
+            r
+        };
+
+        let scale = 1.0 / (qk_head_dim as f32).sqrt();
+
+        Ok(Self {
+            q_a_proj,
+            q_a_layernorm,
+            q_b_proj,
+            q_proj,
+            kv_a_proj_with_mqa,
+            kv_a_layernorm,
+            kv_b_proj,
+            o_proj,
+            rope,
+            num_heads,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            qk_head_dim,
+            v_head_dim,
+            kv_lora_rank,
+            scale,
+        })
+    }
+
+    fn forward(
+        &mut self,
+        hidden_states: &Array,
+        positions: &Array,
+        cache: &mut Option<(Array, Array)>,
+    ) -> Result<Array, Exception> {
+        let seq_len = hidden_states.dim(0);
+
+        // --- Q path ---
+        let q_full = if let (Some(q_a), Some(q_a_ln), Some(q_b)) = (
+            self.q_a_proj.as_mut(),
+            self.q_a_layernorm.as_mut(),
+            self.q_b_proj.as_mut(),
+        ) {
+            let q_latent = q_a.forward(hidden_states)?;
+            let q_latent = q_a_ln.forward(&q_latent)?;
+            q_b.forward(&q_latent)?
+        } else {
+            self.q_proj.as_mut().unwrap().forward(hidden_states)?
+        };
+
+        let q = q_full.reshape(&[seq_len, self.num_heads as i32, self.qk_head_dim as i32])?;
+
+        let q_parts = q.split_axis(&[self.qk_nope_head_dim as i32], -1)?;
+        let q_nope = &q_parts[0];
+        let q_pe = &q_parts[1];
+
+        // --- KV path ---
+        let kv_a = self.kv_a_proj_with_mqa.forward(hidden_states)?;
+
+        let kv_a_parts = kv_a.split_axis(&[self.kv_lora_rank as i32], -1)?;
+        let kv_latent = &kv_a_parts[0];
+        let k_pe = &kv_a_parts[1];
+
+        let kv_latent = self.kv_a_layernorm.forward(kv_latent)?;
+        let kv_b = self.kv_b_proj.forward(&kv_latent)?;
+
+        let kv_b_total = self.qk_nope_head_dim + self.v_head_dim;
+        let kv_b = kv_b.reshape(&[seq_len, self.num_heads as i32, kv_b_total as i32])?;
+
+        let kv_b_parts = kv_b.split_axis(&[self.qk_nope_head_dim as i32], -1)?;
+        let k_nope = &kv_b_parts[0];
+        let v = &kv_b_parts[1];
+
+        // --- Apply RoPE to q_pe and k_pe ---
+        let q_pe = q_pe.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let k_pe = k_pe
+            .reshape(&[seq_len, 1, self.qk_rope_head_dim as i32])?
+            .transpose_axes(&[1, 0, 2])?
+            .expand_dims(0)?;
+
+        let offset = if positions.size() > 0 {
+            positions.reshape(&[-1])?.min(None)?.item::<i32>()
+        } else {
+            0
+        };
+        let q_pe = self.rope.forward((&q_pe, offset))?;
+        let k_pe = self.rope.forward((&k_pe, offset))?;
+
+        let q_pe = q_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
+        let k_pe = k_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
+
+        // --- Assemble full Q and K ---
+        let q = concatenate_axis(&[q_nope, &q_pe], 2)?;
+
+        let k_pe = mlx_rs::ops::broadcast_to(
+            &k_pe,
+            &[seq_len, self.num_heads as i32, self.qk_rope_head_dim as i32],
+        )?;
+        let k = concatenate_axis(&[k_nope, &k_pe], 2)?;
+
+        // --- Pad V to qk_head_dim ---
+        let v_padded = if self.v_head_dim < self.qk_head_dim {
+            let pad_size = self.qk_head_dim - self.v_head_dim;
+            let padding =
+                mlx_rs::ops::zeros::<f32>(&[seq_len, self.num_heads as i32, pad_size as i32])?;
+            let padding = padding.as_dtype(v.dtype())?;
+            concatenate_axis(&[v, &padding], 2)?
+        } else {
+            v.clone()
+        };
+
+        // --- Transform to SDPA layout: [1, heads, seq, head_dim] ---
+        let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let mut v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+
+        // KV cache update
+        if let Some((ck, cv)) = cache.take() {
+            k = concatenate_axis(&[ck, k], 2)?;
+            v_sdpa = concatenate_axis(&[cv, v_sdpa], 2)?;
+        }
+        *cache = Some((k.clone(), v_sdpa.clone()));
+
+        // Fused SDPA
+        let mask = if seq_len > 1 {
+            Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
+        } else {
+            None
+        };
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v_sdpa, self.scale, mask)?;
+
+        // --- Slice V back from padded dim ---
+        let out = if self.v_head_dim < self.qk_head_dim {
+            let parts = out.split_axis(&[self.v_head_dim as i32], -1)?;
+            parts.into_iter().next().unwrap()
+        } else {
+            out
+        };
+
+        // [1, heads, seq, v_head_dim] -> [seq, heads * v_head_dim]
+        let hidden = (self.num_heads * self.v_head_dim) as i32;
+        let out = out
+            .squeeze_axes(&[0])?
+            .transpose_axes(&[1, 0, 2])?
+            .reshape(&[seq_len, hidden])?;
+
+        self.o_proj.forward(&out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MlxQuantizedDeepSeekV2MoE
+// ---------------------------------------------------------------------------
+
+/// Quantized Mixture of Experts layer with optional shared experts.
+///
+/// MLX quantized models store routed experts as fused 3D `switch_mlp` tensors
+/// (shape `[n_experts, out, in_packed]`) rather than per-expert `experts.{i}`
+/// weights.  The gate (router) is a regular float linear, not quantized.
+struct MlxQuantizedDeepSeekV2MoE {
+    /// Gate (router) — float linear, not quantized.
+    gate: nn::Linear,
+    experts: Vec<MlxQuantizedLlamaMLP>,
+    shared_experts: Option<MlxQuantizedLlamaMLP>,
+    top_k: usize,
+    norm_topk_prob: bool,
+    routed_scaling_factor: f32,
+}
+
+/// Slice expert `i` from a fused 3D quantized weight tensor triplet.
+fn slice_quantized_linear(
+    w3d: Option<&Array>,
+    s3d: Option<&Array>,
+    b3d: Option<&Array>,
+    idx: i32,
+    qc: &QuantConfig,
+) -> nn::QuantizedLinear {
+    let slice_or_zero = |arr: Option<&Array>| {
+        arr.and_then(|t| t.try_index(idx).ok())
+            .unwrap_or(Array::from_f32(0.0))
+    };
+
+    nn::QuantizedLinear {
+        group_size: qc.group_size,
+        bits: qc.bits,
+        scales: Param::new(slice_or_zero(s3d)),
+        biases: Param::new(slice_or_zero(b3d)),
+        inner: nn::Linear {
+            weight: Param::new(slice_or_zero(w3d)),
+            bias: Param::new(None),
+        },
+    }
+}
+
+impl MlxQuantizedDeepSeekV2MoE {
+    fn from_weights(
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        config: &MlxDeepSeekV2Config,
+        qc: &QuantConfig,
+    ) -> Self {
+        let n = config.n_routed_experts;
+
+        // Gate is a regular float linear in mlx-community quantized format.
+        let mut gate = nn::LinearBuilder::new(config.hidden_size as i32, n as i32)
+            .bias(false)
+            .build()
+            .expect("failed to create gate linear");
+        assign_weight(&mut gate.weight, weights, &format!("{prefix}.gate.weight"));
+
+        // Load experts: try fused switch_mlp format first, fall back to per-expert.
+        let switch_prefix = format!("{prefix}.switch_mlp");
+        let has_switch_mlp = weights.contains_key(&format!("{switch_prefix}.gate_proj.weight"));
+
+        let experts = if has_switch_mlp {
+            // Fused 3D format: [n_experts, out, in_packed].
+            let gate_w = weights.get(&format!("{switch_prefix}.gate_proj.weight"));
+            let gate_s = weights.get(&format!("{switch_prefix}.gate_proj.scales"));
+            let gate_b = weights.get(&format!("{switch_prefix}.gate_proj.biases"));
+            let up_w = weights.get(&format!("{switch_prefix}.up_proj.weight"));
+            let up_s = weights.get(&format!("{switch_prefix}.up_proj.scales"));
+            let up_b = weights.get(&format!("{switch_prefix}.up_proj.biases"));
+            let down_w = weights.get(&format!("{switch_prefix}.down_proj.weight"));
+            let down_s = weights.get(&format!("{switch_prefix}.down_proj.scales"));
+            let down_b = weights.get(&format!("{switch_prefix}.down_proj.biases"));
+
+            (0..n)
+                .map(|i| {
+                    let idx = i as i32;
+                    MlxQuantizedLlamaMLP {
+                        gate_proj: slice_quantized_linear(gate_w, gate_s, gate_b, idx, qc),
+                        up_proj: slice_quantized_linear(up_w, up_s, up_b, idx, qc),
+                        down_proj: slice_quantized_linear(down_w, down_s, down_b, idx, qc),
+                    }
+                })
+                .collect()
+        } else {
+            // Per-expert format: experts.{i}.gate_proj.{weight,scales,biases}.
+            (0..n)
+                .map(|i| {
+                    MlxQuantizedLlamaMLP::from_weights(
+                        weights,
+                        &format!("{prefix}.experts.{i}"),
+                        qc,
+                    )
+                })
+                .collect()
+        };
+
+        let shared_experts = if config.n_shared_experts > 0 {
+            Some(MlxQuantizedLlamaMLP::from_weights(
+                weights,
+                &format!("{prefix}.shared_experts"),
+                qc,
+            ))
+        } else {
+            None
+        };
+
+        Self {
+            gate,
+            experts,
+            shared_experts,
+            top_k: config.num_experts_per_tok,
+            norm_topk_prob: config.norm_topk_prob,
+            routed_scaling_factor: config.routed_scaling_factor,
+        }
+    }
+
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        // Evaluate x so we can read its values for routing.
+        mlx_rs::transforms::eval(std::iter::once(x))?;
+
+        let seq_len = x.dim(0);
+        let hidden = x.dim(1);
+
+        let router_logits = self.gate.forward(x)?;
+        let probs = mlx_rs::ops::softmax_axis(&router_logits, -1, None)?;
+        mlx_rs::transforms::eval(std::iter::once(&probs))?;
+
+        let probs_flat: Vec<f32> = probs.as_dtype(Dtype::Float32)?.as_slice().to_vec();
+        let n_experts = self.experts.len();
+
+        let mut output_data = vec![0.0f32; (seq_len * hidden) as usize];
+
+        for tok in 0..(seq_len as usize) {
+            let tok_probs = &probs_flat[tok * n_experts..(tok + 1) * n_experts];
+
+            let mut indexed: Vec<(usize, f32)> = tok_probs.iter().copied().enumerate().collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            indexed.truncate(self.top_k);
+
+            let total: f32 = indexed.iter().map(|(_, p)| p).sum();
+            let scale = if self.norm_topk_prob && total > 0.0 {
+                1.0 / total
+            } else {
+                1.0
+            };
+
+            let token_x = x.try_index(tok as i32)?;
+
+            for &(expert_idx, prob) in &indexed {
+                let token_x_2d = token_x.reshape(&[1, hidden])?;
+                let expert_out = self.experts[expert_idx].forward(&token_x_2d)?;
+                mlx_rs::transforms::eval(std::iter::once(&expert_out))?;
+
+                let weight = prob * scale * self.routed_scaling_factor;
+                let vals: Vec<f32> = expert_out.as_dtype(Dtype::Float32)?.as_slice().to_vec();
+                for (j, &v) in vals.iter().enumerate() {
+                    output_data[tok * (hidden as usize) + j] += v * weight;
+                }
+            }
+        }
+
+        let mut output = Array::from_slice(&output_data, &[seq_len, hidden]);
+        output = output.as_dtype(x.dtype())?;
+
+        if let Some(ref mut shared) = self.shared_experts {
+            let shared_out = shared.forward(x)?;
+            output = output.add(&shared_out)?;
+        }
+
+        Ok(output)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MlxQuantizedDeepSeekV2DecoderLayer
+// ---------------------------------------------------------------------------
+
+/// A single quantized DeepSeek V2 decoder layer.
+struct MlxQuantizedDeepSeekV2DecoderLayer {
+    self_attn: MlxQuantizedDeepSeekV2Attention,
+    mlp: MlxQuantizedDeepSeekV2Mlp,
+    input_layernorm: nn::RmsNorm,
+    post_attention_layernorm: nn::RmsNorm,
+}
+
+enum MlxQuantizedDeepSeekV2Mlp {
+    Dense(MlxQuantizedLlamaMLP),
+    MoE(MlxQuantizedDeepSeekV2MoE),
+}
+
+impl MlxQuantizedDeepSeekV2DecoderLayer {
+    fn from_weights(
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        config: &MlxDeepSeekV2Config,
+        layer_idx: usize,
+        qc: &QuantConfig,
+    ) -> Result<Self, Exception> {
+        let mlp = if config.has_moe() && layer_idx >= config.first_k_dense_replace {
+            MlxQuantizedDeepSeekV2Mlp::MoE(MlxQuantizedDeepSeekV2MoE::from_weights(
+                weights,
+                &format!("{prefix}.mlp"),
+                config,
+                qc,
+            ))
+        } else {
+            MlxQuantizedDeepSeekV2Mlp::Dense(MlxQuantizedLlamaMLP::from_weights(
+                weights,
+                &format!("{prefix}.mlp"),
+                qc,
+            ))
+        };
+
+        let mut input_layernorm = nn::RmsNormBuilder::new(config.hidden_size as i32)
+            .eps(config.rms_norm_eps)
+            .build()?;
+        let mut post_attention_layernorm = nn::RmsNormBuilder::new(config.hidden_size as i32)
+            .eps(config.rms_norm_eps)
+            .build()?;
+        if let Some(w) = weights.get(&format!("{prefix}.input_layernorm.weight")) {
+            input_layernorm.weight.value = w.clone();
+        }
+        if let Some(w) = weights.get(&format!("{prefix}.post_attention_layernorm.weight")) {
+            post_attention_layernorm.weight.value = w.clone();
+        }
+
+        Ok(Self {
+            self_attn: MlxQuantizedDeepSeekV2Attention::from_weights(
+                weights,
+                &format!("{prefix}.self_attn"),
+                config,
+                qc,
+            )?,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        })
+    }
+
+    fn forward(
+        &mut self,
+        hidden_states: &Array,
+        positions: &Array,
+        cache: &mut Option<(Array, Array)>,
+    ) -> Result<Array, Exception> {
+        let normed = self.input_layernorm.forward(hidden_states)?;
+        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let hidden_states = hidden_states.add(&attn_output)?;
+
+        let normed = self.post_attention_layernorm.forward(&hidden_states)?;
+        let mlp_output = match &mut self.mlp {
+            MlxQuantizedDeepSeekV2Mlp::Dense(mlp) => mlp.forward(&normed)?,
+            MlxQuantizedDeepSeekV2Mlp::MoE(moe) => moe.forward(&normed)?,
+        };
+        hidden_states.add(&mlp_output)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MlxQuantizedDeepSeekV2ForCausalLM
+// ---------------------------------------------------------------------------
+
+/// Quantized DeepSeek V2 for causal language modeling using MLX.
+pub struct MlxQuantizedDeepSeekV2ForCausalLM {
+    embed_tokens: MlxEmbedTokens,
+    layers: Vec<MlxQuantizedDeepSeekV2DecoderLayer>,
+    norm: nn::RmsNorm,
+    lm_head: Option<MlxLmHead>,
+    tie_word_embeddings: bool,
+    #[allow(dead_code)]
+    config: MlxDeepSeekV2Config,
+}
+
+impl MlxQuantizedDeepSeekV2ForCausalLM {
+    pub fn load(
+        model_dir: &Path,
+        config: &MlxDeepSeekV2Config,
+        qc: &QuantConfig,
+        _dtype: Dtype,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let weights = load_safetensors_weights(model_dir)?;
+
+        let embed_tokens =
+            MlxEmbedTokens::from_weights(&weights, "model.embed_tokens", qc.group_size, qc.bits);
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            layers.push(MlxQuantizedDeepSeekV2DecoderLayer::from_weights(
+                &weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                qc,
+            )?);
+        }
+
+        let mut norm = nn::RmsNormBuilder::new(config.hidden_size as i32)
+            .eps(config.rms_norm_eps)
+            .build()?;
+        if let Some(w) = weights.get("model.norm.weight") {
+            norm.weight.value = w.clone();
+        }
+
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(MlxLmHead::from_weights(
+                &weights,
+                "lm_head",
+                qc.group_size,
+                qc.bits,
+            ))
+        };
+
+        mlx_rs::transforms::eval(weights.values())?;
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            tie_word_embeddings: config.tie_word_embeddings,
+            config: config.clone(),
+        })
+    }
+}
+
+impl super::MlxModel for MlxQuantizedDeepSeekV2ForCausalLM {
+    fn forward(
+        &mut self,
+        input_ids: &Array,
+        positions: &Array,
+        kv_cache: &mut MlxKvCache,
+    ) -> mlx_rs::error::Result<Array> {
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+        }
+
+        hidden_states = self.norm.forward(&hidden_states)?;
+
+        let logits = if self.tie_word_embeddings {
+            self.embed_tokens.as_linear(&hidden_states)?
+        } else {
+            self.lm_head.as_mut().unwrap().forward(&hidden_states)?
+        };
+
+        logits.as_dtype(Dtype::Float32)
+    }
+
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+}
+
+/// Factory function for creating a quantized MLX DeepSeek V2 model.
+pub fn create_mlx_quantized_deepseek_v2(
+    model_dir: &Path,
+    config: &HfModelConfig,
+    dtype: Dtype,
+) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
+    let ds_config = MlxDeepSeekV2Config::from_hf_config(config)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let qc = QuantConfig::from_hf_config(config).unwrap_or_default();
+    tracing::info!(
+        "Loading quantized MLX DeepSeek V2 (group_size={}, bits={})",
+        qc.group_size,
+        qc.bits
+    );
+    let model = MlxQuantizedDeepSeekV2ForCausalLM::load(model_dir, &ds_config, &qc, dtype)?;
+    Ok(Box::new(model))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -884,5 +1514,282 @@ mod tests {
     fn test_mlx_deepseek_v2_registry() {
         let registry = crate::models::MlxModelRegistry::default_registry();
         assert!(registry.contains("DeepseekV2ForCausalLM"));
+    }
+
+    // --- Quantized variant tests ---
+
+    fn test_quant_config() -> QuantConfig {
+        QuantConfig {
+            group_size: 32,
+            bits: 4,
+        }
+    }
+
+    /// Config with dimensions large enough for quantization (all input dims divisible by group_size=32).
+    fn test_quantized_config() -> MlxDeepSeekV2Config {
+        MlxDeepSeekV2Config {
+            hidden_size: 64,
+            num_attention_heads: 4,
+            num_kv_heads: 4,
+            num_hidden_layers: 2,
+            intermediate_size: 128,
+            vocab_size: 100,
+            max_position_embeddings: 128,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            tie_word_embeddings: false,
+            qk_nope_head_dim: 8,
+            qk_rope_head_dim: 8,
+            v_head_dim: 8,
+            q_lora_rank: Some(32),
+            kv_lora_rank: 32,
+            n_routed_experts: 0,
+            n_shared_experts: 0,
+            num_experts_per_tok: 2,
+            first_k_dense_replace: 1,
+            moe_intermediate_size: 64,
+            norm_topk_prob: true,
+            routed_scaling_factor: 1.0,
+        }
+    }
+
+    /// Build a quantized DeepSeek V2 model with builder-initialized weights for testing.
+    fn build_quantized_test_model(
+        config: &MlxDeepSeekV2Config,
+        qc: &QuantConfig,
+    ) -> Result<MlxQuantizedDeepSeekV2ForCausalLM, Exception> {
+        use mlx_rs::builder::Builder;
+        use mlx_rs::module::Param;
+
+        let hidden = config.hidden_size as i32;
+        let qk_head_dim = config.qk_head_dim() as i32;
+        let qk_nope = config.qk_nope_head_dim as i32;
+        let qk_rope = config.qk_rope_head_dim as i32;
+        let v_dim = config.v_head_dim as i32;
+        let kv_lora_rank = config.kv_lora_rank as i32;
+        let num_heads = config.num_attention_heads as i32;
+        let intermediate = config.intermediate_size as i32;
+
+        let embed_tokens = MlxEmbedTokens::Quantized(
+            nn::QuantizedEmbeddingBuilder::new(config.vocab_size as i32, hidden)
+                .group_size(qc.group_size)
+                .bits(qc.bits)
+                .build()?,
+        );
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for layer_idx in 0..config.num_hidden_layers {
+            // Build quantized attention.
+            let (q_a_proj, q_a_layernorm, q_b_proj, q_proj) = if let Some(q_lora_rank) =
+                config.q_lora_rank
+            {
+                let q_a = nn::QuantizedLinearBuilder::new(hidden, q_lora_rank as i32)
+                    .group_size(qc.group_size)
+                    .bits(qc.bits)
+                    .bias(false)
+                    .build()?;
+                let q_a_ln = nn::RmsNormBuilder::new(q_lora_rank as i32)
+                    .eps(config.rms_norm_eps)
+                    .build()?;
+                let q_b =
+                    nn::QuantizedLinearBuilder::new(q_lora_rank as i32, num_heads * qk_head_dim)
+                        .group_size(qc.group_size)
+                        .bits(qc.bits)
+                        .bias(false)
+                        .build()?;
+                (Some(q_a), Some(q_a_ln), Some(q_b), None)
+            } else {
+                let q = nn::QuantizedLinearBuilder::new(hidden, num_heads * qk_head_dim)
+                    .group_size(qc.group_size)
+                    .bits(qc.bits)
+                    .bias(false)
+                    .build()?;
+                (None, None, None, Some(q))
+            };
+
+            let kv_a_proj_with_mqa =
+                nn::QuantizedLinearBuilder::new(hidden, kv_lora_rank + qk_rope)
+                    .group_size(qc.group_size)
+                    .bits(qc.bits)
+                    .bias(false)
+                    .build()?;
+            let kv_a_layernorm = nn::RmsNormBuilder::new(kv_lora_rank)
+                .eps(config.rms_norm_eps)
+                .build()?;
+            let kv_b_proj =
+                nn::QuantizedLinearBuilder::new(kv_lora_rank, num_heads * (qk_nope + v_dim))
+                    .group_size(qc.group_size)
+                    .bits(qc.bits)
+                    .bias(false)
+                    .build()?;
+            let o_proj = nn::QuantizedLinearBuilder::new(num_heads * v_dim, hidden)
+                .group_size(qc.group_size)
+                .bits(qc.bits)
+                .bias(false)
+                .build()?;
+
+            let rope = {
+                let mut r = nn::Rope::new(qk_rope);
+                r.base = config.rope_theta;
+                r
+            };
+
+            let self_attn = MlxQuantizedDeepSeekV2Attention {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+                q_proj,
+                kv_a_proj_with_mqa,
+                kv_a_layernorm,
+                kv_b_proj,
+                o_proj,
+                rope,
+                num_heads: config.num_attention_heads,
+                qk_nope_head_dim: config.qk_nope_head_dim,
+                qk_rope_head_dim: config.qk_rope_head_dim,
+                qk_head_dim: config.qk_head_dim(),
+                v_head_dim: config.v_head_dim,
+                kv_lora_rank: config.kv_lora_rank,
+                scale: 1.0 / (config.qk_head_dim() as f32).sqrt(),
+            };
+
+            // Build quantized MLP (dense for this test config — no MoE).
+            let mlp = if config.has_moe() && layer_idx >= config.first_k_dense_replace {
+                // MoE path — not exercised in default test_config.
+                let gate = nn::LinearBuilder::new(hidden, config.n_routed_experts as i32)
+                    .bias(false)
+                    .build()?;
+                let moe_intermediate = config.moe_intermediate_size as i32;
+                let mut experts = Vec::with_capacity(config.n_routed_experts);
+                for _ in 0..config.n_routed_experts {
+                    experts.push(MlxQuantizedLlamaMLP {
+                        gate_proj: nn::QuantizedLinearBuilder::new(hidden, moe_intermediate)
+                            .group_size(qc.group_size)
+                            .bits(qc.bits)
+                            .bias(false)
+                            .build()?,
+                        up_proj: nn::QuantizedLinearBuilder::new(hidden, moe_intermediate)
+                            .group_size(qc.group_size)
+                            .bits(qc.bits)
+                            .bias(false)
+                            .build()?,
+                        down_proj: nn::QuantizedLinearBuilder::new(moe_intermediate, hidden)
+                            .group_size(qc.group_size)
+                            .bits(qc.bits)
+                            .bias(false)
+                            .build()?,
+                    });
+                }
+                let shared_experts = if config.n_shared_experts > 0 {
+                    let shared_intermediate =
+                        (config.moe_intermediate_size * config.n_shared_experts) as i32;
+                    Some(MlxQuantizedLlamaMLP {
+                        gate_proj: nn::QuantizedLinearBuilder::new(hidden, shared_intermediate)
+                            .group_size(qc.group_size)
+                            .bits(qc.bits)
+                            .bias(false)
+                            .build()?,
+                        up_proj: nn::QuantizedLinearBuilder::new(hidden, shared_intermediate)
+                            .group_size(qc.group_size)
+                            .bits(qc.bits)
+                            .bias(false)
+                            .build()?,
+                        down_proj: nn::QuantizedLinearBuilder::new(shared_intermediate, hidden)
+                            .group_size(qc.group_size)
+                            .bits(qc.bits)
+                            .bias(false)
+                            .build()?,
+                    })
+                } else {
+                    None
+                };
+                MlxQuantizedDeepSeekV2Mlp::MoE(MlxQuantizedDeepSeekV2MoE {
+                    gate,
+                    experts,
+                    shared_experts,
+                    top_k: config.num_experts_per_tok,
+                    norm_topk_prob: config.norm_topk_prob,
+                    routed_scaling_factor: config.routed_scaling_factor,
+                })
+            } else {
+                MlxQuantizedDeepSeekV2Mlp::Dense(MlxQuantizedLlamaMLP {
+                    gate_proj: nn::QuantizedLinearBuilder::new(hidden, intermediate)
+                        .group_size(qc.group_size)
+                        .bits(qc.bits)
+                        .bias(false)
+                        .build()?,
+                    up_proj: nn::QuantizedLinearBuilder::new(hidden, intermediate)
+                        .group_size(qc.group_size)
+                        .bits(qc.bits)
+                        .bias(false)
+                        .build()?,
+                    down_proj: nn::QuantizedLinearBuilder::new(intermediate, hidden)
+                        .group_size(qc.group_size)
+                        .bits(qc.bits)
+                        .bias(false)
+                        .build()?,
+                })
+            };
+
+            layers.push(MlxQuantizedDeepSeekV2DecoderLayer {
+                self_attn,
+                mlp,
+                input_layernorm: nn::RmsNormBuilder::new(hidden)
+                    .eps(config.rms_norm_eps)
+                    .build()?,
+                post_attention_layernorm: nn::RmsNormBuilder::new(hidden)
+                    .eps(config.rms_norm_eps)
+                    .build()?,
+            });
+        }
+
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(MlxLmHead::Float(nn::Linear {
+                weight: Param::new(
+                    mlx_rs::ops::ones::<f32>(&[config.vocab_size as i32, hidden]).unwrap(),
+                ),
+                bias: Param::new(None),
+            }))
+        };
+
+        Ok(MlxQuantizedDeepSeekV2ForCausalLM {
+            embed_tokens,
+            layers,
+            norm: nn::RmsNormBuilder::new(hidden)
+                .eps(config.rms_norm_eps)
+                .build()?,
+            lm_head,
+            tie_word_embeddings: config.tie_word_embeddings,
+            config: config.clone(),
+        })
+    }
+
+    #[test]
+    fn test_quantized_deepseek_v2_forward() {
+        let config = test_quantized_config();
+        let qc = test_quant_config();
+        let mut model = build_quantized_test_model(&config, &qc).unwrap();
+
+        let input_ids = Array::from_iter(vec![1i32, 5, 10], &[3]);
+        let positions = Array::from_iter(0..3i32, &[3]);
+        let mut kv_cache = crate::cache::empty_kv_cache(config.num_hidden_layers);
+
+        let logits = <MlxQuantizedDeepSeekV2ForCausalLM as crate::models::MlxModel>::forward(
+            &mut model,
+            &input_ids,
+            &positions,
+            &mut kv_cache,
+        )
+        .unwrap();
+        logits.eval().unwrap();
+        assert_eq!(logits.shape(), &[3, config.vocab_size as i32]);
+    }
+
+    #[test]
+    fn test_quantized_deepseek_v2_registry() {
+        let registry = crate::models::MlxModelRegistry::default_registry();
+        assert!(registry.contains_quantized("DeepseekV2ForCausalLM"));
     }
 }

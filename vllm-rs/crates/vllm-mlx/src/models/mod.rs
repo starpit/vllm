@@ -107,6 +107,10 @@ impl MlxModelRegistry {
         registry.register_quantized("Phi3ForCausalLM", phi3::create_mlx_quantized_phi3);
         // DeepSeek V2/V3 (MLA attention + MoE)
         registry.register("DeepseekV2ForCausalLM", deepseek_v2::create_mlx_deepseek_v2);
+        registry.register_quantized(
+            "DeepseekV2ForCausalLM",
+            deepseek_v2::create_mlx_quantized_deepseek_v2,
+        );
         // Command R (Cohere) — CohereLayerNorm, parallel attn+MLP, logit scaling,
         // interleaved RoPE
         registry.register("CohereForCausalLM", commandr::create_mlx_commandr);

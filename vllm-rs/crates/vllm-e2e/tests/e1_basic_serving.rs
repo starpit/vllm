@@ -416,37 +416,36 @@ async fn test_t4_mistral_chat_basic() {
 
 // ===========================================================================
 // Weekly: DeepSeek-V2-Lite (DeepseekV2ForCausalLM) — Tier 4
-// DISABLED: quantized DeepSeek V2 MLX not yet implemented (see PARITY.md)
 // ===========================================================================
 
-// #[tokio::test(flavor = "multi_thread")]
-// #[ignore]
-// async fn test_t4_deepseek_server_starts() {
-//     let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE_4BIT)
-//         .start()
-//         .await
-//         .expect("server should start");
-//
-//     let client = Client::new(server.base_url());
-//     assert!(client.health().await.unwrap());
-// }
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_t4_deepseek_server_starts() {
+    let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE_4BIT)
+        .start()
+        .await
+        .expect("server should start");
 
-// #[tokio::test(flavor = "multi_thread")]
-// #[ignore]
-// async fn test_t4_deepseek_chat_basic() {
-//     let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE_4BIT)
-//         .start()
-//         .await
-//         .unwrap();
-//
-//     let client = Client::new(server.base_url());
-//     let request = simple_chat_request("Say hello in one sentence.", Some(50));
-//     let resp = client.chat_completion(&request).await.unwrap();
-//
-//     assert_valid_chat_response(&resp);
-//     let text = resp.choices[0].message.content.as_deref().unwrap_or("");
-//     assert_coherent_text(text, 2);
-// }
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_t4_deepseek_chat_basic() {
+    let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE_4BIT)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text, 2);
+}
 
 // ===========================================================================
 // E1b: Float16 vs quantized comparison

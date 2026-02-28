@@ -1,6 +1,6 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (751 tests: 698 unit + 53 e2e, 0 clippy errors)
+> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (754 tests: 701 unit + 53 e2e, 0 clippy errors)
 
 ### Legend
 
@@ -111,7 +111,7 @@
 | Gemma 1 | N/A | &#x1F535; | 2 | 0 | |
 | Gemma 2 | N/A | &#x1F535; | 7 | 0 | |
 | Phi-3 (fused projections) | N/A | &#x1F535; | 4 | 0 | |
-| DeepSeek V2 / V3 (float only) | N/A | &#x1F7E1; | 5 | 2 | |
+| DeepSeek V2 / V3 | N/A | &#x1F535; | 5 | 2 | |
 | Command R (Cohere) | N/A | &#x1F535; | 4 | 0 | |
 | Quantized LLaMA (mlx-community 4-bit) | N/A | &#x1F535; | 4 | 8 | |
 | Quantized Mistral (4-bit) | N/A | &#x1F535; | 0 | 2 | |
@@ -119,6 +119,7 @@
 | Quantized Gemma 1 (4-bit) | N/A | &#x1F535; | 0 | 0 | |
 | Quantized Gemma 2 (4-bit) | N/A | &#x1F535; | 0 | 2 | |
 | Quantized Phi-3 (4-bit) | N/A | &#x1F535; | 0 | 2 | |
+| Quantized DeepSeek V2 (4-bit) | N/A | &#x1F535; | 2 | 2 | |
 | Quantized Command R (4-bit) | N/A | &#x1F535; | 0 | 0 | |
 
 > Python vLLM does not have an MLX backend. The Rust MLX backend is unique to the Rust port. All E2E tests use `mlx-community` models and exercise the MLX backend (`--features metal`). MLX unit tests require `--test-threads=1`.
@@ -447,12 +448,6 @@
 
 ---
 
-## Known Gaps
-
-| Gap | Details | Workaround |
-|-----|---------|------------|
-| MLX quantized DeepSeek V2/V3 | No `register_quantized("DeepseekV2ForCausalLM", ...)` factory. The float model is used for quantized weights, causing dimension mismatches (`rms_norm` size error) and missing MoE expert weights. | Use a float DeepSeek V2 model, or use the candle backend. |
-
 ---
 
 ## Stats
@@ -464,6 +459,6 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Unit tests | ~948 test files | 698 passing (660 non-MLX + 38 MLX) |
+| Unit tests | ~948 test files | 701 passing (660 non-MLX + 41 MLX) |
 | E2E tests | — | 53 passing (24 basic serving + 21 chat/sampling + 8 streaming) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

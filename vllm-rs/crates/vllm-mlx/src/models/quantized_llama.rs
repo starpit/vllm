@@ -255,9 +255,9 @@ impl MlxLmHead {
 
 /// Quantized LLaMA MLP (SiLU-gated feed-forward network).
 pub struct MlxQuantizedLlamaMLP {
-    gate_proj: nn::QuantizedLinear,
-    up_proj: nn::QuantizedLinear,
-    down_proj: nn::QuantizedLinear,
+    pub(crate) gate_proj: nn::QuantizedLinear,
+    pub(crate) up_proj: nn::QuantizedLinear,
+    pub(crate) down_proj: nn::QuantizedLinear,
 }
 
 impl MlxQuantizedLlamaMLP {

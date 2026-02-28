@@ -158,7 +158,7 @@ For each model in the test matrix:
 | Model | Architecture | Quantized |
 |-------|-------------|-----------|
 | Mistral-7B-Instruct-v0.3-4bit | MistralForCausalLM | Yes (4-bit) |
-| DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx | DeepseekV2ForCausalLM | Yes (4-bit) — **DISABLED** (quantized MLX not implemented, see PARITY.md) |
+| DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx | DeepseekV2ForCausalLM | Yes (4-bit) |
 
 ### E1b. Float16 vs quantized comparison
 

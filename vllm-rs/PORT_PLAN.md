@@ -2,7 +2,7 @@
 
 ## Implementation Progress
 
-> **Last updated**: 2026-02-28 (ORCA metrics DONE — scheduler stats gauges, endpoint-load-metrics headers)
+> **Last updated**: 2026-02-28 (E2E test infrastructure + pycompat chat template fix)
 
 | Phase | Status | Details |
 |-------|--------|---------|
@@ -57,6 +57,8 @@
 | **12b. Tool call response parsing** | **DONE** | `ToolCallParser` trait + `StreamingToolParserState` trait. HermesToolParser (`<tool_call>` tags) + LlamaJsonToolParser (raw JSON / `<|python_tag|>`). Partial JSON helper for incomplete arguments. Non-streaming: full text extraction → structured `ToolCall` objects. Streaming: per-request state machine with delta diffing for incremental argument fragments. `--tool-call-parser hermes\|llama3_json` CLI flag. Wired into `AsyncEngine` (non-streaming + streaming) and `server.rs` SSE. 18 new tests. (651 tests) |
 | **12c. Structured output / constrained decoding** | **DONE** | `response_format` (`json_object`, `json_schema`) via `outlines-core` (pure Rust, default-features=false). `GuidedGrammar` enum in `vllm-common`; `GrammarGuide` wraps `outlines_core::Index` + FSM state. Schema → regex → FSM compiled per request; grammar vocabulary built once from `tokenizer.json`. `apply_grammar_mask()` sets disallowed logits to -inf before penalties/temperature. Per-request grammar state in CandleWorker + MlxWorker. `parse_response_format()` in engine.rs. 14 new tests. (665 tests) |
 | **12d. ORCA metrics** | **DONE** | `KVCacheManagerOps::usage()` trait method, `SchedulerStats` piggybacked on `EngineCoreOutputs`, `num_requests_running`/`num_requests_waiting`/`kv_cache_usage_perc` Prometheus gauges updated per step, ORCA `endpoint-load-metrics` response header (TEXT+JSON) for non-streaming chat/completion endpoints. New `orca.rs` module. 22 new tests. (687 tests) |
+| **8b+. Chat template pycompat** | **DONE** | Added `minijinja-contrib` with `pycompat` feature — enables Python string methods (`startswith`, `endswith`, `split`, `strip`, `lower`, `upper`, `join`, `replace`) and dict/list methods (`get`, `items`, `keys`, `values`, `count`) in HF Jinja2 chat templates. Fixes Qwen3 and other models whose templates use Python-native string methods. |
+| **E0. E2E test infrastructure** | **DONE** | New `vllm-e2e` crate with `TestServer` (spawns `vllm serve` child process, random port, health-check polling, kill-on-drop), `Client` (reqwest wrapper with typed chat/completion/stream methods, SSE parsing), assertion helpers (`assert_valid_chat_response`, `assert_valid_stream`, `assert_coherent_text`, etc.), `TestModels` constants (Tier 1–4 models). Feature-gated (`--features e2e`) + `#[ignore]`. 52 E2E tests across 3 test files (E1 basic serving, E2 chat completions, E3 streaming). All 52 passing on MLX backend. |
 | 9c. Metal Tier 2 (legacy candle) | Superseded | Custom MSL fused kernels approach superseded by MLX backend. Use `--features candle-metal` for legacy path |
 | 9d. Metal Tier 3 | Partially superseded | UMA-aware KV cache, memory pressure handling. Zero-copy weight loading and quantization are handled natively by MLX backend (Phase 10d) |
 
@@ -95,7 +97,9 @@
 | 12c | ~400 | 3 mod | 14 | 665 | Structured output: json_object + json_schema via outlines-core |
 | 12d | ~300 | 1 new + 7 mod | 22 | 687 | ORCA metrics: scheduler stats gauges, endpoint-load-metrics headers |
 | 12c+ | ~180 | 5 mod | 10 | 697 | Regex-constrained decoding via `guided_regex` API parameter |
-| **Total** | **~33,700** | **98 files** | **697** | **697** | **0 clippy errors** |
+| 8b+ | ~5 | 3 mod | 0 | 697 | Chat template pycompat (minijinja-contrib) |
+| E0 | ~750 | 8 new + 1 mod | 52 (E2E) | 697 + 52 E2E | E2E infrastructure + E1/E2/E3 tests |
+| **Total** | **~34,450** | **107 files** | **697 + 52 E2E** | **749** | **0 clippy errors** |
 
 ### Known limitations / follow-ups
 - **MLX YaRN RoPE**: The MLX backend uses `nn::Rope` which doesn't apply YaRN frequency corrections. Models with `rope_scaling` (e.g., Qwen3 with YaRN factor=4.0, DeepSeek V2 with factor=40.0) will generate correctly within the original context window but won't have correct positional encoding beyond it. Fix: either implement a custom MLX RoPE that pre-applies YaRN corrections, or upstream YaRN support to mlx-rs `nn::Rope`.

@@ -1,0 +1,33 @@
+[package]
+name = "vllm-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "End-to-end tests for vLLM Rust inference engine"
+
+[features]
+default = []
+e2e = []
+
+[dependencies]
+# HTTP client
+reqwest = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization (reuse protocol types from vllm-serve)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Protocol types
+vllm-serve = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

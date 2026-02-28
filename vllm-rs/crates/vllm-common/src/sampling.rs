@@ -11,6 +11,23 @@ use serde::{Deserialize, Serialize};
 const SAMPLING_EPS: f64 = 1e-5;
 
 // ---------------------------------------------------------------------------
+// GuidedGrammar — constrained decoding specification
+// ---------------------------------------------------------------------------
+
+/// Specifies a grammar constraint for structured output / constrained decoding.
+///
+/// Stored in `SamplingParams` and used by workers to create per-request
+/// `GrammarGuide` instances that mask logits during sampling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GuidedGrammar {
+    /// `response_format: { type: "json_object" }` — output must be valid JSON.
+    Json,
+    /// `response_format: { type: "json_schema", json_schema: { schema: ... } }` —
+    /// output must conform to the given JSON schema.
+    JsonSchema { schema: serde_json::Value },
+}
+
+// ---------------------------------------------------------------------------
 // SamplingType
 // ---------------------------------------------------------------------------
 
@@ -124,6 +141,12 @@ pub struct SamplingParams {
     /// specified token ID before sampling.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logit_bias: Option<HashMap<u32, f32>>,
+
+    /// Grammar constraint for structured output (constrained decoding).
+    /// When set, the sampler masks logits so that only tokens allowed by
+    /// the grammar are sampled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guided_grammar: Option<GuidedGrammar>,
 }
 
 impl Default for SamplingParams {
@@ -150,6 +173,7 @@ impl Default for SamplingParams {
             include_stop_str_in_output: false,
             output_kind: RequestOutputKind::default(),
             logit_bias: None,
+            guided_grammar: None,
         }
     }
 }

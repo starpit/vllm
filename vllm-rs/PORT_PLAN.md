@@ -55,7 +55,7 @@
 | **8g. Sampling gaps** | **DONE** | Unified `Sampler::sample_one()`: min_p, repetition/frequency/presence penalties, logit_bias, logprobs (top-N). `LogprobsOutput`/`TokenLogprob` in `vllm-common`. CPU-side penalty application in both CandleWorker + MlxWorker. Logprobs propagated through `EngineCoreOutput` → API responses (chat + completion, streaming + non-streaming). 12 new sampler unit tests. (629 tests) |
 | **12a. Tool calling protocol** | **DONE** | Rich JSON messages + `tools`/`tool_choice` passed to chat templates via `apply()`. `tool_calls` arguments auto-parsed from string→object. `tool_choice: "none"` suppresses tools. `date_string` template variable. minijinja `json` feature for `tojson`. 4 new template tests. (633 tests) |
 | **12b. Tool call response parsing** | **DONE** | `ToolCallParser` trait + `StreamingToolParserState` trait. HermesToolParser (`<tool_call>` tags) + LlamaJsonToolParser (raw JSON / `<|python_tag|>`). Partial JSON helper for incomplete arguments. Non-streaming: full text extraction → structured `ToolCall` objects. Streaming: per-request state machine with delta diffing for incremental argument fragments. `--tool-call-parser hermes\|llama3_json` CLI flag. Wired into `AsyncEngine` (non-streaming + streaming) and `server.rs` SSE. 18 new tests. (651 tests) |
-| 12c. Structured output / constrained decoding | Not started | `response_format` (json_object, json_schema), grammar-guided logit masking via `llguidance` or similar, schema-to-grammar compilation |
+| **12c. Structured output / constrained decoding** | **DONE** | `response_format` (`json_object`, `json_schema`) via `outlines-core` (pure Rust, default-features=false). `GuidedGrammar` enum in `vllm-common`; `GrammarGuide` wraps `outlines_core::Index` + FSM state. Schema → regex → FSM compiled per request; grammar vocabulary built once from `tokenizer.json`. `apply_grammar_mask()` sets disallowed logits to -inf before penalties/temperature. Per-request grammar state in CandleWorker + MlxWorker. `parse_response_format()` in engine.rs. 14 new tests. (665 tests) |
 | 9c. Metal Tier 2 (legacy candle) | Superseded | Custom MSL fused kernels approach superseded by MLX backend. Use `--features candle-metal` for legacy path |
 | 9d. Metal Tier 3 | Partially superseded | UMA-aware KV cache, memory pressure handling. Zero-copy weight loading and quantization are handled natively by MLX backend (Phase 10d) |
 
@@ -979,36 +979,35 @@ The model generates tool calls as text (JSON blocks, special tokens, or model-sp
 
 **Key files (Python reference)**: `vllm/entrypoints/openai/tool_parsers/` — contains Hermes, Mistral, LLaMA, Jamba, and other model-specific parsers. The streaming logic in Python is complex; start with non-streaming, then add streaming.
 
-### 12c. Structured output / constrained decoding
+### 12c. Structured output / constrained decoding — DONE
 
-Constrained decoding forces the model to produce output matching a given format (JSON object, JSON schema, regex, grammar). This requires modifying logits at each decode step before sampling.
+Constrained decoding forces the model to produce output matching a given format (JSON object, JSON schema, regex, grammar). Logits are masked at each decode step before sampling.
 
-**`response_format` protocol support** (`vllm-serve/src/protocol.rs`):
-- [ ] Add `response_format: Option<ResponseFormat>` to `ChatCompletionRequest`
-- [ ] `ResponseFormat` enum: `{ type: "text" }` (default, no-op) | `{ type: "json_object" }` (valid JSON) | `{ type: "json_schema", json_schema: { name, schema, strict } }`
+**Implementation** (uses `outlines-core` 0.2, pure Rust, `default-features = false`):
 
-**Logit processor infrastructure** (`vllm-models/src/logit_processor.rs`, new file):
-- [ ] `LogitProcessor` trait: `fn process(&mut self, token_ids: &[u32], logits: &mut Tensor) -> Result<()>`
-- [ ] `LogitProcessorPipeline`: chain of processors applied in order before sampling
-- [ ] Wire into `CandleWorker` and `MlxWorker`: after forward pass produces logits, apply per-request logit processors before sampler
+- [x] `GuidedGrammar` enum (`Json` | `JsonSchema { schema }`) in `vllm-common/src/sampling.rs`, stored in `SamplingParams`
+- [x] `parse_response_format()` in `vllm-serve/src/engine.rs`: `text` → None, `json_object` → `GuidedGrammar::Json`, `json_schema` → extract schema → `GuidedGrammar::JsonSchema`
+- [x] `GrammarGuide` struct in `vllm-models/src/grammar.rs`: wraps `outlines_core::Index` + current `StateId`
+  - `from_json_schema(schema, vocabulary)` → compile JSON schema → regex → FSM index
+  - `from_json_object(vocabulary)` → generic `{"type": "object"}` schema
+  - `allowed_tokens()` → query current FSM state for valid next tokens
+  - `advance(token_id)` → transition FSM state
+  - `is_finished()` → check accepting state
+- [x] `apply_grammar_mask(logits, allowed)` — set disallowed logits to `-inf` (before penalties/temperature in `sample_one()`)
+- [x] `build_vocabulary(tokens, eos_id)` — build `outlines_core::Vocabulary` from tokenizer token list
+- [x] Grammar vocabulary built once from `tokenizer.json` at `load_model` time (`try_build_grammar_vocabulary()`)
+- [x] Per-request `GrammarGuide` state in `CandleWorker` and `MlxWorker` (`grammar_states` HashMap)
+- [x] MLX: grammar forces CPU sampling path (logits evaluated, masked on CPU, then sampled)
+- [x] 14 new tests: 8 grammar/sampler + 6 response_format parsing
 
-**Grammar-guided decoding** (`vllm-models/src/grammar.rs` or new crate):
-- [ ] Evaluate Rust grammar engines: `llguidance` (Microsoft, used by Python vLLM), `outlines-core` (Rust core of outlines), or custom CFG/PDA implementation
-- [ ] `GrammarLogitProcessor`: implements `LogitProcessor`, maintains grammar state machine, masks logits for invalid next tokens
-- [ ] JSON mode (`type: "json_object"`): compile a generic JSON grammar, apply as logit processor
-- [ ] JSON Schema mode (`type: "json_schema"`): compile schema → grammar (handle object keys, enum values, string patterns, numeric ranges), apply as logit processor
-- [ ] `strict: true` vs `strict: false`: strict mode enforces exact schema match via grammar; non-strict mode uses JSON grammar only
+**Future work**:
+- Regex-constrained decoding (arbitrary regex patterns via API)
+- `strict: true` vs `strict: false` differentiation
+- Pre-compiled grammar caching by schema hash
+- `json_object` pre-compiled Index at model load time (shared across requests)
 
-**Performance considerations**:
-- Grammar state update and logit masking must be fast (runs every decode step per request)
-- Pre-compile grammars for common schemas; cache compiled grammars by schema hash
-- Token vocabulary → grammar transition table can be pre-computed at model load time
-- Vocabulary-aware masking: map grammar state → set of valid token IDs → logit mask tensor
-
-**Dependencies**: This is the most complex sub-phase. 12a and 12b are independent and can be done first. 12c depends on nothing in 12a/12b (it's a separate logit-level mechanism) but is complementary — structured output ensures tool call arguments are valid JSON.
-
-### Milestone 12 deliverable (12a+12b DONE, 12c remaining)
-`./vllm serve meta-llama/Llama-3.1-8B-Instruct --tool-call-parser hermes` with `tools` in the chat completion request returns structured `tool_calls` in the response. Streaming tool call deltas work correctly. Compatible with OpenAI client libraries. Remaining: `response_format` (12c) for structured output / constrained decoding.
+### Milestone 12 deliverable (12a+12b+12c DONE)
+`./vllm serve meta-llama/Llama-3.1-8B-Instruct --tool-call-parser hermes` with `tools` in the chat completion request returns structured `tool_calls` in the response. Streaming tool call deltas work correctly. `response_format: { type: "json_schema", json_schema: { name: "...", schema: {...} } }` constrains output to conform to the given JSON schema via grammar-guided logit masking. Compatible with OpenAI client libraries.
 
 ---
 

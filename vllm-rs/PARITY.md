@@ -1,6 +1,6 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (613+38 tests, 0 clippy errors)
+> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (627+38 tests, 0 clippy errors)
 
 ### Legend
 
@@ -19,8 +19,8 @@
 |---|:---:|:---:|---|
 | [Model Architectures](#model-architectures) | &#x1F535; | &#x1F7E1; | `███░░░░░░░` 9/36 |
 | [Quantization](#quantization) | &#x1F535; | &#x1F7E1; | `█░░░░░░░░░` 1/11 |
-| [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | `█████░░░░░` 13/25 |
-| [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | `████████░░` 17/21 |
+| [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | `██████░░░░` 14/25 |
+| [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | `████████░░` 18/21 |
 | [KV Cache & Attention](#kv-cache--attention) | &#x1F535; | &#x1F7E1; | `█████░░░░░` 9/19 |
 | [Scheduling](#scheduling) | &#x1F535; | &#x1F7E1; | `████████░░` 8/10 |
 | [Hardware Backends](#hardware-backends) | &#x1F535; | &#x1F7E1; | `████░░░░░░` 3/8 |
@@ -29,12 +29,12 @@
 | [LoRA / Adapters](#lora--adapters) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/5 |
 | [Speculative Decoding](#speculative-decoding) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/5 |
 | [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F535; | &#x2795; | `░░░░░░░░░░` 0/10 |
-| [Structured Output](#structured-output--guided-decoding) | &#x1F535; | &#x2795; | `░░░░░░░░░░` 0/4 |
+| [Structured Output](#structured-output--guided-decoding) | &#x1F535; | &#x1F7E1; | `███████░░░` 3/4 |
 | [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x1F7E1; | `█████░░░░░` 5/6 |
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/4 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F7E1; | `█████████░` 6/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | `██████████` 14/15 |
-| | | **Total** | `████░░░░░░` **90/198** |
+| | | **Total** | `█████░░░░░` **95/198** |
 
 ---
 
@@ -143,7 +143,7 @@
 | Chat templates (Jinja2) | &#x1F535; | &#x1F535; |
 | `POST /v1/embeddings` | &#x1F535; | &#x1F534; |
 | `POST /v1/chat/completions` tool_calls | &#x1F535; | &#x1F535; |
-| `response_format` (JSON mode/schema) | &#x1F535; | &#x2795; |
+| `response_format` (JSON mode/schema) | &#x1F535; | &#x1F535; |
 | Anthropic Messages API | &#x1F535; | &#x1F534; |
 | gRPC server | &#x1F535; | &#x2795; |
 | MCP tool server | &#x1F535; | &#x1F534; |
@@ -183,7 +183,7 @@
 | `ignore_eos` | &#x1F535; | &#x1F535; |
 | `min_tokens` | &#x1F535; | &#x1F535; |
 | Seed (reproducible sampling) | &#x1F535; | &#x1F535; |
-| Guided decoding (grammar/regex/JSON) | &#x1F535; | &#x2795; |
+| Guided decoding (grammar/regex/JSON) | &#x1F535; | &#x1F7E1; |
 
 > All penalty/filter/logprobs features use a unified `Sampler::sample_one()` entry point that operates on CPU logit vectors in both CandleWorker and MlxWorker. Prompt logprobs are not yet implemented (requires running logprobs on every prefill position).
 
@@ -336,12 +336,12 @@
 
 | Feature | Python | Rust |
 |---|:---:|:---:|
-| `response_format: json_object` | &#x1F535; | &#x2795; |
-| `response_format: json_schema` | &#x1F535; | &#x2795; |
-| Grammar-guided logit masking | &#x1F535; | &#x2795; |
+| `response_format: json_object` | &#x1F535; | &#x1F535; |
+| `response_format: json_schema` | &#x1F535; | &#x1F535; |
+| Grammar-guided logit masking | &#x1F535; | &#x1F535; |
 | Regex-constrained decoding | &#x1F535; | &#x2795; |
 
-> Protocol types for `response_format` exist in Rust but enforcement is not implemented.
+> Phase 12c: `response_format` with `json_object` and `json_schema` types fully implemented using `outlines-core` (pure Rust). JSON schemas are compiled to regex → FSM index at request start; per-request `GrammarGuide` tracks FSM state and masks logits before sampling. Grammar vocabulary built once from `tokenizer.json` at model load. Both CandleWorker and MlxWorker supported. Regex-constrained decoding (arbitrary regex patterns) is planned but not yet exposed via the API.
 
 ---
 
@@ -421,5 +421,5 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Test count | ~948 test files | 651 passing tests (613+38 MLX) |
+| Test count | ~948 test files | 665 passing tests (627+38 MLX) |
 | Crate count | N/A | 13 crates |

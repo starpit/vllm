@@ -187,12 +187,13 @@ impl Sampler {
     // -------------------------------------------------------------------
 
     /// Sample a single token from raw logits, applying all configured
-    /// transformations: logit_bias → penalties → temperature → top-k →
-    /// top-p → min_p → sample → optional logprobs.
+    /// transformations: logit_bias → grammar mask → penalties → temperature →
+    /// top-k → top-p → min_p → sample → optional logprobs.
     ///
     /// `logits` — vocab-sized raw logits for one request.
     /// `params` — full sampling parameters.
     /// `prev_tokens` — all previously generated tokens for this request.
+    /// `grammar_allowed` — if set, only these token IDs are allowed (constrained decoding).
     ///
     /// Returns `(sampled_token_id, optional_logprobs)`.
     pub fn sample_one(
@@ -200,12 +201,18 @@ impl Sampler {
         logits: &[f32],
         params: &SamplingParams,
         prev_tokens: &[u32],
+        grammar_allowed: Option<&[u32]>,
     ) -> (u32, Option<LogprobsOutput>) {
         let mut logits_buf: Vec<f32> = logits.to_vec();
 
         // 1. Apply logit bias.
         if let Some(bias) = &params.logit_bias {
             apply_logit_bias(&mut logits_buf, bias);
+        }
+
+        // 1.5. Apply grammar mask (constrained decoding).
+        if let Some(allowed) = grammar_allowed {
+            crate::grammar::apply_grammar_mask(&mut logits_buf, allowed);
         }
 
         // 2. Apply repetition/frequency/presence penalties.
@@ -672,7 +679,7 @@ mod tests {
             temperature: 0.0,
             ..Default::default()
         };
-        let (token, lp) = sampler.sample_one(&logits, &params, &[]);
+        let (token, lp) = sampler.sample_one(&logits, &params, &[], None);
         assert_eq!(token, 1); // argmax
         assert!(lp.is_none()); // no logprobs requested
     }
@@ -686,7 +693,7 @@ mod tests {
             logprobs: Some(2),
             ..Default::default()
         };
-        let (token, lp) = sampler.sample_one(&logits, &params, &[]);
+        let (token, lp) = sampler.sample_one(&logits, &params, &[], None);
         assert_eq!(token, 1);
         let lp = lp.unwrap();
         assert_eq!(lp.sampled.token_id, 1);
@@ -704,7 +711,7 @@ mod tests {
             ..Default::default()
         };
         // Token 1 seen: logit 5.0 / 2.0 = 2.5, so token 2 (4.9) wins.
-        let (token, _) = sampler.sample_one(&logits, &params, &[1]);
+        let (token, _) = sampler.sample_one(&logits, &params, &[1], None);
         assert_eq!(token, 2);
     }
 
@@ -719,7 +726,37 @@ mod tests {
             ..Default::default()
         };
         // Token 0 boosted by 100 → should be selected.
-        let (token, _) = sampler.sample_one(&logits, &params, &[]);
+        let (token, _) = sampler.sample_one(&logits, &params, &[], None);
         assert_eq!(token, 0);
+    }
+
+    #[test]
+    fn test_sample_one_with_grammar_mask() {
+        let mut sampler = Sampler::new();
+        // Token 1 has highest logit, but grammar only allows tokens 0 and 2.
+        let logits = vec![1.0f32, 5.0, 3.0, 2.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let allowed = vec![0u32, 2];
+        let (token, _) = sampler.sample_one(&logits, &params, &[], Some(&allowed));
+        // Token 2 (logit 3.0) should win since token 1 is masked out.
+        assert_eq!(token, 2);
+    }
+
+    #[test]
+    fn test_sample_one_grammar_mask_with_temperature() {
+        let mut sampler = Sampler::new();
+        // Token 1 dominates, but grammar masks it out.
+        let logits = vec![1.0f32, 100.0, 50.0, 2.0];
+        let params = SamplingParams {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        let allowed = vec![2u32];
+        let (token, _) = sampler.sample_one(&logits, &params, &[], Some(&allowed));
+        // Only token 2 is allowed.
+        assert_eq!(token, 2);
     }
 }

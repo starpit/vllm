@@ -93,6 +93,11 @@ pub struct MlxWorker {
     /// Per-request KV cache (simple contiguous, no paging).
     kv_caches: HashMap<String, MlxKvCache>,
 
+    /// Per-request grammar guide state for constrained decoding.
+    grammar_states: HashMap<String, vllm_models::grammar::GrammarGuide>,
+    /// Compiled vocabulary for grammar-guided decoding (built once from tokenizer).
+    grammar_vocabulary: Option<outlines_core::vocabulary::Vocabulary>,
+
     // Timing instrumentation.
     step_count: usize,
     prefill_count: usize,
@@ -115,6 +120,8 @@ impl MlxWorker {
             token_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
             kv_caches: HashMap::new(),
+            grammar_states: HashMap::new(),
+            grammar_vocabulary: None,
             step_count: 0,
             prefill_count: 0,
             decode_count: 0,
@@ -168,6 +175,43 @@ impl MlxWorker {
             0.0
         } else {
             self.total_decode_ms / self.decode_count as f64
+        }
+    }
+
+    /// Try to build grammar vocabulary from the model's tokenizer.
+    fn try_build_grammar_vocabulary(&mut self) {
+        let Some(model_dir) = &self.model_dir else {
+            return;
+        };
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        if !tokenizer_path.exists() {
+            info!("MlxWorker: no tokenizer.json found, grammar-guided decoding unavailable");
+            return;
+        }
+        let tokenizer = match tokenizers::Tokenizer::from_file(&tokenizer_path) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("MlxWorker: failed to load tokenizer.json for grammar vocabulary: {e}");
+                return;
+            }
+        };
+
+        let hf_vocab = tokenizer.get_vocab(true);
+        let eos_token_id = tokenizer.token_to_id("</s>").unwrap_or(0);
+        let tokens: Vec<(u32, String)> = hf_vocab.into_iter().map(|(s, id)| (id, s)).collect();
+
+        match vllm_models::grammar::build_vocabulary(&tokens, eos_token_id) {
+            Ok(vocab) => {
+                info!(
+                    "MlxWorker: grammar vocabulary built ({} tokens, eos={})",
+                    vocab.len(),
+                    eos_token_id
+                );
+                self.grammar_vocabulary = Some(vocab);
+            }
+            Err(e) => {
+                warn!("MlxWorker: failed to build grammar vocabulary: {e}");
+            }
         }
     }
 
@@ -401,6 +445,10 @@ impl Worker for MlxWorker {
         self.model = Some(model);
         let quant_str = if is_quantized { ", quantized" } else { "" };
         info!("MlxWorker: model loaded (arch={arch}, dtype={dtype:?}{quant_str})");
+
+        // Build grammar vocabulary from tokenizer for constrained decoding.
+        self.try_build_grammar_vocabulary();
+
         Ok(())
     }
 
@@ -448,6 +496,7 @@ impl Worker for MlxWorker {
             self.token_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.kv_caches.remove(req_id);
+            self.grammar_states.remove(req_id);
         }
 
         // Collect requests.
@@ -476,6 +525,29 @@ impl Worker for MlxWorker {
             self.token_buffers
                 .insert(new_req.req_id.clone(), prompt_ids.to_vec());
             if let Some(ref params) = new_req.sampling_params {
+                // Create grammar guide for constrained decoding if requested.
+                if let Some(ref grammar) = params.guided_grammar {
+                    if let Some(ref vocab) = self.grammar_vocabulary {
+                        match vllm_models::grammar::GrammarGuide::from_guided_grammar(
+                            grammar, vocab,
+                        ) {
+                            Ok(guide) => {
+                                self.grammar_states.insert(new_req.req_id.clone(), guide);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to compile grammar for request {}: {e}",
+                                    new_req.req_id
+                                );
+                            }
+                        }
+                    } else {
+                        warn!(
+                            "Grammar requested for {} but no vocabulary available",
+                            new_req.req_id
+                        );
+                    }
+                }
                 self.sampling_params_map
                     .insert(new_req.req_id.clone(), params.clone());
             }
@@ -606,17 +678,25 @@ impl Worker for MlxWorker {
                 logits
             };
 
-            // Determine if we need CPU-side sampling (penalties/logprobs/etc.).
+            // Query grammar-allowed tokens if constrained decoding is active.
+            let grammar_allowed: Option<Vec<u32>> = self
+                .grammar_states
+                .get(&req_input.req_id)
+                .and_then(|g| g.allowed_tokens());
+            let has_grammar = grammar_allowed.is_some();
+
+            // Determine if we need CPU-side sampling (penalties/logprobs/grammar/etc.).
             let params = self.sampling_params_map.get(&req_input.req_id);
-            let needs_cpu_sampling = params.is_some_and(|p| {
-                p.repetition_penalty != 1.0
-                    || p.frequency_penalty != 0.0
-                    || p.presence_penalty != 0.0
-                    || p.min_p > 0.0
-                    || p.logit_bias.is_some()
-                    || p.logprobs.is_some()
-                    || (p.top_k > 0 || p.top_p < 1.0)
-            });
+            let needs_cpu_sampling = has_grammar
+                || params.is_some_and(|p| {
+                    p.repetition_penalty != 1.0
+                        || p.frequency_penalty != 0.0
+                        || p.presence_penalty != 0.0
+                        || p.min_p > 0.0
+                        || p.logit_bias.is_some()
+                        || p.logprobs.is_some()
+                        || (p.top_k > 0 || p.top_p < 1.0)
+                });
 
             let sampled = if needs_cpu_sampling {
                 // Eval the logits graph, extract to CPU Vec<f32>, and use
@@ -638,7 +718,8 @@ impl Worker for MlxWorker {
                     .get(&req_input.req_id)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
-                let (token_id, maybe_logprobs) = cpu_sampler.sample_one(flat, p, prev_tokens);
+                let (token_id, maybe_logprobs) =
+                    cpu_sampler.sample_one(flat, p, prev_tokens, grammar_allowed.as_deref());
                 if let Some(lp) = maybe_logprobs {
                     logprobs_map
                         .entry(req_input.req_id.clone())
@@ -655,6 +736,13 @@ impl Worker for MlxWorker {
             };
 
             let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+
+            // Advance grammar state with the sampled token.
+            if let Some(guide) = self.grammar_states.get_mut(&req_input.req_id)
+                && let Some(&token_id) = sampled.first()
+            {
+                guide.advance(token_id);
+            }
 
             // Update token buffer.
             if let Some(buf) = self.token_buffers.get_mut(&req_input.req_id) {

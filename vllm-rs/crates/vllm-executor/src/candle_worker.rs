@@ -107,6 +107,10 @@ pub struct CandleWorker {
     num_kv_heads: usize,
     /// Model head dimension (set after load_model).
     head_dim: usize,
+    /// Per-request grammar guide state for constrained decoding.
+    grammar_states: HashMap<String, vllm_models::grammar::GrammarGuide>,
+    /// Compiled vocabulary for grammar-guided decoding (built once from tokenizer).
+    grammar_vocabulary: Option<outlines_core::vocabulary::Vocabulary>,
 }
 
 impl CandleWorker {
@@ -130,6 +134,8 @@ impl CandleWorker {
             kv_caches: HashMap::new(),
             num_kv_heads: 0,
             head_dim: 0,
+            grammar_states: HashMap::new(),
+            grammar_vocabulary: None,
         }
     }
 
@@ -146,6 +152,48 @@ impl CandleWorker {
     /// Get the resolved model dtype (after `load_model` has been called).
     pub fn resolved_dtype(&self) -> Option<DType> {
         self.resolved_dtype
+    }
+
+    /// Try to build grammar vocabulary from the model's tokenizer.
+    ///
+    /// Best-effort: logs a warning if tokenizer.json is not found or
+    /// vocabulary construction fails. Grammar-guided decoding will be
+    /// unavailable for those models.
+    fn try_build_grammar_vocabulary(&mut self) {
+        let Some(model_dir) = &self.model_dir else {
+            return;
+        };
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        if !tokenizer_path.exists() {
+            info!("CandleWorker: no tokenizer.json found, grammar-guided decoding unavailable");
+            return;
+        }
+        let tokenizer = match tokenizers::Tokenizer::from_file(&tokenizer_path) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("CandleWorker: failed to load tokenizer.json for grammar vocabulary: {e}");
+                return;
+            }
+        };
+
+        // Extract vocabulary: (token_id, token_string) pairs.
+        let hf_vocab = tokenizer.get_vocab(true);
+        let eos_token_id = tokenizer.token_to_id("</s>").unwrap_or(0);
+        let tokens: Vec<(u32, String)> = hf_vocab.into_iter().map(|(s, id)| (id, s)).collect();
+
+        match vllm_models::grammar::build_vocabulary(&tokens, eos_token_id) {
+            Ok(vocab) => {
+                info!(
+                    "CandleWorker: grammar vocabulary built ({} tokens, eos={})",
+                    vocab.len(),
+                    eos_token_id
+                );
+                self.grammar_vocabulary = Some(vocab);
+            }
+            Err(e) => {
+                warn!("CandleWorker: failed to build grammar vocabulary: {e}");
+            }
+        }
     }
 
     /// Check if the model path points to a GGUF file, resolving HF downloads
@@ -409,6 +457,10 @@ impl CandleWorker {
             "CandleWorker: GGUF model loaded (arch={arch}, kv_dtype={:?})",
             dtype
         );
+
+        // Build grammar vocabulary from tokenizer for constrained decoding.
+        self.try_build_grammar_vocabulary();
+
         Ok(())
     }
 
@@ -616,6 +668,10 @@ impl Worker for CandleWorker {
             "CandleWorker: model loaded (arch={arch}, dtype={:?})",
             dtype
         );
+
+        // Build grammar vocabulary from tokenizer for constrained decoding.
+        self.try_build_grammar_vocabulary();
+
         Ok(())
     }
 
@@ -699,6 +755,7 @@ impl Worker for CandleWorker {
             self.kv_caches.remove(req_id);
             self.req_block_tables.remove(req_id);
             self.req_tokens_in_pool.remove(req_id);
+            self.grammar_states.remove(req_id);
         }
 
         struct ReqInput {
@@ -728,6 +785,29 @@ impl Worker for CandleWorker {
 
             // Store sampling params if provided.
             if let Some(ref params) = new_req.sampling_params {
+                // Create grammar guide for constrained decoding if requested.
+                if let Some(ref grammar) = params.guided_grammar {
+                    if let Some(ref vocab) = self.grammar_vocabulary {
+                        match vllm_models::grammar::GrammarGuide::from_guided_grammar(
+                            grammar, vocab,
+                        ) {
+                            Ok(guide) => {
+                                self.grammar_states.insert(new_req.req_id.clone(), guide);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to compile grammar for request {}: {e}",
+                                    new_req.req_id
+                                );
+                            }
+                        }
+                    } else {
+                        warn!(
+                            "Grammar requested for {} but no vocabulary available",
+                            new_req.req_id
+                        );
+                    }
+                }
                 self.sampling_params_map
                     .insert(new_req.req_id.clone(), params.clone());
             }
@@ -929,14 +1009,24 @@ impl Worker for CandleWorker {
                 .to_vec1::<f32>()
                 .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
 
+            // Query grammar-allowed tokens if constrained decoding is active.
+            let grammar_allowed: Option<Vec<u32>> = self
+                .grammar_states
+                .get(&req_input.req_id)
+                .and_then(|g| g.allowed_tokens());
+
             let sampled = if let Some(params) = self.sampling_params_map.get(&req_input.req_id) {
                 let prev_tokens = self
                     .token_buffers
                     .get(&req_input.req_id)
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
-                let (token_id, maybe_logprobs) =
-                    sampler.sample_one(&logits_vec, params, prev_tokens);
+                let (token_id, maybe_logprobs) = sampler.sample_one(
+                    &logits_vec,
+                    params,
+                    prev_tokens,
+                    grammar_allowed.as_deref(),
+                );
                 if let Some(lp) = maybe_logprobs {
                     logprobs_map
                         .entry(req_input.req_id.clone())
@@ -952,6 +1042,13 @@ impl Worker for CandleWorker {
                     .to_vec1::<u32>()
                     .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?
             };
+
+            // Advance grammar state with the sampled token.
+            if let Some(guide) = self.grammar_states.get_mut(&req_input.req_id)
+                && let Some(&token_id) = sampled.first()
+            {
+                guide.advance(token_id);
+            }
 
             // Update the token buffer with the new sampled token(s).
             if let Some(buf) = self.token_buffers.get_mut(&req_input.req_id) {

@@ -15,6 +15,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, error};
 use uuid::Uuid;
+use vllm_common::sampling::GuidedGrammar;
 use vllm_common::{EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, StopReason};
 use vllm_engine::core_client::EngineCoreClient;
 
@@ -237,7 +238,7 @@ impl AsyncEngine {
             .unwrap_or_else(|| self.model_name.clone());
         let n = request.n.max(1) as usize;
 
-        let mut sampling_params = self.build_sampling_params_from_chat(&request);
+        let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
 
         // Tokenize prompt once.
         let ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
@@ -407,7 +408,7 @@ impl AsyncEngine {
             .unwrap_or_else(|| self.model_name.clone());
         let n = request.n.max(1) as usize;
 
-        let mut sampling_params = self.build_sampling_params_from_chat(&request);
+        let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
         let ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
         let prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
         let num_prompt_tokens = prompt_token_ids.len() as u32;
@@ -1225,7 +1226,7 @@ impl AsyncEngine {
     fn build_sampling_params_from_chat(
         &self,
         request: &protocol::ChatCompletionRequest,
-    ) -> SamplingParams {
+    ) -> ServeResult<SamplingParams> {
         let stop = match &request.stop {
             Some(protocol::StopCondition::Single(s)) => vec![s.clone()],
             Some(protocol::StopCondition::Multiple(v)) => v.clone(),
@@ -1241,7 +1242,10 @@ impl AsyncEngine {
             None
         };
 
-        SamplingParams {
+        // Parse response_format → guided_grammar.
+        let guided_grammar = parse_response_format(&request.response_format)?;
+
+        Ok(SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
             top_k: request.top_k.unwrap_or(0),
@@ -1259,8 +1263,9 @@ impl AsyncEngine {
             skip_special_tokens: request.skip_special_tokens,
             logprobs,
             logit_bias: parse_logit_bias(&request.logit_bias),
+            guided_grammar,
             ..Default::default()
-        }
+        })
     }
 
     /// Build SamplingParams from a completion request.
@@ -1322,6 +1327,38 @@ fn parse_logit_bias(
         None
     } else {
         Some(parsed)
+    }
+}
+
+/// Parse `response_format` from an API request into a `GuidedGrammar`.
+///
+/// - `type: "text"` → `None` (no constraint)
+/// - `type: "json_object"` → `Some(GuidedGrammar::Json)`
+/// - `type: "json_schema"` → `Some(GuidedGrammar::JsonSchema { schema })`
+fn parse_response_format(
+    rf: &Option<protocol::ResponseFormat>,
+) -> ServeResult<Option<GuidedGrammar>> {
+    let Some(rf) = rf else {
+        return Ok(None);
+    };
+    match rf.format_type.as_str() {
+        "text" => Ok(None),
+        "json_object" => Ok(Some(GuidedGrammar::Json)),
+        "json_schema" => {
+            let schema = rf
+                .json_schema
+                .as_ref()
+                .and_then(|js| js.json_schema.clone())
+                .ok_or_else(|| {
+                    ServeError::Validation(
+                        "response_format type 'json_schema' requires json_schema.schema".into(),
+                    )
+                })?;
+            Ok(Some(GuidedGrammar::JsonSchema { schema }))
+        }
+        other => Err(ServeError::Validation(format!(
+            "unsupported response_format type: {other:?}. Must be 'text', 'json_object', or 'json_schema'",
+        ))),
     }
 }
 
@@ -1560,7 +1597,7 @@ mod tests {
     fn test_chat_to_engine_request_without_tokenizer() {
         let engine = make_test_engine();
         let request = make_chat_request();
-        let params = engine.build_sampling_params_from_chat(&request);
+        let params = engine.build_sampling_params_from_chat(&request).unwrap();
         let ec_req = engine
             .chat_to_engine_request("test-1", &request, &params)
             .unwrap();
@@ -1576,7 +1613,7 @@ mod tests {
     fn test_chat_to_engine_request_with_tokenizer() {
         let engine = make_test_engine_with_tokenizer();
         let request = make_chat_request();
-        let params = engine.build_sampling_params_from_chat(&request);
+        let params = engine.build_sampling_params_from_chat(&request).unwrap();
         let ec_req = engine
             .chat_to_engine_request("test-1", &request, &params)
             .unwrap();
@@ -1844,7 +1881,7 @@ mod tests {
         ]));
         request.include_stop_str_in_output = true;
 
-        let params = engine.build_sampling_params_from_chat(&request);
+        let params = engine.build_sampling_params_from_chat(&request).unwrap();
         assert_eq!(params.stop, vec!["END", "STOP"]);
         assert!(params.include_stop_str_in_output);
     }
@@ -2090,5 +2127,80 @@ mod tests {
 
         let delta = rx.try_recv().unwrap();
         assert_eq!(delta.index, 7);
+    }
+
+    // ---------------------------------------------------------------
+    // parse_response_format tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_parse_response_format_none() {
+        let result = parse_response_format(&None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_response_format_text() {
+        let rf = protocol::ResponseFormat {
+            format_type: "text".to_string(),
+            json_schema: None,
+        };
+        let result = parse_response_format(&Some(rf)).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_response_format_json_object() {
+        let rf = protocol::ResponseFormat {
+            format_type: "json_object".to_string(),
+            json_schema: None,
+        };
+        let result = parse_response_format(&Some(rf)).unwrap();
+        assert!(matches!(result, Some(GuidedGrammar::Json)));
+    }
+
+    #[test]
+    fn test_parse_response_format_json_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } },
+            "required": ["name"]
+        });
+        let rf = protocol::ResponseFormat {
+            format_type: "json_schema".to_string(),
+            json_schema: Some(protocol::JsonSchemaResponseFormat {
+                name: "test".to_string(),
+                description: None,
+                json_schema: Some(schema.clone()),
+                strict: None,
+            }),
+        };
+        let result = parse_response_format(&Some(rf)).unwrap();
+        match result {
+            Some(GuidedGrammar::JsonSchema { schema: s }) => {
+                assert_eq!(s, schema);
+            }
+            other => panic!("expected JsonSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_response_format_json_schema_missing_schema() {
+        let rf = protocol::ResponseFormat {
+            format_type: "json_schema".to_string(),
+            json_schema: None,
+        };
+        let result = parse_response_format(&Some(rf));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_response_format_invalid_type() {
+        let rf = protocol::ResponseFormat {
+            format_type: "xml".to_string(),
+            json_schema: None,
+        };
+        let result = parse_response_format(&Some(rf));
+        assert!(result.is_err());
     }
 }

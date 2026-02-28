@@ -25,7 +25,7 @@ use crate::tensor::{self, TensorInfo};
 
 /// A loaded safetensors file that can yield tensors on demand.
 pub struct SafeTensorsFile {
-    /// Memory-mapped file data.
+    /// Raw file data (header + tensor bytes).
     data: Vec<u8>,
     /// Path for diagnostics.
     path: PathBuf,
@@ -36,35 +36,27 @@ impl SafeTensorsFile {
     pub fn open(path: impl AsRef<Path>) -> ModelResult<Self> {
         let path = path.as_ref().to_path_buf();
         let data = std::fs::read(&path)?;
-        // Validate by parsing the header.
+        // Validate the header.
         SafeTensors::deserialize(&data)
             .map_err(|e| ModelError::SafeTensors(format!("{}: {}", path.display(), e)))?;
         Ok(Self { data, path })
     }
 
-    /// Open a safetensors file using memory mapping (for large files).
-    pub fn open_mmap(path: impl AsRef<Path>) -> ModelResult<Self> {
-        let path = path.as_ref().to_path_buf();
-        let file = std::fs::File::open(&path)?;
-        // SAFETY: The file is opened read-only and we don't modify it.
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let data = mmap.to_vec(); // Copy into owned buffer for safetensors API
-        SafeTensors::deserialize(&data)
-            .map_err(|e| ModelError::SafeTensors(format!("{}: {}", path.display(), e)))?;
-        Ok(Self { data, path })
+    /// Parse the safetensors header from the in-memory data.
+    fn parsed(&self) -> ModelResult<SafeTensors<'_>> {
+        SafeTensors::deserialize(&self.data)
+            .map_err(|e| ModelError::SafeTensors(format!("{}: {}", self.path.display(), e)))
     }
 
     /// List all tensor names in this file.
     pub fn tensor_names(&self) -> ModelResult<Vec<String>> {
-        let st = SafeTensors::deserialize(&self.data)
-            .map_err(|e| ModelError::SafeTensors(format!("{}: {}", self.path.display(), e)))?;
+        let st = self.parsed()?;
         Ok(st.names().into_iter().map(|s| s.to_string()).collect())
     }
 
     /// Get metadata about all tensors without loading their data.
     pub fn tensor_infos(&self) -> ModelResult<Vec<TensorInfo>> {
-        let st = SafeTensors::deserialize(&self.data)
-            .map_err(|e| ModelError::SafeTensors(format!("{}: {}", self.path.display(), e)))?;
+        let st = self.parsed()?;
         let mut infos = Vec::new();
         for name in st.names() {
             let view = st
@@ -82,8 +74,7 @@ impl SafeTensorsFile {
 
     /// Load a single tensor by name onto the given device.
     pub fn load_tensor(&self, name: &str, device: &Device) -> ModelResult<Tensor> {
-        let st = SafeTensors::deserialize(&self.data)
-            .map_err(|e| ModelError::SafeTensors(format!("{}: {}", self.path.display(), e)))?;
+        let st = self.parsed()?;
         let view = st
             .tensor(name)
             .map_err(|e| ModelError::SafeTensors(format!("{}: {}", name, e)))?;
@@ -108,8 +99,7 @@ impl SafeTensorsFile {
 
     /// Iterate over all tensors, loading each onto the given device.
     pub fn load_all(&self, device: &Device) -> ModelResult<Vec<(String, Tensor)>> {
-        let st = SafeTensors::deserialize(&self.data)
-            .map_err(|e| ModelError::SafeTensors(format!("{}: {}", self.path.display(), e)))?;
+        let st = self.parsed()?;
         let mut tensors = Vec::new();
         for name in st.names() {
             let view = st

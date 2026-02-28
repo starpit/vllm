@@ -8,6 +8,8 @@
 //! producing the formatted prompt string that the model expects.
 //!
 //! Uses `minijinja` (a Rust Jinja2 engine) for template rendering.
+//! The `Environment` and compiled template are built once at construction time
+//! and reused for every request, avoiding per-request template compilation.
 
 use std::path::Path;
 
@@ -21,14 +23,18 @@ use crate::error::ServeError;
 // ---------------------------------------------------------------------------
 
 /// A parsed chat template that can format messages for a specific model.
-#[derive(Clone)]
+///
+/// The minijinja `Environment` (with the compiled template) is built once
+/// at construction time and reused on every `apply()` call.
 pub struct ChatTemplate {
-    /// The raw Jinja2 template string.
-    template_str: String,
+    /// Pre-compiled minijinja environment with the "chat" template loaded.
+    env: Environment<'static>,
     /// Optional BOS token string (e.g. "<s>", "<|begin_of_text|>").
     bos_token: Option<String>,
     /// Optional EOS token string (e.g. "</s>", "<|end_of_text|>").
     eos_token: Option<String>,
+    /// The raw Jinja2 template string (kept for `template_str()` accessor).
+    template_str: String,
 }
 
 /// A single chat message for template rendering.
@@ -47,14 +53,33 @@ struct TokenizerConfig {
     eos_token: Option<serde_json::Value>,
 }
 
+/// Build a minijinja Environment with the given template string compiled as "chat".
+fn build_env(template_str: &str) -> Result<Environment<'static>, ServeError> {
+    let mut env = Environment::new();
+
+    // Enable Python string/dict/list methods (startswith, endswith, etc.)
+    // that HuggingFace Jinja2 chat templates commonly use.
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+
+    // Add a `raise_exception` function that Jinja2 templates often use.
+    env.add_function("raise_exception", raise_exception);
+
+    env.add_template_owned("chat", template_str.to_owned())
+        .map_err(|e| ServeError::Internal(format!("invalid chat template: {e}")))?;
+
+    Ok(env)
+}
+
 impl ChatTemplate {
     /// Create a `ChatTemplate` from a raw Jinja2 template string.
-    pub fn new(template_str: String) -> Self {
-        Self {
-            template_str,
+    pub fn new(template_str: String) -> Result<Self, ServeError> {
+        let env = build_env(&template_str)?;
+        Ok(Self {
+            env,
             bos_token: None,
             eos_token: None,
-        }
+            template_str,
+        })
     }
 
     /// Set the BOS token string used by the template.
@@ -123,7 +148,7 @@ impl ChatTemplate {
         let bos_token = extract_token_string(config.bos_token);
         let eos_token = extract_token_string(config.eos_token);
 
-        let mut tpl = ChatTemplate::new(template_str);
+        let mut tpl = ChatTemplate::new(template_str)?;
         if let Some(bos) = bos_token {
             tpl = tpl.with_bos_token(bos);
         }
@@ -146,19 +171,8 @@ impl ChatTemplate {
         add_generation_prompt: bool,
         tools: Option<&serde_json::Value>,
     ) -> Result<String, ServeError> {
-        let mut env = Environment::new();
-
-        // Enable Python string/dict/list methods (startswith, endswith, etc.)
-        // that HuggingFace Jinja2 chat templates commonly use.
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-
-        // Add a `raise_exception` function that Jinja2 templates often use.
-        env.add_function("raise_exception", raise_exception);
-
-        env.add_template("chat", &self.template_str)
-            .map_err(|e| ServeError::Internal(format!("invalid chat template: {e}")))?;
-
-        let tmpl = env
+        let tmpl = self
+            .env
             .get_template("chat")
             .map_err(|e| ServeError::Internal(format!("failed to get template: {e}")))?;
 
@@ -289,7 +303,7 @@ mod tests {
     fn test_simple_template() {
         let tpl = ChatTemplate::new(
             "{% for message in messages %}{{ message.role }}: {{ message.content }}\n{% endfor %}{% if add_generation_prompt %}assistant: {% endif %}".to_string(),
-        );
+        ).unwrap();
 
         let messages = vec![TemplateMessage {
             role: "user".to_string(),
@@ -306,7 +320,7 @@ mod tests {
         // ChatML format used by Qwen, Yi, etc.
         let tpl = ChatTemplate::new(
             "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}".to_string(),
-        );
+        ).unwrap();
 
         let messages = vec![
             TemplateMessage {
@@ -329,7 +343,7 @@ mod tests {
     fn test_bos_eos_tokens() {
         let tpl = ChatTemplate::new(
             "{{ bos_token }}{% for message in messages %}{{ message.content }}{% endfor %}{{ eos_token }}".to_string(),
-        )
+        ).unwrap()
         .with_bos_token("<s>".to_string())
         .with_eos_token("</s>".to_string());
 
@@ -346,7 +360,7 @@ mod tests {
     fn test_no_generation_prompt() {
         let tpl = ChatTemplate::new(
             "{% for message in messages %}{{ message.role }}: {{ message.content }}\n{% endfor %}{% if add_generation_prompt %}GENERATE{% endif %}".to_string(),
-        );
+        ).unwrap();
 
         let messages = vec![TemplateMessage {
             role: "user".to_string(),
@@ -364,7 +378,8 @@ mod tests {
     fn test_empty_messages() {
         let tpl = ChatTemplate::new(
             "{% for message in messages %}{{ message.content }}{% endfor %}".to_string(),
-        );
+        )
+        .unwrap();
 
         let result = tpl.apply_simple(&[], false).unwrap();
         assert_eq!(result, "");
@@ -374,7 +389,7 @@ mod tests {
     fn test_multi_turn_conversation() {
         let tpl = ChatTemplate::new(
             "{% for message in messages %}[{{ message.role|upper }}] {{ message.content }}\n{% endfor %}".to_string(),
-        );
+        ).unwrap();
 
         let messages = vec![
             TemplateMessage {
@@ -428,7 +443,7 @@ mod tests {
         // Template that dumps tools via tojson.
         let tpl = ChatTemplate::new(
             "{% if tools %}TOOLS:{{ tools | tojson }}{% endif %}{% for message in messages %}{{ message.role }}: {{ message.content }}\n{% endfor %}".to_string(),
-        );
+        ).unwrap();
 
         let messages = vec![serde_json::json!({"role": "user", "content": "Hi"})];
         let tools = serde_json::json!([
@@ -445,7 +460,7 @@ mod tests {
         // Template that accesses tool_calls on a message.
         let tpl = ChatTemplate::new(
             "{% for message in messages %}{{ message.role }}:{% if message.tool_calls %} CALL={{ message.tool_calls[0].function.name }}{% endif %} {{ message.content }}\n{% endfor %}".to_string(),
-        );
+        ).unwrap();
 
         let messages = vec![
             serde_json::json!({
@@ -472,7 +487,8 @@ mod tests {
     #[test]
     fn test_no_tools_omitted_from_template() {
         let tpl =
-            ChatTemplate::new("{% if tools %}HAS_TOOLS{% else %}NO_TOOLS{% endif %}".to_string());
+            ChatTemplate::new("{% if tools %}HAS_TOOLS{% else %}NO_TOOLS{% endif %}".to_string())
+                .unwrap();
 
         let result = tpl.apply(&[], false, None).unwrap();
         assert!(result.contains("NO_TOOLS"));
@@ -484,7 +500,7 @@ mod tests {
 
     #[test]
     fn test_date_string_in_template() {
-        let tpl = ChatTemplate::new("DATE:{{ date_string }}".to_string());
+        let tpl = ChatTemplate::new("DATE:{{ date_string }}".to_string()).unwrap();
         let result = tpl.apply(&[], false, None).unwrap();
         // Should contain a date like "28 Feb 2026".
         assert!(result.starts_with("DATE:"));

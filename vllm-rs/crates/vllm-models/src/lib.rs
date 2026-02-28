@@ -77,11 +77,11 @@ pub enum PendingWrite {
 ///
 /// Returned by `LayerKvHandle::paged_block_refs()` so that attention can
 /// read K/V directly from blocks without gathering into a contiguous tensor.
-pub struct PagedKvBlockRefs<'a> {
+pub struct PagedKvBlockRefs {
     /// K block tensors in sequence order, each `[block_size, num_kv_heads, head_dim]`.
-    pub k_blocks: Vec<&'a Tensor>,
+    pub k_blocks: Vec<Tensor>,
     /// V block tensors in sequence order, each `[block_size, num_kv_heads, head_dim]`.
-    pub v_blocks: Vec<&'a Tensor>,
+    pub v_blocks: Vec<Tensor>,
     /// Total number of cached tokens across all blocks.
     pub num_tokens: usize,
     /// Number of token slots per block.
@@ -240,7 +240,7 @@ impl LayerKvHandle<'_> {
     /// Returns `Some(PagedKvBlockRefs)` when this is a paged handle with
     /// `tokens_before > 0` (i.e., there are cached tokens to read).
     /// Returns `None` for contiguous handles or when there are no cached tokens.
-    pub fn paged_block_refs(&self) -> Option<PagedKvBlockRefs<'_>> {
+    pub fn paged_block_refs(&self) -> Option<PagedKvBlockRefs> {
         match self {
             LayerKvHandle::Contiguous(_) => None,
             LayerKvHandle::Paged {

@@ -1384,7 +1384,7 @@ mod tests {
     #[test]
     fn test_gemma2_attention_forward() {
         let config = test_config();
-        let mut attn = MlxGemma2Attention::new(&config).unwrap();
+        let mut attn = MlxGemma2Attention::new(&config, None).unwrap();
 
         let x = mlx_rs::ops::ones::<f32>(&[4, 32]).unwrap();
         let positions = Array::from_iter(0..4i32, &[4]);

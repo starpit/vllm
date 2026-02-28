@@ -19,7 +19,6 @@ serde_json = { workspace = true }
 candle-core = { workspace = true }
 safetensors = { workspace = true }
 half = { workspace = true }
-memmap2 = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

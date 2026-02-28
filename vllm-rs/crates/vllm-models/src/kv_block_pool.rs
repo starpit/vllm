@@ -15,6 +15,12 @@
 //! Each block stores `block_size` token slots of K and V tensors for every
 //! layer. The shape of each block tensor is
 //! `[block_size, num_kv_heads, head_dim]`.
+//!
+//! **Allocation strategy**: Instead of allocating `num_blocks × num_layers × 2`
+//! individual tensors, we allocate one large tensor per layer per K/V of shape
+//! `[num_blocks, block_size, num_kv_heads, head_dim]` and `narrow()` to get
+//! individual block views. This collapses allocation count from O(blocks×layers)
+//! to O(layers).
 
 use candle_core::{DType, Device, Tensor};
 use vllm_model::ModelResult;
@@ -26,12 +32,12 @@ use vllm_model::error::ModelError;
 /// `vllm-core`. The CandleWorker translates between scheduler block IDs
 /// and tensor storage via this pool.
 pub struct KvBlockPool {
-    /// Per-layer Vec of K block tensors.
-    /// `k_blocks[layer][block_idx]` has shape `[block_size, num_kv_heads, head_dim]`.
-    k_blocks: Vec<Vec<Tensor>>,
-    /// Per-layer Vec of V block tensors.
-    /// `v_blocks[layer][block_idx]` has shape `[block_size, num_kv_heads, head_dim]`.
-    v_blocks: Vec<Vec<Tensor>>,
+    /// Per-layer K storage tensor.
+    /// `k_storage[layer]` has shape `[num_blocks, block_size, num_kv_heads, head_dim]`.
+    k_storage: Vec<Tensor>,
+    /// Per-layer V storage tensor.
+    /// `v_storage[layer]` has shape `[num_blocks, block_size, num_kv_heads, head_dim]`.
+    v_storage: Vec<Tensor>,
     /// Number of token slots currently filled in each block.
     /// `tokens_in_block[block_idx]` is in `0..=block_size`.
     tokens_in_block: Vec<usize>,
@@ -55,29 +61,33 @@ impl KvBlockPool {
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
-        let mut k_blocks = Vec::with_capacity(num_layers);
-        let mut v_blocks = Vec::with_capacity(num_layers);
+        let mut k_storage = Vec::with_capacity(num_layers);
+        let mut v_storage = Vec::with_capacity(num_layers);
 
+        // Allocate one big tensor per layer: [num_blocks, block_size, num_kv_heads, head_dim].
+        // This replaces num_blocks individual Tensor::zeros() calls per layer.
         for _ in 0..num_layers {
-            let mut layer_k = Vec::with_capacity(num_blocks);
-            let mut layer_v = Vec::with_capacity(num_blocks);
-            for _ in 0..num_blocks {
-                layer_k.push(
-                    Tensor::zeros((block_size, num_kv_heads, head_dim), dtype, device)
-                        .map_err(ModelError::Candle)?,
-                );
-                layer_v.push(
-                    Tensor::zeros((block_size, num_kv_heads, head_dim), dtype, device)
-                        .map_err(ModelError::Candle)?,
-                );
-            }
-            k_blocks.push(layer_k);
-            v_blocks.push(layer_v);
+            k_storage.push(
+                Tensor::zeros(
+                    (num_blocks, block_size, num_kv_heads, head_dim),
+                    dtype,
+                    device,
+                )
+                .map_err(ModelError::Candle)?,
+            );
+            v_storage.push(
+                Tensor::zeros(
+                    (num_blocks, block_size, num_kv_heads, head_dim),
+                    dtype,
+                    device,
+                )
+                .map_err(ModelError::Candle)?,
+            );
         }
 
         Ok(Self {
-            k_blocks,
-            v_blocks,
+            k_storage,
+            v_storage,
             tokens_in_block: vec![0; num_blocks],
             block_size,
             num_layers,
@@ -116,16 +126,24 @@ impl KvBlockPool {
 
     /// Read-only reference to a K block tensor for a given layer and block index.
     ///
-    /// Shape: `[block_size, num_kv_heads, head_dim]`.
-    pub fn k_block(&self, layer: usize, block_idx: usize) -> &Tensor {
-        &self.k_blocks[layer][block_idx]
+    /// Returns a view of shape `[block_size, num_kv_heads, head_dim]`.
+    pub fn k_block(&self, layer: usize, block_idx: usize) -> Tensor {
+        self.k_storage[layer]
+            .narrow(0, block_idx, 1)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
     }
 
     /// Read-only reference to a V block tensor for a given layer and block index.
     ///
-    /// Shape: `[block_size, num_kv_heads, head_dim]`.
-    pub fn v_block(&self, layer: usize, block_idx: usize) -> &Tensor {
-        &self.v_blocks[layer][block_idx]
+    /// Returns a view of shape `[block_size, num_kv_heads, head_dim]`.
+    pub fn v_block(&self, layer: usize, block_idx: usize) -> Tensor {
+        self.v_storage[layer]
+            .narrow(0, block_idx, 1)
+            .unwrap()
+            .squeeze(0)
+            .unwrap()
     }
 
     /// How many token slots are filled in a block.
@@ -153,13 +171,36 @@ impl KvBlockPool {
         k_token: &Tensor,
         v_token: &Tensor,
     ) -> ModelResult<()> {
+        // Get the block view: [block_size, num_kv_heads, head_dim]
+        let k_block = self.k_storage[layer]
+            .narrow(0, block_idx, 1)
+            .map_err(ModelError::Candle)?
+            .squeeze(0)
+            .map_err(ModelError::Candle)?;
+        let v_block = self.v_storage[layer]
+            .narrow(0, block_idx, 1)
+            .map_err(ModelError::Candle)?
+            .squeeze(0)
+            .map_err(ModelError::Candle)?;
+
         let k_3d = k_token.unsqueeze(0).map_err(ModelError::Candle)?;
         let v_3d = v_token.unsqueeze(0).map_err(ModelError::Candle)?;
-        self.k_blocks[layer][block_idx] = self.k_blocks[layer][block_idx]
+
+        let new_k_block = k_block
             .slice_scatter0(&k_3d, position_in_block)
             .map_err(ModelError::Candle)?;
-        self.v_blocks[layer][block_idx] = self.v_blocks[layer][block_idx]
+        let new_v_block = v_block
             .slice_scatter0(&v_3d, position_in_block)
+            .map_err(ModelError::Candle)?;
+
+        // Write back into storage: unsqueeze to [1, block_size, ...] and scatter at block_idx.
+        let new_k_4d = new_k_block.unsqueeze(0).map_err(ModelError::Candle)?;
+        let new_v_4d = new_v_block.unsqueeze(0).map_err(ModelError::Candle)?;
+        self.k_storage[layer] = self.k_storage[layer]
+            .slice_scatter0(&new_k_4d, block_idx)
+            .map_err(ModelError::Candle)?;
+        self.v_storage[layer] = self.v_storage[layer]
+            .slice_scatter0(&new_v_4d, block_idx)
             .map_err(ModelError::Candle)?;
         Ok(())
     }
@@ -202,16 +243,19 @@ impl KvBlockPool {
                 break;
             }
             let n = remaining.min(self.block_size);
-            k_parts.push(
-                self.k_blocks[layer][bid]
-                    .narrow(0, 0, n)
-                    .map_err(ModelError::Candle)?,
-            );
-            v_parts.push(
-                self.v_blocks[layer][bid]
-                    .narrow(0, 0, n)
-                    .map_err(ModelError::Candle)?,
-            );
+            // narrow from the big storage: [num_blocks, block_size, ...] → [1, block_size, ...] → [n, ...]
+            let k_block = self.k_storage[layer]
+                .narrow(0, bid, 1)
+                .map_err(ModelError::Candle)?
+                .squeeze(0)
+                .map_err(ModelError::Candle)?;
+            let v_block = self.v_storage[layer]
+                .narrow(0, bid, 1)
+                .map_err(ModelError::Candle)?
+                .squeeze(0)
+                .map_err(ModelError::Candle)?;
+            k_parts.push(k_block.narrow(0, 0, n).map_err(ModelError::Candle)?);
+            v_parts.push(v_block.narrow(0, 0, n).map_err(ModelError::Candle)?);
             remaining -= n;
         }
 
@@ -267,11 +311,32 @@ impl KvBlockPool {
             let k_token = new_k.narrow(0, i, 1).map_err(ModelError::Candle)?;
             let v_token = new_v.narrow(0, i, 1).map_err(ModelError::Candle)?;
 
-            self.k_blocks[layer][bid] = self.k_blocks[layer][bid]
+            // Get block view, scatter token, write back.
+            let k_block = self.k_storage[layer]
+                .narrow(0, bid, 1)
+                .map_err(ModelError::Candle)?
+                .squeeze(0)
+                .map_err(ModelError::Candle)?;
+            let v_block = self.v_storage[layer]
+                .narrow(0, bid, 1)
+                .map_err(ModelError::Candle)?
+                .squeeze(0)
+                .map_err(ModelError::Candle)?;
+
+            let new_k_block = k_block
                 .slice_scatter0(&k_token, position_in_block)
                 .map_err(ModelError::Candle)?;
-            self.v_blocks[layer][bid] = self.v_blocks[layer][bid]
+            let new_v_block = v_block
                 .slice_scatter0(&v_token, position_in_block)
+                .map_err(ModelError::Candle)?;
+
+            let new_k_4d = new_k_block.unsqueeze(0).map_err(ModelError::Candle)?;
+            let new_v_4d = new_v_block.unsqueeze(0).map_err(ModelError::Candle)?;
+            self.k_storage[layer] = self.k_storage[layer]
+                .slice_scatter0(&new_k_4d, bid)
+                .map_err(ModelError::Candle)?;
+            self.v_storage[layer] = self.v_storage[layer]
+                .slice_scatter0(&new_v_4d, bid)
                 .map_err(ModelError::Candle)?;
         }
 
@@ -299,10 +364,18 @@ impl KvBlockPool {
     /// Copy all layers of a block (for copy-on-write).
     pub fn copy_block(&mut self, src_idx: usize, dst_idx: usize) -> ModelResult<()> {
         for layer in 0..self.num_layers {
-            let src_k = self.k_blocks[layer][src_idx].clone();
-            let src_v = self.v_blocks[layer][src_idx].clone();
-            self.k_blocks[layer][dst_idx] = src_k;
-            self.v_blocks[layer][dst_idx] = src_v;
+            let src_k = self.k_storage[layer]
+                .narrow(0, src_idx, 1)
+                .map_err(ModelError::Candle)?;
+            let src_v = self.v_storage[layer]
+                .narrow(0, src_idx, 1)
+                .map_err(ModelError::Candle)?;
+            self.k_storage[layer] = self.k_storage[layer]
+                .slice_scatter0(&src_k, dst_idx)
+                .map_err(ModelError::Candle)?;
+            self.v_storage[layer] = self.v_storage[layer]
+                .slice_scatter0(&src_v, dst_idx)
+                .map_err(ModelError::Candle)?;
         }
         self.tokens_in_block[dst_idx] = self.tokens_in_block[src_idx];
         Ok(())
@@ -310,19 +383,19 @@ impl KvBlockPool {
 
     /// Reset a block to zeros (for reuse after free).
     pub fn reset_block(&mut self, block_idx: usize) -> ModelResult<()> {
+        let zeros = Tensor::zeros(
+            (1, self.block_size, self.num_kv_heads, self.head_dim),
+            self.dtype,
+            &self.device,
+        )
+        .map_err(ModelError::Candle)?;
         for layer in 0..self.num_layers {
-            self.k_blocks[layer][block_idx] = Tensor::zeros(
-                (self.block_size, self.num_kv_heads, self.head_dim),
-                self.dtype,
-                &self.device,
-            )
-            .map_err(ModelError::Candle)?;
-            self.v_blocks[layer][block_idx] = Tensor::zeros(
-                (self.block_size, self.num_kv_heads, self.head_dim),
-                self.dtype,
-                &self.device,
-            )
-            .map_err(ModelError::Candle)?;
+            self.k_storage[layer] = self.k_storage[layer]
+                .slice_scatter0(&zeros, block_idx)
+                .map_err(ModelError::Candle)?;
+            self.v_storage[layer] = self.v_storage[layer]
+                .slice_scatter0(&zeros, block_idx)
+                .map_err(ModelError::Candle)?;
         }
         self.tokens_in_block[block_idx] = 0;
         Ok(())

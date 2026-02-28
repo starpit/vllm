@@ -154,12 +154,15 @@ impl CandleWorker {
         self.resolved_dtype
     }
 
-    /// Try to build grammar vocabulary from the model's tokenizer.
+    /// Build grammar vocabulary on demand (lazy — deferred from startup).
     ///
     /// Best-effort: logs a warning if tokenizer.json is not found or
     /// vocabulary construction fails. Grammar-guided decoding will be
     /// unavailable for those models.
-    fn try_build_grammar_vocabulary(&mut self) {
+    fn ensure_grammar_vocabulary(&mut self) {
+        if self.grammar_vocabulary.is_some() {
+            return;
+        }
         let Some(model_dir) = &self.model_dir else {
             return;
         };
@@ -458,8 +461,7 @@ impl CandleWorker {
             dtype
         );
 
-        // Build grammar vocabulary from tokenizer for constrained decoding.
-        self.try_build_grammar_vocabulary();
+        // Grammar vocabulary is built lazily on first constrained-decoding request.
 
         Ok(())
     }
@@ -669,8 +671,7 @@ impl Worker for CandleWorker {
             dtype
         );
 
-        // Build grammar vocabulary from tokenizer for constrained decoding.
-        self.try_build_grammar_vocabulary();
+        // Grammar vocabulary is built lazily on first constrained-decoding request.
 
         Ok(())
     }
@@ -736,6 +737,17 @@ impl Worker for CandleWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
+        // Lazily build grammar vocabulary if any new request needs constrained decoding.
+        // Done before borrowing self.model to satisfy the borrow checker.
+        let needs_grammar = scheduler_output.scheduled_new_reqs.iter().any(|r| {
+            r.sampling_params
+                .as_ref()
+                .is_some_and(|p| p.guided_grammar.is_some())
+        });
+        if needs_grammar {
+            self.ensure_grammar_vocabulary();
+        }
+
         let model = self
             .model
             .as_ref()

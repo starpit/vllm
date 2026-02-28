@@ -249,7 +249,7 @@ fn softmax_last_dim(x: &Tensor) -> ModelResult<Tensor> {
 /// Returns attention output of shape `[1, num_q_heads, head_dim]`.
 pub fn paged_decode_attention(
     q: &Tensor,
-    block_refs: &PagedKvBlockRefs<'_>,
+    block_refs: &PagedKvBlockRefs,
     k_new: &Tensor,
     v_new: &Tensor,
     scale: f64,

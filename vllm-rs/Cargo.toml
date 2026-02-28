@@ -67,7 +67,7 @@ zeromq = "0.4"
 tokenizers = "0.22"
 
 # Template engine (for HuggingFace chat templates)
-minijinja = { version = "2", features = ["builtins"] }
+minijinja = { version = "2", features = ["builtins", "json"] }
 
 # Tensor ops
 candle-core = "0.9"

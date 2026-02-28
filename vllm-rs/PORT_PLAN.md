@@ -53,7 +53,7 @@
 | **10e. MLX additional models** | **DONE** | Gemma v1 (2 norms, GemmaRmsNorm +1 offset, gelu_approximate, tied embeddings), Gemma2 (4 norms, logit softcapping), Phi-3 (fused qkv_proj + gate_up_proj, split_axis), Qwen2 bias loading, MlxEmbedTokens/MlxLmHead mixed-precision enums (582 tests) |
 | **11a. Memory profiling + `--gpu-memory-utilization`** | **DONE** | Real memory detection via `sysinfo` crate (CandleWorker: available RAM, MlxWorker: total unified memory), `--gpu-memory-utilization` CLI flag (default 0.9, env `VLLM_GPU_MEMORY_UTILIZATION`) on serve + bench, replaces hardcoded 4/8 GiB stubs (570 tests) |
 | **8g. Sampling gaps** | **DONE** | Unified `Sampler::sample_one()`: min_p, repetition/frequency/presence penalties, logit_bias, logprobs (top-N). `LogprobsOutput`/`TokenLogprob` in `vllm-common`. CPU-side penalty application in both CandleWorker + MlxWorker. Logprobs propagated through `EngineCoreOutput` → API responses (chat + completion, streaming + non-streaming). 12 new sampler unit tests. (629 tests) |
-| 12a. Tool calling protocol | Not started | `tools`/`tool_choice` fields in chat completion request, `tool_calls` in assistant response, chat template integration for tool definitions |
+| **12a. Tool calling protocol** | **DONE** | Rich JSON messages + `tools`/`tool_choice` passed to chat templates via `apply()`. `tool_calls` arguments auto-parsed from string→object. `tool_choice: "none"` suppresses tools. `date_string` template variable. minijinja `json` feature for `tojson`. 4 new template tests. (633 tests) |
 | 12b. Tool call response parsing | Not started | Detect model-emitted tool calls (special tokens, JSON blocks), parse into structured `ToolCall` objects, streaming tool call deltas |
 | 12c. Structured output / constrained decoding | Not started | `response_format` (json_object, json_schema), grammar-guided logit masking via `llguidance` or similar, schema-to-grammar compilation |
 | 9c. Metal Tier 2 (legacy candle) | Superseded | Custom MSL fused kernels approach superseded by MLX backend. Use `--features candle-metal` for legacy path |
@@ -89,7 +89,8 @@
 | 6b | ~2,530 | 2 new + 6 mod | 17 | 599 | DeepSeek V2/V3 MLA+MoE+YaRN, Qwen3 QK norms |
 | 6b | ~850 | 2 new + 4 mod | 18 | 617 | Command R (candle+MLX float+quantized) |
 | 8g | ~450 | 10 mod | 12 | 629 | Sampling gaps (min_p, penalties, logprobs, logit_bias) |
-| **Total** | **~32,000** | **94 files** | **629** | **629** | **0 clippy errors** |
+| 12a | ~120 | 3 mod | 4 | 633 | Tool calling protocol: rich messages + tools to templates |
+| **Total** | **~32,100** | **95 files** | **633** | **633** | **0 clippy errors** |
 
 ### Known limitations / follow-ups
 - **MLX YaRN RoPE**: The MLX backend uses `nn::Rope` which doesn't apply YaRN frequency corrections. Models with `rope_scaling` (e.g., Qwen3 with YaRN factor=4.0, DeepSeek V2 with factor=40.0) will generate correctly within the original context window but won't have correct positional encoding beyond it. Fix: either implement a custom MLX RoPE that pre-applies YaRN corrections, or upstream YaRN support to mlx-rs `nn::Rope`.
@@ -933,23 +934,24 @@ into the forward pass.
 
 OpenAI-compatible tool/function calling and structured output support. This is a serving-layer feature that sits above the model — models already generate the right tokens when prompted correctly; this phase adds the protocol plumbing, response parsing, and optionally constrained decoding to guarantee valid output.
 
-### 12a. Tool calling protocol types + chat template integration
+### 12a. Tool calling protocol types + chat template integration — DONE
 
-**Protocol types** (`vllm-serve/src/protocol.rs`):
-- [ ] Add `tools: Option<Vec<Tool>>` and `tool_choice: Option<ToolChoice>` to `ChatCompletionRequest`
-- [ ] `Tool` struct: `type: "function"`, `function: FunctionDef` (name, description, parameters as JSON Schema)
-- [ ] `ToolChoice` enum: `"none"` | `"auto"` | `"required"` | `{ type: "function", function: { name } }`
-- [ ] Add `tool_calls: Option<Vec<ToolCallDelta>>` to `ChatCompletionMessage` (response) and `DeltaMessage` (streaming)
-- [ ] `ToolCall` struct: `id`, `type: "function"`, `function: { name, arguments }` (arguments is a JSON string)
-- [ ] `ToolCallDelta`: same shape but all fields optional (for streaming partial tool calls)
-- [ ] Add `role: "tool"` variant to message types, with `tool_call_id` field for tool results
+**Protocol types** (`vllm-serve/src/protocol.rs`) — already existed:
+- [x] `tools: Option<Vec<ChatCompletionToolsParam>>` and `tool_choice: Option<Value>` on `ChatCompletionRequest`
+- [x] `ChatCompletionToolsParam` struct: `type`, `function: FunctionDefinition` (name, description, parameters)
+- [x] `ToolCall` struct: `id`, `type`, `function: FunctionCall` (name, arguments)
+- [x] `tool_calls: Option<Vec<ToolCall>>` on `ChatCompletionMessageParam` and `ChatMessage`
+- [x] `tool_call_id: Option<String>` on `ChatCompletionMessageParam`
 
 **Chat template integration** (`vllm-serve/src/chat_template.rs`, `engine.rs`):
-- [ ] Pass `tools` array into minijinja template context when rendering (most model templates already handle tool definitions — e.g., LLaMA 3.1+, Qwen2.5, Mistral v3+)
-- [ ] Pass `tool_choice` into template context (some templates use it to force tool-call format)
-- [ ] No model-specific code needed — the Jinja2 templates in `tokenizer_config.json` already encode tool schemas into the prompt for each model family
-
-**Key insight**: Modern chat templates (LLaMA 3.1+, Qwen2.5, Mistral) natively handle `tools` in Jinja2. The minijinja engine already supports the required Jinja2 features. This sub-phase is primarily protocol types + passing data through to the template.
+- [x] `apply()` takes `&[serde_json::Value]` messages + `Option<&serde_json::Value>` tools (rich JSON, not stripped `TemplateMessage`)
+- [x] `apply_simple()` convenience wrapper for backward compat (old `&[TemplateMessage]` signature)
+- [x] `tools` array passed to minijinja context — templates can access tool definitions via `{{ tools | tojson }}`
+- [x] `date_string` passed to context (e.g. "28 Feb 2026") — used by LLaMA 3.1 templates
+- [x] `engine.rs`: messages converted via `serde_json::to_value()` preserving all fields (`tool_calls`, `tool_call_id`, `name`)
+- [x] `tool_calls[].function.arguments` auto-parsed from JSON string → JSON object (for template `| items`)
+- [x] `tool_choice: "none"` → tools suppressed (not passed to template)
+- [x] minijinja `json` feature added for `tojson` filter support
 
 ### 12b. Tool call response parsing
 

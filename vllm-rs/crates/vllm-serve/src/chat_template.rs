@@ -134,13 +134,17 @@ impl ChatTemplate {
         Ok(Some(tpl))
     }
 
-    /// Apply the chat template to a list of messages.
+    /// Apply the chat template to rich JSON messages, with optional tool definitions.
+    ///
+    /// Messages are `serde_json::Value` objects so templates can access any field
+    /// (`tool_calls`, `tool_call_id`, `name`, etc.) without needing Rust struct changes.
     ///
     /// Returns the formatted prompt string ready for tokenization.
     pub fn apply(
         &self,
-        messages: &[TemplateMessage],
+        messages: &[serde_json::Value],
         add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
     ) -> Result<String, ServeError> {
         let mut env = Environment::new();
 
@@ -154,12 +158,32 @@ impl ChatTemplate {
             .get_template("chat")
             .map_err(|e| ServeError::Internal(format!("failed to get template: {e}")))?;
 
+        // Today's date string — used by some templates (e.g. LLaMA 3.1).
+        let date_string = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            // Simple UTC date: days since epoch.
+            let days = now / 86400;
+            // 1970-01-01 is a Thursday (day 4).
+            let (year, month, day) = days_to_ymd(days);
+            format!(
+                "{:02} {month_name} {year}",
+                day,
+                month_name = MONTH_NAMES[month as usize - 1],
+                year = year
+            )
+        };
+
         // Build the context.
         let ctx = minijinja::context! {
             messages => messages,
             add_generation_prompt => add_generation_prompt,
             bos_token => self.bos_token.as_deref().unwrap_or(""),
             eos_token => self.eos_token.as_deref().unwrap_or(""),
+            tools => tools,
+            date_string => date_string,
         };
 
         let rendered = tmpl
@@ -167,6 +191,21 @@ impl ChatTemplate {
             .map_err(|e| ServeError::Internal(format!("chat template render failed: {e}")))?;
 
         Ok(rendered)
+    }
+
+    /// Convenience wrapper: apply with simple `TemplateMessage` slices and no tools.
+    ///
+    /// Used by tests and callers that don't need tool support.
+    pub fn apply_simple(
+        &self,
+        messages: &[TemplateMessage],
+        add_generation_prompt: bool,
+    ) -> Result<String, ServeError> {
+        let values: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap())
+            .collect();
+        self.apply(&values, add_generation_prompt, None)
     }
 
     /// Get the raw template string.
@@ -187,6 +226,42 @@ fn extract_token_string(value: Option<serde_json::Value>) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+const MONTH_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// Convert days since Unix epoch to (year, month, day).
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+    // Civil calendar algorithm (simplified Euclidean).
+    let mut year = 1970u64;
+    loop {
+        let days_in_year = if is_leap(year) { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let month_days: [u64; 12] = if is_leap(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut month = 0u64;
+    for (i, &md) in month_days.iter().enumerate() {
+        if days < md {
+            month = i as u64 + 1;
+            break;
+        }
+        days -= md;
+    }
+    (year, month, days + 1)
+}
+
+fn is_leap(y: u64) -> bool {
+    y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400))
 }
 
 /// A raise_exception function for Jinja2 compatibility.
@@ -217,7 +292,7 @@ mod tests {
             content: "Hello!".to_string(),
         }];
 
-        let result = tpl.apply(&messages, true).unwrap();
+        let result = tpl.apply_simple(&messages, true).unwrap();
         assert!(result.contains("user: Hello!"));
         assert!(result.contains("assistant:"));
     }
@@ -240,7 +315,7 @@ mod tests {
             },
         ];
 
-        let result = tpl.apply(&messages, true).unwrap();
+        let result = tpl.apply_simple(&messages, true).unwrap();
         assert!(result.contains("<|im_start|>system\nYou are a helpful assistant.<|im_end|>"));
         assert!(result.contains("<|im_start|>user\nHi!<|im_end|>"));
         assert!(result.ends_with("<|im_start|>assistant\n"));
@@ -259,7 +334,7 @@ mod tests {
             content: "Hello".to_string(),
         }];
 
-        let result = tpl.apply(&messages, false).unwrap();
+        let result = tpl.apply_simple(&messages, false).unwrap();
         assert_eq!(result, "<s>Hello</s>");
     }
 
@@ -274,8 +349,8 @@ mod tests {
             content: "Hi".to_string(),
         }];
 
-        let with = tpl.apply(&messages, true).unwrap();
-        let without = tpl.apply(&messages, false).unwrap();
+        let with = tpl.apply_simple(&messages, true).unwrap();
+        let without = tpl.apply_simple(&messages, false).unwrap();
 
         assert!(with.contains("GENERATE"));
         assert!(!without.contains("GENERATE"));
@@ -287,7 +362,7 @@ mod tests {
             "{% for message in messages %}{{ message.content }}{% endfor %}".to_string(),
         );
 
-        let result = tpl.apply(&[], false).unwrap();
+        let result = tpl.apply_simple(&[], false).unwrap();
         assert_eq!(result, "");
     }
 
@@ -312,7 +387,7 @@ mod tests {
             },
         ];
 
-        let result = tpl.apply(&messages, false).unwrap();
+        let result = tpl.apply_simple(&messages, false).unwrap();
         assert!(result.contains("[USER] What is 2+2?"));
         assert!(result.contains("[ASSISTANT] 4"));
         assert!(result.contains("[USER] Thanks!"));
@@ -342,5 +417,73 @@ mod tests {
     #[test]
     fn test_extract_token_string_none() {
         assert_eq!(extract_token_string(None), None);
+    }
+
+    #[test]
+    fn test_tools_passed_to_template() {
+        // Template that dumps tools via tojson.
+        let tpl = ChatTemplate::new(
+            "{% if tools %}TOOLS:{{ tools | tojson }}{% endif %}{% for message in messages %}{{ message.role }}: {{ message.content }}\n{% endfor %}".to_string(),
+        );
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hi"})];
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object"}}}
+        ]);
+
+        let result = tpl.apply(&messages, false, Some(&tools)).unwrap();
+        assert!(result.contains("TOOLS:"));
+        assert!(result.contains("get_weather"));
+    }
+
+    #[test]
+    fn test_tool_calls_in_message() {
+        // Template that accesses tool_calls on a message.
+        let tpl = ChatTemplate::new(
+            "{% for message in messages %}{{ message.role }}:{% if message.tool_calls %} CALL={{ message.tool_calls[0].function.name }}{% endif %} {{ message.content }}\n{% endfor %}".to_string(),
+        );
+
+        let messages = vec![
+            serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": {"city": "NYC"}}
+                }]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "content": "{\"temp\": 72}",
+                "tool_call_id": "call_1"
+            }),
+        ];
+
+        let result = tpl.apply(&messages, false, None).unwrap();
+        assert!(result.contains("CALL=get_weather"));
+        assert!(result.contains("tool:"));
+    }
+
+    #[test]
+    fn test_no_tools_omitted_from_template() {
+        let tpl =
+            ChatTemplate::new("{% if tools %}HAS_TOOLS{% else %}NO_TOOLS{% endif %}".to_string());
+
+        let result = tpl.apply(&[], false, None).unwrap();
+        assert!(result.contains("NO_TOOLS"));
+
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+        let result = tpl.apply(&[], false, Some(&tools)).unwrap();
+        assert!(result.contains("HAS_TOOLS"));
+    }
+
+    #[test]
+    fn test_date_string_in_template() {
+        let tpl = ChatTemplate::new("DATE:{{ date_string }}".to_string());
+        let result = tpl.apply(&[], false, None).unwrap();
+        // Should contain a date like "28 Feb 2026".
+        assert!(result.starts_with("DATE:"));
+        assert!(result.len() > 5);
     }
 }

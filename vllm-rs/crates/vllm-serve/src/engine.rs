@@ -18,7 +18,7 @@ use uuid::Uuid;
 use vllm_common::{EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, StopReason};
 use vllm_engine::core_client::EngineCoreClient;
 
-use crate::chat_template::{ChatTemplate, TemplateMessage};
+use crate::chat_template::ChatTemplate;
 use crate::detokenizer::IncrementalDetokenizer;
 use crate::error::{ServeError, ServeResult};
 use crate::protocol;
@@ -898,25 +898,45 @@ impl AsyncEngine {
     ) -> ServeResult<EngineCoreRequest> {
         // Build text from chat messages — using chat template if available.
         let text = if let Some(template) = &self.chat_template {
-            // Convert messages to TemplateMessage format.
-            let template_messages: Vec<TemplateMessage> = request
+            // Convert messages to JSON values so templates can access all fields
+            // (tool_calls, tool_call_id, name, etc.).
+            let message_values: Vec<serde_json::Value> = request
                 .messages
                 .iter()
                 .map(|msg| {
-                    let content = msg
-                        .content
-                        .as_ref()
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    TemplateMessage {
-                        role: msg.role.clone(),
-                        content,
+                    let mut val = serde_json::to_value(msg).unwrap_or_default();
+                    // For tool_calls where function.arguments is a JSON string,
+                    // parse it into a JSON object so templates using `| items` work.
+                    if let Some(tool_calls) = val.get_mut("tool_calls")
+                        && let Some(arr) = tool_calls.as_array_mut()
+                    {
+                        for tc in arr.iter_mut() {
+                            if let Some(func) = tc.get_mut("function")
+                                && let Some(args) = func.get("arguments")
+                                && let Some(args_str) = args.as_str()
+                                && let Ok(parsed) =
+                                    serde_json::from_str::<serde_json::Value>(args_str)
+                            {
+                                func.as_object_mut()
+                                    .unwrap()
+                                    .insert("arguments".to_string(), parsed);
+                            }
+                        }
                     }
+                    val
                 })
                 .collect();
 
-            template.apply(&template_messages, true)?
+            // Convert tools to JSON, respecting tool_choice.
+            let tools_value = match &request.tool_choice {
+                Some(tc) if tc.as_str() == Some("none") => None,
+                _ => request
+                    .tools
+                    .as_ref()
+                    .and_then(|t| serde_json::to_value(t).ok()),
+            };
+
+            template.apply(&message_values, true, tools_value.as_ref())?
         } else {
             // Fallback: concatenate messages with newlines.
             let mut text = String::new();

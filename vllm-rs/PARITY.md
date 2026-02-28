@@ -1,6 +1,6 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-02-27 | Rust port: `vllm-rs/` on branch `feat/rust` (629 tests, 0 clippy errors)
+> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (633 tests, 0 clippy errors)
 
 ### Legend
 
@@ -30,11 +30,11 @@
 | [Speculative Decoding](#speculative-decoding) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/5 |
 | [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F535; | &#x2795; | `░░░░░░░░░░` 0/10 |
 | [Structured Output](#structured-output--guided-decoding) | &#x1F535; | &#x2795; | `░░░░░░░░░░` 0/4 |
-| [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x2795; | `░░░░░░░░░░` 0/6 |
+| [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x1F7E1; | `██░░░░░░░░` 2/6 |
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/4 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F7E1; | `█████████░` 6/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | `█████████░` 13/15 |
-| | | **Total** | `████░░░░░░` **84/198** |
+| | | **Total** | `████░░░░░░` **86/198** |
 
 ---
 
@@ -349,14 +349,14 @@
 
 | Feature | Python | Rust |
 |---|:---:|:---:|
-| `tools` / `tool_choice` request fields | &#x1F535; | &#x1F7E1; |
-| Chat template tool definitions | &#x1F535; | &#x2795; |
+| `tools` / `tool_choice` request fields | &#x1F535; | &#x1F535; |
+| Chat template tool definitions | &#x1F535; | &#x1F535; |
 | Model-emitted tool call parsing | &#x1F535; | &#x2795; |
 | `tool_calls` in response | &#x1F535; | &#x2795; |
 | Streaming tool call deltas | &#x1F535; | &#x2795; |
 | Parallel tool calls | &#x1F535; | &#x2795; |
 
-> Rust protocol types include `tools`, `tool_choice`, and `tool_calls` fields for serialization, but model-side tool call detection and structured parsing are not implemented.
+> Tool definitions and multi-turn tool-use messages are passed through to chat templates (Phase 12a). Models with tool-aware Jinja2 templates (LLaMA 3.1+, Qwen2.5, Mistral) will see correct tool prompts. Model-side tool call output parsing (Phase 12b) is not yet implemented.
 
 ---
 
@@ -420,5 +420,5 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Test count | ~948 test files | 629 passing tests |
+| Test count | ~948 test files | 633 passing tests |
 | Crate count | N/A | 13 crates |

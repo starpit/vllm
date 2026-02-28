@@ -23,6 +23,9 @@ use crate::detokenizer::IncrementalDetokenizer;
 use crate::error::{ServeError, ServeResult};
 use crate::protocol;
 use crate::tokenizer::Tokenizer;
+use crate::tool_parser::{
+    DeltaToolCall, StreamingToolParserState, ToolCallParser, ToolParserDelta,
+};
 
 // ---------------------------------------------------------------------------
 // RequestState
@@ -67,6 +70,15 @@ struct RequestState {
 
     /// Accumulated per-token log-probabilities (if requested).
     logprobs: Vec<vllm_common::LogprobsOutput>,
+
+    /// Streaming tool parser state (if tool parsing is active for this request).
+    tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
+
+    /// Accumulated generated text so far (for streaming tool parsing).
+    accumulated_text: String,
+
+    /// Whether any tool call deltas have been emitted (for setting finish_reason).
+    tool_calls_emitted: bool,
 }
 
 /// A delta sent to a streaming response.
@@ -84,6 +96,8 @@ pub struct StreamDelta {
     pub stop_reason: Option<StopReason>,
     /// Per-token log-probabilities for this step (if requested).
     pub logprobs: Option<Vec<vllm_common::LogprobsOutput>>,
+    /// Tool call deltas for streaming tool parsing.
+    pub tool_call_deltas: Option<Vec<DeltaToolCall>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +140,8 @@ pub struct AsyncEngine {
     tokenizer: Option<Arc<Tokenizer>>,
     /// Optional chat template for formatting chat messages.
     chat_template: Option<Arc<ChatTemplate>>,
+    /// Optional tool call parser for extracting structured tool calls from output.
+    tool_parser: Option<Arc<dyn ToolCallParser>>,
 }
 
 impl AsyncEngine {
@@ -149,6 +165,7 @@ impl AsyncEngine {
             notify: Arc::new(Notify::new()),
             tokenizer: None,
             chat_template: None,
+            tool_parser: None,
         }
     }
 
@@ -176,6 +193,11 @@ impl AsyncEngine {
         engine.tokenizer = Some(tokenizer);
         engine.chat_template = Some(chat_template);
         engine
+    }
+
+    /// Set the tool call parser on this engine.
+    pub fn set_tool_parser(&mut self, parser: Arc<dyn ToolCallParser>) {
+        self.tool_parser = Some(parser);
     }
 
     /// Get the model name.
@@ -273,6 +295,7 @@ impl AsyncEngine {
                 None,
                 detokenizer,
                 i as u32,
+                None, // no streaming tool parser for non-streaming requests
             )
             .await?;
 
@@ -310,17 +333,38 @@ impl AsyncEngine {
                 ))
             };
 
+            // Try tool call extraction if parser is configured and request has tools.
+            let (final_content, final_tool_calls, final_finish_reason) =
+                if let Some(ref parser) = self.tool_parser {
+                    if request.tools.is_some() && !is_tool_choice_none(&request.tool_choice) {
+                        let extracted = parser.extract_tool_calls(&text);
+                        if extracted.tools_called {
+                            (
+                                extracted.content,
+                                Some(extracted.tool_calls),
+                                "tool_calls".to_string(),
+                            )
+                        } else {
+                            (Some(text), None, finish_reason_str)
+                        }
+                    } else {
+                        (Some(text), None, finish_reason_str)
+                    }
+                } else {
+                    (Some(text), None, finish_reason_str)
+                };
+
             choices.push(protocol::ChatCompletionResponseChoice {
                 index: i as u32,
                 message: protocol::ChatMessage {
                     role: "assistant".to_string(),
-                    content: Some(text),
+                    content: final_content,
                     refusal: None,
-                    tool_calls: None,
+                    tool_calls: final_tool_calls,
                     reasoning: None,
                 },
                 logprobs: chat_logprobs,
-                finish_reason: Some(finish_reason_str),
+                finish_reason: Some(final_finish_reason),
                 stop_reason: state.stop_reason.map(|sr| match sr {
                     StopReason::Token(id) => serde_json::Value::Number(id.into()),
                     StopReason::String(s) => serde_json::Value::String(s),
@@ -376,6 +420,11 @@ impl AsyncEngine {
         metrics.requests_total.inc();
         metrics.prompt_tokens_total.inc_by(num_prompt_tokens as u64);
 
+        // Determine if tool parsing is active for this request.
+        let use_tool_parser = self.tool_parser.is_some()
+            && request.tools.is_some()
+            && !is_tool_choice_none(&request.tool_choice);
+
         // All n children share one channel.
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -404,6 +453,15 @@ impl AsyncEngine {
             ec_req.request_id = child_id.clone();
             ec_req.sampling_params = Some(sp);
 
+            // Create streaming tool parser state if applicable.
+            let tool_state = if use_tool_parser {
+                self.tool_parser
+                    .as_ref()
+                    .map(|p| p.create_streaming_state())
+            } else {
+                None
+            };
+
             self.submit_request(
                 child_id,
                 ec_req,
@@ -411,6 +469,7 @@ impl AsyncEngine {
                 Some(tx.clone()),
                 detokenizer,
                 i as u32,
+                tool_state,
             )
             .await?;
         }
@@ -502,6 +561,7 @@ impl AsyncEngine {
                     None,
                     detokenizer,
                     choice_index,
+                    None, // no tool parsing for completions
                 )
                 .await?;
 
@@ -676,6 +736,7 @@ impl AsyncEngine {
     /// Note: `requests_total` and `prompt_tokens_total` metrics are the
     /// caller's responsibility (once per HTTP request). This method only
     /// increments `requests_active` (once per engine-core request).
+    #[allow(clippy::too_many_arguments)]
     async fn submit_request(
         &self,
         request_id: String,
@@ -684,6 +745,7 @@ impl AsyncEngine {
         stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
         detokenizer: Option<IncrementalDetokenizer>,
         choice_index: u32,
+        tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
     ) -> ServeResult<()> {
         let metrics = crate::metrics::VllmMetrics::global();
         metrics.requests_active.inc();
@@ -708,6 +770,9 @@ impl AsyncEngine {
                     itl_count: 0,
                     itl_sum: 0.0,
                     logprobs: Vec::new(),
+                    tool_parser_state,
+                    accumulated_text: String::new(),
+                    tool_calls_emitted: false,
                 },
             );
         }
@@ -819,15 +884,99 @@ impl AsyncEngine {
 
         // Send streaming delta if applicable.
         if let Some(tx) = &req_state.stream_tx {
-            let delta = StreamDelta {
-                index: req_state.choice_index,
-                new_token_ids: output.new_token_ids,
-                text: delta_text,
-                finish_reason: delta_finish_reason,
-                stop_reason: delta_stop_reason.clone(),
-                logprobs: step_logprobs.clone(),
-            };
-            let _ = tx.send(delta);
+            // If tool parser state is active, route through it.
+            if let Some(ref mut parser_state) = req_state.tool_parser_state {
+                if let Some(ref text) = delta_text {
+                    let previous_text = req_state.accumulated_text.clone();
+                    req_state.accumulated_text.push_str(text);
+                    let current_text = req_state.accumulated_text.clone();
+
+                    let parser_result =
+                        parser_state.process_delta(&previous_text, &current_text, text);
+
+                    match parser_result {
+                        ToolParserDelta::Content(content) => {
+                            let delta = StreamDelta {
+                                index: req_state.choice_index,
+                                new_token_ids: output.new_token_ids.clone(),
+                                text: Some(content),
+                                finish_reason: if is_finished && !req_state.tool_calls_emitted {
+                                    delta_finish_reason
+                                } else {
+                                    None
+                                },
+                                stop_reason: if is_finished && !req_state.tool_calls_emitted {
+                                    delta_stop_reason.clone()
+                                } else {
+                                    None
+                                },
+                                logprobs: step_logprobs.clone(),
+                                tool_call_deltas: None,
+                            };
+                            let _ = tx.send(delta);
+                        }
+                        ToolParserDelta::ToolCalls(tool_deltas) => {
+                            req_state.tool_calls_emitted = true;
+                            let delta = StreamDelta {
+                                index: req_state.choice_index,
+                                new_token_ids: output.new_token_ids.clone(),
+                                text: None,
+                                finish_reason: None,
+                                stop_reason: None,
+                                logprobs: step_logprobs.clone(),
+                                tool_call_deltas: Some(tool_deltas),
+                            };
+                            let _ = tx.send(delta);
+                        }
+                        ToolParserDelta::None => {
+                            // Buffering, don't send anything yet.
+                        }
+                    }
+
+                    // Send finish delta separately if finished and tool calls were emitted.
+                    if is_finished && req_state.tool_calls_emitted {
+                        let finish_delta = StreamDelta {
+                            index: req_state.choice_index,
+                            new_token_ids: vec![],
+                            text: None,
+                            finish_reason: Some(FinishReason::Stop), // overridden to tool_calls in server.rs
+                            stop_reason: delta_stop_reason.clone(),
+                            logprobs: None,
+                            tool_call_deltas: None,
+                        };
+                        let _ = tx.send(finish_delta);
+                    }
+                } else if is_finished {
+                    // No text but finished — send finish delta.
+                    let fr = if req_state.tool_calls_emitted {
+                        Some(FinishReason::Stop)
+                    } else {
+                        delta_finish_reason
+                    };
+                    let delta = StreamDelta {
+                        index: req_state.choice_index,
+                        new_token_ids: output.new_token_ids.clone(),
+                        text: None,
+                        finish_reason: fr,
+                        stop_reason: delta_stop_reason.clone(),
+                        logprobs: step_logprobs.clone(),
+                        tool_call_deltas: None,
+                    };
+                    let _ = tx.send(delta);
+                }
+            } else {
+                // No tool parsing — normal streaming path.
+                let delta = StreamDelta {
+                    index: req_state.choice_index,
+                    new_token_ids: output.new_token_ids,
+                    text: delta_text,
+                    finish_reason: delta_finish_reason,
+                    stop_reason: delta_stop_reason.clone(),
+                    logprobs: step_logprobs.clone(),
+                    tool_call_deltas: None,
+                };
+                let _ = tx.send(delta);
+            }
         }
 
         // Update request state finish/stop reason.
@@ -1264,6 +1413,11 @@ fn build_completion_logprobs(
     }
 }
 
+/// Check if tool_choice is set to "none" (disabling tool use).
+fn is_tool_choice_none(tool_choice: &Option<serde_json::Value>) -> bool {
+    tool_choice.as_ref().and_then(|v| v.as_str()) == Some("none")
+}
+
 /// Generate placeholder text from token IDs (used when no tokenizer is available).
 fn placeholder_text(token_ids: &[u32]) -> String {
     use std::fmt::Write;
@@ -1286,6 +1440,30 @@ mod tests {
     use vllm_engine::core_client::InprocClient;
     use vllm_engine::engine_core::EngineCoreConfig;
     use vllm_engine::executor::NoopExecutor;
+
+    fn make_test_request_state(
+        stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
+    ) -> RequestState {
+        RequestState {
+            generated_token_ids: Vec::new(),
+            num_prompt_tokens: 5,
+            num_cached_tokens: 0,
+            finish_reason: None,
+            stop_reason: None,
+            stream_tx,
+            detokenizer: None,
+            choice_index: 0,
+            submit_time: Instant::now(),
+            first_token_time: None,
+            last_token_time: None,
+            itl_count: 0,
+            itl_sum: 0.0,
+            logprobs: Vec::new(),
+            tool_parser_state: None,
+            accumulated_text: String::new(),
+            tool_calls_emitted: false,
+        }
+    }
 
     fn make_engine_config() -> EngineCoreConfig {
         EngineCoreConfig {
@@ -1521,25 +1699,7 @@ mod tests {
     #[test]
     fn test_process_output_accumulates_tokens() {
         let mut requests = HashMap::new();
-        requests.insert(
-            "req-1".to_string(),
-            RequestState {
-                generated_token_ids: Vec::new(),
-                num_prompt_tokens: 5,
-                num_cached_tokens: 0,
-                finish_reason: None,
-                stop_reason: None,
-                stream_tx: None,
-                detokenizer: None,
-                choice_index: 0,
-                submit_time: Instant::now(),
-                first_token_time: None,
-                last_token_time: None,
-                itl_count: 0,
-                itl_sum: 0.0,
-                logprobs: Vec::new(),
-            },
-        );
+        requests.insert("req-1".to_string(), make_test_request_state(None));
 
         // First output.
         AsyncEngine::process_output(
@@ -1581,25 +1741,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let mut requests = HashMap::new();
-        requests.insert(
-            "req-1".to_string(),
-            RequestState {
-                generated_token_ids: Vec::new(),
-                num_prompt_tokens: 5,
-                num_cached_tokens: 0,
-                finish_reason: None,
-                stop_reason: None,
-                stream_tx: Some(tx),
-                detokenizer: None,
-                choice_index: 0,
-                submit_time: Instant::now(),
-                first_token_time: None,
-                last_token_time: None,
-                itl_count: 0,
-                itl_sum: 0.0,
-                logprobs: Vec::new(),
-            },
-        );
+        requests.insert("req-1".to_string(), make_test_request_state(Some(tx)));
 
         AsyncEngine::process_output(
             &mut requests,
@@ -1656,25 +1798,12 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut requests = HashMap::new();
-        requests.insert(
-            "req-1".to_string(),
-            RequestState {
-                generated_token_ids: Vec::new(),
-                num_prompt_tokens: prompt_ids.len() as u32,
-                num_cached_tokens: 0,
-                finish_reason: None,
-                stop_reason: None,
-                stream_tx: Some(tx),
-                detokenizer: Some(detok),
-                choice_index: 0,
-                submit_time: Instant::now(),
-                first_token_time: None,
-                last_token_time: None,
-                itl_count: 0,
-                itl_sum: 0.0,
-                logprobs: Vec::new(),
-            },
-        );
+        {
+            let mut state = make_test_request_state(Some(tx));
+            state.num_prompt_tokens = prompt_ids.len() as u32;
+            state.detokenizer = Some(detok);
+            requests.insert("req-1".to_string(), state);
+        }
 
         AsyncEngine::process_output(
             &mut requests,
@@ -1939,25 +2068,12 @@ mod tests {
     fn test_stream_delta_has_choice_index() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut requests = HashMap::new();
-        requests.insert(
-            "req-idx".to_string(),
-            RequestState {
-                generated_token_ids: Vec::new(),
-                num_prompt_tokens: 3,
-                num_cached_tokens: 0,
-                finish_reason: None,
-                stop_reason: None,
-                stream_tx: Some(tx),
-                detokenizer: None,
-                choice_index: 7,
-                submit_time: Instant::now(),
-                first_token_time: None,
-                last_token_time: None,
-                itl_count: 0,
-                itl_sum: 0.0,
-                logprobs: Vec::new(),
-            },
-        );
+        {
+            let mut state = make_test_request_state(Some(tx));
+            state.num_prompt_tokens = 3;
+            state.choice_index = 7;
+            requests.insert("req-idx".to_string(), state);
+        }
 
         AsyncEngine::process_output(
             &mut requests,

@@ -85,6 +85,15 @@ pub struct ServeArgs {
     /// Example: --gguf-file llama-2-7b-chat.Q4_K_M.gguf
     #[arg(long)]
     pub gguf_file: Option<String>,
+
+    /// Tool call parser to use (e.g. "hermes", "llama3_json").
+    /// Enables structured tool call extraction from model output.
+    #[arg(long)]
+    pub tool_call_parser: Option<String>,
+
+    /// Enable automatic tool choice (model decides when to call tools).
+    #[arg(long)]
+    pub enable_auto_tool_choice: bool,
 }
 
 impl ServeArgs {

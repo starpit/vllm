@@ -22,6 +22,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     let host = args.host.clone();
     let port = args.port;
     let enable_metrics = args.enable_metrics;
+    let tool_call_parser_name = args.tool_call_parser.clone();
 
     info!("vLLM Rust — starting server");
     info!("Model: {}", model);
@@ -29,9 +30,20 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
 
     // 2. Initialize the full stack (on a blocking thread to avoid starving
     //    the tokio I/O driver during model download / weight loading).
-    let stack = tokio::task::spawn_blocking(move || initialize_stack(&args))
+    let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&args))
         .await
         .expect("initialize_stack panicked")?;
+
+    // 2b. Configure tool call parser if specified.
+    if let Some(ref parser_name) = tool_call_parser_name {
+        let parser = vllm_serve::tool_parser::get_tool_parser(parser_name)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        // We need mutable access before the engine is shared.
+        Arc::get_mut(&mut stack.engine)
+            .expect("engine should not be shared yet")
+            .set_tool_parser(parser);
+        info!("Tool call parser: {}", parser_name);
+    }
 
     // 3. Spawn the engine step loop.
     let _step_handle = stack.engine.spawn_step_loop();

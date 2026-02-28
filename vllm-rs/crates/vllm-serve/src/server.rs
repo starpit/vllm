@@ -219,17 +219,70 @@ fn stream_chat_response(
     rx: tokio::sync::mpsc::UnboundedReceiver<StreamDelta>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let stream = UnboundedReceiverStream::new(rx).map(move |delta| {
-        let finish_reason_str = delta.finish_reason.map(|r| r.to_string());
-
-        // Use detokenized text if available, otherwise fall back to placeholders.
-        let text = delta.text.unwrap_or_else(|| {
-            use std::fmt::Write;
-            let mut s = String::new();
-            for id in &delta.new_token_ids {
-                let _ = write!(s, "<token_{id}>");
+        // Determine finish reason — override to "tool_calls" if tool call deltas present.
+        let has_tool_calls = delta.tool_call_deltas.is_some();
+        let finish_reason_str = delta.finish_reason.map(|r| {
+            if has_tool_calls {
+                "tool_calls".to_string()
+            } else {
+                r.to_string()
             }
-            s
         });
+
+        // Convert tool call deltas to protocol JSON values.
+        let tool_calls_json: Option<Vec<serde_json::Value>> =
+            delta.tool_call_deltas.as_ref().map(|deltas| {
+                deltas
+                    .iter()
+                    .map(|tc| {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert(
+                            "index".to_string(),
+                            serde_json::Value::Number(tc.index.into()),
+                        );
+                        if let Some(ref id) = tc.id {
+                            obj.insert("id".to_string(), serde_json::Value::String(id.clone()));
+                        }
+                        if let Some(ref ct) = tc.call_type {
+                            obj.insert("type".to_string(), serde_json::Value::String(ct.clone()));
+                        }
+                        let mut func = serde_json::Map::new();
+                        if let Some(ref name) = tc.function_name {
+                            func.insert(
+                                "name".to_string(),
+                                serde_json::Value::String(name.clone()),
+                            );
+                        }
+                        if let Some(ref args) = tc.function_arguments {
+                            func.insert(
+                                "arguments".to_string(),
+                                serde_json::Value::String(args.clone()),
+                            );
+                        }
+                        if !func.is_empty() {
+                            obj.insert("function".to_string(), serde_json::Value::Object(func));
+                        }
+                        serde_json::Value::Object(obj)
+                    })
+                    .collect()
+            });
+
+        // When tool calls are present, suppress content.
+        let (content, tool_calls) = if tool_calls_json.is_some() {
+            (None, tool_calls_json)
+        } else {
+            // Use detokenized text if available, otherwise fall back to placeholders.
+            let text = delta.text.unwrap_or_else(|| {
+                use std::fmt::Write;
+                let mut s = String::new();
+                for id in &delta.new_token_ids {
+                    let _ = write!(s, "<token_{id}>");
+                }
+                s
+            });
+            let content = if text.is_empty() { None } else { Some(text) };
+            (content, None)
+        };
 
         let chunk = protocol::ChatCompletionStreamResponse::new(
             format!("chatcmpl-{}", request_id),
@@ -238,9 +291,9 @@ fn stream_chat_response(
                 index: delta.index,
                 delta: protocol::DeltaMessage {
                     role: None,
-                    content: if text.is_empty() { None } else { Some(text) },
+                    content,
                     reasoning: None,
-                    tool_calls: None,
+                    tool_calls,
                 },
                 logprobs: delta.logprobs.as_ref().map(|lps| {
                     let content: Vec<protocol::ChatCompletionLogProbsContent> = lps

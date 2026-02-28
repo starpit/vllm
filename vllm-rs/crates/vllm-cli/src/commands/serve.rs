@@ -4,6 +4,7 @@
 //! `vllm serve` subcommand — start the OpenAI-compatible API server.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use tracing::info;
@@ -15,6 +16,8 @@ use crate::init::initialize_stack;
 
 /// Run the serve subcommand.
 pub async fn run_serve(args: ServeArgs) -> Result<()> {
+    let startup_start = Instant::now();
+
     // 1. Init tracing.
     telemetry::init_tracing(&args.log_level);
 
@@ -50,7 +53,12 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
 
     // 4. Build server config and serve.
     let bind_address = format!("{}:{}", host, port);
-    info!("Serving on http://{}", bind_address);
+    let startup_elapsed = startup_start.elapsed();
+    info!(
+        "Serving on http://{} (startup: {:.2}s)",
+        bind_address,
+        startup_elapsed.as_secs_f64()
+    );
     let server_config = ServerConfig {
         bind_address,
         version: format!("0.1.0-rust ({})", stack.model_name),

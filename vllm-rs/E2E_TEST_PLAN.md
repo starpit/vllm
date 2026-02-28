@@ -328,7 +328,15 @@ Validate `response_format` for JSON output.
 | `test_json_schema_with_tools` | Both tools and response_format → structured output respected |
 | `test_json_object_max_tokens` | json_object + short max_tokens → may be truncated but starts valid |
 
-**Deliverables**: ~11 structured output tests.
+### E6d. Regex-constrained decoding
+
+| Test | Description |
+|------|-------------|
+| `test_guided_regex_digits` | `guided_regex: "[0-9]+"` → output is all digits |
+| `test_guided_regex_stream` | stream + `guided_regex` → concatenated output matches pattern |
+| `test_guided_regex_conflict` | Both `response_format` and `guided_regex` → 400 error |
+
+**Deliverables**: ~14 structured output tests.
 
 ---
 
@@ -479,13 +487,13 @@ Validate the server handles concurrent requests correctly.
 | E3. Streaming | ~14 | SmolLM-135M | Every PR | 2 min |
 | E4. Text Completions | ~9 | SmolLM-135M | Every PR | 1 min |
 | E5. Tool Calling | ~18 | Llama-3.2-1B / Qwen2.5-0.5B | Every PR | 3 min |
-| E6. Structured Output | ~11 | SmolLM-135M | Every PR | 2 min |
+| E6. Structured Output | ~14 | SmolLM-135M | Every PR | 2 min |
 | E7. Sampling Features | ~10 | SmolLM-135M | Every PR | 2 min |
 | E8. Multi-Architecture | ~12 | All tiers | PR / nightly / weekly | 5 min (Tier 1+2) |
 | E9. Concurrency | ~6 | SmolLM-135M | Every PR | 2 min |
 | E10. Observability | ~6 | SmolLM-135M | Every PR | 1 min |
 | E11. CLI & Config | ~10 | SmolLM-135M | Every PR | 2 min |
-| **Total** | **~156** | | | **~28 min** |
+| **Total** | **~159** | | | **~28 min** |
 
 ### CI Tiers
 

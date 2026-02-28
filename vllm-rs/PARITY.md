@@ -49,7 +49,7 @@
 | [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F535; | &#x2795; | 0 | 0 | `░░░░░░░░░░` 0/10 |
 | [Structured Output](#structured-output--guided-decoding) | &#x1F535; | &#x1F535; | 12 | 0 | `██████████` 4/4 |
 | [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x1F535; | 25 | 0 | `██████████` 7/7 |
-| [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/4 |
+| [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/6 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | 15 | 0 | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | 14 | 0 | `██████████` 14/15 |
 | | | **Total** | **530** | **53** | `█████░░░░░` **99/199** |
@@ -389,10 +389,14 @@
 
 ## Embeddings & Pooling
 
+> Embedding in Python vLLM is a **server-level execution mode**, not just an API endpoint. It is selected via `--runner pooling` or auto-detected from model architecture (`is_pooling_model = True` or the presence of a sentence-transformers `pooling_config`). The execution path is fundamentally different from generation: a single forward pass returns hidden-state vectors — there is no iterative decode loop and no KV cache for generation. Decoder models (LLaMA, Mistral, etc.) can be repurposed for embeddings via the sentence-transformers pattern (`--convert embed`), while dedicated embedding architectures (BERT, ModernBERT) use encoder-only bidirectional attention.
+
 | Feature | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
 | `/v1/embeddings` endpoint | &#x1F535; | &#x1F534; | — | — | P3 |
-| Embedding model architectures (BERT, etc.) | &#x1F535; | &#x1F534; | — | — | P3 |
+| Pooling execution mode (`--runner pooling`) | &#x1F535; | &#x1F534; | — | — | P3 |
+| Decoder-based embedding (sentence-transformers) | &#x1F535; | &#x1F534; | — | — | P3 |
+| Encoder-only models (BERT, ModernBERT) | &#x1F535; | &#x1F534; | — | — | P2 |
 | Pooling strategies (CLS, mean, last) | &#x1F535; | &#x1F534; | — | — | P3 |
 | Reward / reranking models | &#x1F535; | &#x1F534; | — | — | P1 |
 

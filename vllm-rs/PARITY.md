@@ -1,6 +1,6 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (633 tests, 0 clippy errors)
+> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (613+38 tests, 0 clippy errors)
 
 ### Legend
 
@@ -19,7 +19,7 @@
 |---|:---:|:---:|---|
 | [Model Architectures](#model-architectures) | &#x1F535; | &#x1F7E1; | `███░░░░░░░` 9/36 |
 | [Quantization](#quantization) | &#x1F535; | &#x1F7E1; | `█░░░░░░░░░` 1/11 |
-| [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | `█████░░░░░` 12/25 |
+| [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | `█████░░░░░` 13/25 |
 | [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | `████████░░` 17/21 |
 | [KV Cache & Attention](#kv-cache--attention) | &#x1F535; | &#x1F7E1; | `█████░░░░░` 9/19 |
 | [Scheduling](#scheduling) | &#x1F535; | &#x1F7E1; | `████████░░` 8/10 |
@@ -30,11 +30,11 @@
 | [Speculative Decoding](#speculative-decoding) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/5 |
 | [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F535; | &#x2795; | `░░░░░░░░░░` 0/10 |
 | [Structured Output](#structured-output--guided-decoding) | &#x1F535; | &#x2795; | `░░░░░░░░░░` 0/4 |
-| [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x1F7E1; | `██░░░░░░░░` 2/6 |
+| [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x1F7E1; | `█████░░░░░` 5/6 |
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/4 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F7E1; | `█████████░` 6/7 |
-| [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | `█████████░` 13/15 |
-| | | **Total** | `████░░░░░░` **86/198** |
+| [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | `██████████` 14/15 |
+| | | **Total** | `████░░░░░░` **90/198** |
 
 ---
 
@@ -142,7 +142,7 @@
 | Multi-prompt completions | &#x1F535; | &#x1F535; |
 | Chat templates (Jinja2) | &#x1F535; | &#x1F535; |
 | `POST /v1/embeddings` | &#x1F535; | &#x1F534; |
-| `POST /v1/chat/completions` tool_calls | &#x1F535; | &#x2795; |
+| `POST /v1/chat/completions` tool_calls | &#x1F535; | &#x1F535; |
 | `response_format` (JSON mode/schema) | &#x1F535; | &#x2795; |
 | Anthropic Messages API | &#x1F535; | &#x1F534; |
 | gRPC server | &#x1F535; | &#x2795; |
@@ -351,12 +351,12 @@
 |---|:---:|:---:|
 | `tools` / `tool_choice` request fields | &#x1F535; | &#x1F535; |
 | Chat template tool definitions | &#x1F535; | &#x1F535; |
-| Model-emitted tool call parsing | &#x1F535; | &#x2795; |
-| `tool_calls` in response | &#x1F535; | &#x2795; |
-| Streaming tool call deltas | &#x1F535; | &#x2795; |
+| Model-emitted tool call parsing | &#x1F535; | &#x1F535; |
+| `tool_calls` in response | &#x1F535; | &#x1F535; |
+| Streaming tool call deltas | &#x1F535; | &#x1F535; |
 | Parallel tool calls | &#x1F535; | &#x2795; |
 
-> Tool definitions and multi-turn tool-use messages are passed through to chat templates (Phase 12a). Models with tool-aware Jinja2 templates (LLaMA 3.1+, Qwen2.5, Mistral) will see correct tool prompts. Model-side tool call output parsing (Phase 12b) is not yet implemented.
+> Tool calling is fully functional end-to-end (Phases 12a+12b). Chat templates pass tool definitions to models; HermesToolParser (`<tool_call>` tags) and LlamaJsonToolParser (raw JSON / `<|python_tag|>`) extract structured `ToolCall` objects from model output. Streaming tool call deltas supported. Use `--tool-call-parser hermes|llama3_json`. Parallel tool calls (multiple tool calls in one response) work; forced single-tool choice (`tool_choice: {function: {name}}`) validation is not yet implemented.
 
 ---
 
@@ -401,6 +401,7 @@
 | `--device auto` / explicit device | &#x1F535; | &#x1F535; |
 | `--gpu-memory-utilization` | &#x1F535; | &#x1F535; |
 | `--gguf-file` | &#x1F535; | &#x1F535; |
+| `--tool-call-parser` | &#x1F535; | &#x1F535; |
 | `--features metal` (MLX backend) | N/A | &#x1F535; |
 | Dockerfile.cpu | &#x1F535; | &#x1F535; |
 | Dockerfile.cuda | &#x1F535; | &#x1F535; |
@@ -420,5 +421,5 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Test count | ~948 test files | 633 passing tests |
+| Test count | ~948 test files | 651 passing tests (613+38 MLX) |
 | Crate count | N/A | 13 crates |

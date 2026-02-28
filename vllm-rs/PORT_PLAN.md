@@ -54,7 +54,7 @@
 | **11a. Memory profiling + `--gpu-memory-utilization`** | **DONE** | Real memory detection via `sysinfo` crate (CandleWorker: available RAM, MlxWorker: total unified memory), `--gpu-memory-utilization` CLI flag (default 0.9, env `VLLM_GPU_MEMORY_UTILIZATION`) on serve + bench, replaces hardcoded 4/8 GiB stubs (570 tests) |
 | **8g. Sampling gaps** | **DONE** | Unified `Sampler::sample_one()`: min_p, repetition/frequency/presence penalties, logit_bias, logprobs (top-N). `LogprobsOutput`/`TokenLogprob` in `vllm-common`. CPU-side penalty application in both CandleWorker + MlxWorker. Logprobs propagated through `EngineCoreOutput` → API responses (chat + completion, streaming + non-streaming). 12 new sampler unit tests. (629 tests) |
 | **12a. Tool calling protocol** | **DONE** | Rich JSON messages + `tools`/`tool_choice` passed to chat templates via `apply()`. `tool_calls` arguments auto-parsed from string→object. `tool_choice: "none"` suppresses tools. `date_string` template variable. minijinja `json` feature for `tojson`. 4 new template tests. (633 tests) |
-| 12b. Tool call response parsing | Not started | Detect model-emitted tool calls (special tokens, JSON blocks), parse into structured `ToolCall` objects, streaming tool call deltas |
+| **12b. Tool call response parsing** | **DONE** | `ToolCallParser` trait + `StreamingToolParserState` trait. HermesToolParser (`<tool_call>` tags) + LlamaJsonToolParser (raw JSON / `<|python_tag|>`). Partial JSON helper for incomplete arguments. Non-streaming: full text extraction → structured `ToolCall` objects. Streaming: per-request state machine with delta diffing for incremental argument fragments. `--tool-call-parser hermes\|llama3_json` CLI flag. Wired into `AsyncEngine` (non-streaming + streaming) and `server.rs` SSE. 18 new tests. (651 tests) |
 | 12c. Structured output / constrained decoding | Not started | `response_format` (json_object, json_schema), grammar-guided logit masking via `llguidance` or similar, schema-to-grammar compilation |
 | 9c. Metal Tier 2 (legacy candle) | Superseded | Custom MSL fused kernels approach superseded by MLX backend. Use `--features candle-metal` for legacy path |
 | 9d. Metal Tier 3 | Partially superseded | UMA-aware KV cache, memory pressure handling. Zero-copy weight loading and quantization are handled natively by MLX backend (Phase 10d) |
@@ -90,7 +90,8 @@
 | 6b | ~850 | 2 new + 4 mod | 18 | 617 | Command R (candle+MLX float+quantized) |
 | 8g | ~450 | 10 mod | 12 | 629 | Sampling gaps (min_p, penalties, logprobs, logit_bias) |
 | 12a | ~120 | 3 mod | 4 | 633 | Tool calling protocol: rich messages + tools to templates |
-| **Total** | **~32,100** | **95 files** | **633** | **633** | **0 clippy errors** |
+| 12b | ~700 | 1 new + 5 mod | 18 | 651 | Tool call response parsing: Hermes + LLaMA JSON parsers, streaming |
+| **Total** | **~32,800** | **96 files** | **651** | **651** | **0 clippy errors** |
 
 ### Known limitations / follow-ups
 - **MLX YaRN RoPE**: The MLX backend uses `nn::Rope` which doesn't apply YaRN frequency corrections. Models with `rope_scaling` (e.g., Qwen3 with YaRN factor=4.0, DeepSeek V2 with factor=40.0) will generate correctly within the original context window but won't have correct positional encoding beyond it. Fix: either implement a custom MLX RoPE that pre-applies YaRN corrections, or upstream YaRN support to mlx-rs `nn::Rope`.
@@ -953,23 +954,28 @@ OpenAI-compatible tool/function calling and structured output support. This is a
 - [x] `tool_choice: "none"` → tools suppressed (not passed to template)
 - [x] minijinja `json` feature added for `tojson` filter support
 
-### 12b. Tool call response parsing
+### 12b. Tool call response parsing — DONE
 
 The model generates tool calls as text (JSON blocks, special tokens, or model-specific formats). This sub-phase parses that raw text into structured `ToolCall` objects in the API response.
 
 **Response parser** (`vllm-serve/src/tool_parser.rs`, new file):
-- [ ] `ToolCallParser` trait with `parse_tool_calls(text: &str) -> Option<Vec<ToolCall>>` and `parse_stream_delta(delta: &str) -> Option<ToolCallDelta>>`
-- [ ] **Hermes/generic parser**: Detects `<tool_call>{"name": ..., "arguments": ...}</tool_call>` blocks (used by LLaMA 3.1+, Qwen2.5, many fine-tuned models)
-- [ ] **Mistral parser**: Detects `[TOOL_CALLS]` token followed by JSON array
-- [ ] **Streaming support**: Incremental JSON parsing — buffer partial tool call text, emit `ToolCallDelta` chunks as `function.name` and `function.arguments` fragments become available
-- [ ] Parser selection: auto-detect from chat template content or model architecture, or allow `--tool-call-parser` CLI flag (matching Python vLLM's approach)
+- [x] `ToolCallParser` trait with `extract_tool_calls(text) -> ExtractedToolCallInfo` + `create_streaming_state() -> Box<dyn StreamingToolParserState>`
+- [x] `StreamingToolParserState` trait with `process_delta(previous, current, delta) -> ToolParserDelta`
+- [x] **Hermes parser**: Detects `<tool_call>{"name": ..., "arguments": ...}</tool_call>` blocks — handles multiple tool calls, unclosed tags, text before tool calls
+- [x] **LLaMA JSON parser**: Detects raw JSON objects with `name`/`arguments` fields, optional `<|python_tag|>` prefix, consecutive JSON objects for multiple tool calls
+- [x] **Streaming support**: Per-request state machines buffer partial tags/JSON, diff argument strings to emit incremental `DeltaToolCall` fragments
+- [x] **Partial JSON helper**: `partial_json_parse()` closes unmatched braces/brackets/strings for incomplete JSON during streaming
+- [x] **Parser registry**: `get_tool_parser("hermes"|"llama3_json"|"llama4_json")`, `--tool-call-parser` CLI flag
 
 **Integration** (`vllm-serve/src/engine.rs`, `server.rs`):
-- [ ] `AsyncEngine` holds optional `ToolCallParser`
-- [ ] Non-streaming: after generation completes, run parser on full output text; if tool calls detected, populate `tool_calls` field and set `finish_reason: "tool_calls"`
-- [ ] Streaming: run parser incrementally on each delta; emit `tool_calls` deltas alongside or instead of `content` deltas
-- [ ] When `tool_choice: "none"`, skip tool parsing entirely
-- [ ] When `tool_choice: { function: { name } }`, validate that the parsed tool call matches the requested function
+- [x] `AsyncEngine` holds optional `Arc<dyn ToolCallParser>` via `set_tool_parser()`
+- [x] `RequestState` holds optional `StreamingToolParserState` + `accumulated_text` + `tool_calls_emitted`
+- [x] `StreamDelta` includes optional `tool_call_deltas: Vec<DeltaToolCall>`
+- [x] Non-streaming: after detokenization, run `extract_tool_calls()` on full text; if tool calls detected, populate `tool_calls` field and set `finish_reason: "tool_calls"`
+- [x] Streaming: route through `process_delta()` state machine; emit content or tool call deltas; set `finish_reason: "tool_calls"` on completion
+- [x] `server.rs`: convert `DeltaToolCall` to OpenAI protocol JSON; suppress content when tool calls active
+- [x] When `tool_choice: "none"`, skip tool parsing entirely
+- [ ] When `tool_choice: { function: { name } }`, validate that the parsed tool call matches the requested function (not yet implemented)
 
 **Key files (Python reference)**: `vllm/entrypoints/openai/tool_parsers/` — contains Hermes, Mistral, LLaMA, Jamba, and other model-specific parsers. The streaming logic in Python is complex; start with non-streaming, then add streaming.
 
@@ -1001,8 +1007,8 @@ Constrained decoding forces the model to produce output matching a given format 
 
 **Dependencies**: This is the most complex sub-phase. 12a and 12b are independent and can be done first. 12c depends on nothing in 12a/12b (it's a separate logit-level mechanism) but is complementary — structured output ensures tool call arguments are valid JSON.
 
-### Milestone 12 deliverable
-`./vllm serve meta-llama/Llama-3.1-8B-Instruct` with `tools` in the chat completion request returns structured `tool_calls` in the response. `response_format: { type: "json_schema", json_schema: { schema: ... } }` forces output to conform to the given schema. Streaming tool call deltas work correctly. Compatible with OpenAI client libraries.
+### Milestone 12 deliverable (12a+12b DONE, 12c remaining)
+`./vllm serve meta-llama/Llama-3.1-8B-Instruct --tool-call-parser hermes` with `tools` in the chat completion request returns structured `tool_calls` in the response. Streaming tool call deltas work correctly. Compatible with OpenAI client libraries. Remaining: `response_format` (12c) for structured output / constrained decoding.
 
 ---
 

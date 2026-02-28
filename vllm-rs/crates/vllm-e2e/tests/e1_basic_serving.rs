@@ -448,6 +448,81 @@ async fn test_t4_deepseek_chat_basic() {
 }
 
 // ===========================================================================
+// Qwen3 MoE 4x0.6B (Qwen3MoeForCausalLM) — MoE architecture
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_qwen3_moe_server_starts() {
+    let server = TestServer::builder(TestModels::QWEN3_MOE_4X06B_4BIT)
+        .start()
+        .await
+        .expect("Qwen3 MoE server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let models = client.list_models().await.unwrap();
+    assert_eq!(models.data.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_qwen3_moe_chat_basic() {
+    let server = TestServer::builder(TestModels::QWEN3_MOE_4X06B_4BIT)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_qwen3_moe_completion_basic() {
+    let server = TestServer::builder(TestModels::QWEN3_MOE_4X06B_4BIT)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "completion should not be empty"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_qwen3_moe_max_tokens() {
+    let server = TestServer::builder(TestModels::QWEN3_MOE_4X06B_4BIT)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Write a long story about a cat.", Some(5));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    assert!(
+        resp.usage.completion_tokens.unwrap_or(0) <= 5,
+        "completion_tokens should be <= 5, got: {:?}",
+        resp.usage.completion_tokens
+    );
+}
+
+// ===========================================================================
 // E1b: Float16 vs quantized comparison
 // ===========================================================================
 

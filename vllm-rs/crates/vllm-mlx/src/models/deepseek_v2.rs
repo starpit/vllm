@@ -1011,7 +1011,7 @@ struct MlxQuantizedDeepSeekV2MoE {
 }
 
 /// Slice expert `i` from a fused 3D quantized weight tensor triplet.
-fn slice_quantized_linear(
+pub(crate) fn slice_quantized_linear(
     w3d: Option<&Array>,
     s3d: Option<&Array>,
     b3d: Option<&Array>,

@@ -13,6 +13,7 @@ pub mod gemma2;
 pub mod llama;
 pub mod phi3;
 pub mod quantized_llama;
+pub mod qwen3_moe;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -111,6 +112,17 @@ impl MlxModelRegistry {
             "DeepseekV2ForCausalLM",
             deepseek_v2::create_mlx_quantized_deepseek_v2,
         );
+        // Qwen3 MoE — LLaMA-like attention + MoE with sigmoid-gated shared expert
+        registry.register("Qwen3MoeForCausalLM", qwen3_moe::create_mlx_qwen3_moe);
+        registry.register("Qwen2MoeForCausalLM", qwen3_moe::create_mlx_qwen3_moe);
+        registry.register_quantized(
+            "Qwen3MoeForCausalLM",
+            qwen3_moe::create_mlx_quantized_qwen3_moe,
+        );
+        registry.register_quantized(
+            "Qwen2MoeForCausalLM",
+            qwen3_moe::create_mlx_quantized_qwen3_moe,
+        );
         // Command R (Cohere) — CohereLayerNorm, parallel attn+MLP, logit scaling,
         // interleaved RoPE
         registry.register("CohereForCausalLM", commandr::create_mlx_commandr);
@@ -179,8 +191,12 @@ mod tests {
         assert!(registry.contains("GemmaForCausalLM"));
         assert!(registry.contains("Gemma2ForCausalLM"));
         assert!(registry.contains("Phi3ForCausalLM"));
+        assert!(registry.contains("Qwen3MoeForCausalLM"));
+        assert!(registry.contains("Qwen2MoeForCausalLM"));
         assert!(registry.contains_quantized("Gemma2ForCausalLM"));
         assert!(registry.contains_quantized("Phi3ForCausalLM"));
+        assert!(registry.contains_quantized("Qwen3MoeForCausalLM"));
+        assert!(registry.contains_quantized("Qwen2MoeForCausalLM"));
         assert!(!registry.contains("GPT2ForCausalLM"));
     }
 

@@ -35,6 +35,10 @@ impl TestModels {
     pub const DEEPSEEK_V2_LITE_4BIT: &str =
         "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx";
 
+    // MoE models
+    pub const QWEN3_MOE_4X06B_4BIT: &str =
+        "justneedsomeavailableusername/Qwen3-MOE-4x0.6B-2.4B-Writing-Thunder-V1.2-mlx-4Bit";
+
     // Float16 variants for non-quantized testing
     pub const SMOLLM_135M_F16: &str = "mlx-community/SmolLM2-135M-Instruct";
 }

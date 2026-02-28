@@ -18,6 +18,7 @@ pub mod kv_block_pool;
 pub mod llama;
 pub mod quantized_llama;
 pub mod qwen2;
+pub mod qwen3_moe;
 pub mod registry;
 pub mod sampler;
 

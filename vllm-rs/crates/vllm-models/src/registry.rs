@@ -69,6 +69,10 @@ impl ModelRegistry {
             "DeepseekV2ForCausalLM",
             crate::deepseek_v2::create_deepseek_v2,
         );
+        // Qwen3 MoE — LLaMA-like attention + MoE with sigmoid-gated shared expert
+        self.register("Qwen3MoeForCausalLM", crate::qwen3_moe::create_qwen3_moe);
+        // Qwen2 MoE — same architecture as Qwen3 MoE (with QKV bias instead of QK norms)
+        self.register("Qwen2MoeForCausalLM", crate::qwen3_moe::create_qwen3_moe);
         // Command R (Cohere) — CohereLayerNorm, parallel attn+MLP, logit scaling,
         // interleaved RoPE
         self.register("CohereForCausalLM", crate::commandr::create_commandr);

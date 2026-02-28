@@ -112,6 +112,9 @@ impl TestModels {
     const COMMANDR_7B_4BIT: &str = "mlx-community/c4ai-command-r7b-12-2024-4bit"; // ~4.2 GB, Cohere2ForCausalLM (NOTE: needs Cohere2 arch)
     const DEEPSEEK_V2_LITE_4BIT: &str = "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx"; // ~8.2 GB, DeepseekV2ForCausalLM
 
+    // MoE models
+    const QWEN3_MOE_4X06B_4BIT: &str = "justneedsomeavailableusername/Qwen3-MOE-4x0.6B-2.4B-Writing-Thunder-V1.2-mlx-4Bit"; // ~1.5 GB, Qwen3MoeForCausalLM
+
     // Float16 variants for non-quantized testing
     const SMOLLM_135M_F16: &str = "mlx-community/SmolLM2-135M-Instruct";          // ~255 MB, LlamaForCausalLM
 }
@@ -152,6 +155,7 @@ For each model in the test matrix:
 |-------|-------------|-----------|
 | gemma-2-2b-it-4bit | Gemma2ForCausalLM | Yes (4-bit) |
 | Phi-3.5-mini-instruct-4bit | Phi3ForCausalLM | Yes (4-bit) |
+| Qwen3-MOE-4x0.6B-2.4B-mlx-4Bit | Qwen3MoeForCausalLM | Yes (4-bit) |
 
 **Models for E1a-weekly** (Tier 4, weekly):
 
@@ -567,6 +571,7 @@ Validate the server handles concurrent requests correctly.
 | Phi-3 | Phi3ForCausalLM | Phi-3.5-mini-instruct-4bit | 2.15 GB | Nightly | — | Yes |
 | Mistral | MistralForCausalLM | Mistral-7B-Instruct-v0.3-4bit | 3.8 GB | Weekly | — | Yes |
 | DeepSeek V2 | DeepseekV2ForCausalLM | DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx | 8.2 GB | Weekly | — | Yes |
+| Qwen3 MoE | Qwen3MoeForCausalLM | Qwen3-MOE-4x0.6B-2.4B-mlx-4Bit | ~1.5 GB | Nightly | — | Yes |
 | Command R | CohereForCausalLM | c4ai-command-r-08-2024-4bit | 16.9 GB | Manual | — | Yes |
 | Gemma v1 | GemmaForCausalLM | (deferred — 2B model at 2 GB) | — | — | — | — |
 

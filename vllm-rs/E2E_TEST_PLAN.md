@@ -10,6 +10,52 @@ End-to-end tests validate the full stack — from HTTP request to model inferenc
 
 ---
 
+## How to Run
+
+### Prerequisites
+
+1. **Build the CLI binary with the MLX backend** (required — tests spawn `vllm serve` as a child process):
+   ```bash
+   cargo build -p vllm-cli --features metal
+   ```
+   This produces `target/debug/vllm` which the test harness auto-discovers.
+
+2. **Models are downloaded on first run** from HuggingFace Hub. Tier 1 models (~76–335 MB each) are fast; larger tiers take longer. No separate download step is required — the `vllm serve` child process handles HF download via the existing HF Hub client.
+
+3. **Apple Silicon Mac required** for `--features metal` (MLX backend). CPU-only and CUDA E2E tests are future work.
+
+### Run commands
+
+```bash
+# All E2E tests (Tier 1–4, all phases):
+cargo test -p vllm-e2e --features e2e -- --ignored --test-threads=1
+
+# Single phase:
+cargo test -p vllm-e2e --features e2e --test e1_basic_serving -- --ignored --test-threads=1
+cargo test -p vllm-e2e --features e2e --test e2_chat_completions -- --ignored --test-threads=1
+cargo test -p vllm-e2e --features e2e --test e3_streaming -- --ignored --test-threads=1
+
+# Single test:
+cargo test -p vllm-e2e --features e2e --test e1_basic_serving test_smollm_chat_basic -- --ignored
+
+# PR tier only (Tier 1+2 models — SmolLM, Qwen2, Qwen3, Llama3):
+cargo test -p vllm-e2e --features e2e --test e1_basic_serving -- --ignored --test-threads=1 \
+  test_smollm test_qwen2 test_qwen3 test_llama3
+
+# With a custom binary path:
+VLLM_E2E_BINARY=/path/to/vllm cargo test -p vllm-e2e --features e2e -- --ignored --test-threads=1
+```
+
+### Key details
+
+- **`--features e2e`** — required. Tests are gated behind `#![cfg(feature = "e2e")]` and won't compile without it.
+- **`-- --ignored`** — required. All E2E tests are `#[ignore]`-tagged so they don't run during normal `cargo test`.
+- **`--test-threads=1`** — recommended. Tests spin up server processes on random ports; single-threaded avoids port races and excessive memory from multiple model loads.
+- **Startup timeout**: 120 seconds per server (configurable via `TestServerBuilder::with_timeout`). First run may be slower due to HF model download.
+- **Binary discovery**: The test harness searches `target/debug/vllm` then `target/release/vllm`, then falls back to `PATH`. Override with `VLLM_E2E_BINARY` env var.
+
+---
+
 ## Test Infrastructure (Phase E0)
 
 ### E0a. Test harness crate

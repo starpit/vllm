@@ -313,6 +313,10 @@ pub struct ChatCompletionRequest {
     /// Custom request ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+
+    /// Regex pattern for constrained decoding (mutually exclusive with `response_format`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guided_regex: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +455,10 @@ pub struct CompletionRequest {
     /// Custom request ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+
+    /// Regex pattern for constrained decoding (mutually exclusive with `response_format`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guided_regex: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,5 +1147,36 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["role"], "assistant");
         assert_eq!(parsed["content"], "hi");
+    }
+
+    // -- guided_regex deserialization --
+
+    #[test]
+    fn test_chat_completion_request_guided_regex() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}],
+            "guided_regex": "[0-9]+"
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.guided_regex.as_deref(), Some("[0-9]+"));
+    }
+
+    #[test]
+    fn test_completion_request_guided_regex() {
+        let json = r#"{
+            "prompt": "Give me a number",
+            "guided_regex": "[0-9]+"
+        }"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.guided_regex.as_deref(), Some("[0-9]+"));
+    }
+
+    #[test]
+    fn test_chat_completion_request_no_guided_regex() {
+        let json = r#"{
+            "messages": [{"role": "user", "content": "Hi"}]
+        }"#;
+        let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.guided_regex.is_none());
     }
 }

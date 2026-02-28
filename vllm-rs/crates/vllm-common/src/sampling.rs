@@ -25,6 +25,8 @@ pub enum GuidedGrammar {
     /// `response_format: { type: "json_schema", json_schema: { schema: ... } }` —
     /// output must conform to the given JSON schema.
     JsonSchema { schema: serde_json::Value },
+    /// `guided_regex` — output must match the given regex pattern.
+    Regex { pattern: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +554,19 @@ mod tests {
         assert_eq!(RequestOutputKind::Cumulative as u8, 0);
         assert_eq!(RequestOutputKind::Delta as u8, 1);
         assert_eq!(RequestOutputKind::FinalOnly as u8, 2);
+    }
+
+    #[test]
+    fn test_guided_grammar_regex_serde_roundtrip() {
+        let grammar = GuidedGrammar::Regex {
+            pattern: "[0-9]+".to_string(),
+        };
+        let json = serde_json::to_string(&grammar).unwrap();
+        let parsed: GuidedGrammar = serde_json::from_str(&json).unwrap();
+        match parsed {
+            GuidedGrammar::Regex { pattern } => assert_eq!(pattern, "[0-9]+"),
+            other => panic!("expected Regex, got {other:?}"),
+        }
     }
 
     #[test]

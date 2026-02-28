@@ -38,12 +38,12 @@
 | [LoRA / Adapters](#lora--adapters) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/5 |
 | [Speculative Decoding](#speculative-decoding) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/5 |
 | [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F535; | &#x2795; | `░░░░░░░░░░` 0/10 |
-| [Structured Output](#structured-output--guided-decoding) | &#x1F535; | &#x1F7E1; | `███████░░░` 3/4 |
+| [Structured Output](#structured-output--guided-decoding) | &#x1F535; | &#x1F535; | `██████████` 4/4 |
 | [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x1F535; | `██████████` 7/7 |
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/4 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | `██████████` 14/15 |
-| | | **Total** | `█████░░░░░` **98/199** |
+| | | **Total** | `█████░░░░░` **99/199** |
 
 ---
 
@@ -192,7 +192,7 @@
 | `ignore_eos` | &#x1F535; | &#x1F535; | |
 | `min_tokens` | &#x1F535; | &#x1F535; | |
 | Seed (reproducible sampling) | &#x1F535; | &#x1F535; | |
-| Guided decoding (grammar/regex/JSON) | &#x1F535; | &#x1F7E1; | P4 |
+| Guided decoding (grammar/regex/JSON) | &#x1F535; | &#x1F535; | P4 |
 
 > All penalty/filter/logprobs features use a unified `Sampler::sample_one()` entry point that operates on CPU logit vectors in both CandleWorker and MlxWorker. Prompt logprobs are not yet implemented (requires running logprobs on every prefill position).
 
@@ -348,9 +348,9 @@
 | `response_format: json_object` | &#x1F535; | &#x1F535; | |
 | `response_format: json_schema` | &#x1F535; | &#x1F535; | |
 | Grammar-guided logit masking | &#x1F535; | &#x1F535; | |
-| Regex-constrained decoding | &#x1F535; | &#x2795; | P4 |
+| Regex-constrained decoding | &#x1F535; | &#x1F535; | P4 |
 
-> Phase 12c: `response_format` with `json_object` and `json_schema` types fully implemented using `outlines-core` (pure Rust). JSON schemas are compiled to regex → FSM index at request start; per-request `GrammarGuide` tracks FSM state and masks logits before sampling. Grammar vocabulary built once from `tokenizer.json` at model load. Both CandleWorker and MlxWorker supported. Regex-constrained decoding (arbitrary regex patterns) is planned but not yet exposed via the API.
+> Phase 12c: `response_format` with `json_object` and `json_schema` types fully implemented using `outlines-core` (pure Rust). JSON schemas are compiled to regex → FSM index at request start; per-request `GrammarGuide` tracks FSM state and masks logits before sampling. Grammar vocabulary built once from `tokenizer.json` at model load. Both CandleWorker and MlxWorker supported. Regex-constrained decoding via `guided_regex` request parameter compiles arbitrary regex patterns directly to FSM index for logit masking.
 
 ---
 
@@ -431,5 +431,5 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Test count | ~948 test files | 687 passing tests (649+38 MLX) |
+| Test count | ~948 test files | 697 passing tests (659+38 MLX) |
 | Crate count | N/A | 13 crates |

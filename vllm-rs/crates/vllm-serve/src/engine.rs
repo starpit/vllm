@@ -521,7 +521,7 @@ impl AsyncEngine {
             .unwrap_or_else(|| self.model_name.clone());
         let n = request.n.max(1) as usize;
 
-        let sampling_params = self.build_sampling_params_from_completion(&request);
+        let sampling_params = self.build_sampling_params_from_completion(&request)?;
 
         // Normalize prompt to Vec<Vec<u32>>.
         let prompts = self.tokenize_completion_prompts(&request)?;
@@ -1292,8 +1292,9 @@ impl AsyncEngine {
             None
         };
 
-        // Parse response_format → guided_grammar.
-        let guided_grammar = parse_response_format(&request.response_format)?;
+        // Parse response_format → guided_grammar, or guided_regex (mutually exclusive).
+        let guided_grammar =
+            resolve_guided_grammar(&request.response_format, &request.guided_regex)?;
 
         Ok(SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
@@ -1322,7 +1323,7 @@ impl AsyncEngine {
     fn build_sampling_params_from_completion(
         &self,
         request: &protocol::CompletionRequest,
-    ) -> SamplingParams {
+    ) -> ServeResult<SamplingParams> {
         let stop = match &request.stop {
             Some(protocol::StopCondition::Single(s)) => vec![s.clone()],
             Some(protocol::StopCondition::Multiple(v)) => v.clone(),
@@ -1331,7 +1332,15 @@ impl AsyncEngine {
         // Completion API: logprobs is directly the count.
         let logprobs = request.logprobs.map(|n| n as i32);
 
-        SamplingParams {
+        // guided_regex → guided_grammar (completions have no response_format).
+        let guided_grammar = request
+            .guided_regex
+            .as_ref()
+            .map(|pattern| GuidedGrammar::Regex {
+                pattern: pattern.clone(),
+            });
+
+        Ok(SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
             top_k: request.top_k.unwrap_or(0),
@@ -1349,8 +1358,9 @@ impl AsyncEngine {
             skip_special_tokens: request.skip_special_tokens,
             logprobs,
             logit_bias: parse_logit_bias(&request.logit_bias),
+            guided_grammar,
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -1409,6 +1419,27 @@ fn parse_response_format(
         other => Err(ServeError::Validation(format!(
             "unsupported response_format type: {other:?}. Must be 'text', 'json_object', or 'json_schema'",
         ))),
+    }
+}
+
+/// Resolve `response_format` and `guided_regex` into a single `GuidedGrammar`.
+///
+/// These are mutually exclusive — returns an error if both are set.
+fn resolve_guided_grammar(
+    response_format: &Option<protocol::ResponseFormat>,
+    guided_regex: &Option<String>,
+) -> ServeResult<Option<GuidedGrammar>> {
+    let from_rf = parse_response_format(response_format)?;
+    let from_regex = guided_regex.as_ref().map(|pattern| GuidedGrammar::Regex {
+        pattern: pattern.clone(),
+    });
+    match (from_rf, from_regex) {
+        (Some(_), Some(_)) => Err(ServeError::Validation(
+            "response_format and guided_regex are mutually exclusive".into(),
+        )),
+        (Some(g), None) => Ok(Some(g)),
+        (None, Some(g)) => Ok(Some(g)),
+        (None, None) => Ok(None),
     }
 }
 
@@ -1636,6 +1667,7 @@ mod tests {
             priority: 0,
             cache_salt: None,
             request_id: None,
+            guided_regex: None,
         }
     }
 
@@ -1722,9 +1754,12 @@ mod tests {
             priority: 0,
             cache_salt: None,
             request_id: None,
+            guided_regex: None,
         };
 
-        let params = engine.build_sampling_params_from_completion(&request);
+        let params = engine
+            .build_sampling_params_from_completion(&request)
+            .unwrap();
         let ec_req = engine
             .completion_to_engine_request("comp-1", &request, &params)
             .unwrap();
@@ -1767,9 +1802,12 @@ mod tests {
             priority: 0,
             cache_salt: None,
             request_id: None,
+            guided_regex: None,
         };
 
-        let params = engine.build_sampling_params_from_completion(&request);
+        let params = engine
+            .build_sampling_params_from_completion(&request)
+            .unwrap();
         let ec_req = engine
             .completion_to_engine_request("comp-1", &request, &params)
             .unwrap();
@@ -1979,6 +2017,7 @@ mod tests {
             priority: 0,
             cache_salt: None,
             request_id: None,
+            guided_regex: None,
         }
     }
 
@@ -2262,6 +2301,45 @@ mod tests {
             json_schema: None,
         };
         let result = parse_response_format(&Some(rf));
+        assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_guided_grammar tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_guided_grammar_none() {
+        let result = resolve_guided_grammar(&None, &None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_guided_grammar_regex_only() {
+        let result = resolve_guided_grammar(&None, &Some("[0-9]+".to_string())).unwrap();
+        match result {
+            Some(GuidedGrammar::Regex { pattern }) => assert_eq!(pattern, "[0-9]+"),
+            other => panic!("expected Regex, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_guided_grammar_response_format_only() {
+        let rf = protocol::ResponseFormat {
+            format_type: "json_object".to_string(),
+            json_schema: None,
+        };
+        let result = resolve_guided_grammar(&Some(rf), &None).unwrap();
+        assert!(matches!(result, Some(GuidedGrammar::Json)));
+    }
+
+    #[test]
+    fn test_resolve_guided_grammar_conflict() {
+        let rf = protocol::ResponseFormat {
+            format_type: "json_object".to_string(),
+            json_schema: None,
+        };
+        let result = resolve_guided_grammar(&Some(rf), &Some("[0-9]+".to_string()));
         assert!(result.is_err());
     }
 

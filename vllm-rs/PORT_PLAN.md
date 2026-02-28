@@ -94,7 +94,8 @@
 | 12b | ~700 | 1 new + 5 mod | 18 | 651 | Tool call response parsing: Hermes + LLaMA JSON parsers, streaming |
 | 12c | ~400 | 3 mod | 14 | 665 | Structured output: json_object + json_schema via outlines-core |
 | 12d | ~300 | 1 new + 7 mod | 22 | 687 | ORCA metrics: scheduler stats gauges, endpoint-load-metrics headers |
-| **Total** | **~33,500** | **98 files** | **687** | **687** | **0 clippy errors** |
+| 12c+ | ~180 | 5 mod | 10 | 697 | Regex-constrained decoding via `guided_regex` API parameter |
+| **Total** | **~33,700** | **98 files** | **697** | **697** | **0 clippy errors** |
 
 ### Known limitations / follow-ups
 - **MLX YaRN RoPE**: The MLX backend uses `nn::Rope` which doesn't apply YaRN frequency corrections. Models with `rope_scaling` (e.g., Qwen3 with YaRN factor=4.0, DeepSeek V2 with factor=40.0) will generate correctly within the original context window but won't have correct positional encoding beyond it. Fix: either implement a custom MLX RoPE that pre-applies YaRN corrections, or upstream YaRN support to mlx-rs `nn::Rope`.
@@ -988,11 +989,12 @@ Constrained decoding forces the model to produce output matching a given format 
 
 **Implementation** (uses `outlines-core` 0.2, pure Rust, `default-features = false`):
 
-- [x] `GuidedGrammar` enum (`Json` | `JsonSchema { schema }`) in `vllm-common/src/sampling.rs`, stored in `SamplingParams`
-- [x] `parse_response_format()` in `vllm-serve/src/engine.rs`: `text` → None, `json_object` → `GuidedGrammar::Json`, `json_schema` → extract schema → `GuidedGrammar::JsonSchema`
+- [x] `GuidedGrammar` enum (`Json` | `JsonSchema { schema }` | `Regex { pattern }`) in `vllm-common/src/sampling.rs`, stored in `SamplingParams`
+- [x] `parse_response_format()` + `resolve_guided_grammar()` in `vllm-serve/src/engine.rs`: `text` → None, `json_object` → `GuidedGrammar::Json`, `json_schema` → extract schema → `GuidedGrammar::JsonSchema`, `guided_regex` → `GuidedGrammar::Regex` (mutually exclusive with `response_format`)
 - [x] `GrammarGuide` struct in `vllm-models/src/grammar.rs`: wraps `outlines_core::Index` + current `StateId`
   - `from_json_schema(schema, vocabulary)` → compile JSON schema → regex → FSM index
   - `from_json_object(vocabulary)` → generic `{"type": "object"}` schema
+  - `from_regex(pattern, vocabulary)` → compile arbitrary regex → FSM index directly
   - `allowed_tokens()` → query current FSM state for valid next tokens
   - `advance(token_id)` → transition FSM state
   - `is_finished()` → check accepting state
@@ -1002,9 +1004,11 @@ Constrained decoding forces the model to produce output matching a given format 
 - [x] Per-request `GrammarGuide` state in `CandleWorker` and `MlxWorker` (`grammar_states` HashMap)
 - [x] MLX: grammar forces CPU sampling path (logits evaluated, masked on CPU, then sampled)
 - [x] 14 new tests: 8 grammar/sampler + 6 response_format parsing
+- [x] `guided_regex` field on `ChatCompletionRequest` and `CompletionRequest` — compiles regex directly to FSM index
+- [x] `resolve_guided_grammar()` — validates mutual exclusivity of `response_format` and `guided_regex`
+- [x] 10 new tests: serde roundtrip, from_regex, from_guided_grammar Regex variant, protocol deserialization, conflict detection
 
 **Future work**:
-- Regex-constrained decoding (arbitrary regex patterns via API)
 - `strict: true` vs `strict: false` differentiation
 - Pre-compiled grammar caching by schema hash
 - `json_object` pre-compiled Index at model load time (shared across requests)

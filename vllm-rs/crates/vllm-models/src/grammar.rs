@@ -45,6 +45,18 @@ impl GrammarGuide {
         })
     }
 
+    /// Build a grammar guide from an arbitrary regex pattern.
+    ///
+    /// Compiles the regex directly into an FSM index (no JSON schema step).
+    pub fn from_regex(pattern: &str, vocabulary: &Vocabulary) -> Result<Self, String> {
+        let index = Index::new(pattern, vocabulary).map_err(|e| e.to_string())?;
+        let initial_state = index.initial_state();
+        Ok(Self {
+            index,
+            current_state: initial_state,
+        })
+    }
+
     /// Build a grammar guide for generic JSON object output.
     ///
     /// Uses a built-in `{"type": "object"}` schema that accepts any JSON object.
@@ -62,6 +74,7 @@ impl GrammarGuide {
         match grammar {
             GuidedGrammar::Json => Self::from_json_object(vocabulary),
             GuidedGrammar::JsonSchema { schema } => Self::from_json_schema(schema, vocabulary),
+            GuidedGrammar::Regex { pattern } => Self::from_regex(pattern, vocabulary),
         }
     }
 
@@ -251,6 +264,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_from_regex_digit_pattern() {
+        let eos = 99;
+        let mut vocab = Vocabulary::new(eos);
+        for (id, tok) in [(0, "0"), (1, "1"), (2, "2"), (3, "3")] {
+            vocab.try_insert(tok, id).unwrap();
+        }
+        let guide = GrammarGuide::from_regex("[0-3]+", &vocab).unwrap();
+        let allowed = guide.allowed_tokens().unwrap();
+        assert!(!allowed.is_empty());
+    }
+
+    #[test]
+    fn test_from_guided_grammar_regex_variant() {
+        let eos = 99;
+        let mut vocab = Vocabulary::new(eos);
+        for (id, tok) in [(0, "0"), (1, "1"), (2, "2"), (3, "3")] {
+            vocab.try_insert(tok, id).unwrap();
+        }
+        let grammar = GuidedGrammar::Regex {
+            pattern: "[0-3]+".to_string(),
+        };
+        let guide = GrammarGuide::from_guided_grammar(&grammar, &vocab).unwrap();
+        let allowed = guide.allowed_tokens().unwrap();
+        assert!(!allowed.is_empty());
     }
 
     #[test]

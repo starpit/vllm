@@ -18,7 +18,7 @@
 | **2e. Executor trait** | **DONE** | `vllm-engine`: Executor trait, NoopExecutor, ModelRunnerOutput (3 tests) |
 | **2f. Engine core client** | **DONE** | `vllm-engine`: EngineCoreClient trait, InprocClient (10 tests) |
 | **3a. OpenAI protocol types** | **DONE** | `vllm-serve`: ChatCompletion/Completion request/response types, streaming types, model types, error types (25 tests) |
-| **3b. Axum HTTP server** | **DONE** | `vllm-serve`: axum routes for /v1/chat/completions, /v1/completions, /v1/models, /health, /version, CORS, SSE streaming (7 tests) |
+| **3b. Axum HTTP server** | **DONE** | `vllm-serve`: axum routes for /v1/chat/completions, /v1/completions, /v1/models, /health, /version, CORS, SSE streaming, SSL/TLS via rustls (`--ssl-certfile`, `--ssl-keyfile`, `--ssl-ca-certs` for mTLS) (12 tests) |
 | **3c. Async engine interface** | **DONE** | `vllm-serve`: AsyncEngine, request lifecycle management, streaming deltas, output routing (6 tests) |
 | **3d. Tokenizer integration** | **DONE** | `vllm-serve`: Tokenizer wrapper (HF `tokenizers` crate), encode/decode, byte-level BPE (6 tests) |
 | **3e. Output processing (detokenization)** | **DONE** | `vllm-serve`: IncrementalDetokenizer (sliding-window), check_stop_strings, per-request state, AsyncEngine integration (24 tests) |
@@ -241,7 +241,7 @@
 
 **`vllm-serve`** (5 files, 32 tests):
 - `protocol.rs` — OpenAI-compatible API types: `ChatCompletionRequest`/`Response`, `CompletionRequest`/`Response`, streaming variants (`ChatCompletionStreamResponse`, `CompletionStreamResponse`), `UsageInfo`, `ErrorResponse`, `ModelCard`/`ModelList`, `DeltaMessage`, `StopCondition`, `CompletionPrompt` (25 tests)
-- `server.rs` — axum HTTP server with routes: `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`, `GET /health`, `GET /version`; CORS middleware via tower-http; SSE streaming for chat completions with `[DONE]` sentinel (7 tests)
+- `server.rs` — axum HTTP server with routes: `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models`, `GET /health`, `GET /version`; CORS middleware via tower-http; SSE streaming for chat completions with `[DONE]` sentinel; SSL/TLS via axum-server + rustls (`--ssl-certfile`, `--ssl-keyfile`) with optional mTLS client cert verification (`--ssl-ca-certs`) (12 tests)
 - `engine.rs` — `AsyncEngine` async wrapper around `EngineCoreClient`: request lifecycle (submit → poll → respond), streaming via `mpsc` channels with `StreamDelta`, output routing, request conversion (chat/completion → `EngineCoreRequest`), `SamplingParams` construction (6 tests)
 - `error.rs` — `ServeError` enum with `IntoResponse` impl for axum error handling
 - `lib.rs` — Module declarations

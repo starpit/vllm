@@ -140,6 +140,9 @@ impl TestServerBuilder {
             version: format!("0.1.0-rust-test ({})", stack.model_name),
             cors_enabled: true,
             metrics_enabled: false,
+            ssl_keyfile: None,
+            ssl_certfile: None,
+            ssl_ca_certs: None,
         };
 
         let app_state = Arc::new(vllm_serve::server::AppState {

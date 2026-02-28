@@ -66,17 +66,23 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
 
     // 4. Build server config and serve.
     let bind_address = format!("{}:{}", host, port);
+    let is_ssl = args.ssl_certfile.is_some() && args.ssl_keyfile.is_some();
     let startup_elapsed = startup_start.elapsed();
+    let scheme = if is_ssl { "https" } else { "http" };
     info!(
-        "Serving on http://{} (startup: {:.2}s)",
+        "Serving on {}://{} (startup: {:.2}s)",
+        scheme,
         bind_address,
         startup_elapsed.as_secs_f64()
     );
     let server_config = ServerConfig {
-        bind_address,
+        bind_address: bind_address.clone(),
         version: format!("0.1.0-rust ({})", stack.model_name),
         cors_enabled: true,
         metrics_enabled: enable_metrics,
+        ssl_keyfile: args.ssl_keyfile.clone(),
+        ssl_certfile: args.ssl_certfile.clone(),
+        ssl_ca_certs: args.ssl_ca_certs.clone(),
     };
 
     let app_state = Arc::new(AppState {

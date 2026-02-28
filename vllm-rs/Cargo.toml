@@ -34,6 +34,9 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP/gRPC
 axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+rustls-pemfile = "2"
 tonic = "0.13"
 tower = "0.5"
 
@@ -92,6 +95,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Testing
 tempfile = "3"
+rcgen = "0.14"
 
 # HTTP client (for E2E tests)
 reqwest = { version = "0.12", features = ["json"] }

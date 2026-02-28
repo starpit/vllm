@@ -19,6 +19,9 @@ vllm-mlx = { workspace = true, optional = true }
 candle-core = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
+axum-server = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"
 serde = { workspace = true }
@@ -37,3 +40,6 @@ prometheus = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 http-body-util = "0.1"
+rcgen = { workspace = true }
+reqwest = { workspace = true }
+tempfile = { workspace = true }

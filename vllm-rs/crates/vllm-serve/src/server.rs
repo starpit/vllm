@@ -49,6 +49,15 @@ pub struct ServerConfig {
 
     /// Whether the `/metrics` endpoint is enabled.
     pub metrics_enabled: bool,
+
+    /// Path to SSL/TLS private key file (PEM format).
+    pub ssl_keyfile: Option<String>,
+
+    /// Path to SSL/TLS certificate file (PEM format).
+    pub ssl_certfile: Option<String>,
+
+    /// Path to CA certificates file for client certificate verification (PEM).
+    pub ssl_ca_certs: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -58,6 +67,9 @@ impl Default for ServerConfig {
             version: "0.1.0-rust".to_string(),
             cors_enabled: true,
             metrics_enabled: false,
+            ssl_keyfile: None,
+            ssl_certfile: None,
+            ssl_ca_certs: None,
         }
     }
 }
@@ -125,16 +137,93 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     router
 }
 
-/// Start the HTTP server.
+/// Start the HTTP server (plain HTTP or HTTPS if SSL cert/key are configured).
 pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
     let router = build_router(state.clone());
-    let listener = tokio::net::TcpListener::bind(&state.config.bind_address).await?;
-    info!(
-        "vLLM Rust server listening on {}",
-        state.config.bind_address
-    );
-    axum::serve(listener, router).await?;
+
+    match (&state.config.ssl_certfile, &state.config.ssl_keyfile) {
+        (Some(certfile), Some(keyfile)) => {
+            let tls_config =
+                build_tls_config(certfile, keyfile, state.config.ssl_ca_certs.as_deref())?;
+            let addr: std::net::SocketAddr = state.config.bind_address.parse()?;
+            info!(
+                "vLLM Rust server listening on https://{}",
+                state.config.bind_address
+            );
+            axum_server::bind_rustls(addr, tls_config)
+                .serve(router.into_make_service())
+                .await?;
+        }
+        _ => {
+            let listener = tokio::net::TcpListener::bind(&state.config.bind_address).await?;
+            info!(
+                "vLLM Rust server listening on http://{}",
+                state.config.bind_address
+            );
+            axum::serve(listener, router).await?;
+        }
+    }
     Ok(())
+}
+
+/// Build a rustls [`axum_server::tls_rustls::RustlsConfig`] from PEM file paths.
+fn build_tls_config(
+    certfile: &str,
+    keyfile: &str,
+    ca_certs: Option<&str>,
+) -> Result<axum_server::tls_rustls::RustlsConfig, Box<dyn std::error::Error>> {
+    use std::io::BufReader;
+
+    let cert_pem = std::fs::read(certfile)
+        .map_err(|e| format!("failed to read ssl_certfile '{}': {}", certfile, e))?;
+    let key_pem = std::fs::read(keyfile)
+        .map_err(|e| format!("failed to read ssl_keyfile '{}': {}", keyfile, e))?;
+
+    // Parse server cert chain and private key.
+    let server_certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_slice()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("failed to parse server certificates: {}", e))?;
+    let server_key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_slice()))
+        .map_err(|e| format!("failed to parse private key: {}", e))?
+        .ok_or("no private key found in ssl_keyfile")?;
+
+    let provider = rustls::crypto::aws_lc_rs::default_provider().into();
+
+    let tls_config = if let Some(ca_path) = ca_certs {
+        info!("Client certificate verification enabled (CA: {})", ca_path);
+        let ca_pem = std::fs::read(ca_path)
+            .map_err(|e| format!("failed to read ssl_ca_certs '{}': {}", ca_path, e))?;
+
+        let ca_certs_parsed: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(ca_pem.as_slice()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("failed to parse CA certificates: {}", e))?;
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in ca_certs_parsed {
+            root_store.add(cert)?;
+        }
+        let client_verifier = rustls::server::WebPkiClientVerifier::builder(root_store.into())
+            .build()
+            .map_err(|e| format!("failed to build client verifier: {}", e))?;
+
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("failed to set protocol versions: {}", e))?
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(server_certs, server_key)
+            .map_err(|e| format!("failed to build TLS config with mTLS: {}", e))?
+    } else {
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("failed to set protocol versions: {}", e))?
+            .with_no_client_auth()
+            .with_single_cert(server_certs, server_key)
+            .map_err(|e| format!("failed to build TLS config: {}", e))?
+    };
+
+    Ok(axum_server::tls_rustls::RustlsConfig::from_config(
+        std::sync::Arc::new(tls_config),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -661,5 +750,206 @@ mod tests {
             !response.headers().contains_key("endpoint-load-metrics"),
             "Response should NOT contain ORCA header when not requested"
         );
+    }
+
+    // -- TLS tests --
+
+    /// Generate a self-signed CA certificate and a server certificate signed by it.
+    /// Returns (ca_cert_pem, server_cert_pem, server_key_pem).
+    fn generate_test_certs() -> (String, String, String) {
+        use rcgen::{CertificateParams, Issuer, KeyPair};
+
+        // Generate CA.
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["Test CA".to_string()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        // Generate server cert signed by CA.
+        let server_key = KeyPair::generate().unwrap();
+        let server_params =
+            CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()]).unwrap();
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
+        let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+        (ca_cert.pem(), server_cert.pem(), server_key.serialize_pem())
+    }
+
+    /// Write PEM content to a temp file and return the path.
+    fn write_pem_file(dir: &tempfile::TempDir, name: &str, pem: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, pem).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    fn make_tls_test_state(
+        certfile: String,
+        keyfile: String,
+        ca_certs: Option<String>,
+    ) -> Arc<AppState> {
+        let engine_config = EngineCoreConfig {
+            scheduler_config: SchedulerConfig {
+                max_num_batched_tokens: 8192,
+                max_num_seqs: 256,
+                max_num_scheduled_tokens: None,
+                policy: SchedulerPolicy::Fcfs,
+                enable_chunked_prefill: true,
+                long_prefill_token_threshold: 0,
+                ..Default::default()
+            },
+            max_model_len: 4096,
+            num_gpu_blocks: 1024,
+            block_size: 16,
+            engine_index: 0,
+            async_scheduling: false,
+            use_spec_decode: false,
+            eos_token_ids: vec![],
+        };
+        let executor = Box::new(NoopExecutor::new(1024));
+        let client = Box::new(InprocClient::new(engine_config, executor));
+        let engine = Arc::new(AsyncEngine::new(client, "test-model".to_string(), 4096));
+
+        // Use port 0 to get a random available port.
+        Arc::new(AppState {
+            engine,
+            config: ServerConfig {
+                bind_address: "127.0.0.1:0".to_string(),
+                ssl_certfile: Some(certfile),
+                ssl_keyfile: Some(keyfile),
+                ssl_ca_certs: ca_certs,
+                ..ServerConfig::default()
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn test_tls_health_endpoint() {
+        let (ca_pem, cert_pem, key_pem) = generate_test_certs();
+        let tmp = tempfile::tempdir().unwrap();
+        let certfile = write_pem_file(&tmp, "server.crt", &cert_pem);
+        let keyfile = write_pem_file(&tmp, "server.key", &key_pem);
+
+        // Build the TLS config directly and start axum-server.
+        let tls_config = build_tls_config(&certfile, &keyfile, None).unwrap();
+        let state = make_tls_test_state(certfile, keyfile, None);
+        let router = build_router(state);
+
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let handle = axum_server::Handle::new();
+        let server_handle = handle.clone();
+
+        let server_task = tokio::spawn(async move {
+            axum_server::bind_rustls(addr, tls_config)
+                .handle(server_handle)
+                .serve(router.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        // Wait for the server to start and get the actual port.
+        let listening_addr = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(addr) = handle.listening().await {
+                    return addr;
+                }
+            }
+        })
+        .await
+        .expect("server did not start within 5s");
+
+        // Connect with reqwest trusting the test CA.
+        let ca_cert = reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap();
+        let client = reqwest::Client::builder()
+            .add_root_certificate(ca_cert)
+            .build()
+            .unwrap();
+
+        let resp = client
+            .get(format!(
+                "https://127.0.0.1:{}/health",
+                listening_addr.port()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "ok");
+
+        // Shutdown.
+        handle.shutdown();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_tls_rejects_plain_http() {
+        let (_ca_pem, cert_pem, key_pem) = generate_test_certs();
+        let tmp = tempfile::tempdir().unwrap();
+        let certfile = write_pem_file(&tmp, "server.crt", &cert_pem);
+        let keyfile = write_pem_file(&tmp, "server.key", &key_pem);
+
+        let tls_config = build_tls_config(&certfile, &keyfile, None).unwrap();
+        let state = make_tls_test_state(certfile, keyfile, None);
+        let router = build_router(state);
+
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let handle = axum_server::Handle::new();
+        let server_handle = handle.clone();
+
+        let server_task = tokio::spawn(async move {
+            axum_server::bind_rustls(addr, tls_config)
+                .handle(server_handle)
+                .serve(router.into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let listening_addr = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(addr) = handle.listening().await {
+                    return addr;
+                }
+            }
+        })
+        .await
+        .expect("server did not start within 5s");
+
+        // Plain HTTP to an HTTPS port should fail.
+        let client = reqwest::Client::new();
+        let result = client
+            .get(format!("http://127.0.0.1:{}/health", listening_addr.port()))
+            .send()
+            .await;
+        assert!(result.is_err(), "plain HTTP to TLS port should fail");
+
+        handle.shutdown();
+        let _ = server_task.await;
+    }
+
+    #[test]
+    fn test_build_tls_config_missing_certfile() {
+        let result = build_tls_config("/nonexistent/cert.pem", "/nonexistent/key.pem", None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("ssl_certfile"), "error was: {err}");
+    }
+
+    #[test]
+    fn test_build_tls_config_missing_keyfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let certfile = write_pem_file(&tmp, "server.crt", "not real but file exists");
+        let result = build_tls_config(&certfile, "/nonexistent/key.pem", None);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("ssl_keyfile"), "error was: {err}");
+    }
+
+    #[test]
+    fn test_server_config_default_no_ssl() {
+        let config = ServerConfig::default();
+        assert!(config.ssl_keyfile.is_none());
+        assert!(config.ssl_certfile.is_none());
+        assert!(config.ssl_ca_certs.is_none());
     }
 }

@@ -37,7 +37,7 @@
 |---|:---:|:---:|---:|---:|---|
 | [Model Architectures](#model-architectures) | &#x1F535; | &#x1F7E1; | 100 | 25 | `███░░░░░░░` 11/36 |
 | [Quantization](#quantization) | &#x1F535; | &#x1F7E1; | 13 | 0 | `█░░░░░░░░░` 1/11 |
-| [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | 96 | 18 | `██████░░░░` 14/25 |
+| [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | 101 | 18 | `██████░░░░` 15/25 |
 | [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | 53 | 13 | `█████████░` 19/21 |
 | [KV Cache & Attention](#kv-cache--attention) | &#x1F535; | &#x1F7E1; | 96 | 0 | `█████░░░░░` 9/19 |
 | [Scheduling](#scheduling) | &#x1F535; | &#x1F7E1; | 67 | 0 | `████████░░` 8/10 |
@@ -52,7 +52,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/6 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | 15 | 0 | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | 14 | 0 | `██████████` 14/15 |
-| | | **Total** | **564** | **58** | `█████░░░░░` **102/199** |
+| | | **Total** | **569** | **58** | `█████░░░░░` **103/199** |
 
 ---
 
@@ -183,7 +183,7 @@
 | Speech-to-text | &#x1F535; | &#x1F534; | — | — | P1 |
 | Realtime API | &#x1F535; | &#x1F534; | — | — | P1 |
 | SageMaker integration | &#x1F535; | &#x1F534; | — | — | P1 |
-| SSL / TLS | &#x1F535; | &#x1F534; | — | — | P3 |
+| SSL / TLS | &#x1F535; | &#x1F535; | 5 | 0 | |
 | CORS | &#x1F535; | &#x1F535; | 0 | 0 | |
 | `usage` field in responses | &#x1F535; | &#x1F535; | 2 | 0 | |
 | `best_of` / `n` with reranking | &#x1F535; | &#x1F534; | — | — | P2 |

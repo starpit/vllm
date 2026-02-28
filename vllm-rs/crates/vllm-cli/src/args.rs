@@ -94,6 +94,18 @@ pub struct ServeArgs {
     /// Enable automatic tool choice (model decides when to call tools).
     #[arg(long)]
     pub enable_auto_tool_choice: bool,
+
+    /// Path to SSL/TLS private key file (PEM format).
+    #[arg(long)]
+    pub ssl_keyfile: Option<String>,
+
+    /// Path to SSL/TLS certificate file (PEM format).
+    #[arg(long)]
+    pub ssl_certfile: Option<String>,
+
+    /// Path to CA certificates file for client certificate verification (PEM).
+    #[arg(long)]
+    pub ssl_ca_certs: Option<String>,
 }
 
 impl ServeArgs {

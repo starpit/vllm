@@ -68,6 +68,7 @@ tokenizers = "0.22"
 
 # Template engine (for HuggingFace chat templates)
 minijinja = { version = "2", features = ["builtins", "json"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # Structured output / constrained decoding
 outlines-core = { version = "0.2", default-features = false }

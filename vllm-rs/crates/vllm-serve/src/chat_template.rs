@@ -148,6 +148,10 @@ impl ChatTemplate {
     ) -> Result<String, ServeError> {
         let mut env = Environment::new();
 
+        // Enable Python string/dict/list methods (startswith, endswith, etc.)
+        // that HuggingFace Jinja2 chat templates commonly use.
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+
         // Add a `raise_exception` function that Jinja2 templates often use.
         env.add_function("raise_exception", raise_exception);
 

@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::sampling::SamplingParams;
+use crate::sampling::{LogprobsOutput, SamplingParams};
 
 // ---------------------------------------------------------------------------
 // FinishReason
@@ -159,6 +159,12 @@ pub struct EngineCoreOutput {
 
     /// Events (queued, scheduled, preempted) recorded during this step.
     pub events: Option<Vec<EngineCoreEvent>>,
+
+    /// Per-token log-probabilities for the newly generated tokens.
+    /// Only populated when the request's `SamplingParams.logprobs` is set.
+    /// Skipped during serialization (only used in-process).
+    #[serde(skip)]
+    pub new_logprobs: Option<Vec<LogprobsOutput>>,
 }
 
 impl EngineCoreOutput {
@@ -341,6 +347,7 @@ mod tests {
             stop_reason: None,
             num_cached_tokens: 10,
             events: None,
+            new_logprobs: None,
         };
         assert!(!out.finished());
     }
@@ -357,6 +364,7 @@ mod tests {
                 EngineCoreEvent::new(EngineCoreEventType::Queued, 1.0),
                 EngineCoreEvent::new(EngineCoreEventType::Scheduled, 2.0),
             ]),
+            new_logprobs: None,
         };
         assert!(out.finished());
         assert_eq!(out.finish_reason, Some(FinishReason::Stop));
@@ -372,6 +380,7 @@ mod tests {
             stop_reason: None,
             num_cached_tokens: 5,
             events: None,
+            new_logprobs: None,
         };
         let json = serde_json::to_string(&out).unwrap();
         let out2: EngineCoreOutput = serde_json::from_str(&json).unwrap();
@@ -403,6 +412,7 @@ mod tests {
                     stop_reason: None,
                     num_cached_tokens: 0,
                     events: None,
+                    new_logprobs: None,
                 },
                 EngineCoreOutput {
                     request_id: "b".into(),
@@ -411,6 +421,7 @@ mod tests {
                     stop_reason: Some(StopReason::String("END".into())),
                     num_cached_tokens: 3,
                     events: None,
+                    new_logprobs: None,
                 },
             ],
             timestamp: 1234.5,
@@ -431,6 +442,7 @@ mod tests {
                 stop_reason: None,
                 num_cached_tokens: 0,
                 events: Some(vec![EngineCoreEvent::new(EngineCoreEventType::Queued, 0.5)]),
+                new_logprobs: None,
             }],
             timestamp: 42.0,
         };

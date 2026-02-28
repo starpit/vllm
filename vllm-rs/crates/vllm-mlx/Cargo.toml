@@ -16,6 +16,7 @@ vllm-core = { workspace = true }
 vllm-engine = { workspace = true }
 vllm-executor = { workspace = true }
 vllm-model = { workspace = true }
+vllm-models = { workspace = true }
 mlx-rs = { workspace = true, optional = true }
 tracing = { workspace = true }
 hf-hub = { workspace = true }

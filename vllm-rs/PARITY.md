@@ -1,6 +1,6 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-02-27 | Rust port: `vllm-rs/` on branch `feat/rust` (599 tests, 0 clippy errors)
+> Generated 2026-02-27 | Rust port: `vllm-rs/` on branch `feat/rust` (629 tests, 0 clippy errors)
 
 ### Legend
 
@@ -20,7 +20,7 @@
 | [Model Architectures](#model-architectures) | &#x1F535; | &#x1F7E1; | `███░░░░░░░` 9/36 |
 | [Quantization](#quantization) | &#x1F535; | &#x1F7E1; | `█░░░░░░░░░` 1/11 |
 | [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | `█████░░░░░` 12/25 |
-| [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | `█████░░░░░` 11/21 |
+| [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | `████████░░` 17/21 |
 | [KV Cache & Attention](#kv-cache--attention) | &#x1F535; | &#x1F7E1; | `█████░░░░░` 9/19 |
 | [Scheduling](#scheduling) | &#x1F535; | &#x1F7E1; | `████████░░` 8/10 |
 | [Hardware Backends](#hardware-backends) | &#x1F535; | &#x1F7E1; | `████░░░░░░` 3/8 |
@@ -34,7 +34,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | `░░░░░░░░░░` 0/4 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F7E1; | `█████████░` 6/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | `█████████░` 13/15 |
-| | | **Total** | `████░░░░░░` **78/198** |
+| | | **Total** | `████░░░░░░` **84/198** |
 
 ---
 
@@ -167,13 +167,13 @@
 | Temperature | &#x1F535; | &#x1F535; |
 | Top-k | &#x1F535; | &#x1F535; |
 | Top-p (nucleus) | &#x1F535; | &#x1F535; |
-| Min-p | &#x1F535; | &#x1F534; |
-| Repetition penalty | &#x1F535; | &#x1F534; |
-| Frequency penalty | &#x1F535; | &#x1F534; |
-| Presence penalty | &#x1F535; | &#x1F534; |
-| Logprobs | &#x1F535; | &#x1F534; |
+| Min-p | &#x1F535; | &#x1F535; |
+| Repetition penalty | &#x1F535; | &#x1F535; |
+| Frequency penalty | &#x1F535; | &#x1F535; |
+| Presence penalty | &#x1F535; | &#x1F535; |
+| Logprobs | &#x1F535; | &#x1F535; |
 | Prompt logprobs | &#x1F535; | &#x1F534; |
-| Logit bias | &#x1F535; | &#x1F534; |
+| Logit bias | &#x1F535; | &#x1F535; |
 | Beam search | &#x1F535; | &#x1F534; |
 | `best_of` | &#x1F535; | &#x1F534; |
 | `max_tokens` / `max_completion_tokens` | &#x1F535; | &#x1F535; |
@@ -185,7 +185,7 @@
 | Seed (reproducible sampling) | &#x1F535; | &#x1F535; |
 | Guided decoding (grammar/regex/JSON) | &#x1F535; | &#x2795; |
 
-> Rust `SamplingParams` struct declares fields for min_p, repetition/frequency/presence penalties, logprobs, and logit_bias, but they are not yet wired into the sampler.
+> All penalty/filter/logprobs features use a unified `Sampler::sample_one()` entry point that operates on CPU logit vectors in both CandleWorker and MlxWorker. Prompt logprobs are not yet implemented (requires running logprobs on every prefill position).
 
 ---
 
@@ -420,5 +420,5 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Test count | ~948 test files | 599 passing tests |
+| Test count | ~948 test files | 629 passing tests |
 | Crate count | N/A | 13 crates |

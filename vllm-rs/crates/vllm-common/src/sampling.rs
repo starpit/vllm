@@ -3,6 +3,8 @@
 
 //! Sampling parameters for text generation, ported from `vllm/sampling_params.py`.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Epsilon used to distinguish greedy from random sampling.
@@ -117,6 +119,11 @@ pub struct SamplingParams {
 
     /// How incremental output is delivered to the caller.
     pub output_kind: RequestOutputKind,
+
+    /// Per-token logit bias: add the bias value to the logit for each
+    /// specified token ID before sampling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logit_bias: Option<HashMap<u32, f32>>,
 }
 
 impl Default for SamplingParams {
@@ -142,6 +149,7 @@ impl Default for SamplingParams {
             skip_special_tokens: true,
             include_stop_str_in_output: false,
             output_kind: RequestOutputKind::default(),
+            logit_bias: None,
         }
     }
 }
@@ -248,6 +256,32 @@ impl SamplingParams {
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Logprobs types
+// ---------------------------------------------------------------------------
+
+/// Log-probability information for a single token position.
+#[derive(Debug, Clone)]
+pub struct TokenLogprob {
+    /// The token ID.
+    pub token_id: u32,
+    /// The log-probability of this token.
+    pub logprob: f32,
+    /// Rank of this token in the vocabulary (1-indexed).
+    pub rank: u32,
+}
+
+/// Log-probability output for a single generation step.
+///
+/// Contains the sampled token's logprob and the top-k alternatives.
+#[derive(Debug, Clone)]
+pub struct LogprobsOutput {
+    /// The sampled token's log-probability info.
+    pub sampled: TokenLogprob,
+    /// Top-k alternative tokens (may be empty if logprobs not requested).
+    pub top_logprobs: Vec<TokenLogprob>,
 }
 
 // ---------------------------------------------------------------------------

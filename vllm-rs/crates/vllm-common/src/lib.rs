@@ -28,4 +28,4 @@ pub use engine_io::{
 };
 pub use error::{VllmError, VllmResult};
 pub use request::{Request, RequestStatus};
-pub use sampling::{RequestOutputKind, SamplingParams, SamplingType};
+pub use sampling::{LogprobsOutput, RequestOutputKind, SamplingParams, SamplingType, TokenLogprob};

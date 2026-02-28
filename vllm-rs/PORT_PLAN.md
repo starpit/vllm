@@ -2,7 +2,7 @@
 
 ## Implementation Progress
 
-> **Last updated**: 2026-02-27 (Phase 6b DONE — all Priority 1 models complete incl. Command R)
+> **Last updated**: 2026-02-27 (Sampling gaps DONE — min_p, penalties, logprobs, logit_bias wired end-to-end)
 
 | Phase | Status | Details |
 |-------|--------|---------|
@@ -52,6 +52,7 @@
 | **10d+. Multi-EOS + logging** | **DONE** | Support all eos_token_ids from config.json (matching Python vLLM), request-finished log includes finish_reason/stop_reason, HTTP handler logs max_completion_tokens, fixed vacuous EOS tests (553 tests) |
 | **10e. MLX additional models** | **DONE** | Gemma v1 (2 norms, GemmaRmsNorm +1 offset, gelu_approximate, tied embeddings), Gemma2 (4 norms, logit softcapping), Phi-3 (fused qkv_proj + gate_up_proj, split_axis), Qwen2 bias loading, MlxEmbedTokens/MlxLmHead mixed-precision enums (582 tests) |
 | **11a. Memory profiling + `--gpu-memory-utilization`** | **DONE** | Real memory detection via `sysinfo` crate (CandleWorker: available RAM, MlxWorker: total unified memory), `--gpu-memory-utilization` CLI flag (default 0.9, env `VLLM_GPU_MEMORY_UTILIZATION`) on serve + bench, replaces hardcoded 4/8 GiB stubs (570 tests) |
+| **8g. Sampling gaps** | **DONE** | Unified `Sampler::sample_one()`: min_p, repetition/frequency/presence penalties, logit_bias, logprobs (top-N). `LogprobsOutput`/`TokenLogprob` in `vllm-common`. CPU-side penalty application in both CandleWorker + MlxWorker. Logprobs propagated through `EngineCoreOutput` → API responses (chat + completion, streaming + non-streaming). 12 new sampler unit tests. (629 tests) |
 | 12a. Tool calling protocol | Not started | `tools`/`tool_choice` fields in chat completion request, `tool_calls` in assistant response, chat template integration for tool definitions |
 | 12b. Tool call response parsing | Not started | Detect model-emitted tool calls (special tokens, JSON blocks), parse into structured `ToolCall` objects, streaming tool call deltas |
 | 12c. Structured output / constrained decoding | Not started | `response_format` (json_object, json_schema), grammar-guided logit masking via `llguidance` or similar, schema-to-grammar compilation |
@@ -87,7 +88,8 @@
 | 10e | ~2,380 | 3 new + 3 mod | 13 | 582 | Gemma v1/2, Phi-3, Qwen2 bias, mixed-precision |
 | 6b | ~2,530 | 2 new + 6 mod | 17 | 599 | DeepSeek V2/V3 MLA+MoE+YaRN, Qwen3 QK norms |
 | 6b | ~850 | 2 new + 4 mod | 18 | 617 | Command R (candle+MLX float+quantized) |
-| **Total** | **~31,550** | **94 files** | **617** | **617** | **0 clippy errors** |
+| 8g | ~450 | 10 mod | 12 | 629 | Sampling gaps (min_p, penalties, logprobs, logit_bias) |
+| **Total** | **~32,000** | **94 files** | **629** | **629** | **0 clippy errors** |
 
 ### Known limitations / follow-ups
 - **MLX YaRN RoPE**: The MLX backend uses `nn::Rope` which doesn't apply YaRN frequency corrections. Models with `rope_scaling` (e.g., Qwen3 with YaRN factor=4.0, DeepSeek V2 with factor=40.0) will generate correctly within the original context window but won't have correct positional encoding beyond it. Fix: either implement a custom MLX RoPE that pre-applies YaRN corrections, or upstream YaRN support to mlx-rs `nn::Rope`.
@@ -174,7 +176,7 @@
 
 **`vllm-common`** (5 files, 65 tests):
 - `error.rs` — `VllmError` enum (Validation, RequestNotFound, Engine, Scheduler, Serialization, Internal), `VllmResult<T>`
-- `sampling.rs` — `SamplingParams` (18 fields matching Python), `SamplingType`, `RequestOutputKind`, validation
+- `sampling.rs` — `SamplingParams` (19 fields matching Python incl. `logit_bias`), `SamplingType`, `RequestOutputKind`, validation, `TokenLogprob`, `LogprobsOutput`
 - `request.rs` — `Request` struct (20 fields), `RequestStatus` enum (11 variants), `Ord` impl for priority scheduling
 - `engine_io.rs` — `FinishReason`, `EngineCoreRequest`, `EngineCoreOutput`, `EngineCoreOutputs`, `EngineCoreEvent`, `StopReason`
 
@@ -281,7 +283,7 @@
 **`vllm-models`** (5 new files, 24 new tests):
 - `lib.rs` — `Model` trait (forward: input_ids + positions → logits), `ModelFactory` type alias for registry
 - `registry.rs` — `ModelRegistry` mapping HuggingFace architecture names to factory functions, default registry with LLaMA + Mistral (3 tests)
-- `sampler.rs` — `Sampler` with greedy (argmax), temperature, top-k, top-p sampling, probability-based random selection (7 tests)
+- `sampler.rs` — `Sampler` with greedy (argmax), temperature, top-k, top-p, min-p sampling; unified `sample_one()` entry point with penalty application (repetition/frequency/presence), logit bias, and logprobs computation; probability-based random selection (19 tests)
 - `attention.rs` — `scaled_dot_product_attention` with causal masking, GQA support (repeat_kv), softmax helper, causal mask generation (7 tests)
 - `llama.rs` — Full LLaMA/Mistral model implementation: `LlamaConfig` (from HfModelConfig), `LlamaMLP` (gate+up SiLU-gated FFN), `LlamaAttention` (Q/K/V projections + RoPE + scaled dot-product attention + output projection, GQA support), `LlamaDecoderLayer` (pre-norm attention + post-norm MLP with residuals), `LlamaModel` (embedding + N layers + final RMS norm), `LlamaForCausalLM` (model + lm_head, tied embeddings support), `create_llama` factory function (7 tests)
 
@@ -727,7 +729,7 @@ Phase 7 delivered a standalone binary that loads models and serves HTTP requests
 1. **Decode token IDs are zeros** — `CandleWorker` has no per-request token buffer. After prefill, every decode step feeds `[0, 0, ...]` instead of the last sampled token. Generation produces garbage after step 1.
 2. **Position IDs reset each step** — Decode steps use positions `0..N` instead of continuing from `num_computed_tokens`. RoPE embeddings are wrong.
 3. **No stop criteria** — `EngineCore::update_from_output()` never checks `max_tokens`, EOS token, or `stop_token_ids`. Requests run forever.
-4. **Sampler not wired up** — `CandleWorker` always does raw argmax, ignoring per-request `SamplingParams` (temperature, top-k, top-p).
+4. **Sampler not wired up** — `CandleWorker` always does raw argmax, ignoring per-request `SamplingParams` (temperature, top-k, top-p). *(Fixed in 8a; full penalty/logprobs support added in 8g.)*
 5. **Chat template not applied** — Messages concatenated with bare newlines instead of model-specific format (`[INST]`, `<|im_start|>`, etc.).
 6. **No KV cache reuse** — Full attention recompute every step (O(n²) in sequence length).
 

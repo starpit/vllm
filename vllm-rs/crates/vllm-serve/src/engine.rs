@@ -64,6 +64,9 @@ struct RequestState {
     itl_count: u32,
     /// Sum of inter-token latencies in seconds (for computing avg ITL).
     itl_sum: f64,
+
+    /// Accumulated per-token log-probabilities (if requested).
+    logprobs: Vec<vllm_common::LogprobsOutput>,
 }
 
 /// A delta sent to a streaming response.
@@ -79,6 +82,8 @@ pub struct StreamDelta {
     pub finish_reason: Option<FinishReason>,
     /// Stop reason, if applicable.
     pub stop_reason: Option<StopReason>,
+    /// Per-token log-probabilities for this step (if requested).
+    pub logprobs: Option<Vec<vllm_common::LogprobsOutput>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +301,15 @@ impl AsyncEngine {
                 placeholder_text(&state.generated_token_ids)
             };
 
+            let chat_logprobs = if state.logprobs.is_empty() {
+                None
+            } else {
+                Some(build_chat_logprobs(
+                    &state.logprobs,
+                    self.tokenizer.as_deref(),
+                ))
+            };
+
             choices.push(protocol::ChatCompletionResponseChoice {
                 index: i as u32,
                 message: protocol::ChatMessage {
@@ -305,7 +319,7 @@ impl AsyncEngine {
                     tool_calls: None,
                     reasoning: None,
                 },
-                logprobs: None,
+                logprobs: chat_logprobs,
                 finish_reason: Some(finish_reason_str),
                 stop_reason: state.stop_reason.map(|sr| match sr {
                     StopReason::Token(id) => serde_json::Value::Number(id.into()),
@@ -515,10 +529,19 @@ impl AsyncEngine {
                 placeholder_text(&state.generated_token_ids)
             };
 
+            let completion_logprobs = if state.logprobs.is_empty() {
+                None
+            } else {
+                Some(build_completion_logprobs(
+                    &state.logprobs,
+                    self.tokenizer.as_deref(),
+                ))
+            };
+
             choices.push(protocol::CompletionResponseChoice {
                 index: *choice_index,
                 text,
-                logprobs: None,
+                logprobs: completion_logprobs,
                 finish_reason: Some(finish_reason_str),
                 stop_reason: state.stop_reason.map(|sr| match sr {
                     StopReason::Token(id) => serde_json::Value::Number(id.into()),
@@ -684,6 +707,7 @@ impl AsyncEngine {
                     last_token_time: None,
                     itl_count: 0,
                     itl_sum: 0.0,
+                    logprobs: Vec::new(),
                 },
             );
         }
@@ -758,8 +782,12 @@ impl AsyncEngine {
             req_state.last_token_time = Some(now);
         }
 
-        // Accumulate tokens.
+        // Accumulate tokens and logprobs.
         req_state.generated_token_ids.extend(&output.new_token_ids);
+        if let Some(lps) = &output.new_logprobs {
+            req_state.logprobs.extend(lps.iter().cloned());
+        }
+        let step_logprobs = output.new_logprobs.clone();
 
         // Update cached tokens.
         if output.num_cached_tokens > 0 {
@@ -797,6 +825,7 @@ impl AsyncEngine {
                 text: delta_text,
                 finish_reason: delta_finish_reason,
                 stop_reason: delta_stop_reason.clone(),
+                logprobs: step_logprobs.clone(),
             };
             let _ = tx.send(delta);
         }
@@ -1036,6 +1065,13 @@ impl AsyncEngine {
         // Resolve max_tokens: max_completion_tokens takes priority over max_tokens.
         let max_tokens = request.max_completion_tokens.or(request.max_tokens);
 
+        // Chat API: logprobs is bool, top_logprobs is count.
+        let logprobs = if request.logprobs == Some(true) {
+            Some(request.top_logprobs.unwrap_or(0) as i32)
+        } else {
+            None
+        };
+
         SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
@@ -1052,6 +1088,8 @@ impl AsyncEngine {
             stop_token_ids: request.stop_token_ids.clone(),
             include_stop_str_in_output: request.include_stop_str_in_output,
             skip_special_tokens: request.skip_special_tokens,
+            logprobs,
+            logit_bias: parse_logit_bias(&request.logit_bias),
             ..Default::default()
         }
     }
@@ -1066,6 +1104,9 @@ impl AsyncEngine {
             Some(protocol::StopCondition::Multiple(v)) => v.clone(),
             None => vec![],
         };
+        // Completion API: logprobs is directly the count.
+        let logprobs = request.logprobs.map(|n| n as i32);
+
         SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
@@ -1082,6 +1123,8 @@ impl AsyncEngine {
             stop_token_ids: request.stop_token_ids.clone(),
             include_stop_str_in_output: request.include_stop_str_in_output,
             skip_special_tokens: request.skip_special_tokens,
+            logprobs,
+            logit_bias: parse_logit_bias(&request.logit_bias),
             ..Default::default()
         }
     }
@@ -1090,6 +1133,116 @@ impl AsyncEngine {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Convert API-style logit_bias (string keys, f64 values) to sampler format.
+///
+/// OpenAI API uses string token IDs as keys; we parse them to u32.
+/// Invalid keys are silently ignored.
+fn parse_logit_bias(
+    api_bias: &Option<std::collections::HashMap<String, f64>>,
+) -> Option<std::collections::HashMap<u32, f32>> {
+    let bias = api_bias.as_ref()?;
+    if bias.is_empty() {
+        return None;
+    }
+    let parsed: std::collections::HashMap<u32, f32> = bias
+        .iter()
+        .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|tid| (tid, v as f32)))
+        .collect();
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+/// Convert engine logprobs to chat completion logprobs format.
+fn build_chat_logprobs(
+    logprobs: &[vllm_common::LogprobsOutput],
+    tokenizer: Option<&Tokenizer>,
+) -> protocol::ChatCompletionLogProbs {
+    let content: Vec<protocol::ChatCompletionLogProbsContent> = logprobs
+        .iter()
+        .map(|lp| {
+            let token_str = tokenizer
+                .and_then(|tok| tok.decode(&[lp.sampled.token_id], false).ok())
+                .unwrap_or_else(|| format!("<token_{}>", lp.sampled.token_id));
+
+            let top_logprobs: Vec<protocol::ChatCompletionLogProb> = lp
+                .top_logprobs
+                .iter()
+                .map(|tlp| {
+                    let t = tokenizer
+                        .and_then(|tok| tok.decode(&[tlp.token_id], false).ok())
+                        .unwrap_or_else(|| format!("<token_{}>", tlp.token_id));
+                    protocol::ChatCompletionLogProb {
+                        token: t,
+                        logprob: tlp.logprob as f64,
+                        bytes: None,
+                    }
+                })
+                .collect();
+
+            protocol::ChatCompletionLogProbsContent {
+                token: token_str,
+                logprob: lp.sampled.logprob as f64,
+                bytes: None,
+                top_logprobs,
+            }
+        })
+        .collect();
+
+    protocol::ChatCompletionLogProbs {
+        content: Some(content),
+    }
+}
+
+/// Convert engine logprobs to completion logprobs format.
+fn build_completion_logprobs(
+    logprobs: &[vllm_common::LogprobsOutput],
+    tokenizer: Option<&Tokenizer>,
+) -> protocol::CompletionLogProbs {
+    let mut text_offset = Vec::with_capacity(logprobs.len());
+    let mut token_logprobs = Vec::with_capacity(logprobs.len());
+    let mut tokens = Vec::with_capacity(logprobs.len());
+    let mut top_logprobs = Vec::with_capacity(logprobs.len());
+
+    let mut offset = 0u32;
+    for lp in logprobs {
+        let token_str = tokenizer
+            .and_then(|tok| tok.decode(&[lp.sampled.token_id], false).ok())
+            .unwrap_or_else(|| format!("<token_{}>", lp.sampled.token_id));
+
+        text_offset.push(offset);
+        offset += token_str.len() as u32;
+
+        token_logprobs.push(Some(lp.sampled.logprob as f64));
+        tokens.push(token_str);
+
+        if lp.top_logprobs.is_empty() {
+            top_logprobs.push(None);
+        } else {
+            let top: std::collections::HashMap<String, f64> = lp
+                .top_logprobs
+                .iter()
+                .map(|tlp| {
+                    let t = tokenizer
+                        .and_then(|tok| tok.decode(&[tlp.token_id], false).ok())
+                        .unwrap_or_else(|| format!("<token_{}>", tlp.token_id));
+                    (t, tlp.logprob as f64)
+                })
+                .collect();
+            top_logprobs.push(Some(top));
+        }
+    }
+
+    protocol::CompletionLogProbs {
+        text_offset,
+        token_logprobs,
+        tokens,
+        top_logprobs,
+    }
+}
 
 /// Generate placeholder text from token IDs (used when no tokenizer is available).
 fn placeholder_text(token_ids: &[u32]) -> String {
@@ -1339,6 +1492,7 @@ mod tests {
             stop_reason: None,
             num_cached_tokens: 0,
             events: None,
+            new_logprobs: None,
         };
         // Should not panic.
         AsyncEngine::process_output(&mut requests, output);
@@ -1363,6 +1517,7 @@ mod tests {
                 last_token_time: None,
                 itl_count: 0,
                 itl_sum: 0.0,
+                logprobs: Vec::new(),
             },
         );
 
@@ -1376,6 +1531,7 @@ mod tests {
                 stop_reason: None,
                 num_cached_tokens: 0,
                 events: None,
+                new_logprobs: None,
             },
         );
 
@@ -1389,6 +1545,7 @@ mod tests {
                 stop_reason: Some(StopReason::Token(50256)),
                 num_cached_tokens: 3,
                 events: None,
+                new_logprobs: None,
             },
         );
 
@@ -1420,6 +1577,7 @@ mod tests {
                 last_token_time: None,
                 itl_count: 0,
                 itl_sum: 0.0,
+                logprobs: Vec::new(),
             },
         );
 
@@ -1432,6 +1590,7 @@ mod tests {
                 stop_reason: None,
                 num_cached_tokens: 0,
                 events: None,
+                new_logprobs: None,
             },
         );
 
@@ -1450,6 +1609,7 @@ mod tests {
                 stop_reason: None,
                 num_cached_tokens: 0,
                 events: None,
+                new_logprobs: None,
             },
         );
 
@@ -1492,6 +1652,7 @@ mod tests {
                 last_token_time: None,
                 itl_count: 0,
                 itl_sum: 0.0,
+                logprobs: Vec::new(),
             },
         );
 
@@ -1504,6 +1665,7 @@ mod tests {
                 stop_reason: None,
                 num_cached_tokens: 0,
                 events: None,
+                new_logprobs: None,
             },
         );
 
@@ -1773,6 +1935,7 @@ mod tests {
                 last_token_time: None,
                 itl_count: 0,
                 itl_sum: 0.0,
+                logprobs: Vec::new(),
             },
         );
 
@@ -1785,6 +1948,7 @@ mod tests {
                 stop_reason: None,
                 num_cached_tokens: 0,
                 events: None,
+                new_logprobs: None,
             },
         );
 

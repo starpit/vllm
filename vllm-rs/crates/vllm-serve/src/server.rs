@@ -242,7 +242,31 @@ fn stream_chat_response(
                     reasoning: None,
                     tool_calls: None,
                 },
-                logprobs: None,
+                logprobs: delta.logprobs.as_ref().map(|lps| {
+                    let content: Vec<protocol::ChatCompletionLogProbsContent> = lps
+                        .iter()
+                        .map(|lp| {
+                            let top: Vec<protocol::ChatCompletionLogProb> = lp
+                                .top_logprobs
+                                .iter()
+                                .map(|tlp| protocol::ChatCompletionLogProb {
+                                    token: format!("<token_{}>", tlp.token_id),
+                                    logprob: tlp.logprob as f64,
+                                    bytes: None,
+                                })
+                                .collect();
+                            protocol::ChatCompletionLogProbsContent {
+                                token: format!("<token_{}>", lp.sampled.token_id),
+                                logprob: lp.sampled.logprob as f64,
+                                bytes: None,
+                                top_logprobs: top,
+                            }
+                        })
+                        .collect();
+                    protocol::ChatCompletionLogProbs {
+                        content: Some(content),
+                    }
+                }),
                 finish_reason: finish_reason_str,
                 stop_reason: delta.stop_reason.map(|sr| match sr {
                     vllm_common::StopReason::Token(id) => serde_json::Value::Number(id.into()),

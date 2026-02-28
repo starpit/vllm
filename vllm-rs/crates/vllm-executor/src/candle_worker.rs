@@ -847,6 +847,13 @@ impl Worker for CandleWorker {
         // Send issues — Sampler holds ThreadRng which is !Send).
         let mut sampler = Sampler::new();
         let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut logprobs_map: HashMap<String, Vec<vllm_common::LogprobsOutput>> = HashMap::new();
+        let any_logprobs_requested = req_inputs.iter().any(|r| {
+            self.sampling_params_map
+                .get(&r.req_id)
+                .and_then(|p| p.logprobs)
+                .is_some()
+        });
 
         // Run a separate forward pass per request (required because each
         // request has its own KV cache with different sequence length).
@@ -913,26 +920,30 @@ impl Worker for CandleWorker {
                 .narrow(0, last_pos, 1)
                 .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
 
-            let sampled = if let Some(params) = self.sampling_params_map.get(&req_input.req_id) {
-                let temp = params.temperature as f32;
-                let top_k = params.top_k.max(0) as usize;
-                let top_p = params.top_p as f32;
+            // Extract logits to CPU for sampling with full param support.
+            let logits_vec = req_logits
+                .to_dtype(DType::F32)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("dtype cast error: {e}")))?
+                .flatten_all()
+                .map_err(|e| ExecutorError::WorkerExecution(format!("flatten error: {e}")))?
+                .to_vec1::<f32>()
+                .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
 
-                if temp < 1e-5 {
-                    sampler
-                        .greedy(&req_logits)
-                        .map_err(|e| ExecutorError::WorkerExecution(format!("greedy error: {e}")))?
-                } else if top_k > 0 || top_p < 1.0 {
-                    sampler
-                        .sample_top_k_top_p(&req_logits, temp, top_k, top_p)
-                        .map_err(|e| {
-                            ExecutorError::WorkerExecution(format!("sampling error: {e}"))
-                        })?
-                } else {
-                    sampler.sample(&req_logits, temp).map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("sampling error: {e}"))
-                    })?
+            let sampled = if let Some(params) = self.sampling_params_map.get(&req_input.req_id) {
+                let prev_tokens = self
+                    .token_buffers
+                    .get(&req_input.req_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                let (token_id, maybe_logprobs) =
+                    sampler.sample_one(&logits_vec, params, prev_tokens);
+                if let Some(lp) = maybe_logprobs {
+                    logprobs_map
+                        .entry(req_input.req_id.clone())
+                        .or_default()
+                        .push(lp);
                 }
+                vec![token_id]
             } else {
                 let indices = req_logits
                     .argmax(candle_core::D::Minus1)
@@ -950,7 +961,17 @@ impl Worker for CandleWorker {
             token_map.insert(req_input.req_id.clone(), sampled);
         }
 
-        Ok(ModelRunnerOutput::from_token_map(token_map))
+        // Build ModelRunnerOutput with logprobs if any were collected.
+        let mut output = ModelRunnerOutput::from_token_map(token_map);
+        if any_logprobs_requested && !logprobs_map.is_empty() {
+            let logprobs_vec: Vec<Option<Vec<vllm_common::LogprobsOutput>>> = output
+                .req_ids
+                .iter()
+                .map(|rid| logprobs_map.remove(rid))
+                .collect();
+            output.logprobs = Some(logprobs_vec);
+        }
+        Ok(output)
     }
 
     fn shutdown(&mut self) {

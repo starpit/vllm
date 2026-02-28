@@ -313,6 +313,18 @@ impl EngineCore {
                 );
             }
 
+            // Extract logprobs for this request if available.
+            let new_logprobs = model_output
+                .logprobs
+                .as_ref()
+                .and_then(|lp_vec| {
+                    model_output
+                        .req_id_to_index
+                        .get(req_id)
+                        .and_then(|&idx| lp_vec.get(idx))
+                })
+                .and_then(|opt| opt.clone());
+
             // Build the output for this request.
             let output = EngineCoreOutput {
                 request_id: req_id.clone(),
@@ -321,6 +333,7 @@ impl EngineCore {
                 stop_reason,
                 num_cached_tokens: 0,
                 events: None,
+                new_logprobs,
             };
 
             // Route to client_index 0 (default for single-client mode).
@@ -359,6 +372,7 @@ impl EngineCore {
                         stop_reason: None,
                         num_cached_tokens: 0,
                         events: None,
+                        new_logprobs: None,
                     });
                 }
             }

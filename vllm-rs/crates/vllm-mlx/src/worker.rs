@@ -558,6 +558,16 @@ impl Worker for MlxWorker {
         }
 
         let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut logprobs_map: HashMap<String, Vec<vllm_common::LogprobsOutput>> = HashMap::new();
+        let any_logprobs_requested = req_inputs.iter().any(|r| {
+            self.sampling_params_map
+                .get(&r.req_id)
+                .and_then(|p| p.logprobs)
+                .is_some()
+        });
+
+        // CPU sampler for penalty/min_p/logit_bias/logprobs support.
+        let mut cpu_sampler = vllm_models::Sampler::new();
 
         // Run a separate forward pass per request (each has its own KV cache).
         for req_input in &req_inputs {
@@ -596,11 +606,49 @@ impl Worker for MlxWorker {
                 logits
             };
 
-            // Sample — the eval() inside greedy_sample/sample_with_temperature
-            // materializes the ENTIRE fused graph (forward + sampling) as
-            // minimal Metal command buffers. One eval instead of two.
-            let sampled = if let Some(params) = self.sampling_params_map.get(&req_input.req_id) {
-                let temp = params.temperature as f32;
+            // Determine if we need CPU-side sampling (penalties/logprobs/etc.).
+            let params = self.sampling_params_map.get(&req_input.req_id);
+            let needs_cpu_sampling = params.is_some_and(|p| {
+                p.repetition_penalty != 1.0
+                    || p.frequency_penalty != 0.0
+                    || p.presence_penalty != 0.0
+                    || p.min_p > 0.0
+                    || p.logit_bias.is_some()
+                    || p.logprobs.is_some()
+                    || (p.top_k > 0 || p.top_p < 1.0)
+            });
+
+            let sampled = if needs_cpu_sampling {
+                // Eval the logits graph, extract to CPU Vec<f32>, and use
+                // the unified CPU sampler which handles all penalty/filter/logprobs.
+                req_logits
+                    .eval()
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
+                let logits_f32 = req_logits.as_dtype(Dtype::Float32).map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("dtype cast error: {e}"))
+                })?;
+                logits_f32
+                    .eval()
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
+                let flat = logits_f32.as_slice::<f32>();
+
+                let p = params.unwrap();
+                let prev_tokens = self
+                    .token_buffers
+                    .get(&req_input.req_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                let (token_id, maybe_logprobs) = cpu_sampler.sample_one(flat, p, prev_tokens);
+                if let Some(lp) = maybe_logprobs {
+                    logprobs_map
+                        .entry(req_input.req_id.clone())
+                        .or_default()
+                        .push(lp);
+                }
+                vec![token_id]
+            } else if let Some(p) = params {
+                // Simple temperature sampling via MLX (no penalties needed).
+                let temp = p.temperature as f32;
                 Self::sample_with_temperature(&req_logits, temp)?
             } else {
                 Self::greedy_sample(&req_logits)?
@@ -626,7 +674,17 @@ impl Worker for MlxWorker {
             token_map.insert(req_input.req_id.clone(), sampled);
         }
 
-        Ok(ModelRunnerOutput::from_token_map(token_map))
+        // Build ModelRunnerOutput with logprobs if any were collected.
+        let mut output = ModelRunnerOutput::from_token_map(token_map);
+        if any_logprobs_requested && !logprobs_map.is_empty() {
+            let logprobs_vec: Vec<Option<Vec<vllm_common::LogprobsOutput>>> = output
+                .req_ids
+                .iter()
+                .map(|rid| logprobs_map.remove(rid))
+                .collect();
+            output.logprobs = Some(logprobs_vec);
+        }
+        Ok(output)
     }
 
     fn shutdown(&mut self) {

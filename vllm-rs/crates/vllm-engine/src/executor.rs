@@ -13,37 +13,12 @@
 
 use std::collections::HashMap;
 
+use vllm_common::LogprobsOutput;
+#[cfg(test)]
+use vllm_common::TokenLogprob;
 use vllm_core::scheduler::output::SchedulerOutput;
 
 use crate::error::EngineResult;
-
-// ---------------------------------------------------------------------------
-// Logprobs types
-// ---------------------------------------------------------------------------
-
-/// Log-probability information for a single token position.
-///
-/// Port of: `vllm/v1/outputs.py::LogprobsLists` (Rust-friendly representation)
-#[derive(Debug, Clone)]
-pub struct TokenLogprob {
-    /// The token ID.
-    pub token_id: u32,
-    /// The log-probability of this token.
-    pub logprob: f32,
-    /// Rank of this token in the vocabulary (1-indexed).
-    pub rank: u32,
-}
-
-/// Log-probability output for a single generation step.
-///
-/// Contains the sampled token's logprob and the top-k alternatives.
-#[derive(Debug, Clone)]
-pub struct LogprobsOutput {
-    /// The sampled token's log-probability info.
-    pub sampled: TokenLogprob,
-    /// Top-k alternative tokens (may be empty if logprobs not requested).
-    pub top_logprobs: Vec<TokenLogprob>,
-}
 
 // ---------------------------------------------------------------------------
 // ModelRunnerOutput

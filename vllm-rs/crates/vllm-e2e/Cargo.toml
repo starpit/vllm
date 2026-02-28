@@ -8,6 +8,7 @@ description = "End-to-end tests for vLLM Rust inference engine"
 [features]
 default = []
 e2e = []
+metal = ["vllm-serve/metal"]
 
 [dependencies]
 # HTTP client
@@ -26,7 +27,8 @@ anyhow = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
-# Protocol types
+# Server stack (in-process startup)
+vllm-common = { workspace = true }
 vllm-serve = { workspace = true }
 
 [dev-dependencies]

@@ -3,7 +3,7 @@
 
 //! End-to-end test infrastructure for the vLLM Rust inference engine.
 //!
-//! Provides [`TestServer`] for spawning a real `vllm serve` process,
+//! Provides [`TestServer`] for starting the server in-process,
 //! [`Client`] for sending HTTP requests, and assertion helpers for
 //! validating OpenAI-compatible responses.
 

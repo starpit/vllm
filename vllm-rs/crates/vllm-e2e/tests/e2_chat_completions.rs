@@ -64,7 +64,7 @@ async fn start_smollm() -> (TestServer, Client) {
 // E2a: Request parameters
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_temperature_0() {
     let (_server, client) = start_smollm().await;
@@ -84,7 +84,7 @@ async fn test_chat_temperature_0() {
     assert_eq!(text1, text2, "temperature=0 should be deterministic");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_temperature_high() {
     let (_server, client) = start_smollm().await;
@@ -102,7 +102,7 @@ async fn test_chat_temperature_high() {
     assert_valid_chat_response(&resp);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_top_p() {
     let (_server, client) = start_smollm().await;
@@ -118,7 +118,7 @@ async fn test_chat_top_p() {
     assert_valid_chat_response(&resp);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_top_k() {
     let (_server, client) = start_smollm().await;
@@ -134,7 +134,7 @@ async fn test_chat_top_k() {
     assert_valid_chat_response(&resp);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_min_p() {
     let (_server, client) = start_smollm().await;
@@ -150,7 +150,7 @@ async fn test_chat_min_p() {
     assert_valid_chat_response(&resp);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_max_tokens() {
     let (_server, client) = start_smollm().await;
@@ -171,7 +171,7 @@ async fn test_chat_max_tokens() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_max_completion_tokens() {
     let (_server, client) = start_smollm().await;
@@ -188,7 +188,7 @@ async fn test_chat_max_completion_tokens() {
     assert!(resp.usage.completion_tokens.unwrap_or(0) <= 10);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_n_1() {
     let (_server, client) = start_smollm().await;
@@ -204,7 +204,7 @@ async fn test_chat_n_1() {
     assert_eq!(resp.choices.len(), 1, "n=1 should produce 1 choice");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_n_3() {
     let (_server, client) = start_smollm().await;
@@ -227,7 +227,7 @@ async fn test_chat_n_3() {
     assert!(indices.contains(&2));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_seed() {
     let (_server, client) = start_smollm().await;
@@ -246,10 +246,13 @@ async fn test_chat_seed() {
 
     let text1 = resp1.choices[0].message.content.as_deref().unwrap_or("");
     let text2 = resp2.choices[0].message.content.as_deref().unwrap_or("");
-    assert_eq!(text1, text2, "same seed + temperature=0 should produce same output");
+    assert_eq!(
+        text1, text2,
+        "same seed + temperature=0 should produce same output"
+    );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_logprobs() {
     let (_server, client) = start_smollm().await;
@@ -270,7 +273,10 @@ async fn test_chat_logprobs() {
         .logprobs
         .as_ref()
         .expect("logprobs should be present");
-    let content = logprobs.content.as_ref().expect("logprobs.content should be present");
+    let content = logprobs
+        .content
+        .as_ref()
+        .expect("logprobs.content should be present");
     assert!(!content.is_empty(), "logprobs content should not be empty");
     // Each entry should have top_logprobs
     for entry in content {
@@ -281,7 +287,7 @@ async fn test_chat_logprobs() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_frequency_penalty() {
     let (_server, client) = start_smollm().await;
@@ -297,7 +303,7 @@ async fn test_chat_frequency_penalty() {
     assert_valid_chat_response(&resp);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_presence_penalty() {
     let (_server, client) = start_smollm().await;
@@ -313,7 +319,7 @@ async fn test_chat_presence_penalty() {
     assert_valid_chat_response(&resp);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_repetition_penalty() {
     let (_server, client) = start_smollm().await;
@@ -333,7 +339,7 @@ async fn test_chat_repetition_penalty() {
 // E2b: Message formats
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_system_message() {
     let (_server, client) = start_smollm().await;
@@ -354,7 +360,7 @@ async fn test_chat_system_message() {
     assert_coherent_text(text, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_multi_turn() {
     let (_server, client) = start_smollm().await;
@@ -375,7 +381,7 @@ async fn test_chat_multi_turn() {
     assert_valid_chat_response(&resp);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_user_only() {
     let (_server, client) = start_smollm().await;
@@ -390,7 +396,7 @@ async fn test_chat_user_only() {
     assert_valid_chat_response(&resp);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_unicode() {
     let (_server, client) = start_smollm().await;
@@ -410,17 +416,21 @@ async fn test_chat_unicode() {
 // E2c: Error handling
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_missing_messages() {
     let (_server, client) = start_smollm().await;
 
     let body = serde_json::json!({"model": "test"});
     let resp = client.chat_completion_raw(&body).await.unwrap();
-    assert_eq!(resp.status().as_u16(), 422, "missing messages should return 422");
+    assert_eq!(
+        resp.status().as_u16(),
+        422,
+        "missing messages should return 422"
+    );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_empty_messages() {
     let (_server, client) = start_smollm().await;
@@ -436,7 +446,7 @@ async fn test_chat_empty_messages() {
     let _resp = client.chat_completion(&request).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_invalid_json() {
     let (_server, client) = start_smollm().await;

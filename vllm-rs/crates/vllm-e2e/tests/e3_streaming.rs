@@ -44,7 +44,7 @@ async fn start_smollm() -> (TestServer, Client) {
 // E3a: Basic streaming
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_stream_basic() {
     let (_server, client) = start_smollm().await;
@@ -64,7 +64,7 @@ async fn test_stream_basic() {
     assert_coherent_text(&text, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_stream_content_matches_nonstream() {
     let (_server, client) = start_smollm().await;
@@ -99,7 +99,7 @@ async fn test_stream_content_matches_nonstream() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_stream_last_chunk_has_finish_reason() {
     let (_server, client) = start_smollm().await;
@@ -122,7 +122,7 @@ async fn test_stream_last_chunk_has_finish_reason() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_stream_intermediate_chunks() {
     let (_server, client) = start_smollm().await;
@@ -150,7 +150,7 @@ async fn test_stream_intermediate_chunks() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_stream_max_tokens() {
     let (_server, client) = start_smollm().await;
@@ -179,7 +179,7 @@ async fn test_stream_max_tokens() {
 // E3b: Streaming with n>1
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_stream_n2() {
     let (_server, client) = start_smollm().await;
@@ -209,21 +209,15 @@ async fn test_stream_n2() {
         }
     }
 
-    assert!(
-        seen_indices.contains(&0),
-        "should have chunks for index 0"
-    );
-    assert!(
-        seen_indices.contains(&1),
-        "should have chunks for index 1"
-    );
+    assert!(seen_indices.contains(&0), "should have chunks for index 0");
+    assert!(seen_indices.contains(&1), "should have chunks for index 1");
     assert!(
         finished_indices.contains(&0) && finished_indices.contains(&1),
         "both choices should have finish_reason"
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_stream_n3_all_finish() {
     let (_server, client) = start_smollm().await;
@@ -260,7 +254,7 @@ async fn test_stream_n3_all_finish() {
 // E3c: Streaming edge cases
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_stream_empty_response() {
     let (_server, client) = start_smollm().await;

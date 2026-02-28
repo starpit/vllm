@@ -62,9 +62,9 @@ fn default_completion_request() -> CompletionRequest {
 // SmolLM-135M-Instruct-4bit (LlamaForCausalLM, quantized) — Tier 1
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_smollm_server_starts() {
+async fn test_t1_smollm_server_starts() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
         .start()
         .await
@@ -85,9 +85,9 @@ async fn test_smollm_server_starts() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_smollm_chat_basic() {
+async fn test_t1_smollm_chat_basic() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
         .start()
         .await
@@ -102,9 +102,9 @@ async fn test_smollm_chat_basic() {
     assert_coherent_text(text, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_smollm_completion_basic() {
+async fn test_t1_smollm_completion_basic() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
         .start()
         .await
@@ -115,12 +115,15 @@ async fn test_smollm_completion_basic() {
     let resp = client.completion(&request).await.unwrap();
 
     assert_valid_completion_response(&resp);
-    assert!(!resp.choices[0].text.is_empty(), "completion should not be empty");
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "completion should not be empty"
+    );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_smollm_max_tokens() {
+async fn test_t1_smollm_max_tokens() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
         .start()
         .await
@@ -138,9 +141,9 @@ async fn test_smollm_max_tokens() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_smollm_version() {
+async fn test_t1_smollm_version() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
         .start()
         .await
@@ -148,10 +151,7 @@ async fn test_smollm_version() {
 
     let client = Client::new(server.base_url());
     let version = client.version().await.unwrap();
-    assert!(
-        !version.version.is_empty(),
-        "version should not be empty"
-    );
+    assert!(!version.version.is_empty(), "version should not be empty");
     assert!(
         version.version.contains("rust"),
         "version should contain 'rust', got: {}",
@@ -163,9 +163,9 @@ async fn test_smollm_version() {
 // Qwen2.5-0.5B-Instruct-4bit (Qwen2ForCausalLM) — Tier 1
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_qwen2_server_starts() {
+async fn test_t1_qwen2_server_starts() {
     let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
         .start()
         .await
@@ -178,9 +178,9 @@ async fn test_qwen2_server_starts() {
     assert_eq!(models.data.len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_qwen2_chat_basic() {
+async fn test_t1_qwen2_chat_basic() {
     let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
         .start()
         .await
@@ -195,9 +195,9 @@ async fn test_qwen2_chat_basic() {
     assert_coherent_text(text, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_qwen2_completion_basic() {
+async fn test_t1_qwen2_completion_basic() {
     let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
         .start()
         .await
@@ -215,9 +215,9 @@ async fn test_qwen2_completion_basic() {
 // Qwen3-0.6B-4bit (Qwen3ForCausalLM) — Tier 1
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_qwen3_server_starts() {
+async fn test_t1_qwen3_server_starts() {
     let server = TestServer::builder(TestModels::QWEN3_0_6B_4BIT)
         .start()
         .await
@@ -230,9 +230,9 @@ async fn test_qwen3_server_starts() {
     assert_eq!(models.data.len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_qwen3_chat_basic() {
+async fn test_t1_qwen3_chat_basic() {
     let server = TestServer::builder(TestModels::QWEN3_0_6B_4BIT)
         .start()
         .await
@@ -251,9 +251,9 @@ async fn test_qwen3_chat_basic() {
 // Llama-3.2-1B-Instruct-4bit (LlamaForCausalLM) — Tier 2
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_llama3_server_starts() {
+async fn test_t2_llama3_server_starts() {
     let server = TestServer::builder(TestModels::LLAMA_3_2_1B_4BIT)
         .start()
         .await
@@ -266,9 +266,9 @@ async fn test_llama3_server_starts() {
     assert_eq!(models.data.len(), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_llama3_chat_basic() {
+async fn test_t2_llama3_chat_basic() {
     let server = TestServer::builder(TestModels::LLAMA_3_2_1B_4BIT)
         .start()
         .await
@@ -283,9 +283,9 @@ async fn test_llama3_chat_basic() {
     assert_coherent_text(text, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_llama3_completion_basic() {
+async fn test_t2_llama3_completion_basic() {
     let server = TestServer::builder(TestModels::LLAMA_3_2_1B_4BIT)
         .start()
         .await
@@ -299,9 +299,9 @@ async fn test_llama3_completion_basic() {
     assert!(!resp.choices[0].text.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_llama3_max_tokens() {
+async fn test_t2_llama3_max_tokens() {
     let server = TestServer::builder(TestModels::LLAMA_3_2_1B_4BIT)
         .start()
         .await
@@ -319,9 +319,9 @@ async fn test_llama3_max_tokens() {
 // Nightly: Gemma2-2B (Gemma2ForCausalLM) — Tier 3
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_gemma2_server_starts() {
+async fn test_t3_gemma2_server_starts() {
     let server = TestServer::builder(TestModels::GEMMA2_2B_4BIT)
         .start()
         .await
@@ -331,9 +331,9 @@ async fn test_gemma2_server_starts() {
     assert!(client.health().await.unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_gemma2_chat_basic() {
+async fn test_t3_gemma2_chat_basic() {
     let server = TestServer::builder(TestModels::GEMMA2_2B_4BIT)
         .start()
         .await
@@ -352,9 +352,9 @@ async fn test_gemma2_chat_basic() {
 // Nightly: Phi-3.5-mini (Phi3ForCausalLM) — Tier 3
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_phi3_server_starts() {
+async fn test_t3_phi3_server_starts() {
     let server = TestServer::builder(TestModels::PHI3_5_MINI_4BIT)
         .start()
         .await
@@ -364,9 +364,9 @@ async fn test_phi3_server_starts() {
     assert!(client.health().await.unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_phi3_chat_basic() {
+async fn test_t3_phi3_chat_basic() {
     let server = TestServer::builder(TestModels::PHI3_5_MINI_4BIT)
         .start()
         .await
@@ -385,9 +385,9 @@ async fn test_phi3_chat_basic() {
 // Weekly: Mistral-7B (MistralForCausalLM) — Tier 4
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_mistral_server_starts() {
+async fn test_t4_mistral_server_starts() {
     let server = TestServer::builder(TestModels::MISTRAL_7B_4BIT)
         .start()
         .await
@@ -397,9 +397,9 @@ async fn test_mistral_server_starts() {
     assert!(client.health().await.unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_mistral_chat_basic() {
+async fn test_t4_mistral_chat_basic() {
     let server = TestServer::builder(TestModels::MISTRAL_7B_4BIT)
         .start()
         .await
@@ -416,44 +416,45 @@ async fn test_mistral_chat_basic() {
 
 // ===========================================================================
 // Weekly: DeepSeek-V2-Lite (DeepseekV2ForCausalLM) — Tier 4
+// DISABLED: quantized DeepSeek V2 MLX not yet implemented (see PARITY.md)
 // ===========================================================================
 
-#[tokio::test]
-#[ignore]
-async fn test_deepseek_server_starts() {
-    let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE_4BIT)
-        .start()
-        .await
-        .expect("server should start");
+// #[tokio::test(flavor = "multi_thread")]
+// #[ignore]
+// async fn test_t4_deepseek_server_starts() {
+//     let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE_4BIT)
+//         .start()
+//         .await
+//         .expect("server should start");
+//
+//     let client = Client::new(server.base_url());
+//     assert!(client.health().await.unwrap());
+// }
 
-    let client = Client::new(server.base_url());
-    assert!(client.health().await.unwrap());
-}
-
-#[tokio::test]
-#[ignore]
-async fn test_deepseek_chat_basic() {
-    let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE_4BIT)
-        .start()
-        .await
-        .unwrap();
-
-    let client = Client::new(server.base_url());
-    let request = simple_chat_request("Say hello in one sentence.", Some(50));
-    let resp = client.chat_completion(&request).await.unwrap();
-
-    assert_valid_chat_response(&resp);
-    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
-    assert_coherent_text(text, 2);
-}
+// #[tokio::test(flavor = "multi_thread")]
+// #[ignore]
+// async fn test_t4_deepseek_chat_basic() {
+//     let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE_4BIT)
+//         .start()
+//         .await
+//         .unwrap();
+//
+//     let client = Client::new(server.base_url());
+//     let request = simple_chat_request("Say hello in one sentence.", Some(50));
+//     let resp = client.chat_completion(&request).await.unwrap();
+//
+//     assert_valid_chat_response(&resp);
+//     let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+//     assert_coherent_text(text, 2);
+// }
 
 // ===========================================================================
 // E1b: Float16 vs quantized comparison
 // ===========================================================================
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_float16_server_starts() {
+async fn test_t1_float16_server_starts() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_F16)
         .start()
         .await
@@ -463,9 +464,9 @@ async fn test_float16_server_starts() {
     assert!(client.health().await.unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_float16_chat_basic() {
+async fn test_t1_float16_chat_basic() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_F16)
         .start()
         .await

@@ -111,7 +111,7 @@
 | Gemma 1 | N/A | &#x1F535; | 2 | 0 | |
 | Gemma 2 | N/A | &#x1F535; | 7 | 0 | |
 | Phi-3 (fused projections) | N/A | &#x1F535; | 4 | 0 | |
-| DeepSeek V2 / V3 | N/A | &#x1F535; | 5 | 2 | |
+| DeepSeek V2 / V3 (float only) | N/A | &#x1F7E1; | 5 | 2 | |
 | Command R (Cohere) | N/A | &#x1F535; | 4 | 0 | |
 | Quantized LLaMA (mlx-community 4-bit) | N/A | &#x1F535; | 4 | 8 | |
 | Quantized Mistral (4-bit) | N/A | &#x1F535; | 0 | 2 | |
@@ -444,6 +444,14 @@
 | Standalone binary (no Python runtime) | &#x1F534; | &#x1F535; | 0 | 0 | |
 
 > Unit counts from `args.rs` (8 — CLI parsing: help, serve/bench positional/flag model, precedence, no-model error, convert) and `init.rs` (6 — extract model name, compute num blocks variants).
+
+---
+
+## Known Gaps
+
+| Gap | Details | Workaround |
+|-----|---------|------------|
+| MLX quantized DeepSeek V2/V3 | No `register_quantized("DeepseekV2ForCausalLM", ...)` factory. The float model is used for quantized weights, causing dimension mismatches (`rms_norm` size error) and missing MoE expert weights. | Use a float DeepSeek V2 model, or use the candle backend. |
 
 ---
 

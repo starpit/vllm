@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! Test server helper — spawns `vllm serve` as a child process and manages its lifecycle.
+//! Test server helper — starts the vLLM server in-process on a background task.
 
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use tokio::task::JoinHandle;
 
 /// Default timeout waiting for the server to become healthy.
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Poll interval when waiting for /health.
-const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// A running `vllm serve` process for E2E testing.
+/// A running vLLM server for E2E testing.
 ///
-/// On drop, the child process is killed. Use [`TestServer::start`] to launch.
+/// The server runs in-process on a background tokio task. On drop, the task
+/// is aborted and the port is released.
 pub struct TestServer {
-    child: Child,
+    server_handle: JoinHandle<()>,
     port: u16,
     base_url: String,
 }
@@ -47,9 +49,7 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        // Best-effort kill.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.server_handle.abort();
     }
 }
 
@@ -64,8 +64,7 @@ pub struct TestServerBuilder {
 impl TestServerBuilder {
     /// Add extra CLI arguments (e.g. `--tool-call-parser hermes`).
     pub fn with_args(mut self, args: &[&str]) -> Self {
-        self.extra_args
-            .extend(args.iter().map(|s| s.to_string()));
+        self.extra_args.extend(args.iter().map(|s| s.to_string()));
         self
     }
 
@@ -81,143 +80,93 @@ impl TestServerBuilder {
         self
     }
 
-    /// Start the server and wait for it to become healthy.
+    /// Start the server in-process and wait for it to become healthy.
     pub async fn start(self) -> Result<TestServer> {
+        // Initialize tracing. Silent by default; set RUST_LOG=info to see
+        // download/loading progress. Idempotent — only the first call takes effect.
+        vllm_common::telemetry::init_tracing("off");
+
         let port = self.port.unwrap_or_else(|| {
-            // Find a free port by binding to :0 and reading the assigned port.
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
         });
 
         let base_url = format!("http://127.0.0.1:{port}");
+        let bind_address = format!("127.0.0.1:{port}");
+        let model = self.model.clone();
 
-        // Find the vllm binary. Prefer the pre-built binary in target/debug or target/release.
-        let binary = find_vllm_binary()?;
+        // Build VllmConfig for the requested configuration.
+        let config = vllm_serve::init::VllmConfig {
+            model: model.clone(),
+            device: "auto".to_string(),
+            dtype: "auto".to_string(),
+            max_num_seqs: 256,
+            block_size: 16,
+            gpu_memory_utilization: 0.9,
+            ..Default::default()
+        };
 
-        let mut cmd = Command::new(&binary);
-        cmd.arg("serve")
-            .arg(&self.model)
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--log-level")
-            .arg("info");
+        // Initialize the full stack (blocking — downloads model, loads weights).
+        let stack =
+            tokio::task::spawn_blocking(move || vllm_serve::init::initialize_stack(&config))
+                .await
+                .context("initialize_stack panicked")?
+                .context("failed to initialize stack")?;
 
-        for arg in &self.extra_args {
-            cmd.arg(arg);
-        }
+        // Spawn the engine step loop.
+        let _step_handle = stack.engine.spawn_step_loop();
 
-        // Inherit stderr so we can see server logs in test output.
-        cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
+        // Build server config and app state.
+        let server_config = vllm_serve::server::ServerConfig {
+            bind_address,
+            version: format!("0.1.0-rust-test ({})", stack.model_name),
+            cors_enabled: true,
+            metrics_enabled: false,
+        };
 
-        tracing::info!("Starting vllm server: {:?}", cmd);
-        let child = cmd.spawn().context("failed to spawn vllm binary")?;
+        let app_state = Arc::new(vllm_serve::server::AppState {
+            engine: stack.engine,
+            config: server_config,
+        });
 
-        let mut server = TestServer {
-            child,
+        // Spawn the HTTP server on a background task.
+        let server_handle = tokio::spawn(async move {
+            if let Err(e) = vllm_serve::server::serve(app_state).await {
+                tracing::error!("Test server error: {e}");
+            }
+        });
+
+        let test_server = TestServer {
+            server_handle,
             port,
             base_url,
         };
 
         // Wait for the server to become healthy.
-        if let Err(e) = wait_for_health(&server.base_url, self.startup_timeout, &mut server.child).await {
-            // Kill on failure so we don't leak processes.
-            let _ = server.child.kill();
-            let _ = server.child.wait();
-            // Prevent the Drop from trying to kill again.
-            std::mem::forget(server);
-            return Err(e);
-        }
+        wait_for_health(&test_server.base_url, self.startup_timeout).await?;
 
-        tracing::info!("Server healthy on port {port}");
-        Ok(server)
+        tracing::info!("Test server healthy on port {port}");
+        Ok(test_server)
     }
 }
 
-/// Find the vllm binary, searching target/debug and target/release.
-fn find_vllm_binary() -> Result<String> {
-    // Check for VLLM_E2E_BINARY env var override.
-    if let Ok(path) = std::env::var("VLLM_E2E_BINARY") {
-        return Ok(path);
-    }
-
-    // Use CARGO_MANIFEST_DIR to locate the workspace root.
-    // This crate lives at vllm-rs/crates/vllm-e2e, so workspace root is ../../.
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = std::path::Path::new(manifest_dir)
-        .parent()  // crates/
-        .and_then(|p| p.parent())  // vllm-rs/
-        .unwrap_or_else(|| std::path::Path::new("."));
-
-    let candidates = [
-        workspace_root.join("target/debug/vllm"),
-        workspace_root.join("target/release/vllm"),
-    ];
-
-    for candidate in &candidates {
-        if candidate.exists() {
-            return Ok(candidate.to_string_lossy().to_string());
-        }
-    }
-
-    // Fall back to PATH.
-    if which_exists("vllm") {
-        return Ok("vllm".to_string());
-    }
-
-    bail!(
-        "Cannot find vllm binary. Build it first with `cargo build -p vllm-cli --features metal` \
-         or set VLLM_E2E_BINARY to the path. (searched: {})",
-        workspace_root.join("target/debug/vllm").display()
-    )
-}
-
-fn which_exists(name: &str) -> bool {
-    Command::new("which")
-        .arg(name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Poll the /health endpoint until it returns 200, the child exits, or we time out.
-async fn wait_for_health(base_url: &str, timeout: Duration, child: &mut Child) -> Result<()> {
+/// Poll the /health endpoint until it returns 200 or we time out.
+async fn wait_for_health(base_url: &str, timeout: Duration) -> Result<()> {
     let client = reqwest::Client::new();
     let health_url = format!("{base_url}/health");
-    let start = Instant::now();
+    let start = std::time::Instant::now();
 
     loop {
         if start.elapsed() > timeout {
-            bail!(
+            anyhow::bail!(
                 "Server did not become healthy within {}s",
                 timeout.as_secs()
             );
         }
 
-        // Check if the child process has exited (non-blocking).
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                bail!(
-                    "Server process exited before becoming healthy (exit status: {status})"
-                );
-            }
-            Ok(None) => {} // still running
-            Err(e) => {
-                bail!("Failed to check server process status: {e}");
-            }
-        }
-
         match client.get(&health_url).send().await {
             Ok(resp) if resp.status().is_success() => return Ok(()),
-            Ok(resp) => {
-                tracing::debug!("Health check returned {}, retrying...", resp.status());
-            }
-            Err(_) => {
-                tracing::debug!("Health check connection refused, retrying...");
-            }
+            _ => {}
         }
 
         tokio::time::sleep(HEALTH_POLL_INTERVAL).await;

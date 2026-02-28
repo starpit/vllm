@@ -5,10 +5,19 @@ edition.workspace = true
 license.workspace = true
 description = "HTTP (axum) and gRPC (tonic) serving layer for vLLM Rust port"
 
+[features]
+default = []
+metal = ["vllm-mlx"]
+
 [dependencies]
 vllm-common = { workspace = true }
 vllm-config = { workspace = true }
 vllm-engine = { workspace = true }
+vllm-executor = { workspace = true }
+vllm-model = { workspace = true }
+vllm-mlx = { workspace = true, optional = true }
+candle-core = { workspace = true }
+anyhow = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"

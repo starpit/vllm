@@ -30,14 +30,8 @@ pub fn assert_valid_chat_response(resp: &ChatCompletionResponse) {
     }
 
     // Usage should be populated
-    assert!(
-        resp.usage.prompt_tokens > 0,
-        "prompt_tokens should be > 0"
-    );
-    assert!(
-        resp.usage.total_tokens > 0,
-        "total_tokens should be > 0"
-    );
+    assert!(resp.usage.prompt_tokens > 0, "prompt_tokens should be > 0");
+    assert!(resp.usage.total_tokens > 0, "total_tokens should be > 0");
 }
 
 /// Assert that a streaming chat completion response is well-formed.
@@ -129,20 +123,22 @@ pub fn assert_valid_tool_calls(tool_calls: &[vllm_serve::protocol::ToolCall]) {
     assert!(!tool_calls.is_empty(), "should have at least one tool call");
     for tc in tool_calls {
         assert!(!tc.id.is_empty(), "tool call id should not be empty");
-        assert_eq!(tc.call_type, "function", "tool call type should be 'function'");
+        assert_eq!(
+            tc.call_type, "function",
+            "tool call type should be 'function'"
+        );
         assert!(
             !tc.function.name.is_empty(),
             "function name should not be empty"
         );
         // Arguments should be valid JSON
-        let _: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap_or_else(
-            |e| {
+        let _: serde_json::Value =
+            serde_json::from_str(&tc.function.arguments).unwrap_or_else(|e| {
                 panic!(
                     "tool call arguments should be valid JSON: {e}\narguments: {}",
                     tc.function.arguments
                 )
-            },
-        );
+            });
     }
 }
 

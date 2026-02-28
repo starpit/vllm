@@ -2,6 +2,10 @@
 // Copyright contributors to the vLLM project
 
 //! Stack initialization: wires together worker → executor → engine → server.
+//!
+//! This module provides the programmatic API for initializing the full vLLM
+//! inference stack. No CLI dependency needed — just construct a [`VllmConfig`]
+//! and call [`initialize_stack`].
 
 use std::path::Path;
 use std::sync::Arc;
@@ -15,16 +19,55 @@ use vllm_executor::candle_worker::{CandleWorker, CandleWorkerConfig};
 use vllm_executor::uniproc::UniProcExecutor;
 use vllm_executor::worker::Worker;
 use vllm_model::weight::HfModelConfig;
-use vllm_serve::chat_template::ChatTemplate;
-use vllm_serve::engine::AsyncEngine;
-use vllm_serve::tokenizer::Tokenizer;
+
+use crate::chat_template::ChatTemplate;
+use crate::engine::AsyncEngine;
+use crate::tokenizer::Tokenizer;
 
 #[cfg(feature = "metal")]
 use vllm_mlx::worker::{MlxWorker, MlxWorkerConfig};
 
 use candle_core::DType;
 
-use crate::args::ServeArgs;
+/// Configuration for initializing the vLLM inference stack.
+///
+/// This is the programmatic API — no CLI dependency needed.
+pub struct VllmConfig {
+    /// Model path or HuggingFace model ID (required).
+    pub model: String,
+    /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
+    pub device: String,
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    pub dtype: String,
+    /// Maximum model context length (None = use config.json).
+    pub max_model_len: Option<usize>,
+    /// Maximum number of concurrent sequences.
+    pub max_num_seqs: usize,
+    /// KV cache block size in tokens.
+    pub block_size: usize,
+    /// Fraction of GPU memory to use for KV cache (0.0–1.0).
+    pub gpu_memory_utilization: f64,
+    /// HuggingFace token for gated models.
+    pub hf_token: Option<String>,
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    pub gguf_file: Option<String>,
+}
+
+impl Default for VllmConfig {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            device: "auto".to_string(),
+            dtype: "auto".to_string(),
+            max_model_len: None,
+            max_num_seqs: 256,
+            block_size: 16,
+            gpu_memory_utilization: 0.9,
+            hf_token: None,
+            gguf_file: None,
+        }
+    }
+}
 
 /// Fully initialized stack ready to serve requests.
 #[allow(dead_code)]
@@ -54,17 +97,17 @@ type WorkerCreationResult = (
 /// Create the appropriate worker based on backend selection.
 ///
 /// Returns `(worker, hf_config, model_dir, dtype)`.
-fn create_worker(args: &ServeArgs, model_path: String) -> Result<WorkerCreationResult> {
+fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreationResult> {
     // Try MLX backend first when metal feature is enabled.
     #[cfg(feature = "metal")]
-    if should_use_mlx(&args.device) {
+    if should_use_mlx(&config.device) {
         info!("Using MLX backend (Apple Silicon GPU)");
         let mlx_config = MlxWorkerConfig {
             model_path: model_path.clone(),
-            dtype: args.dtype.clone(),
-            hf_token: args.hf_token.clone(),
+            dtype: config.dtype.clone(),
+            hf_token: config.hf_token.clone(),
             cache_dir: None,
-            block_size: args.block_size,
+            block_size: config.block_size,
         };
 
         let mut worker = MlxWorker::new(mlx_config);
@@ -81,7 +124,7 @@ fn create_worker(args: &ServeArgs, model_path: String) -> Result<WorkerCreationR
 
         // Map MLX dtype to candle DType for compute_num_blocks.
         // We resolve via the string representation to avoid depending on mlx_rs directly.
-        let model_dtype = match args.dtype.as_str() {
+        let model_dtype = match config.dtype.as_str() {
             "f32" | "float32" => DType::F32,
             "bf16" | "bfloat16" => DType::BF16,
             _ => DType::F16, // Default: f16 for Metal
@@ -94,12 +137,12 @@ fn create_worker(args: &ServeArgs, model_path: String) -> Result<WorkerCreationR
     info!("Using Candle backend");
     let worker_config = CandleWorkerConfig {
         model_path,
-        device_str: args.device.clone(),
-        dtype: args.dtype.clone(),
-        hf_token: args.hf_token.clone(),
+        device_str: config.device.clone(),
+        dtype: config.dtype.clone(),
+        hf_token: config.hf_token.clone(),
         cache_dir: None,
-        block_size: args.block_size,
-        gguf_file: args.gguf_file.clone(),
+        block_size: config.block_size,
+        gguf_file: config.gguf_file.clone(),
     };
 
     let mut worker = CandleWorker::new(worker_config);
@@ -142,7 +185,7 @@ fn init_cache(
     Ok((worker, available_memory, num_gpu_blocks))
 }
 
-/// Initialize the full vLLM stack from CLI arguments.
+/// Initialize the full vLLM stack from a [`VllmConfig`].
 ///
 /// Sequence:
 /// 1. Create worker config from args
@@ -155,16 +198,16 @@ fn init_cache(
 /// 8. Load tokenizer from model_dir
 /// 9. Create AsyncEngine
 /// 10. Return InitializedStack
-pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
-    let model_path = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
+pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
+    let model_path = config.model.clone();
 
     // Extract model name before moving model_path into the worker config.
     let model_name = extract_model_name(&model_path).into_owned();
 
     // Decide backend: MLX (Metal) or Candle (CPU/CUDA).
-    let (worker, hf_config, model_dir, model_dtype) = create_worker(args, model_path)?;
+    let (worker, hf_config, model_dir, model_dtype) = create_worker(config, model_path)?;
 
-    let max_model_len = args
+    let max_model_len = config
         .max_model_len
         .or(hf_config.max_position_embeddings)
         .unwrap_or(4096);
@@ -177,16 +220,16 @@ pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
 
     let (worker, available_memory, num_gpu_blocks) = init_cache(
         worker,
-        args.block_size,
+        config.block_size,
         &hf_config,
         model_dtype,
-        args.gpu_memory_utilization,
+        config.gpu_memory_utilization,
     )?;
 
     info!(
         "Available memory: {:.1} GB, gpu_memory_utilization={}, num_gpu_blocks={}",
         available_memory as f64 / (1024.0 * 1024.0 * 1024.0),
-        args.gpu_memory_utilization,
+        config.gpu_memory_utilization,
         num_gpu_blocks
     );
 
@@ -221,14 +264,14 @@ pub fn initialize_stack(args: &ServeArgs) -> Result<InitializedStack> {
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
             max_num_batched_tokens: max_model_len.min(8192),
-            max_num_seqs: args.max_num_seqs,
+            max_num_seqs: config.max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,
             ..Default::default()
         },
         max_model_len,
         num_gpu_blocks,
-        block_size: args.block_size,
+        block_size: config.block_size,
         engine_index: 0,
         async_scheduling: false,
         use_spec_decode: false,
@@ -426,5 +469,16 @@ mod tests {
         // 0.5 should produce roughly 0.5/0.9 ≈ 55% of the blocks from 0.9.
         let ratio = blocks_50 as f64 / blocks_90 as f64;
         assert!(ratio > 0.5 && ratio < 0.65, "ratio was {ratio}");
+    }
+
+    #[test]
+    fn test_vllm_config_default() {
+        let config = VllmConfig::default();
+        assert_eq!(config.device, "auto");
+        assert_eq!(config.dtype, "auto");
+        assert_eq!(config.max_num_seqs, 256);
+        assert_eq!(config.block_size, 16);
+        assert!((config.gpu_memory_utilization - 0.9).abs() < f64::EPSILON);
+        assert!(config.model.is_empty());
     }
 }

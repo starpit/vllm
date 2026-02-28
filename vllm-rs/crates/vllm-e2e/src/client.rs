@@ -5,8 +5,8 @@
 
 use anyhow::{Context, Result, bail};
 use vllm_serve::protocol::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamResponse,
-    CompletionRequest, CompletionResponse, ModelList, VersionResponse,
+    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamResponse, CompletionRequest,
+    CompletionResponse, ModelList, VersionResponse,
 };
 
 /// A thin HTTP client for talking to a running vLLM server.
@@ -41,7 +41,9 @@ impl Client {
             .get(format!("{}/version", self.base_url))
             .send()
             .await?;
-        resp.json().await.context("failed to parse version response")
+        resp.json()
+            .await
+            .context("failed to parse version response")
     }
 
     /// GET /v1/models — list available models.
@@ -126,10 +128,7 @@ impl Client {
     }
 
     /// POST /v1/chat/completions — returns raw response for status code checking.
-    pub async fn chat_completion_raw(
-        &self,
-        body: &serde_json::Value,
-    ) -> Result<reqwest::Response> {
+    pub async fn chat_completion_raw(&self, body: &serde_json::Value) -> Result<reqwest::Response> {
         let resp = self
             .inner
             .post(format!("{}/v1/chat/completions", self.base_url))

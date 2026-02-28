@@ -4,7 +4,7 @@
 
 End-to-end tests validate the full stack — from HTTP request to model inference to HTTP response — using real models downloaded from HuggingFace. Unlike unit tests (665 today) which mock out the model/worker layer, E2E tests prove that `vllm serve <model>` actually starts, loads weights, generates coherent text, streams correctly, handles tool calls, obeys structured output constraints, and returns well-formed OpenAI-compatible responses.
 
-**Strategy**: Tests launch a real `vllm serve` process (or construct the full stack in-process), send HTTP requests using `reqwest`, and validate responses. Tests are `#[ignore]`-tagged and gated behind `--features e2e` so they don't run in normal `cargo test`. A CI job downloads models once and caches them.
+**Strategy**: Tests construct the full inference stack in-process via `vllm_serve::init::initialize_stack()`, spawn the HTTP server on a random port, send requests using `reqwest`, and validate responses. Tests are `#[ignore]`-tagged and gated behind `--features e2e,metal` so they don't run in normal `cargo test`. A CI job downloads models once and caches them.
 
 **Backend focus**: MLX (Apple Silicon) first, since that's the primary development target. Candle backend E2E tests are a future phase.
 
@@ -14,45 +14,44 @@ End-to-end tests validate the full stack — from HTTP request to model inferenc
 
 ### Prerequisites
 
-1. **Build the CLI binary with the MLX backend** (required — tests spawn `vllm serve` as a child process):
-   ```bash
-   cargo build -p vllm-cli --features metal
-   ```
-   This produces `target/debug/vllm` which the test harness auto-discovers.
+1. **Apple Silicon Mac required** for the MLX backend (`--features metal`). CPU-only and CUDA E2E tests are future work.
 
-2. **Models are downloaded on first run** from HuggingFace Hub. Tier 1 models (~76–335 MB each) are fast; larger tiers take longer. No separate download step is required — the `vllm serve` child process handles HF download via the existing HF Hub client.
+2. **Models are downloaded on first run** from HuggingFace Hub. Tier 1 models (~76–335 MB each) are fast; larger tiers take longer. Downloads are cached in `~/.cache/huggingface/hub/`.
 
-3. **Apple Silicon Mac required** for `--features metal` (MLX backend). CPU-only and CUDA E2E tests are future work.
+### Architecture
+
+Tests run **in-process** — no separate CLI binary needed. Each test constructs a `VllmConfig`, calls `vllm_serve::init::initialize_stack()` to build the full inference stack, then spawns the HTTP server on a random port. This is faster than spawning a child process and avoids binary discovery issues.
 
 ### Run commands
 
 ```bash
 # All E2E tests (Tier 1–4, all phases):
-cargo test -p vllm-e2e --features e2e -- --ignored --test-threads=1
+cargo test -p vllm-e2e --features e2e,metal -- --ignored --test-threads=1
 
 # Single phase:
-cargo test -p vllm-e2e --features e2e --test e1_basic_serving -- --ignored --test-threads=1
-cargo test -p vllm-e2e --features e2e --test e2_chat_completions -- --ignored --test-threads=1
-cargo test -p vllm-e2e --features e2e --test e3_streaming -- --ignored --test-threads=1
+cargo test -p vllm-e2e --features e2e,metal --test e1_basic_serving -- --ignored --test-threads=1
+cargo test -p vllm-e2e --features e2e,metal --test e2_chat_completions -- --ignored --test-threads=1
+cargo test -p vllm-e2e --features e2e,metal --test e3_streaming -- --ignored --test-threads=1
 
 # Single test:
-cargo test -p vllm-e2e --features e2e --test e1_basic_serving test_smollm_chat_basic -- --ignored
+cargo test -p vllm-e2e --features e2e,metal --test e1_basic_serving test_t1_smollm_chat_basic -- --ignored
 
 # PR tier only (Tier 1+2 models — SmolLM, Qwen2, Qwen3, Llama3):
-cargo test -p vllm-e2e --features e2e --test e1_basic_serving -- --ignored --test-threads=1 \
-  test_smollm test_qwen2 test_qwen3 test_llama3
+cargo test -p vllm-e2e --features e2e,metal --test e1_basic_serving -- --ignored --test-threads=1 \
+  test_t1 test_t2
 
-# With a custom binary path:
-VLLM_E2E_BINARY=/path/to/vllm cargo test -p vllm-e2e --features e2e -- --ignored --test-threads=1
+# With verbose logging (model download progress, weight loading, etc.):
+RUST_LOG=info cargo test -p vllm-e2e --features e2e,metal -- --ignored --test-threads=1
 ```
 
 ### Key details
 
-- **`--features e2e`** — required. Tests are gated behind `#![cfg(feature = "e2e")]` and won't compile without it.
+- **`--features e2e,metal`** — both required. `e2e` gates test compilation (`#![cfg(feature = "e2e")]`); `metal` enables the MLX backend.
 - **`-- --ignored`** — required. All E2E tests are `#[ignore]`-tagged so they don't run during normal `cargo test`.
-- **`--test-threads=1`** — recommended. Tests spin up server processes on random ports; single-threaded avoids port races and excessive memory from multiple model loads.
+- **`--test-threads=1`** — recommended. Each test loads a model into GPU memory; parallel tests cause excessive memory pressure.
+- **Logging**: Silent by default. Set `RUST_LOG=info` (or `debug`, `trace`) to see model download progress, weight loading, cache initialization, and request handling.
 - **Startup timeout**: 120 seconds per server (configurable via `TestServerBuilder::with_timeout`). First run may be slower due to HF model download.
-- **Binary discovery**: The test harness searches `target/debug/vllm` then `target/release/vllm`, then falls back to `PATH`. Override with `VLLM_E2E_BINARY` env var.
+- **Tokio runtime**: Tests use `#[tokio::test(flavor = "multi_thread")]` because the engine step loop requires `block_in_place`.
 
 ---
 
@@ -62,14 +61,13 @@ VLLM_E2E_BINARY=/path/to/vllm cargo test -p vllm-e2e --features e2e -- --ignored
 
 Create `vllm-rs/crates/vllm-e2e/` — a test-only crate with:
 
-- **`TestServer`** helper: starts `vllm serve` as a child process on a random port, waits for `/health` to return 200, provides `base_url()`, drops to kill the process.
+- **`TestServer`** helper: initializes the full stack in-process via `vllm_serve::init::initialize_stack()`, spawns the HTTP server on a random port, waits for `/health` to return 200, provides `base_url()`, aborts the server task on drop.
   ```rust
-  let server = TestServer::new("mlx-community/SmolLM-135M-Instruct-4bit")
-      .with_args(&["--tool-call-parser", "hermes"])
+  let server = TestServer::builder("mlx-community/SmolLM-135M-Instruct-4bit")
       .start().await?;
   let url = server.base_url(); // "http://127.0.0.1:{port}"
   // ... send requests ...
-  drop(server); // kills child process
+  drop(server); // aborts server task
   ```
 - **`Client`** wrapper: thin `reqwest`-based client with helpers for:
   - `chat_completion(request) -> ChatCompletionResponse`
@@ -87,10 +85,9 @@ Create `vllm-rs/crates/vllm-e2e/` — a test-only crate with:
 
 ### E0b. Model cache management
 
-- **`MODEL_CACHE_DIR`**: env var `VLLM_E2E_MODEL_CACHE` (default `~/.cache/vllm-e2e/`)
-- **Pre-download script**: `scripts/download_e2e_models.sh` downloads all test models before CI runs
-- **Cargo feature**: `e2e` in `vllm-e2e/Cargo.toml` to gate test compilation
-- **CI integration**: GitHub Actions job with model cache (keyed by model list hash)
+- **Model cache**: Uses the standard HuggingFace Hub cache at `~/.cache/huggingface/hub/`. No separate cache directory needed.
+- **Cargo features**: `e2e` gates test compilation; `metal` enables the MLX backend.
+- **CI integration**: GitHub Actions job with HF cache (keyed by model list hash)
 
 ### E0c. Test configuration
 
@@ -161,7 +158,7 @@ For each model in the test matrix:
 | Model | Architecture | Quantized |
 |-------|-------------|-----------|
 | Mistral-7B-Instruct-v0.3-4bit | MistralForCausalLM | Yes (4-bit) |
-| DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx | DeepseekV2ForCausalLM | Yes (4-bit) |
+| DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx | DeepseekV2ForCausalLM | Yes (4-bit) — **DISABLED** (quantized MLX not implemented, see PARITY.md) |
 
 ### E1b. Float16 vs quantized comparison
 

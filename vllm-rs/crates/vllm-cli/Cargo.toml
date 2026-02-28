@@ -7,7 +7,7 @@ description = "CLI binary for vLLM Rust inference engine"
 
 [features]
 default = []
-metal = ["vllm-mlx"]
+metal = ["vllm-serve/metal", "vllm-mlx"]
 candle-metal = ["vllm-executor/metal", "vllm-kernels/metal", "vllm-models/metal"]
 
 [[bin]]
@@ -16,21 +16,16 @@ path = "src/main.rs"
 
 [dependencies]
 vllm-common = { workspace = true }
-vllm-config = { workspace = true }
 vllm-core = { workspace = true }
-vllm-engine = { workspace = true }
 vllm-serve = { workspace = true }
 vllm-executor = { workspace = true }
-vllm-model = { workspace = true }
 vllm-models = { workspace = true }
 vllm-kernels = { workspace = true }
-candle-core = { workspace = true }
 vllm-mlx = { workspace = true, optional = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-tokenizers = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

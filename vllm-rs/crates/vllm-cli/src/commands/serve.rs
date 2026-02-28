@@ -9,10 +9,10 @@ use std::time::Instant;
 use anyhow::Result;
 use tracing::info;
 use vllm_common::telemetry;
+use vllm_serve::init::{VllmConfig, initialize_stack};
 use vllm_serve::server::{AppState, ServerConfig};
 
 use crate::args::ServeArgs;
-use crate::init::initialize_stack;
 
 /// Run the serve subcommand.
 pub async fn run_serve(args: ServeArgs) -> Result<()> {
@@ -31,9 +31,22 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     info!("Model: {}", model);
     info!("Device: {}, dtype: {}", args.device, args.dtype);
 
-    // 2. Initialize the full stack (on a blocking thread to avoid starving
-    //    the tokio I/O driver during model download / weight loading).
-    let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&args))
+    // 2. Convert CLI args to VllmConfig and initialize the full stack
+    //    (on a blocking thread to avoid starving the tokio I/O driver
+    //    during model download / weight loading).
+    let config = VllmConfig {
+        model,
+        device: args.device.clone(),
+        dtype: args.dtype.clone(),
+        max_model_len: args.max_model_len,
+        max_num_seqs: args.max_num_seqs,
+        block_size: args.block_size,
+        gpu_memory_utilization: args.gpu_memory_utilization,
+        hf_token: args.hf_token.clone(),
+        gguf_file: args.gguf_file.clone(),
+    };
+
+    let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&config))
         .await
         .expect("initialize_stack panicked")?;
 

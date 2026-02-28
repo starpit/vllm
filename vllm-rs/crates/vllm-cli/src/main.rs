@@ -10,11 +10,10 @@
 
 mod args;
 mod commands;
-mod init;
 
 use clap::Parser;
 
-use args::{Cli, Commands};
+use crate::args::{Cli, Commands};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

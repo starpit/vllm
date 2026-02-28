@@ -35,7 +35,7 @@
 
 | Feature Group | Python | Rust | Unit | E2E | Parity |
 |---|:---:|:---:|---:|---:|---|
-| [Model Architectures](#model-architectures) | &#x1F535; | &#x1F7E1; | 90 | 25 | `███░░░░░░░` 10/36 |
+| [Model Architectures](#model-architectures) | &#x1F535; | &#x1F7E1; | 100 | 25 | `███░░░░░░░` 11/36 |
 | [Quantization](#quantization) | &#x1F535; | &#x1F7E1; | 13 | 0 | `█░░░░░░░░░` 1/11 |
 | [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | 96 | 18 | `██████░░░░` 14/25 |
 | [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | 49 | 12 | `████████░░` 18/21 |
@@ -52,7 +52,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/6 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | 15 | 0 | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | 14 | 0 | `██████████` 14/15 |
-| | | **Total** | **550** | **57** | `█████░░░░░` **100/199** |
+| | | **Total** | **560** | **57** | `█████░░░░░` **101/199** |
 
 ---
 
@@ -77,7 +77,7 @@
 | Qwen2 MoE | &#x1F535; | &#x1F535; | 8 | 0 | |
 | Qwen3 MoE | &#x1F535; | &#x1F535; | 8 | 0 | |
 | Qwen3 Next (hybrid linear attn) | &#x1F535; | &#x1F534; | — | — | P3 |
-| Mixtral (MoE) | &#x1F535; | &#x2795; | — | — | P3 |
+| Mixtral (MoE) | &#x1F535; | &#x1F535; | 7 | 0 | |
 | GPT-NeoX | &#x1F535; | &#x2795; | — | — | P1 |
 | GPT-J | &#x1F535; | &#x2795; | — | — | P1 |
 | Falcon | &#x1F535; | &#x2795; | — | — | P1 |
@@ -131,6 +131,8 @@
 | Quantized Gemma 3 (4-bit) | N/A | &#x1F535; | 0 | 4 | |
 | Kimi K2.5 text-only (via DeepSeek V2) | N/A | &#x1F535; | 0 | 0 | |
 | Quantized Kimi K2.5 text-only (4-bit) | N/A | &#x1F535; | 0 | 0 | |
+| Mixtral (MoE, float) | N/A | &#x1F535; | 3 | 0 | |
+| Quantized Mixtral (MoE, 4-bit) | N/A | &#x1F535; | 0 | 0 | |
 
 > Python vLLM does not have an MLX backend. The Rust MLX backend is unique to the Rust port. All E2E tests use `mlx-community` models and exercise the MLX backend (`--features metal`). MLX unit tests require `--test-threads=1`.
 
@@ -464,7 +466,7 @@
 
 | Metric | Python | Rust |
 |---|---|---|
-| Model architectures | ~248 | 10 candle + 10 MLX (+ quantized variants) |
+| Model architectures | ~248 | 11 candle + 11 MLX (+ quantized variants) |
 | Quantization methods | ~14 | 2 (GGUF + MLX native 4-bit) |
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |

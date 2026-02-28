@@ -12,6 +12,7 @@ pub mod deepseek_v2;
 pub mod gemma2;
 pub mod gemma3;
 pub mod llama;
+pub mod mixtral;
 pub mod phi3;
 pub mod quantized_llama;
 pub mod qwen3_moe;
@@ -127,6 +128,9 @@ impl MlxModelRegistry {
             "Qwen2MoeForCausalLM",
             qwen3_moe::create_mlx_quantized_qwen3_moe,
         );
+        // Mixtral — LLaMA-like attention + MoE (all layers), no shared expert
+        registry.register("MixtralForCausalLM", mixtral::create_mlx_mixtral);
+        registry.register_quantized("MixtralForCausalLM", mixtral::create_mlx_quantized_mixtral);
         // Command R (Cohere) — CohereLayerNorm, parallel attn+MLP, logit scaling,
         // interleaved RoPE
         registry.register("CohereForCausalLM", commandr::create_mlx_commandr);
@@ -208,6 +212,8 @@ mod tests {
         assert!(registry.contains_quantized("Phi3ForCausalLM"));
         assert!(registry.contains_quantized("Qwen3MoeForCausalLM"));
         assert!(registry.contains_quantized("Qwen2MoeForCausalLM"));
+        assert!(registry.contains("MixtralForCausalLM"));
+        assert!(registry.contains_quantized("MixtralForCausalLM"));
         assert!(!registry.contains("GPT2ForCausalLM"));
     }
 

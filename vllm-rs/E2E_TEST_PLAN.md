@@ -581,10 +581,13 @@ Validate the server handles concurrent requests correctly.
 | Mistral | MistralForCausalLM | Mistral-7B-Instruct-v0.3-4bit | 3.8 GB | Weekly | — | Yes |
 | DeepSeek V2 | DeepseekV2ForCausalLM | DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx | 8.2 GB | Weekly | — | Yes |
 | Qwen3 MoE | Qwen3MoeForCausalLM | Qwen3-MOE-4x0.6B-2.4B-mlx-4Bit | ~1.5 GB | Nightly | — | Yes |
+| Mixtral MoE | MixtralForCausalLM | Mixtral-SlimOrca-8x7B-3bit | ~18 GB | Manual | — | Yes |
 | Command R | CohereForCausalLM | c4ai-command-r-08-2024-4bit | 16.9 GB | Manual | — | Yes |
 | Gemma v1 | GemmaForCausalLM | (deferred — 2B model at 2 GB) | — | — | — | — |
 
 **Note on Command R**: The smallest `CohereForCausalLM` is 35B (16.9 GB). The 7B variant uses `Cohere2ForCausalLM` which is a different architecture not yet implemented. Command R E2E tests are manual-only until either (a) a smaller CohereForCausalLM model appears, or (b) we implement Cohere2ForCausalLM.
+
+**Note on Mixtral**: The smallest quantized Mixtral 8x7B is ~18 GB (3-bit). No smaller MixtralForCausalLM models exist. Mixtral E2E tests are manual-only. The architecture is covered by a synthetic weights unit test (`test_mixtral_model_from_weights`) which exercises the full load→forward path with tiny dimensions.
 
 ---
 

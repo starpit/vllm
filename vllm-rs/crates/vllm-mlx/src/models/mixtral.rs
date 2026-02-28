@@ -1,20 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! Qwen3 MoE / Qwen2 MoE model architecture for MLX.
+//! Mixtral MoE model architecture for MLX.
 //!
-//! Both float and quantized variants. Reuses LLaMA attention (handles QK
-//! norms for Qwen3, optional QKV bias for Qwen2) and LLaMA MLP for experts.
-//! Novel: sigmoid-gated shared expert + decoder_sparse_step layer selection.
+//! Both float and quantized variants. Reuses LLaMA attention for GQA.
+//! All layers are MoE — no dense/MoE alternation, no shared experts.
 //!
-//! Port of: `vllm/model_executor/models/qwen3_moe.py`
+//! Expert weights use w1/w2/w3 naming: w1 = gate_proj, w3 = up_proj, w2 = down_proj.
+//! The MoE module is named `block_sparse_moe` (not `mlp`).
+//!
+//! Port of: `vllm/model_executor/models/mixtral.py`
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use mlx_rs::builder::Builder;
 use mlx_rs::error::Exception;
-use mlx_rs::module::{Module, Param};
+use mlx_rs::module::Module;
 use mlx_rs::nn;
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
@@ -22,21 +24,21 @@ use mlx_rs::{Array, Dtype};
 use crate::cache::MlxKvCache;
 use crate::models::deepseek_v2::slice_quantized_linear;
 use crate::models::llama::{
-    LlamaConfig, MlxLlamaAttention, MlxLlamaMLP, assign_weight, load_safetensors_weights,
+    LlamaConfig, MlxLlamaAttention, assign_weight, load_safetensors_weights,
 };
 use crate::models::quantized_llama::{
-    MlxEmbedTokens, MlxLmHead, MlxQuantizedLlamaAttention, MlxQuantizedLlamaMLP, QuantConfig,
-    make_quantized_linear,
+    MlxEmbedTokens, MlxLmHead, MlxQuantizedLlamaAttention, QuantConfig, make_quantized_linear,
 };
+use crate::models::qwen3_moe::MlxGate;
 use vllm_model::weight::HfModelConfig;
 
 // ---------------------------------------------------------------------------
-// MlxQwen3MoeConfig
+// MlxMixtralConfig
 // ---------------------------------------------------------------------------
 
-/// Parsed configuration for a Qwen3 MoE / Qwen2 MoE model (MLX backend).
+/// Parsed configuration for a Mixtral model (MLX backend).
 #[derive(Debug, Clone)]
-pub struct MlxQwen3MoeConfig {
+pub struct MlxMixtralConfig {
     pub hidden_size: usize,
     pub num_attention_heads: usize,
     pub num_kv_heads: usize,
@@ -48,18 +50,14 @@ pub struct MlxQwen3MoeConfig {
     pub rope_theta: f32,
     pub head_dim: usize,
     pub tie_word_embeddings: bool,
+    pub sliding_window: Option<usize>,
 
     // MoE-specific.
-    pub num_experts: usize,
+    pub num_local_experts: usize,
     pub num_experts_per_tok: usize,
-    pub moe_intermediate_size: usize,
-    pub shared_expert_intermediate_size: usize,
-    pub norm_topk_prob: bool,
-    pub decoder_sparse_step: usize,
-    pub mlp_only_layers: Vec<usize>,
 }
 
-impl MlxQwen3MoeConfig {
+impl MlxMixtralConfig {
     /// Parse from a HuggingFace config.json.
     pub fn from_hf_config(config: &HfModelConfig) -> Result<Self, String> {
         let llama = LlamaConfig::from_hf_config(config)?;
@@ -68,7 +66,6 @@ impl MlxQwen3MoeConfig {
         let get_usize = |key: &str| -> Option<usize> {
             extra.get(key).and_then(|v| v.as_u64()).map(|v| v as usize)
         };
-        let get_bool = |key: &str| -> Option<bool> { extra.get(key).and_then(|v| v.as_bool()) };
 
         Ok(Self {
             hidden_size: llama.hidden_size,
@@ -82,23 +79,9 @@ impl MlxQwen3MoeConfig {
             rope_theta: llama.rope_theta,
             head_dim: llama.head_dim,
             tie_word_embeddings: llama.tie_word_embeddings,
-            num_experts: get_usize("num_experts").unwrap_or(0),
-            num_experts_per_tok: get_usize("num_experts_per_tok").unwrap_or(4),
-            moe_intermediate_size: get_usize("moe_intermediate_size")
-                .unwrap_or(llama.intermediate_size),
-            shared_expert_intermediate_size: get_usize("shared_expert_intermediate_size")
-                .unwrap_or(0),
-            norm_topk_prob: get_bool("norm_topk_prob").unwrap_or(true),
-            decoder_sparse_step: get_usize("decoder_sparse_step").unwrap_or(1),
-            mlp_only_layers: extra
-                .get("mlp_only_layers")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_u64().map(|n| n as usize))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            sliding_window: llama.sliding_window,
+            num_local_experts: get_usize("num_local_experts").unwrap_or(8),
+            num_experts_per_tok: get_usize("num_experts_per_tok").unwrap_or(2),
         })
     }
 
@@ -116,40 +99,71 @@ impl MlxQwen3MoeConfig {
             rope_theta: self.rope_theta,
             head_dim: self.head_dim,
             tie_word_embeddings: self.tie_word_embeddings,
-            sliding_window: None,
+            sliding_window: self.sliding_window,
         }
     }
+}
 
-    /// Whether a given layer index is a MoE layer.
-    pub fn is_moe_layer(&self, layer_idx: usize) -> bool {
-        !self.mlp_only_layers.contains(&layer_idx)
-            && self.num_experts > 0
-            && (layer_idx + 1).is_multiple_of(self.decoder_sparse_step)
+// ===========================================================================
+// Float Mixtral
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// MlxMixtralExpertMLP
+// ---------------------------------------------------------------------------
+
+/// A single Mixtral expert MLP using w1/w2/w3 naming.
+struct MlxMixtralExpertMLP {
+    w1: nn::Linear, // gate_proj
+    w2: nn::Linear, // down_proj
+    w3: nn::Linear, // up_proj
+}
+
+impl MlxMixtralExpertMLP {
+    fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self, Exception> {
+        Ok(Self {
+            w1: nn::LinearBuilder::new(hidden_size, intermediate_size)
+                .bias(false)
+                .build()?,
+            w2: nn::LinearBuilder::new(intermediate_size, hidden_size)
+                .bias(false)
+                .build()?,
+            w3: nn::LinearBuilder::new(hidden_size, intermediate_size)
+                .bias(false)
+                .build()?,
+        })
+    }
+
+    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) {
+        assign_weight(&mut self.w1.weight, weights, &format!("{prefix}.w1.weight"));
+        assign_weight(&mut self.w2.weight, weights, &format!("{prefix}.w2.weight"));
+        assign_weight(&mut self.w3.weight, weights, &format!("{prefix}.w3.weight"));
+    }
+
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        let gate = self.w1.forward(x)?;
+        let gate = nn::silu(&gate)?;
+        let up = self.w3.forward(x)?;
+        let hidden = gate.multiply(&up)?;
+        self.w2.forward(&hidden)
     }
 }
 
-// ===========================================================================
-// Float MoE
-// ===========================================================================
-
 // ---------------------------------------------------------------------------
-// MlxQwen3MoeMoE
+// MlxMixtralMoE
 // ---------------------------------------------------------------------------
 
-/// Mixture of Experts layer with sigmoid-gated shared expert (MLX float).
-struct MlxQwen3MoeMoE {
+/// Mixture of Experts layer — no shared expert (MLX float).
+struct MlxMixtralMoE {
     gate: nn::Linear,
-    experts: Vec<MlxLlamaMLP>,
-    shared_expert: Option<MlxLlamaMLP>,
-    shared_expert_gate: Option<nn::Linear>,
+    experts: Vec<MlxMixtralExpertMLP>,
     top_k: usize,
-    norm_topk_prob: bool,
 }
 
-impl MlxQwen3MoeMoE {
-    fn new(config: &MlxQwen3MoeConfig) -> Result<Self, Exception> {
+impl MlxMixtralMoE {
+    fn new(config: &MlxMixtralConfig) -> Result<Self, Exception> {
         let hidden = config.hidden_size as i32;
-        let n = config.num_experts;
+        let n = config.num_local_experts;
 
         let gate = nn::LinearBuilder::new(hidden, n as i32)
             .bias(false)
@@ -157,27 +171,16 @@ impl MlxQwen3MoeMoE {
 
         let mut experts = Vec::with_capacity(n);
         for _ in 0..n {
-            experts.push(MlxLlamaMLP::new(
+            experts.push(MlxMixtralExpertMLP::new(
                 hidden,
-                config.moe_intermediate_size as i32,
+                config.intermediate_size as i32,
             )?);
         }
-
-        let (shared_expert, shared_expert_gate) = if config.shared_expert_intermediate_size > 0 {
-            let se = MlxLlamaMLP::new(hidden, config.shared_expert_intermediate_size as i32)?;
-            let seg = nn::LinearBuilder::new(hidden, 1).bias(false).build()?;
-            (Some(se), Some(seg))
-        } else {
-            (None, None)
-        };
 
         Ok(Self {
             gate,
             experts,
-            shared_expert,
-            shared_expert_gate,
             top_k: config.num_experts_per_tok,
-            norm_topk_prob: config.norm_topk_prob,
         })
     }
 
@@ -191,27 +194,14 @@ impl MlxQwen3MoeMoE {
         for (i, expert) in self.experts.iter_mut().enumerate() {
             expert.load_weights(weights, &format!("{prefix}.experts.{i}"));
         }
-
-        if let Some(ref mut se) = self.shared_expert {
-            se.load_weights(weights, &format!("{prefix}.shared_expert"));
-        }
-        if let Some(ref mut seg) = self.shared_expert_gate {
-            assign_weight(
-                &mut seg.weight,
-                weights,
-                &format!("{prefix}.shared_expert_gate.weight"),
-            );
-        }
     }
 
     fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        // Evaluate x for routing decisions.
         mlx_rs::transforms::eval(std::iter::once(x))?;
 
         let seq_len = x.dim(0);
         let hidden = x.dim(1);
 
-        // Compute router logits and softmax.
         let router_logits = self.gate.forward(x)?;
         let probs = mlx_rs::ops::softmax_axis(&router_logits, -1, None)?;
         mlx_rs::transforms::eval(std::iter::once(&probs))?;
@@ -219,7 +209,6 @@ impl MlxQwen3MoeMoE {
         let probs_flat: Vec<f32> = probs.as_dtype(Dtype::Float32)?.as_slice().to_vec();
         let n_experts = self.experts.len();
 
-        // Route each token.
         let mut output_data = vec![0.0f32; (seq_len * hidden) as usize];
 
         for tok in 0..(seq_len as usize) {
@@ -229,13 +218,7 @@ impl MlxQwen3MoeMoE {
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             indexed.truncate(self.top_k);
 
-            let total: f32 = indexed.iter().map(|(_, p)| p).sum();
-            let scale = if self.norm_topk_prob && total > 0.0 {
-                1.0 / total
-            } else {
-                1.0
-            };
-
+            // Mixtral does not renormalize top-k probabilities.
             let token_x = x.try_index(tok as i32)?;
 
             for &(expert_idx, prob) in &indexed {
@@ -243,62 +226,37 @@ impl MlxQwen3MoeMoE {
                 let expert_out = self.experts[expert_idx].forward(&token_x_2d)?;
                 mlx_rs::transforms::eval(std::iter::once(&expert_out))?;
 
-                let weight = prob * scale;
                 let vals: Vec<f32> = expert_out.as_dtype(Dtype::Float32)?.as_slice().to_vec();
                 for (j, &v) in vals.iter().enumerate() {
-                    output_data[tok * (hidden as usize) + j] += v * weight;
+                    output_data[tok * (hidden as usize) + j] += v * prob;
                 }
             }
         }
 
-        let mut output = Array::from_slice(&output_data, &[seq_len, hidden]);
-        output = output.as_dtype(x.dtype())?;
-
-        // Shared expert with sigmoid gate.
-        if let (Some(se), Some(seg)) = (&mut self.shared_expert, &mut self.shared_expert_gate) {
-            let shared_out = se.forward(x)?;
-            let gate_val = seg.forward(x)?; // [seq, 1]
-            let gate_sigmoid = nn::sigmoid(&gate_val)?;
-            let shared_gated = shared_out.multiply(&gate_sigmoid)?;
-            output = output.add(&shared_gated)?;
-        }
-
-        Ok(output)
+        let output = Array::from_slice(&output_data, &[seq_len, hidden]);
+        output.as_dtype(x.dtype())
     }
 }
 
 // ---------------------------------------------------------------------------
-// MlxQwen3MoeDecoderLayer (float)
+// MlxMixtralDecoderLayer (float)
 // ---------------------------------------------------------------------------
 
-/// A single float decoder layer with dense MLP or MoE dispatch.
-struct MlxQwen3MoeDecoderLayer {
+/// A single float decoder layer (always MoE).
+struct MlxMixtralDecoderLayer {
     self_attn: MlxLlamaAttention,
-    mlp: MlxQwen3MoeMlp,
+    block_sparse_moe: MlxMixtralMoE,
     input_layernorm: nn::RmsNorm,
     post_attention_layernorm: nn::RmsNorm,
 }
 
-enum MlxQwen3MoeMlp {
-    Dense(MlxLlamaMLP),
-    MoE(MlxQwen3MoeMoE),
-}
-
-impl MlxQwen3MoeDecoderLayer {
-    fn new(config: &MlxQwen3MoeConfig, layer_idx: usize) -> Result<Self, Exception> {
+impl MlxMixtralDecoderLayer {
+    fn new(config: &MlxMixtralConfig) -> Result<Self, Exception> {
         let llama_config = config.llama_config();
-        let mlp = if config.is_moe_layer(layer_idx) {
-            MlxQwen3MoeMlp::MoE(MlxQwen3MoeMoE::new(config)?)
-        } else {
-            MlxQwen3MoeMlp::Dense(MlxLlamaMLP::new(
-                config.hidden_size as i32,
-                config.intermediate_size as i32,
-            )?)
-        };
 
         Ok(Self {
             self_attn: MlxLlamaAttention::new(&llama_config)?,
-            mlp,
+            block_sparse_moe: MlxMixtralMoE::new(config)?,
             input_layernorm: nn::RmsNormBuilder::new(config.hidden_size as i32)
                 .eps(config.rms_norm_eps)
                 .build()?,
@@ -311,14 +269,8 @@ impl MlxQwen3MoeDecoderLayer {
     fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) {
         self.self_attn
             .load_weights(weights, &format!("{prefix}.self_attn"));
-        match &mut self.mlp {
-            MlxQwen3MoeMlp::Dense(mlp) => {
-                mlp.load_weights(weights, &format!("{prefix}.mlp"));
-            }
-            MlxQwen3MoeMlp::MoE(moe) => {
-                moe.load_weights(weights, &format!("{prefix}.mlp"));
-            }
-        }
+        self.block_sparse_moe
+            .load_weights(weights, &format!("{prefix}.block_sparse_moe"));
         assign_weight(
             &mut self.input_layernorm.weight,
             weights,
@@ -337,46 +289,41 @@ impl MlxQwen3MoeDecoderLayer {
         positions: &Array,
         cache: &mut Option<(Array, Array)>,
     ) -> Result<Array, Exception> {
-        // Pre-attention layernorm + attention + residual.
         let normed = self.input_layernorm.forward(hidden_states)?;
         let attn_output = self.self_attn.forward(&normed, positions, cache)?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
-        // Post-attention layernorm + MLP/MoE + residual.
         let normed = self.post_attention_layernorm.forward(&hidden_states)?;
-        let mlp_output = match &mut self.mlp {
-            MlxQwen3MoeMlp::Dense(mlp) => mlp.forward(&normed)?,
-            MlxQwen3MoeMlp::MoE(moe) => moe.forward(&normed)?,
-        };
+        let mlp_output = self.block_sparse_moe.forward(&normed)?;
         hidden_states.add(&mlp_output)
     }
 }
 
 // ---------------------------------------------------------------------------
-// MlxQwen3MoeForCausalLM (float)
+// MlxMixtralForCausalLM (float)
 // ---------------------------------------------------------------------------
 
-/// Qwen3 MoE for causal language modeling using MLX (float).
-pub struct MlxQwen3MoeForCausalLM {
+/// Mixtral for causal language modeling using MLX (float).
+pub struct MlxMixtralForCausalLM {
     embed_tokens: nn::Embedding,
-    layers: Vec<MlxQwen3MoeDecoderLayer>,
+    layers: Vec<MlxMixtralDecoderLayer>,
     norm: nn::RmsNorm,
     lm_head: Option<nn::Linear>,
     tie_word_embeddings: bool,
     #[allow(dead_code)]
-    config: MlxQwen3MoeConfig,
+    config: MlxMixtralConfig,
 }
 
-impl MlxQwen3MoeForCausalLM {
+impl MlxMixtralForCausalLM {
     /// Load model weights from safetensors files in a directory.
     pub fn load(
         model_dir: &Path,
-        config: &MlxQwen3MoeConfig,
+        config: &MlxMixtralConfig,
         _dtype: Dtype,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for i in 0..config.num_hidden_layers {
-            layers.push(MlxQwen3MoeDecoderLayer::new(config, i)?);
+        for _ in 0..config.num_hidden_layers {
+            layers.push(MlxMixtralDecoderLayer::new(config)?);
         }
 
         let lm_head = if config.tie_word_embeddings {
@@ -420,7 +367,7 @@ impl MlxQwen3MoeForCausalLM {
     }
 }
 
-impl super::MlxModel for MlxQwen3MoeForCausalLM {
+impl super::MlxModel for MlxMixtralForCausalLM {
     fn forward(
         &mut self,
         input_ids: &Array,
@@ -450,103 +397,66 @@ impl super::MlxModel for MlxQwen3MoeForCausalLM {
 }
 
 // ===========================================================================
-// Quantized MoE
+// Quantized Mixtral
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// MlxQuantizedQwen3MoeMoE
+// MlxQuantizedMixtralExpertMLP
 // ---------------------------------------------------------------------------
 
-/// Router gate that may or may not be quantized.
-///
-/// mlx-community DeepSeek V2 models have float gates, but some Qwen3 MoE
-/// models quantize the gate at different bit widths (e.g., 8-bit while the
-/// rest of the model is 4-bit). Auto-detect from weight presence.
-pub(crate) enum MlxGate {
-    Float(nn::Linear),
-    Quantized(nn::QuantizedLinear),
+/// A single quantized Mixtral expert using w1/w2/w3 naming.
+struct MlxQuantizedMixtralExpertMLP {
+    w1: nn::QuantizedLinear, // gate_proj
+    w2: nn::QuantizedLinear, // down_proj
+    w3: nn::QuantizedLinear, // up_proj
 }
 
-impl MlxGate {
-    /// Load from weights: if `{prefix}.scales` exists, load as quantized
-    /// (auto-detecting bits from packed weight shape); otherwise float.
-    pub(crate) fn from_weights(
-        weights: &HashMap<String, Array>,
-        prefix: &str,
-        qc: &QuantConfig,
-    ) -> Self {
-        if weights.contains_key(&format!("{prefix}.scales")) {
-            // Auto-detect bits from packed weight shape.
-            // packed_cols = in_features * bits / 32, so
-            // bits = packed_cols * 32 / in_features
-            // in_features = num_groups * group_size
-            let bits = if let (Some(w), Some(s)) = (
-                weights.get(&format!("{prefix}.weight")),
-                weights.get(&format!("{prefix}.scales")),
-            ) {
-                let packed_cols = w.dim(1) as i64;
-                let num_groups = s.dim(1) as i64;
-                let in_features = num_groups * qc.group_size as i64;
-                if in_features > 0 {
-                    (packed_cols * 32 / in_features) as i32
-                } else {
-                    qc.bits
-                }
-            } else {
-                qc.bits
-            };
-            MlxGate::Quantized(make_quantized_linear(weights, prefix, qc.group_size, bits))
-        } else if let Some(w) = weights.get(&format!("{prefix}.weight")) {
-            MlxGate::Float(nn::Linear {
-                weight: Param::new(w.clone()),
-                bias: Param::new(None),
-            })
-        } else {
-            tracing::warn!("Gate weights not found at {prefix}, creating stub");
-            MlxGate::Float(
-                nn::LinearBuilder::new(1, 1)
-                    .bias(false)
-                    .build()
-                    .expect("stub linear"),
-            )
+impl MlxQuantizedMixtralExpertMLP {
+    fn from_weights(weights: &HashMap<String, Array>, prefix: &str, qc: &QuantConfig) -> Self {
+        Self {
+            w1: make_quantized_linear(weights, &format!("{prefix}.w1"), qc.group_size, qc.bits),
+            w2: make_quantized_linear(weights, &format!("{prefix}.w2"), qc.group_size, qc.bits),
+            w3: make_quantized_linear(weights, &format!("{prefix}.w3"), qc.group_size, qc.bits),
         }
     }
 
-    pub(crate) fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        match self {
-            MlxGate::Float(l) => l.forward(x),
-            MlxGate::Quantized(l) => l.forward(x),
-        }
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        let gate = self.w1.forward(x)?;
+        let gate = nn::silu(&gate)?;
+        let up = self.w3.forward(x)?;
+        let hidden = gate.multiply(&up)?;
+        self.w2.forward(&hidden)
     }
 }
 
-/// Mixture of Experts layer with sigmoid-gated shared expert (MLX quantized).
-struct MlxQuantizedQwen3MoeMoE {
+// ---------------------------------------------------------------------------
+// MlxQuantizedMixtralMoE
+// ---------------------------------------------------------------------------
+
+/// Mixture of Experts layer — no shared expert (MLX quantized).
+struct MlxQuantizedMixtralMoE {
     gate: MlxGate,
-    experts: Vec<MlxQuantizedLlamaMLP>,
-    shared_expert: Option<MlxQuantizedLlamaMLP>,
-    shared_expert_gate: Option<nn::Linear>,
+    experts: Vec<MlxQuantizedMixtralExpertMLP>,
     top_k: usize,
-    norm_topk_prob: bool,
 }
 
-impl MlxQuantizedQwen3MoeMoE {
+impl MlxQuantizedMixtralMoE {
     fn from_weights(
         weights: &HashMap<String, Array>,
         prefix: &str,
-        config: &MlxQwen3MoeConfig,
+        config: &MlxMixtralConfig,
         qc: &QuantConfig,
     ) -> Self {
-        let n = config.num_experts;
+        let n = config.num_local_experts;
 
-        // Gate: auto-detect quantized vs float.
         let gate = MlxGate::from_weights(weights, &format!("{prefix}.gate"), qc);
 
-        // Load experts: try fused switch_mlp format, fall back to per-expert.
+        // Try fused switch_mlp format first, fall back to per-expert w1/w2/w3.
         let switch_prefix = format!("{prefix}.switch_mlp");
         let has_switch_mlp = weights.contains_key(&format!("{switch_prefix}.gate_proj.weight"));
 
         let experts = if has_switch_mlp {
+            // switch_mlp stores fused 3D tensors; gate_proj=w1, up_proj=w3, down_proj=w2.
             let gate_w = weights.get(&format!("{switch_prefix}.gate_proj.weight"));
             let gate_s = weights.get(&format!("{switch_prefix}.gate_proj.scales"));
             let gate_b = weights.get(&format!("{switch_prefix}.gate_proj.biases"));
@@ -560,17 +470,17 @@ impl MlxQuantizedQwen3MoeMoE {
             (0..n)
                 .map(|i| {
                     let idx = i as i32;
-                    MlxQuantizedLlamaMLP {
-                        gate_proj: slice_quantized_linear(gate_w, gate_s, gate_b, idx, qc),
-                        up_proj: slice_quantized_linear(up_w, up_s, up_b, idx, qc),
-                        down_proj: slice_quantized_linear(down_w, down_s, down_b, idx, qc),
+                    MlxQuantizedMixtralExpertMLP {
+                        w1: slice_quantized_linear(gate_w, gate_s, gate_b, idx, qc),
+                        w3: slice_quantized_linear(up_w, up_s, up_b, idx, qc),
+                        w2: slice_quantized_linear(down_w, down_s, down_b, idx, qc),
                     }
                 })
                 .collect()
         } else {
             (0..n)
                 .map(|i| {
-                    MlxQuantizedLlamaMLP::from_weights(
+                    MlxQuantizedMixtralExpertMLP::from_weights(
                         weights,
                         &format!("{prefix}.experts.{i}"),
                         qc,
@@ -579,45 +489,14 @@ impl MlxQuantizedQwen3MoeMoE {
                 .collect()
         };
 
-        // Shared expert (quantized).
-        let shared_expert = if config.shared_expert_intermediate_size > 0 {
-            Some(MlxQuantizedLlamaMLP::from_weights(
-                weights,
-                &format!("{prefix}.shared_expert"),
-                qc,
-            ))
-        } else {
-            None
-        };
-
-        // Shared expert gate (always float, hidden_size -> 1).
-        let shared_expert_gate = if config.shared_expert_intermediate_size > 0 {
-            let mut seg = nn::LinearBuilder::new(config.hidden_size as i32, 1)
-                .bias(false)
-                .build()
-                .expect("failed to create shared_expert_gate");
-            assign_weight(
-                &mut seg.weight,
-                weights,
-                &format!("{prefix}.shared_expert_gate.weight"),
-            );
-            Some(seg)
-        } else {
-            None
-        };
-
         Self {
             gate,
             experts,
-            shared_expert,
-            shared_expert_gate,
             top_k: config.num_experts_per_tok,
-            norm_topk_prob: config.norm_topk_prob,
         }
     }
 
     fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        // Evaluate x for routing decisions.
         mlx_rs::transforms::eval(std::iter::once(x))?;
 
         let seq_len = x.dim(0);
@@ -639,13 +518,6 @@ impl MlxQuantizedQwen3MoeMoE {
             indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             indexed.truncate(self.top_k);
 
-            let total: f32 = indexed.iter().map(|(_, p)| p).sum();
-            let scale = if self.norm_topk_prob && total > 0.0 {
-                1.0 / total
-            } else {
-                1.0
-            };
-
             let token_x = x.try_index(tok as i32)?;
 
             for &(expert_idx, prob) in &indexed {
@@ -653,71 +525,38 @@ impl MlxQuantizedQwen3MoeMoE {
                 let expert_out = self.experts[expert_idx].forward(&token_x_2d)?;
                 mlx_rs::transforms::eval(std::iter::once(&expert_out))?;
 
-                let weight = prob * scale;
                 let vals: Vec<f32> = expert_out.as_dtype(Dtype::Float32)?.as_slice().to_vec();
                 for (j, &v) in vals.iter().enumerate() {
-                    output_data[tok * (hidden as usize) + j] += v * weight;
+                    output_data[tok * (hidden as usize) + j] += v * prob;
                 }
             }
         }
 
-        let mut output = Array::from_slice(&output_data, &[seq_len, hidden]);
-        output = output.as_dtype(x.dtype())?;
-
-        // Shared expert with sigmoid gate.
-        if let (Some(se), Some(seg)) = (&mut self.shared_expert, &mut self.shared_expert_gate) {
-            let shared_out = se.forward(x)?;
-            let gate_val = seg.forward(x)?;
-            let gate_sigmoid = nn::sigmoid(&gate_val)?;
-            let shared_gated = shared_out.multiply(&gate_sigmoid)?;
-            output = output.add(&shared_gated)?;
-        }
-
-        Ok(output)
+        let output = Array::from_slice(&output_data, &[seq_len, hidden]);
+        output.as_dtype(x.dtype())
     }
 }
 
 // ---------------------------------------------------------------------------
-// MlxQuantizedQwen3MoeDecoderLayer
+// MlxQuantizedMixtralDecoderLayer
 // ---------------------------------------------------------------------------
 
-/// A single quantized decoder layer.
-struct MlxQuantizedQwen3MoeDecoderLayer {
+/// A single quantized decoder layer (always MoE).
+struct MlxQuantizedMixtralDecoderLayer {
     self_attn: MlxQuantizedLlamaAttention,
-    mlp: MlxQuantizedQwen3MoeMlp,
+    block_sparse_moe: MlxQuantizedMixtralMoE,
     input_layernorm: nn::RmsNorm,
     post_attention_layernorm: nn::RmsNorm,
 }
 
-enum MlxQuantizedQwen3MoeMlp {
-    Dense(MlxQuantizedLlamaMLP),
-    MoE(MlxQuantizedQwen3MoeMoE),
-}
-
-impl MlxQuantizedQwen3MoeDecoderLayer {
+impl MlxQuantizedMixtralDecoderLayer {
     fn from_weights(
         weights: &HashMap<String, Array>,
         prefix: &str,
-        config: &MlxQwen3MoeConfig,
-        layer_idx: usize,
+        config: &MlxMixtralConfig,
         qc: &QuantConfig,
     ) -> Result<Self, Exception> {
         let llama_config = config.llama_config();
-
-        let mlp = if config.is_moe_layer(layer_idx) {
-            MlxQuantizedQwen3MoeMlp::MoE(MlxQuantizedQwen3MoeMoE::from_weights(
-                weights,
-                &format!("{prefix}.mlp"),
-                config,
-                qc,
-            ))
-        } else {
-            MlxQuantizedQwen3MoeMlp::Dense(MlxQuantizedLlamaMLP::from_weights(
-                weights,
-                &format!("{prefix}.mlp"),
-                qc,
-            ))
-        };
 
         let mut input_layernorm = nn::RmsNormBuilder::new(config.hidden_size as i32)
             .eps(config.rms_norm_eps)
@@ -739,7 +578,12 @@ impl MlxQuantizedQwen3MoeDecoderLayer {
                 &llama_config,
                 qc,
             ),
-            mlp,
+            block_sparse_moe: MlxQuantizedMixtralMoE::from_weights(
+                weights,
+                &format!("{prefix}.block_sparse_moe"),
+                config,
+                qc,
+            ),
             input_layernorm,
             post_attention_layernorm,
         })
@@ -756,33 +600,30 @@ impl MlxQuantizedQwen3MoeDecoderLayer {
         let hidden_states = hidden_states.add(&attn_output)?;
 
         let normed = self.post_attention_layernorm.forward(&hidden_states)?;
-        let mlp_output = match &mut self.mlp {
-            MlxQuantizedQwen3MoeMlp::Dense(mlp) => mlp.forward(&normed)?,
-            MlxQuantizedQwen3MoeMlp::MoE(moe) => moe.forward(&normed)?,
-        };
+        let mlp_output = self.block_sparse_moe.forward(&normed)?;
         hidden_states.add(&mlp_output)
     }
 }
 
 // ---------------------------------------------------------------------------
-// MlxQuantizedQwen3MoeForCausalLM
+// MlxQuantizedMixtralForCausalLM
 // ---------------------------------------------------------------------------
 
-/// Quantized Qwen3 MoE for causal language modeling using MLX.
-pub struct MlxQuantizedQwen3MoeForCausalLM {
+/// Quantized Mixtral for causal language modeling using MLX.
+pub struct MlxQuantizedMixtralForCausalLM {
     embed_tokens: MlxEmbedTokens,
-    layers: Vec<MlxQuantizedQwen3MoeDecoderLayer>,
+    layers: Vec<MlxQuantizedMixtralDecoderLayer>,
     norm: nn::RmsNorm,
     lm_head: Option<MlxLmHead>,
     tie_word_embeddings: bool,
     #[allow(dead_code)]
-    config: MlxQwen3MoeConfig,
+    config: MlxMixtralConfig,
 }
 
-impl MlxQuantizedQwen3MoeForCausalLM {
+impl MlxQuantizedMixtralForCausalLM {
     pub fn load(
         model_dir: &Path,
-        config: &MlxQwen3MoeConfig,
+        config: &MlxMixtralConfig,
         qc: &QuantConfig,
         _dtype: Dtype,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -793,11 +634,10 @@ impl MlxQuantizedQwen3MoeForCausalLM {
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            layers.push(MlxQuantizedQwen3MoeDecoderLayer::from_weights(
+            layers.push(MlxQuantizedMixtralDecoderLayer::from_weights(
                 &weights,
                 &format!("model.layers.{i}"),
                 config,
-                i,
                 qc,
             )?);
         }
@@ -833,7 +673,7 @@ impl MlxQuantizedQwen3MoeForCausalLM {
     }
 }
 
-impl super::MlxModel for MlxQuantizedQwen3MoeForCausalLM {
+impl super::MlxModel for MlxQuantizedMixtralForCausalLM {
     fn forward(
         &mut self,
         input_ids: &Array,
@@ -866,35 +706,35 @@ impl super::MlxModel for MlxQuantizedQwen3MoeForCausalLM {
 // Factory functions
 // ===========================================================================
 
-/// Factory function for creating a float MLX Qwen3 MoE model.
-pub fn create_mlx_qwen3_moe(
+/// Factory function for creating a float MLX Mixtral model.
+pub fn create_mlx_mixtral(
     model_dir: &Path,
     config: &HfModelConfig,
     dtype: Dtype,
 ) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
-    let moe_config = MlxQwen3MoeConfig::from_hf_config(config)
+    let mixtral_config = MlxMixtralConfig::from_hf_config(config)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-    let model = MlxQwen3MoeForCausalLM::load(model_dir, &moe_config, dtype)?;
+    let model = MlxMixtralForCausalLM::load(model_dir, &mixtral_config, dtype)?;
     Ok(Box::new(model))
 }
 
-/// Factory function for creating a quantized MLX Qwen3 MoE model.
-pub fn create_mlx_quantized_qwen3_moe(
+/// Factory function for creating a quantized MLX Mixtral model.
+pub fn create_mlx_quantized_mixtral(
     model_dir: &Path,
     config: &HfModelConfig,
     dtype: Dtype,
 ) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
-    let moe_config = MlxQwen3MoeConfig::from_hf_config(config)
+    let mixtral_config = MlxMixtralConfig::from_hf_config(config)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
     let qc = QuantConfig::from_hf_config(config).unwrap_or_default();
     tracing::info!(
-        "Loading quantized MLX Qwen3 MoE (group_size={}, bits={})",
+        "Loading quantized MLX Mixtral (group_size={}, bits={})",
         qc.group_size,
         qc.bits
     );
 
-    let model = MlxQuantizedQwen3MoeForCausalLM::load(model_dir, &moe_config, &qc, dtype)?;
+    let model = MlxQuantizedMixtralForCausalLM::load(model_dir, &mixtral_config, &qc, dtype)?;
     Ok(Box::new(model))
 }
 
@@ -905,26 +745,23 @@ pub fn create_mlx_quantized_qwen3_moe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn test_config() -> MlxQwen3MoeConfig {
-        MlxQwen3MoeConfig {
+
+    fn test_config() -> MlxMixtralConfig {
+        MlxMixtralConfig {
             hidden_size: 32,
             num_attention_heads: 4,
             num_kv_heads: 2,
-            num_hidden_layers: 4,
+            num_hidden_layers: 2,
             intermediate_size: 64,
             vocab_size: 100,
             max_position_embeddings: 128,
             rms_norm_eps: 1e-5,
-            rope_theta: 10000.0,
+            rope_theta: 1000000.0,
             head_dim: 8,
             tie_word_embeddings: true,
-            num_experts: 4,
+            sliding_window: Some(4096),
+            num_local_experts: 4,
             num_experts_per_tok: 2,
-            moe_intermediate_size: 32,
-            shared_expert_intermediate_size: 48,
-            norm_topk_prob: true,
-            decoder_sparse_step: 2,
-            mlp_only_layers: vec![],
         }
     }
 
@@ -932,49 +769,34 @@ mod tests {
     fn test_config_from_hf() {
         let hf_config: HfModelConfig = serde_json::from_str(
             r#"{
-                "architectures": ["Qwen3MoeForCausalLM"],
-                "hidden_size": 2048,
-                "num_attention_heads": 16,
-                "num_key_value_heads": 4,
-                "num_hidden_layers": 24,
-                "intermediate_size": 8192,
-                "vocab_size": 151936,
-                "rms_norm_eps": 1e-6,
+                "architectures": ["MixtralForCausalLM"],
+                "hidden_size": 4096,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "num_hidden_layers": 32,
+                "intermediate_size": 14336,
+                "vocab_size": 32000,
+                "rms_norm_eps": 1e-5,
                 "rope_theta": 1000000.0,
-                "num_experts": 64,
-                "num_experts_per_tok": 8,
-                "moe_intermediate_size": 1408,
-                "shared_expert_intermediate_size": 5632,
-                "norm_topk_prob": true,
-                "decoder_sparse_step": 2,
-                "mlp_only_layers": [0]
+                "sliding_window": 4096,
+                "num_local_experts": 8,
+                "num_experts_per_tok": 2
             }"#,
         )
         .unwrap();
 
-        let config = MlxQwen3MoeConfig::from_hf_config(&hf_config).unwrap();
-        assert_eq!(config.hidden_size, 2048);
-        assert_eq!(config.num_experts, 64);
-        assert_eq!(config.num_experts_per_tok, 8);
-        assert_eq!(config.moe_intermediate_size, 1408);
-        assert_eq!(config.shared_expert_intermediate_size, 5632);
-        assert_eq!(config.decoder_sparse_step, 2);
-        assert_eq!(config.mlp_only_layers, vec![0]);
-    }
-
-    #[test]
-    fn test_is_moe_layer() {
-        let config = test_config();
-        assert!(!config.is_moe_layer(0));
-        assert!(config.is_moe_layer(1));
-        assert!(!config.is_moe_layer(2));
-        assert!(config.is_moe_layer(3));
+        let config = MlxMixtralConfig::from_hf_config(&hf_config).unwrap();
+        assert_eq!(config.hidden_size, 4096);
+        assert_eq!(config.num_local_experts, 8);
+        assert_eq!(config.num_experts_per_tok, 2);
+        assert_eq!(config.intermediate_size, 14336);
+        assert_eq!(config.sliding_window, Some(4096));
     }
 
     #[test]
     fn test_moe_forward() {
         let config = test_config();
-        let mut moe = MlxQwen3MoeMoE::new(&config).unwrap();
+        let mut moe = MlxMixtralMoE::new(&config).unwrap();
         let x = mlx_rs::ops::ones::<f32>(&[2, config.hidden_size as i32]).unwrap();
         let out = moe.forward(&x).unwrap();
         out.eval().unwrap();
@@ -984,13 +806,12 @@ mod tests {
     #[test]
     fn test_float_model_forward() {
         let config = test_config();
-        // Build model with default init.
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for i in 0..config.num_hidden_layers {
-            layers.push(MlxQwen3MoeDecoderLayer::new(&config, i).unwrap());
+        for _ in 0..config.num_hidden_layers {
+            layers.push(MlxMixtralDecoderLayer::new(&config).unwrap());
         }
 
-        let model_inner = MlxQwen3MoeForCausalLM {
+        let model_inner = MlxMixtralForCausalLM {
             embed_tokens: nn::Embedding::new(config.vocab_size as i32, config.hidden_size as i32)
                 .unwrap(),
             layers,

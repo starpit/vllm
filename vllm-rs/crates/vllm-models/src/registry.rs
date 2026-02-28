@@ -76,6 +76,8 @@ impl ModelRegistry {
         self.register("Qwen3MoeForCausalLM", crate::qwen3_moe::create_qwen3_moe);
         // Qwen2 MoE — same architecture as Qwen3 MoE (with QKV bias instead of QK norms)
         self.register("Qwen2MoeForCausalLM", crate::qwen3_moe::create_qwen3_moe);
+        // Mixtral — LLaMA-like attention + MoE (all layers), no shared expert
+        self.register("MixtralForCausalLM", crate::mixtral::create_mixtral);
         // Command R (Cohere) — CohereLayerNorm, parallel attn+MLP, logit scaling,
         // interleaved RoPE
         self.register("CohereForCausalLM", crate::commandr::create_commandr);

@@ -127,6 +127,13 @@ impl MlxModelRegistry {
         // interleaved RoPE
         registry.register("CohereForCausalLM", commandr::create_mlx_commandr);
         registry.register_quantized("CohereForCausalLM", commandr::create_mlx_quantized_commandr);
+        // Kimi K2.5 — text backbone is DeepSeek V2/V3 (K2.5 factories strip
+        // "language_model." weight prefix)
+        registry.register("KimiK25ForCausalLM", deepseek_v2::create_mlx_kimi_k25);
+        registry.register_quantized(
+            "KimiK25ForCausalLM",
+            deepseek_v2::create_mlx_quantized_kimi_k25,
+        );
         registry
     }
 

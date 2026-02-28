@@ -2,7 +2,7 @@
 
 ## Implementation Progress
 
-> **Last updated**: 2026-02-28 (MLX quantized DeepSeek V2 support)
+> **Last updated**: 2026-02-28 (Kimi K2.5 text-only support)
 
 | Phase | Status | Details |
 |-------|--------|---------|
@@ -60,7 +60,8 @@
 | **8b+. Chat template pycompat** | **DONE** | Added `minijinja-contrib` with `pycompat` feature — enables Python string methods (`startswith`, `endswith`, `split`, `strip`, `lower`, `upper`, `join`, `replace`) and dict/list methods (`get`, `items`, `keys`, `values`, `count`) in HF Jinja2 chat templates. Fixes Qwen3 and other models whose templates use Python-native string methods. |
 | **10f. MLX quantized DeepSeek V2** | **DONE** | Quantized MLA attention (`nn::QuantizedLinear` projections, float norms/RoPE), quantized MoE (float gate, fused 3D `switch_mlp` tensors sliced per-expert, `MlxQuantizedLlamaMLP` experts), `MlxQuantizedDeepSeekV2ForCausalLM` with `MlxEmbedTokens`/`MlxLmHead` auto-detect. `register_quantized("DeepseekV2ForCausalLM", ...)`. E2E tests enabled. (701 + 53 E2E tests) |
 | **6g. Qwen3 MoE / Qwen2 MoE** | **DONE** | Candle + MLX (float + quantized). MoE routing (gate → softmax → top-k) + sigmoid-gated shared expert. `decoder_sparse_step` + `mlp_only_layers` for dense/MoE layer selection. Reuses `LlamaAttention`/`LlamaMLP` for attention and experts. `MlxGate` enum auto-detects quantized vs float router gates with bit-width inference from packed weight shapes. Both `Qwen3MoeForCausalLM` and `Qwen2MoeForCausalLM` registered. 12 unit + 4 E2E tests. |
-| **E0. E2E test infrastructure** | **DONE** | New `vllm-e2e` crate with `TestServer` (spawns `vllm serve` child process, random port, health-check polling, kill-on-drop), `Client` (reqwest wrapper with typed chat/completion/stream methods, SSE parsing), assertion helpers (`assert_valid_chat_response`, `assert_valid_stream`, `assert_coherent_text`, etc.), `TestModels` constants (Tier 1–4 models). Feature-gated (`--features e2e`) + `#[ignore]`. 56 E2E tests across 3 test files (E1 basic serving, E2 chat completions, E3 streaming). All 56 passing on MLX backend. |
+| **10g. Kimi K2.5 text-only** | **DONE** | `KimiK25ForCausalLM` → DeepSeek V2 alias (candle + MLX float + quantized). `HfModelConfig::resolve_text_config()` unwraps composite `kimi_k25` configs (text_config extraction). `ModelWeights::strip_prefix()` for `language_model.` weight prefix. MLX `create_mlx_kimi_k25` / `create_mlx_quantized_kimi_k25` factories with prefix stripping. `KimiK2ToolParser` (non-streaming + streaming) for `<\|tool_calls_section_begin\|>` format; registered as `"kimi_k2"`. `TestServerBuilder::with_tool_call_parser()` for E2E. 15 unit + 5 E2E tests. |
+| **E0. E2E test infrastructure** | **DONE** | New `vllm-e2e` crate with `TestServer` (in-process stack via `initialize_stack()`, random port, health-check polling, kill-on-drop, `with_tool_call_parser()`), `Client` (reqwest wrapper with typed chat/completion/stream methods, SSE parsing), assertion helpers. Feature-gated (`--features e2e`) + `#[ignore]`. 61 E2E tests across 4 test files (E1 basic serving, E2 chat completions, E3 streaming, E5 kimi_k2 tool parser). All 61 passing on MLX backend. |
 | 9c. Metal Tier 2 (legacy candle) | Superseded | Custom MSL fused kernels approach superseded by MLX backend. Use `--features candle-metal` for legacy path |
 | 9d. Metal Tier 3 | Partially superseded | UMA-aware KV cache, memory pressure handling. Zero-copy weight loading and quantization are handled natively by MLX backend (Phase 10d) |
 

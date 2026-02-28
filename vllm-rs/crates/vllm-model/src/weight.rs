@@ -291,6 +291,22 @@ impl ModelWeights {
             .sum()
     }
 
+    /// Strip a prefix from all tensor names, keeping only matching tensors.
+    ///
+    /// Used for composite models (e.g. Kimi K2.5) where the text backbone
+    /// weights are stored under a prefix like `language_model.`.
+    pub fn strip_prefix(&mut self, prefix: &str) {
+        let stripped: HashMap<String, Tensor> = self
+            .tensors
+            .drain()
+            .filter_map(|(name, tensor)| {
+                name.strip_prefix(prefix)
+                    .map(|rest| (rest.to_string(), tensor))
+            })
+            .collect();
+        self.tensors = stripped;
+    }
+
     /// Remove a tensor from the loaded set (e.g., after loading into a layer).
     pub fn take(&mut self, name: &str) -> ModelResult<Tensor> {
         self.tensors
@@ -405,6 +421,31 @@ impl HfModelConfig {
     /// Effective norm epsilon.
     pub fn norm_eps(&self) -> f64 {
         self.rms_norm_eps.or(self.layer_norm_eps).unwrap_or(1e-5)
+    }
+
+    /// For composite models (e.g. vision-language models like Kimi K2.5),
+    /// extract the text sub-config.
+    ///
+    /// Returns `Some((text_config, weight_prefix_to_strip))` if this is a
+    /// composite model whose text backbone is a supported architecture.
+    /// Returns `None` for non-composite models.
+    ///
+    /// The `weight_prefix_to_strip` should be stripped from safetensors weight
+    /// names to make them match the expected format for the underlying model.
+    pub fn resolve_text_config(&self) -> Option<(Self, &'static str)> {
+        match self.model_type.as_deref() {
+            Some("kimi_k25") => {
+                let text_config_val = self.extra.get("text_config")?;
+                let mut cfg: Self = serde_json::from_value(text_config_val.clone()).ok()?;
+                // The text sub-config may not have architectures; preserve the
+                // original so the registry lookup uses "KimiK25ForCausalLM".
+                if cfg.architectures.is_empty() {
+                    cfg.architectures = self.architectures.clone();
+                }
+                Some((cfg, "language_model."))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -800,6 +841,75 @@ mod tests {
         assert_eq!(config.head_dim(), None);
         assert_eq!(config.num_kv_heads(), None);
         assert!((config.norm_eps() - 1e-5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_resolve_text_config_kimi_k25() {
+        let config_json = r#"{
+            "architectures": ["KimiK25ForCausalLM"],
+            "model_type": "kimi_k25",
+            "text_config": {
+                "model_type": "deepseek_v2",
+                "hidden_size": 7168,
+                "num_attention_heads": 128,
+                "num_hidden_layers": 61,
+                "vocab_size": 129280,
+                "rms_norm_eps": 1e-6
+            },
+            "vision_config": {
+                "image_size": 384
+            }
+        }"#;
+        let config: HfModelConfig = serde_json::from_str(config_json).unwrap();
+        let result = config.resolve_text_config();
+        assert!(result.is_some());
+
+        let (text_cfg, prefix) = result.unwrap();
+        assert_eq!(prefix, "language_model.");
+        assert_eq!(text_cfg.model_type, Some("deepseek_v2".to_string()));
+        assert_eq!(text_cfg.hidden_size, Some(7168));
+        assert_eq!(text_cfg.num_hidden_layers, Some(61));
+        // Architectures should be preserved from outer config.
+        assert_eq!(text_cfg.architectures, vec!["KimiK25ForCausalLM"]);
+    }
+
+    #[test]
+    fn test_resolve_text_config_non_composite() {
+        let config_json = r#"{
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 4096
+        }"#;
+        let config: HfModelConfig = serde_json::from_str(config_json).unwrap();
+        assert!(config.resolve_text_config().is_none());
+    }
+
+    #[test]
+    fn test_model_weights_strip_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+
+        let data1: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let data2: Vec<u8> = [3.0f32, 4.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let data3: Vec<u8> = [5.0f32, 6.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        create_safetensors_file(
+            &path,
+            &[
+                ("language_model.model.weight", vec![2], DType::F32, &data1),
+                ("language_model.lm_head.weight", vec![2], DType::F32, &data2),
+                ("vision_tower.proj.weight", vec![2], DType::F32, &data3),
+            ],
+        );
+
+        let mut weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
+        assert_eq!(weights.len(), 3);
+
+        weights.strip_prefix("language_model.");
+        assert_eq!(weights.len(), 2);
+        assert!(weights.contains("model.weight"));
+        assert!(weights.contains("lm_head.weight"));
+        assert!(!weights.contains("vision_tower.proj.weight"));
     }
 
     #[test]

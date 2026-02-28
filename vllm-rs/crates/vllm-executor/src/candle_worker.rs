@@ -615,6 +615,17 @@ impl Worker for CandleWorker {
         let hf_config = HfModelConfig::from_dir(&model_dir)
             .map_err(|e| ExecutorError::WorkerInit(format!("failed to parse config.json: {e}")))?;
 
+        // Unwrap composite models (e.g. Kimi K2.5 → text_config).
+        let (hf_config, weight_prefix) = match hf_config.resolve_text_config() {
+            Some((text_cfg, prefix)) => {
+                info!(
+                    "CandleWorker: composite model detected, unwrapping text config (strip prefix: {prefix})"
+                );
+                (text_cfg, Some(prefix))
+            }
+            None => (hf_config, None),
+        };
+
         // Resolve "auto" dtype: read torch_dtype from config.json, fall back to F16.
         let dtype = if let Some(dt) = explicit_dtype {
             dt
@@ -648,8 +659,17 @@ impl Worker for CandleWorker {
         })?;
 
         // 4. Load weights.
-        let weights = ModelWeights::from_dir(&model_dir, &device)
+        let mut weights = ModelWeights::from_dir(&model_dir, &device)
             .map_err(|e| ExecutorError::WorkerInit(format!("failed to load weights: {e}")))?;
+        // Strip weight name prefix for composite models (e.g. "language_model." for K2.5).
+        if let Some(prefix) = weight_prefix {
+            let before = weights.len();
+            weights.strip_prefix(prefix);
+            info!(
+                "CandleWorker: stripped prefix \"{prefix}\" from weights ({before} → {} tensors)",
+                weights.len()
+            );
+        }
         info!(
             "CandleWorker: loaded {} tensors ({:.1} MB)",
             weights.names().len(),

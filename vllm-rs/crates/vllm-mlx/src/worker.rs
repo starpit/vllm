@@ -396,6 +396,17 @@ impl Worker for MlxWorker {
         let hf_config = HfModelConfig::from_dir(&model_dir)
             .map_err(|e| ExecutorError::WorkerInit(format!("failed to parse config.json: {e}")))?;
 
+        // Unwrap composite models (e.g. Kimi K2.5 → text_config).
+        let hf_config = match hf_config.resolve_text_config() {
+            Some((text_cfg, prefix)) => {
+                info!(
+                    "MlxWorker: composite model detected, unwrapping text config (strip prefix: {prefix})"
+                );
+                text_cfg
+            }
+            None => hf_config,
+        };
+
         // Resolve dtype.
         let dtype = if let Some(dt) = explicit_dtype {
             dt

@@ -76,6 +76,9 @@ impl ModelRegistry {
         // Command R (Cohere) — CohereLayerNorm, parallel attn+MLP, logit scaling,
         // interleaved RoPE
         self.register("CohereForCausalLM", crate::commandr::create_commandr);
+        // Kimi K2.5 — text backbone is DeepSeek V2/V3 (config unwrapped + weights
+        // prefix-stripped by worker before calling factory)
+        self.register("KimiK25ForCausalLM", crate::deepseek_v2::create_deepseek_v2);
 
         // --- GGUF factories (keyed by GGUF general.architecture value) ---
         self.register_gguf("llama", crate::quantized_llama::create_llama_gguf);

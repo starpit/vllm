@@ -739,6 +739,320 @@ pub fn partial_json_parse(input: &str) -> Option<serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Kimi K2 tool parser
+// ---------------------------------------------------------------------------
+
+/// Markers for Kimi K2 tool call format.
+const KIMI_SECTION_BEGIN: &str = "<|tool_calls_section_begin|>";
+const KIMI_SECTION_BEGIN_SINGULAR: &str = "<|tool_call_section_begin|>";
+const KIMI_SECTION_END: &str = "<|tool_calls_section_end|>";
+const KIMI_SECTION_END_SINGULAR: &str = "<|tool_call_section_end|>";
+const KIMI_CALL_BEGIN: &str = "<|tool_call_begin|>";
+const KIMI_CALL_ARG_BEGIN: &str = "<|tool_call_argument_begin|>";
+const KIMI_CALL_END: &str = "<|tool_call_end|>";
+
+/// Kimi K2-style tool call parser.
+///
+/// Format:
+/// ```text
+/// <|tool_calls_section_begin|>
+/// <|tool_call_begin|> functions.get_weather:0 <|tool_call_argument_begin|> {"city": "SF"} <|tool_call_end|>
+/// <|tool_calls_section_end|>
+/// ```
+#[derive(Default)]
+pub struct KimiK2ToolParser;
+
+impl KimiK2ToolParser {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ToolCallParser for KimiK2ToolParser {
+    fn extract_tool_calls(&self, model_output: &str) -> ExtractedToolCallInfo {
+        kimi_k2_extract(model_output)
+    }
+
+    fn create_streaming_state(&self) -> Box<dyn StreamingToolParserState + Send> {
+        Box::new(KimiK2StreamingState::new())
+    }
+}
+
+/// Extract the content before the tool calls section.
+fn kimi_k2_find_section_start(text: &str) -> Option<usize> {
+    text.find(KIMI_SECTION_BEGIN)
+        .or_else(|| text.find(KIMI_SECTION_BEGIN_SINGULAR))
+}
+
+/// Parse a Kimi K2 tool call ID into a function name.
+///
+/// `functions.get_weather:0` → `get_weather`
+fn kimi_k2_parse_function_name(tool_call_id: &str) -> String {
+    let name_part = tool_call_id
+        .rsplit_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(tool_call_id);
+    name_part
+        .rsplit_once('.')
+        .map(|(_, name)| name)
+        .unwrap_or(name_part)
+        .to_string()
+}
+
+/// Extract tool calls from Kimi K2-formatted text.
+fn kimi_k2_extract(text: &str) -> ExtractedToolCallInfo {
+    let section_start = match kimi_k2_find_section_start(text) {
+        Some(pos) => pos,
+        None => {
+            return ExtractedToolCallInfo {
+                tools_called: false,
+                tool_calls: Vec::new(),
+                content: Some(text.to_string()),
+            };
+        }
+    };
+
+    let content_before = text[..section_start].trim();
+    let content = if content_before.is_empty() {
+        None
+    } else {
+        Some(content_before.to_string())
+    };
+
+    // Extract individual tool calls using the markers.
+    let mut tool_calls = Vec::new();
+    let mut search_pos = section_start;
+
+    while let Some(call_begin) = text[search_pos..].find(KIMI_CALL_BEGIN) {
+        let call_begin = search_pos + call_begin + KIMI_CALL_BEGIN.len();
+
+        // Find the argument section.
+        let arg_begin = match text[call_begin..].find(KIMI_CALL_ARG_BEGIN) {
+            Some(pos) => call_begin + pos,
+            None => break,
+        };
+        let tool_call_id = text[call_begin..arg_begin].trim();
+        let args_start = arg_begin + KIMI_CALL_ARG_BEGIN.len();
+
+        // Find the end of this tool call.
+        let call_end = text[args_start..]
+            .find(KIMI_CALL_END)
+            .map(|p| args_start + p)
+            .unwrap_or(text.len());
+        let args_str = text[args_start..call_end].trim();
+
+        let function_name = kimi_k2_parse_function_name(tool_call_id);
+
+        // Validate JSON arguments.
+        if serde_json::from_str::<serde_json::Value>(args_str).is_ok() {
+            tool_calls.push(protocol::ToolCall {
+                id: format!("call_{}", Uuid::new_v4().simple()),
+                call_type: "function".to_string(),
+                function: protocol::FunctionCall {
+                    name: function_name,
+                    arguments: args_str.to_string(),
+                },
+            });
+        }
+
+        search_pos = if call_end < text.len() {
+            call_end + KIMI_CALL_END.len()
+        } else {
+            text.len()
+        };
+    }
+
+    if tool_calls.is_empty() {
+        ExtractedToolCallInfo {
+            tools_called: false,
+            tool_calls: Vec::new(),
+            content: Some(text.to_string()),
+        }
+    } else {
+        ExtractedToolCallInfo {
+            tools_called: true,
+            tool_calls,
+            content,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kimi K2 streaming state machine
+// ---------------------------------------------------------------------------
+
+struct KimiK2StreamingState {
+    /// Whether we're inside a tool_calls_section.
+    in_tool_section: bool,
+    /// Current tool call index (-1 = no tool call started).
+    current_tool_id: i32,
+    /// Whether the name for the current tool has been sent.
+    current_tool_name_sent: bool,
+    /// Streamed argument characters for each tool call.
+    streamed_args_for_tool: Vec<String>,
+    /// Buffer for partial tag tokens.
+    buffer: String,
+    /// Number of tool_call_begin tags seen.
+    num_call_begins: usize,
+    /// Number of tool_call_end tags seen.
+    num_call_ends: usize,
+}
+
+impl KimiK2StreamingState {
+    fn new() -> Self {
+        Self {
+            in_tool_section: false,
+            current_tool_id: -1,
+            current_tool_name_sent: false,
+            streamed_args_for_tool: Vec::new(),
+            buffer: String::new(),
+            num_call_begins: 0,
+            num_call_ends: 0,
+        }
+    }
+}
+
+/// Check if text ends with a partial Kimi K2 tag.
+fn is_partial_kimi_tag(text: &str) -> bool {
+    for tag in [
+        KIMI_SECTION_BEGIN,
+        KIMI_SECTION_BEGIN_SINGULAR,
+        KIMI_SECTION_END,
+        KIMI_SECTION_END_SINGULAR,
+        KIMI_CALL_BEGIN,
+        KIMI_CALL_ARG_BEGIN,
+        KIMI_CALL_END,
+    ] {
+        for i in 1..tag.len() {
+            if text.ends_with(&tag[..i]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+impl StreamingToolParserState for KimiK2StreamingState {
+    fn process_delta(
+        &mut self,
+        _previous_text: &str,
+        current_text: &str,
+        delta_text: &str,
+    ) -> ToolParserDelta {
+        self.buffer.push_str(delta_text);
+
+        // Wait for more tokens if we might be in a partial tag.
+        if is_partial_kimi_tag(&self.buffer) {
+            return ToolParserDelta::None;
+        }
+
+        let text_to_process = std::mem::take(&mut self.buffer);
+
+        // Check if the section has started.
+        if !self.in_tool_section {
+            if current_text.contains(KIMI_SECTION_BEGIN)
+                || current_text.contains(KIMI_SECTION_BEGIN_SINGULAR)
+            {
+                self.in_tool_section = true;
+                // Emit any content before the section marker in this delta.
+                let before_marker = if let Some(pos) = text_to_process.find("<|tool_call") {
+                    &text_to_process[..pos]
+                } else {
+                    ""
+                };
+                if !before_marker.is_empty() {
+                    return ToolParserDelta::Content(before_marker.to_string());
+                }
+                return ToolParserDelta::None;
+            }
+            // No section yet — emit as content.
+            return ToolParserDelta::Content(text_to_process);
+        }
+
+        // We're inside the tool calls section.
+        // Count tool_call_begin/end tags in full text.
+        let new_begins = current_text.matches(KIMI_CALL_BEGIN).count();
+        let new_ends = current_text.matches(KIMI_CALL_END).count();
+
+        // New tool call started?
+        if new_begins > self.num_call_begins {
+            self.num_call_begins = new_begins;
+            self.current_tool_id += 1;
+            self.current_tool_name_sent = false;
+            self.streamed_args_for_tool.push(String::new());
+        }
+        self.num_call_ends = new_ends;
+
+        if self.current_tool_id < 0 {
+            return ToolParserDelta::None;
+        }
+
+        let tool_idx = self.current_tool_id as usize;
+
+        // Extract the current tool call's text from current_text.
+        // Find the Nth tool_call_begin tag.
+        let mut search = 0;
+        for _ in 0..self.num_call_begins {
+            if let Some(pos) = current_text[search..].find(KIMI_CALL_BEGIN) {
+                search = search + pos + KIMI_CALL_BEGIN.len();
+            }
+        }
+        let after_last_begin = &current_text[search..];
+
+        // Try to extract function name (before <|tool_call_argument_begin|>).
+        if !self.current_tool_name_sent
+            && let Some(arg_pos) = after_last_begin.find(KIMI_CALL_ARG_BEGIN)
+        {
+            let tool_call_id = after_last_begin[..arg_pos].trim();
+            if !tool_call_id.is_empty() {
+                let function_name = kimi_k2_parse_function_name(tool_call_id);
+                self.current_tool_name_sent = true;
+
+                return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
+                    index: tool_idx as u32,
+                    id: Some(format!("call_{}", Uuid::new_v4().simple())),
+                    call_type: Some("function".to_string()),
+                    function_name: Some(function_name),
+                    function_arguments: Some(String::new()),
+                }]);
+            }
+        }
+
+        // Stream argument diffs.
+        if self.current_tool_name_sent {
+            // Get text after <|tool_call_argument_begin|>.
+            if let Some(arg_start_pos) = after_last_begin.find(KIMI_CALL_ARG_BEGIN) {
+                let args_text_start = arg_start_pos + KIMI_CALL_ARG_BEGIN.len();
+                let args_text = if let Some(end_pos) =
+                    after_last_begin[args_text_start..].find(KIMI_CALL_END)
+                {
+                    &after_last_begin[args_text_start..args_text_start + end_pos]
+                } else {
+                    &after_last_begin[args_text_start..]
+                };
+                let args_text = args_text.trim_start();
+
+                let prev_args = &self.streamed_args_for_tool[tool_idx];
+                if args_text.len() > prev_args.len() {
+                    let diff = args_text[prev_args.len()..].to_string();
+                    self.streamed_args_for_tool[tool_idx] = args_text.to_string();
+
+                    return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
+                        index: tool_idx as u32,
+                        id: None,
+                        call_type: None,
+                        function_name: None,
+                        function_arguments: Some(diff),
+                    }]);
+                }
+            }
+        }
+
+        ToolParserDelta::None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parser registry
 // ---------------------------------------------------------------------------
 
@@ -747,6 +1061,7 @@ pub fn get_tool_parser(name: &str) -> Result<Arc<dyn ToolCallParser>, String> {
     match name {
         "hermes" => Ok(Arc::new(HermesToolParser::new())),
         "llama3_json" | "llama4_json" => Ok(Arc::new(LlamaJsonToolParser::new())),
+        "kimi_k2" => Ok(Arc::new(KimiK2ToolParser::new())),
         other => Err(format!("Unknown tool call parser: {other}")),
     }
 }
@@ -1005,7 +1320,186 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_kimi_k2() {
+        assert!(get_tool_parser("kimi_k2").is_ok());
+    }
+
+    #[test]
     fn test_registry_unknown() {
         assert!(get_tool_parser("unknown").is_err());
+    }
+
+    // -- Kimi K2 non-streaming tests --
+
+    #[test]
+    fn test_kimi_k2_single_tool_call() {
+        let parser = KimiK2ToolParser::new();
+        let output = "<|tool_calls_section_begin|>\n<|tool_call_begin|> functions.get_weather:0 <|tool_call_argument_begin|> {\"city\": \"SF\"} <|tool_call_end|>\n<|tool_calls_section_end|>";
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].function.name, "get_weather");
+        assert_eq!(
+            result.tool_calls[0].function.arguments,
+            "{\"city\": \"SF\"}"
+        );
+        assert_eq!(result.tool_calls[0].call_type, "function");
+        assert!(result.tool_calls[0].id.starts_with("call_"));
+        assert!(result.content.is_none());
+    }
+
+    #[test]
+    fn test_kimi_k2_two_tool_calls() {
+        let parser = KimiK2ToolParser::new();
+        let output = "<|tool_calls_section_begin|>\n<|tool_call_begin|> functions.search:0 <|tool_call_argument_begin|> {\"q\": \"rust\"} <|tool_call_end|>\n<|tool_call_begin|> functions.fetch:1 <|tool_call_argument_begin|> {\"url\": \"https://example.com\"} <|tool_call_end|>\n<|tool_calls_section_end|>";
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].function.name, "search");
+        assert_eq!(result.tool_calls[1].function.name, "fetch");
+    }
+
+    #[test]
+    fn test_kimi_k2_text_before_section() {
+        let parser = KimiK2ToolParser::new();
+        let output = "I'll check the weather for you.\n<|tool_calls_section_begin|>\n<|tool_call_begin|> functions.get_weather:0 <|tool_call_argument_begin|> {\"city\": \"SF\"} <|tool_call_end|>\n<|tool_calls_section_end|>";
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.content.unwrap(), "I'll check the weather for you.");
+    }
+
+    #[test]
+    fn test_kimi_k2_no_tool_call() {
+        let parser = KimiK2ToolParser::new();
+        let output = "The weather in SF is sunny and 72°F.";
+        let result = parser.extract_tool_calls(output);
+        assert!(!result.tools_called);
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.content.unwrap(), output);
+    }
+
+    #[test]
+    fn test_kimi_k2_singular_section_markers() {
+        // Support both singular and plural section markers.
+        let parser = KimiK2ToolParser::new();
+        let output = "<|tool_call_section_begin|>\n<|tool_call_begin|> functions.get_weather:0 <|tool_call_argument_begin|> {\"city\": \"SF\"} <|tool_call_end|>\n<|tool_call_section_end|>";
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn test_kimi_k2_function_name_parsing() {
+        assert_eq!(
+            kimi_k2_parse_function_name("functions.get_weather:0"),
+            "get_weather"
+        );
+        assert_eq!(kimi_k2_parse_function_name("functions.search:1"), "search");
+        assert_eq!(kimi_k2_parse_function_name("get_weather:0"), "get_weather");
+        assert_eq!(kimi_k2_parse_function_name("get_weather"), "get_weather");
+        assert_eq!(kimi_k2_parse_function_name("a.b.c:2"), "c");
+    }
+
+    // -- Kimi K2 streaming tests --
+
+    #[test]
+    fn test_kimi_k2_streaming_basic() {
+        let parser = KimiK2ToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let tokens = vec![
+            "<|tool_calls_section_begin|>",
+            "\n",
+            "<|tool_call_begin|>",
+            " functions.get_weather:0 ",
+            "<|tool_call_argument_begin|>",
+            " {\"city\":",
+            " \"SF\"}",
+            " <|tool_call_end|>",
+            "\n",
+            "<|tool_calls_section_end|>",
+        ];
+
+        let mut accumulated = String::new();
+        let mut got_name = false;
+        let mut got_args = false;
+
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            match state.process_delta(&prev, &accumulated, token) {
+                ToolParserDelta::ToolCalls(calls) => {
+                    for call in &calls {
+                        if call.function_name.is_some() {
+                            got_name = true;
+                            assert_eq!(call.function_name.as_ref().unwrap(), "get_weather");
+                            assert_eq!(call.index, 0);
+                            assert!(call.id.is_some());
+                        }
+                        if call.function_arguments.is_some()
+                            && !call.function_arguments.as_ref().unwrap().is_empty()
+                        {
+                            got_args = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(got_name, "Should have received tool name");
+        assert!(got_args, "Should have received argument fragments");
+    }
+
+    #[test]
+    fn test_kimi_k2_streaming_content_then_tool() {
+        let parser = KimiK2ToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let mut accumulated = String::new();
+        let mut got_content = false;
+        let mut got_tool = false;
+
+        // Content before tools.
+        let prev = accumulated.clone();
+        accumulated.push_str("Let me check. ");
+        match state.process_delta(&prev, &accumulated, "Let me check. ") {
+            ToolParserDelta::Content(text) => {
+                assert_eq!(text, "Let me check. ");
+                got_content = true;
+            }
+            _ => {}
+        }
+
+        // Tool section.
+        let tokens = vec![
+            "<|tool_calls_section_begin|>",
+            "\n<|tool_call_begin|>",
+            " functions.f:0 ",
+            "<|tool_call_argument_begin|>",
+            " {}",
+            " <|tool_call_end|>",
+            "\n<|tool_calls_section_end|>",
+        ];
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            match state.process_delta(&prev, &accumulated, token) {
+                ToolParserDelta::ToolCalls(calls) => {
+                    got_tool = true;
+                    for call in &calls {
+                        if let Some(name) = &call.function_name {
+                            assert_eq!(name, "f");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(got_content, "Should have received content");
+        assert!(got_tool, "Should have received tool call");
     }
 }

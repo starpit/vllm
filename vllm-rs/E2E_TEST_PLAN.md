@@ -64,6 +64,7 @@ Create `vllm-rs/crates/vllm-e2e/` — a test-only crate with:
 - **`TestServer`** helper: initializes the full stack in-process via `vllm_serve::init::initialize_stack()`, spawns the HTTP server on a random port, waits for `/health` to return 200, provides `base_url()`, aborts the server task on drop.
   ```rust
   let server = TestServer::builder("mlx-community/SmolLM-135M-Instruct-4bit")
+      .with_tool_call_parser("kimi_k2")  // optional
       .start().await?;
   let url = server.base_url(); // "http://127.0.0.1:{port}"
   // ... send requests ...
@@ -334,6 +335,11 @@ Use a model with Hermes-style tool call support (Llama-3.2-1B-Instruct or Qwen2.
 |------|-------------|
 | `test_hermes_parser_e2e` | `--tool-call-parser hermes` → extracts `<tool_call>` tags |
 | `test_llama_json_parser_e2e` | `--tool-call-parser llama3_json` → extracts raw JSON |
+| **`test_kimi_k2_server_starts`** | **DONE** — `kimi_k2` parser + SmolLM → server healthy |
+| **`test_kimi_k2_chat_with_tools`** | **DONE** — non-streaming + tools → valid response |
+| **`test_kimi_k2_chat_without_tools`** | **DONE** — non-streaming, no tools → coherent text |
+| **`test_kimi_k2_stream_with_tools`** | **DONE** — streaming + tools → valid SSE chunks |
+| **`test_kimi_k2_stream_without_tools`** | **DONE** — streaming, no tools → coherent streamed text |
 
 ### E5d. Tool message round-trip
 
@@ -540,7 +546,7 @@ Validate the server handles concurrent requests correctly.
 | E2. Chat Completions | ~30 | SmolLM-135M | Every PR | 3 min |
 | E3. Streaming | ~14 | SmolLM-135M | Every PR | 2 min |
 | E4. Text Completions | ~9 | SmolLM-135M | Every PR | 1 min |
-| E5. Tool Calling | ~18 | Llama-3.2-1B / Qwen2.5-0.5B | Every PR | 3 min |
+| E5. Tool Calling | ~23 (5 done) | SmolLM-135M / Llama-3.2-1B | Every PR | 3 min |
 | E6. Structured Output | ~14 | SmolLM-135M | Every PR | 2 min |
 | E7. Sampling Features | ~10 | SmolLM-135M | Every PR | 2 min |
 | E8. Multi-Architecture | ~18 | All tiers | PR / nightly / weekly | 5 min (Tier 1+2) |

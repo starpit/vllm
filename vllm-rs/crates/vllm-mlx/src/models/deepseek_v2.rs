@@ -1268,21 +1268,19 @@ pub struct MlxQuantizedDeepSeekV2ForCausalLM {
 }
 
 impl MlxQuantizedDeepSeekV2ForCausalLM {
-    pub fn load(
-        model_dir: &Path,
+    /// Construct a quantized DeepSeek V2 model from pre-loaded weights.
+    pub fn from_weights(
+        weights: &HashMap<String, Array>,
         config: &MlxDeepSeekV2Config,
         qc: &QuantConfig,
-        _dtype: Dtype,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let weights = load_safetensors_weights(model_dir)?;
-
         let embed_tokens =
-            MlxEmbedTokens::from_weights(&weights, "model.embed_tokens", qc.group_size, qc.bits);
+            MlxEmbedTokens::from_weights(weights, "model.embed_tokens", qc.group_size, qc.bits);
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             layers.push(MlxQuantizedDeepSeekV2DecoderLayer::from_weights(
-                &weights,
+                weights,
                 &format!("model.layers.{i}"),
                 config,
                 i,
@@ -1301,14 +1299,12 @@ impl MlxQuantizedDeepSeekV2ForCausalLM {
             None
         } else {
             Some(MlxLmHead::from_weights(
-                &weights,
+                weights,
                 "lm_head",
                 qc.group_size,
                 qc.bits,
             ))
         };
-
-        mlx_rs::transforms::eval(weights.values())?;
 
         Ok(Self {
             embed_tokens,
@@ -1318,6 +1314,18 @@ impl MlxQuantizedDeepSeekV2ForCausalLM {
             tie_word_embeddings: config.tie_word_embeddings,
             config: config.clone(),
         })
+    }
+
+    pub fn load(
+        model_dir: &Path,
+        config: &MlxDeepSeekV2Config,
+        qc: &QuantConfig,
+        _dtype: Dtype,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let weights = load_safetensors_weights(model_dir)?;
+        let model = Self::from_weights(&weights, config, qc)?;
+        mlx_rs::transforms::eval(weights.values())?;
+        Ok(model)
     }
 }
 
@@ -1365,6 +1373,66 @@ pub fn create_mlx_quantized_deepseek_v2(
         qc.bits
     );
     let model = MlxQuantizedDeepSeekV2ForCausalLM::load(model_dir, &ds_config, &qc, dtype)?;
+    Ok(Box::new(model))
+}
+
+// ---------------------------------------------------------------------------
+// Kimi K2.5 factory functions (weight prefix stripping)
+// ---------------------------------------------------------------------------
+
+/// Strip a prefix from all weight names, keeping only matching entries.
+fn strip_weight_prefix(weights: HashMap<String, Array>, prefix: &str) -> HashMap<String, Array> {
+    weights
+        .into_iter()
+        .filter_map(|(name, tensor)| {
+            name.strip_prefix(prefix)
+                .map(|rest| (rest.to_string(), tensor))
+        })
+        .collect()
+}
+
+/// Factory for Kimi K2.5 float model (MLX).
+///
+/// Loads weights with `language_model.` prefix stripped, then delegates to
+/// the standard DeepSeek V2 model construction.
+pub fn create_mlx_kimi_k25(
+    model_dir: &Path,
+    config: &HfModelConfig,
+    dtype: Dtype,
+) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
+    let ds_config = MlxDeepSeekV2Config::from_hf_config(config)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let mut model = MlxDeepSeekV2ForCausalLM::new(&ds_config)?;
+    let weights = load_safetensors_weights(model_dir)?;
+    let weights = strip_weight_prefix(weights, "language_model.");
+    model.load_weights(&weights);
+    mlx_rs::transforms::eval(weights.values())?;
+    let _ = dtype; // dtype used by lazy eval, not construction
+    Ok(Box::new(model))
+}
+
+/// Factory for Kimi K2.5 quantized model (MLX).
+///
+/// Loads weights with `language_model.` prefix stripped, then delegates to
+/// the quantized DeepSeek V2 model construction.
+pub fn create_mlx_quantized_kimi_k25(
+    model_dir: &Path,
+    config: &HfModelConfig,
+    dtype: Dtype,
+) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
+    let ds_config = MlxDeepSeekV2Config::from_hf_config(config)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let qc = QuantConfig::from_hf_config(config).unwrap_or_default();
+    tracing::info!(
+        "Loading quantized MLX Kimi K2.5 (group_size={}, bits={})",
+        qc.group_size,
+        qc.bits
+    );
+    let weights = load_safetensors_weights(model_dir)?;
+    let weights = strip_weight_prefix(weights, "language_model.");
+    let model = MlxQuantizedDeepSeekV2ForCausalLM::from_weights(&weights, &ds_config, &qc)?;
+    mlx_rs::transforms::eval(weights.values())?;
+    let _ = dtype;
     Ok(Box::new(model))
 }
 

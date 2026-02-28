@@ -33,6 +33,7 @@ impl TestServer {
             extra_args: Vec::new(),
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             port: None,
+            tool_call_parser: None,
         }
     }
 
@@ -59,6 +60,7 @@ pub struct TestServerBuilder {
     extra_args: Vec<String>,
     startup_timeout: Duration,
     port: Option<u16>,
+    tool_call_parser: Option<String>,
 }
 
 impl TestServerBuilder {
@@ -77,6 +79,12 @@ impl TestServerBuilder {
     /// Override the startup timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.startup_timeout = timeout;
+        self
+    }
+
+    /// Set the tool call parser (e.g. "hermes", "llama3_json", "kimi_k2").
+    pub fn with_tool_call_parser(mut self, parser: &str) -> Self {
+        self.tool_call_parser = Some(parser.to_string());
         self
     }
 
@@ -107,11 +115,21 @@ impl TestServerBuilder {
         };
 
         // Initialize the full stack (blocking — downloads model, loads weights).
-        let stack =
+        let mut stack =
             tokio::task::spawn_blocking(move || vllm_serve::init::initialize_stack(&config))
                 .await
                 .context("initialize_stack panicked")?
                 .context("failed to initialize stack")?;
+
+        // Configure tool call parser if requested.
+        if let Some(ref parser_name) = self.tool_call_parser {
+            let parser = vllm_serve::tool_parser::get_tool_parser(parser_name)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            Arc::get_mut(&mut stack.engine)
+                .expect("engine should not be shared yet")
+                .set_tool_parser(parser);
+            tracing::info!("Tool call parser configured: {}", parser_name);
+        }
 
         // Spawn the engine step loop.
         let _step_handle = stack.engine.spawn_step_loop();

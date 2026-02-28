@@ -70,6 +70,7 @@
 | Gemma 2 | &#x1F535; | &#x1F535; | 7 | 0 | |
 | DeepSeek V2 / V3 (MLA + MoE) | &#x1F535; | &#x1F535; | 7 | 0 | |
 | Command R (Cohere) | &#x1F535; | &#x1F535; | 8 | 0 | |
+| Kimi K2.5 (text-only, via DeepSeek V2) | &#x1F535; | &#x1F535; | 0 | 0 | |
 | Quantized LLaMA (GGUF) | &#x1F535; | &#x1F535; | 1 | 0 | |
 | Gemma 1 | &#x1F535; | &#x1F534; | — | — | P1 |
 | Qwen 1 | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -98,6 +99,7 @@
 | Solar | &#x1F535; | &#x1F534; | — | — | P1 |
 | Arctic (MoE) | &#x1F535; | &#x1F534; | — | — | P1 |
 | PLaMo | &#x1F535; | &#x1F534; | — | — | P1 |
+| Kimi Linear (KDA + MoE) | &#x1F535; | &#x1F534; | — | — | P2 |
 | Zamba 2 | &#x1F535; | &#x1F534; | — | — | P1 |
 | ~200+ other architectures | &#x1F535; | &#x1F534; | — | — | P1 |
 
@@ -125,6 +127,8 @@
 | Qwen3 MoE (float) | N/A | &#x1F535; | 4 | 0 | |
 | Quantized Qwen3 MoE (4/8-bit) | N/A | &#x1F535; | 0 | 4 | |
 | Qwen2 MoE (float + quantized) | N/A | &#x1F535; | 0 | 0 | |
+| Kimi K2.5 text-only (via DeepSeek V2) | N/A | &#x1F535; | 0 | 0 | |
+| Quantized Kimi K2.5 text-only (4-bit) | N/A | &#x1F535; | 0 | 0 | |
 
 > Python vLLM does not have an MLX backend. The Rust MLX backend is unique to the Rust port. All E2E tests use `mlx-community` models and exercise the MLX backend (`--features metal`). MLX unit tests require `--test-threads=1`.
 

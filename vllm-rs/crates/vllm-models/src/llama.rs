@@ -40,6 +40,9 @@ pub struct LlamaConfig {
     pub rope_theta: f64,
     pub head_dim: usize,
     pub tie_word_embeddings: bool,
+    /// Sliding window size for attention. When `Some(w)`, each token only
+    /// attends to the most recent `w` positions. Used by Mistral, Qwen2, etc.
+    pub sliding_window: Option<usize>,
 }
 
 impl LlamaConfig {
@@ -51,6 +54,13 @@ impl LlamaConfig {
         let num_attention_heads = config
             .num_attention_heads
             .ok_or_else(|| ModelError::Other("missing num_attention_heads".into()))?;
+
+        // Parse sliding_window from config.json extras (used by Mistral, Qwen2, Phi-3, etc.).
+        let sliding_window = config
+            .extra
+            .get("sliding_window")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         Ok(Self {
             hidden_size,
@@ -72,6 +82,7 @@ impl LlamaConfig {
                 .head_dim()
                 .unwrap_or(hidden_size / num_attention_heads),
             tie_word_embeddings: config.tie_word_embeddings.unwrap_or(false),
+            sliding_window,
         })
     }
 }
@@ -180,6 +191,7 @@ pub struct LlamaAttention {
     num_kv_heads: usize,
     head_dim: usize,
     scale: f64,
+    sliding_window: Option<usize>,
 }
 
 impl LlamaAttention {
@@ -250,6 +262,7 @@ impl LlamaAttention {
             num_kv_heads,
             head_dim,
             scale: 1.0 / (head_dim as f64).sqrt(),
+            sliding_window: config.sliding_window,
         })
     }
 
@@ -285,6 +298,7 @@ impl LlamaAttention {
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             scale: 1.0 / (config.head_dim as f64).sqrt(),
+            sliding_window: config.sliding_window,
         })
     }
 
@@ -334,7 +348,8 @@ impl LlamaAttention {
         let (q, k) = self.rotary_emb.apply(&q, &k, positions)?;
 
         // Cache-merge + attention (paged decode reads blocks directly).
-        let attn_output = attention_with_cache(&q, &k, &v, self.scale, kv_cache)?;
+        let attn_output =
+            attention_with_cache(&q, &k, &v, self.scale, kv_cache, self.sliding_window)?;
 
         // Reshape back to [num_tokens, num_q_heads * head_dim].
         let attn_output = attn_output
@@ -641,6 +656,7 @@ mod tests {
             rope_theta: 10000.0,
             head_dim: 8,
             tie_word_embeddings: false,
+            sliding_window: None,
         }
     }
 

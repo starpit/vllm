@@ -651,7 +651,7 @@ impl DeepSeekV2Attention {
         };
 
         // --- Cache + Attention ---
-        let attn_output = attention_with_cache(&q, &k, &v_padded, self.scale, kv_cache)?;
+        let attn_output = attention_with_cache(&q, &k, &v_padded, self.scale, kv_cache, None)?;
 
         // --- Slice V back to v_head_dim ---
         let attn_output = attn_output

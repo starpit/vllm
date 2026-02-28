@@ -321,7 +321,7 @@ impl CommandRAttention {
         let k = apply_interleaved_rope(&k, &self.cos, &self.sin, positions)?;
 
         // Cache-merge + attention.
-        let attn_output = attention_with_cache(&q, &k, &v, self.scale, kv_cache)?;
+        let attn_output = attention_with_cache(&q, &k, &v, self.scale, kv_cache, None)?;
 
         // Reshape back to [num_tokens, num_q_heads * head_dim].
         let attn_output = attn_output

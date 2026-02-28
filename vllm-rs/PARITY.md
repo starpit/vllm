@@ -230,10 +230,10 @@
 | FlexAttention | &#x1F535; | &#x1F534; | — | — | P1 |
 | xFormers | &#x1F535; | &#x1F534; | — | — | P1 |
 | MLA (Multi-head Latent Attention) | &#x1F535; | &#x1F535; | 4 | 0 | |
-| Sliding window attention | &#x1F535; | &#x1F534; | — | — | P4 |
+| Sliding window attention | &#x1F535; | &#x1F535; | 7 | 0 | |
 | Tree attention | &#x1F535; | &#x1F534; | — | — | P1 |
 
-> Unit counts: `block_pool.rs` (19), `free_block_queue.rs` (16), `kv_cache_manager.rs` (13), `kv_cache_block.rs` (11), `kv_block_pool.rs` (13), `attention.rs` (17), MLX `cache.rs` (1). Per-row counts reflect the primary feature each test targets; some tests cross-cut multiple rows. Total section: 90 unit tests.
+> Unit counts: `block_pool.rs` (19), `free_block_queue.rs` (16), `kv_cache_manager.rs` (13), `kv_cache_block.rs` (11), `kv_block_pool.rs` (13), `attention.rs` (24), MLX `cache.rs` (1). Per-row counts reflect the primary feature each test targets; some tests cross-cut multiple rows. Total section: 97 unit tests.
 
 ---
 

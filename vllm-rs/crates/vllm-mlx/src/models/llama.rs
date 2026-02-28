@@ -17,6 +17,7 @@ use mlx_rs::error::Exception;
 use mlx_rs::module::{Module, Param};
 use mlx_rs::nn;
 use mlx_rs::ops::concatenate_axis;
+use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
 use crate::cache::MlxKvCache;
@@ -40,6 +41,9 @@ pub struct LlamaConfig {
     pub rope_theta: f32,
     pub head_dim: usize,
     pub tie_word_embeddings: bool,
+    /// Sliding window size for attention. When `Some(w)`, each token only
+    /// attends to the most recent `w` positions. Used by Mistral, Qwen2, etc.
+    pub sliding_window: Option<usize>,
 }
 
 impl LlamaConfig {
@@ -51,6 +55,13 @@ impl LlamaConfig {
         let num_attention_heads = config
             .num_attention_heads
             .ok_or_else(|| "missing num_attention_heads".to_string())?;
+
+        // Parse sliding_window from config.json extras (used by Mistral, Qwen2, Phi-3, etc.).
+        let sliding_window = config
+            .extra
+            .get("sliding_window")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         Ok(Self {
             hidden_size,
@@ -72,6 +83,7 @@ impl LlamaConfig {
                 .head_dim()
                 .unwrap_or(hidden_size / num_attention_heads),
             tie_word_embeddings: config.tie_word_embeddings.unwrap_or(false),
+            sliding_window,
         })
     }
 }
@@ -168,6 +180,7 @@ pub struct MlxLlamaAttention {
     num_kv_heads: usize,
     head_dim: usize,
     scale: f32,
+    sliding_window: Option<usize>,
 }
 
 impl MlxLlamaAttention {
@@ -197,6 +210,7 @@ impl MlxLlamaAttention {
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
+            sliding_window: config.sliding_window,
         })
     }
 
@@ -308,7 +322,22 @@ impl MlxLlamaAttention {
             k = concatenate_axis(&[ck, k], 2)?; // concat along seq dim
             v = concatenate_axis(&[cv, v], 2)?;
         }
+        // Store the full cache (for future steps).
         *cache = Some((k.clone(), v.clone()));
+
+        // Sliding window: trim K/V to only the last `w` positions.
+        // The stored cache remains full (future tokens may still be in window),
+        // but we only attend to the windowed subset.
+        if let Some(w) = self.sliding_window {
+            let kv_len = k.dim(2) as usize;
+            if kv_len > w {
+                let start = (kv_len - w) as i32;
+                let end = kv_len as i32;
+                // k, v shape: [1, heads, kv_len, head_dim]
+                k = k.try_index((.., .., start..end, ..))?;
+                v = v.try_index((.., .., start..end, ..))?;
+            }
+        }
 
         // Fused SDPA (single Metal kernel for decode when q_len=1).
         let mask = if seq_len > 1 {
@@ -570,6 +599,7 @@ mod tests {
             rope_theta: 10000.0,
             head_dim: 8,
             tie_word_embeddings: false,
+            sliding_window: None,
         }
     }
 

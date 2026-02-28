@@ -14,12 +14,14 @@ use vllm_model::error::ModelError;
 
 use crate::{LayerKvHandle, PagedKvBlockRefs};
 
-/// Compute scaled dot-product attention.
+/// Compute scaled dot-product attention with optional sliding window.
 ///
 /// * `q` — queries, shape `[q_len, num_q_heads, head_dim]`
 /// * `k` — keys, shape `[kv_len, num_kv_heads, head_dim]`
 /// * `v` — values, shape `[kv_len, num_kv_heads, head_dim]`
 /// * `scale` — attention scaling factor (typically `1 / sqrt(head_dim)`)
+/// * `sliding_window` — if `Some(w)`, each query attends only to the most
+///   recent `w` KV positions (plus itself). `None` means full attention.
 ///
 /// Returns attention output of shape `[q_len, num_q_heads, head_dim]`.
 ///
@@ -32,6 +34,7 @@ pub fn scaled_dot_product_attention(
     k: &Tensor,
     v: &Tensor,
     scale: f64,
+    sliding_window: Option<usize>,
 ) -> ModelResult<Tensor> {
     let (q_len, num_q_heads, _head_dim) = q.dims3().map_err(ModelError::Candle)?;
     let (kv_len, num_kv_heads, _head_dim_k) = k.dims3().map_err(ModelError::Candle)?;
@@ -74,13 +77,20 @@ pub fn scaled_dot_product_attention(
     let scores_scaled = (scores * scale).map_err(ModelError::Candle)?;
 
     // Apply causal mask if needed.
-    // Single-token decode (q_len == 1): the token can attend to all kv_len
-    // positions, so no masking is needed.
+    // Single-token decode (q_len == 1) with no sliding window: the token can
+    // attend to all kv_len positions, so no masking is needed.
+    // With sliding window, even single-token decode needs a mask.
     let input_dtype = scores_scaled.dtype();
+    let need_mask = q_len > 1 || sliding_window.is_some();
 
-    if q_len > 1 {
-        let mask =
-            create_causal_mask(q_len, kv_len, scores_scaled.dtype(), scores_scaled.device())?;
+    if need_mask {
+        let mask = create_causal_mask(
+            q_len,
+            kv_len,
+            sliding_window,
+            scores_scaled.dtype(),
+            scores_scaled.device(),
+        )?;
         let scores_masked = scores_scaled
             .broadcast_add(&mask)
             .map_err(ModelError::Candle)?;
@@ -104,7 +114,7 @@ pub fn scaled_dot_product_attention(
         let output = attn_weights.matmul(&v_t).map_err(ModelError::Candle)?;
         output.transpose(0, 1).map_err(ModelError::Candle)
     } else {
-        // Single token: no masking needed.
+        // Single token, no sliding window: no masking needed.
         let scores_for_softmax = if needs_upcast(input_dtype) {
             scores_scaled
                 .to_dtype(DType::F32)
@@ -156,7 +166,7 @@ fn repeat_kv(x: &Tensor, repeats: usize) -> ModelResult<Tensor> {
         .map_err(ModelError::Candle)
 }
 
-/// Create a causal attention mask.
+/// Create a causal attention mask, optionally with a sliding window.
 ///
 /// Returns a tensor of shape `[1, q_len, kv_len]`.
 ///
@@ -164,10 +174,14 @@ fn repeat_kv(x: &Tensor, repeats: usize) -> ModelResult<Tensor> {
 /// attend to KV positions `0..=(kv_len - q_len + i)`. Positions beyond
 /// that are masked with `-inf`.
 ///
+/// When `sliding_window` is `Some(w)`, positions where
+/// `kv_pos < abs_q_pos - w + 1` are also masked out.
+///
 /// When `q_len == kv_len` this produces the standard lower-triangular mask.
 fn create_causal_mask(
     q_len: usize,
     kv_len: usize,
+    sliding_window: Option<usize>,
     dtype: DType,
     device: &candle_core::Device,
 ) -> ModelResult<Tensor> {
@@ -175,8 +189,18 @@ fn create_causal_mask(
     let mut mask_data = vec![0.0f32; q_len * kv_len];
     for i in 0..q_len {
         let abs_pos = offset + i; // absolute position of query token i
+        // Causal: mask future positions.
         for j in (abs_pos + 1)..kv_len {
             mask_data[i * kv_len + j] = f32::NEG_INFINITY;
+        }
+        // Sliding window: mask positions that are too far back.
+        if let Some(w) = sliding_window
+            && abs_pos >= w
+        {
+            let cutoff = abs_pos - w + 1;
+            for j in 0..cutoff.min(kv_len) {
+                mask_data[i * kv_len + j] = f32::NEG_INFINITY;
+            }
         }
     }
     let mask = Tensor::from_slice(&mask_data, (q_len, kv_len), device)
@@ -219,6 +243,8 @@ fn softmax_last_dim(x: &Tensor) -> ModelResult<Tensor> {
 /// * `k_new` — new token K, shape `[1, num_kv_heads, head_dim]`
 /// * `v_new` — new token V, shape `[1, num_kv_heads, head_dim]`
 /// * `scale` — attention scaling factor (typically `1 / sqrt(head_dim)`)
+/// * `sliding_window` — if `Some(w)`, only attend to the most recent `w`
+///   tokens in the cache (plus the new token). Older blocks are skipped.
 ///
 /// Returns attention output of shape `[1, num_q_heads, head_dim]`.
 pub fn paged_decode_attention(
@@ -227,6 +253,7 @@ pub fn paged_decode_attention(
     k_new: &Tensor,
     v_new: &Tensor,
     scale: f64,
+    sliding_window: Option<usize>,
 ) -> ModelResult<Tensor> {
     let (_one, num_q_heads, _head_dim) = q.dims3().map_err(ModelError::Candle)?;
     let (_one2, num_kv_heads, _hd) = k_new.dims3().map_err(ModelError::Candle)?;
@@ -240,9 +267,20 @@ pub fn paged_decode_attention(
         .contiguous()
         .map_err(ModelError::Candle)?;
 
+    // Sliding window: determine which cached tokens are visible.
+    // The new token is at absolute position `num_tokens`. With window `w`,
+    // only positions `max(0, num_tokens + 1 - w)..=num_tokens` are visible.
+    let total_tokens = block_refs.num_tokens + 1; // cached + new
+    let window_start = sliding_window
+        .map(|w| total_tokens.saturating_sub(w))
+        .unwrap_or(0);
+
     // Collect partial scores from each cached block.
     let mut all_scores: Vec<Tensor> = Vec::new();
     let mut remaining = block_refs.num_tokens;
+    // Track which blocks contribute (for the weighted V sum later).
+    let mut block_contributions: Vec<(usize, usize)> = Vec::new(); // (block_idx, n_valid)
+    let mut global_pos = 0usize; // absolute position of start of current block
 
     for (i, (k_blk, _v_blk)) in block_refs
         .k_blocks
@@ -255,21 +293,31 @@ pub fn paged_decode_attention(
             break;
         }
 
-        // Narrow to valid tokens: [n, num_kv_heads, head_dim]
-        let k_valid = if n < block_refs.block_size {
-            k_blk.narrow(0, 0, n).map_err(ModelError::Candle)?
-        } else {
-            (*k_blk).clone()
-        };
+        let block_end = global_pos + n; // exclusive end of this block
+        if block_end <= window_start {
+            // Entire block is outside the sliding window — skip.
+            remaining -= n;
+            global_pos += n;
+            continue;
+        }
 
-        // GQA expand: [n, num_q_heads, head_dim]
+        // Determine the visible slice within this block.
+        let local_start = window_start.saturating_sub(global_pos);
+        let n_visible = n - local_start;
+
+        // Narrow to visible tokens: [n_visible, num_kv_heads, head_dim]
+        let k_valid = k_blk
+            .narrow(0, local_start, n_visible)
+            .map_err(ModelError::Candle)?;
+
+        // GQA expand: [n_visible, num_q_heads, head_dim]
         let k_exp = if gqa_repeats > 1 {
             repeat_kv(&k_valid, gqa_repeats)?
         } else {
             k_valid
         };
 
-        // [num_q_heads, n, head_dim] → scores = Q @ K^T → [num_q_heads, 1, n]
+        // [num_q_heads, n_visible, head_dim] → scores = Q @ K^T → [num_q_heads, 1, n_visible]
         let k_t = k_exp
             .transpose(0, 1)
             .map_err(ModelError::Candle)?
@@ -282,9 +330,10 @@ pub fn paged_decode_attention(
             .map_err(ModelError::Candle)?;
         let block_scores = q_t.matmul(&k_tr).map_err(ModelError::Candle)?;
         all_scores.push(block_scores);
+        block_contributions.push((i, n_visible));
 
         remaining -= n;
-        let _ = i; // silence unused warning
+        global_pos += n;
     }
 
     // New token scores: [1, num_kv_heads, head_dim] → expand → [num_q_heads, 1, 1]
@@ -328,22 +377,20 @@ pub fn paged_decode_attention(
         attn_weights
     };
 
-    // Weighted V sum per block.
+    // Weighted V sum per contributing block (only blocks within the window).
     let mut output_parts: Vec<Tensor> = Vec::new();
     let mut score_offset = 0usize;
-    remaining = block_refs.num_tokens;
 
-    for v_blk in &block_refs.v_blocks {
-        let n = remaining.min(block_refs.block_size);
-        if n == 0 {
-            break;
-        }
+    for &(blk_idx, n_visible) in &block_contributions {
+        let v_blk = &block_refs.v_blocks[blk_idx];
 
-        let v_valid = if n < block_refs.block_size {
-            v_blk.narrow(0, 0, n).map_err(ModelError::Candle)?
-        } else {
-            (*v_blk).clone()
-        };
+        // For the first contributing block, we may need a partial slice.
+        let blk_global_start = blk_idx * block_refs.block_size;
+        let local_start = window_start.saturating_sub(blk_global_start);
+
+        let v_valid = v_blk
+            .narrow(0, local_start, n_visible)
+            .map_err(ModelError::Candle)?;
 
         let v_exp = if gqa_repeats > 1 {
             repeat_kv(&v_valid, gqa_repeats)?
@@ -351,24 +398,23 @@ pub fn paged_decode_attention(
             v_valid
         };
 
-        // Extract weight slice: [num_q_heads, 1, n]
+        // Extract weight slice: [num_q_heads, 1, n_visible]
         let w_slice = attn_weights
-            .narrow(2, score_offset, n)
+            .narrow(2, score_offset, n_visible)
             .map_err(ModelError::Candle)?;
 
-        // V: [num_q_heads, n, head_dim]
+        // V: [num_q_heads, n_visible, head_dim]
         let v_t = v_exp
             .transpose(0, 1)
             .map_err(ModelError::Candle)?
             .contiguous()
             .map_err(ModelError::Candle)?;
 
-        // [num_q_heads, 1, n] @ [num_q_heads, n, head_dim] → [num_q_heads, 1, head_dim]
+        // [num_q_heads, 1, n_visible] @ [num_q_heads, n_visible, head_dim] → [num_q_heads, 1, head_dim]
         let partial = w_slice.matmul(&v_t).map_err(ModelError::Candle)?;
         output_parts.push(partial);
 
-        score_offset += n;
-        remaining -= n;
+        score_offset += n_visible;
     }
 
     // New token's weighted V.
@@ -414,6 +460,8 @@ pub fn paged_decode_attention(
 /// * `v_new` — new values, shape `[q_len, num_kv_heads, head_dim]`
 /// * `scale` — attention scaling factor
 /// * `kv_cache` — optional per-layer KV handle
+/// * `sliding_window` — if `Some(w)`, each query attends only to the most
+///   recent `w` KV positions. `None` means full attention.
 ///
 /// Returns attention output of shape `[q_len, num_q_heads, head_dim]`.
 pub fn attention_with_cache(
@@ -422,6 +470,7 @@ pub fn attention_with_cache(
     v_new: &Tensor,
     scale: f64,
     kv_cache: Option<LayerKvHandle<'_>>,
+    sliding_window: Option<usize>,
 ) -> ModelResult<Tensor> {
     let q_len = q.dim(0).map_err(ModelError::Candle)?;
 
@@ -435,7 +484,8 @@ pub fn attention_with_cache(
             // kernel. The current Rust per-block loop is a correct reference
             // implementation but slower than gather+single-matmul due to
             // per-block kernel dispatch overhead.
-            let output = paged_decode_attention(q, &block_refs, k_new, v_new, scale)?;
+            let output =
+                paged_decode_attention(q, &block_refs, k_new, v_new, scale, sliding_window)?;
             let k_token = k_new.squeeze(0).map_err(ModelError::Candle)?;
             let v_token = v_new.squeeze(0).map_err(ModelError::Candle)?;
             handle.store_new_token(k_token, v_token)?;
@@ -446,16 +496,36 @@ pub fn attention_with_cache(
         if let Some((cached_k, cached_v)) = handle.take_cached()? {
             let k_cat = Tensor::cat(&[&cached_k, k_new], 0).map_err(ModelError::Candle)?;
             let v_cat = Tensor::cat(&[&cached_v, v_new], 0).map_err(ModelError::Candle)?;
-            handle.store(k_cat.clone(), v_cat.clone())?;
-            scaled_dot_product_attention(q, &k_cat, &v_cat, scale)
+
+            // Sliding window: trim the cache to keep only the last `w` entries.
+            // This saves memory and ensures the SDPA mask matches the data.
+            let (k_for_attn, v_for_attn) = if let Some(w) = sliding_window {
+                let kv_len = k_cat.dim(0).map_err(ModelError::Candle)?;
+                if kv_len > w {
+                    let start = kv_len - w;
+                    let k_trimmed = k_cat.narrow(0, start, w).map_err(ModelError::Candle)?;
+                    let v_trimmed = v_cat.narrow(0, start, w).map_err(ModelError::Candle)?;
+                    // Store the full cache (tokens still in window for future steps).
+                    handle.store(k_cat, v_cat)?;
+                    (k_trimmed, v_trimmed)
+                } else {
+                    handle.store(k_cat.clone(), v_cat.clone())?;
+                    (k_cat, v_cat)
+                }
+            } else {
+                handle.store(k_cat.clone(), v_cat.clone())?;
+                (k_cat, v_cat)
+            };
+
+            scaled_dot_product_attention(q, &k_for_attn, &v_for_attn, scale, sliding_window)
         } else {
             // First call (prefill): populate the cache.
             handle.store(k_new.clone(), v_new.clone())?;
-            scaled_dot_product_attention(q, k_new, v_new, scale)
+            scaled_dot_product_attention(q, k_new, v_new, scale, sliding_window)
         }
     } else {
         // No caching requested.
-        scaled_dot_product_attention(q, k_new, v_new, scale)
+        scaled_dot_product_attention(q, k_new, v_new, scale, sliding_window)
     }
 }
 
@@ -475,7 +545,7 @@ mod tests {
         let k = Tensor::ones(&[1, 1, 4], DType::F32, &Device::Cpu).unwrap();
         let v = Tensor::new(&[[[1.0f32, 2.0, 3.0, 4.0]]], &Device::Cpu).unwrap();
 
-        let out = scaled_dot_product_attention(&q, &k, &v, 0.5).unwrap();
+        let out = scaled_dot_product_attention(&q, &k, &v, 0.5, None).unwrap();
         assert_eq!(out.dims(), &[1, 1, 4]);
 
         let vals = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -496,7 +566,7 @@ mod tests {
         let v = Tensor::ones(&[seq_len, num_heads, head_dim], DType::F32, &Device::Cpu).unwrap();
 
         let scale = 1.0 / (head_dim as f64).sqrt();
-        let out = scaled_dot_product_attention(&q, &k, &v, scale).unwrap();
+        let out = scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
         assert_eq!(out.dims(), &[seq_len, num_heads, head_dim]);
     }
 
@@ -513,14 +583,14 @@ mod tests {
         let v = Tensor::ones(&[seq_len, num_kv_heads, head_dim], DType::F32, &Device::Cpu).unwrap();
 
         let scale = 1.0 / (head_dim as f64).sqrt();
-        let out = scaled_dot_product_attention(&q, &k, &v, scale).unwrap();
+        let out = scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
         assert_eq!(out.dims(), &[seq_len, num_q_heads, head_dim]);
     }
 
     #[test]
     fn test_causal_mask_square() {
         // q_len == kv_len: standard lower-triangular mask.
-        let mask = create_causal_mask(3, 3, DType::F32, &Device::Cpu).unwrap();
+        let mask = create_causal_mask(3, 3, None, DType::F32, &Device::Cpu).unwrap();
         assert_eq!(mask.dims(), &[1, 3, 3]);
 
         let vals = mask.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
@@ -542,7 +612,7 @@ mod tests {
     fn test_causal_mask_decode() {
         // q_len=2, kv_len=5: query tokens at absolute positions 3,4.
         // Token at pos 3 attends to KV 0..=3, token at pos 4 attends to 0..=4.
-        let mask = create_causal_mask(2, 5, DType::F32, &Device::Cpu).unwrap();
+        let mask = create_causal_mask(2, 5, None, DType::F32, &Device::Cpu).unwrap();
         assert_eq!(mask.dims(), &[1, 2, 5]);
 
         let vals = mask.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
@@ -568,7 +638,7 @@ mod tests {
         let v = Tensor::ones(&[4, num_heads, head_dim], DType::F32, &Device::Cpu).unwrap();
 
         let scale = 1.0 / (head_dim as f64).sqrt();
-        let out = scaled_dot_product_attention(&q, &k, &v, scale).unwrap();
+        let out = scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
         // Output should be [1, num_heads, head_dim].
         assert_eq!(out.dims(), &[1, num_heads, head_dim]);
     }
@@ -584,7 +654,7 @@ mod tests {
         let v = Tensor::ones(&[5, num_heads, head_dim], DType::F32, &Device::Cpu).unwrap();
 
         let scale = 1.0 / (head_dim as f64).sqrt();
-        let out = scaled_dot_product_attention(&q, &k, &v, scale).unwrap();
+        let out = scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
         assert_eq!(out.dims(), &[2, num_heads, head_dim]);
     }
 
@@ -635,7 +705,7 @@ mod tests {
         let v = Tensor::ones(&[seq_len, num_heads, head_dim], DType::F16, &Device::Cpu).unwrap();
 
         let scale = 1.0 / (head_dim as f64).sqrt();
-        let out = scaled_dot_product_attention(&q, &k, &v, scale).unwrap();
+        let out = scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
         assert_eq!(out.dims(), &[seq_len, num_heads, head_dim]);
         assert_eq!(out.dtype(), DType::F16);
     }
@@ -650,7 +720,7 @@ mod tests {
         let v = Tensor::ones(&[4, num_heads, head_dim], DType::F16, &Device::Cpu).unwrap();
 
         let scale = 1.0 / (head_dim as f64).sqrt();
-        let out = scaled_dot_product_attention(&q, &k, &v, scale).unwrap();
+        let out = scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
         assert_eq!(out.dims(), &[1, num_heads, head_dim]);
         assert_eq!(out.dtype(), DType::F16);
     }
@@ -711,7 +781,7 @@ mod tests {
         // Reference: gather + standard attention.
         let k_full = Tensor::cat(&[&k_cached, &k_new], 0).unwrap();
         let v_full = Tensor::cat(&[&v_cached, &v_new], 0).unwrap();
-        let ref_out = scaled_dot_product_attention(&q, &k_full, &v_full, scale).unwrap();
+        let ref_out = scaled_dot_product_attention(&q, &k_full, &v_full, scale, None).unwrap();
 
         // Paged: put cached tokens into pool.
         let pool = make_pool_with_kv(
@@ -729,7 +799,8 @@ mod tests {
             num_tokens: 3,
             block_size,
         };
-        let paged_out = paged_decode_attention(&q, &block_refs, &k_new, &v_new, scale).unwrap();
+        let paged_out =
+            paged_decode_attention(&q, &block_refs, &k_new, &v_new, scale, None).unwrap();
 
         assert_eq!(paged_out.dims(), &[1, num_q_heads, head_dim]);
         let ref_vals = ref_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -760,7 +831,7 @@ mod tests {
         // Reference.
         let k_full = Tensor::cat(&[&k_cached, &k_new], 0).unwrap();
         let v_full = Tensor::cat(&[&v_cached, &v_new], 0).unwrap();
-        let ref_out = scaled_dot_product_attention(&q, &k_full, &v_full, scale).unwrap();
+        let ref_out = scaled_dot_product_attention(&q, &k_full, &v_full, scale, None).unwrap();
 
         // Paged.
         let pool = make_pool_with_kv(
@@ -778,7 +849,8 @@ mod tests {
             num_tokens: 6,
             block_size,
         };
-        let paged_out = paged_decode_attention(&q, &block_refs, &k_new, &v_new, scale).unwrap();
+        let paged_out =
+            paged_decode_attention(&q, &block_refs, &k_new, &v_new, scale, None).unwrap();
 
         assert_eq!(paged_out.dims(), &[1, num_q_heads, head_dim]);
         let ref_vals = ref_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -809,7 +881,7 @@ mod tests {
         // Reference.
         let k_full = Tensor::cat(&[&k_cached, &k_new], 0).unwrap();
         let v_full = Tensor::cat(&[&v_cached, &v_new], 0).unwrap();
-        let ref_out = scaled_dot_product_attention(&q, &k_full, &v_full, scale).unwrap();
+        let ref_out = scaled_dot_product_attention(&q, &k_full, &v_full, scale, None).unwrap();
 
         // Paged.
         let pool = make_pool_with_kv(
@@ -827,7 +899,8 @@ mod tests {
             num_tokens: 5,
             block_size,
         };
-        let paged_out = paged_decode_attention(&q, &block_refs, &k_new, &v_new, scale).unwrap();
+        let paged_out =
+            paged_decode_attention(&q, &block_refs, &k_new, &v_new, scale, None).unwrap();
 
         assert_eq!(paged_out.dims(), &[1, num_q_heads, head_dim]);
         let ref_vals = ref_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -870,7 +943,7 @@ mod tests {
         // Reference.
         let k_full = Tensor::cat(&[&k_cached, &k_new], 0).unwrap();
         let v_full = Tensor::cat(&[&v_cached, &v_new], 0).unwrap();
-        let ref_out = scaled_dot_product_attention(&q, &k_full, &v_full, scale).unwrap();
+        let ref_out = scaled_dot_product_attention(&q, &k_full, &v_full, scale, None).unwrap();
 
         // Paged.
         let pool = make_pool_with_kv(
@@ -888,7 +961,8 @@ mod tests {
             num_tokens: 3,
             block_size,
         };
-        let paged_out = paged_decode_attention(&q, &block_refs, &k_new, &v_new, scale).unwrap();
+        let paged_out =
+            paged_decode_attention(&q, &block_refs, &k_new, &v_new, scale, None).unwrap();
 
         assert_eq!(paged_out.dims(), &[1, num_q_heads, head_dim]);
         assert_eq!(paged_out.dtype(), DType::F16);
@@ -933,7 +1007,7 @@ mod tests {
         // Reference: standard attention.
         let k_full = Tensor::cat(&[&k_cached, &k_new], 0).unwrap();
         let v_full = Tensor::cat(&[&v_cached, &v_new], 0).unwrap();
-        let ref_out = scaled_dot_product_attention(&q, &k_full, &v_full, scale).unwrap();
+        let ref_out = scaled_dot_product_attention(&q, &k_full, &v_full, scale, None).unwrap();
 
         // Set up paged storage.
         let mut pool = make_pool_with_kv(
@@ -949,7 +1023,8 @@ mod tests {
         let mut storage = crate::KvCacheStorage::paged(&mut pool, &block_ids, 3);
         let handle = storage.layer_handle(0);
 
-        let paged_out = attention_with_cache(&q, &k_new, &v_new, scale, Some(handle)).unwrap();
+        let paged_out =
+            attention_with_cache(&q, &k_new, &v_new, scale, Some(handle), None).unwrap();
 
         // Flush pending writes.
         storage.flush().unwrap();
@@ -979,7 +1054,7 @@ mod tests {
         let v = Tensor::randn(0.0f32, 1.0, &[4, num_kv_heads, head_dim], &Device::Cpu).unwrap();
 
         // Reference: standard attention (no cache).
-        let ref_out = scaled_dot_product_attention(&q, &k, &v, scale).unwrap();
+        let ref_out = scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
 
         // Paged storage with tokens_before=0 (prefill).
         let mut pool = KvBlockPool::new(
@@ -996,7 +1071,7 @@ mod tests {
         let mut storage = crate::KvCacheStorage::paged(&mut pool, &block_ids, 0);
         let handle = storage.layer_handle(0);
 
-        let paged_out = attention_with_cache(&q, &k, &v, scale, Some(handle)).unwrap();
+        let paged_out = attention_with_cache(&q, &k, &v, scale, Some(handle), None).unwrap();
         storage.flush().unwrap();
 
         assert_eq!(paged_out.dims(), &[4, num_q_heads, head_dim]);
@@ -1008,5 +1083,291 @@ mod tests {
 
         // Verify the prefill tokens were written to the pool.
         assert_eq!(pool.tokens_stored(0), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Sliding window attention tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sliding_window_mask() {
+        // q_len=4, kv_len=4, window=2.
+        // Token at abs pos 0 can attend to [0] (window covers pos -1..0, clamped to [0]).
+        // Token at abs pos 1 can attend to [0, 1] (window covers pos 0..1).
+        // Token at abs pos 2 can attend to [1, 2] (window covers pos 1..2).
+        // Token at abs pos 3 can attend to [2, 3] (window covers pos 2..3).
+        let mask = create_causal_mask(4, 4, Some(2), DType::F32, &Device::Cpu).unwrap();
+        assert_eq!(mask.dims(), &[1, 4, 4]);
+
+        let vals = mask.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+        // Row 0 (abs pos 0): [0, -inf, -inf, -inf]
+        assert_eq!(vals[0][0], 0.0);
+        assert!(vals[0][1].is_infinite() && vals[0][1] < 0.0);
+        // Row 1 (abs pos 1): [0, 0, -inf, -inf]
+        assert_eq!(vals[1][0], 0.0);
+        assert_eq!(vals[1][1], 0.0);
+        assert!(vals[1][2].is_infinite() && vals[1][2] < 0.0);
+        // Row 2 (abs pos 2): [-inf, 0, 0, -inf] (pos 0 is outside window)
+        assert!(vals[2][0].is_infinite() && vals[2][0] < 0.0);
+        assert_eq!(vals[2][1], 0.0);
+        assert_eq!(vals[2][2], 0.0);
+        assert!(vals[2][3].is_infinite() && vals[2][3] < 0.0);
+        // Row 3 (abs pos 3): [-inf, -inf, 0, 0] (pos 0,1 are outside window)
+        assert!(vals[3][0].is_infinite() && vals[3][0] < 0.0);
+        assert!(vals[3][1].is_infinite() && vals[3][1] < 0.0);
+        assert_eq!(vals[3][2], 0.0);
+        assert_eq!(vals[3][3], 0.0);
+    }
+
+    #[test]
+    fn test_sliding_window_mask_larger_window() {
+        // Window larger than seq_len: mask should be identical to plain causal.
+        let with_window = create_causal_mask(3, 3, Some(10), DType::F32, &Device::Cpu).unwrap();
+        let without_window = create_causal_mask(3, 3, None, DType::F32, &Device::Cpu).unwrap();
+
+        let w_vals = with_window.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+        let wo_vals = without_window.squeeze(0).unwrap().to_vec2::<f32>().unwrap();
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_eq!(
+                    w_vals[i][j].is_infinite(),
+                    wo_vals[i][j].is_infinite(),
+                    "mismatch at [{i}][{j}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_attention_sliding_window_prefill() {
+        // Prefill with sliding_window: short sequences should produce same output
+        // as no window; longer sequences should differ.
+        let num_heads = 2;
+        let head_dim = 8;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        // Short sequence (len=3, window=10): within window — identical output.
+        let q = Tensor::randn(0.0f32, 1.0, &[3, num_heads, head_dim], &Device::Cpu).unwrap();
+        let k = Tensor::randn(0.0f32, 1.0, &[3, num_heads, head_dim], &Device::Cpu).unwrap();
+        let v = Tensor::randn(0.0f32, 1.0, &[3, num_heads, head_dim], &Device::Cpu).unwrap();
+
+        let out_none = scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
+        let out_large_window = scaled_dot_product_attention(&q, &k, &v, scale, Some(10)).unwrap();
+
+        let vals_none = out_none.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let vals_window = out_large_window
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (a, b) in vals_none.iter().zip(vals_window.iter()) {
+            assert!((a - b).abs() < 1e-4, "none={a}, window={b}");
+        }
+
+        // Longer sequence (len=6, window=2): output should differ because window
+        // restricts what each token can attend to.
+        let q6 = Tensor::randn(0.0f32, 1.0, &[6, num_heads, head_dim], &Device::Cpu).unwrap();
+        let k6 = Tensor::randn(0.0f32, 1.0, &[6, num_heads, head_dim], &Device::Cpu).unwrap();
+        let v6 = Tensor::randn(0.0f32, 1.0, &[6, num_heads, head_dim], &Device::Cpu).unwrap();
+
+        let out_full = scaled_dot_product_attention(&q6, &k6, &v6, scale, None).unwrap();
+        let out_sw2 = scaled_dot_product_attention(&q6, &k6, &v6, scale, Some(2)).unwrap();
+
+        // The last few tokens should differ because they can't see early tokens.
+        let vals_full = out_full.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let vals_sw2 = out_sw2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut differs = false;
+        for (a, b) in vals_full.iter().zip(vals_sw2.iter()) {
+            if (a - b).abs() > 1e-3 {
+                differs = true;
+                break;
+            }
+        }
+        assert!(
+            differs,
+            "sliding window should produce different output for long sequences"
+        );
+    }
+
+    #[test]
+    fn test_attention_sliding_window_decode() {
+        // Decode with sliding_window: single token decode with window=3 and 5 cached tokens.
+        // Only the last 3 cached + 1 new = 4 visible positions (out of 6 total).
+        let num_heads = 2;
+        let head_dim = 8;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        let q = Tensor::randn(0.0f32, 1.0, &[1, num_heads, head_dim], &Device::Cpu).unwrap();
+        let k = Tensor::randn(0.0f32, 1.0, &[6, num_heads, head_dim], &Device::Cpu).unwrap();
+        let v = Tensor::randn(0.0f32, 1.0, &[6, num_heads, head_dim], &Device::Cpu).unwrap();
+
+        let out_full = scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
+        let out_sw3 = scaled_dot_product_attention(&q, &k, &v, scale, Some(3)).unwrap();
+
+        assert_eq!(out_full.dims(), &[1, num_heads, head_dim]);
+        assert_eq!(out_sw3.dims(), &[1, num_heads, head_dim]);
+
+        // With window=3, the output should differ from full attention because
+        // early tokens are masked out.
+        let vals_full = out_full.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let vals_sw3 = out_sw3.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut differs = false;
+        for (a, b) in vals_full.iter().zip(vals_sw3.iter()) {
+            if (a - b).abs() > 1e-3 {
+                differs = true;
+                break;
+            }
+        }
+        assert!(
+            differs,
+            "sliding window decode should differ from full attention"
+        );
+    }
+
+    #[test]
+    fn test_paged_decode_attention_sliding_window() {
+        // Paged decode with sliding_window: 7 cached tokens across 2 blocks
+        // (block_size=4), window=3, + 1 new token.
+        // Total = 8 tokens, window=3 → only positions 5,6,7 visible.
+        let num_q_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 8;
+        let block_size = 4;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        let k_cached =
+            Tensor::randn(0.0f32, 1.0, &[7, num_kv_heads, head_dim], &Device::Cpu).unwrap();
+        let v_cached =
+            Tensor::randn(0.0f32, 1.0, &[7, num_kv_heads, head_dim], &Device::Cpu).unwrap();
+
+        let q = Tensor::randn(0.0f32, 1.0, &[1, num_q_heads, head_dim], &Device::Cpu).unwrap();
+        let k_new = Tensor::randn(0.0f32, 1.0, &[1, num_kv_heads, head_dim], &Device::Cpu).unwrap();
+        let v_new = Tensor::randn(0.0f32, 1.0, &[1, num_kv_heads, head_dim], &Device::Cpu).unwrap();
+
+        // Reference: gather full + SDPA with sliding window mask.
+        let k_full = Tensor::cat(&[&k_cached, &k_new], 0).unwrap();
+        let v_full = Tensor::cat(&[&v_cached, &v_new], 0).unwrap();
+        let ref_out = scaled_dot_product_attention(&q, &k_full, &v_full, scale, Some(3)).unwrap();
+
+        // Paged.
+        let pool = make_pool_with_kv(
+            7,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            DType::F32,
+            &k_cached,
+            &v_cached,
+        );
+        let block_refs = PagedKvBlockRefs {
+            k_blocks: vec![pool.k_block(0, 0), pool.k_block(0, 1)],
+            v_blocks: vec![pool.v_block(0, 0), pool.v_block(0, 1)],
+            num_tokens: 7,
+            block_size,
+        };
+        let paged_out =
+            paged_decode_attention(&q, &block_refs, &k_new, &v_new, scale, Some(3)).unwrap();
+
+        assert_eq!(paged_out.dims(), &[1, num_q_heads, head_dim]);
+        let ref_vals = ref_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let paged_vals = paged_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (r, p) in ref_vals.iter().zip(paged_vals.iter()) {
+            assert!((r - p).abs() < 1e-4, "ref={r}, paged={p}");
+        }
+
+        // Also verify it differs from no-window paged decode.
+        let paged_full =
+            paged_decode_attention(&q, &block_refs, &k_new, &v_new, scale, None).unwrap();
+        let full_vals = paged_full.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mut differs = false;
+        for (w, f) in paged_vals.iter().zip(full_vals.iter()) {
+            if (w - f).abs() > 1e-3 {
+                differs = true;
+                break;
+            }
+        }
+        assert!(
+            differs,
+            "paged sliding window should differ from full attention"
+        );
+    }
+
+    #[test]
+    fn test_attention_with_cache_sliding_window_contiguous() {
+        // Contiguous cache with sliding window: prefill 6 tokens, decode 1.
+        // Window=3 means only last 3 KV entries are attended to.
+        let num_q_heads = 2;
+        let num_kv_heads = 2;
+        let head_dim = 8;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        // Prefill: 6 tokens with sliding_window=3.
+        let q = Tensor::randn(0.0f32, 1.0, &[6, num_q_heads, head_dim], &Device::Cpu).unwrap();
+        let k = Tensor::randn(0.0f32, 1.0, &[6, num_kv_heads, head_dim], &Device::Cpu).unwrap();
+        let v = Tensor::randn(0.0f32, 1.0, &[6, num_kv_heads, head_dim], &Device::Cpu).unwrap();
+
+        let mut cache: Option<(Tensor, Tensor)> = None;
+        let handle = crate::LayerKvHandle::Contiguous(&mut cache);
+        let out = attention_with_cache(&q, &k, &v, scale, Some(handle), Some(3)).unwrap();
+        assert_eq!(out.dims(), &[6, num_q_heads, head_dim]);
+
+        // Cache should hold full 6 tokens (we store full, trim only for attention).
+        let (cached_k, _cached_v) = cache.as_ref().unwrap();
+        assert_eq!(cached_k.dim(0).unwrap(), 6);
+
+        // Decode: 1 token at position 6.
+        let q_dec = Tensor::randn(0.0f32, 1.0, &[1, num_q_heads, head_dim], &Device::Cpu).unwrap();
+        let k_dec = Tensor::randn(0.0f32, 1.0, &[1, num_kv_heads, head_dim], &Device::Cpu).unwrap();
+        let v_dec = Tensor::randn(0.0f32, 1.0, &[1, num_kv_heads, head_dim], &Device::Cpu).unwrap();
+
+        let handle = crate::LayerKvHandle::Contiguous(&mut cache);
+        let out_dec =
+            attention_with_cache(&q_dec, &k_dec, &v_dec, scale, Some(handle), Some(3)).unwrap();
+        assert_eq!(out_dec.dims(), &[1, num_q_heads, head_dim]);
+
+        // Cache should hold 7 tokens now.
+        let (cached_k, _cached_v) = cache.as_ref().unwrap();
+        assert_eq!(cached_k.dim(0).unwrap(), 7);
+    }
+
+    #[test]
+    fn test_sliding_window_config_parsing() {
+        // Verify sliding_window is parsed from config.json extras.
+        use crate::llama::LlamaConfig;
+        use vllm_model::weight::HfModelConfig;
+
+        // With sliding_window.
+        let hf_config: HfModelConfig = serde_json::from_str(
+            r#"{
+                "architectures": ["MistralForCausalLM"],
+                "hidden_size": 4096,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "num_hidden_layers": 32,
+                "intermediate_size": 14336,
+                "vocab_size": 32000,
+                "sliding_window": 4096
+            }"#,
+        )
+        .unwrap();
+
+        let config = LlamaConfig::from_hf_config(&hf_config).unwrap();
+        assert_eq!(config.sliding_window, Some(4096));
+
+        // Without sliding_window.
+        let hf_config2: HfModelConfig = serde_json::from_str(
+            r#"{
+                "architectures": ["LlamaForCausalLM"],
+                "hidden_size": 4096,
+                "num_attention_heads": 32,
+                "num_hidden_layers": 32,
+                "intermediate_size": 11008,
+                "vocab_size": 32000
+            }"#,
+        )
+        .unwrap();
+
+        let config2 = LlamaConfig::from_hf_config(&hf_config2).unwrap();
+        assert_eq!(config2.sliding_window, None);
     }
 }

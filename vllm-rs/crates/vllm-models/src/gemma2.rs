@@ -359,7 +359,7 @@ impl Gemma2Attention {
 
         // Cache-merge + attention (paged decode reads blocks directly).
         let _ = self.attn_logit_softcapping; // Reserved for GPU kernel integration
-        let attn_output = attention_with_cache(&q, &k, &v, self.scale, kv_cache)?;
+        let attn_output = attention_with_cache(&q, &k, &v, self.scale, kv_cache, None)?;
 
         let attn_output = attn_output
             .reshape((num_tokens, self.num_q_heads * self.head_dim))

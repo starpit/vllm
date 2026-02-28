@@ -21,6 +21,7 @@ use mlx_rs::error::Exception;
 use mlx_rs::module::{Module, Param};
 use mlx_rs::nn;
 use mlx_rs::ops::concatenate_axis;
+use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
 use crate::cache::MlxKvCache;
@@ -313,6 +314,7 @@ pub struct MlxQuantizedLlamaAttention {
     num_kv_heads: usize,
     head_dim: usize,
     scale: f32,
+    sliding_window: Option<usize>,
 }
 
 impl MlxQuantizedLlamaAttention {
@@ -377,6 +379,7 @@ impl MlxQuantizedLlamaAttention {
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
+            sliding_window: config.sliding_window,
         }
     }
 
@@ -432,7 +435,19 @@ impl MlxQuantizedLlamaAttention {
             k = concatenate_axis(&[ck, k], 2)?;
             v = concatenate_axis(&[cv, v], 2)?;
         }
+        // Store the full cache (for future steps).
         *cache = Some((k.clone(), v.clone()));
+
+        // Sliding window: trim K/V to only the last `w` positions.
+        if let Some(w) = self.sliding_window {
+            let kv_len = k.dim(2) as usize;
+            if kv_len > w {
+                let start = (kv_len - w) as i32;
+                let end = kv_len as i32;
+                k = k.try_index((.., .., start..end, ..))?;
+                v = v.try_index((.., .., start..end, ..))?;
+            }
+        }
 
         // Fused SDPA.
         let mask = if seq_len > 1 {
@@ -673,6 +688,7 @@ mod tests {
             rope_theta: 10000.0,
             head_dim: 8,
             tie_word_embeddings: true,
+            sliding_window: None,
         }
     }
 
@@ -736,6 +752,7 @@ mod tests {
                 num_kv_heads: config.num_kv_heads,
                 head_dim: config.head_dim,
                 scale: 1.0 / (config.head_dim as f32).sqrt(),
+                sliding_window: config.sliding_window,
             };
 
             let mlp = MlxQuantizedLlamaMLP {

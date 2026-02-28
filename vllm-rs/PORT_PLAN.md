@@ -423,6 +423,26 @@
 - `test_tokenize_completion_prompts_*` (single, multiple, token_ids, none)
 - `test_stream_delta_has_choice_index`
 
+### What was built: Sliding window attention
+
+**`vllm-models/src/attention.rs`** (1 modified file, 7 new tests):
+- `create_causal_mask()` — new `sliding_window: Option<usize>` parameter; when set, masks KV positions where `kv_pos < abs_q_pos - w + 1`
+- `scaled_dot_product_attention()` — new `sliding_window` parameter; applies mask even for single-token decode when window is set
+- `paged_decode_attention()` — new `sliding_window` parameter; skips blocks entirely outside the window, partial-reads the first contributing block
+- `attention_with_cache()` — new `sliding_window` parameter; trims contiguous KV cache to last `w` entries before SDPA while storing full cache
+
+**`vllm-models/src/llama.rs`** — `LlamaConfig.sliding_window: Option<usize>` parsed from `config.extra["sliding_window"]`; `LlamaAttention` stores and passes to `attention_with_cache()`
+
+**`vllm-models/src/quantized_llama.rs`** — `QuantizedLlamaAttention` stores and passes `sliding_window`
+
+**`vllm-mlx/src/models/llama.rs`** — `LlamaConfig.sliding_window` parsed; `MlxLlamaAttention` trims K/V via `try_index` before SDPA
+
+**`vllm-mlx/src/models/quantized_llama.rs`** — `MlxQuantizedLlamaAttention` same K/V trimming
+
+**Models without sliding window** (`gemma2.rs`, `commandr.rs`, `deepseek_v2.rs`) pass `None`.
+
+**Coverage**: Mistral, Qwen2, Phi-3 (candle), LLaMA/Mistral/Qwen2/Qwen3 (MLX float + quantized). Per-layer sliding window (Gemma2 interleaved pattern) deferred.
+
 ### Key design decisions
 - **Arena-style indices** instead of Rc/RefCell for linked list pointers (cache-friendly, no GC overhead)
 - **SmallVec<[usize; 1]>** for block hash map values (inline single-block case, heap only for duplicates)

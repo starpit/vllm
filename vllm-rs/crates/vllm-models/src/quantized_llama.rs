@@ -75,6 +75,7 @@ struct QuantizedLlamaAttention {
     num_kv_heads: usize,
     head_dim: usize,
     scale: f64,
+    sliding_window: Option<usize>,
 }
 
 /// Precompute cos/sin tables for interleaved RoPE (GGML / Cohere convention).
@@ -196,6 +197,7 @@ impl QuantizedLlamaAttention {
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
             scale: 1.0 / (config.head_dim as f64).sqrt(),
+            sliding_window: config.sliding_window,
         })
     }
 
@@ -237,7 +239,8 @@ impl QuantizedLlamaAttention {
         let k = apply_interleaved_rope(&k, &self.cos, &self.sin, positions)?;
 
         // Cache-merge + attention (paged decode reads blocks directly).
-        let attn_output = attention_with_cache(&q, &k, &v, self.scale, kv_cache)?;
+        let attn_output =
+            attention_with_cache(&q, &k, &v, self.scale, kv_cache, self.sliding_window)?;
 
         // Reshape and output projection.
         let attn_output = attn_output

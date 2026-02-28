@@ -711,6 +711,7 @@ mod tests {
             rope_theta: 10000.0,
             head_dim: 8,
             tie_word_embeddings: false,
+            sliding_window: None,
         }
     }
 

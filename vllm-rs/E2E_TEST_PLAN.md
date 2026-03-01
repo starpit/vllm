@@ -548,7 +548,7 @@ Validate the server handles concurrent requests correctly.
 
 Test file: `e_embedding.rs`
 
-Tests decoder models as embedding models via the `/v1/embeddings` endpoint. Uses last-token pooling and L2 normalization.
+Tests decoder models as embedding models via the `/v1/embeddings` endpoint. Supports last-token, mean, and CLS pooling strategies with L2 normalization. Pooling strategy is configurable via `--pooling-strategy` and auto-detected from `1_Pooling/config.json`.
 
 | Test | Model | Description |
 |------|-------|-------------|
@@ -557,10 +557,13 @@ Tests decoder models as embedding models via the `/v1/embeddings` endpoint. Uses
 | `test_embedding_dimensions` | SmolLM-135M-4bit | `dimensions: 32` → embedding truncated to 32 floats |
 | `test_embedding_normalized` | SmolLM-135M-4bit | Embedding L2 norm ≈ 1.0 |
 | `test_embedding_different_inputs` | SmolLM-135M-4bit | Two different strings → cosine similarity < 1.0 |
+| `test_embedding_mean_pooling` | SmolLM-135M-4bit | `--pooling-strategy mean` → valid normalized embedding |
+| `test_embedding_cls_pooling` | SmolLM-135M-4bit | `--pooling-strategy cls` → valid normalized embedding |
+| `test_embedding_mean_vs_last_differ` | SmolLM-135M-4bit | Mean and last pooling produce different embeddings (cosine < 1.0) |
 | `test_embedding_qwen2` | Qwen2.5-0.5B-4bit | Qwen2 arch produces valid normalized embeddings |
 | `test_embedding_llama3` | Llama-3.2-1B-4bit | LLaMA3 arch produces valid normalized embeddings |
 
-**Deliverables**: 7 E2E tests (all implemented).
+**Deliverables**: 10 E2E tests (all implemented).
 
 ---
 
@@ -597,9 +600,9 @@ Tests single-adapter LoRA support. Creates a synthetic LoRA adapter (random A/B 
 | E9. Concurrency | ~6 | SmolLM-135M | Every PR | 2 min |
 | E10. Observability | ~6 | SmolLM-135M | Every PR | 1 min |
 | E11. CLI & Config | ~10 | SmolLM-135M | Every PR | 2 min |
-| E12. Embedding | 7 (done) | SmolLM / Qwen2 / Llama3 | Every PR | 2 min |
+| E12. Embedding | 10 (done) | SmolLM / Qwen2 / Llama3 | Every PR | 2 min |
 | E13. LoRA Adapters | 4 (done) | SmolLM-135M-F16 | Every PR | <1 min |
-| **Total** | **~173** | | | **~30 min** |
+| **Total** | **~176** | | | **~30 min** |
 
 ### CI Tiers
 

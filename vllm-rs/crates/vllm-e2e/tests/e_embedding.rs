@@ -4,7 +4,7 @@
 //! Embedding endpoint E2E tests.
 //!
 //! Validates that the /v1/embeddings endpoint works with decoder models
-//! using last-token pooling and L2 normalization.
+//! using last-token, mean, and CLS pooling strategies with L2 normalization.
 //!
 //! Run with: `cargo test -p vllm-e2e --features e2e,metal --test e_embedding -- --ignored --test-threads=1`
 
@@ -143,6 +143,108 @@ async fn test_embedding_different_inputs() {
     assert!(
         cosine < 0.999,
         "Different inputs should have cosine similarity < 1.0, got {cosine}"
+    );
+}
+
+// ===========================================================================
+// Pooling strategy tests
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_embedding_mean_pooling() {
+    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+        .with_pooling_strategy("mean")
+        .start()
+        .await
+        .expect("server should start");
+
+    let client = Client::new(server.base_url());
+
+    let request = embed_request(EmbeddingInput::Single(
+        "The quick brown fox jumps over the lazy dog".to_string(),
+    ));
+    let response = client.embedding(&request).await.unwrap();
+
+    assert_eq!(response.data.len(), 1);
+    let emb = &response.data[0].embedding;
+    assert!(!emb.is_empty());
+
+    // Should be L2-normalized regardless of pooling strategy.
+    let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!(
+        (norm - 1.0).abs() < 0.01,
+        "L2 norm should be ~1.0, got {norm}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_embedding_cls_pooling() {
+    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+        .with_pooling_strategy("cls")
+        .start()
+        .await
+        .expect("server should start");
+
+    let client = Client::new(server.base_url());
+
+    let request = embed_request(EmbeddingInput::Single(
+        "The quick brown fox jumps over the lazy dog".to_string(),
+    ));
+    let response = client.embedding(&request).await.unwrap();
+
+    assert_eq!(response.data.len(), 1);
+    let emb = &response.data[0].embedding;
+    assert!(!emb.is_empty());
+
+    let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!(
+        (norm - 1.0).abs() < 0.01,
+        "L2 norm should be ~1.0, got {norm}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_embedding_mean_vs_last_differ() {
+    // Mean and last-token pooling should produce different embeddings.
+    let server_mean = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+        .with_pooling_strategy("mean")
+        .start()
+        .await
+        .expect("server should start");
+
+    let server_last = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+        .with_pooling_strategy("last")
+        .start()
+        .await
+        .expect("server should start");
+
+    let input = "Hello world, this is a test sentence.".to_string();
+
+    let resp_mean = Client::new(server_mean.base_url())
+        .embedding(&embed_request(EmbeddingInput::Single(input.clone())))
+        .await
+        .unwrap();
+    let resp_last = Client::new(server_last.base_url())
+        .embedding(&embed_request(EmbeddingInput::Single(input)))
+        .await
+        .unwrap();
+
+    let emb_mean = &resp_mean.data[0].embedding;
+    let emb_last = &resp_last.data[0].embedding;
+
+    // Same model, same input, different strategies → different embeddings.
+    assert_eq!(emb_mean.len(), emb_last.len());
+    let cosine: f32 = emb_mean
+        .iter()
+        .zip(emb_last.iter())
+        .map(|(a, b)| a * b)
+        .sum();
+    assert!(
+        cosine < 0.999,
+        "Mean and last pooling should produce different embeddings, cosine={cosine}"
     );
 }
 

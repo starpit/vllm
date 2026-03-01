@@ -50,6 +50,9 @@ pub struct MlxWorkerConfig {
 
     /// Optional path to a LoRA adapter directory (local path or HF repo ID).
     pub lora_adapter: Option<String>,
+    /// Pooling strategy for embeddings: "auto", "last", "cls", "mean".
+    /// "auto" detects from `1_Pooling/config.json`, defaults to "last".
+    pub pooling_strategy: String,
 }
 
 impl MlxWorkerConfig {
@@ -101,6 +104,9 @@ pub struct MlxWorker {
     /// Compiled vocabulary for grammar-guided decoding (built once from tokenizer).
     grammar_vocabulary: Option<outlines_core::vocabulary::Vocabulary>,
 
+    /// Resolved pooling strategy for embeddings.
+    pooling_strategy: vllm_models::embedding::PoolingStrategy,
+
     // Timing instrumentation.
     step_count: usize,
     prefill_count: usize,
@@ -125,6 +131,7 @@ impl MlxWorker {
             kv_caches: HashMap::new(),
             grammar_states: HashMap::new(),
             grammar_vocabulary: None,
+            pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
             step_count: 0,
             prefill_count: 0,
             decode_count: 0,
@@ -179,6 +186,35 @@ impl MlxWorker {
         } else {
             self.total_decode_ms / self.decode_count as f64
         }
+    }
+
+    /// Resolve the pooling strategy from config or auto-detect.
+    fn resolve_pooling_strategy(&mut self) {
+        use vllm_models::embedding::{PoolingStrategy, detect_pooling_strategy};
+
+        let strategy = match self.config.pooling_strategy.as_str() {
+            "auto" => {
+                let detected = self
+                    .model_dir
+                    .as_ref()
+                    .and_then(|dir| detect_pooling_strategy(dir));
+                if let Some(s) = detected {
+                    info!("MlxWorker: pooling strategy auto-detected: {:?}", s);
+                    s
+                } else {
+                    info!("MlxWorker: pooling strategy defaulting to Last (decoder model)");
+                    PoolingStrategy::Last
+                }
+            }
+            other => other.parse().unwrap_or_else(|_| {
+                warn!(
+                    "MlxWorker: unknown pooling strategy '{}', defaulting to Last",
+                    other
+                );
+                PoolingStrategy::Last
+            }),
+        };
+        self.pooling_strategy = strategy;
     }
 
     /// Build grammar vocabulary on demand (lazy — deferred from startup).
@@ -273,6 +309,11 @@ impl MlxWorker {
         match repo.get("tokenizer_config.json") {
             Ok(p) => info!("Downloaded tokenizer_config.json to {}", p.display()),
             Err(e) => warn!("Failed to download tokenizer_config.json: {e:?}"),
+        }
+
+        // Try to download sentence-transformers pooling config (optional).
+        if let Ok(p) = repo.get("1_Pooling/config.json") {
+            info!("Downloaded 1_Pooling/config.json to {}", p.display());
         }
 
         // Download weights.
@@ -486,6 +527,8 @@ impl Worker for MlxWorker {
                 adapter.name, adapter.config.r, adapter.config.target_modules
             );
         }
+        // Resolve pooling strategy for embeddings.
+        self.resolve_pooling_strategy();
 
         // Grammar vocabulary is built lazily on first constrained-decoding request.
 
@@ -1018,7 +1061,9 @@ impl Worker for MlxWorker {
         token_id_seqs: &[&[u32]],
     ) -> vllm_executor::error::ExecutorResult<Vec<Vec<f32>>> {
         use vllm_executor::error::ExecutorError;
+        use vllm_models::embedding::PoolingStrategy;
 
+        let strategy = self.pooling_strategy;
         let model = self
             .model
             .as_mut()
@@ -1039,12 +1084,23 @@ impl Worker for MlxWorker {
                 .hidden_states(&input_ids, &positions)
                 .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
 
-            // Pool: last token. index() returns Array directly.
-            let num_tokens = token_ids.len();
-            let last_hidden = hidden_states.index(num_tokens as i32 - 1);
+            // Pool according to strategy.
+            let num_tokens = token_ids.len() as i32;
+            let pooled = match strategy {
+                PoolingStrategy::Last => hidden_states.index(num_tokens - 1),
+                PoolingStrategy::Cls => hidden_states.index(0),
+                PoolingStrategy::Mean => {
+                    // Average across the token dimension (axis 0).
+                    let sum = hidden_states
+                        .sum_axis(0, None)
+                        .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                    sum.divide(Array::from(num_tokens as f32))
+                        .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?
+                }
+            };
 
             // L2 normalize: compute norm, divide, cast to f32.
-            let sq = last_hidden
+            let sq = pooled
                 .square()
                 .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
             let sum = sq
@@ -1053,7 +1109,7 @@ impl Worker for MlxWorker {
             let norm = sum
                 .sqrt()
                 .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
-            let normalized = last_hidden
+            let normalized = pooled
                 .divide(&norm)
                 .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
             let normalized_f32 = normalized
@@ -1105,6 +1161,7 @@ mod tests {
             cache_dir: None,
             block_size: 16,
             lora_adapter: None,
+            pooling_strategy: "auto".to_string(),
         })
     }
 
@@ -1146,6 +1203,7 @@ mod tests {
             cache_dir: None,
             block_size: 16,
             lora_adapter: None,
+            pooling_strategy: "auto".to_string(),
         };
         assert!(config.mlx_dtype().unwrap().is_none());
 

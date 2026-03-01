@@ -16,7 +16,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Start the OpenAI-compatible API server.
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
     /// Run a quick benchmark against a model.
     Bench(BenchArgs),
     /// Convert model weights between formats (stub).
@@ -106,6 +106,11 @@ pub struct ServeArgs {
     /// Path to CA certificates file for client certificate verification (PEM).
     #[arg(long)]
     pub ssl_ca_certs: Option<String>,
+
+    /// Pooling strategy for /v1/embeddings: "auto", "last", "cls", "mean".
+    /// "auto" detects from 1_Pooling/config.json, defaults to "last".
+    #[arg(long, default_value = "auto")]
+    pub pooling_strategy: String,
 
     /// Speculative decoding model. Currently only "ngram" is supported.
     /// When set, the engine proposes draft tokens from n-gram matches

@@ -61,6 +61,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         ngram_prompt_lookup_max: args.ngram_prompt_lookup_max,
         ngram_prompt_lookup_min: args.ngram_prompt_lookup_min,
         lora_adapter: args.lora_adapter.clone(),
+        pooling_strategy: args.pooling_strategy.clone(),
     };
 
     let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&config))

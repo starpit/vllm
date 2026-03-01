@@ -35,6 +35,7 @@ impl TestServer {
             port: None,
             tool_call_parser: None,
             lora_adapter: None,
+            pooling_strategy: None,
         }
     }
 
@@ -63,6 +64,7 @@ pub struct TestServerBuilder {
     port: Option<u16>,
     tool_call_parser: Option<String>,
     lora_adapter: Option<String>,
+    pooling_strategy: Option<String>,
 }
 
 impl TestServerBuilder {
@@ -96,6 +98,12 @@ impl TestServerBuilder {
         self
     }
 
+    /// Set the pooling strategy for embeddings (e.g. "mean", "cls", "last").
+    pub fn with_pooling_strategy(mut self, strategy: &str) -> Self {
+        self.pooling_strategy = Some(strategy.to_string());
+        self
+    }
+
     /// Start the server in-process and wait for it to become healthy.
     pub async fn start(self) -> Result<TestServer> {
         // Initialize tracing. Silent by default; set RUST_LOG=info to see
@@ -112,6 +120,10 @@ impl TestServerBuilder {
         let model = self.model.clone();
 
         // Build VllmConfig for the requested configuration.
+        let pooling_strategy = self
+            .pooling_strategy
+            .clone()
+            .unwrap_or_else(|| "auto".to_string());
         let config = vllm_serve::init::VllmConfig {
             model: model.clone(),
             device: "auto".to_string(),
@@ -120,6 +132,7 @@ impl TestServerBuilder {
             block_size: 16,
             gpu_memory_utilization: 0.9,
             lora_adapter: self.lora_adapter.clone(),
+            pooling_strategy,
             ..Default::default()
         };
 

@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve(args) => commands::serve::run_serve(args).await,
+        Commands::Serve(args) => commands::serve::run_serve(*args).await,
         Commands::Bench(args) => commands::bench::run_bench(args).await,
         Commands::Convert(args) => commands::convert::run_convert(args).await,
     }

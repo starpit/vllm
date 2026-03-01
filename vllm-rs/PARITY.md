@@ -1,22 +1,22 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (889 tests: 818 unit + 71 e2e, 0 clippy errors)
+> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (920 tests: 842 unit + 78 e2e, 0 clippy errors)
 
 ### Legend
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 148 |
-| &#x1F7E1; | Partially implemented | 8 |
-| &#x1F534; | Not implemented | 113 |
+| &#x1F535; | Fully implemented | 156 |
+| &#x1F7E1; | Partially implemented | 5 |
+| &#x1F534; | Not implemented | 110 |
 
 ### Priority (for incomplete features)
 
 | Priority | Meaning | Count |
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
-| **P3** | High — meaningfully expands user base or enables key use cases | 27 |
-| **P2** | Medium — useful improvement, broader coverage | 39 |
+| **P3** | High — meaningfully expands user base or enables key use cases | 22 |
+| **P2** | Medium — useful improvement, broader coverage | 38 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
 
@@ -39,7 +39,7 @@
 |---|---|---:|---:|---|
 | [Model Architectures](#model-architectures) | &#x1F535;41 &#x1F534;25 | 100 | 25 | `███░░░░░░░` 11/36 |
 | [Quantization](#quantization) | &#x1F535;2 &#x1F534;11 | 13 | 0 | `█░░░░░░░░░` 1/11 |
-| [Serving / OpenAI API](#serving--openai-api) | &#x1F535;15 &#x1F7E1;1 &#x1F534;9 | 101 | 18 | `██████░░░░` 15/24 |
+| [Serving / OpenAI API](#serving--openai-api) | &#x1F535;16 &#x1F534;9 | 101 | 18 | `██████░░░░` 16/24 |
 | [Sampling & Decoding](#sampling--decoding) | &#x1F535;19 &#x1F534;2 | 53 | 13 | `██████████` 19/19 |
 | [KV Cache & Attention](#kv-cache--attention) | &#x1F535;10 &#x1F7E1;1 &#x1F534;9 | 96 | 0 | `█████░░░░░` 9/19 |
 | [Scheduling](#scheduling) | &#x1F535;9 &#x1F534;2 | 67 | 0 | `████████░░` 8/10 |
@@ -47,15 +47,15 @@
 | [Parallelism & Distribution](#parallelism--distribution) | &#x1F535;3 &#x1F7E1;1 &#x1F534;6 | 33 | 0 | `███░░░░░░░` 3/10 |
 | [Performance Optimizations](#performance-optimizations) | &#x1F535;6 &#x1F534;11 | 6 | 0 | `██░░░░░░░░` 2/13 |
 | [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | &#x1F535;2 &#x1F7E1;1 &#x1F534;9 | 0 | 0 | `██░░░░░░░░` 3/12 |
-| [LoRA / Adapters](#lora--adapters) | &#x1F7E2;2 &#x1F534;3 | 12 | 8 | `████░░░░░░` 2/5 |
+| [LoRA / Adapters](#lora--adapters) | &#x1F535;2 &#x1F534;3 | 12 | 8 | `████░░░░░░` 2/5 |
 | [Speculative Decoding](#speculative-decoding) | &#x1F535;1 &#x1F534;4 | 20 | 0 | `██░░░░░░░░` 1/5 |
 | [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F534;10 | 0 | 0 | `░░░░░░░░░░` 0/10 |
 | [Structured Output](#structured-output--guided-decoding) | &#x1F535;4 | 12 | 0 | `██████████` 4/4 |
 | [Tool Calling](#tool-calling--function-calling) | &#x1F535;7 | 25 | 0 | `██████████` 7/7 |
-| [Embeddings & Pooling](#embeddings--pooling) | &#x1F7E1;2 &#x1F534;4 | 7 | 7 | `████░░░░░░` 2/6 |
+| [Embeddings & Pooling](#embeddings--pooling) | &#x1F535;5 &#x1F534;3 | 19 | 10 | `██████░░░░` 5/8 |
 | [Observability & Operations](#observability--operations) | &#x1F535;8 &#x1F534;1 | 15 | 0 | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535;17 &#x1F7E1;1 &#x1F534;1 | 14 | 0 | `██████████` 15/16 |
-| **Total** | **&#x1F535;148 &#x1F7E1;8 &#x1F534;113** | **583** | **58** | `█████░░░░░` **107/209** |
+| **Total** | **&#x1F535;156 &#x1F7E1;5 &#x1F534;110** | **607** | **69** | `█████░░░░░` **114/213** |
 
 ---
 
@@ -175,7 +175,7 @@
 | `n` parameter (multiple completions) | &#x1F535; | &#x1F535; | 4 | 2 | |
 | Multi-prompt completions | &#x1F535; | &#x1F535; | 2 | 0 | |
 | Chat templates (Jinja2) | &#x1F535; | &#x1F535; | 14 | 3 | |
-| `POST /v1/embeddings` | &#x1F535; | &#x1F7E1; | — | 7 | P3 |
+| `POST /v1/embeddings` | &#x1F535; | &#x1F535; | 19 | 10 | |
 | `POST /v1/chat/completions` tool_calls | &#x1F535; | &#x1F535; | 3 | 0 | |
 | `response_format` (JSON mode/schema) | &#x1F535; | &#x1F535; | 6 | 0 | |
 | Anthropic Messages API | &#x1F535; | &#x1F534; | — | — | P2 |
@@ -387,9 +387,9 @@
 
 | Feature | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
-| LoRA adapter loading | &#x1F535; | &#x1F7E2; | 8 | 4 | P3 |
+| LoRA adapter loading | &#x1F535; | &#x1F535; | 8 | 4 | P3 |
 | Multi-LoRA serving | &#x1F535; | &#x1F534; | — | — | P2 |
-| LoRA weight merging (single adapter) | &#x1F535; | &#x1F7E2; | 4 | 4 | P2 |
+| LoRA weight merging (single adapter) | &#x1F535; | &#x1F535; | 4 | 4 | P2 |
 | Punica kernels | &#x1F535; | &#x1F534; | — | — | P0 |
 | Dynamic adapter switching | &#x1F535; | &#x1F534; | — | — | P2 |
 
@@ -461,12 +461,21 @@
 
 | Feature | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
-| `/v1/embeddings` endpoint | &#x1F535; | &#x1F7E1; | 7 | 7 | P3 |
+| `/v1/embeddings` endpoint | &#x1F535; | &#x1F535; | 19 | 10 | |
+| Pooling strategies (last, CLS, mean) | &#x1F535; | &#x1F535; | 19 | 10 | |
+| Auto-detect pooling from `1_Pooling/config.json` | &#x1F535; | &#x1F535; | 5 | 0 | |
+| `--pooling-strategy` CLI flag (auto/last/cls/mean) | &#x1F535; | &#x1F535; | 1 | 3 | |
+| Matryoshka dimension truncation | &#x1F535; | &#x1F535; | 2 | 1 | |
 | Pooling execution mode (`--runner pooling`) | &#x1F535; | &#x1F534; | — | — | P3 |
-| Decoder-based embedding (last-token pooling) | &#x1F535; | &#x1F7E1; | 7 | 7 | P3 |
 | Encoder-only models (BERT, ModernBERT) | &#x1F535; | &#x1F534; | — | — | P2 |
-| Pooling strategies (CLS, mean, last) | &#x1F535; | &#x1F534; | — | — | P3 |
 | Reward / reranking models | &#x1F535; | &#x1F534; | — | — | P1 |
+
+> **Implementation notes:**
+>
+> - **Decoder-as-embedder works end-to-end:** `/v1/embeddings` runs a single `hidden_states()` forward pass (no KV cache, no decode loop), pools, L2-normalizes, and returns OpenAI-compatible responses. Tested with LLaMA, Qwen2, SmolLM on both Candle and MLX backends.
+> - **Three pooling strategies:** `Last` (default for decoder models like e5-mistral, gte-Qwen2), `Cls` (first token, for encoder models), `Mean` (average all tokens, most common for BERT-family). Strategy is resolved at model-load time: explicit `--pooling-strategy` > auto-detect from `1_Pooling/config.json` > default to `Last`.
+> - **Auto-detection:** sentence-transformers models publish `1_Pooling/config.json` with boolean fields (`pooling_mode_mean_tokens`, `pooling_mode_cls_token`, `pooling_mode_lasttoken`). Both Candle and MLX workers download this file from HF Hub and detect the strategy automatically.
+> - **Remaining gaps are structural, not incremental:** `--runner pooling` requires a dedicated execution mode where the scheduler knows the model is embedding-only (reject generation requests, different init path). Encoder-only models (BERT, NomicBERT, ModernBERT) need bidirectional attention (remove causal mask) — a fundamentally different attention mode from the current decoder-only pipeline.
 
 ---
 
@@ -527,6 +536,6 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Unit tests | ~948 test files | 818 passing (760 non-MLX + 58 MLX) |
-| E2E tests | — | 71 passing (36 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser) |
+| Unit tests | ~948 test files | 842 passing (784 non-MLX + 58 MLX) |
+| E2E tests | — | 78 passing (36 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 3 embedding pooling + 4 LoRA) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

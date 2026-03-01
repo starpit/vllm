@@ -56,6 +56,9 @@ pub struct CandleWorkerConfig {
 
     /// Optional path to a LoRA adapter directory (local path or HF repo ID).
     pub lora_adapter: Option<String>,
+    /// Pooling strategy for embeddings: "auto", "last", "cls", "mean".
+    /// "auto" detects from `1_Pooling/config.json`, defaults to "last".
+    pub pooling_strategy: String,
 }
 
 impl CandleWorkerConfig {
@@ -114,6 +117,8 @@ pub struct CandleWorker {
     grammar_states: HashMap<String, vllm_models::grammar::GrammarGuide>,
     /// Compiled vocabulary for grammar-guided decoding (built once from tokenizer).
     grammar_vocabulary: Option<outlines_core::vocabulary::Vocabulary>,
+    /// Resolved pooling strategy for embeddings.
+    pooling_strategy: vllm_models::embedding::PoolingStrategy,
 }
 
 impl CandleWorker {
@@ -139,6 +144,7 @@ impl CandleWorker {
             head_dim: 0,
             grammar_states: HashMap::new(),
             grammar_vocabulary: None,
+            pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
         }
     }
 
@@ -155,6 +161,36 @@ impl CandleWorker {
     /// Get the resolved model dtype (after `load_model` has been called).
     pub fn resolved_dtype(&self) -> Option<DType> {
         self.resolved_dtype
+    }
+
+    /// Resolve the pooling strategy from config or auto-detect.
+    fn resolve_pooling_strategy(&mut self) {
+        use vllm_models::embedding::{PoolingStrategy, detect_pooling_strategy};
+
+        let strategy = match self.config.pooling_strategy.as_str() {
+            "auto" => {
+                // Try to detect from 1_Pooling/config.json.
+                let detected = self
+                    .model_dir
+                    .as_ref()
+                    .and_then(|dir| detect_pooling_strategy(dir));
+                if let Some(s) = detected {
+                    info!("CandleWorker: pooling strategy auto-detected: {:?}", s);
+                    s
+                } else {
+                    info!("CandleWorker: pooling strategy defaulting to Last (decoder model)");
+                    PoolingStrategy::Last
+                }
+            }
+            other => other.parse().unwrap_or_else(|_| {
+                warn!(
+                    "CandleWorker: unknown pooling strategy '{}', defaulting to Last",
+                    other
+                );
+                PoolingStrategy::Last
+            }),
+        };
+        self.pooling_strategy = strategy;
     }
 
     /// Build grammar vocabulary on demand (lazy — deferred from startup).
@@ -512,6 +548,12 @@ impl CandleWorker {
             Err(e) => warn!("Failed to download tokenizer_config.json: {e:?}"),
         }
 
+        // Try to download sentence-transformers pooling config (optional).
+        // Used for auto-detecting pooling strategy for /v1/embeddings.
+        if let Ok(p) = repo.get("1_Pooling/config.json") {
+            info!("Downloaded 1_Pooling/config.json to {}", p.display());
+        }
+
         // Try single-file weights first.
         if repo.get("model.safetensors").is_ok() {
             info!("Downloaded single safetensors file");
@@ -711,6 +753,8 @@ impl Worker for CandleWorker {
                 adapter.name, adapter.config.r, adapter.config.target_modules
             );
         }
+        // Resolve pooling strategy for embeddings.
+        self.resolve_pooling_strategy();
 
         // Grammar vocabulary is built lazily on first constrained-decoding request.
 
@@ -1374,7 +1418,7 @@ impl Worker for CandleWorker {
     }
 
     fn embed(&mut self, token_id_seqs: &[&[u32]]) -> ExecutorResult<Vec<Vec<f32>>> {
-        use vllm_models::embedding::{PoolingStrategy, l2_normalize, pool};
+        use vllm_models::embedding::{l2_normalize, pool};
 
         let model = self
             .model
@@ -1384,6 +1428,7 @@ impl Worker for CandleWorker {
             .device
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerExecution("device not initialized".into()))?;
+        let strategy = self.pooling_strategy;
 
         let mut results = Vec::with_capacity(token_id_seqs.len());
         for token_ids in token_id_seqs {
@@ -1397,7 +1442,7 @@ impl Worker for CandleWorker {
                 .hidden_states(&input_ids, &positions)
                 .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
 
-            let pooled = pool(&hidden_states, PoolingStrategy::Last)
+            let pooled = pool(&hidden_states, strategy)
                 .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
 
             let normalized =
@@ -1569,6 +1614,7 @@ mod tests {
             block_size: 16,
             gguf_file: None,
             lora_adapter: None,
+            pooling_strategy: "auto".to_string(),
         }
     }
 

@@ -121,6 +121,9 @@ impl TestModels {
 
     // Float16 variants for non-quantized testing
     const SMOLLM_135M_F16: &str = "mlx-community/SmolLM2-135M-Instruct";          // ~255 MB, LlamaForCausalLM
+
+    // GPTQ quantized models (candle + MLX backends)
+    const QWEN2_0_5B_GPTQ_INT4: &str = "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4";  // ~459 MB, Qwen2ForCausalLM
 }
 ```
 
@@ -584,6 +587,32 @@ Tests single-adapter LoRA support. Creates a synthetic LoRA adapter (random A/B 
 
 ---
 
+## Phase E14: GPTQ Quantization — DONE
+
+Test file: `e_gptq.rs`
+
+Tests GPTQ INT4 quantized model loading and inference. GPTQ is the most popular GPU quantization format on HuggingFace. Supports both candle (CPU dequantize-per-forward) and MLX (dequantize-at-load-time on Metal) backends.
+
+| Test | Model | Description |
+|------|-------|-------------|
+| `test_gptq_qwen2_server_starts` | Qwen2.5-0.5B-Instruct-GPTQ-Int4 | Server starts, /health + /v1/models work |
+| `test_gptq_qwen2_chat_basic` | Qwen2.5-0.5B-Instruct-GPTQ-Int4 | Chat completion returns coherent text |
+| `test_gptq_qwen2_completion_basic` | Qwen2.5-0.5B-Instruct-GPTQ-Int4 | Text completion returns non-empty text |
+| `test_gptq_qwen2_max_tokens` | Qwen2.5-0.5B-Instruct-GPTQ-Int4 | max_tokens=5 → completion_tokens ≤ 5 |
+
+Run commands:
+```bash
+# MLX backend (fast, ~4s):
+cargo test -p vllm-e2e --features e2e,metal --test e_gptq --release -- --ignored --test-threads=1
+
+# Candle CPU backend (slower, ~120s):
+cargo test -p vllm-e2e --features e2e --test e_gptq --release -- --ignored --test-threads=1
+```
+
+**Deliverables**: 4 E2E tests (all implemented). Uses official Qwen GPTQ model (~459 MB).
+
+---
+
 ## Test Matrix Summary
 
 | Phase | Tests | Models Used | Run Frequency | Estimated Time |
@@ -602,7 +631,8 @@ Tests single-adapter LoRA support. Creates a synthetic LoRA adapter (random A/B 
 | E11. CLI & Config | ~10 | SmolLM-135M | Every PR | 2 min |
 | E12. Embedding | 10 (done) | SmolLM / Qwen2 / Llama3 | Every PR | 2 min |
 | E13. LoRA Adapters | 4 (done) | SmolLM-135M-F16 | Every PR | <1 min |
-| **Total** | **~176** | | | **~30 min** |
+| E14. GPTQ Quantization | 4 (done) | Qwen2.5-0.5B-GPTQ-Int4 | Every PR | <1 min (MLX) |
+| **Total** | **~180** | | | **~30 min** |
 
 ### CI Tiers
 
@@ -632,6 +662,8 @@ Tests single-adapter LoRA support. Creates a synthetic LoRA adapter (random A/B 
 | Mixtral MoE | MixtralForCausalLM | Mixtral-SlimOrca-8x7B-3bit | ~18 GB | Manual | — | Yes |
 | Command R | CohereForCausalLM | c4ai-command-r-08-2024-4bit | 16.9 GB | Manual | — | Yes |
 | Gemma v1 | GemmaForCausalLM | (deferred — 2B model at 2 GB) | — | — | — | — |
+
+| GPTQ Qwen2 | Qwen2ForCausalLM | Qwen2.5-0.5B-Instruct-GPTQ-Int4 | 459 MB | PR | — | Yes (GPTQ INT4) |
 
 **Note on Command R**: The smallest `CohereForCausalLM` is 35B (16.9 GB). The 7B variant uses `Cohere2ForCausalLM` which is a different architecture not yet implemented. Command R E2E tests are manual-only until either (a) a smaller CohereForCausalLM model appears, or (b) we implement Cohere2ForCausalLM.
 

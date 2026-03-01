@@ -13,6 +13,7 @@
 
 pub mod activation;
 pub mod embedding;
+pub mod gptq;
 pub mod linear;
 pub mod norm;
 pub mod quantized_linear;
@@ -20,6 +21,7 @@ pub mod rotary;
 
 pub use activation::{Activation, gelu, relu, silu};
 pub use embedding::Embedding;
+pub use gptq::{GptqConfig, GptqLinear};
 pub use linear::{ColumnParallelLinear, Linear, RowParallelLinear};
 pub use norm::{CohereLayerNorm, GemmaRmsNorm, RmsNorm};
 pub use quantized_linear::QuantizedLinear;

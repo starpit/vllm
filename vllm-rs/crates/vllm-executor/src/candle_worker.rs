@@ -547,6 +547,10 @@ impl CandleWorker {
             Ok(p) => info!("Downloaded tokenizer_config.json to {}", p.display()),
             Err(e) => warn!("Failed to download tokenizer_config.json: {e:?}"),
         }
+        // Try to download quantize_config.json (for GPTQ models).
+        if let Ok(p) = repo.get("quantize_config.json") {
+            info!("Downloaded quantize_config.json to {}", p.display());
+        }
 
         // Try to download sentence-transformers pooling config (optional).
         // Used for auto-detecting pooling strategy for /v1/embeddings.
@@ -687,7 +691,17 @@ impl Worker for CandleWorker {
             resolved
         };
 
-        // 3. Look up architecture in the registry.
+        // 3. Detect GPTQ quantization.
+        let gptq_config = vllm_model::gptq_config::GptqQuantizeConfig::from_dir(&model_dir).ok();
+        let is_gptq = gptq_config.is_some()
+            || hf_config
+                .extra
+                .get("quantization_config")
+                .and_then(|v| v.get("quant_method"))
+                .and_then(|v| v.as_str())
+                == Some("gptq");
+
+        // 4. Look up architecture in the registry.
         let arch = hf_config
             .architectures
             .first()
@@ -696,14 +710,8 @@ impl Worker for CandleWorker {
             })?
             .clone();
         let registry = ModelRegistry::default();
-        let factory = registry.get(&arch).ok_or_else(|| {
-            ExecutorError::WorkerInit(format!(
-                "unsupported architecture: {arch}. Supported: {:?}",
-                registry.architectures().collect::<Vec<_>>()
-            ))
-        })?;
 
-        // 4. Load weights.
+        // 5. Load weights.
         let mut weights = ModelWeights::from_dir(&model_dir, &device)
             .map_err(|e| ExecutorError::WorkerInit(format!("failed to load weights: {e}")))?;
         // Strip weight name prefix for composite models (e.g. "language_model." for K2.5).
@@ -721,9 +729,55 @@ impl Worker for CandleWorker {
             weights.total_size_bytes() as f64 / 1_048_576.0
         );
 
-        // 5. Construct the model.
-        let model = factory(&weights, &hf_config, dtype, &device)
-            .map_err(|e| ExecutorError::WorkerInit(format!("failed to construct model: {e}")))?;
+        // 6. Construct the model (GPTQ or standard).
+        let model = if is_gptq {
+            let gptq_cfg = match gptq_config {
+                Some(cfg) => cfg,
+                None => {
+                    let qc = hf_config
+                        .extra
+                        .get("quantization_config")
+                        .ok_or_else(|| {
+                            ExecutorError::WorkerInit(
+                                "GPTQ detected but no quantize_config.json or quantization_config in config.json".to_string(),
+                            )
+                        })?;
+                    vllm_model::gptq_config::GptqQuantizeConfig::from_json_value(qc).map_err(
+                        |e| {
+                            ExecutorError::WorkerInit(format!(
+                                "failed to parse quantization_config: {e}"
+                            ))
+                        },
+                    )?
+                }
+            };
+
+            info!(
+                "CandleWorker: GPTQ detected (bits={}, group_size={}, desc_act={})",
+                gptq_cfg.bits, gptq_cfg.group_size, gptq_cfg.desc_act
+            );
+
+            let gptq_factory = registry.get_gptq(&arch).ok_or_else(|| {
+                ExecutorError::WorkerInit(format!(
+                    "unsupported GPTQ architecture: {arch}. Supported GPTQ: {:?}",
+                    registry.gptq_architectures().collect::<Vec<_>>()
+                ))
+            })?;
+
+            gptq_factory(&weights, &hf_config, &gptq_cfg, dtype, &device).map_err(|e| {
+                ExecutorError::WorkerInit(format!("failed to construct GPTQ model: {e}"))
+            })?
+        } else {
+            let factory = registry.get(&arch).ok_or_else(|| {
+                ExecutorError::WorkerInit(format!(
+                    "unsupported architecture: {arch}. Supported: {:?}",
+                    registry.architectures().collect::<Vec<_>>()
+                ))
+            })?;
+
+            factory(&weights, &hf_config, dtype, &device)
+                .map_err(|e| ExecutorError::WorkerInit(format!("failed to construct model: {e}")))?
+        };
 
         self.num_kv_heads = hf_config.num_kv_heads().unwrap_or(0);
         self.head_dim = hf_config.head_dim().unwrap_or(0);

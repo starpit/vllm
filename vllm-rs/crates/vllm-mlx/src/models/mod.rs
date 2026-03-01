@@ -90,6 +90,8 @@ pub struct MlxModelRegistry {
     /// Separate map for quantized model factories (checked first when config has
     /// a `"quantization"` field). Mirrors the candle `gguf_models` pattern.
     quantized_models: HashMap<String, MlxModelFactory>,
+    /// GPTQ model factories, keyed by HF architecture name.
+    gptq_models: HashMap<String, MlxModelFactory>,
 }
 
 impl MlxModelRegistry {
@@ -98,6 +100,7 @@ impl MlxModelRegistry {
         Self {
             models: HashMap::new(),
             quantized_models: HashMap::new(),
+            gptq_models: HashMap::new(),
         }
     }
 
@@ -169,6 +172,12 @@ impl MlxModelRegistry {
             "KimiK25ForCausalLM",
             deepseek_v2::create_mlx_quantized_kimi_k25,
         );
+        // GPTQ factories — dequantize at load time, reuse standard models.
+        registry.register_gptq("LlamaForCausalLM", llama::create_mlx_gptq_llama);
+        registry.register_gptq("MistralForCausalLM", llama::create_mlx_gptq_llama);
+        registry.register_gptq("Qwen2ForCausalLM", llama::create_mlx_gptq_qwen2);
+        registry.register_gptq("Qwen3ForCausalLM", llama::create_mlx_gptq_llama);
+        registry.register_gptq("Phi3ForCausalLM", llama::create_mlx_gptq_llama);
         registry
     }
 
@@ -180,6 +189,11 @@ impl MlxModelRegistry {
     /// Register a quantized model factory for an architecture name.
     pub fn register_quantized(&mut self, arch: &str, factory: MlxModelFactory) {
         self.quantized_models.insert(arch.to_string(), factory);
+    }
+
+    /// Register a GPTQ model factory for an architecture name.
+    pub fn register_gptq(&mut self, arch: &str, factory: MlxModelFactory) {
+        self.gptq_models.insert(arch.to_string(), factory);
     }
 
     /// Look up a model factory by architecture name.
@@ -196,6 +210,11 @@ impl MlxModelRegistry {
     /// Look up a non-quantized model factory by architecture name.
     pub fn get(&self, arch: &str) -> Option<MlxModelFactory> {
         self.models.get(arch).copied()
+    }
+
+    /// Look up a GPTQ model factory by architecture name.
+    pub fn get_gptq(&self, arch: &str) -> Option<MlxModelFactory> {
+        self.gptq_models.get(arch).copied()
     }
 
     /// Check if an architecture is supported (quantized or not).

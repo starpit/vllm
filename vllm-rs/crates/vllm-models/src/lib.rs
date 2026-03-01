@@ -16,6 +16,7 @@ pub mod deepseek_v2;
 pub mod embedding;
 pub mod gemma2;
 pub mod gemma3;
+pub mod gptq_llama;
 pub mod grammar;
 pub mod kv_block_pool;
 pub mod llama;

@@ -735,6 +735,57 @@ pub fn create_mlx_llama(
     Ok(Box::new(model))
 }
 
+/// Factory function for creating an MLX LLaMA model from GPTQ weights.
+///
+/// Dequantizes GPTQ INT4 weights at load time, then uses the standard
+/// (non-quantized) model architecture.
+pub fn create_mlx_gptq_llama(
+    model_dir: &Path,
+    config: &HfModelConfig,
+    _dtype: Dtype,
+) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
+    let llama_config = LlamaConfig::from_hf_config(config)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+    // Parse GPTQ config.
+    let gptq_cfg = vllm_model::gptq_config::GptqQuantizeConfig::from_dir(model_dir)
+        .or_else(|_| {
+            config
+                .extra
+                .get("quantization_config")
+                .ok_or_else(|| {
+                    vllm_model::error::ModelError::Other("no GPTQ config found".into())
+                })
+                .and_then(vllm_model::gptq_config::GptqQuantizeConfig::from_json_value)
+        })
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+    let gptq = gptq_cfg.to_gptq_config();
+
+    // Load raw safetensors weights (includes qweight/qzeros/scales/g_idx).
+    let raw_weights = load_safetensors_weights(model_dir)?;
+
+    // Dequantize GPTQ weights into standard .weight tensors.
+    let weights = crate::gptq::dequantize_gptq_weights(raw_weights, &gptq)?;
+
+    // Build standard model and load dequantized weights.
+    let mut model = MlxLlamaForCausalLM::new(&llama_config)?;
+    model.load_weights(&weights);
+    mlx_rs::transforms::eval(weights.values())?;
+
+    Ok(Box::new(model))
+}
+
+/// Factory function for creating an MLX Qwen2 model from GPTQ weights.
+pub fn create_mlx_gptq_qwen2(
+    model_dir: &Path,
+    config: &HfModelConfig,
+    dtype: Dtype,
+) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
+    // Qwen2 is architecturally identical to LLaMA, reuse the same factory.
+    create_mlx_gptq_llama(model_dir, config, dtype)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

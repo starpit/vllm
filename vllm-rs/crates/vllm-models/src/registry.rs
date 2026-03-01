@@ -11,6 +11,7 @@ use vllm_model::gguf::GgufFile;
 use vllm_model::weight::HfModelConfig;
 
 use crate::ModelFactory;
+use crate::gptq_llama::GptqModelFactory;
 
 /// Factory function type for constructing a model from a GGUF file.
 pub type GgufModelFactory = fn(
@@ -27,6 +28,8 @@ pub struct ModelRegistry {
     models: HashMap<&'static str, ModelFactory>,
     /// GGUF model factories, keyed by GGUF `general.architecture` value.
     gguf_models: HashMap<&'static str, GgufModelFactory>,
+    /// GPTQ model factories, keyed by HF architecture name.
+    gptq_models: HashMap<&'static str, GptqModelFactory>,
 }
 
 impl ModelRegistry {
@@ -35,6 +38,7 @@ impl ModelRegistry {
         Self {
             models: HashMap::new(),
             gguf_models: HashMap::new(),
+            gptq_models: HashMap::new(),
         }
     }
 
@@ -88,6 +92,13 @@ impl ModelRegistry {
         // --- GGUF factories (keyed by GGUF general.architecture value) ---
         self.register_gguf("llama", crate::quantized_llama::create_llama_gguf);
         // Mistral/Phi GGUF files use "llama" architecture internally.
+
+        // --- GPTQ factories (keyed by HF architecture name) ---
+        self.register_gptq("LlamaForCausalLM", crate::gptq_llama::create_llama_gptq);
+        self.register_gptq("MistralForCausalLM", crate::gptq_llama::create_llama_gptq);
+        self.register_gptq("Qwen2ForCausalLM", crate::gptq_llama::create_qwen2_gptq);
+        self.register_gptq("Qwen3ForCausalLM", crate::gptq_llama::create_llama_gptq);
+        self.register_gptq("Phi3ForCausalLM", crate::gptq_llama::create_llama_gptq);
     }
 
     /// Register a model factory for the given architecture name.
@@ -100,6 +111,11 @@ impl ModelRegistry {
         self.gguf_models.insert(arch, factory);
     }
 
+    /// Register a GPTQ model factory for the given HF architecture.
+    pub fn register_gptq(&mut self, arch: &'static str, factory: GptqModelFactory) {
+        self.gptq_models.insert(arch, factory);
+    }
+
     /// Look up a model factory by architecture name.
     pub fn get(&self, arch: &str) -> Option<&ModelFactory> {
         self.models.get(arch)
@@ -108,6 +124,11 @@ impl ModelRegistry {
     /// Look up a GGUF model factory by GGUF architecture name.
     pub fn get_gguf(&self, arch: &str) -> Option<&GgufModelFactory> {
         self.gguf_models.get(arch)
+    }
+
+    /// Look up a GPTQ model factory by HF architecture name.
+    pub fn get_gptq(&self, arch: &str) -> Option<&GptqModelFactory> {
+        self.gptq_models.get(arch)
     }
 
     /// Check if an architecture is supported.
@@ -128,6 +149,16 @@ impl ModelRegistry {
     /// List all registered GGUF architecture names.
     pub fn gguf_architectures(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.gguf_models.keys().copied()
+    }
+
+    /// Check if a GPTQ architecture is supported.
+    pub fn contains_gptq(&self, arch: &str) -> bool {
+        self.gptq_models.contains_key(arch)
+    }
+
+    /// List all registered GPTQ architecture names.
+    pub fn gptq_architectures(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.gptq_models.keys().copied()
     }
 }
 

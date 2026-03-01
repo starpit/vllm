@@ -45,4 +45,7 @@ impl TestModels {
 
     // Float16 variants for non-quantized testing
     pub const SMOLLM_135M_F16: &str = "mlx-community/SmolLM2-135M-Instruct";
+
+    // GPTQ quantized models (candle backend, not MLX)
+    pub const QWEN2_0_5B_GPTQ_INT4: &str = "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4";
 }

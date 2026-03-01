@@ -131,6 +131,8 @@ pub fn from_raw_bytes(
         DType::U8 => Tensor::from_slice(data, Shape::from_dims(shape), &Device::Cpu)
             .map_err(ModelError::Candle)?,
         DType::U32 => cast_or_copy!(u32, "u32"),
+        DType::I16 => cast_or_copy!(i16, "i16"),
+        DType::I32 => cast_or_copy!(i32, "i32"),
         DType::I64 => cast_or_copy!(i64, "i64"),
         _ => {
             return Err(ModelError::UnsupportedDType(format!(

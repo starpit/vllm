@@ -310,6 +310,10 @@ impl MlxWorker {
             Ok(p) => info!("Downloaded tokenizer_config.json to {}", p.display()),
             Err(e) => warn!("Failed to download tokenizer_config.json: {e:?}"),
         }
+        // Try to download quantize_config.json (for GPTQ models).
+        if let Ok(p) = repo.get("quantize_config.json") {
+            info!("Downloaded quantize_config.json to {}", p.display());
+        }
 
         // Try to download sentence-transformers pooling config (optional).
         if let Ok(p) = repo.get("1_Pooling/config.json") {
@@ -476,6 +480,15 @@ impl Worker for MlxWorker {
             info!("MlxWorker: detected quantized model: {qinfo}");
         }
 
+        // Detect GPTQ quantization.
+        let is_gptq = vllm_model::gptq_config::GptqQuantizeConfig::from_dir(&model_dir).is_ok()
+            || hf_config
+                .extra
+                .get("quantization_config")
+                .and_then(|v| v.get("quant_method"))
+                .and_then(|v| v.as_str())
+                == Some("gptq");
+
         // Look up architecture in the MLX registry.
         let arch = hf_config
             .architectures
@@ -485,12 +498,22 @@ impl Worker for MlxWorker {
             })?
             .clone();
         let registry = MlxModelRegistry::default_registry();
-        let factory = registry.get_factory(&arch, is_quantized).ok_or_else(|| {
-            ExecutorError::WorkerInit(format!(
-                "unsupported MLX architecture: {arch}. Supported: {:?}",
-                registry.architectures().collect::<Vec<_>>()
-            ))
-        })?;
+
+        let factory = if is_gptq {
+            info!("MlxWorker: GPTQ quantization detected, using dequantize-at-load path");
+            registry.get_gptq(&arch).ok_or_else(|| {
+                ExecutorError::WorkerInit(format!(
+                    "unsupported GPTQ MLX architecture: {arch}"
+                ))
+            })?
+        } else {
+            registry.get_factory(&arch, is_quantized).ok_or_else(|| {
+                ExecutorError::WorkerInit(format!(
+                    "unsupported MLX architecture: {arch}. Supported: {:?}",
+                    registry.architectures().collect::<Vec<_>>()
+                ))
+            })?
+        };
 
         // Load the model.
         let model = factory(&model_dir, &hf_config, dtype).map_err(|e| {
@@ -501,7 +524,13 @@ impl Worker for MlxWorker {
         self.hf_config = Some(hf_config);
         self.resolved_dtype = Some(dtype);
         self.model = Some(model);
-        let quant_str = if is_quantized { ", quantized" } else { "" };
+        let quant_str = if is_gptq {
+            ", GPTQ"
+        } else if is_quantized {
+            ", quantized"
+        } else {
+            ""
+        };
         info!("MlxWorker: model loaded (arch={arch}, dtype={dtype:?}{quant_str})");
 
         // Inject LoRA adapter if configured.

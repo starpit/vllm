@@ -9,6 +9,7 @@
 //! Port of: `vllm/model_executor/model_loader/` and `vllm/model_executor/layers/`
 
 pub mod gguf;
+pub mod gptq_config;
 pub mod layers;
 pub mod lora;
 pub mod tensor;

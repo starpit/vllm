@@ -6,16 +6,16 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 156 |
+| &#x1F535; | Fully implemented | 157 |
 | &#x1F7E1; | Partially implemented | 5 |
-| &#x1F534; | Not implemented | 110 |
+| &#x1F534; | Not implemented | 109 |
 
 ### Priority (for incomplete features)
 
 | Priority | Meaning | Count |
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
-| **P3** | High — meaningfully expands user base or enables key use cases | 22 |
+| **P3** | High — meaningfully expands user base or enables key use cases | 21 |
 | **P2** | Medium — useful improvement, broader coverage | 38 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
@@ -38,7 +38,7 @@
 | Feature Group | Rust Status | Unit | E2E | Parity |
 |---|---|---:|---:|---|
 | [Model Architectures](#model-architectures) | &#x1F535;41 &#x1F534;25 | 100 | 25 | `███░░░░░░░` 11/36 |
-| [Quantization](#quantization) | &#x1F535;2 &#x1F534;11 | 13 | 0 | `█░░░░░░░░░` 1/11 |
+| [Quantization](#quantization) | &#x1F535;3 &#x1F534;10 | 27 | 4 | `██░░░░░░░░` 2/11 |
 | [Serving / OpenAI API](#serving--openai-api) | &#x1F535;16 &#x1F534;9 | 101 | 18 | `██████░░░░` 16/24 |
 | [Sampling & Decoding](#sampling--decoding) | &#x1F535;19 &#x1F534;2 | 53 | 13 | `██████████` 19/19 |
 | [KV Cache & Attention](#kv-cache--attention) | &#x1F535;10 &#x1F7E1;1 &#x1F534;9 | 96 | 0 | `█████░░░░░` 9/19 |
@@ -55,7 +55,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535;5 &#x1F534;3 | 19 | 10 | `██████░░░░` 5/8 |
 | [Observability & Operations](#observability--operations) | &#x1F535;8 &#x1F534;1 | 15 | 0 | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535;17 &#x1F7E1;1 &#x1F534;1 | 14 | 0 | `██████████` 15/16 |
-| **Total** | **&#x1F535;156 &#x1F7E1;5 &#x1F534;110** | **607** | **69** | `█████░░░░░` **114/213** |
+| **Total** | **&#x1F535;157 &#x1F7E1;5 &#x1F534;109** | **621** | **73** | `█████░░░░░` **115/213** |
 
 ---
 
@@ -147,7 +147,7 @@
 |---|:---:|:---:|---:|---:|:---:|
 | GGUF (Q4_0 / Q4_K / Q8_0 / etc.) | &#x1F535; | &#x1F535; | 11 | 0 | |
 | MLX native 4-bit group quantization | N/A | &#x1F535; | 2 | 0 | |
-| GPTQ | &#x1F535; | &#x1F534; | — | — | P3 |
+| GPTQ (INT4, candle + MLX) | &#x1F535; | &#x1F535; | 14 | 4 | |
 | AWQ | &#x1F535; | &#x1F534; | — | — | P3 |
 | Marlin (GPTQ-Marlin / AWQ-Marlin) | &#x1F535; | &#x1F534; | — | — | P2 |
 | FP8 (FBGemm / ModelOpt) | &#x1F535; | &#x1F534; | — | — | P3 |
@@ -532,7 +532,7 @@
 | Metric | Python | Rust |
 |---|---|---|
 | Model architectures | ~248 | 11 candle + 11 MLX (+ quantized variants) |
-| Quantization methods | ~14 | 2 (GGUF + MLX native 4-bit) |
+| Quantization methods | ~14 | 3 (GGUF + MLX native 4-bit + GPTQ INT4) |
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |

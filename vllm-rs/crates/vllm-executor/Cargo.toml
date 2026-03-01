@@ -7,6 +7,7 @@ description = "Worker/process management and distributed coordination for vLLM R
 
 [features]
 default = []
+cuda = ["vllm-models/cuda", "candle-core/cuda", "cudarc"]
 metal = ["candle-core/metal"]
 
 [dependencies]
@@ -27,6 +28,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sysinfo = { workspace = true }
+cudarc = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

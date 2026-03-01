@@ -7,6 +7,7 @@ description = "Model loading, weight management, and tensor abstractions for vLL
 
 [features]
 default = []
+cuda = ["candle-core/cuda"]
 metal = ["candle-core/metal"]
 
 [dependencies]

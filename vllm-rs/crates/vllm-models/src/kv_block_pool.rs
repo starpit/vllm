@@ -400,6 +400,45 @@ impl KvBlockPool {
         self.tokens_in_block[block_idx] = 0;
         Ok(())
     }
+    /// Swap a block out from GPU to CPU (for preemption).
+    ///
+    /// Returns a vector of `(K, V)` tensors on CPU, one per layer.
+    pub fn swap_out(&self, block_idx: usize) -> ModelResult<Vec<(Tensor, Tensor)>> {
+        let cpu = Device::Cpu;
+        let mut layers = Vec::with_capacity(self.num_layers);
+        for layer in 0..self.num_layers {
+            let k = self.k_storage[layer]
+                .narrow(0, block_idx, 1)
+                .map_err(ModelError::Candle)?
+                .to_device(&cpu)
+                .map_err(ModelError::Candle)?;
+            let v = self.v_storage[layer]
+                .narrow(0, block_idx, 1)
+                .map_err(ModelError::Candle)?
+                .to_device(&cpu)
+                .map_err(ModelError::Candle)?;
+            layers.push((k, v));
+        }
+        Ok(layers)
+    }
+
+    /// Swap a block in from CPU to GPU (restore after preemption).
+    ///
+    /// * `block_idx` — target block in the pool
+    /// * `cpu_data` — per-layer `(K, V)` tensors on CPU (from `swap_out`)
+    pub fn swap_in(&mut self, block_idx: usize, cpu_data: &[(Tensor, Tensor)]) -> ModelResult<()> {
+        for (layer, (k_cpu, v_cpu)) in cpu_data.iter().enumerate() {
+            let k_gpu = k_cpu.to_device(&self.device).map_err(ModelError::Candle)?;
+            let v_gpu = v_cpu.to_device(&self.device).map_err(ModelError::Candle)?;
+            self.k_storage[layer] = self.k_storage[layer]
+                .slice_scatter0(&k_gpu, block_idx)
+                .map_err(ModelError::Candle)?;
+            self.v_storage[layer] = self.v_storage[layer]
+                .slice_scatter0(&v_gpu, block_idx)
+                .map_err(ModelError::Candle)?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -698,5 +737,39 @@ mod tests {
         let v1 = k1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!((v0[0] - 1.0).abs() < 1e-5);
         assert!((v1[0] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_swap_out_and_in() {
+        let mut pool = make_pool();
+
+        // Write data to block 0.
+        let k = (Tensor::ones(&[NUM_KV_HEADS, HEAD_DIM], DType::F32, &Device::Cpu).unwrap() * 7.0)
+            .unwrap();
+        let v = (Tensor::ones(&[NUM_KV_HEADS, HEAD_DIM], DType::F32, &Device::Cpu).unwrap() * 8.0)
+            .unwrap();
+        pool.write_kv(0, 0, 0, &k, &v).unwrap();
+        pool.set_tokens_stored(0, 1);
+
+        // Swap out block 0 → CPU.
+        let cpu_data = pool.swap_out(0).unwrap();
+        assert_eq!(cpu_data.len(), NUM_LAYERS);
+
+        // Reset the block (simulates freeing it).
+        pool.reset_block(0).unwrap();
+        let (k_zero, _) = pool.gather_kv(0, &[0], 1).unwrap();
+        let z = k_zero.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!((z[0]).abs() < 1e-5);
+
+        // Swap in to block 2.
+        pool.swap_in(2, &cpu_data).unwrap();
+        pool.set_tokens_stored(2, 1);
+
+        // Verify data is restored.
+        let (k_restored, v_restored) = pool.gather_kv(0, &[2], 1).unwrap();
+        let kr = k_restored.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let vr = v_restored.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!((kr[0] - 7.0).abs() < 1e-5);
+        assert!((vr[0] - 8.0).abs() < 1e-5);
     }
 }

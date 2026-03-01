@@ -9,7 +9,7 @@ description = "FFI bindings to CUDA/C++ kernels for vLLM Rust port"
 default = []
 # Enable CUDA kernel compilation and FFI bindings.
 # Requires nvcc and CUDA toolkit.
-cuda = []
+cuda = ["candle-core/cuda", "cudarc", "cc"]
 # Enable Metal GPU compute on Apple Silicon.
 metal = ["candle-core/metal"]
 
@@ -17,13 +17,13 @@ metal = ["candle-core/metal"]
 vllm-common = { workspace = true }
 vllm-model = { workspace = true }
 candle-core = { workspace = true }
+cudarc = { workspace = true, optional = true }
+half = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [build-dependencies]
-# Uncomment when building with CUDA:
-# cc = "1"
-# bindgen = "0.71"
+cc = { version = "1", optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }

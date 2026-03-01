@@ -7,6 +7,7 @@ description = "HTTP (axum) and gRPC (tonic) serving layer for vLLM Rust port"
 
 [features]
 default = []
+cuda = ["vllm-executor/cuda"]
 metal = ["vllm-mlx"]
 
 [dependencies]

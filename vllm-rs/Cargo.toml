@@ -78,7 +78,10 @@ minijinja-contrib = { version = "2", features = ["pycompat"] }
 outlines-core = { version = "0.2", default-features = false }
 
 # Tensor ops
-candle-core = "0.9"
+candle-core = { version = "0.9", default-features = false }
+
+# CUDA (NVIDIA GPU) — must match candle-core's cudarc version
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver"] }
 safetensors = "0.7"
 half = "2.7"
 memmap2 = "0.9"

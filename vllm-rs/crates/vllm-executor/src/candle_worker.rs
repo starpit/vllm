@@ -905,6 +905,16 @@ impl Worker for CandleWorker {
     }
 
     fn determine_available_memory(&mut self) -> ExecutorResult<usize> {
+        // On CUDA devices, query actual GPU VRAM via cudarc.
+        #[cfg(feature = "cuda")]
+        if let Some(device) = &self.device
+            && device.is_cuda()
+        {
+            return cuda_free_memory()
+                .map_err(|e| ExecutorError::WorkerInit(format!("CUDA memory query failed: {e}")));
+        }
+
+        // CPU / Metal fallback: use system RAM.
         use sysinfo::System;
         let sys = System::new_with_specifics(
             sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
@@ -1704,6 +1714,18 @@ fn auto_detect_device() -> Device {
     }
     info!("No GPU detected, using CPU");
     Device::Cpu
+}
+
+/// Query free GPU memory on the current CUDA device via cudarc.
+///
+/// Uses `cudarc::driver::result::mem_get_info()` which calls `cuMemGetInfo_v2`
+/// on the current CUDA context. The candle Device::new_cuda() call in init_device()
+/// has already set the current context for us.
+#[cfg(feature = "cuda")]
+fn cuda_free_memory() -> Result<usize, String> {
+    let (free, _total) =
+        cudarc::driver::result::mem_get_info().map_err(|e| format!("cuMemGetInfo: {e}"))?;
+    Ok(free)
 }
 
 // ---------------------------------------------------------------------------

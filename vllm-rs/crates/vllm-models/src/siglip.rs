@@ -309,9 +309,12 @@ impl SiglipEncoderLayer {
 
         // Scaled dot-product attention (no mask = bidirectional).
         let scale = (self.head_dim as f64).powf(-0.5);
-        let scores = q
-            .matmul(&k.transpose(2, 3).map_err(ModelError::Candle)?)
+        let k_tr = k
+            .transpose(2, 3)
+            .map_err(ModelError::Candle)?
+            .contiguous()
             .map_err(ModelError::Candle)?;
+        let scores = q.matmul(&k_tr).map_err(ModelError::Candle)?;
         let scores = (scores * scale).map_err(ModelError::Candle)?;
 
         // Upcast to f32 for softmax.

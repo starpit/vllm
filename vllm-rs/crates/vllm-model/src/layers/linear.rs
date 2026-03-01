@@ -138,6 +138,7 @@ impl Linear {
 impl Module for Linear {
     /// Forward pass: y = x @ W_t + b + x @ A @ B (LoRA delta when attached)
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let x = x.contiguous()?;
         let y = x.matmul(&self.weight)?;
         let y = match &self.bias {
             Some(b) => y.broadcast_add(b)?,

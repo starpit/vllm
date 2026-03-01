@@ -39,18 +39,10 @@ impl GptqQuantizeConfig {
     /// Parse from a JSON file path.
     pub fn from_file(path: impl AsRef<Path>) -> ModelResult<Self> {
         let path = path.as_ref();
-        let data = std::fs::read_to_string(path).map_err(|e| {
-            ModelError::Other(format!(
-                "failed to read {}: {e}",
-                path.display()
-            ))
-        })?;
-        let config: Self = serde_json::from_str(&data).map_err(|e| {
-            ModelError::Other(format!(
-                "failed to parse {}: {e}",
-                path.display()
-            ))
-        })?;
+        let data = std::fs::read_to_string(path)
+            .map_err(|e| ModelError::Other(format!("failed to read {}: {e}", path.display())))?;
+        let config: Self = serde_json::from_str(&data)
+            .map_err(|e| ModelError::Other(format!("failed to parse {}: {e}", path.display())))?;
         Ok(config)
     }
 
@@ -61,9 +53,8 @@ impl GptqQuantizeConfig {
 
     /// Parse from a serde_json Value (e.g. from config.json `quantization_config`).
     pub fn from_json_value(value: &serde_json::Value) -> ModelResult<Self> {
-        serde_json::from_value(value.clone()).map_err(|e| {
-            ModelError::Other(format!("failed to parse quantization_config: {e}"))
-        })
+        serde_json::from_value(value.clone())
+            .map_err(|e| ModelError::Other(format!("failed to parse quantization_config: {e}")))
     }
 
     /// Convert to the layer-level `GptqConfig`.

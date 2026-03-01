@@ -547,15 +547,11 @@ impl CandleWorker {
             Ok(p) => info!("Downloaded tokenizer_config.json to {}", p.display()),
             Err(e) => warn!("Failed to download tokenizer_config.json: {e:?}"),
         }
-        // Try to download quantize_config.json (for GPTQ models).
-        if let Ok(p) = repo.get("quantize_config.json") {
+        // Only download quantize_config.json if config.json indicates GPTQ.
+        if std::fs::read_to_string(&config_path).is_ok_and(|s| s.contains("\"gptq\""))
+            && let Ok(p) = repo.get("quantize_config.json")
+        {
             info!("Downloaded quantize_config.json to {}", p.display());
-        }
-
-        // Try to download sentence-transformers pooling config (optional).
-        // Used for auto-detecting pooling strategy for /v1/embeddings.
-        if let Ok(p) = repo.get("1_Pooling/config.json") {
-            info!("Downloaded 1_Pooling/config.json to {}", p.display());
         }
 
         // Try single-file weights first.

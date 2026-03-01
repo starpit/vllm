@@ -50,7 +50,13 @@ pub fn dequantize_gptq_weights(
         let g_idx = weights.remove(&format!("{prefix}.g_idx"));
 
         let dequantized = dequantize_layer(
-            &qweight, &qzeros, &scales, g_idx.as_ref(), config, pack_factor, mask,
+            &qweight,
+            &qzeros,
+            &scales,
+            g_idx.as_ref(),
+            config,
+            pack_factor,
+            mask,
         )?;
 
         weights.insert(format!("{prefix}.weight"), dequantized);
@@ -86,13 +92,27 @@ fn dequantize_layer(
     let in_features = packed_rows * pack_factor;
 
     // Unpack qweight on CPU: [in/pack, out] i32 → [in, out] f32
-    let unpacked_weight = unpack_rows_cpu(qweight, config.bits, pack_factor, mask, in_features, out_features)?;
+    let unpacked_weight = unpack_rows_cpu(
+        qweight,
+        config.bits,
+        pack_factor,
+        mask,
+        in_features,
+        out_features,
+    )?;
     let unpacked_weight = unpacked_weight.as_dtype(scales_dtype)?;
 
     // Unpack qzeros: [num_groups, out/pack] → [num_groups, out_features]
     let qz_shape = qzeros.shape();
     let num_groups = qz_shape[0] as usize;
-    let zeros = unpack_cols_cpu(qzeros, config.bits, pack_factor, mask, num_groups, out_features)?;
+    let zeros = unpack_cols_cpu(
+        qzeros,
+        config.bits,
+        pack_factor,
+        mask,
+        num_groups,
+        out_features,
+    )?;
     let zeros = zeros.as_dtype(scales_dtype)?;
 
     // Build group indices and gather scales/zeros per row.
@@ -108,9 +128,7 @@ fn dequantize_layer(
         let zp = zeros.take_axis(&g_idx, 0)?;
         (sp, zp)
     } else {
-        let indices: Vec<u32> = (0..in_features)
-            .map(|i| (i / group_size) as u32)
-            .collect();
+        let indices: Vec<u32> = (0..in_features).map(|i| (i / group_size) as u32).collect();
         let idx = Array::from_slice(&indices, &[in_features as i32]);
         let sp = scales.take_axis(&idx, 0)?;
         let zp = zeros.take_axis(&idx, 0)?;

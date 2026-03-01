@@ -40,12 +40,7 @@ impl GptqLlamaMLP {
                 gptq,
                 device,
             )?,
-            up_proj: GptqLinear::from_weights(
-                weights,
-                &format!("{prefix}.up_proj"),
-                gptq,
-                device,
-            )?,
+            up_proj: GptqLinear::from_weights(weights, &format!("{prefix}.up_proj"), gptq, device)?,
             down_proj: GptqLinear::from_weights(
                 weights,
                 &format!("{prefix}.down_proj"),
@@ -91,14 +86,10 @@ impl GptqLlamaAttention {
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
-        let q_proj =
-            GptqLinear::from_weights(weights, &format!("{prefix}.q_proj"), gptq, device)?;
-        let k_proj =
-            GptqLinear::from_weights(weights, &format!("{prefix}.k_proj"), gptq, device)?;
-        let v_proj =
-            GptqLinear::from_weights(weights, &format!("{prefix}.v_proj"), gptq, device)?;
-        let o_proj =
-            GptqLinear::from_weights(weights, &format!("{prefix}.o_proj"), gptq, device)?;
+        let q_proj = GptqLinear::from_weights(weights, &format!("{prefix}.q_proj"), gptq, device)?;
+        let k_proj = GptqLinear::from_weights(weights, &format!("{prefix}.k_proj"), gptq, device)?;
+        let v_proj = GptqLinear::from_weights(weights, &format!("{prefix}.v_proj"), gptq, device)?;
+        let o_proj = GptqLinear::from_weights(weights, &format!("{prefix}.o_proj"), gptq, device)?;
 
         let rotary_emb = RotaryEmbedding::new(
             config.head_dim,

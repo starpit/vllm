@@ -310,14 +310,11 @@ impl MlxWorker {
             Ok(p) => info!("Downloaded tokenizer_config.json to {}", p.display()),
             Err(e) => warn!("Failed to download tokenizer_config.json: {e:?}"),
         }
-        // Try to download quantize_config.json (for GPTQ models).
-        if let Ok(p) = repo.get("quantize_config.json") {
+        // Only download quantize_config.json if config.json indicates GPTQ.
+        if std::fs::read_to_string(&config_path).is_ok_and(|s| s.contains("\"gptq\""))
+            && let Ok(p) = repo.get("quantize_config.json")
+        {
             info!("Downloaded quantize_config.json to {}", p.display());
-        }
-
-        // Try to download sentence-transformers pooling config (optional).
-        if let Ok(p) = repo.get("1_Pooling/config.json") {
-            info!("Downloaded 1_Pooling/config.json to {}", p.display());
         }
 
         // Download weights.
@@ -502,9 +499,7 @@ impl Worker for MlxWorker {
         let factory = if is_gptq {
             info!("MlxWorker: GPTQ quantization detected, using dequantize-at-load path");
             registry.get_gptq(&arch).ok_or_else(|| {
-                ExecutorError::WorkerInit(format!(
-                    "unsupported GPTQ MLX architecture: {arch}"
-                ))
+                ExecutorError::WorkerInit(format!("unsupported GPTQ MLX architecture: {arch}"))
             })?
         } else {
             registry.get_factory(&arch, is_quantized).ok_or_else(|| {

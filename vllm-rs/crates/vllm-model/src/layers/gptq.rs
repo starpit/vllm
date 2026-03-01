@@ -136,10 +136,10 @@ fn read_i32_data(t: &Tensor) -> ModelResult<Vec<i32>> {
 /// working dtype, multiplied with the input, and optionally bias is added.
 /// This is a CPU-friendly approach (no custom CUDA kernels).
 pub struct GptqLinear {
-    qweight: Tensor,        // [in_features/pack_factor, out_features] i32
-    qzeros: Tensor,         // [num_groups, out_features/pack_factor] i32
-    scales: Tensor,         // [num_groups, out_features] f16
-    g_idx: Option<Tensor>,  // [in_features] i32
+    qweight: Tensor,       // [in_features/pack_factor, out_features] i32
+    qzeros: Tensor,        // [num_groups, out_features/pack_factor] i32
+    scales: Tensor,        // [num_groups, out_features] f16
+    g_idx: Option<Tensor>, // [in_features] i32
     bias: Option<Tensor>,
     bits: usize,
     in_features: usize,
@@ -165,10 +165,7 @@ impl GptqLinear {
             Some(weights.get(&format!("{prefix}.g_idx"))?.clone())
         } else {
             // Try to load g_idx even for non-desc_act (some models include it).
-            weights
-                .get(&format!("{prefix}.g_idx"))
-                .ok()
-                .cloned()
+            weights.get(&format!("{prefix}.g_idx")).ok().cloned()
         };
 
         let bias = weights.get(&format!("{prefix}.bias")).ok().cloned();
@@ -233,8 +230,7 @@ impl GptqLinear {
             let indices: Vec<u32> = (0..self.in_features)
                 .map(|i| (i / group_size) as u32)
                 .collect();
-            let idx_tensor =
-                Tensor::new(indices.as_slice(), device).map_err(ModelError::Candle)?;
+            let idx_tensor = Tensor::new(indices.as_slice(), device).map_err(ModelError::Candle)?;
             let sp = self
                 .scales
                 .index_select(&idx_tensor, 0)
@@ -308,14 +304,8 @@ mod tests {
     fn test_gptq_unpack_int4() {
         let device = Device::Cpu;
         // Pack 8 INT4 values (0..7) into one i32.
-        let packed: i32 = 0
-            | (1 << 4)
-            | (2 << 8)
-            | (3 << 12)
-            | (4 << 16)
-            | (5 << 20)
-            | (6 << 24)
-            | (7 << 28);
+        let packed: i32 =
+            0 | (1 << 4) | (2 << 8) | (3 << 12) | (4 << 16) | (5 << 20) | (6 << 24) | (7 << 28);
 
         let qweight = Tensor::new(&[[packed]], &device).unwrap();
         let qzeros = Tensor::new(&[[0i32]], &device).unwrap();
@@ -346,7 +336,9 @@ mod tests {
             assert!(
                 (vals[i] - i as f32).abs() < 0.01,
                 "expected {}, got {} at position {}",
-                i, vals[i], i
+                i,
+                vals[i],
+                i
             );
         }
     }
@@ -436,9 +428,6 @@ mod tests {
         let x = Tensor::ones((1, 8), DType::F32, &device).unwrap();
         let y = linear.forward(&x).unwrap();
         let val: f32 = y.flatten_all().unwrap().to_vec1().unwrap()[0];
-        assert!(
-            (val - 36.0).abs() < 0.1,
-            "expected 36.0, got {val}"
-        );
+        assert!((val - 36.0).abs() < 0.1, "expected 36.0, got {val}");
     }
 }

@@ -753,9 +753,7 @@ pub fn create_mlx_gptq_llama(
             config
                 .extra
                 .get("quantization_config")
-                .ok_or_else(|| {
-                    vllm_model::error::ModelError::Other("no GPTQ config found".into())
-                })
+                .ok_or_else(|| vllm_model::error::ModelError::Other("no GPTQ config found".into()))
                 .and_then(vllm_model::gptq_config::GptqQuantizeConfig::from_json_value)
         })
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;

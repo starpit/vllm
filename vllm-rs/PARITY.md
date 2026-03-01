@@ -39,11 +39,11 @@
 | [Quantization](#quantization) | &#x1F535; | &#x1F7E1; | 13 | 0 | `█░░░░░░░░░` 1/11 |
 | [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | 101 | 18 | `██████░░░░` 15/25 |
 | [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | 53 | 13 | `█████████░` 19/21 |
-| [KV Cache & Attention](#kv-cache--attention) | &#x1F535; | &#x1F7E1; | 96 | 0 | `█████░░░░░` 9/19 |
-| [Scheduling](#scheduling) | &#x1F535; | &#x1F7E1; | 67 | 0 | `████████░░` 8/10 |
+| [KV Cache & Attention](#kv-cache--attention) | &#x1F535; | &#x1F7E1; | 96 | 0 | `█████░░░░░` 9/20 |
+| [Scheduling](#scheduling) | &#x1F535; | &#x1F7E1; | 67 | 0 | `███████░░░` 8/11 |
 | [Hardware Backends](#hardware-backends) | &#x1F535; | &#x1F7E1; | 28 | 2 | `████░░░░░░` 3/8 |
 | [Parallelism & Distribution](#parallelism--distribution) | &#x1F535; | &#x1F7E1; | 33 | 0 | `███░░░░░░░` 3/10 |
-| [Performance Optimizations](#performance-optimizations) | &#x1F535; | &#x1F7E1; | 12 | 0 | `███░░░░░░░` 3/12 |
+| [Performance Optimizations](#performance-optimizations) | &#x1F535; | &#x1F7E1; | 6 | 0 | `██░░░░░░░░` 2/13 |
 | [LoRA / Adapters](#lora--adapters) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/5 |
 | [Speculative Decoding](#speculative-decoding) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/5 |
 | [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F535; | &#x2795; | 0 | 0 | `░░░░░░░░░░` 0/10 |
@@ -52,7 +52,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/6 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | 15 | 0 | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | 14 | 0 | `██████████` 14/15 |
-| | | **Total** | **569** | **58** | `█████░░░░░` **103/199** |
+| | | **Total** | **563** | **58** | `█████░░░░░` **102/202** |
 
 ---
 
@@ -244,9 +244,12 @@
 | xFormers | &#x1F535; | &#x1F534; | — | — | P1 |
 | MLA (Multi-head Latent Attention) | &#x1F535; | &#x1F535; | 4 | 0 | |
 | Sliding window attention | &#x1F535; | &#x1F535; | 13 | 0 | |
+| Batched attention metadata (cu_seqlens, slot_mapping, block_table) | &#x1F535; | &#x1F534; | — | — | P4 |
 | Tree attention | &#x1F535; | &#x1F534; | — | — | P1 |
 
 > Unit counts: `block_pool.rs` (19), `free_block_queue.rs` (16), `kv_cache_manager.rs` (13), `kv_cache_block.rs` (11), `kv_block_pool.rs` (13), `attention.rs` (25), MLX `cache.rs` (1). Sliding window: 7 attention.rs + 2 gemma2.rs interleaved + 2 qwen2.rs max_window_layers + 1 MLX phi3 trim + 1 array-format parsing = 13. Per-row counts reflect the primary feature each test targets; some tests cross-cut multiple rows. Total section: 103 unit tests.
+>
+> **Batched attention metadata note:** In Python vLLM, the model runner constructs `CommonAttentionMetadata` containing `query_start_loc` (cumulative token offsets per request), `seq_lens` (total context length per request), `block_table` (paged KV block IDs per request), and `slot_mapping` (flat token→cache-slot mapping). These are passed to FlashAttention's `varlen` API or FlashInfer's batched wrappers, which handle variable-length multi-request attention in a single kernel call. The Rust port has no equivalent — each request runs its own attention with its own KV cache. On CUDA, this metadata is a prerequisite for batched forward passes. On MLX, the equivalent is simpler: a `BatchKVCache` with per-sequence `left_padding` offsets and padding-aware causal masks (no `cu_seqlens` needed since MLX's SDPA requires uniform sequence lengths across the batch dimension).
 
 ---
 
@@ -254,7 +257,8 @@
 
 | Feature | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
-| Continuous batching | &#x1F535; | &#x1F535; | 6 | 0 | |
+| Iteration-level scheduling (add/remove per step) | &#x1F535; | &#x1F535; | 6 | 0 | |
+| Batched forward pass (cross-request token concat) | &#x1F535; | &#x1F534; | — | — | P4 |
 | FCFS request queue | &#x1F535; | &#x1F535; | 7 | 0 | |
 | Priority request queue | &#x1F535; | &#x1F535; | 7 | 0 | |
 | Preemption | &#x1F535; | &#x1F535; | 3 | 0 | |
@@ -265,6 +269,13 @@
 | Multi-step scheduling | &#x1F535; | &#x1F534; | — | — | P3 |
 | Async scheduler | &#x1F535; | &#x1F534; | — | — | P2 |
 
+> **Continuous batching note:** Python vLLM's "continuous batching" combines two things: (1) iteration-level scheduling — the scheduler can add/remove requests at each step, and (2) batched model execution — all scheduled requests' tokens are concatenated into a single flat 1D `input_ids` tensor and processed in one `model.forward()` call, with per-request boundaries tracked via attention metadata (`cu_seqlens_q`, `seq_lens`, `block_table`, `slot_mapping`). The Rust port implements (1) but not (2): the scheduler correctly produces multi-request `SchedulerOutput`, but `CandleWorker` and `MlxWorker` loop over requests and run a separate `model.forward()` per request. This means the "continuous" scheduling provides no throughput benefit — it's effectively sequential inference with dynamic request interleaving.
+>
+> **Backend-specific batching approaches:**
+> - **CUDA (CandleWorker):** Requires a variable-length attention backend — FlashAttention's `flash_attn_varlen_func` (uses `cu_seqlens_q`/`cu_seqlens_k` to handle ragged sequences in one kernel call) or FlashInfer (splits decode/prefill into separate batched wrappers). No padding waste since each request's exact token count is used.
+> - **MLX (MlxWorker):** MLX's `fast::scaled_dot_product_attention` has **no varlen equivalent** — all sequences in a batch dimension must share the same K/V length. Two feasible approaches: (a) **Padding-based batching** (proven by mlx-lm's `BatchGenerator`): left-pad inputs to uniform length, use `BatchKVCache` with per-sequence padding offsets, construct padding-aware causal masks. Costs wasted compute on pad tokens but works with stock MLX SDPA. (b) **Custom Metal PagedAttention kernels** (implemented by mistral.rs / HF kernels-community): block-table-based paged attention Metal shaders, no padding, +77–131% throughput on M3 Max benchmarks. Significantly more effort but eliminates padding waste.
+> - **Single-user note:** For Apple Silicon with one concurrent user, per-request forward passes are adequate — MLX's lazy eval graph fusion already saturates the GPU for a single sequence. Batching primarily matters for multi-user serving throughput.
+>
 > Unit counts: `scheduler/core.rs` (30), `scheduler/request_queue.rs` (14), `scheduler/output.rs` (5), `scheduler/interface.rs` (2), `request.rs` (16). Block allocation count includes `block_pool.rs` and `kv_cache_manager.rs` allocate/free/eviction tests counted above in KV Cache; per-row counts here reflect scheduler-specific tests.
 
 ---
@@ -323,10 +334,13 @@
 | MLX single-eval sampling fusion | N/A | &#x1F535; | 0 | 0 | |
 | Pre-transposed weights (Metal) | N/A | &#x1F535; | 0 | 0 | |
 | Native dtype inference (`--dtype auto`) | &#x1F535; | &#x1F535; | 4 | 2 | |
-| Continuous batching | &#x1F535; | &#x1F535; | 6 | 0 | |
+| Mixed prefill+decode in single forward pass | &#x1F535; | &#x1F534; | — | — | P3 |
+| Persistent InputBatch (cross-iteration reuse) | &#x1F535; | &#x1F534; | — | — | P3 |
 | Paged KV (no gather copy on decode) | &#x1F535; | &#x1F535; | 2 | 0 | |
 
 > CPU kernel stubs in `vllm-kernels` (12 tests: rotary 3, activation 3, norm 2, cache 2, attention 2) provide building blocks for performance features. Native dtype unit tests count `candle_worker.rs` dtype parsing tests.
+>
+> **Batching-related items moved:** "Continuous batching" was previously listed here as fully implemented. It has been decomposed into its constituent parts: iteration-level scheduling (in [Scheduling](#scheduling)), batched forward pass (in [Scheduling](#scheduling)), batched attention metadata (in [KV Cache & Attention](#kv-cache--attention)), and mixed prefill+decode / persistent InputBatch (here). See the Scheduling section note for details on the gap.
 
 ---
 

@@ -3,6 +3,16 @@
 //!
 //! Trait abstraction for RMS norm and fused add-RMS norm kernels.
 //! Port of: `csrc/layernorm_kernels.cu`
+//!
+//! ## Simplifications vs Python vLLM
+//!
+//! The CUDA kernels here are simplified compared to Python vLLM's:
+//! - Scalar loads instead of vectorized `vec_n_t<T, VEC_SIZE>` loads (~2-3x slower on large hidden)
+//! - Simple warp shuffle reduction instead of CUB `BlockReduce`
+//! - 2D only (no 3D/4D for per-head QK-norm)
+//! - `fused_add_rms_norm` not yet wired to CUDA (uses add + separate norm)
+//!
+//! These will be upgraded to match Python vLLM's performance in a follow-up.
 
 use candle_core::Tensor;
 
@@ -53,6 +63,155 @@ impl NormKernels for CpuNormKernels {
         weight: &Tensor,
         epsilon: f64,
     ) -> KernelResult<(Tensor, Tensor)> {
+        let updated = (input + residual)?;
+        let normed = self.rms_norm(&updated, weight, epsilon)?;
+        Ok((normed, updated))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CUDA implementation
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+mod cuda_ffi {
+    unsafe extern "C" {
+        pub fn rms_norm_f32(
+            out: *mut f32,
+            input: *const f32,
+            weight: *const f32,
+            epsilon: f32,
+            num_tokens: i32,
+            hidden_size: i32,
+        );
+        pub fn rms_norm_f16(
+            out: *mut u16,
+            input: *const u16,
+            weight: *const u16,
+            epsilon: f32,
+            num_tokens: i32,
+            hidden_size: i32,
+        );
+        pub fn rms_norm_bf16(
+            out: *mut u16,
+            input: *const u16,
+            weight: *const u16,
+            epsilon: f32,
+            num_tokens: i32,
+            hidden_size: i32,
+        );
+    }
+}
+
+/// CUDA implementation of normalization kernels.
+#[cfg(feature = "cuda")]
+pub struct CudaNormKernels;
+
+#[cfg(feature = "cuda")]
+impl CudaNormKernels {
+    /// Extract a raw device pointer (as usize) from a contiguous CUDA tensor.
+    ///
+    /// Uses `DevicePtr::device_ptr()` which requires the CUDA stream to
+    /// synchronize outstanding writes. This is correct for kernel launch —
+    /// kernels on the same stream see prior writes.
+    fn device_ptr_of<T: cudarc::driver::DeviceRepr + candle_core::cuda_backend::CudaDType>(
+        tensor: &Tensor,
+    ) -> KernelResult<usize> {
+        use cudarc::driver::DevicePtr;
+        let cuda_dev = tensor
+            .device()
+            .as_cuda_device()
+            .map_err(|e| crate::error::KernelError::Other(format!("{e}")))?;
+        let stream = cuda_dev.cuda_stream();
+        let (storage, layout) = tensor.storage_and_layout();
+        match &*storage {
+            candle_core::Storage::Cuda(cuda_storage) => {
+                let slice = cuda_storage.as_cuda_slice::<T>()?;
+                let view = slice.slice(layout.start_offset()..);
+                let (ptr, _sync_guard) = view.device_ptr(&stream);
+                Ok(ptr as usize)
+            }
+            _ => Err(crate::error::KernelError::Other(
+                "expected CUDA tensor".to_string(),
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl NormKernels for CudaNormKernels {
+    fn rms_norm(&self, input: &Tensor, weight: &Tensor, epsilon: f64) -> KernelResult<Tensor> {
+        use candle_core::DType;
+
+        let dims = input.shape().dims();
+        let hidden_size = *dims
+            .last()
+            .ok_or_else(|| crate::error::KernelError::Other("empty input tensor".to_string()))?;
+        let num_tokens: usize = dims[..dims.len() - 1].iter().product();
+
+        let input = input.contiguous()?;
+        let weight = weight.contiguous()?;
+        let out = Tensor::zeros(input.shape(), input.dtype(), input.device())?;
+
+        match input.dtype() {
+            DType::F32 => {
+                let o = Self::device_ptr_of::<f32>(&out)?;
+                let i = Self::device_ptr_of::<f32>(&input)?;
+                let w = Self::device_ptr_of::<f32>(&weight)?;
+                unsafe {
+                    cuda_ffi::rms_norm_f32(
+                        o as *mut f32,
+                        i as *const f32,
+                        w as *const f32,
+                        epsilon as f32,
+                        num_tokens as i32,
+                        hidden_size as i32,
+                    );
+                }
+            }
+            DType::F16 => {
+                let o = Self::device_ptr_of::<half::f16>(&out)?;
+                let i = Self::device_ptr_of::<half::f16>(&input)?;
+                let w = Self::device_ptr_of::<half::f16>(&weight)?;
+                unsafe {
+                    cuda_ffi::rms_norm_f16(
+                        o as *mut u16,
+                        i as *const u16,
+                        w as *const u16,
+                        epsilon as f32,
+                        num_tokens as i32,
+                        hidden_size as i32,
+                    );
+                }
+            }
+            DType::BF16 => {
+                let o = Self::device_ptr_of::<half::bf16>(&out)?;
+                let i = Self::device_ptr_of::<half::bf16>(&input)?;
+                let w = Self::device_ptr_of::<half::bf16>(&weight)?;
+                unsafe {
+                    cuda_ffi::rms_norm_bf16(
+                        o as *mut u16,
+                        i as *const u16,
+                        w as *const u16,
+                        epsilon as f32,
+                        num_tokens as i32,
+                        hidden_size as i32,
+                    );
+                }
+            }
+            _ => return CpuNormKernels.rms_norm(&input, &weight, epsilon),
+        }
+        Ok(out)
+    }
+
+    fn fused_add_rms_norm(
+        &self,
+        input: &Tensor,
+        residual: &Tensor,
+        weight: &Tensor,
+        epsilon: f64,
+    ) -> KernelResult<(Tensor, Tensor)> {
+        // TODO: wire fused_add_rms_norm CUDA kernel for in-place residual update.
         let updated = (input + residual)?;
         let normed = self.rms_norm(&updated, weight, epsilon)?;
         Ok((normed, updated))

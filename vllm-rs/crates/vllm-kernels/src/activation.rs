@@ -3,6 +3,15 @@
 //!
 //! Trait abstraction for fused activation kernels (SiLU+mul, GELU+mul).
 //! Port of: `csrc/activation_kernels.cu`
+//!
+//! ## Simplifications vs Python vLLM
+//!
+//! The CUDA kernels here are simplified compared to Python vLLM's:
+//! - Scalar loads instead of vectorized int4/u32x8 loads (~2-3x slower on large hidden)
+//! - No packed half2/bfloat162 arithmetic path
+//! - Separate gate/up pointers (matching Rust trait) instead of concatenated [2*d] input
+//!
+//! These will be upgraded to match Python vLLM's performance in a follow-up.
 
 use candle_core::Tensor;
 
@@ -47,6 +56,299 @@ impl ActivationKernels for CpuActivationKernels {
     fn gelu_new_and_mul(&self, gate: &Tensor, up: &Tensor) -> KernelResult<Tensor> {
         let activated = gate.gelu_erf()?;
         let out = activated.mul(up)?;
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CUDA implementation
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+mod cuda_ffi {
+    unsafe extern "C" {
+        // SiLU + mul
+        pub fn silu_and_mul_f32(
+            out: *mut f32,
+            gate: *const f32,
+            up: *const f32,
+            num_tokens: i32,
+            d: i32,
+        );
+        pub fn silu_and_mul_f16(
+            out: *mut u16,
+            gate: *const u16,
+            up: *const u16,
+            num_tokens: i32,
+            d: i32,
+        );
+        pub fn silu_and_mul_bf16(
+            out: *mut u16,
+            gate: *const u16,
+            up: *const u16,
+            num_tokens: i32,
+            d: i32,
+        );
+        // GELU (tanh approx) + mul
+        pub fn gelu_and_mul_f32(
+            out: *mut f32,
+            gate: *const f32,
+            up: *const f32,
+            num_tokens: i32,
+            d: i32,
+        );
+        pub fn gelu_and_mul_f16(
+            out: *mut u16,
+            gate: *const u16,
+            up: *const u16,
+            num_tokens: i32,
+            d: i32,
+        );
+        pub fn gelu_and_mul_bf16(
+            out: *mut u16,
+            gate: *const u16,
+            up: *const u16,
+            num_tokens: i32,
+            d: i32,
+        );
+        // GELU (exact/erf) + mul
+        pub fn gelu_new_and_mul_f32(
+            out: *mut f32,
+            gate: *const f32,
+            up: *const f32,
+            num_tokens: i32,
+            d: i32,
+        );
+        pub fn gelu_new_and_mul_f16(
+            out: *mut u16,
+            gate: *const u16,
+            up: *const u16,
+            num_tokens: i32,
+            d: i32,
+        );
+        pub fn gelu_new_and_mul_bf16(
+            out: *mut u16,
+            gate: *const u16,
+            up: *const u16,
+            num_tokens: i32,
+            d: i32,
+        );
+    }
+}
+
+/// CUDA implementation of activation kernels.
+#[cfg(feature = "cuda")]
+pub struct CudaActivationKernels;
+
+#[cfg(feature = "cuda")]
+impl CudaActivationKernels {
+    /// Extract a raw device pointer (as usize) from a contiguous CUDA tensor.
+    fn device_ptr_of<T: cudarc::driver::DeviceRepr + candle_core::cuda_backend::CudaDType>(
+        tensor: &Tensor,
+    ) -> KernelResult<usize> {
+        use cudarc::driver::DevicePtr;
+        let cuda_dev = tensor
+            .device()
+            .as_cuda_device()
+            .map_err(|e| crate::error::KernelError::Other(format!("{e}")))?;
+        let stream = cuda_dev.cuda_stream();
+        let (storage, layout) = tensor.storage_and_layout();
+        match &*storage {
+            candle_core::Storage::Cuda(cuda_storage) => {
+                let slice = cuda_storage.as_cuda_slice::<T>()?;
+                let view = slice.slice(layout.start_offset()..);
+                let (ptr, _sync_guard) = view.device_ptr(&stream);
+                Ok(ptr as usize)
+            }
+            _ => Err(crate::error::KernelError::Other(
+                "expected CUDA tensor".to_string(),
+            )),
+        }
+    }
+
+    /// Shared helper: validate shapes, make contiguous, compute dimensions.
+    fn prepare_tensors(
+        gate: &Tensor,
+        up: &Tensor,
+    ) -> KernelResult<(Tensor, Tensor, Tensor, usize, usize)> {
+        if gate.shape() != up.shape() {
+            return Err(crate::error::KernelError::Other(format!(
+                "gate shape {:?} != up shape {:?}",
+                gate.shape(),
+                up.shape()
+            )));
+        }
+        let dims = gate.shape().dims();
+        let d = *dims
+            .last()
+            .ok_or_else(|| crate::error::KernelError::Other("empty gate tensor".to_string()))?;
+        let num_tokens: usize = dims[..dims.len() - 1].iter().product();
+
+        let gate = gate.contiguous()?;
+        let up = up.contiguous()?;
+        let out = Tensor::zeros(gate.shape(), gate.dtype(), gate.device())?;
+        Ok((gate, up, out, num_tokens, d))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl ActivationKernels for CudaActivationKernels {
+    fn silu_and_mul(&self, gate: &Tensor, up: &Tensor) -> KernelResult<Tensor> {
+        use candle_core::DType;
+
+        let (gate, up, out, num_tokens, d) = Self::prepare_tensors(gate, up)?;
+
+        match gate.dtype() {
+            DType::F32 => {
+                let o = Self::device_ptr_of::<f32>(&out)?;
+                let g = Self::device_ptr_of::<f32>(&gate)?;
+                let u = Self::device_ptr_of::<f32>(&up)?;
+                unsafe {
+                    cuda_ffi::silu_and_mul_f32(
+                        o as *mut f32,
+                        g as *const f32,
+                        u as *const f32,
+                        num_tokens as i32,
+                        d as i32,
+                    );
+                }
+            }
+            DType::F16 => {
+                let o = Self::device_ptr_of::<half::f16>(&out)?;
+                let g = Self::device_ptr_of::<half::f16>(&gate)?;
+                let u = Self::device_ptr_of::<half::f16>(&up)?;
+                unsafe {
+                    cuda_ffi::silu_and_mul_f16(
+                        o as *mut u16,
+                        g as *const u16,
+                        u as *const u16,
+                        num_tokens as i32,
+                        d as i32,
+                    );
+                }
+            }
+            DType::BF16 => {
+                let o = Self::device_ptr_of::<half::bf16>(&out)?;
+                let g = Self::device_ptr_of::<half::bf16>(&gate)?;
+                let u = Self::device_ptr_of::<half::bf16>(&up)?;
+                unsafe {
+                    cuda_ffi::silu_and_mul_bf16(
+                        o as *mut u16,
+                        g as *const u16,
+                        u as *const u16,
+                        num_tokens as i32,
+                        d as i32,
+                    );
+                }
+            }
+            _ => return CpuActivationKernels.silu_and_mul(&gate, &up),
+        }
+        Ok(out)
+    }
+
+    fn gelu_and_mul(&self, gate: &Tensor, up: &Tensor) -> KernelResult<Tensor> {
+        use candle_core::DType;
+
+        let (gate, up, out, num_tokens, d) = Self::prepare_tensors(gate, up)?;
+
+        match gate.dtype() {
+            DType::F32 => {
+                let o = Self::device_ptr_of::<f32>(&out)?;
+                let g = Self::device_ptr_of::<f32>(&gate)?;
+                let u = Self::device_ptr_of::<f32>(&up)?;
+                unsafe {
+                    cuda_ffi::gelu_and_mul_f32(
+                        o as *mut f32,
+                        g as *const f32,
+                        u as *const f32,
+                        num_tokens as i32,
+                        d as i32,
+                    );
+                }
+            }
+            DType::F16 => {
+                let o = Self::device_ptr_of::<half::f16>(&out)?;
+                let g = Self::device_ptr_of::<half::f16>(&gate)?;
+                let u = Self::device_ptr_of::<half::f16>(&up)?;
+                unsafe {
+                    cuda_ffi::gelu_and_mul_f16(
+                        o as *mut u16,
+                        g as *const u16,
+                        u as *const u16,
+                        num_tokens as i32,
+                        d as i32,
+                    );
+                }
+            }
+            DType::BF16 => {
+                let o = Self::device_ptr_of::<half::bf16>(&out)?;
+                let g = Self::device_ptr_of::<half::bf16>(&gate)?;
+                let u = Self::device_ptr_of::<half::bf16>(&up)?;
+                unsafe {
+                    cuda_ffi::gelu_and_mul_bf16(
+                        o as *mut u16,
+                        g as *const u16,
+                        u as *const u16,
+                        num_tokens as i32,
+                        d as i32,
+                    );
+                }
+            }
+            _ => return CpuActivationKernels.gelu_and_mul(&gate, &up),
+        }
+        Ok(out)
+    }
+
+    fn gelu_new_and_mul(&self, gate: &Tensor, up: &Tensor) -> KernelResult<Tensor> {
+        use candle_core::DType;
+
+        let (gate, up, out, num_tokens, d) = Self::prepare_tensors(gate, up)?;
+
+        match gate.dtype() {
+            DType::F32 => {
+                let o = Self::device_ptr_of::<f32>(&out)?;
+                let g = Self::device_ptr_of::<f32>(&gate)?;
+                let u = Self::device_ptr_of::<f32>(&up)?;
+                unsafe {
+                    cuda_ffi::gelu_new_and_mul_f32(
+                        o as *mut f32,
+                        g as *const f32,
+                        u as *const f32,
+                        num_tokens as i32,
+                        d as i32,
+                    );
+                }
+            }
+            DType::F16 => {
+                let o = Self::device_ptr_of::<half::f16>(&out)?;
+                let g = Self::device_ptr_of::<half::f16>(&gate)?;
+                let u = Self::device_ptr_of::<half::f16>(&up)?;
+                unsafe {
+                    cuda_ffi::gelu_new_and_mul_f16(
+                        o as *mut u16,
+                        g as *const u16,
+                        u as *const u16,
+                        num_tokens as i32,
+                        d as i32,
+                    );
+                }
+            }
+            DType::BF16 => {
+                let o = Self::device_ptr_of::<half::bf16>(&out)?;
+                let g = Self::device_ptr_of::<half::bf16>(&gate)?;
+                let u = Self::device_ptr_of::<half::bf16>(&up)?;
+                unsafe {
+                    cuda_ffi::gelu_new_and_mul_bf16(
+                        o as *mut u16,
+                        g as *const u16,
+                        u as *const u16,
+                        num_tokens as i32,
+                        d as i32,
+                    );
+                }
+            }
+            _ => return CpuActivationKernels.gelu_new_and_mul(&gate, &up),
+        }
         Ok(out)
     }
 }

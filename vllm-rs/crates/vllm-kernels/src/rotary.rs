@@ -3,6 +3,15 @@
 //!
 //! Trait abstraction for rotary position embedding (RoPE) kernels.
 //! Port of: `csrc/pos_encoding_kernels.cu`
+//!
+//! ## Simplifications vs Python vLLM
+//!
+//! The CUDA kernels here are simplified compared to Python vLLM's:
+//! - Scalar loads instead of vectorized loads
+//! - NeoX-style only (no GPT-J interleaved mode)
+//! - No packed half2 arithmetic
+//!
+//! These will be upgraded to match Python vLLM's performance in a follow-up.
 
 use candle_core::Tensor;
 
@@ -88,6 +97,185 @@ fn apply_rotary_1d(x: &Tensor, cos: &Tensor, sin: &Tensor, half: usize) -> Kerne
         Ok(result)
     } else {
         Ok(rotated)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CUDA implementation
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+mod cuda_ffi {
+    unsafe extern "C" {
+        pub fn rotary_embedding_f32(
+            positions: *const u32,
+            query: *mut f32,
+            key: *mut f32,
+            cos_sin_cache: *const f32,
+            rotary_dim: i32,
+            total_q_dim: i32,
+            total_k_dim: i32,
+            head_size: i32,
+            num_tokens: i32,
+        );
+        pub fn rotary_embedding_f16(
+            positions: *const u32,
+            query: *mut u16,
+            key: *mut u16,
+            cos_sin_cache: *const u16,
+            rotary_dim: i32,
+            total_q_dim: i32,
+            total_k_dim: i32,
+            head_size: i32,
+            num_tokens: i32,
+        );
+        pub fn rotary_embedding_bf16(
+            positions: *const u32,
+            query: *mut u16,
+            key: *mut u16,
+            cos_sin_cache: *const u16,
+            rotary_dim: i32,
+            total_q_dim: i32,
+            total_k_dim: i32,
+            head_size: i32,
+            num_tokens: i32,
+        );
+    }
+}
+
+/// CUDA implementation of rotary kernels.
+#[cfg(feature = "cuda")]
+pub struct CudaRotaryKernels;
+
+#[cfg(feature = "cuda")]
+impl CudaRotaryKernels {
+    /// Extract a raw device pointer (as usize) from a contiguous CUDA tensor.
+    fn device_ptr_of<T: cudarc::driver::DeviceRepr + candle_core::cuda_backend::CudaDType>(
+        tensor: &Tensor,
+    ) -> KernelResult<usize> {
+        use cudarc::driver::DevicePtr;
+        let cuda_dev = tensor
+            .device()
+            .as_cuda_device()
+            .map_err(|e| crate::error::KernelError::Other(format!("{e}")))?;
+        let stream = cuda_dev.cuda_stream();
+        let (storage, layout) = tensor.storage_and_layout();
+        match &*storage {
+            candle_core::Storage::Cuda(cuda_storage) => {
+                let slice = cuda_storage.as_cuda_slice::<T>()?;
+                let view = slice.slice(layout.start_offset()..);
+                let (ptr, _sync_guard) = view.device_ptr(&stream);
+                Ok(ptr as usize)
+            }
+            _ => Err(crate::error::KernelError::Other(
+                "expected CUDA tensor".to_string(),
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl RotaryKernels for CudaRotaryKernels {
+    fn rotary_embedding(
+        &self,
+        positions: &Tensor,
+        query: &Tensor,
+        key: &Tensor,
+        cos_sin_cache: &Tensor,
+        _is_neox: bool,
+    ) -> KernelResult<(Tensor, Tensor)> {
+        use candle_core::DType;
+
+        let rotary_dim = cos_sin_cache.dim(1)?;
+        let q_dims = query.shape().dims();
+        let total_q_dim = *q_dims
+            .last()
+            .ok_or_else(|| crate::error::KernelError::Other("empty query tensor".to_string()))?;
+        let num_tokens: usize = q_dims[..q_dims.len() - 1].iter().product();
+        let k_dims = key.shape().dims();
+        let total_k_dim = *k_dims
+            .last()
+            .ok_or_else(|| crate::error::KernelError::Other("empty key tensor".to_string()))?;
+
+        // For the flat trait API, treat the entire dim as one "head".
+        // Phase 3.8 will wire per-head rotation via RotaryEmbedding.
+        let head_size = total_q_dim;
+
+        // Clone query/key for out-of-place semantics, make contiguous.
+        let q_out = query.contiguous()?.clone();
+        let k_out = key.contiguous()?.clone();
+        let positions = positions.contiguous()?;
+        let cos_sin_cache = cos_sin_cache.contiguous()?;
+
+        match query.dtype() {
+            DType::F32 => {
+                let p = Self::device_ptr_of::<u32>(&positions)?;
+                let q = Self::device_ptr_of::<f32>(&q_out)?;
+                let k = Self::device_ptr_of::<f32>(&k_out)?;
+                let c = Self::device_ptr_of::<f32>(&cos_sin_cache)?;
+                unsafe {
+                    cuda_ffi::rotary_embedding_f32(
+                        p as *const u32,
+                        q as *mut f32,
+                        k as *mut f32,
+                        c as *const f32,
+                        rotary_dim as i32,
+                        total_q_dim as i32,
+                        total_k_dim as i32,
+                        head_size as i32,
+                        num_tokens as i32,
+                    );
+                }
+            }
+            DType::F16 => {
+                let p = Self::device_ptr_of::<u32>(&positions)?;
+                let q = Self::device_ptr_of::<half::f16>(&q_out)?;
+                let k = Self::device_ptr_of::<half::f16>(&k_out)?;
+                let c = Self::device_ptr_of::<half::f16>(&cos_sin_cache)?;
+                unsafe {
+                    cuda_ffi::rotary_embedding_f16(
+                        p as *const u32,
+                        q as *mut u16,
+                        k as *mut u16,
+                        c as *const u16,
+                        rotary_dim as i32,
+                        total_q_dim as i32,
+                        total_k_dim as i32,
+                        head_size as i32,
+                        num_tokens as i32,
+                    );
+                }
+            }
+            DType::BF16 => {
+                let p = Self::device_ptr_of::<u32>(&positions)?;
+                let q = Self::device_ptr_of::<half::bf16>(&q_out)?;
+                let k = Self::device_ptr_of::<half::bf16>(&k_out)?;
+                let c = Self::device_ptr_of::<half::bf16>(&cos_sin_cache)?;
+                unsafe {
+                    cuda_ffi::rotary_embedding_bf16(
+                        p as *const u32,
+                        q as *mut u16,
+                        k as *mut u16,
+                        c as *const u16,
+                        rotary_dim as i32,
+                        total_q_dim as i32,
+                        total_k_dim as i32,
+                        head_size as i32,
+                        num_tokens as i32,
+                    );
+                }
+            }
+            _ => {
+                return CpuRotaryKernels.rotary_embedding(
+                    &positions,
+                    query,
+                    key,
+                    &cos_sin_cache,
+                    _is_neox,
+                );
+            }
+        }
+        Ok((q_out, k_out))
     }
 }
 

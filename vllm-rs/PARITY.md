@@ -1,14 +1,14 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (920 tests: 842 unit + 78 e2e, 0 clippy errors)
+> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (944 tests: 848 unit + 96 e2e, 0 clippy errors)
 
 ### Legend
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 157 |
+| &#x1F535; | Fully implemented | 158 |
 | &#x1F7E1; | Partially implemented | 5 |
-| &#x1F534; | Not implemented | 109 |
+| &#x1F534; | Not implemented | 108 |
 
 ### Priority (for incomplete features)
 
@@ -16,7 +16,7 @@
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
 | **P3** | High — meaningfully expands user base or enables key use cases | 21 |
-| **P2** | Medium — useful improvement, broader coverage | 38 |
+| **P2** | Medium — useful improvement, broader coverage | 37 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
 
@@ -42,7 +42,7 @@
 | [Serving / OpenAI API](#serving--openai-api) | 24 | `██████░░░░` 16/24 | 0 | 101 | 18 |
 | [Sampling & Decoding](#sampling--decoding) | 19 | `██████████` 19/19 | 0 | 53 | 13 |
 | [KV Cache & Attention](#kv-cache--attention) | 19 | `█████░░░░░` 9/19 | 0 | 96 | 0 |
-| [Scheduling](#scheduling) | 10 | `████████░░` 8/10 | 0 | 67 | 0 |
+| [Scheduling](#scheduling) | 10 | `█████████░` 9/10 | 0 | 73 | 1 |
 | [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 28 | 2 |
 | [Parallelism & Distribution](#parallelism--distribution) | 10 | `███░░░░░░░` 3/10 | 0 | 33 | 0 |
 | [Performance Optimizations](#performance-optimizations) | 13 | `██░░░░░░░░` 2/13 | 4 | 6 | 0 |
@@ -55,7 +55,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | 8 | `██████░░░░` 5/8 | 0 | 19 | 10 |
 | [Observability & Operations](#observability--operations) | 7 | `██████████` 7/7 | 1 | 15 | 0 |
 | [CLI & Deployment](#cli--deployment) | 16 | `██████████` 15/16 | 2 | 14 | 0 |
-| **Total** | **213** | `█████░░░░░` **115/213** | **35** | **621** | **73** |
+| **Total** | **213** | `█████░░░░░` **116/213** | **35** | **627** | **74** |
 
 ---
 
@@ -276,11 +276,13 @@
 | Prefix cache hits | &#x1F535; | &#x1F535; | 5 | 0 | |
 | Pause / resume | &#x1F535; | &#x1F535; | 3 | 0 | |
 | Multi-step scheduling (`--num-scheduler-steps`) | &#x1F535; | &#x1F534; | — | — | P0 |
-| Async scheduler | &#x1F535; | &#x1F534; | — | — | P2 |
+| Async scheduler | &#x1F535; | &#x1F535; | 6 | 1 | |
 
 > **Continuous batching note:** Python vLLM's "continuous batching" combines two things: (1) iteration-level scheduling — the scheduler can add/remove requests at each step, and (2) batched model execution — all scheduled requests' tokens are concatenated into a single flat 1D `input_ids` tensor and processed in one `model.forward()` call, with per-request boundaries tracked via attention metadata. The Rust port now implements both: `CandleWorker` (paged KV path) concatenates all requests' tokens into flat `[total_tokens]` tensors, builds `AttentionMetadata` with per-request slicing info, and calls `model.forward_batch()` — a single pass that batches embedding, projections, norms, and MLP across all requests while running attention per-request via `BatchedKvCacheStorage`. `MlxWorker` defers `eval()` across all per-request forward passes, enabling MLX graph fusion into a single Metal command buffer. `LlamaForCausalLM` provides a real batched implementation (covering LLaMA, Mistral, Qwen2, Qwen3, Phi-3); other architectures fall back to the default per-request loop. The remaining gap vs Python vLLM is batched attention kernels (FlashAttention varlen / FlashInfer) — the Rust port still runs attention per-request within the batched forward.
 >
 > Unit counts: `scheduler/core.rs` (30), `scheduler/request_queue.rs` (14), `scheduler/output.rs` (5), `scheduler/interface.rs` (2), `request.rs` (16). Batched forward: `attention_metadata.rs` (3), `llama.rs` forward_batch equivalence (2), `candle_worker.rs` paged multi-request (2). Block allocation count includes `block_pool.rs` and `kv_cache_manager.rs` allocate/free/eviction tests counted above in KV Cache; per-row counts here reflect scheduler-specific tests.
+>
+> **Async scheduler note:** Enabled by default (matching Python vLLM V1). The executor runs on a dedicated OS thread; the step loop schedules the next batch while the GPU executes the current one — overlapping CPU scheduling with GPU execution. Channel-based communication (`sync_channel(1)`) provides backpressure. Disable with `--disable-async-scheduling` CLI flag. Unit tests: `engine_core.rs` (6 — take_executor, step_errors_after_take, schedule_next empty/with_requests, finalize_step, shutdown_after_take). E2E: all 96 E2E tests exercise the async path; 1 explicit sync-path smoke test (`test_sync_scheduling_smollm_chat`).
 >
 > **Multi-step scheduling note:** Python vLLM's `--num-scheduler-steps` (default 1) was a V0 engine feature that ran N decode steps per scheduler call to amortize scheduling overhead. The V1 engine (default since vLLM 0.8.x) deprecated this flag — V1's async scheduler and persistent `InputBatch` achieve the same throughput gains without multi-step complexity. P0 — not worth implementing.
 
@@ -539,6 +541,6 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Unit tests | ~948 test files | 842 passing (784 non-MLX + 58 MLX) |
-| E2E tests | — | 78 passing (36 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 3 embedding pooling + 4 LoRA) |
+| Unit tests | ~948 test files | 848 passing (790 non-MLX + 58 MLX) |
+| E2E tests | — | 96 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 6 LLM API + 4 LoRA) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

@@ -12,6 +12,7 @@ metal = ["vllm-mlx"]
 [dependencies]
 vllm-common = { workspace = true }
 vllm-config = { workspace = true }
+vllm-core = { workspace = true }
 vllm-engine = { workspace = true }
 vllm-executor = { workspace = true }
 vllm-model = { workspace = true }

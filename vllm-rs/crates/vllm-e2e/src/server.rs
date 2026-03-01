@@ -36,6 +36,7 @@ impl TestServer {
             tool_call_parser: None,
             lora_adapter: None,
             pooling_strategy: None,
+            disable_async_scheduling: false,
         }
     }
 
@@ -65,6 +66,7 @@ pub struct TestServerBuilder {
     tool_call_parser: Option<String>,
     lora_adapter: Option<String>,
     pooling_strategy: Option<String>,
+    disable_async_scheduling: bool,
 }
 
 impl TestServerBuilder {
@@ -104,6 +106,12 @@ impl TestServerBuilder {
         self
     }
 
+    /// Disable async scheduling (use synchronous step loop instead).
+    pub fn with_sync_scheduling(mut self) -> Self {
+        self.disable_async_scheduling = true;
+        self
+    }
+
     /// Start the server in-process and wait for it to become healthy.
     pub async fn start(self) -> Result<TestServer> {
         // Initialize tracing. Silent by default; set RUST_LOG=info to see
@@ -133,6 +141,7 @@ impl TestServerBuilder {
             gpu_memory_utilization: 0.9,
             lora_adapter: self.lora_adapter.clone(),
             pooling_strategy,
+            disable_async_scheduling: self.disable_async_scheduling,
             ..Default::default()
         };
 

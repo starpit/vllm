@@ -63,6 +63,9 @@ pub struct VllmConfig {
     pub lora_adapter: Option<String>,
     /// Pooling strategy for embeddings: "auto", "last", "cls", "mean".
     pub pooling_strategy: String,
+    /// Whether to disable async scheduling (overlap GPU/CPU work).
+    /// Default false — async scheduling is enabled by default.
+    pub disable_async_scheduling: bool,
 }
 
 impl Default for VllmConfig {
@@ -83,6 +86,7 @@ impl Default for VllmConfig {
             ngram_prompt_lookup_min: 1,
             lora_adapter: None,
             pooling_strategy: "auto".to_string(),
+            disable_async_scheduling: false,
         }
     }
 }
@@ -295,7 +299,7 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         num_gpu_blocks,
         block_size: config.block_size,
         engine_index: 0,
-        async_scheduling: false,
+        async_scheduling: true,
         use_spec_decode: config.speculative_model.is_some(),
         ngram_proposer_config: if config.speculative_model.as_deref() == Some("ngram") {
             Some(vllm_engine::ngram::NgramProposerConfig {
@@ -349,7 +353,13 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         AsyncEngine::new(client, model_name.clone(), max_model_len)
     };
 
-    // 9. Return the stack.
+    // 9. Enable async scheduling unless disabled.
+    let mut engine = engine;
+    if !config.disable_async_scheduling {
+        engine.set_async_scheduling(true);
+    }
+
+    // 10. Return the stack.
     Ok(InitializedStack {
         engine: Arc::new(engine),
         model_name,

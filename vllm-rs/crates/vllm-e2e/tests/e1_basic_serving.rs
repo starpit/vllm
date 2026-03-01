@@ -704,3 +704,26 @@ async fn test_t1_float16_chat_basic() {
     let text = resp.choices[0].message.content.as_deref().unwrap_or("");
     assert_coherent_text(text, 2);
 }
+
+// ---------------------------------------------------------------------------
+// Sync scheduling path (verify both scheduling modes work)
+// ---------------------------------------------------------------------------
+
+/// Smoke test: sync scheduling path still works end-to-end.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_sync_scheduling_smollm_chat() {
+    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+        .with_sync_scheduling()
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text, 2);
+}

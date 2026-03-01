@@ -54,6 +54,7 @@ RUST_LOG=info cargo test -p vllm-e2e --features e2e,metal -- --ignored --test-th
 - **Logging**: Silent by default. Set `RUST_LOG=info` (or `debug`, `trace`) to see model download progress, weight loading, cache initialization, and request handling.
 - **Startup timeout**: 120 seconds per server (configurable via `TestServerBuilder::with_timeout`). First run may be slower due to HF model download.
 - **Tokio runtime**: Tests use `#[tokio::test(flavor = "multi_thread")]` because the engine step loop requires `block_in_place`.
+- **Async scheduling**: All E2E tests exercise the async scheduling path by default (executor on a dedicated OS thread, overlapping GPU execution with CPU scheduling). Use `TestServerBuilder::with_sync_scheduling()` to test the synchronous path.
 
 ---
 
@@ -182,7 +183,15 @@ For each model in the test matrix:
 | `test_float16_chat_basic` | Float16 model generates coherent text |
 | `test_float16_vs_quantized_both_work` | Both float16 and 4-bit variants produce non-empty responses for same prompt |
 
-**Deliverables**: ~30 tests covering server lifecycle for all architectures.
+### E1c. Scheduling mode coverage — DONE
+
+All E2E tests exercise the **async scheduling** path by default (enabled in `initialize_stack()`, matching Python vLLM V1). One explicit sync-path test validates the synchronous step loop still works end-to-end.
+
+| Test | Description |
+|------|-------------|
+| **`test_sync_scheduling_smollm_chat`** | **DONE** — `with_sync_scheduling()` builder → SmolLM chat works with synchronous step loop |
+
+**Deliverables**: ~30 tests covering server lifecycle for all architectures + 1 sync scheduling test.
 
 ---
 
@@ -643,7 +652,7 @@ cargo test -p vllm-e2e --features e2e,metal --test e_llm_api -- --ignored --test
 | Phase | Tests | Models Used | Run Frequency | Estimated Time |
 |-------|------:|-------------|---------------|----------------|
 | E0. Infrastructure | 0 | — | — | — |
-| E1. Basic Serving | ~30 | All tiers | PR / nightly / weekly | 5 min (Tier 1+2) |
+| E1. Basic Serving | ~30 (+1 sync sched) | All tiers | PR / nightly / weekly | 5 min (Tier 1+2) |
 | E2. Chat Completions | ~30 | SmolLM-135M | Every PR | 3 min |
 | E3. Streaming | ~14 | SmolLM-135M | Every PR | 2 min |
 | E4. Text Completions | ~9 | SmolLM-135M | Every PR | 1 min |

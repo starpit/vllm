@@ -11,11 +11,12 @@
 //! Port of: `vllm/v1/engine/core_client.py`
 
 use vllm_common::{EngineCoreOutputs, EngineCoreRequest, Request};
+use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_protocol::messages::PauseMode;
 
-use crate::engine_core::{EngineCore, EngineCoreConfig};
+use crate::engine_core::{EngineCore, EngineCoreConfig, StepOutputs};
 use crate::error::EngineResult;
-use crate::executor::Executor;
+use crate::executor::{Executor, ModelRunnerOutput};
 
 // ---------------------------------------------------------------------------
 // EngineCoreClient trait
@@ -62,6 +63,38 @@ pub trait EngineCoreClient {
         Err(crate::error::EngineError::Executor(
             "embedding not supported".into(),
         ))
+    }
+
+    // -------------------------------------------------------------------
+    // Async scheduling split ops (default: unsupported)
+    // -------------------------------------------------------------------
+
+    /// Take the executor out for use on a dedicated thread.
+    fn take_executor(&mut self) -> Option<Box<dyn Executor>> {
+        None
+    }
+
+    /// Post-execution processing: update state from model output.
+    fn finalize_step(
+        &mut self,
+        _sched: &SchedulerOutput,
+        _model: &ModelRunnerOutput,
+    ) -> EngineResult<StepOutputs> {
+        Err(crate::error::EngineError::Executor(
+            "finalize_step not supported".into(),
+        ))
+    }
+
+    /// Run scheduling if there is work to do.
+    fn schedule_next(&mut self) -> EngineResult<Option<SchedulerOutput>> {
+        Err(crate::error::EngineError::Executor(
+            "schedule_next not supported".into(),
+        ))
+    }
+
+    /// Whether async scheduling is enabled on the underlying engine.
+    fn async_scheduling(&self) -> bool {
+        false
     }
 }
 
@@ -169,6 +202,26 @@ impl EngineCoreClient for InprocClient {
 
     fn embed(&mut self, token_id_seqs: Vec<Vec<u32>>) -> EngineResult<Vec<Vec<f32>>> {
         self.engine.embed(token_id_seqs)
+    }
+
+    fn take_executor(&mut self) -> Option<Box<dyn Executor>> {
+        self.engine.take_executor()
+    }
+
+    fn finalize_step(
+        &mut self,
+        sched: &SchedulerOutput,
+        model: &ModelRunnerOutput,
+    ) -> EngineResult<StepOutputs> {
+        Ok(self.engine.finalize_step(sched, model))
+    }
+
+    fn schedule_next(&mut self) -> EngineResult<Option<SchedulerOutput>> {
+        Ok(self.engine.schedule_next())
+    }
+
+    fn async_scheduling(&self) -> bool {
+        self.engine.async_scheduling()
     }
 }
 

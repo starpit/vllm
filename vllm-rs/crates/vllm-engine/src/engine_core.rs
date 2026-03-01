@@ -53,7 +53,8 @@ pub struct EngineCore {
     scheduler: Scheduler,
 
     /// The executor that runs model forward passes.
-    executor: Box<dyn Executor>,
+    /// `None` when taken for async scheduling (moved to a dedicated thread).
+    executor: Option<Box<dyn Executor>>,
 
     /// Index of this engine (for data-parallel setups).
     engine_index: u32,
@@ -68,7 +69,6 @@ pub struct EngineCore {
     aborts_queue: VecDeque<Vec<String>>,
 
     /// Whether async scheduling is enabled.
-    #[allow(dead_code)]
     async_scheduling: bool,
 
     /// N-gram proposer for speculative decoding (None when disabled).
@@ -135,7 +135,7 @@ impl EngineCore {
 
         Self {
             scheduler,
-            executor,
+            executor: Some(executor),
             engine_index: config.engine_index,
             is_shutdown: false,
             start_time: Instant::now(),
@@ -258,7 +258,14 @@ impl EngineCore {
     ///
     /// Returns a map of client_index → outputs, and a flag indicating
     /// whether the model was actually executed.
+    ///
+    /// Requires the executor to be present (not taken for async scheduling).
     pub fn step(&mut self) -> EngineResult<(StepOutputs, bool)> {
+        let executor = self
+            .executor
+            .as_mut()
+            .ok_or_else(|| EngineError::Executor("executor taken for async scheduling".into()))?;
+
         if !self.scheduler.has_requests() {
             return Ok((HashMap::new(), false));
         }
@@ -272,18 +279,56 @@ impl EngineCore {
         }
 
         // 2. Execute model.
-        let model_output = self
-            .executor
+        let model_output = executor
             .execute_model(&scheduler_output)
             .map_err(|e| EngineError::Executor(e.to_string()))?;
 
-        // 3. Process any pending aborts.
+        // 3. Finalize: process outputs, aborts, ngram, and stats.
+        let outputs = self.finalize_step(&scheduler_output, &model_output);
+
+        Ok((outputs, model_executed))
+    }
+
+    /// Take the executor out of the engine core for use on a dedicated thread.
+    ///
+    /// Returns `None` if the executor was already taken. After this call,
+    /// `step()` and `embed()` will error — the caller must use
+    /// `schedule_next()` + `finalize_step()` with the taken executor.
+    pub fn take_executor(&mut self) -> Option<Box<dyn Executor>> {
+        self.executor.take()
+    }
+
+    /// Run scheduling if there is work to do.
+    ///
+    /// Returns `Some(scheduler_output)` when tokens are scheduled,
+    /// `None` when there is nothing to execute.
+    pub fn schedule_next(&mut self) -> Option<SchedulerOutput> {
+        if !self.scheduler.has_requests() {
+            return None;
+        }
+        let sched = self.scheduler.schedule();
+        if sched.total_num_scheduled_tokens == 0 {
+            return None;
+        }
+        Some(sched)
+    }
+
+    /// Post-execution processing: update state from model output, process
+    /// aborts, run ngram proposer, and attach scheduler stats.
+    ///
+    /// Used by both the sync `step()` path and the async scheduling path.
+    pub fn finalize_step(
+        &mut self,
+        scheduler_output: &SchedulerOutput,
+        model_output: &ModelRunnerOutput,
+    ) -> StepOutputs {
+        // 1. Process any pending aborts.
         self.process_aborts_queue();
 
-        // 4. Update scheduler state and build outputs.
-        let mut outputs = self.update_from_output(&scheduler_output, &model_output);
+        // 2. Update scheduler state and build outputs.
+        let mut outputs = self.update_from_output(scheduler_output, model_output);
 
-        // 4b. Propose speculative draft tokens for running requests.
+        // 3. Propose speculative draft tokens for running requests.
         if let Some(ref proposer) = self.ngram_proposer {
             for req_id in scheduler_output.num_scheduled_tokens.keys() {
                 let should_propose = self
@@ -308,7 +353,7 @@ impl EngineCore {
             }
         }
 
-        // 5. Attach scheduler stats to outputs.
+        // 4. Attach scheduler stats to outputs.
         let (num_running, num_waiting) = self.scheduler.get_request_counts();
         let stats = SchedulerStats {
             num_running_reqs: num_running,
@@ -319,7 +364,7 @@ impl EngineCore {
             engine_outputs.scheduler_stats = Some(stats);
         }
 
-        Ok((outputs, model_executed))
+        outputs
     }
 
     /// Update the scheduler state from model output and build engine outputs.
@@ -545,7 +590,11 @@ impl EngineCore {
 
     /// Compute embeddings, bypassing the scheduler.
     pub fn embed(&mut self, token_id_seqs: Vec<Vec<u32>>) -> EngineResult<Vec<Vec<f32>>> {
-        self.executor.embed(token_id_seqs)
+        let executor = self
+            .executor
+            .as_mut()
+            .ok_or_else(|| EngineError::Executor("executor taken for async scheduling".into()))?;
+        executor.embed(token_id_seqs)
     }
 
     /// Shut down the engine core.
@@ -556,7 +605,14 @@ impl EngineCore {
         info!("Shutting down EngineCore");
         self.is_shutdown = true;
         self.scheduler.shutdown();
-        self.executor.shutdown();
+        if let Some(ref mut executor) = self.executor {
+            executor.shutdown();
+        }
+    }
+
+    /// Whether async scheduling is enabled.
+    pub fn async_scheduling(&self) -> bool {
+        self.async_scheduling
     }
 
     // -----------------------------------------------------------------------
@@ -1185,5 +1241,96 @@ mod tests {
             // Just verify no panics and the request is functional.
             assert!(!req.all_token_ids.is_empty());
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Async scheduling support tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_take_executor() {
+        let config = make_test_config();
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        // First take succeeds.
+        let ex = engine.take_executor();
+        assert!(ex.is_some());
+
+        // Second take returns None.
+        assert!(engine.take_executor().is_none());
+    }
+
+    #[test]
+    fn test_step_errors_after_take() {
+        let config = make_test_config();
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        engine.add_request(make_request("req-1", 10));
+        let _ = engine.take_executor();
+
+        // step() should error because executor was taken.
+        assert!(engine.step().is_err());
+    }
+
+    #[test]
+    fn test_schedule_next_empty() {
+        let config = make_test_config();
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        // No requests → None.
+        assert!(engine.schedule_next().is_none());
+    }
+
+    #[test]
+    fn test_schedule_next_with_requests() {
+        let config = make_test_config();
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        engine.add_request(make_request("req-1", 10));
+
+        let sched = engine.schedule_next();
+        assert!(sched.is_some());
+        let sched = sched.unwrap();
+        assert!(sched.total_num_scheduled_tokens > 0);
+    }
+
+    #[test]
+    fn test_finalize_step_produces_output() {
+        let config = make_test_config();
+        let mut noop = NoopExecutor::new(1024);
+        noop.initialize_cache(1024, 0).unwrap();
+
+        let mut engine = EngineCore::new(config, Box::new(NoopExecutor::new(1024)));
+        engine.add_request(make_request("req-1", 10));
+
+        // Schedule, then manually execute and finalize.
+        let sched = engine.schedule_next().unwrap();
+        let mut executor = engine.take_executor().unwrap();
+        let model_output = executor.execute_model(&sched).unwrap();
+        let outputs = engine.finalize_step(&sched, &model_output);
+
+        // Should have outputs for client 0.
+        assert!(!outputs.is_empty());
+        let client_0 = outputs.get(&0).unwrap();
+        assert!(!client_0.outputs.is_empty());
+        assert_eq!(client_0.outputs[0].request_id, "req-1");
+        assert!(!client_0.outputs[0].new_token_ids.is_empty());
+    }
+
+    #[test]
+    fn test_shutdown_after_take() {
+        let config = make_test_config();
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        let _ = engine.take_executor();
+
+        // Shutdown should not panic even with executor taken.
+        engine.shutdown();
+        assert!(engine.is_shutdown());
     }
 }

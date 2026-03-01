@@ -220,6 +220,9 @@ impl LLM {
             tokio::task::block_in_place(|| crate::init::initialize_stack(&config))
         })?;
 
+        // Enter the runtime context so tokio::spawn works inside
+        // spawn_step_loop (needed for async scheduling path).
+        let _guard = runtime.enter();
         let step_handle = engine.spawn_step_loop();
 
         Ok(Self {

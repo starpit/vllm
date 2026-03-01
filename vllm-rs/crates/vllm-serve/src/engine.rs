@@ -13,11 +13,12 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, Notify, mpsc};
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 use vllm_common::sampling::GuidedGrammar;
 use vllm_common::{EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, StopReason};
 use vllm_engine::core_client::EngineCoreClient;
+use vllm_engine::executor::{Executor, ModelRunnerOutput};
 
 use crate::chat_template::ChatTemplate;
 use crate::detokenizer::IncrementalDetokenizer;
@@ -159,6 +160,8 @@ pub struct AsyncEngine {
     chat_template: Option<Arc<ChatTemplate>>,
     /// Optional tool call parser for extracting structured tool calls from output.
     tool_parser: Option<Arc<dyn ToolCallParser>>,
+    /// Whether async scheduling is enabled (overlap GPU execution with CPU scheduling).
+    async_scheduling: bool,
 }
 
 impl AsyncEngine {
@@ -185,6 +188,7 @@ impl AsyncEngine {
             tokenizer: None,
             chat_template: None,
             tool_parser: None,
+            async_scheduling: false,
         }
     }
 
@@ -217,6 +221,11 @@ impl AsyncEngine {
     /// Set the tool call parser on this engine.
     pub fn set_tool_parser(&mut self, parser: Arc<dyn ToolCallParser>) {
         self.tool_parser = Some(parser);
+    }
+
+    /// Enable or disable async scheduling.
+    pub fn set_async_scheduling(&mut self, enabled: bool) {
+        self.async_scheduling = enabled;
     }
 
     /// Get the model name.
@@ -852,13 +861,24 @@ impl AsyncEngine {
             .take()
             .expect("spawn_step_loop called twice");
 
-        Self::spawn_step_loop_inner(
-            client,
-            rx,
-            embed_rx,
-            Arc::clone(&self.requests),
-            Arc::clone(&self.notify),
-        )
+        if self.async_scheduling {
+            info!("Async scheduling enabled — overlapping GPU execution with CPU scheduling");
+            Self::spawn_step_loop_async(
+                client,
+                rx,
+                embed_rx,
+                Arc::clone(&self.requests),
+                Arc::clone(&self.notify),
+            )
+        } else {
+            Self::spawn_step_loop_inner(
+                client,
+                rx,
+                embed_rx,
+                Arc::clone(&self.requests),
+                Arc::clone(&self.notify),
+            )
+        }
     }
 
     /// Internal: actually spawn the step loop with the client.
@@ -946,6 +966,169 @@ impl AsyncEngine {
                 // 5. Wake all waiting handlers so they can check their results.
                 notify.notify_waiters();
             }
+        })
+    }
+
+    /// Async scheduling step loop: overlaps GPU execution with CPU work.
+    ///
+    /// The executor is moved to a dedicated OS thread. The tokio task handles
+    /// scheduling, output processing, and request drain concurrently with
+    /// GPU execution.
+    fn spawn_step_loop_async(
+        mut client: Box<dyn EngineCoreClient + Send>,
+        mut request_rx: mpsc::UnboundedReceiver<EngineCoreRequest>,
+        mut embed_rx: mpsc::UnboundedReceiver<EmbedRequest>,
+        requests: Arc<Mutex<HashMap<String, RequestState>>>,
+        notify: Arc<Notify>,
+    ) -> tokio::task::JoinHandle<()> {
+        // Take the executor out of the client for the dedicated thread.
+        let executor = client
+            .take_executor()
+            .expect("async scheduling requires an executor");
+
+        // Bounded channel with capacity 1: the step loop can't enqueue a new
+        // schedule until the executor consumes the previous one.
+        let (sched_tx, sched_rx) = std::sync::mpsc::sync_channel::<ExecutorWork>(1);
+        let (model_tx, mut model_rx) = tokio::sync::mpsc::channel::<ExecutorResult>(1);
+
+        // Spawn the executor on a dedicated OS thread.
+        std::thread::Builder::new()
+            .name("vllm-executor".into())
+            .spawn(move || executor_thread_loop(executor, sched_rx, model_tx))
+            .expect("failed to spawn executor thread");
+
+        tokio::spawn(async move {
+            // Pending model output from the previous step (None initially).
+            let mut pending_sched: Option<vllm_core::scheduler::output::SchedulerOutput> = None;
+
+            loop {
+                // 0. Drain pending embedding requests.
+                while let Ok(embed_req) = embed_rx.try_recv() {
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    if sched_tx
+                        .send(ExecutorWork::Embed(embed_req.token_id_seqs, reply_tx))
+                        .is_err()
+                    {
+                        let _ = embed_req.reply.send(Err(ServeError::Internal(
+                            "executor thread shut down".into(),
+                        )));
+                        continue;
+                    }
+                    let result = reply_rx
+                        .await
+                        .unwrap_or(Err(ServeError::Internal("embed reply lost".into())));
+                    let _ = embed_req.reply.send(result);
+                }
+
+                // 1. Drain pending request submissions (non-blocking).
+                let mut added = false;
+                while let Ok(ec_request) = request_rx.try_recv() {
+                    if let Err(e) = client.add_request(ec_request) {
+                        error!("Failed to add request: {}", e);
+                    }
+                    added = true;
+                }
+
+                // 2. If we have a pending schedule in flight, wait for its result.
+                if let Some(prev_sched) = pending_sched.take() {
+                    // Wait for the model output from the executor thread.
+                    match model_rx.recv().await {
+                        Some(ExecutorResult::Model(Ok(model_output))) => {
+                            // Process the completed step's output.
+                            match client.finalize_step(&prev_sched, &model_output) {
+                                Ok(outputs) => {
+                                    route_step_outputs(&requests, outputs).await;
+                                }
+                                Err(e) => {
+                                    error!("finalize_step error: {}", e);
+                                }
+                            }
+                        }
+                        Some(ExecutorResult::Model(Err(e))) => {
+                            error!("Executor error: {}", e);
+                        }
+                        None => {
+                            // Executor thread exited.
+                            break;
+                        }
+                    }
+
+                    // Wake waiters after processing output.
+                    notify.notify_waiters();
+
+                    // Drain requests that arrived while GPU was busy.
+                    while let Ok(ec_request) = request_rx.try_recv() {
+                        if let Err(e) = client.add_request(ec_request) {
+                            error!("Failed to add request: {}", e);
+                        }
+                    }
+                }
+
+                // 3. Try to schedule the next batch.
+                match client.schedule_next() {
+                    Ok(Some(sched)) => {
+                        // Send to executor thread (blocks if previous not consumed yet,
+                        // but sync_channel(1) ensures at most 1 in flight).
+                        if sched_tx
+                            .send(ExecutorWork::Execute(Box::new(sched.clone())))
+                            .is_err()
+                        {
+                            break; // Executor thread exited.
+                        }
+                        pending_sched = Some(sched);
+                    }
+                    Ok(None) => {
+                        // Nothing to schedule. Route any pending outputs and wait.
+                        notify.notify_waiters();
+
+                        // Check if there are tracked requests.
+                        let has_requests = {
+                            let reqs = requests.lock().await;
+                            !reqs.is_empty()
+                        };
+
+                        if !has_requests && !added {
+                            // Block until a new request or embed arrives.
+                            tokio::select! {
+                                Some(ec_request) = request_rx.recv() => {
+                                    if let Err(e) = client.add_request(ec_request) {
+                                        error!("Failed to add request: {}", e);
+                                    }
+                                }
+                                Some(embed_req) = embed_rx.recv() => {
+                                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                                    if sched_tx
+                                        .send(ExecutorWork::Embed(
+                                            embed_req.token_id_seqs,
+                                            reply_tx,
+                                        ))
+                                        .is_err()
+                                    {
+                                        let _ = embed_req.reply.send(Err(ServeError::Internal(
+                                            "executor thread shut down".into(),
+                                        )));
+                                    } else {
+                                        let result = reply_rx.await.unwrap_or(Err(
+                                            ServeError::Internal("embed reply lost".into()),
+                                        ));
+                                        let _ = embed_req.reply.send(result);
+                                    }
+                                    notify.notify_waiters();
+                                    continue;
+                                }
+                                else => break, // Both channels closed.
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("schedule_next error: {}", e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+
+            // Shutdown: drop the sender so the executor thread exits.
+            let _ = sched_tx.send(ExecutorWork::Shutdown);
         })
     }
 
@@ -1559,6 +1742,85 @@ impl AsyncEngine {
             guided_grammar,
             ..Default::default()
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async scheduling types and executor thread
+// ---------------------------------------------------------------------------
+
+use vllm_engine::error::EngineResult;
+
+/// Work item sent from the step loop to the executor thread.
+enum ExecutorWork {
+    /// Execute a model forward pass.
+    Execute(Box<vllm_core::scheduler::output::SchedulerOutput>),
+    /// Compute embeddings (reply goes back via the oneshot).
+    Embed(
+        Vec<Vec<u32>>,
+        tokio::sync::oneshot::Sender<ServeResult<Vec<Vec<f32>>>>,
+    ),
+    /// Shut down the executor.
+    Shutdown,
+}
+
+/// Result sent back from the executor thread to the step loop.
+enum ExecutorResult {
+    /// Model forward pass result.
+    Model(EngineResult<ModelRunnerOutput>),
+}
+
+/// The executor thread's main loop.
+///
+/// Receives work items from the step loop, executes them, and sends results
+/// back. Runs on a dedicated OS thread so GPU work doesn't block tokio.
+fn executor_thread_loop(
+    mut executor: Box<dyn Executor>,
+    rx: std::sync::mpsc::Receiver<ExecutorWork>,
+    tx: tokio::sync::mpsc::Sender<ExecutorResult>,
+) {
+    while let Ok(work) = rx.recv() {
+        match work {
+            ExecutorWork::Execute(sched) => {
+                let result = executor.execute_model(&sched);
+                if tx.blocking_send(ExecutorResult::Model(result)).is_err() {
+                    break; // Step loop dropped its receiver.
+                }
+            }
+            ExecutorWork::Embed(seqs, reply) => {
+                let result = executor
+                    .embed(seqs)
+                    .map_err(|e| ServeError::Engine(e.to_string()));
+                let _ = reply.send(result);
+            }
+            ExecutorWork::Shutdown => {
+                executor.shutdown();
+                break;
+            }
+        }
+    }
+}
+
+/// Route step outputs to request states and update metrics.
+async fn route_step_outputs(
+    requests: &Mutex<HashMap<String, RequestState>>,
+    outputs: vllm_engine::engine_core::StepOutputs,
+) {
+    for (_, engine_outputs) in outputs {
+        // Update scheduler gauges from stats.
+        if let Some(stats) = &engine_outputs.scheduler_stats {
+            let m = crate::metrics::VllmMetrics::global();
+            m.num_requests_running.set(stats.num_running_reqs as f64);
+            m.num_requests_waiting.set(stats.num_waiting_reqs as f64);
+            m.kv_cache_usage_perc.set(stats.kv_cache_usage);
+        }
+
+        if !engine_outputs.outputs.is_empty() {
+            let mut reqs = requests.lock().await;
+            for output in engine_outputs.outputs {
+                AsyncEngine::process_output(&mut reqs, output);
+            }
+        }
     }
 }
 

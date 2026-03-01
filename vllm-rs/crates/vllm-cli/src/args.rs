@@ -139,6 +139,11 @@ pub struct ServeArgs {
     /// HuggingFace repo ID.
     #[arg(long)]
     pub lora_adapter: Option<String>,
+
+    /// Disable async scheduling (overlap of GPU execution and CPU scheduling).
+    /// By default, async scheduling is enabled for better throughput.
+    #[arg(long)]
+    pub disable_async_scheduling: bool,
 }
 
 impl ServeArgs {

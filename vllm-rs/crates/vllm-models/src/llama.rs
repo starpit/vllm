@@ -266,12 +266,15 @@ pub struct LlamaAttention {
     head_dim: usize,
     scale: f64,
     sliding_window: Option<usize>,
+    /// Layer index for extracting the correct per-layer KV handle in batched forward.
+    layer_idx: usize,
 }
 
 impl LlamaAttention {
     /// Load attention weights.
     ///
     /// Weight names: `{prefix}.q_proj`, `{prefix}.k_proj`, `{prefix}.v_proj`, `{prefix}.o_proj`
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         weights: &ModelWeights,
         prefix: &str,
@@ -280,6 +283,7 @@ impl LlamaAttention {
         device: &Device,
         rank: usize,
         world_size: usize,
+        layer_idx: usize,
     ) -> ModelResult<Self> {
         let q_proj = ColumnParallelLinear::load(
             weights,
@@ -337,11 +341,17 @@ impl LlamaAttention {
             head_dim,
             scale: 1.0 / (head_dim as f64).sqrt(),
             sliding_window: config.sliding_window,
+            layer_idx,
         })
     }
 
     /// Create with zero weights (for testing).
-    pub fn zeros(config: &LlamaConfig, dtype: DType, device: &Device) -> ModelResult<Self> {
+    pub fn zeros(
+        config: &LlamaConfig,
+        dtype: DType,
+        device: &Device,
+        layer_idx: usize,
+    ) -> ModelResult<Self> {
         let hidden = config.hidden_size;
         let q_size = config.num_attention_heads * config.head_dim;
         let kv_size = config.num_kv_heads * config.head_dim;
@@ -373,6 +383,7 @@ impl LlamaAttention {
             head_dim: config.head_dim,
             scale: 1.0 / (config.head_dim as f64).sqrt(),
             sliding_window: config.sliding_window,
+            layer_idx,
         })
     }
 
@@ -435,6 +446,75 @@ impl LlamaAttention {
             .forward(&attn_output)
             .map_err(ModelError::Candle)
     }
+
+    /// Batched forward: Q/K/V projections + RoPE on all tokens, per-request attention loop.
+    pub fn forward_batch(
+        &self,
+        hidden_states: &Tensor,
+        positions: &Tensor,
+        attn_meta: &crate::AttentionMetadata,
+        storage: &mut crate::BatchedKvCacheStorage<'_>,
+    ) -> ModelResult<Tensor> {
+        let total_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
+
+        // Batched Q/K/V projections on ALL tokens at once.
+        let q = self
+            .q_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
+        let k = self
+            .k_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
+        let v = self
+            .v_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
+
+        // Reshape to [total_tokens, num_heads, head_dim].
+        let q = q
+            .reshape((total_tokens, self.num_q_heads, self.head_dim))
+            .map_err(ModelError::Candle)?;
+        let k = k
+            .reshape((total_tokens, self.num_kv_heads, self.head_dim))
+            .map_err(ModelError::Candle)?;
+        let v = v
+            .reshape((total_tokens, self.num_kv_heads, self.head_dim))
+            .map_err(ModelError::Candle)?;
+
+        // Batched RoPE on all tokens.
+        let (q, k) = self.rotary_emb.apply(&q, &k, positions)?;
+
+        // Per-request attention loop (reuses existing attention_with_cache unchanged).
+        let mut output_parts = Vec::with_capacity(attn_meta.num_reqs);
+        for req_idx in 0..attn_meta.num_reqs {
+            let (start, q_len) = attn_meta.request_slice(req_idx);
+            let q_req = q.narrow(0, start, q_len).map_err(ModelError::Candle)?;
+            let k_req = k.narrow(0, start, q_len).map_err(ModelError::Candle)?;
+            let v_req = v.narrow(0, start, q_len).map_err(ModelError::Candle)?;
+            let handle = storage.request_layer_handle(req_idx, self.layer_idx);
+            let out = attention_with_cache(
+                &q_req,
+                &k_req,
+                &v_req,
+                self.scale,
+                Some(handle),
+                self.sliding_window,
+            )?;
+            output_parts.push(out);
+        }
+        let attn_output = Tensor::cat(&output_parts, 0).map_err(ModelError::Candle)?;
+
+        // Reshape back to [total_tokens, num_q_heads * head_dim].
+        let attn_output = attn_output
+            .reshape((total_tokens, self.num_q_heads * self.head_dim))
+            .map_err(ModelError::Candle)?;
+
+        // Batched output projection.
+        self.o_proj
+            .forward(&attn_output)
+            .map_err(ModelError::Candle)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +541,7 @@ impl LlamaDecoderLayer {
     /// - `mlp.{gate,up,down}_proj`
     /// - `input_layernorm`
     /// - `post_attention_layernorm`
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         weights: &ModelWeights,
         prefix: &str,
@@ -469,6 +550,7 @@ impl LlamaDecoderLayer {
         device: &Device,
         rank: usize,
         world_size: usize,
+        layer_idx: usize,
     ) -> ModelResult<Self> {
         let self_attn = LlamaAttention::load(
             weights,
@@ -478,6 +560,7 @@ impl LlamaDecoderLayer {
             device,
             rank,
             world_size,
+            layer_idx,
         )?;
         let mlp = LlamaMLP::load(weights, &format!("{}.mlp", prefix), dtype, rank, world_size)?;
         let input_layernorm = RmsNorm::load(
@@ -532,6 +615,36 @@ impl LlamaDecoderLayer {
 
         Ok(hidden_states)
     }
+
+    /// Batched forward: norms and MLP on all tokens, attention per-request.
+    pub fn forward_batch(
+        &self,
+        hidden_states: &Tensor,
+        positions: &Tensor,
+        attn_meta: &crate::AttentionMetadata,
+        storage: &mut crate::BatchedKvCacheStorage<'_>,
+    ) -> ModelResult<Tensor> {
+        // Batched pre-attention layernorm.
+        let normed = self
+            .input_layernorm
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
+        // Batched Q/K/V + RoPE, per-request attention, batched o_proj.
+        let attn_output = self
+            .self_attn
+            .forward_batch(&normed, positions, attn_meta, storage)?;
+        let hidden_states = (hidden_states + attn_output).map_err(ModelError::Candle)?;
+
+        // Batched post-attention layernorm + MLP.
+        let normed = self
+            .post_attention_layernorm
+            .forward(&hidden_states)
+            .map_err(ModelError::Candle)?;
+        let mlp_output = self.mlp.forward(&normed).map_err(ModelError::Candle)?;
+        let hidden_states = (hidden_states + mlp_output).map_err(ModelError::Candle)?;
+
+        Ok(hidden_states)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +685,7 @@ impl LlamaModel {
                 device,
                 rank,
                 world_size,
+                i,
             )?;
             layers.push(layer);
         }
@@ -613,6 +727,32 @@ impl LlamaModel {
             hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
         }
 
+        self.norm
+            .forward(&hidden_states)
+            .map_err(ModelError::Candle)
+    }
+
+    /// Batched forward pass.
+    pub fn forward_batch(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        attn_meta: &crate::AttentionMetadata,
+        kv_storage: &mut crate::BatchedKvCacheStorage<'_>,
+    ) -> ModelResult<Tensor> {
+        // Batched embedding.
+        let mut hidden_states = self
+            .embed_tokens
+            .forward(input_ids)
+            .map_err(ModelError::Candle)?;
+
+        // Batched layer forward.
+        for layer in &self.layers {
+            hidden_states =
+                layer.forward_batch(&hidden_states, positions, attn_meta, kv_storage)?;
+        }
+
+        // Batched final norm.
         self.norm
             .forward(&hidden_states)
             .map_err(ModelError::Candle)
@@ -698,6 +838,20 @@ impl crate::Model for LlamaForCausalLM {
 
     fn hidden_states(&self, input_ids: &Tensor, positions: &Tensor) -> ModelResult<Tensor> {
         self.model.forward(input_ids, positions, None)
+    }
+
+    fn forward_batch(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        attn_meta: &crate::AttentionMetadata,
+        kv_storage: &mut crate::BatchedKvCacheStorage<'_>,
+    ) -> ModelResult<Tensor> {
+        let hidden_states = self
+            .model
+            .forward_batch(input_ids, positions, attn_meta, kv_storage)?;
+        let logits = self.compute_logits(&hidden_states)?;
+        logits.to_dtype(DType::F32).map_err(ModelError::Candle)
     }
 }
 
@@ -838,7 +992,7 @@ mod tests {
     #[test]
     fn test_llama_attention_forward() {
         let config = test_config();
-        let attn = LlamaAttention::zeros(&config, DType::F32, &Device::Cpu).unwrap();
+        let attn = LlamaAttention::zeros(&config, DType::F32, &Device::Cpu, 0).unwrap();
 
         let num_tokens = 4;
         let x = Tensor::ones(&[num_tokens, config.hidden_size], DType::F32, &Device::Cpu).unwrap();
@@ -851,7 +1005,7 @@ mod tests {
     #[test]
     fn test_llama_attention_gqa() {
         let config = test_config_gqa();
-        let attn = LlamaAttention::zeros(&config, DType::F32, &Device::Cpu).unwrap();
+        let attn = LlamaAttention::zeros(&config, DType::F32, &Device::Cpu, 0).unwrap();
 
         let num_tokens = 3;
         let x = Tensor::ones(&[num_tokens, config.hidden_size], DType::F32, &Device::Cpu).unwrap();
@@ -864,7 +1018,7 @@ mod tests {
     #[test]
     fn test_llama_attention_single_token() {
         let config = test_config();
-        let attn = LlamaAttention::zeros(&config, DType::F32, &Device::Cpu).unwrap();
+        let attn = LlamaAttention::zeros(&config, DType::F32, &Device::Cpu, 0).unwrap();
 
         let x = Tensor::ones(&[1, config.hidden_size], DType::F32, &Device::Cpu).unwrap();
         let positions = Tensor::new(&[0u32], &Device::Cpu).unwrap();
@@ -1142,7 +1296,7 @@ mod tests {
         // Verify that KV cache is populated on prefill and used on decode,
         // and that the decode output shape is correct.
         let config = test_config();
-        let attn = LlamaAttention::zeros(&config, DType::F32, &Device::Cpu).unwrap();
+        let attn = LlamaAttention::zeros(&config, DType::F32, &Device::Cpu, 0).unwrap();
 
         // Prefill: 4 tokens.
         let x = Tensor::ones(&[4, config.hidden_size], DType::F32, &Device::Cpu).unwrap();
@@ -1315,5 +1469,197 @@ mod tests {
 
         let bytes = safetensors::tensor::serialize(views, None).unwrap();
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Helper: build a full LlamaForCausalLM from the test_config with small weights.
+    fn make_test_model() -> (LlamaConfig, LlamaForCausalLM) {
+        let config = test_config();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let mut tensor_specs: Vec<(String, Vec<usize>)> = Vec::new();
+        tensor_specs.push((
+            "model.embed_tokens.weight".to_string(),
+            vec![config.vocab_size, config.hidden_size],
+        ));
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{}", i);
+            let q_size = config.num_attention_heads * config.head_dim;
+            let kv_size = config.num_kv_heads * config.head_dim;
+            for (name, shape) in [
+                (
+                    format!("{prefix}.self_attn.q_proj.weight"),
+                    vec![q_size, config.hidden_size],
+                ),
+                (
+                    format!("{prefix}.self_attn.k_proj.weight"),
+                    vec![kv_size, config.hidden_size],
+                ),
+                (
+                    format!("{prefix}.self_attn.v_proj.weight"),
+                    vec![kv_size, config.hidden_size],
+                ),
+                (
+                    format!("{prefix}.self_attn.o_proj.weight"),
+                    vec![config.hidden_size, q_size],
+                ),
+                (
+                    format!("{prefix}.mlp.gate_proj.weight"),
+                    vec![config.intermediate_size, config.hidden_size],
+                ),
+                (
+                    format!("{prefix}.mlp.up_proj.weight"),
+                    vec![config.intermediate_size, config.hidden_size],
+                ),
+                (
+                    format!("{prefix}.mlp.down_proj.weight"),
+                    vec![config.hidden_size, config.intermediate_size],
+                ),
+                (
+                    format!("{prefix}.input_layernorm.weight"),
+                    vec![config.hidden_size],
+                ),
+                (
+                    format!("{prefix}.post_attention_layernorm.weight"),
+                    vec![config.hidden_size],
+                ),
+            ] {
+                tensor_specs.push((name, shape));
+            }
+        }
+        tensor_specs.push(("model.norm.weight".to_string(), vec![config.hidden_size]));
+        tensor_specs.push((
+            "lm_head.weight".to_string(),
+            vec![config.vocab_size, config.hidden_size],
+        ));
+        create_test_weights(&path, &tensor_specs);
+
+        let weights = ModelWeights::from_single_file(&path, &device).unwrap();
+        // Keep the dir alive by leaking it (tests are short-lived).
+        std::mem::forget(dir);
+        let model = LlamaForCausalLM::load(&weights, &config, dtype, &device, 0, 1).unwrap();
+        (config, model)
+    }
+
+    #[test]
+    fn test_forward_batch_matches_sequential_prefill() {
+        // Verify that forward_batch produces the same logits as sequential
+        // forward() calls for two prefill requests.
+        let (config, model) = make_test_model();
+        let device = Device::Cpu;
+
+        // Two requests: 3 tokens and 2 tokens.
+        let ids_a = Tensor::new(&[1u32, 2, 3], &device).unwrap();
+        let pos_a = Tensor::new(&[0u32, 1, 2], &device).unwrap();
+        let ids_b = Tensor::new(&[4u32, 5], &device).unwrap();
+        let pos_b = Tensor::new(&[0u32, 1], &device).unwrap();
+
+        // Sequential: two separate forward() calls (no KV cache).
+        let logits_a = crate::Model::forward(&model, &ids_a, &pos_a, None).unwrap();
+        let logits_b = crate::Model::forward(&model, &ids_b, &pos_b, None).unwrap();
+
+        // Batched: single forward_batch call.
+        let flat_ids = Tensor::cat(&[&ids_a, &ids_b], 0).unwrap();
+        let flat_pos = Tensor::cat(&[&pos_a, &pos_b], 0).unwrap();
+
+        let mut pool = crate::KvBlockPool::new(
+            4,
+            config.num_hidden_layers,
+            config.num_kv_heads,
+            config.head_dim,
+            16,
+            DType::F32,
+            &device,
+        )
+        .unwrap();
+        let attn_meta = crate::AttentionMetadata {
+            num_reqs: 2,
+            total_tokens: 5,
+            query_start_loc: vec![0, 3, 5],
+            q_lens: vec![3, 2],
+            seq_lens: vec![3, 2],
+            block_ids: vec![vec![0], vec![1]],
+            tokens_before: vec![0, 0],
+            is_prefill: vec![true, true],
+            req_ids: vec!["a".into(), "b".into()],
+        };
+        let mut batched =
+            crate::BatchedKvCacheStorage::new(&mut pool, vec![vec![0], vec![1]], vec![0, 0]);
+        let logits_batched =
+            crate::Model::forward_batch(&model, &flat_ids, &flat_pos, &attn_meta, &mut batched)
+                .unwrap();
+        batched.flush_all().unwrap();
+
+        // Split and compare.
+        let batch_a = logits_batched.narrow(0, 0, 3).unwrap();
+        let batch_b = logits_batched.narrow(0, 3, 2).unwrap();
+
+        assert_eq!(batch_a.dims(), logits_a.dims());
+        assert_eq!(batch_b.dims(), logits_b.dims());
+
+        // Logits should be identical (deterministic ops, same weights).
+        let diff_a = (batch_a - logits_a).unwrap().abs().unwrap().max(0).unwrap();
+        let max_diff_a: f32 = diff_a.max(0).unwrap().to_scalar().unwrap();
+        assert!(
+            max_diff_a < 1e-4,
+            "Request A logits differ: max_diff={max_diff_a}"
+        );
+
+        let diff_b = (batch_b - logits_b).unwrap().abs().unwrap().max(0).unwrap();
+        let max_diff_b: f32 = diff_b.max(0).unwrap().to_scalar().unwrap();
+        assert!(
+            max_diff_b < 1e-4,
+            "Request B logits differ: max_diff={max_diff_b}"
+        );
+    }
+
+    #[test]
+    fn test_forward_batch_single_request_matches_forward() {
+        // Batch of 1 should produce identical results to forward().
+        let (config, model) = make_test_model();
+        let device = Device::Cpu;
+
+        let ids = Tensor::new(&[1u32, 2, 3, 4], &device).unwrap();
+        let pos = Tensor::new(&[0u32, 1, 2, 3], &device).unwrap();
+
+        let logits_seq = crate::Model::forward(&model, &ids, &pos, None).unwrap();
+
+        let mut pool = crate::KvBlockPool::new(
+            2,
+            config.num_hidden_layers,
+            config.num_kv_heads,
+            config.head_dim,
+            16,
+            DType::F32,
+            &device,
+        )
+        .unwrap();
+        let attn_meta = crate::AttentionMetadata {
+            num_reqs: 1,
+            total_tokens: 4,
+            query_start_loc: vec![0, 4],
+            q_lens: vec![4],
+            seq_lens: vec![4],
+            block_ids: vec![vec![0]],
+            tokens_before: vec![0],
+            is_prefill: vec![true],
+            req_ids: vec!["r".into()],
+        };
+        let mut batched = crate::BatchedKvCacheStorage::new(&mut pool, vec![vec![0]], vec![0]);
+        let logits_batch =
+            crate::Model::forward_batch(&model, &ids, &pos, &attn_meta, &mut batched).unwrap();
+        batched.flush_all().unwrap();
+
+        assert_eq!(logits_batch.dims(), logits_seq.dims());
+        let diff = (logits_batch - logits_seq)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(0)
+            .unwrap();
+        let max_diff: f32 = diff.max(0).unwrap().to_scalar().unwrap();
+        assert!(max_diff < 1e-4, "Logits differ: max_diff={max_diff}");
     }
 }

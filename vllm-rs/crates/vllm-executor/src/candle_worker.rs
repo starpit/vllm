@@ -969,52 +969,115 @@ impl Worker for CandleWorker {
                 .is_some()
         });
 
-        // Run a separate forward pass per request (required because each
-        // request has its own KV cache with different sequence length).
-        for req_input in &req_inputs {
-            let input_ids = Tensor::new(req_input.token_ids.as_slice(), device)
+        // --- Forward pass ---
+        // For paged KV: batched forward (all requests in one model call).
+        // For legacy KV: per-request forward (each has its own contiguous cache).
+        //
+        // `all_logits[i]` holds logits for req_inputs[i], shape [q_len, vocab].
+        let all_logits: Vec<Tensor> = if use_paged {
+            // Build flat tensors: concatenate all requests' tokens and positions.
+            let all_token_ids: Vec<u32> = req_inputs
+                .iter()
+                .flat_map(|r| r.token_ids.iter().copied())
+                .collect();
+            let all_positions: Vec<u32> = req_inputs
+                .iter()
+                .flat_map(|r| r.positions.iter().copied())
+                .collect();
+
+            let flat_ids = Tensor::new(all_token_ids.as_slice(), device)
                 .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
-            let positions = Tensor::new(req_input.positions.as_slice(), device)
+            let flat_pos = Tensor::new(all_positions.as_slice(), device)
                 .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
 
-            let logits = if use_paged {
-                // --- Paged KV cache path ---
-                // Gathers happen lazily per-layer inside forward.
-                // Scatters are deferred and flushed in batch after forward.
-                let block_ids = self
-                    .req_block_tables
-                    .get(&req_input.req_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let tokens_before = self
-                    .req_tokens_in_pool
-                    .get(&req_input.req_id)
-                    .copied()
-                    .unwrap_or(0);
+            // Build AttentionMetadata.
+            let mut query_start_loc = Vec::with_capacity(req_inputs.len() + 1);
+            let mut q_lens = Vec::with_capacity(req_inputs.len());
+            let mut seq_lens = Vec::with_capacity(req_inputs.len());
+            let mut batch_block_ids = Vec::with_capacity(req_inputs.len());
+            let mut batch_tokens_before = Vec::with_capacity(req_inputs.len());
+            let mut is_prefill = Vec::with_capacity(req_inputs.len());
+            let mut batch_req_ids = Vec::with_capacity(req_inputs.len());
+            let mut offset = 0usize;
+            for r in &req_inputs {
+                query_start_loc.push(offset);
+                let q_len = r.token_ids.len();
+                q_lens.push(q_len);
+                let tb = self.req_tokens_in_pool.get(&r.req_id).copied().unwrap_or(0);
+                seq_lens.push(tb + q_len);
+                batch_block_ids.push(
+                    self.req_block_tables
+                        .get(&r.req_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+                batch_tokens_before.push(tb);
+                is_prefill.push(q_len > 1);
+                batch_req_ids.push(r.req_id.clone());
+                offset += q_len;
+            }
+            query_start_loc.push(offset);
 
-                let pool = self.kv_block_pool.as_mut().unwrap();
-                let mut storage = KvCacheStorage::paged(pool, &block_ids, tokens_before);
+            let attn_meta = vllm_models::AttentionMetadata {
+                num_reqs: req_inputs.len(),
+                total_tokens: offset,
+                query_start_loc,
+                q_lens: q_lens.clone(),
+                seq_lens,
+                block_ids: batch_block_ids.clone(),
+                tokens_before: batch_tokens_before.clone(),
+                is_prefill,
+                req_ids: batch_req_ids,
+            };
 
-                let logits = model
-                    .forward(&input_ids, &positions, Some(&mut storage))
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
-                    })?;
+            // Build BatchedKvCacheStorage.
+            let pool = self.kv_block_pool.as_mut().unwrap();
+            let mut batched_storage = vllm_models::BatchedKvCacheStorage::new(
+                pool,
+                batch_block_ids,
+                batch_tokens_before.clone(),
+            );
 
-                // Flush deferred scatters to the block pool.
-                storage.flush().map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
+            // Single batched forward pass.
+            let all_logits_flat = model
+                .forward_batch(&flat_ids, &flat_pos, &attn_meta, &mut batched_storage)
+                .map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
                 })?;
 
-                // Update tokens-in-pool count.
-                let new_total = tokens_before + req_input.token_ids.len();
-                self.req_tokens_in_pool
-                    .insert(req_input.req_id.clone(), new_total);
+            // Flush deferred scatters.
+            batched_storage
+                .flush_all()
+                .map_err(|e| ExecutorError::WorkerExecution(format!("scatter flush error: {e}")))?;
 
-                logits
-            } else {
-                // --- Legacy per-request KV cache path ---
-                if let Some(kv_cache) = self.kv_caches.get_mut(&req_input.req_id) {
+            // Update tokens-in-pool counts.
+            for (idx, r) in req_inputs.iter().enumerate() {
+                let new_total = batch_tokens_before[idx] + r.token_ids.len();
+                self.req_tokens_in_pool.insert(r.req_id.clone(), new_total);
+            }
+
+            // Split flat logits [total_tokens, vocab] into per-request logits.
+            let mut per_req_logits = Vec::with_capacity(req_inputs.len());
+            let mut pos = 0usize;
+            for r in &req_inputs {
+                let q_len = r.token_ids.len();
+                let req_logits = all_logits_flat
+                    .narrow(0, pos, q_len)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("narrow error: {e}")))?;
+                per_req_logits.push(req_logits);
+                pos += q_len;
+            }
+            per_req_logits
+        } else {
+            // --- Legacy per-request KV cache path ---
+            let mut per_req_logits = Vec::with_capacity(req_inputs.len());
+            for req_input in &req_inputs {
+                let input_ids = Tensor::new(req_input.token_ids.as_slice(), device)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+                let positions = Tensor::new(req_input.positions.as_slice(), device)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+
+                let logits = if let Some(kv_cache) = self.kv_caches.get_mut(&req_input.req_id) {
                     let mut storage = KvCacheStorage::Contiguous(kv_cache);
                     model
                         .forward(&input_ids, &positions, Some(&mut storage))
@@ -1025,8 +1088,15 @@ impl Worker for CandleWorker {
                     model.forward(&input_ids, &positions, None).map_err(|e| {
                         ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
                     })?
-                }
-            };
+                };
+                per_req_logits.push(logits);
+            }
+            per_req_logits
+        };
+
+        // --- Per-request sampling (same for both paths) ---
+        for (req_idx, req_input) in req_inputs.iter().enumerate() {
+            let logits = &all_logits[req_idx];
 
             // Compute prompt logprobs if requested and this is a prefill
             // (more than 1 input token). logits[i] predicts token_ids[i+1].
@@ -1036,7 +1106,6 @@ impl Worker for CandleWorker {
             {
                 let top_n = top_n.max(0) as usize;
                 let num_positions = req_input.token_ids.len() - 1;
-                // Extract logits for positions 0..n-1 → predict tokens 1..n
                 let prefix_logits = logits
                     .narrow(0, 0, num_positions)
                     .and_then(|t| t.to_dtype(DType::F32))
@@ -1738,5 +1807,163 @@ mod tests {
         assert!(!worker.token_buffers.contains_key("r1"));
         assert!(!worker.sampling_params_map.contains_key("r1"));
         assert!(!worker.kv_caches.contains_key("r1"));
+    }
+
+    #[test]
+    fn test_execute_model_paged_multi_request_prefill() {
+        // Test the batched forward path: two concurrent prefill requests
+        // with paged KV cache.
+        use std::collections::HashSet;
+        use vllm_core::scheduler::output::{CachedRequestData, NewRequestData, SchedulerOutput};
+
+        let mut worker = CandleWorker::new(make_config());
+        worker.device = Some(Device::Cpu);
+        worker.model = Some(Box::new(TinyStubModel::new(32, 8)));
+
+        // Set up a paged KV block pool (the TinyStubModel has 1 layer).
+        // 4 blocks, block_size=16, 1 kv_head, head_dim=8 (matches nothing
+        // real but the stub model doesn't use the KV cache).
+        worker.kv_block_pool =
+            Some(vllm_models::KvBlockPool::new(4, 1, 1, 8, 16, DType::F32, &Device::Cpu).unwrap());
+
+        // Two concurrent prefill requests.
+        let mut num_scheduled = HashMap::new();
+        num_scheduled.insert("r1".to_string(), 3);
+        num_scheduled.insert("r2".to_string(), 2);
+
+        let scheduler_output = SchedulerOutput {
+            scheduled_new_reqs: vec![
+                NewRequestData::new(
+                    "r1".to_string(),
+                    Some(vec![1, 2, 3]),
+                    vec![vec![0]],
+                    0,
+                    Some(SamplingParams::default()),
+                ),
+                NewRequestData::new(
+                    "r2".to_string(),
+                    Some(vec![4, 5]),
+                    vec![vec![1]],
+                    0,
+                    Some(SamplingParams::default()),
+                ),
+            ],
+            scheduled_cached_reqs: CachedRequestData::make_empty(),
+            num_scheduled_tokens: num_scheduled,
+            total_num_scheduled_tokens: 5,
+            scheduled_spec_decode_tokens: HashMap::new(),
+            scheduled_encoder_inputs: HashMap::new(),
+            num_common_prefix_blocks: Vec::new(),
+            finished_req_ids: HashSet::new(),
+            free_encoder_mm_hashes: Vec::new(),
+            preempted_req_ids: None,
+        };
+
+        let result = worker.execute_model(&scheduler_output).unwrap();
+
+        // Both requests should have produced a token.
+        let tokens_r1 = result.get_tokens("r1").unwrap();
+        let tokens_r2 = result.get_tokens("r2").unwrap();
+        assert_eq!(tokens_r1.len(), 1);
+        assert_eq!(tokens_r2.len(), 1);
+        assert!((tokens_r1[0] as usize) < 32);
+        assert!((tokens_r2[0] as usize) < 32);
+
+        // Token buffers: prompt + 1 generated.
+        assert_eq!(worker.token_buffers["r1"].len(), 4);
+        assert_eq!(worker.token_buffers["r2"].len(), 3);
+
+        // Tokens-in-pool should be updated.
+        assert_eq!(worker.req_tokens_in_pool["r1"], 3);
+        assert_eq!(worker.req_tokens_in_pool["r2"], 2);
+    }
+
+    #[test]
+    fn test_execute_model_paged_prefill_then_concurrent_decode() {
+        // Test batched forward: prefill two requests, then decode them
+        // concurrently in the same step.
+        use std::collections::HashSet;
+        use vllm_core::scheduler::output::{CachedRequestData, NewRequestData, SchedulerOutput};
+
+        let mut worker = CandleWorker::new(make_config());
+        worker.device = Some(Device::Cpu);
+        worker.model = Some(Box::new(TinyStubModel::new(32, 8)));
+        worker.kv_block_pool =
+            Some(vllm_models::KvBlockPool::new(4, 1, 1, 8, 16, DType::F32, &Device::Cpu).unwrap());
+
+        // Step 1: prefill both requests.
+        let mut num_scheduled = HashMap::new();
+        num_scheduled.insert("r1".to_string(), 3);
+        num_scheduled.insert("r2".to_string(), 2);
+
+        let prefill = SchedulerOutput {
+            scheduled_new_reqs: vec![
+                NewRequestData::new(
+                    "r1".to_string(),
+                    Some(vec![1, 2, 3]),
+                    vec![vec![0]],
+                    0,
+                    Some(SamplingParams::default()),
+                ),
+                NewRequestData::new(
+                    "r2".to_string(),
+                    Some(vec![4, 5]),
+                    vec![vec![1]],
+                    0,
+                    Some(SamplingParams::default()),
+                ),
+            ],
+            scheduled_cached_reqs: CachedRequestData::make_empty(),
+            num_scheduled_tokens: num_scheduled,
+            total_num_scheduled_tokens: 5,
+            scheduled_spec_decode_tokens: HashMap::new(),
+            scheduled_encoder_inputs: HashMap::new(),
+            num_common_prefix_blocks: Vec::new(),
+            finished_req_ids: HashSet::new(),
+            free_encoder_mm_hashes: Vec::new(),
+            preempted_req_ids: None,
+        };
+        worker.execute_model(&prefill).unwrap();
+
+        // Step 2: decode both concurrently.
+        let mut num_scheduled = HashMap::new();
+        num_scheduled.insert("r1".to_string(), 1);
+        num_scheduled.insert("r2".to_string(), 1);
+
+        let decode = SchedulerOutput {
+            scheduled_new_reqs: Vec::new(),
+            scheduled_cached_reqs: CachedRequestData {
+                req_ids: vec!["r1".to_string(), "r2".to_string()],
+                resumed_req_ids: HashSet::new(),
+                new_token_ids: Vec::new(),
+                new_block_ids: vec![None, None],
+                num_computed_tokens: vec![4, 3],
+                num_output_tokens: vec![1, 1],
+            },
+            num_scheduled_tokens: num_scheduled,
+            total_num_scheduled_tokens: 2,
+            scheduled_spec_decode_tokens: HashMap::new(),
+            scheduled_encoder_inputs: HashMap::new(),
+            num_common_prefix_blocks: Vec::new(),
+            finished_req_ids: HashSet::new(),
+            free_encoder_mm_hashes: Vec::new(),
+            preempted_req_ids: None,
+        };
+
+        let result = worker.execute_model(&decode).unwrap();
+
+        // Both decoded successfully.
+        let tokens_r1 = result.get_tokens("r1").unwrap();
+        let tokens_r2 = result.get_tokens("r2").unwrap();
+        assert_eq!(tokens_r1.len(), 1);
+        assert_eq!(tokens_r2.len(), 1);
+
+        // Buffers grew: prompt + 2 generated tokens each.
+        assert_eq!(worker.token_buffers["r1"].len(), 5);
+        assert_eq!(worker.token_buffers["r2"].len(), 4);
+
+        // Tokens-in-pool incremented.
+        assert_eq!(worker.req_tokens_in_pool["r1"], 4);
+        assert_eq!(worker.req_tokens_in_pool["r2"], 3);
     }
 }

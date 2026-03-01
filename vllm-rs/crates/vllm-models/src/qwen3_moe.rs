@@ -341,6 +341,7 @@ impl Qwen3MoeDecoderLayer {
             device,
             0,
             1,
+            layer_idx,
         )?;
 
         let mlp = if config.is_moe_layer(layer_idx) {
@@ -389,7 +390,7 @@ impl Qwen3MoeDecoderLayer {
         device: &Device,
     ) -> ModelResult<Self> {
         let llama_config = config.llama_config();
-        let self_attn = LlamaAttention::zeros(&llama_config, dtype, device)?;
+        let self_attn = LlamaAttention::zeros(&llama_config, dtype, device, layer_idx)?;
 
         let mlp = if config.is_moe_layer(layer_idx) {
             Qwen3MoeMlp::MoE(Qwen3MoE::zeros(config, dtype, device)?)

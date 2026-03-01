@@ -262,6 +262,7 @@ impl MixtralDecoderLayer {
         config: &MixtralConfig,
         dtype: DType,
         device: &Device,
+        layer_idx: usize,
     ) -> ModelResult<Self> {
         let llama_config = config.llama_config();
         let self_attn = LlamaAttention::load(
@@ -272,6 +273,7 @@ impl MixtralDecoderLayer {
             device,
             0,
             1,
+            layer_idx,
         )?;
 
         let block_sparse_moe = MixtralMoE::load(
@@ -303,9 +305,14 @@ impl MixtralDecoderLayer {
     }
 
     /// Create with zero weights (for testing).
-    pub fn zeros(config: &MixtralConfig, dtype: DType, device: &Device) -> ModelResult<Self> {
+    pub fn zeros(
+        config: &MixtralConfig,
+        dtype: DType,
+        device: &Device,
+        layer_idx: usize,
+    ) -> ModelResult<Self> {
         let llama_config = config.llama_config();
-        let self_attn = LlamaAttention::zeros(&llama_config, dtype, device)?;
+        let self_attn = LlamaAttention::zeros(&llama_config, dtype, device, layer_idx)?;
         let block_sparse_moe = MixtralMoE::zeros(config, dtype, device)?;
 
         let input_layernorm =
@@ -380,6 +387,7 @@ impl MixtralModel {
                 config,
                 dtype,
                 device,
+                i,
             )?);
         }
 
@@ -577,7 +585,7 @@ mod tests {
         let device = Device::Cpu;
         let dtype = DType::F32;
 
-        let layer = MixtralDecoderLayer::zeros(&config, dtype, &device).unwrap();
+        let layer = MixtralDecoderLayer::zeros(&config, dtype, &device, 0).unwrap();
         let x = Tensor::zeros((3, config.hidden_size), dtype, &device).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2], &device).unwrap();
         let output = layer.forward(&x, &positions, None).unwrap();

@@ -667,10 +667,20 @@ impl Worker for MlxWorker {
         // CPU sampler for penalty/min_p/logit_bias/logprobs support.
         let mut cpu_sampler = vllm_models::Sampler::new();
 
-        // Run a separate forward pass per request (each has its own KV cache).
-        for req_input in &req_inputs {
-            let step_start = Instant::now();
+        let step_start = Instant::now();
 
+        // --- Phase A: Run all forward passes, collecting lazy logit arrays ---
+        // MLX lazy eval means these build compute graphs without materializing.
+        // By deferring eval until after all forwards, MLX can fuse all graphs
+        // into a single Metal command buffer.
+        struct LazyReqOutput {
+            last_logits: Array,
+            full_logits_f32: Option<Array>,
+            prompt_logprobs_info: Option<(usize, Vec<u32>)>,
+        }
+        let mut lazy_outputs: Vec<LazyReqOutput> = Vec::with_capacity(req_inputs.len());
+
+        for req_input in &req_inputs {
             let input_ids = Array::from_iter(
                 req_input.token_ids.iter().map(|&t| t as i32),
                 &[req_input.token_ids.len() as i32],
@@ -693,31 +703,66 @@ impl Worker for MlxWorker {
                     ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
                 })?;
 
-            // Compute prompt logprobs if requested and this is a prefill.
-            if req_input.is_prefill
+            // Extract last-position logits (still lazy — no eval).
+            let last_pos = req_input.token_ids.len() - 1;
+            let last_logits = if req_input.token_ids.len() > 1 {
+                logits
+                    .index(last_pos as i32)
+                    .expand_dims(0)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("index error: {e}")))?
+            } else {
+                logits.clone()
+            };
+
+            // Prepare prompt logprobs conversion (lazy).
+            let (full_logits_f32, prompt_logprobs_info) = if req_input.is_prefill
                 && req_input.token_ids.len() > 1
                 && let Some(params) = self.sampling_params_map.get(&req_input.req_id)
-                && let Some(top_n) = params.prompt_logprobs
+                && params.prompt_logprobs.is_some()
             {
-                let top_n = top_n.max(0) as usize;
-                let num_positions = req_input.token_ids.len() - 1;
-                // Eval the full logits to extract prompt-position logits.
-                logits
-                    .eval()
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
-                let full_logits_f32 = logits.as_dtype(Dtype::Float32).map_err(|e| {
+                let top_n = params.prompt_logprobs.unwrap().max(0) as usize;
+                let f32_logits = logits.as_dtype(Dtype::Float32).map_err(|e| {
                     ExecutorError::WorkerExecution(format!("dtype cast error: {e}"))
                 })?;
-                full_logits_f32
-                    .eval()
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
-                // full_logits_f32 shape: [num_tokens, vocab_size]
+                (Some(f32_logits), Some((top_n, req_input.token_ids.clone())))
+            } else {
+                (None, None)
+            };
+
+            lazy_outputs.push(LazyReqOutput {
+                last_logits,
+                full_logits_f32,
+                prompt_logprobs_info,
+            });
+        }
+
+        // --- Phase B: Single batch eval materializes all graphs at once ---
+        {
+            let mut arrays_to_eval: Vec<&Array> = Vec::new();
+            for out in &lazy_outputs {
+                arrays_to_eval.push(&out.last_logits);
+                if let Some(ref f32_logits) = out.full_logits_f32 {
+                    arrays_to_eval.push(f32_logits);
+                }
+            }
+            mlx_rs::transforms::eval(arrays_to_eval)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("batch eval error: {e}")))?;
+        }
+
+        // --- Phase C: Per-request sampling on now-materialized arrays ---
+        for (req_idx, req_input) in req_inputs.iter().enumerate() {
+            let lazy_out = &lazy_outputs[req_idx];
+
+            // Compute prompt logprobs if requested (arrays are already materialized).
+            if let Some((top_n, ref token_ids)) = lazy_out.prompt_logprobs_info {
+                let full_logits_f32 = lazy_out.full_logits_f32.as_ref().unwrap();
+                let num_positions = token_ids.len() - 1;
                 let vocab_size = full_logits_f32.dim(-1) as usize;
                 let flat = full_logits_f32.as_slice::<f32>();
                 let mut plps = Vec::with_capacity(num_positions);
                 for i in 0..num_positions {
                     let row = &flat[i * vocab_size..(i + 1) * vocab_size];
-                    let actual_token = req_input.token_ids[i + 1];
+                    let actual_token = token_ids[i + 1];
                     plps.push(vllm_models::sampler::compute_logprobs(
                         row,
                         actual_token,
@@ -727,17 +772,6 @@ impl Worker for MlxWorker {
                 prompt_logprobs_map.insert(req_input.req_id.clone(), plps);
             }
 
-            // Take logits at the last position (still lazy — no eval).
-            let last_pos = req_input.token_ids.len() - 1;
-            let req_logits = if req_input.token_ids.len() > 1 {
-                logits
-                    .index(last_pos as i32)
-                    .expand_dims(0)
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("index error: {e}")))?
-            } else {
-                logits
-            };
-
             // Query grammar-allowed tokens if constrained decoding is active.
             let grammar_allowed: Option<Vec<u32>> = self
                 .grammar_states
@@ -745,7 +779,7 @@ impl Worker for MlxWorker {
                 .and_then(|g| g.allowed_tokens());
             let has_grammar = grammar_allowed.is_some();
 
-            // Determine if we need CPU-side sampling (penalties/logprobs/grammar/etc.).
+            // Determine if we need CPU-side sampling.
             let params = self.sampling_params_map.get(&req_input.req_id);
             let needs_cpu_sampling = has_grammar
                 || params.is_some_and(|p| {
@@ -759,12 +793,8 @@ impl Worker for MlxWorker {
                 });
 
             let sampled = if needs_cpu_sampling {
-                // Eval the logits graph, extract to CPU Vec<f32>, and use
-                // the unified CPU sampler which handles all penalty/filter/logprobs.
-                req_logits
-                    .eval()
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
-                let logits_f32 = req_logits.as_dtype(Dtype::Float32).map_err(|e| {
+                // Logits are already eval'd — just extract to CPU.
+                let logits_f32 = lazy_out.last_logits.as_dtype(Dtype::Float32).map_err(|e| {
                     ExecutorError::WorkerExecution(format!("dtype cast error: {e}"))
                 })?;
                 logits_f32
@@ -788,14 +818,12 @@ impl Worker for MlxWorker {
                 }
                 vec![token_id]
             } else if let Some(p) = params {
-                // Simple temperature sampling via MLX (no penalties needed).
+                // Simple temperature sampling via MLX.
                 let temp = p.temperature as f32;
-                Self::sample_with_temperature(&req_logits, temp)?
+                Self::sample_with_temperature(&lazy_out.last_logits, temp)?
             } else {
-                Self::greedy_sample(&req_logits)?
+                Self::greedy_sample(&lazy_out.last_logits)?
             };
-
-            let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
             // Advance grammar state with the sampled token.
             if let Some(guide) = self.grammar_states.get_mut(&req_input.req_id)
@@ -809,17 +837,21 @@ impl Worker for MlxWorker {
                 buf.extend_from_slice(&sampled);
             }
 
-            // Timing bookkeeping.
-            self.step_count += 1;
-            if req_input.is_prefill {
-                self.prefill_count += 1;
-                self.total_prefill_ms += step_ms;
-            } else {
-                self.decode_count += 1;
-                self.total_decode_ms += step_ms;
-            }
-
             token_map.insert(req_input.req_id.clone(), sampled);
+        }
+
+        // Timing bookkeeping (aggregate for all requests in this batch).
+        let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+        let num_prefills = req_inputs.iter().filter(|r| r.is_prefill).count();
+        let num_decodes = req_inputs.len() - num_prefills;
+        self.step_count += req_inputs.len();
+        if num_prefills > 0 {
+            self.prefill_count += num_prefills;
+            self.total_prefill_ms += step_ms * (num_prefills as f64 / req_inputs.len() as f64);
+        }
+        if num_decodes > 0 {
+            self.decode_count += num_decodes;
+            self.total_decode_ms += step_ms * (num_decodes as f64 / req_inputs.len() as f64);
         }
 
         // Build ModelRunnerOutput with logprobs if any were collected.

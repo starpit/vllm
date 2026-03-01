@@ -216,7 +216,7 @@
 | `ignore_eos` | &#x1F535; | &#x1F535; | 1 | 0 | |
 | `min_tokens` | &#x1F535; | &#x1F535; | 1 | 0 | |
 | Seed (reproducible sampling) | &#x1F535; | &#x1F535; | 2 | 1 | |
-| Guided decoding (grammar/regex/JSON) | &#x1F535; | &#x1F535; | 6 | 0 | P4 |
+| Guided decoding (grammar/regex/JSON) | &#x1F535; | &#x1F535; | 6 | 0 | |
 
 > Unit counts drawn from `sampling.rs` (27 tests — validation, serde, types) and `sampler.rs` (24 tests — greedy, temperature, top-k/p, min-p, penalties, logprobs, prompt logprobs, grammar mask), plus 1 engine propagation test. Guided decoding unit tests count API-level resolve/conflict tests in `engine.rs`; grammar engine tests are in the [Structured Output](#structured-output--guided-decoding) section.
 
@@ -378,7 +378,7 @@
 | `response_format: json_object` | &#x1F535; | &#x1F535; | 2 | 0 | |
 | `response_format: json_schema` | &#x1F535; | &#x1F535; | 3 | 0 | |
 | Grammar-guided logit masking | &#x1F535; | &#x1F535; | 5 | 0 | |
-| Regex-constrained decoding | &#x1F535; | &#x1F535; | 2 | 0 | P4 |
+| Regex-constrained decoding | &#x1F535; | &#x1F535; | 2 | 0 | |
 
 > Unit counts from `grammar.rs` (8 tests: mask basic/empty/all-allowed, build vocabulary, JSON schema compile, regex digit, guided_grammar regex variant, advance+finish) plus `engine.rs` resolve/conflict tests (4 tests, attributed to [Serving](#serving--openai-api) `response_format` row). Total section: 12 unit tests.
 

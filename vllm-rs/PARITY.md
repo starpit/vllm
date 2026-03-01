@@ -6,16 +6,16 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 159 |
+| &#x1F535; | Fully implemented | 160 |
 | &#x1F7E1; | Partially implemented | 5 |
-| &#x1F534; | Not implemented | 107 |
+| &#x1F534; | Not implemented | 106 |
 
 ### Priority (for incomplete features)
 
 | Priority | Meaning | Count |
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
-| **P3** | High — meaningfully expands user base or enables key use cases | 20 |
+| **P3** | High — meaningfully expands user base or enables key use cases | 19 |
 | **P2** | Medium — useful improvement, broader coverage | 37 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
@@ -45,7 +45,7 @@
 | [Scheduling](#scheduling) | 10 | `█████████░` 9/10 | 0 | 73 | 1 |
 | [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 28 | 2 |
 | [Parallelism & Distribution](#parallelism--distribution) | 10 | `███░░░░░░░` 3/10 | 0 | 33 | 0 |
-| [Performance Optimizations](#performance-optimizations) | 13 | `██░░░░░░░░` 2/13 | 4 | 6 | 0 |
+| [Performance Optimizations](#performance-optimizations) | 13 | `██░░░░░░░░` 3/13 | 4 | 6 | 0 |
 | [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | 12 | `██░░░░░░░░` 3/12 | 0 | 0 | 0 |
 | [LoRA / Adapters](#lora--adapters) | 5 | `████░░░░░░` 2/5 | 0 | 12 | 8 |
 | [Speculative Decoding](#speculative-decoding) | 5 | `██░░░░░░░░` 1/5 | 0 | 20 | 0 |
@@ -55,7 +55,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | 8 | `██████░░░░` 5/8 | 0 | 19 | 10 |
 | [Observability & Operations](#observability--operations) | 7 | `██████████` 7/7 | 1 | 15 | 0 |
 | [CLI & Deployment](#cli--deployment) | 17 | `██████████` 16/17 | 2 | 19 | 6 |
-| **Total** | **213** | `█████░░░░░` **117/213** | **35** | **630** | **80** |
+| **Total** | **213** | `█████░░░░░` **118/213** | **35** | **630** | **80** |
 
 ---
 
@@ -343,7 +343,7 @@
 | MLX cross-request deferred eval | N/A | &#x1F535; | 0 | 0 | |
 | Pre-transposed weights (Metal) | N/A | &#x1F535; | 0 | 0 | |
 | Native dtype inference (`--dtype auto`) | &#x1F535; | &#x1F535; | 4 | 2 | |
-| Mixed prefill+decode in single forward pass | &#x1F535; | &#x1F534; | — | — | P3 |
+| Mixed prefill+decode in single forward pass | &#x1F535; | &#x1F535; | 0 | 0 | |
 | Persistent InputBatch (cross-iteration reuse) | &#x1F535; | &#x1F534; | — | — | P3 |
 | Paged KV (no gather copy on decode) | &#x1F535; | &#x1F535; | 2 | 0 | |
 

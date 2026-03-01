@@ -22,9 +22,15 @@ pub const ORCA_RESPONSE_HEADER: &str = "endpoint-load-metrics";
 /// or `None` for unsupported formats.
 pub fn orca_header(format: &str) -> Option<(String, String)> {
     let m = VllmMetrics::global();
-    let kv = m.kv_cache_usage_perc.get();
-    let waiting = m.num_requests_waiting.get();
+    format_orca(
+        format,
+        m.kv_cache_usage_perc.get(),
+        m.num_requests_waiting.get(),
+    )
+}
 
+/// Format ORCA header from raw metric values (pure function, no global state).
+fn format_orca(format: &str, kv: f64, waiting: f64) -> Option<(String, String)> {
     let value = match format.to_ascii_uppercase().as_str() {
         "TEXT" => format!(
             "named_metrics.kv_cache_usage_perc={kv},named_metrics.num_requests_waiting={waiting}"
@@ -48,12 +54,7 @@ mod tests {
 
     #[test]
     fn test_orca_text_format() {
-        // Reset gauges to known values.
-        let m = VllmMetrics::global();
-        m.kv_cache_usage_perc.set(0.0);
-        m.num_requests_waiting.set(0.0);
-
-        let result = orca_header("TEXT");
+        let result = format_orca("TEXT", 0.0, 0.0);
         assert!(result.is_some());
         let (name, value) = result.unwrap();
         assert_eq!(name, ORCA_RESPONSE_HEADER);
@@ -63,15 +64,7 @@ mod tests {
 
     #[test]
     fn test_orca_json_format() {
-        let m = VllmMetrics::global();
-        m.kv_cache_usage_perc.set(0.0);
-        m.num_requests_waiting.set(0.0);
-
-        let result = orca_header("JSON");
-        assert!(result.is_some());
-        let (name, value) = result.unwrap();
-        assert_eq!(name, ORCA_RESPONSE_HEADER);
-        // Should be valid JSON.
+        let (_, value) = format_orca("JSON", 0.0, 0.0).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&value).unwrap();
         assert!(parsed["named_metrics"]["kv_cache_usage_perc"].is_number());
         assert!(parsed["named_metrics"]["num_requests_waiting"].is_number());
@@ -79,42 +72,35 @@ mod tests {
 
     #[test]
     fn test_orca_case_insensitive() {
-        let result = orca_header("text");
-        assert!(result.is_some());
-
-        let result = orca_header("json");
-        assert!(result.is_some());
-
-        let result = orca_header("Json");
-        assert!(result.is_some());
+        assert!(format_orca("text", 0.0, 0.0).is_some());
+        assert!(format_orca("json", 0.0, 0.0).is_some());
+        assert!(format_orca("Json", 0.0, 0.0).is_some());
     }
 
     #[test]
     fn test_orca_unsupported_format() {
-        let result = orca_header("BINARY");
-        assert!(result.is_none());
-
-        let result = orca_header("");
-        assert!(result.is_none());
+        assert!(format_orca("BINARY", 0.0, 0.0).is_none());
+        assert!(format_orca("", 0.0, 0.0).is_none());
     }
 
     #[test]
     fn test_orca_with_nonzero_values() {
-        let m = VllmMetrics::global();
-        m.kv_cache_usage_perc.set(0.75);
-        m.num_requests_waiting.set(3.0);
-
-        let (_, value) = orca_header("TEXT").unwrap();
+        let (_, value) = format_orca("TEXT", 0.75, 3.0).unwrap();
         assert!(value.contains("kv_cache_usage_perc=0.75"));
         assert!(value.contains("num_requests_waiting=3"));
 
-        let (_, value) = orca_header("JSON").unwrap();
+        let (_, value) = format_orca("JSON", 0.75, 3.0).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&value).unwrap();
         assert_eq!(parsed["named_metrics"]["kv_cache_usage_perc"], 0.75);
         assert_eq!(parsed["named_metrics"]["num_requests_waiting"], 3.0);
+    }
 
-        // Reset.
-        m.kv_cache_usage_perc.set(0.0);
-        m.num_requests_waiting.set(0.0);
+    #[test]
+    fn test_orca_header_returns_some() {
+        // Integration test: orca_header reads from global metrics and produces output.
+        // Does not assert exact values since other tests may mutate shared gauges.
+        assert!(orca_header("TEXT").is_some());
+        assert!(orca_header("JSON").is_some());
+        assert!(orca_header("BINARY").is_none());
     }
 }

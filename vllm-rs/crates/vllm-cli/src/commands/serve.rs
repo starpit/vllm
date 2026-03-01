@@ -39,6 +39,9 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
             args.ngram_prompt_lookup_min
         );
     }
+    if let Some(ref adapter) = args.lora_adapter {
+        info!("LoRA adapter: {}", adapter);
+    }
 
     // 2. Convert CLI args to VllmConfig and initialize the full stack
     //    (on a blocking thread to avoid starving the tokio I/O driver
@@ -57,6 +60,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         num_speculative_tokens: args.num_speculative_tokens,
         ngram_prompt_lookup_max: args.ngram_prompt_lookup_max,
         ngram_prompt_lookup_min: args.ngram_prompt_lookup_min,
+        lora_adapter: args.lora_adapter.clone(),
     };
 
     let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&config))

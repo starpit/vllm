@@ -128,6 +128,12 @@ pub struct ServeArgs {
     /// Only used when --speculative-model ngram.
     #[arg(long, default_value_t = 1)]
     pub ngram_prompt_lookup_min: usize,
+
+    /// LoRA adapter to load. Path to a local directory containing
+    /// adapter_config.json and adapter_model.safetensors, or a
+    /// HuggingFace repo ID.
+    #[arg(long)]
+    pub lora_adapter: Option<String>,
 }
 
 impl ServeArgs {

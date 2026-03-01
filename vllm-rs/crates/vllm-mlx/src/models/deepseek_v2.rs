@@ -697,6 +697,78 @@ impl MlxDeepSeekV2ForCausalLM {
 }
 
 impl super::MlxModel for MlxDeepSeekV2ForCausalLM {
+    fn inject_lora(
+        &mut self,
+        adapter: &crate::lora::MlxLoraAdapter,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::lora::merge_lora_into_weight;
+        let targets = &adapter.config.target_modules;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            // MLA attention projections.
+            let attn_prefix = format!("model.layers.{}.self_attn", i);
+            // Optional low-rank Q path.
+            if targets.iter().any(|t| t == "q_a_proj") {
+                let key = format!("{}.q_a_proj", attn_prefix);
+                if let (Some((a, b)), Some(proj)) =
+                    (adapter.weights.get(&key), layer.self_attn.q_a_proj.as_mut())
+                {
+                    merge_lora_into_weight(&mut proj.weight, a, b, adapter.scaling)?;
+                }
+            }
+            if targets.iter().any(|t| t == "q_b_proj") {
+                let key = format!("{}.q_b_proj", attn_prefix);
+                if let (Some((a, b)), Some(proj)) =
+                    (adapter.weights.get(&key), layer.self_attn.q_b_proj.as_mut())
+                {
+                    merge_lora_into_weight(&mut proj.weight, a, b, adapter.scaling)?;
+                }
+            }
+            // Direct Q projection (non-low-rank path).
+            if targets.iter().any(|t| t == "q_proj") {
+                let key = format!("{}.q_proj", attn_prefix);
+                if let (Some((a, b)), Some(proj)) =
+                    (adapter.weights.get(&key), layer.self_attn.q_proj.as_mut())
+                {
+                    merge_lora_into_weight(&mut proj.weight, a, b, adapter.scaling)?;
+                }
+            }
+            // KV path and output.
+            for name in ["kv_a_proj_with_mqa", "kv_b_proj", "o_proj"] {
+                if targets.iter().any(|t| t == name) {
+                    let key = format!("{}.{}", attn_prefix, name);
+                    if let Some((a, b)) = adapter.weights.get(&key) {
+                        let proj = match name {
+                            "kv_a_proj_with_mqa" => &mut layer.self_attn.kv_a_proj_with_mqa,
+                            "kv_b_proj" => &mut layer.self_attn.kv_b_proj,
+                            "o_proj" => &mut layer.self_attn.o_proj,
+                            _ => unreachable!(),
+                        };
+                        merge_lora_into_weight(&mut proj.weight, a, b, adapter.scaling)?;
+                    }
+                }
+            }
+            // Dense MLP only (MoE layers are skipped).
+            if let MlxDeepSeekV2Mlp::Dense(ref mut mlp) = layer.mlp {
+                let mlp_prefix = format!("model.layers.{}.mlp", i);
+                for name in ["gate_proj", "up_proj", "down_proj"] {
+                    if targets.iter().any(|t| t == name) {
+                        let key = format!("{}.{}", mlp_prefix, name);
+                        if let Some((a, b)) = adapter.weights.get(&key) {
+                            let proj = match name {
+                                "gate_proj" => &mut mlp.gate_proj,
+                                "up_proj" => &mut mlp.up_proj,
+                                "down_proj" => &mut mlp.down_proj,
+                                _ => unreachable!(),
+                            };
+                            merge_lora_into_weight(&mut proj.weight, a, b, adapter.scaling)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn forward(
         &mut self,
         input_ids: &Array,

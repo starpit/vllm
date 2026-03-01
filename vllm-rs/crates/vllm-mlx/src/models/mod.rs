@@ -31,6 +31,16 @@ use vllm_model::weight::HfModelConfig;
 /// All operations are lazy — the caller must call `eval()` on the result to
 /// materialize the entire forward pass as fused Metal command buffers.
 pub trait MlxModel: Send {
+    /// Inject LoRA adapter weights into this model by merging into base weights.
+    ///
+    /// Default implementation: no-op (model doesn't support LoRA).
+    fn inject_lora(
+        &mut self,
+        _adapter: &crate::lora::MlxLoraAdapter,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
     /// Run the model forward pass.
     ///
     /// * `input_ids` — token IDs, shape `[num_tokens]`

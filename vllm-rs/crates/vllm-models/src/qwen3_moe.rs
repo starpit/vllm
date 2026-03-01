@@ -13,6 +13,7 @@ use candle_core::{DType, Device, Module, Tensor};
 
 use vllm_model::error::{ModelError, ModelResult};
 use vllm_model::layers::{Embedding, Linear, RmsNorm};
+use vllm_model::lora::LoraAdapter;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
 use crate::llama::{LlamaAttention, LlamaConfig, LlamaMLP};
@@ -547,6 +548,21 @@ impl Qwen3MoeForCausalLM {
 }
 
 impl crate::Model for Qwen3MoeForCausalLM {
+    fn inject_lora(&mut self, adapter: &LoraAdapter) -> ModelResult<()> {
+        for (i, layer) in self.model.layers.iter_mut().enumerate() {
+            // Attention uses LlamaAttention — delegate.
+            let attn_prefix = format!("model.layers.{}.self_attn", i);
+            layer.self_attn.inject_lora(&attn_prefix, adapter)?;
+
+            // MLP: only dense layers get LoRA (MoE expert LoRA is rare).
+            if let Qwen3MoeMlp::Dense(ref mut mlp) = layer.mlp {
+                let mlp_prefix = format!("model.layers.{}.mlp", i);
+                mlp.inject_lora(&mlp_prefix, adapter)?;
+            }
+        }
+        Ok(())
+    }
+
     fn forward(
         &self,
         input_ids: &Tensor,

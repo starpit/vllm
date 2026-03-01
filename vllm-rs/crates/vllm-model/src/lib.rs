@@ -10,6 +10,7 @@
 
 pub mod gguf;
 pub mod layers;
+pub mod lora;
 pub mod tensor;
 pub mod weight;
 

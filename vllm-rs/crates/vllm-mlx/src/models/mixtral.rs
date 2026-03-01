@@ -370,6 +370,34 @@ impl MlxMixtralForCausalLM {
 }
 
 impl super::MlxModel for MlxMixtralForCausalLM {
+    fn inject_lora(
+        &mut self,
+        adapter: &crate::lora::MlxLoraAdapter,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::lora::merge_lora_into_weight;
+        let targets = &adapter.config.target_modules;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            // Attention projections only — Mixtral has no dense MLP layers.
+            let attn_prefix = format!("model.layers.{}.self_attn", i);
+            for name in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                if targets.iter().any(|t| t == name) {
+                    let key = format!("{}.{}", attn_prefix, name);
+                    if let Some((a, b)) = adapter.weights.get(&key) {
+                        let proj = match name {
+                            "q_proj" => &mut layer.self_attn.q_proj,
+                            "k_proj" => &mut layer.self_attn.k_proj,
+                            "v_proj" => &mut layer.self_attn.v_proj,
+                            "o_proj" => &mut layer.self_attn.o_proj,
+                            _ => unreachable!(),
+                        };
+                        merge_lora_into_weight(&mut proj.weight, a, b, adapter.scaling)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn forward(
         &mut self,
         input_ids: &Array,

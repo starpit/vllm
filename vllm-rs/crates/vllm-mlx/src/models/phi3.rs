@@ -522,6 +522,36 @@ impl MlxPhi3ForCausalLM {
 }
 
 impl super::MlxModel for MlxPhi3ForCausalLM {
+    fn inject_lora(
+        &mut self,
+        adapter: &crate::lora::MlxLoraAdapter,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::lora::merge_lora_into_weight;
+        let targets = &adapter.config.target_modules;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            // Phi-3 uses fused qkv_proj; only the unfused o_proj is injectable.
+            if targets.iter().any(|t| t == "o_proj") {
+                let key = format!("model.layers.{}.self_attn.o_proj", i);
+                if let Some((a, b)) = adapter.weights.get(&key) {
+                    merge_lora_into_weight(
+                        &mut layer.self_attn.o_proj.weight,
+                        a,
+                        b,
+                        adapter.scaling,
+                    )?;
+                }
+            }
+            // Phi-3 uses fused gate_up_proj; only the unfused down_proj is injectable.
+            if targets.iter().any(|t| t == "down_proj") {
+                let key = format!("model.layers.{}.mlp.down_proj", i);
+                if let Some((a, b)) = adapter.weights.get(&key) {
+                    merge_lora_into_weight(&mut layer.mlp.down_proj.weight, a, b, adapter.scaling)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn forward(
         &mut self,
         input_ids: &Array,

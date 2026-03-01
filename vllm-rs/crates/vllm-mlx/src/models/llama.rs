@@ -207,9 +207,9 @@ pub(crate) fn assign_weight(
 
 /// LLaMA MLP (SiLU-gated feed-forward network) using MLX.
 pub struct MlxLlamaMLP {
-    gate_proj: nn::Linear,
-    up_proj: nn::Linear,
-    down_proj: nn::Linear,
+    pub(crate) gate_proj: nn::Linear,
+    pub(crate) up_proj: nn::Linear,
+    pub(crate) down_proj: nn::Linear,
 }
 
 impl MlxLlamaMLP {
@@ -263,10 +263,10 @@ impl MlxLlamaMLP {
 
 /// LLaMA multi-head attention with RoPE and optional GQA, using MLX.
 pub struct MlxLlamaAttention {
-    q_proj: nn::Linear,
-    k_proj: nn::Linear,
-    v_proj: nn::Linear,
-    o_proj: nn::Linear,
+    pub(crate) q_proj: nn::Linear,
+    pub(crate) k_proj: nn::Linear,
+    pub(crate) v_proj: nn::Linear,
+    pub(crate) o_proj: nn::Linear,
     /// Optional per-head Q norm (Qwen3 uses this).
     q_norm: Option<nn::RmsNorm>,
     /// Optional per-head K norm (Qwen3 uses this).
@@ -600,6 +600,50 @@ impl MlxLlamaForCausalLM {
 }
 
 impl super::MlxModel for MlxLlamaForCausalLM {
+    fn inject_lora(
+        &mut self,
+        adapter: &crate::lora::MlxLoraAdapter,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::lora::merge_lora_into_weight;
+        let targets = &adapter.config.target_modules;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            // Attention projections.
+            let attn_prefix = format!("model.layers.{}.self_attn", i);
+            for name in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                if targets.iter().any(|t| t == name) {
+                    let key = format!("{}.{}", attn_prefix, name);
+                    if let Some((a, b)) = adapter.weights.get(&key) {
+                        let proj = match name {
+                            "q_proj" => &mut layer.self_attn.q_proj,
+                            "k_proj" => &mut layer.self_attn.k_proj,
+                            "v_proj" => &mut layer.self_attn.v_proj,
+                            "o_proj" => &mut layer.self_attn.o_proj,
+                            _ => unreachable!(),
+                        };
+                        merge_lora_into_weight(&mut proj.weight, a, b, adapter.scaling)?;
+                    }
+                }
+            }
+            // MLP projections.
+            let mlp_prefix = format!("model.layers.{}.mlp", i);
+            for name in ["gate_proj", "up_proj", "down_proj"] {
+                if targets.iter().any(|t| t == name) {
+                    let key = format!("{}.{}", mlp_prefix, name);
+                    if let Some((a, b)) = adapter.weights.get(&key) {
+                        let proj = match name {
+                            "gate_proj" => &mut layer.mlp.gate_proj,
+                            "up_proj" => &mut layer.mlp.up_proj,
+                            "down_proj" => &mut layer.mlp.down_proj,
+                            _ => unreachable!(),
+                        };
+                        merge_lora_into_weight(&mut proj.weight, a, b, adapter.scaling)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn forward(
         &mut self,
         input_ids: &Array,

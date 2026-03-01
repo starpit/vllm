@@ -19,6 +19,7 @@ use candle_core::{DType, Device, Module, Tensor};
 
 use vllm_model::error::{ModelError, ModelResult};
 use vllm_model::layers::{Embedding, Linear, RmsNorm, RotaryEmbedding};
+use vllm_model::lora::LoraAdapter;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
 use crate::attention::attention_with_cache;
@@ -923,6 +924,65 @@ impl DeepSeekV2ForCausalLM {
 }
 
 impl crate::Model for DeepSeekV2ForCausalLM {
+    fn inject_lora(&mut self, adapter: &LoraAdapter) -> ModelResult<()> {
+        let targets = &adapter.config.target_modules;
+        for (i, layer) in self.model.layers.iter_mut().enumerate() {
+            let attn_prefix = format!("model.layers.{}.self_attn", i);
+            // MLA has non-standard projection names — inject via direct field access.
+            for name in targets {
+                let key = format!("{}.{}", attn_prefix, name);
+                if let Some((a, b)) = adapter.weights.get(&key) {
+                    match name.as_str() {
+                        "q_a_proj" => {
+                            if let Some(ref mut p) = layer.self_attn.q_a_proj {
+                                p.attach_lora(a.clone(), b.clone(), adapter.scaling)?;
+                            }
+                        }
+                        "q_b_proj" => {
+                            if let Some(ref mut p) = layer.self_attn.q_b_proj {
+                                p.attach_lora(a.clone(), b.clone(), adapter.scaling)?;
+                            }
+                        }
+                        "q_proj" => {
+                            if let Some(ref mut p) = layer.self_attn.q_proj {
+                                p.attach_lora(a.clone(), b.clone(), adapter.scaling)?;
+                            }
+                        }
+                        "kv_a_proj_with_mqa" => {
+                            layer.self_attn.kv_a_proj_with_mqa.attach_lora(
+                                a.clone(),
+                                b.clone(),
+                                adapter.scaling,
+                            )?;
+                        }
+                        "kv_b_proj" => {
+                            layer.self_attn.kv_b_proj.attach_lora(
+                                a.clone(),
+                                b.clone(),
+                                adapter.scaling,
+                            )?;
+                        }
+                        "o_proj" => {
+                            layer.self_attn.o_proj.attach_lora(
+                                a.clone(),
+                                b.clone(),
+                                adapter.scaling,
+                            )?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // MLP: dense layers use LlamaMLP, MoE layers have expert MLPs.
+            // Only inject LoRA into dense MLP layers (MoE expert LoRA is rare).
+            if let DeepSeekV2Mlp::Dense(ref mut mlp) = layer.mlp {
+                let mlp_prefix = format!("model.layers.{}.mlp", i);
+                mlp.inject_lora(&mlp_prefix, adapter)?;
+            }
+        }
+        Ok(())
+    }
+
     fn forward(
         &self,
         input_ids: &Tensor,

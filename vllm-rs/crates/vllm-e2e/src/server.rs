@@ -34,6 +34,7 @@ impl TestServer {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             port: None,
             tool_call_parser: None,
+            lora_adapter: None,
         }
     }
 
@@ -61,6 +62,7 @@ pub struct TestServerBuilder {
     startup_timeout: Duration,
     port: Option<u16>,
     tool_call_parser: Option<String>,
+    lora_adapter: Option<String>,
 }
 
 impl TestServerBuilder {
@@ -88,6 +90,12 @@ impl TestServerBuilder {
         self
     }
 
+    /// Set a LoRA adapter to load (local path or HF repo ID).
+    pub fn with_lora_adapter(mut self, adapter: &str) -> Self {
+        self.lora_adapter = Some(adapter.to_string());
+        self
+    }
+
     /// Start the server in-process and wait for it to become healthy.
     pub async fn start(self) -> Result<TestServer> {
         // Initialize tracing. Silent by default; set RUST_LOG=info to see
@@ -111,6 +119,7 @@ impl TestServerBuilder {
             max_num_seqs: 256,
             block_size: 16,
             gpu_memory_utilization: 0.9,
+            lora_adapter: self.lora_adapter.clone(),
             ..Default::default()
         };
 

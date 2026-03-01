@@ -47,7 +47,7 @@
 | [Parallelism & Distribution](#parallelism--distribution) | &#x1F535;3 &#x1F7E1;1 &#x1F534;6 | 33 | 0 | `███░░░░░░░` 3/10 |
 | [Performance Optimizations](#performance-optimizations) | &#x1F535;6 &#x1F534;11 | 6 | 0 | `██░░░░░░░░` 2/13 |
 | [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | &#x1F535;2 &#x1F7E1;1 &#x1F534;9 | 0 | 0 | `██░░░░░░░░` 3/12 |
-| [LoRA / Adapters](#lora--adapters) | &#x1F534;5 | 0 | 0 | `░░░░░░░░░░` 0/4 |
+| [LoRA / Adapters](#lora--adapters) | &#x1F7E2;2 &#x1F534;3 | 12 | 8 | `████░░░░░░` 2/5 |
 | [Speculative Decoding](#speculative-decoding) | &#x1F535;1 &#x1F534;4 | 20 | 0 | `██░░░░░░░░` 1/5 |
 | [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F534;10 | 0 | 0 | `░░░░░░░░░░` 0/10 |
 | [Structured Output](#structured-output--guided-decoding) | &#x1F535;4 | 12 | 0 | `██████████` 4/4 |
@@ -387,9 +387,9 @@
 
 | Feature | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
-| LoRA adapter loading | &#x1F535; | &#x1F534; | — | — | P3 |
+| LoRA adapter loading | &#x1F535; | &#x1F7E2; | 8 | 4 | P3 |
 | Multi-LoRA serving | &#x1F535; | &#x1F534; | — | — | P2 |
-| LoRA weight merging | &#x1F535; | &#x1F534; | — | — | P2 |
+| LoRA weight merging (single adapter) | &#x1F535; | &#x1F7E2; | 4 | 4 | P2 |
 | Punica kernels | &#x1F535; | &#x1F534; | — | — | P0 |
 | Dynamic adapter switching | &#x1F535; | &#x1F534; | — | — | P2 |
 

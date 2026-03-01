@@ -459,6 +459,16 @@ impl<'a> BatchedKvCacheStorage<'a> {
 ///
 /// Port of: `vllm/model_executor/models/interfaces_base.py::VllmModelForTextGeneration`
 pub trait Model: Send {
+    /// Inject LoRA adapter weights into this model.
+    ///
+    /// Walks the model's linear layers and attaches LoRA A/B pairs to those
+    /// whose names match the adapter's `target_modules`.
+    ///
+    /// Default implementation: no-op (model doesn't support LoRA).
+    fn inject_lora(&mut self, _adapter: &vllm_model::lora::LoraAdapter) -> ModelResult<()> {
+        Ok(())
+    }
+
     /// Run the model forward pass (single request).
     ///
     /// * `input_ids` — token IDs, shape `[num_tokens]`

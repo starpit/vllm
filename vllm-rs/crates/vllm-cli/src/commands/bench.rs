@@ -52,6 +52,7 @@ fn create_bench_worker(args: &BenchArgs, model: String) -> Result<Box<dyn Worker
         hf_token: args.hf_token.clone(),
         cache_dir: None,
         block_size: 16,
+        lora_adapter: None,
     };
     let mut worker = MlxWorker::new(config);
     worker.init_device()?;
@@ -73,6 +74,7 @@ fn create_bench_worker(args: &BenchArgs, model: String) -> Result<Box<dyn Worker
         cache_dir: None,
         block_size: 16,
         gguf_file: args.gguf_file.clone(),
+        lora_adapter: None,
     };
     let mut worker = CandleWorker::new(config);
     worker.init_device()?;

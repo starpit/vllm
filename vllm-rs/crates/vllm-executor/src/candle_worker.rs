@@ -53,6 +53,9 @@ pub struct CandleWorkerConfig {
     /// Specific GGUF filename to download from a HuggingFace repo.
     /// When set, only this file is downloaded instead of safetensors weights.
     pub gguf_file: Option<String>,
+
+    /// Optional path to a LoRA adapter directory (local path or HF repo ID).
+    pub lora_adapter: Option<String>,
 }
 
 impl CandleWorkerConfig {
@@ -690,6 +693,24 @@ impl Worker for CandleWorker {
             "CandleWorker: model loaded (arch={arch}, dtype={:?})",
             dtype
         );
+
+        // Inject LoRA adapter if configured.
+        if let Some(ref adapter_path) = self.config.lora_adapter {
+            let adapter =
+                vllm_model::lora::LoraAdapter::from_dir(adapter_path, "default", &device, dtype)
+                    .map_err(|e| {
+                        ExecutorError::WorkerInit(format!("failed to load LoRA adapter: {e}"))
+                    })?;
+            if let Some(ref mut model) = self.model {
+                model.inject_lora(&adapter).map_err(|e| {
+                    ExecutorError::WorkerInit(format!("failed to inject LoRA: {e}"))
+                })?;
+            }
+            info!(
+                "CandleWorker: LoRA adapter '{}' loaded (rank={}, targets={:?})",
+                adapter.name, adapter.config.r, adapter.config.target_modules
+            );
+        }
 
         // Grammar vocabulary is built lazily on first constrained-decoding request.
 
@@ -1547,6 +1568,7 @@ mod tests {
             cache_dir: None,
             block_size: 16,
             gguf_file: None,
+            lora_adapter: None,
         }
     }
 

@@ -32,6 +32,7 @@ cargo test -p vllm-e2e --features e2e,metal -- --ignored --test-threads=1
 cargo test -p vllm-e2e --features e2e,metal --test e1_basic_serving -- --ignored --test-threads=1
 cargo test -p vllm-e2e --features e2e,metal --test e2_chat_completions -- --ignored --test-threads=1
 cargo test -p vllm-e2e --features e2e,metal --test e3_streaming -- --ignored --test-threads=1
+cargo test -p vllm-e2e --features e2e,metal --test e_lora --release -- --ignored --test-threads=1
 
 # Single test:
 cargo test -p vllm-e2e --features e2e,metal --test e1_basic_serving test_t1_smollm_chat_basic -- --ignored
@@ -563,6 +564,23 @@ Tests decoder models as embedding models via the `/v1/embeddings` endpoint. Uses
 
 ---
 
+## Phase E13: LoRA Adapters — DONE
+
+Test file: `e_lora.rs`
+
+Tests single-adapter LoRA support. Creates a synthetic LoRA adapter (random A/B weights targeting q_proj + v_proj) at test time — no external adapter download needed. Runs on both Candle CPU and MLX backends depending on `--features metal`.
+
+| Test | Model | Description |
+|------|-------|-------------|
+| `test_lora_synthetic_server_starts` | SmolLM-135M-F16 | Server with synthetic LoRA adapter starts, /health + /v1/models work |
+| `test_lora_synthetic_chat` | SmolLM-135M-F16 | Chat completion with LoRA adapter returns non-empty response |
+| `test_lora_synthetic_completion` | SmolLM-135M-F16 | Text completion with LoRA adapter returns non-empty text |
+| `test_lora_synthetic_output_differs` | SmolLM-135M-F16 | Same prompt with vs without LoRA produces different outputs |
+
+**Deliverables**: 4 E2E tests (all implemented). Self-contained — generates synthetic adapter in tempdir.
+
+---
+
 ## Test Matrix Summary
 
 | Phase | Tests | Models Used | Run Frequency | Estimated Time |
@@ -580,7 +598,8 @@ Tests decoder models as embedding models via the `/v1/embeddings` endpoint. Uses
 | E10. Observability | ~6 | SmolLM-135M | Every PR | 1 min |
 | E11. CLI & Config | ~10 | SmolLM-135M | Every PR | 2 min |
 | E12. Embedding | 7 (done) | SmolLM / Qwen2 / Llama3 | Every PR | 2 min |
-| **Total** | **~169** | | | **~30 min** |
+| E13. LoRA Adapters | 4 (done) | SmolLM-135M-F16 | Every PR | <1 min |
+| **Total** | **~173** | | | **~30 min** |
 
 ### CI Tiers
 

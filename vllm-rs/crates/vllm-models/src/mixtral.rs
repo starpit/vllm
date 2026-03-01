@@ -16,6 +16,7 @@ use candle_core::{DType, Device, Module, Tensor};
 
 use vllm_model::error::{ModelError, ModelResult};
 use vllm_model::layers::{Embedding, Linear, RmsNorm};
+use vllm_model::lora::LoraAdapter;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
 use crate::llama::{LlamaAttention, LlamaConfig};
@@ -462,6 +463,16 @@ impl MixtralForCausalLM {
 }
 
 impl crate::Model for MixtralForCausalLM {
+    fn inject_lora(&mut self, adapter: &LoraAdapter) -> ModelResult<()> {
+        for (i, layer) in self.model.layers.iter_mut().enumerate() {
+            // Attention uses LlamaAttention — delegate.
+            let attn_prefix = format!("model.layers.{}.self_attn", i);
+            layer.self_attn.inject_lora(&attn_prefix, adapter)?;
+            // MoE expert LoRA is not supported — all layers are MoE.
+        }
+        Ok(())
+    }
+
     fn forward(
         &self,
         input_ids: &Tensor,

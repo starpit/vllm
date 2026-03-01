@@ -21,12 +21,20 @@ use crate::weight::ModelWeights;
 /// performance.
 ///
 /// Bias shape: [out_features] (optional)
+///
+/// Supports optional LoRA (Low-Rank Adaptation) weights. When `lora_a`
+/// and `lora_b` are set, forward computes `y = xW + x·A·B` where A and B
+/// are low-rank matrices with scaling already absorbed into B.
 pub struct Linear {
     /// Pre-transposed weight: [in_features, out_features]
     weight: Tensor,
     bias: Option<Tensor>,
     out_features: usize,
     in_features: usize,
+    /// LoRA A matrix: [in_features, rank] (pre-transposed at attach time)
+    lora_a: Option<Tensor>,
+    /// LoRA B matrix: [rank, out_features] (pre-transposed, scaling absorbed)
+    lora_b: Option<Tensor>,
 }
 
 impl Linear {
@@ -42,6 +50,8 @@ impl Linear {
             bias,
             out_features,
             in_features,
+            lora_a: None,
+            lora_b: None,
         }
     }
 
@@ -92,15 +102,50 @@ impl Linear {
     pub fn bias(&self) -> Option<&Tensor> {
         self.bias.as_ref()
     }
+
+    /// Attach LoRA adapter weights to this linear layer.
+    ///
+    /// * `lora_a` — shape `[rank, in_features]` (raw from safetensors)
+    /// * `lora_b` — shape `[out_features, rank]` (raw from safetensors)
+    /// * `scaling` — alpha / rank (or alpha / sqrt(rank) for rsLoRA)
+    ///
+    /// The weights are pre-transposed and scaling is absorbed into B so that
+    /// forward is `y + x @ A_t @ (B_t * scaling)` with no per-call overhead.
+    pub fn attach_lora(&mut self, lora_a: Tensor, lora_b: Tensor, scaling: f64) -> ModelResult<()> {
+        // lora_a raw: [rank, in_features] → transpose to [in_features, rank]
+        let a_t = lora_a.t()?.contiguous()?;
+        // lora_b raw: [out_features, rank] → transpose to [rank, out_features]
+        let b_t = lora_b.t()?.contiguous()?;
+        // Absorb scaling into B.
+        let b_scaled = (b_t * scaling)?;
+        self.lora_a = Some(a_t);
+        self.lora_b = Some(b_scaled);
+        Ok(())
+    }
+
+    /// Remove LoRA adapter weights from this layer.
+    pub fn detach_lora(&mut self) {
+        self.lora_a = None;
+        self.lora_b = None;
+    }
+
+    /// Whether this layer has a LoRA adapter attached.
+    pub fn has_lora(&self) -> bool {
+        self.lora_a.is_some() && self.lora_b.is_some()
+    }
 }
 
 impl Module for Linear {
-    /// Forward pass: y = x @ W_t + b (weight already pre-transposed)
+    /// Forward pass: y = x @ W_t + b + x @ A @ B (LoRA delta when attached)
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let y = x.matmul(&self.weight)?;
-        match &self.bias {
-            Some(b) => y.broadcast_add(b),
-            None => Ok(y),
+        let y = match &self.bias {
+            Some(b) => y.broadcast_add(b)?,
+            None => y,
+        };
+        match (&self.lora_a, &self.lora_b) {
+            (Some(a), Some(b)) => y.add(&x.matmul(a)?.matmul(b)?),
+            _ => Ok(y),
         }
     }
 }
@@ -166,6 +211,11 @@ impl ColumnParallelLinear {
     /// Access the inner linear layer.
     pub fn inner(&self) -> &Linear {
         &self.inner
+    }
+
+    /// Mutable access to the inner linear layer (for LoRA injection).
+    pub fn inner_mut(&mut self) -> &mut Linear {
+        &mut self.inner
     }
 }
 
@@ -235,6 +285,11 @@ impl RowParallelLinear {
     /// Access the inner linear layer.
     pub fn inner(&self) -> &Linear {
         &self.inner
+    }
+
+    /// Mutable access to the inner linear layer (for LoRA injection).
+    pub fn inner_mut(&mut self) -> &mut Linear {
+        &mut self.inner
     }
 }
 
@@ -382,5 +437,80 @@ mod tests {
 
         let rp0 = RowParallelLinear::load(&weights, "proj", DType::F32, 0, 2, true).unwrap();
         assert_eq!(rp0.inner().in_features(), 2);
+    }
+
+    #[test]
+    fn test_lora_forward() {
+        // Identity weight: y = x
+        let weight = Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &Device::Cpu).unwrap();
+        let mut linear = Linear::new(weight, None);
+        assert!(!linear.has_lora());
+
+        // LoRA A: [rank=1, in=2], B: [out=2, rank=1]
+        let lora_a = Tensor::new(&[[1.0f32, 0.0]], &Device::Cpu).unwrap(); // [1, 2]
+        let lora_b = Tensor::new(&[[1.0f32], [0.0]], &Device::Cpu).unwrap(); // [2, 1]
+        linear.attach_lora(lora_a, lora_b, 1.0).unwrap();
+        assert!(linear.has_lora());
+
+        // x = [1, 2] → base y = [1, 2], delta = x·A_t·B_t = [1]·[1, 0] = [1, 0]
+        // total = [2, 2]
+        let x = Tensor::new(&[[1.0f32, 2.0]], &Device::Cpu).unwrap();
+        let y = linear.forward(&x).unwrap();
+        let vals = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!((vals[0] - 2.0).abs() < 1e-5);
+        assert!((vals[1] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_lora_scaling() {
+        let weight = Tensor::zeros(&[2, 2], DType::F32, &Device::Cpu).unwrap();
+        let mut linear = Linear::new(weight, None);
+
+        let lora_a = Tensor::new(&[[1.0f32, 0.0]], &Device::Cpu).unwrap();
+        let lora_b = Tensor::new(&[[1.0f32], [0.0]], &Device::Cpu).unwrap();
+        // scaling = 0.5
+        linear.attach_lora(lora_a, lora_b, 0.5).unwrap();
+
+        let x = Tensor::new(&[[2.0f32, 0.0]], &Device::Cpu).unwrap();
+        let y = linear.forward(&x).unwrap();
+        let vals = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // delta = 2*1*0.5 = 1, base = 0 → [1, 0]
+        assert!((vals[0] - 1.0).abs() < 1e-5);
+        assert!(vals[1].abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_lora_zero_cost() {
+        // Without LoRA attached, forward should be identical to base.
+        let weight = Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &Device::Cpu).unwrap();
+        let linear = Linear::new(weight, None);
+        assert!(!linear.has_lora());
+
+        let x = Tensor::new(&[[3.0f32, 4.0]], &Device::Cpu).unwrap();
+        let y = linear.forward(&x).unwrap();
+        let vals = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!((vals[0] - 3.0).abs() < 1e-5);
+        assert!((vals[1] - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_lora_detach() {
+        let weight = Tensor::new(&[[1.0f32, 0.0], [0.0, 1.0]], &Device::Cpu).unwrap();
+        let mut linear = Linear::new(weight, None);
+
+        let lora_a = Tensor::new(&[[1.0f32, 0.0]], &Device::Cpu).unwrap();
+        let lora_b = Tensor::new(&[[1.0f32], [0.0]], &Device::Cpu).unwrap();
+        linear.attach_lora(lora_a, lora_b, 1.0).unwrap();
+        assert!(linear.has_lora());
+
+        linear.detach_lora();
+        assert!(!linear.has_lora());
+
+        // After detach, output should be pure base again.
+        let x = Tensor::new(&[[1.0f32, 2.0]], &Device::Cpu).unwrap();
+        let y = linear.forward(&x).unwrap();
+        let vals = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!((vals[0] - 1.0).abs() < 1e-5);
+        assert!((vals[1] - 2.0).abs() < 1e-5);
     }
 }

@@ -59,6 +59,8 @@ pub struct VllmConfig {
     pub ngram_prompt_lookup_max: usize,
     /// Minimum n-gram size for prompt lookup.
     pub ngram_prompt_lookup_min: usize,
+    /// LoRA adapter path (local directory or HF repo ID). None = disabled.
+    pub lora_adapter: Option<String>,
 }
 
 impl Default for VllmConfig {
@@ -77,6 +79,7 @@ impl Default for VllmConfig {
             num_speculative_tokens: 5,
             ngram_prompt_lookup_max: 4,
             ngram_prompt_lookup_min: 1,
+            lora_adapter: None,
         }
     }
 }
@@ -120,6 +123,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             hf_token: config.hf_token.clone(),
             cache_dir: None,
             block_size: config.block_size,
+            lora_adapter: config.lora_adapter.clone(),
         };
 
         let mut worker = MlxWorker::new(mlx_config);
@@ -155,6 +159,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
         cache_dir: None,
         block_size: config.block_size,
         gguf_file: config.gguf_file.clone(),
+        lora_adapter: config.lora_adapter.clone(),
     };
 
     let mut worker = CandleWorker::new(worker_config);

@@ -18,6 +18,7 @@ use vllm_model::error::{ModelError, ModelResult};
 use vllm_model::layers::{
     ColumnParallelLinear, Embedding, Linear, RmsNorm, RotaryEmbedding, RowParallelLinear,
 };
+use vllm_model::lora::LoraAdapter;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
 use crate::attention::attention_with_cache;
@@ -233,6 +234,36 @@ impl LlamaMLP {
             up_proj: ColumnParallelLinear::new(up, false),
             down_proj: RowParallelLinear::new(down, true),
         })
+    }
+}
+
+impl LlamaMLP {
+    /// Inject LoRA weights into MLP projections.
+    pub fn inject_lora(&mut self, prefix: &str, adapter: &LoraAdapter) -> ModelResult<()> {
+        let targets = &adapter.config.target_modules;
+        let projs: &mut [(&str, &mut ColumnParallelLinear)] = &mut [
+            ("gate_proj", &mut self.gate_proj),
+            ("up_proj", &mut self.up_proj),
+        ];
+        for (name, proj) in projs.iter_mut() {
+            if targets.iter().any(|t| t == name) {
+                let key = format!("{}.{}", prefix, name);
+                if let Some((a, b)) = adapter.weights.get(&key) {
+                    proj.inner_mut()
+                        .attach_lora(a.clone(), b.clone(), adapter.scaling)?;
+                }
+            }
+        }
+        // down_proj is RowParallelLinear.
+        if targets.iter().any(|t| t == "down_proj") {
+            let key = format!("{}.down_proj", prefix);
+            if let Some((a, b)) = adapter.weights.get(&key) {
+                self.down_proj
+                    .inner_mut()
+                    .attach_lora(a.clone(), b.clone(), adapter.scaling)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -514,6 +545,35 @@ impl LlamaAttention {
         self.o_proj
             .forward(&attn_output)
             .map_err(ModelError::Candle)
+    }
+
+    /// Inject LoRA weights into attention projections.
+    pub fn inject_lora(&mut self, prefix: &str, adapter: &LoraAdapter) -> ModelResult<()> {
+        let targets = &adapter.config.target_modules;
+        let projs: &mut [(&str, &mut ColumnParallelLinear)] = &mut [
+            ("q_proj", &mut self.q_proj),
+            ("k_proj", &mut self.k_proj),
+            ("v_proj", &mut self.v_proj),
+        ];
+        for (name, proj) in projs.iter_mut() {
+            if targets.iter().any(|t| t == name) {
+                let key = format!("{}.{}", prefix, name);
+                if let Some((a, b)) = adapter.weights.get(&key) {
+                    proj.inner_mut()
+                        .attach_lora(a.clone(), b.clone(), adapter.scaling)?;
+                }
+            }
+        }
+        // o_proj is RowParallelLinear.
+        if targets.iter().any(|t| t == "o_proj") {
+            let key = format!("{}.o_proj", prefix);
+            if let Some((a, b)) = adapter.weights.get(&key) {
+                self.o_proj
+                    .inner_mut()
+                    .attach_lora(a.clone(), b.clone(), adapter.scaling)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -820,6 +880,17 @@ impl LlamaForCausalLM {
 }
 
 impl crate::Model for LlamaForCausalLM {
+    fn inject_lora(&mut self, adapter: &LoraAdapter) -> ModelResult<()> {
+        for (i, layer) in self.model.layers.iter_mut().enumerate() {
+            let attn_prefix = format!("model.layers.{}.self_attn", i);
+            layer.self_attn.inject_lora(&attn_prefix, adapter)?;
+
+            let mlp_prefix = format!("model.layers.{}.mlp", i);
+            layer.mlp.inject_lora(&mlp_prefix, adapter)?;
+        }
+        Ok(())
+    }
+
     fn forward(
         &self,
         input_ids: &Tensor,

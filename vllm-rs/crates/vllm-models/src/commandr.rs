@@ -22,6 +22,7 @@ use vllm_model::error::{ModelError, ModelResult};
 use vllm_model::layers::{
     CohereLayerNorm, ColumnParallelLinear, Embedding, Linear, RowParallelLinear,
 };
+use vllm_model::lora::LoraAdapter;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
 use crate::attention::attention_with_cache;
@@ -535,6 +536,42 @@ impl CommandRForCausalLM {
 }
 
 impl crate::Model for CommandRForCausalLM {
+    fn inject_lora(&mut self, adapter: &LoraAdapter) -> ModelResult<()> {
+        let targets = &adapter.config.target_modules;
+        for (i, layer) in self.model.layers.iter_mut().enumerate() {
+            // Attention projections (ColumnParallel/RowParallel).
+            let attn_prefix = format!("model.layers.{}.self_attn", i);
+            let attn_projs: &mut [(&str, &mut ColumnParallelLinear)] = &mut [
+                ("q_proj", &mut layer.self_attn.q_proj),
+                ("k_proj", &mut layer.self_attn.k_proj),
+                ("v_proj", &mut layer.self_attn.v_proj),
+            ];
+            for (name, proj) in attn_projs.iter_mut() {
+                if targets.iter().any(|t| t == name) {
+                    let key = format!("{}.{}", attn_prefix, name);
+                    if let Some((a, b)) = adapter.weights.get(&key) {
+                        proj.inner_mut()
+                            .attach_lora(a.clone(), b.clone(), adapter.scaling)?;
+                    }
+                }
+            }
+            if targets.iter().any(|t| t == "o_proj") {
+                let key = format!("{}.o_proj", attn_prefix);
+                if let Some((a, b)) = adapter.weights.get(&key) {
+                    layer.self_attn.o_proj.inner_mut().attach_lora(
+                        a.clone(),
+                        b.clone(),
+                        adapter.scaling,
+                    )?;
+                }
+            }
+            // MLP (reuses LlamaMLP).
+            let mlp_prefix = format!("model.layers.{}.mlp", i);
+            layer.mlp.inject_lora(&mlp_prefix, adapter)?;
+        }
+        Ok(())
+    }
+
     fn forward(
         &self,
         input_ids: &Tensor,

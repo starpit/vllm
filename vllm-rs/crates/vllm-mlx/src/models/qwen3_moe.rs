@@ -423,6 +423,52 @@ impl MlxQwen3MoeForCausalLM {
 }
 
 impl super::MlxModel for MlxQwen3MoeForCausalLM {
+    fn inject_lora(
+        &mut self,
+        adapter: &crate::lora::MlxLoraAdapter,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::lora::merge_lora_into_weight;
+        let targets = &adapter.config.target_modules;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            // Attention projections (MlxLlamaAttention fields).
+            let attn_prefix = format!("model.layers.{}.self_attn", i);
+            for name in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                if targets.iter().any(|t| t == name) {
+                    let key = format!("{}.{}", attn_prefix, name);
+                    if let Some((a, b)) = adapter.weights.get(&key) {
+                        let proj = match name {
+                            "q_proj" => &mut layer.self_attn.q_proj,
+                            "k_proj" => &mut layer.self_attn.k_proj,
+                            "v_proj" => &mut layer.self_attn.v_proj,
+                            "o_proj" => &mut layer.self_attn.o_proj,
+                            _ => unreachable!(),
+                        };
+                        merge_lora_into_weight(&mut proj.weight, a, b, adapter.scaling)?;
+                    }
+                }
+            }
+            // Dense MLP only (MoE layers are skipped).
+            if let MlxQwen3MoeMlp::Dense(ref mut mlp) = layer.mlp {
+                let mlp_prefix = format!("model.layers.{}.mlp", i);
+                for name in ["gate_proj", "up_proj", "down_proj"] {
+                    if targets.iter().any(|t| t == name) {
+                        let key = format!("{}.{}", mlp_prefix, name);
+                        if let Some((a, b)) = adapter.weights.get(&key) {
+                            let proj = match name {
+                                "gate_proj" => &mut mlp.gate_proj,
+                                "up_proj" => &mut mlp.up_proj,
+                                "down_proj" => &mut mlp.down_proj,
+                                _ => unreachable!(),
+                            };
+                            merge_lora_into_weight(&mut proj.weight, a, b, adapter.scaling)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn forward(
         &mut self,
         input_ids: &Array,

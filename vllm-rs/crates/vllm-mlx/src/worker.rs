@@ -47,6 +47,9 @@ pub struct MlxWorkerConfig {
 
     /// KV cache block size in tokens.
     pub block_size: usize,
+
+    /// Optional path to a LoRA adapter directory (local path or HF repo ID).
+    pub lora_adapter: Option<String>,
 }
 
 impl MlxWorkerConfig {
@@ -459,6 +462,30 @@ impl Worker for MlxWorker {
         self.model = Some(model);
         let quant_str = if is_quantized { ", quantized" } else { "" };
         info!("MlxWorker: model loaded (arch={arch}, dtype={dtype:?}{quant_str})");
+
+        // Inject LoRA adapter if configured.
+        if let Some(ref adapter_path) = self.config.lora_adapter {
+            let adapter_dir = std::path::Path::new(adapter_path);
+            if !adapter_dir.exists() {
+                return Err(ExecutorError::WorkerInit(format!(
+                    "LoRA adapter path does not exist: {}",
+                    adapter_path
+                )));
+            }
+            let adapter = crate::lora::MlxLoraAdapter::from_dir(adapter_dir, "default", dtype)
+                .map_err(|e| {
+                    ExecutorError::WorkerInit(format!("failed to load LoRA adapter: {e}"))
+                })?;
+            if let Some(ref mut model) = self.model {
+                model.inject_lora(&adapter).map_err(|e| {
+                    ExecutorError::WorkerInit(format!("failed to inject LoRA: {e}"))
+                })?;
+            }
+            info!(
+                "MlxWorker: LoRA adapter '{}' loaded (rank={}, targets={:?})",
+                adapter.name, adapter.config.r, adapter.config.target_modules
+            );
+        }
 
         // Grammar vocabulary is built lazily on first constrained-decoding request.
 
@@ -1077,6 +1104,7 @@ mod tests {
             hf_token: None,
             cache_dir: None,
             block_size: 16,
+            lora_adapter: None,
         })
     }
 
@@ -1117,6 +1145,7 @@ mod tests {
             hf_token: None,
             cache_dir: None,
             block_size: 16,
+            lora_adapter: None,
         };
         assert!(config.mlx_dtype().unwrap().is_none());
 

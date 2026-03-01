@@ -929,6 +929,53 @@ impl EmbeddingResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Batch processing types
+// ---------------------------------------------------------------------------
+
+/// A single request in a batch input JSONL file.
+///
+/// Matches the OpenAI Batch API input format:
+/// ```json
+/// {"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {...}}
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRequestInput {
+    /// User-specified identifier for correlating input to output.
+    pub custom_id: String,
+    /// HTTP method (always "POST" for supported endpoints).
+    pub method: String,
+    /// API endpoint URL (e.g. "/v1/chat/completions").
+    pub url: String,
+    /// Request body — deserialized based on the `url` field.
+    pub body: serde_json::Value,
+}
+
+/// Response data for a single batch request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchResponseData {
+    /// HTTP status code.
+    pub status_code: u16,
+    /// Unique request identifier.
+    pub request_id: String,
+    /// Response body (serialized response object), absent on error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<serde_json::Value>,
+}
+
+/// A single result in the batch output JSONL file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchRequestOutput {
+    /// Unique batch output identifier.
+    pub id: String,
+    /// The custom_id from the corresponding input request.
+    pub custom_id: String,
+    /// Successful response data (None if error).
+    pub response: Option<BatchResponseData>,
+    /// Error information (None if success).
+    pub error: Option<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
 // Default helpers
 // ---------------------------------------------------------------------------
 
@@ -1335,5 +1382,79 @@ mod tests {
         }"#;
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert!(req.guided_regex.is_none());
+    }
+
+    // -- Batch types --
+
+    #[test]
+    fn test_batch_request_input_serde() {
+        let input = BatchRequestInput {
+            custom_id: "req-1".to_string(),
+            method: "POST".to_string(),
+            url: "/v1/chat/completions".to_string(),
+            body: serde_json::json!({"messages": [{"role": "user", "content": "Hello"}]}),
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        let parsed: BatchRequestInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.custom_id, "req-1");
+        assert_eq!(parsed.url, "/v1/chat/completions");
+        assert!(parsed.body["messages"].is_array());
+    }
+
+    #[test]
+    fn test_batch_request_output_serde() {
+        let output = BatchRequestOutput {
+            id: "batch-abc123".to_string(),
+            custom_id: "req-1".to_string(),
+            response: Some(BatchResponseData {
+                status_code: 200,
+                request_id: "req-id-1".to_string(),
+                body: Some(serde_json::json!({"choices": []})),
+            }),
+            error: None,
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let parsed: BatchRequestOutput = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "batch-abc123");
+        assert_eq!(parsed.custom_id, "req-1");
+        let resp = parsed.response.unwrap();
+        assert_eq!(resp.status_code, 200);
+        assert!(parsed.error.is_none());
+    }
+
+    #[test]
+    fn test_batch_request_input_chat() {
+        let json = r#"{
+            "custom_id": "chat-1",
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 50
+            }
+        }"#;
+        let input: BatchRequestInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.custom_id, "chat-1");
+        // Body should be deserializable as a ChatCompletionRequest.
+        let req: ChatCompletionRequest = serde_json::from_value(input.body).unwrap();
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.max_tokens, Some(50));
+    }
+
+    #[test]
+    fn test_batch_request_input_embedding() {
+        let json = r#"{
+            "custom_id": "emb-1",
+            "method": "POST",
+            "url": "/v1/embeddings",
+            "body": {
+                "input": "Hello world",
+                "model": "test"
+            }
+        }"#;
+        let input: BatchRequestInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.custom_id, "emb-1");
+        let req: EmbeddingRequest = serde_json::from_value(input.body).unwrap();
+        assert_eq!(req.model.as_deref(), Some("test"));
     }
 }

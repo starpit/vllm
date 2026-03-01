@@ -24,6 +24,9 @@ serde_json = { workspace = true }
 # Error handling
 anyhow = { workspace = true }
 
+# UUID generation (for batch IDs in tests)
+uuid = { version = "1", features = ["v4"] }
+
 # Logging
 tracing = { workspace = true }
 

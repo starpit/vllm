@@ -676,6 +676,30 @@ cargo test -p vllm-e2e --features e2e,metal --test e_llm_api -- --ignored --test
 
 ---
 
+## Phase E16: Batch Processing — DONE
+
+Test file: `e_batch.rs`
+
+Tests the `vllm batch` offline batch processing command. Reads a JSONL input file, processes requests through the engine (no HTTP server), and writes a JSONL output file. Tests call the batch runner logic directly using `initialize_stack()` + `AsyncEngine` methods. Supports `/v1/chat/completions`, `/v1/completions`, and `/v1/embeddings` endpoints.
+
+| Test | Model | Description |
+|------|-------|-------------|
+| `test_batch_chat_completions` | SmolLM-135M-4bit | 3 chat requests → 3 outputs with correct custom_ids and response bodies |
+| `test_batch_completions` | SmolLM-135M-4bit | 2 text completion requests → non-empty completion text |
+| `test_batch_embeddings` | SmolLM-135M-4bit | 2 embedding requests → non-empty embedding vectors |
+| `test_batch_mixed_endpoints` | SmolLM-135M-4bit | Chat + completion + embedding in single batch → each routed correctly |
+| `test_batch_invalid_url` | SmolLM-135M-4bit | Unsupported URL → error in output (not a crash), good request still succeeds |
+| `test_batch_malformed_body` | SmolLM-135M-4bit | Missing required fields → error in output (not a crash) |
+
+Run command:
+```bash
+cargo test -p vllm-e2e --features e2e,metal --release --test e_batch -- --ignored --test-threads=1
+```
+
+**Deliverables**: 6 E2E tests (all implemented). No HTTP server — tests exercise the engine directly.
+
+---
+
 ## Test Matrix Summary
 
 | Phase | Tests | Models Used | Run Frequency | Estimated Time |
@@ -697,7 +721,8 @@ cargo test -p vllm-e2e --features e2e,metal --test e_llm_api -- --ignored --test
 | E14. GPTQ Quantization | 4 (done) | Qwen2.5-0.5B-GPTQ-Int4 | Every PR | <1 min (MLX) |
 | E14b. AWQ Quantization | 4 (done) | Qwen2.5-0.5B-AWQ | Every PR | <1 min (MLX) |
 | E15. Offline Batch LLM API | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
-| **Total** | **~190** | | | **~30 min** |
+| E16. Batch Processing | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
+| **Total** | **~196** | | | **~31 min** |
 
 ### CI Tiers
 

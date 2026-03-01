@@ -22,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Serve(args) => commands::serve::run_serve(*args).await,
         Commands::Bench(args) => commands::bench::run_bench(args).await,
+        Commands::Batch(args) => commands::batch::run_batch(args).await,
         Commands::Convert(args) => commands::convert::run_convert(args).await,
     }
 }

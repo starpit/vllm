@@ -19,6 +19,8 @@ pub enum Commands {
     Serve(Box<ServeArgs>),
     /// Run a quick benchmark against a model.
     Bench(BenchArgs),
+    /// Process a batch of OpenAI-compatible requests offline.
+    Batch(BatchArgs),
     /// Convert model weights between formats (stub).
     Convert(ConvertArgs),
 }
@@ -227,6 +229,67 @@ impl BenchArgs {
     }
 }
 
+/// Arguments for the `batch` subcommand.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm batch [MODEL] [OPTIONS]")]
+pub struct BatchArgs {
+    /// Model: local path or HuggingFace model ID.
+    pub model_tag: Option<String>,
+
+    /// Path to a local model directory, or HuggingFace model ID.
+    #[arg(long, env = "VLLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Input JSONL file containing batch requests.
+    #[arg(short = 'i', long)]
+    pub input: String,
+
+    /// Output JSONL file for batch results.
+    #[arg(short = 'o', long)]
+    pub output: String,
+
+    /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
+    pub dtype: String,
+
+    /// HuggingFace token for gated models.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Log level: "trace", "debug", "info", "warn", "error".
+    #[arg(long, default_value = "info")]
+    pub log_level: String,
+
+    /// Fraction of GPU memory to use for KV cache (0.0–1.0).
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
+
+    /// Tool call parser to use (e.g. "hermes", "llama3_json").
+    #[arg(long)]
+    pub tool_call_parser: Option<String>,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+}
+
+impl BatchArgs {
+    /// Resolve the effective model path/ID.
+    pub fn resolved_model(&self) -> Result<String, String> {
+        if let Some(ref tag) = self.model_tag {
+            Ok(tag.clone())
+        } else if let Some(ref m) = self.model {
+            Ok(m.clone())
+        } else {
+            Err("model is required: provide as positional arg or --model flag".to_string())
+        }
+    }
+}
+
 /// Arguments for the `convert` subcommand (stub).
 #[derive(Parser, Debug)]
 pub struct ConvertArgs {
@@ -334,6 +397,77 @@ mod tests {
                 assert_eq!(args.resolved_model().unwrap(), "/path/to/model");
             }
             _ => panic!("expected Bench command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_batch_args() {
+        let cli = Cli::parse_from([
+            "vllm",
+            "batch",
+            "meta-llama/Llama-3.2-1B",
+            "-i",
+            "input.jsonl",
+            "-o",
+            "output.jsonl",
+        ]);
+        match cli.command {
+            Commands::Batch(args) => {
+                assert_eq!(args.resolved_model().unwrap(), "meta-llama/Llama-3.2-1B");
+                assert_eq!(args.input, "input.jsonl");
+                assert_eq!(args.output, "output.jsonl");
+                assert_eq!(args.device, "auto");
+            }
+            _ => panic!("expected Batch command"),
+        }
+    }
+
+    #[test]
+    fn test_batch_resolved_model() {
+        // Flag model.
+        let cli = Cli::parse_from([
+            "vllm",
+            "batch",
+            "--model",
+            "flag-model",
+            "-i",
+            "in.jsonl",
+            "-o",
+            "out.jsonl",
+        ]);
+        match cli.command {
+            Commands::Batch(args) => {
+                assert_eq!(args.resolved_model().unwrap(), "flag-model");
+            }
+            _ => panic!("expected Batch command"),
+        }
+
+        // Positional takes precedence over --model.
+        let cli = Cli::parse_from([
+            "vllm",
+            "batch",
+            "positional-model",
+            "--model",
+            "flag-model",
+            "-i",
+            "in.jsonl",
+            "-o",
+            "out.jsonl",
+        ]);
+        match cli.command {
+            Commands::Batch(args) => {
+                assert_eq!(args.resolved_model().unwrap(), "positional-model");
+            }
+            _ => panic!("expected Batch command"),
+        }
+
+        // No model → error.
+        let cli = Cli::parse_from(["vllm", "batch", "-i", "in.jsonl", "-o", "out.jsonl"]);
+        match cli.command {
+            Commands::Batch(args) => {
+                assert!(args.resolved_model().is_err());
+            }
+            _ => panic!("expected Batch command"),
         }
     }
 

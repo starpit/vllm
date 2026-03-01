@@ -1,21 +1,21 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (944 tests: 848 unit + 96 e2e, 0 clippy errors)
+> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (956 tests: 854 unit + 102 e2e, 0 clippy errors)
 
 ### Legend
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 158 |
+| &#x1F535; | Fully implemented | 159 |
 | &#x1F7E1; | Partially implemented | 5 |
-| &#x1F534; | Not implemented | 108 |
+| &#x1F534; | Not implemented | 107 |
 
 ### Priority (for incomplete features)
 
 | Priority | Meaning | Count |
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
-| **P3** | High — meaningfully expands user base or enables key use cases | 21 |
+| **P3** | High — meaningfully expands user base or enables key use cases | 20 |
 | **P2** | Medium — useful improvement, broader coverage | 37 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
@@ -39,7 +39,7 @@
 |---|---:|---|---:|---:|---:|
 | [Model Architectures](#model-architectures) | 36 | `███░░░░░░░` 11/36 | 26 | 100 | 25 |
 | [Quantization](#quantization) | 11 | `██░░░░░░░░` 3/11 | 1 | 39 | 8 |
-| [Serving / OpenAI API](#serving--openai-api) | 24 | `██████░░░░` 16/24 | 0 | 101 | 18 |
+| [Serving / OpenAI API](#serving--openai-api) | 24 | `███████░░░` 17/24 | 0 | 104 | 24 |
 | [Sampling & Decoding](#sampling--decoding) | 19 | `██████████` 19/19 | 0 | 53 | 13 |
 | [KV Cache & Attention](#kv-cache--attention) | 19 | `█████░░░░░` 9/19 | 0 | 96 | 0 |
 | [Scheduling](#scheduling) | 10 | `█████████░` 9/10 | 0 | 73 | 1 |
@@ -54,8 +54,8 @@
 | [Tool Calling](#tool-calling--function-calling) | 7 | `██████████` 7/7 | 0 | 25 | 0 |
 | [Embeddings & Pooling](#embeddings--pooling) | 8 | `██████░░░░` 5/8 | 0 | 19 | 10 |
 | [Observability & Operations](#observability--operations) | 7 | `██████████` 7/7 | 1 | 15 | 0 |
-| [CLI & Deployment](#cli--deployment) | 16 | `██████████` 15/16 | 2 | 14 | 0 |
-| **Total** | **213** | `█████░░░░░` **116/213** | **35** | **627** | **74** |
+| [CLI & Deployment](#cli--deployment) | 17 | `██████████` 16/17 | 2 | 19 | 6 |
+| **Total** | **213** | `█████░░░░░` **117/213** | **35** | **630** | **80** |
 
 ---
 
@@ -181,7 +181,7 @@
 | Anthropic Messages API | &#x1F535; | &#x1F534; | — | — | P2 |
 | gRPC server | &#x1F535; | &#x1F534; | — | — | P1 |
 | MCP tool server | &#x1F535; | &#x1F534; | — | — | P2 |
-| Batch processing | &#x1F535; | &#x1F534; | — | — | P3 |
+| Batch processing (`vllm batch`) | &#x1F535; | &#x1F535; | 3 | 6 | |
 | Responses API | &#x1F535; | &#x1F534; | — | — | P1 |
 | Speech-to-text | &#x1F535; | &#x1F534; | — | — | P1 |
 | Realtime API | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -508,6 +508,7 @@
 |---|:---:|:---:|---:|---:|:---:|
 | `vllm serve <model>` | &#x1F535; | &#x1F535; | 2 | 0 | |
 | `vllm bench <model>` | &#x1F535; | &#x1F535; | 2 | 0 | |
+| `vllm batch -i <in> -o <out>` | &#x1F535; | &#x1F535; | 5 | 6 | |
 | `vllm convert` | &#x1F535; | &#x1F535; | 1 | 0 | |
 | HF Hub model download | &#x1F535; | &#x1F535; | 0 | 0 | |
 | Sharded weight loading | &#x1F535; | &#x1F535; | 0 | 0 | |
@@ -526,7 +527,7 @@
 | Python fallback for unported models | &#x1F535; | &#x1F534; | — | — | P1 |
 | Standalone binary (no Python runtime) | &#x1F534; | &#x1F535; | 0 | 0 | |
 
-> Unit counts from `args.rs` (8 — CLI parsing: help, serve/bench positional/flag model, precedence, no-model error, convert) and `init.rs` (6 — extract model name, compute num blocks variants).
+> Unit counts from `args.rs` (10 — CLI parsing: help, serve/bench/batch positional/flag model, precedence, no-model error, convert) and `init.rs` (6 — extract model name, compute num blocks variants). Batch runner: `batch.rs` (3 — JSONL parse/write).
 
 ---
 
@@ -541,6 +542,6 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Unit tests | ~948 test files | 848 passing (790 non-MLX + 58 MLX) |
-| E2E tests | — | 100 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 4 AWQ + 6 LLM API + 4 LoRA) |
+| Unit tests | ~948 test files | 854 passing (796 non-MLX + 58 MLX) |
+| E2E tests | — | 106 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 4 AWQ + 6 LLM API + 4 LoRA + 6 batch) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

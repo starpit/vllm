@@ -14,6 +14,7 @@ pub mod detokenizer;
 pub mod engine;
 pub mod error;
 pub mod init;
+pub mod llm;
 pub mod metrics;
 pub mod orca;
 pub mod protocol;

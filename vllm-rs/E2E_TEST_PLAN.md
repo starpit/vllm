@@ -33,6 +33,7 @@ cargo test -p vllm-e2e --features e2e,metal --test e1_basic_serving -- --ignored
 cargo test -p vllm-e2e --features e2e,metal --test e2_chat_completions -- --ignored --test-threads=1
 cargo test -p vllm-e2e --features e2e,metal --test e3_streaming -- --ignored --test-threads=1
 cargo test -p vllm-e2e --features e2e,metal --test e_lora --release -- --ignored --test-threads=1
+cargo test -p vllm-e2e --features e2e,metal --test e_llm_api -- --ignored --test-threads=1
 
 # Single test:
 cargo test -p vllm-e2e --features e2e,metal --test e1_basic_serving test_t1_smollm_chat_basic -- --ignored
@@ -613,6 +614,30 @@ cargo test -p vllm-e2e --features e2e --test e_gptq --release -- --ignored --tes
 
 ---
 
+## Phase E15: Offline Batch LLM API — DONE
+
+Test file: `e_llm_api.rs`
+
+Tests the programmatic `LLM` struct — offline batch inference without an HTTP server. `LLM::new()` initializes the full stack (worker → executor → engine) and provides synchronous `generate()` / `chat()` methods. This is the foundation for the `vllm-pyo3` Python binding layer.
+
+| Test | Model | Description |
+|------|-------|-------------|
+| `test_llm_generate_basic` | SmolLM-135M-4bit | Single prompt → non-empty output, model name correct |
+| `test_llm_generate_multiple_prompts` | SmolLM-135M-4bit | Two prompts → two outputs, prompt text preserved |
+| `test_llm_generate_max_tokens` | SmolLM-135M-4bit | max_tokens=3 → finish_reason="length" |
+| `test_llm_chat_basic` | SmolLM-135M-4bit | Single user message → non-empty chat response |
+| `test_llm_chat_with_system_message` | SmolLM-135M-4bit | System + user messages → non-empty response |
+| `test_llm_builder` | SmolLM-135M-4bit | `LLM::builder().max_model_len(512).build()` → generates correctly |
+
+Run command:
+```bash
+cargo test -p vllm-e2e --features e2e,metal --test e_llm_api -- --ignored --test-threads=1
+```
+
+**Deliverables**: 6 E2E tests (all implemented). Tests use `#[test]` (not `#[tokio::test]`) since LLM owns its own runtime.
+
+---
+
 ## Test Matrix Summary
 
 | Phase | Tests | Models Used | Run Frequency | Estimated Time |
@@ -632,7 +657,8 @@ cargo test -p vllm-e2e --features e2e --test e_gptq --release -- --ignored --tes
 | E12. Embedding | 10 (done) | SmolLM / Qwen2 / Llama3 | Every PR | 2 min |
 | E13. LoRA Adapters | 4 (done) | SmolLM-135M-F16 | Every PR | <1 min |
 | E14. GPTQ Quantization | 4 (done) | Qwen2.5-0.5B-GPTQ-Int4 | Every PR | <1 min (MLX) |
-| **Total** | **~180** | | | **~30 min** |
+| E15. Offline Batch LLM API | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
+| **Total** | **~186** | | | **~30 min** |
 
 ### CI Tiers
 

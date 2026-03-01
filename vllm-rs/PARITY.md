@@ -4,21 +4,21 @@
 
 ### Legend
 
-| Symbol | Meaning |
-|--------|---------|
-| &#x1F535; | Fully implemented |
-| &#x1F7E1; | Partially implemented |
-| &#x2795; | Planned (in [`PORT_PLAN.md`](PORT_PLAN.md)) |
-| &#x1F534; | Not implemented / not planned |
+| Symbol | Meaning | Count |
+|--------|---------|------:|
+| &#x1F535; | Fully implemented | 148 |
+| &#x1F7E1; | Partially implemented | 8 |
+| &#x1F534; | Not implemented | 113 |
 
 ### Priority (for incomplete features)
 
-| Priority | Meaning |
-|----------|---------|
-| **P4** | Highest — production blockers, widely needed, or near-free to implement |
-| **P3** | High — meaningfully expands user base or enables key use cases |
-| **P2** | Medium — useful improvement, broader coverage |
-| **P1** | Lowest — niche, edge-case, or low demand |
+| Priority | Meaning | Count |
+|----------|---------|------:|
+| **P4** | Highest — production blockers, widely needed, or near-free to implement | 1 |
+| **P3** | High — meaningfully expands user base or enables key use cases | 26 |
+| **P2** | Medium — useful improvement, broader coverage | 39 |
+| **P1** | Lowest — niche, edge-case, or low demand | 49 |
+| **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
 
 ### Test columns
 
@@ -33,27 +33,29 @@
 
 ## Summary: Major Feature Groups
 
-| Feature Group | Python | Rust | Unit | E2E | Parity |
-|---|:---:|:---:|---:|---:|---|
-| [Model Architectures](#model-architectures) | &#x1F535; | &#x1F7E1; | 100 | 25 | `███░░░░░░░` 11/36 |
-| [Quantization](#quantization) | &#x1F535; | &#x1F7E1; | 13 | 0 | `█░░░░░░░░░` 1/11 |
-| [Serving / OpenAI API](#serving--openai-api) | &#x1F535; | &#x1F7E1; | 101 | 18 | `██████░░░░` 15/25 |
-| [Sampling & Decoding](#sampling--decoding) | &#x1F535; | &#x1F7E1; | 53 | 13 | `█████████░` 19/21 |
-| [KV Cache & Attention](#kv-cache--attention) | &#x1F535; | &#x1F7E1; | 96 | 0 | `█████░░░░░` 9/20 |
-| [Scheduling](#scheduling) | &#x1F535; | &#x1F7E1; | 67 | 0 | `███████░░░` 8/11 |
-| [Hardware Backends](#hardware-backends) | &#x1F535; | &#x1F7E1; | 28 | 2 | `████░░░░░░` 3/8 |
-| [Parallelism & Distribution](#parallelism--distribution) | &#x1F535; | &#x1F7E1; | 33 | 0 | `███░░░░░░░` 3/10 |
-| [Performance Optimizations](#performance-optimizations) | &#x1F535; | &#x1F7E1; | 6 | 0 | `██░░░░░░░░` 2/13 |
-| [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | &#x1F535; | &#x1F7E1; | 0 | 0 | `██░░░░░░░░` 3/12 |
-| [LoRA / Adapters](#lora--adapters) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/5 |
-| [Speculative Decoding](#speculative-decoding) | &#x1F535; | &#x1F7E1; | 20 | 0 | `██░░░░░░░░` 1/5 |
-| [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F535; | &#x2795; | 0 | 0 | `░░░░░░░░░░` 0/10 |
-| [Structured Output](#structured-output--guided-decoding) | &#x1F535; | &#x1F535; | 12 | 0 | `██████████` 4/4 |
-| [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x1F535; | 25 | 0 | `██████████` 7/7 |
-| [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F7E2; | 7 | 7 | `████░░░░░░` 2/6 |
-| [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | 15 | 0 | `██████████` 7/7 |
-| [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | 14 | 0 | `██████████` 15/16 |
-| | | **Total** | **583** | **58** | `█████░░░░░` **107/215** |
+> Parity denominators exclude P0 items (deprecated / won't implement).
+
+| Feature Group | Rust Status | Unit | E2E | Parity |
+|---|---|---:|---:|---|
+| [Model Architectures](#model-architectures) | &#x1F535;41 &#x1F534;25 | 100 | 25 | `███░░░░░░░` 11/36 |
+| [Quantization](#quantization) | &#x1F535;2 &#x1F534;11 | 13 | 0 | `█░░░░░░░░░` 1/11 |
+| [Serving / OpenAI API](#serving--openai-api) | &#x1F535;15 &#x1F7E1;1 &#x1F534;9 | 101 | 18 | `██████░░░░` 15/24 |
+| [Sampling & Decoding](#sampling--decoding) | &#x1F535;19 &#x1F534;2 | 53 | 13 | `██████████` 19/19 |
+| [KV Cache & Attention](#kv-cache--attention) | &#x1F535;10 &#x1F7E1;1 &#x1F534;9 | 96 | 0 | `█████░░░░░` 9/19 |
+| [Scheduling](#scheduling) | &#x1F535;9 &#x1F534;2 | 67 | 0 | `████████░░` 8/10 |
+| [Hardware Backends](#hardware-backends) | &#x1F535;4 &#x1F7E1;1 &#x1F534;4 | 28 | 2 | `████░░░░░░` 3/8 |
+| [Parallelism & Distribution](#parallelism--distribution) | &#x1F535;3 &#x1F7E1;1 &#x1F534;6 | 33 | 0 | `███░░░░░░░` 3/10 |
+| [Performance Optimizations](#performance-optimizations) | &#x1F535;6 &#x1F534;11 | 6 | 0 | `██░░░░░░░░` 2/13 |
+| [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | &#x1F535;2 &#x1F7E1;1 &#x1F534;9 | 0 | 0 | `██░░░░░░░░` 3/12 |
+| [LoRA / Adapters](#lora--adapters) | &#x1F534;5 | 0 | 0 | `░░░░░░░░░░` 0/4 |
+| [Speculative Decoding](#speculative-decoding) | &#x1F535;1 &#x1F534;4 | 20 | 0 | `██░░░░░░░░` 1/5 |
+| [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F534;10 | 0 | 0 | `░░░░░░░░░░` 0/10 |
+| [Structured Output](#structured-output--guided-decoding) | &#x1F535;4 | 12 | 0 | `██████████` 4/4 |
+| [Tool Calling](#tool-calling--function-calling) | &#x1F535;7 | 25 | 0 | `██████████` 7/7 |
+| [Embeddings & Pooling](#embeddings--pooling) | &#x1F7E1;2 &#x1F534;4 | 7 | 7 | `████░░░░░░` 2/6 |
+| [Observability & Operations](#observability--operations) | &#x1F535;8 &#x1F534;1 | 15 | 0 | `██████████` 7/7 |
+| [CLI & Deployment](#cli--deployment) | &#x1F535;17 &#x1F7E1;1 &#x1F534;1 | 14 | 0 | `██████████` 15/16 |
+| **Total** | **&#x1F535;148 &#x1F7E1;8 &#x1F534;113** | **583** | **58** | `█████░░░░░` **107/209** |
 
 ---
 
@@ -79,12 +81,12 @@
 | Qwen3 MoE | &#x1F535; | &#x1F535; | 8 | 0 | |
 | Qwen3 Next (hybrid linear attn) | &#x1F535; | &#x1F534; | — | — | P3 |
 | Mixtral (MoE) | &#x1F535; | &#x1F535; | 7 | 0 | |
-| GPT-NeoX | &#x1F535; | &#x2795; | — | — | P1 |
-| GPT-J | &#x1F535; | &#x2795; | — | — | P1 |
-| Falcon | &#x1F535; | &#x2795; | — | — | P1 |
-| BLOOM | &#x1F535; | &#x2795; | — | — | P1 |
-| MPT | &#x1F535; | &#x2795; | — | — | P1 |
-| StarCoder / StarCoder2 | &#x1F535; | &#x2795; | — | — | P2 |
+| GPT-NeoX | &#x1F535; | &#x1F534; | — | — | P1 |
+| GPT-J | &#x1F535; | &#x1F534; | — | — | P1 |
+| Falcon | &#x1F535; | &#x1F534; | — | — | P1 |
+| BLOOM | &#x1F535; | &#x1F534; | — | — | P1 |
+| MPT | &#x1F535; | &#x1F534; | — | — | P1 |
+| StarCoder / StarCoder2 | &#x1F535; | &#x1F534; | — | — | P2 |
 | OPT | &#x1F535; | &#x1F534; | — | — | P1 |
 | Phi-1 / Phi-2 | &#x1F535; | &#x1F534; | — | — | P1 |
 | Phi-4 (via Phi3ForCausalLM + LongRoPE) | &#x1F535; | &#x1F535; | 0 | 4 | |
@@ -173,11 +175,11 @@
 | `n` parameter (multiple completions) | &#x1F535; | &#x1F535; | 4 | 2 | |
 | Multi-prompt completions | &#x1F535; | &#x1F535; | 2 | 0 | |
 | Chat templates (Jinja2) | &#x1F535; | &#x1F535; | 14 | 3 | |
-| `POST /v1/embeddings` | &#x1F535; | &#x1F7E2; | — | 7 | P3 |
+| `POST /v1/embeddings` | &#x1F535; | &#x1F7E1; | — | 7 | P3 |
 | `POST /v1/chat/completions` tool_calls | &#x1F535; | &#x1F535; | 3 | 0 | |
 | `response_format` (JSON mode/schema) | &#x1F535; | &#x1F535; | 6 | 0 | |
 | Anthropic Messages API | &#x1F535; | &#x1F534; | — | — | P2 |
-| gRPC server | &#x1F535; | &#x2795; | — | — | P1 |
+| gRPC server | &#x1F535; | &#x1F534; | — | — | P1 |
 | MCP tool server | &#x1F535; | &#x1F534; | — | — | P2 |
 | Batch processing | &#x1F535; | &#x1F534; | — | — | P3 |
 | Responses API | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -187,7 +189,7 @@
 | SSL / TLS | &#x1F535; | &#x1F535; | 5 | 0 | |
 | CORS | &#x1F535; | &#x1F535; | 0 | 0 | |
 | `usage` field in responses | &#x1F535; | &#x1F535; | 2 | 0 | |
-| `best_of` / `n` with reranking | &#x1F535; | &#x1F534; | — | — | P2 |
+| `best_of` / `n` with reranking | &#x1F535; | &#x1F534; | — | — | P0 |
 
 > Unit counts include tests from `engine.rs`, `server.rs`, `protocol.rs`, and `chat_template.rs`. Tokenizer (6 tests) and detokenizer (18 tests) provide additional cross-cutting serving coverage not attributed to individual rows.
 
@@ -208,8 +210,8 @@
 | Logprobs | &#x1F535; | &#x1F535; | 5 | 1 | |
 | Prompt logprobs | &#x1F535; | &#x1F535; | 4 | 1 | |
 | Logit bias | &#x1F535; | &#x1F535; | 3 | 0 | |
-| Beam search | &#x1F535; | &#x1F534; | — | — | P1 |
-| `best_of` | &#x1F535; | &#x1F534; | — | — | P2 |
+| Beam search | &#x1F535; | &#x1F534; | — | — | P0 |
+| `best_of` | &#x1F535; | &#x1F534; | — | — | P0 |
 | `max_tokens` / `max_completion_tokens` | &#x1F535; | &#x1F535; | 2 | 2 | |
 | Stop strings | &#x1F535; | &#x1F535; | 3 | 0 | |
 | Stop token IDs | &#x1F535; | &#x1F535; | 1 | 0 | |
@@ -242,7 +244,7 @@
 | FlashAttention v2 | &#x1F535; | &#x1F534; | — | — | P3 |
 | FlashInfer | &#x1F535; | &#x1F534; | — | — | P2 |
 | FlexAttention | &#x1F535; | &#x1F534; | — | — | P1 |
-| xFormers | &#x1F535; | &#x1F534; | — | — | P1 |
+| xFormers | &#x1F535; | &#x1F534; | — | — | P0 |
 | MLA (Multi-head Latent Attention) | &#x1F535; | &#x1F535; | 4 | 0 | |
 | Sliding window attention | &#x1F535; | &#x1F535; | 13 | 0 | |
 | Batched attention metadata (cu_seqlens, slot_mapping, block_table) | &#x1F535; | &#x1F7E1; | 3 | 0 | P4 |
@@ -270,12 +272,14 @@
 | Block allocation / eviction | &#x1F535; | &#x1F535; | 19 | 0 | |
 | Prefix cache hits | &#x1F535; | &#x1F535; | 5 | 0 | |
 | Pause / resume | &#x1F535; | &#x1F535; | 3 | 0 | |
-| Multi-step scheduling | &#x1F535; | &#x1F534; | — | — | P3 |
+| Multi-step scheduling (`--num-scheduler-steps`) | &#x1F535; | &#x1F534; | — | — | P0 |
 | Async scheduler | &#x1F535; | &#x1F534; | — | — | P2 |
 
 > **Continuous batching note:** Python vLLM's "continuous batching" combines two things: (1) iteration-level scheduling — the scheduler can add/remove requests at each step, and (2) batched model execution — all scheduled requests' tokens are concatenated into a single flat 1D `input_ids` tensor and processed in one `model.forward()` call, with per-request boundaries tracked via attention metadata. The Rust port now implements both: `CandleWorker` (paged KV path) concatenates all requests' tokens into flat `[total_tokens]` tensors, builds `AttentionMetadata` with per-request slicing info, and calls `model.forward_batch()` — a single pass that batches embedding, projections, norms, and MLP across all requests while running attention per-request via `BatchedKvCacheStorage`. `MlxWorker` defers `eval()` across all per-request forward passes, enabling MLX graph fusion into a single Metal command buffer. `LlamaForCausalLM` provides a real batched implementation (covering LLaMA, Mistral, Qwen2, Qwen3, Phi-3); other architectures fall back to the default per-request loop. The remaining gap vs Python vLLM is batched attention kernels (FlashAttention varlen / FlashInfer) — the Rust port still runs attention per-request within the batched forward.
 >
 > Unit counts: `scheduler/core.rs` (30), `scheduler/request_queue.rs` (14), `scheduler/output.rs` (5), `scheduler/interface.rs` (2), `request.rs` (16). Batched forward: `attention_metadata.rs` (3), `llama.rs` forward_batch equivalence (2), `candle_worker.rs` paged multi-request (2). Block allocation count includes `block_pool.rs` and `kv_cache_manager.rs` allocate/free/eviction tests counted above in KV Cache; per-row counts here reflect scheduler-specific tests.
+>
+> **Multi-step scheduling note:** Python vLLM's `--num-scheduler-steps` (default 1) was a V0 engine feature that ran N decode steps per scheduler call to amortize scheduling overhead. The V1 engine (default since vLLM 0.8.x) deprecated this flag — V1's async scheduler and persistent `InputBatch` achieve the same throughput gains without multi-step complexity. P0 — not worth implementing.
 
 ---
 
@@ -306,7 +310,7 @@
 | MultiProc executor (multi-worker) | &#x1F535; | &#x1F535; | 6 | 0 | |
 | Tensor parallelism (actual sharding) | &#x1F535; | &#x1F7E1; | 0 | 0 | P3 |
 | Pipeline parallelism | &#x1F535; | &#x1F534; | — | — | P2 |
-| NCCL communication | &#x1F535; | &#x2795; | — | — | P3 |
+| NCCL communication | &#x1F535; | &#x1F534; | — | — | P3 |
 | Ray distributed executor | &#x1F535; | &#x1F534; | — | — | P1 |
 | Expert parallelism (MoE) | &#x1F535; | &#x1F534; | — | — | P2 |
 | Data parallelism | &#x1F535; | &#x1F534; | — | — | P2 |
@@ -386,7 +390,7 @@
 | LoRA adapter loading | &#x1F535; | &#x1F534; | — | — | P3 |
 | Multi-LoRA serving | &#x1F535; | &#x1F534; | — | — | P2 |
 | LoRA weight merging | &#x1F535; | &#x1F534; | — | — | P2 |
-| Punica kernels | &#x1F535; | &#x1F534; | — | — | P1 |
+| Punica kernels | &#x1F535; | &#x1F534; | — | — | P0 |
 | Dynamic adapter switching | &#x1F535; | &#x1F534; | — | — | P2 |
 
 ---
@@ -409,9 +413,9 @@
 
 | Feature | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
-| Image input processing | &#x1F535; | &#x2795; | — | — | P3 |
-| LLaVA | &#x1F535; | &#x2795; | — | — | P2 |
-| Qwen-VL / Qwen2.5-VL | &#x1F535; | &#x2795; | — | — | P3 |
+| Image input processing | &#x1F535; | &#x1F534; | — | — | P3 |
+| LLaVA | &#x1F535; | &#x1F534; | — | — | P2 |
+| Qwen-VL / Qwen2.5-VL | &#x1F535; | &#x1F534; | — | — | P3 |
 | Pixtral | &#x1F535; | &#x1F534; | — | — | P2 |
 | InternVL | &#x1F535; | &#x1F534; | — | — | P2 |
 | Phi-3V / Phi-4MM | &#x1F535; | &#x1F534; | — | — | P2 |
@@ -457,9 +461,9 @@
 
 | Feature | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
-| `/v1/embeddings` endpoint | &#x1F535; | &#x1F7E2; | 7 | 7 | P3 |
+| `/v1/embeddings` endpoint | &#x1F535; | &#x1F7E1; | 7 | 7 | P3 |
 | Pooling execution mode (`--runner pooling`) | &#x1F535; | &#x1F534; | — | — | P3 |
-| Decoder-based embedding (last-token pooling) | &#x1F535; | &#x1F7E2; | 7 | 7 | P3 |
+| Decoder-based embedding (last-token pooling) | &#x1F535; | &#x1F7E1; | 7 | 7 | P3 |
 | Encoder-only models (BERT, ModernBERT) | &#x1F535; | &#x1F534; | — | — | P2 |
 | Pooling strategies (CLS, mean, last) | &#x1F535; | &#x1F534; | — | — | P3 |
 | Reward / reranking models | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -505,7 +509,7 @@
 | Dockerfile.cuda | &#x1F535; | &#x1F535; | 0 | 0 | |
 | `VLLM_MODEL` env var | &#x1F535; | &#x1F535; | 0 | 0 | |
 | PyO3 bridge (Rust scheduler in Python) | &#x1F535; | &#x1F7E1; | 0 | 0 | P1 |
-| Python fallback for unported models | &#x1F535; | &#x2795; | — | — | P1 |
+| Python fallback for unported models | &#x1F535; | &#x1F534; | — | — | P1 |
 | Standalone binary (no Python runtime) | &#x1F534; | &#x1F535; | 0 | 0 | |
 
 > Unit counts from `args.rs` (8 — CLI parsing: help, serve/bench positional/flag model, precedence, no-model error, convert) and `init.rs` (6 — extract model name, compute num blocks variants).

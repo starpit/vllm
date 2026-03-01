@@ -106,6 +106,28 @@ pub struct ServeArgs {
     /// Path to CA certificates file for client certificate verification (PEM).
     #[arg(long)]
     pub ssl_ca_certs: Option<String>,
+
+    /// Speculative decoding model. Currently only "ngram" is supported.
+    /// When set, the engine proposes draft tokens from n-gram matches
+    /// in the request's token history and verifies them in a single
+    /// multi-token forward pass.
+    #[arg(long)]
+    pub speculative_model: Option<String>,
+
+    /// Number of speculative tokens to propose per step (default: 5).
+    /// Only used when --speculative-model is set.
+    #[arg(long, default_value_t = 5)]
+    pub num_speculative_tokens: usize,
+
+    /// Maximum n-gram size for prompt lookup (default: 4).
+    /// Only used when --speculative-model ngram.
+    #[arg(long, default_value_t = 4)]
+    pub ngram_prompt_lookup_max: usize,
+
+    /// Minimum n-gram size for prompt lookup (default: 1).
+    /// Only used when --speculative-model ngram.
+    #[arg(long, default_value_t = 1)]
+    pub ngram_prompt_lookup_min: usize,
 }
 
 impl ServeArgs {

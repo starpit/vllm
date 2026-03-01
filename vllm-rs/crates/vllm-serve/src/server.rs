@@ -498,6 +498,7 @@ mod tests {
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,
+            ngram_proposer_config: None,
             eos_token_ids: vec![],
         };
         let executor = Box::new(NoopExecutor::new(1024));
@@ -640,6 +641,7 @@ mod tests {
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,
+            ngram_proposer_config: None,
             eos_token_ids: vec![],
         };
         let executor = Box::new(NoopExecutor::new(1024));
@@ -816,6 +818,7 @@ mod tests {
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,
+            ngram_proposer_config: None,
             eos_token_ids: vec![],
         };
         let executor = Box::new(NoopExecutor::new(1024));

@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use vllm_common::SamplingParams;
 use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_engine::executor::ModelRunnerOutput;
@@ -794,6 +794,11 @@ impl Worker for CandleWorker {
             req_id: String,
             token_ids: Vec<u32>,
             positions: Vec<u32>,
+            /// Draft tokens for speculative decode verification.
+            /// When non-empty, the last `spec_token_ids.len()` entries in
+            /// `token_ids` are drafts that need greedy verification against
+            /// the model's logits.
+            spec_token_ids: Vec<u32>,
         }
         let mut req_inputs: Vec<ReqInput> = Vec::new();
 
@@ -866,6 +871,7 @@ impl Worker for CandleWorker {
                 req_id: new_req.req_id.clone(),
                 token_ids: tokens_to_use.to_vec(),
                 positions,
+                spec_token_ids: Vec::new(),
             });
         }
 
@@ -913,11 +919,39 @@ impl Worker for CandleWorker {
                 let last_token = *buf.last().unwrap_or(&0);
                 let position = (buf.len() - 1) as u32;
 
-                req_inputs.push(ReqInput {
-                    req_id: req_id.clone(),
-                    token_ids: vec![last_token],
-                    positions: vec![position],
-                });
+                // Check for speculative decode draft tokens.
+                let spec_tokens = scheduler_output
+                    .scheduled_spec_decode_tokens
+                    .get(req_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                if spec_tokens.is_empty() {
+                    // Normal single-token decode.
+                    req_inputs.push(ReqInput {
+                        req_id: req_id.clone(),
+                        token_ids: vec![last_token],
+                        positions: vec![position],
+                        spec_token_ids: Vec::new(),
+                    });
+                } else {
+                    // Speculative decode: feed [last_token, draft_1, ..., draft_K].
+                    // The model processes all K+1 tokens in one forward pass.
+                    let mut token_ids = Vec::with_capacity(1 + spec_tokens.len());
+                    let mut positions = Vec::with_capacity(1 + spec_tokens.len());
+                    token_ids.push(last_token);
+                    positions.push(position);
+                    for (j, &draft_tok) in spec_tokens.iter().enumerate() {
+                        token_ids.push(draft_tok);
+                        positions.push(position + 1 + j as u32);
+                    }
+                    req_inputs.push(ReqInput {
+                        req_id: req_id.clone(),
+                        token_ids,
+                        positions,
+                        spec_token_ids: spec_tokens,
+                    });
+                }
             } else {
                 warn!("No token buffer for continuing request {}", req_id);
             }
@@ -945,6 +979,7 @@ impl Worker for CandleWorker {
                     req_id: req_id.clone(),
                     token_ids: vec![last_token],
                     positions: vec![position],
+                    spec_token_ids: Vec::new(),
                 });
             } else {
                 warn!("No token buffer for continuing request {}", req_id);
@@ -1050,11 +1085,9 @@ impl Worker for CandleWorker {
                 .flush_all()
                 .map_err(|e| ExecutorError::WorkerExecution(format!("scatter flush error: {e}")))?;
 
-            // Update tokens-in-pool counts.
-            for (idx, r) in req_inputs.iter().enumerate() {
-                let new_total = batch_tokens_before[idx] + r.token_ids.len();
-                self.req_tokens_in_pool.insert(r.req_id.clone(), new_total);
-            }
+            // tokens-in-pool update is deferred until after sampling/
+            // spec-decode verification so we can account for rejected
+            // draft tokens.
 
             // Split flat logits [total_tokens, vocab] into per-request logits.
             let mut per_req_logits = Vec::with_capacity(req_inputs.len());
@@ -1125,60 +1158,176 @@ impl Worker for CandleWorker {
                 prompt_logprobs_map.insert(req_input.req_id.clone(), plps);
             }
 
-            // Take logits at the last position and sample.
-            let last_pos = req_input.token_ids.len() - 1;
-            let req_logits = logits
-                .narrow(0, last_pos, 1)
-                .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+            // --- Sample / verify speculative tokens ---
+            let sampled = if !req_input.spec_token_ids.is_empty() {
+                // Speculative decode verification: check each draft token
+                // against the model's logits at that position.
+                //
+                // Input layout: [bonus_token, draft_0, draft_1, ..., draft_{K-1}]
+                // Logits layout: [logits_0, logits_1, ..., logits_K]
+                //   - logits_0 predicts what should follow bonus_token
+                //   - logits_i predicts what should follow draft_{i-1}
+                //
+                // For greedy: accept draft_i if argmax(logits_i) == draft_i.
+                // On first rejection at position j: take argmax(logits_j) instead.
+                // If all K drafts accepted: sample bonus token from logits_K.
+                let num_positions = req_input.token_ids.len(); // K+1
+                let all_logits = logits
+                    .to_dtype(DType::F32)
+                    .and_then(|t| t.to_vec2::<f32>())
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("spec decode logits error: {e}"))
+                    })?;
 
-            // Extract logits to CPU for sampling with full param support.
-            let logits_vec = req_logits
-                .to_dtype(DType::F32)
-                .map_err(|e| ExecutorError::WorkerExecution(format!("dtype cast error: {e}")))?
-                .flatten_all()
-                .map_err(|e| ExecutorError::WorkerExecution(format!("flatten error: {e}")))?
-                .to_vec1::<f32>()
-                .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+                let mut accepted = Vec::new();
+                let num_drafts = req_input.spec_token_ids.len();
 
-            // Query grammar-allowed tokens if constrained decoding is active.
-            let grammar_allowed: Option<Vec<u32>> = self
-                .grammar_states
-                .get(&req_input.req_id)
-                .and_then(|g| g.allowed_tokens());
+                for i in 0..num_drafts {
+                    // logits at position i predict the token after input[i].
+                    // We verify that draft_i matches argmax(logits[i]).
+                    if i >= all_logits.len() {
+                        break;
+                    }
+                    let row = &all_logits[i];
+                    let argmax_id = row
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(idx, _)| idx as u32)
+                        .unwrap_or(0);
 
-            let sampled = if let Some(params) = self.sampling_params_map.get(&req_input.req_id) {
-                let prev_tokens = self
-                    .token_buffers
-                    .get(&req_input.req_id)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                let (token_id, maybe_logprobs) = sampler.sample_one(
-                    &logits_vec,
-                    params,
-                    prev_tokens,
-                    grammar_allowed.as_deref(),
-                );
-                if let Some(lp) = maybe_logprobs {
-                    logprobs_map
-                        .entry(req_input.req_id.clone())
-                        .or_default()
-                        .push(lp);
+                    let draft = req_input.spec_token_ids[i];
+                    if argmax_id == draft {
+                        accepted.push(draft);
+                    } else {
+                        // Rejection: take the model's token instead.
+                        accepted.push(argmax_id);
+                        break; // Stop verifying remaining drafts.
+                    }
                 }
-                vec![token_id]
+
+                // If all drafts were accepted, sample a bonus token from the
+                // last position's logits (free extra token).
+                if accepted.len() == num_drafts && num_positions > 0 {
+                    let last_row = &all_logits[all_logits.len() - 1];
+                    let bonus = last_row
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(idx, _)| idx as u32)
+                        .unwrap_or(0);
+                    accepted.push(bonus);
+                }
+
+                if accepted.is_empty() {
+                    // Fallback: should not happen, but sample normally.
+                    let last_row = &all_logits[all_logits.len() - 1];
+                    let argmax = last_row
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(idx, _)| idx as u32)
+                        .unwrap_or(0);
+                    vec![argmax]
+                } else {
+                    debug!(
+                        "Spec decode {}: {}/{} drafts accepted (+ {} tokens total)",
+                        req_input.req_id,
+                        accepted.len().min(num_drafts),
+                        num_drafts,
+                        accepted.len()
+                    );
+                    accepted
+                }
             } else {
-                let indices = req_logits
-                    .argmax(candle_core::D::Minus1)
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("argmax error: {e}")))?;
-                indices
-                    .to_vec1::<u32>()
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?
+                // Normal (non-speculative) decode path.
+                let last_pos = req_input.token_ids.len() - 1;
+                let req_logits = logits
+                    .narrow(0, last_pos, 1)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+
+                // Extract logits to CPU for sampling with full param support.
+                let logits_vec = req_logits
+                    .to_dtype(DType::F32)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("dtype cast error: {e}")))?
+                    .flatten_all()
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("flatten error: {e}")))?
+                    .to_vec1::<f32>()
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+
+                // Query grammar-allowed tokens if constrained decoding is active.
+                let grammar_allowed: Option<Vec<u32>> = self
+                    .grammar_states
+                    .get(&req_input.req_id)
+                    .and_then(|g| g.allowed_tokens());
+
+                if let Some(params) = self.sampling_params_map.get(&req_input.req_id) {
+                    let prev_tokens = self
+                        .token_buffers
+                        .get(&req_input.req_id)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    let (token_id, maybe_logprobs) = sampler.sample_one(
+                        &logits_vec,
+                        params,
+                        prev_tokens,
+                        grammar_allowed.as_deref(),
+                    );
+                    if let Some(lp) = maybe_logprobs {
+                        logprobs_map
+                            .entry(req_input.req_id.clone())
+                            .or_default()
+                            .push(lp);
+                    }
+                    vec![token_id]
+                } else {
+                    let indices = req_logits.argmax(candle_core::D::Minus1).map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("argmax error: {e}"))
+                    })?;
+                    indices
+                        .to_vec1::<u32>()
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?
+                }
             };
 
-            // Advance grammar state with the sampled token.
+            // Advance grammar state with the sampled token(s).
+            // (Grammar-guided decoding is incompatible with spec decode for now.)
             if let Some(guide) = self.grammar_states.get_mut(&req_input.req_id)
                 && let Some(&token_id) = sampled.first()
             {
                 guide.advance(token_id);
+            }
+
+            // Deferred tokens-in-pool update (paged KV cache).
+            // For spec decode, only count accepted tokens, not all K+1 input tokens.
+            if use_paged {
+                let tokens_before = self
+                    .req_tokens_in_pool
+                    .get(&req_input.req_id)
+                    .copied()
+                    .unwrap_or(0);
+                // For prefill: all input tokens were accepted.
+                // For normal decode: 1 input → 1 sampled token (the input was the prev token).
+                // For spec decode: input had K+1 tokens but only `sampled.len()` new tokens accepted.
+                let new_tokens_in_cache = if !req_input.spec_token_ids.is_empty() {
+                    // Spec decode: we forwarded K+1 tokens but only the first
+                    // `sampled.len()` positions have valid KV.
+                    // The 1 input token (bonus) already had its KV from the
+                    // previous step; the new accepted count is sampled.len().
+                    sampled.len()
+                } else {
+                    req_input.token_ids.len()
+                };
+                self.req_tokens_in_pool.insert(
+                    req_input.req_id.clone(),
+                    tokens_before + new_tokens_in_cache,
+                );
             }
 
             // Update the token buffer with the new sampled token(s).

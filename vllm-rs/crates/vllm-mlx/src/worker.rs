@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, Dtype};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use vllm_common::SamplingParams;
 use vllm_core::scheduler::output::SchedulerOutput;
@@ -529,6 +529,8 @@ impl Worker for MlxWorker {
             token_ids: Vec<u32>,
             positions: Vec<i32>,
             is_prefill: bool,
+            /// Draft tokens for speculative decode verification.
+            spec_token_ids: Vec<u32>,
         }
         let mut req_inputs: Vec<ReqInput> = Vec::new();
 
@@ -588,6 +590,7 @@ impl Worker for MlxWorker {
                 token_ids: tokens_to_use.to_vec(),
                 positions,
                 is_prefill: true,
+                spec_token_ids: Vec::new(),
             });
         }
 
@@ -614,12 +617,40 @@ impl Worker for MlxWorker {
             if let Some(buf) = self.token_buffers.get(req_id) {
                 let last_token = *buf.last().unwrap_or(&0);
                 let position = (buf.len() - 1) as i32;
-                req_inputs.push(ReqInput {
-                    req_id: req_id.clone(),
-                    token_ids: vec![last_token],
-                    positions: vec![position],
-                    is_prefill: false,
-                });
+
+                // Check for speculative decode draft tokens.
+                let spec_tokens = scheduler_output
+                    .scheduled_spec_decode_tokens
+                    .get(req_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                if spec_tokens.is_empty() {
+                    req_inputs.push(ReqInput {
+                        req_id: req_id.clone(),
+                        token_ids: vec![last_token],
+                        positions: vec![position],
+                        is_prefill: false,
+                        spec_token_ids: Vec::new(),
+                    });
+                } else {
+                    // Speculative decode: feed [last_token, draft_1, ..., draft_K].
+                    let mut token_ids = Vec::with_capacity(1 + spec_tokens.len());
+                    let mut positions = Vec::with_capacity(1 + spec_tokens.len());
+                    token_ids.push(last_token);
+                    positions.push(position);
+                    for (j, &draft_tok) in spec_tokens.iter().enumerate() {
+                        token_ids.push(draft_tok);
+                        positions.push(position + 1 + j as i32);
+                    }
+                    req_inputs.push(ReqInput {
+                        req_id: req_id.clone(),
+                        token_ids,
+                        positions,
+                        is_prefill: false,
+                        spec_token_ids: spec_tokens,
+                    });
+                }
             } else {
                 warn!("No token buffer for continuing request {}", req_id);
             }
@@ -645,6 +676,7 @@ impl Worker for MlxWorker {
                     token_ids: vec![last_token],
                     positions: vec![position],
                     is_prefill: false,
+                    spec_token_ids: Vec::new(),
                 });
             }
         }
@@ -714,17 +746,27 @@ impl Worker for MlxWorker {
                 logits.clone()
             };
 
-            // Prepare prompt logprobs conversion (lazy).
-            let (full_logits_f32, prompt_logprobs_info) = if req_input.is_prefill
+            // Prepare full logits for prompt logprobs or spec decode verification.
+            let needs_full_logits = (req_input.is_prefill
                 && req_input.token_ids.len() > 1
-                && let Some(params) = self.sampling_params_map.get(&req_input.req_id)
-                && params.prompt_logprobs.is_some()
-            {
-                let top_n = params.prompt_logprobs.unwrap().max(0) as usize;
+                && self
+                    .sampling_params_map
+                    .get(&req_input.req_id)
+                    .and_then(|p| p.prompt_logprobs)
+                    .is_some())
+                || !req_input.spec_token_ids.is_empty();
+
+            let (full_logits_f32, prompt_logprobs_info) = if needs_full_logits {
+                let top_n = self
+                    .sampling_params_map
+                    .get(&req_input.req_id)
+                    .and_then(|p| p.prompt_logprobs)
+                    .map(|n| n.max(0) as usize);
                 let f32_logits = logits.as_dtype(Dtype::Float32).map_err(|e| {
                     ExecutorError::WorkerExecution(format!("dtype cast error: {e}"))
                 })?;
-                (Some(f32_logits), Some((top_n, req_input.token_ids.clone())))
+                let info = top_n.map(|n| (n, req_input.token_ids.clone()));
+                (Some(f32_logits), info)
             } else {
                 (None, None)
             };
@@ -772,57 +814,133 @@ impl Worker for MlxWorker {
                 prompt_logprobs_map.insert(req_input.req_id.clone(), plps);
             }
 
-            // Query grammar-allowed tokens if constrained decoding is active.
-            let grammar_allowed: Option<Vec<u32>> = self
-                .grammar_states
-                .get(&req_input.req_id)
-                .and_then(|g| g.allowed_tokens());
-            let has_grammar = grammar_allowed.is_some();
+            // --- Sample / verify speculative tokens ---
+            let sampled = if !req_input.spec_token_ids.is_empty() {
+                // Speculative decode verification (greedy).
+                // Full logits are already eval'd via Phase B.
+                let all_logits_f32 = lazy_out.full_logits_f32.as_ref().unwrap();
 
-            // Determine if we need CPU-side sampling.
-            let params = self.sampling_params_map.get(&req_input.req_id);
-            let needs_cpu_sampling = has_grammar
-                || params.is_some_and(|p| {
-                    p.repetition_penalty != 1.0
-                        || p.frequency_penalty != 0.0
-                        || p.presence_penalty != 0.0
-                        || p.min_p > 0.0
-                        || p.logit_bias.is_some()
-                        || p.logprobs.is_some()
-                        || (p.top_k > 0 || p.top_p < 1.0)
-                });
+                let vocab_size = all_logits_f32.dim(-1) as usize;
+                let flat = all_logits_f32.as_slice::<f32>();
+                let num_drafts = req_input.spec_token_ids.len();
+                let num_positions = req_input.token_ids.len();
 
-            let sampled = if needs_cpu_sampling {
-                // Logits are already eval'd — just extract to CPU.
-                let logits_f32 = lazy_out.last_logits.as_dtype(Dtype::Float32).map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("dtype cast error: {e}"))
-                })?;
-                logits_f32
-                    .eval()
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
-                let flat = logits_f32.as_slice::<f32>();
+                let mut accepted = Vec::new();
+                for i in 0..num_drafts {
+                    if i >= num_positions {
+                        break;
+                    }
+                    let row = &flat[i * vocab_size..(i + 1) * vocab_size];
+                    let argmax_id = row
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(idx, _)| idx as u32)
+                        .unwrap_or(0);
 
-                let p = params.unwrap();
-                let prev_tokens = self
-                    .token_buffers
-                    .get(&req_input.req_id)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                let (token_id, maybe_logprobs) =
-                    cpu_sampler.sample_one(flat, p, prev_tokens, grammar_allowed.as_deref());
-                if let Some(lp) = maybe_logprobs {
-                    logprobs_map
-                        .entry(req_input.req_id.clone())
-                        .or_default()
-                        .push(lp);
+                    let draft = req_input.spec_token_ids[i];
+                    if argmax_id == draft {
+                        accepted.push(draft);
+                    } else {
+                        accepted.push(argmax_id);
+                        break;
+                    }
                 }
-                vec![token_id]
-            } else if let Some(p) = params {
-                // Simple temperature sampling via MLX.
-                let temp = p.temperature as f32;
-                Self::sample_with_temperature(&lazy_out.last_logits, temp)?
+
+                // Bonus token if all drafts accepted.
+                if accepted.len() == num_drafts && num_positions > 0 {
+                    let last_row_start = (num_positions - 1) * vocab_size;
+                    let last_row = &flat[last_row_start..last_row_start + vocab_size];
+                    let bonus = last_row
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(idx, _)| idx as u32)
+                        .unwrap_or(0);
+                    accepted.push(bonus);
+                }
+
+                if accepted.is_empty() {
+                    // Fallback.
+                    let last_row_start = (num_positions - 1) * vocab_size;
+                    let last_row = &flat[last_row_start..last_row_start + vocab_size];
+                    let argmax = last_row
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| {
+                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(idx, _)| idx as u32)
+                        .unwrap_or(0);
+                    vec![argmax]
+                } else {
+                    debug!(
+                        "Spec decode {}: {}/{} drafts accepted (+ {} tokens total)",
+                        req_input.req_id,
+                        accepted.len().min(num_drafts),
+                        num_drafts,
+                        accepted.len()
+                    );
+                    accepted
+                }
             } else {
-                Self::greedy_sample(&lazy_out.last_logits)?
+                // Normal (non-speculative) decode path — use HEAD's lazy_out approach.
+                // Query grammar-allowed tokens if constrained decoding is active.
+                let grammar_allowed: Option<Vec<u32>> = self
+                    .grammar_states
+                    .get(&req_input.req_id)
+                    .and_then(|g| g.allowed_tokens());
+                let has_grammar = grammar_allowed.is_some();
+
+                // Determine if we need CPU-side sampling.
+                let params = self.sampling_params_map.get(&req_input.req_id);
+                let needs_cpu_sampling = has_grammar
+                    || params.is_some_and(|p| {
+                        p.repetition_penalty != 1.0
+                            || p.frequency_penalty != 0.0
+                            || p.presence_penalty != 0.0
+                            || p.min_p > 0.0
+                            || p.logit_bias.is_some()
+                            || p.logprobs.is_some()
+                            || (p.top_k > 0 || p.top_p < 1.0)
+                    });
+
+                if needs_cpu_sampling {
+                    // Logits are already eval'd via Phase B — just extract to CPU.
+                    let logits_f32 =
+                        lazy_out.last_logits.as_dtype(Dtype::Float32).map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("dtype cast error: {e}"))
+                        })?;
+                    logits_f32
+                        .eval()
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
+                    let flat = logits_f32.as_slice::<f32>();
+
+                    let p = params.unwrap();
+                    let prev_tokens = self
+                        .token_buffers
+                        .get(&req_input.req_id)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    let (token_id, maybe_logprobs) =
+                        cpu_sampler.sample_one(flat, p, prev_tokens, grammar_allowed.as_deref());
+                    if let Some(lp) = maybe_logprobs {
+                        logprobs_map
+                            .entry(req_input.req_id.clone())
+                            .or_default()
+                            .push(lp);
+                    }
+                    vec![token_id]
+                } else if let Some(p) = params {
+                    let temp = p.temperature as f32;
+                    Self::sample_with_temperature(&lazy_out.last_logits, temp)?
+                } else {
+                    Self::greedy_sample(&lazy_out.last_logits)?
+                }
             };
 
             // Advance grammar state with the sampled token.

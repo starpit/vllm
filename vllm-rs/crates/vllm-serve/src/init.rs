@@ -51,6 +51,14 @@ pub struct VllmConfig {
     pub hf_token: Option<String>,
     /// Specific GGUF filename to download from a HuggingFace repo.
     pub gguf_file: Option<String>,
+    /// Speculative model type (e.g. "ngram"). None = disabled.
+    pub speculative_model: Option<String>,
+    /// Number of speculative tokens to propose per step.
+    pub num_speculative_tokens: usize,
+    /// Maximum n-gram size for prompt lookup.
+    pub ngram_prompt_lookup_max: usize,
+    /// Minimum n-gram size for prompt lookup.
+    pub ngram_prompt_lookup_min: usize,
 }
 
 impl Default for VllmConfig {
@@ -65,6 +73,10 @@ impl Default for VllmConfig {
             gpu_memory_utilization: 0.9,
             hf_token: None,
             gguf_file: None,
+            speculative_model: None,
+            num_speculative_tokens: 5,
+            ngram_prompt_lookup_max: 4,
+            ngram_prompt_lookup_min: 1,
         }
     }
 }
@@ -274,7 +286,16 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         block_size: config.block_size,
         engine_index: 0,
         async_scheduling: false,
-        use_spec_decode: false,
+        use_spec_decode: config.speculative_model.is_some(),
+        ngram_proposer_config: if config.speculative_model.as_deref() == Some("ngram") {
+            Some(vllm_engine::ngram::NgramProposerConfig {
+                num_speculative_tokens: config.num_speculative_tokens,
+                max_ngram_size: config.ngram_prompt_lookup_max,
+                min_ngram_size: config.ngram_prompt_lookup_min,
+            })
+        } else {
+            None
+        },
         eos_token_ids,
     };
 

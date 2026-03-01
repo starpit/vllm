@@ -30,6 +30,15 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     info!("vLLM Rust — starting server");
     info!("Model: {}", model);
     info!("Device: {}, dtype: {}", args.device, args.dtype);
+    if let Some(ref spec_model) = args.speculative_model {
+        info!(
+            "Speculative decoding: {} (k={}, ngram_max={}, ngram_min={})",
+            spec_model,
+            args.num_speculative_tokens,
+            args.ngram_prompt_lookup_max,
+            args.ngram_prompt_lookup_min
+        );
+    }
 
     // 2. Convert CLI args to VllmConfig and initialize the full stack
     //    (on a blocking thread to avoid starving the tokio I/O driver
@@ -44,6 +53,10 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         gpu_memory_utilization: args.gpu_memory_utilization,
         hf_token: args.hf_token.clone(),
         gguf_file: args.gguf_file.clone(),
+        speculative_model: args.speculative_model.clone(),
+        num_speculative_tokens: args.num_speculative_tokens,
+        ngram_prompt_lookup_max: args.ngram_prompt_lookup_max,
+        ngram_prompt_lookup_min: args.ngram_prompt_lookup_min,
     };
 
     let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&config))

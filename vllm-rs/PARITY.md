@@ -1,6 +1,6 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (856 tests: 791 unit + 65 e2e, 0 clippy errors)
+> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (889 tests: 818 unit + 71 e2e, 0 clippy errors)
 
 ### Legend
 
@@ -46,14 +46,14 @@
 | [Performance Optimizations](#performance-optimizations) | &#x1F535; | &#x1F7E1; | 6 | 0 | `██░░░░░░░░` 2/13 |
 | [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | &#x1F535; | &#x1F7E1; | 0 | 0 | `██░░░░░░░░` 3/12 |
 | [LoRA / Adapters](#lora--adapters) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/5 |
-| [Speculative Decoding](#speculative-decoding) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/5 |
+| [Speculative Decoding](#speculative-decoding) | &#x1F535; | &#x1F7E1; | 20 | 0 | `██░░░░░░░░` 1/5 |
 | [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F535; | &#x2795; | 0 | 0 | `░░░░░░░░░░` 0/10 |
 | [Structured Output](#structured-output--guided-decoding) | &#x1F535; | &#x1F535; | 12 | 0 | `██████████` 4/4 |
 | [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x1F535; | 25 | 0 | `██████████` 7/7 |
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F7E2; | 7 | 7 | `████░░░░░░` 2/6 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | 15 | 0 | `██████████` 7/7 |
-| [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | 14 | 0 | `██████████` 14/15 |
-| | | **Total** | **563** | **58** | `█████░░░░░` **105/214** |
+| [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | 14 | 0 | `██████████` 15/16 |
+| | | **Total** | **583** | **58** | `█████░░░░░` **107/215** |
 
 ---
 
@@ -394,8 +394,10 @@
 | Draft model (MLP speculator) | &#x1F535; | &#x1F534; | — | — | P2 |
 | Eagle speculative decoding | &#x1F535; | &#x1F534; | — | — | P2 |
 | Medusa heads | &#x1F535; | &#x1F534; | — | — | P2 |
-| N-gram proposer | &#x1F535; | &#x1F534; | — | — | P3 |
+| N-gram proposer | &#x1F535; | &#x1F535; | 20 | 0 | |
 | Suffix decoding | &#x1F535; | &#x1F534; | — | — | P1 |
+
+> Unit counts from `ngram.rs` (16 — proposer algorithm: empty/single/no-match, bigram/trigram/unigram matching, n-gram size priority, most-recent-match preference, max-token limits, code-like patterns, boundary cases) and `engine_core.rs` (4 — proposer creation, disabled-by-default, propose-after-step, cleared-after-schedule). N-gram proposer scans the request's own token history for matching n-grams and proposes continuation tokens; the target model verifies drafts in a single multi-token forward pass with greedy acceptance. CLI: `--speculative-model ngram --num-speculative-tokens K --ngram-prompt-lookup-max N --ngram-prompt-lookup-min N`.
 
 ---
 
@@ -493,6 +495,7 @@
 | `--gpu-memory-utilization` | &#x1F535; | &#x1F535; | 0 | 0 | |
 | `--gguf-file` | &#x1F535; | &#x1F535; | 0 | 0 | |
 | `--tool-call-parser` | &#x1F535; | &#x1F535; | 0 | 0 | |
+| `--speculative-model ngram` | &#x1F535; | &#x1F535; | 0 | 0 | |
 | `--features metal` (MLX backend) | N/A | &#x1F535; | 0 | 0 | |
 | Dockerfile.cpu | &#x1F535; | &#x1F535; | 0 | 0 | |
 | Dockerfile.cuda | &#x1F535; | &#x1F535; | 0 | 0 | |
@@ -516,6 +519,6 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Unit tests | ~948 test files | 715 passing (665 non-MLX + 50 MLX) |
-| E2E tests | — | 57 passing (28 basic serving + 21 chat/sampling + 8 streaming) |
+| Unit tests | ~948 test files | 818 passing (760 non-MLX + 58 MLX) |
+| E2E tests | — | 71 passing (36 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

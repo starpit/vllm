@@ -14,8 +14,8 @@
 
 | Priority | Meaning | Count |
 |----------|---------|------:|
-| **P4** | Highest — production blockers, widely needed, or near-free to implement | 1 |
-| **P3** | High — meaningfully expands user base or enables key use cases | 26 |
+| **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
+| **P3** | High — meaningfully expands user base or enables key use cases | 27 |
 | **P2** | Medium — useful improvement, broader coverage | 39 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
@@ -247,7 +247,7 @@
 | xFormers | &#x1F535; | &#x1F534; | — | — | P0 |
 | MLA (Multi-head Latent Attention) | &#x1F535; | &#x1F535; | 4 | 0 | |
 | Sliding window attention | &#x1F535; | &#x1F535; | 13 | 0 | |
-| Batched attention metadata (cu_seqlens, slot_mapping, block_table) | &#x1F535; | &#x1F7E1; | 3 | 0 | P4 |
+| Batched attention metadata (cu_seqlens, slot_mapping, block_table) | &#x1F535; | &#x1F7E1; | 3 | 0 | P3 |
 | Tree attention | &#x1F535; | &#x1F534; | — | — | P1 |
 
 > Unit counts: `block_pool.rs` (19), `free_block_queue.rs` (16), `kv_cache_manager.rs` (13), `kv_cache_block.rs` (11), `kv_block_pool.rs` (13), `attention.rs` (25), MLX `cache.rs` (1). Sliding window: 7 attention.rs + 2 gemma2.rs interleaved + 2 qwen2.rs max_window_layers + 1 MLX phi3 trim + 1 array-format parsing = 13. Per-row counts reflect the primary feature each test targets; some tests cross-cut multiple rows. Total section: 103 unit tests.
@@ -255,7 +255,7 @@
 > **Batched attention metadata note:** The Rust port now has `AttentionMetadata` (with `query_start_loc`, `seq_lens`, `block_ids`, `tokens_before` per request) used by `forward_batch()` to split Q/K/V for per-request attention. However, the attention inner loop is still per-request — each request's slice runs through `attention_with_cache()` separately. Python vLLM passes equivalent metadata to FlashAttention's `varlen` API or FlashInfer's batched wrappers, which handle variable-length multi-request attention in a single kernel call. The remaining gap is a batched attention kernel that processes all requests' attention in one dispatch:
 > - **CUDA**: FlashAttention varlen (`flash_attn_varlen_func`) via FFI, or FlashInfer batched wrappers — uses `cu_seqlens` to handle ragged sequences without padding.
 > - **MLX**: Two approaches: (a) **Padded-batch SDPA** — left-pad inputs to uniform KV length, use `BatchKVCache` with per-sequence padding offsets, construct padding-aware causal masks (proven by mlx-lm's `BatchGenerator`; wastes compute on pad tokens but works with stock MLX SDPA). (b) **Custom Metal PagedAttention kernels** — block-table-based paged attention Metal shaders (implemented by mistral.rs / HF kernels-community); no padding, higher throughput, more implementation effort.
-> - **Impact**: On already-saturated hardware (e.g., M1 Max with MLX), the current batched-forward-with-per-request-attention yields ~33% throughput gain at n=4. Batched attention kernels would improve this further by parallelizing the attention compute itself.
+> - **Impact (downgraded from P4 to P3)**: On MLX, the current batched-forward-with-per-request-attention already yields ~33% throughput gain at n=4. MLX lazy eval already implicitly batches the N separate SDPA kernel dispatches into a single `eval()` / Metal command buffer, so the kernel-launch-overhead savings are already captured. The remaining gap is GPU occupancy within the attention shader itself — a modest incremental win (est. 10-20% ITL reduction at n=4-8). The padded-batch SDPA approach also introduces padding waste when requests have different sequence lengths, partially offsetting gains. TTFT is unaffected (prefill is projection/MLP-dominated and rarely overlaps). The high-value path is CUDA FlashAttention varlen (ragged sequences, no padding), but that requires C FFI — a larger lift gated on CUDA backend maturity.
 
 ---
 

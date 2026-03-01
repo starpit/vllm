@@ -101,6 +101,7 @@ fn make_prefill_output(req_id: &str, prompt_ids: &[u32]) -> SchedulerOutput {
             block_ids: vec![],
             num_computed_tokens: 0,
             sampling_params: None,
+            mm_data: None,
         }],
         num_scheduled_tokens: num_scheduled,
         total_num_scheduled_tokens: prompt_ids.len(),

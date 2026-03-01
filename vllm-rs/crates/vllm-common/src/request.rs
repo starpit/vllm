@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 use serde::{Deserialize, Serialize};
 
 use crate::engine_io::FinishReason;
+use crate::multimodal::MultimodalData;
 use crate::sampling::SamplingParams;
 
 // ---------------------------------------------------------------------------
@@ -152,6 +153,11 @@ pub struct Request {
 
     /// Number of placeholder output tokens reserved for async scheduling.
     pub num_output_placeholders: u32,
+
+    /// Multimodal data (images) for vision-language models.
+    /// Set once at request creation, consumed during the first prefill step.
+    #[serde(skip)]
+    pub mm_data: Option<MultimodalData>,
 }
 
 impl Request {
@@ -191,6 +197,7 @@ impl Request {
             num_preemptions: 0,
             num_external_computed_tokens: 0,
             num_output_placeholders: 0,
+            mm_data: None,
         }
     }
 

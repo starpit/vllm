@@ -647,21 +647,22 @@ impl Gemma3Model {
         })
     }
 
-    /// Forward pass.
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        positions: &Tensor,
-        mut kv_cache: Option<&mut crate::KvCacheStorage<'_>>,
-    ) -> ModelResult<Tensor> {
-        let mut hidden_states = self
+    /// Embed token IDs and scale by sqrt(hidden_size).
+    pub fn embed(&self, input_ids: &Tensor) -> ModelResult<Tensor> {
+        let hidden_states = self
             .embed_tokens
             .forward(input_ids)
             .map_err(ModelError::Candle)?;
+        (hidden_states * self.normalizer).map_err(ModelError::Candle)
+    }
 
-        // Gemma normalizes embeddings by sqrt(hidden_size).
-        hidden_states = (hidden_states * self.normalizer).map_err(ModelError::Candle)?;
-
+    /// Run the transformer backbone on pre-computed embeddings.
+    pub fn backbone(
+        &self,
+        mut hidden_states: Tensor,
+        positions: &Tensor,
+        mut kv_cache: Option<&mut crate::KvCacheStorage<'_>>,
+    ) -> ModelResult<Tensor> {
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_handle = kv_cache.as_mut().map(|s| s.layer_handle(i));
             hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
@@ -670,6 +671,17 @@ impl Gemma3Model {
         self.norm
             .forward(&hidden_states)
             .map_err(ModelError::Candle)
+    }
+
+    /// Forward pass (embed + backbone).
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        positions: &Tensor,
+        kv_cache: Option<&mut crate::KvCacheStorage<'_>>,
+    ) -> ModelResult<Tensor> {
+        let hidden_states = self.embed(input_ids)?;
+        self.backbone(hidden_states, positions, kv_cache)
     }
 
     /// Number of decoder layers.
@@ -687,8 +699,8 @@ impl Gemma3Model {
 /// Uses tied embeddings (embed_tokens weight as lm_head) and optional
 /// logit soft capping (None for Gemma3, kept for robustness).
 pub struct Gemma3ForCausalLM {
-    model: Gemma3Model,
-    lm_head: Linear,
+    pub(crate) model: Gemma3Model,
+    pub(crate) lm_head: Linear,
     final_logit_softcapping: Option<f64>,
 }
 
@@ -797,6 +809,19 @@ impl crate::Model for Gemma3ForCausalLM {
         let hidden_states = self.model.forward(input_ids, positions, kv_cache)?;
         let logits = self.compute_logits(&hidden_states)?;
         // Cast logits to f32 for sampling (sampler expects f32).
+        logits.to_dtype(DType::F32).map_err(ModelError::Candle)
+    }
+
+    fn forward_embeds(
+        &self,
+        inputs_embeds: &Tensor,
+        positions: &Tensor,
+        kv_cache: Option<&mut crate::KvCacheStorage<'_>>,
+    ) -> ModelResult<Tensor> {
+        let hidden_states = self
+            .model
+            .backbone(inputs_embeds.clone(), positions, kv_cache)?;
+        let logits = self.compute_logits(&hidden_states)?;
         logits.to_dtype(DType::F32).map_err(ModelError::Candle)
     }
 

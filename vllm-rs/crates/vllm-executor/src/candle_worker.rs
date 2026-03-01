@@ -119,6 +119,8 @@ pub struct CandleWorker {
     grammar_vocabulary: Option<outlines_core::vocabulary::Vocabulary>,
     /// Resolved pooling strategy for embeddings.
     pooling_strategy: vllm_models::embedding::PoolingStrategy,
+    /// Per-request multimodal data, consumed on first forward (prefill).
+    mm_data_map: HashMap<String, vllm_common::MultimodalData>,
 }
 
 impl CandleWorker {
@@ -145,6 +147,7 @@ impl CandleWorker {
             grammar_states: HashMap::new(),
             grammar_vocabulary: None,
             pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
+            mm_data_map: HashMap::new(),
         }
     }
 
@@ -885,7 +888,7 @@ impl Worker for CandleWorker {
 
         let model = self
             .model
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| ExecutorError::WorkerExecution("model not loaded".to_string()))?;
         let device = self
             .device
@@ -903,6 +906,7 @@ impl Worker for CandleWorker {
             self.req_block_tables.remove(req_id);
             self.req_tokens_in_pool.remove(req_id);
             self.grammar_states.remove(req_id);
+            self.mm_data_map.remove(req_id);
         }
 
         struct ReqInput {
@@ -981,6 +985,12 @@ impl Worker for CandleWorker {
             let positions: Vec<u32> = (0..tokens_to_use.len() as u32)
                 .map(|i| pos_offset + i)
                 .collect();
+
+            // Store multimodal data for VLM models (consumed during forward).
+            if let Some(ref mm_data) = new_req.mm_data {
+                self.mm_data_map
+                    .insert(new_req.req_id.clone(), mm_data.clone());
+            }
 
             req_inputs.push(ReqInput {
                 req_id: new_req.req_id.clone(),
@@ -1220,6 +1230,10 @@ impl Worker for CandleWorker {
             // --- Legacy per-request KV cache path ---
             let mut per_req_logits = Vec::with_capacity(req_inputs.len());
             for req_input in &req_inputs {
+                // Inject multimodal data for VLM models (consumed during forward).
+                let mm_data = self.mm_data_map.remove(&req_input.req_id);
+                model.set_mm_data(mm_data);
+
                 let input_ids = Tensor::new(req_input.token_ids.as_slice(), device)
                     .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
                 let positions = Tensor::new(req_input.positions.as_slice(), device)
@@ -1931,6 +1945,7 @@ mod tests {
                 vec![vec![0]],
                 0,
                 Some(SamplingParams::default()),
+                None,
             )],
             scheduled_cached_reqs: CachedRequestData::make_empty(),
             num_scheduled_tokens: num_scheduled,
@@ -1972,6 +1987,7 @@ mod tests {
                 vec![vec![0]],
                 0,
                 Some(SamplingParams::default()),
+                None,
             )],
             scheduled_cached_reqs: CachedRequestData::make_empty(),
             num_scheduled_tokens: num_scheduled,
@@ -2039,6 +2055,7 @@ mod tests {
                 vec![vec![0]],
                 0,
                 Some(SamplingParams::default()),
+                None,
             )],
             scheduled_cached_reqs: CachedRequestData::make_empty(),
             num_scheduled_tokens: num_scheduled,
@@ -2106,6 +2123,7 @@ mod tests {
                     vec![vec![0]],
                     0,
                     Some(SamplingParams::default()),
+                    None,
                 ),
                 NewRequestData::new(
                     "r2".to_string(),
@@ -2113,6 +2131,7 @@ mod tests {
                     vec![vec![1]],
                     0,
                     Some(SamplingParams::default()),
+                    None,
                 ),
             ],
             scheduled_cached_reqs: CachedRequestData::make_empty(),
@@ -2171,6 +2190,7 @@ mod tests {
                     vec![vec![0]],
                     0,
                     Some(SamplingParams::default()),
+                    None,
                 ),
                 NewRequestData::new(
                     "r2".to_string(),
@@ -2178,6 +2198,7 @@ mod tests {
                     vec![vec![1]],
                     0,
                     Some(SamplingParams::default()),
+                    None,
                 ),
             ],
             scheduled_cached_reqs: CachedRequestData::make_empty(),

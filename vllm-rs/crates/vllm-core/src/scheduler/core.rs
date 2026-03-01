@@ -725,6 +725,7 @@ impl SchedulerInterface for Scheduler {
                     blocks,
                     req.num_computed_tokens,
                     Some(req.sampling_params),
+                    req.mm_data,
                 )
             })
             .collect();

@@ -106,6 +106,8 @@ pub struct MlxWorker {
 
     /// Resolved pooling strategy for embeddings.
     pooling_strategy: vllm_models::embedding::PoolingStrategy,
+    /// Per-request multimodal data, consumed on first forward (prefill).
+    mm_data_map: HashMap<String, vllm_common::MultimodalData>,
 
     // Timing instrumentation.
     step_count: usize,
@@ -132,6 +134,7 @@ impl MlxWorker {
             grammar_states: HashMap::new(),
             grammar_vocabulary: None,
             pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
+            mm_data_map: HashMap::new(),
             step_count: 0,
             prefill_count: 0,
             decode_count: 0,
@@ -615,6 +618,7 @@ impl Worker for MlxWorker {
             self.sampling_params_map.remove(req_id);
             self.kv_caches.remove(req_id);
             self.grammar_states.remove(req_id);
+            self.mm_data_map.remove(req_id);
         }
 
         // Collect requests.
@@ -678,6 +682,11 @@ impl Worker for MlxWorker {
             let positions: Vec<i32> = (0..tokens_to_use.len() as i32)
                 .map(|i| pos_offset + i)
                 .collect();
+
+            // Store multimodal data for VLM models (consumed during forward).
+            if let Some(mm_data) = new_req.mm_data.clone() {
+                self.mm_data_map.insert(new_req.req_id.clone(), mm_data);
+            }
 
             req_inputs.push(ReqInput {
                 req_id: new_req.req_id.clone(),
@@ -821,6 +830,10 @@ impl Worker for MlxWorker {
                 .kv_caches
                 .entry(req_input.req_id.clone())
                 .or_insert_with(|| cache::empty_kv_cache(num_layers));
+
+            // Inject multimodal data for VLM models (consumed during forward).
+            let mm_data = self.mm_data_map.remove(&req_input.req_id);
+            model.set_mm_data(mm_data);
 
             // Forward pass — builds lazy compute graph (no eval yet).
             let logits = model

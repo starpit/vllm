@@ -359,7 +359,41 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         engine.set_async_scheduling(true);
     }
 
-    // 10. Return the stack.
+    // 10. Configure multimodal support if the model has a vision_config.
+    if let Some(vision_config) = hf_config.extra.get("vision_config") {
+        let image_size = vision_config
+            .get("image_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(224) as usize;
+        let patch_size = vision_config
+            .get("patch_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(14) as usize;
+        let num_patches = if patch_size > 0 {
+            (image_size / patch_size).pow(2)
+        } else {
+            256
+        };
+        let image_token_index = hf_config
+            .extra
+            .get("image_token_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(255999) as u32;
+        let mm_tokens_per_image = hf_config
+            .extra
+            .get("mm_tokens_per_image")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(num_patches);
+
+        info!(
+            "Multimodal config: image_token_id={}, tokens_per_image={}, image_size={}",
+            image_token_index, mm_tokens_per_image, image_size,
+        );
+        engine.set_multimodal_config(image_token_index, mm_tokens_per_image, image_size);
+    }
+
+    // 11. Return the stack.
     Ok(InitializedStack {
         engine: Arc::new(engine),
         model_name,

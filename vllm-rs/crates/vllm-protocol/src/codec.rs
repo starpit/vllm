@@ -160,6 +160,7 @@ mod tests {
             priority: 0,
             cache_salt: None,
             data_parallel_rank: None,
+            mm_data: None,
         };
 
         let encoded = encode(&req).unwrap();
@@ -284,6 +285,7 @@ mod tests {
             priority: 0,
             cache_salt: None,
             data_parallel_rank: None,
+            mm_data: None,
         };
 
         let encoded = encode(&req).unwrap();
@@ -310,6 +312,7 @@ mod tests {
             priority: 0,
             cache_salt: None,
             data_parallel_rank: None,
+            mm_data: None,
         };
 
         let encoded = encode(&req).unwrap();

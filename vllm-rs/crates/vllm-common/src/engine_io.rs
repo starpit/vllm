@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::multimodal::MultimodalData;
 use crate::sampling::{LogprobsOutput, SamplingParams};
 
 // ---------------------------------------------------------------------------
@@ -129,6 +130,12 @@ pub struct EngineCoreRequest {
 
     /// In data-parallel mode, the rank this request should be sent to.
     pub data_parallel_rank: Option<u32>,
+
+    /// Multimodal data (images) for vision-language models.
+    /// Only present for requests with image content. Skipped during
+    /// serialization since images are passed in-process only.
+    #[serde(skip)]
+    pub mm_data: Option<MultimodalData>,
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +342,7 @@ mod tests {
             priority: 0,
             cache_salt: None,
             data_parallel_rank: None,
+            mm_data: None,
         };
         assert_eq!(req.request_id, "req-1");
         assert_eq!(req.prompt_token_ids.as_ref().unwrap().len(), 3);
@@ -355,6 +363,7 @@ mod tests {
             priority: 5,
             cache_salt: Some("salt-abc".into()),
             data_parallel_rank: Some(1),
+            mm_data: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let req2: EngineCoreRequest = serde_json::from_str(&json).unwrap();

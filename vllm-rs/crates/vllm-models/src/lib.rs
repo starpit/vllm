@@ -16,6 +16,7 @@ pub mod deepseek_v2;
 pub mod embedding;
 pub mod gemma2;
 pub mod gemma3;
+pub mod gemma3_mm;
 pub mod gptq_llama;
 pub mod grammar;
 pub mod kv_block_pool;
@@ -26,6 +27,7 @@ pub mod qwen2;
 pub mod qwen3_moe;
 pub mod registry;
 pub mod sampler;
+pub mod siglip;
 
 use candle_core::Tensor;
 use vllm_model::ModelResult;
@@ -503,6 +505,32 @@ pub trait Model: Send {
             "hidden_states not supported by this model".into(),
         ))
     }
+
+    /// Run the model forward pass from pre-computed embeddings (for VLM models).
+    ///
+    /// * `inputs_embeds` — merged text+image embeddings, shape `[num_tokens, hidden_size]`
+    /// * `positions` — position indices, shape `[num_tokens]`
+    /// * `kv_cache` — optional KV cache storage.
+    ///
+    /// Returns logits of shape `[num_tokens, vocab_size]`.
+    ///
+    /// Default implementation returns an error. VLM-wrapped text models override this.
+    fn forward_embeds(
+        &self,
+        _inputs_embeds: &Tensor,
+        _positions: &Tensor,
+        _kv_cache: Option<&mut KvCacheStorage<'_>>,
+    ) -> ModelResult<Tensor> {
+        Err(vllm_model::error::ModelError::Other(
+            "forward_embeds not supported by this model".into(),
+        ))
+    }
+
+    /// Provide multimodal data (images) for the next forward pass.
+    ///
+    /// VLM models store this internally and consume it during `forward()`.
+    /// Text-only models ignore this (default no-op).
+    fn set_mm_data(&mut self, _mm_data: Option<vllm_common::MultimodalData>) {}
 
     /// Batched forward pass across multiple requests.
     ///

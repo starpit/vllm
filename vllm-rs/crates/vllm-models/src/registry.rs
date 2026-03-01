@@ -71,6 +71,11 @@ impl ModelRegistry {
         // Gemma 3 — like Gemma2 but with per-head QK norms, per-layer RoPE theta,
         // sliding_window_pattern, and no softcapping
         self.register("Gemma3ForCausalLM", crate::gemma3::create_gemma3);
+        // Gemma 3 multimodal (vision-language) — SigLIP vision + projector + Gemma3 LM
+        self.register(
+            "Gemma3ForConditionalGeneration",
+            crate::gemma3_mm::create_gemma3_mm,
+        );
         // DeepSeek V2/V3 — MLA attention + MoE + YaRN RoPE
         self.register(
             "DeepseekV2ForCausalLM",

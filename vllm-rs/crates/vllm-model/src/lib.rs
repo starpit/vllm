@@ -10,6 +10,7 @@
 
 pub mod gguf;
 pub mod gptq_config;
+pub mod image;
 pub mod layers;
 pub mod lora;
 pub mod tensor;

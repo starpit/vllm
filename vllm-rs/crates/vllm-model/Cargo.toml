@@ -19,6 +19,7 @@ serde_json = { workspace = true }
 candle-core = { workspace = true }
 safetensors = { workspace = true }
 half = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 [dev-dependencies]
 rand = { workspace = true }

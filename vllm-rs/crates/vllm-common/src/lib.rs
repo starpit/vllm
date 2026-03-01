@@ -14,6 +14,7 @@
 
 pub mod engine_io;
 pub mod error;
+pub mod multimodal;
 pub mod request;
 pub mod sampling;
 pub mod telemetry;
@@ -27,5 +28,6 @@ pub use engine_io::{
     FinishReason, SchedulerStats, StopReason,
 };
 pub use error::{VllmError, VllmResult};
+pub use multimodal::MultimodalData;
 pub use request::{Request, RequestStatus};
 pub use sampling::{LogprobsOutput, RequestOutputKind, SamplingParams, SamplingType, TokenLogprob};

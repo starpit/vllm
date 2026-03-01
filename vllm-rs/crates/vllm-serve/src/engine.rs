@@ -15,6 +15,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, error, info};
 use uuid::Uuid;
+use vllm_common::multimodal::{ImageData, MultimodalData};
 use vllm_common::sampling::GuidedGrammar;
 use vllm_common::{EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, StopReason};
 use vllm_engine::core_client::EngineCoreClient;
@@ -162,6 +163,13 @@ pub struct AsyncEngine {
     tool_parser: Option<Arc<dyn ToolCallParser>>,
     /// Whether async scheduling is enabled (overlap GPU execution with CPU scheduling).
     async_scheduling: bool,
+    /// Multimodal config: image token ID for placeholder expansion.
+    /// `None` for text-only models.
+    image_token_id: Option<u32>,
+    /// Number of image tokens per image (vision encoder output patches).
+    mm_tokens_per_image: usize,
+    /// SigLIP image preprocessing size (pixels). 0 if not a VLM.
+    mm_image_size: usize,
 }
 
 impl AsyncEngine {
@@ -189,6 +197,9 @@ impl AsyncEngine {
             chat_template: None,
             tool_parser: None,
             async_scheduling: false,
+            image_token_id: None,
+            mm_tokens_per_image: 0,
+            mm_image_size: 0,
         }
     }
 
@@ -226,6 +237,22 @@ impl AsyncEngine {
     /// Enable or disable async scheduling.
     pub fn set_async_scheduling(&mut self, enabled: bool) {
         self.async_scheduling = enabled;
+    }
+
+    /// Configure multimodal (VLM) support.
+    ///
+    /// * `image_token_id` — the token ID used as image placeholder (e.g. 255999 for Gemma 3)
+    /// * `mm_tokens_per_image` — number of tokens per image (vision encoder patches)
+    /// * `mm_image_size` — pixel size for image preprocessing (e.g. 224 for SigLIP)
+    pub fn set_multimodal_config(
+        &mut self,
+        image_token_id: u32,
+        mm_tokens_per_image: usize,
+        mm_image_size: usize,
+    ) {
+        self.image_token_id = Some(image_token_id);
+        self.mm_tokens_per_image = mm_tokens_per_image;
+        self.mm_image_size = mm_image_size;
     }
 
     /// Get the model name.
@@ -627,6 +654,7 @@ impl AsyncEngine {
                     priority: request.priority,
                     cache_salt: request.cache_salt.clone(),
                     data_parallel_rank: None,
+                    mm_data: None,
                 };
 
                 let detokenizer = self.tokenizer.as_ref().map(|tok| {
@@ -1533,7 +1561,7 @@ impl AsyncEngine {
         };
 
         // Tokenize the text, or fall back to byte-value IDs.
-        let token_ids = if let Some(tok) = &self.tokenizer {
+        let mut token_ids = if let Some(tok) = &self.tokenizer {
             if text.is_empty() {
                 vec![]
             } else {
@@ -1543,6 +1571,13 @@ impl AsyncEngine {
             vec![0] // BOS placeholder
         } else {
             text.as_bytes().iter().map(|&b| b as u32).collect()
+        };
+
+        // Extract images from message content arrays and build multimodal data.
+        let mm_data = if self.image_token_id.is_some() {
+            self.extract_images_from_messages(&request.messages, &mut token_ids)?
+        } else {
+            None
         };
 
         Ok(EngineCoreRequest {
@@ -1557,6 +1592,7 @@ impl AsyncEngine {
             priority: request.priority,
             cache_salt: request.cache_salt.clone(),
             data_parallel_rank: None,
+            mm_data,
         })
     }
 
@@ -1636,7 +1672,96 @@ impl AsyncEngine {
             priority: request.priority,
             cache_salt: request.cache_salt.clone(),
             data_parallel_rank: None,
+            mm_data: None,
         })
+    }
+
+    /// Extract image URLs from chat message content arrays, decode/preprocess
+    /// images, expand image placeholder tokens, and build `MultimodalData`.
+    ///
+    /// Returns `None` if no images are present.
+    fn extract_images_from_messages(
+        &self,
+        messages: &[protocol::ChatCompletionMessageParam],
+        token_ids: &mut Vec<u32>,
+    ) -> ServeResult<Option<MultimodalData>> {
+        let image_token_id = match self.image_token_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        let image_size = self.mm_image_size;
+        if image_size == 0 {
+            return Ok(None);
+        }
+
+        let mut images: Vec<ImageData> = Vec::new();
+
+        // Walk messages looking for content arrays with image_url parts.
+        for msg in messages {
+            if let Some(content) = &msg.content
+                && let Some(parts) = content.as_array()
+            {
+                for part in parts {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("image_url")
+                        && let Some(image_url_obj) = part.get("image_url")
+                    {
+                        let url = image_url_obj
+                            .get("url")
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("");
+                        if url.is_empty() {
+                            continue;
+                        }
+
+                        // Decode the image.
+                        let img_bytes = if url.starts_with("data:") {
+                            vllm_model::image::decode_data_uri(url).map_err(|e| {
+                                ServeError::Validation(format!("failed to decode data URI: {e}"))
+                            })?
+                        } else {
+                            // For now, only data URIs are supported.
+                            // HTTP URL download would require async reqwest.
+                            return Err(ServeError::Validation(
+                                "HTTP image URLs not yet supported; use base64 data URIs".into(),
+                            ));
+                        };
+
+                        let dyn_image =
+                            vllm_model::image::decode_image(&img_bytes).map_err(|e| {
+                                ServeError::Validation(format!("failed to decode image: {e}"))
+                            })?;
+
+                        let image_data =
+                            vllm_model::image::preprocess_siglip(&dyn_image, image_size);
+                        images.push(image_data);
+                    }
+                }
+            }
+        }
+
+        if images.is_empty() {
+            return Ok(None);
+        }
+
+        // Expand image placeholders in token IDs.
+        let placeholders = vllm_model::image::expand_image_placeholders(
+            token_ids,
+            image_token_id,
+            self.mm_tokens_per_image,
+        );
+
+        if placeholders.len() != images.len() {
+            debug!(
+                "Image count mismatch: {} images but {} placeholders in token sequence",
+                images.len(),
+                placeholders.len()
+            );
+        }
+
+        Ok(Some(MultimodalData {
+            images,
+            image_placeholders: placeholders,
+        }))
     }
 
     /// Resolve `max_tokens` to fit within `max_model_len - prompt_len`.

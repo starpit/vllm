@@ -23,6 +23,6 @@ pub use activation::{Activation, gelu, relu, silu};
 pub use embedding::Embedding;
 pub use gptq::{GptqConfig, GptqLinear};
 pub use linear::{ColumnParallelLinear, Linear, RowParallelLinear};
-pub use norm::{CohereLayerNorm, GemmaRmsNorm, RmsNorm};
+pub use norm::{CohereLayerNorm, GemmaRmsNorm, LayerNorm, RmsNorm};
 pub use quantized_linear::QuantizedLinear;
 pub use rotary::RotaryEmbedding;

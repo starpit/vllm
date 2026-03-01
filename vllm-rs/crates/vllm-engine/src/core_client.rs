@@ -135,7 +135,7 @@ impl InprocClient {
         let params = ec_request.sampling_params.unwrap_or_default();
         let prompt_token_ids = ec_request.prompt_token_ids.unwrap_or_default();
 
-        let request = Request::new(
+        let mut request = Request::new(
             ec_request.request_id,
             prompt_token_ids,
             params,
@@ -144,6 +144,7 @@ impl InprocClient {
             ec_request.priority,
             ec_request.cache_salt,
         );
+        request.mm_data = ec_request.mm_data;
 
         self.engine.add_request(request);
         Ok(())
@@ -271,6 +272,7 @@ mod tests {
             priority: 0,
             cache_salt: None,
             data_parallel_rank: None,
+            mm_data: None,
         }
     }
 

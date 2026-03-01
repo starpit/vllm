@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use vllm_common::SamplingParams;
+use vllm_common::multimodal::MultimodalData;
 
 // ---------------------------------------------------------------------------
 // NewRequestData
@@ -39,6 +40,10 @@ pub struct NewRequestData {
 
     /// Sampling parameters for this request.
     pub sampling_params: Option<SamplingParams>,
+
+    /// Multimodal data (images) for vision-language models.
+    /// Only present on the first scheduling of a request with images.
+    pub mm_data: Option<MultimodalData>,
 }
 
 impl NewRequestData {
@@ -49,6 +54,7 @@ impl NewRequestData {
         block_ids: Vec<Vec<usize>>,
         num_computed_tokens: u32,
         sampling_params: Option<SamplingParams>,
+        mm_data: Option<MultimodalData>,
     ) -> Self {
         Self {
             req_id,
@@ -56,6 +62,7 @@ impl NewRequestData {
             block_ids,
             num_computed_tokens,
             sampling_params,
+            mm_data,
         }
     }
 }
@@ -216,6 +223,7 @@ mod tests {
             vec![vec![0, 1, 2]],
             10,
             None,
+            None,
         );
         assert_eq!(nrd.req_id, "req-1");
         assert_eq!(nrd.prompt_token_ids.as_ref().unwrap().len(), 3);
@@ -243,6 +251,7 @@ mod tests {
                 Some(vec![1, 2, 3]),
                 vec![vec![0]],
                 0,
+                None,
                 None,
             )],
             scheduled_cached_reqs: CachedRequestData {

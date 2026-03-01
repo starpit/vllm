@@ -484,13 +484,13 @@ impl MlxGemma3DecoderLayer {
 
 /// Gemma3 for causal language modeling using MLX (float weights).
 pub struct MlxGemma3ForCausalLM {
-    embed_tokens: nn::Embedding,
+    pub(crate) embed_tokens: nn::Embedding,
     layers: Vec<MlxGemma3DecoderLayer>,
     norm: nn::RmsNorm,
-    normalizer: f32,
+    pub(crate) normalizer: f32,
     final_logit_softcapping: Option<f32>,
     #[allow(dead_code)]
-    config: MlxGemma3Config,
+    pub(crate) config: MlxGemma3Config,
 }
 
 impl MlxGemma3ForCausalLM {
@@ -518,16 +518,32 @@ impl MlxGemma3ForCausalLM {
         })
     }
 
+    /// Public constructor for use by the VLM wrapper.
+    pub(crate) fn new_public(
+        config: &MlxGemma3Config,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Self::new(config)?)
+    }
+
     fn load_weights(&mut self, weights: &HashMap<String, Array>) {
+        self.load_weights_with_prefix(weights, "model");
+    }
+
+    /// Load weights with a configurable prefix (e.g., "model" or "model.language_model.model").
+    pub(crate) fn load_weights_with_prefix(
+        &mut self,
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+    ) {
         assign_weight(
             &mut self.embed_tokens.weight,
             weights,
-            "model.embed_tokens.weight",
+            &format!("{prefix}.embed_tokens.weight"),
         );
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            layer.load_weights(weights, &format!("model.layers.{i}"));
+            layer.load_weights(weights, &format!("{prefix}.layers.{i}"));
         }
-        assign_gemma_norm_weight(&mut self.norm, weights, "model.norm.weight");
+        assign_gemma_norm_weight(&mut self.norm, weights, &format!("{prefix}.norm.weight"));
     }
 
     fn load(
@@ -540,6 +556,42 @@ impl MlxGemma3ForCausalLM {
         model.load_weights(&weights);
         mlx_rs::transforms::eval(weights.values())?;
         Ok(model)
+    }
+
+    /// Embed token IDs and scale by sqrt(hidden_size).
+    pub(crate) fn embed(&mut self, input_ids: &Array) -> Result<Array, Exception> {
+        let hidden_states = self.embed_tokens.forward(input_ids)?;
+        hidden_states.multiply(Array::from_f32(self.normalizer))
+    }
+
+    /// Run the transformer backbone on pre-computed embeddings, returning hidden states.
+    pub(crate) fn backbone(
+        &mut self,
+        mut hidden_states: Array,
+        positions: &Array,
+        kv_cache: &mut MlxKvCache,
+    ) -> Result<Array, Exception> {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+        }
+        self.norm.forward(&hidden_states)
+    }
+
+    /// Run backbone + logit projection (tied embeddings + optional softcapping).
+    fn backbone_to_logits(
+        &mut self,
+        hidden_states: Array,
+        positions: &Array,
+        kv_cache: &mut MlxKvCache,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self.backbone(hidden_states, positions, kv_cache)?;
+        let logits = self.embed_tokens.as_linear(&hidden_states)?;
+        let logits = if let Some(cap) = self.final_logit_softcapping {
+            Self::apply_softcap(&logits, cap)?
+        } else {
+            logits
+        };
+        logits.as_dtype(Dtype::Float32)
     }
 
     /// Apply logit softcapping: `cap * tanh(logits / cap)`.
@@ -601,25 +653,17 @@ impl super::MlxModel for MlxGemma3ForCausalLM {
         positions: &Array,
         kv_cache: &mut MlxKvCache,
     ) -> mlx_rs::error::Result<Array> {
-        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
-        hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
+        let hidden_states = self.embed(input_ids)?;
+        self.backbone_to_logits(hidden_states, positions, kv_cache)
+    }
 
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
-        }
-
-        hidden_states = self.norm.forward(&hidden_states)?;
-
-        // Tied embeddings.
-        let logits = self.embed_tokens.as_linear(&hidden_states)?;
-
-        let logits = if let Some(cap) = self.final_logit_softcapping {
-            Self::apply_softcap(&logits, cap)?
-        } else {
-            logits
-        };
-
-        logits.as_dtype(Dtype::Float32)
+    fn forward_embeds(
+        &mut self,
+        inputs_embeds: &Array,
+        positions: &Array,
+        kv_cache: &mut MlxKvCache,
+    ) -> mlx_rs::error::Result<Array> {
+        self.backbone_to_logits(inputs_embeds.clone(), positions, kv_cache)
     }
 
     fn num_layers(&self) -> usize {
@@ -632,12 +676,8 @@ impl super::MlxModel for MlxGemma3ForCausalLM {
         positions: &Array,
     ) -> mlx_rs::error::Result<Array> {
         let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
-        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
-        hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
-        }
-        self.norm.forward(&hidden_states)
+        let hidden_states = self.embed(input_ids)?;
+        self.backbone(hidden_states, positions, &mut kv_cache)
     }
 }
 

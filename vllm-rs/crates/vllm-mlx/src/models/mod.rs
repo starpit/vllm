@@ -11,11 +11,13 @@ pub mod commandr;
 pub mod deepseek_v2;
 pub mod gemma2;
 pub mod gemma3;
+pub mod gemma3_mm;
 pub mod llama;
 pub mod mixtral;
 pub mod phi3;
 pub mod quantized_llama;
 pub mod qwen3_moe;
+pub mod siglip;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -57,6 +59,21 @@ pub trait MlxModel: Send {
 
     /// Number of transformer layers in this model.
     fn num_layers(&self) -> usize;
+
+    /// Run the model forward pass from pre-computed embeddings (for VLM models).
+    fn forward_embeds(
+        &mut self,
+        _inputs_embeds: &Array,
+        _positions: &Array,
+        _kv_cache: &mut MlxKvCache,
+    ) -> mlx_rs::error::Result<Array> {
+        Err(mlx_rs::error::Exception::custom(
+            "forward_embeds not supported by this model",
+        ))
+    }
+
+    /// Provide multimodal data (images) for the next forward pass.
+    fn set_mm_data(&mut self, _mm_data: Option<vllm_common::MultimodalData>) {}
 
     /// Run the model backbone and return hidden states (before lm_head).
     ///
@@ -138,6 +155,11 @@ impl MlxModelRegistry {
         // Gemma3 (per-head QK norms, per-layer RoPE theta, no softcapping)
         registry.register("Gemma3ForCausalLM", gemma3::create_mlx_gemma3);
         registry.register_quantized("Gemma3ForCausalLM", gemma3::create_mlx_quantized_gemma3);
+        // Gemma 3 multimodal (vision-language) — SigLIP vision + projector + Gemma3 LM
+        registry.register(
+            "Gemma3ForConditionalGeneration",
+            gemma3_mm::create_mlx_gemma3_mm,
+        );
         // Phi-3 (fused qkv_proj + gate_up_proj)
         registry.register("Phi3ForCausalLM", phi3::create_mlx_phi3);
         registry.register_quantized("Phi3ForCausalLM", phi3::create_mlx_quantized_phi3);

@@ -5,7 +5,7 @@
 
 use candle_core::{DType, Device, Module, Tensor};
 
-use crate::error::ModelResult;
+use crate::error::{ModelError, ModelResult};
 use crate::tensor;
 use crate::weight::ModelWeights;
 
@@ -173,6 +173,71 @@ impl Module for GemmaRmsNorm {
             let rsqrt = (variance + self.eps)?.sqrt()?.recip()?;
             x.broadcast_mul(&rsqrt)?
                 .broadcast_mul(&self.effective_weight)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LayerNorm (standard, with weight + bias)
+// ---------------------------------------------------------------------------
+
+/// Standard Layer Normalization with weight and bias parameters.
+///
+/// Formula: `y = weight * (x - mean(x)) / sqrt(var(x) + eps) + bias`
+///
+/// Used by vision encoders (SigLIP, CLIP) which require both weight and bias,
+/// unlike RmsNorm (decoder-only LLMs) or CohereLayerNorm (weight only).
+pub struct LayerNorm {
+    weight: Tensor,
+    bias: Tensor,
+    eps: f64,
+}
+
+impl LayerNorm {
+    /// Create from explicit weight and bias tensors.
+    pub fn new(weight: Tensor, bias: Tensor, eps: f64) -> Self {
+        Self { weight, bias, eps }
+    }
+
+    /// Load from model weights.
+    ///
+    /// Looks for `{prefix}.weight` and `{prefix}.bias`.
+    pub fn load(weights: &ModelWeights, prefix: &str, eps: f64, dtype: DType) -> ModelResult<Self> {
+        let weight = weights.get_cast(&format!("{prefix}.weight"), dtype)?;
+        let bias = weights.get_cast(&format!("{prefix}.bias"), dtype)?;
+        Ok(Self { weight, bias, eps })
+    }
+
+    /// Create with ones weight and zeros bias (for testing).
+    pub fn ones(hidden_size: usize, eps: f64, dtype: DType, device: &Device) -> ModelResult<Self> {
+        let weight = tensor::ones(&[hidden_size], dtype, device)?;
+        let bias = Tensor::zeros(hidden_size, dtype, device).map_err(ModelError::Candle)?;
+        Ok(Self { weight, bias, eps })
+    }
+}
+
+impl Module for LayerNorm {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let input_dtype = x.dtype();
+        if needs_upcast(input_dtype) {
+            let x_f32 = x.to_dtype(DType::F32)?;
+            let mean = x_f32.mean_keepdim(candle_core::D::Minus1)?;
+            let centered = x_f32.broadcast_sub(&mean)?;
+            let variance = centered.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+            let rsqrt = (variance + self.eps)?.sqrt()?.recip()?;
+            let normed = centered.broadcast_mul(&rsqrt)?.to_dtype(input_dtype)?;
+            normed
+                .broadcast_mul(&self.weight)?
+                .broadcast_add(&self.bias)
+        } else {
+            let mean = x.mean_keepdim(candle_core::D::Minus1)?;
+            let centered = x.broadcast_sub(&mean)?;
+            let variance = centered.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+            let rsqrt = (variance + self.eps)?.sqrt()?.recip()?;
+            centered
+                .broadcast_mul(&rsqrt)?
+                .broadcast_mul(&self.weight)?
+                .broadcast_add(&self.bias)
         }
     }
 }

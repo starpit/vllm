@@ -48,4 +48,8 @@ impl TestModels {
 
     // GPTQ quantized models (candle backend, not MLX)
     pub const QWEN2_0_5B_GPTQ_INT4: &str = "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4";
+
+    // Multimodal (vision-language) models
+    // Tier 3: ~2.8 GB — nightly only (QAT = quantization-aware training)
+    pub const GEMMA3_4B_IT_QAT_3BIT: &str = "mlx-community/gemma-3-4b-it-qat-3bit";
 }

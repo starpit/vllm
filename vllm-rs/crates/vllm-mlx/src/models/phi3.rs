@@ -22,11 +22,200 @@ use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
 use crate::cache::MlxKvCache;
-use crate::models::llama::{LlamaConfig, assign_weight, load_safetensors_weights};
+use crate::models::llama::{LlamaConfig, LongRopeScaling, assign_weight, load_safetensors_weights};
 use crate::models::quantized_llama::{
     MlxEmbedTokens, MlxLmHead, QuantConfig, make_quantized_linear,
 };
 use vllm_model::weight::HfModelConfig;
+
+// ---------------------------------------------------------------------------
+// Phi3Rope — RoPE with optional LongRoPE scaling + partial rotation
+// ---------------------------------------------------------------------------
+
+/// Custom RoPE supporting partial rotation (`partial_rotary_factor`) and
+/// LongRoPE per-dimension frequency scaling (Phi-3/Phi-4 family).
+enum Phi3Rope {
+    /// Standard: full head_dim rotation via nn::Rope (most Phi-3 models).
+    Standard(nn::Rope),
+    /// Custom: LongRoPE and/or partial rotation (Phi-4 mini, etc.).
+    Custom {
+        /// Inverse frequencies [rotary_dim / 2], already scaled by LongRoPE factors.
+        inv_freq: Array,
+        /// Magnitude scaling factor applied to cos/sin.
+        mscale: f32,
+        /// Number of head dimensions that get rotation.
+        rotary_dim: usize,
+        /// Full head dimension.
+        head_dim: usize,
+    },
+}
+
+impl Phi3Rope {
+    fn new(config: &LlamaConfig) -> Self {
+        let rotary_dim = (config.head_dim as f64 * config.partial_rotary_factor) as usize;
+
+        // Standard RoPE: no LongRoPE, full head_dim rotation.
+        if config.long_rope_scaling.is_none() && rotary_dim == config.head_dim {
+            let mut r = nn::Rope::new(config.head_dim as i32);
+            r.base = config.rope_theta;
+            return Self::Standard(r);
+        }
+
+        // Custom RoPE: compute inv_freq with optional LongRoPE scaling.
+        let half_dim = rotary_dim / 2;
+        let (inv_freq_vec, mscale) = compute_longrope_inv_freq(
+            config.rope_theta as f64,
+            half_dim,
+            rotary_dim,
+            config.max_position_embeddings,
+            config.long_rope_scaling.as_ref(),
+        );
+
+        let inv_freq = Array::from_slice(&inv_freq_vec, &[half_dim as i32]);
+
+        Self::Custom {
+            inv_freq,
+            mscale,
+            rotary_dim,
+            head_dim: config.head_dim,
+        }
+    }
+
+    /// Apply RoPE to Q and K tensors.
+    ///
+    /// Input shapes: `[1, heads, seq_len, head_dim]`
+    /// Returns rotated (Q, K) with same shapes.
+    fn apply(&mut self, q: &Array, k: &Array, offset: i32) -> Result<(Array, Array), Exception> {
+        match self {
+            Self::Standard(rope) => {
+                let q_rot = rope.forward((q, offset))?;
+                let k_rot = rope.forward((k, offset))?;
+                Ok((q_rot, k_rot))
+            }
+            Self::Custom {
+                inv_freq,
+                mscale,
+                rotary_dim,
+                head_dim,
+            } => {
+                let seq_len = q.dim(2);
+                let half_dim = (*rotary_dim / 2) as i32;
+
+                // Position indices: [offset, offset+1, ..., offset+seq_len-1]
+                let positions: Vec<f32> = (0..seq_len).map(|i| (offset + i) as f32).collect();
+                let pos = Array::from_slice(&positions, &[seq_len]);
+
+                // Outer product: [seq, 1] * [1, half_dim] = [seq, half_dim]
+                let freqs = pos
+                    .reshape(&[seq_len, 1])?
+                    .matmul(&inv_freq.reshape(&[1, half_dim])?)?;
+
+                // cos/sin with mscale: [seq, half_dim]
+                let cos_half = freqs.cos()?.multiply(Array::from_f32(*mscale))?;
+                let sin_half = freqs.sin()?.multiply(Array::from_f32(*mscale))?;
+
+                // Duplicate for full rotary_dim: [seq, rotary_dim]
+                let cos = concatenate_axis(&[&cos_half, &cos_half], -1)?;
+                let sin = concatenate_axis(&[&sin_half, &sin_half], -1)?;
+
+                // Broadcast: [seq, rotary_dim] -> [1, 1, seq, rotary_dim]
+                let cos_b = cos.reshape(&[1, 1, seq_len, *rotary_dim as i32])?;
+                let sin_b = sin.reshape(&[1, 1, seq_len, *rotary_dim as i32])?;
+
+                let q_rot = apply_partial_rope(q, &cos_b, &sin_b, *rotary_dim, *head_dim)?;
+                let k_rot = apply_partial_rope(k, &cos_b, &sin_b, *rotary_dim, *head_dim)?;
+                Ok((q_rot, k_rot))
+            }
+        }
+    }
+}
+
+/// Compute inverse frequencies and mscale for LongRoPE.
+fn compute_longrope_inv_freq(
+    base: f64,
+    half_dim: usize,
+    rotary_dim: usize,
+    max_position_embeddings: usize,
+    long_rope: Option<&LongRopeScaling>,
+) -> (Vec<f32>, f32) {
+    if let Some(lr) = long_rope {
+        // Choose long vs short factors based on max_position vs original_max_position.
+        let use_long = max_position_embeddings > lr.original_max_position_embeddings;
+        let factors = if use_long {
+            &lr.long_factor
+        } else {
+            &lr.short_factor
+        };
+
+        if use_long {
+            tracing::info!(
+                "Using LongRoPE long factors (max_pos={} > original_max_pos={})",
+                max_position_embeddings,
+                lr.original_max_position_embeddings
+            );
+        }
+
+        let inv_freq: Vec<f32> = (0..half_dim)
+            .map(|i| {
+                let factor = factors.get(i).copied().unwrap_or(1.0);
+                (1.0 / (factor * base.powf(2.0 * i as f64 / rotary_dim as f64))) as f32
+            })
+            .collect();
+
+        // mscale: magnitude correction for extended context.
+        let scale = max_position_embeddings as f64 / lr.original_max_position_embeddings as f64;
+        let mscale = if scale <= 1.0 {
+            1.0f32
+        } else {
+            (1.0 + scale.ln() / (lr.original_max_position_embeddings as f64).ln()).sqrt() as f32
+        };
+
+        (inv_freq, mscale)
+    } else {
+        // Standard RoPE with partial rotation (no scaling factors).
+        let inv_freq: Vec<f32> = (0..half_dim)
+            .map(|i| (1.0 / base.powf(2.0 * i as f64 / rotary_dim as f64)) as f32)
+            .collect();
+        (inv_freq, 1.0f32)
+    }
+}
+
+/// Apply rotary embedding with partial rotation support.
+///
+/// `x` shape: `[1, heads, seq, head_dim]`
+/// `cos`/`sin` shape: `[1, 1, seq, rotary_dim]`
+fn apply_partial_rope(
+    x: &Array,
+    cos: &Array,
+    sin: &Array,
+    rotary_dim: usize,
+    head_dim: usize,
+) -> Result<Array, Exception> {
+    let rd = rotary_dim as i32;
+    let half = (rotary_dim / 2) as i32;
+
+    // Extract rotary portion: [1, heads, seq, rotary_dim]
+    let x_rot = x.try_index((.., .., .., ..rd))?;
+
+    // Split into first/second halves along last dim.
+    let x1 = x_rot.try_index((.., .., .., ..half))?;
+    let x2 = x_rot.try_index((.., .., .., half..rd))?;
+
+    // Rotate: [-x2, x1]
+    let neg_x2 = x2.negative()?;
+    let x_rotated = concatenate_axis(&[&neg_x2, &x1], -1)?;
+
+    // Apply: x_rot * cos + rotated * sin
+    let rotated = x_rot.multiply(cos)?.add(&x_rotated.multiply(sin)?)?;
+
+    if rotary_dim == head_dim {
+        Ok(rotated)
+    } else {
+        // Concatenate passthrough dims.
+        let x_pass = x.try_index((.., .., .., rd..head_dim as i32))?;
+        concatenate_axis(&[&rotated, &x_pass], -1)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MlxPhi3MLP — fused gate_up_proj
@@ -81,7 +270,7 @@ impl MlxPhi3MLP {
 struct MlxPhi3Attention {
     qkv_proj: nn::Linear,
     o_proj: nn::Linear,
-    rope: nn::Rope,
+    rope: Phi3Rope,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -105,11 +294,7 @@ impl MlxPhi3Attention {
             o_proj: nn::LinearBuilder::new(q_size as i32, hidden)
                 .bias(false)
                 .build()?,
-            rope: {
-                let mut r = nn::Rope::new(config.head_dim as i32);
-                r.base = config.rope_theta;
-                r
-            },
+            rope: Phi3Rope::new(config),
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
@@ -154,7 +339,7 @@ impl MlxPhi3Attention {
             .reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
-        let mut k = parts[1]
+        let k = parts[1]
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
@@ -163,14 +348,13 @@ impl MlxPhi3Attention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        // RoPE
+        // RoPE (supports partial rotation + LongRoPE).
         let offset = if positions.size() > 0 {
             positions.reshape(&[-1])?.min(None)?.item::<i32>()
         } else {
             0
         };
-        let q = self.rope.forward((&q, offset))?;
-        k = self.rope.forward((&k, offset))?;
+        let (q, mut k) = self.rope.apply(&q, &k, offset)?;
 
         // KV cache
         if let Some((ck, cv)) = cache.take() {
@@ -412,7 +596,7 @@ impl MlxQuantizedPhi3MLP {
 struct MlxQuantizedPhi3Attention {
     qkv_proj: nn::QuantizedLinear,
     o_proj: nn::QuantizedLinear,
-    rope: nn::Rope,
+    rope: Phi3Rope,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -442,11 +626,7 @@ impl MlxQuantizedPhi3Attention {
                 qc.group_size,
                 qc.bits,
             ),
-            rope: {
-                let mut r = nn::Rope::new(config.head_dim as i32);
-                r.base = config.rope_theta;
-                r
-            },
+            rope: Phi3Rope::new(config),
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
@@ -475,7 +655,7 @@ impl MlxQuantizedPhi3Attention {
             .reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
-        let mut k = parts[1]
+        let k = parts[1]
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
@@ -489,8 +669,7 @@ impl MlxQuantizedPhi3Attention {
         } else {
             0
         };
-        let q = self.rope.forward((&q, offset))?;
-        k = self.rope.forward((&k, offset))?;
+        let (q, mut k) = self.rope.apply(&q, &k, offset)?;
 
         if let Some((ck, cv)) = cache.take() {
             k = concatenate_axis(&[ck, k], 2)?;
@@ -741,6 +920,8 @@ mod tests {
             head_dim: 8,
             tie_word_embeddings: false,
             sliding_window: None,
+            partial_rotary_factor: 1.0,
+            long_rope_scaling: None,
         }
     }
 
@@ -822,6 +1003,153 @@ mod tests {
         .unwrap();
         logits2.eval().unwrap();
         assert_eq!(logits2.shape(), &[1, config.vocab_size as i32]);
+    }
+
+    /// Config mimicking Phi-4 mini: partial_rotary_factor=0.75, LongRoPE.
+    fn phi4_mini_config() -> LlamaConfig {
+        LlamaConfig {
+            hidden_size: 32,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            num_hidden_layers: 2,
+            intermediate_size: 64,
+            vocab_size: 100,
+            max_position_embeddings: 256, // > original_max to trigger long factors
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            head_dim: 8,
+            tie_word_embeddings: true,
+            sliding_window: None,
+            partial_rotary_factor: 0.75, // rotary_dim = 6
+            long_rope_scaling: Some(LongRopeScaling {
+                // 3 factors for half_dim = 3 (rotary_dim=6, half=3)
+                short_factor: vec![1.0, 1.0, 1.0],
+                long_factor: vec![2.0, 4.0, 8.0],
+                original_max_position_embeddings: 64,
+            }),
+        }
+    }
+
+    #[test]
+    fn test_phi3_partial_rotation_rope() {
+        // partial_rotary_factor = 0.75, head_dim = 8 → rotary_dim = 6
+        let config = LlamaConfig {
+            partial_rotary_factor: 0.75,
+            ..test_config()
+        };
+        let mut attn = MlxPhi3Attention::new(&config).unwrap();
+
+        let x = mlx_rs::ops::ones::<f32>(&[3, 32]).unwrap();
+        let positions = Array::from_iter(0..3i32, &[3]);
+        let mut cache = None;
+
+        let out = attn.forward(&x, &positions, &mut cache).unwrap();
+        out.eval().unwrap();
+        assert_eq!(out.shape(), &[3, 32]);
+        assert!(cache.is_some());
+    }
+
+    #[test]
+    fn test_phi3_longrope_attention_forward() {
+        let config = phi4_mini_config();
+        let mut attn = MlxPhi3Attention::new(&config).unwrap();
+
+        let x = mlx_rs::ops::ones::<f32>(&[4, 32]).unwrap();
+        let positions = Array::from_iter(0..4i32, &[4]);
+        let mut cache = None;
+
+        let out = attn.forward(&x, &positions, &mut cache).unwrap();
+        out.eval().unwrap();
+        assert_eq!(out.shape(), &[4, 32]);
+        assert!(cache.is_some());
+    }
+
+    #[test]
+    fn test_phi3_longrope_model_forward() {
+        let config = phi4_mini_config();
+        let mut model = MlxPhi3ForCausalLM::new(&config).unwrap();
+
+        let input_ids = Array::from_iter(vec![1i32, 5, 10], &[3]);
+        let positions = Array::from_iter(0..3i32, &[3]);
+        let mut kv_cache = crate::cache::empty_kv_cache(config.num_hidden_layers);
+
+        let logits = <MlxPhi3ForCausalLM as crate::models::MlxModel>::forward(
+            &mut model,
+            &input_ids,
+            &positions,
+            &mut kv_cache,
+        )
+        .unwrap();
+        logits.eval().unwrap();
+        assert_eq!(logits.shape(), &[3, config.vocab_size as i32]);
+    }
+
+    #[test]
+    fn test_phi3_longrope_prefill_and_decode() {
+        let config = phi4_mini_config();
+        let mut model = MlxPhi3ForCausalLM::new(&config).unwrap();
+        let mut kv_cache = crate::cache::empty_kv_cache(config.num_hidden_layers);
+
+        // Prefill
+        let input_ids = Array::from_iter(vec![1i32, 5, 10], &[3]);
+        let positions = Array::from_iter(0..3i32, &[3]);
+        let logits = <MlxPhi3ForCausalLM as crate::models::MlxModel>::forward(
+            &mut model,
+            &input_ids,
+            &positions,
+            &mut kv_cache,
+        )
+        .unwrap();
+        logits.eval().unwrap();
+
+        // Decode
+        let decode_ids = Array::from_iter(vec![15i32], &[1]);
+        let decode_pos = Array::from_iter(vec![3i32], &[1]);
+        let logits2 = <MlxPhi3ForCausalLM as crate::models::MlxModel>::forward(
+            &mut model,
+            &decode_ids,
+            &decode_pos,
+            &mut kv_cache,
+        )
+        .unwrap();
+        logits2.eval().unwrap();
+        assert_eq!(logits2.shape(), &[1, config.vocab_size as i32]);
+    }
+
+    #[test]
+    fn test_phi3_longrope_inv_freq_computation() {
+        let half_dim = 3;
+        let rotary_dim = 6;
+        let base = 10000.0;
+        let max_pos = 256;
+        let lr = LongRopeScaling {
+            short_factor: vec![1.0, 1.0, 1.0],
+            long_factor: vec![2.0, 4.0, 8.0],
+            original_max_position_embeddings: 64,
+        };
+
+        // max_pos > original → uses long factors.
+        let (inv_freq, mscale) =
+            compute_longrope_inv_freq(base, half_dim, rotary_dim, max_pos, Some(&lr));
+
+        assert_eq!(inv_freq.len(), 3);
+        // inv_freq[0] = 1.0 / (2.0 * base^(0/6)) = 1.0 / (2.0 * 1.0) = 0.5
+        assert!((inv_freq[0] - 0.5).abs() < 1e-5);
+        // mscale should be > 1.0 since max_pos > original_max_pos.
+        assert!(mscale > 1.0, "mscale={mscale} should be > 1.0");
+
+        // max_pos <= original → uses short factors (all 1.0).
+        let (inv_freq_short, mscale_short) =
+            compute_longrope_inv_freq(base, half_dim, rotary_dim, 32, Some(&lr));
+        // Short factors are all 1.0 → same as standard RoPE.
+        let (inv_freq_std, _) = compute_longrope_inv_freq(base, half_dim, rotary_dim, 32, None);
+        for (a, b) in inv_freq_short.iter().zip(inv_freq_std.iter()) {
+            assert!((a - b).abs() < 1e-6, "short factors should match standard");
+        }
+        assert!(
+            (mscale_short - 1.0).abs() < 1e-6,
+            "short mscale should be 1.0"
+        );
     }
 
     #[test]

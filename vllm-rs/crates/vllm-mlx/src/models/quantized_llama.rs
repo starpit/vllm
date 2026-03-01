@@ -689,6 +689,8 @@ mod tests {
             head_dim: 8,
             tie_word_embeddings: true,
             sliding_window: None,
+            partial_rotary_factor: 1.0,
+            long_rope_scaling: None,
         }
     }
 

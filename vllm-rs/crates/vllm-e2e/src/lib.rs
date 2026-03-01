@@ -32,6 +32,7 @@ impl TestModels {
     // Tier 3: Medium (1–3 GB) — nightly only
     pub const GEMMA2_2B_4BIT: &str = "mlx-community/gemma-2-2b-it-4bit";
     pub const PHI3_5_MINI_4BIT: &str = "mlx-community/Phi-3.5-mini-instruct-4bit";
+    pub const PHI4_MINI_4BIT: &str = "mlx-community/Unsloth-Phi-4-mini-instruct-4bit";
 
     // Tier 4: Large (3+ GB) — weekly/manual only
     pub const MISTRAL_7B_4BIT: &str = "mlx-community/Mistral-7B-Instruct-v0.3-4bit";

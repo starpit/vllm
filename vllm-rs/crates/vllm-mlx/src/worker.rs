@@ -694,37 +694,37 @@ impl Worker for MlxWorker {
                 })?;
 
             // Compute prompt logprobs if requested and this is a prefill.
-            if req_input.is_prefill && req_input.token_ids.len() > 1 {
-                if let Some(params) = self.sampling_params_map.get(&req_input.req_id) {
-                    if let Some(top_n) = params.prompt_logprobs {
-                        let top_n = top_n.max(0) as usize;
-                        let num_positions = req_input.token_ids.len() - 1;
-                        // Eval the full logits to extract prompt-position logits.
-                        logits.eval().map_err(|e| {
-                            ExecutorError::WorkerExecution(format!("eval error: {e}"))
-                        })?;
-                        let full_logits_f32 = logits.as_dtype(Dtype::Float32).map_err(|e| {
-                            ExecutorError::WorkerExecution(format!("dtype cast error: {e}"))
-                        })?;
-                        full_logits_f32.eval().map_err(|e| {
-                            ExecutorError::WorkerExecution(format!("eval error: {e}"))
-                        })?;
-                        // full_logits_f32 shape: [num_tokens, vocab_size]
-                        let vocab_size = full_logits_f32.dim(-1) as usize;
-                        let flat = full_logits_f32.as_slice::<f32>();
-                        let mut plps = Vec::with_capacity(num_positions);
-                        for i in 0..num_positions {
-                            let row = &flat[i * vocab_size..(i + 1) * vocab_size];
-                            let actual_token = req_input.token_ids[i + 1];
-                            plps.push(vllm_models::sampler::compute_logprobs(
-                                row,
-                                actual_token,
-                                top_n,
-                            ));
-                        }
-                        prompt_logprobs_map.insert(req_input.req_id.clone(), plps);
-                    }
+            if req_input.is_prefill
+                && req_input.token_ids.len() > 1
+                && let Some(params) = self.sampling_params_map.get(&req_input.req_id)
+                && let Some(top_n) = params.prompt_logprobs
+            {
+                let top_n = top_n.max(0) as usize;
+                let num_positions = req_input.token_ids.len() - 1;
+                // Eval the full logits to extract prompt-position logits.
+                logits
+                    .eval()
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
+                let full_logits_f32 = logits.as_dtype(Dtype::Float32).map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("dtype cast error: {e}"))
+                })?;
+                full_logits_f32
+                    .eval()
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
+                // full_logits_f32 shape: [num_tokens, vocab_size]
+                let vocab_size = full_logits_f32.dim(-1) as usize;
+                let flat = full_logits_f32.as_slice::<f32>();
+                let mut plps = Vec::with_capacity(num_positions);
+                for i in 0..num_positions {
+                    let row = &flat[i * vocab_size..(i + 1) * vocab_size];
+                    let actual_token = req_input.token_ids[i + 1];
+                    plps.push(vllm_models::sampler::compute_logprobs(
+                        row,
+                        actual_token,
+                        top_n,
+                    ));
                 }
+                prompt_logprobs_map.insert(req_input.req_id.clone(), plps);
             }
 
             // Take logits at the last position (still lazy — no eval).

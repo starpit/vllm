@@ -117,6 +117,8 @@ impl MlxQwen3MoeConfig {
             head_dim: self.head_dim,
             tie_word_embeddings: self.tie_word_embeddings,
             sliding_window: None,
+            partial_rotary_factor: 1.0,
+            long_rope_scaling: None,
         }
     }
 

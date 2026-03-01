@@ -27,6 +27,19 @@ use vllm_model::weight::HfModelConfig;
 // LlamaConfig
 // ---------------------------------------------------------------------------
 
+/// LongRoPE scaling configuration (used by Phi-3/Phi-4 family).
+///
+/// Per-dimension frequency rescale factors for short and long contexts.
+#[derive(Debug, Clone)]
+pub struct LongRopeScaling {
+    /// Rescale factors for short contexts (len = rotary_dim / 2).
+    pub short_factor: Vec<f64>,
+    /// Rescale factors for long contexts (len = rotary_dim / 2).
+    pub long_factor: Vec<f64>,
+    /// Original max position embeddings before LongRoPE extension.
+    pub original_max_position_embeddings: usize,
+}
+
 /// Parsed configuration for a LLaMA model.
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
@@ -44,6 +57,10 @@ pub struct LlamaConfig {
     /// Sliding window size for attention. When `Some(w)`, each token only
     /// attends to the most recent `w` positions. Used by Mistral, Qwen2, etc.
     pub sliding_window: Option<usize>,
+    /// Fraction of head dimensions that get RoPE (default 1.0). Used by Phi-3/4.
+    pub partial_rotary_factor: f64,
+    /// LongRoPE scaling parameters. `None` means standard RoPE.
+    pub long_rope_scaling: Option<LongRopeScaling>,
 }
 
 impl LlamaConfig {
@@ -100,6 +117,48 @@ impl LlamaConfig {
             sliding_window
         };
 
+        // Parse partial_rotary_factor (Phi-3/4 family).
+        let partial_rotary_factor = config
+            .extra
+            .get("partial_rotary_factor")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+
+        // Parse LongRoPE scaling (rope_scaling.type == "longrope").
+        let long_rope_scaling = config.extra.get("rope_scaling").and_then(|rs| {
+            let scaling_type = rs.get("type")?.as_str()?;
+            if scaling_type != "longrope" {
+                return None;
+            }
+            let short_factor: Vec<f64> = rs
+                .get("short_factor")?
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_f64())
+                .collect();
+            let long_factor: Vec<f64> = rs
+                .get("long_factor")?
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_f64())
+                .collect();
+            let original_max = config
+                .extra
+                .get("original_max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4096) as usize;
+
+            if short_factor.is_empty() || long_factor.is_empty() {
+                return None;
+            }
+
+            Some(LongRopeScaling {
+                short_factor,
+                long_factor,
+                original_max_position_embeddings: original_max,
+            })
+        });
+
         Ok(Self {
             hidden_size,
             num_attention_heads,
@@ -119,6 +178,8 @@ impl LlamaConfig {
                 .unwrap_or(hidden_size / num_attention_heads),
             tie_word_embeddings: config.tie_word_embeddings.unwrap_or(false),
             sliding_window,
+            partial_rotary_factor,
+            long_rope_scaling,
         })
     }
 }
@@ -635,6 +696,8 @@ mod tests {
             head_dim: 8,
             tie_word_embeddings: false,
             sliding_window: None,
+            partial_rotary_factor: 1.0,
+            long_rope_scaling: None,
         }
     }
 

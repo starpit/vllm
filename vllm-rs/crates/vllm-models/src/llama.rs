@@ -26,6 +26,19 @@ use crate::attention::attention_with_cache;
 // LlamaConfig
 // ---------------------------------------------------------------------------
 
+/// LongRoPE scaling configuration (used by Phi-3/Phi-4 family).
+///
+/// Per-dimension frequency rescale factors for short and long contexts.
+#[derive(Debug, Clone)]
+pub struct LongRopeScaling {
+    /// Rescale factors for short contexts (len = rotary_dim / 2).
+    pub short_factor: Vec<f64>,
+    /// Rescale factors for long contexts (len = rotary_dim / 2).
+    pub long_factor: Vec<f64>,
+    /// Original max position embeddings before LongRoPE extension.
+    pub original_max_position_embeddings: usize,
+}
+
 /// Parsed configuration for a LLaMA model.
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
@@ -43,6 +56,11 @@ pub struct LlamaConfig {
     /// Sliding window size for attention. When `Some(w)`, each token only
     /// attends to the most recent `w` positions. Used by Mistral, Qwen2, etc.
     pub sliding_window: Option<usize>,
+    /// Fraction of head dimensions that get RoPE (default 1.0). Used by Phi-3/4.
+    /// `rotary_dim = (head_dim as f64 * partial_rotary_factor) as usize`
+    pub partial_rotary_factor: f64,
+    /// LongRoPE scaling parameters. `None` means standard RoPE.
+    pub long_rope_scaling: Option<LongRopeScaling>,
 }
 
 impl LlamaConfig {
@@ -72,6 +90,52 @@ impl LlamaConfig {
             }
         });
 
+        // Parse partial_rotary_factor (Phi-3/4 family).
+        let partial_rotary_factor = config
+            .extra
+            .get("partial_rotary_factor")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+
+        let head_dim = config
+            .head_dim()
+            .unwrap_or(hidden_size / num_attention_heads);
+
+        // Parse LongRoPE scaling (rope_scaling.type == "longrope").
+        let long_rope_scaling = config.extra.get("rope_scaling").and_then(|rs| {
+            let scaling_type = rs.get("type")?.as_str()?;
+            if scaling_type != "longrope" {
+                return None;
+            }
+            let short_factor: Vec<f64> = rs
+                .get("short_factor")?
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_f64())
+                .collect();
+            let long_factor: Vec<f64> = rs
+                .get("long_factor")?
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_f64())
+                .collect();
+            let original_max = config
+                .extra
+                .get("original_max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4096) as usize;
+
+            if short_factor.is_empty() || long_factor.is_empty() {
+                return None;
+            }
+
+            Some(LongRopeScaling {
+                short_factor,
+                long_factor,
+                original_max_position_embeddings: original_max,
+            })
+        });
+
         Ok(Self {
             hidden_size,
             num_attention_heads,
@@ -88,11 +152,11 @@ impl LlamaConfig {
             max_position_embeddings: config.max_position_embeddings.unwrap_or(4096),
             rms_norm_eps: config.norm_eps(),
             rope_theta: config.rope_theta.unwrap_or(10000.0),
-            head_dim: config
-                .head_dim()
-                .unwrap_or(hidden_size / num_attention_heads),
+            head_dim,
             tie_word_embeddings: config.tie_word_embeddings.unwrap_or(false),
             sliding_window,
+            partial_rotary_factor,
+            long_rope_scaling,
         })
     }
 }
@@ -667,6 +731,8 @@ mod tests {
             head_dim: 8,
             tie_word_embeddings: false,
             sliding_window: None,
+            partial_rotary_factor: 1.0,
+            long_rope_scaling: None,
         }
     }
 
@@ -706,6 +772,47 @@ mod tests {
         assert_eq!(config.vocab_size, 32000);
         assert_eq!(config.head_dim, 128);
         assert!(!config.tie_word_embeddings);
+    }
+
+    #[test]
+    fn test_phi4_mini_config_from_hf() {
+        let hf_config: HfModelConfig = serde_json::from_str(
+            r#"{
+                "architectures": ["Phi3ForCausalLM"],
+                "model_type": "phi3",
+                "hidden_size": 3072,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 8,
+                "num_hidden_layers": 32,
+                "intermediate_size": 8192,
+                "vocab_size": 200064,
+                "max_position_embeddings": 131072,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 10000.0,
+                "tie_word_embeddings": true,
+                "partial_rotary_factor": 0.75,
+                "original_max_position_embeddings": 4096,
+                "rope_scaling": {
+                    "type": "longrope",
+                    "short_factor": [1.0, 1.0, 1.0],
+                    "long_factor": [2.0, 4.0, 8.0]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = LlamaConfig::from_hf_config(&hf_config).unwrap();
+        assert_eq!(config.hidden_size, 3072);
+        assert_eq!(config.head_dim, 128); // 3072 / 24
+        assert!((config.partial_rotary_factor - 0.75).abs() < 1e-6);
+        assert!(config.long_rope_scaling.is_some());
+
+        let lr = config.long_rope_scaling.unwrap();
+        assert_eq!(lr.original_max_position_embeddings, 4096);
+        assert_eq!(lr.short_factor.len(), 3);
+        assert_eq!(lr.long_factor.len(), 3);
+        assert!((lr.long_factor[0] - 2.0).abs() < 1e-6);
+        assert!(config.tie_word_embeddings);
     }
 
     #[test]

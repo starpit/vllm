@@ -108,6 +108,7 @@ impl TestModels {
     // Tier 3: Medium (1–3 GB) — nightly only
     const GEMMA2_2B_4BIT: &str = "mlx-community/gemma-2-2b-it-4bit";              // ~1.4 GB, Gemma2ForCausalLM
     const PHI3_5_MINI_4BIT: &str = "mlx-community/Phi-3.5-mini-instruct-4bit";    // ~2.15 GB, Phi3ForCausalLM
+    const PHI4_MINI_4BIT: &str = "mlx-community/Unsloth-Phi-4-mini-instruct-4bit"; // ~2.3 GB, Phi3ForCausalLM (LongRoPE + partial_rotary_factor)
 
     // Tier 4: Large (3+ GB) — weekly/manual only
     const MISTRAL_7B_4BIT: &str = "mlx-community/Mistral-7B-Instruct-v0.3-4bit";  // ~3.8 GB, MistralForCausalLM
@@ -158,6 +159,7 @@ For each model in the test matrix:
 |-------|-------------|-----------|
 | gemma-2-2b-it-4bit | Gemma2ForCausalLM | Yes (4-bit) |
 | Phi-3.5-mini-instruct-4bit | Phi3ForCausalLM | Yes (4-bit) |
+| Unsloth-Phi-4-mini-instruct-4bit | Phi3ForCausalLM (LongRoPE) | Yes (4-bit) |
 | Qwen3-MOE-4x0.6B-2.4B-mlx-4Bit | Qwen3MoeForCausalLM | Yes (4-bit) |
 
 **Models for E1a-weekly** (Tier 4, weekly):
@@ -580,6 +582,7 @@ Validate the server handles concurrent requests correctly.
 | Gemma3 | Gemma3ForCausalLM | gemma-3-270m-it-qat-4bit | 900 MB | PR | — | Yes |
 | Gemma2 | Gemma2ForCausalLM | gemma-2-2b-it-4bit | 1.4 GB | Nightly | — | Yes |
 | Phi-3 | Phi3ForCausalLM | Phi-3.5-mini-instruct-4bit | 2.15 GB | Nightly | — | Yes |
+| Phi-4 | Phi3ForCausalLM (LongRoPE) | Unsloth-Phi-4-mini-instruct-4bit | 2.3 GB | Nightly | — | Yes |
 | Mistral | MistralForCausalLM | Mistral-7B-Instruct-v0.3-4bit | 3.8 GB | Weekly | — | Yes |
 | DeepSeek V2 | DeepseekV2ForCausalLM | DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx | 8.2 GB | Weekly | — | Yes |
 | Qwen3 MoE | Qwen3MoeForCausalLM | Qwen3-MOE-4x0.6B-2.4B-mlx-4Bit | ~1.5 GB | Nightly | — | Yes |

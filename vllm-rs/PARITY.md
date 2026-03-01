@@ -86,7 +86,7 @@
 | StarCoder / StarCoder2 | &#x1F535; | &#x2795; | — | — | P2 |
 | OPT | &#x1F535; | &#x1F534; | — | — | P1 |
 | Phi-1 / Phi-2 | &#x1F535; | &#x1F534; | — | — | P1 |
-| Phi-4 | &#x1F535; | &#x1F534; | — | — | P3 |
+| Phi-4 (via Phi3ForCausalLM + LongRoPE) | &#x1F535; | &#x1F535; | 0 | 4 | |
 | Gemma 3 (text-only) | &#x1F535; | &#x1F535; | 9 | 0 | |
 | ChatGLM / GLM-4 | &#x1F535; | &#x1F534; | — | — | P2 |
 | Baichuan | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -113,7 +113,7 @@
 | Qwen3 (with QK norms) | N/A | &#x1F535; | 0 | 0 | |
 | Gemma 1 | N/A | &#x1F535; | 2 | 0 | |
 | Gemma 2 | N/A | &#x1F535; | 7 | 0 | |
-| Phi-3 (fused projections) | N/A | &#x1F535; | 4 | 0 | |
+| Phi-3 / Phi-4 (fused projections, LongRoPE) | N/A | &#x1F535; | 10 | 4 | |
 | DeepSeek V2 / V3 | N/A | &#x1F535; | 5 | 2 | |
 | Command R (Cohere) | N/A | &#x1F535; | 4 | 0 | |
 | Quantized LLaMA (mlx-community 4-bit) | N/A | &#x1F535; | 4 | 8 | |
@@ -121,7 +121,7 @@
 | Quantized Qwen2/3 (4-bit) | N/A | &#x1F535; | 0 | 5 | |
 | Quantized Gemma 1 (4-bit) | N/A | &#x1F535; | 0 | 0 | |
 | Quantized Gemma 2 (4-bit) | N/A | &#x1F535; | 0 | 2 | |
-| Quantized Phi-3 (4-bit) | N/A | &#x1F535; | 0 | 2 | |
+| Quantized Phi-3 / Phi-4 (4-bit) | N/A | &#x1F535; | 0 | 6 | |
 | Quantized DeepSeek V2 (4-bit) | N/A | &#x1F535; | 2 | 2 | |
 | Quantized Command R (4-bit) | N/A | &#x1F535; | 0 | 0 | |
 | Qwen3 MoE (float) | N/A | &#x1F535; | 4 | 0 | |

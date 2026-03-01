@@ -109,6 +109,8 @@ pub struct MlxModelRegistry {
     quantized_models: HashMap<String, MlxModelFactory>,
     /// GPTQ model factories, keyed by HF architecture name.
     gptq_models: HashMap<String, MlxModelFactory>,
+    /// AWQ model factories, keyed by HF architecture name.
+    awq_models: HashMap<String, MlxModelFactory>,
 }
 
 impl MlxModelRegistry {
@@ -118,6 +120,7 @@ impl MlxModelRegistry {
             models: HashMap::new(),
             quantized_models: HashMap::new(),
             gptq_models: HashMap::new(),
+            awq_models: HashMap::new(),
         }
     }
 
@@ -200,6 +203,12 @@ impl MlxModelRegistry {
         registry.register_gptq("Qwen2ForCausalLM", llama::create_mlx_gptq_qwen2);
         registry.register_gptq("Qwen3ForCausalLM", llama::create_mlx_gptq_llama);
         registry.register_gptq("Phi3ForCausalLM", llama::create_mlx_gptq_llama);
+        // AWQ factories — dequantize at load time, reuse standard models.
+        registry.register_awq("LlamaForCausalLM", llama::create_mlx_awq_llama);
+        registry.register_awq("MistralForCausalLM", llama::create_mlx_awq_llama);
+        registry.register_awq("Qwen2ForCausalLM", llama::create_mlx_awq_qwen2);
+        registry.register_awq("Qwen3ForCausalLM", llama::create_mlx_awq_llama);
+        registry.register_awq("Phi3ForCausalLM", llama::create_mlx_awq_llama);
         registry
     }
 
@@ -216,6 +225,11 @@ impl MlxModelRegistry {
     /// Register a GPTQ model factory for an architecture name.
     pub fn register_gptq(&mut self, arch: &str, factory: MlxModelFactory) {
         self.gptq_models.insert(arch.to_string(), factory);
+    }
+
+    /// Register an AWQ model factory for an architecture name.
+    pub fn register_awq(&mut self, arch: &str, factory: MlxModelFactory) {
+        self.awq_models.insert(arch.to_string(), factory);
     }
 
     /// Look up a model factory by architecture name.
@@ -237,6 +251,11 @@ impl MlxModelRegistry {
     /// Look up a GPTQ model factory by architecture name.
     pub fn get_gptq(&self, arch: &str) -> Option<MlxModelFactory> {
         self.gptq_models.get(arch).copied()
+    }
+
+    /// Look up an AWQ model factory by architecture name.
+    pub fn get_awq(&self, arch: &str) -> Option<MlxModelFactory> {
+        self.awq_models.get(arch).copied()
     }
 
     /// Check if an architecture is supported (quantized or not).

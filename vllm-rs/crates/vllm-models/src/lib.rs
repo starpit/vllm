@@ -11,6 +11,7 @@
 
 pub mod attention;
 pub mod attention_metadata;
+pub mod awq_llama;
 pub mod commandr;
 pub mod deepseek_v2;
 pub mod embedding;

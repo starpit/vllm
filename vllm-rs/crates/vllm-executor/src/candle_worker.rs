@@ -550,11 +550,18 @@ impl CandleWorker {
             Ok(p) => info!("Downloaded tokenizer_config.json to {}", p.display()),
             Err(e) => warn!("Failed to download tokenizer_config.json: {e:?}"),
         }
-        // Only download quantize_config.json if config.json indicates GPTQ.
-        if std::fs::read_to_string(&config_path).is_ok_and(|s| s.contains("\"gptq\""))
-            && let Ok(p) = repo.get("quantize_config.json")
-        {
-            info!("Downloaded quantize_config.json to {}", p.display());
+        // Download quantization config files if config.json indicates GPTQ or AWQ.
+        if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+            if config_str.contains("\"gptq\"")
+                && let Ok(p) = repo.get("quantize_config.json")
+            {
+                info!("Downloaded quantize_config.json to {}", p.display());
+            }
+            if config_str.contains("\"awq\"")
+                && let Ok(p) = repo.get("quant_config.json")
+            {
+                info!("Downloaded quant_config.json to {}", p.display());
+            }
         }
 
         // Try single-file weights first.
@@ -690,15 +697,19 @@ impl Worker for CandleWorker {
             resolved
         };
 
-        // 3. Detect GPTQ quantization.
+        // 3. Detect GPTQ or AWQ quantization.
+        let quant_method = hf_config
+            .extra
+            .get("quantization_config")
+            .and_then(|v| v.get("quant_method"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         let gptq_config = vllm_model::gptq_config::GptqQuantizeConfig::from_dir(&model_dir).ok();
-        let is_gptq = gptq_config.is_some()
-            || hf_config
-                .extra
-                .get("quantization_config")
-                .and_then(|v| v.get("quant_method"))
-                .and_then(|v| v.as_str())
-                == Some("gptq");
+        let is_gptq = gptq_config.is_some() || quant_method.as_deref() == Some("gptq");
+
+        let awq_config = vllm_model::awq_config::AwqQuantizeConfig::from_dir(&model_dir).ok();
+        let is_awq = !is_gptq && (awq_config.is_some() || quant_method.as_deref() == Some("awq"));
 
         // 4. Look up architecture in the registry.
         let arch = hf_config
@@ -728,7 +739,7 @@ impl Worker for CandleWorker {
             weights.total_size_bytes() as f64 / 1_048_576.0
         );
 
-        // 6. Construct the model (GPTQ or standard).
+        // 6. Construct the model (GPTQ, AWQ, or standard).
         let model = if is_gptq {
             let gptq_cfg = match gptq_config {
                 Some(cfg) => cfg,
@@ -765,6 +776,41 @@ impl Worker for CandleWorker {
 
             gptq_factory(&weights, &hf_config, &gptq_cfg, dtype, &device).map_err(|e| {
                 ExecutorError::WorkerInit(format!("failed to construct GPTQ model: {e}"))
+            })?
+        } else if is_awq {
+            let awq_cfg = match awq_config {
+                Some(cfg) => cfg,
+                None => {
+                    let qc = hf_config
+                        .extra
+                        .get("quantization_config")
+                        .ok_or_else(|| {
+                            ExecutorError::WorkerInit(
+                                "AWQ detected but no quant_config.json or quantization_config in config.json".to_string(),
+                            )
+                        })?;
+                    vllm_model::awq_config::AwqQuantizeConfig::from_json_value(qc).map_err(|e| {
+                        ExecutorError::WorkerInit(format!(
+                            "failed to parse quantization_config: {e}"
+                        ))
+                    })?
+                }
+            };
+
+            info!(
+                "CandleWorker: AWQ detected (bits={}, group_size={}, zero_point={})",
+                awq_cfg.bits, awq_cfg.group_size, awq_cfg.zero_point
+            );
+
+            let awq_factory = registry.get_awq(&arch).ok_or_else(|| {
+                ExecutorError::WorkerInit(format!(
+                    "unsupported AWQ architecture: {arch}. Supported AWQ: {:?}",
+                    registry.awq_architectures().collect::<Vec<_>>()
+                ))
+            })?;
+
+            awq_factory(&weights, &hf_config, &awq_cfg, dtype, &device).map_err(|e| {
+                ExecutorError::WorkerInit(format!("failed to construct AWQ model: {e}"))
             })?
         } else {
             let factory = registry.get(&arch).ok_or_else(|| {

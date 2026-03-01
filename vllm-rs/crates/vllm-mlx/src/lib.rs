@@ -14,6 +14,7 @@
 //! - [`models`] — model architecture implementations using mlx-rs primitives
 //! - [`cache`] — MLX KV cache (Array-based)
 
+pub mod awq;
 pub mod cache;
 pub mod gptq;
 pub mod lora;

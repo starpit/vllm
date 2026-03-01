@@ -11,6 +11,7 @@ use vllm_model::gguf::GgufFile;
 use vllm_model::weight::HfModelConfig;
 
 use crate::ModelFactory;
+use crate::awq_llama::AwqModelFactory;
 use crate::gptq_llama::GptqModelFactory;
 
 /// Factory function type for constructing a model from a GGUF file.
@@ -30,6 +31,8 @@ pub struct ModelRegistry {
     gguf_models: HashMap<&'static str, GgufModelFactory>,
     /// GPTQ model factories, keyed by HF architecture name.
     gptq_models: HashMap<&'static str, GptqModelFactory>,
+    /// AWQ model factories, keyed by HF architecture name.
+    awq_models: HashMap<&'static str, AwqModelFactory>,
 }
 
 impl ModelRegistry {
@@ -39,6 +42,7 @@ impl ModelRegistry {
             models: HashMap::new(),
             gguf_models: HashMap::new(),
             gptq_models: HashMap::new(),
+            awq_models: HashMap::new(),
         }
     }
 
@@ -104,6 +108,13 @@ impl ModelRegistry {
         self.register_gptq("Qwen2ForCausalLM", crate::gptq_llama::create_qwen2_gptq);
         self.register_gptq("Qwen3ForCausalLM", crate::gptq_llama::create_llama_gptq);
         self.register_gptq("Phi3ForCausalLM", crate::gptq_llama::create_llama_gptq);
+
+        // --- AWQ factories (keyed by HF architecture name) ---
+        self.register_awq("LlamaForCausalLM", crate::awq_llama::create_llama_awq);
+        self.register_awq("MistralForCausalLM", crate::awq_llama::create_llama_awq);
+        self.register_awq("Qwen2ForCausalLM", crate::awq_llama::create_qwen2_awq);
+        self.register_awq("Qwen3ForCausalLM", crate::awq_llama::create_llama_awq);
+        self.register_awq("Phi3ForCausalLM", crate::awq_llama::create_llama_awq);
     }
 
     /// Register a model factory for the given architecture name.
@@ -121,6 +132,11 @@ impl ModelRegistry {
         self.gptq_models.insert(arch, factory);
     }
 
+    /// Register an AWQ model factory for the given HF architecture.
+    pub fn register_awq(&mut self, arch: &'static str, factory: AwqModelFactory) {
+        self.awq_models.insert(arch, factory);
+    }
+
     /// Look up a model factory by architecture name.
     pub fn get(&self, arch: &str) -> Option<&ModelFactory> {
         self.models.get(arch)
@@ -134,6 +150,11 @@ impl ModelRegistry {
     /// Look up a GPTQ model factory by HF architecture name.
     pub fn get_gptq(&self, arch: &str) -> Option<&GptqModelFactory> {
         self.gptq_models.get(arch)
+    }
+
+    /// Look up an AWQ model factory by HF architecture name.
+    pub fn get_awq(&self, arch: &str) -> Option<&AwqModelFactory> {
+        self.awq_models.get(arch)
     }
 
     /// Check if an architecture is supported.
@@ -164,6 +185,16 @@ impl ModelRegistry {
     /// List all registered GPTQ architecture names.
     pub fn gptq_architectures(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.gptq_models.keys().copied()
+    }
+
+    /// Check if an AWQ architecture is supported.
+    pub fn contains_awq(&self, arch: &str) -> bool {
+        self.awq_models.contains_key(arch)
+    }
+
+    /// List all registered AWQ architecture names.
+    pub fn awq_architectures(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.awq_models.keys().copied()
     }
 }
 

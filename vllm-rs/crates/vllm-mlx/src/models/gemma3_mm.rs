@@ -185,11 +185,7 @@ impl MlxGemma3ForConditionalGeneration {
         let pixel_arrays: Vec<Array> = mm_data
             .images
             .iter()
-            .map(|img| {
-                let arr =
-                    Array::from_slice(&img.pixels, &[1, 3, img.height as i32, img.width as i32]);
-                arr
-            })
+            .map(|img| Array::from_slice(&img.pixels, &[1, 3, img.height as i32, img.width as i32]))
             .collect();
         let pixel_values = concatenate_axis(&pixel_arrays.iter().collect::<Vec<_>>(), 0)?;
 

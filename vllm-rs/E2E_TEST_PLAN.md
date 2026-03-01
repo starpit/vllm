@@ -126,6 +126,9 @@ impl TestModels {
 
     // GPTQ quantized models (candle + MLX backends)
     const QWEN2_0_5B_GPTQ_INT4: &str = "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4";  // ~459 MB, Qwen2ForCausalLM
+
+    // AWQ quantized models (candle + MLX backends)
+    const QWEN2_0_5B_AWQ: &str = "Qwen/Qwen2.5-0.5B-Instruct-AWQ";              // ~393 MB, Qwen2ForCausalLM
 }
 ```
 
@@ -623,6 +626,32 @@ cargo test -p vllm-e2e --features e2e --test e_gptq --release -- --ignored --tes
 
 ---
 
+## Phase E14b: AWQ Quantization — DONE
+
+Test file: `e_awq.rs`
+
+Tests AWQ INT4 quantized model loading and inference. AWQ (Activation-aware Weight Quantization) is widely used on HuggingFace (`TheBloke/*-AWQ`, `casperhansen/*-awq`). Supports both candle (CPU dequantize-per-forward) and MLX (dequantize-at-load-time on Metal) backends.
+
+| Test | Model | Description |
+|------|-------|-------------|
+| `test_awq_qwen2_server_starts` | Qwen2.5-0.5B-Instruct-AWQ | Server starts, /health + /v1/models work |
+| `test_awq_qwen2_chat_basic` | Qwen2.5-0.5B-Instruct-AWQ | Chat completion returns coherent text |
+| `test_awq_qwen2_completion_basic` | Qwen2.5-0.5B-Instruct-AWQ | Text completion returns non-empty text |
+| `test_awq_qwen2_max_tokens` | Qwen2.5-0.5B-Instruct-AWQ | max_tokens=5 → completion_tokens ≤ 5 |
+
+Run commands:
+```bash
+# MLX backend (fast, ~10s):
+cargo test -p vllm-e2e --features e2e,metal --test e_awq --release -- --ignored --test-threads=1
+
+# Candle CPU backend (slower):
+cargo test -p vllm-e2e --features e2e --test e_awq --release -- --ignored --test-threads=1
+```
+
+**Deliverables**: 4 E2E tests (all implemented). Uses official Qwen AWQ model (~393 MB).
+
+---
+
 ## Phase E15: Offline Batch LLM API — DONE
 
 Test file: `e_llm_api.rs`
@@ -666,8 +695,9 @@ cargo test -p vllm-e2e --features e2e,metal --test e_llm_api -- --ignored --test
 | E12. Embedding | 10 (done) | SmolLM / Qwen2 / Llama3 | Every PR | 2 min |
 | E13. LoRA Adapters | 4 (done) | SmolLM-135M-F16 | Every PR | <1 min |
 | E14. GPTQ Quantization | 4 (done) | Qwen2.5-0.5B-GPTQ-Int4 | Every PR | <1 min (MLX) |
+| E14b. AWQ Quantization | 4 (done) | Qwen2.5-0.5B-AWQ | Every PR | <1 min (MLX) |
 | E15. Offline Batch LLM API | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
-| **Total** | **~186** | | | **~30 min** |
+| **Total** | **~190** | | | **~30 min** |
 
 ### CI Tiers
 
@@ -699,6 +729,7 @@ cargo test -p vllm-e2e --features e2e,metal --test e_llm_api -- --ignored --test
 | Gemma v1 | GemmaForCausalLM | (deferred — 2B model at 2 GB) | — | — | — | — |
 
 | GPTQ Qwen2 | Qwen2ForCausalLM | Qwen2.5-0.5B-Instruct-GPTQ-Int4 | 459 MB | PR | — | Yes (GPTQ INT4) |
+| AWQ Qwen2 | Qwen2ForCausalLM | Qwen2.5-0.5B-Instruct-AWQ | 393 MB | PR | — | Yes (AWQ INT4) |
 
 **Note on Command R**: The smallest `CohereForCausalLM` is 35B (16.9 GB). The 7B variant uses `Cohere2ForCausalLM` which is a different architecture not yet implemented. Command R E2E tests are manual-only until either (a) a smaller CohereForCausalLM model appears, or (b) we implement Cohere2ForCausalLM.
 

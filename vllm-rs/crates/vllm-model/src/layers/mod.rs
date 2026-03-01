@@ -12,6 +12,7 @@
 //! Port of: `vllm/model_executor/layers/`
 
 pub mod activation;
+pub mod awq;
 pub mod embedding;
 pub mod gptq;
 pub mod linear;
@@ -20,6 +21,7 @@ pub mod quantized_linear;
 pub mod rotary;
 
 pub use activation::{Activation, gelu, relu, silu};
+pub use awq::{AwqConfig, AwqLinear};
 pub use embedding::Embedding;
 pub use gptq::{GptqConfig, GptqLinear};
 pub use linear::{ColumnParallelLinear, Linear, RowParallelLinear};

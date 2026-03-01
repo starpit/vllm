@@ -313,11 +313,18 @@ impl MlxWorker {
             Ok(p) => info!("Downloaded tokenizer_config.json to {}", p.display()),
             Err(e) => warn!("Failed to download tokenizer_config.json: {e:?}"),
         }
-        // Only download quantize_config.json if config.json indicates GPTQ.
-        if std::fs::read_to_string(&config_path).is_ok_and(|s| s.contains("\"gptq\""))
-            && let Ok(p) = repo.get("quantize_config.json")
-        {
-            info!("Downloaded quantize_config.json to {}", p.display());
+        // Download quantization config files if config.json indicates GPTQ or AWQ.
+        if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+            if config_str.contains("\"gptq\"")
+                && let Ok(p) = repo.get("quantize_config.json")
+            {
+                info!("Downloaded quantize_config.json to {}", p.display());
+            }
+            if config_str.contains("\"awq\"")
+                && let Ok(p) = repo.get("quant_config.json")
+            {
+                info!("Downloaded quant_config.json to {}", p.display());
+            }
         }
 
         // Download weights.
@@ -480,14 +487,20 @@ impl Worker for MlxWorker {
             info!("MlxWorker: detected quantized model: {qinfo}");
         }
 
-        // Detect GPTQ quantization.
+        // Detect GPTQ/AWQ quantization.
+        let quant_method = hf_config
+            .extra
+            .get("quantization_config")
+            .and_then(|v| v.get("quant_method"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         let is_gptq = vllm_model::gptq_config::GptqQuantizeConfig::from_dir(&model_dir).is_ok()
-            || hf_config
-                .extra
-                .get("quantization_config")
-                .and_then(|v| v.get("quant_method"))
-                .and_then(|v| v.as_str())
-                == Some("gptq");
+            || quant_method.as_deref() == Some("gptq");
+
+        let is_awq = !is_gptq
+            && (vllm_model::awq_config::AwqQuantizeConfig::from_dir(&model_dir).is_ok()
+                || quant_method.as_deref() == Some("awq"));
 
         // Look up architecture in the MLX registry.
         let arch = hf_config
@@ -503,6 +516,11 @@ impl Worker for MlxWorker {
             info!("MlxWorker: GPTQ quantization detected, using dequantize-at-load path");
             registry.get_gptq(&arch).ok_or_else(|| {
                 ExecutorError::WorkerInit(format!("unsupported GPTQ MLX architecture: {arch}"))
+            })?
+        } else if is_awq {
+            info!("MlxWorker: AWQ quantization detected, using dequantize-at-load path");
+            registry.get_awq(&arch).ok_or_else(|| {
+                ExecutorError::WorkerInit(format!("unsupported AWQ MLX architecture: {arch}"))
             })?
         } else {
             registry.get_factory(&arch, is_quantized).ok_or_else(|| {
@@ -524,6 +542,8 @@ impl Worker for MlxWorker {
         self.model = Some(model);
         let quant_str = if is_gptq {
             ", GPTQ"
+        } else if is_awq {
+            ", AWQ"
         } else if is_quantized {
             ", quantized"
         } else {

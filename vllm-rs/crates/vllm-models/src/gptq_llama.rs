@@ -55,7 +55,7 @@ impl Module for GptqLlamaMLP {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let activated = gate.silu()?.mul(&up)?;
+        let activated = crate::ops::silu_and_mul(&gate, &up)?;
         self.down_proj.forward(&activated)
     }
 }
@@ -215,16 +215,12 @@ impl GptqLlamaDecoderLayer {
         positions: &Tensor,
         kv_cache: Option<crate::LayerKvHandle<'_>>,
     ) -> ModelResult<Tensor> {
-        let normed = self
-            .input_layernorm
-            .forward(hidden_states)
+        let normed = crate::ops::rms_norm(hidden_states, &self.input_layernorm)
             .map_err(ModelError::Candle)?;
         let attn_output = self.self_attn.forward(&normed, positions, kv_cache)?;
         let hidden_states = (hidden_states + attn_output).map_err(ModelError::Candle)?;
 
-        let normed = self
-            .post_attention_layernorm
-            .forward(&hidden_states)
+        let normed = crate::ops::rms_norm(&hidden_states, &self.post_attention_layernorm)
             .map_err(ModelError::Candle)?;
         let mlp_output = self.mlp.forward(&normed).map_err(ModelError::Candle)?;
         let hidden_states = (hidden_states + mlp_output).map_err(ModelError::Candle)?;
@@ -291,9 +287,7 @@ impl GptqLlamaModel {
             hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
         }
 
-        self.norm
-            .forward(&hidden_states)
-            .map_err(ModelError::Candle)
+        crate::ops::rms_norm(&hidden_states, &self.norm).map_err(ModelError::Candle)
     }
 
     fn num_layers(&self) -> usize {

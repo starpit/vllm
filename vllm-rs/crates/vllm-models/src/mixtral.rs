@@ -135,7 +135,7 @@ impl Module for MixtralExpertMLP {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let gate = self.w1.forward(x)?;
         let up = self.w3.forward(x)?;
-        let activated = gate.silu()?.mul(&up)?;
+        let activated = crate::ops::silu_and_mul(&gate, &up)?;
         self.w2.forward(&activated)
     }
 }
@@ -337,17 +337,13 @@ impl MixtralDecoderLayer {
         kv_cache: Option<crate::LayerKvHandle<'_>>,
     ) -> ModelResult<Tensor> {
         // Pre-attention layernorm + attention + residual.
-        let normed = self
-            .input_layernorm
-            .forward(hidden_states)
+        let normed = crate::ops::rms_norm(hidden_states, &self.input_layernorm)
             .map_err(ModelError::Candle)?;
         let attn_output = self.self_attn.forward(&normed, positions, kv_cache)?;
         let hidden_states = (hidden_states + attn_output).map_err(ModelError::Candle)?;
 
         // Post-attention layernorm + MoE + residual.
-        let normed = self
-            .post_attention_layernorm
-            .forward(&hidden_states)
+        let normed = crate::ops::rms_norm(&hidden_states, &self.post_attention_layernorm)
             .map_err(ModelError::Candle)?;
         let mlp_output = self
             .block_sparse_moe
@@ -422,9 +418,7 @@ impl MixtralModel {
             hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
         }
 
-        self.norm
-            .forward(&hidden_states)
-            .map_err(ModelError::Candle)
+        crate::ops::rms_norm(&hidden_states, &self.norm).map_err(ModelError::Candle)
     }
 
     fn num_layers(&self) -> usize {

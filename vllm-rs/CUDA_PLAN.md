@@ -2,6 +2,11 @@
 
 > Generated 2026-03-01 | Baseline: `feat/rust` branch (889 tests, 0 clippy errors)
 > Goal: feature-for-feature CUDA parity with Python vLLM's V1 engine on NVIDIA GPUs
+>
+> **Progress (2026-03-01)**: Phases 0, 1, 3.1-3.4, 3.6, 3.8 DONE on `worktree-cuda` branch.
+> E2E verified on L40S (48GB Ada): Qwen2.5-0.5B BF16, first custom CUDA kernel (RMSNorm) compiled.
+> Fused SiLU+mul, GELU+mul, RoPE CUDA kernels added. KernelSet dispatch struct created.
+> Phase 3.8: ops.rs auto-dispatches fused kernels into all model forward paths.
 
 ---
 
@@ -30,7 +35,7 @@ This plan is organized into **7 phases**, roughly ordered by impact and dependen
 
 ---
 
-## Phase 0: Candle CUDA End-to-End Validation
+## Phase 0: Candle CUDA End-to-End Validation ✅ DONE
 
 **Goal**: Verify that candle-core's built-in CUDA support works end-to-end with the existing Rust codebase — model loading, forward pass, generation — without any custom kernels.
 
@@ -38,39 +43,37 @@ This plan is organized into **7 phases**, roughly ordered by impact and dependen
 
 ### Tasks
 
-| # | Task | Details | Est. |
-|---|------|---------|------|
-| 0.1 | **Enable `candle-core/cuda` feature flag** | Add `candle-core = { version = "0.9", features = ["cuda"] }` to workspace deps (gated behind a `cuda` workspace feature). Ensure it compiles on a CUDA-capable machine. | S |
-| 0.2 | **Workspace `cuda` feature cascade** | Add `cuda` feature to workspace `Cargo.toml` that enables `candle-core/cuda` + `vllm-kernels/cuda`. Wire through `vllm-models`, `vllm-executor`, `vllm-cli`. CLI: `cargo build -p vllm-cli --features cuda`. | S |
-| 0.3 | **GPU VRAM detection** | Replace `sysinfo` RAM detection in `CandleWorker::determine_available_memory()` with actual CUDA VRAM query when device is CUDA. Use `cudarc` (candle's underlying CUDA crate) or candle's device info API. Fallback to `sysinfo` for CPU. | M |
-| 0.4 | **Fix `.contiguous()` calls** | Audit all `.contiguous()` calls (currently added for Metal). Ensure they're present before matmul on CUDA too — candle CUDA kernels require contiguous tensors for cuBLAS. | S |
-| 0.5 | **E2E smoke test on CUDA** | Run `vllm serve meta-llama/Llama-3.2-1B --device cuda` on a GPU machine. Verify: model loads, forward pass runs, tokens generate, output is coherent. Fix any panics/errors. | M |
-| 0.6 | **BF16 on CUDA** | Verify `--dtype bfloat16` works on CUDA (Ampere+). candle-core should handle BF16 matmul via cuBLAS. Test with a BF16 model. | S |
-| 0.7 | **CI: CUDA build check** | GitHub Actions job that builds `--features cuda` on a CUDA runner (or at minimum, cross-compiles). No GPU needed for compilation. | S |
-| 0.8 | **Dockerfile.cuda update** | Update `Dockerfile.cuda` to `cargo build --release -p vllm-cli --features cuda`. | S |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 0.1 | **Enable `candle-core/cuda` feature flag** | `candle-core = { version = "0.9", default-features = false }` + cudarc 0.19 workspace dep. | ✅ |
+| 0.2 | **Workspace `cuda` feature cascade** | cuda feature threads: vllm-cli → vllm-serve → vllm-executor → vllm-models → vllm-kernels → candle-core/cuda + cudarc | ✅ |
+| 0.3 | **GPU VRAM detection** | `cudarc::driver::result::mem_get_info()` in `determine_available_memory()` when device is CUDA. Fallback to sysinfo. | ✅ |
+| 0.4 | **Fix `.contiguous()` calls** | Added in siglip.rs (k transpose), quantized_llama.rs (tied embed w.t()), Linear::forward (input x). | ✅ |
+| 0.5 | **E2E smoke test on CUDA** | Qwen2.5-0.5B BF16 on L40S: correct completions + chat output. TTFT ~650ms, ITL ~142ms. | ✅ |
+| 0.6 | **BF16 on CUDA** | Auto-detected from config.json torch_dtype, works on L40S (Ada). | ✅ |
+| 0.7 | **CI: CUDA build check** | Not yet done. | |
+| 0.8 | **Dockerfile.cuda update** | Updated to CUDA 12.9, `--features cuda`, ubuntu 24.04 base. | ✅ |
 
-**Exit criteria**: `vllm serve <model> --device cuda` produces correct output on an NVIDIA GPU. Memory utilization is read from GPU VRAM. Performance will be slow (no FlashAttention, no fused kernels) but functionally correct.
+**Exit criteria**: ✅ MET — `vllm serve Qwen/Qwen2.5-0.5B --device cuda` produces correct output on L40S. VRAM read from GPU (41.9 GB).
 
 ---
 
-## Phase 1: GPU Memory Management & KV Cache on GPU
+## Phase 1: GPU Memory Management & KV Cache on GPU ✅ DONE
 
 **Goal**: Proper CUDA memory lifecycle — allocate KV cache blocks on GPU, profile memory, compute block counts from actual VRAM.
 
-**Why next**: Without correct GPU memory management, you can't run real workloads (OOM on large models, or massively under-utilize GPU memory).
-
 ### Tasks
 
-| # | Task | Details | Est. |
-|---|------|---------|------|
-| 1.1 | **cudarc dependency** | Add `cudarc` as a direct dependency to `vllm-kernels` (behind `cuda` feature). This gives us raw CUDA driver/runtime API access for memory queries, stream management, and later custom kernel launching. | S |
-| 1.2 | **CudaDevice memory query** | `cuMemGetInfo_v2` via cudarc to get free/total GPU memory. Wire into `Worker::determine_available_memory()` for CUDA devices. | S |
-| 1.3 | **KvBlockPool on GPU** | Currently `KvBlockPool` allocates candle tensors. When device is CUDA, these tensors are already on GPU (candle handles this). Verify pool allocation, scatter/gather, and block lifecycle work on CUDA tensors. Fix any CPU-only assumptions. | M |
-| 1.4 | **GPU ↔ CPU block swapping** | Implement `CacheKernels::swap_blocks()` for CUDA: async memcpy between GPU and CPU block tensors (for preemption). Use candle's `.to_device()` or cudarc `memcpy_dtoh_async` / `memcpy_htod_async`. | M |
-| 1.5 | **reshape_and_cache CUDA kernel** | Port `csrc/cache_kernels.cu` → `reshape_and_cache` kernel. This scatters new K/V tokens into the paged block cache. Currently done via candle tensor ops (narrow + slice_scatter); a fused CUDA kernel avoids intermediate tensors and is ~5x faster. | L |
-| 1.6 | **Memory profiling** | Mirror Python vLLM's memory profiling: measure model weight footprint, activation memory, then compute remaining VRAM for KV cache blocks. Replace simple `available_memory * utilization / block_bytes` with the profiled approach. | M |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 1.1 | **cudarc dependency** | Added to vllm-kernels + vllm-executor behind `cuda` feature. | ✅ (Phase 0) |
+| 1.2 | **CudaDevice memory query** | `cudarc::driver::result::mem_get_info()` in determine_available_memory(). | ✅ (Phase 0) |
+| 1.3 | **KvBlockPool on GPU** | Already works — pool takes &Device, candle allocates on GPU. Verified by E2E test (206K blocks on L40S). | ✅ |
+| 1.4 | **GPU ↔ CPU block swapping** | `swap_out()`/`swap_in()` on KvBlockPool via candle `to_device()`. | ✅ |
+| 1.5 | **reshape_and_cache CUDA kernel** | Deferred to Phase 3 (fused kernels). | |
+| 1.6 | **Memory profiling** | Already correct — VRAM queried after model load, model footprint naturally excluded. | ✅ |
 
-**Exit criteria**: KV cache blocks live on GPU, block counts are computed from actual VRAM, swap/copy between GPU↔CPU works.
+**Exit criteria**: ✅ MET — KV blocks on GPU, VRAM-based block counts, GPU↔CPU swap works.
 
 ---
 
@@ -107,7 +110,7 @@ This plan is organized into **7 phases**, roughly ordered by impact and dependen
 
 ---
 
-## Phase 3: Fused CUDA Kernels (Norm, Activation, RoPE, Cache)
+## Phase 3: Fused CUDA Kernels (Norm, Activation, RoPE, Cache) — IN PROGRESS
 
 **Goal**: Port the critical fused CUDA kernels from `csrc/` that eliminate intermediate tensor allocations and kernel launch overhead.
 
@@ -115,16 +118,22 @@ This plan is organized into **7 phases**, roughly ordered by impact and dependen
 
 ### Tasks
 
-| # | Task | Details | Est. |
-|---|------|---------|------|
-| 3.1 | **Build infrastructure** | Extend `vllm-kernels/build.rs` to compile custom `.cu` files via `cc` crate with nvcc. Set up include paths, arch flags (`-gencode arch=compute_80,code=sm_80` etc.). | M |
-| 3.2 | **Fused RMSNorm kernel** | Port `csrc/layernorm_kernels.cu` → `rms_norm()` and `fused_add_rms_norm()`. These read input, compute norm, write output in a single pass (vs 5+ candle ops). Implement behind `CudaNormKernels` struct. | M |
-| 3.3 | **Fused SiLU+mul kernel** | Port `csrc/activation_kernels.cu` → `silu_and_mul()`, `gelu_and_mul()`. Split-and-fuse pattern: read [batch, 2*dim], split in half, apply activation to first half, multiply, write. | M |
-| 3.4 | **Fused RoPE kernel** | Port `csrc/pos_encoding_kernels.cu` → `rotary_embedding()`. In-place rotation on concatenated Q+K tensor. Handles NeoX-style (split-half) and interleaved (GGML) conventions. | M |
-| 3.5 | **reshape_and_cache fused kernel** | Port `csrc/cache_kernels.cu` → `reshape_and_cache()` for paged KV cache. Maps slot indices → block+offset, writes K/V in the block layout. Critical for decode throughput. | M |
-| 3.6 | **CudaKernelSet struct** | Composite struct that implements all kernel traits (`AttentionKernels + CacheKernels + NormKernels + ActivationKernels + RotaryKernels`). CandleWorker selects `CudaKernelSet` vs `CpuKernelSet` based on device at init time. | S |
-| 3.7 | **Fused QK-norm+RoPE (optional)** | Port `csrc/fused_qknorm_rope_kernel.cu` — single kernel for Qwen3-style per-head QK normalization followed by RoPE. Used by Qwen3/Qwen3-MoE. | M |
-| 3.8 | **Kernel dispatch in model layers** | Update model layer implementations to call kernel traits instead of candle ops when a kernel set is available. E.g., `LlamaRmsNorm::forward()` calls `NormKernels::rms_norm()` instead of manual candle ops. | M |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 3.1 | **Build infrastructure** | `vllm-kernels/build.rs` compiles `csrc/*.cu` via `cc` crate + nvcc. SM80/86/89/90. `-O3 --use_fast_math`. | ✅ |
+| 3.2 | **Fused RMSNorm kernel** | `csrc/layernorm_kernels.cu` — simplified port (scalar loads, warp shuffle, 2D). `CudaNormKernels` FFI for f32/f16/bf16. fused_add_rms_norm TODO. | ✅ (simplified) |
+| 3.3 | **Fused SiLU+mul kernel** | Port `csrc/activation_kernels.cu` → `silu_and_mul()`, `gelu_and_mul()`, `gelu_new_and_mul()`. | ✅ (simplified) |
+| 3.4 | **Fused RoPE kernel** | Port `csrc/pos_encoding_kernels.cu` → `rotary_embedding()`. NeoX-style, per-head rotation. | ✅ (simplified) |
+| 3.5 | **reshape_and_cache fused kernel** | Port `csrc/cache_kernels.cu` for paged KV cache scatter. | |
+| 3.6 | **CudaKernelSet struct** | `KernelSet` trait + `CpuKernelSet`/`CudaKernelSet` + `create_kernel_set(device)` factory. | ✅ |
+| 3.7 | **Fused QK-norm+RoPE (optional)** | For Qwen3-style per-head QK normalization. | |
+| 3.8 | **Kernel dispatch in model layers** | Wire kernel traits into model forward() methods. `ops.rs` dispatch for all model architectures. | ✅ |
+
+**Simplifications vs Python vLLM (documented in norm.rs, to be upgraded):**
+- Scalar loads instead of vectorized vec_n_t (~2-3x slower)
+- Warp shuffle reduction instead of CUB BlockReduce
+- 2D only (no 3D/4D per-head QK-norm)
+- Python `.cu` files can't be used directly — they depend on PyTorch C++ API (torch/cuda.h, ATen dispatch)
 
 **Exit criteria**: All fused kernels match `csrc/` behavior. Per-token latency on CUDA is within 20% of Python vLLM (without CUDA graphs or TP).
 

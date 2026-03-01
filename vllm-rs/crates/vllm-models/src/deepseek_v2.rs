@@ -550,7 +550,7 @@ impl DeepSeekV2Attention {
             (&self.q_a_proj, &self.q_a_layernorm, &self.q_b_proj)
         {
             let q_latent = q_a.forward(hidden_states).map_err(ModelError::Candle)?;
-            let q_latent = q_a_ln.forward(&q_latent).map_err(ModelError::Candle)?;
+            let q_latent = crate::ops::rms_norm(&q_latent, q_a_ln).map_err(ModelError::Candle)?;
             q_b.forward(&q_latent).map_err(ModelError::Candle)?
         } else {
             self.q_proj
@@ -589,10 +589,8 @@ impl DeepSeekV2Attention {
             .map_err(ModelError::Candle)?;
 
         // kv_latent → RMSNorm → kv_b_proj.
-        let kv_latent = self
-            .kv_a_layernorm
-            .forward(&kv_latent)
-            .map_err(ModelError::Candle)?;
+        let kv_latent =
+            crate::ops::rms_norm(&kv_latent, &self.kv_a_layernorm).map_err(ModelError::Candle)?;
         let kv_b = self
             .kv_b_proj
             .forward(&kv_latent)
@@ -800,17 +798,13 @@ impl DeepSeekV2DecoderLayer {
         kv_cache: Option<crate::LayerKvHandle<'_>>,
     ) -> ModelResult<Tensor> {
         // Pre-attention layernorm + attention + residual.
-        let normed = self
-            .input_layernorm
-            .forward(hidden_states)
+        let normed = crate::ops::rms_norm(hidden_states, &self.input_layernorm)
             .map_err(ModelError::Candle)?;
         let attn_output = self.self_attn.forward(&normed, positions, kv_cache)?;
         let hidden_states = (hidden_states + attn_output).map_err(ModelError::Candle)?;
 
         // Post-attention layernorm + MLP/MoE + residual.
-        let normed = self
-            .post_attention_layernorm
-            .forward(&hidden_states)
+        let normed = crate::ops::rms_norm(&hidden_states, &self.post_attention_layernorm)
             .map_err(ModelError::Candle)?;
         let mlp_output = self.mlp.forward(&normed).map_err(ModelError::Candle)?;
         let hidden_states = (hidden_states + mlp_output).map_err(ModelError::Candle)?;
@@ -883,9 +877,7 @@ impl DeepSeekV2Model {
             hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
         }
 
-        self.norm
-            .forward(&hidden_states)
-            .map_err(ModelError::Candle)
+        crate::ops::rms_norm(&hidden_states, &self.norm).map_err(ModelError::Candle)
     }
 
     fn num_layers(&self) -> usize {

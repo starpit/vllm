@@ -425,17 +425,13 @@ impl Qwen3MoeDecoderLayer {
         kv_cache: Option<crate::LayerKvHandle<'_>>,
     ) -> ModelResult<Tensor> {
         // Pre-attention layernorm + attention + residual.
-        let normed = self
-            .input_layernorm
-            .forward(hidden_states)
+        let normed = crate::ops::rms_norm(hidden_states, &self.input_layernorm)
             .map_err(ModelError::Candle)?;
         let attn_output = self.self_attn.forward(&normed, positions, kv_cache)?;
         let hidden_states = (hidden_states + attn_output).map_err(ModelError::Candle)?;
 
         // Post-attention layernorm + MLP/MoE + residual.
-        let normed = self
-            .post_attention_layernorm
-            .forward(&hidden_states)
+        let normed = crate::ops::rms_norm(&hidden_states, &self.post_attention_layernorm)
             .map_err(ModelError::Candle)?;
         let mlp_output = self.mlp.forward(&normed).map_err(ModelError::Candle)?;
         let hidden_states = (hidden_states + mlp_output).map_err(ModelError::Candle)?;
@@ -507,9 +503,7 @@ impl Qwen3MoeModel {
             hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
         }
 
-        self.norm
-            .forward(&hidden_states)
-            .map_err(ModelError::Candle)
+        crate::ops::rms_norm(&hidden_states, &self.norm).map_err(ModelError::Candle)
     }
 
     fn num_layers(&self) -> usize {

@@ -248,7 +248,7 @@ impl Module for Gemma3MLP {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
         // GELU(tanh)(gate) * up
-        let activated = gate.gelu()?.mul(&up)?;
+        let activated = crate::ops::gelu_and_mul(&gate, &up)?;
         self.down_proj.forward(&activated)
     }
 }
@@ -451,8 +451,8 @@ impl Gemma3Attention {
             .map_err(ModelError::Candle)?;
 
         // Per-head QK norms: GemmaRmsNorm normalizes last dim (head_dim).
-        let q = self.q_norm.forward(&q).map_err(ModelError::Candle)?;
-        let k = self.k_norm.forward(&k).map_err(ModelError::Candle)?;
+        let q = crate::ops::gemma_rms_norm(&q, &self.q_norm).map_err(ModelError::Candle)?;
+        let k = crate::ops::gemma_rms_norm(&k, &self.k_norm).map_err(ModelError::Candle)?;
 
         // RoPE
         let (q, k) = self.rotary_emb.apply(&q, &k, positions)?;
@@ -556,28 +556,20 @@ impl Gemma3DecoderLayer {
         kv_cache: Option<crate::LayerKvHandle<'_>>,
     ) -> ModelResult<Tensor> {
         // Pre-attention norm + attention.
-        let normed = self
-            .input_layernorm
-            .forward(hidden_states)
+        let normed = crate::ops::gemma_rms_norm(hidden_states, &self.input_layernorm)
             .map_err(ModelError::Candle)?;
         let attn_output = self.self_attn.forward(&normed, positions, kv_cache)?;
         // Post-attention norm + residual.
-        let attn_output = self
-            .post_attention_layernorm
-            .forward(&attn_output)
+        let attn_output = crate::ops::gemma_rms_norm(&attn_output, &self.post_attention_layernorm)
             .map_err(ModelError::Candle)?;
         let hidden_states = (hidden_states + attn_output).map_err(ModelError::Candle)?;
 
         // Pre-feedforward norm + MLP.
-        let normed = self
-            .pre_feedforward_layernorm
-            .forward(&hidden_states)
+        let normed = crate::ops::gemma_rms_norm(&hidden_states, &self.pre_feedforward_layernorm)
             .map_err(ModelError::Candle)?;
         let mlp_output = self.mlp.forward(&normed).map_err(ModelError::Candle)?;
         // Post-feedforward norm + residual.
-        let mlp_output = self
-            .post_feedforward_layernorm
-            .forward(&mlp_output)
+        let mlp_output = crate::ops::gemma_rms_norm(&mlp_output, &self.post_feedforward_layernorm)
             .map_err(ModelError::Candle)?;
         let hidden_states = (hidden_states + mlp_output).map_err(ModelError::Candle)?;
 
@@ -668,9 +660,7 @@ impl Gemma3Model {
             hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
         }
 
-        self.norm
-            .forward(&hidden_states)
-            .map_err(ModelError::Candle)
+        crate::ops::gemma_rms_norm(&hidden_states, &self.norm).map_err(ModelError::Candle)
     }
 
     /// Forward pass (embed + backbone).

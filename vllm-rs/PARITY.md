@@ -44,6 +44,7 @@
 | [Hardware Backends](#hardware-backends) | &#x1F535; | &#x1F7E1; | 28 | 2 | `████░░░░░░` 3/8 |
 | [Parallelism & Distribution](#parallelism--distribution) | &#x1F535; | &#x1F7E1; | 33 | 0 | `███░░░░░░░` 3/10 |
 | [Performance Optimizations](#performance-optimizations) | &#x1F535; | &#x1F7E1; | 6 | 0 | `██░░░░░░░░` 2/13 |
+| [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | &#x1F535; | &#x1F7E1; | 0 | 0 | `██░░░░░░░░` 3/12 |
 | [LoRA / Adapters](#lora--adapters) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/5 |
 | [Speculative Decoding](#speculative-decoding) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/5 |
 | [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F535; | &#x2795; | 0 | 0 | `░░░░░░░░░░` 0/10 |
@@ -52,7 +53,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/6 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | 15 | 0 | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | 14 | 0 | `██████████` 14/15 |
-| | | **Total** | **563** | **58** | `█████░░░░░` **102/202** |
+| | | **Total** | **563** | **58** | `█████░░░░░` **105/214** |
 
 ---
 
@@ -341,6 +342,41 @@
 > CPU kernel stubs in `vllm-kernels` (12 tests: rotary 3, activation 3, norm 2, cache 2, attention 2) provide building blocks for performance features. Native dtype unit tests count `candle_worker.rs` dtype parsing tests.
 >
 > **Batching-related items moved:** "Continuous batching" was previously listed here as fully implemented. It has been decomposed into its constituent parts: iteration-level scheduling (in [Scheduling](#scheduling)), batched forward pass (in [Scheduling](#scheduling)), batched attention metadata (in [KV Cache & Attention](#kv-cache--attention)), and mixed prefill+decode / persistent InputBatch (here). See the Scheduling section note for details on the gap.
+
+---
+
+## GPU Compute Kernels (Triton Equivalents)
+
+> Python vLLM contains **72+ Triton kernel files** (`@triton.jit`) implementing GPU-optimized operations for NVIDIA hardware. Triton is a Python→PTX compiler — it cannot be used from Rust. The Rust port uses different strategies per backend:
+> - **CUDA**: Custom CUDA kernels via `cudarc`, or FFI bindings to C++ libraries (FlashAttention, FlashInfer, CUTLASS)
+> - **MLX**: Framework-provided Metal kernels + lazy eval graph fusion covers attention, norm, RoPE, and activation implicitly
+> - **CPU**: Many operations (sampling, penalties, logprobs) are trivially fast on CPU for 1D per-request logit vectors
+>
+> Rows marked ✱ overlap with items in [Performance Optimizations](#performance-optimizations), [KV Cache & Attention](#kv-cache--attention), or [LoRA / Adapters](#lora--adapters) and are included here for a complete kernel-level view. Test counts are attributed to their primary sections to avoid double-counting.
+
+| Kernel Category | Python | Rust | Unit | E2E | Pri |
+|---|:---:|:---:|---:|---:|:---:|
+| Triton attention (prefill / decode / unified) ✱ | &#x1F535; | &#x1F534; | — | — | P3 |
+| Merge attention states | &#x1F535; | &#x1F534; | — | — | P2 |
+| KV cache write (reshape_and_cache) | &#x1F535; | &#x1F535; | 0 | 0 | |
+| GPU sampling (top-k / top-p / penalties / logprobs) | &#x1F535; | &#x1F535; | 0 | 0 | |
+| Fused MoE routing + expert matmul ✱ | &#x1F535; | &#x1F534; | — | — | P2 |
+| Fused layer ops (activation / norm / RoPE) ✱ | &#x1F535; | &#x1F7E1; | 0 | 0 | P2 |
+| Quantization compute (FP8 / INT8 / AWQ matmul) | &#x1F535; | &#x1F534; | — | — | P2 |
+| Mamba / SSM ops (selective scan, SSD, conv1d) | &#x1F535; | &#x1F534; | — | — | P2 |
+| FLA ops (fused recurrent, KDA, chunk) | &#x1F535; | &#x1F534; | — | — | P3 |
+| LoRA kernels (expand / shrink, fused_moe_lora) ✱ | &#x1F535; | &#x1F534; | — | — | P3 |
+| Speculative decoding Triton ops ✱ | &#x1F535; | &#x1F534; | — | — | P2 |
+| GPU batch utilities (block_table, buffer, input_batch) | &#x1F535; | &#x1F534; | — | — | P3 |
+
+> **72 Triton files breakdown**: attention ops (6), sampling (8), fused MoE (6), quantization compute (5), Mamba/SSM (7), FLA/linear attention (11), LoRA (5), speculative decoding (2), model-level/misc (22+).
+>
+> **Rust strategies by category**:
+> - *KV cache write*: Covered by `KvBlockPool::scatter_new_kv()` and `MlxKvCache` — different mechanism, same result. Tests attributed to [KV Cache & Attention](#kv-cache--attention).
+> - *GPU sampling*: All sampling runs on CPU in both CandleWorker and MlxWorker. For per-request forward passes this is trivially fast (~µs for a 1D logits vector). GPU sampling kernels only matter for batched inference where logits are a 2D `[batch, vocab]` tensor. Tests attributed to [Sampling & Decoding](#sampling--decoding).
+> - *Fused layer ops*: MLX lazy eval fuses `silu(x) * y`, `nn::RmsNorm`, and `nn::Rope` into single Metal command buffers — functionally equivalent to Triton fused kernels. The candle/CUDA path has no fused equivalents yet.
+> - *Triton attention*: Python vLLM has its own Triton attention implementations (distinct from the FlashAttention C++ library). Both serve the same purpose: batched variable-length attention. The Rust port would use FlashAttention via FFI rather than reimplementing in Triton.
+> - *Model-gated kernels*: Mamba/SSM, FLA, LoRA, and speculative decoding kernels are only needed when those model types or features are implemented — they are blocked by their parent feature.
 
 ---
 

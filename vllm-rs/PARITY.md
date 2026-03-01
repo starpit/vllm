@@ -33,29 +33,29 @@
 
 ## Summary: Major Feature Groups
 
-> Parity denominators exclude P0 items (deprecated / won't implement).
+> **Python Features** and **Rust Parity** exclude P0 items (deprecated / won't implement). **Rust Additions** counts features unique to the Rust port (e.g. MLX backend, standalone binary).
 
-| Feature Group | Rust Status | Unit | E2E | Parity |
-|---|---|---:|---:|---|
-| [Model Architectures](#model-architectures) | &#x1F535;41 &#x1F534;25 | 100 | 25 | `███░░░░░░░` 11/36 |
-| [Quantization](#quantization) | &#x1F535;3 &#x1F534;10 | 27 | 4 | `██░░░░░░░░` 2/11 |
-| [Serving / OpenAI API](#serving--openai-api) | &#x1F535;16 &#x1F534;9 | 101 | 18 | `██████░░░░` 16/24 |
-| [Sampling & Decoding](#sampling--decoding) | &#x1F535;19 &#x1F534;2 | 53 | 13 | `██████████` 19/19 |
-| [KV Cache & Attention](#kv-cache--attention) | &#x1F535;10 &#x1F7E1;1 &#x1F534;9 | 96 | 0 | `█████░░░░░` 9/19 |
-| [Scheduling](#scheduling) | &#x1F535;9 &#x1F534;2 | 67 | 0 | `████████░░` 8/10 |
-| [Hardware Backends](#hardware-backends) | &#x1F535;4 &#x1F7E1;1 &#x1F534;4 | 28 | 2 | `████░░░░░░` 3/8 |
-| [Parallelism & Distribution](#parallelism--distribution) | &#x1F535;3 &#x1F7E1;1 &#x1F534;6 | 33 | 0 | `███░░░░░░░` 3/10 |
-| [Performance Optimizations](#performance-optimizations) | &#x1F535;6 &#x1F534;11 | 6 | 0 | `██░░░░░░░░` 2/13 |
-| [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | &#x1F535;2 &#x1F7E1;1 &#x1F534;9 | 0 | 0 | `██░░░░░░░░` 3/12 |
-| [LoRA / Adapters](#lora--adapters) | &#x1F535;2 &#x1F534;3 | 12 | 8 | `████░░░░░░` 2/5 |
-| [Speculative Decoding](#speculative-decoding) | &#x1F535;1 &#x1F534;4 | 20 | 0 | `██░░░░░░░░` 1/5 |
-| [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F534;10 | 0 | 0 | `░░░░░░░░░░` 0/10 |
-| [Structured Output](#structured-output--guided-decoding) | &#x1F535;4 | 12 | 0 | `██████████` 4/4 |
-| [Tool Calling](#tool-calling--function-calling) | &#x1F535;7 | 25 | 0 | `██████████` 7/7 |
-| [Embeddings & Pooling](#embeddings--pooling) | &#x1F535;5 &#x1F534;3 | 19 | 10 | `██████░░░░` 5/8 |
-| [Observability & Operations](#observability--operations) | &#x1F535;8 &#x1F534;1 | 15 | 0 | `██████████` 7/7 |
-| [CLI & Deployment](#cli--deployment) | &#x1F535;17 &#x1F7E1;1 &#x1F534;1 | 14 | 0 | `██████████` 15/16 |
-| **Total** | **&#x1F535;157 &#x1F7E1;5 &#x1F534;109** | **621** | **73** | `█████░░░░░` **115/213** |
+| Feature Group | Python | Rust Parity | +Rust | Unit | E2E |
+|---|---:|---|---:|---:|---:|
+| [Model Architectures](#model-architectures) | 36 | `███░░░░░░░` 11/36 | 26 | 100 | 25 |
+| [Quantization](#quantization) | 11 | `██░░░░░░░░` 2/11 | 1 | 27 | 4 |
+| [Serving / OpenAI API](#serving--openai-api) | 24 | `██████░░░░` 16/24 | 0 | 101 | 18 |
+| [Sampling & Decoding](#sampling--decoding) | 19 | `██████████` 19/19 | 0 | 53 | 13 |
+| [KV Cache & Attention](#kv-cache--attention) | 19 | `█████░░░░░` 9/19 | 0 | 96 | 0 |
+| [Scheduling](#scheduling) | 10 | `████████░░` 8/10 | 0 | 67 | 0 |
+| [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 28 | 2 |
+| [Parallelism & Distribution](#parallelism--distribution) | 10 | `███░░░░░░░` 3/10 | 0 | 33 | 0 |
+| [Performance Optimizations](#performance-optimizations) | 13 | `██░░░░░░░░` 2/13 | 4 | 6 | 0 |
+| [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | 12 | `██░░░░░░░░` 3/12 | 0 | 0 | 0 |
+| [LoRA / Adapters](#lora--adapters) | 5 | `████░░░░░░` 2/5 | 0 | 12 | 8 |
+| [Speculative Decoding](#speculative-decoding) | 5 | `██░░░░░░░░` 1/5 | 0 | 20 | 0 |
+| [Multimodal / Vision-Language](#multimodal--vision-language) | 10 | `░░░░░░░░░░` 0/10 | 0 | 0 | 0 |
+| [Structured Output](#structured-output--guided-decoding) | 4 | `██████████` 4/4 | 0 | 12 | 0 |
+| [Tool Calling](#tool-calling--function-calling) | 7 | `██████████` 7/7 | 0 | 25 | 0 |
+| [Embeddings & Pooling](#embeddings--pooling) | 8 | `██████░░░░` 5/8 | 0 | 19 | 10 |
+| [Observability & Operations](#observability--operations) | 7 | `██████████` 7/7 | 1 | 15 | 0 |
+| [CLI & Deployment](#cli--deployment) | 16 | `██████████` 15/16 | 2 | 14 | 0 |
+| **Total** | **213** | `█████░░░░░` **115/213** | **35** | **621** | **73** |
 
 ---
 

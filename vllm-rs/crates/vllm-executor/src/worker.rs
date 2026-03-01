@@ -101,6 +101,19 @@ pub trait Worker: Send {
         Ok(())
     }
 
+    /// Compute embeddings for the given token ID sequences.
+    ///
+    /// Each inner slice is a single input to embed. Returns one embedding
+    /// vector (as `Vec<f32>`) per input.
+    ///
+    /// Default implementation returns an error — override in workers that
+    /// support embedding.
+    fn embed(&mut self, _token_id_seqs: &[&[u32]]) -> ExecutorResult<Vec<Vec<f32>>> {
+        Err(crate::error::ExecutorError::WorkerExecution(
+            "embedding not supported".into(),
+        ))
+    }
+
     /// Shut down the worker and release all resources.
     fn shutdown(&mut self);
 

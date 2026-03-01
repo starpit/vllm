@@ -185,6 +185,16 @@ pub trait Executor: Send {
         false
     }
 
+    /// Compute embeddings for the given token ID sequences.
+    ///
+    /// Returns one embedding vector per input sequence.
+    /// Default implementation returns an error.
+    fn embed(&mut self, _token_id_seqs: Vec<Vec<u32>>) -> EngineResult<Vec<Vec<f32>>> {
+        Err(crate::error::EngineError::Executor(
+            "embedding not supported".into(),
+        ))
+    }
+
     /// Shut down the executor and all workers.
     fn shutdown(&mut self);
 }

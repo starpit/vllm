@@ -1134,6 +1134,44 @@ impl Worker for CandleWorker {
         Ok(output)
     }
 
+    fn embed(&mut self, token_id_seqs: &[&[u32]]) -> ExecutorResult<Vec<Vec<f32>>> {
+        use vllm_models::embedding::{PoolingStrategy, l2_normalize, pool};
+
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerExecution("model not loaded".into()))?;
+        let device = self
+            .device
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerExecution("device not initialized".into()))?;
+
+        let mut results = Vec::with_capacity(token_id_seqs.len());
+        for token_ids in token_id_seqs {
+            let input_ids = Tensor::new(*token_ids, device)
+                .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+            let positions: Vec<u32> = (0..token_ids.len() as u32).collect();
+            let positions = Tensor::new(positions.as_slice(), device)
+                .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+            let hidden_states = model
+                .hidden_states(&input_ids, &positions)
+                .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+            let pooled = pool(&hidden_states, PoolingStrategy::Last)
+                .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+            let normalized =
+                l2_normalize(&pooled).map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+            let vec: Vec<f32> = normalized
+                .to_vec1()
+                .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+            results.push(vec);
+        }
+        Ok(results)
+    }
+
     fn shutdown(&mut self) {
         self.is_shutdown = true;
         self.model = None;

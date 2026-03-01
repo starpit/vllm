@@ -836,6 +836,63 @@ impl Worker for MlxWorker {
         Ok(output)
     }
 
+    fn embed(
+        &mut self,
+        token_id_seqs: &[&[u32]],
+    ) -> vllm_executor::error::ExecutorResult<Vec<Vec<f32>>> {
+        use vllm_executor::error::ExecutorError;
+
+        let model = self
+            .model
+            .as_mut()
+            .ok_or_else(|| ExecutorError::WorkerExecution("model not loaded".into()))?;
+
+        let mut results = Vec::with_capacity(token_id_seqs.len());
+        for token_ids in token_id_seqs {
+            let input_ids = Array::from_iter(
+                token_ids.iter().map(|&t| t as i32),
+                &[token_ids.len() as i32],
+            );
+            let positions = Array::from_iter(
+                (0..token_ids.len() as i32).collect::<Vec<_>>(),
+                &[token_ids.len() as i32],
+            );
+
+            let hidden_states = model
+                .hidden_states(&input_ids, &positions)
+                .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+            // Pool: last token. index() returns Array directly.
+            let num_tokens = token_ids.len();
+            let last_hidden = hidden_states.index(num_tokens as i32 - 1);
+
+            // L2 normalize: compute norm, divide, cast to f32.
+            let sq = last_hidden
+                .square()
+                .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+            let sum = sq
+                .sum(None)
+                .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+            let norm = sum
+                .sqrt()
+                .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+            let normalized = last_hidden
+                .divide(&norm)
+                .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+            let normalized_f32 = normalized
+                .as_dtype(mlx_rs::Dtype::Float32)
+                .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+            // Evaluate and convert to Vec<f32>.
+            normalized_f32
+                .eval()
+                .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+            let vec: Vec<f32> = normalized_f32.as_slice().to_vec();
+            results.push(vec);
+        }
+        Ok(results)
+    }
+
     fn shutdown(&mut self) {
         self.is_shutdown = true;
         self.model = None;

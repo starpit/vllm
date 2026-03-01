@@ -165,6 +165,13 @@ impl Executor for UniProcExecutor {
         self.is_sleeping
     }
 
+    fn embed(&mut self, token_id_seqs: Vec<Vec<u32>>) -> EngineResult<Vec<Vec<f32>>> {
+        let refs: Vec<&[u32]> = token_id_seqs.iter().map(|v| v.as_slice()).collect();
+        self.worker
+            .embed(&refs)
+            .map_err(|e| vllm_engine::error::EngineError::Executor(e.to_string()))
+    }
+
     fn shutdown(&mut self) {
         if self.is_shutdown {
             return;

@@ -6,6 +6,7 @@
 //! Provides endpoints:
 //! - `POST /v1/chat/completions` — chat completion (streaming + non-streaming)
 //! - `POST /v1/completions` — text completion (streaming + non-streaming)
+//! - `POST /v1/embeddings` — text embedding
 //! - `GET  /v1/models` — list available models
 //! - `GET  /health` — health check
 //! - `GET  /version` — version info
@@ -93,6 +94,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
         .route("/version", get(version));
@@ -273,6 +275,17 @@ async fn completions(
             Ok(response) => attach_orca_header(&headers, Json(response).into_response()),
             Err(e) => e.into_response(),
         }
+    }
+}
+
+/// POST /v1/embeddings
+async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<protocol::EmbeddingRequest>,
+) -> Response {
+    match state.engine.embeddings(request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 

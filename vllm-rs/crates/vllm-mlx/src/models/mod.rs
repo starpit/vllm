@@ -47,6 +47,23 @@ pub trait MlxModel: Send {
 
     /// Number of transformer layers in this model.
     fn num_layers(&self) -> usize;
+
+    /// Run the model backbone and return hidden states (before lm_head).
+    ///
+    /// Used for embedding: a single prefill pass with no KV cache, returning
+    /// the transformer output before the language model head projection.
+    ///
+    /// Default implementation returns an error for models that haven't
+    /// overridden this method.
+    fn hidden_states(
+        &mut self,
+        _input_ids: &Array,
+        _positions: &Array,
+    ) -> mlx_rs::error::Result<Array> {
+        Err(mlx_rs::error::Exception::custom(
+            "hidden_states not supported by this model",
+        ))
+    }
 }
 
 /// Factory function type for constructing an MLX model.

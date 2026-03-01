@@ -112,6 +112,12 @@ pub struct StreamDelta {
 // AsyncEngine
 // ---------------------------------------------------------------------------
 
+/// An embedding request sent to the step loop.
+struct EmbedRequest {
+    token_id_seqs: Vec<Vec<u32>>,
+    reply: tokio::sync::oneshot::Sender<ServeResult<Vec<Vec<f32>>>>,
+}
+
 /// An async wrapper around the engine core client, providing request lifecycle
 /// management for the HTTP serving layer.
 ///
@@ -131,13 +137,16 @@ pub struct AsyncEngine {
     requests: Arc<Mutex<HashMap<String, RequestState>>>,
     /// Channel to send new `EngineCoreRequest`s to the step loop.
     request_tx: mpsc::UnboundedSender<EngineCoreRequest>,
-    /// The engine client + channel receiver, held until `spawn_step_loop`
+    /// Channel to send embedding requests to the step loop.
+    embed_tx: mpsc::UnboundedSender<EmbedRequest>,
+    /// The engine client + channel receivers, held until `spawn_step_loop`
     /// moves them into the background task. `None` after the loop starts.
     #[allow(clippy::type_complexity)]
     pending_loop: std::sync::Mutex<
         Option<(
             Box<dyn EngineCoreClient + Send>,
             mpsc::UnboundedReceiver<EngineCoreRequest>,
+            mpsc::UnboundedReceiver<EmbedRequest>,
         )>,
     >,
     model_name: String,
@@ -163,11 +172,13 @@ impl AsyncEngine {
         max_model_len: usize,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (embed_tx, embed_rx) = mpsc::unbounded_channel();
 
         Self {
             requests: Arc::new(Mutex::new(HashMap::new())),
             request_tx: tx,
-            pending_loop: std::sync::Mutex::new(Some((client, rx))),
+            embed_tx,
+            pending_loop: std::sync::Mutex::new(Some((client, rx, embed_rx))),
             model_name,
             max_model_len,
             notify: Arc::new(Notify::new()),
@@ -715,6 +726,113 @@ impl AsyncEngine {
     }
 
     // -----------------------------------------------------------------------
+    // Embedding
+    // -----------------------------------------------------------------------
+
+    /// Process an embedding request.
+    ///
+    /// Tokenizes the inputs, sends them to the step loop for embedding,
+    /// and builds the response.
+    pub async fn embeddings(
+        &self,
+        request: protocol::EmbeddingRequest,
+    ) -> ServeResult<protocol::EmbeddingResponse> {
+        let model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| self.model_name.clone());
+
+        // Tokenize inputs into token ID sequences.
+        let token_id_seqs = self.tokenize_embedding_inputs(&request)?;
+        let total_prompt_tokens: u32 = token_id_seqs.iter().map(|s| s.len() as u32).sum();
+
+        // Send to step loop via embed channel.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.embed_tx
+            .send(EmbedRequest {
+                token_id_seqs,
+                reply: reply_tx,
+            })
+            .map_err(|_| ServeError::Internal("embed channel closed".into()))?;
+
+        // Await result.
+        let embeddings = reply_rx
+            .await
+            .map_err(|_| ServeError::Internal("embed reply channel closed".into()))??;
+
+        // Apply optional dimension truncation and re-normalize.
+        let data: Vec<protocol::EmbeddingObject> = embeddings
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut emb)| {
+                if let Some(dims) = request.dimensions
+                    && dims < emb.len()
+                {
+                    emb.truncate(dims);
+                    // Re-normalize after truncation.
+                    let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        for x in &mut emb {
+                            *x /= norm;
+                        }
+                    }
+                }
+                protocol::EmbeddingObject {
+                    index: i,
+                    object: "embedding".to_string(),
+                    embedding: emb,
+                }
+            })
+            .collect();
+
+        Ok(protocol::EmbeddingResponse::new(
+            model,
+            data,
+            protocol::EmbeddingUsage {
+                prompt_tokens: total_prompt_tokens,
+                total_tokens: total_prompt_tokens,
+            },
+        ))
+    }
+
+    /// Tokenize embedding request inputs into token ID sequences.
+    fn tokenize_embedding_inputs(
+        &self,
+        request: &protocol::EmbeddingRequest,
+    ) -> ServeResult<Vec<Vec<u32>>> {
+        match &request.input {
+            protocol::EmbeddingInput::Single(text) => {
+                let ids = self.tokenize_embed_text(text)?;
+                Ok(vec![ids])
+            }
+            protocol::EmbeddingInput::Multiple(items) => {
+                let mut seqs = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        protocol::EmbeddingInputItem::Text(text) => {
+                            seqs.push(self.tokenize_embed_text(text)?);
+                        }
+                        protocol::EmbeddingInputItem::TokenIds(ids) => {
+                            seqs.push(ids.clone());
+                        }
+                    }
+                }
+                Ok(seqs)
+            }
+        }
+    }
+
+    /// Tokenize a single text string for embedding.
+    fn tokenize_embed_text(&self, text: &str) -> ServeResult<Vec<u32>> {
+        if let Some(ref tokenizer) = self.tokenizer {
+            tokenizer.encode(text, false)
+        } else {
+            // Fallback: byte-level tokenization (for testing without a tokenizer).
+            Ok(text.bytes().map(|b| b as u32).collect())
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Engine step loop
     // -----------------------------------------------------------------------
 
@@ -727,7 +845,7 @@ impl AsyncEngine {
     ///
     /// Must be called exactly once. Panics if called twice.
     pub fn spawn_step_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let (client, rx) = self
+        let (client, rx, embed_rx) = self
             .pending_loop
             .lock()
             .expect("spawn_step_loop lock poisoned")
@@ -737,6 +855,7 @@ impl AsyncEngine {
         Self::spawn_step_loop_inner(
             client,
             rx,
+            embed_rx,
             Arc::clone(&self.requests),
             Arc::clone(&self.notify),
         )
@@ -746,11 +865,19 @@ impl AsyncEngine {
     fn spawn_step_loop_inner(
         mut client: Box<dyn EngineCoreClient + Send>,
         mut request_rx: mpsc::UnboundedReceiver<EngineCoreRequest>,
+        mut embed_rx: mpsc::UnboundedReceiver<EmbedRequest>,
         requests: Arc<Mutex<HashMap<String, RequestState>>>,
         notify: Arc<Notify>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
+                // 0. Drain pending embedding requests (synchronous, bypasses scheduler).
+                while let Ok(embed_req) = embed_rx.try_recv() {
+                    let result =
+                        tokio::task::block_in_place(|| client.embed(embed_req.token_id_seqs));
+                    let _ = embed_req.reply.send(result.map_err(ServeError::from));
+                }
+
                 // 1. Drain pending request submissions (non-blocking).
                 //    This never blocks on a mutex — the channel is lock-free.
                 let mut added = false;
@@ -768,14 +895,23 @@ impl AsyncEngine {
                 };
 
                 if !has_requests && !added {
-                    // Block until a new request arrives on the channel.
-                    match request_rx.recv().await {
-                        Some(ec_request) => {
+                    // Block until a new request arrives on either channel.
+                    tokio::select! {
+                        Some(ec_request) = request_rx.recv() => {
                             if let Err(e) = client.add_request(ec_request) {
                                 error!("Failed to add request: {}", e);
                             }
                         }
-                        None => break, // Channel closed, engine dropped.
+                        Some(embed_req) = embed_rx.recv() => {
+                            let result = tokio::task::block_in_place(|| {
+                                client.embed(embed_req.token_id_seqs)
+                            });
+                            let _ = embed_req.reply.send(result.map_err(ServeError::from));
+                            // After handling embed, continue loop to check for more work.
+                            notify.notify_waiters();
+                            continue;
+                        }
+                        else => break, // Both channels closed, engine dropped.
                     }
                 }
 

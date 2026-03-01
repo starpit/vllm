@@ -628,6 +628,19 @@ impl super::MlxModel for MlxLlamaForCausalLM {
     fn num_layers(&self) -> usize {
         self.layers.len()
     }
+
+    fn hidden_states(
+        &mut self,
+        input_ids: &Array,
+        positions: &Array,
+    ) -> mlx_rs::error::Result<Array> {
+        let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+        }
+        self.norm.forward(&hidden_states)
+    }
 }
 
 // ---------------------------------------------------------------------------

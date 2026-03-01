@@ -12,6 +12,7 @@
 pub mod attention;
 pub mod commandr;
 pub mod deepseek_v2;
+pub mod embedding;
 pub mod gemma2;
 pub mod gemma3;
 pub mod grammar;
@@ -362,6 +363,19 @@ pub trait Model: Send {
     ///
     /// Used by callers to create an appropriately-sized KV cache.
     fn num_layers(&self) -> usize;
+
+    /// Run the model backbone and return hidden states (before lm_head).
+    ///
+    /// Used for embedding: a single prefill pass with no KV cache, returning
+    /// the transformer output before the language model head projection.
+    ///
+    /// Default implementation returns an error for models that haven't
+    /// overridden this method.
+    fn hidden_states(&self, _input_ids: &Tensor, _positions: &Tensor) -> ModelResult<Tensor> {
+        Err(vllm_model::error::ModelError::Other(
+            "hidden_states not supported by this model".into(),
+        ))
+    }
 }
 
 /// Factory function type for constructing a model from weights and config.

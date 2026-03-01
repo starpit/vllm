@@ -1,6 +1,6 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-02-28 | Rust port: `vllm-rs/` on branch `feat/rust` (772 tests: 715 unit + 57 e2e, 0 clippy errors)
+> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (856 tests: 791 unit + 65 e2e, 0 clippy errors)
 
 ### Legend
 
@@ -50,7 +50,7 @@
 | [Multimodal / Vision-Language](#multimodal--vision-language) | &#x1F535; | &#x2795; | 0 | 0 | `░░░░░░░░░░` 0/10 |
 | [Structured Output](#structured-output--guided-decoding) | &#x1F535; | &#x1F535; | 12 | 0 | `██████████` 4/4 |
 | [Tool Calling](#tool-calling--function-calling) | &#x1F535; | &#x1F535; | 25 | 0 | `██████████` 7/7 |
-| [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F534; | 0 | 0 | `░░░░░░░░░░` 0/6 |
+| [Embeddings & Pooling](#embeddings--pooling) | &#x1F535; | &#x1F7E2; | 7 | 7 | `████░░░░░░` 2/6 |
 | [Observability & Operations](#observability--operations) | &#x1F535; | &#x1F535; | 15 | 0 | `██████████` 7/7 |
 | [CLI & Deployment](#cli--deployment) | &#x1F535; | &#x1F7E1; | 14 | 0 | `██████████` 14/15 |
 | | | **Total** | **563** | **58** | `█████░░░░░` **105/214** |
@@ -173,7 +173,7 @@
 | `n` parameter (multiple completions) | &#x1F535; | &#x1F535; | 4 | 2 | |
 | Multi-prompt completions | &#x1F535; | &#x1F535; | 2 | 0 | |
 | Chat templates (Jinja2) | &#x1F535; | &#x1F535; | 14 | 3 | |
-| `POST /v1/embeddings` | &#x1F535; | &#x1F534; | — | — | P3 |
+| `POST /v1/embeddings` | &#x1F535; | &#x1F7E2; | — | 7 | P3 |
 | `POST /v1/chat/completions` tool_calls | &#x1F535; | &#x1F535; | 3 | 0 | |
 | `response_format` (JSON mode/schema) | &#x1F535; | &#x1F535; | 6 | 0 | |
 | Anthropic Messages API | &#x1F535; | &#x1F534; | — | — | P2 |
@@ -456,9 +456,9 @@
 
 | Feature | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
-| `/v1/embeddings` endpoint | &#x1F535; | &#x1F534; | — | — | P3 |
+| `/v1/embeddings` endpoint | &#x1F535; | &#x1F7E2; | 7 | 7 | P3 |
 | Pooling execution mode (`--runner pooling`) | &#x1F535; | &#x1F534; | — | — | P3 |
-| Decoder-based embedding (sentence-transformers) | &#x1F535; | &#x1F534; | — | — | P3 |
+| Decoder-based embedding (last-token pooling) | &#x1F535; | &#x1F7E2; | 7 | 7 | P3 |
 | Encoder-only models (BERT, ModernBERT) | &#x1F535; | &#x1F534; | — | — | P2 |
 | Pooling strategies (CLS, mean, last) | &#x1F535; | &#x1F534; | — | — | P3 |
 | Reward / reranking models | &#x1F535; | &#x1F534; | — | — | P1 |

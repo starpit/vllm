@@ -843,6 +843,92 @@ pub struct VersionResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Embedding types
+// ---------------------------------------------------------------------------
+
+/// Embedding request input: a string, array of strings, or array of token IDs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    /// A single string.
+    Single(String),
+    /// Multiple inputs (strings or token IDs).
+    Multiple(Vec<EmbeddingInputItem>),
+}
+
+/// A single item in an embedding request input array.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInputItem {
+    /// A text string.
+    Text(String),
+    /// Pre-tokenized token IDs.
+    TokenIds(Vec<u32>),
+}
+
+/// Embedding request.
+///
+/// Follows the OpenAI API specification:
+/// https://platform.openai.com/docs/api-reference/embeddings/create
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    /// Input text(s) to embed.
+    pub input: EmbeddingInput,
+
+    /// Model identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
+    /// Encoding format: "float" (default). "base64" is deferred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_format: Option<String>,
+
+    /// Matryoshka dimension truncation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<usize>,
+
+    /// User identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// A single embedding object in the response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingObject {
+    pub index: usize,
+    pub object: String,
+    pub embedding: Vec<f32>,
+}
+
+/// Usage information for embedding requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
+/// Embedding response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    pub object: String,
+    pub data: Vec<EmbeddingObject>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
+}
+
+impl EmbeddingResponse {
+    /// Create a new embedding response.
+    pub fn new(model: String, data: Vec<EmbeddingObject>, usage: EmbeddingUsage) -> Self {
+        Self {
+            object: "list".to_string(),
+            data,
+            model,
+            usage,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Default helpers
 // ---------------------------------------------------------------------------
 
@@ -1175,6 +1261,61 @@ mod tests {
         }"#;
         let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.guided_regex.as_deref(), Some("[0-9]+"));
+    }
+
+    // -- Embedding types --
+
+    #[test]
+    fn test_embedding_request_single_string() {
+        let json = r#"{"input": "Hello world", "model": "test"}"#;
+        let req: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(req.input, EmbeddingInput::Single(ref s) if s == "Hello world"));
+        assert_eq!(req.model.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn test_embedding_request_multiple_strings() {
+        let json = r#"{"input": ["Hello", "World"]}"#;
+        let req: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(req.input, EmbeddingInput::Multiple(ref v) if v.len() == 2));
+    }
+
+    #[test]
+    fn test_embedding_request_token_ids() {
+        let json = r#"{"input": [[1, 2, 3], [4, 5]]}"#;
+        let req: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(req.input, EmbeddingInput::Multiple(ref v) if v.len() == 2));
+    }
+
+    #[test]
+    fn test_embedding_request_dimensions() {
+        let json = r#"{"input": "test", "dimensions": 32}"#;
+        let req: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.dimensions, Some(32));
+    }
+
+    #[test]
+    fn test_embedding_response_serde() {
+        let resp = EmbeddingResponse::new(
+            "test-model".to_string(),
+            vec![EmbeddingObject {
+                index: 0,
+                object: "embedding".to_string(),
+                embedding: vec![0.1, 0.2, 0.3],
+            }],
+            EmbeddingUsage {
+                prompt_tokens: 3,
+                total_tokens: 3,
+            },
+        );
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["object"], "list");
+        assert_eq!(
+            parsed["data"][0]["embedding"],
+            serde_json::json!([0.1, 0.2, 0.3])
+        );
+        assert_eq!(parsed["usage"]["prompt_tokens"], 3);
     }
 
     #[test]

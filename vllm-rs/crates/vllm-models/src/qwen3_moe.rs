@@ -563,6 +563,10 @@ impl crate::Model for Qwen3MoeForCausalLM {
     fn num_layers(&self) -> usize {
         self.model.num_layers()
     }
+
+    fn hidden_states(&self, input_ids: &Tensor, positions: &Tensor) -> ModelResult<Tensor> {
+        self.model.forward(input_ids, positions, None)
+    }
 }
 
 /// Factory function for the model registry.

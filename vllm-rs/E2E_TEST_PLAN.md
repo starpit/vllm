@@ -543,6 +543,26 @@ Validate the server handles concurrent requests correctly.
 
 ---
 
+## Phase E12: Embedding — DONE
+
+Test file: `e_embedding.rs`
+
+Tests decoder models as embedding models via the `/v1/embeddings` endpoint. Uses last-token pooling and L2 normalization.
+
+| Test | Model | Description |
+|------|-------|-------------|
+| `test_embedding_single_string` | SmolLM-135M-4bit | Single string → 1 embedding, usage.prompt_tokens > 0 |
+| `test_embedding_multiple_strings` | SmolLM-135M-4bit | 3 strings → 3 embedding objects, same dimensions |
+| `test_embedding_dimensions` | SmolLM-135M-4bit | `dimensions: 32` → embedding truncated to 32 floats |
+| `test_embedding_normalized` | SmolLM-135M-4bit | Embedding L2 norm ≈ 1.0 |
+| `test_embedding_different_inputs` | SmolLM-135M-4bit | Two different strings → cosine similarity < 1.0 |
+| `test_embedding_qwen2` | Qwen2.5-0.5B-4bit | Qwen2 arch produces valid normalized embeddings |
+| `test_embedding_llama3` | Llama-3.2-1B-4bit | LLaMA3 arch produces valid normalized embeddings |
+
+**Deliverables**: 7 E2E tests (all implemented).
+
+---
+
 ## Test Matrix Summary
 
 | Phase | Tests | Models Used | Run Frequency | Estimated Time |
@@ -559,7 +579,8 @@ Validate the server handles concurrent requests correctly.
 | E9. Concurrency | ~6 | SmolLM-135M | Every PR | 2 min |
 | E10. Observability | ~6 | SmolLM-135M | Every PR | 1 min |
 | E11. CLI & Config | ~10 | SmolLM-135M | Every PR | 2 min |
-| **Total** | **~162** | | | **~28 min** |
+| E12. Embedding | 7 (done) | SmolLM / Qwen2 / Llama3 | Every PR | 2 min |
+| **Total** | **~169** | | | **~30 min** |
 
 ### CI Tiers
 

@@ -503,6 +503,11 @@ impl EngineCore {
     // Shutdown
     // -----------------------------------------------------------------------
 
+    /// Compute embeddings, bypassing the scheduler.
+    pub fn embed(&mut self, token_id_seqs: Vec<Vec<u32>>) -> EngineResult<Vec<Vec<f32>>> {
+        self.executor.embed(token_id_seqs)
+    }
+
     /// Shut down the engine core.
     pub fn shutdown(&mut self) {
         if self.is_shutdown {

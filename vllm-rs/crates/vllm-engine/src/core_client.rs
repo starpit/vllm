@@ -53,6 +53,16 @@ pub trait EngineCoreClient {
 
     /// Whether the scheduler is paused.
     fn is_scheduler_paused(&self) -> bool;
+
+    /// Compute embeddings for the given token ID sequences.
+    ///
+    /// Bypasses the scheduler — embedding is a single prefill pass with no
+    /// KV cache or decode loop.
+    fn embed(&mut self, _token_id_seqs: Vec<Vec<u32>>) -> EngineResult<Vec<Vec<f32>>> {
+        Err(crate::error::EngineError::Executor(
+            "embedding not supported".into(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +165,10 @@ impl EngineCoreClient for InprocClient {
 
     fn is_scheduler_paused(&self) -> bool {
         self.engine.is_scheduler_paused()
+    }
+
+    fn embed(&mut self, token_id_seqs: Vec<Vec<u32>>) -> EngineResult<Vec<Vec<f32>>> {
+        self.engine.embed(token_id_seqs)
     }
 }
 

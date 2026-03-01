@@ -138,6 +138,29 @@ impl Client {
         Ok(resp)
     }
 
+    /// POST /v1/embeddings — compute embeddings.
+    pub async fn embedding(
+        &self,
+        request: &vllm_serve::protocol::EmbeddingRequest,
+    ) -> Result<vllm_serve::protocol::EmbeddingResponse> {
+        let resp = self
+            .inner
+            .post(format!("{}/v1/embeddings", self.base_url))
+            .json(request)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("embedding failed with status {status}: {body}");
+        }
+
+        resp.json()
+            .await
+            .context("failed to parse embedding response")
+    }
+
     /// GET /metrics — returns raw Prometheus text.
     pub async fn metrics(&self) -> Result<String> {
         let resp = self

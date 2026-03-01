@@ -66,4 +66,10 @@ impl IntoResponse for ServeError {
     }
 }
 
+impl From<vllm_engine::error::EngineError> for ServeError {
+    fn from(e: vllm_engine::error::EngineError) -> Self {
+        ServeError::Engine(e.to_string())
+    }
+}
+
 pub type ServeResult<T> = Result<T, ServeError>;

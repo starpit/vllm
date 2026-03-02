@@ -306,7 +306,7 @@ fn yarn_get_mscale(scaling_factor: f64, mscale_all_dim: f64) -> f64 {
 ///
 /// `x` shape: `[seq_len, num_heads, head_dim]`
 /// `cos`/`sin` shape: `[seq_len, head_dim]`
-fn apply_rotary_to_tensor(x: &Tensor, cos: &Tensor, sin: &Tensor) -> ModelResult<Tensor> {
+pub fn apply_rotary_to_tensor(x: &Tensor, cos: &Tensor, sin: &Tensor) -> ModelResult<Tensor> {
     let half_dim = x.dim(candle_core::D::Minus1).map_err(ModelError::Candle)? / 2;
 
     // Split x into first half and second half along last dim.

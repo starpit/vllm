@@ -3,10 +3,11 @@
 > Generated 2026-03-01 | Baseline: `feat/rust` branch (889 tests, 0 clippy errors)
 > Goal: feature-for-feature CUDA parity with Python vLLM's V1 engine on NVIDIA GPUs
 >
-> **Progress (2026-03-01)**: Phases 0, 1, 3.1-3.6, 3.8 DONE on `worktree-cuda` branch.
+> **Progress (2026-03-01)**: Phases 0, 1, 3.1-3.8 DONE on `worktree-cuda` branch.
 > E2E verified on L40S (48GB Ada): Qwen2.5-0.5B BF16, first custom CUDA kernel (RMSNorm) compiled.
 > Fused SiLU+mul, GELU+mul, RoPE CUDA kernels added. KernelSet dispatch struct created.
 > Phase 3.5: reshape_and_cache fused kernel for paged KV cache scatter (NHD layout).
+> Phase 3.7: fused QK-norm+RoPE kernel for Gemma3 (per-head RMS norm + NeoX RoPE in single kernel).
 > Phase 3.8: ops.rs auto-dispatches fused kernels into all model forward paths.
 
 ---
@@ -127,7 +128,7 @@ This plan is organized into **7 phases**, roughly ordered by impact and dependen
 | 3.4 | **Fused RoPE kernel** | Port `csrc/pos_encoding_kernels.cu` → `rotary_embedding()`. NeoX-style, per-head rotation. | ✅ (simplified) |
 | 3.5 | **reshape_and_cache fused kernel** | Port `csrc/cache_kernels.cu` for paged KV cache scatter. NHD layout, fused write for scatter_new_kv + write_kv on CUDA. | ✅ (simplified) |
 | 3.6 | **CudaKernelSet struct** | `KernelSet` trait + `CpuKernelSet`/`CudaKernelSet` + `create_kernel_set(device)` factory. | ✅ |
-| 3.7 | **Fused QK-norm+RoPE (optional)** | For Qwen3-style per-head QK normalization. | |
+| 3.7 | **Fused QK-norm+RoPE** | Per-head RMS norm + NeoX RoPE in single kernel. Used by Gemma3. `qk_norm_rope_kernels.cu`, wired via `ops::qk_norm_and_rope()`. 4 GPU unit tests. | ✅ |
 | 3.8 | **Kernel dispatch in model layers** | Wire kernel traits into model forward() methods. `ops.rs` dispatch for all model architectures. | ✅ |
 
 **Simplifications vs Python vLLM (documented in norm.rs, to be upgraded):**

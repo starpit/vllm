@@ -27,4 +27,4 @@ pub use gptq::{GptqConfig, GptqLinear};
 pub use linear::{ColumnParallelLinear, Linear, RowParallelLinear};
 pub use norm::{CohereLayerNorm, GemmaRmsNorm, LayerNorm, RmsNorm};
 pub use quantized_linear::QuantizedLinear;
-pub use rotary::RotaryEmbedding;
+pub use rotary::{RotaryEmbedding, apply_rotary_to_tensor};

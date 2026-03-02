@@ -456,12 +456,19 @@ impl Gemma3Attention {
             .reshape((num_tokens, self.num_kv_heads, self.head_dim))
             .map_err(ModelError::Candle)?;
 
-        // Per-head QK norms: GemmaRmsNorm normalizes last dim (head_dim).
-        let q = crate::ops::gemma_rms_norm(&q, &self.q_norm).map_err(ModelError::Candle)?;
-        let k = crate::ops::gemma_rms_norm(&k, &self.k_norm).map_err(ModelError::Candle)?;
-
-        // RoPE
-        let (q, k) = self.rotary_emb.apply(&q, &k, positions)?;
+        // Fused per-head QK norm + RoPE: on CUDA this is a single kernel,
+        // on CPU it falls back to separate norm + rotation.
+        let (q, k) = crate::ops::qk_norm_and_rope(
+            &q,
+            &k,
+            self.q_norm.weight(),
+            self.k_norm.weight(),
+            self.q_norm.eps(),
+            self.rotary_emb.cos_cache(),
+            self.rotary_emb.sin_cache(),
+            positions,
+        )
+        .map_err(ModelError::Candle)?;
 
         // Cache-merge + attention
         let attn_output =

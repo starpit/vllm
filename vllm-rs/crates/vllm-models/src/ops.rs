@@ -84,3 +84,57 @@ pub fn gemma_rms_norm(input: &Tensor, norm: &GemmaRmsNorm) -> candle_core::Resul
     }
     candle_core::Module::forward(norm, input)
 }
+
+// ---------------------------------------------------------------------------
+// Fused QK-norm + RoPE dispatch
+// ---------------------------------------------------------------------------
+
+/// Fused per-head QK RMS normalization + NeoX RoPE rotation.
+///
+/// On CUDA: single fused kernel (no intermediate global memory round-trip).
+/// On CPU: separate RMS norm + RoPE via candle ops.
+///
+/// * `query` — `[num_tokens, num_q_heads, head_dim]`
+/// * `key` — `[num_tokens, num_kv_heads, head_dim]`
+/// * `q_weight`, `k_weight` — `[head_dim]` (effective weight, already +1 for Gemma)
+/// * `epsilon` — norm epsilon
+/// * `cos_cache`, `sin_cache` — `[max_pos, head_dim]`
+/// * `positions` — `[num_tokens]` (u32)
+#[allow(clippy::too_many_arguments)]
+pub fn qk_norm_and_rope(
+    query: &Tensor,
+    key: &Tensor,
+    q_weight: &Tensor,
+    k_weight: &Tensor,
+    epsilon: f64,
+    cos_cache: &Tensor,
+    sin_cache: &Tensor,
+    positions: &Tensor,
+) -> candle_core::Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    if query.device().is_cuda() {
+        use vllm_kernels::norm::CudaNormKernels;
+        return CudaNormKernels
+            .qk_norm_and_rope(
+                query, key, q_weight, k_weight, epsilon, cos_cache, sin_cache, positions,
+            )
+            .map_err(kernel_err);
+    }
+
+    // CPU fallback: separate norm + RoPE.
+    use vllm_kernels::norm::{CpuNormKernels, NormKernels};
+    let q_normed = CpuNormKernels
+        .rms_norm(query, q_weight, epsilon)
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+    let k_normed = CpuNormKernels
+        .rms_norm(key, k_weight, epsilon)
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+    let cos = cos_cache.index_select(positions, 0)?;
+    let sin = sin_cache.index_select(positions, 0)?;
+    let q_rot = vllm_model::layers::apply_rotary_to_tensor(&q_normed, &cos, &sin)
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+    let k_rot = vllm_model::layers::apply_rotary_to_tensor(&k_normed, &cos, &sin)
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+    Ok((q_rot, k_rot))
+}

@@ -16,12 +16,14 @@ fn main() {
             .file("csrc/layernorm_kernels.cu")
             .file("csrc/activation_kernels.cu")
             .file("csrc/pos_encoding_kernels.cu")
-            .file("csrc/cache_kernels.cu");
+            .file("csrc/cache_kernels.cu")
+            .file("csrc/qk_norm_rope_kernels.cu");
         build.compile("vllm_kernels");
 
         println!("cargo:rerun-if-changed=csrc/layernorm_kernels.cu");
         println!("cargo:rerun-if-changed=csrc/activation_kernels.cu");
         println!("cargo:rerun-if-changed=csrc/pos_encoding_kernels.cu");
         println!("cargo:rerun-if-changed=csrc/cache_kernels.cu");
+        println!("cargo:rerun-if-changed=csrc/qk_norm_rope_kernels.cu");
     }
 }

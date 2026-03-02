@@ -17,6 +17,7 @@ pub mod mixtral;
 pub mod phi3;
 pub mod quantized_llama;
 pub mod qwen3_moe;
+pub mod qwen3_next;
 pub mod siglip;
 
 use std::collections::HashMap;
@@ -74,6 +75,11 @@ pub trait MlxModel: Send {
 
     /// Provide multimodal data (images) for the next forward pass.
     fn set_mm_data(&mut self, _mm_data: Option<vllm_common::MultimodalData>) {}
+
+    /// Reset recurrent state for hybrid models (e.g., GDN linear attention).
+    ///
+    /// Called before each request's forward pass. Default: no-op.
+    fn reset_recurrent_state(&self) {}
 
     /// Run the model backbone and return hidden states (before lm_head).
     ///
@@ -186,6 +192,12 @@ impl MlxModelRegistry {
         registry.register_quantized(
             "Qwen2MoeForCausalLM",
             qwen3_moe::create_mlx_quantized_qwen3_moe,
+        );
+        // Qwen3-Next — hybrid GDN + full attention + MoE
+        registry.register("Qwen3NextForCausalLM", qwen3_next::create_mlx_qwen3_next);
+        registry.register_quantized(
+            "Qwen3NextForCausalLM",
+            qwen3_next::create_mlx_quantized_qwen3_next,
         );
         // Mixtral — LLaMA-like attention + MoE (all layers), no shared expert
         registry.register("MixtralForCausalLM", mixtral::create_mlx_mixtral);

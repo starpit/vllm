@@ -1542,6 +1542,11 @@ impl Worker for CandleWorker {
 
         let mut per_req_logits = Vec::with_capacity(req_inputs.len());
         for req_input in &req_inputs {
+            // Reset recurrent state for hybrid models (e.g., Qwen3-Next GDN layers).
+            // Each request processes independently; GDN state doesn't persist across
+            // different requests in the same step.
+            model.reset_recurrent_state();
+
             let mm_data = self.mm_data_map.remove(&req_input.req_id);
             model.set_mm_data(mm_data);
 

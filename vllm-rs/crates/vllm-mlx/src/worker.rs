@@ -973,6 +973,9 @@ impl Worker for MlxWorker {
         let mut lazy_outputs: Vec<LazyReqOutput> = Vec::with_capacity(req_inputs.len());
 
         for req_input in &req_inputs {
+            // Reset recurrent state for hybrid models (e.g., Qwen3-Next GDN layers).
+            model.reset_recurrent_state();
+
             let input_ids = Array::from_iter(
                 req_input.token_ids.iter().map(|&t| t as i32),
                 &[req_input.token_ids.len() as i32],

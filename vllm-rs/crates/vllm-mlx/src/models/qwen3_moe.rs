@@ -139,7 +139,7 @@ impl MlxQwen3MoeConfig {
 // ---------------------------------------------------------------------------
 
 /// Mixture of Experts layer with sigmoid-gated shared expert (MLX float).
-struct MlxQwen3MoeMoE {
+pub(crate) struct MlxQwen3MoeMoE {
     gate: nn::Linear,
     experts: Vec<MlxLlamaMLP>,
     shared_expert: Option<MlxLlamaMLP>,
@@ -149,7 +149,7 @@ struct MlxQwen3MoeMoE {
 }
 
 impl MlxQwen3MoeMoE {
-    fn new(config: &MlxQwen3MoeConfig) -> Result<Self, Exception> {
+    pub(crate) fn new(config: &MlxQwen3MoeConfig) -> Result<Self, Exception> {
         let hidden = config.hidden_size as i32;
         let n = config.num_experts;
 
@@ -183,7 +183,7 @@ impl MlxQwen3MoeMoE {
         })
     }
 
-    fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) {
+    pub(crate) fn load_weights(&mut self, weights: &HashMap<String, Array>, prefix: &str) {
         assign_weight(
             &mut self.gate.weight,
             weights,
@@ -206,7 +206,7 @@ impl MlxQwen3MoeMoE {
         }
     }
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+    pub(crate) fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         // Evaluate x for routing decisions.
         mlx_rs::transforms::eval(std::iter::once(x))?;
 

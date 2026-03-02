@@ -28,6 +28,7 @@ pub mod ops;
 pub mod quantized_llama;
 pub mod qwen2;
 pub mod qwen3_moe;
+pub mod qwen3_next;
 pub mod registry;
 pub mod sampler;
 pub mod siglip;
@@ -494,7 +495,16 @@ pub trait Model: Send {
     /// Number of transformer layers in this model.
     ///
     /// Used by callers to create an appropriately-sized KV cache.
+    /// For hybrid models (e.g., Qwen3-Next), returns the number of layers
+    /// that use KV cache (full attention layers only).
     fn num_layers(&self) -> usize;
+
+    /// Reset recurrent state for hybrid models (e.g., GDN linear attention).
+    ///
+    /// Called before each request's forward pass so that recurrent layers
+    /// (conv state, SSM state) start fresh. Default: no-op for standard
+    /// transformer models.
+    fn reset_recurrent_state(&self) {}
 
     /// Run the model backbone and return hidden states (before lm_head).
     ///

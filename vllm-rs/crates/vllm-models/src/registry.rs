@@ -94,6 +94,8 @@ impl ModelRegistry {
         // Command R (Cohere) — CohereLayerNorm, parallel attn+MLP, logit scaling,
         // interleaved RoPE
         self.register("CohereForCausalLM", crate::commandr::create_commandr);
+        // Qwen3-Next — hybrid GDN linear attention + full attention + MoE
+        self.register("Qwen3NextForCausalLM", crate::qwen3_next::create_qwen3_next);
         // Kimi K2.5 — text backbone is DeepSeek V2/V3 (config unwrapped + weights
         // prefix-stripped by worker before calling factory)
         self.register("KimiK25ForCausalLM", crate::deepseek_v2::create_deepseek_v2);

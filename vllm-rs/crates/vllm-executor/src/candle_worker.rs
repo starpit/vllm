@@ -1061,16 +1061,24 @@ impl Worker for CandleWorker {
                 .map_err(|e| ExecutorError::WorkerInit(format!("CUDA memory query failed: {e}")));
         }
 
-        // CPU / Metal fallback: use system RAM.
-        use sysinfo::System;
-        let sys = System::new_with_specifics(
-            sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
-        );
-        let available = sys.available_memory() as usize;
-        // Sanity: if sysinfo reports 0 (shouldn't happen), fall back to 4 GiB.
-        if available == 0 {
-            return Ok(4 * 1024 * 1024 * 1024);
-        }
+        // CPU / Metal fallback: query system RAM directly via libc instead of
+        // the `sysinfo` crate (which is surprisingly expensive).
+        //
+        // On Linux, _SC_AVPHYS_PAGES gives free pages (conservative "available").
+        // On macOS, only _SC_PHYS_PAGES exists — report total physical memory
+        // (the candle-Metal path is rare; MLX is the primary macOS backend).
+        #[cfg(target_os = "linux")]
+        let pages = unsafe { libc::sysconf(libc::_SC_AVPHYS_PAGES) };
+        #[cfg(not(target_os = "linux"))]
+        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let available = if pages > 0 && page_size > 0 {
+            (pages as usize) * (page_size as usize)
+        } else {
+            // Fallback: 4 GiB.
+            4 * 1024 * 1024 * 1024
+        };
         Ok(available)
     }
 

@@ -623,11 +623,23 @@ impl Worker for MlxWorker {
         // Apple Silicon uses unified memory — GPU and CPU share the same pool.
         // Report total physical memory (not just "available") since MLX manages
         // its own memory pool and the OS will page out inactive data as needed.
-        use sysinfo::System;
-        let sys = System::new_with_specifics(
-            sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
-        );
-        let total = sys.total_memory() as usize;
+        //
+        // Use sysctl directly instead of the `sysinfo` crate, which is
+        // surprisingly expensive (~10-50ms) due to process enumeration.
+        let total = unsafe {
+            let mut memsize: u64 = 0;
+            let mut size = std::mem::size_of::<u64>();
+            let mut mib = [libc::CTL_HW, libc::HW_MEMSIZE];
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                &mut memsize as *mut u64 as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            );
+            memsize as usize
+        };
         if total == 0 {
             return Ok(8 * 1024 * 1024 * 1024);
         }

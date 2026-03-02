@@ -55,7 +55,7 @@ thiserror = "2"
 anyhow = "1"
 
 # System info
-sysinfo = "0.33"
+libc = "0.2"
 
 # Collections / utilities
 indexmap = { version = "2", features = ["serde"] }

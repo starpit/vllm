@@ -37,7 +37,7 @@
 
 | Feature Group | Python | Rust Parity | +Rust | Unit | E2E |
 |---|---:|---|---:|---:|---:|
-| [Model Architectures](#model-architectures) | 36 | `███░░░░░░░` 11/36 | 26 | 100 | 25 |
+| [Model Architectures](#model-architectures) | 36 | `███░░░░░░░` 12/36 | 30 | 108 | 25 |
 | [Quantization](#quantization) | 11 | `██░░░░░░░░` 3/11 | 1 | 39 | 8 |
 | [Serving / OpenAI API](#serving--openai-api) | 24 | `███████░░░` 17/24 | 0 | 104 | 24 |
 | [Sampling & Decoding](#sampling--decoding) | 19 | `██████████` 19/19 | 0 | 53 | 13 |
@@ -49,7 +49,7 @@
 | [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | 12 | `████░░░░░░` 5/12 | 0 | 25 | 0 |
 | [LoRA / Adapters](#lora--adapters) | 5 | `████░░░░░░` 2/5 | 0 | 12 | 8 |
 | [Speculative Decoding](#speculative-decoding) | 5 | `██░░░░░░░░` 1/5 | 0 | 20 | 0 |
-| [Multimodal / Vision-Language](#multimodal--vision-language) | 10 | `░░░░░░░░░░` 0/10 | 0 | 0 | 0 |
+| [Multimodal / Vision-Language](#multimodal--vision-language) | 10 | `██░░░░░░░░` 2/10 | 4 | 8 | 0 |
 | [Structured Output](#structured-output--guided-decoding) | 4 | `██████████` 4/4 | 0 | 12 | 0 |
 | [Tool Calling](#tool-calling--function-calling) | 7 | `██████████` 7/7 | 0 | 25 | 0 |
 | [Embeddings & Pooling](#embeddings--pooling) | 8 | `██████░░░░` 5/8 | 0 | 19 | 10 |
@@ -91,6 +91,7 @@
 | Phi-1 / Phi-2 | &#x1F535; | &#x1F534; | — | — | P1 |
 | Phi-4 (via Phi3ForCausalLM + LongRoPE) | &#x1F535; | &#x1F535; | 0 | 4 | |
 | Gemma 3 (text-only) | &#x1F535; | &#x1F535; | 9 | 0 | |
+| Gemma 3 VLM (SigLIP + projector + LM) | &#x1F535; | &#x1F535; | 4 | 3 | |
 | ChatGLM / GLM-4 | &#x1F535; | &#x1F534; | — | — | P2 |
 | Baichuan | &#x1F535; | &#x1F534; | — | — | P1 |
 | DBRX | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -132,6 +133,8 @@
 | Qwen2 MoE (float + quantized) | N/A | &#x1F535; | 0 | 0 | |
 | Gemma 3 (text-only) | N/A | &#x1F535; | 5 | 4 | |
 | Quantized Gemma 3 (4-bit) | N/A | &#x1F535; | 0 | 4 | |
+| Gemma 3 VLM (float, SigLIP + projector + LM) | N/A | &#x1F535; | 0 | 5 | |
+| Quantized Gemma 3 VLM (4-bit LM, float vision) | N/A | &#x1F535; | 0 | 5 | |
 | Kimi K2.5 text-only (via DeepSeek V2) | N/A | &#x1F535; | 0 | 0 | |
 | Quantized Kimi K2.5 text-only (4-bit) | N/A | &#x1F535; | 0 | 0 | |
 | Mixtral (MoE, float) | N/A | &#x1F535; | 3 | 0 | |
@@ -418,16 +421,18 @@
 
 | Feature | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
-| Image input processing | &#x1F535; | &#x1F534; | — | — | P3 |
+| Image input processing (base64 data URI) | &#x1F535; | &#x1F535; | 0 | 5 | |
 | LLaVA | &#x1F535; | &#x1F534; | — | — | P2 |
 | Qwen-VL / Qwen2.5-VL | &#x1F535; | &#x1F534; | — | — | P3 |
 | Pixtral | &#x1F535; | &#x1F534; | — | — | P2 |
 | InternVL | &#x1F535; | &#x1F534; | — | — | P2 |
 | Phi-3V / Phi-4MM | &#x1F535; | &#x1F534; | — | — | P2 |
-| Gemma 3 multimodal | &#x1F535; | &#x1F534; | — | — | P2 |
+| Gemma 3 multimodal (SigLIP vision + projector) | &#x1F535; | &#x1F535; | 4 | 8 | |
 | Molmo | &#x1F535; | &#x1F534; | — | — | P1 |
 | PaliGemma | &#x1F535; | &#x1F534; | — | — | P1 |
 | Audio models (Whisper, Qwen-Audio) | &#x1F535; | &#x1F534; | — | — | P1 |
+
+> **Gemma 3 VLM implementation**: Full `Gemma3ForConditionalGeneration` support on both Candle (CPU/CUDA) and MLX (Metal) backends, including quantized MLX models (4-bit language model with float vision tower). Architecture: SigLIP vision encoder → AvgPool2d → GemmaRMSNorm → projection → merge with text embeddings → Gemma3 language model. Image input via OpenAI-compatible base64 data URI in chat messages. Unit tests: 2 weight-name validation (against real HF checkpoints), 1 projector shape, 1 config parsing. E2E: 3 Candle (server start, text-only chat, max_tokens) + 5 MLX (server start, text-only, image chat, image stream, image max_tokens).
 
 ---
 

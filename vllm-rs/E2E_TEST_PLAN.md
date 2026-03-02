@@ -790,11 +790,11 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_batch -- --ignore
 
 ---
 
-## Phase E17: Multimodal / Vision-Language — DONE
+## Phase E17: Multimodal / Vision-Language — DONE (verified 2026-03-02)
 
 Test files: `e_multimodal.rs` (MLX), `e_gemma3_vlm.rs` (Candle)
 
-Tests Gemma3ForConditionalGeneration — a VLM with SiglipVisionModel + projector + Gemma3 text backbone. The multimodal config.json stores text model params under a nested `text_config` that relies on transformers defaults for many fields (vocab_size, head_dim, num_attention_heads, etc.). These tests catch regressions in config parsing for both MLX and Candle backends.
+Tests Gemma3ForConditionalGeneration — a VLM with SigLIP vision encoder + AvgPool2d → GemmaRMSNorm → projection + Gemma3 text backbone. Supports both float and quantized (4-bit) models on MLX. Weight prefixes: `vision_tower.vision_model.*`, `multi_modal_projector.*`, `language_model.model.*`. Unit tests in `gemma3_mm.rs` validate weight names against real HF checkpoints to catch prefix mismatches without downloading models.
 
 ### MLX path (`e_multimodal.rs` — Tier 3, nightly)
 
@@ -816,14 +816,14 @@ Tests Gemma3ForConditionalGeneration — a VLM with SiglipVisionModel + projecto
 
 Run commands:
 ```bash
-# MLX backend (~2.8 GB model):
-cargo test -p vllm-e2e --features e2e,metal --test e_multimodal -- --ignored --test-threads=1
+# MLX backend (~2.8 GB model, use --release for Metal performance):
+cargo test -p vllm-e2e --features e2e,metal --release --test e_multimodal -- --ignored --test-threads=1
 
 # Candle backend (~8 GB BF16 model):
-cargo test -p vllm-e2e --features e2e --test e_gemma3_vlm -- --ignored --test-threads=1
+cargo test -p vllm-e2e --features e2e,metal --release --test e_gemma3_vlm -- --ignored --test-threads=1
 ```
 
-**Deliverables**: 8 E2E tests (all implemented). Covers both MLX quantized and Candle BF16 paths.
+**Deliverables**: 8 E2E tests (all implemented and verified). Covers both MLX quantized and Candle BF16 paths. Candle tests verified 2026-03-02 (3/3 passed in 7.4s with --release).
 
 ---
 

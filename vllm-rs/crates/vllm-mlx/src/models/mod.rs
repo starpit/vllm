@@ -163,6 +163,10 @@ impl MlxModelRegistry {
             "Gemma3ForConditionalGeneration",
             gemma3_mm::create_mlx_gemma3_mm,
         );
+        registry.register_quantized(
+            "Gemma3ForConditionalGeneration",
+            gemma3_mm::create_mlx_quantized_gemma3_mm,
+        );
         // Phi-3 (fused qkv_proj + gate_up_proj)
         registry.register("Phi3ForCausalLM", phi3::create_mlx_phi3);
         registry.register_quantized("Phi3ForCausalLM", phi3::create_mlx_quantized_phi3);

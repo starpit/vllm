@@ -598,7 +598,7 @@ impl Gemma3DecoderLayer {
 ///
 /// Embedding (* sqrt(hidden_size)) -> N decoder layers -> final GemmaRMS norm.
 pub struct Gemma3Model {
-    embed_tokens: Embedding,
+    pub(crate) embed_tokens: Embedding,
     layers: Vec<Gemma3DecoderLayer>,
     norm: GemmaRmsNorm,
     /// Embedding normalizer: sqrt(hidden_size).
@@ -704,7 +704,7 @@ impl Gemma3Model {
 pub struct Gemma3ForCausalLM {
     pub(crate) model: Gemma3Model,
     pub(crate) lm_head: Linear,
-    final_logit_softcapping: Option<f64>,
+    pub(crate) final_logit_softcapping: Option<f64>,
 }
 
 impl Gemma3ForCausalLM {

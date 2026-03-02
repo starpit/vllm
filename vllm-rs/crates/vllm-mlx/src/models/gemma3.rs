@@ -974,9 +974,24 @@ impl MlxQuantizedGemma3ForCausalLM {
         _dtype: Dtype,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let weights = load_safetensors_weights(model_dir)?;
+        let model = Self::from_weights(&weights, "model", config, qc)?;
+        mlx_rs::transforms::eval(weights.values())?;
+        Ok(model)
+    }
 
-        let embed_tokens =
-            MlxEmbedTokens::from_weights(&weights, "model.embed_tokens", qc.group_size, qc.bits);
+    /// Build from a pre-loaded weight map with a configurable prefix.
+    pub(crate) fn from_weights(
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        config: &MlxGemma3Config,
+        qc: &QuantConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let embed_tokens = MlxEmbedTokens::from_weights(
+            weights,
+            &format!("{prefix}.embed_tokens"),
+            qc.group_size,
+            qc.bits,
+        );
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
@@ -987,8 +1002,8 @@ impl MlxQuantizedGemma3ForCausalLM {
                     None
                 };
             layers.push(MlxQuantizedGemma3DecoderLayer::from_weights(
-                &weights,
-                &format!("model.layers.{i}"),
+                weights,
+                &format!("{prefix}.layers.{i}"),
                 config,
                 qc,
                 i,
@@ -999,9 +1014,7 @@ impl MlxQuantizedGemma3ForCausalLM {
         let mut norm = nn::RmsNormBuilder::new(config.hidden_size as i32)
             .eps(config.rms_norm_eps)
             .build()?;
-        assign_gemma_norm_weight(&mut norm, &weights, "model.norm.weight");
-
-        mlx_rs::transforms::eval(weights.values())?;
+        assign_gemma_norm_weight(&mut norm, weights, &format!("{prefix}.norm.weight"));
 
         Ok(Self {
             embed_tokens,
@@ -1011,6 +1024,37 @@ impl MlxQuantizedGemma3ForCausalLM {
             final_logit_softcapping: config.final_logit_softcapping,
             config: config.clone(),
         })
+    }
+
+    pub(crate) fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Embed token IDs and scale by sqrt(hidden_size).
+    pub(crate) fn embed(&mut self, input_ids: &Array) -> Result<Array, Exception> {
+        let hidden_states = self.embed_tokens.forward(input_ids)?;
+        hidden_states.multiply(Array::from_f32(self.normalizer))
+    }
+
+    /// Run backbone on pre-computed embeddings → hidden states → logits.
+    pub(crate) fn forward_embeds(
+        &mut self,
+        inputs_embeds: &Array,
+        positions: &Array,
+        kv_cache: &mut MlxKvCache,
+    ) -> Result<Array, Exception> {
+        let mut hidden_states = inputs_embeds.clone();
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+        }
+        hidden_states = self.norm.forward(&hidden_states)?;
+        let logits = self.embed_tokens.as_linear(&hidden_states)?;
+        let logits = if let Some(cap) = self.final_logit_softcapping {
+            MlxGemma3ForCausalLM::apply_softcap(&logits, cap)?
+        } else {
+            logits
+        };
+        logits.as_dtype(Dtype::Float32)
     }
 }
 

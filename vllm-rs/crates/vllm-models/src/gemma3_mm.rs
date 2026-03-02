@@ -4,22 +4,27 @@
 //! Gemma 3 multimodal (vision-language) model for Candle.
 //!
 //! Implements `Gemma3ForConditionalGeneration` which wraps:
-//! - `SiglipVisionModel` — vision encoder (Step 4)
-//! - `Gemma3MultiModalProjector` — linear→GELU→linear projector
+//! - `SiglipVisionModel` — vision encoder
+//! - `Gemma3MultiModalProjector` — AvgPool2d → GemmaRMSNorm → matmul(projection_weight)
 //! - `Gemma3ForCausalLM` — existing text-only language model
 //!
 //! The VLM model processes images through the vision encoder, projects them
 //! into the LLM's embedding space, merges with text embeddings at placeholder
 //! positions, and runs the language model backbone.
+//!
+//! Weight prefix mapping (HF checkpoint → code):
+//! - `vision_tower.vision_model.*` → vision encoder
+//! - `multi_modal_projector.*` → projector
+//! - `language_model.model.*` → text backbone
 
 use candle_core::{DType, Device, Module, Tensor};
 
 use vllm_common::multimodal::MultimodalData;
 use vllm_model::error::{ModelError, ModelResult};
-use vllm_model::layers::Linear;
+use vllm_model::layers::{GemmaRmsNorm, Linear};
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
-use crate::gemma3::{Gemma3Config, Gemma3ForCausalLM};
+use crate::gemma3::{Gemma3Config, Gemma3ForCausalLM, Gemma3Model};
 use crate::siglip::{SiglipVisionConfig, SiglipVisionModel};
 
 // ---------------------------------------------------------------------------
@@ -33,13 +38,19 @@ pub struct Gemma3VisionModelConfig {
     /// Text model config.
     text_config: Gemma3Config,
     /// Hidden size of the vision encoder.
+    #[allow(dead_code)]
     vision_hidden_size: usize,
     /// Projection dimension (usually same as text hidden size).
+    #[allow(dead_code)]
     projection_dim: usize,
     /// Token ID for image placeholders.
     image_token_index: u32,
     /// Number of image tokens per image in the token sequence.
     mm_tokens_per_image: usize,
+    /// Number of patches per side: image_size / patch_size.
+    patches_per_image: usize,
+    /// AvgPool2d kernel size: patches_per_image / tokens_per_side.
+    pool_kernel_size: usize,
 }
 
 impl Gemma3VisionModelConfig {
@@ -76,6 +87,10 @@ impl Gemma3VisionModelConfig {
             .map(|v| v as usize)
             .unwrap_or(vision_config.num_patches());
 
+        let patches_per_image = vision_config.image_size / vision_config.patch_size;
+        let tokens_per_side = (mm_tokens_per_image as f64).sqrt() as usize;
+        let pool_kernel_size = patches_per_image / tokens_per_side;
+
         Ok(Self {
             vision_config,
             text_config,
@@ -83,6 +98,8 @@ impl Gemma3VisionModelConfig {
             projection_dim,
             image_token_index,
             mm_tokens_per_image,
+            patches_per_image,
+            pool_kernel_size,
         })
     }
 }
@@ -93,58 +110,124 @@ impl Gemma3VisionModelConfig {
 
 /// Projects vision encoder hidden states into the LLM's embedding space.
 ///
-/// Architecture: Linear → GELU → Linear
+/// Architecture: AvgPool2d → GemmaRMSNorm → matmul(projection_weight)
+///
+/// Port of: `vllm/model_executor/models/gemma3_mm.py::Gemma3MultiModalProjector`
 struct Gemma3MultiModalProjector {
-    linear_1: Linear,
-    linear_2: Linear,
+    /// Raw projection weight `[vision_hidden, text_hidden]`.
+    mm_input_projection_weight: Tensor,
+    /// GemmaRMSNorm applied after pooling.
+    mm_soft_emb_norm: GemmaRmsNorm,
+    /// Number of vision patches per side (image_size / patch_size).
+    patches_per_image: usize,
+    /// AvgPool2d kernel/stride size.
+    kernel_size: usize,
 }
 
 impl Gemma3MultiModalProjector {
     fn load(
         weights: &ModelWeights,
         prefix: &str,
-        vision_hidden_size: usize,
-        projection_dim: usize,
+        patches_per_image: usize,
+        kernel_size: usize,
+        norm_eps: f64,
         dtype: DType,
     ) -> ModelResult<Self> {
-        let linear_1 = Linear::load(weights, &format!("{prefix}.linear_1"), dtype)?;
-        let linear_2 = Linear::load(weights, &format!("{prefix}.linear_2"), dtype)?;
+        let mm_input_projection_weight =
+            weights.get_cast(&format!("{prefix}.mm_input_projection_weight"), dtype)?;
+        let mm_soft_emb_norm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.mm_soft_emb_norm"),
+            norm_eps,
+            dtype,
+        )?;
 
-        // Verify dimensions.
-        if linear_1.in_features() != vision_hidden_size {
-            return Err(ModelError::Other(format!(
-                "projector linear_1 in_features {} != vision_hidden_size {}",
-                linear_1.in_features(),
-                vision_hidden_size,
-            )));
-        }
-        if linear_2.out_features() != projection_dim {
-            return Err(ModelError::Other(format!(
-                "projector linear_2 out_features {} != projection_dim {}",
-                linear_2.out_features(),
-                projection_dim,
-            )));
-        }
-
-        Ok(Self { linear_1, linear_2 })
+        Ok(Self {
+            mm_input_projection_weight,
+            mm_soft_emb_norm,
+            patches_per_image,
+            kernel_size,
+        })
     }
 
-    fn forward(&self, x: &Tensor) -> ModelResult<Tensor> {
-        let h = self.linear_1.forward(x).map_err(ModelError::Candle)?;
-        let h = h.gelu().map_err(ModelError::Candle)?;
-        self.linear_2.forward(&h).map_err(ModelError::Candle)
+    /// Forward: vision_outputs `[B, num_patches, vision_hidden]` → `[B, pooled_tokens, text_hidden]`
+    fn forward(&self, vision_outputs: &Tensor) -> ModelResult<Tensor> {
+        let (batch, _num_patches, seq_length) =
+            vision_outputs.dims3().map_err(ModelError::Candle)?;
+
+        // Transpose: [B, num_patches, vision_hidden] → [B, vision_hidden, num_patches]
+        let x = vision_outputs.transpose(1, 2).map_err(ModelError::Candle)?;
+
+        // Reshape to 2D grid: [B, vision_hidden, grid, grid]
+        let grid = self.patches_per_image;
+        let x = x
+            .reshape((batch, seq_length, grid, grid))
+            .map_err(ModelError::Candle)?;
+
+        // AvgPool2d with kernel_size stride — reshape blocks and mean.
+        let k = self.kernel_size;
+        let out_grid = grid / k;
+        // [B, C, grid, grid] → [B, C, out_grid, k, out_grid, k]
+        let x = x
+            .reshape((batch, seq_length, out_grid, k, out_grid, k))
+            .map_err(ModelError::Candle)?;
+        // Mean over the two kernel dims (3 and 5).
+        let x = x
+            .mean_keepdim(5)
+            .map_err(ModelError::Candle)?
+            .mean_keepdim(3)
+            .map_err(ModelError::Candle)?;
+        // Squeeze: [B, C, out_grid, 1, out_grid, 1] → [B, C, out_grid, out_grid]
+        let x = x
+            .reshape((batch, seq_length, out_grid, out_grid))
+            .map_err(ModelError::Candle)?;
+
+        // Flatten spatial: [B, C, out_grid, out_grid] → [B, C, pooled_tokens]
+        let pooled_tokens = out_grid * out_grid;
+        let x = x
+            .reshape((batch, seq_length, pooled_tokens))
+            .map_err(ModelError::Candle)?;
+
+        // Transpose: [B, C, pooled_tokens] → [B, pooled_tokens, C]
+        let x = x.transpose(1, 2).map_err(ModelError::Candle)?;
+
+        // GemmaRMSNorm (operates on last dim).
+        let x = self
+            .mm_soft_emb_norm
+            .forward(&x)
+            .map_err(ModelError::Candle)?;
+
+        // Matmul with projection weight: flatten to 2D for candle compatibility.
+        // [B, pooled_tokens, vision_hidden] → [B*pooled_tokens, vision_hidden]
+        let (b, t, _c) = x.dims3().map_err(ModelError::Candle)?;
+        let x = x.reshape((b * t, ())).map_err(ModelError::Candle)?;
+        // [B*pooled_tokens, vision_hidden] @ [vision_hidden, text_hidden] → [B*pooled_tokens, text_hidden]
+        let x = x
+            .matmul(&self.mm_input_projection_weight)
+            .map_err(ModelError::Candle)?;
+        // Reshape back: [B, pooled_tokens, text_hidden]
+        let text_hidden = x.dim(1).map_err(ModelError::Candle)?;
+        x.reshape((b, t, text_hidden)).map_err(ModelError::Candle)
     }
 
     #[cfg(test)]
     fn zeros(
         vision_hidden_size: usize,
         projection_dim: usize,
+        patches_per_image: usize,
+        kernel_size: usize,
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
+        let mm_input_projection_weight =
+            Tensor::zeros((vision_hidden_size, projection_dim), dtype, device)
+                .map_err(ModelError::Candle)?;
+        let mm_soft_emb_norm = GemmaRmsNorm::zeros(vision_hidden_size, 1e-6, dtype, device)?;
         Ok(Self {
-            linear_1: Linear::zeros(vision_hidden_size, projection_dim, dtype, device)?,
-            linear_2: Linear::zeros(projection_dim, projection_dim, dtype, device)?,
+            mm_input_projection_weight,
+            mm_soft_emb_norm,
+            patches_per_image,
+            kernel_size,
         })
     }
 }
@@ -175,23 +258,42 @@ impl Gemma3ForConditionalGeneration {
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
+        // Vision tower — weights prefixed with "vision_tower.vision_model."
         let vision_tower = SiglipVisionModel::load(
             weights,
-            "model.vision_tower.vision_model",
+            "vision_tower.vision_model",
             &config.vision_config,
             dtype,
         )?;
 
+        // Projector — weights prefixed with "multi_modal_projector."
         let multi_modal_projector = Gemma3MultiModalProjector::load(
             weights,
-            "model.multi_modal_projector",
-            config.vision_hidden_size,
-            config.projection_dim,
+            "multi_modal_projector",
+            config.patches_per_image,
+            config.pool_kernel_size,
+            config.vision_config.layer_norm_eps,
             dtype,
         )?;
 
-        let language_model =
-            Gemma3ForCausalLM::load(weights, &config.text_config, dtype, device, 0, 1)?;
+        // Language model — weights prefixed with "language_model.model."
+        // Build directly with prefix instead of using Gemma3ForCausalLM::load
+        // (which hardcodes "model" prefix for text-only use).
+        let model = Gemma3Model::load(
+            weights,
+            "language_model.model",
+            &config.text_config,
+            dtype,
+            device,
+            0,
+            1,
+        )?;
+        let lm_head = Linear::new(model.embed_tokens.weight().clone(), None);
+        let language_model = Gemma3ForCausalLM {
+            model,
+            lm_head,
+            final_logit_softcapping: config.text_config.final_logit_softcapping,
+        };
 
         Ok(Self {
             vision_tower,
@@ -234,16 +336,9 @@ impl Gemma3ForConditionalGeneration {
         // Encode: [N, 3, H, W] → [N, num_patches, vision_hidden]
         let vision_outputs = self.vision_tower.forward(&pixel_values)?;
 
-        // Project: [N, num_patches, vision_hidden] → [N, num_patches, text_hidden]
-        // Flatten to 2D for Linear, then back to 3D.
-        let (n_images, n_patches, _) = vision_outputs.dims3().map_err(ModelError::Candle)?;
-        let flat = vision_outputs
-            .reshape((n_images * n_patches, ()))
-            .map_err(ModelError::Candle)?;
-        let projected = self.multi_modal_projector.forward(&flat)?;
-        let projected = projected
-            .reshape((n_images, n_patches, ()))
-            .map_err(ModelError::Candle)?;
+        // Project: [N, num_patches, vision_hidden] → [N, pooled_tokens, text_hidden]
+        let projected = self.multi_modal_projector.forward(&vision_outputs)?;
+        let n_images = projected.dim(0).map_err(ModelError::Candle)?;
 
         // Scatter image embeddings into text embeddings at placeholder positions.
         let mut merged = text_embeds;
@@ -251,7 +346,8 @@ impl Gemma3ForConditionalGeneration {
             if img_idx >= n_images {
                 break;
             }
-            let image_embeds = projected.get(img_idx).map_err(ModelError::Candle)?; // [num_patches, hidden]
+            let image_embeds = projected.get(img_idx).map_err(ModelError::Candle)?; // [pooled_tokens, hidden]
+            let n_embed_tokens = image_embeds.dim(0).map_err(ModelError::Candle)?;
 
             // Replace tokens at offset..offset+length with image embeddings.
             let num_tokens = merged.dim(0).map_err(ModelError::Candle)?;
@@ -262,15 +358,10 @@ impl Gemma3ForConditionalGeneration {
             }
 
             // Trim image embeds if needed.
-            let image_embeds = if actual_len < placeholder.length {
-                image_embeds
-                    .narrow(0, 0, actual_len)
-                    .map_err(ModelError::Candle)?
-            } else {
-                image_embeds
-                    .narrow(0, 0, actual_len.min(n_patches))
-                    .map_err(ModelError::Candle)?
-            };
+            let use_len = actual_len.min(n_embed_tokens);
+            let image_embeds = image_embeds
+                .narrow(0, 0, use_len)
+                .map_err(ModelError::Candle)?;
 
             // Build merged = [before, image_embeds, after].
             let mut parts = Vec::new();
@@ -353,15 +444,172 @@ pub fn create_gemma3_mm(
 mod tests {
     use super::*;
 
+    /// Resolve the HF cache snapshot directory for a given model ID.
+    /// Returns `None` if the model is not cached locally.
+    fn resolve_hf_cache_dir(model_id: &str) -> Option<std::path::PathBuf> {
+        let hf_home = std::env::var("HF_HOME")
+            .unwrap_or_else(|_| format!("{}/.cache/huggingface", std::env::var("HOME").unwrap()));
+        let dir_name = format!("models--{}", model_id.replace('/', "--"));
+        let models_dir = std::path::PathBuf::from(hf_home).join("hub").join(dir_name);
+        if !models_dir.exists() {
+            return None;
+        }
+        // Find the first snapshot directory.
+        let snapshots = models_dir.join("snapshots");
+        std::fs::read_dir(snapshots)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+    }
+
+    /// Collect all tensor names from a model directory (single or sharded safetensors).
+    fn collect_tensor_names(model_dir: &std::path::Path) -> Vec<String> {
+        use vllm_model::weight::{SafeTensorsFile, SafeTensorsIndex};
+
+        let index_path = model_dir.join("model.safetensors.index.json");
+        let single_path = model_dir.join("model.safetensors");
+
+        if index_path.exists() {
+            let index = SafeTensorsIndex::from_file(&index_path).unwrap();
+            index.weight_map.keys().cloned().collect()
+        } else if single_path.exists() {
+            let file = SafeTensorsFile::open(&single_path).unwrap();
+            file.tensor_names().unwrap()
+        } else {
+            panic!("No safetensors files in {}", model_dir.display());
+        }
+    }
+
+    /// Validate that the weight prefixes our VLM code expects actually exist
+    /// in the real HF checkpoint. This catches prefix mismatches without needing
+    /// to load multi-GB weights.
+    #[test]
+    fn test_weight_names_match_hf_checkpoint_google_gemma3_4b_it() {
+        let model_dir = match resolve_hf_cache_dir("google/gemma-3-4b-it") {
+            Some(d) => d,
+            None => {
+                eprintln!("SKIP: google/gemma-3-4b-it not cached locally");
+                return;
+            }
+        };
+
+        let names = collect_tensor_names(&model_dir);
+        let name_set: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+
+        // --- Vision tower (prefix: "vision_tower.vision_model") ---
+        assert!(
+            name_set.contains("vision_tower.vision_model.embeddings.patch_embedding.weight"),
+            "missing vision tower patch_embedding.weight"
+        );
+        assert!(
+            name_set.contains("vision_tower.vision_model.embeddings.position_embedding.weight"),
+            "missing vision tower position_embedding.weight"
+        );
+        assert!(
+            name_set.contains("vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight"),
+            "missing vision tower encoder layer 0 q_proj"
+        );
+        assert!(
+            name_set.contains("vision_tower.vision_model.post_layernorm.weight"),
+            "missing vision tower post_layernorm"
+        );
+
+        // --- Projector (prefix: "multi_modal_projector") ---
+        assert!(
+            name_set.contains("multi_modal_projector.mm_input_projection_weight"),
+            "missing projector mm_input_projection_weight"
+        );
+        assert!(
+            name_set.contains("multi_modal_projector.mm_soft_emb_norm.weight"),
+            "missing projector mm_soft_emb_norm.weight"
+        );
+
+        // --- Language model (prefix: "language_model.model") ---
+        assert!(
+            name_set.contains("language_model.model.embed_tokens.weight"),
+            "missing language_model embed_tokens"
+        );
+        assert!(
+            name_set.contains("language_model.model.layers.0.self_attn.q_proj.weight"),
+            "missing language_model layer 0 q_proj"
+        );
+        assert!(
+            name_set.contains("language_model.model.norm.weight"),
+            "missing language_model final norm"
+        );
+
+        // --- Verify old/wrong prefixes do NOT exist ---
+        assert!(
+            !name_set.contains("model.vision_tower.vision_model.embeddings.patch_embedding.weight"),
+            "old 'model.' prefix should not exist for vision tower"
+        );
+        assert!(
+            !name_set.contains("model.multi_modal_projector.mm_input_projection_weight"),
+            "old 'model.' prefix should not exist for projector"
+        );
+        assert!(
+            !name_set.contains("model.embed_tokens.weight"),
+            "bare 'model.' prefix should not exist (should be 'language_model.model.')"
+        );
+    }
+
+    /// Same validation for the MLX community quantized model.
+    #[test]
+    fn test_weight_names_match_hf_checkpoint_mlx_gemma3_4b_4bit() {
+        let model_dir = match resolve_hf_cache_dir("mlx-community/gemma-3-4b-it-4bit") {
+            Some(d) => d,
+            None => {
+                eprintln!("SKIP: mlx-community/gemma-3-4b-it-4bit not cached locally");
+                return;
+            }
+        };
+
+        let names = collect_tensor_names(&model_dir);
+        let name_set: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+
+        // Vision tower (float, same prefix).
+        assert!(
+            name_set.contains("vision_tower.vision_model.embeddings.patch_embedding.weight"),
+            "missing vision tower patch_embedding.weight"
+        );
+
+        // Projector (float).
+        assert!(
+            name_set.contains("multi_modal_projector.mm_input_projection_weight"),
+            "missing projector mm_input_projection_weight"
+        );
+        assert!(
+            name_set.contains("multi_modal_projector.mm_soft_emb_norm.weight"),
+            "missing projector mm_soft_emb_norm.weight"
+        );
+
+        // Language model (quantized — has weight/biases/scales).
+        assert!(
+            name_set.contains("language_model.model.embed_tokens.weight"),
+            "missing language_model embed_tokens.weight (quantized)"
+        );
+        assert!(
+            name_set.contains("language_model.model.embed_tokens.scales"),
+            "missing language_model embed_tokens.scales (quantized)"
+        );
+        assert!(
+            name_set.contains("language_model.model.layers.0.self_attn.q_proj.weight"),
+            "missing language_model layer 0 q_proj.weight"
+        );
+    }
+
     #[test]
     fn test_projector_forward_shape() {
         let dtype = DType::F32;
         let device = Device::Cpu;
-        let proj = Gemma3MultiModalProjector::zeros(1152, 2304, dtype, &device).unwrap();
+        // 64 patches per side, kernel=4 → 16x16=256 output tokens
+        let proj = Gemma3MultiModalProjector::zeros(1152, 2560, 64, 4, dtype, &device).unwrap();
 
-        let input = Tensor::zeros((256, 1152), dtype, &device).unwrap();
+        // Input: [1, 4096, 1152] (batch=1, 64*64 patches, vision_hidden=1152)
+        let input = Tensor::zeros((1, 4096, 1152), dtype, &device).unwrap();
         let output = proj.forward(&input).unwrap();
-        assert_eq!(output.dims(), &[256, 2304]);
+        assert_eq!(output.dims(), &[1, 256, 2560]); // [1, pooled_tokens, text_hidden]
     }
 
     #[test]
@@ -377,16 +625,16 @@ mod tests {
                     "intermediate_size": 4304,
                     "num_hidden_layers": 27,
                     "num_attention_heads": 16,
-                    "image_size": 224,
+                    "image_size": 896,
                     "patch_size": 14,
                     "layer_norm_eps": 1e-6
                 },
                 "text_config": {
-                    "hidden_size": 2304,
+                    "hidden_size": 2560,
                     "num_attention_heads": 8,
                     "num_key_value_heads": 4,
                     "num_hidden_layers": 26,
-                    "intermediate_size": 9216,
+                    "intermediate_size": 10240,
                     "vocab_size": 262144,
                     "head_dim": 256,
                     "query_pre_attn_scalar": 256,
@@ -398,10 +646,12 @@ mod tests {
 
         let config = Gemma3VisionModelConfig::from_hf_config(&json).unwrap();
         assert_eq!(config.vision_config.hidden_size, 1152);
-        assert_eq!(config.vision_config.image_size, 224);
-        assert_eq!(config.text_config.hidden_size, 2304);
+        assert_eq!(config.vision_config.image_size, 896);
+        assert_eq!(config.text_config.hidden_size, 2560);
         assert_eq!(config.image_token_index, 255999);
         assert_eq!(config.mm_tokens_per_image, 256);
-        assert_eq!(config.projection_dim, 2304);
+        assert_eq!(config.projection_dim, 2560);
+        assert_eq!(config.patches_per_image, 64); // 896/14
+        assert_eq!(config.pool_kernel_size, 4); // 64/16
     }
 }

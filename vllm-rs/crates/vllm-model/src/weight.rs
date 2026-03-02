@@ -326,7 +326,7 @@ impl ModelWeights {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HfModelConfig {
     /// Model architecture identifiers (e.g., ["LlamaForCausalLM"]).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub architectures: Vec<String>,
 
     /// Model type (e.g., "llama", "mistral", "qwen2").
@@ -452,6 +452,19 @@ impl HfModelConfig {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Deserialize a value that may be `null` as the type's `Default`.
+///
+/// `#[serde(default)]` only handles *missing* keys — a key present with value
+/// `null` still fails for non-`Option` types like `Vec<String>`.  This
+/// deserializer treats `null` the same as absent.
+fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
 
 /// Convert safetensors Dtype to candle DType.
 fn safetensors_dtype_to_candle(dt: safetensors::Dtype) -> ModelResult<DType> {
@@ -841,6 +854,17 @@ mod tests {
         assert_eq!(config.head_dim(), None);
         assert_eq!(config.num_kv_heads(), None);
         assert!((config.norm_eps() - 1e-5).abs() < 1e-10);
+    }
+
+    /// Some HF configs (e.g. MLX community quantized VLMs) include
+    /// `"architectures": null` in sub-configs. Verify this deserializes
+    /// as an empty vec instead of failing.
+    #[test]
+    fn test_hf_model_config_null_architectures() {
+        let config: HfModelConfig =
+            serde_json::from_str(r#"{"architectures": null, "hidden_size": 2560}"#).unwrap();
+        assert!(config.architectures.is_empty());
+        assert_eq!(config.hidden_size, Some(2560));
     }
 
     #[test]

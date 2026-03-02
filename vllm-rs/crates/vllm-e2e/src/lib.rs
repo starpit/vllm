@@ -55,6 +55,10 @@ impl TestModels {
     // BitsAndBytes NF4 quantized models (MLX dequant-at-load or candle)
     pub const LLAMA_3_2_1B_BNB_4BIT: &str = "unsloth/Llama-3.2-1B-Instruct-bnb-4bit";
 
+    // GGUF quantized models (candle backend, not MLX)
+    pub const GEMMA3_270M_GGUF: &str = "unsloth/gemma-3-270m-it-qat-GGUF";
+    pub const GEMMA3_1B_GGUF: &str = "unsloth/gemma-3-1b-it-GGUF";
+
     // CUDA-compatible safetensors models (non-quantized, run on GPU)
     pub const SMOLLM_135M_CUDA: &str = "HuggingFaceTB/SmolLM2-135M-Instruct";
     pub const QWEN2_0_5B_CUDA: &str = "Qwen/Qwen2.5-0.5B";

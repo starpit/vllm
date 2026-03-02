@@ -209,6 +209,16 @@ impl ModelWeights {
         }
     }
 
+    /// Create from pre-built tensor map (e.g. dequantized GGUF tensors).
+    pub fn from_tensors(tensors: HashMap<String, Tensor>) -> Self {
+        let device = tensors
+            .values()
+            .next()
+            .map(|t| t.device().clone())
+            .unwrap_or(Device::Cpu);
+        Self { tensors, device }
+    }
+
     /// Load from a single safetensors file.
     pub fn from_single_file(path: impl AsRef<Path>, device: &Device) -> ModelResult<Self> {
         let file = SafeTensorsFile::open(&path)?;

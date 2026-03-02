@@ -107,6 +107,7 @@ impl ModelRegistry {
         // --- GGUF factories (keyed by GGUF general.architecture value) ---
         self.register_gguf("llama", crate::quantized_llama::create_llama_gguf);
         // Mistral/Phi GGUF files use "llama" architecture internally.
+        self.register_gguf("gemma3", crate::quantized_gemma3::create_gemma3_gguf);
 
         // --- GPTQ factories (keyed by HF architecture name) ---
         self.register_gptq("LlamaForCausalLM", crate::gptq_llama::create_llama_gptq);

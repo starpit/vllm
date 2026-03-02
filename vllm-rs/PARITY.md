@@ -37,13 +37,13 @@
 
 | Feature Group | Python | Rust Parity | +Rust | Unit | E2E |
 |---|---:|---|---:|---:|---:|
-| [Model Architectures](#model-architectures) | 36 | `████░░░░░░` 13/36 | 32 | 137 | 28 |
-| [Quantization](#quantization) | 12 | `████░░░░░░` 5/12 | 1 | 61 | 12 |
+| [Model Architectures](#model-architectures) | 36 | `████░░░░░░` 14/36 | 32 | 139 | 31 |
+| [Quantization](#quantization) | 12 | `████░░░░░░` 5/12 | 1 | 69 | 15 |
 | [Serving / OpenAI API](#serving--openai-api) | 24 | `███████░░░` 17/24 | 0 | 104 | 33 |
 | [Sampling & Decoding](#sampling--decoding) | 19 | `██████████` 19/19 | 0 | 53 | 13 |
 | [KV Cache & Attention](#kv-cache--attention) | 19 | `█████░░░░░` 10/19 | 0 | 105 | 0 |
 | [Scheduling](#scheduling) | 10 | `█████████░` 9/10 | 0 | 73 | 1 |
-| [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 62 | 2 |
+| [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 62 | 5 |
 | [Parallelism & Distribution](#parallelism--distribution) | 10 | `███░░░░░░░` 3/10 | 0 | 33 | 0 |
 | [Performance Optimizations](#performance-optimizations) | 13 | `██████░░░░` 8/13 | 4 | 50 | 0 |
 | [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | 12 | `████░░░░░░` 5/12 | 0 | 25 | 0 |
@@ -75,6 +75,7 @@
 | Command R (Cohere) | &#x1F535; | &#x1F535; | 8 | 0 | |
 | Kimi K2.5 (text-only, via DeepSeek V2) | &#x1F535; | &#x1F535; | 0 | 0 | |
 | Quantized LLaMA (GGUF) | &#x1F535; | &#x1F535; | 1 | 0 | |
+| Quantized Gemma 3 (GGUF, text + multimodal) | &#x1F535; | &#x1F535; | 2 | 3 | |
 | Gemma 1 | &#x1F535; | &#x1F534; | — | — | P1 |
 | Qwen 1 | &#x1F535; | &#x1F534; | — | — | P1 |
 | Qwen2 MoE | &#x1F535; | &#x1F535; | 8 | 0 | |
@@ -150,7 +151,7 @@
 
 | Method | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
-| GGUF (Q4_0 / Q4_K / Q8_0 / etc.) | &#x1F535; | &#x1F535; | 11 | 0 | |
+| GGUF (Q4_0 / Q4_K / Q8_0 / etc.) | &#x1F535; | &#x1F535; | 19 | 3 | |
 | MLX native 4-bit group quantization | N/A | &#x1F535; | 2 | 0 | |
 | GPTQ (INT4, candle + MLX) | &#x1F535; | &#x1F535; | 14 | 4 | |
 | AWQ (INT4, candle + MLX) | &#x1F535; | &#x1F535; | 12 | 4 | |
@@ -299,7 +300,7 @@
 | Backend | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
 | CPU | &#x1F535; | &#x1F535; | 4 | 0 | |
-| CUDA (NVIDIA GPU) | &#x1F535; | &#x1F7E1; | 42 | 5 | P3 |
+| CUDA (NVIDIA GPU) | &#x1F535; | &#x1F7E1; | 42 | 8 | P3 |
 | Metal / MLX (Apple Silicon) | &#x1F534; | &#x1F535; | 4 | 0 | |
 | ROCm (AMD GPU) | &#x1F535; | &#x1F534; | — | — | P2 |
 | TPU | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -308,7 +309,7 @@
 | Device auto-detection | &#x1F535; | &#x1F535; | 4 | 0 | |
 | Memory profiling / `--gpu-memory-utilization` | &#x1F535; | &#x1F535; | 6 | 2 | |
 
-> Unit counts from `candle_worker.rs` (24 total) and `mlx_worker.rs` (4). CUDA: 29 GPU kernel unit tests (norm 13 incl. fused_add_rms_norm, activation 7, rotary 5, cache 4) + 9 FlashAttention v2 tests + 2 device detection tests + 2 misc = 42. E2E: 5 CUDA tests (SmolLM-135M + Qwen2.5-0.5B safetensors on GPU: server start, completion, chat). The CUDA backend supports E2E inference (verified: Qwen2.5-0.5B BF16 on L40S) with 6 fused CUDA kernels (RMSNorm, fused add+RMSNorm, SiLU+mul/GELU+mul, RoPE, reshape_and_cache, QK-norm+RoPE) all using vectorized 128-bit loads, plus FlashAttention v2 (via `candle-flash-attn` crate, auto-dispatches on CUDA F16/BF16). GPU KV block pool, VRAM-based block allocation, and GPU↔CPU block swapping. Remaining for full parity: CUDA graphs, tensor parallelism. Device auto-detection includes `parse_device` tests for cpu/cuda/metal/auto. E2E float16 tests validate dtype selection end-to-end.
+> Unit counts from `candle_worker.rs` (24 total) and `mlx_worker.rs` (4). CUDA: 29 GPU kernel unit tests (norm 13 incl. fused_add_rms_norm, activation 7, rotary 5, cache 4) + 9 FlashAttention v2 tests + 2 device detection tests + 2 misc = 42. E2E: 5 CUDA safetensors tests (SmolLM-135M + Qwen2.5-0.5B on GPU: server start, completion, chat) + 3 CUDA GGUF tests (Gemma3-1B Q4_K_M: server start, completion, chat). The CUDA backend supports E2E inference (verified: Qwen2.5-0.5B BF16 on L40S) with 6 fused CUDA kernels (RMSNorm, fused add+RMSNorm, SiLU+mul/GELU+mul, RoPE, reshape_and_cache, QK-norm+RoPE) all using vectorized 128-bit loads, plus FlashAttention v2 (via `candle-flash-attn` crate, auto-dispatches on CUDA F16/BF16). GPU KV block pool, VRAM-based block allocation, and GPU↔CPU block swapping. Remaining for full parity: CUDA graphs, tensor parallelism. Device auto-detection includes `parse_device` tests for cpu/cuda/metal/auto. E2E float16 tests validate dtype selection end-to-end.
 
 ---
 
@@ -585,7 +586,7 @@ cargo build -p vllm-cli --no-default-features --features metal
 
 | Metric | Python | Rust |
 |---|---|---|
-| Model architectures | ~248 | 11 candle + 11 MLX (+ quantized variants) |
+| Model architectures | ~248 | 12 candle + 11 MLX (+ quantized variants) |
 | Quantization methods | ~14 | 5 (GGUF + MLX native 4-bit + GPTQ INT4 + AWQ INT4 + BnB NF4) |
 | Attention backends | ~15 | 2 (custom SDPA + FlashAttention v2) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |

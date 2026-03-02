@@ -6,7 +6,7 @@ End-to-end tests validate the full stack — from HTTP request to model inferenc
 
 **Strategy**: Tests construct the full inference stack in-process via `vllm_serve::init::initialize_stack()`, spawn the HTTP server on a random port, send requests using `reqwest`, and validate responses. Tests are `#[ignore]`-tagged and gated behind `--features e2e,metal` so they don't run in normal `cargo test`. A CI job downloads models once and caches them.
 
-**Backend focus**: MLX (Apple Silicon) for `--features e2e,metal` tests using `mlx-community` quantized models. CUDA tests use `--features e2e,cuda` with safetensors models (non-quantized) that run on GPU.
+**Backend focus**: MLX (Apple Silicon) for `--features e2e,metal` tests using `mlx-community` quantized models. CUDA tests use `--features e2e,cuda` with safetensors models (non-quantized) and GGUF quantized models that run on GPU.
 
 ---
 
@@ -38,8 +38,11 @@ cargo test -p vllm-e2e --features e2e,metal --test e_llm_api -- --ignored --test
 # Single test:
 cargo test -p vllm-e2e --features e2e,metal --test e1_basic_serving test_t1_smollm_chat_basic -- --ignored
 
-# CUDA E2E tests (requires NVIDIA GPU):
-cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda -- --ignored --test-threads=1
+# CUDA E2E tests — safetensors models (requires NVIDIA GPU):
+cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_smollm test_cuda_qwen -- --ignored --test-threads=1
+
+# CUDA E2E tests — GGUF quantized models (requires NVIDIA GPU):
+cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gguf -- --ignored --test-threads=1
 
 # PR tier only (Tier 1+2 models — SmolLM, Qwen2, Qwen3, Llama3):
 cargo test -p vllm-e2e --features e2e,metal --test e1_basic_serving -- --ignored --test-threads=1 \

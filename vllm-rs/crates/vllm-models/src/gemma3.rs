@@ -169,7 +169,7 @@ impl Gemma3Config {
     }
 
     /// Returns the RoPE theta for a given layer based on whether it uses sliding attention.
-    fn rope_theta_for_layer(&self, layer_idx: usize) -> f64 {
+    pub fn rope_theta_for_layer(&self, layer_idx: usize) -> f64 {
         if layer_idx < self.layer_is_sliding.len() && self.layer_is_sliding[layer_idx] {
             self.rope_local_base_freq
         } else {

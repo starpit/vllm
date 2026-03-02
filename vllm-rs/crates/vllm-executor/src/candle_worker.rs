@@ -504,9 +504,72 @@ impl CandleWorker {
         })?;
 
         // Build the model.
-        let model = factory(&mut gguf, &hf_config, device).map_err(|e| {
-            ExecutorError::WorkerInit(format!("failed to construct GGUF model: {e}"))
-        })?;
+        let mut hf_config = hf_config;
+        let model: Box<dyn Model> = if arch == "gemma3" {
+            // Check for mmproj GGUF (multimodal) alongside the main GGUF.
+            if let Some(mmproj_path) = gguf::detect_mmproj_gguf(gguf_path) {
+                info!(
+                    "CandleWorker: detected mmproj GGUF at {}",
+                    mmproj_path.display()
+                );
+
+                // Extract vision config from mmproj metadata into hf_config.
+                gguf::extract_mmproj_vision_config(&mmproj_path, &mut hf_config).map_err(|e| {
+                    ExecutorError::WorkerInit(format!(
+                        "failed to extract mmproj vision config: {e}"
+                    ))
+                })?;
+
+                // Load text backbone from main GGUF.
+                let gemma3_config = vllm_models::gemma3::Gemma3Config::from_hf_config(&hf_config)
+                    .map_err(|e| {
+                    ExecutorError::WorkerInit(format!("failed to parse Gemma3 config: {e}"))
+                })?;
+                let text_model = vllm_models::quantized_gemma3::QuantizedGemma3ForCausalLM::load(
+                    &mut gguf,
+                    &gemma3_config,
+                    device,
+                )
+                .map_err(|e| {
+                    ExecutorError::WorkerInit(format!("failed to load Gemma3 text backbone: {e}"))
+                })?;
+
+                // Load mmproj weights (dequantized to f32).
+                let mmproj_weights = gguf::load_mmproj_as_model_weights(&mmproj_path, device)
+                    .map_err(|e| {
+                        ExecutorError::WorkerInit(format!("failed to load mmproj weights: {e}"))
+                    })?;
+
+                // Wrap as multimodal model.
+                let mm_model =
+                    vllm_models::quantized_gemma3::QuantizedGemma3ForConditionalGeneration::new(
+                        text_model,
+                        &mmproj_weights,
+                        &hf_config,
+                        DType::F32,
+                    )
+                    .map_err(|e| {
+                        ExecutorError::WorkerInit(format!(
+                            "failed to construct Gemma3 multimodal model: {e}"
+                        ))
+                    })?;
+
+                // Update architecture to reflect multimodal.
+                hf_config.architectures = vec!["Gemma3ForConditionalGeneration".to_string()];
+
+                Box::new(mm_model)
+            } else {
+                // Text-only Gemma3 GGUF.
+                let f = factory;
+                f(&mut gguf, &hf_config, device).map_err(|e| {
+                    ExecutorError::WorkerInit(format!("failed to construct GGUF model: {e}"))
+                })?
+            }
+        } else {
+            factory(&mut gguf, &hf_config, device).map_err(|e| {
+                ExecutorError::WorkerInit(format!("failed to construct GGUF model: {e}"))
+            })?
+        };
 
         // For GGUF, KV cache is always f32.
         let dtype = DType::F32;

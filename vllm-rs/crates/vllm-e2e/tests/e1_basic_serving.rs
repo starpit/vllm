@@ -827,3 +827,71 @@ async fn test_cuda_qwen2_chat() {
     let text = resp.choices[0].message.content.as_deref().unwrap_or("");
     assert!(!text.is_empty(), "response should not be empty");
 }
+
+// ===========================================================================
+// CUDA GGUF E2E tests — quantized GGUF models on GPU
+// ===========================================================================
+// These use GGUF quantized models to test the GGUF + CUDA path.
+// Candle 0.9 has full CUDA quantized matmul support (QCudaStorage),
+// so quantized weights load directly onto the GPU and matmuls run
+// via CUDA kernels (dequantize-mul-mat-vec for decode, dequantize-matmul for prefill).
+//
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gguf -- --ignored
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_gemma3_1b_server_starts() {
+    let server = TestServer::builder(TestModels::GEMMA3_1B_GGUF)
+        .start()
+        .await
+        .expect("CUDA Gemma3 1B GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let models = client.list_models().await.unwrap();
+    assert_eq!(models.data.len(), 1);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_gemma3_1b_completion() {
+    let server = TestServer::builder(TestModels::GEMMA3_1B_GGUF)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "completion should not be empty"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_gemma3_1b_chat() {
+    let server = TestServer::builder(TestModels::GEMMA3_1B_GGUF)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    // Note: small quantized GGUF models may generate low-quality text;
+    // we only assert the response structure is valid.
+    assert!(
+        resp.usage.completion_tokens.unwrap_or(0) > 0,
+        "should generate at least one token"
+    );
+}

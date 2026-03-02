@@ -718,7 +718,7 @@ impl LlamaDecoderLayer {
 ///
 /// Port of: `vllm/model_executor/models/llama.py::LlamaModel`
 pub struct LlamaModel {
-    embed_tokens: Embedding,
+    pub(crate) embed_tokens: Embedding,
     layers: Vec<LlamaDecoderLayer>,
     norm: RmsNorm,
 }
@@ -763,6 +763,27 @@ impl LlamaModel {
             layers,
             norm,
         })
+    }
+
+    /// Embed token IDs into hidden states.
+    pub fn embed(&self, input_ids: &Tensor) -> ModelResult<Tensor> {
+        self.embed_tokens
+            .forward(input_ids)
+            .map_err(ModelError::Candle)
+    }
+
+    /// Run the transformer backbone on pre-computed embeddings.
+    pub fn backbone(
+        &self,
+        mut hidden_states: Tensor,
+        positions: &Tensor,
+        mut kv_cache: Option<&mut crate::KvCacheStorage<'_>>,
+    ) -> ModelResult<Tensor> {
+        for (i, layer) in self.layers.iter().enumerate() {
+            let layer_handle = kv_cache.as_mut().map(|s| s.layer_handle(i));
+            hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
+        }
+        crate::ops::rms_norm(&hidden_states, &self.norm).map_err(ModelError::Candle)
     }
 
     /// Forward pass.
@@ -832,8 +853,8 @@ impl LlamaModel {
 ///
 /// Port of: `vllm/model_executor/models/llama.py::LlamaForCausalLM`
 pub struct LlamaForCausalLM {
-    model: LlamaModel,
-    lm_head: Linear,
+    pub(crate) model: LlamaModel,
+    pub(crate) lm_head: Linear,
 }
 
 impl LlamaForCausalLM {
@@ -897,6 +918,19 @@ impl crate::Model for LlamaForCausalLM {
         let hidden_states = self.model.forward(input_ids, positions, kv_cache)?;
         let logits = self.compute_logits(&hidden_states)?;
         // Cast logits to f32 for sampling (sampler expects f32).
+        logits.to_dtype(DType::F32).map_err(ModelError::Candle)
+    }
+
+    fn forward_embeds(
+        &self,
+        inputs_embeds: &Tensor,
+        positions: &Tensor,
+        kv_cache: Option<&mut crate::KvCacheStorage<'_>>,
+    ) -> ModelResult<Tensor> {
+        let hidden_states = self
+            .model
+            .backbone(inputs_embeds.clone(), positions, kv_cache)?;
+        let logits = self.compute_logits(&hidden_states)?;
         logits.to_dtype(DType::F32).map_err(ModelError::Candle)
     }
 

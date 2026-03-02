@@ -71,7 +71,11 @@ impl MlxSiglipVisionConfig {
 // Helper: load LayerNorm weights
 // ---------------------------------------------------------------------------
 
-fn load_layernorm_weights(ln: &mut nn::LayerNorm, weights: &HashMap<String, Array>, prefix: &str) {
+pub(crate) fn load_layernorm_weights(
+    ln: &mut nn::LayerNorm,
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+) {
     if let Some(w) = weights.get(&format!("{prefix}.weight")) {
         ln.weight.value = Some(w.clone());
     }
@@ -80,7 +84,11 @@ fn load_layernorm_weights(ln: &mut nn::LayerNorm, weights: &HashMap<String, Arra
     }
 }
 
-fn load_linear_weights(linear: &mut nn::Linear, weights: &HashMap<String, Array>, prefix: &str) {
+pub(crate) fn load_linear_weights(
+    linear: &mut nn::Linear,
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+) {
     assign_weight(&mut linear.weight, weights, &format!("{prefix}.weight"));
     if let Some(b) = weights.get(&format!("{prefix}.bias")) {
         linear.bias.value = Some(b.clone());

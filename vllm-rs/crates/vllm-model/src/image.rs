@@ -54,6 +54,81 @@ pub fn preprocess_siglip(img: &DynamicImage, image_size: usize) -> ImageData {
     }
 }
 
+/// Smart resize for Qwen2-VL: round dimensions to multiples of `factor`,
+/// then clamp total pixel count within `[min_pixels, max_pixels]`.
+///
+/// Returns `(new_h, new_w)`.
+pub fn smart_resize(
+    h: usize,
+    w: usize,
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> (usize, usize) {
+    // Round to nearest multiple of factor (at least one factor).
+    let mut new_h = ((h.max(1) + factor / 2) / factor).max(1) * factor;
+    let mut new_w = ((w.max(1) + factor / 2) / factor).max(1) * factor;
+
+    // Scale up if below min_pixels.
+    if new_h * new_w < min_pixels {
+        let scale = (min_pixels as f64 / (new_h * new_w) as f64).sqrt();
+        new_h = ((new_h as f64 * scale / factor as f64).ceil() as usize) * factor;
+        new_w = ((new_w as f64 * scale / factor as f64).ceil() as usize) * factor;
+    }
+
+    // Scale down if above max_pixels.
+    if new_h * new_w > max_pixels {
+        let scale = (max_pixels as f64 / (new_h * new_w) as f64).sqrt();
+        new_h = ((new_h as f64 * scale / factor as f64).floor() as usize) * factor;
+        new_w = ((new_w as f64 * scale / factor as f64).floor() as usize) * factor;
+        if new_h == 0 {
+            new_h = factor;
+        }
+        if new_w == 0 {
+            new_w = factor;
+        }
+    }
+
+    (new_h, new_w)
+}
+
+/// Preprocess an image for Qwen2-VL: resize to `target_h x target_w`,
+/// convert to f32, normalize with CLIP normalization:
+/// `mean=[0.48145466, 0.4578275, 0.40821073]`, `std=[0.26862954, 0.26130258, 0.27577711]`
+///
+/// Returns `ImageData` with pixels in `[3, H, W]` CHW layout.
+pub fn preprocess_qwen2_vl(img: &DynamicImage, target_h: usize, target_w: usize) -> ImageData {
+    let resized = img.resize_exact(
+        target_w as u32,
+        target_h as u32,
+        FilterType::Triangle, // bilinear
+    );
+    let rgb = resized.to_rgb8();
+
+    let mean = [0.48145466f32, 0.4578275, 0.40821073];
+    let std_dev = [0.26862954f32, 0.261_302_6, 0.275_777_1];
+
+    let mut pixels = vec![0.0f32; 3 * target_h * target_w];
+
+    // Convert HWC -> CHW and normalize.
+    for y in 0..target_h {
+        for x in 0..target_w {
+            let pixel = rgb.get_pixel(x as u32, y as u32);
+            for c in 0..3 {
+                let val = pixel[c] as f32 / 255.0;
+                let normalized = (val - mean[c]) / std_dev[c];
+                pixels[c * target_h * target_w + y * target_w + x] = normalized;
+            }
+        }
+    }
+
+    ImageData {
+        pixels,
+        height: target_h,
+        width: target_w,
+    }
+}
+
 /// Extract raw bytes from a `data:image/...;base64,...` URI.
 pub fn decode_data_uri(uri: &str) -> ModelResult<Vec<u8>> {
     // Find the base64 data after the comma.
@@ -229,6 +304,61 @@ mod tests {
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].offset, 1);
         assert_eq!(ranges[0].length, 1);
+    }
+
+    #[test]
+    fn test_smart_resize_basic() {
+        // 100x200 with factor=28 → rounds to 84x196
+        let (h, w) = smart_resize(100, 200, 28, 256 * 28 * 28, 1280 * 28 * 28);
+        assert_eq!(h % 28, 0);
+        assert_eq!(w % 28, 0);
+        assert!(h * w >= 256 * 28 * 28);
+        assert!(h * w <= 1280 * 28 * 28);
+    }
+
+    #[test]
+    fn test_smart_resize_small_image() {
+        // Very small image should scale up to min_pixels.
+        let (h, w) = smart_resize(10, 10, 28, 256 * 28 * 28, 1280 * 28 * 28);
+        assert_eq!(h % 28, 0);
+        assert_eq!(w % 28, 0);
+        assert!(h * w >= 256 * 28 * 28);
+    }
+
+    #[test]
+    fn test_smart_resize_large_image() {
+        // Very large image should scale down to max_pixels.
+        let (h, w) = smart_resize(5000, 5000, 28, 256 * 28 * 28, 1280 * 28 * 28);
+        assert_eq!(h % 28, 0);
+        assert_eq!(w % 28, 0);
+        assert!(h * w <= 1280 * 28 * 28);
+    }
+
+    #[test]
+    fn test_preprocess_qwen2_vl_shape() {
+        let img = DynamicImage::new_rgb8(100, 100);
+        let result = preprocess_qwen2_vl(&img, 224, 224);
+        assert_eq!(result.height, 224);
+        assert_eq!(result.width, 224);
+        assert_eq!(result.pixels.len(), 3 * 224 * 224);
+    }
+
+    #[test]
+    fn test_preprocess_qwen2_vl_normalization() {
+        // Pure white image: pixel=255 → (1.0 - 0.48145466) / 0.26862954 ≈ 1.930
+        let mut img = image::RgbImage::new(4, 4);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgb([255, 255, 255]);
+        }
+        let dyn_img = DynamicImage::ImageRgb8(img);
+        let result = preprocess_qwen2_vl(&dyn_img, 4, 4);
+        // Check first channel (R): (1.0 - 0.48145466) / 0.26862954
+        let expected_r = (1.0 - 0.48145466) / 0.26862954;
+        assert!(
+            (result.pixels[0] - expected_r).abs() < 1e-3,
+            "expected ~{expected_r}, got {}",
+            result.pixels[0]
+        );
     }
 
     #[test]

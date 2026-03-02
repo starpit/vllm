@@ -68,4 +68,10 @@ impl TestModels {
     pub const GEMMA3_4B_IT_QAT_3BIT: &str = "mlx-community/gemma-3-4b-it-qat-3bit";
     // Tier 4: ~8 GB BF16 SafeTensors — Gemma3ForConditionalGeneration (Candle path)
     pub const GEMMA3_4B_IT: &str = "google/gemma-3-4b-it";
+
+    // Qwen2-VL multimodal (vision-language) models
+    // Tier 3: ~3.8 GB BF16 SafeTensors — Candle path
+    pub const QWEN2_VL_2B_INSTRUCT: &str = "unsloth/Qwen2-VL-2B-Instruct";
+    // Tier 4: ~4.6 GB 4-bit quantized — MLX path
+    pub const QWEN2_VL_7B_4BIT: &str = "mlx-community/Qwen2-VL-7B-4bit";
 }

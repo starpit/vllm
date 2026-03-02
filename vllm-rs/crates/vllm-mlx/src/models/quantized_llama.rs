@@ -611,6 +611,93 @@ impl MlxQuantizedLlamaForCausalLM {
     }
 }
 
+impl MlxQuantizedLlamaForCausalLM {
+    /// Load model from pre-loaded weights with a configurable prefix.
+    ///
+    /// `prefix` is the model backbone prefix (e.g., "model" or "language_model.model").
+    /// The lm_head prefix is auto-detected: if the backbone prefix contains "language_model",
+    /// the head is at "language_model.lm_head", otherwise "lm_head".
+    pub fn from_weights_with_prefix(
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        config: &LlamaConfig,
+        qc: &QuantConfig,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let embed_tokens = MlxEmbedTokens::from_weights(
+            weights,
+            &format!("{prefix}.embed_tokens"),
+            qc.group_size,
+            qc.bits,
+        );
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            layers.push(MlxQuantizedLlamaDecoderLayer::from_weights(
+                weights,
+                &format!("{prefix}.layers.{i}"),
+                config,
+                qc,
+            )?);
+        }
+
+        let mut norm = nn::RmsNormBuilder::new(config.hidden_size as i32)
+            .eps(config.rms_norm_eps)
+            .build()?;
+        assign_weight(&mut norm.weight, weights, &format!("{prefix}.norm.weight"));
+
+        let head_prefix = if prefix.contains("language_model") {
+            "language_model.lm_head"
+        } else {
+            "lm_head"
+        };
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(MlxLmHead::from_weights(
+                weights,
+                head_prefix,
+                qc.group_size,
+                qc.bits,
+            ))
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            tie_word_embeddings: config.tie_word_embeddings,
+            config: config.clone(),
+        })
+    }
+
+    /// Embed token IDs → hidden states.
+    pub fn embed(&mut self, input_ids: &Array) -> Result<Array, Exception> {
+        self.embed_tokens.forward(input_ids)
+    }
+
+    /// Run backbone on embeddings → logits.
+    pub fn forward_embeds(
+        &mut self,
+        inputs_embeds: &Array,
+        positions: &Array,
+        kv_cache: &mut MlxKvCache,
+    ) -> Result<Array, Exception> {
+        let mut hidden_states = inputs_embeds.clone();
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+        }
+        hidden_states = self.norm.forward(&hidden_states)?;
+
+        let logits = if self.tie_word_embeddings {
+            self.embed_tokens.as_linear(&hidden_states)?
+        } else {
+            self.lm_head.as_mut().unwrap().forward(&hidden_states)?
+        };
+        logits.as_dtype(Dtype::Float32)
+    }
+}
+
 impl super::MlxModel for MlxQuantizedLlamaForCausalLM {
     fn forward(
         &mut self,

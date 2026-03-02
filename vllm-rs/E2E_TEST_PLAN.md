@@ -762,10 +762,11 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_batch -- --ignore
 | E14c. BnB NF4 Quantization | 4 (done) | Llama-3.2-1B-bnb-4bit | Every PR | <1 min (MLX) |
 | E15. Offline Batch LLM API | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
 | E16. Batch Processing | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
-| E17. Multimodal VLM | 8 (done) | Gemma3-4B (MLX + Candle) | Nightly / Weekly | ~2 min |
+| E17. Multimodal VLM (Gemma3) | 8 (done) | Gemma3-4B (MLX + Candle) | Nightly / Weekly | ~2 min |
 | E18. Pooling Mode | 9 (done) | SmolLM-135M-4bit | Every PR | <1 min |
 | E19. Qwen3-Next Synthetic | 3 (done) | Synthetic (no download) | Every PR | <2 min |
-| **Total** | **~216** | | | **~36 min** |
+| E20. Multimodal VLM (Qwen2-VL) | 5 (done) | Qwen2-VL-7B-4bit (MLX) | Nightly | ~1 min |
+| **Total** | **~221** | | | **~37 min** |
 
 ### CI Tiers
 
@@ -798,6 +799,7 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_batch -- --ignore
 
 | Gemma3 VLM (MLX) | Gemma3ForConditionalGeneration | gemma-3-4b-it-qat-3bit | 2.8 GB | Nightly | — | Yes |
 | Gemma3 VLM (Candle) | Gemma3ForConditionalGeneration | google/gemma-3-4b-it | 8 GB | Weekly | Yes (BF16) | — |
+| Qwen2-VL (MLX) | Qwen2VLForConditionalGeneration | Qwen2-VL-7B-4bit | 4.6 GB | Nightly | — | Yes (4-bit) |
 |
 | GPTQ Qwen2 | Qwen2ForCausalLM | Qwen2.5-0.5B-Instruct-GPTQ-Int4 | 459 MB | PR | — | Yes (GPTQ INT4) |
 | AWQ Qwen2 | Qwen2ForCausalLM | Qwen2.5-0.5B-Instruct-AWQ | 393 MB | PR | — | Yes (AWQ INT4) |
@@ -919,6 +921,32 @@ cargo test -p vllm-e2e --features e2e --test e_qwen3_next -- --ignored --test-th
 ```
 
 **Deliverables**: 3 E2E tests (all implemented). Self-contained — generates synthetic model in tempdir, no HF download needed.
+
+---
+
+## Phase E20: Qwen2-VL Multimodal — DONE
+
+Test file: `e_qwen2_vl.rs`
+
+Tests Qwen2VLForConditionalGeneration — a VLM with custom ViT vision encoder (3D patch embedding + 2D RoPE + PatchMerger) + Qwen2 text backbone. Uses quantized MLX model (mlx-community/Qwen2-VL-7B-4bit). Vision encoder weights are dequantized at load time to float; language model remains quantized. Weight prefixes: `vision_tower.*` (MLX-community) or `visual.*` (original HF), `language_model.model.*` / `model.*`.
+
+### MLX path (`e_qwen2_vl.rs` — Tier 3, nightly)
+
+| Test | Model | What it validates |
+|---|---|---|
+| `test_qwen2_vl_server_starts` | Qwen2-VL-7B-4bit | Model loads, /health + /v1/models respond |
+| `test_qwen2_vl_text_only_chat` | Qwen2-VL-7B-4bit | Text-only chat through VLM backbone |
+| `test_qwen2_vl_image_chat` | Qwen2-VL-7B-4bit | Image+text chat produces output |
+| `test_qwen2_vl_image_stream` | Qwen2-VL-7B-4bit | Streaming with image input |
+| `test_qwen2_vl_image_max_tokens` | Qwen2-VL-7B-4bit | max_tokens respected with image |
+
+Run command:
+```bash
+# MLX backend (~4.6 GB quantized model):
+cargo test -p vllm-e2e --features e2e,metal --release --test e_qwen2_vl -- --ignored --test-threads=1
+```
+
+**Deliverables**: 5 E2E tests (all implemented and verified 2026-03-02, 5/5 passed in 7.2s on Apple Silicon).
 
 ---
 

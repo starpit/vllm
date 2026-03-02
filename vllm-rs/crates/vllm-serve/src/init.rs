@@ -410,10 +410,15 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
 
     // 10. Configure multimodal support if the model has a vision_config.
     if let Some(vision_config) = hf_config.extra.get("vision_config") {
+        // Detect model type for architecture-specific defaults.
+        let is_qwen2_vl = hf_config.architectures.iter().any(|a| {
+            a == "Qwen2VLForConditionalGeneration" || a == "Qwen2_5_VLForConditionalGeneration"
+        });
+
         let image_size = vision_config
             .get("image_size")
             .and_then(|v| v.as_u64())
-            .unwrap_or(224) as usize;
+            .unwrap_or(if is_qwen2_vl { 392 } else { 224 }) as usize;
         let patch_size = vision_config
             .get("patch_size")
             .and_then(|v| v.as_u64())
@@ -423,23 +428,48 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         } else {
             256
         };
-        let image_token_index = hf_config
-            .extra
-            .get("image_token_index")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(255999) as u32;
-        let mm_tokens_per_image = hf_config
-            .extra
-            .get("mm_tokens_per_image")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .unwrap_or(num_patches);
+
+        // Qwen2-VL uses <|image_pad|> token (151655) instead of image_token_index.
+        let image_token_index = if is_qwen2_vl {
+            hf_config
+                .extra
+                .get("image_token_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(151655) as u32
+        } else {
+            hf_config
+                .extra
+                .get("image_token_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(255999) as u32
+        };
+
+        // For Qwen2-VL, compute tokens per image from spatial_merge_size.
+        let mm_tokens_per_image = if is_qwen2_vl {
+            let spatial_merge = vision_config
+                .get("spatial_merge_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(2) as usize;
+            let grid = image_size / patch_size;
+            let merged_grid = grid / spatial_merge;
+            merged_grid * merged_grid
+        } else {
+            hf_config
+                .extra
+                .get("mm_tokens_per_image")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(num_patches)
+        };
 
         info!(
             "Multimodal config: image_token_id={}, tokens_per_image={}, image_size={}",
             image_token_index, mm_tokens_per_image, image_size,
         );
         engine.set_multimodal_config(image_token_index, mm_tokens_per_image, image_size);
+        if is_qwen2_vl {
+            engine.set_mm_model_type("qwen2_vl");
+        }
     }
 
     info!(

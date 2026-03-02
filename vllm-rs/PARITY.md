@@ -1,21 +1,21 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (997 tests: 889 unit + 108 e2e, 0 clippy errors)
+> Generated 2026-03-02 | Rust port: `vllm-rs/` on branch `feat/rust` (1000 tests: 889 unit + 111 e2e, 0 clippy errors)
 
 ### Legend
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 172 |
+| &#x1F535; | Fully implemented | 173 |
 | &#x1F7E1; | Partially implemented | 4 |
-| &#x1F534; | Not implemented | 98 |
+| &#x1F534; | Not implemented | 97 |
 
 ### Priority (for incomplete features)
 
 | Priority | Meaning | Count |
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
-| **P3** | High — meaningfully expands user base or enables key use cases | 14 |
+| **P3** | High — meaningfully expands user base or enables key use cases | 13 |
 | **P2** | Medium — useful improvement, broader coverage | 33 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
@@ -49,13 +49,13 @@
 | [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | 12 | `████░░░░░░` 5/12 | 0 | 25 | 0 |
 | [LoRA / Adapters](#lora--adapters) | 5 | `████░░░░░░` 2/5 | 0 | 12 | 8 |
 | [Speculative Decoding](#speculative-decoding) | 5 | `██░░░░░░░░` 1/5 | 0 | 20 | 0 |
-| [Multimodal / Vision-Language](#multimodal--vision-language) | 10 | `██░░░░░░░░` 2/10 | 4 | 8 | 0 |
+| [Multimodal / Vision-Language](#multimodal--vision-language) | 10 | `███░░░░░░░` 3/10 | 12 | 13 | 5 |
 | [Structured Output](#structured-output--guided-decoding) | 4 | `██████████` 4/4 | 0 | 12 | 0 |
 | [Tool Calling](#tool-calling--function-calling) | 7 | `██████████` 7/7 | 0 | 25 | 0 |
 | [Embeddings & Pooling](#embeddings--pooling) | 8 | `████████░░` 6/8 | 0 | 31 | 19 |
 | [Observability & Operations](#observability--operations) | 7 | `██████████` 7/7 | 1 | 15 | 0 |
 | [CLI & Deployment](#cli--deployment) | 17 | `██████████` 16/17 | 2 | 19 | 6 |
-| **Total** | **214** | `██████░░░░` **129/214** | **37** | **741** | **96** |
+| **Total** | **214** | `██████░░░░` **130/214** | **37** | **749** | **101** |
 
 ---
 
@@ -427,7 +427,7 @@
 |---|:---:|:---:|---:|---:|:---:|
 | Image input processing (base64 data URI) | &#x1F535; | &#x1F535; | 0 | 5 | |
 | LLaVA | &#x1F535; | &#x1F534; | — | — | P2 |
-| Qwen-VL / Qwen2.5-VL | &#x1F535; | &#x1F534; | — | — | P3 |
+| Qwen2-VL / Qwen2.5-VL (vision encoder + Qwen2 LM) | &#x1F535; | &#x1F535; | 8 | 5 | |
 | Pixtral | &#x1F535; | &#x1F534; | — | — | P2 |
 | InternVL | &#x1F535; | &#x1F534; | — | — | P2 |
 | Phi-3V / Phi-4MM | &#x1F535; | &#x1F534; | — | — | P2 |
@@ -437,6 +437,8 @@
 | Audio models (Whisper, Qwen-Audio) | &#x1F535; | &#x1F534; | — | — | P1 |
 
 > **Gemma 3 VLM implementation**: Full `Gemma3ForConditionalGeneration` support on both Candle (CPU/CUDA) and MLX (Metal) backends, including quantized MLX models (4-bit language model with float vision tower). Architecture: SigLIP vision encoder → AvgPool2d → GemmaRMSNorm → projection → merge with text embeddings → Gemma3 language model. Image input via OpenAI-compatible base64 data URI in chat messages. Unit tests: 2 weight-name validation (against real HF checkpoints), 1 projector shape, 1 config parsing. E2E: 3 Candle (server start, text-only chat, max_tokens) + 5 MLX (server start, text-only, image chat, image stream, image max_tokens).
+
+> **Qwen2-VL / Qwen2.5-VL implementation**: Full `Qwen2VLForConditionalGeneration` and `Qwen2_5_VLForConditionalGeneration` support on both Candle and MLX backends. Architecture: custom ViT with 3D patch embedding (Conv3d-as-Linear) + 2D RoPE → PatchMerger (2x2 spatial merge + GELU MLP) → Qwen2 LLM backbone. Qwen2.5-VL variant uses RMSNorm + SwiGLU MLP in the vision encoder instead of LayerNorm + QuickGELU. M-RoPE support added to RotaryEmbedding for 3-section position encoding. CLIP normalization for image preprocessing with smart_resize. Quantized MLX models dequantize vision encoder weights at load time. Unit tests: 5 config/preprocessing + 3 M-RoPE. E2E (MLX): server start, text-only chat, image chat, image stream, image max_tokens.
 
 ---
 
@@ -592,5 +594,5 @@ cargo build -p vllm-cli --no-default-features --features metal
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
 | Unit tests | ~948 test files | 890 passing (832 non-MLX + 58 MLX) |
-| E2E tests | — | 112 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 4 AWQ + 4 BnB + 6 LLM API + 4 LoRA + 6 batch + 2 multimodal) |
+| E2E tests | — | 117 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 4 AWQ + 4 BnB + 6 LLM API + 4 LoRA + 6 batch + 7 multimodal) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

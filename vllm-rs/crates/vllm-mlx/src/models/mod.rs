@@ -16,6 +16,7 @@ pub mod llama;
 pub mod mixtral;
 pub mod phi3;
 pub mod quantized_llama;
+pub mod qwen2_vl;
 pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod siglip;
@@ -228,6 +229,23 @@ impl MlxModelRegistry {
         // Kimi K2.5 — text backbone is DeepSeek V2/V3 (K2.5 factories strip
         // "language_model." weight prefix)
         registry.register("KimiK25ForCausalLM", deepseek_v2::create_mlx_kimi_k25);
+        // Qwen2-VL / Qwen2.5-VL multimodal (vision-language)
+        registry.register(
+            "Qwen2VLForConditionalGeneration",
+            qwen2_vl::create_mlx_qwen2_vl,
+        );
+        registry.register_quantized(
+            "Qwen2VLForConditionalGeneration",
+            qwen2_vl::create_mlx_quantized_qwen2_vl,
+        );
+        registry.register(
+            "Qwen2_5_VLForConditionalGeneration",
+            qwen2_vl::create_mlx_qwen25_vl,
+        );
+        registry.register_quantized(
+            "Qwen2_5_VLForConditionalGeneration",
+            qwen2_vl::create_mlx_quantized_qwen25_vl,
+        );
         registry.register_quantized(
             "KimiK25ForCausalLM",
             deepseek_v2::create_mlx_quantized_kimi_k25,

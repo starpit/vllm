@@ -103,6 +103,15 @@ impl ModelRegistry {
         // Kimi K2.5 — text backbone is DeepSeek V2/V3 (config unwrapped + weights
         // prefix-stripped by worker before calling factory)
         self.register("KimiK25ForCausalLM", crate::deepseek_v2::create_deepseek_v2);
+        // Qwen2-VL / Qwen2.5-VL — multimodal (vision-language) models
+        self.register(
+            "Qwen2VLForConditionalGeneration",
+            crate::qwen2_vl::create_qwen2_vl,
+        );
+        self.register(
+            "Qwen2_5_VLForConditionalGeneration",
+            crate::qwen2_vl::create_qwen25_vl,
+        );
 
         // --- GGUF factories (keyed by GGUF general.architecture value) ---
         self.register_gguf("llama", crate::quantized_llama::create_llama_gguf);

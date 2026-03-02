@@ -526,7 +526,7 @@ pub struct MlxLlamaForCausalLM {
     embed_tokens: nn::Embedding,
     layers: Vec<MlxLlamaDecoderLayer>,
     norm: nn::RmsNorm,
-    lm_head: Option<nn::Linear>,
+    pub(crate) lm_head: Option<nn::Linear>,
     tie_word_embeddings: bool,
     #[allow(dead_code)]
     config: LlamaConfig,
@@ -576,6 +576,52 @@ impl MlxLlamaForCausalLM {
         if let Some(ref mut lm_head) = self.lm_head {
             assign_weight(&mut lm_head.weight, weights, "lm_head.weight");
         }
+    }
+
+    /// Load weights with a configurable prefix (e.g., "model" or "language_model.model").
+    pub fn load_weights_with_prefix(&mut self, weights: &HashMap<String, Array>, prefix: &str) {
+        assign_weight(
+            &mut self.embed_tokens.weight,
+            weights,
+            &format!("{prefix}.embed_tokens.weight"),
+        );
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            layer.load_weights(weights, &format!("{prefix}.layers.{i}"));
+        }
+        assign_weight(
+            &mut self.norm.weight,
+            weights,
+            &format!("{prefix}.norm.weight"),
+        );
+        if let Some(ref mut lm_head) = self.lm_head {
+            assign_weight(&mut lm_head.weight, weights, "lm_head.weight");
+        }
+    }
+
+    /// Embed token IDs → hidden states.
+    pub fn embed(&mut self, input_ids: &Array) -> Result<Array, Exception> {
+        self.embed_tokens.forward(input_ids)
+    }
+
+    /// Run backbone on embeddings → logits.
+    pub fn forward_embeds(
+        &mut self,
+        inputs_embeds: &Array,
+        positions: &Array,
+        kv_cache: &mut MlxKvCache,
+    ) -> Result<Array, Exception> {
+        let mut hidden_states = inputs_embeds.clone();
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+        }
+        hidden_states = self.norm.forward(&hidden_states)?;
+
+        let logits = if self.tie_word_embeddings {
+            self.embed_tokens.as_linear(&hidden_states)?
+        } else {
+            self.lm_head.as_mut().unwrap().forward(&hidden_states)?
+        };
+        logits.as_dtype(Dtype::Float32)
     }
 
     /// Load model weights from safetensors files in a directory.

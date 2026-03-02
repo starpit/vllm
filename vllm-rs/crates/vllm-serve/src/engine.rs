@@ -174,8 +174,11 @@ pub struct AsyncEngine {
     image_token_id: Option<u32>,
     /// Number of image tokens per image (vision encoder output patches).
     mm_tokens_per_image: usize,
-    /// SigLIP image preprocessing size (pixels). 0 if not a VLM.
+    /// Image preprocessing size (pixels). 0 if not a VLM.
     mm_image_size: usize,
+    /// Multimodal model type for preprocessing dispatch.
+    /// "siglip" (Gemma3), "qwen2_vl" (Qwen2-VL/Qwen2.5-VL), or empty.
+    mm_model_type: String,
     /// Whether the engine is in pooling mode (embedding requests go through scheduler).
     is_pooling: bool,
 }
@@ -209,6 +212,7 @@ impl AsyncEngine {
             image_token_id: None,
             mm_tokens_per_image: 0,
             mm_image_size: 0,
+            mm_model_type: String::new(),
             is_pooling: false,
         }
     }
@@ -274,6 +278,12 @@ impl AsyncEngine {
         self.image_token_id = Some(image_token_id);
         self.mm_tokens_per_image = mm_tokens_per_image;
         self.mm_image_size = mm_image_size;
+    }
+
+    /// Set the multimodal model type for preprocessing dispatch.
+    /// e.g., "qwen2_vl" for Qwen2-VL/Qwen2.5-VL.
+    pub fn set_mm_model_type(&mut self, model_type: &str) {
+        self.mm_model_type = model_type.to_string();
     }
 
     /// Get the model name.
@@ -1870,8 +1880,21 @@ impl AsyncEngine {
                                 ServeError::Validation(format!("failed to decode image: {e}"))
                             })?;
 
-                        let image_data =
-                            vllm_model::image::preprocess_siglip(&dyn_image, image_size);
+                        let image_data = if self.mm_model_type == "qwen2_vl" {
+                            // Qwen2-VL: smart_resize to target dimensions, CLIP normalization.
+                            // Factor = patch_size(14) * spatial_merge_size(2) = 28.
+                            let factor = 28;
+                            let (target_h, target_w) = vllm_model::image::smart_resize(
+                                dyn_image.height() as usize,
+                                dyn_image.width() as usize,
+                                factor,
+                                256 * 28 * 28,  // min_pixels
+                                1280 * 28 * 28, // max_pixels
+                            );
+                            vllm_model::image::preprocess_qwen2_vl(&dyn_image, target_h, target_w)
+                        } else {
+                            vllm_model::image::preprocess_siglip(&dyn_image, image_size)
+                        };
                         images.push(image_data);
                     }
                 }

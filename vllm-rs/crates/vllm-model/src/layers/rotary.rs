@@ -290,6 +290,137 @@ impl RotaryEmbedding {
     pub fn sin_cache(&self) -> &Tensor {
         &self.sin_cache
     }
+
+    /// Apply M-RoPE (Multi-dimensional Rotary Position Embedding) used by Qwen2-VL.
+    ///
+    /// M-RoPE splits `head_dim` into 3 sections (temporal, height, width) and
+    /// applies independent RoPE per section using separate position sequences.
+    ///
+    /// * `q` — query tensor `[seq_len, num_heads, head_dim]`
+    /// * `k` — key tensor `[seq_len, num_kv_heads, head_dim]`
+    /// * `positions_3d` — position indices `[3, seq_len]` (time, height, width)
+    /// * `sections` — dimension sections `[s0, s1, s2]` where `s0+s1+s2 = head_dim/2`
+    pub fn apply_mrope(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        positions_3d: &Tensor,
+        sections: &[usize; 3],
+    ) -> ModelResult<(Tensor, Tensor)> {
+        let half_dim = self.head_dim / 2;
+        debug_assert_eq!(
+            sections[0] + sections[1] + sections[2],
+            half_dim,
+            "M-RoPE sections must sum to head_dim/2"
+        );
+
+        // Gather cos/sin for each of the 3 position dimensions.
+        // positions_3d[i] → [seq_len], gather → [seq_len, head_dim]
+        let pos_t = positions_3d
+            .narrow(0, 0, 1)
+            .map_err(ModelError::Candle)?
+            .squeeze(0)
+            .map_err(ModelError::Candle)?;
+        let pos_h = positions_3d
+            .narrow(0, 1, 1)
+            .map_err(ModelError::Candle)?
+            .squeeze(0)
+            .map_err(ModelError::Candle)?;
+        let pos_w = positions_3d
+            .narrow(0, 2, 1)
+            .map_err(ModelError::Candle)?
+            .squeeze(0)
+            .map_err(ModelError::Candle)?;
+
+        let cos_t = self
+            .cos_cache
+            .index_select(&pos_t, 0)
+            .map_err(ModelError::Candle)?;
+        let sin_t = self
+            .sin_cache
+            .index_select(&pos_t, 0)
+            .map_err(ModelError::Candle)?;
+        let cos_h = self
+            .cos_cache
+            .index_select(&pos_h, 0)
+            .map_err(ModelError::Candle)?;
+        let sin_h = self
+            .sin_cache
+            .index_select(&pos_h, 0)
+            .map_err(ModelError::Candle)?;
+        let cos_w = self
+            .cos_cache
+            .index_select(&pos_w, 0)
+            .map_err(ModelError::Candle)?;
+        let sin_w = self
+            .sin_cache
+            .index_select(&pos_w, 0)
+            .map_err(ModelError::Candle)?;
+
+        // Build per-section cos/sin by narrowing the head_dim dimension.
+        // cos_cache has shape [seq_len, head_dim] where head_dim = 2*half_dim,
+        // laid out as [freq0, freq1, ..., freq_{hd/2-1}, freq0, freq1, ...].
+        // Section i uses dimensions [offset..offset+sec_i] and [half_dim+offset..half_dim+offset+sec_i].
+        let s0 = sections[0];
+        let s1 = sections[1];
+        let s2 = sections[2];
+
+        // Narrow each cos/sin to its section, then concatenate to form full head_dim cos/sin.
+        // First half: [s0 from t, s1 from h, s2 from w]
+        // Second half: [s0 from t, s1 from h, s2 from w] (same pattern, offset by half_dim)
+        let cos_first = Tensor::cat(
+            &[
+                &cos_t.narrow(1, 0, s0).map_err(ModelError::Candle)?,
+                &cos_h.narrow(1, s0, s1).map_err(ModelError::Candle)?,
+                &cos_w.narrow(1, s0 + s1, s2).map_err(ModelError::Candle)?,
+            ],
+            1,
+        )
+        .map_err(ModelError::Candle)?;
+        let cos_second = Tensor::cat(
+            &[
+                &cos_t.narrow(1, half_dim, s0).map_err(ModelError::Candle)?,
+                &cos_h
+                    .narrow(1, half_dim + s0, s1)
+                    .map_err(ModelError::Candle)?,
+                &cos_w
+                    .narrow(1, half_dim + s0 + s1, s2)
+                    .map_err(ModelError::Candle)?,
+            ],
+            1,
+        )
+        .map_err(ModelError::Candle)?;
+        let cos = Tensor::cat(&[&cos_first, &cos_second], 1).map_err(ModelError::Candle)?;
+
+        let sin_first = Tensor::cat(
+            &[
+                &sin_t.narrow(1, 0, s0).map_err(ModelError::Candle)?,
+                &sin_h.narrow(1, s0, s1).map_err(ModelError::Candle)?,
+                &sin_w.narrow(1, s0 + s1, s2).map_err(ModelError::Candle)?,
+            ],
+            1,
+        )
+        .map_err(ModelError::Candle)?;
+        let sin_second = Tensor::cat(
+            &[
+                &sin_t.narrow(1, half_dim, s0).map_err(ModelError::Candle)?,
+                &sin_h
+                    .narrow(1, half_dim + s0, s1)
+                    .map_err(ModelError::Candle)?,
+                &sin_w
+                    .narrow(1, half_dim + s0 + s1, s2)
+                    .map_err(ModelError::Candle)?,
+            ],
+            1,
+        )
+        .map_err(ModelError::Candle)?;
+        let sin = Tensor::cat(&[&sin_first, &sin_second], 1).map_err(ModelError::Candle)?;
+
+        let q_rot = apply_rotary_to_tensor(q, &cos, &sin)?;
+        let k_rot = apply_rotary_to_tensor(k, &cos, &sin)?;
+
+        Ok((q_rot, k_rot))
+    }
 }
 
 /// YaRN magnitude scaling function.
@@ -516,6 +647,72 @@ mod tests {
 
         let x_rot = rope.apply_one(&x, &positions).unwrap();
         assert_eq!(x_rot.dims(), &[3, 2, 8]);
+    }
+
+    #[test]
+    fn test_mrope_shape_preservation() {
+        let rope = RotaryEmbedding::new(8, 100, 10000.0, DType::F32, &Device::Cpu).unwrap();
+
+        let q = Tensor::ones(&[4, 2, 8], DType::F32, &Device::Cpu).unwrap();
+        let k = Tensor::ones(&[4, 2, 8], DType::F32, &Device::Cpu).unwrap();
+        // 3 position dims, each with 4 positions
+        let positions_3d =
+            Tensor::new(&[[0u32, 1, 2, 3], [0, 0, 1, 1], [0, 1, 0, 1]], &Device::Cpu).unwrap();
+        let sections = [2, 1, 1]; // sum = 4 = head_dim/2
+
+        let (q_rot, k_rot) = rope.apply_mrope(&q, &k, &positions_3d, &sections).unwrap();
+        assert_eq!(q_rot.dims(), &[4, 2, 8]);
+        assert_eq!(k_rot.dims(), &[4, 2, 8]);
+    }
+
+    #[test]
+    fn test_mrope_position_zero_is_identity() {
+        // When all 3 position dimensions are 0, M-RoPE should be identity (like standard RoPE).
+        let rope = RotaryEmbedding::new(8, 100, 10000.0, DType::F32, &Device::Cpu).unwrap();
+
+        let q = Tensor::new(
+            &[[[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]]],
+            &Device::Cpu,
+        )
+        .unwrap();
+        let k = q.clone();
+        let positions_3d = Tensor::new(&[[0u32], [0], [0]], &Device::Cpu).unwrap();
+        let sections = [2, 1, 1];
+
+        let (q_rot, _) = rope.apply_mrope(&q, &k, &positions_3d, &sections).unwrap();
+        let vals = q_rot.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (i, &v) in vals.iter().enumerate() {
+            let expected = (i + 1) as f32;
+            assert!(
+                (v - expected).abs() < 1e-5,
+                "M-RoPE at pos 0 should be identity, dim {i}: expected {expected}, got {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mrope_matches_standard_when_positions_equal() {
+        // When all 3 position dims have the same values, M-RoPE should match standard RoPE.
+        let rope = RotaryEmbedding::new(8, 100, 10000.0, DType::F32, &Device::Cpu).unwrap();
+
+        let q = Tensor::ones(&[3, 2, 8], DType::F32, &Device::Cpu).unwrap();
+        let k = Tensor::ones(&[3, 2, 8], DType::F32, &Device::Cpu).unwrap();
+        let positions = Tensor::new(&[5u32, 10, 15], &Device::Cpu).unwrap();
+        let positions_3d =
+            Tensor::new(&[[5u32, 10, 15], [5, 10, 15], [5, 10, 15]], &Device::Cpu).unwrap();
+        let sections = [2, 1, 1];
+
+        let (q_standard, _) = rope.apply(&q, &k, &positions).unwrap();
+        let (q_mrope, _) = rope.apply_mrope(&q, &k, &positions_3d, &sections).unwrap();
+
+        let std_vals = q_standard.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let mrope_vals = q_mrope.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (i, (s, m)) in std_vals.iter().zip(mrope_vals.iter()).enumerate() {
+            assert!(
+                (s - m).abs() < 1e-4,
+                "dim {i}: standard={s}, mrope={m} should match when positions are equal"
+            );
+        }
     }
 
     #[test]

@@ -54,6 +54,7 @@ fn create_bench_worker(args: &BenchArgs, model: String) -> Result<Box<dyn Worker
         block_size: 16,
         lora_adapter: None,
         pooling_strategy: "auto".to_string(),
+        is_pooling: false,
     };
     let mut worker = MlxWorker::new(config);
     worker.init_device()?;

@@ -652,6 +652,30 @@ impl GatedDeltaNet {
         *self.ssm_state.borrow_mut() = None;
     }
 
+    /// Extract (take) the recurrent state from this GDN layer.
+    pub fn extract_state(&self) -> Option<(Tensor, Tensor)> {
+        let conv = self.conv_state.borrow_mut().take();
+        let ssm = self.ssm_state.borrow_mut().take();
+        match (conv, ssm) {
+            (Some(c), Some(s)) => Some((c, s)),
+            _ => None,
+        }
+    }
+
+    /// Inject previously-saved recurrent state into this GDN layer.
+    pub fn inject_state(&self, state: &Option<(Tensor, Tensor)>) {
+        match state {
+            Some((c, s)) => {
+                *self.conv_state.borrow_mut() = Some(c.clone());
+                *self.ssm_state.borrow_mut() = Some(s.clone());
+            }
+            None => {
+                *self.conv_state.borrow_mut() = None;
+                *self.ssm_state.borrow_mut() = None;
+            }
+        }
+    }
+
     /// Forward pass.
     fn forward(&self, hidden_states: &Tensor) -> ModelResult<Tensor> {
         let num_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
@@ -1186,6 +1210,21 @@ impl Qwen3NextDecoderLayer {
             gdn.reset_state();
         }
     }
+
+    /// Extract GDN recurrent state. Returns `None` for full attention layers.
+    fn extract_recurrent_state(&self) -> Option<Option<(Tensor, Tensor)>> {
+        match &self.attn {
+            Qwen3NextAttnVariant::LinearAttention(gdn) => Some(gdn.extract_state()),
+            Qwen3NextAttnVariant::FullAttention(_) => None,
+        }
+    }
+
+    /// Inject GDN recurrent state. No-op for full attention layers.
+    fn inject_recurrent_state(&self, state: &Option<(Tensor, Tensor)>) {
+        if let Qwen3NextAttnVariant::LinearAttention(gdn) = &self.attn {
+            gdn.inject_state(state);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,6 +1313,35 @@ impl Qwen3NextModel {
             layer.reset_recurrent_state();
         }
     }
+
+    /// Count of recurrent (GDN) layers.
+    fn num_recurrent_layers(&self) -> usize {
+        self.layers
+            .iter()
+            .filter(|l| matches!(l.attn, Qwen3NextAttnVariant::LinearAttention(_)))
+            .count()
+    }
+
+    /// Extract recurrent state from all GDN layers.
+    fn extract_recurrent_state(&self) -> crate::RecurrentState {
+        self.layers
+            .iter()
+            .filter_map(|l| l.extract_recurrent_state())
+            .collect()
+    }
+
+    /// Inject recurrent state into all GDN layers.
+    fn inject_recurrent_state(&self, state: &[Option<(Tensor, Tensor)>]) {
+        let mut idx = 0;
+        for layer in &self.layers {
+            if matches!(layer.attn, Qwen3NextAttnVariant::LinearAttention(_)) {
+                if let Some(s) = state.get(idx) {
+                    layer.inject_recurrent_state(s);
+                }
+                idx += 1;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,6 +1406,18 @@ impl crate::Model for Qwen3NextForCausalLM {
 
     fn reset_recurrent_state(&self) {
         self.model.reset_recurrent_state();
+    }
+
+    fn num_recurrent_layers(&self) -> usize {
+        self.model.num_recurrent_layers()
+    }
+
+    fn extract_recurrent_state(&self) -> crate::RecurrentState {
+        self.model.extract_recurrent_state()
+    }
+
+    fn inject_recurrent_state(&self, state: &[Option<(Tensor, Tensor)>]) {
+        self.model.inject_recurrent_state(state);
     }
 }
 

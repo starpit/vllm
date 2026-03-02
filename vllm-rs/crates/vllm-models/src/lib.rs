@@ -46,6 +46,15 @@ pub use sampler::Sampler;
 // KV Cache
 // ---------------------------------------------------------------------------
 
+/// Per-GDN-layer recurrent state: `(conv_state, ssm_state)`.
+///
+/// - `conv_state`: `[kernel_size-1, conv_dim]`
+/// - `ssm_state`: `[num_v_heads, head_v_dim, head_k_dim]`
+///
+/// `None` entries indicate a layer with no state yet (first call).
+/// The vector length equals the number of recurrent (GDN) layers.
+pub type RecurrentState = Vec<Option<(Tensor, Tensor)>>;
+
 /// Per-layer KV cache entry: `(key, value)` tensors.
 ///
 /// Keys and values have shape `[cached_seq_len, num_kv_heads, head_dim]`.
@@ -505,6 +514,30 @@ pub trait Model: Send {
     /// (conv state, SSM state) start fresh. Default: no-op for standard
     /// transformer models.
     fn reset_recurrent_state(&self) {}
+
+    /// Number of recurrent (GDN) layers in this model.
+    ///
+    /// Returns 0 for standard transformer models. For hybrid models,
+    /// returns the count of GDN / linear-attention layers whose state
+    /// must be tracked per-request.
+    fn num_recurrent_layers(&self) -> usize {
+        0
+    }
+
+    /// Extract recurrent state from all GDN layers.
+    ///
+    /// Returns a vector of `Option<(conv_state, ssm_state)>` with one entry
+    /// per recurrent layer. The model's internal state is taken (moved out),
+    /// leaving `None` in the RefCells.
+    fn extract_recurrent_state(&self) -> RecurrentState {
+        vec![]
+    }
+
+    /// Inject previously-saved recurrent state into all GDN layers.
+    ///
+    /// The slice must have length `num_recurrent_layers()`. Each entry
+    /// replaces the corresponding GDN layer's internal state.
+    fn inject_recurrent_state(&self, _state: &[Option<(Tensor, Tensor)>]) {}
 
     /// Run the model backbone and return hidden states (before lm_head).
     ///

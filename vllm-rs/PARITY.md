@@ -6,16 +6,16 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 166 |
+| &#x1F535; | Fully implemented | 169 |
 | &#x1F7E1; | Partially implemented | 4 |
-| &#x1F534; | Not implemented | 101 |
+| &#x1F534; | Not implemented | 100 |
 
 ### Priority (for incomplete features)
 
 | Priority | Meaning | Count |
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
-| **P3** | High — meaningfully expands user base or enables key use cases | 17 |
+| **P3** | High — meaningfully expands user base or enables key use cases | 16 |
 | **P2** | Medium — useful improvement, broader coverage | 33 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
@@ -37,7 +37,7 @@
 
 | Feature Group | Python | Rust Parity | +Rust | Unit | E2E |
 |---|---:|---|---:|---:|---:|
-| [Model Architectures](#model-architectures) | 36 | `███░░░░░░░` 12/36 | 30 | 108 | 25 |
+| [Model Architectures](#model-architectures) | 36 | `████░░░░░░` 13/36 | 32 | 137 | 28 |
 | [Quantization](#quantization) | 11 | `██░░░░░░░░` 3/11 | 1 | 39 | 8 |
 | [Serving / OpenAI API](#serving--openai-api) | 24 | `███████░░░` 17/24 | 0 | 104 | 33 |
 | [Sampling & Decoding](#sampling--decoding) | 19 | `██████████` 19/19 | 0 | 53 | 13 |
@@ -55,7 +55,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | 8 | `████████░░` 6/8 | 0 | 31 | 19 |
 | [Observability & Operations](#observability--operations) | 7 | `██████████` 7/7 | 1 | 15 | 0 |
 | [CLI & Deployment](#cli--deployment) | 17 | `██████████` 16/17 | 2 | 19 | 6 |
-| **Total** | **213** | `█████░░░░░` **124/213** | **35** | **681** | **89** |
+| **Total** | **213** | `█████░░░░░` **125/213** | **37** | **710** | **92** |
 
 ---
 
@@ -79,7 +79,7 @@
 | Qwen 1 | &#x1F535; | &#x1F534; | — | — | P1 |
 | Qwen2 MoE | &#x1F535; | &#x1F535; | 8 | 0 | |
 | Qwen3 MoE | &#x1F535; | &#x1F535; | 8 | 0 | |
-| Qwen3 Next (hybrid linear attn) | &#x1F535; | &#x1F534; | — | — | P3 |
+| Qwen3 Next (hybrid linear attn) | &#x1F535; | &#x1F535; | 26 | 3 | |
 | Mixtral (MoE) | &#x1F535; | &#x1F535; | 7 | 0 | |
 | GPT-NeoX | &#x1F535; | &#x1F534; | — | — | P1 |
 | GPT-J | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -138,6 +138,8 @@
 | Kimi K2.5 text-only (via DeepSeek V2) | N/A | &#x1F535; | 0 | 0 | |
 | Quantized Kimi K2.5 text-only (4-bit) | N/A | &#x1F535; | 0 | 0 | |
 | Mixtral (MoE, float) | N/A | &#x1F535; | 3 | 0 | |
+| Qwen3 Next (hybrid GDN + full attn + MoE, float) | N/A | &#x1F535; | 3 | 0 | |
+| Quantized Qwen3 Next (4-bit) | N/A | &#x1F535; | 0 | 0 | |
 | Quantized Mixtral (MoE, 4-bit) | N/A | &#x1F535; | 0 | 0 | |
 
 > Python vLLM does not have an MLX backend. The Rust MLX backend is unique to the Rust port. All E2E tests use `mlx-community` models and exercise the MLX backend (`--features metal`). MLX unit tests require `--test-threads=1`.

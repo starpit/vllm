@@ -728,7 +728,8 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_batch -- --ignore
 | E16. Batch Processing | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
 | E17. Multimodal VLM | 8 (done) | Gemma3-4B (MLX + Candle) | Nightly / Weekly | ~2 min |
 | E18. Pooling Mode | 9 (done) | SmolLM-135M-4bit | Every PR | <1 min |
-| **Total** | **~213** | | | **~34 min** |
+| E19. Qwen3-Next Synthetic | 3 (done) | Synthetic (no download) | Every PR | <2 min |
+| **Total** | **~216** | | | **~36 min** |
 
 ### CI Tiers
 
@@ -852,6 +853,35 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_pooling -- --igno
 ```
 
 **Deliverables**: 9 E2E tests (all implemented and verified).
+
+---
+
+## Phase E19: Qwen3-Next Synthetic Model — DONE
+
+Test file: `e_qwen3_next.rs`
+
+Tests the Qwen3-Next hybrid model (GDN linear attention + full attention + MoE) using a synthetic tiny model generated at test time. Since no small public Qwen3-Next model exists on HuggingFace (the only public model is 80B params), the test creates a synthetic model directory with random f32 weights, config.json, and tokenizer.json in a tempdir. This validates the full config → load_weights → forward → sample pipeline, including:
+- GDN (GatedDeltaNet) linear attention layers with causal conv1d + gated delta recurrence
+- Full attention layers with output gating, QK norms, and partial RoPE
+- MoE routing (per-expert gate_proj/up_proj/down_proj)
+- Per-request recurrent state management (conv_state + ssm_state)
+- GemmaRMSNorm (weight+1 scaling)
+
+Synthetic model config: 4 layers (3 GDN + 1 full_attention), hidden_size=64, 4 heads, vocab_size=256, 4 experts with 2 active, dense MLP on layer 0.
+
+| Test | Description |
+|------|-------------|
+| `test_qwen3_next_server_starts` | Synthetic model loads, server starts, /health + /v1/models work |
+| `test_qwen3_next_chat_basic` | Chat completion through hybrid model returns non-empty response |
+| `test_qwen3_next_completion_basic` | Text completion returns non-empty text |
+
+Run command:
+```bash
+# CPU backend (no model download needed — synthetic weights):
+cargo test -p vllm-e2e --features e2e --test e_qwen3_next -- --ignored --test-threads=1
+```
+
+**Deliverables**: 3 E2E tests (all implemented). Self-contained — generates synthetic model in tempdir, no HF download needed.
 
 ---
 

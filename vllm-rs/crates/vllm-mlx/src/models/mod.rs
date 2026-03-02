@@ -28,6 +28,9 @@ use mlx_rs::Array;
 use crate::cache::MlxKvCache;
 use vllm_model::weight::HfModelConfig;
 
+/// Per-GDN-layer recurrent state for MLX models: `(conv_state, ssm_state)`.
+pub type MlxRecurrentState = Vec<Option<(Array, Array)>>;
+
 /// Core trait for all MLX model architectures.
 ///
 /// A model takes token IDs and positions, produces logits over the vocabulary.
@@ -80,6 +83,19 @@ pub trait MlxModel: Send {
     ///
     /// Called before each request's forward pass. Default: no-op.
     fn reset_recurrent_state(&self) {}
+
+    /// Number of recurrent (GDN) layers in this model.
+    fn num_recurrent_layers(&self) -> usize {
+        0
+    }
+
+    /// Extract recurrent state from all GDN layers (takes from internal RefCells).
+    fn extract_recurrent_state(&self) -> MlxRecurrentState {
+        vec![]
+    }
+
+    /// Inject previously-saved recurrent state into all GDN layers.
+    fn inject_recurrent_state(&self, _state: &[Option<(Array, Array)>]) {}
 
     /// Run the model backbone and return hidden states (before lm_head).
     ///

@@ -22,7 +22,10 @@ use mlx_rs::{Array, Dtype};
 use crate::cache::MlxKvCache;
 use crate::models::gemma2::assign_gemma_norm_weight;
 use crate::models::llama::{LlamaConfig, MlxLlamaMLP, assign_weight, load_safetensors_weights};
-use crate::models::qwen3_moe::{MlxQwen3MoeConfig, MlxQwen3MoeMoE};
+use crate::models::quantized_llama::{
+    MlxEmbedTokens, MlxLmHead, MlxQuantizedLlamaMLP, QuantConfig, make_quantized_linear,
+};
+use crate::models::qwen3_moe::{MlxQuantizedQwen3MoeMoE, MlxQwen3MoeConfig, MlxQwen3MoeMoE};
 use vllm_model::weight::HfModelConfig;
 
 // ---------------------------------------------------------------------------
@@ -524,6 +527,28 @@ impl MlxGatedDeltaNet {
         *self.ssm_state.borrow_mut() = None;
     }
 
+    fn extract_state(&self) -> Option<(Array, Array)> {
+        let conv = self.conv_state.borrow_mut().take();
+        let ssm = self.ssm_state.borrow_mut().take();
+        match (conv, ssm) {
+            (Some(c), Some(s)) => Some((c, s)),
+            _ => None,
+        }
+    }
+
+    fn inject_state(&self, state: &Option<(Array, Array)>) {
+        match state {
+            Some((c, s)) => {
+                *self.conv_state.borrow_mut() = Some(c.clone());
+                *self.ssm_state.borrow_mut() = Some(s.clone());
+            }
+            None => {
+                *self.conv_state.borrow_mut() = None;
+                *self.ssm_state.borrow_mut() = None;
+            }
+        }
+    }
+
     fn forward(&mut self, hidden_states: &Array) -> Result<Array, Exception> {
         // Evaluate input for shape queries.
         mlx_rs::transforms::eval(std::iter::once(hidden_states))?;
@@ -870,6 +895,19 @@ impl MlxQwen3NextDecoderLayer {
             gdn.reset_state();
         }
     }
+
+    fn extract_recurrent_state(&self) -> Option<Option<(Array, Array)>> {
+        match &self.attn {
+            MlxQwen3NextAttnVariant::LinearAttention(gdn) => Some(gdn.extract_state()),
+            MlxQwen3NextAttnVariant::FullAttention(_) => None,
+        }
+    }
+
+    fn inject_recurrent_state(&self, state: &Option<(Array, Array)>) {
+        if let MlxQwen3NextAttnVariant::LinearAttention(gdn) = &self.attn {
+            gdn.inject_state(state);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1046,854 @@ impl super::MlxModel for MlxQwen3NextForCausalLM {
             layer.reset_recurrent_state();
         }
     }
+
+    fn num_recurrent_layers(&self) -> usize {
+        self.layers
+            .iter()
+            .filter(|l| matches!(l.attn, MlxQwen3NextAttnVariant::LinearAttention(_)))
+            .count()
+    }
+
+    fn extract_recurrent_state(&self) -> super::MlxRecurrentState {
+        self.layers
+            .iter()
+            .filter_map(|l| l.extract_recurrent_state())
+            .collect()
+    }
+
+    fn inject_recurrent_state(&self, state: &[Option<(Array, Array)>]) {
+        let mut idx = 0;
+        for layer in &self.layers {
+            if matches!(layer.attn, MlxQwen3NextAttnVariant::LinearAttention(_)) {
+                if let Some(s) = state.get(idx) {
+                    layer.inject_recurrent_state(s);
+                }
+                idx += 1;
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// Quantized variants
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// MlxQuantizedQwen3NextAttention
+// ---------------------------------------------------------------------------
+
+/// Quantized full attention with output gating for Qwen3-Next (MLX).
+struct MlxQuantizedQwen3NextAttention {
+    q_proj: nn::QuantizedLinear,
+    k_proj: nn::QuantizedLinear,
+    v_proj: nn::QuantizedLinear,
+    o_proj: nn::QuantizedLinear,
+    q_norm: nn::RmsNorm,
+    k_norm: nn::RmsNorm,
+    rope: nn::Rope,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    scale: f32,
+}
+
+impl MlxQuantizedQwen3NextAttention {
+    fn from_weights(
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        config: &MlxQwen3NextConfig,
+        qc: &QuantConfig,
+    ) -> Self {
+        let q_proj =
+            make_quantized_linear(weights, &format!("{prefix}.q_proj"), qc.group_size, qc.bits);
+        let k_proj =
+            make_quantized_linear(weights, &format!("{prefix}.k_proj"), qc.group_size, qc.bits);
+        let v_proj =
+            make_quantized_linear(weights, &format!("{prefix}.v_proj"), qc.group_size, qc.bits);
+        let o_proj =
+            make_quantized_linear(weights, &format!("{prefix}.o_proj"), qc.group_size, qc.bits);
+
+        // QK norms: GemmaRMSNorm (weight+1).
+        let mut q_norm = nn::RmsNormBuilder::new(config.head_dim as i32)
+            .eps(config.rms_norm_eps)
+            .build()
+            .unwrap();
+        assign_gemma_norm_weight(&mut q_norm, weights, &format!("{prefix}.q_norm.weight"));
+        let mut k_norm = nn::RmsNormBuilder::new(config.head_dim as i32)
+            .eps(config.rms_norm_eps)
+            .build()
+            .unwrap();
+        assign_gemma_norm_weight(&mut k_norm, weights, &format!("{prefix}.k_norm.weight"));
+
+        let rotary_dim = {
+            let d = (config.head_dim as f64 * config.partial_rotary_factor).round() as usize;
+            d - (d % 2)
+        };
+
+        Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            rope: {
+                let mut r = nn::Rope::new(rotary_dim as i32);
+                r.base = config.rope_theta;
+                r
+            },
+            num_heads: config.num_attention_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            rotary_dim,
+            scale: 1.0 / (config.head_dim as f32).sqrt(),
+        }
+    }
+
+    fn forward(
+        &mut self,
+        hidden_states: &Array,
+        positions: &Array,
+        cache: &mut Option<(Array, Array)>,
+    ) -> Result<Array, Exception> {
+        let seq_len = hidden_states.dim(0);
+        let n_h = self.num_heads as i32;
+        let n_kv = self.num_kv_heads as i32;
+        let hd = self.head_dim as i32;
+
+        // Q projection (doubled for gate).
+        let q_gate = self.q_proj.forward(hidden_states)?;
+        let k = self.k_proj.forward(hidden_states)?;
+        let v = self.v_proj.forward(hidden_states)?;
+
+        // Split q_gate into q and gate: [seq, num_heads, 2*head_dim].
+        let q_gate = q_gate.reshape(&[seq_len, n_h, 2 * hd])?;
+        let q = q_gate.try_index((.., .., ..hd))?;
+        let gate = q_gate.try_index((.., .., hd..))?;
+
+        // Reshape K.
+        let k = k.reshape(&[seq_len, n_kv, hd])?;
+
+        // QK norms (GemmaRMSNorm).
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
+
+        // Transpose to [1, heads, seq, head_dim] for attention.
+        let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let mut v = v
+            .reshape(&[seq_len, n_kv, hd])?
+            .transpose_axes(&[1, 0, 2])?
+            .expand_dims(0)?;
+
+        // Apply partial RoPE.
+        let offset = if positions.size() > 0 {
+            positions.reshape(&[-1])?.min(None)?.item::<i32>()
+        } else {
+            0
+        };
+
+        let rd = self.rotary_dim as i32;
+        let q = if self.rotary_dim < self.head_dim {
+            let q_rot = q.try_index((.., .., .., ..rd))?;
+            let q_pass = q.try_index((.., .., .., rd..))?;
+            let q_rot = self.rope.forward((&q_rot, offset))?;
+            mlx_rs::ops::concatenate_axis(&[q_rot, q_pass], -1)?
+        } else {
+            self.rope.forward((&q, offset))?
+        };
+
+        k = if self.rotary_dim < self.head_dim {
+            let k_rot = k.try_index((.., .., .., ..rd))?;
+            let k_pass = k.try_index((.., .., .., rd..))?;
+            let k_rot = self.rope.forward((&k_rot, offset))?;
+            mlx_rs::ops::concatenate_axis(&[k_rot, k_pass], -1)?
+        } else {
+            self.rope.forward((&k, offset))?
+        };
+
+        // KV cache update.
+        if let Some((ck, cv)) = cache.take() {
+            k = mlx_rs::ops::concatenate_axis(&[ck, k], 2)?;
+            v = mlx_rs::ops::concatenate_axis(&[cv, v], 2)?;
+        }
+        *cache = Some((k.clone(), v.clone()));
+
+        // Scaled dot-product attention.
+        let mask = if seq_len > 1 {
+            Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
+        } else {
+            None
+        };
+        let attn_out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
+
+        // Reshape: [1, heads, seq, head_dim] -> [seq, heads, head_dim].
+        let attn_out = attn_out.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
+
+        // Output gating: sigmoid(gate) * attn_output.
+        let gate_sigmoid = nn::sigmoid(&gate)?;
+        let gated = attn_out.multiply(&gate_sigmoid)?;
+
+        // Flatten and project.
+        let hidden = n_h * hd;
+        let gated = gated.reshape(&[seq_len, hidden])?;
+        self.o_proj.forward(&gated)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MlxQuantizedGatedDeltaNet
+// ---------------------------------------------------------------------------
+
+/// Quantized GDN linear attention layer for Qwen3-Next (MLX).
+struct MlxQuantizedGatedDeltaNet {
+    in_proj_qkvz: nn::QuantizedLinear,
+    in_proj_ba: nn::QuantizedLinear,
+    conv1d_weight: Param<Array>,
+    a_log: Param<Array>,
+    dt_bias: Param<Array>,
+    norm_weight: Param<Array>,
+    norm_eps: f32,
+    out_proj: nn::QuantizedLinear,
+
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_dim: usize,
+    conv_kernel_size: usize,
+
+    conv_state: RefCell<Option<Array>>,
+    ssm_state: RefCell<Option<Array>>,
+}
+
+impl MlxQuantizedGatedDeltaNet {
+    fn from_weights(
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        config: &MlxQwen3NextConfig,
+        qc: &QuantConfig,
+    ) -> Self {
+        let in_proj_qkvz = make_quantized_linear(
+            weights,
+            &format!("{prefix}.in_proj_qkvz"),
+            qc.group_size,
+            qc.bits,
+        );
+        let in_proj_ba = make_quantized_linear(
+            weights,
+            &format!("{prefix}.in_proj_ba"),
+            qc.group_size,
+            qc.bits,
+        );
+        let out_proj = make_quantized_linear(
+            weights,
+            &format!("{prefix}.out_proj"),
+            qc.group_size,
+            qc.bits,
+        );
+
+        // Raw parameter tensors (always float).
+        let conv1d_weight_raw = weights
+            .get(&format!("{prefix}.conv1d.weight"))
+            .cloned()
+            .unwrap_or_else(|| {
+                Array::zeros::<f32>(&[
+                    config.conv_dim() as i32,
+                    config.linear_conv_kernel_dim as i32,
+                ])
+                .unwrap()
+            });
+        // Squeeze if 3D [conv_dim, 1, kernel_size] → [conv_dim, kernel_size].
+        let conv1d_weight = if conv1d_weight_raw.ndim() == 3 {
+            conv1d_weight_raw.squeeze_axes(&[1]).unwrap()
+        } else {
+            conv1d_weight_raw
+        };
+
+        let a_log = weights
+            .get(&format!("{prefix}.A_log"))
+            .cloned()
+            .unwrap_or_else(|| {
+                Array::zeros::<f32>(&[config.linear_num_value_heads as i32]).unwrap()
+            });
+        let dt_bias = weights
+            .get(&format!("{prefix}.dt_bias"))
+            .cloned()
+            .unwrap_or_else(|| {
+                Array::zeros::<f32>(&[config.linear_num_value_heads as i32]).unwrap()
+            });
+        let norm_weight = weights
+            .get(&format!("{prefix}.norm.weight"))
+            .cloned()
+            .unwrap_or_else(|| Array::ones::<f32>(&[config.linear_value_head_dim as i32]).unwrap());
+
+        Self {
+            in_proj_qkvz,
+            in_proj_ba,
+            conv1d_weight: Param::new(conv1d_weight),
+            a_log: Param::new(a_log),
+            dt_bias: Param::new(dt_bias),
+            norm_weight: Param::new(norm_weight),
+            norm_eps: config.rms_norm_eps,
+            out_proj,
+            num_k_heads: config.linear_num_key_heads,
+            num_v_heads: config.linear_num_value_heads,
+            head_k_dim: config.linear_key_head_dim,
+            head_v_dim: config.linear_value_head_dim,
+            key_dim: config.key_dim(),
+            value_dim: config.value_dim(),
+            conv_dim: config.conv_dim(),
+            conv_kernel_size: config.linear_conv_kernel_dim,
+            conv_state: RefCell::new(None),
+            ssm_state: RefCell::new(None),
+        }
+    }
+
+    fn reset_state(&self) {
+        *self.conv_state.borrow_mut() = None;
+        *self.ssm_state.borrow_mut() = None;
+    }
+
+    fn extract_state(&self) -> Option<(Array, Array)> {
+        let conv = self.conv_state.borrow_mut().take();
+        let ssm = self.ssm_state.borrow_mut().take();
+        match (conv, ssm) {
+            (Some(c), Some(s)) => Some((c, s)),
+            _ => None,
+        }
+    }
+
+    fn inject_state(&self, state: &Option<(Array, Array)>) {
+        match state {
+            Some((c, s)) => {
+                *self.conv_state.borrow_mut() = Some(c.clone());
+                *self.ssm_state.borrow_mut() = Some(s.clone());
+            }
+            None => {
+                *self.conv_state.borrow_mut() = None;
+                *self.ssm_state.borrow_mut() = None;
+            }
+        }
+    }
+
+    fn forward(&mut self, hidden_states: &Array) -> Result<Array, Exception> {
+        // Reuse the same forward logic as the float variant — the only difference
+        // is that in_proj_qkvz, in_proj_ba, out_proj are QuantizedLinear.
+        mlx_rs::transforms::eval(std::iter::once(hidden_states))?;
+        let num_tokens = hidden_states.dim(0) as usize;
+        let dtype = hidden_states.dtype();
+
+        // --- 1. Input projections ---
+        let proj_qkvz = self.in_proj_qkvz.forward(hidden_states)?;
+        let proj_ba = self.in_proj_ba.forward(hidden_states)?;
+
+        let v_per_k = self.num_v_heads / self.num_k_heads;
+        let per_group = self.head_k_dim
+            + self.head_k_dim
+            + v_per_k * self.head_v_dim
+            + v_per_k * self.head_v_dim;
+        let proj_qkvz =
+            proj_qkvz.reshape(&[num_tokens as i32, self.num_k_heads as i32, per_group as i32])?;
+
+        let hk = self.head_k_dim as i32;
+        let q_grouped = proj_qkvz.try_index((.., .., ..hk))?;
+        let k_grouped = proj_qkvz.try_index((.., .., hk..2 * hk))?;
+        let v_end = 2 * hk + (v_per_k * self.head_v_dim) as i32;
+        let v_grouped = proj_qkvz.try_index((.., .., 2 * hk..v_end))?;
+        let z_grouped = proj_qkvz.try_index((.., .., v_end..))?;
+
+        let q_flat = q_grouped.reshape(&[num_tokens as i32, self.key_dim as i32])?;
+        let k_flat = k_grouped.reshape(&[num_tokens as i32, self.key_dim as i32])?;
+        let v_flat = v_grouped.reshape(&[num_tokens as i32, self.value_dim as i32])?;
+        let z = z_grouped.reshape(&[num_tokens as i32, self.value_dim as i32])?;
+
+        let proj_ba = proj_ba.reshape(&[
+            num_tokens as i32,
+            self.num_k_heads as i32,
+            (2 * v_per_k) as i32,
+        ])?;
+        let b = proj_ba
+            .try_index((.., .., ..v_per_k as i32))?
+            .reshape(&[num_tokens as i32, self.num_v_heads as i32])?;
+        let a = proj_ba
+            .try_index((.., .., v_per_k as i32..))?
+            .reshape(&[num_tokens as i32, self.num_v_heads as i32])?;
+
+        let mixed_qkv = mlx_rs::ops::concatenate_axis(&[q_flat, k_flat, v_flat], 1)?;
+
+        // --- 2. Causal conv1d + SiLU ---
+        mlx_rs::transforms::eval(std::iter::once(&mixed_qkv))?;
+        let conv_out = self.causal_conv1d(&mixed_qkv, num_tokens)?;
+
+        // --- 3. Split conv output ---
+        let q_conv = conv_out.try_index((.., ..self.key_dim as i32))?;
+        let k_conv = conv_out.try_index((.., self.key_dim as i32..(2 * self.key_dim) as i32))?;
+        let v_conv = conv_out.try_index((.., (2 * self.key_dim) as i32..))?;
+
+        // --- 4. Gating ---
+        let a_plus_bias = a.add(&self.dt_bias)?;
+        mlx_rs::transforms::eval(std::iter::once(&a_plus_bias))?;
+        let sp = mlx_rs::ops::log(&a_plus_bias.exp()?.add(Array::from_f32(1.0))?)?;
+        let a_exp = self.a_log.as_dtype(Dtype::Float32)?.exp()?;
+        let g = sp.as_dtype(Dtype::Float32)?.multiply(&a_exp)?.negative()?;
+        let g = g.as_dtype(dtype)?;
+        let beta = nn::sigmoid(&b)?;
+
+        // --- 5. Recurrence ---
+        mlx_rs::transforms::eval([&q_conv, &k_conv, &v_conv, &g, &beta].iter().copied())?;
+        let output =
+            self.gated_delta_recurrence(&q_conv, &k_conv, &v_conv, &g, &beta, num_tokens)?;
+
+        // --- 6. RMSNormGated ---
+        let z = z.reshape(&[
+            num_tokens as i32,
+            self.num_v_heads as i32,
+            self.head_v_dim as i32,
+        ])?;
+        let normed = self.rms_norm_gated(&output, &z)?;
+
+        // --- 7. Output projection ---
+        let normed_flat = normed.reshape(&[num_tokens as i32, self.value_dim as i32])?;
+        self.out_proj.forward(&normed_flat)
+    }
+
+    fn causal_conv1d(&self, mixed_qkv: &Array, num_tokens: usize) -> Result<Array, Exception> {
+        let k = self.conv_kernel_size;
+        let mut conv_st = self.conv_state.borrow_mut();
+
+        let pad = match conv_st.take() {
+            Some(s) => s,
+            None => Array::zeros::<f32>(&[(k - 1) as i32, self.conv_dim as i32])?,
+        };
+
+        let padded = mlx_rs::ops::concatenate_axis(&[pad, mixed_qkv.clone()], 0)?;
+        mlx_rs::transforms::eval(std::iter::once(&padded))?;
+
+        let mut outputs = Vec::with_capacity(num_tokens);
+        for t in 0..num_tokens {
+            let window = padded.try_index(t as i32..(t + k) as i32)?;
+            let window_t = window.transpose_axes(&[1, 0])?;
+            let out = window_t.multiply(&self.conv1d_weight)?.sum_axis(-1, None)?;
+            outputs.push(out);
+        }
+        let output = mlx_rs::ops::stack_axis(&outputs, 0)?;
+        let output = nn::silu(&output)?;
+
+        let start = num_tokens.saturating_sub(k - 1);
+        let len = num_tokens.min(k - 1);
+        *conv_st = Some(mixed_qkv.try_index(start as i32..(start + len) as i32)?);
+
+        Ok(output)
+    }
+
+    fn gated_delta_recurrence(
+        &self,
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        g: &Array,
+        beta: &Array,
+        num_tokens: usize,
+    ) -> Result<Array, Exception> {
+        let mut ssm_st = self.ssm_state.borrow_mut();
+        let mut state = match ssm_st.take() {
+            Some(s) => s,
+            None => Array::zeros::<f32>(&[
+                self.num_v_heads as i32,
+                self.head_v_dim as i32,
+                self.head_k_dim as i32,
+            ])?,
+        };
+
+        let q = q.reshape(&[
+            num_tokens as i32,
+            self.num_k_heads as i32,
+            self.head_k_dim as i32,
+        ])?;
+        let k = k.reshape(&[
+            num_tokens as i32,
+            self.num_k_heads as i32,
+            self.head_k_dim as i32,
+        ])?;
+        let v = v.reshape(&[
+            num_tokens as i32,
+            self.num_v_heads as i32,
+            self.head_v_dim as i32,
+        ])?;
+
+        let mut outputs = Vec::with_capacity(num_tokens);
+
+        for t in 0..num_tokens {
+            let q_t = q.try_index(t as i32)?;
+            let k_t = k.try_index(t as i32)?;
+            let v_t = v.try_index(t as i32)?;
+            let g_t = g.try_index(t as i32)?;
+            let beta_t = beta.try_index(t as i32)?;
+
+            let q_norm = mlx_rs::ops::sqrt(&q_t.square()?.sum_axis(-1, true)?)?;
+            let q_t = q_t.divide(&q_norm.add(Array::from_f32(1e-12))?)?;
+            let k_norm = mlx_rs::ops::sqrt(&k_t.square()?.sum_axis(-1, true)?)?;
+            let k_t = k_t.divide(&k_norm.add(Array::from_f32(1e-12))?)?;
+
+            let q_f32 = q_t.as_dtype(Dtype::Float32)?;
+            let k_f32 = k_t.as_dtype(Dtype::Float32)?;
+            let v_f32 = v_t.as_dtype(Dtype::Float32)?;
+            let g_f32 = g_t.as_dtype(Dtype::Float32)?;
+            let beta_f32 = beta_t.as_dtype(Dtype::Float32)?;
+
+            let mut head_outputs = Vec::with_capacity(self.num_v_heads);
+
+            for h_v in 0..self.num_v_heads {
+                let h_k = h_v * self.num_k_heads / self.num_v_heads;
+
+                let g_h = g_f32.try_index(h_v as i32)?.exp()?;
+                let beta_h = beta_f32.try_index(h_v as i32)?;
+                let k_head = k_f32.try_index(h_k as i32)?;
+                let v_head = v_f32.try_index(h_v as i32)?;
+
+                let v_col = v_head.reshape(&[self.head_v_dim as i32, 1])?;
+                let k_row = k_head.reshape(&[1, self.head_k_dim as i32])?;
+                let outer = v_col.multiply(&k_row)?;
+
+                let s_h = state.try_index(h_v as i32)?;
+                let new_s = s_h.multiply(&g_h)?.add(&outer.multiply(&beta_h)?)?;
+
+                let q_head = q_f32.try_index(h_k as i32)?;
+                let q_col = q_head.reshape(&[self.head_k_dim as i32, 1])?;
+                let o_h = mlx_rs::ops::matmul(&new_s, &q_col)?.squeeze_axes(&[-1])?;
+
+                head_outputs.push((h_v, o_h, new_s));
+            }
+
+            let mut state_slices = Vec::with_capacity(self.num_v_heads);
+            let mut out_slices = Vec::with_capacity(self.num_v_heads);
+            for (_, o_h, new_s) in &head_outputs {
+                state_slices.push(new_s.expand_dims(0)?);
+                out_slices.push(o_h.as_dtype(v.dtype())?.expand_dims(0)?);
+            }
+            state = mlx_rs::ops::concatenate_axis(&state_slices, 0)?;
+            let token_out = mlx_rs::ops::concatenate_axis(&out_slices, 0)?;
+            outputs.push(token_out);
+
+            if (t + 1) % 32 == 0 || t + 1 == num_tokens {
+                mlx_rs::transforms::eval(std::iter::once(&state))?;
+            }
+        }
+
+        *ssm_st = Some(state);
+        let result = mlx_rs::ops::stack_axis(&outputs, 0)?;
+        Ok(result)
+    }
+
+    fn rms_norm_gated(&self, x: &Array, z: &Array) -> Result<Array, Exception> {
+        let x_f32 = x.as_dtype(Dtype::Float32)?;
+        let variance = x_f32.square()?.mean_axis(-1, true)?;
+        let rsqrt = mlx_rs::ops::rsqrt(&variance.add(Array::from_f32(self.norm_eps))?)?;
+        let normed = x_f32.multiply(&rsqrt)?.as_dtype(x.dtype())?;
+        let normed = normed.multiply(&self.norm_weight)?;
+        let z_sigmoid = nn::sigmoid(z)?;
+        normed.multiply(&z_sigmoid)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MlxQuantizedQwen3NextDecoderLayer
+// ---------------------------------------------------------------------------
+
+enum MlxQuantizedQwen3NextAttnVariant {
+    FullAttention(MlxQuantizedQwen3NextAttention),
+    LinearAttention(MlxQuantizedGatedDeltaNet),
+}
+
+enum MlxQuantizedQwen3NextMlpVariant {
+    Dense(MlxQuantizedLlamaMLP),
+    MoE(MlxQuantizedQwen3MoeMoE),
+}
+
+struct MlxQuantizedQwen3NextDecoderLayer {
+    attn: MlxQuantizedQwen3NextAttnVariant,
+    mlp: MlxQuantizedQwen3NextMlpVariant,
+    input_layernorm: nn::RmsNorm,
+    post_attention_layernorm: nn::RmsNorm,
+    is_full_attn: bool,
+}
+
+impl MlxQuantizedQwen3NextDecoderLayer {
+    fn from_weights(
+        weights: &HashMap<String, Array>,
+        prefix: &str,
+        config: &MlxQwen3NextConfig,
+        layer_idx: usize,
+        qc: &QuantConfig,
+    ) -> Self {
+        let is_full_attn = config.is_full_attention(layer_idx);
+        let attn = if is_full_attn {
+            MlxQuantizedQwen3NextAttnVariant::FullAttention(
+                MlxQuantizedQwen3NextAttention::from_weights(
+                    weights,
+                    &format!("{prefix}.self_attn"),
+                    config,
+                    qc,
+                ),
+            )
+        } else {
+            MlxQuantizedQwen3NextAttnVariant::LinearAttention(
+                MlxQuantizedGatedDeltaNet::from_weights(
+                    weights,
+                    &format!("{prefix}.linear_attn"),
+                    config,
+                    qc,
+                ),
+            )
+        };
+
+        let moe_config = config.moe_config();
+        let mlp = if config.is_moe_layer(layer_idx) {
+            MlxQuantizedQwen3NextMlpVariant::MoE(MlxQuantizedQwen3MoeMoE::from_weights(
+                weights,
+                &format!("{prefix}.mlp"),
+                &moe_config,
+                qc,
+            ))
+        } else {
+            MlxQuantizedQwen3NextMlpVariant::Dense(MlxQuantizedLlamaMLP::from_weights(
+                weights,
+                &format!("{prefix}.mlp"),
+                qc,
+            ))
+        };
+
+        // GemmaRMSNorm: weight+1.
+        let mut input_layernorm = nn::RmsNormBuilder::new(config.hidden_size as i32)
+            .eps(config.rms_norm_eps)
+            .build()
+            .unwrap();
+        assign_gemma_norm_weight(
+            &mut input_layernorm,
+            weights,
+            &format!("{prefix}.input_layernorm.weight"),
+        );
+        let mut post_attention_layernorm = nn::RmsNormBuilder::new(config.hidden_size as i32)
+            .eps(config.rms_norm_eps)
+            .build()
+            .unwrap();
+        assign_gemma_norm_weight(
+            &mut post_attention_layernorm,
+            weights,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+        );
+
+        Self {
+            attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            is_full_attn,
+        }
+    }
+
+    fn forward(
+        &mut self,
+        hidden_states: &Array,
+        positions: &Array,
+        cache: &mut Option<(Array, Array)>,
+    ) -> Result<Array, Exception> {
+        let normed = self.input_layernorm.forward(hidden_states)?;
+        let attn_output = match &mut self.attn {
+            MlxQuantizedQwen3NextAttnVariant::FullAttention(attn) => {
+                attn.forward(&normed, positions, cache)?
+            }
+            MlxQuantizedQwen3NextAttnVariant::LinearAttention(gdn) => gdn.forward(&normed)?,
+        };
+        let hidden_states = hidden_states.add(&attn_output)?;
+
+        let normed = self.post_attention_layernorm.forward(&hidden_states)?;
+        let mlp_output = match &mut self.mlp {
+            MlxQuantizedQwen3NextMlpVariant::Dense(mlp) => mlp.forward(&normed)?,
+            MlxQuantizedQwen3NextMlpVariant::MoE(moe) => moe.forward(&normed)?,
+        };
+        hidden_states.add(&mlp_output)
+    }
+
+    fn reset_recurrent_state(&self) {
+        if let MlxQuantizedQwen3NextAttnVariant::LinearAttention(gdn) = &self.attn {
+            gdn.reset_state();
+        }
+    }
+
+    fn extract_recurrent_state(&self) -> Option<Option<(Array, Array)>> {
+        match &self.attn {
+            MlxQuantizedQwen3NextAttnVariant::LinearAttention(gdn) => Some(gdn.extract_state()),
+            MlxQuantizedQwen3NextAttnVariant::FullAttention(_) => None,
+        }
+    }
+
+    fn inject_recurrent_state(&self, state: &Option<(Array, Array)>) {
+        if let MlxQuantizedQwen3NextAttnVariant::LinearAttention(gdn) = &self.attn {
+            gdn.inject_state(state);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MlxQuantizedQwen3NextForCausalLM
+// ---------------------------------------------------------------------------
+
+/// Quantized Qwen3-Next for causal language modeling using MLX.
+pub struct MlxQuantizedQwen3NextForCausalLM {
+    embed_tokens: MlxEmbedTokens,
+    layers: Vec<MlxQuantizedQwen3NextDecoderLayer>,
+    norm: nn::RmsNorm,
+    lm_head: Option<MlxLmHead>,
+    tie_word_embeddings: bool,
+    num_attn_layers: usize,
+}
+
+impl MlxQuantizedQwen3NextForCausalLM {
+    pub fn load(
+        model_dir: &Path,
+        config: &MlxQwen3NextConfig,
+        qc: &QuantConfig,
+        _dtype: Dtype,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let weights = load_safetensors_weights(model_dir)?;
+
+        let embed_tokens =
+            MlxEmbedTokens::from_weights(&weights, "model.embed_tokens", qc.group_size, qc.bits);
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            layers.push(MlxQuantizedQwen3NextDecoderLayer::from_weights(
+                &weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                qc,
+            ));
+        }
+
+        let mut norm = nn::RmsNormBuilder::new(config.hidden_size as i32)
+            .eps(config.rms_norm_eps)
+            .build()?;
+        assign_gemma_norm_weight(&mut norm, &weights, "model.norm.weight");
+
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(MlxLmHead::from_weights(
+                &weights,
+                "lm_head",
+                qc.group_size,
+                qc.bits,
+            ))
+        };
+
+        mlx_rs::transforms::eval(weights.values())?;
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            tie_word_embeddings: config.tie_word_embeddings,
+            num_attn_layers: config.num_full_attention_layers(),
+        })
+    }
+}
+
+impl super::MlxModel for MlxQuantizedQwen3NextForCausalLM {
+    fn forward(
+        &mut self,
+        input_ids: &Array,
+        positions: &Array,
+        kv_cache: &mut MlxKvCache,
+    ) -> mlx_rs::error::Result<Array> {
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+
+        let mut kv_slot = 0;
+        for layer in self.layers.iter_mut() {
+            if layer.is_full_attn {
+                hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[kv_slot])?;
+                kv_slot += 1;
+            } else {
+                let mut dummy_cache = None;
+                hidden_states = layer.forward(&hidden_states, positions, &mut dummy_cache)?;
+            }
+        }
+
+        hidden_states = self.norm.forward(&hidden_states)?;
+
+        let logits = if self.tie_word_embeddings {
+            self.embed_tokens.as_linear(&hidden_states)?
+        } else {
+            self.lm_head.as_mut().unwrap().forward(&hidden_states)?
+        };
+
+        logits.as_dtype(Dtype::Float32)
+    }
+
+    fn num_layers(&self) -> usize {
+        self.num_attn_layers
+    }
+
+    fn hidden_states(
+        &mut self,
+        input_ids: &Array,
+        positions: &Array,
+    ) -> mlx_rs::error::Result<Array> {
+        let mut kv_cache: MlxKvCache = (0..self.num_attn_layers).map(|_| None).collect();
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        let mut kv_slot = 0;
+        for layer in self.layers.iter_mut() {
+            if layer.is_full_attn {
+                hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[kv_slot])?;
+                kv_slot += 1;
+            } else {
+                let mut dummy_cache = None;
+                hidden_states = layer.forward(&hidden_states, positions, &mut dummy_cache)?;
+            }
+        }
+        self.norm.forward(&hidden_states)
+    }
+
+    fn reset_recurrent_state(&self) {
+        for layer in &self.layers {
+            layer.reset_recurrent_state();
+        }
+    }
+
+    fn num_recurrent_layers(&self) -> usize {
+        self.layers
+            .iter()
+            .filter(|l| matches!(l.attn, MlxQuantizedQwen3NextAttnVariant::LinearAttention(_)))
+            .count()
+    }
+
+    fn extract_recurrent_state(&self) -> super::MlxRecurrentState {
+        self.layers
+            .iter()
+            .filter_map(|l| l.extract_recurrent_state())
+            .collect()
+    }
+
+    fn inject_recurrent_state(&self, state: &[Option<(Array, Array)>]) {
+        let mut idx = 0;
+        for layer in &self.layers {
+            if matches!(
+                layer.attn,
+                MlxQuantizedQwen3NextAttnVariant::LinearAttention(_)
+            ) {
+                if let Some(s) = state.get(idx) {
+                    layer.inject_recurrent_state(s);
+                }
+                idx += 1;
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -1027,17 +1913,16 @@ pub fn create_mlx_qwen3_next(
 }
 
 /// Factory function for creating a quantized MLX Qwen3-Next model.
-///
-/// For now, reuses the float implementation (quantized MLX Qwen3-Next can be
-/// added later when there's a suitable test model).
 pub fn create_mlx_quantized_qwen3_next(
     model_dir: &Path,
     config: &HfModelConfig,
     dtype: Dtype,
 ) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
-    // TODO: implement full quantized variant with QuantizedLinear for projections.
-    // For now, load as float (MLX quantized models auto-dequantize float weights).
-    create_mlx_qwen3_next(model_dir, config, dtype)
+    let next_config = MlxQwen3NextConfig::from_hf_config(config)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let qc = QuantConfig::from_hf_config(config).unwrap_or_default();
+    let model = MlxQuantizedQwen3NextForCausalLM::load(model_dir, &next_config, &qc, dtype)?;
+    Ok(Box::new(model))
 }
 
 // ===========================================================================

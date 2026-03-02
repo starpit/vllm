@@ -582,7 +582,7 @@ impl MlxGate {
 }
 
 /// Mixture of Experts layer with sigmoid-gated shared expert (MLX quantized).
-struct MlxQuantizedQwen3MoeMoE {
+pub(crate) struct MlxQuantizedQwen3MoeMoE {
     gate: MlxGate,
     experts: Vec<MlxQuantizedLlamaMLP>,
     shared_expert: Option<MlxQuantizedLlamaMLP>,
@@ -592,7 +592,7 @@ struct MlxQuantizedQwen3MoeMoE {
 }
 
 impl MlxQuantizedQwen3MoeMoE {
-    fn from_weights(
+    pub(crate) fn from_weights(
         weights: &HashMap<String, Array>,
         prefix: &str,
         config: &MlxQwen3MoeConfig,
@@ -677,7 +677,7 @@ impl MlxQuantizedQwen3MoeMoE {
         }
     }
 
-    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+    pub(crate) fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         // Evaluate x for routing decisions.
         mlx_rs::transforms::eval(std::iter::once(x))?;
 

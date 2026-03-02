@@ -112,6 +112,8 @@ pub struct CandleWorker {
     input_batch: InputBatch,
     /// Per-request KV cache (legacy, used when block pool is not available).
     kv_caches: HashMap<String, KvCache>,
+    /// Per-request recurrent state for hybrid models (e.g., Qwen3-Next GDN layers).
+    recurrent_states: HashMap<String, vllm_models::RecurrentState>,
     /// Model KV head count (set after load_model).
     num_kv_heads: usize,
     /// Model head dimension (set after load_model).
@@ -153,6 +155,7 @@ impl CandleWorker {
             kv_block_pool: None,
             input_batch: InputBatch::new(),
             kv_caches: HashMap::new(),
+            recurrent_states: HashMap::new(),
             num_kv_heads: 0,
             head_dim: 0,
             preloaded_tokenizer: None,
@@ -1129,6 +1132,7 @@ impl Worker for CandleWorker {
             self.token_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.kv_caches.remove(req_id);
+            self.recurrent_states.remove(req_id);
             #[cfg(feature = "guided-decoding")]
             self.grammar_states.remove(req_id);
             self.mm_data_map.remove(req_id);
@@ -1542,10 +1546,15 @@ impl Worker for CandleWorker {
 
         let mut per_req_logits = Vec::with_capacity(req_inputs.len());
         for req_input in &req_inputs {
-            // Reset recurrent state for hybrid models (e.g., Qwen3-Next GDN layers).
-            // Each request processes independently; GDN state doesn't persist across
-            // different requests in the same step.
-            model.reset_recurrent_state();
+            // Inject per-request recurrent state for hybrid models (e.g., Qwen3-Next GDN).
+            // If no saved state exists yet, initialize with empty state.
+            if model.num_recurrent_layers() > 0 {
+                if let Some(rs) = self.recurrent_states.get(&req_input.req_id) {
+                    model.inject_recurrent_state(rs);
+                } else {
+                    model.reset_recurrent_state();
+                }
+            }
 
             let mm_data = self.mm_data_map.remove(&req_input.req_id);
             model.set_mm_data(mm_data);
@@ -1567,6 +1576,12 @@ impl Worker for CandleWorker {
                     ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
                 })?
             };
+            // Extract recurrent state after forward for hybrid models.
+            if model.num_recurrent_layers() > 0 {
+                self.recurrent_states
+                    .insert(req_input.req_id.clone(), model.extract_recurrent_state());
+            }
+
             per_req_logits.push(logits);
         }
 

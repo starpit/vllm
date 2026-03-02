@@ -101,6 +101,8 @@ pub struct MlxWorker {
     sampling_params_map: HashMap<String, SamplingParams>,
     /// Per-request KV cache (simple contiguous, no paging).
     kv_caches: HashMap<String, MlxKvCache>,
+    /// Per-request recurrent state for hybrid models (e.g., Qwen3-Next GDN layers).
+    recurrent_states: HashMap<String, super::models::MlxRecurrentState>,
 
     /// Per-request grammar guide state for constrained decoding.
     #[cfg(feature = "guided-decoding")]
@@ -145,6 +147,7 @@ impl MlxWorker {
             token_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
             kv_caches: HashMap::new(),
+            recurrent_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
@@ -688,6 +691,7 @@ impl Worker for MlxWorker {
             self.token_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.kv_caches.remove(req_id);
+            self.recurrent_states.remove(req_id);
             #[cfg(feature = "guided-decoding")]
             self.grammar_states.remove(req_id);
             self.mm_data_map.remove(req_id);
@@ -973,8 +977,14 @@ impl Worker for MlxWorker {
         let mut lazy_outputs: Vec<LazyReqOutput> = Vec::with_capacity(req_inputs.len());
 
         for req_input in &req_inputs {
-            // Reset recurrent state for hybrid models (e.g., Qwen3-Next GDN layers).
-            model.reset_recurrent_state();
+            // Inject per-request recurrent state for hybrid models (e.g., Qwen3-Next GDN).
+            if model.num_recurrent_layers() > 0 {
+                if let Some(rs) = self.recurrent_states.get(&req_input.req_id) {
+                    model.inject_recurrent_state(rs);
+                } else {
+                    model.reset_recurrent_state();
+                }
+            }
 
             let input_ids = Array::from_iter(
                 req_input.token_ids.iter().map(|&t| t as i32),
@@ -1001,6 +1011,12 @@ impl Worker for MlxWorker {
                 .map_err(|e| {
                     ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
                 })?;
+
+            // Extract recurrent state after forward for hybrid models.
+            if model.num_recurrent_layers() > 0 {
+                self.recurrent_states
+                    .insert(req_input.req_id.clone(), model.extract_recurrent_state());
+            }
 
             // Extract last-position logits (still lazy — no eval).
             let last_pos = req_input.token_ids.len() - 1;
@@ -1371,6 +1387,7 @@ mod tests {
             block_size: 16,
             lora_adapter: None,
             pooling_strategy: "auto".to_string(),
+            is_pooling: false,
         })
     }
 
@@ -1413,6 +1430,7 @@ mod tests {
             block_size: 16,
             lora_adapter: None,
             pooling_strategy: "auto".to_string(),
+            is_pooling: false,
         };
         assert!(config.mlx_dtype().unwrap().is_none());
 

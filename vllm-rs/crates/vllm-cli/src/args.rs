@@ -17,8 +17,8 @@ pub struct Cli {
 pub enum Commands {
     /// Start the OpenAI-compatible API server.
     Serve(Box<ServeArgs>),
-    /// Run a quick benchmark against a model.
-    Bench(BenchArgs),
+    /// Run benchmarks (latency, serving, throughput).
+    Bench(BenchCommand),
     /// Process a batch of OpenAI-compatible requests offline.
     Batch(BatchArgs),
     /// Convert model weights between formats (stub).
@@ -170,10 +170,27 @@ impl ServeArgs {
     }
 }
 
-/// Arguments for the `bench` subcommand.
+/// Container for `bench` subcommands.
 #[derive(Parser, Debug)]
-#[command(override_usage = "vllm bench [MODEL] [OPTIONS]")]
-pub struct BenchArgs {
+pub struct BenchCommand {
+    #[command(subcommand)]
+    pub command: BenchCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BenchCommands {
+    /// Measure latency (TTFT, ITL, throughput) for a model.
+    Latency(Box<BenchLatencyArgs>),
+    /// Benchmark online serving throughput (not yet implemented).
+    Serve(BenchServeArgs),
+    /// Benchmark offline throughput (not yet implemented).
+    Throughput(BenchThroughputArgs),
+}
+
+/// Arguments for `vllm bench latency`.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm bench latency [MODEL] [OPTIONS]")]
+pub struct BenchLatencyArgs {
     /// Model: local path or HuggingFace model ID.
     pub model_tag: Option<String>,
 
@@ -189,21 +206,25 @@ pub struct BenchArgs {
     #[arg(long, default_value = "auto")]
     pub dtype: String,
 
-    /// Number of requests to send.
+    /// Number of benchmark iterations.
     #[arg(long, default_value_t = 10)]
-    pub num_requests: usize,
+    pub num_iters: usize,
 
-    /// Prompt length in tokens.
+    /// Input prompt length in tokens.
     #[arg(long, default_value_t = 32)]
-    pub prompt_len: usize,
+    pub input_len: usize,
 
-    /// Maximum output tokens per request.
+    /// Number of output tokens per iteration.
     #[arg(long, default_value_t = 64)]
-    pub max_tokens: usize,
+    pub output_len: usize,
 
-    /// Number of warmup requests before timing.
+    /// Number of warmup iterations before timing.
     #[arg(long, default_value_t = 2)]
-    pub warmup: usize,
+    pub num_iters_warmup: usize,
+
+    /// Number of requests per iteration (batch size).
+    #[arg(long, default_value_t = 8)]
+    pub batch_size: usize,
 
     /// HuggingFace token.
     #[arg(long, env = "HF_TOKEN")]
@@ -220,9 +241,13 @@ pub struct BenchArgs {
     /// Specific GGUF filename to download from a HuggingFace repo.
     #[arg(long)]
     pub gguf_file: Option<String>,
+
+    /// Path to write JSON results.
+    #[arg(long)]
+    pub output_json: Option<String>,
 }
 
-impl BenchArgs {
+impl BenchLatencyArgs {
     /// Resolve the effective model path/ID.
     pub fn resolved_model(&self) -> Result<String, String> {
         if let Some(ref tag) = self.model_tag {
@@ -234,6 +259,14 @@ impl BenchArgs {
         }
     }
 }
+
+/// Arguments for `vllm bench serve` (stub).
+#[derive(Parser, Debug)]
+pub struct BenchServeArgs {}
+
+/// Arguments for `vllm bench throughput` (stub).
+#[derive(Parser, Debug)]
+pub struct BenchThroughputArgs {}
 
 /// Arguments for the `batch` subcommand.
 #[derive(Parser, Debug)]
@@ -384,26 +417,65 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_bench_positional_model() {
-        let cli = Cli::parse_from(["vllm", "bench", "/path/to/model", "--num-requests", "5"]);
+    fn test_parse_bench_latency_positional_model() {
+        let cli = Cli::parse_from([
+            "vllm",
+            "bench",
+            "latency",
+            "/path/to/model",
+            "--num-iters",
+            "5",
+        ]);
         match cli.command {
-            Commands::Bench(args) => {
-                assert_eq!(args.resolved_model().unwrap(), "/path/to/model");
-                assert_eq!(args.num_requests, 5);
-            }
+            Commands::Bench(cmd) => match cmd.command {
+                BenchCommands::Latency(args) => {
+                    assert_eq!(args.resolved_model().unwrap(), "/path/to/model");
+                    assert_eq!(args.num_iters, 5);
+                }
+                _ => panic!("expected Latency subcommand"),
+            },
             _ => panic!("expected Bench command"),
         }
     }
 
     #[test]
-    fn test_parse_bench_flag_model() {
-        let cli = Cli::parse_from(["vllm", "bench", "--model", "/path/to/model"]);
+    fn test_parse_bench_latency_flag_model() {
+        let cli = Cli::parse_from(["vllm", "bench", "latency", "--model", "/path/to/model"]);
         match cli.command {
-            Commands::Bench(args) => {
-                assert_eq!(args.resolved_model().unwrap(), "/path/to/model");
-            }
+            Commands::Bench(cmd) => match cmd.command {
+                BenchCommands::Latency(args) => {
+                    assert_eq!(args.resolved_model().unwrap(), "/path/to/model");
+                }
+                _ => panic!("expected Latency subcommand"),
+            },
             _ => panic!("expected Bench command"),
         }
+    }
+
+    #[test]
+    fn test_parse_bench_latency_defaults() {
+        let cli = Cli::parse_from(["vllm", "bench", "latency", "some-model"]);
+        match cli.command {
+            Commands::Bench(cmd) => match cmd.command {
+                BenchCommands::Latency(args) => {
+                    assert_eq!(args.num_iters, 10);
+                    assert_eq!(args.input_len, 32);
+                    assert_eq!(args.output_len, 64);
+                    assert_eq!(args.num_iters_warmup, 2);
+                    assert_eq!(args.batch_size, 8);
+                    assert!(args.output_json.is_none());
+                }
+                _ => panic!("expected Latency subcommand"),
+            },
+            _ => panic!("expected Bench command"),
+        }
+    }
+
+    #[test]
+    fn test_bench_requires_subcommand() {
+        // `vllm bench` alone (no subcommand) should fail to parse.
+        let result = Cli::try_parse_from(["vllm", "bench"]);
+        assert!(result.is_err());
     }
 
     #[test]

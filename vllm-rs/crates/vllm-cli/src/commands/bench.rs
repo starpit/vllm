@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! `vllm bench` subcommand — throughput & latency benchmark.
+//! `vllm bench` subcommand — benchmarking tools.
 //!
-//! Measures:
+//! `vllm bench latency` measures:
 //! - **Prefill latency** (time-to-first-token, TTFT)
 //! - **Decode inter-token latency** (ITL)
 //! - **Total throughput** (tokens/sec)
@@ -17,7 +17,7 @@ use vllm_common::telemetry;
 use vllm_core::scheduler::output::{CachedRequestData, NewRequestData, SchedulerOutput};
 use vllm_executor::worker::Worker;
 
-use crate::args::BenchArgs;
+use crate::args::{BenchCommand, BenchCommands, BenchLatencyArgs};
 
 // ---------------------------------------------------------------------------
 // Backend-polymorphic worker creation
@@ -42,7 +42,7 @@ fn init_bench_cache(worker: &mut dyn Worker, gpu_memory_utilization: f64) -> Res
 }
 
 #[cfg(feature = "metal")]
-fn create_bench_worker(args: &BenchArgs, model: String) -> Result<Box<dyn Worker>> {
+fn create_bench_worker(args: &BenchLatencyArgs, model: String) -> Result<Box<dyn Worker>> {
     use vllm_mlx::worker::{MlxWorker, MlxWorkerConfig};
 
     info!("Bench: using MLX backend (Apple Silicon GPU)");
@@ -64,7 +64,7 @@ fn create_bench_worker(args: &BenchArgs, model: String) -> Result<Box<dyn Worker
 }
 
 #[cfg(not(feature = "metal"))]
-fn create_bench_worker(args: &BenchArgs, model: String) -> Result<Box<dyn Worker>> {
+fn create_bench_worker(args: &BenchLatencyArgs, model: String) -> Result<Box<dyn Worker>> {
     use vllm_executor::candle_worker::{CandleWorker, CandleWorkerConfig};
 
     info!("Bench: using Candle backend");
@@ -111,26 +111,27 @@ fn make_prefill_output(req_id: &str, prompt_ids: &[u32]) -> SchedulerOutput {
     }
 }
 
-/// Build a scheduler output for a decode step (cached request, 1 token).
-fn make_decode_output(req_id: &str) -> SchedulerOutput {
+/// Build a scheduler output for a batch decode step.
+fn make_batch_decode_output(req_ids: &[String]) -> SchedulerOutput {
     let mut num_scheduled = HashMap::new();
-    num_scheduled.insert(req_id.to_string(), 1);
+    for id in req_ids {
+        num_scheduled.insert(id.clone(), 1);
+    }
 
     SchedulerOutput {
         scheduled_cached_reqs: CachedRequestData {
-            req_ids: vec![req_id.to_string()],
+            req_ids: req_ids.to_vec(),
             ..CachedRequestData::make_empty()
         },
         num_scheduled_tokens: num_scheduled,
-        total_num_scheduled_tokens: 1,
+        total_num_scheduled_tokens: req_ids.len(),
         ..SchedulerOutput::make_empty()
     }
 }
 
-/// Build a scheduler output that marks a request as finished.
-fn make_finish_output(req_id: &str) -> SchedulerOutput {
-    let mut finished = std::collections::HashSet::new();
-    finished.insert(req_id.to_string());
+/// Build a scheduler output that marks requests as finished.
+fn make_batch_finish_output(req_ids: &[String]) -> SchedulerOutput {
+    let finished = req_ids.iter().cloned().collect();
     SchedulerOutput {
         finished_req_ids: finished,
         ..SchedulerOutput::make_empty()
@@ -141,58 +142,65 @@ fn make_finish_output(req_id: &str) -> SchedulerOutput {
 // Bench runner
 // ---------------------------------------------------------------------------
 
-/// Per-request timing results.
-struct RequestTiming {
+/// Per-iteration timing results.
+struct IterationTiming {
     prefill_ms: f64,
     decode_itl_ms: Vec<f64>,
 }
 
-/// Run one request through prefill + decode steps, returning timing.
-fn run_one_request(
+/// Run one iteration: prefill + decode for `batch_size` requests.
+fn run_iteration(
     worker: &mut dyn Worker,
-    req_id: &str,
+    iter_prefix: &str,
+    batch_size: usize,
     prompt_ids: &[u32],
-    max_tokens: usize,
-) -> Result<RequestTiming> {
-    // Prefill.
+    output_len: usize,
+) -> Result<IterationTiming> {
+    let req_ids: Vec<String> = (0..batch_size)
+        .map(|i| format!("{iter_prefix}-{i}"))
+        .collect();
+
+    // Prefill all requests in the batch.
     let prefill_start = Instant::now();
-    let sched = make_prefill_output(req_id, prompt_ids);
-    worker.execute_model(&sched)?;
+    for req_id in &req_ids {
+        let sched = make_prefill_output(req_id, prompt_ids);
+        worker.execute_model(&sched)?;
+    }
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Decode steps.
-    let mut decode_itl_ms = Vec::with_capacity(max_tokens.saturating_sub(1));
-    for _ in 1..max_tokens {
+    // Decode steps (all requests together).
+    let mut decode_itl_ms = Vec::with_capacity(output_len.saturating_sub(1));
+    for _ in 1..output_len {
         let decode_start = Instant::now();
-        let sched = make_decode_output(req_id);
+        let sched = make_batch_decode_output(&req_ids);
         worker.execute_model(&sched)?;
         decode_itl_ms.push(decode_start.elapsed().as_secs_f64() * 1000.0);
     }
 
     // Clean up.
-    let finish = make_finish_output(req_id);
+    let finish = make_batch_finish_output(&req_ids);
     worker.execute_model(&finish)?;
 
-    Ok(RequestTiming {
+    Ok(IterationTiming {
         prefill_ms,
         decode_itl_ms,
     })
 }
 
-/// Run the bench subcommand.
-pub async fn run_bench(args: BenchArgs) -> Result<()> {
+/// Run the `bench latency` subcommand.
+async fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
     telemetry::init_tracing(&args.log_level);
 
     let model = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
 
-    info!("vLLM Rust — benchmark mode");
+    info!("vLLM Rust — latency benchmark");
     info!(
         "Model: {}, device: {}, dtype: {}",
         model, args.device, args.dtype
     );
     info!(
-        "Requests: {}, prompt_len: {}, max_tokens: {}, warmup: {}",
-        args.num_requests, args.prompt_len, args.max_tokens, args.warmup
+        "Iters: {}, batch_size: {}, input_len: {}, output_len: {}, warmup: {}",
+        args.num_iters, args.batch_size, args.input_len, args.output_len, args.num_iters_warmup
     );
 
     // Initialize worker.
@@ -201,32 +209,42 @@ pub async fn run_bench(args: BenchArgs) -> Result<()> {
     let load_elapsed = load_start.elapsed();
     info!("Model loaded in {:.2}s", load_elapsed.as_secs_f64());
 
-    let prompt_ids: Vec<u32> = (0..args.prompt_len as u32).collect();
+    let prompt_ids: Vec<u32> = (0..args.input_len as u32).collect();
 
     // Warmup.
-    if args.warmup > 0 {
-        info!("Running {} warmup request(s)...", args.warmup);
-        for i in 0..args.warmup {
-            let req_id = format!("warmup-{i}");
-            run_one_request(worker.as_mut(), &req_id, &prompt_ids, args.max_tokens)?;
+    if args.num_iters_warmup > 0 {
+        info!("Running {} warmup iteration(s)...", args.num_iters_warmup);
+        for i in 0..args.num_iters_warmup {
+            run_iteration(
+                worker.as_mut(),
+                &format!("warmup-{i}"),
+                args.batch_size,
+                &prompt_ids,
+                args.output_len,
+            )?;
         }
         info!("Warmup complete");
     }
 
     // Timed runs.
-    let mut timings: Vec<RequestTiming> = Vec::with_capacity(args.num_requests);
+    let mut timings: Vec<IterationTiming> = Vec::with_capacity(args.num_iters);
     let bench_start = Instant::now();
 
-    for i in 0..args.num_requests {
-        let req_id = format!("bench-{i}");
-        let timing = run_one_request(worker.as_mut(), &req_id, &prompt_ids, args.max_tokens)?;
+    for i in 0..args.num_iters {
+        let timing = run_iteration(
+            worker.as_mut(),
+            &format!("bench-{i}"),
+            args.batch_size,
+            &prompt_ids,
+            args.output_len,
+        )?;
         timings.push(timing);
     }
 
     let bench_elapsed = bench_start.elapsed();
 
     // Compute stats.
-    let total_tokens = args.num_requests as u64 * args.max_tokens as u64;
+    let total_tokens = args.num_iters as u64 * args.batch_size as u64 * args.output_len as u64;
     let throughput = total_tokens as f64 / bench_elapsed.as_secs_f64();
 
     let avg_prefill_ms: f64 =
@@ -246,9 +264,10 @@ pub async fn run_bench(args: BenchArgs) -> Result<()> {
 
     println!();
     println!("=== Benchmark Results ===");
-    println!("Requests:        {}", args.num_requests);
-    println!("Prompt len:      {} tokens", args.prompt_len);
-    println!("Max tokens:      {}", args.max_tokens);
+    println!("Iterations:      {}", args.num_iters);
+    println!("Batch size:      {}", args.batch_size);
+    println!("Input len:       {} tokens", args.input_len);
+    println!("Output len:      {}", args.output_len);
     println!("Total tokens:    {total_tokens}");
     println!("Elapsed:         {:.3}s", bench_elapsed.as_secs_f64());
     println!("Throughput:      {throughput:.1} tokens/s");
@@ -261,8 +280,40 @@ pub async fn run_bench(args: BenchArgs) -> Result<()> {
     println!("  p50:  {p50_itl:.2}ms");
     println!("  p99:  {p99_itl:.2}ms");
 
+    // Write JSON output if requested.
+    if let Some(ref path) = args.output_json {
+        let results = serde_json::json!({
+            "num_iters": args.num_iters,
+            "batch_size": args.batch_size,
+            "input_len": args.input_len,
+            "output_len": args.output_len,
+            "total_tokens": total_tokens,
+            "elapsed_s": bench_elapsed.as_secs_f64(),
+            "throughput_tps": throughput,
+            "avg_prefill_ms": avg_prefill_ms,
+            "avg_itl_ms": avg_itl_ms,
+            "p50_itl_ms": p50_itl,
+            "p99_itl_ms": p99_itl,
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&results)?)?;
+        info!("Results written to {path}");
+    }
+
     worker.shutdown();
     Ok(())
+}
+
+/// Dispatch bench subcommands.
+pub async fn run_bench(cmd: BenchCommand) -> Result<()> {
+    match cmd.command {
+        BenchCommands::Latency(args) => run_bench_latency(*args).await,
+        BenchCommands::Serve(_) => {
+            anyhow::bail!("bench serve is not yet implemented");
+        }
+        BenchCommands::Throughput(_) => {
+            anyhow::bail!("bench throughput is not yet implemented");
+        }
+    }
 }
 
 /// Compute the p-th percentile of a sorted slice. Returns 0 for empty input.

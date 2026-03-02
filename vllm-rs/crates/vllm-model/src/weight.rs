@@ -24,19 +24,26 @@ use crate::tensor::{self, TensorInfo};
 // ---------------------------------------------------------------------------
 
 /// A loaded safetensors file that can yield tensors on demand.
+///
+/// Uses memory-mapping instead of reading the entire file into a heap
+/// buffer, so the OS can page data in lazily and share pages across
+/// processes.
 pub struct SafeTensorsFile {
-    /// Raw file data (header + tensor bytes).
-    data: Vec<u8>,
+    /// Memory-mapped file data (header + tensor bytes).
+    data: memmap2::Mmap,
     /// Path for diagnostics.
     path: PathBuf,
 }
 
 impl SafeTensorsFile {
-    /// Open a safetensors file from disk.
+    /// Open a safetensors file from disk via memory-mapping.
     pub fn open(path: impl AsRef<Path>) -> ModelResult<Self> {
         let path = path.as_ref().to_path_buf();
-        let data = std::fs::read(&path)?;
-        // Validate the header.
+        let file = std::fs::File::open(&path)?;
+        // SAFETY: the file is read-only and we hold no mutable references.
+        let data = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| ModelError::Other(format!("{}: mmap failed: {e}", path.display())))?;
+        // Validate the safetensors header.
         SafeTensors::deserialize(&data)
             .map_err(|e| ModelError::SafeTensors(format!("{}: {}", path.display(), e)))?;
         Ok(Self { data, path })
@@ -222,6 +229,21 @@ impl ModelWeights {
 
         let index = SafeTensorsIndex::from_file(index_path)?;
         let shard_files = index.shard_files();
+        let total = shard_files.len();
+
+        // Show a progress bar for multi-shard models (like Python vLLM's tqdm).
+        let bar = if total > 1 {
+            let bar = indicatif::ProgressBar::new(total as u64);
+            bar.set_style(
+                indicatif::ProgressStyle::with_template(
+                    "Loading safetensors {bar:40.cyan/blue} {pos}/{len} shards",
+                )
+                .unwrap(),
+            );
+            Some(bar)
+        } else {
+            None
+        };
 
         let mut tensors = HashMap::new();
         for shard_name in &shard_files {
@@ -230,6 +252,12 @@ impl ModelWeights {
             for (name, tensor) in file.load_all(device)? {
                 tensors.insert(name, tensor);
             }
+            if let Some(ref bar) = bar {
+                bar.inc(1);
+            }
+        }
+        if let Some(bar) = bar {
+            bar.finish_and_clear();
         }
 
         Ok(Self {

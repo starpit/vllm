@@ -52,6 +52,9 @@ impl TestModels {
     // AWQ quantized models (candle backend, not MLX)
     pub const QWEN2_0_5B_AWQ: &str = "Qwen/Qwen2.5-0.5B-Instruct-AWQ";
 
+    // BitsAndBytes NF4 quantized models (MLX dequant-at-load or candle)
+    pub const LLAMA_3_2_1B_BNB_4BIT: &str = "unsloth/Llama-3.2-1B-Instruct-bnb-4bit";
+
     // CUDA-compatible safetensors models (non-quantized, run on GPU)
     pub const SMOLLM_135M_CUDA: &str = "HuggingFaceTB/SmolLM2-135M-Instruct";
     pub const QWEN2_0_5B_CUDA: &str = "Qwen/Qwen2.5-0.5B";

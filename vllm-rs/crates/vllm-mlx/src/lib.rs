@@ -15,6 +15,7 @@
 //! - [`cache`] — MLX KV cache (Array-based)
 
 pub mod awq;
+pub mod bnb;
 pub mod cache;
 pub mod gptq;
 pub mod lora;

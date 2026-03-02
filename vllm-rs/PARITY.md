@@ -38,7 +38,7 @@
 | Feature Group | Python | Rust Parity | +Rust | Unit | E2E |
 |---|---:|---|---:|---:|---:|
 | [Model Architectures](#model-architectures) | 36 | `████░░░░░░` 13/36 | 32 | 137 | 28 |
-| [Quantization](#quantization) | 11 | `██░░░░░░░░` 3/11 | 1 | 39 | 8 |
+| [Quantization](#quantization) | 12 | `████░░░░░░` 5/12 | 1 | 61 | 12 |
 | [Serving / OpenAI API](#serving--openai-api) | 24 | `███████░░░` 17/24 | 0 | 104 | 33 |
 | [Sampling & Decoding](#sampling--decoding) | 19 | `██████████` 19/19 | 0 | 53 | 13 |
 | [KV Cache & Attention](#kv-cache--attention) | 19 | `█████░░░░░` 9/19 | 0 | 96 | 0 |
@@ -156,7 +156,8 @@
 | AWQ (INT4, candle + MLX) | &#x1F535; | &#x1F535; | 12 | 4 | |
 | Marlin (GPTQ-Marlin / AWQ-Marlin) | &#x1F535; | &#x1F534; | — | — | P2 |
 | FP8 (FBGemm / ModelOpt) | &#x1F535; | &#x1F534; | — | — | P3 |
-| BitsAndBytes (4-bit / 8-bit) | &#x1F535; | &#x1F534; | — | — | P2 |
+| BitsAndBytes NF4 (4-bit, candle + MLX) | &#x1F535; | &#x1F535; | 22 | 4 | |
+| BitsAndBytes INT8 (8-bit) | &#x1F535; | &#x1F534; | — | — | P3 |
 | SqueezeLLM | &#x1F535; | &#x1F534; | — | — | P1 |
 | Compressed Tensors | &#x1F535; | &#x1F534; | — | — | P1 |
 | TorchAO | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -585,10 +586,10 @@ cargo build -p vllm-cli --no-default-features --features metal
 | Metric | Python | Rust |
 |---|---|---|
 | Model architectures | ~248 | 11 candle + 11 MLX (+ quantized variants) |
-| Quantization methods | ~14 | 4 (GGUF + MLX native 4-bit + GPTQ INT4 + AWQ INT4) |
+| Quantization methods | ~14 | 5 (GGUF + MLX native 4-bit + GPTQ INT4 + AWQ INT4 + BnB NF4) |
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
 | Unit tests | ~948 test files | 868 passing (810 non-MLX + 58 MLX) |
-| E2E tests | — | 108 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 4 AWQ + 6 LLM API + 4 LoRA + 6 batch + 2 multimodal) |
+| E2E tests | — | 112 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 4 AWQ + 4 BnB + 6 LLM API + 4 LoRA + 6 batch + 2 multimodal) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

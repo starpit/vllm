@@ -133,6 +133,8 @@ pub struct MlxModelRegistry {
     gptq_models: HashMap<String, MlxModelFactory>,
     /// AWQ model factories, keyed by HF architecture name.
     awq_models: HashMap<String, MlxModelFactory>,
+    /// BitsAndBytes NF4 model factories, keyed by HF architecture name.
+    bnb_models: HashMap<String, MlxModelFactory>,
 }
 
 impl MlxModelRegistry {
@@ -143,6 +145,7 @@ impl MlxModelRegistry {
             quantized_models: HashMap::new(),
             gptq_models: HashMap::new(),
             awq_models: HashMap::new(),
+            bnb_models: HashMap::new(),
         }
     }
 
@@ -241,6 +244,12 @@ impl MlxModelRegistry {
         registry.register_awq("Qwen2ForCausalLM", llama::create_mlx_awq_qwen2);
         registry.register_awq("Qwen3ForCausalLM", llama::create_mlx_awq_llama);
         registry.register_awq("Phi3ForCausalLM", llama::create_mlx_awq_llama);
+        // BitsAndBytes NF4 factories — dequantize at load time, reuse standard models.
+        registry.register_bnb("LlamaForCausalLM", llama::create_mlx_bnb_llama);
+        registry.register_bnb("MistralForCausalLM", llama::create_mlx_bnb_llama);
+        registry.register_bnb("Qwen2ForCausalLM", llama::create_mlx_bnb_qwen2);
+        registry.register_bnb("Qwen3ForCausalLM", llama::create_mlx_bnb_llama);
+        registry.register_bnb("Phi3ForCausalLM", llama::create_mlx_bnb_llama);
         registry
     }
 
@@ -262,6 +271,11 @@ impl MlxModelRegistry {
     /// Register an AWQ model factory for an architecture name.
     pub fn register_awq(&mut self, arch: &str, factory: MlxModelFactory) {
         self.awq_models.insert(arch.to_string(), factory);
+    }
+
+    /// Register a BitsAndBytes NF4 model factory for an architecture name.
+    pub fn register_bnb(&mut self, arch: &str, factory: MlxModelFactory) {
+        self.bnb_models.insert(arch.to_string(), factory);
     }
 
     /// Look up a model factory by architecture name.
@@ -288,6 +302,11 @@ impl MlxModelRegistry {
     /// Look up an AWQ model factory by architecture name.
     pub fn get_awq(&self, arch: &str) -> Option<MlxModelFactory> {
         self.awq_models.get(arch).copied()
+    }
+
+    /// Look up a BitsAndBytes NF4 model factory by architecture name.
+    pub fn get_bnb(&self, arch: &str) -> Option<MlxModelFactory> {
+        self.bnb_models.get(arch).copied()
     }
 
     /// Check if an architecture is supported (quantized or not).

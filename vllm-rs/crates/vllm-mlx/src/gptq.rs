@@ -226,3 +226,142 @@ fn unpack_cols_cpu(
         &[rows as i32, actual_cols as i32],
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pack 8 INT4 values into one i32 (GPTQ row packing order).
+    fn pack_gptq_i32(vals: &[u32; 8]) -> i32 {
+        let mut packed: u32 = 0;
+        for (j, &v) in vals.iter().enumerate() {
+            packed |= (v & 0xF) << (j * 4);
+        }
+        packed as i32
+    }
+
+    #[test]
+    fn test_unpack_rows_cpu() {
+        // Pack values 0..7 into one i32 → qweight [1, 1] → unpack to [8, 1]
+        let packed_val = pack_gptq_i32(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let qweight = Array::from_slice(&[packed_val], &[1, 1]);
+
+        let result = unpack_rows_cpu(&qweight, 4, 8, 0xF, 8, 1).unwrap();
+        mlx_rs::transforms::eval(std::iter::once(&result)).unwrap();
+
+        assert_eq!(result.shape(), &[8, 1]);
+        let vals: Vec<f32> = result
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        for i in 0..8 {
+            assert!(
+                (vals[i] - i as f32).abs() < 0.01,
+                "expected {i}, got {}",
+                vals[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_unpack_cols_cpu() {
+        // Pack values 0..7 into one i32 → qzeros [1, 1] → unpack to [1, 8]
+        let packed_val = pack_gptq_i32(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let qzeros = Array::from_slice(&[packed_val], &[1, 1]);
+
+        let result = unpack_cols_cpu(&qzeros, 4, 8, 0xF, 1, 8).unwrap();
+        mlx_rs::transforms::eval(std::iter::once(&result)).unwrap();
+
+        assert_eq!(result.shape(), &[1, 8]);
+        let vals: Vec<f32> = result
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        for i in 0..8 {
+            assert!(
+                (vals[i] - i as f32).abs() < 0.01,
+                "expected {i}, got {}",
+                vals[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_dequantize_layer_identity() {
+        // qweight: all 8s (val=8), qzeros: all 8s → unpacked - zeros = 0
+        // scales = 2.0 → dequantized = 0.0 for all elements
+        let packed_val = pack_gptq_i32(&[8; 8]);
+        let qweight = Array::from_slice(&[packed_val], &[1, 1]); // [1, 1] → 8 rows, 1 col
+        let zero_packed = pack_gptq_i32(&[8; 8]);
+        let qzeros = Array::from_slice(&[zero_packed], &[1, 1]); // [1, 1] → 1 group, 8 cols
+        let scales = Array::from_slice(&[2.0f32], &[1, 1]); // [1, 1]
+
+        let config = GptqConfig {
+            bits: 4,
+            group_size: 8,
+            desc_act: false,
+            sym: true,
+        };
+
+        let result = dequantize_layer(&qweight, &qzeros, &scales, None, &config, 8, 0xF).unwrap();
+        mlx_rs::transforms::eval(std::iter::once(&result)).unwrap();
+
+        // Output is transposed: [out_features=1, in_features=8]
+        assert_eq!(result.shape(), &[1, 8]);
+        let vals: Vec<f32> = result
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        for (i, v) in vals.iter().enumerate() {
+            assert!(v.abs() < 0.01, "expected 0.0 at {i}, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_dequantize_gptq_weights_end_to_end() {
+        // Single GPTQ layer: 8 input features, 1 output feature
+        // qweight [1, 1], qzeros [1, 1], scales [1, 1]
+        // values = 1..8, zeros = 0, scale = 1.0 → sum = 1+2+...+8 = 36
+        let packed_val = pack_gptq_i32(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let qweight = Array::from_slice(&[packed_val], &[1, 1]);
+        let zero_packed = pack_gptq_i32(&[0; 8]);
+        let qzeros = Array::from_slice(&[zero_packed], &[1, 1]);
+        let scales = Array::from_slice(&[1.0f32], &[1, 1]);
+
+        let mut weights = HashMap::new();
+        weights.insert("layer.qweight".to_string(), qweight);
+        weights.insert("layer.qzeros".to_string(), qzeros);
+        weights.insert("layer.scales".to_string(), scales);
+
+        let config = GptqConfig {
+            bits: 4,
+            group_size: 8,
+            desc_act: false,
+            sym: true,
+        };
+
+        let result = dequantize_gptq_weights(weights, &config).unwrap();
+
+        assert!(result.contains_key("layer.weight"));
+        assert!(!result.contains_key("layer.qweight"));
+
+        let w = result.get("layer.weight").unwrap();
+        // Transposed: [1, 8]
+        assert_eq!(w.shape(), &[1, 8]);
+
+        let vals: Vec<f32> = w
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let sum: f32 = vals.iter().sum();
+        assert!((sum - 36.0).abs() < 0.1, "expected sum 36.0, got {sum}");
+    }
+}

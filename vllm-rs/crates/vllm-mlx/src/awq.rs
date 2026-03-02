@@ -181,3 +181,153 @@ fn unpack_cols_awq_cpu(
         &[rows as i32, actual_cols as i32],
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::Dtype;
+
+    /// Pack 8 INT4 values into one i32 using AWQ interleave order.
+    ///
+    /// AWQ stores nibble j from logical column ORDER[j],
+    /// where ORDER = [0, 2, 4, 6, 1, 3, 5, 7].
+    fn pack_awq_i32(vals: &[u32; 8]) -> i32 {
+        let order_map: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+        let mut packed: u32 = 0;
+        for (j, &src_col) in order_map.iter().enumerate() {
+            packed |= (vals[src_col] & 0xF) << (j * 4);
+        }
+        packed as i32
+    }
+
+    #[test]
+    fn test_unpack_cols_awq_cpu_basic() {
+        // Pack values 0..7 in AWQ interleave order → unpack to [1, 8] with correct logical order
+        let packed = pack_awq_i32(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let qweight = Array::from_slice(&[packed], &[1, 1]); // [1 row, 1 packed_col]
+
+        let result = unpack_cols_awq_cpu(&qweight, 4, 8, 0xF, 1, 8).unwrap();
+        mlx_rs::transforms::eval(std::iter::once(&result)).unwrap();
+
+        assert_eq!(result.shape(), &[1, 8]);
+        let vals: Vec<f32> = result
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        for i in 0..8 {
+            assert!(
+                (vals[i] - i as f32).abs() < 0.01,
+                "expected {i}, got {} at position {i}",
+                vals[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_dequantize_layer_zeros_cancel() {
+        // All values = 8, zeros = 8, scales = 2.0 → dequantized = 2*(8-8) = 0
+        let packed = pack_awq_i32(&[8; 8]);
+        let zero_packed = pack_awq_i32(&[8; 8]);
+
+        let qweight = Array::from_slice(&[packed], &[1, 1]); // [1 in_feat, 1 packed_col]
+        let qzeros = Array::from_slice(&[zero_packed], &[1, 1]); // [1 group, 1 packed_col]
+        let scales = Array::from_slice(&[2.0f32; 8], &[1, 8]); // [1 group, 8 out_feat]
+
+        let config = AwqConfig {
+            bits: 4,
+            group_size: 1,
+            zero_point: true,
+        };
+
+        let result = dequantize_layer(&qweight, &qzeros, &scales, &config, 8, 0xF).unwrap();
+        mlx_rs::transforms::eval(std::iter::once(&result)).unwrap();
+
+        // Transposed: [8, 1]
+        assert_eq!(result.shape(), &[8, 1]);
+        let vals: Vec<f32> = result
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        for (i, v) in vals.iter().enumerate() {
+            assert!(v.abs() < 0.01, "expected 0.0 at {i}, got {v}");
+        }
+    }
+
+    #[test]
+    fn test_dequantize_awq_weights_end_to_end() {
+        // Single AWQ layer: 1 input feature, 8 output features
+        // Pack 1..8 in AWQ order, zeros=0, scales=1.0
+        let packed = pack_awq_i32(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let zero_packed = pack_awq_i32(&[0; 8]);
+
+        let qweight = Array::from_slice(&[packed], &[1, 1]); // [1, 1]
+        let qzeros = Array::from_slice(&[zero_packed], &[1, 1]); // [1, 1]
+        let scales = Array::from_slice(&[1.0f32; 8], &[1, 8]); // [1, 8]
+
+        let mut weights = HashMap::new();
+        weights.insert("layer.qweight".to_string(), qweight);
+        weights.insert("layer.qzeros".to_string(), qzeros);
+        weights.insert("layer.scales".to_string(), scales);
+
+        let config = AwqConfig {
+            bits: 4,
+            group_size: 1,
+            zero_point: true,
+        };
+
+        let result = dequantize_awq_weights(weights, &config).unwrap();
+
+        assert!(result.contains_key("layer.weight"));
+        assert!(!result.contains_key("layer.qweight"));
+
+        let w = result.get("layer.weight").unwrap();
+        // Transposed: [8, 1]
+        assert_eq!(w.shape(), &[8, 1]);
+
+        let vals: Vec<f32> = w
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        let sum: f32 = vals.iter().sum();
+        let expected: f32 = (1..=8).map(|i| i as f32).sum();
+        assert!(
+            (sum - expected).abs() < 0.1,
+            "expected sum {expected}, got {sum}"
+        );
+    }
+
+    #[test]
+    fn test_dequantize_awq_preserves_non_quantized() {
+        let norm_weight = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let packed = pack_awq_i32(&[0; 8]);
+        let zero_packed = pack_awq_i32(&[0; 8]);
+
+        let qweight = Array::from_slice(&[packed], &[1, 1]);
+        let qzeros = Array::from_slice(&[zero_packed], &[1, 1]);
+        let scales = Array::from_slice(&[1.0f32; 8], &[1, 8]);
+
+        let mut weights = HashMap::new();
+        weights.insert("model.norm.weight".to_string(), norm_weight);
+        weights.insert("layer.qweight".to_string(), qweight);
+        weights.insert("layer.qzeros".to_string(), qzeros);
+        weights.insert("layer.scales".to_string(), scales);
+
+        let config = AwqConfig {
+            bits: 4,
+            group_size: 1,
+            zero_point: true,
+        };
+
+        let result = dequantize_awq_weights(weights, &config).unwrap();
+        assert!(result.contains_key("model.norm.weight"));
+        assert!(result.contains_key("layer.weight"));
+        assert_eq!(result.len(), 2);
+    }
+}

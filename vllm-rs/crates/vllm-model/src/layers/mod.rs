@@ -13,6 +13,7 @@
 
 pub mod activation;
 pub mod awq;
+pub mod bnb;
 pub mod embedding;
 pub mod gptq;
 pub mod linear;
@@ -22,6 +23,7 @@ pub mod rotary;
 
 pub use activation::{Activation, gelu, relu, silu};
 pub use awq::{AwqConfig, AwqLinear};
+pub use bnb::{BnbNf4Config, BnbNf4Linear, BnbQuantType};
 pub use embedding::Embedding;
 pub use gptq::{GptqConfig, GptqLinear};
 pub use linear::{ColumnParallelLinear, Linear, RowParallelLinear};

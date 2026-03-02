@@ -833,6 +833,52 @@ pub fn create_mlx_awq_qwen2(
     create_mlx_awq_llama(model_dir, config, dtype)
 }
 
+/// Factory function for creating an MLX LLaMA model from BitsAndBytes NF4 weights.
+///
+/// Dequantizes BnB NF4 weights at load time, then uses the standard
+/// (non-quantized) model architecture.
+pub fn create_mlx_bnb_llama(
+    model_dir: &Path,
+    config: &HfModelConfig,
+    _dtype: Dtype,
+) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
+    let llama_config = LlamaConfig::from_hf_config(config)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+    // Parse BnB config.
+    let bnb_cfg = config
+        .extra
+        .get("quantization_config")
+        .ok_or_else(|| vllm_model::error::ModelError::Other("no BnB config found".into()))
+        .and_then(vllm_model::bnb_config::BnbQuantizeConfig::from_json_value)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+    let bnb = bnb_cfg.to_bnb_config();
+
+    // Load raw safetensors weights (includes packed uint8 + absmax).
+    let raw_weights = load_safetensors_weights(model_dir)?;
+
+    // Dequantize BnB weights into standard .weight tensors.
+    let weights = crate::bnb::dequantize_bnb_weights(raw_weights, &bnb, config)?;
+
+    // Build standard model and load dequantized weights.
+    let mut model = MlxLlamaForCausalLM::new(&llama_config)?;
+    model.load_weights(&weights);
+    mlx_rs::transforms::eval(weights.values())?;
+
+    Ok(Box::new(model))
+}
+
+/// Factory function for creating an MLX Qwen2 model from BitsAndBytes NF4 weights.
+pub fn create_mlx_bnb_qwen2(
+    model_dir: &Path,
+    config: &HfModelConfig,
+    dtype: Dtype,
+) -> Result<Box<dyn super::MlxModel>, Box<dyn std::error::Error + Send + Sync>> {
+    // Qwen2 is architecturally identical to LLaMA, reuse the same factory.
+    create_mlx_bnb_llama(model_dir, config, dtype)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -869,6 +869,8 @@ impl Worker for CandleWorker {
         let awq_config = vllm_model::awq_config::AwqQuantizeConfig::from_dir(&model_dir).ok();
         let is_awq = !is_gptq && (awq_config.is_some() || quant_method.as_deref() == Some("awq"));
 
+        let is_bnb = !is_gptq && !is_awq && quant_method.as_deref() == Some("bitsandbytes");
+
         // 4. Look up architecture in the registry.
         let arch = hf_config
             .architectures
@@ -969,6 +971,35 @@ impl Worker for CandleWorker {
 
             awq_factory(&weights, &hf_config, &awq_cfg, dtype, &device).map_err(|e| {
                 ExecutorError::WorkerInit(format!("failed to construct AWQ model: {e}"))
+            })?
+        } else if is_bnb {
+            let bnb_cfg = {
+                let qc = hf_config.extra.get("quantization_config").ok_or_else(|| {
+                    ExecutorError::WorkerInit(
+                        "BnB detected but no quantization_config in config.json".to_string(),
+                    )
+                })?;
+                vllm_model::bnb_config::BnbQuantizeConfig::from_json_value(qc).map_err(|e| {
+                    ExecutorError::WorkerInit(format!(
+                        "failed to parse BnB quantization_config: {e}"
+                    ))
+                })?
+            };
+
+            info!(
+                "CandleWorker: BnB NF4 detected (quant_type={}, blocksize={})",
+                bnb_cfg.bnb_4bit_quant_type, bnb_cfg.bnb_4bit_blocksize
+            );
+
+            let bnb_factory = registry.get_bnb(&arch).ok_or_else(|| {
+                ExecutorError::WorkerInit(format!(
+                    "unsupported BnB architecture: {arch}. Supported BnB: {:?}",
+                    registry.bnb_architectures().collect::<Vec<_>>()
+                ))
+            })?;
+
+            bnb_factory(&weights, &hf_config, &bnb_cfg, dtype, &device).map_err(|e| {
+                ExecutorError::WorkerInit(format!("failed to construct BnB model: {e}"))
             })?
         } else {
             let factory = registry.get(&arch).ok_or_else(|| {

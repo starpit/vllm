@@ -537,6 +537,8 @@ impl Worker for MlxWorker {
             && (vllm_model::awq_config::AwqQuantizeConfig::from_dir(&model_dir).is_ok()
                 || quant_method.as_deref() == Some("awq"));
 
+        let is_bnb = !is_gptq && !is_awq && quant_method.as_deref() == Some("bitsandbytes");
+
         // Look up architecture in the MLX registry.
         let arch = hf_config
             .architectures
@@ -556,6 +558,11 @@ impl Worker for MlxWorker {
             info!("MlxWorker: AWQ quantization detected, using dequantize-at-load path");
             registry.get_awq(&arch).ok_or_else(|| {
                 ExecutorError::WorkerInit(format!("unsupported AWQ MLX architecture: {arch}"))
+            })?
+        } else if is_bnb {
+            info!("MlxWorker: BnB NF4 quantization detected, using dequantize-at-load path");
+            registry.get_bnb(&arch).ok_or_else(|| {
+                ExecutorError::WorkerInit(format!("unsupported BnB MLX architecture: {arch}"))
             })?
         } else {
             registry.get_factory(&arch, is_quantized).ok_or_else(|| {
@@ -580,6 +587,8 @@ impl Worker for MlxWorker {
             ", GPTQ"
         } else if is_awq {
             ", AWQ"
+        } else if is_bnb {
+            ", BnB NF4"
         } else if is_quantized {
             ", quantized"
         } else {

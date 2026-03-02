@@ -12,6 +12,7 @@ use vllm_model::weight::HfModelConfig;
 
 use crate::ModelFactory;
 use crate::awq_llama::AwqModelFactory;
+use crate::bnb_llama::BnbModelFactory;
 use crate::gptq_llama::GptqModelFactory;
 
 /// Factory function type for constructing a model from a GGUF file.
@@ -33,6 +34,8 @@ pub struct ModelRegistry {
     gptq_models: HashMap<&'static str, GptqModelFactory>,
     /// AWQ model factories, keyed by HF architecture name.
     awq_models: HashMap<&'static str, AwqModelFactory>,
+    /// BitsAndBytes NF4 model factories, keyed by HF architecture name.
+    bnb_models: HashMap<&'static str, BnbModelFactory>,
 }
 
 impl ModelRegistry {
@@ -43,6 +46,7 @@ impl ModelRegistry {
             gguf_models: HashMap::new(),
             gptq_models: HashMap::new(),
             awq_models: HashMap::new(),
+            bnb_models: HashMap::new(),
         }
     }
 
@@ -117,6 +121,13 @@ impl ModelRegistry {
         self.register_awq("Qwen2ForCausalLM", crate::awq_llama::create_qwen2_awq);
         self.register_awq("Qwen3ForCausalLM", crate::awq_llama::create_llama_awq);
         self.register_awq("Phi3ForCausalLM", crate::awq_llama::create_llama_awq);
+
+        // --- BitsAndBytes NF4 factories (keyed by HF architecture name) ---
+        self.register_bnb("LlamaForCausalLM", crate::bnb_llama::create_llama_bnb);
+        self.register_bnb("MistralForCausalLM", crate::bnb_llama::create_llama_bnb);
+        self.register_bnb("Qwen2ForCausalLM", crate::bnb_llama::create_qwen2_bnb);
+        self.register_bnb("Qwen3ForCausalLM", crate::bnb_llama::create_llama_bnb);
+        self.register_bnb("Phi3ForCausalLM", crate::bnb_llama::create_llama_bnb);
     }
 
     /// Register a model factory for the given architecture name.
@@ -139,6 +150,11 @@ impl ModelRegistry {
         self.awq_models.insert(arch, factory);
     }
 
+    /// Register a BitsAndBytes NF4 model factory for the given HF architecture.
+    pub fn register_bnb(&mut self, arch: &'static str, factory: BnbModelFactory) {
+        self.bnb_models.insert(arch, factory);
+    }
+
     /// Look up a model factory by architecture name.
     pub fn get(&self, arch: &str) -> Option<&ModelFactory> {
         self.models.get(arch)
@@ -157,6 +173,11 @@ impl ModelRegistry {
     /// Look up an AWQ model factory by HF architecture name.
     pub fn get_awq(&self, arch: &str) -> Option<&AwqModelFactory> {
         self.awq_models.get(arch)
+    }
+
+    /// Look up a BitsAndBytes NF4 model factory by HF architecture name.
+    pub fn get_bnb(&self, arch: &str) -> Option<&BnbModelFactory> {
+        self.bnb_models.get(arch)
     }
 
     /// Check if an architecture is supported.
@@ -197,6 +218,16 @@ impl ModelRegistry {
     /// List all registered AWQ architecture names.
     pub fn awq_architectures(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.awq_models.keys().copied()
+    }
+
+    /// Check if a BitsAndBytes NF4 architecture is supported.
+    pub fn contains_bnb(&self, arch: &str) -> bool {
+        self.bnb_models.contains_key(arch)
+    }
+
+    /// List all registered BitsAndBytes NF4 architecture names.
+    pub fn bnb_architectures(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.bnb_models.keys().copied()
     }
 }
 

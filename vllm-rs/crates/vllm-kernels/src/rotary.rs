@@ -364,4 +364,146 @@ mod tests {
         assert!((vals[6] - 7.0).abs() < 1e-4);
         assert!((vals[7] - 8.0).abs() < 1e-4);
     }
+
+    // -----------------------------------------------------------------------
+    // CUDA tests — compare CUDA kernel output against CPU reference
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "cuda")]
+    fn cuda_device() -> Device {
+        Device::new_cuda(0).expect("CUDA device required for this test")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn assert_close(label: &str, cpu: &[f32], cuda: &[f32], tol: f64) {
+        assert_eq!(cpu.len(), cuda.len(), "{label}: length mismatch");
+        for (i, (c, g)) in cpu.iter().zip(cuda.iter()).enumerate() {
+            assert!(
+                (c - g).abs() as f64 <= tol,
+                "{label} mismatch at {i}: cpu={c} cuda={g}"
+            );
+        }
+    }
+
+    /// Helper: run rotary_embedding on CPU and CUDA, compare results.
+    #[cfg(feature = "cuda")]
+    fn assert_rotary_cuda_matches_cpu(
+        num_tokens: usize,
+        dim: usize,
+        half_dim: usize,
+        dtype: DType,
+        tol: f64,
+    ) {
+        use super::CudaRotaryKernels;
+
+        let max_pos = 128;
+        let cache_cpu = make_cos_sin_cache(max_pos, half_dim)
+            .to_dtype(dtype)
+            .unwrap();
+        let positions_cpu = Tensor::new(
+            (0..num_tokens as u32).collect::<Vec<_>>().as_slice(),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let q_cpu = Tensor::randn(0f32, 1.0, &[num_tokens, dim], &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let k_cpu = Tensor::randn(0f32, 1.0, &[num_tokens, dim], &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+
+        // CPU reference.
+        let (q_ref, k_ref) = CpuRotaryKernels
+            .rotary_embedding(&positions_cpu, &q_cpu, &k_cpu, &cache_cpu, true)
+            .unwrap();
+
+        // CUDA kernel.
+        let dev = cuda_device();
+        let cache_gpu = cache_cpu.to_device(&dev).unwrap();
+        let positions_gpu = positions_cpu.to_device(&dev).unwrap();
+        let q_gpu = q_cpu.to_device(&dev).unwrap();
+        let k_gpu = k_cpu.to_device(&dev).unwrap();
+        let (q_cuda, k_cuda) = CudaRotaryKernels
+            .rotary_embedding(&positions_gpu, &q_gpu, &k_gpu, &cache_gpu, true)
+            .unwrap();
+        let q_cuda = q_cuda.to_device(&Device::Cpu).unwrap();
+        let k_cuda = k_cuda.to_device(&Device::Cpu).unwrap();
+
+        // Compare queries.
+        let q_ref_vals = q_ref
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let q_cuda_vals = q_cuda
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_close(
+            &format!("rotary_q_{dtype:?}"),
+            &q_ref_vals,
+            &q_cuda_vals,
+            tol,
+        );
+
+        // Compare keys.
+        let k_ref_vals = k_ref
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let k_cuda_vals = k_cuda
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_close(
+            &format!("rotary_k_{dtype:?}"),
+            &k_ref_vals,
+            &k_cuda_vals,
+            tol,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_rotary_f32() {
+        assert_rotary_cuda_matches_cpu(4, 64, 32, DType::F32, 1e-4);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_rotary_f16() {
+        assert_rotary_cuda_matches_cpu(4, 64, 32, DType::F16, 5e-2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_rotary_bf16() {
+        assert_rotary_cuda_matches_cpu(4, 64, 32, DType::BF16, 5e-2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_rotary_partial_dim() {
+        // rotary_dim (2*16=32) < total dim (64) → pass-through for remaining dims.
+        assert_rotary_cuda_matches_cpu(4, 64, 16, DType::F32, 1e-4);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_rotary_many_tokens() {
+        assert_rotary_cuda_matches_cpu(32, 128, 64, DType::F32, 1e-4);
+    }
 }

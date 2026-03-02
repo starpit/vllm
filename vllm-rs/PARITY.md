@@ -1,14 +1,14 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (976 tests: 868 unit + 108 e2e, 0 clippy errors)
+> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (997 tests: 889 unit + 108 e2e, 0 clippy errors)
 
 ### Legend
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 161 |
-| &#x1F7E1; | Partially implemented | 5 |
-| &#x1F534; | Not implemented | 105 |
+| &#x1F535; | Fully implemented | 165 |
+| &#x1F7E1; | Partially implemented | 4 |
+| &#x1F534; | Not implemented | 102 |
 
 ### Priority (for incomplete features)
 
@@ -16,7 +16,7 @@
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
 | **P3** | High — meaningfully expands user base or enables key use cases | 18 |
-| **P2** | Medium — useful improvement, broader coverage | 37 |
+| **P2** | Medium — useful improvement, broader coverage | 33 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
 
@@ -43,10 +43,10 @@
 | [Sampling & Decoding](#sampling--decoding) | 19 | `██████████` 19/19 | 0 | 53 | 13 |
 | [KV Cache & Attention](#kv-cache--attention) | 19 | `█████░░░░░` 9/19 | 0 | 96 | 0 |
 | [Scheduling](#scheduling) | 10 | `█████████░` 9/10 | 0 | 73 | 1 |
-| [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 28 | 2 |
+| [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 49 | 2 |
 | [Parallelism & Distribution](#parallelism--distribution) | 10 | `███░░░░░░░` 3/10 | 0 | 33 | 0 |
-| [Performance Optimizations](#performance-optimizations) | 13 | `███░░░░░░░` 4/13 | 4 | 20 | 0 |
-| [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | 12 | `██░░░░░░░░` 3/12 | 0 | 0 | 0 |
+| [Performance Optimizations](#performance-optimizations) | 13 | `█████░░░░░` 7/13 | 4 | 37 | 0 |
+| [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | 12 | `████░░░░░░` 5/12 | 0 | 21 | 0 |
 | [LoRA / Adapters](#lora--adapters) | 5 | `████░░░░░░` 2/5 | 0 | 12 | 8 |
 | [Speculative Decoding](#speculative-decoding) | 5 | `██░░░░░░░░` 1/5 | 0 | 20 | 0 |
 | [Multimodal / Vision-Language](#multimodal--vision-language) | 10 | `░░░░░░░░░░` 0/10 | 0 | 0 | 0 |
@@ -55,7 +55,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | 8 | `██████░░░░` 5/8 | 0 | 19 | 10 |
 | [Observability & Operations](#observability--operations) | 7 | `██████████` 7/7 | 1 | 15 | 0 |
 | [CLI & Deployment](#cli--deployment) | 17 | `██████████` 16/17 | 2 | 19 | 6 |
-| **Total** | **213** | `█████░░░░░` **119/213** | **35** | **644** | **80** |
+| **Total** | **213** | `█████░░░░░` **123/213** | **35** | **665** | **80** |
 
 ---
 
@@ -293,7 +293,7 @@
 | Backend | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
 | CPU | &#x1F535; | &#x1F535; | 4 | 0 | |
-| CUDA (NVIDIA GPU) | &#x1F535; | &#x1F7E1; | 2 | 0 | P3 |
+| CUDA (NVIDIA GPU) | &#x1F535; | &#x1F7E1; | 23 | 0 | P3 |
 | Metal / MLX (Apple Silicon) | &#x1F534; | &#x1F535; | 4 | 0 | |
 | ROCm (AMD GPU) | &#x1F535; | &#x1F534; | — | — | P2 |
 | TPU | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -302,7 +302,7 @@
 | Device auto-detection | &#x1F535; | &#x1F535; | 4 | 0 | |
 | Memory profiling / `--gpu-memory-utilization` | &#x1F535; | &#x1F535; | 6 | 2 | |
 
-> Unit counts from `candle_worker.rs` (24 total) and `mlx_worker.rs` (4). Device auto-detection includes `parse_device` tests for cpu/cuda/metal/auto. E2E float16 tests validate dtype selection end-to-end.
+> Unit counts from `candle_worker.rs` (24 total) and `mlx_worker.rs` (4). CUDA: 21 GPU kernel unit tests (norm 5, activation 7, rotary 5, cache 4) + 2 device detection tests = 23. The CUDA backend supports E2E inference (verified: Qwen2.5-0.5B BF16 on L40S) with 4 fused CUDA kernels (RMSNorm, SiLU+mul/GELU+mul, RoPE, reshape_and_cache), GPU KV block pool, VRAM-based block allocation, and GPU↔CPU block swapping. Remaining for full parity: FlashAttention, CUDA graphs, tensor parallelism. Device auto-detection includes `parse_device` tests for cpu/cuda/metal/auto. E2E float16 tests validate dtype selection end-to-end.
 
 ---
 
@@ -333,9 +333,9 @@
 | FlashAttention v2 kernels | &#x1F535; | &#x1F534; | — | — | P3 |
 | FlashInfer kernels | &#x1F535; | &#x1F534; | — | — | P2 |
 | xFormers memory-efficient attention | &#x1F535; | &#x1F534; | — | — | P1 |
-| Fused SiLU-and-mul kernel | &#x1F535; | &#x1F534; | — | — | P2 |
-| Fused RMSNorm kernel | &#x1F535; | &#x1F534; | — | — | P2 |
-| Fused RoPE kernel | &#x1F535; | &#x1F534; | — | — | P2 |
+| Fused SiLU-and-mul kernel | &#x1F535; | &#x1F535; | 7 | 0 | |
+| Fused RMSNorm kernel | &#x1F535; | &#x1F535; | 5 | 0 | |
+| Fused RoPE kernel | &#x1F535; | &#x1F535; | 5 | 0 | |
 | Custom all-reduce kernel | &#x1F535; | &#x1F534; | — | — | P1 |
 | MoE fused routing kernels | &#x1F535; | &#x1F534; | — | — | P2 |
 | MLX lazy eval graph fusion | N/A | &#x1F535; | 0 | 0 | |
@@ -347,7 +347,7 @@
 | Persistent InputBatch (cross-iteration reuse) | &#x1F535; | &#x1F535; | 14 | 0 | |
 | Paged KV (no gather copy on decode) | &#x1F535; | &#x1F535; | 2 | 0 | |
 
-> CPU kernel stubs in `vllm-kernels` (12 tests: rotary 3, activation 3, norm 2, cache 2, attention 2) provide building blocks for performance features. Native dtype unit tests count `candle_worker.rs` dtype parsing tests. Persistent InputBatch: 14 unit tests in `input_batch.rs` (add/remove/swap-remove compaction, prefill→decode transition, mixed batches, spec decode, tokens-in-pool tracking, query_start_loc consistency).
+> Fused CUDA kernels: `vllm-kernels/csrc/` contains 4 custom CUDA kernel files compiled via nvcc (SM80/86/89/90). Each kernel has CPU and CUDA implementations behind the `KernelSet` trait, with `ops.rs` auto-dispatch wiring all model architectures to use fused kernels when on CUDA. 21 GPU unit tests compare CUDA output against CPU reference across f32/f16/bf16. CPU kernel stubs (12 tests: rotary 3, activation 3, norm 2, cache 2, attention 2) provide CPU fallback paths. Native dtype unit tests count `candle_worker.rs` dtype parsing tests. Persistent InputBatch: 14 unit tests in `input_batch.rs` (add/remove/swap-remove compaction, prefill→decode transition, mixed batches, spec decode, tokens-in-pool tracking, query_start_loc consistency).
 >
 > **Persistent InputBatch note:** `CandleWorker` now maintains a persistent `InputBatch` struct across engine steps, matching Python vLLM V1's `InputBatch`. Per-request state (block tables, tokens-in-pool, positions, last token ID) lives in dense slot arrays that are delta-updated each step. Finished requests are swap-removed to keep the array compact. `prepare_inputs()` builds flat token/position tensors and `AttentionMetadata` from the slot arrays without HashMap lookups. This eliminates per-step allocation overhead on the decode hot path — the steady-state case where N concurrent requests each generate 1 token per step.
 
@@ -366,10 +366,10 @@
 |---|:---:|:---:|---:|---:|:---:|
 | Triton attention (prefill / decode / unified) ✱ | &#x1F535; | &#x1F534; | — | — | P3 |
 | Merge attention states | &#x1F535; | &#x1F534; | — | — | P2 |
-| KV cache write (reshape_and_cache) | &#x1F535; | &#x1F535; | 0 | 0 | |
+| KV cache write (reshape_and_cache) | &#x1F535; | &#x1F535; | 4 | 0 | |
 | GPU sampling (top-k / top-p / penalties / logprobs) | &#x1F535; | &#x1F535; | 0 | 0 | |
 | Fused MoE routing + expert matmul ✱ | &#x1F535; | &#x1F534; | — | — | P2 |
-| Fused layer ops (activation / norm / RoPE) ✱ | &#x1F535; | &#x1F7E1; | 0 | 0 | P2 |
+| Fused layer ops (activation / norm / RoPE) ✱ | &#x1F535; | &#x1F535; | 17 | 0 | |
 | Quantization compute (FP8 / INT8 / AWQ matmul) | &#x1F535; | &#x1F534; | — | — | P2 |
 | Mamba / SSM ops (selective scan, SSD, conv1d) | &#x1F535; | &#x1F534; | — | — | P2 |
 | FLA ops (fused recurrent, KDA, chunk) | &#x1F535; | &#x1F534; | — | — | P3 |
@@ -380,9 +380,9 @@
 > **72 Triton files breakdown**: attention ops (6), sampling (8), fused MoE (6), quantization compute (5), Mamba/SSM (7), FLA/linear attention (11), LoRA (5), speculative decoding (2), model-level/misc (22+).
 >
 > **Rust strategies by category**:
-> - *KV cache write*: Covered by `KvBlockPool::scatter_new_kv()` and `MlxKvCache` — different mechanism, same result. Tests attributed to [KV Cache & Attention](#kv-cache--attention).
+> - *KV cache write*: CUDA path uses a fused `reshape_and_cache` kernel (`csrc/cache_kernels.cu`) that scatters all tokens in a single kernel launch via slot_mapping. CPU path uses `KvBlockPool::scatter_new_kv()` per-token loop. MLX uses `MlxKvCache`. 4 CUDA unit tests verify scatter correctness (basic, f16, padding skip, single-token).
 > - *GPU sampling*: All sampling runs on CPU in both CandleWorker and MlxWorker. For per-request forward passes this is trivially fast (~µs for a 1D logits vector). GPU sampling kernels only matter for batched inference where logits are a 2D `[batch, vocab]` tensor. Tests attributed to [Sampling & Decoding](#sampling--decoding).
-> - *Fused layer ops*: MLX lazy eval fuses `silu(x) * y`, `nn::RmsNorm`, and `nn::Rope` into single Metal command buffers — functionally equivalent to Triton fused kernels. The candle/CUDA path has no fused equivalents yet.
+> - *Fused layer ops*: CUDA path has fused kernels for RMSNorm (`csrc/layernorm_kernels.cu`), SiLU+mul / GELU+mul (`csrc/activation_kernels.cu`), and RoPE (`csrc/pos_encoding_kernels.cu`). `ops.rs` auto-dispatches to CUDA when tensors are on GPU, falling back to candle ops on CPU. All model architectures use fused kernels on CUDA. MLX lazy eval fuses the same operations into single Metal command buffers. 17 CUDA unit tests (norm 5 + activation 7 + rotary 5) compare against CPU reference across f32/f16/bf16.
 > - *Triton attention*: Python vLLM has its own Triton attention implementations (distinct from the FlashAttention C++ library). Both serve the same purpose: batched variable-length attention. The Rust port would use FlashAttention via FFI rather than reimplementing in Triton.
 > - *Model-gated kernels*: Mamba/SSM, FLA, LoRA, and speculative decoding kernels are only needed when those model types or features are implemented — they are blocked by their parent feature.
 

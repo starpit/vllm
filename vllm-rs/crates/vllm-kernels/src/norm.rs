@@ -269,4 +269,110 @@ mod tests {
             assert!((v - 2.0).abs() < 1e-4);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // CUDA tests — compare CUDA kernel output against CPU reference
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "cuda")]
+    fn cuda_device() -> Device {
+        Device::new_cuda(0).expect("CUDA device required for this test")
+    }
+
+    /// Helper: run rms_norm on CPU and CUDA, compare results.
+    #[cfg(feature = "cuda")]
+    fn assert_rms_norm_cuda_matches_cpu(shape: &[usize], dtype: DType, tol: f64) {
+        use super::CudaNormKernels;
+
+        let input_cpu = Tensor::randn(0f32, 1.0, shape, &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let hidden = *shape.last().unwrap();
+        let weight_cpu = Tensor::randn(0f32, 1.0, &[hidden], &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let eps = 1e-5;
+
+        // CPU reference (computed in f32 for accuracy).
+        let ref_out = CpuNormKernels
+            .rms_norm(
+                &input_cpu.to_dtype(DType::F32).unwrap(),
+                &weight_cpu.to_dtype(DType::F32).unwrap(),
+                eps,
+            )
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+
+        // CUDA kernel.
+        let dev = cuda_device();
+        let input_gpu = input_cpu.to_device(&dev).unwrap();
+        let weight_gpu = weight_cpu.to_device(&dev).unwrap();
+        let cuda_out = CudaNormKernels
+            .rms_norm(&input_gpu, &weight_gpu, eps)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap();
+
+        // Compare.
+        let ref_vals = ref_out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cuda_vals = cuda_out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(ref_vals.len(), cuda_vals.len());
+        for (i, (r, c)) in ref_vals.iter().zip(cuda_vals.iter()).enumerate() {
+            assert!(
+                (r - c).abs() as f64 <= tol,
+                "rms_norm {:?} mismatch at {}: cpu={} cuda={}",
+                dtype,
+                i,
+                r,
+                c
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_rms_norm_f32() {
+        assert_rms_norm_cuda_matches_cpu(&[4, 128], DType::F32, 1e-4);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_rms_norm_f16() {
+        assert_rms_norm_cuda_matches_cpu(&[4, 128], DType::F16, 5e-2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_rms_norm_bf16() {
+        assert_rms_norm_cuda_matches_cpu(&[4, 128], DType::BF16, 5e-2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_rms_norm_large_hidden() {
+        // Typical model hidden size (e.g., Qwen2.5-0.5B uses 896).
+        assert_rms_norm_cuda_matches_cpu(&[8, 896], DType::F32, 1e-4);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_rms_norm_3d() {
+        // 3D input: [batch, seq, hidden].
+        assert_rms_norm_cuda_matches_cpu(&[2, 4, 128], DType::F32, 1e-4);
+    }
 }

@@ -404,4 +404,133 @@ mod tests {
         assert!(vals[0].abs() < 1e-6); // gelu(0) = 0
         assert!((vals[1] - 0.8413).abs() < 0.01); // gelu_erf(1) ~ 0.8413
     }
+
+    // -----------------------------------------------------------------------
+    // CUDA tests — compare CUDA kernel output against CPU reference
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "cuda")]
+    fn cuda_device() -> Device {
+        Device::new_cuda(0).expect("CUDA device required for this test")
+    }
+
+    /// Helper: compare two f32 vecs with tolerance.
+    #[cfg(feature = "cuda")]
+    fn assert_close(label: &str, cpu: &[f32], cuda: &[f32], tol: f64) {
+        assert_eq!(cpu.len(), cuda.len(), "{label}: length mismatch");
+        for (i, (c, g)) in cpu.iter().zip(cuda.iter()).enumerate() {
+            assert!(
+                (c - g).abs() as f64 <= tol,
+                "{label} mismatch at {i}: cpu={c} cuda={g}"
+            );
+        }
+    }
+
+    /// Helper: run an activation kernel on CPU and CUDA, compare.
+    #[cfg(feature = "cuda")]
+    fn assert_activation_cuda_matches_cpu(op: &str, shape: &[usize], dtype: DType, tol: f64) {
+        use super::CudaActivationKernels;
+
+        let gate_cpu = Tensor::randn(0f32, 1.0, shape, &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let up_cpu = Tensor::randn(0f32, 1.0, shape, &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+
+        // CPU reference.
+        let ref_out = match op {
+            "silu" => CpuActivationKernels
+                .silu_and_mul(&gate_cpu, &up_cpu)
+                .unwrap(),
+            "gelu" => CpuActivationKernels
+                .gelu_and_mul(&gate_cpu, &up_cpu)
+                .unwrap(),
+            "gelu_new" => CpuActivationKernels
+                .gelu_new_and_mul(&gate_cpu, &up_cpu)
+                .unwrap(),
+            _ => panic!("unknown op: {op}"),
+        };
+
+        // CUDA kernel.
+        let dev = cuda_device();
+        let gate_gpu = gate_cpu.to_device(&dev).unwrap();
+        let up_gpu = up_cpu.to_device(&dev).unwrap();
+        let cuda_out = match op {
+            "silu" => CudaActivationKernels
+                .silu_and_mul(&gate_gpu, &up_gpu)
+                .unwrap(),
+            "gelu" => CudaActivationKernels
+                .gelu_and_mul(&gate_gpu, &up_gpu)
+                .unwrap(),
+            "gelu_new" => CudaActivationKernels
+                .gelu_new_and_mul(&gate_gpu, &up_gpu)
+                .unwrap(),
+            _ => panic!("unknown op: {op}"),
+        }
+        .to_device(&Device::Cpu)
+        .unwrap();
+
+        let ref_vals = ref_out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cuda_vals = cuda_out
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_close(&format!("{op}_{dtype:?}"), &ref_vals, &cuda_vals, tol);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_silu_and_mul_f32() {
+        assert_activation_cuda_matches_cpu("silu", &[8, 256], DType::F32, 1e-5);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_silu_and_mul_f16() {
+        assert_activation_cuda_matches_cpu("silu", &[8, 256], DType::F16, 5e-2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_silu_and_mul_bf16() {
+        // BF16 has 7-bit mantissa: at magnitude ~8, ULP = 0.0625. Allow 2 ULP.
+        assert_activation_cuda_matches_cpu("silu", &[8, 256], DType::BF16, 0.15);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_gelu_and_mul_f32() {
+        assert_activation_cuda_matches_cpu("gelu", &[8, 256], DType::F32, 1e-4);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_gelu_and_mul_bf16() {
+        assert_activation_cuda_matches_cpu("gelu", &[8, 256], DType::BF16, 5e-2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_gelu_new_and_mul_f32() {
+        assert_activation_cuda_matches_cpu("gelu_new", &[8, 256], DType::F32, 1e-4);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_activation_large() {
+        // Typical MLP intermediate size.
+        assert_activation_cuda_matches_cpu("silu", &[16, 4864], DType::F32, 1e-5);
+    }
 }

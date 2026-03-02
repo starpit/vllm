@@ -20,6 +20,7 @@ use vllm_model::weight::{HfModelConfig, ModelWeights};
 use vllm_models::{KvBlockPool, KvCache, KvCacheStorage, Model, ModelRegistry, Sampler};
 
 use crate::error::{ExecutorError, ExecutorResult};
+use crate::input_batch::InputBatch;
 use crate::worker::Worker;
 
 // ---------------------------------------------------------------------------
@@ -103,10 +104,9 @@ pub struct CandleWorker {
     sampling_params_map: HashMap<String, SamplingParams>,
     /// Global paged KV cache block pool (created by `initialize_cache`).
     kv_block_pool: Option<KvBlockPool>,
-    /// Per-request block table: req_id → ordered list of block arena indices.
-    req_block_tables: HashMap<String, Vec<usize>>,
-    /// Per-request count of tokens already written to the block pool.
-    req_tokens_in_pool: HashMap<String, usize>,
+    /// Persistent input batch: maintains per-request state (block tables,
+    /// tokens-in-pool, positions, last token) across engine steps.
+    input_batch: InputBatch,
     /// Per-request KV cache (legacy, used when block pool is not available).
     kv_caches: HashMap<String, KvCache>,
     /// Model KV head count (set after load_model).
@@ -139,8 +139,7 @@ impl CandleWorker {
             token_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
             kv_block_pool: None,
-            req_block_tables: HashMap::new(),
-            req_tokens_in_pool: HashMap::new(),
+            input_batch: InputBatch::new(),
             kv_caches: HashMap::new(),
             num_kv_heads: 0,
             head_dim: 0,
@@ -631,6 +630,127 @@ impl CandleWorker {
         // weight loading will produce a better error message.
         Ok(model_dir)
     }
+
+    /// Verify speculative decode draft tokens against model logits.
+    ///
+    /// Returns the list of accepted tokens (may include a bonus token).
+    fn verify_spec_decode(
+        &self,
+        logits: &Tensor,
+        spec_token_ids: &[u32],
+        num_input_tokens: usize,
+    ) -> ExecutorResult<Vec<u32>> {
+        let all_logits = logits
+            .to_dtype(DType::F32)
+            .and_then(|t| t.to_vec2::<f32>())
+            .map_err(|e| {
+                ExecutorError::WorkerExecution(format!("spec decode logits error: {e}"))
+            })?;
+
+        let mut accepted = Vec::new();
+        let num_drafts = spec_token_ids.len();
+
+        for i in 0..num_drafts {
+            if i >= all_logits.len() {
+                break;
+            }
+            let row = &all_logits[i];
+            let argmax_id = row
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx as u32)
+                .unwrap_or(0);
+
+            let draft = spec_token_ids[i];
+            if argmax_id == draft {
+                accepted.push(draft);
+            } else {
+                accepted.push(argmax_id);
+                break;
+            }
+        }
+
+        // If all drafts accepted, sample bonus token from last position.
+        if accepted.len() == num_drafts && num_input_tokens > 0 {
+            let last_row = &all_logits[all_logits.len() - 1];
+            let bonus = last_row
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx as u32)
+                .unwrap_or(0);
+            accepted.push(bonus);
+        }
+
+        if accepted.is_empty() {
+            let last_row = &all_logits[all_logits.len() - 1];
+            let argmax = last_row
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx as u32)
+                .unwrap_or(0);
+            Ok(vec![argmax])
+        } else {
+            debug!(
+                "Spec decode: {}/{} drafts accepted (+ {} tokens total)",
+                accepted.len().min(num_drafts),
+                num_drafts,
+                accepted.len()
+            );
+            Ok(accepted)
+        }
+    }
+
+    /// Sample a single token from the last position's logits (normal decode/prefill).
+    fn sample_normal(
+        &self,
+        logits: &Tensor,
+        req_id: &str,
+        token_count: usize,
+        sampler: &mut Sampler,
+        logprobs_map: &mut HashMap<String, Vec<vllm_common::LogprobsOutput>>,
+    ) -> ExecutorResult<Vec<u32>> {
+        let last_pos = token_count - 1;
+        let req_logits = logits
+            .narrow(0, last_pos, 1)
+            .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+
+        let logits_vec = req_logits
+            .to_dtype(DType::F32)
+            .map_err(|e| ExecutorError::WorkerExecution(format!("dtype cast error: {e}")))?
+            .flatten_all()
+            .map_err(|e| ExecutorError::WorkerExecution(format!("flatten error: {e}")))?
+            .to_vec1::<f32>()
+            .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+
+        let grammar_allowed: Option<Vec<u32>> = self
+            .grammar_states
+            .get(req_id)
+            .and_then(|g| g.allowed_tokens());
+
+        if let Some(params) = self.sampling_params_map.get(req_id) {
+            let prev_tokens = self
+                .token_buffers
+                .get(req_id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let (token_id, maybe_logprobs) =
+                sampler.sample_one(&logits_vec, params, prev_tokens, grammar_allowed.as_deref());
+            if let Some(lp) = maybe_logprobs {
+                logprobs_map.entry(req_id.to_string()).or_default().push(lp);
+            }
+            Ok(vec![token_id])
+        } else {
+            let indices = req_logits
+                .argmax(candle_core::D::Minus1)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("argmax error: {e}")))?;
+            indices
+                .to_vec1::<u32>()
+                .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))
+        }
+    }
 }
 
 impl Worker for CandleWorker {
@@ -959,25 +1079,13 @@ impl Worker for CandleWorker {
             self.token_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.kv_caches.remove(req_id);
-            self.req_block_tables.remove(req_id);
-            self.req_tokens_in_pool.remove(req_id);
             self.grammar_states.remove(req_id);
             self.mm_data_map.remove(req_id);
         }
+        self.input_batch
+            .remove_finished(&scheduler_output.finished_req_ids);
 
-        struct ReqInput {
-            req_id: String,
-            token_ids: Vec<u32>,
-            positions: Vec<u32>,
-            /// Draft tokens for speculative decode verification.
-            /// When non-empty, the last `spec_token_ids.len()` entries in
-            /// `token_ids` are drafts that need greedy verification against
-            /// the model's logits.
-            spec_token_ids: Vec<u32>,
-        }
-        let mut req_inputs: Vec<ReqInput> = Vec::new();
-
-        // --- Process newly scheduled requests (prefill) ---
+        // --- Process newly scheduled requests ---
         for new_req in &scheduler_output.scheduled_new_reqs {
             let num_tokens = scheduler_output
                 .num_scheduled_tokens
@@ -991,13 +1099,12 @@ impl Worker for CandleWorker {
             let prompt_ids = new_req.prompt_token_ids.as_deref().unwrap_or(&[]);
             let tokens_to_use = &prompt_ids[..num_tokens.min(prompt_ids.len())];
 
-            // Store prompt tokens in the buffer.
+            // Store prompt tokens in the buffer (needed for penalty sampling).
             self.token_buffers
                 .insert(new_req.req_id.clone(), prompt_ids.to_vec());
 
             // Store sampling params if provided.
             if let Some(ref params) = new_req.sampling_params {
-                // Create grammar guide for constrained decoding if requested.
                 if let Some(ref grammar) = params.guided_grammar {
                     if let Some(ref vocab) = self.grammar_vocabulary {
                         match vllm_models::grammar::GrammarGuide::from_guided_grammar(
@@ -1025,29 +1132,235 @@ impl Worker for CandleWorker {
             }
 
             if use_paged {
-                // Store block IDs from the scheduler (group 0).
                 let block_ids = new_req.block_ids.first().cloned().unwrap_or_default();
-                self.req_block_tables
-                    .insert(new_req.req_id.clone(), block_ids);
-                self.req_tokens_in_pool.insert(new_req.req_id.clone(), 0);
+                self.input_batch.add_request(
+                    new_req.req_id.clone(),
+                    tokens_to_use,
+                    block_ids,
+                    new_req.num_computed_tokens,
+                );
             } else {
                 // Legacy: per-request contiguous KV cache.
                 self.kv_caches
                     .insert(new_req.req_id.clone(), vec![None; num_layers]);
             }
 
-            // Build positions: 0..num_tokens (offset by num_computed_tokens).
-            let pos_offset = new_req.num_computed_tokens;
-            let positions: Vec<u32> = (0..tokens_to_use.len() as u32)
-                .map(|i| pos_offset + i)
-                .collect();
-
             // Store multimodal data for VLM models (consumed during forward).
             if let Some(ref mm_data) = new_req.mm_data {
                 self.mm_data_map
                     .insert(new_req.req_id.clone(), mm_data.clone());
             }
+        }
 
+        // --- Update cached requests' block tables ---
+        if use_paged {
+            let new_req_ids: HashSet<&str> = scheduler_output
+                .scheduled_new_reqs
+                .iter()
+                .map(|r| r.req_id.as_str())
+                .collect();
+            for (i, req_id) in scheduler_output
+                .scheduled_cached_reqs
+                .req_ids
+                .iter()
+                .enumerate()
+            {
+                if new_req_ids.contains(req_id.as_str()) {
+                    continue;
+                }
+                if let Some(Some(new_blocks)) =
+                    scheduler_output.scheduled_cached_reqs.new_block_ids.get(i)
+                    && let Some(group0) = new_blocks.first()
+                {
+                    self.input_batch.update_blocks(req_id, group0.clone());
+                }
+            }
+        }
+
+        // --- Build model inputs ---
+        // For paged mode: use InputBatch to produce flat tensors + metadata.
+        // For legacy mode: build per-request inputs from token_buffers.
+
+        // Create a sampler for non-greedy requests (created per-call to avoid
+        // Send issues — Sampler holds ThreadRng which is !Send).
+        let mut sampler = Sampler::new();
+        let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut logprobs_map: HashMap<String, Vec<vllm_common::LogprobsOutput>> = HashMap::new();
+        let mut prompt_logprobs_map: HashMap<String, Vec<vllm_common::LogprobsOutput>> =
+            HashMap::new();
+
+        if use_paged {
+            // Use InputBatch to prepare flat tensors and metadata.
+            let prepared = self
+                .input_batch
+                .prepare_inputs(&scheduler_output.scheduled_spec_decode_tokens);
+
+            if prepared.flat_token_ids.is_empty() {
+                return Ok(ModelRunnerOutput::from_token_map(HashMap::new()));
+            }
+
+            let flat_ids = Tensor::new(prepared.flat_token_ids.as_slice(), device)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+            let flat_pos = Tensor::new(prepared.flat_positions.as_slice(), device)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+
+            // Build BatchedKvCacheStorage.
+            let pool = self.kv_block_pool.as_mut().unwrap();
+            let mut batched_storage = vllm_models::BatchedKvCacheStorage::new(
+                pool,
+                prepared.batch_block_ids,
+                prepared.batch_tokens_before,
+            );
+
+            // Single batched forward pass.
+            let all_logits_flat = model
+                .forward_batch(
+                    &flat_ids,
+                    &flat_pos,
+                    &prepared.attn_meta,
+                    &mut batched_storage,
+                )
+                .map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
+                })?;
+
+            // Flush deferred scatters.
+            batched_storage
+                .flush_all()
+                .map_err(|e| ExecutorError::WorkerExecution(format!("scatter flush error: {e}")))?;
+
+            // Split flat logits [total_tokens, vocab] into per-request logits.
+            let mut per_req_logits = Vec::with_capacity(prepared.req_inputs.len());
+            let mut pos = 0usize;
+            for r in &prepared.req_inputs {
+                let q_len = r.token_count;
+                let req_logits = all_logits_flat
+                    .narrow(0, pos, q_len)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("narrow error: {e}")))?;
+                per_req_logits.push(req_logits);
+                pos += q_len;
+            }
+
+            // --- Per-request sampling (paged path) ---
+            let any_logprobs_requested = prepared.req_inputs.iter().any(|r| {
+                self.sampling_params_map
+                    .get(&r.req_id)
+                    .and_then(|p| p.logprobs)
+                    .is_some()
+            });
+
+            for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+                let logits = &per_req_logits[req_idx];
+                let token_ids_slice = &prepared.flat_token_ids
+                    [req_slice.token_start..req_slice.token_start + req_slice.token_count];
+
+                // Compute prompt logprobs if requested and this is a prefill.
+                if req_slice.token_count > 1
+                    && let Some(params) = self.sampling_params_map.get(&req_slice.req_id)
+                    && let Some(top_n) = params.prompt_logprobs
+                {
+                    let top_n = top_n.max(0) as usize;
+                    let num_positions = req_slice.token_count - 1;
+                    let prefix_logits = logits
+                        .narrow(0, 0, num_positions)
+                        .and_then(|t| t.to_dtype(DType::F32))
+                        .and_then(|t| t.to_vec2::<f32>())
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "prompt logprobs tensor error: {e}"
+                            ))
+                        })?;
+                    let mut plps = Vec::with_capacity(num_positions);
+                    for (i, row) in prefix_logits.iter().enumerate() {
+                        let actual_token = token_ids_slice[i + 1];
+                        plps.push(vllm_models::sampler::compute_logprobs(
+                            row,
+                            actual_token,
+                            top_n,
+                        ));
+                    }
+                    prompt_logprobs_map.insert(req_slice.req_id.clone(), plps);
+                }
+
+                // Sample / verify speculative tokens.
+                let sampled = if !req_slice.spec_token_ids.is_empty() {
+                    self.verify_spec_decode(
+                        logits,
+                        &req_slice.spec_token_ids,
+                        req_slice.token_count,
+                    )?
+                } else {
+                    self.sample_normal(
+                        logits,
+                        &req_slice.req_id,
+                        req_slice.token_count,
+                        &mut sampler,
+                        &mut logprobs_map,
+                    )?
+                };
+
+                // Advance grammar state.
+                if let Some(guide) = self.grammar_states.get_mut(&req_slice.req_id)
+                    && let Some(&token_id) = sampled.first()
+                {
+                    guide.advance(token_id);
+                }
+
+                // Commit step results to InputBatch.
+                self.input_batch.commit_step(
+                    &req_slice.req_id,
+                    &sampled,
+                    req_slice.token_count,
+                    !req_slice.spec_token_ids.is_empty(),
+                );
+
+                // Update the token buffer with the new sampled token(s).
+                if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
+                    buf.extend_from_slice(&sampled);
+                }
+
+                token_map.insert(req_slice.req_id.clone(), sampled);
+            }
+
+            // Build ModelRunnerOutput with logprobs if any were collected.
+            let mut output = ModelRunnerOutput::from_token_map(token_map);
+            if any_logprobs_requested && !logprobs_map.is_empty() {
+                let logprobs_vec: Vec<Option<Vec<vllm_common::LogprobsOutput>>> = output
+                    .req_ids
+                    .iter()
+                    .map(|rid| logprobs_map.remove(rid))
+                    .collect();
+                output.logprobs = Some(logprobs_vec);
+            }
+            output.prompt_logprobs_dict = prompt_logprobs_map;
+            return Ok(output);
+        }
+
+        // --- Legacy per-request KV cache path (no InputBatch) ---
+        struct ReqInput {
+            req_id: String,
+            token_ids: Vec<u32>,
+            positions: Vec<u32>,
+            spec_token_ids: Vec<u32>,
+        }
+        let mut req_inputs: Vec<ReqInput> = Vec::new();
+
+        // Build prefill inputs for new requests.
+        for new_req in &scheduler_output.scheduled_new_reqs {
+            let num_tokens = scheduler_output
+                .num_scheduled_tokens
+                .get(&new_req.req_id)
+                .copied()
+                .unwrap_or(0);
+            if num_tokens == 0 {
+                continue;
+            }
+            let prompt_ids = new_req.prompt_token_ids.as_deref().unwrap_or(&[]);
+            let tokens_to_use = &prompt_ids[..num_tokens.min(prompt_ids.len())];
+            let pos_offset = new_req.num_computed_tokens;
+            let positions: Vec<u32> = (0..tokens_to_use.len() as u32)
+                .map(|i| pos_offset + i)
+                .collect();
             req_inputs.push(ReqInput {
                 req_id: new_req.req_id.clone(),
                 token_ids: tokens_to_use.to_vec(),
@@ -1056,21 +1369,13 @@ impl Worker for CandleWorker {
             });
         }
 
-        // --- Process cached/continuing requests (decode) ---
-        // With KV cache, we only feed the last token; previous tokens' K/V
-        // are already cached. This makes decode O(1) per token instead of O(n).
+        // Build decode inputs for cached requests.
         let new_req_ids: HashSet<&str> = scheduler_output
             .scheduled_new_reqs
             .iter()
             .map(|r| r.req_id.as_str())
             .collect();
-
-        for (i, req_id) in scheduler_output
-            .scheduled_cached_reqs
-            .req_ids
-            .iter()
-            .enumerate()
-        {
+        for req_id in scheduler_output.scheduled_cached_reqs.req_ids.iter() {
             if new_req_ids.contains(req_id.as_str()) {
                 continue;
             }
@@ -1082,70 +1387,25 @@ impl Worker for CandleWorker {
             if num_tokens == 0 {
                 continue;
             }
-
-            // Update block tables for paged mode.
-            // The scheduler's allocate_slots returns the FULL block list
-            // for the request (not just new blocks), so we replace rather
-            // than extend to avoid accumulating duplicates.
-            if use_paged
-                && let Some(Some(new_blocks)) =
-                    scheduler_output.scheduled_cached_reqs.new_block_ids.get(i)
-                && let Some(group0) = new_blocks.first()
-            {
-                self.req_block_tables.insert(req_id.clone(), group0.clone());
-            }
-
             if let Some(buf) = self.token_buffers.get(req_id) {
-                // Feed only the last token (the most recently generated one).
                 let last_token = *buf.last().unwrap_or(&0);
                 let position = (buf.len() - 1) as u32;
-
-                // Check for speculative decode draft tokens.
-                let spec_tokens = scheduler_output
-                    .scheduled_spec_decode_tokens
-                    .get(req_id)
-                    .cloned()
-                    .unwrap_or_default();
-
-                if spec_tokens.is_empty() {
-                    // Normal single-token decode.
-                    req_inputs.push(ReqInput {
-                        req_id: req_id.clone(),
-                        token_ids: vec![last_token],
-                        positions: vec![position],
-                        spec_token_ids: Vec::new(),
-                    });
-                } else {
-                    // Speculative decode: feed [last_token, draft_1, ..., draft_K].
-                    // The model processes all K+1 tokens in one forward pass.
-                    let mut token_ids = Vec::with_capacity(1 + spec_tokens.len());
-                    let mut positions = Vec::with_capacity(1 + spec_tokens.len());
-                    token_ids.push(last_token);
-                    positions.push(position);
-                    for (j, &draft_tok) in spec_tokens.iter().enumerate() {
-                        token_ids.push(draft_tok);
-                        positions.push(position + 1 + j as u32);
-                    }
-                    req_inputs.push(ReqInput {
-                        req_id: req_id.clone(),
-                        token_ids,
-                        positions,
-                        spec_token_ids: spec_tokens,
-                    });
-                }
+                req_inputs.push(ReqInput {
+                    req_id: req_id.clone(),
+                    token_ids: vec![last_token],
+                    positions: vec![position],
+                    spec_token_ids: Vec::new(),
+                });
             } else {
                 warn!("No token buffer for continuing request {}", req_id);
             }
         }
 
-        // Also handle any requests in num_scheduled_tokens not yet processed
-        // (backward compat: some tests put decode requests only in
-        // num_scheduled_tokens without cached_reqs).
+        // Backward compat: handle requests only in num_scheduled_tokens.
         for req_id in scheduler_output.num_scheduled_tokens.keys() {
             if new_req_ids.contains(req_id.as_str()) {
                 continue;
             }
-            // Skip if already collected via cached_reqs.
             if req_inputs.iter().any(|r| r.req_id == *req_id) {
                 continue;
             }
@@ -1171,13 +1431,32 @@ impl Worker for CandleWorker {
             return Ok(ModelRunnerOutput::from_token_map(HashMap::new()));
         }
 
-        // Create a sampler for non-greedy requests (created per-call to avoid
-        // Send issues — Sampler holds ThreadRng which is !Send).
-        let mut sampler = Sampler::new();
-        let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
-        let mut logprobs_map: HashMap<String, Vec<vllm_common::LogprobsOutput>> = HashMap::new();
-        let mut prompt_logprobs_map: HashMap<String, Vec<vllm_common::LogprobsOutput>> =
-            HashMap::new();
+        let mut per_req_logits = Vec::with_capacity(req_inputs.len());
+        for req_input in &req_inputs {
+            let mm_data = self.mm_data_map.remove(&req_input.req_id);
+            model.set_mm_data(mm_data);
+
+            let input_ids = Tensor::new(req_input.token_ids.as_slice(), device)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+            let positions = Tensor::new(req_input.positions.as_slice(), device)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+
+            let logits = if let Some(kv_cache) = self.kv_caches.get_mut(&req_input.req_id) {
+                let mut storage = KvCacheStorage::Contiguous(kv_cache);
+                model
+                    .forward(&input_ids, &positions, Some(&mut storage))
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
+                    })?
+            } else {
+                model.forward(&input_ids, &positions, None).map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
+                })?
+            };
+            per_req_logits.push(logits);
+        }
+
+        // --- Per-request sampling (legacy path) ---
         let any_logprobs_requested = req_inputs.iter().any(|r| {
             self.sampling_params_map
                 .get(&r.req_id)
@@ -1185,139 +1464,10 @@ impl Worker for CandleWorker {
                 .is_some()
         });
 
-        // --- Forward pass ---
-        // For paged KV: batched forward (all requests in one model call).
-        // For legacy KV: per-request forward (each has its own contiguous cache).
-        //
-        // `all_logits[i]` holds logits for req_inputs[i], shape [q_len, vocab].
-        let all_logits: Vec<Tensor> = if use_paged {
-            // Build flat tensors: concatenate all requests' tokens and positions.
-            let all_token_ids: Vec<u32> = req_inputs
-                .iter()
-                .flat_map(|r| r.token_ids.iter().copied())
-                .collect();
-            let all_positions: Vec<u32> = req_inputs
-                .iter()
-                .flat_map(|r| r.positions.iter().copied())
-                .collect();
-
-            let flat_ids = Tensor::new(all_token_ids.as_slice(), device)
-                .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
-            let flat_pos = Tensor::new(all_positions.as_slice(), device)
-                .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
-
-            // Build AttentionMetadata.
-            let mut query_start_loc = Vec::with_capacity(req_inputs.len() + 1);
-            let mut q_lens = Vec::with_capacity(req_inputs.len());
-            let mut seq_lens = Vec::with_capacity(req_inputs.len());
-            let mut batch_block_ids = Vec::with_capacity(req_inputs.len());
-            let mut batch_tokens_before = Vec::with_capacity(req_inputs.len());
-            let mut is_prefill = Vec::with_capacity(req_inputs.len());
-            let mut batch_req_ids = Vec::with_capacity(req_inputs.len());
-            let mut offset = 0usize;
-            for r in &req_inputs {
-                query_start_loc.push(offset);
-                let q_len = r.token_ids.len();
-                q_lens.push(q_len);
-                let tb = self.req_tokens_in_pool.get(&r.req_id).copied().unwrap_or(0);
-                seq_lens.push(tb + q_len);
-                batch_block_ids.push(
-                    self.req_block_tables
-                        .get(&r.req_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                );
-                batch_tokens_before.push(tb);
-                is_prefill.push(q_len > 1);
-                batch_req_ids.push(r.req_id.clone());
-                offset += q_len;
-            }
-            query_start_loc.push(offset);
-
-            let attn_meta = vllm_models::AttentionMetadata {
-                num_reqs: req_inputs.len(),
-                total_tokens: offset,
-                query_start_loc,
-                q_lens: q_lens.clone(),
-                seq_lens,
-                block_ids: batch_block_ids.clone(),
-                tokens_before: batch_tokens_before.clone(),
-                is_prefill,
-                req_ids: batch_req_ids,
-            };
-
-            // Build BatchedKvCacheStorage.
-            let pool = self.kv_block_pool.as_mut().unwrap();
-            let mut batched_storage = vllm_models::BatchedKvCacheStorage::new(
-                pool,
-                batch_block_ids,
-                batch_tokens_before.clone(),
-            );
-
-            // Single batched forward pass.
-            let all_logits_flat = model
-                .forward_batch(&flat_ids, &flat_pos, &attn_meta, &mut batched_storage)
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
-                })?;
-
-            // Flush deferred scatters.
-            batched_storage
-                .flush_all()
-                .map_err(|e| ExecutorError::WorkerExecution(format!("scatter flush error: {e}")))?;
-
-            // tokens-in-pool update is deferred until after sampling/
-            // spec-decode verification so we can account for rejected
-            // draft tokens.
-
-            // Split flat logits [total_tokens, vocab] into per-request logits.
-            let mut per_req_logits = Vec::with_capacity(req_inputs.len());
-            let mut pos = 0usize;
-            for r in &req_inputs {
-                let q_len = r.token_ids.len();
-                let req_logits = all_logits_flat
-                    .narrow(0, pos, q_len)
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("narrow error: {e}")))?;
-                per_req_logits.push(req_logits);
-                pos += q_len;
-            }
-            per_req_logits
-        } else {
-            // --- Legacy per-request KV cache path ---
-            let mut per_req_logits = Vec::with_capacity(req_inputs.len());
-            for req_input in &req_inputs {
-                // Inject multimodal data for VLM models (consumed during forward).
-                let mm_data = self.mm_data_map.remove(&req_input.req_id);
-                model.set_mm_data(mm_data);
-
-                let input_ids = Tensor::new(req_input.token_ids.as_slice(), device)
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
-                let positions = Tensor::new(req_input.positions.as_slice(), device)
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
-
-                let logits = if let Some(kv_cache) = self.kv_caches.get_mut(&req_input.req_id) {
-                    let mut storage = KvCacheStorage::Contiguous(kv_cache);
-                    model
-                        .forward(&input_ids, &positions, Some(&mut storage))
-                        .map_err(|e| {
-                            ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
-                        })?
-                } else {
-                    model.forward(&input_ids, &positions, None).map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
-                    })?
-                };
-                per_req_logits.push(logits);
-            }
-            per_req_logits
-        };
-
-        // --- Per-request sampling (same for both paths) ---
         for (req_idx, req_input) in req_inputs.iter().enumerate() {
-            let logits = &all_logits[req_idx];
+            let logits = &per_req_logits[req_idx];
 
-            // Compute prompt logprobs if requested and this is a prefill
-            // (more than 1 input token). logits[i] predicts token_ids[i+1].
+            // Compute prompt logprobs if requested and this is a prefill.
             if req_input.token_ids.len() > 1
                 && let Some(params) = self.sampling_params_map.get(&req_input.req_id)
                 && let Some(top_n) = params.prompt_logprobs
@@ -1343,176 +1493,28 @@ impl Worker for CandleWorker {
                 prompt_logprobs_map.insert(req_input.req_id.clone(), plps);
             }
 
-            // --- Sample / verify speculative tokens ---
+            // Sample / verify speculative tokens.
             let sampled = if !req_input.spec_token_ids.is_empty() {
-                // Speculative decode verification: check each draft token
-                // against the model's logits at that position.
-                //
-                // Input layout: [bonus_token, draft_0, draft_1, ..., draft_{K-1}]
-                // Logits layout: [logits_0, logits_1, ..., logits_K]
-                //   - logits_0 predicts what should follow bonus_token
-                //   - logits_i predicts what should follow draft_{i-1}
-                //
-                // For greedy: accept draft_i if argmax(logits_i) == draft_i.
-                // On first rejection at position j: take argmax(logits_j) instead.
-                // If all K drafts accepted: sample bonus token from logits_K.
-                let num_positions = req_input.token_ids.len(); // K+1
-                let all_logits = logits
-                    .to_dtype(DType::F32)
-                    .and_then(|t| t.to_vec2::<f32>())
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("spec decode logits error: {e}"))
-                    })?;
-
-                let mut accepted = Vec::new();
-                let num_drafts = req_input.spec_token_ids.len();
-
-                for i in 0..num_drafts {
-                    // logits at position i predict the token after input[i].
-                    // We verify that draft_i matches argmax(logits[i]).
-                    if i >= all_logits.len() {
-                        break;
-                    }
-                    let row = &all_logits[i];
-                    let argmax_id = row
-                        .iter()
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|(idx, _)| idx as u32)
-                        .unwrap_or(0);
-
-                    let draft = req_input.spec_token_ids[i];
-                    if argmax_id == draft {
-                        accepted.push(draft);
-                    } else {
-                        // Rejection: take the model's token instead.
-                        accepted.push(argmax_id);
-                        break; // Stop verifying remaining drafts.
-                    }
-                }
-
-                // If all drafts were accepted, sample a bonus token from the
-                // last position's logits (free extra token).
-                if accepted.len() == num_drafts && num_positions > 0 {
-                    let last_row = &all_logits[all_logits.len() - 1];
-                    let bonus = last_row
-                        .iter()
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|(idx, _)| idx as u32)
-                        .unwrap_or(0);
-                    accepted.push(bonus);
-                }
-
-                if accepted.is_empty() {
-                    // Fallback: should not happen, but sample normally.
-                    let last_row = &all_logits[all_logits.len() - 1];
-                    let argmax = last_row
-                        .iter()
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| {
-                            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|(idx, _)| idx as u32)
-                        .unwrap_or(0);
-                    vec![argmax]
-                } else {
-                    debug!(
-                        "Spec decode {}: {}/{} drafts accepted (+ {} tokens total)",
-                        req_input.req_id,
-                        accepted.len().min(num_drafts),
-                        num_drafts,
-                        accepted.len()
-                    );
-                    accepted
-                }
+                self.verify_spec_decode(
+                    logits,
+                    &req_input.spec_token_ids,
+                    req_input.token_ids.len(),
+                )?
             } else {
-                // Normal (non-speculative) decode path.
-                let last_pos = req_input.token_ids.len() - 1;
-                let req_logits = logits
-                    .narrow(0, last_pos, 1)
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
-
-                // Extract logits to CPU for sampling with full param support.
-                let logits_vec = req_logits
-                    .to_dtype(DType::F32)
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("dtype cast error: {e}")))?
-                    .flatten_all()
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("flatten error: {e}")))?
-                    .to_vec1::<f32>()
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
-
-                // Query grammar-allowed tokens if constrained decoding is active.
-                let grammar_allowed: Option<Vec<u32>> = self
-                    .grammar_states
-                    .get(&req_input.req_id)
-                    .and_then(|g| g.allowed_tokens());
-
-                if let Some(params) = self.sampling_params_map.get(&req_input.req_id) {
-                    let prev_tokens = self
-                        .token_buffers
-                        .get(&req_input.req_id)
-                        .map(|v| v.as_slice())
-                        .unwrap_or(&[]);
-                    let (token_id, maybe_logprobs) = sampler.sample_one(
-                        &logits_vec,
-                        params,
-                        prev_tokens,
-                        grammar_allowed.as_deref(),
-                    );
-                    if let Some(lp) = maybe_logprobs {
-                        logprobs_map
-                            .entry(req_input.req_id.clone())
-                            .or_default()
-                            .push(lp);
-                    }
-                    vec![token_id]
-                } else {
-                    let indices = req_logits.argmax(candle_core::D::Minus1).map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("argmax error: {e}"))
-                    })?;
-                    indices
-                        .to_vec1::<u32>()
-                        .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?
-                }
+                self.sample_normal(
+                    logits,
+                    &req_input.req_id,
+                    req_input.token_ids.len(),
+                    &mut sampler,
+                    &mut logprobs_map,
+                )?
             };
 
-            // Advance grammar state with the sampled token(s).
-            // (Grammar-guided decoding is incompatible with spec decode for now.)
+            // Advance grammar state.
             if let Some(guide) = self.grammar_states.get_mut(&req_input.req_id)
                 && let Some(&token_id) = sampled.first()
             {
                 guide.advance(token_id);
-            }
-
-            // Deferred tokens-in-pool update (paged KV cache).
-            // For spec decode, only count accepted tokens, not all K+1 input tokens.
-            if use_paged {
-                let tokens_before = self
-                    .req_tokens_in_pool
-                    .get(&req_input.req_id)
-                    .copied()
-                    .unwrap_or(0);
-                // For prefill: all input tokens were accepted.
-                // For normal decode: 1 input → 1 sampled token (the input was the prev token).
-                // For spec decode: input had K+1 tokens but only `sampled.len()` new tokens accepted.
-                let new_tokens_in_cache = if !req_input.spec_token_ids.is_empty() {
-                    // Spec decode: we forwarded K+1 tokens but only the first
-                    // `sampled.len()` positions have valid KV.
-                    // The 1 input token (bonus) already had its KV from the
-                    // previous step; the new accepted count is sampled.len().
-                    sampled.len()
-                } else {
-                    req_input.token_ids.len()
-                };
-                self.req_tokens_in_pool.insert(
-                    req_input.req_id.clone(),
-                    tokens_before + new_tokens_in_cache,
-                );
             }
 
             // Update the token buffer with the new sampled token(s).
@@ -2227,9 +2229,9 @@ mod tests {
         assert_eq!(worker.token_buffers["r1"].len(), 4);
         assert_eq!(worker.token_buffers["r2"].len(), 3);
 
-        // Tokens-in-pool should be updated.
-        assert_eq!(worker.req_tokens_in_pool["r1"], 3);
-        assert_eq!(worker.req_tokens_in_pool["r2"], 2);
+        // Tokens-in-pool should be updated (now tracked in InputBatch).
+        assert_eq!(worker.input_batch.tokens_in_pool_for("r1"), 3);
+        assert_eq!(worker.input_batch.tokens_in_pool_for("r2"), 2);
     }
 
     #[test]
@@ -2318,8 +2320,8 @@ mod tests {
         assert_eq!(worker.token_buffers["r1"].len(), 5);
         assert_eq!(worker.token_buffers["r2"].len(), 4);
 
-        // Tokens-in-pool incremented.
-        assert_eq!(worker.req_tokens_in_pool["r1"], 4);
-        assert_eq!(worker.req_tokens_in_pool["r2"], 3);
+        // Tokens-in-pool incremented (now tracked in InputBatch).
+        assert_eq!(worker.input_batch.tokens_in_pool_for("r1"), 4);
+        assert_eq!(worker.input_batch.tokens_in_pool_for("r2"), 3);
     }
 }

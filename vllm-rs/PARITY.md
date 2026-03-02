@@ -1,21 +1,21 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (956 tests: 854 unit + 102 e2e, 0 clippy errors)
+> Generated 2026-03-01 | Rust port: `vllm-rs/` on branch `feat/rust` (976 tests: 868 unit + 108 e2e, 0 clippy errors)
 
 ### Legend
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 160 |
+| &#x1F535; | Fully implemented | 161 |
 | &#x1F7E1; | Partially implemented | 5 |
-| &#x1F534; | Not implemented | 106 |
+| &#x1F534; | Not implemented | 105 |
 
 ### Priority (for incomplete features)
 
 | Priority | Meaning | Count |
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
-| **P3** | High — meaningfully expands user base or enables key use cases | 19 |
+| **P3** | High — meaningfully expands user base or enables key use cases | 18 |
 | **P2** | Medium — useful improvement, broader coverage | 37 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
@@ -45,7 +45,7 @@
 | [Scheduling](#scheduling) | 10 | `█████████░` 9/10 | 0 | 73 | 1 |
 | [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 28 | 2 |
 | [Parallelism & Distribution](#parallelism--distribution) | 10 | `███░░░░░░░` 3/10 | 0 | 33 | 0 |
-| [Performance Optimizations](#performance-optimizations) | 13 | `██░░░░░░░░` 3/13 | 4 | 6 | 0 |
+| [Performance Optimizations](#performance-optimizations) | 13 | `███░░░░░░░` 4/13 | 4 | 20 | 0 |
 | [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | 12 | `██░░░░░░░░` 3/12 | 0 | 0 | 0 |
 | [LoRA / Adapters](#lora--adapters) | 5 | `████░░░░░░` 2/5 | 0 | 12 | 8 |
 | [Speculative Decoding](#speculative-decoding) | 5 | `██░░░░░░░░` 1/5 | 0 | 20 | 0 |
@@ -55,7 +55,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | 8 | `██████░░░░` 5/8 | 0 | 19 | 10 |
 | [Observability & Operations](#observability--operations) | 7 | `██████████` 7/7 | 1 | 15 | 0 |
 | [CLI & Deployment](#cli--deployment) | 17 | `██████████` 16/17 | 2 | 19 | 6 |
-| **Total** | **213** | `█████░░░░░` **118/213** | **35** | **630** | **80** |
+| **Total** | **213** | `█████░░░░░` **119/213** | **35** | **644** | **80** |
 
 ---
 
@@ -344,12 +344,12 @@
 | Pre-transposed weights (Metal) | N/A | &#x1F535; | 0 | 0 | |
 | Native dtype inference (`--dtype auto`) | &#x1F535; | &#x1F535; | 4 | 2 | |
 | Mixed prefill+decode in single forward pass | &#x1F535; | &#x1F535; | 0 | 0 | |
-| Persistent InputBatch (cross-iteration reuse) | &#x1F535; | &#x1F534; | — | — | P3 |
+| Persistent InputBatch (cross-iteration reuse) | &#x1F535; | &#x1F535; | 14 | 0 | |
 | Paged KV (no gather copy on decode) | &#x1F535; | &#x1F535; | 2 | 0 | |
 
-> CPU kernel stubs in `vllm-kernels` (12 tests: rotary 3, activation 3, norm 2, cache 2, attention 2) provide building blocks for performance features. Native dtype unit tests count `candle_worker.rs` dtype parsing tests.
+> CPU kernel stubs in `vllm-kernels` (12 tests: rotary 3, activation 3, norm 2, cache 2, attention 2) provide building blocks for performance features. Native dtype unit tests count `candle_worker.rs` dtype parsing tests. Persistent InputBatch: 14 unit tests in `input_batch.rs` (add/remove/swap-remove compaction, prefill→decode transition, mixed batches, spec decode, tokens-in-pool tracking, query_start_loc consistency).
 >
-> **Batching-related items moved:** "Continuous batching" was previously listed here as fully implemented. It has been decomposed into its constituent parts: iteration-level scheduling (in [Scheduling](#scheduling)), batched forward pass (in [Scheduling](#scheduling)), batched attention metadata (in [KV Cache & Attention](#kv-cache--attention)), and mixed prefill+decode / persistent InputBatch (here). See the Scheduling section note for details on the gap.
+> **Persistent InputBatch note:** `CandleWorker` now maintains a persistent `InputBatch` struct across engine steps, matching Python vLLM V1's `InputBatch`. Per-request state (block tables, tokens-in-pool, positions, last token ID) lives in dense slot arrays that are delta-updated each step. Finished requests are swap-removed to keep the array compact. `prepare_inputs()` builds flat token/position tensors and `AttentionMetadata` from the slot arrays without HashMap lookups. This eliminates per-step allocation overhead on the decode hot path — the steady-state case where N concurrent requests each generate 1 token per step.
 
 ---
 
@@ -542,6 +542,6 @@
 | Attention backends | ~15 | 1 (custom SDPA) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Unit tests | ~948 test files | 854 passing (796 non-MLX + 58 MLX) |
-| E2E tests | — | 106 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 4 AWQ + 6 LLM API + 4 LoRA + 6 batch) |
+| Unit tests | ~948 test files | 868 passing (810 non-MLX + 58 MLX) |
+| E2E tests | — | 108 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 4 AWQ + 6 LLM API + 4 LoRA + 6 batch + 2 multimodal) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

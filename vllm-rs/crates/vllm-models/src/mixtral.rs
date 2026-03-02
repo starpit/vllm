@@ -336,15 +336,20 @@ impl MixtralDecoderLayer {
         positions: &Tensor,
         kv_cache: Option<crate::LayerKvHandle<'_>>,
     ) -> ModelResult<Tensor> {
-        // Pre-attention layernorm + attention + residual.
+        // Pre-attention layernorm + attention.
         let normed = crate::ops::rms_norm(hidden_states, &self.input_layernorm)
             .map_err(ModelError::Candle)?;
         let attn_output = self.self_attn.forward(&normed, positions, kv_cache)?;
-        let hidden_states = (hidden_states + attn_output).map_err(ModelError::Candle)?;
 
-        // Post-attention layernorm + MoE + residual.
-        let normed = crate::ops::rms_norm(&hidden_states, &self.post_attention_layernorm)
-            .map_err(ModelError::Candle)?;
+        // Fused residual add + post-attention layernorm.
+        let (normed, hidden_states) = crate::ops::fused_add_rms_norm(
+            &attn_output,
+            hidden_states,
+            &self.post_attention_layernorm,
+        )
+        .map_err(ModelError::Candle)?;
+
+        // MoE + residual.
         let mlp_output = self
             .block_sparse_moe
             .forward(&normed)

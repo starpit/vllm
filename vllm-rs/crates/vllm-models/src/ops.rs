@@ -85,6 +85,49 @@ pub fn gemma_rms_norm(input: &Tensor, norm: &GemmaRmsNorm) -> candle_core::Resul
     candle_core::Module::forward(norm, input)
 }
 
+/// Fused add + RMS normalization — dispatches to CUDA fused kernel on GPU.
+///
+/// Computes `residual += input`, then `normed = rms_norm(residual) * weight`.
+/// Returns `(normed, updated_residual)`.
+///
+/// On CPU: falls back to separate add + rms_norm.
+pub fn fused_add_rms_norm(
+    input: &Tensor,
+    residual: &Tensor,
+    norm: &RmsNorm,
+) -> candle_core::Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    if input.device().is_cuda() {
+        use vllm_kernels::norm::{CudaNormKernels, NormKernels};
+        return CudaNormKernels
+            .fused_add_rms_norm(input, residual, norm.weight(), norm.eps())
+            .map_err(kernel_err);
+    }
+    let updated = (input + residual)?;
+    let normed = candle_core::Module::forward(norm, &updated)?;
+    Ok((normed, updated))
+}
+
+/// Fused add + Gemma RMS normalization — dispatches to CUDA fused kernel on GPU.
+///
+/// Same as `fused_add_rms_norm` but uses GemmaRmsNorm (effective weight = weight + 1).
+pub fn fused_add_gemma_rms_norm(
+    input: &Tensor,
+    residual: &Tensor,
+    norm: &GemmaRmsNorm,
+) -> candle_core::Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    if input.device().is_cuda() {
+        use vllm_kernels::norm::{CudaNormKernels, NormKernels};
+        return CudaNormKernels
+            .fused_add_rms_norm(input, residual, norm.weight(), norm.eps())
+            .map_err(kernel_err);
+    }
+    let updated = (input + residual)?;
+    let normed = candle_core::Module::forward(norm, &updated)?;
+    Ok((normed, updated))
+}
+
 // ---------------------------------------------------------------------------
 // Fused QK-norm + RoPE dispatch
 // ---------------------------------------------------------------------------

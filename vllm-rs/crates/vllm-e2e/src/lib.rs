@@ -52,6 +52,10 @@ impl TestModels {
     // AWQ quantized models (candle backend, not MLX)
     pub const QWEN2_0_5B_AWQ: &str = "Qwen/Qwen2.5-0.5B-Instruct-AWQ";
 
+    // CUDA-compatible safetensors models (non-quantized, run on GPU)
+    pub const SMOLLM_135M_CUDA: &str = "HuggingFaceTB/SmolLM2-135M-Instruct";
+    pub const QWEN2_0_5B_CUDA: &str = "Qwen/Qwen2.5-0.5B";
+
     // Multimodal (vision-language) models
     // Tier 3: ~2.8 GB — nightly only (QAT = quantization-aware training)
     pub const GEMMA3_4B_IT_QAT_3BIT: &str = "mlx-community/gemma-3-4b-it-qat-3bit";

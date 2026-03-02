@@ -495,16 +495,20 @@ impl Gemma2DecoderLayer {
         let normed = crate::ops::gemma_rms_norm(hidden_states, &self.input_layernorm)
             .map_err(ModelError::Candle)?;
         let attn_output = self.self_attn.forward(&normed, positions, kv_cache)?;
-        // Post-attention norm + residual.
+        // Post-attention norm.
         let attn_output = crate::ops::gemma_rms_norm(&attn_output, &self.post_attention_layernorm)
             .map_err(ModelError::Candle)?;
-        let hidden_states = (hidden_states + attn_output).map_err(ModelError::Candle)?;
 
-        // Pre-feedforward norm + MLP.
-        let normed = crate::ops::gemma_rms_norm(&hidden_states, &self.pre_feedforward_layernorm)
-            .map_err(ModelError::Candle)?;
+        // Fused residual add + pre-feedforward norm.
+        let (normed, hidden_states) = crate::ops::fused_add_gemma_rms_norm(
+            &attn_output,
+            hidden_states,
+            &self.pre_feedforward_layernorm,
+        )
+        .map_err(ModelError::Candle)?;
+
+        // MLP + post-feedforward norm + residual.
         let mlp_output = self.mlp.forward(&normed).map_err(ModelError::Candle)?;
-        // Post-feedforward norm + residual.
         let mlp_output = crate::ops::gemma_rms_norm(&mlp_output, &self.post_feedforward_layernorm)
             .map_err(ModelError::Candle)?;
         let hidden_states = (hidden_states + mlp_output).map_err(ModelError::Candle)?;

@@ -7,12 +7,9 @@
 //! ## Simplifications vs Python vLLM
 //!
 //! The CUDA kernels here are simplified compared to Python vLLM's:
-//! - Scalar loads instead of vectorized `vec_n_t<T, VEC_SIZE>` loads (~2-3x slower on large hidden)
+//! - Vectorized loads for improved throughput on large hidden sizes
 //! - Simple warp shuffle reduction instead of CUB `BlockReduce`
 //! - 2D only (no 3D/4D for per-head QK-norm)
-//! - `fused_add_rms_norm` not yet wired to CUDA (uses add + separate norm)
-//!
-//! These will be upgraded to match Python vLLM's performance in a follow-up.
 
 use candle_core::Tensor;
 
@@ -95,6 +92,32 @@ mod cuda_ffi {
         pub fn rms_norm_bf16(
             out: *mut u16,
             input: *const u16,
+            weight: *const u16,
+            epsilon: f32,
+            num_tokens: i32,
+            hidden_size: i32,
+        );
+
+        // Fused add + RMS norm kernels
+        pub fn fused_add_rms_norm_f32(
+            input: *mut f32,
+            residual: *mut f32,
+            weight: *const f32,
+            epsilon: f32,
+            num_tokens: i32,
+            hidden_size: i32,
+        );
+        pub fn fused_add_rms_norm_f16(
+            input: *mut u16,
+            residual: *mut u16,
+            weight: *const u16,
+            epsilon: f32,
+            num_tokens: i32,
+            hidden_size: i32,
+        );
+        pub fn fused_add_rms_norm_bf16(
+            input: *mut u16,
+            residual: *mut u16,
             weight: *const u16,
             epsilon: f32,
             num_tokens: i32,
@@ -389,10 +412,69 @@ impl NormKernels for CudaNormKernels {
         weight: &Tensor,
         epsilon: f64,
     ) -> KernelResult<(Tensor, Tensor)> {
-        // TODO: wire fused_add_rms_norm CUDA kernel for in-place residual update.
-        let updated = (input + residual)?;
-        let normed = self.rms_norm(&updated, weight, epsilon)?;
-        Ok((normed, updated))
+        use candle_core::DType;
+
+        let dims = input.shape().dims();
+        let hidden_size = *dims
+            .last()
+            .ok_or_else(|| crate::error::KernelError::Other("empty input tensor".to_string()))?;
+        let num_tokens: usize = dims[..dims.len() - 1].iter().product();
+
+        // Clone for out-of-place semantics, then make contiguous.
+        let inp = input.clone().contiguous()?;
+        let res = residual.clone().contiguous()?;
+        let weight = weight.contiguous()?;
+
+        match input.dtype() {
+            DType::F32 => {
+                let i = Self::device_ptr_of::<f32>(&inp)?;
+                let r = Self::device_ptr_of::<f32>(&res)?;
+                let w = Self::device_ptr_of::<f32>(&weight)?;
+                unsafe {
+                    cuda_ffi::fused_add_rms_norm_f32(
+                        i as *mut f32,
+                        r as *mut f32,
+                        w as *const f32,
+                        epsilon as f32,
+                        num_tokens as i32,
+                        hidden_size as i32,
+                    );
+                }
+            }
+            DType::F16 => {
+                let i = Self::device_ptr_of::<half::f16>(&inp)?;
+                let r = Self::device_ptr_of::<half::f16>(&res)?;
+                let w = Self::device_ptr_of::<half::f16>(&weight)?;
+                unsafe {
+                    cuda_ffi::fused_add_rms_norm_f16(
+                        i as *mut u16,
+                        r as *mut u16,
+                        w as *const u16,
+                        epsilon as f32,
+                        num_tokens as i32,
+                        hidden_size as i32,
+                    );
+                }
+            }
+            DType::BF16 => {
+                let i = Self::device_ptr_of::<half::bf16>(&inp)?;
+                let r = Self::device_ptr_of::<half::bf16>(&res)?;
+                let w = Self::device_ptr_of::<half::bf16>(&weight)?;
+                unsafe {
+                    cuda_ffi::fused_add_rms_norm_bf16(
+                        i as *mut u16,
+                        r as *mut u16,
+                        w as *const u16,
+                        epsilon as f32,
+                        num_tokens as i32,
+                        hidden_size as i32,
+                    );
+                }
+            }
+            _ => return CpuNormKernels.fused_add_rms_norm(input, residual, &weight, epsilon),
+        }
+        // inp now contains the normalized result, res contains the updated residual.
+        Ok((inp, res))
     }
 }
 
@@ -552,6 +634,132 @@ mod tests {
     fn test_cuda_rms_norm_3d() {
         // 3D input: [batch, seq, hidden].
         assert_rms_norm_cuda_matches_cpu(&[2, 4, 128], DType::F32, 1e-4);
+    }
+
+    // -----------------------------------------------------------------------
+    // CUDA tests — fused add + RMS norm
+    // -----------------------------------------------------------------------
+
+    /// Helper: run fused_add_rms_norm on CPU and CUDA, compare results.
+    #[cfg(feature = "cuda")]
+    fn assert_fused_add_rms_norm_cuda_matches_cpu(shape: &[usize], dtype: DType, tol: f64) {
+        use super::CudaNormKernels;
+
+        let input_cpu = Tensor::randn(0f32, 1.0, shape, &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let residual_cpu = Tensor::randn(0f32, 1.0, shape, &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let hidden = *shape.last().unwrap();
+        let weight_cpu = Tensor::randn(0f32, 1.0, &[hidden], &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let eps = 1e-5;
+
+        // CPU reference (computed in f32 for accuracy).
+        let (ref_normed, ref_updated) = CpuNormKernels
+            .fused_add_rms_norm(
+                &input_cpu.to_dtype(DType::F32).unwrap(),
+                &residual_cpu.to_dtype(DType::F32).unwrap(),
+                &weight_cpu.to_dtype(DType::F32).unwrap(),
+                eps,
+            )
+            .unwrap();
+        let ref_normed = ref_normed.to_dtype(dtype).unwrap();
+        let ref_updated = ref_updated.to_dtype(dtype).unwrap();
+
+        // CUDA kernel.
+        let dev = cuda_device();
+        let input_gpu = input_cpu.to_device(&dev).unwrap();
+        let residual_gpu = residual_cpu.to_device(&dev).unwrap();
+        let weight_gpu = weight_cpu.to_device(&dev).unwrap();
+        let (cuda_normed, cuda_updated) = CudaNormKernels
+            .fused_add_rms_norm(&input_gpu, &residual_gpu, &weight_gpu, eps)
+            .unwrap();
+        let cuda_normed = cuda_normed.to_device(&Device::Cpu).unwrap();
+        let cuda_updated = cuda_updated.to_device(&Device::Cpu).unwrap();
+
+        // Compare normed output.
+        let ref_vals = ref_normed
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cuda_vals = cuda_normed
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(ref_vals.len(), cuda_vals.len());
+        for (i, (r, c)) in ref_vals.iter().zip(cuda_vals.iter()).enumerate() {
+            assert!(
+                (r - c).abs() as f64 <= tol,
+                "fused_add_rms_norm normed {:?} mismatch at {}: cpu={} cuda={}",
+                dtype,
+                i,
+                r,
+                c
+            );
+        }
+
+        // Compare updated residual.
+        let ref_upd = ref_updated
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cuda_upd = cuda_updated
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(ref_upd.len(), cuda_upd.len());
+        for (i, (r, c)) in ref_upd.iter().zip(cuda_upd.iter()).enumerate() {
+            assert!(
+                (r - c).abs() as f64 <= tol,
+                "fused_add_rms_norm residual {:?} mismatch at {}: cpu={} cuda={}",
+                dtype,
+                i,
+                r,
+                c
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_fused_add_rms_norm_f32() {
+        assert_fused_add_rms_norm_cuda_matches_cpu(&[4, 128], DType::F32, 1e-4);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_fused_add_rms_norm_f16() {
+        assert_fused_add_rms_norm_cuda_matches_cpu(&[4, 128], DType::F16, 5e-2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_fused_add_rms_norm_bf16() {
+        assert_fused_add_rms_norm_cuda_matches_cpu(&[4, 128], DType::BF16, 5e-2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_fused_add_rms_norm_large_hidden() {
+        assert_fused_add_rms_norm_cuda_matches_cpu(&[8, 896], DType::F32, 1e-4);
     }
 
     // -----------------------------------------------------------------------

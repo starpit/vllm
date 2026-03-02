@@ -8,6 +8,7 @@ description = "End-to-end tests for vLLM Rust inference engine"
 [features]
 default = ["guided-decoding", "chat-template", "metrics", "multimodal", "tls"]
 e2e = []
+cuda = ["vllm-serve/cuda"]
 metal = ["vllm-serve/metal"]
 guided-decoding = ["vllm-serve/guided-decoding"]
 multimodal = ["vllm-serve/multimodal"]

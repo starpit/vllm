@@ -3,12 +3,12 @@
 > Generated 2026-03-01 | Baseline: `feat/rust` branch (889 tests, 0 clippy errors)
 > Goal: feature-for-feature CUDA parity with Python vLLM's V1 engine on NVIDIA GPUs
 >
-> **Progress (2026-03-01)**: Phases 0, 1, 3.1-3.8 DONE on `worktree-cuda` branch.
-> E2E verified on L40S (48GB Ada): Qwen2.5-0.5B BF16, first custom CUDA kernel (RMSNorm) compiled.
-> Fused SiLU+mul, GELU+mul, RoPE CUDA kernels added. KernelSet dispatch struct created.
-> Phase 3.5: reshape_and_cache fused kernel for paged KV cache scatter (NHD layout).
-> Phase 3.7: fused QK-norm+RoPE kernel for Gemma3 (per-head RMS norm + NeoX RoPE in single kernel).
-> Phase 3.8: ops.rs auto-dispatches fused kernels into all model forward paths.
+> **Progress (2026-03-02)**: Phases 0, 1, 3.1-3.8 DONE on `worktree-cuda` branch.
+> E2E verified on L40S (48GB Ada): Qwen2.5-0.5B BF16.
+> All custom CUDA kernels use vectorized 128-bit loads (vec_utils.cuh).
+> `fused_add_rms_norm` wired — saves 1 kernel launch + 1 tensor alloc per decoder layer.
+> `ops::fused_add_rms_norm` / `ops::fused_add_gemma_rms_norm` integrated into all model architectures.
+> Next: Phase 2 (FlashAttention) or Phase 4 (CUDA Graphs).
 
 ---
 
@@ -123,16 +123,15 @@ This plan is organized into **7 phases**, roughly ordered by impact and dependen
 | # | Task | Details | Status |
 |---|------|---------|--------|
 | 3.1 | **Build infrastructure** | `vllm-kernels/build.rs` compiles `csrc/*.cu` via `cc` crate + nvcc. SM80/86/89/90. `-O3 --use_fast_math`. | ✅ |
-| 3.2 | **Fused RMSNorm kernel** | `csrc/layernorm_kernels.cu` — simplified port (scalar loads, warp shuffle, 2D). `CudaNormKernels` FFI for f32/f16/bf16. fused_add_rms_norm TODO. | ✅ (simplified) |
-| 3.3 | **Fused SiLU+mul kernel** | Port `csrc/activation_kernels.cu` → `silu_and_mul()`, `gelu_and_mul()`, `gelu_new_and_mul()`. | ✅ (simplified) |
-| 3.4 | **Fused RoPE kernel** | Port `csrc/pos_encoding_kernels.cu` → `rotary_embedding()`. NeoX-style, per-head rotation. | ✅ (simplified) |
-| 3.5 | **reshape_and_cache fused kernel** | Port `csrc/cache_kernels.cu` for paged KV cache scatter. NHD layout, fused write for scatter_new_kv + write_kv on CUDA. | ✅ (simplified) |
+| 3.2 | **Fused RMSNorm kernel** | `csrc/layernorm_kernels.cu` — vectorized loads, warp shuffle, 2D. `CudaNormKernels` FFI for f32/f16/bf16. `fused_add_rms_norm` wired. | ✅ |
+| 3.3 | **Fused SiLU+mul kernel** | Port `csrc/activation_kernels.cu` → `silu_and_mul()`, `gelu_and_mul()`, `gelu_new_and_mul()`. Vectorized loads. | ✅ |
+| 3.4 | **Fused RoPE kernel** | Port `csrc/pos_encoding_kernels.cu` → `rotary_embedding()`. NeoX-style, per-head rotation. Vectorized loads. | ✅ |
+| 3.5 | **reshape_and_cache fused kernel** | Port `csrc/cache_kernels.cu` for paged KV cache scatter. NHD layout. Vectorized loads. | ✅ |
 | 3.6 | **CudaKernelSet struct** | `KernelSet` trait + `CpuKernelSet`/`CudaKernelSet` + `create_kernel_set(device)` factory. | ✅ |
 | 3.7 | **Fused QK-norm+RoPE** | Per-head RMS norm + NeoX RoPE in single kernel. Used by Gemma3. `qk_norm_rope_kernels.cu`, wired via `ops::qk_norm_and_rope()`. 4 GPU unit tests. | ✅ |
 | 3.8 | **Kernel dispatch in model layers** | Wire kernel traits into model forward() methods. `ops.rs` dispatch for all model architectures. | ✅ |
 
-**Simplifications vs Python vLLM (documented in norm.rs, to be upgraded):**
-- Scalar loads instead of vectorized vec_n_t (~2-3x slower)
+**Remaining simplifications vs Python vLLM:**
 - Warp shuffle reduction instead of CUB BlockReduce
 - 2D only (no 3D/4D per-head QK-norm)
 - Python `.cu` files can't be used directly — they depend on PyTorch C++ API (torch/cuda.h, ATen dispatch)

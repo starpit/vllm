@@ -1,22 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Fused rotary position embedding (RoPE) CUDA kernel for vLLM Rust.
 //
-// Port of csrc/pos_encoding_kernels.cu from Python vLLM (simplified).
+// Port of csrc/pos_encoding_kernels.cu from Python vLLM.
 // One thread block per token. Each thread handles one (head, rot_offset)
 // pair, performing the NeoX-style rotation in-place.
 //
-// Simplifications vs Python vLLM:
-// - Scalar loads instead of vectorized loads
-// - NeoX-style only (no GPT-J interleaved mode)
-// - Single kernel handles all heads (no batched multi-head optimizations)
-//
-// The kernel is parameterized by head_size, enabling correct per-head
-// rotation for multi-head attention. For flat rotation (single "head"),
-// set head_size = total_dim.
+// Uses vectorized 128-bit loads/stores where alignment allows.
+// RoPE pairs (x, y) are at offsets [i] and [i + half], which may not be
+// adjacent for vectorization, so we vectorize the cos/sin loads and
+// process multiple rotation pairs per thread iteration.
 
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include "vec_utils.cuh"
 
 // ---------------------------------------------------------------------------
 // Fused RoPE kernel: lookup cos/sin from cache + rotate per head, in-place
@@ -33,6 +30,8 @@ __global__ void rotary_embedding_kernel(
     int total_k_dim,                         // = num_kv_heads * head_size
     int head_size)                           // dimension per head
 {
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+
     const int token_idx = blockIdx.x;
     const int pos = static_cast<int>(positions[token_idx]);
     const int half_rot = rotary_dim / 2;
@@ -42,16 +41,42 @@ __global__ void rotary_embedding_kernel(
     const T* sin_ptr = cos_ptr + half_rot;
 
     // Compute the rotary dimension per head (min of half_rot and head_size/2).
-    // This handles partial rotation (rotary_dim < head_size).
     const int half = (half_rot < head_size / 2) ? half_rot : (head_size / 2);
+
+    // Number of vec-sized chunks in the rotary half-dimension.
+    const int half_vecs = half / VEC_SIZE;
+    const int half_tail = half_vecs * VEC_SIZE;
 
     // --- Rotate query heads ---
     const int num_q_heads = total_q_dim / head_size;
     T* q = query + token_idx * total_q_dim;
 
-    for (int tid = threadIdx.x; tid < num_q_heads * half; tid += blockDim.x) {
-        const int head = tid / half;
-        const int rot_offset = tid % half;
+    // Vectorized: process VEC_SIZE rotation pairs at a time.
+    for (int tid = threadIdx.x; tid < num_q_heads * half_vecs; tid += blockDim.x) {
+        const int head = tid / half_vecs;
+        const int vi = tid % half_vecs;
+        const int base = head * head_size + vi * VEC_SIZE;
+
+        float xbuf[VEC_SIZE], ybuf[VEC_SIZE], cbuf[VEC_SIZE], sbuf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&q[base]), xbuf);
+        unpack_vec<T>(vec_load(&q[base + half]), ybuf);
+        unpack_vec<T>(vec_load(&cos_ptr[vi * VEC_SIZE]), cbuf);
+        unpack_vec<T>(vec_load(&sin_ptr[vi * VEC_SIZE]), sbuf);
+
+        float ox[VEC_SIZE], oy[VEC_SIZE];
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            ox[j] = xbuf[j] * cbuf[j] - ybuf[j] * sbuf[j];
+            oy[j] = ybuf[j] * cbuf[j] + xbuf[j] * sbuf[j];
+        }
+        vec_store(&q[base], pack_vec<T>(ox));
+        vec_store(&q[base + half], pack_vec<T>(oy));
+    }
+
+    // Scalar tail for remaining rotation pairs.
+    for (int tid = threadIdx.x; tid < num_q_heads * (half - half_tail); tid += blockDim.x) {
+        const int head = tid / (half - half_tail);
+        const int rot_offset = half_tail + tid % (half - half_tail);
         const int base = head * head_size;
 
         float x = static_cast<float>(q[base + rot_offset]);
@@ -68,9 +93,32 @@ __global__ void rotary_embedding_kernel(
         const int num_k_heads = total_k_dim / head_size;
         T* k = key + token_idx * total_k_dim;
 
-        for (int tid = threadIdx.x; tid < num_k_heads * half; tid += blockDim.x) {
-            const int head = tid / half;
-            const int rot_offset = tid % half;
+        // Vectorized.
+        for (int tid = threadIdx.x; tid < num_k_heads * half_vecs; tid += blockDim.x) {
+            const int head = tid / half_vecs;
+            const int vi = tid % half_vecs;
+            const int base = head * head_size + vi * VEC_SIZE;
+
+            float xbuf[VEC_SIZE], ybuf[VEC_SIZE], cbuf[VEC_SIZE], sbuf[VEC_SIZE];
+            unpack_vec<T>(vec_load(&k[base]), xbuf);
+            unpack_vec<T>(vec_load(&k[base + half]), ybuf);
+            unpack_vec<T>(vec_load(&cos_ptr[vi * VEC_SIZE]), cbuf);
+            unpack_vec<T>(vec_load(&sin_ptr[vi * VEC_SIZE]), sbuf);
+
+            float ox[VEC_SIZE], oy[VEC_SIZE];
+            #pragma unroll
+            for (int j = 0; j < VEC_SIZE; j++) {
+                ox[j] = xbuf[j] * cbuf[j] - ybuf[j] * sbuf[j];
+                oy[j] = ybuf[j] * cbuf[j] + xbuf[j] * sbuf[j];
+            }
+            vec_store(&k[base], pack_vec<T>(ox));
+            vec_store(&k[base + half], pack_vec<T>(oy));
+        }
+
+        // Scalar tail.
+        for (int tid = threadIdx.x; tid < num_k_heads * (half - half_tail); tid += blockDim.x) {
+            const int head = tid / (half - half_tail);
+            const int rot_offset = half_tail + tid % (half - half_tail);
             const int base = head * head_size;
 
             float x = static_cast<float>(k[base + rot_offset]);

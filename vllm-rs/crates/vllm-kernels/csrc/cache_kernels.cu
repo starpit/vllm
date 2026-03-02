@@ -1,25 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Fused reshape_and_cache CUDA kernel for vLLM Rust.
 //
-// Port of csrc/cache_kernels.cu from Python vLLM (simplified).
+// Port of csrc/cache_kernels.cu from Python vLLM.
 // Scatters newly computed K/V tokens into the paged KV cache using
 // a slot_mapping that maps each token to its target cache slot.
 //
 // Cache layout: [num_blocks, block_size, num_kv_heads, head_dim] (NHD)
 // This matches the "flash" variant in Python vLLM.
 //
-// Simplifications vs Python vLLM:
-// - Scalar loads instead of vectorized int4/vec_n_t loads
-// - No FP8 KV cache dtype support (kv_dt always auto)
-// - No k_scale/v_scale quantization parameters
-// - NHD layout only (no head_size/x reshuffling)
+// Uses vectorized 128-bit loads/stores for throughput.
 
 #include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include "vec_utils.cuh"
 
 // ---------------------------------------------------------------------------
-// reshape_and_cache kernel
+// reshape_and_cache kernel (vectorized)
 // ---------------------------------------------------------------------------
 // Grid:  num_tokens blocks (one per token)
 // Block: min(num_heads * head_dim, 1024) threads
@@ -38,6 +35,8 @@ __global__ void reshape_and_cache_kernel(
     int head_dim,
     int block_size)
 {
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+
     const int token_idx = blockIdx.x;
     const int64_t slot = slot_mapping[token_idx];
 
@@ -47,18 +46,25 @@ __global__ void reshape_and_cache_kernel(
     }
 
     const int n_elems = num_heads * head_dim;
+    const int num_vecs = n_elems / VEC_SIZE;
+    const int tail_start = num_vecs * VEC_SIZE;
 
     // Source: contiguous input at [token_idx, :, :]
     const T* key_src = key + token_idx * n_elems;
     const T* value_src = value + token_idx * n_elems;
 
     // Destination: cache[block_idx, block_offset, :, :]
-    // slot = block_idx * block_size + block_offset
-    // Flat offset = slot * n_elems (since the last two dims are num_heads * head_dim)
     T* key_dst = key_cache + slot * n_elems;
     T* value_dst = value_cache + slot * n_elems;
 
-    for (int i = threadIdx.x; i < n_elems; i += blockDim.x) {
+    // Vectorized copy.
+    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
+        vec_store(&key_dst[vi * VEC_SIZE], vec_load(&key_src[vi * VEC_SIZE]));
+        vec_store(&value_dst[vi * VEC_SIZE], vec_load(&value_src[vi * VEC_SIZE]));
+    }
+
+    // Scalar tail.
+    for (int i = tail_start + threadIdx.x; i < n_elems; i += blockDim.x) {
         key_dst[i] = key_src[i];
         value_dst[i] = value_src[i];
     }

@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Fused activation + element-wise multiply CUDA kernels for vLLM Rust.
 //
-// Port of csrc/activation_kernels.cu from Python vLLM (simplified).
+// Port of csrc/activation_kernels.cu from Python vLLM.
 // One thread block per row (token). Each block processes the gate and up
 // projections element-wise: out[i] = act(gate[i]) * up[i].
 //
-// Simplifications vs Python vLLM:
-// - Scalar loads instead of vectorized int4/u32x8 loads
-// - No packed half2/bfloat162 arithmetic path
-// - Separate gate/up pointers (matching Rust trait API) instead of
-//   concatenated [2*d] input
+// Uses vectorized 128-bit loads/stores for throughput.
 
 #include <cstdint>
 #include <cmath>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include "vec_utils.cuh"
 
 // ---------------------------------------------------------------------------
 // Activation functions (scalar, in float)
@@ -41,7 +38,7 @@ __device__ __forceinline__ float gelu_tanh(float x) {
 }
 
 // ---------------------------------------------------------------------------
-// Fused act-and-mul kernel: out[i] = act(gate[i]) * up[i]
+// Fused act-and-mul kernel (vectorized): out[i] = act(gate[i]) * up[i]
 // ---------------------------------------------------------------------------
 
 template <float (*ACT_FN)(float), typename T>
@@ -51,12 +48,30 @@ __global__ void act_and_mul_kernel(
     const T* __restrict__ up,
     int d)
 {
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+
     const int row = blockIdx.x;
     const T* g = gate + row * d;
     const T* u = up + row * d;
     T* o = out + row * d;
 
-    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+    const int num_vecs = d / VEC_SIZE;
+    const int tail_start = num_vecs * VEC_SIZE;
+
+    // Vectorized loop.
+    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
+        float gbuf[VEC_SIZE], ubuf[VEC_SIZE], obuf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&g[vi * VEC_SIZE]), gbuf);
+        unpack_vec<T>(vec_load(&u[vi * VEC_SIZE]), ubuf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            obuf[j] = ACT_FN(gbuf[j]) * ubuf[j];
+        }
+        vec_store(&o[vi * VEC_SIZE], pack_vec<T>(obuf));
+    }
+
+    // Scalar tail.
+    for (int i = tail_start + threadIdx.x; i < d; i += blockDim.x) {
         float gv = ACT_FN(static_cast<float>(g[i]));
         float uv = static_cast<float>(u[i]);
         o[i] = static_cast<T>(gv * uv);

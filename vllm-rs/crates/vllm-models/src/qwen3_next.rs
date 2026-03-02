@@ -1183,7 +1183,7 @@ impl Qwen3NextDecoderLayer {
         positions: &Tensor,
         kv_cache: Option<crate::LayerKvHandle<'_>>,
     ) -> ModelResult<Tensor> {
-        // Pre-attention layernorm + attention + residual.
+        // Pre-attention layernorm + attention.
         let normed = crate::ops::gemma_rms_norm(hidden_states, &self.input_layernorm)
             .map_err(ModelError::Candle)?;
 
@@ -1193,11 +1193,16 @@ impl Qwen3NextDecoderLayer {
             }
             Qwen3NextAttnVariant::LinearAttention(gdn) => gdn.forward(&normed)?,
         };
-        let hidden_states = (hidden_states + attn_output).map_err(ModelError::Candle)?;
 
-        // Post-attention layernorm + MLP/MoE + residual.
-        let normed = crate::ops::gemma_rms_norm(&hidden_states, &self.post_attention_layernorm)
-            .map_err(ModelError::Candle)?;
+        // Fused residual add + post-attention layernorm.
+        let (normed, hidden_states) = crate::ops::fused_add_gemma_rms_norm(
+            &attn_output,
+            hidden_states,
+            &self.post_attention_layernorm,
+        )
+        .map_err(ModelError::Candle)?;
+
+        // MLP/MoE + residual.
         let mlp_output = self.mlp.forward(&normed).map_err(ModelError::Candle)?;
         let hidden_states = (hidden_states + mlp_output).map_err(ModelError::Candle)?;
 

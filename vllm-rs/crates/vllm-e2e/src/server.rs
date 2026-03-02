@@ -174,6 +174,7 @@ impl TestServerBuilder {
             ssl_keyfile: None,
             ssl_certfile: None,
             ssl_ca_certs: None,
+            startup_instant: None,
         };
 
         let app_state = Arc::new(vllm_serve::server::AppState {

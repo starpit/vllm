@@ -58,6 +58,9 @@ pub struct ServerConfig {
 
     /// Path to CA certificates file for client certificate verification (PEM).
     pub ssl_ca_certs: Option<String>,
+
+    /// Instant when the process started, for total startup time reporting.
+    pub startup_instant: Option<std::time::Instant>,
 }
 
 impl Default for ServerConfig {
@@ -70,6 +73,7 @@ impl Default for ServerConfig {
             ssl_keyfile: None,
             ssl_certfile: None,
             ssl_ca_certs: None,
+            startup_instant: None,
         }
     }
 }
@@ -170,7 +174,14 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
             "vLLM Rust server listening on https://{}",
             state.config.bind_address
         );
-        info!("Application startup complete.");
+        if let Some(start) = state.config.startup_instant {
+            info!(
+                "Application startup complete. ({:.2}s)",
+                start.elapsed().as_secs_f64()
+            );
+        } else {
+            info!("Application startup complete.");
+        }
         axum_server::bind_rustls(addr, tls_config)
             .serve(router.into_make_service())
             .await?;
@@ -187,7 +198,14 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         "vLLM Rust server listening on http://{}",
         state.config.bind_address
     );
-    info!("Application startup complete.");
+    if let Some(start) = state.config.startup_instant {
+        info!(
+            "Application startup complete. ({:.2}s)",
+            start.elapsed().as_secs_f64()
+        );
+    } else {
+        info!("Application startup complete.");
+    }
     axum::serve(listener, router).await?;
     Ok(())
 }

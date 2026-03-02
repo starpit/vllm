@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//! BitsAndBytes NF4/FP4 quantized linear layer.
+//! BitsAndBytes quantized linear layers (NF4/FP4 4-bit and INT8 8-bit).
 //!
-//! Implements 4-bit dequantization and matmul for weights stored in the
-//! BitsAndBytes HuggingFace format:
+//! NF4/FP4 (4-bit):
 //! - `*.weight` — packed uint8, two nibbles per byte, flat `[num_elements/2]`
 //! - `*.weight.absmax` — f32, per-block absmax scales `[num_blocks]`
 //! - `*.weight.quant_state.bitsandbytes__nf4` — metadata (ignored, we parse shape ourselves)
+//! - Dequantization: `weight[i] = absmax[i / blocksize] * TABLE[nibble(packed, i)]`
 //!
-//! Dequantization: `weight[i] = absmax[i / blocksize] * TABLE[nibble(packed, i)]`
+//! INT8 (8-bit):
+//! - `*.weight` — int8 stored as uint8 `[out_features, in_features]`
+//! - `*.weight.SCB` — f32, per-row absmax scales `[out_features]`
+//! - Dequantization: `weight[row][col] = int8_val * (SCB[row] / 127.0)`
 
 use candle_core::{DType, Device, Module, Tensor};
 
@@ -55,6 +58,216 @@ impl Default for BnbNf4Config {
             quant_type: BnbQuantType::NF4,
             blocksize: 64,
             double_quant: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BnbLayerConfig — unified config for NF4 or INT8 layers
+// ---------------------------------------------------------------------------
+
+/// Layer-level BnB configuration — either NF4 or INT8.
+#[derive(Debug, Clone)]
+pub enum BnbLayerConfig {
+    Nf4(BnbNf4Config),
+    Int8,
+}
+
+// ---------------------------------------------------------------------------
+// BnbInt8Linear
+// ---------------------------------------------------------------------------
+
+/// A linear layer backed by BitsAndBytes INT8 quantized weights.
+///
+/// On each forward pass the int8 weights are dequantized to the working dtype
+/// using per-row absmax scales, multiplied with the input, and optionally bias
+/// is added.
+pub struct BnbInt8Linear {
+    weight_u8: Tensor, // uint8 (reinterpreted as int8), [out_features, in_features]
+    absmax: Tensor,    // f32, per-row scales [out_features]
+    bias: Option<Tensor>,
+    in_features: usize,
+    out_features: usize,
+    original_dtype: DType,
+}
+
+impl BnbInt8Linear {
+    /// Load a BnB INT8 linear layer from model weights.
+    ///
+    /// Looks for `{prefix}.weight` (int8 stored as uint8) and `{prefix}.SCB` (f32 absmax).
+    pub fn from_weights(
+        weights: &ModelWeights,
+        prefix: &str,
+        out_features: usize,
+        in_features: usize,
+        dtype: DType,
+        _device: &Device,
+    ) -> ModelResult<Self> {
+        let weight_u8 = weights.get(&format!("{prefix}.weight"))?.clone();
+        let absmax = weights.get(&format!("{prefix}.SCB"))?.clone();
+        let bias = weights.get(&format!("{prefix}.bias")).ok().cloned();
+
+        Ok(Self {
+            weight_u8,
+            absmax,
+            bias,
+            in_features,
+            out_features,
+            original_dtype: dtype,
+        })
+    }
+
+    /// Dequantize INT8 weights to a full float weight matrix.
+    ///
+    /// Returns shape `[out_features, in_features]` in the original dtype.
+    pub fn dequantize(&self) -> ModelResult<Tensor> {
+        let device = self.weight_u8.device();
+
+        // Read weight bytes (stored as uint8, reinterpreted as signed int8).
+        let weight_data: Vec<u8> = self
+            .weight_u8
+            .flatten_all()
+            .map_err(ModelError::Candle)?
+            .to_vec1()
+            .map_err(ModelError::Candle)?;
+
+        // Read per-row absmax scales.
+        let absmax_data: Vec<f32> = self
+            .absmax
+            .to_dtype(DType::F32)
+            .map_err(ModelError::Candle)?
+            .flatten_all()
+            .map_err(ModelError::Candle)?
+            .to_vec1()
+            .map_err(ModelError::Candle)?;
+
+        let mut out = vec![0.0f32; self.out_features * self.in_features];
+
+        for (row, &scale_raw) in absmax_data.iter().enumerate().take(self.out_features) {
+            let scale = scale_raw / 127.0;
+            for col in 0..self.in_features {
+                let idx = row * self.in_features + col;
+                let signed_val = weight_data[idx] as i8;
+                out[idx] = signed_val as f32 * scale;
+            }
+        }
+
+        let t = Tensor::from_vec(out, (self.out_features, self.in_features), device)
+            .map_err(ModelError::Candle)?;
+        t.to_dtype(self.original_dtype).map_err(ModelError::Candle)
+    }
+
+    /// Input features (unquantized).
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// Output features.
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+}
+
+impl Module for BnbInt8Linear {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let w = self
+            .dequantize()
+            .map_err(|e| candle_core::Error::Msg(format!("BnB INT8 dequantize: {e}")))?;
+
+        let x_dtype = x.dtype();
+        let x = if x.dtype() != w.dtype() {
+            x.to_dtype(w.dtype())?
+        } else {
+            x.clone()
+        };
+
+        let wt = w.t()?.contiguous()?;
+        let output = x.contiguous()?.matmul(&wt)?;
+        let output = if output.dtype() != x_dtype {
+            output.to_dtype(x_dtype)?
+        } else {
+            output
+        };
+
+        match &self.bias {
+            Some(b) => output.broadcast_add(b),
+            None => Ok(output),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BnbLinear — unified NF4/INT8 enum
+// ---------------------------------------------------------------------------
+
+/// Unified BitsAndBytes linear layer supporting both NF4 (4-bit) and INT8 (8-bit).
+pub enum BnbLinear {
+    Nf4(BnbNf4Linear),
+    Int8(BnbInt8Linear),
+}
+
+impl BnbLinear {
+    /// Load a BnB linear layer, selecting NF4 or INT8 based on the config.
+    pub fn from_weights(
+        weights: &ModelWeights,
+        prefix: &str,
+        config: &BnbLayerConfig,
+        out_features: usize,
+        in_features: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> ModelResult<Self> {
+        match config {
+            BnbLayerConfig::Nf4(nf4_cfg) => Ok(Self::Nf4(BnbNf4Linear::from_weights(
+                weights,
+                prefix,
+                nf4_cfg,
+                out_features,
+                in_features,
+                dtype,
+                device,
+            )?)),
+            BnbLayerConfig::Int8 => Ok(Self::Int8(BnbInt8Linear::from_weights(
+                weights,
+                prefix,
+                out_features,
+                in_features,
+                dtype,
+                device,
+            )?)),
+        }
+    }
+
+    /// Dequantize to a full float weight matrix `[out_features, in_features]`.
+    pub fn dequantize(&self) -> ModelResult<Tensor> {
+        match self {
+            Self::Nf4(inner) => inner.dequantize(),
+            Self::Int8(inner) => inner.dequantize(),
+        }
+    }
+
+    /// Input features (unquantized).
+    pub fn in_features(&self) -> usize {
+        match self {
+            Self::Nf4(inner) => inner.in_features(),
+            Self::Int8(inner) => inner.in_features(),
+        }
+    }
+
+    /// Output features.
+    pub fn out_features(&self) -> usize {
+        match self {
+            Self::Nf4(inner) => inner.out_features(),
+            Self::Int8(inner) => inner.out_features(),
+        }
+    }
+}
+
+impl Module for BnbLinear {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Nf4(inner) => inner.forward(x),
+            Self::Int8(inner) => inner.forward(x),
         }
     }
 }
@@ -569,5 +782,253 @@ mod tests {
             .unwrap();
         assert!((vals[0] - 1.0).abs() < 0.02);
         assert!((vals[1] - (-1.0)).abs() < 0.02);
+    }
+
+    // -----------------------------------------------------------------------
+    // INT8 tests
+    // -----------------------------------------------------------------------
+
+    /// Create a uint8 tensor from signed i8 values (two's complement).
+    fn i8_to_u8_bytes(vals: &[i8]) -> Vec<u8> {
+        vals.iter().map(|&v| v as u8).collect()
+    }
+
+    /// Test INT8 dequantization with known values.
+    #[test]
+    fn test_bnb_int8_dequantize_basic() {
+        let device = Device::Cpu;
+
+        // 1 row, 4 cols. INT8 values: [127, -127, 0, 64]
+        // absmax (SCB) = 2.54 → scale = 2.54/127 = 0.02
+        // Expected: [127*0.02, -127*0.02, 0, 64*0.02] = [2.54, -2.54, 0.0, 1.28]
+        let weight_bytes = i8_to_u8_bytes(&[127, -127, 0, 64]);
+        let weight = Tensor::new(weight_bytes.as_slice(), &device).unwrap();
+        let absmax = Tensor::new(&[2.54f32], &device).unwrap();
+
+        let linear = BnbInt8Linear {
+            weight_u8: weight,
+            absmax,
+            bias: None,
+            in_features: 4,
+            out_features: 1,
+            original_dtype: DType::F32,
+        };
+
+        let w = linear.dequantize().unwrap();
+        assert_eq!(w.dims(), &[1, 4]);
+        let vals: Vec<f32> = w.flatten_all().unwrap().to_vec1().unwrap();
+
+        assert!(
+            (vals[0] - 2.54).abs() < 0.01,
+            "expected 2.54, got {}",
+            vals[0]
+        );
+        assert!(
+            (vals[1] - (-2.54)).abs() < 0.01,
+            "expected -2.54, got {}",
+            vals[1]
+        );
+        assert!(
+            (vals[2] - 0.0).abs() < 0.01,
+            "expected 0.0, got {}",
+            vals[2]
+        );
+        assert!(
+            (vals[3] - 1.28).abs() < 0.01,
+            "expected 1.28, got {}",
+            vals[3]
+        );
+    }
+
+    /// Test INT8 forward pass shape.
+    #[test]
+    fn test_bnb_int8_forward_shape() {
+        let device = Device::Cpu;
+
+        // 2 outputs, 4 inputs — 8 bytes.
+        let weight_bytes = i8_to_u8_bytes(&[127i8; 8]);
+        let weight = Tensor::new(weight_bytes.as_slice(), &device).unwrap();
+        let absmax = Tensor::new(&[1.0f32, 1.0], &device).unwrap();
+
+        let linear = BnbInt8Linear {
+            weight_u8: weight,
+            absmax,
+            bias: None,
+            in_features: 4,
+            out_features: 2,
+            original_dtype: DType::F32,
+        };
+
+        let x = Tensor::ones((3, 4), DType::F32, &device).unwrap();
+        let y = linear.forward(&x).unwrap();
+        assert_eq!(y.dims(), &[3, 2]);
+    }
+
+    /// Test INT8 forward pass values.
+    #[test]
+    fn test_bnb_int8_forward_values() {
+        let device = Device::Cpu;
+
+        // 1 output, 2 inputs. INT8 = [127, 127], absmax = 1.27
+        // scale = 1.27/127 = 0.01, dequant = [1.27, 1.27]
+        // x = [1.0, 1.0] → output = 1.27 + 1.27 = 2.54
+        let weight_bytes = i8_to_u8_bytes(&[127, 127]);
+        let weight = Tensor::new(weight_bytes.as_slice(), &device).unwrap();
+        let absmax = Tensor::new(&[1.27f32], &device).unwrap();
+
+        let linear = BnbInt8Linear {
+            weight_u8: weight,
+            absmax,
+            bias: None,
+            in_features: 2,
+            out_features: 1,
+            original_dtype: DType::F32,
+        };
+
+        let x = Tensor::ones((1, 2), DType::F32, &device).unwrap();
+        let y = linear.forward(&x).unwrap();
+        let val: f32 = y.flatten_all().unwrap().to_vec1().unwrap()[0];
+        assert!((val - 2.54).abs() < 0.01, "expected 2.54, got {val}");
+    }
+
+    /// Test INT8 with bias.
+    #[test]
+    fn test_bnb_int8_with_bias() {
+        let device = Device::Cpu;
+
+        // All zeros (int8=0), bias=10.0 → output = 10.0
+        let weight_bytes = vec![0u8; 4];
+        let weight = Tensor::new(weight_bytes.as_slice(), &device).unwrap();
+        let absmax = Tensor::new(&[1.0f32], &device).unwrap();
+        let bias = Tensor::new(&[10.0f32], &device).unwrap();
+
+        let linear = BnbInt8Linear {
+            weight_u8: weight,
+            absmax,
+            bias: Some(bias),
+            in_features: 4,
+            out_features: 1,
+            original_dtype: DType::F32,
+        };
+
+        let x = Tensor::ones((1, 4), DType::F32, &device).unwrap();
+        let y = linear.forward(&x).unwrap();
+        let val: f32 = y.flatten_all().unwrap().to_vec1().unwrap()[0];
+        assert!((val - 10.0).abs() < 0.01, "expected 10.0, got {val}");
+    }
+
+    /// Test INT8 BF16 dtype conversion.
+    #[test]
+    fn test_bnb_int8_dequantize_bf16() {
+        let device = Device::Cpu;
+
+        let weight_bytes = i8_to_u8_bytes(&[127, -127]);
+        let weight = Tensor::new(weight_bytes.as_slice(), &device).unwrap();
+        let absmax = Tensor::new(&[1.27f32], &device).unwrap();
+
+        let linear = BnbInt8Linear {
+            weight_u8: weight,
+            absmax,
+            bias: None,
+            in_features: 2,
+            out_features: 1,
+            original_dtype: DType::BF16,
+        };
+
+        let w = linear.dequantize().unwrap();
+        assert_eq!(w.dtype(), DType::BF16);
+        let vals: Vec<f32> = w
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert!((vals[0] - 1.27).abs() < 0.02);
+        assert!((vals[1] - (-1.27)).abs() < 0.02);
+    }
+
+    /// Test INT8 multiple rows (different absmax per row).
+    #[test]
+    fn test_bnb_int8_multiple_rows() {
+        let device = Device::Cpu;
+
+        // 2 rows, 2 cols. Row 0: absmax=2.54, Row 1: absmax=1.27
+        // INT8 vals: [[127, 127], [127, 127]]
+        // Row 0 dequant: [2.54, 2.54], Row 1 dequant: [1.27, 1.27]
+        let weight_bytes = i8_to_u8_bytes(&[127, 127, 127, 127]);
+        let weight = Tensor::new(weight_bytes.as_slice(), &device).unwrap();
+        let absmax = Tensor::new(&[2.54f32, 1.27], &device).unwrap();
+
+        let linear = BnbInt8Linear {
+            weight_u8: weight,
+            absmax,
+            bias: None,
+            in_features: 2,
+            out_features: 2,
+            original_dtype: DType::F32,
+        };
+
+        let w = linear.dequantize().unwrap();
+        let vals: Vec<f32> = w.flatten_all().unwrap().to_vec1().unwrap();
+        assert!((vals[0] - 2.54).abs() < 0.01); // row 0, col 0
+        assert!((vals[1] - 2.54).abs() < 0.01); // row 0, col 1
+        assert!((vals[2] - 1.27).abs() < 0.01); // row 1, col 0
+        assert!((vals[3] - 1.27).abs() < 0.01); // row 1, col 1
+    }
+
+    // -----------------------------------------------------------------------
+    // BnbLinear enum tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bnb_linear_nf4_variant() {
+        let device = Device::Cpu;
+
+        let nibbles = vec![15u8, 15];
+        let packed_bytes = pack_nibbles(&nibbles);
+        let packed = Tensor::new(packed_bytes.as_slice(), &device).unwrap();
+        let absmax = Tensor::new(&[3.0f32], &device).unwrap();
+
+        let nf4 = BnbNf4Linear {
+            packed,
+            absmax,
+            bias: None,
+            blocksize: 64,
+            quant_type: BnbQuantType::NF4,
+            in_features: 2,
+            out_features: 1,
+            original_dtype: DType::F32,
+        };
+        let unified = BnbLinear::Nf4(nf4);
+
+        let x = Tensor::ones((1, 2), DType::F32, &device).unwrap();
+        let y = unified.forward(&x).unwrap();
+        let val: f32 = y.flatten_all().unwrap().to_vec1().unwrap()[0];
+        assert!((val - 6.0).abs() < 0.01, "expected 6.0, got {val}");
+    }
+
+    #[test]
+    fn test_bnb_linear_int8_variant() {
+        let device = Device::Cpu;
+
+        let weight_bytes = i8_to_u8_bytes(&[127, 127]);
+        let weight = Tensor::new(weight_bytes.as_slice(), &device).unwrap();
+        let absmax = Tensor::new(&[1.27f32], &device).unwrap();
+
+        let int8 = BnbInt8Linear {
+            weight_u8: weight,
+            absmax,
+            bias: None,
+            in_features: 2,
+            out_features: 1,
+            original_dtype: DType::F32,
+        };
+        let unified = BnbLinear::Int8(int8);
+
+        let x = Tensor::ones((1, 2), DType::F32, &device).unwrap();
+        let y = unified.forward(&x).unwrap();
+        let val: f32 = y.flatten_all().unwrap().to_vec1().unwrap()[0];
+        assert!((val - 2.54).abs() < 0.01, "expected 2.54, got {val}");
     }
 }

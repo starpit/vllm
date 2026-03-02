@@ -560,7 +560,7 @@ impl Worker for MlxWorker {
                 ExecutorError::WorkerInit(format!("unsupported AWQ MLX architecture: {arch}"))
             })?
         } else if is_bnb {
-            info!("MlxWorker: BnB NF4 quantization detected, using dequantize-at-load path");
+            info!("MlxWorker: BnB quantization detected, using dequantize-at-load path");
             registry.get_bnb(&arch).ok_or_else(|| {
                 ExecutorError::WorkerInit(format!("unsupported BnB MLX architecture: {arch}"))
             })?
@@ -588,7 +588,7 @@ impl Worker for MlxWorker {
         } else if is_awq {
             ", AWQ"
         } else if is_bnb {
-            ", BnB NF4"
+            ", BnB"
         } else if is_quantized {
             ", quantized"
         } else {

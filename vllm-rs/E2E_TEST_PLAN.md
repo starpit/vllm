@@ -136,8 +136,9 @@ impl TestModels {
     // AWQ quantized models (candle + MLX backends)
     const QWEN2_0_5B_AWQ: &str = "Qwen/Qwen2.5-0.5B-Instruct-AWQ";              // ~393 MB, Qwen2ForCausalLM
 
-    // BitsAndBytes NF4 quantized models (MLX dequant-at-load or candle)
+    // BitsAndBytes quantized models (MLX dequant-at-load or candle)
     const LLAMA_3_2_1B_BNB_4BIT: &str = "unsloth/Llama-3.2-1B-Instruct-bnb-4bit"; // ~600 MB, LlamaForCausalLM
+    const TINYLLAMA_1B_BNB_8BIT: &str = "Jiqing/TinyLlama-1.1B-Chat-v1.0-bnb-8bit"; // ~1.1 GB, LlamaForCausalLM
 
     // Multimodal (vision-language) models
     const GEMMA3_4B_IT_QAT_3BIT: &str = "mlx-community/gemma-3-4b-it-qat-3bit";  // ~2.8 GB, Gemma3ForConditionalGeneration (MLX)
@@ -665,11 +666,11 @@ cargo test -p vllm-e2e --features e2e --test e_awq --release -- --ignored --test
 
 ---
 
-## Phase E14c: BitsAndBytes NF4 Quantization — DONE
+## Phase E14c: BitsAndBytes Quantization (NF4 + INT8) — DONE
 
 Test file: `e_bnb.rs`
 
-Tests BitsAndBytes NF4 quantized model loading and inference. BnB NF4 uses a 16-entry normal-distribution codebook per 4-bit value, per-block absmax scaling (blocksize=64), and optional double quantization (absmax itself stored as uint8 with nested codebook+scales). Supports both MLX (dequantize-at-load-time on Metal) and candle (CPU dequantize-per-forward) backends.
+Tests BitsAndBytes quantized model loading and inference for both NF4 (4-bit) and INT8 (8-bit). NF4 uses a 16-entry normal-distribution codebook per 4-bit value, per-block absmax scaling (blocksize=64), and optional double quantization. INT8 uses per-row absmax scaling (SCB / 127.0). Both support MLX (dequantize-at-load-time on Metal) and candle (CPU dequantize-per-forward) backends.
 
 | Test | Model | Description |
 |------|-------|-------------|
@@ -677,6 +678,9 @@ Tests BitsAndBytes NF4 quantized model loading and inference. BnB NF4 uses a 16-
 | `test_bnb_llama_chat_basic` | Llama-3.2-1B-Instruct-bnb-4bit | Chat completion returns coherent text |
 | `test_bnb_llama_completion_basic` | Llama-3.2-1B-Instruct-bnb-4bit | Text completion returns non-empty text |
 | `test_bnb_llama_max_tokens` | Llama-3.2-1B-Instruct-bnb-4bit | max_tokens=5 → completion_tokens ≤ 5 |
+| `test_bnb_int8_llama_server_starts` | TinyLlama-1.1B-Chat-bnb-8bit | Server starts, /health + /v1/models work |
+| `test_bnb_int8_llama_chat_basic` | TinyLlama-1.1B-Chat-bnb-8bit | Chat completion returns coherent text |
+| `test_bnb_int8_llama_completion_basic` | TinyLlama-1.1B-Chat-bnb-8bit | Text completion returns non-empty text |
 
 Run commands:
 ```bash
@@ -687,7 +691,7 @@ cargo test -p vllm-e2e --features e2e,metal --test e_bnb --release -- --ignored 
 cargo test -p vllm-e2e --features e2e --test e_bnb --release -- --ignored --test-threads=1
 ```
 
-**Deliverables**: 4 E2E tests (all implemented). Uses unsloth Llama BnB NF4 model (~600 MB). Double quantization supported. Verified on MLX Metal: 1.4s load, 356ms TTFT, 22ms/token decode.
+**Deliverables**: 7 E2E tests (all implemented). NF4: unsloth Llama BnB NF4 model (~600 MB), double quantization supported, verified on MLX Metal. INT8: Jiqing TinyLlama BnB INT8 model (~1.1 GB), verified on CUDA pod (L40S).
 
 ---
 
@@ -759,7 +763,7 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_batch -- --ignore
 | E13. LoRA Adapters | 4 (done) | SmolLM-135M-F16 | Every PR | <1 min |
 | E14. GPTQ Quantization | 4 (done) | Qwen2.5-0.5B-GPTQ-Int4 | Every PR | <1 min (MLX) |
 | E14b. AWQ Quantization | 4 (done) | Qwen2.5-0.5B-AWQ | Every PR | <1 min (MLX) |
-| E14c. BnB NF4 Quantization | 4 (done) | Llama-3.2-1B-bnb-4bit | Every PR | <1 min (MLX) |
+| E14c. BnB NF4+INT8 Quantization | 7 (done) | Llama-3.2-1B-bnb-4bit, TinyLlama-1.1B-bnb-8bit | Every PR | <1 min (MLX) |
 | E15. Offline Batch LLM API | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
 | E16. Batch Processing | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
 | E17. Multimodal VLM (Gemma3) | 8 (done) | Gemma3-4B (MLX + Candle) | Nightly / Weekly | ~2 min |
@@ -803,7 +807,8 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_batch -- --ignore
 |
 | GPTQ Qwen2 | Qwen2ForCausalLM | Qwen2.5-0.5B-Instruct-GPTQ-Int4 | 459 MB | PR | — | Yes (GPTQ INT4) |
 | AWQ Qwen2 | Qwen2ForCausalLM | Qwen2.5-0.5B-Instruct-AWQ | 393 MB | PR | — | Yes (AWQ INT4) |
-| BnB Llama | LlamaForCausalLM | Llama-3.2-1B-Instruct-bnb-4bit | 600 MB | PR | — | Yes (BnB NF4) |
+| BnB Llama (NF4) | LlamaForCausalLM | Llama-3.2-1B-Instruct-bnb-4bit | 600 MB | PR | — | Yes (BnB NF4) |
+| BnB TinyLlama (INT8) | LlamaForCausalLM | TinyLlama-1.1B-Chat-v1.0-bnb-8bit | 1.1 GB | PR | — | Yes (BnB INT8) |
 
 **Note on Command R**: The smallest `CohereForCausalLM` is 35B (16.9 GB). The 7B variant uses `Cohere2ForCausalLM` which is a different architecture not yet implemented. Command R E2E tests are manual-only until either (a) a smaller CohereForCausalLM model appears, or (b) we implement Cohere2ForCausalLM.
 

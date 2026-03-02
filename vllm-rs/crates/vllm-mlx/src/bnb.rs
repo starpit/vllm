@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-//! BitsAndBytes NF4/FP4 dequantization for MLX.
+//! BitsAndBytes dequantization for MLX (NF4/FP4 4-bit and INT8 8-bit).
 //!
-//! Converts BnB-format weights (packed uint8 + absmax) into standard
-//! float weight tensors that can be used by the regular (non-quantized) MLX
-//! model factories. Dequantization is done once at load time.
+//! Converts BnB-format weights into standard float weight tensors that can be
+//! used by the regular (non-quantized) MLX model factories. Dequantization is
+//! done once at load time.
+//!
+//! NF4/FP4: packed uint8 + absmax → float via lookup table
+//! INT8: int8 stored as uint8 + per-row SCB → float via `val * (SCB / 127)`
 //!
 //! Supports double quantization (absmax stored as uint8 with nested scales).
 
@@ -57,19 +60,24 @@ pub fn dequantize_bnb_weights(
         BnbQuantType::FP4 => &FP4_TABLE,
     };
 
-    // Collect all BnB layer prefixes (e.g. "model.layers.0.self_attn.q_proj").
-    // Identified by having "{prefix}.weight.absmax" in the weight map.
+    // Collect NF4/FP4 layer prefixes (identified by "{prefix}.weight.absmax").
     let prefixes: Vec<String> = weights
         .keys()
         .filter(|k| k.ends_with(".weight.absmax"))
         .map(|k| k.strip_suffix(".weight.absmax").unwrap().to_string())
         .collect();
 
+    // Collect INT8 layer prefixes (identified by "{prefix}.SCB").
+    let int8_prefixes: Vec<String> = weights
+        .keys()
+        .filter(|k| k.ends_with(".SCB"))
+        .map(|k| k.strip_suffix(".SCB").unwrap().to_string())
+        .collect();
+
     info!(
-        "BnB: dequantizing {} linear layers (quant_type={:?}, blocksize={})",
+        "BnB: dequantizing {} NF4/FP4 + {} INT8 linear layers",
         prefixes.len(),
-        config.quant_type,
-        config.blocksize
+        int8_prefixes.len(),
     );
 
     for prefix in &prefixes {
@@ -144,6 +152,47 @@ pub fn dequantize_bnb_weights(
             in_features,
         )?;
 
+        weights.insert(format!("{prefix}.weight"), dequantized);
+    }
+
+    // Dequantize INT8 layers.
+    for prefix in &int8_prefixes {
+        let weight_raw = weights
+            .remove(&format!("{prefix}.weight"))
+            .ok_or_else(|| format!("missing {prefix}.weight"))?;
+        let scb = weights
+            .remove(&format!("{prefix}.SCB"))
+            .ok_or_else(|| format!("missing {prefix}.SCB"))?;
+
+        // Parse shape from quant_state JSON if available.
+        let quant_state_key = format!("{prefix}.weight.quant_state.bitsandbytes__nf4");
+        let quant_state = weights.remove(&quant_state_key);
+
+        let (out_features, in_features) = if let Some(qs) = quant_state {
+            mlx_rs::transforms::eval(std::iter::once(&qs))?;
+            let qs_u8 = qs.as_dtype(mlx_rs::Dtype::Uint8)?;
+            mlx_rs::transforms::eval(std::iter::once(&qs_u8))?;
+            let bytes: Vec<u8> = qs_u8.as_slice::<u8>().to_vec();
+            if let Ok(meta) = serde_json::from_slice::<BnbQuantState>(&bytes) {
+                (meta.shape[0], meta.shape[1])
+            } else {
+                // Infer from weight shape.
+                let shape = weight_raw.shape();
+                (shape[0] as usize, shape[1] as usize)
+            }
+        } else {
+            // Infer from weight tensor shape directly.
+            let shape = weight_raw.shape();
+            (shape[0] as usize, shape[1] as usize)
+        };
+
+        // Remove any remaining metadata tensors.
+        weights.remove(&format!("{prefix}.weight.quant_map"));
+        weights.remove(&format!("{prefix}.weight.blocksize"));
+        weights.remove(&format!("{prefix}.weight.dtype"));
+        weights.remove(&format!("{prefix}.weight.shape"));
+
+        let dequantized = dequantize_int8_layer(&weight_raw, &scb, out_features, in_features)?;
         weights.insert(format!("{prefix}.weight"), dequantized);
     }
 
@@ -233,6 +282,47 @@ fn dequantize_layer(
         let nibble = ((byte >> ((i % 2) * 4)) & 0xF) as usize;
         let block_idx = i / blocksize;
         out[i] = absmax_data[block_idx] * table[nibble];
+    }
+
+    Ok(Array::from_slice(
+        &out,
+        &[out_features as i32, in_features as i32],
+    ))
+}
+
+/// Dequantize a single BnB INT8 linear layer.
+///
+/// INT8 weights are stored as uint8 (reinterpreted as signed int8), with
+/// per-row absmax scales (SCB). Dequantization:
+///   `weight[row][col] = int8_val * (SCB[row] / 127.0)`
+///
+/// Returns weight tensor of shape `[out_features, in_features]`.
+fn dequantize_int8_layer(
+    weight_raw: &Array,
+    scb: &Array,
+    out_features: usize,
+    in_features: usize,
+) -> Result<Array, Box<dyn std::error::Error + Send + Sync>> {
+    mlx_rs::transforms::eval([weight_raw, scb].into_iter())?;
+
+    let weight_u8 = weight_raw.as_dtype(mlx_rs::Dtype::Uint8)?;
+    mlx_rs::transforms::eval(std::iter::once(&weight_u8))?;
+    let weight_data: Vec<u8> = weight_u8.as_slice::<u8>().to_vec();
+
+    let scb_f32 = scb.as_dtype(mlx_rs::Dtype::Float32)?;
+    mlx_rs::transforms::eval(std::iter::once(&scb_f32))?;
+    let scb_data: Vec<f32> = scb_f32.as_slice::<f32>().to_vec();
+
+    let total = out_features * in_features;
+    let mut out = vec![0.0f32; total];
+
+    for row in 0..out_features {
+        let scale = scb_data[row] / 127.0;
+        for col in 0..in_features {
+            let idx = row * in_features + col;
+            let signed_val = weight_data[idx] as i8;
+            out[idx] = signed_val as f32 * scale;
+        }
     }
 
     Ok(Array::from_slice(
@@ -468,5 +558,103 @@ mod tests {
             .as_slice::<f32>()
             .to_vec();
         assert_eq!(norm_vals, vec![1.0, 2.0, 3.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // INT8 tests
+    // -----------------------------------------------------------------------
+
+    fn i8_to_u8_bytes(vals: &[i8]) -> Vec<u8> {
+        vals.iter().map(|&v| v as u8).collect()
+    }
+
+    #[test]
+    fn test_dequantize_int8_layer_basic() {
+        // 1 row, 4 cols. INT8 values: [127, -127, 0, 64]
+        // SCB = 2.54 → scale = 2.54/127 = 0.02
+        let weight_bytes = i8_to_u8_bytes(&[127, -127, 0, 64]);
+        let weight = Array::from_slice(&weight_bytes, &[1, 4]);
+        let scb = Array::from_slice(&[2.54f32], &[1]);
+
+        let result = dequantize_int8_layer(&weight, &scb, 1, 4).unwrap();
+        mlx_rs::transforms::eval(std::iter::once(&result)).unwrap();
+
+        assert_eq!(result.shape(), &[1, 4]);
+        let vals: Vec<f32> = result
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+
+        assert!(
+            (vals[0] - 2.54).abs() < 0.01,
+            "expected 2.54, got {}",
+            vals[0]
+        );
+        assert!(
+            (vals[1] - (-2.54)).abs() < 0.01,
+            "expected -2.54, got {}",
+            vals[1]
+        );
+        assert!(
+            (vals[2] - 0.0).abs() < 0.01,
+            "expected 0.0, got {}",
+            vals[2]
+        );
+        assert!(
+            (vals[3] - 1.28).abs() < 0.01,
+            "expected 1.28, got {}",
+            vals[3]
+        );
+    }
+
+    #[test]
+    fn test_dequantize_int8_layer_multiple_rows() {
+        // 2 rows, 2 cols. Row 0: SCB=2.54, Row 1: SCB=1.27
+        let weight_bytes = i8_to_u8_bytes(&[127, 127, 127, 127]);
+        let weight = Array::from_slice(&weight_bytes, &[2, 2]);
+        let scb = Array::from_slice(&[2.54f32, 1.27], &[2]);
+
+        let result = dequantize_int8_layer(&weight, &scb, 2, 2).unwrap();
+        mlx_rs::transforms::eval(std::iter::once(&result)).unwrap();
+
+        assert_eq!(result.shape(), &[2, 2]);
+        let vals: Vec<f32> = result
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+
+        assert!((vals[0] - 2.54).abs() < 0.01);
+        assert!((vals[1] - 2.54).abs() < 0.01);
+        assert!((vals[2] - 1.27).abs() < 0.01);
+        assert!((vals[3] - 1.27).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_dequantize_bnb_weights_int8() {
+        // End-to-end: INT8 layer identified by .SCB
+        let weight_bytes = i8_to_u8_bytes(&[127i8; 4]);
+        let weight = Array::from_slice(&weight_bytes, &[2, 2]);
+        let scb = Array::from_slice(&[2.54f32, 1.27], &[2]);
+
+        let mut weights = HashMap::new();
+        weights.insert("layer.weight".to_string(), weight);
+        weights.insert("layer.SCB".to_string(), scb);
+
+        let config = BnbNf4Config::default();
+        let hf_config = hf_config_with_hidden(2);
+
+        let result = dequantize_bnb_weights(weights, &config, &hf_config).unwrap();
+        let w = result.get("layer.weight").unwrap();
+
+        assert_eq!(w.shape(), &[2, 2]);
+        let vals: Vec<f32> = w
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .as_slice::<f32>()
+            .to_vec();
+        assert!((vals[0] - 2.54).abs() < 0.01);
+        assert!((vals[2] - 1.27).abs() < 0.01);
     }
 }

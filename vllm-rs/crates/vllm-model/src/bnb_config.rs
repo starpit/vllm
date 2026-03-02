@@ -9,7 +9,7 @@
 use serde::Deserialize;
 
 use crate::error::{ModelError, ModelResult};
-use crate::layers::bnb::BnbNf4Config;
+use crate::layers::bnb::{BnbLayerConfig, BnbNf4Config};
 
 // ---------------------------------------------------------------------------
 // BnbQuantizeConfig
@@ -49,7 +49,7 @@ impl BnbQuantizeConfig {
             .map_err(|e| ModelError::Other(format!("failed to parse BnB quantization_config: {e}")))
     }
 
-    /// Convert to the layer-level `BnbNf4Config`.
+    /// Convert to the layer-level `BnbNf4Config` (4-bit only).
     pub fn to_bnb_config(&self) -> BnbNf4Config {
         let quant_type = match self.bnb_4bit_quant_type.as_str() {
             "fp4" => crate::layers::bnb::BnbQuantType::FP4,
@@ -59,6 +59,20 @@ impl BnbQuantizeConfig {
             quant_type,
             blocksize: self.bnb_4bit_blocksize,
             double_quant: self.bnb_4bit_use_double_quant,
+        }
+    }
+
+    /// Whether this is an 8-bit quantization config.
+    pub fn is_8bit(&self) -> bool {
+        self.load_in_8bit && !self.load_in_4bit
+    }
+
+    /// Convert to the unified layer-level config (NF4 or INT8).
+    pub fn to_bnb_layer_config(&self) -> BnbLayerConfig {
+        if self.is_8bit() {
+            BnbLayerConfig::Int8
+        } else {
+            BnbLayerConfig::Nf4(self.to_bnb_config())
         }
     }
 }
@@ -163,5 +177,61 @@ mod tests {
         }"#;
         let config: BnbQuantizeConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.bnb_4bit_blocksize, 128);
+    }
+
+    #[test]
+    fn test_bnb_config_is_8bit() {
+        let json_8bit = r#"{
+            "quant_method": "bitsandbytes",
+            "load_in_8bit": true,
+            "load_in_4bit": false
+        }"#;
+        let config: BnbQuantizeConfig = serde_json::from_str(json_8bit).unwrap();
+        assert!(config.is_8bit());
+
+        let json_4bit = r#"{
+            "quant_method": "bitsandbytes",
+            "load_in_8bit": false,
+            "load_in_4bit": true
+        }"#;
+        let config: BnbQuantizeConfig = serde_json::from_str(json_4bit).unwrap();
+        assert!(!config.is_8bit());
+
+        // Both set — 4bit takes precedence.
+        let json_both = r#"{
+            "quant_method": "bitsandbytes",
+            "load_in_8bit": true,
+            "load_in_4bit": true
+        }"#;
+        let config: BnbQuantizeConfig = serde_json::from_str(json_both).unwrap();
+        assert!(!config.is_8bit());
+    }
+
+    #[test]
+    fn test_bnb_config_to_layer_config_int8() {
+        let json = r#"{
+            "quant_method": "bitsandbytes",
+            "load_in_8bit": true
+        }"#;
+        let config: BnbQuantizeConfig = serde_json::from_str(json).unwrap();
+        let layer_cfg = config.to_bnb_layer_config();
+        assert!(matches!(
+            layer_cfg,
+            crate::layers::bnb::BnbLayerConfig::Int8
+        ));
+    }
+
+    #[test]
+    fn test_bnb_config_to_layer_config_nf4() {
+        let json = r#"{
+            "quant_method": "bitsandbytes",
+            "load_in_4bit": true
+        }"#;
+        let config: BnbQuantizeConfig = serde_json::from_str(json).unwrap();
+        let layer_cfg = config.to_bnb_layer_config();
+        assert!(matches!(
+            layer_cfg,
+            crate::layers::bnb::BnbLayerConfig::Nf4(_)
+        ));
     }
 }

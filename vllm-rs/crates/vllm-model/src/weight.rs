@@ -517,6 +517,9 @@ fn safetensors_dtype_to_candle(dt: safetensors::Dtype) -> ModelResult<DType> {
         SD::I32 => Ok(DType::I32),
         SD::I64 => Ok(DType::I64),
         SD::I16 => Ok(DType::I16),
+        // INT8: candle has no I8 dtype; load as U8 (same bytes, reinterpreted as
+        // signed during BitsAndBytes INT8 dequantization).
+        SD::I8 => Ok(DType::U8),
         other => Err(ModelError::UnsupportedDType(format!("{:?}", other))),
     }
 }

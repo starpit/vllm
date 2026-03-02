@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! BitsAndBytes NF4-quantized LLaMA/Qwen2 model architecture.
+//! BitsAndBytes quantized LLaMA/Qwen2 model architecture (NF4 + INT8).
 //!
-//! Mirrors `llama.rs` but uses `BnbNf4Linear` for all linear projections.
+//! Mirrors `llama.rs` but uses `BnbLinear` for all linear projections.
 //! Embedding, norms, and lm_head stay in float (BnB typically doesn't
 //! quantize these). KV cache uses the working dtype (usually bf16).
 
@@ -9,7 +9,7 @@ use candle_core::{DType, Device, Module, Tensor};
 
 use vllm_model::bnb_config::BnbQuantizeConfig;
 use vllm_model::error::{ModelError, ModelResult};
-use vllm_model::layers::{BnbNf4Config, BnbNf4Linear, Embedding, Linear, RmsNorm, RotaryEmbedding};
+use vllm_model::layers::{BnbLayerConfig, BnbLinear, Embedding, Linear, RmsNorm, RotaryEmbedding};
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
 use crate::attention::attention_with_cache;
@@ -21,9 +21,9 @@ use crate::qwen2::Qwen2Config;
 // ---------------------------------------------------------------------------
 
 struct BnbLlamaMLP {
-    gate_proj: BnbNf4Linear,
-    up_proj: BnbNf4Linear,
-    down_proj: BnbNf4Linear,
+    gate_proj: BnbLinear,
+    up_proj: BnbLinear,
+    down_proj: BnbLinear,
 }
 
 impl BnbLlamaMLP {
@@ -31,12 +31,12 @@ impl BnbLlamaMLP {
         weights: &ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
-        bnb: &BnbNf4Config,
+        bnb: &BnbLayerConfig,
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
         Ok(Self {
-            gate_proj: BnbNf4Linear::from_weights(
+            gate_proj: BnbLinear::from_weights(
                 weights,
                 &format!("{prefix}.gate_proj"),
                 bnb,
@@ -45,7 +45,7 @@ impl BnbLlamaMLP {
                 dtype,
                 device,
             )?,
-            up_proj: BnbNf4Linear::from_weights(
+            up_proj: BnbLinear::from_weights(
                 weights,
                 &format!("{prefix}.up_proj"),
                 bnb,
@@ -54,7 +54,7 @@ impl BnbLlamaMLP {
                 dtype,
                 device,
             )?,
-            down_proj: BnbNf4Linear::from_weights(
+            down_proj: BnbLinear::from_weights(
                 weights,
                 &format!("{prefix}.down_proj"),
                 bnb,
@@ -81,10 +81,10 @@ impl Module for BnbLlamaMLP {
 // ---------------------------------------------------------------------------
 
 struct BnbLlamaAttention {
-    q_proj: BnbNf4Linear,
-    k_proj: BnbNf4Linear,
-    v_proj: BnbNf4Linear,
-    o_proj: BnbNf4Linear,
+    q_proj: BnbLinear,
+    k_proj: BnbLinear,
+    v_proj: BnbLinear,
+    o_proj: BnbLinear,
     rotary_emb: RotaryEmbedding,
     num_q_heads: usize,
     num_kv_heads: usize,
@@ -98,11 +98,11 @@ impl BnbLlamaAttention {
         weights: &ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
-        bnb: &BnbNf4Config,
+        bnb: &BnbLayerConfig,
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
-        let q_proj = BnbNf4Linear::from_weights(
+        let q_proj = BnbLinear::from_weights(
             weights,
             &format!("{prefix}.q_proj"),
             bnb,
@@ -111,7 +111,7 @@ impl BnbLlamaAttention {
             dtype,
             device,
         )?;
-        let k_proj = BnbNf4Linear::from_weights(
+        let k_proj = BnbLinear::from_weights(
             weights,
             &format!("{prefix}.k_proj"),
             bnb,
@@ -120,7 +120,7 @@ impl BnbLlamaAttention {
             dtype,
             device,
         )?;
-        let v_proj = BnbNf4Linear::from_weights(
+        let v_proj = BnbLinear::from_weights(
             weights,
             &format!("{prefix}.v_proj"),
             bnb,
@@ -129,7 +129,7 @@ impl BnbLlamaAttention {
             dtype,
             device,
         )?;
-        let o_proj = BnbNf4Linear::from_weights(
+        let o_proj = BnbLinear::from_weights(
             weights,
             &format!("{prefix}.o_proj"),
             bnb,
@@ -223,7 +223,7 @@ impl BnbLlamaDecoderLayer {
         weights: &ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
-        bnb: &BnbNf4Config,
+        bnb: &BnbLayerConfig,
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
@@ -298,7 +298,7 @@ impl BnbLlamaModel {
     fn load(
         weights: &ModelWeights,
         config: &LlamaConfig,
-        bnb: &BnbNf4Config,
+        bnb: &BnbLayerConfig,
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
@@ -354,7 +354,7 @@ impl BnbLlamaModel {
 // BnbLlamaForCausalLM
 // ---------------------------------------------------------------------------
 
-/// BitsAndBytes NF4-quantized LLaMA for causal language modeling.
+/// BitsAndBytes quantized LLaMA for causal language modeling (NF4 + INT8).
 pub struct BnbLlamaForCausalLM {
     model: BnbLlamaModel,
     lm_head: Linear,
@@ -364,7 +364,7 @@ impl BnbLlamaForCausalLM {
     pub fn load(
         weights: &ModelWeights,
         config: &LlamaConfig,
-        bnb: &BnbNf4Config,
+        bnb: &BnbLayerConfig,
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
@@ -373,9 +373,9 @@ impl BnbLlamaForCausalLM {
         // lm_head: usually float, not quantized.
         let lm_head = if config.tie_word_embeddings {
             Linear::new(model.embed_tokens.weight().clone(), None)
-        } else if weights.contains("lm_head.weight.absmax") {
-            // Rare: some BnB models quantize lm_head too.
-            let bnb_lm = BnbNf4Linear::from_weights(
+        } else if weights.contains("lm_head.weight.absmax") || weights.contains("lm_head.SCB") {
+            // Rare: some BnB models quantize lm_head too (NF4 or INT8).
+            let bnb_lm = BnbLinear::from_weights(
                 weights,
                 "lm_head",
                 bnb,
@@ -431,7 +431,7 @@ pub type BnbModelFactory = fn(
     device: &Device,
 ) -> ModelResult<Box<dyn crate::Model>>;
 
-/// Create a BnB LLaMA model.
+/// Create a BnB LLaMA model (NF4 or INT8).
 pub fn create_llama_bnb(
     weights: &ModelWeights,
     config: &HfModelConfig,
@@ -440,7 +440,7 @@ pub fn create_llama_bnb(
     device: &Device,
 ) -> ModelResult<Box<dyn crate::Model>> {
     let llama_config = LlamaConfig::from_hf_config(config)?;
-    let bnb = bnb_config.to_bnb_config();
+    let bnb = bnb_config.to_bnb_layer_config();
     let model = BnbLlamaForCausalLM::load(weights, &llama_config, &bnb, dtype, device)?;
     Ok(Box::new(model))
 }
@@ -454,7 +454,7 @@ pub fn create_qwen2_bnb(
     device: &Device,
 ) -> ModelResult<Box<dyn crate::Model>> {
     let qwen2_config = Qwen2Config::from_hf_config(config)?;
-    let bnb = bnb_config.to_bnb_config();
+    let bnb = bnb_config.to_bnb_layer_config();
     let model = BnbLlamaForCausalLM::load(weights, &qwen2_config.0, &bnb, dtype, device)?;
     Ok(Box::new(model))
 }

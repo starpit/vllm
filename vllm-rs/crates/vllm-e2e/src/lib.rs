@@ -52,8 +52,9 @@ impl TestModels {
     // AWQ quantized models (candle backend, not MLX)
     pub const QWEN2_0_5B_AWQ: &str = "Qwen/Qwen2.5-0.5B-Instruct-AWQ";
 
-    // BitsAndBytes NF4 quantized models (MLX dequant-at-load or candle)
+    // BitsAndBytes quantized models (MLX dequant-at-load or candle)
     pub const LLAMA_3_2_1B_BNB_4BIT: &str = "unsloth/Llama-3.2-1B-Instruct-bnb-4bit";
+    pub const TINYLLAMA_1B_BNB_8BIT: &str = "Jiqing/TinyLlama-1.1B-Chat-v1.0-bnb-8bit";
 
     // GGUF quantized models (candle backend, not MLX)
     pub const GEMMA3_270M_GGUF: &str = "unsloth/gemma-3-270m-it-qat-GGUF";

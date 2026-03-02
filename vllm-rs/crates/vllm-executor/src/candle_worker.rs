@@ -1049,10 +1049,14 @@ impl Worker for CandleWorker {
                 })?
             };
 
-            info!(
-                "CandleWorker: BnB NF4 detected (quant_type={}, blocksize={})",
-                bnb_cfg.bnb_4bit_quant_type, bnb_cfg.bnb_4bit_blocksize
-            );
+            if bnb_cfg.is_8bit() {
+                info!("CandleWorker: BnB INT8 detected");
+            } else {
+                info!(
+                    "CandleWorker: BnB NF4 detected (quant_type={}, blocksize={})",
+                    bnb_cfg.bnb_4bit_quant_type, bnb_cfg.bnb_4bit_blocksize
+                );
+            }
 
             let bnb_factory = registry.get_bnb(&arch).ok_or_else(|| {
                 ExecutorError::WorkerInit(format!(

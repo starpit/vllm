@@ -1,21 +1,21 @@
 # vLLM Feature Parity Punchlist: Python vs Rust
 
-> Generated 2026-03-02 | Rust port: `vllm-rs/` on branch `feat/rust` (1000 tests: 889 unit + 111 e2e, 0 clippy errors)
+> Generated 2026-03-02 | Rust port: `vllm-rs/` on branch `feat/rust` (1018 tests: 904 unit + 114 e2e, 0 clippy errors)
 
 ### Legend
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 173 |
+| &#x1F535; | Fully implemented | 174 |
 | &#x1F7E1; | Partially implemented | 4 |
-| &#x1F534; | Not implemented | 97 |
+| &#x1F534; | Not implemented | 96 |
 
 ### Priority (for incomplete features)
 
 | Priority | Meaning | Count |
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
-| **P3** | High — meaningfully expands user base or enables key use cases | 13 |
+| **P3** | High — meaningfully expands user base or enables key use cases | 12 |
 | **P2** | Medium — useful improvement, broader coverage | 33 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
@@ -38,7 +38,7 @@
 | Feature Group | Python | Rust Parity | +Rust | Unit | E2E |
 |---|---:|---|---:|---:|---:|
 | [Model Architectures](#model-architectures) | 36 | `████░░░░░░` 14/36 | 32 | 139 | 31 |
-| [Quantization](#quantization) | 12 | `████░░░░░░` 5/12 | 1 | 69 | 15 |
+| [Quantization](#quantization) | 12 | `█████░░░░░` 6/12 | 1 | 84 | 18 |
 | [Serving / OpenAI API](#serving--openai-api) | 24 | `███████░░░` 17/24 | 0 | 104 | 33 |
 | [Sampling & Decoding](#sampling--decoding) | 19 | `██████████` 19/19 | 0 | 53 | 13 |
 | [KV Cache & Attention](#kv-cache--attention) | 19 | `█████░░░░░` 10/19 | 0 | 105 | 0 |
@@ -55,7 +55,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | 8 | `████████░░` 6/8 | 0 | 31 | 19 |
 | [Observability & Operations](#observability--operations) | 7 | `██████████` 7/7 | 1 | 15 | 0 |
 | [CLI & Deployment](#cli--deployment) | 17 | `██████████` 16/17 | 2 | 19 | 6 |
-| **Total** | **214** | `██████░░░░` **130/214** | **37** | **749** | **101** |
+| **Total** | **214** | `██████░░░░` **131/214** | **37** | **764** | **104** |
 
 ---
 
@@ -158,7 +158,7 @@
 | Marlin (GPTQ-Marlin / AWQ-Marlin) | &#x1F535; | &#x1F534; | — | — | P2 |
 | FP8 (FBGemm / ModelOpt) | &#x1F535; | &#x1F534; | — | — | P3 |
 | BitsAndBytes NF4 (4-bit, candle + MLX) | &#x1F535; | &#x1F535; | 22 | 4 | |
-| BitsAndBytes INT8 (8-bit) | &#x1F535; | &#x1F534; | — | — | P3 |
+| BitsAndBytes INT8 (8-bit, candle + MLX) | &#x1F535; | &#x1F535; | 15 | 3 | |
 | SqueezeLLM | &#x1F535; | &#x1F534; | — | — | P1 |
 | Compressed Tensors | &#x1F535; | &#x1F534; | — | — | P1 |
 | TorchAO | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -589,10 +589,10 @@ cargo build -p vllm-cli --no-default-features --features metal
 | Metric | Python | Rust |
 |---|---|---|
 | Model architectures | ~248 | 12 candle + 11 MLX (+ quantized variants) |
-| Quantization methods | ~14 | 5 (GGUF + MLX native 4-bit + GPTQ INT4 + AWQ INT4 + BnB NF4) |
+| Quantization methods | ~14 | 6 (GGUF + MLX native 4-bit + GPTQ INT4 + AWQ INT4 + BnB NF4 + BnB INT8) |
 | Attention backends | ~15 | 2 (custom SDPA + FlashAttention v2) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Unit tests | ~948 test files | 890 passing (832 non-MLX + 58 MLX) |
-| E2E tests | — | 117 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 4 AWQ + 4 BnB + 6 LLM API + 4 LoRA + 6 batch + 7 multimodal) |
+| Unit tests | ~948 test files | 905 passing (844 non-MLX + 61 MLX) |
+| E2E tests | — | 120 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 4 AWQ + 7 BnB + 6 LLM API + 4 LoRA + 6 batch + 7 multimodal) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

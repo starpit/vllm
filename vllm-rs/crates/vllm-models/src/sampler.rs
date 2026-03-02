@@ -212,7 +212,19 @@ impl Sampler {
 
         // 1.5. Apply grammar mask (constrained decoding).
         if let Some(allowed) = grammar_allowed {
-            crate::grammar::apply_grammar_mask(&mut logits_buf, allowed);
+            // Mask all tokens not in `allowed` to -inf.
+            let mut mask = vec![false; logits_buf.len()];
+            for &tid in allowed {
+                let idx = tid as usize;
+                if idx < mask.len() {
+                    mask[idx] = true;
+                }
+            }
+            for (i, l) in logits_buf.iter_mut().enumerate() {
+                if !mask[i] {
+                    *l = f32::NEG_INFINITY;
+                }
+            }
         }
 
         // 2. Apply repetition/frequency/presence penalties.

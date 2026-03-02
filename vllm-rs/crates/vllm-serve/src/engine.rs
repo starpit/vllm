@@ -15,12 +15,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, error, info};
 use uuid::Uuid;
+#[cfg(feature = "multimodal")]
 use vllm_common::multimodal::{ImageData, MultimodalData};
 use vllm_common::sampling::GuidedGrammar;
 use vllm_common::{EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, StopReason};
 use vllm_engine::core_client::EngineCoreClient;
 use vllm_engine::executor::{Executor, ModelRunnerOutput};
 
+#[cfg(feature = "chat-template")]
 use crate::chat_template::ChatTemplate;
 use crate::detokenizer::IncrementalDetokenizer;
 use crate::error::{ServeError, ServeResult};
@@ -158,6 +160,7 @@ pub struct AsyncEngine {
     /// Optional tokenizer for encoding prompts and decoding outputs.
     tokenizer: Option<Arc<Tokenizer>>,
     /// Optional chat template for formatting chat messages.
+    #[cfg(feature = "chat-template")]
     chat_template: Option<Arc<ChatTemplate>>,
     /// Optional tool call parser for extracting structured tool calls from output.
     tool_parser: Option<Arc<dyn ToolCallParser>>,
@@ -194,6 +197,7 @@ impl AsyncEngine {
             max_model_len,
             notify: Arc::new(Notify::new()),
             tokenizer: None,
+            #[cfg(feature = "chat-template")]
             chat_template: None,
             tool_parser: None,
             async_scheduling: false,
@@ -216,6 +220,7 @@ impl AsyncEngine {
     }
 
     /// Create a new `AsyncEngine` with a tokenizer and chat template.
+    #[cfg(feature = "chat-template")]
     pub fn with_tokenizer_and_template(
         client: Box<dyn EngineCoreClient + Send>,
         model_name: String,
@@ -312,9 +317,12 @@ impl AsyncEngine {
         );
 
         // Per-HTTP-request metrics (once, not per child).
-        let metrics = crate::metrics::VllmMetrics::global();
-        metrics.requests_total.inc();
-        metrics.prompt_tokens_total.inc_by(num_prompt_tokens as u64);
+        #[cfg(feature = "metrics")]
+        {
+            let metrics = crate::metrics::VllmMetrics::global();
+            metrics.requests_total.inc();
+            metrics.prompt_tokens_total.inc_by(num_prompt_tokens as u64);
+        }
 
         // Submit n child requests.
         let mut child_ids = Vec::with_capacity(n);
@@ -526,9 +534,12 @@ impl AsyncEngine {
         self.resolve_max_tokens(&mut sampling_params, prompt_token_ids.len());
 
         // Per-HTTP-request metrics.
-        let metrics = crate::metrics::VllmMetrics::global();
-        metrics.requests_total.inc();
-        metrics.prompt_tokens_total.inc_by(num_prompt_tokens as u64);
+        #[cfg(feature = "metrics")]
+        {
+            let metrics = crate::metrics::VllmMetrics::global();
+            metrics.requests_total.inc();
+            metrics.prompt_tokens_total.inc_by(num_prompt_tokens as u64);
+        }
 
         // Determine if tool parsing is active for this request.
         let use_tool_parser = self.tool_parser.is_some()
@@ -618,11 +629,14 @@ impl AsyncEngine {
 
         // Per-HTTP-request metrics (once).
         let total_prompt_tokens: u32 = prompts.iter().map(|p| p.len() as u32).sum();
-        let metrics = crate::metrics::VllmMetrics::global();
-        metrics.requests_total.inc();
-        metrics
-            .prompt_tokens_total
-            .inc_by(total_prompt_tokens as u64);
+        #[cfg(feature = "metrics")]
+        {
+            let metrics = crate::metrics::VllmMetrics::global();
+            metrics.requests_total.inc();
+            metrics
+                .prompt_tokens_total
+                .inc_by(total_prompt_tokens as u64);
+        }
 
         // Submit all child requests.
         let mut child_ids: Vec<(String, u32)> = Vec::with_capacity(total);
@@ -970,6 +984,7 @@ impl AsyncEngine {
                 match step_result {
                     Ok(outputs) => {
                         // 4. Update scheduler gauges from stats.
+                        #[cfg(feature = "metrics")]
                         if let Some(stats) = &outputs.scheduler_stats {
                             let m = crate::metrics::VllmMetrics::global();
                             m.num_requests_running.set(stats.num_running_reqs as f64);
@@ -1184,8 +1199,11 @@ impl AsyncEngine {
         tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
         forced_function_name: Option<String>,
     ) -> ServeResult<()> {
-        let metrics = crate::metrics::VllmMetrics::global();
-        metrics.requests_active.inc();
+        #[cfg(feature = "metrics")]
+        {
+            let metrics = crate::metrics::VllmMetrics::global();
+            metrics.requests_active.inc();
+        }
 
         // Insert request state (brief lock, no engine interaction).
         {
@@ -1263,10 +1281,13 @@ impl AsyncEngine {
         };
 
         // Track output tokens.
-        let metrics = crate::metrics::VllmMetrics::global();
-        metrics
-            .output_tokens_total
-            .inc_by(output.new_token_ids.len() as u64);
+        #[cfg(feature = "metrics")]
+        {
+            let metrics = crate::metrics::VllmMetrics::global();
+            metrics
+                .output_tokens_total
+                .inc_by(output.new_token_ids.len() as u64);
+        }
 
         // --- TTFT / ITL timing ---
         let now = Instant::now();
@@ -1274,12 +1295,20 @@ impl AsyncEngine {
             if req_state.first_token_time.is_none() {
                 // First token: record TTFT.
                 req_state.first_token_time = Some(now);
-                let ttft = now.duration_since(req_state.submit_time).as_secs_f64();
-                metrics.time_to_first_token_seconds.observe(ttft);
+                #[cfg(feature = "metrics")]
+                {
+                    let ttft = now.duration_since(req_state.submit_time).as_secs_f64();
+                    crate::metrics::VllmMetrics::global()
+                        .time_to_first_token_seconds
+                        .observe(ttft);
+                }
             } else if let Some(last) = req_state.last_token_time {
                 // Subsequent token: record inter-token latency.
                 let itl = now.duration_since(last).as_secs_f64();
-                metrics.inter_token_latency_seconds.observe(itl);
+                #[cfg(feature = "metrics")]
+                crate::metrics::VllmMetrics::global()
+                    .inter_token_latency_seconds
+                    .observe(itl);
                 req_state.itl_count += 1;
                 req_state.itl_sum += itl;
             }
@@ -1482,11 +1511,15 @@ impl AsyncEngine {
                 "request finished"
             );
 
-            metrics.request_latency_seconds.observe(total_latency);
+            #[cfg(feature = "metrics")]
+            {
+                let metrics = crate::metrics::VllmMetrics::global();
+                metrics.request_latency_seconds.observe(total_latency);
+                metrics.requests_active.dec();
+                metrics.requests_success_total.inc();
+            }
             // Drop stream sender; capture whether this was a streaming request.
             let was_streaming = req_state.stream_tx.take().is_some();
-            metrics.requests_active.dec();
-            metrics.requests_success_total.inc();
 
             // Streaming requests are cleaned up here — there's no poll_until_done
             // consumer. Non-streaming requests stay for poll_until_done to remove.
@@ -1504,6 +1537,7 @@ impl AsyncEngine {
         sampling_params: &SamplingParams,
     ) -> ServeResult<EngineCoreRequest> {
         // Build text from chat messages — using chat template if available.
+        #[cfg(feature = "chat-template")]
         let text = if let Some(template) = &self.chat_template {
             // Convert messages to JSON values so templates can access all fields
             // (tool_calls, tool_call_id, name, etc.).
@@ -1559,8 +1593,25 @@ impl AsyncEngine {
             }
             text
         };
+        #[cfg(not(feature = "chat-template"))]
+        let text = {
+            // Fallback: concatenate messages with newlines.
+            let mut text = String::new();
+            for msg in &request.messages {
+                if let Some(content) = &msg.content
+                    && let Some(s) = content.as_str()
+                {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(s);
+                }
+            }
+            text
+        };
 
         // Tokenize the text, or fall back to byte-value IDs.
+        #[allow(unused_mut)]
         let mut token_ids = if let Some(tok) = &self.tokenizer {
             if text.is_empty() {
                 vec![]
@@ -1574,11 +1625,14 @@ impl AsyncEngine {
         };
 
         // Extract images from message content arrays and build multimodal data.
+        #[cfg(feature = "multimodal")]
         let mm_data = if self.image_token_id.is_some() {
             self.extract_images_from_messages(&request.messages, &mut token_ids)?
         } else {
             None
         };
+        #[cfg(not(feature = "multimodal"))]
+        let mm_data = None;
 
         Ok(EngineCoreRequest {
             request_id: request_id.to_string(),
@@ -1680,6 +1734,7 @@ impl AsyncEngine {
     /// images, expand image placeholder tokens, and build `MultimodalData`.
     ///
     /// Returns `None` if no images are present.
+    #[cfg(feature = "multimodal")]
     fn extract_images_from_messages(
         &self,
         messages: &[protocol::ChatCompletionMessageParam],
@@ -1933,6 +1988,7 @@ async fn route_step_outputs(
 ) {
     for (_, engine_outputs) in outputs {
         // Update scheduler gauges from stats.
+        #[cfg(feature = "metrics")]
         if let Some(stats) = &engine_outputs.scheduler_stats {
             let m = crate::metrics::VllmMetrics::global();
             m.num_requests_running.set(stats.num_running_reqs as f64);

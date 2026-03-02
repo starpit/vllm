@@ -9,6 +9,7 @@ description = "Model loading, weight management, and tensor abstractions for vLL
 default = []
 cuda = ["candle-core/cuda"]
 metal = ["candle-core/metal"]
+multimodal = ["image"]
 
 [dependencies]
 vllm-common = { workspace = true }
@@ -20,7 +21,7 @@ serde_json = { workspace = true }
 candle-core = { workspace = true }
 safetensors = { workspace = true }
 half = { workspace = true }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }

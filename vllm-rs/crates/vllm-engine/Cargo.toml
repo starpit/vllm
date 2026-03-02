@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Engine core loop and request lifecycle for vLLM Rust port"
 
+[features]
+default = []
+multiproc = ["vllm-protocol/multiproc"]
+
 [dependencies]
 vllm-common = { workspace = true }
 vllm-config = { workspace = true }

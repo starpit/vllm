@@ -11,6 +11,7 @@
 pub mod awq_config;
 pub mod gguf;
 pub mod gptq_config;
+#[cfg(feature = "multimodal")]
 pub mod image;
 pub mod layers;
 pub mod lora;

@@ -23,6 +23,7 @@ pub enum EngineError {
     Shutdown,
 
     /// Protocol/transport error.
+    #[cfg(feature = "multiproc")]
     #[error("transport error: {0}")]
     Transport(#[from] vllm_protocol::transport::TransportError),
 

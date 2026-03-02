@@ -6,9 +6,15 @@ license.workspace = true
 description = "End-to-end tests for vLLM Rust inference engine"
 
 [features]
-default = []
+default = ["guided-decoding", "chat-template", "metrics", "multimodal", "tls"]
 e2e = []
 metal = ["vllm-serve/metal"]
+guided-decoding = ["vllm-serve/guided-decoding"]
+multimodal = ["vllm-serve/multimodal"]
+chat-template = ["vllm-serve/chat-template"]
+tls = ["vllm-serve/tls"]
+metrics = ["vllm-serve/metrics"]
+multiproc = ["vllm-serve/multiproc"]
 
 [dependencies]
 # HTTP client

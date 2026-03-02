@@ -14,4 +14,5 @@
 
 pub mod codec;
 pub mod messages;
+#[cfg(feature = "multiproc")]
 pub mod transport;

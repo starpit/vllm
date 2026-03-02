@@ -114,8 +114,10 @@ pub struct CandleWorker {
     /// Model head dimension (set after load_model).
     head_dim: usize,
     /// Per-request grammar guide state for constrained decoding.
+    #[cfg(feature = "guided-decoding")]
     grammar_states: HashMap<String, vllm_models::grammar::GrammarGuide>,
     /// Compiled vocabulary for grammar-guided decoding (built once from tokenizer).
+    #[cfg(feature = "guided-decoding")]
     grammar_vocabulary: Option<outlines_core::vocabulary::Vocabulary>,
     /// Resolved pooling strategy for embeddings.
     pooling_strategy: vllm_models::embedding::PoolingStrategy,
@@ -143,7 +145,9 @@ impl CandleWorker {
             kv_caches: HashMap::new(),
             num_kv_heads: 0,
             head_dim: 0,
+            #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
+            #[cfg(feature = "guided-decoding")]
             grammar_vocabulary: None,
             pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
             mm_data_map: HashMap::new(),
@@ -200,6 +204,7 @@ impl CandleWorker {
     /// Best-effort: logs a warning if tokenizer.json is not found or
     /// vocabulary construction fails. Grammar-guided decoding will be
     /// unavailable for those models.
+    #[cfg(feature = "guided-decoding")]
     fn ensure_grammar_vocabulary(&mut self) {
         if self.grammar_vocabulary.is_some() {
             return;
@@ -725,10 +730,13 @@ impl CandleWorker {
             .to_vec1::<f32>()
             .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
 
+        #[cfg(feature = "guided-decoding")]
         let grammar_allowed: Option<Vec<u32>> = self
             .grammar_states
             .get(req_id)
             .and_then(|g| g.allowed_tokens());
+        #[cfg(not(feature = "guided-decoding"))]
+        let grammar_allowed: Option<Vec<u32>> = None;
 
         if let Some(params) = self.sampling_params_map.get(req_id) {
             let prev_tokens = self
@@ -1053,13 +1061,16 @@ impl Worker for CandleWorker {
     ) -> ExecutorResult<ModelRunnerOutput> {
         // Lazily build grammar vocabulary if any new request needs constrained decoding.
         // Done before borrowing self.model to satisfy the borrow checker.
-        let needs_grammar = scheduler_output.scheduled_new_reqs.iter().any(|r| {
-            r.sampling_params
-                .as_ref()
-                .is_some_and(|p| p.guided_grammar.is_some())
-        });
-        if needs_grammar {
-            self.ensure_grammar_vocabulary();
+        #[cfg(feature = "guided-decoding")]
+        {
+            let needs_grammar = scheduler_output.scheduled_new_reqs.iter().any(|r| {
+                r.sampling_params
+                    .as_ref()
+                    .is_some_and(|p| p.guided_grammar.is_some())
+            });
+            if needs_grammar {
+                self.ensure_grammar_vocabulary();
+            }
         }
 
         let model = self
@@ -1079,6 +1090,7 @@ impl Worker for CandleWorker {
             self.token_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.kv_caches.remove(req_id);
+            #[cfg(feature = "guided-decoding")]
             self.grammar_states.remove(req_id);
             self.mm_data_map.remove(req_id);
         }
@@ -1105,6 +1117,8 @@ impl Worker for CandleWorker {
 
             // Store sampling params if provided.
             if let Some(ref params) = new_req.sampling_params {
+                // Create grammar guide for constrained decoding if requested.
+                #[cfg(feature = "guided-decoding")]
                 if let Some(ref grammar) = params.guided_grammar {
                     if let Some(ref vocab) = self.grammar_vocabulary {
                         match vllm_models::grammar::GrammarGuide::from_guided_grammar(
@@ -1300,6 +1314,7 @@ impl Worker for CandleWorker {
                 };
 
                 // Advance grammar state.
+                #[cfg(feature = "guided-decoding")]
                 if let Some(guide) = self.grammar_states.get_mut(&req_slice.req_id)
                     && let Some(&token_id) = sampled.first()
                 {
@@ -1511,6 +1526,7 @@ impl Worker for CandleWorker {
             };
 
             // Advance grammar state.
+            #[cfg(feature = "guided-decoding")]
             if let Some(guide) = self.grammar_states.get_mut(&req_input.req_id)
                 && let Some(&token_id) = sampled.first()
             {

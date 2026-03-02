@@ -531,6 +531,44 @@
 
 ---
 
+## Cargo Feature Flags
+
+> The Rust port gates heavy optional dependencies behind Cargo feature flags. All flags default to **on** so `cargo build` works identically to a build with every subsystem. Use `--no-default-features` for minimal builds, then opt in to individual features as needed. Feature flags propagate through the crate dependency chain: `vllm-cli` → `vllm-serve` → leaf crates.
+
+| Flag | Default | Dependencies gated | Crates affected |
+|---|:---:|---|---|
+| `guided-decoding` | yes | `outlines-core` | vllm-models, vllm-executor, vllm-mlx, vllm-serve, vllm-cli |
+| `multimodal` | yes | `image` | vllm-model, vllm-serve, vllm-cli |
+| `chat-template` | yes | `minijinja`, `minijinja-contrib` | vllm-serve, vllm-cli |
+| `tls` | yes | `axum-server`, `rustls`, `rustls-pemfile` | vllm-serve, vllm-cli |
+| `metrics` | yes | `prometheus` | vllm-serve, vllm-cli |
+| `multiproc` | **no** | `zeromq` | vllm-protocol, vllm-engine, vllm-serve, vllm-cli |
+
+### Build profiles
+
+```sh
+# Full build (all defaults on — identical to pre-feature-flags behavior)
+cargo build -p vllm-cli
+
+# Minimal build (no optional subsystems)
+cargo build -p vllm-cli --no-default-features
+
+# Minimal + single feature
+cargo build -p vllm-cli --no-default-features --features guided-decoding
+
+# CUDA without optional deps
+cargo build -p vllm-cli --no-default-features --features cuda
+
+# Metal without optional deps
+cargo build -p vllm-cli --no-default-features --features metal
+```
+
+> `multiproc` is excluded from the default set because most users use `UniProcExecutor` (single-process). The `zeromq` crate adds significant compile time and a native dependency. Enable it explicitly with `--features multiproc` when using the multi-process executor.
+>
+> Hardware backend flags (`cuda`, `metal`, `candle-metal`) are orthogonal to the optional subsystem flags and can be combined freely.
+
+---
+
 ---
 
 ## Stats

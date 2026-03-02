@@ -9,6 +9,7 @@ description = "Model architecture implementations for vLLM Rust port"
 default = []
 cuda = ["vllm-model/cuda", "vllm-kernels/cuda", "candle-core/cuda"]
 metal = ["vllm-model/metal", "candle-core/metal"]
+guided-decoding = ["outlines-core"]
 
 [dependencies]
 vllm-common = { workspace = true }
@@ -16,7 +17,7 @@ vllm-config = { workspace = true }
 vllm-model = { workspace = true }
 vllm-kernels = { workspace = true }
 candle-core = { workspace = true }
-outlines-core = { workspace = true }
+outlines-core = { workspace = true, optional = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }

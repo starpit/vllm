@@ -19,6 +19,7 @@ pub mod gemma2;
 pub mod gemma3;
 pub mod gemma3_mm;
 pub mod gptq_llama;
+#[cfg(feature = "guided-decoding")]
 pub mod grammar;
 pub mod kv_block_pool;
 pub mod llama;

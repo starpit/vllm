@@ -20,6 +20,7 @@ use vllm_executor::uniproc::UniProcExecutor;
 use vllm_executor::worker::Worker;
 use vllm_model::weight::HfModelConfig;
 
+#[cfg(feature = "chat-template")]
 use crate::chat_template::ChatTemplate;
 use crate::engine::AsyncEngine;
 use crate::tokenizer::Tokenizer;
@@ -323,18 +324,30 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
                 let tokenizer = Arc::new(tok);
 
                 // Try to load chat template from tokenizer_config.json.
-                let chat_template = try_load_chat_template(dir);
-
-                if let Some(tpl) = chat_template {
-                    info!("Chat template loaded from tokenizer_config.json");
-                    AsyncEngine::with_tokenizer_and_template(
-                        client,
-                        model_name.clone(),
-                        max_model_len,
-                        tokenizer,
-                        Arc::new(tpl),
-                    )
-                } else {
+                #[cfg(feature = "chat-template")]
+                {
+                    let chat_template = try_load_chat_template(dir);
+                    if let Some(tpl) = chat_template {
+                        info!("Chat template loaded from tokenizer_config.json");
+                        AsyncEngine::with_tokenizer_and_template(
+                            client,
+                            model_name.clone(),
+                            max_model_len,
+                            tokenizer,
+                            Arc::new(tpl),
+                        )
+                    } else {
+                        info!("No chat template found, using plain concatenation");
+                        AsyncEngine::with_tokenizer(
+                            client,
+                            model_name.clone(),
+                            max_model_len,
+                            tokenizer,
+                        )
+                    }
+                }
+                #[cfg(not(feature = "chat-template"))]
+                {
                     info!("No chat template found, using plain concatenation");
                     AsyncEngine::with_tokenizer(
                         client,
@@ -412,6 +425,7 @@ fn try_load_tokenizer(model_dir: &Path) -> Result<Tokenizer> {
 }
 
 /// Try to load a chat template from `tokenizer_config.json` in the model dir.
+#[cfg(feature = "chat-template")]
 fn try_load_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
     let config_path = model_dir.join("tokenizer_config.json");
     match ChatTemplate::from_tokenizer_config(&config_path) {

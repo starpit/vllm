@@ -9,6 +9,12 @@ description = "HTTP (axum) and gRPC (tonic) serving layer for vLLM Rust port"
 default = []
 cuda = ["vllm-executor/cuda"]
 metal = ["vllm-mlx"]
+guided-decoding = ["vllm-executor/guided-decoding", "vllm-mlx?/guided-decoding"]
+multimodal = ["vllm-model/multimodal"]
+chat-template = ["minijinja", "minijinja-contrib"]
+tls = ["axum-server", "rustls", "rustls-pemfile"]
+metrics = ["prometheus"]
+multiproc = ["vllm-engine/multiproc"]
 
 [dependencies]
 vllm-common = { workspace = true }
@@ -21,9 +27,9 @@ vllm-mlx = { workspace = true, optional = true }
 candle-core = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
-axum-server = { workspace = true }
-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+axum-server = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-stream = "0.1"
 serde = { workspace = true }
@@ -35,9 +41,9 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 uuid = { version = "1", features = ["v4"] }
 http = "1"
 tokenizers = { workspace = true }
-minijinja = { workspace = true }
-minijinja-contrib = { workspace = true }
-prometheus = { workspace = true }
+minijinja = { workspace = true, optional = true }
+minijinja-contrib = { workspace = true, optional = true }
+prometheus = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

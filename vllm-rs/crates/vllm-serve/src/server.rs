@@ -30,7 +30,6 @@ use tower_http::trace::TraceLayer;
 use tracing::{Span, info};
 
 use crate::engine::{AsyncEngine, StreamDelta};
-use crate::orca;
 use crate::protocol;
 
 // ---------------------------------------------------------------------------
@@ -91,6 +90,7 @@ pub struct AppState {
 
 /// Build the axum router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    #[allow(unused_mut)]
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
@@ -99,6 +99,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/version", get(version));
 
+    #[cfg(feature = "metrics")]
     if state.config.metrics_enabled {
         router = router.route("/metrics", get(metrics));
     }
@@ -140,35 +141,41 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 }
 
 /// Start the HTTP server (plain HTTP or HTTPS if SSL cert/key are configured).
+#[allow(clippy::needless_return)]
 pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
     let router = build_router(state.clone());
 
-    match (&state.config.ssl_certfile, &state.config.ssl_keyfile) {
-        (Some(certfile), Some(keyfile)) => {
-            let tls_config =
-                build_tls_config(certfile, keyfile, state.config.ssl_ca_certs.as_deref())?;
-            let addr: std::net::SocketAddr = state.config.bind_address.parse()?;
-            info!(
-                "vLLM Rust server listening on https://{}",
-                state.config.bind_address
-            );
-            axum_server::bind_rustls(addr, tls_config)
-                .serve(router.into_make_service())
-                .await?;
-        }
-        _ => {
-            let listener = tokio::net::TcpListener::bind(&state.config.bind_address).await?;
-            info!(
-                "vLLM Rust server listening on http://{}",
-                state.config.bind_address
-            );
-            axum::serve(listener, router).await?;
-        }
+    #[cfg(feature = "tls")]
+    if let (Some(certfile), Some(keyfile)) = (&state.config.ssl_certfile, &state.config.ssl_keyfile)
+    {
+        let tls_config = build_tls_config(certfile, keyfile, state.config.ssl_ca_certs.as_deref())?;
+        let addr: std::net::SocketAddr = state.config.bind_address.parse()?;
+        info!(
+            "vLLM Rust server listening on https://{}",
+            state.config.bind_address
+        );
+        axum_server::bind_rustls(addr, tls_config)
+            .serve(router.into_make_service())
+            .await?;
+        return Ok(());
     }
+
+    #[cfg(not(feature = "tls"))]
+    if state.config.ssl_certfile.is_some() || state.config.ssl_keyfile.is_some() {
+        return Err("TLS support is not enabled (compile with --features tls)".into());
+    }
+
+    let listener = tokio::net::TcpListener::bind(&state.config.bind_address).await?;
+    info!(
+        "vLLM Rust server listening on http://{}",
+        state.config.bind_address
+    );
+    axum::serve(listener, router).await?;
     Ok(())
 }
 
 /// Build a rustls [`axum_server::tls_rustls::RustlsConfig`] from PEM file paths.
+#[cfg(feature = "tls")]
 fn build_tls_config(
     certfile: &str,
     keyfile: &str,
@@ -309,6 +316,7 @@ async fn version(State(state): State<Arc<AppState>>) -> Json<protocol::VersionRe
 }
 
 /// GET /metrics — Prometheus metrics endpoint.
+#[cfg(feature = "metrics")]
 async fn metrics() -> String {
     crate::metrics::VllmMetrics::global().encode()
 }
@@ -319,10 +327,11 @@ async fn metrics() -> String {
 
 /// If the request includes the ORCA opt-in header, attach the load-metrics
 /// response header. Otherwise return the response unchanged.
+#[cfg(feature = "metrics")]
 fn attach_orca_header(request_headers: &HeaderMap, mut response: Response) -> Response {
-    if let Some(format_value) = request_headers.get(orca::ORCA_REQUEST_HEADER)
+    if let Some(format_value) = request_headers.get(crate::orca::ORCA_REQUEST_HEADER)
         && let Ok(format_str) = format_value.to_str()
-        && let Some((name, value)) = orca::orca_header(format_str)
+        && let Some((name, value)) = crate::orca::orca_header(format_str)
         && let Ok(hv) = axum::http::HeaderValue::from_str(&value)
     {
         response.headers_mut().insert(
@@ -330,6 +339,13 @@ fn attach_orca_header(request_headers: &HeaderMap, mut response: Response) -> Re
             hv,
         );
     }
+    response
+}
+
+/// If the request includes the ORCA opt-in header, attach the load-metrics
+/// response header. Otherwise return the response unchanged.
+#[cfg(not(feature = "metrics"))]
+fn attach_orca_header(_request_headers: &HeaderMap, response: Response) -> Response {
     response
 }
 

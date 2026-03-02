@@ -8,6 +8,7 @@ description = "MLX backend for Apple Silicon GPU acceleration in vLLM Rust port"
 [features]
 default = ["mlx"]
 mlx = ["mlx-rs"]
+guided-decoding = ["outlines-core", "vllm-models/guided-decoding"]
 
 [dependencies]
 vllm-common = { workspace = true }
@@ -18,7 +19,7 @@ vllm-executor = { workspace = true }
 vllm-model = { workspace = true }
 vllm-models = { workspace = true }
 mlx-rs = { workspace = true, optional = true }
-outlines-core = { workspace = true }
+outlines-core = { workspace = true, optional = true }
 tokenizers = { workspace = true }
 tracing = { workspace = true }
 hf-hub = { workspace = true }

@@ -100,8 +100,10 @@ pub struct MlxWorker {
     kv_caches: HashMap<String, MlxKvCache>,
 
     /// Per-request grammar guide state for constrained decoding.
+    #[cfg(feature = "guided-decoding")]
     grammar_states: HashMap<String, vllm_models::grammar::GrammarGuide>,
     /// Compiled vocabulary for grammar-guided decoding (built once from tokenizer).
+    #[cfg(feature = "guided-decoding")]
     grammar_vocabulary: Option<outlines_core::vocabulary::Vocabulary>,
 
     /// Resolved pooling strategy for embeddings.
@@ -131,7 +133,9 @@ impl MlxWorker {
             token_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
             kv_caches: HashMap::new(),
+            #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
+            #[cfg(feature = "guided-decoding")]
             grammar_vocabulary: None,
             pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
             mm_data_map: HashMap::new(),
@@ -221,6 +225,7 @@ impl MlxWorker {
     }
 
     /// Build grammar vocabulary on demand (lazy — deferred from startup).
+    #[cfg(feature = "guided-decoding")]
     fn ensure_grammar_vocabulary(&mut self) {
         if self.grammar_vocabulary.is_some() {
             return;
@@ -616,13 +621,16 @@ impl Worker for MlxWorker {
     ) -> ExecutorResult<ModelRunnerOutput> {
         // Lazily build grammar vocabulary if any new request needs constrained decoding.
         // Done before borrowing self.model to satisfy the borrow checker.
-        let needs_grammar = scheduler_output.scheduled_new_reqs.iter().any(|r| {
-            r.sampling_params
-                .as_ref()
-                .is_some_and(|p| p.guided_grammar.is_some())
-        });
-        if needs_grammar {
-            self.ensure_grammar_vocabulary();
+        #[cfg(feature = "guided-decoding")]
+        {
+            let needs_grammar = scheduler_output.scheduled_new_reqs.iter().any(|r| {
+                r.sampling_params
+                    .as_ref()
+                    .is_some_and(|p| p.guided_grammar.is_some())
+            });
+            if needs_grammar {
+                self.ensure_grammar_vocabulary();
+            }
         }
 
         let model = self
@@ -637,6 +645,7 @@ impl Worker for MlxWorker {
             self.token_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.kv_caches.remove(req_id);
+            #[cfg(feature = "guided-decoding")]
             self.grammar_states.remove(req_id);
             self.mm_data_map.remove(req_id);
         }
@@ -670,6 +679,7 @@ impl Worker for MlxWorker {
                 .insert(new_req.req_id.clone(), prompt_ids.to_vec());
             if let Some(ref params) = new_req.sampling_params {
                 // Create grammar guide for constrained decoding if requested.
+                #[cfg(feature = "guided-decoding")]
                 if let Some(ref grammar) = params.guided_grammar {
                     if let Some(ref vocab) = self.grammar_vocabulary {
                         match vllm_models::grammar::GrammarGuide::from_guided_grammar(
@@ -1017,10 +1027,13 @@ impl Worker for MlxWorker {
             } else {
                 // Normal (non-speculative) decode path — use HEAD's lazy_out approach.
                 // Query grammar-allowed tokens if constrained decoding is active.
+                #[cfg(feature = "guided-decoding")]
                 let grammar_allowed: Option<Vec<u32>> = self
                     .grammar_states
                     .get(&req_input.req_id)
                     .and_then(|g| g.allowed_tokens());
+                #[cfg(not(feature = "guided-decoding"))]
+                let grammar_allowed: Option<Vec<u32>> = None;
                 let has_grammar = grammar_allowed.is_some();
 
                 // Determine if we need CPU-side sampling.
@@ -1071,6 +1084,7 @@ impl Worker for MlxWorker {
             };
 
             // Advance grammar state with the sampled token.
+            #[cfg(feature = "guided-decoding")]
             if let Some(guide) = self.grammar_states.get_mut(&req_input.req_id)
                 && let Some(&token_id) = sampled.first()
             {

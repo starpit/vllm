@@ -6,10 +6,16 @@ license.workspace = true
 description = "CLI binary for vLLM Rust inference engine"
 
 [features]
-default = []
+default = ["guided-decoding", "chat-template", "metrics", "multimodal", "tls"]
 cuda = ["vllm-serve/cuda", "vllm-executor/cuda", "vllm-kernels/cuda", "vllm-models/cuda"]
 metal = ["vllm-serve/metal", "vllm-mlx"]
 candle-metal = ["vllm-executor/metal", "vllm-kernels/metal", "vllm-models/metal"]
+guided-decoding = ["vllm-serve/guided-decoding"]
+multimodal = ["vllm-serve/multimodal"]
+chat-template = ["vllm-serve/chat-template"]
+tls = ["vllm-serve/tls"]
+metrics = ["vllm-serve/metrics"]
+multiproc = ["vllm-serve/multiproc"]
 
 [[bin]]
 name = "vllm"

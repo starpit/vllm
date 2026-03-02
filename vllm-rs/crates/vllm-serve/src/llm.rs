@@ -285,6 +285,58 @@ impl LLM {
     }
 
     // -----------------------------------------------------------------------
+    // generate_token_ids()
+    // -----------------------------------------------------------------------
+
+    /// Generate completions from pre-tokenized prompts.
+    ///
+    /// Like [`generate()`](Self::generate), but accepts token IDs directly,
+    /// skipping tokenization. All prompts are submitted as a single batch.
+    pub fn generate_token_ids(
+        &self,
+        prompts: &[Vec<u32>],
+        params: Option<SamplingParams>,
+    ) -> Result<Vec<RequestOutput>> {
+        let params = params.unwrap_or_default();
+        params
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
+
+        let n = params.n.max(1) as usize;
+        let request = build_token_ids_completion_request(prompts, &params, &self.model_name);
+
+        let response = self
+            .runtime
+            .block_on(self.engine.completion(request))
+            .map_err(|e| anyhow::anyhow!("completion failed: {e}"))?;
+
+        // The engine returns one CompletionResponseChoice per (prompt, n) pair.
+        // Group them back into per-prompt RequestOutputs.
+        let mut outputs = Vec::with_capacity(prompts.len());
+        let choices_per_prompt = n;
+        for (p_idx, chunk) in response.choices.chunks(choices_per_prompt).enumerate() {
+            let completion_outputs: Vec<CompletionOutput> = chunk
+                .iter()
+                .map(|c| CompletionOutput {
+                    index: c.index,
+                    text: c.text.clone(),
+                    token_ids: Vec::new(),
+                    finish_reason: c.finish_reason.clone(),
+                })
+                .collect();
+            outputs.push(RequestOutput {
+                request_id: format!("{}-{p_idx}", response.id),
+                prompt: None,
+                prompt_token_ids: prompts.get(p_idx).cloned().unwrap_or_default(),
+                outputs: completion_outputs,
+                finished: true,
+            });
+        }
+
+        Ok(outputs)
+    }
+
+    // -----------------------------------------------------------------------
     // chat()
     // -----------------------------------------------------------------------
 
@@ -333,6 +385,59 @@ fn build_completion_request(
     protocol::CompletionRequest {
         model: Some(model.to_string()),
         prompt: Some(protocol::CompletionPrompt::Single(prompt.to_string())),
+        echo: false,
+        temperature: Some(params.temperature),
+        top_p: Some(params.top_p),
+        n: params.n,
+        max_tokens: params.max_tokens,
+        stream: false,
+        stream_options: None,
+        stop,
+        frequency_penalty: Some(params.frequency_penalty),
+        presence_penalty: Some(params.presence_penalty),
+        logit_bias: None,
+        logprobs: params.logprobs.map(|v| v.max(0) as u32),
+        prompt_logprobs: params.prompt_logprobs.map(|v| v.max(0) as u32),
+        suffix: None,
+        seed: params.seed.map(|s| s as i64),
+        user: None,
+        top_k: Some(params.top_k),
+        min_p: Some(params.min_p),
+        repetition_penalty: Some(params.repetition_penalty),
+        min_tokens: params.min_tokens,
+        stop_token_ids: params.stop_token_ids.clone(),
+        include_stop_str_in_output: params.include_stop_str_in_output,
+        ignore_eos: params.ignore_eos,
+        skip_special_tokens: params.skip_special_tokens,
+        priority: 0,
+        cache_salt: None,
+        request_id: None,
+        guided_regex: None,
+    }
+}
+
+fn build_token_ids_completion_request(
+    prompts: &[Vec<u32>],
+    params: &SamplingParams,
+    model: &str,
+) -> protocol::CompletionRequest {
+    let stop = if params.stop.is_empty() {
+        None
+    } else {
+        Some(protocol::StopCondition::Multiple(params.stop.clone()))
+    };
+
+    let prompt = if prompts.len() == 1 {
+        Some(protocol::CompletionPrompt::TokenIds(prompts[0].clone()))
+    } else {
+        Some(protocol::CompletionPrompt::MultipleTokenIds(
+            prompts.to_vec(),
+        ))
+    };
+
+    protocol::CompletionRequest {
+        model: Some(model.to_string()),
+        prompt,
         echo: false,
         temperature: Some(params.temperature),
         top_p: Some(params.top_p),

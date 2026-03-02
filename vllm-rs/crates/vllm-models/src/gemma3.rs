@@ -64,16 +64,20 @@ pub struct Gemma3Config {
 
 impl Gemma3Config {
     /// Parse from a HuggingFace config.json.
+    ///
+    /// Defaults match the transformers `Gemma3TextConfig` class so that
+    /// multimodal configs (which store only overrides in `text_config`)
+    /// are handled correctly.
     pub fn from_hf_config(config: &HfModelConfig) -> ModelResult<Self> {
         let hidden_size = config
             .hidden_size
             .ok_or_else(|| ModelError::Other("missing hidden_size".into()))?;
-        let num_attention_heads = config
-            .num_attention_heads
-            .ok_or_else(|| ModelError::Other("missing num_attention_heads".into()))?;
-        let head_dim = config
-            .head_dim()
-            .unwrap_or(hidden_size / num_attention_heads);
+        // Gemma3TextConfig default: num_attention_heads=8, num_key_value_heads=4.
+        let num_attention_heads = config.num_attention_heads.unwrap_or(8);
+        // Gemma 3 default head_dim is 256, which may differ from
+        // hidden_size / num_attention_heads (e.g. 3840/16 = 240 for 12B).
+        // Use the raw field, not the computed fallback.
+        let head_dim = config.head_dim.unwrap_or(256);
 
         let query_pre_attn_scalar = config
             .extra
@@ -103,7 +107,7 @@ impl Gemma3Config {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
-        let rope_theta = config.rope_theta.unwrap_or(10000.0);
+        let rope_theta = config.rope_theta.unwrap_or(1_000_000.0);
 
         let rope_local_base_freq = config
             .extra
@@ -119,6 +123,7 @@ impl Gemma3Config {
         // local (sliding) vs global (full). Every Nth layer is global, the rest
         // are local: is_sliding(i) = (i + 1) % pattern != 0
         // Falls back to `layer_types` array (Gemma2 format) if present.
+        // Default pattern is 6 when sliding_window is set (matches transformers).
         let layer_is_sliding = if let Some(pattern) = config
             .extra
             .get("sliding_window_pattern")
@@ -133,6 +138,9 @@ impl Gemma3Config {
                 .iter()
                 .map(|v| v.as_str() == Some("sliding_attention"))
                 .collect()
+        } else if sliding_window.is_some() {
+            // Gemma 3 default: sliding_window_pattern=6
+            (0..num_hidden_layers).map(|i| (i + 1) % 6 != 0).collect()
         } else {
             Vec::new()
         };
@@ -140,15 +148,13 @@ impl Gemma3Config {
         Ok(Self {
             hidden_size,
             num_attention_heads,
-            num_kv_heads: config.num_kv_heads().unwrap_or(num_attention_heads),
+            num_kv_heads: config.num_key_value_heads.unwrap_or(4),
             num_hidden_layers,
             intermediate_size: config
                 .intermediate_size
                 .ok_or_else(|| ModelError::Other("missing intermediate_size".into()))?,
-            vocab_size: config
-                .vocab_size
-                .ok_or_else(|| ModelError::Other("missing vocab_size".into()))?,
-            max_position_embeddings: config.max_position_embeddings.unwrap_or(8192),
+            vocab_size: config.vocab_size.unwrap_or(262144),
+            max_position_embeddings: config.max_position_embeddings.unwrap_or(131072),
             rms_norm_eps: config.norm_eps(),
             rope_theta,
             rope_local_base_freq,
@@ -912,6 +918,74 @@ mod tests {
         assert_eq!(config.sliding_window, Some(512));
         assert!((config.rope_theta - 1000000.0).abs() < 1.0);
         assert!((config.rope_local_base_freq - 10000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_gemma3_config_from_multimodal_text_config_12b() {
+        // Gemma 3 12B multimodal text_config — specifies num_attention_heads
+        // but omits vocab_size, head_dim, etc.
+        let hf_config: HfModelConfig = serde_json::from_str(
+            r#"{
+                "hidden_size": 3840,
+                "intermediate_size": 15360,
+                "model_type": "gemma3_text",
+                "num_attention_heads": 16,
+                "num_hidden_layers": 48,
+                "num_key_value_heads": 8,
+                "sliding_window": 1024
+            }"#,
+        )
+        .unwrap();
+
+        let config = Gemma3Config::from_hf_config(&hf_config).unwrap();
+        assert_eq!(config.hidden_size, 3840);
+        assert_eq!(config.num_attention_heads, 16);
+        assert_eq!(config.num_kv_heads, 8);
+        assert_eq!(config.num_hidden_layers, 48);
+        assert_eq!(config.intermediate_size, 15360);
+        // Defaults from transformers Gemma3TextConfig:
+        assert_eq!(config.vocab_size, 262144);
+        assert_eq!(config.head_dim, 256);
+        assert_eq!(config.max_position_embeddings, 131072);
+        assert!((config.rope_theta - 1_000_000.0).abs() < 1.0);
+        assert_eq!(config.sliding_window, Some(1024));
+        // Default sliding_window_pattern=6 inferred from sliding_window presence.
+        assert_eq!(config.layer_is_sliding.len(), 48);
+        assert!(config.layer_is_sliding[0]); // layer 0: sliding
+        assert!(config.layer_is_sliding[4]); // layer 4: sliding
+        assert!(!config.layer_is_sliding[5]); // layer 5: global (6th)
+        assert!(!config.layer_is_sliding[11]); // layer 11: global (12th)
+    }
+
+    #[test]
+    fn test_gemma3_config_from_multimodal_text_config_4b() {
+        // Gemma 3 4B multimodal text_config — omits num_attention_heads,
+        // num_key_value_heads, vocab_size, head_dim, and everything else
+        // that matches the transformers Gemma3TextConfig defaults.
+        let hf_config: HfModelConfig = serde_json::from_str(
+            r#"{
+                "hidden_size": 2560,
+                "intermediate_size": 10240,
+                "model_type": "gemma3_text",
+                "num_hidden_layers": 34,
+                "sliding_window": 1024
+            }"#,
+        )
+        .unwrap();
+
+        let config = Gemma3Config::from_hf_config(&hf_config).unwrap();
+        assert_eq!(config.hidden_size, 2560);
+        assert_eq!(config.num_hidden_layers, 34);
+        assert_eq!(config.intermediate_size, 10240);
+        // All of these come from Gemma3TextConfig defaults:
+        assert_eq!(config.num_attention_heads, 8);
+        assert_eq!(config.num_kv_heads, 4);
+        assert_eq!(config.vocab_size, 262144);
+        assert_eq!(config.head_dim, 256);
+        assert_eq!(config.max_position_embeddings, 131072);
+        assert!((config.rope_theta - 1_000_000.0).abs() < 1.0);
+        assert_eq!(config.sliding_window, Some(1024));
+        assert_eq!(config.layer_is_sliding.len(), 34);
     }
 
     #[test]

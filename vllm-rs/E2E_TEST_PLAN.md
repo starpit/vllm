@@ -129,6 +129,10 @@ impl TestModels {
 
     // AWQ quantized models (candle + MLX backends)
     const QWEN2_0_5B_AWQ: &str = "Qwen/Qwen2.5-0.5B-Instruct-AWQ";              // ~393 MB, Qwen2ForCausalLM
+
+    // Multimodal (vision-language) models
+    const GEMMA3_4B_IT_QAT_3BIT: &str = "mlx-community/gemma-3-4b-it-qat-3bit";  // ~2.8 GB, Gemma3ForConditionalGeneration (MLX)
+    const GEMMA3_4B_IT: &str = "google/gemma-3-4b-it";                            // ~8 GB BF16, Gemma3ForConditionalGeneration (Candle)
 }
 ```
 
@@ -722,7 +726,8 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_batch -- --ignore
 | E14b. AWQ Quantization | 4 (done) | Qwen2.5-0.5B-AWQ | Every PR | <1 min (MLX) |
 | E15. Offline Batch LLM API | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
 | E16. Batch Processing | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
-| **Total** | **~196** | | | **~31 min** |
+| E17. Multimodal VLM | 8 (done) | Gemma3-4B (MLX + Candle) | Nightly / Weekly | ~2 min |
+| **Total** | **~204** | | | **~33 min** |
 
 ### CI Tiers
 
@@ -753,6 +758,9 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_batch -- --ignore
 | Command R | CohereForCausalLM | c4ai-command-r-08-2024-4bit | 16.9 GB | Manual | — | Yes |
 | Gemma v1 | GemmaForCausalLM | (deferred — 2B model at 2 GB) | — | — | — | — |
 
+| Gemma3 VLM (MLX) | Gemma3ForConditionalGeneration | gemma-3-4b-it-qat-3bit | 2.8 GB | Nightly | — | Yes |
+| Gemma3 VLM (Candle) | Gemma3ForConditionalGeneration | google/gemma-3-4b-it | 8 GB | Weekly | Yes (BF16) | — |
+|
 | GPTQ Qwen2 | Qwen2ForCausalLM | Qwen2.5-0.5B-Instruct-GPTQ-Int4 | 459 MB | PR | — | Yes (GPTQ INT4) |
 | AWQ Qwen2 | Qwen2ForCausalLM | Qwen2.5-0.5B-Instruct-AWQ | 393 MB | PR | — | Yes (AWQ INT4) |
 
@@ -782,13 +790,49 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_batch -- --ignore
 
 ---
 
+## Phase E17: Multimodal / Vision-Language — DONE
+
+Test files: `e_multimodal.rs` (MLX), `e_gemma3_vlm.rs` (Candle)
+
+Tests Gemma3ForConditionalGeneration — a VLM with SiglipVisionModel + projector + Gemma3 text backbone. The multimodal config.json stores text model params under a nested `text_config` that relies on transformers defaults for many fields (vocab_size, head_dim, num_attention_heads, etc.). These tests catch regressions in config parsing for both MLX and Candle backends.
+
+### MLX path (`e_multimodal.rs` — Tier 3, nightly)
+
+| Test | Model | Description |
+|------|-------|-------------|
+| `test_vlm_gemma3_server_starts` | gemma-3-4b-it-qat-3bit | Server starts, /health + /v1/models work |
+| `test_vlm_gemma3_text_only_chat` | gemma-3-4b-it-qat-3bit | Text-only chat through VLM backbone |
+| `test_vlm_gemma3_image_chat` | gemma-3-4b-it-qat-3bit | Image + text chat completion |
+| `test_vlm_gemma3_image_stream` | gemma-3-4b-it-qat-3bit | Streaming image + text chat |
+| `test_vlm_gemma3_image_max_tokens` | gemma-3-4b-it-qat-3bit | max_tokens respected with image input |
+
+### Candle path (`e_gemma3_vlm.rs` — Tier 4, weekly)
+
+| Test | Model | Description |
+|------|-------|-------------|
+| `test_gemma3_vlm_candle_server_starts` | google/gemma-3-4b-it | Server starts with SafeTensors BF16 model |
+| `test_gemma3_vlm_candle_text_only_chat` | google/gemma-3-4b-it | Text-only chat through VLM backbone |
+| `test_gemma3_vlm_candle_max_tokens` | google/gemma-3-4b-it | max_tokens respected |
+
+Run commands:
+```bash
+# MLX backend (~2.8 GB model):
+cargo test -p vllm-e2e --features e2e,metal --test e_multimodal -- --ignored --test-threads=1
+
+# Candle backend (~8 GB BF16 model):
+cargo test -p vllm-e2e --features e2e --test e_gemma3_vlm -- --ignored --test-threads=1
+```
+
+**Deliverables**: 8 E2E tests (all implemented). Covers both MLX quantized and Candle BF16 paths.
+
+---
+
 ## Future Extensions (not in initial scope)
 
 - **Candle backend E2E**: Same test suite but with `--features candle-metal` or CPU-only, using GGUF models
 - **CUDA backend E2E**: Run on Linux CI with GPU, test CUDA worker path
 - **Performance regression tests**: Track TTFT, ITL, throughput across commits
 - **Python vLLM comparison tests**: Same prompts to Python vLLM and Rust, compare output quality
-- **Multimodal E2E**: When vision-language models are implemented
 - **LoRA E2E**: When adapter support is added
 - **Long-context E2E**: Test with 32K+ token contexts
 - **Memory pressure tests**: Run until OOM, verify graceful degradation

@@ -67,12 +67,9 @@ impl MlxGemma3Config {
         let hidden_size = config
             .hidden_size
             .ok_or_else(|| "missing hidden_size".to_string())?;
-        let num_attention_heads = config
-            .num_attention_heads
-            .ok_or_else(|| "missing num_attention_heads".to_string())?;
-        let head_dim = config
-            .head_dim()
-            .unwrap_or(hidden_size / num_attention_heads);
+        let num_attention_heads = config.num_attention_heads.unwrap_or(8);
+        // Gemma 3 default head_dim is 256 (may differ from hidden_size / num_heads).
+        let head_dim = config.head_dim.unwrap_or(256);
 
         let query_pre_attn_scalar = config
             .extra
@@ -104,7 +101,7 @@ impl MlxGemma3Config {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
-        let rope_theta = config.rope_theta.unwrap_or(10000.0) as f32;
+        let rope_theta = config.rope_theta.unwrap_or(1_000_000.0) as f32;
 
         let rope_local_base_freq = config
             .extra
@@ -131,6 +128,9 @@ impl MlxGemma3Config {
                 .iter()
                 .map(|v| v.as_str() == Some("sliding_attention"))
                 .collect()
+        } else if sliding_window.is_some() {
+            // Gemma 3 default: sliding_window_pattern=6
+            (0..num_hidden_layers).map(|i| (i + 1) % 6 != 0).collect()
         } else {
             Vec::new()
         };
@@ -138,15 +138,13 @@ impl MlxGemma3Config {
         Ok(Self {
             hidden_size,
             num_attention_heads,
-            num_kv_heads: config.num_kv_heads().unwrap_or(num_attention_heads),
+            num_kv_heads: config.num_key_value_heads.unwrap_or(4),
             num_hidden_layers,
             intermediate_size: config
                 .intermediate_size
                 .ok_or_else(|| "missing intermediate_size".to_string())?,
-            vocab_size: config
-                .vocab_size
-                .ok_or_else(|| "missing vocab_size".to_string())?,
-            max_position_embeddings: config.max_position_embeddings.unwrap_or(8192),
+            vocab_size: config.vocab_size.unwrap_or(262144),
+            max_position_embeddings: config.max_position_embeddings.unwrap_or(131072),
             rms_norm_eps: config.norm_eps() as f32,
             rope_theta,
             rope_local_base_freq,

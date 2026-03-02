@@ -55,4 +55,6 @@ impl TestModels {
     // Multimodal (vision-language) models
     // Tier 3: ~2.8 GB — nightly only (QAT = quantization-aware training)
     pub const GEMMA3_4B_IT_QAT_3BIT: &str = "mlx-community/gemma-3-4b-it-qat-3bit";
+    // Tier 4: ~8 GB BF16 SafeTensors — Gemma3ForConditionalGeneration (Candle path)
+    pub const GEMMA3_4B_IT: &str = "google/gemma-3-4b-it";
 }

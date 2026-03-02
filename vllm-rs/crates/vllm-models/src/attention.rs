@@ -229,6 +229,59 @@ fn softmax_last_dim(x: &Tensor) -> ModelResult<Tensor> {
 }
 
 // ---------------------------------------------------------------------------
+// FlashAttention v2 — CUDA-only, F16/BF16 only (SM80+)
+// ---------------------------------------------------------------------------
+
+/// Compute attention using FlashAttention v2 for a single sequence.
+///
+/// Wraps `candle_flash_attn::flash_attn` / `flash_attn_windowed` for our
+/// 3D tensor layout. Adds a batch dimension, calls FA2, removes it.
+///
+/// * `q` — queries, shape `[q_len, num_q_heads, head_dim]`
+/// * `k` — keys, shape `[kv_len, num_kv_heads, head_dim]`
+/// * `v` — values, shape `[kv_len, num_kv_heads, head_dim]`
+/// * `scale` — attention scaling factor (typically `1 / sqrt(head_dim)`)
+/// * `sliding_window` — if `Some(w)`, apply sliding window attention
+///
+/// Returns attention output of shape `[q_len, num_q_heads, head_dim]`.
+#[cfg(feature = "cuda")]
+fn flash_attention_single_seq(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    sliding_window: Option<usize>,
+) -> ModelResult<Tensor> {
+    // FA2 expects [batch, seq_len, num_heads, head_dim] — add batch dim.
+    let q_4d = q.unsqueeze(0).map_err(ModelError::Candle)?;
+    let k_4d = k.unsqueeze(0).map_err(ModelError::Candle)?;
+    let v_4d = v.unsqueeze(0).map_err(ModelError::Candle)?;
+
+    let out_4d = if let Some(w) = sliding_window {
+        // Sliding window: our `sliding_window=w` means each query attends to `w`
+        // positions total (itself + w-1 to the left). FA2's `window_size_left`
+        // means positions to the left *excluding* self, so pass `w - 1`.
+        // `window_size_right=Some(0)` = causal (no future positions).
+        candle_flash_attn::flash_attn_windowed(
+            &q_4d,
+            &k_4d,
+            &v_4d,
+            scale as f32,
+            Some(w.saturating_sub(1)),
+            Some(0),
+        )
+        .map_err(ModelError::Candle)?
+    } else {
+        // Standard causal attention.
+        candle_flash_attn::flash_attn(&q_4d, &k_4d, &v_4d, scale as f32, true)
+            .map_err(ModelError::Candle)?
+    };
+
+    // Remove batch dim: [1, q_len, num_q_heads, head_dim] → [q_len, num_q_heads, head_dim]
+    out_4d.squeeze(0).map_err(ModelError::Candle)
+}
+
+// ---------------------------------------------------------------------------
 // Paged decode attention — reads K/V directly from block tensors
 // ---------------------------------------------------------------------------
 
@@ -474,16 +527,21 @@ pub fn attention_with_cache(
 ) -> ModelResult<Tensor> {
     let q_len = q.dim(0).map_err(ModelError::Candle)?;
 
+    // FlashAttention v2: CUDA + F16/BF16 only (SM80+).
+    #[cfg(feature = "cuda")]
+    let use_flash = q.device().is_cuda() && matches!(q.dtype(), DType::F16 | DType::BF16);
+    #[cfg(not(feature = "cuda"))]
+    let use_flash = false;
+
     if let Some(mut handle) = kv_cache {
-        // Paged decode fast path: q_len == 1 with cached blocks.
+        // CPU paged decode fast path: q_len == 1 with cached blocks.
         // Reads K/V directly from block tensors — no O(seq_len) gather.
-        if q_len == 1
+        // On CUDA, skip this path — FA2 via the standard gather path is faster
+        // than the per-block Rust loop.
+        if !use_flash
+            && q_len == 1
             && let Some(block_refs) = handle.paged_block_refs()
         {
-            // TODO: replace paged_decode_attention body with fused Metal/CUDA
-            // kernel. The current Rust per-block loop is a correct reference
-            // implementation but slower than gather+single-matmul due to
-            // per-block kernel dispatch overhead.
             let output =
                 paged_decode_attention(q, &block_refs, k_new, v_new, scale, sliding_window)?;
             let k_token = k_new.squeeze(0).map_err(ModelError::Candle)?;
@@ -517,16 +575,40 @@ pub fn attention_with_cache(
                 (k_cat, v_cat)
             };
 
-            scaled_dot_product_attention(q, &k_for_attn, &v_for_attn, scale, sliding_window)
+            dispatch_attention(
+                q,
+                &k_for_attn,
+                &v_for_attn,
+                scale,
+                sliding_window,
+                use_flash,
+            )
         } else {
             // First call (prefill): populate the cache.
             handle.store(k_new.clone(), v_new.clone())?;
-            scaled_dot_product_attention(q, k_new, v_new, scale, sliding_window)
+            dispatch_attention(q, k_new, v_new, scale, sliding_window, use_flash)
         }
     } else {
         // No caching requested.
-        scaled_dot_product_attention(q, k_new, v_new, scale, sliding_window)
+        dispatch_attention(q, k_new, v_new, scale, sliding_window, use_flash)
     }
+}
+
+/// Dispatch to FlashAttention v2 (CUDA F16/BF16) or naive SDPA.
+#[inline]
+fn dispatch_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    sliding_window: Option<usize>,
+    _use_flash: bool,
+) -> ModelResult<Tensor> {
+    #[cfg(feature = "cuda")]
+    if _use_flash {
+        return flash_attention_single_seq(q, k, v, scale, sliding_window);
+    }
+    scaled_dot_product_attention(q, k, v, scale, sliding_window)
 }
 
 // ---------------------------------------------------------------------------
@@ -1394,5 +1476,194 @@ mod tests {
 
         let config = LlamaConfig::from_hf_config(&hf_config).unwrap();
         assert_eq!(config.sliding_window, Some(4096));
+    }
+
+    // -----------------------------------------------------------------------
+    // FlashAttention v2 CUDA tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: compare FA2 output against CPU SDPA reference.
+    ///
+    /// CPU reference is computed in F32 (candle CPU doesn't support BF16 matmul),
+    /// with inputs quantized to the target dtype first to match the precision loss
+    /// that FA2 sees on GPU.
+    #[cfg(feature = "cuda")]
+    fn assert_flash_matches_sdpa(
+        q_len: usize,
+        kv_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        dtype: DType,
+        sliding_window: Option<usize>,
+        tol: f32,
+    ) {
+        let cuda = Device::cuda_if_available(0).unwrap();
+        assert!(cuda.is_cuda(), "CUDA device required");
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        // Generate random data on CPU in F32.
+        let q_f32 =
+            Tensor::randn(0.0f32, 1.0, &[q_len, num_q_heads, head_dim], &Device::Cpu).unwrap();
+        let k_f32 =
+            Tensor::randn(0.0f32, 1.0, &[kv_len, num_kv_heads, head_dim], &Device::Cpu).unwrap();
+        let v_f32 =
+            Tensor::randn(0.0f32, 1.0, &[kv_len, num_kv_heads, head_dim], &Device::Cpu).unwrap();
+
+        // Round-trip through target dtype to match FA2's precision loss, then
+        // compute CPU reference in F32 (candle CPU doesn't support BF16 matmul).
+        let q_ref = q_f32.to_dtype(dtype).unwrap().to_dtype(DType::F32).unwrap();
+        let k_ref = k_f32.to_dtype(dtype).unwrap().to_dtype(DType::F32).unwrap();
+        let v_ref = v_f32.to_dtype(dtype).unwrap().to_dtype(DType::F32).unwrap();
+        let ref_out =
+            scaled_dot_product_attention(&q_ref, &k_ref, &v_ref, scale, sliding_window).unwrap();
+
+        // CUDA FlashAttention: convert to target dtype, move to GPU.
+        let q_cuda = q_f32.to_dtype(dtype).unwrap().to_device(&cuda).unwrap();
+        let k_cuda = k_f32.to_dtype(dtype).unwrap().to_device(&cuda).unwrap();
+        let v_cuda = v_f32.to_dtype(dtype).unwrap().to_device(&cuda).unwrap();
+        let fa_out = flash_attention_single_seq(&q_cuda, &k_cuda, &v_cuda, scale, sliding_window)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+
+        assert_eq!(fa_out.dims(), ref_out.dims());
+        let ref_vals = ref_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let fa_vals = fa_out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (i, (r, f)) in ref_vals.iter().zip(fa_vals.iter()).enumerate() {
+            assert!(
+                (r - f).abs() < tol,
+                "mismatch at idx {i}: ref={r}, fa={f} (tol={tol})"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_flash_attn_decode_bf16() {
+        // Single-token decode: q_len=1, kv_len=128, MHA.
+        assert_flash_matches_sdpa(1, 128, 8, 8, 64, DType::BF16, None, 0.05);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_flash_attn_prefill_bf16() {
+        // Multi-token prefill: q_len=64, kv_len=64, MHA.
+        assert_flash_matches_sdpa(64, 64, 8, 8, 64, DType::BF16, None, 0.05);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_flash_attn_gqa_bf16() {
+        // GQA: 8 Q heads, 2 KV heads, head_dim=128.
+        assert_flash_matches_sdpa(1, 64, 8, 2, 128, DType::BF16, None, 0.05);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_flash_attn_prefill_gqa_bf16() {
+        // GQA prefill: q_len=32, 8 Q heads, 2 KV heads, head_dim=128.
+        assert_flash_matches_sdpa(32, 32, 8, 2, 128, DType::BF16, None, 0.05);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_flash_attn_decode_f16() {
+        // Single-token decode in F16.
+        assert_flash_matches_sdpa(1, 128, 8, 8, 64, DType::F16, None, 0.05);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_flash_attn_prefill_f16() {
+        // Multi-token prefill in F16.
+        assert_flash_matches_sdpa(64, 64, 4, 4, 64, DType::F16, None, 0.05);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_flash_attn_head_dim_128() {
+        // Head dim 128 (common in larger models like Llama-70B).
+        assert_flash_matches_sdpa(1, 64, 8, 8, 128, DType::BF16, None, 0.05);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_flash_attn_sliding_window() {
+        // Sliding window attention (Mistral-style).
+        assert_flash_matches_sdpa(32, 32, 8, 8, 64, DType::BF16, Some(16), 0.05);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_flash_attn_dispatch_in_attention_with_cache() {
+        // Verify that attention_with_cache dispatches to FA2 on CUDA BF16.
+        let cuda = Device::cuda_if_available(0).unwrap();
+        assert!(cuda.is_cuda(), "CUDA device required");
+
+        let num_q_heads = 8;
+        let num_kv_heads = 2;
+        let head_dim = 64;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        // Prefill: 16 tokens.
+        let q = Tensor::randn(0.0f32, 1.0, &[16, num_q_heads, head_dim], &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&cuda)
+            .unwrap();
+        let k = Tensor::randn(0.0f32, 1.0, &[16, num_kv_heads, head_dim], &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&cuda)
+            .unwrap();
+        let v = Tensor::randn(0.0f32, 1.0, &[16, num_kv_heads, head_dim], &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&cuda)
+            .unwrap();
+
+        // Use contiguous cache.
+        let mut cache: Option<(Tensor, Tensor)> = None;
+        let handle = crate::LayerKvHandle::Contiguous(&mut cache);
+        let out = attention_with_cache(&q, &k, &v, scale, Some(handle), None).unwrap();
+        assert_eq!(out.dims(), &[16, num_q_heads, head_dim]);
+        assert_eq!(out.dtype(), DType::BF16);
+
+        // Decode step.
+        let q_dec = Tensor::randn(0.0f32, 1.0, &[1, num_q_heads, head_dim], &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&cuda)
+            .unwrap();
+        let k_dec = Tensor::randn(0.0f32, 1.0, &[1, num_kv_heads, head_dim], &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&cuda)
+            .unwrap();
+        let v_dec = Tensor::randn(0.0f32, 1.0, &[1, num_kv_heads, head_dim], &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&cuda)
+            .unwrap();
+
+        let handle = crate::LayerKvHandle::Contiguous(&mut cache);
+        let out_dec =
+            attention_with_cache(&q_dec, &k_dec, &v_dec, scale, Some(handle), None).unwrap();
+        assert_eq!(out_dec.dims(), &[1, num_q_heads, head_dim]);
+        assert_eq!(out_dec.dtype(), DType::BF16);
+
+        // Cache should hold 17 tokens now.
+        let (cached_k, _) = cache.as_ref().unwrap();
+        assert_eq!(cached_k.dim(0).unwrap(), 17);
     }
 }

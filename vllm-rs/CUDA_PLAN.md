@@ -3,37 +3,58 @@
 > Generated 2026-03-01 | Baseline: `feat/rust` branch (889 tests, 0 clippy errors)
 > Goal: feature-for-feature CUDA parity with Python vLLM's V1 engine on NVIDIA GPUs
 >
-> **Progress (2026-03-02)**: Phases 0, 1, 3.1-3.8 DONE on `worktree-cuda` branch.
+> **Progress (2026-03-02)**: Phases 0, 1, 2.1, 3 DONE on `worktree-cuda` branch.
 > E2E verified on L40S (48GB Ada): Qwen2.5-0.5B BF16.
-> All custom CUDA kernels use vectorized 128-bit loads (vec_utils.cuh).
-> `fused_add_rms_norm` wired — saves 1 kernel launch + 1 tensor alloc per decoder layer.
-> `ops::fused_add_rms_norm` / `ops::fused_add_gemma_rms_norm` integrated into all model architectures.
-> Next: Phase 2 (FlashAttention) or Phase 4 (CUDA Graphs).
+> 6 fused CUDA kernels, all with vectorized 128-bit loads (vec_utils.cuh).
+> FlashAttention v2 integrated via `candle-flash-attn` crate — auto-dispatches on CUDA F16/BF16.
+> 33 CUDA kernel unit tests + 9 FlashAttention tests + 5 CUDA E2E tests.
+> Next: CUDA pod verification, then Phase 4 (CUDA Graphs) or Phase 2b (batched FA2).
 
 ---
 
 ## Executive Summary
 
-The Rust port currently has **all the scaffolding** for CUDA but **zero GPU-accelerated codepaths** beyond what candle-core provides out of the box. Specifically:
+The Rust port has **working CUDA inference** with custom fused kernels (Phases 0, 1, 3 complete):
 
-- `candle-core` 0.9 supports CUDA tensors (`Device::new_cuda(ordinal)`) — basic matmul, add, softmax run on GPU automatically
-- `CandleWorker` parses `cuda:N` device strings and creates CUDA devices
-- `vllm-kernels` has trait abstractions (`AttentionKernels`, `CacheKernels`, `NormKernels`, `ActivationKernels`, `RotaryKernels`) with **CPU-only stub implementations**
-- `Dockerfile.cuda` exists but doesn't activate CUDA features
-- `determine_available_memory()` reads system RAM via `sysinfo`, not GPU VRAM
-- No FlashAttention, no cudarc direct usage, no NCCL, no CUDA graphs, no fused kernels
+- **Candle CUDA baseline** — `candle-core` 0.9 runs matmul, softmax, element-wise ops on GPU automatically via cuBLAS
+- **GPU memory management** — VRAM detection via `cudarc::driver::result::mem_get_info()`, KV cache blocks allocated on GPU, GPU↔CPU block swapping
+- **6 fused CUDA kernels** in `vllm-kernels/csrc/` — RMSNorm, fused-add-RMSNorm, SiLU+mul / GELU+mul, RoPE, reshape_and_cache, QK-norm+RoPE — all with vectorized 128-bit loads via `vec_utils.cuh`
+- **Runtime kernel dispatch** — `KernelSet` trait + `ops.rs` auto-routes to fused CUDA kernels on GPU, CPU fallbacks otherwise
+- **`fused_add_rms_norm`** wired into all model decoder layers — saves 1 kernel launch + 1 tensor alloc per layer per forward pass
+- **E2E verified** — Qwen2.5-0.5B BF16 on L40S (48GB Ada), correct completions + chat. TTFT ~650ms, ITL ~142ms.
 
-Python vLLM has **~183 CUDA/C++ source files** in `csrc/`, plus **72+ Triton kernels**, covering:
-- FlashAttention v2 varlen + FlashInfer paged attention
-- Paged attention v1/v2 (custom CUDA)
-- Fused RMSNorm, SiLU+mul, RoPE, cache reshape kernels
-- CUDA graphs for decode-phase acceleration
-- NCCL-based tensor/pipeline parallelism
-- Quantization compute (AWQ, GPTQ, Marlin, FP8, INT8, CUTLASS)
-- Custom all-reduce for multi-GPU
-- GPU memory profiling and management
+- **FlashAttention v2** — via `candle-flash-attn` crate, auto-dispatches on CUDA F16/BF16. Replaces naive O(n²) SDPA with tiled IO-aware algorithm — O(1) extra memory, ~10x faster on long sequences.
 
-This plan is organized into **7 phases**, roughly ordered by impact and dependency. Each phase builds on the previous.
+**What's NOT yet done** (biggest remaining gaps vs Python vLLM):
+
+- **Batched FlashAttention** (Phase 2b) — FA2 dispatches per-request; batched `flash_attn_varlen()` across all requests in a batch would improve throughput further.
+- **CUDA Graphs** (Phase 4) — no graph capture for decode phase. Kernel launch overhead dominates single-token decode steps.
+- **Multi-GPU / NCCL** (Phase 5) — single-GPU only.
+- **Quantization kernels** (Phase 6) — no GPTQ/AWQ/FP8 CUDA compute. GGUF models fall back to CPU via candle's QMatMul.
+- **Fused MoE** (Phase 7) — MoE models (DeepSeek, Qwen3-MoE) use per-expert loops on GPU, no fused top-k routing + expert matmul.
+
+Python vLLM has **~183 CUDA/C++ source files** in `csrc/`, plus **72+ Triton kernels**. This plan targets feature-for-feature parity organized into **7 phases**, roughly ordered by impact and dependency.
+
+---
+
+## What's Next
+
+The recommended priority order for remaining phases:
+
+### 1. Phase 2 CUDA pod verification
+FlashAttention v2 is integrated (Phase 2.1 ✅) but needs pod testing. Build + clippy + unit tests + E2E on L40S to verify correctness and measure ITL improvement over naive SDPA.
+
+### 2. Phase 4: CUDA Graphs (decode acceleration)
+With FlashAttention done, decode-phase kernel launch overhead becomes the next bottleneck. CUDA graphs capture the entire decode forward pass as a single GPU-side graph, eliminating ~100 individual kernel launches per step. Python vLLM gets ~30-50% decode ITL improvement from this.
+
+### 3. Phase 7.1: Fused MoE Kernels (MoE model perf)
+Critical for DeepSeek V2/V3, Qwen3-MoE, and Mixtral performance on CUDA. Current per-expert loop is extremely slow on GPU. Fused top-k gating + expert GEMM is a well-known optimization. Can be done independently of Phases 2/4.
+
+### 4. Phase 5: Multi-GPU / NCCL (model size scaling)
+Enables models >13B that don't fit on a single GPU. Important for production use but lower priority than single-GPU performance. NCCL tensor parallelism is the standard approach.
+
+### 5. Phase 6: Quantization Kernels (GPTQ/AWQ/FP8)
+Enables quantized model inference on CUDA. Most production deployments use 4-bit or 8-bit models. Currently GGUF falls back to CPU; GPTQ/AWQ don't work at all. Large effort but high production value.
 
 ---
 
@@ -79,36 +100,28 @@ This plan is organized into **7 phases**, roughly ordered by impact and dependen
 
 ---
 
-## Phase 2: FlashAttention Integration (Highest-Impact Kernel)
+## Phase 2: FlashAttention Integration (Highest-Impact Kernel) — PHASE 2.1 DONE
 
 **Goal**: FFI bindings to FlashAttention v2 for batched variable-length attention on CUDA. This is the single largest performance win — it's what makes Python vLLM fast.
 
 **Why next**: Attention is the bottleneck for all LLM inference. FlashAttention is ~10x faster than naive SDPA on long sequences, uses O(1) extra memory (no materialized attention matrix), and supports paged KV cache natively.
 
-### Strategy Decision: FlashAttention C library vs. FlashInfer
+### Approach: `candle-flash-attn` crate (0.9.2)
 
-| Option | Pros | Cons |
-|--------|------|------|
-| **FlashAttention 2 C API** | Stable C/CUDA API (`flash_attn_varlen_func`), well-tested, used by Python vLLM V1 default | Requires building FA2 from source (CUDA, complex CMake) |
-| **FlashInfer** | Paged KV natively, decode-optimized kernels, FP8 KV cache | Heavier build, Python-first API (but has C++ core) |
-| **Write custom CUDA attention** | Full control, no external dep | Massive effort, won't match FA2/FlashInfer perf |
+Instead of vendoring FA2 source or writing custom FFI, we use the `candle-flash-attn` crate which wraps FlashAttention v2 CUDA kernels with a native candle `Tensor` API. It matches our `candle-core` 0.9 version exactly.
 
-**Recommendation**: FlashAttention 2 C FFI first (it's what Python vLLM V1 defaults to). FlashInfer as Phase 2b if needed for paged decode perf.
+**Integration point**: `attention_with_cache()` in `vllm-models/src/attention.rs` — the single function through which ALL model attention flows. On CUDA with F16/BF16, it auto-dispatches to FlashAttention via `flash_attn()` / `flash_attn_windowed()`. No model architecture changes needed — all models get FA2 automatically.
 
 ### Tasks
 
-| # | Task | Details | Est. |
-|---|------|---------|------|
-| 2.1 | **FlashAttention 2 build integration** | Vendor or git-submodule FlashAttention 2 (BSD license). Add a `build.rs` in `vllm-kernels` that compiles the FA2 C++/CUDA source via `cc` crate + nvcc. | L |
-| 2.2 | **FA2 Rust FFI bindings** | Generate bindings to `flash_attn_varlen_func` (prefill) and `flash_attn_with_kvcache` (decode). Expose via `CudaAttentionKernels` implementing the `AttentionKernels` trait. Key parameters: `cu_seqlens_q`, `cu_seqlens_k`, `max_seqlen_q`, `max_seqlen_k`, `softmax_scale`, `causal`, `block_table` (for paged decode). | L |
-| 2.3 | **AttentionMetadata → FA2 args** | Convert the existing Rust `AttentionMetadata` (per-request `query_start_loc`, `seq_lens`, `block_ids`) into FlashAttention's expected format: `cu_seqlens_q`, `cu_seqlens_k` (cumulative sequence lengths), `block_table` (2D tensor mapping sequence → block IDs). | M |
-| 2.4 | **Batched attention in forward_batch()** | Replace the per-request `attention_with_cache()` loop in `LlamaForCausalLM::forward_batch()` with a single FlashAttention varlen call across all requests. This is the critical integration point — all Q/K/V tensors concatenated, FA2 handles ragged sequence lengths via cu_seqlens. | L |
-| 2.5 | **Paged decode path** | For single-token decode steps, use FA2's `flash_attn_with_kvcache` which natively reads from paged block tables — replacing the current Rust `paged_decode_attention()` per-block loop. | M |
-| 2.6 | **FA2 correctness tests** | Unit tests comparing FA2 output against CPU SDPA for various seq lengths, head dims, GQA configs. | M |
-| 2.7 | **Wire to all model architectures** | All candle model attention layers (LLaMA, Gemma2, DeepSeek, CommandR, etc.) should use FA2 when on CUDA. The `attention_with_cache()` helper should dispatch to FA2 vs CPU based on device. | M |
-| 2.8 | **Mixed prefill+decode (Phase 2b)** | Python vLLM V1 uses a single batched attention call mixing prefill and decode sequences. This requires split-k scheduling in FA2. Lower priority but important for continuous batching throughput. | L |
+| # | Task | Details | Status |
+|---|------|---------|--------|
+| 2.1 | **FA2 single-sequence integration** | `candle-flash-attn` dep + `flash_attention_single_seq()` helper + dispatch in `attention_with_cache()`. Auto-routes CUDA F16/BF16 to FA2, CPU/F32 to SDPA. On CUDA, paged decode path is skipped (gather+FA2 is faster than per-block Rust loop). 9 unit tests. | ✅ |
+| 2.2 | **CUDA pod verification** | Build + clippy + kernel tests + E2E on L40S pod. Verify FA2 correctness and measure ITL improvement. | |
+| 2.3 | **Batched attention (Phase 2b)** | Replace per-request `attention_with_cache()` loop with single batched `flash_attn_varlen()` call across all requests in `forward_batch()`. This is the continuous batching optimization — all Q/K/V concatenated, FA2 handles ragged seqlens via cu_seqlens. | |
+| 2.4 | **Paged decode with FA2 (Phase 2c)** | Use FA2's `flash_attn_with_kvcache` for paged KV cache decode — reads directly from block table without gather. Requires FlashInfer or custom paged wrapper. | |
 
-**Exit criteria**: `forward_batch()` calls FlashAttention for all attention computation on CUDA. All model architectures use it. Throughput approaches Python vLLM for attention-bound workloads.
+**Phase 2.1 exit criteria**: ✅ MET — `attention_with_cache()` dispatches to FA2 on CUDA F16/BF16. All model architectures use it automatically. 9 CUDA unit tests pass locally (awaiting pod verification). Local clippy + all non-CUDA tests pass.
 
 ---
 

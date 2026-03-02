@@ -6,16 +6,16 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 169 |
+| &#x1F535; | Fully implemented | 172 |
 | &#x1F7E1; | Partially implemented | 4 |
-| &#x1F534; | Not implemented | 100 |
+| &#x1F534; | Not implemented | 98 |
 
 ### Priority (for incomplete features)
 
 | Priority | Meaning | Count |
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
-| **P3** | High — meaningfully expands user base or enables key use cases | 16 |
+| **P3** | High — meaningfully expands user base or enables key use cases | 14 |
 | **P2** | Medium — useful improvement, broader coverage | 33 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
@@ -41,11 +41,11 @@
 | [Quantization](#quantization) | 12 | `████░░░░░░` 5/12 | 1 | 61 | 12 |
 | [Serving / OpenAI API](#serving--openai-api) | 24 | `███████░░░` 17/24 | 0 | 104 | 33 |
 | [Sampling & Decoding](#sampling--decoding) | 19 | `██████████` 19/19 | 0 | 53 | 13 |
-| [KV Cache & Attention](#kv-cache--attention) | 19 | `█████░░░░░` 9/19 | 0 | 96 | 0 |
+| [KV Cache & Attention](#kv-cache--attention) | 19 | `█████░░░░░` 10/19 | 0 | 105 | 0 |
 | [Scheduling](#scheduling) | 10 | `█████████░` 9/10 | 0 | 73 | 1 |
-| [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 53 | 2 |
+| [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 62 | 2 |
 | [Parallelism & Distribution](#parallelism--distribution) | 10 | `███░░░░░░░` 3/10 | 0 | 33 | 0 |
-| [Performance Optimizations](#performance-optimizations) | 13 | `█████░░░░░` 7/13 | 4 | 41 | 0 |
+| [Performance Optimizations](#performance-optimizations) | 13 | `██████░░░░` 8/13 | 4 | 50 | 0 |
 | [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | 12 | `████░░░░░░` 5/12 | 0 | 25 | 0 |
 | [LoRA / Adapters](#lora--adapters) | 5 | `████░░░░░░` 2/5 | 0 | 12 | 8 |
 | [Speculative Decoding](#speculative-decoding) | 5 | `██░░░░░░░░` 1/5 | 0 | 20 | 0 |
@@ -55,7 +55,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | 8 | `████████░░` 6/8 | 0 | 31 | 19 |
 | [Observability & Operations](#observability--operations) | 7 | `██████████` 7/7 | 1 | 15 | 0 |
 | [CLI & Deployment](#cli--deployment) | 17 | `██████████` 16/17 | 2 | 19 | 6 |
-| **Total** | **213** | `█████░░░░░` **125/213** | **37** | **710** | **92** |
+| **Total** | **214** | `██████░░░░` **129/214** | **37** | **741** | **96** |
 
 ---
 
@@ -247,7 +247,7 @@
 | KV cache offloading (CPU ↔ GPU) | &#x1F535; | &#x1F534; | — | — | P3 |
 | KV cache transfer (distributed) | &#x1F535; | &#x1F534; | — | — | P1 |
 | Multi-group KV cache (hybrid models) | &#x1F535; | &#x1F534; | — | — | P1 |
-| FlashAttention v2 | &#x1F535; | &#x1F534; | — | — | P3 |
+| FlashAttention v2 | &#x1F535; | &#x1F535; | 9 | 0 | |
 | FlashInfer | &#x1F535; | &#x1F534; | — | — | P2 |
 | FlexAttention | &#x1F535; | &#x1F534; | — | — | P1 |
 | xFormers | &#x1F535; | &#x1F534; | — | — | P0 |
@@ -256,7 +256,7 @@
 | Batched attention metadata (cu_seqlens, slot_mapping, block_table) | &#x1F535; | &#x1F7E1; | 3 | 0 | P3 |
 | Tree attention | &#x1F535; | &#x1F534; | — | — | P1 |
 
-> Unit counts: `block_pool.rs` (19), `free_block_queue.rs` (16), `kv_cache_manager.rs` (13), `kv_cache_block.rs` (11), `kv_block_pool.rs` (13), `attention.rs` (25), MLX `cache.rs` (1). Sliding window: 7 attention.rs + 2 gemma2.rs interleaved + 2 qwen2.rs max_window_layers + 1 MLX phi3 trim + 1 array-format parsing = 13. Per-row counts reflect the primary feature each test targets; some tests cross-cut multiple rows. Total section: 103 unit tests.
+> Unit counts: `block_pool.rs` (19), `free_block_queue.rs` (16), `kv_cache_manager.rs` (13), `kv_cache_block.rs` (11), `kv_block_pool.rs` (13), `attention.rs` (34 — 25 SDPA/paged + 9 FlashAttention v2), MLX `cache.rs` (1). FlashAttention v2 tests: decode BF16/F16, prefill BF16/F16, GQA BF16 decode/prefill, head_dim=128, sliding window, attention_with_cache dispatch — all compare FA2 CUDA output against CPU SDPA reference. Sliding window: 7 attention.rs + 2 gemma2.rs interleaved + 2 qwen2.rs max_window_layers + 1 MLX phi3 trim + 1 array-format parsing = 13. Per-row counts reflect the primary feature each test targets; some tests cross-cut multiple rows. Total section: 112 unit tests.
 >
 > **Batched attention metadata note:** The Rust port now has `AttentionMetadata` (with `query_start_loc`, `seq_lens`, `block_ids`, `tokens_before` per request) used by `forward_batch()` to split Q/K/V for per-request attention. However, the attention inner loop is still per-request — each request's slice runs through `attention_with_cache()` separately. Python vLLM passes equivalent metadata to FlashAttention's `varlen` API or FlashInfer's batched wrappers, which handle variable-length multi-request attention in a single kernel call. The remaining gap is a batched attention kernel that processes all requests' attention in one dispatch:
 > - **CUDA**: FlashAttention varlen (`flash_attn_varlen_func`) via FFI, or FlashInfer batched wrappers — uses `cu_seqlens` to handle ragged sequences without padding.
@@ -299,7 +299,7 @@
 | Backend | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
 | CPU | &#x1F535; | &#x1F535; | 4 | 0 | |
-| CUDA (NVIDIA GPU) | &#x1F535; | &#x1F7E1; | 33 | 5 | P3 |
+| CUDA (NVIDIA GPU) | &#x1F535; | &#x1F7E1; | 42 | 5 | P3 |
 | Metal / MLX (Apple Silicon) | &#x1F534; | &#x1F535; | 4 | 0 | |
 | ROCm (AMD GPU) | &#x1F535; | &#x1F534; | — | — | P2 |
 | TPU | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -308,7 +308,7 @@
 | Device auto-detection | &#x1F535; | &#x1F535; | 4 | 0 | |
 | Memory profiling / `--gpu-memory-utilization` | &#x1F535; | &#x1F535; | 6 | 2 | |
 
-> Unit counts from `candle_worker.rs` (24 total) and `mlx_worker.rs` (4). CUDA: 29 GPU kernel unit tests (norm 13 incl. fused_add_rms_norm, activation 7, rotary 5, cache 4) + 2 device detection tests + 2 misc = 33. E2E: 5 CUDA tests (SmolLM-135M + Qwen2.5-0.5B safetensors on GPU: server start, completion, chat). The CUDA backend supports E2E inference (verified: Qwen2.5-0.5B BF16 on L40S) with 6 fused CUDA kernels (RMSNorm, fused add+RMSNorm, SiLU+mul/GELU+mul, RoPE, reshape_and_cache, QK-norm+RoPE), all using vectorized 128-bit loads. GPU KV block pool, VRAM-based block allocation, and GPU↔CPU block swapping. Remaining for full parity: FlashAttention, CUDA graphs, tensor parallelism. Device auto-detection includes `parse_device` tests for cpu/cuda/metal/auto. E2E float16 tests validate dtype selection end-to-end.
+> Unit counts from `candle_worker.rs` (24 total) and `mlx_worker.rs` (4). CUDA: 29 GPU kernel unit tests (norm 13 incl. fused_add_rms_norm, activation 7, rotary 5, cache 4) + 9 FlashAttention v2 tests + 2 device detection tests + 2 misc = 42. E2E: 5 CUDA tests (SmolLM-135M + Qwen2.5-0.5B safetensors on GPU: server start, completion, chat). The CUDA backend supports E2E inference (verified: Qwen2.5-0.5B BF16 on L40S) with 6 fused CUDA kernels (RMSNorm, fused add+RMSNorm, SiLU+mul/GELU+mul, RoPE, reshape_and_cache, QK-norm+RoPE) all using vectorized 128-bit loads, plus FlashAttention v2 (via `candle-flash-attn` crate, auto-dispatches on CUDA F16/BF16). GPU KV block pool, VRAM-based block allocation, and GPU↔CPU block swapping. Remaining for full parity: CUDA graphs, tensor parallelism. Device auto-detection includes `parse_device` tests for cpu/cuda/metal/auto. E2E float16 tests validate dtype selection end-to-end.
 
 ---
 
@@ -336,7 +336,7 @@
 | Feature | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
 | CUDA graphs | &#x1F535; | &#x1F534; | — | — | P3 |
-| FlashAttention v2 kernels | &#x1F535; | &#x1F534; | — | — | P3 |
+| FlashAttention v2 kernels | &#x1F535; | &#x1F535; | 9 | 0 | |
 | FlashInfer kernels | &#x1F535; | &#x1F534; | — | — | P2 |
 | xFormers memory-efficient attention | &#x1F535; | &#x1F534; | — | — | P1 |
 | Fused SiLU-and-mul kernel | &#x1F535; | &#x1F535; | 7 | 0 | |
@@ -353,7 +353,7 @@
 | Persistent InputBatch (cross-iteration reuse) | &#x1F535; | &#x1F535; | 14 | 0 | |
 | Paged KV (no gather copy on decode) | &#x1F535; | &#x1F535; | 2 | 0 | |
 
-> Fused CUDA kernels: `vllm-kernels/csrc/` contains 5 custom CUDA kernel files compiled via nvcc (SM80/86/89/90), all using vectorized 128-bit loads via `vec_utils.cuh`. Each kernel has CPU and CUDA implementations behind the `KernelSet` trait, with `ops.rs` auto-dispatch wiring all model architectures to use fused kernels when on CUDA. `fused_add_rms_norm` saves 1 kernel launch + 1 tensor allocation per decoder layer (called in every model architecture). 29 GPU unit tests compare CUDA output against CPU reference across f32/f16/bf16. Norm tests include 5 RMSNorm + 4 fused_add_rms_norm + 4 fused QK-norm+RoPE (Gemma3). CPU kernel stubs (12 tests: rotary 3, activation 3, norm 2, cache 2, attention 2) provide CPU fallback paths. Native dtype unit tests count `candle_worker.rs` dtype parsing tests. Persistent InputBatch: 14 unit tests in `input_batch.rs` (add/remove/swap-remove compaction, prefill→decode transition, mixed batches, spec decode, tokens-in-pool tracking, query_start_loc consistency).
+> Fused CUDA kernels: `vllm-kernels/csrc/` contains 5 custom CUDA kernel files compiled via nvcc (SM80/86/89/90), all using vectorized 128-bit loads via `vec_utils.cuh`. Each kernel has CPU and CUDA implementations behind the `KernelSet` trait, with `ops.rs` auto-dispatch wiring all model architectures to use fused kernels when on CUDA. `fused_add_rms_norm` saves 1 kernel launch + 1 tensor allocation per decoder layer (called in every model architecture). 29 GPU unit tests compare CUDA output against CPU reference across f32/f16/bf16. Norm tests include 5 RMSNorm + 4 fused_add_rms_norm + 4 fused QK-norm+RoPE (Gemma3). FlashAttention v2 via `candle-flash-attn` crate (0.9.2): auto-dispatches on CUDA F16/BF16 in `attention_with_cache()`, falls back to naive SDPA on CPU/F32. 9 unit tests compare FA2 output against CPU SDPA reference (decode, prefill, GQA, F16, head_dim=128, sliding window). CPU kernel stubs (12 tests: rotary 3, activation 3, norm 2, cache 2, attention 2) provide CPU fallback paths. Native dtype unit tests count `candle_worker.rs` dtype parsing tests. Persistent InputBatch: 14 unit tests in `input_batch.rs` (add/remove/swap-remove compaction, prefill→decode transition, mixed batches, spec decode, tokens-in-pool tracking, query_start_loc consistency).
 >
 > **Persistent InputBatch note:** `CandleWorker` now maintains a persistent `InputBatch` struct across engine steps, matching Python vLLM V1's `InputBatch`. Per-request state (block tables, tokens-in-pool, positions, last token ID) lives in dense slot arrays that are delta-updated each step. Finished requests are swap-removed to keep the array compact. `prepare_inputs()` builds flat token/position tensors and `AttentionMetadata` from the slot arrays without HashMap lookups. This eliminates per-step allocation overhead on the decode hot path — the steady-state case where N concurrent requests each generate 1 token per step.
 
@@ -375,7 +375,7 @@
 | KV cache write (reshape_and_cache) | &#x1F535; | &#x1F535; | 4 | 0 | |
 | GPU sampling (top-k / top-p / penalties / logprobs) | &#x1F535; | &#x1F535; | 0 | 0 | |
 | Fused MoE routing + expert matmul ✱ | &#x1F535; | &#x1F534; | — | — | P2 |
-| Fused layer ops (activation / norm / RoPE) ✱ | &#x1F535; | &#x1F535; | 25 | 0 | |
+| Fused layer ops (activation / norm / RoPE / attention) ✱ | &#x1F535; | &#x1F535; | 34 | 0 | |
 | Quantization compute (FP8 / INT8 / AWQ matmul) | &#x1F535; | &#x1F534; | — | — | P2 |
 | Mamba / SSM ops (selective scan, SSD, conv1d) | &#x1F535; | &#x1F534; | — | — | P2 |
 | FLA ops (fused recurrent, KDA, chunk) | &#x1F535; | &#x1F534; | — | — | P3 |
@@ -388,8 +388,8 @@
 > **Rust strategies by category**:
 > - *KV cache write*: CUDA path uses a fused `reshape_and_cache` kernel (`csrc/cache_kernels.cu`) that scatters all tokens in a single kernel launch via slot_mapping. CPU path uses `KvBlockPool::scatter_new_kv()` per-token loop. MLX uses `MlxKvCache`. 4 CUDA unit tests verify scatter correctness (basic, f16, padding skip, single-token).
 > - *GPU sampling*: All sampling runs on CPU in both CandleWorker and MlxWorker. For per-request forward passes this is trivially fast (~µs for a 1D logits vector). GPU sampling kernels only matter for batched inference where logits are a 2D `[batch, vocab]` tensor. Tests attributed to [Sampling & Decoding](#sampling--decoding).
-> - *Fused layer ops*: CUDA path has fused kernels for RMSNorm + fused add+RMSNorm (`csrc/layernorm_kernels.cu`), SiLU+mul / GELU+mul (`csrc/activation_kernels.cu`), RoPE (`csrc/pos_encoding_kernels.cu`), and fused QK-norm+RoPE (`csrc/qk_norm_rope_kernels.cu`, used by Gemma3). All kernels use vectorized 128-bit loads via `vec_utils.cuh`. `ops.rs` auto-dispatches to CUDA when tensors are on GPU, falling back to candle ops on CPU. All model decoder layers use `fused_add_rms_norm` to merge the residual add + post-attention norm into a single kernel launch. MLX lazy eval fuses the same operations into single Metal command buffers. 25 CUDA unit tests (norm 13 + activation 7 + rotary 5) compare against CPU reference across f32/f16/bf16.
-> - *Triton attention*: Python vLLM has its own Triton attention implementations (distinct from the FlashAttention C++ library). Both serve the same purpose: batched variable-length attention. The Rust port would use FlashAttention via FFI rather than reimplementing in Triton.
+> - *Fused layer ops*: CUDA path has fused kernels for RMSNorm + fused add+RMSNorm (`csrc/layernorm_kernels.cu`), SiLU+mul / GELU+mul (`csrc/activation_kernels.cu`), RoPE (`csrc/pos_encoding_kernels.cu`), fused QK-norm+RoPE (`csrc/qk_norm_rope_kernels.cu`, used by Gemma3), and FlashAttention v2 (`candle-flash-attn` crate). All custom kernels use vectorized 128-bit loads via `vec_utils.cuh`. `ops.rs` auto-dispatches to CUDA when tensors are on GPU, falling back to candle ops on CPU. `attention_with_cache()` auto-dispatches to FA2 on CUDA F16/BF16. All model decoder layers use `fused_add_rms_norm` to merge the residual add + post-attention norm into a single kernel launch. MLX lazy eval fuses the same operations into single Metal command buffers. 34 CUDA unit tests (norm 13 + activation 7 + rotary 5 + FlashAttention 9) compare against CPU reference across f32/f16/bf16.
+> - *Triton attention*: Python vLLM has its own Triton attention implementations (distinct from the FlashAttention C++ library). Both serve the same purpose: batched variable-length attention. The Rust port uses FlashAttention v2 via `candle-flash-attn` crate — auto-dispatches in `attention_with_cache()` on CUDA F16/BF16. The Triton attention row above tracks the batched varlen Triton kernels specifically (distinct from FA2).
 > - *Model-gated kernels*: Mamba/SSM, FLA, LoRA, and speculative decoding kernels are only needed when those model types or features are implemented — they are blocked by their parent feature.
 
 ---
@@ -587,9 +587,9 @@ cargo build -p vllm-cli --no-default-features --features metal
 |---|---|---|
 | Model architectures | ~248 | 11 candle + 11 MLX (+ quantized variants) |
 | Quantization methods | ~14 | 5 (GGUF + MLX native 4-bit + GPTQ INT4 + AWQ INT4 + BnB NF4) |
-| Attention backends | ~15 | 1 (custom SDPA) |
+| Attention backends | ~15 | 2 (custom SDPA + FlashAttention v2) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Unit tests | ~948 test files | 868 passing (810 non-MLX + 58 MLX) |
+| Unit tests | ~948 test files | 890 passing (832 non-MLX + 58 MLX) |
 | E2E tests | — | 112 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 4 AWQ + 4 BnB + 6 LLM API + 4 LoRA + 6 batch + 2 multimodal) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

@@ -123,6 +123,13 @@ pub trait Worker: Send {
         None
     }
 
+    /// Return the resolved model architecture name (e.g. "LlamaForCausalLM").
+    ///
+    /// Available after `load_model()` has been called.
+    fn architecture(&self) -> Option<String> {
+        None
+    }
+
     /// Shut down the worker and release all resources.
     fn shutdown(&mut self);
 

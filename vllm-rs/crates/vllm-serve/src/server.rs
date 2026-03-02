@@ -140,10 +140,26 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     router
 }
 
+/// Log the available API routes.
+fn log_routes(state: &AppState) {
+    info!("Available routes are:");
+    info!("Route: /v1/chat/completions, Methods: POST");
+    info!("Route: /v1/completions, Methods: POST");
+    info!("Route: /v1/embeddings, Methods: POST");
+    info!("Route: /v1/models, Methods: GET");
+    info!("Route: /health, Methods: GET");
+    info!("Route: /version, Methods: GET");
+    if state.config.metrics_enabled {
+        info!("Route: /metrics, Methods: GET");
+    }
+}
+
 /// Start the HTTP server (plain HTTP or HTTPS if SSL cert/key are configured).
 #[allow(clippy::needless_return)]
 pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
     let router = build_router(state.clone());
+
+    log_routes(&state);
 
     #[cfg(feature = "tls")]
     if let (Some(certfile), Some(keyfile)) = (&state.config.ssl_certfile, &state.config.ssl_keyfile)
@@ -154,6 +170,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
             "vLLM Rust server listening on https://{}",
             state.config.bind_address
         );
+        info!("Application startup complete.");
         axum_server::bind_rustls(addr, tls_config)
             .serve(router.into_make_service())
             .await?;
@@ -170,6 +187,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         "vLLM Rust server listening on http://{}",
         state.config.bind_address
     );
+    info!("Application startup complete.");
     axum::serve(listener, router).await?;
     Ok(())
 }

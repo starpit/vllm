@@ -9,6 +9,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tracing::info;
@@ -226,6 +227,7 @@ fn init_cache(
 /// 9. Create AsyncEngine
 /// 10. Return InitializedStack
 pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
+    let init_start = Instant::now();
     let model_path = config.model.clone();
 
     // Extract model name before moving model_path into the worker config.
@@ -233,6 +235,11 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
 
     // Decide backend: MLX (Metal) or Candle (CPU/CUDA).
     let (mut worker, hf_config, model_dir, model_dtype) = create_worker(config, model_path)?;
+
+    // Log resolved architecture.
+    if let Some(arch) = worker.architecture() {
+        info!("Resolved model architecture: {}", arch);
+    }
 
     // Take the tokenizer that was loaded in parallel during load_model().
     // This avoids a redundant parse of tokenizer.json later.
@@ -262,6 +269,14 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         available_memory as f64 / (1024.0 * 1024.0 * 1024.0),
         config.gpu_memory_utilization,
         num_gpu_blocks
+    );
+
+    let kv_cache_tokens = num_gpu_blocks * config.block_size;
+    info!("KV cache size: {} tokens", kv_cache_tokens);
+    info!(
+        "Maximum concurrency for {} tokens per request: {:.2}x",
+        max_model_len,
+        kv_cache_tokens as f64 / max_model_len as f64
     );
 
     // 6. Wrap in UniProcExecutor (pre-initialized — skip init sequence).
@@ -414,6 +429,11 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         );
         engine.set_multimodal_config(image_token_index, mm_tokens_per_image, image_size);
     }
+
+    info!(
+        "init engine (load model, create kv cache) took {:.2} seconds",
+        init_start.elapsed().as_secs_f64()
+    );
 
     // 11. Return the stack.
     Ok(InitializedStack {

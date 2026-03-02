@@ -125,6 +125,8 @@ pub struct CandleWorker {
     pooling_strategy: vllm_models::embedding::PoolingStrategy,
     /// Per-request multimodal data, consumed on first forward (prefill).
     mm_data_map: HashMap<String, vllm_common::MultimodalData>,
+    /// Resolved model architecture name (e.g. "LlamaForCausalLM").
+    resolved_architecture: Option<String>,
 }
 
 impl CandleWorker {
@@ -154,6 +156,7 @@ impl CandleWorker {
             grammar_vocabulary: None,
             pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
             mm_data_map: HashMap::new(),
+            resolved_architecture: None,
         }
     }
 
@@ -505,6 +508,7 @@ impl CandleWorker {
         self.hf_config = Some(hf_config);
         self.resolved_dtype = Some(dtype);
         self.model = Some(model);
+        self.resolved_architecture = Some(arch.clone());
         info!(
             "CandleWorker: GGUF model loaded (arch={arch}, kv_dtype={:?})",
             dtype
@@ -974,6 +978,7 @@ impl Worker for CandleWorker {
         self.hf_config = Some(hf_config);
         self.resolved_dtype = Some(dtype);
         self.model = Some(model);
+        self.resolved_architecture = Some(arch.clone());
         info!(
             "CandleWorker: model loaded (arch={arch}, dtype={:?})",
             dtype
@@ -1623,6 +1628,10 @@ impl Worker for CandleWorker {
 
     fn take_preloaded_tokenizer(&mut self) -> Option<tokenizers::Tokenizer> {
         self.preloaded_tokenizer.take()
+    }
+
+    fn architecture(&self) -> Option<String> {
+        self.resolved_architecture.clone()
     }
 
     fn shutdown(&mut self) {

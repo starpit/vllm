@@ -113,6 +113,8 @@ pub struct MlxWorker {
 
     /// Pre-loaded tokenizer (parsed in parallel with weight loading).
     preloaded_tokenizer: Option<tokenizers::Tokenizer>,
+    /// Resolved model architecture name (e.g. "LlamaForCausalLM").
+    resolved_architecture: Option<String>,
 
     // Timing instrumentation.
     step_count: usize,
@@ -143,6 +145,7 @@ impl MlxWorker {
             pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
             mm_data_map: HashMap::new(),
             preloaded_tokenizer: None,
+            resolved_architecture: None,
             step_count: 0,
             prefill_count: 0,
             decode_count: 0,
@@ -561,6 +564,7 @@ impl Worker for MlxWorker {
         self.hf_config = Some(hf_config);
         self.resolved_dtype = Some(dtype);
         self.model = Some(model);
+        self.resolved_architecture = Some(arch.clone());
         let quant_str = if is_gptq {
             ", GPTQ"
         } else if is_awq {
@@ -1230,6 +1234,10 @@ impl Worker for MlxWorker {
 
     fn take_preloaded_tokenizer(&mut self) -> Option<tokenizers::Tokenizer> {
         self.preloaded_tokenizer.take()
+    }
+
+    fn architecture(&self) -> Option<String> {
+        self.resolved_architecture.clone()
     }
 
     fn shutdown(&mut self) {

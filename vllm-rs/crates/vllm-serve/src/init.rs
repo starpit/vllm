@@ -68,6 +68,8 @@ pub struct VllmConfig {
     /// Whether to disable async scheduling (overlap GPU/CPU work).
     /// Default false — async scheduling is enabled by default.
     pub disable_async_scheduling: bool,
+    /// Runner type: "generate" (default) or "pooling".
+    pub runner: String,
 }
 
 impl Default for VllmConfig {
@@ -89,6 +91,7 @@ impl Default for VllmConfig {
             lora_adapter: None,
             pooling_strategy: "auto".to_string(),
             disable_async_scheduling: false,
+            runner: "generate".to_string(),
         }
     }
 }
@@ -122,6 +125,8 @@ type WorkerCreationResult = (
 ///
 /// Returns `(worker, hf_config, model_dir, dtype)`.
 fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreationResult> {
+    let is_pooling = config.runner == "pooling";
+
     // Try MLX backend first when metal feature is enabled.
     #[cfg(feature = "metal")]
     if should_use_mlx(&config.device) {
@@ -134,6 +139,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             block_size: config.block_size,
             lora_adapter: config.lora_adapter.clone(),
             pooling_strategy: config.pooling_strategy.clone(),
+            is_pooling,
         };
 
         let mut worker = MlxWorker::new(mlx_config);
@@ -171,6 +177,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
         gguf_file: config.gguf_file.clone(),
         lora_adapter: config.lora_adapter.clone(),
         pooling_strategy: config.pooling_strategy.clone(),
+        is_pooling,
     };
 
     let mut worker = CandleWorker::new(worker_config);
@@ -331,6 +338,7 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
             None
         },
         eos_token_ids,
+        is_pooling: config.runner == "pooling",
     };
 
     let client = Box::new(InprocClient::new(engine_config, Box::new(executor)));
@@ -390,10 +398,14 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         AsyncEngine::new(client, model_name.clone(), max_model_len)
     };
 
-    // 9. Enable async scheduling unless disabled.
+    // 9. Enable async scheduling unless disabled. Configure pooling mode.
     let mut engine = engine;
     if !config.disable_async_scheduling {
         engine.set_async_scheduling(true);
+    }
+    if config.runner == "pooling" {
+        engine.set_is_pooling(true);
+        info!("Runner: pooling mode (embedding requests go through scheduler)");
     }
 
     // 10. Configure multimodal support if the model has a vision_config.

@@ -53,6 +53,9 @@ pub struct MlxWorkerConfig {
     /// Pooling strategy for embeddings: "auto", "last", "cls", "mean".
     /// "auto" detects from `1_Pooling/config.json`, defaults to "last".
     pub pooling_strategy: String,
+    /// Whether the engine is in pooling mode.
+    /// In pooling mode, `execute_model` returns embedding vectors instead of sampled tokens.
+    pub is_pooling: bool,
 }
 
 impl MlxWorkerConfig {
@@ -116,6 +119,9 @@ pub struct MlxWorker {
     /// Resolved model architecture name (e.g. "LlamaForCausalLM").
     resolved_architecture: Option<String>,
 
+    /// Whether the engine is in pooling mode.
+    is_pooling: bool,
+
     // Timing instrumentation.
     step_count: usize,
     prefill_count: usize,
@@ -127,6 +133,7 @@ pub struct MlxWorker {
 impl MlxWorker {
     /// Create a new MlxWorker from the given config.
     pub fn new(config: MlxWorkerConfig) -> Self {
+        let is_pooling = config.is_pooling;
         Self {
             config,
             model: None,
@@ -145,6 +152,7 @@ impl MlxWorker {
             pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
             mm_data_map: HashMap::new(),
             preloaded_tokenizer: None,
+            is_pooling,
             resolved_architecture: None,
             step_count: 0,
             prefill_count: 0,
@@ -851,6 +859,90 @@ impl Worker for MlxWorker {
 
         if req_inputs.is_empty() {
             return Ok(ModelRunnerOutput::from_token_map(HashMap::new()));
+        }
+
+        // --- Pooling mode: run hidden_states + pool + normalize ---
+        if self.is_pooling {
+            use vllm_models::embedding::PoolingStrategy;
+            let strategy = self.pooling_strategy;
+
+            let mut pooler_map: HashMap<String, Vec<f32>> = HashMap::new();
+
+            for ri in &req_inputs {
+                let token_ids = match self.token_buffers.get(&ri.req_id) {
+                    Some(buf) => buf.as_slice(),
+                    None => continue,
+                };
+
+                let input_ids = Array::from_iter(
+                    token_ids.iter().map(|&t| t as i32),
+                    &[token_ids.len() as i32],
+                );
+                let positions = Array::from_iter(
+                    (0..token_ids.len() as i32).collect::<Vec<_>>(),
+                    &[token_ids.len() as i32],
+                );
+
+                let hidden = model
+                    .hidden_states(&input_ids, &positions)
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+                // Pool according to strategy.
+                let num_tokens = token_ids.len() as i32;
+                let pooled = match strategy {
+                    PoolingStrategy::Last => hidden.index(num_tokens - 1),
+                    PoolingStrategy::Cls => hidden.index(0),
+                    PoolingStrategy::Mean => {
+                        let sum = hidden
+                            .sum_axis(0, None)
+                            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                        sum.divide(Array::from(num_tokens as f32))
+                            .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?
+                    }
+                };
+
+                // L2 normalize.
+                let sq = pooled
+                    .square()
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                let sum = sq
+                    .sum(None)
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                let norm = sum
+                    .sqrt()
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                let normalized = pooled
+                    .divide(&norm)
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                let normalized_f32 = normalized
+                    .as_dtype(Dtype::Float32)
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+                normalized_f32
+                    .eval()
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                let vec: Vec<f32> = normalized_f32.as_slice().to_vec();
+
+                pooler_map.insert(ri.req_id.clone(), vec);
+            }
+
+            let req_ids: Vec<String> = pooler_map.keys().cloned().collect();
+            let req_id_to_index: HashMap<String, usize> = req_ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (id.clone(), i))
+                .collect();
+            let sampled_token_ids = vec![vec![]; req_ids.len()];
+
+            return Ok(ModelRunnerOutput {
+                req_ids,
+                req_id_to_index,
+                sampled_token_ids,
+                logprobs: None,
+                prompt_logprobs_dict: HashMap::new(),
+                draft_token_ids: None,
+                pooler_output: Some(pooler_map),
+            });
         }
 
         let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();

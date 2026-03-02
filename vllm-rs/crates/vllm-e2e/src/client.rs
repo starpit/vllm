@@ -138,6 +138,17 @@ impl Client {
         Ok(resp)
     }
 
+    /// POST /v1/completions — returns raw response for status code checking.
+    pub async fn completion_raw(&self, body: &serde_json::Value) -> Result<reqwest::Response> {
+        let resp = self
+            .inner
+            .post(format!("{}/v1/completions", self.base_url))
+            .json(body)
+            .send()
+            .await?;
+        Ok(resp)
+    }
+
     /// POST /v1/embeddings — compute embeddings.
     pub async fn embedding(
         &self,

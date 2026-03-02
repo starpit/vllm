@@ -65,7 +65,7 @@ pub enum WorkerRequest {
 #[derive(Debug)]
 pub enum WorkerResponse {
     /// Model execution completed.
-    ModelOutput(ExecutorResult<ModelRunnerOutput>),
+    ModelOutput(Box<ExecutorResult<ModelRunnerOutput>>),
     /// Cache initialization completed.
     CacheInitialized(ExecutorResult<()>),
     /// Available memory reported.
@@ -125,7 +125,7 @@ async fn worker_task(
     while let Some((request, response_tx)) = request_rx.recv().await {
         let response = match request {
             WorkerRequest::ExecuteModel(sched_output) => {
-                WorkerResponse::ModelOutput(worker.execute_model(&sched_output))
+                WorkerResponse::ModelOutput(Box::new(worker.execute_model(&sched_output)))
             }
             WorkerRequest::InitializeCache {
                 num_gpu_blocks,
@@ -316,7 +316,7 @@ impl Executor for MultiprocExecutor {
 
         match output_response {
             WorkerResponse::ModelOutput(result) => {
-                result.map_err(|e| vllm_engine::error::EngineError::Executor(e.to_string()))
+                (*result).map_err(|e| vllm_engine::error::EngineError::Executor(e.to_string()))
             }
             other => Err(vllm_engine::error::EngineError::Executor(format!(
                 "unexpected response: {other:?}"

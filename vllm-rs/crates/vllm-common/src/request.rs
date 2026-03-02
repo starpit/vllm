@@ -154,6 +154,10 @@ pub struct Request {
     /// Number of placeholder output tokens reserved for async scheduling.
     pub num_output_placeholders: u32,
 
+    /// Whether this is a pooling (embedding) request rather than generation.
+    /// Pooling requests are finished after one forward pass (no decode loop).
+    pub is_pooling: bool,
+
     /// Multimodal data (images) for vision-language models.
     /// Set once at request creation, consumed during the first prefill step.
     #[serde(skip)]
@@ -197,6 +201,7 @@ impl Request {
             num_preemptions: 0,
             num_external_computed_tokens: 0,
             num_output_placeholders: 0,
+            is_pooling: false,
             mm_data: None,
         }
     }

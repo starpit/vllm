@@ -86,6 +86,8 @@ impl Default for ServerConfig {
 pub struct AppState {
     pub engine: Arc<AsyncEngine>,
     pub config: ServerConfig,
+    /// Whether the server is in pooling mode.
+    pub is_pooling: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +554,7 @@ mod tests {
             use_spec_decode: false,
             ngram_proposer_config: None,
             eos_token_ids: vec![],
+            is_pooling: false,
         };
         let executor = Box::new(NoopExecutor::new(1024));
         let client = Box::new(InprocClient::new(engine_config, executor));
@@ -560,6 +563,7 @@ mod tests {
         Arc::new(AppState {
             engine,
             config: ServerConfig::default(),
+            is_pooling: false,
         })
     }
 
@@ -695,6 +699,7 @@ mod tests {
             use_spec_decode: false,
             ngram_proposer_config: None,
             eos_token_ids: vec![],
+            is_pooling: false,
         };
         let executor = Box::new(NoopExecutor::new(1024));
         let client = Box::new(InprocClient::new(engine_config, executor));
@@ -706,6 +711,7 @@ mod tests {
                 metrics_enabled: true,
                 ..ServerConfig::default()
             },
+            is_pooling: false,
         })
     }
 
@@ -872,6 +878,7 @@ mod tests {
             use_spec_decode: false,
             ngram_proposer_config: None,
             eos_token_ids: vec![],
+            is_pooling: false,
         };
         let executor = Box::new(NoopExecutor::new(1024));
         let client = Box::new(InprocClient::new(engine_config, executor));
@@ -887,6 +894,7 @@ mod tests {
                 ssl_ca_certs: ca_certs,
                 ..ServerConfig::default()
             },
+            is_pooling: false,
         })
     }
 
@@ -1019,5 +1027,135 @@ mod tests {
         assert!(config.ssl_keyfile.is_none());
         assert!(config.ssl_certfile.is_none());
         assert!(config.ssl_ca_certs.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // Pooling mode tests
+    // -------------------------------------------------------------------
+
+    fn make_pooling_test_state() -> Arc<AppState> {
+        let engine_config = EngineCoreConfig {
+            scheduler_config: SchedulerConfig {
+                max_num_batched_tokens: 8192,
+                max_num_seqs: 256,
+                max_num_scheduled_tokens: None,
+                policy: SchedulerPolicy::Fcfs,
+                enable_chunked_prefill: true,
+                long_prefill_token_threshold: 0,
+                ..Default::default()
+            },
+            max_model_len: 4096,
+            num_gpu_blocks: 1024,
+            block_size: 16,
+            engine_index: 0,
+            async_scheduling: false,
+            use_spec_decode: false,
+            ngram_proposer_config: None,
+            eos_token_ids: vec![],
+            is_pooling: true,
+        };
+        let executor = Box::new(NoopExecutor::new(1024));
+        let client = Box::new(InprocClient::new(engine_config, executor));
+        let mut engine = AsyncEngine::new(client, "test-model".to_string(), 4096);
+        engine.set_is_pooling(true);
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+
+        Arc::new(AppState {
+            engine,
+            config: ServerConfig::default(),
+            is_pooling: true,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_pooling_mode_rejects_chat_completions() {
+        let state = make_pooling_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "Chat completions should return 400 in pooling mode, got {}",
+            response.status()
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = parsed["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("pooling mode"),
+            "Error should mention pooling mode, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pooling_mode_rejects_completions() {
+        let state = make_pooling_test_state();
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "model": "test-model",
+            "prompt": "Hello"
+        });
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "Completions should return 400 in pooling mode, got {}",
+            response.status()
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = parsed["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("pooling mode"),
+            "Error should mention pooling mode, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pooling_mode_allows_health_and_models() {
+        let state = make_pooling_test_state();
+        let app = build_router(Arc::clone(&state));
+
+        // Health should still work.
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Models should still work.
+        let app2 = build_router(state);
+        let request = Request::builder()
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let response = app2.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

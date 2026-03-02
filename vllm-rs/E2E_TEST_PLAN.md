@@ -727,7 +727,8 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_batch -- --ignore
 | E15. Offline Batch LLM API | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
 | E16. Batch Processing | 6 (done) | SmolLM-135M-4bit | Every PR | <1 min |
 | E17. Multimodal VLM | 8 (done) | Gemma3-4B (MLX + Candle) | Nightly / Weekly | ~2 min |
-| **Total** | **~204** | | | **~33 min** |
+| E18. Pooling Mode | 9 (done) | SmolLM-135M-4bit | Every PR | <1 min |
+| **Total** | **~213** | | | **~34 min** |
 
 ### CI Tiers
 
@@ -824,6 +825,33 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_gemma3_vlm -- --i
 ```
 
 **Deliverables**: 8 E2E tests (all implemented and verified). Covers both MLX quantized and Candle BF16 paths. Candle tests verified 2026-03-02 (3/3 passed in 7.4s with --release).
+
+---
+
+## Phase E18: Pooling Execution Mode — DONE
+
+Test file: `e_pooling.rs`
+
+Tests the `--runner pooling` execution mode, where embedding requests flow through the scheduler (batched, lifecycle-managed) instead of the side-channel embed path. Generation endpoints are rejected with 400. Validates the full pipeline: HTTP → AsyncEngine (scheduler-routed) → EngineCore (pooling update_from_output) → Worker (hidden_states + pool + normalize) → HTTP response.
+
+| Test | Model | Description |
+|------|-------|-------------|
+| `test_pooling_server_starts` | SmolLM-135M-4bit | Server starts with `--runner pooling`, /health + /v1/models work |
+| `test_pooling_single_embedding` | SmolLM-135M-4bit | Single string → 1 embedding via scheduler path, correct usage |
+| `test_pooling_multiple_embeddings` | SmolLM-135M-4bit | 3 strings → 3 embeddings, same dimensions |
+| `test_pooling_embedding_normalized` | SmolLM-135M-4bit | Embedding L2 norm ≈ 1.0 |
+| `test_pooling_embedding_dimensions` | SmolLM-135M-4bit | `dimensions: 32` → truncated + re-normalized |
+| `test_pooling_different_inputs_differ` | SmolLM-135M-4bit | Different inputs → cosine similarity < 1.0 |
+| `test_pooling_rejects_chat_completions` | SmolLM-135M-4bit | `/v1/chat/completions` → 400 |
+| `test_pooling_rejects_completions` | SmolLM-135M-4bit | `/v1/completions` → 400 |
+| `test_pooling_mean_strategy` | SmolLM-135M-4bit | `--pooling-strategy mean` + `--runner pooling` → valid normalized embedding |
+
+Run command:
+```bash
+cargo test -p vllm-e2e --features e2e,metal --release --test e_pooling -- --ignored --test-threads=1
+```
+
+**Deliverables**: 9 E2E tests (all implemented and verified).
 
 ---
 

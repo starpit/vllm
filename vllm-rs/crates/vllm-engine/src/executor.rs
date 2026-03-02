@@ -62,6 +62,12 @@ pub struct ModelRunnerOutput {
     ///
     /// Maps request ID to draft token sequences.
     pub draft_token_ids: Option<HashMap<String, Vec<u32>>>,
+
+    /// Pooling output (embedding vectors) for requests in pooling mode.
+    ///
+    /// Maps request ID to the L2-normalized embedding vector.
+    /// `None` when the engine is not in pooling mode.
+    pub pooler_output: Option<HashMap<String, Vec<f32>>>,
 }
 
 impl ModelRunnerOutput {
@@ -74,6 +80,7 @@ impl ModelRunnerOutput {
             logprobs: None,
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
+            pooler_output: None,
         }
     }
 
@@ -115,6 +122,7 @@ impl ModelRunnerOutput {
             logprobs: None,
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
+            pooler_output: None,
         }
     }
 }
@@ -249,6 +257,7 @@ impl Executor for NoopExecutor {
             logprobs: None,
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
+            pooler_output: None,
         })
     }
 

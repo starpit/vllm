@@ -91,6 +91,9 @@ struct RequestState {
 
     /// Forced function name from `tool_choice: {function: {name}}` (for filtering).
     forced_function_name: Option<String>,
+
+    /// Pooling output (embedding vector), set when the engine is in pooling mode.
+    pooler_output: Option<Vec<f32>>,
 }
 
 /// A delta sent to a streaming response.
@@ -173,6 +176,8 @@ pub struct AsyncEngine {
     mm_tokens_per_image: usize,
     /// SigLIP image preprocessing size (pixels). 0 if not a VLM.
     mm_image_size: usize,
+    /// Whether the engine is in pooling mode (embedding requests go through scheduler).
+    is_pooling: bool,
 }
 
 impl AsyncEngine {
@@ -204,7 +209,18 @@ impl AsyncEngine {
             image_token_id: None,
             mm_tokens_per_image: 0,
             mm_image_size: 0,
+            is_pooling: false,
         }
+    }
+
+    /// Enable or disable pooling mode.
+    pub fn set_is_pooling(&mut self, enabled: bool) {
+        self.is_pooling = enabled;
+    }
+
+    /// Whether the engine is in pooling mode.
+    pub fn is_pooling(&self) -> bool {
+        self.is_pooling
     }
 
     /// Create a new `AsyncEngine` with a tokenizer for real text processing.
@@ -287,6 +303,11 @@ impl AsyncEngine {
         &self,
         request: protocol::ChatCompletionRequest,
     ) -> ServeResult<protocol::ChatCompletionResponse> {
+        if self.is_pooling {
+            return Err(ServeError::Validation(
+                "server is in pooling mode — chat completions are not supported".to_string(),
+            ));
+        }
         let base_id = request
             .request_id
             .clone()
@@ -611,6 +632,11 @@ impl AsyncEngine {
         &self,
         request: protocol::CompletionRequest,
     ) -> ServeResult<protocol::CompletionResponse> {
+        if self.is_pooling {
+            return Err(ServeError::Validation(
+                "server is in pooling mode — text completions are not supported".to_string(),
+            ));
+        }
         let base_id = request
             .request_id
             .clone()
@@ -668,6 +694,7 @@ impl AsyncEngine {
                     priority: request.priority,
                     cache_salt: request.cache_salt.clone(),
                     data_parallel_rank: None,
+                    is_pooling: false,
                     mm_data: None,
                 };
 
@@ -782,8 +809,8 @@ impl AsyncEngine {
 
     /// Process an embedding request.
     ///
-    /// Tokenizes the inputs, sends them to the step loop for embedding,
-    /// and builds the response.
+    /// In pooling mode, routes through the scheduler (batched, lifecycle-managed).
+    /// In default mode, uses the side-channel embed path (sequential).
     pub async fn embeddings(
         &self,
         request: protocol::EmbeddingRequest,
@@ -797,19 +824,68 @@ impl AsyncEngine {
         let token_id_seqs = self.tokenize_embedding_inputs(&request)?;
         let total_prompt_tokens: u32 = token_id_seqs.iter().map(|s| s.len() as u32).sum();
 
-        // Send to step loop via embed channel.
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.embed_tx
-            .send(EmbedRequest {
-                token_id_seqs,
-                reply: reply_tx,
-            })
-            .map_err(|_| ServeError::Internal("embed channel closed".into()))?;
+        let embeddings: Vec<Vec<f32>> = if self.is_pooling {
+            // Pooling mode: route each input through the scheduler as a pooling request.
+            let mut results = Vec::with_capacity(token_id_seqs.len());
+            for token_ids in &token_id_seqs {
+                let request_id = Uuid::new_v4().to_string();
+                let num_prompt_tokens = token_ids.len() as u32;
 
-        // Await result.
-        let embeddings = reply_rx
-            .await
-            .map_err(|_| ServeError::Internal("embed reply channel closed".into()))??;
+                let ec_request = EngineCoreRequest {
+                    request_id: request_id.clone(),
+                    prompt_token_ids: Some(token_ids.clone()),
+                    sampling_params: Some(SamplingParams {
+                        max_tokens: Some(1), // Will never be used — pooling finishes in one pass.
+                        ..Default::default()
+                    }),
+                    arrival_time: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs_f64(),
+                    client_index: 0,
+                    priority: 0,
+                    cache_salt: None,
+                    data_parallel_rank: None,
+                    is_pooling: true,
+                    mm_data: None,
+                };
+
+                self.submit_request(
+                    request_id.clone(),
+                    ec_request,
+                    num_prompt_tokens,
+                    None,
+                    None,
+                    0,
+                    None,
+                    None,
+                )
+                .await?;
+
+                // Wait for the request to complete.
+                let state = self.poll_until_done(&request_id).await?;
+
+                // Extract the embedding vector from the pooler output.
+                let emb = state.pooler_output.ok_or_else(|| {
+                    ServeError::Internal("pooling request completed without embedding".into())
+                })?;
+                results.push(emb);
+            }
+            results
+        } else {
+            // Default mode: send to step loop via embed channel (bypasses scheduler).
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            self.embed_tx
+                .send(EmbedRequest {
+                    token_id_seqs,
+                    reply: reply_tx,
+                })
+                .map_err(|_| ServeError::Internal("embed channel closed".into()))?;
+
+            reply_rx
+                .await
+                .map_err(|_| ServeError::Internal("embed reply channel closed".into()))??
+        };
 
         // Apply optional dimension truncation and re-normalize.
         let data: Vec<protocol::EmbeddingObject> = embeddings
@@ -1230,6 +1306,7 @@ impl AsyncEngine {
                     accumulated_text: String::new(),
                     tool_calls_emitted: false,
                     forced_function_name,
+                    pooler_output: None,
                 },
             );
         }
@@ -1328,6 +1405,11 @@ impl AsyncEngine {
         // Update cached tokens.
         if output.num_cached_tokens > 0 {
             req_state.num_cached_tokens = output.num_cached_tokens;
+        }
+
+        // Store pooler output (embedding vector) if present.
+        if output.pooler_output.is_some() {
+            req_state.pooler_output = output.pooler_output;
         }
 
         // Determine if the engine already terminated (stop token).
@@ -1646,6 +1728,7 @@ impl AsyncEngine {
             priority: request.priority,
             cache_salt: request.cache_salt.clone(),
             data_parallel_rank: None,
+            is_pooling: false,
             mm_data,
         })
     }
@@ -1726,6 +1809,7 @@ impl AsyncEngine {
             priority: request.priority,
             cache_salt: request.cache_salt.clone(),
             data_parallel_rank: None,
+            is_pooling: false,
             mm_data: None,
         })
     }
@@ -2233,6 +2317,7 @@ mod tests {
             accumulated_text: String::new(),
             tool_calls_emitted: false,
             forced_function_name: None,
+            pooler_output: None,
         }
     }
 
@@ -2255,6 +2340,7 @@ mod tests {
             use_spec_decode: false,
             ngram_proposer_config: None,
             eos_token_ids: vec![],
+            is_pooling: false,
         }
     }
 
@@ -2474,6 +2560,7 @@ mod tests {
             events: None,
             new_logprobs: None,
             new_prompt_logprobs: None,
+            pooler_output: None,
         };
         // Should not panic.
         AsyncEngine::process_output(&mut requests, output);
@@ -2496,6 +2583,7 @@ mod tests {
                 events: None,
                 new_logprobs: None,
                 new_prompt_logprobs: None,
+                pooler_output: None,
             },
         );
 
@@ -2511,6 +2599,7 @@ mod tests {
                 events: None,
                 new_logprobs: None,
                 new_prompt_logprobs: None,
+                pooler_output: None,
             },
         );
 
@@ -2539,6 +2628,7 @@ mod tests {
                 events: None,
                 new_logprobs: None,
                 new_prompt_logprobs: None,
+                pooler_output: None,
             },
         );
 
@@ -2559,6 +2649,7 @@ mod tests {
                 events: None,
                 new_logprobs: None,
                 new_prompt_logprobs: None,
+                pooler_output: None,
             },
         );
 
@@ -2603,6 +2694,7 @@ mod tests {
                 events: None,
                 new_logprobs: None,
                 new_prompt_logprobs: None,
+                pooler_output: None,
             },
         );
 
@@ -2876,6 +2968,7 @@ mod tests {
                 events: None,
                 new_logprobs: None,
                 new_prompt_logprobs: None,
+                pooler_output: None,
             },
         );
 
@@ -3045,5 +3138,101 @@ mod tests {
     fn test_get_tool_choice_function_name_missing_name() {
         let tc = serde_json::json!({"type": "function", "function": {}});
         assert_eq!(get_tool_choice_function_name(&Some(tc)), None);
+    }
+
+    // -------------------------------------------------------------------
+    // Pooling mode tests
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_pooling_mode_rejects_chat_completion() {
+        let mut engine = make_test_engine();
+        engine.set_is_pooling(true);
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+
+        let request: protocol::ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .unwrap();
+        let result = engine.chat_completion(request).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("pooling mode"),
+            "Error should mention pooling mode, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pooling_mode_rejects_completion() {
+        let mut engine = make_test_engine();
+        engine.set_is_pooling(true);
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+
+        let request: protocol::CompletionRequest =
+            serde_json::from_value(serde_json::json!({"prompt": "Hello"})).unwrap();
+        let result = engine.completion(request).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("pooling mode"),
+            "Error should mention pooling mode, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_process_output_stores_pooler_output() {
+        let mut requests = HashMap::new();
+        requests.insert("pool-1".to_string(), make_test_request_state(None));
+
+        let embedding = vec![0.1, 0.2, 0.3];
+        AsyncEngine::process_output(
+            &mut requests,
+            EngineCoreOutput {
+                request_id: "pool-1".to_string(),
+                new_token_ids: vec![],
+                finish_reason: Some(FinishReason::Stop),
+                stop_reason: None,
+                num_cached_tokens: 0,
+                events: None,
+                new_logprobs: None,
+                new_prompt_logprobs: None,
+                pooler_output: Some(embedding.clone()),
+            },
+        );
+
+        // Request should be removed (finished + no stream).
+        // Check that pooler_output was set before removal by using streaming.
+        let mut requests2 = HashMap::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        requests2.insert("pool-2".to_string(), make_test_request_state(Some(tx)));
+
+        AsyncEngine::process_output(
+            &mut requests2,
+            EngineCoreOutput {
+                request_id: "pool-2".to_string(),
+                new_token_ids: vec![],
+                finish_reason: None, // Not finished yet, so state stays.
+                stop_reason: None,
+                num_cached_tokens: 0,
+                events: None,
+                new_logprobs: None,
+                new_prompt_logprobs: None,
+                pooler_output: Some(embedding.clone()),
+            },
+        );
+
+        let state = requests2.get("pool-2").unwrap();
+        assert_eq!(state.pooler_output, Some(embedding));
+    }
+
+    #[test]
+    fn test_pooling_mode_flag() {
+        let mut engine = make_test_engine();
+        assert!(!engine.is_pooling());
+        engine.set_is_pooling(true);
+        assert!(engine.is_pooling());
     }
 }

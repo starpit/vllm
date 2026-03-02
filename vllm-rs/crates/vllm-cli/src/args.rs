@@ -146,6 +146,12 @@ pub struct ServeArgs {
     /// By default, async scheduling is enabled for better throughput.
     #[arg(long)]
     pub disable_async_scheduling: bool,
+
+    /// Runner type: "generate" (default) or "pooling".
+    /// In pooling mode, embedding requests go through the scheduler and
+    /// generation endpoints (chat, completions) are rejected.
+    #[arg(long, default_value = "generate")]
+    pub runner: String,
 }
 
 impl ServeArgs {
@@ -483,6 +489,30 @@ mod tests {
                 assert_eq!(args.dtype, "bf16");
             }
             _ => panic!("expected Convert command"),
+        }
+    }
+
+    // -- Runner flag tests --
+
+    #[test]
+    fn test_serve_runner_default_is_generate() {
+        let cli = Cli::parse_from(["vllm", "serve", "some-model"]);
+        match cli.command {
+            Commands::Serve(args) => {
+                assert_eq!(args.runner, "generate");
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_serve_runner_pooling() {
+        let cli = Cli::parse_from(["vllm", "serve", "some-model", "--runner", "pooling"]);
+        match cli.command {
+            Commands::Serve(args) => {
+                assert_eq!(args.runner, "pooling");
+            }
+            _ => panic!("expected Serve command"),
         }
     }
 }

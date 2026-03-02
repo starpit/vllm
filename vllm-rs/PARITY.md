@@ -6,16 +6,16 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 165 |
+| &#x1F535; | Fully implemented | 166 |
 | &#x1F7E1; | Partially implemented | 4 |
-| &#x1F534; | Not implemented | 102 |
+| &#x1F534; | Not implemented | 101 |
 
 ### Priority (for incomplete features)
 
 | Priority | Meaning | Count |
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
-| **P3** | High — meaningfully expands user base or enables key use cases | 18 |
+| **P3** | High — meaningfully expands user base or enables key use cases | 17 |
 | **P2** | Medium — useful improvement, broader coverage | 33 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
@@ -39,7 +39,7 @@
 |---|---:|---|---:|---:|---:|
 | [Model Architectures](#model-architectures) | 36 | `███░░░░░░░` 12/36 | 30 | 108 | 25 |
 | [Quantization](#quantization) | 11 | `██░░░░░░░░` 3/11 | 1 | 39 | 8 |
-| [Serving / OpenAI API](#serving--openai-api) | 24 | `███████░░░` 17/24 | 0 | 104 | 24 |
+| [Serving / OpenAI API](#serving--openai-api) | 24 | `███████░░░` 17/24 | 0 | 104 | 33 |
 | [Sampling & Decoding](#sampling--decoding) | 19 | `██████████` 19/19 | 0 | 53 | 13 |
 | [KV Cache & Attention](#kv-cache--attention) | 19 | `█████░░░░░` 9/19 | 0 | 96 | 0 |
 | [Scheduling](#scheduling) | 10 | `█████████░` 9/10 | 0 | 73 | 1 |
@@ -52,10 +52,10 @@
 | [Multimodal / Vision-Language](#multimodal--vision-language) | 10 | `██░░░░░░░░` 2/10 | 4 | 8 | 0 |
 | [Structured Output](#structured-output--guided-decoding) | 4 | `██████████` 4/4 | 0 | 12 | 0 |
 | [Tool Calling](#tool-calling--function-calling) | 7 | `██████████` 7/7 | 0 | 25 | 0 |
-| [Embeddings & Pooling](#embeddings--pooling) | 8 | `██████░░░░` 5/8 | 0 | 19 | 10 |
+| [Embeddings & Pooling](#embeddings--pooling) | 8 | `████████░░` 6/8 | 0 | 31 | 19 |
 | [Observability & Operations](#observability--operations) | 7 | `██████████` 7/7 | 1 | 15 | 0 |
 | [CLI & Deployment](#cli--deployment) | 17 | `██████████` 16/17 | 2 | 19 | 6 |
-| **Total** | **213** | `█████░░░░░` **123/213** | **35** | **669** | **80** |
+| **Total** | **213** | `█████░░░░░` **124/213** | **35** | **681** | **89** |
 
 ---
 
@@ -178,7 +178,7 @@
 | `n` parameter (multiple completions) | &#x1F535; | &#x1F535; | 4 | 2 | |
 | Multi-prompt completions | &#x1F535; | &#x1F535; | 2 | 0 | |
 | Chat templates (Jinja2) | &#x1F535; | &#x1F535; | 14 | 3 | |
-| `POST /v1/embeddings` | &#x1F535; | &#x1F535; | 19 | 10 | |
+| `POST /v1/embeddings` | &#x1F535; | &#x1F535; | 19 | 19 | |
 | `POST /v1/chat/completions` tool_calls | &#x1F535; | &#x1F535; | 3 | 0 | |
 | `response_format` (JSON mode/schema) | &#x1F535; | &#x1F535; | 6 | 0 | |
 | Anthropic Messages API | &#x1F535; | &#x1F534; | — | — | P2 |
@@ -476,7 +476,7 @@
 | Auto-detect pooling from `1_Pooling/config.json` | &#x1F535; | &#x1F535; | 5 | 0 | |
 | `--pooling-strategy` CLI flag (auto/last/cls/mean) | &#x1F535; | &#x1F535; | 1 | 3 | |
 | Matryoshka dimension truncation | &#x1F535; | &#x1F535; | 2 | 1 | |
-| Pooling execution mode (`--runner pooling`) | &#x1F535; | &#x1F534; | — | — | P3 |
+| Pooling execution mode (`--runner pooling`) | &#x1F535; | &#x1F535; | 12 | 9 | |
 | Encoder-only models (BERT, ModernBERT) | &#x1F535; | &#x1F534; | — | — | P2 |
 | Reward / reranking models | &#x1F535; | &#x1F534; | — | — | P1 |
 
@@ -485,7 +485,8 @@
 > - **Decoder-as-embedder works end-to-end:** `/v1/embeddings` runs a single `hidden_states()` forward pass (no KV cache, no decode loop), pools, L2-normalizes, and returns OpenAI-compatible responses. Tested with LLaMA, Qwen2, SmolLM on both Candle and MLX backends.
 > - **Three pooling strategies:** `Last` (default for decoder models like e5-mistral, gte-Qwen2), `Cls` (first token, for encoder models), `Mean` (average all tokens, most common for BERT-family). Strategy is resolved at model-load time: explicit `--pooling-strategy` > auto-detect from `1_Pooling/config.json` > default to `Last`.
 > - **Auto-detection:** sentence-transformers models publish `1_Pooling/config.json` with boolean fields (`pooling_mode_mean_tokens`, `pooling_mode_cls_token`, `pooling_mode_lasttoken`). Both Candle and MLX workers download this file from HF Hub and detect the strategy automatically.
-> - **Remaining gaps are structural, not incremental:** `--runner pooling` requires a dedicated execution mode where the scheduler knows the model is embedding-only (reject generation requests, different init path). Encoder-only models (BERT, NomicBERT, ModernBERT) need bidirectional attention (remove causal mask) — a fundamentally different attention mode from the current decoder-only pipeline.
+> - **`--runner pooling` is fully implemented:** Embedding requests flow through the scheduler like generation requests. The worker calls `hidden_states()` + pool + normalize (no decode loop). Requests finish after one forward pass. Generation endpoints (`/v1/chat/completions`, `/v1/completions`) return 400 in pooling mode. 12 unit tests + 9 E2E tests (SmolLM-135M on MLX).
+> - **Remaining gap is encoder-only models:** BERT, NomicBERT, ModernBERT need bidirectional attention (remove causal mask) — a fundamentally different attention mode from the current decoder-only pipeline.
 
 ---
 
@@ -524,6 +525,7 @@
 | `--gguf-file` | &#x1F535; | &#x1F535; | 0 | 0 | |
 | `--tool-call-parser` | &#x1F535; | &#x1F535; | 0 | 0 | |
 | `--speculative-model ngram` | &#x1F535; | &#x1F535; | 0 | 0 | |
+| `--runner [generate\|pooling]` | &#x1F535; | &#x1F535; | 2 | 0 | |
 | `--features metal` (MLX backend) | N/A | &#x1F535; | 0 | 0 | |
 | Dockerfile.cpu | &#x1F535; | &#x1F535; | 0 | 0 | |
 | Dockerfile.cuda | &#x1F535; | &#x1F535; | 0 | 0 | |

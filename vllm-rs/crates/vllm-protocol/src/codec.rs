@@ -160,6 +160,7 @@ mod tests {
             priority: 0,
             cache_salt: None,
             data_parallel_rank: None,
+            is_pooling: false,
             mm_data: None,
         };
 
@@ -189,6 +190,7 @@ mod tests {
             ]),
             new_logprobs: None,
             new_prompt_logprobs: None,
+            pooler_output: None,
         };
 
         let encoded = encode(&out).unwrap();
@@ -216,6 +218,7 @@ mod tests {
                     events: None,
                     new_logprobs: None,
                     new_prompt_logprobs: None,
+                    pooler_output: None,
                 },
                 EngineCoreOutput {
                     request_id: "b".into(),
@@ -226,6 +229,7 @@ mod tests {
                     events: None,
                     new_logprobs: None,
                     new_prompt_logprobs: None,
+                    pooler_output: None,
                 },
             ],
             timestamp: 1234.5,
@@ -253,6 +257,7 @@ mod tests {
             events: None,
             new_logprobs: None,
             new_prompt_logprobs: None,
+            pooler_output: None,
         };
 
         let encoded = encode(&out).unwrap();
@@ -285,6 +290,7 @@ mod tests {
             priority: 0,
             cache_salt: None,
             data_parallel_rank: None,
+            is_pooling: false,
             mm_data: None,
         };
 
@@ -312,6 +318,7 @@ mod tests {
             priority: 0,
             cache_salt: None,
             data_parallel_rank: None,
+            is_pooling: false,
             mm_data: None,
         };
 

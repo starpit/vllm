@@ -347,6 +347,7 @@ mod tests {
             use_spec_decode: false,
             ngram_proposer_config: None,
             eos_token_ids: vec![],
+            is_pooling: false,
         };
 
         let mut engine = EngineCore::new(config, Box::new(exec));

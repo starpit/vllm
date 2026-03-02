@@ -60,6 +60,9 @@ pub struct CandleWorkerConfig {
     /// Pooling strategy for embeddings: "auto", "last", "cls", "mean".
     /// "auto" detects from `1_Pooling/config.json`, defaults to "last".
     pub pooling_strategy: String,
+    /// Whether the engine is in pooling mode.
+    /// In pooling mode, `execute_model` returns embedding vectors instead of sampled tokens.
+    pub is_pooling: bool,
 }
 
 impl CandleWorkerConfig {
@@ -125,6 +128,8 @@ pub struct CandleWorker {
     pooling_strategy: vllm_models::embedding::PoolingStrategy,
     /// Per-request multimodal data, consumed on first forward (prefill).
     mm_data_map: HashMap<String, vllm_common::MultimodalData>,
+    /// Whether the engine is in pooling mode.
+    is_pooling: bool,
     /// Resolved model architecture name (e.g. "LlamaForCausalLM").
     resolved_architecture: Option<String>,
 }
@@ -132,6 +137,7 @@ pub struct CandleWorker {
 impl CandleWorker {
     /// Create a new CandleWorker from the given config.
     pub fn new(config: CandleWorkerConfig) -> Self {
+        let is_pooling = config.is_pooling;
         Self {
             config,
             device: None,
@@ -156,6 +162,7 @@ impl CandleWorker {
             grammar_vocabulary: None,
             pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
             mm_data_map: HashMap::new(),
+            is_pooling,
             resolved_architecture: None,
         }
     }
@@ -1223,6 +1230,61 @@ impl Worker for CandleWorker {
             }
         }
 
+        // --- Pooling mode: run hidden_states + pool + normalize ---
+        if self.is_pooling {
+            use vllm_models::embedding::{l2_normalize, pool};
+            let strategy = self.pooling_strategy;
+
+            let mut pooler_map: HashMap<String, Vec<f32>> = HashMap::new();
+
+            for req_id in scheduler_output.num_scheduled_tokens.keys() {
+                let token_ids = match self.token_buffers.get(req_id) {
+                    Some(buf) => buf.as_slice(),
+                    None => continue,
+                };
+
+                let input_ids = Tensor::new(token_ids, device)
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+                let positions: Vec<u32> = (0..token_ids.len() as u32).collect();
+                let positions_t = Tensor::new(positions.as_slice(), device)
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+                let hidden = model
+                    .hidden_states(&input_ids, &positions_t)
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+                let pooled = pool(&hidden, strategy)
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+                let normalized = l2_normalize(&pooled)
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+                let vec: Vec<f32> = normalized
+                    .to_vec1()
+                    .map_err(|e| ExecutorError::WorkerExecution(e.to_string()))?;
+
+                pooler_map.insert(req_id.clone(), vec);
+            }
+
+            let req_ids: Vec<String> = pooler_map.keys().cloned().collect();
+            let req_id_to_index: HashMap<String, usize> = req_ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (id.clone(), i))
+                .collect();
+            let sampled_token_ids = vec![vec![]; req_ids.len()];
+
+            return Ok(ModelRunnerOutput {
+                req_ids,
+                req_id_to_index,
+                sampled_token_ids,
+                logprobs: None,
+                prompt_logprobs_dict: HashMap::new(),
+                draft_token_ids: None,
+                pooler_output: Some(pooler_map),
+            });
+        }
+
         // --- Build model inputs ---
         // For paged mode: use InputBatch to produce flat tensors + metadata.
         // For legacy mode: build per-request inputs from token_buffers.
@@ -1805,6 +1867,7 @@ mod tests {
             gguf_file: None,
             lora_adapter: None,
             pooling_strategy: "auto".to_string(),
+            is_pooling: false,
         }
     }
 

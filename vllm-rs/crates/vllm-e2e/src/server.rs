@@ -37,6 +37,7 @@ impl TestServer {
             lora_adapter: None,
             pooling_strategy: None,
             disable_async_scheduling: false,
+            runner: "generate".to_string(),
         }
     }
 
@@ -67,6 +68,7 @@ pub struct TestServerBuilder {
     lora_adapter: Option<String>,
     pooling_strategy: Option<String>,
     disable_async_scheduling: bool,
+    runner: String,
 }
 
 impl TestServerBuilder {
@@ -112,6 +114,14 @@ impl TestServerBuilder {
         self
     }
 
+    /// Set the runner type: "generate" (default) or "pooling".
+    /// In pooling mode, embedding requests go through the scheduler and
+    /// generation endpoints are rejected.
+    pub fn with_runner(mut self, runner: &str) -> Self {
+        self.runner = runner.to_string();
+        self
+    }
+
     /// Start the server in-process and wait for it to become healthy.
     pub async fn start(self) -> Result<TestServer> {
         // Initialize tracing. Silent by default; set RUST_LOG=info to see
@@ -132,6 +142,7 @@ impl TestServerBuilder {
             .pooling_strategy
             .clone()
             .unwrap_or_else(|| "auto".to_string());
+        let runner = self.runner.clone();
         let config = vllm_serve::init::VllmConfig {
             model: model.clone(),
             device: "auto".to_string(),
@@ -142,6 +153,7 @@ impl TestServerBuilder {
             lora_adapter: self.lora_adapter.clone(),
             pooling_strategy,
             disable_async_scheduling: self.disable_async_scheduling,
+            runner: runner.clone(),
             ..Default::default()
         };
 
@@ -177,9 +189,11 @@ impl TestServerBuilder {
             startup_instant: None,
         };
 
+        let is_pooling = runner == "pooling";
         let app_state = Arc::new(vllm_serve::server::AppState {
             engine: stack.engine,
             config: server_config,
+            is_pooling,
         });
 
         // Spawn the HTTP server on a background task.

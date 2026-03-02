@@ -96,6 +96,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         lora_adapter: args.lora_adapter.clone(),
         pooling_strategy: args.pooling_strategy.clone(),
         disable_async_scheduling: args.disable_async_scheduling,
+        runner: args.runner.clone(),
     };
 
     let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&config))
@@ -129,9 +130,11 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         startup_instant: Some(startup_start),
     };
 
+    let is_pooling = args.runner == "pooling";
     let app_state = Arc::new(AppState {
         engine: stack.engine,
         config: server_config,
+        is_pooling,
     });
     vllm_serve::server::serve(app_state)
         .await

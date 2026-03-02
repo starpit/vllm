@@ -76,6 +76,9 @@ pub struct EngineCore {
 
     /// EOS token IDs for stop criteria (primary + additional from config).
     eos_token_ids: Vec<u32>,
+
+    /// Whether the engine is in pooling mode (embedding-only).
+    is_pooling: bool,
 }
 
 /// Configuration for creating an EngineCore.
@@ -101,6 +104,9 @@ pub struct EngineCoreConfig {
     /// Supports models with multiple EOS tokens (e.g. LLaMA 3:
     /// `<|end_of_text|>`, `<|eom_id|>`, `<|eot_id|>`).
     pub eos_token_ids: Vec<u32>,
+    /// Whether the engine is in pooling mode (embedding-only).
+    /// In pooling mode, requests are finished after one forward pass.
+    pub is_pooling: bool,
 }
 
 /// Output from a single engine step, grouped by client index.
@@ -125,12 +131,13 @@ impl EngineCore {
         });
 
         info!(
-            "EngineCore initialized: max_model_len={}, num_gpu_blocks={}, block_size={}, eos_token_ids={:?}, spec_decode={}",
+            "EngineCore initialized: max_model_len={}, num_gpu_blocks={}, block_size={}, eos_token_ids={:?}, spec_decode={}, pooling={}",
             config.max_model_len,
             config.num_gpu_blocks,
             config.block_size,
             config.eos_token_ids,
-            ngram_proposer.is_some()
+            ngram_proposer.is_some(),
+            config.is_pooling,
         );
 
         Self {
@@ -143,6 +150,7 @@ impl EngineCore {
             async_scheduling: config.async_scheduling,
             ngram_proposer,
             eos_token_ids: config.eos_token_ids,
+            is_pooling: config.is_pooling,
         }
     }
 
@@ -385,6 +393,48 @@ impl EngineCore {
 
         // Process each request that was scheduled.
         for req_id in scheduler_output.num_scheduled_tokens.keys() {
+            // Check if this is a pooling request.
+            let is_pooling_request = self.is_pooling
+                && self
+                    .scheduler
+                    .get_request(req_id)
+                    .is_some_and(|r| r.is_pooling);
+
+            if is_pooling_request {
+                // Pooling request: extract embedding vector, finish immediately.
+                let pooler_vec = model_output
+                    .pooler_output
+                    .as_ref()
+                    .and_then(|m| m.get(req_id))
+                    .cloned();
+
+                finished_ids.push((req_id.clone(), RequestStatus::FinishedStopped));
+
+                let output = EngineCoreOutput {
+                    request_id: req_id.clone(),
+                    new_token_ids: Vec::new(),
+                    finish_reason: Some(FinishReason::Stop),
+                    stop_reason: None,
+                    num_cached_tokens: 0,
+                    events: None,
+                    new_logprobs: None,
+                    new_prompt_logprobs: None,
+                    pooler_output: pooler_vec,
+                };
+
+                let engine_outputs = client_outputs
+                    .entry(0)
+                    .or_insert_with(|| EngineCoreOutputs {
+                        engine_index: self.engine_index,
+                        outputs: Vec::new(),
+                        timestamp,
+                        scheduler_stats: None,
+                    });
+                engine_outputs.outputs.push(output);
+                continue;
+            }
+
+            // Generation request: normal token-based processing.
             let new_token_ids_slice: &[u32] = model_output.get_tokens(req_id).unwrap_or_default();
 
             // Append new tokens to the request's state in the scheduler.
@@ -445,6 +495,7 @@ impl EngineCore {
                 events: None,
                 new_logprobs,
                 new_prompt_logprobs,
+                pooler_output: None,
             };
 
             // Route to client_index 0 (default for single-client mode).
@@ -487,6 +538,7 @@ impl EngineCore {
                         events: None,
                         new_logprobs: None,
                         new_prompt_logprobs: None,
+                        pooler_output: None,
                     });
                 }
             }
@@ -680,6 +732,7 @@ mod tests {
             use_spec_decode: false,
             ngram_proposer_config: None,
             eos_token_ids: vec![],
+            is_pooling: false,
         }
     }
 
@@ -1101,6 +1154,7 @@ mod tests {
             logprobs: None,
             prompt_logprobs_dict,
             draft_token_ids: None,
+            pooler_output: None,
         };
 
         // Set up engine.
@@ -1159,6 +1213,7 @@ mod tests {
                 min_ngram_size: 1,
             }),
             eos_token_ids: vec![],
+            is_pooling: false,
         }
     }
 
@@ -1332,5 +1387,139 @@ mod tests {
         // Shutdown should not panic even with executor taken.
         engine.shutdown();
         assert!(engine.is_shutdown());
+    }
+
+    // -------------------------------------------------------------------
+    // Pooling mode tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_pooling_request_finishes_with_embedding() {
+        // In pooling mode, a request with is_pooling=true should:
+        // 1. Finish after one step (FinishReason::Stop)
+        // 2. Have pooler_output populated with the embedding vector
+        // 3. Have no generated tokens
+        let mut config = make_test_config();
+        config.is_pooling = true;
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        // Create a pooling request.
+        let params = SamplingParams {
+            max_tokens: Some(1),
+            ..Default::default()
+        };
+        let mut req = Request::new("pool-1".to_string(), vec![1, 2, 3], params, 0.0, 0, 0, None);
+        req.is_pooling = true;
+        engine.add_request(req);
+
+        // Schedule it.
+        let scheduler_output = engine.scheduler.schedule();
+
+        // Simulate a model output with pooler_output.
+        let embedding = vec![0.1, 0.2, 0.3, 0.4];
+        let mut pooler_output = HashMap::new();
+        pooler_output.insert("pool-1".to_string(), embedding.clone());
+
+        let model_output = ModelRunnerOutput {
+            req_ids: vec!["pool-1".to_string()],
+            req_id_to_index: [("pool-1".to_string(), 0)].into_iter().collect(),
+            sampled_token_ids: vec![vec![]], // No tokens for pooling.
+            logprobs: None,
+            prompt_logprobs_dict: HashMap::new(),
+            draft_token_ids: None,
+            pooler_output: Some(pooler_output),
+        };
+
+        let outputs = engine.update_from_output(&scheduler_output, &model_output);
+
+        // Check the output.
+        let client_out = outputs.get(&0).unwrap();
+        let req_out = client_out
+            .outputs
+            .iter()
+            .find(|o| o.request_id == "pool-1")
+            .unwrap();
+
+        // Should be finished immediately.
+        assert_eq!(req_out.finish_reason, Some(FinishReason::Stop));
+        // Should have no generated tokens.
+        assert!(req_out.new_token_ids.is_empty());
+        // Should have the embedding vector.
+        assert_eq!(req_out.pooler_output, Some(embedding));
+    }
+
+    #[test]
+    fn test_pooling_request_finishes_even_without_pooler_data() {
+        // A pooling request should still finish (with None pooler_output)
+        // even if the model output has no pooler data for it.
+        let mut config = make_test_config();
+        config.is_pooling = true;
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        let params = SamplingParams {
+            max_tokens: Some(1),
+            ..Default::default()
+        };
+        let mut req = Request::new("pool-2".to_string(), vec![1, 2], params, 0.0, 0, 0, None);
+        req.is_pooling = true;
+        engine.add_request(req);
+
+        let scheduler_output = engine.scheduler.schedule();
+
+        // Model output with empty pooler_output map.
+        let model_output = ModelRunnerOutput {
+            req_ids: vec!["pool-2".to_string()],
+            req_id_to_index: [("pool-2".to_string(), 0)].into_iter().collect(),
+            sampled_token_ids: vec![vec![]],
+            logprobs: None,
+            prompt_logprobs_dict: HashMap::new(),
+            draft_token_ids: None,
+            pooler_output: Some(HashMap::new()),
+        };
+
+        let outputs = engine.update_from_output(&scheduler_output, &model_output);
+        let client_out = outputs.get(&0).unwrap();
+        let req_out = client_out
+            .outputs
+            .iter()
+            .find(|o| o.request_id == "pool-2")
+            .unwrap();
+
+        // Should still finish.
+        assert_eq!(req_out.finish_reason, Some(FinishReason::Stop));
+        // Pooler output is None (not found in the map).
+        assert!(req_out.pooler_output.is_none());
+    }
+
+    #[test]
+    fn test_non_pooling_request_unaffected_in_pooling_engine() {
+        // A non-pooling request (is_pooling=false) in a pooling engine
+        // should go through the normal generation path.
+        let mut config = make_test_config();
+        config.is_pooling = true;
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        // Regular generation request (is_pooling defaults to false).
+        let req = make_request("gen-1", 5);
+        engine.add_request(req);
+
+        // Step — NoopExecutor generates a token.
+        let (outputs, model_executed) = engine.step().unwrap();
+        assert!(model_executed);
+
+        let client_out = outputs.get(&0).unwrap();
+        let req_out = client_out
+            .outputs
+            .iter()
+            .find(|o| o.request_id == "gen-1")
+            .unwrap();
+
+        // Should have generated tokens (not pooling path).
+        assert!(!req_out.new_token_ids.is_empty());
+        // No pooler output.
+        assert!(req_out.pooler_output.is_none());
     }
 }

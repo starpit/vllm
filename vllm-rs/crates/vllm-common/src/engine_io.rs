@@ -131,6 +131,11 @@ pub struct EngineCoreRequest {
     /// In data-parallel mode, the rank this request should be sent to.
     pub data_parallel_rank: Option<u32>,
 
+    /// Whether this is a pooling (embedding) request rather than generation.
+    /// Pooling requests are finished after one forward pass (no decode loop).
+    #[serde(default)]
+    pub is_pooling: bool,
+
     /// Multimodal data (images) for vision-language models.
     /// Only present for requests with image content. Skipped during
     /// serialization since images are passed in-process only.
@@ -180,6 +185,12 @@ pub struct EngineCoreOutput {
     /// Skipped during serialization (only used in-process).
     #[serde(skip)]
     pub new_prompt_logprobs: Option<Vec<Option<LogprobsOutput>>>,
+
+    /// Pooling output (embedding vector) for this request.
+    /// Only populated when the engine is in pooling mode.
+    /// Skipped during serialization (only used in-process).
+    #[serde(skip)]
+    pub pooler_output: Option<Vec<f32>>,
 }
 
 impl EngineCoreOutput {
@@ -342,6 +353,7 @@ mod tests {
             priority: 0,
             cache_salt: None,
             data_parallel_rank: None,
+            is_pooling: false,
             mm_data: None,
         };
         assert_eq!(req.request_id, "req-1");
@@ -363,6 +375,7 @@ mod tests {
             priority: 5,
             cache_salt: Some("salt-abc".into()),
             data_parallel_rank: Some(1),
+            is_pooling: false,
             mm_data: None,
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -387,6 +400,7 @@ mod tests {
             events: None,
             new_logprobs: None,
             new_prompt_logprobs: None,
+            pooler_output: None,
         };
         assert!(!out.finished());
     }
@@ -405,6 +419,7 @@ mod tests {
             ]),
             new_logprobs: None,
             new_prompt_logprobs: None,
+            pooler_output: None,
         };
         assert!(out.finished());
         assert_eq!(out.finish_reason, Some(FinishReason::Stop));
@@ -422,6 +437,7 @@ mod tests {
             events: None,
             new_logprobs: None,
             new_prompt_logprobs: None,
+            pooler_output: None,
         };
         let json = serde_json::to_string(&out).unwrap();
         let out2: EngineCoreOutput = serde_json::from_str(&json).unwrap();
@@ -456,6 +472,7 @@ mod tests {
                     events: None,
                     new_logprobs: None,
                     new_prompt_logprobs: None,
+                    pooler_output: None,
                 },
                 EngineCoreOutput {
                     request_id: "b".into(),
@@ -466,6 +483,7 @@ mod tests {
                     events: None,
                     new_logprobs: None,
                     new_prompt_logprobs: None,
+                    pooler_output: None,
                 },
             ],
             timestamp: 1234.5,
@@ -511,6 +529,7 @@ mod tests {
                 events: Some(vec![EngineCoreEvent::new(EngineCoreEventType::Queued, 0.5)]),
                 new_logprobs: None,
                 new_prompt_logprobs: None,
+                pooler_output: None,
             }],
             timestamp: 42.0,
             scheduler_stats: None,

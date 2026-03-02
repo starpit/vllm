@@ -144,6 +144,7 @@ impl InprocClient {
             ec_request.priority,
             ec_request.cache_salt,
         );
+        request.is_pooling = ec_request.is_pooling;
         request.mm_data = ec_request.mm_data;
 
         self.engine.add_request(request);
@@ -256,6 +257,7 @@ mod tests {
             use_spec_decode: false,
             ngram_proposer_config: None,
             eos_token_ids: vec![],
+            is_pooling: false,
         }
     }
 
@@ -272,6 +274,7 @@ mod tests {
             priority: 0,
             cache_salt: None,
             data_parallel_rank: None,
+            is_pooling: false,
             mm_data: None,
         }
     }

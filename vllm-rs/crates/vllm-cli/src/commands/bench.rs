@@ -77,6 +77,7 @@ fn create_bench_worker(args: &BenchArgs, model: String) -> Result<Box<dyn Worker
         gguf_file: args.gguf_file.clone(),
         lora_adapter: None,
         pooling_strategy: "auto".to_string(),
+        is_pooling: false,
     };
     let mut worker = CandleWorker::new(config);
     worker.init_device()?;

@@ -248,13 +248,13 @@
 | KV cache offloading (CPU ↔ GPU) | &#x1F535; | &#x1F534; | — | — | P3 |
 | KV cache transfer (distributed) | &#x1F535; | &#x1F534; | — | — | P1 |
 | Multi-group KV cache (hybrid models) | &#x1F535; | &#x1F534; | — | — | P1 |
-| FlashAttention v2 | &#x1F535; | &#x1F535; | 9 | 0 | |
+| FlashAttention v2 (single-seq + batched varlen) | &#x1F535; | &#x1F535; | 15 | 0 | |
 | FlashInfer | &#x1F535; | &#x1F534; | — | — | P2 |
 | FlexAttention | &#x1F535; | &#x1F534; | — | — | P1 |
 | xFormers | &#x1F535; | &#x1F534; | — | — | P0 |
 | MLA (Multi-head Latent Attention) | &#x1F535; | &#x1F535; | 4 | 0 | |
 | Sliding window attention | &#x1F535; | &#x1F535; | 13 | 0 | |
-| Batched attention metadata (cu_seqlens, slot_mapping, block_table) | &#x1F535; | &#x1F7E1; | 3 | 0 | P3 |
+| Batched attention metadata (cu_seqlens, slot_mapping, block_table) | &#x1F535; | &#x1F535; | 9 | 0 | |
 | Tree attention | &#x1F535; | &#x1F534; | — | — | P1 |
 
 > Unit counts: `block_pool.rs` (19), `free_block_queue.rs` (16), `kv_cache_manager.rs` (13), `kv_cache_block.rs` (11), `kv_block_pool.rs` (13), `attention.rs` (34 — 25 SDPA/paged + 9 FlashAttention v2), MLX `cache.rs` (1). FlashAttention v2 tests: decode BF16/F16, prefill BF16/F16, GQA BF16 decode/prefill, head_dim=128, sliding window, attention_with_cache dispatch — all compare FA2 CUDA output against CPU SDPA reference. Sliding window: 7 attention.rs + 2 gemma2.rs interleaved + 2 qwen2.rs max_window_layers + 1 MLX phi3 trim + 1 array-format parsing = 13. Per-row counts reflect the primary feature each test targets; some tests cross-cut multiple rows. Total section: 112 unit tests.
@@ -337,7 +337,7 @@
 | Feature | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
 | CUDA graphs | &#x1F535; | &#x1F534; | — | — | P3 |
-| FlashAttention v2 kernels | &#x1F535; | &#x1F535; | 9 | 0 | |
+| FlashAttention v2 kernels (single-seq + batched varlen) | &#x1F535; | &#x1F535; | 15 | 0 | |
 | FlashInfer kernels | &#x1F535; | &#x1F534; | — | — | P2 |
 | xFormers memory-efficient attention | &#x1F535; | &#x1F534; | — | — | P1 |
 | Fused SiLU-and-mul kernel | &#x1F535; | &#x1F535; | 7 | 0 | |
@@ -590,7 +590,7 @@ cargo build -p vllm-cli --no-default-features --features metal
 |---|---|---|
 | Model architectures | ~248 | 12 candle + 11 MLX (+ quantized variants) |
 | Quantization methods | ~14 | 6 (GGUF + MLX native 4-bit + GPTQ INT4 + AWQ INT4 + BnB NF4 + BnB INT8) |
-| Attention backends | ~15 | 2 (custom SDPA + FlashAttention v2) |
+| Attention backends | ~15 | 2 (custom SDPA + FlashAttention v2 single-seq/varlen) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
 | Unit tests | ~948 test files | 905 passing (844 non-MLX + 61 MLX) |

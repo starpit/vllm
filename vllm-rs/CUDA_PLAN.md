@@ -3,12 +3,13 @@
 > Generated 2026-03-01 | Baseline: `feat/rust` branch (889 tests, 0 clippy errors)
 > Goal: feature-for-feature CUDA parity with Python vLLM's V1 engine on NVIDIA GPUs
 >
-> **Progress (2026-03-02)**: Phases 0, 1, 2.1, 3 DONE on `worktree-cuda` branch.
+> **Progress (2026-03-02)**: Phases 0, 1, 2.1, 2.3, 3 DONE on `worktree-cuda` branch.
 > E2E verified on L40S (48GB Ada): Qwen2.5-0.5B BF16.
 > 6 fused CUDA kernels, all with vectorized 128-bit loads (vec_utils.cuh).
 > FlashAttention v2 integrated via `candle-flash-attn` crate — auto-dispatches on CUDA F16/BF16.
-> 33 CUDA kernel unit tests + 9 FlashAttention tests + 5 CUDA E2E tests.
-> Next: CUDA pod verification, then Phase 4 (CUDA Graphs) or Phase 2b (batched FA2).
+> Batched FA2 via `flash_attn_varlen` — single kernel for entire batch in `forward_batch()`.
+> 33 CUDA kernel unit tests + 9 single-seq FA2 tests + 6 batched FA2 tests + 5 CUDA E2E tests.
+> Next: CUDA pod verification of batched FA2, then Phase 7.1 (Fused MoE) or Phase 5 (Multi-GPU).
 
 ---
 
@@ -24,10 +25,11 @@ The Rust port has **working CUDA inference** with custom fused kernels (Phases 0
 - **E2E verified** — Qwen2.5-0.5B BF16 on L40S (48GB Ada), correct completions + chat. TTFT ~650ms, ITL ~142ms.
 
 - **FlashAttention v2** — via `candle-flash-attn` crate, auto-dispatches on CUDA F16/BF16. Replaces naive O(n²) SDPA with tiled IO-aware algorithm — O(1) extra memory, ~10x faster on long sequences.
+- **Batched FA2** — `flash_attn_varlen` replaces per-request FA2 loop in `forward_batch()`. Single kernel launch for the entire batch, with ragged Q/KV lengths handled via cu_seqlens. Supports mixed prefill+decode, GQA, sliding window.
 
 **What's NOT yet done** (biggest remaining gaps vs Python vLLM):
 
-- **Batched FlashAttention** (Phase 2b) — FA2 dispatches per-request; batched `flash_attn_varlen()` across all requests in a batch would improve throughput further.
+- ~~**Batched FlashAttention** (Phase 2b)~~ ✅ — `batched_flash_attention_with_cache()` replaces per-request loop with single `flash_attn_varlen` call in `forward_batch()`.
 - **CUDA Graphs** (Phase 4) — no graph capture for decode phase. Kernel launch overhead dominates single-token decode steps.
 - **Multi-GPU / NCCL** (Phase 5) — single-GPU only.
 - **Quantization kernels** (Phase 6) — no GPTQ/AWQ/FP8 CUDA compute. GGUF models fall back to CPU via candle's QMatMul.
@@ -44,8 +46,8 @@ The recommended priority order for remaining phases:
 ### 1. Phase 2 CUDA pod verification
 FlashAttention v2 is integrated (Phase 2.1 ✅) but needs pod testing. Build + clippy + unit tests + E2E on L40S to verify correctness and measure ITL improvement over naive SDPA.
 
-### 2. Phase 4: CUDA Graphs (decode acceleration)
-With FlashAttention done, decode-phase kernel launch overhead becomes the next bottleneck. CUDA graphs capture the entire decode forward pass as a single GPU-side graph, eliminating ~100 individual kernel launches per step. Python vLLM gets ~30-50% decode ITL improvement from this.
+### 2. Phase 2b: Batched FlashAttention (throughput)
+Replace per-request `flash_attn` calls with single `flash_attn_varlen` across the batch. Directly reduces N attention kernel launches to 1. High ROI — same overhead reduction as CUDA Graphs but targeted at the most expensive operation.
 
 ### 3. Phase 7.1: Fused MoE Kernels (MoE model perf)
 Critical for DeepSeek V2/V3, Qwen3-MoE, and Mixtral performance on CUDA. Current per-expert loop is extremely slow on GPU. Fused top-k gating + expert GEMM is a well-known optimization. Can be done independently of Phases 2/4.
@@ -55,6 +57,9 @@ Enables models >13B that don't fit on a single GPU. Important for production use
 
 ### 5. Phase 6: Quantization Kernels (GPTQ/AWQ/FP8)
 Enables quantized model inference on CUDA. Most production deployments use 4-bit or 8-bit models. Currently GGUF falls back to CPU; GPTQ/AWQ don't work at all. Large effort but high production value.
+
+### 6. Phase 4: CUDA Graphs (decode polish)
+Deprioritized. Rust's AOT compilation already eliminates ~70% of the overhead CUDA Graphs target in Python. See Phase 4 section for detailed analysis.
 
 ---
 
@@ -118,7 +123,7 @@ Instead of vendoring FA2 source or writing custom FFI, we use the `candle-flash-
 |---|------|---------|--------|
 | 2.1 | **FA2 single-sequence integration** | `candle-flash-attn` dep + `flash_attention_single_seq()` helper + dispatch in `attention_with_cache()`. Auto-routes CUDA F16/BF16 to FA2, CPU/F32 to SDPA. On CUDA, paged decode path is skipped (gather+FA2 is faster than per-block Rust loop). 9 unit tests. | ✅ |
 | 2.2 | **CUDA pod verification** | Build + clippy + kernel tests + E2E on L40S pod. Verify FA2 correctness and measure ITL improvement. | |
-| 2.3 | **Batched attention (Phase 2b)** | Replace per-request `attention_with_cache()` loop with single batched `flash_attn_varlen()` call across all requests in `forward_batch()`. This is the continuous batching optimization — all Q/K/V concatenated, FA2 handles ragged seqlens via cu_seqlens. | |
+| 2.3 | **Batched attention (Phase 2b)** | `batched_flash_attention_with_cache()` in attention.rs — gathers KV cache per-request, builds flat K/V + cu_seqlens tensors, single `flash_attn_varlen` / `flash_attn_varlen_windowed` call. Wired into `LlamaAttention::forward_batch` on CUDA F16/BF16. 6 unit tests (decode, prefill, mixed, GQA, sliding window, F16). | ✅ |
 | 2.4 | **Paged decode with FA2 (Phase 2c)** | Use FA2's `flash_attn_with_kvcache` for paged KV cache decode — reads directly from block table without gather. Requires FlashInfer or custom paged wrapper. | |
 
 **Phase 2.1 exit criteria**: ✅ MET — `attention_with_cache()` dispatches to FA2 on CUDA F16/BF16. All model architectures use it automatically. 9 CUDA unit tests pass locally (awaiting pod verification). Local clippy + all non-CUDA tests pass.
@@ -153,11 +158,44 @@ Instead of vendoring FA2 source or writing custom FFI, we use the `candle-flash-
 
 ---
 
-## Phase 4: CUDA Graphs
+## Phase 4: CUDA Graphs (Deprioritized)
 
 **Goal**: Capture and replay static computation graphs for the decode phase, eliminating kernel launch overhead.
 
-**Why**: The decode phase processes a single token per request per step. The compute per token is small, so kernel launch overhead dominates. CUDA graphs capture the entire decode forward pass as a single GPU-side graph, reducing ~100 kernel launches to 1 graph launch. Python vLLM V1 gets ~30-50% decode speedup from this.
+**Status**: Deprioritized. CUDA Graphs are a "polish" optimization for the Rust port — real but not critical. Batched FA2 (Phase 2b), Fused MoE (Phase 7.1), and Multi-GPU (Phase 5) are all higher ROI.
+
+### Why CUDA Graphs matter less in Rust than in Python
+
+CUDA Graphs solve **kernel launch overhead** — the CPU-side cost of dispatching each kernel to the GPU. In Python vLLM, this overhead dominates single-token decode steps because the Python interpreter and PyTorch's operator dispatch add significant per-kernel cost on top of the CUDA driver overhead.
+
+Rust's ahead-of-time compilation eliminates the interpreter and framework dispatch layers, dramatically reducing the baseline overhead that CUDA Graphs are designed to hide:
+
+| Overhead source | Python vLLM | Rust vLLM |
+|-----------------|-------------|-----------|
+| Interpreter dispatch | ~20-50μs/kernel | 0 (AOT compiled) |
+| Framework dispatch (PyTorch / candle) | ~10-30μs/kernel | ~1-3μs/kernel |
+| CUDA driver launch | ~5-15μs/kernel | ~5-15μs/kernel (same) |
+| **Total per kernel** | **~35-95μs** | **~6-19μs** |
+
+For a 32-layer model with ~150 kernel launches per decode step:
+
+- **Python without graphs**: ~5-14ms overhead → CUDA Graphs save ~4-13ms (**30-50% ITL improvement**)
+- **Rust without graphs**: ~1-3ms overhead → CUDA Graphs would save ~1-3ms (**10-20% ITL improvement**)
+
+The CUDA driver cost (~5-15μs/kernel) is identical in both languages — it's in the driver, not the host code. What Rust eliminates is the ~30-80μs/kernel of Python + PyTorch overhead that sits on top.
+
+### When CUDA Graphs would still help
+
+- **Small models** (SmolLM-135M, Qwen2.5-0.5B) where compute per step is tiny and overhead is a large fraction
+- **Latency-critical** applications where every millisecond of ITL matters
+- **Very high batch sizes** with many concurrent decode steps per second
+
+### Recommended priority (higher-ROI alternatives)
+
+1. **Batched FA2** (Phase 2b) — replaces N per-request `flash_attn` calls with 1 `flash_attn_varlen` call. Directly reduces attention kernel launches from N to 1, targeting the same overhead problem as CUDA Graphs but for the most expensive operation.
+2. **Fused MoE** (Phase 7.1) — fuses the per-expert loop into a single kernel. Critical for DeepSeek/Qwen3-MoE where the expert loop is the real bottleneck.
+3. **Multi-GPU / NCCL** (Phase 5) — enables models >13B. Production necessity.
+4. **CUDA Graphs** (this phase) — polish optimization for last-mile decode latency.
 
 ### Tasks
 

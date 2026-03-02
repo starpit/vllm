@@ -515,25 +515,51 @@ impl LlamaAttention {
         // Batched RoPE on all tokens.
         let (q, k) = self.rotary_emb.apply(&q, &k, positions)?;
 
-        // Per-request attention loop (reuses existing attention_with_cache unchanged).
-        let mut output_parts = Vec::with_capacity(attn_meta.num_reqs);
-        for req_idx in 0..attn_meta.num_reqs {
-            let (start, q_len) = attn_meta.request_slice(req_idx);
-            let q_req = q.narrow(0, start, q_len).map_err(ModelError::Candle)?;
-            let k_req = k.narrow(0, start, q_len).map_err(ModelError::Candle)?;
-            let v_req = v.narrow(0, start, q_len).map_err(ModelError::Candle)?;
-            let handle = storage.request_layer_handle(req_idx, self.layer_idx);
-            let out = attention_with_cache(
-                &q_req,
-                &k_req,
-                &v_req,
-                self.scale,
-                Some(handle),
-                self.sliding_window,
-            )?;
-            output_parts.push(out);
-        }
-        let attn_output = Tensor::cat(&output_parts, 0).map_err(ModelError::Candle)?;
+        // Batched FA2 on CUDA F16/BF16: single flash_attn_varlen call across all requests.
+        // Falls back to per-request attention_with_cache loop on CPU/F32.
+        #[cfg(feature = "cuda")]
+        let use_batched_flash =
+            q.device().is_cuda() && matches!(q.dtype(), DType::F16 | DType::BF16);
+        #[cfg(not(feature = "cuda"))]
+        let use_batched_flash = false;
+
+        let attn_output = if use_batched_flash {
+            #[cfg(feature = "cuda")]
+            {
+                let config = crate::attention::BatchedAttnConfig {
+                    scale: self.scale,
+                    layer_idx: self.layer_idx,
+                    sliding_window: self.sliding_window,
+                };
+                crate::attention::batched_flash_attention_with_cache(
+                    &q, &k, &v, &config, attn_meta, storage,
+                )?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                unreachable!()
+            }
+        } else {
+            // Per-request attention loop (CPU / F32 path).
+            let mut output_parts = Vec::with_capacity(attn_meta.num_reqs);
+            for req_idx in 0..attn_meta.num_reqs {
+                let (start, q_len) = attn_meta.request_slice(req_idx);
+                let q_req = q.narrow(0, start, q_len).map_err(ModelError::Candle)?;
+                let k_req = k.narrow(0, start, q_len).map_err(ModelError::Candle)?;
+                let v_req = v.narrow(0, start, q_len).map_err(ModelError::Candle)?;
+                let handle = storage.request_layer_handle(req_idx, self.layer_idx);
+                let out = attention_with_cache(
+                    &q_req,
+                    &k_req,
+                    &v_req,
+                    self.scale,
+                    Some(handle),
+                    self.sliding_window,
+                )?;
+                output_parts.push(out);
+            }
+            Tensor::cat(&output_parts, 0).map_err(ModelError::Candle)?
+        };
 
         // Reshape back to [total_tokens, num_q_heads * head_dim].
         let attn_output = attn_output

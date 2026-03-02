@@ -612,6 +612,147 @@ fn dispatch_attention(
 }
 
 // ---------------------------------------------------------------------------
+// Batched FlashAttention v2 via flash_attn_varlen — CUDA-only
+// ---------------------------------------------------------------------------
+
+/// Per-layer attention config for batched FA2.
+#[cfg(feature = "cuda")]
+pub struct BatchedAttnConfig {
+    pub scale: f64,
+    pub layer_idx: usize,
+    pub sliding_window: Option<usize>,
+}
+
+/// Batched attention across multiple requests using a single `flash_attn_varlen` call.
+///
+/// Replaces the per-request `attention_with_cache` loop in `forward_batch()` with:
+/// 1. Per-request KV cache management (gather cached, concat with new, store back)
+/// 2. A single `flash_attn_varlen` / `flash_attn_varlen_windowed` call on concatenated Q/K/V
+///
+/// This reduces N separate FA2 kernel launches to 1, which is the continuous batching
+/// optimization that makes Python vLLM fast.
+///
+/// Returns attention output of shape `[total_q_tokens, num_q_heads, head_dim]`.
+#[cfg(feature = "cuda")]
+pub fn batched_flash_attention_with_cache(
+    q: &Tensor,
+    k_new: &Tensor,
+    v_new: &Tensor,
+    config: &BatchedAttnConfig,
+    attn_meta: &crate::AttentionMetadata,
+    storage: &mut crate::BatchedKvCacheStorage<'_>,
+) -> ModelResult<Tensor> {
+    let device = q.device();
+    let num_reqs = attn_meta.num_reqs;
+    let BatchedAttnConfig {
+        scale,
+        layer_idx,
+        sliding_window,
+    } = *config;
+
+    // Phase 1: Per-request KV cache management.
+    // Gather cached K/V, concatenate with new tokens, store back, collect for batched attention.
+    let mut all_k_parts: Vec<Tensor> = Vec::with_capacity(num_reqs);
+    let mut all_v_parts: Vec<Tensor> = Vec::with_capacity(num_reqs);
+    let mut kv_cumlen: Vec<u32> = Vec::with_capacity(num_reqs + 1);
+    kv_cumlen.push(0);
+    let mut max_seqlen_q: usize = 0;
+    let mut max_seqlen_k: usize = 0;
+
+    for req_idx in 0..num_reqs {
+        let (start, q_len) = attn_meta.request_slice(req_idx);
+        let k_req = k_new.narrow(0, start, q_len).map_err(ModelError::Candle)?;
+        let v_req = v_new.narrow(0, start, q_len).map_err(ModelError::Candle)?;
+
+        // Cache: gather previously stored K/V, concat with new, store the full sequence.
+        let mut handle = storage.request_layer_handle(req_idx, layer_idx);
+        let (k_full, v_full) = if let Some((cached_k, cached_v)) = handle.take_cached()? {
+            let k_cat = Tensor::cat(&[&cached_k, &k_req], 0).map_err(ModelError::Candle)?;
+            let v_cat = Tensor::cat(&[&cached_v, &v_req], 0).map_err(ModelError::Candle)?;
+            handle.store(k_cat.clone(), v_cat.clone())?;
+            (k_cat, v_cat)
+        } else {
+            // First call (prefill): no cached data.
+            handle.store(k_req.clone(), v_req.clone())?;
+            (k_req, v_req)
+        };
+        // handle dropped here — borrow on storage released
+
+        // Sliding window: trim K/V for attention (full sequence stored in cache above).
+        let (k_for_attn, v_for_attn) = if let Some(w) = sliding_window {
+            let kv_len = k_full.dim(0).map_err(ModelError::Candle)?;
+            if kv_len > w {
+                let trim_start = kv_len - w;
+                (
+                    k_full
+                        .narrow(0, trim_start, w)
+                        .map_err(ModelError::Candle)?,
+                    v_full
+                        .narrow(0, trim_start, w)
+                        .map_err(ModelError::Candle)?,
+                )
+            } else {
+                (k_full, v_full)
+            }
+        } else {
+            (k_full, v_full)
+        };
+
+        let kv_len = k_for_attn.dim(0).map_err(ModelError::Candle)?;
+        all_k_parts.push(k_for_attn);
+        all_v_parts.push(v_for_attn);
+        kv_cumlen.push(kv_cumlen.last().unwrap() + kv_len as u32);
+        max_seqlen_q = max_seqlen_q.max(q_len);
+        max_seqlen_k = max_seqlen_k.max(kv_len);
+    }
+
+    // Phase 2: Build flat K/V and cu_seqlens tensors on the GPU.
+    let flat_k = Tensor::cat(&all_k_parts, 0).map_err(ModelError::Candle)?;
+    let flat_v = Tensor::cat(&all_v_parts, 0).map_err(ModelError::Candle)?;
+
+    // cu_seqlens_q: cumulative query offsets from AttentionMetadata (already correct).
+    let cu_seqlens_q_vals: Vec<u32> = attn_meta
+        .query_start_loc
+        .iter()
+        .map(|&x| x as u32)
+        .collect();
+    let cu_seqlens_q = Tensor::from_slice(&cu_seqlens_q_vals, cu_seqlens_q_vals.len(), device)
+        .map_err(ModelError::Candle)?;
+    let cu_seqlens_k =
+        Tensor::from_slice(&kv_cumlen, kv_cumlen.len(), device).map_err(ModelError::Candle)?;
+
+    // Phase 3: Single batched FlashAttention v2 call.
+    if let Some(w) = sliding_window {
+        candle_flash_attn::flash_attn_varlen_windowed(
+            q,
+            &flat_k,
+            &flat_v,
+            &cu_seqlens_q,
+            &cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale as f32,
+            Some(w.saturating_sub(1)),
+            Some(0),
+        )
+        .map_err(ModelError::Candle)
+    } else {
+        candle_flash_attn::flash_attn_varlen(
+            q,
+            &flat_k,
+            &flat_v,
+            &cu_seqlens_q,
+            &cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale as f32,
+            true,
+        )
+        .map_err(ModelError::Candle)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1665,5 +1806,351 @@ mod tests {
         // Cache should hold 17 tokens now.
         let (cached_k, _) = cache.as_ref().unwrap();
         assert_eq!(cached_k.dim(0).unwrap(), 17);
+    }
+
+    // -----------------------------------------------------------------------
+    // Batched FlashAttention v2 (flash_attn_varlen) CUDA tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: compare batched FA2 (varlen) against per-request single-seq FA2 as reference.
+    ///
+    /// Builds a batch of `requests` where each entry is `(q_len, cached_kv_len)`.
+    /// Runs per-request `flash_attention_single_seq` as the reference, then runs
+    /// `batched_flash_attention_with_cache` and asserts outputs match within `tol`.
+    #[cfg(feature = "cuda")]
+    fn assert_batched_fa2_matches_per_request(
+        requests: &[(usize, usize)], // (q_len, tokens_before)
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        dtype: DType,
+        sliding_window: Option<usize>,
+        tol: f32,
+    ) {
+        let cuda = Device::cuda_if_available(0).unwrap();
+        assert!(cuda.is_cuda(), "CUDA device required");
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let num_reqs = requests.len();
+        let block_size = 16;
+
+        // Generate per-request Q/K_new/V_new and cached K/V.
+        let mut per_req_q: Vec<Tensor> = Vec::new();
+        let mut per_req_k_new: Vec<Tensor> = Vec::new();
+        let mut per_req_v_new: Vec<Tensor> = Vec::new();
+        let mut per_req_k_cached: Vec<Option<Tensor>> = Vec::new();
+        let mut per_req_v_cached: Vec<Option<Tensor>> = Vec::new();
+
+        for &(q_len, tokens_before) in requests {
+            let q = Tensor::randn(0.0f32, 1.0, &[q_len, num_q_heads, head_dim], &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .to_device(&cuda)
+                .unwrap();
+            let k_new = Tensor::randn(0.0f32, 1.0, &[q_len, num_kv_heads, head_dim], &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .to_device(&cuda)
+                .unwrap();
+            let v_new = Tensor::randn(0.0f32, 1.0, &[q_len, num_kv_heads, head_dim], &Device::Cpu)
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .to_device(&cuda)
+                .unwrap();
+
+            if tokens_before > 0 {
+                let k_cached = Tensor::randn(
+                    0.0f32,
+                    1.0,
+                    &[tokens_before, num_kv_heads, head_dim],
+                    &Device::Cpu,
+                )
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .to_device(&cuda)
+                .unwrap();
+                let v_cached = Tensor::randn(
+                    0.0f32,
+                    1.0,
+                    &[tokens_before, num_kv_heads, head_dim],
+                    &Device::Cpu,
+                )
+                .unwrap()
+                .to_dtype(dtype)
+                .unwrap()
+                .to_device(&cuda)
+                .unwrap();
+                per_req_k_cached.push(Some(k_cached));
+                per_req_v_cached.push(Some(v_cached));
+            } else {
+                per_req_k_cached.push(None);
+                per_req_v_cached.push(None);
+            }
+
+            per_req_q.push(q);
+            per_req_k_new.push(k_new);
+            per_req_v_new.push(v_new);
+        }
+
+        // --- Reference: per-request single-seq FA2 ---
+        let mut ref_outputs: Vec<Tensor> = Vec::new();
+        for req_idx in 0..num_reqs {
+            let k_full = if let Some(ref cached) = per_req_k_cached[req_idx] {
+                Tensor::cat(&[cached, &per_req_k_new[req_idx]], 0).unwrap()
+            } else {
+                per_req_k_new[req_idx].clone()
+            };
+            let v_full = if let Some(ref cached) = per_req_v_cached[req_idx] {
+                Tensor::cat(&[cached, &per_req_v_new[req_idx]], 0).unwrap()
+            } else {
+                per_req_v_new[req_idx].clone()
+            };
+
+            // Apply same sliding window trim as batched path.
+            let (k_for_attn, v_for_attn) = if let Some(w) = sliding_window {
+                let kv_len = k_full.dim(0).unwrap();
+                if kv_len > w {
+                    let s = kv_len - w;
+                    (
+                        k_full.narrow(0, s, w).unwrap(),
+                        v_full.narrow(0, s, w).unwrap(),
+                    )
+                } else {
+                    (k_full, v_full)
+                }
+            } else {
+                (k_full, v_full)
+            };
+
+            let out = flash_attention_single_seq(
+                &per_req_q[req_idx],
+                &k_for_attn,
+                &v_for_attn,
+                scale,
+                sliding_window,
+            )
+            .unwrap();
+            ref_outputs.push(out);
+        }
+        let ref_output = Tensor::cat(&ref_outputs, 0).unwrap();
+
+        // --- Batched: flash_attn_varlen via batched_flash_attention_with_cache ---
+        // Build flat Q/K_new/V_new + AttentionMetadata + BatchedKvCacheStorage.
+        let flat_q = Tensor::cat(&per_req_q, 0).unwrap();
+        let flat_k_new = Tensor::cat(&per_req_k_new, 0).unwrap();
+        let flat_v_new = Tensor::cat(&per_req_v_new, 0).unwrap();
+
+        // Build AttentionMetadata.
+        let mut query_start_loc = vec![0usize];
+        let mut q_lens = Vec::new();
+        let mut seq_lens = Vec::new();
+        let mut block_ids_all = Vec::new();
+        let mut tokens_before_all = Vec::new();
+        let mut is_prefill = Vec::new();
+        let mut total_tokens = 0usize;
+
+        for (req_idx, &(q_len, tokens_before)) in requests.iter().enumerate() {
+            total_tokens += q_len;
+            query_start_loc.push(total_tokens);
+            q_lens.push(q_len);
+            seq_lens.push(tokens_before + q_len);
+            tokens_before_all.push(tokens_before);
+            is_prefill.push(tokens_before == 0);
+
+            // Allocate enough blocks for the full sequence.
+            let total_kv = tokens_before + q_len;
+            let num_blocks = (total_kv + block_size - 1) / block_size;
+            let base_block = req_idx * 10; // spread blocks apart
+            block_ids_all.push((0..num_blocks).map(|b| base_block + b).collect::<Vec<_>>());
+        }
+
+        let attn_meta = crate::AttentionMetadata {
+            num_reqs,
+            total_tokens,
+            query_start_loc,
+            q_lens,
+            seq_lens,
+            block_ids: block_ids_all.clone(),
+            tokens_before: tokens_before_all.clone(),
+            is_prefill,
+            req_ids: (0..num_reqs).map(|i| format!("req-{i}")).collect(),
+        };
+
+        // Build pool with enough blocks, pre-populate cached K/V.
+        let max_block_id = block_ids_all
+            .iter()
+            .flat_map(|v| v.iter())
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let num_pool_blocks = max_block_id + 1;
+        let mut pool = KvBlockPool::new(
+            num_pool_blocks,
+            1, // single layer
+            num_kv_heads,
+            head_dim,
+            block_size,
+            dtype,
+            &cuda,
+        )
+        .unwrap();
+
+        // Pre-populate cached K/V into the pool.
+        for (req_idx, &(_, tokens_before)) in requests.iter().enumerate() {
+            if tokens_before > 0 {
+                let cached_k = per_req_k_cached[req_idx].as_ref().unwrap();
+                let cached_v = per_req_v_cached[req_idx].as_ref().unwrap();
+                pool.scatter_new_kv(
+                    0, // layer 0
+                    &block_ids_all[req_idx],
+                    0, // offset 0
+                    cached_k,
+                    cached_v,
+                )
+                .unwrap();
+            }
+        }
+
+        let mut batched_storage =
+            crate::BatchedKvCacheStorage::new(&mut pool, block_ids_all, tokens_before_all);
+
+        let config = BatchedAttnConfig {
+            scale,
+            layer_idx: 0,
+            sliding_window,
+        };
+        let batched_output = batched_flash_attention_with_cache(
+            &flat_q,
+            &flat_k_new,
+            &flat_v_new,
+            &config,
+            &attn_meta,
+            &mut batched_storage,
+        )
+        .unwrap();
+
+        // Flush deferred writes.
+        batched_storage.flush_all().unwrap();
+
+        // --- Compare ---
+        assert_eq!(batched_output.dims(), ref_output.dims());
+        let ref_vals = ref_output
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let batched_vals = batched_output
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (i, (r, b)) in ref_vals.iter().zip(batched_vals.iter()).enumerate() {
+            assert!(
+                (r - b).abs() < tol,
+                "mismatch at idx {i}: ref={r}, batched={b} (tol={tol})"
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_batched_fa2_all_decode() {
+        // 4 decode requests (q_len=1), different cache lengths.
+        assert_batched_fa2_matches_per_request(
+            &[(1, 32), (1, 64), (1, 16), (1, 128)],
+            8,  // num_q_heads
+            2,  // num_kv_heads (GQA)
+            64, // head_dim
+            DType::BF16,
+            None,
+            0.05,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_batched_fa2_all_prefill() {
+        // 3 prefill requests (no cached data), different prompt lengths.
+        assert_batched_fa2_matches_per_request(
+            &[(16, 0), (32, 0), (8, 0)],
+            8,  // num_q_heads
+            8,  // num_kv_heads (MHA)
+            64, // head_dim
+            DType::BF16,
+            None,
+            0.05,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_batched_fa2_mixed_prefill_decode() {
+        // Mixed batch: 1 prefill + 2 decode requests.
+        assert_batched_fa2_matches_per_request(
+            &[(24, 0), (1, 50), (1, 100)],
+            8,   // num_q_heads
+            2,   // num_kv_heads (GQA)
+            128, // head_dim
+            DType::BF16,
+            None,
+            0.05,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_batched_fa2_sliding_window() {
+        // 3 decode requests with sliding window.
+        assert_batched_fa2_matches_per_request(
+            &[(1, 64), (1, 128), (1, 32)],
+            8,  // num_q_heads
+            2,  // num_kv_heads (GQA)
+            64, // head_dim
+            DType::BF16,
+            Some(32), // sliding window
+            0.05,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_batched_fa2_f16() {
+        // Same as all_decode but in F16.
+        assert_batched_fa2_matches_per_request(
+            &[(1, 32), (1, 64)],
+            4,  // num_q_heads
+            4,  // num_kv_heads (MHA)
+            64, // head_dim
+            DType::F16,
+            None,
+            0.05,
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_batched_fa2_single_request() {
+        // Single request: batched path should produce same output as single-seq path.
+        assert_batched_fa2_matches_per_request(
+            &[(1, 64)],
+            8,  // num_q_heads
+            2,  // num_kv_heads (GQA)
+            64, // head_dim
+            DType::BF16,
+            None,
+            0.05,
+        );
     }
 }

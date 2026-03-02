@@ -114,6 +114,15 @@ pub trait Worker: Send {
         ))
     }
 
+    /// Take the pre-loaded tokenizer, if one was loaded during `load_model()`.
+    ///
+    /// Workers that support parallel tokenizer loading will parse `tokenizer.json`
+    /// on a background thread during weight loading. This method retrieves (and
+    /// consumes) that tokenizer so the caller can avoid a redundant load.
+    fn take_preloaded_tokenizer(&mut self) -> Option<tokenizers::Tokenizer> {
+        None
+    }
+
     /// Shut down the worker and release all resources.
     fn shutdown(&mut self);
 

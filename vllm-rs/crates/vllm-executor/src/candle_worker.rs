@@ -113,6 +113,8 @@ pub struct CandleWorker {
     num_kv_heads: usize,
     /// Model head dimension (set after load_model).
     head_dim: usize,
+    /// Pre-loaded tokenizer (parsed in parallel with weight loading).
+    preloaded_tokenizer: Option<tokenizers::Tokenizer>,
     /// Per-request grammar guide state for constrained decoding.
     #[cfg(feature = "guided-decoding")]
     grammar_states: HashMap<String, vllm_models::grammar::GrammarGuide>,
@@ -145,6 +147,7 @@ impl CandleWorker {
             kv_caches: HashMap::new(),
             num_kv_heads: 0,
             head_dim: 0,
+            preloaded_tokenizer: None,
             #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
@@ -794,6 +797,19 @@ impl Worker for CandleWorker {
         let model_dir = self.resolve_model_path()?;
         info!("CandleWorker: loading model from {}", model_dir.display());
 
+        // Optimistically parse tokenizer.json on a background thread while we
+        // load config + weights on the main thread. The result is stored on
+        // self and consumed later by init.rs, avoiding a redundant parse.
+        let tok_dir = model_dir.clone();
+        let tokenizer_handle = std::thread::spawn(move || {
+            let path = tok_dir.join("tokenizer.json");
+            if path.exists() {
+                tokenizers::Tokenizer::from_file(&path).ok()
+            } else {
+                None
+            }
+        });
+
         // 2. Parse config.json.
         let hf_config = HfModelConfig::from_dir(&model_dir)
             .map_err(|e| ExecutorError::WorkerInit(format!("failed to parse config.json: {e}")))?;
@@ -984,6 +1000,9 @@ impl Worker for CandleWorker {
         self.resolve_pooling_strategy();
 
         // Grammar vocabulary is built lazily on first constrained-decoding request.
+
+        // Collect the tokenizer we loaded in the background.
+        self.preloaded_tokenizer = tokenizer_handle.join().unwrap_or(None);
 
         Ok(())
     }
@@ -1592,6 +1611,10 @@ impl Worker for CandleWorker {
             results.push(vec);
         }
         Ok(results)
+    }
+
+    fn take_preloaded_tokenizer(&mut self) -> Option<tokenizers::Tokenizer> {
+        self.preloaded_tokenizer.take()
     }
 
     fn shutdown(&mut self) {

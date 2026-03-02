@@ -232,7 +232,11 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
     let model_name = extract_model_name(&model_path).into_owned();
 
     // Decide backend: MLX (Metal) or Candle (CPU/CUDA).
-    let (worker, hf_config, model_dir, model_dtype) = create_worker(config, model_path)?;
+    let (mut worker, hf_config, model_dir, model_dtype) = create_worker(config, model_path)?;
+
+    // Take the tokenizer that was loaded in parallel during load_model().
+    // This avoids a redundant parse of tokenizer.json later.
+    let preloaded_tokenizer = worker.take_preloaded_tokenizer();
 
     let max_model_len = config
         .max_model_len
@@ -317,50 +321,55 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
     let client = Box::new(InprocClient::new(engine_config, Box::new(executor)));
 
     // 8. Try to load tokenizer and chat template from model directory.
-    let engine = if let Some(ref dir) = model_dir {
-        match try_load_tokenizer(dir) {
-            Ok(tok) => {
-                info!("Tokenizer loaded from {}", dir.display());
-                let tokenizer = Arc::new(tok);
-
-                // Try to load chat template from tokenizer_config.json.
-                #[cfg(feature = "chat-template")]
-                {
-                    let chat_template = try_load_chat_template(dir);
-                    if let Some(tpl) = chat_template {
-                        info!("Chat template loaded from tokenizer_config.json");
-                        AsyncEngine::with_tokenizer_and_template(
-                            client,
-                            model_name.clone(),
-                            max_model_len,
-                            tokenizer,
-                            Arc::new(tpl),
-                        )
-                    } else {
-                        info!("No chat template found, using plain concatenation");
-                        AsyncEngine::with_tokenizer(
-                            client,
-                            model_name.clone(),
-                            max_model_len,
-                            tokenizer,
-                        )
+    //
+    // Use the tokenizer that was pre-loaded in parallel during load_model()
+    // when available, avoiding a redundant parse of tokenizer.json.
+    let loaded_tokenizer = preloaded_tokenizer
+        .map(Tokenizer::from_hf_tokenizer)
+        .or_else(|| {
+            model_dir
+                .as_ref()
+                .and_then(|dir| match try_load_tokenizer(dir) {
+                    Ok(tok) => Some(tok),
+                    Err(e) => {
+                        info!("No tokenizer found ({}), running without", e);
+                        None
                     }
-                }
-                #[cfg(not(feature = "chat-template"))]
-                {
-                    info!("No chat template found, using plain concatenation");
-                    AsyncEngine::with_tokenizer(
-                        client,
-                        model_name.clone(),
-                        max_model_len,
-                        tokenizer,
-                    )
-                }
+                })
+        });
+
+    let engine = if let Some(tok) = loaded_tokenizer {
+        let dir_for_log = model_dir
+            .as_ref()
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|| "<preloaded>".to_string());
+        info!("Tokenizer loaded from {}", dir_for_log);
+        let tokenizer = Arc::new(tok);
+
+        // Try to load chat template from tokenizer_config.json.
+        #[cfg(feature = "chat-template")]
+        {
+            let chat_template = model_dir
+                .as_ref()
+                .and_then(|dir| try_load_chat_template(dir));
+            if let Some(tpl) = chat_template {
+                info!("Chat template loaded from tokenizer_config.json");
+                AsyncEngine::with_tokenizer_and_template(
+                    client,
+                    model_name.clone(),
+                    max_model_len,
+                    tokenizer,
+                    Arc::new(tpl),
+                )
+            } else {
+                info!("No chat template found, using plain concatenation");
+                AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
             }
-            Err(e) => {
-                info!("No tokenizer found ({}), running without", e);
-                AsyncEngine::new(client, model_name.clone(), max_model_len)
-            }
+        }
+        #[cfg(not(feature = "chat-template"))]
+        {
+            info!("No chat template found, using plain concatenation");
+            AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
         }
     } else {
         AsyncEngine::new(client, model_name.clone(), max_model_len)

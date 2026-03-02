@@ -111,6 +111,9 @@ pub struct MlxWorker {
     /// Per-request multimodal data, consumed on first forward (prefill).
     mm_data_map: HashMap<String, vllm_common::MultimodalData>,
 
+    /// Pre-loaded tokenizer (parsed in parallel with weight loading).
+    preloaded_tokenizer: Option<tokenizers::Tokenizer>,
+
     // Timing instrumentation.
     step_count: usize,
     prefill_count: usize,
@@ -139,6 +142,7 @@ impl MlxWorker {
             grammar_vocabulary: None,
             pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
             mm_data_map: HashMap::new(),
+            preloaded_tokenizer: None,
             step_count: 0,
             prefill_count: 0,
             decode_count: 0,
@@ -452,6 +456,18 @@ impl Worker for MlxWorker {
         let model_dir = self.resolve_model_path()?;
         info!("MlxWorker: loading model from {}", model_dir.display());
 
+        // Optimistically parse tokenizer.json on a background thread while we
+        // load config + weights on the main thread.
+        let tok_dir = model_dir.clone();
+        let tokenizer_handle = std::thread::spawn(move || {
+            let path = tok_dir.join("tokenizer.json");
+            if path.exists() {
+                tokenizers::Tokenizer::from_file(&path).ok()
+            } else {
+                None
+            }
+        });
+
         // Parse config.json.
         let hf_config = HfModelConfig::from_dir(&model_dir)
             .map_err(|e| ExecutorError::WorkerInit(format!("failed to parse config.json: {e}")))?;
@@ -583,6 +599,9 @@ impl Worker for MlxWorker {
         self.resolve_pooling_strategy();
 
         // Grammar vocabulary is built lazily on first constrained-decoding request.
+
+        // Collect the tokenizer we loaded in the background.
+        self.preloaded_tokenizer = tokenizer_handle.join().unwrap_or(None);
 
         Ok(())
     }
@@ -1195,6 +1214,10 @@ impl Worker for MlxWorker {
             results.push(vec);
         }
         Ok(results)
+    }
+
+    fn take_preloaded_tokenizer(&mut self) -> Option<tokenizers::Tokenizer> {
+        self.preloaded_tokenizer.take()
     }
 
     fn shutdown(&mut self) {

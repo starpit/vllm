@@ -638,14 +638,14 @@ pub struct BatchedAttnConfig {
     pub sliding_window: Option<usize>,
 }
 
-/// Batched attention across multiple requests using a single `flash_attn_varlen` call.
+/// Batched attention across multiple requests using a single FA2 call.
 ///
-/// Replaces the per-request `attention_with_cache` loop in `forward_batch()` with:
-/// 1. Per-request KV cache management (gather cached, concat with new, store back)
-/// 2. A single `flash_attn_varlen` / `flash_attn_varlen_windowed` call on concatenated Q/K/V
+/// For all-decode batches without sliding window, uses the **paged FA2 path**:
+/// new tokens are written directly into the paged block pool, and FA2 reads
+/// K/V from the pool via a `block_table` — no per-request gather or Tensor::cat.
 ///
-/// This reduces N separate FA2 kernel launches to 1, which is the continuous batching
-/// optimization that makes Python vLLM fast.
+/// For prefill or mixed batches, falls back to per-request gather + contiguous
+/// buffer + `flash_attn_varlen`.
 ///
 /// Returns attention output of shape `[total_q_tokens, num_q_heads, head_dim]`.
 #[cfg(feature = "cuda")]
@@ -665,9 +665,21 @@ pub fn batched_flash_attention_with_cache(
         sliding_window,
     } = *config;
 
-    // Phase 1: Per-request KV cache management.
-    // Uses pre-allocated contiguous buffers with in-place CUDA writes to
-    // eliminate per-step GPU memory allocation and O(seq_len) block gathers.
+    // -----------------------------------------------------------------------
+    // Paged FA2 fast path: all-decode, no sliding window
+    // -----------------------------------------------------------------------
+    // Write new tokens into the paged pool, then call flash_attn_varlen_paged
+    // with the raw pool tensors + block_table. No per-request gathers, no
+    // Tensor::cat, no ContiguousKvBuffer.
+    if attn_meta.is_all_decode() && sliding_window.is_none() {
+        return batched_paged_flash_attention(
+            q, k_new, v_new, scale, layer_idx, attn_meta, storage, device,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Fallback: per-request gather + contiguous buffer (prefill / sliding window)
+    // -----------------------------------------------------------------------
     let num_layers = storage.pool.num_layers();
     let num_kv_heads = storage.pool.num_kv_heads();
     let head_dim = storage.pool.head_dim();
@@ -692,10 +704,15 @@ pub fn batched_flash_attention_with_cache(
             // Zero GPU memory allocation during decode.
             let buf = storage.contiguous_kv_buf(req_idx, layer_idx).unwrap();
             buf.write(&k_req, &v_req, buf.len)?;
-            // Skip paged block writes during decode — the contiguous buffer is
-            // authoritative. Paged blocks were populated during prefill and are
-            // not read again while the contiguous buffer exists.
-            buf.view()?
+            let view = buf.view()?;
+            // Also keep the paged pool up-to-date so the paged FA2 path
+            // can be used when the batch transitions to all-decode.
+            if q_len == 1 {
+                let k_token = k_req.squeeze(0).map_err(ModelError::Candle)?;
+                let v_token = v_req.squeeze(0).map_err(ModelError::Candle)?;
+                storage.enqueue_new_token(req_idx, layer_idx, k_token, v_token);
+            }
+            view
         } else {
             // Slow path: gather from paged blocks (prefill / first decode step).
             let mut handle = storage.request_layer_handle(req_idx, layer_idx);
@@ -716,7 +733,6 @@ pub fn batched_flash_attention_with_cache(
             };
             // Allocate contiguous buffer and populate it for subsequent decode steps.
             let total_len = k_full.dim(0).map_err(ModelError::Candle)?;
-            // Capacity: current length + generous headroom to avoid re-allocation.
             let capacity = (total_len + 256).next_power_of_two();
             let mut buf = crate::ContiguousKvBuffer::new(
                 capacity,
@@ -758,15 +774,13 @@ pub fn batched_flash_attention_with_cache(
         max_seqlen_k = max_seqlen_k.max(kv_len);
     }
 
-    // Phase 2: Build flat K/V and cu_seqlens tensors on the GPU.
+    // Build flat K/V and cu_seqlens tensors on the GPU.
     let flat_k = Tensor::cat(&all_k_parts, 0).map_err(ModelError::Candle)?;
     let flat_v = Tensor::cat(&all_v_parts, 0).map_err(ModelError::Candle)?;
 
-    // cu_seqlens: use cached GPU tensors when possible to avoid per-layer H2D copies.
     let cu_seqlens_q = attn_meta
         .cu_seqlens_q_gpu(device)
         .map_err(ModelError::Candle)?;
-    // cu_seqlens_k can be cached when there's no sliding window (kv_len == seq_lens[i]).
     let cu_seqlens_k_owned;
     let cu_seqlens_k = if sliding_window.is_none() {
         attn_meta
@@ -778,7 +792,6 @@ pub fn batched_flash_attention_with_cache(
         &cu_seqlens_k_owned
     };
 
-    // Phase 3: Single batched FlashAttention v2 call.
     if let Some(w) = sliding_window {
         candle_flash_attn::flash_attn_varlen_windowed(
             q,
@@ -807,6 +820,97 @@ pub fn batched_flash_attention_with_cache(
         )
         .map_err(ModelError::Candle)
     }
+}
+
+/// Paged FA2 decode path: writes new tokens into the block pool, then calls
+/// `flash_attn_varlen_paged` reading K/V directly from the pool.
+///
+/// No per-request gathers, no Tensor::cat, no ContiguousKvBuffer.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn batched_paged_flash_attention(
+    q: &Tensor,
+    k_new: &Tensor,
+    v_new: &Tensor,
+    scale: f64,
+    layer_idx: usize,
+    attn_meta: &crate::AttentionMetadata,
+    storage: &mut crate::BatchedKvCacheStorage<'_>,
+    device: &candle_core::Device,
+) -> ModelResult<Tensor> {
+    use vllm_kernels::cache::{CacheKernels, CudaCacheKernels};
+
+    let num_reqs = attn_meta.num_reqs;
+    let block_size = storage.pool.block_size();
+
+    // Phase 1: Write new tokens into the paged pool via batched reshape_and_cache.
+    // The slot_mapping is cached per step (built once, reused across all layers).
+    let slot_mapping = attn_meta
+        .decode_slot_mapping_gpu(block_size, device)
+        .map_err(ModelError::Candle)?;
+
+    // k_new/v_new are [total_tokens=num_reqs, num_kv_heads, head_dim] for all-decode.
+    CudaCacheKernels
+        .reshape_and_cache(
+            k_new,
+            v_new,
+            storage.pool.k_cache_for_layer(layer_idx),
+            storage.pool.v_cache_for_layer(layer_idx),
+            slot_mapping,
+        )
+        .map_err(|e| ModelError::Other(e.to_string()))?;
+
+    // Update tokens_in_block counters for each request.
+    for req_idx in 0..num_reqs {
+        let tokens_before = attn_meta.tokens_before[req_idx];
+        let global_pos = tokens_before;
+        let block_offset = global_pos / block_size;
+        let position_in_block = global_pos % block_size;
+        let block_ids = &attn_meta.block_ids[req_idx];
+        if block_offset < block_ids.len() {
+            let bid = block_ids[block_offset];
+            let new_fill = position_in_block + 1;
+            if new_fill > storage.pool.tokens_stored(bid) {
+                storage.pool.set_tokens_stored(bid, new_fill);
+            }
+        }
+    }
+
+    // Phase 2: Build cu_seqlens_q, cu_seqlens_k (non-cumulative for paged),
+    // and block_table, then call flash_attn_varlen_paged.
+    let cu_seqlens_q = attn_meta
+        .cu_seqlens_q_gpu(device)
+        .map_err(ModelError::Candle)?;
+
+    // For paged FA2, seqlens_k is cumulative (same as regular varlen).
+    let cu_seqlens_k = attn_meta
+        .cu_seqlens_k_gpu(device)
+        .map_err(ModelError::Candle)?;
+
+    let block_table = attn_meta
+        .block_table_gpu(device)
+        .map_err(ModelError::Candle)?;
+
+    let max_seqlen_q = 1; // all-decode
+    let max_seqlen_k = attn_meta.seq_lens.iter().copied().max().unwrap_or(1);
+
+    let k_cache = storage.pool.k_cache_for_layer(layer_idx);
+    let v_cache = storage.pool.v_cache_for_layer(layer_idx);
+
+    candle_flash_attn::flash_attn_varlen_paged(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        block_table,
+        block_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        scale as f32,
+        true, // causal
+    )
+    .map_err(ModelError::Candle)
 }
 
 // ---------------------------------------------------------------------------

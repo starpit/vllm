@@ -80,7 +80,7 @@ outlines-core = { version = "0.2", default-features = false }
 
 # Tensor ops
 candle-core = { version = "0.9", default-features = false }
-candle-flash-attn = "0.9.2"
+candle-flash-attn = { path = "third_party/candle-flash-attn" }
 
 # CUDA (NVIDIA GPU) — must match candle-core's cudarc version
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "f16"] }

@@ -30,10 +30,7 @@ impl Default for CudaGraphConfig {
 impl CudaGraphConfig {
     /// Parse a comma-separated list of batch sizes (e.g. "1,2,4,8").
     pub fn parse_sizes(s: &str) -> Vec<usize> {
-        let mut sizes: Vec<usize> = s
-            .split(',')
-            .filter_map(|x| x.trim().parse().ok())
-            .collect();
+        let mut sizes: Vec<usize> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         sizes.sort();
         sizes.dedup();
         sizes

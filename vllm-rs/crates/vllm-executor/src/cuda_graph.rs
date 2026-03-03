@@ -190,10 +190,8 @@ impl CudaGraphRunner {
             info!("Capturing CUDA graph for batch size {padded_bs}...");
 
             // 1. Create pre-allocated input tensors at fixed addresses.
-            let input_ids =
-                Tensor::zeros(padded_bs, DType::U32, &self.device).map_err(err_init)?;
-            let positions =
-                Tensor::zeros(padded_bs, DType::U32, &self.device).map_err(err_init)?;
+            let input_ids = Tensor::zeros(padded_bs, DType::U32, &self.device).map_err(err_init)?;
+            let positions = Tensor::zeros(padded_bs, DType::U32, &self.device).map_err(err_init)?;
 
             // Extract raw device pointers for later in-place memcpy.
             let input_ids_dev_ptr = extract_device_ptr_u32(&input_ids, cuda_dev)?;
@@ -255,11 +253,8 @@ impl CudaGraphRunner {
                 unsafe { ctx.disable_event_tracking() };
             }
 
-            let mut capture_storage = BatchedKvCacheStorage::new(
-                kv_block_pool,
-                batch_block_ids,
-                batch_tokens_before,
-            );
+            let mut capture_storage =
+                BatchedKvCacheStorage::new(kv_block_pool, batch_block_ids, batch_tokens_before);
 
             stream
                 .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
@@ -271,12 +266,8 @@ impl CudaGraphRunner {
                     err_init(format!("begin_capture failed: {e}"))
                 })?;
 
-            let capture_result = model.forward_batch(
-                &input_ids,
-                &positions,
-                &attn_meta,
-                &mut capture_storage,
-            );
+            let capture_result =
+                model.forward_batch(&input_ids, &positions, &attn_meta, &mut capture_storage);
 
             let graph_flags = cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
 

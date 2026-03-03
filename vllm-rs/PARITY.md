@@ -251,7 +251,7 @@
 | KV cache offloading (CPU ↔ GPU) | &#x1F535; | &#x1F534; | — | — | P3 |
 | KV cache transfer (distributed) | &#x1F535; | &#x1F534; | — | — | P1 |
 | Multi-group KV cache (hybrid models) | &#x1F535; | &#x1F534; | — | — | P1 |
-| FlashAttention v2 (single-seq + batched varlen) | &#x1F535; | &#x1F535; | 15 | 0 | |
+| FlashAttention v2 (single-seq + batched varlen + paged decode) | &#x1F535; | &#x1F535; | 15 | 0 | |
 | FlashInfer | &#x1F535; | &#x1F534; | — | — | P2 |
 | FlexAttention | &#x1F535; | &#x1F534; | — | — | P1 |
 | xFormers | &#x1F535; | &#x1F534; | — | — | P0 |
@@ -262,8 +262,8 @@
 
 > Unit counts: `block_pool.rs` (19), `free_block_queue.rs` (16), `kv_cache_manager.rs` (13), `kv_cache_block.rs` (11), `kv_block_pool.rs` (13), `attention.rs` (34 — 25 SDPA/paged + 9 FlashAttention v2), MLX `cache.rs` (1). FlashAttention v2 tests: decode BF16/F16, prefill BF16/F16, GQA BF16 decode/prefill, head_dim=128, sliding window, attention_with_cache dispatch — all compare FA2 CUDA output against CPU SDPA reference. Sliding window: 7 attention.rs + 2 gemma2.rs interleaved + 2 qwen2.rs max_window_layers + 1 MLX phi3 trim + 1 array-format parsing = 13. Per-row counts reflect the primary feature each test targets; some tests cross-cut multiple rows. Total section: 112 unit tests.
 >
-> **Batched attention metadata note:** The Rust port now has `AttentionMetadata` (with `query_start_loc`, `seq_lens`, `block_ids`, `tokens_before` per request) used by `forward_batch()` to split Q/K/V for per-request attention. However, the attention inner loop is still per-request — each request's slice runs through `attention_with_cache()` separately. Python vLLM passes equivalent metadata to FlashAttention's `varlen` API or FlashInfer's batched wrappers, which handle variable-length multi-request attention in a single kernel call. The remaining gap is a batched attention kernel that processes all requests' attention in one dispatch:
-> - **CUDA**: FlashAttention varlen (`flash_attn_varlen_func`) via FFI, or FlashInfer batched wrappers — uses `cu_seqlens` to handle ragged sequences without padding.
+> **Batched attention metadata note:** The Rust port has `AttentionMetadata` (with `query_start_loc`, `seq_lens`, `block_ids`, `tokens_before`, cached `block_table_gpu`, `decode_slot_mapping_gpu` per request) used by `forward_batch()`. On CUDA, batched FA2 uses `flash_attn_varlen` for prefill/mixed batches and `flash_attn_varlen_paged` for all-decode batches — the paged path reads K/V directly from the block pool via `block_table`, eliminating per-request gathers and `Tensor::cat`. This matches Python vLLM's paged FlashAttention decode path.
+> - **CUDA**: FlashAttention varlen (`flash_attn_varlen`) for prefill/mixed + paged FA2 (`flash_attn_varlen_paged`) for decode — uses `cu_seqlens` and `block_table` to handle ragged sequences without padding or gather.
 > - **MLX**: Two approaches: (a) **Padded-batch SDPA** — left-pad inputs to uniform KV length, use `BatchKVCache` with per-sequence padding offsets, construct padding-aware causal masks (proven by mlx-lm's `BatchGenerator`; wastes compute on pad tokens but works with stock MLX SDPA). Effort: ~1-2 weeks, low risk. (b) **Custom Metal PagedAttention kernels** — block-table-based paged attention Metal shaders; no padding, higher throughput, more implementation effort. Effort: ~4-6 weeks production-quality, medium risk.
 >   - **Existing implementations**: The same core kernel (by the mistral.rs author) lives in two repos: `mistralrs-paged-attn/src/metal/` (~2,100 lines Metal shader + ~1,070 lines Rust dispatch via candle `CustomOp1`) and HF `kernels-community/paged-attention` (same shader, Obj-C++ dispatch). The kernel handles per-block QK scoring, cross-warp softmax reduction via `simd_shuffle_xor`, V accumulation, partitioned attention V2 for long sequences, GQA, FP8 cache, soft-capping, ALiBi. Templated across head sizes (64/80/96/128/192/256) and block sizes (8/16/32). HF also has a separate `kernels-community/metal-flash-sdpa` (~2,100 lines Metal) for varlen prefill — the complementary kernel.
 >   - **Integration challenge**: MLX's `metal_kernel` API (bindings exist in mlx-sys but aren't wrapped in mlx-rs) auto-generates kernel signatures from inputs/outputs. The paged attention kernel uses function constants, explicit threadgroup memory allocation, and 19 buffers — features the `metal_kernel` convenience API doesn't support. Options: restructure the kernel to fit (losing some optimizations), contribute threadgroup memory support upstream to MLX, or go raw Metal via the `metal` crate (requires sharing `MTLBuffer` pointers between MLX's command queue and a separate dispatch — fragile, since mlx-c doesn't expose raw buffer pointers).
@@ -594,7 +594,7 @@ cargo build -p vllm-cli --no-default-features --features metal
 |---|---|---|
 | Model architectures | ~248 | 12 candle + 11 MLX (+ quantized variants) |
 | Quantization methods | ~14 | 6 (GGUF + MLX native 4-bit + GPTQ INT4 + AWQ INT4 + BnB NF4 + BnB INT8) |
-| Attention backends | ~15 | 2 (custom SDPA + FlashAttention v2 single-seq/varlen) |
+| Attention backends | ~15 | 3 (custom SDPA + FlashAttention v2 single-seq/varlen + paged FA2 decode) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
 | Unit tests | ~948 test files | 910 passing (849 non-MLX + 61 MLX) |

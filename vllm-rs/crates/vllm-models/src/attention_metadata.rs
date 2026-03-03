@@ -44,6 +44,15 @@ pub struct AttentionMetadata {
     /// `cu_seqlens_k` as a GPU tensor — valid only when there is no sliding window
     /// (i.e. `kv_len == seq_lens[i]` for every request).
     cu_seqlens_k_cache: OnceCell<Tensor>,
+    /// Block table as a GPU tensor: `[batch_size, max_pages_per_seq]` u32.
+    /// Cached to avoid per-layer H2D copies. Built on first access.
+    #[cfg(feature = "cuda")]
+    block_table_cache: OnceCell<Tensor>,
+    /// Decode slot_mapping as a GPU tensor: `[num_reqs]` i64.
+    /// For all-decode batches, maps each request's new token to its flat cache slot.
+    /// Cached to avoid per-layer H2D copies (28 layers × 128 decode steps).
+    #[cfg(feature = "cuda")]
+    decode_slot_mapping_cache: OnceCell<Tensor>,
 }
 
 impl std::fmt::Debug for AttentionMetadata {
@@ -77,6 +86,10 @@ impl Clone for AttentionMetadata {
             // Don't clone cached GPU tensors — they'll be recomputed if needed.
             cu_seqlens_q_cache: OnceCell::new(),
             cu_seqlens_k_cache: OnceCell::new(),
+            #[cfg(feature = "cuda")]
+            block_table_cache: OnceCell::new(),
+            #[cfg(feature = "cuda")]
+            decode_slot_mapping_cache: OnceCell::new(),
         }
     }
 }
@@ -107,6 +120,10 @@ impl AttentionMetadata {
             req_ids,
             cu_seqlens_q_cache: OnceCell::new(),
             cu_seqlens_k_cache: OnceCell::new(),
+            #[cfg(feature = "cuda")]
+            block_table_cache: OnceCell::new(),
+            #[cfg(feature = "cuda")]
+            decode_slot_mapping_cache: OnceCell::new(),
         }
     }
 
@@ -207,6 +224,81 @@ impl AttentionMetadata {
         let _ = self.cu_seqlens_k_cache.set(t);
         Ok(self.cu_seqlens_k_cache.get().unwrap())
     }
+
+    /// Build and cache the block table as a GPU u32 tensor.
+    ///
+    /// Returns a tensor of shape `[batch_size, max_pages_per_seq]` where each
+    /// row contains the block IDs for that request, zero-padded to the maximum
+    /// number of pages across all requests in the batch.
+    ///
+    /// This is computed once per step and cached for all layers.
+    #[cfg(feature = "cuda")]
+    pub fn block_table_gpu(&self, device: &Device) -> candle_core::Result<&Tensor> {
+        if let Some(t) = self.block_table_cache.get() {
+            return Ok(t);
+        }
+
+        let max_pages = self
+            .block_ids
+            .iter()
+            .map(|ids| ids.len())
+            .max()
+            .unwrap_or(0);
+
+        if max_pages == 0 || self.num_reqs == 0 {
+            let t = Tensor::zeros((self.num_reqs, 1), candle_core::DType::U32, device)?;
+            let _ = self.block_table_cache.set(t);
+            return Ok(self.block_table_cache.get().unwrap());
+        }
+
+        // Build flat [batch_size * max_pages] array, zero-padded.
+        let mut flat: Vec<u32> = vec![0u32; self.num_reqs * max_pages];
+        for (i, ids) in self.block_ids.iter().enumerate() {
+            for (j, &bid) in ids.iter().enumerate() {
+                flat[i * max_pages + j] = bid as u32;
+            }
+        }
+
+        let t = Tensor::from_slice(&flat, (self.num_reqs, max_pages), device)?;
+        let _ = self.block_table_cache.set(t);
+        Ok(self.block_table_cache.get().unwrap())
+    }
+
+    /// Build and cache the decode slot_mapping as a GPU i64 tensor.
+    ///
+    /// For all-decode batches (q_len=1 per request), returns a tensor of shape
+    /// `[num_reqs]` where `slot_mapping[i]` is the flat cache slot for request
+    /// `i`'s new token: `block_ids[i][pos / block_size] * block_size + pos % block_size`.
+    ///
+    /// Cached per step to avoid per-layer H2D copies.
+    #[cfg(feature = "cuda")]
+    pub fn decode_slot_mapping_gpu(
+        &self,
+        block_size: usize,
+        device: &Device,
+    ) -> candle_core::Result<&Tensor> {
+        if let Some(t) = self.decode_slot_mapping_cache.get() {
+            return Ok(t);
+        }
+
+        let mut slots = Vec::with_capacity(self.num_reqs);
+        for req_idx in 0..self.num_reqs {
+            let global_pos = self.tokens_before[req_idx];
+            let block_offset = global_pos / block_size;
+            let position_in_block = global_pos % block_size;
+            let block_ids = &self.block_ids[req_idx];
+            if block_offset < block_ids.len() {
+                let bid = block_ids[block_offset];
+                slots.push((bid * block_size + position_in_block) as i64);
+            } else {
+                slots.push(-1);
+            }
+        }
+
+        let t = Tensor::new(slots.as_slice(), device)?;
+        let _ = self.decode_slot_mapping_cache.set(t);
+        Ok(self.decode_slot_mapping_cache.get().unwrap())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -288,13 +380,7 @@ mod tests {
     #[test]
     fn test_padded_decode_exact_size() {
         // actual_bs == padded_bs: no padding needed.
-        let meta = AttentionMetadata::padded_decode(
-            2,
-            2,
-            &[10, 20],
-            &[vec![0], vec![1]],
-            &[9, 19],
-        );
+        let meta = AttentionMetadata::padded_decode(2, 2, &[10, 20], &[vec![0], vec![1]], &[9, 19]);
         assert_eq!(meta.num_reqs, 2);
         assert!(meta.is_all_decode());
     }

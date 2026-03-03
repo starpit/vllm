@@ -639,6 +639,27 @@ impl<'a> BatchedKvCacheStorage<'a> {
         )
     }
 
+    /// Enqueue a new-token write for a specific request and layer.
+    ///
+    /// This is used by the contiguous buffer path to keep the paged pool
+    /// up-to-date so the paged FA2 path can be used on subsequent steps.
+    #[cfg(feature = "cuda")]
+    pub fn enqueue_new_token(
+        &mut self,
+        req_idx: usize,
+        layer: usize,
+        k_token: Tensor,
+        v_token: Tensor,
+    ) {
+        if req_idx < self.pending_writes.len() {
+            self.pending_writes[req_idx].push(PendingWrite::NewToken {
+                layer,
+                k_token,
+                v_token,
+            });
+        }
+    }
+
     /// Flush all deferred writes to the block pool.
     pub fn flush_all(&mut self) -> ModelResult<()> {
         for req_idx in 0..self.block_ids.len() {

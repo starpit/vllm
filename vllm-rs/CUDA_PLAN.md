@@ -124,9 +124,11 @@ Instead of vendoring FA2 source or writing custom FFI, we use the `candle-flash-
 | 2.1 | **FA2 single-sequence integration** | `candle-flash-attn` dep + `flash_attention_single_seq()` helper + dispatch in `attention_with_cache()`. Auto-routes CUDA F16/BF16 to FA2, CPU/F32 to SDPA. On CUDA, paged decode path is skipped (gather+FA2 is faster than per-block Rust loop). 9 unit tests. | ✅ |
 | 2.2 | **CUDA pod verification** | Build + clippy + kernel tests + E2E on L40S pod. Verify FA2 correctness and measure ITL improvement. | |
 | 2.3 | **Batched attention (Phase 2b)** | `batched_flash_attention_with_cache()` in attention.rs — gathers KV cache per-request, builds flat K/V + cu_seqlens tensors, single `flash_attn_varlen` / `flash_attn_varlen_windowed` call. Wired into `LlamaAttention::forward_batch` on CUDA F16/BF16. 6 unit tests (decode, prefill, mixed, GQA, sliding window, F16). | ✅ |
-| 2.4 | **Paged decode with FA2 (Phase 2c)** | Use FA2's `flash_attn_with_kvcache` for paged KV cache decode — reads directly from block table without gather. Requires FlashInfer or custom paged wrapper. | |
+| 2.4 | **Paged FA2 decode (Phase 2c)** | Local fork of `candle-flash-attn` with `flash_attn_varlen_paged()` — passes `block_table` + `page_block_size` to FA2 kernel so it reads K/V directly from the paged block pool. Eliminates per-request gather, `Tensor::cat`, and `ContiguousKvBuffer` on all-decode batches. Cached `block_table_gpu` + `decode_slot_mapping_gpu` in `AttentionMetadata` avoid per-layer H2D copies. L40S verified: bs=8 0.921s (was 1.027s, **10% faster**), bs=32 2.654s (was 3.666s, **28% faster**). 12/12 single-GPU E2E tests pass. | ✅ |
 
 **Phase 2.1 exit criteria**: ✅ MET — `attention_with_cache()` dispatches to FA2 on CUDA F16/BF16. All model architectures use it automatically. 9 CUDA unit tests pass locally (awaiting pod verification). Local clippy + all non-CUDA tests pass.
+
+**Phase 2c exit criteria**: ✅ MET — Paged FA2 decode path eliminates contiguous buffer round-trip. L40S benchmarks show 10-28% speedup. All E2E tests pass. Fallback path preserved for prefill and sliding window.
 
 ---
 

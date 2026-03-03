@@ -1608,9 +1608,7 @@ impl Worker for CandleWorker {
                             &prepared.flat_token_ids,
                             &prepared.flat_positions,
                         )
-                        .map_err(|e| {
-                            ExecutorError::WorkerExecution(format!("graph replay: {e}"))
-                        })?
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
                 } else {
                     None
                 }
@@ -1649,11 +1647,9 @@ impl Worker for CandleWorker {
 
             let all_logits_flat = if let Some(graph_logits) = cuda_graph_logits {
                 // Graph replay succeeded — still flush real KV scatter eagerly.
-                batched_storage
-                    .flush_all()
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
-                    })?;
+                batched_storage.flush_all().map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
+                })?;
                 graph_logits
             } else {
                 // Eager forward path (no CUDA graph or not all-decode).
@@ -1669,11 +1665,9 @@ impl Worker for CandleWorker {
                     })?;
 
                 // Flush deferred scatters.
-                batched_storage
-                    .flush_all()
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
-                    })?;
+                batched_storage.flush_all().map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
+                })?;
 
                 logits
             };

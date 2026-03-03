@@ -121,7 +121,9 @@ mod tests {
     /// begin_capture + end_capture works after GPU operations (simulating warmup).
     #[test]
     fn test_cuda_stream_capture_basic() {
-        use cudarc::driver::{CudaContext, DevicePtrMut, ValidAsZeroBits, sys::CUstreamCaptureMode};
+        use cudarc::driver::{
+            CudaContext, DevicePtrMut, ValidAsZeroBits, sys::CUstreamCaptureMode,
+        };
 
         let ctx = CudaContext::new(0).expect("failed to create CUDA context");
         // new_stream() creates CU_STREAM_NON_BLOCKING — same as candle.
@@ -131,7 +133,9 @@ mod tests {
         for _ in 0..3 {
             let mut buf = stream.alloc_zeros::<f32>(1024).expect("alloc failed");
             let host_data = vec![1.0f32; 1024];
-            stream.memcpy_htod(&host_data, &mut buf).expect("memcpy failed");
+            stream
+                .memcpy_htod(&host_data, &mut buf)
+                .expect("memcpy failed");
             drop(buf); // triggers cuMemFreeAsync on this stream
         }
         stream.synchronize().expect("sync failed");
@@ -142,15 +146,18 @@ mod tests {
             .expect("begin_capture failed after warmup");
 
         // Do a capturable operation: alloc + memset.
-        let buf = stream.alloc_zeros::<f32>(256).expect("alloc during capture");
+        let buf = stream
+            .alloc_zeros::<f32>(256)
+            .expect("alloc during capture");
 
         let flags = cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
-        let graph = stream
-            .end_capture(flags)
-            .expect("end_capture failed");
+        let graph = stream.end_capture(flags).expect("end_capture failed");
 
         assert!(graph.is_some(), "graph should not be None after alloc");
-        eprintln!("Graph captured successfully with {} nodes", if graph.is_some() { "some" } else { "zero" });
+        eprintln!(
+            "Graph captured successfully with {} nodes",
+            if graph.is_some() { "some" } else { "zero" }
+        );
 
         // Launch the graph.
         graph.as_ref().unwrap().launch().expect("launch failed");
@@ -160,8 +167,8 @@ mod tests {
     /// Test capture after cuBLAS operations (simulating candle's matmul warmup).
     #[test]
     fn test_cuda_stream_capture_after_cublas() {
-        use cudarc::driver::{CudaContext, DevicePtrMut, sys::CUstreamCaptureMode};
         use cudarc::cublas::CudaBlas;
+        use cudarc::driver::{CudaContext, DevicePtrMut, sys::CUstreamCaptureMode};
 
         let ctx = CudaContext::new(0).expect("failed to create CUDA context");
         let stream = ctx.new_stream().expect("failed to create stream");
@@ -181,13 +188,19 @@ mod tests {
                 *blas.handle(),
                 cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
                 cudarc::cublas::sys::cublasOperation_t::CUBLAS_OP_N,
-                n as i32, n as i32, n as i32,
+                n as i32,
+                n as i32,
+                n as i32,
                 &1.0f32 as *const f32,
-                a_ptr as *const f32, n as i32,
-                b_ptr as *const f32, n as i32,
+                a_ptr as *const f32,
+                n as i32,
+                b_ptr as *const f32,
+                n as i32,
                 &0.0f32 as *const f32,
-                c_ptr as *mut f32, n as i32,
-            ).expect("sgemm failed");
+                c_ptr as *mut f32,
+                n as i32,
+            )
+            .expect("sgemm failed");
         }
 
         drop(a);
@@ -200,12 +213,12 @@ mod tests {
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .expect("begin_capture failed after cuBLAS warmup");
 
-        let buf = stream.alloc_zeros::<f32>(256).expect("alloc during capture");
+        let buf = stream
+            .alloc_zeros::<f32>(256)
+            .expect("alloc during capture");
 
         let flags = cudarc::driver::sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
-        let graph = stream
-            .end_capture(flags)
-            .expect("end_capture failed");
+        let graph = stream.end_capture(flags).expect("end_capture failed");
 
         assert!(graph.is_some());
         eprintln!("Graph capture after cuBLAS: OK");
@@ -224,9 +237,15 @@ mod tests {
         };
 
         eprintln!("context ordinal: {}", stream.context().ordinal());
-        eprintln!("multi-stream: {}", stream.context().is_in_multi_stream_mode());
+        eprintln!(
+            "multi-stream: {}",
+            stream.context().is_in_multi_stream_mode()
+        );
         eprintln!("event tracking: {}", stream.context().is_event_tracking());
-        eprintln!("managing sync: {}", stream.context().is_managing_stream_synchronization());
+        eprintln!(
+            "managing sync: {}",
+            stream.context().is_managing_stream_synchronization()
+        );
 
         stream.synchronize().expect("sync");
 

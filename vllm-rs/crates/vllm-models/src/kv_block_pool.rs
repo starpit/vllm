@@ -134,6 +134,20 @@ impl KvBlockPool {
         self.head_dim
     }
 
+    /// Raw K cache storage for a layer: `[num_blocks, block_size, num_kv_heads, head_dim]`.
+    ///
+    /// Used by paged FlashAttention to read K directly from the pool.
+    pub fn k_cache_for_layer(&self, layer: usize) -> &Tensor {
+        &self.k_storage[layer]
+    }
+
+    /// Raw V cache storage for a layer: `[num_blocks, block_size, num_kv_heads, head_dim]`.
+    ///
+    /// Used by paged FlashAttention to read V directly from the pool.
+    pub fn v_cache_for_layer(&self, layer: usize) -> &Tensor {
+        &self.v_storage[layer]
+    }
+
     /// Read-only reference to a K block tensor for a given layer and block index.
     ///
     /// Returns a view of shape `[block_size, num_kv_heads, head_dim]`.

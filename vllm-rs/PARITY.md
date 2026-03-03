@@ -244,8 +244,8 @@
 | KV block pool (pre-allocated) | &#x1F535; | &#x1F535; | 13 | 0 | |
 | Direct block KV reads (no gather copy) | &#x1F535; | &#x1F535; | 2 | 0 | |
 | Paged decode attention (per-block scoring) | &#x1F535; | &#x1F535; | 6 | 0 | |
-| Prefix caching (hash-based) | &#x1F535; | &#x1F535; | 5 | 0 | |
-| Automatic prefix caching | &#x1F535; | &#x1F535; | 2 | 0 | |
+| Prefix caching (hash-based, Candle + MLX) | &#x1F535; | &#x1F535; | 5 | 3 | |
+| Automatic prefix caching | &#x1F535; | &#x1F535; | 2 | 3 | |
 | Chunked prefill | &#x1F535; | &#x1F535; | 1 | 0 | |
 | KV cache compression (latent caching) | &#x1F535; | &#x1F534; | — | — | P2 |
 | KV cache offloading (CPU ↔ GPU) | &#x1F535; | &#x1F534; | — | — | P3 |
@@ -260,7 +260,7 @@
 | Batched attention metadata (cu_seqlens, slot_mapping, block_table) | &#x1F535; | &#x1F535; | 9 | 0 | |
 | Tree attention | &#x1F535; | &#x1F534; | — | — | P1 |
 
-> Unit counts: `block_pool.rs` (19), `free_block_queue.rs` (16), `kv_cache_manager.rs` (13), `kv_cache_block.rs` (11), `kv_block_pool.rs` (13), `attention.rs` (34 — 25 SDPA/paged + 9 FlashAttention v2), MLX `cache.rs` (1). FlashAttention v2 tests: decode BF16/F16, prefill BF16/F16, GQA BF16 decode/prefill, head_dim=128, sliding window, attention_with_cache dispatch — all compare FA2 CUDA output against CPU SDPA reference. Sliding window: 7 attention.rs + 2 gemma2.rs interleaved + 2 qwen2.rs max_window_layers + 1 MLX phi3 trim + 1 array-format parsing = 13. Per-row counts reflect the primary feature each test targets; some tests cross-cut multiple rows. Total section: 112 unit tests.
+> Unit counts: `block_pool.rs` (19), `free_block_queue.rs` (16), `kv_cache_manager.rs` (13), `kv_cache_block.rs` (11), `kv_block_pool.rs` (13), `attention.rs` (34 — 25 SDPA/paged + 9 FlashAttention v2), MLX `cache.rs` (3 incl. truncate). FlashAttention v2 tests: decode BF16/F16, prefill BF16/F16, GQA BF16 decode/prefill, head_dim=128, sliding window, attention_with_cache dispatch — all compare FA2 CUDA output against CPU SDPA reference. Sliding window: 7 attention.rs + 2 gemma2.rs interleaved + 2 qwen2.rs max_window_layers + 1 MLX phi3 trim + 1 array-format parsing = 13. E2E prefix caching: `e_prefix_caching.rs` — 2 CPU (CandleWorker) + 1 MLX (Metal). CandleWorker uses paged KvBlockPool; MLX uses worker-level `HashMap<u64, MlxKvCache>` pool with COW cloning. Per-row counts reflect the primary feature each test targets; some tests cross-cut multiple rows. Total section: 114 unit tests.
 >
 > **Batched attention metadata note:** The Rust port has `AttentionMetadata` (with `query_start_loc`, `seq_lens`, `block_ids`, `tokens_before`, cached `block_table_gpu`, `decode_slot_mapping_gpu` per request) used by `forward_batch()`. On CUDA, batched FA2 uses `flash_attn_varlen` for prefill/mixed batches and `flash_attn_varlen_paged` for all-decode batches — the paged path reads K/V directly from the block pool via `block_table`, eliminating per-request gathers and `Tensor::cat`. This matches Python vLLM's paged FlashAttention decode path.
 > - **CUDA**: FlashAttention varlen (`flash_attn_varlen`) for prefill/mixed + paged FA2 (`flash_attn_varlen_paged`) for decode — uses `cu_seqlens` and `block_table` to handle ragged sequences without padding or gather.

@@ -1039,6 +1039,42 @@ cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving tes
 
 ---
 
+## Phase E23: Prefix Caching (KV Cache Reuse) — DONE
+
+Test file: `e_prefix_caching.rs`
+
+Validates cross-request KV cache reuse — sending the same prompt twice should produce identical greedy output, exercising the full path from HTTP request through scheduler prefix lookup to worker token slicing and back.
+
+Two backends are tested:
+- **CandleWorker (CPU)**: Uses paged `KvBlockPool` with hash-based block tracking in `SimpleBlockTracker`. The scheduler sets `num_computed_tokens` and the worker slices tokens starting from the cached prefix.
+- **MLX (Metal)**: Uses a worker-level `HashMap<u64, MlxKvCache>` pool keyed by block-aligned prompt hash. On request completion, the KV cache is stashed; on new request with matching prefix, it is cloned (MLX copy-on-write) and truncated. Pool capped at 32 entries with FIFO eviction.
+
+### CPU path (`e_prefix_caching.rs` — Tier 1)
+
+| Test | Model | What it validates |
+|---|---|---|
+| `test_prefix_caching_same_prompt_twice` | SmolLM2-135M-Instruct | Same prompt twice → identical greedy output (CPU, paged KV) |
+| `test_prefix_caching_many_repeats` | SmolLM2-135M-Instruct | 3 repeats → all match (no degradation over time) |
+
+### MLX path (`e_prefix_caching.rs` — Tier 1, macOS only)
+
+| Test | Model | What it validates |
+|---|---|---|
+| `test_prefix_caching_mlx_same_prompt_twice` | SmolLM-135M-Instruct-4bit | Same prompt twice → identical greedy output (Metal, COW cache pool) |
+
+Run commands:
+```bash
+# CPU (CandleWorker):
+cargo test -p vllm-e2e --features e2e --test e_prefix_caching -- --ignored --test-threads=1
+
+# MLX (Apple Silicon):
+cargo test -p vllm-e2e --features e2e --test e_prefix_caching test_prefix_caching_mlx -- --ignored --test-threads=1
+```
+
+**Deliverables**: 3 E2E tests (2 CPU + 1 MLX), all verified.
+
+---
+
 ## Future Extensions (not in initial scope)
 
 - **Candle backend E2E**: Same test suite but with `--features candle-metal` or CPU-only, using GGUF models

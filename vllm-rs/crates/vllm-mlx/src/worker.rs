@@ -9,6 +9,7 @@
 //! per-dispatch overhead seen with candle's eager execution on Metal.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -56,6 +57,8 @@ pub struct MlxWorkerConfig {
     /// Whether the engine is in pooling mode.
     /// In pooling mode, `execute_model` returns embedding vectors instead of sampled tokens.
     pub is_pooling: bool,
+    /// Whether prefix caching (KV cache reuse) is enabled.
+    pub enable_prefix_caching: bool,
 }
 
 impl MlxWorkerConfig {
@@ -76,6 +79,21 @@ impl MlxWorkerConfig {
 // ---------------------------------------------------------------------------
 // MlxWorker
 // ---------------------------------------------------------------------------
+
+/// Maximum number of KV caches retained in the prefix cache pool.
+const PREFIX_CACHE_POOL_MAX: usize = 32;
+
+/// Hash the block-aligned prefix of a prompt (same logic as `SimpleBlockTracker::hash_block`).
+///
+/// Only full blocks are hashed — trailing partial blocks are ignored so that
+/// the hash matches the scheduler's prefix lookup.
+fn hash_prefix(prompt: &[u32], block_size: usize) -> u64 {
+    let num_full_blocks = prompt.len() / block_size;
+    let prefix_len = num_full_blocks * block_size;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    prompt[..prefix_len].hash(&mut hasher);
+    hasher.finish()
+}
 
 /// A worker backed by MLX for Apple Silicon GPU inference.
 ///
@@ -124,6 +142,13 @@ pub struct MlxWorker {
     /// Whether the engine is in pooling mode.
     is_pooling: bool,
 
+    /// Cached KV caches for prefix reuse: hash → kv_cache.
+    kv_cache_pool: HashMap<u64, MlxKvCache>,
+    /// Whether prefix caching is enabled.
+    enable_prefix_caching: bool,
+    /// Block size for prefix hashing (must match scheduler block size).
+    prefix_block_size: usize,
+
     // Timing instrumentation.
     step_count: usize,
     prefill_count: usize,
@@ -136,6 +161,8 @@ impl MlxWorker {
     /// Create a new MlxWorker from the given config.
     pub fn new(config: MlxWorkerConfig) -> Self {
         let is_pooling = config.is_pooling;
+        let enable_prefix_caching = config.enable_prefix_caching;
+        let prefix_block_size = config.block_size;
         Self {
             config,
             model: None,
@@ -157,6 +184,9 @@ impl MlxWorker {
             preloaded_tokenizer: None,
             is_pooling,
             resolved_architecture: None,
+            kv_cache_pool: HashMap::new(),
+            enable_prefix_caching,
+            prefix_block_size,
             step_count: 0,
             prefill_count: 0,
             decode_count: 0,
@@ -695,11 +725,33 @@ impl Worker for MlxWorker {
 
         let num_layers = model.num_layers();
 
-        // Clean up finished requests.
+        // Clean up finished requests — stash KV caches for prefix reuse.
         for req_id in &scheduler_output.finished_req_ids {
+            if self.enable_prefix_caching {
+                if let (Some(prompt), Some(kv_cache)) = (
+                    self.token_buffers.get(req_id),
+                    self.kv_caches.remove(req_id),
+                ) {
+                    if prompt.len() >= self.prefix_block_size {
+                        let h = hash_prefix(prompt, self.prefix_block_size);
+                        if !self.kv_cache_pool.contains_key(&h) {
+                            // FIFO eviction when pool is full.
+                            if self.kv_cache_pool.len() >= PREFIX_CACHE_POOL_MAX
+                                && let Some(&oldest) = self.kv_cache_pool.keys().next()
+                            {
+                                self.kv_cache_pool.remove(&oldest);
+                            }
+                            self.kv_cache_pool.insert(h, kv_cache);
+                        }
+                    }
+                } else {
+                    self.kv_caches.remove(req_id);
+                }
+            } else {
+                self.kv_caches.remove(req_id);
+            }
             self.token_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
-            self.kv_caches.remove(req_id);
             self.recurrent_states.remove(req_id);
             #[cfg(feature = "guided-decoding")]
             self.grammar_states.remove(req_id);
@@ -729,7 +781,14 @@ impl Worker for MlxWorker {
             }
 
             let prompt_ids = new_req.prompt_token_ids.as_deref().unwrap_or(&[]);
-            let tokens_to_use = &prompt_ids[..num_tokens.min(prompt_ids.len())];
+            let num_computed = new_req.num_computed_tokens as usize;
+
+            // Fix: slice from num_computed_tokens, not 0.
+            // The scheduler tells us how many prefix tokens are already cached;
+            // we only need to forward the remaining tokens.
+            let start = num_computed.min(prompt_ids.len());
+            let end = (start + num_tokens).min(prompt_ids.len());
+            let tokens_to_use = &prompt_ids[start..end];
 
             self.token_buffers
                 .insert(new_req.req_id.clone(), prompt_ids.to_vec());
@@ -761,10 +820,37 @@ impl Worker for MlxWorker {
                 self.sampling_params_map
                     .insert(new_req.req_id.clone(), params.clone());
             }
-            self.kv_caches
-                .insert(new_req.req_id.clone(), cache::empty_kv_cache(num_layers));
 
-            let pos_offset = new_req.num_computed_tokens as i32;
+            // Try to reuse a cached KV from the prefix pool.
+            let kv_cache = if num_computed > 0 && self.enable_prefix_caching {
+                let prefix = &prompt_ids[..num_computed];
+                let h = hash_prefix(prefix, self.prefix_block_size);
+                if let Some(cached) = self.kv_cache_pool.get(&h) {
+                    // Clone (MLX copy-on-write) and truncate to the matched prefix length.
+                    let mut kv = cached.clone();
+                    for layer in kv.iter_mut().flatten() {
+                        if layer.seq_len() > num_computed {
+                            layer.truncate(num_computed);
+                        }
+                    }
+                    debug!(
+                        "prefix cache hit for req {} ({} computed tokens)",
+                        new_req.req_id, num_computed
+                    );
+                    kv
+                } else {
+                    debug!(
+                        "prefix cache miss for req {} ({} computed tokens, forwarding all)",
+                        new_req.req_id, num_computed
+                    );
+                    cache::empty_kv_cache(num_layers)
+                }
+            } else {
+                cache::empty_kv_cache(num_layers)
+            };
+            self.kv_caches.insert(new_req.req_id.clone(), kv_cache);
+
+            let pos_offset = num_computed as i32;
             let positions: Vec<i32> = (0..tokens_to_use.len() as i32)
                 .map(|i| pos_offset + i)
                 .collect();
@@ -1643,6 +1729,7 @@ mod tests {
             lora_adapter: None,
             pooling_strategy: "auto".to_string(),
             is_pooling: false,
+            enable_prefix_caching: false,
         })
     }
 
@@ -1686,6 +1773,7 @@ mod tests {
             lora_adapter: None,
             pooling_strategy: "auto".to_string(),
             is_pooling: false,
+            enable_prefix_caching: false,
         };
         assert!(config.mlx_dtype().unwrap().is_none());
 

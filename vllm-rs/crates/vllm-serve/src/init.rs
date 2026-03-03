@@ -126,18 +126,6 @@ fn should_use_mlx(device: &str) -> bool {
     matches!(device, "auto" | "metal")
 }
 
-/// Check if this config will use the MLX backend.
-fn is_mlx_backend(_config: &VllmConfig) -> bool {
-    #[cfg(feature = "metal")]
-    {
-        should_use_mlx(&_config.device)
-    }
-    #[cfg(not(feature = "metal"))]
-    {
-        false
-    }
-}
-
 /// Result of worker creation: the worker plus metadata needed for init.
 type WorkerCreationResult = (
     Box<dyn Worker>,
@@ -165,6 +153,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             lora_adapter: config.lora_adapter.clone(),
             pooling_strategy: config.pooling_strategy.clone(),
             is_pooling,
+            enable_prefix_caching: config.enable_prefix_caching,
         };
 
         let mut worker = MlxWorker::new(mlx_config);
@@ -387,9 +376,7 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
 
     let use_async_scheduling = !config.disable_async_scheduling;
 
-    // Prefix caching requires paged KV (CandleWorker). The MLX worker uses
-    // per-request contiguous caches, so disable prefix caching on MLX.
-    let enable_prefix_caching = config.enable_prefix_caching && !is_mlx_backend(config);
+    let enable_prefix_caching = config.enable_prefix_caching;
 
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {

@@ -91,6 +91,15 @@ impl MlxLayerKvCache {
         self.seq_len
     }
 
+    /// Reset the logical length without touching the buffer.
+    ///
+    /// Used when cloning a cached KV for a new request that only matches
+    /// a prefix of the original sequence.
+    pub fn truncate(&mut self, new_seq_len: usize) {
+        assert!(new_seq_len <= self.seq_len);
+        self.seq_len = new_seq_len;
+    }
+
     /// View of the filled K portion: `[1, heads, seq_len, dim]`.
     fn k_view(&self) -> Result<Array, Exception> {
         self.k.try_index((.., .., ..self.seq_len as i32, ..))
@@ -246,5 +255,34 @@ mod tests {
         }
 
         assert_eq!(cache.as_ref().unwrap().seq_len(), 7);
+    }
+
+    #[test]
+    fn test_truncate() {
+        let k = Array::zeros::<f32>(&[1, 4, 16, 8]).unwrap();
+        let v = Array::zeros::<f32>(&[1, 4, 16, 8]).unwrap();
+
+        let mut entry = MlxLayerKvCache::new(&k, &v).unwrap();
+        assert_eq!(entry.seq_len(), 16);
+
+        entry.truncate(10);
+        assert_eq!(entry.seq_len(), 10);
+
+        // Can still write into the truncated cache.
+        let dk = Array::zeros::<f32>(&[1, 4, 1, 8]).unwrap();
+        let dv = Array::zeros::<f32>(&[1, 4, 1, 8]).unwrap();
+        let (kv, vv) = entry.update_and_view(&dk, &dv).unwrap();
+        mlx_rs::transforms::eval([&kv, &vv]).unwrap();
+        assert_eq!(kv.dim(2) as usize, 11);
+        assert_eq!(entry.seq_len(), 11);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion")]
+    fn test_truncate_panics_on_larger() {
+        let k = Array::zeros::<f32>(&[1, 4, 8, 8]).unwrap();
+        let v = Array::zeros::<f32>(&[1, 4, 8, 8]).unwrap();
+        let mut entry = MlxLayerKvCache::new(&k, &v).unwrap();
+        entry.truncate(16); // larger than seq_len=8 → panic
     }
 }

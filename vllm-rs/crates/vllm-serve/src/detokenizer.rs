@@ -243,10 +243,18 @@ impl IncrementalDetokenizer {
         // the Unicode replacement character (incomplete UTF-8), extract
         // the new portion.
         if full_text.len() > prefix_text.len() && !full_text.ends_with('\u{fffd}') {
-            // Update the sliding window: keep ~6 tokens of context.
-            self.prefix_offset = self.all_token_ids.len().saturating_sub(6);
-            self.read_offset = self.all_token_ids.len();
-            full_text[prefix_text.len()..].to_string()
+            // find_char_boundary ceils to the next valid boundary if
+            // prefix_text.len() falls inside a multi-byte character (the
+            // prefix and full decodes can produce different byte alignments).
+            let split_at = find_char_boundary(&full_text, prefix_text.len());
+            if split_at < full_text.len() {
+                // Update the sliding window: keep ~6 tokens of context.
+                self.prefix_offset = self.all_token_ids.len().saturating_sub(6);
+                self.read_offset = self.all_token_ids.len();
+                full_text[split_at..].to_string()
+            } else {
+                String::new()
+            }
         } else {
             // No decodable new text yet (possibly incomplete character).
             String::new()

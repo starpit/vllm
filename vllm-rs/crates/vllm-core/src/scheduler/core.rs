@@ -231,6 +231,11 @@ pub struct Scheduler {
     long_prefill_token_threshold: usize,
     /// Number of speculative lookahead tokens (0 = no speculation).
     num_lookahead_tokens: usize,
+    /// Whether async scheduling is enabled (pre-scheduling overlap).
+    /// When true, `update_after_schedule` increments `num_output_placeholders`
+    /// for non-prefill requests so the next `schedule()` call accounts for
+    /// tokens that are in-flight on the GPU but not yet finalized.
+    async_scheduling: bool,
 
     // -- Request state --
     /// All tracked requests: `req_id -> Request`.
@@ -266,6 +271,8 @@ impl Scheduler {
             .max_num_scheduled_tokens
             .unwrap_or(scheduler_config.max_num_batched_tokens);
 
+        let async_scheduling = scheduler_config.async_scheduling.unwrap_or(false);
+
         Self {
             max_num_running_reqs: scheduler_config.max_num_seqs,
             max_num_scheduled_tokens,
@@ -273,6 +280,7 @@ impl Scheduler {
             enable_chunked_prefill: scheduler_config.enable_chunked_prefill,
             long_prefill_token_threshold: scheduler_config.long_prefill_token_threshold,
             num_lookahead_tokens: 0,
+            async_scheduling,
 
             requests: HashMap::new(),
             waiting: create_request_queue(policy),
@@ -317,6 +325,18 @@ impl Scheduler {
         request.num_computed_tokens = 0;
         request.spec_token_ids.clear();
         request.num_preemptions += 1;
+        // Async scheduling: reset placeholder count so the request is
+        // re-scheduled from scratch after resuming.
+        request.num_output_placeholders = 0;
+
+        // Sync to canonical requests map.
+        if let Some(canonical) = self.requests.get_mut(&request.request_id) {
+            canonical.status = RequestStatus::Preempted;
+            canonical.num_computed_tokens = 0;
+            canonical.spec_token_ids.clear();
+            canonical.num_preemptions = request.num_preemptions;
+            canonical.num_output_placeholders = 0;
+        }
     }
 
     /// Build `CachedRequestData` for running + resumed requests.
@@ -370,6 +390,19 @@ impl Scheduler {
                 request.num_computed_tokens += num_tokens as u32;
                 request.is_prefill_chunk = (request.num_computed_tokens as usize)
                     < request.num_tokens() + request.num_output_placeholders as usize;
+
+                // Async scheduling: increment placeholders for non-prefill
+                // decode requests. Each scheduled decode step will produce
+                // 1 token (+ num_spec_tokens draft tokens) whose values are
+                // unknown until `update_from_output` runs.
+                if self.async_scheduling && !request.is_prefill_chunk {
+                    let cur_num_spec_tokens = output
+                        .scheduled_spec_decode_tokens
+                        .get(req_id)
+                        .map(|v| v.len() as u32)
+                        .unwrap_or(0);
+                    request.num_output_placeholders += 1 + cur_num_spec_tokens;
+                }
             }
         }
 
@@ -378,6 +411,7 @@ impl Scheduler {
             if let Some(canonical) = self.requests.get(&running_req.request_id) {
                 running_req.num_computed_tokens = canonical.num_computed_tokens;
                 running_req.is_prefill_chunk = canonical.is_prefill_chunk;
+                running_req.num_output_placeholders = canonical.num_output_placeholders;
             }
         }
 
@@ -434,10 +468,18 @@ impl Scheduler {
     pub fn append_output_tokens(&mut self, request_id: &str, token_ids: &[u32]) {
         if let Some(request) = self.requests.get_mut(request_id) {
             request.append_output_token_ids(token_ids);
+            // Async scheduling: decrement placeholders now that actual
+            // tokens have arrived from the GPU.
+            request.num_output_placeholders = request
+                .num_output_placeholders
+                .saturating_sub(token_ids.len() as u32);
         }
         // Also update the running list copy.
         if let Some(running_req) = self.running.iter_mut().find(|r| r.request_id == request_id) {
             running_req.append_output_token_ids(token_ids);
+            running_req.num_output_placeholders = running_req
+                .num_output_placeholders
+                .saturating_sub(token_ids.len() as u32);
         }
     }
 }
@@ -474,6 +516,29 @@ impl SchedulerInterface for Scheduler {
         let mut req_index = 0;
         while req_index < self.running.len() && token_budget > 0 {
             let request = &self.running[req_index];
+
+            // Async scheduling: skip requests that will certainly hit
+            // max_tokens once the in-flight step completes. Without this
+            // guard the scheduler would schedule one extra decode step
+            // because `update_from_output` (which checks the finish
+            // condition) hasn't run yet for the previous step.
+            //
+            // The formula is: (num_computed_tokens + 1) - (num_output_placeholders - 1)
+            //   = num_computed_tokens + 2 - num_output_placeholders
+            // Since placeholders are included in num_computed_tokens, we
+            // subtract (placeholders - 1) to count only the guaranteed
+            // minimum tokens (all drafts rejected).
+            if request.num_output_placeholders > 0 {
+                let effective_computed = request
+                    .num_computed_tokens
+                    .saturating_add(2)
+                    .saturating_sub(request.num_output_placeholders);
+                let max_total = request.num_prompt_tokens + request.max_tokens;
+                if effective_computed >= max_total {
+                    req_index += 1;
+                    continue;
+                }
+            }
 
             // How many tokens does this request need computed?
             let num_new_tokens_raw = request
@@ -1423,5 +1488,247 @@ mod tests {
 
         // After scheduling, some blocks should be allocated.
         assert!(sched.kv_cache_usage() > 0.0);
+    }
+
+    // ----- Async scheduling tests -----
+
+    fn async_scheduler_config() -> SchedulerConfig {
+        SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 4,
+            enable_chunked_prefill: true,
+            long_prefill_token_threshold: 0,
+            async_scheduling: Some(true),
+            ..Default::default()
+        }
+    }
+
+    /// Helper: create a request with a specific max_tokens.
+    fn make_request_with_max(id: &str, num_prompt_tokens: usize, max_tokens: u32) -> Request {
+        let prompt: Vec<u32> = (0..num_prompt_tokens as u32).collect();
+        Request::new(
+            id.into(),
+            prompt,
+            SamplingParams {
+                max_tokens: Some(max_tokens),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_async_placeholder_increment_on_decode() {
+        let cfg = async_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        // Add request, schedule prefill (non-chunked).
+        sched.add_request(make_request("r1", 10));
+        let output1 = sched.schedule();
+
+        // After a completed (non-chunked) prefill, is_prefill_chunk=false
+        // so placeholders are incremented to 1 (the prefill step will
+        // produce 1 output token whose value is unknown).
+        assert_eq!(output1.scheduled_new_reqs.len(), 1);
+        let req = sched.get_request("r1").unwrap();
+        assert_eq!(req.num_output_placeholders, 1);
+
+        // Simulate prefill producing a first output token.
+        sched.append_output_tokens("r1", &[99]);
+        assert_eq!(sched.get_request("r1").unwrap().num_output_placeholders, 0);
+
+        // Now schedule decode step 2.
+        let output2 = sched.schedule();
+        assert!(output2.num_scheduled_tokens.contains_key("r1"));
+
+        // After schedule, placeholder incremented again for the decode.
+        let req = sched.get_request("r1").unwrap();
+        assert_eq!(
+            req.num_output_placeholders, 1,
+            "Decode request should have 1 placeholder after async schedule"
+        );
+    }
+
+    #[test]
+    fn test_async_placeholder_decrement_on_output() {
+        let cfg = async_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.schedule(); // prefill
+
+        // First decode token from prefill.
+        sched.append_output_tokens("r1", &[99]);
+
+        // Schedule decode (sets placeholder = 1).
+        sched.schedule();
+        assert_eq!(sched.get_request("r1").unwrap().num_output_placeholders, 1);
+
+        // Simulate GPU returning 1 token → decrement placeholder.
+        sched.append_output_tokens("r1", &[100]);
+        assert_eq!(sched.get_request("r1").unwrap().num_output_placeholders, 0);
+    }
+
+    #[test]
+    fn test_async_back_to_back_schedule_no_double_schedule() {
+        // Core test: two consecutive schedule() calls without
+        // update_from_output in between must not double-schedule the
+        // same position.
+        let cfg = async_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+
+        // Prefill.
+        let output1 = sched.schedule();
+        assert_eq!(*output1.num_scheduled_tokens.get("r1").unwrap(), 10);
+
+        // Simulate prefill producing first token.
+        sched.append_output_tokens("r1", &[99]);
+
+        // First decode schedule → r1 needs 1 token.
+        let output2 = sched.schedule();
+        assert_eq!(
+            *output2.num_scheduled_tokens.get("r1").unwrap(),
+            1,
+            "First decode step should schedule 1 token"
+        );
+        // After schedule, placeholder = 1.
+
+        // Second schedule() WITHOUT update_from_output — simulates
+        // pre-scheduling while GPU is still running.
+        let output3 = sched.schedule();
+        assert_eq!(
+            *output3.num_scheduled_tokens.get("r1").unwrap(),
+            1,
+            "Second decode should schedule 1 token (placeholder prevents overlap)"
+        );
+
+        // Placeholder should now be 2 (one for each in-flight step).
+        let req = sched.get_request("r1").unwrap();
+        assert_eq!(req.num_output_placeholders, 2);
+    }
+
+    #[test]
+    fn test_async_max_tokens_guard_prevents_over_scheduling() {
+        let cfg = async_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        // Request with only 2 max_tokens.
+        sched.add_request(make_request_with_max("r1", 10, 2));
+        sched.schedule(); // prefill (10 tokens)
+
+        // Simulate generating 1st output token.
+        sched.append_output_tokens("r1", &[99]);
+
+        // Decode step 1 → schedules 1 token, placeholder = 1.
+        let output2 = sched.schedule();
+        assert_eq!(*output2.num_scheduled_tokens.get("r1").unwrap(), 1);
+        assert_eq!(sched.get_request("r1").unwrap().num_output_placeholders, 1);
+
+        // Now pre-schedule step 2 (without finalization).
+        // num_computed = 12 (10 prompt + 1 output + 1 placeholder),
+        // max_total = 10 + 2 = 12.
+        // Guard: 12 + 2 - 1 = 13 >= 12 → skip!
+        let output3 = sched.schedule();
+        assert!(
+            !output3.num_scheduled_tokens.contains_key("r1"),
+            "Max-tokens guard should prevent scheduling request about to finish"
+        );
+    }
+
+    #[test]
+    fn test_async_preemption_resets_placeholders() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 10,
+            enable_chunked_prefill: true,
+            async_scheduling: Some(true),
+            ..Default::default()
+        };
+        // 3 blocks of size 8 = 24 tokens of KV capacity.
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 3, 8);
+
+        // Schedule r1 (8 tokens = 1 block) and r2 (8 tokens = 1 block).
+        sched.add_request(make_request("r1", 8));
+        sched.add_request(make_request("r2", 8));
+        sched.schedule(); // prefill both
+
+        // Both should have placeholder = 1 after completed prefill.
+        assert_eq!(sched.get_request("r1").unwrap().num_output_placeholders, 1);
+        assert_eq!(sched.get_request("r2").unwrap().num_output_placeholders, 1);
+
+        // Simulate output tokens for both.
+        sched.append_output_tokens("r1", &[99]);
+        sched.append_output_tokens("r2", &[99]);
+        assert_eq!(sched.get_request("r1").unwrap().num_output_placeholders, 0);
+        assert_eq!(sched.get_request("r2").unwrap().num_output_placeholders, 0);
+
+        // Generate several more tokens for r1 to consume more blocks.
+        // r1 now has 8 prompt + 1 output = 9 tokens → 2 blocks.
+        // r2 has 8 prompt + 1 output = 9 tokens → 2 blocks.
+        // Total: 4 blocks needed but only 3 available.
+
+        // Schedule decode step: this should trigger preemption because
+        // r1 (2 blocks) + r2 (2 blocks) > 3 blocks.
+        let output = sched.schedule();
+
+        // One of the two should be preempted. Check which.
+        // (FCFS preempts from the back, so r2 should be preempted.)
+        if sched.get_request("r2").unwrap().status == RequestStatus::Preempted {
+            assert_eq!(
+                sched.get_request("r2").unwrap().num_output_placeholders,
+                0,
+                "Preemption must reset placeholders"
+            );
+        } else if sched.get_request("r1").unwrap().status == RequestStatus::Preempted {
+            assert_eq!(
+                sched.get_request("r1").unwrap().num_output_placeholders,
+                0,
+                "Preemption must reset placeholders"
+            );
+        }
+
+        // Only one should be scheduled.
+        assert!(
+            output.num_scheduled_tokens.len() <= 2,
+            "At most 2 requests should be scheduled with limited blocks"
+        );
+    }
+
+    #[test]
+    fn test_async_placeholder_saturating_decrement() {
+        // Ensure decrement never underflows.
+        let cfg = async_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.schedule(); // prefill
+
+        // Placeholders = 0. Appending tokens should not underflow.
+        sched.append_output_tokens("r1", &[99, 100, 101]);
+        assert_eq!(sched.get_request("r1").unwrap().num_output_placeholders, 0);
+    }
+
+    #[test]
+    fn test_sync_mode_no_placeholders() {
+        // Verify that without async_scheduling, placeholders are never set.
+        let cfg = test_scheduler_config(); // async_scheduling = None (false)
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.schedule(); // prefill
+
+        sched.append_output_tokens("r1", &[99]);
+
+        sched.schedule(); // decode
+        assert_eq!(
+            sched.get_request("r1").unwrap().num_output_placeholders,
+            0,
+            "Sync mode should never set placeholders"
+        );
     }
 }

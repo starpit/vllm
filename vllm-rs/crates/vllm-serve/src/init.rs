@@ -330,19 +330,21 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         info!("EOS token IDs: {:?}", eos_token_ids);
     }
 
+    let use_async_scheduling = !config.disable_async_scheduling;
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
             max_num_batched_tokens: max_model_len.min(8192),
             max_num_seqs: config.max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,
+            async_scheduling: Some(use_async_scheduling),
             ..Default::default()
         },
         max_model_len,
         num_gpu_blocks,
         block_size: config.block_size,
         engine_index: 0,
-        async_scheduling: true,
+        async_scheduling: use_async_scheduling,
         use_spec_decode: config.speculative_model.is_some(),
         ngram_proposer_config: if config.speculative_model.as_deref() == Some("ngram") {
             Some(vllm_engine::ngram::NgramProposerConfig {
@@ -644,19 +646,21 @@ fn initialize_stack_tp(
         info!("EOS token IDs: {:?}", eos_token_ids);
     }
 
+    let use_async_scheduling = !config.disable_async_scheduling;
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
             max_num_batched_tokens: max_model_len.min(8192),
             max_num_seqs: config.max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,
+            async_scheduling: Some(use_async_scheduling),
             ..Default::default()
         },
         max_model_len,
         num_gpu_blocks,
         block_size: config.block_size,
         engine_index: 0,
-        async_scheduling: true,
+        async_scheduling: use_async_scheduling,
         use_spec_decode: config.speculative_model.is_some(),
         ngram_proposer_config: if config.speculative_model.as_deref() == Some("ngram") {
             Some(vllm_engine::ngram::NgramProposerConfig {

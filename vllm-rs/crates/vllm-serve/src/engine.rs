@@ -1151,10 +1151,10 @@ impl AsyncEngine {
             .take_executor()
             .expect("async scheduling requires an executor");
 
-        // Bounded channel with capacity 1: the step loop can't enqueue a new
-        // schedule until the executor consumes the previous one.
-        let (sched_tx, sched_rx) = std::sync::mpsc::sync_channel::<ExecutorWork>(1);
-        let (model_tx, mut model_rx) = tokio::sync::mpsc::channel::<ExecutorResult>(1);
+        // Bounded channel with capacity 2: allows up to 2 batches in flight
+        // (one executing, one queued) without blocking the tokio thread.
+        let (sched_tx, sched_rx) = tokio::sync::mpsc::channel::<ExecutorWork>(2);
+        let (model_tx, mut model_rx) = tokio::sync::mpsc::channel::<ExecutorResult>(2);
 
         // Spawn the executor on a dedicated OS thread.
         std::thread::Builder::new()
@@ -1163,18 +1163,21 @@ impl AsyncEngine {
             .expect("failed to spawn executor thread");
 
         tokio::spawn(async move {
-            // Deferred finalization: when GPU(N) completes, immediately
-            // schedule(N+1) and send to GPU, then finalize(N) while GPU
-            // runs N+1. This overlaps finalization with GPU execution.
+            // Pre-scheduling with deferred finalization:
             //
-            //   GPU: ─execute(N)──┐──execute(N+1)────────────────┐
-            //                     │                              │
-            //   CPU:    waiting   │sched(N+1)→send│finalize(N)   │
+            // GPU: ─execute(N)───────────────────────┬─execute(N+1)──
+            //                                        │ (pre-queued)
+            // CPU: finalize(N-1)→sched(N+1)→wait(N)→send│→finalize(N)→...
+            //
+            // The scheduler uses `num_output_placeholders` to account for
+            // tokens that are in-flight on the GPU but not yet finalized.
+            // This allows schedule(N+1) to run before finalize(N) without
+            // double-scheduling the same position.
             let mut deferred: Option<(
                 Box<vllm_core::scheduler::output::SchedulerOutput>,
                 ModelRunnerOutput,
             )> = None;
-            let mut gpu_busy = false;
+            let mut gpu_in_flight: u32 = 0;
 
             loop {
                 // 0. Drain pending embedding requests.
@@ -1182,6 +1185,7 @@ impl AsyncEngine {
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                     if sched_tx
                         .send(ExecutorWork::Embed(embed_req.token_id_seqs, reply_tx))
+                        .await
                         .is_err()
                     {
                         let _ = embed_req.reply.send(Err(ServeError::Internal(
@@ -1204,15 +1208,53 @@ impl AsyncEngine {
                     added = true;
                 }
 
-                // 2. If the GPU is busy, wait for its result.
-                if gpu_busy {
+                // 2. Finalize the previously completed step. The GPU is
+                //    already running (or about to run) the next batch, so
+                //    this CPU work overlaps with GPU execution.
+                if let Some((prev_sched, prev_output)) = deferred.take() {
+                    match client.finalize_step(&prev_sched, &prev_output) {
+                        Ok(outputs) => {
+                            route_step_outputs(&requests, outputs).await;
+                        }
+                        Err(e) => {
+                            error!("finalize_step error: {}", e);
+                        }
+                    }
+                    notify.notify_waiters();
+                }
+
+                // 3. Pre-schedule: fill the pipeline up to 2 in-flight
+                //    batches. With placeholder tracking, the scheduler
+                //    correctly accounts for tokens still on the GPU.
+                while gpu_in_flight < 2 {
+                    match client.schedule_next() {
+                        Ok(Some(sched)) => {
+                            if sched_tx
+                                .send(ExecutorWork::Execute(Box::new(sched)))
+                                .await
+                                .is_err()
+                            {
+                                break; // Executor thread exited.
+                            }
+                            gpu_in_flight += 1;
+                        }
+                        Ok(None) => break, // Nothing to schedule.
+                        Err(e) => {
+                            error!("schedule_next error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // 4. Wait for the oldest GPU result.
+                if gpu_in_flight > 0 {
                     match model_rx.recv().await {
                         Some(ExecutorResult::Model(Ok(model_output), sched)) => {
                             deferred = Some((sched, model_output));
+                            gpu_in_flight -= 1;
                         }
                         Some(ExecutorResult::Model(Err(e), sched)) => {
                             error!("Executor error: {}", e);
-                            // Abort every request that was in the failed batch.
                             let err_msg = format!("Executor error: {e}");
                             let req_ids: Vec<String> =
                                 sched.num_scheduled_tokens.keys().cloned().collect();
@@ -1228,57 +1270,22 @@ impl AsyncEngine {
                             }
                             drop(reqs);
                             notify.notify_waiters();
+                            gpu_in_flight -= 1;
                         }
                         None => {
                             // Executor thread exited.
                             break;
                         }
                     }
-                    gpu_busy = false;
 
-                    // Drain requests that arrived while GPU was busy.
+                    // Drain requests that arrived while waiting for GPU.
                     while let Ok(ec_request) = request_rx.try_recv() {
                         if let Err(e) = client.add_request(ec_request) {
                             error!("Failed to add request: {}", e);
                         }
                     }
-                }
-
-                // 3. Schedule and send next batch BEFORE finalizing, so the
-                //    GPU starts immediately while we do CPU finalization.
-                match client.schedule_next() {
-                    Ok(Some(sched)) => {
-                        if sched_tx
-                            .send(ExecutorWork::Execute(Box::new(sched)))
-                            .is_err()
-                        {
-                            break; // Executor thread exited.
-                        }
-                        gpu_busy = true;
-                    }
-                    Ok(None) => { /* nothing to schedule */ }
-                    Err(e) => {
-                        error!("schedule_next error: {}", e);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    }
-                }
-
-                // 4. NOW finalize the previous step — the GPU is already
-                //    working on the next batch, so this CPU work is free.
-                if let Some((prev_sched, prev_output)) = deferred.take() {
-                    match client.finalize_step(&prev_sched, &prev_output) {
-                        Ok(outputs) => {
-                            route_step_outputs(&requests, outputs).await;
-                        }
-                        Err(e) => {
-                            error!("finalize_step error: {}", e);
-                        }
-                    }
-                    notify.notify_waiters();
-                }
-
-                // 5. If the GPU isn't busy, idle-wait or yield.
-                if !gpu_busy {
+                } else {
+                    // 5. No GPU work — idle-wait for a new request.
                     let has_requests = {
                         let reqs = requests.lock().await;
                         !reqs.is_empty()
@@ -1298,6 +1305,7 @@ impl AsyncEngine {
                                         embed_req.token_id_seqs,
                                         reply_tx,
                                     ))
+                                    .await
                                     .is_err()
                                 {
                                     let _ = embed_req.reply.send(Err(ServeError::Internal(
@@ -1332,7 +1340,7 @@ impl AsyncEngine {
             notify.notify_waiters(); // Wake any poll_until_done waiters so they see the dead loop.
 
             // Shutdown: drop the sender so the executor thread exits.
-            let _ = sched_tx.send(ExecutorWork::Shutdown);
+            let _ = sched_tx.send(ExecutorWork::Shutdown).await;
         })
     }
 
@@ -2166,10 +2174,10 @@ enum ExecutorResult {
 /// back. Runs on a dedicated OS thread so GPU work doesn't block tokio.
 fn executor_thread_loop(
     mut executor: Box<dyn Executor>,
-    rx: std::sync::mpsc::Receiver<ExecutorWork>,
+    mut rx: tokio::sync::mpsc::Receiver<ExecutorWork>,
     tx: tokio::sync::mpsc::Sender<ExecutorResult>,
 ) {
-    while let Ok(work) = rx.recv() {
+    while let Some(work) = rx.blocking_recv() {
         match work {
             ExecutorWork::Execute(sched) => {
                 let result = executor.execute_model(&sched);

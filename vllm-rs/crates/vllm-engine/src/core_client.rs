@@ -32,7 +32,10 @@ pub trait EngineCoreClient {
     ///
     /// For the in-process client, this runs a step and returns the outputs.
     /// For the multi-process client, this receives outputs from ZMQ.
-    fn get_output(&mut self) -> EngineResult<EngineCoreOutputs>;
+    ///
+    /// Returns `(outputs, model_executed)` where `model_executed` indicates
+    /// whether the model actually ran a forward pass this step.
+    fn get_output(&mut self) -> EngineResult<(EngineCoreOutputs, bool)>;
 
     /// Add a new inference request.
     fn add_request(&mut self, request: EngineCoreRequest) -> EngineResult<()>;
@@ -153,20 +156,20 @@ impl InprocClient {
 }
 
 impl EngineCoreClient for InprocClient {
-    fn get_output(&mut self) -> EngineResult<EngineCoreOutputs> {
-        let (outputs, _model_executed) = self.engine.step()?;
+    fn get_output(&mut self) -> EngineResult<(EngineCoreOutputs, bool)> {
+        let (outputs, model_executed) = self.engine.step()?;
 
         // Merge all client outputs into a single EngineCoreOutputs.
         // In the in-process case, there's typically just one client (index 0).
         if outputs.is_empty() {
-            return Ok(EngineCoreOutputs::default());
+            return Ok((EngineCoreOutputs::default(), model_executed));
         }
 
         // Return client 0's outputs, or merge all clients.
         if let Some(out) = outputs.into_values().next() {
-            Ok(out)
+            Ok((out, model_executed))
         } else {
-            Ok(EngineCoreOutputs::default())
+            Ok((EngineCoreOutputs::default(), model_executed))
         }
     }
 
@@ -297,8 +300,9 @@ mod tests {
         client.add_request(make_ec_request("req-1", 10)).unwrap();
 
         // Get output (triggers a step).
-        let outputs = client.get_output().unwrap();
+        let (outputs, model_executed) = client.get_output().unwrap();
         assert!(!outputs.outputs.is_empty());
+        assert!(model_executed);
     }
 
     #[test]
@@ -308,8 +312,9 @@ mod tests {
         let mut client = InprocClient::new(config, executor);
 
         // No requests, should return empty outputs.
-        let outputs = client.get_output().unwrap();
+        let (outputs, model_executed) = client.get_output().unwrap();
         assert!(outputs.outputs.is_empty());
+        assert!(!model_executed);
     }
 
     #[test]
@@ -369,7 +374,7 @@ mod tests {
         client.add_request(make_ec_request("req-1", 10)).unwrap();
 
         // First step should produce output.
-        let outputs = client.get_output().unwrap();
+        let (outputs, _) = client.get_output().unwrap();
         assert!(!outputs.outputs.is_empty());
 
         // Subsequent steps should not error (request may or may not produce
@@ -391,7 +396,7 @@ mod tests {
                 .unwrap();
         }
 
-        let outputs = client.get_output().unwrap();
+        let (outputs, _) = client.get_output().unwrap();
         assert!(outputs.outputs.len() >= 10);
     }
 
@@ -403,7 +408,7 @@ mod tests {
         let mut client: Box<dyn EngineCoreClient> = Box::new(InprocClient::new(config, executor));
 
         client.add_request(make_ec_request("req-1", 10)).unwrap();
-        let outputs = client.get_output().unwrap();
+        let (outputs, _) = client.get_output().unwrap();
         assert!(!outputs.outputs.is_empty());
         client.shutdown().unwrap();
     }

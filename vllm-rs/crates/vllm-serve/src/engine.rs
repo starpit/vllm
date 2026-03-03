@@ -1068,7 +1068,7 @@ impl AsyncEngine {
                 let step_result = tokio::task::block_in_place(|| client.get_output());
 
                 match step_result {
-                    Ok(outputs) => {
+                    Ok((outputs, model_executed)) => {
                         // 4. Update scheduler gauges from stats.
                         #[cfg(feature = "metrics")]
                         if let Some(stats) = &outputs.scheduler_stats {
@@ -1084,6 +1084,11 @@ impl AsyncEngine {
                             for output in outputs.outputs {
                                 Self::process_output(&mut reqs, output);
                             }
+                            // Wake waiters only when there are actual outputs.
+                            notify.notify_waiters();
+                        } else if !model_executed {
+                            // No work done — yield to avoid busy-spinning.
+                            tokio::task::yield_now().await;
                         }
                     }
                     Err(e) => {
@@ -1091,9 +1096,6 @@ impl AsyncEngine {
                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     }
                 }
-
-                // 5. Wake all waiting handlers so they can check their results.
-                notify.notify_waiters();
             }
         })
     }
@@ -1207,8 +1209,7 @@ impl AsyncEngine {
                         pending_sched = Some(sched);
                     }
                     Ok(None) => {
-                        // Nothing to schedule. Route any pending outputs and wait.
-                        notify.notify_waiters();
+                        // Nothing to schedule.
 
                         // Check if there are tracked requests.
                         let has_requests = {
@@ -1247,6 +1248,9 @@ impl AsyncEngine {
                                 }
                                 else => break, // Both channels closed.
                             }
+                        } else {
+                            // Requests exist but nothing to schedule — yield to avoid spinning.
+                            tokio::task::yield_now().await;
                         }
                     }
                     Err(e) => {

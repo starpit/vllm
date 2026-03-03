@@ -124,6 +124,16 @@ impl KvBlockPool {
         &self.device
     }
 
+    /// Number of KV attention heads per layer.
+    pub fn num_kv_heads(&self) -> usize {
+        self.num_kv_heads
+    }
+
+    /// Head dimension (per attention head).
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
     /// Read-only reference to a K block tensor for a given layer and block index.
     ///
     /// Returns a view of shape `[block_size, num_kv_heads, head_dim]`.

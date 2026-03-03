@@ -666,7 +666,12 @@ pub fn batched_flash_attention_with_cache(
     } = *config;
 
     // Phase 1: Per-request KV cache management.
-    // Gather cached K/V, concatenate with new tokens, store back, collect for batched attention.
+    // Uses pre-allocated contiguous buffers with in-place CUDA writes to
+    // eliminate per-step GPU memory allocation and O(seq_len) block gathers.
+    let num_layers = storage.pool.num_layers();
+    let num_kv_heads = storage.pool.num_kv_heads();
+    let head_dim = storage.pool.head_dim();
+    let pool_dtype = storage.pool.dtype();
     let mut all_k_parts: Vec<Tensor> = Vec::with_capacity(num_reqs);
     let mut all_v_parts: Vec<Tensor> = Vec::with_capacity(num_reqs);
     let mut kv_cumlen: Vec<u32> = Vec::with_capacity(num_reqs + 1);
@@ -679,27 +684,52 @@ pub fn batched_flash_attention_with_cache(
         let k_req = k_new.narrow(0, start, q_len).map_err(ModelError::Candle)?;
         let v_req = v_new.narrow(0, start, q_len).map_err(ModelError::Candle)?;
 
-        // Cache: gather previously stored K/V, concat with new, store back.
-        let mut handle = storage.request_layer_handle(req_idx, layer_idx);
-        let (k_full, v_full) = if let Some((cached_k, cached_v)) = handle.take_cached()? {
-            let k_cat = Tensor::cat(&[&cached_k, &k_req], 0).map_err(ModelError::Candle)?;
-            let v_cat = Tensor::cat(&[&cached_v, &v_req], 0).map_err(ModelError::Candle)?;
-            // Decode (q_len==1): store only the new token, not the full sequence.
-            // The old tokens are already in the pool (gather was non-destructive).
-            if q_len == 1 {
-                let k_token = k_req.squeeze(0).map_err(ModelError::Candle)?;
-                let v_token = v_req.squeeze(0).map_err(ModelError::Candle)?;
-                handle.store_new_token(k_token, v_token)?;
-            } else {
-                handle.store(k_cat.clone(), v_cat.clone())?;
-            }
-            (k_cat, v_cat)
+        // Check if we have a pre-allocated contiguous buffer from a previous step.
+        let has_buf = storage.contiguous_kv_buf(req_idx, layer_idx).is_some();
+
+        let (k_full, v_full) = if has_buf {
+            // Fast path: write new tokens in-place into the pre-allocated buffer.
+            // Zero GPU memory allocation during decode.
+            let buf = storage.contiguous_kv_buf(req_idx, layer_idx).unwrap();
+            buf.write(&k_req, &v_req, buf.len)?;
+            let view = buf.view()?;
+            // Skip paged block writes during decode — the contiguous buffer is
+            // authoritative. Paged blocks were populated during prefill and are
+            // not read again while the contiguous buffer exists.
+            view
         } else {
-            // First call (prefill): no cached data.
-            handle.store(k_req.clone(), v_req.clone())?;
-            (k_req, v_req)
+            // Slow path: gather from paged blocks (prefill / first decode step).
+            let mut handle = storage.request_layer_handle(req_idx, layer_idx);
+            let (k_full, v_full) = if let Some((cached_k, cached_v)) = handle.take_cached()? {
+                let k_cat = Tensor::cat(&[&cached_k, &k_req], 0).map_err(ModelError::Candle)?;
+                let v_cat = Tensor::cat(&[&cached_v, &v_req], 0).map_err(ModelError::Candle)?;
+                if q_len == 1 {
+                    let k_token = k_req.squeeze(0).map_err(ModelError::Candle)?;
+                    let v_token = v_req.squeeze(0).map_err(ModelError::Candle)?;
+                    handle.store_new_token(k_token, v_token)?;
+                } else {
+                    handle.store(k_cat.clone(), v_cat.clone())?;
+                }
+                (k_cat, v_cat)
+            } else {
+                handle.store(k_req.clone(), v_req.clone())?;
+                (k_req, v_req)
+            };
+            // Allocate contiguous buffer and populate it for subsequent decode steps.
+            let total_len = k_full.dim(0).map_err(ModelError::Candle)?;
+            // Capacity: current length + generous headroom to avoid re-allocation.
+            let capacity = (total_len + 256).next_power_of_two();
+            let mut buf = crate::ContiguousKvBuffer::new(
+                capacity,
+                num_kv_heads,
+                head_dim,
+                pool_dtype,
+                device,
+            )?;
+            buf.write(&k_full, &v_full, 0)?;
+            storage.store_contiguous_kv_buf(req_idx, num_layers, layer_idx, buf);
+            (k_full, v_full)
         };
-        // handle dropped here — borrow on storage released
 
         // Sliding window: trim K/V for attention (full sequence stored in cache above).
         let (k_for_attn, v_for_attn) = if let Some(w) = sliding_window {

@@ -138,6 +138,15 @@ pub struct CandleWorker {
     is_pooling: bool,
     /// Resolved model architecture name (e.g. "LlamaForCausalLM").
     resolved_architecture: Option<String>,
+    /// Per-request contiguous KV cache for CUDA decode optimization.
+    ///
+    /// Pre-allocated buffers that use in-place CUDA writes (reshape_and_cache)
+    /// to eliminate GPU memory allocation during decode. Each buffer is
+    /// allocated once on prefill and reused for all subsequent decode steps.
+    ///
+    /// Only populated on CUDA with BF16/FP16 (FA2 path).
+    #[cfg(feature = "cuda")]
+    contiguous_kv_cache: HashMap<String, Vec<Option<vllm_models::ContiguousKvBuffer>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +230,8 @@ impl CandleWorker {
             mm_data_map: HashMap::new(),
             is_pooling,
             resolved_architecture: None,
+            #[cfg(feature = "cuda")]
+            contiguous_kv_cache: HashMap::new(),
         }
     }
 
@@ -1345,6 +1356,8 @@ impl Worker for CandleWorker {
             self.sampling_params_map.remove(req_id);
             self.kv_caches.remove(req_id);
             self.recurrent_states.remove(req_id);
+            #[cfg(feature = "cuda")]
+            self.contiguous_kv_cache.remove(req_id);
             #[cfg(feature = "guided-decoding")]
             self.grammar_states.remove(req_id);
             self.mm_data_map.remove(req_id);
@@ -1529,7 +1542,25 @@ impl Worker for CandleWorker {
                 .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
 
             // Build BatchedKvCacheStorage.
+            // On CUDA: inject pre-allocated contiguous KV buffers to avoid
+            // O(seq_len) block gathers and per-step GPU memory allocation.
+            #[cfg(feature = "cuda")]
+            let contiguous_kv: Vec<_> = prepared
+                .req_inputs
+                .iter()
+                .map(|r| self.contiguous_kv_cache.remove(&r.req_id))
+                .collect();
+
             let pool = self.kv_block_pool.as_mut().unwrap();
+
+            #[cfg(feature = "cuda")]
+            let mut batched_storage = vllm_models::BatchedKvCacheStorage::with_contiguous_kv(
+                pool,
+                prepared.batch_block_ids,
+                prepared.batch_tokens_before,
+                contiguous_kv,
+            );
+            #[cfg(not(feature = "cuda"))]
             let mut batched_storage = vllm_models::BatchedKvCacheStorage::new(
                 pool,
                 prepared.batch_block_ids,
@@ -1552,6 +1583,18 @@ impl Worker for CandleWorker {
             batched_storage
                 .flush_all()
                 .map_err(|e| ExecutorError::WorkerExecution(format!("scatter flush error: {e}")))?;
+
+            // Extract updated contiguous KV buffers for persistence.
+            #[cfg(feature = "cuda")]
+            {
+                let updated_kv = batched_storage.take_all_contiguous_kv();
+                for (i, kv) in updated_kv.into_iter().enumerate() {
+                    if let Some(kv_vec) = kv {
+                        self.contiguous_kv_cache
+                            .insert(prepared.req_inputs[i].req_id.clone(), kv_vec);
+                    }
+                }
+            }
 
             // Split flat logits [total_tokens, vocab] into per-request logits.
             let mut per_req_logits = Vec::with_capacity(prepared.req_inputs.len());

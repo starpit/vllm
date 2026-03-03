@@ -75,6 +75,156 @@ pub type LayerKvCache = (Tensor, Tensor);
 /// The vector length must equal the number of layers in the model.
 pub type KvCache = Vec<Option<LayerKvCache>>;
 
+/// Pre-allocated contiguous KV buffer for CUDA decode optimization.
+///
+/// Eliminates per-step tensor allocation by writing new tokens in-place
+/// via the CUDA `reshape_and_cache` kernel. The buffer is allocated once
+/// on prefill and reused for all subsequent decode steps.
+///
+/// The buffer layout is `[1, capacity, num_kv_heads, head_dim]` to match
+/// the `reshape_and_cache` kernel's expected cache layout.
+#[cfg(feature = "cuda")]
+pub struct ContiguousKvBuffer {
+    /// K cache buffer: `[1, capacity, num_kv_heads, head_dim]`
+    pub k_buf: Tensor,
+    /// V cache buffer: `[1, capacity, num_kv_heads, head_dim]`
+    pub v_buf: Tensor,
+    /// Number of tokens currently filled (0..=capacity).
+    pub len: usize,
+    /// Maximum number of tokens this buffer can hold.
+    pub capacity: usize,
+    /// Pre-allocated slot indices `[0, 1, ..., capacity-1]` on GPU.
+    /// Used as a zero-copy source for `reshape_and_cache` slot_mapping
+    /// via `narrow()`, eliminating per-write GPU tensor allocation.
+    slot_indices: Tensor,
+}
+
+#[cfg(feature = "cuda")]
+impl ContiguousKvBuffer {
+    /// Allocate a new buffer with the given capacity.
+    pub fn new(
+        capacity: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        dtype: candle_core::DType,
+        device: &candle_core::Device,
+    ) -> vllm_model::ModelResult<Self> {
+        use vllm_model::error::ModelError;
+        let k_buf = Tensor::zeros((1, capacity, num_kv_heads, head_dim), dtype, device)
+            .map_err(ModelError::Candle)?;
+        let v_buf = Tensor::zeros((1, capacity, num_kv_heads, head_dim), dtype, device)
+            .map_err(ModelError::Candle)?;
+        // Pre-allocate slot indices on GPU — narrow() gives zero-copy views.
+        let indices: Vec<i64> = (0..capacity as i64).collect();
+        let slot_indices = Tensor::new(indices.as_slice(), device).map_err(ModelError::Candle)?;
+        Ok(Self {
+            k_buf,
+            v_buf,
+            len: 0,
+            capacity,
+            slot_indices,
+        })
+    }
+
+    /// Write tokens into the buffer using the CUDA reshape_and_cache kernel.
+    ///
+    /// * `k` — keys, shape `[num_tokens, num_kv_heads, head_dim]`
+    /// * `v` — values, same shape
+    /// * `start` — position in the buffer to write at
+    pub fn write(&mut self, k: &Tensor, v: &Tensor, start: usize) -> vllm_model::ModelResult<()> {
+        use vllm_kernels::cache::{CacheKernels, CudaCacheKernels};
+        use vllm_model::error::ModelError;
+
+        let num_tokens = k.dim(0).map_err(ModelError::Candle)?;
+
+        // Grow buffer if needed.
+        if start + num_tokens > self.capacity {
+            self.grow(start + num_tokens)?;
+        }
+
+        // Zero-copy narrow of pre-allocated slot indices — no GPU allocation.
+        let slot_mapping = self
+            .slot_indices
+            .narrow(0, start, num_tokens)
+            .map_err(ModelError::Candle)?;
+
+        CudaCacheKernels
+            .reshape_and_cache(k, v, &self.k_buf, &self.v_buf, &slot_mapping)
+            .map_err(|e| ModelError::Other(e.to_string()))?;
+
+        self.len = start + num_tokens;
+        Ok(())
+    }
+
+    /// Grow the buffer to accommodate at least `min_capacity` tokens.
+    fn grow(&mut self, min_capacity: usize) -> vllm_model::ModelResult<()> {
+        use vllm_kernels::cache::{CacheKernels, CudaCacheKernels};
+        use vllm_model::error::ModelError;
+
+        let new_capacity = (min_capacity + 256).next_power_of_two();
+        let (_one, _old_cap, num_kv_heads, head_dim) =
+            self.k_buf.dims4().map_err(ModelError::Candle)?;
+        let dtype = self.k_buf.dtype();
+        let device = self.k_buf.device().clone();
+
+        let new_k = Tensor::zeros((1, new_capacity, num_kv_heads, head_dim), dtype, &device)
+            .map_err(ModelError::Candle)?;
+        let new_v = Tensor::zeros((1, new_capacity, num_kv_heads, head_dim), dtype, &device)
+            .map_err(ModelError::Candle)?;
+
+        // Copy old data into new buffers via reshape_and_cache.
+        if self.len > 0 {
+            let old_k = self
+                .k_buf
+                .squeeze(0)
+                .map_err(ModelError::Candle)?
+                .narrow(0, 0, self.len)
+                .map_err(ModelError::Candle)?;
+            let old_v = self
+                .v_buf
+                .squeeze(0)
+                .map_err(ModelError::Candle)?
+                .narrow(0, 0, self.len)
+                .map_err(ModelError::Candle)?;
+            let slots: Vec<i64> = (0..self.len as i64).collect();
+            let slot_mapping =
+                Tensor::new(slots.as_slice(), &device).map_err(ModelError::Candle)?;
+            CudaCacheKernels
+                .reshape_and_cache(&old_k, &old_v, &new_k, &new_v, &slot_mapping)
+                .map_err(|e| ModelError::Other(e.to_string()))?;
+        }
+
+        // Update slot_indices to match new capacity.
+        let indices: Vec<i64> = (0..new_capacity as i64).collect();
+        self.slot_indices = Tensor::new(indices.as_slice(), &device).map_err(ModelError::Candle)?;
+
+        self.k_buf = new_k;
+        self.v_buf = new_v;
+        self.capacity = new_capacity;
+        Ok(())
+    }
+
+    /// Get a view of the filled portion for attention.
+    ///
+    /// Returns `(K, V)` each of shape `[len, num_kv_heads, head_dim]`.
+    pub fn view(&self) -> vllm_model::ModelResult<(Tensor, Tensor)> {
+        use vllm_model::error::ModelError;
+        let k = self
+            .k_buf
+            .squeeze(0)
+            .map_err(ModelError::Candle)?
+            .narrow(0, 0, self.len)
+            .map_err(ModelError::Candle)?;
+        let v = self
+            .v_buf
+            .squeeze(0)
+            .map_err(ModelError::Candle)?
+            .narrow(0, 0, self.len)
+            .map_err(ModelError::Candle)?;
+        Ok((k, v))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KvCacheStorage — unified cache abstraction
 // ---------------------------------------------------------------------------
@@ -373,6 +523,14 @@ pub struct BatchedKvCacheStorage<'a> {
     tokens_before: Vec<usize>,
     /// Per-request pending writes. Each inner vec collects writes for one request.
     pending_writes: Vec<Vec<PendingWrite>>,
+    /// Per-request contiguous KV cache for CUDA decode optimization.
+    ///
+    /// Pre-allocated buffers that use in-place CUDA writes (reshape_and_cache)
+    /// instead of Tensor::cat, eliminating GPU memory allocation during decode.
+    ///
+    /// Layout: `contiguous_kv[req_idx]` = per-layer vec where `[layer]` = `Some(buffer)`.
+    #[cfg(feature = "cuda")]
+    contiguous_kv: Vec<Option<Vec<Option<ContiguousKvBuffer>>>>,
 }
 
 impl<'a> BatchedKvCacheStorage<'a> {
@@ -388,7 +546,70 @@ impl<'a> BatchedKvCacheStorage<'a> {
             block_ids,
             tokens_before,
             pending_writes: (0..num_reqs).map(|_| Vec::new()).collect(),
+            #[cfg(feature = "cuda")]
+            contiguous_kv: (0..num_reqs).map(|_| None).collect(),
         }
+    }
+
+    /// Create batched storage with pre-allocated contiguous KV buffers.
+    ///
+    /// Used on CUDA to avoid O(seq_len) gathers from paged blocks during decode.
+    /// Pass the buffers extracted from the previous step via
+    /// `take_all_contiguous_kv()`.
+    #[cfg(feature = "cuda")]
+    pub fn with_contiguous_kv(
+        pool: &'a mut KvBlockPool,
+        block_ids: Vec<Vec<usize>>,
+        tokens_before: Vec<usize>,
+        contiguous_kv: Vec<Option<Vec<Option<ContiguousKvBuffer>>>>,
+    ) -> Self {
+        let num_reqs = block_ids.len();
+        Self {
+            pool,
+            block_ids,
+            tokens_before,
+            pending_writes: (0..num_reqs).map(|_| Vec::new()).collect(),
+            contiguous_kv,
+        }
+    }
+
+    /// Get a mutable reference to the contiguous KV buffer for a request+layer.
+    #[cfg(feature = "cuda")]
+    pub fn contiguous_kv_buf(
+        &mut self,
+        req_idx: usize,
+        layer: usize,
+    ) -> Option<&mut ContiguousKvBuffer> {
+        self.contiguous_kv
+            .get_mut(req_idx)
+            .and_then(|opt| opt.as_mut())
+            .and_then(|layers| layers.get_mut(layer))
+            .and_then(|slot| slot.as_mut())
+    }
+
+    /// Store a contiguous KV buffer for a specific request and layer.
+    #[cfg(feature = "cuda")]
+    pub fn store_contiguous_kv_buf(
+        &mut self,
+        req_idx: usize,
+        num_layers: usize,
+        layer: usize,
+        buf: ContiguousKvBuffer,
+    ) {
+        if req_idx >= self.contiguous_kv.len() {
+            return;
+        }
+        let layers = self.contiguous_kv[req_idx]
+            .get_or_insert_with(|| (0..num_layers).map(|_| None).collect());
+        if layer < layers.len() {
+            layers[layer] = Some(buf);
+        }
+    }
+
+    /// Extract all contiguous KV buffers for persistence between steps.
+    #[cfg(feature = "cuda")]
+    pub fn take_all_contiguous_kv(&mut self) -> Vec<Option<Vec<Option<ContiguousKvBuffer>>>> {
+        std::mem::take(&mut self.contiguous_kv)
     }
 
     /// Extract a per-layer handle for one request. Returns a standard

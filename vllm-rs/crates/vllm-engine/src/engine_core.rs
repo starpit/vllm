@@ -295,11 +295,12 @@ impl EngineCore {
         let scheduler_output = self.scheduler.schedule();
         let model_executed = scheduler_output.total_num_scheduled_tokens > 0;
 
-        if !model_executed {
+        if !model_executed && scheduler_output.finished_req_ids.is_empty() {
             return Ok((HashMap::new(), false));
         }
 
-        // 2. Execute model.
+        // 2. Execute model (also handles cleanup of finished requests even
+        //    when no tokens are scheduled).
         let model_output = executor
             .execute_model(&scheduler_output)
             .map_err(|e| EngineError::Executor(e.to_string()))?;
@@ -328,7 +329,10 @@ impl EngineCore {
             return None;
         }
         let sched = self.scheduler.schedule();
-        if sched.total_num_scheduled_tokens == 0 {
+        // Still return the output if there are finished request IDs to clean up,
+        // even when no tokens are scheduled. The executor needs to see these IDs
+        // to release per-request resources (KV cache buffers, token buffers, etc.).
+        if sched.total_num_scheduled_tokens == 0 && sched.finished_req_ids.is_empty() {
             return None;
         }
         Some(sched)

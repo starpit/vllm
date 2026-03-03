@@ -235,8 +235,9 @@ pub struct BenchLatencyArgs {
     #[arg(long, env = "HF_TOKEN")]
     pub hf_token: Option<String>,
 
-    /// Log level.
-    #[arg(long, default_value = "info")]
+    /// Log level (default "warn" to suppress per-request engine logs;
+    /// use "info" or "debug" for verbose output).
+    #[arg(long, default_value = "warn")]
     pub log_level: String,
 
     /// Fraction of GPU memory to use for KV cache (0.0–1.0).

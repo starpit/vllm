@@ -12,7 +12,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use tracing::info;
+use indicatif::{ProgressBar, ProgressStyle};
 use vllm_common::telemetry;
 use vllm_serve::llm::{LLM, LLMBuilder, SamplingParams};
 
@@ -56,12 +56,12 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
 
     let model = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
 
-    info!("vLLM Rust — latency benchmark");
-    info!(
+    eprintln!("vLLM Rust — latency benchmark");
+    eprintln!(
         "Model: {}, device: {}, dtype: {}",
         model, args.device, args.dtype
     );
-    info!(
+    eprintln!(
         "Iters: {}, batch_size: {}, input_len: {}, output_len: {}, warmup: {}",
         args.num_iters, args.batch_size, args.input_len, args.output_len, args.num_iters_warmup
     );
@@ -70,7 +70,7 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
     let load_start = Instant::now();
     let llm = create_llm(&args, &model)?;
     let load_elapsed = load_start.elapsed();
-    info!("Model loaded in {:.2}s", load_elapsed.as_secs_f64());
+    eprintln!("Model loaded in {:.2}s", load_elapsed.as_secs_f64());
 
     // Build dummy prompts: batch_size prompts of input_len random-ish token IDs.
     // Mirrors Python: `np.random.randint(10000, size=(batch_size, input_len))`
@@ -90,23 +90,36 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
+    let bar_style = ProgressStyle::with_template(
+        "{msg}: {wide_bar:.cyan/blue} {pos}/{len} [{elapsed_precise}<{eta_precise}, {per_sec}]",
+    )
+    .unwrap();
+
     // Warmup.
     if args.num_iters_warmup > 0 {
-        info!("Running {} warmup iteration(s)...", args.num_iters_warmup);
+        let pb = ProgressBar::new(args.num_iters_warmup as u64)
+            .with_style(bar_style.clone())
+            .with_message("Warmup iterations");
         for _ in 0..args.num_iters_warmup {
             llm.generate_token_ids(&dummy_prompts, Some(sampling_params.clone()))?;
+            pb.inc(1);
         }
-        info!("Warmup complete");
+        pb.finish();
     }
 
     // Timed runs.
     let mut latencies: Vec<f64> = Vec::with_capacity(args.num_iters);
 
+    let pb = ProgressBar::new(args.num_iters as u64)
+        .with_style(bar_style)
+        .with_message("Bench iterations");
     for _ in 0..args.num_iters {
         let start = Instant::now();
         llm.generate_token_ids(&dummy_prompts, Some(sampling_params.clone()))?;
         latencies.push(start.elapsed().as_secs_f64());
+        pb.inc(1);
     }
+    pb.finish();
 
     // Compute stats (matching Python output format).
     let avg_latency: f64 = latencies.iter().sum::<f64>() / latencies.len() as f64;
@@ -147,7 +160,7 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
             "percentiles": pct_map,
         });
         std::fs::write(path, serde_json::to_string_pretty(&results)?)?;
-        info!("Results written to {path}");
+        eprintln!("Results written to {path}");
     }
 
     Ok(())

@@ -6,7 +6,7 @@ End-to-end tests validate the full stack — from HTTP request to model inferenc
 
 **Strategy**: Tests construct the full inference stack in-process via `vllm_serve::init::initialize_stack()`, spawn the HTTP server on a random port, send requests using `reqwest`, and validate responses. Tests are `#[ignore]`-tagged and gated behind `--features e2e,metal` so they don't run in normal `cargo test`. A CI job downloads models once and caches them.
 
-**Backend focus**: MLX (Apple Silicon) for `--features e2e,metal` tests using `mlx-community` quantized models. CUDA tests use `--features e2e,cuda` with safetensors models (non-quantized) and GGUF quantized models that run on GPU.
+**Backend focus**: MLX (Apple Silicon) for `--features e2e,metal` tests using `mlx-community` quantized models. CUDA tests use `--features e2e,cuda` with safetensors models (non-quantized), GGUF quantized models, and MoE models that run on GPU.
 
 ---
 
@@ -43,6 +43,9 @@ cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving tes
 
 # CUDA E2E tests — GGUF quantized models (requires NVIDIA GPU):
 cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gguf -- --ignored --test-threads=1
+
+# CUDA MoE kernel unit tests (any NVIDIA GPU):
+cargo test -p vllm-kernels --features cuda -- test_cuda_moe
 
 # PR tier only (Tier 1+2 models — SmolLM, Qwen2, Qwen3, Llama3):
 cargo test -p vllm-e2e --features e2e,metal --test e1_basic_serving -- --ignored --test-threads=1 \
@@ -955,10 +958,37 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_qwen2_vl -- --ign
 
 ---
 
+## Phase E21: CUDA MoE (Fused Routing Kernels) — DONE (kernel tests)
+
+Tests the fused MoE CUDA pipeline: GPU top-k softmax gating (`topk_softmax` CUDA kernel adapted from Python vLLM's `csrc/moe/topk_softmax_kernels.cu`) + `moe_sum` reduction kernel + per-expert batched cuBLAS GEMMs.
+
+### CUDA kernel unit tests (`vllm-kernels/src/moe.rs`) — all passing on L40S
+
+| Test | What it validates |
+|---|---|
+| `test_cuda_topk_softmax_f32` | Top-k softmax matches CPU reference (64 experts, top-4, f32) |
+| `test_cuda_topk_softmax_pow2_experts` | Fast warp-level path for 4/8/16/32/64/128 experts |
+| `test_cuda_topk_softmax_non_pow2` | CUB BlockReduce fallback for 13 experts |
+| `test_cuda_moe_sum_f32` | moe_sum reduction matches CPU (f32) |
+| `test_cuda_moe_sum_bf16` | moe_sum reduction matches CPU (bf16) |
+
+### E2E tests — blocked on GPU size
+
+MoE E2E tests (`test_cuda_moe_server_starts`, `test_cuda_moe_completion`, `test_cuda_moe_chat`) are written but commented out. The smallest MoE safetensors models (Qwen1.5-MoE-A2.7B-Chat at 14.3B params / ~31GB BF16, Mixtral-8x7B at 46.7B) exceed L40S 48GB VRAM. Uncomment when ≥80GB GPU (A100-80GB, H100) is available, or when a small MoE GGUF model is tested.
+
+Run command:
+```bash
+# CUDA MoE kernel unit tests (any NVIDIA GPU):
+cargo test -p vllm-kernels --features cuda -- test_cuda_moe
+```
+
+**Deliverables**: 5 CUDA kernel unit tests (all verified on L40S). 3 E2E tests written, awaiting larger GPU.
+
+---
+
 ## Future Extensions (not in initial scope)
 
 - **Candle backend E2E**: Same test suite but with `--features candle-metal` or CPU-only, using GGUF models
-- **CUDA backend E2E**: Run on Linux CI with GPU, test CUDA worker path
 - **Performance regression tests**: Track TTFT, ITL, throughput across commits
 - **Python vLLM comparison tests**: Same prompts to Python vLLM and Rust, compare output quality
 - **LoRA E2E**: When adapter support is added

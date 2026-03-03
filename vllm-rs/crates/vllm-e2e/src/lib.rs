@@ -63,6 +63,9 @@ impl TestModels {
     // CUDA-compatible safetensors models (non-quantized, run on GPU)
     pub const SMOLLM_135M_CUDA: &str = "HuggingFaceTB/SmolLM2-135M-Instruct";
     pub const QWEN2_0_5B_CUDA: &str = "Qwen/Qwen2.5-0.5B";
+    // MoE model for CUDA — Qwen2MoeForCausalLM (~31GB BF16, needs ≥80GB GPU)
+    // Too large for L40S (48GB); enable when A100-80GB or H100 is available.
+    // pub const QWEN_MOE_A2_7B_CUDA: &str = "Qwen/Qwen1.5-MoE-A2.7B-Chat";
 
     // Multimodal (vision-language) models
     // Tier 3: ~2.8 GB — nightly only (QAT = quantization-aware training)

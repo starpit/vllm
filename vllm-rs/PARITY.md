@@ -6,9 +6,9 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| &#x1F535; | Fully implemented | 174 |
-| &#x1F7E1; | Partially implemented | 4 |
-| &#x1F534; | Not implemented | 96 |
+| &#x1F535; | Fully implemented | 175 |
+| &#x1F7E1; | Partially implemented | 6 |
+| &#x1F534; | Not implemented | 93 |
 
 ### Priority (for incomplete features)
 
@@ -16,7 +16,7 @@
 |----------|---------|------:|
 | **P4** | Highest — production blockers, widely needed, or near-free to implement | 0 |
 | **P3** | High — meaningfully expands user base or enables key use cases | 12 |
-| **P2** | Medium — useful improvement, broader coverage | 33 |
+| **P2** | Medium — useful improvement, broader coverage | 32 |
 | **P1** | Lowest — niche, edge-case, or low demand | 49 |
 | **P0** | Won't do — deprecated in Python vLLM V1+ or superseded | 6 |
 
@@ -43,10 +43,10 @@
 | [Sampling & Decoding](#sampling--decoding) | 19 | `██████████` 19/19 | 0 | 53 | 13 |
 | [KV Cache & Attention](#kv-cache--attention) | 19 | `█████░░░░░` 10/19 | 0 | 105 | 0 |
 | [Scheduling](#scheduling) | 10 | `█████████░` 9/10 | 0 | 73 | 1 |
-| [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 62 | 5 |
+| [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 67 | 5 |
 | [Parallelism & Distribution](#parallelism--distribution) | 10 | `████░░░░░░` 3+2/10 | 0 | 39 | 1 |
-| [Performance Optimizations](#performance-optimizations) | 13 | `██████░░░░` 8/13 | 4 | 50 | 0 |
-| [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | 12 | `████░░░░░░` 5/12 | 0 | 25 | 0 |
+| [Performance Optimizations](#performance-optimizations) | 13 | `███████░░░` 9/13 | 4 | 55 | 0 |
+| [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | 12 | `████░░░░░░` 5/12 | 0 | 30 | 0 |
 | [LoRA / Adapters](#lora--adapters) | 5 | `████░░░░░░` 2/5 | 0 | 12 | 8 |
 | [Speculative Decoding](#speculative-decoding) | 5 | `██░░░░░░░░` 1/5 | 0 | 20 | 0 |
 | [Multimodal / Vision-Language](#multimodal--vision-language) | 10 | `███░░░░░░░` 3/10 | 12 | 13 | 5 |
@@ -55,7 +55,7 @@
 | [Embeddings & Pooling](#embeddings--pooling) | 8 | `████████░░` 6/8 | 0 | 31 | 19 |
 | [Observability & Operations](#observability--operations) | 7 | `██████████` 7/7 | 1 | 15 | 0 |
 | [CLI & Deployment](#cli--deployment) | 17 | `██████████` 16/17 | 2 | 19 | 6 |
-| **Total** | **214** | `██████░░░░` **131/214** | **37** | **764** | **104** |
+| **Total** | **214** | `██████░░░░` **132/214** | **37** | **774** | **104** |
 
 ---
 
@@ -300,7 +300,7 @@
 | Backend | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
 | CPU | &#x1F535; | &#x1F535; | 4 | 0 | |
-| CUDA (NVIDIA GPU) | &#x1F535; | &#x1F7E1; | 42 | 8 | P3 |
+| CUDA (NVIDIA GPU) | &#x1F535; | &#x1F7E1; | 47 | 8 | P3 |
 | Metal / MLX (Apple Silicon) | &#x1F534; | &#x1F535; | 4 | 0 | |
 | ROCm (AMD GPU) | &#x1F535; | &#x1F534; | — | — | P2 |
 | TPU | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -309,7 +309,7 @@
 | Device auto-detection | &#x1F535; | &#x1F535; | 4 | 0 | |
 | Memory profiling / `--gpu-memory-utilization` | &#x1F535; | &#x1F535; | 6 | 2 | |
 
-> Unit counts from `candle_worker.rs` (24 total) and `mlx_worker.rs` (4). CUDA: 29 GPU kernel unit tests (norm 13 incl. fused_add_rms_norm, activation 7, rotary 5, cache 4) + 9 FlashAttention v2 tests + 2 device detection tests + 2 misc = 42. E2E: 5 CUDA safetensors tests (SmolLM-135M + Qwen2.5-0.5B on GPU: server start, completion, chat) + 3 CUDA GGUF tests (Gemma3-1B Q4_K_M: server start, completion, chat). The CUDA backend supports E2E inference (verified: Qwen2.5-0.5B BF16 on L40S) with 6 fused CUDA kernels (RMSNorm, fused add+RMSNorm, SiLU+mul/GELU+mul, RoPE, reshape_and_cache, QK-norm+RoPE) all using vectorized 128-bit loads, plus FlashAttention v2 (via `candle-flash-attn` crate, auto-dispatches on CUDA F16/BF16). GPU KV block pool, VRAM-based block allocation, and GPU↔CPU block swapping. Remaining for full parity: CUDA graphs, tensor parallelism. Device auto-detection includes `parse_device` tests for cpu/cuda/metal/auto. E2E float16 tests validate dtype selection end-to-end.
+> Unit counts from `candle_worker.rs` (24 total) and `mlx_worker.rs` (4). CUDA: 29 GPU kernel unit tests (norm 13 incl. fused_add_rms_norm, activation 7, rotary 5, cache 4) + 5 MoE kernel tests (topk_softmax pow2/non-pow2/f32, moe_sum f32/bf16) + 9 FlashAttention v2 tests + 2 device detection tests + 2 misc = 47. E2E: 5 CUDA safetensors tests (SmolLM-135M + Qwen2.5-0.5B) + 3 CUDA GGUF tests (Gemma3-1B Q4_K_M) = 8. MoE E2E tests need ≥80GB GPU (smallest safetensors MoE models are 14B+ params). The CUDA backend supports E2E inference (verified: Qwen2.5-0.5B BF16 on L40S) with 8 fused CUDA kernels (RMSNorm, fused add+RMSNorm, SiLU+mul/GELU+mul, RoPE, reshape_and_cache, QK-norm+RoPE, MoE topk_softmax, MoE moe_sum) plus FlashAttention v2 (via `candle-flash-attn` crate). MoE models (Qwen3MoE, Qwen2MoE, DeepSeekV2) use GPU-accelerated top-k softmax gating and per-expert batched cuBLAS GEMMs instead of the per-token CPU loop. GPU KV block pool, VRAM-based block allocation, and GPU↔CPU block swapping. Remaining for full parity: CUDA graphs, tensor parallelism. Device auto-detection includes `parse_device` tests for cpu/cuda/metal/auto. E2E float16 tests validate dtype selection end-to-end.
 
 ---
 
@@ -344,7 +344,7 @@
 | Fused RMSNorm kernel (+ fused add+RMSNorm) | &#x1F535; | &#x1F535; | 13 | 0 | |
 | Fused RoPE kernel | &#x1F535; | &#x1F535; | 5 | 0 | |
 | Custom all-reduce kernel | &#x1F535; | &#x1F534; | — | — | P1 |
-| MoE fused routing kernels | &#x1F535; | &#x1F534; | — | — | P2 |
+| MoE fused routing kernels (topk softmax + moe_sum) | &#x1F535; | &#x1F535; | 5 | 0 | |
 | MLX lazy eval graph fusion | N/A | &#x1F535; | 0 | 0 | |
 | MLX single-eval sampling fusion | N/A | &#x1F535; | 0 | 0 | |
 | MLX cross-request deferred eval | N/A | &#x1F535; | 0 | 0 | |
@@ -354,7 +354,7 @@
 | Persistent InputBatch (cross-iteration reuse) | &#x1F535; | &#x1F535; | 14 | 0 | |
 | Paged KV (no gather copy on decode) | &#x1F535; | &#x1F535; | 2 | 0 | |
 
-> Fused CUDA kernels: `vllm-kernels/csrc/` contains 5 custom CUDA kernel files compiled via nvcc (SM80/86/89/90), all using vectorized 128-bit loads via `vec_utils.cuh`. Each kernel has CPU and CUDA implementations behind the `KernelSet` trait, with `ops.rs` auto-dispatch wiring all model architectures to use fused kernels when on CUDA. `fused_add_rms_norm` saves 1 kernel launch + 1 tensor allocation per decoder layer (called in every model architecture). 29 GPU unit tests compare CUDA output against CPU reference across f32/f16/bf16. Norm tests include 5 RMSNorm + 4 fused_add_rms_norm + 4 fused QK-norm+RoPE (Gemma3). FlashAttention v2 via `candle-flash-attn` crate (0.9.2): auto-dispatches on CUDA F16/BF16 in `attention_with_cache()`, falls back to naive SDPA on CPU/F32. 9 unit tests compare FA2 output against CPU SDPA reference (decode, prefill, GQA, F16, head_dim=128, sliding window). CPU kernel stubs (12 tests: rotary 3, activation 3, norm 2, cache 2, attention 2) provide CPU fallback paths. Native dtype unit tests count `candle_worker.rs` dtype parsing tests. Persistent InputBatch: 14 unit tests in `input_batch.rs` (add/remove/swap-remove compaction, prefill→decode transition, mixed batches, spec decode, tokens-in-pool tracking, query_start_loc consistency).
+> Fused CUDA kernels: `vllm-kernels/csrc/` contains 7 custom CUDA kernel files compiled via nvcc (SM80/86/89/90). Each kernel has CPU and CUDA implementations behind the `KernelSet` trait, with `ops.rs` auto-dispatch wiring all model architectures to use fused kernels when on CUDA. `fused_add_rms_norm` saves 1 kernel launch + 1 tensor allocation per decoder layer (called in every model architecture). MoE routing kernels (`moe_topk_kernels.cu`, `moe_align_kernels.cu`) adapted from Python vLLM's `csrc/moe/` — `topk_softmax` uses warp-level fused softmax+argmax for power-of-2 expert counts, CUB BlockReduce fallback for arbitrary counts; `moe_sum` reduces expert outputs via template-specialized topk unrolling. MoE models (Qwen3MoE, Qwen2MoE, DeepSeekV2) use GPU gating + per-expert batched cuBLAS GEMMs. 34 GPU unit tests compare CUDA output against CPU reference across f32/f16/bf16 (norm 13, activation 7, rotary 5, cache 4, MoE 5). FlashAttention v2 via `candle-flash-attn` crate (0.9.2): auto-dispatches on CUDA F16/BF16 in `attention_with_cache()`. 9 FA2 unit tests. CPU kernel stubs (15 tests: rotary 3, activation 3, norm 2, cache 2, attention 2, MoE 3) provide CPU fallback paths. Native dtype unit tests count `candle_worker.rs` dtype parsing tests. Persistent InputBatch: 14 unit tests in `input_batch.rs`.
 >
 > **Persistent InputBatch note:** `CandleWorker` now maintains a persistent `InputBatch` struct across engine steps, matching Python vLLM V1's `InputBatch`. Per-request state (block tables, tokens-in-pool, positions, last token ID) lives in dense slot arrays that are delta-updated each step. Finished requests are swap-removed to keep the array compact. `prepare_inputs()` builds flat token/position tensors and `AttentionMetadata` from the slot arrays without HashMap lookups. This eliminates per-step allocation overhead on the decode hot path — the steady-state case where N concurrent requests each generate 1 token per step.
 
@@ -375,7 +375,7 @@
 | Merge attention states | &#x1F535; | &#x1F534; | — | — | P2 |
 | KV cache write (reshape_and_cache) | &#x1F535; | &#x1F535; | 4 | 0 | |
 | GPU sampling (top-k / top-p / penalties / logprobs) | &#x1F535; | &#x1F535; | 0 | 0 | |
-| Fused MoE routing + expert matmul ✱ | &#x1F535; | &#x1F534; | — | — | P2 |
+| Fused MoE routing + expert matmul ✱ | &#x1F535; | &#x1F7E1; | 5 | 0 | P2 |
 | Fused layer ops (activation / norm / RoPE / attention) ✱ | &#x1F535; | &#x1F535; | 34 | 0 | |
 | Quantization compute (FP8 / INT8 / AWQ matmul) | &#x1F535; | &#x1F534; | — | — | P2 |
 | Mamba / SSM ops (selective scan, SSD, conv1d) | &#x1F535; | &#x1F534; | — | — | P2 |
@@ -390,6 +390,7 @@
 > - *KV cache write*: CUDA path uses a fused `reshape_and_cache` kernel (`csrc/cache_kernels.cu`) that scatters all tokens in a single kernel launch via slot_mapping. CPU path uses `KvBlockPool::scatter_new_kv()` per-token loop. MLX uses `MlxKvCache`. 4 CUDA unit tests verify scatter correctness (basic, f16, padding skip, single-token).
 > - *GPU sampling*: All sampling runs on CPU in both CandleWorker and MlxWorker. For per-request forward passes this is trivially fast (~µs for a 1D logits vector). GPU sampling kernels only matter for batched inference where logits are a 2D `[batch, vocab]` tensor. Tests attributed to [Sampling & Decoding](#sampling--decoding).
 > - *Fused layer ops*: CUDA path has fused kernels for RMSNorm + fused add+RMSNorm (`csrc/layernorm_kernels.cu`), SiLU+mul / GELU+mul (`csrc/activation_kernels.cu`), RoPE (`csrc/pos_encoding_kernels.cu`), fused QK-norm+RoPE (`csrc/qk_norm_rope_kernels.cu`, used by Gemma3), and FlashAttention v2 (`candle-flash-attn` crate). All custom kernels use vectorized 128-bit loads via `vec_utils.cuh`. `ops.rs` auto-dispatches to CUDA when tensors are on GPU, falling back to candle ops on CPU. `attention_with_cache()` auto-dispatches to FA2 on CUDA F16/BF16. All model decoder layers use `fused_add_rms_norm` to merge the residual add + post-attention norm into a single kernel launch. MLX lazy eval fuses the same operations into single Metal command buffers. 34 CUDA unit tests (norm 13 + activation 7 + rotary 5 + FlashAttention 9) compare against CPU reference across f32/f16/bf16.
+> - *Fused MoE routing*: CUDA `topk_softmax` kernel (`csrc/moe_topk_kernels.cu`, adapted from Python vLLM's `csrc/moe/topk_softmax_kernels.cu`) fuses softmax + top-k selection into a single kernel with warp-level butterfly reduction for power-of-2 expert counts (1–512) and CUB BlockReduce fallback for arbitrary counts. `moe_sum` kernel (`csrc/moe_align_kernels.cu`) reduces `[tokens, topk, hidden]` → `[tokens, hidden]` with template-specialized topk unrolling. Expert GEMMs use per-expert batched cuBLAS matmul (tokens grouped by expert assignment, one matmul per active expert) — simpler than Python vLLM's Triton fused_moe_kernel but effective for small active expert counts (2–8). MoE models (Qwen3MoE, Qwen2MoE, DeepSeekV2MoE) auto-dispatch to GPU gating when on CUDA. 5 CUDA unit tests. E2E tests require ≥80GB GPU (smallest safetensors MoE models are 14B+ total params, ~31GB BF16). Future: custom tiled GEMM or cuBLAS batched GEMM for higher throughput.
 > - *Triton attention*: Python vLLM has its own Triton attention implementations (distinct from the FlashAttention C++ library). Both serve the same purpose: batched variable-length attention. The Rust port uses FlashAttention v2 via `candle-flash-attn` crate — auto-dispatches in `attention_with_cache()` on CUDA F16/BF16. The Triton attention row above tracks the batched varlen Triton kernels specifically (distinct from FA2).
 > - *Model-gated kernels*: Mamba/SSM, FLA, LoRA, and speculative decoding kernels are only needed when those model types or features are implemented — they are blocked by their parent feature.
 
@@ -593,6 +594,6 @@ cargo build -p vllm-cli --no-default-features --features metal
 | Attention backends | ~15 | 2 (custom SDPA + FlashAttention v2 single-seq/varlen) |
 | Hardware backends | 6 (CUDA, ROCm, CPU, TPU, XPU, Neuron) | 3 (CPU, CUDA, Metal/MLX) |
 | Lines of code | ~507K Python + ~89K C++/CUDA | ~30.7K Rust |
-| Unit tests | ~948 test files | 905 passing (844 non-MLX + 61 MLX) |
+| Unit tests | ~948 test files | 910 passing (849 non-MLX + 61 MLX) |
 | E2E tests | — | 120 passing (37 basic serving + 22 chat/sampling + 8 streaming + 5 tool parser + 10 embedding + 4 GPTQ + 4 AWQ + 7 BnB + 6 LLM API + 4 LoRA + 6 batch + 7 multimodal) |
 | Crate count | N/A | 14 crates (incl. vllm-e2e) |

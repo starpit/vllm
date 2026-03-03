@@ -930,3 +930,18 @@ async fn test_cuda_tp2_qwen2_completion() {
         "TP=2 completion should produce non-empty text"
     );
 }
+
+// ===========================================================================
+// CUDA MoE E2E tests — commented out, needs ≥80GB GPU
+// ===========================================================================
+// The smallest MoE safetensors models (Qwen1.5-MoE-A2.7B-Chat, Mixtral-8x7B)
+// are 14B+ total params (~31GB BF16) — too large for L40S (48GB).
+// MoE CUDA kernels are covered by 5 unit tests in vllm-kernels/src/moe.rs.
+// Uncomment when A100-80GB or H100 is available.
+//
+// #[cfg(feature = "cuda")]
+// #[tokio::test(flavor = "multi_thread")]
+// #[ignore]
+// async fn test_cuda_moe_server_starts() { ... }
+// async fn test_cuda_moe_completion() { ... }
+// async fn test_cuda_moe_chat() { ... }

@@ -272,53 +272,60 @@ impl Module for DeepSeekV2MoE {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let (num_tokens, hidden_size) = x.dims2()?;
 
-        // Compute router logits and softmax probabilities.
+        // Compute router logits.
         let router_logits = self.gate.forward(x)?; // [num_tokens, n_experts]
-        // Softmax over experts.
-        let max_vals = router_logits.max_keepdim(candle_core::D::Minus1)?;
-        let shifted = router_logits.broadcast_sub(&max_vals)?;
-        let exp = shifted.exp()?;
-        let sum = exp.sum_keepdim(candle_core::D::Minus1)?;
-        let probs = exp.broadcast_div(&sum)?; // [num_tokens, n_experts]
 
-        // Top-k selection: for each token, find the top_k experts.
-        let probs_f32 = probs.to_dtype(DType::F32)?;
-        let probs_vec = probs_f32.to_vec2::<f32>()?;
+        // GPU-accelerated top-k softmax gating (CUDA kernel on GPU, CPU fallback).
+        let (topk_weights, topk_ids) =
+            crate::ops::topk_softmax(&router_logits, self.top_k, self.norm_topk_prob)?;
 
-        // Compute output token by token (correct reference implementation).
-        let mut output_data = vec![0.0f32; num_tokens * hidden_size];
+        // Read routing decisions back to CPU (small: [num_tokens, top_k]).
+        let ids = topk_ids.to_vec2::<u32>()?;
+        let weights = topk_weights.to_vec2::<f32>()?;
 
-        for tok in 0..num_tokens {
-            let token_probs = &probs_vec[tok];
-            // Find top-k expert indices.
-            let mut indexed: Vec<(usize, f32)> = token_probs.iter().copied().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            indexed.truncate(self.top_k);
-
-            // Normalize if required.
-            let total: f32 = indexed.iter().map(|(_, p)| p).sum();
-            let scale = if self.norm_topk_prob && total > 0.0 {
-                1.0 / total
-            } else {
-                1.0
-            };
-
-            // Get token hidden states.
-            let token_x = x.narrow(0, tok, 1)?; // [1, hidden]
-
-            // Route through selected experts.
-            for &(expert_idx, prob) in &indexed {
-                let expert_out = self.experts[expert_idx].forward(&token_x)?; // [1, hidden]
-                let weight = (prob as f64 * scale as f64 * self.routed_scaling_factor) as f32;
-                let expert_vals = expert_out.flatten_all()?.to_vec1::<f32>()?;
-                for (j, &v) in expert_vals.iter().enumerate() {
-                    output_data[tok * hidden_size + j] += v * weight;
+        // Group tokens by expert for batched forward.
+        let num_experts = self.experts.len();
+        let mut expert_token_map: Vec<Vec<(usize, usize)>> = vec![vec![]; num_experts];
+        for (tok, tok_ids) in ids.iter().enumerate() {
+            for (k_idx, &eid) in tok_ids.iter().enumerate() {
+                let eid = eid as usize;
+                if eid < num_experts {
+                    expert_token_map[eid].push((tok, k_idx));
                 }
             }
         }
 
-        let mut output = Tensor::from_slice(&output_data, (num_tokens, hidden_size), x.device())?;
-        output = output.to_dtype(x.dtype())?;
+        // Build output by accumulating weighted expert contributions.
+        let device = x.device();
+        let dtype = x.dtype();
+        let mut token_accum = vec![Tensor::zeros((1, hidden_size), dtype, device)?; num_tokens];
+
+        for (eid, token_k_pairs) in expert_token_map.iter().enumerate() {
+            if token_k_pairs.is_empty() {
+                continue;
+            }
+
+            // Gather input tokens for this expert.
+            let token_rows: Vec<Tensor> = token_k_pairs
+                .iter()
+                .map(|&(tok, _)| x.narrow(0, tok, 1))
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            let x_batch = Tensor::cat(&token_rows, 0)?; // [batch, hidden]
+
+            // Batched expert MLP forward (one cuBLAS matmul per projection).
+            let expert_out = self.experts[eid].forward(&x_batch)?; // [batch, hidden]
+
+            // Scale each output by routing weight * routed_scaling_factor and accumulate.
+            for (batch_idx, &(tok, k_idx)) in token_k_pairs.iter().enumerate() {
+                let row = expert_out.narrow(0, batch_idx, 1)?; // [1, hidden]
+                let w = weights[tok][k_idx] as f64 * self.routed_scaling_factor;
+                let weighted = (row * w)?;
+                token_accum[tok] = (&token_accum[tok] + &weighted)?;
+            }
+        }
+
+        let token_refs: Vec<&Tensor> = token_accum.iter().collect();
+        let mut output = Tensor::cat(&token_refs, 0)?; // [num_tokens, hidden]
 
         // Add shared expert contribution.
         if let Some(ref shared) = self.shared_experts {

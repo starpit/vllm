@@ -181,3 +181,46 @@ pub fn qk_norm_and_rope(
         .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
     Ok((q_rot, k_rot))
 }
+
+// ---------------------------------------------------------------------------
+// MoE dispatch
+// ---------------------------------------------------------------------------
+
+/// Top-k softmax gating — dispatches to CUDA kernel on GPU, CPU fallback otherwise.
+///
+/// * `router_logits` — `[num_tokens, num_experts]`
+/// * Returns `(topk_weights, topk_ids)` — `[num_tokens, top_k]` each (f32 and u32)
+pub fn topk_softmax(
+    router_logits: &Tensor,
+    top_k: usize,
+    renormalize: bool,
+) -> candle_core::Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    if router_logits.device().is_cuda() {
+        use vllm_kernels::moe::{CudaMoeKernels, MoeKernels};
+        return CudaMoeKernels
+            .topk_softmax(router_logits, top_k, renormalize)
+            .map_err(kernel_err);
+    }
+    use vllm_kernels::moe::{CpuMoeKernels, MoeKernels};
+    CpuMoeKernels
+        .topk_softmax(router_logits, top_k, renormalize)
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))
+}
+
+/// Weighted sum across top-k expert outputs.
+///
+/// * `input` — `[num_tokens, top_k, hidden_size]` (already weighted by routing probs)
+///
+/// Returns `[num_tokens, hidden_size]`
+pub fn moe_sum(input: &Tensor, top_k: usize) -> candle_core::Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if input.device().is_cuda() {
+        use vllm_kernels::moe::{CudaMoeKernels, MoeKernels};
+        return CudaMoeKernels.moe_sum(input, top_k).map_err(kernel_err);
+    }
+    use vllm_kernels::moe::{CpuMoeKernels, MoeKernels};
+    CpuMoeKernels
+        .moe_sum(input, top_k)
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))
+}

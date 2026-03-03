@@ -12,6 +12,7 @@ pub mod activation;
 pub mod attention;
 pub mod cache;
 pub mod error;
+pub mod moe;
 #[cfg(feature = "nccl")]
 pub mod nccl;
 pub mod norm;
@@ -20,6 +21,7 @@ pub mod rotary;
 pub use error::{KernelError, KernelResult};
 
 use activation::ActivationKernels;
+use moe::MoeKernels;
 use norm::NormKernels;
 use rotary::RotaryKernels;
 
@@ -36,6 +38,7 @@ pub trait KernelSet: Send + Sync {
     fn norm(&self) -> &dyn NormKernels;
     fn activation(&self) -> &dyn ActivationKernels;
     fn rotary(&self) -> &dyn RotaryKernels;
+    fn moe(&self) -> &dyn MoeKernels;
 }
 
 /// CPU kernel set (always available).
@@ -50,6 +53,9 @@ impl KernelSet for CpuKernelSet {
     }
     fn rotary(&self) -> &dyn RotaryKernels {
         &rotary::CpuRotaryKernels
+    }
+    fn moe(&self) -> &dyn MoeKernels {
+        &moe::CpuMoeKernels
     }
 }
 
@@ -67,6 +73,9 @@ impl KernelSet for CudaKernelSet {
     }
     fn rotary(&self) -> &dyn RotaryKernels {
         &rotary::CudaRotaryKernels
+    }
+    fn moe(&self) -> &dyn MoeKernels {
+        &moe::CudaMoeKernels
     }
 }
 

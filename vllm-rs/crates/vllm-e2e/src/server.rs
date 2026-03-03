@@ -40,6 +40,8 @@ impl TestServer {
             disable_async_scheduling: false,
             runner: "generate".to_string(),
             tensor_parallel_size: 1,
+            dtype: None,
+            device: None,
         }
     }
 
@@ -72,6 +74,8 @@ pub struct TestServerBuilder {
     pooling_strategy: Option<String>,
     disable_async_scheduling: bool,
     runner: String,
+    dtype: Option<String>,
+    device: Option<String>,
     tensor_parallel_size: usize,
 }
 
@@ -132,6 +136,18 @@ impl TestServerBuilder {
         self
     }
 
+    /// Override the weight dtype (e.g. "f32", "f16", "bf16").
+    pub fn with_dtype(mut self, dtype: &str) -> Self {
+        self.dtype = Some(dtype.to_string());
+        self
+    }
+
+    /// Override the device (e.g. "cpu", "cuda:0", "metal").
+    pub fn with_device(mut self, device: &str) -> Self {
+        self.device = Some(device.to_string());
+        self
+    }
+
     /// Start the server in-process and wait for it to become healthy.
     pub async fn start(self) -> Result<TestServer> {
         // Initialize tracing. Silent by default; set RUST_LOG=info to see
@@ -153,10 +169,12 @@ impl TestServerBuilder {
             .clone()
             .unwrap_or_else(|| "auto".to_string());
         let runner = self.runner.clone();
+        let dtype = self.dtype.clone().unwrap_or_else(|| "auto".to_string());
+        let device = self.device.clone().unwrap_or_else(|| "auto".to_string());
         let config = vllm_serve::init::VllmConfig {
             model: model.clone(),
-            device: "auto".to_string(),
-            dtype: "auto".to_string(),
+            device,
+            dtype,
             max_num_seqs: 256,
             block_size: 16,
             gpu_memory_utilization: 0.9,

@@ -81,6 +81,7 @@ pub struct App {
     kv_cache_usage: f64,
     gpu_blocks_used: i64,
     gpu_blocks_total: i64,
+    num_cached_blocks: i64,
 
     // Histogram averages + sparkline history (ms, scaled to u64 for sparkline).
     avg_ttft_ms: f64,
@@ -116,6 +117,7 @@ impl App {
             kv_cache_usage: 0.0,
             gpu_blocks_used: 0,
             gpu_blocks_total: 0,
+            num_cached_blocks: 0,
             avg_ttft_ms: 0.0,
             avg_itl_ms: 0.0,
             avg_latency_ms: 0.0,
@@ -167,6 +169,7 @@ impl App {
         self.kv_cache_usage = s.kv_cache_usage;
         self.gpu_blocks_used = s.gpu_cache_blocks_used;
         self.gpu_blocks_total = s.gpu_cache_blocks_total;
+        self.num_cached_blocks = s.num_cached_blocks;
 
         if self.model_name.is_empty() {
             self.model_name.clone_from(&s.model_name);
@@ -318,8 +321,8 @@ impl App {
 
         let pct = (self.kv_cache_usage * 100.0).min(100.0);
         let info = Paragraph::new(vec![Line::from(format!(
-            "  blocks: {} / {}    usage: {:.1}%",
-            self.gpu_blocks_used, self.gpu_blocks_total, pct
+            "  blocks: {} / {}    cached: {}    usage: {:.1}%",
+            self.gpu_blocks_used, self.gpu_blocks_total, self.num_cached_blocks, pct
         ))]);
         f.render_widget(info, chunks[0]);
 

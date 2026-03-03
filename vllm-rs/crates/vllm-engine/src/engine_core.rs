@@ -107,6 +107,8 @@ pub struct EngineCoreConfig {
     /// Whether the engine is in pooling mode (embedding-only).
     /// In pooling mode, requests are finished after one forward pass.
     pub is_pooling: bool,
+    /// Whether prefix caching (KV cache reuse) is enabled.
+    pub enable_prefix_caching: bool,
 }
 
 /// Output from a single engine step, grouped by client index.
@@ -115,12 +117,23 @@ pub type StepOutputs = HashMap<u32, EngineCoreOutputs>;
 impl EngineCore {
     /// Create a new EngineCore.
     pub fn new(config: EngineCoreConfig, executor: Box<dyn Executor>) -> Self {
-        let scheduler = Scheduler::with_simple_blocks(
-            &config.scheduler_config,
-            config.max_model_len,
-            config.num_gpu_blocks,
-            config.block_size,
-        );
+        use vllm_core::scheduler::core::SimpleBlockTracker;
+
+        let kv_cache: Box<dyn vllm_core::scheduler::core::KVCacheManagerOps> =
+            if config.enable_prefix_caching {
+                info!("Prefix caching enabled");
+                Box::new(SimpleBlockTracker::with_caching(
+                    config.num_gpu_blocks,
+                    config.block_size,
+                ))
+            } else {
+                Box::new(SimpleBlockTracker::new(
+                    config.num_gpu_blocks,
+                    config.block_size,
+                ))
+            };
+
+        let scheduler = Scheduler::new(&config.scheduler_config, config.max_model_len, kv_cache);
 
         let ngram_proposer = config.ngram_proposer_config.map(|cfg| {
             info!(
@@ -357,6 +370,7 @@ impl EngineCore {
             kv_cache_usage: self.scheduler.kv_cache_usage(),
             gpu_cache_blocks_used: self.scheduler.num_used_blocks(),
             gpu_cache_blocks_total: self.scheduler.num_total_blocks(),
+            num_cached_blocks: self.scheduler.num_cached_blocks(),
         };
 
         // 2. Process any pending aborts.
@@ -756,6 +770,7 @@ mod tests {
             ngram_proposer_config: None,
             eos_token_ids: vec![],
             is_pooling: false,
+            enable_prefix_caching: false,
         }
     }
 
@@ -1237,6 +1252,7 @@ mod tests {
             }),
             eos_token_ids: vec![],
             is_pooling: false,
+            enable_prefix_caching: false,
         }
     }
 

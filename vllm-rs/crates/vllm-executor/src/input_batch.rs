@@ -96,7 +96,9 @@ impl InputBatch {
 
         // Position will be set properly during prepare_inputs for prefill.
         self.positions.push(0);
-        self.tokens_in_pool.push(0);
+        // When prefix caching provides computed tokens, those KV entries are
+        // already in the block pool — initialize tokens_in_pool accordingly.
+        self.tokens_in_pool.push(num_computed_tokens as usize);
         self.block_tables.push(block_ids);
         self.is_prefill.push(true);
         self.prefill_tokens.push(Some(prompt_token_ids.to_vec()));

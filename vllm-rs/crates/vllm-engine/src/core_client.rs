@@ -272,6 +272,7 @@ mod tests {
             ngram_proposer_config: None,
             eos_token_ids: vec![],
             is_pooling: false,
+            enable_prefix_caching: false,
         }
     }
 

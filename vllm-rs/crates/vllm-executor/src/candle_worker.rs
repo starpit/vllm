@@ -1434,7 +1434,12 @@ impl Worker for CandleWorker {
             }
 
             let prompt_ids = new_req.prompt_token_ids.as_deref().unwrap_or(&[]);
-            let tokens_to_use = &prompt_ids[..num_tokens.min(prompt_ids.len())];
+            // When prefix caching provides num_computed_tokens > 0, the
+            // scheduler only schedules the non-cached suffix. Slice from
+            // the cached offset instead of from the start of the prompt.
+            let start = new_req.num_computed_tokens as usize;
+            let end = (start + num_tokens).min(prompt_ids.len());
+            let tokens_to_use = &prompt_ids[start..end];
 
             // Store prompt tokens in the buffer (needed for penalty sampling).
             self.token_buffers

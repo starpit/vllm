@@ -77,6 +77,9 @@ pub struct VllmConfig {
     /// CUDA graph configuration. When `Some`, CUDA graphs may be captured
     /// for decode-step acceleration.
     pub cuda_graph_config: Option<CudaGraphConfig>,
+    /// Whether prefix caching is enabled (KV cache reuse for shared prompts).
+    /// Default: true.
+    pub enable_prefix_caching: bool,
 }
 
 impl Default for VllmConfig {
@@ -101,6 +104,7 @@ impl Default for VllmConfig {
             disable_async_scheduling: false,
             runner: "generate".to_string(),
             cuda_graph_config: None,
+            enable_prefix_caching: true,
         }
     }
 }
@@ -120,6 +124,18 @@ pub struct InitializedStack {
 #[cfg(feature = "metal")]
 fn should_use_mlx(device: &str) -> bool {
     matches!(device, "auto" | "metal")
+}
+
+/// Check if this config will use the MLX backend.
+fn is_mlx_backend(_config: &VllmConfig) -> bool {
+    #[cfg(feature = "metal")]
+    {
+        should_use_mlx(&_config.device)
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        false
+    }
 }
 
 /// Result of worker creation: the worker plus metadata needed for init.
@@ -370,6 +386,11 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
     }
 
     let use_async_scheduling = !config.disable_async_scheduling;
+
+    // Prefix caching requires paged KV (CandleWorker). The MLX worker uses
+    // per-request contiguous caches, so disable prefix caching on MLX.
+    let enable_prefix_caching = config.enable_prefix_caching && !is_mlx_backend(config);
+
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
             max_num_batched_tokens: max_model_len.min(8192),
@@ -396,6 +417,7 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         },
         eos_token_ids,
         is_pooling: config.runner == "pooling",
+        enable_prefix_caching,
     };
 
     let client = Box::new(InprocClient::new(engine_config, Box::new(executor)));
@@ -719,6 +741,7 @@ fn initialize_stack_tp(
         },
         eos_token_ids,
         is_pooling: config.runner == "pooling",
+        enable_prefix_caching: config.enable_prefix_caching,
     };
 
     let client = Box::new(InprocClient::new(engine_config, Box::new(executor)));

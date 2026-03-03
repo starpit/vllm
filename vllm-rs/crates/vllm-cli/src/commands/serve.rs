@@ -113,6 +113,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
                 })
             }
         },
+        enable_prefix_caching: !args.no_prefix_caching,
     };
 
     let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&config))

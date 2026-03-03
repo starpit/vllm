@@ -417,6 +417,7 @@ fn collect_stats(state: &AppState) -> protocol::StatsResponse {
         kv_cache_usage: m.kv_cache_usage_perc.get(),
         gpu_cache_blocks_used: m.gpu_cache_blocks_used.get(),
         gpu_cache_blocks_total: m.gpu_cache_blocks_total.get(),
+        num_cached_blocks: m.prefix_cache_blocks.get(),
         ttft_sum,
         ttft_count,
         itl_sum,
@@ -660,6 +661,7 @@ mod tests {
             ngram_proposer_config: None,
             eos_token_ids: vec![],
             is_pooling: false,
+            enable_prefix_caching: false,
         };
         let executor = Box::new(NoopExecutor::new(1024));
         let client = Box::new(InprocClient::new(engine_config, executor));
@@ -805,6 +807,7 @@ mod tests {
             ngram_proposer_config: None,
             eos_token_ids: vec![],
             is_pooling: false,
+            enable_prefix_caching: false,
         };
         let executor = Box::new(NoopExecutor::new(1024));
         let client = Box::new(InprocClient::new(engine_config, executor));
@@ -984,6 +987,7 @@ mod tests {
             ngram_proposer_config: None,
             eos_token_ids: vec![],
             is_pooling: false,
+            enable_prefix_caching: false,
         };
         let executor = Box::new(NoopExecutor::new(1024));
         let client = Box::new(InprocClient::new(engine_config, executor));
@@ -1158,6 +1162,7 @@ mod tests {
             ngram_proposer_config: None,
             eos_token_ids: vec![],
             is_pooling: true,
+            enable_prefix_caching: false,
         };
         let executor = Box::new(NoopExecutor::new(1024));
         let client = Box::new(InprocClient::new(engine_config, executor));

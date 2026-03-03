@@ -218,6 +218,8 @@ pub struct SchedulerStats {
     pub gpu_cache_blocks_used: usize,
     /// Total number of GPU KV cache blocks.
     pub gpu_cache_blocks_total: usize,
+    /// Number of blocks retained in the prefix cache.
+    pub num_cached_blocks: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +518,7 @@ mod tests {
             kv_cache_usage: 0.42,
             gpu_cache_blocks_used: 100,
             gpu_cache_blocks_total: 1024,
+            num_cached_blocks: 0,
         };
         assert_eq!(stats.num_running_reqs, 5);
         assert_eq!(stats.num_waiting_reqs, 3);

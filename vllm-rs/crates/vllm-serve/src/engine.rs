@@ -1096,6 +1096,7 @@ impl AsyncEngine {
                                 .set(stats.gpu_cache_blocks_used as i64);
                             m.gpu_cache_blocks_total
                                 .set(stats.gpu_cache_blocks_total as i64);
+                            m.prefix_cache_blocks.set(stats.num_cached_blocks as i64);
                         }
 
                         // 5. Route outputs to requests (brief lock).
@@ -2224,6 +2225,7 @@ async fn route_step_outputs(
                 .set(stats.gpu_cache_blocks_used as i64);
             m.gpu_cache_blocks_total
                 .set(stats.gpu_cache_blocks_total as i64);
+            m.prefix_cache_blocks.set(stats.num_cached_blocks as i64);
         }
 
         if !engine_outputs.outputs.is_empty() {
@@ -2488,6 +2490,7 @@ mod tests {
             ngram_proposer_config: None,
             eos_token_ids: vec![],
             is_pooling: false,
+            enable_prefix_caching: false,
         }
     }
 

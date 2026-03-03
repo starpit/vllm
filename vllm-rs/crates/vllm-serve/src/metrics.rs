@@ -58,6 +58,8 @@ pub struct VllmMetrics {
     pub gpu_cache_blocks_used: IntGauge,
     /// Total number of GPU KV cache blocks.
     pub gpu_cache_blocks_total: IntGauge,
+    /// Number of blocks retained in the prefix cache.
+    pub prefix_cache_blocks: IntGauge,
 }
 
 impl VllmMetrics {
@@ -180,6 +182,13 @@ impl VllmMetrics {
             )
             .unwrap();
 
+            let prefix_cache_blocks = register_int_gauge_with_registry!(
+                "prefix_cache_blocks",
+                "Number of blocks retained in the prefix cache",
+                registry
+            )
+            .unwrap();
+
             VllmMetrics {
                 registry,
                 requests_total,
@@ -196,6 +205,7 @@ impl VllmMetrics {
                 kv_cache_usage_perc,
                 gpu_cache_blocks_used,
                 gpu_cache_blocks_total,
+                prefix_cache_blocks,
             }
         })
     }

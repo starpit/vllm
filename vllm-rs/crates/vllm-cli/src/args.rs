@@ -172,6 +172,11 @@ pub struct ServeArgs {
     /// Default: false (CUDA graphs enabled on CUDA devices).
     #[arg(long)]
     pub enforce_eager: bool,
+
+    /// Disable prefix caching (KV cache reuse for shared prompt prefixes).
+    /// By default, prefix caching is enabled.
+    #[arg(long)]
+    pub no_prefix_caching: bool,
 }
 
 impl ServeArgs {

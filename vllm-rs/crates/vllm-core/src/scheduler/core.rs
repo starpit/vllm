@@ -12,7 +12,8 @@
 //! [`KVCacheManagerOps`] is defined so that the real KV cache manager (built
 //! by another agent) can be plugged in later.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 
 use tracing::warn;
 use vllm_common::{Request, RequestStatus};
@@ -75,6 +76,11 @@ pub trait KVCacheManagerOps: Send {
 
     /// KV cache usage as a fraction in `[0.0, 1.0]`.
     fn usage(&self) -> f64;
+
+    /// Number of blocks retained in the prefix cache.
+    fn num_cached_blocks(&self) -> usize {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -83,17 +89,30 @@ pub trait KVCacheManagerOps: Send {
 
 /// A minimal block tracker that satisfies [`KVCacheManagerOps`].
 ///
-/// Instead of managing actual block tables, it tracks a simple counter of
-/// free blocks and assigns monotonically increasing block IDs. This is
-/// sufficient for testing the scheduler logic.
+/// Uses a free list of block IDs (0..total_blocks) that are recycled when
+/// freed. Optionally supports prefix caching: when `enable_caching` is
+/// true, freed full blocks are retained in a hash-indexed cache so that
+/// subsequent requests with the same prompt prefix can reuse them.
 pub struct SimpleBlockTracker {
-    #[allow(dead_code)]
     total_blocks: usize,
-    free_blocks: usize,
     block_size: usize,
-    next_block_id: usize,
+    /// Free block IDs available for allocation (recycled on free).
+    free_list: VecDeque<usize>,
     /// request_id -> (block_ids, num_blocks_held)
     allocations: HashMap<String, (Vec<Vec<usize>>, usize)>,
+
+    // --- Prefix caching fields ---
+    /// Whether prefix caching is enabled.
+    enable_caching: bool,
+    /// Hash of a full block's token content → block ID.
+    /// Only full blocks (block_size tokens) are cached.
+    block_hash_to_id: HashMap<u64, usize>,
+    /// Request ID → ordered list of block hashes (for cleanup on free).
+    req_to_hashes: HashMap<String, Vec<u64>>,
+    /// Block IDs that are freed but retained for cache reuse (evicted FIFO).
+    cached_block_ids: VecDeque<usize>,
+    /// Number of cached (retained) blocks.
+    num_cached_blocks: usize,
 }
 
 impl SimpleBlockTracker {
@@ -102,11 +121,27 @@ impl SimpleBlockTracker {
     pub fn new(num_gpu_blocks: usize, block_size: usize) -> Self {
         Self {
             total_blocks: num_gpu_blocks,
-            free_blocks: num_gpu_blocks,
             block_size,
-            next_block_id: 0,
+            free_list: (0..num_gpu_blocks).collect(),
             allocations: HashMap::new(),
+            enable_caching: false,
+            block_hash_to_id: HashMap::new(),
+            req_to_hashes: HashMap::new(),
+            cached_block_ids: VecDeque::new(),
+            num_cached_blocks: 0,
         }
+    }
+
+    /// Create a new block tracker with prefix caching enabled.
+    pub fn with_caching(num_gpu_blocks: usize, block_size: usize) -> Self {
+        let mut tracker = Self::new(num_gpu_blocks, block_size);
+        tracker.enable_caching = true;
+        tracker
+    }
+
+    /// Number of blocks currently retained in the prefix cache.
+    pub fn num_cached_blocks(&self) -> usize {
+        self.num_cached_blocks
     }
 
     /// Compute how many blocks a request needs for the given number of tokens.
@@ -115,6 +150,49 @@ impl SimpleBlockTracker {
             return 0;
         }
         num_tokens.div_ceil(block_size)
+    }
+
+    /// Hash a block-sized chunk of token IDs.
+    fn hash_block(tokens: &[u32]) -> u64 {
+        let mut hasher = std::hash::DefaultHasher::new();
+        tokens.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Evict one cached block to make room for a new allocation.
+    /// Returns true if a block was evicted, false if cache is empty.
+    fn evict_one_cached_block(&mut self) -> bool {
+        if let Some(block_id) = self.cached_block_ids.pop_front() {
+            // Remove from hash map (find the hash that maps to this block).
+            self.block_hash_to_id.retain(|_, &mut bid| bid != block_id);
+            self.num_cached_blocks -= 1;
+            // Recycle the block ID back to the free list.
+            self.free_list.push_back(block_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Try to allocate `count` block IDs, evicting cached blocks if needed.
+    /// Returns recycled IDs from the free list (bounded by total_blocks).
+    fn allocate_fresh_blocks(&mut self, count: usize) -> Option<Vec<usize>> {
+        // Evict cached blocks as needed to make room.
+        while self.free_list.len() < count {
+            if !self.evict_one_cached_block() {
+                return None; // truly out of blocks
+            }
+        }
+
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = self
+                .free_list
+                .pop_front()
+                .expect("free_list not empty after check");
+            ids.push(id);
+        }
+        Some(ids)
     }
 }
 
@@ -136,18 +214,68 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             .map(|(_, n)| *n)
             .unwrap_or(0);
 
-        let additional = needed.saturating_sub(currently_held);
-        if additional > self.free_blocks {
-            return None;
+        // If this is a new request with cached prefix, seed the allocation
+        // with the cached block IDs (they're already populated with KV data).
+        if currently_held == 0 && self.enable_caching && request.num_computed_tokens > 0 {
+            let num_cached_blocks = request.num_computed_tokens as usize / self.block_size;
+            if num_cached_blocks > 0 {
+                // Look up cached blocks from the prompt hashes.
+                let prompt = &request.prompt_token_ids;
+                let mut cached_ids = Vec::new();
+                let mut hashes = Vec::new();
+                for i in 0..num_cached_blocks {
+                    let start = i * self.block_size;
+                    let end = start + self.block_size;
+                    if end <= prompt.len() {
+                        let hash = Self::hash_block(&prompt[start..end]);
+                        if let Some(&bid) = self.block_hash_to_id.get(&hash) {
+                            cached_ids.push(bid);
+                            hashes.push(hash);
+                            // Remove from the eviction queue (it's now in use).
+                            self.cached_block_ids.retain(|&id| id != bid);
+                            self.num_cached_blocks = self.num_cached_blocks.saturating_sub(1);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                if !cached_ids.is_empty() {
+                    let cached_count = cached_ids.len();
+                    let additional = needed.saturating_sub(cached_count);
+
+                    let fresh_ids = if additional > 0 {
+                        self.allocate_fresh_blocks(additional)?
+                    } else {
+                        Vec::new()
+                    };
+
+                    let mut all_ids = cached_ids;
+                    all_ids.extend(fresh_ids);
+
+                    // Record hashes for this request (for cache cleanup on free).
+                    self.req_to_hashes
+                        .insert(request.request_id.clone(), hashes);
+
+                    self.allocations
+                        .insert(request.request_id.clone(), (vec![all_ids.clone()], needed));
+                    return Some(vec![all_ids]);
+                }
+            }
         }
 
-        // Allocate new blocks.
-        let mut new_block_ids = Vec::with_capacity(additional);
-        for _ in 0..additional {
-            new_block_ids.push(self.next_block_id);
-            self.next_block_id += 1;
-            self.free_blocks -= 1;
+        let additional = needed.saturating_sub(currently_held);
+        if additional == 0 {
+            // No new blocks needed — return existing allocation.
+            return Some(
+                self.allocations
+                    .get(&request.request_id)
+                    .map(|(blocks, _)| blocks.clone())
+                    .unwrap_or_else(|| vec![Vec::new()]),
+            );
         }
+
+        let new_block_ids = self.allocate_fresh_blocks(additional)?;
 
         // Merge with existing allocation.
         let entry = self
@@ -157,13 +285,67 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         entry.0[0].extend(new_block_ids.iter().copied());
         entry.1 = needed;
 
+        // When caching is enabled, record block hashes for full blocks.
+        if self.enable_caching {
+            let prompt = &request.prompt_token_ids;
+            let all_block_ids = &entry.0[0];
+            let mut hashes = self
+                .req_to_hashes
+                .remove(&request.request_id)
+                .unwrap_or_default();
+
+            // Hash all full blocks that we haven't hashed yet.
+            let num_full_blocks = total_tokens / self.block_size;
+            for i in hashes.len()..num_full_blocks {
+                let start = i * self.block_size;
+                let end = start + self.block_size;
+                if end <= prompt.len() && i < all_block_ids.len() {
+                    let hash = Self::hash_block(&prompt[start..end]);
+                    self.block_hash_to_id.insert(hash, all_block_ids[i]);
+                    hashes.push(hash);
+                }
+            }
+
+            if !hashes.is_empty() {
+                self.req_to_hashes
+                    .insert(request.request_id.clone(), hashes);
+            }
+        }
+
         // Return all block IDs for this request (single KV cache group).
         Some(entry.0.clone())
     }
 
     fn free(&mut self, request_id: &str) {
-        if let Some((_, num_blocks)) = self.allocations.remove(request_id) {
-            self.free_blocks += num_blocks;
+        if let Some((block_ids_groups, _num_blocks)) = self.allocations.remove(request_id) {
+            if self.enable_caching {
+                // Check which blocks have associated hashes (full blocks).
+                let hashes = self.req_to_hashes.remove(request_id).unwrap_or_default();
+                let cached_block_set: HashSet<usize> = hashes
+                    .iter()
+                    .filter_map(|h| self.block_hash_to_id.get(h).copied())
+                    .collect();
+
+                // Full cached blocks go to the retained cache; partial blocks
+                // are recycled back to the free list.
+                for group in &block_ids_groups {
+                    for &bid in group {
+                        if cached_block_set.contains(&bid) {
+                            self.cached_block_ids.push_back(bid);
+                            self.num_cached_blocks += 1;
+                        } else {
+                            self.free_list.push_back(bid);
+                        }
+                    }
+                }
+            } else {
+                // No caching — recycle all block IDs to the free list.
+                for group in &block_ids_groups {
+                    for &bid in group {
+                        self.free_list.push_back(bid);
+                    }
+                }
+            }
         }
     }
 
@@ -174,9 +356,33 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             .unwrap_or_else(|| vec![Vec::new()])
     }
 
-    fn get_computed_blocks(&self, _request: &Request) -> (u32, Vec<Vec<usize>>) {
-        // No prefix caching in the simple tracker.
-        (0, vec![Vec::new()])
+    fn get_computed_blocks(&self, request: &Request) -> (u32, Vec<Vec<usize>>) {
+        if !self.enable_caching {
+            return (0, vec![Vec::new()]);
+        }
+
+        // Hash full-block-sized chunks of the prompt and look for cached matches.
+        let prompt = &request.prompt_token_ids;
+        let mut matched_block_ids = Vec::new();
+        let mut num_matched_tokens = 0u32;
+
+        let num_full_blocks = prompt.len() / self.block_size;
+        for i in 0..num_full_blocks {
+            let start = i * self.block_size;
+            let end = start + self.block_size;
+            let chunk = &prompt[start..end];
+            let hash = Self::hash_block(chunk);
+
+            if let Some(&block_id) = self.block_hash_to_id.get(&hash) {
+                matched_block_ids.push(block_id);
+                num_matched_tokens += self.block_size as u32;
+            } else {
+                // Stop at first miss — prefix caching requires contiguous match.
+                break;
+            }
+        }
+
+        (num_matched_tokens, vec![matched_block_ids])
     }
 
     fn new_step_starts(&mut self) {
@@ -184,12 +390,21 @@ impl KVCacheManagerOps for SimpleBlockTracker {
     }
 
     fn reset_prefix_cache(&mut self) -> bool {
-        // No prefix cache to reset.
+        if !self.enable_caching {
+            return true;
+        }
+        // Recycle all cached block IDs back to the free list.
+        while let Some(bid) = self.cached_block_ids.pop_front() {
+            self.free_list.push_back(bid);
+        }
+        self.block_hash_to_id.clear();
+        self.req_to_hashes.clear();
+        self.num_cached_blocks = 0;
         true
     }
 
     fn num_free_blocks(&self) -> usize {
-        self.free_blocks
+        self.free_list.len()
     }
 
     fn num_total_blocks(&self) -> usize {
@@ -204,7 +419,11 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         if self.total_blocks == 0 {
             return 0.0;
         }
-        1.0 - self.free_blocks as f64 / self.total_blocks as f64
+        1.0 - self.free_list.len() as f64 / self.total_blocks as f64
+    }
+
+    fn num_cached_blocks(&self) -> usize {
+        self.num_cached_blocks
     }
 }
 
@@ -325,6 +544,11 @@ impl Scheduler {
     /// Number of GPU KV cache blocks currently in use.
     pub fn num_used_blocks(&self) -> usize {
         self.kv_cache.num_total_blocks() - self.kv_cache.num_free_blocks()
+    }
+
+    /// Number of blocks retained in the prefix cache.
+    pub fn num_cached_blocks(&self) -> usize {
+        self.kv_cache.num_cached_blocks()
     }
 
     // -- Internal helpers --
@@ -1755,5 +1979,359 @@ mod tests {
             0,
             "Sync mode should never set placeholders"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Prefix caching tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prefix_cache_basic() {
+        // Two requests with the same 32-token prompt should share cached blocks.
+        let block_size = 16;
+        let mut tracker = SimpleBlockTracker::with_caching(100, block_size);
+
+        // Make a 32-token prompt (2 full blocks).
+        let prompt: Vec<u32> = (0..32).collect();
+        let mut r1 = Request::new(
+            "r1".into(),
+            prompt.clone(),
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+
+        // First request: no cache hits.
+        let (cached, _) = tracker.get_computed_blocks(&r1);
+        assert_eq!(cached, 0);
+
+        // Allocate for r1.
+        let blocks = tracker.allocate_slots(&r1, 32, 0).unwrap();
+        assert_eq!(blocks[0].len(), 2);
+        let block0 = blocks[0][0];
+        let block1 = blocks[0][1];
+
+        // Simulate completion: r1 fully computed and freed.
+        r1.num_computed_tokens = 32;
+        tracker.free("r1");
+
+        // Now both blocks should be in the cache.
+        assert_eq!(tracker.num_cached_blocks(), 2);
+
+        // Second request with the same prompt.
+        let r2 = Request::new(
+            "r2".into(),
+            prompt.clone(),
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            2.0,
+            0,
+            0,
+            None,
+        );
+
+        // Should get 32 cached tokens.
+        let (cached2, cached_blocks2) = tracker.get_computed_blocks(&r2);
+        assert_eq!(cached2, 32);
+        assert_eq!(cached_blocks2[0].len(), 2);
+        assert_eq!(cached_blocks2[0][0], block0);
+        assert_eq!(cached_blocks2[0][1], block1);
+    }
+
+    #[test]
+    fn test_prefix_cache_partial_match() {
+        // Request with longer prompt should match the shared prefix.
+        let block_size = 16;
+        let mut tracker = SimpleBlockTracker::with_caching(100, block_size);
+
+        // First request: 32 tokens.
+        let prompt32: Vec<u32> = (0..32).collect();
+        let mut r1 = Request::new(
+            "r1".into(),
+            prompt32.clone(),
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+        tracker.allocate_slots(&r1, 32, 0).unwrap();
+        r1.num_computed_tokens = 32;
+        tracker.free("r1");
+
+        // Second request: 48 tokens, first 32 overlap.
+        let prompt48: Vec<u32> = (0..48).collect();
+        let r2 = Request::new(
+            "r2".into(),
+            prompt48,
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            2.0,
+            0,
+            0,
+            None,
+        );
+        let (cached, _) = tracker.get_computed_blocks(&r2);
+        assert_eq!(cached, 32, "first 2 blocks should match");
+    }
+
+    #[test]
+    fn test_prefix_cache_no_match_different_prompt() {
+        let block_size = 16;
+        let mut tracker = SimpleBlockTracker::with_caching(100, block_size);
+
+        let prompt_a: Vec<u32> = (0..32).collect();
+        let mut r1 = Request::new(
+            "r1".into(),
+            prompt_a,
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+        tracker.allocate_slots(&r1, 32, 0).unwrap();
+        r1.num_computed_tokens = 32;
+        tracker.free("r1");
+
+        // Different prompt — no match.
+        let prompt_b: Vec<u32> = (100..132).collect();
+        let r2 = Request::new(
+            "r2".into(),
+            prompt_b,
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            2.0,
+            0,
+            0,
+            None,
+        );
+        let (cached, _) = tracker.get_computed_blocks(&r2);
+        assert_eq!(cached, 0);
+    }
+
+    #[test]
+    fn test_prefix_cache_eviction_under_pressure() {
+        // With limited blocks, cached blocks get evicted FIFO.
+        let block_size = 16;
+        let mut tracker = SimpleBlockTracker::with_caching(4, block_size);
+
+        // Fill all 4 blocks with r1 (64 tokens).
+        let prompt64: Vec<u32> = (0..64).collect();
+        let mut r1 = Request::new(
+            "r1".into(),
+            prompt64,
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+        tracker.allocate_slots(&r1, 64, 0).unwrap();
+        r1.num_computed_tokens = 64;
+        tracker.free("r1");
+        assert_eq!(tracker.num_cached_blocks(), 4);
+
+        // New request needs 2 blocks — must evict 2 cached blocks.
+        let prompt_new: Vec<u32> = (200..232).collect();
+        let r2 = Request::new(
+            "r2".into(),
+            prompt_new,
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            2.0,
+            0,
+            0,
+            None,
+        );
+        let blocks = tracker.allocate_slots(&r2, 32, 0);
+        assert!(blocks.is_some(), "should evict cached blocks to make room");
+        assert_eq!(
+            tracker.num_cached_blocks(),
+            2,
+            "2 of 4 cached blocks should remain"
+        );
+    }
+
+    #[test]
+    fn test_prefix_cache_reset() {
+        let block_size = 16;
+        let mut tracker = SimpleBlockTracker::with_caching(100, block_size);
+
+        let prompt: Vec<u32> = (0..32).collect();
+        let mut r1 = Request::new(
+            "r1".into(),
+            prompt.clone(),
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+        tracker.allocate_slots(&r1, 32, 0).unwrap();
+        r1.num_computed_tokens = 32;
+        tracker.free("r1");
+        assert_eq!(tracker.num_cached_blocks(), 2);
+
+        tracker.reset_prefix_cache();
+        assert_eq!(tracker.num_cached_blocks(), 0);
+
+        // After reset, no cache hits.
+        let r2 = Request::new(
+            "r2".into(),
+            prompt,
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            2.0,
+            0,
+            0,
+            None,
+        );
+        let (cached, _) = tracker.get_computed_blocks(&r2);
+        assert_eq!(cached, 0);
+    }
+
+    #[test]
+    fn test_prefix_cache_allocate_reuses_cached_blocks() {
+        // When allocating for a request with cached prefix, the cached block IDs
+        // should appear in the allocation.
+        let block_size = 16;
+        let mut tracker = SimpleBlockTracker::with_caching(100, block_size);
+
+        let prompt: Vec<u32> = (0..32).collect();
+        let mut r1 = Request::new(
+            "r1".into(),
+            prompt.clone(),
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+        let r1_blocks = tracker.allocate_slots(&r1, 32, 0).unwrap();
+        let cached_block0 = r1_blocks[0][0];
+        let cached_block1 = r1_blocks[0][1];
+        r1.num_computed_tokens = 32;
+        tracker.free("r1");
+
+        // r2 has same prompt + 8 extra tokens = 40 tokens total.
+        let prompt40: Vec<u32> = (0..40).collect();
+        let mut r2 = Request::new(
+            "r2".into(),
+            prompt40,
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            2.0,
+            0,
+            0,
+            None,
+        );
+        // Simulate what the scheduler does: get_computed_blocks, then set
+        // num_computed_tokens, then allocate.
+        let (cached, _) = tracker.get_computed_blocks(&r2);
+        assert_eq!(cached, 32);
+        r2.num_computed_tokens = cached;
+
+        let r2_blocks = tracker.allocate_slots(&r2, 8, 0).unwrap();
+        // Should reuse the 2 cached blocks + 1 new block.
+        assert_eq!(r2_blocks[0].len(), 3);
+        assert_eq!(r2_blocks[0][0], cached_block0);
+        assert_eq!(r2_blocks[0][1], cached_block1);
+    }
+
+    #[test]
+    fn test_block_id_recycling() {
+        // Verify that block IDs are recycled and stay within bounds.
+        // With 4 blocks, serve many sequential requests — IDs must stay in 0..4.
+        let block_size = 16;
+        let mut tracker = SimpleBlockTracker::new(4, block_size);
+
+        for round in 0..20 {
+            let prompt: Vec<u32> = (0..16).collect();
+            let id = format!("r{round}");
+            let r = Request::new(
+                id.clone(),
+                prompt,
+                SamplingParams {
+                    max_tokens: Some(1),
+                    ..Default::default()
+                },
+                round as f64,
+                0,
+                0,
+                None,
+            );
+            let blocks = tracker.allocate_slots(&r, 16, 0).expect("should allocate");
+            // Block IDs must be within pool bounds.
+            for &bid in &blocks[0] {
+                assert!(bid < 4, "block ID {bid} out of bounds (round {round})");
+            }
+            tracker.free(&id);
+        }
+    }
+
+    #[test]
+    fn test_block_id_recycling_with_caching() {
+        // Same as above but with caching — evicted cached blocks must also
+        // produce IDs within bounds.
+        let block_size = 16;
+        let mut tracker = SimpleBlockTracker::with_caching(4, block_size);
+
+        for round in 0..20 {
+            // Each request uses a different prompt so no cache hits.
+            let base = (round * 16) as u32 + 1000;
+            let prompt: Vec<u32> = (base..base + 16).collect();
+            let id = format!("r{round}");
+            let mut r = Request::new(
+                id.clone(),
+                prompt,
+                SamplingParams {
+                    max_tokens: Some(1),
+                    ..Default::default()
+                },
+                round as f64,
+                0,
+                0,
+                None,
+            );
+            let blocks = tracker.allocate_slots(&r, 16, 0).expect("should allocate");
+            for &bid in &blocks[0] {
+                assert!(bid < 4, "block ID {bid} out of bounds (round {round})");
+            }
+            r.num_computed_tokens = 16;
+            tracker.free(&id);
+        }
     }
 }

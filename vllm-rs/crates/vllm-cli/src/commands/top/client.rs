@@ -26,6 +26,7 @@ pub struct StatsResponse {
     pub kv_cache_usage: f64,
     pub gpu_cache_blocks_used: i64,
     pub gpu_cache_blocks_total: i64,
+    pub num_cached_blocks: i64,
     pub ttft_sum: f64,
     pub ttft_count: u64,
     pub itl_sum: f64,

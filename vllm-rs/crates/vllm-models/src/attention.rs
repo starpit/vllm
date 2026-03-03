@@ -550,28 +550,43 @@ pub fn attention_with_cache(
             return Ok(output);
         }
 
-        // Standard path: gather cached K/V, concatenate, attend, store full.
+        // Standard path: gather cached K/V, concatenate, attend, store.
         if let Some((cached_k, cached_v)) = handle.take_cached()? {
             let k_cat = Tensor::cat(&[&cached_k, k_new], 0).map_err(ModelError::Candle)?;
             let v_cat = Tensor::cat(&[&cached_v, v_new], 0).map_err(ModelError::Candle)?;
 
-            // Sliding window: trim the cache to keep only the last `w` entries.
-            // This saves memory and ensures the SDPA mask matches the data.
+            // Paged decode (q_len==1): only store the single new token, avoiding
+            // a full O(seq_len) scatter + clone of the concatenated KV.  The old
+            // tokens are already in the pool (gather was non-destructive).
+            let is_paged_decode = q_len == 1 && handle.paged_block_refs().is_some();
+            if is_paged_decode {
+                let k_token = k_new.squeeze(0).map_err(ModelError::Candle)?;
+                let v_token = v_new.squeeze(0).map_err(ModelError::Candle)?;
+                handle.store_new_token(k_token, v_token)?;
+            }
+
+            // Sliding window: trim for attention (storage already written above).
             let (k_for_attn, v_for_attn) = if let Some(w) = sliding_window {
                 let kv_len = k_cat.dim(0).map_err(ModelError::Candle)?;
                 if kv_len > w {
-                    let start = kv_len - w;
-                    let k_trimmed = k_cat.narrow(0, start, w).map_err(ModelError::Candle)?;
-                    let v_trimmed = v_cat.narrow(0, start, w).map_err(ModelError::Candle)?;
-                    // Store the full cache (tokens still in window for future steps).
-                    handle.store(k_cat, v_cat)?;
+                    let trim_start = kv_len - w;
+                    let k_trimmed = k_cat.narrow(0, trim_start, w).map_err(ModelError::Candle)?;
+                    let v_trimmed = v_cat.narrow(0, trim_start, w).map_err(ModelError::Candle)?;
+                    if !is_paged_decode {
+                        // Contiguous / prefill: store full cache for future windows.
+                        handle.store(k_cat, v_cat)?;
+                    }
                     (k_trimmed, v_trimmed)
                 } else {
-                    handle.store(k_cat.clone(), v_cat.clone())?;
+                    if !is_paged_decode {
+                        handle.store(k_cat.clone(), v_cat.clone())?;
+                    }
                     (k_cat, v_cat)
                 }
             } else {
-                handle.store(k_cat.clone(), v_cat.clone())?;
+                if !is_paged_decode {
+                    handle.store(k_cat.clone(), v_cat.clone())?;
+                }
                 (k_cat, v_cat)
             };
 
@@ -664,12 +679,20 @@ pub fn batched_flash_attention_with_cache(
         let k_req = k_new.narrow(0, start, q_len).map_err(ModelError::Candle)?;
         let v_req = v_new.narrow(0, start, q_len).map_err(ModelError::Candle)?;
 
-        // Cache: gather previously stored K/V, concat with new, store the full sequence.
+        // Cache: gather previously stored K/V, concat with new, store back.
         let mut handle = storage.request_layer_handle(req_idx, layer_idx);
         let (k_full, v_full) = if let Some((cached_k, cached_v)) = handle.take_cached()? {
             let k_cat = Tensor::cat(&[&cached_k, &k_req], 0).map_err(ModelError::Candle)?;
             let v_cat = Tensor::cat(&[&cached_v, &v_req], 0).map_err(ModelError::Candle)?;
-            handle.store(k_cat.clone(), v_cat.clone())?;
+            // Decode (q_len==1): store only the new token, not the full sequence.
+            // The old tokens are already in the pool (gather was non-destructive).
+            if q_len == 1 {
+                let k_token = k_req.squeeze(0).map_err(ModelError::Candle)?;
+                let v_token = v_req.squeeze(0).map_err(ModelError::Candle)?;
+                handle.store_new_token(k_token, v_token)?;
+            } else {
+                handle.store(k_cat.clone(), v_cat.clone())?;
+            }
             (k_cat, v_cat)
         } else {
             // First call (prefill): no cached data.
@@ -710,16 +733,21 @@ pub fn batched_flash_attention_with_cache(
     let flat_k = Tensor::cat(&all_k_parts, 0).map_err(ModelError::Candle)?;
     let flat_v = Tensor::cat(&all_v_parts, 0).map_err(ModelError::Candle)?;
 
-    // cu_seqlens_q: cumulative query offsets from AttentionMetadata (already correct).
-    let cu_seqlens_q_vals: Vec<u32> = attn_meta
-        .query_start_loc
-        .iter()
-        .map(|&x| x as u32)
-        .collect();
-    let cu_seqlens_q = Tensor::from_slice(&cu_seqlens_q_vals, cu_seqlens_q_vals.len(), device)
+    // cu_seqlens: use cached GPU tensors when possible to avoid per-layer H2D copies.
+    let cu_seqlens_q = attn_meta
+        .cu_seqlens_q_gpu(device)
         .map_err(ModelError::Candle)?;
-    let cu_seqlens_k =
-        Tensor::from_slice(&kv_cumlen, kv_cumlen.len(), device).map_err(ModelError::Candle)?;
+    // cu_seqlens_k can be cached when there's no sliding window (kv_len == seq_lens[i]).
+    let cu_seqlens_k_owned;
+    let cu_seqlens_k = if sliding_window.is_none() {
+        attn_meta
+            .cu_seqlens_k_gpu(device)
+            .map_err(ModelError::Candle)?
+    } else {
+        cu_seqlens_k_owned =
+            Tensor::from_slice(&kv_cumlen, kv_cumlen.len(), device).map_err(ModelError::Candle)?;
+        &cu_seqlens_k_owned
+    };
 
     // Phase 3: Single batched FlashAttention v2 call.
     if let Some(w) = sliding_window {
@@ -1968,17 +1996,17 @@ mod tests {
             block_ids_all.push((0..num_blocks).map(|b| base_block + b).collect::<Vec<_>>());
         }
 
-        let attn_meta = crate::AttentionMetadata {
+        let attn_meta = crate::AttentionMetadata::new(
             num_reqs,
             total_tokens,
             query_start_loc,
             q_lens,
             seq_lens,
-            block_ids: block_ids_all.clone(),
-            tokens_before: tokens_before_all.clone(),
+            block_ids_all.clone(),
+            tokens_before_all.clone(),
             is_prefill,
-            req_ids: (0..num_reqs).map(|i| format!("req-{i}")).collect(),
-        };
+            (0..num_reqs).map(|i| format!("req-{i}")).collect(),
+        );
 
         // Build pool with enough blocks, pre-populate cached K/V.
         let max_block_id = block_ids_all

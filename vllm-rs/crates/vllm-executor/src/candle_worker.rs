@@ -136,6 +136,56 @@ pub struct CandleWorker {
     resolved_architecture: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// GPU-side sampling helpers
+// ---------------------------------------------------------------------------
+
+/// Check whether sampling for this request can stay entirely on-device.
+///
+/// Returns `true` when no CPU-side modifiers are needed (no penalties, no
+/// logit_bias, no logprobs, no grammar masking).  The caller must check
+/// grammar separately because the grammar state lives on the worker.
+fn can_gpu_sample(params: &SamplingParams) -> bool {
+    params.logit_bias.is_none()
+        && params.logprobs.is_none()
+        && params.seed.is_none()
+        && params.repetition_penalty == 1.0
+        && params.frequency_penalty == 0.0
+        && params.presence_penalty == 0.0
+        // For temperature>0 we use the Gumbel-max trick, which only handles
+        // the unfiltered categorical distribution.  top-p / top-k / min-p
+        // filtering still needs the CPU path.
+        && (params.temperature < 1e-5
+            || (params.top_p >= 1.0 && params.top_k <= 0 && params.min_p <= 0.0))
+}
+
+/// Sample one token entirely on-device.
+///
+/// * Greedy (temp ≈ 0): `argmax(logits)`
+/// * Temperature > 0: Gumbel-max trick — `argmax(logits/T − log(−log(U)))`
+///   where U ~ Uniform(0,1).  This is an exact categorical sample from
+///   `softmax(logits/T)` with no top-p/top-k filtering.  All computation
+///   stays on-device; only the 4-byte token ID is copied back.
+fn gpu_sample(logits: &Tensor, temperature: f32) -> candle_core::Result<u32> {
+    let flat = logits.flatten_all()?;
+
+    if temperature < 1e-5 {
+        // Greedy.
+        flat.argmax(0)?.reshape(())?.to_scalar::<u32>()
+    } else {
+        // Gumbel-max trick: argmax(logits/T + gumbel_noise).
+        let scaled = (flat.to_dtype(DType::F32)? / temperature as f64)?;
+        let uniform = Tensor::rand(0.0f32, 1.0, scaled.shape(), scaled.device())?;
+        // gumbel = -log(-log(u));  clamp u away from 0 and 1 for stability.
+        let clamped = uniform.clamp(1e-7, 1.0 - 1e-7)?;
+        let gumbel = clamped.log()?.neg()?.log()?.neg()?;
+        (scaled + gumbel)?
+            .argmax(0)?
+            .reshape(())?
+            .to_scalar::<u32>()
+    }
+}
+
 impl CandleWorker {
     /// Create a new CandleWorker from the given config.
     pub fn new(config: CandleWorkerConfig) -> Self {
@@ -802,6 +852,36 @@ impl CandleWorker {
             .narrow(0, last_pos, 1)
             .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
 
+        #[cfg(feature = "guided-decoding")]
+        let has_grammar = self
+            .grammar_states
+            .get(req_id)
+            .and_then(|g| g.allowed_tokens())
+            .is_some();
+        #[cfg(not(feature = "guided-decoding"))]
+        let has_grammar = false;
+
+        // GPU fast path: avoid transferring full vocab logits to CPU.
+        // For greedy or simple temperature sampling with no modifiers,
+        // we can sample entirely on-device and only copy back 4 bytes.
+        if let Some(params) = self.sampling_params_map.get(req_id) {
+            if !has_grammar && can_gpu_sample(params) {
+                let token_id = gpu_sample(&req_logits, params.temperature as f32).map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("GPU sample error: {e}"))
+                })?;
+                return Ok(vec![token_id]);
+            }
+        } else if !has_grammar {
+            // No sampling params at all — greedy argmax on device.
+            let token_id = req_logits
+                .argmax(candle_core::D::Minus1)
+                .and_then(|t| t.reshape(()))
+                .and_then(|t| t.to_scalar::<u32>())
+                .map_err(|e| ExecutorError::WorkerExecution(format!("argmax error: {e}")))?;
+            return Ok(vec![token_id]);
+        }
+
+        // Slow path: transfer full logits to CPU for penalties/grammar/logprobs.
         let logits_vec = req_logits
             .to_dtype(DType::F32)
             .map_err(|e| ExecutorError::WorkerExecution(format!("dtype cast error: {e}")))?

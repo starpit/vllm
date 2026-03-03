@@ -295,17 +295,17 @@ impl InputBatch {
         }
         query_start_loc.push(offset);
 
-        let attn_meta = AttentionMetadata {
+        let attn_meta = AttentionMetadata::new(
             num_reqs,
-            total_tokens: offset,
+            offset,
             query_start_loc,
             q_lens,
             seq_lens,
-            block_ids: batch_block_ids.clone(),
-            tokens_before: batch_tokens_before.clone(),
-            is_prefill: is_prefill_vec,
-            req_ids: batch_req_ids,
-        };
+            batch_block_ids.clone(),
+            batch_tokens_before.clone(),
+            is_prefill_vec,
+            batch_req_ids,
+        );
 
         PreparedInputs {
             req_inputs,

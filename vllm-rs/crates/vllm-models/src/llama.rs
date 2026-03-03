@@ -1702,17 +1702,17 @@ mod tests {
             &device,
         )
         .unwrap();
-        let attn_meta = crate::AttentionMetadata {
-            num_reqs: 2,
-            total_tokens: 5,
-            query_start_loc: vec![0, 3, 5],
-            q_lens: vec![3, 2],
-            seq_lens: vec![3, 2],
-            block_ids: vec![vec![0], vec![1]],
-            tokens_before: vec![0, 0],
-            is_prefill: vec![true, true],
-            req_ids: vec!["a".into(), "b".into()],
-        };
+        let attn_meta = crate::AttentionMetadata::new(
+            2,
+            5,
+            vec![0, 3, 5],
+            vec![3, 2],
+            vec![3, 2],
+            vec![vec![0], vec![1]],
+            vec![0, 0],
+            vec![true, true],
+            vec!["a".into(), "b".into()],
+        );
         let mut batched =
             crate::BatchedKvCacheStorage::new(&mut pool, vec![vec![0], vec![1]], vec![0, 0]);
         let logits_batched =
@@ -1764,17 +1764,17 @@ mod tests {
             &device,
         )
         .unwrap();
-        let attn_meta = crate::AttentionMetadata {
-            num_reqs: 1,
-            total_tokens: 4,
-            query_start_loc: vec![0, 4],
-            q_lens: vec![4],
-            seq_lens: vec![4],
-            block_ids: vec![vec![0]],
-            tokens_before: vec![0],
-            is_prefill: vec![true],
-            req_ids: vec!["r".into()],
-        };
+        let attn_meta = crate::AttentionMetadata::new(
+            1,
+            4,
+            vec![0, 4],
+            vec![4],
+            vec![4],
+            vec![vec![0]],
+            vec![0],
+            vec![true],
+            vec!["r".into()],
+        );
         let mut batched = crate::BatchedKvCacheStorage::new(&mut pool, vec![vec![0]], vec![0]);
         let logits_batch =
             crate::Model::forward_batch(&model, &ids, &pos, &attn_meta, &mut batched).unwrap();

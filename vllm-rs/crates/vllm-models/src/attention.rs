@@ -692,11 +692,10 @@ pub fn batched_flash_attention_with_cache(
             // Zero GPU memory allocation during decode.
             let buf = storage.contiguous_kv_buf(req_idx, layer_idx).unwrap();
             buf.write(&k_req, &v_req, buf.len)?;
-            let view = buf.view()?;
             // Skip paged block writes during decode — the contiguous buffer is
             // authoritative. Paged blocks were populated during prefill and are
             // not read again while the contiguous buffer exists.
-            view
+            buf.view()?
         } else {
             // Slow path: gather from paged blocks (prefill / first decode step).
             let mut handle = storage.request_layer_handle(req_idx, layer_idx);
@@ -785,8 +784,8 @@ pub fn batched_flash_attention_with_cache(
             q,
             &flat_k,
             &flat_v,
-            &cu_seqlens_q,
-            &cu_seqlens_k,
+            cu_seqlens_q,
+            cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
             scale as f32,
@@ -799,8 +798,8 @@ pub fn batched_flash_attention_with_cache(
             q,
             &flat_k,
             &flat_v,
-            &cu_seqlens_q,
-            &cu_seqlens_k,
+            cu_seqlens_q,
+            cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
             scale as f32,

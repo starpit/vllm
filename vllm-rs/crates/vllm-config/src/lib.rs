@@ -12,6 +12,7 @@
 //! the Python/Rust boundary through PyO3.
 
 pub mod cache;
+pub mod compilation;
 pub mod model;
 pub mod parallel;
 pub mod scheduler;
@@ -21,6 +22,7 @@ pub use cache::{
     CacheConfig, CacheDType, KVCacheConfig, KVCacheGroupSpec, KVCacheSpec, KVCacheSpecType,
     KVCacheTensor, MambaCacheMode, PrefixCachingHashAlgo,
 };
+pub use compilation::CudaGraphConfig;
 pub use model::{AttnType, ModelConfig, ModelDType};
 pub use parallel::ParallelConfig;
 pub use scheduler::{RunnerType, SchedulerConfig, SchedulerPolicy};

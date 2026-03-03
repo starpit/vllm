@@ -25,6 +25,7 @@ path = "src/main.rs"
 
 [dependencies]
 vllm-common = { workspace = true }
+vllm-config = { workspace = true }
 vllm-serve = { workspace = true }
 vllm-executor = { workspace = true }
 vllm-models = { workspace = true }

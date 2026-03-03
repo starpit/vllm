@@ -339,7 +339,7 @@
 
 | Feature | Python | Rust | Unit | E2E | Pri |
 |---|:---:|:---:|---:|---:|:---:|
-| CUDA graphs | &#x1F535; | &#x1F534; | — | — | P3 |
+| CUDA graphs | &#x1F535; | &#x1F7E1; | 5 | 0 | P3 | Infrastructure done; blocked on candle default-stream capture (candle#3083) |
 | FlashAttention v2 kernels (single-seq + batched varlen) | &#x1F535; | &#x1F535; | 15 | 0 | |
 | FlashInfer kernels | &#x1F535; | &#x1F534; | — | — | P2 |
 | xFormers memory-efficient attention | &#x1F535; | &#x1F534; | — | — | P1 |

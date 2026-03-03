@@ -14,6 +14,7 @@ use std::time::Instant;
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use vllm_common::telemetry;
+use vllm_config::CudaGraphConfig;
 use vllm_serve::llm::{LLM, LLMBuilder, SamplingParams};
 
 use crate::args::{BenchCommand, BenchCommands, BenchLatencyArgs};
@@ -34,6 +35,18 @@ fn create_llm(args: &BenchLatencyArgs, model: &str) -> Result<LLM> {
     }
     if let Some(ref gguf) = args.gguf_file {
         builder = builder.gguf_file(gguf);
+    }
+
+    // Wire CUDA graph config unless --enforce-eager is set.
+    if !args.enforce_eager {
+        let sizes = CudaGraphConfig::parse_sizes(&args.cuda_graph_sizes);
+        if !sizes.is_empty() {
+            builder = builder.cuda_graph_config(CudaGraphConfig {
+                enabled: true,
+                capture_sizes: sizes,
+                num_warmups: 3,
+            });
+        }
     }
 
     builder.build()

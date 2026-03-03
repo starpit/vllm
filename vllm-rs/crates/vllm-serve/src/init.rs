@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tracing::info;
-use vllm_config::{SchedulerConfig, SchedulerPolicy};
+use vllm_config::{CudaGraphConfig, SchedulerConfig, SchedulerPolicy};
 use vllm_engine::core_client::InprocClient;
 use vllm_engine::engine_core::EngineCoreConfig;
 use vllm_executor::candle_worker::{CandleWorker, CandleWorkerConfig};
@@ -74,6 +74,9 @@ pub struct VllmConfig {
     pub disable_async_scheduling: bool,
     /// Runner type: "generate" (default) or "pooling".
     pub runner: String,
+    /// CUDA graph configuration. When `Some`, CUDA graphs may be captured
+    /// for decode-step acceleration.
+    pub cuda_graph_config: Option<CudaGraphConfig>,
 }
 
 impl Default for VllmConfig {
@@ -97,6 +100,7 @@ impl Default for VllmConfig {
             tensor_parallel_size: 1,
             disable_async_scheduling: false,
             runner: "generate".to_string(),
+            cuda_graph_config: None,
         }
     }
 }
@@ -185,6 +189,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
         is_pooling,
         tp_rank: 0,
         tp_world_size: 1,
+        cuda_graph_config: config.cuda_graph_config.clone(),
     };
 
     let mut worker = CandleWorker::new(worker_config);
@@ -300,7 +305,7 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         model_name, max_model_len, num_layers
     );
 
-    let (worker, available_memory, num_gpu_blocks, effective_utilization) = init_cache(
+    let (mut worker, available_memory, num_gpu_blocks, effective_utilization) = init_cache(
         worker,
         config.block_size,
         &hf_config,
@@ -330,6 +335,11 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         let m = crate::metrics::VllmMetrics::global();
         m.gpu_cache_blocks_total.set(num_gpu_blocks as i64);
     }
+
+    // 5b. Compile / warm up model (CUDA graph capture if enabled).
+    worker
+        .compile_or_warm_up_model()
+        .context("failed to compile or warm up model")?;
 
     // 6. Wrap in UniProcExecutor (pre-initialized — skip init sequence).
     let executor = UniProcExecutor::new_pre_initialized(worker);
@@ -565,6 +575,7 @@ fn initialize_stack_tp(
             is_pooling,
             tp_rank: rank,
             tp_world_size: tp_size,
+            cuda_graph_config: config.cuda_graph_config.clone(),
         })
         .collect();
 

@@ -160,6 +160,18 @@ pub struct ServeArgs {
     /// generation endpoints (chat, completions) are rejected.
     #[arg(long, default_value = "generate")]
     pub runner: String,
+
+    /// Comma-separated CUDA graph capture batch sizes.
+    /// CUDA graphs accelerate decode steps by replaying a captured kernel
+    /// sequence in a single driver call.
+    #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
+    pub cuda_graph_sizes: String,
+
+    /// Disable CUDA graphs and run all steps eagerly.
+    /// Equivalent to Python vLLM's --enforce-eager flag.
+    /// Default: false (CUDA graphs enabled on CUDA devices).
+    #[arg(long)]
+    pub enforce_eager: bool,
 }
 
 impl ServeArgs {
@@ -254,6 +266,15 @@ pub struct BenchLatencyArgs {
     /// Path to write JSON results.
     #[arg(long)]
     pub output_json: Option<String>,
+
+    /// Disable CUDA graphs and run all steps eagerly.
+    /// Default: false (CUDA graphs enabled on CUDA devices).
+    #[arg(long)]
+    pub enforce_eager: bool,
+
+    /// Comma-separated list of batch sizes to capture as CUDA graphs.
+    #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
+    pub cuda_graph_sizes: String,
 }
 
 impl BenchLatencyArgs {

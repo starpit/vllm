@@ -7,7 +7,7 @@ description = "Worker/process management and distributed coordination for vLLM R
 
 [features]
 default = []
-cuda = ["vllm-models/cuda", "candle-core/cuda", "cudarc"]
+cuda = ["vllm-models/cuda", "vllm-kernels/cuda", "candle-core/cuda", "cudarc"]
 metal = ["candle-core/metal"]
 guided-decoding = ["outlines-core", "vllm-models/guided-decoding"]
 
@@ -17,6 +17,7 @@ vllm-config = { workspace = true }
 vllm-core = { workspace = true }
 vllm-engine = { workspace = true }
 vllm-model = { workspace = true }
+vllm-kernels = { workspace = true, optional = true }
 vllm-models = { workspace = true }
 candle-core = { workspace = true }
 outlines-core = { workspace = true, optional = true }

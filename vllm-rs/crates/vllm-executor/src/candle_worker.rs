@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use candle_core::{DType, Device, Tensor};
 use tracing::{debug, info, warn};
 use vllm_common::SamplingParams;
+use vllm_config::CudaGraphConfig;
 use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_engine::executor::ModelRunnerOutput;
 use vllm_model::gguf::{self, GgufFile};
@@ -67,6 +68,9 @@ pub struct CandleWorkerConfig {
     pub tp_rank: usize,
     /// Tensor parallelism world size. Default 1 (no TP).
     pub tp_world_size: usize,
+    /// CUDA graph configuration. When `Some` and `enabled`, graphs are
+    /// captured during `compile_or_warm_up_model()` for decode acceleration.
+    pub cuda_graph_config: Option<CudaGraphConfig>,
 }
 
 impl CandleWorkerConfig {
@@ -147,6 +151,9 @@ pub struct CandleWorker {
     /// Only populated on CUDA with BF16/FP16 (FA2 path).
     #[cfg(feature = "cuda")]
     contiguous_kv_cache: HashMap<String, Vec<Option<vllm_models::ContiguousKvBuffer>>>,
+    /// CUDA graph runner for decode acceleration (None if not CUDA or disabled).
+    #[cfg(feature = "cuda")]
+    cuda_graph_runner: Option<crate::cuda_graph::CudaGraphRunner>,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +239,8 @@ impl CandleWorker {
             resolved_architecture: None,
             #[cfg(feature = "cuda")]
             contiguous_kv_cache: HashMap::new(),
+            #[cfg(feature = "cuda")]
+            cuda_graph_runner: None,
         }
     }
 
@@ -1284,6 +1293,54 @@ impl Worker for CandleWorker {
         Ok(())
     }
 
+    fn compile_or_warm_up_model(&mut self) -> ExecutorResult<()> {
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(ref config) = self.config.cuda_graph_config
+                && config.enabled
+                && self.device.as_ref().is_some_and(|d| d.is_cuda())
+                && self.model.is_some()
+                && self.kv_block_pool.is_some()
+            {
+                info!(
+                    "CandleWorker: capturing CUDA graphs for batch sizes {:?}",
+                    config.capture_sizes
+                );
+                let vocab_size = self
+                    .hf_config
+                    .as_ref()
+                    .and_then(|c| c.vocab_size)
+                    .unwrap_or(32000);
+                let mut runner = crate::cuda_graph::CudaGraphRunner::new(
+                    config.capture_sizes.clone(),
+                    vocab_size,
+                    self.resolved_dtype.unwrap_or(DType::F32),
+                    self.device.clone().unwrap(),
+                    config.num_warmups,
+                );
+                match runner.capture_graphs(
+                    self.model.as_ref().unwrap().as_ref(),
+                    self.kv_block_pool.as_mut().unwrap(),
+                    self.config.block_size,
+                ) {
+                    Ok(()) => {
+                        info!(
+                            "CandleWorker: captured {} CUDA graphs",
+                            config.capture_sizes.len()
+                        );
+                        self.cuda_graph_runner = Some(runner);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "CandleWorker: CUDA graph capture failed, falling back to eager mode: {e}"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn determine_available_memory(&mut self) -> ExecutorResult<usize> {
         // On CUDA devices, query actual GPU VRAM via cudarc.
         #[cfg(feature = "cuda")]
@@ -1541,6 +1598,29 @@ impl Worker for CandleWorker {
             let flat_pos = Tensor::new(prepared.flat_positions.as_slice(), device)
                 .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
 
+            // --- CUDA graph fast path for all-decode batches ---
+            #[cfg(feature = "cuda")]
+            let cuda_graph_logits: Option<Tensor> = if prepared.attn_meta.is_all_decode() {
+                if let Some(ref runner) = self.cuda_graph_runner {
+                    runner
+                        .try_replay(
+                            prepared.attn_meta.num_reqs,
+                            &prepared.flat_token_ids,
+                            &prepared.flat_positions,
+                        )
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("graph replay: {e}"))
+                        })?
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            #[cfg(not(feature = "cuda"))]
+            let cuda_graph_logits: Option<Tensor> = None;
+
             // Build BatchedKvCacheStorage.
             // On CUDA: inject pre-allocated contiguous KV buffers to avoid
             // O(seq_len) block gathers and per-step GPU memory allocation.
@@ -1567,22 +1647,36 @@ impl Worker for CandleWorker {
                 prepared.batch_tokens_before,
             );
 
-            // Single batched forward pass.
-            let all_logits_flat = model
-                .forward_batch(
-                    &flat_ids,
-                    &flat_pos,
-                    &prepared.attn_meta,
-                    &mut batched_storage,
-                )
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
-                })?;
+            let all_logits_flat = if let Some(graph_logits) = cuda_graph_logits {
+                // Graph replay succeeded — still flush real KV scatter eagerly.
+                batched_storage
+                    .flush_all()
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
+                    })?;
+                graph_logits
+            } else {
+                // Eager forward path (no CUDA graph or not all-decode).
+                let logits = model
+                    .forward_batch(
+                        &flat_ids,
+                        &flat_pos,
+                        &prepared.attn_meta,
+                        &mut batched_storage,
+                    )
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
+                    })?;
 
-            // Flush deferred scatters.
-            batched_storage
-                .flush_all()
-                .map_err(|e| ExecutorError::WorkerExecution(format!("scatter flush error: {e}")))?;
+                // Flush deferred scatters.
+                batched_storage
+                    .flush_all()
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
+                    })?;
+
+                logits
+            };
 
             // Extract updated contiguous KV buffers for persistence.
             #[cfg(feature = "cuda")]
@@ -2145,6 +2239,7 @@ mod tests {
             is_pooling: false,
             tp_rank: 0,
             tp_world_size: 1,
+            cuda_graph_config: None,
         }
     }
 

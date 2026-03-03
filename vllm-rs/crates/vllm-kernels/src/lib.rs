@@ -11,6 +11,8 @@
 pub mod activation;
 pub mod attention;
 pub mod cache;
+#[cfg(feature = "cuda")]
+pub mod cuda_graph;
 pub mod error;
 pub mod moe;
 #[cfg(feature = "nccl")]

@@ -25,6 +25,8 @@ use tokio::task::JoinHandle;
 
 pub use vllm_common::SamplingParams;
 
+use vllm_config::CudaGraphConfig;
+
 use crate::engine::AsyncEngine;
 use crate::init::{InitializedStack, VllmConfig};
 use crate::protocol;
@@ -165,6 +167,12 @@ impl LLMBuilder {
     /// Set a specific GGUF filename to download.
     pub fn gguf_file(mut self, filename: impl Into<String>) -> Self {
         self.config.gguf_file = Some(filename.into());
+        self
+    }
+
+    /// Set the CUDA graph configuration for decode acceleration.
+    pub fn cuda_graph_config(mut self, config: CudaGraphConfig) -> Self {
+        self.config.cuda_graph_config = Some(config);
         self
     }
 

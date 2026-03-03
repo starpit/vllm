@@ -10,6 +10,7 @@ use std::time::Instant;
 use anyhow::Result;
 use tracing::info;
 use vllm_common::telemetry;
+use vllm_config::CudaGraphConfig;
 use vllm_serve::init::{VllmConfig, initialize_stack};
 use vllm_serve::server::{AppState, ServerConfig};
 
@@ -98,6 +99,20 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         tensor_parallel_size: args.tensor_parallel_size,
         disable_async_scheduling: args.disable_async_scheduling,
         runner: args.runner.clone(),
+        cuda_graph_config: if args.enforce_eager {
+            None
+        } else {
+            let sizes = CudaGraphConfig::parse_sizes(&args.cuda_graph_sizes);
+            if sizes.is_empty() {
+                None
+            } else {
+                Some(CudaGraphConfig {
+                    enabled: true,
+                    capture_sizes: sizes,
+                    num_warmups: 2,
+                })
+            }
+        },
     };
 
     let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&config))

@@ -16,7 +16,7 @@ use mlx_rs::module::Module;
 use mlx_rs::nn;
 use mlx_rs::{Array, Dtype};
 
-use crate::cache::MlxKvCache;
+use crate::cache::{MlxKvCache, MlxLayerKvCache};
 use crate::models::llama::{LlamaConfig, load_safetensors_weights};
 use crate::models::quantized_llama::{
     MlxEmbedTokens, MlxLmHead, MlxQuantizedLlamaAttention, MlxQuantizedLlamaMLP, QuantConfig,
@@ -134,11 +134,14 @@ impl MlxQuantizedGraniteDecoderLayer {
         &mut self,
         hidden_states: &Array,
         positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         // Pre-attention norm.
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let attn_output = self
+            .self_attn
+            .forward(&normed, positions, cache, rope_offset)?;
         // Scale attention output before residual add.
         let hidden_states =
             hidden_states.add(&attn_output.multiply(Array::from(self.residual_multiplier))?)?;
@@ -224,13 +227,15 @@ impl super::MlxModel for MlxQuantizedGraniteForCausalLM {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         // Embed + scale.
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         hidden_states = hidden_states.multiply(Array::from(self.embedding_multiplier))?;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], offset)?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;
@@ -241,9 +246,9 @@ impl super::MlxModel for MlxQuantizedGraniteForCausalLM {
             self.lm_head.as_mut().unwrap().forward(&hidden_states)?
         };
 
-        // Divide by logits_scaling, cast to f32.
+        // Divide by logits_scaling.
         let logits = logits.multiply(Array::from(1.0f32 / self.logits_scaling))?;
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -259,7 +264,7 @@ impl super::MlxModel for MlxQuantizedGraniteForCausalLM {
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         hidden_states = hidden_states.multiply(Array::from(self.embedding_multiplier))?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], 0)?;
         }
         self.norm.forward(&hidden_states)
     }

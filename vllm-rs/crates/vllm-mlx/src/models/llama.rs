@@ -16,11 +16,10 @@ use mlx_rs::builder::Builder;
 use mlx_rs::error::Exception;
 use mlx_rs::module::{Module, Param};
 use mlx_rs::nn;
-use mlx_rs::ops::concatenate_axis;
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
-use crate::cache::MlxKvCache;
+use crate::cache::{MlxBatchInfo, MlxKvCache, MlxLayerKvCache};
 use vllm_model::weight::HfModelConfig;
 
 // ---------------------------------------------------------------------------
@@ -369,8 +368,9 @@ impl MlxLlamaAttention {
     pub fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        _positions: &Array,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let seq_len = hidden_states.dim(0);
 
@@ -399,27 +399,17 @@ impl MlxLlamaAttention {
         // [seq, heads, head_dim] -> [1, heads, seq, head_dim]
         let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
         let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut v = v
+        let v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        // RoPE: uses positions[0] as offset for proper positional encoding.
-        let offset = if positions.size() > 0 {
-            positions.reshape(&[-1])?.min(None)?.item::<i32>()
-        } else {
-            0
-        };
-        let q = self.rope.forward((&q, offset))?;
-        k = self.rope.forward((&k, offset))?;
+        // RoPE: offset passed from caller (avoids .item() sync in MLX).
+        let q = self.rope.forward((&q, rope_offset))?;
+        k = self.rope.forward((&k, rope_offset))?;
 
-        // KV cache update (lazy — no actual concat until eval).
-        if let Some((ck, cv)) = cache.take() {
-            k = concatenate_axis(&[ck, k], 2)?; // concat along seq dim
-            v = concatenate_axis(&[cv, v], 2)?;
-        }
-        // Store the full cache (for future steps).
-        *cache = Some((k.clone(), v.clone()));
+        // KV cache update — pre-allocated buffer with O(1) slice_update.
+        let (mut k, mut v) = crate::cache::kv_cache_update(cache, &k, &v)?;
 
         // Sliding window: trim K/V to only the last `w` positions.
         // The stored cache remains full (future tokens may still be in window),
@@ -451,6 +441,102 @@ impl MlxLlamaAttention {
             .reshape(&[seq_len, hidden])?;
 
         self.o_proj.forward(&out)
+    }
+
+    /// Batched forward: projections batched on `[total_tokens, hidden]`,
+    /// split per-request for reshape/RoPE/KV-cache/SDPA, then rejoin for O projection.
+    pub fn forward_batch(
+        &mut self,
+        hidden_states: &Array,
+        batch_info: &MlxBatchInfo,
+        caches: &mut [Option<MlxLayerKvCache>],
+    ) -> Result<Array, Exception> {
+        // Batched Q/K/V projections on [total_tokens, hidden].
+        let q_all = self.q_proj.forward(hidden_states)?;
+        let k_all = self.k_proj.forward(hidden_states)?;
+        let v_all = self.v_proj.forward(hidden_states)?;
+
+        // Split per-request for reshape/RoPE/cache/SDPA.
+        let mut attn_outputs = Vec::with_capacity(batch_info.num_reqs);
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..batch_info.num_reqs {
+            let start = batch_info.offsets[i] as i32;
+            let seq_len = batch_info.q_lens[i] as i32;
+            let offset = batch_info.rope_offsets[i];
+
+            let q = q_all.try_index((start..start + seq_len, ..))?;
+            let k = k_all.try_index((start..start + seq_len, ..))?;
+            let v = v_all.try_index((start..start + seq_len, ..))?;
+
+            // Reshape: [seq, hidden] -> [seq, heads, head_dim]
+            let q = q.reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?;
+            let k = k.reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
+
+            // Optional per-head QK norms (Qwen3).
+            let q = if let Some(ref mut norm) = self.q_norm {
+                norm.forward(&q)?
+            } else {
+                q
+            };
+            let k = if let Some(ref mut norm) = self.k_norm {
+                norm.forward(&k)?
+            } else {
+                k
+            };
+
+            // [seq, heads, head_dim] -> [1, heads, seq, head_dim]
+            let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+            let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+            let v = v
+                .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
+                .transpose_axes(&[1, 0, 2])?
+                .expand_dims(0)?;
+
+            // RoPE
+            let q = self.rope.forward((&q, offset))?;
+            k = self.rope.forward((&k, offset))?;
+
+            // KV cache update
+            let (mut k, mut v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+
+            // Sliding window
+            if let Some(w) = self.sliding_window {
+                let kv_len = k.dim(2) as usize;
+                if kv_len > w {
+                    let s = (kv_len - w) as i32;
+                    let e = kv_len as i32;
+                    k = k.try_index((.., .., s..e, ..))?;
+                    v = v.try_index((.., .., s..e, ..))?;
+                }
+            }
+
+            // SDPA
+            let mask = if seq_len > 1 {
+                Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
+            } else {
+                None
+            };
+            let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
+
+            // [1, heads, seq, head_dim] -> [seq, heads*head_dim]
+            let hidden = (self.num_heads * self.head_dim) as i32;
+            let out = out
+                .squeeze_axes(&[0])?
+                .transpose_axes(&[1, 0, 2])?
+                .reshape(&[seq_len, hidden])?;
+
+            attn_outputs.push(out);
+        }
+
+        // Concatenate per-request outputs -> [total_tokens, heads*head_dim]
+        let concat = if attn_outputs.len() == 1 {
+            attn_outputs.into_iter().next().unwrap()
+        } else {
+            mlx_rs::ops::concatenate_axis(&attn_outputs, 0)?
+        };
+
+        // Batched O projection on [total_tokens, hidden]
+        self.o_proj.forward(&concat)
     }
 }
 
@@ -503,14 +589,36 @@ impl MlxLlamaDecoderLayer {
         &mut self,
         hidden_states: &Array,
         positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         // Pre-attention layernorm + attention + residual.
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let attn_output = self
+            .self_attn
+            .forward(&normed, positions, cache, rope_offset)?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
         // Post-attention layernorm + MLP + residual.
+        let normed = self.post_attention_layernorm.forward(&hidden_states)?;
+        let mlp_output = self.mlp.forward(&normed)?;
+        hidden_states.add(&mlp_output)
+    }
+
+    /// Batched forward: norms and MLP run on `[total_tokens, hidden]`,
+    /// attention splits per-request for RoPE/KV/SDPA.
+    pub fn forward_batch(
+        &mut self,
+        hidden_states: &Array,
+        batch_info: &MlxBatchInfo,
+        caches: &mut [Option<MlxLayerKvCache>],
+    ) -> Result<Array, Exception> {
+        // Batched input layernorm + batched attention + residual.
+        let normed = self.input_layernorm.forward(hidden_states)?;
+        let attn_output = self.self_attn.forward_batch(&normed, batch_info, caches)?;
+        let hidden_states = hidden_states.add(&attn_output)?;
+
+        // Batched post-attention layernorm + batched MLP + residual.
         let normed = self.post_attention_layernorm.forward(&hidden_states)?;
         let mlp_output = self.mlp.forward(&normed)?;
         hidden_states.add(&mlp_output)
@@ -609,10 +717,12 @@ impl MlxLlamaForCausalLM {
         inputs_embeds: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> Result<Array, Exception> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = inputs_embeds.clone();
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], offset)?;
         }
         hidden_states = self.norm.forward(&hidden_states)?;
 
@@ -621,7 +731,7 @@ impl MlxLlamaForCausalLM {
         } else {
             self.lm_head.as_mut().unwrap().forward(&hidden_states)?
         };
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     /// Load model weights from safetensors files in a directory.
@@ -695,11 +805,13 @@ impl super::MlxModel for MlxLlamaForCausalLM {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], offset)?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;
@@ -711,12 +823,50 @@ impl super::MlxModel for MlxLlamaForCausalLM {
             self.lm_head.as_mut().unwrap().forward(&hidden_states)?
         };
 
-        // Cast logits to f32 for sampling.
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    fn forward_batch(
+        &mut self,
+        input_ids: &Array,
+        _positions: &Array,
+        batch_info: &MlxBatchInfo,
+        kv_caches: &mut [MlxKvCache],
+    ) -> mlx_rs::error::Result<Array> {
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // Collect the per-layer cache entry from each request's KV cache.
+            let mut layer_caches: Vec<&mut Option<MlxLayerKvCache>> =
+                kv_caches.iter_mut().map(|kv| &mut kv[layer_idx]).collect();
+
+            // Build a contiguous slice for the layer's forward_batch.
+            // We need to pass &mut [Option<MlxLayerKvCache>], but we have Vec<&mut Option<...>>.
+            // Use a temporary Vec to hold the values, then put them back.
+            let mut temp_caches: Vec<Option<MlxLayerKvCache>> =
+                layer_caches.iter_mut().map(|c| c.take()).collect();
+
+            hidden_states = layer.forward_batch(&hidden_states, batch_info, &mut temp_caches)?;
+
+            // Put caches back.
+            for (dst, src) in layer_caches.iter_mut().zip(temp_caches.into_iter()) {
+                **dst = src;
+            }
+        }
+
+        hidden_states = self.norm.forward(&hidden_states)?;
+
+        let logits = if self.tie_word_embeddings {
+            self.embed_tokens.as_linear(&hidden_states)?
+        } else {
+            self.lm_head.as_mut().unwrap().forward(&hidden_states)?
+        };
+
+        Ok(logits)
     }
 
     fn hidden_states(
@@ -727,7 +877,7 @@ impl super::MlxModel for MlxLlamaForCausalLM {
         let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], 0)?;
         }
         self.norm.forward(&hidden_states)
     }
@@ -992,7 +1142,7 @@ mod tests {
         let positions = Array::from_iter(0..4i32, &[4]);
         let mut cache = None;
 
-        let out = attn.forward(&x, &positions, &mut cache).unwrap();
+        let out = attn.forward(&x, &positions, &mut cache, 0).unwrap();
         out.eval().unwrap();
         assert_eq!(out.shape(), &[4, 32]);
         assert!(cache.is_some());
@@ -1012,6 +1162,7 @@ mod tests {
             &input_ids,
             &positions,
             &mut kv_cache,
+            None,
         )
         .unwrap();
         logits.eval().unwrap();
@@ -1032,6 +1183,7 @@ mod tests {
             &input_ids,
             &positions,
             &mut kv_cache,
+            None,
         )
         .unwrap();
         logits.eval().unwrap();
@@ -1050,6 +1202,7 @@ mod tests {
             &decode_ids,
             &decode_pos,
             &mut kv_cache,
+            Some(3),
         )
         .unwrap();
         logits2.eval().unwrap();

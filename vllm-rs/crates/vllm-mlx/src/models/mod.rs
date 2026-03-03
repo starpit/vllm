@@ -26,8 +26,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use mlx_rs::Array;
+#[allow(unused_imports)]
+use mlx_rs::ops::indexing::IndexOp;
 
-use crate::cache::MlxKvCache;
+use crate::cache::{MlxBatchInfo, MlxKvCache};
 use vllm_model::weight::HfModelConfig;
 
 /// Per-GDN-layer recurrent state for MLX models: `(conv_state, ssm_state)`.
@@ -61,6 +63,7 @@ pub trait MlxModel: Send {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array>;
 
     /// Number of transformer layers in this model.
@@ -72,6 +75,7 @@ pub trait MlxModel: Send {
         _inputs_embeds: &Array,
         _positions: &Array,
         _kv_cache: &mut MlxKvCache,
+        _rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
         Err(mlx_rs::error::Exception::custom(
             "forward_embeds not supported by this model",
@@ -98,6 +102,45 @@ pub trait MlxModel: Send {
 
     /// Inject previously-saved recurrent state into all GDN layers.
     fn inject_recurrent_state(&self, _state: &[Option<(Array, Array)>]) {}
+
+    /// Run a batched forward pass over concatenated tokens from multiple requests.
+    ///
+    /// Default implementation falls back to per-request `forward()` calls.
+    /// Models that override this can batch embedding, norms, projections, and MLP
+    /// across all requests, splitting only for per-request RoPE + KV cache + SDPA.
+    ///
+    /// * `input_ids` — flat token IDs, shape `[total_tokens]`
+    /// * `positions` — flat position indices, shape `[total_tokens]`
+    /// * `batch_info` — per-request lengths, offsets, and RoPE offsets
+    /// * `kv_caches` — per-request KV caches, ordered matching `batch_info`
+    ///
+    /// Returns logits of shape `[total_tokens, vocab_size]` (lazy).
+    fn forward_batch(
+        &mut self,
+        input_ids: &Array,
+        positions: &Array,
+        batch_info: &MlxBatchInfo,
+        kv_caches: &mut [MlxKvCache],
+    ) -> mlx_rs::error::Result<Array> {
+        // Default: per-request loop calling forward().
+        let mut logit_parts = Vec::with_capacity(batch_info.num_reqs);
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..batch_info.num_reqs {
+            let start = batch_info.offsets[i] as i32;
+            let len = batch_info.q_lens[i] as i32;
+            let req_ids = input_ids.index(start..start + len);
+            let req_pos = positions.index(start..start + len);
+            let rope_offset = Some(batch_info.rope_offsets[i]);
+            let logits = self.forward(&req_ids, &req_pos, &mut kv_caches[i], rope_offset)?;
+            logit_parts.push(logits);
+        }
+        if logit_parts.len() == 1 {
+            Ok(logit_parts.into_iter().next().unwrap())
+        } else {
+            let refs: Vec<Array> = logit_parts;
+            mlx_rs::ops::concatenate_axis(&refs, 0)
+        }
+    }
 
     /// Run the model backbone and return hidden states (before lm_head).
     ///

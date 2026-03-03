@@ -637,13 +637,15 @@ impl super::MlxModel for MlxQwen2VLForConditionalGeneration {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
         if let Some(mm_data) = self.stashed_mm_data.take() {
             let merged_embeds = self.merge_vision_embeddings(input_ids, &mm_data)?;
             self.language_model
-                .forward_embeds(&merged_embeds, positions, kv_cache)
+                .forward_embeds(&merged_embeds, positions, kv_cache, rope_offset)
         } else {
-            self.language_model.forward(input_ids, positions, kv_cache)
+            self.language_model
+                .forward(input_ids, positions, kv_cache, rope_offset)
         }
     }
 
@@ -652,9 +654,10 @@ impl super::MlxModel for MlxQwen2VLForConditionalGeneration {
         inputs_embeds: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
         self.language_model
-            .forward_embeds(inputs_embeds, positions, kv_cache)
+            .forward_embeds(inputs_embeds, positions, kv_cache, rope_offset)
     }
 
     fn set_mm_data(&mut self, mm_data: Option<MultimodalData>) {
@@ -758,15 +761,16 @@ impl super::MlxModel for MlxQuantizedQwen2VLForConditionalGeneration {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
         if let Some(mm_data) = self.stashed_mm_data.take() {
             let merged_embeds = self.merge_vision_embeddings(input_ids, &mm_data)?;
             self.language_model
-                .forward_embeds(&merged_embeds, positions, kv_cache)
+                .forward_embeds(&merged_embeds, positions, kv_cache, rope_offset)
         } else {
             let hidden_states = self.language_model.embed(input_ids)?;
             self.language_model
-                .forward_embeds(&hidden_states, positions, kv_cache)
+                .forward_embeds(&hidden_states, positions, kv_cache, rope_offset)
         }
     }
 
@@ -775,9 +779,10 @@ impl super::MlxModel for MlxQuantizedQwen2VLForConditionalGeneration {
         inputs_embeds: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
         self.language_model
-            .forward_embeds(inputs_embeds, positions, kv_cache)
+            .forward_embeds(inputs_embeds, positions, kv_cache, rope_offset)
     }
 
     fn set_mm_data(&mut self, mm_data: Option<MultimodalData>) {

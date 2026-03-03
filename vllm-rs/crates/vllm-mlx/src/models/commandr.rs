@@ -19,10 +19,9 @@ use mlx_rs::builder::Builder;
 use mlx_rs::error::Exception;
 use mlx_rs::module::Module;
 use mlx_rs::nn;
-use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
-use crate::cache::MlxKvCache;
+use crate::cache::{MlxKvCache, MlxLayerKvCache};
 use crate::models::llama::{LlamaConfig, assign_weight, load_safetensors_weights};
 use crate::models::quantized_llama::{
     MlxEmbedTokens, MlxLmHead, MlxQuantizedLlamaMLP, QuantConfig, make_quantized_linear,
@@ -237,8 +236,9 @@ impl MlxCommandRAttention {
     fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        _positions: &Array,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let seq_len = hidden_states.dim(0);
 
@@ -260,27 +260,18 @@ impl MlxCommandRAttention {
 
         // [seq, heads, head_dim] -> [1, heads, seq, head_dim]
         let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut v = v
+        let k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        // RoPE (interleaved via traditional=true).
-        let offset = if positions.size() > 0 {
-            positions.reshape(&[-1])?.min(None)?.item::<i32>()
-        } else {
-            0
-        };
-        let q = self.rope.forward((&q, offset))?;
-        k = self.rope.forward((&k, offset))?;
+        // RoPE (interleaved via traditional=true): offset passed from caller (avoids .item() sync).
+        let q = self.rope.forward((&q, rope_offset))?;
+        let k = self.rope.forward((&k, rope_offset))?;
 
-        // KV cache update.
-        if let Some((ck, cv)) = cache.take() {
-            k = concatenate_axis(&[ck, k], 2)?;
-            v = concatenate_axis(&[cv, v], 2)?;
-        }
-        *cache = Some((k.clone(), v.clone()));
+        // KV cache update — pre-allocated buffer with O(1) slice_update.
+        let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
 
         // Fused SDPA.
         let mask = if seq_len > 1 {
@@ -335,7 +326,8 @@ impl MlxCommandRDecoderLayer {
         &mut self,
         hidden_states: &Array,
         positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let residual = hidden_states;
 
@@ -343,7 +335,9 @@ impl MlxCommandRDecoderLayer {
         let normed = self.input_layernorm.forward(hidden_states)?;
 
         // Parallel attention + MLP.
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let attn_output = self
+            .self_attn
+            .forward(&normed, positions, cache, rope_offset)?;
         let mlp_output = self.mlp.forward(&normed)?;
 
         // residual + attn_output + mlp_output
@@ -476,11 +470,13 @@ impl super::MlxModel for MlxCommandRForCausalLM {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], offset)?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;
@@ -495,8 +491,7 @@ impl super::MlxModel for MlxCommandRForCausalLM {
         // Apply logit scaling.
         let logits = logits.multiply(Array::from_f32(self.logit_scale))?;
 
-        // Cast logits to f32 for sampling.
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -511,7 +506,7 @@ impl super::MlxModel for MlxCommandRForCausalLM {
         let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], 0)?;
         }
         self.norm.forward(&hidden_states)
     }
@@ -602,8 +597,9 @@ impl MlxQuantizedCommandRAttention {
     fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        _positions: &Array,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let seq_len = hidden_states.dim(0);
 
@@ -622,25 +618,18 @@ impl MlxQuantizedCommandRAttention {
         }
 
         let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut v = v
+        let k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        let offset = if positions.size() > 0 {
-            positions.reshape(&[-1])?.min(None)?.item::<i32>()
-        } else {
-            0
-        };
-        let q = self.rope.forward((&q, offset))?;
-        k = self.rope.forward((&k, offset))?;
+        // RoPE (interleaved via traditional=true): offset passed from caller (avoids .item() sync).
+        let q = self.rope.forward((&q, rope_offset))?;
+        let k = self.rope.forward((&k, rope_offset))?;
 
-        if let Some((ck, cv)) = cache.take() {
-            k = concatenate_axis(&[ck, k], 2)?;
-            v = concatenate_axis(&[cv, v], 2)?;
-        }
-        *cache = Some((k.clone(), v.clone()));
+        // KV cache update — pre-allocated buffer with O(1) slice_update.
+        let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
 
         let mask = if seq_len > 1 {
             Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
@@ -695,11 +684,14 @@ impl MlxQuantizedCommandRDecoderLayer {
         &mut self,
         hidden_states: &Array,
         positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let residual = hidden_states;
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let attn_output = self
+            .self_attn
+            .forward(&normed, positions, cache, rope_offset)?;
         let mlp_output = self.mlp.forward(&normed)?;
         residual.add(&attn_output)?.add(&mlp_output)
     }
@@ -773,11 +765,13 @@ impl super::MlxModel for MlxQuantizedCommandRForCausalLM {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], offset)?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;
@@ -789,7 +783,7 @@ impl super::MlxModel for MlxQuantizedCommandRForCausalLM {
         };
 
         let logits = logits.multiply(Array::from_f32(self.logit_scale))?;
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -804,7 +798,7 @@ impl super::MlxModel for MlxQuantizedCommandRForCausalLM {
         let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], 0)?;
         }
         self.norm.forward(&hidden_states)
     }

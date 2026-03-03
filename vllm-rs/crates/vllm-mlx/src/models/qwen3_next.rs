@@ -19,7 +19,7 @@ use mlx_rs::nn;
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
-use crate::cache::MlxKvCache;
+use crate::cache::{MlxKvCache, MlxLayerKvCache};
 use crate::models::gemma2::assign_gemma_norm_weight;
 use crate::models::llama::{LlamaConfig, MlxLlamaMLP, assign_weight, load_safetensors_weights};
 use crate::models::quantized_llama::{
@@ -327,8 +327,9 @@ impl MlxQwen3NextAttention {
     fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        _positions: &Array,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let seq_len = hidden_states.dim(0);
 
@@ -352,18 +353,14 @@ impl MlxQwen3NextAttention {
 
         // Transpose to [1, heads, seq, head_dim] for attention.
         let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut v = v
+        let k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        // Apply partial RoPE.
-        let offset = if positions.size() > 0 {
-            positions.reshape(&[-1])?.min(None)?.item::<i32>()
-        } else {
-            0
-        };
+        // Apply partial RoPE (offset threaded from caller — no sync needed).
+        let offset = rope_offset;
 
         // RoPE only applies to the first rotary_dim dimensions (handled by nn::Rope
         // which was initialized with rotary_dim). For partial RoPE, we split, apply, concat.
@@ -376,7 +373,7 @@ impl MlxQwen3NextAttention {
             self.rope.forward((&q, offset))?
         };
 
-        k = if self.rotary_dim < self.head_dim {
+        let k = if self.rotary_dim < self.head_dim {
             let k_rot = k.try_index((.., .., .., ..self.rotary_dim as i32))?;
             let k_pass = k.try_index((.., .., .., self.rotary_dim as i32..))?;
             let k_rot = self.rope.forward((&k_rot, offset))?;
@@ -385,12 +382,8 @@ impl MlxQwen3NextAttention {
             self.rope.forward((&k, offset))?
         };
 
-        // KV cache update.
-        if let Some((ck, cv)) = cache.take() {
-            k = mlx_rs::ops::concatenate_axis(&[ck, k], 2)?;
-            v = mlx_rs::ops::concatenate_axis(&[cv, v], 2)?;
-        }
-        *cache = Some((k.clone(), v.clone()));
+        // KV cache update — pre-allocated buffer with O(1) slice_update.
+        let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
 
         // Scaled dot-product attention.
         let mask = if seq_len > 1 {
@@ -871,12 +864,13 @@ impl MlxQwen3NextDecoderLayer {
         &mut self,
         hidden_states: &Array,
         positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(hidden_states)?;
         let attn_output = match &mut self.attn {
             MlxQwen3NextAttnVariant::FullAttention(attn) => {
-                attn.forward(&normed, positions, cache)?
+                attn.forward(&normed, positions, cache, rope_offset)?
             }
             MlxQwen3NextAttnVariant::LinearAttention(gdn) => gdn.forward(&normed)?,
         };
@@ -991,18 +985,22 @@ impl super::MlxModel for MlxQwen3NextForCausalLM {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         // Only full attention layers use KV cache slots.
         let mut kv_slot = 0;
         for layer in self.layers.iter_mut() {
             if layer.is_full_attn {
-                hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[kv_slot])?;
+                hidden_states =
+                    layer.forward(&hidden_states, positions, &mut kv_cache[kv_slot], offset)?;
                 kv_slot += 1;
             } else {
                 let mut dummy_cache = None;
-                hidden_states = layer.forward(&hidden_states, positions, &mut dummy_cache)?;
+                hidden_states =
+                    layer.forward(&hidden_states, positions, &mut dummy_cache, offset)?;
             }
         }
 
@@ -1014,7 +1012,7 @@ impl super::MlxModel for MlxQwen3NextForCausalLM {
             self.lm_head.as_mut().unwrap().forward(&hidden_states)?
         };
 
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -1031,11 +1029,12 @@ impl super::MlxModel for MlxQwen3NextForCausalLM {
         let mut kv_slot = 0;
         for layer in self.layers.iter_mut() {
             if layer.is_full_attn {
-                hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[kv_slot])?;
+                hidden_states =
+                    layer.forward(&hidden_states, positions, &mut kv_cache[kv_slot], 0)?;
                 kv_slot += 1;
             } else {
                 let mut dummy_cache = None;
-                hidden_states = layer.forward(&hidden_states, positions, &mut dummy_cache)?;
+                hidden_states = layer.forward(&hidden_states, positions, &mut dummy_cache, 0)?;
             }
         }
         self.norm.forward(&hidden_states)
@@ -1154,8 +1153,9 @@ impl MlxQuantizedQwen3NextAttention {
     fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        _positions: &Array,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let seq_len = hidden_states.dim(0);
         let n_h = self.num_heads as i32;
@@ -1181,18 +1181,14 @@ impl MlxQuantizedQwen3NextAttention {
 
         // Transpose to [1, heads, seq, head_dim] for attention.
         let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut v = v
+        let k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let v = v
             .reshape(&[seq_len, n_kv, hd])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        // Apply partial RoPE.
-        let offset = if positions.size() > 0 {
-            positions.reshape(&[-1])?.min(None)?.item::<i32>()
-        } else {
-            0
-        };
+        // Apply partial RoPE (offset threaded from caller — no sync needed).
+        let offset = rope_offset;
 
         let rd = self.rotary_dim as i32;
         let q = if self.rotary_dim < self.head_dim {
@@ -1204,7 +1200,7 @@ impl MlxQuantizedQwen3NextAttention {
             self.rope.forward((&q, offset))?
         };
 
-        k = if self.rotary_dim < self.head_dim {
+        let k = if self.rotary_dim < self.head_dim {
             let k_rot = k.try_index((.., .., .., ..rd))?;
             let k_pass = k.try_index((.., .., .., rd..))?;
             let k_rot = self.rope.forward((&k_rot, offset))?;
@@ -1213,12 +1209,8 @@ impl MlxQuantizedQwen3NextAttention {
             self.rope.forward((&k, offset))?
         };
 
-        // KV cache update.
-        if let Some((ck, cv)) = cache.take() {
-            k = mlx_rs::ops::concatenate_axis(&[ck, k], 2)?;
-            v = mlx_rs::ops::concatenate_axis(&[cv, v], 2)?;
-        }
-        *cache = Some((k.clone(), v.clone()));
+        // KV cache update — pre-allocated buffer with O(1) slice_update.
+        let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
 
         // Scaled dot-product attention.
         let mask = if seq_len > 1 {
@@ -1700,12 +1692,13 @@ impl MlxQuantizedQwen3NextDecoderLayer {
         &mut self,
         hidden_states: &Array,
         positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(hidden_states)?;
         let attn_output = match &mut self.attn {
             MlxQuantizedQwen3NextAttnVariant::FullAttention(attn) => {
-                attn.forward(&normed, positions, cache)?
+                attn.forward(&normed, positions, cache, rope_offset)?
             }
             MlxQuantizedQwen3NextAttnVariant::LinearAttention(gdn) => gdn.forward(&normed)?,
         };
@@ -1811,17 +1804,21 @@ impl super::MlxModel for MlxQuantizedQwen3NextForCausalLM {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         let mut kv_slot = 0;
         for layer in self.layers.iter_mut() {
             if layer.is_full_attn {
-                hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[kv_slot])?;
+                hidden_states =
+                    layer.forward(&hidden_states, positions, &mut kv_cache[kv_slot], offset)?;
                 kv_slot += 1;
             } else {
                 let mut dummy_cache = None;
-                hidden_states = layer.forward(&hidden_states, positions, &mut dummy_cache)?;
+                hidden_states =
+                    layer.forward(&hidden_states, positions, &mut dummy_cache, offset)?;
             }
         }
 
@@ -1833,7 +1830,7 @@ impl super::MlxModel for MlxQuantizedQwen3NextForCausalLM {
             self.lm_head.as_mut().unwrap().forward(&hidden_states)?
         };
 
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -1850,11 +1847,12 @@ impl super::MlxModel for MlxQuantizedQwen3NextForCausalLM {
         let mut kv_slot = 0;
         for layer in self.layers.iter_mut() {
             if layer.is_full_attn {
-                hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[kv_slot])?;
+                hidden_states =
+                    layer.forward(&hidden_states, positions, &mut kv_cache[kv_slot], 0)?;
                 kv_slot += 1;
             } else {
                 let mut dummy_cache = None;
-                hidden_states = layer.forward(&hidden_states, positions, &mut dummy_cache)?;
+                hidden_states = layer.forward(&hidden_states, positions, &mut dummy_cache, 0)?;
             }
         }
         self.norm.forward(&hidden_states)
@@ -2032,7 +2030,7 @@ mod tests {
         let mut kv_cache = crate::cache::empty_kv_cache(config.num_full_attention_layers());
 
         let logits = model
-            .forward(&input_ids, &positions, &mut kv_cache)
+            .forward(&input_ids, &positions, &mut kv_cache, None)
             .unwrap();
         logits.eval().unwrap();
         assert_eq!(logits.shape(), &[3, config.vocab_size as i32]);

@@ -20,7 +20,7 @@ use mlx_rs::ops::concatenate_axis;
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
-use crate::cache::MlxKvCache;
+use crate::cache::{MlxKvCache, MlxLayerKvCache};
 use crate::models::llama::{MlxLlamaMLP, assign_weight, load_safetensors_weights};
 use crate::models::quantized_llama::{
     MlxEmbedTokens, MlxLmHead, MlxQuantizedLlamaMLP, QuantConfig, make_quantized_linear,
@@ -412,8 +412,9 @@ impl MlxDeepSeekV2Attention {
     fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        _positions: &Array,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let seq_len = hidden_states.dim(0);
 
@@ -467,13 +468,8 @@ impl MlxDeepSeekV2Attention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        let offset = if positions.size() > 0 {
-            positions.reshape(&[-1])?.min(None)?.item::<i32>()
-        } else {
-            0
-        };
-        let q_pe = self.rope.forward((&q_pe, offset))?;
-        let k_pe = self.rope.forward((&k_pe, offset))?;
+        let q_pe = self.rope.forward((&q_pe, rope_offset))?;
+        let k_pe = self.rope.forward((&k_pe, rope_offset))?;
 
         // Back to [seq, heads, dim] layout for assembly.
         let q_pe = q_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
@@ -502,15 +498,11 @@ impl MlxDeepSeekV2Attention {
 
         // --- Transform to SDPA layout: [1, heads, seq, head_dim] ---
         let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
 
-        // KV cache update
-        if let Some((ck, cv)) = cache.take() {
-            k = concatenate_axis(&[ck, k], 2)?;
-            v_sdpa = concatenate_axis(&[cv, v_sdpa], 2)?;
-        }
-        *cache = Some((k.clone(), v_sdpa.clone()));
+        // KV cache update — pre-allocated buffer with O(1) slice_update.
+        let (k, v_sdpa) = crate::cache::kv_cache_update(cache, &k, &v_sdpa)?;
 
         // Fused SDPA
         let mask = if seq_len > 1 {
@@ -607,11 +599,14 @@ impl MlxDeepSeekV2DecoderLayer {
         &mut self,
         hidden_states: &Array,
         positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         // Pre-attention layernorm + attention + residual.
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let attn_output = self
+            .self_attn
+            .forward(&normed, positions, cache, rope_offset)?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
         // Post-attention layernorm + MLP/MoE + residual.
@@ -774,11 +769,13 @@ impl super::MlxModel for MlxDeepSeekV2ForCausalLM {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], offset)?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;
@@ -789,7 +786,7 @@ impl super::MlxModel for MlxDeepSeekV2ForCausalLM {
             self.lm_head.as_mut().unwrap().forward(&hidden_states)?
         };
 
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -804,7 +801,7 @@ impl super::MlxModel for MlxDeepSeekV2ForCausalLM {
         let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], 0)?;
         }
         self.norm.forward(&hidden_states)
     }
@@ -958,8 +955,9 @@ impl MlxQuantizedDeepSeekV2Attention {
     fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        _positions: &Array,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let seq_len = hidden_states.dim(0);
 
@@ -1006,13 +1004,8 @@ impl MlxQuantizedDeepSeekV2Attention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        let offset = if positions.size() > 0 {
-            positions.reshape(&[-1])?.min(None)?.item::<i32>()
-        } else {
-            0
-        };
-        let q_pe = self.rope.forward((&q_pe, offset))?;
-        let k_pe = self.rope.forward((&k_pe, offset))?;
+        let q_pe = self.rope.forward((&q_pe, rope_offset))?;
+        let k_pe = self.rope.forward((&k_pe, rope_offset))?;
 
         let q_pe = q_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
         let k_pe = k_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
@@ -1039,15 +1032,11 @@ impl MlxQuantizedDeepSeekV2Attention {
 
         // --- Transform to SDPA layout: [1, heads, seq, head_dim] ---
         let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
 
-        // KV cache update
-        if let Some((ck, cv)) = cache.take() {
-            k = concatenate_axis(&[ck, k], 2)?;
-            v_sdpa = concatenate_axis(&[cv, v_sdpa], 2)?;
-        }
-        *cache = Some((k.clone(), v_sdpa.clone()));
+        // KV cache update — pre-allocated buffer with O(1) slice_update.
+        let (k, v_sdpa) = crate::cache::kv_cache_update(cache, &k, &v_sdpa)?;
 
         // Fused SDPA
         let mask = if seq_len > 1 {
@@ -1322,10 +1311,13 @@ impl MlxQuantizedDeepSeekV2DecoderLayer {
         &mut self,
         hidden_states: &Array,
         positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let attn_output = self
+            .self_attn
+            .forward(&normed, positions, cache, rope_offset)?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
         let normed = self.post_attention_layernorm.forward(&hidden_states)?;
@@ -1420,11 +1412,13 @@ impl super::MlxModel for MlxQuantizedDeepSeekV2ForCausalLM {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], offset)?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;
@@ -1435,7 +1429,7 @@ impl super::MlxModel for MlxQuantizedDeepSeekV2ForCausalLM {
             self.lm_head.as_mut().unwrap().forward(&hidden_states)?
         };
 
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -1450,7 +1444,7 @@ impl super::MlxModel for MlxQuantizedDeepSeekV2ForCausalLM {
         let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], 0)?;
         }
         self.norm.forward(&hidden_states)
     }
@@ -1612,7 +1606,7 @@ mod tests {
         let positions = Array::from_iter(0..4i32, &[4]);
         let mut cache = None;
 
-        let out = attn.forward(&x, &positions, &mut cache).unwrap();
+        let out = attn.forward(&x, &positions, &mut cache, 0).unwrap();
         out.eval().unwrap();
         assert_eq!(out.shape(), &[4, config.hidden_size as i32]);
         assert!(cache.is_some());
@@ -1632,6 +1626,7 @@ mod tests {
             &input_ids,
             &positions,
             &mut kv_cache,
+            None,
         )
         .unwrap();
         logits.eval().unwrap();
@@ -1652,6 +1647,7 @@ mod tests {
             &input_ids,
             &positions,
             &mut kv_cache,
+            None,
         )
         .unwrap();
         logits.eval().unwrap();
@@ -1670,6 +1666,7 @@ mod tests {
             &decode_ids,
             &decode_pos,
             &mut kv_cache,
+            None,
         )
         .unwrap();
         logits2.eval().unwrap();
@@ -1947,6 +1944,7 @@ mod tests {
             &input_ids,
             &positions,
             &mut kv_cache,
+            None,
         )
         .unwrap();
         logits.eval().unwrap();

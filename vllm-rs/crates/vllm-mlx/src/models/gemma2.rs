@@ -19,11 +19,10 @@ use mlx_rs::builder::Builder;
 use mlx_rs::error::Exception;
 use mlx_rs::module::Module;
 use mlx_rs::nn;
-use mlx_rs::ops::concatenate_axis;
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
-use crate::cache::MlxKvCache;
+use crate::cache::{MlxKvCache, MlxLayerKvCache};
 use crate::models::llama::{assign_weight, load_safetensors_weights};
 use crate::models::quantized_llama::{MlxEmbedTokens, QuantConfig, make_quantized_linear};
 use vllm_model::weight::HfModelConfig;
@@ -309,8 +308,8 @@ impl MlxGemma2Attention {
     fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        rope_offset: i32,
+        cache: &mut Option<MlxLayerKvCache>,
     ) -> Result<Array, Exception> {
         let seq_len = hidden_states.dim(0);
 
@@ -323,31 +322,21 @@ impl MlxGemma2Attention {
             .reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
-        let mut k = k
+        let k = k
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
-        let mut v = v
+        let v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
         // RoPE
-        let offset = if positions.size() > 0 {
-            positions.reshape(&[-1])?.min(None)?.item::<i32>()
-        } else {
-            0
-        };
-        let q = self.rope.forward((&q, offset))?;
-        k = self.rope.forward((&k, offset))?;
+        let q = self.rope.forward((&q, rope_offset))?;
+        let k = self.rope.forward((&k, rope_offset))?;
 
-        // KV cache update
-        if let Some((ck, cv)) = cache.take() {
-            k = concatenate_axis(&[ck, k], 2)?;
-            v = concatenate_axis(&[cv, v], 2)?;
-        }
-        // Store the full cache (for future steps).
-        *cache = Some((k.clone(), v.clone()));
+        // KV cache update — pre-allocated buffer with O(1) slice_update.
+        let (mut k, mut v) = crate::cache::kv_cache_update(cache, &k, &v)?;
 
         // Sliding window: trim K/V to only the last `w` positions.
         if let Some(w) = self.sliding_window {
@@ -449,12 +438,12 @@ impl MlxGemma2DecoderLayer {
     fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        rope_offset: i32,
+        cache: &mut Option<MlxLayerKvCache>,
     ) -> Result<Array, Exception> {
         // Pre-attention norm + attention + post-attention norm + residual.
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let attn_output = self.self_attn.forward(&normed, rope_offset, cache)?;
         let attn_output = self.post_attention_layernorm.forward(&attn_output)?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
@@ -588,15 +577,17 @@ impl super::MlxModel for MlxGemma2ForCausalLM {
     fn forward(
         &mut self,
         input_ids: &Array,
-        positions: &Array,
+        _positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         // Embed and normalize by sqrt(hidden_size).
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, offset, &mut kv_cache[i])?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;
@@ -611,7 +602,7 @@ impl super::MlxModel for MlxGemma2ForCausalLM {
             logits
         };
 
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -621,13 +612,13 @@ impl super::MlxModel for MlxGemma2ForCausalLM {
     fn hidden_states(
         &mut self,
         input_ids: &Array,
-        positions: &Array,
+        _positions: &Array,
     ) -> mlx_rs::error::Result<Array> {
         let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, 0, &mut kv_cache[i])?;
         }
         self.norm.forward(&hidden_states)
     }
@@ -755,8 +746,8 @@ impl MlxQuantizedGemma2Attention {
     fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        rope_offset: i32,
+        cache: &mut Option<MlxLayerKvCache>,
     ) -> Result<Array, Exception> {
         let seq_len = hidden_states.dim(0);
 
@@ -768,29 +759,20 @@ impl MlxQuantizedGemma2Attention {
             .reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
-        let mut k = k
+        let k = k
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
-        let mut v = v
+        let v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        let offset = if positions.size() > 0 {
-            positions.reshape(&[-1])?.min(None)?.item::<i32>()
-        } else {
-            0
-        };
-        let q = self.rope.forward((&q, offset))?;
-        k = self.rope.forward((&k, offset))?;
+        let q = self.rope.forward((&q, rope_offset))?;
+        let k = self.rope.forward((&k, rope_offset))?;
 
-        if let Some((ck, cv)) = cache.take() {
-            k = concatenate_axis(&[ck, k], 2)?;
-            v = concatenate_axis(&[cv, v], 2)?;
-        }
-        // Store the full cache (for future steps).
-        *cache = Some((k.clone(), v.clone()));
+        // KV cache update — pre-allocated buffer with O(1) slice_update.
+        let (mut k, mut v) = crate::cache::kv_cache_update(cache, &k, &v)?;
 
         // Sliding window: trim K/V to only the last `w` positions.
         if let Some(w) = self.sliding_window {
@@ -891,11 +873,11 @@ impl MlxQuantizedGemma2DecoderLayer {
     fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        rope_offset: i32,
+        cache: &mut Option<MlxLayerKvCache>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let attn_output = self.self_attn.forward(&normed, rope_offset, cache)?;
         let attn_output = self.post_attention_layernorm.forward(&attn_output)?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
@@ -968,14 +950,16 @@ impl super::MlxModel for MlxQuantizedGemma2ForCausalLM {
     fn forward(
         &mut self,
         input_ids: &Array,
-        positions: &Array,
+        _positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, offset, &mut kv_cache[i])?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;
@@ -988,7 +972,7 @@ impl super::MlxModel for MlxQuantizedGemma2ForCausalLM {
             logits
         };
 
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -998,13 +982,13 @@ impl super::MlxModel for MlxQuantizedGemma2ForCausalLM {
     fn hidden_states(
         &mut self,
         input_ids: &Array,
-        positions: &Array,
+        _positions: &Array,
     ) -> mlx_rs::error::Result<Array> {
         let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, 0, &mut kv_cache[i])?;
         }
         self.norm.forward(&hidden_states)
     }
@@ -1098,11 +1082,11 @@ impl MlxGemmaDecoderLayer {
     fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        rope_offset: i32,
+        cache: &mut Option<MlxLayerKvCache>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let attn_output = self.self_attn.forward(&normed, rope_offset, cache)?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
         let normed = self.post_attention_layernorm.forward(&hidden_states)?;
@@ -1215,21 +1199,23 @@ impl super::MlxModel for MlxGemmaForCausalLM {
     fn forward(
         &mut self,
         input_ids: &Array,
-        positions: &Array,
+        _positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, offset, &mut kv_cache[i])?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;
 
         // Gemma v1 always uses tied embeddings.
         let logits = self.embed_tokens.as_linear(&hidden_states)?;
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -1239,13 +1225,13 @@ impl super::MlxModel for MlxGemmaForCausalLM {
     fn hidden_states(
         &mut self,
         input_ids: &Array,
-        positions: &Array,
+        _positions: &Array,
     ) -> mlx_rs::error::Result<Array> {
         let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, 0, &mut kv_cache[i])?;
         }
         self.norm.forward(&hidden_states)
     }
@@ -1304,11 +1290,11 @@ impl MlxQuantizedGemmaDecoderLayer {
     fn forward(
         &mut self,
         hidden_states: &Array,
-        positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        rope_offset: i32,
+        cache: &mut Option<MlxLayerKvCache>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let attn_output = self.self_attn.forward(&normed, rope_offset, cache)?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
         let normed = self.post_attention_layernorm.forward(&hidden_states)?;
@@ -1369,20 +1355,22 @@ impl super::MlxModel for MlxQuantizedGemmaForCausalLM {
     fn forward(
         &mut self,
         input_ids: &Array,
-        positions: &Array,
+        _positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, offset, &mut kv_cache[i])?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;
 
         let logits = self.embed_tokens.as_linear(&hidden_states)?;
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -1392,13 +1380,13 @@ impl super::MlxModel for MlxQuantizedGemmaForCausalLM {
     fn hidden_states(
         &mut self,
         input_ids: &Array,
-        positions: &Array,
+        _positions: &Array,
     ) -> mlx_rs::error::Result<Array> {
         let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         hidden_states = hidden_states.multiply(Array::from_f32(self.normalizer))?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, 0, &mut kv_cache[i])?;
         }
         self.norm.forward(&hidden_states)
     }
@@ -1535,10 +1523,9 @@ mod tests {
         let mut attn = MlxGemma2Attention::new(&config, None).unwrap();
 
         let x = mlx_rs::ops::ones::<f32>(&[4, 32]).unwrap();
-        let positions = Array::from_iter(0..4i32, &[4]);
         let mut cache = None;
 
-        let out = attn.forward(&x, &positions, &mut cache).unwrap();
+        let out = attn.forward(&x, 0, &mut cache).unwrap();
         out.eval().unwrap();
         assert_eq!(out.shape(), &[4, 32]);
         assert!(cache.is_some());
@@ -1558,6 +1545,7 @@ mod tests {
             &input_ids,
             &positions,
             &mut kv_cache,
+            Some(0),
         )
         .unwrap();
         logits.eval().unwrap();
@@ -1578,6 +1566,7 @@ mod tests {
             &input_ids,
             &positions,
             &mut kv_cache,
+            Some(0),
         )
         .unwrap();
         logits.eval().unwrap();
@@ -1595,6 +1584,7 @@ mod tests {
             &decode_ids,
             &decode_pos,
             &mut kv_cache,
+            Some(3),
         )
         .unwrap();
         logits2.eval().unwrap();
@@ -1659,6 +1649,7 @@ mod tests {
             &input_ids,
             &positions,
             &mut kv_cache,
+            Some(0),
         )
         .unwrap();
         logits.eval().unwrap();
@@ -1679,6 +1670,7 @@ mod tests {
             &input_ids,
             &positions,
             &mut kv_cache,
+            Some(0),
         )
         .unwrap();
         logits.eval().unwrap();
@@ -1695,6 +1687,7 @@ mod tests {
             &decode_ids,
             &decode_pos,
             &mut kv_cache,
+            Some(3),
         )
         .unwrap();
         logits2.eval().unwrap();

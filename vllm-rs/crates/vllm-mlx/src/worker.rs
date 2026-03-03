@@ -974,10 +974,13 @@ impl Worker for MlxWorker {
 
         let step_start = Instant::now();
 
-        // --- Phase A: Run all forward passes, collecting lazy logit arrays ---
+        // --- Phase A: Run forward passes, collecting lazy logit arrays ---
         // MLX lazy eval means these build compute graphs without materializing.
         // By deferring eval until after all forwards, MLX can fuse all graphs
         // into a single Metal command buffer.
+        //
+        // Batched path: requests without recurrent state or mm_data are grouped
+        // into a single `forward_batch` call. Remaining requests use per-request `forward`.
         struct LazyReqOutput {
             last_logits: Array,
             full_logits_f32: Option<Array>,
@@ -985,8 +988,142 @@ impl Worker for MlxWorker {
         }
         let mut lazy_outputs: Vec<LazyReqOutput> = Vec::with_capacity(req_inputs.len());
 
-        for req_input in &req_inputs {
-            // Inject per-request recurrent state for hybrid models (e.g., Qwen3-Next GDN).
+        // Partition requests into batchable vs fallback.
+        let has_recurrent = model.num_recurrent_layers() > 0;
+        let mut batch_indices: Vec<usize> = Vec::new();
+        let mut fallback_indices: Vec<usize> = Vec::new();
+        for (idx, ri) in req_inputs.iter().enumerate() {
+            let needs_fallback = has_recurrent || self.mm_data_map.contains_key(&ri.req_id);
+            if needs_fallback {
+                fallback_indices.push(idx);
+            } else {
+                batch_indices.push(idx);
+            }
+        }
+
+        // Pre-allocate output slots.
+        for _ in 0..req_inputs.len() {
+            lazy_outputs.push(LazyReqOutput {
+                last_logits: Array::from_f32(0.0),
+                full_logits_f32: None,
+                prompt_logprobs_info: None,
+            });
+        }
+
+        // --- Batched forward for eligible requests ---
+        if !batch_indices.is_empty() {
+            // Build flat input_ids, positions, and batch_info.
+            let mut flat_token_ids: Vec<i32> = Vec::new();
+            let mut flat_positions: Vec<i32> = Vec::new();
+            let mut q_lens: Vec<usize> = Vec::new();
+            let mut rope_offsets: Vec<i32> = Vec::new();
+
+            for &idx in &batch_indices {
+                let ri = &req_inputs[idx];
+                for &t in &ri.token_ids {
+                    flat_token_ids.push(t as i32);
+                }
+                flat_positions.extend_from_slice(&ri.positions);
+                q_lens.push(ri.token_ids.len());
+                rope_offsets.push(ri.positions.iter().copied().min().unwrap_or(0));
+            }
+
+            let batch_info = cache::MlxBatchInfo::new(q_lens, rope_offsets);
+            let total = batch_info.total_tokens as i32;
+            let input_ids_arr = Array::from_iter(flat_token_ids, &[total]);
+            let positions_arr = Array::from_iter(flat_positions, &[total]);
+
+            // Extract KV caches from HashMap into ordered Vec.
+            let mut batch_kv_caches: Vec<cache::MlxKvCache> = batch_indices
+                .iter()
+                .map(|&idx| {
+                    let req_id = &req_inputs[idx].req_id;
+                    self.kv_caches
+                        .remove(req_id)
+                        .unwrap_or_else(|| cache::empty_kv_cache(num_layers))
+                })
+                .collect();
+
+            // Single batched forward call.
+            let all_logits = model
+                .forward_batch(
+                    &input_ids_arr,
+                    &positions_arr,
+                    &batch_info,
+                    &mut batch_kv_caches,
+                )
+                .map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
+                })?;
+
+            // Put KV caches back.
+            for &idx in &batch_indices {
+                let req_id = req_inputs[idx].req_id.clone();
+                self.kv_caches.insert(req_id, batch_kv_caches.remove(0));
+            }
+
+            // Split output logits per-request.
+            for (i, &idx) in batch_indices.iter().enumerate() {
+                let ri = &req_inputs[idx];
+                let start = batch_info.offsets[i] as i32;
+                let len = batch_info.q_lens[i] as i32;
+
+                // Extract per-request logits from the flat output.
+                let req_logits = if batch_indices.len() == 1 {
+                    all_logits.clone()
+                } else {
+                    all_logits.index((start..start + len, ..))
+                };
+
+                let last_pos = ri.token_ids.len() - 1;
+                let last_logits = if ri.token_ids.len() > 1 {
+                    req_logits
+                        .index(last_pos as i32)
+                        .expand_dims(0)
+                        .and_then(|a| a.as_dtype(Dtype::Float32))
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("index error: {e}")))?
+                } else {
+                    req_logits
+                        .as_dtype(Dtype::Float32)
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("dtype cast: {e}")))?
+                };
+
+                let needs_full_logits = (ri.is_prefill
+                    && ri.token_ids.len() > 1
+                    && self
+                        .sampling_params_map
+                        .get(&ri.req_id)
+                        .and_then(|p| p.prompt_logprobs)
+                        .is_some())
+                    || !ri.spec_token_ids.is_empty();
+
+                let (full_logits_f32, prompt_logprobs_info) = if needs_full_logits {
+                    let top_n = self
+                        .sampling_params_map
+                        .get(&ri.req_id)
+                        .and_then(|p| p.prompt_logprobs)
+                        .map(|n| n.max(0) as usize);
+                    let f32_logits = req_logits.as_dtype(Dtype::Float32).map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("dtype cast error: {e}"))
+                    })?;
+                    let info = top_n.map(|n| (n, ri.token_ids.clone()));
+                    (Some(f32_logits), info)
+                } else {
+                    (None, None)
+                };
+
+                lazy_outputs[idx] = LazyReqOutput {
+                    last_logits,
+                    full_logits_f32,
+                    prompt_logprobs_info,
+                };
+            }
+        }
+
+        // --- Fallback: per-request forward for requests with recurrent state or mm_data ---
+        for &idx in &fallback_indices {
+            let req_input = &req_inputs[idx];
+
             if model.num_recurrent_layers() > 0 {
                 if let Some(rs) = self.recurrent_states.get(&req_input.req_id) {
                     model.inject_recurrent_state(rs);
@@ -1004,41 +1141,40 @@ impl Worker for MlxWorker {
                 &[req_input.positions.len() as i32],
             );
 
-            // Get or create KV cache for this request.
             let kv_cache = self
                 .kv_caches
                 .entry(req_input.req_id.clone())
                 .or_insert_with(|| cache::empty_kv_cache(num_layers));
 
-            // Inject multimodal data for VLM models (consumed during forward).
             let mm_data = self.mm_data_map.remove(&req_input.req_id);
             model.set_mm_data(mm_data);
 
-            // Forward pass — builds lazy compute graph (no eval yet).
+            let rope_offset = req_input.positions.iter().copied().min();
+
             let logits = model
-                .forward(&input_ids, &positions, kv_cache)
+                .forward(&input_ids, &positions, kv_cache, rope_offset)
                 .map_err(|e| {
                     ExecutorError::WorkerExecution(format!("model forward failed: {e}"))
                 })?;
 
-            // Extract recurrent state after forward for hybrid models.
             if model.num_recurrent_layers() > 0 {
                 self.recurrent_states
                     .insert(req_input.req_id.clone(), model.extract_recurrent_state());
             }
 
-            // Extract last-position logits (still lazy — no eval).
             let last_pos = req_input.token_ids.len() - 1;
             let last_logits = if req_input.token_ids.len() > 1 {
                 logits
                     .index(last_pos as i32)
                     .expand_dims(0)
+                    .and_then(|a| a.as_dtype(Dtype::Float32))
                     .map_err(|e| ExecutorError::WorkerExecution(format!("index error: {e}")))?
             } else {
-                logits.clone()
+                logits
+                    .as_dtype(Dtype::Float32)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("dtype cast: {e}")))?
             };
 
-            // Prepare full logits for prompt logprobs or spec decode verification.
             let needs_full_logits = (req_input.is_prefill
                 && req_input.token_ids.len() > 1
                 && self
@@ -1063,11 +1199,11 @@ impl Worker for MlxWorker {
                 (None, None)
             };
 
-            lazy_outputs.push(LazyReqOutput {
+            lazy_outputs[idx] = LazyReqOutput {
                 last_logits,
                 full_logits_f32,
                 prompt_logprobs_info,
-            });
+            };
         }
 
         // --- Phase B: Single batch eval materializes all graphs at once ---

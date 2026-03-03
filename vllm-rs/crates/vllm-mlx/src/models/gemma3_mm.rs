@@ -300,26 +300,29 @@ impl super::MlxModel for MlxGemma3ForConditionalGeneration {
     fn forward(
         &mut self,
         input_ids: &Array,
-        positions: &Array,
+        _positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
         if let Some(mm_data) = self.stashed_mm_data.take() {
             let merged_embeds = self.merge_vision_embeddings(input_ids, &mm_data)?;
             self.language_model
-                .forward_embeds(&merged_embeds, positions, kv_cache)
+                .forward_embeds(&merged_embeds, _positions, kv_cache, rope_offset)
         } else {
-            self.language_model.forward(input_ids, positions, kv_cache)
+            self.language_model
+                .forward(input_ids, _positions, kv_cache, rope_offset)
         }
     }
 
     fn forward_embeds(
         &mut self,
         inputs_embeds: &Array,
-        positions: &Array,
+        _positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
         self.language_model
-            .forward_embeds(inputs_embeds, positions, kv_cache)
+            .forward_embeds(inputs_embeds, _positions, kv_cache, rope_offset)
     }
 
     fn set_mm_data(&mut self, mm_data: Option<MultimodalData>) {
@@ -424,28 +427,32 @@ impl super::MlxModel for MlxQuantizedGemma3ForConditionalGeneration {
     fn forward(
         &mut self,
         input_ids: &Array,
-        positions: &Array,
+        _positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         if let Some(mm_data) = self.stashed_mm_data.take() {
             let merged_embeds = self.merge_vision_embeddings(input_ids, &mm_data)?;
             self.language_model
-                .forward_embeds(&merged_embeds, positions, kv_cache)
+                .forward_embeds(&merged_embeds, offset, kv_cache)
         } else {
             let hidden_states = self.language_model.embed(input_ids)?;
             self.language_model
-                .forward_embeds(&hidden_states, positions, kv_cache)
+                .forward_embeds(&hidden_states, offset, kv_cache)
         }
     }
 
     fn forward_embeds(
         &mut self,
         inputs_embeds: &Array,
-        positions: &Array,
+        _positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         self.language_model
-            .forward_embeds(inputs_embeds, positions, kv_cache)
+            .forward_embeds(inputs_embeds, offset, kv_cache)
     }
 
     fn set_mm_data(&mut self, mm_data: Option<MultimodalData>) {

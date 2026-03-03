@@ -19,7 +19,7 @@ use mlx_rs::nn;
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
-use crate::cache::MlxKvCache;
+use crate::cache::{MlxKvCache, MlxLayerKvCache};
 use crate::models::deepseek_v2::slice_quantized_linear;
 use crate::models::llama::{
     LlamaConfig, MlxLlamaAttention, MlxLlamaMLP, assign_weight, load_safetensors_weights,
@@ -337,11 +337,14 @@ impl MlxQwen3MoeDecoderLayer {
         &mut self,
         hidden_states: &Array,
         positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         // Pre-attention layernorm + attention + residual.
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let attn_output = self
+            .self_attn
+            .forward(&normed, positions, cache, rope_offset)?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
         // Post-attention layernorm + MLP/MoE + residual.
@@ -474,11 +477,13 @@ impl super::MlxModel for MlxQwen3MoeForCausalLM {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], offset)?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;
@@ -489,7 +494,7 @@ impl super::MlxModel for MlxQwen3MoeForCausalLM {
             self.lm_head.as_mut().unwrap().forward(&hidden_states)?
         };
 
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -504,7 +509,7 @@ impl super::MlxModel for MlxQwen3MoeForCausalLM {
         let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], 0)?;
         }
         self.norm.forward(&hidden_states)
     }
@@ -810,10 +815,13 @@ impl MlxQuantizedQwen3MoeDecoderLayer {
         &mut self,
         hidden_states: &Array,
         positions: &Array,
-        cache: &mut Option<(Array, Array)>,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward(&normed, positions, cache)?;
+        let attn_output = self
+            .self_attn
+            .forward(&normed, positions, cache, rope_offset)?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
         let normed = self.post_attention_layernorm.forward(&hidden_states)?;
@@ -900,11 +908,13 @@ impl super::MlxModel for MlxQuantizedQwen3MoeForCausalLM {
         input_ids: &Array,
         positions: &Array,
         kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
     ) -> mlx_rs::error::Result<Array> {
+        let offset = rope_offset.unwrap_or(0);
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], offset)?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;
@@ -915,7 +925,7 @@ impl super::MlxModel for MlxQuantizedQwen3MoeForCausalLM {
             self.lm_head.as_mut().unwrap().forward(&hidden_states)?
         };
 
-        logits.as_dtype(Dtype::Float32)
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -930,7 +940,7 @@ impl super::MlxModel for MlxQuantizedQwen3MoeForCausalLM {
         let mut kv_cache: MlxKvCache = (0..self.layers.len()).map(|_| None).collect();
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i])?;
+            hidden_states = layer.forward(&hidden_states, positions, &mut kv_cache[i], 0)?;
         }
         self.norm.forward(&hidden_states)
     }
@@ -1084,7 +1094,7 @@ mod tests {
         let mut kv_cache = crate::cache::empty_kv_cache(config.num_hidden_layers);
 
         let logits = model
-            .forward(&input_ids, &positions, &mut kv_cache)
+            .forward(&input_ids, &positions, &mut kv_cache, None)
             .unwrap();
         logits.eval().unwrap();
         assert_eq!(logits.shape(), &[3, config.vocab_size as i32]);

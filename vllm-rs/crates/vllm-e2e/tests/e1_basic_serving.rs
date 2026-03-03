@@ -895,3 +895,38 @@ async fn test_cuda_gguf_gemma3_1b_chat() {
         "should generate at least one token"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tensor Parallelism (TP=2) tests — require 2 CUDA GPUs + NCCL
+// ---------------------------------------------------------------------------
+
+/// TP=2 Qwen2.5-0.5B: server starts, health check passes, completion works.
+///
+/// Uses Qwen2.5-0.5B (14 Q heads, 2 KV heads — both divisible by 2).
+/// SmolLM-135M has 9/3 heads which don't divide evenly by 2.
+///
+/// Run on nick2 pod (2x L40S):
+///   cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_tp2 -- --ignored --test-threads=1
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_tp2_qwen2_completion() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .with_tensor_parallel_size(2)
+        .start()
+        .await
+        .expect("TP=2 Qwen2.5-0.5B server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    let text = &resp.choices[0].text;
+    assert!(
+        !text.is_empty(),
+        "TP=2 completion should produce non-empty text"
+    );
+}

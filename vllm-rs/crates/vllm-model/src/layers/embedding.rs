@@ -3,9 +3,12 @@
 //!
 //! Port of: `vllm/model_executor/layers/vocab_parallel_embedding.py`
 
+use std::sync::Arc;
+
 use candle_core::{DType, Device, Module, Tensor};
 
 use crate::error::{ModelError, ModelResult};
+use crate::process_group::ProcessGroup;
 use crate::tensor;
 use crate::weight::ModelWeights;
 
@@ -90,6 +93,8 @@ pub struct VocabParallelEmbedding {
     vocab_start: usize,
     /// End index (exclusive) for this rank's vocab shard.
     vocab_end: usize,
+    /// NCCL process group for all-reduce (used when TP > 1).
+    tp_group: Option<Arc<dyn ProcessGroup>>,
 }
 
 impl VocabParallelEmbedding {
@@ -99,6 +104,7 @@ impl VocabParallelEmbedding {
             inner: embedding,
             vocab_start,
             vocab_end,
+            tp_group: None,
         }
     }
 
@@ -123,6 +129,7 @@ impl VocabParallelEmbedding {
             inner: Embedding::new(shard),
             vocab_start,
             vocab_end,
+            tp_group: None,
         })
     }
 
@@ -134,6 +141,73 @@ impl VocabParallelEmbedding {
     /// Access the inner embedding.
     pub fn inner(&self) -> &Embedding {
         &self.inner
+    }
+
+    /// Set the NCCL process group for tensor-parallel communication.
+    pub fn set_tp_group(&mut self, group: Arc<dyn ProcessGroup>) {
+        self.tp_group = Some(group);
+    }
+
+    /// Forward pass: offset IDs to local range, lookup, zero out-of-range, all-reduce.
+    ///
+    /// For TP=1, this is equivalent to a normal embedding lookup.
+    /// For TP>1, each rank looks up its shard and they all-reduce the results.
+    pub fn forward(&self, ids: &Tensor) -> ModelResult<Tensor> {
+        if self.tp_group.is_none() || self.tp_group.as_ref().is_some_and(|g| g.world_size() == 1) {
+            // TP=1: just do normal lookup (IDs are within range).
+            return self.inner.forward_ids(ids);
+        }
+
+        // TP>1: offset IDs to local shard, lookup, mask out-of-range, all-reduce.
+        let shard_size = self.vocab_end - self.vocab_start;
+        let device = ids.device();
+
+        // Create offset: local_ids = global_ids - vocab_start
+        let offset = Tensor::new(&[self.vocab_start as u32], device)
+            .map_err(ModelError::Candle)?
+            .broadcast_as(ids.shape())
+            .map_err(ModelError::Candle)?;
+
+        // Compute local IDs (may underflow for out-of-range — we'll mask those).
+        // Use i64 to handle negative values from subtraction.
+        let ids_i64 = ids.to_dtype(DType::I64).map_err(ModelError::Candle)?;
+        let offset_i64 = offset.to_dtype(DType::I64).map_err(ModelError::Candle)?;
+        let local_ids = ids_i64.sub(&offset_i64).map_err(ModelError::Candle)?;
+
+        // Build mask: true where IDs are in this rank's range [0, shard_size).
+        let zeros =
+            Tensor::zeros(local_ids.shape(), DType::I64, device).map_err(ModelError::Candle)?;
+        let shard_max = Tensor::new(&[shard_size as i64], device)
+            .map_err(ModelError::Candle)?
+            .broadcast_as(local_ids.shape())
+            .map_err(ModelError::Candle)?;
+        let in_range = local_ids
+            .ge(&zeros)
+            .map_err(ModelError::Candle)?
+            .mul(&local_ids.lt(&shard_max).map_err(ModelError::Candle)?)
+            .map_err(ModelError::Candle)?;
+
+        // Clamp local IDs to valid range for lookup (out-of-range will be zeroed).
+        let clamped = local_ids
+            .clamp(0i64, (shard_size - 1) as i64)
+            .map_err(ModelError::Candle)?
+            .to_dtype(DType::U32)
+            .map_err(ModelError::Candle)?;
+
+        // Lookup embeddings.
+        let embeddings = self.inner.forward_ids(&clamped)?;
+
+        // Zero out embeddings for out-of-range IDs.
+        let mask_f = in_range
+            .to_dtype(embeddings.dtype())
+            .map_err(ModelError::Candle)?
+            .unsqueeze(candle_core::D::Minus1)
+            .map_err(ModelError::Candle)?;
+        let masked = embeddings.mul(&mask_f).map_err(ModelError::Candle)?;
+
+        // All-reduce across ranks to combine shards.
+        let group = self.tp_group.as_ref().unwrap();
+        group.all_reduce(&masked).map_err(ModelError::Candle)
     }
 }
 

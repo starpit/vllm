@@ -17,6 +17,8 @@ use vllm_config::{SchedulerConfig, SchedulerPolicy};
 use vllm_engine::core_client::InprocClient;
 use vllm_engine::engine_core::EngineCoreConfig;
 use vllm_executor::candle_worker::{CandleWorker, CandleWorkerConfig};
+use vllm_executor::multiproc::MultiprocExecutor;
+use vllm_executor::parallel::ResolvedParallelConfig;
 use vllm_executor::uniproc::UniProcExecutor;
 use vllm_executor::worker::Worker;
 use vllm_model::weight::HfModelConfig;
@@ -65,6 +67,8 @@ pub struct VllmConfig {
     pub lora_adapter: Option<String>,
     /// Pooling strategy for embeddings: "auto", "last", "cls", "mean".
     pub pooling_strategy: String,
+    /// Number of GPUs for tensor parallelism (1 = single GPU, no TP).
+    pub tensor_parallel_size: usize,
     /// Whether to disable async scheduling (overlap GPU/CPU work).
     /// Default false — async scheduling is enabled by default.
     pub disable_async_scheduling: bool,
@@ -90,6 +94,7 @@ impl Default for VllmConfig {
             ngram_prompt_lookup_min: 1,
             lora_adapter: None,
             pooling_strategy: "auto".to_string(),
+            tensor_parallel_size: 1,
             disable_async_scheduling: false,
             runner: "generate".to_string(),
         }
@@ -178,6 +183,8 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
         lora_adapter: config.lora_adapter.clone(),
         pooling_strategy: config.pooling_strategy.clone(),
         is_pooling,
+        tp_rank: 0,
+        tp_world_size: 1,
     };
 
     let mut worker = CandleWorker::new(worker_config);
@@ -239,6 +246,15 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
 
     // Extract model name before moving model_path into the worker config.
     let model_name = extract_model_name(&model_path).into_owned();
+
+    let tp_size = config.tensor_parallel_size;
+
+    // TP > 1: multi-GPU path with NCCL.
+    if tp_size > 1 {
+        return initialize_stack_tp(config, model_name, init_start);
+    }
+
+    // TP=1: single-GPU path (original flow).
 
     // Decide backend: MLX (Metal) or Candle (CPU/CUDA).
     let (mut worker, hf_config, model_dir, model_dtype) = create_worker(config, model_path)?;
@@ -478,6 +494,249 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
     );
 
     // 11. Return the stack.
+    Ok(InitializedStack {
+        engine: Arc::new(engine),
+        model_name,
+        max_model_len,
+    })
+}
+
+/// Multi-GPU init flow: creates N CandleWorkers (one per GPU rank), inits NCCL,
+/// and wraps them in a MultiprocExecutor.
+///
+/// Each worker loads the full model weights and keeps only its shard
+/// (via ColumnParallelLinear/RowParallelLinear sharding at load time).
+fn initialize_stack_tp(
+    config: &VllmConfig,
+    model_name: String,
+    init_start: Instant,
+) -> Result<InitializedStack> {
+    let tp_size = config.tensor_parallel_size;
+    info!(
+        "Tensor parallelism: {} GPUs (thread-per-GPU model)",
+        tp_size
+    );
+
+    let is_pooling = config.runner == "pooling";
+
+    // Create N worker configs (one per TP rank).
+    let worker_configs: Vec<CandleWorkerConfig> = (0..tp_size)
+        .map(|rank| CandleWorkerConfig {
+            model_path: config.model.clone(),
+            device_str: format!("cuda:{rank}"),
+            dtype: config.dtype.clone(),
+            hf_token: config.hf_token.clone(),
+            cache_dir: None,
+            block_size: config.block_size,
+            gguf_file: config.gguf_file.clone(),
+            lora_adapter: config.lora_adapter.clone(),
+            pooling_strategy: config.pooling_strategy.clone(),
+            is_pooling,
+            tp_rank: rank,
+            tp_world_size: tp_size,
+        })
+        .collect();
+
+    // Init devices and load models on all ranks sequentially.
+    // Sequential init avoids CUDA context creation races across threads.
+    info!(
+        "Initializing {} CUDA devices and loading model shards...",
+        tp_size
+    );
+    let mut workers: Vec<CandleWorker> = Vec::with_capacity(tp_size);
+    for cfg in worker_configs {
+        let mut worker = CandleWorker::new(cfg);
+        worker.init_device().context("init_device failed")?;
+        worker.load_model().context("load_model failed")?;
+        workers.push(worker);
+    }
+
+    // Extract metadata from rank 0 worker.
+    let hf_config = workers[0]
+        .hf_config()
+        .context("model config not available after load")?
+        .clone();
+    let model_dir = workers[0].model_dir().map(|p| p.to_path_buf());
+    let model_dtype = workers[0]
+        .resolved_dtype()
+        .unwrap_or(candle_core::DType::F32);
+    let preloaded_tokenizer = {
+        // Only take tokenizer from mutable ref to rank 0.
+        // We can't mutate here since workers is Vec<CandleWorker> not Vec<&mut>.
+        // The tokenizer will be loaded separately below.
+        None
+    };
+
+    if let Some(arch) = workers[0].architecture() {
+        info!("Resolved model architecture: {}", arch);
+    }
+
+    let max_model_len = config
+        .max_model_len
+        .or(hf_config.max_position_embeddings)
+        .unwrap_or(4096);
+    let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
+
+    info!(
+        "Model: {}, max_model_len={}, num_layers={}, tp={}",
+        model_name, max_model_len, num_layers, tp_size
+    );
+
+    // Wrap all workers in MultiprocExecutor. This spawns each worker as a
+    // tokio task, ensuring CUDA operations happen on the correct device context.
+    let all_workers: Vec<Box<dyn Worker>> = workers
+        .into_iter()
+        .map(|w| Box::new(w) as Box<dyn Worker>)
+        .collect();
+
+    let parallel_config = ResolvedParallelConfig::tensor_parallel(tp_size, 0);
+    let runtime = tokio::runtime::Handle::current();
+    let mut executor = MultiprocExecutor::new(all_workers, parallel_config, runtime);
+
+    // Determine available memory via executor (dispatches to worker tasks,
+    // which run on the correct CUDA context).
+    use vllm_engine::executor::Executor;
+    let memories = executor
+        .determine_available_memory()
+        .context("failed to determine available memory")?;
+    let min_available = *memories.iter().min().unwrap_or(&0);
+
+    let num_gpu_blocks = compute_num_blocks(
+        min_available,
+        config.block_size,
+        &hf_config,
+        model_dtype,
+        config.gpu_memory_utilization,
+    );
+
+    // Initialize cache on all workers via executor.
+    executor
+        .initialize_cache(num_gpu_blocks, 0)
+        .context("failed to initialize cache")?;
+
+    info!(
+        "Available memory (min): {:.1} GB, gpu_memory_utilization={}, num_gpu_blocks={}",
+        min_available as f64 / (1024.0 * 1024.0 * 1024.0),
+        config.gpu_memory_utilization,
+        num_gpu_blocks
+    );
+
+    let kv_cache_tokens = num_gpu_blocks * config.block_size;
+    info!("KV cache size: {} tokens", kv_cache_tokens);
+
+    // Build engine config.
+    let eos_token_ids: Vec<u32> = hf_config
+        .extra
+        .get("eos_token_id")
+        .map(|v| {
+            if let Some(id) = v.as_u64() {
+                vec![id as u32]
+            } else if let Some(arr) = v.as_array() {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|id| id as u32))
+                    .collect()
+            } else {
+                vec![]
+            }
+        })
+        .unwrap_or_default();
+    if !eos_token_ids.is_empty() {
+        info!("EOS token IDs: {:?}", eos_token_ids);
+    }
+
+    let engine_config = EngineCoreConfig {
+        scheduler_config: SchedulerConfig {
+            max_num_batched_tokens: max_model_len.min(8192),
+            max_num_seqs: config.max_num_seqs,
+            policy: SchedulerPolicy::Fcfs,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        },
+        max_model_len,
+        num_gpu_blocks,
+        block_size: config.block_size,
+        engine_index: 0,
+        async_scheduling: true,
+        use_spec_decode: config.speculative_model.is_some(),
+        ngram_proposer_config: if config.speculative_model.as_deref() == Some("ngram") {
+            Some(vllm_engine::ngram::NgramProposerConfig {
+                num_speculative_tokens: config.num_speculative_tokens,
+                max_ngram_size: config.ngram_prompt_lookup_max,
+                min_ngram_size: config.ngram_prompt_lookup_min,
+            })
+        } else {
+            None
+        },
+        eos_token_ids,
+        is_pooling: config.runner == "pooling",
+    };
+
+    let client = Box::new(InprocClient::new(engine_config, Box::new(executor)));
+
+    // Load tokenizer from model directory.
+    let loaded_tokenizer = preloaded_tokenizer
+        .map(Tokenizer::from_hf_tokenizer)
+        .or_else(|| {
+            model_dir
+                .as_ref()
+                .and_then(|dir| match try_load_tokenizer(dir) {
+                    Ok(tok) => Some(tok),
+                    Err(e) => {
+                        info!("No tokenizer found ({}), running without", e);
+                        None
+                    }
+                })
+        });
+
+    let engine = if let Some(tok) = loaded_tokenizer {
+        let dir_for_log = model_dir
+            .as_ref()
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|| "<preloaded>".to_string());
+        info!("Tokenizer loaded from {}", dir_for_log);
+        let tokenizer = Arc::new(tok);
+
+        #[cfg(feature = "chat-template")]
+        {
+            let chat_template = model_dir
+                .as_ref()
+                .and_then(|dir| try_load_chat_template(dir));
+            if let Some(tpl) = chat_template {
+                info!("Chat template loaded from tokenizer_config.json");
+                AsyncEngine::with_tokenizer_and_template(
+                    client,
+                    model_name.clone(),
+                    max_model_len,
+                    tokenizer,
+                    Arc::new(tpl),
+                )
+            } else {
+                info!("No chat template found, using plain concatenation");
+                AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
+            }
+        }
+        #[cfg(not(feature = "chat-template"))]
+        {
+            info!("No chat template found, using plain concatenation");
+            AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
+        }
+    } else {
+        AsyncEngine::new(client, model_name.clone(), max_model_len)
+    };
+
+    let mut engine = engine;
+    if !config.disable_async_scheduling {
+        engine.set_async_scheduling(true);
+    }
+    if config.runner == "pooling" {
+        engine.set_is_pooling(true);
+    }
+
+    info!(
+        "init engine (load model, create kv cache) took {:.2} seconds",
+        init_start.elapsed().as_secs_f64()
+    );
+
     Ok(InitializedStack {
         engine: Arc::new(engine),
         model_name,

@@ -38,6 +38,7 @@ impl TestServer {
             pooling_strategy: None,
             disable_async_scheduling: false,
             runner: "generate".to_string(),
+            tensor_parallel_size: 1,
         }
     }
 
@@ -69,6 +70,7 @@ pub struct TestServerBuilder {
     pooling_strategy: Option<String>,
     disable_async_scheduling: bool,
     runner: String,
+    tensor_parallel_size: usize,
 }
 
 impl TestServerBuilder {
@@ -122,6 +124,12 @@ impl TestServerBuilder {
         self
     }
 
+    /// Set the tensor parallel size (number of GPUs).
+    pub fn with_tensor_parallel_size(mut self, tp: usize) -> Self {
+        self.tensor_parallel_size = tp;
+        self
+    }
+
     /// Start the server in-process and wait for it to become healthy.
     pub async fn start(self) -> Result<TestServer> {
         // Initialize tracing. Silent by default; set RUST_LOG=info to see
@@ -152,6 +160,7 @@ impl TestServerBuilder {
             gpu_memory_utilization: 0.9,
             lora_adapter: self.lora_adapter.clone(),
             pooling_strategy,
+            tensor_parallel_size: self.tensor_parallel_size,
             disable_async_scheduling: self.disable_async_scheduling,
             runner: runner.clone(),
             ..Default::default()

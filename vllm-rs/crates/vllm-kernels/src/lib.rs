@@ -12,6 +12,8 @@ pub mod activation;
 pub mod attention;
 pub mod cache;
 pub mod error;
+#[cfg(feature = "nccl")]
+pub mod nccl;
 pub mod norm;
 pub mod rotary;
 

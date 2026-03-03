@@ -63,6 +63,10 @@ pub struct CandleWorkerConfig {
     /// Whether the engine is in pooling mode.
     /// In pooling mode, `execute_model` returns embedding vectors instead of sampled tokens.
     pub is_pooling: bool,
+    /// Tensor parallelism rank (0-based). Default 0.
+    pub tp_rank: usize,
+    /// Tensor parallelism world size. Default 1 (no TP).
+    pub tp_world_size: usize,
 }
 
 impl CandleWorkerConfig {
@@ -923,7 +927,19 @@ impl CandleWorker {
 
 impl Worker for CandleWorker {
     fn init_device(&mut self) -> ExecutorResult<()> {
-        let device = parse_device(&self.config.device_str)?;
+        // When TP > 1, override to cuda:rank regardless of device_str.
+        let device = if self.config.tp_world_size > 1 {
+            let ordinal = self.config.tp_rank;
+            info!(
+                "CandleWorker (rank {}): initializing CUDA device {}",
+                ordinal, ordinal
+            );
+            Device::new_cuda(ordinal).map_err(|e| {
+                ExecutorError::Config(format!("failed to init CUDA device {ordinal}: {e}"))
+            })?
+        } else {
+            parse_device(&self.config.device_str)?
+        };
         info!(
             "CandleWorker: initialized device {:?}",
             self.config.device_str
@@ -1156,11 +1172,24 @@ impl Worker for CandleWorker {
                 ))
             })?;
 
-            factory(&weights, &hf_config, dtype, &device)
-                .map_err(|e| ExecutorError::WorkerInit(format!("failed to construct model: {e}")))?
+            factory(
+                &weights,
+                &hf_config,
+                dtype,
+                &device,
+                self.config.tp_rank,
+                self.config.tp_world_size,
+            )
+            .map_err(|e| ExecutorError::WorkerInit(format!("failed to construct model: {e}")))?
         };
 
-        self.num_kv_heads = hf_config.num_kv_heads().unwrap_or(0);
+        // With TP, each rank has num_kv_heads / world_size local KV heads.
+        let full_kv_heads = hf_config.num_kv_heads().unwrap_or(0);
+        self.num_kv_heads = if self.config.tp_world_size > 1 {
+            full_kv_heads / self.config.tp_world_size
+        } else {
+            full_kv_heads
+        };
         self.head_dim = hf_config.head_dim().unwrap_or(0);
         self.model_dir = Some(model_dir);
         self.hf_config = Some(hf_config);
@@ -1247,9 +1276,14 @@ impl Worker for CandleWorker {
     fn determine_available_memory(&mut self) -> ExecutorResult<usize> {
         // On CUDA devices, query actual GPU VRAM via cudarc.
         #[cfg(feature = "cuda")]
-        if let Some(device) = &self.device
-            && device.is_cuda()
-        {
+        if let Some(Device::Cuda(cuda_dev)) = &self.device {
+            // Bind the device's CUDA context before querying memory.
+            // This is critical for multi-GPU: each worker thread must
+            // activate its own context before calling cuMemGetInfo.
+            let stream = cuda_dev.cuda_stream();
+            stream.context().bind_to_thread().map_err(|e| {
+                ExecutorError::WorkerInit(format!("CUDA context bind failed: {e:?}"))
+            })?;
             return cuda_free_memory()
                 .map_err(|e| ExecutorError::WorkerInit(format!("CUDA memory query failed: {e}")));
         }
@@ -1901,15 +1935,15 @@ impl Worker for CandleWorker {
     }
 
     fn rank(&self) -> usize {
-        0
+        self.config.tp_rank
     }
 
     fn local_rank(&self) -> usize {
-        0
+        self.config.tp_rank
     }
 
     fn is_driver_worker(&self) -> bool {
-        true
+        self.config.tp_rank == 0
     }
 }
 
@@ -2066,6 +2100,8 @@ mod tests {
             lora_adapter: None,
             pooling_strategy: "auto".to_string(),
             is_pooling: false,
+            tp_rank: 0,
+            tp_world_size: 1,
         }
     }
 

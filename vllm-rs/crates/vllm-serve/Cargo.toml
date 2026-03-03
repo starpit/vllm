@@ -7,7 +7,8 @@ description = "HTTP (axum) and gRPC (tonic) serving layer for vLLM Rust port"
 
 [features]
 default = []
-cuda = ["vllm-executor/cuda"]
+cuda = ["vllm-executor/cuda", "vllm-kernels/cuda"]
+nccl = ["cuda", "vllm-kernels/nccl"]
 metal = ["vllm-mlx"]
 guided-decoding = ["vllm-executor/guided-decoding", "vllm-mlx?/guided-decoding"]
 multimodal = ["vllm-model/multimodal"]
@@ -23,6 +24,7 @@ vllm-core = { workspace = true }
 vllm-engine = { workspace = true }
 vllm-executor = { workspace = true }
 vllm-model = { workspace = true }
+vllm-kernels = { workspace = true }
 vllm-mlx = { workspace = true, optional = true }
 candle-core = { workspace = true }
 anyhow = { workspace = true }

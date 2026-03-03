@@ -501,7 +501,10 @@ pub fn create_mixtral(
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
+    rank: usize,
+    world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
+    let _ = (rank, world_size);
     let mixtral_config = MixtralConfig::from_hf_config(config)?;
     let model = MixtralForCausalLM::load(weights, &mixtral_config, dtype, device)?;
     Ok(Box::new(model))

@@ -1015,7 +1015,10 @@ pub fn create_qwen2_vl(
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
+    rank: usize,
+    world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
+    let _ = (rank, world_size);
     let mm_config = Qwen2VLConfig::from_hf_config(config, false)?;
     let model = Qwen2VLForConditionalGeneration::load(weights, &mm_config, dtype, device)?;
     Ok(Box::new(model))
@@ -1027,7 +1030,10 @@ pub fn create_qwen25_vl(
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
+    rank: usize,
+    world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
+    let _ = (rank, world_size);
     let mm_config = Qwen2VLConfig::from_hf_config(config, true)?;
     let model = Qwen2VLForConditionalGeneration::load(weights, &mm_config, dtype, device)?;
     Ok(Box::new(model))

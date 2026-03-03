@@ -1009,7 +1009,10 @@ pub fn create_deepseek_v2(
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
+    rank: usize,
+    world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
+    let _ = (rank, world_size);
     let ds_config = DeepSeekV2Config::from_hf_config(config)?;
     let model = DeepSeekV2ForCausalLM::load(weights, &ds_config, dtype, device)?;
     Ok(Box::new(model))

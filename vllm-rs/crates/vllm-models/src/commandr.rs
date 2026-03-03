@@ -604,9 +604,12 @@ pub fn create_commandr(
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
+    rank: usize,
+    world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
     let commandr_config = CommandRConfig::from_hf_config(config)?;
-    let model = CommandRForCausalLM::load(weights, &commandr_config, dtype, device, 0, 1)?;
+    let model =
+        CommandRForCausalLM::load(weights, &commandr_config, dtype, device, rank, world_size)?;
     Ok(Box::new(model))
 }
 

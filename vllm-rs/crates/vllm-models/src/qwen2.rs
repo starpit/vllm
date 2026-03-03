@@ -77,9 +77,11 @@ pub fn create_qwen2(
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
+    rank: usize,
+    world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
     let qwen2_config = Qwen2Config::from_hf_config(config)?;
-    let model = LlamaForCausalLM::load(weights, &qwen2_config.0, dtype, device, 0, 1)?;
+    let model = LlamaForCausalLM::load(weights, &qwen2_config.0, dtype, device, rank, world_size)?;
     Ok(Box::new(model))
 }
 
@@ -265,7 +267,7 @@ mod tests {
         create_test_weights(&path, &tensor_specs);
 
         let weights = ModelWeights::from_single_file(&path, &device).unwrap();
-        let model = create_qwen2(&weights, &hf_config, DType::F32, &device).unwrap();
+        let model = create_qwen2(&weights, &hf_config, DType::F32, &device, 0, 1).unwrap();
 
         let input_ids = Tensor::new(&[1u32, 5, 10], &device).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2], &device).unwrap();

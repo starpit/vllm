@@ -747,9 +747,11 @@ pub fn create_gemma2(
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
+    rank: usize,
+    world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
     let gemma2_config = Gemma2Config::from_hf_config(config)?;
-    let model = Gemma2ForCausalLM::load(weights, &gemma2_config, dtype, device, 0, 1)?;
+    let model = Gemma2ForCausalLM::load(weights, &gemma2_config, dtype, device, rank, world_size)?;
     Ok(Box::new(model))
 }
 

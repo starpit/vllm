@@ -847,9 +847,11 @@ pub fn create_gemma3(
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
+    rank: usize,
+    world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
     let gemma3_config = Gemma3Config::from_hf_config(config)?;
-    let model = Gemma3ForCausalLM::load(weights, &gemma3_config, dtype, device, 0, 1)?;
+    let model = Gemma3ForCausalLM::load(weights, &gemma3_config, dtype, device, rank, world_size)?;
     Ok(Box::new(model))
 }
 

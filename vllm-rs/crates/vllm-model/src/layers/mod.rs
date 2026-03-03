@@ -24,7 +24,7 @@ pub mod rotary;
 pub use activation::{Activation, gelu, relu, silu};
 pub use awq::{AwqConfig, AwqLinear};
 pub use bnb::{BnbInt8Linear, BnbLayerConfig, BnbLinear, BnbNf4Config, BnbNf4Linear, BnbQuantType};
-pub use embedding::Embedding;
+pub use embedding::{Embedding, VocabParallelEmbedding};
 pub use gptq::{GptqConfig, GptqLinear};
 pub use linear::{ColumnParallelLinear, Linear, RowParallelLinear};
 pub use norm::{CohereLayerNorm, GemmaRmsNorm, LayerNorm, RmsNorm};

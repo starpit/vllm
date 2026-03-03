@@ -16,6 +16,7 @@ pub mod gptq_config;
 pub mod image;
 pub mod layers;
 pub mod lora;
+pub mod process_group;
 pub mod tensor;
 pub mod weight;
 

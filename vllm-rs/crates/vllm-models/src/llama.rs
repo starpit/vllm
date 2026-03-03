@@ -989,9 +989,11 @@ pub fn create_llama(
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
+    rank: usize,
+    world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
     let llama_config = LlamaConfig::from_hf_config(config)?;
-    let model = LlamaForCausalLM::load(weights, &llama_config, dtype, device, 0, 1)?;
+    let model = LlamaForCausalLM::load(weights, &llama_config, dtype, device, rank, world_size)?;
     Ok(Box::new(model))
 }
 
@@ -1411,7 +1413,7 @@ mod tests {
         .unwrap();
 
         let weights = ModelWeights::from_single_file(&path, &device).unwrap();
-        let model = factory(&weights, &hf_config, DType::F32, &device).unwrap();
+        let model = factory(&weights, &hf_config, DType::F32, &device, 0, 1).unwrap();
 
         let input_ids = Tensor::new(&[1u32, 2, 3], &device).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2], &device).unwrap();

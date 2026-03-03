@@ -591,7 +591,10 @@ pub fn create_qwen3_moe(
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
+    rank: usize,
+    world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
+    let _ = (rank, world_size);
     let moe_config = Qwen3MoeConfig::from_hf_config(config)?;
     let model = Qwen3MoeForCausalLM::load(weights, &moe_config, dtype, device)?;
     Ok(Box::new(model))

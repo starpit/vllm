@@ -95,6 +95,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         ngram_prompt_lookup_min: args.ngram_prompt_lookup_min,
         lora_adapter: args.lora_adapter.clone(),
         pooling_strategy: args.pooling_strategy.clone(),
+        tensor_parallel_size: args.tensor_parallel_size,
         disable_async_scheduling: args.disable_async_scheduling,
         runner: args.runner.clone(),
     };

@@ -10,6 +10,8 @@ default = []
 # Enable CUDA kernel compilation and FFI bindings.
 # Requires nvcc and CUDA toolkit.
 cuda = ["candle-core/cuda", "cudarc", "cc"]
+# Enable NCCL multi-GPU collective communication (requires libnccl).
+nccl = ["cuda", "cudarc/nccl"]
 # Enable Metal GPU compute on Apple Silicon.
 metal = ["candle-core/metal"]
 

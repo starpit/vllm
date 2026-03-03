@@ -1432,7 +1432,10 @@ pub fn create_qwen3_next(
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
+    rank: usize,
+    world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
+    let _ = (rank, world_size);
     let next_config = Qwen3NextConfig::from_hf_config(config)?;
     let model = Qwen3NextForCausalLM::load(weights, &next_config, dtype, device)?;
     Ok(Box::new(model))

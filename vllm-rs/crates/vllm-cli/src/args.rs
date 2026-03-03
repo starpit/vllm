@@ -142,6 +142,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub lora_adapter: Option<String>,
 
+    /// Number of GPUs for tensor parallelism (default: 1).
+    /// Splits model weights across N GPUs using NCCL all-reduce.
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel_size: usize,
+
     /// Disable async scheduling (overlap of GPU execution and CPU scheduling).
     /// By default, async scheduling is enabled for better throughput.
     #[arg(long)]

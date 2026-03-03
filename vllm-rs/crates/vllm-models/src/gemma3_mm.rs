@@ -430,7 +430,10 @@ pub fn create_gemma3_mm(
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
+    rank: usize,
+    world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
+    let _ = (rank, world_size);
     let mm_config = Gemma3VisionModelConfig::from_hf_config(config)?;
     let model = Gemma3ForConditionalGeneration::load(weights, &mm_config, dtype, device)?;
     Ok(Box::new(model))

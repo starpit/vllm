@@ -44,7 +44,7 @@
 | [KV Cache & Attention](#kv-cache--attention) | 19 | `█████░░░░░` 10/19 | 0 | 105 | 0 |
 | [Scheduling](#scheduling) | 10 | `█████████░` 9/10 | 0 | 73 | 1 |
 | [Hardware Backends](#hardware-backends) | 8 | `████░░░░░░` 3/8 | 1 | 62 | 5 |
-| [Parallelism & Distribution](#parallelism--distribution) | 10 | `███░░░░░░░` 3/10 | 0 | 33 | 0 |
+| [Parallelism & Distribution](#parallelism--distribution) | 10 | `████░░░░░░` 3+2/10 | 0 | 39 | 1 |
 | [Performance Optimizations](#performance-optimizations) | 13 | `██████░░░░` 8/13 | 4 | 50 | 0 |
 | [GPU Compute Kernels (Triton)](#gpu-compute-kernels-triton-equivalents) | 12 | `████░░░░░░` 5/12 | 0 | 25 | 0 |
 | [LoRA / Adapters](#lora--adapters) | 5 | `████░░░░░░` 2/5 | 0 | 12 | 8 |
@@ -320,15 +320,15 @@
 | Parallel config types (TP/PP groups) | &#x1F535; | &#x1F535; | 10 | 0 | |
 | UniProc executor (single-process) | &#x1F535; | &#x1F535; | 10 | 0 | |
 | MultiProc executor (multi-worker) | &#x1F535; | &#x1F535; | 6 | 0 | |
-| Tensor parallelism (actual sharding) | &#x1F535; | &#x1F7E1; | 0 | 0 | P3 |
+| Tensor parallelism (weight sharding + multi-GPU init) | &#x1F535; | &#x1F7E1; | 3 | 1 | P3 |
 | Pipeline parallelism | &#x1F535; | &#x1F534; | — | — | P2 |
-| NCCL communication | &#x1F535; | &#x1F534; | — | — | P3 |
+| NCCL communication (bindings + ProcessGroup trait) | &#x1F535; | &#x1F7E1; | 3 | 0 | P3 |
 | Ray distributed executor | &#x1F535; | &#x1F534; | — | — | P1 |
 | Expert parallelism (MoE) | &#x1F535; | &#x1F534; | — | — | P2 |
 | Data parallelism | &#x1F535; | &#x1F534; | — | — | P2 |
 | Weight transfer / migration | &#x1F535; | &#x1F534; | — | — | P1 |
 
-> Unit counts: `parallel.rs` (10), `uniproc.rs` (10), `multiproc.rs` (6), `worker.rs` (7 — NoopWorker lifecycle).
+> Unit counts: `parallel.rs` (10), `uniproc.rs` (10), `multiproc.rs` (6), `worker.rs` (7 — NoopWorker lifecycle), `nccl.rs` (3 — NCCL all-reduce/all-gather on 2x L40S). E2E: `test_cuda_tp2_qwen2_completion` (1 — TP=2 Qwen2.5-0.5B on 2x L40S).
 
 ---
 

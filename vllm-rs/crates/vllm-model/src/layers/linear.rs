@@ -3,9 +3,12 @@
 //!
 //! Port of: `vllm/model_executor/layers/linear.py`
 
+use std::sync::Arc;
+
 use candle_core::{DType, Device, Module, Tensor};
 
 use crate::error::ModelResult;
+use crate::process_group::ProcessGroup;
 use crate::tensor;
 use crate::weight::ModelWeights;
 
@@ -165,6 +168,8 @@ pub struct ColumnParallelLinear {
     inner: Linear,
     /// Whether to gather outputs across ranks after forward.
     gather_output: bool,
+    /// NCCL process group for all-gather (only used when gather_output=true and TP>1).
+    tp_group: Option<Arc<dyn ProcessGroup>>,
 }
 
 impl ColumnParallelLinear {
@@ -173,6 +178,7 @@ impl ColumnParallelLinear {
         Self {
             inner: linear,
             gather_output,
+            tp_group: None,
         }
     }
 
@@ -201,6 +207,7 @@ impl ColumnParallelLinear {
         Ok(Self {
             inner: Linear::new(weight, bias),
             gather_output,
+            tp_group: None,
         })
     }
 
@@ -218,14 +225,24 @@ impl ColumnParallelLinear {
     pub fn inner_mut(&mut self) -> &mut Linear {
         &mut self.inner
     }
+
+    /// Set the NCCL process group for tensor-parallel communication.
+    pub fn set_tp_group(&mut self, group: Arc<dyn ProcessGroup>) {
+        self.tp_group = Some(group);
+    }
 }
 
 impl Module for ColumnParallelLinear {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        // Note: actual all-gather for gather_output=true requires
-        // distributed communication (Phase 5c). For now, just do the
-        // local matmul.
-        self.inner.forward(x)
+        let output = self.inner.forward(x)?;
+        // All-gather when gather_output=true and TP > 1 (used for lm_head).
+        if self.gather_output
+            && let Some(ref group) = self.tp_group
+            && group.world_size() > 1
+        {
+            return group.all_gather(&output, 0);
+        }
+        Ok(output)
     }
 }
 
@@ -244,6 +261,8 @@ pub struct RowParallelLinear {
     /// Whether the input is already sharded across ranks.
     #[allow(dead_code)]
     input_is_parallel: bool,
+    /// NCCL process group for all-reduce (used when TP > 1).
+    tp_group: Option<Arc<dyn ProcessGroup>>,
 }
 
 impl RowParallelLinear {
@@ -252,6 +271,7 @@ impl RowParallelLinear {
         Self {
             inner: linear,
             input_is_parallel,
+            tp_group: None,
         }
     }
 
@@ -280,6 +300,7 @@ impl RowParallelLinear {
         Ok(Self {
             inner: Linear::new(weight, bias),
             input_is_parallel,
+            tp_group: None,
         })
     }
 
@@ -292,13 +313,41 @@ impl RowParallelLinear {
     pub fn inner_mut(&mut self) -> &mut Linear {
         &mut self.inner
     }
+
+    /// Set the NCCL process group for tensor-parallel communication.
+    pub fn set_tp_group(&mut self, group: Arc<dyn ProcessGroup>) {
+        self.tp_group = Some(group);
+    }
 }
 
 impl Module for RowParallelLinear {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        // Note: actual all-reduce requires distributed communication.
-        // For now, just do the local matmul + bias.
-        self.inner.forward(x)
+        // Local matmul (no bias — bias is added after all-reduce).
+        let x = x.contiguous()?;
+        let output = x.matmul(self.inner.weight())?;
+
+        // Apply LoRA delta if attached.
+        let output = match (&self.inner.lora_a, &self.inner.lora_b) {
+            (Some(a), Some(b)) => output.add(&x.matmul(a)?.matmul(b)?)?,
+            _ => output,
+        };
+
+        // All-reduce across TP ranks.
+        let output = if let Some(ref group) = self.tp_group {
+            if group.world_size() > 1 {
+                group.all_reduce(&output)?
+            } else {
+                output
+            }
+        } else {
+            output
+        };
+
+        // Bias is added AFTER all-reduce (it's the full, unsharded bias).
+        match self.inner.bias() {
+            Some(b) => output.broadcast_add(b),
+            None => Ok(output),
+        }
     }
 }
 

@@ -60,6 +60,9 @@ pub trait SchedulerInterface {
     /// Number of unfinished requests in the scheduler's internal queue.
     fn get_num_unfinished_requests(&self) -> usize;
 
+    /// Collect the IDs of all unfinished requests (running + waiting).
+    fn get_unfinished_request_ids(&self) -> Vec<String>;
+
     /// Returns `true` if there are unfinished requests.
     fn has_unfinished_requests(&self) -> bool {
         self.get_num_unfinished_requests() > 0

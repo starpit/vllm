@@ -788,6 +788,14 @@ impl SchedulerInterface for Scheduler {
         self.running.len() + self.waiting.len()
     }
 
+    fn get_unfinished_request_ids(&self) -> Vec<String> {
+        self.running
+            .iter()
+            .chain(self.waiting.iter())
+            .map(|r| r.request_id.clone())
+            .collect()
+    }
+
     fn has_finished_requests(&self) -> bool {
         !self.finished_req_ids.is_empty()
     }

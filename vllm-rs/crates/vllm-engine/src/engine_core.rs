@@ -179,6 +179,19 @@ impl EngineCore {
             .finish_requests(&id_refs, RequestStatus::FinishedAborted);
     }
 
+    /// Abort all currently running and waiting requests.
+    ///
+    /// Used when a persistent executor error makes it impossible to continue
+    /// processing the current batch. Drains the scheduler's unfinished queue.
+    pub fn abort_running_requests(&mut self) {
+        let ids = self.scheduler.get_unfinished_request_ids();
+        if !ids.is_empty() {
+            let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            self.scheduler
+                .finish_requests(&id_refs, RequestStatus::FinishedAborted);
+        }
+    }
+
     /// Queue abort requests for processing during the next step.
     ///
     /// This is used when aborts arrive asynchronously (e.g., from the

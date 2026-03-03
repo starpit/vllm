@@ -43,6 +43,13 @@ pub trait EngineCoreClient {
     /// Abort requests by ID.
     fn abort_requests(&mut self, request_ids: &[String]) -> EngineResult<()>;
 
+    /// Abort all currently running requests.
+    ///
+    /// Used when a persistent executor error (OOM, shape mismatch) makes it
+    /// impossible to continue processing the current batch. Drains the
+    /// scheduler's running queue and frees their KV blocks.
+    fn abort_running_requests(&mut self);
+
     /// Shut down the engine.
     fn shutdown(&mut self) -> EngineResult<()>;
 
@@ -180,6 +187,10 @@ impl EngineCoreClient for InprocClient {
     fn abort_requests(&mut self, request_ids: &[String]) -> EngineResult<()> {
         self.engine.abort_requests(request_ids);
         Ok(())
+    }
+
+    fn abort_running_requests(&mut self) {
+        self.engine.abort_running_requests();
     }
 
     fn shutdown(&mut self) -> EngineResult<()> {

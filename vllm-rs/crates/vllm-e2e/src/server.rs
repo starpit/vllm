@@ -20,6 +20,7 @@ const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// The server runs in-process on a background tokio task. On drop, the task
 /// is aborted and the port is released.
 pub struct TestServer {
+    step_handle: JoinHandle<()>,
     server_handle: JoinHandle<()>,
     port: u16,
     base_url: String,
@@ -55,6 +56,7 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
+        self.step_handle.abort();
         self.server_handle.abort();
     }
 }
@@ -184,7 +186,7 @@ impl TestServerBuilder {
         }
 
         // Spawn the engine step loop.
-        let _step_handle = stack.engine.spawn_step_loop();
+        let step_handle = stack.engine.spawn_step_loop();
 
         // Build server config and app state.
         let server_config = vllm_serve::server::ServerConfig {
@@ -213,6 +215,7 @@ impl TestServerBuilder {
         });
 
         let test_server = TestServer {
+            step_handle,
             server_handle,
             port,
             base_url,

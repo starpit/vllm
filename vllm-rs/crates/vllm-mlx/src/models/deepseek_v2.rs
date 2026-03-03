@@ -20,7 +20,7 @@ use mlx_rs::ops::concatenate_axis;
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
-use crate::cache::{MlxKvCache, MlxLayerKvCache};
+use crate::cache::{MlxBatchInfo, MlxKvCache, MlxLayerKvCache};
 use crate::models::llama::{MlxLlamaMLP, assign_weight, load_safetensors_weights};
 use crate::models::quantized_llama::{
     MlxEmbedTokens, MlxLmHead, MlxQuantizedLlamaMLP, QuantConfig, make_quantized_linear,
@@ -530,6 +530,185 @@ impl MlxDeepSeekV2Attention {
 
         self.o_proj.forward(&out)
     }
+
+    /// Batched forward: projections run on `[total_tokens, hidden]`, then
+    /// per-request reshape/RoPE/KV-cache/SDPA, then batched O projection.
+    fn forward_batch(
+        &mut self,
+        hidden_states: &Array,
+        batch_info: &MlxBatchInfo,
+        caches: &mut [Option<MlxLayerKvCache>],
+    ) -> Result<Array, Exception> {
+        // --- Batched Q path on [total_tokens, hidden] ---
+        let q_full_all = if let (Some(q_a), Some(q_a_ln), Some(q_b)) = (
+            self.q_a_proj.as_mut(),
+            self.q_a_layernorm.as_mut(),
+            self.q_b_proj.as_mut(),
+        ) {
+            let q_latent = q_a.forward(hidden_states)?;
+            let q_latent = q_a_ln.forward(&q_latent)?;
+            q_b.forward(&q_latent)?
+        } else {
+            self.q_proj.as_mut().unwrap().forward(hidden_states)?
+        };
+
+        // --- Batched KV path on [total_tokens, hidden] ---
+        let kv_a_all = self.kv_a_proj_with_mqa.forward(hidden_states)?;
+        let kv_a_parts_all = kv_a_all.split_axis(&[self.kv_lora_rank as i32], -1)?;
+        let kv_latent_all = &kv_a_parts_all[0];
+        let k_pe_all = &kv_a_parts_all[1];
+
+        let kv_latent_all = self.kv_a_layernorm.forward(kv_latent_all)?;
+        let kv_b_all = self.kv_b_proj.forward(&kv_latent_all)?;
+
+        // Check if all requests are decode (q_len=1) for potential batched SDPA.
+        let all_decode = batch_info.num_reqs > 1 && batch_info.q_lens.iter().all(|&ql| ql == 1);
+
+        // Per-request: slice, reshape, RoPE, KV cache update, collect for SDPA.
+        let mut per_req_q = Vec::with_capacity(batch_info.num_reqs);
+        let mut per_req_k = Vec::with_capacity(batch_info.num_reqs);
+        let mut per_req_v = Vec::with_capacity(batch_info.num_reqs);
+        let mut kv_lens = Vec::with_capacity(batch_info.num_reqs);
+
+        let kv_b_total = self.qk_nope_head_dim + self.v_head_dim;
+
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..batch_info.num_reqs {
+            let start = batch_info.offsets[i] as i32;
+            let seq_len = batch_info.q_lens[i] as i32;
+            let offset = batch_info.rope_offsets[i];
+
+            // Slice per-request Q.
+            let q_full = q_full_all.try_index((start..start + seq_len, ..))?;
+            let q = q_full.reshape(&[seq_len, self.num_heads as i32, self.qk_head_dim as i32])?;
+            let q_parts = q.split_axis(&[self.qk_nope_head_dim as i32], -1)?;
+            let q_nope = &q_parts[0];
+            let q_pe = &q_parts[1];
+
+            // Slice per-request KV.
+            let kv_b = kv_b_all.try_index((start..start + seq_len, ..))?;
+            let kv_b = kv_b.reshape(&[seq_len, self.num_heads as i32, kv_b_total as i32])?;
+            let kv_b_parts = kv_b.split_axis(&[self.qk_nope_head_dim as i32], -1)?;
+            let k_nope = &kv_b_parts[0];
+            let v = &kv_b_parts[1];
+
+            let k_pe = k_pe_all.try_index((start..start + seq_len, ..))?;
+
+            // --- Apply RoPE ---
+            let q_pe = q_pe.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+            let k_pe = k_pe
+                .reshape(&[seq_len, 1, self.qk_rope_head_dim as i32])?
+                .transpose_axes(&[1, 0, 2])?
+                .expand_dims(0)?;
+
+            let q_pe = self.rope.forward((&q_pe, offset))?;
+            let k_pe = self.rope.forward((&k_pe, offset))?;
+
+            let q_pe = q_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
+            let k_pe = k_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
+
+            // --- Assemble full Q and K ---
+            let q = concatenate_axis(&[q_nope, &q_pe], 2)?;
+            let k_pe = mlx_rs::ops::broadcast_to(
+                &k_pe,
+                &[seq_len, self.num_heads as i32, self.qk_rope_head_dim as i32],
+            )?;
+            let k = concatenate_axis(&[k_nope, &k_pe], 2)?;
+
+            // --- Pad V to qk_head_dim ---
+            let v_padded = if self.v_head_dim < self.qk_head_dim {
+                let pad_size = self.qk_head_dim - self.v_head_dim;
+                let padding =
+                    mlx_rs::ops::zeros::<f32>(&[seq_len, self.num_heads as i32, pad_size as i32])?;
+                let padding = padding.as_dtype(v.dtype())?;
+                concatenate_axis(&[v, &padding], 2)?
+            } else {
+                v.clone()
+            };
+
+            // --- Transform to SDPA layout: [1, heads, seq, head_dim] ---
+            let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+            let k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+            let v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+
+            // KV cache update.
+            let (k, v_sdpa) = crate::cache::kv_cache_update(&mut caches[i], &k, &v_sdpa)?;
+
+            kv_lens.push(k.dim(2) as usize);
+            per_req_q.push(q);
+            per_req_k.push(k);
+            per_req_v.push(v_sdpa);
+        }
+
+        // Decide: batched SDPA (all decode + same KV len) or per-request.
+        let can_batch_sdpa =
+            all_decode && !kv_lens.is_empty() && kv_lens.iter().all(|&l| l == kv_lens[0]);
+
+        let concat = if can_batch_sdpa {
+            let q_stacked = mlx_rs::ops::concatenate_axis(&per_req_q, 0)?;
+            let k_stacked = mlx_rs::ops::concatenate_axis(&per_req_k, 0)?;
+            let v_stacked = mlx_rs::ops::concatenate_axis(&per_req_v, 0)?;
+
+            let out = mlx_rs::fast::scaled_dot_product_attention(
+                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
+            )?;
+
+            // Slice V back from padded dim.
+            let out = if self.v_head_dim < self.qk_head_dim {
+                let parts = out.split_axis(&[self.v_head_dim as i32], -1)?;
+                parts.into_iter().next().unwrap()
+            } else {
+                out
+            };
+
+            // out: [batch, heads, 1, v_head_dim] -> [batch, heads*v_head_dim]
+            let hidden = (self.num_heads * self.v_head_dim) as i32;
+            out.squeeze_axes(&[2])?
+                .reshape(&[batch_info.num_reqs as i32, hidden])?
+        } else {
+            // Per-request SDPA.
+            let mut attn_outputs = Vec::with_capacity(batch_info.num_reqs);
+            for i in 0..batch_info.num_reqs {
+                let seq_len = batch_info.q_lens[i] as i32;
+
+                let mask = if seq_len > 1 {
+                    Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
+                } else {
+                    None
+                };
+                let out = mlx_rs::fast::scaled_dot_product_attention(
+                    &per_req_q[i],
+                    &per_req_k[i],
+                    &per_req_v[i],
+                    self.scale,
+                    mask,
+                )?;
+
+                // Slice V back from padded dim.
+                let out = if self.v_head_dim < self.qk_head_dim {
+                    let parts = out.split_axis(&[self.v_head_dim as i32], -1)?;
+                    parts.into_iter().next().unwrap()
+                } else {
+                    out
+                };
+
+                let hidden = (self.num_heads * self.v_head_dim) as i32;
+                let out = out
+                    .squeeze_axes(&[0])?
+                    .transpose_axes(&[1, 0, 2])?
+                    .reshape(&[seq_len, hidden])?;
+                attn_outputs.push(out);
+            }
+
+            if attn_outputs.len() == 1 {
+                attn_outputs.into_iter().next().unwrap()
+            } else {
+                mlx_rs::ops::concatenate_axis(&attn_outputs, 0)?
+            }
+        };
+
+        self.o_proj.forward(&concat)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +789,29 @@ impl MlxDeepSeekV2DecoderLayer {
         let hidden_states = hidden_states.add(&attn_output)?;
 
         // Post-attention layernorm + MLP/MoE + residual.
+        let normed = self.post_attention_layernorm.forward(&hidden_states)?;
+        let mlp_output = match &mut self.mlp {
+            MlxDeepSeekV2Mlp::Dense(mlp) => mlp.forward(&normed)?,
+            MlxDeepSeekV2Mlp::MoE(moe) => moe.forward(&normed)?,
+        };
+        hidden_states.add(&mlp_output)
+    }
+
+    /// Batched forward: norms and MLP/MoE run on `[total_tokens, hidden]`,
+    /// attention splits per-request for RoPE/KV/SDPA.
+    fn forward_batch(
+        &mut self,
+        hidden_states: &Array,
+        batch_info: &MlxBatchInfo,
+        caches: &mut [Option<MlxLayerKvCache>],
+    ) -> Result<Array, Exception> {
+        // Batched input layernorm + batched attention + residual.
+        let normed = self.input_layernorm.forward(hidden_states)?;
+        let attn_output = self.self_attn.forward_batch(&normed, batch_info, caches)?;
+        let hidden_states = hidden_states.add(&attn_output)?;
+
+        // Batched post-attention layernorm + MLP/MoE + residual.
+        // Both dense MLP and MoE naturally operate on [total_tokens, hidden].
         let normed = self.post_attention_layernorm.forward(&hidden_states)?;
         let mlp_output = match &mut self.mlp {
             MlxDeepSeekV2Mlp::Dense(mlp) => mlp.forward(&normed)?,
@@ -791,6 +993,43 @@ impl super::MlxModel for MlxDeepSeekV2ForCausalLM {
 
     fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    fn forward_batch(
+        &mut self,
+        input_ids: &Array,
+        _positions: &Array,
+        batch_info: &MlxBatchInfo,
+        kv_caches: &mut [MlxKvCache],
+    ) -> mlx_rs::error::Result<Array> {
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            // Collect the per-layer cache entry from each request's KV cache.
+            let mut layer_caches: Vec<&mut Option<MlxLayerKvCache>> =
+                kv_caches.iter_mut().map(|kv| &mut kv[layer_idx]).collect();
+
+            // Use a temporary Vec to hold the values, then put them back.
+            let mut temp_caches: Vec<Option<MlxLayerKvCache>> =
+                layer_caches.iter_mut().map(|c| c.take()).collect();
+
+            hidden_states = layer.forward_batch(&hidden_states, batch_info, &mut temp_caches)?;
+
+            // Put caches back.
+            for (dst, src) in layer_caches.iter_mut().zip(temp_caches.into_iter()) {
+                **dst = src;
+            }
+        }
+
+        hidden_states = self.norm.forward(&hidden_states)?;
+
+        let logits = if self.tie_word_embeddings {
+            self.embed_tokens.as_linear(&hidden_states)?
+        } else {
+            self.lm_head.as_mut().unwrap().forward(&hidden_states)?
+        };
+
+        Ok(logits)
     }
 
     fn hidden_states(
@@ -1063,6 +1302,185 @@ impl MlxQuantizedDeepSeekV2Attention {
 
         self.o_proj.forward(&out)
     }
+
+    /// Batched forward: projections run on `[total_tokens, hidden]`, then
+    /// per-request reshape/RoPE/KV-cache/SDPA, then batched O projection.
+    fn forward_batch(
+        &mut self,
+        hidden_states: &Array,
+        batch_info: &MlxBatchInfo,
+        caches: &mut [Option<MlxLayerKvCache>],
+    ) -> Result<Array, Exception> {
+        // --- Batched Q path on [total_tokens, hidden] ---
+        let q_full_all = if let (Some(q_a), Some(q_a_ln), Some(q_b)) = (
+            self.q_a_proj.as_mut(),
+            self.q_a_layernorm.as_mut(),
+            self.q_b_proj.as_mut(),
+        ) {
+            let q_latent = q_a.forward(hidden_states)?;
+            let q_latent = q_a_ln.forward(&q_latent)?;
+            q_b.forward(&q_latent)?
+        } else {
+            self.q_proj.as_mut().unwrap().forward(hidden_states)?
+        };
+
+        // --- Batched KV path on [total_tokens, hidden] ---
+        let kv_a_all = self.kv_a_proj_with_mqa.forward(hidden_states)?;
+        let kv_a_parts_all = kv_a_all.split_axis(&[self.kv_lora_rank as i32], -1)?;
+        let kv_latent_all = &kv_a_parts_all[0];
+        let k_pe_all = &kv_a_parts_all[1];
+
+        let kv_latent_all = self.kv_a_layernorm.forward(kv_latent_all)?;
+        let kv_b_all = self.kv_b_proj.forward(&kv_latent_all)?;
+
+        // Check if all requests are decode (q_len=1) for potential batched SDPA.
+        let all_decode = batch_info.num_reqs > 1 && batch_info.q_lens.iter().all(|&ql| ql == 1);
+
+        // Per-request: slice, reshape, RoPE, KV cache update, collect for SDPA.
+        let mut per_req_q = Vec::with_capacity(batch_info.num_reqs);
+        let mut per_req_k = Vec::with_capacity(batch_info.num_reqs);
+        let mut per_req_v = Vec::with_capacity(batch_info.num_reqs);
+        let mut kv_lens = Vec::with_capacity(batch_info.num_reqs);
+
+        let kv_b_total = self.qk_nope_head_dim + self.v_head_dim;
+
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..batch_info.num_reqs {
+            let start = batch_info.offsets[i] as i32;
+            let seq_len = batch_info.q_lens[i] as i32;
+            let offset = batch_info.rope_offsets[i];
+
+            // Slice per-request Q.
+            let q_full = q_full_all.try_index((start..start + seq_len, ..))?;
+            let q = q_full.reshape(&[seq_len, self.num_heads as i32, self.qk_head_dim as i32])?;
+            let q_parts = q.split_axis(&[self.qk_nope_head_dim as i32], -1)?;
+            let q_nope = &q_parts[0];
+            let q_pe = &q_parts[1];
+
+            // Slice per-request KV.
+            let kv_b = kv_b_all.try_index((start..start + seq_len, ..))?;
+            let kv_b = kv_b.reshape(&[seq_len, self.num_heads as i32, kv_b_total as i32])?;
+            let kv_b_parts = kv_b.split_axis(&[self.qk_nope_head_dim as i32], -1)?;
+            let k_nope = &kv_b_parts[0];
+            let v = &kv_b_parts[1];
+
+            let k_pe = k_pe_all.try_index((start..start + seq_len, ..))?;
+
+            // --- Apply RoPE ---
+            let q_pe = q_pe.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+            let k_pe = k_pe
+                .reshape(&[seq_len, 1, self.qk_rope_head_dim as i32])?
+                .transpose_axes(&[1, 0, 2])?
+                .expand_dims(0)?;
+
+            let q_pe = self.rope.forward((&q_pe, offset))?;
+            let k_pe = self.rope.forward((&k_pe, offset))?;
+
+            let q_pe = q_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
+            let k_pe = k_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
+
+            // --- Assemble full Q and K ---
+            let q = concatenate_axis(&[q_nope, &q_pe], 2)?;
+            let k_pe = mlx_rs::ops::broadcast_to(
+                &k_pe,
+                &[seq_len, self.num_heads as i32, self.qk_rope_head_dim as i32],
+            )?;
+            let k = concatenate_axis(&[k_nope, &k_pe], 2)?;
+
+            // --- Pad V to qk_head_dim ---
+            let v_padded = if self.v_head_dim < self.qk_head_dim {
+                let pad_size = self.qk_head_dim - self.v_head_dim;
+                let padding =
+                    mlx_rs::ops::zeros::<f32>(&[seq_len, self.num_heads as i32, pad_size as i32])?;
+                let padding = padding.as_dtype(v.dtype())?;
+                concatenate_axis(&[v, &padding], 2)?
+            } else {
+                v.clone()
+            };
+
+            // --- Transform to SDPA layout: [1, heads, seq, head_dim] ---
+            let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+            let k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+            let v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+
+            // KV cache update.
+            let (k, v_sdpa) = crate::cache::kv_cache_update(&mut caches[i], &k, &v_sdpa)?;
+
+            kv_lens.push(k.dim(2) as usize);
+            per_req_q.push(q);
+            per_req_k.push(k);
+            per_req_v.push(v_sdpa);
+        }
+
+        // Decide: batched SDPA (all decode + same KV len) or per-request.
+        let can_batch_sdpa =
+            all_decode && !kv_lens.is_empty() && kv_lens.iter().all(|&l| l == kv_lens[0]);
+
+        let concat = if can_batch_sdpa {
+            let q_stacked = mlx_rs::ops::concatenate_axis(&per_req_q, 0)?;
+            let k_stacked = mlx_rs::ops::concatenate_axis(&per_req_k, 0)?;
+            let v_stacked = mlx_rs::ops::concatenate_axis(&per_req_v, 0)?;
+
+            let out = mlx_rs::fast::scaled_dot_product_attention(
+                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
+            )?;
+
+            // Slice V back from padded dim.
+            let out = if self.v_head_dim < self.qk_head_dim {
+                let parts = out.split_axis(&[self.v_head_dim as i32], -1)?;
+                parts.into_iter().next().unwrap()
+            } else {
+                out
+            };
+
+            // out: [batch, heads, 1, v_head_dim] -> [batch, heads*v_head_dim]
+            let hidden = (self.num_heads * self.v_head_dim) as i32;
+            out.squeeze_axes(&[2])?
+                .reshape(&[batch_info.num_reqs as i32, hidden])?
+        } else {
+            // Per-request SDPA.
+            let mut attn_outputs = Vec::with_capacity(batch_info.num_reqs);
+            for i in 0..batch_info.num_reqs {
+                let seq_len = batch_info.q_lens[i] as i32;
+
+                let mask = if seq_len > 1 {
+                    Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
+                } else {
+                    None
+                };
+                let out = mlx_rs::fast::scaled_dot_product_attention(
+                    &per_req_q[i],
+                    &per_req_k[i],
+                    &per_req_v[i],
+                    self.scale,
+                    mask,
+                )?;
+
+                // Slice V back from padded dim.
+                let out = if self.v_head_dim < self.qk_head_dim {
+                    let parts = out.split_axis(&[self.v_head_dim as i32], -1)?;
+                    parts.into_iter().next().unwrap()
+                } else {
+                    out
+                };
+
+                let hidden = (self.num_heads * self.v_head_dim) as i32;
+                let out = out
+                    .squeeze_axes(&[0])?
+                    .transpose_axes(&[1, 0, 2])?
+                    .reshape(&[seq_len, hidden])?;
+                attn_outputs.push(out);
+            }
+
+            if attn_outputs.len() == 1 {
+                attn_outputs.into_iter().next().unwrap()
+            } else {
+                mlx_rs::ops::concatenate_axis(&attn_outputs, 0)?
+            }
+        };
+
+        self.o_proj.forward(&concat)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1327,6 +1745,28 @@ impl MlxQuantizedDeepSeekV2DecoderLayer {
         };
         hidden_states.add(&mlp_output)
     }
+
+    /// Batched forward: norms and MLP/MoE run on `[total_tokens, hidden]`,
+    /// attention splits per-request for RoPE/KV/SDPA.
+    fn forward_batch(
+        &mut self,
+        hidden_states: &Array,
+        batch_info: &MlxBatchInfo,
+        caches: &mut [Option<MlxLayerKvCache>],
+    ) -> Result<Array, Exception> {
+        // Batched input layernorm + batched attention + residual.
+        let normed = self.input_layernorm.forward(hidden_states)?;
+        let attn_output = self.self_attn.forward_batch(&normed, batch_info, caches)?;
+        let hidden_states = hidden_states.add(&attn_output)?;
+
+        // Batched post-attention layernorm + MLP/MoE + residual.
+        let normed = self.post_attention_layernorm.forward(&hidden_states)?;
+        let mlp_output = match &mut self.mlp {
+            MlxQuantizedDeepSeekV2Mlp::Dense(mlp) => mlp.forward(&normed)?,
+            MlxQuantizedDeepSeekV2Mlp::MoE(moe) => moe.forward(&normed)?,
+        };
+        hidden_states.add(&mlp_output)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1434,6 +1874,40 @@ impl super::MlxModel for MlxQuantizedDeepSeekV2ForCausalLM {
 
     fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    fn forward_batch(
+        &mut self,
+        input_ids: &Array,
+        _positions: &Array,
+        batch_info: &MlxBatchInfo,
+        kv_caches: &mut [MlxKvCache],
+    ) -> mlx_rs::error::Result<Array> {
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let mut layer_caches: Vec<&mut Option<MlxLayerKvCache>> =
+                kv_caches.iter_mut().map(|kv| &mut kv[layer_idx]).collect();
+
+            let mut temp_caches: Vec<Option<MlxLayerKvCache>> =
+                layer_caches.iter_mut().map(|c| c.take()).collect();
+
+            hidden_states = layer.forward_batch(&hidden_states, batch_info, &mut temp_caches)?;
+
+            for (dst, src) in layer_caches.iter_mut().zip(temp_caches.into_iter()) {
+                **dst = src;
+            }
+        }
+
+        hidden_states = self.norm.forward(&hidden_states)?;
+
+        let logits = if self.tie_word_embeddings {
+            self.embed_tokens.as_linear(&hidden_states)?
+        } else {
+            self.lm_head.as_mut().unwrap().forward(&hidden_states)?
+        };
+
+        Ok(logits)
     }
 
     fn hidden_states(

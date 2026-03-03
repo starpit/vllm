@@ -316,8 +316,8 @@ fn dequantize_int8_layer(
     let total = out_features * in_features;
     let mut out = vec![0.0f32; total];
 
-    for row in 0..out_features {
-        let scale = scb_data[row] / 127.0;
+    for (row, &scb_val) in scb_data.iter().enumerate().take(out_features) {
+        let scale = scb_val / 127.0;
         for col in 0..in_features {
             let idx = row * in_features + col;
             let signed_val = weight_data[idx] as i8;

@@ -445,6 +445,9 @@ impl MlxLlamaAttention {
 
     /// Batched forward: projections batched on `[total_tokens, hidden]`,
     /// split per-request for reshape/RoPE/KV-cache/SDPA, then rejoin for O projection.
+    ///
+    /// When all requests are decode (q_len=1) and KV lengths match, SDPA is
+    /// batched into a single kernel launch.
     pub fn forward_batch(
         &mut self,
         hidden_states: &Array,
@@ -456,8 +459,18 @@ impl MlxLlamaAttention {
         let k_all = self.k_proj.forward(hidden_states)?;
         let v_all = self.v_proj.forward(hidden_states)?;
 
-        // Split per-request for reshape/RoPE/cache/SDPA.
-        let mut attn_outputs = Vec::with_capacity(batch_info.num_reqs);
+        // Check if all requests are decode (q_len=1) → can attempt batched SDPA.
+        let all_decode = batch_info.num_reqs > 1
+            && batch_info.q_lens.iter().all(|&ql| ql == 1)
+            && self.sliding_window.is_none();
+
+        // Per-request: reshape, RoPE, KV cache update.
+        // Collect per-request Q/K/V after cache update for potential batching.
+        let mut per_req_q = Vec::with_capacity(batch_info.num_reqs);
+        let mut per_req_k = Vec::with_capacity(batch_info.num_reqs);
+        let mut per_req_v = Vec::with_capacity(batch_info.num_reqs);
+        let mut kv_lens = Vec::with_capacity(batch_info.num_reqs);
+
         #[allow(clippy::needless_range_loop)]
         for i in 0..batch_info.num_reqs {
             let start = batch_info.offsets[i] as i32;
@@ -468,11 +481,9 @@ impl MlxLlamaAttention {
             let k = k_all.try_index((start..start + seq_len, ..))?;
             let v = v_all.try_index((start..start + seq_len, ..))?;
 
-            // Reshape: [seq, hidden] -> [seq, heads, head_dim]
             let q = q.reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?;
             let k = k.reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
 
-            // Optional per-head QK norms (Qwen3).
             let q = if let Some(ref mut norm) = self.q_norm {
                 norm.forward(&q)?
             } else {
@@ -484,7 +495,6 @@ impl MlxLlamaAttention {
                 k
             };
 
-            // [seq, heads, head_dim] -> [1, heads, seq, head_dim]
             let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
             let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
             let v = v
@@ -492,50 +502,82 @@ impl MlxLlamaAttention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            // RoPE
             let q = self.rope.forward((&q, offset))?;
             k = self.rope.forward((&k, offset))?;
 
-            // KV cache update
-            let (mut k, mut v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+            let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
 
-            // Sliding window
-            if let Some(w) = self.sliding_window {
-                let kv_len = k.dim(2) as usize;
-                if kv_len > w {
-                    let s = (kv_len - w) as i32;
-                    let e = kv_len as i32;
-                    k = k.try_index((.., .., s..e, ..))?;
-                    v = v.try_index((.., .., s..e, ..))?;
-                }
-            }
-
-            // SDPA
-            let mask = if seq_len > 1 {
-                Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
-            } else {
-                None
-            };
-            let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
-
-            // [1, heads, seq, head_dim] -> [seq, heads*head_dim]
-            let hidden = (self.num_heads * self.head_dim) as i32;
-            let out = out
-                .squeeze_axes(&[0])?
-                .transpose_axes(&[1, 0, 2])?
-                .reshape(&[seq_len, hidden])?;
-
-            attn_outputs.push(out);
+            kv_lens.push(k.dim(2) as usize);
+            per_req_q.push(q);
+            per_req_k.push(k);
+            per_req_v.push(v);
         }
 
-        // Concatenate per-request outputs -> [total_tokens, heads*head_dim]
-        let concat = if attn_outputs.len() == 1 {
-            attn_outputs.into_iter().next().unwrap()
+        // Decide: batched SDPA (all decode + same KV len) or per-request.
+        let can_batch_sdpa =
+            all_decode && !kv_lens.is_empty() && kv_lens.iter().all(|&l| l == kv_lens[0]);
+
+        let concat = if can_batch_sdpa {
+            // Stack Q/K/V across batch dim: [batch, heads, seq/kv_len, head_dim]
+            let q_stacked = mlx_rs::ops::concatenate_axis(&per_req_q, 0)?;
+            let k_stacked = mlx_rs::ops::concatenate_axis(&per_req_k, 0)?;
+            let v_stacked = mlx_rs::ops::concatenate_axis(&per_req_v, 0)?;
+
+            // Single SDPA: q_len=1 decode → no mask needed.
+            let out = mlx_rs::fast::scaled_dot_product_attention(
+                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
+            )?;
+
+            // out: [batch, heads, 1, head_dim] -> [batch, heads*head_dim]
+            let hidden = (self.num_heads * self.head_dim) as i32;
+            out.squeeze_axes(&[2])?
+                .reshape(&[batch_info.num_reqs as i32, hidden])?
         } else {
-            mlx_rs::ops::concatenate_axis(&attn_outputs, 0)?
+            // Per-request SDPA (prefill or mixed KV lengths).
+            let mut attn_outputs = Vec::with_capacity(batch_info.num_reqs);
+            for i in 0..batch_info.num_reqs {
+                let seq_len = batch_info.q_lens[i] as i32;
+                let mut k = per_req_k[i].clone();
+                let mut v = per_req_v[i].clone();
+
+                if let Some(w) = self.sliding_window {
+                    let kv_len = kv_lens[i];
+                    if kv_len > w {
+                        let s = (kv_len - w) as i32;
+                        let e = kv_len as i32;
+                        k = k.try_index((.., .., s..e, ..))?;
+                        v = v.try_index((.., .., s..e, ..))?;
+                    }
+                }
+
+                let mask = if seq_len > 1 {
+                    Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
+                } else {
+                    None
+                };
+                let out = mlx_rs::fast::scaled_dot_product_attention(
+                    &per_req_q[i],
+                    &k,
+                    &v,
+                    self.scale,
+                    mask,
+                )?;
+
+                let hidden = (self.num_heads * self.head_dim) as i32;
+                let out = out
+                    .squeeze_axes(&[0])?
+                    .transpose_axes(&[1, 0, 2])?
+                    .reshape(&[seq_len, hidden])?;
+                attn_outputs.push(out);
+            }
+
+            if attn_outputs.len() == 1 {
+                attn_outputs.into_iter().next().unwrap()
+            } else {
+                mlx_rs::ops::concatenate_axis(&attn_outputs, 0)?
+            }
         };
 
-        // Batched O projection on [total_tokens, hidden]
         self.o_proj.forward(&concat)
     }
 }

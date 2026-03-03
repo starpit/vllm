@@ -21,7 +21,7 @@ use mlx_rs::nn;
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
-use crate::cache::{MlxKvCache, MlxLayerKvCache};
+use crate::cache::{MlxBatchInfo, MlxKvCache, MlxLayerKvCache};
 use crate::models::deepseek_v2::slice_quantized_linear;
 use crate::models::llama::{
     LlamaConfig, MlxLlamaAttention, assign_weight, load_safetensors_weights,
@@ -302,6 +302,23 @@ impl MlxMixtralDecoderLayer {
         let mlp_output = self.block_sparse_moe.forward(&normed)?;
         hidden_states.add(&mlp_output)
     }
+
+    /// Batched forward: norms and MoE run on `[total_tokens, hidden]`,
+    /// attention splits per-request for RoPE/KV/SDPA.
+    fn forward_batch(
+        &mut self,
+        hidden_states: &Array,
+        batch_info: &MlxBatchInfo,
+        caches: &mut [Option<MlxLayerKvCache>],
+    ) -> Result<Array, Exception> {
+        let normed = self.input_layernorm.forward(hidden_states)?;
+        let attn_output = self.self_attn.forward_batch(&normed, batch_info, caches)?;
+        let hidden_states = hidden_states.add(&attn_output)?;
+
+        let normed = self.post_attention_layernorm.forward(&hidden_states)?;
+        let mlp_output = self.block_sparse_moe.forward(&normed)?;
+        hidden_states.add(&mlp_output)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +445,40 @@ impl super::MlxModel for MlxMixtralForCausalLM {
 
     fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    fn forward_batch(
+        &mut self,
+        input_ids: &Array,
+        _positions: &Array,
+        batch_info: &MlxBatchInfo,
+        kv_caches: &mut [MlxKvCache],
+    ) -> mlx_rs::error::Result<Array> {
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let mut layer_caches: Vec<&mut Option<MlxLayerKvCache>> =
+                kv_caches.iter_mut().map(|kv| &mut kv[layer_idx]).collect();
+
+            let mut temp_caches: Vec<Option<MlxLayerKvCache>> =
+                layer_caches.iter_mut().map(|c| c.take()).collect();
+
+            hidden_states = layer.forward_batch(&hidden_states, batch_info, &mut temp_caches)?;
+
+            for (dst, src) in layer_caches.iter_mut().zip(temp_caches.into_iter()) {
+                **dst = src;
+            }
+        }
+
+        hidden_states = self.norm.forward(&hidden_states)?;
+
+        let logits = if self.tie_word_embeddings {
+            self.embed_tokens.as_linear(&hidden_states)?
+        } else {
+            self.lm_head.as_mut().unwrap().forward(&hidden_states)?
+        };
+
+        Ok(logits)
     }
 
     fn hidden_states(
@@ -654,6 +705,23 @@ impl MlxQuantizedMixtralDecoderLayer {
         let mlp_output = self.block_sparse_moe.forward(&normed)?;
         hidden_states.add(&mlp_output)
     }
+
+    /// Batched forward: norms and MoE run on `[total_tokens, hidden]`,
+    /// attention splits per-request for RoPE/KV/SDPA.
+    fn forward_batch(
+        &mut self,
+        hidden_states: &Array,
+        batch_info: &MlxBatchInfo,
+        caches: &mut [Option<MlxLayerKvCache>],
+    ) -> Result<Array, Exception> {
+        let normed = self.input_layernorm.forward(hidden_states)?;
+        let attn_output = self.self_attn.forward_batch(&normed, batch_info, caches)?;
+        let hidden_states = hidden_states.add(&attn_output)?;
+
+        let normed = self.post_attention_layernorm.forward(&hidden_states)?;
+        let mlp_output = self.block_sparse_moe.forward(&normed)?;
+        hidden_states.add(&mlp_output)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -752,6 +820,40 @@ impl super::MlxModel for MlxQuantizedMixtralForCausalLM {
 
     fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    fn forward_batch(
+        &mut self,
+        input_ids: &Array,
+        _positions: &Array,
+        batch_info: &MlxBatchInfo,
+        kv_caches: &mut [MlxKvCache],
+    ) -> mlx_rs::error::Result<Array> {
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let mut layer_caches: Vec<&mut Option<MlxLayerKvCache>> =
+                kv_caches.iter_mut().map(|kv| &mut kv[layer_idx]).collect();
+
+            let mut temp_caches: Vec<Option<MlxLayerKvCache>> =
+                layer_caches.iter_mut().map(|c| c.take()).collect();
+
+            hidden_states = layer.forward_batch(&hidden_states, batch_info, &mut temp_caches)?;
+
+            for (dst, src) in layer_caches.iter_mut().zip(temp_caches.into_iter()) {
+                **dst = src;
+            }
+        }
+
+        hidden_states = self.norm.forward(&hidden_states)?;
+
+        let logits = if self.tie_word_embeddings {
+            self.embed_tokens.as_linear(&hidden_states)?
+        } else {
+            self.lm_head.as_mut().unwrap().forward(&hidden_states)?
+        };
+
+        Ok(logits)
     }
 
     fn hidden_states(

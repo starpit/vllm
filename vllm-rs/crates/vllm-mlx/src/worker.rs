@@ -1219,7 +1219,17 @@ impl Worker for MlxWorker {
                 .map_err(|e| ExecutorError::WorkerExecution(format!("batch eval error: {e}")))?;
         }
 
-        // --- Phase C: Per-request sampling on now-materialized arrays ---
+        // --- Phase C: Sampling on now-materialized arrays ---
+        // First pass: compute prompt logprobs and classify requests for batched
+        // vs CPU-fallback sampling.
+
+        // Indices of requests that can be GPU-sampled (greedy or temperature-only).
+        let mut gpu_greedy: Vec<usize> = Vec::new();
+        // (req_idx, temperature) for GPU temp sampling, grouped later.
+        let mut gpu_temp: Vec<(usize, f32)> = Vec::new();
+        // Indices that need per-request CPU sampling or speculative verification.
+        let mut cpu_fallback: Vec<usize> = Vec::new();
+
         for (req_idx, req_input) in req_inputs.iter().enumerate() {
             let lazy_out = &lazy_outputs[req_idx];
 
@@ -1242,10 +1252,129 @@ impl Worker for MlxWorker {
                 prompt_logprobs_map.insert(req_input.req_id.clone(), plps);
             }
 
-            // --- Sample / verify speculative tokens ---
+            // Classify: speculative → CPU, grammar/penalties → CPU, else GPU.
+            if !req_input.spec_token_ids.is_empty() {
+                cpu_fallback.push(req_idx);
+                continue;
+            }
+
+            #[cfg(feature = "guided-decoding")]
+            let has_grammar = self
+                .grammar_states
+                .get(&req_input.req_id)
+                .is_some_and(|g| g.allowed_tokens().is_some());
+            #[cfg(not(feature = "guided-decoding"))]
+            let has_grammar = false;
+
+            let params = self.sampling_params_map.get(&req_input.req_id);
+            let needs_cpu = has_grammar
+                || params.is_some_and(|p| {
+                    p.repetition_penalty != 1.0
+                        || p.frequency_penalty != 0.0
+                        || p.presence_penalty != 0.0
+                        || p.min_p > 0.0
+                        || p.logit_bias.is_some()
+                        || p.logprobs.is_some()
+                        || (p.top_k > 0 || p.top_p < 1.0)
+                });
+
+            if needs_cpu {
+                cpu_fallback.push(req_idx);
+            } else if let Some(p) = params {
+                let temp = p.temperature as f32;
+                if temp < 1e-5 {
+                    gpu_greedy.push(req_idx);
+                } else {
+                    gpu_temp.push((req_idx, temp));
+                }
+            } else {
+                gpu_greedy.push(req_idx);
+            }
+        }
+
+        // --- Batched GPU greedy sampling: single argmax over stacked logits ---
+        if gpu_greedy.len() > 1 {
+            let logit_refs: Vec<Array> = gpu_greedy
+                .iter()
+                .map(|&i| lazy_outputs[i].last_logits.clone())
+                .collect();
+            let stacked = mlx_rs::ops::stack_axis(&logit_refs, 0)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("stack error: {e}")))?;
+            let indices = mlx_rs::ops::indexing::argmax_axis(&stacked, -1, None)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("argmax error: {e}")))?;
+            indices
+                .eval()
+                .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
+            let flat = indices.as_slice::<u32>();
+            for (batch_pos, &req_idx) in gpu_greedy.iter().enumerate() {
+                token_map.insert(req_inputs[req_idx].req_id.clone(), vec![flat[batch_pos]]);
+            }
+        } else if gpu_greedy.len() == 1 {
+            let req_idx = gpu_greedy[0];
+            let sampled = Self::greedy_sample(&lazy_outputs[req_idx].last_logits)?;
+            token_map.insert(req_inputs[req_idx].req_id.clone(), sampled);
+        }
+
+        // --- Batched GPU temperature sampling: group by temp, single categorical per group ---
+        if !gpu_temp.is_empty() {
+            // Group by temperature (quantize to 0.01 to allow batching of near-equal temps).
+            let mut temp_groups: HashMap<i32, Vec<usize>> = HashMap::new();
+            for &(req_idx, temp) in &gpu_temp {
+                let key = (temp * 100.0).round() as i32;
+                temp_groups.entry(key).or_default().push(req_idx);
+            }
+
+            for (temp_key, group) in &temp_groups {
+                let temp = *temp_key as f32 / 100.0;
+                if group.len() > 1 {
+                    let logit_refs: Vec<Array> = group
+                        .iter()
+                        .map(|&i| lazy_outputs[i].last_logits.clone())
+                        .collect();
+                    let stacked = mlx_rs::ops::stack_axis(&logit_refs, 0)
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("stack error: {e}")))?;
+                    let scaled = if temp < 1e-5 {
+                        stacked
+                    } else {
+                        stacked
+                            .as_dtype(Dtype::Float32)
+                            .and_then(|s| s.divide(Array::from_f32(temp)))
+                            .map_err(|e| {
+                                ExecutorError::WorkerExecution(format!("scale error: {e}"))
+                            })?
+                    };
+                    let sampled = if temp < 1e-5 {
+                        mlx_rs::ops::indexing::argmax_axis(&scaled, -1, None).map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("argmax error: {e}"))
+                        })?
+                    } else {
+                        mlx_rs::random::categorical(&scaled, None, None, None).map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("categorical error: {e}"))
+                        })?
+                    };
+                    sampled
+                        .eval()
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
+                    let flat = sampled.as_slice::<u32>();
+                    for (batch_pos, &req_idx) in group.iter().enumerate() {
+                        token_map.insert(req_inputs[req_idx].req_id.clone(), vec![flat[batch_pos]]);
+                    }
+                } else {
+                    let req_idx = group[0];
+                    let sampled =
+                        Self::sample_with_temperature(&lazy_outputs[req_idx].last_logits, temp)?;
+                    token_map.insert(req_inputs[req_idx].req_id.clone(), sampled);
+                }
+            }
+        }
+
+        // --- CPU fallback: per-request sampling for speculative/grammar/penalties ---
+        for &req_idx in &cpu_fallback {
+            let req_input = &req_inputs[req_idx];
+            let lazy_out = &lazy_outputs[req_idx];
+
             let sampled = if !req_input.spec_token_ids.is_empty() {
                 // Speculative decode verification (greedy).
-                // Full logits are already eval'd via Phase B.
                 let all_logits_f32 = lazy_out.full_logits_f32.as_ref().unwrap();
 
                 let vocab_size = all_logits_f32.dim(-1) as usize;
@@ -1293,7 +1422,6 @@ impl Worker for MlxWorker {
                 }
 
                 if accepted.is_empty() {
-                    // Fallback.
                     let last_row_start = (num_positions - 1) * vocab_size;
                     let last_row = &flat[last_row_start..last_row_start + vocab_size];
                     let argmax = last_row
@@ -1316,8 +1444,7 @@ impl Worker for MlxWorker {
                     accepted
                 }
             } else {
-                // Normal (non-speculative) decode path — use HEAD's lazy_out approach.
-                // Query grammar-allowed tokens if constrained decoding is active.
+                // CPU sampling with penalties/grammar/logprobs.
                 #[cfg(feature = "guided-decoding")]
                 let grammar_allowed: Option<Vec<u32>> = self
                     .grammar_states
@@ -1325,54 +1452,38 @@ impl Worker for MlxWorker {
                     .and_then(|g| g.allowed_tokens());
                 #[cfg(not(feature = "guided-decoding"))]
                 let grammar_allowed: Option<Vec<u32>> = None;
-                let has_grammar = grammar_allowed.is_some();
 
-                // Determine if we need CPU-side sampling.
-                let params = self.sampling_params_map.get(&req_input.req_id);
-                let needs_cpu_sampling = has_grammar
-                    || params.is_some_and(|p| {
-                        p.repetition_penalty != 1.0
-                            || p.frequency_penalty != 0.0
-                            || p.presence_penalty != 0.0
-                            || p.min_p > 0.0
-                            || p.logit_bias.is_some()
-                            || p.logprobs.is_some()
-                            || (p.top_k > 0 || p.top_p < 1.0)
-                    });
+                let logits_f32 = lazy_out.last_logits.as_dtype(Dtype::Float32).map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("dtype cast error: {e}"))
+                })?;
+                logits_f32
+                    .eval()
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
+                let flat = logits_f32.as_slice::<f32>();
 
-                if needs_cpu_sampling {
-                    // Logits are already eval'd via Phase B — just extract to CPU.
-                    let logits_f32 =
-                        lazy_out.last_logits.as_dtype(Dtype::Float32).map_err(|e| {
-                            ExecutorError::WorkerExecution(format!("dtype cast error: {e}"))
-                        })?;
-                    logits_f32
-                        .eval()
-                        .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
-                    let flat = logits_f32.as_slice::<f32>();
-
-                    let p = params.unwrap();
-                    let prev_tokens = self
-                        .token_buffers
-                        .get(&req_input.req_id)
-                        .map(|v| v.as_slice())
-                        .unwrap_or(&[]);
-                    let (token_id, maybe_logprobs) =
-                        cpu_sampler.sample_one(flat, p, prev_tokens, grammar_allowed.as_deref());
-                    if let Some(lp) = maybe_logprobs {
-                        logprobs_map
-                            .entry(req_input.req_id.clone())
-                            .or_default()
-                            .push(lp);
-                    }
-                    vec![token_id]
-                } else if let Some(p) = params {
-                    let temp = p.temperature as f32;
-                    Self::sample_with_temperature(&lazy_out.last_logits, temp)?
-                } else {
-                    Self::greedy_sample(&lazy_out.last_logits)?
+                let p = self.sampling_params_map.get(&req_input.req_id).unwrap();
+                let prev_tokens = self
+                    .token_buffers
+                    .get(&req_input.req_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                let (token_id, maybe_logprobs) =
+                    cpu_sampler.sample_one(flat, p, prev_tokens, grammar_allowed.as_deref());
+                if let Some(lp) = maybe_logprobs {
+                    logprobs_map
+                        .entry(req_input.req_id.clone())
+                        .or_default()
+                        .push(lp);
                 }
+                vec![token_id]
             };
+
+            token_map.insert(req_input.req_id.clone(), sampled);
+        }
+
+        // --- Post-sampling: update grammar states and token buffers ---
+        for (req_idx, req_input) in req_inputs.iter().enumerate() {
+            let sampled = token_map.get(&req_input.req_id).unwrap();
 
             // Advance grammar state with the sampled token.
             #[cfg(feature = "guided-decoding")]
@@ -1381,13 +1492,12 @@ impl Worker for MlxWorker {
             {
                 guide.advance(token_id);
             }
+            let _ = req_idx; // suppress unused warning
 
             // Update token buffer.
             if let Some(buf) = self.token_buffers.get_mut(&req_input.req_id) {
-                buf.extend_from_slice(&sampled);
+                buf.extend_from_slice(sampled);
             }
-
-            token_map.insert(req_input.req_id.clone(), sampled);
         }
 
         // Timing bookkeeping (aggregate for all requests in this batch).

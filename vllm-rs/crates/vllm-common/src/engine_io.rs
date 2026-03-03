@@ -214,6 +214,10 @@ pub struct SchedulerStats {
     pub num_waiting_reqs: usize,
     /// KV cache usage as a fraction in `[0.0, 1.0]`.
     pub kv_cache_usage: f64,
+    /// Number of GPU KV cache blocks currently in use.
+    pub gpu_cache_blocks_used: usize,
+    /// Total number of GPU KV cache blocks.
+    pub gpu_cache_blocks_total: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +514,8 @@ mod tests {
             num_running_reqs: 5,
             num_waiting_reqs: 3,
             kv_cache_usage: 0.42,
+            gpu_cache_blocks_used: 100,
+            gpu_cache_blocks_total: 1024,
         };
         assert_eq!(stats.num_running_reqs, 5);
         assert_eq!(stats.num_waiting_reqs, 3);

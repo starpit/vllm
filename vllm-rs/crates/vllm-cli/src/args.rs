@@ -23,6 +23,9 @@ pub enum Commands {
     Batch(BatchArgs),
     /// Convert model weights between formats (stub).
     Convert(ConvertArgs),
+    /// Live TUI dashboard — monitor a running vllm server.
+    #[cfg(feature = "top")]
+    Top(TopArgs),
 }
 
 /// Arguments for the `serve` subcommand.
@@ -349,6 +352,24 @@ pub struct ConvertArgs {
     /// Target dtype.
     #[arg(long, default_value = "f16")]
     pub dtype: String,
+}
+
+/// Arguments for the `top` subcommand.
+#[cfg(feature = "top")]
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm top [OPTIONS]")]
+pub struct TopArgs {
+    /// Server host to connect to.
+    #[arg(long, default_value = "localhost")]
+    pub host: String,
+
+    /// Server port to connect to.
+    #[arg(long, default_value_t = 8000)]
+    pub port: u16,
+
+    /// Poll interval in milliseconds.
+    #[arg(long, default_value_t = 1000)]
+    pub interval: u64,
 }
 
 // ---------------------------------------------------------------------------

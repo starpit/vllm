@@ -204,27 +204,48 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
 }
 
 /// Initialize cache on the worker and compute block counts.
+///
+/// On CPU, `gpu_memory_utilization` is ignored and a default of 50% is used
+/// instead (matching Python vLLM's `DEFAULT_CPU_MEM_UTILIZATION`). This
+/// prevents allocating most of system RAM for KV cache on CPU-only hosts.
 fn init_cache(
     mut worker: Box<dyn Worker>,
     block_size: usize,
     hf_config: &HfModelConfig,
     model_dtype: DType,
     gpu_memory_utilization: f64,
-) -> Result<(Box<dyn Worker>, usize, usize)> {
+    device: &str,
+) -> Result<(Box<dyn Worker>, usize, usize, f64)> {
     let available_memory = worker
         .determine_available_memory()
         .context("failed to determine available memory")?;
+
+    // CPU: ignore gpu_memory_utilization (default 0.9 is for GPU VRAM).
+    // Use 50% of system RAM, matching Python vLLM's DEFAULT_CPU_MEM_UTILIZATION.
+    let is_cpu = device == "cpu"
+        || (device == "auto" && !cfg!(feature = "cuda") && !cfg!(feature = "metal"));
+    let utilization = if is_cpu {
+        const DEFAULT_CPU_MEM_UTILIZATION: f64 = 0.5;
+        info!(
+            "CPU device: using {:.0}% of system memory for KV cache (override with --gpu-memory-utilization)",
+            DEFAULT_CPU_MEM_UTILIZATION * 100.0
+        );
+        DEFAULT_CPU_MEM_UTILIZATION
+    } else {
+        gpu_memory_utilization
+    };
+
     let num_gpu_blocks = compute_num_blocks(
         available_memory,
         block_size,
         hf_config,
         model_dtype,
-        gpu_memory_utilization,
+        utilization,
     );
     worker
         .initialize_cache(num_gpu_blocks, 0)
         .context("failed to initialize cache")?;
-    Ok((worker, available_memory, num_gpu_blocks))
+    Ok((worker, available_memory, num_gpu_blocks, utilization))
 }
 
 /// Initialize the full vLLM stack from a [`VllmConfig`].
@@ -279,18 +300,19 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         model_name, max_model_len, num_layers
     );
 
-    let (worker, available_memory, num_gpu_blocks) = init_cache(
+    let (worker, available_memory, num_gpu_blocks, effective_utilization) = init_cache(
         worker,
         config.block_size,
         &hf_config,
         model_dtype,
         config.gpu_memory_utilization,
+        &config.device,
     )?;
 
     info!(
-        "Available memory: {:.1} GB, gpu_memory_utilization={}, num_gpu_blocks={}",
+        "Available memory: {:.1} GB, memory_utilization={}, num_gpu_blocks={}",
         available_memory as f64 / (1024.0 * 1024.0 * 1024.0),
-        config.gpu_memory_utilization,
+        effective_utilization,
         num_gpu_blocks
     );
 
@@ -301,6 +323,13 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         max_model_len,
         kv_cache_tokens as f64 / max_model_len as f64
     );
+
+    // Set gpu_cache_blocks_total early so /stats shows it before first request.
+    #[cfg(feature = "metrics")]
+    {
+        let m = crate::metrics::VllmMetrics::global();
+        m.gpu_cache_blocks_total.set(num_gpu_blocks as i64);
+    }
 
     // 6. Wrap in UniProcExecutor (pre-initialized — skip init sequence).
     let executor = UniProcExecutor::new_pre_initialized(worker);
@@ -617,7 +646,7 @@ fn initialize_stack_tp(
         .context("failed to initialize cache")?;
 
     info!(
-        "Available memory (min): {:.1} GB, gpu_memory_utilization={}, num_gpu_blocks={}",
+        "Available memory (min): {:.1} GB, memory_utilization={}, num_gpu_blocks={}",
         min_available as f64 / (1024.0 * 1024.0 * 1024.0),
         config.gpu_memory_utilization,
         num_gpu_blocks
@@ -625,6 +654,12 @@ fn initialize_stack_tp(
 
     let kv_cache_tokens = num_gpu_blocks * config.block_size;
     info!("KV cache size: {} tokens", kv_cache_tokens);
+
+    #[cfg(feature = "metrics")]
+    {
+        let m = crate::metrics::VllmMetrics::global();
+        m.gpu_cache_blocks_total.set(num_gpu_blocks as i64);
+    }
 
     // Build engine config.
     let eos_token_ids: Vec<u32> = hf_config

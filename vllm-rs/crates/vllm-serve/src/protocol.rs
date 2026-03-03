@@ -842,6 +842,33 @@ pub struct VersionResponse {
     pub version: String,
 }
 
+/// JSON stats response for the `/stats` endpoint (used by `vllm top`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsResponse {
+    pub model_name: String,
+    pub version: String,
+    // counters (monotonic — client computes rates from deltas)
+    pub requests_total: u64,
+    pub requests_success: u64,
+    pub requests_failed: u64,
+    pub prompt_tokens_total: u64,
+    pub output_tokens_total: u64,
+    // gauges (instantaneous)
+    pub requests_active: i64,
+    pub num_requests_running: f64,
+    pub num_requests_waiting: f64,
+    pub kv_cache_usage: f64,
+    pub gpu_cache_blocks_used: i64,
+    pub gpu_cache_blocks_total: i64,
+    // histogram summaries (sum, count — client computes avg)
+    pub ttft_sum: f64,
+    pub ttft_count: u64,
+    pub itl_sum: f64,
+    pub itl_count: u64,
+    pub latency_sum: f64,
+    pub latency_count: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Embedding types
 // ---------------------------------------------------------------------------

@@ -7,3 +7,5 @@ pub mod batch;
 pub mod bench;
 pub mod convert;
 pub mod serve;
+#[cfg(feature = "top")]
+pub mod top;

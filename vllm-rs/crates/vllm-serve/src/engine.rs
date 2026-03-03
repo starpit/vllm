@@ -1092,6 +1092,10 @@ impl AsyncEngine {
                             m.num_requests_running.set(stats.num_running_reqs as f64);
                             m.num_requests_waiting.set(stats.num_waiting_reqs as f64);
                             m.kv_cache_usage_perc.set(stats.kv_cache_usage);
+                            m.gpu_cache_blocks_used
+                                .set(stats.gpu_cache_blocks_used as i64);
+                            m.gpu_cache_blocks_total
+                                .set(stats.gpu_cache_blocks_total as i64);
                         }
 
                         // 5. Route outputs to requests (brief lock).
@@ -2216,6 +2220,10 @@ async fn route_step_outputs(
             m.num_requests_running.set(stats.num_running_reqs as f64);
             m.num_requests_waiting.set(stats.num_waiting_reqs as f64);
             m.kv_cache_usage_perc.set(stats.kv_cache_usage);
+            m.gpu_cache_blocks_used
+                .set(stats.gpu_cache_blocks_used as i64);
+            m.gpu_cache_blocks_total
+                .set(stats.gpu_cache_blocks_total as i64);
         }
 
         if !engine_outputs.outputs.is_empty() {

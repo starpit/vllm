@@ -108,6 +108,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     #[cfg(feature = "metrics")]
     if state.config.metrics_enabled {
         router = router.route("/metrics", get(metrics));
+
+        #[cfg(feature = "top")]
+        {
+            router = router
+                .route("/stats", get(stats))
+                .route("/stats/live", get(stats_live));
+        }
     }
 
     let mut router = router.with_state(state.clone());
@@ -157,6 +164,11 @@ fn log_routes(state: &AppState) {
     info!("Route: /version, Methods: GET");
     if state.config.metrics_enabled {
         info!("Route: /metrics, Methods: GET");
+        #[cfg(feature = "top")]
+        {
+            info!("Route: /stats, Methods: GET");
+            info!("Route: /stats/live, Methods: GET (SSE)");
+        }
     }
 }
 
@@ -357,6 +369,99 @@ async fn version(State(state): State<Arc<AppState>>) -> Json<protocol::VersionRe
 #[cfg(feature = "metrics")]
 async fn metrics() -> String {
     crate::metrics::VllmMetrics::global().encode()
+}
+
+/// Collect current stats from the metrics singleton.
+#[cfg(all(feature = "metrics", feature = "top"))]
+fn collect_stats(state: &AppState) -> protocol::StatsResponse {
+    let m = crate::metrics::VllmMetrics::global();
+    let families = m.registry.gather();
+    let mut ttft_sum = 0.0;
+    let mut ttft_count = 0u64;
+    let mut itl_sum = 0.0;
+    let mut itl_count = 0u64;
+    let mut latency_sum = 0.0;
+    let mut latency_count = 0u64;
+    for mf in &families {
+        for metric in mf.get_metric() {
+            let h = metric.get_histogram();
+            match mf.get_name() {
+                "vllm_time_to_first_token_seconds" => {
+                    ttft_sum = h.get_sample_sum();
+                    ttft_count = h.get_sample_count();
+                }
+                "vllm_inter_token_latency_seconds" => {
+                    itl_sum = h.get_sample_sum();
+                    itl_count = h.get_sample_count();
+                }
+                "vllm_request_latency_seconds" => {
+                    latency_sum = h.get_sample_sum();
+                    latency_count = h.get_sample_count();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    protocol::StatsResponse {
+        model_name: state.engine.model_name().to_string(),
+        version: state.config.version.clone(),
+        requests_total: m.requests_total.get(),
+        requests_success: m.requests_success_total.get(),
+        requests_failed: m.requests_failed_total.get(),
+        prompt_tokens_total: m.prompt_tokens_total.get(),
+        output_tokens_total: m.output_tokens_total.get(),
+        requests_active: m.requests_active.get(),
+        num_requests_running: m.num_requests_running.get(),
+        num_requests_waiting: m.num_requests_waiting.get(),
+        kv_cache_usage: m.kv_cache_usage_perc.get(),
+        gpu_cache_blocks_used: m.gpu_cache_blocks_used.get(),
+        gpu_cache_blocks_total: m.gpu_cache_blocks_total.get(),
+        ttft_sum,
+        ttft_count,
+        itl_sum,
+        itl_count,
+        latency_sum,
+        latency_count,
+    }
+}
+
+/// GET /stats — JSON stats snapshot (for `vllm top` initial fetch).
+#[cfg(all(feature = "metrics", feature = "top"))]
+async fn stats(State(state): State<Arc<AppState>>) -> Json<protocol::StatsResponse> {
+    Json(collect_stats(&state))
+}
+
+/// GET /stats/live?interval=1000 — SSE stream of stats snapshots.
+#[cfg(all(feature = "metrics", feature = "top"))]
+async fn stats_live(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<StatsLiveParams>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let interval_ms = params.interval.unwrap_or(1000).clamp(100, 30_000);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+        loop {
+            ticker.tick().await;
+            let snap = collect_stats(&state);
+            let Ok(json) = serde_json::to_string(&snap) else {
+                continue;
+            };
+            if tx.send(Ok(Event::default().data(json))).is_err() {
+                break; // client disconnected
+            }
+        }
+    });
+
+    Sse::new(UnboundedReceiverStream::new(rx)).keep_alive(KeepAlive::default())
+}
+
+#[cfg(all(feature = "metrics", feature = "top"))]
+#[derive(serde::Deserialize)]
+struct StatsLiveParams {
+    interval: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

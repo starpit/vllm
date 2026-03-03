@@ -99,6 +99,12 @@ pub trait SchedulerInterface {
     /// KV cache usage as a fraction in `[0.0, 1.0]`.
     fn kv_cache_usage(&self) -> f64;
 
+    /// Total number of GPU KV cache blocks.
+    fn num_total_blocks(&self) -> usize;
+
+    /// Number of GPU KV cache blocks currently in use.
+    fn num_used_blocks(&self) -> usize;
+
     /// Shut down the scheduler.
     fn shutdown(&mut self);
 }

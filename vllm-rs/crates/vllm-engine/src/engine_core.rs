@@ -347,13 +347,25 @@ impl EngineCore {
         scheduler_output: &SchedulerOutput,
         model_output: &ModelRunnerOutput,
     ) -> StepOutputs {
-        // 1. Process any pending aborts.
+        // 1. Snapshot scheduler stats BEFORE processing outputs (which frees
+        //    blocks for finished requests). This gives an accurate view of
+        //    blocks in use during the step.
+        let (num_running, num_waiting) = self.scheduler.get_request_counts();
+        let stats = SchedulerStats {
+            num_running_reqs: num_running,
+            num_waiting_reqs: num_waiting,
+            kv_cache_usage: self.scheduler.kv_cache_usage(),
+            gpu_cache_blocks_used: self.scheduler.num_used_blocks(),
+            gpu_cache_blocks_total: self.scheduler.num_total_blocks(),
+        };
+
+        // 2. Process any pending aborts.
         self.process_aborts_queue();
 
-        // 2. Update scheduler state and build outputs.
+        // 3. Update scheduler state and build outputs.
         let mut outputs = self.update_from_output(scheduler_output, model_output);
 
-        // 3. Propose speculative draft tokens for running requests.
+        // 4. Propose speculative draft tokens for running requests.
         if let Some(ref proposer) = self.ngram_proposer {
             for req_id in scheduler_output.num_scheduled_tokens.keys() {
                 let should_propose = self
@@ -378,13 +390,7 @@ impl EngineCore {
             }
         }
 
-        // 4. Attach scheduler stats to outputs.
-        let (num_running, num_waiting) = self.scheduler.get_request_counts();
-        let stats = SchedulerStats {
-            num_running_reqs: num_running,
-            num_waiting_reqs: num_waiting,
-            kv_cache_usage: self.scheduler.kv_cache_usage(),
-        };
+        // 5. Attach pre-captured scheduler stats to outputs.
         for engine_outputs in outputs.values_mut() {
             engine_outputs.scheduler_stats = Some(stats);
         }

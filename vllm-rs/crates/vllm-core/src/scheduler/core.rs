@@ -67,6 +67,9 @@ pub trait KVCacheManagerOps: Send {
     /// Number of free blocks available.
     fn num_free_blocks(&self) -> usize;
 
+    /// Total number of blocks.
+    fn num_total_blocks(&self) -> usize;
+
     /// Block size (tokens per block).
     fn block_size(&self) -> usize;
 
@@ -189,6 +192,10 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         self.free_blocks
     }
 
+    fn num_total_blocks(&self) -> usize {
+        self.total_blocks
+    }
+
     fn block_size(&self) -> usize {
         self.block_size
     }
@@ -308,6 +315,16 @@ impl Scheduler {
     /// KV cache usage as a fraction in `[0.0, 1.0]`.
     pub fn kv_cache_usage(&self) -> f64 {
         self.kv_cache.usage()
+    }
+
+    /// Total number of GPU KV cache blocks.
+    pub fn num_total_blocks(&self) -> usize {
+        self.kv_cache.num_total_blocks()
+    }
+
+    /// Number of GPU KV cache blocks currently in use.
+    pub fn num_used_blocks(&self) -> usize {
+        self.kv_cache.num_total_blocks() - self.kv_cache.num_free_blocks()
     }
 
     // -- Internal helpers --
@@ -886,6 +903,14 @@ impl SchedulerInterface for Scheduler {
 
     fn kv_cache_usage(&self) -> f64 {
         self.kv_cache.usage()
+    }
+
+    fn num_total_blocks(&self) -> usize {
+        self.kv_cache.num_total_blocks()
+    }
+
+    fn num_used_blocks(&self) -> usize {
+        self.kv_cache.num_total_blocks() - self.kv_cache.num_free_blocks()
     }
 
     fn shutdown(&mut self) {

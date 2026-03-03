@@ -729,6 +729,74 @@ async fn test_sync_scheduling_smollm_chat() {
 }
 
 // ===========================================================================
+// Granite (IBM) — GraniteForCausalLM, MLX 4-bit quantized (~1.3 GB)
+// ===========================================================================
+// Granite is architecturally identical to LLaMA with 4 scalar multipliers.
+// MLX 4-bit quantized model for Apple Silicon testing.
+//
+// Run with: cargo test -p vllm-e2e --features e2e,metal --release --test e1_basic_serving test_granite -- --ignored
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_granite_server_starts() {
+    let server = TestServer::builder(TestModels::GRANITE_3_3_2B_4BIT)
+        .start()
+        .await
+        .expect("Granite server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let models = client.list_models().await.unwrap();
+    assert_eq!(models.data.len(), 1);
+    assert!(
+        models.data[0].id.contains("granite"),
+        "model name should contain 'granite', got: {}",
+        models.data[0].id
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_granite_completion() {
+    let server = TestServer::builder(TestModels::GRANITE_3_3_2B_4BIT)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "completion should not be empty"
+    );
+}
+
+/// Granite's chat template uses `strftime_now` which our Jinja engine
+/// doesn't support yet, so test with a second completion prompt instead.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_granite_completion_coherent() {
+    let server = TestServer::builder(TestModels::GRANITE_3_3_2B_4BIT)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("Once upon a time", 30);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "completion should not be empty"
+    );
+}
+
+// ===========================================================================
 // CUDA E2E tests — safetensors models that actually run on GPU
 // ===========================================================================
 // These use non-quantized safetensors models (not MLX 4-bit) so that
@@ -928,6 +996,96 @@ async fn test_cuda_tp2_qwen2_completion() {
     assert!(
         !text.is_empty(),
         "TP=2 completion should produce non-empty text"
+    );
+}
+
+// ===========================================================================
+// CUDA Granite — safetensors BF16 (~4.5 GB) on GPU
+// ===========================================================================
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_granite -- --ignored
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_granite_completion() {
+    let server = TestServer::builder(TestModels::GRANITE_3_3_2B_INSTRUCT)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "completion should not be empty"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_granite_completion_coherent() {
+    let server = TestServer::builder(TestModels::GRANITE_3_3_2B_INSTRUCT)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("Once upon a time", 30);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "completion should not be empty"
+    );
+}
+
+// ===========================================================================
+// CUDA Granite GGUF — quantized on GPU
+// ===========================================================================
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_granite_gguf -- --ignored
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_granite_gguf_completion() {
+    let server = TestServer::builder(TestModels::GRANITE_3_3_2B_INSTRUCT_GGUF)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "completion should not be empty"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_granite_gguf_completion_coherent() {
+    let server = TestServer::builder(TestModels::GRANITE_3_3_2B_INSTRUCT_GGUF)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("Once upon a time", 30);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "completion should not be empty"
     );
 }
 

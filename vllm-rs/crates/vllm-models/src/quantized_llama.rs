@@ -21,14 +21,14 @@ use crate::llama::LlamaConfig;
 // ---------------------------------------------------------------------------
 
 /// LLaMA MLP with quantized linear projections.
-struct QuantizedLlamaMLP {
+pub(crate) struct QuantizedLlamaMLP {
     gate_proj: QuantizedLinear,
     up_proj: QuantizedLinear,
     down_proj: QuantizedLinear,
 }
 
 impl QuantizedLlamaMLP {
-    fn load(gguf: &mut GgufFile, prefix: &str, device: &Device) -> ModelResult<Self> {
+    pub(crate) fn load(gguf: &mut GgufFile, prefix: &str, device: &Device) -> ModelResult<Self> {
         Ok(Self {
             gate_proj: QuantizedLinear::from_gguf(
                 gguf,
@@ -62,7 +62,7 @@ impl Module for QuantizedLlamaMLP {
 ///
 /// Uses interleaved RoPE (GGML convention) rather than half-split RoPE
 /// (HuggingFace convention) because GGUF weights are stored in GGML layout.
-struct QuantizedLlamaAttention {
+pub(crate) struct QuantizedLlamaAttention {
     q_proj: QuantizedLinear,
     k_proj: QuantizedLinear,
     v_proj: QuantizedLinear,
@@ -74,7 +74,7 @@ struct QuantizedLlamaAttention {
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    scale: f64,
+    pub(crate) scale: f64,
     sliding_window: Option<usize>,
 }
 
@@ -172,7 +172,7 @@ pub(crate) fn apply_interleaved_rope(
 }
 
 impl QuantizedLlamaAttention {
-    fn load(
+    pub(crate) fn load(
         gguf: &mut GgufFile,
         prefix: &str,
         config: &LlamaConfig,
@@ -201,7 +201,7 @@ impl QuantizedLlamaAttention {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &self,
         hidden_states: &Tensor,
         positions: &Tensor,

@@ -22,11 +22,13 @@ pub mod gemma3_mm;
 pub mod gptq_llama;
 #[cfg(feature = "guided-decoding")]
 pub mod grammar;
+pub mod granite;
 pub mod kv_block_pool;
 pub mod llama;
 pub mod mixtral;
 pub mod ops;
 pub mod quantized_gemma3;
+pub mod quantized_granite;
 pub mod quantized_llama;
 pub mod qwen2;
 pub mod qwen2_vl;

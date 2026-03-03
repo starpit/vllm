@@ -12,6 +12,7 @@ pub mod deepseek_v2;
 pub mod gemma2;
 pub mod gemma3;
 pub mod gemma3_mm;
+pub mod granite;
 pub mod llama;
 pub mod mixtral;
 pub mod phi3;
@@ -193,6 +194,8 @@ impl MlxModelRegistry {
             "Gemma3ForConditionalGeneration",
             gemma3_mm::create_mlx_quantized_gemma3_mm,
         );
+        // Granite (IBM) — LLaMA with embedding/residual/attention/logit multipliers
+        registry.register_quantized("GraniteForCausalLM", granite::create_mlx_quantized_granite);
         // Phi-3 (fused qkv_proj + gate_up_proj)
         registry.register("Phi3ForCausalLM", phi3::create_mlx_phi3);
         registry.register_quantized("Phi3ForCausalLM", phi3::create_mlx_quantized_phi3);

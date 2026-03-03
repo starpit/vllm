@@ -39,10 +39,10 @@ cargo test -p vllm-e2e --features e2e,metal --test e_llm_api -- --ignored --test
 cargo test -p vllm-e2e --features e2e,metal --test e1_basic_serving test_t1_smollm_chat_basic -- --ignored
 
 # CUDA E2E tests — safetensors models (requires NVIDIA GPU):
-cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_smollm test_cuda_qwen -- --ignored --test-threads=1
+cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_smollm test_cuda_qwen test_cuda_granite -- --ignored --test-threads=1
 
 # CUDA E2E tests — GGUF quantized models (requires NVIDIA GPU):
-cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gguf -- --ignored --test-threads=1
+cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gguf test_cuda_granite_gguf -- --ignored --test-threads=1
 
 # CUDA MoE kernel unit tests (any NVIDIA GPU):
 cargo test -p vllm-kernels --features cuda -- test_cuda_moe
@@ -118,6 +118,7 @@ impl TestModels {
     const GEMMA3_270M_4BIT: &str = "mlx-community/gemma-3-270m-it-qat-4bit";       // ~900 MB, Gemma3ForCausalLM
 
     // Tier 3: Medium (1–3 GB) — nightly only
+    const GRANITE_3_3_2B_4BIT: &str = "mlx-community/granite-3.3-2b-instruct-4bit"; // ~1.3 GB, GraniteForCausalLM
     const GEMMA2_2B_4BIT: &str = "mlx-community/gemma-2-2b-it-4bit";              // ~1.4 GB, Gemma2ForCausalLM
     const PHI3_5_MINI_4BIT: &str = "mlx-community/Phi-3.5-mini-instruct-4bit";    // ~2.15 GB, Phi3ForCausalLM
     const PHI4_MINI_4BIT: &str = "mlx-community/Unsloth-Phi-4-mini-instruct-4bit"; // ~2.3 GB, Phi3ForCausalLM (LongRoPE + partial_rotary_factor)
@@ -142,6 +143,10 @@ impl TestModels {
     // BitsAndBytes quantized models (MLX dequant-at-load or candle)
     const LLAMA_3_2_1B_BNB_4BIT: &str = "unsloth/Llama-3.2-1B-Instruct-bnb-4bit"; // ~600 MB, LlamaForCausalLM
     const TINYLLAMA_1B_BNB_8BIT: &str = "Jiqing/TinyLlama-1.1B-Chat-v1.0-bnb-8bit"; // ~1.1 GB, LlamaForCausalLM
+
+    // Granite (IBM) — safetensors BF16 and GGUF (candle/CUDA)
+    const GRANITE_3_3_2B_INSTRUCT: &str = "ibm-granite/granite-3.3-2b-instruct";   // ~4.5 GB BF16, GraniteForCausalLM
+    const GRANITE_3_3_2B_INSTRUCT_GGUF: &str = "ibm-granite/granite-3.3-2b-instruct-GGUF"; // ~1.5 GB Q4_K_M, GraniteForCausalLM
 
     // Multimodal (vision-language) models
     const GEMMA3_4B_IT_QAT_3BIT: &str = "mlx-community/gemma-3-4b-it-qat-3bit";  // ~2.8 GB, Gemma3ForConditionalGeneration (MLX)
@@ -183,6 +188,7 @@ For each model in the test matrix:
 
 | Model | Architecture | Quantized |
 |-------|-------------|-----------|
+| granite-3.3-2b-instruct-4bit | GraniteForCausalLM | Yes (MLX 4-bit) |
 | gemma-2-2b-it-4bit | Gemma2ForCausalLM | Yes (4-bit) |
 | Phi-3.5-mini-instruct-4bit | Phi3ForCausalLM | Yes (4-bit) |
 | Unsloth-Phi-4-mini-instruct-4bit | Phi3ForCausalLM (LongRoPE) | Yes (4-bit) |
@@ -802,6 +808,7 @@ cargo test -p vllm-e2e --features e2e,metal --release --test e_batch -- --ignore
 | Qwen3 MoE | Qwen3MoeForCausalLM | Qwen3-MOE-4x0.6B-2.4B-mlx-4Bit | ~1.5 GB | Nightly | — | Yes |
 | Mixtral MoE | MixtralForCausalLM | Mixtral-SlimOrca-8x7B-3bit | ~18 GB | Manual | — | Yes |
 | Command R | CohereForCausalLM | c4ai-command-r-08-2024-4bit | 16.9 GB | Manual | — | Yes |
+| Granite (IBM) | GraniteForCausalLM | granite-3.3-2b-instruct-4bit (MLX) | ~1.3 GB | Nightly | BF16 + GGUF (CUDA) | Yes |
 | Gemma v1 | GemmaForCausalLM | (deferred — 2B model at 2 GB) | — | — | — | — |
 
 | Gemma3 VLM (MLX) | Gemma3ForConditionalGeneration | gemma-3-4b-it-qat-3bit | 2.8 GB | Nightly | — | Yes |
@@ -983,6 +990,52 @@ cargo test -p vllm-kernels --features cuda -- test_cuda_moe
 ```
 
 **Deliverables**: 5 CUDA kernel unit tests (all verified on L40S). 3 E2E tests written, awaiting larger GPU.
+
+---
+
+## Phase E22: Granite (IBM) — DONE
+
+Test file: `e1_basic_serving.rs` (Granite sections)
+
+Granite is architecturally identical to LLaMA with 4 scalar multipliers: `embedding_multiplier`, `residual_multiplier`, `attention_multiplier`, `logits_scaling`. Tests cover all three backends: MLX (4-bit quantized), CUDA safetensors (BF16), and CUDA GGUF (Q4_K_M).
+
+**Note**: Granite's chat template uses `strftime_now` which our Jinja engine doesn't support, so tests use completion prompts instead of chat.
+
+### MLX path (Tier 3, nightly)
+
+| Test | Model | What it validates |
+|---|---|---|
+| `test_granite_server_starts` | granite-3.3-2b-instruct-4bit | Server starts, /health + /v1/models |
+| `test_granite_completion` | granite-3.3-2b-instruct-4bit | Completion generates non-empty text |
+| `test_granite_completion_coherent` | granite-3.3-2b-instruct-4bit | Second prompt produces non-empty text |
+
+### CUDA safetensors path (BF16, requires NVIDIA GPU)
+
+| Test | Model | What it validates |
+|---|---|---|
+| `test_cuda_granite_completion` | granite-3.3-2b-instruct | BF16 safetensors on GPU, completion works |
+| `test_cuda_granite_completion_coherent` | granite-3.3-2b-instruct | Second prompt on GPU |
+
+### CUDA GGUF path (quantized, requires NVIDIA GPU)
+
+| Test | Model | What it validates |
+|---|---|---|
+| `test_cuda_granite_gguf_completion` | granite-3.3-2b-instruct-GGUF | GGUF quantized on GPU, completion works |
+| `test_cuda_granite_gguf_completion_coherent` | granite-3.3-2b-instruct-GGUF | Second prompt on GPU |
+
+Run commands:
+```bash
+# MLX (Apple Silicon):
+cargo test -p vllm-e2e --features e2e,metal --release --test e1_basic_serving test_granite -- --ignored --test-threads=1
+
+# CUDA safetensors:
+cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_granite -- --ignored --test-threads=1
+
+# CUDA GGUF:
+cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_granite_gguf -- --ignored --test-threads=1
+```
+
+**Deliverables**: 7 E2E tests (3 MLX + 2 CUDA safetensors + 2 CUDA GGUF), all verified.
 
 ---
 

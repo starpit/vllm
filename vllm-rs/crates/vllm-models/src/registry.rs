@@ -84,6 +84,8 @@ impl ModelRegistry {
             "Gemma3ForConditionalGeneration",
             crate::gemma3_mm::create_gemma3_mm,
         );
+        // Granite (IBM) — LLaMA with embedding/residual/attention/logit multipliers
+        self.register("GraniteForCausalLM", crate::granite::create_granite);
         // DeepSeek V2/V3 — MLA attention + MoE + YaRN RoPE
         self.register(
             "DeepseekV2ForCausalLM",
@@ -115,6 +117,7 @@ impl ModelRegistry {
 
         // --- GGUF factories (keyed by GGUF general.architecture value) ---
         self.register_gguf("llama", crate::quantized_llama::create_llama_gguf);
+        self.register_gguf("granite", crate::quantized_granite::create_granite_gguf);
         // Mistral/Phi GGUF files use "llama" architecture internally.
         self.register_gguf("gemma3", crate::quantized_gemma3::create_gemma3_gguf);
 

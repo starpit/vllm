@@ -67,6 +67,13 @@ impl TestModels {
     // Too large for L40S (48GB); enable when A100-80GB or H100 is available.
     // pub const QWEN_MOE_A2_7B_CUDA: &str = "Qwen/Qwen1.5-MoE-A2.7B-Chat";
 
+    // Granite (IBM) — MLX 4-bit quantized
+    pub const GRANITE_3_3_2B_4BIT: &str = "mlx-community/granite-3.3-2b-instruct-4bit";
+    // Granite (IBM) — safetensors BF16, candle backend (CUDA)
+    pub const GRANITE_3_3_2B_INSTRUCT: &str = "ibm-granite/granite-3.3-2b-instruct";
+    // Granite GGUF — quantized, candle backend (CUDA)
+    pub const GRANITE_3_3_2B_INSTRUCT_GGUF: &str = "ibm-granite/granite-3.3-2b-instruct-GGUF";
+
     // Multimodal (vision-language) models
     // Tier 3: ~2.8 GB — nightly only (QAT = quantization-aware training)
     pub const GEMMA3_4B_IT_QAT_3BIT: &str = "mlx-community/gemma-3-4b-it-qat-3bit";

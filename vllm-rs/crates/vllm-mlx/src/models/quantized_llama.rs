@@ -313,7 +313,7 @@ pub struct MlxQuantizedLlamaAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    scale: f32,
+    pub(crate) scale: f32,
     sliding_window: Option<usize>,
 }
 

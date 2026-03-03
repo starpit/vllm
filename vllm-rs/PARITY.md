@@ -82,6 +82,8 @@
 | Qwen3 MoE | &#x1F535; | &#x1F535; | 8 | 0 | |
 | Qwen3 Next (hybrid linear attn) | &#x1F535; | &#x1F535; | 26 | 3 | |
 | Mixtral (MoE) | &#x1F535; | &#x1F535; | 7 | 0 | |
+| Granite (IBM) | &#x1F535; | &#x1F535; | 3 | 4 | |
+| Quantized Granite (GGUF) | &#x1F535; | &#x1F535; | 0 | 2 | |
 | GPT-NeoX | &#x1F535; | &#x1F534; | — | — | P1 |
 | GPT-J | &#x1F535; | &#x1F534; | — | — | P1 |
 | Falcon | &#x1F535; | &#x1F534; | — | — | P1 |
@@ -142,6 +144,7 @@
 | Qwen3 Next (hybrid GDN + full attn + MoE, float) | N/A | &#x1F535; | 3 | 0 | |
 | Quantized Qwen3 Next (4-bit) | N/A | &#x1F535; | 0 | 0 | |
 | Quantized Mixtral (MoE, 4-bit) | N/A | &#x1F535; | 0 | 0 | |
+| Quantized Granite (4-bit) | N/A | &#x1F535; | 0 | 3 | |
 
 > Python vLLM does not have an MLX backend. The Rust MLX backend is unique to the Rust port. All E2E tests use `mlx-community` models and exercise the MLX backend (`--features metal`). MLX unit tests require `--test-threads=1`.
 

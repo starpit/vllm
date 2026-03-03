@@ -294,7 +294,7 @@ pub struct LlamaAttention {
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    scale: f64,
+    pub(crate) scale: f64,
     sliding_window: Option<usize>,
     /// Layer index for extracting the correct per-layer KV handle in batched forward.
     layer_idx: usize,

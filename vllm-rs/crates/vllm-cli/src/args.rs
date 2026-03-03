@@ -214,14 +214,14 @@ pub enum BenchCommands {
 
 /// Arguments for `vllm bench latency`.
 #[derive(Parser, Debug)]
-#[command(override_usage = "vllm bench latency [MODEL] [OPTIONS]")]
+#[command(override_usage = "vllm bench latency [MODEL...] [OPTIONS]")]
 pub struct BenchLatencyArgs {
-    /// Model: local path or HuggingFace model ID.
-    pub model_tag: Option<String>,
+    /// Model(s): local path or HuggingFace model ID (positional, repeatable).
+    pub model_tags: Vec<String>,
 
-    /// Path to a local model directory, or HuggingFace model ID.
-    #[arg(long, env = "VLLM_MODEL")]
-    pub model: Option<String>,
+    /// Path to a local model directory, or HuggingFace model ID (repeatable, comma-separated).
+    #[arg(short = 'm', long = "model", env = "VLLM_MODEL", value_delimiter = ',')]
+    pub models: Vec<String>,
 
     /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
     #[arg(long, default_value = "auto")]
@@ -232,7 +232,7 @@ pub struct BenchLatencyArgs {
     pub dtype: String,
 
     /// Number of benchmark iterations.
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 30)]
     pub num_iters: usize,
 
     /// Input prompt length in tokens.
@@ -240,16 +240,25 @@ pub struct BenchLatencyArgs {
     pub input_len: usize,
 
     /// Number of output tokens per iteration.
-    #[arg(long, default_value_t = 64)]
+    #[arg(long, default_value_t = 128)]
     pub output_len: usize,
 
     /// Number of warmup iterations before timing.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 10)]
     pub num_iters_warmup: usize,
 
-    /// Number of requests per iteration (batch size).
-    #[arg(long, default_value_t = 8)]
-    pub batch_size: usize,
+    /// Number of requests per iteration (batch size). Repeatable/comma-separated.
+    #[arg(
+        short = 'b',
+        long = "batch-size",
+        value_delimiter = ',',
+        default_value = "8"
+    )]
+    pub batch_sizes: Vec<usize>,
+
+    /// Percentiles to display (comma-separated, e.g. 10,50,90,99).
+    #[arg(long = "percentile", value_delimiter = ',', default_value = "50")]
+    pub percentiles: Vec<f64>,
 
     /// HuggingFace token.
     #[arg(long, env = "HF_TOKEN")]
@@ -283,14 +292,14 @@ pub struct BenchLatencyArgs {
 }
 
 impl BenchLatencyArgs {
-    /// Resolve the effective model path/ID.
-    pub fn resolved_model(&self) -> Result<String, String> {
-        if let Some(ref tag) = self.model_tag {
-            Ok(tag.clone())
-        } else if let Some(ref m) = self.model {
-            Ok(m.clone())
-        } else {
+    /// Resolve the list of models by merging positional and --model values.
+    pub fn resolved_models(&self) -> Result<Vec<String>, String> {
+        let mut all: Vec<String> = self.model_tags.clone();
+        all.extend(self.models.clone());
+        if all.is_empty() {
             Err("model is required: provide as positional arg or --model flag".to_string())
+        } else {
+            Ok(all)
         }
     }
 }

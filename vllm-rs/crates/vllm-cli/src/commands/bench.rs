@@ -3,11 +3,9 @@
 
 //! `vllm bench` subcommand — benchmarking tools.
 //!
-//! `vllm bench latency` measures end-to-end latency of processing a single
-//! batch of requests, matching the Python `vllm bench latency` behavior.
-//!
-//! Uses the full engine stack (`LLM` → `AsyncEngine` → scheduler → worker)
-//! rather than driving the worker directly.
+//! `vllm bench latency` measures end-to-end latency of processing batches of
+//! requests. Supports multiple models and batch sizes, displaying results as a
+//! formatted matrix table.
 
 use std::time::Instant;
 
@@ -53,47 +51,50 @@ fn create_llm(args: &BenchLatencyArgs, model: &str) -> Result<LLM> {
 }
 
 // ---------------------------------------------------------------------------
+// Result type
+// ---------------------------------------------------------------------------
+
+struct BenchResult {
+    model: String,
+    batch_size: usize,
+    latencies: Vec<f64>,
+}
+
+impl BenchResult {
+    fn avg_latency(&self) -> f64 {
+        self.latencies.iter().sum::<f64>() / self.latencies.len() as f64
+    }
+
+    fn percentile_value(&self, p: f64) -> f64 {
+        percentile(&self.latencies, p)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bench runner
 // ---------------------------------------------------------------------------
 
-/// Run the `bench latency` subcommand.
-///
-/// Mirrors Python `vllm bench latency`: creates an LLM, generates
-/// `batch_size` dummy-token prompts of length `input_len`, and times
-/// each `generate()` call.
-///
-/// This is deliberately **not** async — `LLM` owns its own tokio runtime,
-/// so it must not be created inside an existing runtime.
 fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
     telemetry::init_tracing(&args.log_level);
 
-    let model = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
+    let models = args.resolved_models().map_err(|e| anyhow::anyhow!(e))?;
+    let batch_sizes = &args.batch_sizes;
+    let pcts = &args.percentiles;
 
     eprintln!("vLLM Rust — latency benchmark");
     eprintln!(
-        "Model: {}, device: {}, dtype: {}",
-        model, args.device, args.dtype
+        "Models: {:?}, batch_sizes: {:?}, percentiles: {:?}",
+        models, batch_sizes, pcts
     );
     eprintln!(
-        "Iters: {}, batch_size: {}, input_len: {}, output_len: {}, warmup: {}",
-        args.num_iters, args.batch_size, args.input_len, args.output_len, args.num_iters_warmup
+        "Iters: {}, input_len: {}, output_len: {}, warmup: {}",
+        args.num_iters, args.input_len, args.output_len, args.num_iters_warmup
     );
 
-    // Initialize the full engine stack.
-    let load_start = Instant::now();
-    let llm = create_llm(&args, &model)?;
-    let load_elapsed = load_start.elapsed();
-    eprintln!("Model loaded in {:.2}s", load_elapsed.as_secs_f64());
-
-    // Build dummy prompts: batch_size prompts of input_len random-ish token IDs.
-    // Mirrors Python: `np.random.randint(10000, size=(batch_size, input_len))`
-    let dummy_prompts: Vec<Vec<u32>> = (0..args.batch_size)
-        .map(|i| {
-            (0..args.input_len)
-                .map(|j| ((i * 997 + j * 31 + 42) % 10000) as u32)
-                .collect()
-        })
-        .collect();
+    let bar_style = ProgressStyle::with_template(
+        "{msg}: {wide_bar:.cyan/blue} {pos}/{len} [{elapsed_precise}<{eta_precise}, {per_sec}]",
+    )
+    .unwrap();
 
     let sampling_params = SamplingParams {
         temperature: 1.0,
@@ -103,80 +104,229 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
-    let bar_style = ProgressStyle::with_template(
-        "{msg}: {wide_bar:.cyan/blue} {pos}/{len} [{elapsed_precise}<{eta_precise}, {per_sec}]",
-    )
-    .unwrap();
+    let mut results: Vec<BenchResult> = Vec::new();
 
-    // Warmup.
-    if args.num_iters_warmup > 0 {
-        let pb = ProgressBar::new(args.num_iters_warmup as u64)
+    for model in &models {
+        eprintln!("\nLoading model: {model}");
+        let load_start = Instant::now();
+        let llm = create_llm(&args, model)?;
+        eprintln!("Model loaded in {:.2}s", load_start.elapsed().as_secs_f64());
+
+        let total_iters = (args.num_iters_warmup + args.num_iters) * batch_sizes.len();
+        let pb = ProgressBar::new(total_iters as u64)
             .with_style(bar_style.clone())
-            .with_message("Warmup iterations");
-        for _ in 0..args.num_iters_warmup {
-            llm.generate_token_ids(&dummy_prompts, Some(sampling_params.clone()))?;
-            pb.inc(1);
+            .with_message(short_model_name(model));
+
+        for &bs in batch_sizes {
+            let dummy_prompts: Vec<Vec<u32>> = (0..bs)
+                .map(|i| {
+                    (0..args.input_len)
+                        .map(|j| ((i * 997 + j * 31 + 42) % 10000) as u32)
+                        .collect()
+                })
+                .collect();
+
+            // Warmup.
+            for _ in 0..args.num_iters_warmup {
+                llm.generate_token_ids(&dummy_prompts, Some(sampling_params.clone()))?;
+                pb.inc(1);
+            }
+
+            // Timed runs.
+            let mut latencies = Vec::with_capacity(args.num_iters);
+            for _ in 0..args.num_iters {
+                let start = Instant::now();
+                llm.generate_token_ids(&dummy_prompts, Some(sampling_params.clone()))?;
+                latencies.push(start.elapsed().as_secs_f64());
+                pb.inc(1);
+            }
+
+            results.push(BenchResult {
+                model: model.clone(),
+                batch_size: bs,
+                latencies,
+            });
         }
         pb.finish();
     }
 
-    // Timed runs.
-    let mut latencies: Vec<f64> = Vec::with_capacity(args.num_iters);
-
-    let pb = ProgressBar::new(args.num_iters as u64)
-        .with_style(bar_style)
-        .with_message("Bench iterations");
-    for _ in 0..args.num_iters {
-        let start = Instant::now();
-        llm.generate_token_ids(&dummy_prompts, Some(sampling_params.clone()))?;
-        latencies.push(start.elapsed().as_secs_f64());
-        pb.inc(1);
+    // Print results.
+    println!();
+    if models.len() == 1 && batch_sizes.len() == 1 {
+        print_single_result(&results[0], &args);
+    } else {
+        print_table(&results, &models, batch_sizes, pcts);
     }
-    pb.finish();
 
-    // Compute stats (matching Python output format).
-    let avg_latency: f64 = latencies.iter().sum::<f64>() / latencies.len() as f64;
-    let total_tokens = args.num_iters as u64 * args.batch_size as u64 * args.output_len as u64;
-    let total_elapsed: f64 = latencies.iter().sum();
+    // JSON output.
+    if let Some(ref path) = args.output_json {
+        let json_results: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                let pct_map: serde_json::Map<String, serde_json::Value> =
+                    [10.0, 25.0, 50.0, 75.0, 90.0, 99.0]
+                        .iter()
+                        .chain(pcts.iter())
+                        .map(|&p| (format!("{p:.0}"), serde_json::json!(r.percentile_value(p))))
+                        .collect();
+                serde_json::json!({
+                    "model": r.model,
+                    "batch_size": r.batch_size,
+                    "avg_latency": r.avg_latency(),
+                    "percentiles": pct_map,
+                    "latencies": r.latencies,
+                })
+            })
+            .collect();
+        let output = serde_json::json!({ "results": json_results });
+        std::fs::write(path, serde_json::to_string_pretty(&output)?)?;
+        eprintln!("Results written to {path}");
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Output formatting
+// ---------------------------------------------------------------------------
+
+/// Single-result output (backward compatible with original format).
+fn print_single_result(r: &BenchResult, args: &BenchLatencyArgs) {
+    let total_tokens = args.num_iters as u64 * r.batch_size as u64 * args.output_len as u64;
+    let total_elapsed: f64 = r.latencies.iter().sum();
     let throughput = total_tokens as f64 / total_elapsed;
 
-    let percentages = [10.0, 25.0, 50.0, 75.0, 90.0, 99.0];
-    let percentiles: Vec<f64> = percentages
-        .iter()
-        .map(|&p| percentile(&latencies, p))
-        .collect();
-
-    println!();
     println!("=== Benchmark Results ===");
     println!("Iterations:      {}", args.num_iters);
-    println!("Batch size:      {}", args.batch_size);
+    println!("Batch size:      {}", r.batch_size);
     println!("Input len:       {} tokens", args.input_len);
     println!("Output len:      {}", args.output_len);
     println!("Total tokens:    {total_tokens}");
     println!("Throughput:      {throughput:.1} tokens/s");
     println!();
-    println!("Avg latency: {avg_latency:.4}s");
-    for (&pct, &val) in percentages.iter().zip(percentiles.iter()) {
-        println!("{pct:.0}% percentile latency: {val:.4}s");
+    println!("Avg latency: {:.4}s", r.avg_latency());
+    for &p in &[10.0, 25.0, 50.0, 75.0, 90.0, 99.0] {
+        println!("{p:.0}% percentile latency: {:.4}s", r.percentile_value(p));
     }
+}
 
-    // Write JSON output if requested.
-    if let Some(ref path) = args.output_json {
-        let pct_map: serde_json::Map<String, serde_json::Value> = percentages
+/// Table output for multi-model and/or multi-batch-size runs.
+fn print_table(results: &[BenchResult], models: &[String], batch_sizes: &[usize], pcts: &[f64]) {
+    // Format a cell: comma-separated percentile values.
+    let fmt_cell = |r: &BenchResult| -> String {
+        pcts.iter()
+            .map(|&p| format!("{:.4}", r.percentile_value(p)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let pct_label = pcts
+        .iter()
+        .map(|p| format!("p{p:.0}"))
+        .collect::<Vec<_>>()
+        .join("/");
+
+    if models.len() == 1 && batch_sizes.len() > 1 {
+        // Rows = batch sizes, columns = percentiles.
+        let col_width = 10_usize;
+        let row_label_width = 12_usize;
+
+        print!("{:<width$}", "Batch size", width = row_label_width);
+        for p in pcts {
+            print!("  {:>width$}", format!("p{p:.0}"), width = col_width);
+        }
+        println!();
+        print!("{:<width$}", "----------", width = row_label_width);
+        for _ in pcts {
+            print!("  {:>width$}", "----------", width = col_width);
+        }
+        println!();
+
+        for r in results {
+            print!("{:<width$}", r.batch_size, width = row_label_width);
+            for &p in pcts {
+                print!("  {:>width$.4}", r.percentile_value(p), width = col_width);
+            }
+            println!();
+        }
+    } else if models.len() > 1 && batch_sizes.len() == 1 {
+        // Rows = models, columns = percentiles.
+        let col_width = 10_usize;
+
+        print!("{:<30}", "Model");
+        for p in pcts {
+            print!("  {:>width$}", format!("p{p:.0}"), width = col_width);
+        }
+        println!();
+        print!("{:<30}", "-----");
+        for _ in pcts {
+            print!("  {:>width$}", "----------", width = col_width);
+        }
+        println!();
+
+        for r in results {
+            print!("{:<30}", short_model_name(&r.model));
+            for &p in pcts {
+                print!("  {:>width$.4}", r.percentile_value(p), width = col_width);
+            }
+            println!();
+        }
+    } else {
+        // N models x M batch sizes. Columns = batch sizes, cells = percentiles.
+        let header_cells: Vec<String> = batch_sizes.iter().map(|b| format!("bs={b}")).collect();
+
+        // Compute column widths from data.
+        let data_cells: Vec<Vec<String>> = models
             .iter()
-            .zip(percentiles.iter())
-            .map(|(&p, &v)| (format!("{p:.0}"), serde_json::json!(v)))
+            .map(|m| {
+                batch_sizes
+                    .iter()
+                    .map(|&bs| {
+                        results
+                            .iter()
+                            .find(|r| r.model == *m && r.batch_size == bs)
+                            .map(&fmt_cell)
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            })
             .collect();
-        let results = serde_json::json!({
-            "avg_latency": avg_latency,
-            "latencies": latencies,
-            "percentiles": pct_map,
-        });
-        std::fs::write(path, serde_json::to_string_pretty(&results)?)?;
-        eprintln!("Results written to {path}");
-    }
 
-    Ok(())
+        let col_widths: Vec<usize> = (0..batch_sizes.len())
+            .map(|ci| {
+                let max_data = data_cells
+                    .iter()
+                    .map(|row| row[ci].len())
+                    .max()
+                    .unwrap_or(0);
+                max_data.max(header_cells[ci].len()).max(8)
+            })
+            .collect();
+
+        print!("{:<30}", format!("Model ({pct_label})"));
+        for (i, h) in header_cells.iter().enumerate() {
+            print!("  {:>width$}", h, width = col_widths[i]);
+        }
+        println!();
+        print!("{:<30}", "-----");
+        for w in &col_widths {
+            print!("  {:>width$}", "----------", width = *w);
+        }
+        println!();
+
+        for (mi, m) in models.iter().enumerate() {
+            print!("{:<30}", short_model_name(m));
+            for (ci, cell) in data_cells[mi].iter().enumerate() {
+                print!("  {:>width$}", cell, width = col_widths[ci]);
+            }
+            println!();
+        }
+    }
+}
+
+/// Extract a short display name from a model path/ID.
+fn short_model_name(model: &str) -> String {
+    model.rsplit('/').next().unwrap_or(model).to_string()
 }
 
 /// Dispatch bench subcommands.

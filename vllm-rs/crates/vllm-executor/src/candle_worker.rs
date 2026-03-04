@@ -1244,6 +1244,7 @@ impl CandleWorker {
 
 impl Worker for CandleWorker {
     fn init_device(&mut self) -> ExecutorResult<()> {
+        let t0 = std::time::Instant::now();
         // When TP > 1, override to cuda:rank regardless of device_str.
         let device = if self.config.tp_world_size > 1 {
             let ordinal = self.config.tp_rank;
@@ -1258,14 +1259,16 @@ impl Worker for CandleWorker {
             parse_device(&self.config.device_str)?
         };
         info!(
-            "CandleWorker: initialized device {:?}",
-            self.config.device_str
+            "CandleWorker: initialized device {:?} ({:.1}ms)",
+            self.config.device_str,
+            t0.elapsed().as_secs_f64() * 1000.0,
         );
         self.device = Some(device);
         Ok(())
     }
 
     fn load_model(&mut self) -> ExecutorResult<()> {
+        let t0 = std::time::Instant::now();
         let device = self
             .device
             .clone()
@@ -1514,8 +1517,9 @@ impl Worker for CandleWorker {
         self.model = Some(model);
         self.resolved_architecture = Some(arch.clone());
         info!(
-            "CandleWorker: model loaded (arch={arch}, dtype={:?})",
-            dtype
+            "CandleWorker: model loaded (arch={arch}, dtype={:?}, {:.1}ms)",
+            dtype,
+            t0.elapsed().as_secs_f64() * 1000.0,
         );
 
         // Inject LoRA adapter if configured.
@@ -1551,6 +1555,7 @@ impl Worker for CandleWorker {
         num_gpu_blocks: usize,
         num_cpu_blocks: usize,
     ) -> ExecutorResult<()> {
+        let t0 = std::time::Instant::now();
         self.num_gpu_blocks = num_gpu_blocks;
         self.num_cpu_blocks = num_cpu_blocks;
 
@@ -1572,13 +1577,14 @@ impl Worker for CandleWorker {
                 ExecutorError::WorkerInit(format!("failed to create KV block pool: {e}"))
             })?;
             info!(
-                "CandleWorker: KV block pool created (blocks={}, layers={}, kv_heads={}, head_dim={}, block_size={}, dtype={:?})",
+                "CandleWorker: KV block pool created (blocks={}, layers={}, kv_heads={}, head_dim={}, block_size={}, dtype={:?}, {:.1}ms)",
                 num_gpu_blocks,
                 num_layers,
                 self.num_kv_heads,
                 self.head_dim,
                 self.config.block_size,
-                dtype
+                dtype,
+                t0.elapsed().as_secs_f64() * 1000.0,
             );
             self.kv_block_pool = Some(pool);
         }
@@ -1609,8 +1615,10 @@ impl Worker for CandleWorker {
         }
 
         info!(
-            "CandleWorker: cache initialized (gpu_blocks={}, cpu_blocks={})",
-            num_gpu_blocks, num_cpu_blocks
+            "CandleWorker: cache initialized (gpu_blocks={}, cpu_blocks={}, {:.1}ms)",
+            num_gpu_blocks,
+            num_cpu_blocks,
+            t0.elapsed().as_secs_f64() * 1000.0,
         );
         Ok(())
     }

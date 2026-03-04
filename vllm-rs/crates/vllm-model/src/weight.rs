@@ -231,6 +231,11 @@ impl ModelWeights {
     }
 
     /// Load from an index file (sharded model).
+    ///
+    /// When there are multiple shard files, they are loaded in parallel
+    /// using one thread per shard. This overlaps disk I/O (mmap page
+    /// faults) and CPU-side parsing across shards, while GPU transfers
+    /// naturally serialize through the PCIe bus.
     pub fn from_index(index_path: impl AsRef<Path>, device: &Device) -> ModelResult<Self> {
         let index_path = index_path.as_ref();
         let dir = index_path
@@ -250,22 +255,60 @@ impl ModelWeights {
                 )
                 .unwrap(),
             );
-            Some(bar)
+            Some(std::sync::Arc::new(bar))
         } else {
             None
         };
 
-        let mut tensors = HashMap::new();
-        for shard_name in &shard_files {
-            let shard_path = dir.join(shard_name);
-            let file = SafeTensorsFile::open(&shard_path)?;
-            for (name, tensor) in file.load_all(device)? {
-                tensors.insert(name, tensor);
+        let tensors = if total <= 1 {
+            // Single shard — no threading overhead.
+            let mut map = HashMap::new();
+            for shard_name in &shard_files {
+                let shard_path = dir.join(shard_name);
+                let file = SafeTensorsFile::open(&shard_path)?;
+                for (name, tensor) in file.load_all(device)? {
+                    map.insert(name, tensor);
+                }
             }
-            if let Some(ref bar) = bar {
-                bar.inc(1);
+            map
+        } else {
+            // Multiple shards — load in parallel.
+            let results: Vec<ModelResult<Vec<(String, Tensor)>>> = std::thread::scope(|s| {
+                let handles: Vec<_> = shard_files
+                    .iter()
+                    .map(|shard_name| {
+                        let shard_path = dir.join(shard_name);
+                        let dev = device.clone();
+                        let bar = bar.clone();
+                        s.spawn(move || {
+                            let file = SafeTensorsFile::open(&shard_path)?;
+                            let tensors = file.load_all(&dev)?;
+                            if let Some(ref b) = bar {
+                                b.inc(1);
+                            }
+                            Ok(tensors)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|e| {
+                            Err(ModelError::Other(format!("shard thread panicked: {e:?}")))
+                        })
+                    })
+                    .collect()
+            });
+
+            let mut map = HashMap::new();
+            for result in results {
+                for (name, tensor) in result? {
+                    map.insert(name, tensor);
+                }
             }
-        }
+            map
+        };
+
         if let Some(bar) = bar {
             bar.finish_and_clear();
         }

@@ -154,6 +154,9 @@ pub struct CandleWorker {
     /// CUDA graph runner for decode acceleration (None if not CUDA or disabled).
     #[cfg(feature = "cuda")]
     cuda_graph_runner: Option<crate::cuda_graph::CudaGraphRunner>,
+    /// Pre-allocated GPU buffers for batched sampling (avoids cudaMalloc per step).
+    #[cfg(feature = "cuda")]
+    sampling_buffers: Option<vllm_models::ops::SamplingBuffers>,
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +258,8 @@ impl CandleWorker {
             contiguous_kv_cache: HashMap::new(),
             #[cfg(feature = "cuda")]
             cuda_graph_runner: None,
+            #[cfg(feature = "cuda")]
+            sampling_buffers: None,
         }
     }
 
@@ -1070,17 +1075,37 @@ impl CandleWorker {
             let batched_logits = Tensor::cat(&logit_rows, 0)
                 .map_err(|e| ExecutorError::WorkerExecution(format!("cat logits error: {e}")))?;
 
-            let batch_tokens = vllm_models::ops::gpu_sample_batched(
-                &batched_logits,
-                &temperatures,
-                &top_ks,
-                &top_ps,
-                &min_ps,
-                &uniforms,
-            )
-            .map_err(|e| {
-                ExecutorError::WorkerExecution(format!("batched GPU sample error: {e}"))
-            })?;
+            // Use pre-allocated buffers when available, fall back to allocating path.
+            let batch_tokens: Vec<u32> = if let Some(ref mut bufs) = self.sampling_buffers
+                && batch_size <= bufs.max_batch
+            {
+                bufs.sample_batched(
+                    &batched_logits,
+                    &temperatures,
+                    &top_ks,
+                    &top_ps,
+                    &min_ps,
+                    &uniforms,
+                )
+                .map(|s| s.to_vec())
+                .map_err(|e| {
+                    ExecutorError::WorkerExecution(format!(
+                        "pre-alloc batched GPU sample error: {e}"
+                    ))
+                })?
+            } else {
+                vllm_models::ops::gpu_sample_batched(
+                    &batched_logits,
+                    &temperatures,
+                    &top_ks,
+                    &top_ps,
+                    &min_ps,
+                    &uniforms,
+                )
+                .map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("batched GPU sample error: {e}"))
+                })?
+            };
 
             // Scatter results back to per-request outputs.
             for (batch_idx, &req_idx) in gpu_batch_indices.iter().enumerate() {
@@ -1443,6 +1468,22 @@ impl Worker for CandleWorker {
                 dtype
             );
             self.kv_block_pool = Some(pool);
+        }
+
+        // Pre-allocate GPU sampling buffers on CUDA devices.
+        #[cfg(feature = "cuda")]
+        if self.device.as_ref().is_some_and(|d| d.is_cuda()) {
+            let device = self.device.as_ref().unwrap();
+            let max_batch = 256; // matches typical max_num_seqs
+            match vllm_models::ops::SamplingBuffers::new(max_batch, device) {
+                Ok(bufs) => {
+                    info!("CandleWorker: pre-allocated sampling buffers (max_batch={max_batch})");
+                    self.sampling_buffers = Some(bufs);
+                }
+                Err(e) => {
+                    warn!("CandleWorker: failed to pre-allocate sampling buffers: {e}");
+                }
+            }
         }
 
         info!(

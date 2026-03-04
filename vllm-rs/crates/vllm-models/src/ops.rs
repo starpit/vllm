@@ -239,6 +239,10 @@ pub fn gpu_sample_batched(
     .map_err(kernel_err)
 }
 
+/// Re-export pre-allocated sampling buffers for the worker to hold.
+#[cfg(feature = "cuda")]
+pub use vllm_kernels::sampling::SamplingBuffers;
+
 // ---------------------------------------------------------------------------
 // MoE dispatch
 // ---------------------------------------------------------------------------

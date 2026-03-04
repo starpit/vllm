@@ -317,6 +317,203 @@ pub fn cuda_sample_batched(
     Ok(token_ids)
 }
 
+// ---------------------------------------------------------------------------
+// Pre-allocated sampling buffers
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated GPU buffers for batched sampling, eliminating per-step
+/// `cudaMalloc` + `cudaFree` overhead. Sized once to `max_batch_size` and
+/// reused across all decode steps.
+#[cfg(feature = "cuda")]
+pub struct SamplingBuffers {
+    /// Max batch size these buffers were allocated for.
+    pub max_batch: usize,
+    /// `[max_batch]` f32 — temperatures
+    d_temperatures: Tensor,
+    /// `[max_batch]` u32 — top_k values (stored as u32, cast to i32 pointer)
+    d_top_ks: Tensor,
+    /// `[max_batch]` f32 — top_p values
+    d_top_ps: Tensor,
+    /// `[max_batch]` f32 — min_p values
+    d_min_ps: Tensor,
+    /// `[max_batch]` f32 — uniform random values
+    d_uniforms: Tensor,
+    /// `[max_batch]` u32 — output token IDs
+    d_output: Tensor,
+    /// Host-side readback buffer (avoids alloc in hot path).
+    host_output: Vec<u32>,
+}
+
+#[cfg(feature = "cuda")]
+impl SamplingBuffers {
+    /// Allocate all buffers on the given CUDA device.
+    pub fn new(max_batch: usize, device: &candle_core::Device) -> KernelResult<Self> {
+        Ok(Self {
+            max_batch,
+            d_temperatures: Tensor::zeros(max_batch, DType::F32, device)?,
+            d_top_ks: Tensor::zeros(max_batch, DType::U32, device)?,
+            d_top_ps: Tensor::zeros(max_batch, DType::F32, device)?,
+            d_min_ps: Tensor::zeros(max_batch, DType::F32, device)?,
+            d_uniforms: Tensor::zeros(max_batch, DType::F32, device)?,
+            d_output: Tensor::zeros(max_batch, DType::U32, device)?,
+            host_output: vec![0u32; max_batch],
+        })
+    }
+
+    /// Sample a batch using pre-allocated buffers. Writes parameters via
+    /// `memcpy_htod_sync` into existing device memory instead of allocating
+    /// new tensors.
+    ///
+    /// * `logits` — 2-D `[batch_size, vocab_size]` CUDA tensor (contiguous)
+    /// * Per-request slices of length `batch_size` (must be <= `max_batch`)
+    ///
+    /// Returns `&[u32]` slice of sampled token IDs (valid until next call).
+    pub fn sample_batched(
+        &mut self,
+        logits: &Tensor,
+        temperatures: &[f32],
+        top_ks: &[i32],
+        top_ps: &[f32],
+        min_ps: &[f32],
+        uniform_randoms: &[f32],
+    ) -> KernelResult<&[u32]> {
+        let shape = logits.dims();
+        if shape.len() != 2 {
+            return Err(KernelError::Other(format!(
+                "SamplingBuffers::sample_batched: expected 2-D logits, got {shape:?}"
+            )));
+        }
+        let batch_size = shape[0];
+        let vocab_size = shape[1];
+        let dtype = logits.dtype();
+
+        if batch_size == 0 {
+            return Ok(&[]);
+        }
+        if batch_size > self.max_batch {
+            return Err(KernelError::Other(format!(
+                "batch_size {batch_size} exceeds pre-allocated max_batch {}",
+                self.max_batch
+            )));
+        }
+
+        let logits = logits.contiguous()?;
+
+        // Convert top_ks i32 → u32 on stack (tiny — batch_size elements).
+        let top_ks_u32: Vec<u32> = top_ks.iter().map(|&k| k as u32).collect();
+
+        // Write parameters into pre-allocated device buffers via memcpy.
+        memcpy_htod_into::<f32>(&self.d_temperatures, temperatures)?;
+        memcpy_htod_into::<u32>(&self.d_top_ks, &top_ks_u32)?;
+        memcpy_htod_into::<f32>(&self.d_top_ps, top_ps)?;
+        memcpy_htod_into::<f32>(&self.d_min_ps, min_ps)?;
+        memcpy_htod_into::<f32>(&self.d_uniforms, uniform_randoms)?;
+
+        // Get device pointers (no allocation — tensors already exist).
+        let out_ptr = device_ptr_of::<u32>(&self.d_output)?;
+        let temps_ptr = device_ptr_of::<f32>(&self.d_temperatures)?;
+        let top_ks_ptr = device_ptr_of::<u32>(&self.d_top_ks)?;
+        let top_ps_ptr = device_ptr_of::<f32>(&self.d_top_ps)?;
+        let min_ps_ptr = device_ptr_of::<f32>(&self.d_min_ps)?;
+        let randoms_ptr = device_ptr_of::<f32>(&self.d_uniforms)?;
+
+        match dtype {
+            DType::F32 => {
+                let logits_ptr = device_ptr_of::<f32>(&logits)?;
+                unsafe {
+                    cuda_ffi::sample_batched_f32(
+                        out_ptr as *mut u32,
+                        logits_ptr as *const f32,
+                        vocab_size as i32,
+                        batch_size as i32,
+                        temps_ptr as *const f32,
+                        top_ks_ptr as *const i32,
+                        top_ps_ptr as *const f32,
+                        min_ps_ptr as *const f32,
+                        randoms_ptr as *const f32,
+                    );
+                }
+            }
+            DType::F16 => {
+                let logits_ptr = device_ptr_of::<half::f16>(&logits)?;
+                unsafe {
+                    cuda_ffi::sample_batched_f16(
+                        out_ptr as *mut u32,
+                        logits_ptr as *const u16,
+                        vocab_size as i32,
+                        batch_size as i32,
+                        temps_ptr as *const f32,
+                        top_ks_ptr as *const i32,
+                        top_ps_ptr as *const f32,
+                        min_ps_ptr as *const f32,
+                        randoms_ptr as *const f32,
+                    );
+                }
+            }
+            DType::BF16 => {
+                let logits_ptr = device_ptr_of::<half::bf16>(&logits)?;
+                unsafe {
+                    cuda_ffi::sample_batched_bf16(
+                        out_ptr as *mut u32,
+                        logits_ptr as *const u16,
+                        vocab_size as i32,
+                        batch_size as i32,
+                        temps_ptr as *const f32,
+                        top_ks_ptr as *const i32,
+                        top_ps_ptr as *const f32,
+                        min_ps_ptr as *const f32,
+                        randoms_ptr as *const f32,
+                    );
+                }
+            }
+            _ => {
+                return Err(KernelError::Other(format!(
+                    "unsupported dtype for batched GPU sampling: {dtype:?}"
+                )));
+            }
+        }
+
+        // Single sync: copy output token IDs to host.
+        // Use narrow to only read `batch_size` elements from the larger buffer.
+        let output_slice = self.d_output.narrow(0, 0, batch_size)?;
+        let token_ids = output_slice.to_vec1::<u32>()?;
+        self.host_output[..batch_size].copy_from_slice(&token_ids);
+        Ok(&self.host_output[..batch_size])
+    }
+}
+
+/// Write `data` into the first `data.len()` elements of a pre-allocated
+/// device tensor via `memcpy_htod_sync` (no allocation).
+#[cfg(feature = "cuda")]
+fn memcpy_htod_into<T: cudarc::driver::DeviceRepr + candle_core::cuda_backend::CudaDType>(
+    tensor: &Tensor,
+    data: &[T],
+) -> KernelResult<()> {
+    use cudarc::driver::DevicePtr;
+    let (storage, layout) = tensor.storage_and_layout();
+    match &*storage {
+        candle_core::Storage::Cuda(cs) => {
+            let slice = cs.as_cuda_slice::<T>()?;
+            let view = slice.slice(layout.start_offset()..);
+            let dev_ptr = {
+                let cuda_dev = tensor
+                    .device()
+                    .as_cuda_device()
+                    .map_err(|e| KernelError::Other(format!("{e}")))?;
+                let stream = cuda_dev.cuda_stream();
+                let (ptr, _guard) = view.device_ptr(&stream);
+                ptr
+            };
+            unsafe {
+                cudarc::driver::result::memcpy_htod_sync(dev_ptr, data)
+                    .map_err(|e| KernelError::Other(format!("memcpy_htod_sync: {e}")))?;
+            }
+            Ok(())
+        }
+        _ => Err(KernelError::Other("expected CUDA tensor".into())),
+    }
+}
+
 /// Extract a raw device pointer from a contiguous CUDA tensor.
 #[cfg(feature = "cuda")]
 fn device_ptr_of<T: cudarc::driver::DeviceRepr + candle_core::cuda_backend::CudaDType>(

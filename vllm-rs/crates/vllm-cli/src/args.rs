@@ -301,6 +301,10 @@ pub struct BenchLatencyArgs {
     /// Top-k sampling cutoff (0 = disabled).
     #[arg(long, default_value_t = 0)]
     pub top_k: i32,
+
+    /// Do not detokenize responses (excludes detokenization time from latency).
+    #[arg(long)]
+    pub disable_detokenize: bool,
 }
 
 impl BenchLatencyArgs {

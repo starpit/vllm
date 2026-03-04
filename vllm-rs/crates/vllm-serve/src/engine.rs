@@ -390,16 +390,20 @@ impl AsyncEngine {
             let mut sp = sampling_params.clone();
             sp.seed = sp.seed.map(|s| s.wrapping_add(i as u64));
 
-            let detokenizer = self.tokenizer.as_ref().map(|tok| {
-                IncrementalDetokenizer::new(
-                    Arc::clone(tok),
-                    &prompt_token_ids,
-                    sp.stop.clone(),
-                    sp.min_tokens,
-                    sp.include_stop_str_in_output,
-                    sp.skip_special_tokens,
-                )
-            });
+            let detokenizer = if sp.detokenize {
+                self.tokenizer.as_ref().map(|tok| {
+                    IncrementalDetokenizer::new(
+                        Arc::clone(tok),
+                        &prompt_token_ids,
+                        sp.stop.clone(),
+                        sp.min_tokens,
+                        sp.include_stop_str_in_output,
+                        sp.skip_special_tokens,
+                    )
+                })
+            } else {
+                None
+            };
 
             let mut ec_req = ec_request.clone();
             ec_req.request_id = child_id.clone();
@@ -615,16 +619,20 @@ impl AsyncEngine {
             let mut sp = sampling_params.clone();
             sp.seed = sp.seed.map(|s| s.wrapping_add(i as u64));
 
-            let detokenizer = self.tokenizer.as_ref().map(|tok| {
-                IncrementalDetokenizer::new(
-                    Arc::clone(tok),
-                    &prompt_token_ids,
-                    sp.stop.clone(),
-                    sp.min_tokens,
-                    sp.include_stop_str_in_output,
-                    sp.skip_special_tokens,
-                )
-            });
+            let detokenizer = if sp.detokenize {
+                self.tokenizer.as_ref().map(|tok| {
+                    IncrementalDetokenizer::new(
+                        Arc::clone(tok),
+                        &prompt_token_ids,
+                        sp.stop.clone(),
+                        sp.min_tokens,
+                        sp.include_stop_str_in_output,
+                        sp.skip_special_tokens,
+                    )
+                })
+            } else {
+                None
+            };
 
             let mut ec_req = ec_request.clone();
             ec_req.request_id = child_id.clone();

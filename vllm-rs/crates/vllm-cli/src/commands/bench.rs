@@ -13,7 +13,7 @@ use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use vllm_common::telemetry;
 use vllm_config::CudaGraphConfig;
-use vllm_serve::llm::{LLM, LLMBuilder, SamplingParams};
+use vllm_serve::llm::{LLM, LLMBuilder, Prompt, SamplingParams};
 
 use crate::args::{BenchCommand, BenchCommands, BenchLatencyArgs};
 
@@ -127,6 +127,7 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
         top_k: args.top_k,
         ignore_eos: true,
         max_tokens: Some(args.output_len as u32),
+        detokenize: !args.disable_detokenize,
         ..SamplingParams::default()
     };
 
@@ -141,11 +142,13 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
         let short_name = short_model_name(model);
 
         for &bs in batch_sizes {
-            let dummy_prompts: Vec<Vec<u32>> = (0..bs)
+            let dummy_prompts: Vec<Prompt> = (0..bs)
                 .map(|i| {
-                    (0..args.input_len)
-                        .map(|j| ((i * 997 + j * 31 + 42) % 10000) as u32)
-                        .collect()
+                    Prompt::TokenIds(
+                        (0..args.input_len)
+                            .map(|j| ((i * 997 + j * 31 + 42) % 10000) as u32)
+                            .collect(),
+                    )
                 })
                 .collect();
 
@@ -166,7 +169,7 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
                     .with_style(warmup_style.clone())
                     .with_message(msg);
                 for _ in 0..args.num_iters_warmup {
-                    llm.generate_token_ids(&dummy_prompts, Some(sampling_params.clone()))?;
+                    llm.generate(&dummy_prompts, Some(sampling_params.clone()))?;
                     pb.inc(1);
                 }
                 pb.finish();
@@ -184,7 +187,7 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
             let mut latencies = Vec::with_capacity(args.num_iters);
             for _ in 0..args.num_iters {
                 let start = Instant::now();
-                llm.generate_token_ids(&dummy_prompts, Some(sampling_params.clone()))?;
+                llm.generate(&dummy_prompts, Some(sampling_params.clone()))?;
                 latencies.push(start.elapsed().as_secs_f64());
                 pb.inc(1);
             }

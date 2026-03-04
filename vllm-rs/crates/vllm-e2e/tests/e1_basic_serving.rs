@@ -974,8 +974,8 @@ async fn test_cuda_gguf_gemma3_1b_chat() {
 /// SmolLM-135M has 9/3 heads which don't divide evenly by 2.
 ///
 /// Run on nick2 pod (2x L40S):
-///   cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_tp2 -- --ignored --test-threads=1
-#[cfg(feature = "cuda")]
+///   cargo test -p vllm-e2e --features e2e,nccl --release --test e1_basic_serving test_cuda_tp2 -- --ignored --test-threads=1
+#[cfg(feature = "nccl")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_cuda_tp2_qwen2_completion() {

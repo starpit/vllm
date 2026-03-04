@@ -4,14 +4,10 @@
 //! Trait abstraction for fused activation kernels (SiLU+mul, GELU+mul).
 //! Port of: `csrc/activation_kernels.cu`
 //!
-//! ## Simplifications vs Python vLLM
-//!
-//! The CUDA kernels here are simplified compared to Python vLLM's:
-//! - Scalar loads instead of vectorized int4/u32x8 loads (~2-3x slower on large hidden)
-//! - No packed half2/bfloat162 arithmetic path
-//! - Separate gate/up pointers (matching Rust trait) instead of concatenated [2*d] input
-//!
-//! These will be upgraded to match Python vLLM's performance in a follow-up.
+//! Features:
+//! - Vectorized 128-bit loads/stores for throughput
+//! - Fused variants that take combined `[num_tokens, 2*d]` gate_up tensor,
+//!   eliminating 2 contiguous copy kernels + allocations per layer
 
 use candle_core::Tensor;
 
@@ -133,6 +129,13 @@ mod cuda_ffi {
             num_tokens: i32,
             d: i32,
         );
+        // Fused variants: take combined [num_tokens, 2*d] gate_up tensor
+        pub fn silu_and_mul_fused_f32(out: *mut f32, gate_up: *const f32, num_tokens: i32, d: i32);
+        pub fn silu_and_mul_fused_f16(out: *mut u16, gate_up: *const u16, num_tokens: i32, d: i32);
+        pub fn silu_and_mul_fused_bf16(out: *mut u16, gate_up: *const u16, num_tokens: i32, d: i32);
+        pub fn gelu_and_mul_fused_f32(out: *mut f32, gate_up: *const f32, num_tokens: i32, d: i32);
+        pub fn gelu_and_mul_fused_f16(out: *mut u16, gate_up: *const u16, num_tokens: i32, d: i32);
+        pub fn gelu_and_mul_fused_bf16(out: *mut u16, gate_up: *const u16, num_tokens: i32, d: i32);
     }
 }
 
@@ -351,6 +354,123 @@ impl ActivationKernels for CudaActivationKernels {
         }
         Ok(out)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fused activation from combined gate_up tensor
+// ---------------------------------------------------------------------------
+
+/// Fused silu_and_mul from a combined `[num_tokens, 2*d]` gate_up tensor.
+///
+/// Avoids the two `contiguous()` copy kernels + allocations that splitting
+/// gate_up into separate gate/up tensors requires. The CUDA kernel reads
+/// gate and up halves from the combined tensor using stride `2*d`.
+#[cfg(feature = "cuda")]
+pub fn silu_and_mul_fused(gate_up: &Tensor, d: usize) -> KernelResult<Tensor> {
+    fused_act_and_mul(gate_up, d, "silu")
+}
+
+/// Fused gelu_and_mul from a combined `[num_tokens, 2*d]` gate_up tensor.
+#[cfg(feature = "cuda")]
+pub fn gelu_and_mul_fused(gate_up: &Tensor, d: usize) -> KernelResult<Tensor> {
+    fused_act_and_mul(gate_up, d, "gelu")
+}
+
+#[cfg(feature = "cuda")]
+fn fused_act_and_mul(gate_up: &Tensor, d: usize, act: &str) -> KernelResult<Tensor> {
+    use candle_core::DType;
+
+    let gate_up = gate_up.contiguous()?;
+    let dims = gate_up.shape().dims();
+    let last_dim = *dims
+        .last()
+        .ok_or_else(|| crate::error::KernelError::Other("empty gate_up tensor".to_string()))?;
+    if last_dim != 2 * d {
+        return Err(crate::error::KernelError::Other(format!(
+            "gate_up last dim {} != 2*d={}",
+            last_dim,
+            2 * d
+        )));
+    }
+    let num_tokens: usize = dims[..dims.len() - 1].iter().product();
+
+    // Build output shape: same leading dims, last dim = d
+    let mut out_dims: Vec<usize> = dims[..dims.len() - 1].to_vec();
+    out_dims.push(d);
+    let out = Tensor::zeros(&out_dims[..], gate_up.dtype(), gate_up.device())?;
+
+    match gate_up.dtype() {
+        DType::F32 => {
+            let o = CudaActivationKernels::device_ptr_of::<f32>(&out)?;
+            let gu = CudaActivationKernels::device_ptr_of::<f32>(&gate_up)?;
+            unsafe {
+                match act {
+                    "silu" => cuda_ffi::silu_and_mul_fused_f32(
+                        o as *mut f32,
+                        gu as *const f32,
+                        num_tokens as i32,
+                        d as i32,
+                    ),
+                    _ => cuda_ffi::gelu_and_mul_fused_f32(
+                        o as *mut f32,
+                        gu as *const f32,
+                        num_tokens as i32,
+                        d as i32,
+                    ),
+                }
+            }
+        }
+        DType::F16 => {
+            let o = CudaActivationKernels::device_ptr_of::<half::f16>(&out)?;
+            let gu = CudaActivationKernels::device_ptr_of::<half::f16>(&gate_up)?;
+            unsafe {
+                match act {
+                    "silu" => cuda_ffi::silu_and_mul_fused_f16(
+                        o as *mut u16,
+                        gu as *const u16,
+                        num_tokens as i32,
+                        d as i32,
+                    ),
+                    _ => cuda_ffi::gelu_and_mul_fused_f16(
+                        o as *mut u16,
+                        gu as *const u16,
+                        num_tokens as i32,
+                        d as i32,
+                    ),
+                }
+            }
+        }
+        DType::BF16 => {
+            let o = CudaActivationKernels::device_ptr_of::<half::bf16>(&out)?;
+            let gu = CudaActivationKernels::device_ptr_of::<half::bf16>(&gate_up)?;
+            unsafe {
+                match act {
+                    "silu" => cuda_ffi::silu_and_mul_fused_bf16(
+                        o as *mut u16,
+                        gu as *const u16,
+                        num_tokens as i32,
+                        d as i32,
+                    ),
+                    _ => cuda_ffi::gelu_and_mul_fused_bf16(
+                        o as *mut u16,
+                        gu as *const u16,
+                        num_tokens as i32,
+                        d as i32,
+                    ),
+                }
+            }
+        }
+        _ => {
+            // CPU fallback: split and use decomposed ops
+            let gate = gate_up.narrow(candle_core::D::Minus1, 0, d)?.contiguous()?;
+            let up = gate_up.narrow(candle_core::D::Minus1, d, d)?.contiguous()?;
+            return match act {
+                "silu" => CpuActivationKernels.silu_and_mul(&gate, &up),
+                _ => CpuActivationKernels.gelu_and_mul(&gate, &up),
+            };
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

@@ -259,11 +259,26 @@ impl LlamaMLP {
 impl Module for LlamaMLP {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let gate_up = self.gate_up_proj.forward(x)?;
-        let gate = gate_up.narrow(1, 0, self.intermediate_size)?.contiguous()?;
-        let up = gate_up
-            .narrow(1, self.intermediate_size, self.intermediate_size)?
-            .contiguous()?;
-        let activated = crate::ops::silu_and_mul(&gate, &up)?;
+        // On CUDA: fused kernel reads both halves from gate_up directly,
+        // eliminating 2 contiguous copy kernels + 2 allocations per layer.
+        #[cfg(feature = "cuda")]
+        let activated = if gate_up.device().is_cuda() {
+            crate::ops::silu_and_mul_fused(&gate_up, self.intermediate_size)?
+        } else {
+            let gate = gate_up.narrow(1, 0, self.intermediate_size)?.contiguous()?;
+            let up = gate_up
+                .narrow(1, self.intermediate_size, self.intermediate_size)?
+                .contiguous()?;
+            crate::ops::silu_and_mul(&gate, &up)?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let activated = {
+            let gate = gate_up.narrow(1, 0, self.intermediate_size)?.contiguous()?;
+            let up = gate_up
+                .narrow(1, self.intermediate_size, self.intermediate_size)?
+                .contiguous()?;
+            crate::ops::silu_and_mul(&gate, &up)?
+        };
         self.down_proj.forward(&activated)
     }
 }

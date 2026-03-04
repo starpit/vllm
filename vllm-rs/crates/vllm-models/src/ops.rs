@@ -53,6 +53,33 @@ pub fn gelu_and_mul(gate: &Tensor, up: &Tensor) -> candle_core::Result<Tensor> {
     gate.gelu()?.mul(up)
 }
 
+/// Fused SiLU(gate) * up from combined gate_up tensor `[num_tokens, 2*d]`.
+///
+/// On CUDA: single kernel reads both halves from the combined tensor,
+/// eliminating 2 contiguous copy kernels + 2 allocations per layer.
+/// On CPU: falls back to split + decomposed ops.
+pub fn silu_and_mul_fused(gate_up: &Tensor, d: usize) -> candle_core::Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if gate_up.device().is_cuda() {
+        return vllm_kernels::activation::silu_and_mul_fused(gate_up, d).map_err(kernel_err);
+    }
+    // CPU fallback: split and use candle ops
+    let gate = gate_up.narrow(candle_core::D::Minus1, 0, d)?.contiguous()?;
+    let up = gate_up.narrow(candle_core::D::Minus1, d, d)?.contiguous()?;
+    gate.silu()?.mul(&up)
+}
+
+/// Fused GELU(gate) * up from combined gate_up tensor `[num_tokens, 2*d]`.
+pub fn gelu_and_mul_fused(gate_up: &Tensor, d: usize) -> candle_core::Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if gate_up.device().is_cuda() {
+        return vllm_kernels::activation::gelu_and_mul_fused(gate_up, d).map_err(kernel_err);
+    }
+    let gate = gate_up.narrow(candle_core::D::Minus1, 0, d)?.contiguous()?;
+    let up = gate_up.narrow(candle_core::D::Minus1, d, d)?.contiguous()?;
+    gate.gelu()?.mul(&up)
+}
+
 // ---------------------------------------------------------------------------
 // Norm dispatch
 // ---------------------------------------------------------------------------

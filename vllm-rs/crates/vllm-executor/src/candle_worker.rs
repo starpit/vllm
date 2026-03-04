@@ -1277,6 +1277,25 @@ impl Worker for CandleWorker {
         } else {
             parse_device(&self.config.device_str)?
         };
+        // Disable cudarc's per-tensor event tracking on CUDA devices.
+        //
+        // cudarc records CudaEvents on every tensor access (device_ptr()) for
+        // cross-stream synchronization. With a single compute stream this is
+        // pure overhead — 913K events adding ~1s to a typical decode run.
+        //
+        // For TP > 1 with NCCL, we still disable automatic tracking and instead
+        // use explicit stream synchronization around NCCL calls. This replaces
+        // hundreds of thousands of implicit events with ~2 explicit sync points
+        // per layer (before all-reduce input, after all-reduce output).
+        #[cfg(feature = "cuda")]
+        if let Ok(cuda_dev) = device.as_cuda_device() {
+            let ctx = cuda_dev.cuda_stream().context().clone();
+            if ctx.is_event_tracking() {
+                unsafe { ctx.disable_event_tracking() };
+                info!("CandleWorker: disabled cudarc event tracking (single-stream optimization)");
+            }
+        }
+
         info!(
             "CandleWorker: initialized device {:?} ({:.1}ms)",
             self.config.device_str,

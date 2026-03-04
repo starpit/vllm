@@ -4,6 +4,7 @@
 //! CLI subcommand implementations.
 
 pub mod batch;
+#[cfg(feature = "bench")]
 pub mod bench;
 pub mod convert;
 pub mod serve;

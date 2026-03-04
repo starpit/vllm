@@ -21,6 +21,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Serve(args) => commands::serve::run_serve(*args).await,
+        #[cfg(feature = "bench")]
         Commands::Bench(cmd) => commands::bench::run_bench(cmd).await,
         Commands::Batch(args) => commands::batch::run_batch(args).await,
         Commands::Convert(args) => commands::convert::run_convert(args).await,

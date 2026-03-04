@@ -1,0 +1,21 @@
+[package]
+name = "vllm-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Benchmarking tools for vLLM Rust inference engine"
+
+[features]
+default = []
+cuda = ["vllm-serve/cuda"]
+metal = ["vllm-serve/metal"]
+
+[dependencies]
+vllm-common = { workspace = true }
+vllm-config = { workspace = true }
+vllm-serve = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+indicatif = { workspace = true }

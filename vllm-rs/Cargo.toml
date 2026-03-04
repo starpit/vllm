@@ -12,6 +12,7 @@ members = [
     "crates/vllm-kernels",
     "crates/vllm-protocol",
     "crates/vllm-pyo3",
+    "crates/vllm-bench",
     "crates/vllm-cli",
     "crates/vllm-mlx",
     "crates/vllm-e2e",
@@ -129,6 +130,7 @@ vllm-model = { path = "crates/vllm-model" }
 vllm-models = { path = "crates/vllm-models" }
 vllm-kernels = { path = "crates/vllm-kernels" }
 vllm-protocol = { path = "crates/vllm-protocol" }
+vllm-bench = { path = "crates/vllm-bench" }
 vllm-cli = { path = "crates/vllm-cli" }
 vllm-mlx = { path = "crates/vllm-mlx" }
 vllm-e2e = { path = "crates/vllm-e2e" }

@@ -491,7 +491,10 @@ mod tests {
         match cli.command {
             Commands::Bench(cmd) => match cmd.command {
                 BenchCommands::Latency(args) => {
-                    assert_eq!(args.resolved_model().unwrap(), "/path/to/model");
+                    assert_eq!(
+                        args.resolved_models().unwrap(),
+                        vec!["/path/to/model".to_string()]
+                    );
                     assert_eq!(args.num_iters, 5);
                 }
                 _ => panic!("expected Latency subcommand"),
@@ -506,7 +509,10 @@ mod tests {
         match cli.command {
             Commands::Bench(cmd) => match cmd.command {
                 BenchCommands::Latency(args) => {
-                    assert_eq!(args.resolved_model().unwrap(), "/path/to/model");
+                    assert_eq!(
+                        args.resolved_models().unwrap(),
+                        vec!["/path/to/model".to_string()]
+                    );
                 }
                 _ => panic!("expected Latency subcommand"),
             },
@@ -520,11 +526,11 @@ mod tests {
         match cli.command {
             Commands::Bench(cmd) => match cmd.command {
                 BenchCommands::Latency(args) => {
-                    assert_eq!(args.num_iters, 10);
+                    assert_eq!(args.num_iters, 30);
                     assert_eq!(args.input_len, 32);
-                    assert_eq!(args.output_len, 64);
-                    assert_eq!(args.num_iters_warmup, 2);
-                    assert_eq!(args.batch_size, 8);
+                    assert_eq!(args.output_len, 128);
+                    assert_eq!(args.num_iters_warmup, 10);
+                    assert_eq!(args.batch_sizes, vec![8]);
                     assert!(args.output_json.is_none());
                 }
                 _ => panic!("expected Latency subcommand"),

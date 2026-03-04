@@ -916,10 +916,24 @@ impl SchedulerInterface for Scheduler {
                 let (num_cached_tokens, _cached_blocks) =
                     self.kv_cache.get_computed_blocks(&request);
 
-                let num_computed_tokens = num_cached_tokens;
-
                 // How many tokens need to be scheduled.
                 let total_tokens = request.num_tokens();
+
+                // When the prefix cache covers the entire prompt, backing up
+                // by one block ensures the model has real input tokens to
+                // process. Without this, num_new_tokens would be 0 and the
+                // request would be stuck in WAITING forever. Reprocessing the
+                // last block is cheap and establishes the decode invariant
+                // (num_tokens > num_computed after the first output token is
+                // generated).
+                let num_computed_tokens =
+                    if num_cached_tokens as usize >= total_tokens && num_cached_tokens > 0 {
+                        let bs = self.kv_cache.block_size();
+                        (((num_cached_tokens as usize) / bs).saturating_sub(1) * bs) as u32
+                    } else {
+                        num_cached_tokens
+                    };
+
                 let num_new_tokens_raw = total_tokens.saturating_sub(num_computed_tokens as usize);
 
                 let mut num_new_tokens = num_new_tokens_raw;
@@ -2300,6 +2314,83 @@ mod tests {
             }
             tracker.free(&id);
         }
+    }
+
+    #[test]
+    fn test_prefix_cache_full_prompt_not_stuck() {
+        // When the prefix cache covers the entire prompt, the scheduler
+        // must still schedule at least one block of tokens so the request
+        // can start decoding. Regression test for the bench-latency hang.
+        let block_size = 16;
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 4,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let kv: Box<dyn KVCacheManagerOps> =
+            Box::new(SimpleBlockTracker::with_caching(100, block_size));
+        let mut sched = Scheduler::new(&cfg, 8192, kv);
+
+        // 32-token prompt = 2 full blocks with block_size=16.
+        let prompt: Vec<u32> = (0..32).collect();
+
+        // --- Iteration 1: no cache, should schedule 32 tokens ---
+        let r1 = Request::new(
+            "r1".into(),
+            prompt.clone(),
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+        sched.add_request(r1);
+        let output1 = sched.schedule();
+        let sched_tokens_1 = *output1.num_scheduled_tokens.get("r1").unwrap();
+        assert_eq!(
+            sched_tokens_1, 32,
+            "first request should schedule all 32 prompt tokens"
+        );
+
+        // Simulate completion: update computed tokens, finish, free.
+        sched.finish_requests(&["r1"], RequestStatus::FinishedStopped);
+        // Consume the finished ID from the scheduler.
+        let _ = sched.schedule();
+
+        // --- Iteration 2: same prompt, fully cached ---
+        let r2 = Request::new(
+            "r2".into(),
+            prompt.clone(),
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            2.0,
+            0,
+            0,
+            None,
+        );
+        sched.add_request(r2);
+        let output2 = sched.schedule();
+
+        // Must schedule >0 tokens (the last block gets reprocessed).
+        let sched_tokens_2 = *output2
+            .num_scheduled_tokens
+            .get("r2")
+            .expect("r2 should be scheduled");
+        assert!(
+            sched_tokens_2 > 0,
+            "fully-cached request must still schedule tokens, got 0"
+        );
+        // Specifically: we back up by one block, so 16 tokens get reprocessed.
+        assert_eq!(
+            sched_tokens_2, 16,
+            "should reprocess the last block ({block_size} tokens)"
+        );
     }
 
     #[test]

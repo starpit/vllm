@@ -157,6 +157,84 @@ pub struct CandleWorker {
     /// Pre-allocated GPU buffers for batched sampling (avoids cudaMalloc per step).
     #[cfg(feature = "cuda")]
     sampling_buffers: Option<vllm_models::ops::SamplingBuffers>,
+    /// Pre-allocated GPU buffers for model inputs (input_ids, positions).
+    #[cfg(feature = "cuda")]
+    input_buffers: Option<ModelInputBuffers>,
+}
+
+// ---------------------------------------------------------------------------
+// Pre-allocated model input buffers (CUDA only)
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated GPU tensors for input_ids and positions, eliminating
+/// `cudaMalloc` + `cudaFree` per decode step. Sized to `max_batch` and
+/// updated in-place via `memcpy_htod_sync`.
+#[cfg(feature = "cuda")]
+struct ModelInputBuffers {
+    max_batch: usize,
+    /// `[max_batch]` u32 — input token IDs
+    d_input_ids: Tensor,
+    /// `[max_batch]` u32 — positions (as u32, model layers cast as needed)
+    d_positions: Tensor,
+}
+
+#[cfg(feature = "cuda")]
+impl ModelInputBuffers {
+    fn new(max_batch: usize, device: &Device) -> Result<Self, candle_core::Error> {
+        Ok(Self {
+            max_batch,
+            d_input_ids: Tensor::zeros(max_batch, DType::U32, device)?,
+            d_positions: Tensor::zeros(max_batch, DType::U32, device)?,
+        })
+    }
+
+    /// Write `input_ids` and `positions` into pre-allocated buffers and return
+    /// narrow views of the correct batch size. Zero-copy on the GPU side.
+    fn update(
+        &self,
+        input_ids: &[u32],
+        positions: &[u32],
+    ) -> Result<(Tensor, Tensor), candle_core::Error> {
+        let batch_size = input_ids.len();
+        debug_assert!(batch_size <= self.max_batch);
+        debug_assert_eq!(input_ids.len(), positions.len());
+
+        // memcpy into existing device buffers.
+        Self::memcpy_htod(&self.d_input_ids, input_ids)?;
+        Self::memcpy_htod(&self.d_positions, positions)?;
+
+        // Return narrow views [0..batch_size] of the pre-allocated tensors.
+        let ids_view = self.d_input_ids.narrow(0, 0, batch_size)?;
+        let pos_view = self.d_positions.narrow(0, 0, batch_size)?;
+        Ok((ids_view, pos_view))
+    }
+
+    fn memcpy_htod(tensor: &Tensor, data: &[u32]) -> Result<(), candle_core::Error> {
+        use cudarc::driver::DevicePtr;
+        let cuda_dev = tensor.device().as_cuda_device()?;
+        let stream = cuda_dev.cuda_stream();
+        // Push the CUDA context to handle cross-thread execution
+        // (async scheduling runs execute_model on a dedicated thread).
+        let ctx = stream.context();
+        unsafe {
+            cudarc::driver::result::ctx::set_current(ctx.cu_ctx())
+                .map_err(|e| candle_core::Error::Msg(format!("set CUDA context: {e}")))?;
+        }
+        let (storage, layout) = tensor.storage_and_layout();
+        match &*storage {
+            candle_core::Storage::Cuda(cs) => {
+                let slice = cs.as_cuda_slice::<u32>()?;
+                let view = slice.slice(layout.start_offset()..);
+                let (ptr, _sync) = view.device_ptr(&stream);
+                unsafe {
+                    cudarc::driver::result::memcpy_htod_sync(ptr, data)
+                        .map_err(|e| candle_core::Error::Msg(format!("memcpy_htod: {e}")))?;
+                }
+                Ok(())
+            }
+            _ => Err(candle_core::Error::Msg("expected CUDA tensor".into())),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +338,8 @@ impl CandleWorker {
             cuda_graph_runner: None,
             #[cfg(feature = "cuda")]
             sampling_buffers: None,
+            #[cfg(feature = "cuda")]
+            input_buffers: None,
         }
     }
 
@@ -1503,7 +1583,7 @@ impl Worker for CandleWorker {
             self.kv_block_pool = Some(pool);
         }
 
-        // Pre-allocate GPU sampling buffers on CUDA devices.
+        // Pre-allocate GPU buffers on CUDA devices.
         #[cfg(feature = "cuda")]
         if self.device.as_ref().is_some_and(|d| d.is_cuda()) {
             let device = self.device.as_ref().unwrap();
@@ -1515,6 +1595,15 @@ impl Worker for CandleWorker {
                 }
                 Err(e) => {
                     warn!("CandleWorker: failed to pre-allocate sampling buffers: {e}");
+                }
+            }
+            match ModelInputBuffers::new(max_batch, device) {
+                Ok(bufs) => {
+                    info!("CandleWorker: pre-allocated input buffers (max_batch={max_batch})");
+                    self.input_buffers = Some(bufs);
+                }
+                Err(e) => {
+                    warn!("CandleWorker: failed to pre-allocate input buffers: {e}");
                 }
             }
         }
@@ -1831,10 +1920,28 @@ impl Worker for CandleWorker {
                 return Ok(ModelRunnerOutput::from_token_map(HashMap::new()));
             }
 
-            let flat_ids = Tensor::new(prepared.flat_token_ids.as_slice(), device)
-                .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
-            let flat_pos = Tensor::new(prepared.flat_positions.as_slice(), device)
-                .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+            // Use pre-allocated input buffers when available (CUDA decode path).
+            #[cfg(feature = "cuda")]
+            let (flat_ids, flat_pos) = if let Some(ref bufs) = self.input_buffers
+                && prepared.flat_token_ids.len() <= bufs.max_batch
+            {
+                bufs.update(&prepared.flat_token_ids, &prepared.flat_positions)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("input buf error: {e}")))?
+            } else {
+                let ids = Tensor::new(prepared.flat_token_ids.as_slice(), device)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+                let pos = Tensor::new(prepared.flat_positions.as_slice(), device)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+                (ids, pos)
+            };
+            #[cfg(not(feature = "cuda"))]
+            let (flat_ids, flat_pos) = {
+                let ids = Tensor::new(prepared.flat_token_ids.as_slice(), device)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+                let pos = Tensor::new(prepared.flat_positions.as_slice(), device)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))?;
+                (ids, pos)
+            };
 
             // --- CUDA graph fast path for all-decode batches ---
             #[cfg(feature = "cuda")]

@@ -935,6 +935,7 @@ mod tests {
 
     // -- TLS tests --
 
+    #[cfg(feature = "tls")]
     /// Generate a self-signed CA certificate and a server certificate signed by it.
     /// Returns (ca_cert_pem, server_cert_pem, server_key_pem).
     fn generate_test_certs() -> (String, String, String) {
@@ -956,6 +957,7 @@ mod tests {
         (ca_cert.pem(), server_cert.pem(), server_key.serialize_pem())
     }
 
+    #[cfg(feature = "tls")]
     /// Write PEM content to a temp file and return the path.
     fn write_pem_file(dir: &tempfile::TempDir, name: &str, pem: &str) -> String {
         let path = dir.path().join(name);
@@ -963,6 +965,7 @@ mod tests {
         path.to_str().unwrap().to_string()
     }
 
+    #[cfg(feature = "tls")]
     fn make_tls_test_state(
         certfile: String,
         keyfile: String,
@@ -1007,6 +1010,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "tls")]
     #[tokio::test]
     async fn test_tls_health_endpoint() {
         let (ca_pem, cert_pem, key_pem) = generate_test_certs();
@@ -1067,6 +1071,7 @@ mod tests {
         let _ = server_task.await;
     }
 
+    #[cfg(feature = "tls")]
     #[tokio::test]
     async fn test_tls_rejects_plain_http() {
         let (_ca_pem, cert_pem, key_pem) = generate_test_certs();
@@ -1112,6 +1117,7 @@ mod tests {
         let _ = server_task.await;
     }
 
+    #[cfg(feature = "tls")]
     #[test]
     fn test_build_tls_config_missing_certfile() {
         let result = build_tls_config("/nonexistent/cert.pem", "/nonexistent/key.pem", None);
@@ -1120,6 +1126,7 @@ mod tests {
         assert!(err.contains("ssl_certfile"), "error was: {err}");
     }
 
+    #[cfg(feature = "tls")]
     #[test]
     fn test_build_tls_config_missing_keyfile() {
         let tmp = tempfile::tempdir().unwrap();

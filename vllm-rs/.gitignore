@@ -1,3 +1,6 @@
 /target/
 **/*.rs.bk
 Cargo.lock
+
+# Override root *.csv ignore for parity data
+!parity.csv

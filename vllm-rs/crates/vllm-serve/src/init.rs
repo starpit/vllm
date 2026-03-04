@@ -132,6 +132,20 @@ pub struct InitializedStack {
     pub max_model_len: usize,
 }
 
+/// Result of [`initialize_stack_sync`]: the raw engine components for
+/// synchronous (offline) use — no async channels, no background step loop.
+/// Used by [`LLM`](crate::llm::LLM) to match Python's direct engine path.
+pub struct InitializedSyncStack {
+    /// In-process engine core client (owns scheduler + executor).
+    pub client: InprocClient,
+    /// Optional tokenizer for encoding prompts / decoding outputs.
+    pub tokenizer: Option<Arc<Tokenizer>>,
+    /// Model name for display.
+    pub model_name: String,
+    /// Maximum model length.
+    pub max_model_len: usize,
+}
+
 /// Check if the metal (MLX) feature is active and the device allows it.
 #[cfg(feature = "metal")]
 fn should_use_mlx(device: &str) -> bool {
@@ -270,45 +284,30 @@ fn init_cache(
     Ok((worker, available_memory, num_gpu_blocks, utilization))
 }
 
-/// Initialize the full vLLM stack from a [`VllmConfig`].
-///
-/// Sequence:
-/// 1. Create worker config from args
-/// 2. Init device, load model
-/// 3. Read HfModelConfig for max_position_embeddings, num_layers, etc.
-/// 4. Determine available memory, compute num_gpu_blocks
-/// 5. Initialize cache
-/// 6. Wrap worker in UniProcExecutor
-/// 7. Build EngineCoreConfig, create InprocClient
-/// 8. Load tokenizer from model_dir
-/// 9. Create AsyncEngine
-/// 10. Return InitializedStack
-pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
-    let init_start = Instant::now();
-    let model_path = config.model.clone();
+#[allow(dead_code)]
+struct InitializedCore {
+    client: InprocClient,
+    tokenizer: Option<Arc<Tokenizer>>,
+    model_name: String,
+    max_model_len: usize,
+    model_dir: Option<std::path::PathBuf>,
+    hf_config: HfModelConfig,
+}
 
-    // Extract model name before moving model_path into the worker config.
+/// Common initialization: worker → cache → executor → InprocClient → tokenizer.
+///
+/// Shared by [`initialize_stack`] (async server path) and
+/// [`initialize_stack_sync`] (sync LLM path).
+fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
+    let model_path = config.model.clone();
     let model_name = extract_model_name(&model_path).into_owned();
 
-    let tp_size = config.tensor_parallel_size;
-
-    // TP > 1: multi-GPU path with NCCL.
-    if tp_size > 1 {
-        return initialize_stack_tp(config, model_name, init_start);
-    }
-
-    // TP=1: single-GPU path (original flow).
-
-    // Decide backend: MLX (Metal) or Candle (CPU/CUDA).
     let (mut worker, hf_config, model_dir, model_dtype) = create_worker(config, model_path)?;
 
-    // Log resolved architecture.
     if let Some(arch) = worker.architecture() {
         info!("Resolved model architecture: {}", arch);
     }
 
-    // Take the tokenizer that was loaded in parallel during load_model().
-    // This avoids a redundant parse of tokenizer.json later.
     let preloaded_tokenizer = worker.take_preloaded_tokenizer();
 
     let max_model_len = config
@@ -346,27 +345,18 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         kv_cache_tokens as f64 / max_model_len as f64
     );
 
-    // Set gpu_cache_blocks_total early so /stats shows it before first request.
     #[cfg(feature = "metrics")]
     {
         let m = crate::metrics::VllmMetrics::global();
         m.gpu_cache_blocks_total.set(num_gpu_blocks as i64);
     }
 
-    // 5b. Compile / warm up model (CUDA graph capture if enabled).
     worker
         .compile_or_warm_up_model()
         .context("failed to compile or warm up model")?;
 
-    // 6. Wrap in UniProcExecutor (pre-initialized — skip init sequence).
     let executor = UniProcExecutor::new_pre_initialized(worker);
 
-    // 7. Build engine config and create InprocClient.
-    //    Extract EOS token ID from model config if available.
-    // Parse all EOS token IDs from config.json. Models like LLaMA 3 have
-    // multiple: [128001 (<|end_of_text|>), 128008 (<|eom_id|>), 128009 (<|eot_id|>)].
-    // Python vLLM checks the primary via eos_token_id and adds the rest to
-    // stop_token_ids; we check all of them in check_stop_criteria.
     let eos_token_ids: Vec<u32> = hf_config
         .extra
         .get("eos_token_id")
@@ -387,7 +377,6 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
     }
 
     let use_async_scheduling = !config.disable_async_scheduling;
-
     let enable_prefix_caching = config.enable_prefix_caching;
 
     let engine_config = EngineCoreConfig {
@@ -419,12 +408,8 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         enable_prefix_caching,
     };
 
-    let client = Box::new(InprocClient::new(engine_config, Box::new(executor)));
+    let client = InprocClient::new(engine_config, Box::new(executor));
 
-    // 8. Try to load tokenizer and chat template from model directory.
-    //
-    // Use the tokenizer that was pre-loaded in parallel during load_model()
-    // when available, avoiding a redundant parse of tokenizer.json.
     let loaded_tokenizer = preloaded_tokenizer
         .map(Tokenizer::from_hf_tokenizer)
         .or_else(|| {
@@ -439,20 +424,65 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
                 })
         });
 
-    let engine = if let Some(tok) = loaded_tokenizer {
-        let dir_for_log = model_dir
-            .as_ref()
-            .map(|d| d.display().to_string())
-            .unwrap_or_else(|| "<preloaded>".to_string());
-        info!("Tokenizer loaded from {}", dir_for_log);
-        let tokenizer = Arc::new(tok);
+    let tokenizer = loaded_tokenizer.map(|tok| {
+        info!("Tokenizer loaded");
+        Arc::new(tok)
+    });
 
-        // Try to load chat template from tokenizer_config.json.
+    Ok(InitializedCore {
+        client,
+        tokenizer,
+        model_name,
+        max_model_len,
+        model_dir,
+        hf_config,
+    })
+}
+
+/// Initialize the sync stack for offline batch inference (no async overhead).
+///
+/// Used by [`LLM`](crate::llm::LLM). Returns an [`InprocClient`] that the
+/// caller drives directly with `add_request()` + `get_output()`.
+pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack> {
+    let init_start = Instant::now();
+    let core = initialize_core(config)?;
+    info!(
+        "init engine (load model, create kv cache) took {:.2} seconds",
+        init_start.elapsed().as_secs_f64()
+    );
+    Ok(InitializedSyncStack {
+        client: core.client,
+        tokenizer: core.tokenizer,
+        model_name: core.model_name,
+        max_model_len: core.max_model_len,
+    })
+}
+
+pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
+    let init_start = Instant::now();
+
+    let tp_size = config.tensor_parallel_size;
+    let model_name = extract_model_name(&config.model).into_owned();
+
+    // TP > 1: multi-GPU path with NCCL.
+    if tp_size > 1 {
+        return initialize_stack_tp(config, model_name, init_start);
+    }
+
+    // TP=1: single-GPU path.
+    let core = initialize_core(config)?;
+
+    let client = Box::new(core.client);
+
+    let model_name = core.model_name;
+    let max_model_len = core.max_model_len;
+
+    let engine = if let Some(tokenizer) = core.tokenizer {
         #[cfg(feature = "chat-template")]
         {
-            let chat_template = model_dir
-                .as_ref()
-                .and_then(|dir| try_load_chat_template(dir));
+            let chat_template = core.model_dir.as_ref().and_then(|dir| {
+                try_load_chat_template(dir)
+            });
             if let Some(tpl) = chat_template {
                 info!("Chat template loaded from tokenizer_config.json");
                 AsyncEngine::with_tokenizer_and_template(
@@ -476,7 +506,6 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         AsyncEngine::new(client, model_name.clone(), max_model_len)
     };
 
-    // 9. Enable async scheduling unless disabled. Configure pooling mode.
     let mut engine = engine;
     if !config.disable_async_scheduling {
         engine.set_async_scheduling(true);
@@ -486,9 +515,9 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         info!("Runner: pooling mode (embedding requests go through scheduler)");
     }
 
-    // 10. Configure multimodal support if the model has a vision_config.
+    // Configure multimodal support if the model has a vision_config.
+    let hf_config = &core.hf_config;
     if let Some(vision_config) = hf_config.extra.get("vision_config") {
-        // Detect model type for architecture-specific defaults.
         let is_qwen2_vl = hf_config.architectures.iter().any(|a| {
             a == "Qwen2VLForConditionalGeneration" || a == "Qwen2_5_VLForConditionalGeneration"
         });

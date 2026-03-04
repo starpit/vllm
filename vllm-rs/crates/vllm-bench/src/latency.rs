@@ -181,7 +181,7 @@ pub(crate) fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
     for model in &models {
         eprintln!("\nLoading model: {model}");
         let load_start = Instant::now();
-        let llm = create_llm(&args, model)?;
+        let mut llm = create_llm(&args, model)?;
         eprintln!("Model loaded in {:.2}s", load_start.elapsed().as_secs_f64());
 
         let required_len = args.input_len + args.output_len;

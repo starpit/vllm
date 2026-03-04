@@ -10,7 +10,7 @@
 //! ```rust,no_run
 //! use vllm_serve::llm::LLM;
 //!
-//! let llm = LLM::new("HuggingFaceTB/SmolLM2-135M")?;
+//! let mut llm = LLM::new("HuggingFaceTB/SmolLM2-135M")?;
 //! let outputs = llm.generate(&["Hello, world!"], None)?;
 //! for output in &outputs {
 //!     println!("{}", output.outputs[0].text);
@@ -19,17 +19,18 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
-use tokio::task::JoinHandle;
+use anyhow::Result;
 
 pub use vllm_common::SamplingParams;
-
+use vllm_common::EngineCoreRequest;
 use vllm_config::CudaGraphConfig;
+use vllm_engine::core_client::{EngineCoreClient, InprocClient};
 
-use crate::engine::AsyncEngine;
-use crate::init::{InitializedStack, VllmConfig};
-use crate::protocol;
+use crate::detokenizer::IncrementalDetokenizer;
+use crate::init::VllmConfig;
+use crate::tokenizer::Tokenizer;
 
 // ---------------------------------------------------------------------------
 // Output types
@@ -265,12 +266,12 @@ impl LLMBuilder {
 
 /// Offline batch inference engine.
 ///
-/// Owns a tokio runtime and an [`AsyncEngine`]. Provides synchronous
-/// `generate()` and `chat()` methods that block until all outputs are ready.
+/// Owns an [`InprocClient`] and drives it synchronously with a tight
+/// `add_request()` + `while has_unfinished: get_output()` loop — matching
+/// Python's `LLM._run_engine()`. No async channels, no background step loop.
 pub struct LLM {
-    engine: Arc<AsyncEngine>,
-    runtime: tokio::runtime::Runtime,
-    _step_handle: JoinHandle<()>,
+    client: InprocClient,
+    tokenizer: Option<Arc<Tokenizer>>,
     model_name: String,
     max_model_len: usize,
 }
@@ -290,32 +291,12 @@ impl LLM {
 
     /// Internal constructor from a fully-specified config.
     fn from_config(config: VllmConfig) -> Result<Self> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("failed to create tokio runtime")?;
-
-        let InitializedStack {
-            engine,
-            model_name,
-            max_model_len,
-        } = runtime.block_on(async {
-            // initialize_stack is sync but we run inside the runtime so
-            // spawn_step_loop (which needs a tokio context) works later.
-            tokio::task::block_in_place(|| crate::init::initialize_stack(&config))
-        })?;
-
-        // Enter the runtime context so tokio::spawn works inside
-        // spawn_step_loop (needed for async scheduling path).
-        let _guard = runtime.enter();
-        let step_handle = engine.spawn_step_loop();
-
+        let stack = crate::init::initialize_stack_sync(&config)?;
         Ok(Self {
-            engine,
-            runtime,
-            _step_handle: step_handle,
-            model_name,
-            max_model_len,
+            client: stack.client,
+            tokenizer: stack.tokenizer,
+            model_name: stack.model_name,
+            max_model_len: stack.max_model_len,
         })
     }
 
@@ -327,6 +308,30 @@ impl LLM {
     /// The maximum context length.
     pub fn max_model_len(&self) -> usize {
         self.max_model_len
+    }
+
+    /// Tokenize a text string, using the tokenizer if available.
+    fn tokenize_text(&self, text: &str) -> Result<Vec<u32>> {
+        if let Some(tok) = &self.tokenizer {
+            if text.is_empty() {
+                Ok(vec![])
+            } else {
+                Ok(tok.encode(text, false)?)
+            }
+        } else if text.is_empty() {
+            Ok(vec![0])
+        } else {
+            Ok(text.as_bytes().iter().map(|&b| b as u32).collect())
+        }
+    }
+
+    /// Resolve `max_tokens` to fit within `max_model_len - prompt_len`.
+    fn resolve_max_tokens(&self, sp: &mut SamplingParams, num_prompt_tokens: usize) {
+        let remaining = self.max_model_len.saturating_sub(num_prompt_tokens);
+        match sp.max_tokens {
+            None => sp.max_tokens = Some(remaining as u32),
+            Some(val) => sp.max_tokens = Some(val.min(remaining as u32)),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -346,7 +351,7 @@ impl LLM {
     ///
     /// ```rust,no_run
     /// # use vllm_serve::llm::LLM;
-    /// # let llm = LLM::new("model")?;
+    /// # let mut llm = LLM::new("model")?;
     /// // Text prompts:
     /// llm.generate(&["Hello", "World"], None)?;
     ///
@@ -355,7 +360,7 @@ impl LLM {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn generate<P: Into<Prompt> + Clone>(
-        &self,
+        &mut self,
         prompts: &[P],
         params: Option<SamplingParams>,
     ) -> Result<Vec<RequestOutput>> {
@@ -365,52 +370,127 @@ impl LLM {
             .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
 
         let n = params.n.max(1) as usize;
+        let detokenize = params.detokenize;
 
         // Convert all prompts to Prompt enum.
         let prompts: Vec<Prompt> = prompts.iter().map(|p| p.clone().into()).collect();
 
-        // Batch all prompts into a single CompletionRequest so the scheduler
-        // sees them together and can batch prefill + decode efficiently.
-        let request = build_batched_completion_request(&prompts, &params, &self.model_name);
+        // Tokenize text prompts; pass token ID prompts through directly.
+        let prompt_token_ids: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|p| match p {
+                Prompt::Text(text) => self.tokenize_text(text),
+                Prompt::TokenIds(ids) => Ok(ids.clone()),
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        let response = self
-            .runtime
-            .block_on(self.engine.completion(request))
-            .map_err(|e| anyhow::anyhow!("completion failed: {e}"))?;
+        let total = prompt_token_ids.len() * n;
+        let base_id = format!("llm-{}", uuid::Uuid::new_v4());
 
-        // The engine returns one CompletionResponseChoice per (prompt, n) pair.
-        // Group them back into per-prompt RequestOutputs.
-        let mut outputs = Vec::with_capacity(prompts.len());
-        let choices_per_prompt = n;
-        for (p_idx, chunk) in response.choices.chunks(choices_per_prompt).enumerate() {
-            let completion_outputs: Vec<CompletionOutput> = chunk
-                .iter()
-                .map(|c| CompletionOutput {
-                    index: c.index,
-                    text: c.text.clone(),
-                    token_ids: Vec::new(),
-                    finish_reason: c.finish_reason.clone(),
-                })
-                .collect();
+        // Submit all requests to the engine.
+        let mut request_ids: Vec<String> = Vec::with_capacity(total);
+        for (p_idx, prompt_ids) in prompt_token_ids.iter().enumerate() {
+            for n_idx in 0..n {
+                let request_id = if total == 1 {
+                    base_id.clone()
+                } else {
+                    format!("{base_id}-{}", p_idx * n + n_idx)
+                };
+
+                let mut sp = params.clone();
+                sp.seed = sp.seed.map(|s| s.wrapping_add(n_idx as u64));
+                self.resolve_max_tokens(&mut sp, prompt_ids.len());
+
+                self.client
+                    .add_request(EngineCoreRequest {
+                        request_id: request_id.clone(),
+                        prompt_token_ids: Some(prompt_ids.clone()),
+                        sampling_params: Some(sp),
+                        arrival_time: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs_f64(),
+                        client_index: 0,
+                        priority: 0,
+                        cache_salt: None,
+                        data_parallel_rank: None,
+                        is_pooling: false,
+                        mm_data: None,
+                    })
+                    .map_err(|e| anyhow::anyhow!("add_request failed: {e}"))?;
+
+                request_ids.push(request_id);
+            }
+        }
+
+        // Sync step loop — mirrors Python's LLM._run_engine().
+        let mut generated_tokens: Vec<Vec<u32>> = vec![Vec::new(); total];
+        let mut finish_reasons: Vec<Option<String>> = vec![None; total];
+
+        while self.client.engine().has_unfinished_requests() {
+            let (outputs, _) = self
+                .client
+                .get_output()
+                .map_err(|e| anyhow::anyhow!("engine step failed: {e}"))?;
+
+            for output in &outputs.outputs {
+                if let Some(idx) = request_ids.iter().position(|id| *id == output.request_id) {
+                    generated_tokens[idx].extend_from_slice(&output.new_token_ids);
+                    if let Some(ref reason) = output.finish_reason {
+                        finish_reasons[idx] = Some(reason.to_string());
+                    }
+                }
+            }
+        }
+
+        // Build RequestOutputs, grouping n completions per prompt.
+        // Detokenize finished sequences (if requested).
+        let mut results = Vec::with_capacity(prompts.len());
+        for p_idx in 0..prompts.len() {
+            let mut completion_outputs = Vec::with_capacity(n);
+            for i in 0..n {
+                let idx = p_idx * n + i;
+                let text = if detokenize {
+                    if let Some(tok) = &self.tokenizer {
+                        let mut detok = IncrementalDetokenizer::new(
+                            Arc::clone(tok),
+                            &prompt_token_ids[p_idx],
+                            params.stop.clone(),
+                            params.min_tokens,
+                            params.include_stop_str_in_output,
+                            params.skip_special_tokens,
+                        );
+                        detok.update(&generated_tokens[idx], false);
+                        detok.get_next_output_text(true, false)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                completion_outputs.push(CompletionOutput {
+                    index: i as u32,
+                    text,
+                    token_ids: generated_tokens[idx].clone(),
+                    finish_reason: finish_reasons[idx].clone(),
+                });
+            }
 
             let prompt_text = match &prompts[p_idx] {
                 Prompt::Text(text) => Some(text.clone()),
                 Prompt::TokenIds(_) => None,
             };
 
-            outputs.push(RequestOutput {
-                request_id: format!("{}-{p_idx}", response.id),
+            results.push(RequestOutput {
+                request_id: request_ids[p_idx * n].clone(),
                 prompt: prompt_text,
-                prompt_token_ids: match &prompts[p_idx] {
-                    Prompt::TokenIds(ids) => ids.clone(),
-                    Prompt::Text(_) => Vec::new(),
-                },
+                prompt_token_ids: prompt_token_ids[p_idx].clone(),
                 outputs: completion_outputs,
                 finished: true,
             });
         }
 
-        Ok(outputs)
+        Ok(results)
     }
 
     // -----------------------------------------------------------------------
@@ -419,195 +499,15 @@ impl LLM {
 
     /// Generate a chat completion from a list of messages.
     ///
-    /// Returns a single [`RequestOutput`] (since chat is typically one
-    /// conversation at a time). Use `SamplingParams::n` for multiple
-    /// completions of the same conversation.
+    /// TODO: Re-implement using sync path (needs chat template applied to
+    /// messages → token IDs, then reuse the same step loop as generate()).
+    /// For now this is unimplemented since the bench only uses generate().
     pub fn chat(
-        &self,
-        messages: &[ChatMessage],
-        params: Option<SamplingParams>,
+        &mut self,
+        _messages: &[ChatMessage],
+        _params: Option<SamplingParams>,
     ) -> Result<RequestOutput> {
-        let params = params.unwrap_or_default();
-        params
-            .validate()
-            .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
-
-        let n = params.n.max(1) as usize;
-        let request = build_chat_request(messages, &params, &self.model_name);
-
-        let response = self
-            .runtime
-            .block_on(self.engine.chat_completion(request))
-            .map_err(|e| anyhow::anyhow!("chat completion failed: {e}"))?;
-
-        Ok(chat_response_to_output(&response, n))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Request builders
-// ---------------------------------------------------------------------------
-
-/// Build a single batched CompletionRequest from multiple prompts.
-///
-/// Groups text prompts as `Multiple` and token-ID prompts as `MultipleTokenIds`.
-/// Mixed prompt types are not supported (token IDs take precedence if all are
-/// token IDs, otherwise all are text).
-fn build_batched_completion_request(
-    prompts: &[Prompt],
-    params: &SamplingParams,
-    model: &str,
-) -> protocol::CompletionRequest {
-    let prompt = if prompts.len() == 1 {
-        match &prompts[0] {
-            Prompt::Text(text) => protocol::CompletionPrompt::Single(text.clone()),
-            Prompt::TokenIds(ids) => protocol::CompletionPrompt::TokenIds(ids.clone()),
-        }
-    } else {
-        // Check if all prompts are the same variant.
-        let all_token_ids = prompts.iter().all(|p| matches!(p, Prompt::TokenIds(_)));
-        if all_token_ids {
-            let seqs: Vec<Vec<u32>> = prompts
-                .iter()
-                .map(|p| match p {
-                    Prompt::TokenIds(ids) => ids.clone(),
-                    Prompt::Text(_) => unreachable!(),
-                })
-                .collect();
-            protocol::CompletionPrompt::MultipleTokenIds(seqs)
-        } else {
-            let texts: Vec<String> = prompts
-                .iter()
-                .map(|p| match p {
-                    Prompt::Text(text) => text.clone(),
-                    Prompt::TokenIds(ids) => format!("<token_ids:{}>", ids.len()),
-                })
-                .collect();
-            protocol::CompletionPrompt::Multiple(texts)
-        }
-    };
-
-    let stop = if params.stop.is_empty() {
-        None
-    } else {
-        Some(protocol::StopCondition::Multiple(params.stop.clone()))
-    };
-
-    protocol::CompletionRequest {
-        model: Some(model.to_string()),
-        prompt: Some(prompt),
-        echo: false,
-        temperature: Some(params.temperature),
-        top_p: Some(params.top_p),
-        n: params.n,
-        max_tokens: params.max_tokens,
-        stream: false,
-        stream_options: None,
-        stop,
-        frequency_penalty: Some(params.frequency_penalty),
-        presence_penalty: Some(params.presence_penalty),
-        logit_bias: None,
-        logprobs: params.logprobs.map(|v| v.max(0) as u32),
-        prompt_logprobs: params.prompt_logprobs.map(|v| v.max(0) as u32),
-        suffix: None,
-        seed: params.seed.map(|s| s as i64),
-        user: None,
-        top_k: Some(params.top_k),
-        min_p: Some(params.min_p),
-        repetition_penalty: Some(params.repetition_penalty),
-        min_tokens: params.min_tokens,
-        stop_token_ids: params.stop_token_ids.clone(),
-        include_stop_str_in_output: params.include_stop_str_in_output,
-        ignore_eos: params.ignore_eos,
-        skip_special_tokens: params.skip_special_tokens,
-        priority: 0,
-        cache_salt: None,
-        request_id: None,
-        guided_regex: None,
-    }
-}
-
-fn build_chat_request(
-    messages: &[ChatMessage],
-    params: &SamplingParams,
-    model: &str,
-) -> protocol::ChatCompletionRequest {
-    let msgs: Vec<protocol::ChatCompletionMessageParam> = messages
-        .iter()
-        .map(|m| protocol::ChatCompletionMessageParam {
-            role: m.role.clone(),
-            content: Some(serde_json::Value::String(m.content.clone())),
-            name: None,
-            tool_calls: None,
-            tool_call_id: None,
-        })
-        .collect();
-
-    let stop = if params.stop.is_empty() {
-        None
-    } else {
-        Some(protocol::StopCondition::Multiple(params.stop.clone()))
-    };
-
-    protocol::ChatCompletionRequest {
-        model: Some(model.to_string()),
-        messages: msgs,
-        temperature: Some(params.temperature),
-        top_p: Some(params.top_p),
-        n: params.n,
-        max_tokens: params.max_tokens,
-        max_completion_tokens: None,
-        stream: false,
-        stream_options: None,
-        stop,
-        frequency_penalty: Some(params.frequency_penalty),
-        presence_penalty: Some(params.presence_penalty),
-        logit_bias: None,
-        logprobs: None,
-        top_logprobs: params.logprobs.map(|v| v.max(0) as u32),
-        prompt_logprobs: params.prompt_logprobs.map(|v| v.max(0) as u32),
-        seed: params.seed.map(|s| s as i64),
-        response_format: None,
-        tools: None,
-        tool_choice: None,
-        user: None,
-        top_k: Some(params.top_k),
-        min_p: Some(params.min_p),
-        repetition_penalty: Some(params.repetition_penalty),
-        min_tokens: params.min_tokens,
-        stop_token_ids: params.stop_token_ids.clone(),
-        include_stop_str_in_output: params.include_stop_str_in_output,
-        ignore_eos: params.ignore_eos,
-        skip_special_tokens: params.skip_special_tokens,
-        priority: 0,
-        cache_salt: None,
-        request_id: None,
-        guided_regex: None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Response → RequestOutput mapping
-// ---------------------------------------------------------------------------
-
-fn chat_response_to_output(resp: &protocol::ChatCompletionResponse, _n: usize) -> RequestOutput {
-    let outputs: Vec<CompletionOutput> = resp
-        .choices
-        .iter()
-        .map(|c| CompletionOutput {
-            index: c.index,
-            text: c.message.content.clone().unwrap_or_default(),
-            token_ids: Vec::new(),
-            finish_reason: c.finish_reason.clone(),
-        })
-        .collect();
-
-    RequestOutput {
-        request_id: resp.id.clone(),
-        prompt: None,
-        prompt_token_ids: Vec::new(),
-        outputs,
-        finished: true,
+        anyhow::bail!("LLM::chat() not yet implemented on sync path")
     }
 }
 
@@ -618,6 +518,80 @@ fn chat_response_to_output(resp: &protocol::ChatCompletionResponse, _n: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol;
+
+    fn build_batched_completion_request(
+        prompts: &[Prompt],
+        params: &SamplingParams,
+        model: &str,
+    ) -> protocol::CompletionRequest {
+        let prompt = if prompts.len() == 1 {
+            match &prompts[0] {
+                Prompt::Text(text) => protocol::CompletionPrompt::Single(text.clone()),
+                Prompt::TokenIds(ids) => protocol::CompletionPrompt::TokenIds(ids.clone()),
+            }
+        } else {
+            let all_token_ids = prompts.iter().all(|p| matches!(p, Prompt::TokenIds(_)));
+            if all_token_ids {
+                let seqs: Vec<Vec<u32>> = prompts
+                    .iter()
+                    .map(|p| match p {
+                        Prompt::TokenIds(ids) => ids.clone(),
+                        Prompt::Text(_) => unreachable!(),
+                    })
+                    .collect();
+                protocol::CompletionPrompt::MultipleTokenIds(seqs)
+            } else {
+                let texts: Vec<String> = prompts
+                    .iter()
+                    .map(|p| match p {
+                        Prompt::Text(text) => text.clone(),
+                        Prompt::TokenIds(ids) => format!("<token_ids:{}>", ids.len()),
+                    })
+                    .collect();
+                protocol::CompletionPrompt::Multiple(texts)
+            }
+        };
+
+        let stop = if params.stop.is_empty() {
+            None
+        } else {
+            Some(protocol::StopCondition::Multiple(params.stop.clone()))
+        };
+
+        protocol::CompletionRequest {
+            model: Some(model.to_string()),
+            prompt: Some(prompt),
+            echo: false,
+            temperature: Some(params.temperature),
+            top_p: Some(params.top_p),
+            n: params.n,
+            max_tokens: params.max_tokens,
+            stream: false,
+            stream_options: None,
+            stop,
+            frequency_penalty: Some(params.frequency_penalty),
+            presence_penalty: Some(params.presence_penalty),
+            logit_bias: None,
+            logprobs: params.logprobs.map(|v| v.max(0) as u32),
+            prompt_logprobs: params.prompt_logprobs.map(|v| v.max(0) as u32),
+            suffix: None,
+            seed: params.seed.map(|s| s as i64),
+            user: None,
+            top_k: Some(params.top_k),
+            min_p: Some(params.min_p),
+            repetition_penalty: Some(params.repetition_penalty),
+            min_tokens: params.min_tokens,
+            stop_token_ids: params.stop_token_ids.clone(),
+            include_stop_str_in_output: params.include_stop_str_in_output,
+            ignore_eos: params.ignore_eos,
+            skip_special_tokens: params.skip_special_tokens,
+            priority: 0,
+            cache_salt: None,
+            request_id: None,
+            guided_regex: None,
+        }
+    }
 
     #[test]
     fn test_builder_defaults() {
@@ -753,52 +727,6 @@ mod tests {
             Some(protocol::CompletionPrompt::Multiple(ref texts))
                 if texts.len() == 2 && texts[0] == "Hello" && texts[1] == "World"
         ));
-    }
-
-    #[test]
-    fn test_build_chat_request() {
-        let messages = vec![ChatMessage::system("Be helpful."), ChatMessage::user("Hi")];
-        let params = SamplingParams::default();
-        let req = build_chat_request(&messages, &params, "test-model");
-        assert_eq!(req.messages.len(), 2);
-        assert_eq!(req.messages[0].role, "system");
-        assert_eq!(req.messages[1].role, "user");
-        assert!(!req.stream);
-    }
-
-    #[test]
-    fn test_chat_response_to_output() {
-        let resp = protocol::ChatCompletionResponse {
-            id: "chat-456".to_string(),
-            object: "chat.completion".to_string(),
-            created: 0,
-            model: "test".to_string(),
-            choices: vec![protocol::ChatCompletionResponseChoice {
-                index: 0,
-                message: protocol::ChatMessage {
-                    role: "assistant".to_string(),
-                    content: Some("Hi there!".to_string()),
-                    refusal: None,
-                    tool_calls: None,
-                    reasoning: None,
-                },
-                logprobs: None,
-                finish_reason: Some("stop".to_string()),
-                stop_reason: None,
-                prompt_logprobs: None,
-            }],
-            system_fingerprint: None,
-            usage: protocol::UsageInfo {
-                prompt_tokens: 2,
-                total_tokens: 5,
-                completion_tokens: Some(3),
-                prompt_tokens_details: None,
-            },
-        };
-        let output = chat_response_to_output(&resp, 1);
-        assert_eq!(output.request_id, "chat-456");
-        assert_eq!(output.outputs[0].text, "Hi there!");
-        assert!(output.finished);
     }
 
     #[test]

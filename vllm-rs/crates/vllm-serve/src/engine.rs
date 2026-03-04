@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, error, info};
@@ -129,6 +129,11 @@ struct EmbedRequest {
     reply: tokio::sync::oneshot::Sender<ServeResult<Vec<Vec<f32>>>>,
 }
 
+/// Maximum time the step loop can run with pending requests but no output
+/// tokens before aborting all requests. Acts as a safety net for scheduler
+/// bugs where requests get stuck without making forward progress.
+const DEFAULT_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// An async wrapper around the engine core client, providing request lifecycle
 /// management for the HTTP serving layer.
 ///
@@ -188,6 +193,9 @@ pub struct AsyncEngine {
     mm_model_type: String,
     /// Whether the engine is in pooling mode (embedding requests go through scheduler).
     is_pooling: bool,
+    /// Maximum time the step loop can have pending requests with no output
+    /// before aborting them. Configurable for tests (default: 60s).
+    no_progress_timeout: Duration,
 }
 
 impl AsyncEngine {
@@ -222,6 +230,7 @@ impl AsyncEngine {
             mm_image_size: 0,
             mm_model_type: String::new(),
             is_pooling: false,
+            no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
         }
     }
 
@@ -233,6 +242,12 @@ impl AsyncEngine {
     /// Whether the engine is in pooling mode.
     pub fn is_pooling(&self) -> bool {
         self.is_pooling
+    }
+
+    /// Override the no-progress watchdog timeout (for testing).
+    #[cfg(test)]
+    fn set_no_progress_timeout(&mut self, timeout: Duration) {
+        self.no_progress_timeout = timeout;
     }
 
     /// Create a new `AsyncEngine` with a tokenizer for real text processing.
@@ -1002,6 +1017,7 @@ impl AsyncEngine {
         // sees alive=false before the spawned task starts.
         alive.store(true, Ordering::Release);
 
+        let no_progress_timeout = self.no_progress_timeout;
         if self.async_scheduling {
             info!("Async scheduling enabled — overlapping GPU execution with CPU scheduling");
             Self::spawn_step_loop_async(
@@ -1011,6 +1027,7 @@ impl AsyncEngine {
                 Arc::clone(&self.requests),
                 Arc::clone(&self.notify),
                 alive,
+                no_progress_timeout,
             )
         } else {
             Self::spawn_step_loop_inner(
@@ -1020,6 +1037,7 @@ impl AsyncEngine {
                 Arc::clone(&self.requests),
                 Arc::clone(&self.notify),
                 alive,
+                no_progress_timeout,
             )
         }
     }
@@ -1032,8 +1050,10 @@ impl AsyncEngine {
         requests: Arc<Mutex<HashMap<String, RequestState>>>,
         notify: Arc<Notify>,
         alive: Arc<AtomicBool>,
+        no_progress_timeout: Duration,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let mut last_progress = Instant::now();
             loop {
                 // 0. Drain pending embedding requests (synchronous, bypasses scheduler).
                 while let Ok(embed_req) = embed_rx.try_recv() {
@@ -1059,6 +1079,8 @@ impl AsyncEngine {
                 };
 
                 if !has_requests && !added {
+                    // Reset watchdog timer when idle (no pending requests).
+                    last_progress = Instant::now();
                     // Block until a new request arrives on either channel.
                     tokio::select! {
                         Some(ec_request) = request_rx.recv() => {
@@ -1101,12 +1123,41 @@ impl AsyncEngine {
 
                         // 5. Route outputs to requests (brief lock).
                         if !outputs.outputs.is_empty() {
+                            last_progress = Instant::now();
                             let mut reqs = requests.lock().await;
                             for output in outputs.outputs {
                                 Self::process_output(&mut reqs, output);
                             }
                             // Wake waiters only when there are actual outputs.
                             notify.notify_waiters();
+                        } else if has_requests && last_progress.elapsed() > no_progress_timeout {
+                            // Watchdog: no output tokens for too long with pending
+                            // requests — likely a scheduler bug. Abort everything.
+                            let reqs_count = {
+                                let r = requests.lock().await;
+                                r.len()
+                            };
+                            error!(
+                                "No output tokens for {:?} with {} pending requests \
+                                 — aborting all (no-progress watchdog)",
+                                last_progress.elapsed(),
+                                reqs_count,
+                            );
+                            let err_msg = format!(
+                                "No-progress watchdog: no output tokens for {:?}",
+                                last_progress.elapsed(),
+                            );
+                            client.abort_running_requests();
+                            let mut reqs = requests.lock().await;
+                            for req_state in reqs.values_mut() {
+                                if req_state.finish_reason.is_none() {
+                                    req_state.finish_reason = Some(FinishReason::Abort);
+                                    req_state.error = Some(err_msg.clone());
+                                }
+                            }
+                            drop(reqs);
+                            notify.notify_waiters();
+                            last_progress = Instant::now();
                         } else if !model_executed {
                             // No work done — yield to avoid busy-spinning.
                             tokio::task::yield_now().await;
@@ -1150,6 +1201,7 @@ impl AsyncEngine {
         requests: Arc<Mutex<HashMap<String, RequestState>>>,
         notify: Arc<Notify>,
         alive: Arc<AtomicBool>,
+        no_progress_timeout: Duration,
     ) -> tokio::task::JoinHandle<()> {
         // Take the executor out of the client for the dedicated thread.
         let executor = client
@@ -1183,6 +1235,7 @@ impl AsyncEngine {
                 ModelRunnerOutput,
             )> = None;
             let mut gpu_in_flight: u32 = 0;
+            let mut last_progress = Instant::now();
 
             loop {
                 // 0. Drain pending embedding requests.
@@ -1219,7 +1272,9 @@ impl AsyncEngine {
                 if let Some((prev_sched, prev_output)) = deferred.take() {
                     match client.finalize_step(&prev_sched, &prev_output) {
                         Ok(outputs) => {
-                            route_step_outputs(&requests, outputs).await;
+                            if route_step_outputs(&requests, outputs).await {
+                                last_progress = Instant::now();
+                            }
                         }
                         Err(e) => {
                             error!("finalize_step error: {}", e);
@@ -1297,6 +1352,7 @@ impl AsyncEngine {
                     };
 
                     if !has_requests && !added {
+                        last_progress = Instant::now();
                         tokio::select! {
                             Some(ec_request) = request_rx.recv() => {
                                 if let Err(e) = client.add_request(ec_request) {
@@ -1327,6 +1383,34 @@ impl AsyncEngine {
                             }
                             else => break, // Both channels closed.
                         }
+                    } else if has_requests && last_progress.elapsed() > no_progress_timeout {
+                        // Watchdog: no output tokens for too long with pending
+                        // requests — likely a scheduler bug. Abort everything.
+                        let reqs_count = {
+                            let r = requests.lock().await;
+                            r.len()
+                        };
+                        error!(
+                            "No output tokens for {:?} with {} pending requests \
+                             — aborting all (no-progress watchdog, async)",
+                            last_progress.elapsed(),
+                            reqs_count,
+                        );
+                        let err_msg = format!(
+                            "No-progress watchdog: no output tokens for {:?}",
+                            last_progress.elapsed(),
+                        );
+                        client.abort_running_requests();
+                        let mut reqs = requests.lock().await;
+                        for req_state in reqs.values_mut() {
+                            if req_state.finish_reason.is_none() {
+                                req_state.finish_reason = Some(FinishReason::Abort);
+                                req_state.error = Some(err_msg.clone());
+                            }
+                        }
+                        drop(reqs);
+                        notify.notify_waiters();
+                        last_progress = Instant::now();
                     } else {
                         tokio::task::yield_now().await;
                     }
@@ -2209,10 +2293,12 @@ fn executor_thread_loop(
 }
 
 /// Route step outputs to request states and update metrics.
+/// Returns `true` if any output tokens were produced.
 async fn route_step_outputs(
     requests: &Mutex<HashMap<String, RequestState>>,
     outputs: vllm_engine::engine_core::StepOutputs,
-) {
+) -> bool {
+    let mut had_outputs = false;
     for (_, engine_outputs) in outputs {
         // Update scheduler gauges from stats.
         #[cfg(feature = "metrics")]
@@ -2229,12 +2315,14 @@ async fn route_step_outputs(
         }
 
         if !engine_outputs.outputs.is_empty() {
+            had_outputs = true;
             let mut reqs = requests.lock().await;
             for output in engine_outputs.outputs {
                 AsyncEngine::process_output(&mut reqs, output);
             }
         }
     }
+    had_outputs
 }
 
 // ---------------------------------------------------------------------------
@@ -2441,6 +2529,7 @@ mod tests {
     use vllm_engine::core_client::InprocClient;
     use vllm_engine::engine_core::EngineCoreConfig;
     use vllm_engine::executor::NoopExecutor;
+    use vllm_protocol::messages::PauseMode;
 
     fn make_test_request_state(
         stream_tx: Option<mpsc::UnboundedSender<StreamDelta>>,
@@ -3431,6 +3520,99 @@ mod tests {
         let mut engine = AsyncEngine::new(client, "test-model".to_string(), 4096);
         engine.set_async_scheduling(async_scheduling);
         engine
+    }
+
+    /// A mock client that always returns empty outputs (simulates the
+    /// scheduler never scheduling any requests — the no-progress bug).
+    struct NoProgressClient;
+
+    impl EngineCoreClient for NoProgressClient {
+        fn get_output(
+            &mut self,
+        ) -> vllm_engine::error::EngineResult<(vllm_common::EngineCoreOutputs, bool)> {
+            // Simulate scheduler returning nothing to schedule.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            Ok((
+                vllm_common::EngineCoreOutputs {
+                    engine_index: 0,
+                    outputs: vec![],
+                    timestamp: 0.0,
+                    scheduler_stats: None,
+                },
+                false,
+            ))
+        }
+
+        fn add_request(
+            &mut self,
+            _request: EngineCoreRequest,
+        ) -> vllm_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn abort_requests(
+            &mut self,
+            _request_ids: &[String],
+        ) -> vllm_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn abort_running_requests(&mut self) {}
+
+        fn shutdown(&mut self) -> vllm_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn reset_prefix_cache(&mut self) -> vllm_engine::error::EngineResult<bool> {
+            Ok(true)
+        }
+
+        fn pause_scheduler(&mut self, _mode: PauseMode) -> vllm_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn resume_scheduler(&mut self) -> vllm_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn is_scheduler_paused(&self) -> bool {
+            false
+        }
+    }
+
+    fn make_no_progress_engine() -> AsyncEngine {
+        let client: Box<dyn EngineCoreClient + Send> = Box::new(NoProgressClient);
+        let mut engine = AsyncEngine::new(client, "test-model".to_string(), 4096);
+        engine.set_no_progress_timeout(Duration::from_secs(2));
+        engine
+    }
+
+    /// Test that the no-progress watchdog aborts requests stuck with no output.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_no_progress_watchdog() {
+        let engine = Arc::new(make_no_progress_engine());
+        engine.spawn_step_loop();
+
+        let request = make_chat_request();
+
+        // Submit a request. The mock client never produces output tokens,
+        // so the watchdog should abort it after ~2 seconds.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.chat_completion(request),
+        )
+        .await;
+
+        // Must not time out (watchdog should fire within ~2s).
+        let inner = result.expect("request timed out — no-progress watchdog did not fire");
+
+        // Must be an error (aborted by watchdog).
+        let err = inner.expect_err("expected error from no-progress watchdog");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("No-progress watchdog") || err_msg.contains("step loop exited"),
+            "unexpected error: {err_msg}"
+        );
     }
 
     /// Test that a forward pass failure in the **sync** step loop aborts the

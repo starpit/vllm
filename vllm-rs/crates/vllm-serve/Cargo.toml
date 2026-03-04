@@ -54,3 +54,4 @@ http-body-util = "0.1"
 rcgen = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
+vllm-protocol = { workspace = true }

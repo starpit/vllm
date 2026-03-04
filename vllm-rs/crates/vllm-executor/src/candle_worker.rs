@@ -957,6 +957,151 @@ impl CandleWorker {
                 .map_err(|e| ExecutorError::WorkerExecution(format!("tensor error: {e}")))
         }
     }
+
+    /// Attempt batched GPU sampling for multiple requests in a single kernel
+    /// launch + single GPU sync, returning `true` if the batched path was used.
+    ///
+    /// When `true`, GPU-batchable requests have been sampled and committed to
+    /// `token_map`, and `cpu_fallback_indices` contains indices of requests
+    /// that need CPU-side sampling (grammar, penalties, logprobs, etc.).
+    ///
+    /// When `false` (non-CUDA, or <=1 GPU-batchable request), no sampling was
+    /// done and the caller should use the per-request fallback loop.
+    fn try_batched_gpu_sample(
+        &mut self,
+        req_inputs: &[crate::input_batch::ReqSlice],
+        per_req_logits: &[Tensor],
+        token_map: &mut HashMap<String, Vec<u32>>,
+        cpu_fallback_indices: &mut Vec<usize>,
+    ) -> ExecutorResult<bool> {
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (req_inputs, per_req_logits, token_map, cpu_fallback_indices);
+            Ok(false)
+        }
+
+        #[cfg(feature = "cuda")]
+        {
+            let is_cuda = self.device.as_ref().map(|d| d.is_cuda()).unwrap_or(false);
+            if !is_cuda {
+                return Ok(false);
+            }
+
+            let mut gpu_batch_indices: Vec<usize> = Vec::new();
+            cpu_fallback_indices.clear();
+
+            for (req_idx, req_slice) in req_inputs.iter().enumerate() {
+                if !req_slice.spec_token_ids.is_empty() {
+                    cpu_fallback_indices.push(req_idx);
+                    continue;
+                }
+
+                #[cfg(feature = "guided-decoding")]
+                let has_grammar = self
+                    .grammar_states
+                    .get(&req_slice.req_id)
+                    .and_then(|g| g.allowed_tokens())
+                    .is_some();
+                #[cfg(not(feature = "guided-decoding"))]
+                let has_grammar = false;
+
+                if has_grammar {
+                    cpu_fallback_indices.push(req_idx);
+                    continue;
+                }
+
+                if let Some(params) = self.sampling_params_map.get(&req_slice.req_id) {
+                    if can_gpu_sample(params) {
+                        gpu_batch_indices.push(req_idx);
+                    } else {
+                        cpu_fallback_indices.push(req_idx);
+                    }
+                } else {
+                    // No sampling params → greedy argmax, GPU-batchable with top_k=1.
+                    gpu_batch_indices.push(req_idx);
+                }
+            }
+
+            if gpu_batch_indices.len() <= 1 {
+                return Ok(false);
+            }
+
+            use rand::Rng;
+
+            let batch_size = gpu_batch_indices.len();
+            let mut logit_rows: Vec<Tensor> = Vec::with_capacity(batch_size);
+            let mut temperatures: Vec<f32> = Vec::with_capacity(batch_size);
+            let mut top_ks: Vec<i32> = Vec::with_capacity(batch_size);
+            let mut top_ps: Vec<f32> = Vec::with_capacity(batch_size);
+            let mut min_ps: Vec<f32> = Vec::with_capacity(batch_size);
+            let mut uniforms: Vec<f32> = Vec::with_capacity(batch_size);
+
+            let mut rng = rand::thread_rng();
+            for &idx in &gpu_batch_indices {
+                let req_slice = &req_inputs[idx];
+                let logits = &per_req_logits[idx];
+                let last_pos = req_slice.token_count - 1;
+                let last_row = logits
+                    .narrow(0, last_pos, 1)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("narrow error: {e}")))?;
+                logit_rows.push(last_row);
+
+                if let Some(params) = self.sampling_params_map.get(&req_slice.req_id) {
+                    let temp = params.temperature as f32;
+                    if temp < 1e-5 {
+                        // Greedy: use top_k=1, temp=1.0 — kernel picks argmax.
+                        temperatures.push(1.0);
+                        top_ks.push(1);
+                    } else {
+                        temperatures.push(temp);
+                        top_ks.push(params.top_k);
+                    }
+                    top_ps.push(params.top_p as f32);
+                    min_ps.push(params.min_p as f32);
+                } else {
+                    temperatures.push(1.0);
+                    top_ks.push(1);
+                    top_ps.push(1.0);
+                    min_ps.push(0.0);
+                }
+                uniforms.push(rng.r#gen::<f32>());
+            }
+
+            let batched_logits = Tensor::cat(&logit_rows, 0)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("cat logits error: {e}")))?;
+
+            let batch_tokens = vllm_models::ops::gpu_sample_batched(
+                &batched_logits,
+                &temperatures,
+                &top_ks,
+                &top_ps,
+                &min_ps,
+                &uniforms,
+            )
+            .map_err(|e| {
+                ExecutorError::WorkerExecution(format!("batched GPU sample error: {e}"))
+            })?;
+
+            // Scatter results back to per-request outputs.
+            for (batch_idx, &req_idx) in gpu_batch_indices.iter().enumerate() {
+                let req_slice = &req_inputs[req_idx];
+                let sampled = vec![batch_tokens[batch_idx]];
+
+                self.input_batch.commit_step(
+                    &req_slice.req_id,
+                    &sampled,
+                    req_slice.token_count,
+                    false,
+                );
+                if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
+                    buf.extend_from_slice(&sampled);
+                }
+                token_map.insert(req_slice.req_id.clone(), sampled);
+            }
+
+            Ok(true)
+        }
+    }
 }
 
 impl Worker for CandleWorker {
@@ -1723,14 +1868,16 @@ impl Worker for CandleWorker {
                     .is_some()
             });
 
+            // Pre-compute prompt logprobs for prefill requests.
             for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+                if req_slice.token_count <= 1 {
+                    continue;
+                }
                 let logits = &per_req_logits[req_idx];
                 let token_ids_slice = &prepared.flat_token_ids
                     [req_slice.token_start..req_slice.token_start + req_slice.token_count];
 
-                // Compute prompt logprobs if requested and this is a prefill.
-                if req_slice.token_count > 1
-                    && let Some(params) = self.sampling_params_map.get(&req_slice.req_id)
+                if let Some(params) = self.sampling_params_map.get(&req_slice.req_id)
                     && let Some(top_n) = params.prompt_logprobs
                 {
                     let top_n = top_n.max(0) as usize;
@@ -1755,46 +1902,96 @@ impl Worker for CandleWorker {
                     }
                     prompt_logprobs_map.insert(req_slice.req_id.clone(), plps);
                 }
+            }
 
-                // Sample / verify speculative tokens.
-                let sampled = if !req_slice.spec_token_ids.is_empty() {
-                    self.verify_spec_decode(
-                        logits,
-                        &req_slice.spec_token_ids,
-                        req_slice.token_count,
-                    )?
-                } else {
-                    self.sample_normal(
-                        logits,
+            // Try batched GPU sampling when multiple requests can stay on-device.
+            let mut cpu_fallback_indices: Vec<usize> = Vec::new();
+            let batched_gpu_done = self.try_batched_gpu_sample(
+                &prepared.req_inputs,
+                &per_req_logits,
+                &mut token_map,
+                &mut cpu_fallback_indices,
+            )?;
+
+            if batched_gpu_done {
+                // Batched path handled GPU requests; process CPU-fallback requests.
+                for &req_idx in &cpu_fallback_indices {
+                    let req_slice = &prepared.req_inputs[req_idx];
+                    let logits = &per_req_logits[req_idx];
+
+                    let sampled = if !req_slice.spec_token_ids.is_empty() {
+                        self.verify_spec_decode(
+                            logits,
+                            &req_slice.spec_token_ids,
+                            req_slice.token_count,
+                        )?
+                    } else {
+                        self.sample_normal(
+                            logits,
+                            &req_slice.req_id,
+                            req_slice.token_count,
+                            &mut sampler,
+                            &mut logprobs_map,
+                        )?
+                    };
+
+                    #[cfg(feature = "guided-decoding")]
+                    if let Some(guide) = self.grammar_states.get_mut(&req_slice.req_id)
+                        && let Some(&token_id) = sampled.first()
+                    {
+                        guide.advance(token_id);
+                    }
+
+                    self.input_batch.commit_step(
                         &req_slice.req_id,
+                        &sampled,
                         req_slice.token_count,
-                        &mut sampler,
-                        &mut logprobs_map,
-                    )?
-                };
-
-                // Advance grammar state.
-                #[cfg(feature = "guided-decoding")]
-                if let Some(guide) = self.grammar_states.get_mut(&req_slice.req_id)
-                    && let Some(&token_id) = sampled.first()
-                {
-                    guide.advance(token_id);
+                        !req_slice.spec_token_ids.is_empty(),
+                    );
+                    if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
+                        buf.extend_from_slice(&sampled);
+                    }
+                    token_map.insert(req_slice.req_id.clone(), sampled);
                 }
+            } else {
+                // Fallback: per-request sampling (non-CUDA or <=1 GPU-batchable).
+                for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+                    let logits = &per_req_logits[req_idx];
 
-                // Commit step results to InputBatch.
-                self.input_batch.commit_step(
-                    &req_slice.req_id,
-                    &sampled,
-                    req_slice.token_count,
-                    !req_slice.spec_token_ids.is_empty(),
-                );
+                    let sampled = if !req_slice.spec_token_ids.is_empty() {
+                        self.verify_spec_decode(
+                            logits,
+                            &req_slice.spec_token_ids,
+                            req_slice.token_count,
+                        )?
+                    } else {
+                        self.sample_normal(
+                            logits,
+                            &req_slice.req_id,
+                            req_slice.token_count,
+                            &mut sampler,
+                            &mut logprobs_map,
+                        )?
+                    };
 
-                // Update the token buffer with the new sampled token(s).
-                if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
-                    buf.extend_from_slice(&sampled);
+                    #[cfg(feature = "guided-decoding")]
+                    if let Some(guide) = self.grammar_states.get_mut(&req_slice.req_id)
+                        && let Some(&token_id) = sampled.first()
+                    {
+                        guide.advance(token_id);
+                    }
+
+                    self.input_batch.commit_step(
+                        &req_slice.req_id,
+                        &sampled,
+                        req_slice.token_count,
+                        !req_slice.spec_token_ids.is_empty(),
+                    );
+                    if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
+                        buf.extend_from_slice(&sampled);
+                    }
+                    token_map.insert(req_slice.req_id.clone(), sampled);
                 }
-
-                token_map.insert(req_slice.req_id.clone(), sampled);
             }
 
             // Build ModelRunnerOutput with logprobs if any were collected.
@@ -2827,5 +3024,100 @@ mod tests {
         // Tokens-in-pool incremented (now tracked in InputBatch).
         assert_eq!(worker.input_batch.tokens_in_pool_for("r1"), 4);
         assert_eq!(worker.input_batch.tokens_in_pool_for("r2"), 3);
+    }
+
+    // --- can_gpu_sample classification tests ---
+
+    fn default_sampling() -> SamplingParams {
+        SamplingParams::default()
+    }
+
+    #[test]
+    fn test_can_gpu_sample_default_params() {
+        // Default params: temp=1.0, no penalties, no logprobs, no seed.
+        let params = default_sampling();
+        assert!(can_gpu_sample(&params));
+    }
+
+    #[test]
+    fn test_can_gpu_sample_greedy() {
+        let mut params = default_sampling();
+        params.temperature = 0.0;
+        // Greedy is GPU-sampleable (handled via argmax or top_k=1).
+        assert!(can_gpu_sample(&params));
+    }
+
+    #[test]
+    fn test_can_gpu_sample_with_top_p() {
+        let mut params = default_sampling();
+        params.top_p = 0.9;
+        assert!(can_gpu_sample(&params));
+    }
+
+    #[test]
+    fn test_can_gpu_sample_with_top_k() {
+        let mut params = default_sampling();
+        params.top_k = 50;
+        assert!(can_gpu_sample(&params));
+    }
+
+    #[test]
+    fn test_can_gpu_sample_with_min_p() {
+        let mut params = default_sampling();
+        params.min_p = 0.1;
+        assert!(can_gpu_sample(&params));
+    }
+
+    #[test]
+    fn test_can_gpu_sample_rejects_repetition_penalty() {
+        let mut params = default_sampling();
+        params.repetition_penalty = 1.1;
+        assert!(!can_gpu_sample(&params));
+    }
+
+    #[test]
+    fn test_can_gpu_sample_rejects_frequency_penalty() {
+        let mut params = default_sampling();
+        params.frequency_penalty = 0.5;
+        assert!(!can_gpu_sample(&params));
+    }
+
+    #[test]
+    fn test_can_gpu_sample_rejects_presence_penalty() {
+        let mut params = default_sampling();
+        params.presence_penalty = 0.5;
+        assert!(!can_gpu_sample(&params));
+    }
+
+    #[test]
+    fn test_can_gpu_sample_rejects_logprobs() {
+        let mut params = default_sampling();
+        params.logprobs = Some(5);
+        assert!(!can_gpu_sample(&params));
+    }
+
+    #[test]
+    fn test_can_gpu_sample_rejects_seed() {
+        let mut params = default_sampling();
+        params.seed = Some(42);
+        assert!(!can_gpu_sample(&params));
+    }
+
+    #[test]
+    fn test_can_gpu_sample_rejects_logit_bias() {
+        let mut params = default_sampling();
+        params.logit_bias = Some(std::collections::HashMap::from([(1, 0.5)]));
+        assert!(!can_gpu_sample(&params));
+    }
+
+    #[test]
+    fn test_gpu_sample_greedy_argmax() {
+        // On CPU, gpu_sample with temp~0 should use argmax.
+        let logits_data: Vec<f32> = vec![1.0, 5.0, 2.0, 0.5];
+        let logits = Tensor::from_vec(logits_data, (1, 4), &Device::Cpu).unwrap();
+        let mut params = default_sampling();
+        params.temperature = 0.0;
+        let token = gpu_sample(&logits, &params).unwrap();
+        assert_eq!(token, 1, "greedy should pick argmax (token 1)");
     }
 }

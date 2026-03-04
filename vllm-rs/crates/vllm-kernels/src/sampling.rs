@@ -51,6 +51,39 @@ mod cuda_ffi {
             min_p: f32,
             uniform_random: f32,
         );
+        pub fn sample_batched_f32(
+            output: *mut u32,
+            logits: *const f32,
+            vocab_size: i32,
+            batch_size: i32,
+            temperatures: *const f32,
+            top_ks: *const i32,
+            top_ps: *const f32,
+            min_ps: *const f32,
+            uniform_randoms: *const f32,
+        );
+        pub fn sample_batched_f16(
+            output: *mut u32,
+            logits: *const u16,
+            vocab_size: i32,
+            batch_size: i32,
+            temperatures: *const f32,
+            top_ks: *const i32,
+            top_ps: *const f32,
+            min_ps: *const f32,
+            uniform_randoms: *const f32,
+        );
+        pub fn sample_batched_bf16(
+            output: *mut u32,
+            logits: *const u16,
+            vocab_size: i32,
+            batch_size: i32,
+            temperatures: *const f32,
+            top_ks: *const i32,
+            top_ps: *const f32,
+            min_ps: *const f32,
+            uniform_randoms: *const f32,
+        );
     }
 }
 
@@ -164,6 +197,124 @@ pub fn cuda_sample_top_k_top_p(
     // Copy back the single u32.
     let token_id = output.to_vec1::<u32>()?[0];
     Ok(token_id)
+}
+
+/// Sample multiple requests in a single batched kernel launch.
+///
+/// * `logits` — 2-D tensor `[batch_size, vocab_size]` on CUDA (contiguous)
+/// * `temperatures`, `top_ks`, `top_ps`, `min_ps`, `uniform_randoms` — per-request
+///   parameter slices of length `batch_size`
+///
+/// Returns `Vec<u32>` of sampled token IDs, one per request.
+///
+/// This avoids `batch_size - 1` extra GPU syncs compared to calling the
+/// single-request kernel in a loop.
+#[cfg(feature = "cuda")]
+pub fn cuda_sample_batched(
+    logits: &Tensor,
+    temperatures: &[f32],
+    top_ks: &[i32],
+    top_ps: &[f32],
+    min_ps: &[f32],
+    uniform_randoms: &[f32],
+) -> KernelResult<Vec<u32>> {
+    let shape = logits.dims();
+    if shape.len() != 2 {
+        return Err(KernelError::Other(format!(
+            "cuda_sample_batched: expected 2-D logits, got shape {shape:?}"
+        )));
+    }
+    let batch_size = shape[0];
+    let vocab_size = shape[1];
+    let dtype = logits.dtype();
+
+    if batch_size == 0 {
+        return Ok(vec![]);
+    }
+
+    // Ensure logits are contiguous.
+    let logits = logits.contiguous()?;
+
+    let device = logits.device();
+
+    // Allocate output [batch_size] u32 on device.
+    let output = Tensor::zeros(batch_size, DType::U32, device)?;
+
+    // Upload parameter arrays to device as tensors.
+    // Cast top_ks (i32) to u32 for Tensor::from_slice, then get raw pointer as i32.
+    let top_ks_u32: Vec<u32> = top_ks.iter().map(|&k| k as u32).collect();
+    let d_temps = Tensor::from_slice(temperatures, batch_size, device)?;
+    let d_top_ks = Tensor::from_slice(&top_ks_u32, batch_size, device)?;
+    let d_top_ps = Tensor::from_slice(top_ps, batch_size, device)?;
+    let d_min_ps = Tensor::from_slice(min_ps, batch_size, device)?;
+    let d_randoms = Tensor::from_slice(uniform_randoms, batch_size, device)?;
+
+    let out_ptr = device_ptr_of::<u32>(&output)?;
+    let temps_ptr = device_ptr_of::<f32>(&d_temps)?;
+    let top_ks_ptr = device_ptr_of::<u32>(&d_top_ks)?;
+    let top_ps_ptr = device_ptr_of::<f32>(&d_top_ps)?;
+    let min_ps_ptr = device_ptr_of::<f32>(&d_min_ps)?;
+    let randoms_ptr = device_ptr_of::<f32>(&d_randoms)?;
+
+    match dtype {
+        DType::F32 => {
+            let logits_ptr = device_ptr_of::<f32>(&logits)?;
+            unsafe {
+                cuda_ffi::sample_batched_f32(
+                    out_ptr as *mut u32,
+                    logits_ptr as *const f32,
+                    vocab_size as i32,
+                    batch_size as i32,
+                    temps_ptr as *const f32,
+                    top_ks_ptr as *const i32,
+                    top_ps_ptr as *const f32,
+                    min_ps_ptr as *const f32,
+                    randoms_ptr as *const f32,
+                );
+            }
+        }
+        DType::F16 => {
+            let logits_ptr = device_ptr_of::<half::f16>(&logits)?;
+            unsafe {
+                cuda_ffi::sample_batched_f16(
+                    out_ptr as *mut u32,
+                    logits_ptr as *const u16,
+                    vocab_size as i32,
+                    batch_size as i32,
+                    temps_ptr as *const f32,
+                    top_ks_ptr as *const i32,
+                    top_ps_ptr as *const f32,
+                    min_ps_ptr as *const f32,
+                    randoms_ptr as *const f32,
+                );
+            }
+        }
+        DType::BF16 => {
+            let logits_ptr = device_ptr_of::<half::bf16>(&logits)?;
+            unsafe {
+                cuda_ffi::sample_batched_bf16(
+                    out_ptr as *mut u32,
+                    logits_ptr as *const u16,
+                    vocab_size as i32,
+                    batch_size as i32,
+                    temps_ptr as *const f32,
+                    top_ks_ptr as *const i32,
+                    top_ps_ptr as *const f32,
+                    min_ps_ptr as *const f32,
+                    randoms_ptr as *const f32,
+                );
+            }
+        }
+        _ => {
+            return Err(KernelError::Other(format!(
+                "unsupported dtype for batched GPU sampling: {dtype:?}"
+            )));
+        }
+    }
+
+    // Single sync: copy all token IDs back.
+    let token_ids = output.to_vec1::<u32>()?;
+    Ok(token_ids)
 }
 
 /// Extract a raw device pointer from a contiguous CUDA tensor.
@@ -337,5 +488,112 @@ mod tests {
 
         let token = super::cuda_sample_top_k_top_p(&logits, 1.0, 50, 0.9, 0.0, 0.5).unwrap();
         assert_eq!(token, 12345, "large vocab: expected dominant token 12345");
+    }
+
+    /// Test batched sampling: 4 requests, each with a different dominant token.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_sampling_batched() {
+        let dev = cuda_device();
+        let vocab_size = 8;
+        let batch_size = 4;
+
+        // Each row has one dominant token at a different position.
+        let mut logits_data = vec![0.0f32; batch_size * vocab_size];
+        logits_data[0 * vocab_size + 2] = 20.0; // request 0 → token 2
+        logits_data[1 * vocab_size + 5] = 20.0; // request 1 → token 5
+        logits_data[2 * vocab_size + 0] = 20.0; // request 2 → token 0
+        logits_data[3 * vocab_size + 7] = 20.0; // request 3 → token 7
+
+        let logits = Tensor::from_vec(logits_data, (batch_size, vocab_size), &dev).unwrap();
+
+        let temperatures = vec![1.0f32; batch_size];
+        let top_ks = vec![1i32; batch_size]; // greedy via top_k=1
+        let top_ps = vec![1.0f32; batch_size];
+        let min_ps = vec![0.0f32; batch_size];
+        let uniforms = vec![0.5f32; batch_size];
+
+        let tokens = super::cuda_sample_batched(
+            &logits,
+            &temperatures,
+            &top_ks,
+            &top_ps,
+            &min_ps,
+            &uniforms,
+        )
+        .unwrap();
+
+        assert_eq!(tokens.len(), batch_size);
+        assert_eq!(tokens[0], 2, "batch[0] should pick token 2");
+        assert_eq!(tokens[1], 5, "batch[1] should pick token 5");
+        assert_eq!(tokens[2], 0, "batch[2] should pick token 0");
+        assert_eq!(tokens[3], 7, "batch[3] should pick token 7");
+    }
+
+    /// Test batched sampling with mixed parameters per request.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_sampling_batched_mixed_params() {
+        let dev = cuda_device();
+        let vocab_size = 5;
+        let batch_size = 2;
+
+        // Request 0: token 0 dominant, greedy (top_k=1).
+        // Request 1: token 3 dominant, with top_p filtering.
+        let mut logits_data = vec![0.0f32; batch_size * vocab_size];
+        logits_data[0 * vocab_size + 0] = 20.0;
+        logits_data[1 * vocab_size + 3] = 20.0;
+
+        let logits = Tensor::from_vec(logits_data, (batch_size, vocab_size), &dev).unwrap();
+
+        let temperatures = vec![1.0, 0.5];
+        let top_ks = vec![1, 0];
+        let top_ps = vec![1.0, 0.9];
+        let min_ps = vec![0.0, 0.0];
+        let uniforms = vec![0.5, 0.5];
+
+        let tokens = super::cuda_sample_batched(
+            &logits,
+            &temperatures,
+            &top_ks,
+            &top_ps,
+            &min_ps,
+            &uniforms,
+        )
+        .unwrap();
+
+        assert_eq!(tokens[0], 0, "batch[0] greedy should pick token 0");
+        assert_eq!(tokens[1], 3, "batch[1] should pick dominant token 3");
+    }
+
+    /// Test batched sampling with bf16 logits.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_sampling_batched_bf16() {
+        let dev = cuda_device();
+        let vocab_size = 4;
+        let batch_size = 2;
+
+        let mut logits_data = vec![0.0f32; batch_size * vocab_size];
+        logits_data[0 * vocab_size + 1] = 20.0;
+        logits_data[1 * vocab_size + 3] = 20.0;
+
+        let logits = Tensor::from_vec(logits_data, (batch_size, vocab_size), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+
+        let tokens = super::cuda_sample_batched(
+            &logits,
+            &[0.1, 0.1],
+            &[1, 1],
+            &[1.0, 1.0],
+            &[0.0, 0.0],
+            &[0.5, 0.5],
+        )
+        .unwrap();
+
+        assert_eq!(tokens[0], 1);
+        assert_eq!(tokens[1], 3);
     }
 }

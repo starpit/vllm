@@ -151,11 +151,11 @@ __device__ __forceinline__ int next_pow2(int n) {
 }
 
 // ---------------------------------------------------------------------------
-// Main sampling kernel
+// Core sampling logic (called by both single and batched kernels)
 // ---------------------------------------------------------------------------
 
 template <typename T>
-__global__ void sample_top_k_top_p_kernel(
+__device__ void sample_top_k_top_p_core(
     uint32_t* __restrict__ output,
     const T* __restrict__ logits,
     int vocab_size,
@@ -364,10 +364,57 @@ __global__ void sample_top_k_top_p_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// C entry points (one per logit dtype)
+// Single-request kernel wrapper (scalar params, <<<1, 256>>>)
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void sample_top_k_top_p_kernel(
+    uint32_t* __restrict__ output,
+    const T* __restrict__ logits,
+    int vocab_size,
+    float temperature,
+    int top_k,
+    float top_p,
+    float min_p,
+    float uniform_random)
+{
+    sample_top_k_top_p_core(output, logits, vocab_size,
+                            temperature, top_k, top_p, min_p, uniform_random);
+}
+
+// ---------------------------------------------------------------------------
+// Batched kernel wrapper (array params, <<<batch_size, 256>>>)
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void sample_top_k_top_p_batched_kernel(
+    uint32_t* __restrict__ output,
+    const T* __restrict__ logits,
+    int vocab_size,
+    const float* __restrict__ temperatures,
+    const int* __restrict__ top_ks,
+    const float* __restrict__ top_ps,
+    const float* __restrict__ min_ps,
+    const float* __restrict__ uniform_randoms)
+{
+    int bid = blockIdx.x;
+    sample_top_k_top_p_core(
+        output + bid,
+        logits + bid * vocab_size,
+        vocab_size,
+        temperatures[bid], top_ks[bid], top_ps[bid],
+        min_ps[bid], uniform_randoms[bid]);
+}
+
+// ---------------------------------------------------------------------------
+// C entry points
 // ---------------------------------------------------------------------------
 
 extern "C" {
+
+// ---------------------------------------------------------------------------
+// Single-request entry points (backwards compatible, launch <<<1, 256>>>)
+// ---------------------------------------------------------------------------
 
 void sample_top_k_top_p_f32(
     uint32_t* output,
@@ -412,6 +459,65 @@ void sample_top_k_top_p_bf16(
     sample_top_k_top_p_kernel<__nv_bfloat16><<<1, SAMPLING_BLOCK_SIZE>>>(
         output, reinterpret_cast<const __nv_bfloat16*>(logits), vocab_size,
         temperature, top_k, top_p, min_p, uniform_random);
+}
+
+// ---------------------------------------------------------------------------
+// Batched entry points (launch <<<batch_size, 256>>>)
+// All param arrays are device pointers of length batch_size.
+// ---------------------------------------------------------------------------
+
+void sample_batched_f32(
+    uint32_t* output,
+    const float* logits,
+    int vocab_size,
+    int batch_size,
+    const float* temperatures,
+    const int* top_ks,
+    const float* top_ps,
+    const float* min_ps,
+    const float* uniform_randoms)
+{
+    if (batch_size > 0) {
+        sample_top_k_top_p_batched_kernel<float><<<batch_size, SAMPLING_BLOCK_SIZE>>>(
+            output, logits, vocab_size,
+            temperatures, top_ks, top_ps, min_ps, uniform_randoms);
+    }
+}
+
+void sample_batched_f16(
+    uint32_t* output,
+    const uint16_t* logits,
+    int vocab_size,
+    int batch_size,
+    const float* temperatures,
+    const int* top_ks,
+    const float* top_ps,
+    const float* min_ps,
+    const float* uniform_randoms)
+{
+    if (batch_size > 0) {
+        sample_top_k_top_p_batched_kernel<__half><<<batch_size, SAMPLING_BLOCK_SIZE>>>(
+            output, reinterpret_cast<const __half*>(logits), vocab_size,
+            temperatures, top_ks, top_ps, min_ps, uniform_randoms);
+    }
+}
+
+void sample_batched_bf16(
+    uint32_t* output,
+    const uint16_t* logits,
+    int vocab_size,
+    int batch_size,
+    const float* temperatures,
+    const int* top_ks,
+    const float* top_ps,
+    const float* min_ps,
+    const float* uniform_randoms)
+{
+    if (batch_size > 0) {
+        sample_top_k_top_p_batched_kernel<__nv_bfloat16><<<batch_size, SAMPLING_BLOCK_SIZE>>>(
+            output, reinterpret_cast<const __nv_bfloat16*>(logits), vocab_size,
+            temperatures, top_ks, top_ps, min_ps, uniform_randoms);
+    }
 }
 
 }  // extern "C"

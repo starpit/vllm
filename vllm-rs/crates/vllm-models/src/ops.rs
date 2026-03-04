@@ -210,6 +210,35 @@ pub fn gpu_sample_top_k_top_p(
     .map_err(kernel_err)
 }
 
+/// Batched fused top-k / top-p / min-p sampling on GPU.
+///
+/// Samples all requests in a single kernel launch + single GPU sync,
+/// eliminating per-request sync overhead. Falls back to error on CPU.
+///
+/// * `logits` — 2-D `[batch_size, vocab_size]` CUDA tensor
+/// * Per-request parameter slices of length `batch_size`
+///
+/// Returns `Vec<u32>` of sampled token IDs.
+#[cfg(feature = "cuda")]
+pub fn gpu_sample_batched(
+    logits: &Tensor,
+    temperatures: &[f32],
+    top_ks: &[i32],
+    top_ps: &[f32],
+    min_ps: &[f32],
+    uniform_randoms: &[f32],
+) -> candle_core::Result<Vec<u32>> {
+    vllm_kernels::sampling::cuda_sample_batched(
+        logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        uniform_randoms,
+    )
+    .map_err(kernel_err)
+}
+
 // ---------------------------------------------------------------------------
 // MoE dispatch
 // ---------------------------------------------------------------------------

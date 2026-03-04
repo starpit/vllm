@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>vLLM WebGPU — In-Browser LLM Chat</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <header>
+            <h1>vLLM <span class="accent">WebGPU</span></h1>
+            <p class="subtitle">LLM inference running entirely in your browser</p>
+        </header>
+
+        <div id="main-layout">
+            <!-- Chat Panel -->
+            <div id="chat-panel">
+                <div id="model-selector">
+                    <label for="model-select">Model:</label>
+                    <select id="model-select">
+                        <option value="HuggingFaceTB/SmolLM-135M">SmolLM-135M (270 MB)</option>
+                        <option value="HuggingFaceTB/SmolLM-360M">SmolLM-360M (720 MB)</option>
+                        <option value="Qwen/Qwen2-0.5B">Qwen2-0.5B (1 GB)</option>
+                    </select>
+                    <button id="load-btn">Load Model</button>
+                    <span id="load-status"></span>
+                </div>
+
+                <div id="messages"></div>
+
+                <div id="input-area">
+                    <textarea id="user-input" placeholder="Type your message..." rows="2"></textarea>
+                    <button id="send-btn" disabled>Send</button>
+                    <button id="stop-btn" style="display:none">Stop</button>
+                </div>
+            </div>
+
+            <!-- Gears Panel (internals sidebar) -->
+            <div id="gears-panel">
+                <h2>Internals</h2>
+
+                <div class="stat-group">
+                    <h3>Generation</h3>
+                    <div class="stat-row">
+                        <span class="stat-label">Tokens/sec</span>
+                        <span id="stat-tps" class="stat-value">—</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Position</span>
+                        <span id="stat-position" class="stat-value">—</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Last token</span>
+                        <span id="stat-last-token" class="stat-value">—</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Probability</span>
+                        <span id="stat-prob" class="stat-value">—</span>
+                    </div>
+                </div>
+
+                <div class="stat-group">
+                    <h3>KV Cache</h3>
+                    <div class="cache-bar-container">
+                        <div id="cache-bar" class="cache-bar"></div>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Used / Total</span>
+                        <span id="stat-kv" class="stat-value">0 / 0</span>
+                    </div>
+                </div>
+
+                <div class="stat-group">
+                    <h3>Memory</h3>
+                    <div class="stat-row">
+                        <span class="stat-label">GPU buffers</span>
+                        <span id="stat-memory" class="stat-value">—</span>
+                    </div>
+                </div>
+
+                <div class="stat-group">
+                    <h3>Layer Timing</h3>
+                    <div id="layer-times"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

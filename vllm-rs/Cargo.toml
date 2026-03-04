@@ -16,6 +16,8 @@ members = [
     "crates/vllm-cli",
     "crates/vllm-mlx",
     "crates/vllm-e2e",
+    "crates/vllm-wgpu",
+    "crates/vllm-examples",
 ]
 exclude = [
     "third_party/candle-flash-attn",
@@ -134,3 +136,13 @@ vllm-bench = { path = "crates/vllm-bench" }
 vllm-cli = { path = "crates/vllm-cli" }
 vllm-mlx = { path = "crates/vllm-mlx" }
 vllm-e2e = { path = "crates/vllm-e2e" }
+vllm-wgpu = { path = "crates/vllm-wgpu" }
+vllm-examples = { path = "crates/vllm-examples" }
+
+# WebGPU
+wgpu = { version = "24", features = ["wgsl"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = "0.3"
+js-sys = "0.3"
+serde-wasm-bindgen = "0.6"

@@ -1,0 +1,27 @@
+[package]
+name = "vllm-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebGPU tensor backend for vLLM — runs in browser via WASM + WebGPU"
+
+[dependencies]
+wgpu = { version = "24", features = ["wgsl"] }
+bytemuck = { version = "1", features = ["derive"] }
+thiserror.workspace = true
+tracing.workspace = true
+futures-channel = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+safetensors = { workspace = true }
+half.workspace = true
+
+# Native-only deps for model download
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+hf-hub.workspace = true
+tokenizers.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+pollster = "0.4"
+approx = "0.5"

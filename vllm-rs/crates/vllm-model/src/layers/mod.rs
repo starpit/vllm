@@ -26,7 +26,9 @@ pub use awq::{AwqConfig, AwqLinear};
 pub use bnb::{BnbInt8Linear, BnbLayerConfig, BnbLinear, BnbNf4Config, BnbNf4Linear, BnbQuantType};
 pub use embedding::{Embedding, VocabParallelEmbedding};
 pub use gptq::{GptqConfig, GptqLinear};
-pub use linear::{ColumnParallelLinear, Linear, RowParallelLinear};
+pub use linear::{
+    ColumnParallelLinear, Linear, RowParallelLinear, load_fused_gate_up, load_fused_qkv,
+};
 pub use norm::{CohereLayerNorm, GemmaRmsNorm, LayerNorm, RmsNorm};
 pub use quantized_linear::QuantizedLinear;
 pub use rotary::{RotaryEmbedding, apply_rotary_to_tensor};

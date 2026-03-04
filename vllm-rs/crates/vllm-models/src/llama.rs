@@ -16,7 +16,8 @@ use candle_core::{DType, Device, Module, Tensor};
 
 use vllm_model::error::{ModelError, ModelResult};
 use vllm_model::layers::{
-    ColumnParallelLinear, Embedding, Linear, RmsNorm, RotaryEmbedding, RowParallelLinear,
+    Embedding, Linear, RmsNorm, RotaryEmbedding, RowParallelLinear, load_fused_gate_up,
+    load_fused_qkv,
 };
 use vllm_model::lora::LoraAdapter;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
@@ -166,19 +167,23 @@ impl LlamaConfig {
 // LlamaMLP
 // ---------------------------------------------------------------------------
 
-/// LLaMA MLP (SiLU-gated feed-forward network).
+/// LLaMA MLP (SiLU-gated feed-forward network) with fused gate+up projection.
 ///
-/// Forward: gate_proj(x) → SiLU → * up_proj(x) → down_proj
+/// Forward: gate_up_proj(x) → split → SiLU(gate) * up → down_proj
+///
+/// The gate and up weights are concatenated into a single linear layer,
+/// eliminating one cuBLAS kernel launch per layer per decode step.
 ///
 /// Port of: `vllm/model_executor/models/llama.py::LlamaMLP`
 pub struct LlamaMLP {
-    gate_proj: ColumnParallelLinear,
-    up_proj: ColumnParallelLinear,
+    gate_up_proj: Linear,
     down_proj: RowParallelLinear,
+    /// Post-shard intermediate size (for splitting the fused output).
+    intermediate_size: usize,
 }
 
 impl LlamaMLP {
-    /// Load MLP weights from a model.
+    /// Load MLP weights from a model with fused gate+up projection.
     ///
     /// Weight names: `{prefix}.gate_proj`, `{prefix}.up_proj`, `{prefix}.down_proj`
     pub fn load(
@@ -188,21 +193,13 @@ impl LlamaMLP {
         rank: usize,
         world_size: usize,
     ) -> ModelResult<Self> {
-        let gate_proj = ColumnParallelLinear::load(
+        let (gate_up_proj, intermediate_size) = load_fused_gate_up(
             weights,
-            &format!("{}.gate_proj", prefix),
+            &format!("{prefix}.gate_proj"),
+            &format!("{prefix}.up_proj"),
             dtype,
             rank,
             world_size,
-            false,
-        )?;
-        let up_proj = ColumnParallelLinear::load(
-            weights,
-            &format!("{}.up_proj", prefix),
-            dtype,
-            rank,
-            world_size,
-            false,
         )?;
         let down_proj = RowParallelLinear::load(
             weights,
@@ -213,9 +210,9 @@ impl LlamaMLP {
             true,
         )?;
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj,
             down_proj,
+            intermediate_size,
         })
     }
 
@@ -226,13 +223,12 @@ impl LlamaMLP {
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
-        let gate = Linear::zeros(hidden_size, intermediate_size, dtype, device)?;
-        let up = Linear::zeros(hidden_size, intermediate_size, dtype, device)?;
+        let gate_up = Linear::zeros(hidden_size, 2 * intermediate_size, dtype, device)?;
         let down = Linear::zeros(intermediate_size, hidden_size, dtype, device)?;
         Ok(Self {
-            gate_proj: ColumnParallelLinear::new(gate, false),
-            up_proj: ColumnParallelLinear::new(up, false),
+            gate_up_proj: gate_up,
             down_proj: RowParallelLinear::new(down, true),
+            intermediate_size,
         })
     }
 }
@@ -241,18 +237,11 @@ impl LlamaMLP {
     /// Inject LoRA weights into MLP projections.
     pub fn inject_lora(&mut self, prefix: &str, adapter: &LoraAdapter) -> ModelResult<()> {
         let targets = &adapter.config.target_modules;
-        let projs: &mut [(&str, &mut ColumnParallelLinear)] = &mut [
-            ("gate_proj", &mut self.gate_proj),
-            ("up_proj", &mut self.up_proj),
-        ];
-        for (name, proj) in projs.iter_mut() {
-            if targets.iter().any(|t| t == name) {
-                let key = format!("{}.{}", prefix, name);
-                if let Some((a, b)) = adapter.weights.get(&key) {
-                    proj.inner_mut()
-                        .attach_lora(a.clone(), b.clone(), adapter.scaling)?;
-                }
-            }
+        if targets.iter().any(|t| t == "gate_proj" || t == "up_proj") {
+            eprintln!(
+                "WARN: LoRA on fused gate_up projection not yet supported; \
+                 gate_proj/up_proj LoRA will be ignored"
+            );
         }
         // down_proj is RowParallelLinear.
         if targets.iter().any(|t| t == "down_proj") {
@@ -269,8 +258,11 @@ impl LlamaMLP {
 
 impl Module for LlamaMLP {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
+        let gate_up = self.gate_up_proj.forward(x)?;
+        let gate = gate_up.narrow(1, 0, self.intermediate_size)?.contiguous()?;
+        let up = gate_up
+            .narrow(1, self.intermediate_size, self.intermediate_size)?
+            .contiguous()?;
         let activated = crate::ops::silu_and_mul(&gate, &up)?;
         self.down_proj.forward(&activated)
     }
@@ -280,17 +272,22 @@ impl Module for LlamaMLP {
 // LlamaAttention
 // ---------------------------------------------------------------------------
 
-/// LLaMA multi-head attention with RoPE and optional GQA.
+/// LLaMA multi-head attention with RoPE, GQA, and fused QKV projection.
 ///
-/// Forward: q,k,v = separate projections → RoPE → scaled dot-product attention → o_proj
+/// Forward: qkv_proj(x) → split Q/K/V → RoPE → scaled dot-product attention → o_proj
+///
+/// Q, K, V weights are fused into a single linear layer `[q_dim + 2*kv_dim, hidden]`,
+/// eliminating two cuBLAS kernel launches per layer per decode step.
 ///
 /// Port of: `vllm/model_executor/models/llama.py::LlamaAttention`
 pub struct LlamaAttention {
-    q_proj: ColumnParallelLinear,
-    k_proj: ColumnParallelLinear,
-    v_proj: ColumnParallelLinear,
+    qkv_proj: Linear,
     o_proj: RowParallelLinear,
     rotary_emb: RotaryEmbedding,
+    /// Post-shard Q output dimension (num_q_heads * head_dim).
+    q_size: usize,
+    /// Post-shard KV output dimension (num_kv_heads * head_dim).
+    kv_size: usize,
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -301,7 +298,7 @@ pub struct LlamaAttention {
 }
 
 impl LlamaAttention {
-    /// Load attention weights.
+    /// Load attention weights with fused QKV projection.
     ///
     /// Weight names: `{prefix}.q_proj`, `{prefix}.k_proj`, `{prefix}.v_proj`, `{prefix}.o_proj`
     #[allow(clippy::too_many_arguments)]
@@ -315,30 +312,7 @@ impl LlamaAttention {
         world_size: usize,
         layer_idx: usize,
     ) -> ModelResult<Self> {
-        let q_proj = ColumnParallelLinear::load(
-            weights,
-            &format!("{}.q_proj", prefix),
-            dtype,
-            rank,
-            world_size,
-            false,
-        )?;
-        let k_proj = ColumnParallelLinear::load(
-            weights,
-            &format!("{}.k_proj", prefix),
-            dtype,
-            rank,
-            world_size,
-            false,
-        )?;
-        let v_proj = ColumnParallelLinear::load(
-            weights,
-            &format!("{}.v_proj", prefix),
-            dtype,
-            rank,
-            world_size,
-            false,
-        )?;
+        let (qkv_proj, q_size, kv_size) = load_fused_qkv(weights, prefix, dtype, rank, world_size)?;
         let o_proj = RowParallelLinear::load(
             weights,
             &format!("{}.o_proj", prefix),
@@ -361,11 +335,11 @@ impl LlamaAttention {
         )?;
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             rotary_emb,
+            q_size,
+            kv_size,
             num_q_heads,
             num_kv_heads,
             head_dim,
@@ -385,13 +359,9 @@ impl LlamaAttention {
         let hidden = config.hidden_size;
         let q_size = config.num_attention_heads * config.head_dim;
         let kv_size = config.num_kv_heads * config.head_dim;
+        let qkv_size = q_size + 2 * kv_size;
 
-        let q_proj =
-            ColumnParallelLinear::new(Linear::zeros(hidden, q_size, dtype, device)?, false);
-        let k_proj =
-            ColumnParallelLinear::new(Linear::zeros(hidden, kv_size, dtype, device)?, false);
-        let v_proj =
-            ColumnParallelLinear::new(Linear::zeros(hidden, kv_size, dtype, device)?, false);
+        let qkv_proj = Linear::zeros(hidden, qkv_size, dtype, device)?;
         let o_proj = RowParallelLinear::new(Linear::zeros(q_size, hidden, dtype, device)?, true);
 
         let rotary_emb = RotaryEmbedding::new(
@@ -403,11 +373,11 @@ impl LlamaAttention {
         )?;
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             rotary_emb,
+            q_size,
+            kv_size,
             num_q_heads: config.num_attention_heads,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
@@ -415,6 +385,26 @@ impl LlamaAttention {
             sliding_window: config.sliding_window,
             layer_idx,
         })
+    }
+
+    /// Split a fused QKV output into Q, K, V tensors reshaped to `[N, heads, head_dim]`.
+    fn split_qkv(&self, qkv: &Tensor, num_tokens: usize) -> ModelResult<(Tensor, Tensor, Tensor)> {
+        let q = qkv
+            .narrow(1, 0, self.q_size)
+            .map_err(ModelError::Candle)?
+            .reshape((num_tokens, self.num_q_heads, self.head_dim))
+            .map_err(ModelError::Candle)?;
+        let k = qkv
+            .narrow(1, self.q_size, self.kv_size)
+            .map_err(ModelError::Candle)?
+            .reshape((num_tokens, self.num_kv_heads, self.head_dim))
+            .map_err(ModelError::Candle)?;
+        let v = qkv
+            .narrow(1, self.q_size + self.kv_size, self.kv_size)
+            .map_err(ModelError::Candle)?
+            .reshape((num_tokens, self.num_kv_heads, self.head_dim))
+            .map_err(ModelError::Candle)?;
+        Ok((q, k, v))
     }
 
     /// Forward pass.
@@ -434,30 +424,12 @@ impl LlamaAttention {
     ) -> ModelResult<Tensor> {
         let num_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
 
-        // Q/K/V projections.
-        let q = self
-            .q_proj
+        // Fused QKV projection (single matmul).
+        let qkv = self
+            .qkv_proj
             .forward(hidden_states)
             .map_err(ModelError::Candle)?;
-        let k = self
-            .k_proj
-            .forward(hidden_states)
-            .map_err(ModelError::Candle)?;
-        let v = self
-            .v_proj
-            .forward(hidden_states)
-            .map_err(ModelError::Candle)?;
-
-        // Reshape to [num_tokens, num_heads, head_dim].
-        let q = q
-            .reshape((num_tokens, self.num_q_heads, self.head_dim))
-            .map_err(ModelError::Candle)?;
-        let k = k
-            .reshape((num_tokens, self.num_kv_heads, self.head_dim))
-            .map_err(ModelError::Candle)?;
-        let v = v
-            .reshape((num_tokens, self.num_kv_heads, self.head_dim))
-            .map_err(ModelError::Candle)?;
+        let (q, k, v) = self.split_qkv(&qkv, num_tokens)?;
 
         // Apply RoPE.
         let (q, k) = self.rotary_emb.apply(&q, &k, positions)?;
@@ -468,7 +440,7 @@ impl LlamaAttention {
 
         // Reshape back to [num_tokens, num_q_heads * head_dim].
         let attn_output = attn_output
-            .reshape((num_tokens, self.num_q_heads * self.head_dim))
+            .reshape((num_tokens, self.q_size))
             .map_err(ModelError::Candle)?;
 
         // Output projection.
@@ -477,7 +449,7 @@ impl LlamaAttention {
             .map_err(ModelError::Candle)
     }
 
-    /// Batched forward: Q/K/V projections + RoPE on all tokens, per-request attention loop.
+    /// Batched forward: fused QKV + RoPE on all tokens, per-request attention loop.
     pub fn forward_batch(
         &self,
         hidden_states: &Tensor,
@@ -487,30 +459,12 @@ impl LlamaAttention {
     ) -> ModelResult<Tensor> {
         let total_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
 
-        // Batched Q/K/V projections on ALL tokens at once.
-        let q = self
-            .q_proj
+        // Fused QKV projection on ALL tokens at once (single matmul).
+        let qkv = self
+            .qkv_proj
             .forward(hidden_states)
             .map_err(ModelError::Candle)?;
-        let k = self
-            .k_proj
-            .forward(hidden_states)
-            .map_err(ModelError::Candle)?;
-        let v = self
-            .v_proj
-            .forward(hidden_states)
-            .map_err(ModelError::Candle)?;
-
-        // Reshape to [total_tokens, num_heads, head_dim].
-        let q = q
-            .reshape((total_tokens, self.num_q_heads, self.head_dim))
-            .map_err(ModelError::Candle)?;
-        let k = k
-            .reshape((total_tokens, self.num_kv_heads, self.head_dim))
-            .map_err(ModelError::Candle)?;
-        let v = v
-            .reshape((total_tokens, self.num_kv_heads, self.head_dim))
-            .map_err(ModelError::Candle)?;
+        let (q, k, v) = self.split_qkv(&qkv, total_tokens)?;
 
         // Batched RoPE on all tokens.
         let (q, k) = self.rotary_emb.apply(&q, &k, positions)?;
@@ -563,7 +517,7 @@ impl LlamaAttention {
 
         // Reshape back to [total_tokens, num_q_heads * head_dim].
         let attn_output = attn_output
-            .reshape((total_tokens, self.num_q_heads * self.head_dim))
+            .reshape((total_tokens, self.q_size))
             .map_err(ModelError::Candle)?;
 
         // Batched output projection.
@@ -575,19 +529,14 @@ impl LlamaAttention {
     /// Inject LoRA weights into attention projections.
     pub fn inject_lora(&mut self, prefix: &str, adapter: &LoraAdapter) -> ModelResult<()> {
         let targets = &adapter.config.target_modules;
-        let projs: &mut [(&str, &mut ColumnParallelLinear)] = &mut [
-            ("q_proj", &mut self.q_proj),
-            ("k_proj", &mut self.k_proj),
-            ("v_proj", &mut self.v_proj),
-        ];
-        for (name, proj) in projs.iter_mut() {
-            if targets.iter().any(|t| t == name) {
-                let key = format!("{}.{}", prefix, name);
-                if let Some((a, b)) = adapter.weights.get(&key) {
-                    proj.inner_mut()
-                        .attach_lora(a.clone(), b.clone(), adapter.scaling)?;
-                }
-            }
+        if targets
+            .iter()
+            .any(|t| t == "q_proj" || t == "k_proj" || t == "v_proj")
+        {
+            eprintln!(
+                "WARN: LoRA on fused QKV projection not yet supported; \
+                 q_proj/k_proj/v_proj LoRA will be ignored"
+            );
         }
         // o_proj is RowParallelLinear.
         if targets.iter().any(|t| t == "o_proj") {

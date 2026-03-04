@@ -289,6 +289,18 @@ pub struct BenchLatencyArgs {
     /// Comma-separated list of batch sizes to capture as CUDA graphs.
     #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
     pub cuda_graph_sizes: String,
+
+    /// Sampling temperature (0 = greedy, >0 = random sampling).
+    #[arg(long, default_value_t = 1.0)]
+    pub temperature: f64,
+
+    /// Top-p (nucleus) sampling cutoff (1.0 = disabled).
+    #[arg(long, default_value_t = 1.0)]
+    pub top_p: f64,
+
+    /// Top-k sampling cutoff (0 = disabled).
+    #[arg(long, default_value_t = 0)]
+    pub top_k: i32,
 }
 
 impl BenchLatencyArgs {

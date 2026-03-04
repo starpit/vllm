@@ -19,9 +19,7 @@
 use candle_core::{DType, Device, Module, Tensor};
 
 use vllm_model::error::{ModelError, ModelResult};
-use vllm_model::layers::{
-    CohereLayerNorm, ColumnParallelLinear, Embedding, Linear, RowParallelLinear,
-};
+use vllm_model::layers::{CohereLayerNorm, Embedding, Linear, RowParallelLinear, load_fused_qkv};
 use vllm_model::lora::LoraAdapter;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
@@ -103,11 +101,9 @@ impl CommandRConfig {
 // CommandRAttention
 // ---------------------------------------------------------------------------
 
-/// Command R multi-head attention with interleaved RoPE and optional QK norm.
+/// Command R multi-head attention with fused QKV, interleaved RoPE, and optional QK norm.
 struct CommandRAttention {
-    q_proj: ColumnParallelLinear,
-    k_proj: ColumnParallelLinear,
-    v_proj: ColumnParallelLinear,
+    qkv_proj: Linear,
     o_proj: RowParallelLinear,
     /// Optional QK norms (CohereLayerNorm).
     q_norm: Option<CohereLayerNorm>,
@@ -116,6 +112,8 @@ struct CommandRAttention {
     cos: Tensor,
     /// Precomputed sin values for interleaved RoPE: [max_position, head_dim/2]
     sin: Tensor,
+    q_size: usize,
+    kv_size: usize,
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -123,7 +121,7 @@ struct CommandRAttention {
 }
 
 impl CommandRAttention {
-    /// Load attention weights.
+    /// Load attention weights with fused QKV projection.
     fn load(
         weights: &ModelWeights,
         prefix: &str,
@@ -133,30 +131,7 @@ impl CommandRAttention {
         rank: usize,
         world_size: usize,
     ) -> ModelResult<Self> {
-        let q_proj = ColumnParallelLinear::load(
-            weights,
-            &format!("{}.q_proj", prefix),
-            dtype,
-            rank,
-            world_size,
-            false,
-        )?;
-        let k_proj = ColumnParallelLinear::load(
-            weights,
-            &format!("{}.k_proj", prefix),
-            dtype,
-            rank,
-            world_size,
-            false,
-        )?;
-        let v_proj = ColumnParallelLinear::load(
-            weights,
-            &format!("{}.v_proj", prefix),
-            dtype,
-            rank,
-            world_size,
-            false,
-        )?;
+        let (qkv_proj, q_size, kv_size) = load_fused_qkv(weights, prefix, dtype, rank, world_size)?;
         let o_proj = RowParallelLinear::load(
             weights,
             &format!("{}.o_proj", prefix),
@@ -201,14 +176,14 @@ impl CommandRAttention {
         )?;
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             q_norm,
             k_norm,
             cos,
             sin,
+            q_size,
+            kv_size,
             num_q_heads,
             num_kv_heads,
             head_dim,
@@ -222,13 +197,9 @@ impl CommandRAttention {
         let hidden = config.hidden_size;
         let q_size = config.num_attention_heads * config.head_dim;
         let kv_size = config.num_kv_heads * config.head_dim;
+        let qkv_size = q_size + 2 * kv_size;
 
-        let q_proj =
-            ColumnParallelLinear::new(Linear::zeros(hidden, q_size, dtype, device)?, false);
-        let k_proj =
-            ColumnParallelLinear::new(Linear::zeros(hidden, kv_size, dtype, device)?, false);
-        let v_proj =
-            ColumnParallelLinear::new(Linear::zeros(hidden, kv_size, dtype, device)?, false);
+        let qkv_proj = Linear::zeros(hidden, qkv_size, dtype, device)?;
         let o_proj = RowParallelLinear::new(Linear::zeros(q_size, hidden, dtype, device)?, true);
 
         let q_norm = if config.use_qk_norm {
@@ -260,14 +231,14 @@ impl CommandRAttention {
         )?;
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             q_norm,
             k_norm,
             cos,
             sin,
+            q_size,
+            kv_size,
             num_q_heads: config.num_attention_heads,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
@@ -284,18 +255,17 @@ impl CommandRAttention {
     ) -> ModelResult<Tensor> {
         let num_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
 
-        // Q/K/V projections.
-        let q = self
-            .q_proj
+        // Fused QKV projection.
+        let qkv = self
+            .qkv_proj
             .forward(hidden_states)
             .map_err(ModelError::Candle)?;
-        let k = self
-            .k_proj
-            .forward(hidden_states)
+        let q = qkv.narrow(1, 0, self.q_size).map_err(ModelError::Candle)?;
+        let k = qkv
+            .narrow(1, self.q_size, self.kv_size)
             .map_err(ModelError::Candle)?;
-        let v = self
-            .v_proj
-            .forward(hidden_states)
+        let v = qkv
+            .narrow(1, self.q_size + self.kv_size, self.kv_size)
             .map_err(ModelError::Candle)?;
 
         // Reshape to [num_tokens, num_heads, head_dim].
@@ -538,23 +508,17 @@ impl CommandRForCausalLM {
 impl crate::Model for CommandRForCausalLM {
     fn inject_lora(&mut self, adapter: &LoraAdapter) -> ModelResult<()> {
         let targets = &adapter.config.target_modules;
+        if targets
+            .iter()
+            .any(|t| t == "q_proj" || t == "k_proj" || t == "v_proj")
+        {
+            eprintln!(
+                "WARN: LoRA on fused QKV projection not yet supported; \
+                 q_proj/k_proj/v_proj LoRA will be ignored"
+            );
+        }
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
-            // Attention projections (ColumnParallel/RowParallel).
             let attn_prefix = format!("model.layers.{}.self_attn", i);
-            let attn_projs: &mut [(&str, &mut ColumnParallelLinear)] = &mut [
-                ("q_proj", &mut layer.self_attn.q_proj),
-                ("k_proj", &mut layer.self_attn.k_proj),
-                ("v_proj", &mut layer.self_attn.v_proj),
-            ];
-            for (name, proj) in attn_projs.iter_mut() {
-                if targets.iter().any(|t| t == name) {
-                    let key = format!("{}.{}", attn_prefix, name);
-                    if let Some((a, b)) = adapter.weights.get(&key) {
-                        proj.inner_mut()
-                            .attach_lora(a.clone(), b.clone(), adapter.scaling)?;
-                    }
-                }
-            }
             if targets.iter().any(|t| t == "o_proj") {
                 let key = format!("{}.o_proj", attn_prefix);
                 if let Some((a, b)) = adapter.weights.get(&key) {

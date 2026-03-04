@@ -183,6 +183,34 @@ pub fn qk_norm_and_rope(
 }
 
 // ---------------------------------------------------------------------------
+// GPU sampling dispatch
+// ---------------------------------------------------------------------------
+
+/// Fused top-k / top-p / min-p sampling entirely on GPU.
+///
+/// Avoids transferring full vocab logits to CPU. Only the 4-byte token ID
+/// comes back. Dispatches to CUDA kernel on GPU, returns error on CPU.
+#[cfg(feature = "cuda")]
+pub fn gpu_sample_top_k_top_p(
+    logits: &Tensor,
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    min_p: f32,
+    uniform: f32,
+) -> candle_core::Result<u32> {
+    vllm_kernels::sampling::cuda_sample_top_k_top_p(
+        logits,
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        uniform,
+    )
+    .map_err(kernel_err)
+}
+
+// ---------------------------------------------------------------------------
 // MoE dispatch
 // ---------------------------------------------------------------------------
 

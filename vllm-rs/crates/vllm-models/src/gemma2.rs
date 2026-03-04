@@ -24,7 +24,8 @@ use candle_core::{DType, Device, Module, Tensor};
 
 use vllm_model::error::{ModelError, ModelResult};
 use vllm_model::layers::{
-    ColumnParallelLinear, Embedding, GemmaRmsNorm, Linear, RotaryEmbedding, RowParallelLinear,
+    Embedding, GemmaRmsNorm, Linear, RotaryEmbedding, RowParallelLinear, load_fused_gate_up,
+    load_fused_qkv,
 };
 use vllm_model::lora::LoraAdapter;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
@@ -152,17 +153,17 @@ impl Gemma2Config {
 // Gemma2MLP
 // ---------------------------------------------------------------------------
 
-/// Gemma2 MLP (GELU-gated feed-forward network).
+/// Gemma2 MLP (GELU-gated feed-forward network) with fused gate+up projection.
 ///
-/// Forward: gate_proj(x) -> GELU(tanh) -> * up_proj(x) -> down_proj
+/// Forward: gate_up_proj(x) -> split -> GELU(tanh)(gate) * up -> down_proj
 pub struct Gemma2MLP {
-    gate_proj: ColumnParallelLinear,
-    up_proj: ColumnParallelLinear,
+    gate_up_proj: Linear,
     down_proj: RowParallelLinear,
+    intermediate_size: usize,
 }
 
 impl Gemma2MLP {
-    /// Load MLP weights.
+    /// Load MLP weights with fused gate+up projection.
     pub fn load(
         weights: &ModelWeights,
         prefix: &str,
@@ -170,21 +171,13 @@ impl Gemma2MLP {
         rank: usize,
         world_size: usize,
     ) -> ModelResult<Self> {
-        let gate_proj = ColumnParallelLinear::load(
+        let (gate_up_proj, intermediate_size) = load_fused_gate_up(
             weights,
-            &format!("{}.gate_proj", prefix),
+            &format!("{prefix}.gate_proj"),
+            &format!("{prefix}.up_proj"),
             dtype,
             rank,
             world_size,
-            false,
-        )?;
-        let up_proj = ColumnParallelLinear::load(
-            weights,
-            &format!("{}.up_proj", prefix),
-            dtype,
-            rank,
-            world_size,
-            false,
         )?;
         let down_proj = RowParallelLinear::load(
             weights,
@@ -195,9 +188,9 @@ impl Gemma2MLP {
             true,
         )?;
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj,
             down_proj,
+            intermediate_size,
         })
     }
 
@@ -208,21 +201,23 @@ impl Gemma2MLP {
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
-        let gate = Linear::zeros(hidden_size, intermediate_size, dtype, device)?;
-        let up = Linear::zeros(hidden_size, intermediate_size, dtype, device)?;
+        let gate_up = Linear::zeros(hidden_size, 2 * intermediate_size, dtype, device)?;
         let down = Linear::zeros(intermediate_size, hidden_size, dtype, device)?;
         Ok(Self {
-            gate_proj: ColumnParallelLinear::new(gate, false),
-            up_proj: ColumnParallelLinear::new(up, false),
+            gate_up_proj: gate_up,
             down_proj: RowParallelLinear::new(down, true),
+            intermediate_size,
         })
     }
 }
 
 impl Module for Gemma2MLP {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
+        let gate_up = self.gate_up_proj.forward(x)?;
+        let gate = gate_up.narrow(1, 0, self.intermediate_size)?.contiguous()?;
+        let up = gate_up
+            .narrow(1, self.intermediate_size, self.intermediate_size)?
+            .contiguous()?;
         let activated = crate::ops::gelu_and_mul(&gate, &up)?;
         self.down_proj.forward(&activated)
     }
@@ -232,13 +227,13 @@ impl Module for Gemma2MLP {
 // Gemma2Attention
 // ---------------------------------------------------------------------------
 
-/// Gemma2 multi-head attention with custom scaling and logit soft capping.
+/// Gemma2 multi-head attention with fused QKV, custom scaling, and logit soft capping.
 pub struct Gemma2Attention {
-    q_proj: ColumnParallelLinear,
-    k_proj: ColumnParallelLinear,
-    v_proj: ColumnParallelLinear,
+    qkv_proj: Linear,
     o_proj: RowParallelLinear,
     rotary_emb: RotaryEmbedding,
+    q_size: usize,
+    kv_size: usize,
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -250,7 +245,7 @@ pub struct Gemma2Attention {
 }
 
 impl Gemma2Attention {
-    /// Load attention weights.
+    /// Load attention weights with fused QKV projection.
     ///
     /// Sliding window is initialized to `None`; set `self.sliding_window` after
     /// construction for sliding-attention layers.
@@ -263,30 +258,7 @@ impl Gemma2Attention {
         rank: usize,
         world_size: usize,
     ) -> ModelResult<Self> {
-        let q_proj = ColumnParallelLinear::load(
-            weights,
-            &format!("{}.q_proj", prefix),
-            dtype,
-            rank,
-            world_size,
-            false,
-        )?;
-        let k_proj = ColumnParallelLinear::load(
-            weights,
-            &format!("{}.k_proj", prefix),
-            dtype,
-            rank,
-            world_size,
-            false,
-        )?;
-        let v_proj = ColumnParallelLinear::load(
-            weights,
-            &format!("{}.v_proj", prefix),
-            dtype,
-            rank,
-            world_size,
-            false,
-        )?;
+        let (qkv_proj, q_size, kv_size) = load_fused_qkv(weights, prefix, dtype, rank, world_size)?;
         let o_proj = RowParallelLinear::load(
             weights,
             &format!("{}.o_proj", prefix),
@@ -308,11 +280,11 @@ impl Gemma2Attention {
         )?;
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             rotary_emb,
+            q_size,
+            kv_size,
             num_q_heads,
             num_kv_heads,
             head_dim: config.head_dim,
@@ -329,13 +301,9 @@ impl Gemma2Attention {
         let hidden = config.hidden_size;
         let q_size = config.num_attention_heads * config.head_dim;
         let kv_size = config.num_kv_heads * config.head_dim;
+        let qkv_size = q_size + 2 * kv_size;
 
-        let q_proj =
-            ColumnParallelLinear::new(Linear::zeros(hidden, q_size, dtype, device)?, false);
-        let k_proj =
-            ColumnParallelLinear::new(Linear::zeros(hidden, kv_size, dtype, device)?, false);
-        let v_proj =
-            ColumnParallelLinear::new(Linear::zeros(hidden, kv_size, dtype, device)?, false);
+        let qkv_proj = Linear::zeros(hidden, qkv_size, dtype, device)?;
         let o_proj = RowParallelLinear::new(Linear::zeros(q_size, hidden, dtype, device)?, true);
 
         let rotary_emb = RotaryEmbedding::new(
@@ -347,11 +315,11 @@ impl Gemma2Attention {
         )?;
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             rotary_emb,
+            q_size,
+            kv_size,
             num_q_heads: config.num_attention_heads,
             num_kv_heads: config.num_kv_heads,
             head_dim: config.head_dim,
@@ -370,26 +338,24 @@ impl Gemma2Attention {
     ) -> ModelResult<Tensor> {
         let num_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
 
-        let q = self
-            .q_proj
+        // Fused QKV projection.
+        let qkv = self
+            .qkv_proj
             .forward(hidden_states)
             .map_err(ModelError::Candle)?;
-        let k = self
-            .k_proj
-            .forward(hidden_states)
-            .map_err(ModelError::Candle)?;
-        let v = self
-            .v_proj
-            .forward(hidden_states)
-            .map_err(ModelError::Candle)?;
-
-        let q = q
+        let q = qkv
+            .narrow(1, 0, self.q_size)
+            .map_err(ModelError::Candle)?
             .reshape((num_tokens, self.num_q_heads, self.head_dim))
             .map_err(ModelError::Candle)?;
-        let k = k
+        let k = qkv
+            .narrow(1, self.q_size, self.kv_size)
+            .map_err(ModelError::Candle)?
             .reshape((num_tokens, self.num_kv_heads, self.head_dim))
             .map_err(ModelError::Candle)?;
-        let v = v
+        let v = qkv
+            .narrow(1, self.q_size + self.kv_size, self.kv_size)
+            .map_err(ModelError::Candle)?
             .reshape((num_tokens, self.num_kv_heads, self.head_dim))
             .map_err(ModelError::Candle)?;
 
@@ -401,7 +367,7 @@ impl Gemma2Attention {
             attention_with_cache(&q, &k, &v, self.scale, kv_cache, self.sliding_window)?;
 
         let attn_output = attn_output
-            .reshape((num_tokens, self.num_q_heads * self.head_dim))
+            .reshape((num_tokens, self.q_size))
             .map_err(ModelError::Candle)?;
 
         self.o_proj
@@ -664,23 +630,23 @@ impl Gemma2ForCausalLM {
 impl crate::Model for Gemma2ForCausalLM {
     fn inject_lora(&mut self, adapter: &LoraAdapter) -> ModelResult<()> {
         let targets = &adapter.config.target_modules;
+        if targets
+            .iter()
+            .any(|t| t == "q_proj" || t == "k_proj" || t == "v_proj")
+        {
+            eprintln!(
+                "WARN: LoRA on fused QKV projection not yet supported; \
+                 q_proj/k_proj/v_proj LoRA will be ignored"
+            );
+        }
+        if targets.iter().any(|t| t == "gate_proj" || t == "up_proj") {
+            eprintln!(
+                "WARN: LoRA on fused gate_up projection not yet supported; \
+                 gate_proj/up_proj LoRA will be ignored"
+            );
+        }
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
-            // Attention projections.
             let attn_prefix = format!("model.layers.{}.self_attn", i);
-            let attn_projs: &mut [(&str, &mut ColumnParallelLinear)] = &mut [
-                ("q_proj", &mut layer.self_attn.q_proj),
-                ("k_proj", &mut layer.self_attn.k_proj),
-                ("v_proj", &mut layer.self_attn.v_proj),
-            ];
-            for (name, proj) in attn_projs.iter_mut() {
-                if targets.iter().any(|t| t == name) {
-                    let key = format!("{}.{}", attn_prefix, name);
-                    if let Some((a, b)) = adapter.weights.get(&key) {
-                        proj.inner_mut()
-                            .attach_lora(a.clone(), b.clone(), adapter.scaling)?;
-                    }
-                }
-            }
             if targets.iter().any(|t| t == "o_proj") {
                 let key = format!("{}.o_proj", attn_prefix);
                 if let Some((a, b)) = adapter.weights.get(&key) {
@@ -691,21 +657,7 @@ impl crate::Model for Gemma2ForCausalLM {
                     )?;
                 }
             }
-            // MLP projections.
             let mlp_prefix = format!("model.layers.{}.mlp", i);
-            let mlp_projs: &mut [(&str, &mut ColumnParallelLinear)] = &mut [
-                ("gate_proj", &mut layer.mlp.gate_proj),
-                ("up_proj", &mut layer.mlp.up_proj),
-            ];
-            for (name, proj) in mlp_projs.iter_mut() {
-                if targets.iter().any(|t| t == name) {
-                    let key = format!("{}.{}", mlp_prefix, name);
-                    if let Some((a, b)) = adapter.weights.get(&key) {
-                        proj.inner_mut()
-                            .attach_lora(a.clone(), b.clone(), adapter.scaling)?;
-                    }
-                }
-            }
             if targets.iter().any(|t| t == "down_proj") {
                 let key = format!("{}.down_proj", mlp_prefix);
                 if let Some((a, b)) = adapter.weights.get(&key) {

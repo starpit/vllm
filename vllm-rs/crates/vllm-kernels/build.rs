@@ -19,7 +19,8 @@ fn main() {
             .file("csrc/cache_kernels.cu")
             .file("csrc/qk_norm_rope_kernels.cu")
             .file("csrc/moe_topk_kernels.cu")
-            .file("csrc/moe_align_kernels.cu");
+            .file("csrc/moe_align_kernels.cu")
+            .file("csrc/sampling_kernels.cu");
         build.compile("vllm_kernels");
 
         println!("cargo:rerun-if-changed=csrc/vec_utils.cuh");
@@ -30,5 +31,6 @@ fn main() {
         println!("cargo:rerun-if-changed=csrc/qk_norm_rope_kernels.cu");
         println!("cargo:rerun-if-changed=csrc/moe_topk_kernels.cu");
         println!("cargo:rerun-if-changed=csrc/moe_align_kernels.cu");
+        println!("cargo:rerun-if-changed=csrc/sampling_kernels.cu");
     }
 }

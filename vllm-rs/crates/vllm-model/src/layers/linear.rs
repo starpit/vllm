@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, Module, Tensor};
 
-use crate::error::ModelResult;
+use crate::error::{ModelError, ModelResult};
 use crate::process_group::ProcessGroup;
 use crate::tensor;
 use crate::weight::ModelWeights;
@@ -349,6 +349,109 @@ impl Module for RowParallelLinear {
             None => Ok(output),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fused projection helpers
+// ---------------------------------------------------------------------------
+
+/// Load a fused QKV linear layer by concatenating separate Q, K, V weights.
+///
+/// Each component is TP-sharded independently along dim 0 (output dim) before
+/// concatenation — critical for GQA where Q has `num_heads` and K/V have
+/// `num_kv_heads`.
+///
+/// Handles optional bias (e.g. Qwen2 has QKV bias).
+///
+/// Returns `(linear, q_size, kv_size)` where sizes are the post-shard output
+/// dimensions of Q and each of K/V respectively.
+pub fn load_fused_qkv(
+    weights: &ModelWeights,
+    prefix: &str,
+    dtype: DType,
+    rank: usize,
+    world_size: usize,
+) -> ModelResult<(Linear, usize, usize)> {
+    let q_name = format!("{prefix}.q_proj.weight");
+    let k_name = format!("{prefix}.k_proj.weight");
+    let v_name = format!("{prefix}.v_proj.weight");
+
+    let q_w = tensor::shard_tensor(&weights.get_cast(&q_name, dtype)?, 0, rank, world_size)?;
+    let k_w = tensor::shard_tensor(&weights.get_cast(&k_name, dtype)?, 0, rank, world_size)?;
+    let v_w = tensor::shard_tensor(&weights.get_cast(&v_name, dtype)?, 0, rank, world_size)?;
+
+    let q_size = q_w.dim(0).map_err(ModelError::Candle)?;
+    let kv_size = k_w.dim(0).map_err(ModelError::Candle)?;
+
+    let qkv_w = Tensor::cat(&[&q_w, &k_w, &v_w], 0).map_err(ModelError::Candle)?;
+
+    let q_bias_name = format!("{prefix}.q_proj.bias");
+    let qkv_bias = if weights.contains(&q_bias_name) {
+        let k_bias_name = format!("{prefix}.k_proj.bias");
+        let v_bias_name = format!("{prefix}.v_proj.bias");
+        let q_b =
+            tensor::shard_tensor(&weights.get_cast(&q_bias_name, dtype)?, 0, rank, world_size)?;
+        let k_b =
+            tensor::shard_tensor(&weights.get_cast(&k_bias_name, dtype)?, 0, rank, world_size)?;
+        let v_b =
+            tensor::shard_tensor(&weights.get_cast(&v_bias_name, dtype)?, 0, rank, world_size)?;
+        Some(Tensor::cat(&[&q_b, &k_b, &v_b], 0).map_err(ModelError::Candle)?)
+    } else {
+        None
+    };
+
+    Ok((Linear::new(qkv_w, qkv_bias), q_size, kv_size))
+}
+
+/// Load a fused gate+up linear layer by concatenating separate gate and up weights.
+///
+/// Each component is TP-sharded independently along dim 0 before concatenation.
+///
+/// `gate_name` / `up_name` are the weight name prefixes (e.g. `"layer.mlp.gate_proj"`
+/// or `"layer.experts.0.w1"` for MoE).
+///
+/// Returns `(linear, half_size)` where `half_size` is the post-shard output
+/// dimension of each component (used to split the fused output).
+pub fn load_fused_gate_up(
+    weights: &ModelWeights,
+    gate_prefix: &str,
+    up_prefix: &str,
+    dtype: DType,
+    rank: usize,
+    world_size: usize,
+) -> ModelResult<(Linear, usize)> {
+    let gate_name = format!("{gate_prefix}.weight");
+    let up_name = format!("{up_prefix}.weight");
+
+    let gate_w = tensor::shard_tensor(&weights.get_cast(&gate_name, dtype)?, 0, rank, world_size)?;
+    let up_w = tensor::shard_tensor(&weights.get_cast(&up_name, dtype)?, 0, rank, world_size)?;
+
+    let half_size = gate_w.dim(0).map_err(ModelError::Candle)?;
+
+    let fused_w = Tensor::cat(&[&gate_w, &up_w], 0).map_err(ModelError::Candle)?;
+
+    // Handle optional bias.
+    let gate_bias_name = format!("{gate_prefix}.bias");
+    let fused_bias = if weights.contains(&gate_bias_name) {
+        let up_bias_name = format!("{up_prefix}.bias");
+        let g_b = tensor::shard_tensor(
+            &weights.get_cast(&gate_bias_name, dtype)?,
+            0,
+            rank,
+            world_size,
+        )?;
+        let u_b = tensor::shard_tensor(
+            &weights.get_cast(&up_bias_name, dtype)?,
+            0,
+            rank,
+            world_size,
+        )?;
+        Some(Tensor::cat(&[&g_b, &u_b], 0).map_err(ModelError::Candle)?)
+    } else {
+        None
+    };
+
+    Ok((Linear::new(fused_w, fused_bias), half_size))
 }
 
 // ---------------------------------------------------------------------------

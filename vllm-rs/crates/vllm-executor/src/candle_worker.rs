@@ -172,38 +172,52 @@ fn can_gpu_sample(params: &SamplingParams) -> bool {
         && params.repetition_penalty == 1.0
         && params.frequency_penalty == 0.0
         && params.presence_penalty == 0.0
-        // For temperature>0 we use the Gumbel-max trick, which only handles
-        // the unfiltered categorical distribution.  top-p / top-k / min-p
-        // filtering still needs the CPU path.
-        && (params.temperature < 1e-5
-            || (params.top_p >= 1.0 && params.top_k <= 0 && params.min_p <= 0.0))
 }
 
 /// Sample one token entirely on-device.
 ///
 /// * Greedy (temp ≈ 0): `argmax(logits)`
-/// * Temperature > 0: Gumbel-max trick — `argmax(logits/T − log(−log(U)))`
-///   where U ~ Uniform(0,1).  This is an exact categorical sample from
-///   `softmax(logits/T)` with no top-p/top-k filtering.  All computation
-///   stays on-device; only the 4-byte token ID is copied back.
-fn gpu_sample(logits: &Tensor, temperature: f32) -> candle_core::Result<u32> {
+/// * Temperature > 0, no filtering: Gumbel-max trick
+/// * Temperature > 0, with top-p/top-k/min-p: fused CUDA sampling kernel
+///
+/// All computation stays on-device; only the 4-byte token ID is copied back.
+fn gpu_sample(logits: &Tensor, params: &SamplingParams) -> candle_core::Result<u32> {
+    let temperature = params.temperature as f32;
     let flat = logits.flatten_all()?;
 
     if temperature < 1e-5 {
         // Greedy.
-        flat.argmax(0)?.reshape(())?.to_scalar::<u32>()
-    } else {
-        // Gumbel-max trick: argmax(logits/T + gumbel_noise).
-        let scaled = (flat.to_dtype(DType::F32)? / temperature as f64)?;
-        let uniform = Tensor::rand(0.0f32, 1.0, scaled.shape(), scaled.device())?;
-        // gumbel = -log(-log(u));  clamp u away from 0 and 1 for stability.
-        let clamped = uniform.clamp(1e-7, 1.0 - 1e-7)?;
-        let gumbel = clamped.log()?.neg()?.log()?.neg()?;
-        (scaled + gumbel)?
-            .argmax(0)?
-            .reshape(())?
-            .to_scalar::<u32>()
+        return flat.argmax(0)?.reshape(())?.to_scalar::<u32>();
     }
+
+    let has_filtering = params.top_p < 1.0 || params.top_k > 0 || params.min_p > 0.0;
+
+    #[cfg(feature = "cuda")]
+    if has_filtering && flat.device().is_cuda() {
+        use rand::Rng;
+        let uniform: f32 = rand::thread_rng().r#gen();
+        return vllm_models::ops::gpu_sample_top_k_top_p(
+            &flat,
+            temperature,
+            params.top_k,
+            params.top_p as f32,
+            params.min_p as f32,
+            uniform,
+        );
+    }
+
+    // Gumbel-max trick: argmax(logits/T + gumbel_noise).
+    // Works for unfiltered temperature sampling (no top-p/top-k/min-p).
+    let _ = has_filtering; // suppress unused warning when cuda feature off
+    let scaled = (flat.to_dtype(DType::F32)? / temperature as f64)?;
+    let uniform = Tensor::rand(0.0f32, 1.0, scaled.shape(), scaled.device())?;
+    // gumbel = -log(-log(u));  clamp u away from 0 and 1 for stability.
+    let clamped = uniform.clamp(1e-7, 1.0 - 1e-7)?;
+    let gumbel = clamped.log()?.neg()?.log()?.neg()?;
+    (scaled + gumbel)?
+        .argmax(0)?
+        .reshape(())?
+        .to_scalar::<u32>()
 }
 
 impl CandleWorker {
@@ -890,7 +904,7 @@ impl CandleWorker {
         // we can sample entirely on-device and only copy back 4 bytes.
         if let Some(params) = self.sampling_params_map.get(req_id) {
             if !has_grammar && can_gpu_sample(params) {
-                let token_id = gpu_sample(&req_logits, params.temperature as f32).map_err(|e| {
+                let token_id = gpu_sample(&req_logits, params).map_err(|e| {
                     ExecutorError::WorkerExecution(format!("GPU sample error: {e}"))
                 })?;
                 return Ok(vec![token_id]);

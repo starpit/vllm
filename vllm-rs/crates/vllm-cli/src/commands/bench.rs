@@ -122,8 +122,9 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
         .unwrap_or(0);
 
     let sampling_params = SamplingParams {
-        temperature: 1.0,
-        top_p: 1.0,
+        temperature: args.temperature,
+        top_p: args.top_p,
+        top_k: args.top_k,
         ignore_eos: true,
         max_tokens: Some(args.output_len as u32),
         ..SamplingParams::default()

@@ -15,7 +15,7 @@
 use candle_core::{DType, Device, Module, Tensor};
 
 use vllm_model::error::{ModelError, ModelResult};
-use vllm_model::layers::{Embedding, Linear, RmsNorm};
+use vllm_model::layers::{Embedding, Linear, RmsNorm, load_fused_gate_up};
 use vllm_model::lora::LoraAdapter;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
@@ -100,22 +100,33 @@ impl MixtralConfig {
 // MixtralExpertMLP
 // ---------------------------------------------------------------------------
 
-/// A single Mixtral expert using w1/w2/w3 naming convention.
+/// A single Mixtral expert with fused gate+up (w1+w3) projection.
 ///
 /// w1 = gate_proj, w3 = up_proj, w2 = down_proj.
-/// SiLU(w1(x)) * w3(x) → w2(...)
+/// Fused: gate_up(x) → split → SiLU(gate) * up → w2(...)
 struct MixtralExpertMLP {
-    w1: Linear,
+    /// Fused w1 (gate) + w3 (up) projection.
+    gate_up: Linear,
     w2: Linear,
-    w3: Linear,
+    intermediate_size: usize,
 }
 
 impl MixtralExpertMLP {
     fn load(weights: &ModelWeights, prefix: &str, dtype: DType) -> ModelResult<Self> {
-        let w1 = Linear::load(weights, &format!("{prefix}.w1"), dtype)?;
+        let (gate_up, intermediate_size) = load_fused_gate_up(
+            weights,
+            &format!("{prefix}.w1"),
+            &format!("{prefix}.w3"),
+            dtype,
+            0,
+            1,
+        )?;
         let w2 = Linear::load(weights, &format!("{prefix}.w2"), dtype)?;
-        let w3 = Linear::load(weights, &format!("{prefix}.w3"), dtype)?;
-        Ok(Self { w1, w2, w3 })
+        Ok(Self {
+            gate_up,
+            w2,
+            intermediate_size,
+        })
     }
 
     fn zeros(
@@ -124,17 +135,23 @@ impl MixtralExpertMLP {
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
-        let w1 = Linear::zeros(hidden_size, intermediate_size, dtype, device)?;
+        let gate_up = Linear::zeros(hidden_size, 2 * intermediate_size, dtype, device)?;
         let w2 = Linear::zeros(intermediate_size, hidden_size, dtype, device)?;
-        let w3 = Linear::zeros(hidden_size, intermediate_size, dtype, device)?;
-        Ok(Self { w1, w2, w3 })
+        Ok(Self {
+            gate_up,
+            w2,
+            intermediate_size,
+        })
     }
 }
 
 impl Module for MixtralExpertMLP {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let gate = self.w1.forward(x)?;
-        let up = self.w3.forward(x)?;
+        let gate_up = self.gate_up.forward(x)?;
+        let gate = gate_up.narrow(1, 0, self.intermediate_size)?.contiguous()?;
+        let up = gate_up
+            .narrow(1, self.intermediate_size, self.intermediate_size)?
+            .contiguous()?;
         let activated = crate::ops::silu_and_mul(&gate, &up)?;
         self.w2.forward(&activated)
     }

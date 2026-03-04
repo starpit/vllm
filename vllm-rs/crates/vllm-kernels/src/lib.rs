@@ -19,6 +19,7 @@ pub mod moe;
 pub mod nccl;
 pub mod norm;
 pub mod rotary;
+pub mod sampling;
 
 pub use error::{KernelError, KernelResult};
 

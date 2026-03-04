@@ -259,26 +259,9 @@ impl LlamaMLP {
 impl Module for LlamaMLP {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let gate_up = self.gate_up_proj.forward(x)?;
-        // On CUDA: fused kernel reads both halves from gate_up directly,
-        // eliminating 2 contiguous copy kernels + 2 allocations per layer.
-        #[cfg(feature = "cuda")]
-        let activated = if gate_up.device().is_cuda() {
-            crate::ops::silu_and_mul_fused(&gate_up, self.intermediate_size)?
-        } else {
-            let gate = gate_up.narrow(1, 0, self.intermediate_size)?.contiguous()?;
-            let up = gate_up
-                .narrow(1, self.intermediate_size, self.intermediate_size)?
-                .contiguous()?;
-            crate::ops::silu_and_mul(&gate, &up)?
-        };
-        #[cfg(not(feature = "cuda"))]
-        let activated = {
-            let gate = gate_up.narrow(1, 0, self.intermediate_size)?.contiguous()?;
-            let up = gate_up
-                .narrow(1, self.intermediate_size, self.intermediate_size)?
-                .contiguous()?;
-            crate::ops::silu_and_mul(&gate, &up)?
-        };
+        // Fused: reads both halves from gate_up directly on CUDA,
+        // falls back to split + decomposed ops on CPU.
+        let activated = crate::ops::silu_and_mul_fused(&gate_up, self.intermediate_size)?;
         self.down_proj.forward(&activated)
     }
 }
@@ -658,53 +641,67 @@ impl LlamaDecoderLayer {
         })
     }
 
-    /// Forward pass.
+    /// Forward pass with residual threading.
     ///
-    /// * `hidden_states` — shape `[num_tokens, hidden_size]`
+    /// * `hidden_states` — for first layer: embedding output; for subsequent layers: previous MLP output
+    /// * `residual` — `None` for first layer, `Some(residual)` for subsequent layers
     /// * `positions` — shape `[num_tokens]`
     /// * `kv_cache` — optional per-layer KV handle for this layer's attention
     ///
-    /// Returns hidden_states of same shape.
+    /// Returns `(mlp_output, residual)` — the MLP output is NOT added to the residual;
+    /// that add is fused into the next layer's input norm (or the final norm).
     pub fn forward(
         &self,
         hidden_states: &Tensor,
+        residual: Option<&Tensor>,
         positions: &Tensor,
         kv_cache: Option<crate::LayerKvHandle<'_>>,
-    ) -> ModelResult<Tensor> {
-        // Pre-attention layernorm + attention.
-        let normed = crate::ops::rms_norm(hidden_states, &self.input_layernorm)
-            .map_err(ModelError::Candle)?;
+    ) -> ModelResult<(Tensor, Tensor)> {
+        // Pre-attention layernorm: fuse previous MLP residual add when available.
+        let (normed, residual) = if let Some(residual) = residual {
+            crate::ops::fused_add_rms_norm(hidden_states, residual, &self.input_layernorm)
+                .map_err(ModelError::Candle)?
+        } else {
+            let normed = crate::ops::rms_norm(hidden_states, &self.input_layernorm)
+                .map_err(ModelError::Candle)?;
+            (normed, hidden_states.clone())
+        };
+
         let attn_output = self.self_attn.forward(&normed, positions, kv_cache)?;
 
         // Fused residual add + post-attention layernorm.
-        let (normed, hidden_states) = crate::ops::fused_add_rms_norm(
-            &attn_output,
-            hidden_states,
-            &self.post_attention_layernorm,
-        )
-        .map_err(ModelError::Candle)?;
+        let (normed, residual) =
+            crate::ops::fused_add_rms_norm(&attn_output, &residual, &self.post_attention_layernorm)
+                .map_err(ModelError::Candle)?;
 
-        // MLP + residual.
+        // MLP (residual add deferred to next layer or final norm).
         let mlp_output = self.mlp.forward(&normed).map_err(ModelError::Candle)?;
-        let hidden_states = (hidden_states + mlp_output).map_err(ModelError::Candle)?;
 
-        Ok(hidden_states)
+        Ok((mlp_output, residual))
     }
 
-    /// Batched forward: norms and MLP on all tokens, attention per-request.
+    /// Batched forward with residual threading.
     pub fn forward_batch(
         &self,
         hidden_states: &Tensor,
+        residual: Option<&Tensor>,
         positions: &Tensor,
         attn_meta: &crate::AttentionMetadata,
         storage: &mut crate::BatchedKvCacheStorage<'_>,
-    ) -> ModelResult<Tensor> {
-        // Batched pre-attention layernorm.
-        let normed = {
+    ) -> ModelResult<(Tensor, Tensor)> {
+        // Pre-attention layernorm: fuse previous MLP residual add when available.
+        let (normed, residual) = {
             let _p = vllm_kernels::profiling::range("pre_norm");
-            crate::ops::rms_norm(hidden_states, &self.input_layernorm)
-                .map_err(ModelError::Candle)?
+            if let Some(residual) = residual {
+                crate::ops::fused_add_rms_norm(hidden_states, residual, &self.input_layernorm)
+                    .map_err(ModelError::Candle)?
+            } else {
+                let normed = crate::ops::rms_norm(hidden_states, &self.input_layernorm)
+                    .map_err(ModelError::Candle)?;
+                (normed, hidden_states.clone())
+            }
         };
+
         // Batched Q/K/V + RoPE, per-request attention, batched o_proj.
         let attn_output = {
             let _p = vllm_kernels::profiling::range("attn");
@@ -713,24 +710,19 @@ impl LlamaDecoderLayer {
         };
 
         // Fused residual add + post-attention layernorm.
-        let (normed, hidden_states) = {
+        let (normed, residual) = {
             let _p = vllm_kernels::profiling::range("post_norm");
-            crate::ops::fused_add_rms_norm(
-                &attn_output,
-                hidden_states,
-                &self.post_attention_layernorm,
-            )
-            .map_err(ModelError::Candle)?
+            crate::ops::fused_add_rms_norm(&attn_output, &residual, &self.post_attention_layernorm)
+                .map_err(ModelError::Candle)?
         };
 
-        // Batched MLP + residual.
+        // Batched MLP (residual add deferred to next layer or final norm).
         let mlp_output = {
             let _p = vllm_kernels::profiling::range("mlp");
             self.mlp.forward(&normed).map_err(ModelError::Candle)?
         };
-        let hidden_states = (hidden_states + mlp_output).map_err(ModelError::Candle)?;
 
-        Ok(hidden_states)
+        Ok((mlp_output, residual))
     }
 }
 
@@ -801,15 +793,24 @@ impl LlamaModel {
     /// Run the transformer backbone on pre-computed embeddings.
     pub fn backbone(
         &self,
-        mut hidden_states: Tensor,
+        hidden_states: Tensor,
         positions: &Tensor,
         mut kv_cache: Option<&mut crate::KvCacheStorage<'_>>,
     ) -> ModelResult<Tensor> {
+        let mut hidden_states = hidden_states;
+        let mut residual: Option<Tensor> = None;
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_handle = kv_cache.as_mut().map(|s| s.layer_handle(i));
-            hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
+            let (hs, res) =
+                layer.forward(&hidden_states, residual.as_ref(), positions, layer_handle)?;
+            hidden_states = hs;
+            residual = Some(res);
         }
-        crate::ops::rms_norm(&hidden_states, &self.norm).map_err(ModelError::Candle)
+        // Final norm: fuse last MLP's residual add into the norm.
+        let (normed, _) =
+            crate::ops::fused_add_rms_norm(&hidden_states, residual.as_ref().unwrap(), &self.norm)
+                .map_err(ModelError::Candle)?;
+        Ok(normed)
     }
 
     /// Forward pass.
@@ -830,12 +831,20 @@ impl LlamaModel {
             .forward(input_ids)
             .map_err(ModelError::Candle)?;
 
+        let mut residual: Option<Tensor> = None;
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_handle = kv_cache.as_mut().map(|s| s.layer_handle(i));
-            hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
+            let (hs, res) =
+                layer.forward(&hidden_states, residual.as_ref(), positions, layer_handle)?;
+            hidden_states = hs;
+            residual = Some(res);
         }
 
-        crate::ops::rms_norm(&hidden_states, &self.norm).map_err(ModelError::Candle)
+        // Final norm: fuse last MLP's residual add into the norm.
+        let (normed, _) =
+            crate::ops::fused_add_rms_norm(&hidden_states, residual.as_ref().unwrap(), &self.norm)
+                .map_err(ModelError::Candle)?;
+        Ok(normed)
     }
 
     /// Batched forward pass.
@@ -854,16 +863,27 @@ impl LlamaModel {
                 .map_err(ModelError::Candle)?
         };
 
-        // Batched layer forward.
+        // Batched layer forward with residual threading.
+        let mut residual: Option<Tensor> = None;
         for (i, layer) in self.layers.iter().enumerate() {
             let _p = vllm_kernels::profiling::range_fmt(format_args!("layer_{i}"));
-            hidden_states =
-                layer.forward_batch(&hidden_states, positions, attn_meta, kv_storage)?;
+            let (hs, res) = layer.forward_batch(
+                &hidden_states,
+                residual.as_ref(),
+                positions,
+                attn_meta,
+                kv_storage,
+            )?;
+            hidden_states = hs;
+            residual = Some(res);
         }
 
-        // Batched final norm.
+        // Batched final norm: fuse last MLP's residual add into the norm.
         let _p = vllm_kernels::profiling::range("final_norm");
-        crate::ops::rms_norm(&hidden_states, &self.norm).map_err(ModelError::Candle)
+        let (normed, _) =
+            crate::ops::fused_add_rms_norm(&hidden_states, residual.as_ref().unwrap(), &self.norm)
+                .map_err(ModelError::Candle)?;
+        Ok(normed)
     }
 
     /// Number of decoder layers.

@@ -244,11 +244,7 @@ impl Gemma3MLP {
 impl Module for Gemma3MLP {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let gate_up = self.gate_up_proj.forward(x)?;
-        let gate = gate_up.narrow(1, 0, self.intermediate_size)?.contiguous()?;
-        let up = gate_up
-            .narrow(1, self.intermediate_size, self.intermediate_size)?
-            .contiguous()?;
-        let activated = crate::ops::gelu_and_mul(&gate, &up)?;
+        let activated = crate::ops::gelu_and_mul_fused(&gate_up, self.intermediate_size)?;
         self.down_proj.forward(&activated)
     }
 }

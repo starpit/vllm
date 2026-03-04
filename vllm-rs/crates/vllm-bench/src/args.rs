@@ -83,6 +83,28 @@ pub struct BenchLatencyArgs {
     #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
     pub gpu_memory_utilization: f64,
 
+    /// Maximum model context length (overrides config.json).
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+
+    /// Maximum number of concurrent sequences.
+    #[arg(long, default_value_t = 256)]
+    pub max_num_seqs: usize,
+
+    /// KV cache block size in tokens.
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+
+    /// Number of GPUs for tensor parallelism (default: 1).
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel_size: usize,
+
+    /// Enable prefix caching (KV cache reuse for shared prompt prefixes).
+    /// Disabled by default for benchmarking — prefix caching skews latency
+    /// because repeated prompts get cache hits.
+    #[arg(long)]
+    pub enable_prefix_caching: bool,
+
     /// Specific GGUF filename to download from a HuggingFace repo.
     #[arg(long)]
     pub gguf_file: Option<String>,

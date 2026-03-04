@@ -22,8 +22,15 @@ fn create_llm(args: &BenchLatencyArgs, model: &str) -> Result<LLM> {
     let mut builder = LLMBuilder::new(model)
         .device(&args.device)
         .dtype(&args.dtype)
-        .gpu_memory_utilization(args.gpu_memory_utilization);
+        .gpu_memory_utilization(args.gpu_memory_utilization)
+        .max_num_seqs(args.max_num_seqs)
+        .block_size(args.block_size)
+        .tensor_parallel_size(args.tensor_parallel_size)
+        .enable_prefix_caching(args.enable_prefix_caching);
 
+    if let Some(len) = args.max_model_len {
+        builder = builder.max_model_len(len);
+    }
     if let Some(ref token) = args.hf_token {
         builder = builder.hf_token(token);
     }
@@ -176,6 +183,16 @@ pub(crate) fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
         let load_start = Instant::now();
         let llm = create_llm(&args, model)?;
         eprintln!("Model loaded in {:.2}s", load_start.elapsed().as_secs_f64());
+
+        let required_len = args.input_len + args.output_len;
+        anyhow::ensure!(
+            llm.max_model_len() >= required_len,
+            "max_model_len ({}) must be >= input_len + output_len ({} + {} = {})",
+            llm.max_model_len(),
+            args.input_len,
+            args.output_len,
+            required_len,
+        );
 
         let short_name = short_model_name(model);
 

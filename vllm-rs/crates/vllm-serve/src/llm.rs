@@ -211,6 +211,18 @@ impl LLMBuilder {
         self
     }
 
+    /// Set the number of GPUs for tensor parallelism.
+    pub fn tensor_parallel_size(mut self, n: usize) -> Self {
+        self.config.tensor_parallel_size = n;
+        self
+    }
+
+    /// Enable or disable prefix caching (KV cache reuse for shared prefixes).
+    pub fn enable_prefix_caching(mut self, enabled: bool) -> Self {
+        self.config.enable_prefix_caching = enabled;
+        self
+    }
+
     /// Set the CUDA graph configuration for decode acceleration.
     pub fn cuda_graph_config(mut self, config: CudaGraphConfig) -> Self {
         self.config.cuda_graph_config = Some(config);

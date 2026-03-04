@@ -91,10 +91,35 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
         args.num_iters, args.input_len, args.output_len, args.num_iters_warmup
     );
 
-    let bar_style = ProgressStyle::with_template(
-        "{msg}: {wide_bar:.cyan/blue} {pos}/{len} [{elapsed_precise}<{eta_precise}, {per_sec}]",
+    let warmup_style = ProgressStyle::with_template(
+        "{msg} {wide_bar:.yellow/yellow} {pos}/{len} [{elapsed_precise}<{eta_precise}, {per_sec}]",
     )
     .unwrap();
+    let bench_style = ProgressStyle::with_template(
+        "{msg} {wide_bar:.cyan/blue} {pos}/{len} [{elapsed_precise}<{eta_precise}, {per_sec}]",
+    )
+    .unwrap();
+
+    // Pre-compute max label width so all progress bars align.
+    let max_msg_len = models
+        .iter()
+        .flat_map(|m| {
+            let name = short_model_name(m);
+            batch_sizes.iter().flat_map(move |&bs| {
+                let bs_label = if batch_sizes.len() > 1 {
+                    format!(" bs={bs}")
+                } else {
+                    String::new()
+                };
+                [
+                    format!("{name}{bs_label} warmup"),
+                    format!("{name}{bs_label} bench"),
+                ]
+            })
+        })
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0);
 
     let sampling_params = SamplingParams {
         temperature: 1.0,
@@ -131,9 +156,14 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
 
             // Warmup.
             if args.num_iters_warmup > 0 {
+                let msg = format!(
+                    "{:<width$}",
+                    format!("{short_name}{bs_label} warmup"),
+                    width = max_msg_len
+                );
                 let pb = ProgressBar::new(args.num_iters_warmup as u64)
-                    .with_style(bar_style.clone())
-                    .with_message(format!("{short_name}{bs_label} warmup"));
+                    .with_style(warmup_style.clone())
+                    .with_message(msg);
                 for _ in 0..args.num_iters_warmup {
                     llm.generate_token_ids(&dummy_prompts, Some(sampling_params.clone()))?;
                     pb.inc(1);
@@ -142,9 +172,14 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
             }
 
             // Timed runs.
+            let msg = format!(
+                "{:<width$}",
+                format!("{short_name}{bs_label} bench"),
+                width = max_msg_len
+            );
             let pb = ProgressBar::new(args.num_iters as u64)
-                .with_style(bar_style.clone())
-                .with_message(format!("{short_name}{bs_label} bench"));
+                .with_style(bench_style.clone())
+                .with_message(msg);
             let mut latencies = Vec::with_capacity(args.num_iters);
             for _ in 0..args.num_iters {
                 let start = Instant::now();
@@ -222,9 +257,23 @@ fn print_single_result(r: &BenchResult, args: &BenchLatencyArgs) {
     }
 }
 
+/// Standard percentile set used when only one dimension varies.
+const ALL_PERCENTILES: &[f64] = &[10.0, 25.0, 50.0, 75.0, 90.0, 99.0];
+
 /// Table output for multi-model and/or multi-batch-size runs.
 fn print_table(results: &[BenchResult], models: &[String], batch_sizes: &[usize], pcts: &[f64]) {
-    // Format a cell: comma-separated percentile values.
+    // When only one dimension is multi-valued, show all standard percentiles
+    // as separate columns. Only limit to user-specified percentiles when both
+    // models and batch sizes are multi-dimensional.
+    let multi_model = models.len() > 1;
+    let multi_bs = batch_sizes.len() > 1;
+    let full_pcts = if multi_model && multi_bs {
+        pcts
+    } else {
+        ALL_PERCENTILES
+    };
+
+    // Format a cell: comma-separated percentile values (2D matrix only).
     let fmt_cell = |r: &BenchResult| -> String {
         pcts.iter()
             .map(|&p| format!("{:.4}", r.percentile_value(p)))
@@ -244,19 +293,19 @@ fn print_table(results: &[BenchResult], models: &[String], batch_sizes: &[usize]
         let row_label_width = 12_usize;
 
         print!("{:<width$}", "Batch size", width = row_label_width);
-        for p in pcts {
+        for p in full_pcts {
             print!("  {:>width$}", format!("p{p:.0}"), width = col_width);
         }
         println!();
         print!("{:<width$}", "----------", width = row_label_width);
-        for _ in pcts {
+        for _ in full_pcts {
             print!("  {:>width$}", "----------", width = col_width);
         }
         println!();
 
         for r in results {
             print!("{:<width$}", r.batch_size, width = row_label_width);
-            for &p in pcts {
+            for &p in full_pcts {
                 print!("  {:>width$.4}", r.percentile_value(p), width = col_width);
             }
             println!();
@@ -266,19 +315,19 @@ fn print_table(results: &[BenchResult], models: &[String], batch_sizes: &[usize]
         let col_width = 10_usize;
 
         print!("{:<30}", "Model");
-        for p in pcts {
+        for p in full_pcts {
             print!("  {:>width$}", format!("p{p:.0}"), width = col_width);
         }
         println!();
         print!("{:<30}", "-----");
-        for _ in pcts {
+        for _ in full_pcts {
             print!("  {:>width$}", "----------", width = col_width);
         }
         println!();
 
         for r in results {
             print!("{:<30}", short_model_name(&r.model));
-            for &p in pcts {
+            for &p in full_pcts {
                 print!("  {:>width$.4}", r.percentile_value(p), width = col_width);
             }
             println!();

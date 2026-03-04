@@ -330,28 +330,48 @@ impl LLM {
 
         let n = params.n.max(1) as usize;
 
+        // Convert all prompts to Prompt enum.
+        let prompts: Vec<Prompt> = prompts.iter().map(|p| p.clone().into()).collect();
+
+        // Batch all prompts into a single CompletionRequest so the scheduler
+        // sees them together and can batch prefill + decode efficiently.
+        let request = build_batched_completion_request(&prompts, &params, &self.model_name);
+
+        let response = self
+            .runtime
+            .block_on(self.engine.completion(request))
+            .map_err(|e| anyhow::anyhow!("completion failed: {e}"))?;
+
+        // The engine returns one CompletionResponseChoice per (prompt, n) pair.
+        // Group them back into per-prompt RequestOutputs.
         let mut outputs = Vec::with_capacity(prompts.len());
+        let choices_per_prompt = n;
+        for (p_idx, chunk) in response.choices.chunks(choices_per_prompt).enumerate() {
+            let completion_outputs: Vec<CompletionOutput> = chunk
+                .iter()
+                .map(|c| CompletionOutput {
+                    index: c.index,
+                    text: c.text.clone(),
+                    token_ids: Vec::new(),
+                    finish_reason: c.finish_reason.clone(),
+                })
+                .collect();
 
-        for (i, prompt) in prompts.iter().enumerate() {
-            let prompt: Prompt = prompt.clone().into();
-            let request = match &prompt {
-                Prompt::Text(text) => build_completion_request(text, &params, &self.model_name),
-                Prompt::TokenIds(ids) => {
-                    build_token_ids_completion_request(ids, &params, &self.model_name)
-                }
-            };
-
-            let response = self
-                .runtime
-                .block_on(self.engine.completion(request))
-                .map_err(|e| anyhow::anyhow!("completion failed for prompt {i}: {e}"))?;
-
-            let prompt_text = match &prompt {
-                Prompt::Text(text) => Some(text.as_str()),
+            let prompt_text = match &prompts[p_idx] {
+                Prompt::Text(text) => Some(text.clone()),
                 Prompt::TokenIds(_) => None,
             };
 
-            outputs.push(completion_response_to_output(&response, prompt_text, n));
+            outputs.push(RequestOutput {
+                request_id: format!("{}-{p_idx}", response.id),
+                prompt: prompt_text,
+                prompt_token_ids: match &prompts[p_idx] {
+                    Prompt::TokenIds(ids) => ids.clone(),
+                    Prompt::Text(_) => Vec::new(),
+                },
+                outputs: completion_outputs,
+                finished: true,
+            });
         }
 
         Ok(outputs)
@@ -392,11 +412,45 @@ impl LLM {
 // Request builders
 // ---------------------------------------------------------------------------
 
-fn build_completion_request(
-    prompt: &str,
+/// Build a single batched CompletionRequest from multiple prompts.
+///
+/// Groups text prompts as `Multiple` and token-ID prompts as `MultipleTokenIds`.
+/// Mixed prompt types are not supported (token IDs take precedence if all are
+/// token IDs, otherwise all are text).
+fn build_batched_completion_request(
+    prompts: &[Prompt],
     params: &SamplingParams,
     model: &str,
 ) -> protocol::CompletionRequest {
+    let prompt = if prompts.len() == 1 {
+        match &prompts[0] {
+            Prompt::Text(text) => protocol::CompletionPrompt::Single(text.clone()),
+            Prompt::TokenIds(ids) => protocol::CompletionPrompt::TokenIds(ids.clone()),
+        }
+    } else {
+        // Check if all prompts are the same variant.
+        let all_token_ids = prompts.iter().all(|p| matches!(p, Prompt::TokenIds(_)));
+        if all_token_ids {
+            let seqs: Vec<Vec<u32>> = prompts
+                .iter()
+                .map(|p| match p {
+                    Prompt::TokenIds(ids) => ids.clone(),
+                    Prompt::Text(_) => unreachable!(),
+                })
+                .collect();
+            protocol::CompletionPrompt::MultipleTokenIds(seqs)
+        } else {
+            let texts: Vec<String> = prompts
+                .iter()
+                .map(|p| match p {
+                    Prompt::Text(text) => text.clone(),
+                    Prompt::TokenIds(ids) => format!("<token_ids:{}>", ids.len()),
+                })
+                .collect();
+            protocol::CompletionPrompt::Multiple(texts)
+        }
+    };
+
     let stop = if params.stop.is_empty() {
         None
     } else {
@@ -405,54 +459,7 @@ fn build_completion_request(
 
     protocol::CompletionRequest {
         model: Some(model.to_string()),
-        prompt: Some(protocol::CompletionPrompt::Single(prompt.to_string())),
-        echo: false,
-        temperature: Some(params.temperature),
-        top_p: Some(params.top_p),
-        n: params.n,
-        max_tokens: params.max_tokens,
-        stream: false,
-        stream_options: None,
-        stop,
-        frequency_penalty: Some(params.frequency_penalty),
-        presence_penalty: Some(params.presence_penalty),
-        logit_bias: None,
-        logprobs: params.logprobs.map(|v| v.max(0) as u32),
-        prompt_logprobs: params.prompt_logprobs.map(|v| v.max(0) as u32),
-        suffix: None,
-        seed: params.seed.map(|s| s as i64),
-        user: None,
-        top_k: Some(params.top_k),
-        min_p: Some(params.min_p),
-        repetition_penalty: Some(params.repetition_penalty),
-        min_tokens: params.min_tokens,
-        stop_token_ids: params.stop_token_ids.clone(),
-        include_stop_str_in_output: params.include_stop_str_in_output,
-        ignore_eos: params.ignore_eos,
-        skip_special_tokens: params.skip_special_tokens,
-        priority: 0,
-        cache_salt: None,
-        request_id: None,
-        guided_regex: None,
-    }
-}
-
-fn build_token_ids_completion_request(
-    prompt_token_ids: &[u32],
-    params: &SamplingParams,
-    model: &str,
-) -> protocol::CompletionRequest {
-    let stop = if params.stop.is_empty() {
-        None
-    } else {
-        Some(protocol::StopCondition::Multiple(params.stop.clone()))
-    };
-
-    protocol::CompletionRequest {
-        model: Some(model.to_string()),
-        prompt: Some(protocol::CompletionPrompt::TokenIds(
-            prompt_token_ids.to_vec(),
-        )),
+        prompt: Some(prompt),
         echo: false,
         temperature: Some(params.temperature),
         top_p: Some(params.top_p),
@@ -546,31 +553,6 @@ fn build_chat_request(
 // ---------------------------------------------------------------------------
 // Response → RequestOutput mapping
 // ---------------------------------------------------------------------------
-
-fn completion_response_to_output(
-    resp: &protocol::CompletionResponse,
-    prompt: Option<&str>,
-    _n: usize,
-) -> RequestOutput {
-    let outputs: Vec<CompletionOutput> = resp
-        .choices
-        .iter()
-        .map(|c| CompletionOutput {
-            index: c.index,
-            text: c.text.clone(),
-            token_ids: Vec::new(), // Token IDs not exposed in CompletionResponse
-            finish_reason: c.finish_reason.clone(),
-        })
-        .collect();
-
-    RequestOutput {
-        request_id: resp.id.clone(),
-        prompt: prompt.map(|s| s.to_string()),
-        prompt_token_ids: Vec::new(), // Not available from CompletionResponse
-        outputs,
-        finished: true,
-    }
-}
 
 fn chat_response_to_output(resp: &protocol::ChatCompletionResponse, _n: usize) -> RequestOutput {
     let outputs: Vec<CompletionOutput> = resp
@@ -673,19 +655,68 @@ mod tests {
     }
 
     #[test]
-    fn test_build_completion_request() {
+    fn test_build_batched_completion_request_single_text() {
         let params = SamplingParams {
             temperature: 0.7,
             max_tokens: Some(100),
             stop: vec!["END".to_string()],
             ..SamplingParams::default()
         };
-        let req = build_completion_request("Hello", &params, "test-model");
+        let prompts = vec![Prompt::Text("Hello".to_string())];
+        let req = build_batched_completion_request(&prompts, &params, "test-model");
         assert_eq!(req.model, Some("test-model".to_string()));
         assert_eq!(req.temperature, Some(0.7));
         assert_eq!(req.max_tokens, Some(100));
         assert!(!req.stream);
         assert!(req.stop.is_some());
+        assert!(matches!(
+            req.prompt,
+            Some(protocol::CompletionPrompt::Single(ref s)) if s == "Hello"
+        ));
+    }
+
+    #[test]
+    fn test_build_batched_completion_request_multiple_token_ids() {
+        let params = SamplingParams {
+            temperature: 0.7,
+            max_tokens: Some(100),
+            ignore_eos: true,
+            ..SamplingParams::default()
+        };
+        let prompts = vec![
+            Prompt::TokenIds(vec![10, 20, 30]),
+            Prompt::TokenIds(vec![40, 50]),
+        ];
+        let req = build_batched_completion_request(&prompts, &params, "test-model");
+        assert_eq!(req.model, Some("test-model".to_string()));
+        assert!(matches!(
+            req.prompt,
+            Some(protocol::CompletionPrompt::MultipleTokenIds(ref seqs))
+                if seqs.len() == 2 && seqs[0] == [10, 20, 30] && seqs[1] == [40, 50]
+        ));
+    }
+
+    #[test]
+    fn test_build_batched_completion_request_single_token_ids() {
+        let params = SamplingParams::default();
+        let prompts = vec![Prompt::TokenIds(vec![1, 2, 3])];
+        let req = build_batched_completion_request(&prompts, &params, "m");
+        assert!(matches!(
+            req.prompt,
+            Some(protocol::CompletionPrompt::TokenIds(ref ids)) if ids == &[1, 2, 3]
+        ));
+    }
+
+    #[test]
+    fn test_build_batched_completion_request_multiple_text() {
+        let params = SamplingParams::default();
+        let prompts = vec![Prompt::Text("Hello".into()), Prompt::Text("World".into())];
+        let req = build_batched_completion_request(&prompts, &params, "m");
+        assert!(matches!(
+            req.prompt,
+            Some(protocol::CompletionPrompt::Multiple(ref texts))
+                if texts.len() == 2 && texts[0] == "Hello" && texts[1] == "World"
+        ));
     }
 
     #[test]
@@ -697,36 +728,6 @@ mod tests {
         assert_eq!(req.messages[0].role, "system");
         assert_eq!(req.messages[1].role, "user");
         assert!(!req.stream);
-    }
-
-    #[test]
-    fn test_completion_response_to_output() {
-        let resp = protocol::CompletionResponse {
-            id: "cmpl-123".to_string(),
-            object: "text_completion".to_string(),
-            created: 0,
-            model: "test".to_string(),
-            choices: vec![protocol::CompletionResponseChoice {
-                index: 0,
-                text: "world".to_string(),
-                logprobs: None,
-                finish_reason: Some("stop".to_string()),
-                stop_reason: None,
-                prompt_logprobs: None,
-            }],
-            usage: protocol::UsageInfo {
-                prompt_tokens: 1,
-                total_tokens: 2,
-                completion_tokens: Some(1),
-                prompt_tokens_details: None,
-            },
-        };
-        let output = completion_response_to_output(&resp, Some("hello"), 1);
-        assert_eq!(output.request_id, "cmpl-123");
-        assert_eq!(output.prompt, Some("hello".to_string()));
-        assert_eq!(output.outputs.len(), 1);
-        assert_eq!(output.outputs[0].text, "world");
-        assert!(output.finished);
     }
 
     #[test]
@@ -780,24 +781,5 @@ mod tests {
     fn test_prompt_from_token_ids() {
         let p: Prompt = vec![1u32, 2, 3].into();
         assert!(matches!(p, Prompt::TokenIds(ids) if ids == [1, 2, 3]));
-    }
-
-    #[test]
-    fn test_build_token_ids_completion_request() {
-        let params = SamplingParams {
-            temperature: 0.7,
-            max_tokens: Some(100),
-            ignore_eos: true,
-            ..SamplingParams::default()
-        };
-        let req = build_token_ids_completion_request(&[10, 20, 30], &params, "test-model");
-        assert_eq!(req.model, Some("test-model".to_string()));
-        assert_eq!(req.temperature, Some(0.7));
-        assert_eq!(req.max_tokens, Some(100));
-        assert!(!req.stream);
-        assert!(matches!(
-            req.prompt,
-            Some(protocol::CompletionPrompt::TokenIds(ref ids)) if ids == &[10, 20, 30]
-        ));
     }
 }

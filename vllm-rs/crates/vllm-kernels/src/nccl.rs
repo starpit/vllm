@@ -63,10 +63,74 @@ impl NcclProcessGroup {
         })
     }
 
+    /// Generate a new NCCL unique ID for bootstrapping communicator creation.
+    ///
+    /// Call this once on rank 0, then distribute the ID to all ranks via
+    /// TCP rendezvous or shared memory.
+    pub fn generate_id() -> KernelResult<cudarc::nccl::Id> {
+        cudarc::nccl::Id::new()
+            .map_err(|e| KernelError::Other(format!("failed to create NCCL ID: {e:?}")))
+    }
+
+    /// Create per-rank communicators for all local devices using `comm_init_rank`.
+    ///
+    /// Unlike `from_devices` (which uses `comm_init_all` and ties comms to
+    /// the calling thread), this creates independent communicators that work
+    /// correctly when used from separate threads (e.g. tokio worker tasks).
+    ///
+    /// `base_rank` is the global rank offset for the first device.
+    /// `global_world_size` is the total number of GPUs across all nodes.
+    /// Create per-rank communicators for local CUDA devices.
+    ///
+    /// `cuda_ordinals` are the CUDA device indices (e.g. `[0, 1]`).
+    /// Each comm is created on its own thread via `comm_init_rank` to avoid
+    /// deadlock (the call is collective) and ensure the correct CUDA context.
+    ///
+    /// Unlike `from_devices` (which uses `comm_init_all` and ties comms to
+    /// the calling thread), these communicators work correctly when used
+    /// from separate threads (e.g. tokio worker tasks in MultiprocExecutor).
+    pub fn from_device_ordinals(
+        cuda_ordinals: &[usize],
+        base_rank: usize,
+        global_world_size: usize,
+    ) -> KernelResult<Vec<Self>> {
+        let nccl_id = Self::generate_id()?;
+
+        // comm_init_rank is a collective — all ranks must call it concurrently.
+        // Spawn each rank on its own thread with a fresh CUDA device to ensure
+        // the correct CUDA context is active.
+        let handles: Vec<_> = cuda_ordinals
+            .iter()
+            .enumerate()
+            .map(|(local_rank, &ordinal)| {
+                let global_rank = base_rank + local_rank;
+                std::thread::spawn(move || {
+                    let device = Device::new_cuda(ordinal).map_err(|e| {
+                        KernelError::Other(format!("failed to create CUDA device {ordinal}: {e}"))
+                    })?;
+                    Self::new(global_rank, global_world_size, nccl_id, &device)
+                })
+            })
+            .collect();
+
+        let mut groups = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let group: KernelResult<Self> = handle
+                .join()
+                .map_err(|_| KernelError::Other("NCCL init thread panicked".to_string()))?;
+            groups.push(group?);
+        }
+        Ok(groups)
+    }
+
     /// Create communicators for all ranks on the current machine.
     ///
     /// This is the simplest init path: creates one communicator per CUDA device
     /// using `comm_init_all` (single-process, multi-GPU).
+    ///
+    /// **Note**: Communicators created this way may not work correctly when
+    /// used from different threads. Prefer `from_devices_per_rank` for
+    /// multi-threaded executors.
     pub fn from_devices(devices: &[Device]) -> KernelResult<Vec<Self>> {
         let streams: Vec<std::sync::Arc<cudarc::driver::CudaStream>> = devices
             .iter()
@@ -395,5 +459,50 @@ mod tests {
         assert!((v0[0] - 5.0).abs() < 0.1);
         assert!((v0[1] - 7.0).abs() < 0.1);
         assert!((v1[2] - 9.0).abs() < 0.1);
+    }
+
+    /// Test NCCL all-reduce from separate OS threads using `ncclCommInitRank`.
+    ///
+    /// This matches the real executor pattern: each rank's communicator is
+    /// created on its own thread (via `NcclProcessGroup::new` with a shared ID),
+    /// and all-reduce is called independently from each thread.
+    #[test]
+    #[ignore] // Requires multi-GPU hardware
+    fn test_nccl_all_reduce_multithreaded() {
+        let n_devices = cudarc::driver::CudaContext::device_count().unwrap() as usize;
+        if n_devices < 2 {
+            return;
+        }
+
+        // Generate a shared NCCL ID on the main thread.
+        let nccl_id = cudarc::nccl::Id::new().unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let b0 = barrier.clone();
+        let id0 = nccl_id;
+        let handle0 = std::thread::spawn(move || {
+            let dev = Device::cuda_if_available(0).unwrap();
+            let group = NcclProcessGroup::new(0, 2, id0, &dev).unwrap();
+            let t = Tensor::new(&[1.0f32, 2.0, 3.0], &dev).unwrap();
+            b0.wait();
+            group.all_reduce(&t).unwrap().to_vec1::<f32>().unwrap()
+        });
+
+        let b1 = barrier.clone();
+        let id1 = nccl_id;
+        let handle1 = std::thread::spawn(move || {
+            let dev = Device::new_cuda(1).unwrap();
+            let group = NcclProcessGroup::new(1, 2, id1, &dev).unwrap();
+            let t = Tensor::new(&[4.0f32, 5.0, 6.0], &dev).unwrap();
+            b1.wait();
+            group.all_reduce(&t).unwrap().to_vec1::<f32>().unwrap()
+        });
+
+        let v0 = handle0.join().unwrap();
+        let v1 = handle1.join().unwrap();
+
+        assert_eq!(v0, vec![5.0, 7.0, 9.0]);
+        assert_eq!(v1, vec![5.0, 7.0, 9.0]);
     }
 }

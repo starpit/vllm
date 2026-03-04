@@ -4,9 +4,9 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| ✅ | Implemented | 118 |
+| ✅ | Implemented | 119 |
 | ⚠️ | Partial | 1 |
-| ❌ | Not implemented | 145 |
+| ❌ | Not implemented | 144 |
 | ➕ | Rust-only | 13 |
 
 ---
@@ -18,7 +18,7 @@
 | Section | Rust ✅ | Rust ⚠️ | Rust ❌ | Rust-only |
 |---|---:|---:|---:|---:|
 | [Hardware Platforms](#hardware-platforms) | 3 | 0 | 6 | 1 |
-| [Multi-GPU & Distribution](#multi-gpu-and-distribution) | 0 | 1 | 8 | 0 |
+| [Multi-GPU & Distribution](#multi-gpu-and-distribution) | 1 | 1 | 7 | 0 |
 | [CLI Commands](#cli-commands) | 3 | 0 | 7 | 1 |
 | [OpenAI-Compatible API Endpoints](#openai-compatible-api-endpoints) | 7 | 0 | 6 | 0 |
 | [Other API Protocols](#other-api-protocols) | 0 | 0 | 7 | 3 |
@@ -43,7 +43,7 @@
 | [CUDA Compute Kernels](#cuda-compute-kernels) | 6 | 0 | 8 | 0 |
 | [Observability & Operations](#observability-and-operations) | 5 | 0 | 2 | 2 |
 | [Engine & Architecture](#engine-and-architecture) | 7 | 0 | 2 | 2 |
-| **Total** | **118** | **1** | **145** | **13** |
+| **Total** | **119** | **1** | **144** | **13** |
 
 ---
 
@@ -68,11 +68,11 @@
 
 | Feature | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| Tensor parallelism (TP) | ✅ | ⚠️ | Rust: scaffolding done (NCCL bindings / parallel layers / MultiprocExecutor); process group injection not yet wired |
+| Tensor parallelism (TP) | ✅ | ✅ | Rust: NCCL all-reduce wired via ThreadPoolExecutor; verified Qwen2.5-14B TP=2 on 2x L40S |
 | Pipeline parallelism (PP) | ✅ | ❌ |  |
 | Data parallelism (DP) | ✅ | ❌ |  |
 | Expert parallelism (EP) for MoE | ✅ | ❌ |  |
-| Multi-node distributed inference | ✅ | ❌ | Python: Ray or external launcher |
+| Multi-node distributed inference | ✅ | ⚠️ | Rust: TCP rendezvous + NCCL ID distribution; needs control channel for headless nodes |
 | NCCL custom all-reduce | ✅ | ❌ |  |
 | Prefill context parallelism | ✅ | ❌ |  |
 | Decode context parallelism | ✅ | ❌ |  |

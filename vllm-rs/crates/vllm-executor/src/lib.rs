@@ -21,5 +21,6 @@ pub mod error;
 pub mod input_batch;
 pub mod multiproc;
 pub mod parallel;
+pub mod threadpool;
 pub mod uniproc;
 pub mod worker;

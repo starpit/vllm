@@ -819,6 +819,19 @@ pub trait Model: Send {
         ))
     }
 
+    /// Inject a tensor-parallel process group into this model's parallel layers.
+    ///
+    /// Walks the model's `RowParallelLinear` layers and sets their process group
+    /// so that NCCL all-reduce is performed after each row-parallel matmul.
+    ///
+    /// Default implementation: no-op (model doesn't use tensor parallelism).
+    fn inject_tp_group(
+        &mut self,
+        _group: std::sync::Arc<dyn vllm_model::process_group::ProcessGroup>,
+    ) -> ModelResult<()> {
+        Ok(())
+    }
+
     /// Provide multimodal data (images) for the next forward pass.
     ///
     /// VLM models store this internally and consume it during `forward()`.

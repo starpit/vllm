@@ -761,6 +761,17 @@ impl crate::Model for Gemma3ForCausalLM {
         Ok(())
     }
 
+    fn inject_tp_group(
+        &mut self,
+        group: std::sync::Arc<dyn vllm_model::process_group::ProcessGroup>,
+    ) -> ModelResult<()> {
+        for layer in &mut self.model.layers {
+            layer.self_attn.o_proj.set_tp_group(group.clone());
+            layer.mlp.down_proj.set_tp_group(group.clone());
+        }
+        Ok(())
+    }
+
     fn forward(
         &self,
         input_ids: &Tensor,

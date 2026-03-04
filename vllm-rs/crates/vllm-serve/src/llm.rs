@@ -217,6 +217,30 @@ impl LLMBuilder {
         self
     }
 
+    /// Set the number of nodes for multi-node TP.
+    pub fn num_nodes(mut self, n: usize) -> Self {
+        self.config.num_nodes = n;
+        self
+    }
+
+    /// Set this node's rank (0 = master).
+    pub fn node_rank(mut self, rank: usize) -> Self {
+        self.config.node_rank = rank;
+        self
+    }
+
+    /// Set the master address for multi-node NCCL rendezvous.
+    pub fn master_addr(mut self, addr: &str) -> Self {
+        self.config.master_addr = addr.to_string();
+        self
+    }
+
+    /// Set the master port for multi-node NCCL rendezvous.
+    pub fn master_port(mut self, port: u16) -> Self {
+        self.config.master_port = port;
+        self
+    }
+
     /// Enable or disable prefix caching (KV cache reuse for shared prefixes).
     pub fn enable_prefix_caching(mut self, enabled: bool) -> Self {
         self.config.enable_prefix_caching = enabled;

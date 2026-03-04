@@ -157,6 +157,23 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 1)]
     pub tensor_parallel_size: usize,
 
+    /// Number of nodes for multi-node tensor parallelism (default: 1).
+    /// When > 1, GPUs are split across nodes using TCP rendezvous for NCCL.
+    #[arg(long, default_value_t = 1)]
+    pub num_nodes: usize,
+
+    /// This node's rank in the multi-node setup (0 = master, default: 0).
+    #[arg(long, default_value_t = 0)]
+    pub node_rank: usize,
+
+    /// Master node address for multi-node NCCL rendezvous (default: localhost).
+    #[arg(long, default_value = "localhost")]
+    pub master_addr: String,
+
+    /// Master port for multi-node NCCL rendezvous (default: 29500).
+    #[arg(long, default_value_t = 29500)]
+    pub master_port: u16,
+
     /// Disable async scheduling (overlap of GPU execution and CPU scheduling).
     /// By default, async scheduling is enabled for better throughput.
     #[arg(long)]

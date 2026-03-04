@@ -17,8 +17,8 @@ use vllm_config::{CudaGraphConfig, SchedulerConfig, SchedulerPolicy};
 use vllm_engine::core_client::InprocClient;
 use vllm_engine::engine_core::EngineCoreConfig;
 use vllm_executor::candle_worker::{CandleWorker, CandleWorkerConfig};
-use vllm_executor::multiproc::MultiprocExecutor;
 use vllm_executor::parallel::ResolvedParallelConfig;
+use vllm_executor::threadpool::ThreadPoolExecutor;
 use vllm_executor::uniproc::UniProcExecutor;
 use vllm_executor::worker::Worker;
 use vllm_model::weight::HfModelConfig;
@@ -69,6 +69,14 @@ pub struct VllmConfig {
     pub pooling_strategy: String,
     /// Number of GPUs for tensor parallelism (1 = single GPU, no TP).
     pub tensor_parallel_size: usize,
+    /// Number of nodes for multi-node TP (1 = single node).
+    pub num_nodes: usize,
+    /// This node's rank (0 = master).
+    pub node_rank: usize,
+    /// Master address for multi-node NCCL rendezvous.
+    pub master_addr: String,
+    /// Master port for multi-node NCCL rendezvous.
+    pub master_port: u16,
     /// Whether to disable async scheduling (overlap GPU/CPU work).
     /// Default false — async scheduling is enabled by default.
     pub disable_async_scheduling: bool,
@@ -101,6 +109,10 @@ impl Default for VllmConfig {
             lora_adapter: None,
             pooling_strategy: "auto".to_string(),
             tensor_parallel_size: 1,
+            num_nodes: 1,
+            node_rank: 0,
+            master_addr: "localhost".to_string(),
+            master_port: 29500,
             disable_async_scheduling: false,
             runner: "generate".to_string(),
             cuda_graph_config: None,
@@ -569,38 +581,165 @@ fn initialize_stack_tp(
 
     let is_pooling = config.runner == "pooling";
 
-    // Create N worker configs (one per TP rank).
-    let worker_configs: Vec<CandleWorkerConfig> = (0..tp_size)
-        .map(|rank| CandleWorkerConfig {
-            model_path: config.model.clone(),
-            device_str: format!("cuda:{rank}"),
-            dtype: config.dtype.clone(),
-            hf_token: config.hf_token.clone(),
-            cache_dir: None,
-            block_size: config.block_size,
-            gguf_file: config.gguf_file.clone(),
-            lora_adapter: config.lora_adapter.clone(),
-            pooling_strategy: config.pooling_strategy.clone(),
-            is_pooling,
-            tp_rank: rank,
-            tp_world_size: tp_size,
-            cuda_graph_config: config.cuda_graph_config.clone(),
+    // Multi-node: each node only creates workers for its local GPUs.
+    let num_nodes = config.num_nodes;
+    let node_rank = config.node_rank;
+    let local_tp = if num_nodes > 1 {
+        tp_size / num_nodes
+    } else {
+        tp_size
+    };
+
+    // Create worker configs (one per local GPU).
+    let worker_configs: Vec<CandleWorkerConfig> = (0..local_tp)
+        .map(|local_rank| {
+            let global_rank = node_rank * local_tp + local_rank;
+            CandleWorkerConfig {
+                model_path: config.model.clone(),
+                device_str: format!("cuda:{local_rank}"),
+                dtype: config.dtype.clone(),
+                hf_token: config.hf_token.clone(),
+                cache_dir: None,
+                block_size: config.block_size,
+                gguf_file: config.gguf_file.clone(),
+                lora_adapter: config.lora_adapter.clone(),
+                pooling_strategy: config.pooling_strategy.clone(),
+                is_pooling,
+                tp_rank: global_rank,
+                tp_world_size: tp_size,
+                cuda_graph_config: config.cuda_graph_config.clone(),
+            }
         })
         .collect();
 
-    // Init devices and load models on all ranks sequentially.
-    // Sequential init avoids CUDA context creation races across threads.
+    // Clean up stale NCCL shared memory segments from previous runs.
+    #[cfg(all(feature = "nccl", target_os = "linux"))]
+    {
+        let shm_path = std::path::Path::new("/dev/shm");
+        if shm_path.exists()
+            && let Ok(entries) = std::fs::read_dir(shm_path)
+        {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str()
+                    && name.starts_with("nccl-")
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "nccl"))]
+    if tp_size > 1 {
+        anyhow::bail!(
+            "tensor parallelism requires the `nccl` feature; \
+             rebuild with --features nccl"
+        );
+    }
+
+    // Initialize all workers on dedicated per-GPU threads.
+    //
+    // Each thread: creates CUDA device → loads model → creates NCCL comm →
+    // injects process group into model layers. This ensures NCCL comms are
+    // created with the correct CUDA context (NCCL ties comms to the thread
+    // that created them for collective synchronization).
+    //
+    // After init, workers are moved back to the main thread and wrapped
+    // in the MultiprocExecutor.
     info!(
-        "Initializing {} CUDA devices and loading model shards...",
-        tp_size
+        "Initializing {} workers on dedicated GPU threads...",
+        local_tp
     );
-    let mut workers: Vec<CandleWorker> = Vec::with_capacity(tp_size);
-    for cfg in worker_configs {
-        let mut worker = CandleWorker::new(cfg);
-        worker.init_device().context("init_device failed")?;
-        worker.load_model().context("load_model failed")?;
+
+    // Use a barrier so rank 0 downloads/loads first (caching model files),
+    // then other ranks proceed (finding cached files, no lock contention).
+    let download_barrier = std::sync::Arc::new(std::sync::Barrier::new(local_tp));
+
+    #[cfg(feature = "nccl")]
+    let nccl_id = {
+        use vllm_kernels::nccl::NcclProcessGroup;
+
+        let num_nodes = config.num_nodes;
+        if num_nodes <= 1 {
+            NcclProcessGroup::generate_id().context("failed to generate NCCL ID")?
+        } else {
+            use vllm_kernels::rendezvous;
+            info!(
+                "Multi-node TP: node_rank={}, num_nodes={}, global_world_size={}, local_tp={}",
+                node_rank, num_nodes, tp_size, local_tp
+            );
+            if node_rank == 0 {
+                rendezvous::rendezvous_master(config.master_port, num_nodes)
+                    .context("NCCL rendezvous master failed")?
+            } else {
+                rendezvous::rendezvous_worker(&config.master_addr, config.master_port)
+                    .context("NCCL rendezvous worker failed")?
+            }
+        }
+    };
+
+    // Spawn one thread per GPU rank. Each thread does device init + model load
+    // + NCCL comm creation + injection, then sends the worker back.
+    let mut rank_counter = 0usize;
+    let handles: Vec<_> = worker_configs
+        .into_iter()
+        .map(|cfg| {
+            let local_idx = rank_counter;
+            rank_counter += 1;
+            // Capture NCCL init params for this rank's thread.
+            #[cfg(feature = "nccl")]
+            let (nccl_id, global_rank, global_ws) =
+                (nccl_id, node_rank * local_tp + local_idx, tp_size);
+            let barrier = download_barrier.clone();
+
+            std::thread::spawn(move || -> Result<CandleWorker> {
+                let mut worker = CandleWorker::new(cfg);
+                worker.init_device().context("init_device failed")?;
+
+                // Rank 0 loads first (downloads model files to cache).
+                // Other ranks wait at the barrier, then load from cache.
+                if local_idx == 0 {
+                    worker.load_model().context("load_model failed")?;
+                    barrier.wait();
+                } else {
+                    barrier.wait();
+                    worker.load_model().context("load_model failed")?;
+                }
+
+                // Create NCCL comm on this thread (correct CUDA context).
+                #[cfg(feature = "nccl")]
+                {
+                    use vllm_kernels::nccl::NcclProcessGroup;
+
+                    let device = worker
+                        .device()
+                        .ok_or_else(|| anyhow::anyhow!("no device after init"))?
+                        .clone();
+                    let group = NcclProcessGroup::new(global_rank, global_ws, nccl_id, &device)
+                        .context("NCCL comm_init_rank failed")?;
+                    let group: std::sync::Arc<dyn vllm_model::process_group::ProcessGroup> =
+                        std::sync::Arc::new(group);
+                    worker
+                        .inject_tp_group(group)
+                        .context("inject_tp_group failed")?;
+                }
+
+                Ok(worker)
+            })
+        })
+        .collect();
+
+    let mut workers: Vec<CandleWorker> = Vec::with_capacity(local_tp);
+    for (rank, handle) in handles.into_iter().enumerate() {
+        let worker = handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("worker thread {rank} panicked"))?
+            .with_context(|| format!("worker {rank} init failed"))?;
         workers.push(worker);
     }
+
+    #[cfg(feature = "nccl")]
+    info!("NCCL communicators initialized and injected into model layers");
 
     // Extract metadata from rank 0 worker.
     let hf_config = workers[0]
@@ -633,16 +772,15 @@ fn initialize_stack_tp(
         model_name, max_model_len, num_layers, tp_size
     );
 
-    // Wrap all workers in MultiprocExecutor. This spawns each worker as a
-    // tokio task, ensuring CUDA operations happen on the correct device context.
+    // Wrap all workers in ThreadPoolExecutor. Each worker gets a dedicated
+    // OS thread, ensuring NCCL collectives can execute concurrently.
     let all_workers: Vec<Box<dyn Worker>> = workers
         .into_iter()
         .map(|w| Box::new(w) as Box<dyn Worker>)
         .collect();
 
     let parallel_config = ResolvedParallelConfig::tensor_parallel(tp_size, 0);
-    let runtime = tokio::runtime::Handle::current();
-    let mut executor = MultiprocExecutor::new(all_workers, parallel_config, runtime);
+    let mut executor = ThreadPoolExecutor::new(all_workers, parallel_config);
 
     // Determine available memory via executor (dispatches to worker tasks,
     // which run on the correct CUDA context).

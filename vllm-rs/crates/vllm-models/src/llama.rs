@@ -177,7 +177,7 @@ impl LlamaConfig {
 /// Port of: `vllm/model_executor/models/llama.py::LlamaMLP`
 pub struct LlamaMLP {
     gate_up_proj: Linear,
-    down_proj: RowParallelLinear,
+    pub(crate) down_proj: RowParallelLinear,
     /// Post-shard intermediate size (for splitting the fused output).
     intermediate_size: usize,
 }
@@ -920,6 +920,17 @@ impl crate::Model for LlamaForCausalLM {
 
             let mlp_prefix = format!("model.layers.{}.mlp", i);
             layer.mlp.inject_lora(&mlp_prefix, adapter)?;
+        }
+        Ok(())
+    }
+
+    fn inject_tp_group(
+        &mut self,
+        group: std::sync::Arc<dyn vllm_model::process_group::ProcessGroup>,
+    ) -> ModelResult<()> {
+        for layer in &mut self.model.layers {
+            layer.self_attn.o_proj.set_tp_group(group.clone());
+            layer.mlp.down_proj.set_tp_group(group.clone());
         }
         Ok(())
     }

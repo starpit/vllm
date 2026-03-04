@@ -358,6 +358,25 @@ impl CandleWorker {
         self.resolved_dtype
     }
 
+    /// Get the device this worker is using.
+    pub fn device(&self) -> Option<&Device> {
+        self.device.as_ref()
+    }
+
+    /// Inject a tensor-parallel process group into the loaded model's
+    /// `RowParallelLinear` layers so that NCCL all-reduce is performed.
+    pub fn inject_tp_group(
+        &mut self,
+        group: std::sync::Arc<dyn vllm_model::process_group::ProcessGroup>,
+    ) -> Result<(), crate::error::ExecutorError> {
+        if let Some(ref mut model) = self.model {
+            model.inject_tp_group(group).map_err(|e| {
+                crate::error::ExecutorError::WorkerInit(format!("failed to inject TP group: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Resolve the pooling strategy from config or auto-detect.
     fn resolve_pooling_strategy(&mut self) {
         use vllm_models::embedding::{PoolingStrategy, detect_pooling_strategy};

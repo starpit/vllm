@@ -976,12 +976,19 @@ impl CandleWorker {
         &mut self,
         req_inputs: &[crate::input_batch::ReqSlice],
         per_req_logits: &[Tensor],
+        flat_logits: Option<&Tensor>,
         token_map: &mut HashMap<String, Vec<u32>>,
         cpu_fallback_indices: &mut Vec<usize>,
     ) -> ExecutorResult<bool> {
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = (req_inputs, per_req_logits, token_map, cpu_fallback_indices);
+            let _ = (
+                req_inputs,
+                per_req_logits,
+                flat_logits,
+                token_map,
+                cpu_fallback_indices,
+            );
             Ok(false)
         }
 
@@ -1034,7 +1041,6 @@ impl CandleWorker {
             use rand::Rng;
 
             let batch_size = gpu_batch_indices.len();
-            let mut logit_rows: Vec<Tensor> = Vec::with_capacity(batch_size);
             let mut temperatures: Vec<f32> = Vec::with_capacity(batch_size);
             let mut top_ks: Vec<i32> = Vec::with_capacity(batch_size);
             let mut top_ps: Vec<f32> = Vec::with_capacity(batch_size);
@@ -1042,14 +1048,36 @@ impl CandleWorker {
             let mut uniforms: Vec<f32> = Vec::with_capacity(batch_size);
 
             let mut rng = rand::thread_rng();
+
+            // Check if we can reuse the flat logits tensor directly:
+            // all requests are GPU-batchable, in order, and each has token_count==1
+            // (pure decode batch — flat logits is already [batch_size, vocab]).
+            let can_use_flat = flat_logits.is_some()
+                && cpu_fallback_indices.is_empty()
+                && gpu_batch_indices.len() == req_inputs.len()
+                && gpu_batch_indices
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &idx)| idx == i)
+                && req_inputs.iter().all(|r| r.token_count == 1);
+
+            let mut logit_rows: Vec<Tensor> = if can_use_flat {
+                Vec::new() // unused — we'll use flat_logits directly
+            } else {
+                Vec::with_capacity(batch_size)
+            };
+
             for &idx in &gpu_batch_indices {
                 let req_slice = &req_inputs[idx];
-                let logits = &per_req_logits[idx];
-                let last_pos = req_slice.token_count - 1;
-                let last_row = logits
-                    .narrow(0, last_pos, 1)
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("narrow error: {e}")))?;
-                logit_rows.push(last_row);
+
+                if !can_use_flat {
+                    let logits = &per_req_logits[idx];
+                    let last_pos = req_slice.token_count - 1;
+                    let last_row = logits.narrow(0, last_pos, 1).map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("narrow error: {e}"))
+                    })?;
+                    logit_rows.push(last_row);
+                }
 
                 if let Some(params) = self.sampling_params_map.get(&req_slice.req_id) {
                     let temp = params.temperature as f32;
@@ -1072,8 +1100,13 @@ impl CandleWorker {
                 uniforms.push(rng.r#gen::<f32>());
             }
 
-            let batched_logits = Tensor::cat(&logit_rows, 0)
-                .map_err(|e| ExecutorError::WorkerExecution(format!("cat logits error: {e}")))?;
+            let batched_logits = if can_use_flat {
+                // Zero-copy: flat logits from forward_batch is already [batch, vocab].
+                flat_logits.unwrap().clone()
+            } else {
+                Tensor::cat(&logit_rows, 0)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("cat logits error: {e}")))?
+            };
 
             // Use pre-allocated buffers when available, fall back to allocating path.
             let batch_tokens: Vec<u32> = if let Some(ref mut bufs) = self.sampling_buffers
@@ -1950,6 +1983,7 @@ impl Worker for CandleWorker {
             let batched_gpu_done = self.try_batched_gpu_sample(
                 &prepared.req_inputs,
                 &per_req_logits,
+                Some(&all_logits_flat),
                 &mut token_map,
                 &mut cpu_fallback_indices,
             )?;

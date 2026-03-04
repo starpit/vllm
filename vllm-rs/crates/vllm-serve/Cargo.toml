@@ -44,6 +44,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 uuid = { version = "1", features = ["v4"] }
 http = "1"
 tokenizers = { workspace = true }
+rayon = { workspace = true }
 minijinja = { workspace = true, optional = true }
 minijinja-contrib = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }

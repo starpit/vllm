@@ -58,6 +58,9 @@ anyhow = "1"
 libc = "0.2"
 core-foundation = "0.10"
 
+# Parallelism
+rayon = "1"
+
 # Collections / utilities
 indexmap = { version = "2", features = ["serde"] }
 hashbrown = "0.15"

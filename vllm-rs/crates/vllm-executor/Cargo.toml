@@ -9,6 +9,7 @@ description = "Worker/process management and distributed coordination for vLLM R
 default = []
 cuda = ["vllm-models/cuda", "vllm-kernels/cuda", "candle-core/cuda", "cudarc"]
 metal = ["candle-core/metal"]
+profiling = ["cuda", "vllm-kernels/profiling"]
 guided-decoding = ["outlines-core", "vllm-models/guided-decoding"]
 
 [dependencies]

@@ -10,6 +10,7 @@ default = ["bench", "guided-decoding", "chat-template", "metrics", "multimodal",
 bench = ["vllm-bench"]
 cuda = ["vllm-serve/cuda", "vllm-executor/cuda", "vllm-kernels/cuda", "vllm-models/cuda", "vllm-bench?/cuda"]
 nccl = ["cuda", "vllm-serve/nccl", "vllm-kernels/nccl"]
+profiling = ["cuda", "vllm-serve/profiling", "vllm-executor/profiling", "vllm-models/profiling", "vllm-kernels/profiling", "vllm-bench?/profiling"]
 metal = ["vllm-serve/metal", "vllm-mlx", "vllm-bench?/metal"]
 candle-metal = ["vllm-executor/metal", "vllm-kernels/metal", "vllm-models/metal"]
 guided-decoding = ["vllm-serve/guided-decoding"]

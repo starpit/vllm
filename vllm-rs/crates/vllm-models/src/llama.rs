@@ -460,14 +460,35 @@ impl LlamaAttention {
         let total_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
 
         // Fused QKV projection on ALL tokens at once (single matmul).
-        let qkv = self
-            .qkv_proj
-            .forward(hidden_states)
-            .map_err(ModelError::Candle)?;
-        let (q, k, v) = self.split_qkv(&qkv, total_tokens)?;
+        let (q, k, v) = {
+            let _p = vllm_kernels::profiling::range("qkv_proj");
+            let qkv = self
+                .qkv_proj
+                .forward(hidden_states)
+                .map_err(ModelError::Candle)?;
+            self.split_qkv(&qkv, total_tokens)?
+        };
 
         // Batched RoPE on all tokens.
-        let (q, k) = self.rotary_emb.apply(&q, &k, positions)?;
+        // On CUDA: fused kernel (1 launch per tensor vs 5-7 from candle decomposition).
+        let (q, k) = {
+            let _p = vllm_kernels::profiling::range("rope");
+            #[cfg(feature = "cuda")]
+            if q.device().is_cuda() {
+                crate::ops::rotary_embedding(
+                    &q,
+                    &k,
+                    positions,
+                    self.rotary_emb.cos_sin_cache(),
+                    self.rotary_emb.head_dim(),
+                )
+                .map_err(ModelError::Candle)?
+            } else {
+                self.rotary_emb.apply(&q, &k, positions)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            self.rotary_emb.apply(&q, &k, positions)?
+        };
 
         // Batched FA2 on CUDA F16/BF16: single flash_attn_varlen call across all requests.
         // Falls back to per-request attention_with_cache loop on CPU/F32.
@@ -477,42 +498,45 @@ impl LlamaAttention {
         #[cfg(not(feature = "cuda"))]
         let use_batched_flash = false;
 
-        let attn_output = if use_batched_flash {
-            #[cfg(feature = "cuda")]
-            {
-                let config = crate::attention::BatchedAttnConfig {
-                    scale: self.scale,
-                    layer_idx: self.layer_idx,
-                    sliding_window: self.sliding_window,
-                };
-                crate::attention::batched_flash_attention_with_cache(
-                    &q, &k, &v, &config, attn_meta, storage,
-                )?
+        let attn_output = {
+            let _p = vllm_kernels::profiling::range("flash_attn");
+            if use_batched_flash {
+                #[cfg(feature = "cuda")]
+                {
+                    let config = crate::attention::BatchedAttnConfig {
+                        scale: self.scale,
+                        layer_idx: self.layer_idx,
+                        sliding_window: self.sliding_window,
+                    };
+                    crate::attention::batched_flash_attention_with_cache(
+                        &q, &k, &v, &config, attn_meta, storage,
+                    )?
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    unreachable!()
+                }
+            } else {
+                // Per-request attention loop (CPU / F32 path).
+                let mut output_parts = Vec::with_capacity(attn_meta.num_reqs);
+                for req_idx in 0..attn_meta.num_reqs {
+                    let (start, q_len) = attn_meta.request_slice(req_idx);
+                    let q_req = q.narrow(0, start, q_len).map_err(ModelError::Candle)?;
+                    let k_req = k.narrow(0, start, q_len).map_err(ModelError::Candle)?;
+                    let v_req = v.narrow(0, start, q_len).map_err(ModelError::Candle)?;
+                    let handle = storage.request_layer_handle(req_idx, self.layer_idx);
+                    let out = attention_with_cache(
+                        &q_req,
+                        &k_req,
+                        &v_req,
+                        self.scale,
+                        Some(handle),
+                        self.sliding_window,
+                    )?;
+                    output_parts.push(out);
+                }
+                Tensor::cat(&output_parts, 0).map_err(ModelError::Candle)?
             }
-            #[cfg(not(feature = "cuda"))]
-            {
-                unreachable!()
-            }
-        } else {
-            // Per-request attention loop (CPU / F32 path).
-            let mut output_parts = Vec::with_capacity(attn_meta.num_reqs);
-            for req_idx in 0..attn_meta.num_reqs {
-                let (start, q_len) = attn_meta.request_slice(req_idx);
-                let q_req = q.narrow(0, start, q_len).map_err(ModelError::Candle)?;
-                let k_req = k.narrow(0, start, q_len).map_err(ModelError::Candle)?;
-                let v_req = v.narrow(0, start, q_len).map_err(ModelError::Candle)?;
-                let handle = storage.request_layer_handle(req_idx, self.layer_idx);
-                let out = attention_with_cache(
-                    &q_req,
-                    &k_req,
-                    &v_req,
-                    self.scale,
-                    Some(handle),
-                    self.sliding_window,
-                )?;
-                output_parts.push(out);
-            }
-            Tensor::cat(&output_parts, 0).map_err(ModelError::Candle)?
         };
 
         // Reshape back to [total_tokens, num_q_heads * head_dim].
@@ -521,6 +545,7 @@ impl LlamaAttention {
             .map_err(ModelError::Candle)?;
 
         // Batched output projection.
+        let _p = vllm_kernels::profiling::range("o_proj");
         self.o_proj
             .forward(&attn_output)
             .map_err(ModelError::Candle)
@@ -660,23 +685,34 @@ impl LlamaDecoderLayer {
         storage: &mut crate::BatchedKvCacheStorage<'_>,
     ) -> ModelResult<Tensor> {
         // Batched pre-attention layernorm.
-        let normed = crate::ops::rms_norm(hidden_states, &self.input_layernorm)
-            .map_err(ModelError::Candle)?;
+        let normed = {
+            let _p = vllm_kernels::profiling::range("pre_norm");
+            crate::ops::rms_norm(hidden_states, &self.input_layernorm)
+                .map_err(ModelError::Candle)?
+        };
         // Batched Q/K/V + RoPE, per-request attention, batched o_proj.
-        let attn_output = self
-            .self_attn
-            .forward_batch(&normed, positions, attn_meta, storage)?;
+        let attn_output = {
+            let _p = vllm_kernels::profiling::range("attn");
+            self.self_attn
+                .forward_batch(&normed, positions, attn_meta, storage)?
+        };
 
         // Fused residual add + post-attention layernorm.
-        let (normed, hidden_states) = crate::ops::fused_add_rms_norm(
-            &attn_output,
-            hidden_states,
-            &self.post_attention_layernorm,
-        )
-        .map_err(ModelError::Candle)?;
+        let (normed, hidden_states) = {
+            let _p = vllm_kernels::profiling::range("post_norm");
+            crate::ops::fused_add_rms_norm(
+                &attn_output,
+                hidden_states,
+                &self.post_attention_layernorm,
+            )
+            .map_err(ModelError::Candle)?
+        };
 
         // Batched MLP + residual.
-        let mlp_output = self.mlp.forward(&normed).map_err(ModelError::Candle)?;
+        let mlp_output = {
+            let _p = vllm_kernels::profiling::range("mlp");
+            self.mlp.forward(&normed).map_err(ModelError::Candle)?
+        };
         let hidden_states = (hidden_states + mlp_output).map_err(ModelError::Candle)?;
 
         Ok(hidden_states)
@@ -796,18 +832,22 @@ impl LlamaModel {
         kv_storage: &mut crate::BatchedKvCacheStorage<'_>,
     ) -> ModelResult<Tensor> {
         // Batched embedding.
-        let mut hidden_states = self
-            .embed_tokens
-            .forward(input_ids)
-            .map_err(ModelError::Candle)?;
+        let mut hidden_states = {
+            let _p = vllm_kernels::profiling::range("embed");
+            self.embed_tokens
+                .forward(input_ids)
+                .map_err(ModelError::Candle)?
+        };
 
         // Batched layer forward.
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
+            let _p = vllm_kernels::profiling::range_fmt(format_args!("layer_{i}"));
             hidden_states =
                 layer.forward_batch(&hidden_states, positions, attn_meta, kv_storage)?;
         }
 
         // Batched final norm.
+        let _p = vllm_kernels::profiling::range("final_norm");
         crate::ops::rms_norm(&hidden_states, &self.norm).map_err(ModelError::Candle)
     }
 
@@ -927,7 +967,10 @@ impl crate::Model for LlamaForCausalLM {
         let hidden_states = self
             .model
             .forward_batch(input_ids, positions, attn_meta, kv_storage)?;
-        let logits = self.compute_logits(&hidden_states)?;
+        let logits = {
+            let _p = vllm_kernels::profiling::range("lm_head");
+            self.compute_logits(&hidden_states)?
+        };
         logits.to_dtype(DType::F32).map_err(ModelError::Candle)
     }
 }

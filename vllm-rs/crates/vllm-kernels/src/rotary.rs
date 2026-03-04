@@ -280,6 +280,196 @@ impl RotaryKernels for CudaRotaryKernels {
 }
 
 // ---------------------------------------------------------------------------
+// Fused RoPE via candle CustomOp2 (bypasses cudarc event overhead)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+mod fused_rope {
+    use candle_core::backend::BackendStorage;
+    use candle_core::cuda_backend::CudaDType;
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+    use candle_core::{CpuStorage, CudaStorage, CustomOp2, DType, Layout, Result, Shape, Tensor};
+
+    /// Fused RoPE CustomOp — rotates a single tensor (Q or K) in-place on the
+    /// GPU using the fused CUDA kernel, bypassing the decomposed candle ops that
+    /// would otherwise launch 5-7 separate kernels per tensor.
+    ///
+    /// Inputs to `apply_op2`: `(x, positions)`
+    /// Stored: `cos_sin_cache` tensor (persistent, precomputed).
+    struct FusedRotaryOp {
+        /// Combined cos|sin cache: `[max_pos, rotary_dim]`.
+        /// Layout per row: `[cos_0..cos_{half-1}, sin_0..sin_{half-1}]`.
+        cos_sin_cache: Tensor,
+        /// Dimension per head.
+        head_size: usize,
+    }
+
+    impl FusedRotaryOp {
+        fn cuda_fwd_t<T: CudaDType + cudarc::driver::DeviceRepr>(
+            &self,
+            x: &CudaStorage,
+            x_l: &Layout,
+            pos: &CudaStorage,
+            pos_l: &Layout,
+            dtype: DType,
+        ) -> Result<(CudaStorage, Shape)> {
+            let dev = x.device();
+            let stream = dev.cuda_stream();
+            let out_shape = x_l.shape().clone();
+            let elem_count = out_shape.elem_count();
+
+            // Validate inputs.
+            let num_tokens = pos_l.shape().dims1()?;
+            let total_dim: usize = x_l.shape().elem_count() / num_tokens;
+
+            let rotary_dim = self
+                .cos_sin_cache
+                .dim(1)
+                .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+            // Get all raw pointers in a single block to minimize event overhead.
+            // Each device_ptr() call records events in cudarc; fewer calls = less overhead.
+            let x_slice = x.as_cuda_slice::<T>()?;
+            let x_view = x_slice.slice(x_l.start_offset()..);
+            let pos_slice = pos.as_cuda_slice::<u32>()?;
+            let pos_view = pos_slice.slice(pos_l.start_offset()..);
+            let (cache_storage, cache_layout) = self.cos_sin_cache.storage_and_layout();
+            let cache_cuda = match &*cache_storage {
+                candle_core::Storage::Cuda(c) => c,
+                _ => candle_core::bail!("cos_sin_cache must be a CUDA tensor"),
+            };
+            let cache_slice = cache_cuda.as_cuda_slice::<T>()?;
+            let cache_view = cache_slice.slice(cache_layout.start_offset()..);
+
+            // Allocate output, copy input, and launch kernel — 3 device_ptr calls total.
+            let dst = unsafe { dev.alloc::<T>(elem_count)? };
+            unsafe {
+                let (src_ptr, _g1) = x_view.device_ptr(&stream);
+                let (dst_ptr, _g2) = dst.device_ptr(&stream);
+                let (pos_ptr, _g3) = pos_view.device_ptr(&stream);
+                let (cache_ptr, _g4) = cache_view.device_ptr(&stream);
+
+                // Device-to-device copy: input → output buffer.
+                cudarc::driver::result::memcpy_dtod_async(
+                    dst_ptr,
+                    src_ptr,
+                    elem_count * std::mem::size_of::<T>(),
+                    stream.cu_stream(),
+                )
+                .map_err(|e| candle_core::Error::Msg(format!("dtod copy: {e}")))?;
+
+                // Launch fused RoPE kernel (modifies dst in-place).
+                // Pass as "query" with total_k_dim=0 to process only this tensor.
+                match dtype {
+                    DType::F32 => {
+                        super::cuda_ffi::rotary_embedding_f32(
+                            pos_ptr as *const u32,
+                            dst_ptr as *mut f32,
+                            std::ptr::null_mut(),
+                            cache_ptr as *const f32,
+                            rotary_dim as i32,
+                            total_dim as i32,
+                            0,
+                            self.head_size as i32,
+                            num_tokens as i32,
+                        );
+                    }
+                    DType::F16 => {
+                        super::cuda_ffi::rotary_embedding_f16(
+                            pos_ptr as *const u32,
+                            dst_ptr as *mut u16,
+                            std::ptr::null_mut(),
+                            cache_ptr as *const u16,
+                            rotary_dim as i32,
+                            total_dim as i32,
+                            0,
+                            self.head_size as i32,
+                            num_tokens as i32,
+                        );
+                    }
+                    DType::BF16 => {
+                        super::cuda_ffi::rotary_embedding_bf16(
+                            pos_ptr as *const u32,
+                            dst_ptr as *mut u16,
+                            std::ptr::null_mut(),
+                            cache_ptr as *const u16,
+                            rotary_dim as i32,
+                            total_dim as i32,
+                            0,
+                            self.head_size as i32,
+                            num_tokens as i32,
+                        );
+                    }
+                    dt => candle_core::bail!("fused RoPE unsupported dtype {dt:?}"),
+                }
+            }
+
+            let dst_storage = CudaStorage::wrap_cuda_slice(dst, dev.clone());
+            Ok((dst_storage, out_shape))
+        }
+    }
+
+    impl CustomOp2 for FusedRotaryOp {
+        fn name(&self) -> &'static str {
+            "fused-rotary-embedding"
+        }
+
+        fn cpu_fwd(
+            &self,
+            _: &CpuStorage,
+            _: &Layout,
+            _: &CpuStorage,
+            _: &Layout,
+        ) -> Result<(CpuStorage, Shape)> {
+            candle_core::bail!("fused RoPE is CUDA-only; use candle ops on CPU")
+        }
+
+        fn cuda_fwd(
+            &self,
+            x: &CudaStorage,
+            x_l: &Layout,
+            pos: &CudaStorage,
+            pos_l: &Layout,
+        ) -> Result<(CudaStorage, Shape)> {
+            let dt = x.dtype();
+            match dt {
+                DType::F32 => self.cuda_fwd_t::<f32>(x, x_l, pos, pos_l, dt),
+                DType::F16 => self.cuda_fwd_t::<half::f16>(x, x_l, pos, pos_l, dt),
+                DType::BF16 => self.cuda_fwd_t::<half::bf16>(x, x_l, pos, pos_l, dt),
+                dt => candle_core::bail!("fused RoPE unsupported dtype {dt:?}"),
+            }
+        }
+    }
+
+    /// Apply fused rotary embedding on CUDA via CustomOp2.
+    ///
+    /// * `x` — tensor to rotate: `[num_tokens, num_heads, head_dim]` or `[num_tokens, total_dim]`
+    /// * `positions` — `[num_tokens]` u32
+    /// * `cos_sin_cache` — `[max_pos, rotary_dim]` combined cache
+    /// * `head_size` — dimension per head
+    ///
+    /// Returns rotated tensor (same shape as input).
+    pub fn fused_rotary_apply(
+        x: &Tensor,
+        positions: &Tensor,
+        cos_sin_cache: &Tensor,
+        head_size: usize,
+    ) -> candle_core::Result<Tensor> {
+        // The kernel expects contiguous [num_tokens, total_dim] layout.
+        let x = x.contiguous()?;
+        let positions = positions.contiguous()?;
+        let op = FusedRotaryOp {
+            cos_sin_cache: cos_sin_cache.clone(),
+            head_size,
+        };
+        x.apply_op2(&positions, op)
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub use fused_rope::fused_rotary_apply;
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -505,5 +695,122 @@ mod tests {
     #[test]
     fn test_cuda_rotary_many_tokens() {
         assert_rotary_cuda_matches_cpu(32, 128, 64, DType::F32, 1e-4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fused RoPE CustomOp tests — compare against CPU reference
+    // -----------------------------------------------------------------------
+
+    /// Helper: run fused_rotary_apply on CUDA and compare against CPU per-head rotation.
+    ///
+    /// The CUDA kernel rotates each head independently, so the CPU reference must
+    /// also do per-head rotation (not flat rotation like CpuRotaryKernels).
+    #[cfg(feature = "cuda")]
+    fn assert_fused_rotary_matches_cpu(
+        num_tokens: usize,
+        num_heads: usize,
+        head_dim: usize,
+        dtype: DType,
+        tol: f64,
+    ) {
+        let half_dim = head_dim / 2;
+        let max_pos = 128;
+
+        // Build cos_sin_cache in the combined layout [max_pos, head_dim]
+        // with [cos_half | sin_half].
+        let cache = make_cos_sin_cache(max_pos, half_dim)
+            .to_dtype(dtype)
+            .unwrap();
+
+        let positions_cpu = Tensor::new(
+            (0..num_tokens as u32).collect::<Vec<_>>().as_slice(),
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        // Input tensors: [num_tokens, num_heads, head_dim]
+        let x_cpu = Tensor::randn(0f32, 1.0, &[num_tokens, num_heads, head_dim], &Device::Cpu)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+
+        // CPU per-head reference: rotate each head independently.
+        let mut ref_heads = Vec::with_capacity(num_heads);
+        for h in 0..num_heads {
+            let head_slice = x_cpu.narrow(1, h, 1).unwrap().squeeze(1).unwrap(); // [num_tokens, head_dim]
+            let (rotated, _) = CpuRotaryKernels
+                .rotary_embedding(&positions_cpu, &head_slice, &head_slice, &cache, true)
+                .unwrap();
+            ref_heads.push(rotated.unsqueeze(1).unwrap());
+        }
+        let ref_slices: Vec<&Tensor> = ref_heads.iter().collect();
+        let ref_result = Tensor::cat(&ref_slices, 1).unwrap();
+
+        // Fused CUDA path.
+        let dev = cuda_device();
+        let x_gpu = x_cpu.to_device(&dev).unwrap();
+        let positions_gpu = positions_cpu.to_device(&dev).unwrap();
+        let cache_gpu = cache.to_device(&dev).unwrap();
+
+        let fused_result = super::fused_rotary_apply(&x_gpu, &positions_gpu, &cache_gpu, head_dim)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap();
+
+        // Compare.
+        let ref_vals = ref_result
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let fused_vals = fused_result
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_close("fused_rotary", &ref_vals, &fused_vals, tol);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_fused_rotary_f32() {
+        assert_fused_rotary_matches_cpu(4, 8, 64, DType::F32, 1e-4);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_fused_rotary_bf16() {
+        assert_fused_rotary_matches_cpu(4, 8, 64, DType::BF16, 5e-2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_fused_rotary_f16() {
+        assert_fused_rotary_matches_cpu(4, 8, 64, DType::F16, 5e-2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_fused_rotary_many_tokens() {
+        // Simulates prefill with larger batch.
+        assert_fused_rotary_matches_cpu(32, 24, 128, DType::BF16, 5e-2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_fused_rotary_gqa() {
+        // GQA: fewer KV heads (2) vs Q heads (8).
+        assert_fused_rotary_matches_cpu(4, 2, 64, DType::BF16, 5e-2);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_fused_rotary_single_token() {
+        // Decode step: single token.
+        assert_fused_rotary_matches_cpu(1, 24, 128, DType::BF16, 5e-2);
     }
 }

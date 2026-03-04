@@ -18,6 +18,7 @@ pub mod moe;
 #[cfg(feature = "nccl")]
 pub mod nccl;
 pub mod norm;
+pub mod profiling;
 pub mod rotary;
 pub mod sampling;
 

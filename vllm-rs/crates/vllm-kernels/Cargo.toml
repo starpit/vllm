@@ -12,6 +12,8 @@ default = []
 cuda = ["candle-core/cuda", "cudarc", "cc"]
 # Enable NCCL multi-GPU collective communication (requires libnccl).
 nccl = ["cuda", "cudarc/nccl"]
+# Enable NVTX profiling annotations for nsys/Nsight traces.
+profiling = ["cuda", "cudarc/nvtx"]
 # Enable Metal GPU compute on Apple Silicon.
 metal = ["candle-core/metal"]
 

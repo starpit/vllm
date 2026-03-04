@@ -29,6 +29,9 @@ pub struct RotaryEmbedding {
     cos_cache: Tensor,
     /// Precomputed sine values: [max_position, head_dim]
     sin_cache: Tensor,
+    /// Combined cos|sin cache for CUDA fused kernel: [max_position, head_dim]
+    /// Layout per row: [cos(f0)..cos(f_{half-1}), sin(f0)..sin(f_{half-1})]
+    cos_sin_cache: Tensor,
     /// Head dimension.
     head_dim: usize,
     /// Maximum cached position.
@@ -99,9 +102,25 @@ impl RotaryEmbedding {
             .to_dtype(dtype)
             .map_err(ModelError::Candle)?;
 
+        // Build combined cos|sin cache for CUDA fused kernel:
+        // [max_pos, head_dim] where first half cols = cos, second half = sin.
+        let cos_sin_cache = Tensor::cat(
+            &[
+                &cos_cache
+                    .narrow(1, 0, half_dim)
+                    .map_err(ModelError::Candle)?,
+                &sin_cache
+                    .narrow(1, 0, half_dim)
+                    .map_err(ModelError::Candle)?,
+            ],
+            1,
+        )
+        .map_err(ModelError::Candle)?;
+
         Ok(Self {
             cos_cache,
             sin_cache,
+            cos_sin_cache,
             head_dim,
             max_position,
         })
@@ -147,9 +166,16 @@ impl RotaryEmbedding {
         self.max_position
     }
 
-    /// Access the cos cache.
+    /// Access the cos cache: `[max_position, head_dim]`.
     pub fn cos_cache(&self) -> &Tensor {
         &self.cos_cache
+    }
+
+    /// Combined cos|sin cache for CUDA fused kernel: `[max_position, head_dim]`.
+    ///
+    /// Layout per row: `[cos(f0)..cos(f_{half-1}), sin(f0)..sin(f_{half-1})]`.
+    pub fn cos_sin_cache(&self) -> &Tensor {
+        &self.cos_sin_cache
     }
 
     /// Create a YaRN-scaled RoPE (used by DeepSeek V2/V3).
@@ -262,9 +288,23 @@ impl RotaryEmbedding {
             .to_dtype(dtype)
             .map_err(ModelError::Candle)?;
 
+        let cos_sin_cache = Tensor::cat(
+            &[
+                &cos_cache
+                    .narrow(1, 0, half_dim)
+                    .map_err(ModelError::Candle)?,
+                &sin_cache
+                    .narrow(1, 0, half_dim)
+                    .map_err(ModelError::Candle)?,
+            ],
+            1,
+        )
+        .map_err(ModelError::Candle)?;
+
         Ok(Self {
             cos_cache,
             sin_cache,
+            cos_sin_cache,
             head_dim,
             max_position,
         })

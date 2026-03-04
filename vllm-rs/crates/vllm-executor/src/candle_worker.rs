@@ -1711,6 +1711,9 @@ impl Worker for CandleWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
+        #[cfg(feature = "profiling")]
+        let _step_guard = vllm_kernels::profiling::range("step");
+
         // Lazily build grammar vocabulary if any new request needs constrained decoding.
         // Done before borrowing self.model to satisfy the borrow checker.
         #[cfg(feature = "guided-decoding")]
@@ -2000,27 +2003,37 @@ impl Worker for CandleWorker {
 
             let all_logits_flat = if let Some(graph_logits) = cuda_graph_logits {
                 // Graph replay succeeded — still flush real KV scatter eagerly.
+                #[cfg(feature = "profiling")]
+                let _kv_guard = vllm_kernels::profiling::range("kv_flush");
                 batched_storage.flush_all().map_err(|e| {
                     ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
                 })?;
                 graph_logits
             } else {
                 // Eager forward path (no CUDA graph or not all-decode).
-                let logits = model
-                    .forward_batch(
-                        &flat_ids,
-                        &flat_pos,
-                        &prepared.attn_meta,
-                        &mut batched_storage,
-                    )
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
-                    })?;
+                let logits = {
+                    #[cfg(feature = "profiling")]
+                    let _fwd_guard = vllm_kernels::profiling::range("forward");
+                    model
+                        .forward_batch(
+                            &flat_ids,
+                            &flat_pos,
+                            &prepared.attn_meta,
+                            &mut batched_storage,
+                        )
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
+                        })?
+                };
 
                 // Flush deferred scatters.
-                batched_storage.flush_all().map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
-                })?;
+                {
+                    #[cfg(feature = "profiling")]
+                    let _kv_guard = vllm_kernels::profiling::range("kv_flush");
+                    batched_storage.flush_all().map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
+                    })?;
+                }
 
                 logits
             };
@@ -2094,6 +2107,8 @@ impl Worker for CandleWorker {
             }
 
             // Try batched GPU sampling when multiple requests can stay on-device.
+            #[cfg(feature = "profiling")]
+            let _sample_guard = vllm_kernels::profiling::range("sampling");
             let mut cpu_fallback_indices: Vec<usize> = Vec::new();
             let batched_gpu_done = self.try_batched_gpu_sample(
                 &prepared.req_inputs,

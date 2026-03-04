@@ -129,6 +129,39 @@ pub fn fused_add_gemma_rms_norm(
 }
 
 // ---------------------------------------------------------------------------
+// Fused RoPE dispatch
+// ---------------------------------------------------------------------------
+
+/// Fused rotary position embedding — dispatches to CUDA fused kernel on GPU.
+///
+/// On CUDA: single kernel launch per tensor (vs 5-7 from candle decomposition).
+/// On CPU: falls back to the standard `RotaryEmbedding::apply()` decomposition.
+///
+/// * `q` — query tensor `[num_tokens, num_q_heads, head_dim]`
+/// * `k` — key tensor `[num_tokens, num_kv_heads, head_dim]`
+/// * `positions` — `[num_tokens]` u32
+/// * `cos_sin_cache` — `[max_pos, head_dim]` combined `[cos|sin]` cache
+/// * `head_size` — dimension per attention head
+pub fn rotary_embedding(
+    q: &Tensor,
+    k: &Tensor,
+    positions: &Tensor,
+    #[allow(unused_variables)] cos_sin_cache: &Tensor,
+    #[allow(unused_variables)] head_size: usize,
+) -> candle_core::Result<(Tensor, Tensor)> {
+    #[cfg(feature = "cuda")]
+    if q.device().is_cuda() {
+        let q_rot =
+            vllm_kernels::rotary::fused_rotary_apply(q, positions, cos_sin_cache, head_size)?;
+        let k_rot =
+            vllm_kernels::rotary::fused_rotary_apply(k, positions, cos_sin_cache, head_size)?;
+        return Ok((q_rot, k_rot));
+    }
+    let _ = (q, k, positions);
+    candle_core::bail!("ops::rotary_embedding requires CUDA; use RotaryEmbedding::apply() on CPU")
+}
+
+// ---------------------------------------------------------------------------
 // Fused QK-norm + RoPE dispatch
 // ---------------------------------------------------------------------------
 

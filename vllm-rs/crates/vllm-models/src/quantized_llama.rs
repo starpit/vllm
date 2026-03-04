@@ -301,27 +301,31 @@ impl QuantizedLlamaDecoderLayer {
     fn forward(
         &self,
         hidden_states: &Tensor,
+        residual: Option<&Tensor>,
         positions: &Tensor,
         kv_cache: Option<crate::LayerKvHandle<'_>>,
-    ) -> ModelResult<Tensor> {
-        // Pre-attention layernorm + attention.
-        let normed = crate::ops::rms_norm(hidden_states, &self.input_layernorm)
-            .map_err(ModelError::Candle)?;
+    ) -> ModelResult<(Tensor, Tensor)> {
+        // Pre-attention layernorm: fuse previous MLP residual add when available.
+        let (normed, residual) = if let Some(residual) = residual {
+            crate::ops::fused_add_rms_norm(hidden_states, residual, &self.input_layernorm)
+                .map_err(ModelError::Candle)?
+        } else {
+            let normed = crate::ops::rms_norm(hidden_states, &self.input_layernorm)
+                .map_err(ModelError::Candle)?;
+            (normed, hidden_states.clone())
+        };
+
         let attn_output = self.self_attn.forward(&normed, positions, kv_cache)?;
 
         // Fused residual add + post-attention layernorm.
-        let (normed, hidden_states) = crate::ops::fused_add_rms_norm(
-            &attn_output,
-            hidden_states,
-            &self.post_attention_layernorm,
-        )
-        .map_err(ModelError::Candle)?;
+        let (normed, residual) =
+            crate::ops::fused_add_rms_norm(&attn_output, &residual, &self.post_attention_layernorm)
+                .map_err(ModelError::Candle)?;
 
-        // MLP + residual.
+        // MLP (residual add deferred to next layer or final norm).
         let mlp_output = self.mlp.forward(&normed).map_err(ModelError::Candle)?;
-        let hidden_states = (hidden_states + mlp_output).map_err(ModelError::Candle)?;
 
-        Ok(hidden_states)
+        Ok((mlp_output, residual))
     }
 }
 
@@ -392,12 +396,20 @@ impl QuantizedLlamaModel {
             .forward(input_ids)
             .map_err(ModelError::Candle)?;
 
+        let mut residual: Option<Tensor> = None;
         for (i, layer) in self.layers.iter().enumerate() {
             let layer_handle = kv_cache.as_mut().map(|s| s.layer_handle(i));
-            hidden_states = layer.forward(&hidden_states, positions, layer_handle)?;
+            let (hs, res) =
+                layer.forward(&hidden_states, residual.as_ref(), positions, layer_handle)?;
+            hidden_states = hs;
+            residual = Some(res);
         }
 
-        crate::ops::rms_norm(&hidden_states, &self.norm).map_err(ModelError::Candle)
+        // Final norm: fuse last MLP's residual add into the norm.
+        let (normed, _) =
+            crate::ops::fused_add_rms_norm(&hidden_states, residual.as_ref().unwrap(), &self.norm)
+                .map_err(ModelError::Candle)?;
+        Ok(normed)
     }
 
     fn num_layers(&self) -> usize {

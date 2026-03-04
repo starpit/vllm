@@ -112,10 +112,7 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
         let llm = create_llm(&args, model)?;
         eprintln!("Model loaded in {:.2}s", load_start.elapsed().as_secs_f64());
 
-        let total_iters = (args.num_iters_warmup + args.num_iters) * batch_sizes.len();
-        let pb = ProgressBar::new(total_iters as u64)
-            .with_style(bar_style.clone())
-            .with_message(short_model_name(model));
+        let short_name = short_model_name(model);
 
         for &bs in batch_sizes {
             let dummy_prompts: Vec<Vec<u32>> = (0..bs)
@@ -126,13 +123,28 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
                 })
                 .collect();
 
+            let bs_label = if batch_sizes.len() > 1 {
+                format!(" bs={bs}")
+            } else {
+                String::new()
+            };
+
             // Warmup.
-            for _ in 0..args.num_iters_warmup {
-                llm.generate_token_ids(&dummy_prompts, Some(sampling_params.clone()))?;
-                pb.inc(1);
+            if args.num_iters_warmup > 0 {
+                let pb = ProgressBar::new(args.num_iters_warmup as u64)
+                    .with_style(bar_style.clone())
+                    .with_message(format!("{short_name}{bs_label} warmup"));
+                for _ in 0..args.num_iters_warmup {
+                    llm.generate_token_ids(&dummy_prompts, Some(sampling_params.clone()))?;
+                    pb.inc(1);
+                }
+                pb.finish();
             }
 
             // Timed runs.
+            let pb = ProgressBar::new(args.num_iters as u64)
+                .with_style(bar_style.clone())
+                .with_message(format!("{short_name}{bs_label} bench"));
             let mut latencies = Vec::with_capacity(args.num_iters);
             for _ in 0..args.num_iters {
                 let start = Instant::now();
@@ -140,6 +152,7 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
                 latencies.push(start.elapsed().as_secs_f64());
                 pb.inc(1);
             }
+            pb.finish();
 
             results.push(BenchResult {
                 model: model.clone(),
@@ -147,7 +160,6 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
                 latencies,
             });
         }
-        pb.finish();
     }
 
     // Print results.

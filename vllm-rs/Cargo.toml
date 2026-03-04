@@ -16,6 +16,9 @@ members = [
     "crates/vllm-mlx",
     "crates/vllm-e2e",
 ]
+exclude = [
+    "third_party/candle-flash-attn",
+]
 
 [workspace.package]
 version = "0.1.0"

@@ -91,14 +91,56 @@ fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
         args.num_iters, args.input_len, args.output_len, args.num_iters_warmup
     );
 
-    let warmup_style = ProgressStyle::with_template(
-        "{msg} {wide_bar:.yellow/yellow} {pos}/{len} [{elapsed_precise}<{eta_precise}, {per_sec}]",
-    )
-    .unwrap();
-    let bench_style = ProgressStyle::with_template(
-        "{msg} {wide_bar:.cyan/blue} {pos}/{len} [{elapsed_precise}<{eta_precise}, {per_sec}]",
-    )
-    .unwrap();
+    // tqdm-style progress key helpers.
+    fn fmt_duration(d: std::time::Duration, w: &mut dyn std::fmt::Write) {
+        let secs = d.as_secs();
+        if secs >= 3600 {
+            write!(
+                w,
+                "{}:{:02}:{:02}",
+                secs / 3600,
+                (secs % 3600) / 60,
+                secs % 60
+            )
+            .unwrap();
+        } else {
+            write!(w, "{:02}:{:02}", secs / 60, secs % 60).unwrap();
+        }
+    }
+    fn tqdm_keys(style: ProgressStyle) -> ProgressStyle {
+        style
+            .with_key(
+                "my_elapsed",
+                |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                    fmt_duration(state.elapsed(), w);
+                },
+            )
+            .with_key(
+                "my_eta",
+                |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                    fmt_duration(state.eta(), w);
+                },
+            )
+            .with_key(
+                "per_sec",
+                |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                    write!(w, "{:.2}it/s", state.per_sec()).unwrap();
+                },
+            )
+    }
+
+    let warmup_style = tqdm_keys(
+        ProgressStyle::with_template(
+            "{msg} {wide_bar:.yellow/yellow} {pos}/{len} [{my_elapsed}<{my_eta}, {per_sec}]",
+        )
+        .unwrap(),
+    );
+    let bench_style = tqdm_keys(
+        ProgressStyle::with_template(
+            "{msg} {wide_bar:.cyan/blue} {pos}/{len} [{my_elapsed}<{my_eta}, {per_sec}]",
+        )
+        .unwrap(),
+    );
 
     // Pre-compute max label width so all progress bars align.
     let max_msg_len = models

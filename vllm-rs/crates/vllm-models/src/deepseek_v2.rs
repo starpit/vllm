@@ -18,7 +18,9 @@
 use candle_core::{DType, Device, Module, Tensor};
 
 use vllm_model::error::{ModelError, ModelResult};
-use vllm_model::layers::{Embedding, Linear, RmsNorm, RotaryEmbedding};
+use vllm_model::layers::{
+    ColumnParallelLinear, Embedding, Linear, RmsNorm, RotaryEmbedding, RowParallelLinear,
+};
 use vllm_model::lora::LoraAdapter;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
@@ -353,16 +355,16 @@ pub struct DeepSeekV2Attention {
     // Q path.
     q_a_proj: Option<Linear>,
     q_a_layernorm: Option<RmsNorm>,
-    q_b_proj: Option<Linear>,
-    q_proj: Option<Linear>,
+    q_b_proj: Option<ColumnParallelLinear>,
+    q_proj: Option<ColumnParallelLinear>,
 
     // KV path.
     kv_a_proj_with_mqa: Linear,
     kv_a_layernorm: RmsNorm,
-    kv_b_proj: Linear,
+    kv_b_proj: ColumnParallelLinear,
 
     // Output.
-    o_proj: Linear,
+    o_proj: RowParallelLinear,
 
     // RoPE for the rope dimensions only.
     rotary_emb: RotaryEmbedding,
@@ -385,15 +387,17 @@ impl DeepSeekV2Attention {
         config: &DeepSeekV2Config,
         dtype: DType,
         device: &Device,
+        rank: usize,
+        world_size: usize,
     ) -> ModelResult<Self> {
-        let num_heads = config.num_attention_heads;
+        let num_heads = config.num_attention_heads / world_size;
         let qk_nope_head_dim = config.qk_nope_head_dim;
         let qk_rope_head_dim = config.qk_rope_head_dim;
         let v_head_dim = config.v_head_dim;
         let kv_lora_rank = config.kv_lora_rank;
         let qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
 
-        // Q path.
+        // Q path: q_a_proj is replicated (low-rank bottleneck), q_b_proj is column-parallel.
         let (q_a_proj, q_a_layernorm, q_b_proj, q_proj) =
             if let Some(q_lora_rank) = config.q_lora_rank {
                 let q_a = Linear::load(weights, &format!("{prefix}.q_a_proj"), dtype)?;
@@ -403,15 +407,29 @@ impl DeepSeekV2Attention {
                     config.rms_norm_eps,
                     dtype,
                 )?;
-                let q_b = Linear::load(weights, &format!("{prefix}.q_b_proj"), dtype)?;
+                let q_b = ColumnParallelLinear::load(
+                    weights,
+                    &format!("{prefix}.q_b_proj"),
+                    dtype,
+                    rank,
+                    world_size,
+                    false,
+                )?;
                 let _ = q_lora_rank;
                 (Some(q_a), Some(q_a_ln), Some(q_b), None)
             } else {
-                let q = Linear::load(weights, &format!("{prefix}.q_proj"), dtype)?;
+                let q = ColumnParallelLinear::load(
+                    weights,
+                    &format!("{prefix}.q_proj"),
+                    dtype,
+                    rank,
+                    world_size,
+                    false,
+                )?;
                 (None, None, None, Some(q))
             };
 
-        // KV path.
+        // KV path: kv_a_proj_with_mqa is replicated, kv_b_proj is column-parallel.
         let kv_a_proj_with_mqa =
             Linear::load(weights, &format!("{prefix}.kv_a_proj_with_mqa"), dtype)?;
         let kv_a_layernorm = RmsNorm::load(
@@ -420,10 +438,24 @@ impl DeepSeekV2Attention {
             config.rms_norm_eps,
             dtype,
         )?;
-        let kv_b_proj = Linear::load(weights, &format!("{prefix}.kv_b_proj"), dtype)?;
+        let kv_b_proj = ColumnParallelLinear::load(
+            weights,
+            &format!("{prefix}.kv_b_proj"),
+            dtype,
+            rank,
+            world_size,
+            false,
+        )?;
 
-        // Output projection.
-        let o_proj = Linear::load(weights, &format!("{prefix}.o_proj"), dtype)?;
+        // Output projection: row-parallel (all-reduce after matmul).
+        let o_proj = RowParallelLinear::load(
+            weights,
+            &format!("{prefix}.o_proj"),
+            dtype,
+            rank,
+            world_size,
+            true,
+        )?;
 
         // RoPE (over rope_head_dim only).
         let rotary_emb = if let Some(ref yarn) = config.rope_scaling {
@@ -484,10 +516,16 @@ impl DeepSeekV2Attention {
             if let Some(q_lora_rank) = config.q_lora_rank {
                 let q_a = Linear::zeros(config.hidden_size, q_lora_rank, dtype, device)?;
                 let q_a_ln = RmsNorm::ones(q_lora_rank, config.rms_norm_eps, dtype, device)?;
-                let q_b = Linear::zeros(q_lora_rank, num_heads * qk_head_dim, dtype, device)?;
+                let q_b = ColumnParallelLinear::new(
+                    Linear::zeros(q_lora_rank, num_heads * qk_head_dim, dtype, device)?,
+                    false,
+                );
                 (Some(q_a), Some(q_a_ln), Some(q_b), None)
             } else {
-                let q = Linear::zeros(config.hidden_size, num_heads * qk_head_dim, dtype, device)?;
+                let q = ColumnParallelLinear::new(
+                    Linear::zeros(config.hidden_size, num_heads * qk_head_dim, dtype, device)?,
+                    false,
+                );
                 (None, None, None, Some(q))
             };
 
@@ -498,14 +536,20 @@ impl DeepSeekV2Attention {
             device,
         )?;
         let kv_a_layernorm = RmsNorm::ones(kv_lora_rank, config.rms_norm_eps, dtype, device)?;
-        let kv_b_proj = Linear::zeros(
-            kv_lora_rank,
-            num_heads * (qk_nope_head_dim + v_head_dim),
-            dtype,
-            device,
-        )?;
+        let kv_b_proj = ColumnParallelLinear::new(
+            Linear::zeros(
+                kv_lora_rank,
+                num_heads * (qk_nope_head_dim + v_head_dim),
+                dtype,
+                device,
+            )?,
+            false,
+        );
 
-        let o_proj = Linear::zeros(num_heads * v_head_dim, config.hidden_size, dtype, device)?;
+        let o_proj = RowParallelLinear::new(
+            Linear::zeros(num_heads * v_head_dim, config.hidden_size, dtype, device)?,
+            true,
+        );
 
         let rotary_emb = RotaryEmbedding::new(
             qk_rope_head_dim,
@@ -710,6 +754,7 @@ impl Module for DeepSeekV2Mlp {
 
 impl DeepSeekV2DecoderLayer {
     /// Load a decoder layer.
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         weights: &ModelWeights,
         prefix: &str,
@@ -717,6 +762,8 @@ impl DeepSeekV2DecoderLayer {
         layer_idx: usize,
         dtype: DType,
         device: &Device,
+        rank: usize,
+        world_size: usize,
     ) -> ModelResult<Self> {
         let self_attn = DeepSeekV2Attention::load(
             weights,
@@ -724,9 +771,12 @@ impl DeepSeekV2DecoderLayer {
             config,
             dtype,
             device,
+            rank,
+            world_size,
         )?;
 
         let mlp = if config.has_moe() && layer_idx >= config.first_k_dense_replace {
+            // MoE layers: experts are replicated (not sharded).
             DeepSeekV2Mlp::MoE(DeepSeekV2MoE::load(
                 weights,
                 &format!("{prefix}.mlp"),
@@ -734,12 +784,13 @@ impl DeepSeekV2DecoderLayer {
                 dtype,
             )?)
         } else {
+            // Dense MLP layers: gate_up column-parallel, down_proj row-parallel.
             DeepSeekV2Mlp::Dense(LlamaMLP::load(
                 weights,
                 &format!("{prefix}.mlp"),
                 dtype,
-                0,
-                1,
+                rank,
+                world_size,
             )?)
         };
 
@@ -847,6 +898,8 @@ impl DeepSeekV2Model {
         config: &DeepSeekV2Config,
         dtype: DType,
         device: &Device,
+        rank: usize,
+        world_size: usize,
     ) -> ModelResult<Self> {
         let embed_tokens = Embedding::load(weights, &format!("{prefix}.embed_tokens"), dtype)?;
 
@@ -859,6 +912,8 @@ impl DeepSeekV2Model {
                 i,
                 dtype,
                 device,
+                rank,
+                world_size,
             )?;
             layers.push(layer);
         }
@@ -926,8 +981,11 @@ impl DeepSeekV2ForCausalLM {
         config: &DeepSeekV2Config,
         dtype: DType,
         device: &Device,
+        rank: usize,
+        world_size: usize,
     ) -> ModelResult<Self> {
-        let model = DeepSeekV2Model::load(weights, "model", config, dtype, device)?;
+        let model =
+            DeepSeekV2Model::load(weights, "model", config, dtype, device, rank, world_size)?;
 
         let lm_head = if config.tie_word_embeddings {
             Linear::new(model.embed_tokens.weight().clone(), None)
@@ -940,6 +998,22 @@ impl DeepSeekV2ForCausalLM {
 }
 
 impl crate::Model for DeepSeekV2ForCausalLM {
+    fn inject_tp_group(
+        &mut self,
+        group: std::sync::Arc<dyn vllm_model::process_group::ProcessGroup>,
+    ) -> ModelResult<()> {
+        for layer in &mut self.model.layers {
+            // Attention o_proj is RowParallelLinear — needs all-reduce.
+            layer.self_attn.o_proj.set_tp_group(group.clone());
+            // Dense MLP layers: down_proj is RowParallelLinear — needs all-reduce.
+            // MoE layers: experts are replicated, no TP group needed.
+            if let DeepSeekV2Mlp::Dense(ref mut mlp) = layer.mlp {
+                mlp.down_proj.set_tp_group(group.clone());
+            }
+        }
+        Ok(())
+    }
+
     fn inject_lora(&mut self, adapter: &LoraAdapter) -> ModelResult<()> {
         let targets = &adapter.config.target_modules;
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
@@ -956,12 +1030,14 @@ impl crate::Model for DeepSeekV2ForCausalLM {
                         }
                         "q_b_proj" => {
                             if let Some(ref mut p) = layer.self_attn.q_b_proj {
-                                p.attach_lora(a.clone(), b.clone(), adapter.scaling)?;
+                                p.inner_mut()
+                                    .attach_lora(a.clone(), b.clone(), adapter.scaling)?;
                             }
                         }
                         "q_proj" => {
                             if let Some(ref mut p) = layer.self_attn.q_proj {
-                                p.attach_lora(a.clone(), b.clone(), adapter.scaling)?;
+                                p.inner_mut()
+                                    .attach_lora(a.clone(), b.clone(), adapter.scaling)?;
                             }
                         }
                         "kv_a_proj_with_mqa" => {
@@ -972,14 +1048,14 @@ impl crate::Model for DeepSeekV2ForCausalLM {
                             )?;
                         }
                         "kv_b_proj" => {
-                            layer.self_attn.kv_b_proj.attach_lora(
+                            layer.self_attn.kv_b_proj.inner_mut().attach_lora(
                                 a.clone(),
                                 b.clone(),
                                 adapter.scaling,
                             )?;
                         }
                         "o_proj" => {
-                            layer.self_attn.o_proj.attach_lora(
+                            layer.self_attn.o_proj.inner_mut().attach_lora(
                                 a.clone(),
                                 b.clone(),
                                 adapter.scaling,
@@ -1031,9 +1107,8 @@ pub fn create_deepseek_v2(
     rank: usize,
     world_size: usize,
 ) -> ModelResult<Box<dyn crate::Model>> {
-    let _ = (rank, world_size);
     let ds_config = DeepSeekV2Config::from_hf_config(config)?;
-    let model = DeepSeekV2ForCausalLM::load(weights, &ds_config, dtype, device)?;
+    let model = DeepSeekV2ForCausalLM::load(weights, &ds_config, dtype, device, rank, world_size)?;
     Ok(Box::new(model))
 }
 
@@ -1332,7 +1407,7 @@ mod tests {
         create_test_weights(&path, &specs);
 
         let weights = ModelWeights::from_single_file(&path, &device).unwrap();
-        let model = DeepSeekV2ForCausalLM::load(&weights, &config, dtype, &device).unwrap();
+        let model = DeepSeekV2ForCausalLM::load(&weights, &config, dtype, &device, 0, 1).unwrap();
 
         let input_ids = Tensor::new(&[1u32, 5, 10], &device).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2], &device).unwrap();

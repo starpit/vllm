@@ -23,8 +23,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 
-pub use vllm_common::SamplingParams;
 use vllm_common::EngineCoreRequest;
+pub use vllm_common::SamplingParams;
 use vllm_config::CudaGraphConfig;
 use vllm_engine::core_client::{EngineCoreClient, InprocClient};
 

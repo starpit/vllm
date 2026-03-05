@@ -480,9 +480,10 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
     let engine = if let Some(tokenizer) = core.tokenizer {
         #[cfg(feature = "chat-template")]
         {
-            let chat_template = core.model_dir.as_ref().and_then(|dir| {
-                try_load_chat_template(dir)
-            });
+            let chat_template = core
+                .model_dir
+                .as_ref()
+                .and_then(|dir| try_load_chat_template(dir));
             if let Some(tpl) = chat_template {
                 info!("Chat template loaded from tokenizer_config.json");
                 AsyncEngine::with_tokenizer_and_template(

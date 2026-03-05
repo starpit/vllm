@@ -322,7 +322,7 @@ mod tests {
                     &b_bytes,
                 ).unwrap()),
             ];
-            safetensors::serialize_to_file(tensors, &None, &path).unwrap();
+            safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
             // Load via GpuWeights.
             let stream = init_cuda();
@@ -374,7 +374,7 @@ mod tests {
                     &bytes,
                 ).unwrap()),
             ];
-            safetensors::serialize_to_file(tensors, &None, &path).unwrap();
+            safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
             let stream = init_cuda();
             let gw = GpuWeights::from_dir(dir.path(), stream).unwrap();
@@ -402,7 +402,7 @@ mod tests {
                     &bytes,
                 ).unwrap()),
             ];
-            safetensors::serialize_to_file(tensors, &None, &path).unwrap();
+            safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
             let stream = init_cuda();
             let mut gw = GpuWeights::from_single_file(&path, stream).unwrap();
@@ -443,7 +443,7 @@ mod tests {
                     &bf16_data,
                 ).unwrap()),
             ];
-            safetensors::serialize_to_file(tensors, &None, &path).unwrap();
+            safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
             let stream = init_cuda();
             let gw = GpuWeights::from_single_file(&path, stream).unwrap();
@@ -471,7 +471,7 @@ mod tests {
                     safetensors::Dtype::F32, vec![4], &data,
                 ).unwrap()),
             ];
-            safetensors::serialize_to_file(tensors, &None, &path).unwrap();
+            safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
             let stream = init_cuda();
             let gw = GpuWeights::from_single_file(&path, stream).unwrap();

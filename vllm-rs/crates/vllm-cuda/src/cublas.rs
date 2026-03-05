@@ -50,7 +50,7 @@ impl CublasHandle {
 
         // Pre-allocate workspace (fixes CUDA graph capture).
         let workspace = driver::mem_alloc(CUBLAS_WORKSPACE_SIZE)?;
-        check(sys::cublasSetWorkspace(
+        check(sys::cublasSetWorkspace_v2(
             handle,
             workspace as *mut _,
             CUBLAS_WORKSPACE_SIZE,
@@ -154,12 +154,13 @@ impl CublasHandle {
 
         let (compute_type, data_type) = gemm_types(a.dtype());
         let lt_data_type = cublas_to_lt_dtype(data_type);
+        let lt_compute_type = cublas_to_lt_compute(compute_type);
 
         // Create matmul descriptor with bias epilogue.
         let mut matmul_desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
         check_lt(lt::cublasLtMatmulDescCreate(
             &mut matmul_desc,
-            compute_type,
+            lt_compute_type,
             lt::cudaDataType_t::CUDA_R_32F, // scale type always F32
         ))
         .expect("cublasLtMatmulDescCreate failed");
@@ -336,6 +337,16 @@ fn cublas_to_lt_dtype(dt: sys::cudaDataType_t) -> lt::cudaDataType_t {
         sys::cudaDataType_t::CUDA_R_16BF => lt::cudaDataType_t::CUDA_R_16BF,
         sys::cudaDataType_t::CUDA_R_32F => lt::cudaDataType_t::CUDA_R_32F,
         _ => panic!("unsupported dtype for cublasLt: {:?}", dt),
+    }
+}
+
+/// Convert cuBLAS compute type to cublasLt compute type (same enum values, different Rust types).
+fn cublas_to_lt_compute(ct: cublasComputeType_t) -> lt::cublasComputeType_t {
+    match ct {
+        cublasComputeType_t::CUBLAS_COMPUTE_16F => lt::cublasComputeType_t::CUBLAS_COMPUTE_16F,
+        cublasComputeType_t::CUBLAS_COMPUTE_32F => lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+        cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32 => lt::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+        _ => panic!("unsupported compute type for cublasLt: {:?}", ct),
     }
 }
 
@@ -573,6 +584,63 @@ mod tests {
 
             driver::mem_free(gpu_a).unwrap();
             driver::mem_free(gpu_b).unwrap();
+            driver::stream_destroy(stream).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_gemm_bias_f32() {
+        let stream = init_cuda();
+        unsafe {
+            let handle = CublasHandle::new(stream).unwrap();
+            let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
+
+            // A = [[1, 2], [3, 4]] (2x2)
+            // B = [[5, 6], [7, 8]] (2x2)  (weight)
+            // bias = [10, 20]
+            // C = A @ B^T + bias = [[17+10, 23+20], [39+10, 53+20]] = [[27, 43], [49, 73]]
+            let host_a = driver::mem_alloc_host(16).unwrap();
+            let host_b = driver::mem_alloc_host(16).unwrap();
+            let host_bias = driver::mem_alloc_host(8).unwrap();
+            std::slice::from_raw_parts_mut(host_a as *mut f32, 4)
+                .copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+            std::slice::from_raw_parts_mut(host_b as *mut f32, 4)
+                .copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+            std::slice::from_raw_parts_mut(host_bias as *mut f32, 2)
+                .copy_from_slice(&[10.0, 20.0]);
+
+            let gpu_a = driver::mem_alloc(16).unwrap();
+            let gpu_b = driver::mem_alloc(16).unwrap();
+            let gpu_bias = driver::mem_alloc(8).unwrap();
+            driver::memcpy_htod_async(gpu_a, host_a, 16, stream).unwrap();
+            driver::memcpy_htod_async(gpu_b, host_b, 16, stream).unwrap();
+            driver::memcpy_htod_async(gpu_bias, host_bias, 8, stream).unwrap();
+
+            let a = GpuTensor::new(gpu_a, &[2, 2], DType::F32);
+            let b = GpuTensor::new(gpu_b, &[2, 2], DType::F32);
+            let bias = GpuTensor::new(gpu_bias, &[2], DType::F32);
+            let c = handle.gemm_bias(a, b, bias, &mut arena);
+
+            let host_c = driver::mem_alloc_host(16).unwrap();
+            driver::memcpy_dtoh_async(host_c, c.raw_ptr(), 16, stream).unwrap();
+            driver::stream_synchronize(stream).unwrap();
+
+            let result = std::slice::from_raw_parts(host_c as *const f32, 4);
+            let expected = [27.0, 43.0, 49.0, 73.0];
+            for (i, (got, exp)) in result.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (got - exp).abs() < 1e-3,
+                    "gemm_bias mismatch at {i}: got {got}, expected {exp}"
+                );
+            }
+
+            driver::mem_free_host(host_a).unwrap();
+            driver::mem_free_host(host_b).unwrap();
+            driver::mem_free_host(host_bias).unwrap();
+            driver::mem_free_host(host_c).unwrap();
+            driver::mem_free(gpu_a).unwrap();
+            driver::mem_free(gpu_b).unwrap();
+            driver::mem_free(gpu_bias).unwrap();
             driver::stream_destroy(stream).unwrap();
         }
     }

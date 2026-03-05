@@ -11,7 +11,7 @@ default = []
 cuda = ["dep:cudarc", "cc", "bindgen_cuda", "candle-flash-attn-build"]
 
 [dependencies]
-cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt"] }
+cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
 half = { workspace = true }
 safetensors = { workspace = true }
 memmap2 = { workspace = true }

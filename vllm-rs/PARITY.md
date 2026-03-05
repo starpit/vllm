@@ -151,10 +151,10 @@
 | Command R (Cohere) | ✅ | ✅ | ✅ |  |
 | Qwen2 MoE | ✅ | ✅ | ✅ |  |
 | Qwen3 MoE | ✅ | ✅ | ✅ |  |
-| Mixtral (MoE) | ✅ | ✅ | ❌ |  |
-| Granite (IBM) | ✅ | ✅ | ❌ |  |
-| Kimi K2.5 | ✅ | ✅ | ❌ | Uses DeepSeek V2 backbone |
-| Qwen3-Next (hybrid GDN + MoE) | ✅ | ✅ | ❌ | Linear attention + full attention |
+| Mixtral (MoE) | ✅ | ✅ | ✅ |  |
+| Granite (IBM) | ✅ | ✅ | ✅ |  |
+| Kimi K2.5 | ✅ | ✅ | ✅ | Uses DeepSeek V2 backbone |
+| Qwen3-Next (hybrid GDN + MoE) | ✅ | ✅ | ✅ | Linear attention + full attention |
 | GPT-NeoX | ✅ | ❌ | ❌ |  |
 | GPT-J | ✅ | ❌ | ❌ |  |
 | GPT-BigCode / StarCoder2 | ✅ | ❌ | ❌ |  |

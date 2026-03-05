@@ -234,8 +234,8 @@
 | Method | Python | Rust | Notes |
 |---|:---:|:---:|---|
 | GGUF (all k-quant variants) | ✅ | ✅ |  |
-| GPTQ | ✅ | ✅ | Rust: LLaMA-family only |
-| AWQ | ✅ | ✅ | Rust: LLaMA-family only |
+| GPTQ | ✅ | ✅ | Rust: LLaMA-family only; CUDA dequant kernel |
+| AWQ | ✅ | ✅ | Rust: LLaMA-family only; CUDA dequant kernel |
 | BitsAndBytes NF4 (4-bit) | ✅ | ✅ | Rust: LLaMA-family only |
 | MLX 4-bit quantized | N/A | ✅ | Rust-only; mlx-community models |
 | FP8 (W8A8 / W8A16) | ✅ | ❌ |  |

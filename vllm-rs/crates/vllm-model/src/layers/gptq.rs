@@ -134,7 +134,9 @@ pub(crate) fn read_i32_data(t: &Tensor) -> ModelResult<Vec<i32>> {
 ///
 /// On each forward pass the packed INT4 weights are dequantized to the
 /// working dtype, multiplied with the input, and optionally bias is added.
-/// This is a CPU-friendly approach (no custom CUDA kernels).
+///
+/// On CPU, dequantization uses scalar unpacking. On CUDA, callers should
+/// use `ops::gptq_forward()` which dispatches to a GPU dequantize kernel.
 pub struct GptqLinear {
     qweight: Tensor,       // [in_features/pack_factor, out_features] i32
     qzeros: Tensor,        // [num_groups, out_features/pack_factor] i32
@@ -185,7 +187,7 @@ impl GptqLinear {
         })
     }
 
-    /// Dequantize packed weights to a full float weight matrix.
+    /// Dequantize packed weights to a full float weight matrix (CPU path).
     ///
     /// Returns shape `[in_features, out_features]` in the scales dtype.
     pub fn dequantize(&self) -> ModelResult<Tensor> {
@@ -246,6 +248,31 @@ impl GptqLinear {
             .map_err(ModelError::Candle)?;
 
         Ok(dequantized)
+    }
+
+    /// Access qweight tensor (for CUDA dequant dispatch).
+    pub fn qweight(&self) -> &Tensor {
+        &self.qweight
+    }
+
+    /// Access qzeros tensor (for CUDA dequant dispatch).
+    pub fn qzeros(&self) -> &Tensor {
+        &self.qzeros
+    }
+
+    /// Access scales tensor (for CUDA dequant dispatch).
+    pub fn scales(&self) -> &Tensor {
+        &self.scales
+    }
+
+    /// Access g_idx tensor (for CUDA dequant dispatch).
+    pub fn g_idx(&self) -> Option<&Tensor> {
+        self.g_idx.as_ref()
+    }
+
+    /// Access bias tensor.
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.bias.as_ref()
     }
 
     /// Input features (unquantized).

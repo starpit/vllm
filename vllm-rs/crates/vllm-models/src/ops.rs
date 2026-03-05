@@ -242,6 +242,105 @@ pub fn qk_norm_and_rope(
 }
 
 // ---------------------------------------------------------------------------
+// GPTQ/AWQ quantized linear dispatch
+// ---------------------------------------------------------------------------
+
+/// GPTQ dequantize + matmul — dispatches to CUDA GPU dequantize kernel on GPU.
+///
+/// On CUDA: dequantizes packed INT4 weights on GPU, then cuBLAS matmul.
+/// On CPU: falls back to `GptqLinear::forward()` (CPU scalar unpacking).
+pub fn gptq_forward(
+    linear: &vllm_model::layers::GptqLinear,
+    x: &Tensor,
+) -> candle_core::Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda() {
+        let qz_2d = linear.qzeros().dims2()?;
+        let num_groups = qz_2d.0;
+        let group_size = if num_groups > 0 {
+            linear.in_features().div_ceil(num_groups)
+        } else {
+            linear.in_features()
+        };
+        let w = vllm_kernels::quantize::CudaQuantizeKernels::gptq_dequantize(
+            linear.qweight(),
+            linear.qzeros(),
+            linear.scales(),
+            linear.g_idx(),
+            linear.in_features(),
+            linear.out_features(),
+            group_size,
+        )
+        .map_err(kernel_err)?;
+
+        let x_dtype = x.dtype();
+        let x = if x.dtype() != w.dtype() {
+            x.to_dtype(w.dtype())?
+        } else {
+            x.clone()
+        };
+        let output = x.contiguous()?.matmul(&w.contiguous()?)?;
+        let output = if output.dtype() != x_dtype {
+            output.to_dtype(x_dtype)?
+        } else {
+            output
+        };
+        return match linear.bias() {
+            Some(b) => output.broadcast_add(b),
+            None => Ok(output),
+        };
+    }
+    candle_core::Module::forward(linear, x)
+}
+
+/// AWQ dequantize + matmul — dispatches to CUDA GPU dequantize kernel on GPU.
+///
+/// On CUDA: dequantizes packed INT4 weights on GPU, then cuBLAS matmul.
+/// On CPU: falls back to `AwqLinear::forward()` (CPU scalar unpacking).
+pub fn awq_forward(
+    linear: &vllm_model::layers::AwqLinear,
+    x: &Tensor,
+) -> candle_core::Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if x.device().is_cuda() {
+        let qz_2d = linear.qzeros().dims2()?;
+        let num_groups = qz_2d.0;
+        let group_size = if num_groups > 0 {
+            linear.in_features().div_ceil(num_groups)
+        } else {
+            linear.in_features()
+        };
+        let w = vllm_kernels::quantize::CudaQuantizeKernels::awq_dequantize(
+            linear.qweight(),
+            linear.qzeros(),
+            linear.scales(),
+            linear.in_features(),
+            linear.out_features(),
+            group_size,
+        )
+        .map_err(kernel_err)?;
+
+        let x_dtype = x.dtype();
+        let x = if x.dtype() != w.dtype() {
+            x.to_dtype(w.dtype())?
+        } else {
+            x.clone()
+        };
+        let output = x.contiguous()?.matmul(&w.contiguous()?)?;
+        let output = if output.dtype() != x_dtype {
+            output.to_dtype(x_dtype)?
+        } else {
+            output
+        };
+        return match linear.bias() {
+            Some(b) => output.broadcast_add(b),
+            None => Ok(output),
+        };
+    }
+    candle_core::Module::forward(linear, x)
+}
+
+// ---------------------------------------------------------------------------
 // GPU sampling dispatch
 // ---------------------------------------------------------------------------
 

@@ -20,7 +20,9 @@ fn main() {
             .file("csrc/qk_norm_rope_kernels.cu")
             .file("csrc/moe_topk_kernels.cu")
             .file("csrc/moe_align_kernels.cu")
-            .file("csrc/sampling_kernels.cu");
+            .file("csrc/sampling_kernels.cu")
+            .file("csrc/gptq_dequant_kernels.cu")
+            .file("csrc/awq_dequant_kernels.cu");
         build.compile("vllm_kernels");
 
         println!("cargo:rerun-if-changed=csrc/vec_utils.cuh");
@@ -32,5 +34,7 @@ fn main() {
         println!("cargo:rerun-if-changed=csrc/moe_topk_kernels.cu");
         println!("cargo:rerun-if-changed=csrc/moe_align_kernels.cu");
         println!("cargo:rerun-if-changed=csrc/sampling_kernels.cu");
+        println!("cargo:rerun-if-changed=csrc/gptq_dequant_kernels.cu");
+        println!("cargo:rerun-if-changed=csrc/awq_dequant_kernels.cu");
     }
 }

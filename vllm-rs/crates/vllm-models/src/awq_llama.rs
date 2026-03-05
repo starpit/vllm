@@ -53,10 +53,10 @@ impl AwqLlamaMLP {
 
 impl Module for AwqLlamaMLP {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
+        let gate = crate::ops::awq_forward(&self.gate_proj, x)?;
+        let up = crate::ops::awq_forward(&self.up_proj, x)?;
         let activated = gate.silu()?.mul(&up)?;
-        self.down_proj.forward(&activated)
+        crate::ops::awq_forward(&self.down_proj, &activated)
     }
 }
 
@@ -121,18 +121,9 @@ impl AwqLlamaAttention {
     ) -> ModelResult<Tensor> {
         let num_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
 
-        let q = self
-            .q_proj
-            .forward(hidden_states)
-            .map_err(ModelError::Candle)?;
-        let k = self
-            .k_proj
-            .forward(hidden_states)
-            .map_err(ModelError::Candle)?;
-        let v = self
-            .v_proj
-            .forward(hidden_states)
-            .map_err(ModelError::Candle)?;
+        let q = crate::ops::awq_forward(&self.q_proj, hidden_states).map_err(ModelError::Candle)?;
+        let k = crate::ops::awq_forward(&self.k_proj, hidden_states).map_err(ModelError::Candle)?;
+        let v = crate::ops::awq_forward(&self.v_proj, hidden_states).map_err(ModelError::Candle)?;
 
         let q = q
             .reshape((num_tokens, self.num_q_heads, self.head_dim))
@@ -153,9 +144,7 @@ impl AwqLlamaAttention {
             .reshape((num_tokens, self.num_q_heads * self.head_dim))
             .map_err(ModelError::Candle)?;
 
-        self.o_proj
-            .forward(&attn_output)
-            .map_err(ModelError::Candle)
+        crate::ops::awq_forward(&self.o_proj, &attn_output).map_err(ModelError::Candle)
     }
 }
 

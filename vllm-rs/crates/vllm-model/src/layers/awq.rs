@@ -107,6 +107,9 @@ fn unpack_cols_awq(packed: &Tensor, bits: usize, out_cols: usize) -> ModelResult
 ///
 /// On each forward pass the packed INT4 weights are dequantized to the
 /// working dtype, multiplied with the input, and optionally bias is added.
+///
+/// On CPU, dequantization uses scalar unpacking. On CUDA, callers should
+/// use `ops::awq_forward()` which dispatches to a GPU dequantize kernel.
 pub struct AwqLinear {
     qweight: Tensor, // [in_features, out_features/pack_factor] i32
     qzeros: Tensor,  // [num_groups, out_features/pack_factor] i32
@@ -150,7 +153,7 @@ impl AwqLinear {
         })
     }
 
-    /// Dequantize packed weights to a full float weight matrix.
+    /// Dequantize packed weights to a full float weight matrix (CPU path).
     ///
     /// Returns shape `[in_features, out_features]` in the scales dtype.
     pub fn dequantize(&self) -> ModelResult<Tensor> {
@@ -199,6 +202,26 @@ impl AwqLinear {
             .map_err(ModelError::Candle)?;
 
         Ok(dequantized)
+    }
+
+    /// Access qweight tensor (for CUDA dequant dispatch).
+    pub fn qweight(&self) -> &Tensor {
+        &self.qweight
+    }
+
+    /// Access qzeros tensor (for CUDA dequant dispatch).
+    pub fn qzeros(&self) -> &Tensor {
+        &self.qzeros
+    }
+
+    /// Access scales tensor (for CUDA dequant dispatch).
+    pub fn scales(&self) -> &Tensor {
+        &self.scales
+    }
+
+    /// Access bias tensor.
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.bias.as_ref()
     }
 
     /// Input features (unquantized).

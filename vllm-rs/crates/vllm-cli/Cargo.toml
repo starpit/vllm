@@ -9,6 +9,7 @@ description = "CLI binary for vLLM Rust inference engine"
 default = ["bench", "guided-decoding", "chat-template", "metrics", "multimodal", "tls"]
 bench = ["vllm-bench"]
 cuda = ["vllm-serve/cuda", "vllm-executor/cuda", "vllm-kernels/cuda", "vllm-models/cuda", "vllm-bench?/cuda"]
+cuda-backend = ["cuda", "vllm-serve/cuda-backend", "vllm-executor/cuda-backend"]
 nccl = ["cuda", "vllm-serve/nccl", "vllm-kernels/nccl"]
 profiling = ["cuda", "vllm-serve/profiling", "vllm-executor/profiling", "vllm-models/profiling", "vllm-kernels/profiling", "vllm-bench?/profiling"]
 metal = ["vllm-serve/metal", "vllm-mlx", "vllm-bench?/metal"]

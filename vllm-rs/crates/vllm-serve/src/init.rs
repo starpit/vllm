@@ -228,6 +228,43 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
         return Ok((Box::new(worker), hf_config, model_dir, model_dtype));
     }
 
+    // Try the purpose-built CUDA backend when feature is enabled and device is CUDA.
+    #[cfg(feature = "cuda-backend")]
+    if config.device.starts_with("cuda") || config.device == "auto" {
+        use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+
+        // Parse device ID (e.g. "cuda:1" → 1, "cuda" → 0, "auto" → 0).
+        let device_id = if config.device.starts_with("cuda:") {
+            config.device[5..].parse::<i32>().unwrap_or(0)
+        } else {
+            0
+        };
+
+        info!("Using vllm-cuda backend (device={})", device_id);
+        let cuda_config = CudaWorkerConfig {
+            model_path: model_path.clone(),
+            dtype: config.dtype.clone(),
+            hf_token: config.hf_token.clone(),
+            block_size: config.block_size,
+            device_id,
+        };
+
+        let mut worker = CudaWorker::new(cuda_config);
+        worker
+            .init_device()
+            .context("failed to initialize CUDA device")?;
+        worker.load_model().context("failed to load CUDA model")?;
+
+        let hf_config = worker
+            .hf_config()
+            .context("model config not available after CUDA load")?
+            .clone();
+        let model_dir = worker.model_dir().map(|p| p.to_path_buf());
+        let model_dtype = worker.resolved_candle_dtype();
+
+        return Ok((Box::new(worker), hf_config, model_dir, model_dtype));
+    }
+
     // Candle backend (CPU/CUDA/candle-Metal).
     info!("Using Candle backend");
     let worker_config = CandleWorkerConfig {

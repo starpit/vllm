@@ -1294,6 +1294,33 @@ impl Worker for CandleWorker {
                 unsafe { ctx.disable_event_tracking() };
                 info!("CandleWorker: disabled cudarc event tracking (single-stream optimization)");
             }
+
+            // Enable CUDA memory pool caching. By default, cuMemFreeAsync returns
+            // memory to the OS immediately. Setting RELEASE_THRESHOLD to u64::MAX
+            // tells the pool to keep freed memory in a free list for reuse by future
+            // cuMemAllocAsync calls — making alloc/free effectively free after warmup.
+            // This is the same strategy PyTorch's CUDACachingAllocator uses.
+            unsafe {
+                use cudarc::driver::sys;
+                let cu_device = ctx.cu_device();
+                let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+                let rc = sys::cuDeviceGetDefaultMemPool(&mut pool, cu_device);
+                if rc == sys::CUresult::CUDA_SUCCESS && !pool.is_null() {
+                    let mut threshold: u64 = u64::MAX;
+                    let rc2 = sys::cuMemPoolSetAttribute(
+                        pool,
+                        sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                        &mut threshold as *mut u64 as *mut std::ffi::c_void,
+                    );
+                    if rc2 == sys::CUresult::CUDA_SUCCESS {
+                        info!("CandleWorker: enabled CUDA memory pool caching (release_threshold=MAX)");
+                    } else {
+                        warn!("CandleWorker: failed to set memory pool release threshold: {:?}", rc2);
+                    }
+                } else {
+                    warn!("CandleWorker: failed to get default memory pool: {:?}", rc);
+                }
+            }
         }
 
         info!(

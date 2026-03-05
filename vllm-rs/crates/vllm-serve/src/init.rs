@@ -208,6 +208,26 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
         return Ok((Box::new(worker), hf_config, model_dir, model_dtype));
     }
 
+    // Try wgpu backend when explicitly requested.
+    #[cfg(feature = "wgpu")]
+    if config.device == "wgpu" {
+        info!("Using WebGPU backend");
+        let mut worker = vllm_wgpu::worker_impl::WgpuBackendWorker::new(model_path);
+        worker
+            .init_device()
+            .context("failed to initialize wgpu device")?;
+        worker.load_model().context("failed to load wgpu model")?;
+
+        let hf_config = worker
+            .hf_config()
+            .context("model config not available after wgpu load")?
+            .clone();
+        let model_dir = worker.model_dir().map(|p| p.to_path_buf());
+        let model_dtype = DType::F16;
+
+        return Ok((Box::new(worker), hf_config, model_dir, model_dtype));
+    }
+
     // Candle backend (CPU/CUDA/candle-Metal).
     info!("Using Candle backend");
     let worker_config = CandleWorkerConfig {

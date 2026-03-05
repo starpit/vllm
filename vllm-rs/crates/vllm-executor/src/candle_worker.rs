@@ -145,6 +145,12 @@ pub struct CandleWorker {
     /// Per-request contiguous KV cache for CUDA decode optimization.
     ///
     /// Pre-allocated buffers that use in-place CUDA writes (reshape_and_cache)
+    /// to eliminate GPU memory allocation during decode. Each buffer is
+    /// allocated once on prefill and reused for all subsequent decode steps.
+    ///
+    /// Only populated on CUDA with BF16/FP16 (FA2 path).
+    #[cfg(feature = "cuda")]
+    contiguous_kv_cache: HashMap<String, Vec<Option<vllm_models::ContiguousKvBuffer>>>,
     /// CUDA graph runner for decode acceleration (None if not CUDA or disabled).
     #[cfg(feature = "cuda")]
     cuda_graph_runner: Option<crate::cuda_graph::CudaGraphRunner>,
@@ -247,7 +253,6 @@ fn can_gpu_sample(params: &SamplingParams) -> bool {
         && params.repetition_penalty == 1.0
         && params.frequency_penalty == 0.0
         && params.presence_penalty == 0.0
-        && params.allowed_token_ids.is_none()
 }
 
 /// Sample one token entirely on-device.
@@ -327,6 +332,8 @@ impl CandleWorker {
             mm_data_map: HashMap::new(),
             is_pooling,
             resolved_architecture: None,
+            #[cfg(feature = "cuda")]
+            contiguous_kv_cache: HashMap::new(),
             #[cfg(feature = "cuda")]
             cuda_graph_runner: None,
             #[cfg(feature = "cuda")]
@@ -1142,15 +1149,16 @@ impl CandleWorker {
             let mut rng = rand::thread_rng();
 
             // Check if we can reuse the flat logits tensor directly:
-            // all requests are GPU-batchable, in order — flat logits is
-            // already [num_reqs, vocab] (one row per request).
+            // all requests are GPU-batchable, in order, and each has token_count==1
+            // (pure decode batch — flat logits is already [batch_size, vocab]).
             let can_use_flat = flat_logits.is_some()
                 && cpu_fallback_indices.is_empty()
                 && gpu_batch_indices.len() == req_inputs.len()
                 && gpu_batch_indices
                     .iter()
                     .enumerate()
-                    .all(|(i, &idx)| idx == i);
+                    .all(|(i, &idx)| idx == i)
+                && req_inputs.iter().all(|r| r.token_count == 1);
 
             let mut logit_rows: Vec<Tensor> = if can_use_flat {
                 Vec::new() // unused — we'll use flat_logits directly
@@ -1162,8 +1170,12 @@ impl CandleWorker {
                 let req_slice = &req_inputs[idx];
 
                 if !can_use_flat {
-                    // per_req_logits[idx] is already [1, vocab].
-                    logit_rows.push(per_req_logits[idx].clone());
+                    let logits = &per_req_logits[idx];
+                    let last_pos = req_slice.token_count - 1;
+                    let last_row = logits.narrow(0, last_pos, 1).map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("narrow error: {e}"))
+                    })?;
+                    logit_rows.push(last_row);
                 }
 
                 if let Some(params) = self.sampling_params_map.get(&req_slice.req_id) {
@@ -1804,6 +1816,8 @@ impl Worker for CandleWorker {
             self.sampling_params_map.remove(req_id);
             self.kv_caches.remove(req_id);
             self.recurrent_states.remove(req_id);
+            #[cfg(feature = "cuda")]
+            self.contiguous_kv_cache.remove(req_id);
             #[cfg(feature = "guided-decoding")]
             self.grammar_states.remove(req_id);
             self.mm_data_map.remove(req_id);
@@ -2031,6 +2045,16 @@ impl Worker for CandleWorker {
             #[cfg(not(feature = "cuda"))]
             let cuda_graph_logits: Option<Tensor> = None;
 
+            // Build BatchedKvCacheStorage.
+            // On CUDA: inject pre-allocated contiguous KV buffers to avoid
+            // O(seq_len) block gathers and per-step GPU memory allocation.
+            #[cfg(feature = "cuda")]
+            let contiguous_kv: Vec<_> = prepared
+                .req_inputs
+                .iter()
+                .map(|r| self.contiguous_kv_cache.remove(&r.req_id))
+                .collect();
+
             let pool = self.kv_block_pool.as_mut().unwrap();
 
             let all_logits_flat = if let Some(graph_logits) = cuda_graph_logits {
@@ -2040,6 +2064,14 @@ impl Worker for CandleWorker {
                 let batch_block_ids = std::mem::take(&mut prepared.attn_meta.block_ids);
                 let batch_tokens_before = std::mem::take(&mut prepared.attn_meta.tokens_before);
 
+                #[cfg(feature = "cuda")]
+                let mut batched_storage = vllm_models::BatchedKvCacheStorage::with_contiguous_kv(
+                    pool,
+                    batch_block_ids,
+                    batch_tokens_before,
+                    contiguous_kv,
+                );
+                #[cfg(not(feature = "cuda"))]
                 let mut batched_storage = vllm_models::BatchedKvCacheStorage::new(
                     pool,
                     batch_block_ids,
@@ -2052,11 +2084,31 @@ impl Worker for CandleWorker {
                     ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
                 })?;
 
+                // Extract updated contiguous KV buffers for persistence.
+                #[cfg(feature = "cuda")]
+                {
+                    let updated_kv = batched_storage.take_all_contiguous_kv();
+                    for (i, kv) in updated_kv.into_iter().enumerate() {
+                        if let Some(kv_vec) = kv {
+                            self.contiguous_kv_cache
+                                .insert(prepared.req_inputs[i].req_id.clone(), kv_vec);
+                        }
+                    }
+                }
+
                 graph_logits
             } else {
                 // Eager forward path (no CUDA graph or not all-decode).
                 // BatchedKvCacheStorage borrows block_ids/tokens_before from
                 // attn_meta via clone, since attn_meta is still needed during forward.
+                #[cfg(feature = "cuda")]
+                let mut batched_storage = vllm_models::BatchedKvCacheStorage::with_contiguous_kv(
+                    pool,
+                    prepared.attn_meta.block_ids.clone(),
+                    prepared.attn_meta.tokens_before.clone(),
+                    contiguous_kv,
+                );
+                #[cfg(not(feature = "cuda"))]
                 let mut batched_storage = vllm_models::BatchedKvCacheStorage::new(
                     pool,
                     prepared.attn_meta.block_ids.clone(),
@@ -2078,8 +2130,7 @@ impl Worker for CandleWorker {
                         })?
                 };
 
-                // Flush deferred scatters (non-CUDA path only — the CUDA paged
-                // FA2 path writes directly to the pool via reshape_and_cache).
+                // Flush deferred scatters.
                 {
                     #[cfg(feature = "profiling")]
                     let _kv_guard = vllm_kernels::profiling::range("kv_flush");
@@ -2088,18 +2139,31 @@ impl Worker for CandleWorker {
                     })?;
                 }
 
+                // Extract updated contiguous KV buffers for persistence.
+                #[cfg(feature = "cuda")]
+                {
+                    let updated_kv = batched_storage.take_all_contiguous_kv();
+                    for (i, kv) in updated_kv.into_iter().enumerate() {
+                        if let Some(kv_vec) = kv {
+                            self.contiguous_kv_cache
+                                .insert(prepared.req_inputs[i].req_id.clone(), kv_vec);
+                        }
+                    }
+                }
+
                 logits
             };
 
-            // Split flat logits [num_reqs, vocab] into per-request logits.
-            // Models return one row per request (last token's logits for prefill,
-            // single token's logits for decode).
+            // Split flat logits [total_tokens, vocab] into per-request logits.
             let mut per_req_logits = Vec::with_capacity(prepared.req_inputs.len());
-            for i in 0..prepared.req_inputs.len() {
+            let mut pos = 0usize;
+            for r in &prepared.req_inputs {
+                let q_len = r.token_count;
                 let req_logits = all_logits_flat
-                    .narrow(0, i, 1)
+                    .narrow(0, pos, q_len)
                     .map_err(|e| ExecutorError::WorkerExecution(format!("narrow error: {e}")))?;
                 per_req_logits.push(req_logits);
+                pos += q_len;
             }
 
             // --- Per-request sampling (paged path) ---
@@ -2110,12 +2174,41 @@ impl Worker for CandleWorker {
                     .is_some()
             });
 
-            // Prompt logprobs require per-token logits for all prefill positions.
-            // Since forward_batch now returns only [num_reqs, vocab] (last-token
-            // logits) to save memory, prompt logprobs are not available in this
-            // path. This is a deliberate trade-off: prompt logprobs are rarely
-            // needed and the memory savings from not computing [total_tokens, vocab]
-            // logits are significant (can be several GB on large prefill batches).
+            // Pre-compute prompt logprobs for prefill requests.
+            for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+                if req_slice.token_count <= 1 {
+                    continue;
+                }
+                let logits = &per_req_logits[req_idx];
+                let token_ids_slice = &prepared.flat_token_ids
+                    [req_slice.token_start..req_slice.token_start + req_slice.token_count];
+
+                if let Some(params) = self.sampling_params_map.get(&req_slice.req_id)
+                    && let Some(top_n) = params.prompt_logprobs
+                {
+                    let top_n = top_n.max(0) as usize;
+                    let num_positions = req_slice.token_count - 1;
+                    let prefix_logits = logits
+                        .narrow(0, 0, num_positions)
+                        .and_then(|t| t.to_dtype(DType::F32))
+                        .and_then(|t| t.to_vec2::<f32>())
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "prompt logprobs tensor error: {e}"
+                            ))
+                        })?;
+                    let mut plps = Vec::with_capacity(num_positions);
+                    for (i, row) in prefix_logits.iter().enumerate() {
+                        let actual_token = token_ids_slice[i + 1];
+                        plps.push(vllm_models::sampler::compute_logprobs(
+                            row,
+                            actual_token,
+                            top_n,
+                        ));
+                    }
+                    prompt_logprobs_map.insert(req_slice.req_id.clone(), plps);
+                }
+            }
 
             // Try batched GPU sampling when multiple requests can stay on-device.
             #[cfg(feature = "profiling")]
@@ -2135,15 +2228,17 @@ impl Worker for CandleWorker {
                     let req_slice = &prepared.req_inputs[req_idx];
                     let logits = &per_req_logits[req_idx];
 
-                    // per_req_logits are [1, vocab] (one row per request from
-                    // forward_batch's sample_indices gathering).
                     let sampled = if !req_slice.spec_token_ids.is_empty() {
-                        self.verify_spec_decode(logits, &req_slice.spec_token_ids, 1)?
+                        self.verify_spec_decode(
+                            logits,
+                            &req_slice.spec_token_ids,
+                            req_slice.token_count,
+                        )?
                     } else {
                         self.sample_normal(
                             logits,
                             &req_slice.req_id,
-                            1,
+                            req_slice.token_count,
                             &mut sampler,
                             &mut logprobs_map,
                         )?
@@ -2169,17 +2264,20 @@ impl Worker for CandleWorker {
                 }
             } else {
                 // Fallback: per-request sampling (non-CUDA or <=1 GPU-batchable).
-                // per_req_logits are [1, vocab] per request.
                 for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
                     let logits = &per_req_logits[req_idx];
 
                     let sampled = if !req_slice.spec_token_ids.is_empty() {
-                        self.verify_spec_decode(logits, &req_slice.spec_token_ids, 1)?
+                        self.verify_spec_decode(
+                            logits,
+                            &req_slice.spec_token_ids,
+                            req_slice.token_count,
+                        )?
                     } else {
                         self.sample_normal(
                             logits,
                             &req_slice.req_id,
-                            1,
+                            req_slice.token_count,
                             &mut sampler,
                             &mut logprobs_map,
                         )?

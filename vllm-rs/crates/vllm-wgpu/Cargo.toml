@@ -5,6 +5,17 @@ edition.workspace = true
 license.workspace = true
 description = "WebGPU tensor backend for vLLM — runs in browser via WASM + WebGPU"
 
+[features]
+default = []
+worker = [
+    "vllm-executor",
+    "vllm-model",
+    "vllm-core",
+    "vllm-engine",
+    "vllm-common",
+    "pollster",
+]
+
 [dependencies]
 wgpu = { version = "24", features = ["wgsl"] }
 bytemuck = { version = "1", features = ["derive"] }
@@ -16,10 +27,19 @@ serde_json = { workspace = true }
 safetensors = { workspace = true }
 half.workspace = true
 
+# Worker trait deps (optional, gated behind `worker` feature)
+vllm-executor = { workspace = true, optional = true }
+vllm-model = { workspace = true, optional = true }
+vllm-core = { workspace = true, optional = true }
+vllm-engine = { workspace = true, optional = true }
+vllm-common = { workspace = true, optional = true }
+pollster = { version = "0.4", optional = true }
+
 # Native-only deps for model download
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 hf-hub.workspace = true
 tokenizers.workspace = true
+ureq = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

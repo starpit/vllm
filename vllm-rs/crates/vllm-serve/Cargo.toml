@@ -11,6 +11,7 @@ cuda = ["vllm-executor/cuda", "vllm-kernels/cuda"]
 nccl = ["cuda", "vllm-kernels/nccl"]
 profiling = ["vllm-executor/profiling", "vllm-kernels/profiling"]
 metal = ["vllm-mlx"]
+wgpu = ["vllm-wgpu"]
 guided-decoding = ["vllm-executor/guided-decoding", "vllm-mlx?/guided-decoding"]
 multimodal = ["vllm-model/multimodal"]
 chat-template = ["minijinja", "minijinja-contrib", "chrono"]
@@ -28,6 +29,7 @@ vllm-executor = { workspace = true }
 vllm-model = { workspace = true }
 vllm-kernels = { workspace = true }
 vllm-mlx = { workspace = true, optional = true }
+vllm-wgpu = { workspace = true, optional = true, features = ["worker"] }
 candle-core = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }

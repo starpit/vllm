@@ -1,0 +1,23 @@
+// Broadcast add: c[i] = a[i] + b[i % D]
+// a: [M, D], b: [D] → c: [M, D]
+
+struct Params {
+    total: u32,
+    D: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if idx >= params.total {
+        return;
+    }
+    c[idx] = a[idx] + b[idx % params.D];
+}

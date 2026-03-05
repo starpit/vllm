@@ -181,7 +181,11 @@ impl VocabParallelEmbedding {
         let in_range = local_ids
             .ge(0i64)
             .map_err(ModelError::Candle)?
-            .mul(&local_ids.lt(self.shard_size_i64).map_err(ModelError::Candle)?)
+            .mul(
+                &local_ids
+                    .lt(self.shard_size_i64)
+                    .map_err(ModelError::Candle)?,
+            )
             .map_err(ModelError::Candle)?;
 
         // Clamp local IDs to valid range for lookup (out-of-range will be zeroed).

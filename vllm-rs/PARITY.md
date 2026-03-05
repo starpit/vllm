@@ -53,13 +53,14 @@
 | CPU inference | ✅ | ✅ | Rust uses candle; Python uses PyTorch CPU |
 | NVIDIA CUDA | ✅ | ✅ | Rust verified on L40S (SM89) |
 | Apple Metal (MLX) | ❌ | ✅ | Rust-only; `--features metal` via mlx-rs |
+| WebGPU (wgpu) | ❌ | ✅ | Rust-only; `--features wgpu` via wgpu-rs (Metal/Vulkan/DX12); ~51 tok/s Qwen2.5-0.5B on M1 Max |
 | AMD ROCm / HIP | ✅ | ❌ |  |
 | Google TPU | ✅ | ❌ |  |
 | Intel XPU (Arc / Data Center) | ✅ | ❌ |  |
 | AWS Neuron / Inferentia | ✅ | ❌ | Via plugin |
 | Intel OpenVINO | ✅ | ❌ | Via plugin |
 | Habana Gaudi (HPU) | ✅ | ❌ | Via plugin |
-| Device auto-detection | ✅ | ✅ | Rust: Metal > CUDA > CPU |
+| Device auto-detection | ✅ | ✅ | Rust: Metal > CUDA > wgpu > CPU |
 
 ---
 

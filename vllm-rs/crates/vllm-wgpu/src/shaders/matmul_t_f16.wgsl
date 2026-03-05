@@ -1,6 +1,6 @@
-// Tiled matrix multiplication with B transposed: C = A * B^T
-// A: [M, K], B: [N, K] (stored row-major), C: [M, N]
-// Uses 16×16 tiles in workgroup shared memory for better GPU utilization.
+// Tiled matrix multiplication with B transposed and f16-packed: C = A * B^T
+// A: [M, K] f32, B: [N, K] stored as packed f16×2 (row-major, K packed), C: [M, N] f32
+// B buffer is array<u32> with shape [N, K/2] — each u32 = pack(B[n,2k], B[n,2k+1])
 
 struct Params {
     M: u32,
@@ -10,7 +10,7 @@ struct Params {
 }
 
 @group(0) @binding(0) var<storage, read> a: array<f32>;
-@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<u32>;  // packed f16×2
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
 
@@ -30,6 +30,8 @@ fn main(
     let lr = lid.x;
     let lc = lid.y;
 
+    let k_half = params.K / 2u;
+
     var sum: f32 = 0.0;
     let num_tiles = (params.K + TILE - 1u) / TILE;
 
@@ -42,10 +44,16 @@ fn main(
             tile_a[lr * TILE + lc] = 0.0;
         }
 
-        // Load tile of B^T: B is [N, K], so B^T[k, col] = B[col, k]
+        // Load tile of B^T: B is [N, K] packed, so B^T[k, col] = B[col, k]
         let b_k = t * TILE + lr;
         if col < params.N && b_k < params.K {
-            tile_b[lr * TILE + lc] = b[col * params.K + b_k];
+            let packed = b[col * k_half + b_k / 2u];
+            let pair = unpack2x16float(packed);
+            if b_k % 2u == 0u {
+                tile_b[lr * TILE + lc] = pair.x;
+            } else {
+                tile_b[lr * TILE + lc] = pair.y;
+            }
         } else {
             tile_b[lr * TILE + lc] = 0.0;
         }

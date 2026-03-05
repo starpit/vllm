@@ -63,16 +63,15 @@ impl BrowserEngine {
     }
 
     /// Prefill: process all prompt tokens to build KV cache.
+    /// Uses batched forward pass for all tokens in a single GPU submission.
     pub async fn prefill(&mut self) -> Result<(), String> {
         self.prefill_pos = 0;
-        for i in 0..self.token_ids.len() {
-            let _next = self
-                .worker
-                .forward_one(self.token_ids[i], i)
-                .await
-                .map_err(|e| format!("{e}"))?;
-            self.prefill_pos = i + 1;
-        }
+        let _next = self
+            .worker
+            .forward_batch(&self.token_ids, 0)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        self.prefill_pos = self.token_ids.len();
         self.stats.seq_position = self.token_ids.len();
         self.stats.kv_cache_used = self.token_ids.len();
         Ok(())

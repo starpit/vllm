@@ -519,10 +519,18 @@ mod fused_rope {
             let rotary_dim = cache_layout.shape().dims()[1];
 
             // Get raw pointers.
-            let q_slice = q_cuda.as_cuda_slice::<T>()?.slice(q_layout.start_offset()..);
-            let k_slice = k_cuda.as_cuda_slice::<T>()?.slice(k_layout.start_offset()..);
-            let pos_slice = pos_cuda.as_cuda_slice::<u32>()?.slice(pos_layout.start_offset()..);
-            let cache_slice = cache_cuda.as_cuda_slice::<T>()?.slice(cache_layout.start_offset()..);
+            let q_slice = q_cuda
+                .as_cuda_slice::<T>()?
+                .slice(q_layout.start_offset()..);
+            let k_slice = k_cuda
+                .as_cuda_slice::<T>()?
+                .slice(k_layout.start_offset()..);
+            let pos_slice = pos_cuda
+                .as_cuda_slice::<u32>()?
+                .slice(pos_layout.start_offset()..);
+            let cache_slice = cache_cuda
+                .as_cuda_slice::<T>()?
+                .slice(cache_layout.start_offset()..);
 
             // Allocate separate output buffers.
             let q_dst = unsafe { dev.alloc::<T>(q_elem)? };
@@ -540,11 +548,19 @@ mod fused_rope {
                 let q_bytes = q_elem * std::mem::size_of::<T>();
                 let k_bytes = k_elem * std::mem::size_of::<T>();
                 cudarc::driver::result::memcpy_dtod_async(
-                    q_dst_ptr, q_src_ptr, q_bytes, stream.cu_stream(),
-                ).map_err(|e| candle_core::Error::Msg(format!("dtod Q: {e}")))?;
+                    q_dst_ptr,
+                    q_src_ptr,
+                    q_bytes,
+                    stream.cu_stream(),
+                )
+                .map_err(|e| candle_core::Error::Msg(format!("dtod Q: {e}")))?;
                 cudarc::driver::result::memcpy_dtod_async(
-                    k_dst_ptr, k_src_ptr, k_bytes, stream.cu_stream(),
-                ).map_err(|e| candle_core::Error::Msg(format!("dtod K: {e}")))?;
+                    k_dst_ptr,
+                    k_src_ptr,
+                    k_bytes,
+                    stream.cu_stream(),
+                )
+                .map_err(|e| candle_core::Error::Msg(format!("dtod K: {e}")))?;
 
                 // Single kernel launch for both Q and K.
                 match q.dtype() {
@@ -616,8 +632,12 @@ mod fused_rope {
 
         match q.dtype() {
             candle_core::DType::F32 => fwd_t::<f32>(&q, &k, &positions, cos_sin_cache, head_size),
-            candle_core::DType::F16 => fwd_t::<half::f16>(&q, &k, &positions, cos_sin_cache, head_size),
-            candle_core::DType::BF16 => fwd_t::<half::bf16>(&q, &k, &positions, cos_sin_cache, head_size),
+            candle_core::DType::F16 => {
+                fwd_t::<half::f16>(&q, &k, &positions, cos_sin_cache, head_size)
+            }
+            candle_core::DType::BF16 => {
+                fwd_t::<half::bf16>(&q, &k, &positions, cos_sin_cache, head_size)
+            }
             dt => candle_core::bail!("fused RoPE QK unsupported dtype {dt:?}"),
         }
     }

@@ -254,8 +254,8 @@
 |---|:---:|:---:|---|
 | Scaled dot-product (CPU) | ✅ | ✅ |  |
 | FlashAttention-2 (single sequence) | ✅ | ✅ | Rust: CUDA only |
-| FlashAttention-2 varlen (batched prefill) | ✅ | ✅ |  |
-| Paged FlashAttention-2 (batched decode) | ✅ | ✅ | Rust: forked candle-flash-attn |
+| FlashAttention-2 varlen (batched prefill) | ✅ | ✅ | Rust: used as non-CUDA fallback |
+| Paged FlashAttention-2 (all batches) | ✅ | ✅ | Rust: prefill + decode + mixed; forked candle-flash-attn |
 | FlashAttention-3 | ✅ | ❌ |  |
 | FlashInfer | ✅ | ❌ |  |
 | Triton attention | ✅ | ❌ |  |
@@ -463,7 +463,7 @@
 | `reshape_and_cache` | ✅ | ✅ |  |
 | MoE top-k gating | ✅ | ✅ |  |
 | GPU sampling (Gumbel-max) | ✅ | ✅ |  |
-| FlashAttention-2 (paged) | ✅ | ✅ | Forked candle-flash-attn |
+| FlashAttention-2 (paged prefill+decode) | ✅ | ✅ | Forked candle-flash-attn |
 | Paged attention v1/v2 (PagedAttention) | ✅ | ❌ |  |
 | `silu_and_mul` fused activation | ✅ | ✅ | Vectorized 128-bit loads; combined gate_up variant |
 | `gelu_and_mul` fused activation | ✅ | ✅ | Vectorized 128-bit loads; combined gate_up variant |

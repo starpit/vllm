@@ -1285,3 +1285,36 @@ pub fn flash_attn_varlen_paged(
     };
     q.apply_op3(k_cache, v_cache, op)
 }
+
+/// Paged flash attention with sliding window support.
+///
+/// Same as `flash_attn_varlen_paged` but accepts explicit `window_size_left`
+/// and `window_size_right` parameters for sliding window attention.
+pub fn flash_attn_varlen_paged_windowed(
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    seqlens_q: &Tensor,
+    seqlens_k: &Tensor,
+    block_table: &Tensor,
+    page_block_size: usize,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    window_size_left: Option<usize>,
+    window_size_right: Option<usize>,
+) -> Result<Tensor> {
+    let op = FlashAttnPagedVarLen {
+        softmax_scale,
+        max_seqlen_q,
+        max_seqlen_k,
+        seqlens_q: seqlens_q.clone(),
+        seqlens_k: seqlens_k.clone(),
+        window_size_left,
+        window_size_right,
+        block_table: block_table.clone(),
+        page_block_size,
+        num_splits: 0,
+    };
+    q.apply_op3(k_cache, v_cache, op)
+}

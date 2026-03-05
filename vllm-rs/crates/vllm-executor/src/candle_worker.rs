@@ -145,12 +145,6 @@ pub struct CandleWorker {
     /// Per-request contiguous KV cache for CUDA decode optimization.
     ///
     /// Pre-allocated buffers that use in-place CUDA writes (reshape_and_cache)
-    /// to eliminate GPU memory allocation during decode. Each buffer is
-    /// allocated once on prefill and reused for all subsequent decode steps.
-    ///
-    /// Only populated on CUDA with BF16/FP16 (FA2 path).
-    #[cfg(feature = "cuda")]
-    contiguous_kv_cache: HashMap<String, Vec<Option<vllm_models::ContiguousKvBuffer>>>,
     /// CUDA graph runner for decode acceleration (None if not CUDA or disabled).
     #[cfg(feature = "cuda")]
     cuda_graph_runner: Option<crate::cuda_graph::CudaGraphRunner>,
@@ -332,8 +326,6 @@ impl CandleWorker {
             mm_data_map: HashMap::new(),
             is_pooling,
             resolved_architecture: None,
-            #[cfg(feature = "cuda")]
-            contiguous_kv_cache: HashMap::new(),
             #[cfg(feature = "cuda")]
             cuda_graph_runner: None,
             #[cfg(feature = "cuda")]
@@ -1811,8 +1803,6 @@ impl Worker for CandleWorker {
             self.sampling_params_map.remove(req_id);
             self.kv_caches.remove(req_id);
             self.recurrent_states.remove(req_id);
-            #[cfg(feature = "cuda")]
-            self.contiguous_kv_cache.remove(req_id);
             #[cfg(feature = "guided-decoding")]
             self.grammar_states.remove(req_id);
             self.mm_data_map.remove(req_id);
@@ -2040,16 +2030,6 @@ impl Worker for CandleWorker {
             #[cfg(not(feature = "cuda"))]
             let cuda_graph_logits: Option<Tensor> = None;
 
-            // Build BatchedKvCacheStorage.
-            // On CUDA: inject pre-allocated contiguous KV buffers to avoid
-            // O(seq_len) block gathers and per-step GPU memory allocation.
-            #[cfg(feature = "cuda")]
-            let contiguous_kv: Vec<_> = prepared
-                .req_inputs
-                .iter()
-                .map(|r| self.contiguous_kv_cache.remove(&r.req_id))
-                .collect();
-
             let pool = self.kv_block_pool.as_mut().unwrap();
 
             let all_logits_flat = if let Some(graph_logits) = cuda_graph_logits {
@@ -2059,14 +2039,6 @@ impl Worker for CandleWorker {
                 let batch_block_ids = std::mem::take(&mut prepared.attn_meta.block_ids);
                 let batch_tokens_before = std::mem::take(&mut prepared.attn_meta.tokens_before);
 
-                #[cfg(feature = "cuda")]
-                let mut batched_storage = vllm_models::BatchedKvCacheStorage::with_contiguous_kv(
-                    pool,
-                    batch_block_ids,
-                    batch_tokens_before,
-                    contiguous_kv,
-                );
-                #[cfg(not(feature = "cuda"))]
                 let mut batched_storage = vllm_models::BatchedKvCacheStorage::new(
                     pool,
                     batch_block_ids,
@@ -2079,31 +2051,11 @@ impl Worker for CandleWorker {
                     ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
                 })?;
 
-                // Extract updated contiguous KV buffers for persistence.
-                #[cfg(feature = "cuda")]
-                {
-                    let updated_kv = batched_storage.take_all_contiguous_kv();
-                    for (i, kv) in updated_kv.into_iter().enumerate() {
-                        if let Some(kv_vec) = kv {
-                            self.contiguous_kv_cache
-                                .insert(prepared.req_inputs[i].req_id.clone(), kv_vec);
-                        }
-                    }
-                }
-
                 graph_logits
             } else {
                 // Eager forward path (no CUDA graph or not all-decode).
                 // BatchedKvCacheStorage borrows block_ids/tokens_before from
                 // attn_meta via clone, since attn_meta is still needed during forward.
-                #[cfg(feature = "cuda")]
-                let mut batched_storage = vllm_models::BatchedKvCacheStorage::with_contiguous_kv(
-                    pool,
-                    prepared.attn_meta.block_ids.clone(),
-                    prepared.attn_meta.tokens_before.clone(),
-                    contiguous_kv,
-                );
-                #[cfg(not(feature = "cuda"))]
                 let mut batched_storage = vllm_models::BatchedKvCacheStorage::new(
                     pool,
                     prepared.attn_meta.block_ids.clone(),
@@ -2125,25 +2077,14 @@ impl Worker for CandleWorker {
                         })?
                 };
 
-                // Flush deferred scatters.
+                // Flush deferred scatters (non-CUDA path only — the CUDA paged
+                // FA2 path writes directly to the pool via reshape_and_cache).
                 {
                     #[cfg(feature = "profiling")]
                     let _kv_guard = vllm_kernels::profiling::range("kv_flush");
                     batched_storage.flush_all().map_err(|e| {
                         ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
                     })?;
-                }
-
-                // Extract updated contiguous KV buffers for persistence.
-                #[cfg(feature = "cuda")]
-                {
-                    let updated_kv = batched_storage.take_all_contiguous_kv();
-                    for (i, kv) in updated_kv.into_iter().enumerate() {
-                        if let Some(kv_vec) = kv {
-                            self.contiguous_kv_cache
-                                .insert(prepared.req_inputs[i].req_id.clone(), kv_vec);
-                        }
-                    }
                 }
 
                 logits

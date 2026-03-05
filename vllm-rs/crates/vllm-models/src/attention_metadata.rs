@@ -53,6 +53,11 @@ pub struct AttentionMetadata {
     /// Cached to avoid per-layer H2D copies (28 layers × 128 decode steps).
     #[cfg(feature = "cuda")]
     decode_slot_mapping_cache: OnceCell<Tensor>,
+    /// Full slot_mapping as a GPU tensor: `[total_tokens]` i64.
+    /// Maps every token (prefill + decode) to its flat cache slot in the paged pool.
+    /// Cached to avoid per-layer H2D copies.
+    #[cfg(feature = "cuda")]
+    slot_mapping_cache: OnceCell<Tensor>,
 }
 
 impl std::fmt::Debug for AttentionMetadata {
@@ -90,6 +95,8 @@ impl Clone for AttentionMetadata {
             block_table_cache: OnceCell::new(),
             #[cfg(feature = "cuda")]
             decode_slot_mapping_cache: OnceCell::new(),
+            #[cfg(feature = "cuda")]
+            slot_mapping_cache: OnceCell::new(),
         }
     }
 }
@@ -124,6 +131,8 @@ impl AttentionMetadata {
             block_table_cache: OnceCell::new(),
             #[cfg(feature = "cuda")]
             decode_slot_mapping_cache: OnceCell::new(),
+            #[cfg(feature = "cuda")]
+            slot_mapping_cache: OnceCell::new(),
         }
     }
 
@@ -312,6 +321,50 @@ impl AttentionMetadata {
         let t = Tensor::new(slots.as_slice(), device)?;
         let _ = self.decode_slot_mapping_cache.set(t);
         Ok(self.decode_slot_mapping_cache.get().unwrap())
+    }
+
+    /// Build and cache the full slot_mapping as a GPU i64 tensor.
+    ///
+    /// Returns a tensor of shape `[total_tokens]` where every token in every
+    /// request (prefill and decode) is mapped to its flat cache slot in the
+    /// paged block pool: `block_ids[block_offset] * block_size + pos_in_block`.
+    ///
+    /// For decode requests (q_len=1), `tokens_before` is the global position.
+    /// For prefill requests (q_len>1), positions `tokens_before..tokens_before+q_len`
+    /// are mapped.
+    ///
+    /// Cached per step to avoid per-layer H2D copies.
+    #[cfg(feature = "cuda")]
+    pub fn slot_mapping_gpu(
+        &self,
+        block_size: usize,
+        device: &Device,
+    ) -> candle_core::Result<&Tensor> {
+        if let Some(t) = self.slot_mapping_cache.get() {
+            return Ok(t);
+        }
+
+        let mut slots = Vec::with_capacity(self.total_tokens);
+        for req_idx in 0..self.num_reqs {
+            let q_len = self.q_lens[req_idx];
+            let tokens_before = self.tokens_before[req_idx];
+            let block_ids = &self.block_ids[req_idx];
+            for token_offset in 0..q_len {
+                let global_pos = tokens_before + token_offset;
+                let block_offset = global_pos / block_size;
+                let position_in_block = global_pos % block_size;
+                if block_offset < block_ids.len() {
+                    let bid = block_ids[block_offset];
+                    slots.push((bid * block_size + position_in_block) as i64);
+                } else {
+                    slots.push(-1);
+                }
+            }
+        }
+
+        let t = Tensor::new(slots.as_slice(), device)?;
+        let _ = self.slot_mapping_cache.set(t);
+        Ok(self.slot_mapping_cache.get().unwrap())
     }
 }
 

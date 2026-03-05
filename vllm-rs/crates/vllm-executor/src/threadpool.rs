@@ -3,10 +3,9 @@
 
 //! Thread-pool executor for multi-GPU tensor parallelism.
 //!
-//! Unlike `MultiprocExecutor` (which uses tokio tasks), this executor gives
-//! each worker a dedicated OS thread. This is essential for NCCL: collectives
-//! like all-reduce block until all ranks participate, so each rank must run
-//! on its own OS thread to avoid deadlock.
+//! Thread-pool executor giving each worker a dedicated OS thread. This is
+//! essential for NCCL: collectives like all-reduce block until all ranks
+//! participate, so each rank must run on its own OS thread to avoid deadlock.
 //!
 //! # Architecture
 //!

@@ -9,8 +9,7 @@
 //!   Port of `vllm/v1/worker/worker_base.py`.
 //! * [`uniproc`] -- `UniProcExecutor`: single-process executor wrapping one worker.
 //!   Port of `vllm/v1/executor/uniproc_executor.py`.
-//! * [`multiproc`] -- `MultiprocExecutor`: multi-process executor managing worker processes.
-//!   Port of `vllm/v1/executor/multiproc_executor.py`.
+//! * [`threadpool`] -- `ThreadPoolExecutor`: thread-pool executor for multi-GPU TP.
 //! * [`parallel`] -- Distributed parallel state types (TP/PP groups, rank management).
 //! * [`error`] -- Executor-specific error types.
 
@@ -19,7 +18,6 @@ pub mod candle_worker;
 pub mod cuda_graph;
 pub mod error;
 pub mod input_batch;
-pub mod multiproc;
 pub mod parallel;
 pub mod threadpool;
 pub mod uniproc;

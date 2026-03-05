@@ -598,7 +598,7 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
 }
 
 /// Multi-GPU init flow: creates N CandleWorkers (one per GPU rank), inits NCCL,
-/// and wraps them in a MultiprocExecutor.
+/// and wraps them in a ThreadPoolExecutor.
 ///
 /// Each worker loads the full model weights and keeps only its shard
 /// (via ColumnParallelLinear/RowParallelLinear sharding at load time).
@@ -679,7 +679,7 @@ fn initialize_stack_tp(
     // that created them for collective synchronization).
     //
     // After init, workers are moved back to the main thread and wrapped
-    // in the MultiprocExecutor.
+    // in the ThreadPoolExecutor.
     info!(
         "Initializing {} workers on dedicated GPU threads...",
         local_tp
@@ -688,6 +688,23 @@ fn initialize_stack_tp(
     // Use a barrier so rank 0 downloads/loads first (caching model files),
     // then other ranks proceed (finding cached files, no lock contention).
     let download_barrier = std::sync::Arc::new(std::sync::Barrier::new(local_tp));
+
+    // Log NCCL-relevant env vars for debuggability.
+    #[cfg(feature = "nccl")]
+    {
+        for var in [
+            "NCCL_DEBUG",
+            "NCCL_SOCKET_IFNAME",
+            "NCCL_SHM_DISABLE",
+            "NCCL_P2P_DISABLE",
+            "NCCL_IB_DISABLE",
+            "NCCL_NET_GDR_LEVEL",
+        ] {
+            if let Ok(val) = std::env::var(var) {
+                info!("NCCL env: {var}={val}");
+            }
+        }
+    }
 
     #[cfg(feature = "nccl")]
     let nccl_id = {

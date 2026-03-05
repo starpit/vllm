@@ -53,8 +53,39 @@ impl NcclProcessGroup {
             }
         };
 
-        let comm = cudarc::nccl::Comm::from_rank(stream, rank, world_size, nccl_id)
-            .map_err(|e| KernelError::Other(format!("NCCL comm_init_rank failed: {e:?}")))?;
+        let comm =
+            cudarc::nccl::Comm::from_rank(stream, rank, world_size, nccl_id).map_err(|e| {
+                let mut msg = format!(
+                    "NCCL comm_init_rank failed (rank={rank}, world_size={world_size}): {e:?}"
+                );
+                #[cfg(target_os = "linux")]
+                {
+                    // NCCL uses /dev/shm for inter-process communication.
+                    // Check if it exists and has space.
+                    let shm = std::path::Path::new("/dev/shm");
+                    if !shm.exists() {
+                        msg.push_str(
+                            "\n  hint: /dev/shm does not exist — NCCL requires shared memory",
+                        );
+                    } else if let Ok(entries) = std::fs::read_dir(shm) {
+                        let nccl_count = entries
+                            .flatten()
+                            .filter(|e| {
+                                e.file_name()
+                                    .to_str()
+                                    .is_some_and(|n| n.starts_with("nccl-"))
+                            })
+                            .count();
+                        if nccl_count > 0 {
+                            msg.push_str(&format!(
+                                "\n  hint: found {nccl_count} stale nccl-* files in /dev/shm — \
+                                 try removing them: rm /dev/shm/nccl-*"
+                            ));
+                        }
+                    }
+                }
+                KernelError::Other(msg)
+            })?;
 
         Ok(Self {
             comm,
@@ -88,7 +119,7 @@ impl NcclProcessGroup {
     ///
     /// Unlike `from_devices` (which uses `comm_init_all` and ties comms to
     /// the calling thread), these communicators work correctly when used
-    /// from separate threads (e.g. tokio worker tasks in MultiprocExecutor).
+    /// from separate threads (e.g. worker threads in ThreadPoolExecutor).
     pub fn from_device_ordinals(
         cuda_ordinals: &[usize],
         base_rank: usize,

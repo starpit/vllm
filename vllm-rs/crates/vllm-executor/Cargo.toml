@@ -26,6 +26,7 @@ tokenizers = { workspace = true }
 hf-hub = { workspace = true }
 indicatif = { workspace = true }
 tokio = { workspace = true }
+anyhow = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
@@ -33,6 +34,7 @@ serde_json = { workspace = true }
 libc = { workspace = true }
 cudarc = { workspace = true, optional = true }
 rand = { workspace = true }
+bincode = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

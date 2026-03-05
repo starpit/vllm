@@ -13,7 +13,7 @@ Multi-GPU & Distribution,Tensor parallelism (TP),yes,yes,,Rust: NCCL all-reduce 
 Multi-GPU & Distribution,Pipeline parallelism (PP),yes,no,,,
 Multi-GPU & Distribution,Data parallelism (DP),yes,no,,,
 Multi-GPU & Distribution,Expert parallelism (EP) for MoE,yes,no,,,
-Multi-GPU & Distribution,Multi-node distributed inference,yes,partial,,Rust: TCP rendezvous + NCCL ID distribution; needs control channel for headless nodes,
+Multi-GPU & Distribution,Multi-node distributed inference,yes,yes,,Rust: TCP rendezvous + NCCL + headless worker mode with bincode control channel,
 Multi-GPU & Distribution,NCCL custom all-reduce,yes,no,,,
 Multi-GPU & Distribution,Prefill context parallelism,yes,no,,,
 Multi-GPU & Distribution,Decode context parallelism,yes,no,,,

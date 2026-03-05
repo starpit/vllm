@@ -17,6 +17,7 @@ use vllm_config::{CudaGraphConfig, SchedulerConfig, SchedulerPolicy};
 use vllm_engine::core_client::InprocClient;
 use vllm_engine::engine_core::EngineCoreConfig;
 use vllm_executor::candle_worker::{CandleWorker, CandleWorkerConfig};
+use vllm_executor::multinode::MultiNodeExecutor;
 use vllm_executor::parallel::ResolvedParallelConfig;
 use vllm_executor::threadpool::ThreadPoolExecutor;
 use vllm_executor::uniproc::UniProcExecutor;
@@ -833,6 +834,19 @@ fn initialize_stack_tp(
     let parallel_config = ResolvedParallelConfig::tensor_parallel(tp_size, 0);
     let mut executor = ThreadPoolExecutor::new(all_workers, parallel_config);
 
+    // Headless worker mode: node_rank > 0 enters a blocking loop receiving
+    // SchedulerOutput from the master node. Never returns (until shutdown).
+    if num_nodes > 1 && node_rank > 0 {
+        let control_port = config.master_port + 1;
+        info!(
+            "Node rank {}: entering headless worker mode (control port {})",
+            node_rank, control_port
+        );
+        crate::headless::run_headless(executor, &config.master_addr, control_port)?;
+        // run_headless only returns on shutdown — exit cleanly.
+        std::process::exit(0);
+    }
+
     // Determine available memory via executor (dispatches to worker tasks,
     // which run on the correct CUDA context).
     use vllm_engine::executor::Executor;
@@ -849,7 +863,8 @@ fn initialize_stack_tp(
         config.gpu_memory_utilization,
     );
 
-    // Initialize cache on all workers via executor.
+    // Initialize cache on all workers via executor (also broadcasts to remotes
+    // if multi-node).
     executor
         .initialize_cache(num_gpu_blocks, 0)
         .context("failed to initialize cache")?;
@@ -920,7 +935,17 @@ fn initialize_stack_tp(
         enable_prefix_caching: config.enable_prefix_caching,
     };
 
-    let client = Box::new(InprocClient::new(engine_config, Box::new(executor)));
+    // Multi-node master: wrap executor to broadcast SchedulerOutput to remotes.
+    let boxed_executor: Box<dyn Executor> = if num_nodes > 1 && node_rank == 0 {
+        let control_port = config.master_port + 1;
+        let mn = MultiNodeExecutor::accept_remotes(executor, control_port, num_nodes - 1)
+            .context("failed to accept remote nodes")?;
+        Box::new(mn)
+    } else {
+        Box::new(executor)
+    };
+
+    let client = Box::new(InprocClient::new(engine_config, boxed_executor));
 
     // Load tokenizer from model directory.
     let loaded_tokenizer = preloaded_tokenizer

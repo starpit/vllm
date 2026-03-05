@@ -11,7 +11,7 @@
 ///
 /// During tokenization, image placeholder tokens are expanded to `length` copies.
 /// The vision encoder's output embeddings replace tokens at `offset..offset+length`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PlaceholderRange {
     /// Start position in the token ID sequence.
     pub offset: usize,
@@ -24,7 +24,7 @@ pub struct PlaceholderRange {
 /// Pixels are stored as a flat `Vec<f32>` in `[C, H, W]` (channels-first) layout,
 /// normalized to the range expected by the vision encoder (e.g., `(pixel/255 - 0.5) / 0.5`
 /// for SigLIP).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImageData {
     /// Pixel values in `[3, height, width]` CHW layout, normalized.
     pub pixels: Vec<f32>,
@@ -39,7 +39,7 @@ pub struct ImageData {
 /// Contains preprocessed images and their corresponding placeholder ranges
 /// within the token sequence. Workers convert `ImageData` to backend tensors
 /// and pass them through the vision encoder during the prefill step.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MultimodalData {
     /// Preprocessed images (one per image in the request).
     pub images: Vec<ImageData>,

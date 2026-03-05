@@ -18,6 +18,7 @@ pub mod candle_worker;
 pub mod cuda_graph;
 pub mod error;
 pub mod input_batch;
+pub mod multinode;
 pub mod parallel;
 pub mod threadpool;
 pub mod uniproc;

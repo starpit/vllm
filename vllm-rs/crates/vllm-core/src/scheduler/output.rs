@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
 use vllm_common::SamplingParams;
 use vllm_common::multimodal::MultimodalData;
 
@@ -22,7 +23,7 @@ use vllm_common::multimodal::MultimodalData;
 /// (see [`CachedRequestData`]).
 ///
 /// Ported from the Python `NewRequestData` dataclass.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewRequestData {
     /// Unique request identifier.
     pub req_id: String,
@@ -77,7 +78,7 @@ impl NewRequestData {
 /// send the diff to minimize communication cost.
 ///
 /// Ported from the Python `CachedRequestData` dataclass.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedRequestData {
     /// Request IDs in the order they appear in this batch.
     pub req_ids: Vec<String>,
@@ -127,7 +128,7 @@ impl CachedRequestData {
 /// The output of a single scheduling step.
 ///
 /// Ported from the Python `SchedulerOutput` dataclass.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerOutput {
     /// Requests scheduled for the first time in this step.
     pub scheduled_new_reqs: Vec<NewRequestData>,

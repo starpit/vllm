@@ -14,6 +14,7 @@ pub mod chat_template;
 pub mod detokenizer;
 pub mod engine;
 pub mod error;
+pub mod headless;
 pub mod init;
 pub mod llm;
 #[cfg(feature = "metrics")]

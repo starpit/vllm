@@ -13,15 +13,23 @@ vllm-wgpu = { path = "../vllm-wgpu" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing.workspace = true
+tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }
 
 # WASM deps (used by lib.rs wasm_bindgen exports)
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
     "console",
+    "CssStyleDeclaration",
     "Document",
     "Element",
+    "EventTarget",
     "HtmlElement",
+    "HtmlInputElement",
+    "HtmlTextAreaElement",
+    "HtmlSelectElement",
+    "HtmlButtonElement",
+    "KeyboardEvent",
     "Window",
     "Performance",
     "Headers",
@@ -29,6 +37,8 @@ web-sys = { version = "0.3", features = [
     "RequestInit",
     "RequestMode",
     "Response",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
 ] }
 js-sys = "0.3"
 serde-wasm-bindgen = "0.6"

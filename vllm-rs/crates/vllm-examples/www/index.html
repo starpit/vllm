@@ -27,6 +27,10 @@
                     <span id="load-status"></span>
                 </div>
 
+                <div id="download-bar-container">
+                    <div id="download-progress"></div>
+                </div>
+
                 <div id="messages"></div>
 
                 <div id="input-area">
@@ -44,19 +48,19 @@
                     <h3>Generation</h3>
                     <div class="stat-row">
                         <span class="stat-label">Tokens/sec</span>
-                        <span id="stat-tps" class="stat-value">—</span>
+                        <span id="stat-tps" class="stat-value">&mdash;</span>
                     </div>
                     <div class="stat-row">
                         <span class="stat-label">Position</span>
-                        <span id="stat-position" class="stat-value">—</span>
+                        <span id="stat-position" class="stat-value">&mdash;</span>
                     </div>
                     <div class="stat-row">
                         <span class="stat-label">Last token</span>
-                        <span id="stat-last-token" class="stat-value">—</span>
+                        <span id="stat-last-token" class="stat-value">&mdash;</span>
                     </div>
                     <div class="stat-row">
                         <span class="stat-label">Probability</span>
-                        <span id="stat-prob" class="stat-value">—</span>
+                        <span id="stat-prob" class="stat-value">&mdash;</span>
                     </div>
                 </div>
 
@@ -75,7 +79,7 @@
                     <h3>Memory</h3>
                     <div class="stat-row">
                         <span class="stat-label">GPU buffers</span>
-                        <span id="stat-memory" class="stat-value">—</span>
+                        <span id="stat-memory" class="stat-value">&mdash;</span>
                     </div>
                 </div>
 
@@ -87,6 +91,9 @@
         </div>
     </div>
 
-    <script type="module" src="app.js"></script>
+    <script type="module">
+        import init from './pkg/vllm_examples.js';
+        await init();
+    </script>
 </body>
 </html>

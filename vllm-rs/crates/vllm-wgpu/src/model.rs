@@ -413,6 +413,23 @@ impl WgpuWorker {
         Ok((worker, config, tokenizer))
     }
 
+    /// Load model weights from raw safetensors byte slices (one per shard).
+    /// This is the WASM-friendly entry point — no filesystem access needed.
+    pub fn load_weights_from_bytes(&mut self, shard_bytes: &[&[u8]]) -> Result<(), String> {
+        let mut tensors: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
+        for (i, data) in shard_bytes.iter().enumerate() {
+            let st = safetensors::SafeTensors::deserialize(data)
+                .map_err(|e| format!("parse shard {i}: {e}"))?;
+            for name in st.names() {
+                let view = st.tensor(name).map_err(|e| format!("{name}: {e}"))?;
+                let shape: Vec<usize> = view.shape().to_vec();
+                let f32_data = safetensors_to_f32(view.dtype(), view.data(), &shape)?;
+                tensors.insert(name.to_string(), (shape, f32_data));
+            }
+        }
+        self.load_weights_from_tensors(tensors)
+    }
+
     /// Load model weights from a directory containing safetensors files.
     pub fn load_weights(&mut self, model_dir: &Path) -> Result<(), String> {
         let mut st_files: Vec<_> = std::fs::read_dir(model_dir)
@@ -439,7 +456,14 @@ impl WgpuWorker {
                 tensors.insert(name.to_string(), (shape, f32_data));
             }
         }
+        self.load_weights_from_tensors(tensors)
+    }
 
+    /// Core weight loading from a pre-parsed tensor map.
+    fn load_weights_from_tensors(
+        &mut self,
+        tensors: HashMap<String, (Vec<usize>, Vec<f32>)>,
+    ) -> Result<(), String> {
         let hidden = self.config.hidden_size;
         let num_q_heads = self.config.num_attention_heads;
         let num_kv_heads = self.config.num_kv_heads();

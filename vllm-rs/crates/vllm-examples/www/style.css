@@ -105,6 +105,20 @@ header h1 {
     color: var(--text-muted);
 }
 
+/* Download progress bar */
+#download-bar-container {
+    height: 3px;
+    background: var(--bg);
+    overflow: hidden;
+}
+
+#download-progress {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    transition: width 0.2s ease;
+}
+
 #messages {
     flex: 1;
     overflow-y: auto;

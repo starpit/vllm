@@ -20,3 +20,5 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 indicatif = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }

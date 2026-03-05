@@ -16,9 +16,9 @@ pub struct BenchCommand {
 pub enum BenchCommands {
     /// Measure latency (TTFT, ITL, throughput) for a model.
     Latency(Box<BenchLatencyArgs>),
-    /// Benchmark online serving throughput (not yet implemented).
+    /// Benchmark online serving (send requests to a running server).
     Serve(BenchServeArgs),
-    /// Benchmark offline throughput (not yet implemented).
+    /// Benchmark offline throughput (batch generation).
     Throughput(BenchThroughputArgs),
 }
 
@@ -152,10 +152,193 @@ impl BenchLatencyArgs {
     }
 }
 
-/// Arguments for `vllm bench serve` (stub).
+/// Arguments for `vllm bench throughput`.
+///
+/// Mirrors Python's `vllm bench throughput` — measures offline inference
+/// throughput by generating a batch of random-length prompts through the
+/// LLM engine and reporting requests/s and tokens/s.
 #[derive(Parser, Debug)]
-pub struct BenchServeArgs {}
+#[command(override_usage = "vllm bench throughput [MODEL] [OPTIONS]")]
+pub struct BenchThroughputArgs {
+    /// Model: local path or HuggingFace model ID (positional).
+    pub model_tag: Option<String>,
 
-/// Arguments for `vllm bench throughput` (stub).
+    /// Path to a local model directory, or HuggingFace model ID.
+    #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
+    pub dtype: String,
+
+    /// Number of prompts to process.
+    #[arg(long, default_value_t = 1000)]
+    pub num_prompts: usize,
+
+    /// Input prompt length for each request (tokens).
+    #[arg(long, default_value_t = 128)]
+    pub input_len: usize,
+
+    /// Output length for each request (tokens).
+    #[arg(long, default_value_t = 128)]
+    pub output_len: usize,
+
+    /// HuggingFace token.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Log level.
+    #[arg(long, default_value = "warn")]
+    pub log_level: String,
+
+    /// Fraction of GPU memory to use for KV cache (0.0–1.0).
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
+
+    /// Maximum model context length (overrides config.json).
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+
+    /// Maximum number of concurrent sequences.
+    #[arg(long, default_value_t = 256)]
+    pub max_num_seqs: usize,
+
+    /// KV cache block size in tokens.
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+
+    /// Number of GPUs for tensor parallelism.
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel_size: usize,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+
+    /// Path to write JSON results.
+    #[arg(long)]
+    pub output_json: Option<String>,
+
+    /// Do not detokenize responses.
+    #[arg(long)]
+    pub disable_detokenize: bool,
+
+    /// Disable CUDA graphs and run all steps eagerly.
+    #[arg(long)]
+    pub enforce_eager: bool,
+
+    /// Comma-separated list of batch sizes to capture as CUDA graphs.
+    #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
+    pub cuda_graph_sizes: String,
+
+    /// Enable prefix caching.
+    #[arg(long)]
+    pub enable_prefix_caching: bool,
+
+    /// Random seed for prompt generation.
+    #[arg(long, default_value_t = 0)]
+    pub seed: u64,
+}
+
+impl BenchThroughputArgs {
+    /// Resolve the model path/ID.
+    pub fn resolved_model(&self) -> Result<String, String> {
+        if let Some(ref tag) = self.model_tag {
+            Ok(tag.clone())
+        } else if let Some(ref m) = self.model {
+            Ok(m.clone())
+        } else {
+            Err("model is required: provide as positional arg or --model flag".to_string())
+        }
+    }
+}
+
+/// Arguments for `vllm bench serve`.
+///
+/// Mirrors Python's `vllm bench serve` — benchmarks online serving by
+/// sending concurrent HTTP requests to a running vLLM server and measuring
+/// TTFT, TPOT, ITL, and end-to-end latency.
 #[derive(Parser, Debug)]
-pub struct BenchThroughputArgs {}
+#[command(override_usage = "vllm bench serve [OPTIONS]")]
+pub struct BenchServeArgs {
+    /// Model name to use in API requests. If not specified, fetches the
+    /// first model from the server's /v1/models endpoint.
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Server base URL.
+    #[arg(long, default_value = "http://127.0.0.1:8000")]
+    pub base_url: String,
+
+    /// API endpoint path.
+    #[arg(long, default_value = "/v1/completions")]
+    pub endpoint: String,
+
+    /// Number of prompts to send.
+    #[arg(long, default_value_t = 1000)]
+    pub num_prompts: usize,
+
+    /// Input prompt length for each request (tokens).
+    #[arg(long, default_value_t = 128)]
+    pub input_len: usize,
+
+    /// Output length for each request (tokens).
+    #[arg(long, default_value_t = 128)]
+    pub output_len: usize,
+
+    /// Request rate (requests/sec). Use "inf" for all-at-once.
+    #[arg(long, default_value_t = f64::INFINITY)]
+    pub request_rate: f64,
+
+    /// Maximum number of concurrent requests.
+    #[arg(long)]
+    pub max_concurrency: Option<usize>,
+
+    /// Random seed.
+    #[arg(long, default_value_t = 0)]
+    pub seed: u64,
+
+    /// Disable tqdm-style progress bar.
+    #[arg(long)]
+    pub disable_tqdm: bool,
+
+    /// Path to save JSON results.
+    #[arg(long)]
+    pub output_json: Option<String>,
+
+    /// Comma-separated percentile metrics to report: ttft,tpot,itl,e2el.
+    #[arg(long, default_value = "ttft,tpot,itl")]
+    pub percentile_metrics: String,
+
+    /// Comma-separated percentiles to report (e.g. 50,90,99).
+    #[arg(long, default_value = "99")]
+    pub metric_percentiles: String,
+
+    /// Ignore EOS token (force generation to max output length).
+    #[arg(long)]
+    pub ignore_eos: bool,
+
+    /// Sampling temperature.
+    #[arg(long)]
+    pub temperature: Option<f64>,
+
+    /// Top-p sampling parameter.
+    #[arg(long)]
+    pub top_p: Option<f64>,
+
+    /// Top-k sampling parameter.
+    #[arg(long)]
+    pub top_k: Option<i32>,
+
+    /// API key for authentication.
+    #[arg(long, env = "OPENAI_API_KEY")]
+    pub api_key: Option<String>,
+
+    /// Disable SSL certificate verification.
+    #[arg(long)]
+    pub insecure: bool,
+}

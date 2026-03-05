@@ -8,6 +8,8 @@
 
 mod args;
 mod latency;
+mod serve;
+mod throughput;
 
 pub use args::{
     BenchCommand, BenchCommands, BenchLatencyArgs, BenchServeArgs, BenchThroughputArgs,
@@ -22,11 +24,10 @@ pub async fn run_bench(cmd: BenchCommand) -> anyhow::Result<()> {
             tokio::task::spawn_blocking(move || latency::run_bench_latency(*args)).await??;
             Ok(())
         }
-        BenchCommands::Serve(_) => {
-            anyhow::bail!("bench serve is not yet implemented");
-        }
-        BenchCommands::Throughput(_) => {
-            anyhow::bail!("bench throughput is not yet implemented");
+        BenchCommands::Serve(args) => serve::run_bench_serve(args).await,
+        BenchCommands::Throughput(args) => {
+            tokio::task::spawn_blocking(move || throughput::run_bench_throughput(args)).await??;
+            Ok(())
         }
     }
 }

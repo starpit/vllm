@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! Test server helper — starts the vLLM server in-process on a background task.
+//! Test server helper — starts the vLLM server in-process or as a child process.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,13 +15,32 @@ const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// Poll interval when waiting for /health.
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Whether to spawn a child process by default.
+fn should_spawn() -> bool {
+    if std::env::var("VLLM_TEST_SPAWN").as_deref() == Ok("1") {
+        return true;
+    }
+    cfg!(feature = "cuda")
+}
+
+/// Internal mode: how the server is running.
+enum TestServerMode {
+    InProcess {
+        step_handle: JoinHandle<()>,
+        server_handle: JoinHandle<()>,
+    },
+    ChildProcess {
+        child: std::process::Child,
+    },
+}
+
 /// A running vLLM server for E2E testing.
 ///
-/// The server runs in-process on a background tokio task. On drop, the task
-/// is aborted and the port is released.
+/// The server runs either in-process on a background tokio task, or as a
+/// spawned child process (for CUDA tests, to reclaim GPU memory between tests).
+/// On drop, the server is stopped and resources are released.
 pub struct TestServer {
-    step_handle: JoinHandle<()>,
-    server_handle: JoinHandle<()>,
+    mode: TestServerMode,
     port: u16,
     base_url: String,
 }
@@ -42,6 +61,7 @@ impl TestServer {
             tensor_parallel_size: 1,
             dtype: None,
             device: None,
+            spawn: should_spawn(),
         }
     }
 
@@ -58,8 +78,19 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        self.step_handle.abort();
-        self.server_handle.abort();
+        match &mut self.mode {
+            TestServerMode::InProcess {
+                step_handle,
+                server_handle,
+            } => {
+                step_handle.abort();
+                server_handle.abort();
+            }
+            TestServerMode::ChildProcess { child } => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 }
 
@@ -77,6 +108,7 @@ pub struct TestServerBuilder {
     dtype: Option<String>,
     device: Option<String>,
     tensor_parallel_size: usize,
+    spawn: bool,
 }
 
 impl TestServerBuilder {
@@ -148,8 +180,114 @@ impl TestServerBuilder {
         self
     }
 
-    /// Start the server in-process and wait for it to become healthy.
+    /// Enable or disable child-process spawning mode.
+    /// When enabled, the server runs as a separate OS process so GPU memory
+    /// is fully reclaimed on drop.
+    pub fn with_spawn(mut self, spawn: bool) -> Self {
+        self.spawn = spawn;
+        self
+    }
+
+    /// Start the server and wait for it to become healthy.
     pub async fn start(self) -> Result<TestServer> {
+        if self.spawn {
+            self.start_child_process().await
+        } else {
+            self.start_in_process().await
+        }
+    }
+
+    /// Start the server as a child process.
+    async fn start_child_process(self) -> Result<TestServer> {
+        let port = self.port.unwrap_or_else(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        });
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let binary = resolve_binary_path()?;
+
+        let mut cmd = std::process::Command::new(&binary);
+        cmd.arg("serve")
+            .arg(&self.model)
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string());
+
+        let dtype = self.dtype.as_deref().unwrap_or("auto");
+        cmd.arg("--dtype").arg(dtype);
+
+        let device = self.device.as_deref().unwrap_or("auto");
+        cmd.arg("--device").arg(device);
+
+        if self.tensor_parallel_size > 1 {
+            cmd.arg("--tensor-parallel-size")
+                .arg(self.tensor_parallel_size.to_string());
+        }
+
+        if let Some(ref parser) = self.tool_call_parser {
+            cmd.arg("--tool-call-parser").arg(parser);
+        }
+
+        if let Some(ref adapter) = self.lora_adapter {
+            cmd.arg("--lora-adapter").arg(adapter);
+        }
+
+        if let Some(ref strategy) = self.pooling_strategy {
+            cmd.arg("--pooling-strategy").arg(strategy);
+        }
+
+        if self.runner != "generate" {
+            cmd.arg("--runner").arg(&self.runner);
+        }
+
+        if self.disable_async_scheduling {
+            cmd.arg("--disable-async-scheduling");
+        }
+
+        for arg in &self.extra_args {
+            cmd.arg(arg);
+        }
+
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        tracing::info!("Spawning test server: {:?}", cmd);
+
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("failed to spawn vllm binary at {}", binary.display()))?;
+
+        let mut test_server = TestServer {
+            mode: TestServerMode::ChildProcess { child },
+            port,
+            base_url,
+        };
+
+        // Wait for the server to become healthy.
+        if let Err(e) = wait_for_health(&test_server.base_url, self.startup_timeout).await {
+            // On failure, dump child stderr for debugging.
+            if let TestServerMode::ChildProcess { child } = &mut test_server.mode {
+                let _ = child.kill();
+                if let Some(mut stderr) = child.stderr.take() {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    let _ = stderr.read_to_string(&mut buf);
+                    if !buf.is_empty() {
+                        eprintln!("=== Child server stderr ===\n{buf}\n=== End stderr ===");
+                    }
+                }
+            }
+            return Err(e);
+        }
+
+        tracing::info!("Test server (child process) healthy on port {port}");
+        Ok(test_server)
+    }
+
+    /// Start the server in-process and wait for it to become healthy.
+    async fn start_in_process(self) -> Result<TestServer> {
         // Initialize tracing. Silent by default; set RUST_LOG=info to see
         // download/loading progress. Idempotent — only the first call takes effect.
         vllm_common::telemetry::init_tracing("off");
@@ -233,8 +371,10 @@ impl TestServerBuilder {
         });
 
         let test_server = TestServer {
-            step_handle,
-            server_handle,
+            mode: TestServerMode::InProcess {
+                step_handle,
+                server_handle,
+            },
             port,
             base_url,
         };
@@ -245,6 +385,51 @@ impl TestServerBuilder {
         tracing::info!("Test server healthy on port {port}");
         Ok(test_server)
     }
+}
+
+/// Resolve the path to the `vllm` binary for child-process mode.
+fn resolve_binary_path() -> Result<std::path::PathBuf> {
+    // 1. Explicit env var override.
+    if let Ok(p) = std::env::var("VLLM_TEST_BINARY") {
+        let path = std::path::PathBuf::from(p);
+        if path.exists() {
+            return Ok(path);
+        }
+        anyhow::bail!(
+            "VLLM_TEST_BINARY set to {} but file not found",
+            path.display()
+        );
+    }
+
+    // 2. Walk up from the current exe dir to find `target/{profile}/vllm`.
+    //    Integration test binaries live in `target/{profile}/deps/`, so the
+    //    vllm binary is at `../vllm` relative to the test binary.
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+    {
+        let profile_dir = if dir.ends_with("deps") {
+            dir.parent().unwrap_or(&dir).to_path_buf()
+        } else {
+            dir
+        };
+        let candidate = profile_dir.join("vllm");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    // 3. Common fallback paths relative to workspace root.
+    for candidate in &["target/release/vllm", "target/debug/vllm"] {
+        let path = std::path::PathBuf::from(candidate);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    anyhow::bail!(
+        "Could not find the vllm binary. Set VLLM_TEST_BINARY or build with `cargo build -p vllm-cli`."
+    )
 }
 
 /// Poll the /health endpoint until it returns 200 or we time out.

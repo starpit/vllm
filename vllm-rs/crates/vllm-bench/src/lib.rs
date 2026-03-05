@@ -9,10 +9,13 @@
 mod args;
 mod latency;
 mod serve;
+mod startup;
+mod sweep;
 mod throughput;
 
 pub use args::{
-    BenchCommand, BenchCommands, BenchLatencyArgs, BenchServeArgs, BenchThroughputArgs,
+    BenchCommand, BenchCommands, BenchLatencyArgs, BenchServeArgs, BenchStartupArgs,
+    BenchThroughputArgs, SweepCommand, SweepCommands, SweepServeArgs, SweepStartupArgs,
 };
 
 /// Dispatch bench subcommands.
@@ -25,6 +28,14 @@ pub async fn run_bench(cmd: BenchCommand) -> anyhow::Result<()> {
             Ok(())
         }
         BenchCommands::Serve(args) => serve::run_bench_serve(args).await,
+        BenchCommands::Startup(args) => {
+            tokio::task::spawn_blocking(move || startup::run_bench_startup(args)).await??;
+            Ok(())
+        }
+        BenchCommands::Sweep(cmd) => {
+            tokio::task::spawn_blocking(move || sweep::run_bench_sweep(cmd)).await??;
+            Ok(())
+        }
         BenchCommands::Throughput(args) => {
             tokio::task::spawn_blocking(move || throughput::run_bench_throughput(args)).await??;
             Ok(())

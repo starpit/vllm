@@ -18,6 +18,10 @@ pub enum BenchCommands {
     Latency(Box<BenchLatencyArgs>),
     /// Benchmark online serving (send requests to a running server).
     Serve(BenchServeArgs),
+    /// Benchmark the startup time of vLLM models.
+    Startup(BenchStartupArgs),
+    /// Parameter sweep: run benchmarks over multiple configurations.
+    Sweep(SweepCommand),
     /// Benchmark offline throughput (batch generation).
     Throughput(BenchThroughputArgs),
 }
@@ -341,4 +345,199 @@ pub struct BenchServeArgs {
     /// Disable SSL certificate verification.
     #[arg(long)]
     pub insecure: bool,
+}
+
+/// Arguments for `vllm bench startup`.
+///
+/// Mirrors Python's `vllm bench startup` — measures cold and warm startup time
+/// by repeatedly constructing the LLM engine.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm bench startup [MODEL] [OPTIONS]")]
+pub struct BenchStartupArgs {
+    /// Model: local path or HuggingFace model ID (positional).
+    pub model_tag: Option<String>,
+
+    /// Path to a local model directory, or HuggingFace model ID.
+    #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
+    pub dtype: String,
+
+    /// Number of cold startup iterations.
+    #[arg(long, default_value_t = 3)]
+    pub num_iters_cold: usize,
+
+    /// Number of warmup iterations before benchmarking warm startups.
+    #[arg(long, default_value_t = 1)]
+    pub num_iters_warmup: usize,
+
+    /// Number of warm startup iterations.
+    #[arg(long, default_value_t = 3)]
+    pub num_iters_warm: usize,
+
+    /// HuggingFace token.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Log level.
+    #[arg(long, default_value = "warn")]
+    pub log_level: String,
+
+    /// Fraction of GPU memory to use for KV cache (0.0–1.0).
+    #[arg(long, default_value_t = 0.9, env = "VLLM_GPU_MEMORY_UTILIZATION")]
+    pub gpu_memory_utilization: f64,
+
+    /// Maximum model context length (overrides config.json).
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+
+    /// Maximum number of concurrent sequences.
+    #[arg(long, default_value_t = 256)]
+    pub max_num_seqs: usize,
+
+    /// KV cache block size in tokens.
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+
+    /// Number of GPUs for tensor parallelism.
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel_size: usize,
+
+    /// Enable prefix caching.
+    #[arg(long)]
+    pub enable_prefix_caching: bool,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+
+    /// Path to write JSON results.
+    #[arg(long)]
+    pub output_json: Option<String>,
+
+    /// Disable CUDA graphs and run all steps eagerly.
+    #[arg(long)]
+    pub enforce_eager: bool,
+
+    /// Comma-separated list of batch sizes to capture as CUDA graphs.
+    #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
+    pub cuda_graph_sizes: String,
+}
+
+impl BenchStartupArgs {
+    /// Resolve the model path/ID.
+    pub fn resolved_model(&self) -> Result<String, String> {
+        if let Some(ref tag) = self.model_tag {
+            Ok(tag.clone())
+        } else if let Some(ref m) = self.model {
+            Ok(m.clone())
+        } else {
+            Err("model is required: provide as positional arg or --model flag".to_string())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sweep
+// ---------------------------------------------------------------------------
+
+/// Container for `sweep` subcommands.
+#[derive(Parser, Debug)]
+pub struct SweepCommand {
+    #[command(subcommand)]
+    pub command: SweepCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SweepCommands {
+    /// Run vLLM server benchmark under multiple settings.
+    Serve(SweepServeArgs),
+    /// Benchmark vLLM startup time over parameter combinations.
+    Startup(SweepStartupArgs),
+}
+
+/// Arguments for `vllm bench sweep serve`.
+#[derive(Parser, Debug)]
+pub struct SweepServeArgs {
+    /// The command used to run the server (e.g. "vllm serve model --port 8000").
+    #[arg(long)]
+    pub serve_cmd: String,
+
+    /// The command used to run the benchmark (e.g. "vllm bench serve ...").
+    #[arg(long)]
+    pub bench_cmd: String,
+
+    /// Path to JSON file with parameter combinations for `vllm serve`.
+    #[arg(long)]
+    pub serve_params: Option<String>,
+
+    /// Path to JSON file with parameter combinations for `vllm bench serve`.
+    #[arg(long)]
+    pub bench_params: Option<String>,
+
+    /// Output directory for results.
+    #[arg(short = 'o', long, default_value = "results")]
+    pub output_dir: String,
+
+    /// Number of runs per parameter combination.
+    #[arg(long, default_value_t = 3)]
+    pub num_runs: usize,
+
+    /// Print commands without executing them.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Resume a previous sweep from a timestamped directory.
+    #[arg(long)]
+    pub resume: Option<String>,
+
+    /// Show stdout from sub-processes.
+    #[arg(long)]
+    pub show_stdout: bool,
+
+    /// Timeout (seconds) to wait for the server to become ready.
+    #[arg(long, default_value_t = 300)]
+    pub server_ready_timeout: u32,
+}
+
+/// Arguments for `vllm bench sweep startup`.
+#[derive(Parser, Debug)]
+pub struct SweepStartupArgs {
+    /// The command used to run the startup benchmark.
+    #[arg(long, default_value = "vllm bench startup")]
+    pub startup_cmd: String,
+
+    /// Path to JSON file with parameter combinations for serve/model args.
+    #[arg(long)]
+    pub serve_params: Option<String>,
+
+    /// Path to JSON file with parameter combinations for startup args.
+    #[arg(long)]
+    pub startup_params: Option<String>,
+
+    /// Output directory for results.
+    #[arg(short = 'o', long, default_value = "results")]
+    pub output_dir: String,
+
+    /// Number of runs per parameter combination.
+    #[arg(long, default_value_t = 1)]
+    pub num_runs: usize,
+
+    /// Print commands without executing them.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Resume a previous sweep from a timestamped directory.
+    #[arg(long)]
+    pub resume: Option<String>,
+
+    /// Show stdout from sub-processes.
+    #[arg(long)]
+    pub show_stdout: bool,
 }

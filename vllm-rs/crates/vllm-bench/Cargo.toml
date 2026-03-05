@@ -22,3 +22,6 @@ serde_json = { workspace = true }
 indicatif = { workspace = true }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+shell-words = "1"
+url = "2"

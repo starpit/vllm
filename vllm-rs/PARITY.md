@@ -4,9 +4,9 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| ✅ | Implemented | 125 |
+| ✅ | Implemented | 127 |
 | ⚠️ | Partial | 1 |
-| ❌ | Not implemented | 138 |
+| ❌ | Not implemented | 136 |
 | ➕ | Rust-only | 13 |
 
 ---
@@ -19,7 +19,7 @@
 |---|---:|---:|---:|---:|
 | [Hardware Platforms](#hardware-platforms) | 3 | 0 | 6 | 1 |
 | [Multi-GPU & Distribution](#multi-gpu-and-distribution) | 1 | 1 | 7 | 0 |
-| [CLI Commands](#cli-commands) | 8 | 0 | 2 | 1 |
+| [CLI Commands](#cli-commands) | 10 | 0 | 0 | 1 |
 | [OpenAI-Compatible API Endpoints](#openai-compatible-api-endpoints) | 7 | 0 | 6 | 0 |
 | [Other API Protocols](#other-api-protocols) | 0 | 0 | 7 | 3 |
 | [Model Architectures — Decoder-Only LLMs](#model-architectures-decoder-only-llms) | 15 | 0 | 20 | 0 |
@@ -43,7 +43,7 @@
 | [CUDA Compute Kernels](#cuda-compute-kernels) | 6 | 0 | 8 | 0 |
 | [Observability & Operations](#observability-and-operations) | 6 | 0 | 1 | 2 |
 | [Engine & Architecture](#engine-and-architecture) | 7 | 0 | 2 | 2 |
-| **Total** | **125** | **1** | **138** | **13** |
+| **Total** | **127** | **1** | **136** | **13** |
 
 ---
 
@@ -90,8 +90,8 @@
 | `bench latency` | ✅ | ✅ |  |
 | `bench throughput` | ✅ | ✅ | Offline batch throughput (requests/s and tokens/s) |
 | `bench serve` | ✅ | ✅ | Online serving benchmark (TTFT/TPOT/ITL/E2EL via HTTP) |
-| `bench startup` | ✅ | ❌ |  |
-| `bench sweep` | ✅ | ❌ |  |
+| `bench startup` | ✅ | ✅ | Cold/warm startup time measurement |
+| `bench sweep` | ✅ | ✅ | serve + startup subcommands; plot subcommands omitted (Python-only matplotlib) |
 | Offline batch inference (CLI) | ✅ | ✅ | Python: `run-batch`; Rust: `batch` + `run-batch` alias |
 | `collect-env` | ✅ | ✅ | Rust-tailored: reports rustc/cargo/features instead of PyTorch/pip |
 | `convert` model weights | ❌ | ⚠️ | Rust: argument parsing only (stub) |

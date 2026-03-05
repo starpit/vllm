@@ -126,6 +126,11 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         conversation.push(ChatMessage::system(system_prompt));
     }
 
+    let params = args.max_tokens.map(|mt| vllm_serve::llm::SamplingParams {
+        max_tokens: Some(mt),
+        ..Default::default()
+    });
+
     // Single-prompt mode (--prompt or --quick): send one message and exit.
     let single_msg = args.prompt.as_ref().or(args.quick.as_ref());
     if let Some(message) = single_msg {
@@ -145,7 +150,7 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
 
         let mut stats = args.bench.then(|| BenchStats::new(startup_ms));
 
-        let output = llm.chat_stream(&conversation, None, |token| {
+        let output = llm.chat_stream(&conversation, params.clone(), |token| {
             print!("{token}");
             io::stdout().flush().ok();
             if let Some(ref mut s) = stats {
@@ -169,7 +174,7 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
 
         let mut stats = args.bench.then(|| BenchStats::new(startup_ms));
 
-        let output = llm.chat_stream(&conversation, None, |token| {
+        let output = llm.chat_stream(&conversation, params.clone(), |token| {
             print!("{token}");
             io::stdout().flush().ok();
             if let Some(ref mut s) = stats {
@@ -294,18 +299,23 @@ async fn run_chat_remote(args: &ChatArgs) -> Result<()> {
         }));
     }
 
+    let mut chat_body = serde_json::json!({
+        "model": model,
+        "stream": true,
+    });
+    if let Some(mt) = args.max_tokens {
+        chat_body["max_tokens"] = serde_json::json!(mt);
+    }
+
     if let Some(ref message) = args.quick {
         conversation.push(serde_json::json!({
             "role": "user",
             "content": message,
         }));
+        chat_body["messages"] = serde_json::json!(conversation);
         let resp = client
             .post(format!("{}/chat/completions", args.url))
-            .json(&serde_json::json!({
-                "model": model,
-                "messages": conversation,
-                "stream": true,
-            }))
+            .json(&chat_body)
             .send()
             .await
             .context("failed to send chat completion request")?;
@@ -322,13 +332,10 @@ async fn run_chat_remote(args: &ChatArgs) -> Result<()> {
             "role": "user",
             "content": input,
         }));
+        chat_body["messages"] = serde_json::json!(conversation);
         let resp = client
             .post(format!("{}/chat/completions", args.url))
-            .json(&serde_json::json!({
-                "model": model,
-                "messages": conversation,
-                "stream": true,
-            }))
+            .json(&chat_body)
             .send()
             .await
             .context("failed to send chat completion request")?;

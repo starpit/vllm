@@ -296,6 +296,10 @@ pub struct ChatArgs {
     /// Maximum model context length (overrides config.json).
     #[arg(long)]
     pub max_model_len: Option<usize>,
+
+    /// Maximum number of tokens to generate per response.
+    #[arg(long)]
+    pub max_tokens: Option<u32>,
 }
 
 impl ChatArgs {
@@ -698,6 +702,7 @@ mod tests {
                 assert!(!args.bench);
                 assert_eq!(args.device, "auto");
                 assert_eq!(args.dtype, "auto");
+                assert_eq!(args.max_tokens, None);
             }
             _ => panic!("expected Chat command"),
         }
@@ -801,6 +806,8 @@ mod tests {
             "4096",
             "--gguf-file",
             "model.gguf",
+            "--max-tokens",
+            "256",
         ]);
         match cli.command {
             Commands::Chat(args) => {
@@ -808,6 +815,7 @@ mod tests {
                 assert_eq!(args.dtype, "float16");
                 assert_eq!(args.max_model_len, Some(4096));
                 assert_eq!(args.gguf_file.as_deref(), Some("model.gguf"));
+                assert_eq!(args.max_tokens, Some(256));
             }
             _ => panic!("expected Chat command"),
         }

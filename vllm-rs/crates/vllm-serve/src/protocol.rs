@@ -957,6 +957,76 @@ impl EmbeddingResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Tokenize / Detokenize types
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /tokenize`.
+///
+/// Accepts either a raw `prompt` string (completion-style) or a `messages`
+/// array (chat-style). When `messages` is provided the server applies the
+/// chat template before tokenizing.
+///
+/// Mirrors Python vLLM `TokenizeCompletionRequest` / `TokenizeChatRequest`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenizeRequest {
+    /// Model identifier (optional, ignored — single-model server).
+    #[serde(default)]
+    pub model: Option<String>,
+
+    /// Raw prompt string to tokenize (completion-style).
+    #[serde(default)]
+    pub prompt: Option<String>,
+
+    /// Chat messages to tokenize (chat-style). Requires a chat template.
+    #[serde(default)]
+    pub messages: Option<Vec<ChatCompletionMessageParam>>,
+
+    /// Whether to add special tokens (e.g. BOS). Default `true` for prompt
+    /// mode, `false` for chat mode (chat template usually adds them).
+    #[serde(default)]
+    pub add_special_tokens: Option<bool>,
+
+    /// If true, also return the string representation of each token.
+    #[serde(default)]
+    pub return_token_strs: Option<bool>,
+
+    /// Whether to add the generation prompt when using chat messages.
+    #[serde(default = "default_true")]
+    pub add_generation_prompt: bool,
+}
+
+/// Response body for `POST /tokenize`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenizeResponse {
+    /// Number of tokens.
+    pub count: usize,
+    /// Maximum context length of the model.
+    pub max_model_len: usize,
+    /// The token IDs.
+    pub tokens: Vec<u32>,
+    /// Optional string representations of each token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_strs: Option<Vec<String>>,
+}
+
+/// Request body for `POST /detokenize`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetokenizeRequest {
+    /// Model identifier (optional, ignored).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Token IDs to decode.
+    pub tokens: Vec<u32>,
+}
+
+/// Response body for `POST /detokenize`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetokenizeResponse {
+    /// The decoded text.
+    pub prompt: String,
+}
+
+// ---------------------------------------------------------------------------
 // Batch processing types
 // ---------------------------------------------------------------------------
 

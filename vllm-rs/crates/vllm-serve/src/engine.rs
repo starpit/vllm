@@ -334,6 +334,17 @@ impl AsyncEngine {
         self.tokenizer.is_some()
     }
 
+    /// Get a reference to the tokenizer, if available.
+    pub fn tokenizer(&self) -> Option<&Arc<Tokenizer>> {
+        self.tokenizer.as_ref()
+    }
+
+    /// Get a reference to the chat template, if available.
+    #[cfg(feature = "chat-template")]
+    pub fn chat_template(&self) -> Option<&Arc<ChatTemplate>> {
+        self.chat_template.as_ref()
+    }
+
     // -----------------------------------------------------------------------
     // Request handling
     // -----------------------------------------------------------------------

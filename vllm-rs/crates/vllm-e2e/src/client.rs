@@ -6,7 +6,8 @@
 use anyhow::{Context, Result, bail};
 use vllm_serve::protocol::{
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamResponse, CompletionRequest,
-    CompletionResponse, ModelList, VersionResponse,
+    CompletionResponse, DetokenizeRequest, DetokenizeResponse, ModelList, TokenizeRequest,
+    TokenizeResponse, VersionResponse,
 };
 
 /// A thin HTTP client for talking to a running vLLM server.
@@ -170,6 +171,46 @@ impl Client {
         resp.json()
             .await
             .context("failed to parse embedding response")
+    }
+
+    /// POST /tokenize — tokenize text.
+    pub async fn tokenize(&self, request: &TokenizeRequest) -> Result<TokenizeResponse> {
+        let resp = self
+            .inner
+            .post(format!("{}/tokenize", self.base_url))
+            .json(request)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("tokenize failed with status {status}: {body}");
+        }
+
+        resp.json()
+            .await
+            .context("failed to parse tokenize response")
+    }
+
+    /// POST /detokenize — decode token IDs back to text.
+    pub async fn detokenize(&self, request: &DetokenizeRequest) -> Result<DetokenizeResponse> {
+        let resp = self
+            .inner
+            .post(format!("{}/detokenize", self.base_url))
+            .json(request)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("detokenize failed with status {status}: {body}");
+        }
+
+        resp.json()
+            .await
+            .context("failed to parse detokenize response")
     }
 
     /// GET /metrics — returns raw Prometheus text.

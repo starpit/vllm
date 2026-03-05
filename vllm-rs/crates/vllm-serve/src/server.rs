@@ -102,6 +102,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))
+        .route("/tokenize", post(tokenize))
+        .route("/detokenize", post(detokenize))
         .route("/health", get(health))
         .route("/version", get(version));
 
@@ -363,6 +365,136 @@ async fn version(State(state): State<Arc<AppState>>) -> Json<protocol::VersionRe
     Json(protocol::VersionResponse {
         version: state.config.version.clone(),
     })
+}
+
+/// POST /tokenize
+async fn tokenize(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<protocol::TokenizeRequest>,
+) -> Response {
+    let tokenizer = match state.engine.tokenizer() {
+        Some(t) => t,
+        None => {
+            return Json(protocol::ErrorResponse::new(
+                "Tokenizer not available",
+                "ServiceUnavailableError",
+                503,
+            ))
+            .into_response();
+        }
+    };
+
+    // Determine the text to tokenize: either from prompt or chat messages.
+    let text = if let Some(prompt) = &request.prompt {
+        prompt.clone()
+    } else if let Some(messages) = &request.messages {
+        #[cfg(feature = "chat-template")]
+        {
+            let template = match state.engine.chat_template() {
+                Some(t) => t,
+                None => {
+                    return Json(protocol::ErrorResponse::new(
+                        "Chat-style tokenize requires a chat template",
+                        "BadRequestError",
+                        400,
+                    ))
+                    .into_response();
+                }
+            };
+            let message_values: Vec<serde_json::Value> = messages
+                .iter()
+                .map(|msg| serde_json::to_value(msg).unwrap_or_default())
+                .collect();
+            match template.apply(&message_values, request.add_generation_prompt, None) {
+                Ok(text) => text,
+                Err(e) => {
+                    return Json(protocol::ErrorResponse::new(
+                        format!("Chat template rendering failed: {e}"),
+                        "BadRequestError",
+                        400,
+                    ))
+                    .into_response();
+                }
+            }
+        }
+        #[cfg(not(feature = "chat-template"))]
+        {
+            let _ = messages;
+            return Json(protocol::ErrorResponse::new(
+                "Chat-style tokenize requires the chat-template feature",
+                "BadRequestError",
+                400,
+            ))
+            .into_response();
+        }
+    } else {
+        return Json(protocol::ErrorResponse::new(
+            "Either 'prompt' or 'messages' must be provided",
+            "BadRequestError",
+            400,
+        ))
+        .into_response();
+    };
+
+    let add_special = request
+        .add_special_tokens
+        .unwrap_or(request.prompt.is_some());
+
+    match tokenizer.encode(&text, add_special) {
+        Ok(token_ids) => {
+            let token_strs = if request.return_token_strs.unwrap_or(false) {
+                Some(
+                    token_ids
+                        .iter()
+                        .map(|&id| tokenizer.id_to_token(id).unwrap_or_default())
+                        .collect(),
+                )
+            } else {
+                None
+            };
+            Json(protocol::TokenizeResponse {
+                count: token_ids.len(),
+                max_model_len: state.engine.max_model_len(),
+                tokens: token_ids,
+                token_strs,
+            })
+            .into_response()
+        }
+        Err(e) => Json(protocol::ErrorResponse::new(
+            format!("Tokenization failed: {e}"),
+            "InternalError",
+            500,
+        ))
+        .into_response(),
+    }
+}
+
+/// POST /detokenize
+async fn detokenize(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<protocol::DetokenizeRequest>,
+) -> Response {
+    let tokenizer = match state.engine.tokenizer() {
+        Some(t) => t,
+        None => {
+            return Json(protocol::ErrorResponse::new(
+                "Tokenizer not available",
+                "ServiceUnavailableError",
+                503,
+            ))
+            .into_response();
+        }
+    };
+
+    match tokenizer.decode(&request.tokens, false) {
+        Ok(text) => Json(protocol::DetokenizeResponse { prompt: text }).into_response(),
+        Err(e) => Json(protocol::ErrorResponse::new(
+            format!("Detokenization failed: {e}"),
+            "InternalError",
+            500,
+        ))
+        .into_response(),
+    }
 }
 
 /// GET /metrics — Prometheus metrics endpoint.

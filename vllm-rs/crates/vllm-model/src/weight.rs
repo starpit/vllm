@@ -501,7 +501,17 @@ impl HfModelConfig {
     }
 
     /// Effective head dimension.
+    ///
+    /// For MLA models (DeepSeek V2/V3) this returns `qk_nope_head_dim + qk_rope_head_dim`
+    /// so that the KV cache is allocated with the correct dimension.
     pub fn head_dim(&self) -> Option<usize> {
+        // MLA: qk_head_dim = qk_nope_head_dim + qk_rope_head_dim (used for KV cache sizing).
+        if let (Some(nope), Some(rope)) = (
+            self.extra.get("qk_nope_head_dim").and_then(|v| v.as_u64()),
+            self.extra.get("qk_rope_head_dim").and_then(|v| v.as_u64()),
+        ) {
+            return Some((nope + rope) as usize);
+        }
         self.head_dim
             .or_else(|| match (self.hidden_size, self.num_attention_heads) {
                 (Some(h), Some(n)) if n > 0 => Some(h / n),

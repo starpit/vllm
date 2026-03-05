@@ -701,6 +701,11 @@ impl DeepSeekV2Attention {
         };
 
         // --- Cache + Attention ---
+        // Ensure contiguity for FlashAttention (cat/expand can produce non-contiguous views,
+        // especially after TP head sharding).
+        let q = q.contiguous().map_err(ModelError::Candle)?;
+        let k = k.contiguous().map_err(ModelError::Candle)?;
+        let v_padded = v_padded.contiguous().map_err(ModelError::Candle)?;
         let attn_output = attention_with_cache(&q, &k, &v_padded, self.scale, kv_cache, None)?;
 
         // --- Slice V back to v_head_dim ---

@@ -681,24 +681,41 @@ impl LlamaDecoderLayer {
     }
 
     /// Batched forward with residual threading.
+    ///
+    /// Takes ownership of `hidden_states` and `residual` to enable in-place
+    /// fused norm on CUDA (avoids 4 cuMemAllocAsync per layer).
     pub fn forward_batch(
         &self,
-        hidden_states: &Tensor,
-        residual: Option<&Tensor>,
+        hidden_states: Tensor,
+        residual: Option<Tensor>,
         positions: &Tensor,
         attn_meta: &crate::AttentionMetadata,
         storage: &mut crate::BatchedKvCacheStorage<'_>,
     ) -> ModelResult<(Tensor, Tensor)> {
         // Pre-attention layernorm: fuse previous MLP residual add when available.
+        // On CUDA: in-place modification avoids 2 cuMemAllocAsync per norm call.
         let (normed, residual) = {
             let _p = vllm_kernels::profiling::range("pre_norm");
             if let Some(residual) = residual {
-                crate::ops::fused_add_rms_norm(hidden_states, residual, &self.input_layernorm)
+                #[cfg(feature = "cuda")]
+                if hidden_states.device().is_cuda() {
+                    crate::ops::fused_add_rms_norm_inplace(
+                        hidden_states,
+                        residual,
+                        &self.input_layernorm,
+                    )
+                    .map_err(ModelError::Candle)?
+                } else {
+                    crate::ops::fused_add_rms_norm(&hidden_states, &residual, &self.input_layernorm)
+                        .map_err(ModelError::Candle)?
+                }
+                #[cfg(not(feature = "cuda"))]
+                crate::ops::fused_add_rms_norm(&hidden_states, &residual, &self.input_layernorm)
                     .map_err(ModelError::Candle)?
             } else {
-                let normed = crate::ops::rms_norm(hidden_states, &self.input_layernorm)
+                let normed = crate::ops::rms_norm(&hidden_states, &self.input_layernorm)
                     .map_err(ModelError::Candle)?;
-                (normed, hidden_states.clone())
+                (normed, hidden_states)
             }
         };
 
@@ -710,8 +727,26 @@ impl LlamaDecoderLayer {
         };
 
         // Fused residual add + post-attention layernorm.
+        // On CUDA: in-place to avoid 2 cuMemAllocAsync.
         let (normed, residual) = {
             let _p = vllm_kernels::profiling::range("post_norm");
+            #[cfg(feature = "cuda")]
+            if attn_output.device().is_cuda() {
+                crate::ops::fused_add_rms_norm_inplace(
+                    attn_output,
+                    residual,
+                    &self.post_attention_layernorm,
+                )
+                .map_err(ModelError::Candle)?
+            } else {
+                crate::ops::fused_add_rms_norm(
+                    &attn_output,
+                    &residual,
+                    &self.post_attention_layernorm,
+                )
+                .map_err(ModelError::Candle)?
+            }
+            #[cfg(not(feature = "cuda"))]
             crate::ops::fused_add_rms_norm(&attn_output, &residual, &self.post_attention_layernorm)
                 .map_err(ModelError::Candle)?
         };
@@ -864,16 +899,12 @@ impl LlamaModel {
         };
 
         // Batched layer forward with residual threading.
+        // Pass ownership of hidden_states/residual to enable in-place norm on CUDA.
         let mut residual: Option<Tensor> = None;
         for (i, layer) in self.layers.iter().enumerate() {
             let _p = vllm_kernels::profiling::range_fmt(format_args!("layer_{i}"));
-            let (hs, res) = layer.forward_batch(
-                &hidden_states,
-                residual.as_ref(),
-                positions,
-                attn_meta,
-                kv_storage,
-            )?;
+            let (hs, res) =
+                layer.forward_batch(hidden_states, residual, positions, attn_meta, kv_storage)?;
             hidden_states = hs;
             residual = Some(res);
         }

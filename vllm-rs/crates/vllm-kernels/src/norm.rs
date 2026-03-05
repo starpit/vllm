@@ -478,6 +478,85 @@ impl NormKernels for CudaNormKernels {
     }
 }
 
+/// CUDA in-place fused add + RMS norm that takes owned contiguous tensors.
+///
+/// The caller transfers ownership of `input` and `residual`. The kernel modifies
+/// them in-place and returns them. This avoids the 2 `cuMemAllocAsync` calls
+/// that the `NormKernels::fused_add_rms_norm` implementation requires for cloning.
+///
+/// **Contract**: `input` and `residual` must be contiguous CUDA tensors.
+/// The caller must not hold any other references to these tensors' storage.
+#[cfg(feature = "cuda")]
+pub fn fused_add_rms_norm_inplace(
+    input: Tensor,
+    residual: Tensor,
+    weight: &Tensor,
+    epsilon: f64,
+) -> KernelResult<(Tensor, Tensor)> {
+    use candle_core::DType;
+
+    let dims = input.shape().dims();
+    let hidden_size = *dims
+        .last()
+        .ok_or_else(|| crate::error::KernelError::Other("empty input tensor".to_string()))?;
+    let num_tokens: usize = dims[..dims.len() - 1].iter().product();
+
+    // Make contiguous without cloning — if already contiguous, this is a no-op.
+    let inp = input.contiguous()?;
+    let res = residual.contiguous()?;
+    let weight = weight.contiguous()?;
+
+    match inp.dtype() {
+        DType::F32 => {
+            let i = CudaNormKernels::device_ptr_of::<f32>(&inp)?;
+            let r = CudaNormKernels::device_ptr_of::<f32>(&res)?;
+            let w = CudaNormKernels::device_ptr_of::<f32>(&weight)?;
+            unsafe {
+                cuda_ffi::fused_add_rms_norm_f32(
+                    i as *mut f32,
+                    r as *mut f32,
+                    w as *const f32,
+                    epsilon as f32,
+                    num_tokens as i32,
+                    hidden_size as i32,
+                );
+            }
+        }
+        DType::F16 => {
+            let i = CudaNormKernels::device_ptr_of::<half::f16>(&inp)?;
+            let r = CudaNormKernels::device_ptr_of::<half::f16>(&res)?;
+            let w = CudaNormKernels::device_ptr_of::<half::f16>(&weight)?;
+            unsafe {
+                cuda_ffi::fused_add_rms_norm_f16(
+                    i as *mut u16,
+                    r as *mut u16,
+                    w as *const u16,
+                    epsilon as f32,
+                    num_tokens as i32,
+                    hidden_size as i32,
+                );
+            }
+        }
+        DType::BF16 => {
+            let i = CudaNormKernels::device_ptr_of::<half::bf16>(&inp)?;
+            let r = CudaNormKernels::device_ptr_of::<half::bf16>(&res)?;
+            let w = CudaNormKernels::device_ptr_of::<half::bf16>(&weight)?;
+            unsafe {
+                cuda_ffi::fused_add_rms_norm_bf16(
+                    i as *mut u16,
+                    r as *mut u16,
+                    w as *const u16,
+                    epsilon as f32,
+                    num_tokens as i32,
+                    hidden_size as i32,
+                );
+            }
+        }
+        _ => return CpuNormKernels.fused_add_rms_norm(&inp, &res, &weight, epsilon),
+    }
+    Ok((inp, res))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

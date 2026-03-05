@@ -155,6 +155,36 @@ pub fn fused_add_gemma_rms_norm(
     Ok((normed, updated))
 }
 
+/// Fused add + RMS normalization with in-place modification (CUDA only).
+///
+/// Takes ownership of `input` and `residual`, modifies them in-place, and returns
+/// them. Eliminates 2 `cuMemAllocAsync` calls per invocation vs the standard
+/// `fused_add_rms_norm` which clones both tensors.
+///
+/// **Contract**: `input` and `residual` must be owned (not shared with other tensors).
+/// This is naturally true in the decoder layer forward pass where each tensor is
+/// consumed after being passed to the norm.
+#[cfg(feature = "cuda")]
+pub fn fused_add_rms_norm_inplace(
+    input: Tensor,
+    residual: Tensor,
+    norm: &RmsNorm,
+) -> candle_core::Result<(Tensor, Tensor)> {
+    if input.device().is_cuda() {
+        return vllm_kernels::norm::fused_add_rms_norm_inplace(
+            input,
+            residual,
+            norm.weight(),
+            norm.eps(),
+        )
+        .map_err(kernel_err);
+    }
+    // CPU fallback: use allocating version.
+    let updated = (&input + &residual)?;
+    let normed = candle_core::Module::forward(norm, &updated)?;
+    Ok((normed, updated))
+}
+
 // ---------------------------------------------------------------------------
 // Fused RoPE dispatch
 // ---------------------------------------------------------------------------
@@ -180,7 +210,11 @@ pub fn rotary_embedding(
     if q.device().is_cuda() {
         // Fused Q+K RoPE: single kernel launch for both tensors.
         return vllm_kernels::rotary::fused_rotary_apply_qk(
-            q, k, positions, cos_sin_cache, head_size,
+            q,
+            k,
+            positions,
+            cos_sin_cache,
+            head_size,
         );
     }
     let _ = (q, k, positions);

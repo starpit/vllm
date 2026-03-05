@@ -1,0 +1,29 @@
+[package]
+name = "vllm-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Purpose-built CUDA tensor runtime for LLM inference — replaces candle on GPU"
+
+[features]
+default = []
+# Enable CUDA runtime. Requires CUDA toolkit + nvcc.
+cuda = ["dep:cudarc", "cc", "bindgen_cuda", "candle-flash-attn-build"]
+
+[dependencies]
+cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt"] }
+half = { workspace = true }
+safetensors = { workspace = true }
+memmap2 = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+bindgen_cuda = { version = "0.1.5", optional = true }
+candle-flash-attn-build = { version = "0.9.2", optional = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+tempfile = { workspace = true }

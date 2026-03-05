@@ -17,6 +17,7 @@ members = [
     "crates/vllm-mlx",
     "crates/vllm-e2e",
     "crates/vllm-wgpu",
+    "crates/vllm-cuda",
     "crates/vllm-examples",
 ]
 exclude = [
@@ -142,6 +143,7 @@ vllm-cli = { path = "crates/vllm-cli" }
 vllm-mlx = { path = "crates/vllm-mlx" }
 vllm-e2e = { path = "crates/vllm-e2e" }
 vllm-wgpu = { path = "crates/vllm-wgpu" }
+vllm-cuda = { path = "crates/vllm-cuda" }
 vllm-examples = { path = "crates/vllm-examples" }
 
 # WebGPU

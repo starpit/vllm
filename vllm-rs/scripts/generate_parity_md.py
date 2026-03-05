@@ -84,14 +84,19 @@ def rust_only_count(rows, col="rust"):
     )
 
 
+def status_bar(yes, partial, no):
+    """Build a visual bar of colored squares: 🟦=yes, 🟨=partial, 🟥=no."""
+    return "\U0001f7e6" * yes + "\U0001f7e8" * partial + "\U0001f7e5" * no
+
+
 def generate_summary_table(sections):
     lines = []
     lines.append(
-        "| Section | Rust ✅ | Rust ⚠️ | Rust ❌ | Rust-only |"
+        "| Section | Parity | ✅ | ⚠️ | ❌ |"
     )
-    lines.append("|---|---:|---:|---:|---:|")
+    lines.append("|---|---|---:|---:|---:|")
 
-    t_yes = t_partial = t_no = t_only = 0
+    t_yes = t_partial = t_no = 0
 
     for name, rows in sections.items():
         ar = active(rows)
@@ -108,39 +113,40 @@ def generate_summary_table(sections):
             1 for r in ar
             if r["python"] in ("yes", "partial") and r["rust"] == "no"
         )
-        r_only = rust_only_count(ar)
 
         t_yes += r_yes
         t_partial += r_partial
         t_no += r_no
-        t_only += r_only
 
+        bar = status_bar(r_yes, r_partial, r_no)
         lines.append(
             f"| [{name}](#{slugify(name)}) "
-            f"| {r_yes} | {r_partial} | {r_no} | {r_only} |"
+            f"| {bar} | {r_yes} | {r_partial} | {r_no} |"
         )
 
+    bar = status_bar(t_yes, t_partial, t_no)
     lines.append(
         f"| **Total** "
-        f"| **{t_yes}** | **{t_partial}** | **{t_no}** | **{t_only}** |"
+        f"| {bar} | **{t_yes}** | **{t_partial}** | **{t_no}** |"
     )
     return "\n".join(lines)
 
 
 def slugify(name):
-    """Convert section name to GitHub-flavored markdown anchor."""
+    """Convert section name to GitHub-flavored markdown anchor.
+
+    Matches GitHub's actual algorithm: lowercase, strip non-[a-z0-9 -],
+    replace spaces with hyphens. Does NOT collapse multiple hyphens.
+    """
     s = name.lower()
-    s = s.replace("&", "and")
     out = []
     for ch in s:
         if ch.isalnum() or ch == "-":
             out.append(ch)
-        elif ch in (" ", "/"):
+        elif ch == " ":
             out.append("-")
-        # drop everything else (backticks, parens, etc.)
-    # collapse multiple dashes
-    result = "-".join(part for part in "".join(out).split("-") if part)
-    return result
+        # drop everything else (em dashes, &, backticks, parens, etc.)
+    return "".join(out)
 
 
 def generate_section(name, rows):
@@ -203,22 +209,19 @@ def generate_md():
     leg_yes = sum(1 for r in all_rows if r["python"] in ("yes", "partial") and r["rust"] == "yes")
     leg_partial = sum(1 for r in all_rows if r["python"] in ("yes", "partial") and r["rust"] == "partial")
     leg_no = sum(1 for r in all_rows if r["python"] in ("yes", "partial") and r["rust"] == "no")
-    leg_rust_only = sum(1 for r in all_rows if r["python"] in ("no", "na", "") and r["rust"] == "yes")
 
     parts.append("| Symbol | Meaning | Count |")
     parts.append("|--------|---------|------:|")
-    parts.append(f"| \u2705 | Implemented | {leg_yes} |")
-    parts.append(f"| \u26A0\uFE0F | Partial | {leg_partial} |")
-    parts.append(f"| \u274C | Not implemented | {leg_no} |")
-    parts.append(f"| \u2795 | Rust-only | {leg_rust_only} |")
+    parts.append(f"| \u2705 \U0001f7e6 | Implemented | {leg_yes} |")
+    parts.append(f"| \u26A0\uFE0F \U0001f7e8 | Partial | {leg_partial} |")
+    parts.append(f"| \u274C \U0001f7e5 | Not implemented | {leg_no} |")
     parts.append("")
     parts.append("---")
     parts.append("")
     parts.append("## Summary")
     parts.append("")
     parts.append(
-        "> Counts are for Rust parity against Python features. "
-        "**Rust-only** = features unique to the Rust port."
+        "> Counts are for Rust parity against Python features."
     )
     parts.append("")
     parts.append(generate_summary_table(sections))

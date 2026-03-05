@@ -4,46 +4,45 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| ✅ | Implemented | 127 |
-| ⚠️ | Partial | 1 |
-| ❌ | Not implemented | 136 |
-| ➕ | Rust-only | 13 |
+| ✅ 🟦 | Implemented | 127 |
+| ⚠️ 🟨 | Partial | 1 |
+| ❌ 🟥 | Not implemented | 136 |
 
 ---
 
 ## Summary
 
-> Counts are for Rust parity against Python features. **Rust-only** = features unique to the Rust port.
+> Counts are for Rust parity against Python features.
 
-| Section | Rust ✅ | Rust ⚠️ | Rust ❌ | Rust-only |
-|---|---:|---:|---:|---:|
-| [Hardware Platforms](#hardware-platforms) | 3 | 0 | 6 | 1 |
-| [Multi-GPU & Distribution](#multi-gpu-and-distribution) | 1 | 1 | 7 | 0 |
-| [CLI Commands](#cli-commands) | 10 | 0 | 0 | 1 |
-| [OpenAI-Compatible API Endpoints](#openai-compatible-api-endpoints) | 7 | 0 | 6 | 0 |
-| [Other API Protocols](#other-api-protocols) | 0 | 0 | 7 | 3 |
-| [Model Architectures — Decoder-Only LLMs](#model-architectures-decoder-only-llms) | 15 | 0 | 20 | 0 |
-| [Model Architectures — Encoder / Embedding](#model-architectures-encoder-embedding) | 0 | 0 | 4 | 0 |
-| [Model Architectures — Vision-Language / Multimodal](#model-architectures-vision-language-multimodal) | 2 | 0 | 9 | 0 |
-| [Model Architectures — Audio / Speech](#model-architectures-audio-speech) | 0 | 0 | 4 | 0 |
-| [Model Architectures — Speculative Decoding Draft Models](#model-architectures-speculative-decoding-draft-models) | 0 | 0 | 4 | 0 |
-| [Quantization Methods](#quantization-methods) | 4 | 0 | 8 | 1 |
-| [Attention Backends](#attention-backends) | 5 | 0 | 8 | 1 |
-| [Sampling & Decoding](#sampling-and-decoding) | 19 | 0 | 3 | 0 |
-| [Structured Output / Guided Decoding](#structured-output-guided-decoding) | 5 | 0 | 5 | 0 |
-| [Tool Calling / Function Calling](#tool-calling-function-calling) | 6 | 0 | 2 | 0 |
-| [Scheduling](#scheduling) | 6 | 0 | 1 | 0 |
-| [KV Cache](#kv-cache) | 4 | 0 | 4 | 0 |
-| [LoRA & Adapters](#lora-and-adapters) | 2 | 0 | 4 | 0 |
-| [Speculative Decoding](#speculative-decoding) | 1 | 0 | 5 | 0 |
-| [Multimodal Input](#multimodal-input) | 1 | 0 | 4 | 0 |
-| [Embeddings & Pooling](#embeddings-and-pooling) | 4 | 0 | 3 | 1 |
-| [Serving Features](#serving-features) | 6 | 0 | 7 | 1 |
-| [Performance Optimizations](#performance-optimizations) | 7 | 0 | 4 | 0 |
-| [CUDA Compute Kernels](#cuda-compute-kernels) | 6 | 0 | 8 | 0 |
-| [Observability & Operations](#observability-and-operations) | 6 | 0 | 1 | 2 |
-| [Engine & Architecture](#engine-and-architecture) | 7 | 0 | 2 | 2 |
-| **Total** | **127** | **1** | **136** | **13** |
+| Section | Parity | ✅ | ⚠️ | ❌ |
+|---|---|---:|---:|---:|
+| [Hardware Platforms](#hardware-platforms) | 🟦🟦🟦🟥🟥🟥🟥🟥🟥 | 3 | 0 | 6 |
+| [Multi-GPU & Distribution](#multi-gpu--distribution) | 🟦🟨🟥🟥🟥🟥🟥🟥🟥 | 1 | 1 | 7 |
+| [CLI Commands](#cli-commands) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 10 | 0 | 0 |
+| [OpenAI-Compatible API Endpoints](#openai-compatible-api-endpoints) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥 | 7 | 0 | 6 |
+| [Other API Protocols](#other-api-protocols) | 🟥🟥🟥🟥🟥🟥🟥 | 0 | 0 | 7 |
+| [Model Architectures — Decoder-Only LLMs](#model-architectures--decoder-only-llms) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 15 | 0 | 20 |
+| [Model Architectures — Encoder / Embedding](#model-architectures--encoder--embedding) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
+| [Model Architectures — Vision-Language / Multimodal](#model-architectures--vision-language--multimodal) | 🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 2 | 0 | 9 |
+| [Model Architectures — Audio / Speech](#model-architectures--audio--speech) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
+| [Model Architectures — Speculative Decoding Draft Models](#model-architectures--speculative-decoding-draft-models) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
+| [Quantization Methods](#quantization-methods) | 🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥 | 4 | 0 | 8 |
+| [Attention Backends](#attention-backends) | 🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥 | 5 | 0 | 8 |
+| [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥 | 19 | 0 | 3 |
+| [Structured Output / Guided Decoding](#structured-output--guided-decoding) | 🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥 | 5 | 0 | 5 |
+| [Tool Calling / Function Calling](#tool-calling--function-calling) | 🟦🟦🟦🟦🟦🟦🟥🟥 | 6 | 0 | 2 |
+| [Scheduling](#scheduling) | 🟦🟦🟦🟦🟦🟦🟥 | 6 | 0 | 1 |
+| [KV Cache](#kv-cache) | 🟦🟦🟦🟦🟥🟥🟥🟥 | 4 | 0 | 4 |
+| [LoRA & Adapters](#lora--adapters) | 🟦🟦🟥🟥🟥🟥 | 2 | 0 | 4 |
+| [Speculative Decoding](#speculative-decoding) | 🟦🟥🟥🟥🟥🟥 | 1 | 0 | 5 |
+| [Multimodal Input](#multimodal-input) | 🟦🟥🟥🟥🟥 | 1 | 0 | 4 |
+| [Embeddings & Pooling](#embeddings--pooling) | 🟦🟦🟦🟦🟥🟥🟥 | 4 | 0 | 3 |
+| [Serving Features](#serving-features) | 🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥 | 6 | 0 | 7 |
+| [Performance Optimizations](#performance-optimizations) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 7 | 0 | 4 |
+| [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥 | 6 | 0 | 8 |
+| [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟥 | 6 | 0 | 1 |
+| [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥 | 7 | 0 | 2 |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **127** | **1** | **136** |
 
 ---
 

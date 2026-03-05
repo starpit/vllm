@@ -464,10 +464,170 @@ mod fused_rope {
         };
         x.apply_op2(&positions, op)
     }
+
+    /// Apply fused rotary embedding to both Q and K in a single kernel launch.
+    ///
+    /// Allocates separate Q and K output buffers, copies inputs, then launches
+    /// one kernel that processes both. Saves one kernel launch per layer vs
+    /// calling `fused_rotary_apply` twice.
+    pub fn fused_rotary_apply_qk(
+        q: &Tensor,
+        k: &Tensor,
+        positions: &Tensor,
+        cos_sin_cache: &Tensor,
+        head_size: usize,
+    ) -> candle_core::Result<(Tensor, Tensor)> {
+        use candle_core::backend::BackendStorage;
+        use candle_core::cuda_backend::CudaDType;
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+
+        fn fwd_t<T: CudaDType + cudarc::driver::DeviceRepr>(
+            q: &Tensor,
+            k: &Tensor,
+            positions: &Tensor,
+            cos_sin_cache: &Tensor,
+            head_size: usize,
+        ) -> candle_core::Result<(Tensor, Tensor)> {
+            let (q_storage, q_layout) = q.storage_and_layout();
+            let q_cuda = match &*q_storage {
+                candle_core::Storage::Cuda(c) => c,
+                _ => candle_core::bail!("Q must be CUDA"),
+            };
+            let (k_storage, k_layout) = k.storage_and_layout();
+            let k_cuda = match &*k_storage {
+                candle_core::Storage::Cuda(c) => c,
+                _ => candle_core::bail!("K must be CUDA"),
+            };
+            let (pos_storage, pos_layout) = positions.storage_and_layout();
+            let pos_cuda = match &*pos_storage {
+                candle_core::Storage::Cuda(c) => c,
+                _ => candle_core::bail!("positions must be CUDA"),
+            };
+            let (cache_storage, cache_layout) = cos_sin_cache.storage_and_layout();
+            let cache_cuda = match &*cache_storage {
+                candle_core::Storage::Cuda(c) => c,
+                _ => candle_core::bail!("cos_sin_cache must be CUDA"),
+            };
+
+            let dev = q_cuda.device();
+            let stream = dev.cuda_stream();
+            let num_tokens = pos_layout.shape().dims1()?;
+            let q_elem = q_layout.shape().elem_count();
+            let k_elem = k_layout.shape().elem_count();
+            let total_q_dim = q_elem / num_tokens;
+            let total_k_dim = k_elem / num_tokens;
+            let rotary_dim = cache_layout.shape().dims()[1];
+
+            // Get raw pointers.
+            let q_slice = q_cuda.as_cuda_slice::<T>()?.slice(q_layout.start_offset()..);
+            let k_slice = k_cuda.as_cuda_slice::<T>()?.slice(k_layout.start_offset()..);
+            let pos_slice = pos_cuda.as_cuda_slice::<u32>()?.slice(pos_layout.start_offset()..);
+            let cache_slice = cache_cuda.as_cuda_slice::<T>()?.slice(cache_layout.start_offset()..);
+
+            // Allocate separate output buffers.
+            let q_dst = unsafe { dev.alloc::<T>(q_elem)? };
+            let k_dst = unsafe { dev.alloc::<T>(k_elem)? };
+
+            unsafe {
+                let (q_src_ptr, _g1) = q_slice.device_ptr(&stream);
+                let (k_src_ptr, _g2) = k_slice.device_ptr(&stream);
+                let (q_dst_ptr, _g3) = q_dst.device_ptr(&stream);
+                let (k_dst_ptr, _g4) = k_dst.device_ptr(&stream);
+                let (pos_ptr, _g5) = pos_slice.device_ptr(&stream);
+                let (cache_ptr, _g6) = cache_slice.device_ptr(&stream);
+
+                // Copy Q and K to output buffers.
+                let q_bytes = q_elem * std::mem::size_of::<T>();
+                let k_bytes = k_elem * std::mem::size_of::<T>();
+                cudarc::driver::result::memcpy_dtod_async(
+                    q_dst_ptr, q_src_ptr, q_bytes, stream.cu_stream(),
+                ).map_err(|e| candle_core::Error::Msg(format!("dtod Q: {e}")))?;
+                cudarc::driver::result::memcpy_dtod_async(
+                    k_dst_ptr, k_src_ptr, k_bytes, stream.cu_stream(),
+                ).map_err(|e| candle_core::Error::Msg(format!("dtod K: {e}")))?;
+
+                // Single kernel launch for both Q and K.
+                match q.dtype() {
+                    candle_core::DType::F32 => {
+                        super::cuda_ffi::rotary_embedding_f32(
+                            pos_ptr as *const u32,
+                            q_dst_ptr as *mut f32,
+                            k_dst_ptr as *mut f32,
+                            cache_ptr as *const f32,
+                            rotary_dim as i32,
+                            total_q_dim as i32,
+                            total_k_dim as i32,
+                            head_size as i32,
+                            num_tokens as i32,
+                        );
+                    }
+                    candle_core::DType::F16 => {
+                        super::cuda_ffi::rotary_embedding_f16(
+                            pos_ptr as *const u32,
+                            q_dst_ptr as *mut u16,
+                            k_dst_ptr as *mut u16,
+                            cache_ptr as *const u16,
+                            rotary_dim as i32,
+                            total_q_dim as i32,
+                            total_k_dim as i32,
+                            head_size as i32,
+                            num_tokens as i32,
+                        );
+                    }
+                    candle_core::DType::BF16 => {
+                        super::cuda_ffi::rotary_embedding_bf16(
+                            pos_ptr as *const u32,
+                            q_dst_ptr as *mut u16,
+                            k_dst_ptr as *mut u16,
+                            cache_ptr as *const u16,
+                            rotary_dim as i32,
+                            total_q_dim as i32,
+                            total_k_dim as i32,
+                            head_size as i32,
+                            num_tokens as i32,
+                        );
+                    }
+                    dt => candle_core::bail!("fused RoPE QK unsupported dtype {dt:?}"),
+                }
+            }
+
+            let q_out_storage = candle_core::CudaStorage::wrap_cuda_slice(q_dst, dev.clone());
+            let k_out_storage = candle_core::CudaStorage::wrap_cuda_slice(k_dst, dev.clone());
+
+            let q_out = candle_core::Tensor::from_storage(
+                candle_core::Storage::Cuda(q_out_storage),
+                q.shape().clone(),
+                candle_core::op::BackpropOp::none(),
+                false,
+            );
+            let k_out = candle_core::Tensor::from_storage(
+                candle_core::Storage::Cuda(k_out_storage),
+                k.shape().clone(),
+                candle_core::op::BackpropOp::none(),
+                false,
+            );
+
+            Ok((q_out, k_out))
+        }
+
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let positions = positions.contiguous()?;
+
+        match q.dtype() {
+            candle_core::DType::F32 => fwd_t::<f32>(&q, &k, &positions, cos_sin_cache, head_size),
+            candle_core::DType::F16 => fwd_t::<half::f16>(&q, &k, &positions, cos_sin_cache, head_size),
+            candle_core::DType::BF16 => fwd_t::<half::bf16>(&q, &k, &positions, cos_sin_cache, head_size),
+            dt => candle_core::bail!("fused RoPE QK unsupported dtype {dt:?}"),
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
 pub use fused_rope::fused_rotary_apply;
+
+#[cfg(feature = "cuda")]
+pub use fused_rope::fused_rotary_apply_qk;
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -178,11 +178,10 @@ pub fn rotary_embedding(
 ) -> candle_core::Result<(Tensor, Tensor)> {
     #[cfg(feature = "cuda")]
     if q.device().is_cuda() {
-        let q_rot =
-            vllm_kernels::rotary::fused_rotary_apply(q, positions, cos_sin_cache, head_size)?;
-        let k_rot =
-            vllm_kernels::rotary::fused_rotary_apply(k, positions, cos_sin_cache, head_size)?;
-        return Ok((q_rot, k_rot));
+        // Fused Q+K RoPE: single kernel launch for both tensors.
+        return vllm_kernels::rotary::fused_rotary_apply_qk(
+            q, k, positions, cos_sin_cache, head_size,
+        );
     }
     let _ = (q, k, positions);
     candle_core::bail!("ops::rotary_embedding requires CUDA; use RotaryEmbedding::apply() on CPU")

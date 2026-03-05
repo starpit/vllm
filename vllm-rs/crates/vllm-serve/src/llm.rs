@@ -28,6 +28,7 @@ pub use vllm_common::SamplingParams;
 use vllm_config::CudaGraphConfig;
 use vllm_engine::core_client::{EngineCoreClient, InprocClient};
 
+use crate::chat_template::ChatTemplate;
 use crate::detokenizer::IncrementalDetokenizer;
 use crate::init::VllmConfig;
 use crate::tokenizer::Tokenizer;
@@ -272,6 +273,7 @@ impl LLMBuilder {
 pub struct LLM {
     client: InprocClient,
     tokenizer: Option<Arc<Tokenizer>>,
+    chat_template: Option<ChatTemplate>,
     model_name: String,
     max_model_len: usize,
 }
@@ -295,6 +297,7 @@ impl LLM {
         Ok(Self {
             client: stack.client,
             tokenizer: stack.tokenizer,
+            chat_template: stack.chat_template,
             model_name: stack.model_name,
             max_model_len: stack.max_model_len,
         })
@@ -499,15 +502,161 @@ impl LLM {
 
     /// Generate a chat completion from a list of messages.
     ///
-    /// TODO: Re-implement using sync path (needs chat template applied to
-    /// messages → token IDs, then reuse the same step loop as generate()).
-    /// For now this is unimplemented since the bench only uses generate().
+    /// Applies the model's chat template to produce a prompt, then runs the
+    /// same sync engine loop as [`generate()`](Self::generate).
     pub fn chat(
         &mut self,
-        _messages: &[ChatMessage],
-        _params: Option<SamplingParams>,
+        messages: &[ChatMessage],
+        params: Option<SamplingParams>,
     ) -> Result<RequestOutput> {
-        anyhow::bail!("LLM::chat() not yet implemented on sync path")
+        let tpl = self
+            .chat_template
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("model does not have a chat template"))?;
+
+        // Convert ChatMessages to serde_json::Value for the template engine.
+        let msg_values: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": m.role,
+                    "content": m.content,
+                })
+            })
+            .collect();
+
+        let prompt = tpl
+            .apply(&msg_values, true, None)
+            .map_err(|e| anyhow::anyhow!("chat template render failed: {e}"))?;
+
+        let mut results = self.generate(&[prompt.as_str()], params)?;
+        results
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("generate returned no results"))
+    }
+
+    /// Generate a single streaming chat turn: yields token strings as they
+    /// are generated, then returns the full output.
+    ///
+    /// The callback is invoked with each new token text fragment. This enables
+    /// print-as-you-go UX for the CLI chat command.
+    pub fn chat_stream(
+        &mut self,
+        messages: &[ChatMessage],
+        params: Option<SamplingParams>,
+        mut on_token: impl FnMut(&str),
+    ) -> Result<RequestOutput> {
+        let tpl = self
+            .chat_template
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("model does not have a chat template"))?;
+
+        let msg_values: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": m.role,
+                    "content": m.content,
+                })
+            })
+            .collect();
+
+        let prompt = tpl
+            .apply(&msg_values, true, None)
+            .map_err(|e| anyhow::anyhow!("chat template render failed: {e}"))?;
+
+        let params = params.unwrap_or_default();
+        params
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
+
+        // Tokenize the rendered prompt.
+        let prompt_token_ids = self.tokenize_text(&prompt)?;
+        let mut sp = params.clone();
+        self.resolve_max_tokens(&mut sp, prompt_token_ids.len());
+
+        let request_id = format!("llm-chat-{}", uuid::Uuid::new_v4());
+        self.client
+            .add_request(EngineCoreRequest {
+                request_id: request_id.clone(),
+                prompt_token_ids: Some(prompt_token_ids.clone()),
+                sampling_params: Some(sp),
+                arrival_time: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64(),
+                client_index: 0,
+                priority: 0,
+                cache_salt: None,
+                data_parallel_rank: None,
+                is_pooling: false,
+                mm_data: None,
+            })
+            .map_err(|e| anyhow::anyhow!("add_request failed: {e}"))?;
+
+        // Step loop with incremental detokenization for streaming output.
+        let mut all_token_ids: Vec<u32> = Vec::new();
+        let mut finish_reason: Option<String> = None;
+        let mut detok = self.tokenizer.as_ref().map(|tok| {
+            IncrementalDetokenizer::new(
+                Arc::clone(tok),
+                &prompt_token_ids,
+                params.stop.clone(),
+                params.min_tokens,
+                params.include_stop_str_in_output,
+                params.skip_special_tokens,
+            )
+        });
+        let mut full_text = String::new();
+
+        while self.client.engine().has_unfinished_requests() {
+            let (outputs, _) = self
+                .client
+                .get_output()
+                .map_err(|e| anyhow::anyhow!("engine step failed: {e}"))?;
+
+            for output in &outputs.outputs {
+                if output.request_id != request_id {
+                    continue;
+                }
+                all_token_ids.extend_from_slice(&output.new_token_ids);
+                if let Some(ref reason) = output.finish_reason {
+                    finish_reason = Some(reason.to_string());
+                }
+
+                // Incremental detokenize and stream.
+                if let Some(ref mut d) = detok {
+                    d.update(&output.new_token_ids, false);
+                    let new_text = d.get_next_output_text(false, false);
+                    if !new_text.is_empty() {
+                        on_token(&new_text);
+                        full_text.push_str(&new_text);
+                    }
+                }
+            }
+        }
+
+        // Flush any remaining detokenizer state.
+        if let Some(ref mut d) = detok {
+            let remaining = d.get_next_output_text(true, false);
+            if !remaining.is_empty() {
+                on_token(&remaining);
+                full_text.push_str(&remaining);
+            }
+        }
+
+        Ok(RequestOutput {
+            request_id,
+            prompt: Some(prompt),
+            prompt_token_ids,
+            outputs: vec![CompletionOutput {
+                index: 0,
+                text: full_text,
+                token_ids: all_token_ids,
+                finish_reason,
+            }],
+            finished: true,
+        })
     }
 }
 

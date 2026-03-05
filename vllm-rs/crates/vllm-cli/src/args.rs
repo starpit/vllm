@@ -28,6 +28,15 @@ pub enum Commands {
     Bench(BenchCommand),
     /// Process a batch of OpenAI-compatible requests offline.
     Batch(BatchArgs),
+    /// Process a batch of OpenAI-compatible requests offline (alias for `batch`).
+    #[command(name = "run-batch")]
+    RunBatch(BatchArgs),
+    /// Generate chat completions via the running API server.
+    Chat(ChatArgs),
+    /// Collect and print environment information for bug reports.
+    CollectEnv(CollectEnvArgs),
+    /// Generate text completions via the running API server.
+    Complete(CompleteArgs),
     /// Convert model weights between formats (stub).
     Convert(ConvertArgs),
     /// Live TUI dashboard — monitor a running vllm server.
@@ -218,6 +227,113 @@ impl ServeArgs {
         }
     }
 }
+
+/// Arguments for the `chat` subcommand.
+///
+/// Supports two modes:
+/// - **In-process** (default when `--model` is given): loads the model locally
+///   and runs inference directly — no server needed.
+/// - **Remote** (when `--url` is given without `--model`): connects to a
+///   running vLLM server's OpenAI-compatible API.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm chat [MODEL] [OPTIONS]")]
+pub struct ChatArgs {
+    /// Model to load in-process: local path or HuggingFace model ID.
+    /// When set, runs inference locally without needing a running server.
+    pub model_tag: Option<String>,
+
+    /// Model: local path or HuggingFace model ID (alternative to positional arg).
+    #[arg(long, env = "VLLM_MODEL")]
+    pub model: Option<String>,
+
+    /// URL of a running OpenAI-compatible API server (remote mode).
+    /// Used only when no --model is specified.
+    #[arg(long, default_value = "http://localhost:8000/v1")]
+    pub url: String,
+
+    /// Model name to request from the remote server.
+    #[arg(long)]
+    pub model_name: Option<String>,
+
+    /// API key for remote server authentication.
+    #[arg(long, env = "OPENAI_API_KEY")]
+    pub api_key: Option<String>,
+
+    /// System prompt to prepend to the conversation.
+    #[arg(long)]
+    pub system_prompt: Option<String>,
+
+    /// Send a single message and exit (non-interactive mode).
+    #[arg(short = 'q', long, value_name = "MESSAGE")]
+    pub quick: Option<String>,
+
+    /// Send a single prompt, print the response, and exit.
+    /// Unlike --quick, this is intended for scripting and benchmarking.
+    #[arg(short = 'p', long, value_name = "PROMPT")]
+    pub prompt: Option<String>,
+
+    /// Print performance metrics after generation: startup time, TTFT,
+    /// inter-token latency (ITL), and tokens/sec. Best used with --prompt.
+    #[arg(long)]
+    pub bench: bool,
+
+    /// Device: "cpu", "cuda:N", "metal", or "auto" (auto-detect best GPU).
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
+    pub dtype: String,
+
+    /// HuggingFace token for gated models.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Specific GGUF filename to download from a HuggingFace repo.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+
+    /// Maximum model context length (overrides config.json).
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+}
+
+impl ChatArgs {
+    /// Resolve the effective model path/ID (if any).
+    pub fn resolved_model(&self) -> Option<String> {
+        self.model_tag.clone().or_else(|| self.model.clone())
+    }
+}
+
+/// Arguments for the `complete` subcommand.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm complete [OPTIONS]")]
+pub struct CompleteArgs {
+    /// URL of the running OpenAI-compatible API server.
+    #[arg(long, default_value = "http://localhost:8000/v1")]
+    pub url: String,
+
+    /// Model name for completions (default: first model from server).
+    #[arg(long)]
+    pub model_name: Option<String>,
+
+    /// API key for authentication.
+    #[arg(long, env = "OPENAI_API_KEY")]
+    pub api_key: Option<String>,
+
+    /// Maximum number of tokens to generate.
+    #[arg(long)]
+    pub max_tokens: Option<usize>,
+
+    /// Send a single prompt and exit (non-interactive mode).
+    #[arg(short = 'q', long, value_name = "PROMPT")]
+    pub quick: Option<String>,
+}
+
+/// Arguments for the `collect-env` subcommand (no options).
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm collect-env")]
+pub struct CollectEnvArgs {}
 
 /// Arguments for the `batch` subcommand.
 #[derive(Parser, Debug)]
@@ -565,5 +681,234 @@ mod tests {
             }
             _ => panic!("expected Serve command"),
         }
+    }
+
+    // -- Chat command tests --
+
+    #[test]
+    fn test_chat_defaults_remote_mode() {
+        let cli = Cli::parse_from(["vllm", "chat"]);
+        match cli.command {
+            Commands::Chat(args) => {
+                assert!(args.resolved_model().is_none());
+                assert_eq!(args.url, "http://localhost:8000/v1");
+                assert!(args.system_prompt.is_none());
+                assert!(args.quick.is_none());
+                assert!(args.prompt.is_none());
+                assert!(!args.bench);
+                assert_eq!(args.device, "auto");
+                assert_eq!(args.dtype, "auto");
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn test_chat_inproc_positional_model() {
+        let cli = Cli::parse_from(["vllm", "chat", "Qwen/Qwen2.5-0.5B"]);
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.resolved_model().unwrap(), "Qwen/Qwen2.5-0.5B");
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn test_chat_inproc_flag_model() {
+        let cli = Cli::parse_from(["vllm", "chat", "--model", "my-model", "--device", "cpu"]);
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.resolved_model().unwrap(), "my-model");
+                assert_eq!(args.device, "cpu");
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn test_chat_positional_takes_precedence() {
+        let cli = Cli::parse_from(["vllm", "chat", "positional", "--model", "flag"]);
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.resolved_model().unwrap(), "positional");
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn test_chat_quick_short_flag() {
+        let cli = Cli::parse_from(["vllm", "chat", "-q", "hello"]);
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.quick.as_deref(), Some("hello"));
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn test_chat_prompt_and_bench() {
+        let cli = Cli::parse_from([
+            "vllm",
+            "chat",
+            "my-model",
+            "--prompt",
+            "Tell me a joke",
+            "--bench",
+        ]);
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.prompt.as_deref(), Some("Tell me a joke"));
+                assert!(args.bench);
+                assert_eq!(args.resolved_model().unwrap(), "my-model");
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn test_chat_system_prompt() {
+        let cli = Cli::parse_from([
+            "vllm",
+            "chat",
+            "--system-prompt",
+            "You are a pirate.",
+            "--url",
+            "http://example.com/v1",
+        ]);
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.system_prompt.as_deref(), Some("You are a pirate."));
+                assert_eq!(args.url, "http://example.com/v1");
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    #[test]
+    fn test_chat_all_inproc_options() {
+        let cli = Cli::parse_from([
+            "vllm",
+            "chat",
+            "my-model",
+            "--device",
+            "metal",
+            "--dtype",
+            "float16",
+            "--max-model-len",
+            "4096",
+            "--gguf-file",
+            "model.gguf",
+        ]);
+        match cli.command {
+            Commands::Chat(args) => {
+                assert_eq!(args.device, "metal");
+                assert_eq!(args.dtype, "float16");
+                assert_eq!(args.max_model_len, Some(4096));
+                assert_eq!(args.gguf_file.as_deref(), Some("model.gguf"));
+            }
+            _ => panic!("expected Chat command"),
+        }
+    }
+
+    // -- Complete command tests --
+
+    #[test]
+    fn test_complete_defaults() {
+        let cli = Cli::parse_from(["vllm", "complete"]);
+        match cli.command {
+            Commands::Complete(args) => {
+                assert_eq!(args.url, "http://localhost:8000/v1");
+                assert!(args.model_name.is_none());
+                assert!(args.max_tokens.is_none());
+                assert!(args.quick.is_none());
+            }
+            _ => panic!("expected Complete command"),
+        }
+    }
+
+    #[test]
+    fn test_complete_all_options() {
+        let cli = Cli::parse_from([
+            "vllm",
+            "complete",
+            "--url",
+            "http://host:9000/v1",
+            "--model-name",
+            "gpt-4",
+            "--max-tokens",
+            "256",
+            "-q",
+            "Once upon a time",
+        ]);
+        match cli.command {
+            Commands::Complete(args) => {
+                assert_eq!(args.url, "http://host:9000/v1");
+                assert_eq!(args.model_name.as_deref(), Some("gpt-4"));
+                assert_eq!(args.max_tokens, Some(256));
+                assert_eq!(args.quick.as_deref(), Some("Once upon a time"));
+            }
+            _ => panic!("expected Complete command"),
+        }
+    }
+
+    // -- run-batch alias tests --
+
+    #[test]
+    fn test_run_batch_alias() {
+        let cli = Cli::parse_from([
+            "vllm",
+            "run-batch",
+            "my-model",
+            "-i",
+            "in.jsonl",
+            "-o",
+            "out.jsonl",
+        ]);
+        match cli.command {
+            Commands::RunBatch(args) => {
+                assert_eq!(args.resolved_model().unwrap(), "my-model");
+                assert_eq!(args.input, "in.jsonl");
+                assert_eq!(args.output, "out.jsonl");
+            }
+            _ => panic!("expected RunBatch command"),
+        }
+    }
+
+    #[test]
+    fn test_run_batch_same_args_as_batch() {
+        // Verify run-batch accepts all the same flags as batch.
+        let cli = Cli::parse_from([
+            "vllm",
+            "run-batch",
+            "--model",
+            "flag-model",
+            "-i",
+            "in.jsonl",
+            "-o",
+            "out.jsonl",
+            "--device",
+            "cuda:0",
+            "--dtype",
+            "bfloat16",
+        ]);
+        match cli.command {
+            Commands::RunBatch(args) => {
+                assert_eq!(args.resolved_model().unwrap(), "flag-model");
+                assert_eq!(args.device, "cuda:0");
+                assert_eq!(args.dtype, "bfloat16");
+            }
+            _ => panic!("expected RunBatch command"),
+        }
+    }
+
+    // -- collect-env tests --
+
+    #[test]
+    fn test_collect_env_no_args() {
+        let cli = Cli::parse_from(["vllm", "collect-env"]);
+        assert!(matches!(cli.command, Commands::CollectEnv(_)));
     }
 }

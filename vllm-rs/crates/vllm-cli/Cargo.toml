@@ -19,7 +19,7 @@ chat-template = ["vllm-serve/chat-template"]
 tls = ["vllm-serve/tls"]
 metrics = ["vllm-serve/metrics"]
 multiproc = ["vllm-serve/multiproc"]
-top = ["ratatui", "crossterm", "reqwest", "tokio-stream", "vllm-serve/top"]
+top = ["ratatui", "crossterm", "tokio-stream", "vllm-serve/top"]
 
 [[bin]]
 name = "vllm"
@@ -45,7 +45,8 @@ libc = { workspace = true }
 core-foundation = { workspace = true }
 ratatui = { workspace = true, optional = true }
 crossterm = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
 tokio-stream = { workspace = true, optional = true }
 
 [dev-dependencies]

@@ -140,6 +140,8 @@ pub struct InitializedSyncStack {
     pub client: InprocClient,
     /// Optional tokenizer for encoding prompts / decoding outputs.
     pub tokenizer: Option<Arc<Tokenizer>>,
+    /// Optional chat template for formatting chat messages.
+    pub chat_template: Option<ChatTemplate>,
     /// Model name for display.
     pub model_name: String,
     /// Maximum model length.
@@ -450,9 +452,11 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
         "init engine (load model, create kv cache) took {:.2} seconds",
         init_start.elapsed().as_secs_f64()
     );
+    let chat_template = core.model_dir.as_deref().and_then(try_load_chat_template);
     Ok(InitializedSyncStack {
         client: core.client,
         tokenizer: core.tokenizer,
+        chat_template,
         model_name: core.model_name,
         max_model_len: core.max_model_len,
     })

@@ -23,7 +23,10 @@ async fn main() -> anyhow::Result<()> {
         Commands::Serve(args) => commands::serve::run_serve(*args).await,
         #[cfg(feature = "bench")]
         Commands::Bench(cmd) => commands::bench::run_bench(cmd).await,
-        Commands::Batch(args) => commands::batch::run_batch(args).await,
+        Commands::Batch(args) | Commands::RunBatch(args) => commands::batch::run_batch(args).await,
+        Commands::Chat(args) => commands::chat::run_chat(args).await,
+        Commands::CollectEnv(args) => commands::collect_env::run_collect_env(args).await,
+        Commands::Complete(args) => commands::chat::run_complete(args).await,
         Commands::Convert(args) => commands::convert::run_convert(args).await,
         #[cfg(feature = "top")]
         Commands::Top(args) => commands::top::run_top(args).await,

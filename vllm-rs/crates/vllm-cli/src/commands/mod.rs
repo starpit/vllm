@@ -6,6 +6,8 @@
 pub mod batch;
 #[cfg(feature = "bench")]
 pub mod bench;
+pub mod chat;
+pub mod collect_env;
 pub mod convert;
 pub mod serve;
 #[cfg(feature = "top")]

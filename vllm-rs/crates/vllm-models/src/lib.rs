@@ -847,7 +847,8 @@ pub trait Model: Send {
     /// * `attn_meta` — per-request slicing info for the attention layers
     /// * `kv_storage` — batched paged KV cache for all requests
     ///
-    /// Returns logits of shape `[total_tokens, vocab_size]`.
+    /// Returns logits of shape `[num_reqs, vocab_size]` — one row per request
+    /// (the last token's logits for prefill, the single token's logits for decode).
     ///
     /// The default implementation falls back to per-request `forward()` calls.
     /// Architectures opt into real batching by overriding this method to batch
@@ -861,6 +862,7 @@ pub trait Model: Send {
     ) -> ModelResult<Tensor> {
         use vllm_model::error::ModelError;
         // Default: per-request loop calling forward() and flushing immediately.
+        // Only keep the last token's logits per request to save memory.
         let mut logits_parts = Vec::with_capacity(attn_meta.num_reqs);
         for req_idx in 0..attn_meta.num_reqs {
             let (start, q_len) = attn_meta.request_slice(req_idx);
@@ -874,7 +876,13 @@ pub trait Model: Send {
             let mut storage = kv_storage.request_storage(req_idx);
             let logits = self.forward(&req_ids, &req_pos, Some(&mut storage))?;
             storage.flush()?;
-            logits_parts.push(logits);
+            // Take only the last row (the token we'll sample from).
+            let last_logits = if q_len > 1 {
+                logits.narrow(0, q_len - 1, 1).map_err(ModelError::Candle)?
+            } else {
+                logits
+            };
+            logits_parts.push(last_logits);
         }
         Tensor::cat(&logits_parts, 0).map_err(ModelError::Candle)
     }

@@ -139,6 +139,20 @@ impl AttentionMetadata {
         self.is_prefill.iter().all(|&p| !p)
     }
 
+    /// Indices of the last token per request in the flat `[total_tokens]` tensor.
+    ///
+    /// For decode requests (q_len=1) this is the token itself. For prefill
+    /// requests this is the last prompt token. Used to gather hidden states
+    /// before the LM head so we only compute `[num_reqs, vocab]` logits
+    /// instead of `[total_tokens, vocab]`.
+    pub fn sample_indices(&self) -> Vec<u32> {
+        self.query_start_loc[..self.num_reqs]
+            .iter()
+            .zip(&self.q_lens)
+            .map(|(&start, &qlen)| (start + qlen - 1) as u32)
+            .collect()
+    }
+
     /// Create metadata for a padded all-decode batch (CUDA graph capture/replay).
     ///
     /// All requests are decode (q_len=1). Padded slots (`actual_bs..padded_bs`)

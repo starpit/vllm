@@ -1044,9 +1044,23 @@ impl crate::Model for LlamaForCausalLM {
         let hidden_states = self
             .model
             .forward_batch(input_ids, positions, attn_meta, kv_storage)?;
+        // Gather only the last hidden state per request before the LM head.
+        // This reduces the logits tensor from [total_tokens, vocab] to
+        // [num_reqs, vocab], saving gigabytes of memory on large prefill batches.
+        let sampled_hidden = if attn_meta.is_all_decode() {
+            // All decode: every token is a sample point, no gathering needed.
+            hidden_states
+        } else {
+            let indices = attn_meta.sample_indices();
+            let idx = Tensor::new(indices.as_slice(), hidden_states.device())
+                .map_err(ModelError::Candle)?;
+            hidden_states
+                .index_select(&idx, 0)
+                .map_err(ModelError::Candle)?
+        };
         let logits = {
             let _p = vllm_kernels::profiling::range("lm_head");
-            self.compute_logits(&hidden_states)?
+            self.compute_logits(&sampled_hidden)?
         };
         logits.to_dtype(DType::F32).map_err(ModelError::Candle)
     }
@@ -1791,22 +1805,23 @@ mod tests {
                 .unwrap();
         batched.flush_all().unwrap();
 
-        // Split and compare.
-        let batch_a = logits_batched.narrow(0, 0, 3).unwrap();
-        let batch_b = logits_batched.narrow(0, 3, 2).unwrap();
+        // forward_batch returns [num_reqs, vocab] — one row per request
+        // (the last token's logits). Compare with the last row from sequential.
+        assert_eq!(logits_batched.dims(), &[2, 100]);
+        let batch_a = logits_batched.narrow(0, 0, 1).unwrap();
+        let batch_b = logits_batched.narrow(0, 1, 1).unwrap();
 
-        assert_eq!(batch_a.dims(), logits_a.dims());
-        assert_eq!(batch_b.dims(), logits_b.dims());
+        let last_a = logits_a.narrow(0, 2, 1).unwrap(); // last of 3 tokens
+        let last_b = logits_b.narrow(0, 1, 1).unwrap(); // last of 2 tokens
 
-        // Logits should be identical (deterministic ops, same weights).
-        let diff_a = (batch_a - logits_a).unwrap().abs().unwrap().max(0).unwrap();
+        let diff_a = (batch_a - last_a).unwrap().abs().unwrap().max(0).unwrap();
         let max_diff_a: f32 = diff_a.max(0).unwrap().to_scalar().unwrap();
         assert!(
             max_diff_a < 1e-4,
             "Request A logits differ: max_diff={max_diff_a}"
         );
 
-        let diff_b = (batch_b - logits_b).unwrap().abs().unwrap().max(0).unwrap();
+        let diff_b = (batch_b - last_b).unwrap().abs().unwrap().max(0).unwrap();
         let max_diff_b: f32 = diff_b.max(0).unwrap().to_scalar().unwrap();
         assert!(
             max_diff_b < 1e-4,
@@ -1851,8 +1866,10 @@ mod tests {
             crate::Model::forward_batch(&model, &ids, &pos, &attn_meta, &mut batched).unwrap();
         batched.flush_all().unwrap();
 
-        assert_eq!(logits_batch.dims(), logits_seq.dims());
-        let diff = (logits_batch - logits_seq)
+        // forward_batch returns [1, vocab] (last token's logits only).
+        assert_eq!(logits_batch.dims(), &[1, 100]);
+        let last_seq = logits_seq.narrow(0, 3, 1).unwrap(); // last of 4 tokens
+        let diff = (logits_batch - last_seq)
             .unwrap()
             .abs()
             .unwrap()

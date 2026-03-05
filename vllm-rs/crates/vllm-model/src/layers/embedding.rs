@@ -93,6 +93,10 @@ pub struct VocabParallelEmbedding {
     vocab_start: usize,
     /// End index (exclusive) for this rank's vocab shard.
     vocab_end: usize,
+    /// Pre-computed vocab_start as i64 scalar (avoids per-forward allocation).
+    vocab_start_i64: i64,
+    /// Pre-computed shard_size as i64 scalar (avoids per-forward allocation).
+    shard_size_i64: i64,
     /// NCCL process group for all-reduce (used when TP > 1).
     tp_group: Option<Arc<dyn ProcessGroup>>,
 }
@@ -100,10 +104,13 @@ pub struct VocabParallelEmbedding {
 impl VocabParallelEmbedding {
     /// Create from an already-sharded embedding.
     pub fn new(embedding: Embedding, vocab_start: usize, vocab_end: usize) -> Self {
+        let shard_size_i64 = (vocab_end - vocab_start) as i64;
         Self {
             inner: embedding,
             vocab_start,
             vocab_end,
+            vocab_start_i64: vocab_start as i64,
+            shard_size_i64,
             tp_group: None,
         }
     }
@@ -129,6 +136,8 @@ impl VocabParallelEmbedding {
             inner: Embedding::new(shard),
             vocab_start,
             vocab_end,
+            vocab_start_i64: vocab_start as i64,
+            shard_size_i64: shard_size as i64,
             tp_group: None,
         })
     }
@@ -160,31 +169,19 @@ impl VocabParallelEmbedding {
 
         // TP>1: offset IDs to local shard, lookup, mask out-of-range, all-reduce.
         let shard_size = self.vocab_end - self.vocab_start;
-        let device = ids.device();
 
-        // Create offset: local_ids = global_ids - vocab_start
-        let offset = Tensor::new(&[self.vocab_start as u32], device)
-            .map_err(ModelError::Candle)?
-            .broadcast_as(ids.shape())
-            .map_err(ModelError::Candle)?;
-
-        // Compute local IDs (may underflow for out-of-range — we'll mask those).
-        // Use i64 to handle negative values from subtraction.
+        // Compute local IDs using affine transform (no tensor allocation).
+        // affine(1.0, -vocab_start) computes element-wise: id - vocab_start.
         let ids_i64 = ids.to_dtype(DType::I64).map_err(ModelError::Candle)?;
-        let offset_i64 = offset.to_dtype(DType::I64).map_err(ModelError::Candle)?;
-        let local_ids = ids_i64.sub(&offset_i64).map_err(ModelError::Candle)?;
-
-        // Build mask: true where IDs are in this rank's range [0, shard_size).
-        let zeros =
-            Tensor::zeros(local_ids.shape(), DType::I64, device).map_err(ModelError::Candle)?;
-        let shard_max = Tensor::new(&[shard_size as i64], device)
-            .map_err(ModelError::Candle)?
-            .broadcast_as(local_ids.shape())
+        let local_ids = ids_i64
+            .affine(1.0, -(self.vocab_start_i64 as f64))
             .map_err(ModelError::Candle)?;
+
+        // Build mask using scalar comparisons (no zeros/shard_max tensor allocations).
         let in_range = local_ids
-            .ge(&zeros)
+            .ge(0i64)
             .map_err(ModelError::Candle)?
-            .mul(&local_ids.lt(&shard_max).map_err(ModelError::Candle)?)
+            .mul(&local_ids.lt(self.shard_size_i64).map_err(ModelError::Candle)?)
             .map_err(ModelError::Candle)?;
 
         // Clamp local IDs to valid range for lookup (out-of-range will be zeroed).

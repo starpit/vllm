@@ -303,19 +303,17 @@ impl InputBatch {
             query_start_loc,
             q_lens,
             seq_lens,
-            batch_block_ids.clone(),
-            batch_tokens_before.clone(),
+            batch_block_ids,
+            batch_tokens_before,
             is_prefill_vec,
             batch_req_ids,
         );
 
         PreparedInputs {
             req_inputs,
-            flat_token_ids: self.flat_token_ids.clone(),
-            flat_positions: self.flat_positions.clone(),
+            flat_token_ids: std::mem::take(&mut self.flat_token_ids),
+            flat_positions: std::mem::take(&mut self.flat_positions),
             attn_meta,
-            batch_block_ids,
-            batch_tokens_before,
         }
     }
 
@@ -383,16 +381,12 @@ impl InputBatch {
 pub struct PreparedInputs {
     /// Per-request slicing info.
     pub req_inputs: Vec<ReqSlice>,
-    /// Flat token IDs for all requests (owned copy).
+    /// Flat token IDs for all requests (moved from InputBatch).
     pub flat_token_ids: Vec<u32>,
-    /// Flat positions for all requests (owned copy).
+    /// Flat positions for all requests (moved from InputBatch).
     pub flat_positions: Vec<u32>,
-    /// Attention metadata.
+    /// Attention metadata (also owns block_ids and tokens_before).
     pub attn_meta: AttentionMetadata,
-    /// Per-request block IDs (clone of block_tables).
-    pub batch_block_ids: Vec<Vec<usize>>,
-    /// Per-request tokens-before counts.
-    pub batch_tokens_before: Vec<usize>,
 }
 
 /// Per-request slice info within the flat tensors.
@@ -511,7 +505,7 @@ mod tests {
         assert_eq!(prepared.flat_token_ids, &[99]);
         assert_eq!(prepared.req_inputs[0].token_count, 1);
         assert!(!prepared.attn_meta.is_prefill[0]);
-        assert_eq!(prepared.batch_tokens_before[0], 3);
+        assert_eq!(prepared.attn_meta.tokens_before[0], 3);
     }
 
     #[test]

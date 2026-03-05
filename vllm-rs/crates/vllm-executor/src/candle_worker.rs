@@ -1961,7 +1961,7 @@ impl Worker for CandleWorker {
 
         if use_paged {
             // Use InputBatch to prepare flat tensors and metadata.
-            let prepared = self
+            let mut prepared = self
                 .input_batch
                 .prepare_inputs(&scheduler_output.scheduled_spec_decode_tokens);
 
@@ -2025,30 +2025,67 @@ impl Worker for CandleWorker {
 
             let pool = self.kv_block_pool.as_mut().unwrap();
 
-            #[cfg(feature = "cuda")]
-            let mut batched_storage = vllm_models::BatchedKvCacheStorage::with_contiguous_kv(
-                pool,
-                prepared.batch_block_ids,
-                prepared.batch_tokens_before,
-                contiguous_kv,
-            );
-            #[cfg(not(feature = "cuda"))]
-            let mut batched_storage = vllm_models::BatchedKvCacheStorage::new(
-                pool,
-                prepared.batch_block_ids,
-                prepared.batch_tokens_before,
-            );
-
             let all_logits_flat = if let Some(graph_logits) = cuda_graph_logits {
-                // Graph replay succeeded — still flush real KV scatter eagerly.
+                // Graph replay succeeded — build storage and flush KV scatter.
+                // Take block_ids/tokens_before from attn_meta (no clone needed
+                // since graph path doesn't use attn_meta during forward).
+                let batch_block_ids = std::mem::take(&mut prepared.attn_meta.block_ids);
+                let batch_tokens_before =
+                    std::mem::take(&mut prepared.attn_meta.tokens_before);
+
+                #[cfg(feature = "cuda")]
+                let mut batched_storage =
+                    vllm_models::BatchedKvCacheStorage::with_contiguous_kv(
+                        pool,
+                        batch_block_ids,
+                        batch_tokens_before,
+                        contiguous_kv,
+                    );
+                #[cfg(not(feature = "cuda"))]
+                let mut batched_storage = vllm_models::BatchedKvCacheStorage::new(
+                    pool,
+                    batch_block_ids,
+                    batch_tokens_before,
+                );
+
                 #[cfg(feature = "profiling")]
                 let _kv_guard = vllm_kernels::profiling::range("kv_flush");
                 batched_storage.flush_all().map_err(|e| {
                     ExecutorError::WorkerExecution(format!("scatter flush error: {e}"))
                 })?;
+
+                // Extract updated contiguous KV buffers for persistence.
+                #[cfg(feature = "cuda")]
+                {
+                    let updated_kv = batched_storage.take_all_contiguous_kv();
+                    for (i, kv) in updated_kv.into_iter().enumerate() {
+                        if let Some(kv_vec) = kv {
+                            self.contiguous_kv_cache
+                                .insert(prepared.req_inputs[i].req_id.clone(), kv_vec);
+                        }
+                    }
+                }
+
                 graph_logits
             } else {
                 // Eager forward path (no CUDA graph or not all-decode).
+                // BatchedKvCacheStorage borrows block_ids/tokens_before from
+                // attn_meta via clone, since attn_meta is still needed during forward.
+                #[cfg(feature = "cuda")]
+                let mut batched_storage =
+                    vllm_models::BatchedKvCacheStorage::with_contiguous_kv(
+                        pool,
+                        prepared.attn_meta.block_ids.clone(),
+                        prepared.attn_meta.tokens_before.clone(),
+                        contiguous_kv,
+                    );
+                #[cfg(not(feature = "cuda"))]
+                let mut batched_storage = vllm_models::BatchedKvCacheStorage::new(
+                    pool,
+                    prepared.attn_meta.block_ids.clone(),
+                    prepared.attn_meta.tokens_before.clone(),
+                );
+
                 let logits = {
                     #[cfg(feature = "profiling")]
                     let _fwd_guard = vllm_kernels::profiling::range("forward");
@@ -2073,20 +2110,20 @@ impl Worker for CandleWorker {
                     })?;
                 }
 
-                logits
-            };
-
-            // Extract updated contiguous KV buffers for persistence.
-            #[cfg(feature = "cuda")]
-            {
-                let updated_kv = batched_storage.take_all_contiguous_kv();
-                for (i, kv) in updated_kv.into_iter().enumerate() {
-                    if let Some(kv_vec) = kv {
-                        self.contiguous_kv_cache
-                            .insert(prepared.req_inputs[i].req_id.clone(), kv_vec);
+                // Extract updated contiguous KV buffers for persistence.
+                #[cfg(feature = "cuda")]
+                {
+                    let updated_kv = batched_storage.take_all_contiguous_kv();
+                    for (i, kv) in updated_kv.into_iter().enumerate() {
+                        if let Some(kv_vec) = kv {
+                            self.contiguous_kv_cache
+                                .insert(prepared.req_inputs[i].req_id.clone(), kv_vec);
+                        }
                     }
                 }
-            }
+
+                logits
+            };
 
             // Split flat logits [total_tokens, vocab] into per-request logits.
             let mut per_req_logits = Vec::with_capacity(prepared.req_inputs.len());

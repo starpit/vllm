@@ -25,6 +25,7 @@ pub mod grammar;
 pub mod granite;
 pub mod kv_block_pool;
 pub mod llama;
+pub mod marlin_linear;
 pub mod mixtral;
 pub mod ops;
 pub mod quantized_gemma3;

@@ -4,9 +4,9 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| ✅ 🟦 | Implemented | 134 |
+| ✅ 🟦 | Implemented | 136 |
 | ⚠️ 🟨 | Partial | 0 |
-| ❌ 🟥 | Not implemented | 130 |
+| ❌ 🟥 | Not implemented | 128 |
 
 ---
 
@@ -26,7 +26,7 @@
 | [Model Architectures — Vision-Language / Multimodal](#model-architectures--vision-language--multimodal) | 🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 2 | 0 | 9 |
 | [Model Architectures — Audio / Speech](#model-architectures--audio--speech) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
 | [Model Architectures — Speculative Decoding Draft Models](#model-architectures--speculative-decoding-draft-models) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
-| [Quantization Methods](#quantization-methods) | 🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥 | 4 | 0 | 8 |
+| [Quantization Methods](#quantization-methods) | 🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥 | 5 | 0 | 7 |
 | [Attention Backends](#attention-backends) | 🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥 | 5 | 0 | 8 |
 | [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥 | 21 | 0 | 1 |
 | [Structured Output / Guided Decoding](#structured-output--guided-decoding) | 🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥 | 5 | 0 | 5 |
@@ -39,10 +39,10 @@
 | [Embeddings & Pooling](#embeddings--pooling) | 🟦🟦🟦🟦🟥🟥🟥 | 4 | 0 | 3 |
 | [Serving Features](#serving-features) | 🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥 | 6 | 0 | 7 |
 | [Performance Optimizations](#performance-optimizations) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 7 | 0 | 4 |
-| [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥 | 8 | 0 | 6 |
+| [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥 | 9 | 0 | 5 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟥 | 6 | 0 | 1 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥 | 7 | 0 | 2 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **134** | **0** | **130** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **136** | **0** | **128** |
 
 ---
 
@@ -234,12 +234,12 @@
 | Method | Python | Rust | Notes |
 |---|:---:|:---:|---|
 | GGUF (all k-quant variants) | ✅ | ✅ |  |
-| GPTQ | ✅ | ✅ | Rust: LLaMA-family only; CUDA dequant kernel |
-| AWQ | ✅ | ✅ | Rust: LLaMA-family only; CUDA dequant kernel |
+| GPTQ | ✅ | ✅ | Rust: LLaMA-family; Marlin fused GEMM on CUDA SM80+ (dequant fallback on CPU/SM<80) |
+| AWQ | ✅ | ✅ | Rust: LLaMA-family; Marlin fused GEMM on CUDA SM80+ (dequant fallback on CPU/SM<80) |
 | BitsAndBytes NF4 (4-bit) | ✅ | ✅ | Rust: LLaMA-family only |
 | MLX 4-bit quantized | N/A | ✅ | Rust-only; mlx-community models |
 | FP8 (W8A8 / W8A16) | ✅ | ❌ |  |
-| Marlin kernels (AWQ/GPTQ) | ✅ | ❌ |  |
+| Marlin kernels (AWQ/GPTQ) | ✅ | ✅ | W4A16 only; auto-converts at load on SM80+ |
 | Compressed-tensors (Neural Magic) | ✅ | ❌ |  |
 | TorchAO (int4/int8/fp8) | ✅ | ❌ |  |
 | MXFP4 (microscaling) | ✅ | ❌ |  |
@@ -469,7 +469,7 @@
 | `silu_and_mul` fused activation | ✅ | ✅ | Vectorized 128-bit loads; combined gate_up variant |
 | `gelu_and_mul` fused activation | ✅ | ✅ | Vectorized 128-bit loads; combined gate_up variant |
 | Fused MoE GEMM | ✅ | ❌ |  |
-| Marlin (INT4 GEMM) | ✅ | ❌ |  |
+| Marlin (INT4 GEMM) | ✅ | ✅ | W4A16 fused dequant+GEMM; 270 kernel instantiations (FP16/BF16 × GPTQ/AWQ) |
 | FP8 GEMM | ✅ | ❌ |  |
 | Prefix caching hash kernel | ✅ | ❌ |  |
 | Custom all-reduce | ✅ | ❌ |  |

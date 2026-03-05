@@ -10,6 +10,8 @@ use candle_core::{DType, Device, Module, Tensor};
 use vllm_model::awq_config::AwqQuantizeConfig;
 use vllm_model::error::{ModelError, ModelResult};
 use vllm_model::layers::{AwqConfig, AwqLinear, Embedding, Linear, RmsNorm, RotaryEmbedding};
+
+use crate::marlin_linear::AwqOrMarlin;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
 use crate::attention::attention_with_cache;
@@ -21,9 +23,9 @@ use crate::qwen2::Qwen2Config;
 // ---------------------------------------------------------------------------
 
 struct AwqLlamaMLP {
-    gate_proj: AwqLinear,
-    up_proj: AwqLinear,
-    down_proj: AwqLinear,
+    gate_proj: AwqOrMarlin,
+    up_proj: AwqOrMarlin,
+    down_proj: AwqOrMarlin,
 }
 
 impl AwqLlamaMLP {
@@ -34,29 +36,19 @@ impl AwqLlamaMLP {
         device: &Device,
     ) -> ModelResult<Self> {
         Ok(Self {
-            gate_proj: AwqLinear::from_weights(
-                weights,
-                &format!("{prefix}.gate_proj"),
-                awq,
-                device,
-            )?,
-            up_proj: AwqLinear::from_weights(weights, &format!("{prefix}.up_proj"), awq, device)?,
-            down_proj: AwqLinear::from_weights(
-                weights,
-                &format!("{prefix}.down_proj"),
-                awq,
-                device,
-            )?,
+            gate_proj: AwqOrMarlin::load(weights, &format!("{prefix}.gate_proj"), awq, device)?,
+            up_proj: AwqOrMarlin::load(weights, &format!("{prefix}.up_proj"), awq, device)?,
+            down_proj: AwqOrMarlin::load(weights, &format!("{prefix}.down_proj"), awq, device)?,
         })
     }
 }
 
 impl Module for AwqLlamaMLP {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let gate = crate::ops::awq_forward(&self.gate_proj, x)?;
-        let up = crate::ops::awq_forward(&self.up_proj, x)?;
-        let activated = gate.silu()?.mul(&up)?;
-        crate::ops::awq_forward(&self.down_proj, &activated)
+        let gate = self.gate_proj.forward(x)?;
+        let up = self.up_proj.forward(x)?;
+        let activated = crate::ops::silu_and_mul(&gate, &up)?;
+        self.down_proj.forward(&activated)
     }
 }
 
@@ -65,10 +57,10 @@ impl Module for AwqLlamaMLP {
 // ---------------------------------------------------------------------------
 
 struct AwqLlamaAttention {
-    q_proj: AwqLinear,
-    k_proj: AwqLinear,
-    v_proj: AwqLinear,
-    o_proj: AwqLinear,
+    q_proj: AwqOrMarlin,
+    k_proj: AwqOrMarlin,
+    v_proj: AwqOrMarlin,
+    o_proj: AwqOrMarlin,
     rotary_emb: RotaryEmbedding,
     num_q_heads: usize,
     num_kv_heads: usize,
@@ -86,10 +78,10 @@ impl AwqLlamaAttention {
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
-        let q_proj = AwqLinear::from_weights(weights, &format!("{prefix}.q_proj"), awq, device)?;
-        let k_proj = AwqLinear::from_weights(weights, &format!("{prefix}.k_proj"), awq, device)?;
-        let v_proj = AwqLinear::from_weights(weights, &format!("{prefix}.v_proj"), awq, device)?;
-        let o_proj = AwqLinear::from_weights(weights, &format!("{prefix}.o_proj"), awq, device)?;
+        let q_proj = AwqOrMarlin::load(weights, &format!("{prefix}.q_proj"), awq, device)?;
+        let k_proj = AwqOrMarlin::load(weights, &format!("{prefix}.k_proj"), awq, device)?;
+        let v_proj = AwqOrMarlin::load(weights, &format!("{prefix}.v_proj"), awq, device)?;
+        let o_proj = AwqOrMarlin::load(weights, &format!("{prefix}.o_proj"), awq, device)?;
 
         let rotary_emb = RotaryEmbedding::new(
             config.head_dim,
@@ -121,9 +113,18 @@ impl AwqLlamaAttention {
     ) -> ModelResult<Tensor> {
         let num_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
 
-        let q = crate::ops::awq_forward(&self.q_proj, hidden_states).map_err(ModelError::Candle)?;
-        let k = crate::ops::awq_forward(&self.k_proj, hidden_states).map_err(ModelError::Candle)?;
-        let v = crate::ops::awq_forward(&self.v_proj, hidden_states).map_err(ModelError::Candle)?;
+        let q = self
+            .q_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
+        let k = self
+            .k_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
+        let v = self
+            .v_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
 
         let q = q
             .reshape((num_tokens, self.num_q_heads, self.head_dim))
@@ -144,7 +145,9 @@ impl AwqLlamaAttention {
             .reshape((num_tokens, self.num_q_heads * self.head_dim))
             .map_err(ModelError::Candle)?;
 
-        crate::ops::awq_forward(&self.o_proj, &attn_output).map_err(ModelError::Candle)
+        self.o_proj
+            .forward(&attn_output)
+            .map_err(ModelError::Candle)
     }
 }
 

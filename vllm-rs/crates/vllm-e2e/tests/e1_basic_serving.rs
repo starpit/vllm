@@ -1252,6 +1252,117 @@ async fn test_cuda_granite_gguf_chat_coherent() {
 }
 
 // ===========================================================================
+// CUDA Marlin W4A16 E2E tests — GPTQ and AWQ quantized models
+// ===========================================================================
+// These tests exercise the Marlin fused GEMM path: GPTQ/AWQ weights are
+// repacked to Marlin tiled format at load time, and forward passes use the
+// fused dequant+GEMM kernel (no intermediate weight allocation).
+//
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_marlin -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_marlin_gptq_server_starts() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_GPTQ_INT4)
+        .start()
+        .await
+        .expect("CUDA GPTQ Marlin server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_marlin_gptq_completion() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_GPTQ_INT4)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "GPTQ Marlin completion should not be empty"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_marlin_gptq_chat() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_GPTQ_INT4)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("What is 2+2? Answer with just the number.", Some(10));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(!text.is_empty(), "GPTQ Marlin chat should not be empty");
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_marlin_awq_server_starts() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_AWQ)
+        .start()
+        .await
+        .expect("CUDA AWQ Marlin server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_marlin_awq_completion() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_AWQ)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "AWQ Marlin completion should not be empty"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_marlin_awq_chat() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_AWQ)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("What is 2+2? Answer with just the number.", Some(10));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(!text.is_empty(), "AWQ Marlin chat should not be empty");
+}
+
+// ===========================================================================
 // CUDA MoE E2E tests — commented out, needs ≥80GB GPU
 // ===========================================================================
 // The smallest MoE safetensors models (Qwen1.5-MoE-A2.7B-Chat, Mixtral-8x7B)

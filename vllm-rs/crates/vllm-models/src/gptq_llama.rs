@@ -10,6 +10,8 @@ use candle_core::{DType, Device, Module, Tensor};
 use vllm_model::error::{ModelError, ModelResult};
 use vllm_model::gptq_config::GptqQuantizeConfig;
 use vllm_model::layers::{Embedding, GptqConfig, GptqLinear, Linear, RmsNorm, RotaryEmbedding};
+
+use crate::marlin_linear::GptqOrMarlin;
 use vllm_model::weight::{HfModelConfig, ModelWeights};
 
 use crate::attention::attention_with_cache;
@@ -21,9 +23,9 @@ use crate::qwen2::Qwen2Config;
 // ---------------------------------------------------------------------------
 
 struct GptqLlamaMLP {
-    gate_proj: GptqLinear,
-    up_proj: GptqLinear,
-    down_proj: GptqLinear,
+    gate_proj: GptqOrMarlin,
+    up_proj: GptqOrMarlin,
+    down_proj: GptqOrMarlin,
 }
 
 impl GptqLlamaMLP {
@@ -34,29 +36,19 @@ impl GptqLlamaMLP {
         device: &Device,
     ) -> ModelResult<Self> {
         Ok(Self {
-            gate_proj: GptqLinear::from_weights(
-                weights,
-                &format!("{prefix}.gate_proj"),
-                gptq,
-                device,
-            )?,
-            up_proj: GptqLinear::from_weights(weights, &format!("{prefix}.up_proj"), gptq, device)?,
-            down_proj: GptqLinear::from_weights(
-                weights,
-                &format!("{prefix}.down_proj"),
-                gptq,
-                device,
-            )?,
+            gate_proj: GptqOrMarlin::load(weights, &format!("{prefix}.gate_proj"), gptq, device)?,
+            up_proj: GptqOrMarlin::load(weights, &format!("{prefix}.up_proj"), gptq, device)?,
+            down_proj: GptqOrMarlin::load(weights, &format!("{prefix}.down_proj"), gptq, device)?,
         })
     }
 }
 
 impl Module for GptqLlamaMLP {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let gate = crate::ops::gptq_forward(&self.gate_proj, x)?;
-        let up = crate::ops::gptq_forward(&self.up_proj, x)?;
+        let gate = self.gate_proj.forward(x)?;
+        let up = self.up_proj.forward(x)?;
         let activated = crate::ops::silu_and_mul(&gate, &up)?;
-        crate::ops::gptq_forward(&self.down_proj, &activated)
+        self.down_proj.forward(&activated)
     }
 }
 
@@ -65,10 +57,10 @@ impl Module for GptqLlamaMLP {
 // ---------------------------------------------------------------------------
 
 struct GptqLlamaAttention {
-    q_proj: GptqLinear,
-    k_proj: GptqLinear,
-    v_proj: GptqLinear,
-    o_proj: GptqLinear,
+    q_proj: GptqOrMarlin,
+    k_proj: GptqOrMarlin,
+    v_proj: GptqOrMarlin,
+    o_proj: GptqOrMarlin,
     rotary_emb: RotaryEmbedding,
     num_q_heads: usize,
     num_kv_heads: usize,
@@ -86,10 +78,10 @@ impl GptqLlamaAttention {
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
-        let q_proj = GptqLinear::from_weights(weights, &format!("{prefix}.q_proj"), gptq, device)?;
-        let k_proj = GptqLinear::from_weights(weights, &format!("{prefix}.k_proj"), gptq, device)?;
-        let v_proj = GptqLinear::from_weights(weights, &format!("{prefix}.v_proj"), gptq, device)?;
-        let o_proj = GptqLinear::from_weights(weights, &format!("{prefix}.o_proj"), gptq, device)?;
+        let q_proj = GptqOrMarlin::load(weights, &format!("{prefix}.q_proj"), gptq, device)?;
+        let k_proj = GptqOrMarlin::load(weights, &format!("{prefix}.k_proj"), gptq, device)?;
+        let v_proj = GptqOrMarlin::load(weights, &format!("{prefix}.v_proj"), gptq, device)?;
+        let o_proj = GptqOrMarlin::load(weights, &format!("{prefix}.o_proj"), gptq, device)?;
 
         let rotary_emb = RotaryEmbedding::new(
             config.head_dim,
@@ -121,12 +113,18 @@ impl GptqLlamaAttention {
     ) -> ModelResult<Tensor> {
         let num_tokens = hidden_states.dim(0).map_err(ModelError::Candle)?;
 
-        let q =
-            crate::ops::gptq_forward(&self.q_proj, hidden_states).map_err(ModelError::Candle)?;
-        let k =
-            crate::ops::gptq_forward(&self.k_proj, hidden_states).map_err(ModelError::Candle)?;
-        let v =
-            crate::ops::gptq_forward(&self.v_proj, hidden_states).map_err(ModelError::Candle)?;
+        let q = self
+            .q_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
+        let k = self
+            .k_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
+        let v = self
+            .v_proj
+            .forward(hidden_states)
+            .map_err(ModelError::Candle)?;
 
         let q = q
             .reshape((num_tokens, self.num_q_heads, self.head_dim))
@@ -147,7 +145,9 @@ impl GptqLlamaAttention {
             .reshape((num_tokens, self.num_q_heads * self.head_dim))
             .map_err(ModelError::Candle)?;
 
-        crate::ops::gptq_forward(&self.o_proj, &attn_output).map_err(ModelError::Candle)
+        self.o_proj
+            .forward(&attn_output)
+            .map_err(ModelError::Candle)
     }
 }
 

@@ -14,6 +14,8 @@ pub mod cache;
 #[cfg(feature = "cuda")]
 pub mod cuda_graph;
 pub mod error;
+#[cfg(feature = "cuda")]
+pub mod marlin;
 pub mod moe;
 #[cfg(feature = "nccl")]
 pub mod nccl;

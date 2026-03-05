@@ -964,6 +964,82 @@ async fn test_cuda_gguf_gemma3_1b_chat() {
     );
 }
 
+// Qwen2.5 GGUF (qwen2 architecture with QKV bias)
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_qwen2_0_5b_server_starts() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_GGUF)
+        .start()
+        .await
+        .expect("CUDA Qwen2.5 0.5B GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let models = client.list_models().await.unwrap();
+    assert_eq!(models.data.len(), 1);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_qwen2_0_5b_chat() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_GGUF)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    assert!(
+        resp.usage.completion_tokens.unwrap_or(0) > 0,
+        "should generate at least one token"
+    );
+}
+
+// Qwen3 GGUF (qwen2 architecture in GGUF, LLaMA-compatible)
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_qwen3_0_6b_server_starts() {
+    let server = TestServer::builder(TestModels::QWEN3_0_6B_GGUF)
+        .start()
+        .await
+        .expect("CUDA Qwen3 0.6B GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let models = client.list_models().await.unwrap();
+    assert_eq!(models.data.len(), 1);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_qwen3_0_6b_chat() {
+    let server = TestServer::builder(TestModels::QWEN3_0_6B_GGUF)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    assert!(
+        resp.usage.completion_tokens.unwrap_or(0) > 0,
+        "should generate at least one token"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tensor Parallelism (TP=2) tests — require 2 CUDA GPUs + NCCL
 // ---------------------------------------------------------------------------

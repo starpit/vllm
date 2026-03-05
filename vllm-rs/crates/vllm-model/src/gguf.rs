@@ -108,6 +108,18 @@ impl GgufFile {
         })
     }
 
+    /// Get the length of an array metadata value.
+    pub fn get_metadata_array_len(&self, key: &str) -> Option<usize> {
+        use candle_core::quantized::gguf_file::Value;
+        self.content.metadata.get(key).and_then(|v| {
+            if let Value::Array(arr) = v {
+                Some(arr.len())
+            } else {
+                None
+            }
+        })
+    }
+
     /// Total number of tensors in the file.
     pub fn num_tensors(&self) -> usize {
         self.content.tensor_infos.len()
@@ -140,6 +152,7 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
     let hf_arch = match arch.as_str() {
         "llama" => "LlamaForCausalLM",
         "qwen2" => "Qwen2ForCausalLM",
+        "qwen3" | "qwen35" => "Qwen3ForCausalLM",
         "gemma3" => "Gemma3ForCausalLM",
         "gemma2" | "gemma" => "Gemma2ForCausalLM",
         "mistral" => "MistralForCausalLM",
@@ -167,11 +180,14 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
     config.vocab_size = gguf
         .get_metadata_u32(&format!("{arch}.vocab_size"))
         .map(|v| v as usize);
-    // Fallback: try general.vocab_size for some GGUF variants.
+    // Fallback: try general.vocab_size, then tokenizer.ggml.tokens array length.
     if config.vocab_size.is_none() {
         config.vocab_size = gguf
             .get_metadata_u32("general.vocab_size")
             .map(|v| v as usize);
+    }
+    if config.vocab_size.is_none() {
+        config.vocab_size = gguf.get_metadata_array_len("tokenizer.ggml.tokens");
     }
     config.max_position_embeddings = gguf
         .get_metadata_u32(&format!("{arch}.context_length"))

@@ -59,6 +59,8 @@ impl TestModels {
     // GGUF quantized models (candle backend, not MLX)
     pub const GEMMA3_270M_GGUF: &str = "unsloth/gemma-3-270m-it-qat-GGUF";
     pub const GEMMA3_1B_GGUF: &str = "unsloth/gemma-3-1b-it-GGUF";
+    pub const QWEN2_0_5B_GGUF: &str = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
+    pub const QWEN3_0_6B_GGUF: &str = "unsloth/Qwen3-0.6B-GGUF";
 
     // CUDA-compatible safetensors models (non-quantized, run on GPU)
     pub const SMOLLM_135M_CUDA: &str = "HuggingFaceTB/SmolLM2-135M-Instruct";

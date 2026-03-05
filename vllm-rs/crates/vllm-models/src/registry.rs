@@ -120,6 +120,10 @@ impl ModelRegistry {
         self.register_gguf("granite", crate::quantized_granite::create_granite_gguf);
         // Mistral/Phi GGUF files use "llama" architecture internally.
         self.register_gguf("gemma3", crate::quantized_gemma3::create_gemma3_gguf);
+        self.register_gguf("qwen2", crate::quantized_qwen2::create_qwen2_gguf);
+        // Qwen3/Qwen3.5 dense is architecturally identical to LLaMA (same as safetensors path).
+        self.register_gguf("qwen3", crate::quantized_llama::create_llama_gguf);
+        self.register_gguf("qwen35", crate::quantized_llama::create_llama_gguf);
 
         // --- GPTQ factories (keyed by HF architecture name) ---
         self.register_gptq("LlamaForCausalLM", crate::gptq_llama::create_llama_gptq);

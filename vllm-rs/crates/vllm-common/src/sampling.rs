@@ -149,6 +149,11 @@ pub struct SamplingParams {
     /// the grammar are sampled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guided_grammar: Option<GuidedGrammar>,
+
+    /// When set, only these token IDs may be sampled. All other logits
+    /// are masked to `-inf`. Similar to grammar masking but static.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_token_ids: Option<Vec<u32>>,
 }
 
 impl Default for SamplingParams {
@@ -176,6 +181,7 @@ impl Default for SamplingParams {
             output_kind: RequestOutputKind::default(),
             logit_bias: None,
             guided_grammar: None,
+            allowed_token_ids: None,
         }
     }
 }
@@ -269,6 +275,11 @@ impl SamplingParams {
             && plp < 0
         {
             return Err(format!("prompt_logprobs must be non-negative or -1, got {plp}").into());
+        }
+        if let Some(ref ids) = self.allowed_token_ids
+            && ids.is_empty()
+        {
+            return Err("allowed_token_ids must not be empty when set".into());
         }
         if !self.stop.is_empty() && !self.detokenize {
             return Err("stop strings are only supported when detokenize is true".into());
@@ -573,6 +584,33 @@ mod tests {
     fn test_max_tokens_none_is_unlimited() {
         let p = SamplingParams {
             max_tokens: None,
+            ..Default::default()
+        };
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_allowed_token_ids_empty() {
+        let p = SamplingParams {
+            allowed_token_ids: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_allowed_token_ids_ok() {
+        let p = SamplingParams {
+            allowed_token_ids: Some(vec![1, 2, 3]),
+            ..Default::default()
+        };
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_allowed_token_ids_none_ok() {
+        let p = SamplingParams {
+            allowed_token_ids: None,
             ..Default::default()
         };
         assert!(p.validate().is_ok());

@@ -247,6 +247,7 @@ fn can_gpu_sample(params: &SamplingParams) -> bool {
         && params.repetition_penalty == 1.0
         && params.frequency_penalty == 0.0
         && params.presence_penalty == 0.0
+        && params.allowed_token_ids.is_none()
 }
 
 /// Sample one token entirely on-device.

@@ -4,9 +4,9 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| ✅ 🟦 | Implemented | 132 |
+| ✅ 🟦 | Implemented | 134 |
 | ⚠️ 🟨 | Partial | 0 |
-| ❌ 🟥 | Not implemented | 132 |
+| ❌ 🟥 | Not implemented | 130 |
 
 ---
 
@@ -28,7 +28,7 @@
 | [Model Architectures — Speculative Decoding Draft Models](#model-architectures--speculative-decoding-draft-models) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
 | [Quantization Methods](#quantization-methods) | 🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥 | 4 | 0 | 8 |
 | [Attention Backends](#attention-backends) | 🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥 | 5 | 0 | 8 |
-| [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥 | 19 | 0 | 3 |
+| [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥 | 21 | 0 | 1 |
 | [Structured Output / Guided Decoding](#structured-output--guided-decoding) | 🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥 | 5 | 0 | 5 |
 | [Tool Calling / Function Calling](#tool-calling--function-calling) | 🟦🟦🟦🟦🟦🟦🟥🟥 | 6 | 0 | 2 |
 | [Scheduling](#scheduling) | 🟦🟦🟦🟦🟦🟦🟥 | 6 | 0 | 1 |
@@ -42,7 +42,7 @@
 | [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥 | 8 | 0 | 6 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟥 | 6 | 0 | 1 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥 | 7 | 0 | 2 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **132** | **0** | **132** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **134** | **0** | **130** |
 
 ---
 
@@ -292,8 +292,8 @@
 | `n > 1` completions | ✅ | ✅ |  |
 | `echo` (return prompt in output) | ✅ | ✅ |  |
 | `bad_words` blocklist | ✅ | ❌ |  |
-| `allowed_token_ids` whitelist | ✅ | ❌ |  |
-| `truncate_prompt_tokens` | ✅ | ❌ |  |
+| `allowed_token_ids` whitelist | ✅ | ✅ | Masks non-allowed logits to -inf in sampler |
+| `truncate_prompt_tokens` | ✅ | ✅ | Truncates from left (keeps last N tokens) |
 | ~~Beam search~~ | ✅ | ❌ | ~~Deprecated in Python V1~~ |
 | ~~`best_of` / `n` with rejection~~ | ✅ | ❌ | ~~Deprecated in Python V1~~ |
 | GPU-side fused sampling (CUDA) | ✅ | ✅ | Rust: Gumbel-max + fused top-k/top-p/min-p |

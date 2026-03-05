@@ -739,6 +739,8 @@ mod tests {
             cache_salt: None,
             request_id: None,
             guided_regex: None,
+            allowed_token_ids: params.allowed_token_ids.clone(),
+            truncate_prompt_tokens: None,
         }
     }
 

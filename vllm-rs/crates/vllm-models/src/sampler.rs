@@ -212,19 +212,12 @@ impl Sampler {
 
         // 1.5. Apply grammar mask (constrained decoding).
         if let Some(allowed) = grammar_allowed {
-            // Mask all tokens not in `allowed` to -inf.
-            let mut mask = vec![false; logits_buf.len()];
-            for &tid in allowed {
-                let idx = tid as usize;
-                if idx < mask.len() {
-                    mask[idx] = true;
-                }
-            }
-            for (i, l) in logits_buf.iter_mut().enumerate() {
-                if !mask[i] {
-                    *l = f32::NEG_INFINITY;
-                }
-            }
+            apply_allow_mask(&mut logits_buf, allowed);
+        }
+
+        // 1.6. Apply allowed_token_ids whitelist.
+        if let Some(ref allowed) = params.allowed_token_ids {
+            apply_allow_mask(&mut logits_buf, allowed);
         }
 
         // 2. Apply repetition/frequency/presence penalties.
@@ -396,6 +389,22 @@ fn apply_min_p(indexed: &mut Vec<(usize, f32)>, min_p: f32) {
 }
 
 /// Apply logit bias: add per-token bias to logits.
+/// Mask all token IDs not in `allowed` to `-inf`.
+fn apply_allow_mask(logits: &mut [f32], allowed: &[u32]) {
+    let mut mask = vec![false; logits.len()];
+    for &tid in allowed {
+        let idx = tid as usize;
+        if idx < mask.len() {
+            mask[idx] = true;
+        }
+    }
+    for (i, l) in logits.iter_mut().enumerate() {
+        if !mask[i] {
+            *l = f32::NEG_INFINITY;
+        }
+    }
+}
+
 fn apply_logit_bias(logits: &mut [f32], logit_bias: &HashMap<u32, f32>) {
     for (&tid, &bias) in logit_bias {
         let idx = tid as usize;
@@ -850,5 +859,35 @@ mod tests {
         assert_eq!(result[1].as_ref().unwrap().sampled.token_id, 1);
         assert!(result[2].is_some());
         assert_eq!(result[2].as_ref().unwrap().sampled.token_id, 2);
+    }
+
+    #[test]
+    fn test_allowed_token_ids_restricts_sampling() {
+        let mut sampler = Sampler::new();
+        // Logits: token 0 has highest logit, but only token 2 is allowed.
+        let logits = vec![10.0f32, 5.0, 1.0, 0.0];
+        let params = SamplingParams {
+            temperature: 0.0, // greedy
+            allowed_token_ids: Some(vec![2]),
+            ..Default::default()
+        };
+        let (token_id, _) = sampler.sample_one(&logits, &params, &[], None);
+        assert_eq!(token_id, 2);
+    }
+
+    #[test]
+    fn test_allowed_token_ids_with_grammar_mask() {
+        let mut sampler = Sampler::new();
+        // Grammar allows tokens 1 and 2; allowed_token_ids allows 0 and 2.
+        // Intersection should be token 2.
+        let logits = vec![10.0f32, 8.0, 1.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            allowed_token_ids: Some(vec![0, 2]),
+            ..Default::default()
+        };
+        let grammar_allowed = vec![1u32, 2];
+        let (token_id, _) = sampler.sample_one(&logits, &params, &[], Some(&grammar_allowed));
+        assert_eq!(token_id, 2);
     }
 }

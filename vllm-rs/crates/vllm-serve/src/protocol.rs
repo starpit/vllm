@@ -321,6 +321,15 @@ pub struct ChatCompletionRequest {
     /// Regex pattern for constrained decoding (mutually exclusive with `response_format`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guided_regex: Option<String>,
+
+    /// Only allow sampling from these token IDs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_token_ids: Option<Vec<u32>>,
+
+    /// Truncate prompt to at most this many tokens (keeps the last N).
+    /// Must be >= 1 or -1 (meaning use model's max input length).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncate_prompt_tokens: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +476,14 @@ pub struct CompletionRequest {
     /// Regex pattern for constrained decoding (mutually exclusive with `response_format`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guided_regex: Option<String>,
+
+    /// Only allow sampling from these token IDs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_token_ids: Option<Vec<u32>>,
+
+    /// Truncate prompt to at most this many tokens (keeps the last N).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncate_prompt_tokens: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

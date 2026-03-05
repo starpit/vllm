@@ -494,6 +494,57 @@ async fn test_chat_empty_messages() {
     let _resp = client.chat_completion(&request).await;
 }
 
+// ===========================================================================
+// E2g: allowed_token_ids and truncate_prompt_tokens
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_chat_allowed_token_ids() {
+    let (_server, client) = start_smollm().await;
+
+    // Constrain output to a small set of token IDs.
+    // Token 198 is typically a newline in many BPE vocabs; the model should
+    // still produce a valid (if nonsensical) response without erroring.
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg("Say hello")],
+        max_tokens: Some(5),
+        temperature: Some(0.0),
+        allowed_token_ids: Some(vec![198, 220, 284, 330]),
+        ..default_chat_request()
+    };
+
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_eq!(resp.choices.len(), 1);
+    assert!(resp.usage.completion_tokens.unwrap_or(0) > 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_chat_truncate_prompt_tokens() {
+    let (_server, client) = start_smollm().await;
+
+    // Send a long prompt but truncate to 5 tokens.
+    let long_prompt = "one two three four five six seven eight nine ten \
+                       eleven twelve thirteen fourteen fifteen sixteen";
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg(long_prompt)],
+        max_tokens: Some(5),
+        temperature: Some(0.0),
+        truncate_prompt_tokens: Some(5),
+        ..default_chat_request()
+    };
+
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_eq!(resp.choices.len(), 1);
+    // The prompt_tokens should be exactly 5 (truncated).
+    assert_eq!(
+        resp.usage.prompt_tokens, 5,
+        "prompt_tokens should be 5 after truncation, got {}",
+        resp.usage.prompt_tokens
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_chat_invalid_json() {

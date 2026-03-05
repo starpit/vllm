@@ -157,8 +157,8 @@ Sampling & Decoding,`min_tokens`,yes,yes,,,
 Sampling & Decoding,`n > 1` completions,yes,yes,,,
 Sampling & Decoding,`echo` (return prompt in output),yes,yes,,,
 Sampling & Decoding,`bad_words` blocklist,yes,no,,,
-Sampling & Decoding,`allowed_token_ids` whitelist,yes,no,,,
-Sampling & Decoding,`truncate_prompt_tokens`,yes,no,,,
+Sampling & Decoding,`allowed_token_ids` whitelist,yes,yes,,Masks non-allowed logits to -inf in sampler,
+Sampling & Decoding,`truncate_prompt_tokens`,yes,yes,,Truncates from left (keeps last N tokens),
 Sampling & Decoding,Beam search,yes,no,,,yes
 Sampling & Decoding,`best_of` / `n` with rejection,yes,no,,,yes
 Sampling & Decoding,GPU-side fused sampling (CUDA),yes,yes,,Rust: Gumbel-max + fused top-k/top-p/min-p,

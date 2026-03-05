@@ -375,8 +375,13 @@ impl AsyncEngine {
         let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
 
         // Tokenize prompt once.
-        let ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
-        let prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
+        let mut ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
+        let mut prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
+
+        // Truncate prompt tokens from the left (keep the last N).
+        truncate_prompt(&mut prompt_token_ids, request.truncate_prompt_tokens)?;
+        ec_request.prompt_token_ids = Some(prompt_token_ids.clone());
+
         let num_prompt_tokens = prompt_token_ids.len() as u32;
 
         // Resolve max_tokens: None → remaining capacity, Some(v) → min(v, remaining).
@@ -605,8 +610,13 @@ impl AsyncEngine {
         let n = request.n.max(1) as usize;
 
         let mut sampling_params = self.build_sampling_params_from_chat(&request)?;
-        let ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
-        let prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
+        let mut ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
+        let mut prompt_token_ids = ec_request.prompt_token_ids.clone().unwrap_or_default();
+
+        // Truncate prompt tokens from the left (keep the last N).
+        truncate_prompt(&mut prompt_token_ids, request.truncate_prompt_tokens)?;
+        ec_request.prompt_token_ids = Some(prompt_token_ids.clone());
+
         let num_prompt_tokens = prompt_token_ids.len() as u32;
 
         // Resolve max_tokens: None → remaining capacity, Some(v) → min(v, remaining).
@@ -712,7 +722,12 @@ impl AsyncEngine {
         let sampling_params = self.build_sampling_params_from_completion(&request)?;
 
         // Normalize prompt to Vec<Vec<u32>>.
-        let prompts = self.tokenize_completion_prompts(&request)?;
+        let mut prompts = self.tokenize_completion_prompts(&request)?;
+
+        // Truncate each prompt from the left (keep the last N tokens).
+        for p in &mut prompts {
+            truncate_prompt(p, request.truncate_prompt_tokens)?;
+        }
         let total = prompts.len() * n;
 
         // Per-HTTP-request metrics (once).
@@ -2544,6 +2559,7 @@ impl AsyncEngine {
             prompt_logprobs: request.prompt_logprobs.map(|n| n as i32),
             logit_bias: parse_logit_bias(&request.logit_bias),
             guided_grammar,
+            allowed_token_ids: request.allowed_token_ids.clone(),
             ..Default::default()
         })
     }
@@ -2589,6 +2605,7 @@ impl AsyncEngine {
             prompt_logprobs: request.prompt_logprobs.map(|n| n as i32),
             logit_bias: parse_logit_bias(&request.logit_bias),
             guided_grammar,
+            allowed_token_ids: request.allowed_token_ids.clone(),
             ..Default::default()
         })
     }
@@ -2714,6 +2731,30 @@ async fn route_step_outputs(
 ///
 /// OpenAI API uses string token IDs as keys; we parse them to u32.
 /// Invalid keys are silently ignored.
+/// Truncate prompt token IDs from the left, keeping the last N tokens.
+///
+/// `truncate` values: `None` → no-op, `Some(-1)` → no-op (model max),
+/// `Some(n)` where n >= 1 → keep last n tokens.
+fn truncate_prompt(tokens: &mut Vec<u32>, truncate: Option<i64>) -> ServeResult<()> {
+    let Some(n) = truncate else { return Ok(()) };
+    if n == -1 {
+        // -1 means "use model's max input length", which is already enforced
+        // by resolve_max_tokens — nothing to do here.
+        return Ok(());
+    }
+    if n < 1 {
+        return Err(ServeError::Validation(format!(
+            "truncate_prompt_tokens must be >= 1 or -1, got {n}"
+        )));
+    }
+    let n = n as usize;
+    if n < tokens.len() {
+        let start = tokens.len() - n;
+        tokens.drain(..start);
+    }
+    Ok(())
+}
+
 fn parse_logit_bias(
     api_bias: &Option<std::collections::HashMap<String, f64>>,
 ) -> Option<std::collections::HashMap<u32, f32>> {
@@ -3018,6 +3059,8 @@ mod tests {
             cache_salt: None,
             request_id: None,
             guided_regex: None,
+            allowed_token_ids: None,
+            truncate_prompt_tokens: None,
         }
     }
 
@@ -3106,6 +3149,8 @@ mod tests {
             cache_salt: None,
             request_id: None,
             guided_regex: None,
+            allowed_token_ids: None,
+            truncate_prompt_tokens: None,
         };
 
         let params = engine
@@ -3155,6 +3200,8 @@ mod tests {
             cache_salt: None,
             request_id: None,
             guided_regex: None,
+            allowed_token_ids: None,
+            truncate_prompt_tokens: None,
         };
 
         let params = engine
@@ -3383,10 +3430,52 @@ mod tests {
             cache_salt: None,
             request_id: None,
             guided_regex: None,
+            allowed_token_ids: None,
+            truncate_prompt_tokens: None,
         }
     }
 
     // -- n>1 and multi-prompt tests --
+
+    #[test]
+    fn test_truncate_prompt_none() {
+        let mut tokens = vec![1, 2, 3, 4, 5];
+        truncate_prompt(&mut tokens, None).unwrap();
+        assert_eq!(tokens, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_truncate_prompt_minus_one() {
+        let mut tokens = vec![1, 2, 3, 4, 5];
+        truncate_prompt(&mut tokens, Some(-1)).unwrap();
+        assert_eq!(tokens, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_truncate_prompt_keeps_last_n() {
+        let mut tokens = vec![1, 2, 3, 4, 5];
+        truncate_prompt(&mut tokens, Some(3)).unwrap();
+        assert_eq!(tokens, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn test_truncate_prompt_larger_than_len() {
+        let mut tokens = vec![1, 2, 3];
+        truncate_prompt(&mut tokens, Some(10)).unwrap();
+        assert_eq!(tokens, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_truncate_prompt_zero_invalid() {
+        let mut tokens = vec![1, 2, 3];
+        assert!(truncate_prompt(&mut tokens, Some(0)).is_err());
+    }
+
+    #[test]
+    fn test_truncate_prompt_negative_invalid() {
+        let mut tokens = vec![1, 2, 3];
+        assert!(truncate_prompt(&mut tokens, Some(-2)).is_err());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_chat_completion_n1_regression() {

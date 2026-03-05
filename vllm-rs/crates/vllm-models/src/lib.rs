@@ -31,6 +31,7 @@ pub mod quantized_gemma3;
 pub mod quantized_granite;
 pub mod quantized_llama;
 pub mod quantized_qwen2;
+pub mod quantized_qwen3_next;
 pub mod qwen2;
 pub mod qwen2_vl;
 pub mod qwen3_moe;

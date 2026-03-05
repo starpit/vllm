@@ -123,7 +123,10 @@ impl ModelRegistry {
         self.register_gguf("qwen2", crate::quantized_qwen2::create_qwen2_gguf);
         // Qwen3/Qwen3.5 dense is architecturally identical to LLaMA (same as safetensors path).
         self.register_gguf("qwen3", crate::quantized_llama::create_llama_gguf);
-        self.register_gguf("qwen35", crate::quantized_llama::create_llama_gguf);
+        self.register_gguf(
+            "qwen35",
+            crate::quantized_qwen3_next::create_qwen3_next_gguf,
+        );
 
         // --- GPTQ factories (keyed by HF architecture name) ---
         self.register_gptq("LlamaForCausalLM", crate::gptq_llama::create_llama_gptq);

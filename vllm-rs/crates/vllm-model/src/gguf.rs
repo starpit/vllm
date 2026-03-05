@@ -152,7 +152,8 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
     let hf_arch = match arch.as_str() {
         "llama" => "LlamaForCausalLM",
         "qwen2" => "Qwen2ForCausalLM",
-        "qwen3" | "qwen35" => "Qwen3ForCausalLM",
+        "qwen3" => "Qwen3ForCausalLM",
+        "qwen35" => "Qwen3NextForCausalLM",
         "gemma3" => "Gemma3ForCausalLM",
         "gemma2" | "gemma" => "Gemma2ForCausalLM",
         "mistral" => "MistralForCausalLM",
@@ -238,6 +239,64 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
             "query_pre_attn_scalar".to_string(),
             serde_json::json!(head_dim as f64),
         );
+    }
+
+    // Qwen3.5 (qwen35) specific metadata: SSM/hybrid attention fields.
+    if arch == "qwen35" {
+        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.ssm.conv_kernel")) {
+            config
+                .extra
+                .insert("linear_conv_kernel_dim".to_string(), serde_json::json!(v));
+        }
+        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.ssm.state_size")) {
+            config
+                .extra
+                .insert("linear_value_head_dim".to_string(), serde_json::json!(v));
+        }
+        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.ssm.group_count")) {
+            config
+                .extra
+                .insert("linear_num_value_heads".to_string(), serde_json::json!(v));
+            // linear_num_key_heads defaults to same as group_count.
+            config
+                .extra
+                .insert("linear_num_key_heads".to_string(), serde_json::json!(v));
+        }
+        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.full_attention_interval")) {
+            config
+                .extra
+                .insert("full_attention_interval".to_string(), serde_json::json!(v));
+        }
+        // Derive partial_rotary_factor from rope.dimension_count / head_dim.
+        if let Some(rope_dim) = gguf.get_metadata_u32(&format!("{arch}.rope.dimension_count"))
+            && let Some(hd) = config.head_dim
+        {
+            let factor = rope_dim as f64 / hd as f64;
+            config.extra.insert(
+                "partial_rotary_factor".to_string(),
+                serde_json::json!(factor),
+            );
+        }
+        // linear_num_key_heads from ssm.time_step_rank.
+        if let Some(time_step_rank) = gguf.get_metadata_u32(&format!("{arch}.ssm.time_step_rank")) {
+            config.extra.insert(
+                "linear_num_key_heads".to_string(),
+                serde_json::json!(time_step_rank),
+            );
+        }
+        // linear_key_head_dim: derive from ssm.inner_size.
+        // inner_size = value_dim = num_v_heads * head_v_dim.
+        // The attn_qkv output dim = 2*key_dim + 2*value_dim, where key_dim = num_k_heads * head_k_dim.
+        // We can derive: head_k_dim = (qkvz_dim - 2*inner_size) / (2*num_k_heads)
+        // But since we don't have qkvz_dim in metadata, use the embedding_length relationship:
+        // For Qwen3.5-0.8B: embedding=1024, inner_size=2048, num_k_heads=16
+        //   => qkvz_dim = 6144 from actual tensor, key_dim = (6144-4096)/2 = 1024, head_k_dim = 64
+        // We store inner_size so the model loader can derive head_k_dim from the actual weight shape.
+        if let Some(inner) = gguf.get_metadata_u32(&format!("{arch}.ssm.inner_size")) {
+            config
+                .extra
+                .insert("ssm_inner_size".to_string(), serde_json::json!(inner));
+        }
     }
 
     // EOS token ID (stored in tokenizer.ggml.eos_token_id or general.eos_token_id).

@@ -22,7 +22,7 @@ use vllm_serve::llm::{ChatMessage, LLM, SamplingParams};
 fn test_llm_generate_basic() {
     vllm_common::telemetry::init_tracing("off");
 
-    let llm = LLM::new(TestModels::SMOLLM_135M_4BIT).expect("LLM should initialize");
+    let mut llm = LLM::new(TestModels::SMOLLM_135M_4BIT).expect("LLM should initialize");
     assert!(llm.model_name().contains("SmolLM"));
 
     let outputs = llm
@@ -44,7 +44,7 @@ fn test_llm_generate_basic() {
 fn test_llm_generate_multiple_prompts() {
     vllm_common::telemetry::init_tracing("off");
 
-    let llm = LLM::new(TestModels::SMOLLM_135M_4BIT).expect("LLM should initialize");
+    let mut llm = LLM::new(TestModels::SMOLLM_135M_4BIT).expect("LLM should initialize");
 
     let prompts = &["Hello, world!", "The meaning of life is"];
     let params = SamplingParams {
@@ -77,7 +77,7 @@ fn test_llm_generate_multiple_prompts() {
 fn test_llm_generate_max_tokens() {
     vllm_common::telemetry::init_tracing("off");
 
-    let llm = LLM::new(TestModels::SMOLLM_135M_4BIT).expect("LLM should initialize");
+    let mut llm = LLM::new(TestModels::SMOLLM_135M_4BIT).expect("LLM should initialize");
 
     let params = SamplingParams {
         max_tokens: Some(3),
@@ -108,7 +108,7 @@ fn test_llm_generate_max_tokens() {
 fn test_llm_chat_basic() {
     vllm_common::telemetry::init_tracing("off");
 
-    let llm = LLM::new(TestModels::SMOLLM_135M_4BIT).expect("LLM should initialize");
+    let mut llm = LLM::new(TestModels::SMOLLM_135M_4BIT).expect("LLM should initialize");
 
     let messages = vec![ChatMessage::user("Say hello in one sentence.")];
     let params = SamplingParams {
@@ -133,7 +133,7 @@ fn test_llm_chat_basic() {
 fn test_llm_chat_with_system_message() {
     vllm_common::telemetry::init_tracing("off");
 
-    let llm = LLM::new(TestModels::SMOLLM_135M_4BIT).expect("LLM should initialize");
+    let mut llm = LLM::new(TestModels::SMOLLM_135M_4BIT).expect("LLM should initialize");
 
     let messages = vec![
         ChatMessage::system("You are a helpful assistant."),
@@ -154,6 +154,57 @@ fn test_llm_chat_with_system_message() {
 }
 
 // ---------------------------------------------------------------------------
+// chat_stream()
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_llm_chat_stream_deltas_not_cumulative() {
+    vllm_common::telemetry::init_tracing("off");
+
+    let mut llm = LLM::new(TestModels::SMOLLM_135M_4BIT).expect("LLM should initialize");
+
+    let messages = vec![ChatMessage::user("Count from 1 to 5.")];
+    let params = SamplingParams {
+        max_tokens: Some(30),
+        temperature: 0.0,
+        ..SamplingParams::default()
+    };
+
+    let mut chunks: Vec<String> = Vec::new();
+    let output = llm
+        .chat_stream(&messages, Some(params), |delta| {
+            chunks.push(delta.to_string());
+        })
+        .expect("chat_stream should succeed");
+
+    assert!(output.finished);
+    assert!(!chunks.is_empty(), "should have received streaming chunks");
+
+    // The concatenation of all deltas must equal the final output text.
+    let concatenated: String = chunks.iter().map(|s| s.as_str()).collect();
+    assert_eq!(
+        concatenated, output.outputs[0].text,
+        "concatenated deltas must equal final text"
+    );
+
+    // No individual chunk should contain a previous chunk's text (i.e., no
+    // cumulative re-emission). Check that no chunk is a prefix of a later
+    // chunk — the bug was that each "delta" was actually the full text so far.
+    if chunks.len() >= 2 {
+        for i in 1..chunks.len() {
+            assert!(
+                !chunks[i].starts_with(&chunks[0]),
+                "chunk {} ({:?}) looks like cumulative text (starts with first chunk {:?})",
+                i,
+                chunks[i],
+                chunks[0],
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Builder
 // ---------------------------------------------------------------------------
 
@@ -162,7 +213,7 @@ fn test_llm_chat_with_system_message() {
 fn test_llm_builder() {
     vllm_common::telemetry::init_tracing("off");
 
-    let llm = LLM::builder(TestModels::SMOLLM_135M_4BIT)
+    let mut llm = LLM::builder(TestModels::SMOLLM_135M_4BIT)
         .max_model_len(512)
         .build()
         .expect("LLM builder should succeed");

@@ -85,14 +85,15 @@ impl BenchStats {
             eprintln!("mean ITL    : {mean_itl:.1} ms");
         }
 
-        let total_gen = self
-            .token_times
-            .last()
-            .map(|t| t.duration_since(self.gen_start).as_secs_f64())
-            .unwrap_or(0.0);
-        if total_gen > 0.0 && num_output_tokens > 0 {
-            let tps = num_output_tokens as f64 / total_gen;
-            eprintln!("tok/sec     : {tps:.1}");
+        // Decode throughput: exclude TTFT, measure from first to last token.
+        if let (Some(first), Some(last)) = (self.first_token, self.token_times.last()) {
+            let decode_secs = last.duration_since(first).as_secs_f64();
+            // num_output_tokens includes the first token, but decode_secs
+            // starts after the first token, so we measure (N-1) intervals.
+            if decode_secs > 0.0 && num_output_tokens > 1 {
+                let tps = (num_output_tokens - 1) as f64 / decode_secs;
+                eprintln!("tok/sec     : {tps:.1}");
+            }
         }
 
         eprintln!("output toks : {num_output_tokens}");
@@ -129,6 +130,18 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     let single_msg = args.prompt.as_ref().or(args.quick.as_ref());
     if let Some(message) = single_msg {
         conversation.push(ChatMessage::user(message));
+
+        // In --bench mode, do an untimed warmup first so that TTFT doesn't
+        // include one-off costs like shader compilation or JIT.
+        if args.bench {
+            eprint!("(warmup) ");
+            let warmup_params = vllm_serve::llm::SamplingParams {
+                max_tokens: Some(1),
+                ..Default::default()
+            };
+            let _ = llm.chat_stream(&conversation, Some(warmup_params), |_| {});
+            eprintln!("done");
+        }
 
         let mut stats = args.bench.then(|| BenchStats::new(startup_ms));
 

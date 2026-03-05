@@ -627,7 +627,7 @@ impl LLM {
                 // Incremental detokenize and stream.
                 if let Some(ref mut d) = detok {
                     d.update(&output.new_token_ids, false);
-                    let new_text = d.get_next_output_text(false, false);
+                    let new_text = d.get_next_output_text(false, true);
                     if !new_text.is_empty() {
                         on_token(&new_text);
                         full_text.push_str(&new_text);
@@ -638,7 +638,7 @@ impl LLM {
 
         // Flush any remaining detokenizer state.
         if let Some(ref mut d) = detok {
-            let remaining = d.get_next_output_text(true, false);
+            let remaining = d.get_next_output_text(true, true);
             if !remaining.is_empty() {
                 on_token(&remaining);
                 full_text.push_str(&remaining);

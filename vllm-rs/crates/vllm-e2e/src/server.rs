@@ -89,6 +89,8 @@ impl Drop for TestServer {
             TestServerMode::ChildProcess { child } => {
                 let _ = child.kill();
                 let _ = child.wait();
+                // Give the CUDA driver time to reclaim GPU memory after process exit.
+                std::thread::sleep(Duration::from_secs(2));
             }
         }
     }

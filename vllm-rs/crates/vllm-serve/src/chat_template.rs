@@ -64,6 +64,10 @@ fn build_env(template_str: &str) -> Result<Environment<'static>, ServeError> {
     // Add a `raise_exception` function that Jinja2 templates often use.
     env.add_function("raise_exception", raise_exception);
 
+    // Add `strftime_now` — used by HuggingFace transformers chat templates
+    // (e.g. granite, llama4) to inject the current date/time.
+    env.add_function("strftime_now", strftime_now);
+
     env.add_template_owned("chat", template_str.to_owned())
         .map_err(|e| ServeError::Internal(format!("invalid chat template: {e}")))?;
 
@@ -289,6 +293,13 @@ fn raise_exception(msg: String) -> Result<String, minijinja::Error> {
         minijinja::ErrorKind::InvalidOperation,
         msg,
     ))
+}
+
+/// `strftime_now(format)` — returns the current local time formatted with the
+/// given strftime format string. Used by HuggingFace transformers chat templates
+/// (granite, llama4, etc.) to inject the current date.
+fn strftime_now(format: String) -> String {
+    chrono::Local::now().format(&format).to_string()
 }
 
 // ---------------------------------------------------------------------------

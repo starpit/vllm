@@ -775,8 +775,8 @@ async fn test_granite_completion() {
     );
 }
 
-/// Granite's chat template uses `strftime_now` which our Jinja engine
-/// doesn't support yet, so test with a second completion prompt instead.
+/// Granite is a chat/instruct model (EOS=token 0) — bare completions may
+/// immediately stop. Test with a second completion prompt for variety.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_granite_completion_coherent() {
@@ -1035,86 +1035,80 @@ async fn test_cuda_tp2_deepseek_v2_completion() {
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_cuda_granite_completion() {
+async fn test_cuda_granite_chat() {
     let server = TestServer::builder(TestModels::GRANITE_3_3_2B_INSTRUCT)
         .start()
         .await
         .unwrap();
 
     let client = Client::new(server.base_url());
-    let request = simple_completion_request("The capital of France is", 20);
-    let resp = client.completion(&request).await.unwrap();
+    let request = simple_chat_request("What is the capital of France?", Some(20));
+    let resp = client.chat_completion(&request).await.unwrap();
 
-    assert_valid_completion_response(&resp);
-    assert!(
-        !resp.choices[0].text.is_empty(),
-        "completion should not be empty"
-    );
+    assert_valid_chat_response(&resp);
+    let content = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(!content.is_empty(), "chat response should not be empty");
 }
 
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_cuda_granite_completion_coherent() {
+async fn test_cuda_granite_chat_coherent() {
     let server = TestServer::builder(TestModels::GRANITE_3_3_2B_INSTRUCT)
         .start()
         .await
         .unwrap();
 
     let client = Client::new(server.base_url());
-    let request = simple_completion_request("Once upon a time", 30);
-    let resp = client.completion(&request).await.unwrap();
+    let request = simple_chat_request("Tell me a short story", Some(30));
+    let resp = client.chat_completion(&request).await.unwrap();
 
-    assert_valid_completion_response(&resp);
-    assert!(
-        !resp.choices[0].text.is_empty(),
-        "completion should not be empty"
-    );
+    assert_valid_chat_response(&resp);
+    let content = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(!content.is_empty(), "chat response should not be empty");
 }
 
 // ===========================================================================
 // CUDA Granite GGUF — quantized on GPU
 // ===========================================================================
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_granite_gguf -- --ignored
+// Note: granite-3.3-2b-instruct is a chat model (EOS=token 0), so bare completions
+// immediately emit EOS. Use chat endpoint (requires strftime_now support).
 
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_cuda_granite_gguf_completion() {
+async fn test_cuda_granite_gguf_chat() {
     let server = TestServer::builder(TestModels::GRANITE_3_3_2B_INSTRUCT_GGUF)
         .start()
         .await
         .unwrap();
 
     let client = Client::new(server.base_url());
-    let request = simple_completion_request("The capital of France is", 20);
-    let resp = client.completion(&request).await.unwrap();
+    let request = simple_chat_request("What is the capital of France?", Some(20));
+    let resp = client.chat_completion(&request).await.unwrap();
 
-    assert_valid_completion_response(&resp);
-    assert!(
-        !resp.choices[0].text.is_empty(),
-        "completion should not be empty"
-    );
+    assert_valid_chat_response(&resp);
+    let content = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(!content.is_empty(), "chat response should not be empty");
 }
 
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn test_cuda_granite_gguf_completion_coherent() {
+async fn test_cuda_granite_gguf_chat_coherent() {
     let server = TestServer::builder(TestModels::GRANITE_3_3_2B_INSTRUCT_GGUF)
         .start()
         .await
         .unwrap();
 
     let client = Client::new(server.base_url());
-    let request = simple_completion_request("Once upon a time", 30);
-    let resp = client.completion(&request).await.unwrap();
+    let request = simple_chat_request("Tell me a short story", Some(30));
+    let resp = client.chat_completion(&request).await.unwrap();
 
-    assert_valid_completion_response(&resp);
-    assert!(
-        !resp.choices[0].text.is_empty(),
-        "completion should not be empty"
-    );
+    assert_valid_chat_response(&resp);
+    let content = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(!content.is_empty(), "chat response should not be empty");
 }
 
 // ===========================================================================

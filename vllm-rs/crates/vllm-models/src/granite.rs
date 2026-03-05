@@ -87,7 +87,7 @@ impl GraniteDecoderLayer {
     /// Load a decoder layer.
     #[allow(clippy::too_many_arguments)]
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &GraniteConfig,
         dtype: DType,
@@ -186,7 +186,7 @@ struct GraniteModel {
 impl GraniteModel {
     /// Load the model backbone.
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &GraniteConfig,
         dtype: DType,
@@ -292,7 +292,7 @@ pub struct GraniteForCausalLM {
 impl GraniteForCausalLM {
     /// Load the full model from weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &GraniteConfig,
         dtype: DType,
         device: &Device,
@@ -368,7 +368,7 @@ impl crate::Model for GraniteForCausalLM {
 
 /// Factory function for the model registry.
 pub fn create_granite(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,

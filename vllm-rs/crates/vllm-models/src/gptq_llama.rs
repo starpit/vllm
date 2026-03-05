@@ -28,7 +28,7 @@ struct GptqLlamaMLP {
 
 impl GptqLlamaMLP {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         gptq: &GptqConfig,
         device: &Device,
@@ -79,7 +79,7 @@ struct GptqLlamaAttention {
 
 impl GptqLlamaAttention {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
         gptq: &GptqConfig,
@@ -172,7 +172,7 @@ struct GptqLlamaDecoderLayer {
 
 impl GptqLlamaDecoderLayer {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
         gptq: &GptqConfig,
@@ -246,7 +246,7 @@ struct GptqLlamaModel {
 
 impl GptqLlamaModel {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &LlamaConfig,
         gptq: &GptqConfig,
         dtype: DType,
@@ -312,7 +312,7 @@ pub struct GptqLlamaForCausalLM {
 
 impl GptqLlamaForCausalLM {
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &LlamaConfig,
         gptq: &GptqConfig,
         dtype: DType,
@@ -367,7 +367,7 @@ impl crate::Model for GptqLlamaForCausalLM {
 
 /// GPTQ factory function signature.
 pub type GptqModelFactory = fn(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     gptq_config: &GptqQuantizeConfig,
     dtype: DType,
@@ -376,7 +376,7 @@ pub type GptqModelFactory = fn(
 
 /// Create a GPTQ LLaMA model.
 pub fn create_llama_gptq(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     gptq_config: &GptqQuantizeConfig,
     dtype: DType,
@@ -390,7 +390,7 @@ pub fn create_llama_gptq(
 
 /// Create a GPTQ Qwen2 model (same arch with Qwen2-specific config defaults).
 pub fn create_qwen2_gptq(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     gptq_config: &GptqQuantizeConfig,
     dtype: DType,

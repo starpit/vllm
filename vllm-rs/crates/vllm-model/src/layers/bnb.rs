@@ -96,16 +96,16 @@ impl BnbInt8Linear {
     ///
     /// Looks for `{prefix}.weight` (int8 stored as uint8) and `{prefix}.SCB` (f32 absmax).
     pub fn from_weights(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         out_features: usize,
         in_features: usize,
         dtype: DType,
         _device: &Device,
     ) -> ModelResult<Self> {
-        let weight_u8 = weights.get(&format!("{prefix}.weight"))?.clone();
-        let absmax = weights.get(&format!("{prefix}.SCB"))?.clone();
-        let bias = weights.get(&format!("{prefix}.bias")).ok().cloned();
+        let bias = weights.take(&format!("{prefix}.bias")).ok();
+        let weight_u8 = weights.take(&format!("{prefix}.weight"))?;
+        let absmax = weights.take(&format!("{prefix}.SCB"))?;
 
         Ok(Self {
             weight_u8,
@@ -209,7 +209,7 @@ pub enum BnbLinear {
 impl BnbLinear {
     /// Load a BnB linear layer, selecting NF4 or INT8 based on the config.
     pub fn from_weights(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &BnbLayerConfig,
         out_features: usize,
@@ -298,7 +298,7 @@ impl BnbNf4Linear {
     /// Handles double quantization: if `{prefix}.weight.nested_absmax` exists,
     /// the absmax is dequantized from uint8 using the nested codebook+scales.
     pub fn from_weights(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &BnbNf4Config,
         out_features: usize,
@@ -306,9 +306,9 @@ impl BnbNf4Linear {
         dtype: DType,
         device: &Device,
     ) -> ModelResult<Self> {
-        let packed = weights.get(&format!("{prefix}.weight"))?.clone();
-        let absmax_raw = weights.get(&format!("{prefix}.weight.absmax"))?.clone();
-        let bias = weights.get(&format!("{prefix}.bias")).ok().cloned();
+        let bias = weights.take(&format!("{prefix}.bias")).ok();
+        let packed = weights.take(&format!("{prefix}.weight"))?;
+        let absmax_raw = weights.take(&format!("{prefix}.weight.absmax"))?;
 
         // Parse blocksize from quant_state JSON if available, else use config.
         let blocksize = if let Ok(qs) =

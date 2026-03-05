@@ -193,7 +193,7 @@ pub struct DeepSeekV2MoE {
 impl DeepSeekV2MoE {
     /// Load MoE weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &DeepSeekV2Config,
         dtype: DType,
@@ -382,7 +382,7 @@ pub struct DeepSeekV2Attention {
 impl DeepSeekV2Attention {
     /// Load attention weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &DeepSeekV2Config,
         dtype: DType,
@@ -756,7 +756,7 @@ impl DeepSeekV2DecoderLayer {
     /// Load a decoder layer.
     #[allow(clippy::too_many_arguments)]
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &DeepSeekV2Config,
         layer_idx: usize,
@@ -893,7 +893,7 @@ struct DeepSeekV2Model {
 
 impl DeepSeekV2Model {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &DeepSeekV2Config,
         dtype: DType,
@@ -977,7 +977,7 @@ pub struct DeepSeekV2ForCausalLM {
 impl DeepSeekV2ForCausalLM {
     /// Load the full model from weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &DeepSeekV2Config,
         dtype: DType,
         device: &Device,
@@ -1100,7 +1100,7 @@ impl crate::Model for DeepSeekV2ForCausalLM {
 
 /// Factory function for the model registry.
 pub fn create_deepseek_v2(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
@@ -1406,8 +1406,9 @@ mod tests {
 
         create_test_weights(&path, &specs);
 
-        let weights = ModelWeights::from_single_file(&path, &device).unwrap();
-        let model = DeepSeekV2ForCausalLM::load(&weights, &config, dtype, &device, 0, 1).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &device).unwrap();
+        let model =
+            DeepSeekV2ForCausalLM::load(&mut weights, &config, dtype, &device, 0, 1).unwrap();
 
         let input_ids = Tensor::new(&[1u32, 5, 10], &device).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2], &device).unwrap();

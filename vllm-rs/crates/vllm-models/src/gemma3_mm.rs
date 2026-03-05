@@ -126,7 +126,7 @@ struct Gemma3MultiModalProjector {
 
 impl Gemma3MultiModalProjector {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         patches_per_image: usize,
         kernel_size: usize,
@@ -134,7 +134,7 @@ impl Gemma3MultiModalProjector {
         dtype: DType,
     ) -> ModelResult<Self> {
         let mm_input_projection_weight =
-            weights.get_cast(&format!("{prefix}.mm_input_projection_weight"), dtype)?;
+            weights.take_cast(&format!("{prefix}.mm_input_projection_weight"), dtype)?;
         let mm_soft_emb_norm = GemmaRmsNorm::load(
             weights,
             &format!("{prefix}.mm_soft_emb_norm"),
@@ -253,7 +253,7 @@ pub struct Gemma3ForConditionalGeneration {
 impl Gemma3ForConditionalGeneration {
     /// Load from weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &Gemma3VisionModelConfig,
         dtype: DType,
         device: &Device,
@@ -426,7 +426,7 @@ impl crate::Model for Gemma3ForConditionalGeneration {
 
 /// Factory function for the model registry.
 pub fn create_gemma3_mm(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,

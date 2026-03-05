@@ -155,7 +155,7 @@ pub struct Qwen3MoE {
 impl Qwen3MoE {
     /// Load MoE weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Qwen3MoeConfig,
         dtype: DType,
@@ -341,7 +341,7 @@ impl Module for Qwen3MoeMlp {
 impl Qwen3MoeDecoderLayer {
     /// Load a decoder layer.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Qwen3MoeConfig,
         layer_idx: usize,
@@ -477,7 +477,7 @@ struct Qwen3MoeModel {
 
 impl Qwen3MoeModel {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Qwen3MoeConfig,
         dtype: DType,
@@ -556,7 +556,7 @@ pub struct Qwen3MoeForCausalLM {
 impl Qwen3MoeForCausalLM {
     /// Load the full model from weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &Qwen3MoeConfig,
         dtype: DType,
         device: &Device,
@@ -614,7 +614,7 @@ impl crate::Model for Qwen3MoeForCausalLM {
 
 /// Factory function for the model registry.
 pub fn create_qwen3_moe(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,

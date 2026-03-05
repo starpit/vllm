@@ -187,7 +187,7 @@ impl LlamaMLP {
     ///
     /// Weight names: `{prefix}.gate_proj`, `{prefix}.up_proj`, `{prefix}.down_proj`
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         dtype: DType,
         rank: usize,
@@ -301,7 +301,7 @@ impl LlamaAttention {
     /// Weight names: `{prefix}.q_proj`, `{prefix}.k_proj`, `{prefix}.v_proj`, `{prefix}.o_proj`
     #[allow(clippy::too_many_arguments)]
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
         dtype: DType,
@@ -600,7 +600,7 @@ impl LlamaDecoderLayer {
     /// - `post_attention_layernorm`
     #[allow(clippy::too_many_arguments)]
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
         dtype: DType,
@@ -744,7 +744,7 @@ pub struct LlamaModel {
 impl LlamaModel {
     /// Load the model backbone.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
         dtype: DType,
@@ -910,7 +910,7 @@ pub struct LlamaForCausalLM {
 impl LlamaForCausalLM {
     /// Load the full model from weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &LlamaConfig,
         dtype: DType,
         device: &Device,
@@ -1023,7 +1023,7 @@ impl crate::Model for LlamaForCausalLM {
 
 /// Factory function for the model registry.
 pub fn create_llama(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
@@ -1272,8 +1272,8 @@ mod tests {
         // Create safetensors file with small random-ish weights.
         create_test_weights(&path, &tensor_specs);
 
-        let weights = ModelWeights::from_single_file(&path, &device).unwrap();
-        let model = LlamaForCausalLM::load(&weights, &config, dtype, &device, 0, 1).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &device).unwrap();
+        let model = LlamaForCausalLM::load(&mut weights, &config, dtype, &device, 0, 1).unwrap();
 
         // Forward pass.
         let input_ids = Tensor::new(&[1u32, 5, 10], &device).unwrap();
@@ -1351,8 +1351,8 @@ mod tests {
 
         create_test_weights(&path, &tensor_specs);
 
-        let weights = ModelWeights::from_single_file(&path, &device).unwrap();
-        let model = LlamaForCausalLM::load(&weights, &config, dtype, &device, 0, 1).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &device).unwrap();
+        let model = LlamaForCausalLM::load(&mut weights, &config, dtype, &device, 0, 1).unwrap();
 
         let input_ids = Tensor::new(&[1u32, 5], &device).unwrap();
         let positions = Tensor::new(&[0u32, 1], &device).unwrap();
@@ -1450,8 +1450,8 @@ mod tests {
         ))
         .unwrap();
 
-        let weights = ModelWeights::from_single_file(&path, &device).unwrap();
-        let model = factory(&weights, &hf_config, DType::F32, &device, 0, 1).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &device).unwrap();
+        let model = factory(&mut weights, &hf_config, DType::F32, &device, 0, 1).unwrap();
 
         let input_ids = Tensor::new(&[1u32, 2, 3], &device).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2], &device).unwrap();
@@ -1556,8 +1556,8 @@ mod tests {
         ));
         create_test_weights(&path, &tensor_specs);
 
-        let weights = ModelWeights::from_single_file(&path, &device).unwrap();
-        let model = LlamaForCausalLM::load(&weights, &config, dtype, &device, 0, 1).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &device).unwrap();
+        let model = LlamaForCausalLM::load(&mut weights, &config, dtype, &device, 0, 1).unwrap();
 
         // Prefill with 3 tokens and KV cache.
         let mut kv_cache: crate::KvCache = vec![None; model.model().num_layers()];
@@ -1704,10 +1704,10 @@ mod tests {
         ));
         create_test_weights(&path, &tensor_specs);
 
-        let weights = ModelWeights::from_single_file(&path, &device).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &device).unwrap();
         // Keep the dir alive by leaking it (tests are short-lived).
         std::mem::forget(dir);
-        let model = LlamaForCausalLM::load(&weights, &config, dtype, &device, 0, 1).unwrap();
+        let model = LlamaForCausalLM::load(&mut weights, &config, dtype, &device, 0, 1).unwrap();
         (config, model)
     }
 

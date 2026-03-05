@@ -99,14 +99,14 @@ struct SiglipVisionEmbeddings {
 
 impl SiglipVisionEmbeddings {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &SiglipVisionConfig,
         dtype: DType,
     ) -> ModelResult<Self> {
         let patch_embedding = Linear::load(weights, &format!("{prefix}.patch_embedding"), dtype)?;
         let position_embedding =
-            weights.get_cast(&format!("{prefix}.position_embedding.weight"), dtype)?;
+            weights.take_cast(&format!("{prefix}.position_embedding.weight"), dtype)?;
 
         // Verify shape.
         let expected_patches = config.num_patches();
@@ -194,7 +194,7 @@ struct SiglipEncoderLayer {
 
 impl SiglipEncoderLayer {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &SiglipVisionConfig,
         dtype: DType,
@@ -379,7 +379,7 @@ pub struct SiglipVisionModel {
 impl SiglipVisionModel {
     /// Load from safetensors weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &SiglipVisionConfig,
         dtype: DType,

@@ -883,7 +883,7 @@ pub trait Model: Send {
 /// Used by `ModelRegistry` to create model instances from architecture names.
 /// `rank` and `world_size` control tensor-parallel weight sharding (0/1 for single-GPU).
 pub type ModelFactory = fn(
-    weights: &vllm_model::weight::ModelWeights,
+    weights: &mut vllm_model::weight::ModelWeights,
     config: &vllm_model::weight::HfModelConfig,
     dtype: candle_core::DType,
     device: &candle_core::Device,

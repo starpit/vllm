@@ -545,7 +545,7 @@ struct Gemma3MultiModalProjector {
 
 impl Gemma3MultiModalProjector {
     fn load(
-        weights: &vllm_model::weight::ModelWeights,
+        weights: &mut vllm_model::weight::ModelWeights,
         prefix: &str,
         patches_per_image: usize,
         kernel_size: usize,
@@ -553,7 +553,7 @@ impl Gemma3MultiModalProjector {
         dtype: DType,
     ) -> ModelResult<Self> {
         let mm_input_projection_weight =
-            weights.get_cast(&format!("{prefix}.mm_input_projection_weight"), dtype)?;
+            weights.take_cast(&format!("{prefix}.mm_input_projection_weight"), dtype)?;
         let mm_soft_emb_norm = GemmaRmsNorm::load(
             weights,
             &format!("{prefix}.mm_soft_emb_norm"),
@@ -620,7 +620,7 @@ impl QuantizedGemma3ForConditionalGeneration {
     /// Create from a pre-loaded text model and mmproj weights.
     pub fn new(
         language_model: QuantizedGemma3ForCausalLM,
-        mmproj_weights: &vllm_model::weight::ModelWeights,
+        mmproj_weights: &mut vllm_model::weight::ModelWeights,
         config: &HfModelConfig,
         dtype: DType,
     ) -> ModelResult<Self> {

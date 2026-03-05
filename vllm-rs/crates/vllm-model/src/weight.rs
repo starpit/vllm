@@ -394,6 +394,21 @@ impl ModelWeights {
             .remove(name)
             .ok_or_else(|| ModelError::WeightNotFound(name.to_string()))
     }
+
+    /// Remove a tensor from the loaded set and cast to the given dtype.
+    ///
+    /// Like `get_cast` but removes the tensor from the HashMap, freeing GPU
+    /// memory before the caller allocates derived tensors (e.g. transposed
+    /// copies). This reduces peak memory from ~2x to ~1x model size during
+    /// CUDA loading.
+    pub fn take_cast(&mut self, name: &str, dtype: DType) -> ModelResult<Tensor> {
+        let t = self.take(name)?;
+        if t.dtype() == dtype {
+            Ok(t)
+        } else {
+            t.to_dtype(dtype).map_err(ModelError::Candle)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -33,9 +33,9 @@ impl Embedding {
     /// Load from model weights.
     ///
     /// Looks for `{prefix}.weight`.
-    pub fn load(weights: &ModelWeights, prefix: &str, dtype: DType) -> ModelResult<Self> {
+    pub fn load(weights: &mut ModelWeights, prefix: &str, dtype: DType) -> ModelResult<Self> {
         let weight_name = format!("{}.weight", prefix);
-        let weight = weights.get_cast(&weight_name, dtype)?;
+        let weight = weights.take_cast(&weight_name, dtype)?;
         Ok(Self { weight })
     }
 
@@ -110,17 +110,17 @@ impl VocabParallelEmbedding {
 
     /// Load from model weights, sharding along the vocab dimension.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         dtype: DType,
         rank: usize,
         world_size: usize,
     ) -> ModelResult<Self> {
         let weight_name = format!("{}.weight", prefix);
-        let full_weight = weights.get_cast(&weight_name, dtype)?;
+        let full_weight = weights.take_cast(&weight_name, dtype)?;
+        let vocab_size = full_weight.dim(0).map_err(ModelError::Candle)?;
         let shard = tensor::shard_tensor(&full_weight, 0, rank, world_size)?;
 
-        let vocab_size = full_weight.dim(0).map_err(ModelError::Candle)?;
         let shard_size = vocab_size / world_size;
         let vocab_start = rank * shard_size;
         let vocab_end = vocab_start + shard_size;
@@ -271,8 +271,8 @@ mod tests {
             &[("embed.weight", vec![4, 2], DType::F32, &w_data)],
         );
 
-        let weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
-        let emb = Embedding::load(&weights, "embed", DType::F32).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
+        let emb = Embedding::load(&mut weights, "embed", DType::F32).unwrap();
         assert_eq!(emb.vocab_size(), 4);
         assert_eq!(emb.hidden_size(), 2);
 
@@ -299,13 +299,15 @@ mod tests {
             &[("embed.weight", vec![4, 2], DType::F32, &w_data)],
         );
 
-        let weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
 
-        let emb0 = VocabParallelEmbedding::load(&weights, "embed", DType::F32, 0, 2).unwrap();
+        let emb0 = VocabParallelEmbedding::load(&mut weights, "embed", DType::F32, 0, 2).unwrap();
         assert_eq!(emb0.vocab_range(), (0, 2));
         assert_eq!(emb0.inner().vocab_size(), 2);
 
-        let emb1 = VocabParallelEmbedding::load(&weights, "embed", DType::F32, 1, 2).unwrap();
+        // Reload for rank 1 (take consumed rank 0's tensor).
+        let mut weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
+        let emb1 = VocabParallelEmbedding::load(&mut weights, "embed", DType::F32, 1, 2).unwrap();
         assert_eq!(emb1.vocab_range(), (2, 4));
         assert_eq!(emb1.inner().vocab_size(), 2);
     }

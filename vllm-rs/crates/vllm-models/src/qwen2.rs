@@ -73,7 +73,7 @@ impl Qwen2Config {
 
 /// Factory function for the model registry.
 pub fn create_qwen2(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
@@ -266,8 +266,8 @@ mod tests {
 
         create_test_weights(&path, &tensor_specs);
 
-        let weights = ModelWeights::from_single_file(&path, &device).unwrap();
-        let model = create_qwen2(&weights, &hf_config, DType::F32, &device, 0, 1).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &device).unwrap();
+        let model = create_qwen2(&mut weights, &hf_config, DType::F32, &device, 0, 1).unwrap();
 
         let input_ids = Tensor::new(&[1u32, 5, 10], &device).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2], &device).unwrap();

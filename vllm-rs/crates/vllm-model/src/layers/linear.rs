@@ -61,16 +61,18 @@ impl Linear {
     /// Load a linear layer from model weights.
     ///
     /// Looks for `{prefix}.weight` and optionally `{prefix}.bias`.
-    pub fn load(weights: &ModelWeights, prefix: &str, dtype: DType) -> ModelResult<Self> {
+    /// Takes ownership of the tensors from the weights HashMap to reduce
+    /// peak GPU memory (original freed before transposed copy allocated).
+    pub fn load(weights: &mut ModelWeights, prefix: &str, dtype: DType) -> ModelResult<Self> {
         let weight_name = format!("{}.weight", prefix);
         let bias_name = format!("{}.bias", prefix);
 
-        let weight = weights.get_cast(&weight_name, dtype)?;
         let bias = if weights.contains(&bias_name) {
-            Some(weights.get_cast(&bias_name, dtype)?)
+            Some(weights.take_cast(&bias_name, dtype)?)
         } else {
             None
         };
+        let weight = weights.take_cast(&weight_name, dtype)?;
 
         Ok(Self::new(weight, bias))
     }
@@ -184,7 +186,7 @@ impl ColumnParallelLinear {
 
     /// Load from model weights, sharding the weight along dim 0.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         dtype: DType,
         rank: usize,
@@ -194,15 +196,15 @@ impl ColumnParallelLinear {
         let weight_name = format!("{}.weight", prefix);
         let bias_name = format!("{}.bias", prefix);
 
-        let full_weight = weights.get_cast(&weight_name, dtype)?;
-        let weight = tensor::shard_tensor(&full_weight, 0, rank, world_size)?;
-
         let bias = if weights.contains(&bias_name) {
-            let full_bias = weights.get_cast(&bias_name, dtype)?;
+            let full_bias = weights.take_cast(&bias_name, dtype)?;
             Some(tensor::shard_tensor(&full_bias, 0, rank, world_size)?)
         } else {
             None
         };
+
+        let full_weight = weights.take_cast(&weight_name, dtype)?;
+        let weight = tensor::shard_tensor(&full_weight, 0, rank, world_size)?;
 
         Ok(Self {
             inner: Linear::new(weight, bias),
@@ -277,7 +279,7 @@ impl RowParallelLinear {
 
     /// Load from model weights, sharding the weight along dim 1.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         dtype: DType,
         rank: usize,
@@ -287,15 +289,15 @@ impl RowParallelLinear {
         let weight_name = format!("{}.weight", prefix);
         let bias_name = format!("{}.bias", prefix);
 
-        let full_weight = weights.get_cast(&weight_name, dtype)?;
-        let weight = tensor::shard_tensor(&full_weight, 1, rank, world_size)?;
-
         // Bias is NOT sharded for row-parallel (added after all-reduce).
         let bias = if weights.contains(&bias_name) {
-            Some(weights.get_cast(&bias_name, dtype)?)
+            Some(weights.take_cast(&bias_name, dtype)?)
         } else {
             None
         };
+
+        let full_weight = weights.take_cast(&weight_name, dtype)?;
+        let weight = tensor::shard_tensor(&full_weight, 1, rank, world_size)?;
 
         Ok(Self {
             inner: Linear::new(weight, bias),
@@ -366,7 +368,7 @@ impl Module for RowParallelLinear {
 /// Returns `(linear, q_size, kv_size)` where sizes are the post-shard output
 /// dimensions of Q and each of K/V respectively.
 pub fn load_fused_qkv(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     prefix: &str,
     dtype: DType,
     rank: usize,
@@ -376,29 +378,42 @@ pub fn load_fused_qkv(
     let k_name = format!("{prefix}.k_proj.weight");
     let v_name = format!("{prefix}.v_proj.weight");
 
-    let q_w = tensor::shard_tensor(&weights.get_cast(&q_name, dtype)?, 0, rank, world_size)?;
-    let k_w = tensor::shard_tensor(&weights.get_cast(&k_name, dtype)?, 0, rank, world_size)?;
-    let v_w = tensor::shard_tensor(&weights.get_cast(&v_name, dtype)?, 0, rank, world_size)?;
+    // Take biases first (before weights) to free them early.
+    let q_bias_name = format!("{prefix}.q_proj.bias");
+    let qkv_bias = if weights.contains(&q_bias_name) {
+        let k_bias_name = format!("{prefix}.k_proj.bias");
+        let v_bias_name = format!("{prefix}.v_proj.bias");
+        let q_b = tensor::shard_tensor(
+            &weights.take_cast(&q_bias_name, dtype)?,
+            0,
+            rank,
+            world_size,
+        )?;
+        let k_b = tensor::shard_tensor(
+            &weights.take_cast(&k_bias_name, dtype)?,
+            0,
+            rank,
+            world_size,
+        )?;
+        let v_b = tensor::shard_tensor(
+            &weights.take_cast(&v_bias_name, dtype)?,
+            0,
+            rank,
+            world_size,
+        )?;
+        Some(Tensor::cat(&[&q_b, &k_b, &v_b], 0).map_err(ModelError::Candle)?)
+    } else {
+        None
+    };
+
+    let q_w = tensor::shard_tensor(&weights.take_cast(&q_name, dtype)?, 0, rank, world_size)?;
+    let k_w = tensor::shard_tensor(&weights.take_cast(&k_name, dtype)?, 0, rank, world_size)?;
+    let v_w = tensor::shard_tensor(&weights.take_cast(&v_name, dtype)?, 0, rank, world_size)?;
 
     let q_size = q_w.dim(0).map_err(ModelError::Candle)?;
     let kv_size = k_w.dim(0).map_err(ModelError::Candle)?;
 
     let qkv_w = Tensor::cat(&[&q_w, &k_w, &v_w], 0).map_err(ModelError::Candle)?;
-
-    let q_bias_name = format!("{prefix}.q_proj.bias");
-    let qkv_bias = if weights.contains(&q_bias_name) {
-        let k_bias_name = format!("{prefix}.k_proj.bias");
-        let v_bias_name = format!("{prefix}.v_proj.bias");
-        let q_b =
-            tensor::shard_tensor(&weights.get_cast(&q_bias_name, dtype)?, 0, rank, world_size)?;
-        let k_b =
-            tensor::shard_tensor(&weights.get_cast(&k_bias_name, dtype)?, 0, rank, world_size)?;
-        let v_b =
-            tensor::shard_tensor(&weights.get_cast(&v_bias_name, dtype)?, 0, rank, world_size)?;
-        Some(Tensor::cat(&[&q_b, &k_b, &v_b], 0).map_err(ModelError::Candle)?)
-    } else {
-        None
-    };
 
     Ok((Linear::new(qkv_w, qkv_bias), q_size, kv_size))
 }
@@ -413,7 +428,7 @@ pub fn load_fused_qkv(
 /// Returns `(linear, half_size)` where `half_size` is the post-shard output
 /// dimension of each component (used to split the fused output).
 pub fn load_fused_gate_up(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     gate_prefix: &str,
     up_prefix: &str,
     dtype: DType,
@@ -423,25 +438,18 @@ pub fn load_fused_gate_up(
     let gate_name = format!("{gate_prefix}.weight");
     let up_name = format!("{up_prefix}.weight");
 
-    let gate_w = tensor::shard_tensor(&weights.get_cast(&gate_name, dtype)?, 0, rank, world_size)?;
-    let up_w = tensor::shard_tensor(&weights.get_cast(&up_name, dtype)?, 0, rank, world_size)?;
-
-    let half_size = gate_w.dim(0).map_err(ModelError::Candle)?;
-
-    let fused_w = Tensor::cat(&[&gate_w, &up_w], 0).map_err(ModelError::Candle)?;
-
-    // Handle optional bias.
+    // Handle optional bias first.
     let gate_bias_name = format!("{gate_prefix}.bias");
     let fused_bias = if weights.contains(&gate_bias_name) {
         let up_bias_name = format!("{up_prefix}.bias");
         let g_b = tensor::shard_tensor(
-            &weights.get_cast(&gate_bias_name, dtype)?,
+            &weights.take_cast(&gate_bias_name, dtype)?,
             0,
             rank,
             world_size,
         )?;
         let u_b = tensor::shard_tensor(
-            &weights.get_cast(&up_bias_name, dtype)?,
+            &weights.take_cast(&up_bias_name, dtype)?,
             0,
             rank,
             world_size,
@@ -450,6 +458,13 @@ pub fn load_fused_gate_up(
     } else {
         None
     };
+
+    let gate_w = tensor::shard_tensor(&weights.take_cast(&gate_name, dtype)?, 0, rank, world_size)?;
+    let up_w = tensor::shard_tensor(&weights.take_cast(&up_name, dtype)?, 0, rank, world_size)?;
+
+    let half_size = gate_w.dim(0).map_err(ModelError::Candle)?;
+
+    let fused_w = Tensor::cat(&[&gate_w, &up_w], 0).map_err(ModelError::Candle)?;
 
     Ok((Linear::new(fused_w, fused_bias), half_size))
 }
@@ -536,8 +551,8 @@ mod tests {
             ],
         );
 
-        let weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
-        let linear = Linear::load(&weights, "layer", DType::F32).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
+        let linear = Linear::load(&mut weights, "layer", DType::F32).unwrap();
         assert_eq!(linear.out_features(), 2);
         assert_eq!(linear.in_features(), 3);
         assert!(linear.bias().is_some());
@@ -559,14 +574,17 @@ mod tests {
             &[("proj.weight", vec![4, 2], DType::F32, &w_data)],
         );
 
-        let weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
 
         // Rank 0 gets first half.
-        let cp0 = ColumnParallelLinear::load(&weights, "proj", DType::F32, 0, 2, false).unwrap();
+        let cp0 =
+            ColumnParallelLinear::load(&mut weights, "proj", DType::F32, 0, 2, false).unwrap();
         assert_eq!(cp0.inner().out_features(), 2);
 
-        // Rank 1 gets second half.
-        let cp1 = ColumnParallelLinear::load(&weights, "proj", DType::F32, 1, 2, false).unwrap();
+        // Load fresh weights for rank 1 (take consumed rank 0's).
+        let mut weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
+        let cp1 =
+            ColumnParallelLinear::load(&mut weights, "proj", DType::F32, 1, 2, false).unwrap();
         assert_eq!(cp1.inner().out_features(), 2);
     }
 
@@ -586,9 +604,9 @@ mod tests {
             &[("proj.weight", vec![2, 4], DType::F32, &w_data)],
         );
 
-        let weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
 
-        let rp0 = RowParallelLinear::load(&weights, "proj", DType::F32, 0, 2, true).unwrap();
+        let rp0 = RowParallelLinear::load(&mut weights, "proj", DType::F32, 0, 2, true).unwrap();
         assert_eq!(rp0.inner().in_features(), 2);
     }
 

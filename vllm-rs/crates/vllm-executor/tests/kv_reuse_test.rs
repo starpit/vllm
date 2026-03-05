@@ -48,10 +48,10 @@ fn load_test_model() -> (Box<dyn Model>, Device) {
         .get(&arch)
         .unwrap_or_else(|| panic!("unsupported arch: {arch}"));
 
-    let weights = ModelWeights::from_dir(model_dir, &device).expect("load weights");
+    let mut weights = ModelWeights::from_dir(model_dir, &device).expect("load weights");
 
     let dtype = DType::F32; // CPU test — use F32 for numerical stability.
-    let model = factory(&weights, &hf_config, dtype, &device, 0, 1).expect("construct model");
+    let model = factory(&mut weights, &hf_config, dtype, &device, 0, 1).expect("construct model");
 
     assert_eq!(model.num_layers(), NUM_LAYERS);
     (model, device)

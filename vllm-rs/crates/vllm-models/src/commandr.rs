@@ -123,7 +123,7 @@ struct CommandRAttention {
 impl CommandRAttention {
     /// Load attention weights with fused QKV projection.
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &CommandRConfig,
         dtype: DType,
@@ -324,7 +324,7 @@ struct CommandRDecoderLayer {
 impl CommandRDecoderLayer {
     /// Load a decoder layer.
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &CommandRConfig,
         dtype: DType,
@@ -399,7 +399,7 @@ struct CommandRModel {
 impl CommandRModel {
     /// Load the model backbone.
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &CommandRConfig,
         dtype: DType,
@@ -482,7 +482,7 @@ pub struct CommandRForCausalLM {
 impl CommandRForCausalLM {
     /// Load the full model from weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &CommandRConfig,
         dtype: DType,
         device: &Device,
@@ -575,7 +575,7 @@ impl crate::Model for CommandRForCausalLM {
 
 /// Factory function for the model registry.
 pub fn create_commandr(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
@@ -709,8 +709,8 @@ mod tests {
         let tensor_specs = build_weight_specs(&config);
         create_test_weights(&path, &tensor_specs);
 
-        let weights = ModelWeights::from_single_file(&path, &device).unwrap();
-        let model = CommandRForCausalLM::load(&weights, &config, dtype, &device, 0, 1).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &device).unwrap();
+        let model = CommandRForCausalLM::load(&mut weights, &config, dtype, &device, 0, 1).unwrap();
 
         let input_ids = Tensor::new(&[1u32, 5, 10], &device).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2], &device).unwrap();
@@ -740,11 +740,12 @@ mod tests {
         let tensor_specs = build_weight_specs(&config_full);
         create_test_weights(&path, &tensor_specs);
 
-        let weights = ModelWeights::from_single_file(&path, &device).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &device).unwrap();
         let model_full =
-            CommandRForCausalLM::load(&weights, &config_full, dtype, &device, 0, 1).unwrap();
+            CommandRForCausalLM::load(&mut weights, &config_full, dtype, &device, 0, 1).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &device).unwrap();
         let model_half =
-            CommandRForCausalLM::load(&weights, &config_half, dtype, &device, 0, 1).unwrap();
+            CommandRForCausalLM::load(&mut weights, &config_half, dtype, &device, 0, 1).unwrap();
 
         let input_ids = Tensor::new(&[1u32, 2], &device).unwrap();
         let positions = Tensor::new(&[0u32, 1], &device).unwrap();

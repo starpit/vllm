@@ -123,15 +123,15 @@ impl AwqLinear {
     /// Looks for `{prefix}.qweight`, `{prefix}.qzeros`, `{prefix}.scales`,
     /// and optionally `{prefix}.bias`.
     pub fn from_weights(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &AwqConfig,
         _device: &Device,
     ) -> ModelResult<Self> {
-        let qweight = weights.get(&format!("{prefix}.qweight"))?.clone();
-        let qzeros = weights.get(&format!("{prefix}.qzeros"))?.clone();
-        let scales = weights.get(&format!("{prefix}.scales"))?.clone();
-        let bias = weights.get(&format!("{prefix}.bias")).ok().cloned();
+        let bias = weights.take(&format!("{prefix}.bias")).ok();
+        let qweight = weights.take(&format!("{prefix}.qweight"))?;
+        let qzeros = weights.take(&format!("{prefix}.qzeros"))?;
+        let scales = weights.take(&format!("{prefix}.scales"))?;
 
         // AWQ packs along columns: qweight is [in_features, out_features/pack_factor].
         let pack_factor = 32 / config.bits;

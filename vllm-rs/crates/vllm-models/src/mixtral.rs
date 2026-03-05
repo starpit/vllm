@@ -112,7 +112,7 @@ struct MixtralExpertMLP {
 }
 
 impl MixtralExpertMLP {
-    fn load(weights: &ModelWeights, prefix: &str, dtype: DType) -> ModelResult<Self> {
+    fn load(weights: &mut ModelWeights, prefix: &str, dtype: DType) -> ModelResult<Self> {
         let (gate_up, intermediate_size) = load_fused_gate_up(
             weights,
             &format!("{prefix}.w1"),
@@ -167,7 +167,7 @@ pub struct MixtralMoE {
 impl MixtralMoE {
     /// Load MoE weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &MixtralConfig,
         dtype: DType,
@@ -271,7 +271,7 @@ pub struct MixtralDecoderLayer {
 impl MixtralDecoderLayer {
     /// Load a decoder layer.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &MixtralConfig,
         dtype: DType,
@@ -390,7 +390,7 @@ struct MixtralModel {
 
 impl MixtralModel {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &MixtralConfig,
         dtype: DType,
@@ -469,7 +469,7 @@ pub struct MixtralForCausalLM {
 impl MixtralForCausalLM {
     /// Load the full model from weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &MixtralConfig,
         dtype: DType,
         device: &Device,
@@ -522,7 +522,7 @@ impl crate::Model for MixtralForCausalLM {
 
 /// Factory function for the model registry.
 pub fn create_mixtral(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
@@ -735,8 +735,8 @@ mod tests {
 
         create_test_weights(&path, &specs);
 
-        let weights = ModelWeights::from_single_file(&path, &device).unwrap();
-        let model = MixtralForCausalLM::load(&weights, &config, dtype, &device).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &device).unwrap();
+        let model = MixtralForCausalLM::load(&mut weights, &config, dtype, &device).unwrap();
 
         // Forward pass.
         let input_ids = Tensor::new(&[1u32, 5, 10], &device).unwrap();

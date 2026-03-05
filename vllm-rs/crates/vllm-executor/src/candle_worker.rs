@@ -727,16 +727,16 @@ impl CandleWorker {
                 })?;
 
                 // Load mmproj weights (dequantized to f32).
-                let mmproj_weights = gguf::load_mmproj_as_model_weights(&mmproj_path, device)
+                let mut mmproj_weights = gguf::load_mmproj_as_model_weights(&mmproj_path, device)
                     .map_err(|e| {
-                        ExecutorError::WorkerInit(format!("failed to load mmproj weights: {e}"))
-                    })?;
+                    ExecutorError::WorkerInit(format!("failed to load mmproj weights: {e}"))
+                })?;
 
                 // Wrap as multimodal model.
                 let mm_model =
                     vllm_models::quantized_gemma3::QuantizedGemma3ForConditionalGeneration::new(
                         text_model,
-                        &mmproj_weights,
+                        &mut mmproj_weights,
                         &hf_config,
                         DType::F32,
                     )
@@ -1451,7 +1451,7 @@ impl Worker for CandleWorker {
                 ))
             })?;
 
-            gptq_factory(&weights, &hf_config, &gptq_cfg, dtype, &device).map_err(|e| {
+            gptq_factory(&mut weights, &hf_config, &gptq_cfg, dtype, &device).map_err(|e| {
                 ExecutorError::WorkerInit(format!("failed to construct GPTQ model: {e}"))
             })?
         } else if is_awq {
@@ -1486,7 +1486,7 @@ impl Worker for CandleWorker {
                 ))
             })?;
 
-            awq_factory(&weights, &hf_config, &awq_cfg, dtype, &device).map_err(|e| {
+            awq_factory(&mut weights, &hf_config, &awq_cfg, dtype, &device).map_err(|e| {
                 ExecutorError::WorkerInit(format!("failed to construct AWQ model: {e}"))
             })?
         } else if is_bnb {
@@ -1519,7 +1519,7 @@ impl Worker for CandleWorker {
                 ))
             })?;
 
-            bnb_factory(&weights, &hf_config, &bnb_cfg, dtype, &device).map_err(|e| {
+            bnb_factory(&mut weights, &hf_config, &bnb_cfg, dtype, &device).map_err(|e| {
                 ExecutorError::WorkerInit(format!("failed to construct BnB model: {e}"))
             })?
         } else {
@@ -1531,7 +1531,7 @@ impl Worker for CandleWorker {
             })?;
 
             factory(
-                &weights,
+                &mut weights,
                 &hf_config,
                 dtype,
                 &device,

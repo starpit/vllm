@@ -28,7 +28,7 @@ struct BnbLlamaMLP {
 
 impl BnbLlamaMLP {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
         bnb: &BnbLayerConfig,
@@ -95,7 +95,7 @@ struct BnbLlamaAttention {
 
 impl BnbLlamaAttention {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
         bnb: &BnbLayerConfig,
@@ -220,7 +220,7 @@ struct BnbLlamaDecoderLayer {
 
 impl BnbLlamaDecoderLayer {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
         bnb: &BnbLayerConfig,
@@ -296,7 +296,7 @@ struct BnbLlamaModel {
 
 impl BnbLlamaModel {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &LlamaConfig,
         bnb: &BnbLayerConfig,
         dtype: DType,
@@ -362,7 +362,7 @@ pub struct BnbLlamaForCausalLM {
 
 impl BnbLlamaForCausalLM {
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &LlamaConfig,
         bnb: &BnbLayerConfig,
         dtype: DType,
@@ -424,7 +424,7 @@ impl crate::Model for BnbLlamaForCausalLM {
 
 /// BnB factory function signature.
 pub type BnbModelFactory = fn(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     bnb_config: &BnbQuantizeConfig,
     dtype: DType,
@@ -433,7 +433,7 @@ pub type BnbModelFactory = fn(
 
 /// Create a BnB LLaMA model (NF4 or INT8).
 pub fn create_llama_bnb(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     bnb_config: &BnbQuantizeConfig,
     dtype: DType,
@@ -447,7 +447,7 @@ pub fn create_llama_bnb(
 
 /// Create a BnB Qwen2 model (same arch with Qwen2-specific config defaults).
 pub fn create_qwen2_bnb(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     bnb_config: &BnbQuantizeConfig,
     dtype: DType,

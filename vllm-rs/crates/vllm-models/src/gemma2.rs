@@ -165,7 +165,7 @@ pub struct Gemma2MLP {
 impl Gemma2MLP {
     /// Load MLP weights with fused gate+up projection.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         dtype: DType,
         rank: usize,
@@ -246,7 +246,7 @@ impl Gemma2Attention {
     /// Sliding window is initialized to `None`; set `self.sliding_window` after
     /// construction for sliding-attention layers.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Gemma2Config,
         dtype: DType,
@@ -393,7 +393,7 @@ pub struct Gemma2DecoderLayer {
 impl Gemma2DecoderLayer {
     /// Load a decoder layer.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Gemma2Config,
         dtype: DType,
@@ -504,7 +504,7 @@ pub struct Gemma2Model {
 impl Gemma2Model {
     /// Load the model backbone.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Gemma2Config,
         dtype: DType,
@@ -604,7 +604,7 @@ pub struct Gemma2ForCausalLM {
 impl Gemma2ForCausalLM {
     /// Load the full model from weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &Gemma2Config,
         dtype: DType,
         device: &Device,
@@ -720,7 +720,7 @@ impl crate::Model for Gemma2ForCausalLM {
 
 /// Factory function for the model registry.
 pub fn create_gemma2(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
@@ -923,8 +923,8 @@ mod tests {
 
         create_test_weights(&path, &tensor_specs);
 
-        let weights = ModelWeights::from_single_file(&path, &device).unwrap();
-        let model = Gemma2ForCausalLM::load(&weights, &config, dtype, &device, 0, 1).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &device).unwrap();
+        let model = Gemma2ForCausalLM::load(&mut weights, &config, dtype, &device, 0, 1).unwrap();
 
         let input_ids = Tensor::new(&[1u32, 5, 10], &device).unwrap();
         let positions = Tensor::new(&[0u32, 1, 2], &device).unwrap();

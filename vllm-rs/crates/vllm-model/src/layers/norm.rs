@@ -44,9 +44,14 @@ impl RmsNorm {
     /// Load from model weights.
     ///
     /// Looks for `{prefix}.weight`.
-    pub fn load(weights: &ModelWeights, prefix: &str, eps: f64, dtype: DType) -> ModelResult<Self> {
+    pub fn load(
+        weights: &mut ModelWeights,
+        prefix: &str,
+        eps: f64,
+        dtype: DType,
+    ) -> ModelResult<Self> {
         let weight_name = format!("{}.weight", prefix);
-        let weight = weights.get_cast(&weight_name, dtype)?;
+        let weight = weights.take_cast(&weight_name, dtype)?;
         Ok(Self { weight, eps })
     }
 
@@ -129,9 +134,14 @@ impl GemmaRmsNorm {
     /// Load from model weights.
     ///
     /// Looks for `{prefix}.weight`.
-    pub fn load(weights: &ModelWeights, prefix: &str, eps: f64, dtype: DType) -> ModelResult<Self> {
+    pub fn load(
+        weights: &mut ModelWeights,
+        prefix: &str,
+        eps: f64,
+        dtype: DType,
+    ) -> ModelResult<Self> {
         let weight_name = format!("{}.weight", prefix);
-        let weight = weights.get_cast(&weight_name, dtype)?;
+        let weight = weights.take_cast(&weight_name, dtype)?;
         Ok(Self::new(weight, eps)?)
     }
 
@@ -202,9 +212,14 @@ impl LayerNorm {
     /// Load from model weights.
     ///
     /// Looks for `{prefix}.weight` and `{prefix}.bias`.
-    pub fn load(weights: &ModelWeights, prefix: &str, eps: f64, dtype: DType) -> ModelResult<Self> {
-        let weight = weights.get_cast(&format!("{prefix}.weight"), dtype)?;
-        let bias = weights.get_cast(&format!("{prefix}.bias"), dtype)?;
+    pub fn load(
+        weights: &mut ModelWeights,
+        prefix: &str,
+        eps: f64,
+        dtype: DType,
+    ) -> ModelResult<Self> {
+        let weight = weights.take_cast(&format!("{prefix}.weight"), dtype)?;
+        let bias = weights.take_cast(&format!("{prefix}.bias"), dtype)?;
         Ok(Self { weight, bias, eps })
     }
 
@@ -269,9 +284,14 @@ impl CohereLayerNorm {
     /// Load from model weights.
     ///
     /// Looks for `{prefix}.weight`.
-    pub fn load(weights: &ModelWeights, prefix: &str, eps: f64, dtype: DType) -> ModelResult<Self> {
+    pub fn load(
+        weights: &mut ModelWeights,
+        prefix: &str,
+        eps: f64,
+        dtype: DType,
+    ) -> ModelResult<Self> {
         let weight_name = format!("{}.weight", prefix);
-        let weight = weights.get_cast(&weight_name, dtype)?;
+        let weight = weights.take_cast(&weight_name, dtype)?;
         Ok(Self { weight, eps })
     }
 
@@ -403,8 +423,8 @@ mod tests {
             &[("norm.weight", vec![4], DType::F32, &w_data)],
         );
 
-        let weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
-        let norm = RmsNorm::load(&weights, "norm", 1e-5, DType::F32).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
+        let norm = RmsNorm::load(&mut weights, "norm", 1e-5, DType::F32).unwrap();
         assert_eq!(norm.hidden_size(), 4);
     }
 
@@ -476,8 +496,8 @@ mod tests {
             &[("norm.weight", vec![4], DType::F32, &w_data)],
         );
 
-        let weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
-        let norm = GemmaRmsNorm::load(&weights, "norm", 1e-5, DType::F32).unwrap();
+        let mut weights = ModelWeights::from_single_file(&path, &Device::Cpu).unwrap();
+        let norm = GemmaRmsNorm::load(&mut weights, "norm", 1e-5, DType::F32).unwrap();
         assert_eq!(norm.hidden_size(), 4);
     }
 

@@ -318,7 +318,7 @@ struct Qwen3NextAttention {
 impl Qwen3NextAttention {
     /// Load from model weights.
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Qwen3NextConfig,
         dtype: DType,
@@ -560,7 +560,7 @@ struct GatedDeltaNet {
 impl GatedDeltaNet {
     /// Load from model weights.
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Qwen3NextConfig,
         dtype: DType,
@@ -570,16 +570,16 @@ impl GatedDeltaNet {
         let in_proj_ba = Linear::load(weights, &format!("{prefix}.in_proj_ba"), dtype)?;
 
         // Conv1d weight may be stored as [conv_dim, 1, kernel_size] — squeeze to [conv_dim, kernel_size].
-        let conv1d_weight_raw = weights.get_cast(&format!("{prefix}.conv1d.weight"), dtype)?;
+        let conv1d_weight_raw = weights.take_cast(&format!("{prefix}.conv1d.weight"), dtype)?;
         let conv1d_weight = if conv1d_weight_raw.dims().len() == 3 {
             conv1d_weight_raw.squeeze(1).map_err(ModelError::Candle)?
         } else {
             conv1d_weight_raw
         };
 
-        let a_log = weights.get_cast(&format!("{prefix}.A_log"), dtype)?;
-        let dt_bias = weights.get_cast(&format!("{prefix}.dt_bias"), dtype)?;
-        let norm_weight = weights.get_cast(&format!("{prefix}.norm.weight"), dtype)?;
+        let a_log = weights.take_cast(&format!("{prefix}.A_log"), dtype)?;
+        let dt_bias = weights.take_cast(&format!("{prefix}.dt_bias"), dtype)?;
+        let norm_weight = weights.take_cast(&format!("{prefix}.norm.weight"), dtype)?;
         let out_proj = Linear::load(weights, &format!("{prefix}.out_proj"), dtype)?;
 
         Ok(Self {
@@ -1068,7 +1068,7 @@ pub struct Qwen3NextDecoderLayer {
 impl Qwen3NextDecoderLayer {
     /// Load from model weights.
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Qwen3NextConfig,
         layer_idx: usize,
@@ -1253,7 +1253,7 @@ struct Qwen3NextModel {
 
 impl Qwen3NextModel {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Qwen3NextConfig,
         dtype: DType,
@@ -1386,7 +1386,7 @@ impl Qwen3NextForCausalLM {
 
     /// Load the full model from weights.
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &Qwen3NextConfig,
         dtype: DType,
         device: &Device,
@@ -1445,7 +1445,7 @@ impl crate::Model for Qwen3NextForCausalLM {
 
 /// Factory function for the model registry.
 pub fn create_qwen3_next(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,

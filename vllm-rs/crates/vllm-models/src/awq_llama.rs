@@ -28,7 +28,7 @@ struct AwqLlamaMLP {
 
 impl AwqLlamaMLP {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         awq: &AwqConfig,
         device: &Device,
@@ -79,7 +79,7 @@ struct AwqLlamaAttention {
 
 impl AwqLlamaAttention {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
         awq: &AwqConfig,
@@ -172,7 +172,7 @@ struct AwqLlamaDecoderLayer {
 
 impl AwqLlamaDecoderLayer {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &LlamaConfig,
         awq: &AwqConfig,
@@ -245,7 +245,7 @@ struct AwqLlamaModel {
 
 impl AwqLlamaModel {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &LlamaConfig,
         awq: &AwqConfig,
         dtype: DType,
@@ -313,7 +313,7 @@ pub struct AwqLlamaForCausalLM {
 
 impl AwqLlamaForCausalLM {
     pub fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &LlamaConfig,
         awq: &AwqConfig,
         dtype: DType,
@@ -367,7 +367,7 @@ impl crate::Model for AwqLlamaForCausalLM {
 
 /// AWQ factory function signature.
 pub type AwqModelFactory = fn(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     awq_config: &AwqQuantizeConfig,
     dtype: DType,
@@ -376,7 +376,7 @@ pub type AwqModelFactory = fn(
 
 /// Create an AWQ LLaMA model.
 pub fn create_llama_awq(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     awq_config: &AwqQuantizeConfig,
     dtype: DType,
@@ -390,7 +390,7 @@ pub fn create_llama_awq(
 
 /// Create an AWQ Qwen2 model (same arch with Qwen2-specific config defaults).
 pub fn create_qwen2_awq(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     awq_config: &AwqQuantizeConfig,
     dtype: DType,

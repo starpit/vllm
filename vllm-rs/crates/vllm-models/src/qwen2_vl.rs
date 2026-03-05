@@ -200,7 +200,7 @@ struct Qwen2VisionPatchEmbed {
 }
 
 impl Qwen2VisionPatchEmbed {
-    fn load(weights: &ModelWeights, prefix: &str, dtype: DType) -> ModelResult<Self> {
+    fn load(weights: &mut ModelWeights, prefix: &str, dtype: DType) -> ModelResult<Self> {
         let proj = Linear::load(weights, &format!("{prefix}.proj"), dtype)?;
         Ok(Self { proj })
     }
@@ -225,7 +225,7 @@ struct Qwen2VisionAttention {
 
 impl Qwen2VisionAttention {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Qwen2VisionConfig,
         dtype: DType,
@@ -349,7 +349,7 @@ struct Qwen2VisionMLP {
 }
 
 impl Qwen2VisionMLP {
-    fn load(weights: &ModelWeights, prefix: &str, dtype: DType) -> ModelResult<Self> {
+    fn load(weights: &mut ModelWeights, prefix: &str, dtype: DType) -> ModelResult<Self> {
         let fc1 = Linear::load(weights, &format!("{prefix}.fc1"), dtype)?;
         let fc2 = Linear::load(weights, &format!("{prefix}.fc2"), dtype)?;
         Ok(Self { fc1, fc2 })
@@ -378,7 +378,7 @@ struct Qwen2VisionBlock {
 
 impl Qwen2VisionBlock {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Qwen2VisionConfig,
         dtype: DType,
@@ -437,7 +437,7 @@ struct Qwen25VisionBlock {
 
 impl Qwen25VisionBlock {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Qwen2VisionConfig,
         dtype: DType,
@@ -499,7 +499,7 @@ struct Qwen2VisionPatchMerger {
 
 impl Qwen2VisionPatchMerger {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Qwen2VisionConfig,
         text_hidden_size: usize,
@@ -595,7 +595,7 @@ struct Qwen2VisionTransformer {
 
 impl Qwen2VisionTransformer {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &Qwen2VisionConfig,
         text_hidden_size: usize,
@@ -827,7 +827,7 @@ pub struct Qwen2VLForConditionalGeneration {
 
 impl Qwen2VLForConditionalGeneration {
     fn load(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         config: &Qwen2VLConfig,
         dtype: DType,
         device: &Device,
@@ -1011,7 +1011,7 @@ impl crate::Model for Qwen2VLForConditionalGeneration {
 
 /// Factory function for `Qwen2VLForConditionalGeneration`.
 pub fn create_qwen2_vl(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,
@@ -1026,7 +1026,7 @@ pub fn create_qwen2_vl(
 
 /// Factory function for `Qwen2_5_VLForConditionalGeneration`.
 pub fn create_qwen25_vl(
-    weights: &ModelWeights,
+    weights: &mut ModelWeights,
     config: &HfModelConfig,
     dtype: DType,
     device: &Device,

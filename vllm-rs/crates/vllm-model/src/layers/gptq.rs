@@ -152,23 +152,20 @@ impl GptqLinear {
     /// Looks for `{prefix}.qweight`, `{prefix}.qzeros`, `{prefix}.scales`,
     /// and optionally `{prefix}.g_idx` and `{prefix}.bias`.
     pub fn from_weights(
-        weights: &ModelWeights,
+        weights: &mut ModelWeights,
         prefix: &str,
         config: &GptqConfig,
         _device: &Device,
     ) -> ModelResult<Self> {
-        let qweight = weights.get(&format!("{prefix}.qweight"))?.clone();
-        let qzeros = weights.get(&format!("{prefix}.qzeros"))?.clone();
-        let scales = weights.get(&format!("{prefix}.scales"))?.clone();
-
+        let bias = weights.take(&format!("{prefix}.bias")).ok();
         let g_idx = if config.desc_act {
-            Some(weights.get(&format!("{prefix}.g_idx"))?.clone())
+            Some(weights.take(&format!("{prefix}.g_idx"))?)
         } else {
-            // Try to load g_idx even for non-desc_act (some models include it).
-            weights.get(&format!("{prefix}.g_idx")).ok().cloned()
+            weights.take(&format!("{prefix}.g_idx")).ok()
         };
-
-        let bias = weights.get(&format!("{prefix}.bias")).ok().cloned();
+        let qweight = weights.take(&format!("{prefix}.qweight"))?;
+        let qzeros = weights.take(&format!("{prefix}.qzeros"))?;
+        let scales = weights.take(&format!("{prefix}.scales"))?;
 
         // Derive dimensions from tensor shapes.
         let pack_factor = 32 / config.bits;

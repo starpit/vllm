@@ -92,6 +92,9 @@ pub struct VllmConfig {
     /// Disable CUDA graph capture and run all steps eagerly.
     /// Default: false.
     pub enforce_eager: bool,
+    /// Maximum number of tokens processed in a single scheduler iteration.
+    /// None = auto (min(max_model_len, 8192)).
+    pub max_num_batched_tokens: Option<usize>,
 }
 
 impl Default for VllmConfig {
@@ -122,6 +125,7 @@ impl Default for VllmConfig {
             cuda_graph_config: None,
             enable_prefix_caching: true,
             enforce_eager: false,
+            max_num_batched_tokens: None,
         }
     }
 }
@@ -232,6 +236,9 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             block_size: config.block_size,
             device_id,
             enforce_eager: config.enforce_eager,
+            // TODO: Python vLLM uses 8192 for H100/MI300x (>=70GB, non-A100).
+            // We don't have a device query here yet — bump this when we do.
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
         };
 
         let mut worker = CudaWorker::new(cuda_config);
@@ -426,7 +433,9 @@ fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
 
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
-            max_num_batched_tokens: max_model_len.min(8192),
+            max_num_batched_tokens: config
+                .max_num_batched_tokens
+                .unwrap_or_else(|| max_model_len.min(8192)),
             max_num_seqs: config.max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,
@@ -971,7 +980,9 @@ fn initialize_stack_tp(
     let use_async_scheduling = !config.disable_async_scheduling;
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
-            max_num_batched_tokens: max_model_len.min(8192),
+            max_num_batched_tokens: config
+                .max_num_batched_tokens
+                .unwrap_or_else(|| max_model_len.min(8192)),
             max_num_seqs: config.max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,
@@ -1226,5 +1237,24 @@ mod tests {
         assert_eq!(config.block_size, 16);
         assert!((config.gpu_memory_utilization - 0.9).abs() < f64::EPSILON);
         assert!(config.model.is_empty());
+        assert!(config.max_num_batched_tokens.is_none());
+    }
+
+    #[test]
+    fn test_max_num_batched_tokens_default_none() {
+        let config = VllmConfig::default();
+        assert!(
+            config.max_num_batched_tokens.is_none(),
+            "default should be None (auto)"
+        );
+    }
+
+    #[test]
+    fn test_max_num_batched_tokens_explicit_override() {
+        let config = VllmConfig {
+            max_num_batched_tokens: Some(4096),
+            ..VllmConfig::default()
+        };
+        assert_eq!(config.max_num_batched_tokens, Some(4096));
     }
 }

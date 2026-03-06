@@ -82,6 +82,10 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 256)]
     pub max_num_seqs: usize,
 
+    /// Maximum number of tokens processed in a single scheduler iteration.
+    #[arg(long)]
+    pub max_num_batched_tokens: Option<usize>,
+
     /// HuggingFace token for gated models.
     #[arg(long, env = "HF_TOKEN")]
     pub hf_token: Option<String>,

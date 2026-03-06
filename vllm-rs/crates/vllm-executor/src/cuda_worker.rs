@@ -47,6 +47,8 @@ pub struct CudaWorkerConfig {
     pub device_id: i32,
     /// Skip CUDA graph capture (--enforce-eager).
     pub enforce_eager: bool,
+    /// Maximum tokens per scheduler iteration (controls arena pre-sizing).
+    pub max_num_batched_tokens: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,10 +1254,9 @@ impl Worker for CudaWorker {
         // Run with a prefill-like token count (max_bs * 32) to cover both prefill
         // and decode arena needs.
         {
-            // Use 8 * 32 = 256 tokens for arena pre-sizing regardless of max graph BS.
-            // The arena only needs to handle the largest single-pass allocation,
-            // which is bounded by max_concurrent_requests * prompt_len.
-            let prefill_tokens = 8 * 32; // 256 tokens covers typical prefill
+            // Pre-size the arena to handle the worst-case prefill batch, which is
+            // max_num_batched_tokens tokens in a single forward pass.
+            let prefill_tokens = self.config.max_num_batched_tokens;
             info!("Pre-sizing arena with dummy forward ({prefill_tokens} tokens)...");
             device.arena.reset();
             let dummy_ids = device.arena.alloc(&[prefill_tokens], GpuDType::U32);
@@ -1271,33 +1272,33 @@ impl Worker for CudaWorker {
                 )
                 .ok();
             }
-            // cu_seqlens: each request has 32 tokens
-            let cu_q: Vec<u32> = (0..=max_bs).map(|i| (i * 32) as u32).collect();
-            let gpu_cu_q = device.arena.alloc(&[max_bs + 1], GpuDType::U32);
+            // cu_seqlens: single sequence of prefill_tokens length (worst case for arena).
+            let cu_q: Vec<u32> = vec![0, prefill_tokens as u32];
+            let gpu_cu_q = device.arena.alloc(&[2], GpuDType::U32);
             unsafe {
                 driver::memcpy_htod_async(
                     gpu_cu_q.raw_ptr(),
                     cu_q.as_ptr() as *const u8,
-                    (max_bs + 1) * 4,
+                    2 * 4,
                     device.compute_stream,
                 )
                 .ok();
             }
-            let gpu_cu_k = device.arena.alloc(&[max_bs + 1], GpuDType::U32);
+            let gpu_cu_k = device.arena.alloc(&[2], GpuDType::U32);
             unsafe {
                 driver::memcpy_htod_async(
                     gpu_cu_k.raw_ptr(),
                     cu_q.as_ptr() as *const u8,
-                    (max_bs + 1) * 4,
+                    2 * 4,
                     device.compute_stream,
                 )
                 .ok();
             }
-            let dummy_bt = device.arena.alloc(&[max_bs, 1], GpuDType::U32);
+            let dummy_bt = device.arena.alloc(&[1, 1], GpuDType::U32);
             unsafe {
-                driver::memset_d8(dummy_bt.raw_ptr(), 0, max_bs * 4, device.compute_stream).ok();
+                driver::memset_d8(dummy_bt.raw_ptr(), 0, 4, device.compute_stream).ok();
             }
-            // Use padded max_seqlen_k=2048 to match graph capture workspace needs.
+            // max_seqlen_q = max_seqlen_k = prefill_tokens for arena sizing.
             unsafe {
                 let _ = model.forward(
                     dummy_ids,
@@ -1306,8 +1307,8 @@ impl Worker for CudaWorker {
                     gpu_cu_q,
                     gpu_cu_k,
                     dummy_bt,
-                    32,
-                    2048,
+                    prefill_tokens,
+                    prefill_tokens,
                     kv_cache,
                     device,
                     None,

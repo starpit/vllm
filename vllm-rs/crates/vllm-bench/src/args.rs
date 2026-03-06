@@ -95,6 +95,10 @@ pub struct BenchLatencyArgs {
     #[arg(long, default_value_t = 256)]
     pub max_num_seqs: usize,
 
+    /// Maximum number of tokens processed in a single scheduler iteration.
+    #[arg(long)]
+    pub max_num_batched_tokens: Option<usize>,
+
     /// KV cache block size in tokens.
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,
@@ -210,6 +214,10 @@ pub struct BenchThroughputArgs {
     /// Maximum number of concurrent sequences.
     #[arg(long, default_value_t = 256)]
     pub max_num_seqs: usize,
+
+    /// Maximum number of tokens processed in a single scheduler iteration.
+    #[arg(long)]
+    pub max_num_batched_tokens: Option<usize>,
 
     /// KV cache block size in tokens.
     #[arg(long, default_value_t = 16)]
@@ -400,6 +408,10 @@ pub struct BenchStartupArgs {
     /// Maximum number of concurrent sequences.
     #[arg(long, default_value_t = 256)]
     pub max_num_seqs: usize,
+
+    /// Maximum number of tokens processed in a single scheduler iteration.
+    #[arg(long)]
+    pub max_num_batched_tokens: Option<usize>,
 
     /// KV cache block size in tokens.
     #[arg(long, default_value_t = 16)]

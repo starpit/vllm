@@ -29,6 +29,9 @@ fn create_llm(args: &BenchLatencyArgs, model: &str) -> Result<LLM> {
         .enable_prefix_caching(args.enable_prefix_caching)
         .enforce_eager(args.enforce_eager);
 
+    if let Some(n) = args.max_num_batched_tokens {
+        builder = builder.max_num_batched_tokens(n);
+    }
     if let Some(len) = args.max_model_len {
         builder = builder.max_model_len(len);
     }

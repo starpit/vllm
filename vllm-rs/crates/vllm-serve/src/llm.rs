@@ -189,6 +189,12 @@ impl LLMBuilder {
         self
     }
 
+    /// Set the maximum number of tokens per scheduler iteration.
+    pub fn max_num_batched_tokens(mut self, n: usize) -> Self {
+        self.config.max_num_batched_tokens = Some(n);
+        self
+    }
+
     /// Set the KV cache block size in tokens.
     pub fn block_size(mut self, size: usize) -> Self {
         self.config.block_size = size;

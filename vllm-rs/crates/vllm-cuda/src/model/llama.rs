@@ -462,18 +462,44 @@ impl LlamaModel {
         device: &mut GpuDevice,
     ) -> GpuTensor {
         // Embedding lookup.
-        let mut hidden_states = kernels::embedding_gather(
+        let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
             input_ids,
             &mut device.arena,
             device.compute_stream,
         );
 
-        // Decoder layers with residual threading.
+        // Decoder layers with per-layer arena scoping.
+        //
+        // Pre-allocate persistent buffers for the two inter-layer tensors
+        // (hidden_states and residual). Each layer's intermediates (QKV
+        // projections, attention workspace, MLP activations) are allocated
+        // after these buffers and reclaimed after the layer completes.
+        // This matches PyTorch's memory behavior where intermediates are
+        // freed when dropped, keeping peak memory proportional to one
+        // layer's scratch instead of all layers combined.
+        //
+        // The residual buffer is updated in-place by fused_add_rms_norm,
+        // so only hidden_states needs a D2D copy per layer.
+        let num_tokens = hidden_states.dim(0);
+        let hidden_size = hidden_states.dim(1);
+        let dtype = hidden_states.dtype();
+        let hs_buf = device.arena.alloc(&[num_tokens, hidden_size], dtype);
+        let res_buf = device.arena.alloc(&[num_tokens, hidden_size], dtype);
+        // Copy initial embedding output into the persistent buffer.
+        crate::driver::memcpy_dtod_async(
+            hs_buf.raw_ptr() as *mut u8,
+            hidden_states.raw_ptr() as *const u8,
+            hidden_states.size_bytes(),
+            device.compute_stream,
+        )
+        .expect("dtod copy initial hidden_states");
+        let layer_scratch_base = device.arena.used();
+
         let mut residual: Option<GpuTensor> = None;
         for layer in &self.layers {
             let (hs, res) = layer.forward(
-                hidden_states,
+                hs_buf,
                 residual,
                 positions,
                 slot_mapping,
@@ -486,9 +512,30 @@ impl LlamaModel {
                 &self.rotary,
                 device,
             );
-            hidden_states = hs;
-            residual = Some(res);
+            // Copy hidden_states (mlp_output, in scratch) to persistent buffer.
+            crate::driver::memcpy_dtod_async(
+                hs_buf.raw_ptr() as *mut u8,
+                hs.raw_ptr() as *const u8,
+                hs.size_bytes(),
+                device.compute_stream,
+            )
+            .expect("dtod copy hidden_states");
+            // First layer returns residual = hs_buf (the original embedding);
+            // subsequent layers return res_buf (updated in-place). Copy into
+            // res_buf if needed.
+            if res.raw_ptr() != res_buf.raw_ptr() {
+                crate::driver::memcpy_dtod_async(
+                    res_buf.raw_ptr() as *mut u8,
+                    res.raw_ptr() as *const u8,
+                    res.size_bytes(),
+                    device.compute_stream,
+                )
+                .expect("dtod copy residual");
+            }
+            device.arena.set_offset(layer_scratch_base);
+            residual = Some(res_buf);
         }
+        let hidden_states = hs_buf;
 
         // Final norm with fused residual add.
         let (normed, _) = kernels::fused_add_rms_norm(

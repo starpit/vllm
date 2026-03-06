@@ -9,7 +9,6 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use indicatif::{ProgressBar, ProgressStyle};
 use vllm_common::telemetry;
 use vllm_config::CudaGraphConfig;
 use vllm_serve::llm::{LLM, LLMBuilder, Prompt, SamplingParams};
@@ -107,20 +106,10 @@ pub(crate) fn run_bench_throughput(args: BenchThroughputArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
-    // Process all prompts in batches (the engine handles scheduling).
-    let pb = ProgressBar::new(args.num_prompts as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "Processing {wide_bar:.cyan/blue} {pos}/{len} [{elapsed}<{eta}]",
-        )
-        .unwrap(),
-    );
-
     let start = Instant::now();
     // Feed all prompts at once — the engine's scheduler handles batching.
-    let outputs = llm.generate(&prompts, Some(sampling_params))?;
+    let outputs = llm.generate_with_tqdm(&prompts, Some(sampling_params))?;
     let elapsed = start.elapsed().as_secs_f64();
-    pb.finish_and_clear();
 
     // Count actual tokens from outputs.
     let total_prompt_tokens: usize = outputs.iter().map(|o| o.prompt_token_ids.len()).sum();

@@ -53,6 +53,7 @@ minijinja = { workspace = true, optional = true }
 minijinja-contrib = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 prometheus = { workspace = true, optional = true }
+indicatif = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

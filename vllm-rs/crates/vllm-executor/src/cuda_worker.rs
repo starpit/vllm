@@ -16,7 +16,7 @@ use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_cuda::device::GpuDevice;
 use vllm_cuda::driver;
 use vllm_cuda::dtype::DType as GpuDType;
-use vllm_cuda::graph::{CudaGraphRunner, GRAPH_MAX_BLOCKS_PER_SEQ};
+use vllm_cuda::graph::{CudaGraphRunner, GRAPH_MAX_BLOCKS_PER_SEQ, PrefillGraphRunner};
 use vllm_cuda::kv_cache::KvCachePool;
 use vllm_cuda::tensor::GpuTensor;
 use vllm_cuda::weights::GpuWeights;
@@ -306,6 +306,8 @@ pub struct CudaWorker {
     _weights: Option<GpuWeights>,
     /// CUDA graph runner for decode batches.
     graph_runner: Option<CudaGraphRunner>,
+    /// CUDA graph runner for single-sequence prefill batches.
+    prefill_graph_runner: Option<PrefillGraphRunner>,
     /// Batch size of the last graph replay. When the batch composition is
     /// unchanged, we can skip the input_ids H2D copy because the graph's
     /// D2D scatter already placed argmax results into the persistent buffer.
@@ -339,6 +341,7 @@ impl CudaWorker {
             is_shutdown: false,
             _weights: None,
             graph_runner: None,
+            prefill_graph_runner: None,
             last_graph_batch_size: None,
             graph_metadata_valid: false,
             token_buffers: HashMap::new(),
@@ -1118,43 +1121,113 @@ impl Worker for CudaWorker {
                 replay_out.logits
             }
         } else {
-            // Eager forward path (prefill or uncaptured batch size).
+            // Non-decode path: try prefill graph, fall back to eager.
             self.last_graph_batch_size = None;
             self.graph_metadata_valid = false;
-            device.arena.reset();
 
-            let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
-            let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
+            // Check if we can use a prefill graph: single request, fresh prefill
+            // (q_len == seq_len, no prior cached tokens), and captured graph exists.
+            let meta = &prepared.attn_meta;
+            let use_prefill_graph = num_reqs == 1
+                && meta.q_lens[0] == meta.seq_lens[0]
+                && self
+                    .prefill_graph_runner
+                    .as_ref()
+                    .and_then(|r| r.nearest_graph_size(total_tokens))
+                    .is_some();
 
-            let (slot_mapping, cu_seqlens_q, cu_seqlens_k, block_table, max_seqlen_q, max_seqlen_k) =
-                Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
+            if use_prefill_graph {
+                let padded = self
+                    .prefill_graph_runner
+                    .as_ref()
+                    .unwrap()
+                    .nearest_graph_size(total_tokens)
+                    .unwrap();
 
-            let last_token_indices = if num_reqs < total_tokens {
-                let mut indices = Vec::with_capacity(num_reqs);
-                let mut offset = 0u32;
-                for req_slice in &prepared.req_inputs {
-                    indices.push(offset + req_slice.token_count as u32 - 1);
-                    offset += req_slice.token_count as u32;
+                // Build block_table padded to MAX_BLOCKS_PER_SEQ.
+                let mut block_table = vec![0u32; GRAPH_MAX_BLOCKS_PER_SEQ];
+                for (j, &bid) in meta.block_ids[0].iter().enumerate() {
+                    if j < GRAPH_MAX_BLOCKS_PER_SEQ {
+                        block_table[j] = bid as u32;
+                    }
                 }
-                Some(Self::h2d_u32(&indices, device)?)
-            } else {
-                None
-            };
 
-            unsafe {
-                model.forward(
-                    gpu_input_ids,
-                    gpu_positions,
+                // Build slot_mapping for real tokens.
+                let mut slot_mapping = Vec::with_capacity(total_tokens);
+                let block_ids = &meta.block_ids[0];
+                for t in 0..total_tokens {
+                    let abs_pos = meta.tokens_before[0] + t;
+                    let block_idx = abs_pos / block_size;
+                    let offset = abs_pos % block_size;
+                    if block_idx < block_ids.len() {
+                        slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
+                    } else {
+                        slot_mapping.push(-1i64);
+                    }
+                }
+
+                let last_token_idx = (total_tokens - 1) as u32;
+
+                let replay_out = unsafe {
+                    self.prefill_graph_runner.as_ref().unwrap().replay(
+                        padded,
+                        &prepared.flat_token_ids,
+                        &prepared.flat_positions,
+                        &slot_mapping,
+                        meta.seq_lens[0],
+                        &block_table,
+                        last_token_idx,
+                        device,
+                    )
+                }
+                .map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("prefill graph replay: {e}"))
+                })?;
+
+                replay_out.logits
+            } else {
+                // Eager forward path (multi-request prefill or uncaptured size).
+                device.arena.reset();
+
+                let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
+                let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
+
+                let (
                     slot_mapping,
                     cu_seqlens_q,
                     cu_seqlens_k,
                     block_table,
                     max_seqlen_q,
                     max_seqlen_k,
-                    kv_cache,
-                    device,
-                    last_token_indices,
-                )
+                ) = Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
+
+                let last_token_indices = if num_reqs < total_tokens {
+                    let mut indices = Vec::with_capacity(num_reqs);
+                    let mut offset = 0u32;
+                    for req_slice in &prepared.req_inputs {
+                        indices.push(offset + req_slice.token_count as u32 - 1);
+                        offset += req_slice.token_count as u32;
+                    }
+                    Some(Self::h2d_u32(&indices, device)?)
+                } else {
+                    None
+                };
+
+                unsafe {
+                    model.forward(
+                        gpu_input_ids,
+                        gpu_positions,
+                        slot_mapping,
+                        cu_seqlens_q,
+                        cu_seqlens_k,
+                        block_table,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        kv_cache,
+                        device,
+                        last_token_indices,
+                    )
+                }
             }
         };
 
@@ -1498,6 +1571,68 @@ impl Worker for CudaWorker {
                 runner.captured_sizes()
             );
             self.graph_runner = Some(runner);
+        }
+
+        // Capture prefill graphs for common single-sequence token counts.
+        // These cover the common case of one prompt arriving at a time.
+        let max_prefill_tokens = self.config.max_num_batched_tokens;
+        let prefill_sizes: Vec<usize> = [128, 256, 512, 1024, 2048, 4096, 8192]
+            .iter()
+            .copied()
+            .filter(|&s| s <= max_prefill_tokens)
+            .collect();
+
+        if !prefill_sizes.is_empty() {
+            let max_prefill = *prefill_sizes.last().unwrap();
+            match unsafe { PrefillGraphRunner::new(max_prefill, vocab_size, self.model_dtype) } {
+                Ok(mut prefill_runner) => {
+                    for &num_tokens in &prefill_sizes {
+                        info!("Capturing prefill CUDA graph for num_tokens={num_tokens}...");
+                        let kv_ref = kv_cache;
+                        let model_ref = model;
+
+                        let result = unsafe {
+                            prefill_runner.capture(num_tokens, device, |inputs, dev| {
+                                model_ref.forward(
+                                    inputs.input_ids,
+                                    inputs.positions,
+                                    inputs.slot_mapping,
+                                    inputs.cu_seqlens_q,
+                                    inputs.cu_seqlens_k,
+                                    inputs.block_table,
+                                    num_tokens, // max_seqlen_q
+                                    num_tokens, // max_seqlen_k
+                                    kv_ref,
+                                    dev,
+                                    Some(inputs.last_token_indices),
+                                )
+                            })
+                        };
+
+                        match result {
+                            Ok(()) => {
+                                info!("Prefill CUDA graph captured for num_tokens={num_tokens}")
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to capture prefill graph for {num_tokens}: {e}"
+                                );
+                            }
+                        }
+                    }
+
+                    if !prefill_runner.captured_sizes().is_empty() {
+                        info!(
+                            "Prefill CUDA graphs captured for token counts: {:?}",
+                            prefill_runner.captured_sizes()
+                        );
+                        self.prefill_graph_runner = Some(prefill_runner);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to create PrefillGraphRunner: {e}");
+                }
+            }
         }
 
         // Benchmark cublasLt algorithms now that the plan cache is populated

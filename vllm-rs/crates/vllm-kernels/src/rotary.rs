@@ -292,8 +292,8 @@ impl RotaryKernels for CudaRotaryKernels {
 #[cfg(feature = "cuda")]
 mod fused_rope {
     use candle_core::backend::BackendStorage;
-    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core::cuda_backend::CudaDType;
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core::{CpuStorage, CudaStorage, CustomOp2, DType, Layout, Result, Shape, Tensor};
 
     /// Fused RoPE CustomOp — rotates a single tensor (Q or K) in-place on the
@@ -487,8 +487,8 @@ mod fused_rope {
         head_size: usize,
     ) -> candle_core::Result<(Tensor, Tensor)> {
         use candle_core::backend::BackendStorage;
-        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
         use candle_core::cuda_backend::CudaDType;
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 
         fn fwd_t<T: CudaDType + cudarc::driver::DeviceRepr>(
             q: &Tensor,

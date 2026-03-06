@@ -236,8 +236,6 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             block_size: config.block_size,
             device_id,
             enforce_eager: config.enforce_eager,
-            // TODO: Python vLLM uses 8192 for H100/MI300x (>=70GB, non-A100).
-            // We don't have a device query here yet — bump this when we do.
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
         };
 
@@ -245,6 +243,22 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
         worker
             .init_device()
             .context("failed to initialize CUDA device")?;
+
+        // Auto-detect max_num_batched_tokens from GPU VRAM if not explicitly set.
+        // H100/MI300x (>=70GB): 8192, others: 2048. Matches Python vLLM defaults.
+        if config.max_num_batched_tokens.is_none() {
+            let total_vram = worker.determine_available_memory().unwrap_or(0);
+            // determine_available_memory returns free VRAM; total is roughly free + used.
+            // For a fresh device, free ≈ total. Use 60GB as threshold (some VRAM used by driver).
+            let total_gb = total_vram as f64 / (1024.0 * 1024.0 * 1024.0);
+            if total_gb >= 60.0 {
+                info!(
+                    "GPU has {:.0}GB free VRAM, using max_num_batched_tokens=8192",
+                    total_gb
+                );
+                worker.set_max_num_batched_tokens(8192);
+            }
+        }
         worker.load_model().context("failed to load CUDA model")?;
 
         let hf_config = worker

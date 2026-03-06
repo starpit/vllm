@@ -95,6 +95,68 @@ void embedding_gather_f32(
 }  // extern "C"
 
 // ---------------------------------------------------------------------------
+// update_decode_metadata: GPU-side metadata update for decode steps.
+//
+// In one kernel launch, this:
+// 1. Increments positions[i] += 1
+// 2. Computes slot_mapping[i] from new position + block_table
+// 3. Increments cu_seqlens_k[1..num_reqs+1] += 1
+//
+// Replaces 3 CPU Vec builds + 3 H2D copies per decode step.
+// ---------------------------------------------------------------------------
+
+__global__ void update_decode_metadata_kernel(
+    uint32_t* __restrict__ positions,       // [num_reqs] — incremented in place
+    int64_t* __restrict__ slot_mapping,     // [num_reqs] — recomputed from new pos
+    uint32_t* __restrict__ cu_seqlens_k,    // [num_reqs+1] — elements 1..N incremented
+    const uint32_t* __restrict__ block_table, // [num_reqs, max_blocks_per_seq]
+    int num_reqs,
+    int block_size,
+    int max_blocks_per_seq
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_reqs) return;
+
+    // 1. Increment position.
+    uint32_t new_pos = positions[i] + 1;
+    positions[i] = new_pos;
+
+    // 2. Compute slot_mapping from new position + block_table.
+    uint32_t block_idx = new_pos / block_size;
+    uint32_t offset = new_pos % block_size;
+    if (block_idx < (uint32_t)max_blocks_per_seq) {
+        uint32_t block_id = block_table[i * max_blocks_per_seq + block_idx];
+        slot_mapping[i] = (int64_t)(block_id * block_size + offset);
+    } else {
+        slot_mapping[i] = -1;
+    }
+
+    // 3. Increment cu_seqlens_k[i+1] (element 0 stays 0).
+    cu_seqlens_k[i + 1] += 1;
+}
+
+extern "C" {
+
+void update_decode_metadata(
+    uint32_t* positions,
+    int64_t* slot_mapping,
+    uint32_t* cu_seqlens_k,
+    const uint32_t* block_table,
+    int num_reqs,
+    int block_size,
+    int max_blocks_per_seq,
+    cudaStream_t stream
+) {
+    int threads = 256;
+    int blocks = (num_reqs + threads - 1) / threads;
+    update_decode_metadata_kernel<<<blocks, threads, 0, stream>>>(
+        positions, slot_mapping, cu_seqlens_k, block_table,
+        num_reqs, block_size, max_blocks_per_seq);
+}
+
+}  // extern "C"
+
+// ---------------------------------------------------------------------------
 // Split fused QKV: [num_tokens, q_size + 2*kv_size] → Q, K, V contiguous
 // One thread per element.
 // ---------------------------------------------------------------------------

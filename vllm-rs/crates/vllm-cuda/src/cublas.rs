@@ -382,6 +382,194 @@ impl CublasHandle {
         out
     }
 
+    /// Benchmark all cached GEMM plans: for each shape, try the top N
+    /// algorithms from the heuristic and keep the fastest.
+    ///
+    /// Call this during warmup after the first forward pass has populated
+    /// the plan cache with all model GEMM shapes.
+    ///
+    /// # Safety
+    /// Requires active CUDA context. Arena must have enough space for the
+    /// largest GEMM output.
+    pub unsafe fn benchmark_plans(&mut self, _arena: &mut ScratchArena) {
+        use crate::driver;
+
+        let keys: Vec<PlanKey> = self.plans.keys().copied().collect();
+        if keys.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            "Benchmarking {} cublasLt GEMM plans ({} warmup + {} timed iters)...",
+            keys.len(),
+            3,
+            10
+        );
+
+        let (event_start, event_end) = match (driver::event_create(), driver::event_create()) {
+            (Ok(s), Ok(e)) => (s, e),
+            _ => {
+                tracing::warn!("Failed to create CUDA events for benchmarking, skipping");
+                return;
+            }
+        };
+
+        for key in &keys {
+            // Allocate scratch buffers for benchmarking.
+            let a_bytes = key.m * key.k * key.dtype.size_bytes();
+            let b_bytes = key.n * key.k * key.dtype.size_bytes();
+            let c_bytes = key.m * key.n * key.dtype.size_bytes();
+            let total = a_bytes + b_bytes + c_bytes;
+
+            // Use temp allocations (not arena, which may be sized for the model).
+            let Ok(buf) = driver::mem_alloc(total) else {
+                continue;
+            };
+            let a_ptr = buf;
+            let b_ptr = unsafe { buf.add(a_bytes) };
+            let c_ptr = unsafe { buf.add(a_bytes + b_bytes) };
+            let _ = driver::memset_d8(buf, 0, total, self.stream);
+
+            // Get the plan's descriptors.
+            let plan = &self.plans[key];
+            let matmul_desc = plan.matmul_desc;
+            let layout_a = plan.layout_a;
+            let layout_b = plan.layout_b;
+            let layout_c = plan.layout_c;
+
+            // Get top N algorithms.
+            let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
+            if check_lt(lt::cublasLtMatmulPreferenceCreate(&mut pref)).is_err() {
+                let _ = driver::mem_free(buf);
+                continue;
+            }
+            let ws_size = CUBLAS_WORKSPACE_SIZE;
+            let _ = check_lt(lt::cublasLtMatmulPreferenceSetAttribute(
+                pref,
+                lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws_size as *const _ as *const _,
+                std::mem::size_of::<usize>(),
+            ));
+
+            const MAX_ALGOS: usize = 8;
+            let mut heuristics =
+                [std::mem::zeroed::<lt::cublasLtMatmulHeuristicResult_t>(); MAX_ALGOS];
+            let mut algo_count: i32 = 0;
+            let _ = lt::cublasLtMatmulAlgoGetHeuristic(
+                self.lt_handle,
+                matmul_desc,
+                layout_a,
+                layout_b,
+                layout_c,
+                layout_c,
+                pref,
+                MAX_ALGOS as i32,
+                heuristics.as_mut_ptr(),
+                &mut algo_count,
+            );
+            lt::cublasLtMatmulPreferenceDestroy(pref);
+
+            if algo_count <= 1 {
+                // Only one algorithm available, nothing to benchmark.
+                let _ = driver::mem_free(buf);
+                continue;
+            }
+
+            let alpha: f32 = 1.0;
+            let beta: f32 = 0.0;
+
+            let mut best_time = f32::MAX;
+            let mut best_algo_idx = 0usize;
+            let mut heuristic_time = f32::MAX; // time for algo 0 (heuristic pick)
+
+            for (ai, heuristic) in heuristics.iter().enumerate().take(algo_count as usize) {
+                let algo = &heuristic.algo;
+
+                // Warmup.
+                for _ in 0..3 {
+                    let _ = lt::cublasLtMatmul(
+                        self.lt_handle,
+                        matmul_desc,
+                        &alpha as *const f32 as *const _,
+                        b_ptr as *const _,
+                        layout_a,
+                        a_ptr as *const _,
+                        layout_b,
+                        &beta as *const f32 as *const _,
+                        c_ptr as *mut _,
+                        layout_c,
+                        c_ptr as *mut _,
+                        layout_c,
+                        algo,
+                        self.workspace as *mut _,
+                        CUBLAS_WORKSPACE_SIZE,
+                        self.stream as _,
+                    );
+                }
+
+                // Timed iterations.
+                let _ = driver::event_record(event_start, self.stream);
+                for _ in 0..10 {
+                    let _ = lt::cublasLtMatmul(
+                        self.lt_handle,
+                        matmul_desc,
+                        &alpha as *const f32 as *const _,
+                        b_ptr as *const _,
+                        layout_a,
+                        a_ptr as *const _,
+                        layout_b,
+                        &beta as *const f32 as *const _,
+                        c_ptr as *mut _,
+                        layout_c,
+                        c_ptr as *mut _,
+                        layout_c,
+                        algo,
+                        self.workspace as *mut _,
+                        CUBLAS_WORKSPACE_SIZE,
+                        self.stream as _,
+                    );
+                }
+                let _ = driver::event_record(event_end, self.stream);
+                let _ = driver::stream_synchronize(self.stream);
+
+                if let Ok(elapsed) = driver::event_elapsed(event_start, event_end) {
+                    let avg = elapsed / 10.0;
+                    if ai == 0 {
+                        heuristic_time = avg;
+                    }
+                    if avg < best_time {
+                        best_time = avg;
+                        best_algo_idx = ai;
+                    }
+                }
+            }
+
+            // Update the plan with the best algorithm.
+            if best_algo_idx != 0 {
+                let plan = self.plans.get_mut(key).unwrap();
+                plan.algo = heuristics[best_algo_idx].algo;
+                let speedup = (1.0 - best_time / heuristic_time) * 100.0;
+                tracing::info!(
+                    "  GEMM M={} K={} N={}: algo #{} is {:.1}% faster ({:.3}ms vs {:.3}ms)",
+                    key.m,
+                    key.k,
+                    key.n,
+                    best_algo_idx,
+                    speedup,
+                    best_time,
+                    heuristic_time,
+                );
+            }
+
+            let _ = driver::mem_free(buf);
+        }
+
+        let _ = driver::event_destroy(event_start);
+        let _ = driver::event_destroy(event_end);
+
+        tracing::info!("cublasLt plan benchmarking complete");
+    }
+
     /// Raw cuBLAS handle (for advanced usage).
     pub fn raw_handle(&self) -> cublasHandle_t {
         self.handle

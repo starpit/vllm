@@ -274,6 +274,11 @@ pub struct CudaWorker {
     /// unchanged, we can skip the input_ids H2D copy because the graph's
     /// D2D scatter already placed argmax results into the persistent buffer.
     last_graph_batch_size: Option<usize>,
+    /// True when persistent graph buffers contain valid metadata from a
+    /// previous replay (positions, slot_mapping, cu_seqlens_k). When true,
+    /// we use `replay_decode_fast()` which updates metadata on GPU instead
+    /// of building Vecs on CPU and doing H2D copies.
+    graph_metadata_valid: bool,
 
     // Per-request state (mirrors CandleWorker).
     token_buffers: HashMap<String, Vec<u32>>,
@@ -299,11 +304,17 @@ impl CudaWorker {
             _weights: None,
             graph_runner: None,
             last_graph_batch_size: None,
+            graph_metadata_valid: false,
             token_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
             input_batch: InputBatch::new(),
             preloaded_tokenizer: None,
         }
+    }
+
+    /// Update max_num_batched_tokens (used for GPU-aware auto-detection).
+    pub fn set_max_num_batched_tokens(&mut self, value: usize) {
+        self.config.max_num_batched_tokens = value;
     }
 
     /// Expose the HF config after load_model.
@@ -710,8 +721,9 @@ impl Worker for CudaWorker {
         if !scheduler_output.finished_req_ids.is_empty()
             || !scheduler_output.scheduled_new_reqs.is_empty()
         {
-            // Batch composition changed — can't reuse persistent input_ids.
+            // Batch composition changed — can't reuse persistent input_ids or metadata.
             self.last_graph_batch_size = None;
+            self.graph_metadata_valid = false;
         }
         for req_id in &scheduler_output.finished_req_ids {
             self.token_buffers.remove(req_id);
@@ -752,7 +764,8 @@ impl Worker for CudaWorker {
             );
         }
 
-        // Update cached requests' block tables.
+        // Update cached requests' block tables. Track if any changed.
+        let mut blocks_changed = !scheduler_output.scheduled_new_reqs.is_empty();
         for (i, req_id) in scheduler_output
             .scheduled_cached_reqs
             .req_ids
@@ -763,6 +776,9 @@ impl Worker for CudaWorker {
                 scheduler_output.scheduled_cached_reqs.new_block_ids.get(i)
                 && let Some(group0) = new_blocks.first()
             {
+                if !group0.is_empty() {
+                    blocks_changed = true;
+                }
                 self.input_batch.update_blocks(req_id, group0.clone());
             }
         }
@@ -815,75 +831,105 @@ impl Worker for CudaWorker {
             let graph_bs = graph_bs.unwrap();
             let meta = &prepared.attn_meta;
 
-            // Pad inputs to graph_bs. Extra slots get safe dummy values
-            // (slot_mapping=-1 means no KV write, block_table=0 is harmless).
-            let mut input_ids = prepared.flat_token_ids.clone();
-            input_ids.resize(graph_bs, 0);
-            let mut positions = prepared.flat_positions.clone();
-            positions.resize(graph_bs, 0);
+            let replay_out =
+                if self.graph_metadata_valid && self.last_graph_batch_size == Some(graph_bs) {
+                    // GPU-side metadata update: positions, slot_mapping, cu_seqlens_k
+                    // are incremented on GPU in a single kernel. Only block_table is
+                    // H2D-copied when blocks changed. input_ids were scattered by the
+                    // previous graph replay's in-graph argmax.
+                    let new_bt = if blocks_changed {
+                        let mut block_table = vec![0u32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
+                        for (i, blocks) in meta.block_ids.iter().enumerate() {
+                            for (j, &bid) in blocks.iter().enumerate() {
+                                if j < GRAPH_MAX_BLOCKS_PER_SEQ {
+                                    block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
+                                }
+                            }
+                        }
+                        Some(block_table)
+                    } else {
+                        None
+                    };
 
-            let mut cu_seqlens_q: Vec<u32> = (0..=num_reqs as u32).collect();
-            // Pad: extra entries all equal to num_reqs (zero-length sequences).
-            for _ in num_reqs..graph_bs {
-                cu_seqlens_q.push(num_reqs as u32);
-            }
-
-            let mut cu_seqlens_k = Vec::with_capacity(graph_bs + 1);
-            cu_seqlens_k.push(0u32);
-            let mut cum = 0u32;
-            for &sl in &meta.seq_lens {
-                cum += sl as u32;
-                cu_seqlens_k.push(cum);
-            }
-            // Pad: extra entries all equal to cum (zero-length sequences).
-            for _ in num_reqs..graph_bs {
-                cu_seqlens_k.push(cum);
-            }
-
-            let mut slot_mapping = Vec::with_capacity(graph_bs);
-            for i in 0..num_reqs {
-                let abs_pos = meta.tokens_before[i];
-                let block_idx = abs_pos / block_size;
-                let offset = abs_pos % block_size;
-                let block_ids = &meta.block_ids[i];
-                if block_idx < block_ids.len() {
-                    slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
-                } else {
-                    slot_mapping.push(-1i64);
-                }
-            }
-            // Pad with -1 (no-op for reshape_and_cache).
-            slot_mapping.resize(graph_bs, -1i64);
-
-            let mut block_table = vec![0u32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
-            for (i, blocks) in meta.block_ids.iter().enumerate() {
-                for (j, &bid) in blocks.iter().enumerate() {
-                    if j < GRAPH_MAX_BLOCKS_PER_SEQ {
-                        block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
+                    let runner = self.graph_runner.as_ref().unwrap();
+                    unsafe {
+                        runner.replay_decode_fast(
+                            graph_bs,
+                            None, // input_ids already scattered by previous graph
+                            new_bt.as_deref(),
+                            block_size,
+                            device,
+                        )
                     }
-                }
-            }
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("graph replay_decode_fast: {e}"))
+                    })?
+                } else {
+                    // First step for this batch or batch composition changed:
+                    // full H2D of all metadata to initialize persistent buffers.
+                    let mut input_ids = prepared.flat_token_ids.clone();
+                    input_ids.resize(graph_bs, 0);
+                    let mut positions = prepared.flat_positions.clone();
+                    positions.resize(graph_bs, 0);
 
-            // Skip input_ids H2D if the previous step already scattered argmax
-            // results into the persistent buffer and the batch hasn't changed.
-            let skip_input_ids =
-                self.last_graph_batch_size == Some(graph_bs) && num_reqs == graph_bs;
+                    let mut cu_seqlens_q: Vec<u32> = (0..=num_reqs as u32).collect();
+                    for _ in num_reqs..graph_bs {
+                        cu_seqlens_q.push(num_reqs as u32);
+                    }
 
-            let runner = self.graph_runner.as_ref().unwrap();
-            let replay_out = unsafe {
-                runner.replay(
-                    graph_bs,
-                    &input_ids,
-                    &positions,
-                    &slot_mapping,
-                    &cu_seqlens_q,
-                    &cu_seqlens_k,
-                    &block_table,
-                    device,
-                    skip_input_ids,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?;
+                    let mut cu_seqlens_k = Vec::with_capacity(graph_bs + 1);
+                    cu_seqlens_k.push(0u32);
+                    let mut cum = 0u32;
+                    for &sl in &meta.seq_lens {
+                        cum += sl as u32;
+                        cu_seqlens_k.push(cum);
+                    }
+                    for _ in num_reqs..graph_bs {
+                        cu_seqlens_k.push(cum);
+                    }
+
+                    let mut slot_mapping = Vec::with_capacity(graph_bs);
+                    for i in 0..num_reqs {
+                        let abs_pos = meta.tokens_before[i];
+                        let block_idx = abs_pos / block_size;
+                        let offset = abs_pos % block_size;
+                        let block_ids = &meta.block_ids[i];
+                        if block_idx < block_ids.len() {
+                            slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
+                        } else {
+                            slot_mapping.push(-1i64);
+                        }
+                    }
+                    slot_mapping.resize(graph_bs, -1i64);
+
+                    let mut block_table = vec![0u32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
+                    for (i, blocks) in meta.block_ids.iter().enumerate() {
+                        for (j, &bid) in blocks.iter().enumerate() {
+                            if j < GRAPH_MAX_BLOCKS_PER_SEQ {
+                                block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
+                            }
+                        }
+                    }
+
+                    let skip_input_ids =
+                        self.last_graph_batch_size == Some(graph_bs) && num_reqs == graph_bs;
+
+                    let runner = self.graph_runner.as_ref().unwrap();
+                    unsafe {
+                        runner.replay(
+                            graph_bs,
+                            &input_ids,
+                            &positions,
+                            &slot_mapping,
+                            &cu_seqlens_q,
+                            &cu_seqlens_k,
+                            &block_table,
+                            device,
+                            skip_input_ids,
+                        )
+                    }
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
+                };
 
             // D2H the argmax token IDs (only num_reqs × 4 bytes — skip padded slots).
             let mut host_ids = vec![0u32; num_reqs];
@@ -899,8 +945,9 @@ impl Worker for CudaWorker {
             unsafe { driver::stream_synchronize(device.compute_stream) }
                 .map_err(|e| ExecutorError::WorkerExecution(format!("sync: {e}")))?;
 
-            // Record that the graph scattered tokens for the next step.
+            // Record that graph buffers now have valid metadata for next step.
             self.last_graph_batch_size = Some(graph_bs);
+            self.graph_metadata_valid = true;
 
             let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
             for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
@@ -972,6 +1019,7 @@ impl Worker for CudaWorker {
 
             // Non-greedy: don't skip input_ids and don't track for next step.
             self.last_graph_batch_size = None;
+            self.graph_metadata_valid = false;
 
             let runner = self.graph_runner.as_ref().unwrap();
             let replay_out = unsafe {
@@ -997,6 +1045,7 @@ impl Worker for CudaWorker {
         } else {
             // Eager forward path (prefill or uncaptured batch size).
             self.last_graph_batch_size = None;
+            self.graph_metadata_valid = false;
             device.arena.reset();
 
             let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
@@ -1371,6 +1420,12 @@ impl Worker for CudaWorker {
             );
             self.graph_runner = Some(runner);
         }
+
+        // Benchmark cublasLt algorithms now that the plan cache is populated
+        // from both the prefill warmup and graph capture (decode shapes).
+        // This replaces heuristic-selected algorithms with empirically fastest ones.
+        unsafe { device.cublas.benchmark_plans(&mut device.arena) };
+        device.arena.reset();
 
         Ok(())
     }

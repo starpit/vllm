@@ -203,6 +203,13 @@ pub unsafe fn event_destroy(event: CUevent) -> Result<()> {
     check(sys::cuEventDestroy_v2(event))
 }
 
+/// Compute elapsed time in milliseconds between two recorded events.
+pub unsafe fn event_elapsed(start: CUevent, end: CUevent) -> Result<f32> {
+    let mut ms: f32 = 0.0;
+    check(sys::cuEventElapsedTime(&mut ms, start, end))?;
+    Ok(ms)
+}
+
 // ---------------------------------------------------------------------------
 // CUDA graphs
 // ---------------------------------------------------------------------------

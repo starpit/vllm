@@ -302,6 +302,84 @@ impl CudaGraphRunner {
         Ok(ReplayOutput { logits, token_ids })
     }
 
+    /// Fast replay for steady-state decode: update metadata on GPU instead of H2D.
+    ///
+    /// Instead of building positions/slot_mapping/cu_seqlens_k on CPU and doing
+    /// H2D copies, this calls a single GPU kernel to increment them in-place.
+    /// Only `block_table` is H2D-copied (and only when `new_block_table` is Some).
+    ///
+    /// Requirements: the persistent buffers must already contain valid state from
+    /// a previous `replay()` call. `cu_seqlens_q` is constant for decode so it
+    /// never needs updating after initial setup.
+    ///
+    /// # Safety
+    /// Same requirements as `replay()`.
+    pub unsafe fn replay_decode_fast(
+        &self,
+        batch_size: usize,
+        input_ids: Option<&[u32]>,
+        new_block_table: Option<&[u32]>,
+        block_size: usize,
+        device: &mut GpuDevice,
+    ) -> Result<ReplayOutput> {
+        let graph = self
+            .graphs
+            .get(&batch_size)
+            .ok_or_else(|| anyhow::anyhow!("no captured graph for batch_size={batch_size}"))?;
+
+        let stream = device.compute_stream;
+
+        // H2D input_ids only if provided (skipped when in-graph argmax scattered them).
+        if let Some(ids) = input_ids {
+            driver::memcpy_htod_async(
+                self.input_ids,
+                ids.as_ptr() as *const u8,
+                batch_size * 4,
+                stream,
+            )?;
+        }
+
+        // H2D block_table only if new blocks were allocated.
+        if let Some(bt) = new_block_table {
+            driver::memcpy_htod_async(
+                self.block_table,
+                bt.as_ptr() as *const u8,
+                bt.len() * 4,
+                stream,
+            )?;
+        }
+
+        // Update positions, slot_mapping, cu_seqlens_k on GPU in one kernel.
+        kernels::update_decode_metadata_gpu(
+            self.positions,
+            self.slot_mapping,
+            self.cu_seqlens_k,
+            self.block_table as *const u8,
+            batch_size,
+            block_size,
+            MAX_BLOCKS_PER_SEQ,
+            stream,
+        );
+
+        // Reset arena so intermediates land at the same offsets as capture.
+        device.arena.reset();
+
+        // Launch the captured graph (forward + argmax + D2D scatter).
+        driver::graph_launch(graph.exec, stream)?;
+
+        // Advance the arena offset past everything the graph wrote.
+        device.arena.set_offset(graph.arena_used);
+
+        let logits = GpuTensor::new(
+            graph.output_ptr as *mut u8,
+            &[batch_size, self.vocab_size],
+            self.dtype,
+        );
+        let token_ids = GpuTensor::new(graph.argmax_ptr as *mut u8, &[batch_size], DType::U32);
+
+        Ok(ReplayOutput { logits, token_ids })
+    }
+
     /// Fill persistent buffers with dummy decode data for capture.
     unsafe fn fill_dummy_decode(&self, batch_size: usize, stream: CUstream) -> Result<()> {
         // input_ids: all zeros.

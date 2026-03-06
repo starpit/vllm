@@ -186,6 +186,18 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Update decode metadata in-place on GPU
+    fn update_decode_metadata(
+        positions: *mut u32,
+        slot_mapping: *mut i64,
+        cu_seqlens_k: *mut u32,
+        block_table: *const u32,
+        num_reqs: c_int,
+        block_size: c_int,
+        max_blocks_per_seq: c_int,
+        stream: CUstream,
+    );
+
     // Split fused QKV
     fn split_qkv_f16(
         q: *mut u16,
@@ -608,6 +620,41 @@ pub unsafe fn embedding_gather(
         _ => panic!("embedding_gather: unsupported dtype {:?}", weight.dtype()),
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Update decode metadata on GPU (persistent buffers)
+// ---------------------------------------------------------------------------
+
+/// Increment positions, recompute slot_mapping from block_table, and
+/// increment cu_seqlens_k — all in one kernel launch on the GPU.
+///
+/// This replaces 3 CPU Vec builds + 3 H2D copies per decode step.
+///
+/// # Safety
+/// All pointers must be valid GPU memory. `positions` and `slot_mapping`
+/// must have at least `num_reqs` elements. `cu_seqlens_k` must have
+/// `num_reqs + 1` elements. `block_table` must be `[num_reqs, max_blocks_per_seq]`.
+pub unsafe fn update_decode_metadata_gpu(
+    positions: *mut u8,
+    slot_mapping: *mut u8,
+    cu_seqlens_k: *mut u8,
+    block_table: *const u8,
+    num_reqs: usize,
+    block_size: usize,
+    max_blocks_per_seq: usize,
+    stream: CUstream,
+) {
+    update_decode_metadata(
+        positions as *mut u32,
+        slot_mapping as *mut i64,
+        cu_seqlens_k as *mut u32,
+        block_table as *const u32,
+        num_reqs as c_int,
+        block_size as c_int,
+        max_blocks_per_seq as c_int,
+        stream,
+    );
 }
 
 // ---------------------------------------------------------------------------

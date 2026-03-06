@@ -268,6 +268,10 @@ pub struct CudaWorker {
     _weights: Option<GpuWeights>,
     /// CUDA graph runner for decode batches.
     graph_runner: Option<CudaGraphRunner>,
+    /// Batch size of the last graph replay. When the batch composition is
+    /// unchanged, we can skip the input_ids H2D copy because the graph's
+    /// D2D scatter already placed argmax results into the persistent buffer.
+    last_graph_batch_size: Option<usize>,
 
     // Per-request state (mirrors CandleWorker).
     token_buffers: HashMap<String, Vec<u32>>,
@@ -292,6 +296,7 @@ impl CudaWorker {
             is_shutdown: false,
             _weights: None,
             graph_runner: None,
+            last_graph_batch_size: None,
             token_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
             input_batch: InputBatch::new(),
@@ -700,6 +705,12 @@ impl Worker for CudaWorker {
         let block_size = self.config.block_size;
 
         // Clean up finished requests.
+        if !scheduler_output.finished_req_ids.is_empty()
+            || !scheduler_output.scheduled_new_reqs.is_empty()
+        {
+            // Batch composition changed — can't reuse persistent input_ids.
+            self.last_graph_batch_size = None;
+        }
         for req_id in &scheduler_output.finished_req_ids {
             self.token_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
@@ -784,9 +795,17 @@ impl Worker for CudaWorker {
                 .as_ref()
                 .is_some_and(|r| r.has_graph(num_reqs));
 
-        let logits = if use_graph {
-            // CUDA graph fast path: replay captured graph.
-            // Build attention metadata on CPU (same as eager path).
+        // Check if all requests are greedy (temp < 1e-6). Used to decide
+        // whether to use the in-graph argmax fast path.
+        let all_greedy = prepared.req_inputs.iter().all(|r| {
+            self.sampling_params_map
+                .get(&r.req_id)
+                .is_none_or(|p| p.temperature < 1e-6)
+        });
+
+        if use_graph && all_greedy {
+            // Fast path: CUDA graph with in-graph argmax. No separate sampling
+            // kernel launch — argmax + D2D scatter are captured in the graph.
             let meta = &prepared.attn_meta;
             let cu_seqlens_q: Vec<u32> = (0..=num_reqs as u32).collect();
             let mut cu_seqlens_k = Vec::with_capacity(num_reqs + 1);
@@ -796,9 +815,7 @@ impl Worker for CudaWorker {
                 cum += sl as u32;
                 cu_seqlens_k.push(cum);
             }
-            let _max_seqlen_k = meta.seq_lens.iter().copied().max().unwrap_or(0);
 
-            // Build slot_mapping.
             let mut slot_mapping = Vec::with_capacity(num_reqs);
             for i in 0..num_reqs {
                 let abs_pos = meta.tokens_before[i];
@@ -812,7 +829,6 @@ impl Worker for CudaWorker {
                 }
             }
 
-            // Build block_table padded to GRAPH_MAX_BLOCKS_PER_SEQ.
             let mut block_table = vec![0u32; num_reqs * GRAPH_MAX_BLOCKS_PER_SEQ];
             for (i, blocks) in meta.block_ids.iter().enumerate() {
                 for (j, &bid) in blocks.iter().enumerate() {
@@ -822,8 +838,12 @@ impl Worker for CudaWorker {
                 }
             }
 
+            // Skip input_ids H2D if the previous step already scattered argmax
+            // results into the persistent buffer and the batch hasn't changed.
+            let skip_input_ids = self.last_graph_batch_size == Some(num_reqs);
+
             let runner = self.graph_runner.as_ref().unwrap();
-            unsafe {
+            let replay_out = unsafe {
                 runner.replay(
                     num_reqs,
                     &prepared.flat_token_ids,
@@ -833,11 +853,103 @@ impl Worker for CudaWorker {
                     &cu_seqlens_k,
                     &block_table,
                     device,
+                    skip_input_ids,
                 )
             }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
+            .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?;
+
+            // D2H the argmax token IDs (only num_reqs × 4 bytes).
+            let mut host_ids = vec![0u32; num_reqs];
+            unsafe {
+                driver::memcpy_dtoh_async(
+                    host_ids.as_mut_ptr() as *mut u8,
+                    replay_out.token_ids.raw_ptr() as *const u8,
+                    num_reqs * 4,
+                    device.compute_stream,
+                )
+            }
+            .map_err(|e| ExecutorError::WorkerExecution(format!("D2H token ids: {e}")))?;
+            unsafe { driver::stream_synchronize(device.compute_stream) }
+                .map_err(|e| ExecutorError::WorkerExecution(format!("sync: {e}")))?;
+
+            // Record that the graph scattered tokens for the next step.
+            self.last_graph_batch_size = Some(num_reqs);
+
+            let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
+            for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+                let sampled = vec![host_ids[req_idx]];
+                self.input_batch.commit_step(
+                    &req_slice.req_id,
+                    &sampled,
+                    req_slice.token_count,
+                    !req_slice.spec_token_ids.is_empty(),
+                );
+                if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
+                    buf.extend_from_slice(&sampled);
+                }
+                token_map.insert(req_slice.req_id.clone(), sampled);
+            }
+            return Ok(ModelRunnerOutput::from_token_map(token_map));
+        }
+
+        // Non-greedy graph path or eager path: need separate sampling.
+        let logits = if use_graph {
+            // CUDA graph replay (non-greedy: uses in-graph argmax result is
+            // discarded; we re-sample with temperature on the logits).
+            let meta = &prepared.attn_meta;
+            let cu_seqlens_q: Vec<u32> = (0..=num_reqs as u32).collect();
+            let mut cu_seqlens_k = Vec::with_capacity(num_reqs + 1);
+            cu_seqlens_k.push(0u32);
+            let mut cum = 0u32;
+            for &sl in &meta.seq_lens {
+                cum += sl as u32;
+                cu_seqlens_k.push(cum);
+            }
+
+            let mut slot_mapping = Vec::with_capacity(num_reqs);
+            for i in 0..num_reqs {
+                let abs_pos = meta.tokens_before[i];
+                let block_idx = abs_pos / block_size;
+                let offset = abs_pos % block_size;
+                let block_ids = &meta.block_ids[i];
+                if block_idx < block_ids.len() {
+                    slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
+                } else {
+                    slot_mapping.push(-1i64);
+                }
+            }
+
+            let mut block_table = vec![0u32; num_reqs * GRAPH_MAX_BLOCKS_PER_SEQ];
+            for (i, blocks) in meta.block_ids.iter().enumerate() {
+                for (j, &bid) in blocks.iter().enumerate() {
+                    if j < GRAPH_MAX_BLOCKS_PER_SEQ {
+                        block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
+                    }
+                }
+            }
+
+            // Non-greedy: don't skip input_ids and don't track for next step.
+            self.last_graph_batch_size = None;
+
+            let runner = self.graph_runner.as_ref().unwrap();
+            let replay_out = unsafe {
+                runner.replay(
+                    num_reqs,
+                    &prepared.flat_token_ids,
+                    &prepared.flat_positions,
+                    &slot_mapping,
+                    &cu_seqlens_q,
+                    &cu_seqlens_k,
+                    &block_table,
+                    device,
+                    false, // always H2D input_ids for non-greedy
+                )
+            }
+            .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?;
+            replay_out.logits
         } else {
             // Eager forward path (prefill or uncaptured batch size).
+            self.last_graph_batch_size = None;
             device.arena.reset();
 
             let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
@@ -874,15 +986,6 @@ impl Worker for CudaWorker {
                 )
             }
         };
-
-        // Check if all requests can use the GPU argmax fast path (greedy, no
-        // penalties, no grammar). This avoids the expensive D2H copy of the full
-        // logits tensor and CPU-side BF16→F32 conversion + argmax scan.
-        let all_greedy = prepared.req_inputs.iter().all(|r| {
-            self.sampling_params_map
-                .get(&r.req_id)
-                .is_none_or(|p| p.temperature < 1e-6)
-        });
 
         let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
 

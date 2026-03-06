@@ -24,6 +24,7 @@ use cudarc::driver::sys::{CUgraphExec, CUstream};
 use crate::device::GpuDevice;
 use crate::driver;
 use crate::dtype::DType;
+use crate::kernels;
 use crate::tensor::GpuTensor;
 
 /// Maximum number of blocks per sequence in the block table.
@@ -37,9 +38,12 @@ struct CapturedGraph {
     output_ptr: *const u8,
     #[allow(dead_code)]
     output_numel: usize,
-    /// Arena bytes used after the forward pass. After replay, the arena offset
-    /// must be advanced to this value so that post-graph allocations (sampling)
-    /// don't overlap with the graph's output.
+    /// Where the argmax kernel wrote token IDs during capture (arena address).
+    /// `[batch_size]` u32 tensor. Only present when argmax is captured in graph.
+    argmax_ptr: *const u8,
+    /// Arena bytes used after the forward pass + argmax. After replay, the arena
+    /// offset must be advanced to this value so that post-graph allocations
+    /// don't overlap with the graph's outputs.
     arena_used: usize,
 }
 
@@ -139,17 +143,26 @@ impl CudaGraphRunner {
         let inputs = self.input_tensors(batch_size);
         self.fill_dummy_decode(batch_size, device.compute_stream)?;
 
-        // Warm up: run one eager forward to populate cuBLAS plans, etc.
+        // Warm up: run one eager forward + argmax to populate cuBLAS plans, etc.
         device.arena.reset();
-        let _ = forward_fn(inputs, device);
+        let warmup_logits = forward_fn(inputs, device);
+        let _ = kernels::argmax_batched(warmup_logits, &mut device.arena, device.compute_stream);
         driver::stream_synchronize(device.compute_stream)?;
 
-        // Now capture.
+        // Now capture: forward + argmax + D2D scatter into persistent input_ids.
         device.arena.reset();
         let inputs = self.input_tensors(batch_size);
 
         driver::stream_begin_capture(device.compute_stream)?;
         let logits = forward_fn(inputs, device);
+        let argmax_out = kernels::argmax_batched(logits, &mut device.arena, device.compute_stream);
+        // Scatter sampled token IDs into persistent input_ids for the next step.
+        driver::memcpy_dtod_async(
+            self.input_ids,
+            argmax_out.raw_ptr() as *const u8,
+            batch_size * 4,
+            device.compute_stream,
+        )?;
         let graph = driver::stream_end_capture(device.compute_stream)?;
 
         let exec = driver::graph_instantiate(graph)?;
@@ -157,17 +170,19 @@ impl CudaGraphRunner {
 
         let output_ptr = logits.raw_ptr() as *const u8;
         let output_numel = logits.numel();
+        let argmax_ptr = argmax_out.raw_ptr() as *const u8;
         let arena_used = device.arena.used();
         let captured = CapturedGraph {
             exec,
             output_ptr,
             output_numel,
+            argmax_ptr,
             arena_used,
         };
         self.graphs.insert(batch_size, captured);
 
         tracing::info!(
-            "CUDA graph captured for batch_size={}, output at {:?} ({} elements), arena_used={} bytes",
+            "CUDA graph captured for batch_size={} (with argmax), output at {:?} ({} elements), arena_used={} bytes",
             batch_size,
             output_ptr,
             output_numel,
@@ -187,8 +202,15 @@ impl CudaGraphRunner {
     /// (so intermediate activations land at the same offsets as during capture),
     /// and launches the graph.
     ///
-    /// Returns a GpuTensor pointing to the output logits (same arena address
-    /// as during capture).
+    /// Returns `ReplayOutput` containing the logits tensor and the argmax
+    /// token IDs (already computed inside the graph). The argmax result is
+    /// also automatically scattered into the persistent `input_ids` buffer
+    /// for the next step (captured as part of the graph).
+    ///
+    /// When `skip_input_ids_h2d` is true, the `input_ids` H2D copy is skipped
+    /// because the previous graph replay already scattered argmax results into
+    /// the persistent buffer. This is valid when the batch composition hasn't
+    /// changed between steps.
     ///
     /// # Safety
     /// Input slices must be correctly sized for `batch_size`.
@@ -202,7 +224,8 @@ impl CudaGraphRunner {
         cu_seqlens_k: &[u32],
         block_table: &[u32], // flattened [batch_size, num_blocks], padded to MAX_BLOCKS_PER_SEQ
         device: &mut GpuDevice,
-    ) -> Result<GpuTensor> {
+        skip_input_ids_h2d: bool,
+    ) -> Result<ReplayOutput> {
         let graph = self
             .graphs
             .get(&batch_size)
@@ -211,12 +234,14 @@ impl CudaGraphRunner {
         let stream = device.compute_stream;
 
         // Copy real inputs into persistent buffers.
-        driver::memcpy_htod_async(
-            self.input_ids,
-            input_ids.as_ptr() as *const u8,
-            batch_size * 4,
-            stream,
-        )?;
+        if !skip_input_ids_h2d {
+            driver::memcpy_htod_async(
+                self.input_ids,
+                input_ids.as_ptr() as *const u8,
+                batch_size * 4,
+                stream,
+            )?;
+        }
         driver::memcpy_htod_async(
             self.positions,
             positions.as_ptr() as *const u8,
@@ -251,21 +276,20 @@ impl CudaGraphRunner {
         // Reset arena so intermediates land at the same offsets as capture.
         device.arena.reset();
 
-        // Launch the captured graph.
+        // Launch the captured graph (forward + argmax + D2D scatter).
         driver::graph_launch(graph.exec, stream)?;
 
         // Advance the arena offset past everything the graph wrote.
-        // Without this, subsequent allocations (e.g. sampling params, argmax
-        // output) would start at offset 0 and overwrite the graph's logits.
         device.arena.set_offset(graph.arena_used);
 
-        // Return a tensor view of the output.
-        let shape = [batch_size, self.vocab_size];
-        Ok(GpuTensor::new(
+        let logits = GpuTensor::new(
             graph.output_ptr as *mut u8,
-            &shape,
+            &[batch_size, self.vocab_size],
             self.dtype,
-        ))
+        );
+        let token_ids = GpuTensor::new(graph.argmax_ptr as *mut u8, &[batch_size], DType::U32);
+
+        Ok(ReplayOutput { logits, token_ids })
     }
 
     /// Fill persistent buffers with dummy decode data for capture.
@@ -320,6 +344,15 @@ impl CudaGraphRunner {
         sizes.sort();
         sizes
     }
+}
+
+/// Output from a graph replay: logits + argmax token IDs.
+pub struct ReplayOutput {
+    /// Logits tensor `[batch_size, vocab_size]` in arena memory.
+    pub logits: GpuTensor,
+    /// Argmax token IDs `[batch_size]` u32 in arena memory.
+    /// These are also scattered into the persistent `input_ids` buffer.
+    pub token_ids: GpuTensor,
 }
 
 impl Drop for CudaGraphRunner {

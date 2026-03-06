@@ -809,7 +809,6 @@ async fn test_granite_completion_coherent() {
 #[ignore]
 async fn test_cuda_smollm_server_starts() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_CUDA)
-        .with_args(&["--enforce-eager"])
         .start()
         .await
         .expect("CUDA SmolLM server should start");
@@ -826,7 +825,6 @@ async fn test_cuda_smollm_server_starts() {
 #[ignore]
 async fn test_cuda_smollm_completion() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_CUDA)
-        .with_args(&["--enforce-eager"])
         .start()
         .await
         .unwrap();
@@ -847,7 +845,6 @@ async fn test_cuda_smollm_completion() {
 #[ignore]
 async fn test_cuda_smollm_chat() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_CUDA)
-        .with_args(&["--enforce-eager"])
         .start()
         .await
         .unwrap();
@@ -866,7 +863,6 @@ async fn test_cuda_smollm_chat() {
 #[ignore]
 async fn test_cuda_qwen2_completion() {
     let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
-        .with_args(&["--enforce-eager"])
         .start()
         .await
         .unwrap();
@@ -887,7 +883,6 @@ async fn test_cuda_qwen2_completion() {
 #[ignore]
 async fn test_cuda_qwen2_chat() {
     let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
-        .with_args(&["--enforce-eager"])
         .start()
         .await
         .unwrap();

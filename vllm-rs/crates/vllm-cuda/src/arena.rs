@@ -166,6 +166,26 @@ impl ScratchArena {
         self.high_water
     }
 
+    /// Advance the bump offset to `offset` bytes.
+    ///
+    /// Used after CUDA graph replay to reserve the arena region that the
+    /// graph's captured kernels wrote to, preventing subsequent allocations
+    /// (e.g. sampling) from overlapping with graph outputs.
+    ///
+    /// # Panics
+    /// Panics if `offset` exceeds capacity.
+    pub fn set_offset(&mut self, offset: usize) {
+        assert!(
+            offset <= self.primary.capacity,
+            "set_offset({offset}) exceeds arena capacity ({})",
+            self.primary.capacity
+        );
+        self.offset = offset;
+        if offset > self.high_water {
+            self.high_water = offset;
+        }
+    }
+
     /// Grow the arena to at least `min_capacity` bytes.
     ///
     /// The old segment is retired (kept alive so existing GpuTensor pointers

@@ -689,6 +689,14 @@ impl Worker for CudaWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
+        // Ensure CUDA context is current on this thread. In async scheduling,
+        // execute_model runs on a dedicated executor thread that differs from
+        // the init thread where the context was created.
+        if let Some(ref dev) = self.device {
+            unsafe { driver::ctx_set_current(dev.ctx) }
+                .map_err(|e| ExecutorError::WorkerExecution(format!("ctx_set_current: {e}")))?;
+        }
+
         let block_size = self.config.block_size;
 
         // Clean up finished requests.
@@ -1102,6 +1110,16 @@ impl Worker for CudaWorker {
             let dummy_ids = device.arena.alloc(&[prefill_tokens], GpuDType::U32);
             let dummy_pos = device.arena.alloc(&[prefill_tokens], GpuDType::U32);
             let dummy_slots = device.arena.alloc(&[prefill_tokens], GpuDType::I64);
+            // Zero slot_mapping and block_table to avoid out-of-bounds KV cache writes.
+            unsafe {
+                driver::memset_d8(
+                    dummy_slots.raw_ptr(),
+                    0,
+                    prefill_tokens * 8,
+                    device.compute_stream,
+                )
+                .ok();
+            }
             // cu_seqlens: each request has 32 tokens
             let cu_q: Vec<u32> = (0..=max_bs).map(|i| (i * 32) as u32).collect();
             let gpu_cu_q = device.arena.alloc(&[max_bs + 1], GpuDType::U32);
@@ -1125,6 +1143,9 @@ impl Worker for CudaWorker {
                 .ok();
             }
             let dummy_bt = device.arena.alloc(&[max_bs, 1], GpuDType::U32);
+            unsafe {
+                driver::memset_d8(dummy_bt.raw_ptr(), 0, max_bs * 4, device.compute_stream).ok();
+            }
             // Use padded max_seqlen_k=2048 to match graph capture workspace needs.
             unsafe {
                 let _ = model.forward(

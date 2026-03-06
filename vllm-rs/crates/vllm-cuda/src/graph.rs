@@ -37,6 +37,10 @@ struct CapturedGraph {
     output_ptr: *const u8,
     #[allow(dead_code)]
     output_numel: usize,
+    /// Arena bytes used after the forward pass. After replay, the arena offset
+    /// must be advanced to this value so that post-graph allocations (sampling)
+    /// don't overlap with the graph's output.
+    arena_used: usize,
 }
 
 /// CUDA graph runner for decode batches.
@@ -153,18 +157,21 @@ impl CudaGraphRunner {
 
         let output_ptr = logits.raw_ptr() as *const u8;
         let output_numel = logits.numel();
+        let arena_used = device.arena.used();
         let captured = CapturedGraph {
             exec,
             output_ptr,
             output_numel,
+            arena_used,
         };
         self.graphs.insert(batch_size, captured);
 
         tracing::info!(
-            "CUDA graph captured for batch_size={}, output at {:?} ({} elements)",
+            "CUDA graph captured for batch_size={}, output at {:?} ({} elements), arena_used={} bytes",
             batch_size,
             output_ptr,
             output_numel,
+            arena_used,
         );
 
         // Reset arena after capture (the captured pointers remain valid since
@@ -246,6 +253,11 @@ impl CudaGraphRunner {
 
         // Launch the captured graph.
         driver::graph_launch(graph.exec, stream)?;
+
+        // Advance the arena offset past everything the graph wrote.
+        // Without this, subsequent allocations (e.g. sampling params, argmax
+        // output) would start at offset 0 and overwrite the graph's logits.
+        device.arena.set_offset(graph.arena_used);
 
         // Return a tensor view of the output.
         let shape = [batch_size, self.vocab_size];

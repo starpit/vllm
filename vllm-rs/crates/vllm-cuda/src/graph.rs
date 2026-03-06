@@ -95,9 +95,19 @@ impl CudaGraphRunner {
         })
     }
 
-    /// Whether we have a captured graph for this batch size.
+    /// Whether we have a captured graph for this batch size (exact match).
     pub fn has_graph(&self, batch_size: usize) -> bool {
         self.graphs.contains_key(&batch_size)
+    }
+
+    /// Find the smallest captured graph size >= `batch_size`, or None.
+    /// This allows padding a smaller batch to use a pre-captured graph.
+    pub fn nearest_graph_size(&self, batch_size: usize) -> Option<usize> {
+        self.graphs
+            .keys()
+            .filter(|&&s| s >= batch_size)
+            .min()
+            .copied()
     }
 
     /// GpuTensor views into persistent input buffers for a given batch size.

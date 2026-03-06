@@ -198,7 +198,7 @@ impl LlamaMLP {
         // gate_up_proj: [num_tokens, 2*intermediate]
         let gate_up = self
             .gate_up_proj
-            .forward(x, &device.cublas, &mut device.arena);
+            .forward(x, &mut device.cublas, &mut device.arena);
 
         // Fused SiLU(gate) * up → [num_tokens, intermediate]
         let activated = kernels::silu_and_mul_fused(
@@ -210,7 +210,7 @@ impl LlamaMLP {
 
         // down_proj: [num_tokens, hidden]
         self.down_proj
-            .forward(activated, &device.cublas, &mut device.arena)
+            .forward(activated, &mut device.cublas, &mut device.arena)
     }
 }
 
@@ -285,7 +285,7 @@ impl LlamaAttention {
         // Fused QKV projection: [num_tokens, q_size + 2*kv_size]
         let qkv = self
             .qkv_proj
-            .forward(hidden_states, &device.cublas, &mut device.arena);
+            .forward(hidden_states, &mut device.cublas, &mut device.arena);
 
         // Fused QKV split + RoPE: reads from QKV, applies RoPE to Q/K,
         // copies V, writes contiguous outputs (1 kernel instead of 2).
@@ -333,7 +333,7 @@ impl LlamaAttention {
         // Reshape to [num_tokens, q_size] and output projection.
         let attn_flat = attn_output.reshape(&[num_tokens, self.q_size]);
         self.o_proj
-            .forward(attn_flat, &device.cublas, &mut device.arena)
+            .forward(attn_flat, &mut device.cublas, &mut device.arena)
     }
 }
 
@@ -559,7 +559,7 @@ impl LlamaForCausalLM {
             hidden_states
         };
         self.lm_head
-            .forward(hidden_states, &device.cublas, &mut device.arena)
+            .forward(hidden_states, &mut device.cublas, &mut device.arena)
     }
 }
 

@@ -61,7 +61,7 @@ impl Linear {
     pub unsafe fn forward(
         &self,
         x: GpuTensor,
-        cublas: &CublasHandle,
+        cublas: &mut CublasHandle,
         arena: &mut ScratchArena,
     ) -> GpuTensor {
         debug_assert_eq!(x.ndim(), 2);
@@ -287,7 +287,7 @@ mod tests {
         fn test_linear_forward_f32() {
             let stream = init_cuda();
             unsafe {
-                let cublas = CublasHandle::new(stream).unwrap();
+                let mut cublas = CublasHandle::new(stream).unwrap();
                 let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
 
                 // Weight [2, 3] = [[1,0,0],[0,1,0]] (identity-ish)
@@ -311,7 +311,7 @@ mod tests {
 
                 // Forward: x @ W^T = [4,3] @ [3,2] = [4,2]
                 // Expected: [[1,2],[4,5],[7,8],[10,11]]
-                let y = linear.forward(x, &cublas, &mut arena);
+                let y = linear.forward(x, &mut cublas, &mut arena);
                 assert_eq!(y.dim(0), 4);
                 assert_eq!(y.dim(1), 2);
 

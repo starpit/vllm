@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-//! cuBLAS handle with pre-allocated workspace for CUDA-graph-safe GEMM.
+//! cuBLAS handle with cached GEMM plans for zero-overhead repeated calls.
+//!
+//! All GEMMs go through **cublasLt** with heuristic algorithm selection.
+//! Plans (descriptors + algorithm) are cached by `(M, K, N, dtype, has_bias)`
+//! so that the first call creates the plan and subsequent calls with the same
+//! shapes reuse it — eliminating ~20 API calls per GEMM.
 //!
 //! The workspace is bound to the handle via `cublasSetWorkspace()` at init,
 //! so cuBLAS never lazily allocates on the default stream — this is what
 //! makes CUDA graph capture work.
+
+use std::collections::HashMap;
 
 use crate::arena::ScratchArena;
 use crate::driver;
@@ -17,12 +24,44 @@ use cudarc::driver::sys::CUstream;
 /// cuBLAS workspace size (4 MB — matches Python vLLM).
 const CUBLAS_WORKSPACE_SIZE: usize = 4 * 1024 * 1024;
 
+/// Cache key for a GEMM plan.
+#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+struct PlanKey {
+    m: usize,
+    k: usize,
+    n: usize,
+    dtype: DType,
+    has_bias: bool,
+}
+
+/// A cached cublasLt GEMM plan — holds pre-created descriptors and the best algorithm.
+struct GemmPlan {
+    matmul_desc: lt::cublasLtMatmulDesc_t,
+    layout_a: lt::cublasLtMatrixLayout_t,
+    layout_b: lt::cublasLtMatrixLayout_t,
+    layout_c: lt::cublasLtMatrixLayout_t,
+    algo: lt::cublasLtMatmulAlgo_t,
+}
+
+impl Drop for GemmPlan {
+    fn drop(&mut self) {
+        unsafe {
+            lt::cublasLtMatrixLayoutDestroy(self.layout_a);
+            lt::cublasLtMatrixLayoutDestroy(self.layout_b);
+            lt::cublasLtMatrixLayoutDestroy(self.layout_c);
+            lt::cublasLtMatmulDescDestroy(self.matmul_desc);
+        }
+    }
+}
+
 /// cuBLAS + cublasLt handles bound to a non-default stream with pre-allocated workspace.
 pub struct CublasHandle {
     handle: cublasHandle_t,
     lt_handle: lt::cublasLtHandle_t,
     stream: CUstream,
     workspace: *mut u8,
+    /// Cached GEMM plans keyed by (M, K, N, dtype, has_bias).
+    plans: HashMap<PlanKey, GemmPlan>,
 }
 
 // Safety: cuBLAS handle is thread-safe when each thread uses its own handle
@@ -56,7 +95,7 @@ impl CublasHandle {
             CUBLAS_WORKSPACE_SIZE,
         ))?;
 
-        // Create cublasLt handle for GEMM+bias epilogue.
+        // Create cublasLt handle.
         let mut lt_handle: lt::cublasLtHandle_t = std::ptr::null_mut();
         check_lt(lt::cublasLtCreate(&mut lt_handle))?;
 
@@ -65,98 +104,28 @@ impl CublasHandle {
             lt_handle,
             stream,
             workspace,
+            plans: HashMap::new(),
         })
     }
 
-    /// GEMM: out = A @ B^T
-    ///
-    /// - `a`: `[M, K]` row-major
-    /// - `b`: `[N, K]` row-major (weight stored as `[out_features, in_features]`)
-    /// - Returns: `[M, N]` allocated from `arena`
-    ///
-    /// # Safety
-    /// `a` and `b` must be valid GPU tensors with compatible dtypes and shapes.
-    pub unsafe fn gemm(&self, a: GpuTensor, b: GpuTensor, arena: &mut ScratchArena) -> GpuTensor {
-        debug_assert_eq!(a.ndim(), 2);
-        debug_assert_eq!(b.ndim(), 2);
-        debug_assert_eq!(a.dim(1), b.dim(1), "GEMM K mismatch");
-        debug_assert_eq!(a.dtype(), b.dtype(), "GEMM dtype mismatch");
-
-        let m = a.dim(0) as i32;
-        let k = a.dim(1) as i32;
-        let n = b.dim(0) as i32;
-
-        let out = arena.alloc(&[m as usize, n as usize], a.dtype());
-
-        let (compute_type, data_type) = gemm_types(a.dtype());
-
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-
-        // cuBLAS is column-major. For row-major C = A @ B^T:
-        // Compute C^T = B @ A^T in column-major → C in row-major.
-        check(sys::cublasGemmEx(
-            self.handle,
-            cublasOperation_t::CUBLAS_OP_T, // B transposed
-            cublasOperation_t::CUBLAS_OP_N, // A not transposed
-            n,
+    /// Ensure a cached GEMM plan exists for the given shapes, creating it if needed.
+    unsafe fn ensure_plan(&mut self, m: usize, k: usize, n: usize, dtype: DType, has_bias: bool) {
+        let key = PlanKey {
             m,
             k,
-            &alpha as *const f32 as *const _,
-            b.as_ptr::<u8>() as *const _,
-            data_type,
-            k, // ldb = K (B is [N,K] row-major)
-            a.as_ptr::<u8>() as *const _,
-            data_type,
-            k, // lda = K (A is [M,K] row-major)
-            &beta as *const f32 as *const _,
-            out.as_mut_ptr::<u8>() as *mut _,
-            data_type,
-            n, // ldc = N (C is [M,N] row-major)
-            compute_type,
-            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-        ))
-        .expect("cublasGemmEx failed");
+            n,
+            dtype,
+            has_bias,
+        };
+        if self.plans.contains_key(&key) {
+            return;
+        }
 
-        out
-    }
-
-    /// GEMM with fused bias add: out = A @ B^T + bias
-    ///
-    /// Uses cublasLt with `CUBLASLT_EPILOGUE_BIAS` to fuse the bias add into
-    /// the GEMM kernel — zero extra kernel launches, zero extra memory traffic.
-    ///
-    /// - `a`: `[M, K]` row-major (activations)
-    /// - `b`: `[N, K]` row-major (weight, transposed internally)
-    /// - `bias`: `[N]` (broadcast along M dimension)
-    /// - Returns: `[M, N]` allocated from `arena`
-    ///
-    /// # Safety
-    /// All tensors must be valid GPU memory with compatible dtypes.
-    pub unsafe fn gemm_bias(
-        &self,
-        a: GpuTensor,
-        b: GpuTensor,
-        bias: GpuTensor,
-        arena: &mut ScratchArena,
-    ) -> GpuTensor {
-        debug_assert_eq!(a.ndim(), 2);
-        debug_assert_eq!(b.ndim(), 2);
-        debug_assert_eq!(bias.ndim(), 1);
-        debug_assert_eq!(a.dim(1), b.dim(1), "GEMM K mismatch");
-        debug_assert_eq!(bias.dim(0), b.dim(0), "bias size must match N");
-
-        let m = a.dim(0) as u64;
-        let k = a.dim(1) as u64;
-        let n = b.dim(0) as u64;
-
-        let out = arena.alloc(&[m as usize, n as usize], a.dtype());
-
-        let (compute_type, data_type) = gemm_types(a.dtype());
+        let (_compute_type, data_type) = gemm_types(dtype);
         let lt_data_type = cublas_to_lt_dtype(data_type);
-        let lt_compute_type = cublas_to_lt_compute(compute_type);
+        let lt_compute_type = cublas_to_lt_compute(_compute_type);
 
-        // Create matmul descriptor with bias epilogue.
+        // Create matmul descriptor.
         let mut matmul_desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
         check_lt(lt::cublasLtMatmulDescCreate(
             &mut matmul_desc,
@@ -165,7 +134,7 @@ impl CublasHandle {
         ))
         .expect("cublasLtMatmulDescCreate failed");
 
-        // Set transpose operations: same as gemm() — C^T = B @ A^T in col-major.
+        // Set transpose operations: C^T = B @ A^T in col-major → C = A @ B^T in row-major.
         let transa = cublasOperation_t::CUBLAS_OP_T as i32;
         let transb = cublasOperation_t::CUBLAS_OP_N as i32;
         check_lt(lt::cublasLtMatmulDescSetAttribute(
@@ -183,24 +152,17 @@ impl CublasHandle {
         ))
         .expect("set TRANSB failed");
 
-        // Set bias epilogue.
-        let epilogue = lt::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS;
-        check_lt(lt::cublasLtMatmulDescSetAttribute(
-            matmul_desc,
-            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
-            &epilogue as *const _ as *const _,
-            std::mem::size_of_val(&epilogue),
-        ))
-        .expect("set EPILOGUE failed");
-
-        let bias_ptr = bias.raw_ptr() as *const std::ffi::c_void;
-        check_lt(lt::cublasLtMatmulDescSetAttribute(
-            matmul_desc,
-            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
-            &bias_ptr as *const _ as *const _,
-            std::mem::size_of::<*const std::ffi::c_void>(),
-        ))
-        .expect("set BIAS_POINTER failed");
+        // Set bias epilogue if needed.
+        if has_bias {
+            let epilogue = lt::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS;
+            check_lt(lt::cublasLtMatmulDescSetAttribute(
+                matmul_desc,
+                lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
+                &epilogue as *const _ as *const _,
+                std::mem::size_of_val(&epilogue),
+            ))
+            .expect("set EPILOGUE failed");
+        }
 
         // Create matrix layouts (column-major convention: C^T = B @ A^T).
         // A in cuBLAS = B (weight) [N, K] col-major → rows=K, cols=N, ld=K
@@ -263,37 +225,159 @@ impl CublasHandle {
             &mut algo_count,
         ))
         .expect("cublasLtMatmulAlgoGetHeuristic failed");
-        assert!(algo_count > 0, "no cublasLt algorithm found for GEMM+bias");
+        assert!(algo_count > 0, "no cublasLt algorithm found");
+
+        lt::cublasLtMatmulPreferenceDestroy(pref);
+
+        let plan = GemmPlan {
+            matmul_desc,
+            layout_a,
+            layout_b,
+            layout_c,
+            algo: heuristic.algo,
+        };
+
+        self.plans.insert(key, plan);
+    }
+
+    /// GEMM: out = A @ B^T
+    ///
+    /// - `a`: `[M, K]` row-major
+    /// - `b`: `[N, K]` row-major (weight stored as `[out_features, in_features]`)
+    /// - Returns: `[M, N]` allocated from `arena`
+    ///
+    /// Uses cublasLt with cached plans for optimal algorithm selection,
+    /// especially split-K for decode-regime skinny GEMMs (M=1-8).
+    ///
+    /// # Safety
+    /// `a` and `b` must be valid GPU tensors with compatible dtypes and shapes.
+    pub unsafe fn gemm(
+        &mut self,
+        a: GpuTensor,
+        b: GpuTensor,
+        arena: &mut ScratchArena,
+    ) -> GpuTensor {
+        debug_assert_eq!(a.ndim(), 2);
+        debug_assert_eq!(b.ndim(), 2);
+        debug_assert_eq!(a.dim(1), b.dim(1), "GEMM K mismatch");
+        debug_assert_eq!(a.dtype(), b.dtype(), "GEMM dtype mismatch");
+
+        let m = a.dim(0);
+        let k = a.dim(1);
+        let n = b.dim(0);
+
+        let out = arena.alloc(&[m, n], a.dtype());
+
+        self.ensure_plan(m, k, n, a.dtype(), false);
+        let key = PlanKey {
+            m,
+            k,
+            n,
+            dtype: a.dtype(),
+            has_bias: false,
+        };
+        let plan = &self.plans[&key];
 
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
 
         check_lt(lt::cublasLtMatmul(
             self.lt_handle,
-            matmul_desc,
+            plan.matmul_desc,
             &alpha as *const f32 as *const _,
             b.as_ptr::<u8>() as *const _, // A in cuBLAS = weight
-            layout_a,
+            plan.layout_a,
             a.as_ptr::<u8>() as *const _, // B in cuBLAS = activation
-            layout_b,
+            plan.layout_b,
             &beta as *const f32 as *const _,
             out.as_mut_ptr::<u8>() as *mut _, // C
-            layout_c,
+            plan.layout_c,
             out.as_mut_ptr::<u8>() as *mut _, // D (same as C for in-place)
-            layout_c,
-            &heuristic.algo,
+            plan.layout_c,
+            &plan.algo,
             self.workspace as *mut _,
             CUBLAS_WORKSPACE_SIZE,
             self.stream as _,
         ))
         .expect("cublasLtMatmul failed");
 
-        // Cleanup descriptors.
-        lt::cublasLtMatmulPreferenceDestroy(pref);
-        lt::cublasLtMatrixLayoutDestroy(layout_a);
-        lt::cublasLtMatrixLayoutDestroy(layout_b);
-        lt::cublasLtMatrixLayoutDestroy(layout_c);
-        lt::cublasLtMatmulDescDestroy(matmul_desc);
+        out
+    }
+
+    /// GEMM with fused bias add: out = A @ B^T + bias
+    ///
+    /// Uses cublasLt with `CUBLASLT_EPILOGUE_BIAS` to fuse the bias add into
+    /// the GEMM kernel — zero extra kernel launches, zero extra memory traffic.
+    ///
+    /// - `a`: `[M, K]` row-major (activations)
+    /// - `b`: `[N, K]` row-major (weight, transposed internally)
+    /// - `bias`: `[N]` (broadcast along M dimension)
+    /// - Returns: `[M, N]` allocated from `arena`
+    ///
+    /// # Safety
+    /// All tensors must be valid GPU memory with compatible dtypes.
+    pub unsafe fn gemm_bias(
+        &mut self,
+        a: GpuTensor,
+        b: GpuTensor,
+        bias: GpuTensor,
+        arena: &mut ScratchArena,
+    ) -> GpuTensor {
+        debug_assert_eq!(a.ndim(), 2);
+        debug_assert_eq!(b.ndim(), 2);
+        debug_assert_eq!(bias.ndim(), 1);
+        debug_assert_eq!(a.dim(1), b.dim(1), "GEMM K mismatch");
+        debug_assert_eq!(bias.dim(0), b.dim(0), "bias size must match N");
+
+        let m = a.dim(0);
+        let k = a.dim(1);
+        let n = b.dim(0);
+
+        let out = arena.alloc(&[m, n], a.dtype());
+
+        self.ensure_plan(m, k, n, a.dtype(), true);
+        let key = PlanKey {
+            m,
+            k,
+            n,
+            dtype: a.dtype(),
+            has_bias: true,
+        };
+        let plan = &self.plans[&key];
+
+        // Set the bias pointer for this specific call (changes per call if bias
+        // tensor lives at a different address, though usually it's the same weight).
+        let bias_ptr = bias.raw_ptr() as *const std::ffi::c_void;
+        check_lt(lt::cublasLtMatmulDescSetAttribute(
+            plan.matmul_desc,
+            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+            &bias_ptr as *const _ as *const _,
+            std::mem::size_of::<*const std::ffi::c_void>(),
+        ))
+        .expect("set BIAS_POINTER failed");
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+
+        check_lt(lt::cublasLtMatmul(
+            self.lt_handle,
+            plan.matmul_desc,
+            &alpha as *const f32 as *const _,
+            b.as_ptr::<u8>() as *const _, // A in cuBLAS = weight
+            plan.layout_a,
+            a.as_ptr::<u8>() as *const _, // B in cuBLAS = activation
+            plan.layout_b,
+            &beta as *const f32 as *const _,
+            out.as_mut_ptr::<u8>() as *mut _, // C
+            plan.layout_c,
+            out.as_mut_ptr::<u8>() as *mut _, // D (same as C for in-place)
+            plan.layout_c,
+            &plan.algo,
+            self.workspace as *mut _,
+            CUBLAS_WORKSPACE_SIZE,
+            self.stream as _,
+        ))
+        .expect("cublasLtMatmul failed");
 
         out
     }
@@ -306,6 +390,8 @@ impl CublasHandle {
 
 impl Drop for CublasHandle {
     fn drop(&mut self) {
+        // Drop all cached plans first (they reference the lt_handle indirectly).
+        self.plans.clear();
         unsafe {
             let _ = lt::cublasLtDestroy(self.lt_handle);
             let _ = sys::cublasDestroy_v2(self.handle);
@@ -430,7 +516,7 @@ mod tests {
     fn test_gemm_f32_identity() {
         let stream = init_cuda();
         unsafe {
-            let handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream).unwrap();
             let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
 
             // A = [2, 3], B = identity-like [3, 3]
@@ -491,7 +577,7 @@ mod tests {
     fn test_gemm_f32_known_values() {
         let stream = init_cuda();
         unsafe {
-            let handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream).unwrap();
             let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
 
             // A = [[1, 2], [3, 4]] (2x2)
@@ -540,7 +626,7 @@ mod tests {
     fn test_gemm_non_square() {
         let stream = init_cuda();
         unsafe {
-            let handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream).unwrap();
             let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
 
             // A = [4, 8], B = [16, 8] → C = [4, 16]
@@ -583,7 +669,7 @@ mod tests {
     fn test_gemm_output_from_arena() {
         let stream = init_cuda();
         unsafe {
-            let handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream).unwrap();
             let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
 
             let gpu_a = driver::mem_alloc(64).unwrap();
@@ -612,7 +698,7 @@ mod tests {
     fn test_gemm_bias_f32() {
         let stream = init_cuda();
         unsafe {
-            let handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream).unwrap();
             let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
 
             // A = [[1, 2], [3, 4]] (2x2)
@@ -660,6 +746,33 @@ mod tests {
             driver::mem_free(gpu_a).unwrap();
             driver::mem_free(gpu_b).unwrap();
             driver::mem_free(gpu_bias).unwrap();
+            driver::stream_destroy(stream).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_plan_caching() {
+        let stream = init_cuda();
+        unsafe {
+            let mut handle = CublasHandle::new(stream).unwrap();
+            assert_eq!(handle.plans.len(), 0);
+
+            // First call creates a plan.
+            handle.ensure_plan(8, 896, 896, DType::BF16, false);
+            assert_eq!(handle.plans.len(), 1);
+
+            // Second call with same shapes reuses it.
+            handle.ensure_plan(8, 896, 896, DType::BF16, false);
+            assert_eq!(handle.plans.len(), 1);
+
+            // Different shapes create a new plan.
+            handle.ensure_plan(8, 896, 4864, DType::BF16, false);
+            assert_eq!(handle.plans.len(), 2);
+
+            // Same shapes but with bias create a separate plan.
+            handle.ensure_plan(8, 896, 896, DType::BF16, true);
+            assert_eq!(handle.plans.len(), 3);
+
             driver::stream_destroy(stream).unwrap();
         }
     }

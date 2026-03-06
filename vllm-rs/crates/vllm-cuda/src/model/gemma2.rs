@@ -154,7 +154,7 @@ impl Gemma2MLP {
     pub unsafe fn forward(&self, x: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
         let gate_up = self
             .gate_up_proj
-            .forward(x, &device.cublas, &mut device.arena);
+            .forward(x, &mut device.cublas, &mut device.arena);
         let activated = kernels::gelu_and_mul_fused(
             gate_up,
             self.intermediate_size,
@@ -162,7 +162,7 @@ impl Gemma2MLP {
             device.compute_stream,
         );
         self.down_proj
-            .forward(activated, &device.cublas, &mut device.arena)
+            .forward(activated, &mut device.cublas, &mut device.arena)
     }
 }
 
@@ -247,7 +247,7 @@ impl Gemma2Attention {
 
         let qkv = self
             .qkv_proj
-            .forward(hidden_states, &device.cublas, &mut device.arena);
+            .forward(hidden_states, &mut device.cublas, &mut device.arena);
 
         let (q, k, v) = kernels::fused_qkv_rope(
             qkv,
@@ -294,7 +294,7 @@ impl Gemma2Attention {
 
         let attn_flat = attn_output.reshape(&[num_tokens, self.q_size]);
         self.o_proj
-            .forward(attn_flat, &device.cublas, &mut device.arena)
+            .forward(attn_flat, &mut device.cublas, &mut device.arena)
     }
 }
 
@@ -547,7 +547,7 @@ impl Gemma2Model {
             &mut device.arena,
             device.compute_stream,
         );
-        kernels::scale_inplace(hidden_states, self.embed_scale, &device.cublas);
+        kernels::scale_inplace(hidden_states, self.embed_scale, &mut device.cublas);
 
         let mut residual: Option<GpuTensor> = None;
         for layer in &self.layers {
@@ -653,7 +653,7 @@ impl Gemma2ForCausalLM {
 
         let logits = self
             .lm_head
-            .forward(hidden_states, &device.cublas, &mut device.arena);
+            .forward(hidden_states, &mut device.cublas, &mut device.arena);
 
         // Apply final logit soft capping: logits = cap * tanh(logits / cap).
         // TODO: This requires a fused tanh-softcap kernel. For now, softcap

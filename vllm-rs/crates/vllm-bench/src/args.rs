@@ -184,7 +184,7 @@ pub struct BenchThroughputArgs {
     pub num_prompts: usize,
 
     /// Input prompt length for each request (tokens).
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 1024)]
     pub input_len: usize,
 
     /// Output length for each request (tokens).

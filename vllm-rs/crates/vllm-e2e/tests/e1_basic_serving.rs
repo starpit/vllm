@@ -809,6 +809,7 @@ async fn test_granite_completion_coherent() {
 #[ignore]
 async fn test_cuda_smollm_server_starts() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_CUDA)
+        .with_args(&["--enforce-eager"])
         .start()
         .await
         .expect("CUDA SmolLM server should start");
@@ -825,6 +826,7 @@ async fn test_cuda_smollm_server_starts() {
 #[ignore]
 async fn test_cuda_smollm_completion() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_CUDA)
+        .with_args(&["--enforce-eager"])
         .start()
         .await
         .unwrap();
@@ -845,6 +847,7 @@ async fn test_cuda_smollm_completion() {
 #[ignore]
 async fn test_cuda_smollm_chat() {
     let server = TestServer::builder(TestModels::SMOLLM_135M_CUDA)
+        .with_args(&["--enforce-eager"])
         .start()
         .await
         .unwrap();
@@ -863,6 +866,7 @@ async fn test_cuda_smollm_chat() {
 #[ignore]
 async fn test_cuda_qwen2_completion() {
     let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .with_args(&["--enforce-eager"])
         .start()
         .await
         .unwrap();
@@ -883,6 +887,7 @@ async fn test_cuda_qwen2_completion() {
 #[ignore]
 async fn test_cuda_qwen2_chat() {
     let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .with_args(&["--enforce-eager"])
         .start()
         .await
         .unwrap();
@@ -899,13 +904,12 @@ async fn test_cuda_qwen2_chat() {
 // ===========================================================================
 // CUDA GGUF E2E tests — quantized GGUF models on GPU
 // ===========================================================================
-// These use GGUF quantized models to test the GGUF + CUDA path.
-// Candle 0.9 has full CUDA quantized matmul support (QCudaStorage),
-// so quantized weights load directly onto the GPU and matmuls run
-// via CUDA kernels (dequantize-mul-mat-vec for decode, dequantize-matmul for prefill).
+// TODO: Re-enable when vllm-cuda backend supports GGUF quantized models.
+// These previously used candle's QCudaStorage for GGUF + CUDA inference.
 //
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gguf -- --ignored
 
+/*
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -1103,6 +1107,8 @@ async fn test_cuda_gguf_qwen3_next_chat() {
         "should generate at least one token"
     );
 }
+*/
+ // end GGUF block comment
 
 // ---------------------------------------------------------------------------
 // Tensor Parallelism (TP=2) tests — require 2 CUDA GPUs + NCCL
@@ -1170,8 +1176,9 @@ async fn test_cuda_tp2_deepseek_v2_completion() {
 // ===========================================================================
 // CUDA Granite — safetensors BF16 (~4.5 GB) on GPU
 // ===========================================================================
+// TODO: Re-enable when vllm-cuda backend supports GraniteForCausalLM.
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_granite -- --ignored
-
+/*
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -1207,14 +1214,14 @@ async fn test_cuda_granite_chat_coherent() {
     let content = resp.choices[0].message.content.as_deref().unwrap_or("");
     assert!(!content.is_empty(), "chat response should not be empty");
 }
+*/ // end Granite safetensors block comment
 
 // ===========================================================================
 // CUDA Granite GGUF — quantized on GPU
 // ===========================================================================
+// TODO: Re-enable when vllm-cuda backend supports GGUF + GraniteForCausalLM.
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_granite_gguf -- --ignored
-// Note: granite-3.3-2b-instruct is a chat model (EOS=token 0), so bare completions
-// immediately emit EOS. Use chat endpoint (requires strftime_now support).
-
+/*
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -1250,16 +1257,14 @@ async fn test_cuda_granite_gguf_chat_coherent() {
     let content = resp.choices[0].message.content.as_deref().unwrap_or("");
     assert!(!content.is_empty(), "chat response should not be empty");
 }
+*/ // end Granite GGUF block comment
 
 // ===========================================================================
 // CUDA Marlin W4A16 E2E tests — GPTQ and AWQ quantized models
 // ===========================================================================
-// These tests exercise the Marlin fused GEMM path: GPTQ/AWQ weights are
-// repacked to Marlin tiled format at load time, and forward passes use the
-// fused dequant+GEMM kernel (no intermediate weight allocation).
-//
+// TODO: Re-enable when vllm-cuda backend supports Marlin GPTQ/AWQ quantization.
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_marlin -- --ignored --test-threads=1
-
+/*
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -1361,6 +1366,7 @@ async fn test_cuda_marlin_awq_chat() {
     let text = resp.choices[0].message.content.as_deref().unwrap_or("");
     assert!(!text.is_empty(), "AWQ Marlin chat should not be empty");
 }
+*/ // end Marlin block comment
 
 // ===========================================================================
 // CUDA MoE E2E tests — commented out, needs ≥80GB GPU

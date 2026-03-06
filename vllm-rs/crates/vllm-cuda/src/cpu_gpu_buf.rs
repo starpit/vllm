@@ -66,6 +66,7 @@ impl CpuGpuBuf {
     ///
     /// # Safety
     /// Caller must ensure `T` matches `self.dtype` and `n <= self.capacity_elements`.
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn cpu_slice_mut<T>(&self, n: usize) -> &mut [T] {
         debug_assert!(n <= self.capacity_elements);
         std::slice::from_raw_parts_mut(self.cpu as *mut T, n)

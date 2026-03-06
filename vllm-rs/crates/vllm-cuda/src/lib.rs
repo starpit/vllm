@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #![allow(unsafe_op_in_unsafe_fn)]
+// Low-level CUDA FFI crate: raw pointers are pervasive and intentional.
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::too_many_arguments)]
 //! Purpose-built CUDA tensor runtime for LLM inference.
 //!
 //! Replaces candle as the GPU backend with a zero-allocation, arena-based
@@ -34,6 +39,8 @@ pub mod cublas;
 pub mod device;
 #[cfg(feature = "cuda")]
 pub mod driver;
+#[cfg(feature = "cuda")]
+pub mod graph;
 #[cfg(feature = "cuda")]
 pub mod kernels;
 #[cfg(feature = "cuda")]

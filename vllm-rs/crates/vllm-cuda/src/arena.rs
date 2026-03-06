@@ -111,7 +111,7 @@ impl ScratchArena {
         }
 
         let ptr = unsafe { self.primary.base.add(self.offset) };
-        self.offset = self.offset + aligned;
+        self.offset += aligned;
         if self.offset > self.high_water {
             self.high_water = self.offset;
         }

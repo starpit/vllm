@@ -249,6 +249,12 @@ impl LLMBuilder {
         self
     }
 
+    /// Disable CUDA graph capture and run all steps eagerly.
+    pub fn enforce_eager(mut self, eager: bool) -> Self {
+        self.config.enforce_eager = eager;
+        self
+    }
+
     /// Set the CUDA graph configuration for decode acceleration.
     pub fn cuda_graph_config(mut self, config: CudaGraphConfig) -> Self {
         self.config.cuda_graph_config = Some(config);

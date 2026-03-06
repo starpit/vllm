@@ -9,7 +9,6 @@ use anyhow::Result;
 
 use crate::arena::ScratchArena;
 use crate::cublas::CublasHandle;
-use crate::dtype::DType;
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
 

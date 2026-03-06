@@ -16,6 +16,7 @@ use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_cuda::device::GpuDevice;
 use vllm_cuda::driver;
 use vllm_cuda::dtype::DType as GpuDType;
+use vllm_cuda::graph::{CudaGraphRunner, GRAPH_MAX_BLOCKS_PER_SEQ};
 use vllm_cuda::kv_cache::KvCachePool;
 use vllm_cuda::tensor::GpuTensor;
 use vllm_cuda::weights::GpuWeights;
@@ -44,6 +45,8 @@ pub struct CudaWorkerConfig {
     pub block_size: usize,
     /// GPU device index.
     pub device_id: i32,
+    /// Skip CUDA graph capture (--enforce-eager).
+    pub enforce_eager: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,24 +113,51 @@ impl CudaModel {
         last_token_indices: Option<GpuTensor>,
     ) -> GpuTensor {
         match self {
-            Self::Llama(m) => unsafe { m.forward(
-                input_ids, positions, slot_mapping,
-                cu_seqlens_q, cu_seqlens_k, block_table,
-                max_seqlen_q, max_seqlen_k, kv_cache, device,
-                last_token_indices,
-            ) },
-            Self::Qwen2(m) => unsafe { m.forward(
-                input_ids, positions, slot_mapping,
-                cu_seqlens_q, cu_seqlens_k, block_table,
-                max_seqlen_q, max_seqlen_k, kv_cache, device,
-                last_token_indices,
-            ) },
-            Self::Gemma2(m) => unsafe { m.forward(
-                input_ids, positions, slot_mapping,
-                cu_seqlens_q, cu_seqlens_k, block_table,
-                max_seqlen_q, max_seqlen_k, kv_cache, device,
-                last_token_indices,
-            ) },
+            Self::Llama(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            Self::Qwen2(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            Self::Gemma2(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
         }
     }
 }
@@ -136,13 +166,15 @@ impl CudaModel {
 // Config helpers: HfModelConfig → vllm-cuda configs
 // ---------------------------------------------------------------------------
 
-fn llama_config_from_hf(hf: &HfModelConfig) -> ExecutorResult<vllm_cuda::model::llama::LlamaConfig> {
-    let hidden_size = hf.hidden_size.ok_or_else(|| {
-        ExecutorError::WorkerInit("missing hidden_size in config.json".into())
-    })?;
-    let num_attention_heads = hf.num_attention_heads.ok_or_else(|| {
-        ExecutorError::WorkerInit("missing num_attention_heads".into())
-    })?;
+fn llama_config_from_hf(
+    hf: &HfModelConfig,
+) -> ExecutorResult<vllm_cuda::model::llama::LlamaConfig> {
+    let hidden_size = hf
+        .hidden_size
+        .ok_or_else(|| ExecutorError::WorkerInit("missing hidden_size in config.json".into()))?;
+    let num_attention_heads = hf
+        .num_attention_heads
+        .ok_or_else(|| ExecutorError::WorkerInit("missing num_attention_heads".into()))?;
     let num_kv_heads = hf.num_key_value_heads.unwrap_or(num_attention_heads);
     let head_dim = hf.head_dim.unwrap_or(hidden_size / num_attention_heads);
 
@@ -161,33 +193,41 @@ fn llama_config_from_hf(hf: &HfModelConfig) -> ExecutorResult<vllm_cuda::model::
     })
 }
 
-fn gemma2_config_from_hf(hf: &HfModelConfig) -> ExecutorResult<vllm_cuda::model::gemma2::Gemma2Config> {
-    let hidden_size = hf.hidden_size.ok_or_else(|| {
-        ExecutorError::WorkerInit("missing hidden_size".into())
-    })?;
-    let num_attention_heads = hf.num_attention_heads.ok_or_else(|| {
-        ExecutorError::WorkerInit("missing num_attention_heads".into())
-    })?;
+fn gemma2_config_from_hf(
+    hf: &HfModelConfig,
+) -> ExecutorResult<vllm_cuda::model::gemma2::Gemma2Config> {
+    let hidden_size = hf
+        .hidden_size
+        .ok_or_else(|| ExecutorError::WorkerInit("missing hidden_size".into()))?;
+    let num_attention_heads = hf
+        .num_attention_heads
+        .ok_or_else(|| ExecutorError::WorkerInit("missing num_attention_heads".into()))?;
     let num_kv_heads = hf.num_key_value_heads.unwrap_or(num_attention_heads);
     let num_hidden_layers = hf.num_hidden_layers.unwrap_or(26);
     let head_dim = hf.head_dim.unwrap_or(hidden_size / num_attention_heads);
 
-    let query_pre_attn_scalar = hf.extra.get("query_pre_attn_scalar")
+    let query_pre_attn_scalar = hf
+        .extra
+        .get("query_pre_attn_scalar")
         .and_then(|v| v.as_f64())
         .unwrap_or(head_dim as f64);
-    let attn_logit_softcapping = hf.extra.get("attn_logit_softcapping")
+    let attn_logit_softcapping = hf
+        .extra
+        .get("attn_logit_softcapping")
         .and_then(|v| v.as_f64());
-    let final_logit_softcapping = hf.extra.get("final_logit_softcapping")
+    let final_logit_softcapping = hf
+        .extra
+        .get("final_logit_softcapping")
         .and_then(|v| v.as_f64());
-    let sliding_window = hf.extra.get("sliding_window")
+    let sliding_window = hf
+        .extra
+        .get("sliding_window")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
 
     // Gemma2 alternates sliding/full attention: even layers = sliding, odd = full.
     // Or it may be specified via sliding_window_pattern in config.
-    let layer_is_sliding: Vec<bool> = (0..num_hidden_layers)
-        .map(|i| i % 2 == 0)
-        .collect();
+    let layer_is_sliding: Vec<bool> = (0..num_hidden_layers).map(|i| i % 2 == 0).collect();
 
     Ok(vllm_cuda::model::gemma2::Gemma2Config {
         hidden_size,
@@ -226,6 +266,8 @@ pub struct CudaWorker {
     is_shutdown: bool,
     /// Backing GPU buffers for weight tensors. Must outlive `model`.
     _weights: Option<GpuWeights>,
+    /// CUDA graph runner for decode batches.
+    graph_runner: Option<CudaGraphRunner>,
 
     // Per-request state (mirrors CandleWorker).
     token_buffers: HashMap<String, Vec<u32>>,
@@ -249,6 +291,7 @@ impl CudaWorker {
             resolved_architecture: None,
             is_shutdown: false,
             _weights: None,
+            graph_runner: None,
             token_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
             input_batch: InputBatch::new(),
@@ -291,9 +334,9 @@ impl CudaWorker {
         if let Some(ref token) = self.config.hf_token {
             builder = builder.with_token(Some(token.clone()));
         }
-        let api = builder.build().map_err(|e| {
-            ExecutorError::WorkerInit(format!("failed to build HF API: {e}"))
-        })?;
+        let api = builder
+            .build()
+            .map_err(|e| ExecutorError::WorkerInit(format!("failed to build HF API: {e}")))?;
         let repo = api.model(self.config.model_path.clone());
 
         let config_path = repo.get("config.json").map_err(|e| {
@@ -327,10 +370,7 @@ impl CudaWorker {
     }
 
     /// H2D copy a u32 slice into an arena-allocated GpuTensor.
-    fn h2d_u32(
-        data: &[u32],
-        device: &mut GpuDevice,
-    ) -> ExecutorResult<GpuTensor> {
+    fn h2d_u32(data: &[u32], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
         let t = device.arena.alloc(&[data.len()], GpuDType::U32);
         unsafe {
             driver::memcpy_htod_async(
@@ -345,10 +385,7 @@ impl CudaWorker {
     }
 
     /// H2D copy an i64 slice into an arena-allocated GpuTensor.
-    fn h2d_i64(
-        data: &[i64],
-        device: &mut GpuDevice,
-    ) -> ExecutorResult<GpuTensor> {
+    fn h2d_i64(data: &[i64], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
         let t = device.arena.alloc(&[data.len()], GpuDType::I64);
         unsafe {
             driver::memcpy_htod_async(
@@ -434,10 +471,7 @@ impl CudaWorker {
     }
 
     /// D2H copy logits to CPU f32 vec.
-    fn logits_to_cpu(
-        logits: GpuTensor,
-        device: &GpuDevice,
-    ) -> ExecutorResult<Vec<f32>> {
+    fn logits_to_cpu(logits: GpuTensor, device: &GpuDevice) -> ExecutorResult<Vec<f32>> {
         let num_elements = logits.numel();
         let nbytes = num_elements * logits.dtype().size_bytes();
 
@@ -472,7 +506,7 @@ impl CudaWorker {
             _ => {
                 return Err(ExecutorError::WorkerExecution(
                     "unexpected logits dtype".into(),
-                ))
+                ));
             }
         };
         Ok(f32_vec)
@@ -544,17 +578,17 @@ impl Worker for CudaWorker {
         // Sync to ensure all H2D weight copies are complete before D2D concat.
         unsafe { driver::stream_synchronize(device.compute_stream) }
             .map_err(|e| ExecutorError::WorkerInit(format!("weight sync: {e}")))?;
-        info!(
-            "CudaWorker: loaded {} weight tensors",
-            weights.len()
-        );
+        info!("CudaWorker: loaded {} weight tensors", weights.len());
 
         // 6. Construct model based on architecture.
         let model = match arch.as_str() {
             "LlamaForCausalLM" | "MistralForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
                 let m = vllm_cuda::model::llama::LlamaForCausalLM::load(
-                    &mut weights, &config, dtype, device,
+                    &mut weights,
+                    &config,
+                    dtype,
+                    device,
                 )
                 .map_err(|e| ExecutorError::WorkerInit(format!("LlamaForCausalLM load: {e}")))?;
                 CudaModel::Llama(m)
@@ -564,7 +598,10 @@ impl Worker for CudaWorker {
                 let qwen2_config =
                     vllm_cuda::model::qwen2::Qwen2Config::from_llama_config(llama_config);
                 let m = vllm_cuda::model::qwen2::Qwen2ForCausalLM::load(
-                    &mut weights, &qwen2_config, dtype, device,
+                    &mut weights,
+                    &qwen2_config,
+                    dtype,
+                    device,
                 )
                 .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2 load: {e}")))?;
                 CudaModel::Qwen2(m)
@@ -572,7 +609,10 @@ impl Worker for CudaWorker {
             "Gemma2ForCausalLM" => {
                 let config = gemma2_config_from_hf(&hf_config)?;
                 let m = vllm_cuda::model::gemma2::Gemma2ForCausalLM::load(
-                    &mut weights, &config, dtype, device,
+                    &mut weights,
+                    &config,
+                    dtype,
+                    device,
                 )
                 .map_err(|e| ExecutorError::WorkerInit(format!("Gemma2 load: {e}")))?;
                 CudaModel::Gemma2(m)
@@ -641,10 +681,7 @@ impl Worker for CudaWorker {
         }
         let (free, _total) = cudarc::driver::result::mem_get_info()
             .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
-        info!(
-            "CudaWorker: {:.0} MB free VRAM",
-            free as f64 / 1_048_576.0
-        );
+        info!("CudaWorker: {:.0} MB free VRAM", free as f64 / 1_048_576.0);
         Ok(free)
     }
 
@@ -728,63 +765,106 @@ impl Worker for CudaWorker {
             }
         };
         let vocab_size = model.vocab_size();
-
-        // Reset scratch arena for this step.
-        device.arena.reset();
-
-        // H2D: input_ids and positions.
-        let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
-        let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
-
-        // Build attention metadata tensors.
-        let (slot_mapping, cu_seqlens_q, cu_seqlens_k, block_table, max_seqlen_q, max_seqlen_k) =
-            Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
-
-        tracing::debug!(
-            "CudaWorker::execute_model: tokens={}, positions={}, slot_mapping={}, cu_q={}, cu_k={}, block_table=[{},{}], max_sq={}, max_sk={}",
-            prepared.flat_token_ids.len(),
-            prepared.flat_positions.len(),
-            slot_mapping.numel(),
-            cu_seqlens_q.numel(),
-            cu_seqlens_k.numel(),
-            block_table.dim(0), block_table.dim(1),
-            max_seqlen_q,
-            max_seqlen_k,
-        );
-
-        // Compute last-token indices: for each request, the index of its last
-        // token in the flattened batch. The model gathers these rows from hidden
-        // states before the lm_head GEMM, avoiding a full [num_tokens, vocab_size]
-        // matmul when only [num_reqs, vocab_size] is needed.
         let num_reqs = prepared.req_inputs.len();
         let total_tokens = prepared.flat_token_ids.len();
-        let last_token_indices = if num_reqs < total_tokens {
-            let mut indices = Vec::with_capacity(num_reqs);
-            let mut offset = 0u32;
-            for req_slice in &prepared.req_inputs {
-                indices.push(offset + req_slice.token_count as u32 - 1);
-                offset += req_slice.token_count as u32;
-            }
-            Some(Self::h2d_u32(&indices, device)?)
-        } else {
-            None // All decode (1 token per request) — no gather needed.
-        };
 
-        // Forward pass.
-        let logits = unsafe {
-            model.forward(
-                gpu_input_ids,
-                gpu_positions,
-                slot_mapping,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                block_table,
-                max_seqlen_q,
-                max_seqlen_k,
-                kv_cache,
-                device,
-                last_token_indices,
-            )
+        // Check if this is a pure decode batch (all q_len=1) and we have a graph.
+        let is_decode = prepared.attn_meta.q_lens.iter().all(|&q| q == 1);
+        let use_graph = is_decode
+            && self
+                .graph_runner
+                .as_ref()
+                .is_some_and(|r| r.has_graph(num_reqs));
+
+        let logits = if use_graph {
+            // CUDA graph fast path: replay captured graph.
+            // Build attention metadata on CPU (same as eager path).
+            let meta = &prepared.attn_meta;
+            let cu_seqlens_q: Vec<u32> = (0..=num_reqs as u32).collect();
+            let mut cu_seqlens_k = Vec::with_capacity(num_reqs + 1);
+            cu_seqlens_k.push(0u32);
+            let mut cum = 0u32;
+            for &sl in &meta.seq_lens {
+                cum += sl as u32;
+                cu_seqlens_k.push(cum);
+            }
+            let _max_seqlen_k = meta.seq_lens.iter().copied().max().unwrap_or(0);
+
+            // Build slot_mapping.
+            let mut slot_mapping = Vec::with_capacity(num_reqs);
+            for i in 0..num_reqs {
+                let abs_pos = meta.tokens_before[i];
+                let block_idx = abs_pos / block_size;
+                let offset = abs_pos % block_size;
+                let block_ids = &meta.block_ids[i];
+                if block_idx < block_ids.len() {
+                    slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
+                } else {
+                    slot_mapping.push(-1i64);
+                }
+            }
+
+            // Build block_table padded to GRAPH_MAX_BLOCKS_PER_SEQ.
+            let mut block_table = vec![0u32; num_reqs * GRAPH_MAX_BLOCKS_PER_SEQ];
+            for (i, blocks) in meta.block_ids.iter().enumerate() {
+                for (j, &bid) in blocks.iter().enumerate() {
+                    if j < GRAPH_MAX_BLOCKS_PER_SEQ {
+                        block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
+                    }
+                }
+            }
+
+            let runner = self.graph_runner.as_ref().unwrap();
+            unsafe {
+                runner.replay(
+                    num_reqs,
+                    &prepared.flat_token_ids,
+                    &prepared.flat_positions,
+                    &slot_mapping,
+                    &cu_seqlens_q,
+                    &cu_seqlens_k,
+                    &block_table,
+                    device,
+                )
+            }
+            .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
+        } else {
+            // Eager forward path (prefill or uncaptured batch size).
+            device.arena.reset();
+
+            let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
+            let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
+
+            let (slot_mapping, cu_seqlens_q, cu_seqlens_k, block_table, max_seqlen_q, max_seqlen_k) =
+                Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
+
+            let last_token_indices = if num_reqs < total_tokens {
+                let mut indices = Vec::with_capacity(num_reqs);
+                let mut offset = 0u32;
+                for req_slice in &prepared.req_inputs {
+                    indices.push(offset + req_slice.token_count as u32 - 1);
+                    offset += req_slice.token_count as u32;
+                }
+                Some(Self::h2d_u32(&indices, device)?)
+            } else {
+                None
+            };
+
+            unsafe {
+                model.forward(
+                    gpu_input_ids,
+                    gpu_positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            }
         };
 
         // Check if all requests can use the GPU argmax fast path (greedy, no
@@ -793,7 +873,7 @@ impl Worker for CudaWorker {
         let all_greedy = prepared.req_inputs.iter().all(|r| {
             self.sampling_params_map
                 .get(&r.req_id)
-                .map_or(true, |p| p.temperature < 1e-6)
+                .is_none_or(|p| p.temperature < 1e-6)
         });
 
         let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
@@ -802,14 +882,12 @@ impl Worker for CudaWorker {
         // no frequency/presence/repetition penalties). This covers both greedy
         // (temp < 1e-6 → argmax) and non-greedy (temp >= 1e-6 → top-k/top-p/min-p).
         let all_gpu_sampleable = prepared.req_inputs.iter().all(|r| {
-            self.sampling_params_map
-                .get(&r.req_id)
-                .map_or(true, |p| {
-                    p.frequency_penalty == 0.0
-                        && p.presence_penalty == 0.0
-                        && p.repetition_penalty == 1.0
-                        && p.logit_bias.is_none()
-                })
+            self.sampling_params_map.get(&r.req_id).is_none_or(|p| {
+                p.frequency_penalty == 0.0
+                    && p.presence_penalty == 0.0
+                    && p.repetition_penalty == 1.0
+                    && p.logit_bias.is_none()
+            })
         });
 
         if all_gpu_sampleable && !all_greedy {
@@ -833,7 +911,12 @@ impl Worker for CudaWorker {
             for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
                 let params = self.sampling_params_map.get(&req_slice.req_id);
                 let (t, k, p, mp) = params.map_or((1.0f32, 0i32, 1.0f32, 0.0f32), |p| {
-                    (p.temperature.max(1e-7) as f32, p.top_k as i32, p.top_p as f32, p.min_p as f32)
+                    (
+                        p.temperature.max(1e-7) as f32,
+                        p.top_k,
+                        p.top_p as f32,
+                        p.min_p as f32,
+                    )
                 });
                 unsafe {
                     *temps_ptr.add(i) = t;
@@ -848,7 +931,10 @@ impl Worker for CudaWorker {
             let gpu_packed = device.arena.alloc(&[total_bytes / 4], GpuDType::F32);
             unsafe {
                 driver::memcpy_htod_async(
-                    gpu_packed.raw_ptr(), packed.as_ptr(), total_bytes, device.compute_stream,
+                    gpu_packed.raw_ptr(),
+                    packed.as_ptr(),
+                    total_bytes,
+                    device.compute_stream,
                 )
             }
             .map_err(|e| ExecutorError::WorkerExecution(format!("H2D sampling params: {e}")))?;
@@ -856,15 +942,25 @@ impl Worker for CudaWorker {
             // Create views into the packed GPU buffer.
             let base = gpu_packed.raw_ptr();
             let gpu_temps = unsafe { GpuTensor::new(base, &[num_reqs], GpuDType::F32) };
-            let gpu_top_ks = unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::U32) };
-            let gpu_top_ps = unsafe { GpuTensor::new(base.add(stride * 2), &[num_reqs], GpuDType::F32) };
-            let gpu_min_ps = unsafe { GpuTensor::new(base.add(stride * 3), &[num_reqs], GpuDType::F32) };
-            let gpu_randoms = unsafe { GpuTensor::new(base.add(stride * 4), &[num_reqs], GpuDType::F32) };
+            let gpu_top_ks =
+                unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::U32) };
+            let gpu_top_ps =
+                unsafe { GpuTensor::new(base.add(stride * 2), &[num_reqs], GpuDType::F32) };
+            let gpu_min_ps =
+                unsafe { GpuTensor::new(base.add(stride * 3), &[num_reqs], GpuDType::F32) };
+            let gpu_randoms =
+                unsafe { GpuTensor::new(base.add(stride * 4), &[num_reqs], GpuDType::F32) };
 
             let token_ids_gpu = unsafe {
                 vllm_cuda::kernels::sample_batched(
-                    logits, gpu_temps, gpu_top_ks, gpu_top_ps, gpu_min_ps, gpu_randoms,
-                    &mut device.arena, device.compute_stream,
+                    logits,
+                    gpu_temps,
+                    gpu_top_ks,
+                    gpu_top_ps,
+                    gpu_min_ps,
+                    gpu_randoms,
+                    &mut device.arena,
+                    device.compute_stream,
                 )
             };
 
@@ -942,20 +1038,20 @@ impl Worker for CudaWorker {
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
 
-                let sampled =
-                    if let Some(params) = self.sampling_params_map.get(&req_slice.req_id) {
-                        let (token_id, _logprobs) =
-                            sampler.sample_one(req_logits, params, prev_tokens, None);
-                        vec![token_id]
-                    } else {
-                        let token_id = req_logits
-                            .iter()
-                            .enumerate()
-                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                            .map(|(i, _)| i as u32)
-                            .unwrap_or(0);
-                        vec![token_id]
-                    };
+                let sampled = if let Some(params) = self.sampling_params_map.get(&req_slice.req_id)
+                {
+                    let (token_id, _logprobs) =
+                        sampler.sample_one(req_logits, params, prev_tokens, None);
+                    vec![token_id]
+                } else {
+                    let token_id = req_logits
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                        .map(|(i, _)| i as u32)
+                        .unwrap_or(0);
+                    vec![token_id]
+                };
 
                 self.input_batch.commit_step(
                     &req_slice.req_id,
@@ -974,7 +1070,135 @@ impl Worker for CudaWorker {
     }
 
     fn compile_or_warm_up_model(&mut self) -> ExecutorResult<()> {
-        // TODO: CUDA graph capture for decode batches.
+        if self.config.enforce_eager {
+            info!("CudaWorker: --enforce-eager set, skipping CUDA graph capture");
+            return Ok(());
+        }
+
+        let (model, kv_cache, device) = match (&self.model, &self.kv_cache, &mut self.device) {
+            (Some(m), Some(kv), Some(d)) => (m, kv, d),
+            _ => return Ok(()), // Not fully initialized yet.
+        };
+
+        unsafe { driver::ctx_set_current(device.ctx) }
+            .map_err(|e| ExecutorError::WorkerInit(format!("ctx_set_current: {e}")))?;
+
+        let vocab_size = model.vocab_size();
+
+        // Capture CUDA graphs for common decode batch sizes.
+        // During decode, every request has q_len=1, so shapes are deterministic.
+        let capture_sizes: Vec<usize> = vec![1, 2, 4, 8];
+        let max_bs = *capture_sizes.iter().max().unwrap();
+
+        // Pre-size the arena by running dummy forwards that cover the worst-case
+        // allocation pattern. This ensures the arena won't grow after graph capture
+        // (which would invalidate captured pointers since the arena base changes).
+        // Run with a prefill-like token count (max_bs * 32) to cover both prefill
+        // and decode arena needs.
+        {
+            let prefill_tokens = max_bs * 32; // simulate prefill of 32 tokens/req
+            info!("Pre-sizing arena with dummy forward ({prefill_tokens} tokens)...");
+            device.arena.reset();
+            let dummy_ids = device.arena.alloc(&[prefill_tokens], GpuDType::U32);
+            let dummy_pos = device.arena.alloc(&[prefill_tokens], GpuDType::U32);
+            let dummy_slots = device.arena.alloc(&[prefill_tokens], GpuDType::I64);
+            // cu_seqlens: each request has 32 tokens
+            let cu_q: Vec<u32> = (0..=max_bs).map(|i| (i * 32) as u32).collect();
+            let gpu_cu_q = device.arena.alloc(&[max_bs + 1], GpuDType::U32);
+            unsafe {
+                driver::memcpy_htod_async(
+                    gpu_cu_q.raw_ptr(),
+                    cu_q.as_ptr() as *const u8,
+                    (max_bs + 1) * 4,
+                    device.compute_stream,
+                )
+                .ok();
+            }
+            let gpu_cu_k = device.arena.alloc(&[max_bs + 1], GpuDType::U32);
+            unsafe {
+                driver::memcpy_htod_async(
+                    gpu_cu_k.raw_ptr(),
+                    cu_q.as_ptr() as *const u8,
+                    (max_bs + 1) * 4,
+                    device.compute_stream,
+                )
+                .ok();
+            }
+            let dummy_bt = device.arena.alloc(&[max_bs, 1], GpuDType::U32);
+            // Use padded max_seqlen_k=2048 to match graph capture workspace needs.
+            unsafe {
+                let _ = model.forward(
+                    dummy_ids,
+                    dummy_pos,
+                    dummy_slots,
+                    gpu_cu_q,
+                    gpu_cu_k,
+                    dummy_bt,
+                    32,
+                    2048,
+                    kv_cache,
+                    device,
+                    None,
+                );
+                let _ = driver::stream_synchronize(device.compute_stream);
+            }
+            device.arena.reset();
+            info!(
+                "Arena pre-sized: capacity={:.1} MB, high_water={:.1} MB",
+                device.arena.capacity() as f64 / (1024.0 * 1024.0),
+                device.arena.high_water_mark() as f64 / (1024.0 * 1024.0),
+            );
+        }
+
+        let mut runner = unsafe { CudaGraphRunner::new(max_bs, vocab_size, self.model_dtype) }
+            .map_err(|e| ExecutorError::WorkerInit(format!("CudaGraphRunner::new: {e}")))?;
+
+        for &bs in &capture_sizes {
+            info!("Capturing CUDA graph for batch_size={bs}...");
+            let kv_ref = kv_cache;
+            let model_ref = model;
+
+            // Capture with max_seqlen_k padded to 2048. Paged FA2 uses per-sequence
+            // lengths from cu_seqlens_k and iterates via block_table, so a large
+            // max_seqlen_k just over-allocates workspace — correctness is maintained.
+            // This avoids re-capture as sequences grow during inference.
+            let padded_max_seqlen_k: usize = 2048;
+
+            let result = unsafe {
+                runner.capture(bs, device, |inputs, dev| {
+                    model_ref.forward(
+                        inputs.input_ids,
+                        inputs.positions,
+                        inputs.slot_mapping,
+                        inputs.cu_seqlens_q,
+                        inputs.cu_seqlens_k,
+                        inputs.block_table,
+                        1, // max_seqlen_q = 1 for decode
+                        padded_max_seqlen_k,
+                        kv_ref,
+                        dev,
+                        None, // no last_token_indices (decode: all tokens are last)
+                    )
+                })
+            };
+
+            match result {
+                Ok(()) => info!("CUDA graph captured for batch_size={bs}"),
+                Err(e) => {
+                    tracing::warn!("Failed to capture CUDA graph for bs={bs}: {e}");
+                    // Continue without graphs for this size.
+                }
+            }
+        }
+
+        if !runner.captured_sizes().is_empty() {
+            info!(
+                "CUDA graphs captured for batch sizes: {:?}",
+                runner.captured_sizes()
+            );
+            self.graph_runner = Some(runner);
+        }
+
         Ok(())
     }
 

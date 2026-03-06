@@ -9,8 +9,6 @@
 
 use anyhow::Result;
 
-use crate::arena::ScratchArena;
-use crate::cublas::CublasHandle;
 use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kernels;
@@ -239,42 +237,23 @@ impl LlamaAttention {
         weights: &mut GpuWeights,
         prefix: &str,
         config: &LlamaConfig,
-        layer_idx: usize,
+        _layer_idx: usize,
     ) -> Result<Self> {
         let num_q_heads = config.num_attention_heads;
         let num_kv_heads = config.num_kv_heads;
         let head_dim = config.head_dim;
-        let q_size = num_q_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
+        let _q_size = num_q_heads * head_dim;
+        let _kv_size = num_kv_heads * head_dim;
 
         // Load and fuse Q/K/V into single [q_size + 2*kv_size, hidden] weight.
-        let q_w = weights.take(&format!("{prefix}.q_proj.weight"))?;
+        let _q_w = weights.take(&format!("{prefix}.q_proj.weight"))?;
         let k_w = weights.take(&format!("{prefix}.k_proj.weight"))?;
         let v_w = weights.take(&format!("{prefix}.v_proj.weight"))?;
 
         // TODO: fuse into contiguous buffer. For now, this needs D2D concat.
-        // Placeholder: just use q_w and we'll fix the fusion.
-        let _ = (k_w, v_w);
-        anyhow::bail!("QKV fusion not yet implemented — need D2D concat");
-
-        #[allow(unreachable_code)]
-        {
-            let qkv_proj = Linear::new(q_w, None); // placeholder
-
-            let o_proj = Linear::load(weights, &format!("{prefix}.o_proj"))?;
-
-            Ok(Self {
-                qkv_proj,
-                o_proj,
-                q_size,
-                kv_size,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                scale: 1.0 / (head_dim as f32).sqrt(),
-                layer_idx,
-            })
-        }
+        // Use `load_fused` instead, which does the concat.
+        let _ = (_q_w, k_w, v_w, _q_size, _kv_size, _layer_idx);
+        anyhow::bail!("QKV fusion not yet implemented — use load_fused instead")
     }
 
     /// Forward pass with paged KV cache and FlashAttention-2.

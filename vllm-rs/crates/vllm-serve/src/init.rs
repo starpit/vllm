@@ -89,6 +89,9 @@ pub struct VllmConfig {
     /// Whether prefix caching is enabled (KV cache reuse for shared prompts).
     /// Default: true.
     pub enable_prefix_caching: bool,
+    /// Disable CUDA graph capture and run all steps eagerly.
+    /// Default: false.
+    pub enforce_eager: bool,
 }
 
 impl Default for VllmConfig {
@@ -118,6 +121,7 @@ impl Default for VllmConfig {
             runner: "generate".to_string(),
             cuda_graph_config: None,
             enable_prefix_caching: true,
+            enforce_eager: false,
         }
     }
 }
@@ -227,6 +231,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             hf_token: config.hf_token.clone(),
             block_size: config.block_size,
             device_id,
+            enforce_eager: config.enforce_eager,
         };
 
         let mut worker = CudaWorker::new(cuda_config);
@@ -887,7 +892,10 @@ fn initialize_stack_tp(
     // Headless worker mode: node_rank > 0 enters a blocking loop receiving
     // SchedulerOutput from rank 0 via NCCL broadcast.
     if num_nodes > 1 && node_rank > 0 {
-        info!("Node rank {}: entering headless worker mode (NCCL broadcast)", node_rank);
+        info!(
+            "Node rank {}: entering headless worker mode (NCCL broadcast)",
+            node_rank
+        );
         crate::headless::run_headless(executor)?;
         // run_headless only returns on shutdown — exit cleanly.
         std::process::exit(0);

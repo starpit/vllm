@@ -10,7 +10,7 @@
 //! - Supports async H2D copies on the transfer stream
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Result, bail};
 use cudarc::driver::sys::CUstream;

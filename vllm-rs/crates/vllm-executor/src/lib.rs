@@ -14,10 +14,10 @@
 //! * [`error`] -- Executor-specific error types.
 
 pub mod candle_worker;
-#[cfg(feature = "cuda-backend")]
-pub mod cuda_worker;
 #[cfg(feature = "cuda")]
 pub mod cuda_graph;
+#[cfg(feature = "cuda-backend")]
+pub mod cuda_worker;
 pub mod error;
 pub mod input_batch;
 pub mod multinode;

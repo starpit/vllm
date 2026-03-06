@@ -14,8 +14,6 @@
 
 use anyhow::Result;
 
-use crate::arena::ScratchArena;
-use crate::cublas::CublasHandle;
 use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kernels;

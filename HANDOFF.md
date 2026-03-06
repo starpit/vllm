@@ -127,6 +127,20 @@ Pod: `oc rsh nick` — L40S GPU, CUDA 12.9, Rust 1.93, path `/root/vllm/vllm-rs/
   is unchanged, saving 5 CPU Vec builds + 5 H2D copies per decode step.
 - Previously only greedy decode used the fast path.
 
+### Pinned host staging buffers
+- **New `PinnedBuf`** type in `cpu_gpu_buf.rs`: host-only pinned (page-locked) memory wrapper.
+  Unlike `CpuGpuBuf`, no GPU allocation — used when GPU destination is managed elsewhere (e.g., graph persistent buffers).
+- **New `HostStaging`** struct in `cuda_worker.rs`: pre-allocated pinned buffers for all graph
+  replay metadata (input_ids, positions, slot_mapping, cu_seqlens_q/k, block_table, host_token_ids,
+  sampling_packed). ~520KB total, allocated after graph capture.
+- All graph replay H2D paths now use pinned memory for true async DMA (pageable memory forces
+  synchronous staging inside the CUDA driver, defeating `_async`).
+- All D2H token ID paths use pinned `host_token_ids` buffer.
+- GPU sampling params packed into pinned `sampling_packed` buffer.
+- Eliminates 6+ heap Vec allocations per batch composition change.
+- `fill_block_table()` helper deduplicates 4× copy-pasted block table building code.
+- 5 new unit tests for `PinnedBuf` (create, zero-cap, u32 slice, i64 slice, H2D roundtrip).
+
 ## Performance (L40S, default bench: BS=8, in=32, out=128)
 
 Current numbers (after all optimizations):
@@ -140,11 +154,11 @@ Current numbers (after all optimizations):
 | Qwen2.5-0.5B BS=1 in=1024 | 0 | Eager | 354.4 |
 | Qwen2.5-0.5B BS=1 in=1024 | 0 | Prefill+Decode graphs | 386.5 |
 | Qwen2.5-3B | 0 | Graphs | 807 |
-| Qwen2.5-3B | - | Throughput | 12528 total tok/s |
+| Qwen2.5-3B | - | Throughput | 13580 total tok/s |
 
 ## Testing methodology
 
-- Unit tests: `cargo test -p vllm-cuda --features cuda -- --include-ignored` — 140 tests covering tensor ops, GEMM, layers, kernels, model forward passes, plan caching, arena scoping. Run on pod only (needs GPU).
+- Unit tests: `cargo test -p vllm-cuda --features cuda -- --include-ignored` — 145 tests covering tensor ops, GEMM, layers, kernels, model forward passes, plan caching, arena scoping, pinned buffers. Run on pod only (needs GPU).
 - Local check: `cargo check -p vllm-cuda --tests` catches Rust compilation errors without needing CUDA.
 - Benchmarking: Always run ONE bench command at a time (GPU contention). Compare against baselines in table above. Use `--enforce-eager` to isolate kernel-level changes from graph effects.
 - E2E correctness tests exist and pass.
@@ -157,14 +171,14 @@ Current numbers (after all optimizations):
 | ~~No cuBLAS autotuning~~ | ~~Medium~~ | **FIXED** — `benchmark_plans()` finds 7-40% faster algorithms per shape. |
 | ~~H2D copies per decode step~~ | ~~Medium~~ | **FIXED** — persistent GPU metadata with `update_decode_metadata` kernel. |
 | ~~Hardcoded max_num_batched_tokens~~ | ~~Low~~ | **FIXED** — GPU-aware auto-detection from VRAM. |
-| Gap to Python vLLM on 3B | Medium | ~30% behind Python on `bench throughput` (12528 vs ~20135). Remaining causes: no cross-step H2D pipelining, chunked prefill not graphed, less aggressive batching/scheduling. |
+| Gap to Python vLLM on 3B | Low | ~3.3% behind Python on `bench throughput` (13.58k vs 14.05k tok/s). Nearly at parity. |
 | Arena pre-sizes to ~1GB for 3B | Low | Correct behavior. Could auto-size from model config. |
 | ~~RoPE scaling for Llama 3.2~~ | ~~Low~~ | **FIXED** — llama3 rope_scaling implemented in both backends. |
 | `--bench` warmup corrupts chat | Low | Chat `--bench` mode warmup (1-token gen) leaves dirty state, garbling subsequent output. Non-bench chat works perfectly. |
 
 ## Next steps (priority order)
 
-1. **Throughput bench** — Re-run with larger graph sizes + non-greedy fast path. Baseline: 14873 tok/s → target: close to Python 20135.
+1. **Throughput bench** — Nearly at parity: 13.58k vs Python 14.05k tok/s (~3.3% gap).
 2. ~~**Prefill graph capture**~~ — **DONE** (360ee9053). Single-sequence prefill graphs at [128..8192] token counts. 9-10% uplift.
 3. ~~**H2D/compute overlap**~~ — **DONE** (360ee9053). Transfer stream for all graph H2D. Cross-step pipelining deferred.
 4. ~~**LLaMA-family aliases**~~ — **DONE**. Added Qwen3ForCausalLM and Phi3ForCausalLM to LLaMA match arm in CudaWorker. E2E verified: Qwen3-0.6B on L40S.
@@ -178,7 +192,8 @@ Current numbers (after all optimizations):
 - Rust FFI + wrapper: `crates/vllm-cuda/src/kernels.rs` (`fused_qkv_rope()`, `update_decode_metadata_gpu()`)
 - Model call sites: `crates/vllm-cuda/src/model/llama.rs`, `crates/vllm-cuda/src/model/gemma2.rs`
 - CUDA graph runner: `crates/vllm-cuda/src/graph.rs` (`CapturedGraph`, `ReplayOutput`, `nearest_graph_size`, `replay_decode_fast`)
-- CUDA worker: `crates/vllm-executor/src/cuda_worker.rs` (greedy graph fast path, batch padding, `graph_metadata_valid`)
+- CUDA worker: `crates/vllm-executor/src/cuda_worker.rs` (greedy graph fast path, batch padding, `graph_metadata_valid`, `HostStaging`)
+- Pinned host buffers: `crates/vllm-cuda/src/cpu_gpu_buf.rs` (`PinnedBuf`, `CpuGpuBuf`)
 - Arena scoping: `crates/vllm-cuda/src/arena.rs` (`set_offset`, scoping tests), `crates/vllm-cuda/src/model/llama.rs` (per-layer scoping pattern)
 - Config: `crates/vllm-serve/src/init.rs` (GPU-aware `max_num_batched_tokens`), `crates/vllm-executor/src/cuda_worker.rs` (`CudaWorkerConfig`)
 - Prefill graph runner: `crates/vllm-cuda/src/graph.rs` (`PrefillGraphRunner`, `PrefillInputTensors`, `PrefillReplayOutput`)

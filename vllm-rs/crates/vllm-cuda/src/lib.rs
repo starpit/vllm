@@ -55,7 +55,7 @@ pub mod weights;
 #[cfg(feature = "cuda")]
 pub use arena::ScratchArena;
 #[cfg(feature = "cuda")]
-pub use cpu_gpu_buf::CpuGpuBuf;
+pub use cpu_gpu_buf::{CpuGpuBuf, PinnedBuf};
 #[cfg(feature = "cuda")]
 pub use cublas::CublasHandle;
 #[cfg(feature = "cuda")]

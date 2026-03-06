@@ -127,6 +127,77 @@ impl Drop for CpuGpuBuf {
     }
 }
 
+/// Host-only pinned (page-locked) buffer for async H2D staging.
+///
+/// Unlike `CpuGpuBuf`, this does NOT allocate GPU memory — use this when the
+/// GPU destination is managed elsewhere (e.g., CUDA graph persistent buffers).
+/// Provides zero-copy async DMA when passed to `memcpy_htod_async`.
+pub struct PinnedBuf {
+    ptr: *mut u8,
+    capacity_bytes: usize,
+}
+
+unsafe impl Send for PinnedBuf {}
+unsafe impl Sync for PinnedBuf {}
+
+impl PinnedBuf {
+    /// Allocate `capacity_bytes` of pinned host memory.
+    ///
+    /// # Safety
+    /// Must be called with an active CUDA context.
+    pub unsafe fn new(capacity_bytes: usize) -> Result<Self> {
+        let ptr = if capacity_bytes > 0 {
+            driver::mem_alloc_host(capacity_bytes)?
+        } else {
+            std::ptr::null_mut()
+        };
+        Ok(Self {
+            ptr,
+            capacity_bytes,
+        })
+    }
+
+    /// Raw pointer to the pinned host memory.
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// Capacity in bytes.
+    pub fn capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+
+    /// Get a mutable typed slice of the first `n` elements.
+    ///
+    /// # Safety
+    /// `T` must be compatible with the intended use and `n * size_of::<T>()` must
+    /// fit in `capacity_bytes`.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn slice_mut<T>(&self, n: usize) -> &mut [T] {
+        debug_assert!(n * std::mem::size_of::<T>() <= self.capacity_bytes);
+        std::slice::from_raw_parts_mut(self.ptr as *mut T, n)
+    }
+
+    /// Get a typed slice of the first `n` elements.
+    ///
+    /// # Safety
+    /// `T` must be compatible and elements must be initialized.
+    pub unsafe fn slice<T>(&self, n: usize) -> &[T] {
+        debug_assert!(n * std::mem::size_of::<T>() <= self.capacity_bytes);
+        std::slice::from_raw_parts(self.ptr as *const T, n)
+    }
+}
+
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                let _ = driver::mem_free_host(self.ptr);
+            }
+        }
+    }
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
@@ -269,6 +340,91 @@ mod tests {
             let buf = unsafe { CpuGpuBuf::new(64, dtype).unwrap() };
             assert_eq!(buf.dtype(), dtype);
             assert_eq!(buf.capacity(), 64);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // PinnedBuf tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pinned_buf_create_and_drop() {
+        init_cuda();
+        let buf = unsafe { PinnedBuf::new(4096).unwrap() };
+        assert!(!buf.ptr().is_null());
+        assert_eq!(buf.capacity_bytes(), 4096);
+        drop(buf);
+    }
+
+    #[test]
+    fn test_pinned_buf_zero_capacity() {
+        init_cuda();
+        let buf = unsafe { PinnedBuf::new(0).unwrap() };
+        assert!(buf.ptr().is_null());
+        assert_eq!(buf.capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn test_pinned_buf_slice_write_read_u32() {
+        init_cuda();
+        let buf = unsafe { PinnedBuf::new(256 * 4).unwrap() };
+        unsafe {
+            let s = buf.slice_mut::<u32>(256);
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = (i * 3 + 7) as u32;
+            }
+            let r = buf.slice::<u32>(256);
+            for (i, v) in r.iter().enumerate() {
+                assert_eq!(*v, (i * 3 + 7) as u32);
+            }
+        }
+    }
+
+    #[test]
+    fn test_pinned_buf_slice_write_read_i64() {
+        init_cuda();
+        let buf = unsafe { PinnedBuf::new(64 * 8).unwrap() };
+        unsafe {
+            let s = buf.slice_mut::<i64>(64);
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = -(i as i64);
+            }
+            let r = buf.slice::<i64>(64);
+            for (i, v) in r.iter().enumerate() {
+                assert_eq!(*v, -(i as i64));
+            }
+        }
+    }
+
+    #[test]
+    fn test_pinned_buf_h2d_async() {
+        init_cuda();
+        unsafe {
+            let stream = driver::stream_create().expect("stream");
+            let buf = PinnedBuf::new(128 * 4).unwrap();
+
+            // Write pattern into pinned memory.
+            let s = buf.slice_mut::<u32>(128);
+            for (i, v) in s.iter_mut().enumerate() {
+                *v = (i * 11) as u32;
+            }
+
+            // Allocate GPU memory and do async H2D from pinned buffer.
+            let gpu = driver::mem_alloc(128 * 4).expect("gpu alloc");
+            driver::memcpy_htod_async(gpu, buf.ptr(), 128 * 4, stream).expect("htod");
+
+            // D2H back into a second pinned buffer to verify.
+            let buf2 = PinnedBuf::new(128 * 4).unwrap();
+            driver::memcpy_dtoh_async(buf2.ptr(), gpu, 128 * 4, stream).expect("dtoh");
+            driver::stream_synchronize(stream).expect("sync");
+
+            let r = buf2.slice::<u32>(128);
+            for (i, v) in r.iter().enumerate() {
+                assert_eq!(*v, (i * 11) as u32, "mismatch at {i}");
+            }
+
+            driver::mem_free(gpu).unwrap();
+            driver::stream_destroy(stream).unwrap();
         }
     }
 }

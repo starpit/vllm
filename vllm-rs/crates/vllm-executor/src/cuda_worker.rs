@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 use vllm_common::SamplingParams;
 use vllm_core::scheduler::output::SchedulerOutput;
+use vllm_cuda::cpu_gpu_buf::PinnedBuf;
 use vllm_cuda::device::GpuDevice;
 use vllm_cuda::driver;
 use vllm_cuda::dtype::DType as GpuDType;
@@ -288,6 +289,73 @@ fn gemma2_config_from_hf(
 }
 
 // ---------------------------------------------------------------------------
+// Pinned host staging buffers
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated pinned (page-locked) host buffers for CUDA graph replay.
+///
+/// Eliminates per-step heap Vec allocations and enables true async DMA
+/// (pageable memory forces the CUDA driver to stage through an internal
+/// pinned buffer, serializing the transfer).
+struct HostStaging {
+    /// `[max_batch]` u32 — input token IDs.
+    input_ids: PinnedBuf,
+    /// `[max_batch]` u32 — position indices.
+    positions: PinnedBuf,
+    /// `[max_batch]` i64 — KV cache slot mapping.
+    slot_mapping: PinnedBuf,
+    /// `[max_batch + 1]` u32 — cumulative query sequence lengths.
+    cu_seqlens_q: PinnedBuf,
+    /// `[max_batch + 1]` u32 — cumulative key sequence lengths.
+    cu_seqlens_k: PinnedBuf,
+    /// `[max_batch * GRAPH_MAX_BLOCKS_PER_SEQ]` u32 — page table.
+    block_table: PinnedBuf,
+    /// `[max_batch]` u32 — D2H token IDs from graph argmax.
+    host_token_ids: PinnedBuf,
+    /// `[max_batch * 5]` f32 — packed sampling params (temps, top_ks, top_ps, min_ps, randoms).
+    sampling_packed: PinnedBuf,
+}
+
+impl HostStaging {
+    /// Allocate pinned staging buffers for up to `max_batch` decode requests.
+    ///
+    /// # Safety
+    /// Requires active CUDA context.
+    unsafe fn new(max_batch: usize) -> anyhow::Result<Self> {
+        Ok(Self {
+            input_ids: unsafe { PinnedBuf::new(max_batch * 4)? },
+            positions: unsafe { PinnedBuf::new(max_batch * 4)? },
+            slot_mapping: unsafe { PinnedBuf::new(max_batch * 8)? },
+            cu_seqlens_q: unsafe { PinnedBuf::new((max_batch + 1) * 4)? },
+            cu_seqlens_k: unsafe { PinnedBuf::new((max_batch + 1) * 4)? },
+            block_table: unsafe { PinnedBuf::new(max_batch * GRAPH_MAX_BLOCKS_PER_SEQ * 4)? },
+            host_token_ids: unsafe { PinnedBuf::new(max_batch * 4)? },
+            sampling_packed: unsafe { PinnedBuf::new(max_batch * 5 * 4)? },
+        })
+    }
+
+    /// Fill block_table pinned buffer from attention metadata block_ids.
+    /// Returns a slice of the pinned buffer with `graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ` elements.
+    unsafe fn fill_block_table<'a>(
+        &'a self,
+        block_ids: &[Vec<usize>],
+        graph_bs: usize,
+    ) -> &'a [u32] {
+        let n = graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ;
+        let bt = unsafe { self.block_table.slice_mut::<u32>(n) };
+        bt.fill(0);
+        for (i, blocks) in block_ids.iter().enumerate() {
+            for (j, &bid) in blocks.iter().enumerate() {
+                if j < GRAPH_MAX_BLOCKS_PER_SEQ {
+                    bt[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
+                }
+            }
+        }
+        &bt[..n]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CudaWorker
 // ---------------------------------------------------------------------------
 
@@ -318,6 +386,10 @@ pub struct CudaWorker {
     /// of building Vecs on CPU and doing H2D copies.
     graph_metadata_valid: bool,
 
+    /// Pre-allocated pinned host staging buffers for graph replay.
+    /// Initialized after graph capture in `compile_or_warm_up_model`.
+    host_staging: Option<HostStaging>,
+
     // Per-request state (mirrors CandleWorker).
     token_buffers: HashMap<String, Vec<u32>>,
     sampling_params_map: HashMap<String, SamplingParams>,
@@ -344,6 +416,7 @@ impl CudaWorker {
             prefill_graph_runner: None,
             last_graph_batch_size: None,
             graph_metadata_valid: false,
+            host_staging: None,
             token_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
             input_batch: InputBatch::new(),
@@ -567,6 +640,43 @@ impl CudaWorker {
             }
         };
         Ok(f32_vec)
+    }
+
+    /// D2H copy token IDs using pinned staging if available.
+    fn d2h_token_ids_pinned(
+        staging: Option<&HostStaging>,
+        gpu_tensor: &GpuTensor,
+        num_reqs: usize,
+        device: &mut GpuDevice,
+    ) -> ExecutorResult<Vec<u32>> {
+        if let Some(stg) = staging {
+            unsafe {
+                driver::memcpy_dtoh_async(
+                    stg.host_token_ids.ptr(),
+                    gpu_tensor.raw_ptr() as *const u8,
+                    num_reqs * 4,
+                    device.compute_stream,
+                )
+            }
+            .map_err(|e| ExecutorError::WorkerExecution(format!("D2H token ids: {e}")))?;
+            unsafe { driver::stream_synchronize(device.compute_stream) }
+                .map_err(|e| ExecutorError::WorkerExecution(format!("sync: {e}")))?;
+            Ok(unsafe { stg.host_token_ids.slice::<u32>(num_reqs) }.to_vec())
+        } else {
+            let mut ids = vec![0u32; num_reqs];
+            unsafe {
+                driver::memcpy_dtoh_async(
+                    ids.as_mut_ptr() as *mut u8,
+                    gpu_tensor.raw_ptr() as *const u8,
+                    num_reqs * 4,
+                    device.compute_stream,
+                )
+            }
+            .map_err(|e| ExecutorError::WorkerExecution(format!("D2H token ids: {e}")))?;
+            unsafe { driver::stream_synchronize(device.compute_stream) }
+                .map_err(|e| ExecutorError::WorkerExecution(format!("sync: {e}")))?;
+            Ok(ids)
+        }
     }
 }
 
@@ -870,6 +980,7 @@ impl Worker for CudaWorker {
             // kernel launch — argmax + D2D scatter are captured in the graph.
             let graph_bs = graph_bs.unwrap();
             let meta = &prepared.attn_meta;
+            let staging = self.host_staging.as_ref();
 
             let replay_out =
                 if self.graph_metadata_valid && self.last_graph_batch_size == Some(graph_bs) {
@@ -878,15 +989,9 @@ impl Worker for CudaWorker {
                     // H2D-copied when blocks changed. input_ids were scattered by the
                     // previous graph replay's in-graph argmax.
                     let new_bt = if blocks_changed {
-                        let mut block_table = vec![0u32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
-                        for (i, blocks) in meta.block_ids.iter().enumerate() {
-                            for (j, &bid) in blocks.iter().enumerate() {
-                                if j < GRAPH_MAX_BLOCKS_PER_SEQ {
-                                    block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
-                                }
-                            }
-                        }
-                        Some(block_table)
+                        let bt =
+                            unsafe { staging.unwrap().fill_block_table(&meta.block_ids, graph_bs) };
+                        Some(bt)
                     } else {
                         None
                     };
@@ -894,19 +999,75 @@ impl Worker for CudaWorker {
                     let runner = self.graph_runner.as_ref().unwrap();
                     unsafe {
                         runner.replay_decode_fast(
-                            graph_bs,
-                            None, // input_ids already scattered by previous graph
-                            new_bt.as_deref(),
-                            block_size,
-                            device,
+                            graph_bs, None, // input_ids already scattered by previous graph
+                            new_bt, block_size, device,
                         )
                     }
                     .map_err(|e| {
                         ExecutorError::WorkerExecution(format!("graph replay_decode_fast: {e}"))
                     })?
-                } else {
+                } else if let Some(stg) = staging {
                     // First step for this batch or batch composition changed:
-                    // full H2D of all metadata to initialize persistent buffers.
+                    // full H2D of all metadata via pinned staging buffers.
+                    unsafe {
+                        let ids = stg.input_ids.slice_mut::<u32>(graph_bs);
+                        ids[..num_reqs].copy_from_slice(&prepared.flat_token_ids);
+                        ids[num_reqs..].fill(0);
+
+                        let pos = stg.positions.slice_mut::<u32>(graph_bs);
+                        pos[..num_reqs].copy_from_slice(&prepared.flat_positions);
+                        pos[num_reqs..].fill(0);
+
+                        let cu_q = stg.cu_seqlens_q.slice_mut::<u32>(graph_bs + 1);
+                        for (i, v) in cu_q[..=num_reqs].iter_mut().enumerate() {
+                            *v = i as u32;
+                        }
+                        cu_q[(num_reqs + 1)..].fill(num_reqs as u32);
+
+                        let cu_k = stg.cu_seqlens_k.slice_mut::<u32>(graph_bs + 1);
+                        cu_k[0] = 0;
+                        let mut cum = 0u32;
+                        for (i, &sl) in meta.seq_lens.iter().enumerate() {
+                            cum += sl as u32;
+                            cu_k[i + 1] = cum;
+                        }
+                        cu_k[(num_reqs + 1)..].fill(cum);
+
+                        let sm = stg.slot_mapping.slice_mut::<i64>(graph_bs);
+                        for (i, slot) in sm[..num_reqs].iter_mut().enumerate() {
+                            let abs_pos = meta.tokens_before[i];
+                            let block_idx = abs_pos / block_size;
+                            let offset = abs_pos % block_size;
+                            let block_ids = &meta.block_ids[i];
+                            if block_idx < block_ids.len() {
+                                *slot = (block_ids[block_idx] * block_size + offset) as i64;
+                            } else {
+                                *slot = -1i64;
+                            }
+                        }
+                        sm[num_reqs..].fill(-1i64);
+
+                        let bt = stg.fill_block_table(&meta.block_ids, graph_bs);
+
+                        let skip_input_ids =
+                            self.last_graph_batch_size == Some(graph_bs) && num_reqs == graph_bs;
+
+                        let runner = self.graph_runner.as_ref().unwrap();
+                        runner.replay(
+                            graph_bs,
+                            stg.input_ids.slice::<u32>(graph_bs),
+                            stg.positions.slice::<u32>(graph_bs),
+                            stg.slot_mapping.slice::<i64>(graph_bs),
+                            stg.cu_seqlens_q.slice::<u32>(graph_bs + 1),
+                            stg.cu_seqlens_k.slice::<u32>(graph_bs + 1),
+                            bt,
+                            device,
+                            skip_input_ids,
+                        )
+                    }
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
+                } else {
+                    // Fallback: no pinned staging (shouldn't happen but safe).
                     let mut input_ids = prepared.flat_token_ids.clone();
                     input_ids.resize(graph_bs, 0);
                     let mut positions = prepared.flat_positions.clone();
@@ -971,19 +1132,13 @@ impl Worker for CudaWorker {
                     .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
                 };
 
-            // D2H the argmax token IDs (only num_reqs × 4 bytes — skip padded slots).
-            let mut host_ids = vec![0u32; num_reqs];
-            unsafe {
-                driver::memcpy_dtoh_async(
-                    host_ids.as_mut_ptr() as *mut u8,
-                    replay_out.token_ids.raw_ptr() as *const u8,
-                    num_reqs * 4,
-                    device.compute_stream,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("D2H token ids: {e}")))?;
-            unsafe { driver::stream_synchronize(device.compute_stream) }
-                .map_err(|e| ExecutorError::WorkerExecution(format!("sync: {e}")))?;
+            // D2H the argmax token IDs via pinned staging.
+            let host_ids = Self::d2h_token_ids_pinned(
+                self.host_staging.as_ref(),
+                &replay_out.token_ids,
+                num_reqs,
+                device,
+            )?;
 
             // Record that graph buffers now have valid metadata for next step.
             self.last_graph_batch_size = Some(graph_bs);
@@ -1012,35 +1167,40 @@ impl Worker for CudaWorker {
             // discarded; we re-sample with temperature on the logits).
             let graph_bs = graph_bs.unwrap();
             let meta = &prepared.attn_meta;
+            let staging = self.host_staging.as_ref();
 
             let replay_out =
                 if self.graph_metadata_valid && self.last_graph_batch_size == Some(graph_bs) {
                     // Fast path: GPU-side metadata update (same as greedy).
                     // Only input_ids must be H2D'd (no in-graph argmax scatter for non-greedy).
                     let new_bt = if blocks_changed {
-                        let mut block_table = vec![0u32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
-                        for (i, blocks) in meta.block_ids.iter().enumerate() {
-                            for (j, &bid) in blocks.iter().enumerate() {
-                                if j < GRAPH_MAX_BLOCKS_PER_SEQ {
-                                    block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
-                                }
-                            }
-                        }
-                        Some(block_table)
+                        let bt =
+                            unsafe { staging.unwrap().fill_block_table(&meta.block_ids, graph_bs) };
+                        Some(bt)
                     } else {
                         None
                     };
 
                     // Must H2D input_ids since non-greedy doesn't use in-graph argmax scatter.
-                    let mut input_ids = prepared.flat_token_ids.clone();
-                    input_ids.resize(graph_bs, 0);
+                    let input_ids_slice = if let Some(stg) = staging {
+                        unsafe {
+                            let ids = stg.input_ids.slice_mut::<u32>(graph_bs);
+                            ids[..num_reqs].copy_from_slice(&prepared.flat_token_ids);
+                            ids[num_reqs..].fill(0);
+                            stg.input_ids.slice::<u32>(graph_bs)
+                        }
+                    } else {
+                        let mut ids = prepared.flat_token_ids.clone();
+                        ids.resize(graph_bs, 0);
+                        ids.leak()
+                    };
 
                     let runner = self.graph_runner.as_ref().unwrap();
                     unsafe {
                         runner.replay_decode_fast(
                             graph_bs,
-                            Some(&input_ids),
-                            new_bt.as_deref(),
+                            Some(input_ids_slice),
+                            new_bt,
                             block_size,
                             device,
                         )
@@ -1048,8 +1208,64 @@ impl Worker for CudaWorker {
                     .map_err(|e| {
                         ExecutorError::WorkerExecution(format!("graph replay_decode_fast: {e}"))
                     })?
+                } else if let Some(stg) = staging {
+                    // First step or batch composition changed: full H2D via pinned staging.
+                    unsafe {
+                        let ids = stg.input_ids.slice_mut::<u32>(graph_bs);
+                        ids[..num_reqs].copy_from_slice(&prepared.flat_token_ids);
+                        ids[num_reqs..].fill(0);
+
+                        let pos = stg.positions.slice_mut::<u32>(graph_bs);
+                        pos[..num_reqs].copy_from_slice(&prepared.flat_positions);
+                        pos[num_reqs..].fill(0);
+
+                        let cu_q = stg.cu_seqlens_q.slice_mut::<u32>(graph_bs + 1);
+                        for (i, v) in cu_q[..=num_reqs].iter_mut().enumerate() {
+                            *v = i as u32;
+                        }
+                        cu_q[(num_reqs + 1)..].fill(num_reqs as u32);
+
+                        let cu_k = stg.cu_seqlens_k.slice_mut::<u32>(graph_bs + 1);
+                        cu_k[0] = 0;
+                        let mut cum = 0u32;
+                        for (i, &sl) in meta.seq_lens.iter().enumerate() {
+                            cum += sl as u32;
+                            cu_k[i + 1] = cum;
+                        }
+                        cu_k[(num_reqs + 1)..].fill(cum);
+
+                        let sm = stg.slot_mapping.slice_mut::<i64>(graph_bs);
+                        for (i, slot) in sm[..num_reqs].iter_mut().enumerate() {
+                            let abs_pos = meta.tokens_before[i];
+                            let block_idx = abs_pos / block_size;
+                            let offset = abs_pos % block_size;
+                            let block_ids = &meta.block_ids[i];
+                            if block_idx < block_ids.len() {
+                                *slot = (block_ids[block_idx] * block_size + offset) as i64;
+                            } else {
+                                *slot = -1i64;
+                            }
+                        }
+                        sm[num_reqs..].fill(-1i64);
+
+                        let bt = stg.fill_block_table(&meta.block_ids, graph_bs);
+
+                        let runner = self.graph_runner.as_ref().unwrap();
+                        runner.replay(
+                            graph_bs,
+                            stg.input_ids.slice::<u32>(graph_bs),
+                            stg.positions.slice::<u32>(graph_bs),
+                            stg.slot_mapping.slice::<i64>(graph_bs),
+                            stg.cu_seqlens_q.slice::<u32>(graph_bs + 1),
+                            stg.cu_seqlens_k.slice::<u32>(graph_bs + 1),
+                            bt,
+                            device,
+                            false,
+                        )
+                    }
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
                 } else {
-                    // First step or batch composition changed: full H2D.
+                    // Fallback: no pinned staging.
                     let mut input_ids = prepared.flat_token_ids.clone();
                     input_ids.resize(graph_bs, 0);
                     let mut positions = prepared.flat_positions.clone();
@@ -1248,21 +1464,27 @@ impl Worker for CudaWorker {
 
         if all_gpu_sampleable && !all_greedy {
             // GPU sampling fast path: batched top-k/top-p/min-p on device.
-            // Pack all 5 param arrays into a single contiguous H2D copy to
-            // minimize driver overhead (1 copy instead of 5).
+            // Pack all 5 param arrays into pinned staging for true async H2D.
             use rand::Rng;
             let mut rng = rand::thread_rng();
 
-            // Layout: [temps(N×f32), top_ks(N×i32), top_ps(N×f32), min_ps(N×f32), randoms(N×f32)]
             let stride = num_reqs * 4; // bytes per array
             let total_bytes = stride * 5;
-            let mut packed = vec![0u8; total_bytes];
 
-            let temps_ptr = packed.as_mut_ptr() as *mut f32;
-            let top_ks_ptr = unsafe { packed.as_mut_ptr().add(stride) as *mut i32 };
-            let top_ps_ptr = unsafe { packed.as_mut_ptr().add(stride * 2) as *mut f32 };
-            let min_ps_ptr = unsafe { packed.as_mut_ptr().add(stride * 3) as *mut f32 };
-            let randoms_ptr = unsafe { packed.as_mut_ptr().add(stride * 4) as *mut f32 };
+            // Use pinned staging buffer if available, else heap.
+            let packed_ptr = if let Some(stg) = &self.host_staging {
+                debug_assert!(total_bytes <= stg.sampling_packed.capacity_bytes());
+                stg.sampling_packed.ptr()
+            } else {
+                // Fallback: pageable (rare).
+                vec![0u8; total_bytes].leak().as_mut_ptr()
+            };
+
+            let temps_ptr = packed_ptr as *mut f32;
+            let top_ks_ptr = unsafe { packed_ptr.add(stride) as *mut i32 };
+            let top_ps_ptr = unsafe { packed_ptr.add(stride * 2) as *mut f32 };
+            let min_ps_ptr = unsafe { packed_ptr.add(stride * 3) as *mut f32 };
+            let randoms_ptr = unsafe { packed_ptr.add(stride * 4) as *mut f32 };
 
             for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
                 let params = self.sampling_params_map.get(&req_slice.req_id);
@@ -1283,12 +1505,12 @@ impl Worker for CudaWorker {
                 }
             }
 
-            // Single H2D copy for all sampling params.
+            // Single H2D copy for all sampling params from pinned memory.
             let gpu_packed = device.arena.alloc(&[total_bytes / 4], GpuDType::F32);
             unsafe {
                 driver::memcpy_htod_async(
                     gpu_packed.raw_ptr(),
-                    packed.as_ptr(),
+                    packed_ptr,
                     total_bytes,
                     device.compute_stream,
                 )
@@ -1320,18 +1542,13 @@ impl Worker for CudaWorker {
                 )
             };
 
-            let mut host_ids = vec![0u32; num_reqs];
-            unsafe {
-                driver::memcpy_dtoh_async(
-                    host_ids.as_mut_ptr() as *mut u8,
-                    token_ids_gpu.raw_ptr() as *const u8,
-                    num_reqs * 4,
-                    device.compute_stream,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("D2H token ids: {e}")))?;
-            unsafe { driver::stream_synchronize(device.compute_stream) }
-                .map_err(|e| ExecutorError::WorkerExecution(format!("sync: {e}")))?;
+            // D2H token IDs into pinned buffer.
+            let host_ids = Self::d2h_token_ids_pinned(
+                self.host_staging.as_ref(),
+                &token_ids_gpu,
+                num_reqs,
+                device,
+            )?;
 
             for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
                 let sampled = vec![host_ids[req_idx]];
@@ -1352,18 +1569,14 @@ impl Worker for CudaWorker {
                 vllm_cuda::kernels::argmax_batched(logits, &mut device.arena, device.compute_stream)
             };
             let num_reqs = prepared.req_inputs.len();
-            let mut host_ids = vec![0u32; num_reqs];
-            unsafe {
-                driver::memcpy_dtoh_async(
-                    host_ids.as_mut_ptr() as *mut u8,
-                    token_ids_gpu.raw_ptr() as *const u8,
-                    num_reqs * 4,
-                    device.compute_stream,
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("D2H token ids: {e}")))?;
-            unsafe { driver::stream_synchronize(device.compute_stream) }
-                .map_err(|e| ExecutorError::WorkerExecution(format!("sync: {e}")))?;
+
+            // D2H token IDs into pinned buffer.
+            let host_ids = Self::d2h_token_ids_pinned(
+                self.host_staging.as_ref(),
+                &token_ids_gpu,
+                num_reqs,
+                device,
+            )?;
 
             for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
                 let sampled = vec![host_ids[req_idx]];
@@ -1571,6 +1784,20 @@ impl Worker for CudaWorker {
                 "CUDA graphs captured for batch sizes: {:?}",
                 runner.captured_sizes()
             );
+            // Allocate pinned host staging buffers sized for the largest captured graph.
+            let staging_max_bs = *runner.captured_sizes().last().unwrap();
+            match unsafe { HostStaging::new(staging_max_bs) } {
+                Ok(staging) => {
+                    info!(
+                        "Pinned host staging allocated for max_batch={}",
+                        staging_max_bs
+                    );
+                    self.host_staging = Some(staging);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to allocate pinned staging: {e}");
+                }
+            }
             self.graph_runner = Some(runner);
         }
 

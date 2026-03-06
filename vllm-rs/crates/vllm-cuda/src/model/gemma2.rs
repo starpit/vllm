@@ -249,25 +249,16 @@ impl Gemma2Attention {
             .qkv_proj
             .forward(hidden_states, &device.cublas, &mut device.arena);
 
-        let (q, k, v) = kernels::split_qkv(
+        let (q, k, v) = kernels::fused_qkv_rope(
             qkv,
+            positions,
+            rotary.cos_sin_cache,
             self.q_size,
             self.kv_size,
             self.num_q_heads,
             self.num_kv_heads,
             self.head_dim,
             &mut device.arena,
-            device.compute_stream,
-        );
-
-        let q_flat = q.reshape(&[num_tokens, self.q_size]);
-        let k_flat = k.reshape(&[num_tokens, self.kv_size]);
-        kernels::rotary_embedding_inplace(
-            q_flat,
-            k_flat,
-            positions,
-            rotary.cos_sin_cache,
-            self.head_dim,
             device.compute_stream,
         );
 

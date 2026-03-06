@@ -180,6 +180,7 @@ impl RmsNorm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DType;
 
     #[test]
     fn test_linear_dimensions() {
@@ -225,6 +226,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     mod cuda_tests {
         use super::*;
+        use crate::DType;
         use crate::driver;
 
         fn init_cuda() -> cudarc::driver::sys::CUstream {

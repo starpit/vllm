@@ -133,10 +133,195 @@ __global__ void rotary_embedding_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Fused QKV split + RoPE kernel
+//
+// Reads from the fused QKV GEMM output [num_tokens, total_dim], applies
+// RoPE to Q and K, and writes contiguous Q, K, V outputs.
+// Replaces separate split_qkv + rotary_embedding kernels (saves 1 launch).
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void fused_qkv_rope_kernel(
+    T* __restrict__ q_out,                   // [num_tokens, q_size]
+    T* __restrict__ k_out,                   // [num_tokens, kv_size]
+    T* __restrict__ v_out,                   // [num_tokens, kv_size]
+    const T* __restrict__ qkv,               // [num_tokens, total_dim]
+    const uint32_t* __restrict__ positions,  // [num_tokens]
+    const T* __restrict__ cos_sin_cache,     // [max_pos, rotary_dim]
+    int q_size,                              // = num_q_heads * head_size
+    int kv_size,                             // = num_kv_heads * head_size
+    int total_dim,                           // = q_size + 2 * kv_size
+    int rotary_dim,                          // = 2 * half_rot
+    int head_size)
+{
+    constexpr int VEC = VecType<T>::SIZE;
+
+    const int token_idx = blockIdx.x;
+    const int pos = static_cast<int>(positions[token_idx]);
+    const int half_rot = rotary_dim / 2;
+    const T* cos_ptr = cos_sin_cache + pos * rotary_dim;
+    const T* sin_ptr = cos_ptr + half_rot;
+    const int half = (half_rot < head_size / 2) ? half_rot : (head_size / 2);
+    const int half_vecs = half / VEC;
+    const int half_tail = half_vecs * VEC;
+
+    const T* row = qkv + token_idx * total_dim;
+    T* q = q_out + token_idx * q_size;
+    T* k = k_out + token_idx * kv_size;
+    T* v = v_out + token_idx * kv_size;
+
+    const int nqh = q_size / head_size;
+    const int nkh = kv_size / head_size;
+    const int rot_dim_full = 2 * half;  // actual rotary portion per head
+    const int non_rot = head_size - rot_dim_full;
+
+    // --- Q heads: read from QKV, apply RoPE, write contiguous ---
+    // Vectorized rotary pairs.
+    for (int tid = threadIdx.x; tid < nqh * half_vecs; tid += blockDim.x) {
+        const int h = tid / half_vecs;
+        const int vi = tid % half_vecs;
+        const int b = h * head_size + vi * VEC;
+
+        float xbuf[VEC], ybuf[VEC], cbuf[VEC], sbuf[VEC];
+        unpack_vec<T>(vec_load(&row[b]), xbuf);
+        unpack_vec<T>(vec_load(&row[b + half]), ybuf);
+        unpack_vec<T>(vec_load(&cos_ptr[vi * VEC]), cbuf);
+        unpack_vec<T>(vec_load(&sin_ptr[vi * VEC]), sbuf);
+
+        float ox[VEC], oy[VEC];
+        #pragma unroll
+        for (int j = 0; j < VEC; j++) {
+            ox[j] = xbuf[j] * cbuf[j] - ybuf[j] * sbuf[j];
+            oy[j] = ybuf[j] * cbuf[j] + xbuf[j] * sbuf[j];
+        }
+        vec_store(&q[b], pack_vec<T>(ox));
+        vec_store(&q[b + half], pack_vec<T>(oy));
+    }
+
+    // Scalar tail for remaining rotary pairs.
+    for (int tid = threadIdx.x; tid < nqh * (half - half_tail); tid += blockDim.x) {
+        const int h = tid / (half - half_tail);
+        const int r = half_tail + tid % (half - half_tail);
+        const int b = h * head_size;
+
+        float x = static_cast<float>(row[b + r]);
+        float y = static_cast<float>(row[b + r + half]);
+        float c = static_cast<float>(cos_ptr[r]);
+        float s = static_cast<float>(sin_ptr[r]);
+
+        q[b + r]        = static_cast<T>(x * c - y * s);
+        q[b + r + half] = static_cast<T>(y * c + x * s);
+    }
+
+    // Copy non-rotary elements (when head_size > rotary_dim).
+    for (int tid = threadIdx.x; tid < nqh * non_rot; tid += blockDim.x) {
+        const int h = tid / non_rot;
+        const int i = rot_dim_full + tid % non_rot;
+        q[h * head_size + i] = row[h * head_size + i];
+    }
+
+    // --- K heads: read from QKV + q_size offset, apply RoPE, write contiguous ---
+    const T* k_row = row + q_size;
+
+    for (int tid = threadIdx.x; tid < nkh * half_vecs; tid += blockDim.x) {
+        const int h = tid / half_vecs;
+        const int vi = tid % half_vecs;
+        const int b = h * head_size + vi * VEC;
+
+        float xbuf[VEC], ybuf[VEC], cbuf[VEC], sbuf[VEC];
+        unpack_vec<T>(vec_load(&k_row[b]), xbuf);
+        unpack_vec<T>(vec_load(&k_row[b + half]), ybuf);
+        unpack_vec<T>(vec_load(&cos_ptr[vi * VEC]), cbuf);
+        unpack_vec<T>(vec_load(&sin_ptr[vi * VEC]), sbuf);
+
+        float ox[VEC], oy[VEC];
+        #pragma unroll
+        for (int j = 0; j < VEC; j++) {
+            ox[j] = xbuf[j] * cbuf[j] - ybuf[j] * sbuf[j];
+            oy[j] = ybuf[j] * cbuf[j] + xbuf[j] * sbuf[j];
+        }
+        vec_store(&k[b], pack_vec<T>(ox));
+        vec_store(&k[b + half], pack_vec<T>(oy));
+    }
+
+    for (int tid = threadIdx.x; tid < nkh * (half - half_tail); tid += blockDim.x) {
+        const int h = tid / (half - half_tail);
+        const int r = half_tail + tid % (half - half_tail);
+        const int b = h * head_size;
+
+        float x = static_cast<float>(k_row[b + r]);
+        float y = static_cast<float>(k_row[b + r + half]);
+        float c = static_cast<float>(cos_ptr[r]);
+        float s = static_cast<float>(sin_ptr[r]);
+
+        k[b + r]        = static_cast<T>(x * c - y * s);
+        k[b + r + half] = static_cast<T>(y * c + x * s);
+    }
+
+    for (int tid = threadIdx.x; tid < nkh * non_rot; tid += blockDim.x) {
+        const int h = tid / non_rot;
+        const int i = rot_dim_full + tid % non_rot;
+        k[h * head_size + i] = k_row[h * head_size + i];
+    }
+
+    // --- V: straight copy from QKV + q_size + kv_size offset (vectorized) ---
+    const T* v_row = row + q_size + kv_size;
+    const int v_vecs = kv_size / VEC;
+
+    for (int tid = threadIdx.x; tid < v_vecs; tid += blockDim.x) {
+        vec_store(&v[tid * VEC], vec_load(&v_row[tid * VEC]));
+    }
+    // Scalar tail for V.
+    for (int tid = threadIdx.x; tid < kv_size - v_vecs * VEC; tid += blockDim.x) {
+        v[v_vecs * VEC + tid] = v_row[v_vecs * VEC + tid];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // C entry points
 // ---------------------------------------------------------------------------
 
+#define LAUNCH_FUSED_QKV_ROPE(T)                                               \
+    do {                                                                        \
+        int half = rotary_dim / 2;                                             \
+        int nqh = q_size / head_size;                                          \
+        int work = nqh * half;                                                 \
+        int threads = (work < 512) ? work : 512;                               \
+        if (threads < 1) threads = 1;                                          \
+        fused_qkv_rope_kernel<T><<<num_tokens, threads, 0, stream>>>(          \
+            (T*)q_out, (T*)k_out, (T*)v_out, (const T*)qkv,                   \
+            (const uint32_t*)positions, (const T*)cos_sin_cache,               \
+            q_size, kv_size, total_dim, rotary_dim, head_size);                \
+    } while (0)
+
 extern "C" {
+
+void fused_qkv_rope_f32(
+    void* q_out, void* k_out, void* v_out, const void* qkv,
+    const void* positions, const void* cos_sin_cache,
+    int q_size, int kv_size, int total_dim, int rotary_dim,
+    int head_size, int num_tokens, cudaStream_t stream)
+{
+    LAUNCH_FUSED_QKV_ROPE(float);
+}
+
+void fused_qkv_rope_f16(
+    void* q_out, void* k_out, void* v_out, const void* qkv,
+    const void* positions, const void* cos_sin_cache,
+    int q_size, int kv_size, int total_dim, int rotary_dim,
+    int head_size, int num_tokens, cudaStream_t stream)
+{
+    LAUNCH_FUSED_QKV_ROPE(__half);
+}
+
+void fused_qkv_rope_bf16(
+    void* q_out, void* k_out, void* v_out, const void* qkv,
+    const void* positions, const void* cos_sin_cache,
+    int q_size, int kv_size, int total_dim, int rotary_dim,
+    int head_size, int num_tokens, cudaStream_t stream)
+{
+    LAUNCH_FUSED_QKV_ROPE(__nv_bfloat16);
+}
 
 void rotary_embedding_f32(
     const uint32_t* positions, float* query, float* key,

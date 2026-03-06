@@ -220,6 +220,53 @@ unsafe extern "C" {
         num_tokens: i32,
         stream: CUstream,
     );
+
+    // Fused QKV split + RoPE (replaces split_qkv + rotary_embedding)
+    fn fused_qkv_rope_f16(
+        q: *mut u16,
+        k: *mut u16,
+        v: *mut u16,
+        qkv: *const u16,
+        positions: *const u32,
+        cos_sin_cache: *const u16,
+        q_size: i32,
+        kv_size: i32,
+        total_dim: i32,
+        rotary_dim: i32,
+        head_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+    fn fused_qkv_rope_bf16(
+        q: *mut u16,
+        k: *mut u16,
+        v: *mut u16,
+        qkv: *const u16,
+        positions: *const u32,
+        cos_sin_cache: *const u16,
+        q_size: i32,
+        kv_size: i32,
+        total_dim: i32,
+        rotary_dim: i32,
+        head_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+    fn fused_qkv_rope_f32(
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        qkv: *const f32,
+        positions: *const u32,
+        cos_sin_cache: *const f32,
+        q_size: i32,
+        kv_size: i32,
+        total_dim: i32,
+        rotary_dim: i32,
+        head_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1045,90 @@ pub unsafe fn split_qkv(
             stream,
         ),
         _ => panic!("split_qkv: unsupported dtype {:?}", qkv.dtype()),
+    }
+
+    (q, k, v)
+}
+
+/// Fused QKV split + RoPE: reads from the fused QKV GEMM output, applies
+/// rotary position embedding to Q and K, copies V, and writes contiguous
+/// outputs. Replaces separate `split_qkv` + `rotary_embedding_inplace` calls,
+/// saving 1 kernel launch per layer per step.
+///
+/// * `qkv`: `[num_tokens, q_size + 2*kv_size]` — fused QKV GEMM output
+/// * `positions`: `[num_tokens]` u32
+/// * `cos_sin_cache`: `[max_pos, rotary_dim]`
+/// * Returns: `(q, k, v)` where q is `[num_tokens, num_q_heads, head_dim]`,
+///   k and v are `[num_tokens, num_kv_heads, head_dim]`.
+pub unsafe fn fused_qkv_rope(
+    qkv: GpuTensor,
+    positions: GpuTensor,
+    cos_sin_cache: GpuTensor,
+    q_size: usize,
+    kv_size: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    arena: &mut ScratchArena,
+    stream: CUstream,
+) -> (GpuTensor, GpuTensor, GpuTensor) {
+    let num_tokens = qkv.dim(0);
+    let total_dim = qkv.dim(1);
+    let rotary_dim = cos_sin_cache.dim(1) as i32;
+
+    debug_assert_eq!(total_dim, q_size + 2 * kv_size);
+
+    let q = arena.alloc(&[num_tokens, num_q_heads, head_dim], qkv.dtype());
+    let k = arena.alloc(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
+    let v = arena.alloc(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
+
+    match qkv.dtype() {
+        DType::F16 => fused_qkv_rope_f16(
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            v.as_mut_ptr(),
+            qkv.as_ptr(),
+            positions.as_ptr(),
+            cos_sin_cache.as_ptr(),
+            q_size as i32,
+            kv_size as i32,
+            total_dim as i32,
+            rotary_dim,
+            head_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        DType::BF16 => fused_qkv_rope_bf16(
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            v.as_mut_ptr(),
+            qkv.as_ptr(),
+            positions.as_ptr(),
+            cos_sin_cache.as_ptr(),
+            q_size as i32,
+            kv_size as i32,
+            total_dim as i32,
+            rotary_dim,
+            head_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        DType::F32 => fused_qkv_rope_f32(
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            v.as_mut_ptr(),
+            qkv.as_ptr(),
+            positions.as_ptr(),
+            cos_sin_cache.as_ptr(),
+            q_size as i32,
+            kv_size as i32,
+            total_dim as i32,
+            rotary_dim,
+            head_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        _ => panic!("fused_qkv_rope: unsupported dtype {:?}", qkv.dtype()),
     }
 
     (q, k, v)

@@ -208,26 +208,6 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
         return Ok((Box::new(worker), hf_config, model_dir, model_dtype));
     }
 
-    // Try wgpu backend when explicitly requested.
-    #[cfg(feature = "wgpu")]
-    if config.device == "wgpu" {
-        info!("Using WebGPU backend");
-        let mut worker = vllm_wgpu::worker_impl::WgpuBackendWorker::new(model_path);
-        worker
-            .init_device()
-            .context("failed to initialize wgpu device")?;
-        worker.load_model().context("failed to load wgpu model")?;
-
-        let hf_config = worker
-            .hf_config()
-            .context("model config not available after wgpu load")?
-            .clone();
-        let model_dir = worker.model_dir().map(|p| p.to_path_buf());
-        let model_dtype = DType::F16;
-
-        return Ok((Box::new(worker), hf_config, model_dir, model_dtype));
-    }
-
     // Try the purpose-built CUDA backend when feature is enabled and device is CUDA.
     #[cfg(feature = "cuda-backend")]
     if config.device.starts_with("cuda") || config.device == "auto" {
@@ -801,7 +781,7 @@ fn initialize_stack_tp(
                 (nccl_id, node_rank * local_tp + local_idx, tp_size);
             let barrier = download_barrier.clone();
 
-            std::thread::spawn(move || -> Result<CandleWorker> {
+            std::thread::spawn(move || -> Result<(CandleWorker, Option<Arc<dyn vllm_model::process_group::ProcessGroup>>)> {
                 let mut worker = CandleWorker::new(cfg);
                 worker.init_device().context("init_device failed")?;
 
@@ -817,7 +797,7 @@ fn initialize_stack_tp(
 
                 // Create NCCL comm on this thread (correct CUDA context).
                 #[cfg(feature = "nccl")]
-                {
+                let nccl_group = {
                     use vllm_kernels::nccl::NcclProcessGroup;
 
                     let device = worker
@@ -829,22 +809,30 @@ fn initialize_stack_tp(
                     let group: std::sync::Arc<dyn vllm_model::process_group::ProcessGroup> =
                         std::sync::Arc::new(group);
                     worker
-                        .inject_tp_group(group)
+                        .inject_tp_group(group.clone())
                         .context("inject_tp_group failed")?;
-                }
+                    Some(group)
+                };
+                #[cfg(not(feature = "nccl"))]
+                let nccl_group: Option<std::sync::Arc<dyn vllm_model::process_group::ProcessGroup>> = None;
 
-                Ok(worker)
+                Ok((worker, nccl_group))
             })
         })
         .collect();
 
     let mut workers: Vec<CandleWorker> = Vec::with_capacity(local_tp);
+    let mut process_groups: Vec<Arc<dyn vllm_model::process_group::ProcessGroup>> = Vec::new();
     for (rank, handle) in handles.into_iter().enumerate() {
-        let worker = handle
+        let (worker, pg) = handle
             .join()
             .map_err(|_| anyhow::anyhow!("worker thread {rank} panicked"))?
             .with_context(|| format!("worker {rank} init failed"))?;
         workers.push(worker);
+        if let Some(pg) = pg {
+            process_groups.push(pg);
+        }
+        let _ = rank;
     }
 
     #[cfg(feature = "nccl")]
@@ -889,24 +877,34 @@ fn initialize_stack_tp(
         .collect();
 
     let parallel_config = ResolvedParallelConfig::tensor_parallel(tp_size, 0);
-    let mut executor = ThreadPoolExecutor::new(all_workers, parallel_config);
+    let pgs = if process_groups.is_empty() {
+        None
+    } else {
+        Some(process_groups)
+    };
+    let executor = ThreadPoolExecutor::with_process_groups(all_workers, parallel_config, pgs);
 
     // Headless worker mode: node_rank > 0 enters a blocking loop receiving
-    // SchedulerOutput from the master node. Never returns (until shutdown).
+    // SchedulerOutput from rank 0 via NCCL broadcast.
     if num_nodes > 1 && node_rank > 0 {
-        let control_port = config.master_port + 1;
-        info!(
-            "Node rank {}: entering headless worker mode (control port {})",
-            node_rank, control_port
-        );
-        crate::headless::run_headless(executor, &config.master_addr, control_port)?;
+        info!("Node rank {}: entering headless worker mode (NCCL broadcast)", node_rank);
+        crate::headless::run_headless(executor)?;
         // run_headless only returns on shutdown — exit cleanly.
         std::process::exit(0);
     }
 
+    use vllm_engine::executor::Executor;
+
+    // Multi-node master: wrap executor to broadcast SchedulerOutput via NCCL.
+    let mut executor: Box<dyn Executor> = if num_nodes > 1 && node_rank == 0 {
+        let mn = MultiNodeExecutor::new(executor);
+        Box::new(mn)
+    } else {
+        Box::new(executor)
+    };
+
     // Determine available memory via executor (dispatches to worker tasks,
     // which run on the correct CUDA context).
-    use vllm_engine::executor::Executor;
     let memories = executor
         .determine_available_memory()
         .context("failed to determine available memory")?;
@@ -992,17 +990,7 @@ fn initialize_stack_tp(
         enable_prefix_caching: config.enable_prefix_caching,
     };
 
-    // Multi-node master: wrap executor to broadcast SchedulerOutput to remotes.
-    let boxed_executor: Box<dyn Executor> = if num_nodes > 1 && node_rank == 0 {
-        let control_port = config.master_port + 1;
-        let mn = MultiNodeExecutor::accept_remotes(executor, control_port, num_nodes - 1)
-            .context("failed to accept remote nodes")?;
-        Box::new(mn)
-    } else {
-        Box::new(executor)
-    };
-
-    let client = Box::new(InprocClient::new(engine_config, boxed_executor));
+    let client = Box::new(InprocClient::new(engine_config, executor));
 
     // Load tokenizer from model directory.
     let loaded_tokenizer = preloaded_tokenizer

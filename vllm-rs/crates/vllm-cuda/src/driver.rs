@@ -347,11 +347,7 @@ mod tests {
 
             // Verify roundtrip.
             for i in 0..256 {
-                assert_eq!(
-                    *host_dst.add(i),
-                    i as u8,
-                    "mismatch at byte {i}"
-                );
+                assert_eq!(*host_dst.add(i), i as u8, "mismatch at byte {i}");
             }
 
             mem_free_host(host_src).expect("free src");
@@ -517,9 +513,7 @@ mod tests {
         let _ctx = init_cuda();
         unsafe {
             // Create 4 streams — verify they're all distinct.
-            let streams: Vec<CUstream> = (0..4)
-                .map(|_| stream_create().expect("stream"))
-                .collect();
+            let streams: Vec<CUstream> = (0..4).map(|_| stream_create().expect("stream")).collect();
 
             for i in 0..streams.len() {
                 for j in (i + 1)..streams.len() {

@@ -221,11 +221,7 @@ mod tests {
             // Verify.
             let cpu = buf.cpu_slice::<u32>(128);
             for (i, v) in cpu.iter().enumerate() {
-                assert_eq!(
-                    *v,
-                    (i * 7 + 13) as u32,
-                    "mismatch at index {i}"
-                );
+                assert_eq!(*v, (i * 7 + 13) as u32, "mismatch at index {i}");
             }
 
             driver::stream_destroy(stream).unwrap();

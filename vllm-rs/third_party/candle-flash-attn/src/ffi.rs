@@ -103,6 +103,7 @@ extern "C" {
         block_table_batch_stride: i64,
         page_block_size: c_int,
         num_splits: c_int,
+        cuda_stream: *mut c_void,
     );
 
 }

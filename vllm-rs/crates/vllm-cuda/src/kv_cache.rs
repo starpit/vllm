@@ -65,8 +65,7 @@ impl KvCachePool {
             v_ptrs.push(v_ptr);
         }
 
-        let total_mb =
-            (2 * num_layers * bytes_per_layer) as f64 / (1024.0 * 1024.0);
+        let total_mb = (2 * num_layers * bytes_per_layer) as f64 / (1024.0 * 1024.0);
         tracing::info!(
             "KvCachePool: {num_layers} layers × {num_blocks} blocks × {block_size} slots = {total_mb:.0} MB"
         );

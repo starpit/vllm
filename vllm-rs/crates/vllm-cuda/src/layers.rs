@@ -7,8 +7,8 @@
 
 use anyhow::Result;
 
-use crate::cublas::CublasHandle;
 use crate::arena::ScratchArena;
+use crate::cublas::CublasHandle;
 use crate::dtype::DType;
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
@@ -23,7 +23,7 @@ use crate::weights::GpuWeights;
 /// cuBLAS GEMM handles the transpose internally via `CUBLAS_OP_T`, which is
 /// more efficient than a separate transpose copy.
 pub struct Linear {
-    pub weight: GpuTensor, // [out_features, in_features]
+    pub weight: GpuTensor,       // [out_features, in_features]
     pub bias: Option<GpuTensor>, // [out_features]
 }
 
@@ -249,12 +249,24 @@ mod tests {
             let b_bytes: Vec<u8> = bias_data.iter().flat_map(|f| f.to_le_bytes()).collect();
 
             let tensors = vec![
-                ("proj.weight", safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32, vec![2, 4], &w_bytes,
-                ).unwrap()),
-                ("proj.bias", safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32, vec![2], &b_bytes,
-                ).unwrap()),
+                (
+                    "proj.weight",
+                    safetensors::tensor::TensorView::new(
+                        safetensors::Dtype::F32,
+                        vec![2, 4],
+                        &w_bytes,
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "proj.bias",
+                    safetensors::tensor::TensorView::new(
+                        safetensors::Dtype::F32,
+                        vec![2],
+                        &b_bytes,
+                    )
+                    .unwrap(),
+                ),
             ];
             safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
@@ -289,8 +301,9 @@ mod tests {
 
                 // Input [4, 3] = [[1,2,3],[4,5,6],[7,8,9],[10,11,12]]
                 let host_x = driver::mem_alloc_host(48).unwrap();
-                std::slice::from_raw_parts_mut(host_x as *mut f32, 12)
-                    .copy_from_slice(&[1.0,2.0,3.0, 4.0,5.0,6.0, 7.0,8.0,9.0, 10.0,11.0,12.0]);
+                std::slice::from_raw_parts_mut(host_x as *mut f32, 12).copy_from_slice(&[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ]);
                 let gpu_x = driver::mem_alloc(48).unwrap();
                 driver::memcpy_htod_async(gpu_x, host_x, 48, stream).unwrap();
                 let x = GpuTensor::new(gpu_x, &[4, 3], DType::F32);
@@ -330,11 +343,11 @@ mod tests {
 
             let data: Vec<f32> = vec![1.0; 128];
             let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            let tensors = vec![
-                ("norm.weight", safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32, vec![128], &bytes,
-                ).unwrap()),
-            ];
+            let tensors = vec![(
+                "norm.weight",
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![128], &bytes)
+                    .unwrap(),
+            )];
             safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
             let stream = init_cuda();
@@ -355,11 +368,15 @@ mod tests {
 
             let data: Vec<f32> = vec![0.0; 100 * 32]; // [100, 32]
             let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            let tensors = vec![
-                ("embed.weight", safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32, vec![100, 32], &bytes,
-                ).unwrap()),
-            ];
+            let tensors = vec![(
+                "embed.weight",
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F32,
+                    vec![100, 32],
+                    &bytes,
+                )
+                .unwrap(),
+            )];
             safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
             let stream = init_cuda();

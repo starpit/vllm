@@ -117,6 +117,7 @@ mod cuda_ffi {
             total_k_dim: i32,
             head_size: i32,
             num_tokens: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn rotary_embedding_f16(
             positions: *const u32,
@@ -128,6 +129,7 @@ mod cuda_ffi {
             total_k_dim: i32,
             head_size: i32,
             num_tokens: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn rotary_embedding_bf16(
             positions: *const u32,
@@ -139,6 +141,7 @@ mod cuda_ffi {
             total_k_dim: i32,
             head_size: i32,
             num_tokens: i32,
+            stream: *mut std::ffi::c_void,
         );
     }
 }
@@ -224,6 +227,7 @@ impl RotaryKernels for CudaRotaryKernels {
                         total_k_dim as i32,
                         head_size as i32,
                         num_tokens as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -243,6 +247,7 @@ impl RotaryKernels for CudaRotaryKernels {
                         total_k_dim as i32,
                         head_size as i32,
                         num_tokens as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -262,6 +267,7 @@ impl RotaryKernels for CudaRotaryKernels {
                         total_k_dim as i32,
                         head_size as i32,
                         num_tokens as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -286,8 +292,8 @@ impl RotaryKernels for CudaRotaryKernels {
 #[cfg(feature = "cuda")]
 mod fused_rope {
     use candle_core::backend::BackendStorage;
-    use candle_core::cuda_backend::CudaDType;
     use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+    use candle_core::cuda_backend::CudaDType;
     use candle_core::{CpuStorage, CudaStorage, CustomOp2, DType, Layout, Result, Shape, Tensor};
 
     /// Fused RoPE CustomOp — rotates a single tensor (Q or K) in-place on the
@@ -372,6 +378,7 @@ mod fused_rope {
                             0,
                             self.head_size as i32,
                             num_tokens as i32,
+                            std::ptr::null_mut(),
                         );
                     }
                     DType::F16 => {
@@ -385,6 +392,7 @@ mod fused_rope {
                             0,
                             self.head_size as i32,
                             num_tokens as i32,
+                            std::ptr::null_mut(),
                         );
                     }
                     DType::BF16 => {
@@ -398,6 +406,7 @@ mod fused_rope {
                             0,
                             self.head_size as i32,
                             num_tokens as i32,
+                            std::ptr::null_mut(),
                         );
                     }
                     dt => candle_core::bail!("fused RoPE unsupported dtype {dt:?}"),
@@ -478,8 +487,8 @@ mod fused_rope {
         head_size: usize,
     ) -> candle_core::Result<(Tensor, Tensor)> {
         use candle_core::backend::BackendStorage;
-        use candle_core::cuda_backend::CudaDType;
         use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        use candle_core::cuda_backend::CudaDType;
 
         fn fwd_t<T: CudaDType + cudarc::driver::DeviceRepr>(
             q: &Tensor,
@@ -575,6 +584,7 @@ mod fused_rope {
                             total_k_dim as i32,
                             head_size as i32,
                             num_tokens as i32,
+                            std::ptr::null_mut(),
                         );
                     }
                     candle_core::DType::F16 => {
@@ -588,6 +598,7 @@ mod fused_rope {
                             total_k_dim as i32,
                             head_size as i32,
                             num_tokens as i32,
+                            std::ptr::null_mut(),
                         );
                     }
                     candle_core::DType::BF16 => {
@@ -601,6 +612,7 @@ mod fused_rope {
                             total_k_dim as i32,
                             head_size as i32,
                             num_tokens as i32,
+                            std::ptr::null_mut(),
                         );
                     }
                     dt => candle_core::bail!("fused RoPE QK unsupported dtype {dt:?}"),

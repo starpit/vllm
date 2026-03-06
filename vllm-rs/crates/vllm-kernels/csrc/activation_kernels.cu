@@ -86,26 +86,26 @@ extern "C" {
 
 void silu_and_mul_f32(
     float* out, const float* gate, const float* up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_kernel<silu, float><<<num_tokens, threads>>>(out, gate, up, d);
+    act_and_mul_kernel<silu, float><<<num_tokens, threads, 0, stream>>>(out, gate, up, d);
 }
 
 void silu_and_mul_f16(
     __half* out, const __half* gate, const __half* up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_kernel<silu, __half><<<num_tokens, threads>>>(out, gate, up, d);
+    act_and_mul_kernel<silu, __half><<<num_tokens, threads, 0, stream>>>(out, gate, up, d);
 }
 
 void silu_and_mul_bf16(
     __nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_kernel<silu, __nv_bfloat16><<<num_tokens, threads>>>(out, gate, up, d);
+    act_and_mul_kernel<silu, __nv_bfloat16><<<num_tokens, threads, 0, stream>>>(out, gate, up, d);
 }
 
 // ---------------------------------------------------------------------------
@@ -114,26 +114,26 @@ void silu_and_mul_bf16(
 
 void gelu_and_mul_f32(
     float* out, const float* gate, const float* up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_kernel<gelu_tanh, float><<<num_tokens, threads>>>(out, gate, up, d);
+    act_and_mul_kernel<gelu_tanh, float><<<num_tokens, threads, 0, stream>>>(out, gate, up, d);
 }
 
 void gelu_and_mul_f16(
     __half* out, const __half* gate, const __half* up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_kernel<gelu_tanh, __half><<<num_tokens, threads>>>(out, gate, up, d);
+    act_and_mul_kernel<gelu_tanh, __half><<<num_tokens, threads, 0, stream>>>(out, gate, up, d);
 }
 
 void gelu_and_mul_bf16(
     __nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_kernel<gelu_tanh, __nv_bfloat16><<<num_tokens, threads>>>(out, gate, up, d);
+    act_and_mul_kernel<gelu_tanh, __nv_bfloat16><<<num_tokens, threads, 0, stream>>>(out, gate, up, d);
 }
 
 // ---------------------------------------------------------------------------
@@ -142,26 +142,26 @@ void gelu_and_mul_bf16(
 
 void gelu_new_and_mul_f32(
     float* out, const float* gate, const float* up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_kernel<gelu_erf, float><<<num_tokens, threads>>>(out, gate, up, d);
+    act_and_mul_kernel<gelu_erf, float><<<num_tokens, threads, 0, stream>>>(out, gate, up, d);
 }
 
 void gelu_new_and_mul_f16(
     __half* out, const __half* gate, const __half* up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_kernel<gelu_erf, __half><<<num_tokens, threads>>>(out, gate, up, d);
+    act_and_mul_kernel<gelu_erf, __half><<<num_tokens, threads, 0, stream>>>(out, gate, up, d);
 }
 
 void gelu_new_and_mul_bf16(
     __nv_bfloat16* out, const __nv_bfloat16* gate, const __nv_bfloat16* up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_kernel<gelu_erf, __nv_bfloat16><<<num_tokens, threads>>>(out, gate, up, d);
+    act_and_mul_kernel<gelu_erf, __nv_bfloat16><<<num_tokens, threads, 0, stream>>>(out, gate, up, d);
 }
 
 } // extern "C"
@@ -211,51 +211,51 @@ extern "C" {
 // C entry points: silu_and_mul_fused (takes [num_tokens, 2*d])
 void silu_and_mul_fused_f32(
     float* out, const float* gate_up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_fused_kernel<silu, float><<<num_tokens, threads>>>(out, gate_up, d);
+    act_and_mul_fused_kernel<silu, float><<<num_tokens, threads, 0, stream>>>(out, gate_up, d);
 }
 
 void silu_and_mul_fused_f16(
     __half* out, const __half* gate_up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_fused_kernel<silu, __half><<<num_tokens, threads>>>(out, gate_up, d);
+    act_and_mul_fused_kernel<silu, __half><<<num_tokens, threads, 0, stream>>>(out, gate_up, d);
 }
 
 void silu_and_mul_fused_bf16(
     __nv_bfloat16* out, const __nv_bfloat16* gate_up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_fused_kernel<silu, __nv_bfloat16><<<num_tokens, threads>>>(out, gate_up, d);
+    act_and_mul_fused_kernel<silu, __nv_bfloat16><<<num_tokens, threads, 0, stream>>>(out, gate_up, d);
 }
 
 // C entry points: gelu_and_mul_fused (takes [num_tokens, 2*d])
 void gelu_and_mul_fused_f32(
     float* out, const float* gate_up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_fused_kernel<gelu_tanh, float><<<num_tokens, threads>>>(out, gate_up, d);
+    act_and_mul_fused_kernel<gelu_tanh, float><<<num_tokens, threads, 0, stream>>>(out, gate_up, d);
 }
 
 void gelu_and_mul_fused_f16(
     __half* out, const __half* gate_up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_fused_kernel<gelu_tanh, __half><<<num_tokens, threads>>>(out, gate_up, d);
+    act_and_mul_fused_kernel<gelu_tanh, __half><<<num_tokens, threads, 0, stream>>>(out, gate_up, d);
 }
 
 void gelu_and_mul_fused_bf16(
     __nv_bfloat16* out, const __nv_bfloat16* gate_up,
-    int num_tokens, int d)
+    int num_tokens, int d, cudaStream_t stream)
 {
     int threads = (d < 1024) ? d : 1024;
-    act_and_mul_fused_kernel<gelu_tanh, __nv_bfloat16><<<num_tokens, threads>>>(out, gate_up, d);
+    act_and_mul_fused_kernel<gelu_tanh, __nv_bfloat16><<<num_tokens, threads, 0, stream>>>(out, gate_up, d);
 }
 
 } // extern "C"

@@ -80,11 +80,12 @@ void reshape_and_cache_f32(
     const float* key, const float* value,
     float* key_cache, float* value_cache,
     const int64_t* slot_mapping,
-    int num_tokens, int num_heads, int head_dim, int block_size)
+    int num_tokens, int num_heads, int head_dim, int block_size,
+    cudaStream_t stream)
 {
     int n_elems = num_heads * head_dim;
     int threads = (n_elems < 1024) ? n_elems : 1024;
-    reshape_and_cache_kernel<float><<<num_tokens, threads>>>(
+    reshape_and_cache_kernel<float><<<num_tokens, threads, 0, stream>>>(
         key, value, key_cache, value_cache, slot_mapping,
         num_heads, head_dim, block_size);
 }
@@ -93,11 +94,12 @@ void reshape_and_cache_f16(
     const __half* key, const __half* value,
     __half* key_cache, __half* value_cache,
     const int64_t* slot_mapping,
-    int num_tokens, int num_heads, int head_dim, int block_size)
+    int num_tokens, int num_heads, int head_dim, int block_size,
+    cudaStream_t stream)
 {
     int n_elems = num_heads * head_dim;
     int threads = (n_elems < 1024) ? n_elems : 1024;
-    reshape_and_cache_kernel<__half><<<num_tokens, threads>>>(
+    reshape_and_cache_kernel<__half><<<num_tokens, threads, 0, stream>>>(
         key, value, key_cache, value_cache, slot_mapping,
         num_heads, head_dim, block_size);
 }
@@ -106,11 +108,12 @@ void reshape_and_cache_bf16(
     const __nv_bfloat16* key, const __nv_bfloat16* value,
     __nv_bfloat16* key_cache, __nv_bfloat16* value_cache,
     const int64_t* slot_mapping,
-    int num_tokens, int num_heads, int head_dim, int block_size)
+    int num_tokens, int num_heads, int head_dim, int block_size,
+    cudaStream_t stream)
 {
     int n_elems = num_heads * head_dim;
     int threads = (n_elems < 1024) ? n_elems : 1024;
-    reshape_and_cache_kernel<__nv_bfloat16><<<num_tokens, threads>>>(
+    reshape_and_cache_kernel<__nv_bfloat16><<<num_tokens, threads, 0, stream>>>(
         key, value, key_cache, value_cache, slot_mapping,
         num_heads, head_dim, block_size);
 }

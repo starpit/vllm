@@ -8,7 +8,7 @@ description = "Purpose-built CUDA tensor runtime for LLM inference — replaces 
 [features]
 default = []
 # Enable CUDA runtime. Requires CUDA toolkit + nvcc.
-cuda = ["dep:cudarc", "cc", "bindgen_cuda", "candle-flash-attn-build"]
+cuda = ["dep:cudarc", "cc", "bindgen_cuda", "candle-flash-attn-build", "vllm-kernels/cuda"]
 
 [dependencies]
 cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
@@ -18,6 +18,7 @@ memmap2 = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+vllm-kernels = { workspace = true, optional = true }
 
 [build-dependencies]
 cc = { version = "1", optional = true }

@@ -142,14 +142,14 @@ void rotary_embedding_f32(
     const uint32_t* positions, float* query, float* key,
     const float* cos_sin_cache,
     int rotary_dim, int total_q_dim, int total_k_dim,
-    int head_size, int num_tokens)
+    int head_size, int num_tokens, cudaStream_t stream)
 {
     int half = rotary_dim / 2;
     int num_q_heads = total_q_dim / head_size;
     int work = num_q_heads * half;
     int threads = (work < 512) ? work : 512;
     if (threads < 1) threads = 1;
-    rotary_embedding_kernel<float><<<num_tokens, threads>>>(
+    rotary_embedding_kernel<float><<<num_tokens, threads, 0, stream>>>(
         positions, query, key, cos_sin_cache,
         rotary_dim, total_q_dim, total_k_dim, head_size);
 }
@@ -158,14 +158,14 @@ void rotary_embedding_f16(
     const uint32_t* positions, __half* query, __half* key,
     const __half* cos_sin_cache,
     int rotary_dim, int total_q_dim, int total_k_dim,
-    int head_size, int num_tokens)
+    int head_size, int num_tokens, cudaStream_t stream)
 {
     int half = rotary_dim / 2;
     int num_q_heads = total_q_dim / head_size;
     int work = num_q_heads * half;
     int threads = (work < 512) ? work : 512;
     if (threads < 1) threads = 1;
-    rotary_embedding_kernel<__half><<<num_tokens, threads>>>(
+    rotary_embedding_kernel<__half><<<num_tokens, threads, 0, stream>>>(
         positions, query, key, cos_sin_cache,
         rotary_dim, total_q_dim, total_k_dim, head_size);
 }
@@ -174,14 +174,14 @@ void rotary_embedding_bf16(
     const uint32_t* positions, __nv_bfloat16* query, __nv_bfloat16* key,
     const __nv_bfloat16* cos_sin_cache,
     int rotary_dim, int total_q_dim, int total_k_dim,
-    int head_size, int num_tokens)
+    int head_size, int num_tokens, cudaStream_t stream)
 {
     int half = rotary_dim / 2;
     int num_q_heads = total_q_dim / head_size;
     int work = num_q_heads * half;
     int threads = (work < 512) ? work : 512;
     if (threads < 1) threads = 1;
-    rotary_embedding_kernel<__nv_bfloat16><<<num_tokens, threads>>>(
+    rotary_embedding_kernel<__nv_bfloat16><<<num_tokens, threads, 0, stream>>>(
         positions, query, key, cos_sin_cache,
         rotary_dim, total_q_dim, total_k_dim, head_size);
 }

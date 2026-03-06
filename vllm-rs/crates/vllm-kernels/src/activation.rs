@@ -70,6 +70,7 @@ mod cuda_ffi {
             up: *const f32,
             num_tokens: i32,
             d: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn silu_and_mul_f16(
             out: *mut u16,
@@ -77,6 +78,7 @@ mod cuda_ffi {
             up: *const u16,
             num_tokens: i32,
             d: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn silu_and_mul_bf16(
             out: *mut u16,
@@ -84,6 +86,7 @@ mod cuda_ffi {
             up: *const u16,
             num_tokens: i32,
             d: i32,
+            stream: *mut std::ffi::c_void,
         );
         // GELU (tanh approx) + mul
         pub fn gelu_and_mul_f32(
@@ -92,6 +95,7 @@ mod cuda_ffi {
             up: *const f32,
             num_tokens: i32,
             d: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn gelu_and_mul_f16(
             out: *mut u16,
@@ -99,6 +103,7 @@ mod cuda_ffi {
             up: *const u16,
             num_tokens: i32,
             d: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn gelu_and_mul_bf16(
             out: *mut u16,
@@ -106,6 +111,7 @@ mod cuda_ffi {
             up: *const u16,
             num_tokens: i32,
             d: i32,
+            stream: *mut std::ffi::c_void,
         );
         // GELU (exact/erf) + mul
         pub fn gelu_new_and_mul_f32(
@@ -114,6 +120,7 @@ mod cuda_ffi {
             up: *const f32,
             num_tokens: i32,
             d: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn gelu_new_and_mul_f16(
             out: *mut u16,
@@ -121,6 +128,7 @@ mod cuda_ffi {
             up: *const u16,
             num_tokens: i32,
             d: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn gelu_new_and_mul_bf16(
             out: *mut u16,
@@ -128,14 +136,51 @@ mod cuda_ffi {
             up: *const u16,
             num_tokens: i32,
             d: i32,
+            stream: *mut std::ffi::c_void,
         );
         // Fused variants: take combined [num_tokens, 2*d] gate_up tensor
-        pub fn silu_and_mul_fused_f32(out: *mut f32, gate_up: *const f32, num_tokens: i32, d: i32);
-        pub fn silu_and_mul_fused_f16(out: *mut u16, gate_up: *const u16, num_tokens: i32, d: i32);
-        pub fn silu_and_mul_fused_bf16(out: *mut u16, gate_up: *const u16, num_tokens: i32, d: i32);
-        pub fn gelu_and_mul_fused_f32(out: *mut f32, gate_up: *const f32, num_tokens: i32, d: i32);
-        pub fn gelu_and_mul_fused_f16(out: *mut u16, gate_up: *const u16, num_tokens: i32, d: i32);
-        pub fn gelu_and_mul_fused_bf16(out: *mut u16, gate_up: *const u16, num_tokens: i32, d: i32);
+        pub fn silu_and_mul_fused_f32(
+            out: *mut f32,
+            gate_up: *const f32,
+            num_tokens: i32,
+            d: i32,
+            stream: *mut std::ffi::c_void,
+        );
+        pub fn silu_and_mul_fused_f16(
+            out: *mut u16,
+            gate_up: *const u16,
+            num_tokens: i32,
+            d: i32,
+            stream: *mut std::ffi::c_void,
+        );
+        pub fn silu_and_mul_fused_bf16(
+            out: *mut u16,
+            gate_up: *const u16,
+            num_tokens: i32,
+            d: i32,
+            stream: *mut std::ffi::c_void,
+        );
+        pub fn gelu_and_mul_fused_f32(
+            out: *mut f32,
+            gate_up: *const f32,
+            num_tokens: i32,
+            d: i32,
+            stream: *mut std::ffi::c_void,
+        );
+        pub fn gelu_and_mul_fused_f16(
+            out: *mut u16,
+            gate_up: *const u16,
+            num_tokens: i32,
+            d: i32,
+            stream: *mut std::ffi::c_void,
+        );
+        pub fn gelu_and_mul_fused_bf16(
+            out: *mut u16,
+            gate_up: *const u16,
+            num_tokens: i32,
+            d: i32,
+            stream: *mut std::ffi::c_void,
+        );
     }
 }
 
@@ -213,6 +258,7 @@ impl ActivationKernels for CudaActivationKernels {
                         u as *const f32,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -227,6 +273,7 @@ impl ActivationKernels for CudaActivationKernels {
                         u as *const u16,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -241,6 +288,7 @@ impl ActivationKernels for CudaActivationKernels {
                         u as *const u16,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -266,6 +314,7 @@ impl ActivationKernels for CudaActivationKernels {
                         u as *const f32,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -280,6 +329,7 @@ impl ActivationKernels for CudaActivationKernels {
                         u as *const u16,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -294,6 +344,7 @@ impl ActivationKernels for CudaActivationKernels {
                         u as *const u16,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -319,6 +370,7 @@ impl ActivationKernels for CudaActivationKernels {
                         u as *const f32,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -333,6 +385,7 @@ impl ActivationKernels for CudaActivationKernels {
                         u as *const u16,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -347,6 +400,7 @@ impl ActivationKernels for CudaActivationKernels {
                         u as *const u16,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -410,12 +464,14 @@ fn fused_act_and_mul(gate_up: &Tensor, d: usize, act: &str) -> KernelResult<Tens
                         gu as *const f32,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     ),
                     _ => cuda_ffi::gelu_and_mul_fused_f32(
                         o as *mut f32,
                         gu as *const f32,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     ),
                 }
             }
@@ -430,12 +486,14 @@ fn fused_act_and_mul(gate_up: &Tensor, d: usize, act: &str) -> KernelResult<Tens
                         gu as *const u16,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     ),
                     _ => cuda_ffi::gelu_and_mul_fused_f16(
                         o as *mut u16,
                         gu as *const u16,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     ),
                 }
             }
@@ -450,12 +508,14 @@ fn fused_act_and_mul(gate_up: &Tensor, d: usize, act: &str) -> KernelResult<Tens
                         gu as *const u16,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     ),
                     _ => cuda_ffi::gelu_and_mul_fused_bf16(
                         o as *mut u16,
                         gu as *const u16,
                         num_tokens as i32,
                         d as i32,
+                        std::ptr::null_mut(),
                     ),
                 }
             }

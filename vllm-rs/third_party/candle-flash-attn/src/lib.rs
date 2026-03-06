@@ -1194,6 +1194,7 @@ impl FlashAttnPagedVarLen {
                 /* block_table_batch_stride */ block_table_batch_stride,
                 /* page_block_size */ self.page_block_size as i32,
                 /* num_splits */ self.num_splits as i32,
+                /* cuda_stream */ std::ptr::null_mut(),
             )
         }
 

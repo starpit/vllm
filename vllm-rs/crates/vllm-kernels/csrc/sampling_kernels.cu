@@ -475,10 +475,11 @@ void sample_batched_f32(
     const int* top_ks,
     const float* top_ps,
     const float* min_ps,
-    const float* uniform_randoms)
+    const float* uniform_randoms,
+    cudaStream_t stream)
 {
     if (batch_size > 0) {
-        sample_top_k_top_p_batched_kernel<float><<<batch_size, SAMPLING_BLOCK_SIZE>>>(
+        sample_top_k_top_p_batched_kernel<float><<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
             output, logits, vocab_size,
             temperatures, top_ks, top_ps, min_ps, uniform_randoms);
     }
@@ -493,10 +494,11 @@ void sample_batched_f16(
     const int* top_ks,
     const float* top_ps,
     const float* min_ps,
-    const float* uniform_randoms)
+    const float* uniform_randoms,
+    cudaStream_t stream)
 {
     if (batch_size > 0) {
-        sample_top_k_top_p_batched_kernel<__half><<<batch_size, SAMPLING_BLOCK_SIZE>>>(
+        sample_top_k_top_p_batched_kernel<__half><<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
             output, reinterpret_cast<const __half*>(logits), vocab_size,
             temperatures, top_ks, top_ps, min_ps, uniform_randoms);
     }
@@ -511,13 +513,98 @@ void sample_batched_bf16(
     const int* top_ks,
     const float* top_ps,
     const float* min_ps,
-    const float* uniform_randoms)
+    const float* uniform_randoms,
+    cudaStream_t stream)
 {
     if (batch_size > 0) {
-        sample_top_k_top_p_batched_kernel<__nv_bfloat16><<<batch_size, SAMPLING_BLOCK_SIZE>>>(
+        sample_top_k_top_p_batched_kernel<__nv_bfloat16><<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
             output, reinterpret_cast<const __nv_bfloat16*>(logits), vocab_size,
             temperatures, top_ks, top_ps, min_ps, uniform_randoms);
     }
+}
+
+}  // extern "C" (close before templates)
+
+// ---------------------------------------------------------------------------
+// Batched argmax: one thread block per row, writes u32 token ID.
+// Much cheaper than the full sampling kernel for greedy decoding.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void argmax_kernel(
+    uint32_t* __restrict__ output,
+    const T* __restrict__ logits,
+    int vocab_size)
+{
+    int bid = blockIdx.x;
+    const T* row = logits + bid * vocab_size;
+
+    __shared__ float s_warp_buf[NUM_WARPS];
+    __shared__ int s_warp_idx_buf[NUM_WARPS];
+
+    int tid = threadIdx.x;
+    float best_val = -INFINITY;
+    int best_idx = 0;
+    for (int i = tid; i < vocab_size; i += SAMPLING_BLOCK_SIZE) {
+        float val = to_float(row[i]);
+        if (val > best_val) {
+            best_val = val;
+            best_idx = i;
+        }
+    }
+
+    // Warp reduce max with index.
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
+        int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
+        if (other_val > best_val) {
+            best_val = other_val;
+            best_idx = other_idx;
+        }
+    }
+
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    if (lane_id == 0) {
+        s_warp_buf[warp_id] = best_val;
+        s_warp_idx_buf[warp_id] = best_idx;
+    }
+    __syncthreads();
+
+    if (tid < WARP_SIZE) {
+        best_val = (tid < NUM_WARPS) ? s_warp_buf[tid] : -INFINITY;
+        best_idx = (tid < NUM_WARPS) ? s_warp_idx_buf[tid] : 0;
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
+            int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
+            if (other_val > best_val) {
+                best_val = other_val;
+                best_idx = other_idx;
+            }
+        }
+        if (tid == 0) {
+            output[bid] = (uint32_t)best_idx;
+        }
+    }
+}
+
+extern "C" {
+
+void argmax_batched_f32(uint32_t* output, const float* logits, int vocab_size, int batch_size, cudaStream_t stream) {
+    if (batch_size > 0)
+        argmax_kernel<float><<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(output, logits, vocab_size);
+}
+
+void argmax_batched_f16(uint32_t* output, const uint16_t* logits, int vocab_size, int batch_size, cudaStream_t stream) {
+    if (batch_size > 0)
+        argmax_kernel<__half><<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(output, reinterpret_cast<const __half*>(logits), vocab_size);
+}
+
+void argmax_batched_bf16(uint32_t* output, const uint16_t* logits, int vocab_size, int batch_size, cudaStream_t stream) {
+    if (batch_size > 0)
+        argmax_kernel<__nv_bfloat16><<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(output, reinterpret_cast<const __nv_bfloat16*>(logits), vocab_size);
 }
 
 }  // extern "C"

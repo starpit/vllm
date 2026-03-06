@@ -12,8 +12,8 @@ use crate::tensor::GpuTensor;
 use anyhow::Result;
 use cudarc::driver::sys::{CUcontext, CUevent, CUstream};
 
-/// Initial scratch arena size (64 MB — grows during warmup if needed).
-const INITIAL_ARENA_SIZE: usize = 64 * 1024 * 1024;
+/// Initial scratch arena size (512 MB — grows during warmup if needed).
+const INITIAL_ARENA_SIZE: usize = 512 * 1024 * 1024;
 
 /// The GPU device runtime. Owns streams, cuBLAS handle, and scratch arena.
 ///
@@ -117,12 +117,7 @@ impl GpuDevice {
     }
 
     /// Async D2D copy on compute stream.
-    pub unsafe fn copy_dtod(
-        &self,
-        dst: *mut u8,
-        src: *const u8,
-        bytes: usize,
-    ) -> Result<()> {
+    pub unsafe fn copy_dtod(&self, dst: *mut u8, src: *const u8, bytes: usize) -> Result<()> {
         driver::memcpy_dtod_async(dst, src, bytes, self.compute_stream)
     }
 
@@ -139,7 +134,9 @@ impl Drop for GpuDevice {
             // CublasHandle is dropped automatically.
             let _ = driver::event_destroy(self.transfer_done);
             let _ = driver::stream_destroy(self.transfer_stream);
-            let _ = driver::stream_destroy(self.compute_stream);
+            if !self.compute_stream.is_null() {
+                let _ = driver::stream_destroy(self.compute_stream);
+            }
             // Don't destroy context here — it may be shared.
             // cuCtxDestroy happens when the process exits.
         }
@@ -157,8 +154,7 @@ mod tests {
         assert!(!dev.compute_stream.is_null());
         assert!(!dev.transfer_stream.is_null());
         assert_ne!(
-            dev.compute_stream as usize,
-            dev.transfer_stream as usize,
+            dev.compute_stream as usize, dev.transfer_stream as usize,
             "compute and transfer streams should differ"
         );
         drop(dev);

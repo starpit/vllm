@@ -14,8 +14,8 @@
 
 use anyhow::Result;
 
-use crate::cublas::CublasHandle;
 use crate::arena::ScratchArena;
+use crate::cublas::CublasHandle;
 use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kernels;
@@ -112,7 +112,10 @@ unsafe fn add_one_to_weight(
                 *v = half::bf16::from_f32(v.to_f32() + 1.0);
             }
         }
-        _ => anyhow::bail!("unsupported dtype for GemmaRmsNorm weight offset: {:?}", dtype),
+        _ => anyhow::bail!(
+            "unsupported dtype for GemmaRmsNorm weight offset: {:?}",
+            dtype
+        ),
     }
 
     crate::driver::memcpy_htod_async(weight.raw_ptr(), host, nbytes, device.compute_stream)?;
@@ -151,9 +154,17 @@ impl Gemma2MLP {
     }
 
     pub unsafe fn forward(&self, x: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
-        let gate_up = self.gate_up_proj.forward(x, &device.cublas, &mut device.arena);
-        let activated = kernels::gelu_and_mul_fused(gate_up, self.intermediate_size, &mut device.arena);
-        self.down_proj.forward(activated, &device.cublas, &mut device.arena)
+        let gate_up = self
+            .gate_up_proj
+            .forward(x, &device.cublas, &mut device.arena);
+        let activated = kernels::gelu_and_mul_fused(
+            gate_up,
+            self.intermediate_size,
+            &mut device.arena,
+            device.compute_stream,
+        );
+        self.down_proj
+            .forward(activated, &device.cublas, &mut device.arena)
     }
 }
 
@@ -167,8 +178,8 @@ pub struct Gemma2Attention {
     q_size: usize,
     kv_size: usize,
     num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
     scale: f32,
     attn_logit_softcapping: f32,
     sliding_window: Option<usize>,
@@ -198,7 +209,11 @@ impl Gemma2Attention {
 
         let o_proj = Linear::load(weights, &format!("{prefix}.o_proj"))?;
 
-        let sliding_window = if is_sliding { config.sliding_window } else { None };
+        let sliding_window = if is_sliding {
+            config.sliding_window
+        } else {
+            None
+        };
 
         Ok(Self {
             qkv_proj,
@@ -232,24 +247,40 @@ impl Gemma2Attention {
     ) -> GpuTensor {
         let num_tokens = hidden_states.dim(0);
 
-        let qkv = self.qkv_proj.forward(hidden_states, &device.cublas, &mut device.arena);
+        let qkv = self
+            .qkv_proj
+            .forward(hidden_states, &device.cublas, &mut device.arena);
 
         let (q, k, v) = kernels::split_qkv(
-            qkv, self.q_size, self.kv_size,
-            self.num_q_heads, self.num_kv_heads, self.head_dim,
-            &mut device.arena, device.compute_stream,
+            qkv,
+            self.q_size,
+            self.kv_size,
+            self.num_q_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            &mut device.arena,
+            device.compute_stream,
         );
 
         let q_flat = q.reshape(&[num_tokens, self.q_size]);
         let k_flat = k.reshape(&[num_tokens, self.kv_size]);
-        kernels::rotary_embedding_inplace(q_flat, k_flat, positions, rotary.cos_sin_cache, self.head_dim);
+        kernels::rotary_embedding_inplace(
+            q_flat,
+            k_flat,
+            positions,
+            rotary.cos_sin_cache,
+            self.head_dim,
+            device.compute_stream,
+        );
 
         kernels::reshape_and_cache(
-            k, v,
+            k,
+            v,
             kv_cache.k_cache(self.layer_idx),
             kv_cache.v_cache(self.layer_idx),
             slot_mapping,
             kv_cache.block_size,
+            device.compute_stream,
         );
 
         let window_left = self.sliding_window.map(|w| w as i32).unwrap_or(-1);
@@ -258,18 +289,23 @@ impl Gemma2Attention {
             q,
             kv_cache.k_cache(self.layer_idx),
             kv_cache.v_cache(self.layer_idx),
-            cu_seqlens_q, cu_seqlens_k, block_table,
-            max_seqlen_q, max_seqlen_k,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
             self.scale,
             true, // causal
             self.attn_logit_softcapping,
             window_left,
             kv_cache.block_size,
             &mut device.arena,
+            device.compute_stream,
         );
 
         let attn_flat = attn_output.reshape(&[num_tokens, self.q_size]);
-        self.o_proj.forward(attn_flat, &device.cublas, &mut device.arena)
+        self.o_proj
+            .forward(attn_flat, &device.cublas, &mut device.arena)
     }
 }
 
@@ -278,7 +314,7 @@ impl Gemma2Attention {
 // ---------------------------------------------------------------------------
 
 pub struct Gemma2DecoderLayer {
-    self_attn: Gemma2Attention,
+    pub self_attn: Gemma2Attention,
     mlp: Gemma2MLP,
     input_layernorm: GemmaRmsNorm,
     post_attention_layernorm: GemmaRmsNorm,
@@ -297,29 +333,54 @@ impl Gemma2DecoderLayer {
         device: &GpuDevice,
     ) -> Result<Self> {
         let self_attn = Gemma2Attention::load_fused(
-            weights, &format!("{prefix}.self_attn"), config,
-            layer_idx, is_sliding, device.compute_stream,
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            is_sliding,
+            device.compute_stream,
         )?;
         let mlp = Gemma2MLP::load(
-            weights, &format!("{prefix}.mlp"),
-            config.intermediate_size, device.compute_stream,
+            weights,
+            &format!("{prefix}.mlp"),
+            config.intermediate_size,
+            device.compute_stream,
         )?;
         let input_layernorm = GemmaRmsNorm::load(
-            weights, &format!("{prefix}.input_layernorm"), config.rms_norm_eps, dtype, device,
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
         )?;
         let post_attention_layernorm = GemmaRmsNorm::load(
-            weights, &format!("{prefix}.post_attention_layernorm"), config.rms_norm_eps, dtype, device,
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
         )?;
         let pre_feedforward_layernorm = GemmaRmsNorm::load(
-            weights, &format!("{prefix}.pre_feedforward_layernorm"), config.rms_norm_eps, dtype, device,
+            weights,
+            &format!("{prefix}.pre_feedforward_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
         )?;
         let post_feedforward_layernorm = GemmaRmsNorm::load(
-            weights, &format!("{prefix}.post_feedforward_layernorm"), config.rms_norm_eps, dtype, device,
+            weights,
+            &format!("{prefix}.post_feedforward_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
         )?;
         Ok(Self {
-            self_attn, mlp,
-            input_layernorm, post_attention_layernorm,
-            pre_feedforward_layernorm, post_feedforward_layernorm,
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            pre_feedforward_layernorm,
+            post_feedforward_layernorm,
         })
     }
 
@@ -351,38 +412,56 @@ impl Gemma2DecoderLayer {
         // 1. Pre-attention norm with fused residual add.
         let (normed, residual) = if let Some(residual) = residual {
             kernels::fused_add_rms_norm(
-                hidden_states, residual,
-                self.input_layernorm.inner.weight, self.input_layernorm.inner.eps,
-                &mut device.arena, device.compute_stream,
+                hidden_states,
+                residual,
+                self.input_layernorm.inner.weight,
+                self.input_layernorm.inner.eps,
+                &mut device.arena,
+                device.compute_stream,
             )
         } else {
             let normed = kernels::rms_norm(
-                hidden_states, self.input_layernorm.inner.weight,
-                self.input_layernorm.inner.eps, &mut device.arena,
+                hidden_states,
+                self.input_layernorm.inner.weight,
+                self.input_layernorm.inner.eps,
+                &mut device.arena,
+                device.compute_stream,
             );
             (normed, hidden_states)
         };
 
         // 2. Attention.
         let attn_output = self.self_attn.forward(
-            normed, positions, slot_mapping,
-            cu_seqlens_q, cu_seqlens_k, block_table,
-            max_seqlen_q, max_seqlen_k,
-            kv_cache, rotary, device,
+            normed,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            rotary,
+            device,
         );
 
         // 3. Post-attention norm (standalone, no residual add).
         let attn_normed = kernels::rms_norm(
-            attn_output, self.post_attention_layernorm.inner.weight,
-            self.post_attention_layernorm.inner.eps, &mut device.arena,
+            attn_output,
+            self.post_attention_layernorm.inner.weight,
+            self.post_attention_layernorm.inner.eps,
+            &mut device.arena,
+            device.compute_stream,
         );
 
         // 4. Pre-feedforward norm with fused residual add.
         let (normed, residual) = kernels::fused_add_rms_norm(
-            attn_normed, residual,
+            attn_normed,
+            residual,
             self.pre_feedforward_layernorm.inner.weight,
             self.pre_feedforward_layernorm.inner.eps,
-            &mut device.arena, device.compute_stream,
+            &mut device.arena,
+            device.compute_stream,
         );
 
         // 5. MLP.
@@ -390,8 +469,11 @@ impl Gemma2DecoderLayer {
 
         // 6. Post-feedforward norm (standalone, no residual add).
         let mlp_normed = kernels::rms_norm(
-            mlp_output, self.post_feedforward_layernorm.inner.weight,
-            self.post_feedforward_layernorm.inner.eps, &mut device.arena,
+            mlp_output,
+            self.post_feedforward_layernorm.inner.weight,
+            self.post_feedforward_layernorm.inner.eps,
+            &mut device.arena,
+            device.compute_stream,
         );
 
         (mlp_normed, residual)
@@ -404,7 +486,7 @@ impl Gemma2DecoderLayer {
 
 pub struct Gemma2Model {
     embed_tokens: Embedding,
-    layers: Vec<Gemma2DecoderLayer>,
+    pub layers: Vec<Gemma2DecoderLayer>,
     norm: GemmaRmsNorm,
     rotary: RotaryCache,
     embed_scale: f32,
@@ -423,8 +505,13 @@ impl Gemma2Model {
         for i in 0..config.num_hidden_layers {
             let is_sliding = i < config.layer_is_sliding.len() && config.layer_is_sliding[i];
             let layer = Gemma2DecoderLayer::load(
-                weights, &format!("model.layers.{i}"), config,
-                i, is_sliding, dtype, device,
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                is_sliding,
+                dtype,
+                device,
             )?;
             layers.push(layer);
         }
@@ -466,17 +553,28 @@ impl Gemma2Model {
     ) -> GpuTensor {
         // Embedding lookup + Gemma scaling.
         let mut hidden_states = kernels::embedding_gather(
-            self.embed_tokens.weight, input_ids, &mut device.arena,
+            self.embed_tokens.weight,
+            input_ids,
+            &mut device.arena,
+            device.compute_stream,
         );
         kernels::scale_inplace(hidden_states, self.embed_scale, &device.cublas);
 
         let mut residual: Option<GpuTensor> = None;
         for layer in &self.layers {
             let (hs, res) = layer.forward(
-                hidden_states, residual, positions,
-                slot_mapping, cu_seqlens_q, cu_seqlens_k, block_table,
-                max_seqlen_q, max_seqlen_k,
-                kv_cache, &self.rotary, device,
+                hidden_states,
+                residual,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                kv_cache,
+                &self.rotary,
+                device,
             );
             hidden_states = hs;
             residual = Some(res);
@@ -484,9 +582,12 @@ impl Gemma2Model {
 
         // Final norm with fused residual add.
         let (normed, _) = kernels::fused_add_rms_norm(
-            hidden_states, residual.unwrap(),
-            self.norm.inner.weight, self.norm.inner.eps,
-            &mut device.arena, device.compute_stream,
+            hidden_states,
+            residual.unwrap(),
+            self.norm.inner.weight,
+            self.norm.inner.eps,
+            &mut device.arena,
+            device.compute_stream,
         );
         normed
     }
@@ -497,8 +598,8 @@ impl Gemma2Model {
 // ---------------------------------------------------------------------------
 
 pub struct Gemma2ForCausalLM {
-    model: Gemma2Model,
-    lm_head: Linear,
+    pub model: Gemma2Model,
+    pub lm_head: Linear,
     final_logit_softcapping: Option<f32>,
 }
 
@@ -534,15 +635,36 @@ impl Gemma2ForCausalLM {
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
+        last_token_indices: Option<GpuTensor>,
     ) -> GpuTensor {
         let hidden_states = self.model.forward(
-            input_ids, positions, slot_mapping,
-            cu_seqlens_q, cu_seqlens_k, block_table,
-            max_seqlen_q, max_seqlen_k,
-            kv_cache, device,
+            input_ids,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            device,
         );
 
-        let logits = self.lm_head.forward(hidden_states, &device.cublas, &mut device.arena);
+        // Gather only last-token hidden states before the expensive lm_head GEMM.
+        let hidden_states = if let Some(indices) = last_token_indices {
+            crate::kernels::embedding_gather(
+                hidden_states,
+                indices,
+                &mut device.arena,
+                device.compute_stream,
+            )
+        } else {
+            hidden_states
+        };
+
+        let logits = self
+            .lm_head
+            .forward(hidden_states, &device.cublas, &mut device.arena);
 
         // Apply final logit soft capping: logits = cap * tanh(logits / cap).
         // TODO: This requires a fused tanh-softcap kernel. For now, softcap

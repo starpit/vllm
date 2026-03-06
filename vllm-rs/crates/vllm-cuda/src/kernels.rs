@@ -15,36 +15,211 @@ use crate::tensor::GpuTensor;
 // FFI declarations (same C symbols as vllm-kernels, linked from libvllm_cuda.a)
 // ---------------------------------------------------------------------------
 
+type CUstream = cudarc::driver::sys::CUstream;
+
 unsafe extern "C" {
     // RMS norm
-    fn rms_norm_f16(out: *mut u16, input: *const u16, weight: *const u16, epsilon: f32, num_tokens: i32, hidden_size: i32);
-    fn rms_norm_bf16(out: *mut u16, input: *const u16, weight: *const u16, epsilon: f32, num_tokens: i32, hidden_size: i32);
-    fn rms_norm_f32(out: *mut f32, input: *const f32, weight: *const f32, epsilon: f32, num_tokens: i32, hidden_size: i32);
+    fn rms_norm_f16(
+        out: *mut u16,
+        input: *const u16,
+        weight: *const u16,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+    fn rms_norm_bf16(
+        out: *mut u16,
+        input: *const u16,
+        weight: *const u16,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+    fn rms_norm_f32(
+        out: *mut f32,
+        input: *const f32,
+        weight: *const f32,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
 
     // Fused add + RMS norm (in-place: residual += input, then norm)
-    fn fused_add_rms_norm_f16(input: *mut u16, residual: *mut u16, weight: *const u16, epsilon: f32, num_tokens: i32, hidden_size: i32);
-    fn fused_add_rms_norm_bf16(input: *mut u16, residual: *mut u16, weight: *const u16, epsilon: f32, num_tokens: i32, hidden_size: i32);
-    fn fused_add_rms_norm_f32(input: *mut f32, residual: *mut f32, weight: *const f32, epsilon: f32, num_tokens: i32, hidden_size: i32);
+    fn fused_add_rms_norm_f16(
+        input: *mut u16,
+        residual: *mut u16,
+        weight: *const u16,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+    fn fused_add_rms_norm_bf16(
+        input: *mut u16,
+        residual: *mut u16,
+        weight: *const u16,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+    fn fused_add_rms_norm_f32(
+        input: *mut f32,
+        residual: *mut f32,
+        weight: *const f32,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
 
     // Fused SiLU(gate) * up from combined [num_tokens, 2*d]
-    fn silu_and_mul_fused_f16(out: *mut u16, gate_up: *const u16, num_tokens: i32, d: i32);
-    fn silu_and_mul_fused_bf16(out: *mut u16, gate_up: *const u16, num_tokens: i32, d: i32);
-    fn silu_and_mul_fused_f32(out: *mut f32, gate_up: *const f32, num_tokens: i32, d: i32);
+    fn silu_and_mul_fused_f16(
+        out: *mut u16,
+        gate_up: *const u16,
+        num_tokens: i32,
+        d: i32,
+        stream: CUstream,
+    );
+    fn silu_and_mul_fused_bf16(
+        out: *mut u16,
+        gate_up: *const u16,
+        num_tokens: i32,
+        d: i32,
+        stream: CUstream,
+    );
+    fn silu_and_mul_fused_f32(
+        out: *mut f32,
+        gate_up: *const f32,
+        num_tokens: i32,
+        d: i32,
+        stream: CUstream,
+    );
 
     // Fused GELU(tanh)(gate) * up from combined [num_tokens, 2*d]
-    fn gelu_and_mul_fused_f16(out: *mut u16, gate_up: *const u16, num_tokens: i32, d: i32);
-    fn gelu_and_mul_fused_bf16(out: *mut u16, gate_up: *const u16, num_tokens: i32, d: i32);
-    fn gelu_and_mul_fused_f32(out: *mut f32, gate_up: *const f32, num_tokens: i32, d: i32);
+    fn gelu_and_mul_fused_f16(
+        out: *mut u16,
+        gate_up: *const u16,
+        num_tokens: i32,
+        d: i32,
+        stream: CUstream,
+    );
+    fn gelu_and_mul_fused_bf16(
+        out: *mut u16,
+        gate_up: *const u16,
+        num_tokens: i32,
+        d: i32,
+        stream: CUstream,
+    );
+    fn gelu_and_mul_fused_f32(
+        out: *mut f32,
+        gate_up: *const f32,
+        num_tokens: i32,
+        d: i32,
+        stream: CUstream,
+    );
 
     // Rotary embedding (in-place on q and k)
-    fn rotary_embedding_f16(positions: *const u32, query: *mut u16, key: *mut u16, cos_sin_cache: *const u16, rotary_dim: i32, total_q_dim: i32, total_k_dim: i32, head_size: i32, num_tokens: i32);
-    fn rotary_embedding_bf16(positions: *const u32, query: *mut u16, key: *mut u16, cos_sin_cache: *const u16, rotary_dim: i32, total_q_dim: i32, total_k_dim: i32, head_size: i32, num_tokens: i32);
-    fn rotary_embedding_f32(positions: *const u32, query: *mut f32, key: *mut f32, cos_sin_cache: *const f32, rotary_dim: i32, total_q_dim: i32, total_k_dim: i32, head_size: i32, num_tokens: i32);
+    fn rotary_embedding_f16(
+        positions: *const u32,
+        query: *mut u16,
+        key: *mut u16,
+        cos_sin_cache: *const u16,
+        rotary_dim: i32,
+        total_q_dim: i32,
+        total_k_dim: i32,
+        head_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+    fn rotary_embedding_bf16(
+        positions: *const u32,
+        query: *mut u16,
+        key: *mut u16,
+        cos_sin_cache: *const u16,
+        rotary_dim: i32,
+        total_q_dim: i32,
+        total_k_dim: i32,
+        head_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+    fn rotary_embedding_f32(
+        positions: *const u32,
+        query: *mut f32,
+        key: *mut f32,
+        cos_sin_cache: *const f32,
+        rotary_dim: i32,
+        total_q_dim: i32,
+        total_k_dim: i32,
+        head_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
 
     // Embedding gather
-    fn embedding_gather_f16(out: *mut u16, weight: *const u16, ids: *const u32, hidden_size: i32, num_tokens: i32);
-    fn embedding_gather_bf16(out: *mut u16, weight: *const u16, ids: *const u32, hidden_size: i32, num_tokens: i32);
-    fn embedding_gather_f32(out: *mut f32, weight: *const f32, ids: *const u32, hidden_size: i32, num_tokens: i32);
+    fn embedding_gather_f16(
+        out: *mut u16,
+        weight: *const u16,
+        ids: *const u32,
+        hidden_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+    fn embedding_gather_bf16(
+        out: *mut u16,
+        weight: *const u16,
+        ids: *const u32,
+        hidden_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+    fn embedding_gather_f32(
+        out: *mut f32,
+        weight: *const f32,
+        ids: *const u32,
+        hidden_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+
+    // Split fused QKV
+    fn split_qkv_f16(
+        q: *mut u16,
+        k: *mut u16,
+        v: *mut u16,
+        qkv: *const u16,
+        q_size: i32,
+        kv_size: i32,
+        total_dim: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+    fn split_qkv_bf16(
+        q: *mut u16,
+        k: *mut u16,
+        v: *mut u16,
+        qkv: *const u16,
+        q_size: i32,
+        kv_size: i32,
+        total_dim: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+    fn split_qkv_f32(
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        qkv: *const f32,
+        q_size: i32,
+        kv_size: i32,
+        total_dim: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -61,15 +236,40 @@ pub unsafe fn rms_norm(
     weight: GpuTensor,
     eps: f32,
     arena: &mut ScratchArena,
+    stream: CUstream,
 ) -> GpuTensor {
     let num_tokens = input.dim(0) as i32;
     let hidden_size = input.dim(1) as i32;
     let out = arena.alloc(&[num_tokens as usize, hidden_size as usize], input.dtype());
 
     match input.dtype() {
-        DType::F16 => rms_norm_f16(out.as_mut_ptr(), input.as_ptr(), weight.as_ptr(), eps, num_tokens, hidden_size),
-        DType::BF16 => rms_norm_bf16(out.as_mut_ptr(), input.as_ptr(), weight.as_ptr(), eps, num_tokens, hidden_size),
-        DType::F32 => rms_norm_f32(out.as_mut_ptr(), input.as_ptr(), weight.as_ptr(), eps, num_tokens, hidden_size),
+        DType::F16 => rms_norm_f16(
+            out.as_mut_ptr(),
+            input.as_ptr(),
+            weight.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        DType::BF16 => rms_norm_bf16(
+            out.as_mut_ptr(),
+            input.as_ptr(),
+            weight.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        DType::F32 => rms_norm_f32(
+            out.as_mut_ptr(),
+            input.as_ptr(),
+            weight.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
         _ => panic!("rms_norm: unsupported dtype {:?}", input.dtype()),
     }
     out
@@ -107,14 +307,39 @@ pub unsafe fn fused_add_rms_norm_inplace(
     residual: GpuTensor,
     weight: GpuTensor,
     eps: f32,
+    stream: CUstream,
 ) -> (GpuTensor, GpuTensor) {
     let num_tokens = input.dim(0) as i32;
     let hidden_size = input.dim(1) as i32;
 
     match input.dtype() {
-        DType::F16 => fused_add_rms_norm_f16(input.as_mut_ptr(), residual.as_mut_ptr(), weight.as_ptr(), eps, num_tokens, hidden_size),
-        DType::BF16 => fused_add_rms_norm_bf16(input.as_mut_ptr(), residual.as_mut_ptr(), weight.as_ptr(), eps, num_tokens, hidden_size),
-        DType::F32 => fused_add_rms_norm_f32(input.as_mut_ptr(), residual.as_mut_ptr(), weight.as_ptr(), eps, num_tokens, hidden_size),
+        DType::F16 => fused_add_rms_norm_f16(
+            input.as_mut_ptr(),
+            residual.as_mut_ptr(),
+            weight.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        DType::BF16 => fused_add_rms_norm_bf16(
+            input.as_mut_ptr(),
+            residual.as_mut_ptr(),
+            weight.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        DType::F32 => fused_add_rms_norm_f32(
+            input.as_mut_ptr(),
+            residual.as_mut_ptr(),
+            weight.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
         _ => panic!("fused_add_rms_norm: unsupported dtype {:?}", input.dtype()),
     }
 
@@ -146,7 +371,7 @@ pub unsafe fn fused_add_rms_norm(
     )
     .expect("fused_add_rms_norm: D2D copy failed");
 
-    fused_add_rms_norm_inplace(normed_buf, residual, weight, eps)
+    fused_add_rms_norm_inplace(normed_buf, residual, weight, eps, stream)
 }
 
 // ---------------------------------------------------------------------------
@@ -162,16 +387,26 @@ pub unsafe fn silu_and_mul_fused(
     gate_up: GpuTensor,
     intermediate_size: usize,
     arena: &mut ScratchArena,
+    stream: CUstream,
 ) -> GpuTensor {
     let num_tokens = gate_up.dim(0) as i32;
     let d = intermediate_size as i32;
     let out = arena.alloc(&[num_tokens as usize, intermediate_size], gate_up.dtype());
 
     match gate_up.dtype() {
-        DType::F16 => silu_and_mul_fused_f16(out.as_mut_ptr(), gate_up.as_ptr(), num_tokens, d),
-        DType::BF16 => silu_and_mul_fused_bf16(out.as_mut_ptr(), gate_up.as_ptr(), num_tokens, d),
-        DType::F32 => silu_and_mul_fused_f32(out.as_mut_ptr(), gate_up.as_ptr(), num_tokens, d),
-        _ => panic!("silu_and_mul_fused: unsupported dtype {:?}", gate_up.dtype()),
+        DType::F16 => {
+            silu_and_mul_fused_f16(out.as_mut_ptr(), gate_up.as_ptr(), num_tokens, d, stream)
+        }
+        DType::BF16 => {
+            silu_and_mul_fused_bf16(out.as_mut_ptr(), gate_up.as_ptr(), num_tokens, d, stream)
+        }
+        DType::F32 => {
+            silu_and_mul_fused_f32(out.as_mut_ptr(), gate_up.as_ptr(), num_tokens, d, stream)
+        }
+        _ => panic!(
+            "silu_and_mul_fused: unsupported dtype {:?}",
+            gate_up.dtype()
+        ),
     }
     out
 }
@@ -189,16 +424,26 @@ pub unsafe fn gelu_and_mul_fused(
     gate_up: GpuTensor,
     intermediate_size: usize,
     arena: &mut ScratchArena,
+    stream: CUstream,
 ) -> GpuTensor {
     let num_tokens = gate_up.dim(0) as i32;
     let d = intermediate_size as i32;
     let out = arena.alloc(&[num_tokens as usize, intermediate_size], gate_up.dtype());
 
     match gate_up.dtype() {
-        DType::F16 => gelu_and_mul_fused_f16(out.as_mut_ptr(), gate_up.as_ptr(), num_tokens, d),
-        DType::BF16 => gelu_and_mul_fused_bf16(out.as_mut_ptr(), gate_up.as_ptr(), num_tokens, d),
-        DType::F32 => gelu_and_mul_fused_f32(out.as_mut_ptr(), gate_up.as_ptr(), num_tokens, d),
-        _ => panic!("gelu_and_mul_fused: unsupported dtype {:?}", gate_up.dtype()),
+        DType::F16 => {
+            gelu_and_mul_fused_f16(out.as_mut_ptr(), gate_up.as_ptr(), num_tokens, d, stream)
+        }
+        DType::BF16 => {
+            gelu_and_mul_fused_bf16(out.as_mut_ptr(), gate_up.as_ptr(), num_tokens, d, stream)
+        }
+        DType::F32 => {
+            gelu_and_mul_fused_f32(out.as_mut_ptr(), gate_up.as_ptr(), num_tokens, d, stream)
+        }
+        _ => panic!(
+            "gelu_and_mul_fused: unsupported dtype {:?}",
+            gate_up.dtype()
+        ),
     }
     out
 }
@@ -220,6 +465,7 @@ pub unsafe fn rotary_embedding_inplace(
     positions: GpuTensor,
     cos_sin_cache: GpuTensor,
     head_dim: usize,
+    stream: CUstream,
 ) {
     let num_tokens = q.dim(0) as i32;
     let total_q_dim = q.dim(1) as i32;
@@ -228,9 +474,42 @@ pub unsafe fn rotary_embedding_inplace(
     let head_size = head_dim as i32;
 
     match q.dtype() {
-        DType::F16 => rotary_embedding_f16(positions.as_ptr(), q.as_mut_ptr(), k.as_mut_ptr(), cos_sin_cache.as_ptr(), rotary_dim, total_q_dim, total_k_dim, head_size, num_tokens),
-        DType::BF16 => rotary_embedding_bf16(positions.as_ptr(), q.as_mut_ptr(), k.as_mut_ptr(), cos_sin_cache.as_ptr(), rotary_dim, total_q_dim, total_k_dim, head_size, num_tokens),
-        DType::F32 => rotary_embedding_f32(positions.as_ptr(), q.as_mut_ptr(), k.as_mut_ptr(), cos_sin_cache.as_ptr(), rotary_dim, total_q_dim, total_k_dim, head_size, num_tokens),
+        DType::F16 => rotary_embedding_f16(
+            positions.as_ptr(),
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            cos_sin_cache.as_ptr(),
+            rotary_dim,
+            total_q_dim,
+            total_k_dim,
+            head_size,
+            num_tokens,
+            stream,
+        ),
+        DType::BF16 => rotary_embedding_bf16(
+            positions.as_ptr(),
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            cos_sin_cache.as_ptr(),
+            rotary_dim,
+            total_q_dim,
+            total_k_dim,
+            head_size,
+            num_tokens,
+            stream,
+        ),
+        DType::F32 => rotary_embedding_f32(
+            positions.as_ptr(),
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            cos_sin_cache.as_ptr(),
+            rotary_dim,
+            total_q_dim,
+            total_k_dim,
+            head_size,
+            num_tokens,
+            stream,
+        ),
         _ => panic!("rotary_embedding: unsupported dtype {:?}", q.dtype()),
     }
 }
@@ -248,15 +527,37 @@ pub unsafe fn embedding_gather(
     weight: GpuTensor,
     input_ids: GpuTensor,
     arena: &mut ScratchArena,
+    stream: CUstream,
 ) -> GpuTensor {
     let num_tokens = input_ids.dim(0);
     let hidden_size = weight.dim(1);
     let out = arena.alloc(&[num_tokens, hidden_size], weight.dtype());
 
     match weight.dtype() {
-        DType::F16 => embedding_gather_f16(out.as_mut_ptr(), weight.as_ptr(), input_ids.as_ptr(), hidden_size as i32, num_tokens as i32),
-        DType::BF16 => embedding_gather_bf16(out.as_mut_ptr(), weight.as_ptr(), input_ids.as_ptr(), hidden_size as i32, num_tokens as i32),
-        DType::F32 => embedding_gather_f32(out.as_mut_ptr(), weight.as_ptr(), input_ids.as_ptr(), hidden_size as i32, num_tokens as i32),
+        DType::F16 => embedding_gather_f16(
+            out.as_mut_ptr(),
+            weight.as_ptr(),
+            input_ids.as_ptr(),
+            hidden_size as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        DType::BF16 => embedding_gather_bf16(
+            out.as_mut_ptr(),
+            weight.as_ptr(),
+            input_ids.as_ptr(),
+            hidden_size as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        DType::F32 => embedding_gather_f32(
+            out.as_mut_ptr(),
+            weight.as_ptr(),
+            input_ids.as_ptr(),
+            hidden_size as i32,
+            num_tokens as i32,
+            stream,
+        ),
         _ => panic!("embedding_gather: unsupported dtype {:?}", weight.dtype()),
     }
     out
@@ -268,22 +569,40 @@ pub unsafe fn embedding_gather(
 
 unsafe extern "C" {
     fn reshape_and_cache_f16(
-        key: *const u16, value: *const u16,
-        key_cache: *mut u16, value_cache: *mut u16,
+        key: *const u16,
+        value: *const u16,
+        key_cache: *mut u16,
+        value_cache: *mut u16,
         slot_mapping: *const i64,
-        num_tokens: i32, num_heads: i32, head_dim: i32, block_size: i32,
+        num_tokens: i32,
+        num_heads: i32,
+        head_dim: i32,
+        block_size: i32,
+        stream: CUstream,
     );
     fn reshape_and_cache_bf16(
-        key: *const u16, value: *const u16,
-        key_cache: *mut u16, value_cache: *mut u16,
+        key: *const u16,
+        value: *const u16,
+        key_cache: *mut u16,
+        value_cache: *mut u16,
         slot_mapping: *const i64,
-        num_tokens: i32, num_heads: i32, head_dim: i32, block_size: i32,
+        num_tokens: i32,
+        num_heads: i32,
+        head_dim: i32,
+        block_size: i32,
+        stream: CUstream,
     );
     fn reshape_and_cache_f32(
-        key: *const f32, value: *const f32,
-        key_cache: *mut f32, value_cache: *mut f32,
+        key: *const f32,
+        value: *const f32,
+        key_cache: *mut f32,
+        value_cache: *mut f32,
         slot_mapping: *const i64,
-        num_tokens: i32, num_heads: i32, head_dim: i32, block_size: i32,
+        num_tokens: i32,
+        num_heads: i32,
+        head_dim: i32,
+        block_size: i32,
+        stream: CUstream,
     );
 }
 
@@ -301,6 +620,7 @@ pub unsafe fn reshape_and_cache(
     value_cache: GpuTensor,
     slot_mapping: GpuTensor,
     block_size: usize,
+    stream: CUstream,
 ) {
     let num_tokens = key.dim(0) as i32;
     let num_heads = key.dim(1) as i32;
@@ -309,19 +629,40 @@ pub unsafe fn reshape_and_cache(
 
     match key.dtype() {
         DType::F16 => reshape_and_cache_f16(
-            key.as_ptr(), value.as_ptr(),
-            key_cache.as_mut_ptr(), value_cache.as_mut_ptr(),
-            slot_mapping.as_ptr(), num_tokens, num_heads, head_dim, bs,
+            key.as_ptr(),
+            value.as_ptr(),
+            key_cache.as_mut_ptr(),
+            value_cache.as_mut_ptr(),
+            slot_mapping.as_ptr(),
+            num_tokens,
+            num_heads,
+            head_dim,
+            bs,
+            stream,
         ),
         DType::BF16 => reshape_and_cache_bf16(
-            key.as_ptr(), value.as_ptr(),
-            key_cache.as_mut_ptr(), value_cache.as_mut_ptr(),
-            slot_mapping.as_ptr(), num_tokens, num_heads, head_dim, bs,
+            key.as_ptr(),
+            value.as_ptr(),
+            key_cache.as_mut_ptr(),
+            value_cache.as_mut_ptr(),
+            slot_mapping.as_ptr(),
+            num_tokens,
+            num_heads,
+            head_dim,
+            bs,
+            stream,
         ),
         DType::F32 => reshape_and_cache_f32(
-            key.as_ptr(), value.as_ptr(),
-            key_cache.as_mut_ptr(), value_cache.as_mut_ptr(),
-            slot_mapping.as_ptr(), num_tokens, num_heads, head_dim, bs,
+            key.as_ptr(),
+            value.as_ptr(),
+            key_cache.as_mut_ptr(),
+            value_cache.as_mut_ptr(),
+            slot_mapping.as_ptr(),
+            num_tokens,
+            num_heads,
+            head_dim,
+            bs,
+            stream,
         ),
         _ => panic!("reshape_and_cache: unsupported dtype {:?}", key.dtype()),
     }
@@ -384,6 +725,7 @@ unsafe extern "C" {
         block_table_batch_stride: i64,
         page_block_size: c_int,
         num_splits: c_int,
+        cuda_stream: CUstream,
     );
 }
 
@@ -422,11 +764,24 @@ pub unsafe fn flash_attn_paged(
     is_causal: bool,
     block_size: usize,
     arena: &mut ScratchArena,
+    stream: CUstream,
 ) -> GpuTensor {
     flash_attn_paged_ext(
-        q, k_cache, v_cache, cu_seqlens_q, cu_seqlens_k, block_table,
-        max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, 0.0, -1,
-        block_size, arena,
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        block_table,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        is_causal,
+        0.0,
+        -1,
+        block_size,
+        arena,
+        stream,
     )
 }
 
@@ -447,6 +802,7 @@ pub unsafe fn flash_attn_paged_ext(
     window_size_left: i32,
     block_size: usize,
     arena: &mut ScratchArena,
+    stream: CUstream,
 ) -> GpuTensor {
     let total_q = q.dim(0);
     let num_heads = q.dim(1);
@@ -524,6 +880,7 @@ pub unsafe fn flash_attn_paged_ext(
         max_blocks_per_seq as i64,
         block_size as c_int,
         /* num_splits */ 0,
+        stream,
     );
 
     out
@@ -570,21 +927,23 @@ pub unsafe fn scale_inplace(x: GpuTensor, scale: f32, cublas: &crate::cublas::Cu
         1,
         cudaDataType_t::CUDA_R_32F,
     );
-    assert_eq!(status, cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS);
+    assert_eq!(
+        status,
+        cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    );
 }
 
 // ---------------------------------------------------------------------------
 // QKV Split (zero-copy on dim 1 via pointer arithmetic + D2D copy)
 // ---------------------------------------------------------------------------
 
-/// Split fused QKV output into separate Q, K, V tensors.
+/// Split fused QKV output into separate Q, K, V tensors via CUDA kernel.
 ///
 /// * `qkv`: `[num_tokens, q_size + 2 * kv_size]` (contiguous)
 /// * Returns: `(q, k, v)` each `[num_tokens, heads, head_dim]`
 ///
-/// Since QKV is contiguous [num_tokens, total_dim], narrowing on dim 1
-/// creates a non-contiguous view. We must copy each slice to a contiguous
-/// arena buffer because our kernels (RoPE, attention) require contiguous input.
+/// Uses a single kernel launch instead of per-token D2D memcpy calls,
+/// eliminating O(num_tokens * 3) driver API overhead per layer.
 pub unsafe fn split_qkv(
     qkv: GpuTensor,
     q_size: usize,
@@ -597,37 +956,221 @@ pub unsafe fn split_qkv(
 ) -> (GpuTensor, GpuTensor, GpuTensor) {
     let num_tokens = qkv.dim(0);
     let total_dim = qkv.dim(1);
-    let elem_bytes = qkv.dtype().size_bytes();
 
     debug_assert_eq!(total_dim, q_size + 2 * kv_size);
 
-    // Allocate contiguous output buffers.
     let q = arena.alloc(&[num_tokens, num_q_heads, head_dim], qkv.dtype());
     let k = arena.alloc(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
     let v = arena.alloc(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
 
-    // Copy row-by-row (non-contiguous dim-1 narrow → contiguous).
-    // For each token, copy the Q/K/V slices from the fused row.
-    for t in 0..num_tokens {
-        let row_base = qkv.raw_ptr().add(t * total_dim * elem_bytes);
-
-        // Q: offset 0, size q_size
-        let q_dst = q.raw_ptr().add(t * q_size * elem_bytes);
-        crate::driver::memcpy_dtod_async(q_dst, row_base, q_size * elem_bytes, stream)
-            .expect("split_qkv: Q copy failed");
-
-        // K: offset q_size, size kv_size
-        let k_src = row_base.add(q_size * elem_bytes);
-        let k_dst = k.raw_ptr().add(t * kv_size * elem_bytes);
-        crate::driver::memcpy_dtod_async(k_dst, k_src, kv_size * elem_bytes, stream)
-            .expect("split_qkv: K copy failed");
-
-        // V: offset q_size + kv_size, size kv_size
-        let v_src = row_base.add((q_size + kv_size) * elem_bytes);
-        let v_dst = v.raw_ptr().add(t * kv_size * elem_bytes);
-        crate::driver::memcpy_dtod_async(v_dst, v_src, kv_size * elem_bytes, stream)
-            .expect("split_qkv: V copy failed");
+    match qkv.dtype() {
+        DType::F16 => split_qkv_f16(
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            v.as_mut_ptr(),
+            qkv.as_ptr(),
+            q_size as i32,
+            kv_size as i32,
+            total_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        DType::BF16 => split_qkv_bf16(
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            v.as_mut_ptr(),
+            qkv.as_ptr(),
+            q_size as i32,
+            kv_size as i32,
+            total_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        DType::F32 => split_qkv_f32(
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            v.as_mut_ptr(),
+            qkv.as_ptr(),
+            q_size as i32,
+            kv_size as i32,
+            total_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        _ => panic!("split_qkv: unsupported dtype {:?}", qkv.dtype()),
     }
 
     (q, k, v)
+}
+
+// ---------------------------------------------------------------------------
+// Batched argmax (GPU greedy sampling — avoids D2H of full logits)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn argmax_batched_f16(
+        output: *mut u32,
+        logits: *const u16,
+        vocab_size: c_int,
+        batch_size: c_int,
+        stream: CUstream,
+    );
+    fn argmax_batched_bf16(
+        output: *mut u32,
+        logits: *const u16,
+        vocab_size: c_int,
+        batch_size: c_int,
+        stream: CUstream,
+    );
+    fn argmax_batched_f32(
+        output: *mut u32,
+        logits: *const f32,
+        vocab_size: c_int,
+        batch_size: c_int,
+        stream: CUstream,
+    );
+
+    fn sample_batched_f16(
+        output: *mut u32,
+        logits: *const u16,
+        vocab_size: c_int,
+        batch_size: c_int,
+        temperatures: *const f32,
+        top_ks: *const c_int,
+        top_ps: *const f32,
+        min_ps: *const f32,
+        uniform_randoms: *const f32,
+        stream: CUstream,
+    );
+    fn sample_batched_bf16(
+        output: *mut u32,
+        logits: *const u16,
+        vocab_size: c_int,
+        batch_size: c_int,
+        temperatures: *const f32,
+        top_ks: *const c_int,
+        top_ps: *const f32,
+        min_ps: *const f32,
+        uniform_randoms: *const f32,
+        stream: CUstream,
+    );
+    fn sample_batched_f32(
+        output: *mut u32,
+        logits: *const f32,
+        vocab_size: c_int,
+        batch_size: c_int,
+        temperatures: *const f32,
+        top_ks: *const c_int,
+        top_ps: *const f32,
+        min_ps: *const f32,
+        uniform_randoms: *const f32,
+        stream: CUstream,
+    );
+}
+
+/// Batched argmax over logits `[batch_size, vocab_size]`.
+///
+/// Returns `[batch_size]` u32 tensor of token IDs, allocated from arena.
+/// Only copies `batch_size * 4` bytes D2H instead of `batch_size * vocab_size * dtype_size`.
+pub unsafe fn argmax_batched(
+    logits: GpuTensor,
+    arena: &mut ScratchArena,
+    stream: CUstream,
+) -> GpuTensor {
+    let batch_size = logits.dim(0) as c_int;
+    let vocab_size = logits.dim(1) as c_int;
+    let out = arena.alloc(&[batch_size as usize], DType::U32);
+
+    match logits.dtype() {
+        DType::F16 => argmax_batched_f16(
+            out.as_mut_ptr() as *mut u32,
+            logits.as_ptr() as *const u16,
+            vocab_size,
+            batch_size,
+            stream,
+        ),
+        DType::BF16 => argmax_batched_bf16(
+            out.as_mut_ptr() as *mut u32,
+            logits.as_ptr() as *const u16,
+            vocab_size,
+            batch_size,
+            stream,
+        ),
+        DType::F32 => argmax_batched_f32(
+            out.as_mut_ptr() as *mut u32,
+            logits.as_ptr() as *const f32,
+            vocab_size,
+            batch_size,
+            stream,
+        ),
+        _ => panic!("argmax_batched: unsupported dtype {:?}", logits.dtype()),
+    }
+    out
+}
+
+/// Batched GPU sampling with top-k/top-p/min-p over logits `[batch_size, vocab_size]`.
+///
+/// * `logits`: `[batch_size, vocab_size]`
+/// * `temperatures`: `[batch_size]` (F32, on GPU)
+/// * `top_ks`: `[batch_size]` (I32, on GPU)
+/// * `top_ps`: `[batch_size]` (F32, on GPU)
+/// * `min_ps`: `[batch_size]` (F32, on GPU)
+/// * `uniform_randoms`: `[batch_size]` (F32, on GPU) — pre-generated U[0,1) random values
+///
+/// Returns `[batch_size]` u32 tensor of sampled token IDs, allocated from arena.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn sample_batched(
+    logits: GpuTensor,
+    temperatures: GpuTensor,
+    top_ks: GpuTensor,
+    top_ps: GpuTensor,
+    min_ps: GpuTensor,
+    uniform_randoms: GpuTensor,
+    arena: &mut ScratchArena,
+    stream: CUstream,
+) -> GpuTensor {
+    let batch_size = logits.dim(0) as c_int;
+    let vocab_size = logits.dim(1) as c_int;
+    let out = arena.alloc(&[batch_size as usize], DType::U32);
+
+    match logits.dtype() {
+        DType::F16 => sample_batched_f16(
+            out.as_mut_ptr() as *mut u32,
+            logits.as_ptr() as *const u16,
+            vocab_size,
+            batch_size,
+            temperatures.as_ptr(),
+            top_ks.as_ptr(),
+            top_ps.as_ptr(),
+            min_ps.as_ptr(),
+            uniform_randoms.as_ptr(),
+            stream,
+        ),
+        DType::BF16 => sample_batched_bf16(
+            out.as_mut_ptr() as *mut u32,
+            logits.as_ptr() as *const u16,
+            vocab_size,
+            batch_size,
+            temperatures.as_ptr(),
+            top_ks.as_ptr(),
+            top_ps.as_ptr(),
+            min_ps.as_ptr(),
+            uniform_randoms.as_ptr(),
+            stream,
+        ),
+        DType::F32 => sample_batched_f32(
+            out.as_mut_ptr() as *mut u32,
+            logits.as_ptr() as *const f32,
+            vocab_size,
+            batch_size,
+            temperatures.as_ptr(),
+            top_ks.as_ptr(),
+            top_ps.as_ptr(),
+            min_ps.as_ptr(),
+            uniform_randoms.as_ptr(),
+            stream,
+        ),
+        _ => panic!("sample_batched: unsupported dtype {:?}", logits.dtype()),
+    }
+    out
 }

@@ -16,7 +16,10 @@ fn main() {
 fn cuda_build() {
     let kernels_csrc = std::path::Path::new("../vllm-kernels/csrc");
 
-    // 1. Custom vllm kernels (norm, activation, RoPE, embedding, cache).
+    // 1. vllm-cuda-only kernels (embedding gather, split_qkv).
+    // Shared kernels (norm, activation, RoPE, cache, sampling) come from
+    // vllm-kernels via its `cuda` feature — we link against that crate's
+    // compiled static lib to avoid duplicate symbol errors.
     let mut build = cc::Build::new();
     build
         .cuda(true)
@@ -27,19 +30,10 @@ fn cuda_build() {
         .flag("-O3")
         .flag("--use_fast_math")
         .include(kernels_csrc)
-        .file(kernels_csrc.join("layernorm_kernels.cu"))
-        .file(kernels_csrc.join("activation_kernels.cu"))
-        .file(kernels_csrc.join("pos_encoding_kernels.cu"))
-        .file(kernels_csrc.join("embedding_kernels.cu"))
-        .file(kernels_csrc.join("cache_kernels.cu"));
+        .file(kernels_csrc.join("embedding_kernels.cu"));
     build.compile("vllm_cuda_kernels");
 
-    println!("cargo:rerun-if-changed=../vllm-kernels/csrc/vec_utils.cuh");
-    println!("cargo:rerun-if-changed=../vllm-kernels/csrc/layernorm_kernels.cu");
-    println!("cargo:rerun-if-changed=../vllm-kernels/csrc/activation_kernels.cu");
-    println!("cargo:rerun-if-changed=../vllm-kernels/csrc/pos_encoding_kernels.cu");
     println!("cargo:rerun-if-changed=../vllm-kernels/csrc/embedding_kernels.cu");
-    println!("cargo:rerun-if-changed=../vllm-kernels/csrc/cache_kernels.cu");
 
     // 2. FlashAttention-2 paged kernels.
     build_flash_attention();
@@ -93,17 +87,16 @@ fn build_flash_attention() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
     let build_dir = match std::env::var("CANDLE_FLASH_ATTN_BUILD_DIR") {
         Err(_) => out_dir.clone(),
-        Ok(d) => PathBuf::from(d).canonicalize().expect("FA build dir missing"),
+        Ok(d) => PathBuf::from(d)
+            .canonicalize()
+            .expect("FA build dir missing"),
     };
 
     let cutlass_dir = fetch_cutlass(&out_dir, CUTLASS_COMMIT).expect("fetch cutlass");
     let cutlass_include: &'static str =
         Box::leak(cutlass_include_arg(&cutlass_dir).into_boxed_str());
 
-    let kernel_paths: Vec<PathBuf> = kernel_files
-        .iter()
-        .map(|f| fa_dir.join(f))
-        .collect();
+    let kernel_paths: Vec<PathBuf> = kernel_files.iter().map(|f| fa_dir.join(f)).collect();
 
     let mut builder = bindgen_cuda::Builder::default()
         .kernel_paths(kernel_paths)
@@ -120,10 +113,10 @@ fn build_flash_attention() {
         .arg("--use_fast_math")
         .arg("--verbose");
 
-    if let Ok(target) = std::env::var("TARGET") {
-        if target.contains("msvc") {
-            builder = builder.arg("-D_USE_MATH_DEFINES");
-        }
+    if let Ok(target) = std::env::var("TARGET")
+        && target.contains("msvc")
+    {
+        builder = builder.arg("-D_USE_MATH_DEFINES");
     }
     if !std::env::var("TARGET")
         .map(|t| t.contains("msvc"))

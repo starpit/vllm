@@ -60,7 +60,12 @@ impl CublasHandle {
         let mut lt_handle: lt::cublasLtHandle_t = std::ptr::null_mut();
         check_lt(lt::cublasLtCreate(&mut lt_handle))?;
 
-        Ok(Self { handle, lt_handle, stream, workspace })
+        Ok(Self {
+            handle,
+            lt_handle,
+            stream,
+            workspace,
+        })
     }
 
     /// GEMM: out = A @ B^T
@@ -71,12 +76,7 @@ impl CublasHandle {
     ///
     /// # Safety
     /// `a` and `b` must be valid GPU tensors with compatible dtypes and shapes.
-    pub unsafe fn gemm(
-        &self,
-        a: GpuTensor,
-        b: GpuTensor,
-        arena: &mut ScratchArena,
-    ) -> GpuTensor {
+    pub unsafe fn gemm(&self, a: GpuTensor, b: GpuTensor, arena: &mut ScratchArena) -> GpuTensor {
         debug_assert_eq!(a.ndim(), 2);
         debug_assert_eq!(b.ndim(), 2);
         debug_assert_eq!(a.dim(1), b.dim(1), "GEMM K mismatch");
@@ -97,8 +97,8 @@ impl CublasHandle {
         // Compute C^T = B @ A^T in column-major → C in row-major.
         check(sys::cublasGemmEx(
             self.handle,
-            cublasOperation_t::CUBLAS_OP_T,  // B transposed
-            cublasOperation_t::CUBLAS_OP_N,  // A not transposed
+            cublasOperation_t::CUBLAS_OP_T, // B transposed
+            cublasOperation_t::CUBLAS_OP_N, // A not transposed
             n,
             m,
             k,
@@ -205,18 +205,36 @@ impl CublasHandle {
         // Create matrix layouts (column-major convention: C^T = B @ A^T).
         // A in cuBLAS = B (weight) [N, K] col-major → rows=K, cols=N, ld=K
         let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
-        check_lt(lt::cublasLtMatrixLayoutCreate(&mut layout_a, lt_data_type, k as u64, n as u64, k as i64))
-            .expect("layout A");
+        check_lt(lt::cublasLtMatrixLayoutCreate(
+            &mut layout_a,
+            lt_data_type,
+            k as u64,
+            n as u64,
+            k as i64,
+        ))
+        .expect("layout A");
 
         // B in cuBLAS = A (activation) [M, K] col-major → rows=K, cols=M, ld=K
         let mut layout_b: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
-        check_lt(lt::cublasLtMatrixLayoutCreate(&mut layout_b, lt_data_type, k as u64, m as u64, k as i64))
-            .expect("layout B");
+        check_lt(lt::cublasLtMatrixLayoutCreate(
+            &mut layout_b,
+            lt_data_type,
+            k as u64,
+            m as u64,
+            k as i64,
+        ))
+        .expect("layout B");
 
         // C/D = output [M, N] col-major → rows=N, cols=M, ld=N
         let mut layout_c: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
-        check_lt(lt::cublasLtMatrixLayoutCreate(&mut layout_c, lt_data_type, n as u64, m as u64, n as i64))
-            .expect("layout C");
+        check_lt(lt::cublasLtMatrixLayoutCreate(
+            &mut layout_c,
+            lt_data_type,
+            n as u64,
+            m as u64,
+            n as i64,
+        ))
+        .expect("layout C");
 
         // Get heuristic for best algorithm.
         let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
@@ -254,14 +272,14 @@ impl CublasHandle {
             self.lt_handle,
             matmul_desc,
             &alpha as *const f32 as *const _,
-            b.as_ptr::<u8>() as *const _,  // A in cuBLAS = weight
+            b.as_ptr::<u8>() as *const _, // A in cuBLAS = weight
             layout_a,
-            a.as_ptr::<u8>() as *const _,  // B in cuBLAS = activation
+            a.as_ptr::<u8>() as *const _, // B in cuBLAS = activation
             layout_b,
             &beta as *const f32 as *const _,
-            out.as_mut_ptr::<u8>() as *mut _,  // C
+            out.as_mut_ptr::<u8>() as *mut _, // C
             layout_c,
-            out.as_mut_ptr::<u8>() as *mut _,  // D (same as C for in-place)
+            out.as_mut_ptr::<u8>() as *mut _, // D (same as C for in-place)
             layout_c,
             &heuristic.algo,
             self.workspace as *mut _,
@@ -345,7 +363,9 @@ fn cublas_to_lt_compute(ct: cublasComputeType_t) -> lt::cublasComputeType_t {
     match ct {
         cublasComputeType_t::CUBLAS_COMPUTE_16F => lt::cublasComputeType_t::CUBLAS_COMPUTE_16F,
         cublasComputeType_t::CUBLAS_COMPUTE_32F => lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-        cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32 => lt::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+        cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32 => {
+            lt::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
+        }
         _ => panic!("unsupported compute type for cublasLt: {:?}", ct),
     }
 }
@@ -606,8 +626,7 @@ mod tests {
                 .copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
             std::slice::from_raw_parts_mut(host_b as *mut f32, 4)
                 .copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
-            std::slice::from_raw_parts_mut(host_bias as *mut f32, 2)
-                .copy_from_slice(&[10.0, 20.0]);
+            std::slice::from_raw_parts_mut(host_bias as *mut f32, 2).copy_from_slice(&[10.0, 20.0]);
 
             let gpu_a = driver::mem_alloc(16).unwrap();
             let gpu_b = driver::mem_alloc(16).unwrap();

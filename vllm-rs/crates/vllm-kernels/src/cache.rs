@@ -104,6 +104,7 @@ mod cuda_ffi {
             num_heads: i32,
             head_dim: i32,
             block_size: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn reshape_and_cache_f16(
             key: *const u16,
@@ -115,6 +116,7 @@ mod cuda_ffi {
             num_heads: i32,
             head_dim: i32,
             block_size: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn reshape_and_cache_bf16(
             key: *const u16,
@@ -126,6 +128,7 @@ mod cuda_ffi {
             num_heads: i32,
             head_dim: i32,
             block_size: i32,
+            stream: *mut std::ffi::c_void,
         );
     }
 }
@@ -205,6 +208,7 @@ impl CacheKernels for CudaCacheKernels {
                         num_heads as i32,
                         head_dim as i32,
                         block_size as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -225,6 +229,7 @@ impl CacheKernels for CudaCacheKernels {
                         num_heads as i32,
                         head_dim as i32,
                         block_size as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -245,6 +250,7 @@ impl CacheKernels for CudaCacheKernels {
                         num_heads as i32,
                         head_dim as i32,
                         block_size as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }

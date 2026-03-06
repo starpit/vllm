@@ -80,6 +80,7 @@ mod cuda_ffi {
             epsilon: f32,
             num_tokens: i32,
             hidden_size: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn rms_norm_f16(
             out: *mut u16,
@@ -88,6 +89,7 @@ mod cuda_ffi {
             epsilon: f32,
             num_tokens: i32,
             hidden_size: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn rms_norm_bf16(
             out: *mut u16,
@@ -96,6 +98,7 @@ mod cuda_ffi {
             epsilon: f32,
             num_tokens: i32,
             hidden_size: i32,
+            stream: *mut std::ffi::c_void,
         );
 
         // Fused add + RMS norm kernels
@@ -106,6 +109,7 @@ mod cuda_ffi {
             epsilon: f32,
             num_tokens: i32,
             hidden_size: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn fused_add_rms_norm_f16(
             input: *mut u16,
@@ -114,6 +118,7 @@ mod cuda_ffi {
             epsilon: f32,
             num_tokens: i32,
             hidden_size: i32,
+            stream: *mut std::ffi::c_void,
         );
         pub fn fused_add_rms_norm_bf16(
             input: *mut u16,
@@ -122,6 +127,7 @@ mod cuda_ffi {
             epsilon: f32,
             num_tokens: i32,
             hidden_size: i32,
+            stream: *mut std::ffi::c_void,
         );
 
         // Fused QK-norm + RoPE kernels
@@ -367,6 +373,7 @@ impl NormKernels for CudaNormKernels {
                         epsilon as f32,
                         num_tokens as i32,
                         hidden_size as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -382,6 +389,7 @@ impl NormKernels for CudaNormKernels {
                         epsilon as f32,
                         num_tokens as i32,
                         hidden_size as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -397,6 +405,7 @@ impl NormKernels for CudaNormKernels {
                         epsilon as f32,
                         num_tokens as i32,
                         hidden_size as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -438,6 +447,7 @@ impl NormKernels for CudaNormKernels {
                         epsilon as f32,
                         num_tokens as i32,
                         hidden_size as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -453,6 +463,7 @@ impl NormKernels for CudaNormKernels {
                         epsilon as f32,
                         num_tokens as i32,
                         hidden_size as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -468,6 +479,7 @@ impl NormKernels for CudaNormKernels {
                         epsilon as f32,
                         num_tokens as i32,
                         hidden_size as i32,
+                        std::ptr::null_mut(),
                     );
                 }
             }
@@ -519,6 +531,7 @@ pub fn fused_add_rms_norm_inplace(
                     epsilon as f32,
                     num_tokens as i32,
                     hidden_size as i32,
+                    std::ptr::null_mut(),
                 );
             }
         }
@@ -534,6 +547,7 @@ pub fn fused_add_rms_norm_inplace(
                     epsilon as f32,
                     num_tokens as i32,
                     hidden_size as i32,
+                    std::ptr::null_mut(),
                 );
             }
         }
@@ -549,6 +563,7 @@ pub fn fused_add_rms_norm_inplace(
                     epsilon as f32,
                     num_tokens as i32,
                     hidden_size as i32,
+                    std::ptr::null_mut(),
                 );
             }
         }

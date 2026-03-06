@@ -9,10 +9,10 @@
 
 use anyhow::Result;
 
-use crate::model::llama::{LlamaConfig, LlamaForCausalLM};
 use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kv_cache::KvCachePool;
+use crate::model::llama::{LlamaConfig, LlamaForCausalLM};
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
 
@@ -69,12 +69,20 @@ impl Qwen2ForCausalLM {
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
+        last_token_indices: Option<GpuTensor>,
     ) -> GpuTensor {
         self.0.forward(
-            input_ids, positions, slot_mapping,
-            cu_seqlens_q, cu_seqlens_k, block_table,
-            max_seqlen_q, max_seqlen_k,
-            kv_cache, device,
+            input_ids,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            device,
+            last_token_indices,
         )
     }
 }

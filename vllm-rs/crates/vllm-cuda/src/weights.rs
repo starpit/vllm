@@ -84,10 +84,7 @@ impl GpuWeights {
         } else if single_path.exists() {
             Self::from_single_file(&single_path, stream)
         } else {
-            bail!(
-                "No safetensors files found in {}",
-                dir.display()
-            );
+            bail!("No safetensors files found in {}", dir.display());
         }
     }
 
@@ -270,11 +267,26 @@ mod tests {
 
     #[test]
     fn test_safetensors_dtype_mapping() {
-        assert_eq!(safetensors_dtype(safetensors::Dtype::F16).unwrap(), DType::F16);
-        assert_eq!(safetensors_dtype(safetensors::Dtype::BF16).unwrap(), DType::BF16);
-        assert_eq!(safetensors_dtype(safetensors::Dtype::F32).unwrap(), DType::F32);
-        assert_eq!(safetensors_dtype(safetensors::Dtype::I64).unwrap(), DType::I64);
-        assert_eq!(safetensors_dtype(safetensors::Dtype::U32).unwrap(), DType::U32);
+        assert_eq!(
+            safetensors_dtype(safetensors::Dtype::F16).unwrap(),
+            DType::F16
+        );
+        assert_eq!(
+            safetensors_dtype(safetensors::Dtype::BF16).unwrap(),
+            DType::BF16
+        );
+        assert_eq!(
+            safetensors_dtype(safetensors::Dtype::F32).unwrap(),
+            DType::F32
+        );
+        assert_eq!(
+            safetensors_dtype(safetensors::Dtype::I64).unwrap(),
+            DType::I64
+        );
+        assert_eq!(
+            safetensors_dtype(safetensors::Dtype::U32).unwrap(),
+            DType::U32
+        );
     }
 
     #[test]
@@ -311,16 +323,24 @@ mod tests {
             let b_bytes: Vec<u8> = data_b.iter().flat_map(|f| f.to_le_bytes()).collect();
 
             let tensors = vec![
-                ("weight_a", safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32,
-                    vec![2, 3],
-                    &a_bytes,
-                ).unwrap()),
-                ("weight_b", safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32,
-                    vec![3],
-                    &b_bytes,
-                ).unwrap()),
+                (
+                    "weight_a",
+                    safetensors::tensor::TensorView::new(
+                        safetensors::Dtype::F32,
+                        vec![2, 3],
+                        &a_bytes,
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "weight_b",
+                    safetensors::tensor::TensorView::new(
+                        safetensors::Dtype::F32,
+                        vec![3],
+                        &b_bytes,
+                    )
+                    .unwrap(),
+                ),
             ];
             safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
@@ -367,13 +387,11 @@ mod tests {
 
             let data: Vec<f32> = vec![1.0; 16];
             let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            let tensors = vec![
-                ("test.weight", safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32,
-                    vec![4, 4],
-                    &bytes,
-                ).unwrap()),
-            ];
+            let tensors = vec![(
+                "test.weight",
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![4, 4], &bytes)
+                    .unwrap(),
+            )];
             safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
             let stream = init_cuda();
@@ -395,13 +413,11 @@ mod tests {
 
             let data: Vec<f32> = vec![0.0; 8];
             let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            let tensors = vec![
-                ("model.layer.weight", safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32,
-                    vec![2, 4],
-                    &bytes,
-                ).unwrap()),
-            ];
+            let tensors = vec![(
+                "model.layer.weight",
+                safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![2, 4], &bytes)
+                    .unwrap(),
+            )];
             safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
             let stream = init_cuda();
@@ -436,13 +452,11 @@ mod tests {
 
             // BF16 data (raw bytes).
             let bf16_data: Vec<u8> = vec![0x00, 0x3F, 0x00, 0x40]; // 0.5 and 2.0 in BF16
-            let tensors = vec![
-                ("w", safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::BF16,
-                    vec![2],
-                    &bf16_data,
-                ).unwrap()),
-            ];
+            let tensors = vec![(
+                "w",
+                safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, vec![2], &bf16_data)
+                    .unwrap(),
+            )];
             safetensors::serialize_to_file(tensors, None, &path).unwrap();
 
             let stream = init_cuda();
@@ -464,12 +478,16 @@ mod tests {
 
             let data: Vec<u8> = vec![0; 16];
             let tensors = vec![
-                ("a", safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32, vec![4], &data,
-                ).unwrap()),
-                ("b", safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32, vec![4], &data,
-                ).unwrap()),
+                (
+                    "a",
+                    safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![4], &data)
+                        .unwrap(),
+                ),
+                (
+                    "b",
+                    safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![4], &data)
+                        .unwrap(),
+                ),
             ];
             safetensors::serialize_to_file(tensors, None, &path).unwrap();
 

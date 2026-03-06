@@ -260,6 +260,82 @@ impl NcclProcessGroup {
         }
     }
 
+    /// Broadcast a byte buffer from `root` rank to all other ranks via NCCL.
+    ///
+    /// Uses a single NCCL broadcast with a fixed-size buffer. The first 4
+    /// bytes encode the payload length (u32 LE), followed by the payload.
+    /// Max payload: 4MB (sufficient for serialized SchedulerOutput).
+    ///
+    /// All ranks must call this simultaneously (it's a collective).
+    ///
+    /// - On `root`: `data` is the payload to send.
+    /// - On non-root: `data` is ignored; the returned `Vec<u8>` is the payload.
+    pub fn broadcast_bytes(&self, data: &[u8], root: usize) -> KernelResult<Vec<u8>> {
+        // Fixed buffer: 4 bytes length header + up to 4MB payload.
+        const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
+        const HEADER_SIZE: usize = 4; // u32 length
+        let buf_bytes = HEADER_SIZE + MAX_PAYLOAD;
+        let num_u32 = buf_bytes / 4;
+
+        if data.len() > MAX_PAYLOAD {
+            return Err(KernelError::Other(format!(
+                "broadcast_bytes: data too large ({} bytes, max {})",
+                data.len(),
+                MAX_PAYLOAD
+            )));
+        }
+
+        let stream = self.comm.stream();
+
+        // Allocate fixed-size GPU buffer.
+        let mut buf = stream
+            .alloc_zeros::<u32>(num_u32)
+            .map_err(|e| KernelError::Other(format!("alloc broadcast buf failed: {e}")))?;
+
+        // Root: pack length + payload into the buffer.
+        if self.rank == root {
+            let len = data.len() as u32;
+            let mut host_buf = vec![0u32; num_u32];
+            // Write length as first u32.
+            host_buf[0] = len;
+            // Copy payload bytes after the header.
+            if !data.is_empty() {
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (host_buf.as_mut_ptr() as *mut u8).add(HEADER_SIZE),
+                        MAX_PAYLOAD,
+                    )
+                };
+                dst[..data.len()].copy_from_slice(data);
+            }
+            stream
+                .memcpy_htod(&host_buf, &mut buf)
+                .map_err(|e| KernelError::Other(format!("memcpy H2D failed: {e}")))?;
+        }
+
+        // Single NCCL broadcast — all ranks participate.
+        self.comm
+            .broadcast_in_place(&mut buf, root as i32)
+            .map_err(|e| KernelError::Other(format!("NCCL broadcast failed: {e:?}")))?;
+
+        // All ranks: read buffer back to host.
+        let mut host_buf = vec![0u32; num_u32];
+        stream
+            .memcpy_dtoh(&buf, &mut host_buf)
+            .map_err(|e| KernelError::Other(format!("memcpy D2H failed: {e}")))?;
+        stream
+            .synchronize()
+            .map_err(|e| KernelError::Other(format!("sync failed: {e}")))?;
+
+        // Extract length and payload.
+        let len = host_buf[0] as usize;
+        let payload = unsafe {
+            let ptr = (host_buf.as_ptr() as *const u8).add(HEADER_SIZE);
+            std::slice::from_raw_parts(ptr, len)
+        };
+        Ok(payload.to_vec())
+    }
+
     // -----------------------------------------------------------------------
     // Internal typed helpers
     // -----------------------------------------------------------------------
@@ -371,6 +447,11 @@ impl vllm_model::process_group::ProcessGroup for NcclProcessGroup {
 
     fn world_size(&self) -> usize {
         self.world_size
+    }
+
+    fn broadcast_bytes(&self, data: &[u8], root: usize) -> candle_core::Result<Vec<u8>> {
+        NcclProcessGroup::broadcast_bytes(self, data, root)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))
     }
 }
 

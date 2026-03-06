@@ -189,7 +189,8 @@ extern "C" void run_mha_paged(
     int32_t *block_table_ptr,
     int64_t block_table_batch_stride,
     int page_block_size,
-    int num_splits
+    int num_splits,
+    cudaStream_t cuda_stream
 ) {
     Flash_fwd_params params;
     memset(&params, 0, sizeof(params));
@@ -261,6 +262,10 @@ extern "C" void run_mha_paged(
     params.page_block_size = page_block_size;
     params.num_splits = num_splits;
 
-    cudaStream_t stream = 0;
+    // Use the caller's stream so FA2 properly orders with preceding kernels
+    // (e.g. reshape_and_cache) that wrote KV data on the same stream.
+    // Passing NULL (0) would use the default stream, which is independent
+    // from non-default streams and causes read-before-write races.
+    cudaStream_t stream = cuda_stream;
     run_mha_fwd(params, stream);
 }

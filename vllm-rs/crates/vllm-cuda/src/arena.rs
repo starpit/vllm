@@ -16,13 +16,43 @@ use anyhow::Result;
 /// Alignment for all arena allocations (256 bytes covers all CUDA requirements).
 const ALIGNMENT: usize = 256;
 
-/// Bump-allocated GPU scratch memory.
-pub struct ScratchArena {
+/// A single contiguous GPU memory segment.
+struct Segment {
     base: *mut u8,
     capacity: usize,
+}
+
+impl Segment {
+    unsafe fn new(capacity: usize) -> Result<Self> {
+        let base = driver::mem_alloc(capacity)?;
+        Ok(Self { base, capacity })
+    }
+}
+
+impl Drop for Segment {
+    fn drop(&mut self) {
+        if !self.base.is_null() {
+            unsafe {
+                let _ = driver::mem_free(self.base);
+            }
+        }
+    }
+}
+
+/// Bump-allocated GPU scratch memory.
+///
+/// Uses a primary segment for fast-path allocation. When the primary overflows
+/// during warmup, a new larger segment is allocated and becomes primary.
+/// The old segment is kept alive in `retired` so existing `GpuTensor` pointers
+/// remain valid until `reset()`. On `reset()`, retired segments are freed and
+/// the primary is kept at its grown capacity.
+pub struct ScratchArena {
+    primary: Segment,
     offset: usize,
     high_water: usize,
     locked: bool,
+    /// Old segments kept alive until reset() so pointers stay valid.
+    retired: Vec<Segment>,
     /// Debug: generation counter, incremented on each reset.
     #[cfg(debug_assertions)]
     generation: u64,
@@ -39,17 +69,20 @@ impl ScratchArena {
     /// Must be called while a CUDA context is active on this thread.
     pub unsafe fn new(initial_capacity: usize) -> Result<Self> {
         let capacity = align_up(initial_capacity);
-        let base = if capacity > 0 {
-            driver::mem_alloc(capacity)?
+        let primary = if capacity > 0 {
+            Segment::new(capacity)?
         } else {
-            std::ptr::null_mut()
+            Segment {
+                base: std::ptr::null_mut(),
+                capacity: 0,
+            }
         };
         Ok(Self {
-            base,
-            capacity,
+            primary,
             offset: 0,
             high_water: 0,
             locked: false,
+            retired: Vec::new(),
             #[cfg(debug_assertions)]
             generation: 0,
         })
@@ -64,20 +97,20 @@ impl ScratchArena {
         let aligned = align_up(elem_bytes);
 
         let new_offset = self.offset + aligned;
-        if new_offset > self.capacity {
+        if new_offset > self.primary.capacity {
             if self.locked {
                 panic!(
                     "ScratchArena overflow after lock! Need {} bytes at offset {}, capacity {}",
-                    aligned, self.offset, self.capacity
+                    aligned, self.offset, self.primary.capacity
                 );
             }
-            // During warmup: grow the arena.
+            // During warmup: grow. Old segment is retired (pointers stay valid).
             unsafe {
                 self.grow(new_offset);
             }
         }
 
-        let ptr = unsafe { self.base.add(self.offset) };
+        let ptr = unsafe { self.primary.base.add(self.offset) };
         self.offset = self.offset + aligned;
         if self.offset > self.high_water {
             self.high_water = self.offset;
@@ -90,6 +123,8 @@ impl ScratchArena {
     /// Called once per engine step, after sampling completes.
     pub fn reset(&mut self) {
         self.offset = 0;
+        // Free retired segments — their tensors are no longer referenced.
+        self.retired.clear();
         #[cfg(debug_assertions)]
         {
             self.generation += 1;
@@ -100,10 +135,12 @@ impl ScratchArena {
     /// Call after warmup to guarantee zero-allocation inference.
     pub fn lock(&mut self) {
         self.locked = true;
+        // Free any retired segments before locking.
+        self.retired.clear();
         tracing::info!(
             "ScratchArena locked: capacity={} bytes ({:.1} MB), high_water={} bytes ({:.1} MB)",
-            self.capacity,
-            self.capacity as f64 / (1024.0 * 1024.0),
+            self.primary.capacity,
+            self.primary.capacity as f64 / (1024.0 * 1024.0),
             self.high_water,
             self.high_water as f64 / (1024.0 * 1024.0),
         );
@@ -121,7 +158,7 @@ impl ScratchArena {
 
     /// Total capacity in bytes.
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.primary.capacity
     }
 
     /// High-water mark: maximum bytes used in any step.
@@ -131,50 +168,32 @@ impl ScratchArena {
 
     /// Grow the arena to at least `min_capacity` bytes.
     ///
+    /// The old segment is retired (kept alive so existing GpuTensor pointers
+    /// remain valid). A new, larger segment becomes primary and the bump
+    /// offset resets to 0. The caller's allocation will be the first in the
+    /// new segment.
+    ///
     /// # Safety
     /// Must be called while a CUDA context is active.
     unsafe fn grow(&mut self, min_capacity: usize) {
-        // Grow by 2x or to min_capacity, whichever is larger.
-        let new_capacity = align_up(min_capacity.max(self.capacity * 2).max(1024 * 1024));
-        tracing::debug!(
+        let new_capacity = align_up(min_capacity.max(self.primary.capacity * 2).max(1024 * 1024));
+        tracing::warn!(
             "ScratchArena growing: {} -> {} bytes ({:.1} MB)",
-            self.capacity,
+            self.primary.capacity,
             new_capacity,
             new_capacity as f64 / (1024.0 * 1024.0),
         );
 
-        let new_base = driver::mem_alloc(new_capacity).expect("ScratchArena: GPU OOM during grow");
+        let new_seg = Segment::new(new_capacity).expect("ScratchArena: GPU OOM during grow");
 
-        // Copy existing live data to new buffer.
-        // During warmup, there may be tensors in use from the current step.
-        if self.offset > 0 && !self.base.is_null() {
-            // Synchronous D2D copy — fine during warmup (not on hot path).
-            // We use the NULL stream here since we don't have a stream ref;
-            // grow() only happens during warmup before arena is locked.
-            let _ = driver::memcpy_dtod_async(
-                new_base,
-                self.base,
-                self.offset,
-                std::ptr::null_mut(), // NULL stream = synchronous
-            );
+        // Retire old segment — its pointers stay valid until reset().
+        let old = std::mem::replace(&mut self.primary, new_seg);
+        if !old.base.is_null() {
+            self.retired.push(old);
         }
 
-        if !self.base.is_null() {
-            let _ = driver::mem_free(self.base);
-        }
-
-        self.base = new_base;
-        self.capacity = new_capacity;
-    }
-}
-
-impl Drop for ScratchArena {
-    fn drop(&mut self) {
-        if !self.base.is_null() {
-            unsafe {
-                let _ = driver::mem_free(self.base);
-            }
-        }
+        // Reset offset — new allocations start from the new segment's base.
+        self.offset = 0;
     }
 }
 

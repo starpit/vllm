@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#![allow(unsafe_op_in_unsafe_fn)]
 //! Purpose-built CUDA tensor runtime for LLM inference.
 //!
 //! Replaces candle as the GPU backend with a zero-allocation, arena-based
@@ -53,8 +54,8 @@ pub use cublas::CublasHandle;
 #[cfg(feature = "cuda")]
 pub use device::GpuDevice;
 #[cfg(feature = "cuda")]
-pub use layers::{Embedding, Linear, RmsNorm};
-#[cfg(feature = "cuda")]
 pub use kv_cache::KvCachePool;
+#[cfg(feature = "cuda")]
+pub use layers::{Embedding, Linear, RmsNorm};
 #[cfg(feature = "cuda")]
 pub use weights::GpuWeights;

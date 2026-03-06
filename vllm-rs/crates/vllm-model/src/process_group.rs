@@ -26,4 +26,11 @@ pub trait ProcessGroup: Send + Sync + std::fmt::Debug {
 
     /// Total number of ranks.
     fn world_size(&self) -> usize;
+
+    /// Broadcast a byte buffer from `root` to all ranks (collective).
+    /// On root: sends `data`. On non-root: returns received data.
+    /// Default: no-op passthrough (single-node).
+    fn broadcast_bytes(&self, data: &[u8], _root: usize) -> candle_core::Result<Vec<u8>> {
+        Ok(data.to_vec())
+    }
 }

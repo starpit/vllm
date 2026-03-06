@@ -9,8 +9,8 @@
 
 use anyhow::Result;
 
-use crate::cublas::CublasHandle;
 use crate::arena::ScratchArena;
+use crate::cublas::CublasHandle;
 use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kernels;
@@ -83,35 +83,25 @@ impl RotaryCache {
         match dtype {
             DType::F32 => {
                 let host = crate::driver::mem_alloc_host(nbytes)?;
-                std::ptr::copy_nonoverlapping(
-                    cache.as_ptr() as *const u8,
-                    host,
-                    nbytes,
-                );
+                std::ptr::copy_nonoverlapping(cache.as_ptr() as *const u8, host, nbytes);
                 crate::driver::memcpy_htod_async(gpu_ptr, host, nbytes, device.compute_stream)?;
                 crate::driver::stream_synchronize(device.compute_stream)?;
                 crate::driver::mem_free_host(host)?;
             }
             DType::F16 => {
-                let f16_data: Vec<half::f16> = cache.iter().map(|&v| half::f16::from_f32(v)).collect();
+                let f16_data: Vec<half::f16> =
+                    cache.iter().map(|&v| half::f16::from_f32(v)).collect();
                 let host = crate::driver::mem_alloc_host(nbytes)?;
-                std::ptr::copy_nonoverlapping(
-                    f16_data.as_ptr() as *const u8,
-                    host,
-                    nbytes,
-                );
+                std::ptr::copy_nonoverlapping(f16_data.as_ptr() as *const u8, host, nbytes);
                 crate::driver::memcpy_htod_async(gpu_ptr, host, nbytes, device.compute_stream)?;
                 crate::driver::stream_synchronize(device.compute_stream)?;
                 crate::driver::mem_free_host(host)?;
             }
             DType::BF16 => {
-                let bf16_data: Vec<half::bf16> = cache.iter().map(|&v| half::bf16::from_f32(v)).collect();
+                let bf16_data: Vec<half::bf16> =
+                    cache.iter().map(|&v| half::bf16::from_f32(v)).collect();
                 let host = crate::driver::mem_alloc_host(nbytes)?;
-                std::ptr::copy_nonoverlapping(
-                    bf16_data.as_ptr() as *const u8,
-                    host,
-                    nbytes,
-                );
+                std::ptr::copy_nonoverlapping(bf16_data.as_ptr() as *const u8, host, nbytes);
                 crate::driver::memcpy_htod_async(gpu_ptr, host, nbytes, device.compute_stream)?;
                 crate::driver::stream_synchronize(device.compute_stream)?;
                 crate::driver::mem_free_host(host)?;
@@ -120,7 +110,10 @@ impl RotaryCache {
         }
 
         let cos_sin_cache = GpuTensor::new(gpu_ptr, &[max_pos, rotary_dim], dtype);
-        Ok(Self { cos_sin_cache, head_dim })
+        Ok(Self {
+            cos_sin_cache,
+            head_dim,
+        })
     }
 }
 
@@ -175,7 +168,11 @@ impl LlamaMLP {
 
     /// Load with pre-fused gate_up weight (if the model stores it that way,
     /// or if we pre-fuse during weight loading).
-    pub fn load_prefused(weights: &mut GpuWeights, prefix: &str, intermediate_size: usize) -> Result<Self> {
+    pub fn load_prefused(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        intermediate_size: usize,
+    ) -> Result<Self> {
         // Try fused first, fallback to separate.
         let gate_up_name = format!("{prefix}.gate_up_proj.weight");
         let gate_up = if weights.contains(&gate_up_name) {
@@ -199,19 +196,23 @@ impl LlamaMLP {
     }
 
     /// Forward pass.
-    pub unsafe fn forward(
-        &self,
-        x: GpuTensor,
-        device: &mut GpuDevice,
-    ) -> GpuTensor {
+    pub unsafe fn forward(&self, x: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
         // gate_up_proj: [num_tokens, 2*intermediate]
-        let gate_up = self.gate_up_proj.forward(x, &device.cublas, &mut device.arena);
+        let gate_up = self
+            .gate_up_proj
+            .forward(x, &device.cublas, &mut device.arena);
 
         // Fused SiLU(gate) * up → [num_tokens, intermediate]
-        let activated = kernels::silu_and_mul_fused(gate_up, self.intermediate_size, &mut device.arena);
+        let activated = kernels::silu_and_mul_fused(
+            gate_up,
+            self.intermediate_size,
+            &mut device.arena,
+            device.compute_stream,
+        );
 
         // down_proj: [num_tokens, hidden]
-        self.down_proj.forward(activated, &device.cublas, &mut device.arena)
+        self.down_proj
+            .forward(activated, &device.cublas, &mut device.arena)
     }
 }
 
@@ -226,8 +227,8 @@ pub struct LlamaAttention {
     q_size: usize,
     kv_size: usize,
     num_q_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
     scale: f32,
     layer_idx: usize,
 }
@@ -303,7 +304,9 @@ impl LlamaAttention {
         let num_tokens = hidden_states.dim(0);
 
         // Fused QKV projection: [num_tokens, q_size + 2*kv_size]
-        let qkv = self.qkv_proj.forward(hidden_states, &device.cublas, &mut device.arena);
+        let qkv = self
+            .qkv_proj
+            .forward(hidden_states, &device.cublas, &mut device.arena);
 
         // Split Q/K/V and make contiguous.
         let (q, k, v) = kernels::split_qkv(
@@ -326,15 +329,18 @@ impl LlamaAttention {
             positions,
             rotary.cos_sin_cache,
             self.head_dim,
+            device.compute_stream,
         );
 
         // Write new K/V tokens into paged cache.
         kernels::reshape_and_cache(
-            k, v,
+            k,
+            v,
             kv_cache.k_cache(self.layer_idx),
             kv_cache.v_cache(self.layer_idx),
             slot_mapping,
             kv_cache.block_size,
+            device.compute_stream,
         );
 
         // Paged FlashAttention-2.
@@ -351,11 +357,13 @@ impl LlamaAttention {
             true, // causal
             kv_cache.block_size,
             &mut device.arena,
+            device.compute_stream,
         );
 
         // Reshape to [num_tokens, q_size] and output projection.
         let attn_flat = attn_output.reshape(&[num_tokens, self.q_size]);
-        self.o_proj.forward(attn_flat, &device.cublas, &mut device.arena)
+        self.o_proj
+            .forward(attn_flat, &device.cublas, &mut device.arena)
     }
 }
 
@@ -365,7 +373,7 @@ impl LlamaAttention {
 
 /// A single LLaMA decoder layer.
 pub struct LlamaDecoderLayer {
-    self_attn: LlamaAttention,
+    pub self_attn: LlamaAttention,
     mlp: LlamaMLP,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
@@ -410,16 +418,24 @@ impl LlamaDecoderLayer {
                 self.input_layernorm.weight,
                 self.input_layernorm.eps,
                 &mut device.arena,
+                device.compute_stream,
             );
             (normed, hidden_states)
         };
 
         // Attention with paged KV cache.
         let attn_output = self.self_attn.forward(
-            normed, positions, slot_mapping,
-            cu_seqlens_q, cu_seqlens_k, block_table,
-            max_seqlen_q, max_seqlen_k,
-            kv_cache, rotary, device,
+            normed,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            rotary,
+            device,
         );
 
         // Post-attention norm with fused residual add.
@@ -431,7 +447,6 @@ impl LlamaDecoderLayer {
             &mut device.arena,
             device.compute_stream,
         );
-
         // MLP.
         let mlp_output = self.mlp.forward(normed, device);
 
@@ -445,10 +460,10 @@ impl LlamaDecoderLayer {
 
 /// LLaMA transformer backbone.
 pub struct LlamaModel {
-    embed_tokens: Embedding,
-    layers: Vec<LlamaDecoderLayer>,
-    norm: RmsNorm,
-    rotary: RotaryCache,
+    pub embed_tokens: Embedding,
+    pub layers: Vec<LlamaDecoderLayer>,
+    pub norm: RmsNorm,
+    pub rotary: RotaryCache,
 }
 
 impl LlamaModel {
@@ -481,16 +496,25 @@ impl LlamaModel {
             self.embed_tokens.weight,
             input_ids,
             &mut device.arena,
+            device.compute_stream,
         );
 
         // Decoder layers with residual threading.
         let mut residual: Option<GpuTensor> = None;
         for layer in &self.layers {
             let (hs, res) = layer.forward(
-                hidden_states, residual, positions,
-                slot_mapping, cu_seqlens_q, cu_seqlens_k, block_table,
-                max_seqlen_q, max_seqlen_k,
-                kv_cache, &self.rotary, device,
+                hidden_states,
+                residual,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                kv_cache,
+                &self.rotary,
+                device,
             );
             hidden_states = hs;
             residual = Some(res);
@@ -515,14 +539,17 @@ impl LlamaModel {
 
 /// LLaMA for causal language modeling.
 pub struct LlamaForCausalLM {
-    model: LlamaModel,
-    lm_head: Linear,
+    pub model: LlamaModel,
+    pub lm_head: Linear,
 }
 
 impl LlamaForCausalLM {
     /// Forward pass: input_ids → logits.
     ///
-    /// Returns `[num_tokens, vocab_size]` logits (in model dtype).
+    /// If `last_token_indices` is provided, gathers only those rows from hidden
+    /// states before the lm_head projection, returning `[num_reqs, vocab_size]`
+    /// instead of `[num_tokens, vocab_size]`. This avoids computing the expensive
+    /// vocab projection for tokens whose logits are never used.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
@@ -536,14 +563,33 @@ impl LlamaForCausalLM {
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
+        last_token_indices: Option<GpuTensor>,
     ) -> GpuTensor {
         let hidden_states = self.model.forward(
-            input_ids, positions,
-            slot_mapping, cu_seqlens_q, cu_seqlens_k, block_table,
-            max_seqlen_q, max_seqlen_k,
-            kv_cache, device,
+            input_ids,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            device,
         );
-        self.lm_head.forward(hidden_states, &device.cublas, &mut device.arena)
+        // Gather only last-token hidden states before the expensive lm_head GEMM.
+        let hidden_states = if let Some(indices) = last_token_indices {
+            kernels::embedding_gather(
+                hidden_states,
+                indices,
+                &mut device.arena,
+                device.compute_stream,
+            )
+        } else {
+            hidden_states
+        };
+        self.lm_head
+            .forward(hidden_states, &device.cublas, &mut device.arena)
     }
 }
 

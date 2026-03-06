@@ -535,9 +535,7 @@ mod tests {
     #[test]
     fn test_llm_kv_cache_block() {
         // KV cache: [num_blocks=128, block_size=16, num_kv_heads=8, head_dim=128] in F16
-        let t = unsafe {
-            GpuTensor::new(0x1000 as *mut u8, &[128, 16, 8, 128], DType::F16)
-        };
+        let t = unsafe { GpuTensor::new(0x1000 as *mut u8, &[128, 16, 8, 128], DType::F16) };
         assert_eq!(t.numel(), 128 * 16 * 8 * 128);
         assert_eq!(t.leading_stride(), 16 * 8 * 128);
     }

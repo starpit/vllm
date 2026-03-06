@@ -172,28 +172,31 @@ extern "C" {
 
 void rms_norm_f32(
     float* out, const float* input, const float* weight,
-    float epsilon, int num_tokens, int hidden_size)
+    float epsilon, int num_tokens, int hidden_size,
+    cudaStream_t stream)
 {
     int threads = (hidden_size < 1024) ? hidden_size : 1024;
-    rms_norm_kernel<float><<<num_tokens, threads>>>(
+    rms_norm_kernel<float><<<num_tokens, threads, 0, stream>>>(
         out, input, weight, epsilon, hidden_size);
 }
 
 void rms_norm_f16(
     __half* out, const __half* input, const __half* weight,
-    float epsilon, int num_tokens, int hidden_size)
+    float epsilon, int num_tokens, int hidden_size,
+    cudaStream_t stream)
 {
     int threads = (hidden_size < 1024) ? hidden_size : 1024;
-    rms_norm_kernel<__half><<<num_tokens, threads>>>(
+    rms_norm_kernel<__half><<<num_tokens, threads, 0, stream>>>(
         out, input, weight, epsilon, hidden_size);
 }
 
 void rms_norm_bf16(
     __nv_bfloat16* out, const __nv_bfloat16* input, const __nv_bfloat16* weight,
-    float epsilon, int num_tokens, int hidden_size)
+    float epsilon, int num_tokens, int hidden_size,
+    cudaStream_t stream)
 {
     int threads = (hidden_size < 1024) ? hidden_size : 1024;
-    rms_norm_kernel<__nv_bfloat16><<<num_tokens, threads>>>(
+    rms_norm_kernel<__nv_bfloat16><<<num_tokens, threads, 0, stream>>>(
         out, input, weight, epsilon, hidden_size);
 }
 
@@ -201,28 +204,31 @@ void rms_norm_bf16(
 
 void fused_add_rms_norm_f32(
     float* input, float* residual, const float* weight,
-    float epsilon, int num_tokens, int hidden_size)
+    float epsilon, int num_tokens, int hidden_size,
+    cudaStream_t stream)
 {
     int threads = (hidden_size < 1024) ? hidden_size : 1024;
-    fused_add_rms_norm_kernel<float><<<num_tokens, threads>>>(
+    fused_add_rms_norm_kernel<float><<<num_tokens, threads, 0, stream>>>(
         input, residual, weight, epsilon, hidden_size);
 }
 
 void fused_add_rms_norm_f16(
     __half* input, __half* residual, const __half* weight,
-    float epsilon, int num_tokens, int hidden_size)
+    float epsilon, int num_tokens, int hidden_size,
+    cudaStream_t stream)
 {
     int threads = (hidden_size < 1024) ? hidden_size : 1024;
-    fused_add_rms_norm_kernel<__half><<<num_tokens, threads>>>(
+    fused_add_rms_norm_kernel<__half><<<num_tokens, threads, 0, stream>>>(
         input, residual, weight, epsilon, hidden_size);
 }
 
 void fused_add_rms_norm_bf16(
     __nv_bfloat16* input, __nv_bfloat16* residual, const __nv_bfloat16* weight,
-    float epsilon, int num_tokens, int hidden_size)
+    float epsilon, int num_tokens, int hidden_size,
+    cudaStream_t stream)
 {
     int threads = (hidden_size < 1024) ? hidden_size : 1024;
-    fused_add_rms_norm_kernel<__nv_bfloat16><<<num_tokens, threads>>>(
+    fused_add_rms_norm_kernel<__nv_bfloat16><<<num_tokens, threads, 0, stream>>>(
         input, residual, weight, epsilon, hidden_size);
 }
 

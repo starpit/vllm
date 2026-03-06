@@ -83,7 +83,8 @@ Pod: `oc rsh nick` — L40S GPU, CUDA 12.9, Rust 1.93, path `/root/vllm/vllm-rs/
 - **`graph_metadata_valid` flag** on `CudaWorker`: tracks whether persistent buffers have valid state. First decode step after batch composition change uses full H2D; subsequent steps use fast path.
 - Rust FFI wrapper: `kernels::update_decode_metadata_gpu()` in `kernels.rs`.
 
-### cublasLt algorithm benchmarking (bc5ae1824 — LATEST)
+### cublasLt algorithm benchmarking (bc5ae1824) — NOW OPT-IN (`--cublas-autotune`)
+- **Off by default** — decode GEMMs are memory-bound at small M, so faster algorithms showed no measurable throughput gain. Adds ~3-5s to startup.
 - **`CublasHandle::benchmark_plans()`**: runs during warmup after plan cache is populated from both prefill warmup and graph capture (decode shapes). Gets top 8 algorithms per GEMM shape from heuristic, benchmarks each (3 warmup + 10 timed with CUDA events), keeps the fastest.
 - **`event_elapsed()`** added to `driver.rs` for GPU timing.
 - Benchmarking found 7-40% faster algorithms on individual GEMM shapes vs heuristic on L40S:
@@ -91,7 +92,7 @@ Pod: `oc rsh nick` — L40S GPU, CUDA 12.9, Rust 1.93, path `/root/vllm/vllm-rs/
   - M=32 K=4864 N=896: algo #4 is **18.8%** faster
   - M=2048 K=896 N=1152 (prefill QKV): algo #1 is **21.2%** faster
   - M=2048 K=896 N=151936 (prefill lm_head): algo #1 is **14.7%** faster
-- Decode throughput stable (GEMMs are memory-bound at small M); prefill benefits not captured by latency bench.
+- Prefill shapes (large M) benefit; decode shapes (small M) do not. May become worthwhile with chunked prefill.
 
 ### GPU-aware max_num_batched_tokens (bc5ae1824 — LATEST)
 - After `init_device()`, queries free VRAM via `determine_available_memory()`.
@@ -176,7 +177,7 @@ Current numbers (after all optimizations):
 | Issue | Severity | Notes |
 |-------|----------|-------|
 | ~~Throughput bench OOM on 3B~~ | ~~High~~ | **FIXED** — per-layer arena scoping + `max_num_batched_tokens` wiring. |
-| ~~No cuBLAS autotuning~~ | ~~Medium~~ | **FIXED** — `benchmark_plans()` finds 7-40% faster algorithms per shape. |
+| ~~No cuBLAS autotuning~~ | ~~Medium~~ | **OPT-IN** — `--cublas-autotune` flag. No decode benefit (memory-bound); may help prefill. |
 | ~~H2D copies per decode step~~ | ~~Medium~~ | **FIXED** — persistent GPU metadata with `update_decode_metadata` kernel. |
 | ~~Hardcoded max_num_batched_tokens~~ | ~~Low~~ | **FIXED** — GPU-aware auto-detection from VRAM. |
 | ~~Gap to Python vLLM on 3B~~ | ~~Low~~ | **FIXED** — Now **5% faster** than Python (17.05k vs 16.24k tok/s) after fixing `max_num_batched_tokens` default + buffer reuse optimizations. |

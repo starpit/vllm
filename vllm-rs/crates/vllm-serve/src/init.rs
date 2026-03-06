@@ -95,6 +95,8 @@ pub struct VllmConfig {
     /// Maximum number of tokens processed in a single scheduler iteration.
     /// None = auto (min(max_model_len, 8192)).
     pub max_num_batched_tokens: Option<usize>,
+    /// Benchmark cublasLt algorithms during warmup.
+    pub cublas_autotune: bool,
 }
 
 impl Default for VllmConfig {
@@ -126,6 +128,7 @@ impl Default for VllmConfig {
             enable_prefix_caching: true,
             enforce_eager: false,
             max_num_batched_tokens: None,
+            cublas_autotune: false,
         }
     }
 }
@@ -242,6 +245,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
                 .as_ref()
                 .map(|c| c.capture_sizes.clone())
                 .unwrap_or_default(),
+            cublas_autotune: config.cublas_autotune,
         };
 
         let mut worker = CudaWorker::new(cuda_config);

@@ -214,6 +214,11 @@ pub struct ServeArgs {
     /// By default, prefix caching is enabled.
     #[arg(long)]
     pub no_prefix_caching: bool,
+
+    /// Benchmark cublasLt algorithms during warmup to find faster GEMM kernels.
+    /// Adds a few seconds to startup. Mainly benefits compute-bound prefill GEMMs.
+    #[arg(long)]
+    pub cublas_autotune: bool,
 }
 
 impl ServeArgs {

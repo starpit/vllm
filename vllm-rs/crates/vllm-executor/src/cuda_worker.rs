@@ -52,6 +52,8 @@ pub struct CudaWorkerConfig {
     pub max_num_batched_tokens: usize,
     /// Batch sizes to capture as CUDA graphs (sorted, deduplicated).
     pub cuda_graph_sizes: Vec<usize>,
+    /// Run cublasLt algorithm benchmarking during warmup (--cublas-autotune).
+    pub cublas_autotune: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1882,10 +1884,9 @@ impl Worker for CudaWorker {
             }
         }
 
-        // Benchmark cublasLt algorithms now that the plan cache is populated
-        // from both the prefill warmup and graph capture (decode shapes).
-        // This replaces heuristic-selected algorithms with empirically fastest ones.
-        unsafe { device.cublas.benchmark_plans(&mut device.arena) };
+        if self.config.cublas_autotune {
+            unsafe { device.cublas.benchmark_plans(&mut device.arena) };
+        }
         device.arena.reset();
 
         Ok(())

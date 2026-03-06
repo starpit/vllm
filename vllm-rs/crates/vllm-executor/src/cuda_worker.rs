@@ -639,7 +639,7 @@ impl Worker for CudaWorker {
 
         // 6. Construct model based on architecture.
         let model = match arch.as_str() {
-            "LlamaForCausalLM" | "MistralForCausalLM" => {
+            "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen3ForCausalLM" | "Phi3ForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
                 let m = vllm_cuda::model::llama::LlamaForCausalLM::load(
                     &mut weights,
@@ -677,7 +677,8 @@ impl Worker for CudaWorker {
             _ => {
                 return Err(ExecutorError::WorkerInit(format!(
                     "unsupported architecture for cuda-backend: {arch}. \
-                     Supported: LlamaForCausalLM, MistralForCausalLM, Qwen2ForCausalLM, Gemma2ForCausalLM"
+                     Supported: LlamaForCausalLM, MistralForCausalLM, Qwen3ForCausalLM, \
+                     Phi3ForCausalLM, Qwen2ForCausalLM, Gemma2ForCausalLM"
                 )));
             }
         };

@@ -1,7 +1,7 @@
 # Context Handoff: vllm-cuda Optimizations
 
 Worktree: `.claude/worktrees/cuda-models/` on branch `feat/cuda-qwen2-gemma2`
-Latest commit: bc5ae1824 — "perf: persistent GPU metadata, cublasLt benchmarking, GPU-aware batching"
+Latest commit: 360ee9053 — "perf: prefill CUDA graphs + transfer stream H2D overlap"
 
 ## Edit/build/test cycle
 
@@ -62,7 +62,22 @@ Pod: `oc rsh nick` — L40S GPU, CUDA 12.9, Rust 1.93, path `/root/vllm/vllm-rs/
 - **Arena pre-sizing**: Warmup dummy forward now uses `max_num_batched_tokens` (single sequence) instead of hardcoded 256 tokens.
 - Wired into LLaMA, Qwen2 (delegates to LLaMA), and Gemma2 model forward passes.
 
-### Persistent GPU decode metadata (bc5ae1824 — LATEST)
+### Prefill CUDA graphs (360ee9053 — LATEST)
+- **New `PrefillGraphRunner`** in `graph.rs`: captures CUDA graphs for single-sequence prefill at power-of-2 token counts [128, 256, 512, 1024, 2048, 4096, 8192] (filtered by `max_num_batched_tokens`).
+- Persistent input buffers: `input_ids`, `positions`, `slot_mapping` sized for max_tokens; `cu_seqlens_q/k` [2], `block_table` [1, MAX_BLOCKS], `last_token_indices` [1].
+- `capture()` runs forward with `last_token_indices` + argmax under graph capture. Output: `[1, vocab_size]`.
+- `replay()` pads real tokens to captured size, padding slots get `slot_mapping=-1`. H2D on transfer stream + event sync.
+- **Wired into `CudaWorker::execute_model()`**: used when `num_reqs == 1 && q_len == seq_len` (fresh single-request prefill).
+- Captured after decode graphs in `compile_or_warm_up_model()`, before cublasLt benchmarking (so prefill GEMM shapes get benchmarked too).
+- **Results**: 9-10% prefill latency reduction at input_len=512-1024 on Qwen2.5-0.5B.
+
+### Transfer stream H2D overlap (360ee9053 — LATEST)
+- All three graph replay paths (`replay()`, `replay_decode_fast()`, prefill `replay()`) now use `device.transfer_stream` for H2D copies instead of `compute_stream`.
+- Event sync via `device.sync_transfer_to_compute()` before graph launch.
+- Frees compute stream from H2D serialization; enables PCIe controller to pipeline multiple small copies.
+- No measurable throughput impact on decode (copies are tiny), but architecturally correct for future cross-step pipelining.
+
+### Persistent GPU decode metadata (bc5ae1824)
 - **New CUDA kernel** `update_decode_metadata` in `embedding_kernels.cu`: in one launch, increments `positions[i] += 1`, computes `slot_mapping[i]` from new position + block_table, increments `cu_seqlens_k[1..N+1] += 1`.
 - **`replay_decode_fast()`** on `CudaGraphRunner`: uses the GPU kernel instead of building 5 CPU Vecs + 5 H2D copies. `cu_seqlens_q` skipped entirely (constant for decode). Block table only H2D-copied when blocks actually change.
 - **`graph_metadata_valid` flag** on `CudaWorker`: tracks whether persistent buffers have valid state. First decode step after batch composition change uses full H2D; subsequent steps use fast path.
@@ -118,8 +133,12 @@ Current numbers (after all optimizations):
 
 | Model | Temp | Mode | tok/s |
 |-------|------|------|-------|
-| Qwen2.5-0.5B | 0 | Eager | 3245 |
-| Qwen2.5-0.5B | 0 | Graphs | 3646 |
+| Qwen2.5-0.5B | 0 | Eager | 3259 |
+| Qwen2.5-0.5B | 0 | Graphs | 3639 |
+| Qwen2.5-0.5B BS=1 in=512 | 0 | Eager | 395.6 |
+| Qwen2.5-0.5B BS=1 in=512 | 0 | Prefill+Decode graphs | 436.3 |
+| Qwen2.5-0.5B BS=1 in=1024 | 0 | Eager | 354.4 |
+| Qwen2.5-0.5B BS=1 in=1024 | 0 | Prefill+Decode graphs | 386.5 |
 | Qwen2.5-3B | 0 | Graphs | 807 |
 | Qwen2.5-3B | - | Throughput | 12528 total tok/s |
 
@@ -138,7 +157,7 @@ Current numbers (after all optimizations):
 | ~~No cuBLAS autotuning~~ | ~~Medium~~ | **FIXED** — `benchmark_plans()` finds 7-40% faster algorithms per shape. |
 | ~~H2D copies per decode step~~ | ~~Medium~~ | **FIXED** — persistent GPU metadata with `update_decode_metadata` kernel. |
 | ~~Hardcoded max_num_batched_tokens~~ | ~~Low~~ | **FIXED** — GPU-aware auto-detection from VRAM. |
-| Gap to Python vLLM on 3B | Medium | Remaining causes: no prefill graph, no H2D overlap with compute. |
+| Gap to Python vLLM on 3B | Medium | ~30% behind Python on `bench throughput` (12528 vs ~20135). Remaining causes: no cross-step H2D pipelining, chunked prefill not graphed, less aggressive batching/scheduling. |
 | Arena pre-sizes to ~1GB for 3B | Low | Correct behavior. Could auto-size from model config. |
 | ~~RoPE scaling for Llama 3.2~~ | ~~Low~~ | **FIXED** — llama3 rope_scaling implemented in both backends. |
 | `--bench` warmup corrupts chat | Low | Chat `--bench` mode warmup (1-token gen) leaves dirty state, garbling subsequent output. Non-bench chat works perfectly. |
@@ -146,9 +165,10 @@ Current numbers (after all optimizations):
 ## Next steps (priority order)
 
 1. **Throughput bench** — Re-run with larger graph sizes + non-greedy fast path. Baseline: 14873 tok/s → target: close to Python 20135.
-2. **Prefill graph capture** — Capture prefill forward passes for common prompt lengths. Currently only decode is graphed.
-3. **H2D/compute overlap** — Use transfer stream to overlap metadata H2D with compute. Currently all H2D is on compute stream.
-4. **More model architectures** — Port additional architectures to vllm-cuda backend.
+2. ~~**Prefill graph capture**~~ — **DONE** (360ee9053). Single-sequence prefill graphs at [128..8192] token counts. 9-10% uplift.
+3. ~~**H2D/compute overlap**~~ — **DONE** (360ee9053). Transfer stream for all graph H2D. Cross-step pipelining deferred.
+4. ~~**LLaMA-family aliases**~~ — **DONE**. Added Qwen3ForCausalLM and Phi3ForCausalLM to LLaMA match arm in CudaWorker. E2E verified: Qwen3-0.6B on L40S.
+5. **More model architectures** — Port remaining architectures (MoE, DeepSeek, Gemma3, etc.) to vllm-cuda backend.
 
 ## Key files
 
@@ -161,4 +181,5 @@ Current numbers (after all optimizations):
 - CUDA worker: `crates/vllm-executor/src/cuda_worker.rs` (greedy graph fast path, batch padding, `graph_metadata_valid`)
 - Arena scoping: `crates/vllm-cuda/src/arena.rs` (`set_offset`, scoping tests), `crates/vllm-cuda/src/model/llama.rs` (per-layer scoping pattern)
 - Config: `crates/vllm-serve/src/init.rs` (GPU-aware `max_num_batched_tokens`), `crates/vllm-executor/src/cuda_worker.rs` (`CudaWorkerConfig`)
+- Prefill graph runner: `crates/vllm-cuda/src/graph.rs` (`PrefillGraphRunner`, `PrefillInputTensors`, `PrefillReplayOutput`)
 - Old split_qkv kernel: Still in `embedding_kernels.cu` and `kernels.rs` (not removed — may be useful for non-RoPE models)

@@ -896,6 +896,44 @@ async fn test_cuda_qwen2_chat() {
     assert!(!text.is_empty(), "response should not be empty");
 }
 
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_qwen3_completion() {
+    let server = TestServer::builder(TestModels::QWEN3_0_6B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "completion should not be empty"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_qwen3_chat() {
+    let server = TestServer::builder(TestModels::QWEN3_0_6B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("What is 2+2? Answer with just the number.", Some(10));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(!text.is_empty(), "response should not be empty");
+}
+
 // ===========================================================================
 // CUDA GGUF E2E tests — quantized GGUF models on GPU
 // ===========================================================================
@@ -1103,7 +1141,7 @@ async fn test_cuda_gguf_qwen3_next_chat() {
     );
 }
 */
- // end GGUF block comment
+// end GGUF block comment
 
 // ---------------------------------------------------------------------------
 // Tensor Parallelism (TP=2) tests — require 2 CUDA GPUs + NCCL

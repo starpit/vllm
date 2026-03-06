@@ -92,6 +92,7 @@ impl MixtralConfig {
             sliding_window: self.sliding_window,
             partial_rotary_factor: 1.0,
             long_rope_scaling: None,
+            llama3_rope_scaling: None,
         }
     }
 }

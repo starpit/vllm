@@ -22,6 +22,15 @@ use crate::weights::GpuWeights;
 // ---------------------------------------------------------------------------
 
 /// Parsed LLaMA config (mirrors the candle version but no candle types).
+/// Llama 3.x rope_scaling parameters.
+#[derive(Debug, Clone)]
+pub struct Llama3RopeScaling {
+    pub factor: f64,
+    pub low_freq_factor: f64,
+    pub high_freq_factor: f64,
+    pub original_max_position_embeddings: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
     pub hidden_size: usize,
@@ -35,6 +44,7 @@ pub struct LlamaConfig {
     pub rope_theta: f64,
     pub head_dim: usize,
     pub tie_word_embeddings: bool,
+    pub llama3_rope_scaling: Option<Llama3RopeScaling>,
 }
 
 // ---------------------------------------------------------------------------
@@ -57,18 +67,43 @@ impl RotaryCache {
         head_dim: usize,
         max_pos: usize,
         rope_theta: f64,
+        llama3_scaling: Option<&Llama3RopeScaling>,
         dtype: DType,
         device: &GpuDevice,
     ) -> Result<Self> {
         let rotary_dim = head_dim; // full rotary for LLaMA
         let half = rotary_dim / 2;
 
+        // Compute inverse frequencies, optionally with llama3 scaling.
+        let inv_freqs: Vec<f64> = (0..half)
+            .map(|i| {
+                let freq = 1.0 / rope_theta.powf(2.0 * i as f64 / rotary_dim as f64);
+                if let Some(scaling) = llama3_scaling {
+                    let old_context_len = scaling.original_max_position_embeddings as f64;
+                    let low_freq_wavelen = old_context_len / scaling.low_freq_factor;
+                    let high_freq_wavelen = old_context_len / scaling.high_freq_factor;
+                    let wavelen = 2.0 * std::f64::consts::PI / freq;
+                    if wavelen < high_freq_wavelen {
+                        freq // high frequency: keep as-is
+                    } else if wavelen > low_freq_wavelen {
+                        freq / scaling.factor // low frequency: scale down
+                    } else {
+                        // smooth interpolation
+                        let smooth = (old_context_len / wavelen - scaling.low_freq_factor)
+                            / (scaling.high_freq_factor - scaling.low_freq_factor);
+                        (1.0 - smooth) * freq / scaling.factor + smooth * freq
+                    }
+                } else {
+                    freq
+                }
+            })
+            .collect();
+
         // Build on CPU, then copy to GPU.
         let mut cache = vec![0f32; max_pos * rotary_dim];
         for pos in 0..max_pos {
             for i in 0..half {
-                let freq = 1.0 / rope_theta.powf(2.0 * i as f64 / rotary_dim as f64);
-                let angle = pos as f64 * freq;
+                let angle = pos as f64 * inv_freqs[i];
                 cache[pos * rotary_dim + i] = angle.cos() as f32;
                 cache[pos * rotary_dim + half + i] = angle.sin() as f32;
             }
@@ -470,23 +505,11 @@ impl LlamaModel {
         );
 
         // Decoder layers with per-layer arena scoping.
-        //
-        // Pre-allocate persistent buffers for the two inter-layer tensors
-        // (hidden_states and residual). Each layer's intermediates (QKV
-        // projections, attention workspace, MLP activations) are allocated
-        // after these buffers and reclaimed after the layer completes.
-        // This matches PyTorch's memory behavior where intermediates are
-        // freed when dropped, keeping peak memory proportional to one
-        // layer's scratch instead of all layers combined.
-        //
-        // The residual buffer is updated in-place by fused_add_rms_norm,
-        // so only hidden_states needs a D2D copy per layer.
         let num_tokens = hidden_states.dim(0);
         let hidden_size = hidden_states.dim(1);
         let dtype = hidden_states.dtype();
         let hs_buf = device.arena.alloc(&[num_tokens, hidden_size], dtype);
         let res_buf = device.arena.alloc(&[num_tokens, hidden_size], dtype);
-        // Copy initial embedding output into the persistent buffer.
         crate::driver::memcpy_dtod_async(
             hs_buf.raw_ptr() as *mut u8,
             hidden_states.raw_ptr() as *const u8,
@@ -512,17 +535,8 @@ impl LlamaModel {
                 &self.rotary,
                 device,
             );
-            // Copy hidden_states (mlp_output, in scratch) to persistent buffer.
-            crate::driver::memcpy_dtod_async(
-                hs_buf.raw_ptr() as *mut u8,
-                hs.raw_ptr() as *const u8,
-                hs.size_bytes(),
-                device.compute_stream,
-            )
-            .expect("dtod copy hidden_states");
-            // First layer returns residual = hs_buf (the original embedding);
-            // subsequent layers return res_buf (updated in-place). Copy into
-            // res_buf if needed.
+            // Copy residual to persistent buffer FIRST if it aliases hs_buf
+            // (first layer: residual = hs_buf = original embedding).
             if res.raw_ptr() != res_buf.raw_ptr() {
                 crate::driver::memcpy_dtod_async(
                     res_buf.raw_ptr() as *mut u8,
@@ -532,6 +546,14 @@ impl LlamaModel {
                 )
                 .expect("dtod copy residual");
             }
+            // Copy hidden_states (mlp_output, in scratch) to persistent buffer.
+            crate::driver::memcpy_dtod_async(
+                hs_buf.raw_ptr() as *mut u8,
+                hs.raw_ptr() as *const u8,
+                hs.size_bytes(),
+                device.compute_stream,
+            )
+            .expect("dtod copy hidden_states");
             device.arena.set_offset(layer_scratch_base);
             residual = Some(res_buf);
         }
@@ -706,7 +728,46 @@ impl LlamaAttention {
 
         // Fuse: [q_size + 2*kv_size, hidden]
         let qkv_w = unsafe { concat3_dim0(q_w, k_w, v_w, stream)? };
-        let qkv_proj = Linear::new(qkv_w, None);
+
+        // Fuse QKV bias if present (Qwen2 has QKV bias, LLaMA doesn't).
+        let q_bias_name = format!("{prefix}.q_proj.bias");
+        let k_bias_name = format!("{prefix}.k_proj.bias");
+        let v_bias_name = format!("{prefix}.v_proj.bias");
+        let qkv_bias = if weights.contains(&q_bias_name) {
+            let q_b = weights.take(&q_bias_name)?;
+            let k_b = weights.take(&k_bias_name)?;
+            let v_b = weights.take(&v_bias_name)?;
+            // Reshape [size] → [size, 1] for concat_dim0, then squeeze back.
+            // Actually concat3_dim0 works on any ndim where dims after 0 match.
+            // For 1-D tensors [q_size], [kv_size], [kv_size] → [q_size + 2*kv_size].
+            // Use a simple D2D concat for 1-D:
+            let total = q_b.numel() + k_b.numel() + v_b.numel();
+            let ptr = unsafe { crate::driver::mem_alloc(total * q_b.dtype().size_bytes())? };
+            unsafe {
+                crate::driver::memcpy_dtod_async(
+                    ptr,
+                    q_b.raw_ptr() as *const u8,
+                    q_b.size_bytes(),
+                    stream,
+                )?;
+                crate::driver::memcpy_dtod_async(
+                    ptr.add(q_b.size_bytes()),
+                    k_b.raw_ptr() as *const u8,
+                    k_b.size_bytes(),
+                    stream,
+                )?;
+                crate::driver::memcpy_dtod_async(
+                    ptr.add(q_b.size_bytes() + k_b.size_bytes()),
+                    v_b.raw_ptr() as *const u8,
+                    v_b.size_bytes(),
+                    stream,
+                )?;
+            }
+            Some(unsafe { GpuTensor::new(ptr, &[total], q_b.dtype()) })
+        } else {
+            None
+        };
+        let qkv_proj = Linear::new(qkv_w, qkv_bias);
 
         let o_proj = Linear::load(weights, &format!("{prefix}.o_proj"))?;
 
@@ -818,6 +879,7 @@ impl LlamaModel {
                 config.head_dim,
                 config.max_position_embeddings,
                 config.rope_theta,
+                config.llama3_rope_scaling.as_ref(),
                 dtype,
                 device,
             )?

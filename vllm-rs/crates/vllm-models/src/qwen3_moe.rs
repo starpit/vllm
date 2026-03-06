@@ -108,6 +108,7 @@ impl Qwen3MoeConfig {
             sliding_window: None,
             partial_rotary_factor: 1.0,
             long_rope_scaling: None,
+            llama3_rope_scaling: None,
         }
     }
 

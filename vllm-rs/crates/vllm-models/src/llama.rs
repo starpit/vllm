@@ -63,6 +63,8 @@ pub struct LlamaConfig {
     pub partial_rotary_factor: f64,
     /// LongRoPE scaling parameters. `None` means standard RoPE.
     pub long_rope_scaling: Option<LongRopeScaling>,
+    /// Llama 3.x rope_scaling parameters. `None` means not using llama3 scaling.
+    pub llama3_rope_scaling: Option<vllm_model::layers::rotary::Llama3RopeScaling>,
 }
 
 impl LlamaConfig {
@@ -102,6 +104,36 @@ impl LlamaConfig {
         let head_dim = config
             .head_dim()
             .unwrap_or(hidden_size / num_attention_heads);
+
+        // Parse llama3 rope_scaling (rope_scaling.rope_type == "llama3" or type == "llama3").
+        let llama3_rope_scaling = config.extra.get("rope_scaling").and_then(|rs| {
+            let rope_type = rs
+                .get("rope_type")
+                .or_else(|| rs.get("type"))
+                .and_then(|v| v.as_str())?;
+            if rope_type != "llama3" {
+                return None;
+            }
+            let factor = rs.get("factor")?.as_f64()?;
+            let low_freq_factor = rs
+                .get("low_freq_factor")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
+            let high_freq_factor = rs
+                .get("high_freq_factor")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(4.0);
+            let original_max = rs
+                .get("original_max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(8192) as usize;
+            Some(vllm_model::layers::rotary::Llama3RopeScaling {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position_embeddings: original_max,
+            })
+        });
 
         // Parse LongRoPE scaling (rope_scaling.type == "longrope").
         let long_rope_scaling = config.extra.get("rope_scaling").and_then(|rs| {
@@ -159,6 +191,7 @@ impl LlamaConfig {
             sliding_window,
             partial_rotary_factor,
             long_rope_scaling,
+            llama3_rope_scaling,
         })
     }
 }
@@ -324,13 +357,24 @@ impl LlamaAttention {
         let num_kv_heads = config.num_kv_heads / world_size;
         let head_dim = config.head_dim;
 
-        let rotary_emb = RotaryEmbedding::new(
-            head_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
-            dtype,
-            device,
-        )?;
+        let rotary_emb = if let Some(ref scaling) = config.llama3_rope_scaling {
+            RotaryEmbedding::new_llama3(
+                head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                scaling,
+                dtype,
+                device,
+            )?
+        } else {
+            RotaryEmbedding::new(
+                head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                dtype,
+                device,
+            )?
+        };
 
         Ok(Self {
             qkv_proj,
@@ -362,13 +406,24 @@ impl LlamaAttention {
         let qkv_proj = Linear::zeros(hidden, qkv_size, dtype, device)?;
         let o_proj = RowParallelLinear::new(Linear::zeros(q_size, hidden, dtype, device)?, true);
 
-        let rotary_emb = RotaryEmbedding::new(
-            config.head_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
-            dtype,
-            device,
-        )?;
+        let rotary_emb = if let Some(ref scaling) = config.llama3_rope_scaling {
+            RotaryEmbedding::new_llama3(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                scaling,
+                dtype,
+                device,
+            )?
+        } else {
+            RotaryEmbedding::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                dtype,
+                device,
+            )?
+        };
 
         Ok(Self {
             qkv_proj,
@@ -1104,6 +1159,7 @@ mod tests {
             sliding_window: None,
             partial_rotary_factor: 1.0,
             long_rope_scaling: None,
+            llama3_rope_scaling: None,
         }
     }
 

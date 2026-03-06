@@ -237,6 +237,11 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             device_id,
             enforce_eager: config.enforce_eager,
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
+            cuda_graph_sizes: config
+                .cuda_graph_config
+                .as_ref()
+                .map(|c| c.capture_sizes.clone())
+                .unwrap_or_default(),
         };
 
         let mut worker = CudaWorker::new(cuda_config);

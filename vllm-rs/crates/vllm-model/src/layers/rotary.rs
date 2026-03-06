@@ -38,6 +38,15 @@ pub struct RotaryEmbedding {
     max_position: usize,
 }
 
+/// Llama 3.x rope_scaling parameters (`rope_type: "llama3"`).
+#[derive(Debug, Clone)]
+pub struct Llama3RopeScaling {
+    pub factor: f64,
+    pub low_freq_factor: f64,
+    pub high_freq_factor: f64,
+    pub original_max_position_embeddings: usize,
+}
+
 impl RotaryEmbedding {
     /// Create a new RoPE with the given parameters.
     ///
@@ -106,6 +115,103 @@ impl RotaryEmbedding {
         // [max_pos, head_dim] where first half cols = cos, second half = sin.
         // Force contiguous to ensure the CUDA kernel can access it with simple
         // pointer arithmetic (pos * rotary_dim).
+        let cos_sin_cache = Tensor::cat(
+            &[
+                &cos_cache
+                    .narrow(1, 0, half_dim)
+                    .map_err(ModelError::Candle)?,
+                &sin_cache
+                    .narrow(1, 0, half_dim)
+                    .map_err(ModelError::Candle)?,
+            ],
+            1,
+        )
+        .map_err(ModelError::Candle)?
+        .contiguous()
+        .map_err(ModelError::Candle)?;
+
+        Ok(Self {
+            cos_cache,
+            sin_cache,
+            cos_sin_cache,
+            head_dim,
+            max_position,
+        })
+    }
+
+    /// Create a Llama 3.x RoPE with frequency-dependent scaling.
+    ///
+    /// Llama 3 modifies the base inverse frequencies: high-frequency dims
+    /// are kept as-is, low-frequency dims are scaled by `1/factor`, and
+    /// middle-range dims are smoothly interpolated.
+    pub fn new_llama3(
+        head_dim: usize,
+        max_position: usize,
+        base: f64,
+        scaling: &Llama3RopeScaling,
+        dtype: DType,
+        device: &Device,
+    ) -> ModelResult<Self> {
+        if !head_dim.is_multiple_of(2) {
+            return Err(ModelError::Other(format!(
+                "RoPE head_dim must be even, got {}",
+                head_dim
+            )));
+        }
+
+        let half_dim = head_dim / 2;
+        let old_context_len = scaling.original_max_position_embeddings as f64;
+        let low_freq_wavelen = old_context_len / scaling.low_freq_factor;
+        let high_freq_wavelen = old_context_len / scaling.high_freq_factor;
+
+        let inv_freq: Vec<f32> = (0..half_dim)
+            .map(|i| {
+                let freq = 1.0 / base.powf(2.0 * i as f64 / head_dim as f64);
+                let wavelen = 2.0 * std::f64::consts::PI / freq;
+                let adjusted = if wavelen < high_freq_wavelen {
+                    // High frequency: keep as-is.
+                    freq
+                } else if wavelen > low_freq_wavelen {
+                    // Low frequency: scale down.
+                    freq / scaling.factor
+                } else {
+                    // Medium: smooth interpolation.
+                    let smooth = (old_context_len / wavelen - scaling.low_freq_factor)
+                        / (scaling.high_freq_factor - scaling.low_freq_factor);
+                    (1.0 - smooth) * freq / scaling.factor + smooth * freq
+                };
+                adjusted as f32
+            })
+            .collect();
+
+        let inv_freq_tensor =
+            Tensor::from_slice(&inv_freq, half_dim, device).map_err(ModelError::Candle)?;
+
+        let positions: Vec<f32> = (0..max_position).map(|p| p as f32).collect();
+        let pos_tensor =
+            Tensor::from_slice(&positions, max_position, device).map_err(ModelError::Candle)?;
+
+        let pos_2d = pos_tensor
+            .reshape((max_position, 1))
+            .map_err(ModelError::Candle)?;
+        let inv_freq_2d = inv_freq_tensor
+            .reshape((1, half_dim))
+            .map_err(ModelError::Candle)?;
+        let freqs = pos_2d.matmul(&inv_freq_2d).map_err(ModelError::Candle)?;
+
+        let freqs_full = Tensor::cat(&[&freqs, &freqs], 1).map_err(ModelError::Candle)?;
+
+        let cos_cache = freqs_full
+            .cos()
+            .map_err(ModelError::Candle)?
+            .to_dtype(dtype)
+            .map_err(ModelError::Candle)?;
+        let sin_cache = freqs_full
+            .sin()
+            .map_err(ModelError::Candle)?
+            .to_dtype(dtype)
+            .map_err(ModelError::Candle)?;
+
         let cos_sin_cache = Tensor::cat(
             &[
                 &cos_cache

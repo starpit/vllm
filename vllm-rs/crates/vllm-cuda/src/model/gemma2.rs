@@ -512,6 +512,7 @@ impl Gemma2Model {
                 config.head_dim,
                 config.max_position_embeddings,
                 config.rope_theta,
+                None, // Gemma2 uses plain RoPE
                 dtype,
                 device,
             )?
@@ -580,13 +581,8 @@ impl Gemma2Model {
                 &self.rotary,
                 device,
             );
-            crate::driver::memcpy_dtod_async(
-                hs_buf.raw_ptr() as *mut u8,
-                hs.raw_ptr() as *const u8,
-                hs.size_bytes(),
-                device.compute_stream,
-            )
-            .expect("dtod copy hidden_states");
+            // Copy residual to persistent buffer FIRST if it aliases hs_buf
+            // (first layer: residual = hs_buf = original embedding).
             if res.raw_ptr() != res_buf.raw_ptr() {
                 crate::driver::memcpy_dtod_async(
                     res_buf.raw_ptr() as *mut u8,
@@ -596,6 +592,13 @@ impl Gemma2Model {
                 )
                 .expect("dtod copy residual");
             }
+            crate::driver::memcpy_dtod_async(
+                hs_buf.raw_ptr() as *mut u8,
+                hs.raw_ptr() as *const u8,
+                hs.size_bytes(),
+                device.compute_stream,
+            )
+            .expect("dtod copy hidden_states");
             device.arena.set_offset(layer_scratch_base);
             residual = Some(res_buf);
         }

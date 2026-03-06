@@ -218,6 +218,7 @@ impl Qwen3NextConfig {
             sliding_window: None,
             partial_rotary_factor: self.partial_rotary_factor,
             long_rope_scaling: None,
+            llama3_rope_scaling: None,
         }
     }
 

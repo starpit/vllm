@@ -49,6 +49,8 @@ pub struct CudaWorkerConfig {
     pub enforce_eager: bool,
     /// Maximum tokens per scheduler iteration (controls arena pre-sizing).
     pub max_num_batched_tokens: usize,
+    /// Batch sizes to capture as CUDA graphs (sorted, deduplicated).
+    pub cuda_graph_sizes: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +182,39 @@ fn llama_config_from_hf(
     let num_kv_heads = hf.num_key_value_heads.unwrap_or(num_attention_heads);
     let head_dim = hf.head_dim.unwrap_or(hidden_size / num_attention_heads);
 
+    // Parse llama3 rope_scaling if present.
+    let llama3_rope_scaling = hf.extra.get("rope_scaling").and_then(|rs| {
+        let rope_type = rs
+            .get("rope_type")
+            .or_else(|| rs.get("type"))
+            .and_then(|v| v.as_str())?;
+        if rope_type != "llama3" {
+            return None;
+        }
+        Some(vllm_cuda::model::llama::Llama3RopeScaling {
+            factor: rs.get("factor")?.as_f64()?,
+            low_freq_factor: rs
+                .get("low_freq_factor")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0),
+            high_freq_factor: rs
+                .get("high_freq_factor")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(4.0),
+            original_max_position_embeddings: rs
+                .get("original_max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(8192) as usize,
+        })
+    });
+
+    if let Some(ref s) = llama3_rope_scaling {
+        info!(
+            "llama3 rope_scaling: factor={}, low_freq={}, high_freq={}, orig_max={}",
+            s.factor, s.low_freq_factor, s.high_freq_factor, s.original_max_position_embeddings
+        );
+    }
+
     Ok(vllm_cuda::model::llama::LlamaConfig {
         hidden_size,
         num_attention_heads,
@@ -192,6 +227,7 @@ fn llama_config_from_hf(
         rope_theta: hf.rope_theta.unwrap_or(10000.0),
         head_dim,
         tie_word_embeddings: hf.tie_word_embeddings.unwrap_or(false),
+        llama3_rope_scaling,
     })
 }
 
@@ -973,69 +1009,108 @@ impl Worker for CudaWorker {
             let graph_bs = graph_bs.unwrap();
             let meta = &prepared.attn_meta;
 
-            let mut input_ids = prepared.flat_token_ids.clone();
-            input_ids.resize(graph_bs, 0);
-            let mut positions = prepared.flat_positions.clone();
-            positions.resize(graph_bs, 0);
+            let replay_out =
+                if self.graph_metadata_valid && self.last_graph_batch_size == Some(graph_bs) {
+                    // Fast path: GPU-side metadata update (same as greedy).
+                    // Only input_ids must be H2D'd (no in-graph argmax scatter for non-greedy).
+                    let new_bt = if blocks_changed {
+                        let mut block_table = vec![0u32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
+                        for (i, blocks) in meta.block_ids.iter().enumerate() {
+                            for (j, &bid) in blocks.iter().enumerate() {
+                                if j < GRAPH_MAX_BLOCKS_PER_SEQ {
+                                    block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
+                                }
+                            }
+                        }
+                        Some(block_table)
+                    } else {
+                        None
+                    };
 
-            let mut cu_seqlens_q: Vec<u32> = (0..=num_reqs as u32).collect();
-            for _ in num_reqs..graph_bs {
-                cu_seqlens_q.push(num_reqs as u32);
-            }
+                    // Must H2D input_ids since non-greedy doesn't use in-graph argmax scatter.
+                    let mut input_ids = prepared.flat_token_ids.clone();
+                    input_ids.resize(graph_bs, 0);
 
-            let mut cu_seqlens_k = Vec::with_capacity(graph_bs + 1);
-            cu_seqlens_k.push(0u32);
-            let mut cum = 0u32;
-            for &sl in &meta.seq_lens {
-                cum += sl as u32;
-                cu_seqlens_k.push(cum);
-            }
-            for _ in num_reqs..graph_bs {
-                cu_seqlens_k.push(cum);
-            }
-
-            let mut slot_mapping = Vec::with_capacity(graph_bs);
-            for i in 0..num_reqs {
-                let abs_pos = meta.tokens_before[i];
-                let block_idx = abs_pos / block_size;
-                let offset = abs_pos % block_size;
-                let block_ids = &meta.block_ids[i];
-                if block_idx < block_ids.len() {
-                    slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
-                } else {
-                    slot_mapping.push(-1i64);
-                }
-            }
-            slot_mapping.resize(graph_bs, -1i64);
-
-            let mut block_table = vec![0u32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
-            for (i, blocks) in meta.block_ids.iter().enumerate() {
-                for (j, &bid) in blocks.iter().enumerate() {
-                    if j < GRAPH_MAX_BLOCKS_PER_SEQ {
-                        block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
+                    let runner = self.graph_runner.as_ref().unwrap();
+                    unsafe {
+                        runner.replay_decode_fast(
+                            graph_bs,
+                            Some(&input_ids),
+                            new_bt.as_deref(),
+                            block_size,
+                            device,
+                        )
                     }
-                }
-            }
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("graph replay_decode_fast: {e}"))
+                    })?
+                } else {
+                    // First step or batch composition changed: full H2D.
+                    let mut input_ids = prepared.flat_token_ids.clone();
+                    input_ids.resize(graph_bs, 0);
+                    let mut positions = prepared.flat_positions.clone();
+                    positions.resize(graph_bs, 0);
 
-            // Non-greedy: don't skip input_ids and don't track for next step.
-            self.last_graph_batch_size = None;
-            self.graph_metadata_valid = false;
+                    let mut cu_seqlens_q: Vec<u32> = (0..=num_reqs as u32).collect();
+                    for _ in num_reqs..graph_bs {
+                        cu_seqlens_q.push(num_reqs as u32);
+                    }
 
-            let runner = self.graph_runner.as_ref().unwrap();
-            let replay_out = unsafe {
-                runner.replay(
-                    graph_bs,
-                    &input_ids,
-                    &positions,
-                    &slot_mapping,
-                    &cu_seqlens_q,
-                    &cu_seqlens_k,
-                    &block_table,
-                    device,
-                    false, // always H2D input_ids for non-greedy
-                )
-            }
-            .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?;
+                    let mut cu_seqlens_k = Vec::with_capacity(graph_bs + 1);
+                    cu_seqlens_k.push(0u32);
+                    let mut cum = 0u32;
+                    for &sl in &meta.seq_lens {
+                        cum += sl as u32;
+                        cu_seqlens_k.push(cum);
+                    }
+                    for _ in num_reqs..graph_bs {
+                        cu_seqlens_k.push(cum);
+                    }
+
+                    let mut slot_mapping = Vec::with_capacity(graph_bs);
+                    for i in 0..num_reqs {
+                        let abs_pos = meta.tokens_before[i];
+                        let block_idx = abs_pos / block_size;
+                        let offset = abs_pos % block_size;
+                        let block_ids = &meta.block_ids[i];
+                        if block_idx < block_ids.len() {
+                            slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
+                        } else {
+                            slot_mapping.push(-1i64);
+                        }
+                    }
+                    slot_mapping.resize(graph_bs, -1i64);
+
+                    let mut block_table = vec![0u32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
+                    for (i, blocks) in meta.block_ids.iter().enumerate() {
+                        for (j, &bid) in blocks.iter().enumerate() {
+                            if j < GRAPH_MAX_BLOCKS_PER_SEQ {
+                                block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
+                            }
+                        }
+                    }
+
+                    let runner = self.graph_runner.as_ref().unwrap();
+                    unsafe {
+                        runner.replay(
+                            graph_bs,
+                            &input_ids,
+                            &positions,
+                            &slot_mapping,
+                            &cu_seqlens_q,
+                            &cu_seqlens_k,
+                            &block_table,
+                            device,
+                            false,
+                        )
+                    }
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
+                };
+
+            // Track metadata validity for next step (works for non-greedy too).
+            self.last_graph_batch_size = Some(graph_bs);
+            self.graph_metadata_valid = true;
+
             // Slice logits to only the real requests (discard padded rows).
             if graph_bs > num_reqs {
                 replay_out.logits.narrow_dim0(0, num_reqs)
@@ -1294,7 +1369,11 @@ impl Worker for CudaWorker {
 
         // Capture CUDA graphs for common decode batch sizes.
         // During decode, every request has q_len=1, so shapes are deterministic.
-        let capture_sizes: Vec<usize> = vec![1, 2, 4, 8, 16, 32];
+        let capture_sizes = if self.config.cuda_graph_sizes.is_empty() {
+            vec![1, 2, 4, 8, 16, 32]
+        } else {
+            self.config.cuda_graph_sizes.clone()
+        };
         let max_bs = *capture_sizes.iter().max().unwrap();
 
         // Pre-size the arena by running dummy forwards that cover the worst-case

@@ -313,6 +313,11 @@ impl LLM {
         self.max_model_len
     }
 
+    /// The tokenizer, if one was loaded.
+    pub fn tokenizer(&self) -> Option<&Arc<crate::tokenizer::Tokenizer>> {
+        self.tokenizer.as_ref()
+    }
+
     /// Tokenize a text string, using the tokenizer if available.
     fn tokenize_text(&self, text: &str) -> Result<Vec<u32>> {
         if let Some(tok) = &self.tokenizer {
@@ -479,11 +484,12 @@ impl LLM {
             for output in &outputs.outputs {
                 if let Some(idx) = request_ids.iter().position(|id| *id == output.request_id) {
                     generated_tokens[idx].extend_from_slice(&output.new_token_ids);
-                    if let Some(ref reason) = output.finish_reason {
+                    if let Some(ref reason) = output.finish_reason
+                        && finish_reasons[idx].is_none()
+                    {
                         finish_reasons[idx] = Some(reason.to_string());
                         newly_finished += 1;
                         if pbar.is_some() {
-                            // Find prompt index for this request.
                             let p_idx = idx / n;
                             total_in_toks += prompt_token_ids[p_idx].len();
                             total_out_toks += generated_tokens[idx].len();

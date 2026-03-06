@@ -9,6 +9,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
+use indicatif::{ProgressBar, ProgressStyle};
 use vllm_common::telemetry;
 use vllm_config::CudaGraphConfig;
 use vllm_serve::llm::{LLM, LLMBuilder, Prompt, SamplingParams};
@@ -77,7 +78,14 @@ pub(crate) fn run_bench_throughput(args: BenchThroughputArgs) -> Result<()> {
         required_len,
     );
 
-    // Generate random prompts with deterministic seed.
+    // Generate random prompts — mirrors Python's RandomDataset.sample():
+    // generate token IDs, decode to text, then let LLM re-tokenize (round-trip
+    // through the tokenizer, matching the Python methodology).
+    let tokenizer = llm
+        .tokenizer()
+        .ok_or_else(|| anyhow::anyhow!("tokenizer required for throughput benchmark"))?;
+    let vocab_size = tokenizer.vocab_size().max(1) as u64;
+
     let mut rng_state: u64 = args.seed;
     let mut next_rng = || -> u64 {
         // Simple xorshift64 for deterministic pseudo-random generation.
@@ -87,15 +95,29 @@ pub(crate) fn run_bench_throughput(args: BenchThroughputArgs) -> Result<()> {
         rng_state
     };
 
+    let pb = ProgressBar::new(args.num_prompts as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "Rendering prompts: {wide_bar:.cyan/blue} {pos}/{len} [{elapsed}<{eta}, {per_sec}]",
+        )
+        .unwrap(),
+    );
+
     let prompts: Vec<Prompt> = (0..args.num_prompts)
         .map(|_| {
-            Prompt::TokenIds(
-                (0..args.input_len)
-                    .map(|_| (next_rng() % 10000) as u32)
-                    .collect(),
-            )
+            let token_ids: Vec<u32> = (0..args.input_len)
+                .map(|_| (next_rng() % vocab_size) as u32)
+                .collect();
+            // Decode to text then feed as a text prompt so that LLM.generate()
+            // re-tokenizes — matching the Python round-trip methodology.
+            let text = tokenizer
+                .decode(&token_ids, true)
+                .unwrap_or_else(|_| String::from("?"));
+            pb.inc(1);
+            Prompt::Text(text)
         })
         .collect();
+    pb.finish();
 
     let sampling_params = SamplingParams {
         temperature: 1.0,

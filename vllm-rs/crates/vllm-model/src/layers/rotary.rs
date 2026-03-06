@@ -104,6 +104,8 @@ impl RotaryEmbedding {
 
         // Build combined cos|sin cache for CUDA fused kernel:
         // [max_pos, head_dim] where first half cols = cos, second half = sin.
+        // Force contiguous to ensure the CUDA kernel can access it with simple
+        // pointer arithmetic (pos * rotary_dim).
         let cos_sin_cache = Tensor::cat(
             &[
                 &cos_cache
@@ -115,6 +117,8 @@ impl RotaryEmbedding {
             ],
             1,
         )
+        .map_err(ModelError::Candle)?
+        .contiguous()
         .map_err(ModelError::Candle)?;
 
         Ok(Self {
@@ -299,6 +303,8 @@ impl RotaryEmbedding {
             ],
             1,
         )
+        .map_err(ModelError::Candle)?
+        .contiguous()
         .map_err(ModelError::Candle)?;
 
         Ok(Self {

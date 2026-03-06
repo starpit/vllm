@@ -76,7 +76,7 @@ pub fn collect_stream_text(chunks: &[ChatCompletionStreamResponse]) -> String {
     text
 }
 
-/// Assert that text output is coherent (not empty, not just special tokens).
+/// Assert that text output is coherent (not empty, not garbled, not just special tokens).
 pub fn assert_coherent_text(text: &str, min_len: usize) {
     let trimmed = text.trim();
     assert!(
@@ -93,6 +93,25 @@ pub fn assert_coherent_text(text: &str, min_len: usize) {
         .trim()
         .is_empty();
     assert!(!unk_only, "text should not be only <unk>/<pad> tokens");
+
+    // Detect garbled output: if the majority of characters are non-ASCII,
+    // CJK, or unusual Unicode, the model is likely producing garbage.
+    // Real model output (even multilingual) has mostly ASCII when prompted
+    // in English with English-centric test prompts.
+    let total_chars = trimmed.chars().count();
+    if total_chars >= 10 {
+        let ascii_chars = trimmed.chars().filter(|c| c.is_ascii()).count();
+        let ascii_ratio = ascii_chars as f64 / total_chars as f64;
+        assert!(
+            ascii_ratio >= 0.5,
+            "text appears garbled: only {:.0}% ASCII ({} of {} chars). \
+             This usually indicates a kernel or numerical bug. Text: {:?}",
+            ascii_ratio * 100.0,
+            ascii_chars,
+            total_chars,
+            &trimmed[..trimmed.len().min(200)]
+        );
+    }
 }
 
 /// Assert that a completion response is well-formed.

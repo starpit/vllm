@@ -993,4 +993,102 @@ mod tests {
         // Decode step: single token.
         assert_fused_rotary_matches_cpu(1, 24, 128, DType::BF16, 5e-2);
     }
+
+    /// Build cos_sin_cache the same way `RotaryEmbedding::new()` does:
+    /// compute cos/sin with duplicated freqs, then narrow + cat.
+    /// This produces a non-trivially-strided tensor (unlike `make_cos_sin_cache`
+    /// which uses `from_slice` and is always contiguous).
+    #[cfg(feature = "cuda")]
+    fn make_cos_sin_cache_via_narrow(
+        max_pos: usize,
+        head_dim: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Tensor {
+        let half_dim = head_dim / 2;
+        let inv_freq: Vec<f32> = (0..half_dim)
+            .map(|i| (1.0 / 10000f64.powf(2.0 * i as f64 / head_dim as f64)) as f32)
+            .collect();
+        let inv_freq_tensor = Tensor::from_slice(&inv_freq, half_dim, device).unwrap();
+        let positions: Vec<f32> = (0..max_pos).map(|p| p as f32).collect();
+        let pos_tensor = Tensor::from_slice(&positions, max_pos, device).unwrap();
+        let pos_2d = pos_tensor.reshape((max_pos, 1)).unwrap();
+        let inv_freq_2d = inv_freq_tensor.reshape((1, half_dim)).unwrap();
+        let freqs = pos_2d.matmul(&inv_freq_2d).unwrap();
+        let freqs_full = Tensor::cat(&[&freqs, &freqs], 1).unwrap();
+        let cos_cache = freqs_full.cos().unwrap().to_dtype(dtype).unwrap();
+        let sin_cache = freqs_full.sin().unwrap().to_dtype(dtype).unwrap();
+        // This is the exact pattern from RotaryEmbedding::new() that was
+        // producing a non-contiguous tensor and causing garbled output.
+        Tensor::cat(
+            &[
+                &cos_cache.narrow(1, 0, half_dim).unwrap(),
+                &sin_cache.narrow(1, 0, half_dim).unwrap(),
+            ],
+            1,
+        )
+        .unwrap()
+        .contiguous()
+        .unwrap()
+    }
+
+    /// Regression test: fused RoPE with cache built via narrow+cat (model path).
+    ///
+    /// This catches the bug where `Tensor::cat` of column-narrowed views
+    /// produces a tensor with unexpected layout that the CUDA kernel
+    /// misinterprets via raw pointer arithmetic.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_fused_rotary_narrow_cat_cache() {
+        let dev = cuda_device();
+        let num_tokens = 4;
+        let num_heads = 8;
+        let head_dim = 128;
+        let half_dim = head_dim / 2;
+        let max_pos = 128;
+
+        // Build cache via narrow+cat on GPU (model construction path).
+        let cache_gpu = make_cos_sin_cache_via_narrow(max_pos, head_dim, DType::BF16, &dev);
+
+        // Build equivalent cache via from_slice on CPU (test construction path).
+        let cache_ref = make_cos_sin_cache(max_pos, half_dim)
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+
+        let positions =
+            Tensor::new((0..num_tokens as u32).collect::<Vec<_>>().as_slice(), &dev).unwrap();
+        let x = Tensor::randn(0f32, 1.0, &[num_tokens, num_heads, head_dim], &Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+
+        // Both caches should produce identical results.
+        let result_narrow =
+            super::fused_rotary_apply(&x, &positions, &cache_gpu, head_dim).unwrap();
+        let result_ref = super::fused_rotary_apply(&x, &positions, &cache_ref, head_dim).unwrap();
+
+        let vals_narrow = result_narrow
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let vals_ref = result_ref
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_close("narrow_cat_cache", &vals_ref, &vals_narrow, 5e-2);
+    }
 }

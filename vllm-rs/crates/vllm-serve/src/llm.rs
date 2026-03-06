@@ -367,6 +367,26 @@ impl LLM {
         prompts: &[P],
         params: Option<SamplingParams>,
     ) -> Result<Vec<RequestOutput>> {
+        self.generate_impl(prompts, params, false)
+    }
+
+    /// Like [`generate`](Self::generate), but with a tqdm-style progress bar
+    /// showing estimated input/output token throughput — mirrors Python's
+    /// `LLM.generate(use_tqdm=True)`.
+    pub fn generate_with_tqdm<P: Into<Prompt> + Clone>(
+        &mut self,
+        prompts: &[P],
+        params: Option<SamplingParams>,
+    ) -> Result<Vec<RequestOutput>> {
+        self.generate_impl(prompts, params, true)
+    }
+
+    fn generate_impl<P: Into<Prompt> + Clone>(
+        &mut self,
+        prompts: &[P],
+        params: Option<SamplingParams>,
+        use_tqdm: bool,
+    ) -> Result<Vec<RequestOutput>> {
         let params = params.unwrap_or_default();
         params
             .validate()
@@ -430,20 +450,63 @@ impl LLM {
         let mut generated_tokens: Vec<Vec<u32>> = vec![Vec::new(); total];
         let mut finish_reasons: Vec<Option<String>> = vec![None; total];
 
+        // Progress bar — mirrors Python's tqdm in _run_engine().
+        let pbar = if use_tqdm {
+            let pb = indicatif::ProgressBar::new(total as u64);
+            pb.set_style(
+                indicatif::ProgressStyle::with_template(
+                    "Processed prompts: {wide_bar:.cyan/blue} {pos}/{len} \
+                     [{elapsed}<{eta}, {per_sec}, {msg}]",
+                )
+                .unwrap(),
+            );
+            pb.set_message("est. speed input: 0.00 toks/s, output: 0.00 toks/s");
+            Some(pb)
+        } else {
+            None
+        };
+        let start = std::time::Instant::now();
+        let mut total_in_toks: usize = 0;
+        let mut total_out_toks: usize = 0;
+
         while self.client.engine().has_unfinished_requests() {
             let (outputs, _) = self
                 .client
                 .get_output()
                 .map_err(|e| anyhow::anyhow!("engine step failed: {e}"))?;
 
+            let mut newly_finished = 0usize;
             for output in &outputs.outputs {
                 if let Some(idx) = request_ids.iter().position(|id| *id == output.request_id) {
                     generated_tokens[idx].extend_from_slice(&output.new_token_ids);
                     if let Some(ref reason) = output.finish_reason {
                         finish_reasons[idx] = Some(reason.to_string());
+                        newly_finished += 1;
+                        if pbar.is_some() {
+                            // Find prompt index for this request.
+                            let p_idx = idx / n;
+                            total_in_toks += prompt_token_ids[p_idx].len();
+                            total_out_toks += generated_tokens[idx].len();
+                        }
                     }
                 }
             }
+
+            if let Some(ref pb) = pbar
+                && newly_finished > 0
+            {
+                let elapsed = start.elapsed().as_secs_f64().max(1e-9);
+                let in_spd = total_in_toks as f64 / elapsed;
+                let out_spd = total_out_toks as f64 / elapsed;
+                pb.set_message(format!(
+                    "est. speed input: {in_spd:.2} toks/s, output: {out_spd:.2} toks/s"
+                ));
+                pb.inc(newly_finished as u64);
+            }
+        }
+
+        if let Some(pb) = pbar {
+            pb.finish();
         }
 
         // Build RequestOutputs, grouping n completions per prompt.

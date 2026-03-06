@@ -125,6 +125,30 @@ impl ModelRunnerOutput {
             pooler_output: None,
         }
     }
+
+    /// Build from pre-ordered req_ids and per-request token IDs.
+    ///
+    /// More efficient than `from_token_map` — avoids the intermediate HashMap
+    /// and its String clones. `req_ids` and `token_ids` must have the same length
+    /// and be in the same order.
+    pub fn from_ordered(req_ids: Vec<String>, token_ids: Vec<u32>) -> Self {
+        debug_assert_eq!(req_ids.len(), token_ids.len());
+        let mut req_id_to_index = HashMap::with_capacity(req_ids.len());
+        let mut sampled_token_ids = Vec::with_capacity(req_ids.len());
+        for (idx, id) in req_ids.iter().enumerate() {
+            req_id_to_index.insert(id.clone(), idx);
+            sampled_token_ids.push(vec![token_ids[idx]]);
+        }
+        Self {
+            req_ids,
+            req_id_to_index,
+            sampled_token_ids,
+            logprobs: None,
+            prompt_logprobs_dict: HashMap::new(),
+            draft_token_ids: None,
+            pooler_output: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

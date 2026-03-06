@@ -236,7 +236,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             block_size: config.block_size,
             device_id,
             enforce_eager: config.enforce_eager,
-            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(4096),
             cuda_graph_sizes: config
                 .cuda_graph_config
                 .as_ref()
@@ -250,19 +250,23 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             .context("failed to initialize CUDA device")?;
 
         // Auto-detect max_num_batched_tokens from GPU VRAM if not explicitly set.
-        // H100/MI300x (>=70GB): 8192, others: 2048. Matches Python vLLM defaults.
+        // Python vLLM defaults: >=70GB non-A100: 16384, else: 8192 (LLM_CLASS).
+        // Note: Python uses PyTorch's fragmented allocator. Our contiguous ScratchArena
+        // needs the peak of one transformer layer to fit, so we may need a lower value
+        // on GPUs where VRAM is tight after model weights + KV cache.
         if config.max_num_batched_tokens.is_none() {
             let total_vram = worker.determine_available_memory().unwrap_or(0);
-            // determine_available_memory returns free VRAM; total is roughly free + used.
-            // For a fresh device, free ≈ total. Use 60GB as threshold (some VRAM used by driver).
             let total_gb = total_vram as f64 / (1024.0 * 1024.0 * 1024.0);
-            if total_gb >= 60.0 {
-                info!(
-                    "GPU has {:.0}GB free VRAM, using max_num_batched_tokens=8192",
-                    total_gb
-                );
-                worker.set_max_num_batched_tokens(8192);
-            }
+            // Without chunked prefill, the ScratchArena must fit the peak of one
+            // transformer layer for max_num_batched_tokens tokens. 8192 tokens on
+            // a 3B model needs ~2.5GB contiguous VRAM — too much for <=48GB GPUs
+            // after model weights + KV cache. Use 4096 as a safe default.
+            let batched_tokens = if total_gb >= 60.0 { 8192 } else { 4096 };
+            info!(
+                "GPU has {:.0}GB free VRAM, using max_num_batched_tokens={}",
+                total_gb, batched_tokens
+            );
+            worker.set_max_num_batched_tokens(batched_tokens);
         }
         worker.load_model().context("failed to load CUDA model")?;
 

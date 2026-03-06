@@ -154,7 +154,15 @@ Current numbers (after all optimizations):
 | Qwen2.5-0.5B BS=1 in=1024 | 0 | Eager | 354.4 |
 | Qwen2.5-0.5B BS=1 in=1024 | 0 | Prefill+Decode graphs | 386.5 |
 | Qwen2.5-3B | 0 | Graphs | 807 |
-| Qwen2.5-3B | - | Throughput | 13580 total tok/s |
+| Qwen2.5-3B | - | Throughput | **17051 total tok/s** |
+
+### Throughput bench comparison (1000 prompts, in=1024, out=128, L40S)
+
+| Engine | max_num_batched_tokens | Total tok/s | vs Python |
+|--------|----------------------|-------------|-----------|
+| Python vLLM (default, chunked prefill) | 8192 | 16,239 | baseline |
+| Rust vLLM (old default) | 2048 | 15,326 | -5.6% |
+| **Rust vLLM (new default)** | **4096** | **17,051** | **+5.0%** |
 
 ## Testing methodology
 
@@ -171,14 +179,30 @@ Current numbers (after all optimizations):
 | ~~No cuBLAS autotuning~~ | ~~Medium~~ | **FIXED** — `benchmark_plans()` finds 7-40% faster algorithms per shape. |
 | ~~H2D copies per decode step~~ | ~~Medium~~ | **FIXED** — persistent GPU metadata with `update_decode_metadata` kernel. |
 | ~~Hardcoded max_num_batched_tokens~~ | ~~Low~~ | **FIXED** — GPU-aware auto-detection from VRAM. |
-| Gap to Python vLLM on 3B | Low | ~3.3% behind Python on `bench throughput` (13.58k vs 14.05k tok/s). Nearly at parity. |
+| ~~Gap to Python vLLM on 3B~~ | ~~Low~~ | **FIXED** — Now **5% faster** than Python (17.05k vs 16.24k tok/s) after fixing `max_num_batched_tokens` default + buffer reuse optimizations. |
+| Arena OOM at max_num_batched_tokens=8192 on 3B | Medium | Contiguous arena needs ~2.5GB for one layer at 8192 tokens. Chunked prefill would fix (not yet implemented). Default capped at 4096 for ≤48GB GPUs. |
 | Arena pre-sizes to ~1GB for 3B | Low | Correct behavior. Could auto-size from model config. |
 | ~~RoPE scaling for Llama 3.2~~ | ~~Low~~ | **FIXED** — llama3 rope_scaling implemented in both backends. |
 | `--bench` warmup corrupts chat | Low | Chat `--bench` mode warmup (1-token gen) leaves dirty state, garbling subsequent output. Non-bench chat works perfectly. |
 
+### Per-step allocation reduction (LATEST)
+- **`InputBatch` buffer reuse**: 8 reusable Vec buffers in `InputBatch` (req_inputs, query_start_loc, q_lens, seq_lens, block_ids, tokens_before, is_prefill, req_ids). `prepare_inputs()` swaps them out, `reclaim_buffers()` returns them — preserving heap capacity across steps.
+- **`ModelRunnerOutput::from_ordered()`**: New constructor taking pre-ordered Vecs, avoids intermediate HashMap + String clones. Used by greedy graph and GPU sampling paths.
+- **Eliminated per-step `vec![token_id]`**: Direct `push(tok)` instead of alloc+extend for ~256 requests per step.
+- **Skip redundant `ctx_set_current`**: `ctx_set_on_thread` flag avoids CUDA driver call after first invocation.
+
+### `max_num_batched_tokens` fix (LATEST)
+- Default was **2048** while Python uses **8192**. L40S (46GB) can handle 4096 with our contiguous arena.
+- New auto-detection: ≥60GB → 8192, <60GB → 4096. Matches Python behavior more closely.
+- 8192 OOMs on L40S for 3B models because the arena needs ~2.5GB contiguous for one transformer layer at that token count. Chunked prefill (not yet implemented) would fix this.
+
+### Throughput bench prompt generation fix (LATEST)
+- Previous bench decoded random token IDs to text but didn't adjust for tokenizer roundtrip length mismatch (1024 random IDs → ~128 re-tokenized tokens).
+- Now uses Python's `gen_prompt_decode_to_target_len` approach: iteratively decode→encode→truncate/extend to hit exact target length (10 retries). Uses non-special tokens only (matching Python's `allowed_tokens` filter).
+
 ## Next steps (priority order)
 
-1. **Throughput bench** — Nearly at parity: 13.58k vs Python 14.05k tok/s (~3.3% gap).
+1. ~~**Throughput bench**~~ — **DONE**: 17.05k vs Python 16.24k tok/s (**+5% faster**).
 2. ~~**Prefill graph capture**~~ — **DONE** (360ee9053). Single-sequence prefill graphs at [128..8192] token counts. 9-10% uplift.
 3. ~~**H2D/compute overlap**~~ — **DONE** (360ee9053). Transfer stream for all graph H2D. Cross-step pipelining deferred.
 4. ~~**LLaMA-family aliases**~~ — **DONE**. Added Qwen3ForCausalLM and Phi3ForCausalLM to LLaMA match arm in CudaWorker. E2E verified: Qwen3-0.6B on L40S.

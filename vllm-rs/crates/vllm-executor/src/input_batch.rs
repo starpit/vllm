@@ -46,6 +46,16 @@ pub struct InputBatch {
     // --- Reusable per-step buffers (cleared + refilled each step) ---
     flat_token_ids: Vec<u32>,
     flat_positions: Vec<u32>,
+
+    // --- Reusable output buffers (swapped out in prepare_inputs, swapped back via reclaim) ---
+    req_inputs_buf: Vec<ReqSlice>,
+    query_start_loc_buf: Vec<usize>,
+    q_lens_buf: Vec<usize>,
+    seq_lens_buf: Vec<usize>,
+    block_ids_buf: Vec<Vec<usize>>,
+    tokens_before_buf: Vec<usize>,
+    is_prefill_buf: Vec<bool>,
+    req_ids_buf: Vec<String>,
 }
 
 impl Default for InputBatch {
@@ -69,6 +79,14 @@ impl InputBatch {
             prefill_pos_offset: Vec::new(),
             flat_token_ids: Vec::new(),
             flat_positions: Vec::new(),
+            req_inputs_buf: Vec::new(),
+            query_start_loc_buf: Vec::new(),
+            q_lens_buf: Vec::new(),
+            seq_lens_buf: Vec::new(),
+            block_ids_buf: Vec::new(),
+            tokens_before_buf: Vec::new(),
+            is_prefill_buf: Vec::new(),
+            req_ids_buf: Vec::new(),
         }
     }
 
@@ -193,14 +211,24 @@ impl InputBatch {
         self.flat_positions.clear();
 
         let num_reqs = self.req_ids.len();
-        let mut req_inputs: Vec<ReqSlice> = Vec::with_capacity(num_reqs);
-        let mut query_start_loc = Vec::with_capacity(num_reqs + 1);
-        let mut q_lens = Vec::with_capacity(num_reqs);
-        let mut seq_lens = Vec::with_capacity(num_reqs);
-        let mut batch_block_ids = Vec::with_capacity(num_reqs);
-        let mut batch_tokens_before = Vec::with_capacity(num_reqs);
-        let mut is_prefill_vec = Vec::with_capacity(num_reqs);
-        let mut batch_req_ids = Vec::with_capacity(num_reqs);
+
+        // Reuse pre-allocated buffers (retain capacity across steps).
+        let mut req_inputs = std::mem::take(&mut self.req_inputs_buf);
+        req_inputs.clear();
+        let mut query_start_loc = std::mem::take(&mut self.query_start_loc_buf);
+        query_start_loc.clear();
+        let mut q_lens = std::mem::take(&mut self.q_lens_buf);
+        q_lens.clear();
+        let mut seq_lens = std::mem::take(&mut self.seq_lens_buf);
+        seq_lens.clear();
+        let mut batch_block_ids = std::mem::take(&mut self.block_ids_buf);
+        batch_block_ids.clear();
+        let mut batch_tokens_before = std::mem::take(&mut self.tokens_before_buf);
+        batch_tokens_before.clear();
+        let mut is_prefill_vec = std::mem::take(&mut self.is_prefill_buf);
+        is_prefill_vec.clear();
+        let mut batch_req_ids = std::mem::take(&mut self.req_ids_buf);
+        batch_req_ids.clear();
 
         let mut offset = 0usize;
 
@@ -367,6 +395,25 @@ impl InputBatch {
         if let Some(&slot) = self.req_id_to_slot.get(req_id) {
             self.last_token_ids[slot] = token_id;
         }
+    }
+
+    /// Reclaim reusable buffers from a consumed `PreparedInputs`.
+    ///
+    /// Call this at the end of `execute_model` to return Vec capacity back to
+    /// `InputBatch`, avoiding heap allocations on the next `prepare_inputs`.
+    pub fn reclaim_buffers(&mut self, prepared: PreparedInputs) {
+        self.flat_token_ids = prepared.flat_token_ids;
+        self.flat_positions = prepared.flat_positions;
+        self.req_inputs_buf = prepared.req_inputs;
+        // Reclaim AttentionMetadata buffers.
+        let meta = prepared.attn_meta;
+        self.query_start_loc_buf = meta.query_start_loc;
+        self.q_lens_buf = meta.q_lens;
+        self.seq_lens_buf = meta.seq_lens;
+        self.block_ids_buf = meta.block_ids;
+        self.tokens_before_buf = meta.tokens_before;
+        self.is_prefill_buf = meta.is_prefill;
+        self.req_ids_buf = meta.req_ids;
     }
 }
 

@@ -395,6 +395,8 @@ pub struct CudaWorker {
     sampling_params_map: HashMap<String, SamplingParams>,
     input_batch: InputBatch,
     preloaded_tokenizer: Option<tokenizers::Tokenizer>,
+    /// Set once per thread to avoid redundant `ctx_set_current` driver calls.
+    ctx_set_on_thread: bool,
 }
 
 unsafe impl Send for CudaWorker {}
@@ -421,6 +423,7 @@ impl CudaWorker {
             sampling_params_map: HashMap::new(),
             input_batch: InputBatch::new(),
             preloaded_tokenizer: None,
+            ctx_set_on_thread: false,
         }
     }
 
@@ -857,12 +860,13 @@ impl Worker for CudaWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
-        // Ensure CUDA context is current on this thread. In async scheduling,
-        // execute_model runs on a dedicated executor thread that differs from
-        // the init thread where the context was created.
-        if let Some(ref dev) = self.device {
-            unsafe { driver::ctx_set_current(dev.ctx) }
-                .map_err(|e| ExecutorError::WorkerExecution(format!("ctx_set_current: {e}")))?;
+        // Ensure CUDA context is current on this thread (once per thread).
+        if !self.ctx_set_on_thread {
+            if let Some(ref dev) = self.device {
+                unsafe { driver::ctx_set_current(dev.ctx) }
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("ctx_set_current: {e}")))?;
+            }
+            self.ctx_set_on_thread = true;
         }
 
         let block_size = self.config.block_size;
@@ -1144,21 +1148,25 @@ impl Worker for CudaWorker {
             self.last_graph_batch_size = Some(graph_bs);
             self.graph_metadata_valid = true;
 
-            let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
             for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
-                let sampled = vec![host_ids[req_idx]];
+                let tok = host_ids[req_idx];
                 self.input_batch.commit_step(
                     &req_slice.req_id,
-                    &sampled,
+                    &[tok],
                     req_slice.token_count,
                     !req_slice.spec_token_ids.is_empty(),
                 );
                 if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
-                    buf.extend_from_slice(&sampled);
+                    buf.push(tok);
                 }
-                token_map.insert(req_slice.req_id.clone(), sampled);
             }
-            return Ok(ModelRunnerOutput::from_token_map(token_map));
+            let req_ids: Vec<String> = prepared
+                .req_inputs
+                .iter()
+                .map(|r| r.req_id.clone())
+                .collect();
+            self.input_batch.reclaim_buffers(prepared);
+            return Ok(ModelRunnerOutput::from_ordered(req_ids, host_ids));
         }
 
         // Non-greedy graph path or eager path: need separate sampling.
@@ -1448,8 +1456,6 @@ impl Worker for CudaWorker {
             }
         };
 
-        let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
-
         // Check if all requests can use GPU sampling (no grammar, no logit_bias,
         // no frequency/presence/repetition penalties). This covers both greedy
         // (temp < 1e-6 → argmax) and non-greedy (temp >= 1e-6 → top-k/top-p/min-p).
@@ -1551,18 +1557,24 @@ impl Worker for CudaWorker {
             )?;
 
             for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
-                let sampled = vec![host_ids[req_idx]];
+                let tok = host_ids[req_idx];
                 self.input_batch.commit_step(
                     &req_slice.req_id,
-                    &sampled,
+                    &[tok],
                     req_slice.token_count,
                     !req_slice.spec_token_ids.is_empty(),
                 );
                 if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
-                    buf.extend_from_slice(&sampled);
+                    buf.push(tok);
                 }
-                token_map.insert(req_slice.req_id.clone(), sampled);
             }
+            let req_ids: Vec<String> = prepared
+                .req_inputs
+                .iter()
+                .map(|r| r.req_id.clone())
+                .collect();
+            self.input_batch.reclaim_buffers(prepared);
+            Ok(ModelRunnerOutput::from_ordered(req_ids, host_ids))
         } else if all_greedy {
             // GPU fast path: batched argmax on device, D2H only num_reqs × 4 bytes.
             let token_ids_gpu = unsafe {
@@ -1579,22 +1591,29 @@ impl Worker for CudaWorker {
             )?;
 
             for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
-                let sampled = vec![host_ids[req_idx]];
+                let tok = host_ids[req_idx];
                 self.input_batch.commit_step(
                     &req_slice.req_id,
-                    &sampled,
+                    &[tok],
                     req_slice.token_count,
                     !req_slice.spec_token_ids.is_empty(),
                 );
                 if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
-                    buf.extend_from_slice(&sampled);
+                    buf.push(tok);
                 }
-                token_map.insert(req_slice.req_id.clone(), sampled);
             }
+            let req_ids: Vec<String> = prepared
+                .req_inputs
+                .iter()
+                .map(|r| r.req_id.clone())
+                .collect();
+            self.input_batch.reclaim_buffers(prepared);
+            Ok(ModelRunnerOutput::from_ordered(req_ids, host_ids))
         } else {
             // Slow path: D2H full logits for CPU sampling.
             let logits_f32 = Self::logits_to_cpu(logits, device)?;
             let mut sampler = Sampler::new();
+            let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
 
             for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
                 let start = req_idx * vocab_size;
@@ -1607,35 +1626,35 @@ impl Worker for CudaWorker {
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);
 
-                let sampled = if let Some(params) = self.sampling_params_map.get(&req_slice.req_id)
+                let token_id = if let Some(params) = self.sampling_params_map.get(&req_slice.req_id)
                 {
                     let (token_id, _logprobs) =
                         sampler.sample_one(req_logits, params, prev_tokens, None);
-                    vec![token_id]
+                    token_id
                 } else {
-                    let token_id = req_logits
+                    req_logits
                         .iter()
                         .enumerate()
                         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
                         .map(|(i, _)| i as u32)
-                        .unwrap_or(0);
-                    vec![token_id]
+                        .unwrap_or(0)
                 };
 
                 self.input_batch.commit_step(
                     &req_slice.req_id,
-                    &sampled,
+                    &[token_id],
                     req_slice.token_count,
                     !req_slice.spec_token_ids.is_empty(),
                 );
                 if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
-                    buf.extend_from_slice(&sampled);
+                    buf.push(token_id);
                 }
-                token_map.insert(req_slice.req_id.clone(), sampled);
+                token_map.insert(req_slice.req_id.clone(), vec![token_id]);
             }
-        }
 
-        Ok(ModelRunnerOutput::from_token_map(token_map))
+            self.input_batch.reclaim_buffers(prepared);
+            Ok(ModelRunnerOutput::from_token_map(token_map))
+        }
     }
 
     fn compile_or_warm_up_model(&mut self) -> ExecutorResult<()> {

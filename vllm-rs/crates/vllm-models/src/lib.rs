@@ -347,11 +347,17 @@ pub trait Model: Send {
     }
 
     fn reset_recurrent_state(&self) {}
-    fn num_recurrent_layers(&self) -> usize { 0 }
-    fn extract_recurrent_state(&self) -> Vec<Option<(Tensor, Tensor)>> { vec![] }
+    fn num_recurrent_layers(&self) -> usize {
+        0
+    }
+    fn extract_recurrent_state(&self) -> Vec<Option<(Tensor, Tensor)>> {
+        vec![]
+    }
     fn inject_recurrent_state(&self, _state: &[Option<(Tensor, Tensor)>]) {}
     fn hidden_states(&self, _input_ids: &Tensor, _positions: &Tensor) -> ModelResult<Tensor> {
-        Err(vllm_model::error::ModelError::Other("hidden_states not supported".into()))
+        Err(vllm_model::error::ModelError::Other(
+            "hidden_states not supported".into(),
+        ))
     }
     fn forward_embeds(
         &self,
@@ -359,7 +365,9 @@ pub trait Model: Send {
         _positions: &Tensor,
         _kv_cache: Option<&mut KvCacheStorage<'_>>,
     ) -> ModelResult<Tensor> {
-        Err(vllm_model::error::ModelError::Other("forward_embeds not supported".into()))
+        Err(vllm_model::error::ModelError::Other(
+            "forward_embeds not supported".into(),
+        ))
     }
     fn inject_tp_group(
         &mut self,
@@ -379,8 +387,12 @@ pub trait Model: Send {
         let mut logits_parts = Vec::with_capacity(attn_meta.num_reqs);
         for req_idx in 0..attn_meta.num_reqs {
             let (start, q_len) = attn_meta.request_slice(req_idx);
-            let req_ids = input_ids.narrow(0, start, q_len).map_err(ModelError::Candle)?;
-            let req_pos = positions.narrow(0, start, q_len).map_err(ModelError::Candle)?;
+            let req_ids = input_ids
+                .narrow(0, start, q_len)
+                .map_err(ModelError::Candle)?;
+            let req_pos = positions
+                .narrow(0, start, q_len)
+                .map_err(ModelError::Candle)?;
             let mut storage = kv_storage.request_storage(req_idx);
             let logits = self.forward(&req_ids, &req_pos, Some(&mut storage))?;
             storage.flush()?;

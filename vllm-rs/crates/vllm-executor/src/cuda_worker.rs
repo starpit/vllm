@@ -306,11 +306,11 @@ struct HostStaging {
     positions: PinnedBuf,
     /// `[max_batch]` i64 — KV cache slot mapping.
     slot_mapping: PinnedBuf,
-    /// `[max_batch + 1]` u32 — cumulative query sequence lengths.
+    /// `[max_batch + 1]` i32 — cumulative query sequence lengths.
     cu_seqlens_q: PinnedBuf,
-    /// `[max_batch]` u32 — per-sequence K lengths for paged FA2.
+    /// `[max_batch]` i32 — per-sequence K lengths for paged FA2.
     seqused_k: PinnedBuf,
-    /// `[max_batch * GRAPH_MAX_BLOCKS_PER_SEQ]` u32 — page table.
+    /// `[max_batch * GRAPH_MAX_BLOCKS_PER_SEQ]` i32 — page table.
     block_table: PinnedBuf,
     /// `[max_batch]` u32 — D2H token IDs from graph argmax.
     host_token_ids: PinnedBuf,
@@ -342,14 +342,14 @@ impl HostStaging {
         &'a self,
         block_ids: &[Vec<usize>],
         graph_bs: usize,
-    ) -> &'a [u32] {
+    ) -> &'a [i32] {
         let n = graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ;
-        let bt = unsafe { self.block_table.slice_mut::<u32>(n) };
+        let bt = unsafe { self.block_table.slice_mut::<i32>(n) };
         bt.fill(0);
         for (i, blocks) in block_ids.iter().enumerate() {
             for (j, &bid) in blocks.iter().enumerate() {
                 if j < GRAPH_MAX_BLOCKS_PER_SEQ {
-                    bt[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
+                    bt[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as i32;
                 }
             }
         }
@@ -520,6 +520,20 @@ impl CudaWorker {
     }
 
     /// H2D copy an i64 slice into an arena-allocated GpuTensor.
+    fn h2d_i32(data: &[i32], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
+        let t = device.arena.alloc(&[data.len()], GpuDType::I32);
+        unsafe {
+            driver::memcpy_htod_async(
+                t.raw_ptr(),
+                data.as_ptr() as *const u8,
+                data.len() * 4,
+                device.compute_stream,
+            )
+        }
+        .map_err(|e| ExecutorError::WorkerExecution(format!("H2D i32: {e}")))?;
+        Ok(t)
+    }
+
     fn h2d_i64(data: &[i64], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
         let t = device.arena.alloc(&[data.len()], GpuDType::I64);
         unsafe {
@@ -546,12 +560,12 @@ impl CudaWorker {
         let num_reqs = meta.num_reqs;
 
         // cu_seqlens_q: cumulative query lengths [num_reqs + 1].
-        let cu_seqlens_q: Vec<u32> = meta.query_start_loc.iter().map(|&x| x as u32).collect();
-        let gpu_cu_seqlens_q = Self::h2d_u32(&cu_seqlens_q, device)?;
+        let cu_seqlens_q: Vec<i32> = meta.query_start_loc.iter().map(|&x| x as i32).collect();
+        let gpu_cu_seqlens_q = Self::h2d_i32(&cu_seqlens_q, device)?;
 
         // seqused_k: per-sequence K lengths [num_reqs] (used by paged FA2 splitkv kernel).
-        let seqused_k: Vec<u32> = meta.seq_lens.iter().map(|&sl| sl as u32).collect();
-        let gpu_seqused_k = Self::h2d_u32(&seqused_k, device)?;
+        let seqused_k: Vec<i32> = meta.seq_lens.iter().map(|&sl| sl as i32).collect();
+        let gpu_seqused_k = Self::h2d_i32(&seqused_k, device)?;
 
         let max_seqlen_q = meta.q_lens.iter().copied().max().unwrap_or(0);
         let max_seqlen_k = meta.seq_lens.iter().copied().max().unwrap_or(0);
@@ -575,19 +589,19 @@ impl CudaWorker {
         }
         let gpu_slot_mapping = Self::h2d_i64(&slot_mapping, device)?;
 
-        // block_table: [num_reqs, max_blocks_per_seq] u32 (padded with 0).
+        // block_table: [num_reqs, max_blocks_per_seq] i32 (padded with 0).
         let max_blocks = meta.block_ids.iter().map(|b| b.len()).max().unwrap_or(0);
         let gpu_block_table = if max_blocks > 0 {
-            let mut block_table = vec![0u32; num_reqs * max_blocks];
+            let mut block_table = vec![0i32; num_reqs * max_blocks];
             for (i, blocks) in meta.block_ids.iter().enumerate() {
                 for (j, &bid) in blocks.iter().enumerate() {
-                    block_table[i * max_blocks + j] = bid as u32;
+                    block_table[i * max_blocks + j] = bid as i32;
                 }
             }
-            let t = Self::h2d_u32(&block_table, device)?;
-            unsafe { GpuTensor::new(t.raw_ptr(), &[num_reqs, max_blocks], GpuDType::U32) }
+            let t = Self::h2d_i32(&block_table, device)?;
+            unsafe { GpuTensor::new(t.raw_ptr(), &[num_reqs, max_blocks], GpuDType::I32) }
         } else {
-            unsafe { GpuTensor::new(std::ptr::null_mut(), &[0, 0], GpuDType::U32) }
+            unsafe { GpuTensor::new(std::ptr::null_mut(), &[0, 0], GpuDType::I32) }
         };
 
         Ok((
@@ -1020,16 +1034,16 @@ impl Worker for CudaWorker {
                     pos[..num_reqs].copy_from_slice(&prepared.flat_positions);
                     pos[num_reqs..].fill(0);
 
-                    let cu_q = stg.cu_seqlens_q.slice_mut::<u32>(graph_bs + 1);
+                    let cu_q = stg.cu_seqlens_q.slice_mut::<i32>(graph_bs + 1);
                     for (i, v) in cu_q[..=num_reqs].iter_mut().enumerate() {
-                        *v = i as u32;
+                        *v = i as i32;
                     }
-                    cu_q[(num_reqs + 1)..].fill(num_reqs as u32);
+                    cu_q[(num_reqs + 1)..].fill(num_reqs as i32);
 
                     // seqused_k: per-sequence K lengths [graph_bs].
-                    let sk = stg.seqused_k.slice_mut::<u32>(graph_bs);
+                    let sk = stg.seqused_k.slice_mut::<i32>(graph_bs);
                     for (i, &sl) in meta.seq_lens.iter().enumerate() {
-                        sk[i] = sl as u32;
+                        sk[i] = sl as i32;
                     }
                     // Padded slots: use 1 (dummy seqs with 1 K token).
                     for s in &mut sk[num_reqs..] {
@@ -1061,8 +1075,8 @@ impl Worker for CudaWorker {
                         stg.input_ids.slice::<u32>(graph_bs),
                         stg.positions.slice::<u32>(graph_bs),
                         stg.slot_mapping.slice::<i64>(graph_bs),
-                        stg.cu_seqlens_q.slice::<u32>(graph_bs + 1),
-                        stg.seqused_k.slice::<u32>(graph_bs),
+                        stg.cu_seqlens_q.slice::<i32>(graph_bs + 1),
+                        stg.seqused_k.slice::<i32>(graph_bs),
                         bt,
                         device,
                         skip_input_ids,
@@ -1076,13 +1090,13 @@ impl Worker for CudaWorker {
                 let mut positions = prepared.flat_positions.clone();
                 positions.resize(graph_bs, 0);
 
-                let mut cu_seqlens_q: Vec<u32> = (0..=num_reqs as u32).collect();
+                let mut cu_seqlens_q: Vec<i32> = (0..=num_reqs as i32).collect();
                 for _ in num_reqs..graph_bs {
-                    cu_seqlens_q.push(num_reqs as u32);
+                    cu_seqlens_q.push(num_reqs as i32);
                 }
 
                 // seqused_k: per-sequence K lengths [graph_bs].
-                let mut seqused_k: Vec<u32> = meta.seq_lens.iter().map(|&sl| sl as u32).collect();
+                let mut seqused_k: Vec<i32> = meta.seq_lens.iter().map(|&sl| sl as i32).collect();
                 // Padded slots: use 1 (dummy seqs with 1 K token).
                 seqused_k.resize(graph_bs, 1);
 
@@ -1100,11 +1114,11 @@ impl Worker for CudaWorker {
                 }
                 slot_mapping.resize(graph_bs, -1i64);
 
-                let mut block_table = vec![0u32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
+                let mut block_table = vec![0i32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
                 for (i, blocks) in meta.block_ids.iter().enumerate() {
                     for (j, &bid) in blocks.iter().enumerate() {
                         if j < GRAPH_MAX_BLOCKS_PER_SEQ {
-                            block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
+                            block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as i32;
                         }
                     }
                 }
@@ -1221,16 +1235,16 @@ impl Worker for CudaWorker {
                     pos[..num_reqs].copy_from_slice(&prepared.flat_positions);
                     pos[num_reqs..].fill(0);
 
-                    let cu_q = stg.cu_seqlens_q.slice_mut::<u32>(graph_bs + 1);
+                    let cu_q = stg.cu_seqlens_q.slice_mut::<i32>(graph_bs + 1);
                     for (i, v) in cu_q[..=num_reqs].iter_mut().enumerate() {
-                        *v = i as u32;
+                        *v = i as i32;
                     }
-                    cu_q[(num_reqs + 1)..].fill(num_reqs as u32);
+                    cu_q[(num_reqs + 1)..].fill(num_reqs as i32);
 
                     // seqused_k: per-sequence K lengths [graph_bs].
-                    let sk = stg.seqused_k.slice_mut::<u32>(graph_bs);
+                    let sk = stg.seqused_k.slice_mut::<i32>(graph_bs);
                     for (i, &sl) in meta.seq_lens.iter().enumerate() {
-                        sk[i] = sl as u32;
+                        sk[i] = sl as i32;
                     }
                     for s in &mut sk[num_reqs..] {
                         *s = 1;
@@ -1258,8 +1272,8 @@ impl Worker for CudaWorker {
                         stg.input_ids.slice::<u32>(graph_bs),
                         stg.positions.slice::<u32>(graph_bs),
                         stg.slot_mapping.slice::<i64>(graph_bs),
-                        stg.cu_seqlens_q.slice::<u32>(graph_bs + 1),
-                        stg.seqused_k.slice::<u32>(graph_bs),
+                        stg.cu_seqlens_q.slice::<i32>(graph_bs + 1),
+                        stg.seqused_k.slice::<i32>(graph_bs),
                         bt,
                         device,
                         false,
@@ -1273,13 +1287,13 @@ impl Worker for CudaWorker {
                 let mut positions = prepared.flat_positions.clone();
                 positions.resize(graph_bs, 0);
 
-                let mut cu_seqlens_q: Vec<u32> = (0..=num_reqs as u32).collect();
+                let mut cu_seqlens_q: Vec<i32> = (0..=num_reqs as i32).collect();
                 for _ in num_reqs..graph_bs {
-                    cu_seqlens_q.push(num_reqs as u32);
+                    cu_seqlens_q.push(num_reqs as i32);
                 }
 
                 // seqused_k: per-sequence K lengths [graph_bs].
-                let mut seqused_k: Vec<u32> = meta.seq_lens.iter().map(|&sl| sl as u32).collect();
+                let mut seqused_k: Vec<i32> = meta.seq_lens.iter().map(|&sl| sl as i32).collect();
                 // Padded slots: use 1 (dummy seqs with 1 K token).
                 seqused_k.resize(graph_bs, 1);
 
@@ -1297,11 +1311,11 @@ impl Worker for CudaWorker {
                 }
                 slot_mapping.resize(graph_bs, -1i64);
 
-                let mut block_table = vec![0u32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
+                let mut block_table = vec![0i32; graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
                 for (i, blocks) in meta.block_ids.iter().enumerate() {
                     for (j, &bid) in blocks.iter().enumerate() {
                         if j < GRAPH_MAX_BLOCKS_PER_SEQ {
-                            block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as u32;
+                            block_table[i * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as i32;
                         }
                     }
                 }
@@ -1354,10 +1368,10 @@ impl Worker for CudaWorker {
                     .unwrap();
 
                 // Build block_table padded to MAX_BLOCKS_PER_SEQ.
-                let mut block_table = vec![0u32; GRAPH_MAX_BLOCKS_PER_SEQ];
+                let mut block_table = vec![0i32; GRAPH_MAX_BLOCKS_PER_SEQ];
                 for (j, &bid) in meta.block_ids[0].iter().enumerate() {
                     if j < GRAPH_MAX_BLOCKS_PER_SEQ {
-                        block_table[j] = bid as u32;
+                        block_table[j] = bid as i32;
                     }
                 }
 

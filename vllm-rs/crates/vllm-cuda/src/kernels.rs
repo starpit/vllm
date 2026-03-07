@@ -190,8 +190,8 @@ unsafe extern "C" {
     fn update_decode_metadata(
         positions: *mut u32,
         slot_mapping: *mut i64,
-        seqused_k: *mut u32,
-        block_table: *const u32,
+        seqused_k: *mut i32,
+        block_table: *const i32,
         num_reqs: c_int,
         block_size: c_int,
         max_blocks_per_seq: c_int,
@@ -648,8 +648,8 @@ pub unsafe fn update_decode_metadata_gpu(
     update_decode_metadata(
         positions as *mut u32,
         slot_mapping as *mut i64,
-        seqused_k as *mut u32,
-        block_table as *const u32,
+        seqused_k as *mut i32,
+        block_table as *const i32,
         num_reqs as c_int,
         block_size as c_int,
         max_blocks_per_seq as c_int,
@@ -1042,7 +1042,7 @@ pub unsafe fn flash_attn_paged_ext(
 
     // Python passes dummy zeros for cu_seqlens_k when using paged KV + seqused_k.
     // We allocate a zero-filled buffer from the arena for this.
-    let dummy_cu_seqlens_k = arena.alloc(&[batch_size + 1], DType::U32);
+    let dummy_cu_seqlens_k = arena.alloc(&[batch_size + 1], DType::I32);
     // Arena memory is NOT guaranteed to be zeroed. Zero it explicitly.
     crate::driver::memset_d8(
         dummy_cu_seqlens_k.raw_ptr(),

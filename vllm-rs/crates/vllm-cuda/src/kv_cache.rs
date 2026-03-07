@@ -95,7 +95,7 @@ impl KvCachePool {
 
     /// Gather K or V from blocks into a contiguous `[total_tokens, kv_heads, head_dim]` tensor.
     ///
-    /// `block_table` is a GPU tensor `[batch_size, max_blocks_per_seq]` of u32 block IDs.
+    /// `block_table` is a GPU tensor `[batch_size, max_blocks_per_seq]` of i32 block IDs.
     /// For single-request decode, batch_size=1. `total_tokens` is the total KV length.
     /// `is_key` selects K (true) or V (false) cache.
     ///
@@ -122,7 +122,7 @@ impl KvCachePool {
 
         // D2H the block table to get block IDs on CPU.
         let num_blocks_in_table = block_table.dim(1);
-        let mut block_ids = vec![0u32; num_blocks_in_table];
+        let mut block_ids = vec![0i32; num_blocks_in_table];
         driver::memcpy_dtoh_async(
             block_ids.as_mut_ptr() as *mut u8,
             block_table.raw_ptr() as *const u8,

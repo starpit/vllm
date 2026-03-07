@@ -108,8 +108,8 @@ void embedding_gather_f32(
 __global__ void update_decode_metadata_kernel(
     uint32_t* __restrict__ positions,       // [num_reqs] — incremented in place
     int64_t* __restrict__ slot_mapping,     // [num_reqs] — recomputed from new pos
-    uint32_t* __restrict__ seqused_k,       // [num_reqs] — per-seq K lengths, incremented
-    const uint32_t* __restrict__ block_table, // [num_reqs, max_blocks_per_seq]
+    int32_t* __restrict__ seqused_k,        // [num_reqs] — per-seq K lengths, incremented
+    const int32_t* __restrict__ block_table, // [num_reqs, max_blocks_per_seq]
     int num_reqs,
     int block_size,
     int max_blocks_per_seq
@@ -122,10 +122,10 @@ __global__ void update_decode_metadata_kernel(
     positions[i] = new_pos;
 
     // 2. Compute slot_mapping from new position + block_table.
-    uint32_t block_idx = new_pos / block_size;
-    uint32_t offset = new_pos % block_size;
-    if (block_idx < (uint32_t)max_blocks_per_seq) {
-        uint32_t block_id = block_table[i * max_blocks_per_seq + block_idx];
+    int block_idx = new_pos / block_size;
+    int offset = new_pos % block_size;
+    if (block_idx < max_blocks_per_seq) {
+        int32_t block_id = block_table[i * max_blocks_per_seq + block_idx];
         slot_mapping[i] = (int64_t)(block_id * block_size + offset);
     } else {
         slot_mapping[i] = -1;
@@ -140,8 +140,8 @@ extern "C" {
 void update_decode_metadata(
     uint32_t* positions,
     int64_t* slot_mapping,
-    uint32_t* seqused_k,
-    const uint32_t* block_table,
+    int32_t* seqused_k,
+    const int32_t* block_table,
     int num_reqs,
     int block_size,
     int max_blocks_per_seq,

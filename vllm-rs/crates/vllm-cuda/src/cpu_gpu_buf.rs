@@ -336,7 +336,14 @@ mod tests {
     #[test]
     fn test_different_dtypes() {
         init_cuda();
-        for dtype in [DType::F16, DType::BF16, DType::F32, DType::U32, DType::I64] {
+        for dtype in [
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::U32,
+            DType::I32,
+            DType::I64,
+        ] {
             let buf = unsafe { CpuGpuBuf::new(64, dtype).unwrap() };
             assert_eq!(buf.dtype(), dtype);
             assert_eq!(buf.capacity(), 64);

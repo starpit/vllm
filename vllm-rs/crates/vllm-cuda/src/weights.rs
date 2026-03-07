@@ -31,6 +31,7 @@ fn safetensors_dtype(dtype: safetensors::Dtype) -> Result<DType> {
         safetensors::Dtype::F32 => Ok(DType::F32),
         safetensors::Dtype::I64 => Ok(DType::I64),
         safetensors::Dtype::U32 => Ok(DType::U32),
+        safetensors::Dtype::I32 => Ok(DType::I32),
         other => bail!("unsupported safetensors dtype: {:?}", other),
     }
 }

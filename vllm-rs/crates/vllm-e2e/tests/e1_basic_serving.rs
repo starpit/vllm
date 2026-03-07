@@ -32,6 +32,16 @@ fn user_msg(content: &str) -> ChatCompletionMessageParam {
     }
 }
 
+fn assistant_msg(content: &str) -> ChatCompletionMessageParam {
+    ChatCompletionMessageParam {
+        role: "assistant".to_string(),
+        content: Some(serde_json::Value::String(content.to_string())),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+    }
+}
+
 fn simple_chat_request(content: &str, max_tokens: Option<u32>) -> ChatCompletionRequest {
     ChatCompletionRequest {
         messages: vec![user_msg(content)],
@@ -278,6 +288,72 @@ async fn test_t1_qwen2_completion_coherent_output() {
     assert!(
         has_relevant_word,
         "Qwen2 quantized completion should contain a relevant word about sky color, got: {text:?}"
+    );
+}
+
+/// Regression test: multi-turn chat preserves context across turns.
+///
+/// The second turn uses a pronoun ("it") that only makes sense if the model
+/// has access to the first turn's context about the sky. Without proper
+/// context, the model can't resolve the reference and produces irrelevant
+/// or garbled output.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_t1_qwen2_chat_multi_turn_context() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Turn 1: establish the topic (sky).
+    let turn1 = ChatCompletionRequest {
+        messages: vec![user_msg("Why is the sky blue? Answer in one sentence.")],
+        max_tokens: Some(40),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp1 = client.chat_completion(&turn1).await.unwrap();
+    assert_valid_chat_response(&resp1);
+    let text1 = resp1.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text1, 10);
+
+    // Turn 2: follow-up that requires context from turn 1.
+    // "Why is it red in the evening?" — "it" refers to "the sky" from turn 1.
+    let turn2 = ChatCompletionRequest {
+        messages: vec![
+            user_msg("Why is the sky blue? Answer in one sentence."),
+            assistant_msg(text1),
+            user_msg("Why is it red in the evening? Answer in one sentence."),
+        ],
+        max_tokens: Some(50),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp2 = client.chat_completion(&turn2).await.unwrap();
+    assert_valid_chat_response(&resp2);
+    let text2 = resp2.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text2, 10);
+
+    // The second answer must reference sky/sunset/red phenomena — proving the
+    // model understood "it" refers to "the sky" from the prior turn.
+    let has_context_word = [
+        "sun",
+        "light",
+        "scatter",
+        "red",
+        "orange",
+        "sunset",
+        "horizon",
+        "atmosphere",
+        "wave",
+    ]
+    .iter()
+    .any(|w| text2.to_lowercase().contains(w));
+    assert!(
+        has_context_word,
+        "Multi-turn: second answer should reference sky/light/sunset, got: {text2:?}"
     );
 }
 

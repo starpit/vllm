@@ -195,28 +195,7 @@ impl KvBlockPool {
         k_token: &Tensor,
         v_token: &Tensor,
     ) -> ModelResult<()> {
-        // CUDA fast path: single-token scatter via fused kernel.
-        #[cfg(feature = "cuda")]
-        if self.device.is_cuda() {
-            use vllm_kernels::cache::{CacheKernels, CudaCacheKernels};
-
-            let slot = (block_idx * self.block_size + position_in_block) as i64;
-            let slot_mapping = Tensor::new(&[slot], &self.device).map_err(ModelError::Candle)?;
-            let k_3d = k_token.unsqueeze(0).map_err(ModelError::Candle)?;
-            let v_3d = v_token.unsqueeze(0).map_err(ModelError::Candle)?;
-            CudaCacheKernels
-                .reshape_and_cache(
-                    &k_3d,
-                    &v_3d,
-                    &self.k_storage[layer],
-                    &self.v_storage[layer],
-                    &slot_mapping,
-                )
-                .map_err(|e| ModelError::Other(e.to_string()))?;
-            return Ok(());
-        }
-
-        // CPU fallback: functional scatter via slice_scatter0.
+        // Functional scatter via slice_scatter0.
         let k_block = self.k_storage[layer]
             .narrow(0, block_idx, 1)
             .map_err(ModelError::Candle)?
@@ -342,15 +321,7 @@ impl KvBlockPool {
             .narrow(0, tokens_before, new_count)
             .map_err(ModelError::Candle)?;
 
-        // CUDA fast path: single fused kernel launch for all tokens.
-        #[cfg(feature = "cuda")]
-        if self.device.is_cuda() {
-            self.scatter_tokens_cuda(layer, block_ids, tokens_before, &new_k, &new_v, new_count)?;
-            self.update_tokens_in_block(block_ids, tokens_before, new_count);
-            return Ok(());
-        }
-
-        // CPU fallback: per-token loop with slice_scatter0.
+        // Per-token loop with slice_scatter0.
         for i in 0..new_count {
             let global_pos = tokens_before + i;
             let block_offset = global_pos / self.block_size;
@@ -418,56 +389,6 @@ impl KvBlockPool {
                 self.tokens_in_block[bid] = self.tokens_in_block[bid].max(fill);
             }
         }
-    }
-
-    /// CUDA fast path: scatter tokens via fused reshape_and_cache kernel.
-    ///
-    /// Computes a slot_mapping from block_ids + tokens_before, transfers it
-    /// to GPU, and calls the CUDA kernel to scatter all tokens in a single
-    /// kernel launch (vs. N×slice_scatter0 on CPU).
-    #[cfg(feature = "cuda")]
-    fn scatter_tokens_cuda(
-        &self,
-        layer: usize,
-        block_ids: &[usize],
-        tokens_before: usize,
-        new_k: &Tensor,
-        new_v: &Tensor,
-        new_count: usize,
-    ) -> ModelResult<()> {
-        use vllm_kernels::cache::{CacheKernels, CudaCacheKernels};
-
-        // Compute slot_mapping: for each new token, compute its flat cache slot.
-        // slot = block_ids[global_pos / block_size] * block_size + global_pos % block_size
-        let mut slots = Vec::with_capacity(new_count);
-        for i in 0..new_count {
-            let global_pos = tokens_before + i;
-            let block_offset = global_pos / self.block_size;
-            let position_in_block = global_pos % self.block_size;
-            if block_offset < block_ids.len() {
-                let bid = block_ids[block_offset];
-                slots.push((bid * self.block_size + position_in_block) as i64);
-            } else {
-                slots.push(-1); // padding — kernel will skip
-            }
-        }
-
-        // Transfer slot_mapping to GPU.
-        let slot_mapping =
-            Tensor::new(slots.as_slice(), &self.device).map_err(ModelError::Candle)?;
-
-        // Call fused CUDA kernel — writes in-place into k_storage/v_storage.
-        CudaCacheKernels
-            .reshape_and_cache(
-                new_k,
-                new_v,
-                &self.k_storage[layer],
-                &self.v_storage[layer],
-                &slot_mapping,
-            )
-            .map_err(|e| ModelError::Other(e.to_string()))?;
-
-        Ok(())
     }
 
     /// Copy all layers of a block (for copy-on-write).

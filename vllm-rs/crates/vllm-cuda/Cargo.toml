@@ -1,0 +1,33 @@
+[package]
+name = "vllm-cuda"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Purpose-built CUDA tensor runtime for LLM inference — replaces candle on GPU"
+
+[features]
+default = []
+# Enable CUDA runtime. Requires CUDA toolkit + nvcc.
+cuda = ["dep:cudarc", "cudaforge"]
+# Enable NCCL multi-GPU collective communication (requires libnccl).
+nccl = ["cuda", "cudarc/nccl"]
+# Enable NVTX profiling annotations for nsys/Nsight traces.
+profiling = ["cuda", "cudarc/nvtx"]
+
+[dependencies]
+cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
+half = { workspace = true }
+safetensors = { workspace = true }
+memmap2 = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+cudaforge = { version = "0.1", optional = true }
+dirs = "6"
+
+[dev-dependencies]
+rand = { workspace = true }
+tempfile = { workspace = true }

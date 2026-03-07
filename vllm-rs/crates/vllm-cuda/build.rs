@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: Apache-2.0
+// Build script: compile ALL CUDA kernels for the vllm-cuda backend.
+// Uses cudaforge for incremental builds (only recompiles changed .cu files).
+//
+// Compiles:
+// 1. vllm fused kernels (norm, activation, RoPE, cache, sampling, MoE, quantize, embedding)
+// 2. Marlin W4A16 fused GEMM kernels
+// 3. FlashAttention-2 paged kernels (vllm-project fork)
+
+fn main() {
+    #[cfg(feature = "cuda")]
+    cuda_build();
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_build() {
+    // Use a stable shared cache directory so clippy/test/build reuse compiled .o files.
+    // Cargo gives each profile a different OUT_DIR, which defeats cudaforge's incremental cache.
+    let cache_dir = dirs::cache_dir()
+        .expect("no cache directory found")
+        .join("cudaforge")
+        .join("vllm-cuda");
+    std::fs::create_dir_all(&cache_dir).expect("Failed to create cudaforge cache dir");
+    let cache_str = cache_dir.to_string_lossy().to_string();
+
+    // 1. vllm fused kernels (merged from vllm-kernels + embedding gather).
+    cudaforge::KernelBuilder::new()
+        .out_dir(&cache_dir)
+        .source_files(vec![
+            "csrc/layernorm_kernels.cu".to_string(),
+            "csrc/activation_kernels.cu".to_string(),
+            "csrc/pos_encoding_kernels.cu".to_string(),
+            "csrc/cache_kernels.cu".to_string(),
+            "csrc/qk_norm_rope_kernels.cu".to_string(),
+            "csrc/moe_topk_kernels.cu".to_string(),
+            "csrc/moe_align_kernels.cu".to_string(),
+            "csrc/sampling_kernels.cu".to_string(),
+            "csrc/gptq_dequant_kernels.cu".to_string(),
+            "csrc/awq_dequant_kernels.cu".to_string(),
+            "csrc/embedding_kernels.cu".to_string(),
+        ])
+        .watch(vec!["csrc/vec_utils.cuh".to_string()])
+        .include_path("csrc")
+        .arg("-O3")
+        .arg("--use_fast_math")
+        .build_lib(format!("{}/libvllm_kernels.a", cache_str))
+        .expect("Failed to build vllm_kernels");
+
+    println!("cargo:rustc-link-search={}", cache_str);
+    println!("cargo:rustc-link-lib=static=vllm_kernels");
+
+    // 2. Marlin W4A16 fused GEMM kernels.
+    cudaforge::KernelBuilder::new()
+        .out_dir(&cache_dir)
+        .source_files(vec![
+            "csrc/marlin/marlin_gemm.cu".to_string(),
+            "csrc/marlin/gptq_marlin_repack.cu".to_string(),
+            "csrc/marlin/awq_marlin_repack.cu".to_string(),
+            "csrc/marlin/sm80_kernel_float16_u4_float16.cu".to_string(),
+            "csrc/marlin/sm80_kernel_bfloat16_u4_bfloat16.cu".to_string(),
+            "csrc/marlin/sm80_kernel_float16_u4b8_float16.cu".to_string(),
+            "csrc/marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu".to_string(),
+        ])
+        .include_path("csrc/marlin")
+        .include_path("csrc")
+        .watch(vec![
+            "csrc/marlin/marlin.cuh".to_string(),
+            "csrc/marlin/kernel.h".to_string(),
+            "csrc/marlin/kernel_selector.h".to_string(),
+            "csrc/marlin/marlin_template.h".to_string(),
+            "csrc/marlin/marlin_mma.h".to_string(),
+            "csrc/marlin/dequant.h".to_string(),
+            "csrc/marlin/marlin_dtypes.cuh".to_string(),
+            "csrc/core/scalar_type.hpp".to_string(),
+        ])
+        .arg("-O3")
+        .arg("--use_fast_math")
+        .arg("-std=c++17")
+        .arg("--expt-relaxed-constexpr")
+        .build_lib(format!("{}/libmarlin_kernels.a", cache_str))
+        .expect("Failed to build marlin_kernels");
+
+    println!("cargo:rustc-link-lib=static=marlin_kernels");
+
+    // 3. FlashAttention-2 paged kernels (vllm-project fork).
+    build_flash_attention(&cache_str);
+}
+
+#[cfg(feature = "cuda")]
+fn build_flash_attention(cache_dir: &str) {
+    // Upstream kernel source (unchanged from vllm-project/flash-attention)
+    let fa_src = std::path::Path::new("../../third_party/vllm-flash-attn/src");
+    // Our compat headers (stubs for PyTorch deps) + FFI shim
+    let shim_dir = std::path::Path::new("../../third_party/flash-attn-shim");
+
+    // Must match the CUTLASS submodule in vllm-project/flash-attention.
+    const CUTLASS_COMMIT: &str = "62750a2b75c802660e4894434dc55e839f322277";
+
+    // Build kernel file list: fwd + splitkv for each headdim/dtype/causal combo
+    let hdims = ["32", "64", "96", "128", "192", "256"];
+    let mut kernel_files: Vec<String> = Vec::new();
+    for hdim in &hdims {
+        for suffix in &[
+            "fp16_sm80",
+            "bf16_sm80",
+            "fp16_causal_sm80",
+            "bf16_causal_sm80",
+        ] {
+            kernel_files.push(
+                fa_src
+                    .join(format!("flash_fwd_hdim{}_{}.cu", hdim, suffix))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            kernel_files.push(
+                fa_src
+                    .join(format!("flash_fwd_split_hdim{}_{}.cu", hdim, suffix))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    // Our FFI shim (the only custom .cu file)
+    kernel_files.push(shim_dir.join("ffi_shim.cu").to_string_lossy().into_owned());
+
+    // Header files to watch for changes
+    let watch_files: Vec<String> = vec![
+        fa_src.join("flash_fwd_kernel.h"),
+        fa_src.join("flash.h"),
+        fa_src.join("flash_fwd_launch_template.h"),
+        fa_src.join("static_switch.h"),
+        shim_dir.join("ffi_shim.cu"),
+        shim_dir.join("compat").join("ATen").join("ATen.h"),
+    ]
+    .into_iter()
+    .map(|p| p.to_string_lossy().into_owned())
+    .collect();
+
+    // Include order matters: compat stubs FIRST (override PyTorch headers),
+    // then upstream kernel source, then CUTLASS (added by with_cutlass).
+    let compat_include = shim_dir.join("compat");
+
+    cudaforge::KernelBuilder::new()
+        .out_dir(cache_dir)
+        .source_files(kernel_files)
+        .watch(watch_files)
+        .include_path(compat_include.to_string_lossy().as_ref())
+        .include_path(fa_src.to_string_lossy().as_ref())
+        .with_cutlass(Some(CUTLASS_COMMIT))
+        .arg("-std=c++17")
+        .arg("-O3")
+        .arg("-U__CUDA_NO_HALF_OPERATORS__")
+        .arg("-U__CUDA_NO_HALF_CONVERSIONS__")
+        .arg("-U__CUDA_NO_HALF2_OPERATORS__")
+        .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
+        .arg("--expt-relaxed-constexpr")
+        .arg("--expt-extended-lambda")
+        .arg("--use_fast_math")
+        .arg("-Xcompiler")
+        .arg("-fPIC")
+        .build_lib(format!("{}/libvllm_flash_attn.a", cache_dir))
+        .expect("Failed to build flash attention");
+
+    println!("cargo:rustc-link-lib=static=vllm_flash_attn");
+    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+}

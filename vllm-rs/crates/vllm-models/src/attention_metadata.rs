@@ -46,17 +46,14 @@ pub struct AttentionMetadata {
     cu_seqlens_k_cache: OnceCell<Tensor>,
     /// Block table as a GPU tensor: `[batch_size, max_pages_per_seq]` u32.
     /// Cached to avoid per-layer H2D copies. Built on first access.
-    #[cfg(feature = "cuda")]
     block_table_cache: OnceCell<Tensor>,
     /// Decode slot_mapping as a GPU tensor: `[num_reqs]` i64.
     /// For all-decode batches, maps each request's new token to its flat cache slot.
     /// Cached to avoid per-layer H2D copies (28 layers × 128 decode steps).
-    #[cfg(feature = "cuda")]
     decode_slot_mapping_cache: OnceCell<Tensor>,
     /// Full slot_mapping as a GPU tensor: `[total_tokens]` i64.
     /// Maps every token (prefill + decode) to its flat cache slot in the paged pool.
     /// Cached to avoid per-layer H2D copies.
-    #[cfg(feature = "cuda")]
     slot_mapping_cache: OnceCell<Tensor>,
 }
 
@@ -91,11 +88,8 @@ impl Clone for AttentionMetadata {
             // Don't clone cached GPU tensors — they'll be recomputed if needed.
             cu_seqlens_q_cache: OnceCell::new(),
             cu_seqlens_k_cache: OnceCell::new(),
-            #[cfg(feature = "cuda")]
             block_table_cache: OnceCell::new(),
-            #[cfg(feature = "cuda")]
             decode_slot_mapping_cache: OnceCell::new(),
-            #[cfg(feature = "cuda")]
             slot_mapping_cache: OnceCell::new(),
         }
     }
@@ -127,11 +121,8 @@ impl AttentionMetadata {
             req_ids,
             cu_seqlens_q_cache: OnceCell::new(),
             cu_seqlens_k_cache: OnceCell::new(),
-            #[cfg(feature = "cuda")]
             block_table_cache: OnceCell::new(),
-            #[cfg(feature = "cuda")]
             decode_slot_mapping_cache: OnceCell::new(),
-            #[cfg(feature = "cuda")]
             slot_mapping_cache: OnceCell::new(),
         }
     }
@@ -255,7 +246,6 @@ impl AttentionMetadata {
     /// number of pages across all requests in the batch.
     ///
     /// This is computed once per step and cached for all layers.
-    #[cfg(feature = "cuda")]
     pub fn block_table_gpu(&self, device: &Device) -> candle_core::Result<&Tensor> {
         if let Some(t) = self.block_table_cache.get() {
             return Ok(t);
@@ -294,7 +284,6 @@ impl AttentionMetadata {
     /// `i`'s new token: `block_ids[i][pos / block_size] * block_size + pos % block_size`.
     ///
     /// Cached per step to avoid per-layer H2D copies.
-    #[cfg(feature = "cuda")]
     pub fn decode_slot_mapping_gpu(
         &self,
         block_size: usize,
@@ -334,7 +323,6 @@ impl AttentionMetadata {
     /// are mapped.
     ///
     /// Cached per step to avoid per-layer H2D copies.
-    #[cfg(feature = "cuda")]
     pub fn slot_mapping_gpu(
         &self,
         block_size: usize,

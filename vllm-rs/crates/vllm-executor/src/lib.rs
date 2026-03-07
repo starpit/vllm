@@ -13,9 +13,8 @@
 //! * [`parallel`] -- Distributed parallel state types (TP/PP groups, rank management).
 //! * [`error`] -- Executor-specific error types.
 
-pub mod candle_worker;
 #[cfg(feature = "cuda")]
-pub mod cuda_graph;
+pub mod cuda_worker;
 pub mod error;
 pub mod input_batch;
 pub mod multinode;

@@ -16,10 +16,6 @@ use tracing::info;
 use vllm_config::{CudaGraphConfig, SchedulerConfig, SchedulerPolicy};
 use vllm_engine::core_client::InprocClient;
 use vllm_engine::engine_core::EngineCoreConfig;
-use vllm_executor::candle_worker::{CandleWorker, CandleWorkerConfig};
-use vllm_executor::multinode::MultiNodeExecutor;
-use vllm_executor::parallel::ResolvedParallelConfig;
-use vllm_executor::threadpool::ThreadPoolExecutor;
 use vllm_executor::uniproc::UniProcExecutor;
 use vllm_executor::worker::Worker;
 use vllm_model::weight::HfModelConfig;
@@ -89,6 +85,14 @@ pub struct VllmConfig {
     /// Whether prefix caching is enabled (KV cache reuse for shared prompts).
     /// Default: true.
     pub enable_prefix_caching: bool,
+    /// Disable CUDA graph capture and run all steps eagerly.
+    /// Default: false.
+    pub enforce_eager: bool,
+    /// Maximum number of tokens processed in a single scheduler iteration.
+    /// None = auto (min(max_model_len, 8192)).
+    pub max_num_batched_tokens: Option<usize>,
+    /// Benchmark cublasLt algorithms during warmup.
+    pub cublas_autotune: bool,
 }
 
 impl Default for VllmConfig {
@@ -117,7 +121,10 @@ impl Default for VllmConfig {
             disable_async_scheduling: false,
             runner: "generate".to_string(),
             cuda_graph_config: None,
-            enable_prefix_caching: true,
+            enable_prefix_caching: false, // TODO: re-enable once paged FA2 prefill works with cached tokens
+            enforce_eager: true,          // TODO: debug multi-turn — disable CUDA graphs to isolate
+            max_num_batched_tokens: None,
+            cublas_autotune: false,
         }
     }
 }
@@ -166,6 +173,7 @@ type WorkerCreationResult = (
 /// Create the appropriate worker based on backend selection.
 ///
 /// Returns `(worker, hf_config, model_dir, dtype)`.
+#[allow(unused_variables)]
 fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreationResult> {
     let is_pooling = config.runner == "pooling";
 
@@ -208,58 +216,77 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
         return Ok((Box::new(worker), hf_config, model_dir, model_dtype));
     }
 
-    // Try wgpu backend when explicitly requested.
-    #[cfg(feature = "wgpu")]
-    if config.device == "wgpu" {
-        info!("Using WebGPU backend");
-        let mut worker = vllm_wgpu::worker_impl::WgpuBackendWorker::new(model_path);
+    // Try the purpose-built CUDA backend when feature is enabled and device is CUDA.
+    #[cfg(feature = "cuda")]
+    if config.device.starts_with("cuda") || config.device == "auto" {
+        use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+
+        // Parse device ID (e.g. "cuda:1" → 1, "cuda" → 0, "auto" → 0).
+        let device_id = if config.device.starts_with("cuda:") {
+            config.device[5..].parse::<i32>().unwrap_or(0)
+        } else {
+            0
+        };
+
+        info!("Using vllm-cuda backend (device={})", device_id);
+        let cuda_config = CudaWorkerConfig {
+            model_path: model_path.clone(),
+            dtype: config.dtype.clone(),
+            hf_token: config.hf_token.clone(),
+            block_size: config.block_size,
+            device_id,
+            enforce_eager: config.enforce_eager,
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(4096),
+            cuda_graph_sizes: config
+                .cuda_graph_config
+                .as_ref()
+                .map(|c| c.capture_sizes.clone())
+                .unwrap_or_default(),
+            cublas_autotune: config.cublas_autotune,
+        };
+
+        let mut worker = CudaWorker::new(cuda_config);
         worker
             .init_device()
-            .context("failed to initialize wgpu device")?;
-        worker.load_model().context("failed to load wgpu model")?;
+            .context("failed to initialize CUDA device")?;
+
+        // Auto-detect max_num_batched_tokens from GPU VRAM if not explicitly set.
+        // Python vLLM defaults: >=70GB non-A100: 16384, else: 8192 (LLM_CLASS).
+        // Note: Python uses PyTorch's fragmented allocator. Our contiguous ScratchArena
+        // needs the peak of one transformer layer to fit, so we may need a lower value
+        // on GPUs where VRAM is tight after model weights + KV cache.
+        if config.max_num_batched_tokens.is_none() {
+            let total_vram = worker.determine_available_memory().unwrap_or(0);
+            let total_gb = total_vram as f64 / (1024.0 * 1024.0 * 1024.0);
+            // Without chunked prefill, the ScratchArena must fit the peak of one
+            // transformer layer for max_num_batched_tokens tokens. 8192 tokens on
+            // a 3B model needs ~2.5GB contiguous VRAM — too much for <=48GB GPUs
+            // after model weights + KV cache. Use 4096 as a safe default.
+            let batched_tokens = if total_gb >= 60.0 { 8192 } else { 4096 };
+            info!(
+                "GPU has {:.0}GB free VRAM, using max_num_batched_tokens={}",
+                total_gb, batched_tokens
+            );
+            worker.set_max_num_batched_tokens(batched_tokens);
+        }
+        worker.load_model().context("failed to load CUDA model")?;
 
         let hf_config = worker
             .hf_config()
-            .context("model config not available after wgpu load")?
+            .context("model config not available after CUDA load")?
             .clone();
         let model_dir = worker.model_dir().map(|p| p.to_path_buf());
-        let model_dtype = DType::F16;
+        let model_dtype = worker.resolved_candle_dtype();
 
         return Ok((Box::new(worker), hf_config, model_dir, model_dtype));
     }
 
-    // Candle backend (CPU/CUDA/candle-Metal).
-    info!("Using Candle backend");
-    let worker_config = CandleWorkerConfig {
-        model_path,
-        device_str: config.device.clone(),
-        dtype: config.dtype.clone(),
-        hf_token: config.hf_token.clone(),
-        cache_dir: None,
-        block_size: config.block_size,
-        gguf_file: config.gguf_file.clone(),
-        lora_adapter: config.lora_adapter.clone(),
-        pooling_strategy: config.pooling_strategy.clone(),
-        is_pooling,
-        tp_rank: 0,
-        tp_world_size: 1,
-        cuda_graph_config: config.cuda_graph_config.clone(),
-    };
-
-    let mut worker = CandleWorker::new(worker_config);
-    worker
-        .init_device()
-        .context("failed to initialize device")?;
-    worker.load_model().context("failed to load model")?;
-
-    let hf_config = worker
-        .hf_config()
-        .context("model config not available after load")?
-        .clone();
-    let model_dir = worker.model_dir().map(|p| p.to_path_buf());
-    let model_dtype = worker.resolved_dtype().unwrap_or(DType::F32);
-
-    Ok((Box::new(worker), hf_config, model_dir, model_dtype))
+    // No backend available.
+    anyhow::bail!(
+        "No backend available for device '{}'. \
+         Build with --features metal (Apple Silicon) or --features cuda (NVIDIA GPU).",
+        config.device
+    )
 }
 
 /// Initialize cache on the worker and compute block counts.
@@ -404,7 +431,9 @@ fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
 
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
-            max_num_batched_tokens: max_model_len.min(8192),
+            max_num_batched_tokens: config
+                .max_num_batched_tokens
+                .unwrap_or_else(|| max_model_len.min(8192)),
             max_num_seqs: config.max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,
@@ -618,424 +647,454 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
     })
 }
 
-/// Multi-GPU init flow: creates N CandleWorkers (one per GPU rank), inits NCCL,
+/// Multi-GPU init flow: creates N workers (one per GPU rank), inits NCCL,
 /// and wraps them in a ThreadPoolExecutor.
 ///
 /// Each worker loads the full model weights and keeps only its shard
 /// (via ColumnParallelLinear/RowParallelLinear sharding at load time).
+///
+/// TODO: Port to CudaWorker. Currently unimplemented after CandleWorker removal.
 fn initialize_stack_tp(
     config: &VllmConfig,
     model_name: String,
     init_start: Instant,
 ) -> Result<InitializedStack> {
-    let tp_size = config.tensor_parallel_size;
-    info!(
-        "Tensor parallelism: {} GPUs (thread-per-GPU model)",
-        tp_size
-    );
+    let _ = (config, model_name, init_start);
 
-    let is_pooling = config.runner == "pooling";
+    // TODO: Port TP to CudaWorker. CandleWorker has been removed.
+    // The old CandleWorker-based TP implementation is preserved below as
+    // commented-out reference code for when we port TP to CudaWorker.
+    anyhow::bail!(
+        "Tensor parallelism is not yet supported with the vllm-cuda backend. \
+         Use --tensor-parallel-size 1 for now."
+    )
 
-    // Multi-node: each node only creates workers for its local GPUs.
-    let num_nodes = config.num_nodes;
-    let node_rank = config.node_rank;
-    let local_tp = if num_nodes > 1 {
-        tp_size / num_nodes
-    } else {
-        tp_size
-    };
-
-    // Create worker configs (one per local GPU).
-    let worker_configs: Vec<CandleWorkerConfig> = (0..local_tp)
-        .map(|local_rank| {
-            let global_rank = node_rank * local_tp + local_rank;
-            CandleWorkerConfig {
-                model_path: config.model.clone(),
-                device_str: format!("cuda:{local_rank}"),
-                dtype: config.dtype.clone(),
-                hf_token: config.hf_token.clone(),
-                cache_dir: None,
-                block_size: config.block_size,
-                gguf_file: config.gguf_file.clone(),
-                lora_adapter: config.lora_adapter.clone(),
-                pooling_strategy: config.pooling_strategy.clone(),
-                is_pooling,
-                tp_rank: global_rank,
-                tp_world_size: tp_size,
-                cuda_graph_config: config.cuda_graph_config.clone(),
-            }
-        })
-        .collect();
-
-    // Clean up stale NCCL shared memory segments from previous runs.
-    #[cfg(all(feature = "nccl", target_os = "linux"))]
-    {
-        let shm_path = std::path::Path::new("/dev/shm");
-        if shm_path.exists()
-            && let Ok(entries) = std::fs::read_dir(shm_path)
-        {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str()
-                    && name.starts_with("nccl-")
-                {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-    }
-
-    #[cfg(not(feature = "nccl"))]
-    if tp_size > 1 {
-        anyhow::bail!(
-            "tensor parallelism requires the `nccl` feature; \
-             rebuild with --features nccl"
-        );
-    }
-
-    // Initialize all workers on dedicated per-GPU threads.
-    //
-    // Each thread: creates CUDA device → loads model → creates NCCL comm →
-    // injects process group into model layers. This ensures NCCL comms are
-    // created with the correct CUDA context (NCCL ties comms to the thread
-    // that created them for collective synchronization).
-    //
-    // After init, workers are moved back to the main thread and wrapped
-    // in the ThreadPoolExecutor.
-    info!(
-        "Initializing {} workers on dedicated GPU threads...",
-        local_tp
-    );
-
-    // Use a barrier so rank 0 downloads/loads first (caching model files),
-    // then other ranks proceed (finding cached files, no lock contention).
-    let download_barrier = std::sync::Arc::new(std::sync::Barrier::new(local_tp));
-
-    // Log NCCL-relevant env vars for debuggability.
-    #[cfg(feature = "nccl")]
-    {
-        for var in [
-            "NCCL_DEBUG",
-            "NCCL_SOCKET_IFNAME",
-            "NCCL_SHM_DISABLE",
-            "NCCL_P2P_DISABLE",
-            "NCCL_IB_DISABLE",
-            "NCCL_NET_GDR_LEVEL",
-        ] {
-            if let Ok(val) = std::env::var(var) {
-                info!("NCCL env: {var}={val}");
-            }
-        }
-    }
-
-    #[cfg(feature = "nccl")]
-    let nccl_id = {
-        use vllm_kernels::nccl::NcclProcessGroup;
-
-        let num_nodes = config.num_nodes;
-        if num_nodes <= 1 {
-            NcclProcessGroup::generate_id().context("failed to generate NCCL ID")?
-        } else {
-            use vllm_kernels::rendezvous;
-            info!(
-                "Multi-node TP: node_rank={}, num_nodes={}, global_world_size={}, local_tp={}",
-                node_rank, num_nodes, tp_size, local_tp
-            );
-            if node_rank == 0 {
-                rendezvous::rendezvous_master(config.master_port, num_nodes)
-                    .context("NCCL rendezvous master failed")?
-            } else {
-                rendezvous::rendezvous_worker(&config.master_addr, config.master_port)
-                    .context("NCCL rendezvous worker failed")?
-            }
-        }
-    };
-
-    // Spawn one thread per GPU rank. Each thread does device init + model load
-    // + NCCL comm creation + injection, then sends the worker back.
-    let mut rank_counter = 0usize;
-    let handles: Vec<_> = worker_configs
-        .into_iter()
-        .map(|cfg| {
-            let local_idx = rank_counter;
-            rank_counter += 1;
-            // Capture NCCL init params for this rank's thread.
-            #[cfg(feature = "nccl")]
-            let (nccl_id, global_rank, global_ws) =
-                (nccl_id, node_rank * local_tp + local_idx, tp_size);
-            let barrier = download_barrier.clone();
-
-            std::thread::spawn(move || -> Result<CandleWorker> {
-                let mut worker = CandleWorker::new(cfg);
-                worker.init_device().context("init_device failed")?;
-
-                // Rank 0 loads first (downloads model files to cache).
-                // Other ranks wait at the barrier, then load from cache.
-                if local_idx == 0 {
-                    worker.load_model().context("load_model failed")?;
-                    barrier.wait();
-                } else {
-                    barrier.wait();
-                    worker.load_model().context("load_model failed")?;
-                }
-
-                // Create NCCL comm on this thread (correct CUDA context).
-                #[cfg(feature = "nccl")]
-                {
-                    use vllm_kernels::nccl::NcclProcessGroup;
-
-                    let device = worker
-                        .device()
-                        .ok_or_else(|| anyhow::anyhow!("no device after init"))?
-                        .clone();
-                    let group = NcclProcessGroup::new(global_rank, global_ws, nccl_id, &device)
-                        .context("NCCL comm_init_rank failed")?;
-                    let group: std::sync::Arc<dyn vllm_model::process_group::ProcessGroup> =
-                        std::sync::Arc::new(group);
-                    worker
-                        .inject_tp_group(group)
-                        .context("inject_tp_group failed")?;
-                }
-
-                Ok(worker)
-            })
-        })
-        .collect();
-
-    let mut workers: Vec<CandleWorker> = Vec::with_capacity(local_tp);
-    for (rank, handle) in handles.into_iter().enumerate() {
-        let worker = handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("worker thread {rank} panicked"))?
-            .with_context(|| format!("worker {rank} init failed"))?;
-        workers.push(worker);
-    }
-
-    #[cfg(feature = "nccl")]
-    info!("NCCL communicators initialized and injected into model layers");
-
-    // Extract metadata from rank 0 worker.
-    let hf_config = workers[0]
-        .hf_config()
-        .context("model config not available after load")?
-        .clone();
-    let model_dir = workers[0].model_dir().map(|p| p.to_path_buf());
-    let model_dtype = workers[0]
-        .resolved_dtype()
-        .unwrap_or(candle_core::DType::F32);
-    let preloaded_tokenizer = {
-        // Only take tokenizer from mutable ref to rank 0.
-        // We can't mutate here since workers is Vec<CandleWorker> not Vec<&mut>.
-        // The tokenizer will be loaded separately below.
-        None
-    };
-
-    if let Some(arch) = workers[0].architecture() {
-        info!("Resolved model architecture: {}", arch);
-    }
-
-    let max_model_len = config
-        .max_model_len
-        .or(hf_config.max_position_embeddings)
-        .unwrap_or(4096);
-    let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
-
-    info!(
-        "Model: {}, max_model_len={}, num_layers={}, tp={}",
-        model_name, max_model_len, num_layers, tp_size
-    );
-
-    // Wrap all workers in ThreadPoolExecutor. Each worker gets a dedicated
-    // OS thread, ensuring NCCL collectives can execute concurrently.
-    let all_workers: Vec<Box<dyn Worker>> = workers
-        .into_iter()
-        .map(|w| Box::new(w) as Box<dyn Worker>)
-        .collect();
-
-    let parallel_config = ResolvedParallelConfig::tensor_parallel(tp_size, 0);
-    let mut executor = ThreadPoolExecutor::new(all_workers, parallel_config);
-
-    // Headless worker mode: node_rank > 0 enters a blocking loop receiving
-    // SchedulerOutput from the master node. Never returns (until shutdown).
-    if num_nodes > 1 && node_rank > 0 {
-        let control_port = config.master_port + 1;
-        info!(
-            "Node rank {}: entering headless worker mode (control port {})",
-            node_rank, control_port
-        );
-        crate::headless::run_headless(executor, &config.master_addr, control_port)?;
-        // run_headless only returns on shutdown — exit cleanly.
-        std::process::exit(0);
-    }
-
-    // Determine available memory via executor (dispatches to worker tasks,
-    // which run on the correct CUDA context).
-    use vllm_engine::executor::Executor;
-    let memories = executor
-        .determine_available_memory()
-        .context("failed to determine available memory")?;
-    let min_available = *memories.iter().min().unwrap_or(&0);
-
-    let num_gpu_blocks = compute_num_blocks(
-        min_available,
-        config.block_size,
-        &hf_config,
-        model_dtype,
-        config.gpu_memory_utilization,
-    );
-
-    // Initialize cache on all workers via executor (also broadcasts to remotes
-    // if multi-node).
-    executor
-        .initialize_cache(num_gpu_blocks, 0)
-        .context("failed to initialize cache")?;
-
-    info!(
-        "Available memory (min): {:.1} GB, memory_utilization={}, num_gpu_blocks={}",
-        min_available as f64 / (1024.0 * 1024.0 * 1024.0),
-        config.gpu_memory_utilization,
-        num_gpu_blocks
-    );
-
-    let kv_cache_tokens = num_gpu_blocks * config.block_size;
-    info!("KV cache size: {} tokens", kv_cache_tokens);
-
-    #[cfg(feature = "metrics")]
-    {
-        let m = crate::metrics::VllmMetrics::global();
-        m.gpu_cache_blocks_total.set(num_gpu_blocks as i64);
-    }
-
-    // Build engine config.
-    let eos_token_ids: Vec<u32> = hf_config
-        .extra
-        .get("eos_token_id")
-        .map(|v| {
-            if let Some(id) = v.as_u64() {
-                vec![id as u32]
-            } else if let Some(arr) = v.as_array() {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|id| id as u32))
-                    .collect()
-            } else {
-                vec![]
-            }
-        })
-        .unwrap_or_default();
-    if !eos_token_ids.is_empty() {
-        info!("EOS token IDs: {:?}", eos_token_ids);
-    }
-
-    let use_async_scheduling = !config.disable_async_scheduling;
-    let engine_config = EngineCoreConfig {
-        scheduler_config: SchedulerConfig {
-            max_num_batched_tokens: max_model_len.min(8192),
-            max_num_seqs: config.max_num_seqs,
-            policy: SchedulerPolicy::Fcfs,
-            enable_chunked_prefill: true,
-            async_scheduling: Some(use_async_scheduling),
-            ..Default::default()
-        },
-        max_model_len,
-        num_gpu_blocks,
-        block_size: config.block_size,
-        engine_index: 0,
-        async_scheduling: use_async_scheduling,
-        use_spec_decode: config.speculative_model.is_some(),
-        ngram_proposer_config: if config.speculative_model.as_deref() == Some("ngram") {
-            Some(vllm_engine::ngram::NgramProposerConfig {
-                num_speculative_tokens: config.num_speculative_tokens,
-                max_ngram_size: config.ngram_prompt_lookup_max,
-                min_ngram_size: config.ngram_prompt_lookup_min,
-            })
-        } else {
-            None
-        },
-        eos_token_ids,
-        is_pooling: config.runner == "pooling",
-        enable_prefix_caching: config.enable_prefix_caching,
-    };
-
-    // Multi-node master: wrap executor to broadcast SchedulerOutput to remotes.
-    let boxed_executor: Box<dyn Executor> = if num_nodes > 1 && node_rank == 0 {
-        let control_port = config.master_port + 1;
-        let mn = MultiNodeExecutor::accept_remotes(executor, control_port, num_nodes - 1)
-            .context("failed to accept remote nodes")?;
-        Box::new(mn)
-    } else {
-        Box::new(executor)
-    };
-
-    let client = Box::new(InprocClient::new(engine_config, boxed_executor));
-
-    // Load tokenizer from model directory.
-    let loaded_tokenizer = preloaded_tokenizer
-        .map(Tokenizer::from_hf_tokenizer)
-        .or_else(|| {
-            model_dir
-                .as_ref()
-                .and_then(|dir| match try_load_tokenizer(dir) {
-                    Ok(tok) => Some(tok),
-                    Err(e) => {
-                        info!("No tokenizer found ({}), running without", e);
-                        None
-                    }
-                })
-        });
-
-    let engine = if let Some(tok) = loaded_tokenizer {
-        let dir_for_log = model_dir
-            .as_ref()
-            .map(|d| d.display().to_string())
-            .unwrap_or_else(|| "<preloaded>".to_string());
-        info!("Tokenizer loaded from {}", dir_for_log);
-        let tokenizer = Arc::new(tok);
-
-        #[cfg(feature = "chat-template")]
-        {
-            let chat_template = model_dir
-                .as_ref()
-                .and_then(|dir| try_load_chat_template(dir));
-            if let Some(tpl) = chat_template {
-                info!("Chat template loaded from tokenizer_config.json");
-                AsyncEngine::with_tokenizer_and_template(
-                    client,
-                    model_name.clone(),
-                    max_model_len,
-                    tokenizer,
-                    Arc::new(tpl),
-                )
-            } else {
-                info!("No chat template found, using plain concatenation");
-                AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
-            }
-        }
-        #[cfg(not(feature = "chat-template"))]
-        {
-            info!("No chat template found, using plain concatenation");
-            AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
-        }
-    } else {
-        AsyncEngine::new(client, model_name.clone(), max_model_len)
-    };
-
-    let mut engine = engine;
-    if !config.disable_async_scheduling {
-        engine.set_async_scheduling(true);
-    }
-    if config.runner == "pooling" {
-        engine.set_is_pooling(true);
-    }
-
-    info!(
-        "init engine (load model, create kv cache) took {:.2} seconds",
-        init_start.elapsed().as_secs_f64()
-    );
-
-    Ok(InitializedStack {
-        engine: Arc::new(engine),
-        model_name,
-        max_model_len,
-    })
+    // --- OLD CandleWorker TP code (reference for CudaWorker port) ---
+    // Key types: CandleWorker, CandleWorkerConfig, NcclProcessGroup,
+    //            ThreadPoolExecutor, MultiNodeExecutor
+    // Key imports: vllm_kernels::nccl, vllm_kernels::rendezvous
+    //     let tp_size = config.tensor_parallel_size;
+    //     info!(
+    //         "Tensor parallelism: {} GPUs (thread-per-GPU model)",
+    //         tp_size
+    //     );
+    // 
+    //     let is_pooling = config.runner == "pooling";
+    // 
+    //     // Multi-node: each node only creates workers for its local GPUs.
+    //     let num_nodes = config.num_nodes;
+    //     let node_rank = config.node_rank;
+    //     let local_tp = if num_nodes > 1 {
+    //         tp_size / num_nodes
+    //     } else {
+    //         tp_size
+    //     };
+    // 
+    //     // Create worker configs (one per local GPU).
+    //     let worker_configs: Vec<CandleWorkerConfig> = (0..local_tp)
+    //         .map(|local_rank| {
+    //             let global_rank = node_rank * local_tp + local_rank;
+    //             CandleWorkerConfig {
+    //                 model_path: config.model.clone(),
+    //                 device_str: format!("cuda:{local_rank}"),
+    //                 dtype: config.dtype.clone(),
+    //                 hf_token: config.hf_token.clone(),
+    //                 cache_dir: None,
+    //                 block_size: config.block_size,
+    //                 gguf_file: config.gguf_file.clone(),
+    //                 lora_adapter: config.lora_adapter.clone(),
+    //                 pooling_strategy: config.pooling_strategy.clone(),
+    //                 is_pooling,
+    //                 tp_rank: global_rank,
+    //                 tp_world_size: tp_size,
+    //                 cuda_graph_config: config.cuda_graph_config.clone(),
+    //             }
+    //         })
+    //         .collect();
+    // 
+    //     // Clean up stale NCCL shared memory segments from previous runs.
+    //     #[cfg(all(feature = "nccl", target_os = "linux"))]
+    //     {
+    //         let shm_path = std::path::Path::new("/dev/shm");
+    //         if shm_path.exists()
+    //             && let Ok(entries) = std::fs::read_dir(shm_path)
+    //         {
+    //             for entry in entries.flatten() {
+    //                 if let Some(name) = entry.file_name().to_str()
+    //                     && name.starts_with("nccl-")
+    //                 {
+    //                     let _ = std::fs::remove_file(entry.path());
+    //                 }
+    //             }
+    //         }
+    //     }
+    // 
+    //     #[cfg(not(feature = "nccl"))]
+    //     if tp_size > 1 {
+    //         anyhow::bail!(
+    //             "tensor parallelism requires the `nccl` feature; \
+    //              rebuild with --features nccl"
+    //         );
+    //     }
+    // 
+    //     // Initialize all workers on dedicated per-GPU threads.
+    //     //
+    //     // Each thread: creates CUDA device → loads model → creates NCCL comm →
+    //     // injects process group into model layers. This ensures NCCL comms are
+    //     // created with the correct CUDA context (NCCL ties comms to the thread
+    //     // that created them for collective synchronization).
+    //     //
+    //     // After init, workers are moved back to the main thread and wrapped
+    //     // in the ThreadPoolExecutor.
+    //     info!(
+    //         "Initializing {} workers on dedicated GPU threads...",
+    //         local_tp
+    //     );
+    // 
+    //     // Use a barrier so rank 0 downloads/loads first (caching model files),
+    //     // then other ranks proceed (finding cached files, no lock contention).
+    //     let download_barrier = std::sync::Arc::new(std::sync::Barrier::new(local_tp));
+    // 
+    //     // Log NCCL-relevant env vars for debuggability.
+    //     #[cfg(feature = "nccl")]
+    //     {
+    //         for var in [
+    //             "NCCL_DEBUG",
+    //             "NCCL_SOCKET_IFNAME",
+    //             "NCCL_SHM_DISABLE",
+    //             "NCCL_P2P_DISABLE",
+    //             "NCCL_IB_DISABLE",
+    //             "NCCL_NET_GDR_LEVEL",
+    //         ] {
+    //             if let Ok(val) = std::env::var(var) {
+    //                 info!("NCCL env: {var}={val}");
+    //             }
+    //         }
+    //     }
+    // 
+    //     #[cfg(feature = "nccl")]
+    //     let nccl_id = {
+    //         use vllm_kernels::nccl::NcclProcessGroup;
+    // 
+    //         let num_nodes = config.num_nodes;
+    //         if num_nodes <= 1 {
+    //             NcclProcessGroup::generate_id().context("failed to generate NCCL ID")?
+    //         } else {
+    //             use vllm_kernels::rendezvous;
+    //             info!(
+    //                 "Multi-node TP: node_rank={}, num_nodes={}, global_world_size={}, local_tp={}",
+    //                 node_rank, num_nodes, tp_size, local_tp
+    //             );
+    //             if node_rank == 0 {
+    //                 rendezvous::rendezvous_master(config.master_port, num_nodes)
+    //                     .context("NCCL rendezvous master failed")?
+    //             } else {
+    //                 rendezvous::rendezvous_worker(&config.master_addr, config.master_port)
+    //                     .context("NCCL rendezvous worker failed")?
+    //             }
+    //         }
+    //     };
+    // 
+    //     // Spawn one thread per GPU rank. Each thread does device init + model load
+    //     // + NCCL comm creation + injection, then sends the worker back.
+    //     let mut rank_counter = 0usize;
+    //     let handles: Vec<_> = worker_configs
+    //         .into_iter()
+    //         .map(|cfg| {
+    //             let local_idx = rank_counter;
+    //             rank_counter += 1;
+    //             // Capture NCCL init params for this rank's thread.
+    //             #[cfg(feature = "nccl")]
+    //             let (nccl_id, global_rank, global_ws) =
+    //                 (nccl_id, node_rank * local_tp + local_idx, tp_size);
+    //             let barrier = download_barrier.clone();
+    // 
+    //             std::thread::spawn(move || -> Result<(CandleWorker, Option<Arc<dyn vllm_model::process_group::ProcessGroup>>)> {
+    //                 let mut worker = CandleWorker::new(cfg);
+    //                 worker.init_device().context("init_device failed")?;
+    // 
+    //                 // Rank 0 loads first (downloads model files to cache).
+    //                 // Other ranks wait at the barrier, then load from cache.
+    //                 if local_idx == 0 {
+    //                     worker.load_model().context("load_model failed")?;
+    //                     barrier.wait();
+    //                 } else {
+    //                     barrier.wait();
+    //                     worker.load_model().context("load_model failed")?;
+    //                 }
+    // 
+    //                 // Create NCCL comm on this thread (correct CUDA context).
+    //                 #[cfg(feature = "nccl")]
+    //                 let nccl_group = {
+    //                     use vllm_kernels::nccl::NcclProcessGroup;
+    // 
+    //                     let device = worker
+    //                         .device()
+    //                         .ok_or_else(|| anyhow::anyhow!("no device after init"))?
+    //                         .clone();
+    //                     let group = NcclProcessGroup::new(global_rank, global_ws, nccl_id, &device)
+    //                         .context("NCCL comm_init_rank failed")?;
+    //                     let group: std::sync::Arc<dyn vllm_model::process_group::ProcessGroup> =
+    //                         std::sync::Arc::new(group);
+    //                     worker
+    //                         .inject_tp_group(group.clone())
+    //                         .context("inject_tp_group failed")?;
+    //                     Some(group)
+    //                 };
+    //                 #[cfg(not(feature = "nccl"))]
+    //                 let nccl_group: Option<std::sync::Arc<dyn vllm_model::process_group::ProcessGroup>> = None;
+    // 
+    //                 Ok((worker, nccl_group))
+    //             })
+    //         })
+    //         .collect();
+    // 
+    //     let mut workers: Vec<CandleWorker> = Vec::with_capacity(local_tp);
+    //     let mut process_groups: Vec<Arc<dyn vllm_model::process_group::ProcessGroup>> = Vec::new();
+    //     for (rank, handle) in handles.into_iter().enumerate() {
+    //         let (worker, pg) = handle
+    //             .join()
+    //             .map_err(|_| anyhow::anyhow!("worker thread {rank} panicked"))?
+    //             .with_context(|| format!("worker {rank} init failed"))?;
+    //         workers.push(worker);
+    //         if let Some(pg) = pg {
+    //             process_groups.push(pg);
+    //         }
+    //         let _ = rank;
+    //     }
+    // 
+    //     #[cfg(feature = "nccl")]
+    //     info!("NCCL communicators initialized and injected into model layers");
+    // 
+    //     // Extract metadata from rank 0 worker.
+    //     let hf_config = workers[0]
+    //         .hf_config()
+    //         .context("model config not available after load")?
+    //         .clone();
+    //     let model_dir = workers[0].model_dir().map(|p| p.to_path_buf());
+    //     let model_dtype = workers[0]
+    //         .resolved_dtype()
+    //         .unwrap_or(candle_core::DType::F32);
+    //     let preloaded_tokenizer = {
+    //         // Only take tokenizer from mutable ref to rank 0.
+    //         // We can't mutate here since workers is Vec<CandleWorker> not Vec<&mut>.
+    //         // The tokenizer will be loaded separately below.
+    //         None
+    //     };
+    // 
+    //     if let Some(arch) = workers[0].architecture() {
+    //         info!("Resolved model architecture: {}", arch);
+    //     }
+    // 
+    //     let max_model_len = config
+    //         .max_model_len
+    //         .or(hf_config.max_position_embeddings)
+    //         .unwrap_or(4096);
+    //     let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
+    // 
+    //     info!(
+    //         "Model: {}, max_model_len={}, num_layers={}, tp={}",
+    //         model_name, max_model_len, num_layers, tp_size
+    //     );
+    // 
+    //     // Wrap all workers in ThreadPoolExecutor. Each worker gets a dedicated
+    //     // OS thread, ensuring NCCL collectives can execute concurrently.
+    //     let all_workers: Vec<Box<dyn Worker>> = workers
+    //         .into_iter()
+    //         .map(|w| Box::new(w) as Box<dyn Worker>)
+    //         .collect();
+    // 
+    //     let parallel_config = ResolvedParallelConfig::tensor_parallel(tp_size, 0);
+    //     let pgs = if process_groups.is_empty() {
+    //         None
+    //     } else {
+    //         Some(process_groups)
+    //     };
+    //     let executor = ThreadPoolExecutor::with_process_groups(all_workers, parallel_config, pgs);
+    // 
+    //     // Headless worker mode: node_rank > 0 enters a blocking loop receiving
+    //     // SchedulerOutput from rank 0 via NCCL broadcast.
+    //     if num_nodes > 1 && node_rank > 0 {
+    //         info!(
+    //             "Node rank {}: entering headless worker mode (NCCL broadcast)",
+    //             node_rank
+    //         );
+    //         crate::headless::run_headless(executor)?;
+    //         // run_headless only returns on shutdown — exit cleanly.
+    //         std::process::exit(0);
+    //     }
+    // 
+    //     use vllm_engine::executor::Executor;
+    // 
+    //     // Multi-node master: wrap executor to broadcast SchedulerOutput via NCCL.
+    //     let mut executor: Box<dyn Executor> = if num_nodes > 1 && node_rank == 0 {
+    //         let mn = MultiNodeExecutor::new(executor);
+    //         Box::new(mn)
+    //     } else {
+    //         Box::new(executor)
+    //     };
+    // 
+    //     // Determine available memory via executor (dispatches to worker tasks,
+    //     // which run on the correct CUDA context).
+    //     let memories = executor
+    //         .determine_available_memory()
+    //         .context("failed to determine available memory")?;
+    //     let min_available = *memories.iter().min().unwrap_or(&0);
+    // 
+    //     let num_gpu_blocks = compute_num_blocks(
+    //         min_available,
+    //         config.block_size,
+    //         &hf_config,
+    //         model_dtype,
+    //         config.gpu_memory_utilization,
+    //     );
+    // 
+    //     // Initialize cache on all workers via executor (also broadcasts to remotes
+    //     // if multi-node).
+    //     executor
+    //         .initialize_cache(num_gpu_blocks, 0)
+    //         .context("failed to initialize cache")?;
+    // 
+    //     info!(
+    //         "Available memory (min): {:.1} GB, memory_utilization={}, num_gpu_blocks={}",
+    //         min_available as f64 / (1024.0 * 1024.0 * 1024.0),
+    //         config.gpu_memory_utilization,
+    //         num_gpu_blocks
+    //     );
+    // 
+    //     let kv_cache_tokens = num_gpu_blocks * config.block_size;
+    //     info!("KV cache size: {} tokens", kv_cache_tokens);
+    // 
+    //     #[cfg(feature = "metrics")]
+    //     {
+    //         let m = crate::metrics::VllmMetrics::global();
+    //         m.gpu_cache_blocks_total.set(num_gpu_blocks as i64);
+    //     }
+    // 
+    //     // Build engine config.
+    //     let eos_token_ids: Vec<u32> = hf_config
+    //         .extra
+    //         .get("eos_token_id")
+    //         .map(|v| {
+    //             if let Some(id) = v.as_u64() {
+    //                 vec![id as u32]
+    //             } else if let Some(arr) = v.as_array() {
+    //                 arr.iter()
+    //                     .filter_map(|v| v.as_u64().map(|id| id as u32))
+    //                     .collect()
+    //             } else {
+    //                 vec![]
+    //             }
+    //         })
+    //         .unwrap_or_default();
+    //     if !eos_token_ids.is_empty() {
+    //         info!("EOS token IDs: {:?}", eos_token_ids);
+    //     }
+    // 
+    //     let use_async_scheduling = !config.disable_async_scheduling;
+    //     let engine_config = EngineCoreConfig {
+    //         scheduler_config: SchedulerConfig {
+    //             max_num_batched_tokens: config
+    //                 .max_num_batched_tokens
+    //                 .unwrap_or_else(|| max_model_len.min(8192)),
+    //             max_num_seqs: config.max_num_seqs,
+    //             policy: SchedulerPolicy::Fcfs,
+    //             enable_chunked_prefill: true,
+    //             async_scheduling: Some(use_async_scheduling),
+    //             ..Default::default()
+    //         },
+    //         max_model_len,
+    //         num_gpu_blocks,
+    //         block_size: config.block_size,
+    //         engine_index: 0,
+    //         async_scheduling: use_async_scheduling,
+    //         use_spec_decode: config.speculative_model.is_some(),
+    //         ngram_proposer_config: if config.speculative_model.as_deref() == Some("ngram") {
+    //             Some(vllm_engine::ngram::NgramProposerConfig {
+    //                 num_speculative_tokens: config.num_speculative_tokens,
+    //                 max_ngram_size: config.ngram_prompt_lookup_max,
+    //                 min_ngram_size: config.ngram_prompt_lookup_min,
+    //             })
+    //         } else {
+    //             None
+    //         },
+    //         eos_token_ids,
+    //         is_pooling: config.runner == "pooling",
+    //         enable_prefix_caching: config.enable_prefix_caching,
+    //     };
+    // 
+    //     let client = Box::new(InprocClient::new(engine_config, executor));
+    // 
+    //     // Load tokenizer from model directory.
+    //     let loaded_tokenizer = preloaded_tokenizer
+    //         .map(Tokenizer::from_hf_tokenizer)
+    //         .or_else(|| {
+    //             model_dir
+    //                 .as_ref()
+    //                 .and_then(|dir| match try_load_tokenizer(dir) {
+    //                     Ok(tok) => Some(tok),
+    //                     Err(e) => {
+    //                         info!("No tokenizer found ({}), running without", e);
+    //                         None
+    //                     }
+    //                 })
+    //         });
+    // 
+    //     let engine = if let Some(tok) = loaded_tokenizer {
+    //         let dir_for_log = model_dir
+    //             .as_ref()
+    //             .map(|d| d.display().to_string())
+    //             .unwrap_or_else(|| "<preloaded>".to_string());
+    //         info!("Tokenizer loaded from {}", dir_for_log);
+    //         let tokenizer = Arc::new(tok);
+    // 
+    //         #[cfg(feature = "chat-template")]
+    //         {
+    //             let chat_template = model_dir
+    //                 .as_ref()
+    //                 .and_then(|dir| try_load_chat_template(dir));
+    //             if let Some(tpl) = chat_template {
+    //                 info!("Chat template loaded from tokenizer_config.json");
+    //                 AsyncEngine::with_tokenizer_and_template(
+    //                     client,
+    //                     model_name.clone(),
+    //                     max_model_len,
+    //                     tokenizer,
+    //                     Arc::new(tpl),
+    //                 )
+    //             } else {
+    //                 info!("No chat template found, using plain concatenation");
+    //                 AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
+    //             }
+    //         }
+    //         #[cfg(not(feature = "chat-template"))]
+    //         {
+    //             info!("No chat template found, using plain concatenation");
+    //             AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
+    //         }
+    //     } else {
+    //         AsyncEngine::new(client, model_name.clone(), max_model_len)
+    //     };
+    // 
+    //     let mut engine = engine;
+    //     if !config.disable_async_scheduling {
+    //         engine.set_async_scheduling(true);
+    //     }
+    //     if config.runner == "pooling" {
+    //         engine.set_is_pooling(true);
+    //     }
+    // 
+    //     info!(
+    //         "init engine (load model, create kv cache) took {:.2} seconds",
+    //         init_start.elapsed().as_secs_f64()
+    //     );
+    // 
+    //     Ok(InitializedStack {
+    //         engine: Arc::new(engine),
+    //         model_name,
+    //         max_model_len,
+    //     })
+    // }
 }
 
 /// Try to load a HuggingFace tokenizer from a model directory.
@@ -1193,5 +1252,24 @@ mod tests {
         assert_eq!(config.block_size, 16);
         assert!((config.gpu_memory_utilization - 0.9).abs() < f64::EPSILON);
         assert!(config.model.is_empty());
+        assert!(config.max_num_batched_tokens.is_none());
+    }
+
+    #[test]
+    fn test_max_num_batched_tokens_default_none() {
+        let config = VllmConfig::default();
+        assert!(
+            config.max_num_batched_tokens.is_none(),
+            "default should be None (auto)"
+        );
+    }
+
+    #[test]
+    fn test_max_num_batched_tokens_explicit_override() {
+        let config = VllmConfig {
+            max_num_batched_tokens: Some(4096),
+            ..VllmConfig::default()
+        };
+        assert_eq!(config.max_num_batched_tokens, Some(4096));
     }
 }

@@ -82,6 +82,10 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 256)]
     pub max_num_seqs: usize,
 
+    /// Maximum number of tokens processed in a single scheduler iteration.
+    #[arg(long)]
+    pub max_num_batched_tokens: Option<usize>,
+
     /// HuggingFace token for gated models.
     #[arg(long, env = "HF_TOKEN")]
     pub hf_token: Option<String>,
@@ -210,6 +214,11 @@ pub struct ServeArgs {
     /// By default, prefix caching is enabled.
     #[arg(long)]
     pub no_prefix_caching: bool,
+
+    /// Benchmark cublasLt algorithms during warmup to find faster GEMM kernels.
+    /// Adds a few seconds to startup. Mainly benefits compute-bound prefill GEMMs.
+    #[arg(long)]
+    pub cublas_autotune: bool,
 }
 
 impl ServeArgs {
@@ -267,10 +276,10 @@ pub struct ChatArgs {
     #[arg(short = 'q', long, value_name = "MESSAGE")]
     pub quick: Option<String>,
 
-    /// Send a single prompt, print the response, and exit.
-    /// Unlike --quick, this is intended for scripting and benchmarking.
-    #[arg(short = 'p', long, value_name = "PROMPT")]
-    pub prompt: Option<String>,
+    /// Send prompt(s) and exit. Multiple values become separate turns in
+    /// a multi-turn conversation (model responds to each in order).
+    #[arg(short = 'p', long, value_name = "PROMPT", num_args = 1..)]
+    pub prompt: Vec<String>,
 
     /// Print performance metrics after generation: startup time, TTFT,
     /// inter-token latency (ITL), and tokens/sec. Best used with --prompt.
@@ -698,7 +707,7 @@ mod tests {
                 assert_eq!(args.url, "http://localhost:8000/v1");
                 assert!(args.system_prompt.is_none());
                 assert!(args.quick.is_none());
-                assert!(args.prompt.is_none());
+                assert!(args.prompt.is_empty());
                 assert!(!args.bench);
                 assert_eq!(args.device, "auto");
                 assert_eq!(args.dtype, "auto");
@@ -765,7 +774,7 @@ mod tests {
         ]);
         match cli.command {
             Commands::Chat(args) => {
-                assert_eq!(args.prompt.as_deref(), Some("Tell me a joke"));
+                assert_eq!(args.prompt, vec!["Tell me a joke"]);
                 assert!(args.bench);
                 assert_eq!(args.resolved_model().unwrap(), "my-model");
             }

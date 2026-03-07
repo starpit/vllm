@@ -25,8 +25,12 @@ fn create_llm(args: &BenchThroughputArgs, model: &str) -> Result<LLM> {
         .max_num_seqs(args.max_num_seqs)
         .block_size(args.block_size)
         .tensor_parallel_size(args.tensor_parallel_size)
-        .enable_prefix_caching(args.enable_prefix_caching);
+        .enable_prefix_caching(args.enable_prefix_caching)
+        .enforce_eager(args.enforce_eager);
 
+    if let Some(n) = args.max_num_batched_tokens {
+        builder = builder.max_num_batched_tokens(n);
+    }
     if let Some(len) = args.max_model_len {
         builder = builder.max_model_len(len);
     }
@@ -84,8 +88,6 @@ pub(crate) fn run_bench_throughput(args: BenchThroughputArgs) -> Result<()> {
     let tokenizer = llm
         .tokenizer()
         .ok_or_else(|| anyhow::anyhow!("tokenizer required for throughput benchmark"))?;
-    let vocab_size = tokenizer.vocab_size().max(1) as u64;
-
     let mut rng_state: u64 = args.seed;
     let mut next_rng = || -> u64 {
         // Simple xorshift64 for deterministic pseudo-random generation.
@@ -103,16 +105,49 @@ pub(crate) fn run_bench_throughput(args: BenchThroughputArgs) -> Result<()> {
         .unwrap(),
     );
 
+    // Python vLLM's RandomDataset uses sequential token IDs from "allowed tokens"
+    // (non-special tokens), then iteratively decodes→encodes to hit exact length.
+    // We match this by filtering to non-special tokens first, then using the same
+    // sequential pattern: (offset + index + i) % num_allowed.
+    let allowed_tokens: Vec<u32> = (0..tokenizer.vocab_size() as u32)
+        .filter(|&t| !tokenizer.is_special_token(t))
+        .collect();
+    let num_allowed = allowed_tokens.len().max(1) as u64;
+
     let prompts: Vec<Prompt> = (0..args.num_prompts)
-        .map(|_| {
-            let token_ids: Vec<u32> = (0..args.input_len)
-                .map(|_| (next_rng() % vocab_size) as u32)
+        .map(|prompt_idx| {
+            let offset = next_rng();
+            let target_len = args.input_len;
+            // Sequential token selection matching Python: (offset + idx + i) % num_allowed
+            let mut token_ids: Vec<u32> = (0..target_len)
+                .map(|i| {
+                    allowed_tokens[((offset + prompt_idx as u64 + i as u64) % num_allowed) as usize]
+                })
                 .collect();
-            // Decode to text then feed as a text prompt so that LLM.generate()
-            // re-tokenizes — matching the Python round-trip methodology.
-            let text = tokenizer
-                .decode(&token_ids, true)
-                .unwrap_or_else(|_| String::from("?"));
+            // Iteratively decode→encode→adjust to hit exact target length (up to 10 retries).
+            let mut text = String::new();
+            for _ in 0..10 {
+                text = tokenizer
+                    .decode(&token_ids, true)
+                    .unwrap_or_else(|_| String::from("?"));
+                let re_encoded = tokenizer.encode(text.as_str(), false).unwrap_or_default();
+                if re_encoded.len() == target_len {
+                    break;
+                } else if re_encoded.len() < target_len {
+                    // Too short: append more allowed tokens.
+                    token_ids = re_encoded;
+                    let mut extra_offset = token_ids.len() as u64;
+                    while token_ids.len() < target_len {
+                        token_ids.push(
+                            allowed_tokens[((next_rng() + extra_offset) % num_allowed) as usize],
+                        );
+                        extra_offset += 1;
+                    }
+                } else {
+                    // Too long: truncate.
+                    token_ids = re_encoded[..target_len].to_vec();
+                }
+            }
             pb.inc(1);
             Prompt::Text(text)
         })

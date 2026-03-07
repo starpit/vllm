@@ -3,22 +3,16 @@ name = "vllm-models"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Model architecture implementations for vLLM Rust port"
+description = "Shared model infrastructure: sampler, attention metadata, KV cache, embeddings"
 
 [features]
 default = []
-cuda = ["vllm-model/cuda", "vllm-kernels/cuda", "candle-core/cuda", "candle-flash-attn"]
-metal = ["vllm-model/metal", "candle-core/metal"]
-profiling = ["vllm-kernels/profiling"]
 guided-decoding = ["outlines-core"]
 
 [dependencies]
 vllm-common = { workspace = true }
-vllm-config = { workspace = true }
 vllm-model = { workspace = true }
-vllm-kernels = { workspace = true }
 candle-core = { workspace = true }
-candle-flash-attn = { workspace = true, optional = true }
 outlines-core = { workspace = true, optional = true }
 thiserror = { workspace = true }
 rand = { workspace = true }

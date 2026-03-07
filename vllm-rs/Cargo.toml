@@ -9,7 +9,6 @@ members = [
     "crates/vllm-executor",
     "crates/vllm-model",
     "crates/vllm-models",
-    "crates/vllm-kernels",
     "crates/vllm-protocol",
     "crates/vllm-pyo3",
     "crates/vllm-bench",
@@ -17,11 +16,10 @@ members = [
     "crates/vllm-mlx",
     "crates/vllm-e2e",
     "crates/vllm-wgpu",
+    "crates/vllm-cuda",
     "crates/vllm-examples",
 ]
-exclude = [
-    "third_party/candle-flash-attn",
-]
+exclude = []
 
 [workspace.package]
 version = "0.1.0"
@@ -93,8 +91,6 @@ outlines-core = { version = "0.2", default-features = false }
 
 # Tensor ops
 candle-core = { version = "0.9", default-features = false }
-candle-flash-attn = { path = "third_party/candle-flash-attn" }
-
 # CUDA (NVIDIA GPU) — must match candle-core's cudarc version
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "f16"] }
 safetensors = "0.7"
@@ -135,13 +131,13 @@ vllm-serve = { path = "crates/vllm-serve" }
 vllm-executor = { path = "crates/vllm-executor" }
 vllm-model = { path = "crates/vllm-model" }
 vllm-models = { path = "crates/vllm-models" }
-vllm-kernels = { path = "crates/vllm-kernels" }
 vllm-protocol = { path = "crates/vllm-protocol" }
 vllm-bench = { path = "crates/vllm-bench" }
 vllm-cli = { path = "crates/vllm-cli" }
 vllm-mlx = { path = "crates/vllm-mlx" }
 vllm-e2e = { path = "crates/vllm-e2e" }
 vllm-wgpu = { path = "crates/vllm-wgpu" }
+vllm-cuda = { path = "crates/vllm-cuda" }
 vllm-examples = { path = "crates/vllm-examples" }
 
 # WebGPU

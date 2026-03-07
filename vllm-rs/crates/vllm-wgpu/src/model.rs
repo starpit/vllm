@@ -9,12 +9,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use serde::Deserialize;
 
 use crate::WgpuDevice;
-use crate::device::GraphCapture;
 use crate::gguf::{self, GgufDType, GgufReader};
 use crate::ops;
 use crate::tensor::{WgpuDType, WgpuTensor};
@@ -150,23 +148,6 @@ pub struct WgpuWorker {
     position_buf: WgpuTensor,
     /// Resolved local model directory (set by `from_pretrained`).
     model_dir: Option<PathBuf>,
-
-    // --- Graph capture / replay for decode steps ---
-    /// Captured decode graph from the first decode step. When present,
-    /// subsequent single-token decode steps replay this instead of
-    /// re-encoding all dispatches.
-    decode_graph: Option<GraphCapture>,
-    /// Writable uniform buffer for `rope_slice_cache` params.
-    /// Layout: `[q_size, kv_size, head_dim, position, num_q_heads, num_kv_heads, max_seq, stride]`
-    /// Updated via `queue.write_buffer()` at word[3] = position before each replay.
-    rope_params_buf: Option<Arc<wgpu::Buffer>>,
-    /// Writable uniform buffer for `attention` params.
-    /// Layout: `[num_q_heads, num_kv_heads, head_dim, seq_len, scale_bits, 0, 0, 0]`
-    /// Updated via `queue.write_buffer()` at word[3] = seq_len before each replay.
-    attn_params_buf: Option<Arc<wgpu::Buffer>>,
-    /// The final normed hidden state from the capture step. Kept alive so the
-    /// replay's bind groups remain valid, and used on replay for the argmax.
-    replay_normed_hidden: Option<WgpuTensor>,
 }
 
 impl WgpuWorker {
@@ -202,10 +183,6 @@ impl WgpuWorker {
             input_id_buf,
             position_buf,
             model_dir: None,
-            decode_graph: None,
-            rope_params_buf: None,
-            attn_params_buf: None,
-            replay_normed_hidden: None,
         }
     }
 
@@ -226,9 +203,6 @@ impl WgpuWorker {
             cache.v = WgpuTensor::zeros(&self.device, &[max_seq, kv_dim], WgpuDType::F32);
             cache.len = 0;
         }
-        // Invalidate captured graph — bind groups reference old KV cache buffers.
-        self.decode_graph = None;
-        self.replay_normed_hidden = None;
     }
 
     /// Precompute RoPE cos/sin caches.
@@ -287,13 +261,13 @@ impl WgpuWorker {
         }
 
         // Prefer Q4_0 for bandwidth efficiency, then other quants
-        let preferred = ["q4_0", "q4_k_m", "q4_k_s", "q8_0", "f16"];
+        let preferred = ["Q4_0", "Q4_K_M", "Q4_K_S", "Q8_0", "F16"];
         let chosen = preferred
             .iter()
             .find_map(|pref| {
                 gguf_files
                     .iter()
-                    .find(|f: &&String| f.to_lowercase().contains(pref))
+                    .find(|f: &&String| f.contains(pref))
                     .cloned()
             })
             .unwrap_or_else(|| {
@@ -380,23 +354,11 @@ impl WgpuWorker {
             eprintln!("  Loading GGUF: {}", gguf_file.display());
             // Download tokenizer — try this repo first, then the base model repo
             let tokenizer = Self::download_tokenizer(&api, &repo, model_id)?;
-            // Download tokenizer_config.json for chat templates — try GGUF repo, then base model
-            let tok_cfg_path = repo.get("tokenizer_config.json").ok().or_else(|| {
-                let base_candidates = infer_base_model(model_id);
-                for base in &base_candidates {
-                    let base_repo = api.model(base.to_string());
-                    if let Ok(path) = base_repo.get("tokenizer_config.json") {
-                        return Some(path);
-                    }
-                }
-                None
-            });
+            let _ = repo.get("tokenizer_config.json"); // best-effort for chat templates
             let (mut worker, config) = Self::from_gguf_path(device, &gguf_file)?;
-            // Resolve model_dir — prefer config.json, fall back to tokenizer_config.json
+            // Try to resolve model_dir from config.json cache path.
             if let Ok(cfg_path) = repo.get("config.json") {
                 worker.model_dir = cfg_path.parent().map(|p| p.to_path_buf());
-            } else if let Some(ref tc_path) = tok_cfg_path {
-                worker.model_dir = tc_path.parent().map(|p| p.to_path_buf());
             }
             return Ok((worker, config, tokenizer));
         }
@@ -689,24 +651,9 @@ impl WgpuWorker {
             WgpuTensor::from_f32(&self.device, &shape, &data).map_err(|e| format!("{name}: {e}"))
         };
 
-        // Load a 1D bias tensor if it exists in the GGUF file
-        let load_bias = |name: &str| -> Result<Option<WgpuTensor>, String> {
-            match gguf.tensor_info(name) {
-                Some(_info) => {
-                    let (shape, data) = deq(name)?;
-                    Ok(Some(
-                        WgpuTensor::from_f32(&self.device, &shape, &data)
-                            .map_err(|e| format!("{name}: {e}"))?,
-                    ))
-                }
-                None => Ok(None),
-            }
-        };
-
         // Load a linear layer weight as Q4_0 if available, else dequant to f16
         let load_linear_q4 = |device: &WgpuDevice,
                               name: &str,
-                              bias_name: Option<&str>,
                               expected_n: usize,
                               expected_k: usize|
          -> Result<WgpuLinear, String> {
@@ -714,11 +661,6 @@ impl WgpuWorker {
                 .tensor_info(name)
                 .ok_or_else(|| format!("missing tensor: {name}"))?;
             let data = gguf.tensor_data(name)?;
-
-            let bias = match bias_name {
-                Some(bn) => load_bias(bn)?,
-                None => None,
-            };
 
             if info.dtype == GgufDType::Q4_0 {
                 // Load directly as Q4_0 packed
@@ -736,7 +678,7 @@ impl WgpuWorker {
                 Ok(WgpuLinear {
                     weight,
                     weight_t,
-                    bias,
+                    bias: None,
                 })
             } else {
                 // Dequant to f32, then store as f16
@@ -754,7 +696,7 @@ impl WgpuWorker {
                 Ok(WgpuLinear {
                     weight,
                     weight_t,
-                    bias,
+                    bias: None,
                 })
             }
         };
@@ -783,26 +725,6 @@ impl WgpuWorker {
 
             let total_out = q_size + 2 * kv_size;
 
-            // Fuse Q/K/V biases if present (e.g. Qwen2.5 has attn biases)
-            let q_bias_name = format!("blk.{layer_idx}.attn_q.bias");
-            let bias = if gguf.tensor_info(&q_bias_name).is_some() {
-                let k_bias_name = format!("blk.{layer_idx}.attn_k.bias");
-                let v_bias_name = format!("blk.{layer_idx}.attn_v.bias");
-                let (_, qb) = deq(&q_bias_name)?;
-                let (_, kb) = deq(&k_bias_name)?;
-                let (_, vb) = deq(&v_bias_name)?;
-                let mut fused_bias = vec![0.0f32; total_out];
-                fused_bias[..q_size].copy_from_slice(&qb[..q_size]);
-                fused_bias[q_size..q_size + kv_size].copy_from_slice(&kb[..kv_size]);
-                fused_bias[q_size + kv_size..total_out].copy_from_slice(&vb[..kv_size]);
-                Some(
-                    WgpuTensor::from_f32(device, &[total_out], &fused_bias)
-                        .map_err(|e| format!("fused qkv bias: {e}"))?,
-                )
-            } else {
-                None
-            };
-
             if q_info.dtype == GgufDType::Q4_0
                 && k_info.dtype == GgufDType::Q4_0
                 && v_info.dtype == GgufDType::Q4_0
@@ -828,7 +750,7 @@ impl WgpuWorker {
                 Ok(WgpuLinear {
                     weight,
                     weight_t,
-                    bias,
+                    bias: None,
                 })
             } else {
                 // Dequant each to f32, fuse, store as f16
@@ -850,7 +772,7 @@ impl WgpuWorker {
                 Ok(WgpuLinear {
                     weight,
                     weight_t,
-                    bias,
+                    bias: None,
                 })
             }
         };
@@ -934,20 +856,16 @@ impl WgpuWorker {
             let post_attention_layernorm = load_1d(&format!("blk.{i}.ffn_norm.weight"))?;
 
             let qkv_proj = load_fused_qkv_q4(&self.device, i)?;
-            let o_bias_name = format!("blk.{i}.attn_output.bias");
             let o_proj = load_linear_q4(
                 &self.device,
                 &format!("blk.{i}.attn_output.weight"),
-                Some(&o_bias_name),
                 hidden,
                 hidden,
             )?;
             let gate_up_proj = load_fused_gate_up_q4(&self.device, i)?;
-            let down_bias_name = format!("blk.{i}.ffn_down.bias");
             let down_proj = load_linear_q4(
                 &self.device,
                 &format!("blk.{i}.ffn_down.weight"),
-                Some(&down_bias_name),
                 hidden,
                 intermediate,
             )?;
@@ -971,13 +889,7 @@ impl WgpuWorker {
         } else {
             "token_embd.weight"
         };
-        let lm_linear = load_linear_q4(
-            &self.device,
-            lm_head_name,
-            None,
-            self.config.vocab_size,
-            hidden,
-        )?;
+        let lm_linear = load_linear_q4(&self.device, lm_head_name, self.config.vocab_size, hidden)?;
 
         self.weights = Some(ModelWeights {
             embed_tokens,
@@ -1014,128 +926,11 @@ impl WgpuWorker {
     }
 
     /// Run a single-token forward pass and return the next token ID.
-    /// Create writable uniform param buffers for graph capture/replay.
-    /// Called once on the first decode step.
-    fn init_replay_params(&mut self, position: usize) {
-        use wgpu::util::DeviceExt;
-
-        let num_q_heads = self.config.num_attention_heads;
-        let num_kv_heads = self.config.num_kv_heads();
-        let head_dim = self.config.head_dim();
-        let q_size = num_q_heads * head_dim;
-        let kv_size = num_kv_heads * head_dim;
-        let max_seq = self.config.max_position_embeddings.min(Self::MAX_KV_SEQ);
-
-        let rope_data: [u32; 8] = [
-            q_size as u32,
-            kv_size as u32,
-            head_dim as u32,
-            position as u32,
-            num_q_heads as u32,
-            num_kv_heads as u32,
-            max_seq as u32,
-            kv_size as u32, // cache_stride
-        ];
-        self.rope_params_buf = Some(Arc::new(self.device.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("rope_params_replay"),
-                contents: bytemuck::cast_slice(&rope_data),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            },
-        )));
-
-        let scale_bits = (1.0f32 / (head_dim as f32).sqrt()).to_bits();
-        let seq_len = (position + 1) as u32;
-        let attn_data: [u32; 8] = [
-            num_q_heads as u32,
-            num_kv_heads as u32,
-            head_dim as u32,
-            seq_len,
-            scale_bits,
-            0,
-            0,
-            0,
-        ];
-        self.attn_params_buf = Some(Arc::new(self.device.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("attn_params_replay"),
-                contents: bytemuck::cast_slice(&attn_data),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            },
-        )));
-    }
-
-    /// Update the step-varying fields in the writable params buffers.
-    fn update_replay_params(&self, position: usize) {
-        let rope_buf = self.rope_params_buf.as_ref().unwrap();
-        let attn_buf = self.attn_params_buf.as_ref().unwrap();
-        // word[3] in both buffers = offset 12 bytes
-        self.device
-            .queue
-            .write_buffer(rope_buf, 12, bytemuck::cast_slice(&[position as u32]));
-        let seq_len = (position + 1) as u32;
-        self.device
-            .queue
-            .write_buffer(attn_buf, 12, bytemuck::cast_slice(&[seq_len]));
-    }
-
     pub async fn forward_one(
         &mut self,
         token_id: u32,
         position: usize,
     ) -> Result<u32, crate::WgpuError> {
-        // --- Replay path: reuse captured graph from a previous decode step ---
-        //
-        // The captured graph contains all compute dispatches from embedding
-        // through the final rms_norm. The bind groups reference the same GPU
-        // buffers (weight tensors, KV caches, intermediate buffers kept alive
-        // by the capture). We update the step-varying inputs via write_buffer,
-        // replay the compute, then run the final matvec_argmax separately
-        // (it involves a CPU readback which isn't capturable).
-        if let Some(ref graph) = self.decode_graph {
-            self.device.queue.write_buffer(
-                &self.input_id_buf.buffer,
-                0,
-                bytemuck::cast_slice(&[token_id]),
-            );
-            self.device.queue.write_buffer(
-                &self.position_buf.buffer,
-                0,
-                bytemuck::cast_slice(&[position as u32]),
-            );
-            self.update_replay_params(position);
-
-            for cache in &mut self.kv_caches {
-                cache.len = position + 1;
-            }
-
-            // Replay all captured compute dispatches (embedding → final rms_norm)
-            graph.replay(&self.device.device, &self.device.queue);
-
-            // The replay wrote new values into the same normed-hidden buffer.
-            // Run the final matvec_argmax outside the capture (it does readback).
-            let hidden = self.replay_normed_hidden.as_ref().unwrap();
-            let weights = self.weights.as_ref().unwrap();
-            let hidden_size = self.config.hidden_size;
-            let max_idx = ops::matvec_argmax_transposed(
-                hidden,
-                &weights.lm_head_t,
-                hidden_size as u32,
-                self.config.vocab_size as u32,
-            )
-            .await?;
-
-            return Ok(max_idx);
-        }
-
-        // --- Capture path: first decode step ---
-        // Initialize writable params buffers for the step-varying ops.
-        if self.rope_params_buf.is_none() {
-            self.init_replay_params(position);
-        } else {
-            self.update_replay_params(position);
-        }
-
         let weights = self
             .weights
             .as_ref()
@@ -1149,9 +944,6 @@ impl WgpuWorker {
         let eps = self.config.rms_norm_eps as f32;
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
-
-        // Enable capture mode — all dispatches go into the capture buffer
-        self.device.batcher.lock().unwrap().begin_capture();
 
         // 1. Embedding lookup (reuse pre-allocated buffers)
         self.device.queue.write_buffer(
@@ -1168,21 +960,20 @@ impl WgpuWorker {
         hidden = hidden.reshape(&[1, hidden_size])?;
 
         // 2. Transformer layers
+        // Pre-compute first layer's QKV (subsequent layers fuse add_rms_norm + qkv_matvec)
         let normed = ops::rms_norm(&hidden, &weights.layers[0].input_layernorm, eps)?;
         let mut qkv = weights.layers[0].qkv_proj.forward(&normed)?;
 
-        let rope_params = self.rope_params_buf.as_ref().unwrap();
-        let attn_params = self.attn_params_buf.as_ref().unwrap();
-
         for layer_idx in 0..self.config.num_hidden_layers {
             let layer = &weights.layers[layer_idx];
+            // qkv shape: [1, q_size + 2*kv_size]
 
+            // Fused QKV slice + RoPE + KV cache write (1 dispatch replaces 7 ops)
             let cos = self.cos_cache.as_ref().unwrap();
             let sin = self.sin_cache.as_ref().unwrap();
             let cache = &mut self.kv_caches[layer_idx];
 
-            // Use replayable variants with writable params buffers
-            let q_rope_flat = ops::rope_slice_cache_with_params(
+            let q_rope_flat = ops::rope_slice_cache(
                 &qkv,
                 cos,
                 sin,
@@ -1190,19 +981,26 @@ impl WgpuWorker {
                 &cache.v,
                 q_size,
                 kv_size,
-                rope_params,
+                head_dim,
+                num_q_heads,
+                num_kv_heads,
+                position,
+                self.config.max_position_embeddings.min(Self::MAX_KV_SEQ),
             )?;
             cache.len = position + 1;
-            let attn_output = ops::attention_with_params(
+            let attn_output = ops::attention(
                 &q_rope_flat,
                 &cache.k,
                 &cache.v,
                 num_q_heads as u32,
-                attn_params,
+                num_kv_heads as u32,
+                head_dim as u32,
+                cache.len as u32,
             )?;
 
             let o_out = layer.o_proj.forward(&attn_output)?;
 
+            // Fused: add_rms_norm + gate_up matvec (2 dispatches → 1)
             let (mut gate_up, hidden_new) = ops::fused_add_rms_norm_matvec(
                 &hidden,
                 &o_out,
@@ -1219,6 +1017,7 @@ impl WgpuWorker {
             let activated = ops::silu_mul_split(&gate_up, intermediate_size)?;
             let mlp_out = layer.down_proj.forward(&activated)?;
 
+            // Fuse post-MLP residual add with next layer's input norm + qkv matvec
             if layer_idx + 1 < self.config.num_hidden_layers {
                 let next_layer = &weights.layers[layer_idx + 1];
                 let total_qkv_out = (q_size + 2 * kv_size) as u32;
@@ -1231,6 +1030,7 @@ impl WgpuWorker {
                     eps,
                 )?;
                 hidden = hidden_new;
+                // Apply qkv bias if present
                 if let Some(b) = &next_layer.qkv_proj.bias {
                     qkv = ops::add(&next_qkv, &b.reshape(&next_qkv.shape)?)?;
                 } else {
@@ -1239,23 +1039,14 @@ impl WgpuWorker {
             } else {
                 hidden = ops::add(&hidden, &mlp_out)?;
             }
+            // Flush every 8 layers to balance GPU pipelining vs batch overhead
+            if (layer_idx + 1) % 8 == 0 || layer_idx + 1 == self.config.num_hidden_layers {
+                self.device.flush();
+            }
         }
 
-        // 3. Final norm
+        // 3. Final norm + fused lm_head + argmax
         hidden = ops::rms_norm(&hidden, &weights.norm, eps)?;
-
-        // End capture and save the graph + normed hidden state for replay
-        let graph = self.device.batcher.lock().unwrap().end_capture();
-        if let Some(graph) = graph {
-            tracing::debug!("Captured decode graph with {} ops", graph.len());
-            // Execute the captured ops for this first step
-            graph.replay(&self.device.device, &self.device.queue);
-            // Store for future replay
-            self.replay_normed_hidden = Some(hidden.clone());
-            self.decode_graph = Some(graph);
-        }
-
-        // 4. Fused lm_head + argmax (outside capture — involves CPU readback)
         let max_idx = ops::matvec_argmax_transposed(
             &hidden,
             &weights.lm_head_t,

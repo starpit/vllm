@@ -70,6 +70,9 @@ impl TestModels {
     // Too large for L40S (48GB); enable when A100-80GB or H100 is available.
     // pub const QWEN_MOE_A2_7B_CUDA: &str = "Qwen/Qwen1.5-MoE-A2.7B-Chat";
 
+    // Qwen3 — safetensors BF16 for cuda-backend (~1.2GB)
+    pub const QWEN3_0_6B_CUDA: &str = "Qwen/Qwen3-0.6B";
+
     // DeepSeek V2 — safetensors BF16 for TP testing (2x L40S)
     pub const DEEPSEEK_V2_LITE_CUDA: &str = "deepseek-ai/DeepSeek-V2-Lite";
 

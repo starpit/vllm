@@ -27,8 +27,12 @@ fn create_llm(args: &BenchStartupArgs) -> Result<LLM> {
         .max_num_seqs(args.max_num_seqs)
         .block_size(args.block_size)
         .tensor_parallel_size(args.tensor_parallel_size)
-        .enable_prefix_caching(args.enable_prefix_caching);
+        .enable_prefix_caching(args.enable_prefix_caching)
+        .enforce_eager(args.enforce_eager);
 
+    if let Some(n) = args.max_num_batched_tokens {
+        builder = builder.max_num_batched_tokens(n);
+    }
     if let Some(len) = args.max_model_len {
         builder = builder.max_model_len(len);
     }

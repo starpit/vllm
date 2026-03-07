@@ -9,7 +9,6 @@ description = "Benchmarking tools for vLLM Rust inference engine"
 default = []
 cuda = ["vllm-serve/cuda"]
 metal = ["vllm-serve/metal"]
-profiling = ["vllm-serve/profiling"]
 
 [dependencies]
 vllm-common = { workspace = true }

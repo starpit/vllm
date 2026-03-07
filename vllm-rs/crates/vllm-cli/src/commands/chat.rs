@@ -131,14 +131,18 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         ..Default::default()
     });
 
-    // Single-prompt mode (--prompt or --quick): send one message and exit.
-    let single_msg = args.prompt.as_ref().or(args.quick.as_ref());
-    if let Some(message) = single_msg {
-        conversation.push(ChatMessage::user(message));
-
-        // In --bench mode, do an untimed warmup first so that TTFT doesn't
-        // include one-off costs like shader compilation or JIT.
+    // Non-interactive mode: --prompt (multi-turn) or --quick (single turn).
+    let prompts: Vec<String> = if !args.prompt.is_empty() {
+        args.prompt.clone()
+    } else if let Some(ref q) = args.quick {
+        vec![q.clone()]
+    } else {
+        vec![]
+    };
+    if !prompts.is_empty() {
+        // In --bench mode, do an untimed warmup first.
         if args.bench {
+            conversation.push(ChatMessage::user(&prompts[0]));
             eprint!("(warmup) ");
             let warmup_params = vllm_serve::llm::SamplingParams {
                 max_tokens: Some(1),
@@ -146,21 +150,31 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
             };
             let _ = llm.chat_stream(&conversation, Some(warmup_params), |_| {});
             eprintln!("done");
+            conversation.pop();
         }
 
-        let mut stats = args.bench.then(|| BenchStats::new(startup_ms));
+        for (i, message) in prompts.iter().enumerate() {
+            conversation.push(ChatMessage::user(message));
 
-        let output = llm.chat_stream(&conversation, params.clone(), |token| {
-            print!("{token}");
-            io::stdout().flush().ok();
-            if let Some(ref mut s) = stats {
-                s.record_token();
+            let mut stats = args.bench.then(|| BenchStats::new(startup_ms));
+
+            if prompts.len() > 1 {
+                eprintln!("[turn {}] {}", i + 1, message);
             }
-        })?;
-        println!();
+            let output = llm.chat_stream(&conversation, params.clone(), |token| {
+                print!("{token}");
+                io::stdout().flush().ok();
+                if let Some(ref mut s) = stats {
+                    s.record_token();
+                }
+            })?;
+            println!();
 
-        if let Some(s) = stats {
-            s.print(output.outputs[0].token_ids.len());
+            if let Some(s) = stats {
+                s.print(output.outputs[0].token_ids.len());
+            }
+
+            conversation.push(ChatMessage::assistant(&output.outputs[0].text));
         }
         return Ok(());
     }

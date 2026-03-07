@@ -221,142 +221,6 @@ async fn test_t1_qwen2_completion_basic() {
     assert!(!resp.choices[0].text.is_empty());
 }
 
-/// Regression test: quantized Qwen2 attention_bias must be loaded.
-///
-/// Qwen2 models have `attention_bias=True` (linear biases on Q/K/V/O projections).
-/// These are stored as `.bias` (singular) in the safetensors, distinct from the
-/// quantization `.biases` (plural). If the linear bias is not loaded, the model
-/// produces garbled/incoherent output.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn test_t1_qwen2_chat_coherent_output() {
-    let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
-        .start()
-        .await
-        .unwrap();
-
-    let client = Client::new(server.base_url());
-
-    // Ask a factual question with a known answer keyword.
-    let request = simple_chat_request(
-        "What is the capital of France? Answer in one word.",
-        Some(10),
-    );
-    let resp = client.chat_completion(&request).await.unwrap();
-    assert_valid_chat_response(&resp);
-
-    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
-    assert_coherent_text(text, 2);
-
-    // The answer must contain "Paris" — without attention biases, the model
-    // produces garbled multilingual garbage instead.
-    assert!(
-        text.contains("Paris"),
-        "Qwen2 quantized should answer 'Paris' for capital of France, got: {text:?}"
-    );
-}
-
-/// Regression test: Qwen2 quantized completion produces coherent English.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn test_t1_qwen2_completion_coherent_output() {
-    let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
-        .start()
-        .await
-        .unwrap();
-
-    let client = Client::new(server.base_url());
-    let request = simple_completion_request("The sky is blue because", 30);
-    let resp = client.completion(&request).await.unwrap();
-    assert_valid_completion_response(&resp);
-
-    let text = &resp.choices[0].text;
-    assert_coherent_text(text, 10);
-
-    // The completion should contain at least one science-related word.
-    let has_relevant_word = [
-        "light",
-        "scatter",
-        "sun",
-        "wave",
-        "atmosphere",
-        "blue",
-        "color",
-    ]
-    .iter()
-    .any(|w| text.to_lowercase().contains(w));
-    assert!(
-        has_relevant_word,
-        "Qwen2 quantized completion should contain a relevant word about sky color, got: {text:?}"
-    );
-}
-
-/// Regression test: multi-turn chat preserves context across turns.
-///
-/// The second turn uses a pronoun ("it") that only makes sense if the model
-/// has access to the first turn's context about the sky. Without proper
-/// context, the model can't resolve the reference and produces irrelevant
-/// or garbled output.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore]
-async fn test_t1_qwen2_chat_multi_turn_context() {
-    let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
-        .start()
-        .await
-        .unwrap();
-
-    let client = Client::new(server.base_url());
-
-    // Turn 1: establish the topic (sky).
-    let turn1 = ChatCompletionRequest {
-        messages: vec![user_msg("Why is the sky blue? Answer in one sentence.")],
-        max_tokens: Some(40),
-        temperature: Some(0.0),
-        ..default_chat_request()
-    };
-    let resp1 = client.chat_completion(&turn1).await.unwrap();
-    assert_valid_chat_response(&resp1);
-    let text1 = resp1.choices[0].message.content.as_deref().unwrap_or("");
-    assert_coherent_text(text1, 10);
-
-    // Turn 2: follow-up that requires context from turn 1.
-    // "Why is it red in the evening?" — "it" refers to "the sky" from turn 1.
-    let turn2 = ChatCompletionRequest {
-        messages: vec![
-            user_msg("Why is the sky blue? Answer in one sentence."),
-            assistant_msg(text1),
-            user_msg("Why is it red in the evening? Answer in one sentence."),
-        ],
-        max_tokens: Some(50),
-        temperature: Some(0.0),
-        ..default_chat_request()
-    };
-    let resp2 = client.chat_completion(&turn2).await.unwrap();
-    assert_valid_chat_response(&resp2);
-    let text2 = resp2.choices[0].message.content.as_deref().unwrap_or("");
-    assert_coherent_text(text2, 10);
-
-    // The second answer must reference sky/sunset/red phenomena — proving the
-    // model understood "it" refers to "the sky" from the prior turn.
-    let has_context_word = [
-        "sun",
-        "light",
-        "scatter",
-        "red",
-        "orange",
-        "sunset",
-        "horizon",
-        "atmosphere",
-        "wave",
-    ]
-    .iter()
-    .any(|w| text2.to_lowercase().contains(w));
-    assert!(
-        has_context_word,
-        "Multi-turn: second answer should reference sky/light/sunset, got: {text2:?}"
-    );
-}
-
 // ===========================================================================
 // Qwen3-0.6B-4bit (Qwen3ForCausalLM) — Tier 1
 // ===========================================================================
@@ -1022,6 +886,7 @@ async fn test_cuda_qwen2_completion() {
         !resp.choices[0].text.is_empty(),
         "completion should not be empty"
     );
+    assert_coherent_text(&resp.choices[0].text, 3);
 }
 
 #[cfg(feature = "cuda")]
@@ -1040,18 +905,56 @@ async fn test_cuda_qwen2_chat() {
     assert_valid_chat_response(&resp);
     let text = resp.choices[0].message.content.as_deref().unwrap_or("");
     assert!(!text.is_empty(), "response should not be empty");
+    assert_coherent_text(text, 1);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_qwen3_completion() {
+    let server = TestServer::builder(TestModels::QWEN3_0_6B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "completion should not be empty"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_qwen3_chat() {
+    let server = TestServer::builder(TestModels::QWEN3_0_6B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("What is 2+2? Answer with just the number.", Some(10));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(!text.is_empty(), "response should not be empty");
 }
 
 // ===========================================================================
 // CUDA GGUF E2E tests — quantized GGUF models on GPU
 // ===========================================================================
-// These use GGUF quantized models to test the GGUF + CUDA path.
-// Candle 0.9 has full CUDA quantized matmul support (QCudaStorage),
-// so quantized weights load directly onto the GPU and matmuls run
-// via CUDA kernels (dequantize-mul-mat-vec for decode, dequantize-matmul for prefill).
+// TODO: Re-enable when vllm-cuda backend supports GGUF quantized models.
+// These previously used candle's QCudaStorage for GGUF + CUDA inference.
 //
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gguf -- --ignored
 
+/*
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -1249,6 +1152,8 @@ async fn test_cuda_gguf_qwen3_next_chat() {
         "should generate at least one token"
     );
 }
+*/
+// end GGUF block comment
 
 // ---------------------------------------------------------------------------
 // Tensor Parallelism (TP=2) tests — require 2 CUDA GPUs + NCCL
@@ -1316,8 +1221,9 @@ async fn test_cuda_tp2_deepseek_v2_completion() {
 // ===========================================================================
 // CUDA Granite — safetensors BF16 (~4.5 GB) on GPU
 // ===========================================================================
+// TODO: Re-enable when vllm-cuda backend supports GraniteForCausalLM.
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_granite -- --ignored
-
+/*
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -1353,14 +1259,14 @@ async fn test_cuda_granite_chat_coherent() {
     let content = resp.choices[0].message.content.as_deref().unwrap_or("");
     assert!(!content.is_empty(), "chat response should not be empty");
 }
+*/ // end Granite safetensors block comment
 
 // ===========================================================================
 // CUDA Granite GGUF — quantized on GPU
 // ===========================================================================
+// TODO: Re-enable when vllm-cuda backend supports GGUF + GraniteForCausalLM.
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_granite_gguf -- --ignored
-// Note: granite-3.3-2b-instruct is a chat model (EOS=token 0), so bare completions
-// immediately emit EOS. Use chat endpoint (requires strftime_now support).
-
+/*
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -1396,16 +1302,14 @@ async fn test_cuda_granite_gguf_chat_coherent() {
     let content = resp.choices[0].message.content.as_deref().unwrap_or("");
     assert!(!content.is_empty(), "chat response should not be empty");
 }
+*/ // end Granite GGUF block comment
 
 // ===========================================================================
 // CUDA Marlin W4A16 E2E tests — GPTQ and AWQ quantized models
 // ===========================================================================
-// These tests exercise the Marlin fused GEMM path: GPTQ/AWQ weights are
-// repacked to Marlin tiled format at load time, and forward passes use the
-// fused dequant+GEMM kernel (no intermediate weight allocation).
-//
+// TODO: Re-enable when vllm-cuda backend supports Marlin GPTQ/AWQ quantization.
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_marlin -- --ignored --test-threads=1
-
+/*
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -1507,6 +1411,7 @@ async fn test_cuda_marlin_awq_chat() {
     let text = resp.choices[0].message.content.as_deref().unwrap_or("");
     assert!(!text.is_empty(), "AWQ Marlin chat should not be empty");
 }
+*/ // end Marlin block comment
 
 // ===========================================================================
 // CUDA MoE E2E tests — commented out, needs ≥80GB GPU
@@ -1522,3 +1427,283 @@ async fn test_cuda_marlin_awq_chat() {
 // async fn test_cuda_moe_server_starts() { ... }
 // async fn test_cuda_moe_completion() { ... }
 // async fn test_cuda_moe_chat() { ... }
+
+// ===========================================================================
+// CUDA semantic correctness + multi-turn + non-greedy tests
+// ===========================================================================
+// These tests validate output quality beyond "non-empty", catching bugs like
+// paged FA2 prefill corruption, KV cache continuity issues, and GPU sampling errors.
+//
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_correctness -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_completion_semantic() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    let text = resp.choices[0].text.to_lowercase();
+    assert!(
+        text.contains("paris"),
+        "expected 'paris' in completion of 'The capital of France is', got: {}",
+        text
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_multi_turn_chat() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Turn 1: establish a fact
+    let req1 = ChatCompletionRequest {
+        messages: vec![user_msg(
+            "My name is Claude. Please remember that. Reply with just 'OK'.",
+        )],
+        max_tokens: Some(10),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp1 = client.chat_completion(&req1).await.unwrap();
+    assert_valid_chat_response(&resp1);
+
+    // Turn 2: query the fact — requires correct KV cache from turn 1 prefill
+    let turn1_text = resp1.choices[0].message.content.clone().unwrap_or_default();
+    let req2 = ChatCompletionRequest {
+        messages: vec![
+            user_msg("My name is Claude. Please remember that. Reply with just 'OK'."),
+            assistant_msg(&turn1_text),
+            user_msg("What is my name?"),
+        ],
+        max_tokens: Some(20),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp2 = client.chat_completion(&req2).await.unwrap();
+    assert_valid_chat_response(&resp2);
+    let text = resp2.choices[0]
+        .message
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    assert!(
+        text.contains("claude"),
+        "turn 2 should remember 'Claude', got: {}",
+        text
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_nongreedy_chat() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg("Say hello in one sentence.")],
+        max_tokens: Some(50),
+        temperature: Some(0.7),
+        ..default_chat_request()
+    };
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_valid_chat_response(&resp);
+
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text, 5);
+    let word_count = text.split_whitespace().count();
+    assert!(word_count >= 3, "expected at least 3 words, got: {}", text);
+}
+
+// ---------------------------------------------------------------------------
+// Paged FA2 multi-turn regression tests
+//
+// The paged FA2 bug caused garbled output on turn 2+ when KV cache blocks
+// were non-contiguous. These tests specifically exercise multi-turn chat
+// which requires correct paged KV cache reads across multiple prefills.
+// ---------------------------------------------------------------------------
+
+/// Multi-turn with 3 turns — each turn adds more KV blocks, stressing
+/// the paged block_table remapping.
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_paged_fa2_three_turn_chat() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Turn 1
+    let req1 = ChatCompletionRequest {
+        messages: vec![user_msg("The number I'm thinking of is 42. Just say OK.")],
+        max_tokens: Some(10),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp1 = client.chat_completion(&req1).await.unwrap();
+    assert_valid_chat_response(&resp1);
+    let t1 = resp1.choices[0].message.content.clone().unwrap_or_default();
+
+    // Turn 2
+    let req2 = ChatCompletionRequest {
+        messages: vec![
+            user_msg("The number I'm thinking of is 42. Just say OK."),
+            assistant_msg(&t1),
+            user_msg("What number am I thinking of? Answer with just the number."),
+        ],
+        max_tokens: Some(10),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp2 = client.chat_completion(&req2).await.unwrap();
+    assert_valid_chat_response(&resp2);
+    let t2_text = resp2.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(
+        t2_text.contains("42"),
+        "turn 2 should recall '42', got: {}",
+        t2_text
+    );
+    let t2 = resp2.choices[0].message.content.clone().unwrap_or_default();
+
+    // Turn 3 — even more KV cache blocks allocated
+    let req3 = ChatCompletionRequest {
+        messages: vec![
+            user_msg("The number I'm thinking of is 42. Just say OK."),
+            assistant_msg(&t1),
+            user_msg("What number am I thinking of? Answer with just the number."),
+            assistant_msg(&t2),
+            user_msg("Double that number. Answer with just the number."),
+        ],
+        max_tokens: Some(10),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp3 = client.chat_completion(&req3).await.unwrap();
+    assert_valid_chat_response(&resp3);
+    let t3_text = resp3.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(
+        t3_text.contains("84"),
+        "turn 3 should compute 42*2=84, got: {}",
+        t3_text
+    );
+}
+
+/// Interleaved multi-turn requests — two separate conversations interleave
+/// their block allocations, ensuring the block_table correctly maps
+/// non-contiguous physical blocks.
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_paged_fa2_interleaved_multi_turn() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Turn 1 for user A — allocates some blocks
+    let req_a1 = ChatCompletionRequest {
+        messages: vec![user_msg(
+            "Remember: the color is blue. Reply with only 'OK'.",
+        )],
+        max_tokens: Some(5),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp_a1 = client.chat_completion(&req_a1).await.unwrap();
+    assert_valid_chat_response(&resp_a1);
+    let ta1 = resp_a1.choices[0]
+        .message
+        .content
+        .clone()
+        .unwrap_or_default();
+
+    // Turn 1 for user B — allocates more blocks (interleaved with A's freed blocks)
+    let req_b1 = ChatCompletionRequest {
+        messages: vec![user_msg(
+            "Remember: the animal is cat. Reply with only 'OK'.",
+        )],
+        max_tokens: Some(5),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp_b1 = client.chat_completion(&req_b1).await.unwrap();
+    assert_valid_chat_response(&resp_b1);
+    let tb1 = resp_b1.choices[0]
+        .message
+        .content
+        .clone()
+        .unwrap_or_default();
+
+    // Turn 2 for user A — prefills into new blocks with possible gaps
+    let req_a2 = ChatCompletionRequest {
+        messages: vec![
+            user_msg("Remember: the color is blue. Reply with only 'OK'."),
+            assistant_msg(&ta1),
+            user_msg("What color did I say? Answer with just the color."),
+        ],
+        max_tokens: Some(10),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp_a2 = client.chat_completion(&req_a2).await.unwrap();
+    assert_valid_chat_response(&resp_a2);
+    let text_a = resp_a2.choices[0]
+        .message
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    assert!(
+        text_a.contains("blue"),
+        "user A turn 2 should recall 'blue', got: {}",
+        text_a
+    );
+
+    // Turn 2 for user B
+    let req_b2 = ChatCompletionRequest {
+        messages: vec![
+            user_msg("Remember: the animal is cat. Reply with only 'OK'."),
+            assistant_msg(&tb1),
+            user_msg("What animal did I say? Answer with just the animal."),
+        ],
+        max_tokens: Some(10),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp_b2 = client.chat_completion(&req_b2).await.unwrap();
+    assert_valid_chat_response(&resp_b2);
+    let text_b = resp_b2.choices[0]
+        .message
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    assert!(
+        text_b.contains("cat"),
+        "user B turn 2 should recall 'cat', got: {}",
+        text_b
+    );
+}

@@ -8,12 +8,11 @@ description = "CLI binary for vLLM Rust inference engine"
 [features]
 default = ["bench", "guided-decoding", "chat-template", "metrics", "multimodal", "tls"]
 bench = ["vllm-bench"]
-cuda = ["vllm-serve/cuda", "vllm-executor/cuda", "vllm-kernels/cuda", "vllm-models/cuda", "vllm-bench?/cuda"]
-nccl = ["cuda", "vllm-serve/nccl", "vllm-kernels/nccl"]
-profiling = ["cuda", "vllm-serve/profiling", "vllm-executor/profiling", "vllm-models/profiling", "vllm-kernels/profiling", "vllm-bench?/profiling"]
+cuda = ["vllm-serve/cuda", "vllm-executor/cuda", "vllm-bench?/cuda"]
+nccl = ["cuda", "vllm-cuda/nccl"]
+profiling = ["cuda"]
 metal = ["vllm-serve/metal", "vllm-mlx", "vllm-bench?/metal"]
 wgpu = ["vllm-serve/wgpu"]
-candle-metal = ["vllm-executor/metal", "vllm-kernels/metal", "vllm-models/metal"]
 guided-decoding = ["vllm-serve/guided-decoding"]
 multimodal = ["vllm-serve/multimodal"]
 chat-template = ["vllm-serve/chat-template"]
@@ -32,7 +31,7 @@ vllm-config = { workspace = true }
 vllm-serve = { workspace = true }
 vllm-executor = { workspace = true }
 vllm-models = { workspace = true }
-vllm-kernels = { workspace = true }
+vllm-cuda = { workspace = true }
 vllm-mlx = { workspace = true, optional = true }
 vllm-bench = { workspace = true, optional = true }
 clap = { workspace = true }

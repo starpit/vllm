@@ -130,6 +130,8 @@ impl WgpuTensor {
     }
 
     /// Create an uninitialized (zero) tensor, reusing a pooled buffer if available.
+    /// The underlying buffer may be larger than the logical tensor size due to
+    /// bucket-aligned allocation, but the tensor metadata tracks the logical shape.
     pub fn zeros(device: &WgpuDevice, shape: &[usize], dtype: WgpuDType) -> Self {
         let numel: usize = shape.iter().product();
         let size = (numel * dtype.size_bytes()) as u64;
@@ -140,9 +142,12 @@ impl WgpuTensor {
                 buf
             } else {
                 drop(pool);
+                // Allocate at bucket-aligned size so the buffer can be reused
+                // by future requests in the same bucket.
+                let alloc_size = crate::device::BufferPool::alloc_size(size);
                 Arc::new(device.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("tensor_pooled"),
-                    size,
+                    size: alloc_size,
                     usage: wgpu::BufferUsages::STORAGE
                         | wgpu::BufferUsages::COPY_SRC
                         | wgpu::BufferUsages::COPY_DST,

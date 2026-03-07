@@ -14,7 +14,7 @@ pub mod tensor;
 #[cfg(feature = "worker")]
 pub mod worker_impl;
 
-pub use device::WgpuDevice;
+pub use device::{GraphCapture, ValidationMode, WgpuDevice};
 pub use tensor::{WgpuDType, WgpuTensor};
 
 /// Errors from the WebGPU backend.
@@ -320,27 +320,25 @@ mod tests {
     fn test_buffer_pool_reuse() {
         let dev = blocking_device();
         // Create a tensor, drop it, then create another of the same size.
-        // The second should reuse the pooled buffer.
+        // The second should reuse the pooled buffer from the same bucket.
         let ptr1 = {
-            let t = WgpuTensor::zeros(&dev, &[1, 64], WgpuDType::F32);
-            // wgpu::Buffer doesn't expose a pointer, but we can check pool state.
+            let t = WgpuTensor::zeros(&dev, &[1, 64], WgpuDType::F32); // 256 bytes → bucket 256
             let _size = t.size_bytes();
-            // Drop t — should return buffer to pool.
             drop(t);
             let pool = dev.buffer_pool.lock().unwrap();
             assert_eq!(
-                pool.pools.get(&256).map(|v| v.len()),
+                pool.buckets.get(&256).map(|v| v.len()),
                 Some(1),
-                "buffer should be in pool after drop"
+                "buffer should be in bucket 256 after drop"
             );
             drop(pool);
-            // Create another tensor of same size — should reuse.
+            // Create another tensor of same size — should reuse from bucket.
             let t2 = WgpuTensor::zeros(&dev, &[1, 64], WgpuDType::F32);
             let pool = dev.buffer_pool.lock().unwrap();
             assert_eq!(
-                pool.pools.get(&256).map(|v| v.len()),
+                pool.buckets.get(&256).map(|v| v.len()),
                 Some(0),
-                "buffer should have been taken from pool"
+                "buffer should have been taken from bucket"
             );
             drop(pool);
             t2
@@ -355,29 +353,53 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_pool_no_reuse_different_size() {
+    fn test_buffer_pool_no_reuse_different_bucket() {
         let dev = blocking_device();
         {
-            let t = WgpuTensor::zeros(&dev, &[1, 64], WgpuDType::F32); // 256 bytes
+            let t = WgpuTensor::zeros(&dev, &[1, 64], WgpuDType::F32); // 256 bytes → bucket 256
             drop(t);
         }
-        // Request different size — should NOT reuse
-        let _t2 = WgpuTensor::zeros(&dev, &[1, 128], WgpuDType::F32); // 512 bytes
+        // Request a larger size in a different bucket — should NOT reuse
+        let _t2 = WgpuTensor::zeros(&dev, &[1, 128], WgpuDType::F32); // 512 bytes → bucket 512
         let pool = dev.buffer_pool.lock().unwrap();
-        // Original 256-byte buffer should still be in pool
-        assert_eq!(pool.pools.get(&256).map(|v| v.len()), Some(1));
+        // Original 256-byte buffer should still be in its bucket
+        assert_eq!(pool.buckets.get(&256).map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn test_buffer_pool_cross_size_reuse() {
+        // Bucket pool reuses buffers across different exact sizes within the same bucket.
+        // A 200-byte request and a 250-byte request both map to bucket 256.
+        let dev = blocking_device();
+        {
+            // 50 f32 = 200 bytes → bucket 256 (allocated at 256 bytes)
+            let t = WgpuTensor::zeros(&dev, &[1, 50], WgpuDType::F32);
+            drop(t);
+        }
+        let pool = dev.buffer_pool.lock().unwrap();
+        assert_eq!(pool.buckets.get(&256).map(|v| v.len()), Some(1));
+        drop(pool);
+        // 60 f32 = 240 bytes → also bucket 256 → should reuse!
+        let _t2 = WgpuTensor::zeros(&dev, &[1, 60], WgpuDType::F32);
+        let pool = dev.buffer_pool.lock().unwrap();
+        assert_eq!(
+            pool.buckets.get(&256).map(|v| v.len()),
+            Some(0),
+            "cross-size reuse within same bucket"
+        );
     }
 
     #[test]
     fn test_buffer_pool_shared_not_recycled() {
         let dev = blocking_device();
         // reshape() clones the Arc, so drop of one shouldn't recycle
+        // 2*4 f32 = 32 bytes → bucket 64 (rounds up)
         let t = WgpuTensor::zeros(&dev, &[2, 4], WgpuDType::F32);
         let t2 = t.reshape(&[1, 8]).unwrap(); // shares the buffer Arc
         drop(t);
         // Buffer has 2 strong refs (t2 + pool candidate), so should NOT be pooled
         let pool = dev.buffer_pool.lock().unwrap();
-        let count = pool.pools.get(&32).map(|v| v.len()).unwrap_or(0);
+        let count = pool.buckets.get(&64).map(|v| v.len()).unwrap_or(0);
         assert_eq!(count, 0, "shared buffer should not be recycled");
         drop(pool);
         // t2 should still work

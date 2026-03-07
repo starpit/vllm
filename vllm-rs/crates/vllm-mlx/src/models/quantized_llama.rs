@@ -92,6 +92,10 @@ pub(crate) fn make_quantized_linear(
             Array::from_f32(0.0)
         });
 
+    // Load optional linear bias (e.g., Qwen2 attention_bias).
+    // Note: `.bias` (singular) is the linear bias, `.biases` (plural) is quantization biases.
+    let linear_bias = weights.get(&format!("{prefix}.bias")).cloned();
+
     nn::QuantizedLinear {
         group_size,
         bits,
@@ -99,7 +103,7 @@ pub(crate) fn make_quantized_linear(
         biases: Param::new(biases),
         inner: nn::Linear {
             weight: Param::new(weight),
-            bias: Param::new(None),
+            bias: Param::new(linear_bias),
         },
     }
 }
@@ -1170,5 +1174,106 @@ mod tests {
         .unwrap();
         logits2.eval().unwrap();
         assert_eq!(logits2.shape(), &[1, config.vocab_size as i32]);
+    }
+
+    #[test]
+    fn test_make_quantized_linear_loads_bias() {
+        // Simulate weight dict with a linear bias (like Qwen2 attention_bias).
+        let mut weights = HashMap::new();
+
+        // Create minimal quantized weight tensors.
+        // For group_size=32, bits=4: weight shape is [out, in/8], scales/biases [out, in/32].
+        let out_features = 8i32;
+        let in_features = 32i32;
+        let packed_cols = in_features / 8; // 4
+        let num_groups = in_features / 32; // 1
+
+        weights.insert(
+            "layer.weight".to_string(),
+            Array::zeros::<u32>(&[out_features, packed_cols]).unwrap(),
+        );
+        weights.insert(
+            "layer.scales".to_string(),
+            Array::ones::<f32>(&[out_features, num_groups]).unwrap(),
+        );
+        weights.insert(
+            "layer.biases".to_string(),
+            Array::zeros::<f32>(&[out_features, num_groups]).unwrap(),
+        );
+
+        // Without linear bias — inner.bias should be None.
+        let ql_no_bias = make_quantized_linear(&weights, "layer", 32, 4);
+        assert!(
+            ql_no_bias.inner.bias.value.is_none(),
+            "without .bias in weights, inner.bias should be None"
+        );
+
+        // Add a linear bias tensor (e.g., Qwen2 attention_bias).
+        let bias_val = Array::ones::<f32>(&[out_features]).unwrap();
+        weights.insert("layer.bias".to_string(), bias_val);
+
+        let ql_with_bias = make_quantized_linear(&weights, "layer", 32, 4);
+        assert!(
+            ql_with_bias.inner.bias.value.is_some(),
+            "with .bias in weights, inner.bias should be loaded"
+        );
+        let bias = ql_with_bias.inner.bias.value.as_ref().unwrap();
+        assert_eq!(bias.shape(), &[out_features]);
+    }
+
+    #[test]
+    fn test_make_quantized_linear_bias_affects_output() {
+        // Verify that the loaded linear bias actually changes the forward output.
+        let mut weights = HashMap::new();
+        let out_features = 32i32;
+        let in_features = 32i32;
+
+        // Build via QuantizedLinearBuilder to get valid quantized weights.
+        let ql_ref = nn::QuantizedLinearBuilder::new(in_features, out_features)
+            .group_size(32)
+            .bits(4)
+            .bias(false)
+            .build()
+            .unwrap();
+
+        // Extract weights into a HashMap.
+        weights.insert(
+            "layer.weight".to_string(),
+            ql_ref.inner.weight.value.clone(),
+        );
+        weights.insert("layer.scales".to_string(), ql_ref.scales.value.clone());
+        weights.insert("layer.biases".to_string(), ql_ref.biases.value.clone());
+
+        // Forward without linear bias.
+        let mut ql_no_bias = make_quantized_linear(&weights, "layer", 32, 4);
+        let x = Array::ones::<f32>(&[1, in_features]).unwrap();
+        let out_no_bias = ql_no_bias.forward(&x).unwrap();
+        out_no_bias.eval().unwrap();
+
+        // Add a large linear bias to make the difference obvious.
+        let bias_val = Array::from_iter(
+            (0..out_features).map(|i| 100.0f32 + i as f32),
+            &[out_features],
+        );
+        weights.insert("layer.bias".to_string(), bias_val);
+
+        let mut ql_with_bias = make_quantized_linear(&weights, "layer", 32, 4);
+        let out_with_bias = ql_with_bias.forward(&x).unwrap();
+        out_with_bias.eval().unwrap();
+
+        // The outputs should differ by approximately the bias values.
+        let diff = out_with_bias
+            .subtract(&out_no_bias)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        diff.eval().unwrap();
+        let diff_vals: &[f32] = diff.as_slice();
+        // First element bias is 100.0, so diff should be ~100.
+        assert!(
+            diff_vals[0].abs() > 90.0,
+            "bias should significantly change output, got diff[0]={:.2}",
+            diff_vals[0]
+        );
     }
 }

@@ -211,6 +211,76 @@ async fn test_t1_qwen2_completion_basic() {
     assert!(!resp.choices[0].text.is_empty());
 }
 
+/// Regression test: quantized Qwen2 attention_bias must be loaded.
+///
+/// Qwen2 models have `attention_bias=True` (linear biases on Q/K/V/O projections).
+/// These are stored as `.bias` (singular) in the safetensors, distinct from the
+/// quantization `.biases` (plural). If the linear bias is not loaded, the model
+/// produces garbled/incoherent output.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_t1_qwen2_chat_coherent_output() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Ask a factual question with a known answer keyword.
+    let request = simple_chat_request(
+        "What is the capital of France? Answer in one word.",
+        Some(10),
+    );
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_valid_chat_response(&resp);
+
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text, 2);
+
+    // The answer must contain "Paris" — without attention biases, the model
+    // produces garbled multilingual garbage instead.
+    assert!(
+        text.contains("Paris"),
+        "Qwen2 quantized should answer 'Paris' for capital of France, got: {text:?}"
+    );
+}
+
+/// Regression test: Qwen2 quantized completion produces coherent English.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_t1_qwen2_completion_coherent_output() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The sky is blue because", 30);
+    let resp = client.completion(&request).await.unwrap();
+    assert_valid_completion_response(&resp);
+
+    let text = &resp.choices[0].text;
+    assert_coherent_text(text, 10);
+
+    // The completion should contain at least one science-related word.
+    let has_relevant_word = [
+        "light",
+        "scatter",
+        "sun",
+        "wave",
+        "atmosphere",
+        "blue",
+        "color",
+    ]
+    .iter()
+    .any(|w| text.to_lowercase().contains(w));
+    assert!(
+        has_relevant_word,
+        "Qwen2 quantized completion should contain a relevant word about sky color, got: {text:?}"
+    );
+}
+
 // ===========================================================================
 // Qwen3-0.6B-4bit (Qwen3ForCausalLM) — Tier 1
 // ===========================================================================

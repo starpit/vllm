@@ -125,8 +125,8 @@ impl Default for VllmConfig {
             disable_async_scheduling: false,
             runner: "generate".to_string(),
             cuda_graph_config: None,
-            enable_prefix_caching: true,
-            enforce_eager: false,
+            enable_prefix_caching: false, // TODO: re-enable once paged FA2 prefill works with cached tokens
+            enforce_eager: true,          // TODO: debug multi-turn — disable CUDA graphs to isolate
             max_num_batched_tokens: None,
             cublas_autotune: false,
         }

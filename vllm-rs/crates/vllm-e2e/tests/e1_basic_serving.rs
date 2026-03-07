@@ -32,6 +32,16 @@ fn user_msg(content: &str) -> ChatCompletionMessageParam {
     }
 }
 
+fn assistant_msg(content: &str) -> ChatCompletionMessageParam {
+    ChatCompletionMessageParam {
+        role: "assistant".to_string(),
+        content: Some(serde_json::Value::String(content.to_string())),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+    }
+}
+
 fn simple_chat_request(content: &str, max_tokens: Option<u32>) -> ChatCompletionRequest {
     ChatCompletionRequest {
         messages: vec![user_msg(content)],
@@ -876,6 +886,7 @@ async fn test_cuda_qwen2_completion() {
         !resp.choices[0].text.is_empty(),
         "completion should not be empty"
     );
+    assert_coherent_text(&resp.choices[0].text, 3);
 }
 
 #[cfg(feature = "cuda")]
@@ -894,6 +905,7 @@ async fn test_cuda_qwen2_chat() {
     assert_valid_chat_response(&resp);
     let text = resp.choices[0].message.content.as_deref().unwrap_or("");
     assert!(!text.is_empty(), "response should not be empty");
+    assert_coherent_text(text, 1);
 }
 
 #[cfg(feature = "cuda")]
@@ -1415,3 +1427,108 @@ async fn test_cuda_marlin_awq_chat() {
 // async fn test_cuda_moe_server_starts() { ... }
 // async fn test_cuda_moe_completion() { ... }
 // async fn test_cuda_moe_chat() { ... }
+
+// ===========================================================================
+// CUDA semantic correctness + multi-turn + non-greedy tests
+// ===========================================================================
+// These tests validate output quality beyond "non-empty", catching bugs like
+// paged FA2 prefill corruption, KV cache continuity issues, and GPU sampling errors.
+//
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_correctness -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_completion_semantic() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    let text = resp.choices[0].text.to_lowercase();
+    assert!(
+        text.contains("paris"),
+        "expected 'paris' in completion of 'The capital of France is', got: {}",
+        text
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_multi_turn_chat() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Turn 1: establish a fact
+    let req1 = ChatCompletionRequest {
+        messages: vec![user_msg(
+            "My name is Claude. Please remember that. Reply with just 'OK'.",
+        )],
+        max_tokens: Some(10),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp1 = client.chat_completion(&req1).await.unwrap();
+    assert_valid_chat_response(&resp1);
+
+    // Turn 2: query the fact — requires correct KV cache from turn 1 prefill
+    let turn1_text = resp1.choices[0].message.content.clone().unwrap_or_default();
+    let req2 = ChatCompletionRequest {
+        messages: vec![
+            user_msg("My name is Claude. Please remember that. Reply with just 'OK'."),
+            assistant_msg(&turn1_text),
+            user_msg("What is my name?"),
+        ],
+        max_tokens: Some(20),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+    let resp2 = client.chat_completion(&req2).await.unwrap();
+    assert_valid_chat_response(&resp2);
+    let text = resp2.choices[0]
+        .message
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    assert!(
+        text.contains("claude"),
+        "turn 2 should remember 'Claude', got: {}",
+        text
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_nongreedy_chat() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg("Say hello in one sentence.")],
+        max_tokens: Some(50),
+        temperature: Some(0.7),
+        ..default_chat_request()
+    };
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_valid_chat_response(&resp);
+
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text, 5);
+    let word_count = text.split_whitespace().count();
+    assert!(word_count >= 3, "expected at least 3 words, got: {}", text);
+}

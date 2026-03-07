@@ -92,6 +92,69 @@ impl KvCachePool {
     pub fn v_cache(&self, layer: usize) -> GpuTensor {
         self.v_caches[layer]
     }
+
+    /// Gather K or V from blocks into a contiguous `[total_tokens, kv_heads, head_dim]` tensor.
+    ///
+    /// `block_table` is a GPU tensor `[batch_size, max_blocks_per_seq]` of u32 block IDs.
+    /// For single-request decode, batch_size=1. `total_tokens` is the total KV length.
+    /// `is_key` selects K (true) or V (false) cache.
+    ///
+    /// This is a CPU-driven D2D copy per block — not fast but correct.
+    /// Used as a fallback when paged FA2 has issues.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gather_kv_contiguous(
+        &self,
+        layer: usize,
+        is_key: bool,
+        block_table: GpuTensor,
+        total_tokens: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        arena: &mut crate::arena::ScratchArena,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> GpuTensor {
+        let cache = if is_key {
+            self.k_caches[layer]
+        } else {
+            self.v_caches[layer]
+        };
+        let out = arena.alloc(&[total_tokens, num_kv_heads, head_dim], cache.dtype());
+
+        // D2H the block table to get block IDs on CPU.
+        let num_blocks_in_table = block_table.dim(1);
+        let mut block_ids = vec![0u32; num_blocks_in_table];
+        driver::memcpy_dtoh_async(
+            block_ids.as_mut_ptr() as *mut u8,
+            block_table.raw_ptr() as *const u8,
+            num_blocks_in_table * 4,
+            stream,
+        )
+        .expect("D2H block_table");
+        driver::stream_synchronize(stream).expect("sync block_table D2H");
+
+        // Copy block by block.
+        let elem_size = cache.dtype().size_bytes();
+        let tokens_per_block = self.block_size;
+        let row_bytes = num_kv_heads * head_dim * elem_size;
+        // Cache layout: [num_blocks, block_size, num_kv_heads, head_dim]
+        let block_stride_bytes = tokens_per_block * row_bytes;
+
+        let mut tokens_remaining = total_tokens;
+        let mut dst_offset: usize = 0;
+        for &bid in &block_ids {
+            if tokens_remaining == 0 {
+                break;
+            }
+            let n = tokens_remaining.min(tokens_per_block);
+            let src = (cache.raw_ptr() as *const u8).add(bid as usize * block_stride_bytes);
+            let dst = (out.raw_ptr() as *mut u8).add(dst_offset);
+            driver::memcpy_dtod_async(dst, src, n * row_bytes, stream).expect("D2D gather block");
+            dst_offset += n * row_bytes;
+            tokens_remaining -= n;
+        }
+
+        out
+    }
 }
 
 impl Drop for KvCachePool {

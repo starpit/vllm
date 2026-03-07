@@ -348,22 +348,72 @@ impl LlamaAttention {
             device.compute_stream,
         );
 
-        // Paged FlashAttention-2.
-        let attn_output = kernels::flash_attn_paged(
-            q,
-            kv_cache.k_cache(self.layer_idx),
-            kv_cache.v_cache(self.layer_idx),
-            cu_seqlens_q,
-            cu_seqlens_k,
-            block_table,
-            max_seqlen_q,
-            max_seqlen_k,
-            self.scale,
-            true, // causal
-            kv_cache.block_size,
-            &mut device.arena,
-            device.compute_stream,
-        );
+        // Choose attention path based on whether we have cached KV tokens:
+        // - Fresh prefill (q_len > 1, no cached tokens): contiguous FA2 with
+        //   Q/K/V from the current forward pass. Fastest path.
+        // - Prefix-cached prefill (q_len > 1, cached tokens in pool): paged FA2
+        //   which reads cached K/V from blocks + new K/V written above.
+        // - Decode (q_len == 1): paged FA2 reading from the block cache.
+        let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
+
+        // Always use contiguous FA2: gather K/V from block cache into
+        // contiguous tensors when there are cached tokens (decode or prefix
+        // cached prefill). Paged FA2 has a known issue for multi-request decode.
+        let attn_output = if fresh_prefill {
+            // Fresh prefill: K/V are [num_tokens, num_kv_heads, head_dim].
+            kernels::flash_attn_contiguous(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                self.scale,
+                true, // causal
+                0.0,  // no softcap
+                -1,   // no sliding window
+                &mut device.arena,
+                device.compute_stream,
+            )
+        } else {
+            // Gather K/V from block cache into contiguous tensors.
+            let k_full = kv_cache.gather_kv_contiguous(
+                self.layer_idx,
+                true,
+                block_table,
+                max_seqlen_k,
+                self.num_kv_heads,
+                self.head_dim,
+                &mut device.arena,
+                device.compute_stream,
+            );
+            let v_full = kv_cache.gather_kv_contiguous(
+                self.layer_idx,
+                false,
+                block_table,
+                max_seqlen_k,
+                self.num_kv_heads,
+                self.head_dim,
+                &mut device.arena,
+                device.compute_stream,
+            );
+            kernels::flash_attn_contiguous(
+                q,
+                k_full,
+                v_full,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                self.scale,
+                true, // causal
+                0.0,  // no softcap
+                -1,   // no sliding window
+                &mut device.arena,
+                device.compute_stream,
+            )
+        };
 
         // Reshape to [num_tokens, q_size] and output projection.
         let attn_flat = attn_output.reshape(&[num_tokens, self.q_size]);

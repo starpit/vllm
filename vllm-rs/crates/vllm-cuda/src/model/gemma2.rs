@@ -274,23 +274,63 @@ impl Gemma2Attention {
 
         let window_left = self.sliding_window.map(|w| w as i32).unwrap_or(-1);
 
-        let attn_output = kernels::flash_attn_paged_ext(
-            q,
-            kv_cache.k_cache(self.layer_idx),
-            kv_cache.v_cache(self.layer_idx),
-            cu_seqlens_q,
-            cu_seqlens_k,
-            block_table,
-            max_seqlen_q,
-            max_seqlen_k,
-            self.scale,
-            true, // causal
-            self.attn_logit_softcapping,
-            window_left,
-            kv_cache.block_size,
-            &mut device.arena,
-            device.compute_stream,
-        );
+        // Fresh prefill (no cached tokens): contiguous FA2.
+        // Prefix-cached prefill or decode: paged FA2 reading from block cache.
+        // Always use contiguous FA2: gather K/V from blocks when needed.
+        let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
+        let attn_output = if fresh_prefill {
+            kernels::flash_attn_contiguous(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                self.scale,
+                true, // causal
+                self.attn_logit_softcapping,
+                window_left,
+                &mut device.arena,
+                device.compute_stream,
+            )
+        } else {
+            let k_full = kv_cache.gather_kv_contiguous(
+                self.layer_idx,
+                true,
+                block_table,
+                max_seqlen_k,
+                self.num_kv_heads,
+                self.head_dim,
+                &mut device.arena,
+                device.compute_stream,
+            );
+            let v_full = kv_cache.gather_kv_contiguous(
+                self.layer_idx,
+                false,
+                block_table,
+                max_seqlen_k,
+                self.num_kv_heads,
+                self.head_dim,
+                &mut device.arena,
+                device.compute_stream,
+            );
+            kernels::flash_attn_contiguous(
+                q,
+                k_full,
+                v_full,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                self.scale,
+                true, // causal
+                self.attn_logit_softcapping,
+                window_left,
+                &mut device.arena,
+                device.compute_stream,
+            )
+        };
 
         let attn_flat = attn_output.reshape(&[num_tokens, self.q_size]);
         self.o_proj

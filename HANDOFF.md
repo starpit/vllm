@@ -1,27 +1,87 @@
 # Context Handoff: vllm-cuda Optimizations
 
 Worktree: `.claude/worktrees/cuda-models/` on branch `feat/cuda-qwen2-gemma2`
-Latest commit: 360ee9053 — "perf: prefill CUDA graphs + transfer stream H2D overlap"
+
+## PRIORITY 1: Paged FlashAttention-2 is broken — must fix before re-enabling CUDA graphs
+
+### The bug
+
+Paged FA2 (`run_mha_paged` in `flash_api.cu`) produces **incorrect results during decode** after the first request completes. Multi-turn chat produces garbled text on the second turn. Single-turn works perfectly.
+
+**Root cause**: Unknown. The paged FA2 kernel reads K/V directly from the block cache via `block_table`. The data in the blocks is correct (verified: gather + contiguous FA2 reads the same blocks and produces correct output). Something in how `run_mha_paged` indexes or reads paged K/V is wrong for subsequent requests.
+
+**What was ruled out**:
+- Prefix caching (disabled — no effect)
+- `tokens_before` / `cu_seqlens_q` / `cu_seqlens_k` (all verified correct via debug prints)
+- Block table contents (verified via D2H)
+- Contiguous FA2 for prefill (works correctly for all sequence lengths)
+- Arena overflow (arena auto-grows, no overflow)
+- cuBLAS plan caching (different M values get different plans)
+- CUDA graph warmup contamination (still broken with `enforce_eager=true`, no warmup)
+- Slot mapping (verified correct)
+
+**What IS known**:
+- The bug affects BOTH the CudaWorker (`vllm-cuda`) and the CandleWorker (`vllm-models` + `candle-flash-attn`)
+- Both use the same `run_mha_paged` C kernel in `third_party/candle-flash-attn/kernels/flash_api.cu`
+- Gathering K/V from blocks into contiguous tensors and using non-paged `run_mha` works correctly
+- The first request's decode (paged FA2) works. The second request's decode (paged FA2) fails.
+- Python vLLM uses paged FA2 for decode without issues, so there is likely a parameter mismatch or fork-specific bug in our `run_mha_paged` wrapper
+
+### Current workaround
+
+**CudaWorker** (`llama.rs`, `gemma2.rs`): Replaced paged FA2 with gather + contiguous FA2 for all non-fresh-prefill paths (decode + prefix-cached prefill). `KvCachePool::gather_kv_contiguous()` does per-block D2D memcpy to build contiguous K/V tensors, then calls `flash_attn_contiguous`.
+
+**CandleWorker** (separate session): Similar — disabled `batched_flash_attention_with_cache` (paged FA2), falls back to per-request gather + single-seq FA2.
+
+### Performance impact of workaround
+
+The gather approach has two major costs:
+1. **`stream_synchronize` per layer per K+V** — D2H of block_table requires sync (kills async pipelining)
+2. **O(num_blocks) D2D memcpy per layer** — extra memory bandwidth
+3. **CUDA graphs disabled** (`enforce_eager=true`) — the gather does host-side work that can't be captured in a graph
+
+This negates most of the CUDA graph decode optimizations. Decode tok/s will regress significantly.
+
+### How to fix properly
+
+1. **Write a minimal reproducer**: Call `run_mha_paged` twice with different sequence lengths in a unit test. First call should work, second should fail. This isolates whether the bug is in the kernel or in the calling code.
+
+2. **Compare parameter setup with Python vLLM**: Python's `flash_attn_with_kvcache` entry point sets up `Flash_fwd_params` differently than our `run_mha_paged`. Compare field by field.
+
+3. **Check `num_splits` handling**: Our code passes `num_splits=0`. Python might pass a different value. `num_splits=0` means "auto" but the kernel code treats `0 > 1` as false, so it's equivalent to `num_splits=1`.
+
+4. **Write a CUDA gather kernel**: Replace the CPU-driven per-block D2D memcpy with a single CUDA kernel that reads block_table and gathers K/V in one launch. This eliminates the `stream_synchronize` and enables CUDA graph capture.
+
+5. **Re-enable CUDA graphs**: Once either paged FA2 is fixed OR the gather kernel is graph-capturable, restore `enforce_eager=false` and the decode graph path.
+
+### Key files for investigation
+
+- `run_mha_paged` C kernel: `third_party/candle-flash-attn/kernels/flash_api.cu:140`
+- CudaWorker FFI call: `crates/vllm-cuda/src/kernels.rs:1031` (`flash_attn_paged_ext`)
+- CandleWorker FFI call: `third_party/candle-flash-attn/src/lib.rs:1155` (`FlashAttnPagedVarLen`)
+- Gather workaround: `crates/vllm-cuda/src/kv_cache.rs:96` (`gather_kv_contiguous`)
+- Model attention: `crates/vllm-cuda/src/model/llama.rs:351`, `gemma2.rs:277`
+
+---
 
 ## Edit/build/test cycle
 
 1. Edit files locally in worktree at `.claude/worktrees/cuda-models/vllm-rs/crates/`
-2. Sync to pod: `oc rsync crates/ nick:/root/vllm/vllm-rs/crates/ --exclude=target` (repeat for `third_party/`). For single files that oc rsync misses, pipe via `cat file | oc rsh nick bash -c 'cat > /path'`
+2. Sync to pod: `tar cf - --exclude target crates/ | oc rsh nick bash -c 'cd /root/vllm/vllm-rs && tar xf -'`. For single files: `cat file | oc rsh nick bash -c 'cat > /path'`
 3. Build: `oc rsh nick bash -c 'cd /root/vllm/vllm-rs && export RUSTC_WRAPPER=/usr/bin/sccache && cargo build -p vllm-cli --features cuda-backend --release 2>&1'`
 4. Unit tests: `oc rsh nick bash -c 'cd /root/vllm/vllm-rs && export RUSTC_WRAPPER=/usr/bin/sccache && cargo test -p vllm-cuda --features cuda -- --include-ignored 2>&1'` (140 tests)
 5. Clippy: `oc rsh nick bash -c 'cd /root/vllm/vllm-rs && export RUSTC_WRAPPER=/usr/bin/sccache && cargo clippy --workspace --exclude vllm-pyo3 --exclude vllm-mlx --features cuda-backend -- -D warnings 2>&1'`
-6. Bench latency: `oc rsh nick bash -c 'cd /root/vllm/vllm-rs && ./target/release/vllm bench latency --model <MODEL> [--temperature 0] [--enforce-eager] 2>&1'`
-7. Bench defaults: BS=8, input_len=32, output_len=128, warmup=10, iters=30
-8. IMPORTANT: Run debug build + release build in parallel (kernel compilation takes ~7 min). Never run two bench commands concurrently — GPU contention gives garbage numbers.
+6. Multi-turn chat test: `oc rsh nick bash -c 'cd /root/vllm/vllm-rs && echo -e "why is the sky blue?\nand why red at night?" | ./target/release/vllm chat --model Qwen/Qwen2.5-0.5B --max-tokens 50 2>&1'`
+7. IMPORTANT: `cargo fmt` can't run `--all` from worktree. Run `cargo fmt -p <crate>` per crate.
+8. IMPORTANT: After `cat | oc rsh` to copy files, `touch` the file on the pod to force recompilation.
 
-Pod: `oc rsh nick` — L40S GPU, CUDA 12.9, Rust 1.93, path `/root/vllm/vllm-rs/`. `nick2` has 2×L40S for TP testing.
+Pod: `oc rsh nick` — L40S GPU, CUDA 12.9, Rust 1.93, path `/root/vllm/vllm-rs/`. `nick2` has 2xL40S for TP testing.
 
 ## Gotchas
 
 - oc rsync sometimes silently fails. Verify with `oc rsh nick bash -c 'grep -n "pattern" /path'`. Fallback: `cat local | oc rsh nick bash -c 'cat > remote'`
 - Edition 2024 — Rust 1.93 enforces `unsafe {}` blocks inside `unsafe fn`. vllm-cuda uses `#![allow(unsafe_op_in_unsafe_fn)]`.
 - `r#gen` not `gen` — gen is a keyword in edition 2024
-- `cargo fmt` can't run `--all` from worktree (nested workspace confusion). Run `cargo fmt -p <crate>` per crate.
 - vllm-cuda links against vllm-kernels for shared CUDA kernels. Only `embedding_kernels.cu` is compiled by vllm-cuda's `build.rs`. Don't add shared kernels back or you get duplicate symbol linker errors.
 - Llama-3.2-3B is a gated model — 401 on the pod. Use `Qwen/Qwen2.5-0.5B` and `Qwen/Qwen2.5-3B` for benchmarking.
 
@@ -62,164 +122,68 @@ Pod: `oc rsh nick` — L40S GPU, CUDA 12.9, Rust 1.93, path `/root/vllm/vllm-rs/
 - **Arena pre-sizing**: Warmup dummy forward now uses `max_num_batched_tokens` (single sequence) instead of hardcoded 256 tokens.
 - Wired into LLaMA, Qwen2 (delegates to LLaMA), and Gemma2 model forward passes.
 
-### Prefill CUDA graphs (360ee9053 — LATEST)
+### Prefill CUDA graphs (360ee9053)
 - **New `PrefillGraphRunner`** in `graph.rs`: captures CUDA graphs for single-sequence prefill at power-of-2 token counts [128, 256, 512, 1024, 2048, 4096, 8192] (filtered by `max_num_batched_tokens`).
-- Persistent input buffers: `input_ids`, `positions`, `slot_mapping` sized for max_tokens; `cu_seqlens_q/k` [2], `block_table` [1, MAX_BLOCKS], `last_token_indices` [1].
-- `capture()` runs forward with `last_token_indices` + argmax under graph capture. Output: `[1, vocab_size]`.
-- `replay()` pads real tokens to captured size, padding slots get `slot_mapping=-1`. H2D on transfer stream + event sync.
-- **Wired into `CudaWorker::execute_model()`**: used when `num_reqs == 1 && q_len == seq_len` (fresh single-request prefill).
-- Captured after decode graphs in `compile_or_warm_up_model()`, before cublasLt benchmarking (so prefill GEMM shapes get benchmarked too).
-- **Results**: 9-10% prefill latency reduction at input_len=512-1024 on Qwen2.5-0.5B.
+- **CURRENTLY DISABLED** (`use_prefill_graph = false`) — prefill graphs captured paged FA2 which is broken.
+- 9-10% prefill latency improvement when working.
 
-### Transfer stream H2D overlap (360ee9053 — LATEST)
-- All three graph replay paths (`replay()`, `replay_decode_fast()`, prefill `replay()`) now use `device.transfer_stream` for H2D copies instead of `compute_stream`.
-- Event sync via `device.sync_transfer_to_compute()` before graph launch.
-- Frees compute stream from H2D serialization; enables PCIe controller to pipeline multiple small copies.
-- No measurable throughput impact on decode (copies are tiny), but architecturally correct for future cross-step pipelining.
+### Paged FA2 workaround — gather + contiguous FA2 (LATEST)
+- Replaced paged FA2 in LLaMA and Gemma2 attention with gather + contiguous FA2
+- New `KvCachePool::gather_kv_contiguous()`: D2H block_table, per-block D2D memcpy to contiguous tensor
+- `enforce_eager=true`, `enable_prefix_caching=false` in defaults (temporary)
+- Fixes multi-turn chat corruption on both CudaWorker and CandleWorker paths
+- **Performance regression**: No CUDA graphs, extra memory copies — needs proper fix (see Priority 1 above)
 
-### Persistent GPU decode metadata (bc5ae1824)
-- **New CUDA kernel** `update_decode_metadata` in `embedding_kernels.cu`: in one launch, increments `positions[i] += 1`, computes `slot_mapping[i]` from new position + block_table, increments `cu_seqlens_k[1..N+1] += 1`.
-- **`replay_decode_fast()`** on `CudaGraphRunner`: uses the GPU kernel instead of building 5 CPU Vecs + 5 H2D copies. `cu_seqlens_q` skipped entirely (constant for decode). Block table only H2D-copied when blocks actually change.
-- **`graph_metadata_valid` flag** on `CudaWorker`: tracks whether persistent buffers have valid state. First decode step after batch composition change uses full H2D; subsequent steps use fast path.
-- Rust FFI wrapper: `kernels::update_decode_metadata_gpu()` in `kernels.rs`.
+### E2E correctness tests — NEW
+- `test_cuda_correctness_completion_semantic`: validates "paris" in "capital of France" completion
+- `test_cuda_correctness_multi_turn_chat`: 2-turn chat, verifies model remembers turn 1 context
+- `test_cuda_correctness_nongreedy_chat`: temperature=0.7, validates coherent text
+- Added `assistant_msg()` helper, `assert_coherent_text` calls to existing CUDA tests
 
-### cublasLt algorithm benchmarking (bc5ae1824) — NOW OPT-IN (`--cublas-autotune`)
-- **Off by default** — decode GEMMs are memory-bound at small M, so faster algorithms showed no measurable throughput gain. Adds ~3-5s to startup.
-- **`CublasHandle::benchmark_plans()`**: runs during warmup after plan cache is populated from both prefill warmup and graph capture (decode shapes). Gets top 8 algorithms per GEMM shape from heuristic, benchmarks each (3 warmup + 10 timed with CUDA events), keeps the fastest.
-- **`event_elapsed()`** added to `driver.rs` for GPU timing.
-- Benchmarking found 7-40% faster algorithms on individual GEMM shapes vs heuristic on L40S:
-  - M=1 K=4864 N=896 (down_proj BS=1): algo #1 is **39.7%** faster
-  - M=32 K=4864 N=896: algo #4 is **18.8%** faster
-  - M=2048 K=896 N=1152 (prefill QKV): algo #1 is **21.2%** faster
-  - M=2048 K=896 N=151936 (prefill lm_head): algo #1 is **14.7%** faster
-- Prefill shapes (large M) benefit; decode shapes (small M) do not. May become worthwhile with chunked prefill.
-
-### GPU-aware max_num_batched_tokens (bc5ae1824 — LATEST)
-- After `init_device()`, queries free VRAM via `determine_available_memory()`.
-- >=60GB free: uses 8192. Otherwise: 2048. Matches Python vLLM defaults.
-- User can still override with `--max-num-batched-tokens`.
-
-### E2E correctness tests — DONE (prior to this session)
-
-### Chat garbage bug — FIXED (upstream engine-level fix, prior to this session)
-
-### CudaWorker model correctness — FIXED
-- **Missing QKV bias**: Fused QKV loading (`load_fused`) dropped bias tensors — `Linear::new(qkv_w, None)`.
-  Qwen2 has QKV bias; LLaMA does not. Fix: concat Q/K/V biases and pass to `Linear::new`.
-- **Per-layer arena copy ordering**: Residual was copied to `res_buf` AFTER `hs_buf` was overwritten with MLP output,
-  corrupting the residual on the first layer. Fix: copy residual first when it aliases `hs_buf`.
-- Both LLaMA and Gemma2 models fixed.
-- Verified: `Qwen/Qwen2.5-0.5B` → "Paris. It is the largest city in Europe..."
-- Verified: `unsloth/Llama-3.2-3B-Instruct` → perfect Rayleigh scattering explanation
-
-### Llama 3 RoPE scaling — ADDED
-- Both candle `RotaryEmbedding::new_llama3()` and CudaWorker `RotaryCache::new()` now support
-  `rope_type: "llama3"` frequency-dependent scaling (factor, low_freq_factor, high_freq_factor).
-- Parsed from config.json `rope_scaling` in both candle `LlamaConfig::from_hf_config()` and
-  CudaWorker `llama_config_from_hf()`.
-
-### Configurable CUDA graph capture sizes
-- `CudaWorkerConfig` now takes `cuda_graph_sizes: Vec<usize>` from `CudaGraphConfig`.
-- Default throughput bench passes `1,2,4,8,16,32,64,128,256` — CudaWorker captures all of them
-  instead of hardcoded `[1,2,4,8,16,32]`.
-
-### Non-greedy GPU metadata fast path
-- `replay_decode_fast()` now used for non-greedy graph decode (temp>0) when batch composition
-  is unchanged, saving 5 CPU Vec builds + 5 H2D copies per decode step.
-- Previously only greedy decode used the fast path.
-
-### Pinned host staging buffers
-- **New `PinnedBuf`** type in `cpu_gpu_buf.rs`: host-only pinned (page-locked) memory wrapper.
-  Unlike `CpuGpuBuf`, no GPU allocation — used when GPU destination is managed elsewhere (e.g., graph persistent buffers).
-- **New `HostStaging`** struct in `cuda_worker.rs`: pre-allocated pinned buffers for all graph
-  replay metadata (input_ids, positions, slot_mapping, cu_seqlens_q/k, block_table, host_token_ids,
-  sampling_packed). ~520KB total, allocated after graph capture.
-- All graph replay H2D paths now use pinned memory for true async DMA (pageable memory forces
-  synchronous staging inside the CUDA driver, defeating `_async`).
-- All D2H token ID paths use pinned `host_token_ids` buffer.
-- GPU sampling params packed into pinned `sampling_packed` buffer.
-- Eliminates 6+ heap Vec allocations per batch composition change.
-- `fill_block_table()` helper deduplicates 4× copy-pasted block table building code.
-- 5 new unit tests for `PinnedBuf` (create, zero-cap, u32 slice, i64 slice, H2D roundtrip).
+### Other completed work (prior sessions)
+- CudaWorker model correctness fixes (QKV bias, arena copy ordering)
+- Llama 3 RoPE scaling
+- Configurable CUDA graph capture sizes
+- Non-greedy GPU metadata fast path
+- Pinned host staging buffers
+- Transfer stream H2D overlap
+- Persistent GPU decode metadata kernel
+- cublasLt algorithm benchmarking (opt-in)
+- GPU-aware max_num_batched_tokens
+- Per-step allocation reduction
+- Throughput bench prompt generation fix
 
 ## Performance (L40S, default bench: BS=8, in=32, out=128)
 
-Current numbers (after all optimizations):
+**Before paged FA2 workaround** (with CUDA graphs):
 
 | Model | Temp | Mode | tok/s |
 |-------|------|------|-------|
-| Qwen2.5-0.5B | 0 | Eager | 3259 |
 | Qwen2.5-0.5B | 0 | Graphs | 3639 |
-| Qwen2.5-0.5B BS=1 in=512 | 0 | Eager | 395.6 |
-| Qwen2.5-0.5B BS=1 in=512 | 0 | Prefill+Decode graphs | 436.3 |
-| Qwen2.5-0.5B BS=1 in=1024 | 0 | Eager | 354.4 |
-| Qwen2.5-0.5B BS=1 in=1024 | 0 | Prefill+Decode graphs | 386.5 |
 | Qwen2.5-3B | 0 | Graphs | 807 |
 | Qwen2.5-3B | - | Throughput | **17051 total tok/s** |
 
-### Throughput bench comparison (1000 prompts, in=1024, out=128, L40S)
-
-| Engine | max_num_batched_tokens | Total tok/s | vs Python |
-|--------|----------------------|-------------|-----------|
-| Python vLLM (default, chunked prefill) | 8192 | 16,239 | baseline |
-| Rust vLLM (old default) | 2048 | 15,326 | -5.6% |
-| **Rust vLLM (new default)** | **4096** | **17,051** | **+5.0%** |
-
-## Testing methodology
-
-- Unit tests: `cargo test -p vllm-cuda --features cuda -- --include-ignored` — 145 tests covering tensor ops, GEMM, layers, kernels, model forward passes, plan caching, arena scoping, pinned buffers. Run on pod only (needs GPU).
-- Local check: `cargo check -p vllm-cuda --tests` catches Rust compilation errors without needing CUDA.
-- Benchmarking: Always run ONE bench command at a time (GPU contention). Compare against baselines in table above. Use `--enforce-eager` to isolate kernel-level changes from graph effects.
-- E2E correctness tests exist and pass.
+**After workaround** (enforce_eager, no graphs): Not yet benchmarked. Expected significant regression.
 
 ## Known issues
 
 | Issue | Severity | Notes |
 |-------|----------|-------|
-| ~~Throughput bench OOM on 3B~~ | ~~High~~ | **FIXED** — per-layer arena scoping + `max_num_batched_tokens` wiring. |
-| ~~No cuBLAS autotuning~~ | ~~Medium~~ | **OPT-IN** — `--cublas-autotune` flag. No decode benefit (memory-bound); may help prefill. |
-| ~~H2D copies per decode step~~ | ~~Medium~~ | **FIXED** — persistent GPU metadata with `update_decode_metadata` kernel. |
-| ~~Hardcoded max_num_batched_tokens~~ | ~~Low~~ | **FIXED** — GPU-aware auto-detection from VRAM. |
-| ~~Gap to Python vLLM on 3B~~ | ~~Low~~ | **FIXED** — Now **5% faster** than Python (17.05k vs 16.24k tok/s) after fixing `max_num_batched_tokens` default + buffer reuse optimizations. |
-| Arena OOM at max_num_batched_tokens=8192 on 3B | Medium | Contiguous arena needs ~2.5GB for one layer at 8192 tokens. Chunked prefill would fix (not yet implemented). Default capped at 4096 for ≤48GB GPUs. |
-| Arena pre-sizes to ~1GB for 3B | Low | Correct behavior. Could auto-size from model config. |
-| ~~RoPE scaling for Llama 3.2~~ | ~~Low~~ | **FIXED** — llama3 rope_scaling implemented in both backends. |
-| `--bench` warmup corrupts chat | Low | Chat `--bench` mode warmup (1-token gen) leaves dirty state, garbling subsequent output. Non-bench chat works perfectly. |
-
-### Per-step allocation reduction (LATEST)
-- **`InputBatch` buffer reuse**: 8 reusable Vec buffers in `InputBatch` (req_inputs, query_start_loc, q_lens, seq_lens, block_ids, tokens_before, is_prefill, req_ids). `prepare_inputs()` swaps them out, `reclaim_buffers()` returns them — preserving heap capacity across steps.
-- **`ModelRunnerOutput::from_ordered()`**: New constructor taking pre-ordered Vecs, avoids intermediate HashMap + String clones. Used by greedy graph and GPU sampling paths.
-- **Eliminated per-step `vec![token_id]`**: Direct `push(tok)` instead of alloc+extend for ~256 requests per step.
-- **Skip redundant `ctx_set_current`**: `ctx_set_on_thread` flag avoids CUDA driver call after first invocation.
-
-### `max_num_batched_tokens` fix (LATEST)
-- Default was **2048** while Python uses **8192**. L40S (46GB) can handle 4096 with our contiguous arena.
-- New auto-detection: ≥60GB → 8192, <60GB → 4096. Matches Python behavior more closely.
-- 8192 OOMs on L40S for 3B models because the arena needs ~2.5GB contiguous for one transformer layer at that token count. Chunked prefill (not yet implemented) would fix this.
-
-### Throughput bench prompt generation fix (LATEST)
-- Previous bench decoded random token IDs to text but didn't adjust for tokenizer roundtrip length mismatch (1024 random IDs → ~128 re-tokenized tokens).
-- Now uses Python's `gen_prompt_decode_to_target_len` approach: iteratively decode→encode→truncate/extend to hit exact target length (10 retries). Uses non-special tokens only (matching Python's `allowed_tokens` filter).
-
-## Next steps (priority order)
-
-1. ~~**Throughput bench**~~ — **DONE**: 17.05k vs Python 16.24k tok/s (**+5% faster**).
-2. ~~**Prefill graph capture**~~ — **DONE** (360ee9053). Single-sequence prefill graphs at [128..8192] token counts. 9-10% uplift.
-3. ~~**H2D/compute overlap**~~ — **DONE** (360ee9053). Transfer stream for all graph H2D. Cross-step pipelining deferred.
-4. ~~**LLaMA-family aliases**~~ — **DONE**. Added Qwen3ForCausalLM and Phi3ForCausalLM to LLaMA match arm in CudaWorker. E2E verified: Qwen3-0.6B on L40S.
-5. **More model architectures** — Port remaining architectures (MoE, DeepSeek, Gemma3, etc.) to vllm-cuda backend.
+| **Paged FA2 broken for multi-request decode** | **CRITICAL** | See Priority 1 above. Workaround in place but kills perf. |
+| CUDA graphs disabled | High | Blocked by paged FA2 fix (gather does host sync). |
+| Prefix caching disabled | Medium | Blocked by paged FA2 fix. |
+| Prefill graphs disabled | Medium | Captured paged FA2; re-enable after fix. |
+| Arena OOM at max_num_batched_tokens=8192 on 3B | Medium | Contiguous arena needs ~2.5GB. Chunked prefill would fix. |
 
 ## Key files
 
-- cublasLt plan cache + benchmarking: `crates/vllm-cuda/src/cublas.rs` (`CublasHandle`, `GemmPlan`, `ensure_plan`, `benchmark_plans`)
+- cublasLt plan cache + benchmarking: `crates/vllm-cuda/src/cublas.rs`
 - Fused QKV+RoPE kernel: `crates/vllm-kernels/csrc/pos_encoding_kernels.cu`
-- Decode metadata kernel: `crates/vllm-kernels/csrc/embedding_kernels.cu` (`update_decode_metadata`)
-- Rust FFI + wrapper: `crates/vllm-cuda/src/kernels.rs` (`fused_qkv_rope()`, `update_decode_metadata_gpu()`)
-- Model call sites: `crates/vllm-cuda/src/model/llama.rs`, `crates/vllm-cuda/src/model/gemma2.rs`
-- CUDA graph runner: `crates/vllm-cuda/src/graph.rs` (`CapturedGraph`, `ReplayOutput`, `nearest_graph_size`, `replay_decode_fast`)
-- CUDA worker: `crates/vllm-executor/src/cuda_worker.rs` (greedy graph fast path, batch padding, `graph_metadata_valid`, `HostStaging`)
-- Pinned host buffers: `crates/vllm-cuda/src/cpu_gpu_buf.rs` (`PinnedBuf`, `CpuGpuBuf`)
-- Arena scoping: `crates/vllm-cuda/src/arena.rs` (`set_offset`, scoping tests), `crates/vllm-cuda/src/model/llama.rs` (per-layer scoping pattern)
-- Config: `crates/vllm-serve/src/init.rs` (GPU-aware `max_num_batched_tokens`), `crates/vllm-executor/src/cuda_worker.rs` (`CudaWorkerConfig`)
-- Prefill graph runner: `crates/vllm-cuda/src/graph.rs` (`PrefillGraphRunner`, `PrefillInputTensors`, `PrefillReplayOutput`)
-- Old split_qkv kernel: Still in `embedding_kernels.cu` and `kernels.rs` (not removed — may be useful for non-RoPE models)
+- Decode metadata kernel: `crates/vllm-kernels/csrc/embedding_kernels.cu`
+- Model attention (with gather workaround): `crates/vllm-cuda/src/model/llama.rs`, `gemma2.rs`
+- KV cache pool + gather: `crates/vllm-cuda/src/kv_cache.rs`
+- CUDA graph runner: `crates/vllm-cuda/src/graph.rs`
+- CUDA worker: `crates/vllm-executor/src/cuda_worker.rs`
+- Config defaults: `crates/vllm-serve/src/init.rs`
+- FA2 C kernel: `third_party/candle-flash-attn/kernels/flash_api.cu`
+- FA2 Rust binding: `third_party/candle-flash-attn/src/lib.rs`

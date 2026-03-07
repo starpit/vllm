@@ -767,6 +767,56 @@ pub unsafe fn reshape_and_cache(
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" {
+    fn run_mha(
+        q_ptr: *const c_void,
+        k_ptr: *const c_void,
+        v_ptr: *const c_void,
+        o_ptr: *const c_void,
+        softmax_lse_ptr: *const c_void,
+        alibi_slopes_ptr: *const c_void,
+
+        cu_seqlens_q_ptr: *const i32,
+        cu_seqlens_k_ptr: *const i32,
+
+        q_batch_stride: u32,
+        k_batch_stride: u32,
+        v_batch_stride: u32,
+        o_batch_stride: u32,
+        alibi_slopes_batch_stride: u32,
+
+        q_row_stride: u32,
+        k_row_stride: u32,
+        v_row_stride: u32,
+        o_row_stride: u32,
+
+        q_head_stride: u32,
+        k_head_stride: u32,
+        v_head_stride: u32,
+        o_head_stride: u32,
+
+        b: u32,
+        h: u32,
+        h_k: u32,
+        d: u32,
+        d_rounded: u32,
+        softmax_scale: f32,
+
+        seqlen_q: u32,
+        seqlen_k: u32,
+        seqlen_q_rounded: u32,
+        seqlen_k_rounded: u32,
+
+        is_bf16: c_int,
+        is_causal: c_int,
+        unpadded_lse: c_int,
+
+        window_size_left: c_int,
+        window_size_right: c_int,
+
+        softcap: f32,
+        cuda_stream: CUstream,
+    );
+
     fn run_mha_paged(
         q_ptr: *const c_void,
         k_ptr: *const c_void,
@@ -825,6 +875,103 @@ unsafe extern "C" {
 
 fn round_multiple(x: usize, m: usize) -> usize {
     x.div_ceil(m) * m
+}
+
+/// Non-paged FlashAttention-2 forward pass (contiguous K/V).
+///
+/// Used for **prefill** where K/V come directly from the current forward pass
+/// (not from the paged block cache). Matches Python vLLM's prefill attention.
+///
+/// * `q`: `[total_q_tokens, num_heads, head_dim]`
+/// * `k`: `[total_k_tokens, num_kv_heads, head_dim]`
+/// * `v`: `[total_k_tokens, num_kv_heads, head_dim]`
+/// * `cu_seqlens_q/k`: `[batch_size + 1]` cumulative sequence lengths
+///
+/// Returns: `[total_q_tokens, num_heads, head_dim]` output tensor from arena.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_contiguous(
+    q: GpuTensor,
+    k: GpuTensor,
+    v: GpuTensor,
+    cu_seqlens_q: GpuTensor,
+    cu_seqlens_k: GpuTensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    softmax_scale: f32,
+    is_causal: bool,
+    softcap: f32,
+    window_size_left: i32,
+    arena: &mut ScratchArena,
+    stream: CUstream,
+) -> GpuTensor {
+    let total_q = q.dim(0);
+    let num_heads = q.dim(1);
+    let head_dim = q.dim(2);
+    let num_kv_heads = k.dim(1);
+
+    let batch_size = cu_seqlens_q.dim(0) - 1;
+
+    let head_size_rounded = round_multiple(head_dim, 32);
+    let seqlen_q_rounded = round_multiple(max_seqlen_q, 128);
+    let seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
+
+    // Allocate output and softmax_lse from arena.
+    let out = arena.alloc(&[total_q, num_heads, head_dim], q.dtype());
+    let softmax_lse = arena.alloc(&[num_heads * total_q], DType::F32);
+
+    let is_bf16_flag: c_int = if q.dtype() == DType::BF16 { 1 } else { 0 };
+    let causal_flag: c_int = if is_causal { 1 } else { 0 };
+
+    // Q: [total_q, num_heads, head_dim] contiguous
+    let q_row_stride = (num_heads * head_dim) as u32;
+    let q_head_stride = head_dim as u32;
+
+    // K/V: [total_k, num_kv_heads, head_dim] contiguous
+    let kv_row_stride = (num_kv_heads * head_dim) as u32;
+    let kv_head_stride = head_dim as u32;
+
+    run_mha(
+        q.raw_ptr() as *const c_void,
+        k.raw_ptr() as *const c_void,
+        v.raw_ptr() as *const c_void,
+        out.raw_ptr() as *const c_void,
+        softmax_lse.raw_ptr() as *const c_void,
+        /* alibi_slopes */ std::ptr::null(),
+        cu_seqlens_q.as_ptr::<i32>(),
+        cu_seqlens_k.as_ptr::<i32>(),
+        /* q_batch_stride */ 0,
+        /* k_batch_stride */ 0,
+        /* v_batch_stride */ 0,
+        /* o_batch_stride */ 0,
+        /* alibi_slopes_batch_stride */ 0,
+        q_row_stride,
+        kv_row_stride,
+        kv_row_stride,
+        /* o_row_stride */ q_row_stride,
+        q_head_stride,
+        kv_head_stride,
+        kv_head_stride,
+        /* o_head_stride */ q_head_stride,
+        batch_size as u32,
+        num_heads as u32,
+        num_kv_heads as u32,
+        head_dim as u32,
+        head_size_rounded as u32,
+        softmax_scale,
+        max_seqlen_q as u32,
+        max_seqlen_k as u32,
+        seqlen_q_rounded as u32,
+        seqlen_k_rounded as u32,
+        is_bf16_flag,
+        causal_flag,
+        /* unpadded_lse */ 1,
+        window_size_left,
+        /* window_size_right */ if is_causal { 0 } else { -1 },
+        softcap,
+        stream,
+    );
+
+    out
 }
 
 /// Paged FlashAttention-2 forward pass.

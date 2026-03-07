@@ -1355,13 +1355,9 @@ impl Worker for CudaWorker {
             // Check if we can use a prefill graph: single request, fresh prefill
             // (q_len == seq_len, no prior cached tokens), and captured graph exists.
             let meta = &prepared.attn_meta;
-            let use_prefill_graph = num_reqs == 1
-                && meta.q_lens[0] == meta.seq_lens[0]
-                && self
-                    .prefill_graph_runner
-                    .as_ref()
-                    .and_then(|r| r.nearest_graph_size(total_tokens))
-                    .is_some();
+            // Prefill graphs are disabled: they capture paged FA2 which produces
+            // incorrect results for q_len > 1. Use eager prefill with contiguous FA2.
+            let use_prefill_graph = false;
 
             if use_prefill_graph {
                 let padded = self
@@ -1414,6 +1410,7 @@ impl Worker for CudaWorker {
                 replay_out.logits
             } else {
                 // Eager forward path (multi-request prefill or uncaptured size).
+                // DEBUG: trace attention metadata for multi-turn debugging
                 device.arena.reset();
 
                 let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;

@@ -58,7 +58,8 @@ extern "C" void run_mha(
     int window_size_left,
     int window_size_right,
 
-    float softcap
+    float softcap,
+    cudaStream_t cuda_stream
 ) {
     Flash_fwd_params params;
     // Reset the parameters
@@ -131,8 +132,7 @@ extern "C" void run_mha(
     params.num_splits = 1;
     params.unpadded_lse = unpadded_lse;
 
-    cudaStream_t stream = 0; // Use the default stream.
-    run_mha_fwd(params, stream);
+    run_mha_fwd(params, cuda_stream);
 }
 
 // Paged KV variant: same as run_mha but passes block_table, page_block_size,

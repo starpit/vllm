@@ -154,11 +154,6 @@ impl GpuWeights {
         let st = safetensors::SafeTensors::deserialize(&mmap)
             .map_err(|e| anyhow::anyhow!("{}: {}", path.display(), e))?;
 
-        // The safetensors header tells us the data offset within the file.
-        // safetensors format: 8 bytes (header_len) + header_len bytes (JSON header) + data
-        let header_len = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
-        let data_start = 8 + header_len;
-
         let mut count = 0;
         for name in st.names() {
             let view = st

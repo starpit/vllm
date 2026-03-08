@@ -10,6 +10,10 @@ All benchmarks: `vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct` (defaul
 
 ### What's been done this session
 
+- **Prefill CUDA graphs re-enabled** (`cuda_worker.rs`): The `use_prefill_graph = false` guard was stale — the model's forward pass already uses contiguous FA2 (not paged) for fresh prefills (`tokens_before == 0`), so the original correctness issue no longer applies. Re-enabled with conditions: single request, fresh prefill, captured graph exists for padded size. Note: the throughput benchmark doesn't hit this path (scheduler batches multiple prefills), but it helps latency-sensitive single-request scenarios like chat.
+
+- **vllm-cuda dead code cleanup** (`kernels.rs`, `weights.rs`): Removed unused `num_splits_heuristic` function, unused `head_dim_rounded` and `data_start` variables. Fixes 4 clippy errors with `-D warnings`.
+
 - **`CachingAllocator::trim()` implemented** (`alloc.rs`): Releases free unsplit segments back to CUDA driver via `cuMemFree`. After profiling dry-run, frees ~3 GiB of activation memory back to CUDA so it can be used for KV cache. Matches PyTorch's `release_cached_blocks()`.
 
 - **Streaming weight loading** (`weights.rs`, `llama.rs`, `gemma2.rs`, `cuda_worker.rs`): Rewrote `GpuWeights` to match Python vLLM's approach — weights stay on CPU (mmap'd safetensors files) and are copied to GPU one at a time via `take()`. Fused weights (QKV, gate_up) use `take_into()` to copy directly from CPU → GPU offset in a pre-allocated buffer. No more shard-level GPU buffers. Saves ~3.4 GiB of GPU memory during model loading.
@@ -70,7 +74,7 @@ Both use only event-based sync in steady state. No unnecessary stream syncs.
 
 ### Root causes of remaining throughput gap
 
-1. **Prefill path runs eager (no CUDA graphs or torch.compile equivalent)** — `cuda_worker.rs`: `let use_prefill_graph = false`. Python uses `torch.compile` for prefill, fusing everything into optimized kernels with minimal CPU dispatch overhead. Our eager prefill launches ~100+ individual kernels per step. This is the primary cause of the 34% GPU idle time.
+1. **Batched prefill runs eager (no torch.compile equivalent)** — Prefill CUDA graphs are now enabled for single fresh-prefill requests, but the throughput benchmark batches many prefills together (`num_reqs >> 1`), so graphs don't apply there. Python uses `torch.compile` for all prefills (batched or not), fusing everything into optimized kernels with minimal CPU dispatch overhead. Our eager batched prefill launches ~365 individual kernels per step (10/layer × 36 layers). This is the primary cause of the 34% GPU idle time.
 
 2. **Peak activation memory gap (3.0 GiB vs ~0.5 GiB)** — Without torch.compile fusing, our eager forward pass materializes more intermediate tensors, consuming more memory. This reduces available KV cache, which may cause more preemption under heavy load.
 

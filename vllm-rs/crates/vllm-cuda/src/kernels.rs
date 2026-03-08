@@ -818,47 +818,6 @@ fn round_multiple(x: usize, m: usize) -> usize {
     x.div_ceil(m) * m
 }
 
-/// Compute optimal num_splits for split-K FlashAttention.
-/// Matches upstream flash_api.cpp heuristic exactly.
-fn num_splits_heuristic(
-    batch_nheads_mblocks: usize,
-    num_sm_x2: usize,
-    num_n_blocks: usize,
-    max_splits: usize,
-) -> usize {
-    if batch_nheads_mblocks as f32 >= 0.8 * num_sm_x2 as f32 {
-        return 1;
-    }
-    let max_splits = max_splits.min(num_sm_x2).min(num_n_blocks);
-    let ceildiv = |a: usize, b: usize| a.div_ceil(b);
-    let is_split_eligible =
-        |ns: usize| ns == 1 || ceildiv(num_n_blocks, ns) != ceildiv(num_n_blocks, ns - 1);
-
-    let mut max_efficiency: f32 = 0.0;
-    let mut efficiency = Vec::with_capacity(max_splits);
-    for ns in 1..=max_splits {
-        if !is_split_eligible(ns) {
-            efficiency.push(0.0f32);
-        } else {
-            let n_waves = (batch_nheads_mblocks * ns) as f32 / num_sm_x2 as f32;
-            let eff = n_waves / n_waves.ceil();
-            if eff > max_efficiency {
-                max_efficiency = eff;
-            }
-            efficiency.push(eff);
-        }
-    }
-    for ns in 1..=max_splits {
-        if !is_split_eligible(ns) {
-            continue;
-        }
-        if efficiency[ns - 1] >= 0.85 * max_efficiency {
-            return ns;
-        }
-    }
-    1
-}
-
 /// Non-paged FlashAttention-2 forward pass (contiguous K/V).
 ///
 /// Used for **prefill** where K/V come directly from the current forward pass
@@ -1009,7 +968,7 @@ pub unsafe fn flash_attn_paged_ext(
     softcap: f32,
     window_size_left: i32,
     block_size: usize,
-    num_sm: i32,
+    _num_sm: i32,
     alloc: &mut CachingAllocator,
     _stream: CUstream,
 ) -> OwnedTensor {
@@ -1024,8 +983,6 @@ pub unsafe fn flash_attn_paged_ext(
     } else {
         0
     };
-
-    let head_dim_rounded = round_multiple(head_dim, if head_dim <= 128 { 32 } else { 64 });
 
     // Allocate output and softmax_lse from arena.
     let out = alloc.alloc_tensor(&[total_q, num_heads, head_dim], q.dtype());

@@ -1851,11 +1851,16 @@ impl CudaWorker {
             self.graph_metadata_valid = false;
 
             // Check if we can use a prefill graph: single request, fresh prefill
-            // (q_len == seq_len, no prior cached tokens), and captured graph exists.
+            // (tokens_before == 0 means q_len == seq_len, so the model uses contiguous
+            // FA2 — not paged — which is safe to capture in a CUDA graph).
             let meta = &prepared.attn_meta;
-            // Prefill graphs are disabled: they capture paged FA2 which produces
-            // incorrect results for q_len > 1. Use eager prefill with contiguous FA2.
-            let use_prefill_graph = false;
+            let use_prefill_graph = num_reqs == 1
+                && meta.tokens_before[0] == 0
+                && self
+                    .prefill_graph_runner
+                    .as_ref()
+                    .and_then(|r| r.nearest_graph_size(total_tokens))
+                    .is_some();
 
             if use_prefill_graph {
                 let padded = self

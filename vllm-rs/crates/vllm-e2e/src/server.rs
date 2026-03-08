@@ -252,47 +252,44 @@ impl TestServerBuilder {
             cmd.arg(arg);
         }
 
+        // Inherit stderr so child server logs are visible in real-time.
+        // Stdout is still piped (unused).
         cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::inherit());
 
-        tracing::info!("Spawning test server: {:?}", cmd);
+        eprintln!("[E2E] Spawning: {:?}", cmd);
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to spawn vllm binary at {}", binary.display()))?;
 
-        let mut test_server = TestServer {
+        // Wait for the server to become healthy, checking for early child exit.
+        let health_result =
+            wait_for_health_with_child(&base_url, &mut child, self.startup_timeout).await;
+
+        if let Err(e) = health_result {
+            eprintln!("[E2E] Health check failed: {e}");
+            let _ = child.kill();
+            let _ = child.wait(); // reap
+            return Err(e);
+        }
+
+        let test_server = TestServer {
             mode: TestServerMode::ChildProcess { child },
             port,
             base_url,
         };
 
-        // Wait for the server to become healthy.
-        if let Err(e) = wait_for_health(&test_server.base_url, self.startup_timeout).await {
-            // On failure, dump child stderr for debugging.
-            if let TestServerMode::ChildProcess { child } = &mut test_server.mode {
-                let _ = child.kill();
-                if let Some(mut stderr) = child.stderr.take() {
-                    use std::io::Read;
-                    let mut buf = String::new();
-                    let _ = stderr.read_to_string(&mut buf);
-                    if !buf.is_empty() {
-                        eprintln!("=== Child server stderr ===\n{buf}\n=== End stderr ===");
-                    }
-                }
-            }
-            return Err(e);
-        }
-
-        tracing::info!("Test server (child process) healthy on port {port}");
+        eprintln!("[E2E] Server healthy on port {port}");
         Ok(test_server)
     }
 
     /// Start the server in-process and wait for it to become healthy.
     async fn start_in_process(self) -> Result<TestServer> {
-        // Initialize tracing. Silent by default; set RUST_LOG=info to see
-        // download/loading progress. Idempotent — only the first call takes effect.
-        vllm_common::telemetry::init_tracing("off");
+        // Initialize tracing. Uses RUST_LOG env if set, otherwise "info" so
+        // initialization progress is visible and hangs are diagnosable.
+        let log_level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+        vllm_common::telemetry::init_tracing(&log_level);
 
         let port = self.port.unwrap_or_else(|| {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -327,11 +324,23 @@ impl TestServerBuilder {
         };
 
         // Initialize the full stack (blocking — downloads model, loads weights).
-        let mut stack =
-            tokio::task::spawn_blocking(move || vllm_serve::init::initialize_stack(&config))
-                .await
-                .context("initialize_stack panicked")?
-                .context("failed to initialize stack")?;
+        // Timeout after 90s so hangs in CUDA graph capture / model load are caught.
+        let init_timeout = Duration::from_secs(90);
+        eprintln!("[E2E] starting initialize_stack for {model}...");
+        let mut stack = tokio::time::timeout(
+            init_timeout,
+            tokio::task::spawn_blocking(move || {
+                eprintln!("[E2E] spawn_blocking: calling initialize_stack");
+                let result = vllm_serve::init::initialize_stack(&config);
+                eprintln!("[E2E] initialize_stack returned: {}", result.is_ok());
+                result
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("initialize_stack timed out after {init_timeout:?}"))?
+        .context("initialize_stack panicked")?
+        .context("failed to initialize stack")?;
+        eprintln!("[E2E] stack initialized successfully");
 
         // Configure tool call parser if requested.
         if let Some(ref parser_name) = self.tool_call_parser {
@@ -390,8 +399,11 @@ impl TestServerBuilder {
 }
 
 /// Resolve the path to the `vllm` binary for child-process mode.
+///
+/// Builds the CLI binary if it doesn't exist or is stale relative to the
+/// test binary. This ensures E2E tests always run against current code.
 fn resolve_binary_path() -> Result<std::path::PathBuf> {
-    // 1. Explicit env var override.
+    // 1. Explicit env var override — skip auto-build.
     if let Ok(p) = std::env::var("VLLM_TEST_BINARY") {
         let path = std::path::PathBuf::from(p);
         if path.exists() {
@@ -403,10 +415,8 @@ fn resolve_binary_path() -> Result<std::path::PathBuf> {
         );
     }
 
-    // 2. Walk up from the current exe dir to find `target/{profile}/vllm`.
-    //    Integration test binaries live in `target/{profile}/deps/`, so the
-    //    vllm binary is at `../vllm` relative to the test binary.
-    if let Some(dir) = std::env::current_exe()
+    // 2. Locate the binary next to the test binary.
+    let (profile_dir, binary_path) = if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|p| p.to_path_buf()))
     {
@@ -416,12 +426,73 @@ fn resolve_binary_path() -> Result<std::path::PathBuf> {
             dir
         };
         let candidate = profile_dir.join("vllm");
-        if candidate.exists() {
-            return Ok(candidate);
+        (Some(profile_dir), Some(candidate))
+    } else {
+        (None, None)
+    };
+
+    // 3. Check if the binary exists and is up-to-date.
+    //    If the test binary is newer than the vllm binary, rebuild.
+    let needs_build = match &binary_path {
+        Some(path) if path.exists() => {
+            // Check if test binary is newer (meaning source changed).
+            let test_mtime = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.metadata().ok())
+                .and_then(|m| m.modified().ok());
+            let bin_mtime = path.metadata().ok().and_then(|m| m.modified().ok());
+            match (test_mtime, bin_mtime) {
+                (Some(t), Some(b)) => t > b,
+                _ => false,
+            }
+        }
+        _ => true,
+    };
+
+    if needs_build {
+        // Determine profile from the path (release vs debug).
+        let is_release = profile_dir
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "release");
+
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.arg("build").arg("-p").arg("vllm-cli");
+        if is_release {
+            cmd.arg("--release");
+        }
+
+        // Forward feature flags from env if set by the test build.
+        // The E2E test Cargo invocation sets these features on vllm-e2e,
+        // but we need them on vllm-cli too.
+        let mut features = Vec::new();
+        if cfg!(feature = "cuda") {
+            features.push("cuda");
+        }
+        if cfg!(feature = "metal") {
+            features.push("metal");
+        }
+        if !features.is_empty() {
+            cmd.arg("--features").arg(features.join(","));
+        }
+
+        eprintln!("[E2E] Building vllm binary: {:?}", cmd);
+        let status = cmd
+            .status()
+            .context("failed to run cargo build for vllm-cli")?;
+        if !status.success() {
+            anyhow::bail!("cargo build -p vllm-cli failed with {status}");
         }
     }
 
-    // 3. Common fallback paths relative to workspace root.
+    // Return the binary path.
+    if let Some(path) = binary_path
+        && path.exists()
+    {
+        return Ok(path);
+    }
+
+    // Fallback.
     for candidate in &["target/release/vllm", "target/debug/vllm"] {
         let path = std::path::PathBuf::from(candidate);
         if path.exists() {
@@ -430,7 +501,7 @@ fn resolve_binary_path() -> Result<std::path::PathBuf> {
     }
 
     anyhow::bail!(
-        "Could not find the vllm binary. Set VLLM_TEST_BINARY or build with `cargo build -p vllm-cli`."
+        "Could not find the vllm binary after build. Set VLLM_TEST_BINARY or build with `cargo build -p vllm-cli`."
     )
 }
 
@@ -441,6 +512,43 @@ async fn wait_for_health(base_url: &str, timeout: Duration) -> Result<()> {
     let start = std::time::Instant::now();
 
     loop {
+        if start.elapsed() > timeout {
+            anyhow::bail!(
+                "Server did not become healthy within {}s",
+                timeout.as_secs()
+            );
+        }
+
+        match client.get(&health_url).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            _ => {}
+        }
+
+        tokio::time::sleep(HEALTH_POLL_INTERVAL).await;
+    }
+}
+
+/// Like `wait_for_health` but also checks if the child process has exited
+/// (e.g. panic, assertion failure). Fails fast instead of waiting the full
+/// timeout.
+async fn wait_for_health_with_child(
+    base_url: &str,
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let health_url = format!("{base_url}/health");
+    let start = std::time::Instant::now();
+
+    loop {
+        // Fail fast: check if child exited.
+        if let Some(status) = child.try_wait().context("failed to check child status")? {
+            anyhow::bail!(
+                "Server child process exited before becoming healthy ({})",
+                status
+            );
+        }
+
         if start.elapsed() > timeout {
             anyhow::bail!(
                 "Server did not become healthy within {}s",

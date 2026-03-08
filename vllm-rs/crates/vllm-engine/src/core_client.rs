@@ -10,12 +10,15 @@
 //!
 //! Port of: `vllm/v1/engine/core_client.py`
 
+use std::collections::HashMap;
+
+use tracing::info;
 use vllm_common::{EngineCoreOutputs, EngineCoreRequest, Request};
 use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_protocol::messages::PauseMode;
 
 use crate::engine_core::{EngineCore, EngineCoreConfig, StepOutputs};
-use crate::error::EngineResult;
+use crate::error::{EngineError, EngineResult};
 use crate::executor::{Executor, ModelRunnerOutput};
 
 // ---------------------------------------------------------------------------
@@ -114,25 +117,103 @@ pub trait EngineCoreClient {
 
 /// In-process engine core client.
 ///
-/// Directly calls methods on an `EngineCore` instance. Used for V0-style
-/// synchronous `add_request()` + `step()` usage patterns.
+/// Directly calls methods on an `EngineCore` instance. When async scheduling
+/// is enabled, spawns a background executor thread with a 2-batch pipeline
+/// to overlap CPU scheduling with GPU execution (matching Python's
+/// `EngineCore.step_with_batch_queue()`).
 ///
 /// Port of: `vllm/v1/engine/core_client.py::InprocClient`
 pub struct InprocClient {
     engine: EngineCore,
+    /// Pipeline state for async scheduling. `None` when async scheduling is
+    /// disabled (falls back to synchronous `step()`).
+    pipeline: Option<PipelineState>,
+}
+
+/// Background executor thread state for pipelined execution.
+struct PipelineState {
+    sched_tx: std::sync::mpsc::SyncSender<SchedulerOutput>,
+    result_rx: std::sync::mpsc::Receiver<(SchedulerOutput, EngineResult<ModelRunnerOutput>)>,
+    /// Deferred (sched, model_output) from the previous step, to be finalized
+    /// at the start of the next `get_output()` call.
+    deferred: Option<(SchedulerOutput, ModelRunnerOutput)>,
+    /// Number of batches currently in-flight on the executor thread.
+    gpu_in_flight: u32,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+/// Background executor thread loop: receives scheduler outputs, runs
+/// `execute_model`, and sends back results.
+fn executor_bg_loop(
+    mut executor: Box<dyn Executor>,
+    rx: std::sync::mpsc::Receiver<SchedulerOutput>,
+    tx: std::sync::mpsc::SyncSender<(SchedulerOutput, EngineResult<ModelRunnerOutput>)>,
+) {
+    while let Ok(sched) = rx.recv() {
+        let result = executor.execute_model(&sched);
+        if tx.send((sched, result)).is_err() {
+            break; // Main thread dropped its receiver.
+        }
+    }
+    executor.shutdown();
 }
 
 impl InprocClient {
     /// Create a new in-process client, initializing the engine core.
+    ///
+    /// When `async_scheduling` is enabled, the pipeline thread is started
+    /// lazily on the first `get_output()` call. This allows the server path
+    /// to call `take_executor()` first for its own background thread.
     pub fn new(config: EngineCoreConfig, executor: Box<dyn Executor>) -> Self {
         Self {
             engine: EngineCore::new(config, executor),
+            pipeline: None,
+        }
+    }
+
+    /// Start the background executor pipeline for overlapping CPU scheduling
+    /// with GPU execution. Called explicitly by the LLM path.
+    ///
+    /// Does nothing if the pipeline is already started or the executor has
+    /// been taken by the server path.
+    pub fn start_pipeline(&mut self) {
+        if self.pipeline.is_some() {
+            return;
+        }
+        if let Some(executor) = self.engine.take_executor() {
+            info!("InprocClient: spawning background executor thread for pipelined execution");
+            let (sched_tx, sched_rx) = std::sync::mpsc::sync_channel::<SchedulerOutput>(2);
+            let (result_tx, result_rx) = std::sync::mpsc::sync_channel(2);
+            let thread = std::thread::Builder::new()
+                .name("vllm-executor".into())
+                .spawn(move || executor_bg_loop(executor, sched_rx, result_tx))
+                .expect("failed to spawn executor thread");
+            self.pipeline = Some(PipelineState {
+                sched_tx,
+                result_rx,
+                deferred: None,
+                gpu_in_flight: 0,
+                _thread: thread,
+            });
         }
     }
 
     /// Get a reference to the inner engine core.
     pub fn engine(&self) -> &EngineCore {
         &self.engine
+    }
+
+    /// Whether there are unfinished requests (including pipelined in-flight).
+    pub fn has_unfinished_requests(&self) -> bool {
+        if self.engine.has_unfinished_requests() {
+            return true;
+        }
+        if let Some(ref pipeline) = self.pipeline
+            && (pipeline.gpu_in_flight > 0 || pipeline.deferred.is_some())
+        {
+            return true;
+        }
+        false
     }
 
     /// Get a mutable reference to the inner engine core.
@@ -160,19 +241,68 @@ impl InprocClient {
         self.engine.add_request(request);
         Ok(())
     }
+
+    /// Pipelined get_output matching Python's `step_with_batch_queue`.
+    ///
+    /// 1. Finalize the deferred (previous) step's output.
+    /// 2. Pre-schedule: fill pipeline up to 2 in-flight batches.
+    /// 3. Block on the oldest GPU result, store as deferred.
+    fn get_output_pipelined(
+        engine: &mut EngineCore,
+        pipeline: &mut PipelineState,
+    ) -> EngineResult<(StepOutputs, bool)> {
+        // 1. Finalize previous deferred result.
+        let mut prev_outputs: StepOutputs = HashMap::new();
+        let mut had_prev = false;
+        if let Some((prev_sched, prev_output)) = pipeline.deferred.take() {
+            prev_outputs = engine.finalize_step(&prev_sched, &prev_output);
+            had_prev = true;
+        }
+
+        // 2. Pre-schedule: fill pipeline up to 2 in-flight batches.
+        while pipeline.gpu_in_flight < 2 {
+            if let Some(sched) = engine.schedule_next() {
+                if pipeline.sched_tx.send(sched).is_err() {
+                    return Err(EngineError::Executor("executor thread exited".into()));
+                }
+                pipeline.gpu_in_flight += 1;
+            } else {
+                break;
+            }
+        }
+
+        // 3. Block on oldest GPU result.
+        if pipeline.gpu_in_flight > 0 {
+            let (sched, result) = pipeline
+                .result_rx
+                .recv()
+                .map_err(|_| EngineError::Executor("executor thread exited".into()))?;
+            let model_output = result?;
+            pipeline.deferred = Some((sched, model_output));
+            pipeline.gpu_in_flight -= 1;
+        }
+
+        Ok((
+            prev_outputs,
+            had_prev || pipeline.gpu_in_flight > 0 || pipeline.deferred.is_some(),
+        ))
+    }
 }
 
 impl EngineCoreClient for InprocClient {
     fn get_output(&mut self) -> EngineResult<(EngineCoreOutputs, bool)> {
-        let (outputs, model_executed) = self.engine.step()?;
+        let (outputs, model_executed) = if let Some(ref mut pipeline) = self.pipeline {
+            // Pipelined path: overlap CPU scheduling with GPU execution.
+            Self::get_output_pipelined(&mut self.engine, pipeline)?
+        } else {
+            // Synchronous path.
+            self.engine.step()?
+        };
 
         // Merge all client outputs into a single EngineCoreOutputs.
-        // In the in-process case, there's typically just one client (index 0).
         if outputs.is_empty() {
             return Ok((EngineCoreOutputs::default(), model_executed));
         }
-
-        // Return client 0's outputs, or merge all clients.
         if let Some(out) = outputs.into_values().next() {
             Ok((out, model_executed))
         } else {

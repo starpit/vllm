@@ -305,7 +305,11 @@ impl LLM {
 
     /// Internal constructor from a fully-specified config.
     fn from_config(config: VllmConfig) -> Result<Self> {
-        let stack = crate::init::initialize_stack_sync(&config)?;
+        let mut stack = crate::init::initialize_stack_sync(&config)?;
+        // Start the background executor pipeline for overlapping CPU
+        // scheduling with GPU execution (the server path uses its own
+        // pipeline via spawn_step_loop_async instead).
+        stack.client.start_pipeline();
         Ok(Self {
             client: stack.client,
             tokenizer: stack.tokenizer,
@@ -486,7 +490,7 @@ impl LLM {
         let mut total_in_toks: usize = 0;
         let mut total_out_toks: usize = 0;
 
-        while self.client.engine().has_unfinished_requests() {
+        while self.client.has_unfinished_requests() {
             let (outputs, _) = self
                 .client
                 .get_output()
@@ -690,7 +694,7 @@ impl LLM {
         });
         let mut full_text = String::new();
 
-        while self.client.engine().has_unfinished_requests() {
+        while self.client.has_unfinished_requests() {
             let (outputs, _) = self
                 .client
                 .get_output()

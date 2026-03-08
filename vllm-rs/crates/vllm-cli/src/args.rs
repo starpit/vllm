@@ -201,7 +201,7 @@ pub struct ServeArgs {
     /// Comma-separated CUDA graph capture batch sizes.
     /// CUDA graphs accelerate decode steps by replaying a captured kernel
     /// sequence in a single driver call.
-    #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
+    #[arg(long, default_value = "auto")]
     pub cuda_graph_sizes: String,
 
     /// Disable CUDA graphs and run all steps eagerly.

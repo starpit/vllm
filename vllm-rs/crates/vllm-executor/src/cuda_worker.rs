@@ -1218,6 +1218,12 @@ impl Worker for CudaWorker {
         };
         let use_graph = graph_bs.is_some();
 
+        if is_decode && !use_graph {
+            tracing::debug!(
+                "CUDA graph miss: decode bs={num_reqs} has no matching graph"
+            );
+        }
+
         // Check if all requests are greedy (temp < 1e-6). Used to decide
         // whether to use the in-graph argmax fast path.
         let all_greedy = prepared.req_inputs.iter().all(|r| {
@@ -1930,7 +1936,18 @@ impl Worker for CudaWorker {
         // Capture CUDA graphs for common decode batch sizes.
         // During decode, every request has q_len=1, so shapes are deterministic.
         let capture_sizes = if self.config.cuda_graph_sizes.is_empty() {
-            vec![1, 2, 4, 8, 16, 32]
+            // Match Python vLLM's capture sizes: [1, 2, 4] + range(8, 256, 8) + range(256, 512+1, 16)
+            let mut sizes = vec![1, 2, 4];
+            let mut s = 8;
+            while s < 256 {
+                sizes.push(s);
+                s += 8;
+            }
+            while s <= 512 {
+                sizes.push(s);
+                s += 16;
+            }
+            sizes
         } else {
             self.config.cuda_graph_sizes.clone()
         };

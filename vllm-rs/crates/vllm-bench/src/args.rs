@@ -92,7 +92,7 @@ pub struct BenchLatencyArgs {
     pub max_model_len: Option<usize>,
 
     /// Maximum number of concurrent sequences.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 128)]
     pub max_num_seqs: usize,
 
     /// Maximum number of tokens processed in a single scheduler iteration.
@@ -127,7 +127,7 @@ pub struct BenchLatencyArgs {
     pub enforce_eager: bool,
 
     /// Comma-separated list of batch sizes to capture as CUDA graphs.
-    #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
+    #[arg(long, default_value = "auto")]
     pub cuda_graph_sizes: String,
 
     /// Sampling temperature (0 = greedy, >0 = random sampling).
@@ -212,7 +212,7 @@ pub struct BenchThroughputArgs {
     pub max_model_len: Option<usize>,
 
     /// Maximum number of concurrent sequences.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 128)]
     pub max_num_seqs: usize,
 
     /// Maximum number of tokens processed in a single scheduler iteration.
@@ -244,7 +244,7 @@ pub struct BenchThroughputArgs {
     pub enforce_eager: bool,
 
     /// Comma-separated list of batch sizes to capture as CUDA graphs.
-    #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
+    #[arg(long, default_value = "auto")]
     pub cuda_graph_sizes: String,
 
     /// Enable prefix caching.
@@ -406,7 +406,7 @@ pub struct BenchStartupArgs {
     pub max_model_len: Option<usize>,
 
     /// Maximum number of concurrent sequences.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, default_value_t = 128)]
     pub max_num_seqs: usize,
 
     /// Maximum number of tokens processed in a single scheduler iteration.
@@ -438,7 +438,7 @@ pub struct BenchStartupArgs {
     pub enforce_eager: bool,
 
     /// Comma-separated list of batch sizes to capture as CUDA graphs.
-    #[arg(long, default_value = "1,2,4,8,16,32,64,128,256")]
+    #[arg(long, default_value = "auto")]
     pub cuda_graph_sizes: String,
 }
 

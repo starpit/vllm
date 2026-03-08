@@ -440,8 +440,6 @@ pub struct CudaWorker {
     model_dtype: GpuDType,
     resolved_architecture: Option<String>,
     is_shutdown: bool,
-    /// Backing GPU buffers for weight tensors. Must outlive `model`.
-    _weights: Option<GpuWeights>,
     /// CUDA graph runner for decode batches.
     graph_runner: Option<CudaGraphRunner>,
     /// CUDA graph runner for single-sequence prefill batches.
@@ -483,7 +481,6 @@ impl CudaWorker {
             model_dtype: GpuDType::BF16,
             resolved_architecture: None,
             is_shutdown: false,
-            _weights: None,
             graph_runner: None,
             prefill_graph_runner: None,
             last_graph_batch_size: None,
@@ -856,13 +853,10 @@ impl Worker for CudaWorker {
         let arch = hf_config.architectures.first().cloned().unwrap_or_default();
         info!("CudaWorker: architecture = {arch}");
 
-        // 5. Load weights into GPU memory.
+        // 5. Parse weight files (CPU mmap — no GPU allocation yet).
         let mut weights = GpuWeights::from_dir(&model_dir, device.compute_stream)
             .map_err(|e| ExecutorError::WorkerInit(format!("weight load failed: {e}")))?;
-        // Sync to ensure all H2D weight copies are complete before D2D concat.
-        unsafe { driver::stream_synchronize(device.compute_stream) }
-            .map_err(|e| ExecutorError::WorkerInit(format!("weight sync: {e}")))?;
-        info!("CudaWorker: loaded {} weight tensors", weights.len());
+        info!("CudaWorker: parsed {} weight tensors (CPU)", weights.len());
 
         // 6. Construct model based on architecture.
         let model = match arch.as_str() {
@@ -955,10 +949,14 @@ impl Worker for CudaWorker {
             }
         };
 
+        // Sync to ensure all async H2D weight copies are complete.
+        unsafe { driver::stream_synchronize(device.compute_stream) }
+            .map_err(|e| ExecutorError::WorkerInit(format!("weight sync: {e}")))?;
+        drop(weights); // CPU mmaps freed, GPU memory owned by model layers
+
         self.model_dtype = dtype;
         self.resolved_architecture = Some(arch);
         self.model = Some(model);
-        self._weights = Some(weights); // keep backing GPU buffers alive
         self.model_dir = Some(model_dir);
         self.hf_config = Some(hf_config);
 

@@ -833,82 +833,15 @@ impl LlamaForCausalLM {
 }
 
 // ---------------------------------------------------------------------------
-// Weight loading with D2D concat helper
-// ---------------------------------------------------------------------------
-
-/// Concatenate two GPU tensors along dimension 0 (D2D copy).
-///
-/// * `a`: `[M, K]`
-/// * `b`: `[N, K]`
-/// * Returns: `[M+N, K]` allocated persistently (not from arena).
-///
-/// # Safety
-/// Requires valid CUDA context and stream.
-pub unsafe fn concat_dim0(
-    a: GpuTensor,
-    b: GpuTensor,
-    stream: cudarc::driver::sys::CUstream,
-) -> Result<GpuTensor> {
-    debug_assert_eq!(a.ndim(), b.ndim());
-    debug_assert_eq!(a.dtype(), b.dtype());
-    // All dims except dim 0 must match.
-    for d in 1..a.ndim() {
-        debug_assert_eq!(a.dim(d), b.dim(d));
-    }
-
-    let total_bytes = a.size_bytes() + b.size_bytes();
-    let ptr = crate::driver::mem_alloc(total_bytes)?;
-
-    crate::driver::memcpy_dtod_async(ptr, a.raw_ptr() as *const u8, a.size_bytes(), stream)?;
-    crate::driver::memcpy_dtod_async(
-        ptr.add(a.size_bytes()),
-        b.raw_ptr() as *const u8,
-        b.size_bytes(),
-        stream,
-    )?;
-
-    let mut new_shape: Vec<usize> = (0..a.ndim()).map(|d| a.dim(d)).collect();
-    new_shape[0] += b.dim(0);
-
-    Ok(GpuTensor::new(ptr, &new_shape, a.dtype()))
-}
-
-/// Concatenate three GPU tensors along dimension 0.
-pub unsafe fn concat3_dim0(
-    a: GpuTensor,
-    b: GpuTensor,
-    c: GpuTensor,
-    stream: cudarc::driver::sys::CUstream,
-) -> Result<GpuTensor> {
-    let total_bytes = a.size_bytes() + b.size_bytes() + c.size_bytes();
-    let ptr = crate::driver::mem_alloc(total_bytes)?;
-
-    crate::driver::memcpy_dtod_async(ptr, a.raw_ptr() as *const u8, a.size_bytes(), stream)?;
-    crate::driver::memcpy_dtod_async(
-        ptr.add(a.size_bytes()),
-        b.raw_ptr() as *const u8,
-        b.size_bytes(),
-        stream,
-    )?;
-    crate::driver::memcpy_dtod_async(
-        ptr.add(a.size_bytes() + b.size_bytes()),
-        c.raw_ptr() as *const u8,
-        c.size_bytes(),
-        stream,
-    )?;
-
-    let mut new_shape: Vec<usize> = (0..a.ndim()).map(|d| a.dim(d)).collect();
-    new_shape[0] += b.dim(0) + c.dim(0);
-
-    Ok(GpuTensor::new(ptr, &new_shape, a.dtype()))
-}
-
-// ---------------------------------------------------------------------------
-// Proper weight loading using concat helpers
+// Fused weight loading (CPU → GPU direct)
 // ---------------------------------------------------------------------------
 
 impl LlamaAttention {
-    /// Load with D2D-fused QKV weights.
+    /// Load with fused QKV weights — streams directly from CPU to GPU.
+    ///
+    /// Matches Python vLLM's QKVParallelLinear weight_loader: pre-allocates the
+    /// fused [q+k+v, hidden] tensor, then copies each component from CPU to the
+    /// correct offset. No intermediate GPU copies.
     pub fn load_fused(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -922,48 +855,59 @@ impl LlamaAttention {
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
 
-        let q_w = weights.take(&format!("{prefix}.q_proj.weight"))?;
-        let k_w = weights.take(&format!("{prefix}.k_proj.weight"))?;
-        let v_w = weights.take(&format!("{prefix}.v_proj.weight"))?;
+        // Get shapes/dtypes from CPU metadata to pre-allocate fused tensor.
+        let q_name = format!("{prefix}.q_proj.weight");
+        let k_name = format!("{prefix}.k_proj.weight");
+        let v_name = format!("{prefix}.v_proj.weight");
 
-        // Fuse: [q_size + 2*kv_size, hidden]
-        let qkv_w = unsafe { concat3_dim0(q_w, k_w, v_w, stream)? };
+        let (q_shape, q_dtype) = weights
+            .tensor_info(&q_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {q_name}"))?;
+        let hidden = if q_shape.len() == 2 { q_shape[1] } else { 1 };
+        let elem_size = q_dtype.size_bytes();
+        let q_bytes = q_size * hidden * elem_size;
+        let kv_bytes = kv_size * hidden * elem_size;
+        let total_bytes = q_bytes + 2 * kv_bytes;
+
+        // Pre-allocate fused QKV tensor on GPU.
+        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+
+        // Stream each component directly from CPU → GPU offset.
+        unsafe {
+            weights.take_into(&q_name, ptr, stream)?;
+            weights.take_into(&k_name, ptr.add(q_bytes), stream)?;
+            weights.take_into(&v_name, ptr.add(q_bytes + kv_bytes), stream)?;
+        }
+
+        let qkv_w = unsafe { GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden], q_dtype) };
 
         // Fuse QKV bias if present (Qwen2 has QKV bias, LLaMA doesn't).
         let q_bias_name = format!("{prefix}.q_proj.bias");
         let k_bias_name = format!("{prefix}.k_proj.bias");
         let v_bias_name = format!("{prefix}.v_proj.bias");
         let qkv_bias = if weights.contains(&q_bias_name) {
-            let q_b = weights.take(&q_bias_name)?;
-            let k_b = weights.take(&k_bias_name)?;
-            let v_b = weights.take(&v_bias_name)?;
-            // Reshape [size] → [size, 1] for concat_dim0, then squeeze back.
-            // Actually concat3_dim0 works on any ndim where dims after 0 match.
-            // For 1-D tensors [q_size], [kv_size], [kv_size] → [q_size + 2*kv_size].
-            // Use a simple D2D concat for 1-D:
-            let total = q_b.numel() + k_b.numel() + v_b.numel();
-            let ptr = unsafe { crate::driver::mem_alloc(total * q_b.dtype().size_bytes())? };
+            let (q_b_shape, q_b_dtype) = weights
+                .tensor_info(&q_bias_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {q_bias_name}"))?;
+            let q_b_bytes = q_b_shape.iter().product::<usize>() * q_b_dtype.size_bytes();
+            let (k_b_shape, _) = weights
+                .tensor_info(&k_bias_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {k_bias_name}"))?;
+            let k_b_bytes = k_b_shape.iter().product::<usize>() * q_b_dtype.size_bytes();
+            let (v_b_shape, _) = weights
+                .tensor_info(&v_bias_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {v_bias_name}"))?;
+            let v_b_bytes = v_b_shape.iter().product::<usize>() * q_b_dtype.size_bytes();
+            let total_bias_bytes = q_b_bytes + k_b_bytes + v_b_bytes;
+            let total_elems = total_bias_bytes / q_b_dtype.size_bytes();
+
+            let bias_ptr = unsafe { crate::driver::mem_alloc(total_bias_bytes)? };
             unsafe {
-                crate::driver::memcpy_dtod_async(
-                    ptr,
-                    q_b.raw_ptr() as *const u8,
-                    q_b.size_bytes(),
-                    stream,
-                )?;
-                crate::driver::memcpy_dtod_async(
-                    ptr.add(q_b.size_bytes()),
-                    k_b.raw_ptr() as *const u8,
-                    k_b.size_bytes(),
-                    stream,
-                )?;
-                crate::driver::memcpy_dtod_async(
-                    ptr.add(q_b.size_bytes() + k_b.size_bytes()),
-                    v_b.raw_ptr() as *const u8,
-                    v_b.size_bytes(),
-                    stream,
-                )?;
+                weights.take_into(&q_bias_name, bias_ptr, stream)?;
+                weights.take_into(&k_bias_name, bias_ptr.add(q_b_bytes), stream)?;
+                weights.take_into(&v_bias_name, bias_ptr.add(q_b_bytes + k_b_bytes), stream)?;
             }
-            Some(unsafe { GpuTensor::new(ptr, &[total], q_b.dtype()) })
+            Some(unsafe { GpuTensor::new(bias_ptr, &[total_elems], q_b_dtype) })
         } else {
             None
         };
@@ -986,18 +930,41 @@ impl LlamaAttention {
 }
 
 impl LlamaMLP {
-    /// Load with D2D-fused gate+up weights.
+    /// Load with fused gate+up weights — streams directly from CPU to GPU.
+    ///
+    /// Matches Python vLLM's MergedColumnParallelLinear: pre-allocates the
+    /// fused [2*intermediate, hidden] tensor, then copies gate and up from CPU.
     pub fn load_fused(
         weights: &mut GpuWeights,
         prefix: &str,
         intermediate_size: usize,
         stream: cudarc::driver::sys::CUstream,
     ) -> Result<Self> {
-        let gate = weights.take(&format!("{prefix}.gate_proj.weight"))?;
-        let up = weights.take(&format!("{prefix}.up_proj.weight"))?;
+        let gate_name = format!("{prefix}.gate_proj.weight");
+        let up_name = format!("{prefix}.up_proj.weight");
 
-        // Fuse: [2*intermediate, hidden]
-        let gate_up_w = unsafe { concat_dim0(gate, up, stream)? };
+        let (gate_shape, gate_dtype) = weights
+            .tensor_info(&gate_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
+        let hidden = if gate_shape.len() == 2 {
+            gate_shape[1]
+        } else {
+            1
+        };
+        let elem_size = gate_dtype.size_bytes();
+        let gate_bytes = gate_shape.iter().product::<usize>() * elem_size;
+        let up_bytes = gate_bytes; // same shape
+
+        let total_bytes = gate_bytes + up_bytes;
+        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+
+        unsafe {
+            weights.take_into(&gate_name, ptr, stream)?;
+            weights.take_into(&up_name, ptr.add(gate_bytes), stream)?;
+        }
+
+        let gate_up_w =
+            unsafe { GpuTensor::new(ptr, &[2 * intermediate_size, hidden], gate_dtype) };
         let gate_up_proj = Linear::new(gate_up_w, None);
 
         let down_proj = Linear::load(weights, &format!("{prefix}.down_proj"))?;

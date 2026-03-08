@@ -139,9 +139,25 @@ impl Gemma2MLP {
         intermediate_size: usize,
         stream: cudarc::driver::sys::CUstream,
     ) -> Result<Self> {
-        let gate = weights.take(&format!("{prefix}.gate_proj.weight"))?;
-        let up = weights.take(&format!("{prefix}.up_proj.weight"))?;
-        let gate_up_w = unsafe { crate::model::llama::concat_dim0(gate, up, stream)? };
+        let gate_name = format!("{prefix}.gate_proj.weight");
+        let up_name = format!("{prefix}.up_proj.weight");
+        let (gate_shape, gate_dtype) = weights
+            .tensor_info(&gate_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
+        let hidden = if gate_shape.len() == 2 {
+            gate_shape[1]
+        } else {
+            1
+        };
+        let gate_bytes = gate_shape.iter().product::<usize>() * gate_dtype.size_bytes();
+        let total_bytes = gate_bytes * 2;
+        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+        unsafe {
+            weights.take_into(&gate_name, ptr, stream)?;
+            weights.take_into(&up_name, ptr.add(gate_bytes), stream)?;
+        }
+        let gate_up_w =
+            unsafe { GpuTensor::new(ptr, &[2 * intermediate_size, hidden], gate_dtype) };
         let gate_up_proj = Linear::new(gate_up_w, None);
         let down_proj = Linear::load(weights, &format!("{prefix}.down_proj"))?;
         Ok(Self {
@@ -199,10 +215,24 @@ impl Gemma2Attention {
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
 
-        let q_w = weights.take(&format!("{prefix}.q_proj.weight"))?;
-        let k_w = weights.take(&format!("{prefix}.k_proj.weight"))?;
-        let v_w = weights.take(&format!("{prefix}.v_proj.weight"))?;
-        let qkv_w = unsafe { crate::model::llama::concat3_dim0(q_w, k_w, v_w, stream)? };
+        let q_name = format!("{prefix}.q_proj.weight");
+        let k_name = format!("{prefix}.k_proj.weight");
+        let v_name = format!("{prefix}.v_proj.weight");
+        let (q_shape, q_dtype) = weights
+            .tensor_info(&q_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {q_name}"))?;
+        let hidden = if q_shape.len() == 2 { q_shape[1] } else { 1 };
+        let elem_size = q_dtype.size_bytes();
+        let q_bytes = q_size * hidden * elem_size;
+        let kv_bytes = kv_size * hidden * elem_size;
+        let total_bytes = q_bytes + 2 * kv_bytes;
+        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+        unsafe {
+            weights.take_into(&q_name, ptr, stream)?;
+            weights.take_into(&k_name, ptr.add(q_bytes), stream)?;
+            weights.take_into(&v_name, ptr.add(q_bytes + kv_bytes), stream)?;
+        }
+        let qkv_w = unsafe { GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden], q_dtype) };
         let qkv_proj = Linear::new(qkv_w, None);
 
         let o_proj = Linear::load(weights, &format!("{prefix}.o_proj"))?;

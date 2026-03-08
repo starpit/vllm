@@ -535,8 +535,61 @@ impl CachingAllocator {
         self.all_blocks.len()
     }
 
+    /// Release all free, unsplit segments back to the CUDA driver.
+    /// Matches PyTorch's `torch.cuda.empty_cache()` / `release_cached_blocks()`.
     pub fn trim(&mut self) {
-        // TODO: release unsplit segments back to driver
+        let mut freed_bytes: usize = 0;
+        let mut freed_count: usize = 0;
+
+        // First pass: identify releasable segments (collect to avoid borrow conflict).
+        // Each entry: (segment_index, head_block_ptr, seg_ptr, seg_size, is_small).
+        let mut releasable: Vec<(usize, *mut Block, *mut u8, usize, bool)> = Vec::new();
+
+        for (seg_idx, &(seg_ptr, seg_size)) in self.segments.iter().enumerate() {
+            let head = self.all_blocks.iter().find(|&&bp| {
+                let b = unsafe { &*bp };
+                b.ptr == seg_ptr && b.prev.is_null()
+            });
+
+            let Some(&head_ptr) = head else { continue };
+            let head_block = unsafe { &*head_ptr };
+
+            if head_block.next.is_null() && !head_block.allocated && head_block.size == seg_size {
+                releasable.push((
+                    seg_idx,
+                    head_ptr,
+                    seg_ptr,
+                    seg_size,
+                    head_block.pool_is_small,
+                ));
+            }
+        }
+
+        // Second pass: release them.
+        let mut to_remove: Vec<usize> = Vec::with_capacity(releasable.len());
+        for (seg_idx, head_ptr, seg_ptr, seg_size, is_small) in releasable {
+            self.get_pool_by_flag(is_small).remove(head_ptr);
+            unsafe {
+                let _ = driver::mem_free(seg_ptr);
+            }
+            freed_bytes += seg_size;
+            freed_count += 1;
+            to_remove.push(seg_idx);
+        }
+
+        // Remove segments in reverse order to keep indices valid.
+        to_remove.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in to_remove {
+            self.segments.swap_remove(idx);
+        }
+
+        if freed_count > 0 {
+            tracing::debug!(
+                "CachingAllocator::trim: released {freed_count} segments, \
+                 {:.1} MiB back to CUDA driver",
+                freed_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
     }
 }
 
@@ -792,6 +845,46 @@ mod tests {
                 alloc.free(p2, 1024);
                 alloc.free(p3, 2048);
             }
+        }
+
+        #[test]
+        fn test_trim_releases_free_segments() {
+            init_cuda();
+            let mut alloc = CachingAllocator::new();
+
+            // Allocate from two different segments (small + large).
+            let p1 = alloc.alloc(512); // small pool → 2 MB segment
+            let p2 = alloc.alloc(2 * 1024 * 1024); // large pool → 20 MB segment
+            assert_eq!(alloc.segments.len(), 2);
+
+            // Free both — blocks coalesce back to full segments.
+            unsafe {
+                alloc.free(p1, 512);
+                alloc.free(p2, 2 * 1024 * 1024);
+            }
+
+            // trim() should release both segments.
+            alloc.trim();
+            assert_eq!(alloc.segments.len(), 0);
+            assert_eq!(alloc.free_block_count(), 0);
+        }
+
+        #[test]
+        fn test_trim_keeps_split_segments() {
+            init_cuda();
+            let mut alloc = CachingAllocator::new();
+
+            // Allocate two blocks from one segment.
+            let p1 = alloc.alloc(512);
+            let _p2 = alloc.alloc(1024);
+            assert_eq!(alloc.segments.len(), 1);
+
+            // Free only the first — segment is still split (p2 allocated).
+            unsafe { alloc.free(p1, 512) };
+
+            // trim() should NOT release (segment is split).
+            alloc.trim();
+            assert_eq!(alloc.segments.len(), 1);
         }
     }
 }

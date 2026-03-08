@@ -2,17 +2,30 @@
 
 ## Current State
 
-**Throughput (default, 1000 prompts)**: Rust 12.14 req/s vs Python 17.41 req/s (~30% gap)
-**Throughput (200 prompts)**: Rust 15.47 req/s vs Python 18.74 req/s (~17% gap)
+**Throughput (default, 1000 prompts)**: Rust 12.17 req/s vs Python 17.41 req/s (~30% gap)
+**Throughput (200 prompts)**: Rust 15.77 req/s vs Python 18.74 req/s (~16% gap)
 **Latency**: Rust ~1.306s vs Python ~1.30s (~0.5% gap)
 
 All benchmarks: `vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct` (defaults: 1000 prompts, 1024 input, 128 output)
 
 ### What's been done this session
-- **FA2 num_splits=1**: Removed Rust-side split-K heuristic for paged attention. Python's upstream `vllm-flash-attn` C code always sets `params.num_splits = 1`. Our code was computing num_splits > 1 for small batches, causing the expensive split-K path unnecessarily. (Latency improved from 1.33s to 1.306s.)
-- **Defaults match Python**: `max_num_seqs=256`, `max_num_batched_tokens=8192` — verified against Python `arg_utils.py` `LLM_CLASS` context.
-- **KV cache memory sizing matches Python's formula**: `total * util - (weights + peak_activations + 150MB)`. Previously we reserved `6 * peak_activations` as headroom, resulting in only 365K KV tokens. Now we get 794K tokens (Python: 975K). GPU memory usage: Rust 41GB vs Python 42.7GB.
-- **nsys profiling done for both Python and Rust** — see findings below.
+
+- **`CachingAllocator::trim()` implemented** (`alloc.rs`): Releases free unsplit segments back to CUDA driver via `cuMemFree`. After profiling dry-run, frees ~3 GiB of activation memory back to CUDA so it can be used for KV cache. Matches PyTorch's `release_cached_blocks()`.
+
+- **Streaming weight loading** (`weights.rs`, `llama.rs`, `gemma2.rs`, `cuda_worker.rs`): Rewrote `GpuWeights` to match Python vLLM's approach — weights stay on CPU (mmap'd safetensors files) and are copied to GPU one at a time via `take()`. Fused weights (QKV, gate_up) use `take_into()` to copy directly from CPU → GPU offset in a pre-allocated buffer. No more shard-level GPU buffers. Saves ~3.4 GiB of GPU memory during model loading.
+
+- **nsys steady-state analysis**: Profiled with `--delay` to isolate steady-state from startup. Found that the 61 `cuStreamSynchronize` calls are ALL from cublasLt algorithm benchmarking during startup (one-time cost). In steady state, both Rust and Python use only event-based sync — no unnecessary stream syncs to eliminate.
+
+### Memory improvements
+
+| Metric | Before | After | Python |
+|--------|--------|-------|--------|
+| weights+overhead | 9.6 GiB | **6.2 GiB** | 5.79 GiB |
+| Available KV cache | 27.3 GiB | **30.6 GiB** | 33.49 GiB |
+| KV cache blocks | 49,613 | **55,697** | ~60,975 |
+| nvidia-smi usage | 41,080 MiB | **~43,000 MiB** | 42,742 MiB |
+
+Remaining ~2.9 GiB gap: peak activations are 3.0 GiB vs Python's ~0.5 GiB. Python's `torch.compile` fuses operations and reduces intermediate tensor sizes.
 
 ### What was already done (prior sessions)
 - Background executor thread with 2-batch pipeline — matches Python's `step_with_batch_queue`
@@ -21,34 +34,47 @@ All benchmarks: `vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct` (defaul
 - PyTorch-style caching allocator (replaces arena)
 - Fused CUDA kernels: rms_norm, fused_add_rms_norm, silu_and_mul, rotary, embedding_gather, reshape_and_cache
 - In-graph argmax for greedy decode
+- FA2 num_splits=1, defaults match Python, KV cache memory formula match
 
-### nsys profiling findings (200 prompts, Qwen2.5-3B)
+### nsys profiling findings
 
-**GPU kernels are faster in Rust** — the bottleneck is CPU-side:
+**Startup (full run, 50 prompts):**
+
+| Metric | Rust | Python |
+|--------|------|--------|
+| cuStreamSynchronize | 61 calls, 1.51s | 0 calls |
+| cuEventSynchronize | 135 calls, 3.72s | — |
+| cudaEventSynchronize | — | 113 calls, 7.53s |
+| cudaDeviceSynchronize | — | 29 calls, 3.7ms |
+
+The 61 Rust `cuStreamSynchronize` are from cublasLt algorithm benchmarking (3-10 algos × ~6 unique GEMM shapes = ~60 syncs). One-time startup cost, not a per-step issue.
+
+**Steady-state (captured with `--delay` to skip startup):**
+
+| Metric | Rust (10s capture) | Python (10s capture) |
+|--------|-------------------|---------------------|
+| cuStreamSynchronize | **0** | — |
+| cuEventSynchronize | 138 calls | — |
+| cudaEventSynchronize | — | 113 calls |
+| cudaDeviceSynchronize | — | 29 calls |
+
+Both use only event-based sync in steady state. No unnecessary stream syncs.
+
+**GPU kernels are faster in Rust** — the bottleneck is CPU-side (eager prefill dispatch overhead):
 
 | Metric | Rust | Python |
 |--------|------|--------|
 | GPU kernel time | 8.4s | 9.2s |
 | Wall time | 12.8s | ~10.7s |
 | **GPU idle time** | **4.4s (34%)** | **~1.5s (14%)** |
-| GPU memory | 41 GB | 42.7 GB |
-| cuStreamSynchronize | 61 calls, 1.57s | — |
-| cudaDeviceSynchronize | — | 2069 calls, 160ms |
-| H2D copies | 1371, 841ms | 2543, 1027ms |
-| cuMemFree | 138, 103ms | 135, 42ms |
-| Graph launches | 128, 84ms | 127, 42ms |
 
-### Memory gap: Rust 41 GB vs Python 42.7 GB (~1.7 GB short)
+### Root causes of remaining throughput gap
 
-After fixing the KV cache formula, Rust allocates 794K KV tokens vs Python's 975K. The remaining ~1.7 GB gap is because our `CachingAllocator::trim()` is a no-op (`alloc.rs` line 538) — it never returns memory to CUDA after the profiling dry-run. Python's PyTorch allocator does `torch.cuda.empty_cache()` after profiling, freeing temp allocations back to CUDA, so that memory becomes available for KV cache. Fix: implement `trim()` to release unsplit segments back to the driver via `cuMemFree`.
+1. **Prefill path runs eager (no CUDA graphs or torch.compile equivalent)** — `cuda_worker.rs`: `let use_prefill_graph = false`. Python uses `torch.compile` for prefill, fusing everything into optimized kernels with minimal CPU dispatch overhead. Our eager prefill launches ~100+ individual kernels per step. This is the primary cause of the 34% GPU idle time.
 
-### Root causes of GPU idle time (next steps)
+2. **Peak activation memory gap (3.0 GiB vs ~0.5 GiB)** — Without torch.compile fusing, our eager forward pass materializes more intermediate tensors, consuming more memory. This reduces available KV cache, which may cause more preemption under heavy load.
 
-1. **61 `cuStreamSynchronize` calls (1.57s total, avg 25ms each)** — explicit GPU sync points in `execute_model` that block the CPU from scheduling the next batch. Python keeps everything async until the final D2H copy. Find and eliminate these.
-
-2. **Prefill path runs eager (no CUDA graphs)** — `cuda_worker.rs` line 1838: `let use_prefill_graph = false`. Comment: "Prefill graphs are disabled: they capture paged FA2 which produces incorrect results for q_len > 1." Python uses torch.compile for prefill, fusing everything into an optimized graph. Our eager prefill launches ~100+ individual kernels per step with CPU dispatch overhead between each. Fix the FA2 correctness issue and enable prefill graphs.
-
-3. **Batch transition stalls** — every 256 sequences in a 1000-prompt run, ~256 new prefills must be chunked through the scheduler. During these transitions, there is a multi-second gap where no completions are reported. Python has these too but they are much shorter. The eager prefill path (cause #2) makes these worse.
+3. **Batch transition stalls** — every 256 sequences in a 1000-prompt run, ~256 new prefills must be chunked. During these transitions, the eager prefill path (cause #1) makes these slower.
 
 ## Rules of the Road
 
@@ -75,15 +101,17 @@ Both use defaults: 1000 prompts, 1024 input tokens, 128 output tokens, greedy de
 
 **nsys profiling** (use --num-prompts 200 to keep profiles manageable):
 ```bash
-# Rust
-nsys profile -o /tmp/rust_throughput --force-overwrite=true \
-  ./target/release/vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct --num-prompts 200
-nsys stats /tmp/rust_throughput.nsys-rep --report cuda_gpu_kern_sum --force-export=true
-nsys stats /tmp/rust_throughput.nsys-rep --report cuda_api_sum --force-export=true
+# Rust — full run
+nsys profile -o /tmp/rust_throughput --force-overwrite=true --stats=true \
+  ./target/release/vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct --num-prompts 50
 
-# Python (must use --trace-fork-before-exec=true to capture child engine process)
-nsys profile -o /tmp/python_throughput --force-overwrite=true --trace-fork-before-exec=true \
-  bash -c 'source /root/vllm/.venv/bin/activate && vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct --num-prompts 200'
+# Rust — steady-state only (skip startup)
+nsys profile -o /tmp/rust_steady --force-overwrite=true --stats=true --delay=8 --duration=10 \
+  ./target/release/vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct --num-prompts 200
+
+# Python (on nick3)
+nsys profile -o /tmp/python_steady --force-overwrite=true --stats=true --delay=25 --duration=10 \
+  vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct --num-prompts 200
 ```
 
 ## Pod Details
@@ -105,6 +133,7 @@ All pods: CUDA 12.9, always `export RUSTC_WRAPPER=/usr/bin/sccache` on nick/nick
 - **KV cache memory formula**: `crates/vllm-executor/src/cuda_worker.rs` — `compute_available_kv_bytes`
 - **CUDA graphs**: `crates/vllm-cuda/src/graph.rs`
 - **Caching allocator**: `crates/vllm-cuda/src/alloc.rs` — `CachingAllocator`
+- **Weight loading**: `crates/vllm-cuda/src/weights.rs` — `GpuWeights` (streaming CPU→GPU)
 - **CUDA kernels**: `crates/vllm-cuda/csrc/` and `crates/vllm-cuda/src/kernels.rs`
 - **FlashAttention-2**: `third_party/vllm-flash-attn/`
 

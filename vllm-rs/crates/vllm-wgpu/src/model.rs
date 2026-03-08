@@ -1245,12 +1245,58 @@ impl WgpuWorker {
     /// Profiled forward pass — syncs GPU at strategic points to measure actual GPU time.
     /// Returns (next_token_id, profile_report_string).
     /// Uses 3 sync points: after attention half, after MLP half, and at layer boundaries.
+    /// Estimate total GPU buffer memory used by weights + KV caches (bytes).
+    pub fn gpu_buffer_bytes(&self) -> usize {
+        let mut total = 0usize;
+        if let Some(w) = &self.weights {
+            total += w.embed_tokens.size_bytes();
+            total += w.norm.size_bytes();
+            total += w.lm_head.size_bytes();
+            total += w.lm_head_t.size_bytes();
+            for layer in &w.layers {
+                total += layer.input_layernorm.size_bytes();
+                total += layer.post_attention_layernorm.size_bytes();
+                total += layer.qkv_proj.weight.size_bytes();
+                total += layer.qkv_proj.weight_t.size_bytes();
+                if let Some(b) = &layer.qkv_proj.bias {
+                    total += b.size_bytes();
+                }
+                total += layer.o_proj.weight.size_bytes();
+                total += layer.o_proj.weight_t.size_bytes();
+                if let Some(b) = &layer.o_proj.bias {
+                    total += b.size_bytes();
+                }
+                total += layer.gate_up_proj.weight.size_bytes();
+                total += layer.gate_up_proj.weight_t.size_bytes();
+                if let Some(b) = &layer.gate_up_proj.bias {
+                    total += b.size_bytes();
+                }
+                total += layer.down_proj.weight.size_bytes();
+                total += layer.down_proj.weight_t.size_bytes();
+                if let Some(b) = &layer.down_proj.bias {
+                    total += b.size_bytes();
+                }
+            }
+        }
+        for cache in &self.kv_caches {
+            total += cache.k.size_bytes();
+            total += cache.v.size_bytes();
+        }
+        if let Some(c) = &self.cos_cache {
+            total += c.size_bytes();
+        }
+        if let Some(s) = &self.sin_cache {
+            total += s.size_bytes();
+        }
+        total
+    }
+
     pub async fn forward_one_profiled(
         &mut self,
         token_id: u32,
         position: usize,
-    ) -> Result<(u32, String), crate::WgpuError> {
-        use std::time::Instant;
+    ) -> Result<(u32, String, Vec<f64>), crate::WgpuError> {
+        use web_time::Instant;
 
         let weights = self
             .weights
@@ -1270,6 +1316,7 @@ impl WgpuWorker {
         // Per-layer phase timings
         let mut t_attn_half = 0.0f64; // rope + attention + o_proj
         let mut t_mlp_half = 0.0f64; // fused_gate_up + silu + down_proj + fused_next_qkv
+        let mut per_layer_ms: Vec<f64> = Vec::with_capacity(num_layers);
 
         let sync = || {
             self.device.flush();
@@ -1298,6 +1345,7 @@ impl WgpuWorker {
             let cache = &mut self.kv_caches[layer_idx];
 
             // --- Attention half: rope + attention + o_proj ---
+            let t_layer_start = Instant::now();
             let t0 = Instant::now();
             let q_rope_flat = ops::rope_slice_cache(
                 &qkv,
@@ -1366,6 +1414,7 @@ impl WgpuWorker {
             }
             sync();
             t_mlp_half += t0.elapsed().as_secs_f64() * 1000.0;
+            per_layer_ms.push(t_layer_start.elapsed().as_secs_f64() * 1000.0);
         }
 
         // 3. Final norm + lm_head
@@ -1437,7 +1486,7 @@ impl WgpuWorker {
             total_bw,
         );
 
-        Ok((max_idx, report))
+        Ok((max_idx, report, per_layer_ms))
     }
 }
 

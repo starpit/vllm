@@ -221,7 +221,7 @@ fn main() {
         // Profile a single decode step
         let pos = ids.len();
         let last_token = *ids.last().unwrap_or(&1);
-        let (_tok, report) =
+        let (_tok, report, _layer_times) =
             pollster::block_on(engine.worker.forward_one_profiled(last_token, pos)).unwrap();
         println!("{report}");
 

@@ -77,13 +77,13 @@ impl BrowserEngine {
         Ok(())
     }
 
-    /// Decode one token.
+    /// Decode one token (with profiling for the gears panel).
     pub async fn step(&mut self) -> Result<u32, String> {
         let pos = self.prefill_pos;
         let input_token = self.token_ids.last().copied().unwrap_or(1);
-        let next_token = self
+        let (next_token, _report, layer_times) = self
             .worker
-            .forward_one(input_token, pos)
+            .forward_one_profiled(input_token, pos)
             .await
             .map_err(|e| format!("{e}"))?;
 
@@ -91,6 +91,8 @@ impl BrowserEngine {
         self.prefill_pos = pos + 1;
         self.stats.seq_position = self.token_ids.len();
         self.stats.kv_cache_used = self.token_ids.len();
+        self.stats.gpu_memory_bytes = self.worker.gpu_buffer_bytes();
+        self.stats.layer_times_ms = layer_times;
         Ok(next_token)
     }
 }

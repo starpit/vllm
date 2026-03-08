@@ -126,8 +126,10 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
         conversation.push(ChatMessage::system(system_prompt));
     }
 
-    let params = args.max_tokens.map(|mt| vllm_serve::llm::SamplingParams {
-        max_tokens: Some(mt),
+    // Match Python's `vllm chat`: omit max_tokens so the server resolves it
+    // to the full remaining context window, letting the model emit EOS naturally.
+    let params = Some(vllm_serve::llm::SamplingParams {
+        max_tokens: args.max_tokens,
         ..Default::default()
     });
 

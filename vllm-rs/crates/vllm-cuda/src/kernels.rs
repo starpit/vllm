@@ -7,7 +7,7 @@
 
 use core::ffi::{c_int, c_void};
 
-use crate::arena::ScratchArena;
+use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::dtype::DType;
 use crate::tensor::GpuTensor;
 
@@ -294,12 +294,12 @@ pub unsafe fn rms_norm(
     input: GpuTensor,
     weight: GpuTensor,
     eps: f32,
-    arena: &mut ScratchArena,
+    alloc: &mut CachingAllocator,
     stream: CUstream,
-) -> GpuTensor {
+) -> OwnedTensor {
     let num_tokens = input.dim(0) as i32;
     let hidden_size = input.dim(1) as i32;
-    let out = arena.alloc(&[num_tokens as usize, hidden_size as usize], input.dtype());
+    let out = alloc.alloc_tensor(&[num_tokens as usize, hidden_size as usize], input.dtype());
 
     match input.dtype() {
         DType::F16 => rms_norm_f16(
@@ -417,20 +417,20 @@ pub unsafe fn fused_add_rms_norm(
     residual: GpuTensor,
     weight: GpuTensor,
     eps: f32,
-    arena: &mut ScratchArena,
+    alloc: &mut CachingAllocator,
     stream: cudarc::driver::sys::CUstream,
 ) -> (GpuTensor, GpuTensor) {
-    // Allocate a copy of input in the arena for the normed output.
-    let normed_buf = arena.alloc(&[input.dim(0), input.dim(1)], input.dtype());
+    // Allocate a copy of input for the normed output.
+    let normed_buf = alloc.alloc_tensor(&[input.dim(0), input.dim(1)], input.dtype());
     crate::driver::memcpy_dtod_async(
-        normed_buf.raw_ptr(),
+        normed_buf.as_gpu_tensor().raw_ptr(),
         input.raw_ptr() as *const u8,
         input.size_bytes(),
         stream,
     )
     .expect("fused_add_rms_norm: D2D copy failed");
 
-    fused_add_rms_norm_inplace(normed_buf, residual, weight, eps, stream)
+    fused_add_rms_norm_inplace(normed_buf.into_gpu_tensor(), residual, weight, eps, stream)
 }
 
 // ---------------------------------------------------------------------------
@@ -445,12 +445,12 @@ pub unsafe fn fused_add_rms_norm(
 pub unsafe fn silu_and_mul_fused(
     gate_up: GpuTensor,
     intermediate_size: usize,
-    arena: &mut ScratchArena,
+    alloc: &mut CachingAllocator,
     stream: CUstream,
-) -> GpuTensor {
+) -> OwnedTensor {
     let num_tokens = gate_up.dim(0) as i32;
     let d = intermediate_size as i32;
-    let out = arena.alloc(&[num_tokens as usize, intermediate_size], gate_up.dtype());
+    let out = alloc.alloc_tensor(&[num_tokens as usize, intermediate_size], gate_up.dtype());
 
     match gate_up.dtype() {
         DType::F16 => {
@@ -482,12 +482,12 @@ pub unsafe fn silu_and_mul_fused(
 pub unsafe fn gelu_and_mul_fused(
     gate_up: GpuTensor,
     intermediate_size: usize,
-    arena: &mut ScratchArena,
+    alloc: &mut CachingAllocator,
     stream: CUstream,
-) -> GpuTensor {
+) -> OwnedTensor {
     let num_tokens = gate_up.dim(0) as i32;
     let d = intermediate_size as i32;
-    let out = arena.alloc(&[num_tokens as usize, intermediate_size], gate_up.dtype());
+    let out = alloc.alloc_tensor(&[num_tokens as usize, intermediate_size], gate_up.dtype());
 
     match gate_up.dtype() {
         DType::F16 => {
@@ -585,12 +585,12 @@ pub unsafe fn rotary_embedding_inplace(
 pub unsafe fn embedding_gather(
     weight: GpuTensor,
     input_ids: GpuTensor,
-    arena: &mut ScratchArena,
+    alloc: &mut CachingAllocator,
     stream: CUstream,
-) -> GpuTensor {
+) -> OwnedTensor {
     let num_tokens = input_ids.dim(0);
     let hidden_size = weight.dim(1);
-    let out = arena.alloc(&[num_tokens, hidden_size], weight.dtype());
+    let out = alloc.alloc_tensor(&[num_tokens, hidden_size], weight.dtype());
 
     match weight.dtype() {
         DType::F16 => embedding_gather_f16(
@@ -883,9 +883,9 @@ pub unsafe fn flash_attn_contiguous(
     is_causal: bool,
     softcap: f32,
     window_size_left: i32,
-    arena: &mut ScratchArena,
+    alloc: &mut CachingAllocator,
     stream: CUstream,
-) -> GpuTensor {
+) -> OwnedTensor {
     let total_q = q.dim(0);
     let num_heads = q.dim(1);
     let head_dim = q.dim(2);
@@ -898,8 +898,8 @@ pub unsafe fn flash_attn_contiguous(
     let _seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
 
     // Allocate output and softmax_lse from arena.
-    let out = arena.alloc(&[total_q, num_heads, head_dim], q.dtype());
-    let softmax_lse = arena.alloc(&[num_heads * total_q], DType::F32);
+    let out = alloc.alloc_tensor(&[total_q, num_heads, head_dim], q.dtype());
+    let softmax_lse = alloc.alloc_tensor(&[num_heads * total_q], DType::F32);
 
     // Use mha_varlen_fwd with null block_table for contiguous (non-paged) path
     mha_varlen_fwd(
@@ -967,9 +967,9 @@ pub unsafe fn flash_attn_paged(
     is_causal: bool,
     block_size: usize,
     num_sm: i32,
-    arena: &mut ScratchArena,
+    alloc: &mut CachingAllocator,
     _stream: CUstream,
-) -> GpuTensor {
+) -> OwnedTensor {
     flash_attn_paged_ext(
         q,
         k_cache,
@@ -985,7 +985,7 @@ pub unsafe fn flash_attn_paged(
         -1,
         block_size,
         num_sm,
-        arena,
+        alloc,
         _stream,
     )
 }
@@ -1010,9 +1010,9 @@ pub unsafe fn flash_attn_paged_ext(
     window_size_left: i32,
     block_size: usize,
     num_sm: i32,
-    arena: &mut ScratchArena,
+    alloc: &mut CachingAllocator,
     _stream: CUstream,
-) -> GpuTensor {
+) -> OwnedTensor {
     let total_q = q.dim(0);
     let num_heads = q.dim(1);
     let head_dim = q.dim(2);
@@ -1028,8 +1028,8 @@ pub unsafe fn flash_attn_paged_ext(
     let head_dim_rounded = round_multiple(head_dim, if head_dim <= 128 { 32 } else { 64 });
 
     // Allocate output and softmax_lse from arena.
-    let out = arena.alloc(&[total_q, num_heads, head_dim], q.dtype());
-    let softmax_lse = arena.alloc(&[num_heads * total_q], DType::F32);
+    let out = alloc.alloc_tensor(&[total_q, num_heads, head_dim], q.dtype());
+    let softmax_lse = alloc.alloc_tensor(&[num_heads * total_q], DType::F32);
 
     // Q/O: [total_q, num_heads, head_dim] contiguous
     let q_row_stride = (num_heads * head_dim) as i64;
@@ -1042,7 +1042,7 @@ pub unsafe fn flash_attn_paged_ext(
 
     // Python passes dummy zeros for cu_seqlens_k when using paged KV + seqused_k.
     // We allocate a zero-filled buffer from the arena for this.
-    let dummy_cu_seqlens_k = arena.alloc(&[batch_size + 1], DType::I32);
+    let dummy_cu_seqlens_k = alloc.alloc_tensor(&[batch_size + 1], DType::I32);
     // Arena memory is NOT guaranteed to be zeroed. Zero it explicitly.
     crate::driver::memset_d8(
         dummy_cu_seqlens_k.raw_ptr(),
@@ -1071,11 +1071,11 @@ pub unsafe fn flash_attn_paged_ext(
 
     // Allocate split-K accumulator buffers if needed.
     let (lse_accum_ptr, out_accum_ptr) = if num_splits > 1 {
-        let lse_accum = arena.alloc(
+        let lse_accum = alloc.alloc_tensor(
             &[num_splits * batch_size * num_heads * max_seqlen_q],
             DType::F32,
         );
-        let out_accum = arena.alloc(
+        let out_accum = alloc.alloc_tensor(
             &[num_splits * batch_size * num_heads * max_seqlen_q * head_dim_rounded],
             DType::F32,
         );
@@ -1192,17 +1192,17 @@ pub unsafe fn split_qkv(
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    arena: &mut ScratchArena,
+    alloc: &mut CachingAllocator,
     stream: cudarc::driver::sys::CUstream,
-) -> (GpuTensor, GpuTensor, GpuTensor) {
+) -> (OwnedTensor, OwnedTensor, OwnedTensor) {
     let num_tokens = qkv.dim(0);
     let total_dim = qkv.dim(1);
 
     debug_assert_eq!(total_dim, q_size + 2 * kv_size);
 
-    let q = arena.alloc(&[num_tokens, num_q_heads, head_dim], qkv.dtype());
-    let k = arena.alloc(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
-    let v = arena.alloc(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
+    let q = alloc.alloc_tensor(&[num_tokens, num_q_heads, head_dim], qkv.dtype());
+    let k = alloc.alloc_tensor(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
+    let v = alloc.alloc_tensor(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
 
     match qkv.dtype() {
         DType::F16 => split_qkv_f16(
@@ -1263,18 +1263,18 @@ pub unsafe fn fused_qkv_rope(
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    arena: &mut ScratchArena,
+    alloc: &mut CachingAllocator,
     stream: CUstream,
-) -> (GpuTensor, GpuTensor, GpuTensor) {
+) -> (OwnedTensor, OwnedTensor, OwnedTensor) {
     let num_tokens = qkv.dim(0);
     let total_dim = qkv.dim(1);
     let rotary_dim = cos_sin_cache.dim(1) as i32;
 
     debug_assert_eq!(total_dim, q_size + 2 * kv_size);
 
-    let q = arena.alloc(&[num_tokens, num_q_heads, head_dim], qkv.dtype());
-    let k = arena.alloc(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
-    let v = arena.alloc(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
+    let q = alloc.alloc_tensor(&[num_tokens, num_q_heads, head_dim], qkv.dtype());
+    let k = alloc.alloc_tensor(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
+    let v = alloc.alloc_tensor(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
 
     match qkv.dtype() {
         DType::F16 => fused_qkv_rope_f16(
@@ -1399,12 +1399,12 @@ unsafe extern "C" {
 /// Only copies `batch_size * 4` bytes D2H instead of `batch_size * vocab_size * dtype_size`.
 pub unsafe fn argmax_batched(
     logits: GpuTensor,
-    arena: &mut ScratchArena,
+    alloc: &mut CachingAllocator,
     stream: CUstream,
-) -> GpuTensor {
+) -> OwnedTensor {
     let batch_size = logits.dim(0) as c_int;
     let vocab_size = logits.dim(1) as c_int;
-    let out = arena.alloc(&[batch_size as usize], DType::U32);
+    let out = alloc.alloc_tensor(&[batch_size as usize], DType::U32);
 
     match logits.dtype() {
         DType::F16 => argmax_batched_f16(
@@ -1451,12 +1451,12 @@ pub unsafe fn sample_batched(
     top_ps: GpuTensor,
     min_ps: GpuTensor,
     uniform_randoms: GpuTensor,
-    arena: &mut ScratchArena,
+    alloc: &mut CachingAllocator,
     stream: CUstream,
-) -> GpuTensor {
+) -> OwnedTensor {
     let batch_size = logits.dim(0) as c_int;
     let vocab_size = logits.dim(1) as c_int;
-    let out = arena.alloc(&[batch_size as usize], DType::U32);
+    let out = alloc.alloc_tensor(&[batch_size as usize], DType::U32);
 
     match logits.dtype() {
         DType::F16 => sample_batched_f16(

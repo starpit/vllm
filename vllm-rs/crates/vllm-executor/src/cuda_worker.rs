@@ -167,6 +167,66 @@ impl CudaModel {
             },
         }
     }
+
+    /// Forward using caching allocator (zero D2D copies between layers).
+    /// Falls back to arena-based `forward()` for Gemma2 (not yet ported).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn forward_owned(
+        &self,
+        input_ids: GpuTensor,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+        last_token_indices: Option<GpuTensor>,
+    ) -> GpuTensor {
+        match self {
+            Self::Llama(m) => m.forward_owned(
+                input_ids,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                kv_cache,
+                device,
+                last_token_indices,
+            ),
+            Self::Qwen2(m) => m.forward_owned(
+                input_ids,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                kv_cache,
+                device,
+                last_token_indices,
+            ),
+            Self::Gemma2(m) => m.forward(
+                input_ids,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                kv_cache,
+                device,
+                last_token_indices,
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -504,48 +564,48 @@ impl CudaWorker {
         )))
     }
 
-    /// H2D copy a u32 slice into an arena-allocated GpuTensor.
+    /// H2D copy a u32 slice into a caching-allocator tensor.
     fn h2d_u32(data: &[u32], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
-        let t = device.arena.alloc(&[data.len()], GpuDType::U32);
+        let t = device.caching.alloc_tensor(&[data.len()], GpuDType::U32);
         unsafe {
             driver::memcpy_htod_async(
-                t.raw_ptr(),
+                t.as_gpu_tensor().raw_ptr(),
                 data.as_ptr() as *const u8,
                 data.len() * 4,
                 device.compute_stream,
             )
         }
         .map_err(|e| ExecutorError::WorkerExecution(format!("H2D u32: {e}")))?;
-        Ok(t)
+        Ok(t.into_gpu_tensor())
     }
 
-    /// H2D copy an i64 slice into an arena-allocated GpuTensor.
+    /// H2D copy an i32 slice into a caching-allocator tensor.
     fn h2d_i32(data: &[i32], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
-        let t = device.arena.alloc(&[data.len()], GpuDType::I32);
+        let t = device.caching.alloc_tensor(&[data.len()], GpuDType::I32);
         unsafe {
             driver::memcpy_htod_async(
-                t.raw_ptr(),
+                t.as_gpu_tensor().raw_ptr(),
                 data.as_ptr() as *const u8,
                 data.len() * 4,
                 device.compute_stream,
             )
         }
         .map_err(|e| ExecutorError::WorkerExecution(format!("H2D i32: {e}")))?;
-        Ok(t)
+        Ok(t.into_gpu_tensor())
     }
 
     fn h2d_i64(data: &[i64], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
-        let t = device.arena.alloc(&[data.len()], GpuDType::I64);
+        let t = device.caching.alloc_tensor(&[data.len()], GpuDType::I64);
         unsafe {
             driver::memcpy_htod_async(
-                t.raw_ptr(),
+                t.as_gpu_tensor().raw_ptr(),
                 data.as_ptr() as *const u8,
                 data.len() * 8,
                 device.compute_stream,
             )
         }
         .map_err(|e| ExecutorError::WorkerExecution(format!("H2D i64: {e}")))?;
-        Ok(t)
+        Ok(t.into_gpu_tensor())
     }
 
     /// Build attention metadata tensors from `AttentionMetadata`.
@@ -906,10 +966,131 @@ impl Worker for CudaWorker {
             unsafe { driver::ctx_set_current(dev.ctx) }
                 .map_err(|e| ExecutorError::WorkerInit(format!("ctx_set_current: {e}")))?;
         }
-        let (free, _total) = cudarc::driver::result::mem_get_info()
+
+        // Like Python vLLM: profile peak activation memory with a dummy forward
+        // pass, then subtract it from available memory for KV cache sizing.
+        let (free_before, _total) = cudarc::driver::result::mem_get_info()
             .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
-        info!("CudaWorker: {:.0} MB free VRAM", free as f64 / 1_048_576.0);
-        Ok(free)
+        info!(
+            "CudaWorker: {:.0} MB free VRAM",
+            free_before as f64 / 1_048_576.0
+        );
+
+        let device = self
+            .device
+            .as_mut()
+            .ok_or_else(|| ExecutorError::WorkerInit("device not initialized".into()))?;
+        let model = self
+            .model
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerInit("model not loaded".into()))?;
+
+        // Run dummy forward with max_num_batched_tokens to measure peak activations.
+        let prefill_tokens = self.config.max_num_batched_tokens;
+        info!("Profiling activation memory with dummy forward ({prefill_tokens} tokens)...");
+
+        // Allocate dummy inputs from caching allocator.
+        let dummy_ids = device
+            .caching
+            .alloc_gpu_tensor(&[prefill_tokens], GpuDType::U32);
+        let dummy_pos = device
+            .caching
+            .alloc_gpu_tensor(&[prefill_tokens], GpuDType::U32);
+        let dummy_slots = device
+            .caching
+            .alloc_gpu_tensor(&[prefill_tokens], GpuDType::I64);
+        unsafe {
+            driver::memset_d8(
+                dummy_slots.raw_ptr(),
+                0,
+                prefill_tokens * 8,
+                device.compute_stream,
+            )
+            .ok();
+        }
+        let cu_q: Vec<u32> = vec![0, prefill_tokens as u32];
+        let gpu_cu_q = device.caching.alloc_gpu_tensor(&[2], GpuDType::U32);
+        unsafe {
+            driver::memcpy_htod_async(
+                gpu_cu_q.raw_ptr(),
+                cu_q.as_ptr() as *const u8,
+                8,
+                device.compute_stream,
+            )
+            .ok();
+        }
+        let dummy_seqused = device.caching.alloc_gpu_tensor(&[1], GpuDType::U32);
+        let dummy_bt = device.caching.alloc_gpu_tensor(&[1, 1], GpuDType::U32);
+        unsafe {
+            driver::memset_d8(dummy_bt.raw_ptr(), 0, 4, device.compute_stream).ok();
+        }
+
+        // We don't have KV cache yet, so create a tiny one for profiling.
+        let dummy_kv = unsafe {
+            vllm_cuda::KvCachePool::new(
+                model.num_layers(),
+                1, // 1 block
+                self.config.block_size,
+                model.num_kv_heads(),
+                model.head_dim(),
+                self.model_dtype,
+            )
+        }
+        .map_err(|e| ExecutorError::WorkerInit(format!("dummy KvCachePool: {e}")))?;
+
+        // Run the forward pass to warm up cuBLAS and measure peak memory.
+        unsafe {
+            let _ = model.forward_owned(
+                dummy_ids,
+                dummy_pos,
+                dummy_slots,
+                gpu_cu_q,
+                dummy_seqused,
+                dummy_bt,
+                prefill_tokens,
+                prefill_tokens,
+                &dummy_kv,
+                device,
+                None,
+            );
+            let _ = driver::stream_synchronize(device.compute_stream);
+        }
+
+        // Measure memory after profile run — the difference is peak activations.
+        let (free_after, _) = cudarc::driver::result::mem_get_info()
+            .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
+
+        // Free the dummy KV cache and all cached allocator blocks.
+        drop(dummy_kv);
+        unsafe { device.caching.free_leaked_blocks() };
+        device.caching.trim();
+
+        let (free_after_cleanup, _) = cudarc::driver::result::mem_get_info()
+            .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
+
+        let peak_activation_bytes = free_before.saturating_sub(free_after);
+        info!(
+            "Peak activation memory: {:.1} MB (free before: {:.1} MB, after: {:.1} MB, after cleanup: {:.1} MB)",
+            peak_activation_bytes as f64 / 1_048_576.0,
+            free_before as f64 / 1_048_576.0,
+            free_after as f64 / 1_048_576.0,
+            free_after_cleanup as f64 / 1_048_576.0,
+        );
+
+        // Like Python: return available memory minus peak activation memory.
+        // Reserve extra for the caching allocator's block pool — during initial
+        // prefill, multiple unique batch sizes create blocks that aren't reusable
+        // until they match a future batch's size. Use 2x peak activation as
+        // headroom (Python's expandable_segments handles this transparently).
+        let reserved = peak_activation_bytes * 6;
+        let available = free_after_cleanup.saturating_sub(reserved);
+        info!(
+            "Available memory for KV cache: {:.1} MB (free: {:.1} MB - reserved: {:.1} MB)",
+            available as f64 / 1_048_576.0,
+            free_after_cleanup as f64 / 1_048_576.0,
+            reserved as f64 / 1_048_576.0,
+        );
+        Ok(available)
     }
 
     fn execute_model(
@@ -926,6 +1107,16 @@ impl Worker for CudaWorker {
         }
 
         let block_size = self.config.block_size;
+
+        // Free any leaked GPU tensors from the previous step (h2d inputs,
+        // logits, sampling outputs, etc.). Keep graph output addresses pinned.
+        if let Some(ref mut dev) = self.device {
+            let mut keep: Vec<*const u8> = Vec::new();
+            if let Some(ref runner) = self.graph_runner {
+                keep.extend(runner.pinned_addresses());
+            }
+            unsafe { dev.caching.free_leaked_blocks_except(&keep) };
+        }
 
         // Clean up finished requests.
         if !scheduler_output.finished_req_ids.is_empty()
@@ -1455,8 +1646,7 @@ impl Worker for CudaWorker {
                 replay_out.logits
             } else {
                 // Eager forward path (multi-request prefill or uncaptured size).
-                // DEBUG: trace attention metadata for multi-turn debugging
-                device.arena.reset();
+                // Caching allocator: no reset needed — tensors freed on drop.
 
                 let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
                 let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
@@ -1482,8 +1672,19 @@ impl Worker for CudaWorker {
                     None
                 };
 
+                // Debug: check memory before forward.
+                if let Ok((free, _total)) = cudarc::driver::result::mem_get_info() {
+                    tracing::info!(
+                        "Before forward: {:.1} MB free, {} tokens, {} reqs, free_blocks={}",
+                        free as f64 / 1_048_576.0,
+                        total_tokens,
+                        num_reqs,
+                        device.caching.free_block_count(),
+                    );
+                }
+
                 unsafe {
-                    model.forward(
+                    model.forward_owned(
                         gpu_input_ids,
                         gpu_positions,
                         slot_mapping,
@@ -1556,7 +1757,10 @@ impl Worker for CudaWorker {
             }
 
             // Single H2D copy for all sampling params from pinned memory.
-            let gpu_packed = device.arena.alloc(&[total_bytes / 4], GpuDType::F32);
+            let gpu_packed_owned = device
+                .caching
+                .alloc_tensor(&[total_bytes / 4], GpuDType::F32);
+            let gpu_packed = gpu_packed_owned.as_gpu_tensor();
             unsafe {
                 driver::memcpy_htod_async(
                     gpu_packed.raw_ptr(),
@@ -1579,7 +1783,7 @@ impl Worker for CudaWorker {
             let gpu_randoms =
                 unsafe { GpuTensor::new(base.add(stride * 4), &[num_reqs], GpuDType::F32) };
 
-            let token_ids_gpu = unsafe {
+            let token_ids_owned = unsafe {
                 vllm_cuda::kernels::sample_batched(
                     logits,
                     gpu_temps,
@@ -1587,10 +1791,11 @@ impl Worker for CudaWorker {
                     gpu_top_ps,
                     gpu_min_ps,
                     gpu_randoms,
-                    &mut device.arena,
+                    &mut device.caching,
                     device.compute_stream,
                 )
             };
+            let token_ids_gpu = token_ids_owned.as_gpu_tensor();
 
             // D2H token IDs into pinned buffer.
             let host_ids = Self::d2h_token_ids_pinned(
@@ -1621,9 +1826,14 @@ impl Worker for CudaWorker {
             Ok(ModelRunnerOutput::from_ordered(req_ids, host_ids))
         } else if all_greedy {
             // GPU fast path: batched argmax on device, D2H only num_reqs × 4 bytes.
-            let token_ids_gpu = unsafe {
-                vllm_cuda::kernels::argmax_batched(logits, &mut device.arena, device.compute_stream)
+            let token_ids_owned = unsafe {
+                vllm_cuda::kernels::argmax_batched(
+                    logits,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
             };
+            let token_ids_gpu = token_ids_owned.as_gpu_tensor();
             let num_reqs = prepared.req_inputs.len();
 
             // D2H token IDs into pinned buffer.
@@ -1726,83 +1936,15 @@ impl Worker for CudaWorker {
         };
         let max_bs = *capture_sizes.iter().max().unwrap();
 
-        // Pre-size the arena by running dummy forwards that cover the worst-case
-        // allocation pattern. This ensures the arena won't grow after graph capture
-        // (which would invalidate captured pointers since the arena base changes).
-        // Run with a prefill-like token count (max_bs * 32) to cover both prefill
-        // and decode arena needs.
-        {
-            // Pre-size the arena to handle the worst-case prefill batch, which is
-            // max_num_batched_tokens tokens in a single forward pass.
-            let prefill_tokens = self.config.max_num_batched_tokens;
-            info!("Pre-sizing arena with dummy forward ({prefill_tokens} tokens)...");
-            device.arena.reset();
-            let dummy_ids = device.arena.alloc(&[prefill_tokens], GpuDType::U32);
-            let dummy_pos = device.arena.alloc(&[prefill_tokens], GpuDType::U32);
-            let dummy_slots = device.arena.alloc(&[prefill_tokens], GpuDType::I64);
-            // Zero slot_mapping and block_table to avoid out-of-bounds KV cache writes.
-            unsafe {
-                driver::memset_d8(
-                    dummy_slots.raw_ptr(),
-                    0,
-                    prefill_tokens * 8,
-                    device.compute_stream,
-                )
-                .ok();
-            }
-            // cu_seqlens: single sequence of prefill_tokens length (worst case for arena).
-            let cu_q: Vec<u32> = vec![0, prefill_tokens as u32];
-            let gpu_cu_q = device.arena.alloc(&[2], GpuDType::U32);
-            unsafe {
-                driver::memcpy_htod_async(
-                    gpu_cu_q.raw_ptr(),
-                    cu_q.as_ptr() as *const u8,
-                    2 * 4,
-                    device.compute_stream,
-                )
-                .ok();
-            }
-            let gpu_cu_k = device.arena.alloc(&[2], GpuDType::U32);
-            unsafe {
-                driver::memcpy_htod_async(
-                    gpu_cu_k.raw_ptr(),
-                    cu_q.as_ptr() as *const u8,
-                    2 * 4,
-                    device.compute_stream,
-                )
-                .ok();
-            }
-            let dummy_bt = device.arena.alloc(&[1, 1], GpuDType::U32);
-            unsafe {
-                driver::memset_d8(dummy_bt.raw_ptr(), 0, 4, device.compute_stream).ok();
-            }
-            // max_seqlen_q = max_seqlen_k = prefill_tokens for arena sizing.
-            unsafe {
-                let _ = model.forward(
-                    dummy_ids,
-                    dummy_pos,
-                    dummy_slots,
-                    gpu_cu_q,
-                    gpu_cu_k,
-                    dummy_bt,
-                    prefill_tokens,
-                    prefill_tokens,
-                    kv_cache,
-                    device,
-                    None,
-                );
-                let _ = driver::stream_synchronize(device.compute_stream);
-            }
-            device.arena.reset();
-            info!(
-                "Arena pre-sized: capacity={:.1} MB, high_water={:.1} MB",
-                device.arena.capacity() as f64 / (1024.0 * 1024.0),
-                device.arena.high_water_mark() as f64 / (1024.0 * 1024.0),
-            );
-        }
+        // No arena pre-sizing needed — caching allocator manages memory
+        // dynamically like PyTorch's CUDACachingAllocator.
 
         let mut runner = unsafe { CudaGraphRunner::new(max_bs, vocab_size, self.model_dtype) }
             .map_err(|e| ExecutorError::WorkerInit(format!("CudaGraphRunner::new: {e}")))?;
+
+        // Begin private pool for ALL graph captures (like PyTorch's shared graph pool).
+        // One pool is shared across all batch sizes so blocks are reused.
+        device.caching.begin_allocate_to_pool();
 
         for &bs in &capture_sizes {
             info!("Capturing CUDA graph for batch_size={bs}...");
@@ -1817,7 +1959,7 @@ impl Worker for CudaWorker {
 
             let result = unsafe {
                 runner.capture(bs, device, |inputs, dev| {
-                    model_ref.forward(
+                    model_ref.forward_owned(
                         inputs.input_ids,
                         inputs.positions,
                         inputs.slot_mapping,
@@ -1841,6 +1983,10 @@ impl Worker for CudaWorker {
                 }
             }
         }
+
+        // End private pool after all captures. Blocks in the pool that are
+        // still free are effectively owned by the captured graphs.
+        device.caching.end_allocate_to_pool();
 
         if !runner.captured_sizes().is_empty() {
             info!(
@@ -1884,7 +2030,7 @@ impl Worker for CudaWorker {
 
                         let result = unsafe {
                             prefill_runner.capture(num_tokens, device, |inputs, dev| {
-                                model_ref.forward(
+                                model_ref.forward_owned(
                                     inputs.input_ids,
                                     inputs.positions,
                                     inputs.slot_mapping,
@@ -1927,9 +2073,8 @@ impl Worker for CudaWorker {
         }
 
         if self.config.cublas_autotune {
-            unsafe { device.cublas.benchmark_plans(&mut device.arena) };
+            unsafe { device.cublas.benchmark_plans() };
         }
-        device.arena.reset();
 
         Ok(())
     }

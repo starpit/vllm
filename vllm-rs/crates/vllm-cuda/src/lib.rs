@@ -7,19 +7,20 @@
 #![allow(clippy::too_many_arguments)]
 //! Purpose-built CUDA tensor runtime for LLM inference.
 //!
-//! Replaces candle as the GPU backend with a zero-allocation, arena-based
-//! design optimized for CUDA graph capture and maximum throughput.
+//! Uses a caching allocator (like PyTorch's CUDACachingAllocator) for all GPU
+//! memory management. Tensors are freed on drop and their blocks reused from
+//! a free list — zero `cudaMalloc` calls on the hot path after warmup.
 //!
 //! ## Key design principles
 //!
-//! 1. **Zero hot-path allocation**: All intermediate tensors come from a
-//!    bump-allocated `ScratchArena` that resets each engine step.
+//! 1. **Caching allocator**: Like PyTorch — free-list based, tensors freed on
+//!    drop. Zero D2D copies between layers.
 //! 2. **Always contiguous**: `GpuTensor` has no strides — eliminates
 //!    `.contiguous()` copies that plague the candle backend.
 //! 3. **Own streams**: Non-default compute and transfer streams enable
 //!    CUDA graph capture and async scheduling overlap.
 //! 4. **Minimal tensor type**: `GpuTensor` is 32 bytes, `Copy`, no `Drop`.
-//!    Pointer extraction is `t.as_ptr::<T>()`, not 10 lines of match/slice.
+//!    `OwnedTensor` wraps it with automatic memory management.
 
 // Always-available types (pure metadata, no CUDA calls).
 pub mod dtype;
@@ -30,7 +31,9 @@ pub use tensor::GpuTensor;
 
 // CUDA runtime (requires CUDA toolkit).
 #[cfg(feature = "cuda")]
-pub mod arena;
+pub mod alloc;
+#[cfg(feature = "cuda")]
+pub mod arena; // kept for backwards compat; not used in forward path
 #[cfg(feature = "cuda")]
 pub mod cpu_gpu_buf;
 #[cfg(feature = "cuda")]
@@ -53,7 +56,7 @@ pub mod model;
 pub mod weights;
 
 #[cfg(feature = "cuda")]
-pub use arena::ScratchArena;
+pub use alloc::{CachingAllocator, OwnedTensor};
 #[cfg(feature = "cuda")]
 pub use cpu_gpu_buf::{CpuGpuBuf, PinnedBuf};
 #[cfg(feature = "cuda")]

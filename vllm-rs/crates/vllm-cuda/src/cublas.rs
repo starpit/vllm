@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use crate::arena::ScratchArena;
+use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::driver;
 use crate::dtype::DType;
 use crate::tensor::GpuTensor;
@@ -255,53 +255,9 @@ impl CublasHandle {
         &mut self,
         a: GpuTensor,
         b: GpuTensor,
-        arena: &mut ScratchArena,
+        alloc: &mut CachingAllocator,
     ) -> GpuTensor {
-        debug_assert_eq!(a.ndim(), 2);
-        debug_assert_eq!(b.ndim(), 2);
-        debug_assert_eq!(a.dim(1), b.dim(1), "GEMM K mismatch");
-        debug_assert_eq!(a.dtype(), b.dtype(), "GEMM dtype mismatch");
-
-        let m = a.dim(0);
-        let k = a.dim(1);
-        let n = b.dim(0);
-
-        let out = arena.alloc(&[m, n], a.dtype());
-
-        self.ensure_plan(m, k, n, a.dtype(), false);
-        let key = PlanKey {
-            m,
-            k,
-            n,
-            dtype: a.dtype(),
-            has_bias: false,
-        };
-        let plan = &self.plans[&key];
-
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-
-        check_lt(lt::cublasLtMatmul(
-            self.lt_handle,
-            plan.matmul_desc,
-            &alpha as *const f32 as *const _,
-            b.as_ptr::<u8>() as *const _, // A in cuBLAS = weight
-            plan.layout_a,
-            a.as_ptr::<u8>() as *const _, // B in cuBLAS = activation
-            plan.layout_b,
-            &beta as *const f32 as *const _,
-            out.as_mut_ptr::<u8>() as *mut _, // C
-            plan.layout_c,
-            out.as_mut_ptr::<u8>() as *mut _, // D (same as C for in-place)
-            plan.layout_c,
-            &plan.algo,
-            self.workspace as *mut _,
-            CUBLAS_WORKSPACE_SIZE,
-            self.stream as _,
-        ))
-        .expect("cublasLtMatmul failed");
-
-        out
+        self.gemm_owned(a, b, alloc).into_gpu_tensor()
     }
 
     /// GEMM with fused bias add: out = A @ B^T + bias
@@ -321,8 +277,75 @@ impl CublasHandle {
         a: GpuTensor,
         b: GpuTensor,
         bias: GpuTensor,
-        arena: &mut ScratchArena,
+        alloc: &mut CachingAllocator,
     ) -> GpuTensor {
+        self.gemm_bias_owned(a, b, bias, alloc).into_gpu_tensor()
+    }
+
+    /// GEMM returning `OwnedTensor` allocated from caching allocator.
+    ///
+    /// Same semantics as `gemm()` but memory is freed on drop.
+    pub unsafe fn gemm_owned(
+        &mut self,
+        a: GpuTensor,
+        b: GpuTensor,
+        alloc: &mut CachingAllocator,
+    ) -> OwnedTensor {
+        debug_assert_eq!(a.ndim(), 2);
+        debug_assert_eq!(b.ndim(), 2);
+        debug_assert_eq!(a.dim(1), b.dim(1), "GEMM K mismatch");
+
+        let m = a.dim(0);
+        let k = a.dim(1);
+        let n = b.dim(0);
+        let dtype = a.dtype();
+
+        let out = alloc.alloc_tensor(&[m, n], dtype);
+
+        self.ensure_plan(m, k, n, dtype, false);
+        let key = PlanKey {
+            m,
+            k,
+            n,
+            dtype,
+            has_bias: false,
+        };
+        let plan = &self.plans[&key];
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+
+        check_lt(lt::cublasLtMatmul(
+            self.lt_handle,
+            plan.matmul_desc,
+            &alpha as *const f32 as *const _,
+            b.as_ptr::<u8>() as *const _,
+            plan.layout_a,
+            a.as_ptr::<u8>() as *const _,
+            plan.layout_b,
+            &beta as *const f32 as *const _,
+            out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
+            plan.layout_c,
+            out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
+            plan.layout_c,
+            &plan.algo,
+            self.workspace as *mut _,
+            CUBLAS_WORKSPACE_SIZE,
+            self.stream as _,
+        ))
+        .expect("cublasLtMatmul failed");
+
+        out
+    }
+
+    /// GEMM with fused bias add, returning `OwnedTensor`.
+    pub unsafe fn gemm_bias_owned(
+        &mut self,
+        a: GpuTensor,
+        b: GpuTensor,
+        bias: GpuTensor,
+        alloc: &mut CachingAllocator,
+    ) -> OwnedTensor {
         debug_assert_eq!(a.ndim(), 2);
         debug_assert_eq!(b.ndim(), 2);
         debug_assert_eq!(bias.ndim(), 1);
@@ -332,21 +355,20 @@ impl CublasHandle {
         let m = a.dim(0);
         let k = a.dim(1);
         let n = b.dim(0);
+        let dtype = a.dtype();
 
-        let out = arena.alloc(&[m, n], a.dtype());
+        let out = alloc.alloc_tensor(&[m, n], dtype);
 
-        self.ensure_plan(m, k, n, a.dtype(), true);
+        self.ensure_plan(m, k, n, dtype, true);
         let key = PlanKey {
             m,
             k,
             n,
-            dtype: a.dtype(),
+            dtype,
             has_bias: true,
         };
         let plan = &self.plans[&key];
 
-        // Set the bias pointer for this specific call (changes per call if bias
-        // tensor lives at a different address, though usually it's the same weight).
         let bias_ptr = bias.raw_ptr() as *const std::ffi::c_void;
         check_lt(lt::cublasLtMatmulDescSetAttribute(
             plan.matmul_desc,
@@ -363,14 +385,14 @@ impl CublasHandle {
             self.lt_handle,
             plan.matmul_desc,
             &alpha as *const f32 as *const _,
-            b.as_ptr::<u8>() as *const _, // A in cuBLAS = weight
+            b.as_ptr::<u8>() as *const _,
             plan.layout_a,
-            a.as_ptr::<u8>() as *const _, // B in cuBLAS = activation
+            a.as_ptr::<u8>() as *const _,
             plan.layout_b,
             &beta as *const f32 as *const _,
-            out.as_mut_ptr::<u8>() as *mut _, // C
+            out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
             plan.layout_c,
-            out.as_mut_ptr::<u8>() as *mut _, // D (same as C for in-place)
+            out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
             plan.layout_c,
             &plan.algo,
             self.workspace as *mut _,
@@ -391,7 +413,7 @@ impl CublasHandle {
     /// # Safety
     /// Requires active CUDA context. Arena must have enough space for the
     /// largest GEMM output.
-    pub unsafe fn benchmark_plans(&mut self, _arena: &mut ScratchArena) {
+    pub unsafe fn benchmark_plans(&mut self) {
         use crate::driver;
 
         let keys: Vec<PlanKey> = self.plans.keys().copied().collect();
@@ -705,7 +727,7 @@ mod tests {
         let stream = init_cuda();
         unsafe {
             let mut handle = CublasHandle::new(stream).unwrap();
-            let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
+            let mut arena = CachingAllocator::new();
 
             // A = [2, 3], B = identity-like [3, 3]
             // A @ B^T should give A when B = I (but B is [N,K] so B^T = I^T = I).
@@ -766,7 +788,7 @@ mod tests {
         let stream = init_cuda();
         unsafe {
             let mut handle = CublasHandle::new(stream).unwrap();
-            let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
+            let mut arena = CachingAllocator::new();
 
             // A = [[1, 2], [3, 4]] (2x2)
             // B = [[5, 6], [7, 8]] (2x2)
@@ -815,7 +837,7 @@ mod tests {
         let stream = init_cuda();
         unsafe {
             let mut handle = CublasHandle::new(stream).unwrap();
-            let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
+            let mut arena = CachingAllocator::new();
 
             // A = [4, 8], B = [16, 8] → C = [4, 16]
             let m = 4usize;
@@ -858,7 +880,7 @@ mod tests {
         let stream = init_cuda();
         unsafe {
             let mut handle = CublasHandle::new(stream).unwrap();
-            let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
+            let mut arena = CachingAllocator::new();
 
             let gpu_a = driver::mem_alloc(64).unwrap();
             let gpu_b = driver::mem_alloc(64).unwrap();
@@ -868,12 +890,12 @@ mod tests {
             let a = GpuTensor::new(gpu_a, &[2, 8], DType::F32);
             let b = GpuTensor::new(gpu_b, &[4, 8], DType::F32);
 
-            let used_before = arena.used();
+            let blocks_before = arena.total_block_count();
             let c = handle.gemm(a, b, &mut arena);
-            let used_after = arena.used();
+            let blocks_after = arena.total_block_count();
 
-            // Arena should have grown by the output size (2 * 4 * 4 = 32 bytes, aligned to 256).
-            assert!(used_after > used_before);
+            // Should have allocated a new block for the output.
+            assert!(blocks_after > blocks_before);
             assert_eq!(c.numel(), 8); // 2 * 4
 
             driver::mem_free(gpu_a).unwrap();
@@ -887,7 +909,7 @@ mod tests {
         let stream = init_cuda();
         unsafe {
             let mut handle = CublasHandle::new(stream).unwrap();
-            let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
+            let mut arena = CachingAllocator::new();
 
             // A = [[1, 2], [3, 4]] (2x2)
             // B = [[5, 6], [7, 8]] (2x2)  (weight)

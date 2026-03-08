@@ -1,0 +1,797 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Caching GPU memory allocator — matches PyTorch's CUDACachingAllocator design.
+//!
+//! Key features (all matching PyTorch):
+//! - **Segments**: Large `cudaMalloc` calls (2 MB for small, ≥10 MB for large)
+//! - **Block splitting**: A segment is divided into blocks; when a request
+//!   is smaller than a free block, the block is split and the remainder stays free
+//! - **Block coalescing**: When a block is freed, it merges with adjacent free blocks
+//! - **Two pools**: small (≤1 MB) and large (>1 MB), each with a sorted free set
+//! - **Private pools**: For CUDA graph capture (like PyTorch's beginAllocateToPool)
+
+use crate::driver;
+use crate::dtype::DType;
+use crate::tensor::GpuTensor;
+use std::collections::BTreeSet;
+use std::ptr;
+
+// ---------------------------------------------------------------------------
+// Constants (matching PyTorch exactly)
+// ---------------------------------------------------------------------------
+
+/// Minimum block size (all allocations rounded up to this).
+const K_MIN_BLOCK_SIZE: usize = 512;
+/// Largest "small" allocation.
+const K_SMALL_SIZE: usize = 1_048_576; // 1 MiB
+/// Segment size for small allocations.
+const K_SMALL_BUFFER: usize = 2_097_152; // 2 MiB
+/// Minimum size for a direct large allocation.
+const K_MIN_LARGE_ALLOC: usize = 10_485_760; // 10 MiB
+/// Round up large allocations to this.
+const K_ROUND_LARGE: usize = 2_097_152; // 2 MiB
+
+// ---------------------------------------------------------------------------
+// Block — sub-allocation within a segment
+// ---------------------------------------------------------------------------
+
+struct Block {
+    ptr: *mut u8,
+    size: usize,
+    allocated: bool,
+    prev: *mut Block,
+    next: *mut Block,
+    pool_is_small: bool,
+}
+
+impl Block {
+    #[allow(dead_code)]
+    fn is_split(&self) -> bool {
+        !self.prev.is_null() || !self.next.is_null()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BlockPool — sorted set of free blocks (by size then address)
+// ---------------------------------------------------------------------------
+
+/// Comparison key for the free block set: (size, ptr address).
+/// Sorted by size first (best-fit), then by address for determinism.
+#[derive(Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
+struct BlockKey {
+    size: usize,
+    ptr: usize,
+}
+
+impl BlockKey {
+    fn from_block(b: &Block) -> Self {
+        Self {
+            size: b.size,
+            ptr: b.ptr as usize,
+        }
+    }
+}
+
+struct BlockPool {
+    /// Free blocks sorted by (size, address) for best-fit search.
+    free_blocks: BTreeSet<(BlockKey, *mut Block)>,
+    is_small: bool,
+}
+
+unsafe impl Send for BlockPool {}
+
+impl BlockPool {
+    fn new(is_small: bool) -> Self {
+        Self {
+            free_blocks: BTreeSet::new(),
+            is_small,
+        }
+    }
+
+    fn insert(&mut self, block: *mut Block) {
+        let b = unsafe { &*block };
+        self.free_blocks.insert((BlockKey::from_block(b), block));
+    }
+
+    fn remove(&mut self, block: *mut Block) {
+        let b = unsafe { &*block };
+        self.free_blocks.remove(&(BlockKey::from_block(b), block));
+    }
+
+    /// Find the smallest free block >= `size`.
+    fn find_best_fit(&mut self, size: usize) -> Option<*mut Block> {
+        let search = BlockKey { size, ptr: 0 };
+        if let Some(&(_, block)) = self.free_blocks.range((search, ptr::null_mut())..).next() {
+            Some(block)
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CachingAllocator
+// ---------------------------------------------------------------------------
+
+/// A caching GPU memory allocator matching PyTorch's CUDACachingAllocator.
+pub struct CachingAllocator {
+    small_pool: BlockPool,
+    large_pool: BlockPool,
+    /// All allocated segments (for cleanup on drop).
+    segments: Vec<(*mut u8, usize)>,
+    /// All Block structs (for cleanup on drop).
+    all_blocks: Vec<*mut Block>,
+    /// Active blocks keyed by ptr (for fast lookup on free).
+    active_blocks: std::collections::HashMap<usize, *mut Block>,
+    /// Private pool redirect (for CUDA graph capture).
+    private_small_pool: Option<BlockPool>,
+    private_large_pool: Option<BlockPool>,
+}
+
+unsafe impl Send for CachingAllocator {}
+unsafe impl Sync for CachingAllocator {}
+
+impl Default for CachingAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CachingAllocator {
+    pub fn new() -> Self {
+        Self {
+            small_pool: BlockPool::new(true),
+            large_pool: BlockPool::new(false),
+            segments: Vec::new(),
+            all_blocks: Vec::new(),
+            active_blocks: std::collections::HashMap::new(),
+            private_small_pool: None,
+            private_large_pool: None,
+        }
+    }
+
+    /// Begin allocating to a private pool (for CUDA graph capture).
+    pub fn begin_allocate_to_pool(&mut self) {
+        assert!(
+            self.private_small_pool.is_none(),
+            "already allocating to a pool"
+        );
+        self.private_small_pool = Some(BlockPool::new(true));
+        self.private_large_pool = Some(BlockPool::new(false));
+    }
+
+    /// Stop allocating to the private pool.
+    pub fn end_allocate_to_pool(&mut self) {
+        self.private_small_pool = None;
+        self.private_large_pool = None;
+    }
+
+    pub fn is_pool_active(&self) -> bool {
+        self.private_small_pool.is_some()
+    }
+
+    fn get_pool(&mut self, size: usize) -> &mut BlockPool {
+        self.get_pool_by_flag(size <= K_SMALL_SIZE)
+    }
+
+    fn get_pool_by_flag(&mut self, is_small: bool) -> &mut BlockPool {
+        if is_small {
+            if let Some(ref mut pp) = self.private_small_pool {
+                pp
+            } else {
+                &mut self.small_pool
+            }
+        } else if let Some(ref mut pp) = self.private_large_pool {
+            pp
+        } else {
+            &mut self.large_pool
+        }
+    }
+
+    /// Round size to minimum block size.
+    fn round_size(size: usize) -> usize {
+        if size < K_MIN_BLOCK_SIZE {
+            K_MIN_BLOCK_SIZE
+        } else {
+            K_MIN_BLOCK_SIZE * size.div_ceil(K_MIN_BLOCK_SIZE)
+        }
+    }
+
+    /// Determine cudaMalloc size for a given request.
+    fn get_allocation_size(size: usize) -> usize {
+        if size <= K_SMALL_SIZE {
+            K_SMALL_BUFFER
+        } else if size < K_MIN_LARGE_ALLOC {
+            // Default large segment: 20 MB (matching PyTorch's default)
+            20 * 1024 * 1024
+        } else {
+            K_ROUND_LARGE * size.div_ceil(K_ROUND_LARGE)
+        }
+    }
+
+    fn should_split(block: &Block, size: usize) -> bool {
+        let remaining = block.size - size;
+        if block.pool_is_small {
+            remaining >= K_MIN_BLOCK_SIZE
+        } else {
+            remaining > K_SMALL_SIZE
+        }
+    }
+
+    /// Allocate GPU memory.
+    pub fn alloc(&mut self, orig_size: usize) -> *mut u8 {
+        let size = Self::round_size(orig_size);
+
+        // 1. Try to find a free block in the pool.
+        let pool = self.get_pool(size);
+        let is_small = pool.is_small;
+        if let Some(block_ptr) = pool.find_best_fit(size) {
+            let block = unsafe { &mut *block_ptr };
+            pool.remove(block_ptr);
+
+            // Split if remainder is large enough.
+            if Self::should_split(block, size) {
+                let remaining_size = block.size - size;
+                let remaining_ptr = unsafe { block.ptr.add(size) };
+
+                let remaining = Box::into_raw(Box::new(Block {
+                    ptr: remaining_ptr,
+                    size: remaining_size,
+                    allocated: false,
+                    prev: block_ptr,
+                    next: block.next,
+                    pool_is_small: is_small,
+                }));
+                self.all_blocks.push(remaining);
+
+                if !block.next.is_null() {
+                    unsafe { (*block.next).prev = remaining };
+                }
+                block.next = remaining;
+                block.size = size;
+
+                // Remainder stays in the same pool as the parent block.
+                self.get_pool_by_flag(is_small).insert(remaining);
+            }
+
+            block.allocated = true;
+            self.active_blocks.insert(block.ptr as usize, block_ptr);
+            return block.ptr;
+        }
+
+        // 2. Also try the main pools if using private pool.
+        if self.private_small_pool.is_some() {
+            let main_pool = if size <= K_SMALL_SIZE {
+                &mut self.small_pool
+            } else {
+                &mut self.large_pool
+            };
+            if let Some(block_ptr) = main_pool.find_best_fit(size) {
+                let block = unsafe { &mut *block_ptr };
+                main_pool.remove(block_ptr);
+
+                if Self::should_split(block, size) {
+                    let remaining_size = block.size - size;
+                    let remaining_ptr = unsafe { block.ptr.add(size) };
+
+                    let remaining = Box::into_raw(Box::new(Block {
+                        ptr: remaining_ptr,
+                        size: remaining_size,
+                        allocated: false,
+                        prev: block_ptr,
+                        next: block.next,
+                        pool_is_small: is_small,
+                    }));
+                    self.all_blocks.push(remaining);
+
+                    if !block.next.is_null() {
+                        unsafe { (*block.next).prev = remaining };
+                    }
+                    block.next = remaining;
+                    block.size = size;
+
+                    // Remainder stays in the same pool as the parent block.
+                    self.get_pool_by_flag(is_small).insert(remaining);
+                }
+
+                block.allocated = true;
+                self.active_blocks.insert(block.ptr as usize, block_ptr);
+                return block.ptr;
+            }
+        }
+
+        // 3. Allocate a new segment from the CUDA driver.
+        let alloc_size = Self::get_allocation_size(size);
+        tracing::debug!(
+            "CachingAllocator: cudaMalloc {alloc_size} bytes for request of {size} bytes \
+             (small_free={}, large_free={}, private={}, segments={})",
+            self.small_pool.free_blocks.len(),
+            self.large_pool.free_blocks.len(),
+            self.private_small_pool.is_some(),
+            self.segments.len(),
+        );
+        let segment_ptr =
+            unsafe { driver::mem_alloc(alloc_size) }.expect("CachingAllocator: GPU OOM");
+        self.segments.push((segment_ptr, alloc_size));
+
+        let block = Box::into_raw(Box::new(Block {
+            ptr: segment_ptr,
+            size: alloc_size,
+            allocated: false,
+            prev: ptr::null_mut(),
+            next: ptr::null_mut(),
+            pool_is_small: is_small,
+        }));
+        self.all_blocks.push(block);
+
+        // Split the segment block if needed.
+        let b = unsafe { &mut *block };
+        if Self::should_split(b, size) {
+            let remaining_size = b.size - size;
+            let remaining_ptr = unsafe { b.ptr.add(size) };
+
+            let remaining = Box::into_raw(Box::new(Block {
+                ptr: remaining_ptr,
+                size: remaining_size,
+                allocated: false,
+                prev: block,
+                next: ptr::null_mut(),
+                pool_is_small: is_small,
+            }));
+            self.all_blocks.push(remaining);
+
+            b.next = remaining;
+            b.size = size;
+
+            self.get_pool_by_flag(is_small).insert(remaining);
+        }
+
+        b.allocated = true;
+        self.active_blocks.insert(b.ptr as usize, block);
+        b.ptr
+    }
+
+    /// Free GPU memory (returns block to free pool, coalesces with neighbors).
+    pub unsafe fn free(&mut self, ptr: *mut u8, _size_bytes: usize) {
+        let Some(block_ptr) = self.active_blocks.remove(&(ptr as usize)) else {
+            return; // not tracked (e.g., persistent allocation)
+        };
+
+        let block = &mut *block_ptr;
+        block.allocated = false;
+
+        // Try merge with prev.
+        if !block.prev.is_null() {
+            let prev = &mut *block.prev;
+            if !prev.allocated {
+                // Remove prev from its free pool.
+                self.get_pool_by_flag(prev.pool_is_small).remove(block.prev);
+
+                // Merge: prev absorbs block.
+                prev.size += block.size;
+                prev.next = block.next;
+                if !block.next.is_null() {
+                    (*block.next).prev = block.prev;
+                }
+
+                // block is now dead; continue with prev as the merged block.
+                // (We don't delete block — it stays in all_blocks for cleanup.)
+                let merged = block.prev;
+                // Try merge merged with next.
+                let merged_block = &mut *merged;
+                if !merged_block.next.is_null() {
+                    let next = &mut *merged_block.next;
+                    if !next.allocated {
+                        self.get_pool_by_flag(next.pool_is_small)
+                            .remove(merged_block.next);
+
+                        merged_block.size += next.size;
+                        merged_block.next = next.next;
+                        if !next.next.is_null() {
+                            (*next.next).prev = merged;
+                        }
+                    }
+                }
+
+                self.get_pool_by_flag(merged_block.pool_is_small)
+                    .insert(merged);
+                return;
+            }
+        }
+
+        // Try merge with next.
+        if !block.next.is_null() {
+            let next = &mut *block.next;
+            if !next.allocated {
+                self.get_pool_by_flag(next.pool_is_small).remove(block.next);
+
+                block.size += next.size;
+                block.next = next.next;
+                if !next.next.is_null() {
+                    (*next.next).prev = block_ptr;
+                }
+            }
+        }
+
+        // Insert into free pool.
+        self.get_pool_by_flag(block.pool_is_small).insert(block_ptr);
+    }
+
+    /// Allocate a GPU tensor (leaked — not auto-freed on drop).
+    pub fn alloc_gpu_tensor(&mut self, shape: &[usize], dtype: DType) -> GpuTensor {
+        let numel: usize = shape.iter().product();
+        let size_bytes = numel * dtype.size_bytes();
+        let ptr = self.alloc(size_bytes);
+        unsafe { GpuTensor::new(ptr, shape, dtype) }
+    }
+
+    /// Allocate an owned tensor (freed on drop).
+    pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> OwnedTensor {
+        let numel: usize = shape.iter().product();
+        let size_bytes = numel * dtype.size_bytes();
+        let ptr = self.alloc(size_bytes);
+        let inner = unsafe { GpuTensor::new(ptr, shape, dtype) };
+        OwnedTensor {
+            inner,
+            alloc: self as *mut CachingAllocator,
+            size_bytes,
+        }
+    }
+
+    /// Free all leaked blocks (blocks that are allocated but not in active_blocks
+    /// because they were leaked via into_gpu_tensor). Blocks in `keep` are skipped.
+    pub unsafe fn free_leaked_blocks_except(&mut self, keep: &[*const u8]) {
+        let keep_set: std::collections::HashSet<usize> = keep.iter().map(|&p| p as usize).collect();
+
+        // Find leaked blocks: allocated, not in active_blocks, not in keep.
+        let leaked_ptrs: Vec<*mut Block> = self
+            .all_blocks
+            .iter()
+            .filter_map(|&bp| {
+                let b = &*bp;
+                if b.allocated
+                    && !self.active_blocks.contains_key(&(b.ptr as usize))
+                    && !keep_set.contains(&(b.ptr as usize))
+                {
+                    Some(bp)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Free each leaked block directly (bypass active_blocks lookup).
+        for block_ptr in leaked_ptrs {
+            let block = &mut *block_ptr;
+            block.allocated = false;
+
+            // Try merge with prev.
+            if !block.prev.is_null() {
+                let prev = &*block.prev;
+                if !prev.allocated {
+                    self.get_pool_by_flag(prev.pool_is_small).remove(block.prev);
+                    let prev = &mut *block.prev;
+                    prev.size += block.size;
+                    prev.next = block.next;
+                    if !block.next.is_null() {
+                        (*block.next).prev = block.prev;
+                    }
+                    // Try merge prev with next.
+                    if !prev.next.is_null() {
+                        let next = &*prev.next;
+                        if !next.allocated {
+                            self.get_pool_by_flag(next.pool_is_small).remove(prev.next);
+                            prev.size += next.size;
+                            let next_next = (*prev.next).next;
+                            prev.next = next_next;
+                            if !next_next.is_null() {
+                                (*next_next).prev = block.prev;
+                            }
+                        }
+                    }
+                    self.get_pool_by_flag(prev.pool_is_small).insert(block.prev);
+                    continue;
+                }
+            }
+
+            // Try merge with next.
+            if !block.next.is_null() {
+                let next = &*block.next;
+                if !next.allocated {
+                    self.get_pool_by_flag(next.pool_is_small).remove(block.next);
+                    block.size += (*block.next).size;
+                    let next_next = (*block.next).next;
+                    block.next = next_next;
+                    if !next_next.is_null() {
+                        (*next_next).prev = block_ptr;
+                    }
+                }
+            }
+
+            self.get_pool_by_flag(block.pool_is_small).insert(block_ptr);
+        }
+    }
+
+    /// Free all leaked blocks.
+    pub unsafe fn free_leaked_blocks(&mut self) {
+        let before = self
+            .all_blocks
+            .iter()
+            .filter(|&&bp| {
+                let b = &*bp;
+                b.allocated && !self.active_blocks.contains_key(&(b.ptr as usize))
+            })
+            .count();
+        self.free_leaked_blocks_except(&[]);
+        if before > 0 {
+            tracing::debug!("free_leaked_blocks: freed {before} leaked blocks");
+        }
+    }
+
+    pub fn free_block_count(&self) -> usize {
+        self.small_pool.free_blocks.len() + self.large_pool.free_blocks.len()
+    }
+
+    pub fn total_block_count(&self) -> usize {
+        self.all_blocks.len()
+    }
+
+    pub fn trim(&mut self) {
+        // TODO: release unsplit segments back to driver
+    }
+}
+
+impl Drop for CachingAllocator {
+    fn drop(&mut self) {
+        // Free all segments.
+        for &(ptr, _) in &self.segments {
+            unsafe {
+                let _ = driver::mem_free(ptr);
+            }
+        }
+        // Free all Block structs.
+        for &bp in &self.all_blocks {
+            unsafe {
+                let _ = Box::from_raw(bp);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OwnedTensor
+// ---------------------------------------------------------------------------
+
+/// A GPU tensor that owns its memory via the caching allocator.
+/// When dropped, the underlying memory is returned to the allocator's free pool.
+pub struct OwnedTensor {
+    inner: GpuTensor,
+    alloc: *mut CachingAllocator,
+    size_bytes: usize,
+}
+
+unsafe impl Send for OwnedTensor {}
+unsafe impl Sync for OwnedTensor {}
+
+impl OwnedTensor {
+    pub fn as_gpu_tensor(&self) -> GpuTensor {
+        self.inner
+    }
+
+    /// Consume self, return GpuTensor WITHOUT freeing. The block stays allocated
+    /// but is removed from active_blocks tracking (so free_leaked_blocks can find it).
+    pub fn into_gpu_tensor(self) -> GpuTensor {
+        let t = self.inner;
+        // Remove from active_blocks so free_leaked_blocks can detect this as leaked.
+        unsafe {
+            (*self.alloc).active_blocks.remove(&(t.raw_ptr() as usize));
+        }
+        std::mem::forget(self);
+        t
+    }
+
+    /// Create from raw parts.
+    pub unsafe fn from_raw(
+        inner: GpuTensor,
+        alloc: *mut CachingAllocator,
+        size_bytes: usize,
+    ) -> Self {
+        Self {
+            inner,
+            alloc,
+            size_bytes,
+        }
+    }
+}
+
+impl Drop for OwnedTensor {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.alloc).free(self.inner.raw_ptr(), self.size_bytes);
+        }
+    }
+}
+
+impl std::ops::Deref for OwnedTensor {
+    type Target = GpuTensor;
+    fn deref(&self) -> &GpuTensor {
+        &self.inner
+    }
+}
+
+impl std::fmt::Debug for OwnedTensor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OwnedTensor({:?})", self.inner)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_round_size() {
+        assert_eq!(CachingAllocator::round_size(0), K_MIN_BLOCK_SIZE);
+        assert_eq!(CachingAllocator::round_size(1), K_MIN_BLOCK_SIZE);
+        assert_eq!(CachingAllocator::round_size(512), 512);
+        assert_eq!(CachingAllocator::round_size(513), 1024);
+        assert_eq!(CachingAllocator::round_size(1024), 1024);
+    }
+
+    #[test]
+    fn test_get_allocation_size() {
+        // Small: always 2 MB segment.
+        assert_eq!(CachingAllocator::get_allocation_size(256), K_SMALL_BUFFER);
+        assert_eq!(
+            CachingAllocator::get_allocation_size(K_SMALL_SIZE),
+            K_SMALL_BUFFER
+        );
+        // Medium: 20 MB segment.
+        assert_eq!(
+            CachingAllocator::get_allocation_size(K_SMALL_SIZE + 1),
+            20 * 1024 * 1024
+        );
+        // Large: rounded to 2 MB.
+        assert_eq!(
+            CachingAllocator::get_allocation_size(K_MIN_LARGE_ALLOC),
+            K_MIN_LARGE_ALLOC
+        );
+        assert_eq!(
+            CachingAllocator::get_allocation_size(K_MIN_LARGE_ALLOC + 1),
+            12 * 1024 * 1024
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    mod cuda_tests {
+        use super::*;
+
+        fn init_cuda() {
+            unsafe {
+                driver::init().expect("CUDA init");
+                let dev = driver::device_get(0).expect("device");
+                let _ctx = driver::ctx_create(dev).expect("context");
+            }
+        }
+
+        #[test]
+        fn test_alloc_and_free() {
+            init_cuda();
+            let mut alloc = CachingAllocator::new();
+
+            let ptr1 = alloc.alloc(1024);
+            assert!(!ptr1.is_null());
+
+            unsafe { alloc.free(ptr1, 1024) };
+
+            // Re-alloc same size should reuse.
+            let ptr2 = alloc.alloc(1024);
+            assert_eq!(ptr1, ptr2);
+
+            unsafe { alloc.free(ptr2, 1024) };
+        }
+
+        #[test]
+        fn test_block_splitting() {
+            init_cuda();
+            let mut alloc = CachingAllocator::new();
+
+            // Alloc 1 KB from a 2 MB segment — should split.
+            let ptr1 = alloc.alloc(1024);
+            // Free it — block returns to pool.
+            unsafe { alloc.free(ptr1, 1024) };
+
+            // Alloc a different size (512 bytes) — should reuse the same block
+            // (split from the same segment).
+            let ptr2 = alloc.alloc(512);
+            assert_eq!(ptr1, ptr2); // same start address (best fit = first block)
+
+            unsafe { alloc.free(ptr2, 512) };
+
+            // Only 1 segment should have been allocated.
+            assert_eq!(alloc.segments.len(), 1);
+        }
+
+        #[test]
+        fn test_block_coalescing() {
+            init_cuda();
+            let mut alloc = CachingAllocator::new();
+
+            // Alloc two blocks from the same segment.
+            let ptr1 = alloc.alloc(1024);
+            let ptr2 = alloc.alloc(1024);
+            assert_ne!(ptr1, ptr2);
+
+            // Free both — they should coalesce.
+            unsafe {
+                alloc.free(ptr1, 1024);
+                alloc.free(ptr2, 1024);
+            }
+
+            // One segment, and the coalesced free block should be large enough
+            // for a bigger allocation without a new segment.
+            let ptr3 = alloc.alloc(2048);
+            assert_eq!(ptr3, ptr1); // reuses the coalesced block
+            assert_eq!(alloc.segments.len(), 1);
+
+            unsafe { alloc.free(ptr3, 2048) };
+        }
+
+        #[test]
+        fn test_owned_tensor() {
+            init_cuda();
+            let mut alloc = CachingAllocator::new();
+
+            let ptr;
+            {
+                let t = alloc.alloc_tensor(&[32, 4096], DType::BF16);
+                ptr = t.as_gpu_tensor().raw_ptr();
+                assert_eq!(t.dim(0), 32);
+                assert_eq!(t.dim(1), 4096);
+            }
+            // Block freed on drop — should be reusable.
+            let t2 = alloc.alloc_tensor(&[32, 4096], DType::BF16);
+            assert_eq!(t2.as_gpu_tensor().raw_ptr(), ptr);
+        }
+
+        #[test]
+        fn test_into_gpu_tensor_no_free() {
+            init_cuda();
+            let mut alloc = CachingAllocator::new();
+            let t = alloc.alloc_tensor(&[16, 128], DType::F32);
+            let free_before = alloc.free_block_count(); // remainder from segment split
+            let gpu = t.into_gpu_tensor();
+            // Block is leaked: not in active_blocks, not in free pool.
+            // free_block_count unchanged (remainder is still there, leaked block is not freed).
+            assert_eq!(alloc.free_block_count(), free_before);
+            assert_eq!(alloc.active_blocks.len(), 0); // removed by into_gpu_tensor
+            // Manually free leaked block back.
+            unsafe { alloc.free_leaked_blocks() };
+            // Now the freed block coalesces with remainder → one larger free block.
+            assert!(alloc.free_block_count() >= 1);
+            let _ = gpu;
+        }
+
+        #[test]
+        fn test_different_sizes_share_segment() {
+            init_cuda();
+            let mut alloc = CachingAllocator::new();
+
+            // Multiple small allocations should share one 2 MB segment.
+            let p1 = alloc.alloc(512);
+            let p2 = alloc.alloc(1024);
+            let p3 = alloc.alloc(2048);
+
+            assert_eq!(alloc.segments.len(), 1); // all from one 2 MB segment
+
+            unsafe {
+                alloc.free(p1, 512);
+                alloc.free(p2, 1024);
+                alloc.free(p3, 2048);
+            }
+        }
+    }
+}

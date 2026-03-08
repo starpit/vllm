@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 
+use crate::alloc::OwnedTensor;
 use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kernels;
@@ -230,22 +231,31 @@ impl LlamaMLP {
 
     /// Forward pass.
     pub unsafe fn forward(&self, x: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
-        // gate_up_proj: [num_tokens, 2*intermediate]
+        self.forward_owned(x, device).into_gpu_tensor()
+    }
+
+    /// Forward pass returning `OwnedTensor` (caching-allocator path).
+    ///
+    /// Intermediates (gate_up, activated) are owned and freed at end of scope.
+    /// Only the final down_proj output survives.
+    pub unsafe fn forward_owned(&self, x: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
         let gate_up = self
             .gate_up_proj
-            .forward(x, &mut device.cublas, &mut device.arena);
-
-        // Fused SiLU(gate) * up → [num_tokens, intermediate]
+            .forward_owned(x, &mut device.cublas, &mut device.caching);
         let activated = kernels::silu_and_mul_fused(
-            gate_up,
+            gate_up.as_gpu_tensor(),
             self.intermediate_size,
-            &mut device.arena,
+            &mut device.caching,
             device.compute_stream,
         );
-
-        // down_proj: [num_tokens, hidden]
-        self.down_proj
-            .forward(activated, &mut device.cublas, &mut device.arena)
+        drop(gate_up); // return gate_up memory to free list
+        let result = self.down_proj.forward_owned(
+            activated.as_gpu_tensor(),
+            &mut device.cublas,
+            &mut device.caching,
+        );
+        drop(activated);
+        result
     }
 }
 
@@ -315,17 +325,48 @@ impl LlamaAttention {
         rotary: &RotaryCache,
         device: &mut GpuDevice,
     ) -> GpuTensor {
+        self.forward_owned(
+            hidden_states,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            rotary,
+            device,
+        )
+        .into_gpu_tensor()
+    }
+
+    /// Forward pass returning `OwnedTensor` (caching-allocator path).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_owned(
+        &self,
+        hidden_states: GpuTensor,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        rotary: &RotaryCache,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
         let num_tokens = hidden_states.dim(0);
 
-        // Fused QKV projection: [num_tokens, q_size + 2*kv_size]
-        let qkv = self
-            .qkv_proj
-            .forward(hidden_states, &mut device.cublas, &mut device.arena);
+        // QKV projection → owned.
+        let qkv =
+            self.qkv_proj
+                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
 
-        // Fused QKV split + RoPE: reads from QKV, applies RoPE to Q/K,
-        // copies V, writes contiguous outputs (1 kernel instead of 2).
+        // Fused QKV split + RoPE → owned Q, K, V.
         let (q, k, v) = kernels::fused_qkv_rope(
-            qkv,
+            qkv.as_gpu_tensor(),
             positions,
             rotary.cos_sin_cache,
             self.q_size,
@@ -333,14 +374,15 @@ impl LlamaAttention {
             self.num_q_heads,
             self.num_kv_heads,
             self.head_dim,
-            &mut device.arena,
+            &mut device.caching,
             device.compute_stream,
         );
+        drop(qkv); // free QKV projection output
 
-        // Write new K/V tokens into paged cache.
+        // Write new K/V into paged cache (reads from k, v).
         kernels::reshape_and_cache(
-            k,
-            v,
+            k.as_gpu_tensor(),
+            v.as_gpu_tensor(),
             kv_cache.k_cache(self.layer_idx),
             kv_cache.v_cache(self.layer_idx),
             slot_mapping,
@@ -348,32 +390,29 @@ impl LlamaAttention {
             device.compute_stream,
         );
 
-        // Choose attention path:
-        // - Fresh prefill (q_len > 1, no cached tokens): contiguous FA2
-        // - Decode / prefix-cached prefill: paged FA2 reading from block cache
         let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
         let attn_output = if fresh_prefill {
-            // Fresh prefill: K/V are contiguous [num_tokens, num_kv_heads, head_dim].
-            // Q lengths == K lengths, so cu_seqlens_q works for both.
             kernels::flash_attn_contiguous(
-                q,
-                k,
-                v,
+                q.as_gpu_tensor(),
+                k.as_gpu_tensor(),
+                v.as_gpu_tensor(),
                 cu_seqlens_q,
-                cu_seqlens_q, // Q==K for fresh prefill
+                cu_seqlens_q,
                 max_seqlen_q,
                 max_seqlen_k,
                 self.scale,
-                true, // causal
-                0.0,  // no softcap
-                -1,   // no sliding window
-                &mut device.arena,
+                true,
+                0.0,
+                -1,
+                &mut device.caching,
                 device.compute_stream,
             )
         } else {
-            // Paged FA2: reads K/V directly from block cache via block_table.
+            // K, V no longer needed after reshape_and_cache (data is in the cache).
+            drop(k);
+            drop(v);
             kernels::flash_attn_paged(
-                q,
+                q.as_gpu_tensor(),
                 kv_cache.k_cache(self.layer_idx),
                 kv_cache.v_cache(self.layer_idx),
                 cu_seqlens_q,
@@ -382,18 +421,24 @@ impl LlamaAttention {
                 max_seqlen_q,
                 max_seqlen_k,
                 self.scale,
-                true, // causal
+                true,
                 kv_cache.block_size,
                 device.num_sm,
-                &mut device.arena,
+                &mut device.caching,
                 device.compute_stream,
             )
         };
+        drop(q); // free Q
 
         // Reshape to [num_tokens, q_size] and output projection.
-        let attn_flat = attn_output.reshape(&[num_tokens, self.q_size]);
-        self.o_proj
-            .forward(attn_flat, &mut device.cublas, &mut device.arena)
+        let attn_flat = attn_output
+            .as_gpu_tensor()
+            .reshape(&[num_tokens, self.q_size]);
+        let result = self
+            .o_proj
+            .forward_owned(attn_flat, &mut device.cublas, &mut device.caching);
+        drop(attn_output);
+        result
     }
 }
 
@@ -418,11 +463,23 @@ impl LlamaDecoderLayer {
     /// * `residual` — residual stream (`None` for first layer)
     ///
     /// Returns `(mlp_output, residual)`.
+    /// Forward using caching allocator with proper Rust ownership.
+    ///
+    /// Uses `fused_add_rms_norm_inplace` (zero copies) and caching allocator
+    /// for all intermediate tensors.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward(
+    /// Forward using caching allocator with proper Rust ownership.
+    ///
+    /// `hidden_states`: OwnedTensor (MLP output from prev layer, or embedding).
+    ///   Consumed by this function — memory freed after attention reads it.
+    /// `residual`: Option<OwnedTensor>. None for first layer. Persists across layers.
+    ///
+    /// Returns `(mlp_output: OwnedTensor, residual: OwnedTensor)`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_owned(
         &self,
-        hidden_states: GpuTensor,
-        residual: Option<GpuTensor>,
+        hidden_states: OwnedTensor,
+        residual: Option<OwnedTensor>,
         positions: GpuTensor,
         slot_mapping: GpuTensor,
         cu_seqlens_q: GpuTensor,
@@ -433,31 +490,41 @@ impl LlamaDecoderLayer {
         kv_cache: &KvCachePool,
         rotary: &RotaryCache,
         device: &mut GpuDevice,
-    ) -> (GpuTensor, GpuTensor) {
-        // Pre-attention norm with fused residual add.
+    ) -> (OwnedTensor, OwnedTensor) {
+        // Pre-attention norm with fused residual add (in-place).
         let (normed, residual) = if let Some(residual) = residual {
-            kernels::fused_add_rms_norm(
-                hidden_states,
-                residual,
+            // fused_add_rms_norm_inplace mutates both in-place:
+            //   hidden_states buffer → normed values
+            //   residual buffer → residual += old_hidden_states
+            // After this, hidden_states OwnedTensor still owns its buffer (now normed).
+            // residual OwnedTensor still owns its buffer (updated).
+            let hs_gpu = *hidden_states; // GpuTensor copy via deref
+            let res_gpu = *residual; // GpuTensor copy via deref
+            kernels::fused_add_rms_norm_inplace(
+                hs_gpu,
+                res_gpu,
                 self.input_layernorm.weight,
                 self.input_layernorm.eps,
-                &mut device.arena,
-                device.compute_stream,
-            )
-        } else {
-            let normed = kernels::rms_norm(
-                hidden_states,
-                self.input_layernorm.weight,
-                self.input_layernorm.eps,
-                &mut device.arena,
                 device.compute_stream,
             );
-            (normed, hidden_states)
+            // hidden_states buffer now contains normed values.
+            // residual buffer is updated. Both OwnedTensors keep ownership.
+            (hidden_states, residual)
+        } else {
+            // First layer: allocate NEW buffer for normed. hidden_states becomes residual.
+            let normed = kernels::rms_norm(
+                *hidden_states,
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+                &mut device.caching,
+                device.compute_stream,
+            );
+            (normed, hidden_states) // hidden_states ownership transfers to residual
         };
 
-        // Attention with paged KV cache.
-        let attn_output = self.self_attn.forward(
-            normed,
+        // Attention reads normed values from hidden_states buffer.
+        let attn_output = self.self_attn.forward_owned(
+            *normed, // GpuTensor copy — kernel reads from this buffer
             positions,
             slot_mapping,
             cu_seqlens_q,
@@ -469,27 +536,34 @@ impl LlamaDecoderLayer {
             rotary,
             device,
         );
+        // normed (= hidden_states buffer) consumed by QKV projection — free it.
+        drop(normed);
 
-        // Granite: scale attention output before residual add.
+        // Granite: scale attention output.
         if self.residual_multiplier != 1.0 {
-            kernels::scale_inplace(attn_output, self.residual_multiplier, &device.cublas);
+            kernels::scale_inplace(*attn_output, self.residual_multiplier, &device.cublas);
         }
 
-        // Post-attention norm with fused residual add.
-        let (normed, residual) = kernels::fused_add_rms_norm(
-            attn_output,
-            residual,
+        // Post-attention norm: mutates attn_output buffer → post-normed,
+        // updates residual buffer.
+        let res_gpu = *residual;
+        kernels::fused_add_rms_norm_inplace(
+            *attn_output,
+            res_gpu,
             self.post_attention_layernorm.weight,
             self.post_attention_layernorm.eps,
-            &mut device.arena,
             device.compute_stream,
         );
-        // MLP.
-        let mlp_output = self.mlp.forward(normed, device);
+        // attn_output buffer now contains post-normed values.
 
-        // Granite: scale MLP output before next residual add.
+        // MLP reads post-normed from attn_output buffer.
+        let mlp_output = self.mlp.forward_owned(*attn_output, device);
+        // attn_output consumed by MLP — free it.
+        drop(attn_output);
+
+        // Granite: scale MLP output.
         if self.residual_multiplier != 1.0 {
-            kernels::scale_inplace(mlp_output, self.residual_multiplier, &device.cublas);
+            kernels::scale_inplace(*mlp_output, self.residual_multiplier, &device.cublas);
         }
 
         (mlp_output, residual)
@@ -536,38 +610,66 @@ impl LlamaModel {
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
     ) -> GpuTensor {
-        // Embedding lookup.
+        // Delegates to forward_owned (caching allocator, zero D2D copies).
+        self.forward_owned(
+            input_ids,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            device,
+        )
+    }
+
+    /// Forward pass using caching allocator — zero D2D copies between layers.
+    ///
+    /// This matches Python's PyTorch flow: intermediates are freed on drop,
+    /// `fused_add_rms_norm` mutates in-place, and only hidden_states + residual
+    /// survive between layers.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_owned(
+        &self,
+        input_ids: GpuTensor,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+    ) -> GpuTensor {
+        // Embedding lookup — owned, survives into first layer.
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
             input_ids,
-            &mut device.arena,
+            &mut device.caching,
             device.compute_stream,
         );
 
         // Granite: scale embeddings.
         if self.embedding_multiplier != 1.0 {
-            kernels::scale_inplace(hidden_states, self.embedding_multiplier, &device.cublas);
+            kernels::scale_inplace(
+                hidden_states.as_gpu_tensor(),
+                self.embedding_multiplier,
+                &device.cublas,
+            );
         }
 
-        // Decoder layers with per-layer arena scoping.
-        let num_tokens = hidden_states.dim(0);
-        let hidden_size = hidden_states.dim(1);
-        let dtype = hidden_states.dtype();
-        let hs_buf = device.arena.alloc(&[num_tokens, hidden_size], dtype);
-        let res_buf = device.arena.alloc(&[num_tokens, hidden_size], dtype);
-        crate::driver::memcpy_dtod_async(
-            hs_buf.raw_ptr() as *mut u8,
-            hidden_states.raw_ptr() as *const u8,
-            hidden_states.size_bytes(),
-            device.compute_stream,
-        )
-        .expect("dtod copy initial hidden_states");
-        let layer_scratch_base = device.arena.used();
+        // Like Python: OwnedTensor handles memory lifetime via Rust ownership.
+        // When hidden_states is replaced, the old OwnedTensor is dropped and
+        // its memory returns to the caching allocator's free list.
+        let mut hidden_states: OwnedTensor = hidden_states;
+        let mut residual: Option<OwnedTensor> = None;
 
-        let mut residual: Option<GpuTensor> = None;
         for layer in &self.layers {
-            let (hs, res) = layer.forward(
-                hs_buf,
+            let (hs, res) = layer.forward_owned(
+                hidden_states,
                 residual,
                 positions,
                 slot_mapping,
@@ -580,40 +682,27 @@ impl LlamaModel {
                 &self.rotary,
                 device,
             );
-            // Copy residual to persistent buffer FIRST if it aliases hs_buf
-            // (first layer: residual = hs_buf = original embedding).
-            if res.raw_ptr() != res_buf.raw_ptr() {
-                crate::driver::memcpy_dtod_async(
-                    res_buf.raw_ptr() as *mut u8,
-                    res.raw_ptr() as *const u8,
-                    res.size_bytes(),
-                    device.compute_stream,
-                )
-                .expect("dtod copy residual");
-            }
-            // Copy hidden_states (mlp_output, in scratch) to persistent buffer.
-            crate::driver::memcpy_dtod_async(
-                hs_buf.raw_ptr() as *mut u8,
-                hs.raw_ptr() as *const u8,
-                hs.size_bytes(),
-                device.compute_stream,
-            )
-            .expect("dtod copy hidden_states");
-            device.arena.set_offset(layer_scratch_base);
-            residual = Some(res_buf);
+            // Old hidden_states was consumed by the layer (dropped inside).
+            // Old residual was passed through (or created from hidden_states).
+            hidden_states = hs;
+            residual = Some(res);
         }
-        let hidden_states = hs_buf;
 
-        // Final norm with fused residual add.
-        let (normed, _) = kernels::fused_add_rms_norm(
-            hidden_states,
-            residual.unwrap(),
+        // Final norm: mutates hidden_states and residual in-place.
+        let hs_gpu = *hidden_states;
+        let res_gpu = residual.as_ref().unwrap().as_gpu_tensor();
+        kernels::fused_add_rms_norm_inplace(
+            hs_gpu,
+            res_gpu,
             self.norm.weight,
             self.norm.eps,
-            &mut device.arena,
             device.compute_stream,
         );
-        normed
+        // hidden_states buffer now contains normed values.
+        // Drop residual (frees the embedding/residual buffer).
+        drop(residual);
+        // Return hidden_states — caller owns this memory.
+        hidden_states.into_gpu_tensor()
     }
 }
 
@@ -668,19 +757,75 @@ impl LlamaForCausalLM {
             kernels::embedding_gather(
                 hidden_states,
                 indices,
-                &mut device.arena,
+                &mut device.caching,
                 device.compute_stream,
             )
+            .into_gpu_tensor()
         } else {
             hidden_states
         };
         let logits = self
             .lm_head
-            .forward(hidden_states, &mut device.cublas, &mut device.arena);
+            .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
         // Granite: scale logits by 1/logits_scaling.
         if self.logits_scaling != 1.0 {
             kernels::scale_inplace(logits, 1.0 / self.logits_scaling, &device.cublas);
+        }
+
+        logits
+    }
+
+    /// Forward using caching allocator (zero D2D copies between layers).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_owned(
+        &self,
+        input_ids: GpuTensor,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+        last_token_indices: Option<GpuTensor>,
+    ) -> GpuTensor {
+        let hidden_states = self.model.forward_owned(
+            input_ids,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            device,
+        );
+
+        // Gather last-token hidden states.
+        let hidden_states = if let Some(indices) = last_token_indices {
+            let gathered = kernels::embedding_gather(
+                hidden_states,
+                indices,
+                &mut device.caching,
+                device.compute_stream,
+            );
+            gathered.into_gpu_tensor()
+        } else {
+            hidden_states
+        };
+
+        // lm_head: logits = hidden_states @ lm_head_weight^T
+        let logits =
+            self.lm_head
+                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+        let logits = logits.into_gpu_tensor();
+
+        if self.logits_scaling != 1.0 {
+            kernels::scale_inplace(logits, self.logits_scaling.recip(), &device.cublas);
         }
 
         logits

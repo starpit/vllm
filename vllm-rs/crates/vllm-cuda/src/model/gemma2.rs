@@ -154,15 +154,15 @@ impl Gemma2MLP {
     pub unsafe fn forward(&self, x: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
         let gate_up = self
             .gate_up_proj
-            .forward(x, &mut device.cublas, &mut device.arena);
+            .forward(x, &mut device.cublas, &mut device.caching);
         let activated = kernels::gelu_and_mul_fused(
             gate_up,
             self.intermediate_size,
-            &mut device.arena,
+            &mut device.caching,
             device.compute_stream,
         );
         self.down_proj
-            .forward(activated, &mut device.cublas, &mut device.arena)
+            .forward(*activated, &mut device.cublas, &mut device.caching)
     }
 }
 
@@ -247,7 +247,7 @@ impl Gemma2Attention {
 
         let qkv = self
             .qkv_proj
-            .forward(hidden_states, &mut device.cublas, &mut device.arena);
+            .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
         let (q, k, v) = kernels::fused_qkv_rope(
             qkv,
@@ -258,13 +258,13 @@ impl Gemma2Attention {
             self.num_q_heads,
             self.num_kv_heads,
             self.head_dim,
-            &mut device.arena,
+            &mut device.caching,
             device.compute_stream,
         );
 
         kernels::reshape_and_cache(
-            k,
-            v,
+            *k,
+            *v,
             kv_cache.k_cache(self.layer_idx),
             kv_cache.v_cache(self.layer_idx),
             slot_mapping,
@@ -280,9 +280,9 @@ impl Gemma2Attention {
         let attn_output = if fresh_prefill {
             // Fresh prefill: Q lengths == K lengths, so cu_seqlens_q works for both.
             kernels::flash_attn_contiguous(
-                q,
-                k,
-                v,
+                *q,
+                *k,
+                *v,
                 cu_seqlens_q,
                 cu_seqlens_q, // Q==K for fresh prefill
                 max_seqlen_q,
@@ -291,12 +291,12 @@ impl Gemma2Attention {
                 true, // causal
                 self.attn_logit_softcapping,
                 window_left,
-                &mut device.arena,
+                &mut device.caching,
                 device.compute_stream,
             )
         } else {
             kernels::flash_attn_paged_ext(
-                q,
+                *q,
                 kv_cache.k_cache(self.layer_idx),
                 kv_cache.v_cache(self.layer_idx),
                 cu_seqlens_q,
@@ -310,14 +310,16 @@ impl Gemma2Attention {
                 window_left,
                 kv_cache.block_size,
                 device.num_sm,
-                &mut device.arena,
+                &mut device.caching,
                 device.compute_stream,
             )
         };
 
-        let attn_flat = attn_output.reshape(&[num_tokens, self.q_size]);
+        let attn_flat = attn_output
+            .into_gpu_tensor()
+            .reshape(&[num_tokens, self.q_size]);
         self.o_proj
-            .forward(attn_flat, &mut device.cublas, &mut device.arena)
+            .forward(attn_flat, &mut device.cublas, &mut device.caching)
     }
 }
 
@@ -428,7 +430,7 @@ impl Gemma2DecoderLayer {
                 residual,
                 self.input_layernorm.inner.weight,
                 self.input_layernorm.inner.eps,
-                &mut device.arena,
+                &mut device.caching,
                 device.compute_stream,
             )
         } else {
@@ -436,10 +438,10 @@ impl Gemma2DecoderLayer {
                 hidden_states,
                 self.input_layernorm.inner.weight,
                 self.input_layernorm.inner.eps,
-                &mut device.arena,
+                &mut device.caching,
                 device.compute_stream,
             );
-            (normed, hidden_states)
+            (normed.into_gpu_tensor(), hidden_states)
         };
 
         // 2. Attention.
@@ -462,17 +464,17 @@ impl Gemma2DecoderLayer {
             attn_output,
             self.post_attention_layernorm.inner.weight,
             self.post_attention_layernorm.inner.eps,
-            &mut device.arena,
+            &mut device.caching,
             device.compute_stream,
         );
 
         // 4. Pre-feedforward norm with fused residual add.
         let (normed, residual) = kernels::fused_add_rms_norm(
-            attn_normed,
+            *attn_normed,
             residual,
             self.pre_feedforward_layernorm.inner.weight,
             self.pre_feedforward_layernorm.inner.eps,
-            &mut device.arena,
+            &mut device.caching,
             device.compute_stream,
         );
 
@@ -484,11 +486,11 @@ impl Gemma2DecoderLayer {
             mlp_output,
             self.post_feedforward_layernorm.inner.weight,
             self.post_feedforward_layernorm.inner.eps,
-            &mut device.arena,
+            &mut device.caching,
             device.compute_stream,
         );
 
-        (mlp_normed, residual)
+        (mlp_normed.into_gpu_tensor(), residual)
     }
 }
 
@@ -568,17 +570,22 @@ impl Gemma2Model {
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
             input_ids,
-            &mut device.arena,
+            &mut device.caching,
             device.compute_stream,
         );
+        let hidden_states = hidden_states.into_gpu_tensor();
         kernels::scale_inplace(hidden_states, self.embed_scale, &device.cublas);
 
         // Per-layer arena scoping (see LlamaModel::forward for details).
         let num_tokens = hidden_states.dim(0);
         let hidden_size = hidden_states.dim(1);
         let dtype = hidden_states.dtype();
-        let hs_buf = device.arena.alloc(&[num_tokens, hidden_size], dtype);
-        let res_buf = device.arena.alloc(&[num_tokens, hidden_size], dtype);
+        let hs_buf = device
+            .caching
+            .alloc_gpu_tensor(&[num_tokens, hidden_size], dtype);
+        let res_buf = device
+            .caching
+            .alloc_gpu_tensor(&[num_tokens, hidden_size], dtype);
         crate::driver::memcpy_dtod_async(
             hs_buf.raw_ptr() as *mut u8,
             hidden_states.raw_ptr() as *const u8,
@@ -586,7 +593,7 @@ impl Gemma2Model {
             device.compute_stream,
         )
         .expect("dtod copy initial hidden_states");
-        let layer_scratch_base = device.arena.used();
+        // No arena offset tracking needed — caching allocator frees on drop.
 
         let mut residual: Option<GpuTensor> = None;
         for layer in &self.layers {
@@ -622,7 +629,7 @@ impl Gemma2Model {
                 device.compute_stream,
             )
             .expect("dtod copy hidden_states");
-            device.arena.set_offset(layer_scratch_base);
+            // Intermediates freed by caching allocator on drop.
             residual = Some(res_buf);
         }
         let hidden_states = hs_buf;
@@ -633,7 +640,7 @@ impl Gemma2Model {
             residual.unwrap(),
             self.norm.inner.weight,
             self.norm.inner.eps,
-            &mut device.arena,
+            &mut device.caching,
             device.compute_stream,
         );
         normed
@@ -702,16 +709,17 @@ impl Gemma2ForCausalLM {
             crate::kernels::embedding_gather(
                 hidden_states,
                 indices,
-                &mut device.arena,
+                &mut device.caching,
                 device.compute_stream,
             )
+            .into_gpu_tensor()
         } else {
             hidden_states
         };
 
         let logits = self
             .lm_head
-            .forward(hidden_states, &mut device.cublas, &mut device.arena);
+            .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
         // Apply final logit soft capping: logits = cap * tanh(logits / cap).
         // TODO: This requires a fused tanh-softcap kernel. For now, softcap

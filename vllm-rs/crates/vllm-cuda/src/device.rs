@@ -1,30 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `GpuDevice`: the central runtime object combining streams, cuBLAS, and arena.
+//! `GpuDevice`: the central runtime object combining streams, cuBLAS, and allocator.
 //!
 //! One `GpuDevice` per GPU. All kernel launches go on `compute_stream`.
 //! The `transfer_stream` handles async H2D/D2H copies for overlap.
 
-use crate::arena::ScratchArena;
+use crate::alloc::CachingAllocator;
 use crate::cublas::CublasHandle;
 use crate::driver;
-use crate::dtype::DType;
-use crate::tensor::GpuTensor;
 use anyhow::Result;
 use cudarc::driver::sys::{CUcontext, CUevent, CUstream};
 
-/// Initial scratch arena size (512 MB — grows during warmup if needed).
-const INITIAL_ARENA_SIZE: usize = 512 * 1024 * 1024;
-
-/// The GPU device runtime. Owns streams, cuBLAS handle, and scratch arena.
+/// The GPU device runtime. Owns streams, cuBLAS handle, and caching allocator.
 ///
 /// All model forward passes operate through this struct. One instance per GPU.
+/// Memory management uses a caching allocator (like PyTorch's CUDACachingAllocator)
+/// — tensors are freed on drop and their blocks reused from a free list.
 pub struct GpuDevice {
     pub device_id: i32,
     pub ctx: CUcontext,
     pub compute_stream: CUstream,
     pub transfer_stream: CUstream,
     pub cublas: CublasHandle,
-    pub arena: ScratchArena,
+    /// Caching allocator — the ONLY allocator. Like PyTorch's CUDACachingAllocator.
+    pub caching: CachingAllocator,
     /// Event for gating CPU reuse of pinned buffers after H2D transfer.
     pub transfer_done: CUevent,
     /// Number of streaming multiprocessors on this device.
@@ -34,7 +32,7 @@ pub struct GpuDevice {
 impl GpuDevice {
     /// Initialize a GPU device.
     ///
-    /// Creates CUDA context, two streams, cuBLAS handle, and scratch arena.
+    /// Creates CUDA context, two streams, cuBLAS handle, and caching allocator.
     pub fn new(device_id: i32) -> Result<Self> {
         unsafe {
             driver::init()?;
@@ -46,13 +44,12 @@ impl GpuDevice {
             let transfer_done = driver::event_create_disable_timing()?;
 
             let cublas = CublasHandle::new(compute_stream)?;
-            let arena = ScratchArena::new(INITIAL_ARENA_SIZE)?;
+            let caching = CachingAllocator::new();
             let num_sm = driver::device_get_num_sm(cu_device)?;
 
             tracing::info!(
-                "GpuDevice initialized: device={}, arena={:.0} MB, SMs={}",
+                "GpuDevice initialized: device={}, SMs={}",
                 device_id,
-                INITIAL_ARENA_SIZE as f64 / (1024.0 * 1024.0),
                 num_sm,
             );
 
@@ -62,34 +59,11 @@ impl GpuDevice {
                 compute_stream,
                 transfer_stream,
                 cublas,
-                arena,
+                caching,
                 transfer_done,
                 num_sm,
             })
         }
-    }
-
-    /// Allocate a tensor from the scratch arena.
-    pub fn alloc(&mut self, shape: &[usize], dtype: DType) -> GpuTensor {
-        self.arena.alloc(shape, dtype)
-    }
-
-    /// GEMM: out = a @ b^T, output allocated from arena.
-    ///
-    /// # Safety
-    /// `a` and `b` must be valid GPU tensors.
-    pub unsafe fn gemm(&mut self, a: GpuTensor, b: GpuTensor) -> GpuTensor {
-        self.cublas.gemm(a, b, &mut self.arena)
-    }
-
-    /// Reset the scratch arena. Call once per engine step after sampling.
-    pub fn reset_arena(&mut self) {
-        self.arena.reset();
-    }
-
-    /// Lock the arena after warmup.
-    pub fn lock_arena(&mut self) {
-        self.arena.lock();
     }
 
     /// Synchronize the compute stream (block until all compute completes).
@@ -112,7 +86,7 @@ impl GpuDevice {
         Ok(())
     }
 
-    /// Allocate persistent device memory (not from arena).
+    /// Allocate persistent device memory (not from caching allocator).
     /// For weight buffers, KV cache, etc.
     ///
     /// # Safety
@@ -135,15 +109,13 @@ impl GpuDevice {
 impl Drop for GpuDevice {
     fn drop(&mut self) {
         unsafe {
-            // Arena is dropped automatically (has its own Drop).
+            // CachingAllocator is dropped automatically (frees all GPU blocks).
             // CublasHandle is dropped automatically.
             let _ = driver::event_destroy(self.transfer_done);
             let _ = driver::stream_destroy(self.transfer_stream);
             if !self.compute_stream.is_null() {
                 let _ = driver::stream_destroy(self.compute_stream);
             }
-            // Don't destroy context here — it may be shared.
-            // cuCtxDestroy happens when the process exits.
         }
     }
 }
@@ -151,6 +123,8 @@ impl Drop for GpuDevice {
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
+    use crate::dtype::DType;
+    use crate::tensor::GpuTensor;
 
     #[test]
     fn test_device_create_and_drop() {
@@ -166,39 +140,12 @@ mod tests {
     }
 
     #[test]
-    fn test_device_arena_alloc() {
+    fn test_device_caching_alloc() {
         let mut dev = GpuDevice::new(0).expect("GpuDevice::new");
-        let t = dev.alloc(&[32, 4096], DType::BF16);
+        let t = dev.caching.alloc_tensor(&[32, 4096], DType::BF16);
         assert_eq!(t.ndim(), 2);
         assert_eq!(t.dim(0), 32);
         assert_eq!(t.dim(1), 4096);
-        assert!(!t.is_null());
-    }
-
-    #[test]
-    fn test_device_arena_reset() {
-        let mut dev = GpuDevice::new(0).expect("GpuDevice::new");
-        let t1 = dev.alloc(&[64], DType::F32);
-        assert!(dev.arena.used() > 0);
-
-        dev.reset_arena();
-        assert_eq!(dev.arena.used(), 0);
-
-        let t2 = dev.alloc(&[64], DType::F32);
-        assert_eq!(t1.raw_ptr(), t2.raw_ptr());
-    }
-
-    #[test]
-    fn test_device_arena_lock() {
-        let mut dev = GpuDevice::new(0).expect("GpuDevice::new");
-        dev.alloc(&[128], DType::F32);
-        dev.reset_arena();
-        dev.lock_arena();
-        assert!(dev.arena.is_locked());
-
-        // Should still be able to alloc within capacity.
-        let t = dev.alloc(&[128], DType::F32);
-        assert!(!t.is_null());
     }
 
     #[test]
@@ -238,7 +185,6 @@ mod tests {
             dev.memset_zero(ptr, 256).expect("memset");
             dev.sync_compute().expect("sync");
 
-            // Verify zeros.
             let host = driver::mem_alloc_host(256).expect("host");
             driver::memcpy_dtoh_async(host, ptr, 256, dev.compute_stream).expect("dtoh");
             driver::stream_synchronize(dev.compute_stream).expect("sync");
@@ -260,18 +206,15 @@ mod tests {
             let src = dev.alloc_persistent(128).expect("src");
             let dst = dev.alloc_persistent(128).expect("dst");
 
-            // Fill src with pattern via host.
             let host = driver::mem_alloc_host(128).expect("host");
             for i in 0..128 {
                 *host.add(i) = (i * 5) as u8;
             }
             driver::memcpy_htod_async(src, host, 128, dev.compute_stream).expect("htod");
 
-            // D2D copy.
             dev.copy_dtod(dst, src, 128).expect("dtod");
             dev.sync_compute().expect("sync");
 
-            // Read back.
             let host_out = driver::mem_alloc_host(128).expect("host_out");
             driver::memcpy_dtoh_async(host_out, dst, 128, dev.compute_stream).expect("dtoh");
             driver::stream_synchronize(dev.compute_stream).expect("sync");
@@ -291,11 +234,10 @@ mod tests {
     fn test_device_gemm_f32() {
         let mut dev = GpuDevice::new(0).expect("GpuDevice::new");
         unsafe {
-            // Simple 2x2 GEMM: A @ B^T
             let host_a = driver::mem_alloc_host(16).unwrap();
             let host_b = driver::mem_alloc_host(16).unwrap();
             std::slice::from_raw_parts_mut(host_a as *mut f32, 4)
-                .copy_from_slice(&[1.0, 0.0, 0.0, 1.0]); // identity
+                .copy_from_slice(&[1.0, 0.0, 0.0, 1.0]);
             std::slice::from_raw_parts_mut(host_b as *mut f32, 4)
                 .copy_from_slice(&[2.0, 3.0, 4.0, 5.0]);
 
@@ -307,15 +249,14 @@ mod tests {
             let a = GpuTensor::new(gpu_a, &[2, 2], DType::F32);
             let b = GpuTensor::new(gpu_b, &[2, 2], DType::F32);
 
-            // I @ B^T = B^T = [[2, 4], [3, 5]]
-            let c = dev.gemm(a, b);
+            let c = dev.cublas.gemm_owned(a, b, &mut dev.caching);
 
             let host_c = driver::mem_alloc_host(16).unwrap();
-            driver::memcpy_dtoh_async(host_c, c.raw_ptr(), 16, dev.compute_stream).unwrap();
+            driver::memcpy_dtoh_async(host_c, c.as_gpu_tensor().raw_ptr(), 16, dev.compute_stream)
+                .unwrap();
             driver::stream_synchronize(dev.compute_stream).unwrap();
 
             let result = std::slice::from_raw_parts(host_c as *const f32, 4);
-            // A = I, B = [[2,3],[4,5]], so C = I @ B^T = [[2,4],[3,5]]
             let expected = [2.0, 4.0, 3.0, 5.0];
             for (i, (got, exp)) in result.iter().zip(expected.iter()).enumerate() {
                 assert!(
@@ -330,28 +271,5 @@ mod tests {
             driver::mem_free(gpu_a).unwrap();
             driver::mem_free(gpu_b).unwrap();
         }
-    }
-
-    #[test]
-    fn test_device_simulated_forward_step() {
-        // Simulate multiple allocs + reset + re-alloc (one engine step).
-        let mut dev = GpuDevice::new(0).expect("GpuDevice::new");
-
-        // "Step 1": alloc some activations.
-        let _t1 = dev.alloc(&[32, 4096], DType::BF16);
-        let _t2 = dev.alloc(&[32, 4096], DType::BF16);
-        let _t3 = dev.alloc(&[32, 11008], DType::BF16);
-        let used_step1 = dev.arena.used();
-        assert!(used_step1 > 0);
-
-        dev.reset_arena();
-        assert_eq!(dev.arena.used(), 0);
-
-        // "Step 2": same alloc pattern, same addresses.
-        let _t4 = dev.alloc(&[32, 4096], DType::BF16);
-        let _t5 = dev.alloc(&[32, 4096], DType::BF16);
-        let _t6 = dev.alloc(&[32, 11008], DType::BF16);
-        let used_step2 = dev.arena.used();
-        assert_eq!(used_step1, used_step2);
     }
 }

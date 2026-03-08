@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 
-use crate::arena::ScratchArena;
+use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::cublas::CublasHandle;
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
@@ -54,7 +54,7 @@ impl Linear {
     /// Forward: y = x @ W^T (+ bias)
     ///
     /// `x`: `[num_tokens, in_features]`
-    /// Returns: `[num_tokens, out_features]` allocated from arena.
+    /// Returns: `[num_tokens, out_features]` as GpuTensor (leaked from caching allocator).
     ///
     /// # Safety
     /// All tensors must be valid GPU memory. cuBLAS handle must be on the correct stream.
@@ -62,16 +62,25 @@ impl Linear {
         &self,
         x: GpuTensor,
         cublas: &mut CublasHandle,
-        arena: &mut ScratchArena,
+        alloc: &mut CachingAllocator,
     ) -> GpuTensor {
+        self.forward_owned(x, cublas, alloc).into_gpu_tensor()
+    }
+
+    /// Forward returning `OwnedTensor` from caching allocator.
+    pub unsafe fn forward_owned(
+        &self,
+        x: GpuTensor,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+    ) -> OwnedTensor {
         debug_assert_eq!(x.ndim(), 2);
         debug_assert_eq!(x.dim(1), self.weight.dim(1), "Linear: input dim mismatch");
 
         if let Some(bias) = self.bias {
-            // Fused GEMM + bias via cublasLt epilogue (zero extra kernel launches).
-            cublas.gemm_bias(x, self.weight, bias, arena)
+            cublas.gemm_bias_owned(x, self.weight, bias, alloc)
         } else {
-            cublas.gemm(x, self.weight, arena)
+            cublas.gemm_owned(x, self.weight, alloc)
         }
     }
 
@@ -128,7 +137,7 @@ impl Embedding {
     pub unsafe fn forward(
         &self,
         _input_ids: GpuTensor,
-        _arena: &mut ScratchArena,
+        _alloc: &mut CachingAllocator,
         _stream: cudarc::driver::sys::CUstream,
     ) -> GpuTensor {
         // TODO: implement embedding gather kernel.
@@ -288,7 +297,7 @@ mod tests {
             let stream = init_cuda();
             unsafe {
                 let mut cublas = CublasHandle::new(stream).unwrap();
-                let mut arena = ScratchArena::new(4 * 1024 * 1024).unwrap();
+                let mut arena = CachingAllocator::new();
 
                 // Weight [2, 3] = [[1,0,0],[0,1,0]] (identity-ish)
                 let host_w = driver::mem_alloc_host(24).unwrap();

@@ -131,7 +131,12 @@ pub(crate) fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
             .with_key(
                 "per_sec",
                 |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-                    write!(w, "{:.2}it/s", state.per_sec()).unwrap();
+                    let per_sec = state.per_sec();
+                    if per_sec > 0.0 {
+                        write!(w, "{:.2}s/it", 1.0 / per_sec).unwrap();
+                    } else {
+                        write!(w, "?s/it").unwrap();
+                    }
                 },
             )
     }

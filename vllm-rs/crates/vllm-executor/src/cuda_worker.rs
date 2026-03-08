@@ -1506,6 +1506,454 @@ impl CudaWorker {
                 .is_none_or(|p| p.temperature < 1e-6)
         });
 
+        // ---------------------------------------------------------------------------
+        // Mixed batch: split into decode (CUDA graph) + prefill (eager) passes.
+        // This avoids running the entire batch through the slow eager path when
+        // most requests are decode (q_len=1) but a few are prefill chunks.
+        // ---------------------------------------------------------------------------
+        let has_decode = prepared.attn_meta.q_lens.contains(&1);
+        let is_mixed = !is_decode && has_decode;
+        let decode_graph_bs = if is_mixed {
+            self.graph_runner.as_ref().and_then(|r| {
+                let n_decode = prepared
+                    .attn_meta
+                    .q_lens
+                    .iter()
+                    .filter(|&&q| q == 1)
+                    .count();
+                r.nearest_graph_size(n_decode)
+            })
+        } else {
+            None
+        };
+
+        if let Some(decode_graph_bs) = decode_graph_bs {
+            // Partition requests into decode (q_len=1) and prefill (q_len>1).
+            let mut decode_indices: Vec<usize> = Vec::new();
+            let mut prefill_indices: Vec<usize> = Vec::new();
+            for (i, &q) in prepared.attn_meta.q_lens.iter().enumerate() {
+                if q == 1 {
+                    decode_indices.push(i);
+                } else {
+                    prefill_indices.push(i);
+                }
+            }
+            let n_decode = decode_indices.len();
+            let n_prefill = prefill_indices.len();
+
+            // --- Decode pass: run through CUDA graph ---
+            // Build decode inputs from the subset of requests.
+            let decode_logits = {
+                let meta = &prepared.attn_meta;
+
+                let mut input_ids = Vec::with_capacity(decode_graph_bs);
+                let mut positions = Vec::with_capacity(decode_graph_bs);
+                let mut slot_mapping: Vec<i64> = Vec::with_capacity(decode_graph_bs);
+                let mut cu_seqlens_q: Vec<i32> = Vec::with_capacity(decode_graph_bs + 1);
+                let mut seqused_k: Vec<i32> = Vec::with_capacity(decode_graph_bs);
+                let mut block_table = vec![0i32; decode_graph_bs * GRAPH_MAX_BLOCKS_PER_SEQ];
+
+                cu_seqlens_q.push(0);
+                for (out_idx, &orig_idx) in decode_indices.iter().enumerate() {
+                    // Each decode request has exactly 1 token.
+                    let token_start = meta.query_start_loc[orig_idx];
+                    input_ids.push(prepared.flat_token_ids[token_start]);
+                    positions.push(prepared.flat_positions[token_start]);
+                    cu_seqlens_q.push((out_idx + 1) as i32);
+                    seqused_k.push(meta.seq_lens[orig_idx] as i32);
+
+                    // Slot mapping: compute physical slot for this decode token.
+                    let abs_pos = meta.tokens_before[orig_idx];
+                    let block_idx = abs_pos / block_size;
+                    let offset = abs_pos % block_size;
+                    let block_ids = &meta.block_ids[orig_idx];
+                    if block_idx < block_ids.len() {
+                        slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
+                    } else {
+                        slot_mapping.push(-1i64);
+                    }
+
+                    // Block table row.
+                    for (j, &bid) in block_ids.iter().enumerate() {
+                        if j < GRAPH_MAX_BLOCKS_PER_SEQ {
+                            block_table[out_idx * GRAPH_MAX_BLOCKS_PER_SEQ + j] = bid as i32;
+                        }
+                    }
+                }
+
+                // Pad to graph batch size.
+                input_ids.resize(decode_graph_bs, 0);
+                positions.resize(decode_graph_bs, 0);
+                slot_mapping.resize(decode_graph_bs, -1i64);
+                for _ in n_decode..decode_graph_bs {
+                    cu_seqlens_q.push(n_decode as i32);
+                }
+                seqused_k.resize(decode_graph_bs, 1);
+
+                let runner = self.graph_runner.as_ref().unwrap();
+                let replay_out = unsafe {
+                    runner.replay(
+                        decode_graph_bs,
+                        &input_ids,
+                        &positions,
+                        &slot_mapping,
+                        &cu_seqlens_q,
+                        &seqused_k,
+                        &block_table,
+                        device,
+                        false,
+                    )
+                }
+                .map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("mixed decode graph replay: {e}"))
+                })?;
+
+                // Slice to real decode requests (discard padding rows).
+                if decode_graph_bs > n_decode {
+                    replay_out.logits.narrow_dim0(0, n_decode)
+                } else {
+                    replay_out.logits
+                }
+            };
+
+            // --- Prefill pass: run through eager forward ---
+            let prefill_logits = {
+                let meta = &prepared.attn_meta;
+
+                // Build flat token/position arrays for prefill requests.
+                let mut pf_token_ids: Vec<u32> = Vec::new();
+                let mut pf_positions: Vec<u32> = Vec::new();
+                let mut pf_q_lens: Vec<usize> = Vec::new();
+                let mut pf_seq_lens: Vec<usize> = Vec::new();
+                let mut pf_block_ids: Vec<Vec<usize>> = Vec::new();
+                let mut pf_tokens_before: Vec<usize> = Vec::new();
+                let mut pf_query_start_loc: Vec<usize> = vec![0];
+
+                let mut pf_offset = 0usize;
+                for &orig_idx in &prefill_indices {
+                    let q_len = meta.q_lens[orig_idx];
+                    let token_start = meta.query_start_loc[orig_idx];
+                    pf_token_ids.extend_from_slice(
+                        &prepared.flat_token_ids[token_start..token_start + q_len],
+                    );
+                    pf_positions.extend_from_slice(
+                        &prepared.flat_positions[token_start..token_start + q_len],
+                    );
+                    pf_q_lens.push(q_len);
+                    pf_seq_lens.push(meta.seq_lens[orig_idx]);
+                    pf_block_ids.push(meta.block_ids[orig_idx].clone());
+                    pf_tokens_before.push(meta.tokens_before[orig_idx]);
+                    pf_offset += q_len;
+                    pf_query_start_loc.push(pf_offset);
+                }
+                let pf_total_tokens = pf_token_ids.len();
+
+                let pf_meta = vllm_models::AttentionMetadata::new(
+                    n_prefill,
+                    pf_total_tokens,
+                    pf_query_start_loc,
+                    pf_q_lens,
+                    pf_seq_lens,
+                    pf_block_ids,
+                    pf_tokens_before,
+                    vec![true; n_prefill],
+                    prefill_indices
+                        .iter()
+                        .map(|&i| meta.req_ids[i].clone())
+                        .collect(),
+                );
+
+                let gpu_input_ids = Self::h2d_u32(&pf_token_ids, device)?;
+                let gpu_positions = Self::h2d_u32(&pf_positions, device)?;
+
+                let (
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table_gpu,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                ) = Self::build_attention_tensors(&pf_meta, block_size, device)?;
+
+                // last_token_indices: for each prefill request, index of last token in flat array.
+                let last_token_indices = if n_prefill < pf_total_tokens {
+                    let mut indices = Vec::with_capacity(n_prefill);
+                    let mut off = 0u32;
+                    for &q in &pf_meta.q_lens {
+                        indices.push(off + q as u32 - 1);
+                        off += q as u32;
+                    }
+                    Some(Self::h2d_u32(&indices, device)?)
+                } else {
+                    None
+                };
+
+                unsafe {
+                    model.forward_owned(
+                        gpu_input_ids,
+                        gpu_positions,
+                        slot_mapping,
+                        cu_seqlens_q,
+                        seqused_k,
+                        block_table_gpu,
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        kv_cache,
+                        device,
+                        last_token_indices,
+                    )
+                }
+            };
+
+            // --- Merge logits in original request order ---
+            // Allocate [num_reqs, vocab_size] and scatter decode/prefill logits.
+            let row_bytes = vocab_size * decode_logits.dtype().size_bytes();
+            let merged_owned = device
+                .caching
+                .alloc_tensor(&[num_reqs, vocab_size], decode_logits.dtype());
+            let merged = merged_owned.as_gpu_tensor();
+
+            // Copy decode logits into merged at their original positions.
+            for (src_row, &orig_idx) in decode_indices.iter().enumerate() {
+                let src = unsafe { decode_logits.raw_ptr().add(src_row * row_bytes) };
+                let dst = unsafe { merged.raw_ptr().add(orig_idx * row_bytes) };
+                unsafe { driver::memcpy_dtod_async(dst, src, row_bytes, device.compute_stream) }
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("mixed merge decode D2D: {e}"))
+                    })?;
+            }
+
+            // Copy prefill logits into merged at their original positions.
+            for (src_row, &orig_idx) in prefill_indices.iter().enumerate() {
+                let src = unsafe { prefill_logits.raw_ptr().add(src_row * row_bytes) };
+                let dst = unsafe { merged.raw_ptr().add(orig_idx * row_bytes) };
+                unsafe { driver::memcpy_dtod_async(dst, src, row_bytes, device.compute_stream) }
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("mixed merge prefill D2D: {e}"))
+                    })?;
+            }
+
+            // Invalidate graph metadata since we changed batch composition.
+            self.last_graph_batch_size = None;
+            self.graph_metadata_valid = false;
+
+            // Drop the sub-logits so their memory returns to the caching allocator.
+            // (decode_logits is a view into graph output — not owned. prefill_logits is
+            // from forward_owned, also a view. merged_owned keeps the merged allocation.)
+            let _ = decode_logits;
+            let _ = prefill_logits;
+
+            // Fall through to sampling with merged logits.
+            let logits = merged;
+
+            // --- Sampling (duplicated from below to avoid restructuring) ---
+            let all_gpu_sampleable = prepared.req_inputs.iter().all(|r| {
+                self.sampling_params_map.get(&r.req_id).is_none_or(|p| {
+                    p.frequency_penalty == 0.0
+                        && p.presence_penalty == 0.0
+                        && p.repetition_penalty == 1.0
+                        && p.logit_bias.is_none()
+                })
+            });
+
+            if all_greedy {
+                let token_ids_owned = unsafe {
+                    vllm_cuda::kernels::argmax_batched(
+                        logits,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                };
+                let token_ids_gpu = token_ids_owned.as_gpu_tensor();
+                return Self::finalize_d2h_and_commit(
+                    &token_ids_gpu,
+                    num_reqs,
+                    prepared,
+                    device,
+                    &self.host_staging,
+                    &mut self.input_batch,
+                    &mut self.token_buffers,
+                );
+            } else if all_gpu_sampleable {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+
+                let all_no_filter = prepared.req_inputs.iter().all(|r| {
+                    self.sampling_params_map
+                        .get(&r.req_id)
+                        .is_none_or(|p| p.top_k <= 0 && p.top_p >= 1.0 && p.min_p <= 0.0)
+                });
+
+                let token_ids_owned = if all_no_filter {
+                    let stride = num_reqs * 4;
+                    let total_bytes = stride * 2;
+                    let packed_ptr = if let Some(stg) = &self.host_staging {
+                        debug_assert!(total_bytes <= stg.sampling_packed.capacity_bytes());
+                        stg.sampling_packed.ptr()
+                    } else {
+                        vec![0u8; total_bytes].leak().as_mut_ptr()
+                    };
+                    let temps_ptr = packed_ptr as *mut f32;
+                    let randoms_ptr = unsafe { packed_ptr.add(stride) as *mut f32 };
+                    for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
+                        let params = self.sampling_params_map.get(&req_slice.req_id);
+                        let t = params.map_or(1.0f32, |p| p.temperature.max(1e-7) as f32);
+                        unsafe {
+                            *temps_ptr.add(i) = t;
+                            *randoms_ptr.add(i) = rng.r#gen::<f32>();
+                        }
+                    }
+                    let gpu_packed_owned = device
+                        .caching
+                        .alloc_tensor(&[total_bytes / 4], GpuDType::F32);
+                    let gpu_packed = gpu_packed_owned.as_gpu_tensor();
+                    unsafe {
+                        driver::memcpy_htod_async(
+                            gpu_packed.raw_ptr(),
+                            packed_ptr,
+                            total_bytes,
+                            device.compute_stream,
+                        )
+                    }
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("H2D sampling params: {e}"))
+                    })?;
+                    let base = gpu_packed.raw_ptr();
+                    let gpu_temps = unsafe { GpuTensor::new(base, &[num_reqs], GpuDType::F32) };
+                    let gpu_randoms =
+                        unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::F32) };
+                    unsafe {
+                        vllm_cuda::kernels::sample_gumbel_batched(
+                            logits,
+                            gpu_temps,
+                            gpu_randoms,
+                            &mut device.caching,
+                            device.compute_stream,
+                        )
+                    }
+                } else {
+                    let stride = num_reqs * 4;
+                    let total_bytes = stride * 5;
+                    let packed_ptr = if let Some(stg) = &self.host_staging {
+                        debug_assert!(total_bytes <= stg.sampling_packed.capacity_bytes());
+                        stg.sampling_packed.ptr()
+                    } else {
+                        vec![0u8; total_bytes].leak().as_mut_ptr()
+                    };
+                    let temps_ptr = packed_ptr as *mut f32;
+                    let top_ks_ptr = unsafe { packed_ptr.add(stride) as *mut i32 };
+                    let top_ps_ptr = unsafe { packed_ptr.add(stride * 2) as *mut f32 };
+                    let min_ps_ptr = unsafe { packed_ptr.add(stride * 3) as *mut f32 };
+                    let randoms_ptr = unsafe { packed_ptr.add(stride * 4) as *mut f32 };
+                    for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
+                        let params = self.sampling_params_map.get(&req_slice.req_id);
+                        let (t, k, p, mp) = params.map_or((1.0f32, 0i32, 1.0f32, 0.0f32), |p| {
+                            (
+                                p.temperature.max(1e-7) as f32,
+                                p.top_k,
+                                p.top_p as f32,
+                                p.min_p as f32,
+                            )
+                        });
+                        unsafe {
+                            *temps_ptr.add(i) = t;
+                            *top_ks_ptr.add(i) = k;
+                            *top_ps_ptr.add(i) = p;
+                            *min_ps_ptr.add(i) = mp;
+                            *randoms_ptr.add(i) = rng.r#gen::<f32>();
+                        }
+                    }
+                    let gpu_packed_owned = device
+                        .caching
+                        .alloc_tensor(&[total_bytes / 4], GpuDType::F32);
+                    let gpu_packed = gpu_packed_owned.as_gpu_tensor();
+                    unsafe {
+                        driver::memcpy_htod_async(
+                            gpu_packed.raw_ptr(),
+                            packed_ptr,
+                            total_bytes,
+                            device.compute_stream,
+                        )
+                    }
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("H2D sampling params: {e}"))
+                    })?;
+                    let base = gpu_packed.raw_ptr();
+                    let gpu_temps = unsafe { GpuTensor::new(base, &[num_reqs], GpuDType::F32) };
+                    let gpu_top_ks =
+                        unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::U32) };
+                    let gpu_top_ps =
+                        unsafe { GpuTensor::new(base.add(stride * 2), &[num_reqs], GpuDType::F32) };
+                    let gpu_min_ps =
+                        unsafe { GpuTensor::new(base.add(stride * 3), &[num_reqs], GpuDType::F32) };
+                    let gpu_randoms =
+                        unsafe { GpuTensor::new(base.add(stride * 4), &[num_reqs], GpuDType::F32) };
+                    unsafe {
+                        vllm_cuda::kernels::sample_batched(
+                            logits,
+                            gpu_temps,
+                            gpu_top_ks,
+                            gpu_top_ps,
+                            gpu_min_ps,
+                            gpu_randoms,
+                            &mut device.caching,
+                            device.compute_stream,
+                        )
+                    }
+                };
+                let token_ids_gpu = token_ids_owned.as_gpu_tensor();
+                return Self::finalize_d2h_and_commit(
+                    &token_ids_gpu,
+                    num_reqs,
+                    prepared,
+                    device,
+                    &self.host_staging,
+                    &mut self.input_batch,
+                    &mut self.token_buffers,
+                );
+            } else {
+                // Slow path: D2H logits for CPU sampling.
+                let logits_f32 = Self::logits_to_cpu(logits, device)?;
+                let mut sampler = Sampler::new();
+                let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
+                for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+                    let start = req_idx * vocab_size;
+                    let end = start + vocab_size;
+                    let req_logits = &logits_f32[start..end];
+                    let prev_tokens = self
+                        .token_buffers
+                        .get(&req_slice.req_id)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]);
+                    let token_id =
+                        if let Some(params) = self.sampling_params_map.get(&req_slice.req_id) {
+                            let (token_id, _) =
+                                sampler.sample_one(req_logits, params, prev_tokens, None);
+                            token_id
+                        } else {
+                            req_logits
+                                .iter()
+                                .enumerate()
+                                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                                .map(|(i, _)| i as u32)
+                                .unwrap_or(0)
+                        };
+                    self.input_batch.commit_step(
+                        &req_slice.req_id,
+                        &[token_id],
+                        req_slice.token_count,
+                        !req_slice.spec_token_ids.is_empty(),
+                    );
+                    if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
+                        buf.push(token_id);
+                    }
+                    token_map.insert(req_slice.req_id.clone(), vec![token_id]);
+                }
+                self.input_batch.reclaim_buffers(prepared);
+                return Ok(ModelRunnerOutput::from_token_map(token_map));
+            }
+        }
+
         if use_graph && all_greedy {
             // Fast path: CUDA graph with in-graph argmax. No separate sampling
             // kernel launch — argmax + D2D scatter are captured in the graph.

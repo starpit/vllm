@@ -236,7 +236,13 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             block_size: config.block_size,
             device_id,
             enforce_eager: config.enforce_eager,
-            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(8192),
+            // Default 1024 (not 8192 like Python). Our CudaWorker splits mixed
+            // batches into a decode CUDA-graph pass + a prefill eager pass.
+            // Smaller prefill chunks keep the eager pass fast (~25ms for 1024
+            // tokens) while decode runs through the captured graph (~5ms).
+            // Benchmarked: 1024 → 21.8 req/s vs 8192 → 12.1 req/s on Qwen2.5-3B.
+            // See PREFILL_DECODE_SPLIT.md for the full analysis.
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
             cuda_graph_sizes: config
                 .cuda_graph_config
                 .as_ref()

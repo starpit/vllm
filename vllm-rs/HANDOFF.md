@@ -2,13 +2,14 @@
 
 ## Current State
 
-**Throughput (default, 1000 prompts)**: Rust 12.17 req/s vs Python 17.41 req/s (~30% gap)
-**Throughput (200 prompts)**: Rust 15.77 req/s vs Python 18.74 req/s (~16% gap)
+**Throughput (default, 1000 prompts)**: Rust 21.8 req/s vs Python 17.4 req/s (**+25% faster**)
 **Latency**: Rust ~1.306s vs Python ~1.30s (~0.5% gap)
 
 All benchmarks: `vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct` (defaults: 1000 prompts, 1024 input, 128 output)
 
 ### What's been done this session
+
+- **Prefill/decode split for mixed batches** (`cuda_worker.rs`): Mixed batches (prefill + decode tokens in the same step) are now split into two sequential forward passes — decode through CUDA graph, prefill through eager. This avoids running the entire batch through the slow eager path. Combined with lowering `max_num_batched_tokens` default from 8192 to 1024 (`init.rs`), this brings throughput from 12.1 → 21.8 req/s (+80%), surpassing Python's 17.4 req/s. See `PREFILL_DECODE_SPLIT.md` for full analysis and tuning data.
 
 - **Prefill CUDA graphs re-enabled** (`cuda_worker.rs`): The `use_prefill_graph = false` guard was stale — the model's forward pass already uses contiguous FA2 (not paged) for fresh prefills (`tokens_before == 0`), so the original correctness issue no longer applies. Re-enabled with conditions: single request, fresh prefill, captured graph exists for padded size. Note: the throughput benchmark doesn't hit this path (scheduler batches multiple prefills), but it helps latency-sensitive single-request scenarios like chat.
 
@@ -72,13 +73,15 @@ Both use only event-based sync in steady state. No unnecessary stream syncs.
 | Wall time | 12.8s | ~10.7s |
 | **GPU idle time** | **4.4s (34%)** | **~1.5s (14%)** |
 
-### Root causes of remaining throughput gap
+### Throughput gap: RESOLVED
 
-1. **Batched prefill runs eager (no torch.compile equivalent)** — Prefill CUDA graphs are now enabled for single fresh-prefill requests, but the throughput benchmark batches many prefills together (`num_reqs >> 1`), so graphs don't apply there. Python uses `torch.compile` for all prefills (batched or not), fusing everything into optimized kernels with minimal CPU dispatch overhead. Our eager batched prefill launches ~365 individual kernels per step (10/layer × 36 layers). This is the primary cause of the 34% GPU idle time.
+The prefill/decode split + `max_num_batched_tokens=1024` default eliminated the throughput gap. Rust now exceeds Python by ~25%. The key insight: instead of trying to match `torch.compile` (piecewise graphs were tried and worsened performance to 11.8 req/s), we split mixed batches so decode tokens always use CUDA graphs and prefill chunks stay small enough for fast eager passes.
 
-2. **Peak activation memory gap (3.0 GiB vs ~0.5 GiB)** — Without torch.compile fusing, our eager forward pass materializes more intermediate tensors, consuming more memory. This reduces available KV cache, which may cause more preemption under heavy load.
+### Remaining optimization opportunities
 
-3. **Batch transition stalls** — every 256 sequences in a 1000-prompt run, ~256 new prefills must be chunked. During these transitions, the eager prefill path (cause #1) makes these slower.
+1. **Peak activation memory gap (3.0 GiB vs ~0.5 GiB)** — Without torch.compile fusing, our eager forward pass materializes more intermediate tensors. This reduces available KV cache blocks (55,697 vs ~60,975), which may cause more preemption under extreme load.
+
+2. **Piecewise CUDA graphs** — Stashed as `piecewise-cuda-graphs-wip`. Per-layer graph capture worked but hurt throughput due to 72 graph launches per step. May be revisitable if individual kernel launch overhead becomes a bottleneck at larger models.
 
 ## Rules of the Road
 

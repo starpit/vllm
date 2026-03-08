@@ -1,149 +1,128 @@
-# Handoff: vllm-cuda Backend
+# Handoff: Closing the Throughput Gap with Python vLLM
 
-Branch: `feat/cuda-qwen2-gemma2`
-Worktree: `.claude/worktrees/cuda-models/`
+## Current State
 
-## Crate Consolidation (c9f9a1888)
+**Throughput (default, 1000 prompts)**: Rust 12.14 req/s vs Python 17.41 req/s (~30% gap)
+**Throughput (200 prompts)**: Rust 15.47 req/s vs Python 18.74 req/s (~17% gap)
+**Latency**: Rust ~1.306s vs Python ~1.30s (~0.5% gap)
 
-vllm-cuda is now the sole GPU backend. Major refactoring:
+All benchmarks: `vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct` (defaults: 1000 prompts, 1024 input, 128 output)
 
-### Removed
-- **CandleWorker** (`vllm-executor/src/candle_worker.rs`, `cuda_graph.rs`) — replaced by CudaWorker
-- **vllm-kernels crate** — CUDA kernel sources (`csrc/`) and `build.rs` merged into `vllm-cuda`
-- **candle-flash-attn** (`third_party/candle-flash-attn/`) — vllm-cuda uses `third_party/vllm-flash-attn/` + `flash-attn-shim/`
-- **Candle model implementations** — all arch files deleted from vllm-models (llama.rs, qwen2.rs, gemma2.rs, deepseek_v2.rs, etc.), plus ops.rs, registry.rs, marlin_linear.rs, GPTQ/AWQ/BnB models
+### What's been done this session
+- **FA2 num_splits=1**: Removed Rust-side split-K heuristic for paged attention. Python's upstream `vllm-flash-attn` C code always sets `params.num_splits = 1`. Our code was computing num_splits > 1 for small batches, causing the expensive split-K path unnecessarily. (Latency improved from 1.33s to 1.306s.)
+- **Defaults match Python**: `max_num_seqs=256`, `max_num_batched_tokens=8192` — verified against Python `arg_utils.py` `LLM_CLASS` context.
+- **KV cache memory sizing matches Python's formula**: `total * util - (weights + peak_activations + 150MB)`. Previously we reserved `6 * peak_activations` as headroom, resulting in only 365K KV tokens. Now we get 794K tokens (Python: 975K). GPU memory usage: Rust 41GB vs Python 42.7GB.
+- **nsys profiling done for both Python and Rust** — see findings below.
 
-### Kept in vllm-models (shared infra)
-- `Sampler`, `AttentionMetadata`, `KvBlockPool`, `KvCacheStorage`, `Model` trait
-- `embedding` (PoolingStrategy), `grammar` (GrammarGuide)
-- Used by both CudaWorker and MlxWorker
+### What was already done (prior sessions)
+- Background executor thread with 2-batch pipeline — matches Python's `step_with_batch_queue`
+- CUDA graph capture for decode (BS=1..512) and prefill (128..8192, but prefill graphs disabled due to FA2 correctness issue)
+- cublasLt with plan caching for all GEMMs
+- PyTorch-style caching allocator (replaces arena)
+- Fused CUDA kernels: rms_norm, fused_add_rms_norm, silu_and_mul, rotary, embedding_gather, reshape_and_cache
+- In-graph argmax for greedy decode
 
-### Feature flags
-- `cuda` is the single flag everywhere (was split `cuda`/`cuda-backend`)
-- `vllm-cuda` crate: `cuda` = compile CUDA kernels + cudarc; without it, only metadata types
-- TP (`--tensor-parallel-size > 1`) bails at runtime — old CandleWorker TP code preserved as comments in `init.rs`
+### nsys profiling findings (200 prompts, Qwen2.5-3B)
 
-### Crate graph (GPU path)
-```
-vllm-cli --features cuda
-  → vllm-serve (cuda)
-    → vllm-executor (cuda)
-      → vllm-cuda (cuda) — GpuTensor, kernels, FA2, models
-  → vllm-models — Sampler, AttentionMetadata, KvBlockPool (no GPU code)
-```
+**GPU kernels are faster in Rust** — the bottleneck is CPU-side:
 
-### Build commands
+| Metric | Rust | Python |
+|--------|------|--------|
+| GPU kernel time | 8.4s | 9.2s |
+| Wall time | 12.8s | ~10.7s |
+| **GPU idle time** | **4.4s (34%)** | **~1.5s (14%)** |
+| GPU memory | 41 GB | 42.7 GB |
+| cuStreamSynchronize | 61 calls, 1.57s | — |
+| cudaDeviceSynchronize | — | 2069 calls, 160ms |
+| H2D copies | 1371, 841ms | 2543, 1027ms |
+| cuMemFree | 138, 103ms | 135, 42ms |
+| Graph launches | 128, 84ms | 127, 42ms |
+
+### Memory gap: Rust 41 GB vs Python 42.7 GB (~1.7 GB short)
+
+After fixing the KV cache formula, Rust allocates 794K KV tokens vs Python's 975K. The remaining ~1.7 GB gap is because our `CachingAllocator::trim()` is a no-op (`alloc.rs` line 538) — it never returns memory to CUDA after the profiling dry-run. Python's PyTorch allocator does `torch.cuda.empty_cache()` after profiling, freeing temp allocations back to CUDA, so that memory becomes available for KV cache. Fix: implement `trim()` to release unsplit segments back to the driver via `cuMemFree`.
+
+### Root causes of GPU idle time (next steps)
+
+1. **61 `cuStreamSynchronize` calls (1.57s total, avg 25ms each)** — explicit GPU sync points in `execute_model` that block the CPU from scheduling the next batch. Python keeps everything async until the final D2H copy. Find and eliminate these.
+
+2. **Prefill path runs eager (no CUDA graphs)** — `cuda_worker.rs` line 1838: `let use_prefill_graph = false`. Comment: "Prefill graphs are disabled: they capture paged FA2 which produces incorrect results for q_len > 1." Python uses torch.compile for prefill, fusing everything into an optimized graph. Our eager prefill launches ~100+ individual kernels per step with CPU dispatch overhead between each. Fix the FA2 correctness issue and enable prefill graphs.
+
+3. **Batch transition stalls** — every 256 sequences in a 1000-prompt run, ~256 new prefills must be chunked through the scheduler. During these transitions, there is a multi-second gap where no completions are reported. Python has these too but they are much shorter. The eager prefill path (cause #2) makes these worse.
+
+## Rules of the Road
+
+1. **Be data-driven, no guessing.** Use nsys or insert instrumentation. Don't just guess at bottlenecks.
+2. **Always check what Python does.** Whenever you think "this is the simplest/most pragmatic path" — STOP and look at what the Python code actually does. If our code differs from Python, that's a red flag.
+3. **Iterate until we are at least as fast.** Don't stop at "close enough."
+4. **Use default settings for benchmarks.** Don't pass explicit CLI flags. The defaults should match Python.
+
+## Benchmark Commands
+
+**Rust** (on nick, use defaults):
 ```bash
-# Local (no CUDA)
-cargo build -p vllm-cli
-cargo clippy --workspace --exclude vllm-pyo3 --exclude vllm-mlx -- -D warnings
-
-# CUDA (on pod)
-cargo build -p vllm-cli --features cuda
-cargo clippy --workspace --exclude vllm-pyo3 --exclude vllm-mlx --features cuda -- -D warnings
-cargo test -p vllm-cuda --features cuda              # 145 kernel tests
-cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda -- --ignored --test-threads=1  # 12 E2E
+cd /root/vllm/vllm-rs
+./target/release/vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct
 ```
 
----
+**Python** (on nick3, use defaults):
+```bash
+source /root/vllm/.venv/bin/activate
+vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct
+```
 
-## Paged FlashAttention-2 — FIXED ✅
+Both use defaults: 1000 prompts, 1024 input tokens, 128 output tokens, greedy decoding, BF16.
 
-Paged FA2 fully working. Multi-turn chat, non-contiguous block tables, all GQA configs — verified on L40S.
+**nsys profiling** (use --num-prompts 200 to keep profiles manageable):
+```bash
+# Rust
+nsys profile -o /tmp/rust_throughput --force-overwrite=true \
+  ./target/release/vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct --num-prompts 200
+nsys stats /tmp/rust_throughput.nsys-rep --report cuda_gpu_kern_sum --force-export=true
+nsys stats /tmp/rust_throughput.nsys-rep --report cuda_api_sum --force-export=true
 
-- 17 CUDA unit tests passing (all `max_diff=0.000000`)
-- 14 CUDA E2E tests passing (including multi-turn, 3-turn, interleaved users)
-- `vllm chat` multi-turn verified manually with Qwen2.5-0.5B-Instruct
+# Python (must use --trace-fork-before-exec=true to capture child engine process)
+nsys profile -o /tmp/python_throughput --force-overwrite=true --trace-fork-before-exec=true \
+  bash -c 'source /root/vllm/.venv/bin/activate && vllm bench throughput --model Qwen/Qwen2.5-3B-Instruct --num-prompts 200'
+```
 
-## Root Cause
+## Pod Details
 
-The FFI shim (`ffi_shim.cu`) called `run_mha_fwd_()` — the **standard** FA2 kernel (`compute_attn_1rowblock`). This kernel has **no `block_table` support** — it treats K/V as contiguous memory and ignores the block table entirely. Only the **splitkv** kernel (`compute_attn_1rowblock_splitkv`) supports paged KV via `block_table` + `resolve_thread_kv_page_slice_offset`.
+| Pod | GPU | Purpose | Path |
+|-----|-----|---------|------|
+| nick | 1x L40S (48GB, Ada SM89) | Rust dev + testing | `/root/vllm/vllm-rs/` |
+| nick2 | 2x L40S | Rust TP testing | `/root/vllm/vllm-rs/` |
+| nick3 | 1x L40S | Python vLLM reference | `/root/vllm/` (`.venv/` for Python env) |
 
-Python vLLM masked this because its `seqlenq_ngroups_swapped` optimization (applied for all GQA decode) always routes through `set_params_splitkv`, which invokes the splitkv kernel.
+All pods: CUDA 12.9, always `export RUSTC_WRAPPER=/usr/bin/sccache` on nick/nick2.
 
-With contiguous block tables `[0,1,2]` the standard kernel happened to work (memory is contiguous anyway). With non-contiguous mappings `[2,0,1]` it read from wrong physical blocks → garbled output.
+## Key Files
 
-## Fix (commit 013cba535)
+- **Benchmark**: `crates/vllm-bench/src/throughput.rs`
+- **LLM path** (what bench uses): `crates/vllm-serve/src/llm.rs`
+- **Pipeline**: `crates/vllm-engine/src/core_client.rs` — `PipelineState`, `get_output_pipelined`
+- **CudaWorker execute_model**: `crates/vllm-executor/src/cuda_worker.rs` — `execute_model_inner`
+- **KV cache memory formula**: `crates/vllm-executor/src/cuda_worker.rs` — `compute_available_kv_bytes`
+- **CUDA graphs**: `crates/vllm-cuda/src/graph.rs`
+- **Caching allocator**: `crates/vllm-cuda/src/alloc.rs` — `CachingAllocator`
+- **CUDA kernels**: `crates/vllm-cuda/csrc/` and `crates/vllm-cuda/src/kernels.rs`
+- **FlashAttention-2**: `third_party/vllm-flash-attn/`
 
-1. **`ffi_shim.cu`**: Added `force_split_kernel` parameter to `run_mha_fwd()`, matching upstream `flash_api.cpp`. When `block_table != nullptr`, force the splitkv kernel:
-   ```cpp
-   run_mha_fwd(params, stream, /*force_split_kernel=*/paged);
-   ```
-
-2. **`kernels.rs`**: Removed dead `run_mha` extern (candle-flash-attn symbol). Rewrote `flash_attn_contiguous()` to use `mha_varlen_fwd` with null block_table — makes vllm-cuda self-contained.
-
-3. **Test fix**: `test_noncontiguous_blocks` used `block_size=4` which violates upstream requirement (`block_size % 16 == 0`). Fixed to `block_size=16, kv_len=32`.
-
-## Test Coverage
-
-### Unit tests (17, all in `crates/vllm-cuda/src/kernels.rs`)
-
-| Test | Config | Validates |
-|------|--------|-----------|
-| `test_mha_varlen_fwd_contiguous_basic` | MHA, contiguous | Basic non-paged path |
-| `test_mha_varlen_fwd_paged_basic` | MHA, 1 block | Single-block paged |
-| `test_mha_varlen_fwd_paged_noncontiguous_blocks` | MHA, bt=[2,0], bs=16 | Non-contiguous blocks |
-| `test_mha_varlen_fwd_paged_batch2` | MHA, batch=2 | Batched paged |
-| `test_mha_varlen_fwd_paged_gqa` | GQA 14:2 | GQA + paged |
-| `test_paged_vs_contiguous_gqa` | GQA 14:2, [0,1,2] vs [1,2,0] | Shuffle equivalence |
-| `test_paged_shuffle_gqa_7to1_hdim64` | GQA 14:2, d=64 | Qwen2.5-0.5B config |
-| `test_paged_shuffle_gqa_4to1_hdim128` | GQA 32:8, d=128 | Common GQA config |
-| `test_paged_shuffle_mha_hdim64` | MHA 8:8, d=64 | Non-GQA + splitkv |
-| `test_paged_shuffle_hdim32` | GQA 8:2, d=32 | Small head dim |
-| `test_paged_shuffle_hdim128_gqa` | GQA 32:4, d=128 | Large head dim |
-| `test_paged_shuffle_single_block` | 1 page | Edge case |
-| `test_paged_shuffle_many_blocks` | 5 pages | Multi-block |
-| `test_paged_shuffle_multi_tile` | kv=200, 13 pages | Spans 2 kBlockN tiles |
-| `test_paged_shuffle_batch4` | batch=4 | Batched shuffle |
-| `test_paged_shuffle_batch2_gqa_hdim128` | batch=2, GQA, d=128 | Combined stress |
-| `test_contiguous_varlen_fwd` | null block_table | Contiguous via mha_varlen_fwd |
-
-### E2E tests (in `crates/vllm-e2e/tests/e1_basic_serving.rs`)
-
-| Test | Validates |
-|------|-----------|
-| `test_cuda_paged_fa2_three_turn_chat` | 3-turn conversation, recalls "42", computes 42*2=84 |
-| `test_cuda_paged_fa2_interleaved_multi_turn` | 2 users, interleaved requests, both recall facts |
-| `test_cuda_correctness_multi_turn_chat` | (existing) 2-turn, recalls "Claude" |
-
-## Architecture
-
-- `third_party/vllm-flash-attn/src/` — upstream kernel source (unchanged)
-- `third_party/flash-attn-shim/ffi_shim.cu` — thin FFI shim (~200 lines), our only custom CUDA
-- `third_party/flash-attn-shim/compat/` — PyTorch header stubs
-- `crates/vllm-cuda/build.rs` — cudaforge incremental build, compiles upstream + shim → `libvllm_flash_attn.a`
-
-### Key design decisions
-
-- ffi_shim.cu includes only `flash.h` (declarations) not `flash_fwd_launch_template.h` (definitions)
-- CUTLASS pinned to `62750a2b` (upstream's exact submodule commit)
-- `seqused_k` (per-seq K lengths) instead of `cu_seqlens_k` (cumulative) for paged attention
-- `force_split_kernel=true` when `block_table != nullptr` — mandatory, standard kernel has no paging
-- `num_splits=1` always (split-K accum buffers not yet wired from Rust side)
-
-## Build/test commands
+## Test Commands
 
 ```bash
-# Unit tests (all 17, ~2 sec after first build)
-cargo test -p vllm-cuda --features cuda --release -- --ignored --nocapture
-
-# E2E tests (paged FA2 only, ~6 sec)
-cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_paged_fa2 -- --ignored --test-threads=1
-
-# All CUDA E2E tests (~45 sec)
+# CUDA E2E (14 tests, ~60s)
 cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda -- --ignored --test-threads=1
 
-# Manual multi-turn chat
-echo -e "What is 2+2?\nWhat is 3+3?" | ./target/release/vllm chat --model Qwen/Qwen2.5-0.5B-Instruct --max-tokens 20
+# CUDA kernel unit tests (151 tests)
+cargo test -p vllm-cuda --features cuda
+
+# KV cache memory budget tests (3 tests)
+cargo test -p vllm-executor --features cuda -- test_kv_cache
+
+# Engine + executor unit tests (41 tests)
+cargo test -p vllm-engine -p vllm-executor
+
+# Full workspace clippy (CUDA)
+cargo clippy --workspace --exclude vllm-pyo3 --exclude vllm-mlx --features cuda -- -D warnings
 ```
-
-Pod: `oc rsh nick` — L40S, CUDA 12.9, path `/root/vllm/vllm-rs/`. Always `export RUSTC_WRAPPER=/usr/bin/sccache`.
-
-## Upstream References
-
-- Python vLLM flash-attn pin: `cmake/external_projects/vllm_flash_attn.cmake` → commit `5824e6e2`
-- CUTLASS pin: `62750a2b`
-- Key upstream file: `csrc/flash_attn/flash_api.cpp` → `mha_varlen_fwd()` (line 516)
-- Standard kernel (NO paging): `flash_fwd_kernel.h` → `compute_attn_1rowblock` (line 52)
-- SplitKV kernel (HAS paging): `flash_fwd_kernel.h` → `compute_attn_1rowblock_splitkv` (line 499)
-- Page resolution: `utils.h` → `resolve_thread_kv_page_slice_offset` (line 300)

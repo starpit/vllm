@@ -236,13 +236,14 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             block_size: config.block_size,
             device_id,
             enforce_eager: config.enforce_eager,
-            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(4096),
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(8192),
             cuda_graph_sizes: config
                 .cuda_graph_config
                 .as_ref()
                 .map(|c| c.capture_sizes.clone())
                 .unwrap_or_default(),
             cublas_autotune: config.cublas_autotune,
+            gpu_memory_utilization: config.gpu_memory_utilization,
         };
 
         let mut worker = CudaWorker::new(cuda_config);
@@ -251,18 +252,13 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             .context("failed to initialize CUDA device")?;
 
         // Auto-detect max_num_batched_tokens from GPU VRAM if not explicitly set.
-        // Python vLLM defaults: >=70GB non-A100: 16384, else: 8192 (LLM_CLASS).
-        // Note: Python uses PyTorch's fragmented allocator. Our contiguous ScratchArena
-        // needs the peak of one transformer layer to fit, so we may need a lower value
-        // on GPUs where VRAM is tight after model weights + KV cache.
+        // Match Python vLLM defaults for LLM_CLASS usage context:
+        //   >=70GB non-A100: 16384
+        //   else (including L40S 48GB): 8192
         if config.max_num_batched_tokens.is_none() {
             let total_vram = worker.determine_available_memory().unwrap_or(0);
             let total_gb = total_vram as f64 / (1024.0 * 1024.0 * 1024.0);
-            // Without chunked prefill, the ScratchArena must fit the peak of one
-            // transformer layer for max_num_batched_tokens tokens. 8192 tokens on
-            // a 3B model needs ~2.5GB contiguous VRAM — too much for <=48GB GPUs
-            // after model weights + KV cache. Use 4096 as a safe default.
-            let batched_tokens = if total_gb >= 60.0 { 8192 } else { 4096 };
+            let batched_tokens = if total_gb >= 60.0 { 16384 } else { 8192 };
             info!(
                 "GPU has {:.0}GB free VRAM, using max_num_batched_tokens={}",
                 total_gb, batched_tokens
@@ -306,23 +302,35 @@ fn init_cache(
         .determine_available_memory()
         .context("failed to determine available memory")?;
 
-    // CPU: ignore gpu_memory_utilization (default 0.9 is for GPU VRAM).
-    // Use 50% of system RAM, matching Python vLLM's DEFAULT_CPU_MEM_UTILIZATION.
+    // For CUDA workers, determine_available_memory already returns the KV
+    // cache budget with gpu_memory_utilization baked in (matching Python vLLM:
+    // total * util - non_kv_cache). For CPU/Metal, the returned value is raw
+    // free memory and we apply utilization here.
+    let is_cuda = cfg!(feature = "cuda")
+        && device != "cpu"
+        && (device == "auto" || device.starts_with("cuda"));
     let is_cpu = device == "cpu"
         || (device == "auto" && !cfg!(feature = "cuda") && !cfg!(feature = "metal"));
-    let utilization = if is_cpu {
+
+    let (kv_cache_bytes, utilization) = if is_cuda {
+        // CudaWorker already computed: total * util - non_kv_cache
+        (available_memory, gpu_memory_utilization)
+    } else if is_cpu {
         const DEFAULT_CPU_MEM_UTILIZATION: f64 = 0.5;
         info!(
             "CPU device: using {:.0}% of system memory for KV cache (override with --gpu-memory-utilization)",
             DEFAULT_CPU_MEM_UTILIZATION * 100.0
         );
-        DEFAULT_CPU_MEM_UTILIZATION
+        let bytes = (available_memory as f64 * DEFAULT_CPU_MEM_UTILIZATION) as usize;
+        (bytes, DEFAULT_CPU_MEM_UTILIZATION)
     } else {
-        gpu_memory_utilization
+        // Metal or other GPU — apply utilization to raw free memory.
+        let bytes = (available_memory as f64 * gpu_memory_utilization) as usize;
+        (bytes, gpu_memory_utilization)
     };
 
     let num_gpu_blocks = compute_num_blocks(
-        available_memory,
+        kv_cache_bytes,
         block_size,
         hf_config,
         model_dtype,
@@ -1122,12 +1130,17 @@ fn try_load_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
 }
 
 /// Compute the number of KV cache blocks from available memory.
+///
+/// `available_bytes` is the KV cache budget in bytes, already accounting for
+/// `gpu_memory_utilization`. This matches Python vLLM where
+/// `determine_available_memory` returns `total * util - non_kv_cache` and
+/// the block count is simply `available / bytes_per_block`.
 fn compute_num_blocks(
     available_bytes: usize,
     block_size: usize,
     hf_config: &HfModelConfig,
     dtype: DType,
-    gpu_memory_utilization: f64,
+    _gpu_memory_utilization: f64,
 ) -> usize {
     let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
     let num_kv_heads = hf_config.num_kv_heads().unwrap_or(0);
@@ -1143,9 +1156,7 @@ fn compute_num_blocks(
         return 1024; // Fallback.
     }
 
-    let utilization = gpu_memory_utilization.clamp(0.0, 1.0);
-    let cache_memory = (available_bytes as f64 * utilization) as usize;
-    let num_blocks = cache_memory / bytes_per_block;
+    let num_blocks = available_bytes / bytes_per_block;
 
     // At least 16 blocks.
     num_blocks.max(16)
@@ -1228,7 +1239,10 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_num_blocks_utilization_half() {
+    fn test_compute_num_blocks_proportional_to_memory() {
+        // compute_num_blocks no longer applies utilization internally —
+        // the caller is responsible for providing the final KV cache budget.
+        // Verify that halving the input memory halves the blocks.
         let config = HfModelConfig {
             num_hidden_layers: Some(32),
             num_attention_heads: Some(32),
@@ -1236,11 +1250,10 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks_90 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9);
-        let blocks_50 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.5);
-        // 0.5 should produce roughly 0.5/0.9 ≈ 55% of the blocks from 0.9.
-        let ratio = blocks_50 as f64 / blocks_90 as f64;
-        assert!(ratio > 0.5 && ratio < 0.65, "ratio was {ratio}");
+        let blocks_full = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9);
+        let blocks_half = compute_num_blocks(2 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9);
+        let ratio = blocks_half as f64 / blocks_full as f64;
+        assert!((ratio - 0.5).abs() < 0.01, "ratio was {ratio}");
     }
 
     #[test]

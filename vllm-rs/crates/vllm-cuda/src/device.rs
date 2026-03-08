@@ -25,6 +25,8 @@ pub struct GpuDevice {
     pub caching: CachingAllocator,
     /// Event for gating CPU reuse of pinned buffers after H2D transfer.
     pub transfer_done: CUevent,
+    /// Event recorded on transfer_stream after D2H copy for async output.
+    pub d2h_done: CUevent,
     /// Number of streaming multiprocessors on this device.
     pub num_sm: i32,
 }
@@ -42,6 +44,7 @@ impl GpuDevice {
             let compute_stream = driver::stream_create()?;
             let transfer_stream = driver::stream_create()?;
             let transfer_done = driver::event_create_disable_timing()?;
+            let d2h_done = driver::event_create_disable_timing()?;
 
             let cublas = CublasHandle::new(compute_stream)?;
             let caching = CachingAllocator::new();
@@ -61,6 +64,7 @@ impl GpuDevice {
                 cublas,
                 caching,
                 transfer_done,
+                d2h_done,
                 num_sm,
             })
         }
@@ -84,6 +88,30 @@ impl GpuDevice {
             driver::stream_wait_event(self.compute_stream, self.transfer_done)?;
         }
         Ok(())
+    }
+
+    /// Record event on compute_stream, make transfer_stream wait for it,
+    /// then do D2H copy on transfer_stream and record d2h_done event.
+    /// The caller must call `sync_d2h()` before reading the host buffer.
+    pub unsafe fn async_d2h(
+        &self,
+        host_dst: *mut u8,
+        device_src: *const u8,
+        bytes: usize,
+    ) -> Result<()> {
+        // Gate transfer_stream on compute_stream completion.
+        driver::event_record(self.transfer_done, self.compute_stream)?;
+        driver::stream_wait_event(self.transfer_stream, self.transfer_done)?;
+        // D2H on transfer_stream.
+        driver::memcpy_dtoh_async(host_dst, device_src, bytes, self.transfer_stream)?;
+        // Record d2h_done so caller can sync on it.
+        driver::event_record(self.d2h_done, self.transfer_stream)?;
+        Ok(())
+    }
+
+    /// Block until the D2H copy initiated by `async_d2h` is complete.
+    pub fn sync_d2h(&self) -> Result<()> {
+        unsafe { driver::event_synchronize(self.d2h_done) }
     }
 
     /// Allocate persistent device memory (not from caching allocator).

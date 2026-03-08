@@ -1052,40 +1052,13 @@ pub unsafe fn flash_attn_paged_ext(
     )
     .expect("memset dummy_cu_seqlens_k");
 
-    // --- Compute num_splits (matches upstream set_params_splitkv heuristic) ---
-    let block_n = if head_dim <= 64 {
-        256
-    } else if head_dim <= 128 {
-        128
-    } else {
-        64
-    };
-    let num_n_blocks = max_seqlen_k.div_ceil(block_n);
-    let num_m_blocks = max_seqlen_q.div_ceil(64);
-    let num_splits = num_splits_heuristic(
-        batch_size * num_heads * num_m_blocks,
-        (num_sm * 2) as usize,
-        num_n_blocks,
-        128,
-    );
-
-    // Allocate split-K accumulator buffers if needed.
-    let (lse_accum_ptr, out_accum_ptr) = if num_splits > 1 {
-        let lse_accum = alloc.alloc_tensor(
-            &[num_splits * batch_size * num_heads * max_seqlen_q],
-            DType::F32,
-        );
-        let out_accum = alloc.alloc_tensor(
-            &[num_splits * batch_size * num_heads * max_seqlen_q * head_dim_rounded],
-            DType::F32,
-        );
-        (
-            lse_accum.raw_ptr() as *mut c_void,
-            out_accum.raw_ptr() as *mut c_void,
-        )
-    } else {
-        (std::ptr::null_mut(), std::ptr::null_mut())
-    };
+    // Always use num_splits=1, matching Python vLLM's FA2 behavior.
+    // The upstream vllm-flash-attn C code always sets params.num_splits = 1.
+    // Our shim previously computed multi-split values via a heuristic, but
+    // Python FA2 never uses num_splits > 1.
+    let num_splits = 1;
+    let lse_accum_ptr: *mut c_void = std::ptr::null_mut();
+    let out_accum_ptr: *mut c_void = std::ptr::null_mut();
 
     mha_varlen_fwd(
         q.raw_ptr() as *mut c_void,
@@ -1355,6 +1328,34 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    fn sample_gumbel_batched_f16(
+        output: *mut u32,
+        logits: *const u16,
+        vocab_size: c_int,
+        batch_size: c_int,
+        temperatures: *const f32,
+        uniform_randoms: *const f32,
+        stream: CUstream,
+    );
+    fn sample_gumbel_batched_bf16(
+        output: *mut u32,
+        logits: *const u16,
+        vocab_size: c_int,
+        batch_size: c_int,
+        temperatures: *const f32,
+        uniform_randoms: *const f32,
+        stream: CUstream,
+    );
+    fn sample_gumbel_batched_f32(
+        output: *mut u32,
+        logits: *const f32,
+        vocab_size: c_int,
+        batch_size: c_int,
+        temperatures: *const f32,
+        uniform_randoms: *const f32,
+        stream: CUstream,
+    );
+
     fn sample_batched_f16(
         output: *mut u32,
         logits: *const u16,
@@ -1429,6 +1430,64 @@ pub unsafe fn argmax_batched(
             stream,
         ),
         _ => panic!("argmax_batched: unsupported dtype {:?}", logits.dtype()),
+    }
+    out
+}
+
+/// Fast batched sampling via the Gumbel-max trick.
+///
+/// Equivalent to sampling from `softmax(logits / temperature)` but uses only
+/// a single argmax-like pass (no radix select, no sort). Requires that no
+/// top-k, top-p, or min-p filtering is needed.
+///
+/// * `logits`: `[batch_size, vocab_size]`
+/// * `temperatures`: `[batch_size]` (F32, on GPU)
+/// * `uniform_randoms`: `[batch_size]` (F32, on GPU) — seeds for per-element noise
+///
+/// Returns `[batch_size]` u32 tensor of sampled token IDs, allocated from arena.
+pub unsafe fn sample_gumbel_batched(
+    logits: GpuTensor,
+    temperatures: GpuTensor,
+    uniform_randoms: GpuTensor,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let batch_size = logits.dim(0) as c_int;
+    let vocab_size = logits.dim(1) as c_int;
+    let out = alloc.alloc_tensor(&[batch_size as usize], DType::U32);
+
+    match logits.dtype() {
+        DType::F16 => sample_gumbel_batched_f16(
+            out.as_mut_ptr() as *mut u32,
+            logits.as_ptr() as *const u16,
+            vocab_size,
+            batch_size,
+            temperatures.as_ptr(),
+            uniform_randoms.as_ptr(),
+            stream,
+        ),
+        DType::BF16 => sample_gumbel_batched_bf16(
+            out.as_mut_ptr() as *mut u32,
+            logits.as_ptr() as *const u16,
+            vocab_size,
+            batch_size,
+            temperatures.as_ptr(),
+            uniform_randoms.as_ptr(),
+            stream,
+        ),
+        DType::F32 => sample_gumbel_batched_f32(
+            out.as_mut_ptr() as *mut u32,
+            logits.as_ptr() as *const f32,
+            vocab_size,
+            batch_size,
+            temperatures.as_ptr(),
+            uniform_randoms.as_ptr(),
+            stream,
+        ),
+        _ => panic!(
+            "sample_gumbel_batched: unsupported dtype {:?}",
+            logits.dtype()
+        ),
     }
     out
 }

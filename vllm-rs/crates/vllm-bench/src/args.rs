@@ -92,7 +92,7 @@ pub struct BenchLatencyArgs {
     pub max_model_len: Option<usize>,
 
     /// Maximum number of concurrent sequences.
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 256)]
     pub max_num_seqs: usize,
 
     /// Maximum number of tokens processed in a single scheduler iteration.
@@ -212,7 +212,7 @@ pub struct BenchThroughputArgs {
     pub max_model_len: Option<usize>,
 
     /// Maximum number of concurrent sequences.
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 256)]
     pub max_num_seqs: usize,
 
     /// Maximum number of tokens processed in a single scheduler iteration.
@@ -406,7 +406,7 @@ pub struct BenchStartupArgs {
     pub max_model_len: Option<usize>,
 
     /// Maximum number of concurrent sequences.
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 256)]
     pub max_num_seqs: usize,
 
     /// Maximum number of tokens processed in a single scheduler iteration.

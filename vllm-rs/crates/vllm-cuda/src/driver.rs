@@ -214,6 +214,11 @@ pub unsafe fn event_destroy(event: CUevent) -> Result<()> {
     check(sys::cuEventDestroy_v2(event))
 }
 
+/// Block the calling thread until the event has been recorded.
+pub unsafe fn event_synchronize(event: CUevent) -> Result<()> {
+    check(sys::cuEventSynchronize(event))
+}
+
 /// Compute elapsed time in milliseconds between two recorded events.
 pub unsafe fn event_elapsed(start: CUevent, end: CUevent) -> Result<f32> {
     let mut ms: f32 = 0.0;

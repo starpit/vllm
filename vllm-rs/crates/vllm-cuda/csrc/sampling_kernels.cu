@@ -526,6 +526,132 @@ void sample_batched_bf16(
 }  // extern "C" (close before templates)
 
 // ---------------------------------------------------------------------------
+// Gumbel-max sampling: equivalent to sampling from softmax(logit/T) but
+// requires only a single argmax-like pass. Uses the identity:
+//   sample ~ Categorical(softmax(logit/T))
+//   <==>  sample = argmax_i(logit_i/T + Gumbel_i)
+// where Gumbel_i = -log(-log(U_i)), U_i ~ Uniform(0,1).
+//
+// Per-element randomness is generated via a counter-based hash (murmurhash3
+// finalizer), seeded from the per-request uniform_random value.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ uint32_t murmurhash3_finalize(uint32_t h) {
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+}
+
+__device__ __forceinline__ float hash_to_uniform(uint32_t seed, uint32_t idx) {
+    // Combine seed and index, then hash to get a uniform float in (0, 1).
+    uint32_t h = murmurhash3_finalize(seed ^ (idx * 2654435761u));
+    // Map to (0, 1) — exclude 0 to avoid log(0).
+    return (float)(h >> 8) * (1.0f / 16777216.0f) + (0.5f / 16777216.0f);
+}
+
+template <typename T>
+__global__ void sample_gumbel_batched_kernel(
+    uint32_t* __restrict__ output,
+    const T* __restrict__ logits,
+    int vocab_size,
+    const float* __restrict__ temperatures,
+    const float* __restrict__ uniform_randoms)
+{
+    int bid = blockIdx.x;
+    const T* row = logits + bid * vocab_size;
+    float inv_temp = 1.0f / temperatures[bid];
+
+    // Use the uniform random as seed for per-element noise.
+    uint32_t seed = __float_as_uint(uniform_randoms[bid]);
+
+    __shared__ float s_warp_buf[NUM_WARPS];
+    __shared__ int s_warp_idx_buf[NUM_WARPS];
+
+    int tid = threadIdx.x;
+    float best_val = -INFINITY;
+    int best_idx = 0;
+
+    for (int i = tid; i < vocab_size; i += SAMPLING_BLOCK_SIZE) {
+        float logit = to_float(row[i]) * inv_temp;
+        // Gumbel noise: -log(-log(u))
+        float u = hash_to_uniform(seed, (uint32_t)i);
+        float gumbel = -logf(-logf(u));
+        float score = logit + gumbel;
+        if (score > best_val) {
+            best_val = score;
+            best_idx = i;
+        }
+    }
+
+    // Warp reduce max with index (same as argmax_kernel).
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
+        int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
+        if (other_val > best_val) {
+            best_val = other_val;
+            best_idx = other_idx;
+        }
+    }
+
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    if (lane_id == 0) {
+        s_warp_buf[warp_id] = best_val;
+        s_warp_idx_buf[warp_id] = best_idx;
+    }
+    __syncthreads();
+
+    if (tid < WARP_SIZE) {
+        best_val = (tid < NUM_WARPS) ? s_warp_buf[tid] : -INFINITY;
+        best_idx = (tid < NUM_WARPS) ? s_warp_idx_buf[tid] : 0;
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
+            int other_idx = __shfl_xor_sync(0xffffffff, best_idx, offset);
+            if (other_val > best_val) {
+                best_val = other_val;
+                best_idx = other_idx;
+            }
+        }
+        if (tid == 0) {
+            output[bid] = (uint32_t)best_idx;
+        }
+    }
+}
+
+extern "C" {
+
+void sample_gumbel_batched_f32(
+    uint32_t* output, const float* logits, int vocab_size, int batch_size,
+    const float* temperatures, const float* uniform_randoms, cudaStream_t stream) {
+    if (batch_size > 0)
+        sample_gumbel_batched_kernel<float><<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
+            output, logits, vocab_size, temperatures, uniform_randoms);
+}
+
+void sample_gumbel_batched_f16(
+    uint32_t* output, const uint16_t* logits, int vocab_size, int batch_size,
+    const float* temperatures, const float* uniform_randoms, cudaStream_t stream) {
+    if (batch_size > 0)
+        sample_gumbel_batched_kernel<__half><<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
+            output, reinterpret_cast<const __half*>(logits), vocab_size, temperatures, uniform_randoms);
+}
+
+void sample_gumbel_batched_bf16(
+    uint32_t* output, const uint16_t* logits, int vocab_size, int batch_size,
+    const float* temperatures, const float* uniform_randoms, cudaStream_t stream) {
+    if (batch_size > 0)
+        sample_gumbel_batched_kernel<__nv_bfloat16><<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
+            output, reinterpret_cast<const __nv_bfloat16*>(logits), vocab_size, temperatures, uniform_randoms);
+}
+
+}  // extern "C" (close gumbel)
+
+// ---------------------------------------------------------------------------
 // Batched argmax: one thread block per row, writes u32 token ID.
 // Much cheaper than the full sampling kernel for greedy decoding.
 // ---------------------------------------------------------------------------

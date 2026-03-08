@@ -1221,9 +1221,7 @@ async fn test_cuda_tp2_deepseek_v2_completion() {
 // ===========================================================================
 // CUDA Granite — safetensors BF16 (~4.5 GB) on GPU
 // ===========================================================================
-// TODO: Re-enable when vllm-cuda backend supports GraniteForCausalLM.
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_granite -- --ignored
-/*
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -1259,7 +1257,6 @@ async fn test_cuda_granite_chat_coherent() {
     let content = resp.choices[0].message.content.as_deref().unwrap_or("");
     assert!(!content.is_empty(), "chat response should not be empty");
 }
-*/ // end Granite safetensors block comment
 
 // ===========================================================================
 // CUDA Granite GGUF — quantized on GPU

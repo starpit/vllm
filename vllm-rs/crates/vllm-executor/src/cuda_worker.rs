@@ -798,11 +798,56 @@ impl Worker for CudaWorker {
                 .map_err(|e| ExecutorError::WorkerInit(format!("Gemma2 load: {e}")))?;
                 CudaModel::Gemma2(m)
             }
+            "GraniteForCausalLM" => {
+                let config = llama_config_from_hf(&hf_config)?;
+                let mut m = vllm_cuda::model::llama::LlamaForCausalLM::load(
+                    &mut weights,
+                    &config,
+                    dtype,
+                    device,
+                )
+                .map_err(|e| ExecutorError::WorkerInit(format!("GraniteForCausalLM load: {e}")))?;
+
+                // Parse Granite-specific multipliers from config.json extras.
+                let extra = &hf_config.extra;
+                let embedding_multiplier = extra
+                    .get("embedding_multiplier")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0) as f32;
+                let residual_multiplier = extra
+                    .get("residual_multiplier")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0) as f32;
+                let logits_scaling = extra
+                    .get("logits_scaling")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0) as f32;
+                let attention_multiplier = extra
+                    .get("attention_multiplier")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+                    .unwrap_or(1.0 / (config.head_dim as f32).sqrt());
+
+                // Apply multipliers.
+                m.model.embedding_multiplier = embedding_multiplier;
+                m.logits_scaling = logits_scaling;
+                for layer in &mut m.model.layers {
+                    layer.residual_multiplier = residual_multiplier;
+                    layer.self_attn.scale = attention_multiplier;
+                }
+
+                info!(
+                    "Granite multipliers: embedding={embedding_multiplier}, \
+                     residual={residual_multiplier}, attention={attention_multiplier}, \
+                     logits_scaling={logits_scaling}"
+                );
+                CudaModel::Llama(m)
+            }
             _ => {
                 return Err(ExecutorError::WorkerInit(format!(
                     "unsupported architecture for cuda-backend: {arch}. \
                      Supported: LlamaForCausalLM, MistralForCausalLM, Qwen3ForCausalLM, \
-                     Phi3ForCausalLM, Qwen2ForCausalLM, Gemma2ForCausalLM"
+                     Phi3ForCausalLM, Qwen2ForCausalLM, Gemma2ForCausalLM, GraniteForCausalLM"
                 )));
             }
         };

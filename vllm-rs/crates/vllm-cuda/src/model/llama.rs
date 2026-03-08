@@ -262,7 +262,7 @@ pub struct LlamaAttention {
     num_q_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
-    scale: f32,
+    pub scale: f32,
     layer_idx: usize,
 }
 
@@ -407,6 +407,8 @@ pub struct LlamaDecoderLayer {
     mlp: LlamaMLP,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
+    /// Granite residual multiplier (1.0 = no-op for LLaMA).
+    pub residual_multiplier: f32,
 }
 
 impl LlamaDecoderLayer {
@@ -468,6 +470,11 @@ impl LlamaDecoderLayer {
             device,
         );
 
+        // Granite: scale attention output before residual add.
+        if self.residual_multiplier != 1.0 {
+            kernels::scale_inplace(attn_output, self.residual_multiplier, &device.cublas);
+        }
+
         // Post-attention norm with fused residual add.
         let (normed, residual) = kernels::fused_add_rms_norm(
             attn_output,
@@ -479,6 +486,11 @@ impl LlamaDecoderLayer {
         );
         // MLP.
         let mlp_output = self.mlp.forward(normed, device);
+
+        // Granite: scale MLP output before next residual add.
+        if self.residual_multiplier != 1.0 {
+            kernels::scale_inplace(mlp_output, self.residual_multiplier, &device.cublas);
+        }
 
         (mlp_output, residual)
     }
@@ -494,6 +506,8 @@ pub struct LlamaModel {
     pub layers: Vec<LlamaDecoderLayer>,
     pub norm: RmsNorm,
     pub rotary: RotaryCache,
+    /// Granite embedding multiplier (1.0 = no-op for LLaMA).
+    pub embedding_multiplier: f32,
 }
 
 impl LlamaModel {
@@ -529,6 +543,11 @@ impl LlamaModel {
             &mut device.arena,
             device.compute_stream,
         );
+
+        // Granite: scale embeddings.
+        if self.embedding_multiplier != 1.0 {
+            kernels::scale_inplace(hidden_states, self.embedding_multiplier, &device.cublas);
+        }
 
         // Decoder layers with per-layer arena scoping.
         let num_tokens = hidden_states.dim(0);
@@ -606,6 +625,8 @@ impl LlamaModel {
 pub struct LlamaForCausalLM {
     pub model: LlamaModel,
     pub lm_head: Linear,
+    /// Granite logits scaling (1.0 = no-op for LLaMA).
+    pub logits_scaling: f32,
 }
 
 impl LlamaForCausalLM {
@@ -653,8 +674,16 @@ impl LlamaForCausalLM {
         } else {
             hidden_states
         };
-        self.lm_head
-            .forward(hidden_states, &mut device.cublas, &mut device.arena)
+        let logits = self
+            .lm_head
+            .forward(hidden_states, &mut device.cublas, &mut device.arena);
+
+        // Granite: scale logits by 1/logits_scaling.
+        if self.logits_scaling != 1.0 {
+            kernels::scale_inplace(logits, 1.0 / self.logits_scaling, &device.cublas);
+        }
+
+        logits
     }
 }
 
@@ -872,6 +901,7 @@ impl LlamaDecoderLayer {
             mlp,
             input_layernorm,
             post_attention_layernorm,
+            residual_multiplier: 1.0,
         })
     }
 }
@@ -916,6 +946,7 @@ impl LlamaModel {
             layers,
             norm,
             rotary,
+            embedding_multiplier: 1.0,
         })
     }
 }
@@ -936,6 +967,10 @@ impl LlamaForCausalLM {
             Linear::load(weights, "lm_head")?
         };
 
-        Ok(Self { model, lm_head })
+        Ok(Self {
+            model,
+            lm_head,
+            logits_scaling: 1.0,
+        })
     }
 }

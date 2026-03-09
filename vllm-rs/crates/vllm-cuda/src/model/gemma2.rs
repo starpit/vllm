@@ -19,10 +19,11 @@ use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
-use crate::layers::{Embedding, Linear, RmsNorm};
+use crate::layers::{Embedding, Linear, LinearLayer, RmsNorm};
 use crate::model::llama::RotaryCache;
+use crate::quant::QuantConfig;
 use crate::tensor::GpuTensor;
-use crate::weights::GpuWeights;
+use crate::weights::{self as gpu_weights, GpuWeights};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -128,8 +129,8 @@ unsafe fn add_one_to_weight(
 // ---------------------------------------------------------------------------
 
 pub struct Gemma2MLP {
-    gate_up_proj: Linear,
-    down_proj: Linear,
+    gate_up_proj: LinearLayer,
+    down_proj: LinearLayer,
     intermediate_size: usize,
 }
 
@@ -159,8 +160,8 @@ impl Gemma2MLP {
         }
         let gate_up_w =
             unsafe { GpuTensor::new(ptr, &[2 * intermediate_size, hidden], gate_dtype) };
-        let gate_up_proj = Linear::new(gate_up_w, None);
-        let down_proj = Linear::load(weights, &format!("{prefix}.down_proj"))?;
+        let gate_up_proj = LinearLayer::Dense(Linear::new(gate_up_w, None));
+        let down_proj = LinearLayer::Dense(Linear::load(weights, &format!("{prefix}.down_proj"))?);
         Ok(Self {
             gate_up_proj,
             down_proj,
@@ -169,24 +170,34 @@ impl Gemma2MLP {
     }
 
     pub unsafe fn forward(&self, x: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
-        let gate_up = self
-            .gate_up_proj
-            .forward(x, &mut device.cublas, &mut device.caching);
+        let gate_up = self.gate_up_proj.forward(
+            x,
+            &mut device.cublas,
+            &mut device.caching,
+            device.compute_stream,
+        );
         let activated = kernels::gelu_and_mul_fused(
             gate_up,
             self.intermediate_size,
             &mut device.caching,
             device.compute_stream,
         );
-        self.down_proj
-            .forward(*activated, &mut device.cublas, &mut device.caching)
+        self.down_proj.forward(
+            *activated,
+            &mut device.cublas,
+            &mut device.caching,
+            device.compute_stream,
+        )
     }
 
     /// Forward pass returning `OwnedTensor` (caching-allocator path).
     pub unsafe fn forward_owned(&self, x: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
-        let gate_up = self
-            .gate_up_proj
-            .forward_owned(x, &mut device.cublas, &mut device.caching);
+        let gate_up = self.gate_up_proj.forward_owned(
+            x,
+            &mut device.cublas,
+            &mut device.caching,
+            device.compute_stream,
+        );
         let activated = kernels::gelu_and_mul_fused(
             gate_up.as_gpu_tensor(),
             self.intermediate_size,
@@ -198,9 +209,45 @@ impl Gemma2MLP {
             activated.as_gpu_tensor(),
             &mut device.cublas,
             &mut device.caching,
+            device.compute_stream,
         );
         drop(activated);
         result
+    }
+
+    /// Load quantized MLP (fused gate_up + down Marlin layers).
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        intermediate_size: usize,
+        qconfig: &QuantConfig,
+        workspace: GpuTensor,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let mut alloc = crate::alloc::CachingAllocator::new();
+
+        let gate_up = gpu_weights::load_fused_marlin_linear(
+            weights,
+            &[format!("{prefix}.gate_proj"), format!("{prefix}.up_proj")],
+            qconfig,
+            workspace,
+            device.device_id,
+            &mut alloc,
+        )?;
+        let down = gpu_weights::load_marlin_linear(
+            weights,
+            &format!("{prefix}.down_proj"),
+            qconfig,
+            workspace,
+            device.device_id,
+            &mut alloc,
+        )?;
+
+        Ok(Self {
+            gate_up_proj: LinearLayer::Marlin(Box::new(gate_up)),
+            down_proj: LinearLayer::Marlin(Box::new(down)),
+            intermediate_size,
+        })
     }
 }
 
@@ -209,8 +256,8 @@ impl Gemma2MLP {
 // ---------------------------------------------------------------------------
 
 pub struct Gemma2Attention {
-    qkv_proj: Linear,
-    o_proj: Linear,
+    qkv_proj: LinearLayer,
+    o_proj: LinearLayer,
     q_size: usize,
     kv_size: usize,
     num_q_heads: usize,
@@ -255,9 +302,9 @@ impl Gemma2Attention {
             weights.take_into(&v_name, ptr.add(q_bytes + kv_bytes), stream)?;
         }
         let qkv_w = unsafe { GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden], q_dtype) };
-        let qkv_proj = Linear::new(qkv_w, None);
+        let qkv_proj = LinearLayer::Dense(Linear::new(qkv_w, None));
 
-        let o_proj = Linear::load(weights, &format!("{prefix}.o_proj"))?;
+        let o_proj = LinearLayer::Dense(Linear::load(weights, &format!("{prefix}.o_proj"))?);
 
         let sliding_window = if is_sliding {
             config.sliding_window
@@ -297,9 +344,12 @@ impl Gemma2Attention {
     ) -> GpuTensor {
         let num_tokens = hidden_states.dim(0);
 
-        let qkv = self
-            .qkv_proj
-            .forward(hidden_states, &mut device.cublas, &mut device.caching);
+        let qkv = self.qkv_proj.forward(
+            hidden_states,
+            &mut device.cublas,
+            &mut device.caching,
+            device.compute_stream,
+        );
 
         let (q, k, v) = kernels::fused_qkv_rope(
             qkv,
@@ -370,8 +420,12 @@ impl Gemma2Attention {
         let attn_flat = attn_output
             .into_gpu_tensor()
             .reshape(&[num_tokens, self.q_size]);
-        self.o_proj
-            .forward(attn_flat, &mut device.cublas, &mut device.caching)
+        self.o_proj.forward(
+            attn_flat,
+            &mut device.cublas,
+            &mut device.caching,
+            device.compute_stream,
+        )
     }
 
     /// Forward pass returning `OwnedTensor` (caching-allocator path).
@@ -392,9 +446,12 @@ impl Gemma2Attention {
     ) -> OwnedTensor {
         let num_tokens = hidden_states.dim(0);
 
-        let qkv =
-            self.qkv_proj
-                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+        let qkv = self.qkv_proj.forward_owned(
+            hidden_states,
+            &mut device.cublas,
+            &mut device.caching,
+            device.compute_stream,
+        );
 
         let (q, k, v) = kernels::fused_qkv_rope(
             qkv.as_gpu_tensor(),
@@ -466,11 +523,76 @@ impl Gemma2Attention {
         let attn_flat = attn_output
             .as_gpu_tensor()
             .reshape(&[num_tokens, self.q_size]);
-        let result = self
-            .o_proj
-            .forward_owned(attn_flat, &mut device.cublas, &mut device.caching);
+        let result = self.o_proj.forward_owned(
+            attn_flat,
+            &mut device.cublas,
+            &mut device.caching,
+            device.compute_stream,
+        );
         drop(attn_output);
         result
+    }
+
+    /// Load quantized attention (fused QKV + o_proj Marlin layers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Gemma2Config,
+        layer_idx: usize,
+        is_sliding: bool,
+        qconfig: &QuantConfig,
+        workspace: GpuTensor,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let num_q_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        let mut alloc = crate::alloc::CachingAllocator::new();
+
+        let qkv = gpu_weights::load_fused_marlin_linear(
+            weights,
+            &[
+                format!("{prefix}.q_proj"),
+                format!("{prefix}.k_proj"),
+                format!("{prefix}.v_proj"),
+            ],
+            qconfig,
+            workspace,
+            device.device_id,
+            &mut alloc,
+        )?;
+        let o = gpu_weights::load_marlin_linear(
+            weights,
+            &format!("{prefix}.o_proj"),
+            qconfig,
+            workspace,
+            device.device_id,
+            &mut alloc,
+        )?;
+
+        let sliding_window = if is_sliding {
+            config.sliding_window
+        } else {
+            None
+        };
+
+        Ok(Self {
+            qkv_proj: LinearLayer::Marlin(Box::new(qkv)),
+            o_proj: LinearLayer::Marlin(Box::new(o)),
+            q_size,
+            kv_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale: config.query_pre_attn_scalar.powf(-0.5) as f32,
+            attn_logit_softcapping: config.attn_logit_softcapping.unwrap_or(0.0) as f32,
+            sliding_window,
+            layer_idx,
+        })
     }
 }
 
@@ -510,6 +632,75 @@ impl Gemma2DecoderLayer {
             &format!("{prefix}.mlp"),
             config.intermediate_size,
             device.compute_stream,
+        )?;
+        let input_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let post_attention_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let pre_feedforward_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.pre_feedforward_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let post_feedforward_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.post_feedforward_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            pre_feedforward_layernorm,
+            post_feedforward_layernorm,
+        })
+    }
+
+    /// Load a quantized decoder layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Gemma2Config,
+        layer_idx: usize,
+        is_sliding: bool,
+        qconfig: &QuantConfig,
+        workspace: GpuTensor,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let self_attn = Gemma2Attention::load_quantized(
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            is_sliding,
+            qconfig,
+            workspace,
+            device,
+        )?;
+        let mlp = Gemma2MLP::load_quantized(
+            weights,
+            &format!("{prefix}.mlp"),
+            config.intermediate_size,
+            qconfig,
+            workspace,
+            device,
         )?;
         let input_layernorm = GemmaRmsNorm::load(
             weights,
@@ -975,6 +1166,66 @@ impl Gemma2ForCausalLM {
         let model = Gemma2Model::load(weights, config, dtype, device)?;
 
         // Gemma2 always uses tied embeddings.
+        let lm_head = Linear::new(model.embed_tokens.weight, None);
+
+        Ok(Self {
+            model,
+            lm_head,
+            final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
+        })
+    }
+
+    /// Load a quantized model (AWQ/GPTQ → Marlin).
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        config: &Gemma2Config,
+        dtype: DType,
+        qconfig: &QuantConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let workspace = gpu_weights::alloc_marlin_workspace(device.num_sm, device.compute_stream)?;
+
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let is_sliding = i < config.layer_is_sliding.len() && config.layer_is_sliding[i];
+            let layer = Gemma2DecoderLayer::load_quantized(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                is_sliding,
+                qconfig,
+                workspace,
+                dtype,
+                device,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = GemmaRmsNorm::load(weights, "model.norm", config.rms_norm_eps, dtype, device)?;
+
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        let model = Gemma2Model {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embed_scale: (config.hidden_size as f32).sqrt(),
+        };
+
+        // Gemma2 always uses tied embeddings — lm_head is dense.
         let lm_head = Linear::new(model.embed_tokens.weight, None);
 
         Ok(Self {

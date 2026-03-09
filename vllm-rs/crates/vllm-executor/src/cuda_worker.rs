@@ -2122,12 +2122,22 @@ impl Worker for CudaWorker {
             }
             "Gemma2ForCausalLM" => {
                 let config = gemma2_config_from_hf(&hf_config)?;
-                let m = vllm_cuda::model::gemma2::Gemma2ForCausalLM::load(
-                    &mut weights,
-                    &config,
-                    dtype,
-                    device,
-                )
+                let m = if qconfig.is_quantized() {
+                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_quantized(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        &qconfig,
+                        device,
+                    )
+                } else {
+                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                }
                 .map_err(|e| ExecutorError::WorkerInit(format!("Gemma2 load: {e}")))?;
                 CudaModel::Gemma2(m)
             }
@@ -2144,12 +2154,22 @@ impl Worker for CudaWorker {
             }
             "GraniteForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
-                let mut m = vllm_cuda::model::llama::LlamaForCausalLM::load(
-                    &mut weights,
-                    &config,
-                    dtype,
-                    device,
-                )
+                let mut m = if qconfig.is_quantized() {
+                    vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        &qconfig,
+                        device,
+                    )
+                } else {
+                    vllm_cuda::model::llama::LlamaForCausalLM::load(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                }
                 .map_err(|e| ExecutorError::WorkerInit(format!("GraniteForCausalLM load: {e}")))?;
 
                 // Parse Granite-specific multipliers from config.json extras.

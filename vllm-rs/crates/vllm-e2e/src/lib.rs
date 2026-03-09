@@ -52,6 +52,9 @@ impl TestModels {
     // AWQ quantized models (candle backend, not MLX)
     pub const QWEN2_0_5B_AWQ: &str = "Qwen/Qwen2.5-0.5B-Instruct-AWQ";
 
+    // Gemma2 GPTQ quantized models (ungated)
+    pub const GEMMA2_2B_GPTQ_INT4: &str = "qilowoq/gemma-2-2B-it-4Bit-GPTQ";
+
     // BitsAndBytes quantized models (MLX dequant-at-load or candle)
     pub const LLAMA_3_2_1B_BNB_4BIT: &str = "unsloth/Llama-3.2-1B-Instruct-bnb-4bit";
     pub const TINYLLAMA_1B_BNB_8BIT: &str = "Jiqing/TinyLlama-1.1B-Chat-v1.0-bnb-8bit";

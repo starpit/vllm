@@ -82,7 +82,7 @@
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
   │ CUDA graphs (quant)         │ yes        │ yes      │ Works with decode graphs                  │
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
-  │ Architectures (quant)       │ all        │ Qwen2    │ LLaMA/Gemma2 need wiring                 │
+  │ Architectures (quant)       │ all        │ LLaMA, Qwen2, Gemma2, Granite │ Gemma3, MoE archs need wiring │
   └─────────────────────────────┴────────────┴──────────┴──────────────────────────────────────────┘
 
   **Performance (Qwen2.5-0.5B-Instruct-GPTQ-Int4, nick5 L40S, 128 output tokens):**
@@ -103,7 +103,7 @@
   1. ~~Fused QKV/gate_up at load time~~ — **DONE** (5→2 GEMMs per layer, CPU concat + single repack)
   2. use_fp32_reduce=true — match Python default for numerical accuracy
   3. ~~AWQ E2E testing~~ — **DONE** (Qwen2.5-0.5B-Instruct-AWQ, nick4 L40S)
-  4. Wire LLaMA/Gemma2 for quantized loading — only Qwen2 works today
+  4. ~~Wire LLaMA/Gemma2/Granite for quantized loading~~ — **DONE** (LLaMA, Qwen2, Gemma2, Granite all wired)
   5. desc_act support — needed for some GPTQ models
 
   Effort: GGUF requires either porting candle's QCudaStorage approach or writing dequant-on-the-fly kernels. BnB is lower priority.

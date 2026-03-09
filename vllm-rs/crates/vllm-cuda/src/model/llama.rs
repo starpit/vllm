@@ -16,9 +16,9 @@ use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Embedding, Linear, LinearLayer, RmsNorm};
 use crate::quant::QuantConfig;
-use crate::weights::{self as gpu_weights};
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
+use crate::weights::{self as gpu_weights};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -345,7 +345,8 @@ impl LlamaAttention {
         let num_tokens = hidden_states.dim(0);
 
         // QKV projection → owned.
-        let qkv = if self.k_proj.is_some() {
+        let qkv = if let (Some(k_proj), Some(v_proj)) = (self.k_proj.as_ref(), self.v_proj.as_ref())
+        {
             // Quantized: separate Q, K, V GEMMs → concat
             let q_out = self.qkv_proj.forward_owned(
                 hidden_states,
@@ -353,13 +354,13 @@ impl LlamaAttention {
                 &mut device.caching,
                 device.compute_stream,
             );
-            let k_out = self.k_proj.as_ref().unwrap().forward_owned(
+            let k_out = k_proj.forward_owned(
                 hidden_states,
                 &mut device.cublas,
                 &mut device.caching,
                 device.compute_stream,
             );
-            let v_out = self.v_proj.as_ref().unwrap().forward_owned(
+            let v_out = v_proj.forward_owned(
                 hidden_states,
                 &mut device.cublas,
                 &mut device.caching,
@@ -731,7 +732,7 @@ impl LlamaModel {
         let mut hidden_states: OwnedTensor = hidden_states;
         let mut residual: Option<OwnedTensor> = None;
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
+        for layer in self.layers.iter() {
             let (hs, res) = layer.forward_owned(
                 hidden_states,
                 residual,
@@ -750,7 +751,6 @@ impl LlamaModel {
             // Old residual was passed through (or created from hidden_states).
             hidden_states = hs;
             residual = Some(res);
-
         }
 
         // Final norm: mutates hidden_states and residual in-place.
@@ -1098,23 +1098,43 @@ impl LlamaAttention {
         let mut alloc = crate::alloc::CachingAllocator::new();
 
         let q = gpu_weights::load_marlin_linear(
-            weights, &format!("{prefix}.q_proj"), qconfig, workspace, device.device_id, &mut alloc,
+            weights,
+            &format!("{prefix}.q_proj"),
+            qconfig,
+            workspace,
+            device.device_id,
+            &mut alloc,
         )?;
         let k = gpu_weights::load_marlin_linear(
-            weights, &format!("{prefix}.k_proj"), qconfig, workspace, device.device_id, &mut alloc,
+            weights,
+            &format!("{prefix}.k_proj"),
+            qconfig,
+            workspace,
+            device.device_id,
+            &mut alloc,
         )?;
         let v = gpu_weights::load_marlin_linear(
-            weights, &format!("{prefix}.v_proj"), qconfig, workspace, device.device_id, &mut alloc,
+            weights,
+            &format!("{prefix}.v_proj"),
+            qconfig,
+            workspace,
+            device.device_id,
+            &mut alloc,
         )?;
         let o = gpu_weights::load_marlin_linear(
-            weights, &format!("{prefix}.o_proj"), qconfig, workspace, device.device_id, &mut alloc,
+            weights,
+            &format!("{prefix}.o_proj"),
+            qconfig,
+            workspace,
+            device.device_id,
+            &mut alloc,
         )?;
 
         Ok(Self {
-            qkv_proj: LinearLayer::Marlin(q),
-            k_proj: Some(LinearLayer::Marlin(k)),
-            v_proj: Some(LinearLayer::Marlin(v)),
-            o_proj: LinearLayer::Marlin(o),
+            qkv_proj: LinearLayer::Marlin(Box::new(q)),
+            k_proj: Some(LinearLayer::Marlin(Box::new(k))),
+            v_proj: Some(LinearLayer::Marlin(Box::new(v))),
+            o_proj: LinearLayer::Marlin(Box::new(o)),
             q_size,
             kv_size,
             num_q_heads,
@@ -1143,19 +1163,34 @@ impl LlamaMLP {
         let mut alloc = crate::alloc::CachingAllocator::new();
 
         let gate = gpu_weights::load_marlin_linear(
-            weights, &format!("{prefix}.gate_proj"), qconfig, workspace, device.device_id, &mut alloc,
+            weights,
+            &format!("{prefix}.gate_proj"),
+            qconfig,
+            workspace,
+            device.device_id,
+            &mut alloc,
         )?;
         let up = gpu_weights::load_marlin_linear(
-            weights, &format!("{prefix}.up_proj"), qconfig, workspace, device.device_id, &mut alloc,
+            weights,
+            &format!("{prefix}.up_proj"),
+            qconfig,
+            workspace,
+            device.device_id,
+            &mut alloc,
         )?;
         let down = gpu_weights::load_marlin_linear(
-            weights, &format!("{prefix}.down_proj"), qconfig, workspace, device.device_id, &mut alloc,
+            weights,
+            &format!("{prefix}.down_proj"),
+            qconfig,
+            workspace,
+            device.device_id,
+            &mut alloc,
         )?;
 
         Ok(Self {
-            gate_up_proj: LinearLayer::Marlin(gate),
-            up_proj: Some(LinearLayer::Marlin(up)),
-            down_proj: LinearLayer::Marlin(down),
+            gate_up_proj: LinearLayer::Marlin(Box::new(gate)),
+            up_proj: Some(LinearLayer::Marlin(Box::new(up))),
+            down_proj: LinearLayer::Marlin(Box::new(down)),
             intermediate_size,
         })
     }
@@ -1326,10 +1361,7 @@ impl LlamaForCausalLM {
         qconfig: &QuantConfig,
         device: &GpuDevice,
     ) -> Result<Self> {
-        let workspace = gpu_weights::alloc_marlin_workspace(
-            device.num_sm,
-            device.compute_stream,
-        )?;
+        let workspace = gpu_weights::alloc_marlin_workspace(device.num_sm, device.compute_stream)?;
 
         let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
 
@@ -1337,13 +1369,7 @@ impl LlamaForCausalLM {
         for i in 0..config.num_hidden_layers {
             let prefix = format!("model.layers.{i}");
             let layer = LlamaDecoderLayer::load_quantized(
-                weights,
-                &prefix,
-                config,
-                i,
-                qconfig,
-                workspace,
-                device,
+                weights, &prefix, config, i, qconfig, workspace, device,
             )?;
             layers.push(layer);
         }

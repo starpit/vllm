@@ -1457,9 +1457,27 @@ pub unsafe fn bias_add_inplace(out: GpuTensor, bias: GpuTensor, stream: CUstream
     let m = out.dim(0) as c_int;
     let n = out.dim(1) as c_int;
     match out.dtype() {
-        DType::F16 => bias_add_f16(out.raw_ptr() as *mut _, bias.raw_ptr() as *const _, m, n, stream),
-        DType::BF16 => bias_add_bf16(out.raw_ptr() as *mut _, bias.raw_ptr() as *const _, m, n, stream),
-        DType::F32 => bias_add_f32(out.raw_ptr() as *mut _, bias.raw_ptr() as *const _, m, n, stream),
+        DType::F16 => bias_add_f16(
+            out.raw_ptr() as *mut _,
+            bias.raw_ptr() as *const _,
+            m,
+            n,
+            stream,
+        ),
+        DType::BF16 => bias_add_bf16(
+            out.raw_ptr() as *mut _,
+            bias.raw_ptr() as *const _,
+            m,
+            n,
+            stream,
+        ),
+        DType::F32 => bias_add_f32(
+            out.raw_ptr() as *mut _,
+            bias.raw_ptr() as *const _,
+            m,
+            n,
+            stream,
+        ),
         _ => panic!("bias_add: unsupported dtype {:?}", out.dtype()),
     }
 }
@@ -4259,7 +4277,7 @@ pub unsafe fn marlin_gemm(
 /// * `size_k`: number of input features
 /// * `size_n`: number of output features
 /// * Returns: repacked weights from caching allocator
-/// Repack AWQ INT4 weights into a pre-allocated buffer.
+///   Repack AWQ INT4 weights into a pre-allocated buffer.
 pub unsafe fn awq_repack_into(
     b_q_weight: GpuTensor,
     out_ptr: *mut u8,

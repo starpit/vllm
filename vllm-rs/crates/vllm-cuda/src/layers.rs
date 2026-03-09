@@ -156,9 +156,11 @@ impl MarlinLinear {
     ) -> OwnedTensor {
         let size_m = x.dim(0);
         debug_assert_eq!(
-            x.dim(1), self.size_k,
+            x.dim(1),
+            self.size_k,
             "MarlinLinear: input dim {} != size_k {}",
-            x.dim(1), self.size_k
+            x.dim(1),
+            self.size_k
         );
         // Don't pass bias to Marlin kernel (would need permutation).
         // Instead, add bias after the GEMM with a simple broadcast add.
@@ -210,7 +212,7 @@ impl MarlinLinear {
 /// at load time which variant to create based on `QuantConfig`.
 pub enum LinearLayer {
     Dense(Linear),
-    Marlin(MarlinLinear),
+    Marlin(Box<MarlinLinear>),
 }
 
 impl LinearLayer {
@@ -222,7 +224,8 @@ impl LinearLayer {
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> GpuTensor {
-        self.forward_owned(x, cublas, alloc, stream).into_gpu_tensor()
+        self.forward_owned(x, cublas, alloc, stream)
+            .into_gpu_tensor()
     }
 
     pub unsafe fn forward_owned(
@@ -261,7 +264,7 @@ impl From<Linear> for LinearLayer {
 
 impl From<MarlinLinear> for LinearLayer {
     fn from(l: MarlinLinear) -> Self {
-        Self::Marlin(l)
+        Self::Marlin(Box::new(l))
     }
 }
 

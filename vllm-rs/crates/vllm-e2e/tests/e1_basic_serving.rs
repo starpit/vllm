@@ -1420,9 +1420,8 @@ async fn test_cuda_granite_gguf_chat_coherent() {
 // ===========================================================================
 // CUDA Marlin W4A16 E2E tests — GPTQ and AWQ quantized models
 // ===========================================================================
-// TODO: Re-enable when vllm-cuda backend supports Marlin GPTQ/AWQ quantization.
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_marlin -- --ignored --test-threads=1
-/*
+
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
@@ -1524,7 +1523,6 @@ async fn test_cuda_marlin_awq_chat() {
     let text = resp.choices[0].message.content.as_deref().unwrap_or("");
     assert!(!text.is_empty(), "AWQ Marlin chat should not be empty");
 }
-*/ // end Marlin block comment
 
 // ===========================================================================
 // ===========================================================================

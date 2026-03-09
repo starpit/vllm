@@ -50,7 +50,7 @@
   ├──────────────────┼──────────────┼─────────────┼────────────────────────────────────────────────┤
   │ GPTQ (W4A16)     │ yes          │ YES         │ Marlin kernel, E2E verified (Qwen2.5-0.5B)    │
   ├──────────────────┼──────────────┼─────────────┼────────────────────────────────────────────────┤
-  │ AWQ (W4A16)      │ yes          │ partial     │ Repack kernel wired, needs E2E testing         │
+  │ AWQ (W4A16)      │ yes          │ YES         │ Marlin kernel, E2E verified (Qwen2.5-0.5B)     │
   ├──────────────────┼──────────────┼─────────────┼────────────────────────────────────────────────┤
   │ BitsAndBytes NF4 │ yes          │ no          │ NF4 dequant kernel                             │
   └──────────────────┴──────────────┴─────────────┴────────────────────────────────────────────────┘
@@ -102,7 +102,7 @@
   **Key gaps to close (priority order):**
   1. Fused QKV/gate_up at load time — 5 GEMMs→2 per layer, big prefill win
   2. use_fp32_reduce=true — match Python default for numerical accuracy
-  3. AWQ E2E testing — repack kernel is wired, just needs model test
+  3. ~~AWQ E2E testing~~ — **DONE** (Qwen2.5-0.5B-Instruct-AWQ, nick4 L40S)
   4. Wire LLaMA/Gemma2 for quantized loading — only Qwen2 works today
   5. desc_act support — needed for some GPTQ models
 
@@ -309,7 +309,7 @@
   Priority Order (to retire CandleWorker CUDA)
 
   1. ~~Low-hanging fruit: Alias Mistral/Qwen3/Phi-3 to LLaMA in CudaWorker~~ — **DONE**
-  2. ~~Marlin FFI for GPTQ/AWQ~~ — **GPTQ DONE** (Qwen2 E2E verified), AWQ needs E2E test
+  2. ~~Marlin FFI for GPTQ/AWQ~~ — **DONE** (both GPTQ + AWQ E2E verified, Qwen2.5-0.5B)
   3. ~~Sampling correctness: GPU-native penalties, logit bias, grammar, logprobs~~ — **DONE** (full GPU parity, no CPU fallback, 18/18 E2E tests)
   4. GGUF support: Either port candle's QCudaStorage approach or add dequant kernels
   5. ~~MoE kernel + models: Fused MoE GEMM, then port Mixtral/Qwen MoE/Qwen3 MoE~~ — **DONE** (WMMA tensor-core kernel, 3 models)

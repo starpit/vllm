@@ -259,20 +259,6 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             .init_device()
             .context("failed to initialize CUDA device")?;
 
-        // Auto-detect max_num_batched_tokens from GPU VRAM if not explicitly set.
-        // Match Python vLLM defaults for LLM_CLASS usage context:
-        //   >=70GB non-A100: 16384
-        //   else (including L40S 48GB): 8192
-        if config.max_num_batched_tokens.is_none() {
-            let total_vram = worker.determine_available_memory().unwrap_or(0);
-            let total_gb = total_vram as f64 / (1024.0 * 1024.0 * 1024.0);
-            let batched_tokens = if total_gb >= 60.0 { 16384 } else { 8192 };
-            info!(
-                "GPU has {:.0}GB free VRAM, using max_num_batched_tokens={}",
-                total_gb, batched_tokens
-            );
-            worker.set_max_num_batched_tokens(batched_tokens);
-        }
         worker.load_model().context("failed to load CUDA model")?;
 
         let hf_config = worker
@@ -447,9 +433,11 @@ fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
 
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
-            max_num_batched_tokens: config
-                .max_num_batched_tokens
-                .unwrap_or_else(|| max_model_len.min(8192)),
+            // Default 1024 to keep prefill chunks small in mixed batches.
+            // CudaWorker splits mixed batches into decode (CUDA graph) +
+            // prefill (eager); 1024 tokens keeps the eager pass fast (~25ms).
+            // See PREFILL_DECODE_SPLIT.md for tuning data.
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
             max_num_seqs: config.max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,

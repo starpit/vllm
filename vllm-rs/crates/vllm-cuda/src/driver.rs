@@ -219,6 +219,11 @@ pub unsafe fn event_synchronize(event: CUevent) -> Result<()> {
     check(sys::cuEventSynchronize(event))
 }
 
+/// Like `event_synchronize` but takes a raw `usize` (for Send-safe closures).
+pub unsafe fn event_synchronize_raw(event_addr: usize) -> Result<()> {
+    check(sys::cuEventSynchronize(event_addr as CUevent))
+}
+
 /// Compute elapsed time in milliseconds between two recorded events.
 pub unsafe fn event_elapsed(start: CUevent, end: CUevent) -> Result<f32> {
     let mut ms: f32 = 0.0;

@@ -1329,7 +1329,8 @@ impl AsyncEngine {
                 // 2. Finalize the previously completed step. The GPU is
                 //    already running (or about to run) the next batch, so
                 //    this CPU work overlaps with GPU execution.
-                if let Some((prev_sched, prev_output)) = deferred.take() {
+                if let Some((prev_sched, mut prev_output)) = deferred.take() {
+                    prev_output.resolve();
                     match client.finalize_step(&prev_sched, &prev_output) {
                         Ok(outputs) => {
                             if route_step_outputs(&requests, outputs).await {
@@ -1478,7 +1479,8 @@ impl AsyncEngine {
             }
 
             // Finalize any remaining deferred output before shutdown.
-            if let Some((prev_sched, prev_output)) = deferred.take() {
+            if let Some((prev_sched, mut prev_output)) = deferred.take() {
+                prev_output.resolve();
                 if let Ok(outputs) = client.finalize_step(&prev_sched, &prev_output) {
                     route_step_outputs(&requests, outputs).await;
                 }

@@ -570,8 +570,13 @@ struct HostStaging {
     seqused_k: PinnedBuf,
     /// `[max_batch * GRAPH_MAX_BLOCKS_PER_SEQ]` i32 — page table.
     block_table: PinnedBuf,
-    /// `[max_batch]` u32 — D2H token IDs from graph argmax.
-    host_token_ids: PinnedBuf,
+    /// `[max_batch]` u32 — D2H token IDs from graph argmax (double-buffered).
+    ///
+    /// Two pinned buffers alternate per step so that the GPU can write to one
+    /// while the CPU reads from the other (deferred D2H pattern).
+    host_token_ids: [PinnedBuf; 2],
+    /// Which of the two `host_token_ids` buffers is current (0 or 1).
+    token_buf_idx: usize,
     /// `[max_batch * 5]` f32 — packed sampling params (temps, top_ks, top_ps, min_ps, randoms).
     sampling_packed: PinnedBuf,
 }
@@ -589,7 +594,10 @@ impl HostStaging {
             cu_seqlens_q: unsafe { PinnedBuf::new((max_batch + 1) * 4)? },
             seqused_k: unsafe { PinnedBuf::new(max_batch * 4)? },
             block_table: unsafe { PinnedBuf::new(max_batch * GRAPH_MAX_BLOCKS_PER_SEQ * 4)? },
-            host_token_ids: unsafe { PinnedBuf::new(max_batch * 4)? },
+            host_token_ids: [unsafe { PinnedBuf::new(max_batch * 4)? }, unsafe {
+                PinnedBuf::new(max_batch * 4)?
+            }],
+            token_buf_idx: 0,
             sampling_packed: unsafe { PinnedBuf::new(max_batch * 5 * 4)? },
         })
     }
@@ -618,6 +626,24 @@ impl HostStaging {
 // ---------------------------------------------------------------------------
 // CudaWorker
 // ---------------------------------------------------------------------------
+
+/// Deferred commit from a previous decode step.
+///
+/// Stored when the greedy graph fast path defers D2H sync. The token IDs
+/// live in one of the double-buffered pinned host staging buffers. The
+/// commit is resolved at the start of the next `execute_model_inner` call.
+struct PendingCommit {
+    /// Which host_token_ids buffer index holds the deferred token IDs.
+    buf_idx: usize,
+    /// Number of real requests (not graph padding).
+    num_reqs: usize,
+    /// Per-request IDs (same order as the host buffer).
+    req_ids: Vec<String>,
+    /// Per-request token count before this step (for `commit_step`).
+    token_counts: Vec<usize>,
+    /// Per-request flag: true if request had speculative tokens.
+    has_spec_tokens: Vec<bool>,
+}
 
 /// A worker backed by the vllm-cuda runtime for zero-allocation GPU inference.
 pub struct CudaWorker {
@@ -660,6 +686,10 @@ pub struct CudaWorker {
     /// Whether executing in pooling mode (--runner pooling).
     is_pooling: bool,
 
+    /// Deferred D2H commit from the previous greedy graph step. Resolved at
+    /// the start of the next `execute_model_inner` call.
+    pending_commit: Option<PendingCommit>,
+
     /// Per-request grammar guide state for constrained decoding.
     #[cfg(feature = "guided-decoding")]
     grammar_states: HashMap<String, vllm_models::grammar::GrammarGuide>,
@@ -695,6 +725,7 @@ impl CudaWorker {
             ctx_set_on_thread: false,
             pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
             is_pooling,
+            pending_commit: None,
             #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
@@ -1113,19 +1144,20 @@ impl CudaWorker {
     }
 
     /// D2H copy token IDs using pinned staging if available.
-    fn d2h_token_ids_pinned(
+    /// Enqueue async D2H + sync, returning token IDs. Uses the pinned double-
+    /// buffer at `buf_idx` when staging is available.
+    fn d2h_token_ids_sync(
         staging: Option<&HostStaging>,
+        buf_idx: usize,
         gpu_tensor: &GpuTensor,
         num_reqs: usize,
         device: &mut GpuDevice,
     ) -> ExecutorResult<Vec<u32>> {
         if let Some(stg) = staging {
             // Async D2H: compute→event→transfer_stream→D2H→event→sync event.
-            // This syncs only on the D2H event, not the full compute stream,
-            // matching Python's AsyncGPUModelRunnerOutput pattern.
             unsafe {
                 device.async_d2h(
-                    stg.host_token_ids.ptr(),
+                    stg.host_token_ids[buf_idx].ptr(),
                     gpu_tensor.raw_ptr() as *const u8,
                     num_reqs * 4,
                 )
@@ -1134,7 +1166,7 @@ impl CudaWorker {
             device
                 .sync_d2h()
                 .map_err(|e| ExecutorError::WorkerExecution(format!("sync d2h: {e}")))?;
-            Ok(unsafe { stg.host_token_ids.slice::<u32>(num_reqs) }.to_vec())
+            Ok(unsafe { stg.host_token_ids[buf_idx].slice::<u32>(num_reqs) }.to_vec())
         } else {
             let mut ids = vec![0u32; num_reqs];
             unsafe {
@@ -1150,6 +1182,26 @@ impl CudaWorker {
                 .map_err(|e| ExecutorError::WorkerExecution(format!("sync d2h: {e}")))?;
             Ok(ids)
         }
+    }
+
+    /// Enqueue async D2H without sync. Returns the buffer index used.
+    /// Caller must sync via `device.sync_d2h()` before reading the buffer.
+    fn d2h_token_ids_async(
+        staging: &HostStaging,
+        buf_idx: usize,
+        gpu_tensor: &GpuTensor,
+        num_reqs: usize,
+        device: &GpuDevice,
+    ) -> ExecutorResult<()> {
+        unsafe {
+            device.async_d2h(
+                staging.host_token_ids[buf_idx].ptr(),
+                gpu_tensor.raw_ptr() as *const u8,
+                num_reqs * 4,
+            )
+        }
+        .map_err(|e| ExecutorError::WorkerExecution(format!("async D2H token ids: {e}")))?;
+        Ok(())
     }
     /// Full GPU sampling pipeline: grammar mask → logit bias → penalties → sample → logprobs.
     /// No CPU fallback — everything stays on GPU, matching Python vLLM exactly.
@@ -1220,6 +1272,7 @@ impl CudaWorker {
                     prepared,
                     device,
                     host_staging,
+                    0,
                     input_batch,
                     token_buffers,
                 );
@@ -1343,6 +1396,7 @@ impl CudaWorker {
                 prepared,
                 device,
                 host_staging,
+                0,
                 input_batch,
                 token_buffers,
             );
@@ -1731,7 +1785,7 @@ impl CudaWorker {
 
         // 8. D2H sampled tokens, commit, build output.
         let host_ids =
-            Self::d2h_token_ids_pinned(host_staging.as_ref(), &token_ids_gpu, num_reqs, device)?;
+            Self::d2h_token_ids_sync(host_staging.as_ref(), 0, &token_ids_gpu, num_reqs, device)?;
 
         for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
             let tok = host_ids[req_idx];
@@ -1784,17 +1838,24 @@ impl CudaWorker {
     }
 
     /// D2H + sync + commit_step helper (static to avoid borrow conflicts).
+    #[allow(clippy::too_many_arguments)]
     fn finalize_d2h_and_commit(
         token_ids_gpu: &GpuTensor,
         num_reqs: usize,
         prepared: PreparedInputs,
         device: &mut GpuDevice,
         host_staging: &Option<HostStaging>,
+        buf_idx: usize,
         input_batch: &mut InputBatch,
         token_buffers: &mut HashMap<String, Vec<u32>>,
     ) -> ExecutorResult<ModelRunnerOutput> {
-        let host_ids =
-            Self::d2h_token_ids_pinned(host_staging.as_ref(), token_ids_gpu, num_reqs, device)?;
+        let host_ids = Self::d2h_token_ids_sync(
+            host_staging.as_ref(),
+            buf_idx,
+            token_ids_gpu,
+            num_reqs,
+            device,
+        )?;
         for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
             let tok = host_ids[req_idx];
             input_batch.commit_step(
@@ -2388,6 +2449,12 @@ impl Worker for CudaWorker {
     }
 
     fn shutdown(&mut self) {
+        // Flush any deferred D2H commit before dropping the device.
+        if self.pending_commit.take().is_some()
+            && let Some(ref dev) = self.device
+        {
+            let _ = dev.sync_d2h();
+        }
         self.model = None;
         self.kv_cache = None;
         self.device = None;
@@ -2526,6 +2593,10 @@ impl CudaWorker {
             unsafe { dev.caching.free_leaked_blocks_except(&keep) };
         }
 
+        // NOTE: pending commit from the previous step is resolved lazily:
+        // - Super fast path: resolved AFTER graph launch (overlaps with GPU)
+        // - Normal path: resolved below, before prepare_inputs needs it
+
         // Clean up finished requests.
         if !scheduler_output.finished_req_ids.is_empty()
             || !scheduler_output.scheduled_new_reqs.is_empty()
@@ -2620,6 +2691,149 @@ impl CudaWorker {
                     blocks_changed = true;
                 }
                 self.input_batch.update_blocks(req_id, group0.clone());
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Super fast path: skip prepare_inputs entirely when the graph
+        // has valid metadata from the previous step. This avoids ~50μs
+        // of CPU work and, critically, lets us defer commit_step(N-1)
+        // to AFTER the graph launch so it overlaps with GPU execution.
+        // ---------------------------------------------------------------
+        let num_active = self.input_batch.num_active();
+        let fast_graph_bs = if self.graph_metadata_valid {
+            self.graph_runner
+                .as_ref()
+                .and_then(|r| r.nearest_graph_size(num_active))
+                .filter(|&gbs| self.last_graph_batch_size == Some(gbs))
+        } else {
+            None
+        };
+
+        if let Some(graph_bs) = fast_graph_bs
+            && let Some(ref mut stg) = self.host_staging
+            && let Some(ref mut device) = self.device
+        {
+            // Collect info from InputBatch upfront (immutable borrow ends here).
+            let (req_ids, block_tables, tokens_in_pool) = self.input_batch.fast_path_info();
+            let out_req_ids: Vec<String> = req_ids.to_vec();
+            let token_counts: Vec<usize> = tokens_in_pool.to_vec();
+
+            // Check all-greedy and no-logprobs/grammar without prepare_inputs.
+            let all_greedy_fast = out_req_ids.iter().all(|rid| {
+                self.sampling_params_map
+                    .get(rid)
+                    .is_none_or(|p| p.temperature < 1e-6)
+            });
+            let any_needs_full = out_req_ids.iter().any(|rid| {
+                self.sampling_params_map
+                    .get(rid)
+                    .is_some_and(|p| p.logprobs.is_some())
+                    || {
+                        #[cfg(feature = "guided-decoding")]
+                        {
+                            self.grammar_states.contains_key(rid)
+                        }
+                        #[cfg(not(feature = "guided-decoding"))]
+                        {
+                            false
+                        }
+                    }
+            });
+
+            if all_greedy_fast && !any_needs_full {
+                let block_size = self.config.block_size;
+
+                // Block table update for the graph (only if blocks changed).
+                let new_bt = if blocks_changed {
+                    let bt = unsafe { stg.fill_block_table(block_tables, graph_bs) };
+                    Some(bt)
+                } else {
+                    None
+                };
+
+                // Graph launch — GPU self-updates positions, slot_mapping, seqused_k.
+                let runner = self.graph_runner.as_ref().unwrap();
+                let replay_out = unsafe {
+                    runner.replay_decode_fast(graph_bs, None, new_bt, block_size, device)
+                }
+                .map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("super fast replay_decode_fast: {e}"))
+                })?;
+
+                // Async D2H — enqueue on transfer stream, don't block.
+                let buf_idx = stg.token_buf_idx;
+                Self::d2h_token_ids_async(stg, buf_idx, &replay_out.token_ids, num_active, device)?;
+
+                // NOW resolve the pending commit from the previous step.
+                // The GPU is running step N, so this CPU work overlaps with it.
+                if let Some(pending) = self.pending_commit.take() {
+                    device.sync_d2h().map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("pending sync_d2h: {e}"))
+                    })?;
+                    let prev_ids = unsafe {
+                        stg.host_token_ids[pending.buf_idx].slice::<u32>(pending.num_reqs)
+                    };
+                    for (i, &tok) in prev_ids.iter().enumerate().take(pending.num_reqs) {
+                        self.input_batch.commit_step(
+                            &pending.req_ids[i],
+                            &[tok],
+                            pending.token_counts[i],
+                            pending.has_spec_tokens[i],
+                        );
+                        if let Some(buf) = self.token_buffers.get_mut(&pending.req_ids[i]) {
+                            buf.push(tok);
+                        }
+                    }
+                }
+
+                self.pending_commit = Some(PendingCommit {
+                    buf_idx,
+                    num_reqs: num_active,
+                    req_ids: out_req_ids.clone(),
+                    token_counts,
+                    has_spec_tokens: vec![false; num_active],
+                });
+
+                // Toggle double-buffer.
+                stg.token_buf_idx ^= 1;
+
+                // Build deferred output.
+                let event_addr = device.d2h_done as usize;
+                let buf_addr = stg.host_token_ids[buf_idx].ptr() as usize;
+                let nr = num_active;
+                return Ok(ModelRunnerOutput::deferred(
+                    out_req_ids,
+                    Box::new(move || unsafe {
+                        driver::event_synchronize_raw(event_addr).expect("D2H event sync failed");
+                        std::slice::from_raw_parts(buf_addr as *const u32, nr).to_vec()
+                    }),
+                ));
+            }
+        }
+
+        // Resolve any deferred D2H commit from the previous step before
+        // prepare_inputs (which reads positions, tokens_in_pool, last_token_ids).
+        if let Some(pending) = self.pending_commit.take() {
+            if let Some(ref dev) = self.device {
+                dev.sync_d2h().map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("pending sync_d2h: {e}"))
+                })?;
+            }
+            if let Some(ref stg) = self.host_staging {
+                let host_ids =
+                    unsafe { stg.host_token_ids[pending.buf_idx].slice::<u32>(pending.num_reqs) };
+                for (i, &tok) in host_ids.iter().enumerate().take(pending.num_reqs) {
+                    self.input_batch.commit_step(
+                        &pending.req_ids[i],
+                        &[tok],
+                        pending.token_counts[i],
+                        pending.has_spec_tokens[i],
+                    );
+                    if let Some(buf) = self.token_buffers.get_mut(&pending.req_ids[i]) {
+                        buf.push(tok);
+                    }
+                }
             }
         }
 
@@ -3170,12 +3384,64 @@ impl CudaWorker {
             self.last_graph_batch_size = Some(graph_bs);
             self.graph_metadata_valid = true;
 
+            // Deferred D2H: enqueue async copy on transfer stream, return
+            // immediately without blocking on the GPU. The token IDs are
+            // resolved lazily by the main thread (via D2HResolver) and the
+            // commit_step is deferred to the start of the next execute_model.
+            if let Some(ref mut stg) = self.host_staging {
+                let buf_idx = stg.token_buf_idx;
+                Self::d2h_token_ids_async(stg, buf_idx, &replay_out.token_ids, num_reqs, device)?;
+
+                // Capture info needed for deferred commit_step.
+                let req_ids: Vec<String> = prepared
+                    .req_inputs
+                    .iter()
+                    .map(|r| r.req_id.clone())
+                    .collect();
+                let token_counts: Vec<usize> =
+                    prepared.req_inputs.iter().map(|r| r.token_count).collect();
+                let has_spec_tokens: Vec<bool> = prepared
+                    .req_inputs
+                    .iter()
+                    .map(|r| !r.spec_token_ids.is_empty())
+                    .collect();
+
+                self.input_batch.reclaim_buffers(prepared);
+
+                self.pending_commit = Some(PendingCommit {
+                    buf_idx,
+                    num_reqs,
+                    req_ids: req_ids.clone(),
+                    token_counts,
+                    has_spec_tokens,
+                });
+
+                // Toggle double-buffer for next step.
+                stg.token_buf_idx ^= 1;
+
+                // Build deferred output: the resolver closure syncs the D2H
+                // event and reads token IDs from the pinned host buffer.
+                // Cast raw pointers to usize for Send safety (pinned buffer
+                // and event outlive the closure — see PendingCommit safety doc).
+                let event_addr = device.d2h_done as usize;
+                let buf_addr = stg.host_token_ids[buf_idx].ptr() as usize;
+                return Ok(ModelRunnerOutput::deferred(
+                    req_ids,
+                    Box::new(move || unsafe {
+                        driver::event_synchronize_raw(event_addr).expect("D2H event sync failed");
+                        std::slice::from_raw_parts(buf_addr as *const u32, num_reqs).to_vec()
+                    }),
+                ));
+            }
+
+            // No pinned staging — fall back to synchronous D2H.
             return Self::finalize_d2h_and_commit(
                 &replay_out.token_ids,
                 num_reqs,
                 prepared,
                 device,
                 &self.host_staging,
+                0,
                 &mut self.input_batch,
                 &mut self.token_buffers,
             );

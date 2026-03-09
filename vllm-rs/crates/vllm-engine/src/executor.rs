@@ -32,7 +32,6 @@ use crate::error::EngineResult;
 ///
 /// Fields related to torch tensors (pooler_output, etc.) are represented
 /// as opaque byte buffers or omitted until Phase 5 (tensor infrastructure).
-#[derive(Debug, Clone)]
 pub struct ModelRunnerOutput {
     /// Ordered list of request IDs that were processed.
     pub req_ids: Vec<String>,
@@ -68,6 +67,25 @@ pub struct ModelRunnerOutput {
     /// Maps request ID to the L2-normalized embedding vector.
     /// `None` when the engine is not in pooling mode.
     pub pooler_output: Option<HashMap<String, Vec<f32>>>,
+
+    /// Deferred D2H resolver. When present, `sampled_token_ids` contains
+    /// placeholders. Call `resolve()` to synchronize the D2H transfer and
+    /// populate the real token IDs.
+    ///
+    /// Matches Python's `AsyncOutput` pattern: the GPU enqueues a D2H copy
+    /// on a transfer stream and returns immediately. The closure syncs the
+    /// CUDA event and reads from a pinned host buffer.
+    pub d2h_resolver: Option<Box<dyn FnOnce() -> Vec<u32> + Send>>,
+}
+
+impl std::fmt::Debug for ModelRunnerOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelRunnerOutput")
+            .field("req_ids", &self.req_ids)
+            .field("sampled_token_ids", &self.sampled_token_ids)
+            .field("is_deferred", &self.d2h_resolver.is_some())
+            .finish()
+    }
 }
 
 impl ModelRunnerOutput {
@@ -81,6 +99,23 @@ impl ModelRunnerOutput {
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
             pooler_output: None,
+            d2h_resolver: None,
+        }
+    }
+
+    /// Whether this output has a deferred D2H transfer that needs resolving.
+    pub fn is_deferred(&self) -> bool {
+        self.d2h_resolver.is_some()
+    }
+
+    /// Resolve the deferred D2H transfer, populating `sampled_token_ids`.
+    ///
+    /// Synchronizes the CUDA D2H event and reads token IDs from the pinned
+    /// host buffer. No-op if the output is already resolved.
+    pub fn resolve(&mut self) {
+        if let Some(resolver) = self.d2h_resolver.take() {
+            let token_ids = resolver();
+            self.sampled_token_ids = token_ids.into_iter().map(|t| vec![t]).collect();
         }
     }
 
@@ -123,6 +158,7 @@ impl ModelRunnerOutput {
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
             pooler_output: None,
+            d2h_resolver: None,
         }
     }
 
@@ -147,6 +183,30 @@ impl ModelRunnerOutput {
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
             pooler_output: None,
+            d2h_resolver: None,
+        }
+    }
+
+    /// Build a deferred output whose token IDs will be resolved lazily.
+    ///
+    /// The `resolver` closure is called by `resolve()` to synchronize the
+    /// D2H CUDA event and read token IDs from a pinned host buffer.
+    /// Until resolved, `sampled_token_ids` is empty.
+    pub fn deferred(req_ids: Vec<String>, resolver: Box<dyn FnOnce() -> Vec<u32> + Send>) -> Self {
+        let req_id_to_index: HashMap<String, usize> = req_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
+        Self {
+            req_ids,
+            req_id_to_index,
+            sampled_token_ids: Vec::new(),
+            logprobs: None,
+            prompt_logprobs_dict: HashMap::new(),
+            draft_token_ids: None,
+            pooler_output: None,
+            d2h_resolver: Some(resolver),
         }
     }
 }
@@ -282,6 +342,7 @@ impl Executor for NoopExecutor {
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
             pooler_output: None,
+            d2h_resolver: None,
         })
     }
 

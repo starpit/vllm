@@ -251,10 +251,12 @@ impl InprocClient {
         engine: &mut EngineCore,
         pipeline: &mut PipelineState,
     ) -> EngineResult<(StepOutputs, bool)> {
-        // 1. Finalize previous deferred result.
+        // 1. Finalize previous deferred result. Resolve deferred D2H first
+        //    (syncs the CUDA event and populates token IDs from pinned buffer).
         let mut prev_outputs: StepOutputs = HashMap::new();
         let mut had_prev = false;
-        if let Some((prev_sched, prev_output)) = pipeline.deferred.take() {
+        if let Some((prev_sched, mut prev_output)) = pipeline.deferred.take() {
+            prev_output.resolve();
             prev_outputs = engine.finalize_step(&prev_sched, &prev_output);
             had_prev = true;
         }

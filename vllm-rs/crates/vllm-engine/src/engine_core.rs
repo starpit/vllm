@@ -314,9 +314,12 @@ impl EngineCore {
 
         // 2. Execute model (also handles cleanup of finished requests even
         //    when no tokens are scheduled).
-        let model_output = executor
+        let mut model_output = executor
             .execute_model(&scheduler_output)
             .map_err(|e| EngineError::Executor(e.to_string()))?;
+
+        // Resolve deferred D2H if present (sync path — resolve immediately).
+        model_output.resolve();
 
         // 3. Finalize: process outputs, aborts, ngram, and stats.
         let outputs = self.finalize_step(&scheduler_output, &model_output);
@@ -1193,6 +1196,7 @@ mod tests {
             prompt_logprobs_dict,
             draft_token_ids: None,
             pooler_output: None,
+            d2h_resolver: None,
         };
 
         // Set up engine.
@@ -1468,6 +1472,7 @@ mod tests {
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
             pooler_output: Some(pooler_output),
+            d2h_resolver: None,
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);
@@ -1516,6 +1521,7 @@ mod tests {
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
             pooler_output: Some(HashMap::new()),
+            d2h_resolver: None,
         };
 
         let outputs = engine.update_from_output(&scheduler_output, &model_output);

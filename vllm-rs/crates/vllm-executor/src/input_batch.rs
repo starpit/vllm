@@ -196,6 +196,15 @@ impl InputBatch {
         self.req_id_to_slot.contains_key(req_id)
     }
 
+    /// Lightweight query for the greedy graph fast path.
+    ///
+    /// Returns `(req_ids, block_tables, tokens_in_pool)` without building
+    /// full `PreparedInputs`. This avoids the cost of `prepare_inputs` when
+    /// the GPU self-updates all metadata.
+    pub fn fast_path_info(&self) -> (&[String], &[Vec<usize>], &[usize]) {
+        (&self.req_ids, &self.block_tables, &self.tokens_in_pool)
+    }
+
     /// Prepare model inputs for the current step.
     ///
     /// Returns `(req_inputs, attn_meta, batch_block_ids, batch_tokens_before)`

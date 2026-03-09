@@ -29,9 +29,13 @@ fn create_llm(args: &BenchLatencyArgs, model: &str) -> Result<LLM> {
         .enable_prefix_caching(args.enable_prefix_caching)
         .enforce_eager(args.enforce_eager);
 
-    if let Some(n) = args.max_num_batched_tokens {
-        builder = builder.max_num_batched_tokens(n);
-    }
+    // Default max_num_batched_tokens to cover the full batch prefill in one
+    // scheduler iteration, matching Python's auto-sizing behavior.
+    let max_batched = args.max_num_batched_tokens.unwrap_or_else(|| {
+        let max_bs = *args.batch_sizes.iter().max().unwrap_or(&1);
+        (max_bs * args.input_len).max(8192)
+    });
+    builder = builder.max_num_batched_tokens(max_batched);
     if let Some(len) = args.max_model_len {
         builder = builder.max_model_len(len);
     }

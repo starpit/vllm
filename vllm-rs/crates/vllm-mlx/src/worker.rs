@@ -1041,6 +1041,7 @@ impl Worker for MlxWorker {
                 prompt_logprobs_dict: HashMap::new(),
                 draft_token_ids: None,
                 pooler_output: Some(pooler_map),
+                d2h_resolver: None,
             });
         }
 

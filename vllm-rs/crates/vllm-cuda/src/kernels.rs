@@ -233,6 +233,11 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Bias add: out[i,j] += bias[j]
+    fn bias_add_f16(out: *mut c_void, bias: *const c_void, m: c_int, n: c_int, stream: CUstream);
+    fn bias_add_bf16(out: *mut c_void, bias: *const c_void, m: c_int, n: c_int, stream: CUstream);
+    fn bias_add_f32(out: *mut c_void, bias: *const c_void, m: c_int, n: c_int, stream: CUstream);
+
     // Fused QKV split + RoPE (replaces split_qkv + rotary_embedding)
     fn fused_qkv_rope_f16(
         q: *mut u16,
@@ -1435,6 +1440,28 @@ pub unsafe fn pool_mean_f32(
     );
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Bias Add
+// ---------------------------------------------------------------------------
+
+/// Add bias to a 2D tensor in-place: out[i,j] += bias[j]
+///
+/// * `out`: `[M, N]` — modified in-place
+/// * `bias`: `[N]`
+pub unsafe fn bias_add_inplace(out: GpuTensor, bias: GpuTensor, stream: CUstream) {
+    debug_assert_eq!(out.ndim(), 2);
+    debug_assert_eq!(bias.ndim(), 1);
+    debug_assert_eq!(out.dim(1), bias.dim(0));
+    let m = out.dim(0) as c_int;
+    let n = out.dim(1) as c_int;
+    match out.dtype() {
+        DType::F16 => bias_add_f16(out.raw_ptr() as *mut _, bias.raw_ptr() as *const _, m, n, stream),
+        DType::BF16 => bias_add_bf16(out.raw_ptr() as *mut _, bias.raw_ptr() as *const _, m, n, stream),
+        DType::F32 => bias_add_f32(out.raw_ptr() as *mut _, bias.raw_ptr() as *const _, m, n, stream),
+        _ => panic!("bias_add: unsupported dtype {:?}", out.dtype()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3992,4 +4019,352 @@ mod tests_pooling {
             let _ = driver::mem_free(ptr);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tensor concatenation along dim 1
+// ---------------------------------------------------------------------------
+
+/// Concatenate two 2D tensors along dimension 1 (column-wise).
+///
+/// * `a`: `[M, Na]`
+/// * `b`: `[M, Nb]`
+/// * Returns: `[M, Na + Nb]` from caching allocator.
+///
+/// Uses row-by-row D2D copies. For the quantized MLP path (separate gate + up
+/// projections), this replaces the fused gate_up dense GEMM approach.
+pub unsafe fn concat_dim1(
+    a: GpuTensor,
+    b: GpuTensor,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let m = a.dim(0);
+    assert_eq!(m, b.dim(0), "concat_dim1: row count mismatch");
+    let na = a.dim(1);
+    let nb = b.dim(1);
+    let n_out = na + nb;
+    let dtype = a.dtype();
+    let elem = dtype.size_bytes();
+
+    let out = alloc.alloc_tensor(&[m, n_out], dtype);
+
+    // Copy row by row: for each row i, copy a[i] then b[i] into out[i]
+    for i in 0..m {
+        let dst_base = out.raw_ptr().add(i * n_out * elem);
+        let src_a = (a.raw_ptr() as *const u8).add(i * na * elem);
+        let src_b = (b.raw_ptr() as *const u8).add(i * nb * elem);
+        crate::driver::memcpy_dtod_async(dst_base, src_a, na * elem, stream)
+            .expect("concat_dim1: D2D copy a");
+        crate::driver::memcpy_dtod_async(dst_base.add(na * elem), src_b, nb * elem, stream)
+            .expect("concat_dim1: D2D copy b");
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Marlin INT4 GEMM (AWQ/GPTQ → Marlin format)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn marlin_gemm_f16(
+        a: *const c_void,
+        b_q_weight: *const c_void,
+        c: *mut c_void,
+        b_scales: *const c_void,
+        b_zeros: *const c_void,
+        g_idx: *const c_void,
+        perm: *const c_void,
+        b_bias: *const c_void,
+        workspace: *mut c_void,
+        c_tmp: *mut c_void,
+        a_tmp: *mut c_void,
+        size_m: c_int,
+        size_n: c_int,
+        size_k: c_int,
+        lda: c_int,
+        num_groups: c_int,
+        group_size: c_int,
+        has_act_order: bool,
+        is_k_full: bool,
+        has_zp: bool,
+        is_zp_float: bool,
+        use_fp32_reduce: bool,
+        has_bias: bool,
+        b_type_id: c_int,
+        stream: CUstream,
+        device_id: c_int,
+    );
+
+    fn marlin_gemm_bf16(
+        a: *const c_void,
+        b_q_weight: *const c_void,
+        c: *mut c_void,
+        b_scales: *const c_void,
+        b_zeros: *const c_void,
+        g_idx: *const c_void,
+        perm: *const c_void,
+        b_bias: *const c_void,
+        workspace: *mut c_void,
+        c_tmp: *mut c_void,
+        a_tmp: *mut c_void,
+        size_m: c_int,
+        size_n: c_int,
+        size_k: c_int,
+        lda: c_int,
+        num_groups: c_int,
+        group_size: c_int,
+        has_act_order: bool,
+        is_k_full: bool,
+        has_zp: bool,
+        is_zp_float: bool,
+        use_fp32_reduce: bool,
+        has_bias: bool,
+        b_type_id: c_int,
+        stream: CUstream,
+        device_id: c_int,
+    );
+
+    fn awq_marlin_repack_4bit(
+        b_q_weight: *const u32,
+        out: *mut u32,
+        size_k: c_int,
+        size_n: c_int,
+        stream: CUstream,
+        device_id: c_int,
+    );
+
+    fn gptq_marlin_repack_4bit(
+        b_q_weight: *const u32,
+        perm: *const u32,
+        out: *mut u32,
+        size_k: c_int,
+        size_n: c_int,
+        has_perm: bool,
+        stream: CUstream,
+        device_id: c_int,
+    );
+}
+
+/// Marlin INT4×FP16→FP16 fused GEMM.
+///
+/// * `a`: `[M, K]` activation tensor (F16 or BF16)
+/// * `b_q_weight`: Marlin-tiled packed INT4 weights
+/// * `b_scales`: `[num_groups, N]` scales (same dtype as `a`)
+/// * `b_zeros`: packed zero points (or null tensor for symmetric)
+/// * `g_idx`: group index for act_order (or null tensor)
+/// * `perm`: permutation for act_order (or null tensor)
+/// * `workspace`: `[num_sms]` i32 workspace buffer
+/// * Returns: `[M, N]` output from caching allocator
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn marlin_gemm(
+    a: GpuTensor,
+    b_q_weight: GpuTensor,
+    b_scales: GpuTensor,
+    b_zeros: Option<GpuTensor>,
+    g_idx: Option<GpuTensor>,
+    perm: Option<GpuTensor>,
+    b_bias: Option<GpuTensor>,
+    workspace: GpuTensor,
+    size_m: usize,
+    size_n: usize,
+    size_k: usize,
+    num_groups: usize,
+    group_size: usize,
+    has_act_order: bool,
+    has_zp: bool,
+    b_type_id: i32,
+    device_id: i32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let out = alloc.alloc_tensor(&[size_m, size_n], a.dtype());
+
+    let zeros_ptr = b_zeros.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
+    let g_idx_ptr = g_idx.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
+    let perm_ptr = perm.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
+    let bias_ptr = b_bias.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
+    let has_bias = b_bias.is_some();
+
+    // is_k_full = true when no act_order or when we have the full K dimension
+    let is_k_full = !has_act_order;
+
+    match a.dtype() {
+        DType::F16 => marlin_gemm_f16(
+            a.raw_ptr() as *const c_void,
+            b_q_weight.raw_ptr() as *const c_void,
+            out.raw_ptr() as *mut c_void,
+            b_scales.raw_ptr() as *const c_void,
+            zeros_ptr,
+            g_idx_ptr,
+            perm_ptr,
+            bias_ptr,
+            workspace.raw_ptr() as *mut c_void,
+            std::ptr::null_mut(), // c_tmp (not needed with use_fp32_reduce=false)
+            std::ptr::null_mut(), // a_tmp (act_order permutation — not needed)
+            size_m as c_int,
+            size_n as c_int,
+            size_k as c_int,
+            size_k as c_int, // lda = size_k for row-major
+            num_groups as c_int,
+            group_size as c_int,
+            has_act_order,
+            is_k_full,
+            has_zp,
+            false, // is_zp_float
+            false, // use_fp32_reduce
+            has_bias,
+            b_type_id as c_int,
+            stream,
+            device_id,
+        ),
+        DType::BF16 => marlin_gemm_bf16(
+            a.raw_ptr() as *const c_void,
+            b_q_weight.raw_ptr() as *const c_void,
+            out.raw_ptr() as *mut c_void,
+            b_scales.raw_ptr() as *const c_void,
+            zeros_ptr,
+            g_idx_ptr,
+            perm_ptr,
+            bias_ptr,
+            workspace.raw_ptr() as *mut c_void,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            size_m as c_int,
+            size_n as c_int,
+            size_k as c_int,
+            size_k as c_int,
+            num_groups as c_int,
+            group_size as c_int,
+            has_act_order,
+            is_k_full,
+            has_zp,
+            false, // is_zp_float
+            false, // use_fp32_reduce
+            has_bias,
+            b_type_id as c_int,
+            stream,
+            device_id,
+        ),
+        _ => panic!("marlin_gemm: unsupported dtype {:?}", a.dtype()),
+    }
+
+    out
+}
+
+/// Repack AWQ INT4 weights to Marlin tiled layout (GPU kernel).
+///
+/// * `b_q_weight`: `[K, N/8]` packed AWQ weights (u32, on GPU)
+/// * `size_k`: number of input features
+/// * `size_n`: number of output features
+/// * Returns: repacked weights from caching allocator
+/// Repack AWQ INT4 weights into a pre-allocated buffer.
+pub unsafe fn awq_repack_into(
+    b_q_weight: GpuTensor,
+    out_ptr: *mut u8,
+    size_k: usize,
+    size_n: usize,
+    device_id: i32,
+    stream: CUstream,
+) {
+    awq_marlin_repack_4bit(
+        b_q_weight.as_ptr::<u32>(),
+        out_ptr as *mut u32,
+        size_k as c_int,
+        size_n as c_int,
+        stream,
+        device_id,
+    );
+}
+
+pub unsafe fn awq_repack(
+    b_q_weight: GpuTensor,
+    size_k: usize,
+    size_n: usize,
+    device_id: i32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let num_u32 = size_k * size_n / 8;
+    let out = alloc.alloc_tensor(&[num_u32], DType::U32);
+
+    awq_marlin_repack_4bit(
+        b_q_weight.as_ptr::<u32>(),
+        out.as_mut_ptr::<u32>(),
+        size_k as c_int,
+        size_n as c_int,
+        stream,
+        device_id,
+    );
+
+    out
+}
+
+/// Repack GPTQ INT4 weights to Marlin tiled layout into a pre-allocated buffer.
+///
+/// Use this for model weights (persistent allocations that must survive
+/// `free_leaked_blocks`). The caller allocates via `driver::mem_alloc`.
+pub unsafe fn gptq_repack_into(
+    b_q_weight: GpuTensor,
+    perm: Option<GpuTensor>,
+    out_ptr: *mut u8,
+    size_k: usize,
+    size_n: usize,
+    device_id: i32,
+    stream: CUstream,
+) {
+    let (perm_ptr, has_perm) = match perm {
+        Some(p) => (p.as_ptr::<u32>(), true),
+        None => (std::ptr::null(), false),
+    };
+
+    gptq_marlin_repack_4bit(
+        b_q_weight.as_ptr::<u32>(),
+        perm_ptr,
+        out_ptr as *mut u32,
+        size_k as c_int,
+        size_n as c_int,
+        has_perm,
+        stream,
+        device_id,
+    );
+}
+
+/// Repack GPTQ INT4 weights to Marlin tiled layout (GPU kernel).
+///
+/// * `b_q_weight`: `[K/8, N]` packed GPTQ weights (u32, on GPU)
+/// * `perm`: optional `[K]` permutation (for act_order)
+/// * `size_k`: number of input features
+/// * `size_n`: number of output features
+/// * Returns: repacked weights from caching allocator
+pub unsafe fn gptq_repack(
+    b_q_weight: GpuTensor,
+    perm: Option<GpuTensor>,
+    size_k: usize,
+    size_n: usize,
+    device_id: i32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let num_u32 = size_k * size_n / 8;
+    let out = alloc.alloc_tensor(&[num_u32], DType::U32);
+
+    let (perm_ptr, has_perm) = match perm {
+        Some(p) => (p.as_ptr::<u32>(), true),
+        None => (std::ptr::null(), false),
+    };
+
+    gptq_marlin_repack_4bit(
+        b_q_weight.as_ptr::<u32>(),
+        perm_ptr,
+        out.as_mut_ptr::<u32>(),
+        size_k as c_int,
+        size_n as c_int,
+        has_perm,
+        stream,
+        device_id,
+    );
+
+    out
 }

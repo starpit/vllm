@@ -231,3 +231,59 @@ void split_qkv_f32(
 }
 
 }  // extern "C"
+
+// ---------------------------------------------------------------------------
+// Bias add: out[i,j] += bias[j]  for out [M, N] and bias [N]
+// ---------------------------------------------------------------------------
+
+template<typename T>
+__global__ void bias_add_kernel(
+    T* __restrict__ out,         // [M, N]
+    const T* __restrict__ bias,  // [N]
+    int M, int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    int j = idx % N;
+    out[idx] = __hadd(out[idx], bias[j]);
+}
+
+template<>
+__global__ void bias_add_kernel<float>(
+    float* __restrict__ out,
+    const float* __restrict__ bias,
+    int M, int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * N) return;
+    int j = idx % N;
+    out[idx] = out[idx] + bias[j];
+}
+
+extern "C" {
+
+void bias_add_f16(void* out, const void* bias, int M, int N, cudaStream_t stream) {
+    int total = M * N;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    bias_add_kernel<__half><<<blocks, threads, 0, stream>>>(
+        (__half*)out, (const __half*)bias, M, N);
+}
+
+void bias_add_bf16(void* out, const void* bias, int M, int N, cudaStream_t stream) {
+    int total = M * N;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    bias_add_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
+        (__nv_bfloat16*)out, (const __nv_bfloat16*)bias, M, N);
+}
+
+void bias_add_f32(void* out, const void* bias, int M, int N, cudaStream_t stream) {
+    int total = M * N;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    bias_add_kernel<float><<<blocks, threads, 0, stream>>>(
+        (float*)out, (const float*)bias, M, N);
+}
+
+}  // extern "C"

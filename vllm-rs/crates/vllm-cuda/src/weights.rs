@@ -431,6 +431,22 @@ impl GpuWeights {
             .collect();
         self.tensors = stripped;
     }
+
+    /// Get the stream used for H2D copies.
+    pub fn stream(&self) -> CUstream {
+        self.stream
+    }
+
+    /// Take a tensor's raw CPU bytes without uploading to GPU.
+    /// Returns (data_bytes, shape, dtype).
+    pub fn take_cpu(&mut self, name: &str) -> Result<(Vec<u8>, Vec<usize>, DType)> {
+        let cpu_ref = self
+            .tensors
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+        let data = cpu_ref.data().to_vec();
+        Ok((data, cpu_ref.shape, cpu_ref.dtype))
+    }
 }
 
 impl Drop for GpuWeights {
@@ -442,6 +458,302 @@ impl Drop for GpuWeights {
         // GPU memory allocated by take()/take_into() is owned by model layers.
         // CPU mmaps are dropped automatically when Arc<Mmap> refcounts reach zero.
     }
+}
+
+// ---------------------------------------------------------------------------
+// Quantized weight loading (AWQ/GPTQ → Marlin)
+// ---------------------------------------------------------------------------
+
+use crate::alloc::CachingAllocator;
+use crate::layers::MarlinLinear;
+use crate::quant::{self, QuantConfig};
+
+/// Load a single quantized linear layer (AWQ or GPTQ) and repack to Marlin format.
+///
+/// Loads qweight, scales, qzeros from safetensors, uploads to GPU,
+/// runs repack kernels, and applies scale/zero-point permutations.
+///
+/// # Arguments
+/// * `weights` — mmap'd safetensors
+/// * `prefix` — weight name prefix (e.g. "model.layers.0.self_attn.q_proj")
+/// * `qconfig` — AWQ or GPTQ config
+/// * `workspace` — shared Marlin workspace tensor `[num_sms]` i32
+/// * `device_id` — CUDA device ordinal
+/// * `alloc` — caching allocator for repack output
+#[allow(clippy::too_many_arguments)]
+pub fn load_marlin_linear(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    qconfig: &QuantConfig,
+    workspace: GpuTensor,
+    device_id: i32,
+    alloc: &mut CachingAllocator,
+) -> Result<MarlinLinear> {
+    let stream = weights.stream();
+
+    match qconfig {
+        QuantConfig::Awq(cfg) => {
+            load_awq_marlin_linear(weights, prefix, cfg, workspace, device_id, alloc, stream)
+        }
+        QuantConfig::Gptq(cfg) => {
+            load_gptq_marlin_linear(weights, prefix, cfg, workspace, device_id, alloc, stream)
+        }
+        QuantConfig::None => bail!("load_marlin_linear called with QuantConfig::None"),
+    }
+}
+
+/// Load AWQ quantized linear layer and repack to Marlin format.
+#[allow(clippy::too_many_arguments)]
+fn load_awq_marlin_linear(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    cfg: &quant::AwqConfig,
+    workspace: GpuTensor,
+    device_id: i32,
+    _alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> Result<MarlinLinear> {
+    // AWQ qweight: [K, N/8] i32 — packed along output dim
+    let qw_name = format!("{prefix}.qweight");
+    let scales_name = format!("{prefix}.scales");
+    let qzeros_name = format!("{prefix}.qzeros");
+
+    // Get dimensions from qweight shape
+    let (qw_shape, _qw_dtype) = weights
+        .tensor_info(&qw_name)
+        .ok_or_else(|| anyhow::anyhow!("weight not found: {qw_name}"))?;
+    let size_k = qw_shape[0];
+    let size_n = qw_shape[1] * 8; // 4-bit: 8 values packed per i32
+    let group_size = cfg.group_size;
+    let num_groups = if group_size > 0 { size_k / group_size } else { 1 };
+
+    // Upload qweight to GPU (raw alloc — will be freed after repack)
+    let qweight_gpu = weights.take(&qw_name)?;
+
+    // Repack AWQ → Marlin tiled layout on GPU.
+    // Use driver::mem_alloc for the output (NOT caching allocator) because model
+    // weights must survive free_leaked_blocks() during profiling.
+    let num_u32 = size_k * size_n / 8;
+    let repack_nbytes = num_u32 * std::mem::size_of::<u32>();
+    let repack_ptr = unsafe { driver::mem_alloc(repack_nbytes)? };
+    unsafe {
+        crate::kernels::awq_repack_into(
+            qweight_gpu, repack_ptr, size_k, size_n, device_id, stream,
+        );
+        driver::stream_synchronize(stream)?;
+        driver::mem_free(qweight_gpu.raw_ptr())?;
+    }
+    let qweight_marlin =
+        unsafe { GpuTensor::new(repack_ptr, &[num_u32], DType::U32) };
+
+    // Load and permute scales (CPU)
+    let (scales_bytes, _scales_shape, scales_dtype) = weights.take_cpu(&scales_name)?;
+    let mut scales_u16: Vec<u16> = scales_bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    quant::marlin_permute_scales(&mut scales_u16, size_k, size_n, group_size);
+
+    // Upload permuted scales to GPU
+    let scales_bytes_permuted: Vec<u8> = scales_u16
+        .iter()
+        .flat_map(|&v| v.to_le_bytes())
+        .collect();
+    let scales_nbytes = scales_bytes_permuted.len();
+    let scales_ptr = unsafe { driver::mem_alloc(scales_nbytes)? };
+    unsafe {
+        driver::memcpy_htod_async(
+            scales_ptr,
+            scales_bytes_permuted.as_ptr(),
+            scales_nbytes,
+            stream,
+        )?;
+    }
+    let scales_gpu =
+        unsafe { GpuTensor::new(scales_ptr, &[num_groups, size_n], scales_dtype) };
+
+    // Load and convert zero points (CPU)
+    let (qzeros_bytes, _qzeros_shape, _qzeros_dtype) = weights.take_cpu(&qzeros_name)?;
+    let qzeros_u32: Vec<u32> = qzeros_bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let marlin_zp = quant::awq_to_marlin_zero_points(&qzeros_u32, num_groups, size_n);
+
+    // Upload zero points to GPU
+    let zp_bytes: Vec<u8> = marlin_zp.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    let zp_nbytes = zp_bytes.len();
+    let zp_ptr = unsafe { driver::mem_alloc(zp_nbytes)? };
+    unsafe { driver::memcpy_htod_async(zp_ptr, zp_bytes.as_ptr(), zp_nbytes, stream)? };
+    let zeros_gpu = unsafe {
+        GpuTensor::new(
+            zp_ptr,
+            &[num_groups, size_n / 8],
+            DType::U32,
+        )
+    };
+
+    // Load bias if present
+    let bias_name = format!("{prefix}.bias");
+    let bias_gpu = if weights.contains(&bias_name) {
+        Some(weights.take(&bias_name)?)
+    } else {
+        None
+    };
+
+    unsafe { driver::stream_synchronize(stream)? };
+
+    Ok(MarlinLinear {
+        qweight: qweight_marlin,
+        scales: scales_gpu,
+        zeros: Some(zeros_gpu),
+        g_idx: None,
+        g_idx_sort_indices: None,
+        workspace,
+        size_k,
+        size_n,
+        group_size,
+        num_groups,
+        has_zp: true,
+        has_act_order: false,
+        b_type_id: 1, // AWQ = uint4
+        device_id,
+        bias: bias_gpu,
+    })
+}
+
+/// Load GPTQ quantized linear layer and repack to Marlin format.
+#[allow(clippy::too_many_arguments)]
+fn load_gptq_marlin_linear(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    cfg: &quant::GptqConfig,
+    workspace: GpuTensor,
+    device_id: i32,
+    _alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> Result<MarlinLinear> {
+    // GPTQ qweight: [K/8, N] i32 — packed along input dim
+    let qw_name = format!("{prefix}.qweight");
+    let scales_name = format!("{prefix}.scales");
+    let qzeros_name = format!("{prefix}.qzeros");
+
+    let (qw_shape, _qw_dtype) = weights
+        .tensor_info(&qw_name)
+        .ok_or_else(|| anyhow::anyhow!("weight not found: {qw_name}"))?;
+    let qw_shape = qw_shape.to_vec();
+    let size_k = qw_shape[0] * 8; // 4-bit: 8 values packed per i32
+    let size_n = qw_shape[1];
+    let group_size = cfg.group_size;
+    let num_groups = if group_size > 0 { size_k / group_size } else { 1 };
+
+    // Upload qweight to GPU (raw alloc — will be freed after repack)
+    let qweight_gpu = weights.take(&qw_name)?;
+
+    // Repack GPTQ → Marlin tiled layout on GPU (no act_order for now).
+    // Use driver::mem_alloc for the output (NOT caching allocator) because model
+    // weights must survive free_leaked_blocks() during profiling.
+    let num_u32 = size_k * size_n / 8;
+    let repack_nbytes = num_u32 * std::mem::size_of::<u32>();
+    let repack_ptr = unsafe { driver::mem_alloc(repack_nbytes)? };
+    unsafe {
+        crate::kernels::gptq_repack_into(
+            qweight_gpu, None, repack_ptr, size_k, size_n, device_id, stream,
+        );
+        // Sync so the repack kernel finishes before we free the source qweight
+        driver::stream_synchronize(stream)?;
+        // Free original qweight (it was raw-allocated by weights.take())
+        driver::mem_free(qweight_gpu.raw_ptr())?;
+    }
+    let qweight_marlin =
+        unsafe { GpuTensor::new(repack_ptr, &[num_u32], DType::U32) };
+
+    // Load and permute scales (CPU)
+    let (scales_bytes, _scales_shape, scales_dtype) = weights.take_cpu(&scales_name)?;
+    let mut scales_u16: Vec<u16> = scales_bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    quant::marlin_permute_scales(&mut scales_u16, size_k, size_n, group_size);
+
+    let scales_bytes_permuted: Vec<u8> = scales_u16
+        .iter()
+        .flat_map(|&v| v.to_le_bytes())
+        .collect();
+    let scales_nbytes = scales_bytes_permuted.len();
+    let scales_ptr = unsafe { driver::mem_alloc(scales_nbytes)? };
+    unsafe {
+        driver::memcpy_htod_async(
+            scales_ptr,
+            scales_bytes_permuted.as_ptr(),
+            scales_nbytes,
+            stream,
+        )?;
+    }
+    let scales_gpu =
+        unsafe { GpuTensor::new(scales_ptr, &[num_groups, size_n], scales_dtype) };
+
+    // Handle zero points for asymmetric GPTQ
+    let zeros_gpu = if !cfg.sym && weights.contains(&qzeros_name) {
+        let qzeros = weights.take(&qzeros_name)?;
+        Some(qzeros)
+    } else {
+        // Consume the tensor if it exists (so it doesn't cause "unused weight" warnings)
+        if weights.contains(&qzeros_name) {
+            let _ = weights.take(&qzeros_name);
+        }
+        None
+    };
+
+    // Consume g_idx if present (not used without desc_act)
+    let g_idx_name = format!("{prefix}.g_idx");
+    if weights.contains(&g_idx_name) {
+        let _ = weights.take(&g_idx_name);
+    }
+
+    // Load bias if present
+    let bias_name = format!("{prefix}.bias");
+    let bias_gpu = if weights.contains(&bias_name) {
+        Some(weights.take(&bias_name)?)
+    } else {
+        None
+    };
+
+    unsafe { driver::stream_synchronize(stream)? };
+
+    Ok(MarlinLinear {
+        qweight: qweight_marlin,
+        scales: scales_gpu,
+        zeros: zeros_gpu,
+        g_idx: None,
+        g_idx_sort_indices: None,
+        workspace,
+        size_k,
+        size_n,
+        group_size,
+        num_groups,
+        has_zp: !cfg.sym,
+        has_act_order: false,
+        b_type_id: 0, // GPTQ = uint4b8
+        device_id,
+        bias: bias_gpu,
+    })
+}
+
+/// Allocate the shared Marlin workspace buffer `[num_sms]` i32.
+///
+/// This is shared across all MarlinLinear layers — only one allocation needed.
+pub fn alloc_marlin_workspace(
+    num_sm: i32,
+    stream: CUstream,
+) -> Result<GpuTensor> {
+    // Match Python: max(2 * num_sm, 1024 * 1024) elements
+    let num_elements = std::cmp::max(2 * num_sm as usize, 1024 * 1024);
+    let nbytes = num_elements * std::mem::size_of::<i32>();
+    let ptr = unsafe { driver::mem_alloc(nbytes)? };
+    // Zero it — Marlin uses it as barrier locks
+    unsafe { driver::memset_d8(ptr, 0, nbytes, stream)? };
+    Ok(unsafe { GpuTensor::new(ptr, &[num_elements], DType::I32) })
 }
 
 // ---------------------------------------------------------------------------

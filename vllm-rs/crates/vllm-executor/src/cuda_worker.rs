@@ -24,6 +24,7 @@ use vllm_cuda::logits_processor::{
     MinTokensProcessor, PenaltiesProcessor,
 };
 use vllm_cuda::tensor::GpuTensor;
+use vllm_cuda::quant;
 use vllm_cuda::weights::GpuWeights;
 use vllm_engine::executor::ModelRunnerOutput;
 use vllm_model::weight::HfModelConfig;
@@ -2066,16 +2067,33 @@ impl Worker for CudaWorker {
         // torch_dtype and PyTorch auto-casts during weight_loader copy.
         weights.set_target_dtype(dtype);
 
-        // 6. Construct model based on architecture.
+        // 6. Detect quantization config.
+        let qconfig = quant::detect_quant_config(&model_dir)
+            .map_err(|e| ExecutorError::WorkerInit(format!("quant config detection: {e}")))?;
+        if qconfig.is_quantized() {
+            info!("CudaWorker: detected quantization: {:?}", qconfig);
+        }
+
+        // 7. Construct model based on architecture.
         let model = match arch.as_str() {
             "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen3ForCausalLM" | "Phi3ForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
-                let m = vllm_cuda::model::llama::LlamaForCausalLM::load(
-                    &mut weights,
-                    &config,
-                    dtype,
-                    device,
-                )
+                let m = if qconfig.is_quantized() {
+                    vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        &qconfig,
+                        device,
+                    )
+                } else {
+                    vllm_cuda::model::llama::LlamaForCausalLM::load(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                }
                 .map_err(|e| ExecutorError::WorkerInit(format!("LlamaForCausalLM load: {e}")))?;
                 CudaModel::Llama(m)
             }
@@ -2083,12 +2101,22 @@ impl Worker for CudaWorker {
                 let llama_config = llama_config_from_hf(&hf_config)?;
                 let qwen2_config =
                     vllm_cuda::model::qwen2::Qwen2Config::from_llama_config(llama_config);
-                let m = vllm_cuda::model::qwen2::Qwen2ForCausalLM::load(
-                    &mut weights,
-                    &qwen2_config,
-                    dtype,
-                    device,
-                )
+                let m = if qconfig.is_quantized() {
+                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_quantized(
+                        &mut weights,
+                        &qwen2_config,
+                        dtype,
+                        &qconfig,
+                        device,
+                    )
+                } else {
+                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load(
+                        &mut weights,
+                        &qwen2_config,
+                        dtype,
+                        device,
+                    )
+                }
                 .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2 load: {e}")))?;
                 CudaModel::Qwen2(m)
             }
@@ -2519,7 +2547,8 @@ impl Worker for CudaWorker {
                 Ok(()) => info!("CUDA graph captured for batch_size={bs}"),
                 Err(e) => {
                     tracing::warn!("Failed to capture CUDA graph for bs={bs}: {e}");
-                    // Continue without graphs for this size.
+                    // Stop trying larger sizes — they'll also OOM.
+                    break;
                 }
             }
         }
@@ -2595,6 +2624,7 @@ impl Worker for CudaWorker {
                                 tracing::warn!(
                                     "Failed to capture prefill graph for {num_tokens}: {e}"
                                 );
+                                break;
                             }
                         }
                     }

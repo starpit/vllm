@@ -19,6 +19,7 @@ cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", 
 half = { workspace = true }
 safetensors = { workspace = true }
 memmap2 = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

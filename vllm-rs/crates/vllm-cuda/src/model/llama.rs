@@ -14,7 +14,9 @@ use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
-use crate::layers::{Embedding, Linear, RmsNorm};
+use crate::layers::{Embedding, Linear, LinearLayer, RmsNorm};
+use crate::quant::QuantConfig;
+use crate::weights::{self as gpu_weights};
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
 
@@ -155,106 +157,77 @@ impl RotaryCache {
 // LlamaMLP
 // ---------------------------------------------------------------------------
 
-/// LLaMA MLP with fused gate+up projection.
+/// LLaMA MLP with fused or separate gate+up projection.
 ///
-/// Forward: gate_up_proj(x) → SiLU(gate) * up → down_proj
+/// Dense: gate_up_proj(x) → SiLU(gate) * up → down_proj  (single fused GEMM)
+/// Quantized: gate_proj(x), up_proj(x) → SiLU(gate) * up → down_proj  (separate GEMMs)
 pub struct LlamaMLP {
-    gate_up_proj: Linear,
-    down_proj: Linear,
+    /// Fused gate+up for dense, or gate-only for quantized.
+    gate_up_proj: LinearLayer,
+    /// Separate up projection — only used for quantized (None for dense).
+    up_proj: Option<LinearLayer>,
+    down_proj: LinearLayer,
     intermediate_size: usize,
 }
 
 impl LlamaMLP {
-    /// Load from `GpuWeights`.
-    pub fn load(weights: &mut GpuWeights, prefix: &str, intermediate_size: usize) -> Result<Self> {
-        // Fuse gate + up: concatenate along out dimension.
-        // In safetensors, gate_proj is [intermediate, hidden] and up_proj is [intermediate, hidden].
-        // Fused: [2*intermediate, hidden].
-        let gate = weights.take(&format!("{prefix}.gate_proj.weight"))?;
-        let up = weights.take(&format!("{prefix}.up_proj.weight"))?;
-
-        // Build fused weight by just recording the two — we'll need them adjacent in memory.
-        // For now, create the fused linear from the gate and up weights.
-        // TODO: fuse at load time into a single contiguous buffer for one GEMM.
-        let gate_up = Self::fuse_gate_up(gate, up)?;
-        let gate_up_proj = Linear::new(gate_up, None);
-
-        let down_proj = Linear::load(weights, &format!("{prefix}.down_proj"))?;
-        Ok(Self {
-            gate_up_proj,
-            down_proj,
-            intermediate_size,
-        })
-    }
-
-    /// Fuse gate and up weight tensors into [2*intermediate, hidden].
-    fn fuse_gate_up(_gate: GpuTensor, _up: GpuTensor) -> Result<GpuTensor> {
-        // In the candle backend, this is done via Tensor::cat on dim 0.
-        // For GpuTensor, we need a D2D copy to create a contiguous fused buffer.
-        // TODO: implement proper fusion. For now, we'll load them separately
-        // and handle in forward by doing two GEMMs.
-        // This is a placeholder — proper implementation needs a D2D concat.
-        anyhow::bail!(
-            "gate_up fusion not yet implemented for GpuTensor; \
-             need D2D concat kernel or pre-fused safetensors loading"
-        )
-    }
-
-    /// Load with pre-fused gate_up weight (if the model stores it that way,
-    /// or if we pre-fuse during weight loading).
-    pub fn load_prefused(
-        weights: &mut GpuWeights,
-        prefix: &str,
-        intermediate_size: usize,
-    ) -> Result<Self> {
-        // Try fused first, fallback to separate.
-        let gate_up_name = format!("{prefix}.gate_up_proj.weight");
-        let gate_up = if weights.contains(&gate_up_name) {
-            Linear::load(weights, &format!("{prefix}.gate_up_proj"))?
-        } else {
-            // Load separate and do two GEMMs in forward.
-            let gate = Linear::load(weights, &format!("{prefix}.gate_proj"))?;
-            let up = Linear::load(weights, &format!("{prefix}.up_proj"))?;
-            // Return gate as the "gate_up" and store up separately.
-            // This is a workaround — see LlamaMlpSeparate below.
-            let _ = up;
-            gate
-        };
-
-        let down_proj = Linear::load(weights, &format!("{prefix}.down_proj"))?;
-        Ok(Self {
-            gate_up_proj: gate_up,
-            down_proj,
-            intermediate_size,
-        })
-    }
-
     /// Forward pass.
     pub unsafe fn forward(&self, x: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
         self.forward_owned(x, device).into_gpu_tensor()
     }
 
     /// Forward pass returning `OwnedTensor` (caching-allocator path).
-    ///
-    /// Intermediates (gate_up, activated) are owned and freed at end of scope.
-    /// Only the final down_proj output survives.
     pub unsafe fn forward_owned(&self, x: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
-        let gate_up = self
-            .gate_up_proj
-            .forward_owned(x, &mut device.cublas, &mut device.caching);
+        let gate_up = if let Some(ref up_proj) = self.up_proj {
+            // Quantized: separate gate + up GEMMs, then concat
+            let gate_out = self.gate_up_proj.forward_owned(
+                x,
+                &mut device.cublas,
+                &mut device.caching,
+                device.compute_stream,
+            );
+            let up_out = up_proj.forward_owned(
+                x,
+                &mut device.cublas,
+                &mut device.caching,
+                device.compute_stream,
+            );
+            // Concat gate_out and up_out along dim 1 → [num_tokens, 2*intermediate]
+            let concat = kernels::concat_dim1(
+                gate_out.as_gpu_tensor(),
+                up_out.as_gpu_tensor(),
+                &mut device.caching,
+                device.compute_stream,
+            );
+            drop(gate_out);
+            drop(up_out);
+            concat
+        } else {
+            // Dense: single fused gate+up GEMM
+            self.gate_up_proj.forward_owned(
+                x,
+                &mut device.cublas,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+
         let activated = kernels::silu_and_mul_fused(
             gate_up.as_gpu_tensor(),
             self.intermediate_size,
             &mut device.caching,
             device.compute_stream,
         );
-        drop(gate_up); // return gate_up memory to free list
+        drop(gate_up);
+
         let result = self.down_proj.forward_owned(
             activated.as_gpu_tensor(),
             &mut device.cublas,
             &mut device.caching,
+            device.compute_stream,
         );
         drop(activated);
+
         result
     }
 }
@@ -264,9 +237,16 @@ impl LlamaMLP {
 // ---------------------------------------------------------------------------
 
 /// LLaMA multi-head attention with RoPE, GQA, fused QKV.
+///
+/// Dense: single fused QKV GEMM. Quantized: separate Q, K, V GEMMs.
 pub struct LlamaAttention {
-    qkv_proj: Linear,
-    o_proj: Linear,
+    /// Fused QKV for dense, or Q-only for quantized.
+    qkv_proj: LinearLayer,
+    /// Separate K projection — only used for quantized.
+    k_proj: Option<LinearLayer>,
+    /// Separate V projection — only used for quantized.
+    v_proj: Option<LinearLayer>,
+    o_proj: LinearLayer,
     q_size: usize,
     kv_size: usize,
     num_q_heads: usize,
@@ -365,9 +345,53 @@ impl LlamaAttention {
         let num_tokens = hidden_states.dim(0);
 
         // QKV projection → owned.
-        let qkv =
-            self.qkv_proj
-                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+        let qkv = if self.k_proj.is_some() {
+            // Quantized: separate Q, K, V GEMMs → concat
+            let q_out = self.qkv_proj.forward_owned(
+                hidden_states,
+                &mut device.cublas,
+                &mut device.caching,
+                device.compute_stream,
+            );
+            let k_out = self.k_proj.as_ref().unwrap().forward_owned(
+                hidden_states,
+                &mut device.cublas,
+                &mut device.caching,
+                device.compute_stream,
+            );
+            let v_out = self.v_proj.as_ref().unwrap().forward_owned(
+                hidden_states,
+                &mut device.cublas,
+                &mut device.caching,
+                device.compute_stream,
+            );
+            // Concat Q, K, V along dim 1 → [num_tokens, q_size + 2*kv_size]
+            let qk = kernels::concat_dim1(
+                q_out.as_gpu_tensor(),
+                k_out.as_gpu_tensor(),
+                &mut device.caching,
+                device.compute_stream,
+            );
+            drop(q_out);
+            drop(k_out);
+            let qkv = kernels::concat_dim1(
+                qk.as_gpu_tensor(),
+                v_out.as_gpu_tensor(),
+                &mut device.caching,
+                device.compute_stream,
+            );
+            drop(qk);
+            drop(v_out);
+            qkv
+        } else {
+            // Dense: single fused QKV GEMM
+            self.qkv_proj.forward_owned(
+                hidden_states,
+                &mut device.cublas,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
 
         // Split QKV and apply RoPE (with optional per-head QK-norm for Qwen3/Gemma3).
         let (q, k, v) =
@@ -471,9 +495,12 @@ impl LlamaAttention {
         let attn_flat = attn_output
             .as_gpu_tensor()
             .reshape(&[num_tokens, self.q_size]);
-        let result = self
-            .o_proj
-            .forward_owned(attn_flat, &mut device.cublas, &mut device.caching);
+        let result = self.o_proj.forward_owned(
+            attn_flat,
+            &mut device.cublas,
+            &mut device.caching,
+            device.compute_stream,
+        );
         drop(attn_output);
         result
     }
@@ -704,7 +731,7 @@ impl LlamaModel {
         let mut hidden_states: OwnedTensor = hidden_states;
         let mut residual: Option<OwnedTensor> = None;
 
-        for layer in &self.layers {
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
             let (hs, res) = layer.forward_owned(
                 hidden_states,
                 residual,
@@ -723,6 +750,7 @@ impl LlamaModel {
             // Old residual was passed through (or created from hidden_states).
             hidden_states = hs;
             residual = Some(res);
+
         }
 
         // Final norm: mutates hidden_states and residual in-place.
@@ -750,7 +778,7 @@ impl LlamaModel {
 /// LLaMA for causal language modeling.
 pub struct LlamaForCausalLM {
     pub model: LlamaModel,
-    pub lm_head: Linear,
+    pub lm_head: LinearLayer,
     /// Granite logits scaling (1.0 = no-op for LLaMA).
     pub logits_scaling: f32,
 }
@@ -801,9 +829,12 @@ impl LlamaForCausalLM {
         } else {
             hidden_states
         };
-        let logits = self
-            .lm_head
-            .forward(hidden_states, &mut device.cublas, &mut device.caching);
+        let logits = self.lm_head.forward(
+            hidden_states,
+            &mut device.cublas,
+            &mut device.caching,
+            device.compute_stream,
+        );
 
         // Granite: scale logits by 1/logits_scaling.
         if self.logits_scaling != 1.0 {
@@ -856,9 +887,12 @@ impl LlamaForCausalLM {
         };
 
         // lm_head: logits = hidden_states @ lm_head_weight^T
-        let logits =
-            self.lm_head
-                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+        let logits = self.lm_head.forward_owned(
+            hidden_states,
+            &mut device.cublas,
+            &mut device.caching,
+            device.compute_stream,
+        );
         let logits = logits.into_gpu_tensor();
 
         if self.logits_scaling != 1.0 {
@@ -874,11 +908,7 @@ impl LlamaForCausalLM {
 // ---------------------------------------------------------------------------
 
 impl LlamaAttention {
-    /// Load with fused QKV weights — streams directly from CPU to GPU.
-    ///
-    /// Matches Python vLLM's QKVParallelLinear weight_loader: pre-allocates the
-    /// fused [q+k+v, hidden] tensor, then copies each component from CPU to the
-    /// correct offset. No intermediate GPU copies.
+    /// Load with fused QKV weights (dense) — streams directly from CPU to GPU.
     pub fn load_fused(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -948,12 +978,14 @@ impl LlamaAttention {
         } else {
             None
         };
-        let qkv_proj = Linear::new(qkv_w, qkv_bias);
+        let qkv_proj = LinearLayer::Dense(Linear::new(qkv_w, qkv_bias));
 
-        let o_proj = Linear::load(weights, &format!("{prefix}.o_proj"))?;
+        let o_proj = LinearLayer::Dense(Linear::load(weights, &format!("{prefix}.o_proj"))?);
 
         Ok(Self {
             qkv_proj,
+            k_proj: None,
+            v_proj: None,
             o_proj,
             q_size,
             kv_size,
@@ -1033,19 +1065,151 @@ impl LlamaMLP {
 
         let gate_up_w =
             unsafe { GpuTensor::new(ptr, &[2 * intermediate_size, hidden], gate_dtype) };
-        let gate_up_proj = Linear::new(gate_up_w, None);
+        let gate_up_proj = LinearLayer::Dense(Linear::new(gate_up_w, None));
 
-        let down_proj = Linear::load(weights, &format!("{prefix}.down_proj"))?;
+        let down_proj = LinearLayer::Dense(Linear::load(weights, &format!("{prefix}.down_proj"))?);
         Ok(Self {
             gate_up_proj,
+            up_proj: None,
             down_proj,
             intermediate_size,
         })
     }
 }
 
+impl LlamaAttention {
+    /// Load quantized attention (separate Q, K, V, O Marlin layers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        qconfig: &QuantConfig,
+        workspace: GpuTensor,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let num_q_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        let mut alloc = crate::alloc::CachingAllocator::new();
+
+        let q = gpu_weights::load_marlin_linear(
+            weights, &format!("{prefix}.q_proj"), qconfig, workspace, device.device_id, &mut alloc,
+        )?;
+        let k = gpu_weights::load_marlin_linear(
+            weights, &format!("{prefix}.k_proj"), qconfig, workspace, device.device_id, &mut alloc,
+        )?;
+        let v = gpu_weights::load_marlin_linear(
+            weights, &format!("{prefix}.v_proj"), qconfig, workspace, device.device_id, &mut alloc,
+        )?;
+        let o = gpu_weights::load_marlin_linear(
+            weights, &format!("{prefix}.o_proj"), qconfig, workspace, device.device_id, &mut alloc,
+        )?;
+
+        Ok(Self {
+            qkv_proj: LinearLayer::Marlin(q),
+            k_proj: Some(LinearLayer::Marlin(k)),
+            v_proj: Some(LinearLayer::Marlin(v)),
+            o_proj: LinearLayer::Marlin(o),
+            q_size,
+            kv_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            layer_idx,
+            q_norm_weight: None,
+            k_norm_weight: None,
+            qk_norm_eps: 0.0,
+        })
+    }
+}
+
+impl LlamaMLP {
+    /// Load quantized MLP (separate gate, up, down Marlin layers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        intermediate_size: usize,
+        qconfig: &QuantConfig,
+        workspace: GpuTensor,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let mut alloc = crate::alloc::CachingAllocator::new();
+
+        let gate = gpu_weights::load_marlin_linear(
+            weights, &format!("{prefix}.gate_proj"), qconfig, workspace, device.device_id, &mut alloc,
+        )?;
+        let up = gpu_weights::load_marlin_linear(
+            weights, &format!("{prefix}.up_proj"), qconfig, workspace, device.device_id, &mut alloc,
+        )?;
+        let down = gpu_weights::load_marlin_linear(
+            weights, &format!("{prefix}.down_proj"), qconfig, workspace, device.device_id, &mut alloc,
+        )?;
+
+        Ok(Self {
+            gate_up_proj: LinearLayer::Marlin(gate),
+            up_proj: Some(LinearLayer::Marlin(up)),
+            down_proj: LinearLayer::Marlin(down),
+            intermediate_size,
+        })
+    }
+}
+
 impl LlamaDecoderLayer {
-    /// Load a decoder layer with fused weights.
+    /// Load a quantized decoder layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        qconfig: &QuantConfig,
+        workspace: GpuTensor,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let self_attn = LlamaAttention::load_quantized(
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            qconfig,
+            workspace,
+            device,
+        )?;
+        let mlp = LlamaMLP::load_quantized(
+            weights,
+            &format!("{prefix}.mlp"),
+            config.intermediate_size,
+            qconfig,
+            workspace,
+            device,
+        )?;
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            residual_multiplier: 1.0,
+        })
+    }
+
+    /// Load a decoder layer with fused weights (dense).
     pub fn load(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -1141,11 +1305,75 @@ impl LlamaForCausalLM {
     ) -> Result<Self> {
         let model = LlamaModel::load(weights, config, dtype, device)?;
 
-        let lm_head = if config.tie_word_embeddings {
+        let lm_head = LinearLayer::Dense(if config.tie_word_embeddings {
             Linear::new(model.embed_tokens.weight, None)
         } else {
             Linear::load(weights, "lm_head")?
+        });
+
+        Ok(Self {
+            model,
+            lm_head,
+            logits_scaling: 1.0,
+        })
+    }
+
+    /// Load a quantized model (AWQ/GPTQ → Marlin).
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        qconfig: &QuantConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let workspace = gpu_weights::alloc_marlin_workspace(
+            device.num_sm,
+            device.compute_stream,
+        )?;
+
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+            let layer = LlamaDecoderLayer::load_quantized(
+                weights,
+                &prefix,
+                config,
+                i,
+                qconfig,
+                workspace,
+                device,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                config.llama3_rope_scaling.as_ref(),
+                dtype,
+                device,
+            )?
         };
+
+        let model = LlamaModel {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embedding_multiplier: 1.0,
+        };
+
+        // lm_head is always dense (not quantized)
+        let lm_head = LinearLayer::Dense(if config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.weight, None)
+        } else {
+            Linear::load(weights, "lm_head")?
+        });
 
         Ok(Self {
             model,

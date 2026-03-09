@@ -614,7 +614,8 @@ impl Drop for CublasHandle {
 fn gemm_types(dtype: DType) -> (cublasComputeType_t, sys::cudaDataType_t) {
     match dtype {
         DType::F16 => (
-            cublasComputeType_t::CUBLAS_COMPUTE_16F,
+            // F16 uses F32 accumulation (matches Python vLLM / PyTorch default).
+            cublasComputeType_t::CUBLAS_COMPUTE_32F,
             sys::cudaDataType_t::CUDA_R_16F,
         ),
         DType::BF16 => (

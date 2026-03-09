@@ -13,6 +13,7 @@ use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kv_cache::KvCachePool;
 use crate::model::llama::{LlamaConfig, LlamaForCausalLM};
+use crate::quant::QuantConfig;
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
 
@@ -44,7 +45,7 @@ impl Qwen2Config {
 pub struct Qwen2ForCausalLM(pub LlamaForCausalLM);
 
 impl Qwen2ForCausalLM {
-    /// Load the model.
+    /// Load the model (dense).
     pub fn load(
         weights: &mut GpuWeights,
         config: &Qwen2Config,
@@ -52,6 +53,18 @@ impl Qwen2ForCausalLM {
         device: &GpuDevice,
     ) -> Result<Self> {
         let model = LlamaForCausalLM::load(weights, &config.0, dtype, device)?;
+        Ok(Self(model))
+    }
+
+    /// Load the model (quantized AWQ/GPTQ → Marlin).
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        config: &Qwen2Config,
+        dtype: DType,
+        qconfig: &QuantConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = LlamaForCausalLM::load_quantized(weights, &config.0, dtype, qconfig, device)?;
         Ok(Self(model))
     }
 

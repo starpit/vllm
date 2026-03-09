@@ -479,12 +479,13 @@ void marlin_gemm_f16(
     const void* a, const void* b_q_weight, void* c,
     const void* b_scales, const void* b_zeros,
     const void* g_idx, const void* perm,
+    const void* b_bias,
     void* workspace, void* c_tmp, void* a_tmp,
     int size_m, int size_n, int size_k, int lda,
     int num_groups, int group_size,
     bool has_act_order, bool is_k_full,
     bool has_zp, bool is_zp_float,
-    bool use_fp32_reduce,
+    bool use_fp32_reduce, bool has_bias,
     int b_type_id,  // 0 = kU4B8 (GPTQ), 1 = kU4 (AWQ)
     cudaStream_t stream, int device_id) {
 
@@ -501,13 +502,13 @@ void marlin_gemm_f16(
 
   marlin::marlin_mm(
       a, b_q_weight, c, c_tmp,
-      /*b_bias=*/nullptr, /*a_s=*/nullptr,
+      const_cast<void*>(b_bias), /*a_s=*/nullptr,
       const_cast<void*>(b_scales), /*g_s=*/nullptr,
       const_cast<void*>(b_zeros), const_cast<void*>(g_idx),
       const_cast<void*>(perm), a_tmp,
       size_m, size_n, size_k, lda, workspace,
       a_type, b_type, c_type, s_type,
-      /*has_bias=*/false, has_act_order, is_k_full, has_zp,
+      has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, device_id, stream,
       /*thread_k=*/-1, /*thread_n=*/-1, sms,
       /*use_atomic_add=*/false, use_fp32_reduce, is_zp_float);
@@ -518,12 +519,13 @@ void marlin_gemm_bf16(
     const void* a, const void* b_q_weight, void* c,
     const void* b_scales, const void* b_zeros,
     const void* g_idx, const void* perm,
+    const void* b_bias,
     void* workspace, void* c_tmp, void* a_tmp,
     int size_m, int size_n, int size_k, int lda,
     int num_groups, int group_size,
     bool has_act_order, bool is_k_full,
     bool has_zp, bool is_zp_float,
-    bool use_fp32_reduce,
+    bool use_fp32_reduce, bool has_bias,
     int b_type_id,
     cudaStream_t stream, int device_id) {
 
@@ -539,13 +541,13 @@ void marlin_gemm_bf16(
 
   marlin::marlin_mm(
       a, b_q_weight, c, c_tmp,
-      /*b_bias=*/nullptr, /*a_s=*/nullptr,
+      const_cast<void*>(b_bias), /*a_s=*/nullptr,
       const_cast<void*>(b_scales), /*g_s=*/nullptr,
       const_cast<void*>(b_zeros), const_cast<void*>(g_idx),
       const_cast<void*>(perm), a_tmp,
       size_m, size_n, size_k, lda, workspace,
       a_type, b_type, c_type, s_type,
-      /*has_bias=*/false, has_act_order, is_k_full, has_zp,
+      has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, device_id, stream,
       /*thread_k=*/-1, /*thread_n=*/-1, sms,
       /*use_atomic_add=*/false, use_fp32_reduce, is_zp_float);

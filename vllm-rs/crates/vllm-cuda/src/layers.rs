@@ -94,6 +94,178 @@ impl Linear {
 }
 
 // ---------------------------------------------------------------------------
+// MarlinLinear (INT4 quantized via Marlin GEMM)
+// ---------------------------------------------------------------------------
+
+/// Quantized linear layer using Marlin INT4×FP16→FP16 GEMM.
+///
+/// Weights are repacked to Marlin tiled format at load time.
+/// Supports both AWQ (has zero points) and GPTQ (symmetric or with zeros).
+pub struct MarlinLinear {
+    /// Marlin-tiled packed INT4 weights.
+    pub qweight: GpuTensor,
+    /// Per-group scales `[num_groups, size_n]`, permuted for Marlin.
+    pub scales: GpuTensor,
+    /// Packed zero points (AWQ) or None (GPTQ symmetric).
+    pub zeros: Option<GpuTensor>,
+    /// Group index for act_order (desc_act) or None.
+    pub g_idx: Option<GpuTensor>,
+    /// Sort indices for act_order or None.
+    pub g_idx_sort_indices: Option<GpuTensor>,
+    /// `[num_sms]` i32 workspace for Marlin barrier sync.
+    pub workspace: GpuTensor,
+    /// Input features (unquantized K dimension).
+    pub size_k: usize,
+    /// Output features (N dimension).
+    pub size_n: usize,
+    /// Quantization group size.
+    pub group_size: usize,
+    /// Number of groups.
+    pub num_groups: usize,
+    /// Whether this layer has zero points.
+    pub has_zp: bool,
+    /// Whether act_order (desc_act) is enabled.
+    pub has_act_order: bool,
+    /// Marlin b_type_id: 0 = GPTQ (uint4b8), 1 = AWQ (uint4).
+    pub b_type_id: i32,
+    /// Device ID for the Marlin kernel.
+    pub device_id: i32,
+    /// Optional bias `[size_n]` — added after Marlin GEMM.
+    pub bias: Option<GpuTensor>,
+}
+
+impl MarlinLinear {
+    /// Forward: y = marlin_gemm(x, qweight, scales, zeros)
+    ///
+    /// `x`: `[num_tokens, size_k]` (F16 or BF16)
+    /// Returns: `[num_tokens, size_n]`
+    pub unsafe fn forward(
+        &self,
+        x: GpuTensor,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> GpuTensor {
+        self.forward_owned(x, alloc, stream).into_gpu_tensor()
+    }
+
+    pub unsafe fn forward_owned(
+        &self,
+        x: GpuTensor,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> OwnedTensor {
+        let size_m = x.dim(0);
+        debug_assert_eq!(
+            x.dim(1), self.size_k,
+            "MarlinLinear: input dim {} != size_k {}",
+            x.dim(1), self.size_k
+        );
+        // Don't pass bias to Marlin kernel (would need permutation).
+        // Instead, add bias after the GEMM with a simple broadcast add.
+        let out = crate::kernels::marlin_gemm(
+            x,
+            self.qweight,
+            self.scales,
+            self.zeros,
+            self.g_idx,
+            self.g_idx_sort_indices,
+            None,
+            self.workspace,
+            size_m,
+            self.size_n,
+            self.size_k,
+            self.num_groups,
+            self.group_size,
+            self.has_act_order,
+            self.has_zp,
+            self.b_type_id,
+            self.device_id,
+            alloc,
+            stream,
+        );
+
+        if let Some(bias) = self.bias {
+            crate::kernels::bias_add_inplace(out.as_gpu_tensor(), bias, stream);
+        }
+
+        out
+    }
+
+    pub fn out_features(&self) -> usize {
+        self.size_n
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.size_k
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LinearLayer (enum dispatch: Dense or Marlin)
+// ---------------------------------------------------------------------------
+
+/// Unified linear layer — either dense (cuBLAS GEMM) or quantized (Marlin GEMM).
+///
+/// Models use this everywhere they currently use `Linear`. The factory decides
+/// at load time which variant to create based on `QuantConfig`.
+pub enum LinearLayer {
+    Dense(Linear),
+    Marlin(MarlinLinear),
+}
+
+impl LinearLayer {
+    /// Forward: y = x @ W^T (dense) or marlin_gemm(x, qweight) (quantized).
+    pub unsafe fn forward(
+        &self,
+        x: GpuTensor,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> GpuTensor {
+        self.forward_owned(x, cublas, alloc, stream).into_gpu_tensor()
+    }
+
+    pub unsafe fn forward_owned(
+        &self,
+        x: GpuTensor,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> OwnedTensor {
+        match self {
+            Self::Dense(l) => l.forward_owned(x, cublas, alloc),
+            Self::Marlin(l) => l.forward_owned(x, alloc, stream),
+        }
+    }
+
+    pub fn out_features(&self) -> usize {
+        match self {
+            Self::Dense(l) => l.out_features(),
+            Self::Marlin(l) => l.out_features(),
+        }
+    }
+
+    pub fn in_features(&self) -> usize {
+        match self {
+            Self::Dense(l) => l.in_features(),
+            Self::Marlin(l) => l.in_features(),
+        }
+    }
+}
+
+impl From<Linear> for LinearLayer {
+    fn from(l: Linear) -> Self {
+        Self::Dense(l)
+    }
+}
+
+impl From<MarlinLinear> for LinearLayer {
+    fn from(l: MarlinLinear) -> Self {
+        Self::Marlin(l)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Embedding
 // ---------------------------------------------------------------------------
 

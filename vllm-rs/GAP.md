@@ -43,22 +43,70 @@
 
   2. Quantization Support
 
-  CudaWorker has zero quantization vs CandleWorker:
+  ┌──────────────────┬──────────────┬─────────────┬────────────────────────────────────────────────┐
+  │      Format      │ CandleWorker │ CudaWorker  │                     Notes                      │
+  ├──────────────────┼──────────────┼─────────────┼────────────────────────────────────────────────┤
+  │ GGUF (k-quants)  │ yes          │ no          │ Dequant kernels or candle's QCudaStorage       │
+  ├──────────────────┼──────────────┼─────────────┼────────────────────────────────────────────────┤
+  │ GPTQ (W4A16)     │ yes          │ YES         │ Marlin kernel, E2E verified (Qwen2.5-0.5B)    │
+  ├──────────────────┼──────────────┼─────────────┼────────────────────────────────────────────────┤
+  │ AWQ (W4A16)      │ yes          │ partial     │ Repack kernel wired, needs E2E testing         │
+  ├──────────────────┼──────────────┼─────────────┼────────────────────────────────────────────────┤
+  │ BitsAndBytes NF4 │ yes          │ no          │ NF4 dequant kernel                             │
+  └──────────────────┴──────────────┴─────────────┴────────────────────────────────────────────────┘
 
-  ┌──────────────────┬──────────────┬────────────┬────────────────────────────────────────────────┐
-  │      Format      │ CandleWorker │ CudaWorker │                 Kernel needed                  │
-  ├──────────────────┼──────────────┼────────────┼────────────────────────────────────────────────┤
-  │ GGUF (k-quants)  │ yes          │ no         │ Dequant kernels or candle's QCudaStorage       │
-  ├──────────────────┼──────────────┼────────────┼────────────────────────────────────────────────┤
-  │ GPTQ (W4A16)     │ yes          │ no         │ Marlin kernel (already exists in vllm-kernels) │
-  ├──────────────────┼──────────────┼────────────┼────────────────────────────────────────────────┤
-  │ AWQ (W4A16)      │ yes          │ no         │ Marlin kernel (already exists in vllm-kernels) │
-  ├──────────────────┼──────────────┼────────────┼────────────────────────────────────────────────┤
-  │ BitsAndBytes NF4 │ yes          │ no         │ NF4 dequant kernel                             │
-  └──────────────────┴──────────────┴────────────┴────────────────────────────────────────────────┘
+  ### GPTQ/AWQ Parity vs Python vLLM (detailed)
 
-  Effort: Marlin is already compiled in vllm-kernels/csrc/ — need FFI bindings from GpuTensor and quantized weight loading in GpuWeights.
-  GGUF requires either porting candle's QCudaStorage approach or writing dequant-on-the-fly kernels. BnB is lower priority.
+  **Functional parity:**
+
+  ┌─────────────────────────────┬────────────┬──────────┬──────────────────────────────────────────┐
+  │          Feature            │ Python vLLM│ Rust vLLM│                  Notes                   │
+  ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
+  │ GPTQ 4-bit symmetric        │ yes        │ yes      │ b_type_id=0 (kU4B8), E2E verified       │
+  ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
+  │ GPTQ 4-bit asymmetric       │ yes        │ no       │ Needs zero-point loading                 │
+  ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
+  │ AWQ 4-bit                   │ yes        │ partial  │ Repack wired, needs E2E test             │
+  ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
+  │ Linear bias (QKV)           │ yes        │ yes      │ Post-GEMM bias_add_inplace               │
+  ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
+  │ desc_act (act ordering)     │ yes        │ no       │ g_idx sort + perm needed                 │
+  ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
+  │ Fused QKV GEMM (quant)      │ yes        │ no       │ Python fuses at load; Rust does 3 GEMMs  │
+  ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
+  │ Fused gate+up GEMM (quant)  │ yes        │ no       │ Python fuses at load; Rust does 2 GEMMs  │
+  ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
+  │ use_fp32_reduce              │ yes (dflt) │ no       │ Python defaults true; Rust passes false   │
+  ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
+  │ In-kernel bias (permuted)   │ yes        │ no       │ Python uses marlin_permute_bias()         │
+  ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
+  │ CUDA graphs (quant)         │ yes        │ yes      │ Works with decode graphs                  │
+  ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
+  │ Architectures (quant)       │ all        │ Qwen2    │ LLaMA/Gemma2 need wiring                 │
+  └─────────────────────────────┴────────────┴──────────┴──────────────────────────────────────────┘
+
+  **Performance (Qwen2.5-0.5B-Instruct-GPTQ-Int4, nick5 L40S, 128 output tokens):**
+
+  ┌───────────────────┬──────────┬──────────┐
+  │     Metric        │ Rust GPTQ│ Rust Dense│
+  ├───────────────────┼──────────┼──────────┤
+  │ avg ITL (decode)  │ 3.0 ms   │ 2.2 ms   │
+  ├───────────────────┼──────────┼──────────┤
+  │ TTFT (prefill)    │ 8.7 ms   │ 2.6 ms   │
+  └───────────────────┴──────────┴──────────┘
+
+  GPTQ is 1.36x slower on decode, 3.3x slower on prefill. Expected for a tiny 0.5B model where
+  Marlin overhead dominates. On larger models (7B+) the memory bandwidth savings should make GPTQ
+  faster than dense.
+
+  **Key gaps to close (priority order):**
+  1. Fused QKV/gate_up at load time — 5 GEMMs→2 per layer, big prefill win
+  2. use_fp32_reduce=true — match Python default for numerical accuracy
+  3. AWQ E2E testing — repack kernel is wired, just needs model test
+  4. Wire LLaMA/Gemma2 for quantized loading — only Qwen2 works today
+  5. desc_act support — needed for some GPTQ models
+
+  Effort: GGUF requires either porting candle's QCudaStorage approach or writing dequant-on-the-fly kernels. BnB is lower priority.
 
   3. Tensor Parallelism (TP)
 
@@ -182,7 +230,7 @@
   apply_logit_bias (CSR scatter-add), apply_grammar_mask (CSR allow-list), log_softmax_topk (fused logprobs), cast_to_f32.
 
   Still needed:
-  - Marlin INT4 GEMM FFI — exists in vllm-kernels but no GpuTensor bindings
+  - ~~Marlin INT4 GEMM FFI~~ — **DONE** (marlin_gemm, repack, permute_scales all wired)
   - GGUF dequant kernels — if not using candle's QCudaStorage
 
   Already implemented:
@@ -261,7 +309,7 @@
   Priority Order (to retire CandleWorker CUDA)
 
   1. ~~Low-hanging fruit: Alias Mistral/Qwen3/Phi-3 to LLaMA in CudaWorker~~ — **DONE**
-  2. Marlin FFI for GPTQ/AWQ: Wire existing Marlin kernel to GpuTensor — unlocks quantized serving for LLaMA-family — **IN PROGRESS**
+  2. ~~Marlin FFI for GPTQ/AWQ~~ — **GPTQ DONE** (Qwen2 E2E verified), AWQ needs E2E test
   3. ~~Sampling correctness: GPU-native penalties, logit bias, grammar, logprobs~~ — **DONE** (full GPU parity, no CPU fallback, 18/18 E2E tests)
   4. GGUF support: Either port candle's QCudaStorage approach or add dequant kernels
   5. ~~MoE kernel + models: Fused MoE GEMM, then port Mixtral/Qwen MoE/Qwen3 MoE~~ — **DONE** (WMMA tensor-core kernel, 3 models)

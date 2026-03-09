@@ -56,6 +56,7 @@ pub mod layers_moe;
 pub mod logits_processor;
 #[cfg(feature = "cuda")]
 pub mod model;
+pub mod quant;
 #[cfg(feature = "cuda")]
 pub mod weights;
 
@@ -70,6 +71,6 @@ pub use device::GpuDevice;
 #[cfg(feature = "cuda")]
 pub use kv_cache::KvCachePool;
 #[cfg(feature = "cuda")]
-pub use layers::{Embedding, Linear, RmsNorm};
+pub use layers::{Embedding, Linear, LinearLayer, MarlinLinear, RmsNorm};
 #[cfg(feature = "cuda")]
 pub use weights::GpuWeights;

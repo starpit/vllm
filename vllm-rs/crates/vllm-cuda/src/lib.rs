@@ -53,6 +53,8 @@ pub mod layers;
 #[cfg(feature = "cuda")]
 pub mod layers_moe;
 #[cfg(feature = "cuda")]
+pub mod logits_processor;
+#[cfg(feature = "cuda")]
 pub mod model;
 #[cfg(feature = "cuda")]
 pub mod weights;

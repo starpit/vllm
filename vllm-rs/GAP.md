@@ -101,12 +101,20 @@
   1. Cast logits to f32 (if any modification needed)
   2. Save raw logits copy for logprobs (GPU D2D, before modifications)
   3. Apply grammar mask on GPU (CSR-packed allow-list → set disallowed to -inf)
-  4. Apply logit bias on GPU (CSR-packed scatter-add)
-  5. Apply penalties on GPU (fused rep/freq/pres kernel, one block per request)
-  6. Sample on GPU (argmax, Gumbel-max, or fused top-k/top-p/min-p)
-  7. Gather logprobs on GPU (fused log-softmax + top-K from raw logits)
-  8. D2H only sampled token IDs + small logprobs tensors
-  9. Grammar FSM advance on CPU (same as Python)
+  4. Apply min_tokens on GPU (suppress EOS/stop tokens until min_tokens reached)
+  5. Apply logit bias on GPU (CSR-packed scatter-add)
+  6. Apply penalties on GPU (fused rep/freq/pres kernel, one block per request)
+  7. Sample on GPU (argmax, Gumbel-max, or fused top-k/top-p/min-p)
+  8. Gather logprobs on GPU (fused log-softmax + top-K from raw logits)
+  9. D2H only sampled token IDs + small logprobs tensors
+  10. Grammar FSM advance on CPU (same as Python)
+
+  Architecture: Formal LogitsProcessor framework (mirrors Python vLLM v1/sample/logits_processor/):
+  - LogitsProcessor trait: update_state(), apply(), is_argmax_invariant(), is_active()
+  - LogitsProcessorPipeline: container splitting processors by argmax-invariance
+  - BatchUpdate: notification struct for batch composition changes
+  - Persistent GPU state: tensors rebuilt only on batch changes (not every step)
+  - Built-in processors: GrammarMaskProcessor, MinTokensProcessor, LogitBiasProcessor, PenaltiesProcessor
 
   ┌────────────────────────────┬────────────────┬──────────────────┬─────────────────────────────────────────────┐
   │          Feature           │ CandleWorker   │ CudaWorker (GPU) │                   Notes                     │
@@ -159,8 +167,8 @@
   │                              │ which checks output_token_ids suffix matches and sets logit to -inf.    │
   │                              │ Needs CPU-side suffix matching + GPU scatter to -inf.                   │
   ├──────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
-  │ min_tokens logits processor  │ Forces EOS token logit to -inf until min_tokens generated. Simple      │
-  │                              │ per-request check: if len(output) < min_tokens, set logits[eos] = -inf │
+  │ ~~min_tokens logits processor~~│ ~~DONE — MinTokensProcessor suppresses EOS/stop tokens on GPU~~       │
+  │                              │ ~~until min_tokens generated. CUDA kernel + E2E test verified.~~       │
   ├──────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
   │ Per-request seed-based RNG   │ Python creates per-request torch.Generator from user-provided seed.    │
   │                              │ CudaWorker currently uses shared thread_rng with murmurhash mixing.    │

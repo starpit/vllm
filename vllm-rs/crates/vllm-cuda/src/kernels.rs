@@ -2068,6 +2068,15 @@ unsafe extern "C" {
         out_ranks: *mut u32,
         stream: CUstream,
     );
+
+    fn apply_min_tokens_inplace(
+        logits: *mut f32,
+        req_indices: *const c_int,
+        token_ids: *const c_int,
+        count: c_int,
+        vocab_size: c_int,
+        stream: CUstream,
+    );
 }
 
 /// Apply repetition, frequency, and presence penalties to f32 logits in-place.
@@ -2159,6 +2168,30 @@ pub unsafe fn apply_grammar_mask(
         req_indices.as_ptr() as *const c_int,
         vocab_size,
         num_grammar_reqs,
+        stream,
+    );
+}
+
+/// Suppress stop tokens for requests below min_tokens by setting logits to -inf.
+///
+/// * `logits`: `[batch_size, vocab_size]` f32 on GPU — modified in-place
+/// * `req_indices`: `[count]` i32 on GPU — batch index for each (req, stop_token) pair
+/// * `token_ids`: `[count]` i32 on GPU — token ID to suppress for each pair
+pub unsafe fn apply_min_tokens(
+    logits: GpuTensor,
+    req_indices: GpuTensor,
+    token_ids: GpuTensor,
+    stream: CUstream,
+) {
+    let count = req_indices.dim(0) as c_int;
+    let vocab_size = logits.dim(1) as c_int;
+
+    apply_min_tokens_inplace(
+        logits.as_mut_ptr() as *mut f32,
+        req_indices.as_ptr() as *const c_int,
+        token_ids.as_ptr() as *const c_int,
+        count,
+        vocab_size,
         stream,
     );
 }
@@ -3515,6 +3548,233 @@ mod tests_flash_attn {
 // ---------------------------------------------------------------------------
 // Tests: GPU pooling kernels
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Sampling kernel tests (logit_bias, penalties, min_tokens)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod tests_sampling {
+    use super::*;
+    use crate::alloc::CachingAllocator;
+    use crate::driver;
+
+    unsafe fn test_init() -> (CachingAllocator, cudarc::driver::sys::CUstream) {
+        driver::init().expect("CUDA init");
+        let dev = driver::device_get(0).expect("device 0");
+        let _ctx = driver::ctx_create(dev).expect("ctx_create");
+        let stream = driver::stream_create().expect("stream_create");
+        let alloc = CachingAllocator::new();
+        (alloc, stream)
+    }
+
+    unsafe fn upload_f32(data: &[f32], stream: cudarc::driver::sys::CUstream) -> *mut u8 {
+        let bytes = data.len() * 4;
+        let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("htod");
+        driver::stream_synchronize(stream).expect("sync");
+        ptr
+    }
+
+    unsafe fn upload_i32(data: &[i32], stream: cudarc::driver::sys::CUstream) -> *mut u8 {
+        let bytes = data.len() * 4;
+        let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("htod");
+        driver::stream_synchronize(stream).expect("sync");
+        ptr
+    }
+
+    unsafe fn download_f32(
+        ptr: *const u8,
+        count: usize,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Vec<f32> {
+        let mut host = vec![0.0f32; count];
+        driver::memcpy_dtoh_async(host.as_mut_ptr() as *mut u8, ptr, count * 4, stream)
+            .expect("dtoh");
+        driver::stream_synchronize(stream).expect("sync");
+        host
+    }
+
+    /// Test apply_min_tokens: suppress specific tokens for specific requests.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_apply_min_tokens() {
+        unsafe {
+            let (_alloc, stream) = test_init();
+            // 2 requests, vocab_size=5.
+            // logits = [[1.0, 2.0, 3.0, 4.0, 5.0],
+            //           [5.0, 4.0, 3.0, 2.0, 1.0]]
+            let vocab_size = 5;
+            let logits_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+            let logits_ptr = upload_f32(&logits_data, stream);
+            let logits = GpuTensor::new(logits_ptr, &[2, vocab_size], DType::F32);
+
+            // Suppress token 4 for request 0, token 0 for request 1.
+            let req_indices = [0i32, 1];
+            let token_ids = [4i32, 0];
+            let req_ptr = upload_i32(&req_indices, stream);
+            let tok_ptr = upload_i32(&token_ids, stream);
+            let gpu_req = GpuTensor::new(req_ptr, &[2], DType::U32);
+            let gpu_tok = GpuTensor::new(tok_ptr, &[2], DType::U32);
+
+            apply_min_tokens(logits, gpu_req, gpu_tok, stream);
+            driver::stream_synchronize(stream).expect("sync");
+
+            let result = download_f32(logits_ptr, 10, stream);
+            // Request 0: token 4 (index 4) should be -inf.
+            assert_eq!(result[0], 1.0);
+            assert_eq!(result[1], 2.0);
+            assert_eq!(result[2], 3.0);
+            assert_eq!(result[3], 4.0);
+            assert!(
+                result[4].is_infinite() && result[4] < 0.0,
+                "token 4 should be -inf"
+            );
+            // Request 1: token 0 (index 0) should be -inf.
+            assert!(
+                result[5].is_infinite() && result[5] < 0.0,
+                "token 0 should be -inf"
+            );
+            assert_eq!(result[6], 4.0);
+            assert_eq!(result[7], 3.0);
+            assert_eq!(result[8], 2.0);
+            assert_eq!(result[9], 1.0);
+
+            let _ = driver::mem_free(logits_ptr);
+            let _ = driver::mem_free(req_ptr);
+            let _ = driver::mem_free(tok_ptr);
+        }
+    }
+
+    /// Test apply_logit_bias: CSR-packed sparse bias addition.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_apply_logit_bias() {
+        unsafe {
+            let (_alloc, stream) = test_init();
+            // 2 requests, vocab_size=4.
+            let vocab_size = 4;
+            let logits_data: Vec<f32> = vec![0.0; 8]; // all zeros
+            let logits_ptr = upload_f32(&logits_data, stream);
+            let logits = GpuTensor::new(logits_ptr, &[2, vocab_size], DType::F32);
+
+            // Request 0: token 1 += 10.0, token 3 += -5.0
+            // Request 1: token 0 += 3.0
+            let bias_ids = [1i32, 3, 0];
+            let bias_vals = [10.0f32, -5.0, 3.0];
+            let bias_offsets = [0i32, 2, 3]; // CSR: req0=[0..2), req1=[2..3)
+            let ids_ptr = upload_i32(&bias_ids, stream);
+            let vals_ptr = upload_f32(&bias_vals, stream);
+            let off_ptr = upload_i32(&bias_offsets, stream);
+            let gpu_ids = GpuTensor::new(ids_ptr, &[3], DType::U32);
+            let gpu_vals = GpuTensor::new(vals_ptr, &[3], DType::F32);
+            let gpu_off = GpuTensor::new(off_ptr, &[3], DType::U32);
+
+            apply_logit_bias(logits, gpu_ids, gpu_vals, gpu_off, stream);
+            driver::stream_synchronize(stream).expect("sync");
+
+            let result = download_f32(logits_ptr, 8, stream);
+            // Request 0: [0, 10, 0, -5]
+            assert_eq!(result[0], 0.0);
+            assert_eq!(result[1], 10.0);
+            assert_eq!(result[2], 0.0);
+            assert_eq!(result[3], -5.0);
+            // Request 1: [3, 0, 0, 0]
+            assert_eq!(result[4], 3.0);
+            assert_eq!(result[5], 0.0);
+            assert_eq!(result[6], 0.0);
+            assert_eq!(result[7], 0.0);
+
+            let _ = driver::mem_free(logits_ptr);
+            let _ = driver::mem_free(ids_ptr);
+            let _ = driver::mem_free(vals_ptr);
+            let _ = driver::mem_free(off_ptr);
+        }
+    }
+
+    /// Test apply_penalties: repetition penalty on output tokens.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_apply_penalties_repetition() {
+        unsafe {
+            let (_alloc, stream) = test_init();
+            // 1 request, vocab_size=4, output tokens = [0, 1].
+            let vocab_size = 4usize;
+            let logits_data: Vec<f32> = vec![2.0, -1.0, 0.5, 3.0];
+            let logits_ptr = upload_f32(&logits_data, stream);
+            let logits = GpuTensor::new(logits_ptr, &[1, vocab_size], DType::F32);
+
+            // Output token IDs: [0, 1], padded with vocab_size sentinel.
+            let out_ids = [0i32, 1, vocab_size as i32]; // 3 cols, last is padding
+            let prompt_ids = [vocab_size as i32]; // 1 col, all padding
+            let out_ptr = upload_i32(&out_ids, stream);
+            let prompt_ptr = upload_i32(&prompt_ids, stream);
+            let gpu_out = GpuTensor::new(out_ptr, &[1, 3], DType::U32);
+            let gpu_prompt = GpuTensor::new(prompt_ptr, &[1, 1], DType::U32);
+
+            // rep_penalty=2.0, freq=0, pres=0.
+            let rep = [2.0f32];
+            let freq = [0.0f32];
+            let pres = [0.0f32];
+            let rep_ptr = upload_f32(&rep, stream);
+            let freq_ptr = upload_f32(&freq, stream);
+            let pres_ptr = upload_f32(&pres, stream);
+            let gpu_rep = GpuTensor::new(rep_ptr, &[1], DType::F32);
+            let gpu_freq = GpuTensor::new(freq_ptr, &[1], DType::F32);
+            let gpu_pres = GpuTensor::new(pres_ptr, &[1], DType::F32);
+
+            apply_penalties(
+                logits, gpu_out, gpu_prompt, gpu_rep, gpu_freq, gpu_pres, stream,
+            );
+            driver::stream_synchronize(stream).expect("sync");
+
+            let result = download_f32(logits_ptr, 4, stream);
+            // Token 0 (logit=2.0, positive): 2.0 / 2.0 = 1.0.
+            assert!((result[0] - 1.0).abs() < 1e-5, "got {}", result[0]);
+            // Token 1 (logit=-1.0, negative): -1.0 * 2.0 = -2.0.
+            assert!((result[1] - (-2.0)).abs() < 1e-5, "got {}", result[1]);
+            // Token 2: unmodified (not in output), 0.5.
+            assert!((result[2] - 0.5).abs() < 1e-5, "got {}", result[2]);
+            // Token 3: unmodified, 3.0.
+            assert!((result[3] - 3.0).abs() < 1e-5, "got {}", result[3]);
+
+            let _ = driver::mem_free(logits_ptr);
+            let _ = driver::mem_free(out_ptr);
+            let _ = driver::mem_free(prompt_ptr);
+            let _ = driver::mem_free(rep_ptr);
+            let _ = driver::mem_free(freq_ptr);
+            let _ = driver::mem_free(pres_ptr);
+        }
+    }
+
+    /// Test apply_min_tokens with zero count (no-op).
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_apply_min_tokens_noop() {
+        unsafe {
+            let (_alloc, stream) = test_init();
+            let logits_data: Vec<f32> = vec![1.0, 2.0, 3.0];
+            let logits_ptr = upload_f32(&logits_data, stream);
+            let logits = GpuTensor::new(logits_ptr, &[1, 3], DType::F32);
+
+            // Empty req_indices and token_ids — kernel should be a no-op.
+            let empty_ptr = driver::mem_alloc(4).expect("mem_alloc");
+            let gpu_req = GpuTensor::new(empty_ptr, &[0], DType::U32);
+            let gpu_tok = GpuTensor::new(empty_ptr, &[0], DType::U32);
+
+            apply_min_tokens(logits, gpu_req, gpu_tok, stream);
+            driver::stream_synchronize(stream).expect("sync");
+
+            let result = download_f32(logits_ptr, 3, stream);
+            assert_eq!(result, vec![1.0, 2.0, 3.0]);
+
+            let _ = driver::mem_free(logits_ptr);
+            let _ = driver::mem_free(empty_ptr);
+        }
+    }
+}
 
 #[cfg(test)]
 #[cfg(feature = "cuda")]

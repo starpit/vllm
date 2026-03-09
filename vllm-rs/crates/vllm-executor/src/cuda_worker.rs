@@ -19,6 +19,10 @@ use vllm_cuda::driver;
 use vllm_cuda::dtype::DType as GpuDType;
 use vllm_cuda::graph::{CudaGraphRunner, GRAPH_MAX_BLOCKS_PER_SEQ, PrefillGraphRunner};
 use vllm_cuda::kv_cache::KvCachePool;
+use vllm_cuda::logits_processor::{
+    BatchUpdate, GrammarMaskProcessor, LogitBiasProcessor, LogitsProcessorPipeline,
+    MinTokensProcessor, PenaltiesProcessor,
+};
 use vllm_cuda::tensor::GpuTensor;
 use vllm_cuda::weights::GpuWeights;
 use vllm_engine::executor::ModelRunnerOutput;
@@ -965,6 +969,15 @@ pub struct CudaWorker {
     /// Compiled vocabulary for grammar-guided decoding (built once from tokenizer).
     #[cfg(feature = "guided-decoding")]
     grammar_vocabulary: Option<outlines_core::vocabulary::Vocabulary>,
+
+    /// LogitsProcessor pipeline: persistent GPU state, rebuilt only on batch changes.
+    logits_pipeline: Option<LogitsProcessorPipeline>,
+    /// Grammar mask processor (separate from pipeline — needs backup logits).
+    grammar_processor: GrammarMaskProcessor,
+    /// True if batch composition changed this step (triggers BatchUpdate).
+    batch_changed: bool,
+    /// Ordered request IDs in the current batch (for pipeline update_state).
+    batch_req_ids: Vec<String>,
 }
 
 unsafe impl Send for CudaWorker {}
@@ -999,6 +1012,10 @@ impl CudaWorker {
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
             grammar_vocabulary: None,
+            logits_pipeline: None,
+            grammar_processor: GrammarMaskProcessor::new(),
+            batch_changed: false,
+            batch_req_ids: Vec::new(),
         }
     }
 
@@ -1161,20 +1178,6 @@ impl CudaWorker {
             )
         }
         .map_err(|e| ExecutorError::WorkerExecution(format!("H2D i64: {e}")))?;
-        Ok(t.into_gpu_tensor())
-    }
-
-    fn h2d_f32(data: &[f32], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
-        let t = device.caching.alloc_tensor(&[data.len()], GpuDType::F32);
-        unsafe {
-            driver::memcpy_htod_async(
-                t.as_gpu_tensor().raw_ptr(),
-                data.as_ptr() as *const u8,
-                data.len() * 4,
-                device.compute_stream,
-            )
-        }
-        .map_err(|e| ExecutorError::WorkerExecution(format!("H2D f32: {e}")))?;
         Ok(t.into_gpu_tensor())
     }
 
@@ -1472,11 +1475,11 @@ impl CudaWorker {
         .map_err(|e| ExecutorError::WorkerExecution(format!("async D2H token ids: {e}")))?;
         Ok(())
     }
-    /// Full GPU sampling pipeline: grammar mask → logit bias → penalties → sample → logprobs.
+    /// Full GPU sampling pipeline: grammar mask → logit processors → sample → logprobs.
     /// No CPU fallback — everything stays on GPU, matching Python vLLM exactly.
     ///
-    /// Takes individual field references to avoid double-borrow of `self` (since
-    /// `device` is already borrowed from `self.device` by the caller).
+    /// Uses the `LogitsProcessorPipeline` for persistent GPU state (logit_bias,
+    /// penalties, min_tokens) and a separate `GrammarMaskProcessor` for grammar.
     #[allow(clippy::too_many_arguments)]
     fn gpu_sample_and_finalize(
         sampling_params_map: &HashMap<String, SamplingParams>,
@@ -1484,6 +1487,8 @@ impl CudaWorker {
             String,
             vllm_models::grammar::GrammarGuide,
         >,
+        grammar_processor: &GrammarMaskProcessor,
+        logits_pipeline: Option<&LogitsProcessorPipeline>,
         host_staging: &Option<HostStaging>,
         input_batch: &mut InputBatch,
         token_buffers: &mut HashMap<String, Vec<u32>>,
@@ -1502,27 +1507,11 @@ impl CudaWorker {
                 .get(&r.req_id)
                 .is_some_and(|p| p.logprobs.is_some())
         });
-        let any_penalties = prepared.req_inputs.iter().any(|r| {
-            sampling_params_map.get(&r.req_id).is_some_and(|p| {
-                p.frequency_penalty != 0.0
-                    || p.presence_penalty != 0.0
-                    || p.repetition_penalty != 1.0
-            })
-        });
-        let any_logit_bias = prepared.req_inputs.iter().any(|r| {
-            sampling_params_map
-                .get(&r.req_id)
-                .is_some_and(|p| p.logit_bias.is_some())
-        });
-        #[cfg(feature = "guided-decoding")]
-        let any_grammar = prepared
-            .req_inputs
-            .iter()
-            .any(|r| grammar_states.contains_key(&r.req_id));
-        #[cfg(not(feature = "guided-decoding"))]
-        let any_grammar = false;
 
-        let needs_f32 = any_penalties || any_logit_bias || any_grammar || any_logprobs;
+        let any_grammar = grammar_processor.is_active();
+
+        let pipeline_active = logits_pipeline.is_some_and(|p| p.any_active());
+        let needs_f32 = pipeline_active || any_grammar || any_logprobs;
 
         if !needs_f32 {
             // Fast path: no modifications needed, use native dtype sampling.
@@ -1702,183 +1691,44 @@ impl CudaWorker {
             None
         };
 
-        // 3. Apply grammar mask on GPU.
-        #[cfg(feature = "guided-decoding")]
-        if any_grammar {
-            // Collect allowed token IDs per grammar request (CSR-packed).
-            let mut allowed_ids_flat: Vec<i32> = Vec::new();
-            let mut allowed_offsets: Vec<i32> = vec![0];
-            let mut req_indices: Vec<i32> = Vec::new();
-
-            for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
-                if let Some(g) = grammar_states.get(&req_slice.req_id)
-                    && let Some(allowed) = g.allowed_tokens()
-                {
-                    req_indices.push(req_idx as i32);
-                    for &tok in &allowed {
-                        allowed_ids_flat.push(tok as i32);
-                    }
-                    allowed_offsets.push(allowed_ids_flat.len() as i32);
-                }
-            }
-
-            if !req_indices.is_empty() {
-                // We need a backup of the logits before masking. If we already
-                // have raw_logits_for_logprobs, reuse it; otherwise make one.
-                // Keep `backup_owned` alive so the GPU memory isn't freed prematurely.
-                let backup_owned = if raw_logits_for_logprobs.is_some() {
-                    None
-                } else {
-                    let bk = device
-                        .caching
-                        .alloc_tensor(&[num_reqs, vocab_size], GpuDType::F32);
-                    unsafe {
-                        driver::memcpy_dtod_async(
-                            bk.as_gpu_tensor().raw_ptr(),
-                            logits_f32.raw_ptr() as *const u8,
-                            num_reqs * vocab_size * 4,
-                            device.compute_stream,
-                        )
-                    }
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("D2D grammar backup: {e}"))
-                    })?;
-                    Some(bk)
-                };
-                let backup = if let Some(ref raw) = raw_logits_for_logprobs {
-                    raw.as_gpu_tensor()
-                } else {
-                    backup_owned.as_ref().unwrap().as_gpu_tensor()
-                };
-
-                let gpu_allowed = Self::h2d_i32(&allowed_ids_flat, device)?;
-                let gpu_offsets = Self::h2d_i32(&allowed_offsets, device)?;
-                let gpu_req_indices = Self::h2d_i32(&req_indices, device)?;
-
+        // 3. Apply grammar mask on GPU (needs backup logits).
+        let _grammar_backup_owned = if any_grammar && grammar_processor.needs_backup() {
+            // Create backup of logits before grammar masking.
+            let backup_owned = if raw_logits_for_logprobs.is_some() {
+                None
+            } else {
+                let bk = device
+                    .caching
+                    .alloc_tensor(&[num_reqs, vocab_size], GpuDType::F32);
                 unsafe {
-                    vllm_cuda::kernels::apply_grammar_mask(
-                        logits_f32,
-                        backup,
-                        gpu_allowed,
-                        gpu_offsets,
-                        gpu_req_indices,
+                    driver::memcpy_dtod_async(
+                        bk.as_gpu_tensor().raw_ptr(),
+                        logits_f32.raw_ptr() as *const u8,
+                        num_reqs * vocab_size * 4,
                         device.compute_stream,
-                    );
-                }
-            }
-        }
-
-        // 4. Apply logit bias on GPU.
-        if any_logit_bias {
-            let mut bias_ids_flat: Vec<i32> = Vec::new();
-            let mut bias_vals_flat: Vec<f32> = Vec::new();
-            let mut bias_offsets: Vec<i32> = vec![];
-
-            for req_slice in &prepared.req_inputs {
-                bias_offsets.push(bias_ids_flat.len() as i32);
-                if let Some(params) = sampling_params_map.get(&req_slice.req_id)
-                    && let Some(ref bias_map) = params.logit_bias
-                {
-                    for (&tok_id, &val) in bias_map {
-                        bias_ids_flat.push(tok_id as i32);
-                        bias_vals_flat.push(val);
-                    }
-                }
-            }
-            bias_offsets.push(bias_ids_flat.len() as i32);
-
-            if !bias_ids_flat.is_empty() {
-                let gpu_bias_ids = Self::h2d_i32(&bias_ids_flat, device)?;
-                let gpu_bias_vals = Self::h2d_f32(&bias_vals_flat, device)?;
-                let gpu_bias_offsets = Self::h2d_i32(&bias_offsets, device)?;
-
-                unsafe {
-                    vllm_cuda::kernels::apply_logit_bias(
-                        logits_f32,
-                        gpu_bias_ids,
-                        gpu_bias_vals,
-                        gpu_bias_offsets,
-                        device.compute_stream,
-                    );
-                }
-            }
-        }
-
-        // 5. Apply penalties on GPU.
-        if any_penalties {
-            // Build padded output_token_ids and prompt_token_ids arrays.
-            let mut max_output_len = 0usize;
-            for req_slice in &prepared.req_inputs {
-                let buf = token_buffers.get(&req_slice.req_id);
-                let params = sampling_params_map.get(&req_slice.req_id);
-                if let Some(buf) = buf
-                    && let Some(p) = params
-                    && (p.frequency_penalty != 0.0
-                        || p.presence_penalty != 0.0
-                        || p.repetition_penalty != 1.0)
-                {
-                    max_output_len = max_output_len.max(buf.len());
-                }
-            }
-            if max_output_len > 0 {
-                let pad_val = vocab_size as i32; // sentinel: never matches any valid token
-                let mut output_ids_flat = vec![pad_val; num_reqs * max_output_len];
-                let mut rep_pens = vec![1.0f32; num_reqs];
-                let mut freq_pens = vec![0.0f32; num_reqs];
-                let mut pres_pens = vec![0.0f32; num_reqs];
-
-                for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
-                    if let Some(params) = sampling_params_map.get(&req_slice.req_id) {
-                        rep_pens[i] = params.repetition_penalty as f32;
-                        freq_pens[i] = params.frequency_penalty as f32;
-                        pres_pens[i] = params.presence_penalty as f32;
-                    }
-                    if let Some(buf) = token_buffers.get(&req_slice.req_id) {
-                        let row = &mut output_ids_flat[i * max_output_len..];
-                        for (j, &tok) in buf.iter().enumerate() {
-                            if j < max_output_len {
-                                row[j] = tok as i32;
-                            }
-                        }
-                    }
-                }
-
-                // H2D all penalty data.
-                let gpu_out_ids = Self::h2d_i32(&output_ids_flat, device)?;
-                // Empty prompt_ids: 0 columns → just need a valid pointer.
-                let dummy_prompt = vec![pad_val; num_reqs]; // 1 column, all padding
-                let gpu_prompt_ids = Self::h2d_i32(&dummy_prompt, device)?;
-                let gpu_rep = Self::h2d_f32(&rep_pens, device)?;
-                let gpu_freq = Self::h2d_f32(&freq_pens, device)?;
-                let gpu_pres = Self::h2d_f32(&pres_pens, device)?;
-
-                // Reshape for kernel.
-                let gpu_out_ids_2d = unsafe {
-                    GpuTensor::new(
-                        gpu_out_ids.raw_ptr(),
-                        &[num_reqs, max_output_len],
-                        GpuDType::U32,
                     )
-                };
-                let gpu_prompt_ids_2d = unsafe {
-                    GpuTensor::new(gpu_prompt_ids.raw_ptr(), &[num_reqs, 1], GpuDType::U32)
-                };
-
-                unsafe {
-                    vllm_cuda::kernels::apply_penalties(
-                        logits_f32,
-                        gpu_out_ids_2d,
-                        gpu_prompt_ids_2d,
-                        gpu_rep,
-                        gpu_freq,
-                        gpu_pres,
-                        device.compute_stream,
-                    );
                 }
-            }
+                .map_err(|e| ExecutorError::WorkerExecution(format!("D2D grammar backup: {e}")))?;
+                Some(bk)
+            };
+            let backup = if let Some(raw) = raw_logits_for_logprobs.as_ref() {
+                raw.as_gpu_tensor()
+            } else {
+                backup_owned.as_ref().unwrap().as_gpu_tensor()
+            };
+
+            grammar_processor.apply_with_backup(logits_f32, backup, device);
+            backup_owned
+        } else {
+            None
+        };
+
+        // 4. Apply logit processors pipeline (min_tokens, logit_bias, penalties).
+        if let Some(pipeline) = logits_pipeline {
+            pipeline.apply_pre_sampling(logits_f32, device);
         }
 
-        // 6. Sample on GPU (from modified f32 logits).
+        // 5. Sample on GPU (from modified f32 logits).
         let mut rng = rand::thread_rng();
         let token_ids_owned = if all_greedy {
             // Argmax on f32 logits.
@@ -2380,6 +2230,15 @@ impl Worker for CudaWorker {
         if let Ok(Some(tok)) = tokenizer_handle.join() {
             self.preloaded_tokenizer = Some(tok);
         }
+
+        // Initialize logits processor pipeline (grammar handled separately).
+        let vocab_size = self.model.as_ref().unwrap().vocab_size();
+        let processors: Vec<Box<dyn vllm_cuda::logits_processor::LogitsProcessor>> = vec![
+            Box::new(MinTokensProcessor::new()),
+            Box::new(LogitBiasProcessor::new()),
+            Box::new(PenaltiesProcessor::new(vocab_size)),
+        ];
+        self.logits_pipeline = Some(LogitsProcessorPipeline::new(processors));
 
         info!(
             "CudaWorker: model loaded in {:.1}s",
@@ -2911,9 +2770,9 @@ impl CudaWorker {
         // - Normal path: resolved below, before prepare_inputs needs it
 
         // Clean up finished requests.
-        if !scheduler_output.finished_req_ids.is_empty()
-            || !scheduler_output.scheduled_new_reqs.is_empty()
-        {
+        self.batch_changed = !scheduler_output.finished_req_ids.is_empty()
+            || !scheduler_output.scheduled_new_reqs.is_empty();
+        if self.batch_changed {
             // Batch composition changed — can't reuse persistent input_ids or metadata.
             self.last_graph_batch_size = None;
             self.graph_metadata_valid = false;
@@ -3170,6 +3029,59 @@ impl CudaWorker {
         };
         let num_reqs = prepared.req_inputs.len();
         let total_tokens = prepared.flat_token_ids.len();
+
+        // Build batch_req_ids and update logits processor pipeline.
+        self.batch_req_ids.clear();
+        self.batch_req_ids
+            .extend(prepared.req_inputs.iter().map(|r| r.req_id.clone()));
+        {
+            let batch_update = if self.batch_changed {
+                Some(BatchUpdate {
+                    batch_size: num_reqs,
+                    added: Vec::new(),
+                    removed: Vec::new(),
+                })
+            } else {
+                None
+            };
+
+            if let Some(ref mut pipeline) = self.logits_pipeline {
+                pipeline.update_state(
+                    batch_update.as_ref(),
+                    &self.sampling_params_map,
+                    &self.token_buffers,
+                    &self.batch_req_ids,
+                    device,
+                );
+            }
+
+            #[cfg(feature = "guided-decoding")]
+            {
+                let grammar_reqs: Vec<(usize, Vec<u32>)> = self
+                    .batch_req_ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, rid)| {
+                        self.grammar_states
+                            .get(rid)
+                            .and_then(|g| g.allowed_tokens())
+                            .map(|allowed| (idx, allowed))
+                    })
+                    .collect();
+                let refs: Vec<(usize, &[u32])> = grammar_reqs
+                    .iter()
+                    .map(|(idx, v)| (*idx, v.as_slice()))
+                    .collect();
+                self.grammar_processor
+                    .update_from_allowed_tokens(&refs, device);
+            }
+            #[cfg(not(feature = "guided-decoding"))]
+            {
+                let empty: Vec<(usize, &[u32])> = Vec::new();
+                self.grammar_processor
+                    .update_from_allowed_tokens(&empty, device);
+            }
+        }
 
         // --- Pooling mode: run backbone, pool, return embeddings ---
         if self.is_pooling {
@@ -3511,6 +3423,8 @@ impl CudaWorker {
                 &self.sampling_params_map,
                 #[cfg(feature = "guided-decoding")]
                 &mut self.grammar_states,
+                &self.grammar_processor,
+                self.logits_pipeline.as_ref(),
                 &self.host_staging,
                 &mut self.input_batch,
                 &mut self.token_buffers,
@@ -3522,23 +3436,17 @@ impl CudaWorker {
             );
         }
 
-        // Check if any request needs logprobs or grammar (these require the full
-        // GPU sampling pipeline instead of in-graph argmax).
+        // Check if any request needs logprobs, grammar, or logit processors
+        // (these require the full GPU sampling pipeline instead of in-graph argmax).
         let any_needs_full_sampling = prepared.req_inputs.iter().any(|r| {
             self.sampling_params_map
                 .get(&r.req_id)
                 .is_some_and(|p| p.logprobs.is_some())
-                || {
-                    #[cfg(feature = "guided-decoding")]
-                    {
-                        self.grammar_states.contains_key(&r.req_id)
-                    }
-                    #[cfg(not(feature = "guided-decoding"))]
-                    {
-                        false
-                    }
-                }
-        });
+        }) || self
+            .logits_pipeline
+            .as_ref()
+            .is_some_and(|p| p.any_active())
+            || self.grammar_processor.is_active();
 
         if use_graph && all_greedy && !any_needs_full_sampling {
             // Fast path: CUDA graph with in-graph argmax. No separate sampling
@@ -4050,6 +3958,8 @@ impl CudaWorker {
             &self.sampling_params_map,
             #[cfg(feature = "guided-decoding")]
             &mut self.grammar_states,
+            &self.grammar_processor,
+            self.logits_pipeline.as_ref(),
             &self.host_staging,
             &mut self.input_batch,
             &mut self.token_buffers,

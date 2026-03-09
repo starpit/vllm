@@ -1105,4 +1105,41 @@ void log_softmax_topk(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Min-tokens kernel: suppress stop tokens for requests below min_tokens
+// ---------------------------------------------------------------------------
+// One thread per (request, stop_token) pair. Sets logits[req_idx][token_id] = -inf.
+
+__global__ void apply_min_tokens_kernel(
+    float* __restrict__ logits,
+    const int* __restrict__ req_indices,
+    const int* __restrict__ token_ids,
+    int count,
+    int vocab_size)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    int req_idx = req_indices[idx];
+    int tok_id = token_ids[idx];
+    if (tok_id >= 0 && tok_id < vocab_size) {
+        logits[req_idx * vocab_size + tok_id] = -INFINITY;
+    }
+}
+
+void apply_min_tokens_inplace(
+    float* logits,
+    const int* req_indices,
+    const int* token_ids,
+    int count,
+    int vocab_size,
+    cudaStream_t stream)
+{
+    if (count > 0) {
+        int threads = 256;
+        int blocks = (count + threads - 1) / threads;
+        apply_min_tokens_kernel<<<blocks, threads, 0, stream>>>(
+            logits, req_indices, token_ids, count, vocab_size);
+    }
+}
+
 }  // extern "C" (new kernels)

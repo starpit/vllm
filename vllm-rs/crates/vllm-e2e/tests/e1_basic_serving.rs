@@ -2112,3 +2112,112 @@ async fn test_cuda_grammar_json_object() {
         "response_format json_object should produce valid JSON, got: {text:?}"
     );
 }
+
+// ===========================================================================
+// LogitsProcessor tests: min_tokens, logit_bias, penalties
+// ===========================================================================
+
+/// Test min_tokens: with min_tokens=10, output must be at least 10 tokens.
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_min_tokens_completion() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = CompletionRequest {
+        prompt: Some(CompletionPrompt::Single("Hello".to_string())),
+        max_tokens: Some(50),
+        min_tokens: 10,
+        temperature: Some(0.0),
+        ..default_completion_request()
+    };
+
+    let resp = client.completion(&request).await.unwrap();
+    assert_valid_completion_response(&resp);
+
+    let text = &resp.choices[0].text;
+    // Rough check: 10 tokens should produce at least ~15 chars of output.
+    // The exact token count isn't available via the API, but usage.completion_tokens is.
+    let completion_tokens = resp.usage.completion_tokens.unwrap_or(0);
+    assert!(
+        completion_tokens >= 10,
+        "min_tokens=10 should produce at least 10 completion tokens, got {completion_tokens}. text: {text:?}"
+    );
+}
+
+/// Test logit_bias: boost a specific token to force it into output.
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_logit_bias_completion() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Token 220 in Qwen2 tokenizer is typically a common token.
+    // Strongly bias it (+100) so it dominates output.
+    let mut bias = std::collections::HashMap::new();
+    bias.insert("220".to_string(), 100.0);
+
+    let request = CompletionRequest {
+        prompt: Some(CompletionPrompt::Single("Test".to_string())),
+        max_tokens: Some(5),
+        temperature: Some(0.0),
+        logit_bias: Some(bias),
+        ..default_completion_request()
+    };
+
+    let resp = client.completion(&request).await.unwrap();
+    assert_valid_completion_response(&resp);
+
+    // The biased token should dominate. At minimum, we should get non-empty output.
+    let text = &resp.choices[0].text;
+    assert!(
+        !text.is_empty(),
+        "logit_bias completion should produce output"
+    );
+    // With +100 bias on token 220, it should dominate output.
+    // We just verify non-empty output and no crash — the exact content depends on tokenizer.
+    assert!(
+        text.len() >= 2,
+        "logit_bias +100 should produce at least a couple characters, got {text:?}"
+    );
+}
+
+/// Test penalties: repetition_penalty suppresses repeated tokens.
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_penalties_completion() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // High repetition penalty should reduce repetition.
+    let request = CompletionRequest {
+        prompt: Some(CompletionPrompt::Single("The".to_string())),
+        max_tokens: Some(30),
+        temperature: Some(0.5),
+        repetition_penalty: Some(2.0),
+        seed: Some(42),
+        ..default_completion_request()
+    };
+
+    let resp = client.completion(&request).await.unwrap();
+    assert_valid_completion_response(&resp);
+    let text = &resp.choices[0].text;
+    assert!(
+        !text.is_empty(),
+        "penalties completion should produce output"
+    );
+}

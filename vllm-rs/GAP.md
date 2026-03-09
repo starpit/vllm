@@ -2,7 +2,7 @@
 
   1. Model Architectures
 
-  CudaWorker has 6 (LLaMA, Mistral, Qwen2, Qwen3, Phi-3, Gemma2) vs CandleWorker has 15+:
+  CudaWorker has 7 (LLaMA, Mistral, Qwen2, Qwen3, Phi-3, Gemma2, Gemma3) vs CandleWorker has 15+:
 
   ┌──────────────────────────┬──────────────┬────────────┬────────────────────────────────────┐
   │       Architecture       │ CandleWorker │ CudaWorker │               Notes                │
@@ -19,7 +19,7 @@
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
   │ Gemma2                   │ yes          │ yes        │                                    │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
-  │ Gemma3 (text)            │ yes          │ no         │                                    │
+  │ Gemma3 (text)            │ yes          │ yes        │ CUDA graphs supported               │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
   │ DeepSeek V2/V3 (MLA+MoE) │ yes          │ no         │ Complex: MLA attention, MoE gating │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
@@ -117,7 +117,7 @@
   4. MoE kernel + models: Fused MoE GEMM, then port Mixtral/Qwen MoE/Qwen3 MoE
   5. DeepSeek V2/V3 (MLA): Most complex arch — absorbed-MLA attention, MoE
   6. Tensor parallelism: Parallel layers, NCCL, multi-GPU init
-  7. Remaining dense archs: Gemma3, Command R, Granite, Qwen3-Next
+  7. Remaining dense archs: Command R, Qwen3-Next
   8. LoRA, speculative decoding: Feature parity on worker traits (embeddings done)
   9. Multimodal: Vision encoders (Gemma3-MM, Qwen2-VL)
 

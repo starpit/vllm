@@ -71,6 +71,7 @@ enum CudaModel {
     Llama(vllm_cuda::model::llama::LlamaForCausalLM),
     Qwen2(vllm_cuda::model::qwen2::Qwen2ForCausalLM),
     Gemma2(vllm_cuda::model::gemma2::Gemma2ForCausalLM),
+    Gemma3(vllm_cuda::model::gemma3::Gemma3ForCausalLM),
 }
 
 impl CudaModel {
@@ -79,6 +80,7 @@ impl CudaModel {
             Self::Llama(m) => m.model.layers.len(),
             Self::Qwen2(m) => m.0.model.layers.len(),
             Self::Gemma2(m) => m.model.layers.len(),
+            Self::Gemma3(m) => m.model.layers.len(),
         }
     }
 
@@ -87,6 +89,7 @@ impl CudaModel {
             Self::Llama(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.num_kv_heads,
             Self::Gemma2(m) => m.model.layers[0].self_attn.num_kv_heads,
+            Self::Gemma3(m) => m.model.layers[0].self_attn.num_kv_heads,
         }
     }
 
@@ -95,6 +98,7 @@ impl CudaModel {
             Self::Llama(m) => m.model.layers[0].self_attn.head_dim,
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.head_dim,
             Self::Gemma2(m) => m.model.layers[0].self_attn.head_dim,
+            Self::Gemma3(m) => m.model.layers[0].self_attn.head_dim,
         }
     }
 
@@ -103,6 +107,7 @@ impl CudaModel {
             Self::Llama(m) => m.lm_head.out_features(),
             Self::Qwen2(m) => m.0.lm_head.out_features(),
             Self::Gemma2(m) => m.lm_head.out_features(),
+            Self::Gemma3(m) => m.lm_head.out_features(),
         }
     }
 
@@ -111,6 +116,7 @@ impl CudaModel {
             Self::Llama(m) => m.lm_head.in_features(),
             Self::Qwen2(m) => m.0.lm_head.in_features(),
             Self::Gemma2(m) => m.lm_head.in_features(),
+            Self::Gemma3(m) => m.lm_head.in_features(),
         }
     }
 
@@ -163,7 +169,21 @@ impl CudaModel {
                 )
             },
             Self::Gemma2(m) => unsafe {
-                m.model.forward(
+                m.model.forward_owned(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                )
+            },
+            Self::Gemma3(m) => unsafe {
+                m.model.forward_owned(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -230,7 +250,22 @@ impl CudaModel {
                 )
             },
             Self::Gemma2(m) => unsafe {
-                m.forward(
+                m.forward_owned(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            Self::Gemma3(m) => unsafe {
+                m.forward_owned(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -248,7 +283,6 @@ impl CudaModel {
     }
 
     /// Forward using caching allocator (zero D2D copies between layers).
-    /// Falls back to arena-based `forward()` for Gemma2 (not yet ported).
     #[allow(clippy::too_many_arguments)]
     unsafe fn forward_owned(
         &self,
@@ -296,7 +330,22 @@ impl CudaModel {
                 )
             },
             Self::Gemma2(m) => unsafe {
-                m.forward(
+                m.forward_owned(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            Self::Gemma3(m) => unsafe {
+                m.forward_owned(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -432,6 +481,71 @@ fn gemma2_config_from_hf(
         tie_word_embeddings: hf.tie_word_embeddings.unwrap_or(true),
         layer_is_sliding,
         sliding_window,
+    })
+}
+
+fn gemma3_config_from_hf(
+    hf: &HfModelConfig,
+) -> ExecutorResult<vllm_cuda::model::gemma3::Gemma3Config> {
+    let hidden_size = hf
+        .hidden_size
+        .ok_or_else(|| ExecutorError::WorkerInit("missing hidden_size".into()))?;
+    let num_attention_heads = hf
+        .num_attention_heads
+        .ok_or_else(|| ExecutorError::WorkerInit("missing num_attention_heads".into()))?;
+    let num_kv_heads = hf.num_key_value_heads.unwrap_or(num_attention_heads);
+    let num_hidden_layers = hf.num_hidden_layers.unwrap_or(26);
+    let head_dim = hf.head_dim.unwrap_or(hidden_size / num_attention_heads);
+
+    let query_pre_attn_scalar = hf
+        .extra
+        .get("query_pre_attn_scalar")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(head_dim as f64);
+    let sliding_window = hf
+        .extra
+        .get("sliding_window")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let sliding_window_pattern = hf
+        .extra
+        .get("sliding_window_pattern")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(6) as usize;
+    let rope_local_base_freq = hf
+        .extra
+        .get("rope_local_base_freq")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10000.0);
+    let attention_bias = hf
+        .extra
+        .get("attention_bias")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Gemma3: every Nth layer is global, rest are sliding.
+    // Python: layer_types[i] == "sliding_attention" when (i+1) % sliding_window_pattern != 0
+    let layer_is_sliding: Vec<bool> = (0..num_hidden_layers)
+        .map(|i| (i + 1) % sliding_window_pattern != 0)
+        .collect();
+
+    Ok(vllm_cuda::model::gemma3::Gemma3Config {
+        hidden_size,
+        num_attention_heads,
+        num_kv_heads,
+        num_hidden_layers,
+        intermediate_size: hf.intermediate_size.unwrap_or(hidden_size * 4),
+        vocab_size: hf.vocab_size.unwrap_or(262144),
+        max_position_embeddings: hf.max_position_embeddings.unwrap_or(131072),
+        rms_norm_eps: hf.rms_norm_eps.unwrap_or(1e-6) as f32,
+        rope_theta: hf.rope_theta.unwrap_or(1_000_000.0),
+        rope_local_base_freq,
+        head_dim,
+        query_pre_attn_scalar,
+        tie_word_embeddings: hf.tie_word_embeddings.unwrap_or(true),
+        layer_is_sliding,
+        sliding_window,
+        attention_bias,
     })
 }
 
@@ -1105,6 +1219,17 @@ impl Worker for CudaWorker {
                 .map_err(|e| ExecutorError::WorkerInit(format!("Gemma2 load: {e}")))?;
                 CudaModel::Gemma2(m)
             }
+            "Gemma3ForCausalLM" => {
+                let config = gemma3_config_from_hf(&hf_config)?;
+                let m = vllm_cuda::model::gemma3::Gemma3ForCausalLM::load(
+                    &mut weights,
+                    &config,
+                    dtype,
+                    device,
+                )
+                .map_err(|e| ExecutorError::WorkerInit(format!("Gemma3 load: {e}")))?;
+                CudaModel::Gemma3(m)
+            }
             "GraniteForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
                 let mut m = vllm_cuda::model::llama::LlamaForCausalLM::load(
@@ -1154,7 +1279,8 @@ impl Worker for CudaWorker {
                 return Err(ExecutorError::WorkerInit(format!(
                     "unsupported architecture for cuda-backend: {arch}. \
                      Supported: LlamaForCausalLM, MistralForCausalLM, Qwen3ForCausalLM, \
-                     Phi3ForCausalLM, Qwen2ForCausalLM, Gemma2ForCausalLM, GraniteForCausalLM"
+                     Phi3ForCausalLM, Qwen2ForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM, \
+                     GraniteForCausalLM"
                 )));
             }
         };

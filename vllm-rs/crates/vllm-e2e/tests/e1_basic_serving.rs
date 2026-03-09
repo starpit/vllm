@@ -947,6 +947,122 @@ async fn test_cuda_qwen3_chat() {
 }
 
 // ===========================================================================
+// CUDA Gemma2 E2E tests — safetensors BF16 on GPU (vllm-cuda backend)
+// ===========================================================================
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gemma2 -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gemma2_server_starts() {
+    let server = TestServer::builder(TestModels::GEMMA2_2B_IT_CUDA)
+        .start()
+        .await
+        .expect("CUDA Gemma2 2B server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let models = client.list_models().await.unwrap();
+    assert_eq!(models.data.len(), 1);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gemma2_completion() {
+    let server = TestServer::builder(TestModels::GEMMA2_2B_IT_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    let text = &resp.choices[0].text;
+    assert!(!text.is_empty(), "completion should not be empty");
+    assert_coherent_text(text, 1);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gemma2_chat() {
+    let server = TestServer::builder(TestModels::GEMMA2_2B_IT_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text, 2);
+}
+
+// ===========================================================================
+// CUDA Gemma3 E2E tests — safetensors BF16 on GPU (vllm-cuda backend)
+// ===========================================================================
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gemma3 -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gemma3_server_starts() {
+    let server = TestServer::builder(TestModels::GEMMA3_1B_IT_CUDA)
+        .start()
+        .await
+        .expect("CUDA Gemma3 1B server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let models = client.list_models().await.unwrap();
+    assert_eq!(models.data.len(), 1);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gemma3_completion() {
+    let server = TestServer::builder(TestModels::GEMMA3_1B_IT_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    let text = &resp.choices[0].text;
+    assert!(!text.is_empty(), "completion should not be empty");
+    assert_coherent_text(text, 1);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gemma3_chat() {
+    let server = TestServer::builder(TestModels::GEMMA3_1B_IT_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text, 2);
+}
+
+// ===========================================================================
 // CUDA GGUF E2E tests — quantized GGUF models on GPU
 // ===========================================================================
 // TODO: Re-enable when vllm-cuda backend supports GGUF quantized models.

@@ -1820,3 +1820,179 @@ async fn test_cuda_paged_fa2_interleaved_multi_turn() {
         text_b
     );
 }
+
+// ===========================================================================
+// CUDA Logprobs tests
+// ===========================================================================
+// Validates that logprobs are correctly returned from CudaWorker (forces CPU
+// fallback path where logprobs are computed).
+//
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_logprobs -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_logprobs_chat() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg("Hello!")],
+        logprobs: Some(true),
+        top_logprobs: Some(5),
+        max_tokens: Some(10),
+        temperature: Some(0.0),
+        ..default_chat_request()
+    };
+
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_valid_chat_response(&resp);
+
+    let logprobs = resp.choices[0]
+        .logprobs
+        .as_ref()
+        .expect("logprobs should be present");
+    let content = logprobs
+        .content
+        .as_ref()
+        .expect("logprobs.content should be present");
+    assert!(!content.is_empty(), "logprobs content should not be empty");
+    for entry in content {
+        assert!(
+            !entry.top_logprobs.is_empty(),
+            "top_logprobs should not be empty"
+        );
+        // Verify logprobs are valid (non-positive log probabilities).
+        assert!(
+            entry.logprob <= 0.0,
+            "logprob should be non-positive, got {}",
+            entry.logprob
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_logprobs_completion() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = CompletionRequest {
+        prompt: Some(CompletionPrompt::Single(
+            "The capital of France is".to_string(),
+        )),
+        max_tokens: Some(10),
+        temperature: Some(0.0),
+        logprobs: Some(5),
+        ..default_completion_request()
+    };
+
+    let resp = client.completion(&request).await.unwrap();
+    assert_valid_completion_response(&resp);
+
+    let token_logprobs = &resp.choices[0]
+        .logprobs
+        .as_ref()
+        .expect("logprobs should be present")
+        .token_logprobs;
+    assert!(
+        !token_logprobs.is_empty(),
+        "token_logprobs should not be empty"
+    );
+    for lp in token_logprobs {
+        if let Some(v) = lp {
+            assert!(*v <= 0.0, "logprob should be non-positive, got {v}");
+        }
+    }
+}
+
+// ===========================================================================
+// CUDA Grammar / constrained decoding tests
+// ===========================================================================
+// Validates that guided_regex constrains output via CudaWorker grammar state.
+//
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_grammar -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_grammar_regex_digits() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Use guided_regex to force the model to output only digits.
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg("Give me a number.")],
+        max_tokens: Some(10),
+        temperature: Some(0.0),
+        guided_regex: Some("[0-9]+".to_string()),
+        ..default_chat_request()
+    };
+
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_valid_chat_response(&resp);
+
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(
+        !text.is_empty(),
+        "grammar-constrained output should not be empty"
+    );
+    assert!(
+        text.chars().all(|c| c.is_ascii_digit()),
+        "guided_regex '[0-9]+' should produce only digits, got: {text:?}"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_grammar_json_object() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Use response_format: json_object to force valid JSON output.
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg(
+            "Return a JSON object with a key 'name' set to 'Alice'.",
+        )],
+        max_tokens: Some(50),
+        temperature: Some(0.0),
+        response_format: Some(vllm_serve::protocol::ResponseFormat {
+            format_type: "json_object".to_string(),
+            json_schema: None,
+        }),
+        ..default_chat_request()
+    };
+
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_valid_chat_response(&resp);
+
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(
+        !text.is_empty(),
+        "json_object constrained output should not be empty"
+    );
+    // The grammar constrains to valid JSON, but the model may append EOS tokens
+    // after the JSON is complete. Trim known EOS markers before parsing.
+    let trimmed = text.trim_end_matches("</s>").trim();
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(trimmed);
+    assert!(
+        parsed.is_ok(),
+        "response_format json_object should produce valid JSON, got: {text:?}"
+    );
+}

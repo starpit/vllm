@@ -23,7 +23,6 @@ use vllm_cuda::tensor::GpuTensor;
 use vllm_cuda::weights::GpuWeights;
 use vllm_engine::executor::ModelRunnerOutput;
 use vllm_model::weight::HfModelConfig;
-use vllm_models::Sampler;
 
 use crate::error::{ExecutorError, ExecutorResult};
 use crate::input_batch::{InputBatch, PreparedInputs};
@@ -660,6 +659,13 @@ pub struct CudaWorker {
     pooling_strategy: vllm_models::embedding::PoolingStrategy,
     /// Whether executing in pooling mode (--runner pooling).
     is_pooling: bool,
+
+    /// Per-request grammar guide state for constrained decoding.
+    #[cfg(feature = "guided-decoding")]
+    grammar_states: HashMap<String, vllm_models::grammar::GrammarGuide>,
+    /// Compiled vocabulary for grammar-guided decoding (built once from tokenizer).
+    #[cfg(feature = "guided-decoding")]
+    grammar_vocabulary: Option<outlines_core::vocabulary::Vocabulary>,
 }
 
 unsafe impl Send for CudaWorker {}
@@ -689,6 +695,10 @@ impl CudaWorker {
             ctx_set_on_thread: false,
             pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
             is_pooling,
+            #[cfg(feature = "guided-decoding")]
+            grammar_states: HashMap::new(),
+            #[cfg(feature = "guided-decoding")]
+            grammar_vocabulary: None,
         }
     }
 
@@ -714,6 +724,49 @@ impl CudaWorker {
             GpuDType::BF16 => candle_core::DType::BF16,
             GpuDType::F32 => candle_core::DType::F32,
             _ => candle_core::DType::BF16,
+        }
+    }
+
+    /// Build grammar vocabulary on demand (lazy — deferred from startup).
+    #[cfg(feature = "guided-decoding")]
+    fn ensure_grammar_vocabulary(&mut self) {
+        if self.grammar_vocabulary.is_some() {
+            return;
+        }
+        let Some(model_dir) = &self.model_dir else {
+            return;
+        };
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        if !tokenizer_path.exists() {
+            info!("CudaWorker: no tokenizer.json found, grammar-guided decoding unavailable");
+            return;
+        }
+        let tokenizer = match tokenizers::Tokenizer::from_file(&tokenizer_path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(
+                    "CudaWorker: failed to load tokenizer.json for grammar vocabulary: {e}"
+                );
+                return;
+            }
+        };
+
+        let hf_vocab = tokenizer.get_vocab(true);
+        let eos_token_id = tokenizer.token_to_id("</s>").unwrap_or(0);
+        let tokens: Vec<(u32, String)> = hf_vocab.into_iter().map(|(s, id)| (id, s)).collect();
+
+        match vllm_models::grammar::build_vocabulary(&tokens, eos_token_id) {
+            Ok(vocab) => {
+                info!(
+                    "CudaWorker: grammar vocabulary built ({} tokens, eos={})",
+                    vocab.len(),
+                    eos_token_id
+                );
+                self.grammar_vocabulary = Some(vocab);
+            }
+            Err(e) => {
+                tracing::warn!("CudaWorker: failed to build grammar vocabulary: {e}");
+            }
         }
     }
 
@@ -808,6 +861,20 @@ impl CudaWorker {
             )
         }
         .map_err(|e| ExecutorError::WorkerExecution(format!("H2D i64: {e}")))?;
+        Ok(t.into_gpu_tensor())
+    }
+
+    fn h2d_f32(data: &[f32], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
+        let t = device.caching.alloc_tensor(&[data.len()], GpuDType::F32);
+        unsafe {
+            driver::memcpy_htod_async(
+                t.as_gpu_tensor().raw_ptr(),
+                data.as_ptr() as *const u8,
+                data.len() * 4,
+                device.compute_stream,
+            )
+        }
+        .map_err(|e| ExecutorError::WorkerExecution(format!("H2D f32: {e}")))?;
         Ok(t.into_gpu_tensor())
     }
 
@@ -1084,6 +1151,638 @@ impl CudaWorker {
             Ok(ids)
         }
     }
+    /// Full GPU sampling pipeline: grammar mask → logit bias → penalties → sample → logprobs.
+    /// No CPU fallback — everything stays on GPU, matching Python vLLM exactly.
+    ///
+    /// Takes individual field references to avoid double-borrow of `self` (since
+    /// `device` is already borrowed from `self.device` by the caller).
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_sample_and_finalize(
+        sampling_params_map: &HashMap<String, SamplingParams>,
+        #[cfg(feature = "guided-decoding")] grammar_states: &mut HashMap<
+            String,
+            vllm_models::grammar::GrammarGuide,
+        >,
+        host_staging: &Option<HostStaging>,
+        input_batch: &mut InputBatch,
+        token_buffers: &mut HashMap<String, Vec<u32>>,
+        logits: GpuTensor,
+        prepared: PreparedInputs,
+        device: &mut GpuDevice,
+        all_greedy: bool,
+        vocab_size: usize,
+    ) -> ExecutorResult<ModelRunnerOutput> {
+        use rand::Rng;
+        let num_reqs = prepared.req_inputs.len();
+
+        // Determine which features are needed.
+        let any_logprobs = prepared.req_inputs.iter().any(|r| {
+            sampling_params_map
+                .get(&r.req_id)
+                .is_some_and(|p| p.logprobs.is_some())
+        });
+        let any_penalties = prepared.req_inputs.iter().any(|r| {
+            sampling_params_map.get(&r.req_id).is_some_and(|p| {
+                p.frequency_penalty != 0.0
+                    || p.presence_penalty != 0.0
+                    || p.repetition_penalty != 1.0
+            })
+        });
+        let any_logit_bias = prepared.req_inputs.iter().any(|r| {
+            sampling_params_map
+                .get(&r.req_id)
+                .is_some_and(|p| p.logit_bias.is_some())
+        });
+        #[cfg(feature = "guided-decoding")]
+        let any_grammar = prepared
+            .req_inputs
+            .iter()
+            .any(|r| grammar_states.contains_key(&r.req_id));
+        #[cfg(not(feature = "guided-decoding"))]
+        let any_grammar = false;
+
+        let needs_f32 = any_penalties || any_logit_bias || any_grammar || any_logprobs;
+
+        if !needs_f32 {
+            // Fast path: no modifications needed, use native dtype sampling.
+            if all_greedy {
+                let token_ids_owned = unsafe {
+                    vllm_cuda::kernels::argmax_batched(
+                        logits,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                };
+                let token_ids_gpu = token_ids_owned.as_gpu_tensor();
+                return Self::finalize_d2h_and_commit(
+                    &token_ids_gpu,
+                    num_reqs,
+                    prepared,
+                    device,
+                    host_staging,
+                    input_batch,
+                    token_buffers,
+                );
+            }
+
+            // Non-greedy fast path: Gumbel or full sampling on native dtype.
+            let mut rng = rand::thread_rng();
+            let all_no_filter = prepared.req_inputs.iter().all(|r| {
+                sampling_params_map
+                    .get(&r.req_id)
+                    .is_none_or(|p| p.top_k <= 0 && p.top_p >= 1.0 && p.min_p <= 0.0)
+            });
+
+            let token_ids_owned = if all_no_filter {
+                let stride = num_reqs * 4;
+                let total_bytes = stride * 2;
+                let packed_ptr = Self::get_sampling_packed_ptr_s(host_staging, total_bytes);
+                let temps_ptr = packed_ptr as *mut f32;
+                let randoms_ptr = unsafe { packed_ptr.add(stride) as *mut f32 };
+                for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
+                    let params = sampling_params_map.get(&req_slice.req_id);
+                    let t = params.map_or(1.0f32, |p| p.temperature.max(1e-7) as f32);
+                    unsafe {
+                        *temps_ptr.add(i) = t;
+                        *randoms_ptr.add(i) = rng.r#gen::<f32>();
+                    }
+                }
+                let gpu_packed_owned = device
+                    .caching
+                    .alloc_tensor(&[total_bytes / 4], GpuDType::F32);
+                let gpu_packed = gpu_packed_owned.as_gpu_tensor();
+                unsafe {
+                    driver::memcpy_htod_async(
+                        gpu_packed.raw_ptr(),
+                        packed_ptr,
+                        total_bytes,
+                        device.compute_stream,
+                    )
+                }
+                .map_err(|e| ExecutorError::WorkerExecution(format!("H2D sampling: {e}")))?;
+                let base = gpu_packed.raw_ptr();
+                let gpu_temps = unsafe { GpuTensor::new(base, &[num_reqs], GpuDType::F32) };
+                let gpu_randoms =
+                    unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::F32) };
+                unsafe {
+                    vllm_cuda::kernels::sample_gumbel_batched(
+                        logits,
+                        gpu_temps,
+                        gpu_randoms,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                }
+            } else {
+                let stride = num_reqs * 4;
+                let total_bytes = stride * 5;
+                let packed_ptr = Self::get_sampling_packed_ptr_s(host_staging, total_bytes);
+                let temps_ptr = packed_ptr as *mut f32;
+                let top_ks_ptr = unsafe { packed_ptr.add(stride) as *mut i32 };
+                let top_ps_ptr = unsafe { packed_ptr.add(stride * 2) as *mut f32 };
+                let min_ps_ptr = unsafe { packed_ptr.add(stride * 3) as *mut f32 };
+                let randoms_ptr = unsafe { packed_ptr.add(stride * 4) as *mut f32 };
+                for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
+                    let params = sampling_params_map.get(&req_slice.req_id);
+                    let (t, k, p, mp) = params.map_or((1.0f32, 0i32, 1.0f32, 0.0f32), |p| {
+                        (
+                            p.temperature.max(1e-7) as f32,
+                            p.top_k,
+                            p.top_p as f32,
+                            p.min_p as f32,
+                        )
+                    });
+                    unsafe {
+                        *temps_ptr.add(i) = t;
+                        *top_ks_ptr.add(i) = k;
+                        *top_ps_ptr.add(i) = p;
+                        *min_ps_ptr.add(i) = mp;
+                        *randoms_ptr.add(i) = rng.r#gen::<f32>();
+                    }
+                }
+                let gpu_packed_owned = device
+                    .caching
+                    .alloc_tensor(&[total_bytes / 4], GpuDType::F32);
+                let gpu_packed = gpu_packed_owned.as_gpu_tensor();
+                unsafe {
+                    driver::memcpy_htod_async(
+                        gpu_packed.raw_ptr(),
+                        packed_ptr,
+                        total_bytes,
+                        device.compute_stream,
+                    )
+                }
+                .map_err(|e| ExecutorError::WorkerExecution(format!("H2D sampling: {e}")))?;
+                let base = gpu_packed.raw_ptr();
+                let gpu_temps = unsafe { GpuTensor::new(base, &[num_reqs], GpuDType::F32) };
+                let gpu_top_ks =
+                    unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::U32) };
+                let gpu_top_ps =
+                    unsafe { GpuTensor::new(base.add(stride * 2), &[num_reqs], GpuDType::F32) };
+                let gpu_min_ps =
+                    unsafe { GpuTensor::new(base.add(stride * 3), &[num_reqs], GpuDType::F32) };
+                let gpu_randoms =
+                    unsafe { GpuTensor::new(base.add(stride * 4), &[num_reqs], GpuDType::F32) };
+                unsafe {
+                    vllm_cuda::kernels::sample_batched(
+                        logits,
+                        gpu_temps,
+                        gpu_top_ks,
+                        gpu_top_ps,
+                        gpu_min_ps,
+                        gpu_randoms,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                }
+            };
+            let token_ids_gpu = token_ids_owned.as_gpu_tensor();
+            return Self::finalize_d2h_and_commit(
+                &token_ids_gpu,
+                num_reqs,
+                prepared,
+                device,
+                host_staging,
+                input_batch,
+                token_buffers,
+            );
+        }
+
+        // ---- Slow(er) path: cast to f32, apply modifications, sample on GPU ----
+
+        // 1. Cast logits to f32.
+        let logits_f32_owned = unsafe {
+            vllm_cuda::kernels::cast_logits_to_f32(
+                logits,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+        let logits_f32 = logits_f32_owned.as_gpu_tensor();
+
+        // 2. Save raw logits for logprobs (GPU copy, before modifications).
+        let raw_logits_for_logprobs = if any_logprobs {
+            let copy = device
+                .caching
+                .alloc_tensor(&[num_reqs, vocab_size], GpuDType::F32);
+            unsafe {
+                driver::memcpy_dtod_async(
+                    copy.as_gpu_tensor().raw_ptr(),
+                    logits_f32.raw_ptr() as *const u8,
+                    num_reqs * vocab_size * 4,
+                    device.compute_stream,
+                )
+            }
+            .map_err(|e| ExecutorError::WorkerExecution(format!("D2D logits copy: {e}")))?;
+            Some(copy)
+        } else {
+            None
+        };
+
+        // 3. Apply grammar mask on GPU.
+        #[cfg(feature = "guided-decoding")]
+        if any_grammar {
+            // Collect allowed token IDs per grammar request (CSR-packed).
+            let mut allowed_ids_flat: Vec<i32> = Vec::new();
+            let mut allowed_offsets: Vec<i32> = vec![0];
+            let mut req_indices: Vec<i32> = Vec::new();
+
+            for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+                if let Some(g) = grammar_states.get(&req_slice.req_id)
+                    && let Some(allowed) = g.allowed_tokens()
+                {
+                    req_indices.push(req_idx as i32);
+                    for &tok in &allowed {
+                        allowed_ids_flat.push(tok as i32);
+                    }
+                    allowed_offsets.push(allowed_ids_flat.len() as i32);
+                }
+            }
+
+            if !req_indices.is_empty() {
+                // We need a backup of the logits before masking. If we already
+                // have raw_logits_for_logprobs, reuse it; otherwise make one.
+                // Keep `backup_owned` alive so the GPU memory isn't freed prematurely.
+                let backup_owned = if raw_logits_for_logprobs.is_some() {
+                    None
+                } else {
+                    let bk = device
+                        .caching
+                        .alloc_tensor(&[num_reqs, vocab_size], GpuDType::F32);
+                    unsafe {
+                        driver::memcpy_dtod_async(
+                            bk.as_gpu_tensor().raw_ptr(),
+                            logits_f32.raw_ptr() as *const u8,
+                            num_reqs * vocab_size * 4,
+                            device.compute_stream,
+                        )
+                    }
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("D2D grammar backup: {e}"))
+                    })?;
+                    Some(bk)
+                };
+                let backup = if let Some(ref raw) = raw_logits_for_logprobs {
+                    raw.as_gpu_tensor()
+                } else {
+                    backup_owned.as_ref().unwrap().as_gpu_tensor()
+                };
+
+                let gpu_allowed = Self::h2d_i32(&allowed_ids_flat, device)?;
+                let gpu_offsets = Self::h2d_i32(&allowed_offsets, device)?;
+                let gpu_req_indices = Self::h2d_i32(&req_indices, device)?;
+
+                unsafe {
+                    vllm_cuda::kernels::apply_grammar_mask(
+                        logits_f32,
+                        backup,
+                        gpu_allowed,
+                        gpu_offsets,
+                        gpu_req_indices,
+                        device.compute_stream,
+                    );
+                }
+            }
+        }
+
+        // 4. Apply logit bias on GPU.
+        if any_logit_bias {
+            let mut bias_ids_flat: Vec<i32> = Vec::new();
+            let mut bias_vals_flat: Vec<f32> = Vec::new();
+            let mut bias_offsets: Vec<i32> = vec![];
+
+            for req_slice in &prepared.req_inputs {
+                bias_offsets.push(bias_ids_flat.len() as i32);
+                if let Some(params) = sampling_params_map.get(&req_slice.req_id)
+                    && let Some(ref bias_map) = params.logit_bias
+                {
+                    for (&tok_id, &val) in bias_map {
+                        bias_ids_flat.push(tok_id as i32);
+                        bias_vals_flat.push(val);
+                    }
+                }
+            }
+            bias_offsets.push(bias_ids_flat.len() as i32);
+
+            if !bias_ids_flat.is_empty() {
+                let gpu_bias_ids = Self::h2d_i32(&bias_ids_flat, device)?;
+                let gpu_bias_vals = Self::h2d_f32(&bias_vals_flat, device)?;
+                let gpu_bias_offsets = Self::h2d_i32(&bias_offsets, device)?;
+
+                unsafe {
+                    vllm_cuda::kernels::apply_logit_bias(
+                        logits_f32,
+                        gpu_bias_ids,
+                        gpu_bias_vals,
+                        gpu_bias_offsets,
+                        device.compute_stream,
+                    );
+                }
+            }
+        }
+
+        // 5. Apply penalties on GPU.
+        if any_penalties {
+            // Build padded output_token_ids and prompt_token_ids arrays.
+            let mut max_output_len = 0usize;
+            for req_slice in &prepared.req_inputs {
+                let buf = token_buffers.get(&req_slice.req_id);
+                let params = sampling_params_map.get(&req_slice.req_id);
+                if let Some(buf) = buf
+                    && let Some(p) = params
+                    && (p.frequency_penalty != 0.0
+                        || p.presence_penalty != 0.0
+                        || p.repetition_penalty != 1.0)
+                {
+                    max_output_len = max_output_len.max(buf.len());
+                }
+            }
+            if max_output_len > 0 {
+                let pad_val = vocab_size as i32; // sentinel: never matches any valid token
+                let mut output_ids_flat = vec![pad_val; num_reqs * max_output_len];
+                let mut rep_pens = vec![1.0f32; num_reqs];
+                let mut freq_pens = vec![0.0f32; num_reqs];
+                let mut pres_pens = vec![0.0f32; num_reqs];
+
+                for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
+                    if let Some(params) = sampling_params_map.get(&req_slice.req_id) {
+                        rep_pens[i] = params.repetition_penalty as f32;
+                        freq_pens[i] = params.frequency_penalty as f32;
+                        pres_pens[i] = params.presence_penalty as f32;
+                    }
+                    if let Some(buf) = token_buffers.get(&req_slice.req_id) {
+                        let row = &mut output_ids_flat[i * max_output_len..];
+                        for (j, &tok) in buf.iter().enumerate() {
+                            if j < max_output_len {
+                                row[j] = tok as i32;
+                            }
+                        }
+                    }
+                }
+
+                // H2D all penalty data.
+                let gpu_out_ids = Self::h2d_i32(&output_ids_flat, device)?;
+                // Empty prompt_ids: 0 columns → just need a valid pointer.
+                let dummy_prompt = vec![pad_val; num_reqs]; // 1 column, all padding
+                let gpu_prompt_ids = Self::h2d_i32(&dummy_prompt, device)?;
+                let gpu_rep = Self::h2d_f32(&rep_pens, device)?;
+                let gpu_freq = Self::h2d_f32(&freq_pens, device)?;
+                let gpu_pres = Self::h2d_f32(&pres_pens, device)?;
+
+                // Reshape for kernel.
+                let gpu_out_ids_2d = unsafe {
+                    GpuTensor::new(
+                        gpu_out_ids.raw_ptr(),
+                        &[num_reqs, max_output_len],
+                        GpuDType::U32,
+                    )
+                };
+                let gpu_prompt_ids_2d = unsafe {
+                    GpuTensor::new(gpu_prompt_ids.raw_ptr(), &[num_reqs, 1], GpuDType::U32)
+                };
+
+                unsafe {
+                    vllm_cuda::kernels::apply_penalties(
+                        logits_f32,
+                        gpu_out_ids_2d,
+                        gpu_prompt_ids_2d,
+                        gpu_rep,
+                        gpu_freq,
+                        gpu_pres,
+                        device.compute_stream,
+                    );
+                }
+            }
+        }
+
+        // 6. Sample on GPU (from modified f32 logits).
+        let mut rng = rand::thread_rng();
+        let token_ids_owned = if all_greedy {
+            // Argmax on f32 logits.
+            unsafe {
+                vllm_cuda::kernels::argmax_batched(
+                    logits_f32,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            }
+        } else {
+            // Full sampling on f32 logits.
+            let stride = num_reqs * 4;
+            let total_bytes = stride * 5;
+            let packed_ptr = Self::get_sampling_packed_ptr_s(host_staging, total_bytes);
+            let temps_ptr = packed_ptr as *mut f32;
+            let top_ks_ptr = unsafe { packed_ptr.add(stride) as *mut i32 };
+            let top_ps_ptr = unsafe { packed_ptr.add(stride * 2) as *mut f32 };
+            let min_ps_ptr = unsafe { packed_ptr.add(stride * 3) as *mut f32 };
+            let randoms_ptr = unsafe { packed_ptr.add(stride * 4) as *mut f32 };
+            for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
+                let params = sampling_params_map.get(&req_slice.req_id);
+                let (t, k, p, mp) = params.map_or((1.0f32, 0i32, 1.0f32, 0.0f32), |p| {
+                    (
+                        p.temperature.max(1e-7) as f32,
+                        p.top_k,
+                        p.top_p as f32,
+                        p.min_p as f32,
+                    )
+                });
+                unsafe {
+                    *temps_ptr.add(i) = t;
+                    *top_ks_ptr.add(i) = k;
+                    *top_ps_ptr.add(i) = p;
+                    *min_ps_ptr.add(i) = mp;
+                    *randoms_ptr.add(i) = rng.r#gen::<f32>();
+                }
+            }
+            let gpu_packed_owned = device
+                .caching
+                .alloc_tensor(&[total_bytes / 4], GpuDType::F32);
+            let gpu_packed = gpu_packed_owned.as_gpu_tensor();
+            unsafe {
+                driver::memcpy_htod_async(
+                    gpu_packed.raw_ptr(),
+                    packed_ptr,
+                    total_bytes,
+                    device.compute_stream,
+                )
+            }
+            .map_err(|e| ExecutorError::WorkerExecution(format!("H2D sampling: {e}")))?;
+            let base = gpu_packed.raw_ptr();
+            let gpu_temps = unsafe { GpuTensor::new(base, &[num_reqs], GpuDType::F32) };
+            let gpu_top_ks =
+                unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::U32) };
+            let gpu_top_ps =
+                unsafe { GpuTensor::new(base.add(stride * 2), &[num_reqs], GpuDType::F32) };
+            let gpu_min_ps =
+                unsafe { GpuTensor::new(base.add(stride * 3), &[num_reqs], GpuDType::F32) };
+            let gpu_randoms =
+                unsafe { GpuTensor::new(base.add(stride * 4), &[num_reqs], GpuDType::F32) };
+            unsafe {
+                vllm_cuda::kernels::sample_batched(
+                    logits_f32,
+                    gpu_temps,
+                    gpu_top_ks,
+                    gpu_top_ps,
+                    gpu_min_ps,
+                    gpu_randoms,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            }
+        };
+        let token_ids_gpu = token_ids_owned.as_gpu_tensor();
+
+        // 7. Gather logprobs on GPU (if needed).
+        let logprobs_output = if let Some(raw_logits_owned) = raw_logits_for_logprobs {
+            let raw_logits = raw_logits_owned.as_gpu_tensor();
+            // Find max num_logprobs across requests.
+            let max_logprobs = prepared
+                .req_inputs
+                .iter()
+                .filter_map(|r| sampling_params_map.get(&r.req_id).and_then(|p| p.logprobs))
+                .max()
+                .unwrap_or(0) as usize;
+
+            if max_logprobs > 0 {
+                let (topk_lp, topk_idx, topk_ranks) = unsafe {
+                    vllm_cuda::kernels::log_softmax_topk_gather(
+                        raw_logits,
+                        token_ids_gpu,
+                        max_logprobs,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                };
+
+                // D2H the small topk tensors.
+                let k = max_logprobs + 1;
+                let n_elements = num_reqs * k;
+                let mut host_lp = vec![0.0f32; n_elements];
+                let mut host_idx = vec![0i32; n_elements];
+                let mut host_ranks = vec![0u32; n_elements];
+                unsafe {
+                    driver::memcpy_dtoh_async(
+                        host_lp.as_mut_ptr() as *mut u8,
+                        topk_lp.as_gpu_tensor().raw_ptr() as *const u8,
+                        n_elements * 4,
+                        device.compute_stream,
+                    )
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("D2H logprobs: {e}")))?;
+                    driver::memcpy_dtoh_async(
+                        host_idx.as_mut_ptr() as *mut u8,
+                        topk_idx.as_gpu_tensor().raw_ptr() as *const u8,
+                        n_elements * 4,
+                        device.compute_stream,
+                    )
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("D2H logprob idx: {e}")))?;
+                    driver::memcpy_dtoh_async(
+                        host_ranks.as_mut_ptr() as *mut u8,
+                        topk_ranks.as_gpu_tensor().raw_ptr() as *const u8,
+                        n_elements * 4,
+                        device.compute_stream,
+                    )
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("D2H logprob ranks: {e}"))
+                    })?;
+                    driver::stream_synchronize(device.compute_stream)
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("sync: {e}")))?;
+                }
+
+                // Build per-request LogprobsOutput.
+                let mut logprobs_map: HashMap<String, Vec<vllm_common::LogprobsOutput>> =
+                    HashMap::new();
+                for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+                    let requested_n = sampling_params_map
+                        .get(&req_slice.req_id)
+                        .and_then(|p| p.logprobs);
+                    if let Some(n) = requested_n {
+                        let n = n as usize;
+                        let base = req_idx * k;
+                        // Slot 0 = sampled token.
+                        let sampled = vllm_common::TokenLogprob {
+                            token_id: host_idx[base] as u32,
+                            logprob: host_lp[base],
+                            rank: host_ranks[base],
+                        };
+                        let mut top_logprobs = Vec::with_capacity(n);
+                        for j in 1..=n.min(max_logprobs) {
+                            top_logprobs.push(vllm_common::TokenLogprob {
+                                token_id: host_idx[base + j] as u32,
+                                logprob: host_lp[base + j],
+                                rank: host_ranks[base + j],
+                            });
+                        }
+                        logprobs_map
+                            .entry(req_slice.req_id.clone())
+                            .or_default()
+                            .push(vllm_common::LogprobsOutput {
+                                sampled,
+                                top_logprobs,
+                            });
+                    }
+                }
+                Some(logprobs_map)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 8. D2H sampled tokens, commit, build output.
+        let host_ids =
+            Self::d2h_token_ids_pinned(host_staging.as_ref(), &token_ids_gpu, num_reqs, device)?;
+
+        for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+            let tok = host_ids[req_idx];
+
+            // Grammar advance on CPU (Python also does FSM state on CPU).
+            #[cfg(feature = "guided-decoding")]
+            if let Some(g) = grammar_states.get_mut(&req_slice.req_id) {
+                g.advance(tok);
+            }
+
+            input_batch.commit_step(
+                &req_slice.req_id,
+                &[tok],
+                req_slice.token_count,
+                !req_slice.spec_token_ids.is_empty(),
+            );
+            if let Some(buf) = token_buffers.get_mut(&req_slice.req_id) {
+                buf.push(tok);
+            }
+        }
+
+        let req_ids: Vec<String> = prepared
+            .req_inputs
+            .iter()
+            .map(|r| r.req_id.clone())
+            .collect();
+        input_batch.reclaim_buffers(prepared);
+        let mut output = ModelRunnerOutput::from_ordered(req_ids, host_ids);
+
+        if let Some(mut logprobs_map) = logprobs_output {
+            let logprobs_vec: Vec<Option<Vec<vllm_common::LogprobsOutput>>> = output
+                .req_ids
+                .iter()
+                .map(|rid| logprobs_map.remove(rid))
+                .collect();
+            output.logprobs = Some(logprobs_vec);
+        }
+
+        Ok(output)
+    }
+
+    /// Get a pointer to pinned host memory for packing sampling parameters.
+    fn get_sampling_packed_ptr_s(host_staging: &Option<HostStaging>, min_bytes: usize) -> *mut u8 {
+        if let Some(stg) = host_staging {
+            debug_assert!(min_bytes <= stg.sampling_packed.capacity_bytes());
+            stg.sampling_packed.ptr()
+        } else {
+            vec![0u8; min_bytes].leak().as_mut_ptr()
+        }
+    }
+
     /// D2H + sync + commit_step helper (static to avoid borrow conflicts).
     fn finalize_d2h_and_commit(
         token_ids_gpu: &GpuTensor,
@@ -1838,9 +2537,24 @@ impl CudaWorker {
         for req_id in &scheduler_output.finished_req_ids {
             self.token_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
+            #[cfg(feature = "guided-decoding")]
+            self.grammar_states.remove(req_id);
         }
         self.input_batch
             .remove_finished(&scheduler_output.finished_req_ids);
+
+        // Ensure grammar vocabulary is built if any new request needs it.
+        #[cfg(feature = "guided-decoding")]
+        {
+            let needs_grammar = scheduler_output.scheduled_new_reqs.iter().any(|r| {
+                r.sampling_params
+                    .as_ref()
+                    .is_some_and(|p| p.guided_grammar.is_some())
+            });
+            if needs_grammar {
+                self.ensure_grammar_vocabulary();
+            }
+        }
 
         // Process newly scheduled requests.
         for new_req in &scheduler_output.scheduled_new_reqs {
@@ -1863,6 +2577,22 @@ impl CudaWorker {
             if let Some(ref params) = new_req.sampling_params {
                 self.sampling_params_map
                     .insert(new_req.req_id.clone(), params.clone());
+                #[cfg(feature = "guided-decoding")]
+                if let Some(ref grammar) = params.guided_grammar
+                    && let Some(ref vocab) = self.grammar_vocabulary
+                {
+                    match vllm_models::grammar::GrammarGuide::from_guided_grammar(grammar, vocab) {
+                        Ok(guide) => {
+                            self.grammar_states.insert(new_req.req_id.clone(), guide);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to compile grammar for request {}: {e}",
+                                new_req.req_id
+                            );
+                        }
+                    }
+                }
             }
 
             let block_ids = new_req.block_ids.first().cloned().unwrap_or_default();
@@ -2249,215 +2979,41 @@ impl CudaWorker {
             // Fall through to sampling with merged logits.
             let logits = merged;
 
-            // --- Sampling (duplicated from below to avoid restructuring) ---
-            let all_gpu_sampleable = prepared.req_inputs.iter().all(|r| {
-                self.sampling_params_map.get(&r.req_id).is_none_or(|p| {
-                    p.frequency_penalty == 0.0
-                        && p.presence_penalty == 0.0
-                        && p.repetition_penalty == 1.0
-                        && p.logit_bias.is_none()
-                })
-            });
-
-            if all_greedy {
-                let token_ids_owned = unsafe {
-                    vllm_cuda::kernels::argmax_batched(
-                        logits,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                };
-                let token_ids_gpu = token_ids_owned.as_gpu_tensor();
-                return Self::finalize_d2h_and_commit(
-                    &token_ids_gpu,
-                    num_reqs,
-                    prepared,
-                    device,
-                    &self.host_staging,
-                    &mut self.input_batch,
-                    &mut self.token_buffers,
-                );
-            } else if all_gpu_sampleable {
-                use rand::Rng;
-                let mut rng = rand::thread_rng();
-
-                let all_no_filter = prepared.req_inputs.iter().all(|r| {
-                    self.sampling_params_map
-                        .get(&r.req_id)
-                        .is_none_or(|p| p.top_k <= 0 && p.top_p >= 1.0 && p.min_p <= 0.0)
-                });
-
-                let token_ids_owned = if all_no_filter {
-                    let stride = num_reqs * 4;
-                    let total_bytes = stride * 2;
-                    let packed_ptr = if let Some(stg) = &self.host_staging {
-                        debug_assert!(total_bytes <= stg.sampling_packed.capacity_bytes());
-                        stg.sampling_packed.ptr()
-                    } else {
-                        vec![0u8; total_bytes].leak().as_mut_ptr()
-                    };
-                    let temps_ptr = packed_ptr as *mut f32;
-                    let randoms_ptr = unsafe { packed_ptr.add(stride) as *mut f32 };
-                    for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
-                        let params = self.sampling_params_map.get(&req_slice.req_id);
-                        let t = params.map_or(1.0f32, |p| p.temperature.max(1e-7) as f32);
-                        unsafe {
-                            *temps_ptr.add(i) = t;
-                            *randoms_ptr.add(i) = rng.r#gen::<f32>();
-                        }
-                    }
-                    let gpu_packed_owned = device
-                        .caching
-                        .alloc_tensor(&[total_bytes / 4], GpuDType::F32);
-                    let gpu_packed = gpu_packed_owned.as_gpu_tensor();
-                    unsafe {
-                        driver::memcpy_htod_async(
-                            gpu_packed.raw_ptr(),
-                            packed_ptr,
-                            total_bytes,
-                            device.compute_stream,
-                        )
-                    }
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("H2D sampling params: {e}"))
-                    })?;
-                    let base = gpu_packed.raw_ptr();
-                    let gpu_temps = unsafe { GpuTensor::new(base, &[num_reqs], GpuDType::F32) };
-                    let gpu_randoms =
-                        unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::F32) };
-                    unsafe {
-                        vllm_cuda::kernels::sample_gumbel_batched(
-                            logits,
-                            gpu_temps,
-                            gpu_randoms,
-                            &mut device.caching,
-                            device.compute_stream,
-                        )
-                    }
-                } else {
-                    let stride = num_reqs * 4;
-                    let total_bytes = stride * 5;
-                    let packed_ptr = if let Some(stg) = &self.host_staging {
-                        debug_assert!(total_bytes <= stg.sampling_packed.capacity_bytes());
-                        stg.sampling_packed.ptr()
-                    } else {
-                        vec![0u8; total_bytes].leak().as_mut_ptr()
-                    };
-                    let temps_ptr = packed_ptr as *mut f32;
-                    let top_ks_ptr = unsafe { packed_ptr.add(stride) as *mut i32 };
-                    let top_ps_ptr = unsafe { packed_ptr.add(stride * 2) as *mut f32 };
-                    let min_ps_ptr = unsafe { packed_ptr.add(stride * 3) as *mut f32 };
-                    let randoms_ptr = unsafe { packed_ptr.add(stride * 4) as *mut f32 };
-                    for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
-                        let params = self.sampling_params_map.get(&req_slice.req_id);
-                        let (t, k, p, mp) = params.map_or((1.0f32, 0i32, 1.0f32, 0.0f32), |p| {
-                            (
-                                p.temperature.max(1e-7) as f32,
-                                p.top_k,
-                                p.top_p as f32,
-                                p.min_p as f32,
-                            )
-                        });
-                        unsafe {
-                            *temps_ptr.add(i) = t;
-                            *top_ks_ptr.add(i) = k;
-                            *top_ps_ptr.add(i) = p;
-                            *min_ps_ptr.add(i) = mp;
-                            *randoms_ptr.add(i) = rng.r#gen::<f32>();
-                        }
-                    }
-                    let gpu_packed_owned = device
-                        .caching
-                        .alloc_tensor(&[total_bytes / 4], GpuDType::F32);
-                    let gpu_packed = gpu_packed_owned.as_gpu_tensor();
-                    unsafe {
-                        driver::memcpy_htod_async(
-                            gpu_packed.raw_ptr(),
-                            packed_ptr,
-                            total_bytes,
-                            device.compute_stream,
-                        )
-                    }
-                    .map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("H2D sampling params: {e}"))
-                    })?;
-                    let base = gpu_packed.raw_ptr();
-                    let gpu_temps = unsafe { GpuTensor::new(base, &[num_reqs], GpuDType::F32) };
-                    let gpu_top_ks =
-                        unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::U32) };
-                    let gpu_top_ps =
-                        unsafe { GpuTensor::new(base.add(stride * 2), &[num_reqs], GpuDType::F32) };
-                    let gpu_min_ps =
-                        unsafe { GpuTensor::new(base.add(stride * 3), &[num_reqs], GpuDType::F32) };
-                    let gpu_randoms =
-                        unsafe { GpuTensor::new(base.add(stride * 4), &[num_reqs], GpuDType::F32) };
-                    unsafe {
-                        vllm_cuda::kernels::sample_batched(
-                            logits,
-                            gpu_temps,
-                            gpu_top_ks,
-                            gpu_top_ps,
-                            gpu_min_ps,
-                            gpu_randoms,
-                            &mut device.caching,
-                            device.compute_stream,
-                        )
-                    }
-                };
-                let token_ids_gpu = token_ids_owned.as_gpu_tensor();
-                return Self::finalize_d2h_and_commit(
-                    &token_ids_gpu,
-                    num_reqs,
-                    prepared,
-                    device,
-                    &self.host_staging,
-                    &mut self.input_batch,
-                    &mut self.token_buffers,
-                );
-            } else {
-                // Slow path: D2H logits for CPU sampling.
-                let logits_f32 = Self::logits_to_cpu(logits, device)?;
-                let mut sampler = Sampler::new();
-                let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
-                for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
-                    let start = req_idx * vocab_size;
-                    let end = start + vocab_size;
-                    let req_logits = &logits_f32[start..end];
-                    let prev_tokens = self
-                        .token_buffers
-                        .get(&req_slice.req_id)
-                        .map(|v| v.as_slice())
-                        .unwrap_or(&[]);
-                    let token_id =
-                        if let Some(params) = self.sampling_params_map.get(&req_slice.req_id) {
-                            let (token_id, _) =
-                                sampler.sample_one(req_logits, params, prev_tokens, None);
-                            token_id
-                        } else {
-                            req_logits
-                                .iter()
-                                .enumerate()
-                                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                                .map(|(i, _)| i as u32)
-                                .unwrap_or(0)
-                        };
-                    self.input_batch.commit_step(
-                        &req_slice.req_id,
-                        &[token_id],
-                        req_slice.token_count,
-                        !req_slice.spec_token_ids.is_empty(),
-                    );
-                    if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
-                        buf.push(token_id);
-                    }
-                    token_map.insert(req_slice.req_id.clone(), vec![token_id]);
-                }
-                self.input_batch.reclaim_buffers(prepared);
-                return Ok(ModelRunnerOutput::from_token_map(token_map));
-            }
+            // GPU sampling for mixed prefill+decode merged logits.
+            return Self::gpu_sample_and_finalize(
+                &self.sampling_params_map,
+                #[cfg(feature = "guided-decoding")]
+                &mut self.grammar_states,
+                &self.host_staging,
+                &mut self.input_batch,
+                &mut self.token_buffers,
+                logits,
+                prepared,
+                device,
+                all_greedy,
+                vocab_size,
+            );
         }
 
-        if use_graph && all_greedy {
+        // Check if any request needs logprobs or grammar (these require the full
+        // GPU sampling pipeline instead of in-graph argmax).
+        let any_needs_full_sampling = prepared.req_inputs.iter().any(|r| {
+            self.sampling_params_map
+                .get(&r.req_id)
+                .is_some_and(|p| p.logprobs.is_some())
+                || {
+                    #[cfg(feature = "guided-decoding")]
+                    {
+                        self.grammar_states.contains_key(&r.req_id)
+                    }
+                    #[cfg(not(feature = "guided-decoding"))]
+                    {
+                        false
+                    }
+                }
+        });
+
+        if use_graph && all_greedy && !any_needs_full_sampling {
             // Fast path: CUDA graph with in-graph argmax. No separate sampling
             // kernel launch — argmax + D2D scatter are captured in the graph.
             let graph_bs = graph_bs.unwrap();
@@ -2807,6 +3363,7 @@ impl CudaWorker {
             let meta = &prepared.attn_meta;
             let use_prefill_graph = num_reqs == 1
                 && meta.tokens_before[0] == 0
+                && !any_needs_full_sampling
                 && self
                     .prefill_graph_runner
                     .as_ref()
@@ -2908,238 +3465,21 @@ impl CudaWorker {
             }
         };
 
-        // Check if all requests can use GPU sampling (no grammar, no logit_bias,
-        // no frequency/presence/repetition penalties). This covers both greedy
-        // (temp < 1e-6 → argmax) and non-greedy (temp >= 1e-6 → top-k/top-p/min-p).
-        let all_gpu_sampleable = prepared.req_inputs.iter().all(|r| {
-            self.sampling_params_map.get(&r.req_id).is_none_or(|p| {
-                p.frequency_penalty == 0.0
-                    && p.presence_penalty == 0.0
-                    && p.repetition_penalty == 1.0
-                    && p.logit_bias.is_none()
-            })
-        });
-
-        if all_gpu_sampleable && !all_greedy {
-            // GPU sampling path: determine if we can use the fast Gumbel-max
-            // kernel (no top-k/top-p/min-p filtering needed) or the full kernel.
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
-
-            // Check if all requests can use the fast Gumbel-max path:
-            // top_k <= 0 (disabled), top_p >= 1.0, min_p <= 0.0.
-            let all_no_filter = prepared.req_inputs.iter().all(|r| {
-                self.sampling_params_map
-                    .get(&r.req_id)
-                    .is_none_or(|p| p.top_k <= 0 && p.top_p >= 1.0 && p.min_p <= 0.0)
-            });
-
-            let token_ids_owned = if all_no_filter {
-                // Fast path: Gumbel-max sampling (single pass, ~5µs vs ~1ms).
-                // Only need temperatures and random seeds.
-                let stride = num_reqs * 4; // bytes per array
-                let total_bytes = stride * 2; // temps + randoms
-
-                let packed_ptr = if let Some(stg) = &self.host_staging {
-                    debug_assert!(total_bytes <= stg.sampling_packed.capacity_bytes());
-                    stg.sampling_packed.ptr()
-                } else {
-                    vec![0u8; total_bytes].leak().as_mut_ptr()
-                };
-
-                let temps_ptr = packed_ptr as *mut f32;
-                let randoms_ptr = unsafe { packed_ptr.add(stride) as *mut f32 };
-
-                for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
-                    let params = self.sampling_params_map.get(&req_slice.req_id);
-                    let t = params.map_or(1.0f32, |p| p.temperature.max(1e-7) as f32);
-                    unsafe {
-                        *temps_ptr.add(i) = t;
-                        *randoms_ptr.add(i) = rng.r#gen::<f32>();
-                    }
-                }
-
-                let gpu_packed_owned = device
-                    .caching
-                    .alloc_tensor(&[total_bytes / 4], GpuDType::F32);
-                let gpu_packed = gpu_packed_owned.as_gpu_tensor();
-                unsafe {
-                    driver::memcpy_htod_async(
-                        gpu_packed.raw_ptr(),
-                        packed_ptr,
-                        total_bytes,
-                        device.compute_stream,
-                    )
-                }
-                .map_err(|e| ExecutorError::WorkerExecution(format!("H2D sampling params: {e}")))?;
-
-                let base = gpu_packed.raw_ptr();
-                let gpu_temps = unsafe { GpuTensor::new(base, &[num_reqs], GpuDType::F32) };
-                let gpu_randoms =
-                    unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::F32) };
-
-                unsafe {
-                    vllm_cuda::kernels::sample_gumbel_batched(
-                        logits,
-                        gpu_temps,
-                        gpu_randoms,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                }
-            } else {
-                // Full path: top-k/top-p/min-p filtering required.
-                let stride = num_reqs * 4;
-                let total_bytes = stride * 5;
-
-                let packed_ptr = if let Some(stg) = &self.host_staging {
-                    debug_assert!(total_bytes <= stg.sampling_packed.capacity_bytes());
-                    stg.sampling_packed.ptr()
-                } else {
-                    vec![0u8; total_bytes].leak().as_mut_ptr()
-                };
-
-                let temps_ptr = packed_ptr as *mut f32;
-                let top_ks_ptr = unsafe { packed_ptr.add(stride) as *mut i32 };
-                let top_ps_ptr = unsafe { packed_ptr.add(stride * 2) as *mut f32 };
-                let min_ps_ptr = unsafe { packed_ptr.add(stride * 3) as *mut f32 };
-                let randoms_ptr = unsafe { packed_ptr.add(stride * 4) as *mut f32 };
-
-                for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
-                    let params = self.sampling_params_map.get(&req_slice.req_id);
-                    let (t, k, p, mp) = params.map_or((1.0f32, 0i32, 1.0f32, 0.0f32), |p| {
-                        (
-                            p.temperature.max(1e-7) as f32,
-                            p.top_k,
-                            p.top_p as f32,
-                            p.min_p as f32,
-                        )
-                    });
-                    unsafe {
-                        *temps_ptr.add(i) = t;
-                        *top_ks_ptr.add(i) = k;
-                        *top_ps_ptr.add(i) = p;
-                        *min_ps_ptr.add(i) = mp;
-                        *randoms_ptr.add(i) = rng.r#gen::<f32>();
-                    }
-                }
-
-                let gpu_packed_owned = device
-                    .caching
-                    .alloc_tensor(&[total_bytes / 4], GpuDType::F32);
-                let gpu_packed = gpu_packed_owned.as_gpu_tensor();
-                unsafe {
-                    driver::memcpy_htod_async(
-                        gpu_packed.raw_ptr(),
-                        packed_ptr,
-                        total_bytes,
-                        device.compute_stream,
-                    )
-                }
-                .map_err(|e| ExecutorError::WorkerExecution(format!("H2D sampling params: {e}")))?;
-
-                let base = gpu_packed.raw_ptr();
-                let gpu_temps = unsafe { GpuTensor::new(base, &[num_reqs], GpuDType::F32) };
-                let gpu_top_ks =
-                    unsafe { GpuTensor::new(base.add(stride), &[num_reqs], GpuDType::U32) };
-                let gpu_top_ps =
-                    unsafe { GpuTensor::new(base.add(stride * 2), &[num_reqs], GpuDType::F32) };
-                let gpu_min_ps =
-                    unsafe { GpuTensor::new(base.add(stride * 3), &[num_reqs], GpuDType::F32) };
-                let gpu_randoms =
-                    unsafe { GpuTensor::new(base.add(stride * 4), &[num_reqs], GpuDType::F32) };
-
-                unsafe {
-                    vllm_cuda::kernels::sample_batched(
-                        logits,
-                        gpu_temps,
-                        gpu_top_ks,
-                        gpu_top_ps,
-                        gpu_min_ps,
-                        gpu_randoms,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                }
-            };
-            let token_ids_gpu = token_ids_owned.as_gpu_tensor();
-
-            Self::finalize_d2h_and_commit(
-                &token_ids_gpu,
-                num_reqs,
-                prepared,
-                device,
-                &self.host_staging,
-                &mut self.input_batch,
-                &mut self.token_buffers,
-            )
-        } else if all_greedy {
-            // GPU fast path: batched argmax on device, D2H only num_reqs × 4 bytes.
-            let token_ids_owned = unsafe {
-                vllm_cuda::kernels::argmax_batched(
-                    logits,
-                    &mut device.caching,
-                    device.compute_stream,
-                )
-            };
-            let token_ids_gpu = token_ids_owned.as_gpu_tensor();
-            let num_reqs = prepared.req_inputs.len();
-
-            Self::finalize_d2h_and_commit(
-                &token_ids_gpu,
-                num_reqs,
-                prepared,
-                device,
-                &self.host_staging,
-                &mut self.input_batch,
-                &mut self.token_buffers,
-            )
-        } else {
-            // Slow path: D2H full logits for CPU sampling.
-            let logits_f32 = Self::logits_to_cpu(logits, device)?;
-            let mut sampler = Sampler::new();
-            let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
-
-            for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
-                let start = req_idx * vocab_size;
-                let end = start + vocab_size;
-                let req_logits = &logits_f32[start..end];
-
-                let prev_tokens = self
-                    .token_buffers
-                    .get(&req_slice.req_id)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-
-                let token_id = if let Some(params) = self.sampling_params_map.get(&req_slice.req_id)
-                {
-                    let (token_id, _logprobs) =
-                        sampler.sample_one(req_logits, params, prev_tokens, None);
-                    token_id
-                } else {
-                    req_logits
-                        .iter()
-                        .enumerate()
-                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                        .map(|(i, _)| i as u32)
-                        .unwrap_or(0)
-                };
-
-                self.input_batch.commit_step(
-                    &req_slice.req_id,
-                    &[token_id],
-                    req_slice.token_count,
-                    !req_slice.spec_token_ids.is_empty(),
-                );
-                if let Some(buf) = self.token_buffers.get_mut(&req_slice.req_id) {
-                    buf.push(token_id);
-                }
-                token_map.insert(req_slice.req_id.clone(), vec![token_id]);
-            }
-
-            self.input_batch.reclaim_buffers(prepared);
-            Ok(ModelRunnerOutput::from_token_map(token_map))
-        }
+        // GPU sampling: handles all cases — greedy, non-greedy, penalties,
+        // grammar, logit_bias, logprobs — entirely on GPU. No CPU fallback.
+        Self::gpu_sample_and_finalize(
+            &self.sampling_params_map,
+            #[cfg(feature = "guided-decoding")]
+            &mut self.grammar_states,
+            &self.host_staging,
+            &mut self.input_batch,
+            &mut self.token_buffers,
+            logits,
+            prepared,
+            device,
+            all_greedy,
+            vocab_size,
+        )
     }
 } // end impl CudaWorker (execute_model_inner)
 

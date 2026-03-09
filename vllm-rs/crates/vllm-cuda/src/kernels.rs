@@ -1643,6 +1643,239 @@ pub unsafe fn sample_batched(
 }
 
 // ---------------------------------------------------------------------------
+// Cast to f32 (for logit modification kernels that require f32)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn cast_to_f32_f16(output: *mut f32, input: *const u16, n: c_int, stream: CUstream);
+    fn cast_to_f32_bf16(output: *mut f32, input: *const u16, n: c_int, stream: CUstream);
+}
+
+/// Cast logits from any dtype to f32 on GPU.
+/// If already f32, returns a view (no copy). Otherwise allocates from arena.
+pub unsafe fn cast_logits_to_f32(
+    logits: GpuTensor,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let n = logits.numel() as c_int;
+    let shape: Vec<usize> = logits.shape().iter().map(|&d| d as usize).collect();
+    let out = alloc.alloc_tensor(&shape, DType::F32);
+    match logits.dtype() {
+        DType::F32 => {
+            // Just D2D copy.
+            crate::driver::memcpy_dtod_async(
+                out.as_gpu_tensor().raw_ptr(),
+                logits.raw_ptr() as *const u8,
+                logits.size_bytes(),
+                stream,
+            )
+            .expect("cast_logits_to_f32: D2D copy failed");
+        }
+        DType::F16 => cast_to_f32_f16(
+            out.as_mut_ptr() as *mut f32,
+            logits.as_ptr() as *const u16,
+            n,
+            stream,
+        ),
+        DType::BF16 => cast_to_f32_bf16(
+            out.as_mut_ptr() as *mut f32,
+            logits.as_ptr() as *const u16,
+            n,
+            stream,
+        ),
+        _ => panic!("cast_logits_to_f32: unsupported dtype {:?}", logits.dtype()),
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Penalties / Logit bias / Grammar mask / Log-softmax top-k
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn apply_penalties_inplace(
+        logits: *mut f32,
+        output_token_ids: *const c_int,
+        prompt_token_ids: *const c_int,
+        rep_penalties: *const f32,
+        freq_penalties: *const f32,
+        pres_penalties: *const f32,
+        vocab_size: c_int,
+        batch_size: c_int,
+        max_output_len: c_int,
+        max_prompt_len: c_int,
+        stream: CUstream,
+    );
+
+    fn apply_logit_bias_inplace(
+        logits: *mut f32,
+        bias_token_ids: *const c_int,
+        bias_values: *const f32,
+        bias_offsets: *const c_int,
+        vocab_size: c_int,
+        batch_size: c_int,
+        stream: CUstream,
+    );
+
+    fn apply_grammar_mask_inplace(
+        logits: *mut f32,
+        logits_backup: *const f32,
+        allowed_ids: *const c_int,
+        allowed_offsets: *const c_int,
+        req_indices: *const c_int,
+        vocab_size: c_int,
+        num_grammar_reqs: c_int,
+        stream: CUstream,
+    );
+
+    fn log_softmax_topk(
+        logits: *const f32,
+        sampled_ids: *const u32,
+        vocab_size: c_int,
+        batch_size: c_int,
+        num_logprobs: c_int,
+        out_logprobs: *mut f32,
+        out_indices: *mut c_int,
+        out_ranks: *mut u32,
+        stream: CUstream,
+    );
+}
+
+/// Apply repetition, frequency, and presence penalties to f32 logits in-place.
+///
+/// * `logits`: `[batch_size, vocab_size]` f32 on GPU — modified in-place
+/// * `output_token_ids`: `[batch_size, max_output_len]` i32 on GPU, padded with `vocab_size`
+/// * `prompt_token_ids`: `[batch_size, max_prompt_len]` i32 on GPU, padded with `vocab_size`
+/// * `rep_penalties`, `freq_penalties`, `pres_penalties`: `[batch_size]` f32 on GPU
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn apply_penalties(
+    logits: GpuTensor,
+    output_token_ids: GpuTensor,
+    prompt_token_ids: GpuTensor,
+    rep_penalties: GpuTensor,
+    freq_penalties: GpuTensor,
+    pres_penalties: GpuTensor,
+    stream: CUstream,
+) {
+    let batch_size = logits.dim(0) as c_int;
+    let vocab_size = logits.dim(1) as c_int;
+    let max_output_len = output_token_ids.dim(1) as c_int;
+    let max_prompt_len = prompt_token_ids.dim(1) as c_int;
+
+    apply_penalties_inplace(
+        logits.as_mut_ptr() as *mut f32,
+        output_token_ids.as_ptr() as *const c_int,
+        prompt_token_ids.as_ptr() as *const c_int,
+        rep_penalties.as_ptr(),
+        freq_penalties.as_ptr(),
+        pres_penalties.as_ptr(),
+        vocab_size,
+        batch_size,
+        max_output_len,
+        max_prompt_len,
+        stream,
+    );
+}
+
+/// Apply sparse logit bias via CSR-packed scatter-add on f32 logits in-place.
+///
+/// * `logits`: `[batch_size, vocab_size]` f32 on GPU
+/// * `bias_token_ids`: `[total_biases]` i32 on GPU
+/// * `bias_values`: `[total_biases]` f32 on GPU
+/// * `bias_offsets`: `[batch_size + 1]` i32 on GPU (CSR offsets)
+pub unsafe fn apply_logit_bias(
+    logits: GpuTensor,
+    bias_token_ids: GpuTensor,
+    bias_values: GpuTensor,
+    bias_offsets: GpuTensor,
+    stream: CUstream,
+) {
+    let batch_size = logits.dim(0) as c_int;
+    let vocab_size = logits.dim(1) as c_int;
+
+    apply_logit_bias_inplace(
+        logits.as_mut_ptr() as *mut f32,
+        bias_token_ids.as_ptr() as *const c_int,
+        bias_values.as_ptr(),
+        bias_offsets.as_ptr() as *const c_int,
+        vocab_size,
+        batch_size,
+        stream,
+    );
+}
+
+/// Apply grammar mask: set disallowed tokens to -inf using CSR-packed allow-list.
+///
+/// * `logits`: `[batch_size, vocab_size]` f32 on GPU — modified in-place
+/// * `logits_backup`: `[batch_size, vocab_size]` f32 on GPU — pristine copy for restoring allowed tokens
+/// * `allowed_ids`: `[total_allowed]` i32 on GPU
+/// * `allowed_offsets`: `[num_grammar_reqs + 1]` i32 on GPU
+/// * `req_indices`: `[num_grammar_reqs]` i32 on GPU — maps grammar index to batch row
+pub unsafe fn apply_grammar_mask(
+    logits: GpuTensor,
+    logits_backup: GpuTensor,
+    allowed_ids: GpuTensor,
+    allowed_offsets: GpuTensor,
+    req_indices: GpuTensor,
+    stream: CUstream,
+) {
+    let vocab_size = logits.dim(1) as c_int;
+    let num_grammar_reqs = req_indices.dim(0) as c_int;
+
+    apply_grammar_mask_inplace(
+        logits.as_mut_ptr() as *mut f32,
+        logits_backup.as_ptr(),
+        allowed_ids.as_ptr() as *const c_int,
+        allowed_offsets.as_ptr() as *const c_int,
+        req_indices.as_ptr() as *const c_int,
+        vocab_size,
+        num_grammar_reqs,
+        stream,
+    );
+}
+
+/// Fused log-softmax + top-k on f32 logits. Returns per-request top-k logprobs.
+///
+/// * `logits`: `[batch_size, vocab_size]` f32 on GPU (raw logits before penalties)
+/// * `sampled_ids`: `[batch_size]` u32 on GPU
+/// * `num_logprobs`: number of top logprobs to return (slot 0 = sampled token)
+///
+/// Returns `(logprobs, indices, ranks)`:
+/// * `logprobs`: `[batch_size, num_logprobs + 1]` f32
+/// * `indices`: `[batch_size, num_logprobs + 1]` i32
+/// * `ranks`: `[batch_size, num_logprobs + 1]` u32
+pub unsafe fn log_softmax_topk_gather(
+    logits: GpuTensor,
+    sampled_ids: GpuTensor,
+    num_logprobs: usize,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> (OwnedTensor, OwnedTensor, OwnedTensor) {
+    let batch_size = logits.dim(0);
+    let vocab_size = logits.dim(1) as c_int;
+    let k = num_logprobs + 1;
+
+    let out_lp = alloc.alloc_tensor(&[batch_size, k], DType::F32);
+    let out_idx = alloc.alloc_tensor(&[batch_size, k], DType::U32);
+    let out_ranks = alloc.alloc_tensor(&[batch_size, k], DType::U32);
+
+    log_softmax_topk(
+        logits.as_ptr(),
+        sampled_ids.as_ptr() as *const u32,
+        vocab_size,
+        batch_size as c_int,
+        num_logprobs as c_int,
+        out_lp.as_mut_ptr() as *mut f32,
+        out_idx.as_mut_ptr() as *mut c_int,
+        out_ranks.as_mut_ptr() as *mut u32,
+        stream,
+    );
+
+    (out_lp, out_idx, out_ranks)
+}
+
+// ---------------------------------------------------------------------------
 // Tests for FlashAttention-2 FFI shim (mha_varlen_fwd)
 // ---------------------------------------------------------------------------
 

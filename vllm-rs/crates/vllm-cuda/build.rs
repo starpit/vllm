@@ -10,10 +10,18 @@
 fn main() {
     #[cfg(feature = "cuda")]
     cuda_build();
+
+    #[cfg(not(feature = "cuda"))]
+    println!("cargo:rerun-if-changed=build.rs");
 }
 
 #[cfg(feature = "cuda")]
 fn cuda_build() {
+    // Track all source/header files for cargo:rerun-if-changed.
+    // Without these directives, cargo re-runs build.rs on EVERY build,
+    // marking vllm-cuda dirty and forcing recompilation of all downstream crates.
+    let mut rerun_files: Vec<String> = vec!["build.rs".to_string()];
+
     // Use a stable shared cache directory so clippy/test/build reuse compiled .o files.
     // Cargo gives each profile a different OUT_DIR, which defeats cudaforge's incremental cache.
     let cache_dir = dirs::cache_dir()
@@ -24,25 +32,31 @@ fn cuda_build() {
     let cache_str = cache_dir.to_string_lossy().to_string();
 
     // 1. vllm fused kernels (merged from vllm-kernels + embedding gather).
+    let vllm_sources = vec![
+        "csrc/layernorm_kernels.cu",
+        "csrc/activation_kernels.cu",
+        "csrc/pos_encoding_kernels.cu",
+        "csrc/cache_kernels.cu",
+        "csrc/qk_norm_rope_kernels.cu",
+        "csrc/moe_topk_kernels.cu",
+        "csrc/moe_align_kernels.cu",
+        "csrc/moe_align_block_size_kernels.cu",
+        "csrc/fused_moe_gemm_kernels.cu",
+        "csrc/moe_ops_kernels.cu",
+        "csrc/sampling_kernels.cu",
+        "csrc/gptq_dequant_kernels.cu",
+        "csrc/awq_dequant_kernels.cu",
+        "csrc/embedding_kernels.cu",
+    ];
+    let vllm_watch = vec!["csrc/vec_utils.cuh"];
+
+    rerun_files.extend(vllm_sources.iter().map(|s| s.to_string()));
+    rerun_files.extend(vllm_watch.iter().map(|s| s.to_string()));
+
     cudaforge::KernelBuilder::new()
         .out_dir(&cache_dir)
-        .source_files(vec![
-            "csrc/layernorm_kernels.cu".to_string(),
-            "csrc/activation_kernels.cu".to_string(),
-            "csrc/pos_encoding_kernels.cu".to_string(),
-            "csrc/cache_kernels.cu".to_string(),
-            "csrc/qk_norm_rope_kernels.cu".to_string(),
-            "csrc/moe_topk_kernels.cu".to_string(),
-            "csrc/moe_align_kernels.cu".to_string(),
-            "csrc/moe_align_block_size_kernels.cu".to_string(),
-            "csrc/fused_moe_gemm_kernels.cu".to_string(),
-            "csrc/moe_ops_kernels.cu".to_string(),
-            "csrc/sampling_kernels.cu".to_string(),
-            "csrc/gptq_dequant_kernels.cu".to_string(),
-            "csrc/awq_dequant_kernels.cu".to_string(),
-            "csrc/embedding_kernels.cu".to_string(),
-        ])
-        .watch(vec!["csrc/vec_utils.cuh".to_string()])
+        .source_files(vllm_sources.iter().map(|s| s.to_string()).collect())
+        .watch(vllm_watch.iter().map(|s| s.to_string()).collect())
         .include_path("csrc")
         .arg("-O3")
         .arg("--use_fast_math")
@@ -53,29 +67,35 @@ fn cuda_build() {
     println!("cargo:rustc-link-lib=static=vllm_kernels");
 
     // 2. Marlin W4A16 fused GEMM kernels.
+    let marlin_sources = vec![
+        "csrc/marlin/marlin_gemm.cu",
+        "csrc/marlin/gptq_marlin_repack.cu",
+        "csrc/marlin/awq_marlin_repack.cu",
+        "csrc/marlin/sm80_kernel_float16_u4_float16.cu",
+        "csrc/marlin/sm80_kernel_bfloat16_u4_bfloat16.cu",
+        "csrc/marlin/sm80_kernel_float16_u4b8_float16.cu",
+        "csrc/marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu",
+    ];
+    let marlin_watch = vec![
+        "csrc/marlin/marlin.cuh",
+        "csrc/marlin/kernel.h",
+        "csrc/marlin/kernel_selector.h",
+        "csrc/marlin/marlin_template.h",
+        "csrc/marlin/marlin_mma.h",
+        "csrc/marlin/dequant.h",
+        "csrc/marlin/marlin_dtypes.cuh",
+        "csrc/core/scalar_type.hpp",
+    ];
+
+    rerun_files.extend(marlin_sources.iter().map(|s| s.to_string()));
+    rerun_files.extend(marlin_watch.iter().map(|s| s.to_string()));
+
     cudaforge::KernelBuilder::new()
         .out_dir(&cache_dir)
-        .source_files(vec![
-            "csrc/marlin/marlin_gemm.cu".to_string(),
-            "csrc/marlin/gptq_marlin_repack.cu".to_string(),
-            "csrc/marlin/awq_marlin_repack.cu".to_string(),
-            "csrc/marlin/sm80_kernel_float16_u4_float16.cu".to_string(),
-            "csrc/marlin/sm80_kernel_bfloat16_u4_bfloat16.cu".to_string(),
-            "csrc/marlin/sm80_kernel_float16_u4b8_float16.cu".to_string(),
-            "csrc/marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu".to_string(),
-        ])
+        .source_files(marlin_sources.iter().map(|s| s.to_string()).collect())
+        .watch(marlin_watch.iter().map(|s| s.to_string()).collect())
         .include_path("csrc/marlin")
         .include_path("csrc")
-        .watch(vec![
-            "csrc/marlin/marlin.cuh".to_string(),
-            "csrc/marlin/kernel.h".to_string(),
-            "csrc/marlin/kernel_selector.h".to_string(),
-            "csrc/marlin/marlin_template.h".to_string(),
-            "csrc/marlin/marlin_mma.h".to_string(),
-            "csrc/marlin/dequant.h".to_string(),
-            "csrc/marlin/marlin_dtypes.cuh".to_string(),
-            "csrc/core/scalar_type.hpp".to_string(),
-        ])
         .arg("-O3")
         .arg("--use_fast_math")
         .arg("-std=c++17")
@@ -86,11 +106,17 @@ fn cuda_build() {
     println!("cargo:rustc-link-lib=static=marlin_kernels");
 
     // 3. FlashAttention-2 paged kernels (vllm-project fork).
-    build_flash_attention(&cache_str);
+    build_flash_attention(&cache_str, &mut rerun_files);
+
+    // Emit rerun-if-changed for all tracked files so cargo skips the build
+    // script (and all downstream recompilation) when nothing changed.
+    for f in &rerun_files {
+        println!("cargo:rerun-if-changed={}", f);
+    }
 }
 
 #[cfg(feature = "cuda")]
-fn build_flash_attention(cache_dir: &str) {
+fn build_flash_attention(cache_dir: &str, rerun_files: &mut Vec<String>) {
     // Upstream kernel source (unchanged from vllm-project/flash-attention)
     let fa_src = std::path::Path::new("../../third_party/vllm-flash-attn/src");
     // Our compat headers (stubs for PyTorch deps) + FFI shim
@@ -138,6 +164,9 @@ fn build_flash_attention(cache_dir: &str) {
     .into_iter()
     .map(|p| p.to_string_lossy().into_owned())
     .collect();
+
+    rerun_files.extend(kernel_files.iter().cloned());
+    rerun_files.extend(watch_files.iter().cloned());
 
     // Include order matters: compat stubs FIRST (override PyTorch headers),
     // then upstream kernel source, then CUTLASS (added by with_cutlass).

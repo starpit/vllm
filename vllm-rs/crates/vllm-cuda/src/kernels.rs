@@ -1105,6 +1105,132 @@ pub unsafe fn scale_inplace(x: GpuTensor, scale: f32, cublas: &crate::cublas::Cu
 }
 
 // ---------------------------------------------------------------------------
+// Embedding pooling (GPU-side)
+// ---------------------------------------------------------------------------
+
+/// Extract a single row from `[num_tokens, hidden_size]` → `[hidden_size]` on GPU.
+/// Used for Last-token and CLS pooling. Just a D2D memcpy of one row.
+///
+/// # Safety
+/// `hidden_states` must be a valid 2D GPU tensor. `row_idx < num_tokens`.
+pub unsafe fn pool_select_row(
+    hidden_states: GpuTensor,
+    row_idx: usize,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let hidden_size = hidden_states.dim(1);
+    let elem_bytes = hidden_states.dtype().size_bytes();
+    let row_bytes = hidden_size * elem_bytes;
+
+    let out = alloc.alloc_tensor(&[hidden_size], hidden_states.dtype());
+    let src = hidden_states.raw_ptr().add(row_idx * row_bytes);
+    crate::driver::memcpy_dtod_async(out.raw_ptr(), src, row_bytes, stream)
+        .expect("pool_select_row: D2D copy failed");
+    out
+}
+
+/// Mean pool: average all rows of `[num_tokens, hidden_size]` → `[hidden_size]`.
+///
+/// Uses cuBLAS gemv: `out = (1/N) * A^T * ones_vec` where A = `[N, H]` (row-major).
+/// The ones vector is allocated from the caching allocator and filled via memset.
+///
+/// # Safety
+/// `hidden_states` must be a valid 2D GPU tensor with dtype F32.
+/// For bf16/f16 inputs, caller must cast to f32 first.
+pub unsafe fn pool_mean_f32(
+    hidden_states: GpuTensor,
+    cublas: &crate::cublas::CublasHandle,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    use cudarc::cublas::sys::cublasOperation_t;
+
+    assert_eq!(
+        hidden_states.dtype(),
+        DType::F32,
+        "pool_mean_f32 requires f32 input"
+    );
+    let num_tokens = hidden_states.dim(0);
+    let hidden_size = hidden_states.dim(1);
+
+    if num_tokens == 1 {
+        // Single token: just copy the row.
+        return pool_select_row(hidden_states, 0, alloc, stream);
+    }
+
+    // Allocate ones vector [num_tokens] filled with 1.0f32.
+    let ones = alloc.alloc_tensor(&[num_tokens], DType::F32);
+    // Fill with 1.0f32 (bit pattern 0x3F800000). Use a kernel-free approach:
+    // set all bytes to 0, then use cuBLAS to set to 1.0 would be circular.
+    // Instead, write 1.0f32 via a small H2D.
+    let ones_host: Vec<f32> = vec![1.0f32; num_tokens];
+    crate::driver::memcpy_htod_async(
+        ones.raw_ptr(),
+        ones_host.as_ptr() as *const u8,
+        num_tokens * 4,
+        stream,
+    )
+    .expect("pool_mean: H2D ones vector");
+
+    // Allocate output [hidden_size].
+    let out = alloc.alloc_tensor(&[hidden_size], DType::F32);
+
+    // cuBLAS gemv: out = alpha * A^T * x + beta * out
+    // A is [N, H] in row-major = [H, N] in column-major.
+    // We want A^T * x = [H, N]^T * [N] = [H] (sum of rows).
+    // In column-major: A is [H, N], op=N means no-transpose, so y = A * x = [H].
+    let alpha = 1.0f32 / num_tokens as f32;
+    let beta = 0.0f32;
+
+    unsafe extern "C" {
+        fn cublasSgemv_v2(
+            handle: cudarc::cublas::sys::cublasHandle_t,
+            trans: cublasOperation_t,
+            m: c_int,
+            n: c_int,
+            alpha: *const f32,
+            a: *const f32,
+            lda: c_int,
+            x: *const f32,
+            incx: c_int,
+            beta: *const f32,
+            y: *mut f32,
+            incy: c_int,
+        ) -> cudarc::cublas::sys::cublasStatus_t;
+    }
+
+    // Row-major [N, H] is column-major [H, N]. We want sum of rows = A^T * ones
+    // In column-major: A = [H, N], trans=T → A^T * x = [N, H] * [N] — wrong dims.
+    // Actually: row-major [N, H] stored as contiguous memory.
+    // In cuBLAS column-major convention, this is a [H, N] matrix (columns are rows).
+    // We want: out[h] = sum_n A[n, h] / N = (1/N) * A^T_colmajor * ones
+    // A_colmajor = [H, N], transpose it → [N, H], multiply by ones[N] → [N] — wrong.
+    // No: A_colmajor = [H, N], no transpose: y = A * x = [H, N] * [N, 1] = [H, 1]. Correct!
+    let status = cublasSgemv_v2(
+        cublas.raw_handle(),
+        cublasOperation_t::CUBLAS_OP_N, // no transpose
+        hidden_size as c_int,           // m = H
+        num_tokens as c_int,            // n = N
+        &alpha,
+        hidden_states.as_ptr::<f32>(),
+        hidden_size as c_int, // lda = H (column-major leading dim)
+        ones.as_ptr::<f32>(),
+        1,
+        &beta,
+        out.as_mut_ptr::<f32>(),
+        1,
+    );
+    assert_eq!(
+        status,
+        cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+        "pool_mean_f32: cublasSgemv failed"
+    );
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // QKV Split (zero-copy on dim 1 via pointer arithmetic + D2D copy)
 // ---------------------------------------------------------------------------
 
@@ -2517,6 +2643,228 @@ mod tests_flash_attn {
             for p in [q_ptr, k_ptr, v_ptr, out_ptr, lse_ptr, cu_q, cu_k] {
                 let _ = driver::mem_free(p);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: GPU pooling kernels
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod tests_pooling {
+    use super::*;
+    use crate::alloc::CachingAllocator;
+    use crate::driver;
+
+    unsafe fn test_init() -> cudarc::driver::sys::CUstream {
+        driver::init().expect("CUDA init");
+        let dev = driver::device_get(0).expect("device 0");
+        let _ctx = driver::ctx_create(dev).expect("ctx_create");
+        driver::stream_create().expect("stream_create")
+    }
+
+    unsafe fn upload_f32(data: &[f32], stream: cudarc::driver::sys::CUstream) -> *mut u8 {
+        let bytes = data.len() * 4;
+        let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("H2D");
+        ptr
+    }
+
+    unsafe fn download_f32(
+        ptr: *mut u8,
+        count: usize,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Vec<f32> {
+        let mut buf = vec![0.0f32; count];
+        driver::memcpy_dtoh_async(buf.as_mut_ptr() as *mut u8, ptr, count * 4, stream)
+            .expect("D2H");
+        driver::stream_synchronize(stream).expect("sync");
+        buf
+    }
+
+    // -- pool_select_row tests --
+
+    #[test]
+    #[ignore]
+    fn test_pool_select_row_first() {
+        unsafe {
+            let stream = test_init();
+            let mut alloc = CachingAllocator::new();
+
+            // 3 tokens, hidden_size=4
+            let data: Vec<f32> = vec![
+                1.0, 2.0, 3.0, 4.0, // row 0
+                5.0, 6.0, 7.0, 8.0, // row 1
+                9.0, 10.0, 11.0, 12.0, // row 2
+            ];
+            let ptr = upload_f32(&data, stream);
+            let hs = GpuTensor::new(ptr, &[3, 4], DType::F32);
+
+            let out = pool_select_row(hs, 0, &mut alloc, stream);
+            let result = download_f32(out.as_gpu_tensor().raw_ptr(), 4, stream);
+            assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0]);
+
+            let _ = driver::mem_free(ptr);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_pool_select_row_last() {
+        unsafe {
+            let stream = test_init();
+            let mut alloc = CachingAllocator::new();
+
+            let data: Vec<f32> = vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ];
+            let ptr = upload_f32(&data, stream);
+            let hs = GpuTensor::new(ptr, &[3, 4], DType::F32);
+
+            let out = pool_select_row(hs, 2, &mut alloc, stream);
+            let result = download_f32(out.as_gpu_tensor().raw_ptr(), 4, stream);
+            assert_eq!(result, vec![9.0, 10.0, 11.0, 12.0]);
+
+            let _ = driver::mem_free(ptr);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_pool_select_row_middle() {
+        unsafe {
+            let stream = test_init();
+            let mut alloc = CachingAllocator::new();
+
+            let data: Vec<f32> = vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ];
+            let ptr = upload_f32(&data, stream);
+            let hs = GpuTensor::new(ptr, &[3, 4], DType::F32);
+
+            let out = pool_select_row(hs, 1, &mut alloc, stream);
+            let result = download_f32(out.as_gpu_tensor().raw_ptr(), 4, stream);
+            assert_eq!(result, vec![5.0, 6.0, 7.0, 8.0]);
+
+            let _ = driver::mem_free(ptr);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_pool_select_row_bf16() {
+        unsafe {
+            let stream = test_init();
+            let mut alloc = CachingAllocator::new();
+
+            // 2 tokens, hidden_size=3, bf16
+            let row0: Vec<u16> = [1.0f32, 2.0, 3.0]
+                .iter()
+                .map(|&v| half::bf16::from_f32(v).to_bits())
+                .collect();
+            let row1: Vec<u16> = [4.0f32, 5.0, 6.0]
+                .iter()
+                .map(|&v| half::bf16::from_f32(v).to_bits())
+                .collect();
+            let data: Vec<u16> = [row0, row1].concat();
+            let bytes = data.len() * 2;
+            let ptr = driver::mem_alloc(bytes).expect("alloc");
+            driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("H2D");
+
+            let hs = GpuTensor::new(ptr, &[2, 3], DType::BF16);
+            let out = pool_select_row(hs, 1, &mut alloc, stream);
+
+            let mut buf = vec![0u16; 3];
+            driver::memcpy_dtoh_async(
+                buf.as_mut_ptr() as *mut u8,
+                out.as_gpu_tensor().raw_ptr(),
+                6,
+                stream,
+            )
+            .expect("D2H");
+            driver::stream_synchronize(stream).expect("sync");
+            let vals: Vec<f32> = buf
+                .iter()
+                .map(|&b| half::bf16::from_bits(b).to_f32())
+                .collect();
+            assert!((vals[0] - 4.0).abs() < 0.1);
+            assert!((vals[1] - 5.0).abs() < 0.1);
+            assert!((vals[2] - 6.0).abs() < 0.1);
+
+            let _ = driver::mem_free(ptr);
+        }
+    }
+
+    // -- pool_mean_f32 tests --
+
+    #[test]
+    #[ignore]
+    fn test_pool_mean_basic() {
+        unsafe {
+            let stream = test_init();
+            let mut alloc = CachingAllocator::new();
+            let cublas = crate::cublas::CublasHandle::new(stream).expect("cublas");
+
+            // 3 tokens, hidden_size=3
+            // row0=[1,2,3], row1=[3,4,5], row2=[5,6,7] → mean=[3,4,5]
+            let data: Vec<f32> = vec![1.0, 2.0, 3.0, 3.0, 4.0, 5.0, 5.0, 6.0, 7.0];
+            let ptr = upload_f32(&data, stream);
+            let hs = GpuTensor::new(ptr, &[3, 3], DType::F32);
+
+            let out = pool_mean_f32(hs, &cublas, &mut alloc, stream);
+            driver::stream_synchronize(stream).expect("sync");
+            let result = download_f32(out.as_gpu_tensor().raw_ptr(), 3, stream);
+            assert!((result[0] - 3.0).abs() < 1e-5, "got {}", result[0]);
+            assert!((result[1] - 4.0).abs() < 1e-5, "got {}", result[1]);
+            assert!((result[2] - 5.0).abs() < 1e-5, "got {}", result[2]);
+
+            let _ = driver::mem_free(ptr);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_pool_mean_single_row() {
+        unsafe {
+            let stream = test_init();
+            let mut alloc = CachingAllocator::new();
+            let cublas = crate::cublas::CublasHandle::new(stream).expect("cublas");
+
+            let data: Vec<f32> = vec![7.0, 8.0, 9.0, 10.0];
+            let ptr = upload_f32(&data, stream);
+            let hs = GpuTensor::new(ptr, &[1, 4], DType::F32);
+
+            let out = pool_mean_f32(hs, &cublas, &mut alloc, stream);
+            driver::stream_synchronize(stream).expect("sync");
+            let result = download_f32(out.as_gpu_tensor().raw_ptr(), 4, stream);
+            assert_eq!(result, vec![7.0, 8.0, 9.0, 10.0]);
+
+            let _ = driver::mem_free(ptr);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_pool_mean_two_rows() {
+        unsafe {
+            let stream = test_init();
+            let mut alloc = CachingAllocator::new();
+            let cublas = crate::cublas::CublasHandle::new(stream).expect("cublas");
+
+            // [0, 4] and [2, 6] → mean [1, 5]
+            let data: Vec<f32> = vec![0.0, 4.0, 2.0, 6.0];
+            let ptr = upload_f32(&data, stream);
+            let hs = GpuTensor::new(ptr, &[2, 2], DType::F32);
+
+            let out = pool_mean_f32(hs, &cublas, &mut alloc, stream);
+            driver::stream_synchronize(stream).expect("sync");
+            let result = download_f32(out.as_gpu_tensor().raw_ptr(), 2, stream);
+            assert!((result[0] - 1.0).abs() < 1e-5);
+            assert!((result[1] - 5.0).abs() < 1e-5);
+
+            let _ = driver::mem_free(ptr);
         }
     }
 }

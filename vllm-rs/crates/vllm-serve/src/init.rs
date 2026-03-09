@@ -250,6 +250,8 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
                 .unwrap_or_default(),
             cublas_autotune: config.cublas_autotune,
             gpu_memory_utilization: config.gpu_memory_utilization,
+            pooling_strategy: config.pooling_strategy.clone(),
+            is_pooling,
         };
 
         let mut worker = CudaWorker::new(cuda_config);

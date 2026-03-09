@@ -56,6 +56,10 @@ pub struct CudaWorkerConfig {
     pub cublas_autotune: bool,
     /// Fraction of GPU memory to use (0.0-1.0). Used to compute KV cache budget.
     pub gpu_memory_utilization: f64,
+    /// Pooling strategy: "auto", "last", "cls", "mean".
+    pub pooling_strategy: String,
+    /// Whether the worker runs in pooling mode (--runner pooling).
+    pub is_pooling: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +103,79 @@ impl CudaModel {
             Self::Llama(m) => m.lm_head.out_features(),
             Self::Qwen2(m) => m.0.lm_head.out_features(),
             Self::Gemma2(m) => m.lm_head.out_features(),
+        }
+    }
+
+    fn hidden_size(&self) -> usize {
+        match self {
+            Self::Llama(m) => m.lm_head.in_features(),
+            Self::Qwen2(m) => m.0.lm_head.in_features(),
+            Self::Gemma2(m) => m.lm_head.in_features(),
+        }
+    }
+
+    /// Run backbone forward pass (without lm_head), returning hidden states
+    /// `[num_tokens, hidden_size]` on GPU.
+    ///
+    /// # Safety
+    /// All GpuTensors must be valid. CUDA context must be current.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn hidden_states(
+        &self,
+        input_ids: GpuTensor,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+    ) -> GpuTensor {
+        match self {
+            Self::Llama(m) => unsafe {
+                m.model.forward_owned(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                )
+            },
+            Self::Qwen2(m) => unsafe {
+                m.0.model.forward_owned(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                )
+            },
+            Self::Gemma2(m) => unsafe {
+                m.model.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                )
+            },
         }
     }
 
@@ -465,12 +542,17 @@ pub struct CudaWorker {
     preloaded_tokenizer: Option<tokenizers::Tokenizer>,
     /// Set once per thread to avoid redundant `ctx_set_current` driver calls.
     ctx_set_on_thread: bool,
+    /// Resolved pooling strategy for embedding mode.
+    pooling_strategy: vllm_models::embedding::PoolingStrategy,
+    /// Whether executing in pooling mode (--runner pooling).
+    is_pooling: bool,
 }
 
 unsafe impl Send for CudaWorker {}
 
 impl CudaWorker {
     pub fn new(config: CudaWorkerConfig) -> Self {
+        let is_pooling = config.is_pooling;
         Self {
             config,
             device: None,
@@ -491,6 +573,8 @@ impl CudaWorker {
             input_batch: InputBatch::new(),
             preloaded_tokenizer: None,
             ctx_set_on_thread: false,
+            pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
+            is_pooling,
         }
     }
 
@@ -719,6 +803,132 @@ impl CudaWorker {
             }
         };
         Ok(f32_vec)
+    }
+
+    /// Pool hidden states on GPU, D2H the small result, cast to f32, L2 normalize.
+    ///
+    /// `hidden_states` is `[num_tokens, hidden_size]` on GPU in model dtype.
+    /// Returns `Vec<f32>` of length `hidden_size`, L2-normalized.
+    fn pool_and_normalize(
+        hidden_states: GpuTensor,
+        num_tokens: usize,
+        strategy: vllm_models::embedding::PoolingStrategy,
+        device: &mut GpuDevice,
+    ) -> ExecutorResult<Vec<f32>> {
+        use vllm_models::embedding::PoolingStrategy;
+
+        let hidden_size = hidden_states.dim(1);
+
+        // 1. GPU-side pooling: extract [hidden_size] from [num_tokens, hidden_size].
+        let pooled_gpu = match strategy {
+            PoolingStrategy::Last => unsafe {
+                vllm_cuda::kernels::pool_select_row(
+                    hidden_states,
+                    num_tokens - 1,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            },
+            PoolingStrategy::Cls => unsafe {
+                vllm_cuda::kernels::pool_select_row(
+                    hidden_states,
+                    0,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            },
+            PoolingStrategy::Mean => {
+                // Mean pooling needs f32 for cuBLAS gemv. For bf16/f16 inputs,
+                // D2H the small pooled tensor and compute mean on CPU.
+                // (Avoids needing a bf16→f32 cast kernel for this small vector.)
+                // Actually, for Mean we need to average ALL rows, so D2H all rows
+                // is expensive. Instead, D2H just the pooled row for Last/CLS,
+                // but for Mean we need GPU computation.
+                //
+                // Strategy: if dtype is f32, use GPU gemv. Otherwise, D2H the
+                // full hidden_states and compute mean on CPU. For typical embedding
+                // use cases, seq_len * hidden_size * 2 bytes is manageable
+                // (512 * 4096 * 2 = 4MB). This is the simple path.
+                //
+                // TODO: add bf16→f32 cast kernel for full GPU mean pooling.
+                if hidden_states.dtype() == GpuDType::F32 {
+                    unsafe {
+                        vllm_cuda::kernels::pool_mean_f32(
+                            hidden_states,
+                            &device.cublas,
+                            &mut device.caching,
+                            device.compute_stream,
+                        )
+                    }
+                } else {
+                    // D2H all hidden states, compute mean on CPU.
+                    let all_f32 = Self::logits_to_cpu(hidden_states, device)?;
+                    let mut mean = vec![0.0f32; hidden_size];
+                    let n = num_tokens as f32;
+                    for row in 0..num_tokens {
+                        let start = row * hidden_size;
+                        for (j, val) in mean.iter_mut().enumerate() {
+                            *val += all_f32[start + j] / n;
+                        }
+                    }
+                    // L2 normalize on CPU.
+                    let norm: f32 = mean.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        for v in &mut mean {
+                            *v /= norm;
+                        }
+                    }
+                    return Ok(mean);
+                }
+            }
+        };
+
+        // 2. D2H the small [hidden_size] vector.
+        let pooled_gpu_t = pooled_gpu.as_gpu_tensor();
+        let nbytes = hidden_size * pooled_gpu_t.dtype().size_bytes();
+        let mut host_buf = vec![0u8; nbytes];
+        unsafe {
+            driver::memcpy_dtoh_async(
+                host_buf.as_mut_ptr(),
+                pooled_gpu_t.raw_ptr() as *const u8,
+                nbytes,
+                device.compute_stream,
+            )
+        }
+        .map_err(|e| ExecutorError::WorkerExecution(format!("D2H pooled: {e}")))?;
+        unsafe { driver::stream_synchronize(device.compute_stream) }
+            .map_err(|e| ExecutorError::WorkerExecution(format!("sync: {e}")))?;
+
+        // 3. Cast to f32 on CPU.
+        let f32_vec: Vec<f32> = match pooled_gpu_t.dtype() {
+            GpuDType::F32 => {
+                let ptr = host_buf.as_ptr() as *const f32;
+                unsafe { std::slice::from_raw_parts(ptr, hidden_size) }.to_vec()
+            }
+            GpuDType::F16 => {
+                let ptr = host_buf.as_ptr() as *const half::f16;
+                let slice = unsafe { std::slice::from_raw_parts(ptr, hidden_size) };
+                slice.iter().map(|v| v.to_f32()).collect()
+            }
+            GpuDType::BF16 => {
+                let ptr = host_buf.as_ptr() as *const half::bf16;
+                let slice = unsafe { std::slice::from_raw_parts(ptr, hidden_size) };
+                slice.iter().map(|v| v.to_f32()).collect()
+            }
+            _ => {
+                return Err(ExecutorError::WorkerExecution(
+                    "unexpected dtype for pooled embedding".into(),
+                ));
+            }
+        };
+
+        // 4. L2 normalize on CPU (tiny vector, ~4096 floats = 16KB).
+        let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            Ok(f32_vec.into_iter().map(|x| x / norm).collect())
+        } else {
+            Ok(f32_vec)
+        }
     }
 
     /// D2H copy token IDs using pinned staging if available.
@@ -957,8 +1167,20 @@ impl Worker for CudaWorker {
         self.model_dtype = dtype;
         self.resolved_architecture = Some(arch);
         self.model = Some(model);
-        self.model_dir = Some(model_dir);
+        self.model_dir = Some(model_dir.clone());
         self.hf_config = Some(hf_config);
+
+        // Resolve pooling strategy.
+        self.pooling_strategy = match self.config.pooling_strategy.as_str() {
+            "last" => vllm_models::embedding::PoolingStrategy::Last,
+            "cls" => vllm_models::embedding::PoolingStrategy::Cls,
+            "mean" => vllm_models::embedding::PoolingStrategy::Mean,
+            _ => {
+                // "auto": detect from 1_Pooling/config.json, default to Last.
+                vllm_models::embedding::detect_pooling_strategy(&model_dir)
+                    .unwrap_or(vllm_models::embedding::PoolingStrategy::Last)
+            }
+        };
 
         // Collect tokenizer.
         if let Ok(Some(tok)) = tokenizer_handle.join() {
@@ -1366,6 +1588,91 @@ impl Worker for CudaWorker {
     fn architecture(&self) -> Option<String> {
         self.resolved_architecture.clone()
     }
+
+    fn embed(&mut self, token_id_seqs: &[&[u32]]) -> ExecutorResult<Vec<Vec<f32>>> {
+        // Ensure CUDA context is current.
+        if let Some(ref dev) = self.device {
+            unsafe { driver::ctx_set_current(dev.ctx) }
+                .map_err(|e| ExecutorError::WorkerExecution(format!("ctx_set_current: {e}")))?;
+        }
+
+        let (model, kv_cache, device) = match (&self.model, &self.kv_cache, &mut self.device) {
+            (Some(m), Some(kv), Some(d)) => (m, kv, d),
+            _ => {
+                return Err(ExecutorError::WorkerExecution(
+                    "model, KV cache, or device not initialized".into(),
+                ));
+            }
+        };
+
+        let block_size = self.config.block_size;
+        let strategy = self.pooling_strategy;
+        let mut results = Vec::with_capacity(token_id_seqs.len());
+
+        for token_ids in token_id_seqs {
+            let num_tokens = token_ids.len();
+            if num_tokens == 0 {
+                let hidden_size = model.hidden_size();
+                results.push(vec![0.0f32; hidden_size]);
+                continue;
+            }
+
+            // Build positions [0, 1, 2, ...].
+            let positions: Vec<u32> = (0..num_tokens as u32).collect();
+
+            // Upload inputs.
+            let gpu_input_ids = Self::h2d_u32(token_ids, device)?;
+            let gpu_positions = Self::h2d_u32(&positions, device)?;
+
+            // Slot mapping: use block 0 sequentially.
+            let slot_mapping: Vec<i64> = (0..num_tokens)
+                .map(|t| {
+                    let block_idx = t / block_size;
+                    let offset = t % block_size;
+                    (block_idx * block_size + offset) as i64
+                })
+                .collect();
+            let gpu_slot_mapping = Self::h2d_i64(&slot_mapping, device)?;
+
+            // Attention metadata: single sequence.
+            let cu_seqlens_q = vec![0i32, num_tokens as i32];
+            let gpu_cu_q = Self::h2d_i32(&cu_seqlens_q, device)?;
+            let seqused_k = vec![num_tokens as i32];
+            let gpu_seqused_k = Self::h2d_i32(&seqused_k, device)?;
+
+            // Block table: [1, max_blocks].
+            let max_blocks = num_tokens.div_ceil(block_size);
+            let block_table: Vec<i32> = (0..max_blocks as i32).collect();
+            let gpu_bt = Self::h2d_i32(&block_table, device)?;
+            let gpu_bt =
+                unsafe { GpuTensor::new(gpu_bt.raw_ptr(), &[1, max_blocks], GpuDType::I32) };
+
+            // Forward pass (backbone only).
+            let hidden_states = unsafe {
+                model.hidden_states(
+                    gpu_input_ids,
+                    gpu_positions,
+                    gpu_slot_mapping,
+                    gpu_cu_q,
+                    gpu_seqused_k,
+                    gpu_bt,
+                    num_tokens,
+                    num_tokens,
+                    kv_cache,
+                    device,
+                )
+            };
+
+            // Pool + normalize.
+            let embedding = Self::pool_and_normalize(hidden_states, num_tokens, strategy, device)?;
+            results.push(embedding);
+
+            // Free leaked tensors from this iteration.
+            unsafe { device.caching.free_leaked_blocks() };
+        }
+
+        Ok(results)
+    }
 } // end impl Worker for CudaWorker
 
 impl CudaWorker {
@@ -1478,9 +1785,79 @@ impl CudaWorker {
                 ));
             }
         };
-        let vocab_size = model.vocab_size();
         let num_reqs = prepared.req_inputs.len();
         let total_tokens = prepared.flat_token_ids.len();
+
+        // --- Pooling mode: run backbone, pool, return embeddings ---
+        if self.is_pooling {
+            let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
+            let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
+
+            let (
+                slot_mapping,
+                cu_seqlens_q,
+                seqused_k,
+                block_table_gpu,
+                max_seqlen_q,
+                max_seqlen_k,
+            ) = Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
+
+            let hidden_states = unsafe {
+                model.hidden_states(
+                    gpu_input_ids,
+                    gpu_positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table_gpu,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                )
+            };
+
+            // Pool each request's hidden states slice.
+            let strategy = self.pooling_strategy;
+            let meta = &prepared.attn_meta;
+            let mut pooler_map: HashMap<String, Vec<f32>> = HashMap::new();
+
+            for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+                let q_start = meta.query_start_loc[req_idx];
+                let q_len = meta.q_lens[req_idx];
+                let hidden_size = model.hidden_size();
+
+                // Narrow hidden_states to this request's rows.
+                let row_bytes = hidden_size * hidden_states.dtype().size_bytes();
+                let req_hs = unsafe {
+                    GpuTensor::new(
+                        hidden_states.raw_ptr().add(q_start * row_bytes),
+                        &[q_len, hidden_size],
+                        hidden_states.dtype(),
+                    )
+                };
+
+                let embedding = Self::pool_and_normalize(req_hs, q_len, strategy, device)?;
+                pooler_map.insert(req_slice.req_id.clone(), embedding);
+
+                // Commit step so InputBatch tracks progress.
+                self.input_batch.commit_step(
+                    &req_slice.req_id,
+                    &[0], // dummy token — pooling doesn't generate tokens
+                    req_slice.token_count,
+                    false,
+                );
+            }
+
+            self.input_batch.reclaim_buffers(prepared);
+
+            // Build a ModelRunnerOutput with pooler_output and empty generation fields.
+            let mut output = ModelRunnerOutput::from_token_map(HashMap::new());
+            output.pooler_output = Some(pooler_map);
+            return Ok(output);
+        }
+
+        let vocab_size = model.vocab_size();
 
         // Check if this is a pure decode batch (all q_len=1) and we have a graph.
         // We allow padding to the nearest captured graph size (e.g. BS=3 → graph BS=4).

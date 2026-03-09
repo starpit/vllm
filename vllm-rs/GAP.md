@@ -79,7 +79,7 @@
   ├───────────────────────────┼───────────────┼───────────────────────────┤
   │ GGUF model loading        │ yes           │ no                        │
   ├───────────────────────────┼───────────────┼───────────────────────────┤
-  │ Embeddings / pooling mode │ yes (embed()) │ no                        │
+  │ Embeddings / pooling mode │ yes (embed()) │ yes (embed() + pooling)   │
   ├───────────────────────────┼───────────────┼───────────────────────────┤
   │ LoRA adapter loading      │ yes           │ no                        │
   ├───────────────────────────┼───────────────┼───────────────────────────┤
@@ -118,7 +118,7 @@
   5. DeepSeek V2/V3 (MLA): Most complex arch — absorbed-MLA attention, MoE
   6. Tensor parallelism: Parallel layers, NCCL, multi-GPU init
   7. Remaining dense archs: Gemma3, Command R, Granite, Qwen3-Next
-  8. LoRA, speculative decoding, embeddings mode: Feature parity on worker traits
+  8. LoRA, speculative decoding: Feature parity on worker traits (embeddings done)
   9. Multimodal: Vision encoders (Gemma3-MM, Qwen2-VL)
 
   The critical path is items 1-4. That covers the vast majority of real-world CUDA usage (dense LLaMA-family models in

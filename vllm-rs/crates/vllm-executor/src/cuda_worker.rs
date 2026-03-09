@@ -23,8 +23,8 @@ use vllm_cuda::logits_processor::{
     BatchUpdate, GrammarMaskProcessor, LogitBiasProcessor, LogitsProcessorPipeline,
     MinTokensProcessor, PenaltiesProcessor,
 };
-use vllm_cuda::tensor::GpuTensor;
 use vllm_cuda::quant;
+use vllm_cuda::tensor::GpuTensor;
 use vllm_cuda::weights::GpuWeights;
 use vllm_engine::executor::ModelRunnerOutput;
 use vllm_model::weight::HfModelConfig;

@@ -72,9 +72,9 @@
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
   │ desc_act (act ordering)     │ yes        │ no       │ g_idx sort + perm needed                 │
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
-  │ Fused QKV GEMM (quant)      │ yes        │ no       │ Python fuses at load; Rust does 3 GEMMs  │
+  │ Fused QKV GEMM (quant)      │ yes        │ YES      │ Concat on CPU, single repack + GEMM      │
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
-  │ Fused gate+up GEMM (quant)  │ yes        │ no       │ Python fuses at load; Rust does 2 GEMMs  │
+  │ Fused gate+up GEMM (quant)  │ yes        │ YES      │ Concat on CPU, single repack + GEMM      │
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
   │ use_fp32_reduce              │ yes (dflt) │ no       │ Python defaults true; Rust passes false   │
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
@@ -100,7 +100,7 @@
   faster than dense.
 
   **Key gaps to close (priority order):**
-  1. Fused QKV/gate_up at load time — 5 GEMMs→2 per layer, big prefill win
+  1. ~~Fused QKV/gate_up at load time~~ — **DONE** (5→2 GEMMs per layer, CPU concat + single repack)
   2. use_fp32_reduce=true — match Python default for numerical accuracy
   3. ~~AWQ E2E testing~~ — **DONE** (Qwen2.5-0.5B-Instruct-AWQ, nick4 L40S)
   4. Wire LLaMA/Gemma2 for quantized loading — only Qwen2 works today

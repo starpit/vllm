@@ -1097,25 +1097,15 @@ impl LlamaAttention {
 
         let mut alloc = crate::alloc::CachingAllocator::new();
 
-        let q = gpu_weights::load_marlin_linear(
+        // Fused QKV: concat q/k/v on CPU, single repack + single Marlin GEMM.
+        // Matches Python vLLM's QKVParallelLinear.
+        let qkv = gpu_weights::load_fused_marlin_linear(
             weights,
-            &format!("{prefix}.q_proj"),
-            qconfig,
-            workspace,
-            device.device_id,
-            &mut alloc,
-        )?;
-        let k = gpu_weights::load_marlin_linear(
-            weights,
-            &format!("{prefix}.k_proj"),
-            qconfig,
-            workspace,
-            device.device_id,
-            &mut alloc,
-        )?;
-        let v = gpu_weights::load_marlin_linear(
-            weights,
-            &format!("{prefix}.v_proj"),
+            &[
+                format!("{prefix}.q_proj"),
+                format!("{prefix}.k_proj"),
+                format!("{prefix}.v_proj"),
+            ],
             qconfig,
             workspace,
             device.device_id,
@@ -1131,9 +1121,9 @@ impl LlamaAttention {
         )?;
 
         Ok(Self {
-            qkv_proj: LinearLayer::Marlin(Box::new(q)),
-            k_proj: Some(LinearLayer::Marlin(Box::new(k))),
-            v_proj: Some(LinearLayer::Marlin(Box::new(v))),
+            qkv_proj: LinearLayer::Marlin(Box::new(qkv)),
+            k_proj: None,
+            v_proj: None,
             o_proj: LinearLayer::Marlin(Box::new(o)),
             q_size,
             kv_size,
@@ -1162,17 +1152,11 @@ impl LlamaMLP {
     ) -> Result<Self> {
         let mut alloc = crate::alloc::CachingAllocator::new();
 
-        let gate = gpu_weights::load_marlin_linear(
+        // Fused gate_up: concat gate/up on CPU, single repack + single Marlin GEMM.
+        // Matches Python vLLM's MergedColumnParallelLinear.
+        let gate_up = gpu_weights::load_fused_marlin_linear(
             weights,
-            &format!("{prefix}.gate_proj"),
-            qconfig,
-            workspace,
-            device.device_id,
-            &mut alloc,
-        )?;
-        let up = gpu_weights::load_marlin_linear(
-            weights,
-            &format!("{prefix}.up_proj"),
+            &[format!("{prefix}.gate_proj"), format!("{prefix}.up_proj")],
             qconfig,
             workspace,
             device.device_id,
@@ -1188,8 +1172,8 @@ impl LlamaMLP {
         )?;
 
         Ok(Self {
-            gate_up_proj: LinearLayer::Marlin(Box::new(gate)),
-            up_proj: Some(LinearLayer::Marlin(Box::new(up))),
+            gate_up_proj: LinearLayer::Marlin(Box::new(gate_up)),
+            up_proj: None,
             down_proj: LinearLayer::Marlin(Box::new(down)),
             intermediate_size,
         })

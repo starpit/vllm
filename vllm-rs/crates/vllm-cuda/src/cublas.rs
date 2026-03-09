@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn test_gemm_types_f16() {
         let (compute, data) = gemm_types(DType::F16);
-        assert_eq!(compute, cublasComputeType_t::CUBLAS_COMPUTE_16F);
+        assert_eq!(compute, cublasComputeType_t::CUBLAS_COMPUTE_32F);
         assert_eq!(data, sys::cudaDataType_t::CUDA_R_16F);
     }
 

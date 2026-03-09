@@ -105,7 +105,6 @@ struct RawQuantConfig {
     sym: bool,
 }
 
-
 fn default_true() -> bool {
     true
 }
@@ -141,10 +140,7 @@ pub fn detect_quant_config(model_dir: impl AsRef<Path>) -> Result<QuantConfig> {
 
 fn parse_raw_config(raw: RawQuantConfig) -> Result<QuantConfig> {
     if raw.bits != 4 {
-        bail!(
-            "only 4-bit quantization supported, got {} bits",
-            raw.bits
-        );
+        bail!("only 4-bit quantization supported, got {} bits", raw.bits);
     }
     if !matches!(raw.group_size, 32 | 64 | 128) && raw.group_size != usize::MAX {
         // group_size -1 in JSON is parsed as very large; allow common values
@@ -209,12 +205,7 @@ pub fn scale_perm_single() -> [usize; 32] {
 ///
 /// `scales`: flat buffer of `[num_groups, size_n]` scale values (as raw bytes).
 /// We operate on the logical f16/bf16 elements by index.
-pub fn marlin_permute_scales(
-    scales: &mut [u16],
-    size_k: usize,
-    size_n: usize,
-    group_size: usize,
-) {
+pub fn marlin_permute_scales(scales: &mut [u16], size_k: usize, size_n: usize, group_size: usize) {
     let num_groups = if group_size > 0 && group_size < size_k {
         size_k / group_size
     } else {
@@ -262,8 +253,7 @@ pub fn unpack_cols_4bit(packed: &[u32], rows: usize, cols: usize) -> Vec<u8> {
         for p in 0..cols / pack_factor {
             let val = packed[r * (cols / pack_factor) + p];
             for b in 0..pack_factor {
-                out[r * cols + b * (cols / pack_factor) + p] =
-                    ((val >> (4 * b)) & 0xF) as u8;
+                out[r * cols + b * (cols / pack_factor) + p] = ((val >> (4 * b)) & 0xF) as u8;
             }
         }
     }
@@ -625,7 +615,8 @@ mod tests {
             unsafe {
                 let gpu_input = upload_u32(&host_data, stream);
 
-                let repacked = crate::kernels::awq_repack(gpu_input, size_k, size_n, 0, &mut alloc, stream);
+                let repacked =
+                    crate::kernels::awq_repack(gpu_input, size_k, size_n, 0, &mut alloc, stream);
 
                 driver::stream_synchronize(stream).expect("sync");
 
@@ -697,12 +688,18 @@ mod tests {
                 let qw_count = size_k * size_n / 8;
                 let qw_data = vec![0u32; qw_count];
                 let qw_ptr = driver::mem_alloc(qw_count * 4).expect("alloc qw");
-                driver::memcpy_htod_async(qw_ptr, qw_data.as_ptr() as *const u8, qw_count * 4, stream)
-                    .expect("h2d qw");
+                driver::memcpy_htod_async(
+                    qw_ptr,
+                    qw_data.as_ptr() as *const u8,
+                    qw_count * 4,
+                    stream,
+                )
+                .expect("h2d qw");
                 let qw = GpuTensor::new(qw_ptr, &[qw_count], DType::U32);
 
                 // Scales: [1, 16] f16 — all ones
-                let s_data: Vec<u16> = vec![half::f16::from_f32(1.0).to_bits(); num_groups * size_n];
+                let s_data: Vec<u16> =
+                    vec![half::f16::from_f32(1.0).to_bits(); num_groups * size_n];
                 let s_nbytes = s_data.len() * 2;
                 let s_ptr = driver::mem_alloc(s_nbytes).expect("alloc s");
                 driver::memcpy_htod_async(s_ptr, s_data.as_ptr() as *const u8, s_nbytes, stream)
@@ -716,25 +713,16 @@ mod tests {
                 let workspace = GpuTensor::new(ws_ptr, &[ws_count], DType::I32);
 
                 let out = crate::kernels::marlin_gemm(
-                    a,
-                    qw,
-                    scales,
-                    None,  // no zeros
-                    None,  // no g_idx
-                    None,  // no perm
-                    None,  // no bias
-                    workspace,
-                    size_m,
-                    size_n,
-                    size_k,
-                    num_groups,
-                    group_size,
+                    a, qw, scales, None, // no zeros
+                    None, // no g_idx
+                    None, // no perm
+                    None, // no bias
+                    workspace, size_m, size_n, size_k, num_groups, group_size,
                     false, // no act_order
                     false, // no zp
                     0,     // GPTQ type
                     0,     // device_id
-                    &mut alloc,
-                    stream,
+                    &mut alloc, stream,
                 );
 
                 driver::stream_synchronize(stream).expect("sync");
@@ -749,10 +737,7 @@ mod tests {
                 // Zero weights → output should be zero (or close)
                 for &bits in result {
                     let val = half::f16::from_bits(bits).to_f32();
-                    assert!(
-                        !val.is_nan(),
-                        "marlin_gemm output contains NaN"
-                    );
+                    assert!(!val.is_nan(), "marlin_gemm output contains NaN");
                 }
 
                 driver::mem_free_host(host).expect("free host");
@@ -785,8 +770,12 @@ mod tests {
 
                 let gptq_ptr = driver::mem_alloc(gptq_count * 4).expect("alloc gptq");
                 driver::memcpy_htod_async(
-                    gptq_ptr, gptq_data.as_ptr() as *const u8, gptq_count * 4, stream
-                ).expect("h2d gptq");
+                    gptq_ptr,
+                    gptq_data.as_ptr() as *const u8,
+                    gptq_count * 4,
+                    stream,
+                )
+                .expect("h2d gptq");
                 let gptq_gpu = GpuTensor::new(gptq_ptr, &[gptq_rows, size_n], DType::U32);
 
                 // 2. Repack GPTQ → Marlin tiled layout
@@ -795,23 +784,27 @@ mod tests {
                 );
 
                 // 3. Create scales [num_groups, N] = all ones, then permute
-                let mut scales_u16: Vec<u16> = vec![half::f16::from_f32(1.0).to_bits(); num_groups * size_n];
+                let mut scales_u16: Vec<u16> =
+                    vec![half::f16::from_f32(1.0).to_bits(); num_groups * size_n];
                 super::super::marlin_permute_scales(&mut scales_u16, size_k, size_n, group_size);
 
                 let s_nbytes = scales_u16.len() * 2;
                 let s_ptr = driver::mem_alloc(s_nbytes).expect("alloc scales");
                 driver::memcpy_htod_async(
-                    s_ptr, scales_u16.as_ptr() as *const u8, s_nbytes, stream
-                ).expect("h2d scales");
+                    s_ptr,
+                    scales_u16.as_ptr() as *const u8,
+                    s_nbytes,
+                    stream,
+                )
+                .expect("h2d scales");
                 let scales = GpuTensor::new(s_ptr, &[num_groups, size_n], DType::F16);
 
                 // 4. Activation: [1, K] f16, all ones
                 let a_data: Vec<u16> = vec![half::f16::from_f32(1.0).to_bits(); size_m * size_k];
                 let a_nbytes = a_data.len() * 2;
                 let a_ptr = driver::mem_alloc(a_nbytes).expect("alloc a");
-                driver::memcpy_htod_async(
-                    a_ptr, a_data.as_ptr() as *const u8, a_nbytes, stream
-                ).expect("h2d a");
+                driver::memcpy_htod_async(a_ptr, a_data.as_ptr() as *const u8, a_nbytes, stream)
+                    .expect("h2d a");
                 let a = GpuTensor::new(a_ptr, &[size_m, size_k], DType::F16);
 
                 // 5. Workspace
@@ -825,15 +818,22 @@ mod tests {
                     a,
                     repacked.as_gpu_tensor(),
                     scales,
-                    None,      // no zeros
-                    None,      // no g_idx
-                    None,      // no perm
-                    None,      // no bias
+                    None, // no zeros
+                    None, // no g_idx
+                    None, // no perm
+                    None, // no bias
                     workspace,
-                    size_m, size_n, size_k,
-                    num_groups, group_size,
-                    false, false, 0, 0,
-                    &mut alloc, stream,
+                    size_m,
+                    size_n,
+                    size_k,
+                    num_groups,
+                    group_size,
+                    false,
+                    false,
+                    0,
+                    0,
+                    &mut alloc,
+                    stream,
                 );
 
                 driver::stream_synchronize(stream).expect("sync");
@@ -895,7 +895,13 @@ mod tests {
                 let gptq_count = gptq_rows * size_n;
                 let gptq_data = vec![0x99999999u32; gptq_count];
                 let gptq_ptr = driver::mem_alloc(gptq_count * 4).expect("alloc");
-                driver::memcpy_htod_async(gptq_ptr, gptq_data.as_ptr() as *const u8, gptq_count * 4, stream).expect("h2d");
+                driver::memcpy_htod_async(
+                    gptq_ptr,
+                    gptq_data.as_ptr() as *const u8,
+                    gptq_count * 4,
+                    stream,
+                )
+                .expect("h2d");
                 let gptq_gpu = GpuTensor::new(gptq_ptr, &[gptq_rows, size_n], DType::U32);
 
                 let repacked = crate::kernels::gptq_repack(
@@ -914,13 +920,25 @@ mod tests {
 
                 let s_nbytes = scales_u16.len() * 2;
                 let s_ptr = driver::mem_alloc(s_nbytes).expect("alloc");
-                driver::memcpy_htod_async(s_ptr, scales_u16.as_ptr() as *const u8, s_nbytes, stream).expect("h2d");
+                driver::memcpy_htod_async(
+                    s_ptr,
+                    scales_u16.as_ptr() as *const u8,
+                    s_nbytes,
+                    stream,
+                )
+                .expect("h2d");
                 let scales = GpuTensor::new(s_ptr, &[num_groups, size_n], DType::F16);
 
                 // Input: all ones
                 let a_data: Vec<u16> = vec![half::f16::from_f32(1.0).to_bits(); size_m * size_k];
                 let a_ptr = driver::mem_alloc(a_data.len() * 2).expect("alloc");
-                driver::memcpy_htod_async(a_ptr, a_data.as_ptr() as *const u8, a_data.len() * 2, stream).expect("h2d");
+                driver::memcpy_htod_async(
+                    a_ptr,
+                    a_data.as_ptr() as *const u8,
+                    a_data.len() * 2,
+                    stream,
+                )
+                .expect("h2d");
                 let a = GpuTensor::new(a_ptr, &[size_m, size_k], DType::F16);
 
                 let ws_ptr = driver::mem_alloc(128 * 4).expect("alloc");
@@ -928,10 +946,25 @@ mod tests {
                 let workspace = GpuTensor::new(ws_ptr, &[128], DType::I32);
 
                 let out = crate::kernels::marlin_gemm(
-                    a, repacked.as_gpu_tensor(), scales,
-                    None, None, None, None, workspace,
-                    size_m, size_n, size_k, num_groups, group_size,
-                    false, false, 0, 0, &mut alloc, stream,
+                    a,
+                    repacked.as_gpu_tensor(),
+                    scales,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace,
+                    size_m,
+                    size_n,
+                    size_k,
+                    num_groups,
+                    group_size,
+                    false,
+                    false,
+                    0,
+                    0,
+                    &mut alloc,
+                    stream,
                 );
 
                 driver::stream_synchronize(stream).expect("sync");
@@ -948,7 +981,9 @@ mod tests {
                 for (i, &bits) in result.iter().enumerate() {
                     let val = half::f16::from_bits(bits).to_f32();
                     let err = (val - expected).abs();
-                    if err > max_err { max_err = err; }
+                    if err > max_err {
+                        max_err = err;
+                    }
                     if i < 8 {
                         eprintln!("out[{i}] = {val} (expected {expected}, err={err})");
                     }
@@ -980,20 +1015,31 @@ mod tests {
             let file = std::fs::File::open(&st_path).unwrap();
             let mmap = unsafe { memmap2::MmapOptions::new().map(&file).unwrap() };
             let header_size = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
-            let header: serde_json::Value = serde_json::from_slice(&mmap[8..8+header_size]).unwrap();
+            let header: serde_json::Value =
+                serde_json::from_slice(&mmap[8..8 + header_size]).unwrap();
             let data_start = 8 + header_size;
 
             let prefix = "model.layers.0.self_attn.q_proj";
 
             // Load qweight [K/8, N] I32
             let qw_info = &header[format!("{prefix}.qweight")];
-            let qw_shape: Vec<usize> = qw_info["shape"].as_array().unwrap().iter()
-                .map(|v| v.as_u64().unwrap() as usize).collect();
-            let qw_offsets: Vec<usize> = qw_info["data_offsets"].as_array().unwrap().iter()
-                .map(|v| v.as_u64().unwrap() as usize).collect();
-            let qw_bytes = &mmap[data_start+qw_offsets[0]..data_start+qw_offsets[1]];
-            let qw_i32: Vec<i32> = qw_bytes.chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            let qw_shape: Vec<usize> = qw_info["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let qw_offsets: Vec<usize> = qw_info["data_offsets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let qw_bytes = &mmap[data_start + qw_offsets[0]..data_start + qw_offsets[1]];
+            let qw_i32: Vec<i32> = qw_bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
 
             let size_k = qw_shape[0] * 8;
             let size_n = qw_shape[1];
@@ -1003,11 +1049,16 @@ mod tests {
 
             // Load scales [num_groups, N] F16
             let sc_info = &header[format!("{prefix}.scales")];
-            let sc_offsets: Vec<usize> = sc_info["data_offsets"].as_array().unwrap().iter()
-                .map(|v| v.as_u64().unwrap() as usize).collect();
-            let sc_bytes = &mmap[data_start+sc_offsets[0]..data_start+sc_offsets[1]];
-            let scales_f32: Vec<f32> = sc_bytes.chunks_exact(2)
-                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0],c[1]])).to_f32())
+            let sc_offsets: Vec<usize> = sc_info["data_offsets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let sc_bytes = &mmap[data_start + sc_offsets[0]..data_start + sc_offsets[1]];
+            let scales_f32: Vec<f32> = sc_bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
                 .collect();
 
             // CPU reference: dequantize and compute y = x @ W^T
@@ -1035,7 +1086,8 @@ mod tests {
                 // Upload qweight
                 let qw_nbytes = qw_bytes.len();
                 let qw_ptr = driver::mem_alloc(qw_nbytes).expect("alloc");
-                driver::memcpy_htod_async(qw_ptr, qw_bytes.as_ptr(), qw_nbytes, stream).expect("h2d");
+                driver::memcpy_htod_async(qw_ptr, qw_bytes.as_ptr(), qw_nbytes, stream)
+                    .expect("h2d");
                 let qw_gpu = GpuTensor::new(qw_ptr, &qw_shape, DType::I32);
 
                 // Repack
@@ -1044,29 +1096,53 @@ mod tests {
                 );
 
                 // Permute scales on CPU, then upload
-                let mut scales_u16: Vec<u16> = sc_bytes.chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0],c[1]])).collect();
+                let mut scales_u16: Vec<u16> = sc_bytes
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
                 super::super::marlin_permute_scales(&mut scales_u16, size_k, size_n, group_size);
                 let s_bytes: Vec<u8> = scales_u16.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let s_ptr = driver::mem_alloc(s_bytes.len()).expect("alloc");
-                driver::memcpy_htod_async(s_ptr, s_bytes.as_ptr(), s_bytes.len(), stream).expect("h2d");
+                driver::memcpy_htod_async(s_ptr, s_bytes.as_ptr(), s_bytes.len(), stream)
+                    .expect("h2d");
                 let scales_gpu = GpuTensor::new(s_ptr, &[num_groups, size_n], DType::F16);
 
                 // Input: all ones [1, K]
                 let a_data: Vec<u16> = vec![half::f16::from_f32(1.0).to_bits(); size_k];
                 let a_ptr = driver::mem_alloc(a_data.len() * 2).expect("alloc");
-                driver::memcpy_htod_async(a_ptr, a_data.as_ptr() as *const u8, a_data.len()*2, stream).expect("h2d");
+                driver::memcpy_htod_async(
+                    a_ptr,
+                    a_data.as_ptr() as *const u8,
+                    a_data.len() * 2,
+                    stream,
+                )
+                .expect("h2d");
                 let a = GpuTensor::new(a_ptr, &[1, size_k], DType::F16);
 
-                let ws_ptr = driver::mem_alloc(256*4).expect("alloc");
-                driver::memset_d8(ws_ptr, 0, 256*4, stream).expect("memset");
+                let ws_ptr = driver::mem_alloc(256 * 4).expect("alloc");
+                driver::memset_d8(ws_ptr, 0, 256 * 4, stream).expect("memset");
                 let workspace = GpuTensor::new(ws_ptr, &[256], DType::I32);
 
                 let out = crate::kernels::marlin_gemm(
-                    a, repacked.as_gpu_tensor(), scales_gpu,
-                    None, None, None, None, workspace,
-                    1, size_n, size_k, num_groups, group_size,
-                    false, false, 0, 0, &mut alloc, stream,
+                    a,
+                    repacked.as_gpu_tensor(),
+                    scales_gpu,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace,
+                    1,
+                    size_n,
+                    size_k,
+                    num_groups,
+                    group_size,
+                    false,
+                    false,
+                    0,
+                    0,
+                    &mut alloc,
+                    stream,
                 );
 
                 driver::stream_synchronize(stream).expect("sync");
@@ -1077,7 +1153,9 @@ mod tests {
                 driver::stream_synchronize(stream).expect("sync");
 
                 let gpu_output: Vec<f32> = std::slice::from_raw_parts(host as *const u16, size_n)
-                    .iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
+                    .iter()
+                    .map(|&b| half::f16::from_bits(b).to_f32())
+                    .collect();
 
                 eprintln!("GPU output first8:   {:?}", &gpu_output[..8]);
 
@@ -1092,10 +1170,16 @@ mod tests {
                     }
                 }
                 eprintln!("max error: {max_err} at index {max_err_idx}");
-                eprintln!("  CPU[{max_err_idx}]={}, GPU[{max_err_idx}]={}", cpu_output[max_err_idx], gpu_output[max_err_idx]);
+                eprintln!(
+                    "  CPU[{max_err_idx}]={}, GPU[{max_err_idx}]={}",
+                    cpu_output[max_err_idx], gpu_output[max_err_idx]
+                );
 
                 // F16 has limited precision, allow reasonable error
-                assert!(max_err < 5.0, "max_err={max_err} too large — GEMM mismatch at idx {max_err_idx}");
+                assert!(
+                    max_err < 5.0,
+                    "max_err={max_err} too large — GEMM mismatch at idx {max_err_idx}"
+                );
 
                 driver::mem_free_host(host).expect("free");
                 driver::stream_destroy(stream).expect("destroy");
@@ -1120,32 +1204,50 @@ mod tests {
             let file = std::fs::File::open(&st_path).unwrap();
             let mmap = unsafe { memmap2::MmapOptions::new().map(&file).unwrap() };
             let header_size = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
-            let header: serde_json::Value = serde_json::from_slice(&mmap[8..8+header_size]).unwrap();
+            let header: serde_json::Value =
+                serde_json::from_slice(&mmap[8..8 + header_size]).unwrap();
             let data_start = 8 + header_size;
 
             let prefix = "model.layers.0.mlp.gate_proj";
 
             let qw_info = &header[format!("{prefix}.qweight")];
-            let qw_shape: Vec<usize> = qw_info["shape"].as_array().unwrap().iter()
-                .map(|v| v.as_u64().unwrap() as usize).collect();
-            let qw_offsets: Vec<usize> = qw_info["data_offsets"].as_array().unwrap().iter()
-                .map(|v| v.as_u64().unwrap() as usize).collect();
-            let qw_bytes = &mmap[data_start+qw_offsets[0]..data_start+qw_offsets[1]];
-            let qw_i32: Vec<i32> = qw_bytes.chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            let qw_shape: Vec<usize> = qw_info["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let qw_offsets: Vec<usize> = qw_info["data_offsets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let qw_bytes = &mmap[data_start + qw_offsets[0]..data_start + qw_offsets[1]];
+            let qw_i32: Vec<i32> = qw_bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
 
             let size_k = qw_shape[0] * 8;
             let size_n = qw_shape[1];
             let group_size = 128usize;
             let num_groups = size_k / group_size;
-            eprintln!("gate_proj: shape={qw_shape:?}, size_k={size_k}, size_n={size_n}, num_groups={num_groups}");
+            eprintln!(
+                "gate_proj: shape={qw_shape:?}, size_k={size_k}, size_n={size_n}, num_groups={num_groups}"
+            );
 
             let sc_info = &header[format!("{prefix}.scales")];
-            let sc_offsets: Vec<usize> = sc_info["data_offsets"].as_array().unwrap().iter()
-                .map(|v| v.as_u64().unwrap() as usize).collect();
-            let sc_bytes = &mmap[data_start+sc_offsets[0]..data_start+sc_offsets[1]];
-            let scales_f32: Vec<f32> = sc_bytes.chunks_exact(2)
-                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0],c[1]])).to_f32())
+            let sc_offsets: Vec<usize> = sc_info["data_offsets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let sc_bytes = &mmap[data_start + sc_offsets[0]..data_start + sc_offsets[1]];
+            let scales_f32: Vec<f32> = sc_bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
                 .collect();
 
             // CPU reference dequantization
@@ -1169,33 +1271,58 @@ mod tests {
             unsafe {
                 let qw_nbytes = qw_bytes.len();
                 let qw_ptr = driver::mem_alloc(qw_nbytes).expect("alloc");
-                driver::memcpy_htod_async(qw_ptr, qw_bytes.as_ptr(), qw_nbytes, stream).expect("h2d");
+                driver::memcpy_htod_async(qw_ptr, qw_bytes.as_ptr(), qw_nbytes, stream)
+                    .expect("h2d");
                 let qw_gpu = GpuTensor::new(qw_ptr, &qw_shape, DType::I32);
 
                 let repacked = crate::kernels::gptq_repack(
                     qw_gpu, None, size_k, size_n, 0, &mut alloc, stream,
                 );
 
-                let mut scales_u16: Vec<u16> = sc_bytes.chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0],c[1]])).collect();
+                let mut scales_u16: Vec<u16> = sc_bytes
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
                 super::super::marlin_permute_scales(&mut scales_u16, size_k, size_n, group_size);
                 let s_bytes: Vec<u8> = scales_u16.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let s_ptr = driver::mem_alloc(s_bytes.len()).expect("alloc");
-                driver::memcpy_htod_async(s_ptr, s_bytes.as_ptr(), s_bytes.len(), stream).expect("h2d");
+                driver::memcpy_htod_async(s_ptr, s_bytes.as_ptr(), s_bytes.len(), stream)
+                    .expect("h2d");
                 let scales_gpu = GpuTensor::new(s_ptr, &[num_groups, size_n], DType::F16);
 
                 let a_data: Vec<u16> = vec![half::f16::from_f32(1.0).to_bits(); size_k];
                 let a_ptr = driver::mem_alloc(a_data.len() * 2).expect("alloc");
-                driver::memcpy_htod_async(a_ptr, a_data.as_ptr() as *const u8, a_data.len()*2, stream).expect("h2d");
+                driver::memcpy_htod_async(
+                    a_ptr,
+                    a_data.as_ptr() as *const u8,
+                    a_data.len() * 2,
+                    stream,
+                )
+                .expect("h2d");
                 let a = GpuTensor::new(a_ptr, &[1, size_k], DType::F16);
 
                 let workspace = crate::weights::alloc_marlin_workspace(142, stream).expect("ws");
 
                 let out = crate::kernels::marlin_gemm(
-                    a, repacked.as_gpu_tensor(), scales_gpu,
-                    None, None, None, None, workspace,
-                    1, size_n, size_k, num_groups, group_size,
-                    false, false, 0, 0, &mut alloc, stream,
+                    a,
+                    repacked.as_gpu_tensor(),
+                    scales_gpu,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace,
+                    1,
+                    size_n,
+                    size_k,
+                    num_groups,
+                    group_size,
+                    false,
+                    false,
+                    0,
+                    0,
+                    &mut alloc,
+                    stream,
                 );
 
                 driver::stream_synchronize(stream).expect("sync");
@@ -1206,7 +1333,9 @@ mod tests {
                 driver::stream_synchronize(stream).expect("sync");
 
                 let gpu_output: Vec<f32> = std::slice::from_raw_parts(host as *const u16, size_n)
-                    .iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
+                    .iter()
+                    .map(|&b| half::f16::from_bits(b).to_f32())
+                    .collect();
 
                 eprintln!("GPU output first8:   {:?}", &gpu_output[..8]);
 
@@ -1245,32 +1374,50 @@ mod tests {
             let file = std::fs::File::open(&st_path).unwrap();
             let mmap = unsafe { memmap2::MmapOptions::new().map(&file).unwrap() };
             let header_size = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
-            let header: serde_json::Value = serde_json::from_slice(&mmap[8..8+header_size]).unwrap();
+            let header: serde_json::Value =
+                serde_json::from_slice(&mmap[8..8 + header_size]).unwrap();
             let data_start = 8 + header_size;
 
             let prefix = "model.layers.0.mlp.down_proj";
 
             let qw_info = &header[format!("{prefix}.qweight")];
-            let qw_shape: Vec<usize> = qw_info["shape"].as_array().unwrap().iter()
-                .map(|v| v.as_u64().unwrap() as usize).collect();
-            let qw_offsets: Vec<usize> = qw_info["data_offsets"].as_array().unwrap().iter()
-                .map(|v| v.as_u64().unwrap() as usize).collect();
-            let qw_bytes = &mmap[data_start+qw_offsets[0]..data_start+qw_offsets[1]];
-            let qw_i32: Vec<i32> = qw_bytes.chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+            let qw_shape: Vec<usize> = qw_info["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let qw_offsets: Vec<usize> = qw_info["data_offsets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let qw_bytes = &mmap[data_start + qw_offsets[0]..data_start + qw_offsets[1]];
+            let qw_i32: Vec<i32> = qw_bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
 
             let size_k = qw_shape[0] * 8;
             let size_n = qw_shape[1];
             let group_size = 128usize;
             let num_groups = size_k / group_size;
-            eprintln!("down_proj: shape={qw_shape:?}, size_k={size_k}, size_n={size_n}, num_groups={num_groups}");
+            eprintln!(
+                "down_proj: shape={qw_shape:?}, size_k={size_k}, size_n={size_n}, num_groups={num_groups}"
+            );
 
             let sc_info = &header[format!("{prefix}.scales")];
-            let sc_offsets: Vec<usize> = sc_info["data_offsets"].as_array().unwrap().iter()
-                .map(|v| v.as_u64().unwrap() as usize).collect();
-            let sc_bytes = &mmap[data_start+sc_offsets[0]..data_start+sc_offsets[1]];
-            let scales_f32: Vec<f32> = sc_bytes.chunks_exact(2)
-                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0],c[1]])).to_f32())
+            let sc_offsets: Vec<usize> = sc_info["data_offsets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect();
+            let sc_bytes = &mmap[data_start + sc_offsets[0]..data_start + sc_offsets[1]];
+            let scales_f32: Vec<f32> = sc_bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
                 .collect();
 
             let mut cpu_output = vec![0.0f32; size_n];
@@ -1293,33 +1440,58 @@ mod tests {
             unsafe {
                 let qw_nbytes = qw_bytes.len();
                 let qw_ptr = driver::mem_alloc(qw_nbytes).expect("alloc");
-                driver::memcpy_htod_async(qw_ptr, qw_bytes.as_ptr(), qw_nbytes, stream).expect("h2d");
+                driver::memcpy_htod_async(qw_ptr, qw_bytes.as_ptr(), qw_nbytes, stream)
+                    .expect("h2d");
                 let qw_gpu = GpuTensor::new(qw_ptr, &qw_shape, DType::I32);
 
                 let repacked = crate::kernels::gptq_repack(
                     qw_gpu, None, size_k, size_n, 0, &mut alloc, stream,
                 );
 
-                let mut scales_u16: Vec<u16> = sc_bytes.chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0],c[1]])).collect();
+                let mut scales_u16: Vec<u16> = sc_bytes
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
                 super::super::marlin_permute_scales(&mut scales_u16, size_k, size_n, group_size);
                 let s_bytes: Vec<u8> = scales_u16.iter().flat_map(|v| v.to_le_bytes()).collect();
                 let s_ptr = driver::mem_alloc(s_bytes.len()).expect("alloc");
-                driver::memcpy_htod_async(s_ptr, s_bytes.as_ptr(), s_bytes.len(), stream).expect("h2d");
+                driver::memcpy_htod_async(s_ptr, s_bytes.as_ptr(), s_bytes.len(), stream)
+                    .expect("h2d");
                 let scales_gpu = GpuTensor::new(s_ptr, &[num_groups, size_n], DType::F16);
 
                 let a_data: Vec<u16> = vec![half::f16::from_f32(1.0).to_bits(); size_k];
                 let a_ptr = driver::mem_alloc(a_data.len() * 2).expect("alloc");
-                driver::memcpy_htod_async(a_ptr, a_data.as_ptr() as *const u8, a_data.len()*2, stream).expect("h2d");
+                driver::memcpy_htod_async(
+                    a_ptr,
+                    a_data.as_ptr() as *const u8,
+                    a_data.len() * 2,
+                    stream,
+                )
+                .expect("h2d");
                 let a = GpuTensor::new(a_ptr, &[1, size_k], DType::F16);
 
                 let workspace = crate::weights::alloc_marlin_workspace(142, stream).expect("ws");
 
                 let out = crate::kernels::marlin_gemm(
-                    a, repacked.as_gpu_tensor(), scales_gpu,
-                    None, None, None, None, workspace,
-                    1, size_n, size_k, num_groups, group_size,
-                    false, false, 0, 0, &mut alloc, stream,
+                    a,
+                    repacked.as_gpu_tensor(),
+                    scales_gpu,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace,
+                    1,
+                    size_n,
+                    size_k,
+                    num_groups,
+                    group_size,
+                    false,
+                    false,
+                    0,
+                    0,
+                    &mut alloc,
+                    stream,
                 );
 
                 driver::stream_synchronize(stream).expect("sync");
@@ -1330,7 +1502,9 @@ mod tests {
                 driver::stream_synchronize(stream).expect("sync");
 
                 let gpu_output: Vec<f32> = std::slice::from_raw_parts(host as *const u16, size_n)
-                    .iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
+                    .iter()
+                    .map(|&b| half::f16::from_bits(b).to_f32())
+                    .collect();
 
                 eprintln!("GPU output first8:   {:?}", &gpu_output[..8]);
 
@@ -1370,7 +1544,8 @@ mod tests {
             let file = std::fs::File::open(&st_path).unwrap();
             let mmap = unsafe { memmap2::MmapOptions::new().map(&file).unwrap() };
             let header_size = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
-            let header: serde_json::Value = serde_json::from_slice(&mmap[8..8+header_size]).unwrap();
+            let header: serde_json::Value =
+                serde_json::from_slice(&mmap[8..8 + header_size]).unwrap();
             let data_start = 8 + header_size;
 
             let group_size = 128usize;
@@ -1378,47 +1553,85 @@ mod tests {
             let intermediate_size = 4864usize;
 
             // Helper: load GPTQ linear layer (qweight + scales) → repacked + permuted
-            let load_linear = |prefix: &str, alloc: &mut CachingAllocator| -> (crate::alloc::OwnedTensor, GpuTensor, usize, usize, usize) {
-                let qw_info = &header[format!("{prefix}.qweight")];
-                let qw_shape: Vec<usize> = qw_info["shape"].as_array().unwrap().iter()
-                    .map(|v| v.as_u64().unwrap() as usize).collect();
-                let qw_offsets: Vec<usize> = qw_info["data_offsets"].as_array().unwrap().iter()
-                    .map(|v| v.as_u64().unwrap() as usize).collect();
-                let qw_bytes = &mmap[data_start+qw_offsets[0]..data_start+qw_offsets[1]];
-                let size_k = qw_shape[0] * 8;
-                let size_n = qw_shape[1];
-                let num_groups = size_k / group_size;
+            let load_linear =
+                |prefix: &str,
+                 alloc: &mut CachingAllocator|
+                 -> (crate::alloc::OwnedTensor, GpuTensor, usize, usize, usize) {
+                    let qw_info = &header[format!("{prefix}.qweight")];
+                    let qw_shape: Vec<usize> = qw_info["shape"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_u64().unwrap() as usize)
+                        .collect();
+                    let qw_offsets: Vec<usize> = qw_info["data_offsets"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.as_u64().unwrap() as usize)
+                        .collect();
+                    let qw_bytes = &mmap[data_start + qw_offsets[0]..data_start + qw_offsets[1]];
+                    let size_k = qw_shape[0] * 8;
+                    let size_n = qw_shape[1];
+                    let num_groups = size_k / group_size;
 
-                unsafe {
-                    let qw_ptr = driver::mem_alloc(qw_bytes.len()).expect("alloc");
-                    driver::memcpy_htod_async(qw_ptr, qw_bytes.as_ptr(), qw_bytes.len(), stream).expect("h2d");
-                    let qw_gpu = GpuTensor::new(qw_ptr, &qw_shape, DType::I32);
-                    let repacked = crate::kernels::gptq_repack(qw_gpu, None, size_k, size_n, 0, alloc, stream);
+                    unsafe {
+                        let qw_ptr = driver::mem_alloc(qw_bytes.len()).expect("alloc");
+                        driver::memcpy_htod_async(
+                            qw_ptr,
+                            qw_bytes.as_ptr(),
+                            qw_bytes.len(),
+                            stream,
+                        )
+                        .expect("h2d");
+                        let qw_gpu = GpuTensor::new(qw_ptr, &qw_shape, DType::I32);
+                        let repacked = crate::kernels::gptq_repack(
+                            qw_gpu, None, size_k, size_n, 0, alloc, stream,
+                        );
 
-                    let sc_info = &header[format!("{prefix}.scales")];
-                    let sc_offsets: Vec<usize> = sc_info["data_offsets"].as_array().unwrap().iter()
-                        .map(|v| v.as_u64().unwrap() as usize).collect();
-                    let sc_bytes = &mmap[data_start+sc_offsets[0]..data_start+sc_offsets[1]];
-                    let mut scales_u16: Vec<u16> = sc_bytes.chunks_exact(2)
-                        .map(|c| u16::from_le_bytes([c[0],c[1]])).collect();
-                    super::super::marlin_permute_scales(&mut scales_u16, size_k, size_n, group_size);
-                    let s_bytes: Vec<u8> = scales_u16.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    let s_ptr = driver::mem_alloc(s_bytes.len()).expect("alloc");
-                    driver::memcpy_htod_async(s_ptr, s_bytes.as_ptr(), s_bytes.len(), stream).expect("h2d");
-                    let scales_gpu = GpuTensor::new(s_ptr, &[num_groups, size_n], DType::F16);
+                        let sc_info = &header[format!("{prefix}.scales")];
+                        let sc_offsets: Vec<usize> = sc_info["data_offsets"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|v| v.as_u64().unwrap() as usize)
+                            .collect();
+                        let sc_bytes =
+                            &mmap[data_start + sc_offsets[0]..data_start + sc_offsets[1]];
+                        let mut scales_u16: Vec<u16> = sc_bytes
+                            .chunks_exact(2)
+                            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                            .collect();
+                        super::super::marlin_permute_scales(
+                            &mut scales_u16,
+                            size_k,
+                            size_n,
+                            group_size,
+                        );
+                        let s_bytes: Vec<u8> =
+                            scales_u16.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        let s_ptr = driver::mem_alloc(s_bytes.len()).expect("alloc");
+                        driver::memcpy_htod_async(s_ptr, s_bytes.as_ptr(), s_bytes.len(), stream)
+                            .expect("h2d");
+                        let scales_gpu = GpuTensor::new(s_ptr, &[num_groups, size_n], DType::F16);
 
-                    driver::mem_free(qw_ptr).expect("free original qweight");
+                        driver::mem_free(qw_ptr).expect("free original qweight");
 
-                    (repacked, scales_gpu, size_k, size_n, num_groups)
-                }
-            };
+                        (repacked, scales_gpu, size_k, size_n, num_groups)
+                    }
+                };
 
             let prefix = "model.layers.0.mlp";
-            let (gate_w, gate_s, gate_k, gate_n, gate_ng) = load_linear(&format!("{prefix}.gate_proj"), &mut alloc);
-            let (up_w, up_s, up_k, up_n, up_ng) = load_linear(&format!("{prefix}.up_proj"), &mut alloc);
-            let (down_w, down_s, down_k, down_n, down_ng) = load_linear(&format!("{prefix}.down_proj"), &mut alloc);
+            let (gate_w, gate_s, gate_k, gate_n, gate_ng) =
+                load_linear(&format!("{prefix}.gate_proj"), &mut alloc);
+            let (up_w, up_s, up_k, up_n, up_ng) =
+                load_linear(&format!("{prefix}.up_proj"), &mut alloc);
+            let (down_w, down_s, down_k, down_n, down_ng) =
+                load_linear(&format!("{prefix}.down_proj"), &mut alloc);
 
-            eprintln!("gate: K={gate_k} N={gate_n}, up: K={up_k} N={up_n}, down: K={down_k} N={down_n}");
+            eprintln!(
+                "gate: K={gate_k} N={gate_n}, up: K={up_k} N={up_n}, down: K={down_k} N={down_n}"
+            );
             assert_eq!(gate_k, hidden_size);
             assert_eq!(gate_n, intermediate_size);
             assert_eq!(up_k, hidden_size);
@@ -1430,46 +1643,106 @@ mod tests {
                 let workspace = crate::weights::alloc_marlin_workspace(142, stream).expect("ws");
 
                 // Create input: small values mimicking normed hidden state
-                let input_f32: Vec<f32> = (0..hidden_size).map(|i| (i as f32 * 0.01).sin() * 0.5).collect();
-                let input_f16: Vec<u16> = input_f32.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+                let input_f32: Vec<f32> = (0..hidden_size)
+                    .map(|i| (i as f32 * 0.01).sin() * 0.5)
+                    .collect();
+                let input_f16: Vec<u16> = input_f32
+                    .iter()
+                    .map(|&v| half::f16::from_f32(v).to_bits())
+                    .collect();
                 let a_ptr = driver::mem_alloc(input_f16.len() * 2).expect("alloc");
-                driver::memcpy_htod_async(a_ptr, input_f16.as_ptr() as *const u8, input_f16.len() * 2, stream).expect("h2d");
+                driver::memcpy_htod_async(
+                    a_ptr,
+                    input_f16.as_ptr() as *const u8,
+                    input_f16.len() * 2,
+                    stream,
+                )
+                .expect("h2d");
                 let a = GpuTensor::new(a_ptr, &[1, hidden_size], DType::F16);
 
                 // Step 1: gate(x) → [1, 4864]
                 let gate_out = crate::kernels::marlin_gemm(
-                    a, gate_w.as_gpu_tensor(), gate_s,
-                    None, None, None, None, workspace,
-                    1, gate_n, gate_k, gate_ng, group_size,
-                    false, false, 0, 0, &mut alloc, stream,
+                    a,
+                    gate_w.as_gpu_tensor(),
+                    gate_s,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace,
+                    1,
+                    gate_n,
+                    gate_k,
+                    gate_ng,
+                    group_size,
+                    false,
+                    false,
+                    0,
+                    0,
+                    &mut alloc,
+                    stream,
                 );
 
                 // Step 2: up(x) → [1, 4864]
                 let up_out = crate::kernels::marlin_gemm(
-                    a, up_w.as_gpu_tensor(), up_s,
-                    None, None, None, None, workspace,
-                    1, up_n, up_k, up_ng, group_size,
-                    false, false, 0, 0, &mut alloc, stream,
+                    a,
+                    up_w.as_gpu_tensor(),
+                    up_s,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace,
+                    1,
+                    up_n,
+                    up_k,
+                    up_ng,
+                    group_size,
+                    false,
+                    false,
+                    0,
+                    0,
+                    &mut alloc,
+                    stream,
                 );
 
                 // Step 3: concat → [1, 9728]
                 let gate_up = crate::kernels::concat_dim1(
-                    gate_out.as_gpu_tensor(), up_out.as_gpu_tensor(),
-                    &mut alloc, stream,
+                    gate_out.as_gpu_tensor(),
+                    up_out.as_gpu_tensor(),
+                    &mut alloc,
+                    stream,
                 );
 
                 // Step 4: silu_and_mul → [1, 4864]
                 let activated = crate::kernels::silu_and_mul_fused(
-                    gate_up.as_gpu_tensor(), intermediate_size,
-                    &mut alloc, stream,
+                    gate_up.as_gpu_tensor(),
+                    intermediate_size,
+                    &mut alloc,
+                    stream,
                 );
 
                 // Step 5: down(activated) → [1, 896]
                 let final_out = crate::kernels::marlin_gemm(
-                    activated.as_gpu_tensor(), down_w.as_gpu_tensor(), down_s,
-                    None, None, None, None, workspace,
-                    1, down_n, down_k, down_ng, group_size,
-                    false, false, 0, 0, &mut alloc, stream,
+                    activated.as_gpu_tensor(),
+                    down_w.as_gpu_tensor(),
+                    down_s,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace,
+                    1,
+                    down_n,
+                    down_k,
+                    down_ng,
+                    group_size,
+                    false,
+                    false,
+                    0,
+                    0,
+                    &mut alloc,
+                    stream,
                 );
 
                 driver::stream_synchronize(stream).expect("sync");
@@ -1481,7 +1754,9 @@ mod tests {
                     driver::memcpy_dtoh_async(host, t.raw_ptr(), nbytes, stream).expect("d2h");
                     driver::stream_synchronize(stream).expect("sync");
                     let vals: Vec<f32> = std::slice::from_raw_parts(host as *const u16, n)
-                        .iter().map(|&b| half::f16::from_bits(b).to_f32()).collect();
+                        .iter()
+                        .map(|&b| half::f16::from_bits(b).to_f32())
+                        .collect();
                     driver::mem_free_host(host).expect("free");
                     vals
                 };
@@ -1503,7 +1778,10 @@ mod tests {
 
                 // Also check gate_out and activated aren't near-zero
                 let gate_max = gate_vals.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-                let act_max = activated_vals.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let act_max = activated_vals
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0.0f32, f32::max);
                 eprintln!("gate_max={gate_max}, activated_max={act_max}");
 
                 driver::mem_free(a_ptr).expect("free");
@@ -1514,8 +1792,8 @@ mod tests {
         #[test]
         fn test_cuda_marlin_workspace_alloc() {
             let stream = init_cuda();
-            let workspace = crate::weights::alloc_marlin_workspace(128, stream)
-                .expect("workspace alloc");
+            let workspace =
+                crate::weights::alloc_marlin_workspace(128, stream).expect("workspace alloc");
             assert_eq!(workspace.dim(0), 1024 * 1024); // max(2*128, 1M)
             assert_eq!(workspace.dtype(), DType::I32);
             unsafe { driver::stream_destroy(stream).expect("destroy") };

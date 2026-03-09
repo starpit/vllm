@@ -2623,7 +2623,11 @@ impl Worker for CudaWorker {
         // One pool is shared across all batch sizes so blocks are reused.
         device.caching.begin_allocate_to_pool();
 
-        for &bs in &capture_sizes {
+        // Capture largest batch sizes first (matching Python vLLM). The first
+        // capture establishes the pool's high-water mark; subsequent smaller
+        // captures reuse the same memory — preventing incremental pool growth
+        // that could OOM the driver.
+        for &bs in capture_sizes.iter().rev() {
             info!("Capturing CUDA graph for batch_size={bs}...");
             let kv_ref = kv_cache;
             let model_ref = model;
@@ -2700,7 +2704,8 @@ impl Worker for CudaWorker {
             let max_prefill = *prefill_sizes.last().unwrap();
             match unsafe { PrefillGraphRunner::new(max_prefill, vocab_size, self.model_dtype) } {
                 Ok(mut prefill_runner) => {
-                    for &num_tokens in &prefill_sizes {
+                    // Capture largest first (matching Python vLLM).
+                    for &num_tokens in prefill_sizes.iter().rev() {
                         info!("Capturing prefill CUDA graph for num_tokens={num_tokens}...");
                         let kv_ref = kv_cache;
                         let model_ref = model;

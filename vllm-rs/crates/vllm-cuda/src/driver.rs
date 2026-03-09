@@ -92,6 +92,14 @@ pub unsafe fn mem_free_host(ptr: *mut u8) -> Result<()> {
     check(sys::cuMemFreeHost(ptr as *mut std::ffi::c_void))
 }
 
+/// Query free and total device memory in bytes.
+pub unsafe fn mem_get_info() -> Result<(usize, usize)> {
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    check(sys::cuMemGetInfo_v2(&mut free, &mut total))?;
+    Ok((free, total))
+}
+
 /// Set device memory to zero.
 pub unsafe fn memset_d8(ptr: *mut u8, value: u8, bytes: usize, stream: CUstream) -> Result<()> {
     check(sys::cuMemsetD8Async(

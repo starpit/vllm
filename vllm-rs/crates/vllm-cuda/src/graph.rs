@@ -32,12 +32,8 @@ const MAX_BLOCKS_PER_SEQ: usize = 512;
 /// A single captured CUDA graph for a specific batch size.
 struct CapturedGraph {
     exec: CUgraphExec,
-    /// Where the model wrote output logits during capture.
-    output_ptr: *const u8,
     #[allow(dead_code)]
-    output_numel: usize,
-    /// Where the argmax kernel wrote token IDs during capture.
-    argmax_ptr: *const u8,
+    batch_size: usize,
 }
 
 /// CUDA graph runner for decode batches.
@@ -49,6 +45,11 @@ pub struct CudaGraphRunner {
     cu_seqlens_q: *mut u8,
     seqused_k: *mut u8,
     block_table: *mut u8,
+    /// Shared output buffer for logits — `[max_batch, vocab_size]` in model dtype.
+    /// All captured graphs copy their logits here, so we only keep one allocation.
+    shared_logits: *mut u8,
+    /// Shared output buffer for argmax token IDs — `[max_batch]` in U32.
+    shared_argmax: *mut u8,
     max_batch: usize,
     dtype: DType,
     vocab_size: usize,
@@ -64,6 +65,8 @@ impl CudaGraphRunner {
         let cu_seqlens_q = driver::mem_alloc((max_batch + 1) * 4)?;
         let seqused_k = driver::mem_alloc(max_batch * 4)?;
         let block_table = driver::mem_alloc(max_batch * MAX_BLOCKS_PER_SEQ * 4)?;
+        let shared_logits = driver::mem_alloc(max_batch * vocab_size * dtype.size_bytes())?;
+        let shared_argmax = driver::mem_alloc(max_batch * 4)?;
 
         Ok(Self {
             graphs: HashMap::new(),
@@ -73,6 +76,8 @@ impl CudaGraphRunner {
             cu_seqlens_q,
             seqused_k,
             block_table,
+            shared_logits,
+            shared_argmax,
             max_batch,
             dtype,
             vocab_size,
@@ -136,15 +141,31 @@ impl CudaGraphRunner {
         device.caching.free_leaked_blocks();
         let inputs = self.input_tensors(batch_size);
 
+        let logits_bytes = batch_size * self.vocab_size * self.dtype.size_bytes();
+        let argmax_bytes = batch_size * 4;
+
         driver::stream_begin_capture(device.compute_stream)?;
         let logits = forward_fn(inputs, device);
         let argmax_out =
             kernels::argmax_batched(logits, &mut device.caching, device.compute_stream);
+        // Copy logits and argmax into shared buffers (recorded in graph).
+        driver::memcpy_dtod_async(
+            self.shared_logits,
+            logits.raw_ptr() as *const u8,
+            logits_bytes,
+            device.compute_stream,
+        )?;
+        driver::memcpy_dtod_async(
+            self.shared_argmax,
+            argmax_out.as_gpu_tensor().raw_ptr() as *const u8,
+            argmax_bytes,
+            device.compute_stream,
+        )?;
         // Scatter sampled token IDs into persistent input_ids for the next step.
         driver::memcpy_dtod_async(
             self.input_ids,
-            argmax_out.as_gpu_tensor().raw_ptr() as *const u8,
-            batch_size * 4,
+            self.shared_argmax as *const u8,
+            argmax_bytes,
             device.compute_stream,
         )?;
         let graph = driver::stream_end_capture(device.compute_stream)?;
@@ -152,34 +173,16 @@ impl CudaGraphRunner {
         let exec = driver::graph_instantiate(graph)?;
         driver::graph_destroy(graph)?;
 
-        let output_ptr = logits.raw_ptr() as *const u8;
-        let output_numel = logits.numel();
-        let argmax_ptr = argmax_out.as_gpu_tensor().raw_ptr() as *const u8;
+        // Free all leaked blocks from this capture — shared buffers are outside the pool.
+        device.caching.free_leaked_blocks();
 
-        // Pool stays active — the caller manages it across all captures.
-        // Free leaked blocks from this capture (but keep graph outputs).
-        let mut keep: Vec<*const u8> = Vec::new();
-        for g in self.graphs.values() {
-            keep.push(g.output_ptr);
-            keep.push(g.argmax_ptr);
-        }
-        keep.push(output_ptr);
-        keep.push(argmax_ptr);
-        device.caching.free_leaked_blocks_except(&keep);
-
-        let captured = CapturedGraph {
-            exec,
-            output_ptr,
-            output_numel,
-            argmax_ptr,
-        };
+        let captured = CapturedGraph { exec, batch_size };
         self.graphs.insert(batch_size, captured);
 
         tracing::info!(
-            "CUDA graph captured for batch_size={} (with argmax), output at {:?} ({} elements)",
+            "CUDA graph captured for batch_size={} (with argmax), shared output ({} logit elements)",
             batch_size,
-            output_ptr,
-            output_numel,
+            batch_size * self.vocab_size,
         );
 
         Ok(())
@@ -250,11 +253,11 @@ impl CudaGraphRunner {
         driver::graph_launch(graph.exec, device.compute_stream)?;
 
         let logits = GpuTensor::new(
-            graph.output_ptr as *mut u8,
+            self.shared_logits,
             &[batch_size, self.vocab_size],
             self.dtype,
         );
-        let token_ids = GpuTensor::new(graph.argmax_ptr as *mut u8, &[batch_size], DType::U32);
+        let token_ids = GpuTensor::new(self.shared_argmax, &[batch_size], DType::U32);
 
         Ok(ReplayOutput { logits, token_ids })
     }
@@ -311,11 +314,11 @@ impl CudaGraphRunner {
         driver::graph_launch(graph.exec, stream)?;
 
         let logits = GpuTensor::new(
-            graph.output_ptr as *mut u8,
+            self.shared_logits,
             &[batch_size, self.vocab_size],
             self.dtype,
         );
-        let token_ids = GpuTensor::new(graph.argmax_ptr as *mut u8, &[batch_size], DType::U32);
+        let token_ids = GpuTensor::new(self.shared_argmax, &[batch_size], DType::U32);
 
         Ok(ReplayOutput { logits, token_ids })
     }
@@ -366,14 +369,12 @@ impl CudaGraphRunner {
     }
 
     /// Get all GPU addresses that must be kept alive (not freed).
-    /// These are the baked-in output addresses from captured graphs.
+    /// With shared buffers, only the two shared output pointers need pinning.
     pub fn pinned_addresses(&self) -> Vec<*const u8> {
-        let mut addrs = Vec::new();
-        for g in self.graphs.values() {
-            addrs.push(g.output_ptr);
-            addrs.push(g.argmax_ptr);
-        }
-        addrs
+        vec![
+            self.shared_logits as *const u8,
+            self.shared_argmax as *const u8,
+        ]
     }
 }
 
@@ -395,6 +396,8 @@ impl Drop for CudaGraphRunner {
             let _ = driver::mem_free(self.cu_seqlens_q);
             let _ = driver::mem_free(self.seqused_k);
             let _ = driver::mem_free(self.block_table);
+            let _ = driver::mem_free(self.shared_logits);
+            let _ = driver::mem_free(self.shared_argmax);
         }
     }
 }
@@ -419,10 +422,8 @@ pub const GRAPH_MAX_BLOCKS_PER_SEQ: usize = MAX_BLOCKS_PER_SEQ;
 
 struct CapturedPrefillGraph {
     exec: CUgraphExec,
-    output_ptr: *const u8,
     #[allow(dead_code)]
-    output_numel: usize,
-    argmax_ptr: *const u8,
+    num_tokens: usize,
 }
 
 pub struct PrefillGraphRunner {
@@ -434,6 +435,10 @@ pub struct PrefillGraphRunner {
     seqused_k: *mut u8,
     block_table: *mut u8,
     last_token_indices: *mut u8,
+    /// Shared output buffer for logits — `[1, vocab_size]` in model dtype (prefill = 1 output).
+    shared_logits: *mut u8,
+    /// Shared output buffer for argmax — `[1]` in U32.
+    shared_argmax: *mut u8,
     max_tokens: usize,
     dtype: DType,
     vocab_size: usize,
@@ -461,6 +466,9 @@ impl PrefillGraphRunner {
         let seqused_k = driver::mem_alloc(4)?;
         let block_table = driver::mem_alloc(MAX_BLOCKS_PER_SEQ * 4)?;
         let last_token_indices = driver::mem_alloc(4)?;
+        // Prefill extracts 1 token's logits, so shared buffer is [1, vocab_size].
+        let shared_logits = driver::mem_alloc(vocab_size * dtype.size_bytes())?;
+        let shared_argmax = driver::mem_alloc(4)?;
 
         Ok(Self {
             graphs: HashMap::new(),
@@ -471,6 +479,8 @@ impl PrefillGraphRunner {
             seqused_k,
             block_table,
             last_token_indices,
+            shared_logits,
+            shared_argmax,
             max_tokens,
             dtype,
             vocab_size,
@@ -522,42 +532,41 @@ impl PrefillGraphRunner {
         device.caching.free_leaked_blocks();
         let inputs = self.input_tensors(num_tokens);
 
+        let logits_bytes = self.vocab_size * self.dtype.size_bytes(); // [1, vocab]
+        let argmax_bytes = 4; // [1] u32
+
         driver::stream_begin_capture(device.compute_stream)?;
         let logits = forward_fn(inputs, device);
         let argmax_out =
             kernels::argmax_batched(logits, &mut device.caching, device.compute_stream);
+        // Copy into shared buffers (recorded in graph).
+        driver::memcpy_dtod_async(
+            self.shared_logits,
+            logits.raw_ptr() as *const u8,
+            logits_bytes,
+            device.compute_stream,
+        )?;
+        driver::memcpy_dtod_async(
+            self.shared_argmax,
+            argmax_out.as_gpu_tensor().raw_ptr() as *const u8,
+            argmax_bytes,
+            device.compute_stream,
+        )?;
         let graph = driver::stream_end_capture(device.compute_stream)?;
 
         let exec = driver::graph_instantiate(graph)?;
         driver::graph_destroy(graph)?;
 
-        let output_ptr = logits.raw_ptr() as *const u8;
-        let output_numel = logits.numel();
-        let argmax_ptr = argmax_out.as_gpu_tensor().raw_ptr() as *const u8;
+        // Free all leaked blocks — shared buffers are outside the pool.
+        device.caching.free_leaked_blocks();
 
-        let mut keep: Vec<*const u8> = Vec::new();
-        for g in self.graphs.values() {
-            keep.push(g.output_ptr);
-            keep.push(g.argmax_ptr);
-        }
-        keep.push(output_ptr);
-        keep.push(argmax_ptr);
-        device.caching.free_leaked_blocks_except(&keep);
-
-        self.graphs.insert(
-            num_tokens,
-            CapturedPrefillGraph {
-                exec,
-                output_ptr,
-                output_numel,
-                argmax_ptr,
-            },
-        );
+        self.graphs
+            .insert(num_tokens, CapturedPrefillGraph { exec, num_tokens });
 
         tracing::info!(
-            "Prefill CUDA graph captured for num_tokens={}, output {} elements",
+            "Prefill CUDA graph captured for num_tokens={}, shared output ({} logit elements)",
             num_tokens,
-            output_numel,
+            self.vocab_size,
         );
 
         Ok(())
@@ -633,12 +642,8 @@ impl PrefillGraphRunner {
         device.sync_transfer_to_compute()?;
         driver::graph_launch(graph.exec, device.compute_stream)?;
 
-        let logits = GpuTensor::new(
-            graph.output_ptr as *mut u8,
-            &[1, self.vocab_size],
-            self.dtype,
-        );
-        let token_ids = GpuTensor::new(graph.argmax_ptr as *mut u8, &[1], DType::U32);
+        let logits = GpuTensor::new(self.shared_logits, &[1, self.vocab_size], self.dtype);
+        let token_ids = GpuTensor::new(self.shared_argmax, &[1], DType::U32);
 
         Ok(PrefillReplayOutput { logits, token_ids })
     }
@@ -699,6 +704,8 @@ impl Drop for PrefillGraphRunner {
             let _ = driver::mem_free(self.seqused_k);
             let _ = driver::mem_free(self.block_table);
             let _ = driver::mem_free(self.last_token_indices);
+            let _ = driver::mem_free(self.shared_logits);
+            let _ = driver::mem_free(self.shared_argmax);
         }
     }
 }

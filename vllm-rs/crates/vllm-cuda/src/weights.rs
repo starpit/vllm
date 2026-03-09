@@ -74,6 +74,15 @@ pub struct GpuWeights {
     tensors: HashMap<String, CpuTensorRef>,
     /// Stream used for H2D copies.
     stream: CUstream,
+    /// Target dtype for floating-point weights. When set, F32 weights are cast
+    /// to this dtype on CPU before H2D copy — matching Python vLLM where model
+    /// parameters are initialized with torch_dtype and PyTorch auto-casts during
+    /// `param.data.copy_(loaded_weight)`.
+    target_dtype: Option<DType>,
+    /// Reusable pinned host buffer for dtype casting. Using pinned memory
+    /// enables async DMA transfers, matching PyTorch's copy_ behavior.
+    /// (ptr, capacity_bytes). Grown as needed, never shrunk.
+    cast_pinned: (*mut u8, usize),
 }
 
 // Safety: GPU device pointers accessible from any host thread.
@@ -105,6 +114,8 @@ impl GpuWeights {
         let mut gw = Self {
             tensors: HashMap::new(),
             stream,
+            target_dtype: None,
+            cast_pinned: (std::ptr::null_mut(), 0),
         };
         gw.load_shard(path)?;
         Ok(gw)
@@ -135,6 +146,8 @@ impl GpuWeights {
         let mut gw = Self {
             tensors: HashMap::new(),
             stream,
+            target_dtype: None,
+            cast_pinned: (std::ptr::null_mut(), 0),
         };
 
         for shard_name in &shard_files {
@@ -189,6 +202,118 @@ impl GpuWeights {
         Ok(())
     }
 
+    /// Ensure the pinned cast buffer has at least `needed` bytes.
+    /// Grows by freeing + reallocating (pinned memory can't realloc).
+    fn ensure_pinned_buf(&mut self, needed: usize) {
+        if needed <= self.cast_pinned.1 {
+            return;
+        }
+        // Free old buffer if any.
+        if !self.cast_pinned.0.is_null() {
+            unsafe { driver::mem_free_host(self.cast_pinned.0).ok() };
+        }
+        // Allocate new pinned buffer. Round up to 1MB alignment for reuse.
+        let alloc_size = needed.next_power_of_two().max(1 << 20);
+        let ptr = unsafe { driver::mem_alloc_host(alloc_size) }
+            .expect("failed to allocate pinned host memory for dtype cast");
+        self.cast_pinned = (ptr, alloc_size);
+    }
+
+    /// If target_dtype is set and the weight needs casting, cast on CPU into
+    /// pinned host memory. Returns (data_ptr, size_bytes, effective_dtype).
+    ///
+    /// Only floating-point weights (F32, BF16, F16) are cast. Integer dtypes
+    /// (I32, U32, I64) are left untouched — they're used for indices/metadata.
+    fn maybe_cast_cpu(&mut self, cpu_ref: &CpuTensorRef) -> (*const u8, usize, DType) {
+        let target = match self.target_dtype {
+            Some(t) => t,
+            None => return (cpu_ref.data().as_ptr(), cpu_ref.size_bytes, cpu_ref.dtype),
+        };
+
+        // Only cast floating-point types.
+        let is_float = matches!(cpu_ref.dtype, DType::F32 | DType::F16 | DType::BF16);
+        if !is_float || cpu_ref.dtype == target {
+            return (cpu_ref.data().as_ptr(), cpu_ref.size_bytes, cpu_ref.dtype);
+        }
+
+        let numel = cpu_ref.size_bytes / cpu_ref.dtype.size_bytes();
+        let cast_size = numel * target.size_bytes();
+        self.ensure_pinned_buf(cast_size);
+
+        let src = cpu_ref.data();
+        let dst = self.cast_pinned.0;
+
+        // Dispatch cast. The common case is F32 → BF16/F16.
+        match (cpu_ref.dtype, target) {
+            (DType::F32, DType::BF16) => {
+                let src_f32 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
+                let dst_u16 = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
+                for (s, d) in src_f32.iter().zip(dst_u16.iter_mut()) {
+                    *d = half::bf16::from_f32(*s).to_bits();
+                }
+            }
+            (DType::F32, DType::F16) => {
+                let src_f32 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
+                let dst_u16 = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
+                for (s, d) in src_f32.iter().zip(dst_u16.iter_mut()) {
+                    *d = half::f16::from_f32(*s).to_bits();
+                }
+            }
+            (DType::F16, DType::BF16) => {
+                let src_u16 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
+                let dst_u16 = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
+                for (s, d) in src_u16.iter().zip(dst_u16.iter_mut()) {
+                    *d = half::bf16::from_f32(half::f16::from_bits(*s).to_f32()).to_bits();
+                }
+            }
+            (DType::BF16, DType::F16) => {
+                let src_u16 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
+                let dst_u16 = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
+                for (s, d) in src_u16.iter().zip(dst_u16.iter_mut()) {
+                    *d = half::f16::from_f32(half::bf16::from_bits(*s).to_f32()).to_bits();
+                }
+            }
+            (DType::BF16 | DType::F16, DType::F32) => {
+                let src_u16 =
+                    unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
+                let dst_f32 = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
+                if cpu_ref.dtype == DType::BF16 {
+                    for (s, d) in src_u16.iter().zip(dst_f32.iter_mut()) {
+                        *d = half::bf16::from_bits(*s).to_f32();
+                    }
+                } else {
+                    for (s, d) in src_u16.iter().zip(dst_f32.iter_mut()) {
+                        *d = half::f16::from_bits(*s).to_f32();
+                    }
+                }
+            }
+            _ => unreachable!("unhandled cast: {:?} → {:?}", cpu_ref.dtype, target),
+        }
+
+        tracing::debug!(
+            "Cast weight: {:?} → {:?} ({} elements)",
+            cpu_ref.dtype,
+            target,
+            numel,
+        );
+
+        (dst as *const u8, cast_size, target)
+    }
+
+    /// Set the target dtype for floating-point weight casting.
+    ///
+    /// When set, floating-point weights (F32, F16, BF16) are cast to the target
+    /// dtype on CPU before H2D copy. Integer weights are never cast.
+    /// This matches Python vLLM where model parameters are initialized with
+    /// `torch_dtype` and PyTorch auto-casts during weight loading.
+    pub fn set_target_dtype(&mut self, dtype: DType) {
+        self.target_dtype = Some(dtype);
+    }
+
     /// Remove a tensor by name and copy it to GPU. Returns a GPU tensor.
     ///
     /// This is the primary weight loading method — matches Python's streaming
@@ -199,18 +324,15 @@ impl GpuWeights {
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
 
-        let gpu_ptr = unsafe { driver::mem_alloc(cpu_ref.size_bytes)? };
+        let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
+
+        let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
 
         unsafe {
-            driver::memcpy_htod_async(
-                gpu_ptr,
-                cpu_ref.data().as_ptr(),
-                cpu_ref.size_bytes,
-                self.stream,
-            )?;
+            driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
         }
 
-        Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, cpu_ref.dtype) })
+        Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, dtype) })
     }
 
     /// Copy a tensor's data directly to an offset within an existing GPU buffer.
@@ -228,16 +350,32 @@ impl GpuWeights {
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
 
-        driver::memcpy_htod_async(dst, cpu_ref.data().as_ptr(), cpu_ref.size_bytes, stream)?;
+        let (data, size_bytes, _dtype) = self.maybe_cast_cpu(&cpu_ref);
 
-        Ok(cpu_ref.size_bytes)
+        driver::memcpy_htod_async(dst, data, size_bytes, stream)?;
+
+        Ok(size_bytes)
     }
 
-    /// Get the shape and dtype of a tensor without loading it to GPU.
+    /// Get the shape and effective dtype of a tensor without loading it to GPU.
+    ///
+    /// If `target_dtype` is set and the tensor is a floating-point type, the
+    /// returned dtype reflects the cast target (matching what `take`/`take_into`
+    /// will produce). This ensures callers compute correct byte sizes for
+    /// pre-allocated buffers.
     pub fn tensor_info(&self, name: &str) -> Option<(&[usize], DType)> {
-        self.tensors
-            .get(name)
-            .map(|r| (r.shape.as_slice(), r.dtype))
+        self.tensors.get(name).map(|r| {
+            let effective_dtype = match self.target_dtype {
+                Some(target)
+                    if matches!(r.dtype, DType::F32 | DType::F16 | DType::BF16)
+                        && r.dtype != target =>
+                {
+                    target
+                }
+                _ => r.dtype,
+            };
+            (r.shape.as_slice(), effective_dtype)
+        })
     }
 
     /// Get a tensor by name (copies to GPU). For read-only access.
@@ -245,20 +383,20 @@ impl GpuWeights {
     /// WARNING: The returned GPU tensor is leaked — caller must arrange cleanup.
     /// Prefer `take()` which is more explicit about ownership transfer.
     pub fn get(&mut self, name: &str) -> Option<GpuTensor> {
-        let cpu_ref = self.tensors.get(name)?;
-        let gpu_ptr = unsafe { driver::mem_alloc(cpu_ref.size_bytes).ok()? };
+        // Remove temporarily to satisfy borrow checker, then re-insert.
+        let cpu_ref = self.tensors.remove(name)?;
+        let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
+
+        let gpu_ptr = unsafe { driver::mem_alloc(size_bytes).ok()? };
 
         unsafe {
-            driver::memcpy_htod_async(
-                gpu_ptr,
-                cpu_ref.data().as_ptr(),
-                cpu_ref.size_bytes,
-                self.stream,
-            )
-            .ok()?;
+            driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream).ok()?;
         }
 
-        Some(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, cpu_ref.dtype) })
+        let shape = cpu_ref.shape.clone();
+        self.tensors.insert(name.to_string(), cpu_ref);
+
+        Some(unsafe { GpuTensor::new(gpu_ptr, &shape, dtype) })
     }
 
     /// Check if a tensor exists.
@@ -295,9 +433,16 @@ impl GpuWeights {
     }
 }
 
-// No Drop impl needed — GPU memory allocated by take()/take_into() is owned
-// by the model layers, not by GpuWeights. CPU mmaps are dropped automatically
-// when the Arc<Mmap> refcounts reach zero.
+impl Drop for GpuWeights {
+    fn drop(&mut self) {
+        // Free pinned cast buffer if allocated.
+        if !self.cast_pinned.0.is_null() {
+            unsafe { driver::mem_free_host(self.cast_pinned.0).ok() };
+        }
+        // GPU memory allocated by take()/take_into() is owned by model layers.
+        // CPU mmaps are dropped automatically when Arc<Mmap> refcounts reach zero.
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests

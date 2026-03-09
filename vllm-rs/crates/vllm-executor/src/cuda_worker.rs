@@ -71,6 +71,9 @@ enum CudaModel {
     Qwen2(vllm_cuda::model::qwen2::Qwen2ForCausalLM),
     Gemma2(vllm_cuda::model::gemma2::Gemma2ForCausalLM),
     Gemma3(vllm_cuda::model::gemma3::Gemma3ForCausalLM),
+    Mixtral(vllm_cuda::model::mixtral::MixtralForCausalLM),
+    Qwen2Moe(vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM),
+    Qwen3Moe(vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM),
 }
 
 impl CudaModel {
@@ -80,6 +83,9 @@ impl CudaModel {
             Self::Qwen2(m) => m.0.model.layers.len(),
             Self::Gemma2(m) => m.model.layers.len(),
             Self::Gemma3(m) => m.model.layers.len(),
+            Self::Mixtral(m) => m.model.layers.len(),
+            Self::Qwen2Moe(m) => m.model.layers.len(),
+            Self::Qwen3Moe(m) => m.model.layers.len(),
         }
     }
 
@@ -89,6 +95,9 @@ impl CudaModel {
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.num_kv_heads,
             Self::Gemma2(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Gemma3(m) => m.model.layers[0].self_attn.num_kv_heads,
+            Self::Mixtral(m) => m.model.layers[0].self_attn.num_kv_heads,
+            Self::Qwen2Moe(m) => m.model.layers[0].self_attn.num_kv_heads,
+            Self::Qwen3Moe(m) => m.model.layers[0].self_attn.num_kv_heads,
         }
     }
 
@@ -98,6 +107,9 @@ impl CudaModel {
             Self::Qwen2(m) => m.0.model.layers[0].self_attn.head_dim,
             Self::Gemma2(m) => m.model.layers[0].self_attn.head_dim,
             Self::Gemma3(m) => m.model.layers[0].self_attn.head_dim,
+            Self::Mixtral(m) => m.model.layers[0].self_attn.head_dim,
+            Self::Qwen2Moe(m) => m.model.layers[0].self_attn.head_dim,
+            Self::Qwen3Moe(m) => m.model.layers[0].self_attn.head_dim,
         }
     }
 
@@ -107,6 +119,9 @@ impl CudaModel {
             Self::Qwen2(m) => m.0.lm_head.out_features(),
             Self::Gemma2(m) => m.lm_head.out_features(),
             Self::Gemma3(m) => m.lm_head.out_features(),
+            Self::Mixtral(m) => m.lm_head.out_features(),
+            Self::Qwen2Moe(m) => m.lm_head.out_features(),
+            Self::Qwen3Moe(m) => m.lm_head.out_features(),
         }
     }
 
@@ -116,6 +131,9 @@ impl CudaModel {
             Self::Qwen2(m) => m.0.lm_head.in_features(),
             Self::Gemma2(m) => m.lm_head.in_features(),
             Self::Gemma3(m) => m.lm_head.in_features(),
+            Self::Mixtral(m) => m.lm_head.in_features(),
+            Self::Qwen2Moe(m) => m.lm_head.in_features(),
+            Self::Qwen3Moe(m) => m.lm_head.in_features(),
         }
     }
 
@@ -182,6 +200,48 @@ impl CudaModel {
                 )
             },
             Self::Gemma3(m) => unsafe {
+                m.model.forward_owned(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                )
+            },
+            Self::Mixtral(m) => unsafe {
+                m.model.forward_owned(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                )
+            },
+            Self::Qwen2Moe(m) => unsafe {
+                m.model.forward_owned(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                )
+            },
+            Self::Qwen3Moe(m) => unsafe {
                 m.model.forward_owned(
                     input_ids,
                     positions,
@@ -278,6 +338,51 @@ impl CudaModel {
                     last_token_indices,
                 )
             },
+            Self::Mixtral(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            Self::Qwen2Moe(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            Self::Qwen3Moe(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
         }
     }
 
@@ -358,6 +463,51 @@ impl CudaModel {
                     last_token_indices,
                 )
             },
+            Self::Mixtral(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            Self::Qwen2Moe(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            Self::Qwen3Moe(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
         }
     }
 }
@@ -424,6 +574,125 @@ fn llama_config_from_hf(
         head_dim,
         tie_word_embeddings: hf.tie_word_embeddings.unwrap_or(false),
         llama3_rope_scaling,
+    })
+}
+
+fn mixtral_config_from_hf(
+    hf: &HfModelConfig,
+) -> ExecutorResult<vllm_cuda::model::mixtral::MixtralConfig> {
+    let hidden_size = hf
+        .hidden_size
+        .ok_or_else(|| ExecutorError::WorkerInit("missing hidden_size".into()))?;
+    let num_attention_heads = hf
+        .num_attention_heads
+        .ok_or_else(|| ExecutorError::WorkerInit("missing num_attention_heads".into()))?;
+    let num_kv_heads = hf.num_key_value_heads.unwrap_or(num_attention_heads);
+    let head_dim = hf.head_dim.unwrap_or(hidden_size / num_attention_heads);
+    let num_local_experts = hf
+        .extra
+        .get("num_local_experts")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ExecutorError::WorkerInit("missing num_local_experts".into()))?
+        as usize;
+    let num_experts_per_tok = hf
+        .extra
+        .get("num_experts_per_tok")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ExecutorError::WorkerInit("missing num_experts_per_tok".into()))?
+        as usize;
+
+    Ok(vllm_cuda::model::mixtral::MixtralConfig {
+        hidden_size,
+        num_attention_heads,
+        num_kv_heads,
+        num_hidden_layers: hf.num_hidden_layers.unwrap_or(32),
+        intermediate_size: hf.intermediate_size.unwrap_or(hidden_size * 4),
+        vocab_size: hf.vocab_size.unwrap_or(32000),
+        max_position_embeddings: hf.max_position_embeddings.unwrap_or(4096),
+        rms_norm_eps: hf.rms_norm_eps.unwrap_or(1e-5) as f32,
+        rope_theta: hf.rope_theta.unwrap_or(1_000_000.0),
+        head_dim,
+        tie_word_embeddings: hf.tie_word_embeddings.unwrap_or(false),
+        num_local_experts,
+        num_experts_per_tok,
+    })
+}
+
+fn qwen2_moe_config_from_hf(
+    hf: &HfModelConfig,
+) -> ExecutorResult<vllm_cuda::model::qwen2_moe::Qwen2MoeConfig> {
+    let hidden_size = hf
+        .hidden_size
+        .ok_or_else(|| ExecutorError::WorkerInit("missing hidden_size".into()))?;
+    let num_attention_heads = hf
+        .num_attention_heads
+        .ok_or_else(|| ExecutorError::WorkerInit("missing num_attention_heads".into()))?;
+    let num_kv_heads = hf.num_key_value_heads.unwrap_or(num_attention_heads);
+    let head_dim = hf.head_dim.unwrap_or(hidden_size / num_attention_heads);
+    let num_experts = hf
+        .extra
+        .get("num_experts")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ExecutorError::WorkerInit("missing num_experts".into()))?
+        as usize;
+    let num_experts_per_tok = hf
+        .extra
+        .get("num_experts_per_tok")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ExecutorError::WorkerInit("missing num_experts_per_tok".into()))?
+        as usize;
+    let moe_intermediate_size = hf
+        .extra
+        .get("moe_intermediate_size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ExecutorError::WorkerInit("missing moe_intermediate_size".into()))?
+        as usize;
+    let shared_expert_intermediate_size = hf
+        .extra
+        .get("shared_expert_intermediate_size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| {
+            ExecutorError::WorkerInit("missing shared_expert_intermediate_size".into())
+        })? as usize;
+    let mlp_only_layers: Vec<usize> = hf
+        .extra
+        .get("decoder_sparse_step")
+        .and_then(|v| v.as_u64())
+        .map(|step| {
+            // decoder_sparse_step=N means every N-th layer is MoE, others are dense.
+            // mlp_only_layers = layers NOT divisible by step.
+            let num_layers = hf.num_hidden_layers.unwrap_or(24);
+            (0..num_layers).filter(|i| i % step as usize != 0).collect()
+        })
+        .or_else(|| {
+            // Or explicit mlp_only_layers array.
+            hf.extra.get("mlp_only_layers").and_then(|v| {
+                v.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_u64().map(|n| n as usize))
+                        .collect()
+                })
+            })
+        })
+        .unwrap_or_default();
+
+    Ok(vllm_cuda::model::qwen2_moe::Qwen2MoeConfig {
+        hidden_size,
+        num_attention_heads,
+        num_kv_heads,
+        num_hidden_layers: hf.num_hidden_layers.unwrap_or(24),
+        intermediate_size: hf.intermediate_size.unwrap_or(hidden_size * 4),
+        moe_intermediate_size,
+        shared_expert_intermediate_size,
+        vocab_size: hf.vocab_size.unwrap_or(151936),
+        max_position_embeddings: hf.max_position_embeddings.unwrap_or(32768),
+        rms_norm_eps: hf.rms_norm_eps.unwrap_or(1e-6) as f32,
+        rope_theta: hf.rope_theta.unwrap_or(1_000_000.0),
+        head_dim,
+        tie_word_embeddings: hf.tie_word_embeddings.unwrap_or(false),
+        num_experts,
+        num_experts_per_tok,
+        mlp_only_layers,
     })
 }
 
@@ -1942,6 +2211,11 @@ impl Worker for CudaWorker {
             .map_err(|e| ExecutorError::WorkerInit(format!("weight load failed: {e}")))?;
         info!("CudaWorker: parsed {} weight tensors (CPU)", weights.len());
 
+        // Set target dtype so F32 weights are cast to model dtype on load.
+        // Matches Python vLLM where model parameters are initialized with
+        // torch_dtype and PyTorch auto-casts during weight_loader copy.
+        weights.set_target_dtype(dtype);
+
         // 6. Construct model based on architecture.
         let model = match arch.as_str() {
             "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen3ForCausalLM" | "Phi3ForCausalLM" => {
@@ -2035,12 +2309,46 @@ impl Worker for CudaWorker {
                 );
                 CudaModel::Llama(m)
             }
+            "MixtralForCausalLM" => {
+                let config = mixtral_config_from_hf(&hf_config)?;
+                let m = vllm_cuda::model::mixtral::MixtralForCausalLM::load(
+                    &mut weights,
+                    &config,
+                    dtype,
+                    device,
+                )
+                .map_err(|e| ExecutorError::WorkerInit(format!("Mixtral load: {e}")))?;
+                CudaModel::Mixtral(m)
+            }
+            "Qwen2MoeForCausalLM" => {
+                let config = qwen2_moe_config_from_hf(&hf_config)?;
+                let m = vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load(
+                    &mut weights,
+                    &config,
+                    dtype,
+                    device,
+                )
+                .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2MoE load: {e}")))?;
+                CudaModel::Qwen2Moe(m)
+            }
+            "Qwen3MoeForCausalLM" => {
+                let config = qwen2_moe_config_from_hf(&hf_config)?;
+                let m = vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load(
+                    &mut weights,
+                    &config,
+                    dtype,
+                    device,
+                )
+                .map_err(|e| ExecutorError::WorkerInit(format!("Qwen3MoE load: {e}")))?;
+                CudaModel::Qwen3Moe(m)
+            }
             _ => {
                 return Err(ExecutorError::WorkerInit(format!(
                     "unsupported architecture for cuda-backend: {arch}. \
                      Supported: LlamaForCausalLM, MistralForCausalLM, Qwen3ForCausalLM, \
                      Phi3ForCausalLM, Qwen2ForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM, \
-                     GraniteForCausalLM"
+                     GraniteForCausalLM, MixtralForCausalLM, Qwen2MoeForCausalLM, \
+                     Qwen3MoeForCausalLM"
                 )));
             }
         };

@@ -279,6 +279,213 @@ unsafe extern "C" {
         num_tokens: i32,
         stream: CUstream,
     );
+
+    // MoE top-k softmax
+    fn topk_softmax_f32(
+        topk_weights: *mut f32,
+        topk_ids: *mut i32,
+        workspace: *mut f32,
+        gating_output: *const f32,
+        num_tokens: c_int,
+        num_experts: c_int,
+        topk: c_int,
+        renormalize: c_int,
+        stream: CUstream,
+    );
+    fn topk_softmax_bf16(
+        topk_weights: *mut f32,
+        topk_ids: *mut i32,
+        workspace: *mut f32,
+        gating_output: *const c_void,
+        num_tokens: c_int,
+        num_experts: c_int,
+        topk: c_int,
+        renormalize: c_int,
+        stream: CUstream,
+    );
+    fn topk_softmax_f16(
+        topk_weights: *mut f32,
+        topk_ids: *mut i32,
+        workspace: *mut f32,
+        gating_output: *const c_void,
+        num_tokens: c_int,
+        num_experts: c_int,
+        topk: c_int,
+        renormalize: c_int,
+        stream: CUstream,
+    );
+
+    // MoE sum reduction
+    fn moe_sum_f32(
+        out: *mut f32,
+        input: *const f32,
+        num_tokens: c_int,
+        hidden_size: c_int,
+        topk: c_int,
+        stream: CUstream,
+    );
+    fn moe_sum_f16(
+        out: *mut c_void,
+        input: *const c_void,
+        num_tokens: c_int,
+        hidden_size: c_int,
+        topk: c_int,
+        stream: CUstream,
+    );
+    fn moe_sum_bf16(
+        out: *mut c_void,
+        input: *const c_void,
+        num_tokens: c_int,
+        hidden_size: c_int,
+        topk: c_int,
+        stream: CUstream,
+    );
+
+    // MoE align block size
+    fn moe_align_block_size_i32(
+        topk_ids: *const i32,
+        sorted_token_ids: *mut i32,
+        expert_ids: *mut i32,
+        total_tokens_post_pad: *mut i32,
+        num_experts: c_int,
+        block_size: c_int,
+        numel: c_int,
+        max_num_tokens_padded: c_int,
+        stream: CUstream,
+    );
+
+    // Fused MoE GEMM
+    fn fused_moe_gemm_bf16(
+        output: *mut c_void,
+        input: *const c_void,
+        weights: *const c_void,
+        topk_weights: *const f32,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        num_tokens_post_padded: *const i32,
+        num_valid_tokens: c_int,
+        in_features: c_int,
+        out_features: c_int,
+        top_k: c_int,
+        block_size: c_int,
+        apply_weights: c_int,
+        stream: CUstream,
+    );
+    fn fused_moe_gemm_f16(
+        output: *mut c_void,
+        input: *const c_void,
+        weights: *const c_void,
+        topk_weights: *const f32,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        num_tokens_post_padded: *const i32,
+        num_valid_tokens: c_int,
+        in_features: c_int,
+        out_features: c_int,
+        top_k: c_int,
+        block_size: c_int,
+        apply_weights: c_int,
+        stream: CUstream,
+    );
+
+    // Fused sigmoid_mul_add: out = a + sigmoid(gate) * b
+    fn sigmoid_mul_add_bf16(
+        out: *mut c_void,
+        a: *const c_void,
+        b: *const c_void,
+        gate: *const c_void,
+        num_tokens: c_int,
+        hidden_size: c_int,
+        stream: CUstream,
+    );
+    fn sigmoid_mul_add_f16(
+        out: *mut c_void,
+        a: *const c_void,
+        b: *const c_void,
+        gate: *const c_void,
+        num_tokens: c_int,
+        hidden_size: c_int,
+        stream: CUstream,
+    );
+    fn sigmoid_mul_add_f32(
+        out: *mut c_void,
+        a: *const c_void,
+        b: *const c_void,
+        gate: *const c_void,
+        num_tokens: c_int,
+        hidden_size: c_int,
+        stream: CUstream,
+    );
+
+    // In-place add: a += b
+    fn add_inplace_bf16(
+        a: *mut c_void,
+        b: *const c_void,
+        num_tokens: c_int,
+        hidden_size: c_int,
+        stream: CUstream,
+    );
+    fn add_inplace_f16(
+        a: *mut c_void,
+        b: *const c_void,
+        num_tokens: c_int,
+        hidden_size: c_int,
+        stream: CUstream,
+    );
+    fn add_inplace_f32(
+        a: *mut c_void,
+        b: *const c_void,
+        num_tokens: c_int,
+        hidden_size: c_int,
+        stream: CUstream,
+    );
+
+    // Fused QK-norm + RoPE (per-head RMS norm on Q/K then RoPE rotation)
+    fn qk_norm_rope_f32(
+        query: *mut f32,
+        key: *mut f32,
+        q_weight: *const f32,
+        k_weight: *const f32,
+        cos_cache: *const f32,
+        sin_cache: *const f32,
+        positions: *const u32,
+        epsilon: f32,
+        num_q_heads: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        num_tokens: c_int,
+        stream: CUstream,
+    );
+    fn qk_norm_rope_f16(
+        query: *mut u16,
+        key: *mut u16,
+        q_weight: *const u16,
+        k_weight: *const u16,
+        cos_cache: *const u16,
+        sin_cache: *const u16,
+        positions: *const u32,
+        epsilon: f32,
+        num_q_heads: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        num_tokens: c_int,
+        stream: CUstream,
+    );
+    fn qk_norm_rope_bf16(
+        query: *mut u16,
+        key: *mut u16,
+        q_weight: *const u16,
+        k_weight: *const u16,
+        cos_cache: *const u16,
+        sin_cache: *const u16,
+        positions: *const u32,
+        epsilon: f32,
+        num_q_heads: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        num_tokens: c_int,
+        stream: CUstream,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1690,6 +1897,127 @@ pub unsafe fn cast_logits_to_f32(
 }
 
 // ---------------------------------------------------------------------------
+// MoE top-k softmax
+// ---------------------------------------------------------------------------
+
+/// Top-k softmax gating for MoE.
+///
+/// * `gating_output`: `[num_tokens, num_experts]` — raw gate logits
+/// * `topk`: number of experts to select per token
+/// * `renormalize`: if true, renormalize selected weights to sum to 1
+///
+/// Returns `(topk_weights, topk_ids)`:
+/// * `topk_weights`: `[num_tokens, topk]` (F32)
+/// * `topk_ids`: `[num_tokens, topk]` (I32)
+pub unsafe fn topk_softmax(
+    gating_output: GpuTensor,
+    topk: usize,
+    renormalize: bool,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> (OwnedTensor, OwnedTensor) {
+    let num_tokens = gating_output.dim(0);
+    let num_experts = gating_output.dim(1);
+
+    let weights_out = alloc.alloc_tensor(&[num_tokens, topk], DType::F32);
+    let ids_out = alloc.alloc_tensor(&[num_tokens, topk], DType::I32);
+    // Workspace for fallback path (separate softmax + topK)
+    let workspace = alloc.alloc_tensor(&[num_tokens, num_experts], DType::F32);
+
+    match gating_output.dtype() {
+        DType::F32 => topk_softmax_f32(
+            weights_out.as_mut_ptr() as *mut f32,
+            ids_out.as_mut_ptr() as *mut i32,
+            workspace.as_mut_ptr() as *mut f32,
+            gating_output.as_ptr() as *const f32,
+            num_tokens as c_int,
+            num_experts as c_int,
+            topk as c_int,
+            renormalize as c_int,
+            stream,
+        ),
+        DType::BF16 => topk_softmax_bf16(
+            weights_out.as_mut_ptr() as *mut f32,
+            ids_out.as_mut_ptr() as *mut i32,
+            workspace.as_mut_ptr() as *mut f32,
+            gating_output.as_ptr() as *const c_void,
+            num_tokens as c_int,
+            num_experts as c_int,
+            topk as c_int,
+            renormalize as c_int,
+            stream,
+        ),
+        DType::F16 => topk_softmax_f16(
+            weights_out.as_mut_ptr() as *mut f32,
+            ids_out.as_mut_ptr() as *mut i32,
+            workspace.as_mut_ptr() as *mut f32,
+            gating_output.as_ptr() as *const c_void,
+            num_tokens as c_int,
+            num_experts as c_int,
+            topk as c_int,
+            renormalize as c_int,
+            stream,
+        ),
+        _ => panic!(
+            "topk_softmax: unsupported dtype {:?}",
+            gating_output.dtype()
+        ),
+    }
+    drop(workspace);
+    (weights_out, ids_out)
+}
+
+// ---------------------------------------------------------------------------
+// MoE sum reduction
+// ---------------------------------------------------------------------------
+
+/// Reduce expert outputs: `[num_tokens, topk, hidden] → [num_tokens, hidden]`.
+///
+/// * `input`: `[num_tokens, topk, hidden_size]`
+/// * `topk`: number of experts per token
+///
+/// Returns `[num_tokens, hidden_size]`.
+pub unsafe fn moe_sum(
+    input: GpuTensor,
+    num_tokens: usize,
+    hidden_size: usize,
+    topk: usize,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let out = alloc.alloc_tensor(&[num_tokens, hidden_size], input.dtype());
+
+    match input.dtype() {
+        DType::F32 => moe_sum_f32(
+            out.as_mut_ptr() as *mut f32,
+            input.as_ptr() as *const f32,
+            num_tokens as c_int,
+            hidden_size as c_int,
+            topk as c_int,
+            stream,
+        ),
+        DType::F16 => moe_sum_f16(
+            out.as_mut_ptr() as *mut c_void,
+            input.as_ptr() as *const c_void,
+            num_tokens as c_int,
+            hidden_size as c_int,
+            topk as c_int,
+            stream,
+        ),
+        DType::BF16 => moe_sum_bf16(
+            out.as_mut_ptr() as *mut c_void,
+            input.as_ptr() as *const c_void,
+            num_tokens as c_int,
+            hidden_size as c_int,
+            topk as c_int,
+            stream,
+        ),
+        _ => panic!("moe_sum: unsupported dtype {:?}", input.dtype()),
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Penalties / Logit bias / Grammar mask / Log-softmax top-k
 // ---------------------------------------------------------------------------
 
@@ -1873,6 +2201,310 @@ pub unsafe fn log_softmax_topk_gather(
     );
 
     (out_lp, out_idx, out_ranks)
+}
+
+// ---------------------------------------------------------------------------
+// MoE align block size
+// ---------------------------------------------------------------------------
+
+/// Align MoE token assignments to GEMM block boundaries.
+///
+/// Sorts tokens by expert and pads to `block_size` alignment.
+///
+/// * `topk_ids`: `[num_tokens * topk]` (I32) — expert assignments
+/// * `num_experts`: total number of experts
+/// * `block_size`: GEMM tile size (e.g. 128)
+///
+/// Returns `(sorted_token_ids, expert_ids, num_tokens_post_padded)`.
+pub unsafe fn moe_align_block_size(
+    topk_ids: GpuTensor,
+    num_experts: usize,
+    block_size: usize,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> (OwnedTensor, OwnedTensor, OwnedTensor) {
+    let numel = topk_ids.numel();
+    // Max padded size: each expert's tokens padded to block_size
+    let max_num_tokens_padded = numel + num_experts * block_size;
+    let max_num_m_blocks = max_num_tokens_padded / block_size;
+
+    let sorted_token_ids = alloc.alloc_tensor(&[max_num_tokens_padded], DType::I32);
+    let expert_ids = alloc.alloc_tensor(&[max_num_m_blocks], DType::I32);
+    let num_tokens_post_pad = alloc.alloc_tensor(&[1], DType::I32);
+
+    moe_align_block_size_i32(
+        topk_ids.as_ptr() as *const i32,
+        sorted_token_ids.as_mut_ptr() as *mut i32,
+        expert_ids.as_mut_ptr() as *mut i32,
+        num_tokens_post_pad.as_mut_ptr() as *mut i32,
+        num_experts as c_int,
+        block_size as c_int,
+        numel as c_int,
+        max_num_tokens_padded as c_int,
+        stream,
+    );
+
+    (sorted_token_ids, expert_ids, num_tokens_post_pad)
+}
+
+// ---------------------------------------------------------------------------
+// Fused MoE GEMM
+// ---------------------------------------------------------------------------
+
+/// Fused MoE GEMM: expert-indexed matrix multiplication.
+///
+/// * `input`: `[num_tokens, in_features]` — hidden states
+/// * `weights`: `[num_experts, out_features, in_features]` — stacked expert weights
+/// * `topk_weights`: `[num_tokens, top_k]` (F32) — routing weights
+/// * `sorted_token_ids`: from `moe_align_block_size`
+/// * `expert_ids`: from `moe_align_block_size`
+/// * `num_tokens_post_padded`: from `moe_align_block_size`
+/// * `apply_weights`: if true, multiply output by routing weight
+///
+/// Returns `[num_tokens * top_k, out_features]`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn fused_moe_gemm(
+    input: GpuTensor,
+    weights: GpuTensor,
+    topk_weights: GpuTensor,
+    sorted_token_ids: GpuTensor,
+    expert_ids: GpuTensor,
+    num_tokens_post_padded: GpuTensor,
+    num_tokens: usize,
+    top_k: usize,
+    block_size: usize,
+    apply_weights: bool,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let in_features = input.dim(1);
+    let out_features = weights.dim(1);
+
+    let out = alloc.alloc_tensor(&[num_tokens * top_k, out_features], input.dtype());
+
+    match input.dtype() {
+        DType::BF16 => fused_moe_gemm_bf16(
+            out.as_mut_ptr() as *mut c_void,
+            input.as_ptr() as *const c_void,
+            weights.as_ptr() as *const c_void,
+            topk_weights.as_ptr() as *const f32,
+            sorted_token_ids.as_ptr() as *const i32,
+            expert_ids.as_ptr() as *const i32,
+            num_tokens_post_padded.as_ptr() as *const i32,
+            num_tokens as c_int,
+            in_features as c_int,
+            out_features as c_int,
+            top_k as c_int,
+            block_size as c_int,
+            apply_weights as c_int,
+            stream,
+        ),
+        DType::F16 => fused_moe_gemm_f16(
+            out.as_mut_ptr() as *mut c_void,
+            input.as_ptr() as *const c_void,
+            weights.as_ptr() as *const c_void,
+            topk_weights.as_ptr() as *const f32,
+            sorted_token_ids.as_ptr() as *const i32,
+            expert_ids.as_ptr() as *const i32,
+            num_tokens_post_padded.as_ptr() as *const i32,
+            num_tokens as c_int,
+            in_features as c_int,
+            out_features as c_int,
+            top_k as c_int,
+            block_size as c_int,
+            apply_weights as c_int,
+            stream,
+        ),
+        _ => panic!("fused_moe_gemm: unsupported dtype {:?}", input.dtype()),
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Sigmoid-gated add: out = a + sigmoid(gate) * b
+// ---------------------------------------------------------------------------
+
+/// Fused sigmoid-gated addition for shared expert output.
+///
+/// `out = a + sigmoid(gate) * b`
+///
+/// * `a`: `[num_tokens, hidden_size]` — MoE output
+/// * `b`: `[num_tokens, hidden_size]` — shared expert output
+/// * `gate`: `[num_tokens, 1]` — shared expert gate logits (pre-sigmoid)
+///
+/// Returns `[num_tokens, hidden_size]` (writes into a new buffer).
+pub unsafe fn sigmoid_mul_add(
+    a: GpuTensor,
+    b: GpuTensor,
+    gate: GpuTensor,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let num_tokens = a.dim(0);
+    let hidden_size = a.dim(1);
+    let out = alloc.alloc_tensor(&[num_tokens, hidden_size], a.dtype());
+
+    match a.dtype() {
+        DType::BF16 => sigmoid_mul_add_bf16(
+            out.as_mut_ptr() as *mut c_void,
+            a.as_ptr() as *const c_void,
+            b.as_ptr() as *const c_void,
+            gate.as_ptr() as *const c_void,
+            num_tokens as c_int,
+            hidden_size as c_int,
+            stream,
+        ),
+        DType::F16 => sigmoid_mul_add_f16(
+            out.as_mut_ptr() as *mut c_void,
+            a.as_ptr() as *const c_void,
+            b.as_ptr() as *const c_void,
+            gate.as_ptr() as *const c_void,
+            num_tokens as c_int,
+            hidden_size as c_int,
+            stream,
+        ),
+        DType::F32 => sigmoid_mul_add_f32(
+            out.as_mut_ptr() as *mut c_void,
+            a.as_ptr() as *const c_void,
+            b.as_ptr() as *const c_void,
+            gate.as_ptr() as *const c_void,
+            num_tokens as c_int,
+            hidden_size as c_int,
+            stream,
+        ),
+        _ => panic!("sigmoid_mul_add: unsupported dtype {:?}", a.dtype()),
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// In-place add: a += b
+// ---------------------------------------------------------------------------
+
+/// Element-wise in-place addition: `a += b`.
+///
+/// * `a`: `[num_tokens, hidden_size]` — modified in place
+/// * `b`: `[num_tokens, hidden_size]`
+pub unsafe fn add_inplace(a: GpuTensor, b: GpuTensor, stream: CUstream) {
+    let num_tokens = a.dim(0);
+    let hidden_size = a.dim(1);
+
+    match a.dtype() {
+        DType::BF16 => add_inplace_bf16(
+            a.as_mut_ptr() as *mut c_void,
+            b.as_ptr() as *const c_void,
+            num_tokens as c_int,
+            hidden_size as c_int,
+            stream,
+        ),
+        DType::F16 => add_inplace_f16(
+            a.as_mut_ptr() as *mut c_void,
+            b.as_ptr() as *const c_void,
+            num_tokens as c_int,
+            hidden_size as c_int,
+            stream,
+        ),
+        DType::F32 => add_inplace_f32(
+            a.as_mut_ptr() as *mut c_void,
+            b.as_ptr() as *const c_void,
+            num_tokens as c_int,
+            hidden_size as c_int,
+            stream,
+        ),
+        _ => panic!("add_inplace: unsupported dtype {:?}", a.dtype()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fused QK-norm + RoPE (per-head RMS norm + rotation)
+// ---------------------------------------------------------------------------
+
+/// Fused per-head QK RMS normalization + RoPE, in-place on Q and K.
+///
+/// Used by Qwen3 (and Gemma3) which apply per-head RMS norm before RoPE.
+///
+/// * `query`: `[num_tokens, num_q_heads * head_dim]` — modified in-place
+/// * `key`: `[num_tokens, num_kv_heads * head_dim]` — modified in-place
+/// * `q_norm_weight`: `[head_dim]` — per-head Q norm weight
+/// * `k_norm_weight`: `[head_dim]` — per-head K norm weight
+/// * `cos_sin_cache`: `[max_pos, head_dim]` — combined cos|sin cache (first half cos, second half sin)
+/// * `positions`: `[num_tokens]` (U32)
+/// * `epsilon`: norm epsilon (e.g. 1e-6)
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn qk_norm_rope_inplace(
+    query: GpuTensor,
+    key: GpuTensor,
+    q_norm_weight: GpuTensor,
+    k_norm_weight: GpuTensor,
+    cos_sin_cache: GpuTensor,
+    positions: GpuTensor,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    epsilon: f32,
+    stream: CUstream,
+) {
+    let num_tokens = positions.dim(0);
+    let half_dim = head_dim / 2;
+    let elem_size = query.dtype().size_bytes();
+
+    // cos_sin_cache layout: [max_pos, head_dim] where each row is [cos_0..cos_{half}, sin_0..sin_{half}].
+    // The kernel expects separate cos and sin pointers. Since cos is at offset 0 and sin at offset
+    // half_dim within each row, and the kernel accesses cos_cache[pos * head_dim + i] for i < half_dim
+    // and sin_cache[pos * head_dim + i] for i < half_dim, we can pass:
+    //   cos_cache = base pointer (stride head_dim per position)
+    //   sin_cache = base pointer + half_dim * elem_size (same stride)
+    let cos_ptr = cos_sin_cache.raw_ptr();
+    let sin_ptr = cos_ptr.add(half_dim * elem_size);
+
+    match query.dtype() {
+        DType::BF16 => qk_norm_rope_bf16(
+            query.as_mut_ptr() as *mut u16,
+            key.as_mut_ptr() as *mut u16,
+            q_norm_weight.as_ptr() as *const u16,
+            k_norm_weight.as_ptr() as *const u16,
+            cos_ptr as *const u16,
+            sin_ptr as *const u16,
+            positions.as_ptr() as *const u32,
+            epsilon,
+            num_q_heads as c_int,
+            num_kv_heads as c_int,
+            head_dim as c_int,
+            num_tokens as c_int,
+            stream,
+        ),
+        DType::F16 => qk_norm_rope_f16(
+            query.as_mut_ptr() as *mut u16,
+            key.as_mut_ptr() as *mut u16,
+            q_norm_weight.as_ptr() as *const u16,
+            k_norm_weight.as_ptr() as *const u16,
+            cos_ptr as *const u16,
+            sin_ptr as *const u16,
+            positions.as_ptr() as *const u32,
+            epsilon,
+            num_q_heads as c_int,
+            num_kv_heads as c_int,
+            head_dim as c_int,
+            num_tokens as c_int,
+            stream,
+        ),
+        DType::F32 => qk_norm_rope_f32(
+            query.as_mut_ptr() as *mut f32,
+            key.as_mut_ptr() as *mut f32,
+            q_norm_weight.as_ptr() as *const f32,
+            k_norm_weight.as_ptr() as *const f32,
+            cos_ptr as *const f32,
+            sin_ptr as *const f32,
+            positions.as_ptr() as *const u32,
+            epsilon,
+            num_q_heads as c_int,
+            num_kv_heads as c_int,
+            head_dim as c_int,
+            num_tokens as c_int,
+            stream,
+        ),
+        _ => panic!("qk_norm_rope: unsupported dtype {:?}", query.dtype()),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
   1. Model Architectures
 
-  CudaWorker has 7 (LLaMA, Mistral, Qwen2, Qwen3, Phi-3, Gemma2, Gemma3) vs CandleWorker has 15+:
+  CudaWorker has 10 (LLaMA, Mistral, Qwen2, Qwen3, Phi-3, Gemma2, Gemma3, Mixtral, Qwen2 MoE, Qwen3 MoE) vs CandleWorker has 15+:
 
   ┌──────────────────────────┬──────────────┬────────────┬────────────────────────────────────┐
   │       Architecture       │ CandleWorker │ CudaWorker │               Notes                │
@@ -25,11 +25,11 @@
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
   │ Command R                │ yes          │ no         │                                    │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
-  │ Qwen2 MoE                │ yes          │ no         │ MoE routing                        │
+  │ Qwen2 MoE                │ yes          │ yes        │ MoE + shared expert (gated)        │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
-  │ Qwen3 MoE                │ yes          │ no         │ MoE routing                        │
+  │ Qwen3 MoE                │ yes          │ yes        │ MoE + shared expert + QK-norm      │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
-  │ Mixtral (MoE)            │ yes          │ no         │ MoE routing                        │
+  │ Mixtral (MoE)            │ yes          │ yes        │ Pure MoE (8 experts, top-2)        │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
   │ Granite                  │ yes          │ yes        │ LLaMA + 4 scalar multipliers       │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
@@ -38,8 +38,8 @@
   │ Qwen3-Next (GDN+MoE)     │ yes          │ no         │ Hybrid linear+full attention       │
   └──────────────────────────┴──────────────┴────────────┴────────────────────────────────────┘
 
-  Effort: ~~Mistral/Qwen3/Phi-3 are trivial (alias LLaMA)~~ — DONE. Granite is similar. MoE models (DeepSeek, Mixtral, Qwen MoE) need a fused MoE GEMM
-  kernel or scatter-gather approach. DeepSeek MLA is the hardest.
+  Effort: ~~Mistral/Qwen3/Phi-3 are trivial (alias LLaMA)~~ — DONE. Granite is similar. ~~MoE models (Mixtral, Qwen MoE) need a fused MoE GEMM
+  kernel~~ — DONE (custom WMMA tensor-core kernel, see MoE section below). DeepSeek MLA is the hardest.
 
   2. Quantization Support
 
@@ -174,10 +174,75 @@
   apply_logit_bias (CSR scatter-add), apply_grammar_mask (CSR allow-list), log_softmax_topk (fused logprobs), cast_to_f32.
 
   Still needed:
-  - Fused MoE GEMM — required for DeepSeek, Mixtral, Qwen MoE, Qwen3 MoE
   - Marlin INT4 GEMM FFI — exists in vllm-kernels but no GpuTensor bindings
   - GGUF dequant kernels — if not using candle's QCudaStorage
-  - MoE top-k gating — exists in vllm-kernels, needs GpuTensor FFI
+
+  Already implemented:
+  - ~~Fused MoE GEMM~~ — custom WMMA kernel (BLOCK_M=128, BLOCK_N=128, BLOCK_K=32)
+  - ~~MoE top-k gating~~ — TRT-LLM topk_softmax kernel with GpuTensor FFI
+  - ~~moe_align_block_size~~ — ported from Python vLLM (small + large batch paths)
+  - ~~moe_sum~~ — reduction kernel with GpuTensor FFI
+  - ~~sigmoid_mul_add~~ — shared expert gating kernel (vectorized 128-bit loads)
+  - ~~qk_norm_rope~~ — fused per-head RMS norm + NeoX RoPE (Qwen3 MoE, Gemma3)
+  - ~~Weight dtype casting~~ — GpuWeights casts F32→BF16/F16 at load time via pinned host memory (matches Python's torch_dtype auto-cast)
+
+  6a. MoE TODOs
+
+  Remaining work items for full MoE parity with Python vLLM:
+
+  - Qwen2 MoE E2E test: Qwen/Qwen1.5-MoE-A2.7B-Chat is ~30GB, times out downloading on pod.
+    Need a smaller Qwen2 MoE test model or pre-cache the model.
+  - Qwen3 MoE E2E test: No small Qwen3 MoE test model identified yet.
+  - CUDA graphs for MoE: Decode CUDA graphs are disabled for MoE models because the
+    fused MoE GEMM kernel uses dynamic shared memory and variable grid sizes based on
+    num_tokens_post_padded (output of moe_align_block_size). Need to either pad to
+    fixed sizes or capture multiple graph variants.
+  - MoE + TP: Expert parallelism (expert_map) needed for multi-GPU MoE serving.
+    Currently only single-GPU MoE works.
+  - Profile vs Python: No nsys data yet comparing our WMMA MoE kernel against
+    Python's Triton fused_moe_kernel on real workloads (Mixtral-8x7B decode/prefill).
+
+  6b. MoE Performance Gaps
+
+  The fused MoE GEMM kernel matches Python vLLM's Triton `fused_moe_kernel` functionally but has known performance gaps:
+
+  ┌──────────────────────────────────────┬───────────────┬─────────────────────────────────────────────────────┐
+  │                 Gap                  │ Est. Impact   │                        Notes                        │
+  ├──────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────┤
+  │ Fixed tile sizes (128/128/32) vs     │ 2-3x slower   │ Triton autotuning picks optimal tile per shape.     │
+  │ Triton autotuning                    │ some shapes   │ Profile to find which shapes regress most.          │
+  ├──────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────┤
+  │ WMMA 16x16x16 vs native mma PTX     │ 10-30% slower │ WMMA is portable but generates suboptimal PTX.      │
+  │                                      │               │ Triton emits mma.m16n8k16 directly.                 │
+  ├──────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────┤
+  │ No GROUP_SIZE_M L2 cache grouping    │ Varies        │ Triton reorders threadblocks for L2 reuse.          │
+  │                                      │               │ Matters most at large token counts (prefill).       │
+  ├──────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────┤
+  │ No chunked processing                │ OOM risk      │ Python splits large batches via                     │
+  │                                      │               │ VLLM_FUSED_MOE_CHUNK_SIZE to limit scratch memory.  │
+  └──────────────────────────────────────┴───────────────┴─────────────────────────────────────────────────────┘
+
+  Mitigation plan: Profile on real MoE models (Mixtral-8x7B, Qwen2-57B-MoE) first. For decode (BS=1-32),
+  the kernel launch overhead dominates and our kernel should be close. For prefill, if the gap is > 2x,
+  upgrade WMMA → inline PTX mma and add tile-size selection based on problem dimensions.
+
+  6c. MoE Feature Gaps (not needed for initial launch)
+
+  ┌──────────────────────────────────────┬──────────────────────────────────────────────────────────────┐
+  │              Feature                 │                            Notes                             │
+  ├──────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ Expert parallelism (expert_map)      │ Needed for TP of MoE models where experts are split across  │
+  │                                      │ GPUs. Not needed for single-GPU or TP on dense layers only. │
+  ├──────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ Quantized MoE (FP8/INT8/INT4)       │ Python supports FP8 W8A8, INT8 W8A8, INT4 W4A16 for MoE    │
+  │                                      │ expert weights. Our kernel only supports BF16/F16.          │
+  ├──────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ token_mask in align_block_size       │ Used for masked expert routing in some configurations.      │
+  │                                      │ Not used by Mixtral/Qwen MoE.                               │
+  ├──────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
+  │ DeepSeek MoE (shared + routed)       │ Different MoE pattern: shared expert runs unconditionally,  │
+  │                                      │ routed experts have fine-grained routing. Needs MLA too.    │
+  └──────────────────────────────────────┴──────────────────────────────────────────────────────────────┘
 
   7. Multimodal
 
@@ -187,17 +252,19 @@
   ---
   Priority Order (to retire CandleWorker CUDA)
 
-  1. ~~Low-hanging fruit: Alias Mistral/Qwen3/Phi-3 to LLaMA in CudaWorker~~ — **DONE** (covers ~50% of real usage)
+  1. ~~Low-hanging fruit: Alias Mistral/Qwen3/Phi-3 to LLaMA in CudaWorker~~ — **DONE**
   2. Marlin FFI for GPTQ/AWQ: Wire existing Marlin kernel to GpuTensor — unlocks quantized serving for LLaMA-family — **IN PROGRESS**
   3. ~~Sampling correctness: GPU-native penalties, logit bias, grammar, logprobs~~ — **DONE** (full GPU parity, no CPU fallback, 18/18 E2E tests)
   4. GGUF support: Either port candle's QCudaStorage approach or add dequant kernels
-  5. MoE kernel + models: Fused MoE GEMM, then port Mixtral/Qwen MoE/Qwen3 MoE
+  5. ~~MoE kernel + models: Fused MoE GEMM, then port Mixtral/Qwen MoE/Qwen3 MoE~~ — **DONE** (WMMA tensor-core kernel, 3 models)
   6. DeepSeek V2/V3 (MLA): Most complex arch — absorbed-MLA attention, MoE
   7. Tensor parallelism: Parallel layers, NCCL, multi-GPU init
   8. Remaining dense archs: Command R, Qwen3-Next
   9. ~~Sampling perf: Fused penalty kernel on GPU, no CPU fallback~~ — **DONE**
   10. LoRA, speculative decoding: Feature parity on worker traits (embeddings done)
   11. Multimodal: Vision encoders (Gemma3-MM, Qwen2-VL)
+  12. MoE perf tuning: Inline PTX mma, tile autoselection, L2 grouping (see section 6)
+  13. Quantized MoE: FP8/INT8/INT4 expert weights
 
-  The critical path is items 1-5. That covers the vast majority of real-world CUDA usage (dense LLaMA-family models in
-  FP16/BF16/GPTQ/AWQ/GGUF with correct sampling).
+  The critical path is items 2 and 4. Items 1, 3, 5, 9 are done. That covers the vast majority of real-world CUDA usage
+  (dense + MoE LLaMA-family models in FP16/BF16 with correct sampling). TP and quantization are next.

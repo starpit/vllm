@@ -51,40 +51,38 @@ static void launch_moe_sum(
     const scalar_t* input,
     int num_tokens,
     int hidden_size,
-    int topk)
+    int topk,
+    cudaStream_t stream)
 {
     dim3 grid(num_tokens);
     dim3 block(min(hidden_size, 1024));
 
     switch (topk) {
         case 1:
-            vllm::moe::moe_sum_kernel<scalar_t, 1><<<grid, block>>>(out, input, hidden_size);
+            vllm::moe::moe_sum_kernel<scalar_t, 1><<<grid, block, 0, stream>>>(out, input, hidden_size);
             break;
         case 2:
-            vllm::moe::moe_sum_kernel<scalar_t, 2><<<grid, block>>>(out, input, hidden_size);
+            vllm::moe::moe_sum_kernel<scalar_t, 2><<<grid, block, 0, stream>>>(out, input, hidden_size);
             break;
         case 3:
-            vllm::moe::moe_sum_kernel<scalar_t, 3><<<grid, block>>>(out, input, hidden_size);
+            vllm::moe::moe_sum_kernel<scalar_t, 3><<<grid, block, 0, stream>>>(out, input, hidden_size);
             break;
         case 4:
-            vllm::moe::moe_sum_kernel<scalar_t, 4><<<grid, block>>>(out, input, hidden_size);
+            vllm::moe::moe_sum_kernel<scalar_t, 4><<<grid, block, 0, stream>>>(out, input, hidden_size);
             break;
         case 5:
-            vllm::moe::moe_sum_kernel<scalar_t, 5><<<grid, block>>>(out, input, hidden_size);
+            vllm::moe::moe_sum_kernel<scalar_t, 5><<<grid, block, 0, stream>>>(out, input, hidden_size);
             break;
         case 6:
-            vllm::moe::moe_sum_kernel<scalar_t, 6><<<grid, block>>>(out, input, hidden_size);
+            vllm::moe::moe_sum_kernel<scalar_t, 6><<<grid, block, 0, stream>>>(out, input, hidden_size);
             break;
         case 8:
-            vllm::moe::moe_sum_kernel<scalar_t, 8><<<grid, block>>>(out, input, hidden_size);
+            vllm::moe::moe_sum_kernel<scalar_t, 8><<<grid, block, 0, stream>>>(out, input, hidden_size);
             break;
         default:
-            // Generic fallback for unusual topk values: sum in a loop
-            // (less efficient due to no unrolling, but correct)
-            vllm::moe::moe_sum_kernel<scalar_t, 4><<<grid, block>>>(out, input, hidden_size);
+            vllm::moe::moe_sum_kernel<scalar_t, 4><<<grid, block, 0, stream>>>(out, input, hidden_size);
             break;
     }
-    cudaDeviceSynchronize();
 }
 
 extern "C" void moe_sum_f32(
@@ -92,9 +90,10 @@ extern "C" void moe_sum_f32(
     const float* input,
     int num_tokens,
     int hidden_size,
-    int topk)
+    int topk,
+    cudaStream_t stream)
 {
-    launch_moe_sum<float>(out, input, num_tokens, hidden_size, topk);
+    launch_moe_sum<float>(out, input, num_tokens, hidden_size, topk, stream);
 }
 
 extern "C" void moe_sum_f16(
@@ -102,12 +101,13 @@ extern "C" void moe_sum_f16(
     const void* input,
     int num_tokens,
     int hidden_size,
-    int topk)
+    int topk,
+    cudaStream_t stream)
 {
     launch_moe_sum<__half>(
         reinterpret_cast<__half*>(out),
         reinterpret_cast<const __half*>(input),
-        num_tokens, hidden_size, topk);
+        num_tokens, hidden_size, topk, stream);
 }
 
 extern "C" void moe_sum_bf16(
@@ -115,10 +115,11 @@ extern "C" void moe_sum_bf16(
     const void* input,
     int num_tokens,
     int hidden_size,
-    int topk)
+    int topk,
+    cudaStream_t stream)
 {
     launch_moe_sum<__nv_bfloat16>(
         reinterpret_cast<__nv_bfloat16*>(out),
         reinterpret_cast<const __nv_bfloat16*>(input),
-        num_tokens, hidden_size, topk);
+        num_tokens, hidden_size, topk, stream);
 }

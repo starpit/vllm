@@ -1,0 +1,497 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Qwen3 MoE model using `GpuTensor`.
+//!
+//! Differences from Qwen2 MoE:
+//! - QKV bias (already handled by LlamaAttention::load_fused)
+//! - QK-norm: per-head RMS norm on Q and K before RoPE
+//!
+//! The MoE layer is identical to Qwen2 MoE. Only the attention layer differs
+//! (QK-norm weights loaded via `load_fused_with_qk_norm`).
+
+use anyhow::Result;
+
+use crate::alloc::OwnedTensor;
+use crate::device::GpuDevice;
+use crate::dtype::DType;
+use crate::kernels;
+use crate::kv_cache::KvCachePool;
+use crate::layers::{Linear, RmsNorm};
+use crate::layers_moe::FusedMoELayer;
+use crate::model::llama::{LlamaAttention, LlamaMLP, RotaryCache};
+use crate::tensor::GpuTensor;
+use crate::weights::GpuWeights;
+
+pub use crate::model::qwen2_moe::Qwen2MoeConfig;
+
+/// Qwen3 MoE config — same fields as Qwen2 MoE.
+pub type Qwen3MoeConfig = Qwen2MoeConfig;
+
+// ---------------------------------------------------------------------------
+// MLP variants (reuse Qwen2 MoE logic)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::large_enum_variant)]
+enum Qwen3MoeMlp {
+    Dense(LlamaMLP),
+    MoE {
+        moe: FusedMoELayer,
+        shared_gate_up: Linear,
+        shared_down: Linear,
+        shared_expert_gate: Linear,
+        shared_intermediate_size: usize,
+    },
+}
+
+impl Qwen3MoeMlp {
+    unsafe fn forward_owned(
+        &self,
+        hidden_states: GpuTensor,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        match self {
+            Self::Dense(mlp) => mlp.forward_owned(hidden_states, device),
+            Self::MoE {
+                moe,
+                shared_gate_up,
+                shared_down,
+                shared_expert_gate,
+                shared_intermediate_size,
+            } => {
+                let stream = device.compute_stream;
+
+                let moe_out = moe.forward_owned(hidden_states, device);
+
+                let shared_gu = shared_gate_up.forward_owned(
+                    hidden_states,
+                    &mut device.cublas,
+                    &mut device.caching,
+                );
+                let shared_activated = kernels::silu_and_mul_fused(
+                    shared_gu.as_gpu_tensor(),
+                    *shared_intermediate_size,
+                    &mut device.caching,
+                    stream,
+                );
+                drop(shared_gu);
+
+                let shared_out = shared_down.forward_owned(
+                    shared_activated.as_gpu_tensor(),
+                    &mut device.cublas,
+                    &mut device.caching,
+                );
+                drop(shared_activated);
+
+                let gate_logits = shared_expert_gate.forward_owned(
+                    hidden_states,
+                    &mut device.cublas,
+                    &mut device.caching,
+                );
+
+                let result = kernels::sigmoid_mul_add(
+                    moe_out.as_gpu_tensor(),
+                    shared_out.as_gpu_tensor(),
+                    gate_logits.as_gpu_tensor(),
+                    &mut device.caching,
+                    stream,
+                );
+                drop(moe_out);
+                drop(shared_out);
+                drop(gate_logits);
+
+                result
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoder layer
+// ---------------------------------------------------------------------------
+
+pub struct Qwen3MoeDecoderLayer {
+    pub self_attn: LlamaAttention,
+    mlp: Qwen3MoeMlp,
+    input_layernorm: RmsNorm,
+    post_attention_layernorm: RmsNorm,
+}
+
+impl Qwen3MoeDecoderLayer {
+    pub fn load(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Qwen3MoeConfig,
+        layer_idx: usize,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let llama_cfg = config.as_llama_config();
+
+        // Qwen3 MoE uses QK-norm on all attention layers.
+        let self_attn = LlamaAttention::load_fused_with_qk_norm(
+            weights,
+            &format!("{prefix}.self_attn"),
+            &llama_cfg,
+            layer_idx,
+            config.rms_norm_eps,
+            stream,
+        )?;
+
+        let is_dense = config.mlp_only_layers.contains(&layer_idx);
+        let mlp = if is_dense {
+            let dense = LlamaMLP::load_fused(
+                weights,
+                &format!("{prefix}.mlp"),
+                config.intermediate_size,
+                stream,
+            )?;
+            Qwen3MoeMlp::Dense(dense)
+        } else {
+            Self::load_moe(weights, &format!("{prefix}.mlp"), config, stream)?
+        };
+
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        })
+    }
+
+    fn load_moe(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Qwen3MoeConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Qwen3MoeMlp> {
+        let num_experts = config.num_experts;
+        let inter = config.moe_intermediate_size;
+        let hidden = config.hidden_size;
+
+        let gate = Linear::load(weights, &format!("{prefix}.gate"))?;
+
+        let first_gate = format!("{prefix}.experts.0.gate_proj.weight");
+        let (_, dtype) = weights
+            .tensor_info(&first_gate)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {first_gate}"))?;
+        let elem = dtype.size_bytes();
+
+        let w1_bytes = num_experts * 2 * inter * hidden * elem;
+        let w2_bytes = num_experts * hidden * inter * elem;
+        let w1_ptr = unsafe { crate::driver::mem_alloc(w1_bytes)? };
+        let w2_ptr = unsafe { crate::driver::mem_alloc(w2_bytes)? };
+
+        for e in 0..num_experts {
+            let gate_name = format!("{prefix}.experts.{e}.gate_proj.weight");
+            let up_name = format!("{prefix}.experts.{e}.up_proj.weight");
+            let down_name = format!("{prefix}.experts.{e}.down_proj.weight");
+
+            let expert_w1_offset = e * 2 * inter * hidden * elem;
+            let gate_proj_bytes = inter * hidden * elem;
+
+            unsafe {
+                weights.take_into(&gate_name, w1_ptr.add(expert_w1_offset), stream)?;
+                weights.take_into(
+                    &up_name,
+                    w1_ptr.add(expert_w1_offset + gate_proj_bytes),
+                    stream,
+                )?;
+
+                let expert_w2_offset = e * hidden * inter * elem;
+                weights.take_into(&down_name, w2_ptr.add(expert_w2_offset), stream)?;
+            }
+        }
+
+        let w1 = unsafe { GpuTensor::new(w1_ptr, &[num_experts, 2 * inter, hidden], dtype) };
+        let w2 = unsafe { GpuTensor::new(w2_ptr, &[num_experts, hidden, inter], dtype) };
+
+        let moe = FusedMoELayer {
+            gate,
+            w1,
+            w2,
+            num_experts,
+            top_k: config.num_experts_per_tok,
+            intermediate_size: inter,
+            hidden_size: hidden,
+            renormalize: true,
+        };
+
+        let shared_inter = config.shared_expert_intermediate_size;
+        let shared_gate_up = {
+            let gate_name = format!("{prefix}.shared_expert.gate_proj.weight");
+            let up_name = format!("{prefix}.shared_expert.up_proj.weight");
+            let gate_proj_bytes = shared_inter * hidden * elem;
+            let total = 2 * gate_proj_bytes;
+            let ptr = unsafe { crate::driver::mem_alloc(total)? };
+            unsafe {
+                weights.take_into(&gate_name, ptr, stream)?;
+                weights.take_into(&up_name, ptr.add(gate_proj_bytes), stream)?;
+            }
+            let w = unsafe { GpuTensor::new(ptr, &[2 * shared_inter, hidden], dtype) };
+            Linear::new(w, None)
+        };
+
+        let shared_down = Linear::load(weights, &format!("{prefix}.shared_expert.down_proj"))?;
+
+        let shared_expert_gate = Linear::load(weights, &format!("{prefix}.shared_expert_gate"))?;
+
+        Ok(Qwen3MoeMlp::MoE {
+            moe,
+            shared_gate_up,
+            shared_down,
+            shared_expert_gate,
+            shared_intermediate_size: shared_inter,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_owned(
+        &self,
+        hidden_states: OwnedTensor,
+        residual: Option<OwnedTensor>,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        rotary: &RotaryCache,
+        device: &mut GpuDevice,
+    ) -> (OwnedTensor, OwnedTensor) {
+        let (normed, residual) = if let Some(residual) = residual {
+            let hs_gpu = *hidden_states;
+            let res_gpu = *residual;
+            kernels::fused_add_rms_norm_inplace(
+                hs_gpu,
+                res_gpu,
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+                device.compute_stream,
+            );
+            (hidden_states, residual)
+        } else {
+            let normed = kernels::rms_norm(
+                *hidden_states,
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+                &mut device.caching,
+                device.compute_stream,
+            );
+            (normed, hidden_states)
+        };
+
+        let attn_output = self.self_attn.forward_owned(
+            *normed,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            rotary,
+            device,
+        );
+        drop(normed);
+
+        let res_gpu = *residual;
+        kernels::fused_add_rms_norm_inplace(
+            *attn_output,
+            res_gpu,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+            device.compute_stream,
+        );
+
+        let mlp_output = self.mlp.forward_owned(*attn_output, device);
+        drop(attn_output);
+
+        (mlp_output, residual)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Qwen3MoeForCausalLM
+// ---------------------------------------------------------------------------
+
+pub struct Qwen3MoeModel {
+    pub embed_tokens: crate::layers::Embedding,
+    pub layers: Vec<Qwen3MoeDecoderLayer>,
+    pub norm: RmsNorm,
+    pub rotary: RotaryCache,
+}
+
+impl Qwen3MoeModel {
+    pub fn load(
+        weights: &mut GpuWeights,
+        config: &Qwen3MoeConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = crate::layers::Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            layers.push(Qwen3MoeDecoderLayer::load(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                device.compute_stream,
+            )?);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_owned(
+        &self,
+        input_ids: GpuTensor,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+    ) -> GpuTensor {
+        let hidden_states = kernels::embedding_gather(
+            self.embed_tokens.weight,
+            input_ids,
+            &mut device.caching,
+            device.compute_stream,
+        );
+
+        let mut hidden_states: OwnedTensor = hidden_states;
+        let mut residual: Option<OwnedTensor> = None;
+
+        for layer in &self.layers {
+            let (hs, res) = layer.forward_owned(
+                hidden_states,
+                residual,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                kv_cache,
+                &self.rotary,
+                device,
+            );
+            hidden_states = hs;
+            residual = Some(res);
+        }
+
+        let hs_gpu = *hidden_states;
+        let res_gpu = residual.as_ref().unwrap().as_gpu_tensor();
+        kernels::fused_add_rms_norm_inplace(
+            hs_gpu,
+            res_gpu,
+            self.norm.weight,
+            self.norm.eps,
+            device.compute_stream,
+        );
+        drop(residual);
+        hidden_states.into_gpu_tensor()
+    }
+}
+
+pub struct Qwen3MoeForCausalLM {
+    pub model: Qwen3MoeModel,
+    pub lm_head: Linear,
+}
+
+impl Qwen3MoeForCausalLM {
+    pub fn load(
+        weights: &mut GpuWeights,
+        config: &Qwen3MoeConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = Qwen3MoeModel::load(weights, config, dtype, device)?;
+        let lm_head = if config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.weight, None)
+        } else {
+            Linear::load(weights, "lm_head")?
+        };
+        Ok(Self { model, lm_head })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward(
+        &self,
+        input_ids: GpuTensor,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+        last_token_indices: Option<GpuTensor>,
+    ) -> GpuTensor {
+        let hidden_states = self.model.forward_owned(
+            input_ids,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            device,
+        );
+
+        let hidden_states = if let Some(indices) = last_token_indices {
+            kernels::embedding_gather(
+                hidden_states,
+                indices,
+                &mut device.caching,
+                device.compute_stream,
+            )
+            .into_gpu_tensor()
+        } else {
+            hidden_states
+        };
+
+        self.lm_head
+            .forward(hidden_states, &mut device.cublas, &mut device.caching)
+    }
+}

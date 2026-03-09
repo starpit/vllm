@@ -274,6 +274,11 @@ pub struct LlamaAttention {
     pub head_dim: usize,
     pub scale: f32,
     layer_idx: usize,
+    /// Optional per-head QK-norm weights (Qwen3, Gemma3).
+    /// When present, forward uses `qk_norm_rope` instead of `fused_qkv_rope`.
+    pub q_norm_weight: Option<GpuTensor>,
+    pub k_norm_weight: Option<GpuTensor>,
+    pub qk_norm_eps: f32,
 }
 
 impl LlamaAttention {
@@ -364,20 +369,52 @@ impl LlamaAttention {
             self.qkv_proj
                 .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
 
-        // Fused QKV split + RoPE → owned Q, K, V.
-        let (q, k, v) = kernels::fused_qkv_rope(
-            qkv.as_gpu_tensor(),
-            positions,
-            rotary.cos_sin_cache,
-            self.q_size,
-            self.kv_size,
-            self.num_q_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            &mut device.caching,
-            device.compute_stream,
-        );
-        drop(qkv); // free QKV projection output
+        // Split QKV and apply RoPE (with optional per-head QK-norm for Qwen3/Gemma3).
+        let (q, k, v) =
+            if let (Some(q_norm_w), Some(k_norm_w)) = (self.q_norm_weight, self.k_norm_weight) {
+                // QK-norm path: split QKV first, then fused QK-norm + RoPE in-place.
+                let (q, k, v) = kernels::split_qkv(
+                    qkv.as_gpu_tensor(),
+                    self.q_size,
+                    self.kv_size,
+                    self.num_q_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(qkv);
+                kernels::qk_norm_rope_inplace(
+                    q.as_gpu_tensor(),
+                    k.as_gpu_tensor(),
+                    q_norm_w,
+                    k_norm_w,
+                    rotary.cos_sin_cache,
+                    positions,
+                    self.num_q_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.qk_norm_eps,
+                    device.compute_stream,
+                );
+                (q, k, v)
+            } else {
+                // Standard path: fused QKV split + RoPE.
+                let result = kernels::fused_qkv_rope(
+                    qkv.as_gpu_tensor(),
+                    positions,
+                    rotary.cos_sin_cache,
+                    self.q_size,
+                    self.kv_size,
+                    self.num_q_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(qkv);
+                result
+            };
 
         // Write new K/V into paged cache (reads from k, v).
         kernels::reshape_and_cache(
@@ -925,7 +962,38 @@ impl LlamaAttention {
             head_dim,
             scale: 1.0 / (head_dim as f32).sqrt(),
             layer_idx,
+            q_norm_weight: None,
+            k_norm_weight: None,
+            qk_norm_eps: 0.0,
         })
+    }
+
+    /// Load with fused QKV weights + QK-norm weights (Qwen3 MoE, Gemma3).
+    ///
+    /// Same as `load_fused` but also loads `{prefix}.q_norm.weight` and
+    /// `{prefix}.k_norm.weight` for per-head RMS normalization before RoPE.
+    pub fn load_fused_with_qk_norm(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        qk_norm_eps: f32,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let mut attn = Self::load_fused(weights, prefix, config, layer_idx, stream)?;
+
+        let q_norm_name = format!("{prefix}.q_norm.weight");
+        let k_norm_name = format!("{prefix}.k_norm.weight");
+
+        if weights.contains(&q_norm_name) {
+            attn.q_norm_weight = Some(weights.take(&q_norm_name)?);
+        }
+        if weights.contains(&k_norm_name) {
+            attn.k_norm_weight = Some(weights.take(&k_norm_name)?);
+        }
+        attn.qk_norm_eps = qk_norm_eps;
+
+        Ok(attn)
     }
 }
 

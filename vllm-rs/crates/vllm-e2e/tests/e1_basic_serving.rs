@@ -1527,19 +1527,135 @@ async fn test_cuda_marlin_awq_chat() {
 */ // end Marlin block comment
 
 // ===========================================================================
-// CUDA MoE E2E tests — commented out, needs ≥80GB GPU
 // ===========================================================================
-// The smallest MoE safetensors models (Qwen1.5-MoE-A2.7B-Chat, Mixtral-8x7B)
-// are 14B+ total params (~31GB BF16) — too large for L40S (48GB).
-// MoE CUDA kernels are covered by 5 unit tests in vllm-kernels/src/moe.rs.
-// Uncomment when A100-80GB or H100 is available.
-//
-// #[cfg(feature = "cuda")]
-// #[tokio::test(flavor = "multi_thread")]
-// #[ignore]
-// async fn test_cuda_moe_server_starts() { ... }
-// async fn test_cuda_moe_completion() { ... }
-// async fn test_cuda_moe_chat() { ... }
+// CUDA MoE E2E tests
+// ===========================================================================
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_mixtral -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_mixtral_server_starts() {
+    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+        .start()
+        .await
+        .expect("CUDA Mixtral MoE server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let models = client.list_models().await.unwrap();
+    assert_eq!(models.data.len(), 1);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_mixtral_completion() {
+    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "MoE completion should not be empty"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_mixtral_chat() {
+    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    assert!(
+        !resp.choices[0]
+            .message
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .is_empty(),
+        "MoE chat should produce output"
+    );
+}
+
+// Qwen2 MoE — ~29GB BF16, fits on L40S (48GB) but tight.
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_qwen2_moe -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_qwen2_moe_server_starts() {
+    let server = TestServer::builder(TestModels::QWEN2_MOE_A2_7B_CUDA)
+        .start()
+        .await
+        .expect("CUDA Qwen2 MoE server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let models = client.list_models().await.unwrap();
+    assert_eq!(models.data.len(), 1);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_qwen2_moe_completion() {
+    let server = TestServer::builder(TestModels::QWEN2_MOE_A2_7B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "Qwen2 MoE completion should not be empty"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_qwen2_moe_chat() {
+    let server = TestServer::builder(TestModels::QWEN2_MOE_A2_7B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("What is 2+2? Answer with just the number.", Some(10));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    assert!(
+        !resp.choices[0]
+            .message
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .is_empty(),
+        "Qwen2 MoE chat should produce output"
+    );
+}
 
 // ===========================================================================
 // CUDA semantic correctness + multi-turn + non-greedy tests

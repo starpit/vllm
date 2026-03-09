@@ -51,6 +51,8 @@ pub mod kv_cache;
 #[cfg(feature = "cuda")]
 pub mod layers;
 #[cfg(feature = "cuda")]
+pub mod layers_moe;
+#[cfg(feature = "cuda")]
 pub mod model;
 #[cfg(feature = "cuda")]
 pub mod weights;

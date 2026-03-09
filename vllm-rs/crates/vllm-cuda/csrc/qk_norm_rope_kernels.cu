@@ -133,12 +133,13 @@ void qk_norm_rope_f32(
     const uint32_t* positions,
     float epsilon,
     int num_q_heads, int num_kv_heads,
-    int head_dim, int num_tokens)
+    int head_dim, int num_tokens,
+    cudaStream_t stream)
 {
     dim3 grid(num_tokens, num_q_heads + num_kv_heads);
     int threads = (head_dim < 1024) ? head_dim : 1024;
     int smem_bytes = head_dim * sizeof(float);
-    qk_norm_rope_kernel<float><<<grid, threads, smem_bytes>>>(
+    qk_norm_rope_kernel<float><<<grid, threads, smem_bytes, stream>>>(
         query, key, q_weight, k_weight,
         cos_cache, sin_cache, positions,
         epsilon, num_q_heads, num_kv_heads, head_dim);
@@ -151,12 +152,13 @@ void qk_norm_rope_f16(
     const uint32_t* positions,
     float epsilon,
     int num_q_heads, int num_kv_heads,
-    int head_dim, int num_tokens)
+    int head_dim, int num_tokens,
+    cudaStream_t stream)
 {
     dim3 grid(num_tokens, num_q_heads + num_kv_heads);
     int threads = (head_dim < 1024) ? head_dim : 1024;
     int smem_bytes = head_dim * sizeof(float);
-    qk_norm_rope_kernel<__half><<<grid, threads, smem_bytes>>>(
+    qk_norm_rope_kernel<__half><<<grid, threads, smem_bytes, stream>>>(
         query, key, q_weight, k_weight,
         cos_cache, sin_cache, positions,
         epsilon, num_q_heads, num_kv_heads, head_dim);
@@ -169,12 +171,13 @@ void qk_norm_rope_bf16(
     const uint32_t* positions,
     float epsilon,
     int num_q_heads, int num_kv_heads,
-    int head_dim, int num_tokens)
+    int head_dim, int num_tokens,
+    cudaStream_t stream)
 {
     dim3 grid(num_tokens, num_q_heads + num_kv_heads);
     int threads = (head_dim < 1024) ? head_dim : 1024;
     int smem_bytes = head_dim * sizeof(float);
-    qk_norm_rope_kernel<__nv_bfloat16><<<grid, threads, smem_bytes>>>(
+    qk_norm_rope_kernel<__nv_bfloat16><<<grid, threads, smem_bytes, stream>>>(
         query, key, q_weight, k_weight,
         cos_cache, sin_cache, positions,
         epsilon, num_q_heads, num_kv_heads, head_dim);

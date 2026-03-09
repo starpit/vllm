@@ -66,9 +66,11 @@ impl TestModels {
     // CUDA-compatible safetensors models (non-quantized, run on GPU)
     pub const SMOLLM_135M_CUDA: &str = "HuggingFaceTB/SmolLM2-135M-Instruct";
     pub const QWEN2_0_5B_CUDA: &str = "Qwen/Qwen2.5-0.5B";
-    // MoE model for CUDA — Qwen2MoeForCausalLM (~31GB BF16, needs ≥80GB GPU)
-    // Too large for L40S (48GB); enable when A100-80GB or H100 is available.
-    // pub const QWEN_MOE_A2_7B_CUDA: &str = "Qwen/Qwen1.5-MoE-A2.7B-Chat";
+    // MoE models for CUDA — safetensors BF16
+    // Mixtral: ~0.8B total params (~1.5GB BF16), MixtralForCausalLM
+    pub const MIXTRAL_SMALL_CUDA: &str = "if001/small_mixtral_ja_llm_jp_tk";
+    // Qwen2 MoE: ~14.3B total params (~29GB BF16), Qwen2MoeForCausalLM — fits on L40S (48GB)
+    pub const QWEN2_MOE_A2_7B_CUDA: &str = "Qwen/Qwen1.5-MoE-A2.7B-Chat";
 
     // Qwen3 — safetensors BF16 for cuda-backend (~1.2GB)
     pub const QWEN3_0_6B_CUDA: &str = "Qwen/Qwen3-0.6B";

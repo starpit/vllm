@@ -452,15 +452,12 @@ extern "C" void topk_softmax_f32(
     int num_tokens,
     int num_experts,
     int topk,
-    int renormalize)
+    int renormalize,
+    cudaStream_t stream)
 {
-    cudaStream_t stream = nullptr;
-    cudaStreamCreate(&stream);
     vllm::moe::topkGatingKernelLauncher<float>(
         gating_output, topk_weights, topk_ids, workspace,
         num_tokens, num_experts, topk, renormalize != 0, stream);
-    cudaStreamSynchronize(stream);
-    cudaStreamDestroy(stream);
 }
 
 extern "C" void topk_softmax_bf16(
@@ -471,16 +468,13 @@ extern "C" void topk_softmax_bf16(
     int num_tokens,
     int num_experts,
     int topk,
-    int renormalize)
+    int renormalize,
+    cudaStream_t stream)
 {
-    cudaStream_t stream = nullptr;
-    cudaStreamCreate(&stream);
     vllm::moe::topkGatingKernelLauncher<__nv_bfloat16>(
         reinterpret_cast<const __nv_bfloat16*>(gating_output),
         topk_weights, topk_ids, workspace,
         num_tokens, num_experts, topk, renormalize != 0, stream);
-    cudaStreamSynchronize(stream);
-    cudaStreamDestroy(stream);
 }
 
 extern "C" void topk_softmax_f16(
@@ -491,14 +485,11 @@ extern "C" void topk_softmax_f16(
     int num_tokens,
     int num_experts,
     int topk,
-    int renormalize)
+    int renormalize,
+    cudaStream_t stream)
 {
-    cudaStream_t stream = nullptr;
-    cudaStreamCreate(&stream);
     vllm::moe::topkGatingKernelLauncher<__half>(
         reinterpret_cast<const __half*>(gating_output),
         topk_weights, topk_ids, workspace,
         num_tokens, num_experts, topk, renormalize != 0, stream);
-    cudaStreamSynchronize(stream);
-    cudaStreamDestroy(stream);
 }

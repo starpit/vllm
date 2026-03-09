@@ -66,7 +66,7 @@
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
   │ GPTQ 4-bit asymmetric       │ yes        │ no       │ Needs zero-point loading                 │
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
-  │ AWQ 4-bit                   │ yes        │ partial  │ Repack wired, needs E2E test             │
+  │ AWQ 4-bit                   │ yes        │ yes      │ Marlin kernel, E2E verified (Qwen2.5-0.5B) │
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
   │ Linear bias (QKV)           │ yes        │ yes      │ Post-GEMM bias_add_inplace               │
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
@@ -82,7 +82,7 @@
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
   │ CUDA graphs (quant)         │ yes        │ yes      │ Works with decode graphs                  │
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
-  │ Architectures (quant)       │ all        │ LLaMA, Qwen2, Gemma2, Granite │ Gemma3, MoE archs need wiring │
+  │ Architectures (quant)       │ all        │ LLaMA, Qwen2, Gemma2, Granite │ Gemma2 GPTQ E2E verified; Granite/Gemma3/MoE E2E tests needed │
   └─────────────────────────────┴────────────┴──────────┴──────────────────────────────────────────┘
 
   **Performance (Qwen2.5-0.5B-Instruct-GPTQ-Int4, nick5 L40S, 128 output tokens):**

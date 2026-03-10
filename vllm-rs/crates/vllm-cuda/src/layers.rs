@@ -208,16 +208,85 @@ impl MarlinLinear {
 }
 
 // ---------------------------------------------------------------------------
-// LinearLayer (enum dispatch: Dense or Marlin)
+// GgmlLinear (GGML quantized via llama.cpp kernels)
 // ---------------------------------------------------------------------------
 
-/// Unified linear layer — either dense (cuBLAS GEMM) or quantized (Marlin GEMM).
+/// Quantized linear layer holding raw GGML-quantized bytes on GPU.
+///
+/// Forward dispatches to the appropriate dequant-matvec kernel based on GGML
+/// dtype and batch size:
+/// - BS=1: `dequantize_mul_mat_vec` (fused dequant + dot product)
+/// - BS>1: quantize activations to Q8_1, then integer dot products
+pub struct GgmlLinear {
+    pub storage: crate::ggml::GgmlStorage,
+    pub bias: Option<GpuTensor>,
+}
+
+impl GgmlLinear {
+    /// Forward: y = ggml_matmul(weight, x) + bias
+    ///
+    /// Activations must be f32 (GGML kernels operate on f32).
+    /// Output is f32 `[num_tokens, out_features]`.
+    pub unsafe fn forward(
+        &self,
+        x: GpuTensor,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> GpuTensor {
+        self.forward_owned(x, alloc, stream).into_gpu_tensor()
+    }
+
+    pub unsafe fn forward_owned(
+        &self,
+        x: GpuTensor,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> OwnedTensor {
+        let input_dtype = x.dtype();
+
+        // GGML kernels require f32 activations — cast if needed.
+        let x_f32 = if input_dtype != crate::dtype::DType::F32 {
+            let cast = crate::kernels::cast_logits_to_f32(x, alloc, stream);
+            cast.into_gpu_tensor()
+        } else {
+            x
+        };
+
+        let out_f32 = crate::ggml::ggml_matmul(&self.storage, x_f32, alloc, stream);
+
+        if let Some(bias) = self.bias {
+            crate::kernels::bias_add_inplace(out_f32.as_gpu_tensor(), bias, stream);
+        }
+
+        // Cast back to original dtype if we converted to f32.
+        if input_dtype != crate::dtype::DType::F32 {
+            crate::kernels::cast_from_f32(out_f32.into_gpu_tensor(), input_dtype, alloc, stream)
+        } else {
+            out_f32
+        }
+    }
+
+    pub fn out_features(&self) -> usize {
+        self.storage.nrows
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.storage.ncols
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LinearLayer (enum dispatch: Dense, Marlin, or Ggml)
+// ---------------------------------------------------------------------------
+
+/// Unified linear layer — dense (cuBLAS), Marlin INT4, or GGML quantized.
 ///
 /// Models use this everywhere they currently use `Linear`. The factory decides
-/// at load time which variant to create based on `QuantConfig`.
+/// at load time which variant to create based on weight format.
 pub enum LinearLayer {
     Dense(Linear),
     Marlin(Box<MarlinLinear>),
+    Ggml(Box<GgmlLinear>),
 }
 
 impl LinearLayer {
@@ -243,6 +312,7 @@ impl LinearLayer {
         match self {
             Self::Dense(l) => l.forward_owned(x, cublas, alloc),
             Self::Marlin(l) => l.forward_owned(x, alloc, stream),
+            Self::Ggml(l) => l.forward_owned(x, alloc, stream),
         }
     }
 
@@ -250,6 +320,7 @@ impl LinearLayer {
         match self {
             Self::Dense(l) => l.out_features(),
             Self::Marlin(l) => l.out_features(),
+            Self::Ggml(l) => l.out_features(),
         }
     }
 
@@ -257,6 +328,7 @@ impl LinearLayer {
         match self {
             Self::Dense(l) => l.in_features(),
             Self::Marlin(l) => l.in_features(),
+            Self::Ggml(l) => l.in_features(),
         }
     }
 }
@@ -270,6 +342,12 @@ impl From<Linear> for LinearLayer {
 impl From<MarlinLinear> for LinearLayer {
     fn from(l: MarlinLinear) -> Self {
         Self::Marlin(Box::new(l))
+    }
+}
+
+impl From<GgmlLinear> for LinearLayer {
+    fn from(l: GgmlLinear) -> Self {
+        Self::Ggml(Box::new(l))
     }
 }
 

@@ -364,6 +364,8 @@ pub fn gguf_to_hf_name(gguf_name: &str) -> String {
             "ffn_up.weight" => "mlp.up_proj.weight",
             "ffn_down.weight" => "mlp.down_proj.weight",
             "ffn_norm.weight" => "post_attention_layernorm.weight",
+            "attn_q_norm.weight" => "self_attn.q_norm.weight",
+            "attn_k_norm.weight" => "self_attn.k_norm.weight",
             other => return format!("model.layers.{layer_num}.{other}"),
         };
 

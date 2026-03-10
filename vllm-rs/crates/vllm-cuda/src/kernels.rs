@@ -1942,6 +1942,57 @@ pub unsafe fn cast_logits_to_f32(
 }
 
 // ---------------------------------------------------------------------------
+// Cast from f32 (for GGML matmul output → model dtype)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn cast_from_f32_f16(output: *mut u16, input: *const f32, n: c_int, stream: CUstream);
+    fn cast_from_f32_bf16(output: *mut u16, input: *const f32, n: c_int, stream: CUstream);
+}
+
+/// Cast f32 tensor to target dtype on GPU. If target is f32, does a D2D copy.
+pub unsafe fn cast_from_f32(
+    input: GpuTensor,
+    target_dtype: DType,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    assert_eq!(
+        input.dtype(),
+        DType::F32,
+        "cast_from_f32: input must be f32"
+    );
+    let n = input.numel() as c_int;
+    let shape: Vec<usize> = input.shape().iter().map(|&d| d as usize).collect();
+    let out = alloc.alloc_tensor(&shape, target_dtype);
+    match target_dtype {
+        DType::F32 => {
+            crate::driver::memcpy_dtod_async(
+                out.as_gpu_tensor().raw_ptr(),
+                input.raw_ptr() as *const u8,
+                input.size_bytes(),
+                stream,
+            )
+            .expect("cast_from_f32: D2D copy failed");
+        }
+        DType::F16 => cast_from_f32_f16(
+            out.as_gpu_tensor().raw_ptr() as *mut u16,
+            input.as_ptr::<f32>() as *const f32,
+            n,
+            stream,
+        ),
+        DType::BF16 => cast_from_f32_bf16(
+            out.as_gpu_tensor().raw_ptr() as *mut u16,
+            input.as_ptr::<f32>() as *const f32,
+            n,
+            stream,
+        ),
+        _ => panic!("cast_from_f32: unsupported target dtype {:?}", target_dtype),
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // MoE top-k softmax
 // ---------------------------------------------------------------------------
 

@@ -46,7 +46,7 @@
   ┌──────────────────┬──────────────┬─────────────┬────────────────────────────────────────────────┐
   │      Format      │ CandleWorker │ CudaWorker  │                     Notes                      │
   ├──────────────────┼──────────────┼─────────────┼────────────────────────────────────────────────┤
-  │ GGUF (k-quants)  │ yes          │ no          │ Dequant kernels or candle's QCudaStorage       │
+  │ GGUF (k-quants)  │ yes          │ YES         │ GGML dequant kernels (llama.cpp-derived)        │
   ├──────────────────┼──────────────┼─────────────┼────────────────────────────────────────────────┤
   │ GPTQ (W4A16)     │ yes          │ YES         │ Marlin kernel, E2E verified (Qwen2.5-0.5B)    │
   ├──────────────────┼──────────────┼─────────────┼────────────────────────────────────────────────┤
@@ -106,7 +106,11 @@
   4. ~~Wire LLaMA/Gemma2/Granite for quantized loading~~ — **DONE** (LLaMA, Qwen2, Gemma2, Granite all wired)
   5. desc_act support — needed for some GPTQ models
 
-  Effort: GGUF requires either porting candle's QCudaStorage approach or writing dequant-on-the-fly kernels. BnB is lower priority.
+  GGUF uses llama.cpp-derived dequant kernels via FFI (quantized.cu). Weights stay compressed on GPU — no dequant at load time.
+  BS=1 uses fused dequant-matvec; BS>1 quantizes activations to Q8_1 then uses int8 dot products. BF16↔f32 casting around GGML matmul.
+  Supported dtypes: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, Q8K.
+  E2E verified: Qwen2.5-0.5B-GGUF, Qwen3-0.6B-GGUF. CUDA graphs disabled for GGML (incompatible with dynamic allocs).
+  BnB NF4 is lower priority.
 
   3. ~~Tensor Parallelism (TP)~~ — **DONE**
 
@@ -126,7 +130,7 @@
   ┌───────────────────────────┬───────────────┬───────────────────────────┐
   │          Feature          │ CandleWorker  │        CudaWorker         │
   ├───────────────────────────┼───────────────┼───────────────────────────┤
-  │ GGUF model loading        │ yes           │ no                        │
+  │ GGUF model loading        │ yes           │ yes (LLaMA/Qwen2/Qwen3)  │
   ├───────────────────────────┼───────────────┼───────────────────────────┤
   │ Embeddings / pooling mode │ yes (embed()) │ yes (embed() + pooling)   │
   ├───────────────────────────┼───────────────┼───────────────────────────┤
@@ -234,7 +238,7 @@
 
   Still needed:
   - ~~Marlin INT4 GEMM FFI~~ — **DONE** (marlin_gemm, repack, permute_scales all wired)
-  - GGUF dequant kernels — if not using candle's QCudaStorage
+  - ~~GGUF dequant kernels~~ — **DONE** (llama.cpp-derived quantized.cu, GgmlLinear layer type)
 
   Already implemented:
   - ~~Fused MoE GEMM~~ — custom WMMA kernel (BLOCK_M=128, BLOCK_N=128, BLOCK_K=32)
@@ -314,7 +318,7 @@
   1. ~~Low-hanging fruit: Alias Mistral/Qwen3/Phi-3 to LLaMA in CudaWorker~~ — **DONE**
   2. ~~Marlin FFI for GPTQ/AWQ~~ — **DONE** (both GPTQ + AWQ E2E verified, Qwen2.5-0.5B)
   3. ~~Sampling correctness: GPU-native penalties, logit bias, grammar, logprobs~~ — **DONE** (full GPU parity, no CPU fallback, 18/18 E2E tests)
-  4. GGUF support: Either port candle's QCudaStorage approach or add dequant kernels
+  4. ~~GGUF support~~ — **DONE** (GgmlLinear + quantized.cu dequant kernels, Qwen2.5/Qwen3 E2E verified)
   5. ~~MoE kernel + models: Fused MoE GEMM, then port Mixtral/Qwen MoE/Qwen3 MoE~~ — **DONE** (WMMA tensor-core kernel, 3 models)
   6. DeepSeek V2/V3 (MLA): Most complex arch — absorbed-MLA attention, MoE
   7. ~~Tensor parallelism: Parallel layers, NCCL, multi-GPU init~~ — **DONE** (TP=2 Qwen2.5-0.5B E2E verified)
@@ -325,5 +329,5 @@
   12. MoE perf tuning: Inline PTX mma, tile autoselection, L2 grouping (see section 6)
   13. Quantized MoE: FP8/INT8/INT4 expert weights
 
-  The critical path is item 4 (GGUF). Items 1, 2, 3, 5, 7, 9 are done. That covers dense + MoE LLaMA-family models
-  in FP16/BF16 with correct sampling, GPTQ/AWQ quantization, and multi-GPU tensor parallelism.
+  Items 1, 2, 3, 4, 5, 7, 9 are done. That covers dense + MoE LLaMA-family models
+  in FP16/BF16/GGUF with correct sampling, GPTQ/AWQ/GGUF quantization, and multi-GPU tensor parallelism.

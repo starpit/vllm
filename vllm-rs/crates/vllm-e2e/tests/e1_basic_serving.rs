@@ -1065,11 +1065,11 @@ async fn test_cuda_gemma3_chat() {
 // ===========================================================================
 // CUDA GGUF E2E tests — quantized GGUF models on GPU
 // ===========================================================================
-// TODO: Re-enable when vllm-cuda backend supports GGUF quantized models.
-// These previously used candle's QCudaStorage for GGUF + CUDA inference.
+// Uses vllm-cuda's GGML kernel FFI for quantized inference (no candle).
 //
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gguf -- --ignored
 
+// TODO: Gemma3 GGUF requires Gemma3ForCausalLM load_gguf() — not yet implemented
 /*
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
@@ -1128,6 +1128,7 @@ async fn test_cuda_gguf_gemma3_1b_chat() {
         "should generate at least one token"
     );
 }
+*/
 
 // Qwen2.5 GGUF (qwen2 architecture with QKV bias)
 
@@ -1205,6 +1206,8 @@ async fn test_cuda_gguf_qwen3_0_6b_chat() {
     );
 }
 
+// TODO: Qwen3Next GGUF requires Qwen3NextForCausalLM load_gguf() — not yet implemented
+/*
 // ---------------------------------------------------------------------------
 // CUDA GGUF: Qwen3.5 (Qwen3-Next) — hybrid GDN + full attention
 // ---------------------------------------------------------------------------
@@ -1269,7 +1272,7 @@ async fn test_cuda_gguf_qwen3_next_chat() {
     );
 }
 */
-// end GGUF block comment
+// end GGUF tests
 
 // ---------------------------------------------------------------------------
 // Tensor Parallelism (TP=2) tests — require 2 CUDA GPUs + NCCL

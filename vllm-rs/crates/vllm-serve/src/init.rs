@@ -254,6 +254,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             is_pooling,
             tp_rank: 0,
             tp_world_size: 1,
+            gguf_file: config.gguf_file.clone(),
         };
 
         let mut worker = CudaWorker::new(cuda_config);

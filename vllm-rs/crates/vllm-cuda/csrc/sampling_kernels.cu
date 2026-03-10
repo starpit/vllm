@@ -44,6 +44,20 @@ __device__ __forceinline__ float to_float<__nv_bfloat16>(__nv_bfloat16 val) {
     return __bfloat162float(val);
 }
 
+template <typename T>
+__device__ __forceinline__ T from_float(float val);
+
+template <>
+__device__ __forceinline__ float from_float<float>(float val) { return val; }
+
+template <>
+__device__ __forceinline__ __half from_float<__half>(float val) { return __float2half(val); }
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 from_float<__nv_bfloat16>(float val) {
+    return __float2bfloat16(val);
+}
+
 // ---------------------------------------------------------------------------
 // Warp-level reductions
 // ---------------------------------------------------------------------------
@@ -751,6 +765,18 @@ __global__ void cast_to_f32_kernel(
     }
 }
 
+template <typename T>
+__global__ void cast_from_f32_kernel(
+    T* __restrict__ output,
+    const float* __restrict__ input,
+    int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = from_float<T>(input[idx]);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Apply penalties: repetition, frequency, presence — fused, one block per row.
 // Matches Python vLLM's apply_penalties logic.
@@ -1033,6 +1059,22 @@ void cast_to_f32_bf16(float* output, const uint16_t* input, int n, cudaStream_t 
     if (n > 0)
         cast_to_f32_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
             output, reinterpret_cast<const __nv_bfloat16*>(input), n);
+}
+
+void cast_from_f32_f16(uint16_t* output, const float* input, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (n > 0)
+        cast_from_f32_kernel<__half><<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<__half*>(output), input, n);
+}
+
+void cast_from_f32_bf16(uint16_t* output, const float* input, int n, cudaStream_t stream) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (n > 0)
+        cast_from_f32_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(output), input, n);
 }
 
 void apply_penalties_inplace(

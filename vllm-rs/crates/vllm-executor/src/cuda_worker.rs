@@ -68,6 +68,8 @@ pub struct CudaWorkerConfig {
     pub tp_rank: usize,
     /// Tensor parallelism world size (1 = no TP).
     pub tp_world_size: usize,
+    /// Optional GGUF file name for HF Hub download (e.g. "model-Q4_K_M.gguf").
+    pub gguf_file: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -961,6 +963,9 @@ pub struct CudaWorker {
     /// of building Vecs on CPU and doing H2D copies.
     graph_metadata_valid: bool,
 
+    /// True when the model uses GGML quantized layers (disables CUDA graphs).
+    uses_ggml: bool,
+
     /// Pre-allocated pinned host staging buffers for graph replay.
     /// Initialized after graph capture in `compile_or_warm_up_model`.
     host_staging: Option<HostStaging>,
@@ -1017,6 +1022,7 @@ impl CudaWorker {
             prefill_graph_runner: None,
             last_graph_batch_size: None,
             graph_metadata_valid: false,
+            uses_ggml: false,
             host_staging: None,
             token_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
@@ -1118,9 +1124,152 @@ impl CudaWorker {
         }
     }
 
-    /// Resolve model path: local dir or HF download.
+    /// Load a GGUF model — separate path from safetensors loading.
+    fn load_model_gguf(
+        &mut self,
+        gguf_path: PathBuf,
+        t0: std::time::Instant,
+    ) -> ExecutorResult<()> {
+        // Tokenizer: look in parent directory of the GGUF file.
+        let tok_dir = gguf_path.parent().unwrap_or(&gguf_path).to_path_buf();
+        let tokenizer_handle = std::thread::spawn(move || {
+            let path = tok_dir.join("tokenizer.json");
+            if path.exists() {
+                tokenizers::Tokenizer::from_file(&path).ok()
+            } else {
+                None
+            }
+        });
+
+        // Parse config from GGUF metadata.
+        let gguf_file = vllm_model::gguf::GgufFile::open(&gguf_path)
+            .map_err(|e| ExecutorError::WorkerInit(format!("GGUF open failed: {e}")))?;
+        let hf_config = vllm_model::gguf::gguf_model_config(&gguf_file)
+            .map_err(|e| ExecutorError::WorkerInit(format!("GGUF config parse failed: {e}")))?;
+
+        // Resolve dtype.
+        let dtype = match self.config.dtype.as_str() {
+            "f16" | "float16" => GpuDType::F16,
+            "bf16" | "bfloat16" => GpuDType::BF16,
+            "f32" | "float32" => GpuDType::F32,
+            _ => match hf_config.torch_dtype.as_deref() {
+                Some("bfloat16") => GpuDType::BF16,
+                Some("float16") => GpuDType::F16,
+                _ => GpuDType::BF16,
+            },
+        };
+        info!("CudaWorker: GGUF model, dtype {:?}", dtype);
+
+        let arch = hf_config.architectures.first().cloned().unwrap_or_default();
+        info!("CudaWorker: GGUF architecture = {arch}");
+
+        // Load GGUF weights (quantized bytes stay on GPU, norms/embeddings dequantized).
+        let device = self
+            .device
+            .as_mut()
+            .ok_or_else(|| ExecutorError::WorkerInit("device not initialized".into()))?;
+        let mut gguf_weights = unsafe {
+            vllm_cuda::ggml::GgufGpuWeights::load(
+                &gguf_path,
+                dtype,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        }
+        .map_err(|e| ExecutorError::WorkerInit(format!("GGUF weight load: {e}")))?;
+        info!("CudaWorker: loaded {} GGUF tensors", gguf_weights.len());
+
+        // Construct model.
+        let model = match arch.as_str() {
+            "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen3ForCausalLM" | "Phi3ForCausalLM" => {
+                let config = llama_config_from_hf(&hf_config)?;
+                let m = vllm_cuda::model::llama::LlamaForCausalLM::load_gguf(
+                    &mut gguf_weights,
+                    &config,
+                    dtype,
+                    device,
+                )
+                .map_err(|e| {
+                    ExecutorError::WorkerInit(format!("LlamaForCausalLM GGUF load: {e}"))
+                })?;
+                CudaModel::Llama(m)
+            }
+            "Qwen2ForCausalLM" | "Qwen2_5ForCausalLM" => {
+                // Qwen2 shares the LLaMA architecture for GGUF.
+                let config = llama_config_from_hf(&hf_config)?;
+                let m = vllm_cuda::model::llama::LlamaForCausalLM::load_gguf(
+                    &mut gguf_weights,
+                    &config,
+                    dtype,
+                    device,
+                )
+                .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2 GGUF load: {e}")))?;
+                CudaModel::Llama(m)
+            }
+            _ => {
+                return Err(ExecutorError::WorkerInit(format!(
+                    "unsupported architecture for GGUF: {arch}. Supported: LlamaForCausalLM, \
+                     MistralForCausalLM, Qwen2ForCausalLM, Qwen3ForCausalLM, Phi3ForCausalLM"
+                )));
+            }
+        };
+
+        // Sync all H2D copies.
+        unsafe { driver::stream_synchronize(device.compute_stream) }
+            .map_err(|e| ExecutorError::WorkerInit(format!("weight sync: {e}")))?;
+
+        let model_dir = gguf_path.parent().unwrap_or(&gguf_path).to_path_buf();
+        self.model_dtype = dtype;
+        self.resolved_architecture = Some(arch);
+        self.model = Some(model);
+        self.uses_ggml = true;
+        self.model_dir = Some(model_dir.clone());
+        self.hf_config = Some(hf_config);
+
+        // Pooling strategy.
+        self.pooling_strategy = match self.config.pooling_strategy.as_str() {
+            "last" => vllm_models::embedding::PoolingStrategy::Last,
+            "cls" => vllm_models::embedding::PoolingStrategy::Cls,
+            "mean" => vllm_models::embedding::PoolingStrategy::Mean,
+            _ => vllm_models::embedding::detect_pooling_strategy(&model_dir)
+                .unwrap_or(vllm_models::embedding::PoolingStrategy::Last),
+        };
+
+        // Tokenizer.
+        if let Ok(Some(tok)) = tokenizer_handle.join() {
+            self.preloaded_tokenizer = Some(tok);
+        }
+
+        // Logits pipeline.
+        let vocab_size = self.model.as_ref().unwrap().vocab_size();
+        let processors: Vec<Box<dyn vllm_cuda::logits_processor::LogitsProcessor>> = vec![
+            Box::new(MinTokensProcessor::new()),
+            Box::new(LogitBiasProcessor::new()),
+            Box::new(PenaltiesProcessor::new(vocab_size)),
+        ];
+        self.logits_pipeline = Some(LogitsProcessorPipeline::new(processors));
+
+        info!(
+            "CudaWorker: GGUF model loaded in {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+
+    /// Resolve model path: local dir, local GGUF file, or HF download.
+    ///
+    /// Returns a `PathBuf` that is either:
+    /// - A directory containing safetensors + config.json (normal path)
+    /// - A `.gguf` file path (GGUF path — load_model detects this)
     fn resolve_model_path(&self) -> ExecutorResult<PathBuf> {
         let path = Path::new(&self.config.model_path);
+
+        // Local .gguf file.
+        if path.is_file() && path.extension().is_some_and(|e| e == "gguf") {
+            return Ok(path.to_path_buf());
+        }
+
+        // Local directory.
         if path.is_dir() {
             return Ok(path.to_path_buf());
         }
@@ -1137,6 +1286,42 @@ impl CudaWorker {
             .build()
             .map_err(|e| ExecutorError::WorkerInit(format!("failed to build HF API: {e}")))?;
         let repo = api.model(self.config.model_path.clone());
+
+        // GGUF download: explicit filename or auto-detect from repo.
+        let gguf_filename = self.config.gguf_file.clone().or_else(|| {
+            // Auto-detect: if model name looks like a GGUF repo, find smallest Q4_K_M file.
+            if !self.config.model_path.to_ascii_uppercase().contains("GGUF") {
+                return None;
+            }
+            let info = repo.info().ok()?;
+            let mut gguf_files: Vec<_> = info
+                .siblings
+                .iter()
+                .filter(|s| s.rfilename.ends_with(".gguf"))
+                .collect();
+            if gguf_files.is_empty() {
+                return None;
+            }
+            // Prefer Q4_K_M, then Q4_K_S, then any Q4, then smallest file.
+            for pattern in &["Q4_K_M", "Q4_K_S", "Q4_K", "Q4_0", "Q8_0"] {
+                if let Some(f) = gguf_files.iter().find(|s| s.rfilename.contains(pattern)) {
+                    return Some(f.rfilename.clone());
+                }
+            }
+            // Fallback: first GGUF file alphabetically.
+            gguf_files.sort_by(|a, b| a.rfilename.cmp(&b.rfilename));
+            Some(gguf_files[0].rfilename.clone())
+        });
+        if let Some(ref gguf_file) = gguf_filename {
+            info!("Downloading GGUF file: {gguf_file}");
+            let gguf_path = repo.get(gguf_file).map_err(|e| {
+                ExecutorError::WorkerInit(format!("failed to download GGUF {gguf_file}: {e}"))
+            })?;
+            // Best-effort tokenizer download.
+            let _ = repo.get("tokenizer.json");
+            let _ = repo.get("tokenizer_config.json");
+            return Ok(gguf_path);
+        }
 
         let config_path = repo.get("config.json").map_err(|e| {
             ExecutorError::WorkerInit(format!("failed to download config.json: {e}"))
@@ -2042,18 +2227,30 @@ impl Worker for CudaWorker {
 
     fn load_model(&mut self) -> ExecutorResult<()> {
         let t0 = std::time::Instant::now();
+
+        // Ensure CUDA context is current on this thread.
+        {
+            let device = self
+                .device
+                .as_ref()
+                .ok_or_else(|| ExecutorError::WorkerInit("device not initialized".into()))?;
+            unsafe { driver::ctx_set_current(device.ctx) }
+                .map_err(|e| ExecutorError::WorkerInit(format!("ctx_set_current: {e}")))?;
+        }
+
+        // 1. Resolve model directory (or GGUF file path).
+        let model_dir = self.resolve_model_path()?;
+        info!("CudaWorker: loading model from {}", model_dir.display());
+
+        // GGUF path — completely different loading flow.
+        if model_dir.extension().is_some_and(|e| e == "gguf") {
+            return self.load_model_gguf(model_dir, t0);
+        }
+
         let device = self
             .device
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerInit("device not initialized".into()))?;
-
-        // Ensure CUDA context is current on this thread (may differ from init_device thread).
-        unsafe { driver::ctx_set_current(device.ctx) }
-            .map_err(|e| ExecutorError::WorkerInit(format!("ctx_set_current: {e}")))?;
-
-        // 1. Resolve model directory.
-        let model_dir = self.resolve_model_path()?;
-        info!("CudaWorker: loading model from {}", model_dir.display());
 
         // Tokenizer on background thread.
         let tok_dir = model_dir.clone();
@@ -2393,6 +2590,32 @@ impl Worker for CudaWorker {
                 .map_err(|e| ExecutorError::WorkerInit(format!("ctx_set_current: {e}")))?;
         }
 
+        // Skip profiling forward for GGML models — the GGML kernels with flash
+        // attention cause CUDA errors during the dummy forward pass (the profiling
+        // forward triggers an illegal memory access in flash attention). Use a
+        // conservative fixed estimate instead.
+        if self.uses_ggml {
+            info!("CudaWorker: GGML model — skipping activation profiling, using fixed estimate");
+            let (free, total) = cudarc::driver::result::mem_get_info()
+                .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
+            let weights_and_overhead = total.saturating_sub(free);
+            let peak_activation_estimate = 512 * 1024 * 1024; // 512 MB conservative
+            let utilization = self.config.gpu_memory_utilization;
+            let available = compute_available_kv_bytes(
+                total,
+                weights_and_overhead,
+                peak_activation_estimate,
+                utilization,
+            );
+            info!(
+                "Memory estimate: total={:.1} GiB, weights+overhead={:.1} GiB, \
+                 est_activations=512 MiB",
+                total as f64 / 1_073_741_824.0,
+                weights_and_overhead as f64 / 1_073_741_824.0,
+            );
+            return Ok(available);
+        }
+
         // Like Python vLLM: profile peak activation memory with a dummy forward
         // pass, then subtract it from available memory for KV cache sizing.
         let (free_before, _total) = cudarc::driver::result::mem_get_info()
@@ -2422,13 +2645,15 @@ impl Worker for CudaWorker {
         let dummy_pos = device
             .caching
             .alloc_gpu_tensor(&[prefill_tokens], GpuDType::U32);
+        // Slot mapping: slot[i] = i (sequential)
+        let slot_data: Vec<i64> = (0..prefill_tokens as i64).collect();
         let dummy_slots = device
             .caching
             .alloc_gpu_tensor(&[prefill_tokens], GpuDType::I64);
         unsafe {
-            driver::memset_d8(
+            driver::memcpy_htod_async(
                 dummy_slots.raw_ptr(),
-                0,
+                slot_data.as_ptr() as *const u8,
                 prefill_tokens * 8,
                 device.compute_stream,
             )
@@ -2445,17 +2670,38 @@ impl Worker for CudaWorker {
             )
             .ok();
         }
+        let seqused_data: Vec<u32> = vec![prefill_tokens as u32];
         let dummy_seqused = device.caching.alloc_gpu_tensor(&[1], GpuDType::U32);
-        let dummy_bt = device.caching.alloc_gpu_tensor(&[1, 1], GpuDType::U32);
         unsafe {
-            driver::memset_d8(dummy_bt.raw_ptr(), 0, 4, device.compute_stream).ok();
+            driver::memcpy_htod_async(
+                dummy_seqused.raw_ptr(),
+                seqused_data.as_ptr() as *const u8,
+                4,
+                device.compute_stream,
+            )
+            .ok();
+        }
+        // Block table: [1, num_blocks_needed] — sequential block indices
+        let num_blocks_needed = prefill_tokens.div_ceil(self.config.block_size);
+        let bt_data: Vec<u32> = (0..num_blocks_needed as u32).collect();
+        let dummy_bt = device
+            .caching
+            .alloc_gpu_tensor(&[1, num_blocks_needed], GpuDType::U32);
+        unsafe {
+            driver::memcpy_htod_async(
+                dummy_bt.raw_ptr(),
+                bt_data.as_ptr() as *const u8,
+                num_blocks_needed * 4,
+                device.compute_stream,
+            )
+            .ok();
         }
 
-        // We don't have KV cache yet, so create a tiny one for profiling.
+        // Create a KV cache large enough for the profiling tokens.
         let dummy_kv = unsafe {
             vllm_cuda::KvCachePool::new(
                 model.num_layers(),
-                1, // 1 block
+                num_blocks_needed,
                 self.config.block_size,
                 model.num_kv_heads(),
                 model.head_dim(),
@@ -2479,7 +2725,9 @@ impl Worker for CudaWorker {
                 device,
                 None,
             );
-            let _ = driver::stream_synchronize(device.compute_stream);
+            if let Err(e) = driver::stream_synchronize(device.compute_stream) {
+                tracing::error!("Memory profiling forward failed: {e}");
+            }
         }
 
         // Measure memory after profile run — the difference is peak activations.
@@ -2549,6 +2797,13 @@ impl Worker for CudaWorker {
     fn compile_or_warm_up_model(&mut self) -> ExecutorResult<()> {
         if self.config.enforce_eager {
             info!("CudaWorker: --enforce-eager set, skipping CUDA graph capture");
+            return Ok(());
+        }
+
+        if self.uses_ggml {
+            info!(
+                "CudaWorker: GGML model — skipping CUDA graph capture (incompatible with graph capture)"
+            );
             return Ok(());
         }
 

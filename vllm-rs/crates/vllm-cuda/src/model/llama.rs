@@ -1830,4 +1830,163 @@ impl LlamaForCausalLM {
             tp_group: None,
         })
     }
+
+    /// Load from GGUF file (GGML quantized weights).
+    ///
+    /// Linear layers stay quantized on GPU (GgmlLinear), norms are dequantized to f32,
+    /// embeddings are dequantized to f32 (for the embedding gather kernel).
+    pub fn load_gguf(
+        gguf_weights: &mut crate::ggml::GgufGpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        use crate::ggml::GgufWeight;
+        use crate::layers::{GgmlLinear, LinearLayer};
+
+        // Helper: create a LinearLayer from a GGUF weight (quantized or dense).
+        let make_linear = |w: GgufWeight| -> LinearLayer {
+            match w {
+                GgufWeight::Quantized(s) => LinearLayer::Ggml(Box::new(GgmlLinear {
+                    storage: s,
+                    bias: None,
+                })),
+                GgufWeight::Dense(t) => LinearLayer::Dense(Linear::new(t, None)),
+            }
+        };
+
+        // Embedding: dequantized at load time.
+        let embed_w = gguf_weights.take_dense("model.embed_tokens.weight")?;
+        let embed_tokens = Embedding::new(embed_w);
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+
+            // Attention: separate Q, K, V, O projections (no fused QKV for GGUF).
+            let q_w = gguf_weights
+                .take(&format!("{prefix}.self_attn.q_proj.weight"))
+                .ok_or_else(|| anyhow::anyhow!("missing {prefix}.self_attn.q_proj.weight"))?;
+            let k_w = gguf_weights
+                .take(&format!("{prefix}.self_attn.k_proj.weight"))
+                .ok_or_else(|| anyhow::anyhow!("missing {prefix}.self_attn.k_proj.weight"))?;
+            let v_w = gguf_weights
+                .take(&format!("{prefix}.self_attn.v_proj.weight"))
+                .ok_or_else(|| anyhow::anyhow!("missing {prefix}.self_attn.v_proj.weight"))?;
+            let o_w = gguf_weights
+                .take(&format!("{prefix}.self_attn.o_proj.weight"))
+                .ok_or_else(|| anyhow::anyhow!("missing {prefix}.self_attn.o_proj.weight"))?;
+
+            let num_q_heads = config.num_attention_heads;
+            let num_kv_heads = config.num_kv_heads;
+            let head_dim = config.head_dim;
+            let q_size = num_q_heads * head_dim;
+            let kv_size = num_kv_heads * head_dim;
+
+            // For GGUF, we use separate Q/K/V projections (not fused QKV).
+            // The Q proj goes in qkv_proj, K and V in k_proj/v_proj.
+            // QK norms (Qwen3, etc.) — optional.
+            let q_norm_name = format!("{prefix}.self_attn.q_norm.weight");
+            let k_norm_name = format!("{prefix}.self_attn.k_norm.weight");
+            let q_norm_weight = gguf_weights.take(&q_norm_name).map(|w| match w {
+                GgufWeight::Dense(t) => t,
+                GgufWeight::Quantized(_) => panic!("q_norm should be dense, not quantized"),
+            });
+            let k_norm_weight = gguf_weights.take(&k_norm_name).map(|w| match w {
+                GgufWeight::Dense(t) => t,
+                GgufWeight::Quantized(_) => panic!("k_norm should be dense, not quantized"),
+            });
+            let qk_norm_eps = if q_norm_weight.is_some() {
+                config.rms_norm_eps
+            } else {
+                0.0
+            };
+
+            let self_attn = LlamaAttention {
+                qkv_proj: make_linear(q_w),
+                k_proj: Some(make_linear(k_w)),
+                v_proj: Some(make_linear(v_w)),
+                o_proj: make_linear(o_w),
+                q_size,
+                kv_size,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                scale: 1.0 / (head_dim as f32).sqrt(),
+                layer_idx: i,
+                q_norm_weight,
+                k_norm_weight,
+                qk_norm_eps,
+            };
+
+            // MLP: separate gate, up, down.
+            let gate_w = gguf_weights
+                .take(&format!("{prefix}.mlp.gate_proj.weight"))
+                .ok_or_else(|| anyhow::anyhow!("missing {prefix}.mlp.gate_proj.weight"))?;
+            let up_w = gguf_weights
+                .take(&format!("{prefix}.mlp.up_proj.weight"))
+                .ok_or_else(|| anyhow::anyhow!("missing {prefix}.mlp.up_proj.weight"))?;
+            let down_w = gguf_weights
+                .take(&format!("{prefix}.mlp.down_proj.weight"))
+                .ok_or_else(|| anyhow::anyhow!("missing {prefix}.mlp.down_proj.weight"))?;
+
+            let mlp = LlamaMLP {
+                gate_up_proj: make_linear(gate_w),
+                up_proj: Some(make_linear(up_w)),
+                down_proj: make_linear(down_w),
+                intermediate_size: config.intermediate_size,
+            };
+
+            // Norms: dequantized to f32.
+            let input_ln_w =
+                gguf_weights.take_dense(&format!("{prefix}.input_layernorm.weight"))?;
+            let post_ln_w =
+                gguf_weights.take_dense(&format!("{prefix}.post_attention_layernorm.weight"))?;
+
+            layers.push(LlamaDecoderLayer {
+                self_attn,
+                mlp,
+                input_layernorm: RmsNorm::new(input_ln_w, config.rms_norm_eps),
+                post_attention_layernorm: RmsNorm::new(post_ln_w, config.rms_norm_eps),
+                residual_multiplier: 1.0,
+            });
+        }
+
+        let norm_w = gguf_weights.take_dense("model.norm.weight")?;
+        let norm = RmsNorm::new(norm_w, config.rms_norm_eps);
+
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                config.llama3_rope_scaling.as_ref(),
+                dtype,
+                device,
+            )?
+        };
+
+        let model = LlamaModel {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embedding_multiplier: 1.0,
+        };
+
+        // lm_head: check if GGUF has output.weight (→ lm_head.weight), else tie embeddings.
+        let lm_head = if gguf_weights.contains("lm_head.weight") {
+            let lm_w = gguf_weights.take_dense("lm_head.weight")?;
+            LinearLayer::Dense(Linear::new(lm_w, None))
+        } else {
+            // Tied embeddings.
+            LinearLayer::Dense(Linear::new(model.embed_tokens.weight, None))
+        };
+
+        Ok(Self {
+            model,
+            lm_head,
+            logits_scaling: 1.0,
+        })
+    }
 }

@@ -66,7 +66,18 @@ fn cuda_build() {
     println!("cargo:rustc-link-search={}", cache_str);
     println!("cargo:rustc-link-lib=static=vllm_kernels");
 
-    // 2. Marlin W4A16 fused GEMM kernels.
+    // 2. GGML quantized kernels (llama.cpp-derived, for GGUF inference).
+    cudaforge::KernelBuilder::new()
+        .out_dir(&cache_dir)
+        .source_files(vec!["csrc/quantized.cu".to_string()])
+        .arg("-O3")
+        .arg("--use_fast_math")
+        .build_lib(format!("{}/libggml_kernels.a", cache_str))
+        .expect("Failed to build ggml_kernels");
+
+    println!("cargo:rustc-link-lib=static=ggml_kernels");
+
+    // 3. Marlin W4A16 fused GEMM kernels.
     let marlin_sources = [
         "csrc/marlin/marlin_gemm.cu",
         "csrc/marlin/gptq_marlin_repack.cu",
@@ -105,7 +116,7 @@ fn cuda_build() {
 
     println!("cargo:rustc-link-lib=static=marlin_kernels");
 
-    // 3. FlashAttention-2 paged kernels (vllm-project fork).
+    // 4. FlashAttention-2 paged kernels (vllm-project fork).
     build_flash_attention(&cache_str, &mut rerun_files);
 
     // Emit rerun-if-changed for all tracked files so cargo skips the build

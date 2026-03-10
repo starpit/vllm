@@ -43,6 +43,8 @@ pub mod device;
 #[cfg(feature = "cuda")]
 pub mod driver;
 #[cfg(feature = "cuda")]
+pub mod ggml;
+#[cfg(feature = "cuda")]
 pub mod graph;
 #[cfg(feature = "cuda")]
 pub mod kernels;
@@ -74,8 +76,8 @@ pub use device::GpuDevice;
 pub use kv_cache::KvCachePool;
 #[cfg(feature = "cuda")]
 pub use layers::{
-    ColumnParallelLinear, Embedding, Linear, LinearLayer, MarlinLinear, RmsNorm, RowParallelLinear,
-    VocabParallelEmbedding,
+    ColumnParallelLinear, Embedding, GgmlLinear, Linear, LinearLayer, MarlinLinear, RmsNorm,
+    RowParallelLinear, VocabParallelEmbedding,
 };
 #[cfg(feature = "nccl")]
 pub use nccl::{NcclGroup, NcclId};

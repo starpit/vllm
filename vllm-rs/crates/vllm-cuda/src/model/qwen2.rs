@@ -80,6 +80,18 @@ impl Qwen2ForCausalLM {
         Ok(Self(model))
     }
 
+    /// Load the model (BNB 4-bit).
+    pub fn load_bnb4bit(
+        weights: &mut GpuWeights,
+        config: &Qwen2Config,
+        dtype: DType,
+        qconfig: &crate::quant::Bnb4bitConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = LlamaForCausalLM::load_bnb4bit(weights, &config.0, dtype, qconfig, device)?;
+        Ok(Self(model))
+    }
+
     /// Forward pass: input_ids → logits.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(

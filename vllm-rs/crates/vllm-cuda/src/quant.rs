@@ -23,7 +23,50 @@ pub enum QuantConfig {
     Awq(AwqConfig),
     /// GPTQ quantization → Marlin format.
     Gptq(GptqConfig),
+    /// BitsAndBytes 4-bit (NF4/FP4) quantization.
+    Bnb4bit(Bnb4bitConfig),
 }
+
+/// BitsAndBytes 4-bit quantization config.
+#[derive(Debug, Clone)]
+pub struct Bnb4bitConfig {
+    pub blocksize: usize,
+    pub quant_type: BnbQuantType,
+}
+
+/// BNB 4-bit quantization type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BnbQuantType {
+    NF4,
+    FP4,
+}
+
+/// NF4 lookup table — 16 quantiles of the standard normal distribution, rescaled to [-1, 1].
+/// From bitsandbytes source; these values are fixed forever.
+#[allow(clippy::excessive_precision)]
+pub const NF4_CODE: [f32; 16] = [
+    -1.0,
+    -0.6961928009986877,
+    -0.5250730514526367,
+    -0.39491748809814453,
+    -0.28444138169288635,
+    -0.18477343022823334,
+    -0.09105003625154495,
+    0.0,
+    0.07958029955625534,
+    0.16093020141124725,
+    0.24611230194568634,
+    0.33791524171829224,
+    0.44070982933044434,
+    0.5626170039176941,
+    0.7229568362236023,
+    1.0,
+];
+
+/// FP4 lookup table — E2M1 values used by bitsandbytes FP4 quantization.
+pub const FP4_CODE: [f32; 16] = [
+    0.0, 0.0625, 8.0, 12.0, 4.0, 6.0, 2.0, 3.0, -0.0, -0.0625, -8.0, -12.0, -4.0, -6.0, -2.0, -3.0,
+];
 
 #[derive(Debug, Clone)]
 pub struct AwqConfig {
@@ -47,7 +90,7 @@ impl QuantConfig {
 
     pub fn group_size(&self) -> usize {
         match self {
-            Self::None => 0,
+            Self::None | Self::Bnb4bit(_) => 0,
             Self::Awq(c) => c.group_size,
             Self::Gptq(c) => c.group_size,
         }
@@ -58,6 +101,7 @@ impl QuantConfig {
             Self::None => 0,
             Self::Awq(c) => c.bits,
             Self::Gptq(c) => c.bits,
+            Self::Bnb4bit(_) => 4,
         }
     }
 
@@ -66,7 +110,7 @@ impl QuantConfig {
         match self {
             Self::Awq(_) => 1,
             Self::Gptq(_) => 0,
-            Self::None => -1,
+            Self::None | Self::Bnb4bit(_) => -1,
         }
     }
 
@@ -75,7 +119,7 @@ impl QuantConfig {
         match self {
             Self::Awq(_) => true,
             Self::Gptq(c) => !c.sym,
-            Self::None => false,
+            Self::None | Self::Bnb4bit(_) => false,
         }
     }
 
@@ -85,6 +129,11 @@ impl QuantConfig {
             Self::Gptq(c) => c.desc_act,
             _ => false,
         }
+    }
+
+    /// Whether this is a BNB 4-bit quantized model.
+    pub fn is_bnb4bit(&self) -> bool {
+        matches!(self, Self::Bnb4bit(_))
     }
 }
 
@@ -130,6 +179,29 @@ pub fn detect_quant_config(model_dir: impl AsRef<Path>) -> Result<QuantConfig> {
         let data = std::fs::read_to_string(&config_path)?;
         let config: serde_json::Value = serde_json::from_str(&data)?;
         if let Some(qc) = config.get("quantization_config") {
+            // Check for BitsAndBytes first.
+            if let Some("bitsandbytes") = qc.get("quant_method").and_then(|v| v.as_str()) {
+                let load_4bit = qc
+                    .get("load_in_4bit")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if load_4bit {
+                    let blocksize = 64; // BNB default
+                    let qt = qc
+                        .get("bnb_4bit_quant_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("nf4");
+                    let quant_type = match qt {
+                        "fp4" => BnbQuantType::FP4,
+                        _ => BnbQuantType::NF4,
+                    };
+                    return Ok(QuantConfig::Bnb4bit(Bnb4bitConfig {
+                        blocksize,
+                        quant_type,
+                    }));
+                }
+                bail!("bitsandbytes 8-bit (load_in_8bit) not supported");
+            }
             let raw: RawQuantConfig = serde_json::from_value(qc.clone())?;
             return parse_raw_config(raw);
         }
@@ -1797,6 +1869,69 @@ mod tests {
             assert_eq!(workspace.dim(0), 1024 * 1024); // max(2*128, 1M)
             assert_eq!(workspace.dtype(), DType::I32);
             unsafe { driver::stream_destroy(stream).expect("destroy") };
+        }
+    }
+
+    #[test]
+    fn test_detect_bnb4bit_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "architectures": ["LlamaForCausalLM"],
+                "quantization_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": true,
+                    "bnb_4bit_quant_type": "nf4",
+                    "bnb_4bit_compute_dtype": "bfloat16"
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = detect_quant_config(dir.path()).unwrap();
+        assert!(matches!(config, QuantConfig::Bnb4bit(_)));
+        assert!(config.is_bnb4bit());
+        assert_eq!(config.bits(), 4);
+        if let QuantConfig::Bnb4bit(ref c) = config {
+            assert_eq!(c.blocksize, 64);
+            assert_eq!(c.quant_type, BnbQuantType::NF4);
+        }
+    }
+
+    #[test]
+    fn test_detect_bnb4bit_fp4() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{
+                "quantization_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": true,
+                    "bnb_4bit_quant_type": "fp4"
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = detect_quant_config(dir.path()).unwrap();
+        if let QuantConfig::Bnb4bit(ref c) = config {
+            assert_eq!(c.quant_type, BnbQuantType::FP4);
+        } else {
+            panic!("expected Bnb4bit config");
+        }
+    }
+
+    #[test]
+    fn test_nf4_code_table() {
+        assert_eq!(NF4_CODE.len(), 16);
+        assert_eq!(NF4_CODE[0], -1.0);
+        assert_eq!(NF4_CODE[7], 0.0);
+        assert_eq!(NF4_CODE[15], 1.0);
+        // Table should be monotonically increasing.
+        for i in 1..16 {
+            assert!(
+                NF4_CODE[i] > NF4_CODE[i - 1],
+                "NF4 table not monotonic at {i}"
+            );
         }
     }
 }

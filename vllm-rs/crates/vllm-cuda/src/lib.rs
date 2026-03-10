@@ -76,8 +76,8 @@ pub use device::GpuDevice;
 pub use kv_cache::KvCachePool;
 #[cfg(feature = "cuda")]
 pub use layers::{
-    ColumnParallelLinear, Embedding, GgmlLinear, Linear, LinearLayer, MarlinLinear, RmsNorm,
-    RowParallelLinear, VocabParallelEmbedding,
+    Bnb4bitLinear, ColumnParallelLinear, Embedding, GgmlLinear, Linear, LinearLayer, MarlinLinear,
+    RmsNorm, RowParallelLinear, VocabParallelEmbedding,
 };
 #[cfg(feature = "nccl")]
 pub use nccl::{NcclGroup, NcclId};

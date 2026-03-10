@@ -2314,7 +2314,19 @@ impl Worker for CudaWorker {
         let model = match arch.as_str() {
             "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen3ForCausalLM" | "Phi3ForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
-                let m = if qconfig.is_quantized() {
+                let m = if qconfig.is_bnb4bit() {
+                    let bnb_cfg = match &qconfig {
+                        vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                        _ => unreachable!(),
+                    };
+                    vllm_cuda::model::llama::LlamaForCausalLM::load_bnb4bit(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        bnb_cfg,
+                        device,
+                    )
+                } else if qconfig.is_quantized() {
                     vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
                         &mut weights,
                         &config,
@@ -2345,7 +2357,19 @@ impl Worker for CudaWorker {
                 let llama_config = llama_config_from_hf(&hf_config)?;
                 let qwen2_config =
                     vllm_cuda::model::qwen2::Qwen2Config::from_llama_config(llama_config);
-                let m = if qconfig.is_quantized() {
+                let m = if qconfig.is_bnb4bit() {
+                    let bnb_cfg = match &qconfig {
+                        vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                        _ => unreachable!(),
+                    };
+                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_bnb4bit(
+                        &mut weights,
+                        &qwen2_config,
+                        dtype,
+                        bnb_cfg,
+                        device,
+                    )
+                } else if qconfig.is_quantized() {
                     vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_quantized(
                         &mut weights,
                         &qwen2_config,
@@ -2374,7 +2398,19 @@ impl Worker for CudaWorker {
             }
             "Gemma2ForCausalLM" => {
                 let config = gemma2_config_from_hf(&hf_config)?;
-                let m = if qconfig.is_quantized() {
+                let m = if qconfig.is_bnb4bit() {
+                    let bnb_cfg = match &qconfig {
+                        vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                        _ => unreachable!(),
+                    };
+                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_bnb4bit(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        bnb_cfg,
+                        device,
+                    )
+                } else if qconfig.is_quantized() {
                     vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_quantized(
                         &mut weights,
                         &config,
@@ -2443,7 +2479,19 @@ impl Worker for CudaWorker {
             }
             "GraniteForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
-                let mut m = if qconfig.is_quantized() {
+                let mut m = if qconfig.is_bnb4bit() {
+                    let bnb_cfg = match &qconfig {
+                        vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                        _ => unreachable!(),
+                    };
+                    vllm_cuda::model::llama::LlamaForCausalLM::load_bnb4bit(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        bnb_cfg,
+                        device,
+                    )
+                } else if qconfig.is_quantized() {
                     vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
                         &mut weights,
                         &config,

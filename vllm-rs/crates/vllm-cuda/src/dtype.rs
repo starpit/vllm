@@ -11,12 +11,14 @@ pub enum DType {
     U32 = 3,
     I64 = 4,
     I32 = 5,
+    U8 = 6,
 }
 
 impl DType {
     /// Size in bytes of a single element.
     pub const fn size_bytes(self) -> usize {
         match self {
+            DType::U8 => 1,
             DType::F16 | DType::BF16 => 2,
             DType::F32 | DType::U32 | DType::I32 => 4,
             DType::I64 => 8,
@@ -33,6 +35,7 @@ impl std::fmt::Display for DType {
             DType::U32 => write!(f, "u32"),
             DType::I32 => write!(f, "i32"),
             DType::I64 => write!(f, "i64"),
+            DType::U8 => write!(f, "u8"),
         }
     }
 }
@@ -68,6 +71,11 @@ mod tests {
     }
 
     #[test]
+    fn test_size_bytes_u8() {
+        assert_eq!(DType::U8.size_bytes(), 1);
+    }
+
+    #[test]
     fn test_size_bytes_i64() {
         assert_eq!(DType::I64.size_bytes(), 8);
     }
@@ -80,6 +88,7 @@ mod tests {
         assert_eq!(format!("{}", DType::U32), "u32");
         assert_eq!(format!("{}", DType::I32), "i32");
         assert_eq!(format!("{}", DType::I64), "i64");
+        assert_eq!(format!("{}", DType::U8), "u8");
     }
 
     #[test]
@@ -113,7 +122,8 @@ mod tests {
         set.insert(DType::U32);
         set.insert(DType::I32);
         set.insert(DType::I64);
-        assert_eq!(set.len(), 6);
+        set.insert(DType::U8);
+        assert_eq!(set.len(), 7);
     }
 
     #[test]
@@ -133,6 +143,7 @@ mod tests {
         assert_eq!(DType::U32 as u8, 3);
         assert_eq!(DType::I64 as u8, 4);
         assert_eq!(DType::I32 as u8, 5);
+        assert_eq!(DType::U8 as u8, 6);
     }
 
     #[test]

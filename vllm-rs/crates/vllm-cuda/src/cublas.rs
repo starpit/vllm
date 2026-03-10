@@ -32,6 +32,8 @@ struct PlanKey {
     n: usize,
     dtype: DType,
     has_bias: bool,
+    /// If true, weight (A in cuBLAS) is transposed (default). If false, no transpose on weight.
+    weight_trans: bool,
 }
 
 /// A cached cublasLt GEMM plan — holds pre-created descriptors and the best algorithm.
@@ -109,13 +111,25 @@ impl CublasHandle {
     }
 
     /// Ensure a cached GEMM plan exists for the given shapes, creating it if needed.
-    unsafe fn ensure_plan(&mut self, m: usize, k: usize, n: usize, dtype: DType, has_bias: bool) {
+    ///
+    /// `weight_trans`: if true, weight is transposed (TRANSA=T, default for `[N,K]` weights).
+    /// If false, weight is NOT transposed (TRANSA=N, for BNB `[K,N]` dequanted weights).
+    unsafe fn ensure_plan(
+        &mut self,
+        m: usize,
+        k: usize,
+        n: usize,
+        dtype: DType,
+        has_bias: bool,
+        weight_trans: bool,
+    ) {
         let key = PlanKey {
             m,
             k,
             n,
             dtype,
             has_bias,
+            weight_trans,
         };
         if self.plans.contains_key(&key) {
             return;
@@ -134,8 +148,14 @@ impl CublasHandle {
         ))
         .expect("cublasLtMatmulDescCreate failed");
 
-        // Set transpose operations: C^T = B @ A^T in col-major → C = A @ B^T in row-major.
-        let transa = cublasOperation_t::CUBLAS_OP_T as i32;
+        // Set transpose operations.
+        // weight_trans=true:  C^T = B @ A^T in col-major → C = A @ B^T in row-major (B is [N,K])
+        // weight_trans=false: C^T = B @ A in col-major → C = A @ B in row-major (B is [K,N], e.g. BNB dequant)
+        let transa = if weight_trans {
+            cublasOperation_t::CUBLAS_OP_T as i32
+        } else {
+            cublasOperation_t::CUBLAS_OP_N as i32
+        };
         let transb = cublasOperation_t::CUBLAS_OP_N as i32;
         check_lt(lt::cublasLtMatmulDescSetAttribute(
             matmul_desc,
@@ -164,15 +184,18 @@ impl CublasHandle {
             .expect("set EPILOGUE failed");
         }
 
-        // Create matrix layouts (column-major convention: C^T = B @ A^T).
-        // A in cuBLAS = B (weight) [N, K] col-major → rows=K, cols=N, ld=K
+        // Create matrix layouts (column-major convention).
+        // A in cuBLAS = B (weight).
+        //   weight_trans=true:  [N, K] row-major → col-major rows=K, cols=N, ld=K
+        //   weight_trans=false: [K, N] row-major → col-major rows=N, cols=K, ld=N
         let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        let (a_rows, a_cols, a_ld) = if weight_trans { (k, n, k) } else { (n, k, n) };
         check_lt(lt::cublasLtMatrixLayoutCreate(
             &mut layout_a,
             lt_data_type,
-            k as u64,
-            n as u64,
-            k as i64,
+            a_rows as u64,
+            a_cols as u64,
+            a_ld as i64,
         ))
         .expect("layout A");
 
@@ -302,13 +325,14 @@ impl CublasHandle {
 
         let out = alloc.alloc_tensor(&[m, n], dtype);
 
-        self.ensure_plan(m, k, n, dtype, false);
+        self.ensure_plan(m, k, n, dtype, false, true);
         let key = PlanKey {
             m,
             k,
             n,
             dtype,
             has_bias: false,
+            weight_trans: true,
         };
         let plan = &self.plans[&key];
 
@@ -359,13 +383,14 @@ impl CublasHandle {
 
         let out = alloc.alloc_tensor(&[m, n], dtype);
 
-        self.ensure_plan(m, k, n, dtype, true);
+        self.ensure_plan(m, k, n, dtype, true, true);
         let key = PlanKey {
             m,
             k,
             n,
             dtype,
             has_bias: true,
+            weight_trans: true,
         };
         let plan = &self.plans[&key];
 
@@ -377,6 +402,71 @@ impl CublasHandle {
             std::mem::size_of::<*const std::ffi::c_void>(),
         ))
         .expect("set BIAS_POINTER failed");
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+
+        check_lt(lt::cublasLtMatmul(
+            self.lt_handle,
+            plan.matmul_desc,
+            &alpha as *const f32 as *const _,
+            b.as_ptr::<u8>() as *const _,
+            plan.layout_a,
+            a.as_ptr::<u8>() as *const _,
+            plan.layout_b,
+            &beta as *const f32 as *const _,
+            out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
+            plan.layout_c,
+            out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
+            plan.layout_c,
+            &plan.algo,
+            self.workspace as *mut _,
+            CUBLAS_WORKSPACE_SIZE,
+            self.stream as _,
+        ))
+        .expect("cublasLtMatmul failed");
+
+        out
+    }
+
+    /// GEMM without weight transpose: out = A @ B (no transpose on B).
+    ///
+    /// - `a`: `[M, K]` row-major (activations)
+    /// - `b`: `[K, N]` row-major (weight, e.g. BNB dequanted W^T)
+    /// - Returns: `[M, N]` allocated from `alloc`
+    ///
+    /// Used for BNB 4-bit: dequant produces W^T in `[K, N]` row-major layout,
+    /// so we compute `x @ W^T` directly without an extra transpose.
+    ///
+    /// # Safety
+    /// `a` and `b` must be valid GPU tensors with compatible dtypes and shapes.
+    pub unsafe fn gemm_owned_nt(
+        &mut self,
+        a: GpuTensor,
+        b: GpuTensor,
+        alloc: &mut CachingAllocator,
+    ) -> OwnedTensor {
+        debug_assert_eq!(a.ndim(), 2);
+        debug_assert_eq!(b.ndim(), 2);
+        debug_assert_eq!(a.dim(1), b.dim(0), "GEMM K mismatch (nt)");
+
+        let m = a.dim(0);
+        let k = a.dim(1); // = b.dim(0)
+        let n = b.dim(1);
+        let dtype = a.dtype();
+
+        let out = alloc.alloc_tensor(&[m, n], dtype);
+
+        self.ensure_plan(m, k, n, dtype, false, false);
+        let key = PlanKey {
+            m,
+            k,
+            n,
+            dtype,
+            has_bias: false,
+            weight_trans: false,
+        };
+        let plan = &self.plans[&key];
 
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
@@ -969,19 +1059,19 @@ mod tests {
             assert_eq!(handle.plans.len(), 0);
 
             // First call creates a plan.
-            handle.ensure_plan(8, 896, 896, DType::BF16, false);
+            handle.ensure_plan(8, 896, 896, DType::BF16, false, true);
             assert_eq!(handle.plans.len(), 1);
 
             // Second call with same shapes reuses it.
-            handle.ensure_plan(8, 896, 896, DType::BF16, false);
+            handle.ensure_plan(8, 896, 896, DType::BF16, false, true);
             assert_eq!(handle.plans.len(), 1);
 
             // Different shapes create a new plan.
-            handle.ensure_plan(8, 896, 4864, DType::BF16, false);
+            handle.ensure_plan(8, 896, 4864, DType::BF16, false, true);
             assert_eq!(handle.plans.len(), 2);
 
             // Same shapes but with bias create a separate plan.
-            handle.ensure_plan(8, 896, 896, DType::BF16, true);
+            handle.ensure_plan(8, 896, 896, DType::BF16, true, true);
             assert_eq!(handle.plans.len(), 3);
 
             driver::stream_destroy(stream).unwrap();

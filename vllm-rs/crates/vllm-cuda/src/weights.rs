@@ -30,6 +30,7 @@ fn safetensors_dtype(dtype: safetensors::Dtype) -> Result<DType> {
         safetensors::Dtype::I64 => Ok(DType::I64),
         safetensors::Dtype::U32 => Ok(DType::U32),
         safetensors::Dtype::I32 => Ok(DType::I32),
+        safetensors::Dtype::U8 => Ok(DType::U8),
         other => bail!("unsupported safetensors dtype: {:?}", other),
     }
 }
@@ -624,6 +625,7 @@ pub fn load_marlin_linear(
             load_gptq_marlin_linear(weights, prefix, cfg, workspace, device_id, alloc, stream)
         }
         QuantConfig::None => bail!("load_marlin_linear called with QuantConfig::None"),
+        QuantConfig::Bnb4bit(_) => bail!("load_marlin_linear called with Bnb4bit config"),
     }
 }
 
@@ -920,6 +922,7 @@ pub fn load_fused_marlin_linear(
             load_fused_gptq_marlin(weights, prefixes, cfg, workspace, device_id, alloc, stream)
         }
         QuantConfig::None => bail!("load_fused_marlin_linear called with QuantConfig::None"),
+        QuantConfig::Bnb4bit(_) => bail!("load_fused_marlin_linear called with Bnb4bit config"),
     }
 }
 
@@ -1221,6 +1224,324 @@ pub fn alloc_marlin_workspace(num_sm: i32, stream: CUstream) -> Result<GpuTensor
 }
 
 // ---------------------------------------------------------------------------
+// BitsAndBytes 4-bit weight loading
+// ---------------------------------------------------------------------------
+
+use crate::layers::Bnb4bitLinear;
+use crate::quant::Bnb4bitConfig;
+
+/// Parse the BNB quant_state JSON blob.
+///
+/// Returns `(nested_offset, blocksize, nested_blocksize)`.
+fn parse_bnb_quant_state_json(data: &[u8]) -> Result<(f32, usize, usize)> {
+    // Quant state blobs may have trailing null bytes after the JSON.
+    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    let s = std::str::from_utf8(&data[..end])?;
+    let v: serde_json::Value = serde_json::from_str(s)?;
+    let nested_offset = v
+        .get("nested_offset")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as f32;
+    let blocksize = v.get("blocksize").and_then(|v| v.as_u64()).unwrap_or(64) as usize;
+    let nested_blocksize = v
+        .get("nested_blocksize")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(256) as usize;
+    Ok((nested_offset, blocksize, nested_blocksize))
+}
+
+/// Upload the NF4/FP4 lookup table to GPU (shared across all layers).
+pub fn upload_bnb_code(code: &[f32; 16], stream: CUstream) -> Result<GpuTensor> {
+    let nbytes = 16 * std::mem::size_of::<f32>();
+    let ptr = unsafe { driver::mem_alloc(nbytes)? };
+    unsafe {
+        driver::memcpy_htod_async(ptr, code.as_ptr() as *const u8, nbytes, stream)?;
+    }
+    Ok(unsafe { GpuTensor::new(ptr, &[16], DType::F32) })
+}
+
+/// Allocate a shared dequantization scratch buffer for BNB 4-bit.
+///
+/// Size: max(out_features * in_features) across all linear layers × elem_size.
+/// The caller should track the max dimensions during model loading.
+pub fn alloc_bnb_dequant_scratch(
+    max_elements: usize,
+    dtype: DType,
+    stream: CUstream,
+) -> Result<GpuTensor> {
+    let nbytes = max_elements * dtype.size_bytes();
+    let ptr = unsafe { driver::mem_alloc(nbytes)? };
+    // Zero-initialize (not strictly needed, but helps debugging).
+    unsafe { driver::memset_d8(ptr, 0, nbytes, stream)? };
+    Ok(unsafe { GpuTensor::new(ptr, &[max_elements], dtype) })
+}
+
+/// Dequantize double-quantized absmax on CPU.
+///
+/// BNB pre-quantized models store absmax as U8 (double-quantized).
+/// This matches Python `_dequantize_dq`:
+/// ```text
+/// absmax_f32[i] = nested_quant_map[absmax_u8[i]] * nested_absmax[i / 256]
+/// ```
+pub fn dequantize_double_quant_absmax(
+    absmax_u8: &[u8],
+    nested_quant_map: &[f32], // [256]
+    nested_absmax: &[f32],    // [num_blocks / nested_blocksize]
+    nested_blocksize: usize,  // typically 256
+    nested_offset: f32,       // from quant_state JSON
+) -> Vec<f32> {
+    absmax_u8
+        .iter()
+        .enumerate()
+        .map(|(i, &val)| {
+            let scale = nested_absmax[i / nested_blocksize];
+            nested_quant_map[val as usize] * scale + nested_offset
+        })
+        .collect()
+}
+
+/// Load a single BNB 4-bit linear layer from safetensors.
+///
+/// Expects:
+/// - `{prefix}.weight` — U8 packed nibbles
+/// - `{prefix}.weight.absmax` — U8 double-quantized absmax
+/// - `{prefix}.weight.nested_absmax` — F32 absmax of absmax
+/// - `{prefix}.weight.nested_quant_map` — F32 [256] nested dequant table
+/// - `{prefix}.weight.quant_map` — F32 [16] NF4/FP4 code (used to detect quant type)
+/// - `{prefix}.weight.quant_state.bitsandbytes__nf4` — U8 metadata blob
+///
+/// `code_gpu` is the shared NF4/FP4 lookup table already on GPU.
+/// `dequant_scratch` is the shared dequant scratch buffer.
+/// `out_features`/`in_features` are the original weight dimensions.
+#[allow(clippy::too_many_arguments)]
+pub fn load_bnb4bit_linear(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    _qconfig: &Bnb4bitConfig,
+    code_gpu: GpuTensor,
+    dequant_scratch: GpuTensor,
+    out_features: usize,
+    in_features: usize,
+    blocksize: usize,
+    stream: CUstream,
+) -> Result<Bnb4bitLinear> {
+    let weight_name = format!("{prefix}.weight");
+    let absmax_name = format!("{prefix}.weight.absmax");
+    let nested_absmax_name = format!("{prefix}.weight.nested_absmax");
+    let nested_quant_map_name = format!("{prefix}.weight.nested_quant_map");
+
+    // Parse quant_state JSON to get nested_offset and actual blocksize.
+    let quant_state_name = format!("{prefix}.weight.quant_state.bitsandbytes__nf4");
+    let (nested_offset, actual_blocksize, nested_blocksize) = if weights.contains(&quant_state_name)
+    {
+        let (qs_bytes, _, _) = weights.take_cpu(&quant_state_name)?;
+        parse_bnb_quant_state_json(&qs_bytes)?
+    } else {
+        (0.0, blocksize, 256)
+    };
+    let blocksize = actual_blocksize;
+
+    // Load packed weight to GPU (U8).
+    let packed_weight = weights.take(&weight_name)?;
+
+    // Load and dequantize double-quantized absmax on CPU.
+    let (absmax_bytes, _absmax_shape, absmax_dtype) = weights.take_cpu(&absmax_name)?;
+
+    let absmax_f32 = if absmax_dtype == DType::U8 {
+        // Double quantized — need nested_absmax and nested_quant_map.
+        let (nqm_bytes, _nqm_shape, _) = weights.take_cpu(&nested_quant_map_name)?;
+        let nested_quant_map: Vec<f32> = nqm_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let (na_bytes, _na_shape, _) = weights.take_cpu(&nested_absmax_name)?;
+        let nested_absmax: Vec<f32> = na_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        dequantize_double_quant_absmax(
+            &absmax_bytes,
+            &nested_quant_map,
+            &nested_absmax,
+            nested_blocksize,
+            nested_offset,
+        )
+    } else {
+        // Already F32 (non-double-quantized).
+        absmax_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+
+    // Upload absmax F32 to GPU.
+    let absmax_nbytes = absmax_f32.len() * 4;
+    let absmax_ptr = unsafe { driver::mem_alloc(absmax_nbytes)? };
+    unsafe {
+        driver::memcpy_htod_async(
+            absmax_ptr,
+            absmax_f32.as_ptr() as *const u8,
+            absmax_nbytes,
+            stream,
+        )?;
+    }
+    let absmax_gpu = unsafe { GpuTensor::new(absmax_ptr, &[absmax_f32.len()], DType::F32) };
+
+    // Load bias if present.
+    let bias_name = format!("{prefix}.bias");
+    let bias = if weights.contains(&bias_name) {
+        Some(weights.take(&bias_name)?)
+    } else {
+        None
+    };
+
+    // Consume remaining BNB metadata tensors so they don't cause "unused weight" warnings.
+    let quant_map_name = format!("{prefix}.weight.quant_map");
+    for name in &[
+        &quant_map_name,
+        &quant_state_name,
+        &nested_absmax_name,
+        &nested_quant_map_name,
+    ] {
+        if weights.contains(name) {
+            let _ = weights.take_cpu(name);
+        }
+    }
+
+    Ok(Bnb4bitLinear {
+        packed_weight,
+        absmax: absmax_gpu,
+        code: code_gpu,
+        dequant_scratch,
+        out_features,
+        in_features,
+        blocksize,
+        bias,
+    })
+}
+
+/// Load fused BNB 4-bit linear (e.g., QKV or gate_up) from multiple prefixes.
+///
+/// Concatenates packed bytes + absmax from multiple shards on CPU, then uploads once.
+/// Absmax blocks are independent per shard, so concat is straightforward.
+#[allow(clippy::too_many_arguments)]
+pub fn load_fused_bnb4bit_linear(
+    weights: &mut GpuWeights,
+    prefixes: &[String],
+    _qconfig: &Bnb4bitConfig,
+    code_gpu: GpuTensor,
+    dequant_scratch: GpuTensor,
+    out_features_per_shard: &[usize],
+    in_features: usize,
+    blocksize: usize,
+    stream: CUstream,
+) -> Result<Bnb4bitLinear> {
+    let total_out_features: usize = out_features_per_shard.iter().sum();
+
+    // Concatenate packed bytes from all shards on CPU.
+    let mut all_packed: Vec<u8> = Vec::new();
+    let mut all_absmax_f32: Vec<f32> = Vec::new();
+
+    for (prefix, &out_feat) in prefixes.iter().zip(out_features_per_shard.iter()) {
+        let weight_name = format!("{prefix}.weight");
+        let absmax_name = format!("{prefix}.weight.absmax");
+        let nested_absmax_name = format!("{prefix}.weight.nested_absmax");
+        let nested_quant_map_name = format!("{prefix}.weight.nested_quant_map");
+        let quant_state_name = format!("{prefix}.weight.quant_state.bitsandbytes__nf4");
+
+        // Parse quant_state JSON for nested_offset.
+        let (nested_offset, _actual_blocksize, nested_blocksize) =
+            if weights.contains(&quant_state_name) {
+                let (qs_bytes, _, _) = weights.take_cpu(&quant_state_name)?;
+                parse_bnb_quant_state_json(&qs_bytes)?
+            } else {
+                (0.0, blocksize, 256)
+            };
+
+        // Load packed weight to CPU.
+        let (packed_bytes, _packed_shape, _) = weights.take_cpu(&weight_name)?;
+        all_packed.extend_from_slice(&packed_bytes);
+
+        // Load and dequantize absmax.
+        let (absmax_bytes, _absmax_shape, absmax_dtype) = weights.take_cpu(&absmax_name)?;
+        let shard_absmax = if absmax_dtype == DType::U8 {
+            let (nqm_bytes, _, _) = weights.take_cpu(&nested_quant_map_name)?;
+            let nested_quant_map: Vec<f32> = nqm_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let (na_bytes, _, _) = weights.take_cpu(&nested_absmax_name)?;
+            let nested_absmax: Vec<f32> = na_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            dequantize_double_quant_absmax(
+                &absmax_bytes,
+                &nested_quant_map,
+                &nested_absmax,
+                nested_blocksize,
+                nested_offset,
+            )
+        } else {
+            absmax_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        all_absmax_f32.extend_from_slice(&shard_absmax);
+
+        // Consume remaining BNB metadata.
+        let quant_map_name = format!("{prefix}.weight.quant_map");
+        for name in &[
+            &quant_map_name,
+            &quant_state_name,
+            &nested_absmax_name,
+            &nested_quant_map_name,
+        ] {
+            if weights.contains(name) {
+                let _ = weights.take_cpu(name);
+            }
+        }
+
+        let _ = out_feat; // used for shape validation in debug
+    }
+
+    // Upload packed weight to GPU.
+    let packed_nbytes = all_packed.len();
+    let packed_ptr = unsafe { driver::mem_alloc(packed_nbytes)? };
+    unsafe {
+        driver::memcpy_htod_async(packed_ptr, all_packed.as_ptr(), packed_nbytes, stream)?;
+    }
+    let packed_gpu = unsafe { GpuTensor::new(packed_ptr, &[packed_nbytes], DType::U8) };
+
+    // Upload absmax F32 to GPU.
+    let absmax_nbytes = all_absmax_f32.len() * 4;
+    let absmax_ptr = unsafe { driver::mem_alloc(absmax_nbytes)? };
+    unsafe {
+        driver::memcpy_htod_async(
+            absmax_ptr,
+            all_absmax_f32.as_ptr() as *const u8,
+            absmax_nbytes,
+            stream,
+        )?;
+    }
+    let absmax_gpu = unsafe { GpuTensor::new(absmax_ptr, &[all_absmax_f32.len()], DType::F32) };
+
+    Ok(Bnb4bitLinear {
+        packed_weight: packed_gpu,
+        absmax: absmax_gpu,
+        code: code_gpu,
+        dequant_scratch,
+        out_features: total_out_features,
+        in_features,
+        blocksize,
+        bias: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1255,7 +1576,14 @@ mod tests {
     #[test]
     fn test_unsupported_dtype() {
         assert!(safetensors_dtype(safetensors::Dtype::BOOL).is_err());
-        assert!(safetensors_dtype(safetensors::Dtype::U8).is_err());
+    }
+
+    #[test]
+    fn test_u8_dtype() {
+        assert_eq!(
+            safetensors_dtype(safetensors::Dtype::U8).unwrap(),
+            DType::U8
+        );
     }
 
     #[test]
@@ -1302,6 +1630,51 @@ mod tests {
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(vals, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_parse_bnb_quant_state_json() {
+        let json = br#"{"quant_type":"nf4","blocksize":64,"dtype":"bfloat16","shape":[2048,1024],"nested_blocksize":256,"nested_dtype":"float32","nested_offset":0.07990148663520813}"#;
+        let (offset, blocksize, nested_blocksize) = parse_bnb_quant_state_json(json).unwrap();
+        assert!((offset - 0.0799).abs() < 1e-4);
+        assert_eq!(blocksize, 64);
+        assert_eq!(nested_blocksize, 256);
+    }
+
+    #[test]
+    fn test_parse_bnb_quant_state_json_with_null_padding() {
+        // Quant state blobs often have null bytes after the JSON.
+        let mut json = br#"{"quant_type":"nf4","blocksize":64}"#.to_vec();
+        json.extend_from_slice(&[0, 0, 0]);
+        let (offset, blocksize, _) = parse_bnb_quant_state_json(&json).unwrap();
+        assert_eq!(offset, 0.0); // no nested_offset key → default 0.0
+        assert_eq!(blocksize, 64);
+    }
+
+    #[test]
+    fn test_dequantize_double_quant_absmax_with_offset() {
+        // Matches Python: nested_quant_map[val] * nested_absmax[i/bs] + offset
+        let absmax_u8 = [3u8, 7, 1, 5];
+        let nqm: Vec<f32> = (0..256).map(|i| i as f32 * 0.01).collect();
+        let na = [2.0f32, 3.0];
+        let result = dequantize_double_quant_absmax(&absmax_u8, &nqm, &na, 2, 0.5);
+        // [0]: 0.03*2.0+0.5=0.56, [1]: 0.07*2.0+0.5=0.64
+        // [2]: 0.01*3.0+0.5=0.53, [3]: 0.05*3.0+0.5=0.65
+        assert!((result[0] - 0.56).abs() < 1e-5);
+        assert!((result[1] - 0.64).abs() < 1e-5);
+        assert!((result[2] - 0.53).abs() < 1e-5);
+        assert!((result[3] - 0.65).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_dequantize_double_quant_absmax_zero_offset() {
+        let absmax_u8 = [100u8, 200];
+        let nqm: Vec<f32> = (0..256).map(|i| i as f32 * 0.001).collect();
+        let na = [1.0f32];
+        let result = dequantize_double_quant_absmax(&absmax_u8, &nqm, &na, 256, 0.0);
+        // [0]: 0.100*1.0+0.0=0.1, [1]: 0.200*1.0+0.0=0.2
+        assert!((result[0] - 0.1).abs() < 1e-5);
+        assert!((result[1] - 0.2).abs() < 1e-5);
     }
 
     // GPU tests for actual weight loading.

@@ -4437,3 +4437,67 @@ pub unsafe fn gptq_repack(
 
     out
 }
+
+// ---------------------------------------------------------------------------
+// BitsAndBytes NF4/FP4 dequantization
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn dequantize_nf4_bf16(
+        packed: *const u8,
+        absmax: *const f32,
+        code: *const f32,
+        out: *mut u8, // actually bf16
+        num_packed: i64,
+        blocksize: c_int,
+        stream: CUstream,
+    );
+    fn dequantize_nf4_f16(
+        packed: *const u8,
+        absmax: *const f32,
+        code: *const f32,
+        out: *mut u8, // actually f16
+        num_packed: i64,
+        blocksize: c_int,
+        stream: CUstream,
+    );
+}
+
+/// Dequantize NF4/FP4 packed weights to BF16 or F16.
+///
+/// * `packed` — `[num_packed]` U8 tensor (2 nibbles per byte)
+/// * `absmax` — `[num_blocks]` F32 per-block scale factors
+/// * `code` — `[16]` F32 lookup table (NF4 or FP4)
+/// * `out` — pre-allocated `[num_elements]` BF16 or F16 tensor
+/// * `blocksize` — elements per quantization block (typically 64)
+pub unsafe fn dequantize_bnb4bit(
+    packed: GpuTensor,
+    absmax: GpuTensor,
+    code: GpuTensor,
+    out: GpuTensor,
+    blocksize: usize,
+    stream: CUstream,
+) {
+    let num_packed = packed.numel() as i64;
+    match out.dtype() {
+        DType::BF16 => dequantize_nf4_bf16(
+            packed.raw_ptr(),
+            absmax.raw_ptr() as *const f32,
+            code.raw_ptr() as *const f32,
+            out.raw_ptr() as *mut u8,
+            num_packed,
+            blocksize as c_int,
+            stream,
+        ),
+        DType::F16 => dequantize_nf4_f16(
+            packed.raw_ptr(),
+            absmax.raw_ptr() as *const f32,
+            code.raw_ptr() as *const f32,
+            out.raw_ptr() as *mut u8,
+            num_packed,
+            blocksize as c_int,
+            stream,
+        ),
+        other => panic!("dequantize_bnb4bit: unsupported output dtype {other}"),
+    }
+}

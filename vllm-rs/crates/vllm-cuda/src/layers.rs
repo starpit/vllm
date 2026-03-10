@@ -7,8 +7,6 @@
 
 use anyhow::Result;
 
-use std::sync::Arc;
-
 use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::cublas::CublasHandle;
 use crate::tensor::GpuTensor;
@@ -208,6 +206,90 @@ impl MarlinLinear {
 }
 
 // ---------------------------------------------------------------------------
+// Bnb4bitLinear (BitsAndBytes NF4/FP4 4-bit quantized)
+// ---------------------------------------------------------------------------
+
+/// BitsAndBytes 4-bit quantized linear layer.
+///
+/// Forward: dequantize packed NF4/FP4 weights to BF16 scratch buffer, then cuBLAS GEMM.
+/// Matches Python `bitsandbytes.matmul_4bit` behavior.
+pub struct Bnb4bitLinear {
+    /// Packed NF4/FP4 nibbles `[num_packed_bytes]` U8 (2 values per byte).
+    pub packed_weight: GpuTensor,
+    /// Per-block scale factors `[num_blocks]` F32.
+    pub absmax: GpuTensor,
+    /// NF4 or FP4 lookup table `[16]` F32 on GPU.
+    pub code: GpuTensor,
+    /// Dequantization scratch buffer `[out_features, in_features]` BF16 on GPU.
+    /// Shared across layers — the caller allocates once and passes to all layers.
+    pub dequant_scratch: GpuTensor,
+    /// Original output features (rows).
+    pub out_features: usize,
+    /// Original input features (cols).
+    pub in_features: usize,
+    /// Block size for quantization (typically 64).
+    pub blocksize: usize,
+    /// Optional bias `[out_features]`.
+    pub bias: Option<GpuTensor>,
+}
+
+impl Bnb4bitLinear {
+    /// Forward: dequantize → cuBLAS GEMM.
+    ///
+    /// `x`: `[num_tokens, in_features]`
+    /// Returns: `[num_tokens, out_features]`
+    pub unsafe fn forward(
+        &self,
+        x: GpuTensor,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> GpuTensor {
+        self.forward_owned(x, cublas, alloc, stream)
+            .into_gpu_tensor()
+    }
+
+    pub unsafe fn forward_owned(
+        &self,
+        x: GpuTensor,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> OwnedTensor {
+        // BNB stores weights in [out_features, in_features] order (same as original W).
+        // Dequant produces the flat W data, reshape as [out, in], then cuBLAS does x @ W^T.
+        let weight_view = self
+            .dequant_scratch
+            .reshape(&[self.out_features, self.in_features]);
+
+        // Dequantize into scratch buffer (reused across layers).
+        crate::kernels::dequantize_bnb4bit(
+            self.packed_weight,
+            self.absmax,
+            self.code,
+            weight_view,
+            self.blocksize,
+            stream,
+        );
+
+        // cuBLAS GEMM: x @ weight_view^T
+        if let Some(bias) = self.bias {
+            cublas.gemm_bias_owned(x, weight_view, bias, alloc)
+        } else {
+            cublas.gemm_owned(x, weight_view, alloc)
+        }
+    }
+
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GgmlLinear (GGML quantized via llama.cpp kernels)
 // ---------------------------------------------------------------------------
 
@@ -287,6 +369,7 @@ pub enum LinearLayer {
     Dense(Linear),
     Marlin(Box<MarlinLinear>),
     Ggml(Box<GgmlLinear>),
+    Bnb4bit(Box<Bnb4bitLinear>),
 }
 
 impl LinearLayer {
@@ -313,6 +396,7 @@ impl LinearLayer {
             Self::Dense(l) => l.forward_owned(x, cublas, alloc),
             Self::Marlin(l) => l.forward_owned(x, alloc, stream),
             Self::Ggml(l) => l.forward_owned(x, alloc, stream),
+            Self::Bnb4bit(l) => l.forward_owned(x, cublas, alloc, stream),
         }
     }
 
@@ -321,6 +405,7 @@ impl LinearLayer {
             Self::Dense(l) => l.out_features(),
             Self::Marlin(l) => l.out_features(),
             Self::Ggml(l) => l.out_features(),
+            Self::Bnb4bit(l) => l.out_features(),
         }
     }
 
@@ -329,6 +414,7 @@ impl LinearLayer {
             Self::Dense(l) => l.in_features(),
             Self::Marlin(l) => l.in_features(),
             Self::Ggml(l) => l.in_features(),
+            Self::Bnb4bit(l) => l.in_features(),
         }
     }
 }
@@ -806,6 +892,499 @@ mod tests {
             assert_eq!(emb.hidden_size(), 32);
 
             unsafe { driver::stream_destroy(stream).unwrap() };
+        }
+
+        /// BNB 4-bit linear forward test: manually create NF4 packed data,
+        /// run dequant + GEMM, compare against CPU reference.
+        #[test]
+        fn test_bnb4bit_linear_forward() {
+            use crate::quant::NF4_CODE;
+
+            let stream = init_cuda();
+            unsafe {
+                let mut cublas = crate::cublas::CublasHandle::new(stream).unwrap();
+                let mut alloc = crate::alloc::CachingAllocator::new();
+
+                // Weight shape: [out=8, in=8] → 64 elements → 32 packed bytes.
+                // Use blocksize=64 so all elements are in one block.
+                let out_features = 8usize;
+                let in_features = 8usize;
+                let num_elements = out_features * in_features; // 64
+                let num_packed = num_elements / 2; // 32
+                let blocksize = 64usize;
+
+                // Create packed bytes: each byte encodes 2 nibbles.
+                // Use nibble values that give a recognizable pattern.
+                // We'll use: row 0 = all nibble 15 (code[15]=1.0), row 1 = all nibble 0 (code[0]=-1.0), etc.
+                // Each row is 8 elements = 4 packed bytes.
+                let nibble_values: Vec<u8> = vec![
+                    15, 15, 15, 15, 15, 15, 15, 15, // row 0: all 1.0
+                    0, 0, 0, 0, 0, 0, 0, 0, // row 1: all -1.0
+                    7, 7, 7, 7, 7, 7, 7, 7, // row 2: all 0.0
+                    8, 8, 8, 8, 8, 8, 8, 8, // row 3: all 0.0796
+                    15, 0, 15, 0, 15, 0, 15, 0, // row 4: alternating 1.0, -1.0
+                    10, 10, 10, 10, 10, 10, 10, 10, // row 5: all 0.2461
+                    5, 5, 5, 5, 5, 5, 5, 5, // row 6: all -0.1848
+                    12, 12, 12, 12, 12, 12, 12, 12, // row 7: all 0.4407
+                ];
+                // Pack: BNB convention — hi nibble = first element, lo nibble = second element.
+                // So packed[i] = second_nibble | (first_nibble << 4).
+                let mut packed_bytes = vec![0u8; num_packed];
+                for i in 0..num_packed {
+                    let first = nibble_values[2 * i];
+                    let second = nibble_values[2 * i + 1];
+                    packed_bytes[i] = second | (first << 4);
+                }
+
+                // absmax: 1 block covering 64 elements, scale = 2.0
+                let absmax_val = 2.0f32;
+                let absmax_f32 = vec![absmax_val];
+
+                // Compute expected dequantized weight on CPU.
+                let mut expected_weight = vec![0.0f32; num_elements];
+                for i in 0..num_elements {
+                    expected_weight[i] = NF4_CODE[nibble_values[i] as usize] * absmax_val;
+                }
+
+                // Compute expected output: x @ W^T where x = [1, 8] all ones.
+                // output[j] = sum_k(x[k] * W[j][k]) = sum_k(W[j][k])
+                let mut expected_output = vec![0.0f32; out_features];
+                for j in 0..out_features {
+                    for k in 0..in_features {
+                        expected_output[j] += expected_weight[j * in_features + k];
+                    }
+                }
+
+                // Upload packed bytes to GPU.
+                let packed_ptr = driver::mem_alloc(num_packed).unwrap();
+                driver::memcpy_htod_async(packed_ptr, packed_bytes.as_ptr(), num_packed, stream)
+                    .unwrap();
+                let packed_gpu = GpuTensor::new(packed_ptr, &[num_packed], DType::U8);
+
+                // Upload absmax to GPU.
+                let absmax_ptr = driver::mem_alloc(4).unwrap();
+                driver::memcpy_htod_async(absmax_ptr, absmax_f32.as_ptr() as *const u8, 4, stream)
+                    .unwrap();
+                let absmax_gpu = GpuTensor::new(absmax_ptr, &[1], DType::F32);
+
+                // Upload NF4 code table to GPU.
+                let code_ptr = driver::mem_alloc(64).unwrap();
+                driver::memcpy_htod_async(code_ptr, NF4_CODE.as_ptr() as *const u8, 64, stream)
+                    .unwrap();
+                let code_gpu = GpuTensor::new(code_ptr, &[16], DType::F32);
+
+                // Allocate dequant scratch buffer.
+                let scratch_bytes = num_elements * 2; // BF16
+                let scratch_ptr = driver::mem_alloc(scratch_bytes).unwrap();
+                let dequant_scratch = GpuTensor::new(scratch_ptr, &[num_elements], DType::BF16);
+
+                // Create input: [1, 8] all ones in BF16.
+                let ones_bf16: Vec<u16> = vec![0x3F80; in_features]; // BF16 for 1.0
+                let x_ptr = driver::mem_alloc(in_features * 2).unwrap();
+                driver::memcpy_htod_async(
+                    x_ptr,
+                    ones_bf16.as_ptr() as *const u8,
+                    in_features * 2,
+                    stream,
+                )
+                .unwrap();
+                let x = GpuTensor::new(x_ptr, &[1, in_features], DType::BF16);
+
+                // Build Bnb4bitLinear.
+                let layer = Bnb4bitLinear {
+                    packed_weight: packed_gpu,
+                    absmax: absmax_gpu,
+                    code: code_gpu,
+                    dequant_scratch,
+                    out_features,
+                    in_features,
+                    blocksize,
+                    bias: None,
+                };
+
+                // Forward.
+                let output = layer.forward_owned(x, &mut cublas, &mut alloc, stream);
+                let out_t = output.as_gpu_tensor();
+                assert_eq!(out_t.dim(0), 1);
+                assert_eq!(out_t.dim(1), out_features);
+
+                // Read back output.
+                let out_bytes = out_features * 2;
+                let host_out = driver::mem_alloc_host(out_bytes).unwrap();
+                driver::memcpy_dtoh_async(host_out, out_t.raw_ptr(), out_bytes, stream).unwrap();
+                driver::stream_synchronize(stream).unwrap();
+
+                let out_bf16 = std::slice::from_raw_parts(host_out as *const u16, out_features);
+                let actual: Vec<f32> = out_bf16
+                    .iter()
+                    .map(|&bits| half::bf16::from_bits(bits).to_f32())
+                    .collect();
+
+                println!("Expected: {:?}", expected_output);
+                println!("Actual:   {:?}", actual);
+
+                for j in 0..out_features {
+                    let diff = (actual[j] - expected_output[j]).abs();
+                    assert!(
+                        diff < 0.1,
+                        "output[{j}]: expected {}, got {}, diff {}",
+                        expected_output[j],
+                        actual[j],
+                        diff
+                    );
+                }
+
+                // Also read back the dequantized weight to verify dequant independently.
+                let dequant_bytes = num_elements * 2;
+                let host_dequant = driver::mem_alloc_host(dequant_bytes).unwrap();
+                driver::memcpy_dtoh_async(
+                    host_dequant,
+                    dequant_scratch.raw_ptr(),
+                    dequant_bytes,
+                    stream,
+                )
+                .unwrap();
+                driver::stream_synchronize(stream).unwrap();
+
+                let dequant_bf16 =
+                    std::slice::from_raw_parts(host_dequant as *const u16, num_elements);
+                let dequant_f32: Vec<f32> = dequant_bf16
+                    .iter()
+                    .map(|&bits| half::bf16::from_bits(bits).to_f32())
+                    .collect();
+
+                println!("Dequant[0..16]: {:?}", &dequant_f32[0..16]);
+                println!("Expected[0..16]: {:?}", &expected_weight[0..16]);
+
+                for i in 0..num_elements {
+                    let diff = (dequant_f32[i] - expected_weight[i]).abs();
+                    assert!(
+                        diff < 0.01,
+                        "dequant[{i}]: expected {}, got {}, diff {}",
+                        expected_weight[i],
+                        dequant_f32[i],
+                        diff
+                    );
+                }
+
+                driver::mem_free_host(host_out).unwrap();
+                driver::mem_free_host(host_dequant).unwrap();
+                driver::stream_destroy(stream).unwrap();
+            }
+        }
+
+        /// Test fused QKV: concatenated packed bytes + absmax from 3 shards
+        /// should produce same result as 3 separate matmuls.
+        #[test]
+        fn test_bnb4bit_fused_qkv_vs_separate() {
+            use crate::quant::NF4_CODE;
+
+            let stream = init_cuda();
+            unsafe {
+                let mut cublas = crate::cublas::CublasHandle::new(stream).unwrap();
+                let mut alloc = crate::alloc::CachingAllocator::new();
+
+                // Simulate: q=[128, 64], k=[64, 64], v=[64, 64], blocksize=64
+                let in_features = 64usize;
+                let q_out = 128usize;
+                let kv_out = 64usize;
+                let total_out = q_out + 2 * kv_out; // 256
+                let blocksize = 64usize;
+
+                // Create distinct nibble patterns for each shard.
+                // q: all nibble 15 (=1.0), k: all nibble 0 (=-1.0), v: all nibble 8 (=0.0796)
+                let q_elements = q_out * in_features; // 8192
+                let kv_elements = kv_out * in_features; // 4096
+
+                let q_nibbles: Vec<u8> = vec![15; q_elements];
+                let k_nibbles: Vec<u8> = vec![0; kv_elements];
+                let v_nibbles: Vec<u8> = vec![8; kv_elements];
+
+                // Pack each shard (BNB convention: hi nibble = first, lo nibble = second).
+                fn pack_nibbles(nibbles: &[u8]) -> Vec<u8> {
+                    nibbles.chunks(2).map(|c| c[1] | (c[0] << 4)).collect()
+                }
+                let q_packed = pack_nibbles(&q_nibbles);
+                let k_packed = pack_nibbles(&k_nibbles);
+                let v_packed = pack_nibbles(&v_nibbles);
+
+                // Concat packed bytes.
+                let mut fused_packed: Vec<u8> = Vec::new();
+                fused_packed.extend_from_slice(&q_packed);
+                fused_packed.extend_from_slice(&k_packed);
+                fused_packed.extend_from_slice(&v_packed);
+
+                // Each shard has its own absmax blocks.
+                let q_blocks = q_elements / blocksize; // 128
+                let kv_blocks = kv_elements / blocksize; // 64
+                let q_absmax: Vec<f32> = vec![3.0; q_blocks];
+                let k_absmax: Vec<f32> = vec![5.0; kv_blocks];
+                let v_absmax: Vec<f32> = vec![7.0; kv_blocks];
+
+                let mut fused_absmax: Vec<f32> = Vec::new();
+                fused_absmax.extend_from_slice(&q_absmax);
+                fused_absmax.extend_from_slice(&k_absmax);
+                fused_absmax.extend_from_slice(&v_absmax);
+
+                // Compute expected per-shard outputs on CPU.
+                // x = [1, 64] all ones. Output = sum of each row.
+                let q_val = NF4_CODE[15] * 3.0; // 1.0 * 3.0 = 3.0
+                let k_val = NF4_CODE[0] * 5.0; // -1.0 * 5.0 = -5.0
+                let v_val = NF4_CODE[8] * 7.0; // 0.0796 * 7.0 = 0.5572
+
+                // Each output element = sum of in_features values of the same row.
+                let q_out_val = q_val * in_features as f32; // 3.0 * 64 = 192.0
+                let k_out_val = k_val * in_features as f32; // -5.0 * 64 = -320.0
+                let v_out_val = v_val * in_features as f32; // ~35.67
+
+                // Upload fused data to GPU.
+                let packed_ptr = driver::mem_alloc(fused_packed.len()).unwrap();
+                driver::memcpy_htod_async(
+                    packed_ptr,
+                    fused_packed.as_ptr(),
+                    fused_packed.len(),
+                    stream,
+                )
+                .unwrap();
+                let packed_gpu = GpuTensor::new(packed_ptr, &[fused_packed.len()], DType::U8);
+
+                let absmax_ptr = driver::mem_alloc(fused_absmax.len() * 4).unwrap();
+                driver::memcpy_htod_async(
+                    absmax_ptr,
+                    fused_absmax.as_ptr() as *const u8,
+                    fused_absmax.len() * 4,
+                    stream,
+                )
+                .unwrap();
+                let absmax_gpu = GpuTensor::new(absmax_ptr, &[fused_absmax.len()], DType::F32);
+
+                let code_ptr = driver::mem_alloc(64).unwrap();
+                driver::memcpy_htod_async(code_ptr, NF4_CODE.as_ptr() as *const u8, 64, stream)
+                    .unwrap();
+                let code_gpu = GpuTensor::new(code_ptr, &[16], DType::F32);
+
+                let total_elements = total_out * in_features;
+                let scratch_ptr = driver::mem_alloc(total_elements * 2).unwrap();
+                let dequant_scratch = GpuTensor::new(scratch_ptr, &[total_elements], DType::BF16);
+
+                // Input: [1, 64] all ones BF16.
+                let ones_bf16: Vec<u16> = vec![0x3F80; in_features];
+                let x_ptr = driver::mem_alloc(in_features * 2).unwrap();
+                driver::memcpy_htod_async(
+                    x_ptr,
+                    ones_bf16.as_ptr() as *const u8,
+                    in_features * 2,
+                    stream,
+                )
+                .unwrap();
+                let x = GpuTensor::new(x_ptr, &[1, in_features], DType::BF16);
+
+                let layer = Bnb4bitLinear {
+                    packed_weight: packed_gpu,
+                    absmax: absmax_gpu,
+                    code: code_gpu,
+                    dequant_scratch,
+                    out_features: total_out,
+                    in_features,
+                    blocksize,
+                    bias: None,
+                };
+
+                let output = layer.forward_owned(x, &mut cublas, &mut alloc, stream);
+                let out_t = output.as_gpu_tensor();
+                assert_eq!(out_t.dim(0), 1);
+                assert_eq!(out_t.dim(1), total_out);
+
+                // Read back.
+                let out_bytes = total_out * 2;
+                let host_out = driver::mem_alloc_host(out_bytes).unwrap();
+                driver::memcpy_dtoh_async(host_out, out_t.raw_ptr(), out_bytes, stream).unwrap();
+                driver::stream_synchronize(stream).unwrap();
+
+                let out_bf16 = std::slice::from_raw_parts(host_out as *const u16, total_out);
+                let actual: Vec<f32> = out_bf16
+                    .iter()
+                    .map(|&b| half::bf16::from_bits(b).to_f32())
+                    .collect();
+
+                println!(
+                    "Fused QKV output first 5 (Q region, expect ~{q_out_val}): {:?}",
+                    &actual[0..5]
+                );
+                println!(
+                    "Fused QKV output at Q/K boundary [{q_out}..{}] (K region, expect ~{k_out_val}): {:?}",
+                    q_out + 5,
+                    &actual[q_out..q_out + 5]
+                );
+                let v_start = q_out + kv_out;
+                println!(
+                    "Fused QKV output at K/V boundary [{v_start}..{}] (V region, expect ~{v_out_val}): {:?}",
+                    v_start + 5,
+                    &actual[v_start..v_start + 5]
+                );
+
+                // Check Q region.
+                for i in 0..q_out {
+                    let diff = (actual[i] - q_out_val).abs();
+                    assert!(
+                        diff < 1.0,
+                        "Q[{i}]: expected {q_out_val}, got {}, diff {diff}",
+                        actual[i]
+                    );
+                }
+                // Check K region.
+                for i in 0..kv_out {
+                    let diff = (actual[q_out + i] - k_out_val).abs();
+                    assert!(
+                        diff < 1.0,
+                        "K[{i}]: expected {k_out_val}, got {}, diff {diff}",
+                        actual[q_out + i]
+                    );
+                }
+                // Check V region.
+                for i in 0..kv_out {
+                    let diff = (actual[v_start + i] - v_out_val).abs();
+                    assert!(
+                        diff < 1.0,
+                        "V[{i}]: expected {v_out_val}, got {}, diff {diff}",
+                        actual[v_start + i]
+                    );
+                }
+
+                driver::mem_free_host(host_out).unwrap();
+                driver::stream_destroy(stream).unwrap();
+            }
+        }
+
+        /// Test nibble order: BNB convention is hi nibble = first element, lo nibble = second.
+        /// Uses distinct nibble values in each position to detect any swap.
+        #[test]
+        fn test_bnb4bit_nibble_order() {
+            use crate::quant::NF4_CODE;
+
+            let stream = init_cuda();
+            unsafe {
+                // 4 elements → 2 packed bytes, blocksize=4 (1 block), absmax=1.0.
+                // Element layout: [A, B, C, D]
+                // BNB packs: byte[0] = B_nibble | (A_nibble << 4)
+                //            byte[1] = D_nibble | (C_nibble << 4)
+                let nibble_a: u8 = 15; // code[15] =  1.0
+                let nibble_b: u8 = 0; // code[0]  = -1.0
+                let nibble_c: u8 = 8; // code[8]  =  0.0796
+                let nibble_d: u8 = 10; // code[10] =  0.2461
+
+                let packed: [u8; 2] = [
+                    nibble_b | (nibble_a << 4), // byte 0: hi=A, lo=B
+                    nibble_d | (nibble_c << 4), // byte 1: hi=C, lo=D
+                ];
+                let absmax: [f32; 1] = [1.0]; // single block covers all 4 elements
+
+                let expected: [f32; 4] = [
+                    NF4_CODE[nibble_a as usize], // 1.0
+                    NF4_CODE[nibble_b as usize], // -1.0
+                    NF4_CODE[nibble_c as usize], // 0.0796
+                    NF4_CODE[nibble_d as usize], // 0.2461
+                ];
+
+                // Upload to GPU.
+                let packed_ptr = driver::mem_alloc(2).unwrap();
+                driver::memcpy_htod_async(packed_ptr, packed.as_ptr(), 2, stream).unwrap();
+                let packed_gpu = GpuTensor::new(packed_ptr, &[2], DType::U8);
+
+                let absmax_ptr = driver::mem_alloc(4).unwrap();
+                driver::memcpy_htod_async(absmax_ptr, absmax.as_ptr() as *const u8, 4, stream)
+                    .unwrap();
+                let absmax_gpu = GpuTensor::new(absmax_ptr, &[1], DType::F32);
+
+                let code_ptr = driver::mem_alloc(64).unwrap();
+                driver::memcpy_htod_async(code_ptr, NF4_CODE.as_ptr() as *const u8, 64, stream)
+                    .unwrap();
+                let code_gpu = GpuTensor::new(code_ptr, &[16], DType::F32);
+
+                let out_ptr = driver::mem_alloc(4 * 2).unwrap(); // 4 BF16 elements
+                let out_gpu = GpuTensor::new(out_ptr, &[2, 2], DType::BF16);
+
+                // Run dequant kernel.
+                crate::kernels::dequantize_bnb4bit(
+                    packed_gpu, absmax_gpu, code_gpu, out_gpu, 4, stream,
+                );
+
+                // Read back.
+                let host = driver::mem_alloc_host(8).unwrap();
+                driver::memcpy_dtoh_async(host, out_ptr, 8, stream).unwrap();
+                driver::stream_synchronize(stream).unwrap();
+
+                let out_bf16 = std::slice::from_raw_parts(host as *const u16, 4);
+                let actual: Vec<f32> = out_bf16
+                    .iter()
+                    .map(|&b| half::bf16::from_bits(b).to_f32())
+                    .collect();
+
+                println!("Nibble order test: expected {:?}", expected);
+                println!("Nibble order test: actual   {:?}", actual);
+
+                for i in 0..4 {
+                    let diff = (actual[i] - expected[i]).abs();
+                    assert!(
+                        diff < 0.01,
+                        "element[{i}]: expected {}, got {}, diff {} — nibble order is wrong!",
+                        expected[i],
+                        actual[i],
+                        diff
+                    );
+                }
+
+                driver::mem_free_host(host).unwrap();
+                driver::stream_destroy(stream).unwrap();
+            }
+        }
+
+        /// Test double-quant absmax dequantization matches Python reference.
+        /// Uses values from unsloth/Qwen3-0.6B-bnb-4bit layer 0 q_proj.
+        #[test]
+        fn test_double_quant_absmax_dequant() {
+            use crate::weights::dequantize_double_quant_absmax;
+
+            // From Python: absmax_u8[:5] = [61, 58, 54, 53, 54]
+            // nested_quant_map = 256-element 8-bit dequant table from state2.code
+            // nested_absmax = per-superblock scales from state2.absmax
+            // nested_blocksize = 256, offset = 0.07990148663520813
+            //
+            // Python result (before offset): [-0.02827, -0.03709, -0.04886, -0.05180, -0.04886]
+            // Python result (after offset):  [ 0.05163,  0.04281,  0.03104,  0.02810,  0.03104]
+
+            // Simple synthetic test: 4 elements, nested_blocksize=2, offset=0.5
+            let absmax_u8 = [3u8, 7, 1, 5];
+            let nested_quant_map: Vec<f32> = (0..256).map(|i| i as f32 * 0.01).collect();
+            let nested_absmax = [2.0f32, 3.0]; // 2 superblocks of size 2
+            let nested_blocksize = 2;
+            let offset = 0.5f32;
+
+            let result = dequantize_double_quant_absmax(
+                &absmax_u8,
+                &nested_quant_map,
+                &nested_absmax,
+                nested_blocksize,
+                offset,
+            );
+
+            // Manual: result[0] = quant_map[3] * absmax[0/2] + 0.5 = 0.03 * 2.0 + 0.5 = 0.56
+            //         result[1] = quant_map[7] * absmax[1/2] + 0.5 = 0.07 * 2.0 + 0.5 = 0.64
+            //         result[2] = quant_map[1] * absmax[2/2] + 0.5 = 0.01 * 3.0 + 0.5 = 0.53
+            //         result[3] = quant_map[5] * absmax[3/2] + 0.5 = 0.05 * 3.0 + 0.5 = 0.65
+            let expected = [0.56f32, 0.64, 0.53, 0.65];
+
+            assert_eq!(result.len(), 4);
+            for i in 0..4 {
+                let diff = (result[i] - expected[i]).abs();
+                assert!(
+                    diff < 1e-5,
+                    "absmax[{i}]: expected {}, got {}, diff {}",
+                    expected[i],
+                    result[i],
+                    diff
+                );
+            }
         }
     }
 }

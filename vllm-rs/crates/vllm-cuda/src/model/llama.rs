@@ -7,8 +7,6 @@
 //!
 //! Port of the candle-based `LlamaForCausalLM` in `vllm-models/src/llama.rs`.
 
-use std::sync::Arc;
-
 use anyhow::Result;
 
 use crate::alloc::OwnedTensor;
@@ -860,6 +858,7 @@ impl LlamaForCausalLM {
         } else {
             hidden_states
         };
+        #[allow(unused_mut)]
         let mut logits = self.lm_head.forward(
             hidden_states,
             &mut device.cublas,
@@ -930,6 +929,7 @@ impl LlamaForCausalLM {
             &mut device.caching,
             device.compute_stream,
         );
+        #[allow(unused_mut)]
         let mut logits = logits.into_gpu_tensor();
 
         // TP: all-gather logits (column parallel lm_head — each rank has vocab shard).
@@ -1987,6 +1987,311 @@ impl LlamaForCausalLM {
             model,
             lm_head,
             logits_scaling: 1.0,
+        })
+    }
+
+    /// Load a BitsAndBytes 4-bit (NF4/FP4) quantized model.
+    pub fn load_bnb4bit(
+        weights: &mut GpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        qconfig: &crate::quant::Bnb4bitConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let stream = device.compute_stream;
+
+        // Upload shared NF4/FP4 code table to GPU.
+        let code_table = match qconfig.quant_type {
+            crate::quant::BnbQuantType::NF4 => &crate::quant::NF4_CODE,
+            crate::quant::BnbQuantType::FP4 => &crate::quant::FP4_CODE,
+        };
+        let code_gpu = gpu_weights::upload_bnb_code(code_table, stream)?;
+
+        // Compute blocksize from the model config: BNB default is 64,
+        // but the actual blocksize is stored in the quant_state metadata.
+        // Use the config blocksize as default.
+        let blocksize = qconfig.blocksize;
+
+        // Compute max dequant buffer size across all linear layers (per-shard, no fusing).
+        let hidden = config.hidden_size;
+        let q_size = config.num_attention_heads * config.head_dim;
+        let inter = config.intermediate_size;
+        let max_elements = [
+            q_size * hidden, // q_proj (largest attention proj)
+            hidden * q_size, // o_proj
+            inter * hidden,  // gate_proj or up_proj
+            hidden * inter,  // down_proj
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+
+        let dequant_scratch = gpu_weights::alloc_bnb_dequant_scratch(max_elements, dtype, stream)?;
+
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+            let layer = LlamaDecoderLayer::load_bnb4bit(
+                weights,
+                &prefix,
+                config,
+                i,
+                qconfig,
+                code_gpu,
+                dequant_scratch,
+                blocksize,
+                stream,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                config.llama3_rope_scaling.as_ref(),
+                dtype,
+                device,
+            )?
+        };
+
+        let model = LlamaModel {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embedding_multiplier: 1.0,
+        };
+
+        let lm_head = LinearLayer::Dense(if config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.weight, None)
+        } else {
+            Linear::load(weights, "lm_head")?
+        });
+
+        Ok(Self {
+            model,
+            lm_head,
+            logits_scaling: 1.0,
+        })
+    }
+}
+
+impl LlamaDecoderLayer {
+    /// Load a BNB 4-bit decoder layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_bnb4bit(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        qconfig: &crate::quant::Bnb4bitConfig,
+        code_gpu: GpuTensor,
+        dequant_scratch: GpuTensor,
+        blocksize: usize,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let self_attn = LlamaAttention::load_bnb4bit(
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            blocksize,
+            stream,
+        )?;
+        let mlp = LlamaMLP::load_bnb4bit(
+            weights,
+            &format!("{prefix}.mlp"),
+            config,
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            blocksize,
+            stream,
+        )?;
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            residual_multiplier: 1.0,
+        })
+    }
+}
+
+impl LlamaAttention {
+    /// Load BNB 4-bit quantized attention — per-shard matmuls (matches Python vLLM exactly).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_bnb4bit(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        qconfig: &crate::quant::Bnb4bitConfig,
+        code_gpu: GpuTensor,
+        dequant_scratch: GpuTensor,
+        blocksize: usize,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let num_q_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+        let hidden = config.hidden_size;
+
+        // Per-shard: separate q, k, v projections (exactly what Python vLLM does).
+        let q = gpu_weights::load_bnb4bit_linear(
+            weights,
+            &format!("{prefix}.q_proj"),
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            q_size,
+            hidden,
+            blocksize,
+            stream,
+        )?;
+        let k = gpu_weights::load_bnb4bit_linear(
+            weights,
+            &format!("{prefix}.k_proj"),
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            kv_size,
+            hidden,
+            blocksize,
+            stream,
+        )?;
+        let v = gpu_weights::load_bnb4bit_linear(
+            weights,
+            &format!("{prefix}.v_proj"),
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            kv_size,
+            hidden,
+            blocksize,
+            stream,
+        )?;
+        let o = gpu_weights::load_bnb4bit_linear(
+            weights,
+            &format!("{prefix}.o_proj"),
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            hidden,
+            q_size,
+            blocksize,
+            stream,
+        )?;
+
+        // Load QK-norm weights if present (Qwen3).
+        let q_norm_name = format!("{prefix}.q_norm.weight");
+        let k_norm_name = format!("{prefix}.k_norm.weight");
+        let q_norm_weight = if weights.contains(&q_norm_name) {
+            Some(weights.take(&q_norm_name)?)
+        } else {
+            None
+        };
+        let k_norm_weight = if weights.contains(&k_norm_name) {
+            Some(weights.take(&k_norm_name)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            qkv_proj: LinearLayer::Bnb4bit(Box::new(q)),
+            k_proj: Some(LinearLayer::Bnb4bit(Box::new(k))),
+            v_proj: Some(LinearLayer::Bnb4bit(Box::new(v))),
+            o_proj: LinearLayer::Bnb4bit(Box::new(o)),
+            q_size,
+            kv_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            layer_idx,
+            q_norm_weight,
+            k_norm_weight,
+            qk_norm_eps: 1e-6,
+        })
+    }
+}
+
+impl LlamaMLP {
+    /// Load BNB 4-bit quantized MLP — per-shard matmuls (matches Python vLLM exactly).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_bnb4bit(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        qconfig: &crate::quant::Bnb4bitConfig,
+        code_gpu: GpuTensor,
+        dequant_scratch: GpuTensor,
+        blocksize: usize,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let inter = config.intermediate_size;
+        let hidden = config.hidden_size;
+
+        // Per-shard: separate gate and up projections (exactly what Python vLLM does).
+        let gate = gpu_weights::load_bnb4bit_linear(
+            weights,
+            &format!("{prefix}.gate_proj"),
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            inter,
+            hidden,
+            blocksize,
+            stream,
+        )?;
+        let up = gpu_weights::load_bnb4bit_linear(
+            weights,
+            &format!("{prefix}.up_proj"),
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            inter,
+            hidden,
+            blocksize,
+            stream,
+        )?;
+        let down = gpu_weights::load_bnb4bit_linear(
+            weights,
+            &format!("{prefix}.down_proj"),
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            hidden,
+            inter,
+            blocksize,
+            stream,
+        )?;
+
+        Ok(Self {
+            gate_up_proj: LinearLayer::Bnb4bit(Box::new(gate)),
+            up_proj: Some(LinearLayer::Bnb4bit(Box::new(up))),
+            down_proj: LinearLayer::Bnb4bit(Box::new(down)),
+            intermediate_size: inter,
         })
     }
 }

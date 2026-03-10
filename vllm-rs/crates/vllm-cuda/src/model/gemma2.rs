@@ -12,8 +12,6 @@
 //! - Final logit soft capping
 //! - Interleaved sliding window (per-layer)
 
-use std::sync::Arc;
-
 use anyhow::Result;
 
 use crate::alloc::OwnedTensor;
@@ -277,6 +275,51 @@ impl Gemma2MLP {
             intermediate_size,
             #[cfg(feature = "nccl")]
             tp_group: None,
+        })
+    }
+
+    /// Load BNB 4-bit quantized MLP.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_bnb4bit(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Gemma2Config,
+        qconfig: &crate::quant::Bnb4bitConfig,
+        code_gpu: GpuTensor,
+        dequant_scratch: GpuTensor,
+        blocksize: usize,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let inter = config.intermediate_size;
+        let hidden = config.hidden_size;
+
+        let gate_up = gpu_weights::load_fused_bnb4bit_linear(
+            weights,
+            &[format!("{prefix}.gate_proj"), format!("{prefix}.up_proj")],
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            &[inter, inter],
+            hidden,
+            blocksize,
+            stream,
+        )?;
+        let down = gpu_weights::load_bnb4bit_linear(
+            weights,
+            &format!("{prefix}.down_proj"),
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            hidden,
+            inter,
+            blocksize,
+            stream,
+        )?;
+
+        Ok(Self {
+            gate_up_proj: LinearLayer::Bnb4bit(Box::new(gate_up)),
+            down_proj: LinearLayer::Bnb4bit(Box::new(down)),
+            intermediate_size: inter,
         })
     }
 }
@@ -649,6 +692,75 @@ impl Gemma2Attention {
             tp_group: None,
         })
     }
+
+    /// Load BNB 4-bit quantized attention.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_bnb4bit(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Gemma2Config,
+        layer_idx: usize,
+        is_sliding: bool,
+        qconfig: &crate::quant::Bnb4bitConfig,
+        code_gpu: GpuTensor,
+        dequant_scratch: GpuTensor,
+        blocksize: usize,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let num_q_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+        let hidden = config.hidden_size;
+
+        let qkv = gpu_weights::load_fused_bnb4bit_linear(
+            weights,
+            &[
+                format!("{prefix}.q_proj"),
+                format!("{prefix}.k_proj"),
+                format!("{prefix}.v_proj"),
+            ],
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            &[q_size, kv_size, kv_size],
+            hidden,
+            blocksize,
+            stream,
+        )?;
+        let o = gpu_weights::load_bnb4bit_linear(
+            weights,
+            &format!("{prefix}.o_proj"),
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            hidden,
+            q_size,
+            blocksize,
+            stream,
+        )?;
+
+        let sliding_window = if is_sliding {
+            config.sliding_window
+        } else {
+            None
+        };
+
+        Ok(Self {
+            qkv_proj: LinearLayer::Bnb4bit(Box::new(qkv)),
+            o_proj: LinearLayer::Bnb4bit(Box::new(o)),
+            q_size,
+            kv_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale: config.query_pre_attn_scalar.powf(-0.5) as f32,
+            attn_logit_softcapping: config.attn_logit_softcapping.unwrap_or(0.0) as f32,
+            sliding_window,
+            layer_idx,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +868,81 @@ impl Gemma2DecoderLayer {
             qconfig,
             workspace,
             device,
+        )?;
+        let input_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let post_attention_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let pre_feedforward_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.pre_feedforward_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let post_feedforward_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.post_feedforward_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            pre_feedforward_layernorm,
+            post_feedforward_layernorm,
+        })
+    }
+
+    /// Load a BNB 4-bit decoder layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_bnb4bit(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Gemma2Config,
+        layer_idx: usize,
+        is_sliding: bool,
+        qconfig: &crate::quant::Bnb4bitConfig,
+        code_gpu: GpuTensor,
+        dequant_scratch: GpuTensor,
+        blocksize: usize,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let self_attn = Gemma2Attention::load_bnb4bit(
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            is_sliding,
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            blocksize,
+            device.compute_stream,
+        )?;
+        let mlp = Gemma2MLP::load_bnb4bit(
+            weights,
+            &format!("{prefix}.mlp"),
+            config,
+            qconfig,
+            code_gpu,
+            dequant_scratch,
+            blocksize,
+            device.compute_stream,
         )?;
         let input_layernorm = GemmaRmsNorm::load(
             weights,
@@ -1293,6 +1480,88 @@ impl Gemma2ForCausalLM {
             final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
             #[cfg(feature = "nccl")]
             tp_group: None,
+        })
+    }
+
+    /// Load a BNB 4-bit quantized Gemma2 model.
+    pub fn load_bnb4bit(
+        weights: &mut GpuWeights,
+        config: &Gemma2Config,
+        dtype: DType,
+        qconfig: &crate::quant::Bnb4bitConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let stream = device.compute_stream;
+
+        let code_table = match qconfig.quant_type {
+            crate::quant::BnbQuantType::NF4 => &crate::quant::NF4_CODE,
+            crate::quant::BnbQuantType::FP4 => &crate::quant::FP4_CODE,
+        };
+        let code_gpu = gpu_weights::upload_bnb_code(code_table, stream)?;
+        let blocksize = qconfig.blocksize;
+
+        let hidden = config.hidden_size;
+        let q_size = config.num_attention_heads * config.head_dim;
+        let kv_size = config.num_kv_heads * config.head_dim;
+        let inter = config.intermediate_size;
+        let max_elements = [
+            (q_size + 2 * kv_size) * hidden,
+            q_size * hidden,
+            2 * inter * hidden,
+            hidden * inter,
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        let dequant_scratch = gpu_weights::alloc_bnb_dequant_scratch(max_elements, dtype, stream)?;
+
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let is_sliding = i < config.layer_is_sliding.len() && config.layer_is_sliding[i];
+            let layer = Gemma2DecoderLayer::load_bnb4bit(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                is_sliding,
+                qconfig,
+                code_gpu,
+                dequant_scratch,
+                blocksize,
+                dtype,
+                device,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = GemmaRmsNorm::load(weights, "model.norm", config.rms_norm_eps, dtype, device)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        let model = Gemma2Model {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embed_scale: (config.hidden_size as f32).sqrt(),
+        };
+
+        let lm_head = Linear::new(model.embed_tokens.weight, None);
+
+        Ok(Self {
+            model,
+            lm_head,
+            final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
         })
     }
 

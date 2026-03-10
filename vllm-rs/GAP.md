@@ -52,7 +52,7 @@
   ├──────────────────┼──────────────┼─────────────┼────────────────────────────────────────────────┤
   │ AWQ (W4A16)      │ yes          │ YES         │ Marlin kernel, E2E verified (Qwen2.5-0.5B)     │
   ├──────────────────┼──────────────┼─────────────┼────────────────────────────────────────────────┤
-  │ BitsAndBytes NF4 │ yes          │ no          │ NF4 dequant kernel                             │
+  │ BitsAndBytes NF4 │ yes          │ YES         │ NF4 dequant kernel, E2E verified (Qwen3-0.6B)  │
   └──────────────────┴──────────────┴─────────────┴────────────────────────────────────────────────┘
 
   ### GPTQ/AWQ Parity vs Python vLLM (detailed)
@@ -110,7 +110,9 @@
   BS=1 uses fused dequant-matvec; BS>1 quantizes activations to Q8_1 then uses int8 dot products. BF16↔f32 casting around GGML matmul.
   Supported dtypes: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, Q8K.
   E2E verified: Qwen2.5-0.5B-GGUF, Qwen3-0.6B-GGUF. CUDA graphs disabled for GGML (incompatible with dynamic allocs).
-  BnB NF4 is lower priority.
+  BnB NF4 uses dequantize-then-cuBLAS GEMM (matching Python vLLM's matmul_4bit). Supports double quantization
+  (nested absmax dequant at load time). Per-shard matmuls for Q/K/V and gate/up projections. Shared dequant scratch buffer.
+  E2E verified: unsloth/Qwen3-0.6B-bnb-4bit on L40S. Architectures: LLaMA, Qwen2, Gemma2 (+ aliases: Mistral, Qwen3, Phi-3, Granite).
 
   3. ~~Tensor Parallelism (TP)~~ — **DONE**
 

@@ -7,6 +7,8 @@
 //!
 //! Port of the candle-based `LlamaForCausalLM` in `vllm-models/src/llama.rs`.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 
 use crate::alloc::OwnedTensor;
@@ -19,6 +21,9 @@ use crate::quant::QuantConfig;
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
 use crate::weights::{self as gpu_weights};
+
+#[cfg(feature = "nccl")]
+use crate::nccl::NcclGroup;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -168,6 +173,9 @@ pub struct LlamaMLP {
     up_proj: Option<LinearLayer>,
     down_proj: LinearLayer,
     intermediate_size: usize,
+    /// NCCL group for TP all-reduce after down_proj (row parallel).
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
 }
 
 impl LlamaMLP {
@@ -228,6 +236,14 @@ impl LlamaMLP {
         );
         drop(activated);
 
+        // TP: all-reduce down_proj output (row parallel).
+        #[cfg(feature = "nccl")]
+        if let Some(ref group) = self.tp_group {
+            group
+                .all_reduce_inplace(result.as_gpu_tensor())
+                .expect("down_proj all_reduce failed");
+        }
+
         result
     }
 }
@@ -259,6 +275,9 @@ pub struct LlamaAttention {
     pub q_norm_weight: Option<GpuTensor>,
     pub k_norm_weight: Option<GpuTensor>,
     pub qk_norm_eps: f32,
+    /// NCCL group for TP all-reduce after o_proj (row parallel).
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
 }
 
 impl LlamaAttention {
@@ -503,6 +522,15 @@ impl LlamaAttention {
             device.compute_stream,
         );
         drop(attn_output);
+
+        // TP: all-reduce o_proj output (row parallel).
+        #[cfg(feature = "nccl")]
+        if let Some(ref group) = self.tp_group {
+            group
+                .all_reduce_inplace(result.as_gpu_tensor())
+                .expect("o_proj all_reduce failed");
+        }
+
         result
     }
 }
@@ -781,6 +809,9 @@ pub struct LlamaForCausalLM {
     pub lm_head: LinearLayer,
     /// Granite logits scaling (1.0 = no-op for LLaMA).
     pub logits_scaling: f32,
+    /// NCCL group for TP all-gather after lm_head (column parallel).
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
 }
 
 impl LlamaForCausalLM {
@@ -829,12 +860,18 @@ impl LlamaForCausalLM {
         } else {
             hidden_states
         };
-        let logits = self.lm_head.forward(
+        let mut logits = self.lm_head.forward(
             hidden_states,
             &mut device.cublas,
             &mut device.caching,
             device.compute_stream,
         );
+
+        // TP: all-gather logits (column parallel lm_head).
+        #[cfg(feature = "nccl")]
+        if let Some(ref group) = self.tp_group {
+            logits = group.all_gather(logits, &mut device.caching);
+        }
 
         // Granite: scale logits by 1/logits_scaling.
         if self.logits_scaling != 1.0 {
@@ -893,13 +930,36 @@ impl LlamaForCausalLM {
             &mut device.caching,
             device.compute_stream,
         );
-        let logits = logits.into_gpu_tensor();
+        let mut logits = logits.into_gpu_tensor();
+
+        // TP: all-gather logits (column parallel lm_head — each rank has vocab shard).
+        #[cfg(feature = "nccl")]
+        if let Some(ref group) = self.tp_group {
+            logits = group.all_gather(logits, &mut device.caching);
+        }
 
         if self.logits_scaling != 1.0 {
             kernels::scale_inplace(logits, self.logits_scaling.recip(), &device.cublas);
         }
 
         logits
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TP group injection
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "nccl")]
+impl LlamaForCausalLM {
+    /// Inject NCCL process group into all TP layers.
+    /// Must be called after loading with `load_tp()`.
+    pub fn set_tp_group(&mut self, group: Arc<NcclGroup>) {
+        for layer in &mut self.model.layers {
+            layer.self_attn.tp_group = Some(Arc::clone(&group));
+            layer.mlp.tp_group = Some(Arc::clone(&group));
+        }
+        self.tp_group = Some(group);
     }
 }
 
@@ -997,6 +1057,8 @@ impl LlamaAttention {
             q_norm_weight: None,
             k_norm_weight: None,
             qk_norm_eps: 0.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 
@@ -1073,6 +1135,8 @@ impl LlamaMLP {
             up_proj: None,
             down_proj,
             intermediate_size,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 }
@@ -1135,6 +1199,8 @@ impl LlamaAttention {
             q_norm_weight: None,
             k_norm_weight: None,
             qk_norm_eps: 0.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 }
@@ -1176,6 +1242,8 @@ impl LlamaMLP {
             up_proj: None,
             down_proj: LinearLayer::Marlin(Box::new(down)),
             intermediate_size,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 }
@@ -1334,6 +1402,8 @@ impl LlamaForCausalLM {
             model,
             lm_head,
             logits_scaling: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 
@@ -1389,6 +1459,348 @@ impl LlamaForCausalLM {
             model,
             lm_head,
             logits_scaling: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tensor-parallel loading (Phase 4)
+// ---------------------------------------------------------------------------
+
+// ColumnParallelLinear/RowParallelLinear/VocabParallelEmbedding available in layers
+// but TP loading constructs plain LinearLayer + injects NcclGroup on the model structs.
+
+/// TP sharding config passed through the load call chain.
+#[derive(Debug, Clone, Copy)]
+pub struct TpConfig {
+    pub rank: usize,
+    pub world_size: usize,
+}
+
+impl LlamaAttention {
+    /// Load with fused QKV weights, sharded for tensor parallelism.
+    ///
+    /// QKV: shard Q by num_q_heads/world_size, K/V by num_kv_heads/world_size (dim=0).
+    /// o_proj: shard along dim=1 (row parallel).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fused_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let num_q_heads = config.num_attention_heads / tp.world_size;
+        let num_kv_heads = config.num_kv_heads / tp.world_size;
+        let head_dim = config.head_dim;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        // Get dtype from weight metadata.
+        let q_name = format!("{prefix}.q_proj.weight");
+        let k_name = format!("{prefix}.k_proj.weight");
+        let v_name = format!("{prefix}.v_proj.weight");
+
+        let (_q_shape, q_dtype) = weights
+            .tensor_info(&q_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {q_name}"))?;
+        let hidden = _q_shape[1];
+        let elem_size = q_dtype.size_bytes();
+
+        // Pre-allocate fused QKV tensor for this rank's shard.
+        let q_bytes = q_size * hidden * elem_size;
+        let kv_bytes = kv_size * hidden * elem_size;
+        let total_bytes = q_bytes + 2 * kv_bytes;
+        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+
+        // Shard each component along dim=0 and stream into fused buffer.
+        unsafe {
+            weights.take_shard_into(&q_name, 0, tp.rank, tp.world_size, ptr, stream)?;
+            weights.take_shard_into(
+                &k_name,
+                0,
+                tp.rank,
+                tp.world_size,
+                ptr.add(q_bytes),
+                stream,
+            )?;
+            weights.take_shard_into(
+                &v_name,
+                0,
+                tp.rank,
+                tp.world_size,
+                ptr.add(q_bytes + kv_bytes),
+                stream,
+            )?;
+        }
+
+        let qkv_w = unsafe { GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden], q_dtype) };
+
+        // Fuse QKV bias if present (Qwen2), also sharded.
+        let q_bias_name = format!("{prefix}.q_proj.bias");
+        let k_bias_name = format!("{prefix}.k_proj.bias");
+        let v_bias_name = format!("{prefix}.v_proj.bias");
+        let qkv_bias = if weights.contains(&q_bias_name) {
+            let (_, q_b_dtype) = weights
+                .tensor_info(&q_bias_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {q_bias_name}"))?;
+            let q_b_bytes = q_size * q_b_dtype.size_bytes();
+            let k_b_bytes = kv_size * q_b_dtype.size_bytes();
+            let v_b_bytes = kv_size * q_b_dtype.size_bytes();
+            let total_bias_bytes = q_b_bytes + k_b_bytes + v_b_bytes;
+            let total_elems = total_bias_bytes / q_b_dtype.size_bytes();
+
+            let bias_ptr = unsafe { crate::driver::mem_alloc(total_bias_bytes)? };
+            unsafe {
+                weights.take_shard_into(
+                    &q_bias_name,
+                    0,
+                    tp.rank,
+                    tp.world_size,
+                    bias_ptr,
+                    stream,
+                )?;
+                weights.take_shard_into(
+                    &k_bias_name,
+                    0,
+                    tp.rank,
+                    tp.world_size,
+                    bias_ptr.add(q_b_bytes),
+                    stream,
+                )?;
+                weights.take_shard_into(
+                    &v_bias_name,
+                    0,
+                    tp.rank,
+                    tp.world_size,
+                    bias_ptr.add(q_b_bytes + k_b_bytes),
+                    stream,
+                )?;
+            }
+            Some(unsafe { GpuTensor::new(bias_ptr, &[total_elems], q_b_dtype) })
+        } else {
+            None
+        };
+        let qkv_proj = LinearLayer::Dense(Linear::new(qkv_w, qkv_bias));
+
+        // o_proj: shard along dim=1 (row parallel — input is split across ranks).
+        let o_name = format!("{prefix}.o_proj.weight");
+        let o_w = weights.take_shard(&o_name, 1, tp.rank, tp.world_size)?;
+        // o_proj bias (if any) is added AFTER all-reduce, so load full bias.
+        let o_bias_name = format!("{prefix}.o_proj.bias");
+        let o_bias = if weights.contains(&o_bias_name) {
+            Some(weights.take(&o_bias_name)?)
+        } else {
+            None
+        };
+        let o_proj = LinearLayer::Dense(Linear::new(o_w, o_bias));
+
+        Ok(Self {
+            qkv_proj,
+            k_proj: None,
+            v_proj: None,
+            o_proj,
+            q_size,
+            kv_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            layer_idx,
+            q_norm_weight: None,
+            k_norm_weight: None,
+            qk_norm_eps: 0.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+}
+
+impl LlamaMLP {
+    /// Load with fused gate+up weights, sharded for tensor parallelism.
+    ///
+    /// gate_up_proj: shard along dim=0 (column parallel).
+    /// down_proj: shard along dim=1 (row parallel).
+    pub fn load_fused_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        intermediate_size: usize,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let shard_intermediate = intermediate_size / tp.world_size;
+
+        let gate_name = format!("{prefix}.gate_proj.weight");
+        let up_name = format!("{prefix}.up_proj.weight");
+
+        let (gate_shape, gate_dtype) = weights
+            .tensor_info(&gate_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
+        let hidden = gate_shape[1];
+        let elem_size = gate_dtype.size_bytes();
+
+        // Each shard: [shard_intermediate, hidden].
+        let shard_bytes = shard_intermediate * hidden * elem_size;
+        let total_bytes = 2 * shard_bytes;
+        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+
+        unsafe {
+            weights.take_shard_into(&gate_name, 0, tp.rank, tp.world_size, ptr, stream)?;
+            weights.take_shard_into(
+                &up_name,
+                0,
+                tp.rank,
+                tp.world_size,
+                ptr.add(shard_bytes),
+                stream,
+            )?;
+        }
+
+        let gate_up_w =
+            unsafe { GpuTensor::new(ptr, &[2 * shard_intermediate, hidden], gate_dtype) };
+        let gate_up_proj = LinearLayer::Dense(Linear::new(gate_up_w, None));
+
+        // down_proj: shard along dim=1 (row parallel).
+        let down_name = format!("{prefix}.down_proj.weight");
+        let down_w = weights.take_shard(&down_name, 1, tp.rank, tp.world_size)?;
+        let down_proj = LinearLayer::Dense(Linear::new(down_w, None));
+
+        Ok(Self {
+            gate_up_proj,
+            up_proj: None,
+            down_proj,
+            intermediate_size: shard_intermediate,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+}
+
+impl LlamaDecoderLayer {
+    /// Load a decoder layer with TP-sharded weights.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let self_attn = LlamaAttention::load_fused_tp(
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            tp,
+            stream,
+        )?;
+        let mlp = LlamaMLP::load_fused_tp(
+            weights,
+            &format!("{prefix}.mlp"),
+            config.intermediate_size,
+            tp,
+            stream,
+        )?;
+        // Norms are NOT sharded — identical on all ranks.
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            residual_multiplier: 1.0,
+        })
+    }
+}
+
+impl LlamaModel {
+    /// Load the model backbone with TP sharding.
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        // Embedding: load full (all ranks need all vocab for now).
+        // VocabParallelEmbedding sharding is handled at the CausalLM level.
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let layer = LlamaDecoderLayer::load_tp(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                tp,
+                device.compute_stream,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                config.llama3_rope_scaling.as_ref(),
+                dtype,
+                device,
+            )?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embedding_multiplier: 1.0,
+        })
+    }
+}
+
+impl LlamaForCausalLM {
+    /// Load the full model with TP sharding.
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = LlamaModel::load_tp(weights, config, dtype, tp, device)?;
+
+        // lm_head: column-parallel (shard output dim).
+        let lm_head = if config.tie_word_embeddings {
+            // Tied embeddings — use full weight (all-gather at inference time).
+            LinearLayer::Dense(Linear::new(model.embed_tokens.weight, None))
+        } else {
+            let lm_w = weights.take_shard("lm_head.weight", 0, tp.rank, tp.world_size)?;
+            LinearLayer::Dense(Linear::new(lm_w, None))
+        };
+
+        Ok(Self {
+            model,
+            lm_head,
+            logits_scaling: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 }

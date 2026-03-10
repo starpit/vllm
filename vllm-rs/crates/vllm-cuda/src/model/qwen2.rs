@@ -12,7 +12,7 @@ use anyhow::Result;
 use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kv_cache::KvCachePool;
-use crate::model::llama::{LlamaConfig, LlamaForCausalLM};
+use crate::model::llama::{LlamaConfig, LlamaForCausalLM, TpConfig};
 use crate::quant::QuantConfig;
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
@@ -65,6 +65,18 @@ impl Qwen2ForCausalLM {
         device: &GpuDevice,
     ) -> Result<Self> {
         let model = LlamaForCausalLM::load_quantized(weights, &config.0, dtype, qconfig, device)?;
+        Ok(Self(model))
+    }
+
+    /// Load the model with TP sharding (dense).
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        config: &Qwen2Config,
+        dtype: DType,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = LlamaForCausalLM::load_tp(weights, &config.0, dtype, tp, device)?;
         Ok(Self(model))
     }
 

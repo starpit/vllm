@@ -12,15 +12,20 @@
 //! - Final logit soft capping
 //! - Interleaved sliding window (per-layer)
 
+use std::sync::Arc;
+
 use anyhow::Result;
 
 use crate::alloc::OwnedTensor;
 use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kernels;
+
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Embedding, Linear, LinearLayer, RmsNorm};
 use crate::model::llama::RotaryCache;
+#[cfg(feature = "nccl")]
+use crate::nccl::NcclGroup;
 use crate::quant::QuantConfig;
 use crate::tensor::GpuTensor;
 use crate::weights::{self as gpu_weights, GpuWeights};
@@ -132,6 +137,8 @@ pub struct Gemma2MLP {
     gate_up_proj: LinearLayer,
     down_proj: LinearLayer,
     intermediate_size: usize,
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
 }
 
 impl Gemma2MLP {
@@ -166,6 +173,8 @@ impl Gemma2MLP {
             gate_up_proj,
             down_proj,
             intermediate_size,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 
@@ -182,12 +191,22 @@ impl Gemma2MLP {
             &mut device.caching,
             device.compute_stream,
         );
-        self.down_proj.forward(
+        let out = self.down_proj.forward(
             *activated,
             &mut device.cublas,
             &mut device.caching,
             device.compute_stream,
-        )
+        );
+
+        // TP: all-reduce down_proj output (row parallel).
+        #[cfg(feature = "nccl")]
+        if let Some(ref group) = self.tp_group {
+            group
+                .all_reduce_inplace(out)
+                .expect("down_proj all_reduce failed");
+        }
+
+        out
     }
 
     /// Forward pass returning `OwnedTensor` (caching-allocator path).
@@ -212,6 +231,15 @@ impl Gemma2MLP {
             device.compute_stream,
         );
         drop(activated);
+
+        // TP: all-reduce down_proj output (row parallel).
+        #[cfg(feature = "nccl")]
+        if let Some(ref group) = self.tp_group {
+            group
+                .all_reduce_inplace(result.as_gpu_tensor())
+                .expect("down_proj all_reduce failed");
+        }
+
         result
     }
 
@@ -247,6 +275,8 @@ impl Gemma2MLP {
             gate_up_proj: LinearLayer::Marlin(Box::new(gate_up)),
             down_proj: LinearLayer::Marlin(Box::new(down)),
             intermediate_size,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 }
@@ -267,6 +297,8 @@ pub struct Gemma2Attention {
     attn_logit_softcapping: f32,
     sliding_window: Option<usize>,
     layer_idx: usize,
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
 }
 
 impl Gemma2Attention {
@@ -324,6 +356,8 @@ impl Gemma2Attention {
             attn_logit_softcapping: config.attn_logit_softcapping.unwrap_or(0.0) as f32,
             sliding_window,
             layer_idx,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 
@@ -420,12 +454,22 @@ impl Gemma2Attention {
         let attn_flat = attn_output
             .into_gpu_tensor()
             .reshape(&[num_tokens, self.q_size]);
-        self.o_proj.forward(
+        let out = self.o_proj.forward(
             attn_flat,
             &mut device.cublas,
             &mut device.caching,
             device.compute_stream,
-        )
+        );
+
+        // TP: all-reduce o_proj output (row parallel).
+        #[cfg(feature = "nccl")]
+        if let Some(ref group) = self.tp_group {
+            group
+                .all_reduce_inplace(out)
+                .expect("o_proj all_reduce failed");
+        }
+
+        out
     }
 
     /// Forward pass returning `OwnedTensor` (caching-allocator path).
@@ -530,6 +574,15 @@ impl Gemma2Attention {
             device.compute_stream,
         );
         drop(attn_output);
+
+        // TP: all-reduce o_proj output (row parallel).
+        #[cfg(feature = "nccl")]
+        if let Some(ref group) = self.tp_group {
+            group
+                .all_reduce_inplace(result.as_gpu_tensor())
+                .expect("o_proj all_reduce failed");
+        }
+
         result
     }
 
@@ -592,6 +645,8 @@ impl Gemma2Attention {
             attn_logit_softcapping: config.attn_logit_softcapping.unwrap_or(0.0) as f32,
             sliding_window,
             layer_idx,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 }
@@ -1154,6 +1209,8 @@ pub struct Gemma2ForCausalLM {
     pub model: Gemma2Model,
     pub lm_head: Linear,
     final_logit_softcapping: Option<f32>,
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
 }
 
 impl Gemma2ForCausalLM {
@@ -1172,6 +1229,8 @@ impl Gemma2ForCausalLM {
             model,
             lm_head,
             final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 
@@ -1232,6 +1291,8 @@ impl Gemma2ForCausalLM {
             model,
             lm_head,
             final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 
@@ -1340,5 +1401,298 @@ impl Gemma2ForCausalLM {
         let _ = self.final_logit_softcapping;
 
         logits
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TP group injection
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "nccl")]
+impl Gemma2ForCausalLM {
+    /// Inject NCCL process group into all TP layers.
+    pub fn set_tp_group(&mut self, group: Arc<NcclGroup>) {
+        for layer in &mut self.model.layers {
+            layer.self_attn.tp_group = Some(Arc::clone(&group));
+            layer.mlp.tp_group = Some(Arc::clone(&group));
+        }
+        self.tp_group = Some(group);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tensor-parallel loading
+// ---------------------------------------------------------------------------
+
+use crate::model::llama::TpConfig;
+
+impl Gemma2Attention {
+    /// Load with fused QKV weights, sharded for tensor parallelism.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fused_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Gemma2Config,
+        layer_idx: usize,
+        is_sliding: bool,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let num_q_heads = config.num_attention_heads / tp.world_size;
+        let num_kv_heads = config.num_kv_heads / tp.world_size;
+        let head_dim = config.head_dim;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        let q_name = format!("{prefix}.q_proj.weight");
+        let k_name = format!("{prefix}.k_proj.weight");
+        let v_name = format!("{prefix}.v_proj.weight");
+        let (_q_shape, q_dtype) = weights
+            .tensor_info(&q_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {q_name}"))?;
+        let hidden = _q_shape[1];
+        let elem_size = q_dtype.size_bytes();
+        let q_bytes = q_size * hidden * elem_size;
+        let kv_bytes = kv_size * hidden * elem_size;
+        let total_bytes = q_bytes + 2 * kv_bytes;
+        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+        unsafe {
+            weights.take_shard_into(&q_name, 0, tp.rank, tp.world_size, ptr, stream)?;
+            weights.take_shard_into(
+                &k_name,
+                0,
+                tp.rank,
+                tp.world_size,
+                ptr.add(q_bytes),
+                stream,
+            )?;
+            weights.take_shard_into(
+                &v_name,
+                0,
+                tp.rank,
+                tp.world_size,
+                ptr.add(q_bytes + kv_bytes),
+                stream,
+            )?;
+        }
+        let qkv_w = unsafe { GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden], q_dtype) };
+        let qkv_proj = LinearLayer::Dense(Linear::new(qkv_w, None));
+
+        // o_proj: shard along dim=1 (row parallel).
+        let o_name = format!("{prefix}.o_proj.weight");
+        let o_w = weights.take_shard(&o_name, 1, tp.rank, tp.world_size)?;
+        let o_proj = LinearLayer::Dense(Linear::new(o_w, None));
+
+        let sliding_window = if is_sliding {
+            config.sliding_window
+        } else {
+            None
+        };
+
+        Ok(Self {
+            qkv_proj,
+            o_proj,
+            q_size,
+            kv_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale: config.query_pre_attn_scalar.powf(-0.5) as f32,
+            attn_logit_softcapping: config.attn_logit_softcapping.unwrap_or(0.0) as f32,
+            sliding_window,
+            layer_idx,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+}
+
+impl Gemma2MLP {
+    /// Load with fused gate+up weights, sharded for tensor parallelism.
+    pub fn load_fused_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        intermediate_size: usize,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let shard_intermediate = intermediate_size / tp.world_size;
+
+        let gate_name = format!("{prefix}.gate_proj.weight");
+        let up_name = format!("{prefix}.up_proj.weight");
+        let (gate_shape, gate_dtype) = weights
+            .tensor_info(&gate_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
+        let hidden = gate_shape[1];
+        let elem_size = gate_dtype.size_bytes();
+        let shard_bytes = shard_intermediate * hidden * elem_size;
+        let total_bytes = 2 * shard_bytes;
+        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+        unsafe {
+            weights.take_shard_into(&gate_name, 0, tp.rank, tp.world_size, ptr, stream)?;
+            weights.take_shard_into(
+                &up_name,
+                0,
+                tp.rank,
+                tp.world_size,
+                ptr.add(shard_bytes),
+                stream,
+            )?;
+        }
+        let gate_up_w =
+            unsafe { GpuTensor::new(ptr, &[2 * shard_intermediate, hidden], gate_dtype) };
+        let gate_up_proj = LinearLayer::Dense(Linear::new(gate_up_w, None));
+
+        let down_name = format!("{prefix}.down_proj.weight");
+        let down_w = weights.take_shard(&down_name, 1, tp.rank, tp.world_size)?;
+        let down_proj = LinearLayer::Dense(Linear::new(down_w, None));
+
+        Ok(Self {
+            gate_up_proj,
+            down_proj,
+            intermediate_size: shard_intermediate,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+}
+
+impl Gemma2DecoderLayer {
+    /// Load a decoder layer with TP-sharded weights.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Gemma2Config,
+        layer_idx: usize,
+        is_sliding: bool,
+        tp: TpConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let self_attn = Gemma2Attention::load_fused_tp(
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            is_sliding,
+            tp,
+            device.compute_stream,
+        )?;
+        let mlp = Gemma2MLP::load_fused_tp(
+            weights,
+            &format!("{prefix}.mlp"),
+            config.intermediate_size,
+            tp,
+            device.compute_stream,
+        )?;
+        // Norms are NOT sharded.
+        let input_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let post_attention_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let pre_feedforward_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.pre_feedforward_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let post_feedforward_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.post_feedforward_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            pre_feedforward_layernorm,
+            post_feedforward_layernorm,
+        })
+    }
+}
+
+impl Gemma2Model {
+    /// Load model backbone with TP sharding.
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        config: &Gemma2Config,
+        dtype: DType,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let is_sliding = i < config.layer_is_sliding.len() && config.layer_is_sliding[i];
+            let layer = Gemma2DecoderLayer::load_tp(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                is_sliding,
+                tp,
+                dtype,
+                device,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = GemmaRmsNorm::load(weights, "model.norm", config.rms_norm_eps, dtype, device)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embed_scale: (config.hidden_size as f32).sqrt(),
+        })
+    }
+}
+
+impl Gemma2ForCausalLM {
+    /// Load the full model with TP sharding.
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        config: &Gemma2Config,
+        dtype: DType,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = Gemma2Model::load_tp(weights, config, dtype, tp, device)?;
+        // Gemma2 always tied embeddings.
+        let lm_head = Linear::new(model.embed_tokens.weight, None);
+        Ok(Self {
+            model,
+            lm_head,
+            final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
     }
 }

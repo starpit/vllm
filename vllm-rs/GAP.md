@@ -108,17 +108,18 @@
 
   Effort: GGUF requires either porting candle's QCudaStorage approach or writing dequant-on-the-fly kernels. BnB is lower priority.
 
-  3. Tensor Parallelism (TP)
+  3. ~~Tensor Parallelism (TP)~~ — **DONE**
 
-  CudaWorker has none vs CandleWorker which has full NCCL-based TP:
+  CudaWorker now has full NCCL-based TP, matching CandleWorker:
 
-  - No ColumnParallelLinear / RowParallelLinear / VocabParallelEmbedding equivalents
-  - No NCCL process group integration
-  - No rank/world_size-aware weight sharding at load time
-  - No MultiprocExecutor wiring
-
-  Effort: Medium-large. Need parallel layer types in vllm-cuda, NCCL FFI from GpuTensor (not candle Tensor), and weight-sharding logic in
-  GpuWeights.
+  - ColumnParallelLinear / RowParallelLinear / VocabParallelEmbedding in `vllm-cuda/src/layers.rs`
+  - NcclGroup wrapping cudarc NCCL FFI for all-reduce/all-gather on GpuTensor (`vllm-cuda/src/nccl.rs`)
+  - CPU-side weight sharding via `take_shard()`/`take_shard_into()` in GpuWeights
+  - `load_fused_tp()` on LLaMA/Qwen2/Gemma2 attention + MLP
+  - NCCL all-reduce after row-parallel layers (o_proj, down_proj), all-gather after lm_head
+  - `initialize_stack_tp()` with concurrent NCCL init + profiling + warmup on scoped threads
+  - ThreadPoolExecutor dispatches execute_model concurrently across ranks
+  - E2E verified: TP=2 Qwen2.5-0.5B on 2x L40S (nick3)
 
   4. Missing Worker Features
 
@@ -138,6 +139,8 @@
   │ Device auto-detection     │ yes           │ no (hardcoded CUDA)       │
   ├───────────────────────────┼───────────────┼───────────────────────────┤
   │ CPU fallback              │ yes           │ no (by design)            │
+  ├───────────────────────────┼───────────────┼───────────────────────────┤
+  │ Tensor parallelism (NCCL) │ yes           │ yes (TP=2 E2E verified)   │
   └───────────────────────────┴───────────────┴───────────────────────────┘
 
   5. Sampling — FULL GPU PARITY
@@ -314,7 +317,7 @@
   4. GGUF support: Either port candle's QCudaStorage approach or add dequant kernels
   5. ~~MoE kernel + models: Fused MoE GEMM, then port Mixtral/Qwen MoE/Qwen3 MoE~~ — **DONE** (WMMA tensor-core kernel, 3 models)
   6. DeepSeek V2/V3 (MLA): Most complex arch — absorbed-MLA attention, MoE
-  7. Tensor parallelism: Parallel layers, NCCL, multi-GPU init
+  7. ~~Tensor parallelism: Parallel layers, NCCL, multi-GPU init~~ — **DONE** (TP=2 Qwen2.5-0.5B E2E verified)
   8. Remaining dense archs: Command R, Qwen3-Next
   9. ~~Sampling perf: Fused penalty kernel on GPU, no CPU fallback~~ — **DONE**
   10. LoRA, speculative decoding: Feature parity on worker traits (embeddings done)
@@ -322,5 +325,5 @@
   12. MoE perf tuning: Inline PTX mma, tile autoselection, L2 grouping (see section 6)
   13. Quantized MoE: FP8/INT8/INT4 expert weights
 
-  The critical path is items 2 and 4. Items 1, 3, 5, 9 are done. That covers the vast majority of real-world CUDA usage
-  (dense + MoE LLaMA-family models in FP16/BF16 with correct sampling). TP and quantization are next.
+  The critical path is item 4 (GGUF). Items 1, 2, 3, 5, 7, 9 are done. That covers dense + MoE LLaMA-family models
+  in FP16/BF16 with correct sampling, GPTQ/AWQ quantization, and multi-GPU tensor parallelism.

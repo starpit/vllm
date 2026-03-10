@@ -32,7 +32,7 @@ fn cuda_build() {
     let cache_str = cache_dir.to_string_lossy().to_string();
 
     // 1. vllm fused kernels (merged from vllm-kernels + embedding gather).
-    let vllm_sources = vec![
+    let vllm_sources = [
         "csrc/layernorm_kernels.cu",
         "csrc/activation_kernels.cu",
         "csrc/pos_encoding_kernels.cu",
@@ -48,7 +48,7 @@ fn cuda_build() {
         "csrc/awq_dequant_kernels.cu",
         "csrc/embedding_kernels.cu",
     ];
-    let vllm_watch = vec!["csrc/vec_utils.cuh"];
+    let vllm_watch = ["csrc/vec_utils.cuh"];
 
     rerun_files.extend(vllm_sources.iter().map(|s| s.to_string()));
     rerun_files.extend(vllm_watch.iter().map(|s| s.to_string()));
@@ -67,7 +67,7 @@ fn cuda_build() {
     println!("cargo:rustc-link-lib=static=vllm_kernels");
 
     // 2. Marlin W4A16 fused GEMM kernels.
-    let marlin_sources = vec![
+    let marlin_sources = [
         "csrc/marlin/marlin_gemm.cu",
         "csrc/marlin/gptq_marlin_repack.cu",
         "csrc/marlin/awq_marlin_repack.cu",
@@ -76,7 +76,7 @@ fn cuda_build() {
         "csrc/marlin/sm80_kernel_float16_u4b8_float16.cu",
         "csrc/marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu",
     ];
-    let marlin_watch = vec![
+    let marlin_watch = [
         "csrc/marlin/marlin.cuh",
         "csrc/marlin/kernel.h",
         "csrc/marlin/kernel_selector.h",

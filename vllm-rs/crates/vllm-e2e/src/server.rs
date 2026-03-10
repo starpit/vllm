@@ -469,6 +469,9 @@ fn resolve_binary_path() -> Result<std::path::PathBuf> {
         if cfg!(feature = "cuda") {
             features.push("cuda");
         }
+        if cfg!(feature = "nccl") {
+            features.push("nccl");
+        }
         if cfg!(feature = "metal") {
             features.push("metal");
         }

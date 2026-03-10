@@ -64,6 +64,10 @@ pub struct CudaWorkerConfig {
     pub pooling_strategy: String,
     /// Whether the worker runs in pooling mode (--runner pooling).
     pub is_pooling: bool,
+    /// Tensor parallelism rank (0 = single GPU / rank 0).
+    pub tp_rank: usize,
+    /// Tensor parallelism world size (1 = no TP).
+    pub tp_world_size: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +143,19 @@ impl CudaModel {
             Self::Mixtral(m) => m.lm_head.in_features(),
             Self::Qwen2Moe(m) => m.lm_head.in_features(),
             Self::Qwen3Moe(m) => m.lm_head.in_features(),
+        }
+    }
+
+    /// Inject NCCL process group into all model layers for TP.
+    #[cfg(feature = "nccl")]
+    fn set_tp_group(&mut self, group: std::sync::Arc<vllm_cuda::nccl::NcclGroup>) {
+        match self {
+            Self::Llama(m) => m.set_tp_group(group),
+            Self::Qwen2(m) => m.0.set_tp_group(group),
+            Self::Gemma2(m) => m.set_tp_group(group),
+            _ => {
+                tracing::warn!("set_tp_group not implemented for this architecture");
+            }
         }
     }
 
@@ -1017,6 +1034,19 @@ impl CudaWorker {
             grammar_processor: GrammarMaskProcessor::new(),
             batch_changed: false,
             batch_req_ids: Vec::new(),
+        }
+    }
+
+    /// Expose the GpuDevice (for NCCL stream access during TP init).
+    pub fn device_ref(&self) -> Option<&GpuDevice> {
+        self.device.as_ref()
+    }
+
+    /// Inject NCCL process group into the loaded model for TP communication.
+    #[cfg(feature = "nccl")]
+    pub fn set_tp_group(&mut self, group: std::sync::Arc<vllm_cuda::nccl::NcclGroup>) {
+        if let Some(ref mut model) = self.model {
+            model.set_tp_group(group);
         }
     }
 
@@ -2075,6 +2105,14 @@ impl Worker for CudaWorker {
         }
 
         // 7. Construct model based on architecture.
+        let tp_world = self.config.tp_world_size;
+        let tp_rank = self.config.tp_rank;
+        let use_tp = tp_world > 1;
+        let tp = vllm_cuda::model::llama::TpConfig {
+            rank: tp_rank,
+            world_size: tp_world,
+        };
+
         let model = match arch.as_str() {
             "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen3ForCausalLM" | "Phi3ForCausalLM" => {
                 let config = llama_config_from_hf(&hf_config)?;
@@ -2084,6 +2122,14 @@ impl Worker for CudaWorker {
                         &config,
                         dtype,
                         &qconfig,
+                        device,
+                    )
+                } else if use_tp {
+                    vllm_cuda::model::llama::LlamaForCausalLM::load_tp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        tp,
                         device,
                     )
                 } else {
@@ -2109,6 +2155,14 @@ impl Worker for CudaWorker {
                         &qconfig,
                         device,
                     )
+                } else if use_tp {
+                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_tp(
+                        &mut weights,
+                        &qwen2_config,
+                        dtype,
+                        tp,
+                        device,
+                    )
                 } else {
                     vllm_cuda::model::qwen2::Qwen2ForCausalLM::load(
                         &mut weights,
@@ -2128,6 +2182,14 @@ impl Worker for CudaWorker {
                         &config,
                         dtype,
                         &qconfig,
+                        device,
+                    )
+                } else if use_tp {
+                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_tp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        tp,
                         device,
                     )
                 } else {

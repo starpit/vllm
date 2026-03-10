@@ -7,10 +7,15 @@
 
 use anyhow::Result;
 
+use std::sync::Arc;
+
 use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::cublas::CublasHandle;
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
+
+#[cfg(feature = "nccl")]
+use crate::nccl::NcclGroup;
 
 // ---------------------------------------------------------------------------
 // Linear
@@ -355,6 +360,156 @@ impl RmsNorm {
 
     // forward() will be implemented when we wire the existing CUDA kernels
     // from vllm-kernels to accept GpuTensor raw pointers.
+}
+
+// ---------------------------------------------------------------------------
+// Tensor-parallel layer wrappers
+// ---------------------------------------------------------------------------
+
+/// Column-parallel linear: shards output dim (dim=0 of weight).
+///
+/// After forward, optionally all-gathers output across ranks to reconstruct
+/// the full output (used for lm_head). For most uses (QKV, gate_up), no
+/// all-gather is needed because the downstream layer consumes the shard.
+pub struct ColumnParallelLinear {
+    pub inner: LinearLayer,
+    pub gather_output: bool,
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
+}
+
+impl ColumnParallelLinear {
+    pub fn new(inner: LinearLayer, gather_output: bool) -> Self {
+        Self {
+            inner,
+            gather_output,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        }
+    }
+
+    /// Forward: y = x @ W_shard^T, optionally all-gather.
+    pub unsafe fn forward(
+        &self,
+        x: GpuTensor,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> GpuTensor {
+        let out = self.inner.forward(x, cublas, alloc, stream);
+
+        #[cfg(feature = "nccl")]
+        if self.gather_output
+            && let Some(ref group) = self.tp_group
+        {
+            return group.all_gather(out, alloc);
+        }
+
+        out
+    }
+
+    pub fn out_features(&self) -> usize {
+        self.inner.out_features()
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.inner.in_features()
+    }
+
+    #[cfg(feature = "nccl")]
+    pub fn set_tp_group(&mut self, group: Arc<NcclGroup>) {
+        self.tp_group = Some(group);
+    }
+}
+
+/// Row-parallel linear: shards input dim (dim=1 of weight).
+///
+/// After forward, all-reduces output across ranks (each rank computed a
+/// partial sum). Bias is added AFTER the all-reduce.
+pub struct RowParallelLinear {
+    pub inner: LinearLayer,
+    /// Bias added after all-reduce (not inside the GEMM).
+    pub bias: Option<GpuTensor>,
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
+}
+
+impl RowParallelLinear {
+    pub fn new(inner: LinearLayer, bias: Option<GpuTensor>) -> Self {
+        Self {
+            inner,
+            bias,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        }
+    }
+
+    /// Forward: y = all_reduce(x @ W_shard^T) + bias.
+    pub unsafe fn forward(
+        &self,
+        x: GpuTensor,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> GpuTensor {
+        let out = self.inner.forward(x, cublas, alloc, stream);
+
+        #[cfg(feature = "nccl")]
+        if let Some(ref group) = self.tp_group {
+            group.all_reduce_inplace(out).expect("all_reduce failed");
+        }
+
+        if let Some(bias) = self.bias {
+            crate::kernels::bias_add_inplace(out, bias, stream);
+        }
+
+        out
+    }
+
+    pub fn out_features(&self) -> usize {
+        self.inner.out_features()
+    }
+
+    #[cfg(feature = "nccl")]
+    pub fn set_tp_group(&mut self, group: Arc<NcclGroup>) {
+        self.tp_group = Some(group);
+    }
+}
+
+/// Vocab-parallel embedding: shards vocab rows across ranks.
+///
+/// Each rank holds rows `[rank * shard_size .. (rank+1) * shard_size]`.
+/// Tokens outside the local range produce zeros. All-reduce sums partial
+/// results to reconstruct the full embedding.
+pub struct VocabParallelEmbedding {
+    pub inner: Embedding,
+    /// Global vocab start offset for this rank's shard.
+    pub vocab_start: usize,
+    /// Global vocab end offset (exclusive) for this rank's shard.
+    pub vocab_end: usize,
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
+}
+
+impl VocabParallelEmbedding {
+    pub fn new(inner: Embedding, vocab_start: usize, vocab_end: usize) -> Self {
+        Self {
+            inner,
+            vocab_start,
+            vocab_end,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        }
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.inner.hidden_size()
+    }
+
+    #[cfg(feature = "nccl")]
+    pub fn set_tp_group(&mut self, group: Arc<NcclGroup>) {
+        self.tp_group = Some(group);
+    }
 }
 
 // ---------------------------------------------------------------------------

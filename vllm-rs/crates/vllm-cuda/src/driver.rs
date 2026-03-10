@@ -52,10 +52,15 @@ pub unsafe fn device_get_num_sm(device: CUdevice) -> Result<i32> {
     Ok(value)
 }
 
-/// Create a CUDA context on the given device.
+/// Retain the primary CUDA context on the given device.
+///
+/// Uses the primary context (shared with the CUDA runtime API) rather than
+/// creating a standalone context. This is required for NCCL compatibility —
+/// NCCL's internal proxy threads use the runtime API and expect the primary context.
 pub unsafe fn ctx_create(device: CUdevice) -> Result<CUcontext> {
     let mut ctx: CUcontext = std::ptr::null_mut();
-    check(sys::cuCtxCreate_v2(&mut ctx, 0, device))?;
+    check(sys::cuDevicePrimaryCtxRetain(&mut ctx, device))?;
+    check(sys::cuCtxSetCurrent(ctx))?;
     Ok(ctx)
 }
 

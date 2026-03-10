@@ -437,6 +437,131 @@ impl GpuWeights {
         self.stream
     }
 
+    // -----------------------------------------------------------------------
+    // Tensor-parallel sharding (CPU-side slice → GPU)
+    // -----------------------------------------------------------------------
+
+    /// Remove a tensor by name, slice it along `dim` for tensor parallelism,
+    /// and copy only the shard to GPU. Returns a GPU tensor of the shard.
+    ///
+    /// For dim=0 sharding (column parallel): contiguous slice of rows.
+    /// For dim=1 sharding (row parallel): strided extraction of columns,
+    /// copied row-by-row into a contiguous pinned buffer before H2D.
+    pub fn take_shard(
+        &mut self,
+        name: &str,
+        dim: usize,
+        rank: usize,
+        world_size: usize,
+    ) -> Result<GpuTensor> {
+        let cpu_ref = self
+            .tensors
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+
+        let (data, shard_shape, dtype) = self.shard_cpu_data(&cpu_ref, dim, rank, world_size);
+
+        let size_bytes = shard_shape.iter().product::<usize>() * dtype.size_bytes();
+        let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
+        unsafe {
+            driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
+        }
+
+        Ok(unsafe { GpuTensor::new(gpu_ptr, &shard_shape, dtype) })
+    }
+
+    /// Copy a shard of a tensor directly to an offset within an existing GPU buffer.
+    ///
+    /// Used for fused TP weight loading (e.g. QKV shards concatenated into one buffer).
+    /// Returns the number of bytes written.
+    pub unsafe fn take_shard_into(
+        &mut self,
+        name: &str,
+        dim: usize,
+        rank: usize,
+        world_size: usize,
+        dst: *mut u8,
+        stream: CUstream,
+    ) -> Result<usize> {
+        let cpu_ref = self
+            .tensors
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+
+        let (data, shard_shape, dtype) = self.shard_cpu_data(&cpu_ref, dim, rank, world_size);
+
+        let size_bytes = shard_shape.iter().product::<usize>() * dtype.size_bytes();
+        driver::memcpy_htod_async(dst, data, size_bytes, stream)?;
+
+        Ok(size_bytes)
+    }
+
+    /// Internal: extract a shard from CPU tensor data. Returns (ptr, shard_shape, dtype).
+    ///
+    /// For dim=0: returns a pointer into the original data (contiguous slice).
+    /// For dim=1: copies strided columns into the pinned cast buffer, returns pointer to that.
+    fn shard_cpu_data(
+        &mut self,
+        cpu_ref: &CpuTensorRef,
+        dim: usize,
+        rank: usize,
+        world_size: usize,
+    ) -> (*const u8, Vec<usize>, DType) {
+        assert!(!cpu_ref.shape.is_empty(), "cannot shard scalar");
+        assert!(dim < cpu_ref.shape.len(), "dim out of range");
+        let full_size = cpu_ref.shape[dim];
+        assert!(
+            full_size.is_multiple_of(world_size),
+            "dim {dim} size {full_size} not divisible by world_size {world_size}"
+        );
+        let shard_size = full_size / world_size;
+
+        // Apply dtype casting first if needed.
+        let (src_data, _src_bytes, dtype) = self.maybe_cast_cpu(cpu_ref);
+
+        let elem_size = dtype.size_bytes();
+        let mut shard_shape = cpu_ref.shape.clone();
+        shard_shape[dim] = shard_size;
+
+        if dim == 0 {
+            // Contiguous slice: rows [rank*shard_size .. (rank+1)*shard_size].
+            // Each row has product(shape[1:]) elements.
+            let row_elems: usize = cpu_ref.shape[1..].iter().product();
+            let row_bytes = row_elems * elem_size;
+            let offset = rank * shard_size * row_bytes;
+            let data = unsafe { src_data.add(offset) };
+            (data, shard_shape, dtype)
+        } else if dim == 1 && cpu_ref.shape.len() == 2 {
+            // Strided column extraction for 2D tensor [rows, cols].
+            // Extract columns [rank*shard_size .. (rank+1)*shard_size] from each row.
+            let rows = cpu_ref.shape[0];
+            let cols = cpu_ref.shape[1];
+            let col_start = rank * shard_size;
+            let shard_row_bytes = shard_size * elem_size;
+            let needed = rows * shard_row_bytes;
+            self.ensure_pinned_buf(needed);
+
+            let dst = self.cast_pinned.0;
+            for r in 0..rows {
+                let src_offset = (r * cols + col_start) * elem_size;
+                let dst_offset = r * shard_row_bytes;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src_data.add(src_offset),
+                        dst.add(dst_offset),
+                        shard_row_bytes,
+                    );
+                }
+            }
+            (dst as *const u8, shard_shape, dtype)
+        } else {
+            panic!(
+                "take_shard: unsupported dim={dim} for {}D tensor",
+                cpu_ref.shape.len()
+            );
+        }
+    }
+
     /// Take a tensor's raw CPU bytes without uploading to GPU.
     /// Returns (data_bytes, shape, dtype).
     pub fn take_cpu(&mut self, name: &str) -> Result<(Vec<u8>, Vec<usize>, DType)> {

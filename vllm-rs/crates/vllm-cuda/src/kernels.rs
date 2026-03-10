@@ -4552,6 +4552,10 @@ pub unsafe fn marlin_gemm(
 ) -> OwnedTensor {
     let out = alloc.alloc_tensor(&[size_m, size_n], a.dtype());
 
+    // FP32 reduction buffer — matches Python vLLM's USE_FP32_REDUCE_DEFAULT=True.
+    // Partial sums across K-splits are accumulated in f32 for numerical accuracy.
+    let c_tmp = alloc.alloc_tensor(&[size_m, size_n], DType::F32);
+
     let zeros_ptr = b_zeros.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
     let g_idx_ptr = g_idx.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
     let perm_ptr = perm.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
@@ -4572,7 +4576,7 @@ pub unsafe fn marlin_gemm(
             perm_ptr,
             bias_ptr,
             workspace.raw_ptr() as *mut c_void,
-            std::ptr::null_mut(), // c_tmp (not needed with use_fp32_reduce=false)
+            c_tmp.raw_ptr() as *mut c_void,
             std::ptr::null_mut(), // a_tmp (act_order permutation — not needed)
             size_m as c_int,
             size_n as c_int,
@@ -4584,7 +4588,7 @@ pub unsafe fn marlin_gemm(
             is_k_full,
             has_zp,
             false, // is_zp_float
-            false, // use_fp32_reduce
+            true,  // use_fp32_reduce (matches Python vLLM default)
             has_bias,
             b_type_id as c_int,
             stream,
@@ -4600,7 +4604,7 @@ pub unsafe fn marlin_gemm(
             perm_ptr,
             bias_ptr,
             workspace.raw_ptr() as *mut c_void,
-            std::ptr::null_mut(),
+            c_tmp.raw_ptr() as *mut c_void,
             std::ptr::null_mut(),
             size_m as c_int,
             size_n as c_int,
@@ -4612,7 +4616,7 @@ pub unsafe fn marlin_gemm(
             is_k_full,
             has_zp,
             false, // is_zp_float
-            false, // use_fp32_reduce
+            true,  // use_fp32_reduce (matches Python vLLM default)
             has_bias,
             b_type_id as c_int,
             stream,

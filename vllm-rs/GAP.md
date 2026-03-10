@@ -76,7 +76,7 @@
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
   │ Fused gate+up GEMM (quant)  │ yes        │ YES      │ Concat on CPU, single repack + GEMM      │
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
-  │ use_fp32_reduce              │ yes (dflt) │ no       │ Python defaults true; Rust passes false   │
+  │ use_fp32_reduce              │ yes (dflt) │ YES      │ Matches Python USE_FP32_REDUCE_DEFAULT    │
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
   │ In-kernel bias (permuted)   │ yes        │ no       │ Python uses marlin_permute_bias()         │
   ├─────────────────────────────┼────────────┼──────────┼──────────────────────────────────────────┤
@@ -101,7 +101,7 @@
 
   **Key gaps to close (priority order):**
   1. ~~Fused QKV/gate_up at load time~~ — **DONE** (5→2 GEMMs per layer, CPU concat + single repack)
-  2. use_fp32_reduce=true — match Python default for numerical accuracy
+  2. ~~use_fp32_reduce=true~~ — **DONE** (matches Python USE_FP32_REDUCE_DEFAULT=True)
   3. ~~AWQ E2E testing~~ — **DONE** (Qwen2.5-0.5B-Instruct-AWQ, nick4 L40S)
   4. ~~Wire LLaMA/Gemma2/Granite for quantized loading~~ — **DONE** (LLaMA, Qwen2, Gemma2, Granite all wired)
   5. desc_act support — needed for some GPTQ models

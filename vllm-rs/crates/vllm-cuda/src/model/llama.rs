@@ -611,9 +611,9 @@ impl LlamaAttention {
 /// A single LLaMA decoder layer.
 pub struct LlamaDecoderLayer {
     pub self_attn: LlamaAttention,
-    mlp: LlamaMLP,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    pub mlp: LlamaMLP,
+    pub input_layernorm: RmsNorm,
+    pub post_attention_layernorm: RmsNorm,
     /// Granite residual multiplier (1.0 = no-op for LLaMA).
     pub residual_multiplier: f32,
 }

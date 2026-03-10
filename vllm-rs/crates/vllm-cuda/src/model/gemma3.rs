@@ -461,11 +461,11 @@ impl Gemma3Attention {
 
 pub struct Gemma3DecoderLayer {
     pub self_attn: Gemma3Attention,
-    mlp: Gemma2MLP,
-    input_layernorm: GemmaRmsNorm,
-    post_attention_layernorm: GemmaRmsNorm,
-    pre_feedforward_layernorm: GemmaRmsNorm,
-    post_feedforward_layernorm: GemmaRmsNorm,
+    pub mlp: Gemma2MLP,
+    pub input_layernorm: GemmaRmsNorm,
+    pub post_attention_layernorm: GemmaRmsNorm,
+    pub pre_feedforward_layernorm: GemmaRmsNorm,
+    pub post_feedforward_layernorm: GemmaRmsNorm,
 }
 
 impl Gemma3DecoderLayer {
@@ -716,13 +716,13 @@ impl Gemma3DecoderLayer {
 // ---------------------------------------------------------------------------
 
 pub struct Gemma3Model {
-    embed_tokens: Embedding,
+    pub embed_tokens: Embedding,
     pub layers: Vec<Gemma3DecoderLayer>,
-    norm: GemmaRmsNorm,
-    rotary_global: RotaryCache,
-    rotary_local: RotaryCache,
-    layer_is_sliding: Vec<bool>,
-    embed_scale: f32,
+    pub norm: GemmaRmsNorm,
+    pub rotary_global: RotaryCache,
+    pub rotary_local: RotaryCache,
+    pub layer_is_sliding: Vec<bool>,
+    pub embed_scale: f32,
 }
 
 impl Gemma3Model {

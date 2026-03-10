@@ -86,7 +86,7 @@ impl GemmaRmsNorm {
 
 /// Add 1.0 to every element of a 1D GPU weight tensor.
 /// Done via CPU round-trip (tiny vector, only during init).
-unsafe fn add_one_to_weight(
+pub unsafe fn add_one_to_weight(
     weight: &mut GpuTensor,
     dtype: DType,
     device: &GpuDevice,

@@ -21,7 +21,8 @@ use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
-use crate::layers::{Embedding, Linear, LinearLayer, RmsNorm};
+use crate::layers::{Embedding, Linear, LinearLayer};
+use crate::model::gemma2::{GemmaRmsNorm, add_one_to_weight};
 use crate::model::llama::{LlamaAttention, LlamaConfig, LlamaMLP, RotaryCache};
 use crate::model::qwen3_moe::{Qwen3MoeConfig, Qwen3MoeDecoderLayer, Qwen3MoeMlp};
 use crate::tensor::GpuTensor;
@@ -71,6 +72,8 @@ pub struct Qwen3NextConfig {
 
     /// Per-layer type: "full_attention" or "linear_attention".
     pub layer_types: Vec<String>,
+    /// Whether to apply per-layer scaling (attn_layer_scale, ffn_layer_scale).
+    pub layer_scale: bool,
 }
 
 impl Qwen3NextConfig {
@@ -264,6 +267,33 @@ impl GdnStatePool {
     pub fn ssm_state_for_layer(&self, _gdn_layer_idx: usize) -> GpuTensor {
         self.ssm_states
     }
+
+    /// Zero out all GDN state (conv + ssm) for a given slot.
+    /// Call this when a new sequence is assigned to the slot.
+    pub unsafe fn clear_slot(
+        &self,
+        slot_idx: usize,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<()> {
+        let state_len = self.kernel_size - 1;
+        let conv_bytes_per_layer = self.conv_dim * state_len * 4; // f32
+        let ssm_bytes_per_layer = self.num_v_heads * self.head_v_dim * self.head_k_dim * 4;
+
+        for layer in 0..self.num_gdn_layers {
+            let flat_idx = slot_idx * self.num_gdn_layers + layer;
+
+            // Clear conv state
+            let conv_offset = flat_idx * conv_bytes_per_layer;
+            let conv_ptr = self.conv_states.raw_ptr().add(conv_offset);
+            crate::driver::memset_d8(conv_ptr, 0, conv_bytes_per_layer, stream)?;
+
+            // Clear ssm state
+            let ssm_offset = flat_idx * ssm_bytes_per_layer;
+            let ssm_ptr = self.ssm_states.raw_ptr().add(ssm_offset);
+            crate::driver::memset_d8(ssm_ptr, 0, ssm_bytes_per_layer, stream)?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +351,22 @@ impl GdnWeights {
         crate::driver::stream_synchronize(stream)?;
         crate::driver::mem_free_host(host)?;
         Ok(GpuTensor::new(ptr, shape, DType::F32))
+    }
+
+    /// Upload a CPU i32 vec to GPU as a GpuTensor (I32).
+    unsafe fn upload_i32(
+        data: &[i32],
+        shape: &[usize],
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<GpuTensor> {
+        let nbytes = data.len() * 4;
+        let ptr = crate::driver::mem_alloc(nbytes)?;
+        let host = crate::driver::mem_alloc_host(nbytes)?;
+        std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, host, nbytes);
+        crate::driver::memcpy_htod_async(ptr, host, nbytes, stream)?;
+        crate::driver::stream_synchronize(stream)?;
+        crate::driver::mem_free_host(host)?;
+        Ok(GpuTensor::new(ptr, shape, DType::I32))
     }
 
     /// Load GDN weights from safetensors.
@@ -438,17 +484,7 @@ impl GdnWeights {
             self.in_proj_ba
                 .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
 
-        // 2. Split QKVZ and BA on GPU.
-        // QKVZ layout: [num_tokens, 2*key_dim + 2*value_dim]
-        // Grouped by k-heads: [num_tokens, num_k_heads, (head_k + head_k + v_per_k*head_v + v_per_k*head_v)]
-        // For now, we need to rearrange on GPU. This is a data shuffle kernel.
-        // TODO: Write a fused QKVZ split kernel. For now, download/upload is acceptable
-        // for the split only (the heavy compute stays on GPU).
-        let qkvz_cpu = download_to_cpu_f32(qkvz.as_gpu_tensor(), stream);
-        let ba_cpu = download_to_cpu_f32(ba.as_gpu_tensor(), stream);
-        drop(qkvz);
-        drop(ba);
-
+        // 2. Split QKVZ and BA on GPU using fused kernel (no CPU round-trip).
         let key_dim = self.key_dim;
         let value_dim = self.value_dim;
         let conv_dim = self.conv_dim;
@@ -456,123 +492,127 @@ impl GdnWeights {
         let num_v_heads = self.num_v_heads;
         let head_k_dim = self.head_k_dim;
         let head_v_dim = self.head_v_dim;
-        let v_per_k = num_v_heads / num_k_heads;
-        let per_group = head_k_dim + head_k_dim + v_per_k * head_v_dim + v_per_k * head_v_dim;
 
-        // Split QKVZ grouped by k-heads.
-        let mut all_q = vec![0.0f32; num_tokens * key_dim];
-        let mut all_k = vec![0.0f32; num_tokens * key_dim];
-        let mut all_v = vec![0.0f32; num_tokens * value_dim];
-        let mut all_z = vec![0.0f32; num_tokens * value_dim];
+        let (_q_split, _k_split, _v_split, z_owned, a_owned, b_owned, mixed_owned) =
+            kernels::gdn_qkvz_split(
+                qkvz.as_gpu_tensor(),
+                ba.as_gpu_tensor(),
+                num_tokens,
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                key_dim,
+                value_dim,
+                conv_dim,
+                &mut device.caching,
+                stream,
+            );
+        drop(qkvz);
+        drop(ba);
 
-        for t in 0..num_tokens {
-            let qkvz = &qkvz_cpu[t * (2 * key_dim + 2 * value_dim)..][..per_group * num_k_heads];
-            for g in 0..num_k_heads {
-                let group = &qkvz[g * per_group..(g + 1) * per_group];
-                all_q[t * key_dim + g * head_k_dim..][..head_k_dim]
-                    .copy_from_slice(&group[..head_k_dim]);
-                all_k[t * key_dim + g * head_k_dim..][..head_k_dim]
-                    .copy_from_slice(&group[head_k_dim..2 * head_k_dim]);
-                for vv in 0..v_per_k {
-                    let vh = g * v_per_k + vv;
-                    all_v[t * value_dim + vh * head_v_dim..][..head_v_dim]
-                        .copy_from_slice(&group[2 * head_k_dim + vv * head_v_dim..][..head_v_dim]);
-                    all_z[t * value_dim + vh * head_v_dim..][..head_v_dim].copy_from_slice(
-                        &group[2 * head_k_dim + v_per_k * head_v_dim + vv * head_v_dim..]
-                            [..head_v_dim],
-                    );
-                }
-            }
-        }
+        let mixed_qkv_gpu = mixed_owned.as_gpu_tensor();
+        let a_gpu = a_owned.as_gpu_tensor();
+        let b_gpu = b_owned.as_gpu_tensor();
+        let z_gpu = z_owned.as_gpu_tensor();
 
-        // Split BA grouped by k-heads.
-        let mut all_b = vec![0.0f32; num_tokens * num_v_heads];
-        let mut all_a = vec![0.0f32; num_tokens * num_v_heads];
-        for t in 0..num_tokens {
-            let ba = &ba_cpu[t * 2 * num_v_heads..][..2 * num_v_heads];
-            for g in 0..num_k_heads {
-                let group = &ba[g * 2 * v_per_k..(g + 1) * 2 * v_per_k];
-                for vv in 0..v_per_k {
-                    let vh = g * v_per_k + vv;
-                    all_b[t * num_v_heads + vh] = group[vv];
-                    all_a[t * num_v_heads + vh] = group[v_per_k + vv];
-                }
-            }
-        }
-
-        // Concatenate Q, K, V for conv1d: [num_tokens, conv_dim].
-        let mut mixed_qkv = vec![0.0f32; num_tokens * conv_dim];
-        for t in 0..num_tokens {
-            mixed_qkv[t * conv_dim..][..key_dim].copy_from_slice(&all_q[t * key_dim..][..key_dim]);
-            mixed_qkv[t * conv_dim + key_dim..][..key_dim]
-                .copy_from_slice(&all_k[t * key_dim..][..key_dim]);
-            mixed_qkv[t * conv_dim + 2 * key_dim..][..value_dim]
-                .copy_from_slice(&all_v[t * value_dim..][..value_dim]);
-        }
-
-        // Upload split results to GPU.
-        let mixed_qkv_gpu = Self::upload_f32(&mixed_qkv, &[num_tokens, conv_dim], stream)
-            .expect("upload mixed_qkv");
-        let a_gpu = Self::upload_f32(&all_a, &[num_tokens, num_v_heads], stream).expect("upload a");
-        let b_gpu = Self::upload_f32(&all_b, &[num_tokens, num_v_heads], stream).expect("upload b");
-        let z_gpu = Self::upload_f32(&all_z, &[num_tokens, value_dim], stream).expect("upload z");
+        // Transform state_indices: slot * num_gdn_layers + gdn_layer_idx
+        // for proper per-layer indexing into the state pool.
+        let num_gdn_layers = gdn_state_pool.num_gdn_layers;
+        let gdn_layer_idx = self.gdn_layer_idx;
+        let adjusted_indices = if num_gdn_layers > 1 {
+            let indices_cpu = download_to_cpu_i32(state_indices, stream);
+            let adjusted: Vec<i32> = indices_cpu
+                .iter()
+                .map(|&s| s * num_gdn_layers as i32 + gdn_layer_idx as i32)
+                .collect();
+            let t =
+                Self::upload_i32(&adjusted, &[num_seqs], stream).expect("upload adjusted_indices");
+            Some(t)
+        } else {
+            None
+        };
+        let eff_state_indices = adjusted_indices.as_ref().map_or(state_indices, |t| *t);
 
         // 3. Causal conv1d on GPU.
         let conv_out = device
             .caching
             .alloc_tensor(&[num_tokens, conv_dim], DType::F32);
-        if num_tokens == 1 {
-            // Decode path: single-token update
+        if num_seqs == num_tokens {
+            // Decode path: one token per sequence — batched update.
             kernels::gdn_conv1d_update(
                 gdn_state_pool.conv_states,
                 mixed_qkv_gpu,
                 self.conv1d_weight,
                 conv_out.as_gpu_tensor(),
-                state_indices,
+                eff_state_indices,
                 conv_dim,
                 self.conv_kernel_size,
                 num_seqs,
                 stream,
             );
         } else {
-            // Prefill path
-            // For simplicity, process first sequence (TODO: batch prefill)
-            kernels::gdn_conv1d_prefill(
-                gdn_state_pool.conv_states,
-                mixed_qkv_gpu,
-                self.conv1d_weight,
-                conv_out.as_gpu_tensor(),
-                0, // slot_idx from state_indices[0] — need CPU readback
-                conv_dim,
-                self.conv_kernel_size,
-                num_tokens,
-                stream,
-            );
+            // Prefill path: iterate per sequence using cu_seqlens and state_indices.
+            // Read cu_seqlens and state_indices to CPU (small arrays).
+            let cu_seqlens_cpu = download_to_cpu_i32(cu_seqlens, stream);
+            let state_indices_cpu = download_to_cpu_i32(state_indices, stream);
+
+            for s in 0..num_seqs {
+                let seq_start = cu_seqlens_cpu[s] as usize;
+                let seq_end = cu_seqlens_cpu[s + 1] as usize;
+                let seq_len = seq_end - seq_start;
+                if seq_len == 0 {
+                    continue;
+                }
+                let raw_slot = state_indices_cpu[s] as usize;
+                let slot_idx = raw_slot * num_gdn_layers + gdn_layer_idx;
+
+                // Slice into the token dimension for this sequence.
+                let byte_offset = seq_start * conv_dim * 4; // f32 = 4 bytes
+                let x_view = GpuTensor::new(
+                    mixed_qkv_gpu.raw_ptr().add(byte_offset),
+                    &[seq_len, conv_dim],
+                    DType::F32,
+                );
+                let out_view = GpuTensor::new(
+                    conv_out.as_gpu_tensor().raw_ptr().add(byte_offset),
+                    &[seq_len, conv_dim],
+                    DType::F32,
+                );
+
+                kernels::gdn_conv1d_prefill(
+                    gdn_state_pool.conv_states,
+                    x_view,
+                    self.conv1d_weight,
+                    out_view,
+                    slot_idx,
+                    conv_dim,
+                    self.conv_kernel_size,
+                    seq_len,
+                    stream,
+                );
+            }
         }
 
-        // Split conv output into Q, K, V: download, split, re-upload as [T, H, D] tensors.
-        let conv_out_cpu = download_to_cpu_f32(conv_out.as_gpu_tensor(), stream);
+        // Split conv output into Q, K, V on GPU (no CPU round-trip).
+        let (q_owned, k_owned, v_owned) = kernels::gdn_conv_split(
+            conv_out.as_gpu_tensor(),
+            num_tokens,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            key_dim,
+            value_dim,
+            conv_dim,
+            &mut device.caching,
+            stream,
+        );
         drop(conv_out);
 
-        let mut q_data = vec![0.0f32; num_tokens * key_dim];
-        let mut k_data = vec![0.0f32; num_tokens * key_dim];
-        let mut v_data = vec![0.0f32; num_tokens * value_dim];
-        for t in 0..num_tokens {
-            q_data[t * key_dim..][..key_dim]
-                .copy_from_slice(&conv_out_cpu[t * conv_dim..][..key_dim]);
-            k_data[t * key_dim..][..key_dim]
-                .copy_from_slice(&conv_out_cpu[t * conv_dim + key_dim..][..key_dim]);
-            v_data[t * value_dim..][..value_dim]
-                .copy_from_slice(&conv_out_cpu[t * conv_dim + 2 * key_dim..][..value_dim]);
-        }
-
-        // Reshape to [T, H, D] for the recurrence kernel.
-        let q_gpu = Self::upload_f32(&q_data, &[num_tokens, num_k_heads, head_k_dim], stream)
-            .expect("upload q");
-        let k_gpu = Self::upload_f32(&k_data, &[num_tokens, num_k_heads, head_k_dim], stream)
-            .expect("upload k");
-        let v_gpu = Self::upload_f32(&v_data, &[num_tokens, num_v_heads, head_v_dim], stream)
-            .expect("upload v");
+        let q_gpu = q_owned.as_gpu_tensor();
+        let k_gpu = k_owned.as_gpu_tensor();
+        let v_gpu = v_owned.as_gpu_tensor();
 
         // 4. Fused gating: g, beta on GPU.
         let g_gpu = device
@@ -606,7 +646,7 @@ impl GdnWeights {
             beta_gpu.as_gpu_tensor(),
             o_gpu.as_gpu_tensor(),
             gdn_state_pool.ssm_states,
-            state_indices,
+            eff_state_indices,
             cu_seqlens,
             scale,
             num_seqs,
@@ -694,8 +734,10 @@ impl Qwen3NextFullAttention {
         prefix: &str,
         config: &Qwen3NextConfig,
         layer_idx: usize,
-        stream: cudarc::driver::sys::CUstream,
+        dtype: DType,
+        device: &GpuDevice,
     ) -> Result<Self> {
+        let stream = device.compute_stream;
         let num_q_heads = config.num_attention_heads;
         let num_kv_heads = config.num_kv_heads;
         let head_dim = config.head_dim;
@@ -748,16 +790,20 @@ impl Qwen3NextFullAttention {
 
         let o_proj = LinearLayer::Dense(Linear::load(weights, &format!("{prefix}.o_proj"))?);
 
-        // QK-norm weights (GemmaRMSNorm: weight + 1 applied later).
+        // QK-norm weights (GemmaRMSNorm convention: add +1 at load time).
         let q_norm_name = format!("{prefix}.q_norm.weight");
         let k_norm_name = format!("{prefix}.k_norm.weight");
         let q_norm_weight = if weights.contains(&q_norm_name) {
-            Some(weights.take(&q_norm_name)?)
+            let mut w = weights.take(&q_norm_name)?;
+            unsafe { add_one_to_weight(&mut w, dtype, device)? };
+            Some(w)
         } else {
             None
         };
         let k_norm_weight = if weights.contains(&k_norm_name) {
-            Some(weights.take(&k_norm_name)?)
+            let mut w = weights.take(&k_norm_name)?;
+            unsafe { add_one_to_weight(&mut w, dtype, device)? };
+            Some(w)
         } else {
             None
         };
@@ -1032,8 +1078,12 @@ pub enum Qwen3NextMlpVariant {
 pub struct Qwen3NextDecoderLayer {
     pub attn: Qwen3NextAttnVariant,
     pub mlp: Qwen3NextMlpVariant,
-    pub input_layernorm: RmsNorm,
-    pub post_attention_layernorm: RmsNorm,
+    pub input_layernorm: GemmaRmsNorm,
+    pub post_attention_layernorm: GemmaRmsNorm,
+    /// Optional layer scale applied after attention: x *= scale (pre-offset by +1).
+    pub attn_layer_scale: Option<GpuTensor>,
+    /// Optional layer scale applied after MLP: x *= scale (pre-offset by +1).
+    pub ffn_layer_scale: Option<GpuTensor>,
     /// KV cache layer index (only valid for full attention layers).
     pub kv_layer_idx: Option<usize>,
     /// GDN state index (only valid for linear attention layers).
@@ -1070,16 +1120,16 @@ impl Qwen3NextDecoderLayer {
             kernels::fused_add_rms_norm_inplace(
                 hs_gpu,
                 res_gpu,
-                self.input_layernorm.weight,
-                self.input_layernorm.eps,
+                self.input_layernorm.inner.weight,
+                self.input_layernorm.inner.eps,
                 stream,
             );
             (hidden_states, residual)
         } else {
             let normed = kernels::rms_norm(
                 *hidden_states,
-                self.input_layernorm.weight,
-                self.input_layernorm.eps,
+                self.input_layernorm.inner.weight,
+                self.input_layernorm.inner.eps,
                 &mut device.caching,
                 stream,
             );
@@ -1118,13 +1168,19 @@ impl Qwen3NextDecoderLayer {
         };
         drop(normed);
 
+        // Apply attention layer scale before residual add.
+        #[cfg(feature = "cuda")]
+        if let Some(ref scale) = self.attn_layer_scale {
+            kernels::broadcast_mul_inplace(*attn_output, *scale, stream);
+        }
+
         // Post-attention norm + residual.
         let res_gpu = *residual;
         kernels::fused_add_rms_norm_inplace(
             *attn_output,
             res_gpu,
-            self.post_attention_layernorm.weight,
-            self.post_attention_layernorm.eps,
+            self.post_attention_layernorm.inner.weight,
+            self.post_attention_layernorm.inner.eps,
             stream,
         );
 
@@ -1134,6 +1190,12 @@ impl Qwen3NextDecoderLayer {
             Qwen3NextMlpVariant::MoE(moe) => moe.forward_owned(*attn_output, device),
         };
         drop(attn_output);
+
+        // Apply MLP layer scale before residual add (residual is implicit in next layer).
+        #[cfg(feature = "cuda")]
+        if let Some(ref scale) = self.ffn_layer_scale {
+            kernels::broadcast_mul_inplace(*mlp_output, *scale, stream);
+        }
 
         (mlp_output, residual)
     }
@@ -1146,7 +1208,7 @@ impl Qwen3NextDecoderLayer {
 pub struct Qwen3NextModel {
     pub embed_tokens: Embedding,
     pub layers: Vec<Qwen3NextDecoderLayer>,
-    pub norm: RmsNorm,
+    pub norm: GemmaRmsNorm,
     pub rotary: RotaryCache,
     pub config: Qwen3NextConfig,
 }
@@ -1175,7 +1237,8 @@ impl Qwen3NextModel {
                     &format!("{prefix}.self_attn"),
                     config,
                     i,
-                    device.compute_stream,
+                    dtype,
+                    device,
                 )?;
                 let idx = kv_idx;
                 kv_idx += 1;
@@ -1214,28 +1277,60 @@ impl Qwen3NextModel {
                 Qwen3NextMlpVariant::Dense(dense)
             };
 
-            let input_layernorm = RmsNorm::load(
+            let input_layernorm = GemmaRmsNorm::load(
                 weights,
                 &format!("{prefix}.input_layernorm"),
                 config.rms_norm_eps,
+                dtype,
+                device,
             )?;
-            let post_attention_layernorm = RmsNorm::load(
+            let post_attention_layernorm = GemmaRmsNorm::load(
                 weights,
                 &format!("{prefix}.post_attention_layernorm"),
                 config.rms_norm_eps,
+                dtype,
+                device,
             )?;
+
+            // Layer scale weights (GemmaRMSNorm convention: +1 at load time).
+            let attn_layer_scale = if config.layer_scale {
+                let name = format!("{prefix}.attn_layer_scale");
+                if weights.contains(&name) {
+                    let mut w = weights.take(&name)?;
+                    unsafe { add_one_to_weight(&mut w, dtype, device)? };
+                    Some(w)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let ffn_layer_scale = if config.layer_scale {
+                let name = format!("{prefix}.ffn_layer_scale");
+                if weights.contains(&name) {
+                    let mut w = weights.take(&name)?;
+                    unsafe { add_one_to_weight(&mut w, dtype, device)? };
+                    Some(w)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             layers.push(Qwen3NextDecoderLayer {
                 attn,
                 mlp,
                 input_layernorm,
                 post_attention_layernorm,
+                attn_layer_scale,
+                ffn_layer_scale,
                 kv_layer_idx,
                 gdn_state_idx,
             });
         }
 
-        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let norm = GemmaRmsNorm::load(weights, "model.norm", config.rms_norm_eps, dtype, device)?;
         let rotary = unsafe {
             RotaryCache::new_partial(
                 config.head_dim,
@@ -1314,8 +1409,8 @@ impl Qwen3NextModel {
         kernels::fused_add_rms_norm_inplace(
             hs_gpu,
             res_gpu,
-            self.norm.weight,
-            self.norm.eps,
+            self.norm.inner.weight,
+            self.norm.inner.eps,
             device.compute_stream,
         );
         drop(residual);
@@ -1432,6 +1527,7 @@ impl Qwen3NextForCausalLM {
 // ---------------------------------------------------------------------------
 
 /// Download a GPU tensor to CPU as f32 (synchronous).
+#[allow(dead_code)]
 unsafe fn download_to_cpu_f32(
     tensor: GpuTensor,
     stream: cudarc::driver::sys::CUstream,
@@ -1460,6 +1556,22 @@ unsafe fn download_to_cpu_f32(
         _ => panic!("unsupported dtype for download: {:?}", tensor.dtype()),
     };
 
+    crate::driver::mem_free_host(host).expect("free host");
+    result
+}
+
+/// Download a GPU tensor to CPU as i32 (synchronous). Expects I32 or U32 dtype.
+unsafe fn download_to_cpu_i32(
+    tensor: GpuTensor,
+    stream: cudarc::driver::sys::CUstream,
+) -> Vec<i32> {
+    let num_elems = tensor.numel();
+    let nbytes = num_elems * 4;
+    let host = crate::driver::mem_alloc_host(nbytes).expect("host alloc");
+    crate::driver::memcpy_dtoh_async(host, tensor.as_ptr(), nbytes, stream).expect("dtoh");
+    crate::driver::stream_synchronize(stream).expect("sync");
+    let slice = std::slice::from_raw_parts(host as *const i32, num_elems);
+    let result = slice.to_vec();
     crate::driver::mem_free_host(host).expect("free host");
     result
 }

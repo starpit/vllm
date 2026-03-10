@@ -227,6 +227,29 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Broadcast multiply inplace: x[row, col] *= scale[col]
+    fn broadcast_mul_inplace_f16(
+        x: *mut u16,
+        scale: *const u16,
+        num_rows: i32,
+        d: i32,
+        stream: CUstream,
+    );
+    fn broadcast_mul_inplace_bf16(
+        x: *mut u16,
+        scale: *const u16,
+        num_rows: i32,
+        d: i32,
+        stream: CUstream,
+    );
+    fn broadcast_mul_inplace_f32(
+        x: *mut f32,
+        scale: *const f32,
+        num_rows: i32,
+        d: i32,
+        stream: CUstream,
+    );
+
     // Rotary embedding (in-place on q and k)
     fn rotary_embedding_f16(
         positions: *const u32,
@@ -1019,6 +1042,36 @@ pub unsafe fn gelu_and_mul_fused(
         ),
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast Multiply Inplace
+// ---------------------------------------------------------------------------
+
+/// `x[row, col] *= scale[col]` — in-place broadcast multiply.
+///
+/// * `x`: `[num_rows, d]` — mutated in-place
+/// * `scale`: `[d]`
+#[cfg(feature = "cuda")]
+pub unsafe fn broadcast_mul_inplace(x: GpuTensor, scale: GpuTensor, stream: CUstream) {
+    let num_rows = x.dim(0) as i32;
+    let d = x.dim(x.ndim() - 1) as i32;
+    match x.dtype() {
+        DType::F16 => {
+            broadcast_mul_inplace_f16(x.as_mut_ptr(), scale.as_ptr(), num_rows, d, stream)
+        }
+        DType::BF16 => {
+            broadcast_mul_inplace_bf16(x.as_mut_ptr(), scale.as_ptr(), num_rows, d, stream)
+        }
+        DType::F32 => broadcast_mul_inplace_f32(
+            x.as_mut_ptr() as *mut f32,
+            scale.as_ptr() as *const f32,
+            num_rows,
+            d,
+            stream,
+        ),
+        _ => panic!("broadcast_mul_inplace: unsupported dtype {:?}", x.dtype()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5040,6 +5093,87 @@ unsafe extern "C" {
         total_rows: c_int,
         stream: CUstream,
     );
+
+    // GDN QKVZ split kernel
+    fn gdn_qkvz_split_bf16(
+        qkvz: *const u16,
+        ba: *const u16,
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        z: *mut f32,
+        a: *mut f32,
+        b: *mut f32,
+        mixed: *mut f32,
+        num_tokens: c_int,
+        num_k_heads: c_int,
+        num_v_heads: c_int,
+        head_k_dim: c_int,
+        head_v_dim: c_int,
+        v_per_k: c_int,
+        key_dim: c_int,
+        value_dim: c_int,
+        qkvz_dim: c_int,
+        conv_dim: c_int,
+        stream: CUstream,
+    );
+    fn gdn_qkvz_split_f16(
+        qkvz: *const u16,
+        ba: *const u16,
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        z: *mut f32,
+        a: *mut f32,
+        b: *mut f32,
+        mixed: *mut f32,
+        num_tokens: c_int,
+        num_k_heads: c_int,
+        num_v_heads: c_int,
+        head_k_dim: c_int,
+        head_v_dim: c_int,
+        v_per_k: c_int,
+        key_dim: c_int,
+        value_dim: c_int,
+        qkvz_dim: c_int,
+        conv_dim: c_int,
+        stream: CUstream,
+    );
+    fn gdn_qkvz_split_f32(
+        qkvz: *const f32,
+        ba: *const f32,
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        z: *mut f32,
+        a: *mut f32,
+        b: *mut f32,
+        mixed: *mut f32,
+        num_tokens: c_int,
+        num_k_heads: c_int,
+        num_v_heads: c_int,
+        head_k_dim: c_int,
+        head_v_dim: c_int,
+        v_per_k: c_int,
+        key_dim: c_int,
+        value_dim: c_int,
+        qkvz_dim: c_int,
+        conv_dim: c_int,
+        stream: CUstream,
+    );
+
+    // GDN conv output split kernel
+    fn gdn_conv_output_split(
+        conv_out: *const f32,
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        num_tokens: c_int,
+        key_dim: c_int,
+        value_dim: c_int,
+        conv_dim: c_int,
+        stream: CUstream,
+    );
 }
 
 /// Fused GDN gating computation (all f32 on GPU).
@@ -5184,6 +5318,166 @@ pub unsafe fn gdn_rms_norm_gated(
         total_rows as c_int,
         stream,
     );
+}
+
+// ---------------------------------------------------------------------------
+// GDN QKVZ Split (GPU)
+// ---------------------------------------------------------------------------
+
+/// Split QKVZ and BA projection outputs into individual f32 tensors on GPU.
+///
+/// Also produces concatenated Q||K||V for conv1d input.
+///
+/// * `qkvz`: `[T, 2*key_dim + 2*value_dim]` in model dtype
+/// * `ba`:   `[T, 2*num_v_heads]` in model dtype
+///
+/// Returns: (q, k, v, z, a, b, mixed_qkv) all f32 on GPU.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gdn_qkvz_split(
+    qkvz: GpuTensor,
+    ba: GpuTensor,
+    num_tokens: usize,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_dim: usize,
+    caching: &mut crate::alloc::CachingAllocator,
+    stream: CUstream,
+) -> (
+    crate::alloc::OwnedTensor, // q [T, key_dim]
+    crate::alloc::OwnedTensor, // k [T, key_dim]
+    crate::alloc::OwnedTensor, // v [T, value_dim]
+    crate::alloc::OwnedTensor, // z [T, value_dim]
+    crate::alloc::OwnedTensor, // a [T, num_v_heads]
+    crate::alloc::OwnedTensor, // b [T, num_v_heads]
+    crate::alloc::OwnedTensor, // mixed_qkv [T, conv_dim]
+) {
+    let q = caching.alloc_tensor(&[num_tokens, key_dim], DType::F32);
+    let k = caching.alloc_tensor(&[num_tokens, key_dim], DType::F32);
+    let v = caching.alloc_tensor(&[num_tokens, value_dim], DType::F32);
+    let z = caching.alloc_tensor(&[num_tokens, value_dim], DType::F32);
+    let a = caching.alloc_tensor(&[num_tokens, num_v_heads], DType::F32);
+    let b = caching.alloc_tensor(&[num_tokens, num_v_heads], DType::F32);
+    let mixed = caching.alloc_tensor(&[num_tokens, conv_dim], DType::F32);
+
+    let v_per_k = (num_v_heads / num_k_heads) as c_int;
+    let qkvz_dim = (2 * key_dim + 2 * value_dim) as c_int;
+
+    match qkvz.dtype() {
+        DType::BF16 => gdn_qkvz_split_bf16(
+            qkvz.as_ptr(),
+            ba.as_ptr(),
+            q.as_gpu_tensor().as_mut_ptr(),
+            k.as_gpu_tensor().as_mut_ptr(),
+            v.as_gpu_tensor().as_mut_ptr(),
+            z.as_gpu_tensor().as_mut_ptr(),
+            a.as_gpu_tensor().as_mut_ptr(),
+            b.as_gpu_tensor().as_mut_ptr(),
+            mixed.as_gpu_tensor().as_mut_ptr(),
+            num_tokens as c_int,
+            num_k_heads as c_int,
+            num_v_heads as c_int,
+            head_k_dim as c_int,
+            head_v_dim as c_int,
+            v_per_k,
+            key_dim as c_int,
+            value_dim as c_int,
+            qkvz_dim,
+            conv_dim as c_int,
+            stream,
+        ),
+        DType::F16 => gdn_qkvz_split_f16(
+            qkvz.as_ptr(),
+            ba.as_ptr(),
+            q.as_gpu_tensor().as_mut_ptr(),
+            k.as_gpu_tensor().as_mut_ptr(),
+            v.as_gpu_tensor().as_mut_ptr(),
+            z.as_gpu_tensor().as_mut_ptr(),
+            a.as_gpu_tensor().as_mut_ptr(),
+            b.as_gpu_tensor().as_mut_ptr(),
+            mixed.as_gpu_tensor().as_mut_ptr(),
+            num_tokens as c_int,
+            num_k_heads as c_int,
+            num_v_heads as c_int,
+            head_k_dim as c_int,
+            head_v_dim as c_int,
+            v_per_k,
+            key_dim as c_int,
+            value_dim as c_int,
+            qkvz_dim,
+            conv_dim as c_int,
+            stream,
+        ),
+        DType::F32 => gdn_qkvz_split_f32(
+            qkvz.as_ptr(),
+            ba.as_ptr(),
+            q.as_gpu_tensor().as_mut_ptr(),
+            k.as_gpu_tensor().as_mut_ptr(),
+            v.as_gpu_tensor().as_mut_ptr(),
+            z.as_gpu_tensor().as_mut_ptr(),
+            a.as_gpu_tensor().as_mut_ptr(),
+            b.as_gpu_tensor().as_mut_ptr(),
+            mixed.as_gpu_tensor().as_mut_ptr(),
+            num_tokens as c_int,
+            num_k_heads as c_int,
+            num_v_heads as c_int,
+            head_k_dim as c_int,
+            head_v_dim as c_int,
+            v_per_k,
+            key_dim as c_int,
+            value_dim as c_int,
+            qkvz_dim,
+            conv_dim as c_int,
+            stream,
+        ),
+        _ => panic!("gdn_qkvz_split: unsupported dtype {:?}", qkvz.dtype()),
+    }
+
+    (q, k, v, z, a, b, mixed)
+}
+
+/// Split conv1d output [T, conv_dim] into Q, K, V on GPU.
+///
+/// conv_dim = 2*key_dim + value_dim, layout is Q||K||V flat.
+#[cfg(feature = "cuda")]
+pub unsafe fn gdn_conv_split(
+    conv_out: GpuTensor,
+    num_tokens: usize,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_dim: usize,
+    caching: &mut crate::alloc::CachingAllocator,
+    stream: CUstream,
+) -> (
+    crate::alloc::OwnedTensor, // q [T, num_k_heads, head_k_dim]
+    crate::alloc::OwnedTensor, // k [T, num_k_heads, head_k_dim]
+    crate::alloc::OwnedTensor, // v [T, num_v_heads, head_v_dim]
+) {
+    let q = caching.alloc_tensor(&[num_tokens, num_k_heads, head_k_dim], DType::F32);
+    let k = caching.alloc_tensor(&[num_tokens, num_k_heads, head_k_dim], DType::F32);
+    let v = caching.alloc_tensor(&[num_tokens, num_v_heads, head_v_dim], DType::F32);
+
+    gdn_conv_output_split(
+        conv_out.as_ptr(),
+        q.as_gpu_tensor().as_mut_ptr(),
+        k.as_gpu_tensor().as_mut_ptr(),
+        v.as_gpu_tensor().as_mut_ptr(),
+        num_tokens as c_int,
+        key_dim as c_int,
+        value_dim as c_int,
+        conv_dim as c_int,
+        stream,
+    );
+
+    (q, k, v)
 }
 
 // ---------------------------------------------------------------------------

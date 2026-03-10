@@ -1145,6 +1145,11 @@ fn qwen3_next_config_from_hf(
         decoder_sparse_step,
         mlp_only_layers,
         layer_types,
+        layer_scale: hf
+            .extra
+            .get("layer_scale")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -4860,6 +4865,17 @@ impl CudaWorker {
                     // Build GDN forward context.
                     let gdn_pool = gdn_pool_ref.unwrap();
                     let meta = &prepared.attn_meta;
+
+                    // Clear GDN state for sequences in prefill (query_len > 1).
+                    for i in 0..meta.num_reqs {
+                        let qlen = meta.query_start_loc[i + 1] - meta.query_start_loc[i];
+                        if qlen > 1 {
+                            unsafe { gdn_pool.clear_slot(i, device.compute_stream) }.map_err(
+                                |e| ExecutorError::WorkerExecution(format!("GDN clear_slot: {e}")),
+                            )?;
+                        }
+                    }
+
                     let (gdn_state_indices, gdn_cu_seqlens, num_seqs) =
                         Self::build_gdn_tensors(meta, device)?;
                     unsafe {

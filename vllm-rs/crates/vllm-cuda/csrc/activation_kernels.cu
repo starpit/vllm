@@ -259,3 +259,53 @@ void gelu_and_mul_fused_bf16(
 }
 
 } // extern "C"
+
+// ---------------------------------------------------------------------------
+// Broadcast multiply inplace: x[row, col] *= scale[col]
+// x: [num_rows, d], scale: [d] — both same dtype.
+// One block per row.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void broadcast_mul_inplace_kernel(
+    T* __restrict__ x,
+    const T* __restrict__ scale,
+    int d)
+{
+    const int row = blockIdx.x;
+    T* xr = x + row * d;
+
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float xv = (float)xr[i];
+        float sv = (float)scale[i];
+        xr[i] = (T)(xv * sv);
+    }
+}
+
+extern "C" {
+
+void broadcast_mul_inplace_f32(
+    float* x, const float* scale,
+    int num_rows, int d, cudaStream_t stream)
+{
+    int threads = (d < 1024) ? d : 1024;
+    broadcast_mul_inplace_kernel<float><<<num_rows, threads, 0, stream>>>(x, scale, d);
+}
+
+void broadcast_mul_inplace_f16(
+    __half* x, const __half* scale,
+    int num_rows, int d, cudaStream_t stream)
+{
+    int threads = (d < 1024) ? d : 1024;
+    broadcast_mul_inplace_kernel<__half><<<num_rows, threads, 0, stream>>>(x, scale, d);
+}
+
+void broadcast_mul_inplace_bf16(
+    __nv_bfloat16* x, const __nv_bfloat16* scale,
+    int num_rows, int d, cudaStream_t stream)
+{
+    int threads = (d < 1024) ? d : 1024;
+    broadcast_mul_inplace_kernel<__nv_bfloat16><<<num_rows, threads, 0, stream>>>(x, scale, d);
+}
+
+} // extern "C"

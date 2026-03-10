@@ -35,7 +35,7 @@
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
   │ Kimi K2.5                │ yes          │ no         │ DeepSeek V2 backbone               │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
-  │ Qwen3-Next (GDN+MoE)     │ yes          │ no         │ Hybrid linear+full attention       │
+  │ Qwen3-Next (GDN+MoE)     │ yes          │ yes        │ Hybrid GDN + full attention, E2E verified │
   └──────────────────────────┴──────────────┴────────────┴────────────────────────────────────┘
 
   Effort: ~~Mistral/Qwen3/Phi-3 are trivial (alias LLaMA)~~ — DONE. Granite is similar. ~~MoE models (Mixtral, Qwen MoE) need a fused MoE GEMM
@@ -315,6 +315,51 @@
   CandleWorker supports Gemma3-MM and Qwen2-VL/Qwen2.5-VL (vision encoder + projector). CudaWorker has none. This is likely out of scope for
   initial parity but worth noting.
 
+  8. Qwen3-Next Parity vs Python vLLM
+
+  **At parity (implemented):**
+  - GemmaRMSNorm for all layer norms (input_layernorm, post_attention_layernorm, model.norm)
+  - QK-norm with +1 weight offset (GemmaRMSNorm convention)
+  - Layer scale: `hidden_states *= (scale + 1)` after attention and MLP
+  - QKVZ grouped-head split on GPU (eliminates 8 CPU round-trips per GDN layer)
+  - Conv output split on GPU (eliminates 3 CPU round-trips per GDN layer)
+  - Per-sequence conv1d prefill with proper slot indices
+  - Per-layer SSM state indexing (`slot * num_gdn_layers + gdn_layer_idx`)
+  - State clearing for new sequences (zero conv+ssm state on prefill)
+  - BA split (grouped → flat B, A tensors)
+  - GDN gating (A_log, dt_bias, sigmoid)
+  - GDN recurrent kernel (fused_recurrent_gated_delta_rule)
+  - RMSNormGated with norm_before_gate
+  - Full attention layers with FlashAttention-2 paged decode
+  - MoE layers (shared expert + routed experts)
+
+  **Remaining gaps for 100% parity:**
+
+  ┌──────────────────────────────────┬──────────┬──────────────────────────────────────────────────────────────┐
+  │              Gap                 │ Severity │                            Notes                             │
+  ├──────────────────────────────────┼──────────┼──────────────────────────────────────────────────────────────┤
+  │ Chunked prefill algorithm        │ Medium   │ Python uses chunk_gated_delta_rule (O(T) memory) for        │
+  │                                  │          │ prefill. Rust uses fused_recurrent for all paths.           │
+  │                                  │          │ Correct but slower/more memory for long prefills.           │
+  ├──────────────────────────────────┼──────────┼──────────────────────────────────────────────────────────────┤
+  │ TP for GDN layers                │ Medium   │ Python shards GDN heads across TP ranks. Rust GDN is       │
+  │                                  │          │ single-GPU only. Blocks multi-GPU Qwen3-Next.               │
+  ├──────────────────────────────────┼──────────┼──────────────────────────────────────────────────────────────┤
+  │ Speculative decoding             │ Low      │ Python has spec/non-spec token splitting in GDN forward.    │
+  │                                  │          │ Not needed until spec decode is wired in Rust.              │
+  ├──────────────────────────────────┼──────────┼──────────────────────────────────────────────────────────────┤
+  │ has_initial_state flag           │ Low      │ Rust uses query_len > 1 heuristic. Works for standard      │
+  │                                  │          │ prefill/decode; could diverge for chunked prefill.          │
+  ├──────────────────────────────────┼──────────┼──────────────────────────────────────────────────────────────┤
+  │ Conv1d bias                      │ Low      │ Python passes bias to causal_conv1d_fn. Qwen3-Next config  │
+  │                                  │          │ likely has conv_bias=False. Verify with real model config.  │
+  ├──────────────────────────────────┼──────────┼──────────────────────────────────────────────────────────────┤
+  │ L2 norm in recurrence            │ Unknown  │ Python passes use_qk_l2norm_in_kernel=True. Need to verify │
+  │                                  │          │ Rust recurrent kernel matches this behavior.                │
+  ├──────────────────────────────────┼──────────┼──────────────────────────────────────────────────────────────┤
+  │ Multi-token prediction (MTP)     │ Low      │ Separate qwen3_next_mtp.py. Not a base model concern.      │
+  └──────────────────────────────────┴──────────┴──────────────────────────────────────────────────────────────┘
+
   ---
   Priority Order (to retire CandleWorker CUDA)
 
@@ -325,12 +370,12 @@
   5. ~~MoE kernel + models: Fused MoE GEMM, then port Mixtral/Qwen MoE/Qwen3 MoE~~ — **DONE** (WMMA tensor-core kernel, 3 models)
   6. DeepSeek V2/V3 (MLA): Most complex arch — absorbed-MLA attention, MoE
   7. ~~Tensor parallelism: Parallel layers, NCCL, multi-GPU init~~ — **DONE** (TP=2 Qwen2.5-0.5B E2E verified)
-  8. Remaining dense archs: Qwen3-Next
+  8. ~~Remaining dense archs: Qwen3-Next~~ — **DONE** (GemmaRMSNorm, layer scale, GPU QKVZ split, per-seq conv1d, SSM state mgmt)
   9. ~~Sampling perf: Fused penalty kernel on GPU, no CPU fallback~~ — **DONE**
   10. LoRA, speculative decoding: Feature parity on worker traits (embeddings done)
   11. Multimodal: Vision encoders (Gemma3-MM, Qwen2-VL)
   12. MoE perf tuning: Inline PTX mma, tile autoselection, L2 grouping (see section 6)
   13. Quantized MoE: FP8/INT8/INT4 expert weights
 
-  Items 1, 2, 3, 4, 5, 7, 9 are done. That covers dense + MoE LLaMA-family models
+  Items 1, 2, 3, 4, 5, 7, 8, 9 are done. That covers dense + MoE + hybrid GDN LLaMA-family models
   in FP16/BF16/GGUF with correct sampling, GPTQ/AWQ/GGUF quantization, and multi-GPU tensor parallelism.

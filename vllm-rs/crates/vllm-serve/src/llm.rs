@@ -825,6 +825,7 @@ mod tests {
             request_id: None,
             guided_regex: None,
             allowed_token_ids: params.allowed_token_ids.clone(),
+            bad_words: None,
             truncate_prompt_tokens: None,
         }
     }

@@ -2541,6 +2541,9 @@ impl AsyncEngine {
         let guided_grammar =
             resolve_guided_grammar(&request.response_format, &request.guided_regex)?;
 
+        // Tokenize bad_words strings into token sequences.
+        let bad_words_token_ids = self.tokenize_bad_words(&request.bad_words)?;
+
         Ok(SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
@@ -2562,6 +2565,7 @@ impl AsyncEngine {
             logit_bias: parse_logit_bias(&request.logit_bias),
             guided_grammar,
             allowed_token_ids: request.allowed_token_ids.clone(),
+            bad_words_token_ids,
             ..Default::default()
         })
     }
@@ -2587,6 +2591,9 @@ impl AsyncEngine {
                 pattern: pattern.clone(),
             });
 
+        // Tokenize bad_words strings into token sequences.
+        let bad_words_token_ids = self.tokenize_bad_words(&request.bad_words)?;
+
         Ok(SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
@@ -2608,8 +2615,37 @@ impl AsyncEngine {
             logit_bias: parse_logit_bias(&request.logit_bias),
             guided_grammar,
             allowed_token_ids: request.allowed_token_ids.clone(),
+            bad_words_token_ids,
             ..Default::default()
         })
+    }
+
+    /// Tokenize bad_words strings into token ID sequences.
+    fn tokenize_bad_words(
+        &self,
+        bad_words: &Option<Vec<String>>,
+    ) -> ServeResult<Option<Vec<Vec<u32>>>> {
+        let Some(words) = bad_words else {
+            return Ok(None);
+        };
+        if words.is_empty() {
+            return Ok(None);
+        }
+        let Some(ref tokenizer) = self.tokenizer else {
+            return Ok(None);
+        };
+        let mut result = Vec::with_capacity(words.len());
+        for word in words {
+            let ids = tokenizer.encode(word, false)?;
+            if !ids.is_empty() {
+                result.push(ids);
+            }
+        }
+        if result.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
     }
 }
 
@@ -3062,6 +3098,7 @@ mod tests {
             request_id: None,
             guided_regex: None,
             allowed_token_ids: None,
+            bad_words: None,
             truncate_prompt_tokens: None,
         }
     }
@@ -3152,6 +3189,7 @@ mod tests {
             request_id: None,
             guided_regex: None,
             allowed_token_ids: None,
+            bad_words: None,
             truncate_prompt_tokens: None,
         };
 
@@ -3203,6 +3241,7 @@ mod tests {
             request_id: None,
             guided_regex: None,
             allowed_token_ids: None,
+            bad_words: None,
             truncate_prompt_tokens: None,
         };
 
@@ -3433,6 +3472,7 @@ mod tests {
             request_id: None,
             guided_regex: None,
             allowed_token_ids: None,
+            bad_words: None,
             truncate_prompt_tokens: None,
         }
     }

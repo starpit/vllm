@@ -200,7 +200,11 @@
   ├────────────────────────────┼────────────────┼──────────────────┼─────────────────────────────────────────────┤
   │ Logprobs                   │ yes            │ yes (GPU)        │ Fused log-softmax + top-K kernel            │
   ├────────────────────────────┼────────────────┼──────────────────┼─────────────────────────────────────────────┤
-  │ Seed-based RNG             │ yes (per-req)  │ partial          │ murmurhash from uniform; not per-request    │
+  │ Seed-based RNG             │ yes (per-req)  │ yes (per-req)    │ Per-request StdRng seeded from user seed    │
+  ├────────────────────────────┼────────────────┼──────────────────┼─────────────────────────────────────────────┤
+  │ Allowed token IDs          │ yes            │ yes (GPU)        │ Reuses grammar mask kernel (CSR allow-list) │
+  ├────────────────────────────┼────────────────┼──────────────────┼─────────────────────────────────────────────┤
+  │ Bad words exclusion        │ yes            │ yes (GPU)        │ CPU suffix matching + apply_min_tokens kern │
   ├────────────────────────────┼────────────────┼──────────────────┼─────────────────────────────────────────────┤
   │ n>1 completions            │ yes            │ yes              │ Engine-level, not worker-level              │
   └────────────────────────────┴────────────────┴──────────────────┴─────────────────────────────────────────────┘
@@ -208,30 +212,25 @@
   No CPU fallback paths remain. Mixed batches (some requests with penalties, some without)
   are handled entirely on GPU — no batch poisoning.
 
-  Minor gaps vs Python (not in CandleWorker either) — see section 5a.
+  5a. ~~Sampling TODOs (minor gaps vs Python vLLM)~~ — **ALL DONE**
 
-  5a. Sampling TODOs (minor gaps vs Python vLLM)
-
-  These features exist in Python vLLM's Sampler but are NOT implemented in CudaWorker (or CandleWorker).
-  They are rarely used in practice but listed here for completeness.
+  All previously-missing sampling features are now implemented:
 
   ┌──────────────────────────────┬─────────────────────────────────────────────────────────────────────────┐
   │           Feature            │                                 Notes                                   │
   ├──────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
-  │ allowed_token_ids whitelist  │ Per-request token whitelist bitmask (different from grammar). Python    │
-  │                              │ uses masked_fill_ on a pre-built bool mask. Need a GPU kernel or       │
-  │                              │ reuse the grammar mask kernel with a different allow-list source.       │
+  │ ~~allowed_token_ids~~        │ **DONE** — AllowedTokenIdsProcessor reuses grammar mask kernel (CSR    │
+  │                              │ allow-list). Static per request, rebuilt only on batch change.          │
   ├──────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
-  │ bad_words exclusion          │ Per-request list of banned token sequences. Python uses apply_bad_words │
-  │                              │ which checks output_token_ids suffix matches and sets logit to -inf.    │
-  │                              │ Needs CPU-side suffix matching + GPU scatter to -inf.                   │
+  │ ~~bad_words exclusion~~      │ **DONE** — BadWordsProcessor: CPU suffix matching every step, then     │
+  │                              │ apply_min_tokens kernel to scatter -inf. Protocol tokenizes strings.    │
   ├──────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
   │ ~~min_tokens logits processor~~│ ~~DONE — MinTokensProcessor suppresses EOS/stop tokens on GPU~~       │
   │                              │ ~~until min_tokens generated. CUDA kernel + E2E test verified.~~       │
   ├──────────────────────────────┼─────────────────────────────────────────────────────────────────────────┤
-  │ Per-request seed-based RNG   │ Python creates per-request torch.Generator from user-provided seed.    │
-  │                              │ CudaWorker currently uses shared thread_rng with murmurhash mixing.    │
-  │                              │ Need per-request Philox state on GPU keyed by user seed.               │
+  │ ~~Per-request seed-based RNG~~ │ **DONE** — Per-request StdRng::seed_from_u64(seed) stored in        │
+  │                              │ HashMap<String, StdRng>. Created on request add, removed on complete.  │
+  │                              │ Used in all three sampling paths (Gumbel, full, slow).                  │
   └──────────────────────────────┴─────────────────────────────────────────────────────────────────────────┘
 
   6. Missing Kernels

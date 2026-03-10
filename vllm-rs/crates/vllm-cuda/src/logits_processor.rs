@@ -594,6 +594,222 @@ impl LogitsProcessor for MinTokensProcessor {
 }
 
 // ---------------------------------------------------------------------------
+// AllowedTokenIdsProcessor
+// ---------------------------------------------------------------------------
+
+/// Static allow-list processor. When a request has `allowed_token_ids`, only
+/// those tokens may be sampled — all others are set to `-inf`.
+/// Reuses the grammar mask kernel (CSR allow-list → set disallowed to `-inf`).
+/// State is static per request — rebuilt only on batch change, not every step.
+pub struct AllowedTokenIdsProcessor {
+    active: bool,
+    needs_backup: bool,
+    gpu_allowed: Option<OwnedTensor>,
+    gpu_offsets: Option<OwnedTensor>,
+    gpu_req_indices: Option<OwnedTensor>,
+}
+
+impl AllowedTokenIdsProcessor {
+    pub fn new() -> Self {
+        Self {
+            active: false,
+            needs_backup: false,
+            gpu_allowed: None,
+            gpu_offsets: None,
+            gpu_req_indices: None,
+        }
+    }
+
+    /// Whether this processor needs a backup of logits before masking.
+    pub fn needs_backup(&self) -> bool {
+        self.needs_backup
+    }
+
+    /// Apply using a backup tensor (same pattern as grammar mask).
+    pub fn apply_with_backup(&self, logits: GpuTensor, backup: GpuTensor, device: &mut GpuDevice) {
+        if let (Some(allowed), Some(offsets), Some(indices)) =
+            (&self.gpu_allowed, &self.gpu_offsets, &self.gpu_req_indices)
+        {
+            unsafe {
+                crate::kernels::apply_grammar_mask(
+                    logits,
+                    backup,
+                    allowed.as_gpu_tensor(),
+                    offsets.as_gpu_tensor(),
+                    indices.as_gpu_tensor(),
+                    device.compute_stream,
+                );
+            }
+        }
+    }
+}
+
+impl LogitsProcessor for AllowedTokenIdsProcessor {
+    fn update_state(
+        &mut self,
+        batch_update: Option<&BatchUpdate>,
+        sampling_params_map: &HashMap<String, SamplingParams>,
+        _token_buffers: &HashMap<String, Vec<u32>>,
+        batch_req_ids: &[String],
+        device: &mut GpuDevice,
+    ) {
+        // Only rebuild when batch changes (static per request).
+        if batch_update.is_none() && self.gpu_allowed.is_some() {
+            return;
+        }
+
+        let mut allowed_ids_flat: Vec<i32> = Vec::new();
+        let mut allowed_offsets: Vec<i32> = vec![0];
+        let mut req_indices: Vec<i32> = Vec::new();
+
+        for (req_idx, req_id) in batch_req_ids.iter().enumerate() {
+            if let Some(params) = sampling_params_map.get(req_id)
+                && let Some(ref allowed) = params.allowed_token_ids
+            {
+                req_indices.push(req_idx as i32);
+                for &tok in allowed {
+                    allowed_ids_flat.push(tok as i32);
+                }
+                allowed_offsets.push(allowed_ids_flat.len() as i32);
+            }
+        }
+
+        if req_indices.is_empty() {
+            self.active = false;
+            self.needs_backup = false;
+            self.gpu_allowed = None;
+            self.gpu_offsets = None;
+            self.gpu_req_indices = None;
+            return;
+        }
+
+        self.active = true;
+        self.needs_backup = true;
+        self.gpu_allowed = Some(h2d_i32_owned(&allowed_ids_flat, device));
+        self.gpu_offsets = Some(h2d_i32_owned(&allowed_offsets, device));
+        self.gpu_req_indices = Some(h2d_i32_owned(&req_indices, device));
+    }
+
+    fn apply(&self, _logits: GpuTensor, _device: &mut GpuDevice) {
+        // apply_with_backup is used instead (needs backup logits).
+        // This is a no-op; the CudaWorker calls apply_with_backup directly.
+    }
+
+    fn is_argmax_invariant(&self) -> bool {
+        false
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BadWordsProcessor
+// ---------------------------------------------------------------------------
+
+/// Suppresses tokens that would complete a "bad word" sequence.
+/// CPU-side suffix matching against output tokens, then GPU scatter to `-inf`.
+/// Mirrors Python's `BadWordsLogitsProcessor`.
+#[derive(Default)]
+pub struct BadWordsProcessor {
+    active: bool,
+    gpu_req_indices: Option<OwnedTensor>,
+    gpu_token_ids: Option<OwnedTensor>,
+}
+
+impl BadWordsProcessor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Check if `output_tokens` ends with the prefix of `bad_word` (all but the last token).
+/// If so, return the completing token (the last token of the bad word).
+fn bad_word_suffix_match(output_tokens: &[u32], bad_word: &[u32]) -> Option<u32> {
+    if bad_word.is_empty() {
+        return None;
+    }
+    // Single-token bad word: always suppress it.
+    if bad_word.len() == 1 {
+        return Some(bad_word[0]);
+    }
+    // Multi-token: check if output ends with bad_word[..len-1].
+    let prefix = &bad_word[..bad_word.len() - 1];
+    if output_tokens.len() >= prefix.len()
+        && output_tokens[output_tokens.len() - prefix.len()..] == *prefix
+    {
+        Some(bad_word[bad_word.len() - 1])
+    } else {
+        None
+    }
+}
+
+impl LogitsProcessor for BadWordsProcessor {
+    fn update_state(
+        &mut self,
+        _batch_update: Option<&BatchUpdate>,
+        sampling_params_map: &HashMap<String, SamplingParams>,
+        token_buffers: &HashMap<String, Vec<u32>>,
+        batch_req_ids: &[String],
+        device: &mut GpuDevice,
+    ) {
+        // Rebuild every step since output tokens grow.
+        let mut req_indices: Vec<i32> = Vec::new();
+        let mut token_ids: Vec<i32> = Vec::new();
+
+        for (req_idx, req_id) in batch_req_ids.iter().enumerate() {
+            if let Some(params) = sampling_params_map.get(req_id)
+                && let Some(ref bad_words) = params.bad_words_token_ids
+            {
+                let output_tokens = token_buffers
+                    .get(req_id)
+                    .map(|b| b.as_slice())
+                    .unwrap_or(&[]);
+                for bad_word in bad_words {
+                    if let Some(suppress_token) = bad_word_suffix_match(output_tokens, bad_word) {
+                        req_indices.push(req_idx as i32);
+                        token_ids.push(suppress_token as i32);
+                    }
+                }
+            }
+        }
+
+        if req_indices.is_empty() {
+            self.active = false;
+            self.gpu_req_indices = None;
+            self.gpu_token_ids = None;
+            return;
+        }
+
+        self.active = true;
+        self.gpu_req_indices = Some(h2d_i32_owned(&req_indices, device));
+        self.gpu_token_ids = Some(h2d_i32_owned(&token_ids, device));
+    }
+
+    fn apply(&self, logits: GpuTensor, device: &mut GpuDevice) {
+        if let (Some(indices), Some(ids)) = (&self.gpu_req_indices, &self.gpu_token_ids) {
+            unsafe {
+                crate::kernels::apply_min_tokens(
+                    logits,
+                    indices.as_gpu_tensor(),
+                    ids.as_gpu_tensor(),
+                    device.compute_stream,
+                );
+            }
+        }
+    }
+
+    fn is_argmax_invariant(&self) -> bool {
+        false
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+// ---------------------------------------------------------------------------
 // H2D helpers (allocate via caching allocator + async copy)
 // ---------------------------------------------------------------------------
 
@@ -650,5 +866,86 @@ mod tests {
             Box::new(MinTokensProcessor::new()),
         ]);
         assert!(!pipeline.any_active());
+    }
+
+    #[test]
+    fn test_bad_word_suffix_match_single_token() {
+        // Single-token bad word: always suppress.
+        assert_eq!(bad_word_suffix_match(&[], &[42]), Some(42));
+        assert_eq!(bad_word_suffix_match(&[1, 2, 3], &[42]), Some(42));
+    }
+
+    #[test]
+    fn test_bad_word_suffix_match_multi_token() {
+        // "bad word" = [10, 20, 30]. Prefix = [10, 20].
+        // Output ends with [10, 20] → suppress 30.
+        assert_eq!(bad_word_suffix_match(&[5, 10, 20], &[10, 20, 30]), Some(30));
+        // Output does NOT end with [10, 20] → no suppression.
+        assert_eq!(bad_word_suffix_match(&[5, 10, 21], &[10, 20, 30]), None);
+        // Output too short for prefix.
+        assert_eq!(bad_word_suffix_match(&[20], &[10, 20, 30]), None);
+    }
+
+    #[test]
+    fn test_bad_word_suffix_match_empty() {
+        assert_eq!(bad_word_suffix_match(&[1, 2], &[]), None);
+    }
+
+    #[test]
+    fn test_bad_word_suffix_match_exact_prefix() {
+        // Output exactly equals the prefix.
+        assert_eq!(bad_word_suffix_match(&[10, 20], &[10, 20, 30]), Some(30));
+    }
+
+    #[test]
+    fn test_allowed_token_ids_processor_default_inactive() {
+        let p = AllowedTokenIdsProcessor::new();
+        assert!(!p.is_active());
+        assert!(!p.needs_backup());
+    }
+
+    #[test]
+    fn test_bad_words_processor_default_inactive() {
+        let p = BadWordsProcessor::new();
+        assert!(!p.is_active());
+    }
+
+    #[test]
+    fn test_seeded_rng_deterministic() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng1 = StdRng::seed_from_u64(42);
+        let mut rng2 = StdRng::seed_from_u64(42);
+        let vals1: Vec<f32> = (0..10).map(|_| rng1.r#gen::<f32>()).collect();
+        let vals2: Vec<f32> = (0..10).map(|_| rng2.r#gen::<f32>()).collect();
+        assert_eq!(vals1, vals2, "same seed must produce same values");
+    }
+
+    #[test]
+    fn test_seeded_rng_different_seeds_differ() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng1 = StdRng::seed_from_u64(42);
+        let mut rng2 = StdRng::seed_from_u64(99);
+        let vals1: Vec<f32> = (0..10).map(|_| rng1.r#gen::<f32>()).collect();
+        let vals2: Vec<f32> = (0..10).map(|_| rng2.r#gen::<f32>()).collect();
+        assert_ne!(
+            vals1, vals2,
+            "different seeds must produce different values"
+        );
+    }
+
+    #[test]
+    fn test_seeded_rng_advances_state() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        // Verify that successive calls produce different values (RNG advances).
+        let mut rng = StdRng::seed_from_u64(42);
+        let v1: f32 = rng.r#gen();
+        let v2: f32 = rng.r#gen();
+        assert_ne!(v1, v2, "successive calls should produce different values");
     }
 }

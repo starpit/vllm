@@ -220,6 +220,17 @@ impl Sampler {
             apply_allow_mask(&mut logits_buf, allowed);
         }
 
+        // 1.7. Suppress bad words: if output ends with a bad word prefix, mask the completing token.
+        if let Some(ref bad_words) = params.bad_words_token_ids {
+            for bad_word in bad_words {
+                if let Some(suppress_token) = bad_word_suffix_match(prev_tokens, bad_word)
+                    && (suppress_token as usize) < logits_buf.len()
+                {
+                    logits_buf[suppress_token as usize] = f32::NEG_INFINITY;
+                }
+            }
+        }
+
         // 2. Apply repetition/frequency/presence penalties.
         let rep = params.repetition_penalty as f32;
         let freq = params.frequency_penalty as f32;
@@ -390,6 +401,25 @@ fn apply_min_p(indexed: &mut Vec<(usize, f32)>, min_p: f32) {
 
 /// Apply logit bias: add per-token bias to logits.
 /// Mask all token IDs not in `allowed` to `-inf`.
+/// Check if `output_tokens` ends with the prefix of `bad_word` (all but the last token).
+/// If so, return the completing token (the last token of the bad word).
+fn bad_word_suffix_match(output_tokens: &[u32], bad_word: &[u32]) -> Option<u32> {
+    if bad_word.is_empty() {
+        return None;
+    }
+    if bad_word.len() == 1 {
+        return Some(bad_word[0]);
+    }
+    let prefix = &bad_word[..bad_word.len() - 1];
+    if output_tokens.len() >= prefix.len()
+        && output_tokens[output_tokens.len() - prefix.len()..] == *prefix
+    {
+        Some(bad_word[bad_word.len() - 1])
+    } else {
+        None
+    }
+}
+
 fn apply_allow_mask(logits: &mut [f32], allowed: &[u32]) {
     let mut mask = vec![false; logits.len()];
     for &tid in allowed {
@@ -889,5 +919,69 @@ mod tests {
         let grammar_allowed = vec![1u32, 2];
         let (token_id, _) = sampler.sample_one(&logits, &params, &[], Some(&grammar_allowed));
         assert_eq!(token_id, 2);
+    }
+
+    #[test]
+    fn test_bad_words_single_token_suppressed() {
+        let mut sampler = Sampler::new();
+        // Token 0 has highest logit, but it's a single-token bad word.
+        let logits = vec![10.0f32, 5.0, 1.0, 0.0];
+        let params = SamplingParams {
+            temperature: 0.0,
+            bad_words_token_ids: Some(vec![vec![0]]),
+            ..Default::default()
+        };
+        let (token_id, _) = sampler.sample_one(&logits, &params, &[], None);
+        assert_eq!(token_id, 1, "single-token bad word should be suppressed");
+    }
+
+    #[test]
+    fn test_bad_words_multi_token_prefix_match() {
+        let mut sampler = Sampler::new();
+        // Bad word is [10, 20, 0]. Output ends with [10, 20].
+        // Token 0 (the completing token) should be suppressed.
+        let logits = vec![10.0f32, 5.0, 1.0];
+        let prev_tokens = vec![10, 20];
+        let params = SamplingParams {
+            temperature: 0.0,
+            bad_words_token_ids: Some(vec![vec![10, 20, 0]]),
+            ..Default::default()
+        };
+        let (token_id, _) = sampler.sample_one(&logits, &params, &prev_tokens, None);
+        assert_eq!(
+            token_id, 1,
+            "completing token of bad word should be suppressed"
+        );
+    }
+
+    #[test]
+    fn test_bad_words_no_match_no_suppression() {
+        let mut sampler = Sampler::new();
+        // Bad word is [10, 20, 0]. Output is [5, 6] — no prefix match.
+        let logits = vec![10.0f32, 5.0, 1.0];
+        let prev_tokens = vec![5, 6];
+        let params = SamplingParams {
+            temperature: 0.0,
+            bad_words_token_ids: Some(vec![vec![10, 20, 0]]),
+            ..Default::default()
+        };
+        let (token_id, _) = sampler.sample_one(&logits, &params, &prev_tokens, None);
+        assert_eq!(token_id, 0, "no prefix match means no suppression");
+    }
+
+    #[test]
+    fn test_bad_words_multiple_words() {
+        let mut sampler = Sampler::new();
+        // Two bad words: [0] (single token) and [99, 1] (multi-token, output ends with [99]).
+        // Tokens 0 and 1 should both be suppressed, leaving token 2.
+        let logits = vec![10.0f32, 8.0, 1.0, 0.0];
+        let prev_tokens = vec![99];
+        let params = SamplingParams {
+            temperature: 0.0,
+            bad_words_token_ids: Some(vec![vec![0], vec![99, 1]]),
+            ..Default::default()
+        };
+        let (token_id, _) = sampler.sample_one(&logits, &params, &prev_tokens, None);
+        assert_eq!(token_id, 2, "both bad words should be suppressed");
     }
 }

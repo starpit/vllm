@@ -326,6 +326,10 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_token_ids: Option<Vec<u32>>,
 
+    /// Words that should never appear in the output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bad_words: Option<Vec<String>>,
+
     /// Truncate prompt to at most this many tokens (keeps the last N).
     /// Must be >= 1 or -1 (meaning use model's max input length).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -480,6 +484,10 @@ pub struct CompletionRequest {
     /// Only allow sampling from these token IDs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_token_ids: Option<Vec<u32>>,
+
+    /// Words that should never appear in the output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bad_words: Option<Vec<String>>,
 
     /// Truncate prompt to at most this many tokens (keeps the last N).
     #[serde(skip_serializing_if = "Option::is_none")]

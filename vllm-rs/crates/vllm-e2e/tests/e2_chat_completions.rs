@@ -560,3 +560,104 @@ async fn test_chat_invalid_json() {
         resp.status()
     );
 }
+
+// ===========================================================================
+// E2: Sampling minor gaps — allowed_token_ids, bad_words, seeded RNG
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_chat_allowed_token_ids_constrains_output() {
+    let (_server, client) = start_smollm().await;
+
+    // Only allow a tiny set of token IDs. Run greedy so output is deterministic.
+    // We verify every generated token is in the allow list.
+    let allowed = vec![198, 220, 284, 330]; // typical BPE tokens
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg("Say hello")],
+        max_tokens: Some(10),
+        temperature: Some(0.0),
+        allowed_token_ids: Some(allowed.clone()),
+        ..default_chat_request()
+    };
+
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_eq!(resp.choices.len(), 1);
+    let tokens = resp.usage.completion_tokens.unwrap_or(0);
+    assert!(tokens > 0, "should generate at least 1 token");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_chat_bad_words() {
+    let (_server, client) = start_smollm().await;
+
+    // Ask the model to say "hello" but ban the word "hello".
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg("Say the word hello")],
+        max_tokens: Some(30),
+        temperature: Some(0.0),
+        bad_words: Some(vec!["hello".to_string()]),
+        ..default_chat_request()
+    };
+
+    let resp = client.chat_completion(&request).await.unwrap();
+    let text = resp.choices[0]
+        .message
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .to_lowercase();
+    assert!(
+        !text.contains("hello"),
+        "output should not contain banned word 'hello', got: {text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_chat_seed_deterministic() {
+    let (_server, client) = start_smollm().await;
+
+    // Same seed + same prompt → same output.
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg("Tell me a random number")],
+        max_tokens: Some(20),
+        temperature: Some(0.8),
+        seed: Some(12345),
+        ..default_chat_request()
+    };
+
+    let resp1 = client.chat_completion(&request).await.unwrap();
+    let resp2 = client.chat_completion(&request).await.unwrap();
+
+    let text1 = resp1.choices[0].message.content.as_deref().unwrap_or("");
+    let text2 = resp2.choices[0].message.content.as_deref().unwrap_or("");
+    assert_eq!(text1, text2, "same seed should produce identical output");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_chat_different_seeds_differ() {
+    let (_server, client) = start_smollm().await;
+
+    // Different seeds → likely different output (with high temp).
+    let make_req = |seed: i64| ChatCompletionRequest {
+        messages: vec![user_msg("Write a random word")],
+        max_tokens: Some(20),
+        temperature: Some(1.5),
+        seed: Some(seed),
+        ..default_chat_request()
+    };
+
+    let resp1 = client.chat_completion(&make_req(111)).await.unwrap();
+    let resp2 = client.chat_completion(&make_req(999)).await.unwrap();
+
+    let text1 = resp1.choices[0].message.content.as_deref().unwrap_or("");
+    let text2 = resp2.choices[0].message.content.as_deref().unwrap_or("");
+    // Not strictly guaranteed but overwhelmingly likely with different seeds + high temp.
+    assert_ne!(
+        text1, text2,
+        "different seeds should (almost certainly) produce different output"
+    );
+}

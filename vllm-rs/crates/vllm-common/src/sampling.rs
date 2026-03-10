@@ -154,6 +154,12 @@ pub struct SamplingParams {
     /// are masked to `-inf`. Similar to grammar masking but static.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_token_ids: Option<Vec<u32>>,
+
+    /// Pre-tokenized bad word sequences. If the output ends with the prefix
+    /// of a bad word, the completing token is suppressed (logit set to `-inf`).
+    /// Each inner `Vec<u32>` is one bad word as a token sequence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bad_words_token_ids: Option<Vec<Vec<u32>>>,
 }
 
 impl Default for SamplingParams {
@@ -182,6 +188,7 @@ impl Default for SamplingParams {
             logit_bias: None,
             guided_grammar: None,
             allowed_token_ids: None,
+            bad_words_token_ids: None,
         }
     }
 }
@@ -280,6 +287,14 @@ impl SamplingParams {
             && ids.is_empty()
         {
             return Err("allowed_token_ids must not be empty when set".into());
+        }
+        if let Some(ref seqs) = self.bad_words_token_ids {
+            if seqs.is_empty() {
+                return Err("bad_words_token_ids must not be empty when set".into());
+            }
+            if seqs.iter().any(|s| s.is_empty()) {
+                return Err("bad_words_token_ids must not contain empty sequences".into());
+            }
         }
         if !self.stop.is_empty() && !self.detokenize {
             return Err("stop strings are only supported when detokenize is true".into());
@@ -611,6 +626,42 @@ mod tests {
     fn test_validate_allowed_token_ids_none_ok() {
         let p = SamplingParams {
             allowed_token_ids: None,
+            ..Default::default()
+        };
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_bad_words_token_ids_empty() {
+        let p = SamplingParams {
+            bad_words_token_ids: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_bad_words_token_ids_empty_seq() {
+        let p = SamplingParams {
+            bad_words_token_ids: Some(vec![vec![]]),
+            ..Default::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_bad_words_token_ids_ok() {
+        let p = SamplingParams {
+            bad_words_token_ids: Some(vec![vec![1, 2], vec![3]]),
+            ..Default::default()
+        };
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_bad_words_token_ids_none_ok() {
+        let p = SamplingParams {
+            bad_words_token_ids: None,
             ..Default::default()
         };
         assert!(p.validate().is_ok());

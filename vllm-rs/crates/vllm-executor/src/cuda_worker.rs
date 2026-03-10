@@ -20,8 +20,9 @@ use vllm_cuda::dtype::DType as GpuDType;
 use vllm_cuda::graph::{CudaGraphRunner, GRAPH_MAX_BLOCKS_PER_SEQ, PrefillGraphRunner};
 use vllm_cuda::kv_cache::KvCachePool;
 use vllm_cuda::logits_processor::{
-    BatchUpdate, GrammarMaskProcessor, LogitBiasProcessor, LogitsProcessorPipeline,
-    MinTokensProcessor, PenaltiesProcessor,
+    AllowedTokenIdsProcessor, BadWordsProcessor, BatchUpdate, GrammarMaskProcessor,
+    LogitBiasProcessor, LogitsProcessor, LogitsProcessorPipeline, MinTokensProcessor,
+    PenaltiesProcessor,
 };
 use vllm_cuda::quant;
 use vllm_cuda::tensor::GpuTensor;
@@ -1093,10 +1094,14 @@ pub struct CudaWorker {
     logits_pipeline: Option<LogitsProcessorPipeline>,
     /// Grammar mask processor (separate from pipeline — needs backup logits).
     grammar_processor: GrammarMaskProcessor,
+    /// Allowed token IDs processor (separate — needs backup logits like grammar).
+    allowed_token_ids_processor: AllowedTokenIdsProcessor,
     /// True if batch composition changed this step (triggers BatchUpdate).
     batch_changed: bool,
     /// Ordered request IDs in the current batch (for pipeline update_state).
     batch_req_ids: Vec<String>,
+    /// Per-request seeded RNGs for deterministic sampling.
+    seeded_rngs: HashMap<String, rand::rngs::StdRng>,
 }
 
 unsafe impl Send for CudaWorker {}
@@ -1134,8 +1139,10 @@ impl CudaWorker {
             grammar_vocabulary: None,
             logits_pipeline: None,
             grammar_processor: GrammarMaskProcessor::new(),
+            allowed_token_ids_processor: AllowedTokenIdsProcessor::new(),
             batch_changed: false,
             batch_req_ids: Vec::new(),
+            seeded_rngs: HashMap::new(),
         }
     }
 
@@ -1342,6 +1349,7 @@ impl CudaWorker {
             Box::new(MinTokensProcessor::new()),
             Box::new(LogitBiasProcessor::new()),
             Box::new(PenaltiesProcessor::new(vocab_size)),
+            Box::new(BadWordsProcessor::new()),
         ];
         self.logits_pipeline = Some(LogitsProcessorPipeline::new(processors));
 
@@ -1800,7 +1808,9 @@ impl CudaWorker {
             vllm_models::grammar::GrammarGuide,
         >,
         grammar_processor: &GrammarMaskProcessor,
+        allowed_token_ids_processor: &AllowedTokenIdsProcessor,
         logits_pipeline: Option<&LogitsProcessorPipeline>,
+        seeded_rngs: &mut HashMap<String, rand::rngs::StdRng>,
         host_staging: &Option<HostStaging>,
         input_batch: &mut InputBatch,
         token_buffers: &mut HashMap<String, Vec<u32>>,
@@ -1812,6 +1822,15 @@ impl CudaWorker {
     ) -> ExecutorResult<ModelRunnerOutput> {
         use rand::Rng;
         let num_reqs = prepared.req_inputs.len();
+        // Helper: get random value using per-request seeded RNG if available.
+        let mut thread_rng = rand::thread_rng();
+        let mut gen_random = |req_id: &str| -> f32 {
+            if let Some(rng) = seeded_rngs.get_mut(req_id) {
+                rng.r#gen::<f32>()
+            } else {
+                thread_rng.r#gen::<f32>()
+            }
+        };
 
         // Determine which features are needed.
         let any_logprobs = prepared.req_inputs.iter().any(|r| {
@@ -1821,9 +1840,10 @@ impl CudaWorker {
         });
 
         let any_grammar = grammar_processor.is_active();
+        let any_allowed = allowed_token_ids_processor.is_active();
 
         let pipeline_active = logits_pipeline.is_some_and(|p| p.any_active());
-        let needs_f32 = pipeline_active || any_grammar || any_logprobs;
+        let needs_f32 = pipeline_active || any_grammar || any_allowed || any_logprobs;
 
         if !needs_f32 {
             // Fast path: no modifications needed, use native dtype sampling.
@@ -1849,7 +1869,6 @@ impl CudaWorker {
             }
 
             // Non-greedy fast path: Gumbel or full sampling on native dtype.
-            let mut rng = rand::thread_rng();
             let all_no_filter = prepared.req_inputs.iter().all(|r| {
                 sampling_params_map
                     .get(&r.req_id)
@@ -1867,7 +1886,7 @@ impl CudaWorker {
                     let t = params.map_or(1.0f32, |p| p.temperature.max(1e-7) as f32);
                     unsafe {
                         *temps_ptr.add(i) = t;
-                        *randoms_ptr.add(i) = rng.r#gen::<f32>();
+                        *randoms_ptr.add(i) = gen_random(&req_slice.req_id);
                     }
                 }
                 let gpu_packed_owned = device
@@ -1920,7 +1939,7 @@ impl CudaWorker {
                         *top_ks_ptr.add(i) = k;
                         *top_ps_ptr.add(i) = p;
                         *min_ps_ptr.add(i) = mp;
-                        *randoms_ptr.add(i) = rng.r#gen::<f32>();
+                        *randoms_ptr.add(i) = gen_random(&req_slice.req_id);
                     }
                 }
                 let gpu_packed_owned = device
@@ -2003,9 +2022,10 @@ impl CudaWorker {
             None
         };
 
-        // 3. Apply grammar mask on GPU (needs backup logits).
-        let _grammar_backup_owned = if any_grammar && grammar_processor.needs_backup() {
-            // Create backup of logits before grammar masking.
+        // 3. Apply grammar mask and/or allowed_token_ids on GPU (both need backup logits).
+        let needs_mask_backup = (any_grammar && grammar_processor.needs_backup())
+            || (any_allowed && allowed_token_ids_processor.needs_backup());
+        let _mask_backup_owned = if needs_mask_backup {
             let backup_owned = if raw_logits_for_logprobs.is_some() {
                 None
             } else {
@@ -2020,7 +2040,7 @@ impl CudaWorker {
                         device.compute_stream,
                     )
                 }
-                .map_err(|e| ExecutorError::WorkerExecution(format!("D2D grammar backup: {e}")))?;
+                .map_err(|e| ExecutorError::WorkerExecution(format!("D2D mask backup: {e}")))?;
                 Some(bk)
             };
             let backup = if let Some(raw) = raw_logits_for_logprobs.as_ref() {
@@ -2029,7 +2049,12 @@ impl CudaWorker {
                 backup_owned.as_ref().unwrap().as_gpu_tensor()
             };
 
-            grammar_processor.apply_with_backup(logits_f32, backup, device);
+            if any_grammar {
+                grammar_processor.apply_with_backup(logits_f32, backup, device);
+            }
+            if any_allowed {
+                allowed_token_ids_processor.apply_with_backup(logits_f32, backup, device);
+            }
             backup_owned
         } else {
             None
@@ -2041,7 +2066,6 @@ impl CudaWorker {
         }
 
         // 5. Sample on GPU (from modified f32 logits).
-        let mut rng = rand::thread_rng();
         let token_ids_owned = if all_greedy {
             // Argmax on f32 logits.
             unsafe {
@@ -2076,7 +2100,7 @@ impl CudaWorker {
                     *top_ks_ptr.add(i) = k;
                     *top_ps_ptr.add(i) = p;
                     *min_ps_ptr.add(i) = mp;
-                    *randoms_ptr.add(i) = rng.r#gen::<f32>();
+                    *randoms_ptr.add(i) = gen_random(&req_slice.req_id);
                 }
             }
             let gpu_packed_owned = device
@@ -2780,6 +2804,7 @@ impl Worker for CudaWorker {
             Box::new(MinTokensProcessor::new()),
             Box::new(LogitBiasProcessor::new()),
             Box::new(PenaltiesProcessor::new(vocab_size)),
+            Box::new(BadWordsProcessor::new()),
         ];
         self.logits_pipeline = Some(LogitsProcessorPipeline::new(processors));
 
@@ -3383,6 +3408,7 @@ impl CudaWorker {
         for req_id in &scheduler_output.finished_req_ids {
             self.token_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
+            self.seeded_rngs.remove(req_id);
             #[cfg(feature = "guided-decoding")]
             self.grammar_states.remove(req_id);
         }
@@ -3423,6 +3449,14 @@ impl CudaWorker {
             if let Some(ref params) = new_req.sampling_params {
                 self.sampling_params_map
                     .insert(new_req.req_id.clone(), params.clone());
+                // Create per-request seeded RNG if seed is specified.
+                if let Some(seed) = params.seed {
+                    use rand::SeedableRng;
+                    self.seeded_rngs.insert(
+                        new_req.req_id.clone(),
+                        rand::rngs::StdRng::seed_from_u64(seed),
+                    );
+                }
                 #[cfg(feature = "guided-decoding")]
                 if let Some(ref grammar) = params.guided_grammar
                     && let Some(ref vocab) = self.grammar_vocabulary
@@ -3684,6 +3718,15 @@ impl CudaWorker {
                 self.grammar_processor
                     .update_from_allowed_tokens(&empty, device);
             }
+
+            // Update allowed_token_ids processor.
+            self.allowed_token_ids_processor.update_state(
+                batch_update.as_ref(),
+                &self.sampling_params_map,
+                &self.token_buffers,
+                &self.batch_req_ids,
+                device,
+            );
         }
 
         // --- Pooling mode: run backbone, pool, return embeddings ---
@@ -4027,7 +4070,9 @@ impl CudaWorker {
                 #[cfg(feature = "guided-decoding")]
                 &mut self.grammar_states,
                 &self.grammar_processor,
+                &self.allowed_token_ids_processor,
                 self.logits_pipeline.as_ref(),
+                &mut self.seeded_rngs,
                 &self.host_staging,
                 &mut self.input_batch,
                 &mut self.token_buffers,
@@ -4562,7 +4607,9 @@ impl CudaWorker {
             #[cfg(feature = "guided-decoding")]
             &mut self.grammar_states,
             &self.grammar_processor,
+            &self.allowed_token_ids_processor,
             self.logits_pipeline.as_ref(),
+            &mut self.seeded_rngs,
             &self.host_staging,
             &mut self.input_batch,
             &mut self.token_buffers,

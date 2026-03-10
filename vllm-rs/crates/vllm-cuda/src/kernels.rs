@@ -1983,8 +1983,83 @@ unsafe extern "C" {
 
         softmax_lse_accum_ptr: *mut c_void,
         out_accum_ptr: *mut c_void,
+        seqlenq_ngroups_swapped: i32,
+        total_q: i32,
         stream: CUstream,
     );
+}
+
+unsafe extern "C" {
+    /// Transpose Q from [B, H, D] to [B*ngroups, Hk, D] for seqlenq_ngroups_swapped.
+    fn ngroups_transpose_q(
+        src: *const c_void,
+        dst: *mut c_void,
+        batch_size: i32,
+        num_heads: i32,
+        num_heads_k: i32,
+        ngroups: i32,
+        head_dim: i32,
+        stream: CUstream,
+    );
+    /// Reverse transpose: [B*ngroups, Hk, D] back to [B, H, D].
+    fn ngroups_untranspose_o(
+        src: *const c_void,
+        dst: *mut c_void,
+        batch_size: i32,
+        num_heads: i32,
+        num_heads_k: i32,
+        ngroups: i32,
+        head_dim: i32,
+        stream: CUstream,
+    );
+}
+
+/// Exact port of num_splits_heuristic from flash_api.cpp lines 262-296.
+/// Two-pass: find max efficiency, then find smallest split ≥ 85% of max.
+fn num_splits_heuristic(
+    batch_nheads_mblocks: usize,
+    num_sm: usize,
+    num_n_blocks: usize,
+    max_splits: usize,
+) -> usize {
+    // Python line 264: if batch_nheads_mblocks >= 0.8f * num_SMs, return 1
+    if batch_nheads_mblocks as f32 >= 0.8 * num_sm as f32 {
+        return 1;
+    }
+
+    let max_splits = max_splits.min(num_sm).min(num_n_blocks);
+
+    // Python's is_split_eligible: ceildiv(n, s) != ceildiv(n, s-1)
+    let ceildiv = |a: usize, b: usize| (a + b - 1) / b;
+    let is_split_eligible =
+        |s: usize| -> bool { s == 1 || ceildiv(num_n_blocks, s) != ceildiv(num_n_blocks, s - 1) };
+
+    // Pass 1: compute efficiencies, find max
+    let mut max_efficiency = 0.0_f32;
+    let mut efficiencies = Vec::with_capacity(max_splits);
+    for s in 1..=max_splits {
+        if !is_split_eligible(s) {
+            efficiencies.push(0.0_f32);
+        } else {
+            let n_waves = (batch_nheads_mblocks * s) as f32 / num_sm as f32;
+            let eff = n_waves / n_waves.ceil();
+            if eff > max_efficiency {
+                max_efficiency = eff;
+            }
+            efficiencies.push(eff);
+        }
+    }
+
+    // Pass 2: find smallest split ≥ 85% of max efficiency
+    for s in 1..=max_splits {
+        if !is_split_eligible(s) {
+            continue;
+        }
+        if efficiencies[s - 1] >= 0.85 * max_efficiency {
+            return s;
+        }
+    }
+    1
 }
 
 fn round_multiple(x: usize, m: usize) -> usize {
@@ -2068,6 +2143,8 @@ pub unsafe fn flash_attn_contiguous(
         1, // num_splits
         std::ptr::null_mut(),
         std::ptr::null_mut(),
+        0, // seqlenq_ngroups_swapped = false
+        total_q as i32,
         stream,
     );
 
@@ -2141,12 +2218,12 @@ pub unsafe fn flash_attn_paged_ext(
     softcap: f32,
     window_size_left: i32,
     block_size: usize,
-    _num_sm: i32,
+    num_sm: i32,
     alloc: &mut CachingAllocator,
     _stream: CUstream,
 ) -> OwnedTensor {
     let total_q = q.dim(0);
-    let num_heads = q.dim(1);
+    let num_heads_orig = q.dim(1);
     let head_dim = q.dim(2);
     let num_kv_heads = k_cache.dim(2);
 
@@ -2157,23 +2234,93 @@ pub unsafe fn flash_attn_paged_ext(
         0
     };
 
-    // Allocate output and softmax_lse from arena.
-    let out = alloc.alloc_tensor(&[total_q, num_heads, head_dim], q.dtype());
-    let softmax_lse = alloc.alloc_tensor(&[num_heads * total_q], DType::F32);
+    // Python line 587: override is_causal FIRST (before window_size_right)
+    let is_causal = if max_seqlen_q == 1 { false } else { is_causal };
+    // Python line 588: then compute window_size_right
+    let window_size_right = if is_causal { 0 } else { -1_i32 };
 
-    // Q/O: [total_q, num_heads, head_dim] contiguous
-    let q_row_stride = (num_heads * head_dim) as i64;
-    let q_head_stride = head_dim as i64;
+    // --- seqlenq_ngroups_swapped (matching Python flash_api.cpp lines 594-601) ---
+    let ngroups = num_heads_orig / num_kv_heads;
+    let do_swap = max_seqlen_q == 1
+        && num_heads_orig > num_kv_heads
+        && window_size_left < 0
+        && window_size_right < 0
+        && softcap == 0.0
+        && head_dim.is_multiple_of(8);
+    // Working dimensions after swap
+    let (eff_max_seqlen_q, eff_num_heads, eff_total_q) = if do_swap {
+        (ngroups, num_kv_heads, batch_size * ngroups)
+    } else {
+        (max_seqlen_q, num_heads_orig, total_q)
+    };
+
+    // --- Allocate all temporaries up front so they stay alive past mha_varlen_fwd ---
+
+    // Output in original layout [total_q, num_heads_orig, head_dim]
+    let final_out = alloc.alloc_tensor(&[total_q, num_heads_orig, head_dim], q.dtype());
+
+    // If swapped, kernel writes to a temp buffer; otherwise directly to final_out
+    let kernel_out_buf = if do_swap {
+        Some(alloc.alloc_tensor(&[eff_total_q, eff_num_heads, head_dim], q.dtype()))
+    } else {
+        None
+    };
+    let out_ptr = match &kernel_out_buf {
+        Some(buf) => buf.raw_ptr() as *mut c_void,
+        None => final_out.raw_ptr() as *mut c_void,
+    };
+
+    // softmax_lse: Python uses [num_heads, total_q] with unpadded_lse=true
+    let softmax_lse = alloc.alloc_tensor(&[eff_num_heads * eff_total_q], DType::F32);
+
+    // Transpose Q if swapped: [B, H, D] -> [B*ngroups, Hk, D]
+    // Python: q.reshape({B, Hk, ngroups, D}).transpose(1,2).reshape({B*ngroups, Hk, D})
+    // The reshape after transpose triggers a clone (contiguous copy).
+    let q_swapped_buf = if do_swap {
+        let buf = alloc.alloc_tensor(&[eff_total_q, eff_num_heads, head_dim], q.dtype());
+        ngroups_transpose_q(
+            q.raw_ptr() as *const c_void,
+            buf.raw_ptr() as *mut c_void,
+            batch_size as i32,
+            num_heads_orig as i32,
+            num_kv_heads as i32,
+            ngroups as i32,
+            head_dim as i32,
+            _stream,
+        );
+        Some(buf)
+    } else {
+        None
+    };
+
+    let (q_ptr, q_row_stride, q_head_stride) = match &q_swapped_buf {
+        Some(buf) => (
+            buf.raw_ptr() as *mut c_void,
+            (num_kv_heads * head_dim) as i64, // contiguous [B*ngroups, Hk, D]
+            head_dim as i64,
+        ),
+        None => (
+            q.raw_ptr() as *mut c_void,
+            (num_heads_orig * head_dim) as i64,
+            head_dim as i64,
+        ),
+    };
+
+    let o_row_stride = if do_swap {
+        (eff_num_heads * head_dim) as i64
+    } else {
+        (num_heads_orig * head_dim) as i64
+    };
+    let o_head_stride = head_dim as i64;
 
     // K/V cache: [num_blocks, block_size, num_kv_heads, head_dim]
     let kv_block_stride = (block_size * num_kv_heads * head_dim) as i64;
     let kv_row_stride = (num_kv_heads * head_dim) as i64;
     let kv_head_stride = head_dim as i64;
 
-    // Python passes dummy zeros for cu_seqlens_k when using paged KV + seqused_k.
-    // We allocate a zero-filled buffer from the arena for this.
+    // Python passes cu_seqlens_k.data_ptr() (line 683). We use a zero buffer
+    // since our caller doesn't provide cu_seqlens_k for the paged path.
     let dummy_cu_seqlens_k = alloc.alloc_tensor(&[batch_size + 1], DType::I32);
-    // Arena memory is NOT guaranteed to be zeroed. Zero it explicitly.
     crate::driver::memset_d8(
         dummy_cu_seqlens_k.raw_ptr(),
         0,
@@ -2182,29 +2329,78 @@ pub unsafe fn flash_attn_paged_ext(
     )
     .expect("memset dummy_cu_seqlens_k");
 
-    // Always use num_splits=1, matching Python vLLM's FA2 behavior.
-    // The upstream vllm-flash-attn C code always sets params.num_splits = 1.
-    // Our shim previously computed multi-split values via a heuristic, but
-    // Python FA2 never uses num_splits > 1.
-    let num_splits = 1;
-    let lse_accum_ptr: *mut c_void = std::ptr::null_mut();
-    let out_accum_ptr: *mut c_void = std::ptr::null_mut();
+    // Python: cu_seqlens_q_d = nullptr when swapped (line 600).
+    // The C shim then uses q_batch_stride instead of cu_seqlens_q.
+    let cu_seqlens_q_ptr: *const i32 = if do_swap {
+        std::ptr::null()
+    } else {
+        cu_seqlens_q.as_ptr::<i32>()
+    };
+
+    // --- num_splits heuristic (only when swapped, matching Python line 705-710) ---
+    let head_size_rounded = round_multiple(head_dim, if head_dim <= 128 { 32 } else { 64 });
+    let block_n = if head_dim <= 64 {
+        256
+    } else if head_dim <= 128 {
+        128
+    } else {
+        64
+    };
+    // Python: (max_seqlen_k + block_n - 1) / block_n (line 307)
+    let num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+    // Python: (max_seqlen_q + 64 - 1) / 64 (line 310)
+    let num_m_blocks = (eff_max_seqlen_q + 63) / 64;
+
+    let num_splits = if do_swap && num_sm > 0 {
+        num_splits_heuristic(
+            batch_size * eff_num_heads * num_m_blocks,
+            (num_sm as usize) * 2,
+            num_n_blocks,
+            128,
+        )
+    } else {
+        1
+    };
+
+    // Allocate split-K accum buffers — keep alive past mha_varlen_fwd
+    let lse_accum_buf = if num_splits > 1 {
+        Some(alloc.alloc_tensor(
+            &[num_splits * batch_size * eff_num_heads * eff_max_seqlen_q],
+            DType::F32,
+        ))
+    } else {
+        None
+    };
+    let out_accum_buf = if num_splits > 1 {
+        Some(alloc.alloc_tensor(
+            &[num_splits * batch_size * eff_num_heads * eff_max_seqlen_q * head_size_rounded],
+            DType::F32,
+        ))
+    } else {
+        None
+    };
+    let lse_accum_ptr = lse_accum_buf
+        .as_ref()
+        .map_or(std::ptr::null_mut(), |t| t.raw_ptr() as *mut c_void);
+    let out_accum_ptr = out_accum_buf
+        .as_ref()
+        .map_or(std::ptr::null_mut(), |t| t.raw_ptr() as *mut c_void);
 
     mha_varlen_fwd(
-        q.raw_ptr() as *mut c_void,
+        q_ptr,
         k_cache.raw_ptr() as *mut c_void,
         v_cache.raw_ptr() as *mut c_void,
-        out.raw_ptr() as *mut c_void,
+        out_ptr,
         softmax_lse.raw_ptr() as *mut c_void,
-        cu_seqlens_q.as_ptr::<i32>(),
+        cu_seqlens_q_ptr,
         dummy_cu_seqlens_k.as_ptr::<i32>(),
         seqused_k.as_ptr::<i32>(),
         block_table.as_ptr::<i32>(),
         max_blocks_per_seq as i32,
         batch_size as i32,
-        max_seqlen_q as i32,
+        eff_max_seqlen_q as i32,
         max_seqlen_k as i32,
-        num_heads as i32,
+        eff_num_heads as i32,
         num_kv_heads as i32,
         head_dim as i32,
         block_size as i32,
@@ -2213,21 +2409,45 @@ pub unsafe fn flash_attn_paged_ext(
         kv_block_stride,
         kv_row_stride,
         kv_head_stride,
-        q_row_stride,  // o_row_stride = same as q
-        q_head_stride, // o_head_stride = same as q
+        o_row_stride,
+        o_head_stride,
         softmax_scale,
         if is_causal { 1 } else { 0 },
         window_size_left,
-        if is_causal { 0 } else { -1 },
+        window_size_right,
         softcap,
         if q.dtype() == DType::BF16 { 1 } else { 0 },
         num_splits as i32,
         lse_accum_ptr,
         out_accum_ptr,
+        if do_swap { 1 } else { 0 },
+        eff_total_q as i32,
         _stream,
     );
 
-    out
+    // Ensure temporaries stay alive past the kernel call
+    drop(lse_accum_buf);
+    drop(out_accum_buf);
+    drop(q_swapped_buf);
+
+    // Untranspose output if swapped: [B*ngroups, Hk, D] -> [B, H, D]
+    // Python: out.reshape({B, ngroups, Hk, D}).transpose(1,2) then copy_ to original out
+    if do_swap && let Some(ref kout) = kernel_out_buf {
+        ngroups_untranspose_o(
+            kout.raw_ptr() as *const c_void,
+            final_out.raw_ptr() as *mut c_void,
+            batch_size as i32,
+            num_heads_orig as i32,
+            num_kv_heads as i32,
+            ngroups as i32,
+            head_dim as i32,
+            _stream,
+        );
+    }
+    drop(kernel_out_buf);
+    drop(dummy_cu_seqlens_k);
+
+    final_out
 }
 
 // ---------------------------------------------------------------------------
@@ -3694,6 +3914,8 @@ mod tests_flash_attn {
                 0,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
+                0, // seqlenq_ngroups_swapped = false
+                total_q as i32,
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -3769,6 +3991,8 @@ mod tests_flash_attn {
                 1, // num_splits=1 (paged requires explicit value)
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
+                0, // seqlenq_ngroups_swapped = false
+                total_q as i32,
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -3871,6 +4095,8 @@ mod tests_flash_attn {
                 1, // num_splits=1 (paged requires explicit value)
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
+                0, // seqlenq_ngroups_swapped = false
+                total_q as i32,
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -3961,6 +4187,8 @@ mod tests_flash_attn {
                 1, // num_splits=1 (paged requires explicit value)
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
+                0, // seqlenq_ngroups_swapped = false
+                total_q as i32,
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -4048,6 +4276,8 @@ mod tests_flash_attn {
                 1, // num_splits=1 (paged requires explicit value)
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
+                0, // seqlenq_ngroups_swapped = false
+                total_q as i32,
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -4180,6 +4410,8 @@ mod tests_flash_attn {
                     1, // num_splits
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
+                    0, // seqlenq_ngroups_swapped = false
+                    1, // total_q
                     stream,
                 );
             };
@@ -4373,6 +4605,8 @@ mod tests_flash_attn {
                 1, // num_splits
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
+                0, // seqlenq_ngroups_swapped = false
+                total_q as i32,
                 stream,
             );
         };
@@ -4579,6 +4813,8 @@ mod tests_flash_attn {
                 1,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
+                0, // seqlenq_ngroups_swapped = false
+                total_q as i32,
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");

@@ -45,6 +45,84 @@ static void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool forc
 static inline int round_up(int x, int m) { return (x + m - 1) / m * m; }
 
 // ---------------------------------------------------------------------------
+// Q transpose for seqlenq_ngroups_swapped.
+//
+// Transposes Q from [B, H, D] (varlen with seqlen_q=1) to [B*ngroups, Hk, D].
+// Python: q.reshape(B, Hk, ngroups, D).transpose(1,2).reshape(B*ngroups, Hk, D)
+// This is equivalent to: for head h_orig = hk*ngroups+g, copy to position
+// (b*ngroups+g)*Hk*D + hk*D.
+// ---------------------------------------------------------------------------
+
+__global__ void ngroups_transpose_kernel(
+    const uint16_t* __restrict__ src,  // [B, H, D]
+    uint16_t* __restrict__ dst,        // [B*ngroups, Hk, D]
+    int B, int H, int Hk, int ngroups, int D
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * H * D;
+    if (idx >= total) return;
+
+    int d = idx % D;
+    int h = (idx / D) % H;
+    int b = idx / (H * D);
+
+    int hk = h / ngroups;
+    int g  = h % ngroups;
+
+    int dst_idx = (b * ngroups + g) * Hk * D + hk * D + d;
+    dst[dst_idx] = src[idx];
+}
+
+// Reverse: from [B*ngroups, Hk, D] back to [B, H, D]
+__global__ void ngroups_untranspose_kernel(
+    const uint16_t* __restrict__ src,  // [B*ngroups, Hk, D]
+    uint16_t* __restrict__ dst,        // [B, H, D]
+    int B, int H, int Hk, int ngroups, int D
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * H * D;
+    if (idx >= total) return;
+
+    int d = idx % D;
+    int h = (idx / D) % H;
+    int b = idx / (H * D);
+
+    int hk = h / ngroups;
+    int g  = h % ngroups;
+
+    int src_idx = (b * ngroups + g) * Hk * D + hk * D + d;
+    dst[idx] = src[src_idx];
+}
+
+extern "C" void ngroups_transpose_q(
+    const void *src, void *dst,
+    int batch_size, int num_heads, int num_heads_k, int ngroups, int head_dim,
+    cudaStream_t stream
+) {
+    int total = batch_size * num_heads * head_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    ngroups_transpose_kernel<<<blocks, threads, 0, stream>>>(
+        (const uint16_t*)src, (uint16_t*)dst,
+        batch_size, num_heads, num_heads_k, ngroups, head_dim
+    );
+}
+
+extern "C" void ngroups_untranspose_o(
+    const void *src, void *dst,
+    int batch_size, int num_heads, int num_heads_k, int ngroups, int head_dim,
+    cudaStream_t stream
+) {
+    int total = batch_size * num_heads * head_dim;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    ngroups_untranspose_kernel<<<blocks, threads, 0, stream>>>(
+        (const uint16_t*)src, (uint16_t*)dst,
+        batch_size, num_heads, num_heads_k, ngroups, head_dim
+    );
+}
+
+// ---------------------------------------------------------------------------
 // mha_varlen_fwd — unified entry point for both contiguous and paged KV.
 //
 // Parameter setup matches vllm-flash-attn/kernels/flash_api.cu exactly.
@@ -98,9 +176,15 @@ extern "C" void mha_varlen_fwd(
     int32_t is_bf16,
     int32_t num_splits,
 
-    // Split-K accumulators (unused — kept for API compat)
+    // Split-K accumulators (required when num_splits > 1)
     void *softmax_lse_accum_ptr,
     void *out_accum_ptr,
+
+    // seqlenq_ngroups_swapped flag (set by Rust caller)
+    int32_t seqlenq_ngroups_swapped,
+
+    // total number of Q tokens (Python: q.sizes()[0])
+    int32_t total_q,
 
     cudaStream_t stream
 ) {
@@ -120,10 +204,19 @@ extern "C" void mha_varlen_fwd(
     params.softmax_lse_ptr = softmax_lse_ptr;
     params.alibi_slopes_ptr = nullptr;
 
-    params.q_batch_stride = 0;
+    // When seqlenq_ngroups_swapped, cu_seqlens_q is nullptr and we use
+    // batch strides instead — matching Python's set_params_fprop exactly.
+    if (seqlenq_ngroups_swapped && cu_seqlens_q == nullptr) {
+        // q is [B*ngroups, Hk, D] contiguous. q.stride(0) = Hk * D = q_row_stride.
+        // Python multiplies by seqlen_q (= ngroups).
+        params.q_batch_stride = q_row_stride * max_seqlen_q;
+        params.o_batch_stride = o_row_stride * max_seqlen_q;
+    } else {
+        params.q_batch_stride = 0;
+        params.o_batch_stride = 0;
+    }
     params.k_batch_stride = k_batch_stride;
     params.v_batch_stride = k_batch_stride;
-    params.o_batch_stride = 0;
     params.alibi_slopes_batch_stride = 0;
 
     params.q_row_stride = q_row_stride;
@@ -167,14 +260,22 @@ extern "C" void mha_varlen_fwd(
     params.seqused_k = seqused_k;
     params.p_ptr = nullptr;
 
-    // Causal / window — set directly, same as upstream flash_api.cu
-    params.is_causal = is_causal;
-    params.window_size_left = window_size_left;
-    params.window_size_right = window_size_right;
+    // Causal / window — matching set_params_fprop lines 139-144 exactly.
+    // is_causal is recomputed from window sizes (not from the input flag).
+    params.is_causal = window_size_left < 0 && window_size_right == 0;
+
+    int wsl = window_size_left;
+    int wsr = window_size_right;
+    if (wsl < 0 && wsr >= 0) { wsl = max_seqlen_k; }
+    if (wsl >= 0 && wsr < 0) { wsr = max_seqlen_k; }
+    params.window_size_left = wsl;
+    params.window_size_right = wsr;
 
     params.is_seqlens_k_cumulative = true;
     params.unpadded_lse = 1;
     params.num_splits = num_splits;
+    params.total_q = total_q;
+    params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
 
     // Paged KV
     const bool paged = (block_table != nullptr);

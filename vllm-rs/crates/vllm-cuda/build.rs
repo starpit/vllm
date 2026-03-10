@@ -52,6 +52,7 @@ fn cuda_build() {
         "csrc/gdn_conv1d_kernels.cu",
         "csrc/gdn_recurrent_kernels.cu",
         "csrc/gdn_split_kernels.cu",
+        "csrc/mla_kernels.cu",
     ];
     let vllm_watch = ["csrc/vec_utils.cuh"];
 

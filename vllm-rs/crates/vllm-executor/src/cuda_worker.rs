@@ -88,6 +88,7 @@ enum CudaModel {
     Qwen3Moe(vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM),
     CommandR(vllm_cuda::model::commandr::CommandRForCausalLM),
     Qwen3Next(vllm_cuda::model::qwen3_next::Qwen3NextForCausalLM),
+    DeepSeekV2(vllm_cuda::model::deepseek_v2::DeepSeekV2ForCausalLM),
 }
 
 impl CudaModel {
@@ -103,6 +104,7 @@ impl CudaModel {
             Self::CommandR(m) => m.model.layers.len(),
             // Only full attention layers need KV cache.
             Self::Qwen3Next(m) => m.num_kv_layers(),
+            Self::DeepSeekV2(m) => m.model.layers.len(),
         }
     }
 
@@ -117,6 +119,7 @@ impl CudaModel {
             Self::Qwen3Moe(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::CommandR(m) => m.model.layers[0].self_attn.inner.num_kv_heads,
             Self::Qwen3Next(m) => m.num_kv_heads(),
+            Self::DeepSeekV2(m) => m.model.layers[0].self_attn.num_heads,
         }
     }
 
@@ -131,6 +134,7 @@ impl CudaModel {
             Self::Qwen3Moe(m) => m.model.layers[0].self_attn.head_dim,
             Self::CommandR(m) => m.model.layers[0].self_attn.inner.head_dim,
             Self::Qwen3Next(m) => m.head_dim(),
+            Self::DeepSeekV2(m) => m.model.layers[0].self_attn.qk_head_dim,
         }
     }
 
@@ -145,6 +149,7 @@ impl CudaModel {
             Self::Qwen3Moe(m) => m.lm_head.out_features(),
             Self::CommandR(m) => m.lm_head.out_features(),
             Self::Qwen3Next(m) => m.lm_head.out_features(),
+            Self::DeepSeekV2(m) => m.lm_head.out_features(),
         }
     }
 
@@ -159,6 +164,7 @@ impl CudaModel {
             Self::Qwen3Moe(m) => m.lm_head.in_features(),
             Self::CommandR(m) => m.lm_head.in_features(),
             Self::Qwen3Next(m) => m.lm_head.in_features(),
+            Self::DeepSeekV2(m) => m.lm_head.in_features(),
         }
     }
 
@@ -175,6 +181,7 @@ impl CudaModel {
             Self::Qwen3Moe(m) => m.set_tp_group(group),
             Self::CommandR(_) => {}  // TP not yet supported
             Self::Qwen3Next(_) => {} // TP not yet supported
+            Self::DeepSeekV2(m) => m.set_tp_group(group),
         }
     }
 
@@ -313,6 +320,20 @@ impl CudaModel {
             Self::Qwen3Next(_) => {
                 panic!("Qwen3Next: use forward_owned with GDN context");
             }
+            Self::DeepSeekV2(m) => unsafe {
+                m.model.forward_owned(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                )
+            },
         }
     }
 
@@ -459,6 +480,21 @@ impl CudaModel {
             Self::Qwen3Next(_) => {
                 panic!("Qwen3Next: use forward_qwen3_next directly");
             }
+            Self::DeepSeekV2(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
         }
     }
 
@@ -602,6 +638,21 @@ impl CudaModel {
             Self::Qwen3Next(_) => {
                 panic!("Qwen3Next: use forward_qwen3_next directly");
             }
+            Self::DeepSeekV2(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
         }
     }
 
@@ -1150,6 +1201,135 @@ fn qwen3_next_config_from_hf(
             .get("layer_scale")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+    })
+}
+
+fn deepseek_v2_config_from_hf(
+    hf: &HfModelConfig,
+) -> ExecutorResult<vllm_cuda::model::deepseek_v2::DeepSeekV2Config> {
+    use vllm_cuda::model::deepseek_v2::{DeepSeekV2Config, YarnRopeScaling};
+
+    let hidden_size = hf
+        .hidden_size
+        .ok_or_else(|| ExecutorError::WorkerInit("missing hidden_size".into()))?;
+    let num_attention_heads = hf
+        .num_attention_heads
+        .ok_or_else(|| ExecutorError::WorkerInit("missing num_attention_heads".into()))?;
+
+    let qk_nope_head_dim = hf
+        .extra
+        .get("qk_nope_head_dim")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ExecutorError::WorkerInit("missing qk_nope_head_dim".into()))?
+        as usize;
+    let qk_rope_head_dim = hf
+        .extra
+        .get("qk_rope_head_dim")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ExecutorError::WorkerInit("missing qk_rope_head_dim".into()))?
+        as usize;
+    let v_head_dim = hf
+        .extra
+        .get("v_head_dim")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ExecutorError::WorkerInit("missing v_head_dim".into()))?
+        as usize;
+    let q_lora_rank = hf
+        .extra
+        .get("q_lora_rank")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let kv_lora_rank = hf
+        .extra
+        .get("kv_lora_rank")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| ExecutorError::WorkerInit("missing kv_lora_rank".into()))?
+        as usize;
+
+    let n_routed_experts = hf
+        .extra
+        .get("n_routed_experts")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let n_shared_experts = hf
+        .extra
+        .get("n_shared_experts")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let num_experts_per_tok = hf
+        .extra
+        .get("num_experts_per_tok")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let first_k_dense_replace = hf
+        .extra
+        .get("first_k_dense_replace")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let moe_intermediate_size = hf
+        .extra
+        .get("moe_intermediate_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let norm_topk_prob = hf
+        .extra
+        .get("norm_topk_prob")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let routed_scaling_factor = hf
+        .extra
+        .get("routed_scaling_factor")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0);
+
+    // YaRN rope_scaling (optional)
+    let yarn_rope_scaling = hf.extra.get("rope_scaling").and_then(|rs| {
+        let rope_type = rs
+            .get("rope_type")
+            .or_else(|| rs.get("type"))
+            .and_then(|v| v.as_str())?;
+        if rope_type != "yarn" {
+            return None;
+        }
+        Some(YarnRopeScaling {
+            factor: rs.get("factor")?.as_f64()?,
+            mscale: rs.get("mscale").and_then(|v| v.as_f64()).unwrap_or(1.0),
+            mscale_all_dim: rs
+                .get("mscale_all_dim")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+            original_max_position_embeddings: rs
+                .get("original_max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4096) as usize,
+            beta_fast: rs.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0),
+            beta_slow: rs.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0),
+        })
+    });
+
+    Ok(DeepSeekV2Config {
+        hidden_size,
+        num_attention_heads,
+        num_hidden_layers: hf.num_hidden_layers.unwrap_or(60),
+        intermediate_size: hf.intermediate_size.unwrap_or(hidden_size * 4),
+        vocab_size: hf.vocab_size.unwrap_or(102400),
+        max_position_embeddings: hf.max_position_embeddings.unwrap_or(163840),
+        rms_norm_eps: hf.rms_norm_eps.unwrap_or(1e-6) as f32,
+        rope_theta: hf.rope_theta.unwrap_or(10000.0),
+        tie_word_embeddings: hf.tie_word_embeddings.unwrap_or(false),
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+        q_lora_rank,
+        kv_lora_rank,
+        n_routed_experts,
+        n_shared_experts,
+        num_experts_per_tok,
+        first_k_dense_replace,
+        moe_intermediate_size,
+        norm_topk_prob,
+        routed_scaling_factor,
+        yarn_rope_scaling,
     })
 }
 
@@ -2990,6 +3170,27 @@ impl Worker for CudaWorker {
                 self.qwen3_next_config = Some(config);
                 CudaModel::Qwen3Next(m)
             }
+            "DeepseekV2ForCausalLM" | "DeepSeekV3ForCausalLM" => {
+                let config = deepseek_v2_config_from_hf(&hf_config)?;
+                let m = if use_tp {
+                    vllm_cuda::model::deepseek_v2::DeepSeekV2ForCausalLM::load_tp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        tp,
+                        device,
+                    )
+                } else {
+                    vllm_cuda::model::deepseek_v2::DeepSeekV2ForCausalLM::load(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                }
+                .map_err(|e| ExecutorError::WorkerInit(format!("DeepSeekV2 load: {e}")))?;
+                CudaModel::DeepSeekV2(m)
+            }
             "CohereForCausalLM" => {
                 let config = commandr_config_from_hf(&hf_config)?;
                 let m = if qconfig.is_bnb4bit() {
@@ -3022,7 +3223,7 @@ impl Worker for CudaWorker {
                      Phi3ForCausalLM, Qwen2ForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM, \
                      Gemma3ForConditionalGeneration, GraniteForCausalLM, MixtralForCausalLM, \
                      Qwen2MoeForCausalLM, Qwen3MoeForCausalLM, CohereForCausalLM, \
-                     Qwen3NextForCausalLM"
+                     Qwen3NextForCausalLM, DeepseekV2ForCausalLM, DeepSeekV3ForCausalLM"
                 )));
             }
         };

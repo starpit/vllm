@@ -288,6 +288,44 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Interleaved rotary embedding (in-place on q and k, DeepSeek MLA style)
+    fn rotary_embedding_interleaved_f16(
+        positions: *const u32,
+        query: *mut u16,
+        key: *mut u16,
+        cos_sin_cache: *const u16,
+        rotary_dim: i32,
+        total_q_dim: i32,
+        total_k_dim: i32,
+        head_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+    fn rotary_embedding_interleaved_bf16(
+        positions: *const u32,
+        query: *mut u16,
+        key: *mut u16,
+        cos_sin_cache: *const u16,
+        rotary_dim: i32,
+        total_q_dim: i32,
+        total_k_dim: i32,
+        head_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+    fn rotary_embedding_interleaved_f32(
+        positions: *const u32,
+        query: *mut f32,
+        key: *mut f32,
+        cos_sin_cache: *const f32,
+        rotary_dim: i32,
+        total_q_dim: i32,
+        total_k_dim: i32,
+        head_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+
     // Embedding gather
     fn embedding_gather_f16(
         out: *mut u16,
@@ -617,6 +655,193 @@ unsafe extern "C" {
         num_kv_heads: c_int,
         head_dim: c_int,
         num_tokens: c_int,
+        stream: CUstream,
+    );
+
+    // MLA data movement kernels (DeepSeek V2/V3)
+    fn mla_split_kv_a_f16(
+        src: *const c_void,
+        dst_latent: *mut c_void,
+        dst_k_pe: *mut c_void,
+        num_tokens: c_int,
+        kv_lora_rank: c_int,
+        rope_dim: c_int,
+        stream: CUstream,
+    );
+    fn mla_split_kv_a_bf16(
+        src: *const c_void,
+        dst_latent: *mut c_void,
+        dst_k_pe: *mut c_void,
+        num_tokens: c_int,
+        kv_lora_rank: c_int,
+        rope_dim: c_int,
+        stream: CUstream,
+    );
+    fn mla_split_kv_a_f32(
+        src: *const c_void,
+        dst_latent: *mut c_void,
+        dst_k_pe: *mut c_void,
+        num_tokens: c_int,
+        kv_lora_rank: c_int,
+        rope_dim: c_int,
+        stream: CUstream,
+    );
+
+    fn mla_extract_q_pe_f16(
+        src: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_head_dim: c_int,
+        qk_nope_head_dim: c_int,
+        rope_dim: c_int,
+        stream: CUstream,
+    );
+    fn mla_extract_q_pe_bf16(
+        src: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_head_dim: c_int,
+        qk_nope_head_dim: c_int,
+        rope_dim: c_int,
+        stream: CUstream,
+    );
+    fn mla_extract_q_pe_f32(
+        src: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_head_dim: c_int,
+        qk_nope_head_dim: c_int,
+        rope_dim: c_int,
+        stream: CUstream,
+    );
+
+    fn mla_write_q_pe_f16(
+        src: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_head_dim: c_int,
+        qk_nope_head_dim: c_int,
+        rope_dim: c_int,
+        stream: CUstream,
+    );
+    fn mla_write_q_pe_bf16(
+        src: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_head_dim: c_int,
+        qk_nope_head_dim: c_int,
+        rope_dim: c_int,
+        stream: CUstream,
+    );
+    fn mla_write_q_pe_f32(
+        src: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_head_dim: c_int,
+        qk_nope_head_dim: c_int,
+        rope_dim: c_int,
+        stream: CUstream,
+    );
+
+    fn mla_assemble_k_f16(
+        kv_b: *const c_void,
+        k_pe: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_nope_head_dim: c_int,
+        qk_rope_head_dim: c_int,
+        v_head_dim: c_int,
+        qk_head_dim: c_int,
+        stream: CUstream,
+    );
+    fn mla_assemble_k_bf16(
+        kv_b: *const c_void,
+        k_pe: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_nope_head_dim: c_int,
+        qk_rope_head_dim: c_int,
+        v_head_dim: c_int,
+        qk_head_dim: c_int,
+        stream: CUstream,
+    );
+    fn mla_assemble_k_f32(
+        kv_b: *const c_void,
+        k_pe: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_nope_head_dim: c_int,
+        qk_rope_head_dim: c_int,
+        v_head_dim: c_int,
+        qk_head_dim: c_int,
+        stream: CUstream,
+    );
+
+    fn mla_assemble_v_f16(
+        kv_b: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_nope_head_dim: c_int,
+        v_head_dim: c_int,
+        qk_head_dim: c_int,
+        stream: CUstream,
+    );
+    fn mla_assemble_v_bf16(
+        kv_b: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_nope_head_dim: c_int,
+        v_head_dim: c_int,
+        qk_head_dim: c_int,
+        stream: CUstream,
+    );
+    fn mla_assemble_v_f32(
+        kv_b: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_nope_head_dim: c_int,
+        v_head_dim: c_int,
+        qk_head_dim: c_int,
+        stream: CUstream,
+    );
+
+    fn mla_slice_attn_output_f16(
+        src: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_head_dim: c_int,
+        v_head_dim: c_int,
+        stream: CUstream,
+    );
+    fn mla_slice_attn_output_bf16(
+        src: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_head_dim: c_int,
+        v_head_dim: c_int,
+        stream: CUstream,
+    );
+    fn mla_slice_attn_output_f32(
+        src: *const c_void,
+        dst: *mut c_void,
+        num_tokens: c_int,
+        num_heads: c_int,
+        qk_head_dim: c_int,
+        v_head_dim: c_int,
         stream: CUstream,
     );
 }
@@ -1137,6 +1362,387 @@ pub unsafe fn rotary_embedding_inplace(
             stream,
         ),
         _ => panic!("rotary_embedding: unsupported dtype {:?}", q.dtype()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interleaved Rotary Embedding (in-place, DeepSeek MLA style)
+// ---------------------------------------------------------------------------
+
+/// Interleaved RoPE in-place on Q and K.
+///
+/// Like `rotary_embedding_inplace` but uses interleaved pair layout
+/// (pairs at [2i, 2i+1]) instead of NeoX layout (pairs at [i, i+half]).
+/// Used by DeepSeek V2/V3 MLA attention.
+///
+/// * `q`: `[num_tokens, total_q_dim]` — modified in place
+/// * `k`: `[num_tokens, total_k_dim]` — modified in place
+/// * `positions`: `[num_tokens]` (U32)
+/// * `cos_sin_cache`: `[max_pos, rotary_dim]`
+/// * `head_dim`: dimension per head (for stride computation)
+pub unsafe fn rotary_embedding_interleaved_inplace(
+    q: GpuTensor,
+    k: GpuTensor,
+    positions: GpuTensor,
+    cos_sin_cache: GpuTensor,
+    head_dim: usize,
+    stream: CUstream,
+) {
+    let num_tokens = q.dim(0) as i32;
+    let total_q_dim = q.dim(1) as i32;
+    let total_k_dim = k.dim(1) as i32;
+    let rotary_dim = cos_sin_cache.dim(1) as i32;
+    let head_size = head_dim as i32;
+
+    match q.dtype() {
+        DType::F16 => rotary_embedding_interleaved_f16(
+            positions.as_ptr(),
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            cos_sin_cache.as_ptr(),
+            rotary_dim,
+            total_q_dim,
+            total_k_dim,
+            head_size,
+            num_tokens,
+            stream,
+        ),
+        DType::BF16 => rotary_embedding_interleaved_bf16(
+            positions.as_ptr(),
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            cos_sin_cache.as_ptr(),
+            rotary_dim,
+            total_q_dim,
+            total_k_dim,
+            head_size,
+            num_tokens,
+            stream,
+        ),
+        DType::F32 => rotary_embedding_interleaved_f32(
+            positions.as_ptr(),
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            cos_sin_cache.as_ptr(),
+            rotary_dim,
+            total_q_dim,
+            total_k_dim,
+            head_size,
+            num_tokens,
+            stream,
+        ),
+        _ => panic!(
+            "rotary_embedding_interleaved: unsupported dtype {:?}",
+            q.dtype()
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MLA Data Movement (DeepSeek V2/V3)
+// ---------------------------------------------------------------------------
+
+/// Split kv_a output into latent and k_pe.
+/// * `src`: `[num_tokens, kv_lora_rank + rope_dim]`
+/// * `dst_latent`: `[num_tokens, kv_lora_rank]`
+/// * `dst_k_pe`: `[num_tokens, rope_dim]`
+pub unsafe fn mla_split_kv_a(
+    src: GpuTensor,
+    dst_latent: GpuTensor,
+    dst_k_pe: GpuTensor,
+    kv_lora_rank: usize,
+    rope_dim: usize,
+    stream: CUstream,
+) {
+    let num_tokens = src.dim(0) as c_int;
+    let s = src.raw_ptr() as *const c_void;
+    let dl = dst_latent.raw_ptr() as *mut c_void;
+    let dk = dst_k_pe.raw_ptr() as *mut c_void;
+    match src.dtype() {
+        DType::F16 => mla_split_kv_a_f16(
+            s,
+            dl,
+            dk,
+            num_tokens,
+            kv_lora_rank as c_int,
+            rope_dim as c_int,
+            stream,
+        ),
+        DType::BF16 => mla_split_kv_a_bf16(
+            s,
+            dl,
+            dk,
+            num_tokens,
+            kv_lora_rank as c_int,
+            rope_dim as c_int,
+            stream,
+        ),
+        DType::F32 => mla_split_kv_a_f32(
+            s,
+            dl,
+            dk,
+            num_tokens,
+            kv_lora_rank as c_int,
+            rope_dim as c_int,
+            stream,
+        ),
+        _ => panic!("mla_split_kv_a: unsupported dtype {:?}", src.dtype()),
+    }
+}
+
+/// Extract q_pe (rope portion) from Q projection output.
+/// * `src`: `[num_tokens, num_heads * qk_head_dim]`
+/// * `dst`: `[num_tokens, num_heads * rope_dim]`
+pub unsafe fn mla_extract_q_pe(
+    src: GpuTensor,
+    dst: GpuTensor,
+    num_heads: usize,
+    qk_head_dim: usize,
+    qk_nope_head_dim: usize,
+    rope_dim: usize,
+    stream: CUstream,
+) {
+    let num_tokens = src.dim(0) as c_int;
+    let s = src.raw_ptr() as *const c_void;
+    let d = dst.raw_ptr() as *mut c_void;
+    match src.dtype() {
+        DType::F16 => mla_extract_q_pe_f16(
+            s,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_head_dim as c_int,
+            qk_nope_head_dim as c_int,
+            rope_dim as c_int,
+            stream,
+        ),
+        DType::BF16 => mla_extract_q_pe_bf16(
+            s,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_head_dim as c_int,
+            qk_nope_head_dim as c_int,
+            rope_dim as c_int,
+            stream,
+        ),
+        DType::F32 => mla_extract_q_pe_f32(
+            s,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_head_dim as c_int,
+            qk_nope_head_dim as c_int,
+            rope_dim as c_int,
+            stream,
+        ),
+        _ => panic!("mla_extract_q_pe: unsupported dtype {:?}", src.dtype()),
+    }
+}
+
+/// Write q_pe back into Q projection output after RoPE.
+/// * `src`: `[num_tokens, num_heads * rope_dim]` (RoPE'd q_pe)
+/// * `dst`: `[num_tokens, num_heads * qk_head_dim]` (Q to write into)
+pub unsafe fn mla_write_q_pe(
+    src: GpuTensor,
+    dst: GpuTensor,
+    num_heads: usize,
+    qk_head_dim: usize,
+    qk_nope_head_dim: usize,
+    rope_dim: usize,
+    stream: CUstream,
+) {
+    let num_tokens = src.dim(0) as c_int;
+    let s = src.raw_ptr() as *const c_void;
+    let d = dst.raw_ptr() as *mut c_void;
+    match src.dtype() {
+        DType::F16 => mla_write_q_pe_f16(
+            s,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_head_dim as c_int,
+            qk_nope_head_dim as c_int,
+            rope_dim as c_int,
+            stream,
+        ),
+        DType::BF16 => mla_write_q_pe_bf16(
+            s,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_head_dim as c_int,
+            qk_nope_head_dim as c_int,
+            rope_dim as c_int,
+            stream,
+        ),
+        DType::F32 => mla_write_q_pe_f32(
+            s,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_head_dim as c_int,
+            qk_nope_head_dim as c_int,
+            rope_dim as c_int,
+            stream,
+        ),
+        _ => panic!("mla_write_q_pe: unsupported dtype {:?}", src.dtype()),
+    }
+}
+
+/// Assemble K from k_nope (in kv_b) + broadcast k_pe.
+/// * `kv_b`: `[num_tokens, num_heads * (nope_dim + v_head_dim)]`
+/// * `k_pe`: `[num_tokens, rope_dim]` (single head, broadcast)
+/// * `dst`: `[num_tokens, num_heads * qk_head_dim]`
+pub unsafe fn mla_assemble_k(
+    kv_b: GpuTensor,
+    k_pe: GpuTensor,
+    dst: GpuTensor,
+    num_heads: usize,
+    qk_nope_head_dim: usize,
+    qk_rope_head_dim: usize,
+    v_head_dim: usize,
+    qk_head_dim: usize,
+    stream: CUstream,
+) {
+    let num_tokens = kv_b.dim(0) as c_int;
+    let kb = kv_b.raw_ptr() as *const c_void;
+    let kp = k_pe.raw_ptr() as *const c_void;
+    let d = dst.raw_ptr() as *mut c_void;
+    match kv_b.dtype() {
+        DType::F16 => mla_assemble_k_f16(
+            kb,
+            kp,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_nope_head_dim as c_int,
+            qk_rope_head_dim as c_int,
+            v_head_dim as c_int,
+            qk_head_dim as c_int,
+            stream,
+        ),
+        DType::BF16 => mla_assemble_k_bf16(
+            kb,
+            kp,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_nope_head_dim as c_int,
+            qk_rope_head_dim as c_int,
+            v_head_dim as c_int,
+            qk_head_dim as c_int,
+            stream,
+        ),
+        DType::F32 => mla_assemble_k_f32(
+            kb,
+            kp,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_nope_head_dim as c_int,
+            qk_rope_head_dim as c_int,
+            v_head_dim as c_int,
+            qk_head_dim as c_int,
+            stream,
+        ),
+        _ => panic!("mla_assemble_k: unsupported dtype {:?}", kv_b.dtype()),
+    }
+}
+
+/// Assemble V: copy v_head_dim from kv_b into zero-padded buffer.
+/// * `kv_b`: `[num_tokens, num_heads * (nope_dim + v_head_dim)]`
+/// * `dst`: `[num_tokens, num_heads * qk_head_dim]` (must be pre-zeroed)
+pub unsafe fn mla_assemble_v(
+    kv_b: GpuTensor,
+    dst: GpuTensor,
+    num_heads: usize,
+    qk_nope_head_dim: usize,
+    v_head_dim: usize,
+    qk_head_dim: usize,
+    stream: CUstream,
+) {
+    let num_tokens = kv_b.dim(0) as c_int;
+    let kb = kv_b.raw_ptr() as *const c_void;
+    let d = dst.raw_ptr() as *mut c_void;
+    match kv_b.dtype() {
+        DType::F16 => mla_assemble_v_f16(
+            kb,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_nope_head_dim as c_int,
+            v_head_dim as c_int,
+            qk_head_dim as c_int,
+            stream,
+        ),
+        DType::BF16 => mla_assemble_v_bf16(
+            kb,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_nope_head_dim as c_int,
+            v_head_dim as c_int,
+            qk_head_dim as c_int,
+            stream,
+        ),
+        DType::F32 => mla_assemble_v_f32(
+            kb,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_nope_head_dim as c_int,
+            v_head_dim as c_int,
+            qk_head_dim as c_int,
+            stream,
+        ),
+        _ => panic!("mla_assemble_v: unsupported dtype {:?}", kv_b.dtype()),
+    }
+}
+
+/// Slice attention output from qk_head_dim to v_head_dim per head.
+/// * `src`: `[num_tokens, num_heads * qk_head_dim]`
+/// * `dst`: `[num_tokens, num_heads * v_head_dim]`
+pub unsafe fn mla_slice_attn_output(
+    src: GpuTensor,
+    dst: GpuTensor,
+    num_heads: usize,
+    qk_head_dim: usize,
+    v_head_dim: usize,
+    stream: CUstream,
+) {
+    let num_tokens = src.dim(0) as c_int;
+    let s = src.raw_ptr() as *const c_void;
+    let d = dst.raw_ptr() as *mut c_void;
+    match src.dtype() {
+        DType::F16 => mla_slice_attn_output_f16(
+            s,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_head_dim as c_int,
+            v_head_dim as c_int,
+            stream,
+        ),
+        DType::BF16 => mla_slice_attn_output_bf16(
+            s,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_head_dim as c_int,
+            v_head_dim as c_int,
+            stream,
+        ),
+        DType::F32 => mla_slice_attn_output_f32(
+            s,
+            d,
+            num_tokens,
+            num_heads as c_int,
+            qk_head_dim as c_int,
+            v_head_dim as c_int,
+            stream,
+        ),
+        _ => panic!("mla_slice_attn_output: unsupported dtype {:?}", src.dtype()),
     }
 }
 

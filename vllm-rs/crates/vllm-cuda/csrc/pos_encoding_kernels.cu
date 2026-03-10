@@ -509,3 +509,109 @@ void fused_qkv_interleaved_rope_bf16(
 }
 
 } // extern "C"
+
+// ---------------------------------------------------------------------------
+// Standalone interleaved RoPE in-place (for MLA partial-dim RoPE)
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void rotary_embedding_interleaved_kernel(
+    const uint32_t* __restrict__ positions,  // [num_tokens]
+    T* __restrict__ query,                   // [num_tokens, total_q_dim]
+    T* __restrict__ key,                     // [num_tokens, total_k_dim]
+    const T* __restrict__ cos_sin_cache,     // [max_pos, rotary_dim]
+    int rotary_dim,                          // = 2 * half_rot
+    int total_q_dim,                         // = num_q_heads * head_size
+    int total_k_dim,                         // = num_kv_heads * head_size
+    int head_size)                           // dimension per head
+{
+    const int token_idx = blockIdx.x;
+    const int pos = static_cast<int>(positions[token_idx]);
+    const int half_rot = rotary_dim / 2;
+    const T* cos_ptr = cos_sin_cache + pos * rotary_dim;
+    const T* sin_ptr = cos_ptr + half_rot;
+    // Number of interleaved pairs per head = min(half_rot, head_size/2)
+    const int num_pairs = (half_rot < head_size / 2) ? half_rot : (head_size / 2);
+
+    // --- Rotate query heads in-place ---
+    const int nqh = total_q_dim / head_size;
+    T* q = query + token_idx * total_q_dim;
+
+    for (int tid = threadIdx.x; tid < nqh * num_pairs; tid += blockDim.x) {
+        const int h = tid / num_pairs;
+        const int p = tid % num_pairs;
+        const int base = h * head_size + 2 * p;  // interleaved: pair at (2p, 2p+1)
+
+        float x0 = static_cast<float>(q[base]);
+        float x1 = static_cast<float>(q[base + 1]);
+        float c = static_cast<float>(cos_ptr[p]);
+        float s = static_cast<float>(sin_ptr[p]);
+
+        q[base]     = static_cast<T>(x0 * c - x1 * s);
+        q[base + 1] = static_cast<T>(x1 * c + x0 * s);
+    }
+
+    // --- Rotate key heads in-place ---
+    if (total_k_dim > 0) {
+        const int nkh = total_k_dim / head_size;
+        T* k = key + token_idx * total_k_dim;
+
+        for (int tid = threadIdx.x; tid < nkh * num_pairs; tid += blockDim.x) {
+            const int h = tid / num_pairs;
+            const int p = tid % num_pairs;
+            const int base = h * head_size + 2 * p;
+
+            float x0 = static_cast<float>(k[base]);
+            float x1 = static_cast<float>(k[base + 1]);
+            float c = static_cast<float>(cos_ptr[p]);
+            float s = static_cast<float>(sin_ptr[p]);
+
+            k[base]     = static_cast<T>(x0 * c - x1 * s);
+            k[base + 1] = static_cast<T>(x1 * c + x0 * s);
+        }
+    }
+}
+
+#define LAUNCH_ROTARY_INTERLEAVED(T)                                            \
+    do {                                                                         \
+        int half = rotary_dim / 2;                                              \
+        int nqh = total_q_dim / head_size;                                      \
+        int work = nqh * half;                                                  \
+        int threads = (work < 512) ? work : 512;                                \
+        if (threads < 1) threads = 1;                                           \
+        rotary_embedding_interleaved_kernel<T><<<num_tokens, threads, 0, stream>>>( \
+            (const uint32_t*)positions, (T*)query, (T*)key,                     \
+            (const T*)cos_sin_cache, rotary_dim, total_q_dim, total_k_dim,      \
+            head_size);                                                          \
+    } while (0)
+
+extern "C" {
+
+void rotary_embedding_interleaved_f32(
+    const void* positions, void* query, void* key,
+    const void* cos_sin_cache, int rotary_dim,
+    int total_q_dim, int total_k_dim, int head_size,
+    int num_tokens, cudaStream_t stream)
+{
+    LAUNCH_ROTARY_INTERLEAVED(float);
+}
+
+void rotary_embedding_interleaved_f16(
+    const void* positions, void* query, void* key,
+    const void* cos_sin_cache, int rotary_dim,
+    int total_q_dim, int total_k_dim, int head_size,
+    int num_tokens, cudaStream_t stream)
+{
+    LAUNCH_ROTARY_INTERLEAVED(__half);
+}
+
+void rotary_embedding_interleaved_bf16(
+    const void* positions, void* query, void* key,
+    const void* cos_sin_cache, int rotary_dim,
+    int total_q_dim, int total_k_dim, int head_size,
+    int num_tokens, cudaStream_t stream)
+{
+    LAUNCH_ROTARY_INTERLEAVED(__nv_bfloat16);
+}
+
+} // extern "C"

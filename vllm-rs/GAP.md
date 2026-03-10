@@ -21,7 +21,7 @@
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
   │ Gemma3 (text)            │ yes          │ yes        │ CUDA graphs supported               │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
-  │ DeepSeek V2/V3 (MLA+MoE) │ yes          │ no         │ Complex: MLA attention, MoE gating │
+  │ DeepSeek V2/V3 (MLA+MoE) │ yes          │ yes (V2)   │ Non-absorbed MLA, 6 MLA CUDA kernels, YaRN RoPE. V3 needs grouped routing │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
   │ Command R                │ yes          │ yes        │ BNB 4-bit verified on L40S         │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
@@ -33,7 +33,7 @@
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
   │ Granite                  │ yes          │ yes        │ LLaMA + 4 scalar multipliers       │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
-  │ Kimi K2.5                │ yes          │ no         │ DeepSeek V2 backbone               │
+  │ Kimi K2.5                │ yes          │ yes        │ DeepSeek V2 backbone               │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
   │ Qwen3-Next (GDN+MoE)     │ yes          │ yes        │ Hybrid GDN + full attention, E2E verified │
   └──────────────────────────┴──────────────┴────────────┴────────────────────────────────────┘
@@ -306,8 +306,9 @@
   │ token_mask in align_block_size       │ Used for masked expert routing in some configurations.      │
   │                                      │ Not used by Mixtral/Qwen MoE.                               │
   ├──────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
-  │ DeepSeek MoE (shared + routed)       │ Different MoE pattern: shared expert runs unconditionally,  │
-  │                                      │ routed experts have fine-grained routing. Needs MLA too.    │
+  │ DeepSeek MoE (shared + routed)       │ DONE for V2 (standard top-k + shared expert, no sigmoid     │
+  │                                      │ gate). V3 needs: grouped top-k, sigmoid scoring,            │
+  │                                      │ e_score_correction_bias/noaux_tc routing.                    │
   └──────────────────────────────────────┴──────────────────────────────────────────────────────────────┘
 
   7. Multimodal
@@ -368,7 +369,7 @@
   3. ~~Sampling correctness: GPU-native penalties, logit bias, grammar, logprobs~~ — **DONE** (full GPU parity, no CPU fallback, 18/18 E2E tests)
   4. ~~GGUF support~~ — **DONE** (GgmlLinear + quantized.cu dequant kernels, Qwen2.5/Qwen3 E2E verified)
   5. ~~MoE kernel + models: Fused MoE GEMM, then port Mixtral/Qwen MoE/Qwen3 MoE~~ — **DONE** (WMMA tensor-core kernel, 3 models)
-  6. DeepSeek V2/V3 (MLA): Most complex arch — absorbed-MLA attention, MoE
+  6. ~~DeepSeek V2/V3 (MLA): Non-absorbed MLA + MoE~~ — **DONE** (V2/V2-Lite BF16 at parity; V3 needs grouped routing)
   7. ~~Tensor parallelism: Parallel layers, NCCL, multi-GPU init~~ — **DONE** (TP=2 Qwen2.5-0.5B E2E verified)
   8. ~~Remaining dense archs: Qwen3-Next~~ — **DONE** (GemmaRMSNorm, layer scale, GPU QKVZ split, per-seq conv1d, SSM state mgmt)
   9. ~~Sampling perf: Fused penalty kernel on GPU, no CPU fallback~~ — **DONE**

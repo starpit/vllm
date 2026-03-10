@@ -2,6 +2,7 @@
 //! Model implementations using `GpuTensor` — no candle dependency.
 
 pub mod commandr;
+pub mod deepseek_v2;
 pub mod gemma2;
 pub mod gemma3;
 pub mod llama;

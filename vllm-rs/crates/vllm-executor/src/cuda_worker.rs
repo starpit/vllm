@@ -2594,6 +2594,14 @@ impl Worker for CudaWorker {
                         &qconfig,
                         device,
                     )
+                } else if use_tp {
+                    vllm_cuda::model::llama::LlamaForCausalLM::load_tp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        tp,
+                        device,
+                    )
                 } else {
                     vllm_cuda::model::llama::LlamaForCausalLM::load(
                         &mut weights,

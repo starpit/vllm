@@ -121,6 +121,76 @@ __global__ void qk_norm_rope_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// QK-norm ONLY kernel (no RoPE) — for models with partial RoPE
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void qk_norm_kernel(
+    T* __restrict__ query,              // [num_tokens, num_q_heads, head_dim] in/out
+    T* __restrict__ key,                // [num_tokens, num_kv_heads, head_dim] in/out
+    const T* __restrict__ q_weight,     // [head_dim]
+    const T* __restrict__ k_weight,     // [head_dim]
+    float epsilon,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim)
+{
+    const int token_idx = blockIdx.x;
+    const int head_idx = blockIdx.y;
+
+    const bool is_q = (head_idx < num_q_heads);
+    const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
+
+    T* head_ptr;
+    const T* weight;
+    if (is_q) {
+        head_ptr = query + (token_idx * num_q_heads + local_head) * head_dim;
+        weight = q_weight;
+    } else {
+        head_ptr = key + (token_idx * num_kv_heads + local_head) * head_dim;
+        weight = k_weight;
+    }
+
+    // Compute sum of squares for RMS norm.
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = static_cast<float>(head_ptr[i]);
+        ss += v * v;
+    }
+    ss = block_reduce_sum_qknr(ss);
+
+    __shared__ float s_inv_rms;
+    if (threadIdx.x == 0) {
+        s_inv_rms = rsqrtf(ss / head_dim + epsilon);
+    }
+    __syncthreads();
+
+    // Normalize and write back (with GemmaRMSNorm weight).
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = static_cast<float>(head_ptr[i]) * s_inv_rms;
+        head_ptr[i] = static_cast<T>(v * static_cast<float>(weight[i]));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sigmoid-mul kernel: out = sigmoid(gate) * input (element-wise, in-place on input)
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void sigmoid_mul_kernel(
+    T* __restrict__ input,        // [numel] in/out — overwritten with result
+    const T* __restrict__ gate,   // [numel]
+    int numel)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= numel) return;
+    float x = static_cast<float>(input[idx]);
+    float g = static_cast<float>(gate[idx]);
+    float sig = 1.0f / (1.0f + expf(-g));
+    input[idx] = static_cast<T>(sig * x);
+}
+
+// ---------------------------------------------------------------------------
 // C entry points
 // ---------------------------------------------------------------------------
 
@@ -181,6 +251,79 @@ void qk_norm_rope_bf16(
         query, key, q_weight, k_weight,
         cos_cache, sin_cache, positions,
         epsilon, num_q_heads, num_kv_heads, head_dim);
+}
+
+// QK-norm only (no RoPE)
+
+void qk_norm_f32(
+    float* query, float* key,
+    const float* q_weight, const float* k_weight,
+    float epsilon,
+    int num_q_heads, int num_kv_heads,
+    int head_dim, int num_tokens,
+    cudaStream_t stream)
+{
+    dim3 grid(num_tokens, num_q_heads + num_kv_heads);
+    int threads = (head_dim < 1024) ? head_dim : 1024;
+    qk_norm_kernel<float><<<grid, threads, 0, stream>>>(
+        query, key, q_weight, k_weight,
+        epsilon, num_q_heads, num_kv_heads, head_dim);
+}
+
+void qk_norm_f16(
+    __half* query, __half* key,
+    const __half* q_weight, const __half* k_weight,
+    float epsilon,
+    int num_q_heads, int num_kv_heads,
+    int head_dim, int num_tokens,
+    cudaStream_t stream)
+{
+    dim3 grid(num_tokens, num_q_heads + num_kv_heads);
+    int threads = (head_dim < 1024) ? head_dim : 1024;
+    qk_norm_kernel<__half><<<grid, threads, 0, stream>>>(
+        query, key, q_weight, k_weight,
+        epsilon, num_q_heads, num_kv_heads, head_dim);
+}
+
+void qk_norm_bf16(
+    __nv_bfloat16* query, __nv_bfloat16* key,
+    const __nv_bfloat16* q_weight, const __nv_bfloat16* k_weight,
+    float epsilon,
+    int num_q_heads, int num_kv_heads,
+    int head_dim, int num_tokens,
+    cudaStream_t stream)
+{
+    dim3 grid(num_tokens, num_q_heads + num_kv_heads);
+    int threads = (head_dim < 1024) ? head_dim : 1024;
+    qk_norm_kernel<__nv_bfloat16><<<grid, threads, 0, stream>>>(
+        query, key, q_weight, k_weight,
+        epsilon, num_q_heads, num_kv_heads, head_dim);
+}
+
+// Sigmoid-mul
+
+void sigmoid_mul_f32(
+    float* input, const float* gate, int numel, cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (numel + threads - 1) / threads;
+    sigmoid_mul_kernel<float><<<blocks, threads, 0, stream>>>(input, gate, numel);
+}
+
+void sigmoid_mul_f16(
+    __half* input, const __half* gate, int numel, cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (numel + threads - 1) / threads;
+    sigmoid_mul_kernel<__half><<<blocks, threads, 0, stream>>>(input, gate, numel);
+}
+
+void sigmoid_mul_bf16(
+    __nv_bfloat16* input, const __nv_bfloat16* gate, int numel, cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (numel + threads - 1) / threads;
+    sigmoid_mul_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(input, gate, numel);
 }
 
 } // extern "C"

@@ -87,6 +87,7 @@ enum CudaModel {
     Qwen2Moe(vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM),
     Qwen3Moe(vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM),
     CommandR(vllm_cuda::model::commandr::CommandRForCausalLM),
+    Qwen3Next(vllm_cuda::model::qwen3_next::Qwen3NextForCausalLM),
 }
 
 impl CudaModel {
@@ -100,6 +101,8 @@ impl CudaModel {
             Self::Qwen2Moe(m) => m.model.layers.len(),
             Self::Qwen3Moe(m) => m.model.layers.len(),
             Self::CommandR(m) => m.model.layers.len(),
+            // Only full attention layers need KV cache.
+            Self::Qwen3Next(m) => m.num_kv_layers(),
         }
     }
 
@@ -113,6 +116,7 @@ impl CudaModel {
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Qwen3Moe(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::CommandR(m) => m.model.layers[0].self_attn.inner.num_kv_heads,
+            Self::Qwen3Next(m) => m.num_kv_heads(),
         }
     }
 
@@ -126,6 +130,7 @@ impl CudaModel {
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.head_dim,
             Self::Qwen3Moe(m) => m.model.layers[0].self_attn.head_dim,
             Self::CommandR(m) => m.model.layers[0].self_attn.inner.head_dim,
+            Self::Qwen3Next(m) => m.head_dim(),
         }
     }
 
@@ -139,6 +144,7 @@ impl CudaModel {
             Self::Qwen2Moe(m) => m.lm_head.out_features(),
             Self::Qwen3Moe(m) => m.lm_head.out_features(),
             Self::CommandR(m) => m.lm_head.out_features(),
+            Self::Qwen3Next(m) => m.lm_head.out_features(),
         }
     }
 
@@ -152,6 +158,7 @@ impl CudaModel {
             Self::Qwen2Moe(m) => m.lm_head.in_features(),
             Self::Qwen3Moe(m) => m.lm_head.in_features(),
             Self::CommandR(m) => m.lm_head.in_features(),
+            Self::Qwen3Next(m) => m.lm_head.in_features(),
         }
     }
 
@@ -166,6 +173,8 @@ impl CudaModel {
             Self::Mixtral(m) => m.set_tp_group(group),
             Self::Qwen2Moe(m) => m.set_tp_group(group),
             Self::Qwen3Moe(m) => m.set_tp_group(group),
+            Self::CommandR(_) => {}  // TP not yet supported
+            Self::Qwen3Next(_) => {} // TP not yet supported
         }
     }
 
@@ -301,6 +310,9 @@ impl CudaModel {
                     device,
                 )
             },
+            Self::Qwen3Next(_) => {
+                panic!("Qwen3Next: use forward_owned with GDN context");
+            }
         }
     }
 
@@ -444,6 +456,9 @@ impl CudaModel {
                     last_token_indices,
                 )
             },
+            Self::Qwen3Next(_) => {
+                panic!("Qwen3Next: use forward_qwen3_next directly");
+            }
         }
     }
 
@@ -584,6 +599,53 @@ impl CudaModel {
                     last_token_indices,
                 )
             },
+            Self::Qwen3Next(_) => {
+                panic!("Qwen3Next: use forward_qwen3_next directly");
+            }
+        }
+    }
+
+    /// Forward pass for Qwen3Next with GDN context.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn forward_qwen3_next(
+        &self,
+        input_ids: GpuTensor,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        gdn_state_pool: &vllm_cuda::model::qwen3_next::GdnStatePool,
+        gdn_state_indices: GpuTensor,
+        gdn_cu_seqlens: GpuTensor,
+        num_seqs: usize,
+        device: &mut GpuDevice,
+        last_token_indices: Option<GpuTensor>,
+    ) -> GpuTensor {
+        match self {
+            Self::Qwen3Next(m) => unsafe {
+                m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    gdn_state_pool,
+                    gdn_state_indices,
+                    gdn_cu_seqlens,
+                    num_seqs,
+                    device,
+                    last_token_indices,
+                )
+            },
+            _ => panic!("forward_qwen3_next called on non-Qwen3Next model"),
         }
     }
 }
@@ -938,6 +1000,154 @@ fn commandr_config_from_hf(
     })
 }
 
+fn qwen3_next_config_from_hf(
+    hf: &HfModelConfig,
+) -> ExecutorResult<vllm_cuda::model::qwen3_next::Qwen3NextConfig> {
+    let hidden_size = hf
+        .hidden_size
+        .ok_or_else(|| ExecutorError::WorkerInit("missing hidden_size".into()))?;
+    let num_attention_heads = hf
+        .num_attention_heads
+        .ok_or_else(|| ExecutorError::WorkerInit("missing num_attention_heads".into()))?;
+    let num_kv_heads = hf.num_key_value_heads.unwrap_or(num_attention_heads);
+    let num_hidden_layers = hf.num_hidden_layers.unwrap_or(28);
+    let head_dim = hf.head_dim.unwrap_or(hidden_size / num_attention_heads);
+
+    let partial_rotary_factor = hf
+        .extra
+        .get("partial_rotary_factor")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.25);
+    let attn_output_gate = hf
+        .extra
+        .get("attn_output_gate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    // GDN fields
+    let linear_conv_kernel_dim = hf
+        .extra
+        .get("linear_conv_kernel_dim")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4) as usize;
+    let linear_key_head_dim = hf
+        .extra
+        .get("linear_key_head_dim")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(64) as usize;
+    let linear_value_head_dim = hf
+        .extra
+        .get("linear_value_head_dim")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(128) as usize;
+    let linear_num_key_heads = hf
+        .extra
+        .get("linear_num_key_heads")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4) as usize;
+    let linear_num_value_heads = hf
+        .extra
+        .get("linear_num_value_heads")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4) as usize;
+
+    // MoE fields
+    let num_experts = hf
+        .extra
+        .get("num_experts")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let num_experts_per_tok = hf
+        .extra
+        .get("num_experts_per_tok")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let moe_intermediate_size = hf
+        .extra
+        .get("moe_intermediate_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let shared_expert_intermediate_size = hf
+        .extra
+        .get("shared_expert_intermediate_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let norm_topk_prob = hf
+        .extra
+        .get("norm_topk_prob")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let decoder_sparse_step = hf
+        .extra
+        .get("decoder_sparse_step")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as usize;
+    let mlp_only_layers: Vec<usize> = hf
+        .extra
+        .get("mlp_only_layers")
+        .and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+
+    // Layer types: ["full_attention", "linear_attention", ...]
+    let layer_types: Vec<String> = hf
+        .extra
+        .get("layer_types")
+        .and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+        })
+        .unwrap_or_else(|| {
+            // Default: every 4th layer is full attention.
+            (0..num_hidden_layers)
+                .map(|i| {
+                    if i % 4 == 0 {
+                        "full_attention".to_string()
+                    } else {
+                        "linear_attention".to_string()
+                    }
+                })
+                .collect()
+        });
+
+    Ok(vllm_cuda::model::qwen3_next::Qwen3NextConfig {
+        hidden_size,
+        num_attention_heads,
+        num_kv_heads,
+        num_hidden_layers,
+        intermediate_size: hf.intermediate_size.unwrap_or(hidden_size * 4),
+        vocab_size: hf.vocab_size.unwrap_or(151936),
+        max_position_embeddings: hf.max_position_embeddings.unwrap_or(32768),
+        rms_norm_eps: hf.rms_norm_eps.unwrap_or(1e-6) as f32,
+        rope_theta: hf.rope_theta.unwrap_or(1_000_000.0),
+        head_dim,
+        tie_word_embeddings: hf.tie_word_embeddings.unwrap_or(false),
+        partial_rotary_factor,
+        attn_output_gate,
+        linear_conv_kernel_dim,
+        linear_key_head_dim,
+        linear_value_head_dim,
+        linear_num_key_heads,
+        linear_num_value_heads,
+        num_experts,
+        num_experts_per_tok,
+        moe_intermediate_size,
+        shared_expert_intermediate_size,
+        norm_topk_prob,
+        decoder_sparse_step,
+        mlp_only_layers,
+        layer_types,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Pinned host staging buffers
 // ---------------------------------------------------------------------------
@@ -1102,6 +1312,11 @@ pub struct CudaWorker {
     batch_req_ids: Vec<String>,
     /// Per-request seeded RNGs for deterministic sampling.
     seeded_rngs: HashMap<String, rand::rngs::StdRng>,
+
+    /// GDN recurrent state pool for Qwen3Next (None for other architectures).
+    gdn_state_pool: Option<vllm_cuda::model::qwen3_next::GdnStatePool>,
+    /// Qwen3Next config (cached for GDN state pool allocation).
+    qwen3_next_config: Option<vllm_cuda::model::qwen3_next::Qwen3NextConfig>,
 }
 
 unsafe impl Send for CudaWorker {}
@@ -1143,6 +1358,8 @@ impl CudaWorker {
             batch_changed: false,
             batch_req_ids: Vec::new(),
             seeded_rngs: HashMap::new(),
+            gdn_state_pool: None,
+            qwen3_next_config: None,
         }
     }
 
@@ -1565,6 +1782,28 @@ impl CudaWorker {
             max_seqlen_q,
             max_seqlen_k,
         ))
+    }
+
+    /// Build GDN state_indices and cu_seqlens for Qwen3Next forward.
+    ///
+    /// Returns (gdn_state_indices, gdn_cu_seqlens, num_seqs) on GPU.
+    /// state_indices: [num_seqs] i32 — slot index per sequence (= batch index).
+    /// cu_seqlens: [num_seqs + 1] i32 — cumulative query lengths.
+    fn build_gdn_tensors(
+        meta: &vllm_models::AttentionMetadata,
+        device: &mut GpuDevice,
+    ) -> ExecutorResult<(GpuTensor, GpuTensor, usize)> {
+        let num_seqs = meta.num_reqs;
+
+        // State indices: sequence i uses slot i in the GDN state pool.
+        let state_indices: Vec<i32> = (0..num_seqs as i32).collect();
+        let gpu_state_indices = Self::h2d_i32(&state_indices, device)?;
+
+        // cu_seqlens for GDN: same as attention cu_seqlens_q.
+        let cu_seqlens: Vec<i32> = meta.query_start_loc.iter().map(|&x| x as i32).collect();
+        let gpu_cu_seqlens = Self::h2d_i32(&cu_seqlens, device)?;
+
+        Ok((gpu_state_indices, gpu_cu_seqlens, num_seqs))
     }
 
     /// D2H copy logits to CPU f32 vec.
@@ -2734,6 +2973,18 @@ impl Worker for CudaWorker {
                 .map_err(|e| ExecutorError::WorkerInit(format!("Qwen3MoE load: {e}")))?;
                 CudaModel::Qwen3Moe(m)
             }
+            "Qwen3NextForCausalLM" => {
+                let config = qwen3_next_config_from_hf(&hf_config)?;
+                let m = vllm_cuda::model::qwen3_next::Qwen3NextForCausalLM::load(
+                    &mut weights,
+                    &config,
+                    dtype,
+                    device,
+                )
+                .map_err(|e| ExecutorError::WorkerInit(format!("Qwen3Next load: {e}")))?;
+                self.qwen3_next_config = Some(config);
+                CudaModel::Qwen3Next(m)
+            }
             "CohereForCausalLM" => {
                 let config = commandr_config_from_hf(&hf_config)?;
                 let m = if qconfig.is_bnb4bit() {
@@ -2765,7 +3016,8 @@ impl Worker for CudaWorker {
                      Supported: LlamaForCausalLM, MistralForCausalLM, Qwen3ForCausalLM, \
                      Phi3ForCausalLM, Qwen2ForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM, \
                      Gemma3ForConditionalGeneration, GraniteForCausalLM, MixtralForCausalLM, \
-                     Qwen2MoeForCausalLM, Qwen3MoeForCausalLM, CohereForCausalLM"
+                     Qwen2MoeForCausalLM, Qwen3MoeForCausalLM, CohereForCausalLM, \
+                     Qwen3NextForCausalLM"
                 )));
             }
         };
@@ -2842,6 +3094,21 @@ impl Worker for CudaWorker {
         .map_err(|e| ExecutorError::WorkerInit(format!("KvCachePool: {e}")))?;
 
         self.kv_cache = Some(pool);
+
+        // Allocate GDN state pool for Qwen3Next.
+        if let Some(ref config) = self.qwen3_next_config {
+            let dev = self.device.as_ref().unwrap();
+            let gdn_pool = unsafe {
+                vllm_cuda::model::qwen3_next::GdnStatePool::new(
+                    config,
+                    num_gpu_blocks,
+                    dev.compute_stream,
+                )
+            }
+            .map_err(|e| ExecutorError::WorkerInit(format!("GdnStatePool: {e}")))?;
+            self.gdn_state_pool = Some(gdn_pool);
+        }
+
         Ok(())
     }
 
@@ -2855,8 +3122,9 @@ impl Worker for CudaWorker {
         // attention cause CUDA errors during the dummy forward pass (the profiling
         // forward triggers an illegal memory access in flash attention). Use a
         // conservative fixed estimate instead.
-        if self.uses_ggml {
-            info!("CudaWorker: GGML model — skipping activation profiling, using fixed estimate");
+        if self.uses_ggml || self.qwen3_next_config.is_some() {
+            let tag = if self.uses_ggml { "GGML" } else { "Qwen3Next" };
+            info!("CudaWorker: {tag} model — skipping activation profiling, using fixed estimate");
             let (free, total) = cudarc::driver::result::mem_get_info()
                 .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
             let weights_and_overhead = total.saturating_sub(free);
@@ -3065,6 +3333,11 @@ impl Worker for CudaWorker {
             info!(
                 "CudaWorker: GGML model — skipping CUDA graph capture (incompatible with graph capture)"
             );
+            return Ok(());
+        }
+
+        if self.qwen3_next_config.is_some() {
+            info!("CudaWorker: Qwen3Next — skipping CUDA graph capture (GDN recurrent state)");
             return Ok(());
         }
 
@@ -3656,6 +3929,7 @@ impl CudaWorker {
 
         // Split borrows: model + kv_cache (shared) vs device (mutable).
         // Use direct field access so the borrow checker sees disjoint borrows.
+        let gdn_pool_ref = self.gdn_state_pool.as_ref();
         let (model, kv_cache, device) = match (&self.model, &self.kv_cache, &mut self.device) {
             (Some(m), Some(kv), Some(d)) => (m, kv, d),
             _ => {
@@ -4582,20 +4856,47 @@ impl CudaWorker {
                     None
                 };
 
-                unsafe {
-                    model.forward_owned(
-                        gpu_input_ids,
-                        gpu_positions,
-                        slot_mapping,
-                        cu_seqlens_q,
-                        seqused_k,
-                        block_table,
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        kv_cache,
-                        device,
-                        last_token_indices,
-                    )
+                if matches!(model, CudaModel::Qwen3Next(_)) {
+                    // Build GDN forward context.
+                    let gdn_pool = gdn_pool_ref.unwrap();
+                    let meta = &prepared.attn_meta;
+                    let (gdn_state_indices, gdn_cu_seqlens, num_seqs) =
+                        Self::build_gdn_tensors(meta, device)?;
+                    unsafe {
+                        model.forward_qwen3_next(
+                            gpu_input_ids,
+                            gpu_positions,
+                            slot_mapping,
+                            cu_seqlens_q,
+                            seqused_k,
+                            block_table,
+                            max_seqlen_q,
+                            max_seqlen_k,
+                            kv_cache,
+                            gdn_pool,
+                            gdn_state_indices,
+                            gdn_cu_seqlens,
+                            num_seqs,
+                            device,
+                            last_token_indices,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        model.forward_owned(
+                            gpu_input_ids,
+                            gpu_positions,
+                            slot_mapping,
+                            cu_seqlens_q,
+                            seqused_k,
+                            block_table,
+                            max_seqlen_q,
+                            max_seqlen_k,
+                            kv_cache,
+                            device,
+                            last_token_indices,
+                        )
+                    }
                 }
             }
         };

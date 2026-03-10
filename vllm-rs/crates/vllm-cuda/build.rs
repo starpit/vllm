@@ -48,6 +48,9 @@ fn cuda_build() {
         "csrc/awq_dequant_kernels.cu",
         "csrc/embedding_kernels.cu",
         "csrc/bnb_dequant_kernels.cu",
+        "csrc/gdn_gating_kernels.cu",
+        "csrc/gdn_conv1d_kernels.cu",
+        "csrc/gdn_recurrent_kernels.cu",
     ];
     let vllm_watch = ["csrc/vec_utils.cuh"];
 

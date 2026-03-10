@@ -8,9 +8,9 @@
 //! This validates the full config→load→forward→sample pipeline.
 //!
 //! Run with:
-//!   cargo test -p vllm-e2e --features e2e --test e_qwen3_next -- --ignored --test-threads=1
+//!   cargo test -p vllm-e2e --features e2e,cuda --release --test e_qwen3_next -- --ignored --test-threads=1
 
-#![cfg(feature = "e2e")]
+#![cfg(all(feature = "e2e", feature = "cuda"))]
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -47,7 +47,7 @@ fn create_synthetic_model(dir: &Path) {
         "head_dim": 16,
         "tie_word_embeddings": false,
         "partial_rotary_factor": 0.25,
-        "torch_dtype": "float32",
+        "torch_dtype": "float16",
         "linear_conv_kernel_dim": 4,
         "linear_key_head_dim": 8,
         "linear_value_head_dim": 8,
@@ -174,13 +174,13 @@ fn generate_weights(
     // Helper: create a random f32 tensor and leak its data for TensorView.
     fn make_tensor(shape: &[usize]) -> safetensors::tensor::TensorView<'static> {
         let numel: usize = shape.iter().product();
-        // Use small random values to avoid numerical issues.
-        let data: Vec<f32> = (0..numel)
-            .map(|i| (i as f32 * 0.001).sin() * 0.01)
+        // Use small random values in f16 to avoid numerical issues.
+        let data: Vec<u16> = (0..numel)
+            .map(|i| half::f16::from_f32((i as f32 * 0.001).sin() * 0.01).to_bits())
             .collect();
-        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
-        safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.to_vec(), leaked)
+        safetensors::tensor::TensorView::new(safetensors::Dtype::F16, shape.to_vec(), leaked)
             .unwrap()
     }
 
@@ -355,7 +355,8 @@ async fn test_qwen3_next_server_starts() {
     create_synthetic_model(tmp.path());
 
     let server = TestServer::builder(tmp.path().to_str().unwrap())
-        .with_args(&["--device", "cpu", "--dtype", "f32"])
+        .with_device("cuda")
+        .with_dtype("f16")
         .start()
         .await
         .expect("Qwen3-Next synthetic server should start");
@@ -375,7 +376,8 @@ async fn test_qwen3_next_chat_basic() {
     create_synthetic_model(tmp.path());
 
     let server = TestServer::builder(tmp.path().to_str().unwrap())
-        .with_args(&["--device", "cpu", "--dtype", "f32"])
+        .with_device("cuda")
+        .with_dtype("f16")
         .start()
         .await
         .unwrap();
@@ -400,7 +402,8 @@ async fn test_qwen3_next_completion_basic() {
     create_synthetic_model(tmp.path());
 
     let server = TestServer::builder(tmp.path().to_str().unwrap())
-        .with_args(&["--device", "cpu", "--dtype", "f32"])
+        .with_device("cuda")
+        .with_dtype("f16")
         .start()
         .await
         .unwrap();

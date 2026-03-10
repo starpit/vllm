@@ -4807,3 +4807,663 @@ pub unsafe fn dequantize_bnb4bit(
         other => panic!("dequantize_bnb4bit: unsupported output dtype {other}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// QK-norm only (no RoPE) — for partial-RoPE models like Qwen3-Next
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn qk_norm_f32(
+        query: *mut f32,
+        key: *mut f32,
+        q_weight: *const f32,
+        k_weight: *const f32,
+        epsilon: f32,
+        num_q_heads: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        num_tokens: c_int,
+        stream: CUstream,
+    );
+    fn qk_norm_f16(
+        query: *mut u16,
+        key: *mut u16,
+        q_weight: *const u16,
+        k_weight: *const u16,
+        epsilon: f32,
+        num_q_heads: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        num_tokens: c_int,
+        stream: CUstream,
+    );
+    fn qk_norm_bf16(
+        query: *mut u16,
+        key: *mut u16,
+        q_weight: *const u16,
+        k_weight: *const u16,
+        epsilon: f32,
+        num_q_heads: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        num_tokens: c_int,
+        stream: CUstream,
+    );
+}
+
+/// Apply per-head QK RMS norm in-place (no RoPE).
+///
+/// Q: `[num_tokens, num_q_heads, head_dim]`
+/// K: `[num_tokens, num_kv_heads, head_dim]`
+/// Weights use GemmaRMSNorm convention (weight applied as-is; caller should add +1 if needed).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn qk_norm_inplace(
+    query: GpuTensor,
+    key: GpuTensor,
+    q_weight: GpuTensor,
+    k_weight: GpuTensor,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    epsilon: f32,
+    stream: CUstream,
+) {
+    let num_tokens = query.dim(0) as c_int;
+    match query.dtype() {
+        DType::F32 => qk_norm_f32(
+            query.as_mut_ptr(),
+            key.as_mut_ptr(),
+            q_weight.as_ptr(),
+            k_weight.as_ptr(),
+            epsilon,
+            num_q_heads as c_int,
+            num_kv_heads as c_int,
+            head_dim as c_int,
+            num_tokens,
+            stream,
+        ),
+        DType::F16 => qk_norm_f16(
+            query.as_mut_ptr() as *mut u16,
+            key.as_mut_ptr() as *mut u16,
+            q_weight.as_ptr() as *const u16,
+            k_weight.as_ptr() as *const u16,
+            epsilon,
+            num_q_heads as c_int,
+            num_kv_heads as c_int,
+            head_dim as c_int,
+            num_tokens,
+            stream,
+        ),
+        DType::BF16 => qk_norm_bf16(
+            query.as_mut_ptr() as *mut u16,
+            key.as_mut_ptr() as *mut u16,
+            q_weight.as_ptr() as *const u16,
+            k_weight.as_ptr() as *const u16,
+            epsilon,
+            num_q_heads as c_int,
+            num_kv_heads as c_int,
+            head_dim as c_int,
+            num_tokens,
+            stream,
+        ),
+        _ => panic!("qk_norm: unsupported dtype {:?}", query.dtype()),
+    }
+}
+
+/// Apply RoPE in-place to separate Q and K tensors (partial RoPE supported).
+///
+/// Q: `[num_tokens, num_q_heads * head_dim]` or `[num_tokens, num_q_heads, head_dim]`
+/// K: `[num_tokens, num_kv_heads * head_dim]` or `[num_tokens, num_kv_heads, head_dim]`
+///
+/// This is a thin wrapper over `rotary_embedding_inplace`.
+pub unsafe fn apply_rope_qk_inplace(
+    q: GpuTensor,
+    k: GpuTensor,
+    cos_sin_cache: GpuTensor,
+    positions: GpuTensor,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    stream: CUstream,
+) {
+    // Reshape to flat [num_tokens, total_dim] for rotary_embedding_inplace.
+    let num_tokens = q.dim(0);
+    let q_flat = q.reshape(&[num_tokens, num_q_heads * head_dim]);
+    let k_flat = k.reshape(&[num_tokens, num_kv_heads * head_dim]);
+    rotary_embedding_inplace(q_flat, k_flat, positions, cos_sin_cache, head_dim, stream);
+}
+
+// ---------------------------------------------------------------------------
+// Sigmoid-mul: out = sigmoid(gate) * input (in-place on input)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn sigmoid_mul_f32(input: *mut f32, gate: *const f32, numel: c_int, stream: CUstream);
+    fn sigmoid_mul_f16(input: *mut u16, gate: *const u16, numel: c_int, stream: CUstream);
+    fn sigmoid_mul_bf16(input: *mut u16, gate: *const u16, numel: c_int, stream: CUstream);
+}
+
+/// Apply `input = sigmoid(gate) * input` element-wise in-place.
+pub unsafe fn sigmoid_mul_inplace(
+    input: GpuTensor,
+    gate: GpuTensor,
+    _alloc: &mut CachingAllocator,
+    stream: CUstream,
+) {
+    let numel = input.numel() as c_int;
+    match input.dtype() {
+        DType::F32 => sigmoid_mul_f32(input.as_mut_ptr(), gate.as_ptr(), numel, stream),
+        DType::F16 => sigmoid_mul_f16(
+            input.as_mut_ptr() as *mut u16,
+            gate.as_ptr() as *const u16,
+            numel,
+            stream,
+        ),
+        DType::BF16 => sigmoid_mul_bf16(
+            input.as_mut_ptr() as *mut u16,
+            gate.as_ptr() as *const u16,
+            numel,
+            stream,
+        ),
+        _ => panic!("sigmoid_mul: unsupported dtype {:?}", input.dtype()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GDN kernels (Gated Delta Net for Qwen3-Next)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn fused_gdn_gating(
+        g_out: *mut f32,
+        beta_out: *mut f32,
+        A_log: *const f32,
+        a: *const f32,
+        b: *const f32,
+        dt_bias: *const f32,
+        num_heads: c_int,
+        batch_size: c_int,
+        stream: CUstream,
+    );
+
+    fn causal_conv1d_update(
+        conv_state: *mut f32,
+        x: *const f32,
+        w: *const f32,
+        output: *mut f32,
+        state_indices: *const c_int,
+        conv_dim: c_int,
+        kernel_size: c_int,
+        batch_size: c_int,
+        stream: CUstream,
+    );
+
+    fn causal_conv1d_prefill(
+        conv_state: *mut f32,
+        x: *const f32,
+        w: *const f32,
+        output: *mut f32,
+        slot_idx: c_int,
+        conv_dim: c_int,
+        kernel_size: c_int,
+        num_tokens: c_int,
+        stream: CUstream,
+    );
+
+    fn fused_recurrent_gdn_fwd(
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        g: *const f32,
+        beta: *const f32,
+        o: *mut f32,
+        ssm_state: *mut f32,
+        state_indices: *const c_int,
+        cu_seqlens: *const c_int,
+        scale: f32,
+        N: c_int,
+        T: c_int,
+        H: c_int,
+        HV: c_int,
+        K: c_int,
+        V_dim: c_int,
+        stream: CUstream,
+    );
+
+    fn rms_norm_gated(
+        x: *const f32,
+        z: *const f32,
+        weight: *const f32,
+        out: *mut f32,
+        eps: f32,
+        head_v_dim: c_int,
+        total_rows: c_int,
+        stream: CUstream,
+    );
+}
+
+/// Fused GDN gating computation (all f32 on GPU).
+///
+/// Computes `g = -exp(A_log) * softplus(a + dt_bias)` and `beta = sigmoid(b)`.
+pub unsafe fn gdn_gating(
+    g_out: GpuTensor,
+    beta_out: GpuTensor,
+    a_log: GpuTensor,
+    a: GpuTensor,
+    b: GpuTensor,
+    dt_bias: GpuTensor,
+    num_heads: usize,
+    batch_size: usize,
+    stream: CUstream,
+) {
+    fused_gdn_gating(
+        g_out.as_mut_ptr(),
+        beta_out.as_mut_ptr(),
+        a_log.as_ptr(),
+        a.as_ptr(),
+        b.as_ptr(),
+        dt_bias.as_ptr(),
+        num_heads as c_int,
+        batch_size as c_int,
+        stream,
+    );
+}
+
+/// Causal conv1d single-token update (decode).
+pub unsafe fn gdn_conv1d_update(
+    conv_state: GpuTensor,
+    x: GpuTensor,
+    w: GpuTensor,
+    output: GpuTensor,
+    state_indices: GpuTensor,
+    conv_dim: usize,
+    kernel_size: usize,
+    batch_size: usize,
+    stream: CUstream,
+) {
+    causal_conv1d_update(
+        conv_state.as_mut_ptr(),
+        x.as_ptr(),
+        w.as_ptr(),
+        output.as_mut_ptr(),
+        state_indices.as_ptr() as *const c_int,
+        conv_dim as c_int,
+        kernel_size as c_int,
+        batch_size as c_int,
+        stream,
+    );
+}
+
+/// Causal conv1d multi-token prefill.
+pub unsafe fn gdn_conv1d_prefill(
+    conv_state: GpuTensor,
+    x: GpuTensor,
+    w: GpuTensor,
+    output: GpuTensor,
+    slot_idx: usize,
+    conv_dim: usize,
+    kernel_size: usize,
+    num_tokens: usize,
+    stream: CUstream,
+) {
+    causal_conv1d_prefill(
+        conv_state.as_mut_ptr(),
+        x.as_ptr(),
+        w.as_ptr(),
+        output.as_mut_ptr(),
+        slot_idx as c_int,
+        conv_dim as c_int,
+        kernel_size as c_int,
+        num_tokens as c_int,
+        stream,
+    );
+}
+
+/// Fused recurrent GDN forward pass.
+///
+/// Processes token-by-token recurrence on GPU with L2 norm, decay, delta update.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gdn_recurrent_fwd(
+    q: GpuTensor,
+    k: GpuTensor,
+    v: GpuTensor,
+    g: GpuTensor,
+    beta: GpuTensor,
+    o: GpuTensor,
+    ssm_state: GpuTensor,
+    state_indices: GpuTensor,
+    cu_seqlens: GpuTensor,
+    scale: f32,
+    num_seqs: usize,
+    total_tokens: usize,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    stream: CUstream,
+) {
+    fused_recurrent_gdn_fwd(
+        q.as_ptr(),
+        k.as_ptr(),
+        v.as_ptr(),
+        g.as_ptr(),
+        beta.as_ptr(),
+        o.as_mut_ptr(),
+        ssm_state.as_mut_ptr(),
+        state_indices.as_ptr() as *const c_int,
+        cu_seqlens.as_ptr() as *const c_int,
+        scale,
+        num_seqs as c_int,
+        total_tokens as c_int,
+        num_k_heads as c_int,
+        num_v_heads as c_int,
+        head_k_dim as c_int,
+        head_v_dim as c_int,
+        stream,
+    );
+}
+
+/// RMS norm with sigmoid gating: `out = rms_norm(x) * weight * sigmoid(z)`.
+pub unsafe fn gdn_rms_norm_gated(
+    x: GpuTensor,
+    z: GpuTensor,
+    weight: GpuTensor,
+    out: GpuTensor,
+    eps: f32,
+    head_v_dim: usize,
+    total_rows: usize,
+    stream: CUstream,
+) {
+    rms_norm_gated(
+        x.as_ptr(),
+        z.as_ptr(),
+        weight.as_ptr(),
+        out.as_mut_ptr(),
+        eps,
+        head_v_dim as c_int,
+        total_rows as c_int,
+        stream,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tests for GDN kernels (gating, conv1d, recurrence, rms_norm_gated)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod tests_gdn {
+    use super::*;
+    use crate::driver;
+    use crate::tensor::GpuTensor;
+
+    unsafe fn test_init() -> CUstream {
+        driver::init().expect("CUDA init");
+        let dev = driver::device_get(0).expect("device 0");
+        let _ctx = driver::ctx_create(dev).expect("ctx_create");
+        driver::stream_create().expect("stream_create")
+    }
+
+    unsafe fn upload_f32(data: &[f32], stream: CUstream) -> GpuTensor {
+        let bytes = data.len() * 4;
+        let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream)
+            .expect("memcpy_htod");
+        driver::stream_synchronize(stream).expect("sync");
+        GpuTensor::new(ptr, &[data.len()], crate::dtype::DType::F32)
+    }
+
+    unsafe fn upload_i32(data: &[i32], stream: CUstream) -> GpuTensor {
+        let bytes = data.len() * 4;
+        let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream)
+            .expect("memcpy_htod");
+        driver::stream_synchronize(stream).expect("sync");
+        GpuTensor::new(ptr, &[data.len()], crate::dtype::DType::I32)
+    }
+
+    unsafe fn alloc_f32(n: usize, stream: CUstream) -> GpuTensor {
+        let bytes = n * 4;
+        let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
+        driver::memset_d8(ptr, 0, bytes, stream).expect("memset");
+        GpuTensor::new(ptr, &[n], crate::dtype::DType::F32)
+    }
+
+    unsafe fn download_f32(t: GpuTensor, stream: CUstream) -> Vec<f32> {
+        let n = t.numel();
+        let bytes = n * 4;
+        let mut host = vec![0.0f32; n];
+        driver::memcpy_dtoh_async(
+            host.as_mut_ptr() as *mut u8,
+            t.as_ptr::<u8>(),
+            bytes,
+            stream,
+        )
+        .expect("dtoh");
+        driver::stream_synchronize(stream).expect("sync");
+        host
+    }
+
+    /// Test fused GDN gating: g = -exp(A_log) * softplus(a + dt_bias), beta = sigmoid(b).
+    #[test]
+    #[ignore]
+    fn test_cuda_gdn_gating() {
+        unsafe {
+            let stream = test_init();
+            let num_heads = 4;
+            let batch = 2;
+            let n = batch * num_heads;
+
+            // A_log = [0.0; 4] => exp(0) = 1
+            let a_log = upload_f32(&vec![0.0; num_heads], stream);
+            // dt_bias = [0.0; 4]
+            let dt_bias = upload_f32(&vec![0.0; num_heads], stream);
+            // a = [1.0; n] => softplus(1.0 + 0.0) = ln(1 + e) ≈ 1.3133
+            let a = upload_f32(&vec![1.0; n], stream);
+            // b = [0.0; n] => sigmoid(0) = 0.5
+            let b = upload_f32(&vec![0.0; n], stream);
+
+            let g_out = alloc_f32(n, stream);
+            let beta_out = alloc_f32(n, stream);
+
+            gdn_gating(
+                g_out, beta_out, a_log, a, b, dt_bias, num_heads, batch, stream,
+            );
+
+            let g = download_f32(g_out, stream);
+            let beta = download_f32(beta_out, stream);
+
+            // g = -1.0 * softplus(1.0) ≈ -1.3133
+            for &v in &g {
+                assert!((v - (-1.3133)).abs() < 0.01, "g={v}, expected ~-1.3133");
+            }
+            // beta = sigmoid(0) = 0.5
+            for &v in &beta {
+                assert!((v - 0.5).abs() < 0.01, "beta={v}, expected 0.5");
+            }
+        }
+    }
+
+    /// Test causal conv1d single-token update.
+    #[test]
+    #[ignore]
+    fn test_cuda_gdn_conv1d_update() {
+        unsafe {
+            let stream = test_init();
+            let conv_dim = 4;
+            let kernel_size = 4;
+            let state_len = kernel_size - 1;
+            let batch = 1;
+            let num_slots = 1;
+
+            // conv_state: [num_slots, conv_dim, state_len] = [1, 4, 3] — all zeros
+            let conv_state = alloc_f32(num_slots * conv_dim * state_len, stream);
+            // x: [batch, conv_dim] = [1, 4] — all ones
+            let x = upload_f32(&vec![1.0; batch * conv_dim], stream);
+            // w: [conv_dim, kernel_size] = [4, 4] — all ones
+            let w = upload_f32(&vec![1.0; conv_dim * kernel_size], stream);
+            let output = alloc_f32(batch * conv_dim, stream);
+            let state_indices = upload_i32(&[0], stream);
+
+            gdn_conv1d_update(
+                conv_state,
+                x,
+                w,
+                output,
+                state_indices,
+                conv_dim,
+                kernel_size,
+                batch,
+                stream,
+            );
+
+            let out = download_f32(output, stream);
+            // With zero state and input=1, conv = 0*1 + 0*1 + 0*1 + 1*1 = 1.
+            // SiLU(1) = 1/(1+exp(-1)) ≈ 0.7311
+            for &v in &out {
+                assert!(
+                    (v - 0.7311).abs() < 0.01,
+                    "conv1d output={v}, expected ~0.7311"
+                );
+            }
+
+            // Verify state was updated: last position should be 1.0.
+            let state = download_f32(conv_state, stream);
+            // State layout: [conv_dim, state_len]. Last element of each dim should be 1.0.
+            for d in 0..conv_dim {
+                let last = state[d * state_len + state_len - 1];
+                assert!(
+                    (last - 1.0).abs() < 1e-6,
+                    "state[{d}][last]={last}, expected 1.0"
+                );
+            }
+        }
+    }
+
+    /// Test RMS norm gated: out = rms_norm(x) * weight * sigmoid(z).
+    #[test]
+    #[ignore]
+    fn test_cuda_gdn_rms_norm_gated() {
+        unsafe {
+            let stream = test_init();
+            let dim = 4;
+            let rows = 2;
+
+            // x = [1, 1, 1, 1, 2, 2, 2, 2]
+            let x_data: Vec<f32> = (0..rows).flat_map(|r| vec![(r + 1) as f32; dim]).collect();
+            let x = upload_f32(&x_data, stream);
+            // z = [0, 0, ...] => sigmoid(0) = 0.5
+            let z = upload_f32(&vec![0.0; rows * dim], stream);
+            // weight = [1, 1, 1, 1]
+            let weight = upload_f32(&vec![1.0; dim], stream);
+            let out = alloc_f32(rows * dim, stream);
+
+            gdn_rms_norm_gated(x, z, weight, out, 1e-6, dim, rows, stream);
+
+            let result = download_f32(out, stream);
+            // Row 0: x=[1,1,1,1], rms = sqrt(4/4) = 1, normed = 1/1 = 1, * 0.5 = 0.5
+            for i in 0..dim {
+                assert!(
+                    (result[i] - 0.5).abs() < 0.01,
+                    "row0[{i}]={}, expected 0.5",
+                    result[i]
+                );
+            }
+            // Row 1: x=[2,2,2,2], rms = sqrt(16/4) = 2, normed = 2/2 = 1, * 0.5 = 0.5
+            for i in dim..2 * dim {
+                assert!(
+                    (result[i] - 0.5).abs() < 0.01,
+                    "row1[{i}]={}, expected 0.5",
+                    result[i]
+                );
+            }
+        }
+    }
+
+    /// Test fused recurrent GDN forward: simple single-token, single-sequence case.
+    #[test]
+    #[ignore]
+    fn test_cuda_gdn_recurrent_fwd_basic() {
+        unsafe {
+            let stream = test_init();
+            let num_seqs = 1;
+            let total_tokens = 1;
+            let hk = 4; // head_k_dim
+            let hv_dim = 2; // head_v_dim
+            let n_k_heads = 1;
+            let n_v_heads = 1;
+            let num_slots = 1;
+
+            // q, k: [T=1, H=1, K=4] — unit vectors
+            let q_data = vec![1.0f32, 0.0, 0.0, 0.0];
+            let k_data = vec![0.0f32, 1.0, 0.0, 0.0];
+            let q = upload_f32(&q_data, stream);
+            let k = upload_f32(&k_data, stream);
+
+            // v: [T=1, HV=1, V=2]
+            let v_data = vec![1.0f32, 2.0];
+            let v = upload_f32(&v_data, stream);
+
+            // g: [T=1, HV=1] = 0.0 => decay = exp(0) = 1
+            let g = upload_f32(&[0.0f32], stream);
+            // beta: [T=1, HV=1] = 1.0
+            let beta = upload_f32(&[1.0f32], stream);
+
+            // ssm_state: [num_slots, HV, V, K] = [1, 1, 2, 4] — zeros
+            let ssm_state = alloc_f32(num_slots * n_v_heads * hv_dim * hk, stream);
+            let o = alloc_f32(total_tokens * n_v_heads * hv_dim, stream);
+
+            let state_indices = upload_i32(&[0], stream);
+            let cu_seqlens = upload_i32(&[0, 1], stream);
+
+            let scale = 1.0f32;
+
+            gdn_recurrent_fwd(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                o,
+                ssm_state,
+                state_indices,
+                cu_seqlens,
+                scale,
+                num_seqs,
+                total_tokens,
+                n_k_heads,
+                n_v_heads,
+                hk,
+                hv_dim,
+                stream,
+            );
+
+            let output = download_f32(o, stream);
+            // With zero state:
+            // q_norm = [1,0,0,0] (already unit), k_norm = [0,1,0,0]
+            // decay = 1, S stays zero
+            // delta = v - dot(S=0, k) = v = [1, 2]
+            // beta = 1, so v_delta = [1, 2]
+            // S += v_delta * k = [[0,1,0,0], [0,2,0,0]]
+            // o = dot(S, q*scale) where q_scaled = [1,0,0,0]
+            // o[0] = S[0][0]*1 = 0, o[1] = S[1][0]*1 = 0
+            // So output should be [0, 0] because S has weight only on k-dim 1, but q on k-dim 0.
+            assert!(output[0].abs() < 0.01, "o[0]={}, expected ~0", output[0]);
+            assert!(output[1].abs() < 0.01, "o[1]={}, expected ~0", output[1]);
+
+            // Verify state was updated.
+            let state = download_f32(ssm_state, stream);
+            // S[v=0, k=1] = 1.0, S[v=1, k=1] = 2.0
+            assert!(
+                (state[1] - 1.0).abs() < 0.01,
+                "state[0,1]={}, expected 1.0",
+                state[1]
+            );
+            assert!(
+                (state[hk + 1] - 2.0).abs() < 0.01,
+                "state[1,1]={}, expected 2.0",
+                state[hk + 1]
+            );
+        }
+    }
+}

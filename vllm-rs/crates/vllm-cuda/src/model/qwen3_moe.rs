@@ -36,19 +36,19 @@ pub type Qwen3MoeConfig = Qwen2MoeConfig;
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::large_enum_variant)]
-enum Qwen3MoeMlp {
+pub enum Qwen3MoeMlp {
     Dense(LlamaMLP),
     MoE {
         moe: FusedMoELayer,
-        shared_gate_up: Linear,
-        shared_down: Linear,
-        shared_expert_gate: Linear,
+        shared_gate_up: Option<Linear>,
+        shared_down: Option<Linear>,
+        shared_expert_gate: Option<Linear>,
         shared_intermediate_size: usize,
     },
 }
 
 impl Qwen3MoeMlp {
-    unsafe fn forward_owned(
+    pub unsafe fn forward_owned(
         &self,
         hidden_states: GpuTensor,
         device: &mut GpuDevice,
@@ -66,44 +66,53 @@ impl Qwen3MoeMlp {
 
                 let moe_out = moe.forward_owned(hidden_states, device);
 
-                let shared_gu = shared_gate_up.forward_owned(
-                    hidden_states,
-                    &mut device.cublas,
-                    &mut device.caching,
-                );
-                let shared_activated = kernels::silu_and_mul_fused(
-                    shared_gu.as_gpu_tensor(),
-                    *shared_intermediate_size,
-                    &mut device.caching,
-                    stream,
-                );
-                drop(shared_gu);
+                // Shared expert is optional (shared_expert_intermediate_size == 0
+                // means no shared expert, matching Python).
+                if let (Some(shared_gu_w), Some(shared_down_w), Some(shared_gate_w)) =
+                    (shared_gate_up, shared_down, shared_expert_gate)
+                {
+                    let shared_gu = shared_gu_w.forward_owned(
+                        hidden_states,
+                        &mut device.cublas,
+                        &mut device.caching,
+                    );
+                    let shared_activated = kernels::silu_and_mul_fused(
+                        shared_gu.as_gpu_tensor(),
+                        *shared_intermediate_size,
+                        &mut device.caching,
+                        stream,
+                    );
+                    drop(shared_gu);
 
-                let shared_out = shared_down.forward_owned(
-                    shared_activated.as_gpu_tensor(),
-                    &mut device.cublas,
-                    &mut device.caching,
-                );
-                drop(shared_activated);
+                    let shared_out = shared_down_w.forward_owned(
+                        shared_activated.as_gpu_tensor(),
+                        &mut device.cublas,
+                        &mut device.caching,
+                    );
+                    drop(shared_activated);
 
-                let gate_logits = shared_expert_gate.forward_owned(
-                    hidden_states,
-                    &mut device.cublas,
-                    &mut device.caching,
-                );
+                    let gate_logits = shared_gate_w.forward_owned(
+                        hidden_states,
+                        &mut device.cublas,
+                        &mut device.caching,
+                    );
 
-                let result = kernels::sigmoid_mul_add(
-                    moe_out.as_gpu_tensor(),
-                    shared_out.as_gpu_tensor(),
-                    gate_logits.as_gpu_tensor(),
-                    &mut device.caching,
-                    stream,
-                );
-                drop(moe_out);
-                drop(shared_out);
-                drop(gate_logits);
+                    let result = kernels::sigmoid_mul_add(
+                        moe_out.as_gpu_tensor(),
+                        shared_out.as_gpu_tensor(),
+                        gate_logits.as_gpu_tensor(),
+                        &mut device.caching,
+                        stream,
+                    );
+                    drop(moe_out);
+                    drop(shared_out);
+                    drop(gate_logits);
 
-                result
+                    result
+                } else {
+                    // No shared expert — MoE output is the final output.
+                    moe_out
+                }
             }
         }
     }
@@ -172,7 +181,7 @@ impl Qwen3MoeDecoderLayer {
         })
     }
 
-    fn load_moe(
+    pub fn load_moe(
         weights: &mut GpuWeights,
         prefix: &str,
         config: &Qwen3MoeConfig,
@@ -265,48 +274,56 @@ impl Qwen3MoeDecoderLayer {
         let shared_inter = config.shared_expert_intermediate_size;
         let sipp = shared_inter / world_size;
 
-        let shared_gate_up = if world_size > 1 {
-            let gate_name = format!("{prefix}.shared_expert.gate_proj.weight");
-            let up_name = format!("{prefix}.shared_expert.up_proj.weight");
-            let gate_proj_bytes = sipp * hidden * elem;
-            let total = 2 * gate_proj_bytes;
-            let ptr = unsafe { crate::driver::mem_alloc(total)? };
-            unsafe {
-                weights.take_shard_into(&gate_name, 0, rank, world_size, ptr, stream)?;
-                weights.take_shard_into(
-                    &up_name,
-                    0,
-                    rank,
-                    world_size,
-                    ptr.add(gate_proj_bytes),
-                    stream,
-                )?;
-            }
-            let w = unsafe { GpuTensor::new(ptr, &[2 * sipp, hidden], dtype) };
-            Linear::new(w, None)
-        } else {
-            let gate_name = format!("{prefix}.shared_expert.gate_proj.weight");
-            let up_name = format!("{prefix}.shared_expert.up_proj.weight");
-            let gate_proj_bytes = shared_inter * hidden * elem;
-            let total = 2 * gate_proj_bytes;
-            let ptr = unsafe { crate::driver::mem_alloc(total)? };
-            unsafe {
-                weights.take_into(&gate_name, ptr, stream)?;
-                weights.take_into(&up_name, ptr.add(gate_proj_bytes), stream)?;
-            }
-            let w = unsafe { GpuTensor::new(ptr, &[2 * shared_inter, hidden], dtype) };
-            Linear::new(w, None)
-        };
+        // Shared expert is optional (shared_expert_intermediate_size == 0 means
+        // no shared expert, matching Python's Qwen3NextSparseMoeBlock).
+        let (shared_gate_up, shared_down, shared_expert_gate) = if shared_inter > 0 {
+            let gate_up = if world_size > 1 {
+                let gate_name = format!("{prefix}.shared_expert.gate_proj.weight");
+                let up_name = format!("{prefix}.shared_expert.up_proj.weight");
+                let gate_proj_bytes = sipp * hidden * elem;
+                let total = 2 * gate_proj_bytes;
+                let ptr = unsafe { crate::driver::mem_alloc(total)? };
+                unsafe {
+                    weights.take_shard_into(&gate_name, 0, rank, world_size, ptr, stream)?;
+                    weights.take_shard_into(
+                        &up_name,
+                        0,
+                        rank,
+                        world_size,
+                        ptr.add(gate_proj_bytes),
+                        stream,
+                    )?;
+                }
+                let w = unsafe { GpuTensor::new(ptr, &[2 * sipp, hidden], dtype) };
+                Linear::new(w, None)
+            } else {
+                let gate_name = format!("{prefix}.shared_expert.gate_proj.weight");
+                let up_name = format!("{prefix}.shared_expert.up_proj.weight");
+                let gate_proj_bytes = shared_inter * hidden * elem;
+                let total = 2 * gate_proj_bytes;
+                let ptr = unsafe { crate::driver::mem_alloc(total)? };
+                unsafe {
+                    weights.take_into(&gate_name, ptr, stream)?;
+                    weights.take_into(&up_name, ptr.add(gate_proj_bytes), stream)?;
+                }
+                let w = unsafe { GpuTensor::new(ptr, &[2 * shared_inter, hidden], dtype) };
+                Linear::new(w, None)
+            };
 
-        let shared_down = if world_size > 1 {
-            let name = format!("{prefix}.shared_expert.down_proj.weight");
-            let w = weights.take_shard(&name, 1, rank, world_size)?;
-            Linear::new(w, None)
-        } else {
-            Linear::load(weights, &format!("{prefix}.shared_expert.down_proj"))?
-        };
+            let down = if world_size > 1 {
+                let name = format!("{prefix}.shared_expert.down_proj.weight");
+                let w = weights.take_shard(&name, 1, rank, world_size)?;
+                Linear::new(w, None)
+            } else {
+                Linear::load(weights, &format!("{prefix}.shared_expert.down_proj"))?
+            };
 
-        let shared_expert_gate = Linear::load(weights, &format!("{prefix}.shared_expert_gate"))?;
+            let gate = Linear::load(weights, &format!("{prefix}.shared_expert_gate"))?;
+
+            (Some(gate_up), Some(down), Some(gate))
+        } else {
+            (None, None, None)
+        };
 
         Ok(Qwen3MoeMlp::MoE {
             moe,

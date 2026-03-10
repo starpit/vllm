@@ -358,6 +358,44 @@ impl GpuWeights {
         Ok(size_bytes)
     }
 
+    /// Take a tensor and return its data as a CPU `Vec<f32>`.
+    ///
+    /// Useful for small per-head parameters (A_log, dt_bias, norm weights)
+    /// that need to be kept on CPU or uploaded to GPU as f32.
+    pub fn take_to_cpu_f32(&mut self, name: &str) -> Result<Vec<f32>> {
+        let cpu_ref = self
+            .tensors
+            .remove(name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+
+        let data = cpu_ref.data();
+        let num_elems: usize = cpu_ref.shape.iter().product();
+        let mut result = Vec::with_capacity(num_elems);
+
+        match cpu_ref.dtype {
+            DType::F32 => {
+                let src =
+                    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, num_elems) };
+                result.extend_from_slice(src);
+            }
+            DType::F16 => {
+                let src = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const half::f16, num_elems)
+                };
+                result.extend(src.iter().map(|v| v.to_f32()));
+            }
+            DType::BF16 => {
+                let src = unsafe {
+                    std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, num_elems)
+                };
+                result.extend(src.iter().map(|v| v.to_f32()));
+            }
+            other => anyhow::bail!("take_to_cpu_f32: unsupported dtype {other}"),
+        }
+
+        Ok(result)
+    }
+
     /// Get the shape and effective dtype of a tensor without loading it to GPU.
     ///
     /// If `target_dtype` is set and the tensor is a floating-point type, the

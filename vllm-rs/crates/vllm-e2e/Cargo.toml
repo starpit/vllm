@@ -45,4 +45,5 @@ vllm-serve = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 safetensors = { workspace = true }
+half = { workspace = true }
 tempfile = { workspace = true }

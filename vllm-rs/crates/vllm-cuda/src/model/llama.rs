@@ -156,6 +156,95 @@ impl RotaryCache {
             head_dim,
         })
     }
+
+    /// Build cos/sin cache with partial rotary dimension (rotary_dim < head_dim).
+    ///
+    /// # Safety
+    /// Requires valid CUDA context and stream.
+    pub unsafe fn new_partial(
+        head_dim: usize,
+        rotary_dim: usize,
+        max_pos: usize,
+        rope_theta: f64,
+        llama3_scaling: Option<&Llama3RopeScaling>,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        // The pos_encoding_kernels.cu already handles head_size > rotary_dim
+        // by copying non-rotary elements through. The cos_sin_cache just needs
+        // to have shape [max_pos, rotary_dim] where rotary_dim <= head_dim.
+        let half = rotary_dim / 2;
+
+        let inv_freqs: Vec<f64> = (0..half)
+            .map(|i| {
+                let freq = 1.0 / rope_theta.powf(2.0 * i as f64 / rotary_dim as f64);
+                if let Some(scaling) = llama3_scaling {
+                    let old_context_len = scaling.original_max_position_embeddings as f64;
+                    let low_freq_wavelen = old_context_len / scaling.low_freq_factor;
+                    let high_freq_wavelen = old_context_len / scaling.high_freq_factor;
+                    let wavelen = 2.0 * std::f64::consts::PI / freq;
+                    if wavelen < high_freq_wavelen {
+                        freq
+                    } else if wavelen > low_freq_wavelen {
+                        freq / scaling.factor
+                    } else {
+                        let smooth = (old_context_len / wavelen - scaling.low_freq_factor)
+                            / (scaling.high_freq_factor - scaling.low_freq_factor);
+                        (1.0 - smooth) * freq / scaling.factor + smooth * freq
+                    }
+                } else {
+                    freq
+                }
+            })
+            .collect();
+
+        let mut cache = vec![0f32; max_pos * rotary_dim];
+        for pos in 0..max_pos {
+            for i in 0..half {
+                let angle = pos as f64 * inv_freqs[i];
+                cache[pos * rotary_dim + i] = angle.cos() as f32;
+                cache[pos * rotary_dim + half + i] = angle.sin() as f32;
+            }
+        }
+
+        let nbytes = max_pos * rotary_dim * dtype.size_bytes();
+        let gpu_ptr = crate::driver::mem_alloc(nbytes)?;
+
+        match dtype {
+            DType::F32 => {
+                let host = crate::driver::mem_alloc_host(nbytes)?;
+                std::ptr::copy_nonoverlapping(cache.as_ptr() as *const u8, host, nbytes);
+                crate::driver::memcpy_htod_async(gpu_ptr, host, nbytes, device.compute_stream)?;
+                crate::driver::stream_synchronize(device.compute_stream)?;
+                crate::driver::mem_free_host(host)?;
+            }
+            DType::F16 => {
+                let f16_data: Vec<half::f16> =
+                    cache.iter().map(|&v| half::f16::from_f32(v)).collect();
+                let host = crate::driver::mem_alloc_host(nbytes)?;
+                std::ptr::copy_nonoverlapping(f16_data.as_ptr() as *const u8, host, nbytes);
+                crate::driver::memcpy_htod_async(gpu_ptr, host, nbytes, device.compute_stream)?;
+                crate::driver::stream_synchronize(device.compute_stream)?;
+                crate::driver::mem_free_host(host)?;
+            }
+            DType::BF16 => {
+                let bf16_data: Vec<half::bf16> =
+                    cache.iter().map(|&v| half::bf16::from_f32(v)).collect();
+                let host = crate::driver::mem_alloc_host(nbytes)?;
+                std::ptr::copy_nonoverlapping(bf16_data.as_ptr() as *const u8, host, nbytes);
+                crate::driver::memcpy_htod_async(gpu_ptr, host, nbytes, device.compute_stream)?;
+                crate::driver::stream_synchronize(device.compute_stream)?;
+                crate::driver::mem_free_host(host)?;
+            }
+            _ => anyhow::bail!("unsupported dtype for RoPE cache: {:?}", dtype),
+        }
+
+        let cos_sin_cache = GpuTensor::new(gpu_ptr, &[max_pos, rotary_dim], dtype);
+        Ok(Self {
+            cos_sin_cache,
+            head_dim,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

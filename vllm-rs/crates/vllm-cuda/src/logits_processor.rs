@@ -609,6 +609,12 @@ pub struct AllowedTokenIdsProcessor {
     gpu_req_indices: Option<OwnedTensor>,
 }
 
+impl Default for AllowedTokenIdsProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AllowedTokenIdsProcessor {
     pub fn new() -> Self {
         Self {

@@ -55,8 +55,8 @@ fn cuda_build() {
 
     cudaforge::KernelBuilder::new()
         .out_dir(&cache_dir)
-        .source_files(vllm_sources.iter().map(|s| s.to_string()).collect())
-        .watch(vllm_watch.iter().map(|s| s.to_string()).collect())
+        .source_files(vllm_sources.iter().map(|s| s.to_string()))
+        .watch(vllm_watch.iter().map(|s| s.to_string()))
         .include_path("csrc")
         .arg("-O3")
         .arg("--use_fast_math")
@@ -92,8 +92,8 @@ fn cuda_build() {
 
     cudaforge::KernelBuilder::new()
         .out_dir(&cache_dir)
-        .source_files(marlin_sources.iter().map(|s| s.to_string()).collect())
-        .watch(marlin_watch.iter().map(|s| s.to_string()).collect())
+        .source_files(marlin_sources.iter().map(|s| s.to_string()))
+        .watch(marlin_watch.iter().map(|s| s.to_string()))
         .include_path("csrc/marlin")
         .include_path("csrc")
         .arg("-O3")

@@ -27,7 +27,7 @@ thiserror = { workspace = true }
 vllm-common = { path = "../vllm-common" }
 
 [build-dependencies]
-cudaforge = { version = "0.1", optional = true }
+cudaforge = { version = "=0.1.4", optional = true }
 dirs = "6"
 
 [dev-dependencies]

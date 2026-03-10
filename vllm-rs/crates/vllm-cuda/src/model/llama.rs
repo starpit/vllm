@@ -255,19 +255,19 @@ impl LlamaMLP {
 /// Dense: single fused QKV GEMM. Quantized: separate Q, K, V GEMMs.
 pub struct LlamaAttention {
     /// Fused QKV for dense, or Q-only for quantized.
-    qkv_proj: LinearLayer,
+    pub(crate) qkv_proj: LinearLayer,
     /// Separate K projection — only used for quantized.
-    k_proj: Option<LinearLayer>,
+    pub(crate) k_proj: Option<LinearLayer>,
     /// Separate V projection — only used for quantized.
-    v_proj: Option<LinearLayer>,
-    o_proj: LinearLayer,
-    q_size: usize,
-    kv_size: usize,
-    num_q_heads: usize,
+    pub(crate) v_proj: Option<LinearLayer>,
+    pub(crate) o_proj: LinearLayer,
+    pub(crate) q_size: usize,
+    pub(crate) kv_size: usize,
+    pub(crate) num_q_heads: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub scale: f32,
-    layer_idx: usize,
+    pub(crate) layer_idx: usize,
     /// Optional per-head QK-norm weights (Qwen3, Gemma3).
     /// When present, forward uses `qk_norm_rope` instead of `fused_qkv_rope`.
     pub q_norm_weight: Option<GpuTensor>,

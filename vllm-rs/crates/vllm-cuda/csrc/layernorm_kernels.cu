@@ -232,4 +232,215 @@ void fused_add_rms_norm_bf16(
         input, residual, weight, epsilon, hidden_size);
 }
 
+// ---- Cohere LayerNorm (out-of-place, vectorized) ----
+// out[row, :] = weight * (input[row, :] - mean(input[row, :])) / sqrt(var(input[row, :]) + eps)
+// Full LayerNorm with mean subtraction, weight only (no bias).
+
+} // extern "C"
+
+template <typename T>
+__global__ void cohere_layer_norm_kernel(
+    T* __restrict__ out,
+    const T* __restrict__ input,
+    const T* __restrict__ weight,
+    float epsilon,
+    int hidden_size)
+{
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+
+    const int row = blockIdx.x;
+    const T* x = input + row * hidden_size;
+    T* y = out + row * hidden_size;
+
+    const int num_vecs = hidden_size / VEC_SIZE;
+    const int tail_start = num_vecs * VEC_SIZE;
+
+    // Pass 1: Compute sum and sum of squares.
+    float sum_val = 0.0f;
+    float ss = 0.0f;
+    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
+        float buf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&x[vi * VEC_SIZE]), buf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            sum_val += buf[j];
+            ss += buf[j] * buf[j];
+        }
+    }
+    for (int i = tail_start + threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = static_cast<float>(x[i]);
+        sum_val += v;
+        ss += v * v;
+    }
+    sum_val = block_reduce_sum(sum_val);
+    ss = block_reduce_sum(ss);
+
+    __shared__ float s_mean, s_inv_std;
+    if (threadIdx.x == 0) {
+        float mean = sum_val / hidden_size;
+        float var = ss / hidden_size - mean * mean;
+        s_mean = mean;
+        s_inv_std = rsqrtf(var + epsilon);
+    }
+    __syncthreads();
+
+    float mean = s_mean;
+    float inv_std = s_inv_std;
+
+    // Pass 2: Normalize.
+    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
+        float xbuf[VEC_SIZE], wbuf[VEC_SIZE], obuf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&x[vi * VEC_SIZE]), xbuf);
+        unpack_vec<T>(vec_load(&weight[vi * VEC_SIZE]), wbuf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            obuf[j] = (xbuf[j] - mean) * inv_std * wbuf[j];
+        }
+        vec_store(&y[vi * VEC_SIZE], pack_vec<T>(obuf));
+    }
+    for (int i = tail_start + threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = (static_cast<float>(x[i]) - mean) * inv_std;
+        y[i] = static_cast<T>(v * static_cast<float>(weight[i]));
+    }
+}
+
+// ---- Fused Add + Cohere LayerNorm (in-place) ----
+// residual += input; input = weight * (residual - mean(residual)) / sqrt(var(residual) + eps)
+
+template <typename T>
+__global__ void fused_add_cohere_layer_norm_kernel(
+    T* __restrict__ input,
+    T* __restrict__ residual,
+    const T* __restrict__ weight,
+    float epsilon,
+    int hidden_size)
+{
+    constexpr int VEC_SIZE = VecType<T>::SIZE;
+
+    const int row = blockIdx.x;
+    T* inp = input + row * hidden_size;
+    T* res = residual + row * hidden_size;
+
+    const int num_vecs = hidden_size / VEC_SIZE;
+    const int tail_start = num_vecs * VEC_SIZE;
+
+    // Pass 1: Fused add + stats.
+    float sum_val = 0.0f;
+    float ss = 0.0f;
+    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
+        float ibuf[VEC_SIZE], rbuf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&inp[vi * VEC_SIZE]), ibuf);
+        unpack_vec<T>(vec_load(&res[vi * VEC_SIZE]), rbuf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            rbuf[j] += ibuf[j];
+            sum_val += rbuf[j];
+            ss += rbuf[j] * rbuf[j];
+        }
+        vec_store(&res[vi * VEC_SIZE], pack_vec<T>(rbuf));
+    }
+    for (int i = tail_start + threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float r = static_cast<float>(res[i]) + static_cast<float>(inp[i]);
+        res[i] = static_cast<T>(r);
+        sum_val += r;
+        ss += r * r;
+    }
+    sum_val = block_reduce_sum(sum_val);
+    ss = block_reduce_sum(ss);
+
+    __shared__ float s_mean, s_inv_std;
+    if (threadIdx.x == 0) {
+        float mean = sum_val / hidden_size;
+        float var = ss / hidden_size - mean * mean;
+        s_mean = mean;
+        s_inv_std = rsqrtf(var + epsilon);
+    }
+    __syncthreads();
+
+    float mean = s_mean;
+    float inv_std = s_inv_std;
+
+    // Pass 2: Normalize.
+    for (int vi = threadIdx.x; vi < num_vecs; vi += blockDim.x) {
+        float rbuf[VEC_SIZE], wbuf[VEC_SIZE], obuf[VEC_SIZE];
+        unpack_vec<T>(vec_load(&res[vi * VEC_SIZE]), rbuf);
+        unpack_vec<T>(vec_load(&weight[vi * VEC_SIZE]), wbuf);
+        #pragma unroll
+        for (int j = 0; j < VEC_SIZE; j++) {
+            obuf[j] = (rbuf[j] - mean) * inv_std * wbuf[j];
+        }
+        vec_store(&inp[vi * VEC_SIZE], pack_vec<T>(obuf));
+    }
+    for (int i = tail_start + threadIdx.x; i < hidden_size; i += blockDim.x) {
+        float v = (static_cast<float>(res[i]) - mean) * inv_std;
+        inp[i] = static_cast<T>(v * static_cast<float>(weight[i]));
+    }
+}
+
+extern "C" {
+
+// ---- Cohere LayerNorm entry points ----
+
+void cohere_layer_norm_f32(
+    float* out, const float* input, const float* weight,
+    float epsilon, int num_tokens, int hidden_size,
+    cudaStream_t stream)
+{
+    int threads = (hidden_size < 1024) ? hidden_size : 1024;
+    cohere_layer_norm_kernel<float><<<num_tokens, threads, 0, stream>>>(
+        out, input, weight, epsilon, hidden_size);
+}
+
+void cohere_layer_norm_f16(
+    __half* out, const __half* input, const __half* weight,
+    float epsilon, int num_tokens, int hidden_size,
+    cudaStream_t stream)
+{
+    int threads = (hidden_size < 1024) ? hidden_size : 1024;
+    cohere_layer_norm_kernel<__half><<<num_tokens, threads, 0, stream>>>(
+        out, input, weight, epsilon, hidden_size);
+}
+
+void cohere_layer_norm_bf16(
+    __nv_bfloat16* out, const __nv_bfloat16* input, const __nv_bfloat16* weight,
+    float epsilon, int num_tokens, int hidden_size,
+    cudaStream_t stream)
+{
+    int threads = (hidden_size < 1024) ? hidden_size : 1024;
+    cohere_layer_norm_kernel<__nv_bfloat16><<<num_tokens, threads, 0, stream>>>(
+        out, input, weight, epsilon, hidden_size);
+}
+
+// ---- Fused Add + Cohere LayerNorm entry points ----
+
+void fused_add_cohere_layer_norm_f32(
+    float* input, float* residual, const float* weight,
+    float epsilon, int num_tokens, int hidden_size,
+    cudaStream_t stream)
+{
+    int threads = (hidden_size < 1024) ? hidden_size : 1024;
+    fused_add_cohere_layer_norm_kernel<float><<<num_tokens, threads, 0, stream>>>(
+        input, residual, weight, epsilon, hidden_size);
+}
+
+void fused_add_cohere_layer_norm_f16(
+    __half* input, __half* residual, const __half* weight,
+    float epsilon, int num_tokens, int hidden_size,
+    cudaStream_t stream)
+{
+    int threads = (hidden_size < 1024) ? hidden_size : 1024;
+    fused_add_cohere_layer_norm_kernel<__half><<<num_tokens, threads, 0, stream>>>(
+        input, residual, weight, epsilon, hidden_size);
+}
+
+void fused_add_cohere_layer_norm_bf16(
+    __nv_bfloat16* input, __nv_bfloat16* residual, const __nv_bfloat16* weight,
+    float epsilon, int num_tokens, int hidden_size,
+    cudaStream_t stream)
+{
+    int threads = (hidden_size < 1024) ? hidden_size : 1024;
+    fused_add_cohere_layer_norm_kernel<__nv_bfloat16><<<num_tokens, threads, 0, stream>>>(
+        input, residual, weight, epsilon, hidden_size);
+}
+
 } // extern "C"

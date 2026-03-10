@@ -23,7 +23,7 @@
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
   │ DeepSeek V2/V3 (MLA+MoE) │ yes          │ no         │ Complex: MLA attention, MoE gating │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
-  │ Command R                │ yes          │ no         │                                    │
+  │ Command R                │ yes          │ yes        │ BNB 4-bit verified on L40S         │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
   │ Qwen2 MoE                │ yes          │ yes        │ MoE + shared expert (gated)        │
   ├──────────────────────────┼──────────────┼────────────┼────────────────────────────────────┤
@@ -326,7 +326,7 @@
   5. ~~MoE kernel + models: Fused MoE GEMM, then port Mixtral/Qwen MoE/Qwen3 MoE~~ — **DONE** (WMMA tensor-core kernel, 3 models)
   6. DeepSeek V2/V3 (MLA): Most complex arch — absorbed-MLA attention, MoE
   7. ~~Tensor parallelism: Parallel layers, NCCL, multi-GPU init~~ — **DONE** (TP=2 Qwen2.5-0.5B E2E verified)
-  8. Remaining dense archs: Command R, Qwen3-Next
+  8. Remaining dense archs: Qwen3-Next
   9. ~~Sampling perf: Fused penalty kernel on GPU, no CPU fallback~~ — **DONE**
   10. LoRA, speculative decoding: Feature parity on worker traits (embeddings done)
   11. Multimodal: Vision encoders (Gemma3-MM, Qwen2-VL)

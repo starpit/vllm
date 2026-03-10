@@ -372,3 +372,140 @@ void rotary_embedding_bf16(
 }
 
 } // extern "C"
+
+// ---------------------------------------------------------------------------
+// Interleaved RoPE kernel (Cohere convention)
+//
+// Pairs (2i, 2i+1) are rotated together, unlike NeoX which pairs (i, i+half).
+// cos_sin_cache layout is the same: [max_pos, rotary_dim] where first half
+// is cos, second half is sin. But we index differently when applying.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void fused_qkv_interleaved_rope_kernel(
+    T* __restrict__ q_out,
+    T* __restrict__ k_out,
+    T* __restrict__ v_out,
+    const T* __restrict__ qkv,
+    const uint32_t* __restrict__ positions,
+    const T* __restrict__ cos_sin_cache,
+    int q_size,
+    int kv_size,
+    int total_dim,
+    int rotary_dim,
+    int head_size)
+{
+    const int token_idx = blockIdx.x;
+    const int pos = static_cast<int>(positions[token_idx]);
+    const int half_rot = rotary_dim / 2;
+    const T* cos_ptr = cos_sin_cache + pos * rotary_dim;
+    const T* sin_ptr = cos_ptr + half_rot;
+    // Number of interleaved pairs per head = min(half_rot, head_size/2)
+    const int num_pairs = (half_rot < head_size / 2) ? half_rot : (head_size / 2);
+    const int non_rot = head_size - 2 * num_pairs;
+
+    const T* row = qkv + token_idx * total_dim;
+    T* q = q_out + token_idx * q_size;
+    T* k = k_out + token_idx * kv_size;
+    T* v = v_out + token_idx * kv_size;
+
+    const int nqh = q_size / head_size;
+    const int nkh = kv_size / head_size;
+
+    // --- Q heads: interleaved RoPE ---
+    for (int tid = threadIdx.x; tid < nqh * num_pairs; tid += blockDim.x) {
+        const int h = tid / num_pairs;
+        const int p = tid % num_pairs;
+        const int base = h * head_size + 2 * p;  // interleaved: pair at (2p, 2p+1)
+
+        float x0 = static_cast<float>(row[base]);
+        float x1 = static_cast<float>(row[base + 1]);
+        float c = static_cast<float>(cos_ptr[p]);
+        float s = static_cast<float>(sin_ptr[p]);
+
+        q[base]     = static_cast<T>(x0 * c - x1 * s);
+        q[base + 1] = static_cast<T>(x1 * c + x0 * s);
+    }
+    // Copy non-rotary elements.
+    for (int tid = threadIdx.x; tid < nqh * non_rot; tid += blockDim.x) {
+        const int h = tid / non_rot;
+        const int i = 2 * num_pairs + tid % non_rot;
+        q[h * head_size + i] = row[h * head_size + i];
+    }
+
+    // --- K heads: interleaved RoPE ---
+    const T* k_row = row + q_size;
+    for (int tid = threadIdx.x; tid < nkh * num_pairs; tid += blockDim.x) {
+        const int h = tid / num_pairs;
+        const int p = tid % num_pairs;
+        const int base = h * head_size + 2 * p;
+
+        float x0 = static_cast<float>(k_row[base]);
+        float x1 = static_cast<float>(k_row[base + 1]);
+        float c = static_cast<float>(cos_ptr[p]);
+        float s = static_cast<float>(sin_ptr[p]);
+
+        k[base]     = static_cast<T>(x0 * c - x1 * s);
+        k[base + 1] = static_cast<T>(x1 * c + x0 * s);
+    }
+    for (int tid = threadIdx.x; tid < nkh * non_rot; tid += blockDim.x) {
+        const int h = tid / non_rot;
+        const int i = 2 * num_pairs + tid % non_rot;
+        k[h * head_size + i] = k_row[h * head_size + i];
+    }
+
+    // --- V: straight copy ---
+    constexpr int VEC = VecType<T>::SIZE;
+    const T* v_row = row + q_size + kv_size;
+    const int v_vecs = kv_size / VEC;
+    for (int tid = threadIdx.x; tid < v_vecs; tid += blockDim.x) {
+        vec_store(&v[tid * VEC], vec_load(&v_row[tid * VEC]));
+    }
+    for (int tid = threadIdx.x; tid < kv_size - v_vecs * VEC; tid += blockDim.x) {
+        v[v_vecs * VEC + tid] = v_row[v_vecs * VEC + tid];
+    }
+}
+
+#define LAUNCH_FUSED_QKV_INTERLEAVED_ROPE(T)                                    \
+    do {                                                                         \
+        int half = rotary_dim / 2;                                              \
+        int nqh = q_size / head_size;                                           \
+        int work = nqh * half;                                                  \
+        int threads = (work < 512) ? work : 512;                                \
+        if (threads < 1) threads = 1;                                           \
+        fused_qkv_interleaved_rope_kernel<T><<<num_tokens, threads, 0, stream>>>( \
+            (T*)q_out, (T*)k_out, (T*)v_out, (const T*)qkv,                    \
+            (const uint32_t*)positions, (const T*)cos_sin_cache,                \
+            q_size, kv_size, total_dim, rotary_dim, head_size);                 \
+    } while (0)
+
+extern "C" {
+
+void fused_qkv_interleaved_rope_f32(
+    void* q_out, void* k_out, void* v_out, const void* qkv,
+    const void* positions, const void* cos_sin_cache,
+    int q_size, int kv_size, int total_dim, int rotary_dim,
+    int head_size, int num_tokens, cudaStream_t stream)
+{
+    LAUNCH_FUSED_QKV_INTERLEAVED_ROPE(float);
+}
+
+void fused_qkv_interleaved_rope_f16(
+    void* q_out, void* k_out, void* v_out, const void* qkv,
+    const void* positions, const void* cos_sin_cache,
+    int q_size, int kv_size, int total_dim, int rotary_dim,
+    int head_size, int num_tokens, cudaStream_t stream)
+{
+    LAUNCH_FUSED_QKV_INTERLEAVED_ROPE(__half);
+}
+
+void fused_qkv_interleaved_rope_bf16(
+    void* q_out, void* k_out, void* v_out, const void* qkv,
+    const void* positions, const void* cos_sin_cache,
+    int q_size, int kv_size, int total_dim, int rotary_dim,
+    int head_size, int num_tokens, cudaStream_t stream)
+{
+    LAUNCH_FUSED_QKV_INTERLEAVED_ROPE(__nv_bfloat16);
+}
+
+} // extern "C"

@@ -76,6 +76,111 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Cohere LayerNorm (full LayerNorm with mean subtraction, weight only)
+    fn cohere_layer_norm_f16(
+        out: *mut u16,
+        input: *const u16,
+        weight: *const u16,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+    fn cohere_layer_norm_bf16(
+        out: *mut u16,
+        input: *const u16,
+        weight: *const u16,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+    fn cohere_layer_norm_f32(
+        out: *mut f32,
+        input: *const f32,
+        weight: *const f32,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+
+    // Fused add + Cohere LayerNorm (in-place)
+    fn fused_add_cohere_layer_norm_f16(
+        input: *mut u16,
+        residual: *mut u16,
+        weight: *const u16,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+    fn fused_add_cohere_layer_norm_bf16(
+        input: *mut u16,
+        residual: *mut u16,
+        weight: *const u16,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+    fn fused_add_cohere_layer_norm_f32(
+        input: *mut f32,
+        residual: *mut f32,
+        weight: *const f32,
+        epsilon: f32,
+        num_tokens: i32,
+        hidden_size: i32,
+        stream: CUstream,
+    );
+
+    // Fused QKV split + interleaved RoPE (Cohere convention: pairs at 2i, 2i+1)
+    fn fused_qkv_interleaved_rope_f16(
+        q: *mut u16,
+        k: *mut u16,
+        v: *mut u16,
+        qkv: *const u16,
+        positions: *const u32,
+        cos_sin_cache: *const u16,
+        q_size: i32,
+        kv_size: i32,
+        total_dim: i32,
+        rotary_dim: i32,
+        head_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+    fn fused_qkv_interleaved_rope_bf16(
+        q: *mut u16,
+        k: *mut u16,
+        v: *mut u16,
+        qkv: *const u16,
+        positions: *const u32,
+        cos_sin_cache: *const u16,
+        q_size: i32,
+        kv_size: i32,
+        total_dim: i32,
+        rotary_dim: i32,
+        head_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+    fn fused_qkv_interleaved_rope_f32(
+        q: *mut f32,
+        k: *mut f32,
+        v: *mut f32,
+        qkv: *const f32,
+        positions: *const u32,
+        cos_sin_cache: *const f32,
+        q_size: i32,
+        kv_size: i32,
+        total_dim: i32,
+        rotary_dim: i32,
+        head_size: i32,
+        num_tokens: i32,
+        stream: CUstream,
+    );
+
     // Fused SiLU(gate) * up from combined [num_tokens, 2*d]
     fn silu_and_mul_fused_f16(
         out: *mut u16,
@@ -643,6 +748,203 @@ pub unsafe fn fused_add_rms_norm(
     .expect("fused_add_rms_norm: D2D copy failed");
 
     fused_add_rms_norm_inplace(normed_buf.into_gpu_tensor(), residual, weight, eps, stream)
+}
+
+// ---------------------------------------------------------------------------
+// Cohere LayerNorm
+// ---------------------------------------------------------------------------
+
+/// Cohere LayerNorm: `out = weight * (input - mean(input)) / sqrt(var(input) + eps)`
+///
+/// Full LayerNorm with mean subtraction, weight only (no bias).
+/// Used by Command R (CohereForCausalLM).
+///
+/// * `input`: `[num_tokens, hidden_size]`
+/// * `weight`: `[hidden_size]`
+/// * Returns: `[num_tokens, hidden_size]` allocated from arena.
+pub unsafe fn cohere_layer_norm(
+    input: GpuTensor,
+    weight: GpuTensor,
+    eps: f32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let num_tokens = input.dim(0) as i32;
+    let hidden_size = input.dim(1) as i32;
+    let out = alloc.alloc_tensor(&[num_tokens as usize, hidden_size as usize], input.dtype());
+
+    match input.dtype() {
+        DType::F16 => cohere_layer_norm_f16(
+            out.as_mut_ptr(),
+            input.as_ptr(),
+            weight.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        DType::BF16 => cohere_layer_norm_bf16(
+            out.as_mut_ptr(),
+            input.as_ptr(),
+            weight.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        DType::F32 => cohere_layer_norm_f32(
+            out.as_mut_ptr(),
+            input.as_ptr(),
+            weight.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        _ => panic!("cohere_layer_norm: unsupported dtype {:?}", input.dtype()),
+    }
+    out
+}
+
+/// Fused add + Cohere LayerNorm: `residual += input; normed = layernorm(residual) * weight`
+///
+/// Mutates both `input` (becomes normed output) and `residual` (updated in-place).
+pub unsafe fn fused_add_cohere_layer_norm_inplace(
+    input: GpuTensor,
+    residual: GpuTensor,
+    weight: GpuTensor,
+    eps: f32,
+    stream: CUstream,
+) -> (GpuTensor, GpuTensor) {
+    let num_tokens = input.dim(0) as i32;
+    let hidden_size = input.dim(1) as i32;
+
+    match input.dtype() {
+        DType::F16 => fused_add_cohere_layer_norm_f16(
+            input.as_mut_ptr(),
+            residual.as_mut_ptr(),
+            weight.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        DType::BF16 => fused_add_cohere_layer_norm_bf16(
+            input.as_mut_ptr(),
+            residual.as_mut_ptr(),
+            weight.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        DType::F32 => fused_add_cohere_layer_norm_f32(
+            input.as_mut_ptr(),
+            residual.as_mut_ptr(),
+            weight.as_ptr(),
+            eps,
+            num_tokens,
+            hidden_size,
+            stream,
+        ),
+        _ => panic!(
+            "fused_add_cohere_layer_norm: unsupported dtype {:?}",
+            input.dtype()
+        ),
+    }
+
+    (input, residual)
+}
+
+// ---------------------------------------------------------------------------
+// Fused QKV split + interleaved RoPE (Cohere convention)
+// ---------------------------------------------------------------------------
+
+/// Fused QKV split + interleaved RoPE.
+///
+/// Like `fused_qkv_rope` but pairs adjacent elements (2i, 2i+1) for rotation
+/// instead of NeoX-style (i, i+half). Used by Command R (CohereForCausalLM).
+///
+/// * `qkv`: `[num_tokens, q_size + 2*kv_size]` — fused QKV GEMM output
+/// * `positions`: `[num_tokens]` u32
+/// * `cos_sin_cache`: `[max_pos, rotary_dim]`
+/// * Returns: `(q, k, v)` where q is `[num_tokens, num_q_heads, head_dim]`,
+///   k and v are `[num_tokens, num_kv_heads, head_dim]`.
+pub unsafe fn fused_qkv_interleaved_rope(
+    qkv: GpuTensor,
+    positions: GpuTensor,
+    cos_sin_cache: GpuTensor,
+    q_size: usize,
+    kv_size: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> (OwnedTensor, OwnedTensor, OwnedTensor) {
+    let num_tokens = qkv.dim(0);
+    let total_dim = qkv.dim(1);
+    let rotary_dim = cos_sin_cache.dim(1) as i32;
+
+    debug_assert_eq!(total_dim, q_size + 2 * kv_size);
+
+    let q = alloc.alloc_tensor(&[num_tokens, num_q_heads, head_dim], qkv.dtype());
+    let k = alloc.alloc_tensor(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
+    let v = alloc.alloc_tensor(&[num_tokens, num_kv_heads, head_dim], qkv.dtype());
+
+    match qkv.dtype() {
+        DType::F16 => fused_qkv_interleaved_rope_f16(
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            v.as_mut_ptr(),
+            qkv.as_ptr(),
+            positions.as_ptr(),
+            cos_sin_cache.as_ptr(),
+            q_size as i32,
+            kv_size as i32,
+            total_dim as i32,
+            rotary_dim,
+            head_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        DType::BF16 => fused_qkv_interleaved_rope_bf16(
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            v.as_mut_ptr(),
+            qkv.as_ptr(),
+            positions.as_ptr(),
+            cos_sin_cache.as_ptr(),
+            q_size as i32,
+            kv_size as i32,
+            total_dim as i32,
+            rotary_dim,
+            head_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        DType::F32 => fused_qkv_interleaved_rope_f32(
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            v.as_mut_ptr(),
+            qkv.as_ptr(),
+            positions.as_ptr(),
+            cos_sin_cache.as_ptr(),
+            q_size as i32,
+            kv_size as i32,
+            total_dim as i32,
+            rotary_dim,
+            head_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        _ => panic!(
+            "fused_qkv_interleaved_rope: unsupported dtype {:?}",
+            qkv.dtype()
+        ),
+    }
+
+    (q, k, v)
 }
 
 // ---------------------------------------------------------------------------

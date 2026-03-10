@@ -677,6 +677,39 @@ impl VocabParallelEmbedding {
 }
 
 // ---------------------------------------------------------------------------
+// CohereLayerNorm
+// ---------------------------------------------------------------------------
+
+/// Cohere LayerNorm: full LayerNorm with mean subtraction, weight only (no bias).
+///
+/// `y = weight * (x - mean(x)) / sqrt(var(x) + eps)`
+///
+/// Used by Command R (CohereForCausalLM).
+/// Weight shape: `[hidden_size]`.
+pub struct CohereLayerNorm {
+    pub weight: GpuTensor, // [hidden_size]
+    pub eps: f32,
+}
+
+impl CohereLayerNorm {
+    pub fn new(weight: GpuTensor, eps: f32) -> Self {
+        debug_assert_eq!(weight.ndim(), 1);
+        Self { weight, eps }
+    }
+
+    /// Load from `GpuWeights` by prefix.
+    pub fn load(weights: &mut GpuWeights, prefix: &str, eps: f32) -> Result<Self> {
+        let weight_name = format!("{prefix}.weight");
+        let weight = weights.take(&weight_name)?;
+        Ok(Self::new(weight, eps))
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.weight.dim(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

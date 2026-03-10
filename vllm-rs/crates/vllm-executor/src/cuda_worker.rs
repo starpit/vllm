@@ -85,6 +85,7 @@ enum CudaModel {
     Mixtral(vllm_cuda::model::mixtral::MixtralForCausalLM),
     Qwen2Moe(vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM),
     Qwen3Moe(vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM),
+    CommandR(vllm_cuda::model::commandr::CommandRForCausalLM),
 }
 
 impl CudaModel {
@@ -97,6 +98,7 @@ impl CudaModel {
             Self::Mixtral(m) => m.model.layers.len(),
             Self::Qwen2Moe(m) => m.model.layers.len(),
             Self::Qwen3Moe(m) => m.model.layers.len(),
+            Self::CommandR(m) => m.model.layers.len(),
         }
     }
 
@@ -109,6 +111,7 @@ impl CudaModel {
             Self::Mixtral(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.num_kv_heads,
             Self::Qwen3Moe(m) => m.model.layers[0].self_attn.num_kv_heads,
+            Self::CommandR(m) => m.model.layers[0].self_attn.inner.num_kv_heads,
         }
     }
 
@@ -121,6 +124,7 @@ impl CudaModel {
             Self::Mixtral(m) => m.model.layers[0].self_attn.head_dim,
             Self::Qwen2Moe(m) => m.model.layers[0].self_attn.head_dim,
             Self::Qwen3Moe(m) => m.model.layers[0].self_attn.head_dim,
+            Self::CommandR(m) => m.model.layers[0].self_attn.inner.head_dim,
         }
     }
 
@@ -133,6 +137,7 @@ impl CudaModel {
             Self::Mixtral(m) => m.lm_head.out_features(),
             Self::Qwen2Moe(m) => m.lm_head.out_features(),
             Self::Qwen3Moe(m) => m.lm_head.out_features(),
+            Self::CommandR(m) => m.lm_head.out_features(),
         }
     }
 
@@ -145,6 +150,7 @@ impl CudaModel {
             Self::Mixtral(m) => m.lm_head.in_features(),
             Self::Qwen2Moe(m) => m.lm_head.in_features(),
             Self::Qwen3Moe(m) => m.lm_head.in_features(),
+            Self::CommandR(m) => m.lm_head.in_features(),
         }
     }
 
@@ -267,6 +273,20 @@ impl CudaModel {
                 )
             },
             Self::Qwen3Moe(m) => unsafe {
+                m.model.forward_owned(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                )
+            },
+            Self::CommandR(m) => unsafe {
                 m.model.forward_owned(
                     input_ids,
                     positions,
@@ -408,6 +428,21 @@ impl CudaModel {
                     last_token_indices,
                 )
             },
+            Self::CommandR(m) => unsafe {
+                m.forward_owned(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
         }
     }
 
@@ -520,6 +555,21 @@ impl CudaModel {
             },
             Self::Qwen3Moe(m) => unsafe {
                 m.forward(
+                    input_ids,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            Self::CommandR(m) => unsafe {
+                m.forward_owned(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -839,6 +889,51 @@ fn gemma3_config_from_hf(
         layer_is_sliding,
         sliding_window,
         attention_bias,
+    })
+}
+
+fn commandr_config_from_hf(
+    hf: &HfModelConfig,
+) -> ExecutorResult<vllm_cuda::model::commandr::CommandRConfig> {
+    let hidden_size = hf
+        .hidden_size
+        .ok_or_else(|| ExecutorError::WorkerInit("missing hidden_size".into()))?;
+    let num_attention_heads = hf
+        .num_attention_heads
+        .ok_or_else(|| ExecutorError::WorkerInit("missing num_attention_heads".into()))?;
+    let num_kv_heads = hf.num_key_value_heads.unwrap_or(num_attention_heads);
+    let head_dim = hf.head_dim.unwrap_or(hidden_size / num_attention_heads);
+
+    let logit_scale = hf
+        .extra
+        .get("logit_scale")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0) as f32;
+    let use_qk_norm = hf
+        .extra
+        .get("use_qk_norm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let layer_norm_eps = hf
+        .extra
+        .get("layer_norm_eps")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-5) as f32;
+
+    Ok(vllm_cuda::model::commandr::CommandRConfig {
+        hidden_size,
+        num_attention_heads,
+        num_kv_heads,
+        num_hidden_layers: hf.num_hidden_layers.unwrap_or(32),
+        intermediate_size: hf.intermediate_size.unwrap_or(hidden_size * 4),
+        vocab_size: hf.vocab_size.unwrap_or(256000),
+        max_position_embeddings: hf.max_position_embeddings.unwrap_or(8192),
+        layer_norm_eps,
+        rope_theta: hf.rope_theta.unwrap_or(10000.0),
+        head_dim,
+        logit_scale,
+        use_qk_norm,
+        tie_word_embeddings: hf.tie_word_embeddings.unwrap_or(true),
     })
 }
 
@@ -2607,13 +2702,38 @@ impl Worker for CudaWorker {
                 .map_err(|e| ExecutorError::WorkerInit(format!("Qwen3MoE load: {e}")))?;
                 CudaModel::Qwen3Moe(m)
             }
+            "CohereForCausalLM" => {
+                let config = commandr_config_from_hf(&hf_config)?;
+                let m = if qconfig.is_bnb4bit() {
+                    let bnb_cfg = match &qconfig {
+                        vllm_cuda::quant::QuantConfig::Bnb4bit(c) => c,
+                        _ => unreachable!(),
+                    };
+                    vllm_cuda::model::commandr::CommandRForCausalLM::load_bnb4bit(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        bnb_cfg,
+                        device,
+                    )
+                } else {
+                    vllm_cuda::model::commandr::CommandRForCausalLM::load(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                }
+                .map_err(|e| ExecutorError::WorkerInit(format!("CommandR load: {e}")))?;
+                CudaModel::CommandR(m)
+            }
             _ => {
                 return Err(ExecutorError::WorkerInit(format!(
                     "unsupported architecture for cuda-backend: {arch}. \
                      Supported: LlamaForCausalLM, MistralForCausalLM, Qwen3ForCausalLM, \
                      Phi3ForCausalLM, Qwen2ForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM, \
                      Gemma3ForConditionalGeneration, GraniteForCausalLM, MixtralForCausalLM, \
-                     Qwen2MoeForCausalLM, Qwen3MoeForCausalLM"
+                     Qwen2MoeForCausalLM, Qwen3MoeForCausalLM, CohereForCausalLM"
                 )));
             }
         };

@@ -1780,6 +1780,103 @@ async fn test_cuda_qwen2_moe_chat() {
 }
 
 // ===========================================================================
+// CUDA graphs + MoE: verify decode CUDA graphs work with MoE models
+// ===========================================================================
+// MoE kernels (topk_softmax, moe_align_block_size, fused_moe_gemm) have
+// deterministic allocation sizes per batch_size, so CUDA graph capture works.
+// These tests explicitly disable enforce_eager to exercise the graph path.
+//
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_moe_graphs -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_moe_graphs_mixtral_completion() {
+    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+        .with_enforce_eager(false)
+        .start()
+        .await
+        .expect("Mixtral MoE with CUDA graphs should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The capital of France is", 30);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "MoE + CUDA graphs completion should not be empty"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_moe_graphs_mixtral_chat() {
+    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+        .with_enforce_eager(false)
+        .start()
+        .await
+        .expect("Mixtral MoE with CUDA graphs should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    assert!(
+        !resp.choices[0]
+            .message
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .is_empty(),
+        "MoE + CUDA graphs chat should produce output"
+    );
+}
+
+/// Multi-turn chat with MoE + CUDA graphs: exercises graph replay with
+/// changing batch composition (prefill eager + decode graphed across turns).
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_moe_graphs_mixtral_multi_turn() {
+    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+        .with_enforce_eager(false)
+        .start()
+        .await
+        .expect("Mixtral MoE with CUDA graphs should start");
+
+    let client = Client::new(server.base_url());
+
+    // Turn 1
+    let request = simple_chat_request("What is 2+2?", Some(30));
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_valid_chat_response(&resp);
+    let turn1 = resp.choices[0]
+        .message
+        .content
+        .as_deref()
+        .unwrap_or("")
+        .to_string();
+    assert!(!turn1.is_empty(), "Turn 1 should produce output");
+
+    // Turn 2 — new request exercises graph replay
+    let request = simple_chat_request("What is 3+3?", Some(30));
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_valid_chat_response(&resp);
+    assert!(
+        !resp.choices[0]
+            .message
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .is_empty(),
+        "Turn 2 should produce output (graph replay)"
+    );
+}
+
+// ===========================================================================
 // CUDA semantic correctness + multi-turn + non-greedy tests
 // ===========================================================================
 // These tests validate output quality beyond "non-empty", catching bugs like

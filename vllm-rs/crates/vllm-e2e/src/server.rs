@@ -62,6 +62,7 @@ impl TestServer {
             dtype: None,
             device: None,
             spawn: should_spawn(),
+            enforce_eager: None,
         }
     }
 
@@ -111,6 +112,7 @@ pub struct TestServerBuilder {
     device: Option<String>,
     tensor_parallel_size: usize,
     spawn: bool,
+    enforce_eager: Option<bool>,
 }
 
 impl TestServerBuilder {
@@ -190,6 +192,14 @@ impl TestServerBuilder {
         self
     }
 
+    /// Override the enforce-eager setting.
+    /// When `false`, CUDA graphs are enabled (default for CLI).
+    /// When `true`, CUDA graphs are disabled (default for in-process tests).
+    pub fn with_enforce_eager(mut self, eager: bool) -> Self {
+        self.enforce_eager = Some(eager);
+        self
+    }
+
     /// Start the server and wait for it to become healthy.
     pub async fn start(self) -> Result<TestServer> {
         if self.spawn {
@@ -246,6 +256,10 @@ impl TestServerBuilder {
 
         if self.disable_async_scheduling {
             cmd.arg("--disable-async-scheduling");
+        }
+
+        if self.enforce_eager == Some(true) {
+            cmd.arg("--enforce-eager");
         }
 
         for arg in &self.extra_args {
@@ -308,7 +322,7 @@ impl TestServerBuilder {
         let runner = self.runner.clone();
         let dtype = self.dtype.clone().unwrap_or_else(|| "auto".to_string());
         let device = self.device.clone().unwrap_or_else(|| "auto".to_string());
-        let config = vllm_serve::init::VllmConfig {
+        let mut config = vllm_serve::init::VllmConfig {
             model: model.clone(),
             device,
             dtype,
@@ -322,6 +336,9 @@ impl TestServerBuilder {
             runner: runner.clone(),
             ..Default::default()
         };
+        if let Some(eager) = self.enforce_eager {
+            config.enforce_eager = eager;
+        }
 
         // Initialize the full stack (blocking — downloads model, loads weights).
         // Timeout after 90s so hangs in CUDA graph capture / model load are caught.

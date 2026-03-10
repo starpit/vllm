@@ -260,10 +260,10 @@
   - Qwen2 MoE E2E test: Qwen/Qwen1.5-MoE-A2.7B-Chat is ~30GB, times out downloading on pod.
     Need a smaller Qwen2 MoE test model or pre-cache the model.
   - Qwen3 MoE E2E test: No small Qwen3 MoE test model identified yet.
-  - CUDA graphs for MoE: Decode CUDA graphs are disabled for MoE models because the
-    fused MoE GEMM kernel uses dynamic shared memory and variable grid sizes based on
-    num_tokens_post_padded (output of moe_align_block_size). Need to either pad to
-    fixed sizes or capture multiple graph variants.
+  - ~~CUDA graphs for MoE~~ — **DONE**: MoE kernel allocations are deterministic per
+    batch_size (topk_softmax, moe_align_block_size, fused_moe_gemm). The caching
+    allocator's private pool handles intermediates correctly. E2E tests added:
+    `test_cuda_moe_graphs_mixtral_{completion,chat,multi_turn}`.
   - ~~MoE + TP~~ — **DONE**: Per-expert weight sharding (intermediate_size / tp_size) + post-MoE
     NCCL all-reduce. Shared expert (Qwen2/3 MoE) also sharded. E2E verified TP=2 Mixtral + Qwen2 MoE.
   - Profile vs Python: No nsys data yet comparing our WMMA MoE kernel against

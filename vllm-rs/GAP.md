@@ -256,8 +256,8 @@
     fused MoE GEMM kernel uses dynamic shared memory and variable grid sizes based on
     num_tokens_post_padded (output of moe_align_block_size). Need to either pad to
     fixed sizes or capture multiple graph variants.
-  - MoE + TP: Expert parallelism (expert_map) needed for multi-GPU MoE serving.
-    Currently only single-GPU MoE works.
+  - ~~MoE + TP~~ — **DONE**: Per-expert weight sharding (intermediate_size / tp_size) + post-MoE
+    NCCL all-reduce. Shared expert (Qwen2/3 MoE) also sharded. E2E verified TP=2 Mixtral + Qwen2 MoE.
   - Profile vs Python: No nsys data yet comparing our WMMA MoE kernel against
     Python's Triton fused_moe_kernel on real workloads (Mixtral-8x7B decode/prefill).
 

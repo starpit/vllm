@@ -1089,6 +1089,33 @@ impl LlamaAttention {
 
         Ok(attn)
     }
+
+    /// Load with QK-norm and TP-sharded weights.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fused_with_qk_norm_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        qk_norm_eps: f32,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let mut attn = Self::load_fused_tp(weights, prefix, config, layer_idx, tp, stream)?;
+
+        let q_norm_name = format!("{prefix}.q_norm.weight");
+        let k_norm_name = format!("{prefix}.k_norm.weight");
+
+        if weights.contains(&q_norm_name) {
+            attn.q_norm_weight = Some(weights.take(&q_norm_name)?);
+        }
+        if weights.contains(&k_norm_name) {
+            attn.k_norm_weight = Some(weights.take(&k_norm_name)?);
+        }
+        attn.qk_norm_eps = qk_norm_eps;
+
+        Ok(attn)
+    }
 }
 
 impl LlamaMLP {

@@ -8,6 +8,9 @@
 //! The MoE layer is identical to Qwen2 MoE. Only the attention layer differs
 //! (QK-norm weights loaded via `load_fused_with_qk_norm`).
 
+#[cfg(feature = "nccl")]
+use std::sync::Arc;
+
 use anyhow::Result;
 
 use crate::alloc::OwnedTensor;
@@ -17,7 +20,9 @@ use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Linear, RmsNorm};
 use crate::layers_moe::FusedMoELayer;
-use crate::model::llama::{LlamaAttention, LlamaMLP, RotaryCache};
+use crate::model::llama::{LlamaAttention, LlamaMLP, RotaryCache, TpConfig};
+#[cfg(feature = "nccl")]
+use crate::nccl::NcclGroup;
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
 
@@ -145,7 +150,7 @@ impl Qwen3MoeDecoderLayer {
             )?;
             Qwen3MoeMlp::Dense(dense)
         } else {
-            Self::load_moe(weights, &format!("{prefix}.mlp"), config, stream)?
+            Self::load_moe(weights, &format!("{prefix}.mlp"), config, None, stream)?
         };
 
         let input_layernorm = RmsNorm::load(
@@ -171,11 +176,14 @@ impl Qwen3MoeDecoderLayer {
         weights: &mut GpuWeights,
         prefix: &str,
         config: &Qwen3MoeConfig,
+        tp: Option<TpConfig>,
         stream: cudarc::driver::sys::CUstream,
     ) -> Result<Qwen3MoeMlp> {
         let num_experts = config.num_experts;
         let inter = config.moe_intermediate_size;
         let hidden = config.hidden_size;
+        let (rank, world_size) = tp.map_or((0, 1), |t| (t.rank, t.world_size));
+        let ipp = inter / world_size;
 
         let gate = Linear::load(weights, &format!("{prefix}.gate"))?;
 
@@ -185,8 +193,8 @@ impl Qwen3MoeDecoderLayer {
             .ok_or_else(|| anyhow::anyhow!("weight not found: {first_gate}"))?;
         let elem = dtype.size_bytes();
 
-        let w1_bytes = num_experts * 2 * inter * hidden * elem;
-        let w2_bytes = num_experts * hidden * inter * elem;
+        let w1_bytes = num_experts * 2 * ipp * hidden * elem;
+        let w2_bytes = num_experts * hidden * ipp * elem;
         let w1_ptr = unsafe { crate::driver::mem_alloc(w1_bytes)? };
         let w2_ptr = unsafe { crate::driver::mem_alloc(w2_bytes)? };
 
@@ -195,24 +203,51 @@ impl Qwen3MoeDecoderLayer {
             let up_name = format!("{prefix}.experts.{e}.up_proj.weight");
             let down_name = format!("{prefix}.experts.{e}.down_proj.weight");
 
-            let expert_w1_offset = e * 2 * inter * hidden * elem;
-            let gate_proj_bytes = inter * hidden * elem;
+            let expert_w1_offset = e * 2 * ipp * hidden * elem;
+            let gate_proj_bytes = ipp * hidden * elem;
 
             unsafe {
-                weights.take_into(&gate_name, w1_ptr.add(expert_w1_offset), stream)?;
-                weights.take_into(
-                    &up_name,
-                    w1_ptr.add(expert_w1_offset + gate_proj_bytes),
-                    stream,
-                )?;
-
-                let expert_w2_offset = e * hidden * inter * elem;
-                weights.take_into(&down_name, w2_ptr.add(expert_w2_offset), stream)?;
+                if world_size > 1 {
+                    weights.take_shard_into(
+                        &gate_name,
+                        0,
+                        rank,
+                        world_size,
+                        w1_ptr.add(expert_w1_offset),
+                        stream,
+                    )?;
+                    weights.take_shard_into(
+                        &up_name,
+                        0,
+                        rank,
+                        world_size,
+                        w1_ptr.add(expert_w1_offset + gate_proj_bytes),
+                        stream,
+                    )?;
+                    let expert_w2_offset = e * hidden * ipp * elem;
+                    weights.take_shard_into(
+                        &down_name,
+                        1,
+                        rank,
+                        world_size,
+                        w2_ptr.add(expert_w2_offset),
+                        stream,
+                    )?;
+                } else {
+                    weights.take_into(&gate_name, w1_ptr.add(expert_w1_offset), stream)?;
+                    weights.take_into(
+                        &up_name,
+                        w1_ptr.add(expert_w1_offset + gate_proj_bytes),
+                        stream,
+                    )?;
+                    let expert_w2_offset = e * hidden * inter * elem;
+                    weights.take_into(&down_name, w2_ptr.add(expert_w2_offset), stream)?;
+                }
             }
         }
 
-        let w1 = unsafe { GpuTensor::new(w1_ptr, &[num_experts, 2 * inter, hidden], dtype) };
-        let w2 = unsafe { GpuTensor::new(w2_ptr, &[num_experts, hidden, inter], dtype) };
+        let w1 = unsafe { GpuTensor::new(w1_ptr, &[num_experts, 2 * ipp, hidden], dtype) };
+        let w2 = unsafe { GpuTensor::new(w2_ptr, &[num_experts, hidden, ipp], dtype) };
 
         let moe = FusedMoELayer {
             gate,
@@ -220,13 +255,36 @@ impl Qwen3MoeDecoderLayer {
             w2,
             num_experts,
             top_k: config.num_experts_per_tok,
-            intermediate_size: inter,
+            intermediate_size: ipp,
             hidden_size: hidden,
             renormalize: true,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         };
 
         let shared_inter = config.shared_expert_intermediate_size;
-        let shared_gate_up = {
+        let sipp = shared_inter / world_size;
+
+        let shared_gate_up = if world_size > 1 {
+            let gate_name = format!("{prefix}.shared_expert.gate_proj.weight");
+            let up_name = format!("{prefix}.shared_expert.up_proj.weight");
+            let gate_proj_bytes = sipp * hidden * elem;
+            let total = 2 * gate_proj_bytes;
+            let ptr = unsafe { crate::driver::mem_alloc(total)? };
+            unsafe {
+                weights.take_shard_into(&gate_name, 0, rank, world_size, ptr, stream)?;
+                weights.take_shard_into(
+                    &up_name,
+                    0,
+                    rank,
+                    world_size,
+                    ptr.add(gate_proj_bytes),
+                    stream,
+                )?;
+            }
+            let w = unsafe { GpuTensor::new(ptr, &[2 * sipp, hidden], dtype) };
+            Linear::new(w, None)
+        } else {
             let gate_name = format!("{prefix}.shared_expert.gate_proj.weight");
             let up_name = format!("{prefix}.shared_expert.up_proj.weight");
             let gate_proj_bytes = shared_inter * hidden * elem;
@@ -240,7 +298,13 @@ impl Qwen3MoeDecoderLayer {
             Linear::new(w, None)
         };
 
-        let shared_down = Linear::load(weights, &format!("{prefix}.shared_expert.down_proj"))?;
+        let shared_down = if world_size > 1 {
+            let name = format!("{prefix}.shared_expert.down_proj.weight");
+            let w = weights.take_shard(&name, 1, rank, world_size)?;
+            Linear::new(w, None)
+        } else {
+            Linear::load(weights, &format!("{prefix}.shared_expert.down_proj"))?
+        };
 
         let shared_expert_gate = Linear::load(weights, &format!("{prefix}.shared_expert_gate"))?;
 
@@ -249,7 +313,7 @@ impl Qwen3MoeDecoderLayer {
             shared_gate_up,
             shared_down,
             shared_expert_gate,
-            shared_intermediate_size: shared_inter,
+            shared_intermediate_size: sipp,
         })
     }
 
@@ -493,5 +557,140 @@ impl Qwen3MoeForCausalLM {
 
         self.lm_head
             .forward(hidden_states, &mut device.cublas, &mut device.caching)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tensor Parallelism
+// ---------------------------------------------------------------------------
+
+impl Qwen3MoeDecoderLayer {
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Qwen3MoeConfig,
+        layer_idx: usize,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let llama_cfg = config.as_llama_config();
+
+        let self_attn = LlamaAttention::load_fused_with_qk_norm_tp(
+            weights,
+            &format!("{prefix}.self_attn"),
+            &llama_cfg,
+            layer_idx,
+            config.rms_norm_eps,
+            tp,
+            stream,
+        )?;
+
+        let is_dense = config.mlp_only_layers.contains(&layer_idx);
+        let mlp = if is_dense {
+            let dense = LlamaMLP::load_fused_tp(
+                weights,
+                &format!("{prefix}.mlp"),
+                config.intermediate_size,
+                tp,
+                stream,
+            )?;
+            Qwen3MoeMlp::Dense(dense)
+        } else {
+            Self::load_moe(weights, &format!("{prefix}.mlp"), config, Some(tp), stream)?
+        };
+
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        })
+    }
+}
+
+impl Qwen3MoeModel {
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        config: &Qwen3MoeConfig,
+        dtype: DType,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = crate::layers::Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            layers.push(Qwen3MoeDecoderLayer::load_tp(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                tp,
+                device.compute_stream,
+            )?);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+        })
+    }
+}
+
+impl Qwen3MoeForCausalLM {
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        config: &Qwen3MoeConfig,
+        dtype: DType,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = Qwen3MoeModel::load_tp(weights, config, dtype, tp, device)?;
+        let lm_head = if config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.weight, None)
+        } else {
+            Linear::load(weights, "lm_head")?
+        };
+        Ok(Self { model, lm_head })
+    }
+
+    #[cfg(feature = "nccl")]
+    pub fn set_tp_group(&mut self, group: Arc<NcclGroup>) {
+        for layer in &mut self.model.layers {
+            layer.self_attn.tp_group = Some(Arc::clone(&group));
+            match &mut layer.mlp {
+                Qwen3MoeMlp::Dense(mlp) => {
+                    mlp.tp_group = Some(Arc::clone(&group));
+                }
+                Qwen3MoeMlp::MoE { moe, .. } => {
+                    moe.tp_group = Some(Arc::clone(&group));
+                }
+            }
+        }
     }
 }

@@ -1334,6 +1334,69 @@ async fn test_cuda_tp2_deepseek_v2_completion() {
     );
 }
 
+/// TP=2 Mixtral MoE: validates MoE expert weight sharding + post-MoE all-reduce.
+///
+/// Uses small_mixtral (~0.8B, 8 experts, top-2). Each expert's intermediate_size
+/// is halved per rank; post-MoE all-reduce combines partial expert outputs.
+///
+/// Run on nick2 pod (2x L40S):
+///   cargo test -p vllm-e2e --features e2e,nccl --release --test e1_basic_serving test_cuda_tp2_mixtral -- --ignored --test-threads=1
+#[cfg(feature = "nccl")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_tp2_mixtral_completion() {
+    let server = TestServer::builder(TestModels::MIXTRAL_SMALL_CUDA)
+        .with_tensor_parallel_size(2)
+        .start()
+        .await
+        .expect("TP=2 Mixtral MoE server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    let text = &resp.choices[0].text;
+    assert!(
+        !text.is_empty(),
+        "TP=2 Mixtral MoE completion should produce non-empty text"
+    );
+}
+
+/// TP=2 Qwen2 MoE: validates shared expert sharding + MoE TP.
+///
+/// Qwen2 MoE has both routed experts and a shared expert (with sigmoid gate).
+/// TP shards both the routed experts' intermediate_size and the shared expert's
+/// gate_up (dim=0) / down (dim=1).
+///
+/// Run on nick2 pod (2x L40S):
+///   cargo test -p vllm-e2e --features e2e,nccl --release --test e1_basic_serving test_cuda_tp2_qwen2_moe -- --ignored --test-threads=1
+#[cfg(feature = "nccl")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_tp2_qwen2_moe_completion() {
+    let server = TestServer::builder(TestModels::QWEN2_MOE_A2_7B_CUDA)
+        .with_tensor_parallel_size(2)
+        .start()
+        .await
+        .expect("TP=2 Qwen2 MoE server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    let text = &resp.choices[0].text;
+    assert!(
+        !text.is_empty(),
+        "TP=2 Qwen2 MoE completion should produce non-empty text"
+    );
+}
+
 // ===========================================================================
 // CUDA Granite — safetensors BF16 (~4.5 GB) on GPU
 // ===========================================================================

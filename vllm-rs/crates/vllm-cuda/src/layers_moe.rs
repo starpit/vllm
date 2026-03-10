@@ -10,10 +10,15 @@
 //! 6. fused_moe_gemm (GEMM 2: down, with routing weight)
 //! 7. moe_sum → reduced output
 
+#[cfg(feature = "nccl")]
+use std::sync::Arc;
+
 use crate::alloc::OwnedTensor;
 use crate::device::GpuDevice;
 use crate::kernels;
 use crate::layers::Linear;
+#[cfg(feature = "nccl")]
+use crate::nccl::NcclGroup;
 use crate::tensor::GpuTensor;
 
 /// Block size for MoE GEMM tiling. Must match BLOCK_M in fused_moe_gemm_kernels.cu.
@@ -39,6 +44,9 @@ pub struct FusedMoELayer {
     pub intermediate_size: usize,
     pub hidden_size: usize,
     pub renormalize: bool,
+    /// NCCL group for tensor-parallel all-reduce after MoE output.
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
 }
 
 impl FusedMoELayer {
@@ -151,6 +159,13 @@ impl FusedMoELayer {
             stream,
         );
         drop(intermediate2);
+
+        // 8. TP all-reduce: combine partial expert results across ranks.
+        #[cfg(feature = "nccl")]
+        if let Some(ref nccl) = self.tp_group {
+            nccl.all_reduce_inplace(output.as_gpu_tensor())
+                .expect("MoE all_reduce failed");
+        }
 
         output
     }
@@ -270,6 +285,8 @@ mod tests {
             intermediate_size: 14336,
             hidden_size: 4096,
             renormalize: false,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         };
 
         assert_eq!(layer.num_experts, 8);

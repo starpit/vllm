@@ -27,6 +27,8 @@ use crate::nccl::NcclGroup;
 use crate::quant::QuantConfig;
 use crate::tensor::GpuTensor;
 use crate::weights::{self as gpu_weights, GpuWeights};
+#[cfg(feature = "nccl")]
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -320,6 +322,8 @@ impl Gemma2MLP {
             gate_up_proj: LinearLayer::Bnb4bit(Box::new(gate_up)),
             down_proj: LinearLayer::Bnb4bit(Box::new(down)),
             intermediate_size: inter,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 }
@@ -759,6 +763,8 @@ impl Gemma2Attention {
             attn_logit_softcapping: config.attn_logit_softcapping.unwrap_or(0.0) as f32,
             sliding_window,
             layer_idx,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 }
@@ -1562,6 +1568,8 @@ impl Gemma2ForCausalLM {
             model,
             lm_head,
             final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 

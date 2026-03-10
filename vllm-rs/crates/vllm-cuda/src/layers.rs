@@ -14,6 +14,8 @@ use crate::weights::GpuWeights;
 
 #[cfg(feature = "nccl")]
 use crate::nccl::NcclGroup;
+#[cfg(feature = "nccl")]
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Linear

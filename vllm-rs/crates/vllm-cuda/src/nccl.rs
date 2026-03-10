@@ -167,5 +167,6 @@ fn gpu_dtype_to_nccl(dtype: DType) -> Result<nccl_sys::ncclDataType_t> {
         DType::I32 => Ok(nccl_sys::ncclDataType_t::ncclInt32),
         DType::I64 => Ok(nccl_sys::ncclDataType_t::ncclInt64),
         DType::U32 => Ok(nccl_sys::ncclDataType_t::ncclUint32),
+        DType::U8 => Ok(nccl_sys::ncclDataType_t::ncclUint8),
     }
 }

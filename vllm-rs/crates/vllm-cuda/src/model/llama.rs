@@ -22,6 +22,8 @@ use crate::weights::{self as gpu_weights};
 
 #[cfg(feature = "nccl")]
 use crate::nccl::NcclGroup;
+#[cfg(feature = "nccl")]
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -1917,6 +1919,8 @@ impl LlamaForCausalLM {
                 q_norm_weight,
                 k_norm_weight,
                 qk_norm_eps,
+                #[cfg(feature = "nccl")]
+                tp_group: None,
             };
 
             // MLP: separate gate, up, down.
@@ -1935,6 +1939,8 @@ impl LlamaForCausalLM {
                 up_proj: Some(make_linear(up_w)),
                 down_proj: make_linear(down_w),
                 intermediate_size: config.intermediate_size,
+                #[cfg(feature = "nccl")]
+                tp_group: None,
             };
 
             // Norms: dequantized to f32.
@@ -1987,6 +1993,8 @@ impl LlamaForCausalLM {
             model,
             lm_head,
             logits_scaling: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 
@@ -2077,6 +2085,8 @@ impl LlamaForCausalLM {
             model,
             lm_head,
             logits_scaling: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 }
@@ -2232,6 +2242,8 @@ impl LlamaAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps: 1e-6,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 }
@@ -2292,6 +2304,8 @@ impl LlamaMLP {
             up_proj: Some(LinearLayer::Bnb4bit(Box::new(up))),
             down_proj: LinearLayer::Bnb4bit(Box::new(down)),
             intermediate_size: inter,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 }

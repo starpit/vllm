@@ -710,6 +710,7 @@ fn initialize_stack_tp(
                 is_pooling,
                 tp_rank: rank,
                 tp_world_size: tp_size,
+                gguf_file: config.gguf_file.clone(),
             })
             .collect();
 

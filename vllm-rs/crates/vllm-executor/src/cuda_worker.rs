@@ -155,9 +155,10 @@ impl CudaModel {
             Self::Llama(m) => m.set_tp_group(group),
             Self::Qwen2(m) => m.0.set_tp_group(group),
             Self::Gemma2(m) => m.set_tp_group(group),
-            _ => {
-                tracing::warn!("set_tp_group not implemented for this architecture");
-            }
+            Self::Gemma3(m) => m.set_tp_group(group),
+            Self::Mixtral(m) => m.set_tp_group(group),
+            Self::Qwen2Moe(m) => m.set_tp_group(group),
+            Self::Qwen3Moe(m) => m.set_tp_group(group),
         }
     }
 
@@ -2400,14 +2401,43 @@ impl Worker for CudaWorker {
                 .map_err(|e| ExecutorError::WorkerInit(format!("Gemma2 load: {e}")))?;
                 CudaModel::Gemma2(m)
             }
-            "Gemma3ForCausalLM" => {
-                let config = gemma3_config_from_hf(&hf_config)?;
-                let m = vllm_cuda::model::gemma3::Gemma3ForCausalLM::load(
-                    &mut weights,
-                    &config,
-                    dtype,
-                    device,
-                )
+            "Gemma3ForCausalLM" | "Gemma3ForConditionalGeneration" => {
+                // For Gemma3ForConditionalGeneration (multimodal), resolve the
+                // nested text_config so we get the text backbone parameters.
+                let effective_hf = if arch == "Gemma3ForConditionalGeneration" {
+                    if let Some(tc) = hf_config.extra.get("text_config") {
+                        serde_json::from_value::<HfModelConfig>(tc.clone()).map_err(|e| {
+                            ExecutorError::WorkerInit(format!(
+                                "failed to parse Gemma3 text_config: {e}"
+                            ))
+                        })?
+                    } else {
+                        hf_config.clone()
+                    }
+                } else {
+                    hf_config.clone()
+                };
+                let config = gemma3_config_from_hf(&effective_hf)?;
+                // Multimodal model: strip "language_model." prefix from weights.
+                if arch == "Gemma3ForConditionalGeneration" {
+                    weights.strip_prefix("language_model.");
+                }
+                let m = if use_tp {
+                    vllm_cuda::model::gemma3::Gemma3ForCausalLM::load_tp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        tp,
+                        device,
+                    )
+                } else {
+                    vllm_cuda::model::gemma3::Gemma3ForCausalLM::load(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                }
                 .map_err(|e| ExecutorError::WorkerInit(format!("Gemma3 load: {e}")))?;
                 CudaModel::Gemma3(m)
             }
@@ -2468,34 +2498,64 @@ impl Worker for CudaWorker {
             }
             "MixtralForCausalLM" => {
                 let config = mixtral_config_from_hf(&hf_config)?;
-                let m = vllm_cuda::model::mixtral::MixtralForCausalLM::load(
-                    &mut weights,
-                    &config,
-                    dtype,
-                    device,
-                )
+                let m = if use_tp {
+                    vllm_cuda::model::mixtral::MixtralForCausalLM::load_tp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        tp,
+                        device,
+                    )
+                } else {
+                    vllm_cuda::model::mixtral::MixtralForCausalLM::load(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                }
                 .map_err(|e| ExecutorError::WorkerInit(format!("Mixtral load: {e}")))?;
                 CudaModel::Mixtral(m)
             }
             "Qwen2MoeForCausalLM" => {
                 let config = qwen2_moe_config_from_hf(&hf_config)?;
-                let m = vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load(
-                    &mut weights,
-                    &config,
-                    dtype,
-                    device,
-                )
+                let m = if use_tp {
+                    vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load_tp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        tp,
+                        device,
+                    )
+                } else {
+                    vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                }
                 .map_err(|e| ExecutorError::WorkerInit(format!("Qwen2MoE load: {e}")))?;
                 CudaModel::Qwen2Moe(m)
             }
             "Qwen3MoeForCausalLM" => {
                 let config = qwen2_moe_config_from_hf(&hf_config)?;
-                let m = vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load(
-                    &mut weights,
-                    &config,
-                    dtype,
-                    device,
-                )
+                let m = if use_tp {
+                    vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_tp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        tp,
+                        device,
+                    )
+                } else {
+                    vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                }
                 .map_err(|e| ExecutorError::WorkerInit(format!("Qwen3MoE load: {e}")))?;
                 CudaModel::Qwen3Moe(m)
             }
@@ -2504,8 +2564,8 @@ impl Worker for CudaWorker {
                     "unsupported architecture for cuda-backend: {arch}. \
                      Supported: LlamaForCausalLM, MistralForCausalLM, Qwen3ForCausalLM, \
                      Phi3ForCausalLM, Qwen2ForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM, \
-                     GraniteForCausalLM, MixtralForCausalLM, Qwen2MoeForCausalLM, \
-                     Qwen3MoeForCausalLM"
+                     Gemma3ForConditionalGeneration, GraniteForCausalLM, MixtralForCausalLM, \
+                     Qwen2MoeForCausalLM, Qwen3MoeForCausalLM"
                 )));
             }
         };

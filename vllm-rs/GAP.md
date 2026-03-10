@@ -119,11 +119,13 @@
   - ColumnParallelLinear / RowParallelLinear / VocabParallelEmbedding in `vllm-cuda/src/layers.rs`
   - NcclGroup wrapping cudarc NCCL FFI for all-reduce/all-gather on GpuTensor (`vllm-cuda/src/nccl.rs`)
   - CPU-side weight sharding via `take_shard()`/`take_shard_into()` in GpuWeights
-  - `load_fused_tp()` on LLaMA/Qwen2/Gemma2 attention + MLP
+  - `load_fused_tp()` on LLaMA/Qwen2/Gemma2/Gemma3 attention + MLP
   - NCCL all-reduce after row-parallel layers (o_proj, down_proj), all-gather after lm_head
   - `initialize_stack_tp()` with concurrent NCCL init + profiling + warmup on scoped threads
   - ThreadPoolExecutor dispatches execute_model concurrently across ranks
-  - E2E verified: TP=2 Qwen2.5-0.5B on 2x L40S (nick3)
+  - All dense + MoE architectures wired for TP in cuda_worker (Gemma3, Mixtral, Qwen2 MoE, Qwen3 MoE)
+  - Gemma3ForConditionalGeneration (multimodal) supported as text-only with text_config resolution
+  - E2E verified: TP=2 Qwen2.5-0.5B + Gemma3-4B on 2x L40S (nick3)
 
   4. Missing Worker Features
 

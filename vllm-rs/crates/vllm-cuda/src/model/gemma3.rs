@@ -8,6 +8,9 @@
 //! - `sliding_window_pattern: N` — every Nth layer is global, rest are sliding
 //! - Configurable `attention_bias`
 
+#[cfg(feature = "nccl")]
+use std::sync::Arc;
+
 use anyhow::Result;
 
 use crate::alloc::OwnedTensor;
@@ -18,6 +21,8 @@ use crate::kv_cache::KvCachePool;
 use crate::layers::{Embedding, Linear};
 use crate::model::gemma2::{Gemma2MLP, GemmaRmsNorm};
 use crate::model::llama::RotaryCache;
+#[cfg(feature = "nccl")]
+use crate::nccl::NcclGroup;
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
 
@@ -65,6 +70,8 @@ pub struct Gemma3Attention {
     scale: f32,
     sliding_window: Option<usize>,
     layer_idx: usize,
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
 }
 
 impl Gemma3Attention {
@@ -174,6 +181,8 @@ impl Gemma3Attention {
             scale: config.query_pre_attn_scalar.powf(-0.5) as f32,
             sliding_window,
             layer_idx,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
         })
     }
 
@@ -313,8 +322,19 @@ impl Gemma3Attention {
         let attn_flat = attn_output
             .into_gpu_tensor()
             .reshape(&[num_tokens, self.q_size]);
-        self.o_proj
-            .forward(attn_flat, &mut device.cublas, &mut device.caching)
+        let out = self
+            .o_proj
+            .forward(attn_flat, &mut device.cublas, &mut device.caching);
+
+        // TP: all-reduce o_proj output (row parallel).
+        #[cfg(feature = "nccl")]
+        if let Some(ref group) = self.tp_group {
+            group
+                .all_reduce_inplace(out)
+                .expect("o_proj all_reduce failed");
+        }
+
+        out
     }
 
     /// Forward pass returning `OwnedTensor` (caching-allocator path).
@@ -462,6 +482,15 @@ impl Gemma3Attention {
             .o_proj
             .forward_owned(attn_flat, &mut device.cublas, &mut device.caching);
         drop(attn_output);
+
+        // TP: all-reduce o_proj output (row parallel).
+        #[cfg(feature = "nccl")]
+        if let Some(ref group) = self.tp_group {
+            group
+                .all_reduce_inplace(result.as_gpu_tensor())
+                .expect("o_proj all_reduce failed");
+        }
+
         result
     }
 }
@@ -1076,5 +1105,330 @@ impl Gemma3ForCausalLM {
             self.lm_head
                 .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
         logits.into_gpu_tensor()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tensor-parallel loading
+// ---------------------------------------------------------------------------
+
+use crate::model::llama::TpConfig;
+
+impl Gemma3Attention {
+    /// Load with fused QKV weights, sharded for tensor parallelism.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fused_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Gemma3Config,
+        layer_idx: usize,
+        is_sliding: bool,
+        tp: TpConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let num_q_heads = config.num_attention_heads / tp.world_size;
+        let num_kv_heads = config.num_kv_heads / tp.world_size;
+        let head_dim = config.head_dim;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        // Fuse QKV weights with per-rank sharding (dim=0).
+        let q_name = format!("{prefix}.q_proj.weight");
+        let k_name = format!("{prefix}.k_proj.weight");
+        let v_name = format!("{prefix}.v_proj.weight");
+        let (_q_shape, q_dtype) = weights
+            .tensor_info(&q_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {q_name}"))?;
+        let hidden = _q_shape[1];
+        let elem_size = q_dtype.size_bytes();
+        let q_bytes = q_size * hidden * elem_size;
+        let kv_bytes = kv_size * hidden * elem_size;
+        let total_bytes = q_bytes + 2 * kv_bytes;
+        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+        unsafe {
+            weights.take_shard_into(
+                &q_name,
+                0,
+                tp.rank,
+                tp.world_size,
+                ptr,
+                device.compute_stream,
+            )?;
+            weights.take_shard_into(
+                &k_name,
+                0,
+                tp.rank,
+                tp.world_size,
+                ptr.add(q_bytes),
+                device.compute_stream,
+            )?;
+            weights.take_shard_into(
+                &v_name,
+                0,
+                tp.rank,
+                tp.world_size,
+                ptr.add(q_bytes + kv_bytes),
+                device.compute_stream,
+            )?;
+        }
+        let qkv_w = unsafe { GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden], q_dtype) };
+
+        // Optional QKV bias — shard dim=0 for each.
+        let qkv_bias = if config.attention_bias {
+            let q_bias_name = format!("{prefix}.q_proj.bias");
+            let k_bias_name = format!("{prefix}.k_proj.bias");
+            let v_bias_name = format!("{prefix}.v_proj.bias");
+            if weights.contains(&q_bias_name) {
+                let bias_bytes = (q_size + 2 * kv_size) * elem_size;
+                let bias_ptr = unsafe { crate::driver::mem_alloc(bias_bytes)? };
+                let q_bias_bytes = q_size * elem_size;
+                let kv_bias_bytes = kv_size * elem_size;
+                unsafe {
+                    weights.take_shard_into(
+                        &q_bias_name,
+                        0,
+                        tp.rank,
+                        tp.world_size,
+                        bias_ptr,
+                        device.compute_stream,
+                    )?;
+                    weights.take_shard_into(
+                        &k_bias_name,
+                        0,
+                        tp.rank,
+                        tp.world_size,
+                        bias_ptr.add(q_bias_bytes),
+                        device.compute_stream,
+                    )?;
+                    weights.take_shard_into(
+                        &v_bias_name,
+                        0,
+                        tp.rank,
+                        tp.world_size,
+                        bias_ptr.add(q_bias_bytes + kv_bias_bytes),
+                        device.compute_stream,
+                    )?;
+                }
+                Some(unsafe { GpuTensor::new(bias_ptr, &[q_size + 2 * kv_size], q_dtype) })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let qkv_proj = Linear::new(qkv_w, qkv_bias);
+
+        // o_proj: shard along dim=1 (row parallel). Bias NOT sharded.
+        let o_name = format!("{prefix}.o_proj.weight");
+        let o_w = weights.take_shard(&o_name, 1, tp.rank, tp.world_size)?;
+        let o_bias = if config.attention_bias {
+            let bias_name = format!("{prefix}.o_proj.bias");
+            if weights.contains(&bias_name) {
+                Some(weights.take(&bias_name)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let o_proj = Linear::new(o_w, o_bias);
+
+        // Per-head QK norms — NOT sharded ([head_dim] each).
+        let q_norm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.q_norm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let k_norm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.k_norm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+
+        let sliding_window = if is_sliding {
+            config.sliding_window
+        } else {
+            None
+        };
+
+        Ok(Self {
+            qkv_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            q_size,
+            kv_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale: config.query_pre_attn_scalar.powf(-0.5) as f32,
+            sliding_window,
+            layer_idx,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+}
+
+impl Gemma3DecoderLayer {
+    /// Load a decoder layer with TP-sharded weights.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Gemma3Config,
+        layer_idx: usize,
+        is_sliding: bool,
+        tp: TpConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let self_attn = Gemma3Attention::load_fused_tp(
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            is_sliding,
+            tp,
+            dtype,
+            device,
+        )?;
+        let mlp = Gemma2MLP::load_fused_tp(
+            weights,
+            &format!("{prefix}.mlp"),
+            config.intermediate_size,
+            tp,
+            device.compute_stream,
+        )?;
+        // Norms are NOT sharded.
+        let input_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let post_attention_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let pre_feedforward_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.pre_feedforward_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let post_feedforward_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.post_feedforward_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            pre_feedforward_layernorm,
+            post_feedforward_layernorm,
+        })
+    }
+}
+
+impl Gemma3Model {
+    /// Load model backbone with TP sharding.
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        config: &Gemma3Config,
+        dtype: DType,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let is_sliding = i < config.layer_is_sliding.len() && config.layer_is_sliding[i];
+            let layer = Gemma3DecoderLayer::load_tp(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                is_sliding,
+                tp,
+                dtype,
+                device,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = GemmaRmsNorm::load(weights, "model.norm", config.rms_norm_eps, dtype, device)?;
+
+        let rotary_global = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+        let rotary_local = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_local_base_freq,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary_global,
+            rotary_local,
+            layer_is_sliding: config.layer_is_sliding.clone(),
+            embed_scale: (config.hidden_size as f32).sqrt(),
+        })
+    }
+}
+
+impl Gemma3ForCausalLM {
+    /// Load the full model with TP sharding.
+    pub fn load_tp(
+        weights: &mut GpuWeights,
+        config: &Gemma3Config,
+        dtype: DType,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = Gemma3Model::load_tp(weights, config, dtype, tp, device)?;
+        // Gemma3 always uses tied embeddings.
+        let lm_head = Linear::new(model.embed_tokens.weight, None);
+        Ok(Self { model, lm_head })
+    }
+
+    /// Inject NCCL process group into all TP layers.
+    #[cfg(feature = "nccl")]
+    pub fn set_tp_group(&mut self, group: Arc<NcclGroup>) {
+        for layer in &mut self.model.layers {
+            layer.self_attn.tp_group = Some(Arc::clone(&group));
+            layer.mlp.tp_group = Some(Arc::clone(&group));
+        }
     }
 }

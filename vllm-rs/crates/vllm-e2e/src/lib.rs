@@ -83,6 +83,8 @@ impl TestModels {
 
     // Gemma3 — safetensors BF16 for cuda-backend (~2GB, Gemma3ForCausalLM)
     pub const GEMMA3_1B_IT_CUDA: &str = "unsloth/gemma-3-1b-it";
+    // Gemma3 — safetensors BF16 for TP testing (~8GB, 8 kv_heads → TP=2 safe)
+    pub const GEMMA3_4B_IT_CUDA: &str = "unsloth/gemma-3-4b-it";
 
     // DeepSeek V2 — safetensors BF16 for TP testing (2x L40S)
     pub const DEEPSEEK_V2_LITE_CUDA: &str = "deepseek-ai/DeepSeek-V2-Lite";

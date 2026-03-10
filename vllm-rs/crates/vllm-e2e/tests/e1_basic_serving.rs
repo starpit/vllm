@@ -2343,3 +2343,34 @@ async fn test_cuda_penalties_completion() {
         "penalties completion should produce output"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Gemma3 TP=2 tests (CUDA, NCCL)
+// ---------------------------------------------------------------------------
+
+/// TP=2 Gemma3 completion test.
+///
+///   cargo test -p vllm-e2e --features e2e,nccl --release --test e1_basic_serving test_cuda_tp2_gemma3 -- --ignored --test-threads=1
+#[cfg(feature = "nccl")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_tp2_gemma3_completion() {
+    let server = TestServer::builder(TestModels::GEMMA3_4B_IT_CUDA)
+        .with_tensor_parallel_size(2)
+        .start()
+        .await
+        .expect("TP=2 Gemma3-1B server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    let text = &resp.choices[0].text;
+    assert!(
+        !text.is_empty(),
+        "TP=2 Gemma3 completion should produce non-empty text"
+    );
+}

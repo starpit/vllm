@@ -1861,6 +1861,190 @@ mod tests {
             }
         }
 
+        /// Test GPTQ desc_act (activation ordering) pipeline:
+        /// create known weights + non-trivial g_idx → argsort → repack with perm → GEMM → verify.
+        ///
+        /// With desc_act, the kernel permutes activation columns via sort_indices before GEMM.
+        /// All INT4 values = 9 (kU4B8: 9-8 = +1), scales = 1.0, input = all-ones.
+        /// The result should be identical to the non-desc_act case (output[j] = K),
+        /// because the permutation is undone by the act_order pipeline.
+        #[test]
+        fn test_cuda_gptq_desc_act_repack_gemm() {
+            let stream = init_cuda();
+            let mut alloc = CachingAllocator::new();
+
+            let size_k: usize = 256;
+            let size_n: usize = 256;
+            let group_size: usize = 128;
+            let num_groups = size_k / group_size;
+            let size_m: usize = 1;
+
+            unsafe {
+                // 1. Create GPTQ-format qweight: [K/8, N] u32, all nibbles = 9
+                let pack_factor = 8;
+                let gptq_rows = size_k / pack_factor;
+                let gptq_count = gptq_rows * size_n;
+                let gptq_data = vec![0x99999999u32; gptq_count];
+
+                let gptq_ptr = driver::mem_alloc(gptq_count * 4).expect("alloc gptq");
+                driver::memcpy_htod_async(
+                    gptq_ptr,
+                    gptq_data.as_ptr() as *const u8,
+                    gptq_count * 4,
+                    stream,
+                )
+                .expect("h2d gptq");
+                let gptq_gpu = GpuTensor::new(gptq_ptr, &[gptq_rows, size_n], DType::U32);
+
+                // 2. Create g_idx: reverse order (group 1 first, then group 0)
+                //    This simulates desc_act where channels are reordered by activation magnitude.
+                let mut g_idx: Vec<i32> = Vec::with_capacity(size_k);
+                for i in 0..size_k {
+                    // Reverse: first half → group 1, second half → group 0
+                    if i < group_size {
+                        g_idx.push(1);
+                    } else {
+                        g_idx.push(0);
+                    }
+                }
+
+                // 3. Argsort g_idx (stable ascending by group ID)
+                let mut sort_indices: Vec<i32> = (0..size_k as i32).collect();
+                sort_indices.sort_by_key(|&i| g_idx[i as usize]);
+
+                let sorted_g_idx: Vec<i32> =
+                    sort_indices.iter().map(|&i| g_idx[i as usize]).collect();
+
+                // Verify argsort: sorted_g_idx should be [0,0,...,1,1,...]
+                assert_eq!(sorted_g_idx[0], 0);
+                assert_eq!(sorted_g_idx[group_size - 1], 0);
+                assert_eq!(sorted_g_idx[group_size], 1);
+                assert_eq!(sorted_g_idx[size_k - 1], 1);
+
+                // Upload sorted_g_idx to GPU
+                let g_idx_bytes: Vec<u8> =
+                    sorted_g_idx.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                let g_idx_ptr = driver::mem_alloc(g_idx_bytes.len()).expect("alloc g_idx");
+                driver::memcpy_htod_async(
+                    g_idx_ptr,
+                    g_idx_bytes.as_ptr(),
+                    g_idx_bytes.len(),
+                    stream,
+                )
+                .expect("h2d g_idx");
+                let g_idx_gpu = GpuTensor::new(g_idx_ptr, &[size_k], DType::I32);
+
+                // Upload sort_indices to GPU
+                let si_bytes: Vec<u8> =
+                    sort_indices.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                let si_ptr = driver::mem_alloc(si_bytes.len()).expect("alloc si");
+                driver::memcpy_htod_async(si_ptr, si_bytes.as_ptr(), si_bytes.len(), stream)
+                    .expect("h2d si");
+                let sort_indices_gpu = GpuTensor::new(si_ptr, &[size_k], DType::I32);
+
+                // 4. Repack GPTQ → Marlin tiled layout WITH perm (sort_indices)
+                let repacked = crate::kernels::gptq_repack(
+                    gptq_gpu,
+                    Some(sort_indices_gpu),
+                    size_k,
+                    size_n,
+                    0,
+                    &mut alloc,
+                    stream,
+                );
+
+                // 5. Create scales [num_groups, N] = all ones, then permute
+                let mut scales_u16: Vec<u16> =
+                    vec![half::f16::from_f32(1.0).to_bits(); num_groups * size_n];
+                super::super::marlin_permute_scales(&mut scales_u16, size_k, size_n, group_size);
+
+                let s_nbytes = scales_u16.len() * 2;
+                let s_ptr = driver::mem_alloc(s_nbytes).expect("alloc scales");
+                driver::memcpy_htod_async(
+                    s_ptr,
+                    scales_u16.as_ptr() as *const u8,
+                    s_nbytes,
+                    stream,
+                )
+                .expect("h2d scales");
+                let scales = GpuTensor::new(s_ptr, &[num_groups, size_n], DType::F16);
+
+                // 6. Activation: [1, K] f16, all ones
+                let a_data: Vec<u16> = vec![half::f16::from_f32(1.0).to_bits(); size_m * size_k];
+                let a_nbytes = a_data.len() * 2;
+                let a_ptr = driver::mem_alloc(a_nbytes).expect("alloc a");
+                driver::memcpy_htod_async(a_ptr, a_data.as_ptr() as *const u8, a_nbytes, stream)
+                    .expect("h2d a");
+                let a = GpuTensor::new(a_ptr, &[size_m, size_k], DType::F16);
+
+                // 7. Workspace
+                let ws_count = 128;
+                let ws_ptr = driver::mem_alloc(ws_count * 4).expect("alloc ws");
+                driver::memset_d8(ws_ptr, 0, ws_count * 4, stream).expect("memset ws");
+                let workspace = GpuTensor::new(ws_ptr, &[ws_count], DType::I32);
+
+                // 8. Run Marlin GEMM with act_order=true
+                let out = crate::kernels::marlin_gemm(
+                    a,
+                    repacked.as_gpu_tensor(),
+                    scales,
+                    None,                   // no zeros (GPTQ uint4b8)
+                    Some(g_idx_gpu),        // sorted g_idx
+                    Some(sort_indices_gpu), // perm
+                    None,                   // no bias
+                    workspace,
+                    size_m,
+                    size_n,
+                    size_k,
+                    num_groups,
+                    group_size,
+                    true,  // has_act_order
+                    false, // no zp
+                    0,     // GPTQ type
+                    0,     // device_id
+                    &mut alloc,
+                    stream,
+                );
+
+                driver::stream_synchronize(stream).expect("sync");
+
+                // 9. Read output and verify
+                let out_nbytes = size_m * size_n * 2;
+                let host = driver::mem_alloc_host(out_nbytes).expect("host alloc");
+                driver::memcpy_dtoh_async(host, out.raw_ptr(), out_nbytes, stream).expect("d2h");
+                driver::stream_synchronize(stream).expect("sync");
+
+                let result = std::slice::from_raw_parts(host as *const u16, size_m * size_n);
+                let expected = size_k as f32; // each output = sum of K * 1.0 * 1.0 = K
+
+                let mut max_err: f32 = 0.0;
+                for (i, &bits) in result.iter().enumerate() {
+                    let val = half::f16::from_bits(bits).to_f32();
+                    let err = (val - expected).abs();
+                    if err > max_err {
+                        max_err = err;
+                    }
+                    if i < 8 {
+                        eprintln!("desc_act out[{i}] = {val} (expected {expected}, err={err})");
+                    }
+                }
+                eprintln!("desc_act max error across {size_n} outputs: {max_err}");
+
+                // Same tolerance as non-desc_act test
+                assert!(
+                    max_err < 2.0,
+                    "desc_act max_err={max_err} too large, expected ~{expected} for all outputs"
+                );
+
+                driver::mem_free_host(host).expect("free host");
+                driver::mem_free(a_ptr).expect("free a");
+                driver::mem_free(gptq_ptr).expect("free gptq");
+                driver::mem_free(g_idx_ptr).expect("free g_idx");
+                driver::mem_free(si_ptr).expect("free si");
+                driver::stream_destroy(stream).expect("destroy");
+            }
+        }
+
         #[test]
         fn test_cuda_marlin_workspace_alloc() {
             let stream = init_cuda();

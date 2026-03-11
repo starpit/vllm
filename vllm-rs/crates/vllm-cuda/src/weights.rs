@@ -1057,10 +1057,65 @@ fn load_gptq_marlin_linear(
         1
     };
 
+    // GPTQ uses uint4b8 scalar type which bakes in the zero-point (bias=8).
+    // Python vLLM never passes zero-points for GPTQ — just consume and discard.
+    if weights.contains(&qzeros_name) {
+        let _ = weights.take(&qzeros_name);
+    }
+
+    // Handle g_idx for desc_act (activation ordering).
+    // Must be done BEFORE repack because repack needs `perm` (sort_indices) on GPU.
+    let g_idx_name = format!("{prefix}.g_idx");
+    let (g_idx_gpu, sort_indices_gpu, has_act_order) =
+        if cfg.desc_act && weights.contains(&g_idx_name) {
+            // Load g_idx on CPU: Vec<i32> of shape [K]
+            let (g_idx_bytes, _g_idx_shape, _g_idx_dtype) = weights.take_cpu(&g_idx_name)?;
+            let g_idx_i32: Vec<i32> = g_idx_bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+
+            // Argsort: stable ascending sort by group ID
+            let mut sort_indices: Vec<i32> = (0..g_idx_i32.len() as i32).collect();
+            sort_indices.sort_by_key(|&i| g_idx_i32[i as usize]);
+
+            // Compute sorted_g_idx
+            let sorted_g_idx: Vec<i32> = sort_indices
+                .iter()
+                .map(|&i| g_idx_i32[i as usize])
+                .collect();
+
+            // Upload sorted_g_idx to GPU
+            let g_idx_bytes: Vec<u8> = sorted_g_idx.iter().flat_map(|&v| v.to_le_bytes()).collect();
+            let g_idx_nbytes = g_idx_bytes.len();
+            let g_idx_ptr = unsafe { driver::mem_alloc(g_idx_nbytes)? };
+            unsafe {
+                driver::memcpy_htod_async(g_idx_ptr, g_idx_bytes.as_ptr(), g_idx_nbytes, stream)?;
+            }
+            let g_idx_gpu = unsafe { GpuTensor::new(g_idx_ptr, &[size_k], DType::I32) };
+
+            // Upload sort_indices to GPU (used as `perm` for repack and GEMM)
+            let si_bytes: Vec<u8> = sort_indices.iter().flat_map(|&v| v.to_le_bytes()).collect();
+            let si_nbytes = si_bytes.len();
+            let si_ptr = unsafe { driver::mem_alloc(si_nbytes)? };
+            unsafe { driver::memcpy_htod_async(si_ptr, si_bytes.as_ptr(), si_nbytes, stream)? };
+            let sort_indices_gpu = unsafe { GpuTensor::new(si_ptr, &[size_k], DType::I32) };
+
+            (Some(g_idx_gpu), Some(sort_indices_gpu), true)
+        } else {
+            // Consume g_idx if present (not needed without desc_act)
+            if weights.contains(&g_idx_name) {
+                let _ = weights.take(&g_idx_name);
+            }
+            (None, None, false)
+        };
+
     // Upload qweight to GPU (raw alloc — will be freed after repack)
     let qweight_gpu = weights.take(&qw_name)?;
 
-    // Repack GPTQ → Marlin tiled layout on GPU (no act_order for now).
+    // Repack GPTQ → Marlin tiled layout on GPU.
+    // When has_act_order, pass sort_indices as perm so the repack kernel
+    // physically reorders weights so same-group channels are contiguous.
     // Use driver::mem_alloc for the output (NOT caching allocator) because model
     // weights must survive free_leaked_blocks() during profiling.
     let num_u32 = size_k * size_n / 8;
@@ -1069,7 +1124,7 @@ fn load_gptq_marlin_linear(
     unsafe {
         crate::kernels::gptq_repack_into(
             qweight_gpu,
-            None,
+            sort_indices_gpu,
             repack_ptr,
             size_k,
             size_n,
@@ -1104,24 +1159,6 @@ fn load_gptq_marlin_linear(
     }
     let scales_gpu = unsafe { GpuTensor::new(scales_ptr, &[num_groups, size_n], scales_dtype) };
 
-    // Handle zero points for asymmetric GPTQ
-    let zeros_gpu = if !cfg.sym && weights.contains(&qzeros_name) {
-        let qzeros = weights.take(&qzeros_name)?;
-        Some(qzeros)
-    } else {
-        // Consume the tensor if it exists (so it doesn't cause "unused weight" warnings)
-        if weights.contains(&qzeros_name) {
-            let _ = weights.take(&qzeros_name);
-        }
-        None
-    };
-
-    // Consume g_idx if present (not used without desc_act)
-    let g_idx_name = format!("{prefix}.g_idx");
-    if weights.contains(&g_idx_name) {
-        let _ = weights.take(&g_idx_name);
-    }
-
     // Load bias if present
     let bias_name = format!("{prefix}.bias");
     let bias_gpu = if weights.contains(&bias_name) {
@@ -1135,16 +1172,16 @@ fn load_gptq_marlin_linear(
     Ok(MarlinLinear {
         qweight: qweight_marlin,
         scales: scales_gpu,
-        zeros: zeros_gpu,
-        g_idx: None,
-        g_idx_sort_indices: None,
+        zeros: None,
+        g_idx: g_idx_gpu,
+        g_idx_sort_indices: sort_indices_gpu,
         workspace,
         size_k,
         size_n,
         group_size,
         num_groups,
-        has_zp: !cfg.sym,
-        has_act_order: false,
+        has_zp: false,
+        has_act_order,
         b_type_id: 0, // GPTQ = uint4b8
         device_id,
         bias: bias_gpu,
@@ -1230,10 +1267,9 @@ fn load_fused_gptq_marlin(
     // Gather raw CPU tensors for concat.
     let mut qw_parts: Vec<(Vec<u8>, Vec<usize>, DType)> = Vec::new();
     let mut sc_parts: Vec<(Vec<u8>, Vec<usize>, DType)> = Vec::new();
-    let mut qz_parts: Vec<(Vec<u8>, Vec<usize>, DType)> = Vec::new();
-    let mut has_qzeros = false;
+    let mut g_idx_i32: Option<Vec<i32>> = None;
 
-    for prefix in prefixes {
+    for (i, prefix) in prefixes.iter().enumerate() {
         let qw_name = format!("{prefix}.qweight");
         let scales_name = format!("{prefix}.scales");
         let qzeros_name = format!("{prefix}.qzeros");
@@ -1241,17 +1277,26 @@ fn load_fused_gptq_marlin(
         qw_parts.push(weights.take_cpu(&qw_name)?);
         sc_parts.push(weights.take_cpu(&scales_name)?);
 
-        if !cfg.sym && weights.contains(&qzeros_name) {
-            qz_parts.push(weights.take_cpu(&qzeros_name)?);
-            has_qzeros = true;
-        } else if weights.contains(&qzeros_name) {
+        // GPTQ uses uint4b8 scalar type — never pass zero-points. Consume and discard.
+        if weights.contains(&qzeros_name) {
             let _ = weights.take_cpu(&qzeros_name);
         }
 
-        // Consume g_idx if present (not used without desc_act).
+        // For desc_act: all sub-layers share the same K dimension → same g_idx.
+        // Take from the first prefix, consume and discard from the rest.
         let g_idx_name = format!("{prefix}.g_idx");
         if weights.contains(&g_idx_name) {
-            let _ = weights.take_cpu(&g_idx_name);
+            if i == 0 && cfg.desc_act {
+                let (g_bytes, _g_shape, _g_dtype) = weights.take_cpu(&g_idx_name)?;
+                g_idx_i32 = Some(
+                    g_bytes
+                        .chunks_exact(4)
+                        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                );
+            } else {
+                let _ = weights.take_cpu(&g_idx_name);
+            }
         }
     }
 
@@ -1270,6 +1315,36 @@ fn load_fused_gptq_marlin(
         1
     };
 
+    // Handle g_idx for desc_act — must be done BEFORE repack.
+    let (g_idx_gpu, sort_indices_gpu, has_act_order) = if let Some(g_idx) = g_idx_i32 {
+        // Argsort: stable ascending sort by group ID
+        let mut sort_indices: Vec<i32> = (0..g_idx.len() as i32).collect();
+        sort_indices.sort_by_key(|&i| g_idx[i as usize]);
+
+        // Compute sorted_g_idx
+        let sorted_g_idx: Vec<i32> = sort_indices.iter().map(|&i| g_idx[i as usize]).collect();
+
+        // Upload sorted_g_idx to GPU
+        let g_idx_bytes: Vec<u8> = sorted_g_idx.iter().flat_map(|&v| v.to_le_bytes()).collect();
+        let g_idx_nbytes = g_idx_bytes.len();
+        let g_idx_ptr = unsafe { driver::mem_alloc(g_idx_nbytes)? };
+        unsafe {
+            driver::memcpy_htod_async(g_idx_ptr, g_idx_bytes.as_ptr(), g_idx_nbytes, stream)?;
+        }
+        let g_idx_gpu = unsafe { GpuTensor::new(g_idx_ptr, &[size_k], DType::I32) };
+
+        // Upload sort_indices to GPU (used as `perm` for repack and GEMM)
+        let si_bytes: Vec<u8> = sort_indices.iter().flat_map(|&v| v.to_le_bytes()).collect();
+        let si_nbytes = si_bytes.len();
+        let si_ptr = unsafe { driver::mem_alloc(si_nbytes)? };
+        unsafe { driver::memcpy_htod_async(si_ptr, si_bytes.as_ptr(), si_nbytes, stream)? };
+        let sort_indices_gpu = unsafe { GpuTensor::new(si_ptr, &[size_k], DType::I32) };
+
+        (Some(g_idx_gpu), Some(sort_indices_gpu), true)
+    } else {
+        (None, None, false)
+    };
+
     // Upload fused qweight to GPU and repack.
     let qw_nbytes = qw_fused.len();
     let qw_gpu_ptr = unsafe { driver::mem_alloc(qw_nbytes)? };
@@ -1281,7 +1356,13 @@ fn load_fused_gptq_marlin(
     let repack_ptr = unsafe { driver::mem_alloc(repack_nbytes)? };
     unsafe {
         crate::kernels::gptq_repack_into(
-            qw_gpu, None, repack_ptr, size_k, size_n, device_id, stream,
+            qw_gpu,
+            sort_indices_gpu,
+            repack_ptr,
+            size_k,
+            size_n,
+            device_id,
+            stream,
         );
         driver::stream_synchronize(stream)?;
         driver::mem_free(qw_gpu_ptr)?;
@@ -1313,37 +1394,21 @@ fn load_fused_gptq_marlin(
     }
     let scales_gpu = unsafe { GpuTensor::new(scales_ptr, &[num_groups, size_n], scales_dtype) };
 
-    // Handle zero points.
-    let zeros_gpu = if has_qzeros && !qz_parts.is_empty() {
-        let qz_refs: Vec<_> = qz_parts
-            .iter()
-            .map(|(d, s, dt)| (d.as_slice(), s.as_slice(), *dt))
-            .collect();
-        // For GPTQ asymmetric zeros, just upload the fused tensor.
-        let (qz_fused, qz_shape, qz_dtype) = concat_cpu_dim1(&qz_refs);
-        let qz_nbytes = qz_fused.len();
-        let qz_ptr = unsafe { driver::mem_alloc(qz_nbytes)? };
-        unsafe { driver::memcpy_htod_async(qz_ptr, qz_fused.as_ptr(), qz_nbytes, stream)? };
-        Some(unsafe { GpuTensor::new(qz_ptr, &qz_shape, qz_dtype) })
-    } else {
-        None
-    };
-
     unsafe { driver::stream_synchronize(stream)? };
 
     Ok(MarlinLinear {
         qweight: qweight_marlin,
         scales: scales_gpu,
-        zeros: zeros_gpu,
-        g_idx: None,
-        g_idx_sort_indices: None,
+        zeros: None,
+        g_idx: g_idx_gpu,
+        g_idx_sort_indices: sort_indices_gpu,
         workspace,
         size_k,
         size_n,
         group_size,
         num_groups,
-        has_zp: !cfg.sym,
-        has_act_order: false,
+        has_zp: false,
+        has_act_order,
         b_type_id: 0, // GPTQ = uint4b8
         device_id,
         bias: None, // Fused layers don't have bias in GPTQ models

@@ -1650,6 +1650,29 @@ async fn test_cuda_marlin_gemma2_gptq_chat() {
 }
 
 // ===========================================================================
+// CUDA Marlin GPTQ desc_act (activation ordering) E2E test
+// ===========================================================================
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gptq_desc_act -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gptq_desc_act_chat() {
+    let server = TestServer::builder(TestModels::TINYLLAMA_1B_GPTQ_DESC_ACT)
+        .start()
+        .await
+        .expect("CUDA GPTQ desc_act server should start");
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("What is 2+2? Answer with just the number.", Some(10));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(!text.is_empty(), "GPTQ desc_act chat should not be empty");
+}
+
+// ===========================================================================
 // CUDA MoE E2E tests
 // ===========================================================================
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_mixtral -- --ignored --test-threads=1

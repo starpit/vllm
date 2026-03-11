@@ -5469,14 +5469,24 @@ pub unsafe fn marlin_gemm(
     // Partial sums across K-splits are accumulated in f32 for numerical accuracy.
     let c_tmp = alloc.alloc_tensor(&[size_m, size_n], DType::F32);
 
+    // When has_act_order, the C++ permute_cols_kernel writes column-permuted
+    // activations into a_tmp before GEMM. Same shape/dtype as input `a`.
+    let a_tmp_ptr: *mut c_void = if has_act_order {
+        let a_tmp = alloc.alloc_tensor(&[size_m, size_k], a.dtype());
+        a_tmp.raw_ptr() as *mut c_void
+    } else {
+        std::ptr::null_mut()
+    };
+
     let zeros_ptr = b_zeros.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
     let g_idx_ptr = g_idx.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
     let perm_ptr = perm.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
     let bias_ptr = b_bias.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
     let has_bias = b_bias.is_some();
 
-    // is_k_full = true when no act_order or when we have the full K dimension
-    let is_k_full = !has_act_order;
+    // is_k_full = true: we always process the complete K dimension.
+    // (is_k_full=false is only for expert-parallelism K-slicing, which we don't do.)
+    let is_k_full = true;
 
     match a.dtype() {
         DType::F16 => marlin_gemm_f16(
@@ -5490,7 +5500,7 @@ pub unsafe fn marlin_gemm(
             bias_ptr,
             workspace.raw_ptr() as *mut c_void,
             c_tmp.raw_ptr() as *mut c_void,
-            std::ptr::null_mut(), // a_tmp (act_order permutation — not needed)
+            a_tmp_ptr,
             size_m as c_int,
             size_n as c_int,
             size_k as c_int,
@@ -5518,7 +5528,7 @@ pub unsafe fn marlin_gemm(
             bias_ptr,
             workspace.raw_ptr() as *mut c_void,
             c_tmp.raw_ptr() as *mut c_void,
-            std::ptr::null_mut(),
+            a_tmp_ptr,
             size_m as c_int,
             size_n as c_int,
             size_k as c_int,

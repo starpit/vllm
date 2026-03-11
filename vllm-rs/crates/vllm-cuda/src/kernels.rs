@@ -2851,6 +2851,8 @@ unsafe extern "C" {
         batch_size: c_int,
         temperatures: *const f32,
         uniform_randoms: *const f32,
+        scratch_vals: *mut f32,
+        scratch_indices: *mut c_int,
         stream: CUstream,
     );
     fn sample_gumbel_batched_bf16(
@@ -2860,6 +2862,8 @@ unsafe extern "C" {
         batch_size: c_int,
         temperatures: *const f32,
         uniform_randoms: *const f32,
+        scratch_vals: *mut f32,
+        scratch_indices: *mut c_int,
         stream: CUstream,
     );
     fn sample_gumbel_batched_f32(
@@ -2869,6 +2873,8 @@ unsafe extern "C" {
         batch_size: c_int,
         temperatures: *const f32,
         uniform_randoms: *const f32,
+        scratch_vals: *mut f32,
+        scratch_indices: *mut c_int,
         stream: CUstream,
     );
 
@@ -2950,11 +2956,11 @@ pub unsafe fn argmax_batched(
     out
 }
 
-/// Fast batched sampling via the Gumbel-max trick.
+/// Fast batched sampling via the Gumbel-max trick (multi-block).
 ///
-/// Equivalent to sampling from `softmax(logits / temperature)` but uses only
-/// a single argmax-like pass (no radix select, no sort). Requires that no
-/// top-k, top-p, or min-p filtering is needed.
+/// Matches Python vLLM's Triton implementation: 2D grid with 1024 threads per
+/// block, ceil(vocab/1024) blocks per request. Phase 1 computes per-block
+/// local argmax, phase 2 reduces across blocks.
 ///
 /// * `logits`: `[batch_size, vocab_size]`
 /// * `temperatures`: `[batch_size]` (F32, on GPU)
@@ -2972,6 +2978,12 @@ pub unsafe fn sample_gumbel_batched(
     let vocab_size = logits.dim(1) as c_int;
     let out = alloc.alloc_tensor(&[batch_size as usize], DType::U32);
 
+    // Scratch for multi-block reduction: [batch_size, num_blocks] for vals and indices.
+    let num_blocks = ((vocab_size as usize) + 1023) / 1024;
+    let scratch_elems = batch_size as usize * num_blocks;
+    let scratch_vals = alloc.alloc_tensor(&[scratch_elems], DType::F32);
+    let scratch_indices = alloc.alloc_tensor(&[scratch_elems], DType::I32);
+
     match logits.dtype() {
         DType::F16 => sample_gumbel_batched_f16(
             out.as_mut_ptr() as *mut u32,
@@ -2980,6 +2992,8 @@ pub unsafe fn sample_gumbel_batched(
             batch_size,
             temperatures.as_ptr(),
             uniform_randoms.as_ptr(),
+            scratch_vals.as_mut_ptr() as *mut f32,
+            scratch_indices.as_mut_ptr() as *mut c_int,
             stream,
         ),
         DType::BF16 => sample_gumbel_batched_bf16(
@@ -2989,6 +3003,8 @@ pub unsafe fn sample_gumbel_batched(
             batch_size,
             temperatures.as_ptr(),
             uniform_randoms.as_ptr(),
+            scratch_vals.as_mut_ptr() as *mut f32,
+            scratch_indices.as_mut_ptr() as *mut c_int,
             stream,
         ),
         DType::F32 => sample_gumbel_batched_f32(
@@ -2998,6 +3014,8 @@ pub unsafe fn sample_gumbel_batched(
             batch_size,
             temperatures.as_ptr(),
             uniform_randoms.as_ptr(),
+            scratch_vals.as_mut_ptr() as *mut f32,
+            scratch_indices.as_mut_ptr() as *mut c_int,
             stream,
         ),
         _ => panic!(

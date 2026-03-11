@@ -566,41 +566,120 @@ __device__ __forceinline__ float hash_to_uniform(uint32_t seed, uint32_t idx) {
     return (float)(h >> 8) * (1.0f / 16777216.0f) + (0.5f / 16777216.0f);
 }
 
+// ---------------------------------------------------------------------------
+// Multi-block Gumbel sampling — matches Python vLLM's Triton implementation.
+//
+// 2D grid: (batch_size, num_blocks) where num_blocks = ceil(vocab / GUMBEL_BLOCK).
+// Phase 1: Each block computes local argmax of (logit/T + gumbel_noise) over
+//          its GUMBEL_BLOCK-sized chunk, writes (value, index) to scratch.
+// Phase 2: A second kernel reduces across blocks per request.
+//
+// This gives ~148 blocks per request for 151k vocab (vs 1 block before),
+// matching Python's parallelism.
+// ---------------------------------------------------------------------------
+
+#define GUMBEL_BLOCK 1024
+
 template <typename T>
-__global__ void sample_gumbel_batched_kernel(
-    uint32_t* __restrict__ output,
+__global__ void sample_gumbel_phase1_kernel(
+    float* __restrict__ block_vals,      // [batch_size, num_blocks]
+    int* __restrict__ block_indices,     // [batch_size, num_blocks]
     const T* __restrict__ logits,
     int vocab_size,
+    int num_blocks,
     const float* __restrict__ temperatures,
     const float* __restrict__ uniform_randoms)
 {
-    int bid = blockIdx.x;
-    const T* row = logits + bid * vocab_size;
-    float inv_temp = 1.0f / temperatures[bid];
+    int req_idx = blockIdx.x;
+    int blk_idx = blockIdx.y;
+    int tid = threadIdx.x;
+    int base = blk_idx * GUMBEL_BLOCK + tid;
 
-    // Use the uniform random as seed for per-element noise.
-    uint32_t seed = __float_as_uint(uniform_randoms[bid]);
+    const T* row = logits + req_idx * vocab_size;
+    float inv_temp = 1.0f / temperatures[req_idx];
+    uint32_t seed = __float_as_uint(uniform_randoms[req_idx]);
+
+    // Each thread handles one element (or none if out of bounds).
+    float my_val = -INFINITY;
+    int my_idx = 0;
+    if (base < vocab_size) {
+        float logit = to_float(row[base]) * inv_temp;
+        float u = hash_to_uniform(seed, (uint32_t)base);
+        float gumbel = -logf(-logf(u));
+        my_val = logit + gumbel;
+        my_idx = base;
+    }
+
+    // Warp reduce max with index.
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        float other_val = __shfl_xor_sync(0xffffffff, my_val, offset);
+        int other_idx = __shfl_xor_sync(0xffffffff, my_idx, offset);
+        if (other_val > my_val) {
+            my_val = other_val;
+            my_idx = other_idx;
+        }
+    }
+
+    // Block reduce across warps.
+    constexpr int GUMBEL_WARPS = GUMBEL_BLOCK / WARP_SIZE;
+    __shared__ float s_vals[GUMBEL_WARPS];
+    __shared__ int s_idxs[GUMBEL_WARPS];
+
+    int warp_id = tid / WARP_SIZE;
+    int lane_id = tid % WARP_SIZE;
+    if (lane_id == 0) {
+        s_vals[warp_id] = my_val;
+        s_idxs[warp_id] = my_idx;
+    }
+    __syncthreads();
+
+    if (tid < WARP_SIZE) {
+        my_val = (tid < GUMBEL_WARPS) ? s_vals[tid] : -INFINITY;
+        my_idx = (tid < GUMBEL_WARPS) ? s_idxs[tid] : 0;
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            float other_val = __shfl_xor_sync(0xffffffff, my_val, offset);
+            int other_idx = __shfl_xor_sync(0xffffffff, my_idx, offset);
+            if (other_val > my_val) {
+                my_val = other_val;
+                my_idx = other_idx;
+            }
+        }
+        if (tid == 0) {
+            block_vals[req_idx * num_blocks + blk_idx] = my_val;
+            block_indices[req_idx * num_blocks + blk_idx] = my_idx;
+        }
+    }
+}
+
+// Phase 2: reduce across blocks. One block per request, 256 threads.
+__global__ void sample_gumbel_phase2_kernel(
+    uint32_t* __restrict__ output,       // [batch_size]
+    const float* __restrict__ block_vals,    // [batch_size, num_blocks]
+    const int* __restrict__ block_indices,   // [batch_size, num_blocks]
+    int num_blocks)
+{
+    int req_idx = blockIdx.x;
+    int tid = threadIdx.x;
+
+    const float* vals = block_vals + req_idx * num_blocks;
+    const int* idxs = block_indices + req_idx * num_blocks;
 
     __shared__ float s_warp_buf[NUM_WARPS];
     __shared__ int s_warp_idx_buf[NUM_WARPS];
 
-    int tid = threadIdx.x;
     float best_val = -INFINITY;
     int best_idx = 0;
-
-    for (int i = tid; i < vocab_size; i += SAMPLING_BLOCK_SIZE) {
-        float logit = to_float(row[i]) * inv_temp;
-        // Gumbel noise: -log(-log(u))
-        float u = hash_to_uniform(seed, (uint32_t)i);
-        float gumbel = -logf(-logf(u));
-        float score = logit + gumbel;
-        if (score > best_val) {
-            best_val = score;
-            best_idx = i;
+    for (int i = tid; i < num_blocks; i += SAMPLING_BLOCK_SIZE) {
+        float v = vals[i];
+        if (v > best_val) {
+            best_val = v;
+            best_idx = idxs[i];
         }
     }
 
-    // Warp reduce max with index (same as argmax_kernel).
+    // Warp reduce.
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
         float other_val = __shfl_xor_sync(0xffffffff, best_val, offset);
@@ -632,7 +711,7 @@ __global__ void sample_gumbel_batched_kernel(
             }
         }
         if (tid == 0) {
-            output[bid] = (uint32_t)best_idx;
+            output[req_idx] = (uint32_t)best_idx;
         }
     }
 }
@@ -641,26 +720,49 @@ extern "C" {
 
 void sample_gumbel_batched_f32(
     uint32_t* output, const float* logits, int vocab_size, int batch_size,
-    const float* temperatures, const float* uniform_randoms, cudaStream_t stream) {
-    if (batch_size > 0)
-        sample_gumbel_batched_kernel<float><<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
-            output, logits, vocab_size, temperatures, uniform_randoms);
+    const float* temperatures, const float* uniform_randoms,
+    float* scratch_vals, int* scratch_indices,
+    cudaStream_t stream) {
+    if (batch_size <= 0) return;
+    int num_blocks = (vocab_size + GUMBEL_BLOCK - 1) / GUMBEL_BLOCK;
+    dim3 grid(batch_size, num_blocks);
+    sample_gumbel_phase1_kernel<float><<<grid, GUMBEL_BLOCK, 0, stream>>>(
+        scratch_vals, scratch_indices, logits, vocab_size, num_blocks,
+        temperatures, uniform_randoms);
+    sample_gumbel_phase2_kernel<<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
+        output, scratch_vals, scratch_indices, num_blocks);
 }
 
 void sample_gumbel_batched_f16(
     uint32_t* output, const uint16_t* logits, int vocab_size, int batch_size,
-    const float* temperatures, const float* uniform_randoms, cudaStream_t stream) {
-    if (batch_size > 0)
-        sample_gumbel_batched_kernel<__half><<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
-            output, reinterpret_cast<const __half*>(logits), vocab_size, temperatures, uniform_randoms);
+    const float* temperatures, const float* uniform_randoms,
+    float* scratch_vals, int* scratch_indices,
+    cudaStream_t stream) {
+    if (batch_size <= 0) return;
+    int num_blocks = (vocab_size + GUMBEL_BLOCK - 1) / GUMBEL_BLOCK;
+    dim3 grid(batch_size, num_blocks);
+    sample_gumbel_phase1_kernel<__half><<<grid, GUMBEL_BLOCK, 0, stream>>>(
+        scratch_vals, scratch_indices,
+        reinterpret_cast<const __half*>(logits), vocab_size, num_blocks,
+        temperatures, uniform_randoms);
+    sample_gumbel_phase2_kernel<<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
+        output, scratch_vals, scratch_indices, num_blocks);
 }
 
 void sample_gumbel_batched_bf16(
     uint32_t* output, const uint16_t* logits, int vocab_size, int batch_size,
-    const float* temperatures, const float* uniform_randoms, cudaStream_t stream) {
-    if (batch_size > 0)
-        sample_gumbel_batched_kernel<__nv_bfloat16><<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
-            output, reinterpret_cast<const __nv_bfloat16*>(logits), vocab_size, temperatures, uniform_randoms);
+    const float* temperatures, const float* uniform_randoms,
+    float* scratch_vals, int* scratch_indices,
+    cudaStream_t stream) {
+    if (batch_size <= 0) return;
+    int num_blocks = (vocab_size + GUMBEL_BLOCK - 1) / GUMBEL_BLOCK;
+    dim3 grid(batch_size, num_blocks);
+    sample_gumbel_phase1_kernel<__nv_bfloat16><<<grid, GUMBEL_BLOCK, 0, stream>>>(
+        scratch_vals, scratch_indices,
+        reinterpret_cast<const __nv_bfloat16*>(logits), vocab_size, num_blocks,
+        temperatures, uniform_randoms);
+    sample_gumbel_phase2_kernel<<<batch_size, SAMPLING_BLOCK_SIZE, 0, stream>>>(
+        output, scratch_vals, scratch_indices, num_blocks);
 }
 
 }  // extern "C" (close gumbel)

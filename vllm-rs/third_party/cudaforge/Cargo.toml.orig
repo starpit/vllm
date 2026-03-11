@@ -1,0 +1,30 @@
+[package]
+name = "cudaforge"
+version = "0.1.4"
+edition = "2021"
+authors = ["Guoqing Bao"]
+description = """
+Advanced CUDA kernel builder for Rust with incremental builds, auto-detection, and external dependency support.
+"""
+readme = "./README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["cuda", "gpu", "nvcc", "kernel", "build"]
+categories = ["development-tools::build-utils", "compilers"]
+repository = "https://github.com/guoqingbao/cudaforge"
+
+[features]
+default = []
+ci-check = []
+
+[dependencies]
+glob = "0.3.1"
+num_cpus = "1.16.0"
+rayon = "1.10.0"
+which = "7.0.0"
+sha2 = "0.10.8"
+walkdir = "2.5.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+fs2 = "0.4"

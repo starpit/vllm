@@ -807,7 +807,7 @@ fn stream_chat_response(
                 delta: protocol::DeltaMessage {
                     role: None,
                     content,
-                    reasoning: None,
+                    reasoning: delta.reasoning,
                     tool_calls,
                 },
                 logprobs: delta.logprobs.as_ref().map(|lps| {

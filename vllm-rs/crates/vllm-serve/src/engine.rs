@@ -29,6 +29,7 @@ use crate::chat_template::ChatTemplate;
 use crate::detokenizer::IncrementalDetokenizer;
 use crate::error::{ServeError, ServeResult};
 use crate::protocol;
+use crate::reasoning_parser::{ReasoningDelta, ReasoningParser, StreamingReasoningParserState};
 use crate::tokenizer::Tokenizer;
 use crate::tool_parser::{
     DeltaToolCall, StreamingToolParserState, ToolCallParser, ToolParserDelta,
@@ -118,8 +119,20 @@ struct RequestState {
     /// Streaming tool parser state (if tool parsing is active for this request).
     tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
 
+    /// Streaming reasoning parser state (if reasoning parsing is active).
+    reasoning_parser_state: Option<Box<dyn StreamingReasoningParserState + Send>>,
+
+    /// Whether reasoning has ended (</think> seen) for this request.
+    reasoning_ended: bool,
+
+    /// Whether to include reasoning content in the response.
+    include_reasoning: bool,
+
     /// Accumulated generated text so far (for streaming tool parsing).
     accumulated_text: String,
+
+    /// Accumulated generated token IDs (for streaming reasoning parsing).
+    accumulated_token_ids: Vec<u32>,
 
     /// Whether any tool call deltas have been emitted (for setting finish_reason).
     tool_calls_emitted: bool,
@@ -148,6 +161,8 @@ pub struct StreamDelta {
     pub logprobs: Option<Vec<vllm_common::LogprobsOutput>>,
     /// Tool call deltas for streaming tool parsing.
     pub tool_call_deltas: Option<Vec<DeltaToolCall>>,
+    /// Reasoning content delta (for streaming reasoning parsing).
+    pub reasoning: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +225,8 @@ pub struct AsyncEngine {
     chat_template: Option<Arc<ChatTemplate>>,
     /// Optional tool call parser for extracting structured tool calls from output.
     tool_parser: Option<Arc<dyn ToolCallParser>>,
+    /// Optional reasoning parser for extracting <think>...</think> blocks.
+    reasoning_parser: Option<Arc<dyn ReasoningParser>>,
     /// Whether async scheduling is enabled (overlap GPU execution with CPU scheduling).
     async_scheduling: bool,
     /// Set to `true` when the step loop is running; cleared on exit.
@@ -259,6 +276,7 @@ impl AsyncEngine {
             #[cfg(feature = "chat-template")]
             chat_template: None,
             tool_parser: None,
+            reasoning_parser: None,
             async_scheduling: false,
             step_loop_alive: Arc::new(AtomicBool::new(false)),
             image_token_id: None,
@@ -330,6 +348,11 @@ impl AsyncEngine {
     /// Set the tool call parser on this engine.
     pub fn set_tool_parser(&mut self, parser: Arc<dyn ToolCallParser>) {
         self.tool_parser = Some(parser);
+    }
+
+    /// Set the reasoning parser on this engine.
+    pub fn set_reasoning_parser(&mut self, parser: Arc<dyn ReasoningParser>) {
+        self.reasoning_parser = Some(parser);
     }
 
     /// Enable or disable async scheduling.
@@ -484,6 +507,8 @@ impl AsyncEngine {
                 i as u32,
                 None, // no streaming tool parser for non-streaming requests
                 None,
+                None, // no streaming reasoning parser for non-streaming requests
+                request.include_reasoning,
             )
             .await?;
 
@@ -521,11 +546,28 @@ impl AsyncEngine {
                 ))
             };
 
+            // Extract reasoning content if parser is configured.
+            let (reasoning_text, text_for_tools, content_was_none) =
+                if let Some(ref rp) = self.reasoning_parser {
+                    let extracted = rp.extract_reasoning(&text);
+                    let reasoning = if request.include_reasoning {
+                        extracted.reasoning
+                    } else {
+                        None
+                    };
+                    // Tool extraction runs on the content portion only.
+                    let was_none = extracted.content.is_none();
+                    let content_for_tools = extracted.content.unwrap_or_default();
+                    (reasoning, content_for_tools, was_none)
+                } else {
+                    (None, text, false)
+                };
+
             // Try tool call extraction if parser is configured and request has tools.
             let (final_content, final_tool_calls, final_finish_reason) =
                 if let Some(ref parser) = self.tool_parser {
                     if request.tools.is_some() && !is_tool_choice_none(&request.tool_choice) {
-                        let extracted = parser.extract_tool_calls(&text);
+                        let extracted = parser.extract_tool_calls(&text_for_tools);
                         if extracted.tools_called {
                             // Filter by forced function name if tool_choice specifies one.
                             let tool_calls = if let Some(forced) =
@@ -540,7 +582,7 @@ impl AsyncEngine {
                                 extracted.tool_calls
                             };
                             if tool_calls.is_empty() {
-                                (Some(text), None, finish_reason_str)
+                                (Some(text_for_tools), None, finish_reason_str)
                             } else {
                                 (
                                     extracted.content,
@@ -549,14 +591,25 @@ impl AsyncEngine {
                                 )
                             }
                         } else {
-                            (Some(text), None, finish_reason_str)
+                            (Some(text_for_tools), None, finish_reason_str)
                         }
                     } else {
-                        (Some(text), None, finish_reason_str)
+                        (Some(text_for_tools), None, finish_reason_str)
                     }
                 } else {
-                    (Some(text), None, finish_reason_str)
+                    (Some(text_for_tools), None, finish_reason_str)
                 };
+
+            // If reasoning parser returned content=None (everything was reasoning),
+            // preserve None rather than wrapping an empty string.
+            let final_content = if content_was_none && final_tool_calls.is_none() {
+                match final_content {
+                    Some(ref s) if s.is_empty() => None,
+                    other => other,
+                }
+            } else {
+                final_content
+            };
 
             // Build prompt logprobs if available.
             let prompt_logprobs_content = state.prompt_logprobs.as_ref().map(|plps| {
@@ -602,7 +655,7 @@ impl AsyncEngine {
                     content: final_content,
                     refusal: None,
                     tool_calls: final_tool_calls,
-                    reasoning: None,
+                    reasoning: reasoning_text,
                 },
                 logprobs: chat_logprobs,
                 finish_reason: Some(final_finish_reason),
@@ -765,6 +818,12 @@ impl AsyncEngine {
                 None
             };
 
+            // Create streaming reasoning parser state if applicable.
+            let reasoning_state = self
+                .reasoning_parser
+                .as_ref()
+                .map(|p| p.create_streaming_state());
+
             self.submit_request(
                 child_id,
                 ec_req,
@@ -774,6 +833,8 @@ impl AsyncEngine {
                 i as u32,
                 tool_state,
                 forced_fn.clone(),
+                reasoning_state,
+                request.include_reasoning,
             )
             .await?;
         }
@@ -882,6 +943,8 @@ impl AsyncEngine {
                     choice_index,
                     None, // no tool parsing for completions
                     None,
+                    None, // no reasoning parsing for completions
+                    true,
                 )
                 .await?;
 
@@ -1023,6 +1086,8 @@ impl AsyncEngine {
                     0,
                     None,
                     None,
+                    None,
+                    true,
                 )
                 .await?;
 
@@ -1630,6 +1695,8 @@ impl AsyncEngine {
         choice_index: u32,
         tool_parser_state: Option<Box<dyn StreamingToolParserState + Send>>,
         forced_function_name: Option<String>,
+        reasoning_parser_state: Option<Box<dyn StreamingReasoningParserState + Send>>,
+        include_reasoning: bool,
     ) -> ServeResult<()> {
         #[cfg(feature = "metrics")]
         {
@@ -1660,7 +1727,11 @@ impl AsyncEngine {
                     logprobs: Vec::new(),
                     prompt_logprobs: None,
                     tool_parser_state,
+                    reasoning_parser_state,
+                    reasoning_ended: false,
+                    include_reasoning,
                     accumulated_text: String::new(),
+                    accumulated_token_ids: Vec::new(),
                     tool_calls_emitted: false,
                     forced_function_name,
                     pooler_output: None,
@@ -1873,15 +1944,87 @@ impl AsyncEngine {
 
             // Send streaming delta if applicable.
             if let Some(tx) = &req_state.stream_tx {
-                // If tool parser state is active, route through it.
-                if let Some(ref mut parser_state) = req_state.tool_parser_state {
-                    if let Some(ref text) = delta_text {
-                        let previous_text = req_state.accumulated_text.clone();
-                        req_state.accumulated_text.push_str(text);
-                        let current_text = req_state.accumulated_text.clone();
+                // Track accumulated text and token IDs for reasoning/tool parsing.
+                if let Some(ref text) = delta_text {
+                    req_state.accumulated_text.push_str(text);
+                }
+                req_state
+                    .accumulated_token_ids
+                    .extend_from_slice(&output.new_token_ids);
 
-                        let parser_result =
-                            parser_state.process_delta(&previous_text, &current_text, text);
+                // Phase 1: Reasoning parsing (runs before tool parsing).
+                // If reasoning parser is active and reasoning hasn't ended yet,
+                // route through reasoning parser first.
+                let (reasoning_delta, content_text_for_tools) =
+                    if let Some(ref mut rp_state) = req_state.reasoning_parser_state {
+                        if !req_state.reasoning_ended {
+                            if let Some(ref text) = delta_text {
+                                let prev_len = req_state.accumulated_token_ids.len()
+                                    - output.new_token_ids.len();
+                                let previous_ids = &req_state.accumulated_token_ids[..prev_len];
+                                let current_ids = &req_state.accumulated_token_ids;
+                                let previous_text = &req_state.accumulated_text
+                                    [..req_state.accumulated_text.len() - text.len()];
+                                let current_text = &req_state.accumulated_text;
+
+                                let rd = rp_state.process_delta(
+                                    previous_text,
+                                    current_text,
+                                    text,
+                                    previous_ids,
+                                    current_ids,
+                                    &output.new_token_ids,
+                                );
+
+                                match rd {
+                                    ReasoningDelta::Reasoning(r) => {
+                                        // Still in reasoning — emit reasoning delta.
+                                        let reasoning_out = if req_state.include_reasoning {
+                                            Some(r)
+                                        } else {
+                                            None
+                                        };
+                                        (reasoning_out, None)
+                                    }
+                                    ReasoningDelta::Content(c) => {
+                                        // Reasoning ended previously, this is content.
+                                        req_state.reasoning_ended = true;
+                                        (None, Some(c))
+                                    }
+                                    ReasoningDelta::Split { reasoning, content } => {
+                                        // Reasoning ends in this delta.
+                                        req_state.reasoning_ended = true;
+                                        let reasoning_out = if req_state.include_reasoning {
+                                            reasoning
+                                        } else {
+                                            None
+                                        };
+                                        (reasoning_out, content)
+                                    }
+                                    ReasoningDelta::None => (None, None),
+                                }
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            // Reasoning already ended — pass text to tool parser or as content.
+                            (None, delta_text.clone())
+                        }
+                    } else {
+                        // No reasoning parser — pass text through as-is.
+                        (None, delta_text.clone())
+                    };
+
+                // Phase 2: Tool parsing on content portion (only after reasoning ends).
+                if let Some(ref mut parser_state) = req_state.tool_parser_state {
+                    if let Some(ref content_text) = content_text_for_tools {
+                        // Build previous/current text for tool parser (content portion only).
+                        let previous_text_for_tools = req_state.accumulated_text.clone(); // approximation
+                        let parser_result = parser_state.process_delta(
+                            &previous_text_for_tools,
+                            &req_state.accumulated_text,
+                            content_text,
+                        );
 
                         match parser_result {
                             ToolParserDelta::Content(content) => {
@@ -1901,10 +2044,25 @@ impl AsyncEngine {
                                     },
                                     logprobs: step_logprobs.clone(),
                                     tool_call_deltas: None,
+                                    reasoning: reasoning_delta,
                                 };
                                 let _ = tx.send(delta);
                             }
                             ToolParserDelta::ToolCalls(tool_deltas) => {
+                                // Emit reasoning delta separately if present.
+                                if let Some(reasoning) = reasoning_delta {
+                                    let delta = StreamDelta {
+                                        index: req_state.choice_index,
+                                        new_token_ids: vec![],
+                                        text: None,
+                                        finish_reason: None,
+                                        stop_reason: None,
+                                        logprobs: None,
+                                        tool_call_deltas: None,
+                                        reasoning: Some(reasoning),
+                                    };
+                                    let _ = tx.send(delta);
+                                }
                                 // Filter by forced function name if specified.
                                 let tool_deltas =
                                     if let Some(ref forced) = req_state.forced_function_name {
@@ -1929,12 +2087,26 @@ impl AsyncEngine {
                                         stop_reason: None,
                                         logprobs: step_logprobs.clone(),
                                         tool_call_deltas: Some(tool_deltas),
+                                        reasoning: None,
                                     };
                                     let _ = tx.send(delta);
                                 }
                             }
                             ToolParserDelta::None => {
-                                // Buffering, don't send anything yet.
+                                // Buffering in tool parser — but still emit reasoning if present.
+                                if let Some(reasoning) = reasoning_delta {
+                                    let delta = StreamDelta {
+                                        index: req_state.choice_index,
+                                        new_token_ids: output.new_token_ids.clone(),
+                                        text: None,
+                                        finish_reason: None,
+                                        stop_reason: None,
+                                        logprobs: step_logprobs.clone(),
+                                        tool_call_deltas: None,
+                                        reasoning: Some(reasoning),
+                                    };
+                                    let _ = tx.send(delta);
+                                }
                             }
                         }
 
@@ -1948,11 +2120,12 @@ impl AsyncEngine {
                                 stop_reason: delta_stop_reason.clone(),
                                 logprobs: None,
                                 tool_call_deltas: None,
+                                reasoning: None,
                             };
                             let _ = tx.send(finish_delta);
                         }
                     } else if is_finished {
-                        // No text but finished — send finish delta.
+                        // No content text but finished — send finish delta.
                         let fr = if req_state.tool_calls_emitted {
                             Some(FinishReason::Stop)
                         } else {
@@ -1966,21 +2139,43 @@ impl AsyncEngine {
                             stop_reason: delta_stop_reason.clone(),
                             logprobs: step_logprobs.clone(),
                             tool_call_deltas: None,
+                            reasoning: reasoning_delta,
+                        };
+                        let _ = tx.send(delta);
+                    } else if reasoning_delta.is_some() {
+                        // Only reasoning, no content for tool parser yet.
+                        let delta = StreamDelta {
+                            index: req_state.choice_index,
+                            new_token_ids: output.new_token_ids.clone(),
+                            text: None,
+                            finish_reason: None,
+                            stop_reason: None,
+                            logprobs: step_logprobs.clone(),
+                            tool_call_deltas: None,
+                            reasoning: reasoning_delta,
                         };
                         let _ = tx.send(delta);
                     }
                 } else {
-                    // No tool parsing — normal streaming path.
-                    let delta = StreamDelta {
-                        index: req_state.choice_index,
-                        new_token_ids: output.new_token_ids,
-                        text: delta_text,
-                        finish_reason: delta_finish_reason,
-                        stop_reason: delta_stop_reason.clone(),
-                        logprobs: step_logprobs.clone(),
-                        tool_call_deltas: None,
+                    // No tool parsing — send content (or reasoning) directly.
+                    let text_out = if req_state.reasoning_parser_state.is_some() {
+                        content_text_for_tools
+                    } else {
+                        delta_text
                     };
-                    let _ = tx.send(delta);
+                    if text_out.is_some() || reasoning_delta.is_some() || is_finished {
+                        let delta = StreamDelta {
+                            index: req_state.choice_index,
+                            new_token_ids: output.new_token_ids,
+                            text: text_out,
+                            finish_reason: delta_finish_reason,
+                            stop_reason: delta_stop_reason.clone(),
+                            logprobs: step_logprobs.clone(),
+                            tool_call_deltas: None,
+                            reasoning: reasoning_delta,
+                        };
+                        let _ = tx.send(delta);
+                    }
                 }
             }
 
@@ -2166,6 +2361,7 @@ impl AsyncEngine {
                                 },
                                 logprobs: step_logprobs.clone(),
                                 tool_call_deltas: None,
+                                reasoning: None,
                             };
                             let _ = tx.send(delta);
                         }
@@ -2194,6 +2390,7 @@ impl AsyncEngine {
                                     stop_reason: None,
                                     logprobs: step_logprobs.clone(),
                                     tool_call_deltas: Some(tool_deltas),
+                                    reasoning: None,
                                 };
                                 let _ = tx.send(delta);
                             }
@@ -2213,6 +2410,7 @@ impl AsyncEngine {
                             stop_reason: delta_stop_reason.clone(),
                             logprobs: None,
                             tool_call_deltas: None,
+                            reasoning: None,
                         };
                         let _ = tx.send(finish_delta);
                     }
@@ -2231,6 +2429,7 @@ impl AsyncEngine {
                         stop_reason: delta_stop_reason.clone(),
                         logprobs: step_logprobs.clone(),
                         tool_call_deltas: None,
+                        reasoning: None,
                     };
                     let _ = tx.send(delta);
                 }
@@ -2244,6 +2443,7 @@ impl AsyncEngine {
                     stop_reason: delta_stop_reason.clone(),
                     logprobs: step_logprobs.clone(),
                     tool_call_deltas: None,
+                    reasoning: None,
                 };
                 let _ = tx.send(delta);
             }
@@ -3124,7 +3324,11 @@ mod tests {
             logprobs: Vec::new(),
             prompt_logprobs: None,
             tool_parser_state: None,
+            reasoning_parser_state: None,
+            reasoning_ended: false,
+            include_reasoning: true,
             accumulated_text: String::new(),
+            accumulated_token_ids: Vec::new(),
             tool_calls_emitted: false,
             forced_function_name: None,
             pooler_output: None,
@@ -3212,6 +3416,7 @@ mod tests {
             allowed_token_ids: None,
             bad_words: None,
             truncate_prompt_tokens: None,
+            include_reasoning: true,
         }
     }
 
@@ -4335,5 +4540,348 @@ mod tests {
             result,
             "reset_prefix_cache should return true with no running requests"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Reasoning parser integration tests
+    // -------------------------------------------------------------------
+
+    /// Helper: build a minimal vocab for reasoning parser tests.
+    fn reasoning_test_vocab() -> std::collections::HashMap<String, u32> {
+        let mut vocab = std::collections::HashMap::new();
+        vocab.insert("<think>".to_string(), 100);
+        vocab.insert("</think>".to_string(), 101);
+        vocab
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_completion_with_deepseek_reasoning_parser() {
+        // NoopExecutor generates placeholder text "<token_1000><token_1001>..."
+        // which doesn't contain <think>/<think>, so DeepSeek R1 treats it as
+        // "everything is reasoning" (no end token found).
+        let vocab = reasoning_test_vocab();
+        let parser = crate::reasoning_parser::get_reasoning_parser("deepseek_r1", &vocab).unwrap();
+
+        let mut engine = make_test_engine();
+        engine.set_reasoning_parser(parser);
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+
+        let request = make_chat_request();
+        let response = engine.chat_completion(request).await.unwrap();
+
+        assert_eq!(response.choices.len(), 1);
+        let msg = &response.choices[0].message;
+        // DeepSeek: no </think> found → everything is reasoning, content is None.
+        assert!(
+            msg.reasoning.is_some(),
+            "reasoning should be populated for DeepSeek R1"
+        );
+        assert!(
+            msg.content.is_none(),
+            "content should be None when no </think>"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_completion_with_qwen3_reasoning_parser() {
+        // Qwen3: no </think> found → thinking disabled, everything is content.
+        let vocab = reasoning_test_vocab();
+        let parser = crate::reasoning_parser::get_reasoning_parser("qwen3", &vocab).unwrap();
+
+        let mut engine = make_test_engine();
+        engine.set_reasoning_parser(parser);
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+
+        let request = make_chat_request();
+        let response = engine.chat_completion(request).await.unwrap();
+
+        assert_eq!(response.choices.len(), 1);
+        let msg = &response.choices[0].message;
+        // Qwen3: no </think> → thinking disabled, everything is content.
+        assert!(
+            msg.reasoning.is_none(),
+            "reasoning should be None for Qwen3 thinking-disabled"
+        );
+        assert!(msg.content.is_some(), "content should be populated");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_completion_include_reasoning_false() {
+        // include_reasoning=false should suppress the reasoning field.
+        let vocab = reasoning_test_vocab();
+        let parser = crate::reasoning_parser::get_reasoning_parser("deepseek_r1", &vocab).unwrap();
+
+        let mut engine = make_test_engine();
+        engine.set_reasoning_parser(parser);
+        let engine = Arc::new(engine);
+        engine.spawn_step_loop();
+
+        let mut request = make_chat_request();
+        request.include_reasoning = false;
+        let response = engine.chat_completion(request).await.unwrap();
+
+        assert_eq!(response.choices.len(), 1);
+        let msg = &response.choices[0].message;
+        // Even though DeepSeek would extract reasoning, include_reasoning=false
+        // suppresses it.
+        assert!(
+            msg.reasoning.is_none(),
+            "reasoning should be None when include_reasoning=false"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_chat_completion_without_reasoning_parser() {
+        // No reasoning parser set — reasoning field should always be None.
+        let engine = Arc::new(make_test_engine());
+        engine.spawn_step_loop();
+
+        let request = make_chat_request();
+        let response = engine.chat_completion(request).await.unwrap();
+
+        assert_eq!(response.choices.len(), 1);
+        let msg = &response.choices[0].message;
+        assert!(
+            msg.reasoning.is_none(),
+            "reasoning should be None without parser"
+        );
+        assert!(msg.content.is_some(), "content should be present");
+    }
+
+    #[test]
+    fn test_streaming_phase3_with_reasoning_parser() {
+        // Directly test process_outputs_phase3 with a RequestState that has
+        // a reasoning parser state, simulating streaming deltas.
+        use crate::reasoning_parser::DeepSeekR1ReasoningParser;
+
+        let vocab = reasoning_test_vocab();
+        let parser = DeepSeekR1ReasoningParser::new(&vocab).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let mut requests = HashMap::new();
+        let mut state = make_test_request_state(Some(tx));
+        state.reasoning_parser_state = Some(parser.create_streaming_state());
+        state.include_reasoning = true;
+        requests.insert("req-1".to_string(), state);
+
+        // Simulate: no tokenizer, so delta_text is None but token IDs are present.
+        // The reasoning parser needs delta_text to work, so simulate with DetokResult.
+        // Since process_outputs_phase3 takes DetokResult, we provide one.
+
+        // Simulate delta: "<think>" (single token ID 100 → skipped by parser).
+        let output1 = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![100],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok1 = Some((
+            IncrementalDetokenizer::dummy(),
+            None,
+            Some("<think>".to_string()),
+        ));
+
+        AsyncEngine::process_outputs_phase3(&mut requests, vec![output1], vec![detok1]);
+
+        // Simulate delta: "reasoning text" (token ID 10).
+        let output2 = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![10],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok2 = Some((
+            IncrementalDetokenizer::dummy(),
+            None,
+            Some("reasoning text".to_string()),
+        ));
+
+        AsyncEngine::process_outputs_phase3(&mut requests, vec![output2], vec![detok2]);
+
+        // Simulate delta: "</think>content" (token IDs 101, 20).
+        let output3 = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![101, 20],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok3 = Some((
+            IncrementalDetokenizer::dummy(),
+            None,
+            Some("</think>content".to_string()),
+        ));
+
+        AsyncEngine::process_outputs_phase3(&mut requests, vec![output3], vec![detok3]);
+
+        // Simulate delta: " done" (token ID 21) — content after reasoning ended.
+        let output4 = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![21],
+            finish_reason: Some(FinishReason::Stop),
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok4 = Some((
+            IncrementalDetokenizer::dummy(),
+            None,
+            Some(" done".to_string()),
+        ));
+
+        AsyncEngine::process_outputs_phase3(&mut requests, vec![output4], vec![detok4]);
+
+        // Collect all deltas from the channel.
+        let mut reasoning_parts = Vec::new();
+        let mut content_parts = Vec::new();
+        while let Ok(delta) = rx.try_recv() {
+            if let Some(r) = delta.reasoning {
+                reasoning_parts.push(r);
+            }
+            if let Some(t) = delta.text {
+                content_parts.push(t);
+            }
+        }
+
+        assert!(
+            !reasoning_parts.is_empty(),
+            "should have reasoning deltas: got {:?}",
+            reasoning_parts
+        );
+        assert!(
+            !content_parts.is_empty(),
+            "should have content deltas: got {:?}",
+            content_parts
+        );
+        assert_eq!(
+            content_parts.join(""),
+            "content done",
+            "content should be everything after </think>"
+        );
+    }
+
+    #[test]
+    fn test_streaming_phase3_include_reasoning_false() {
+        // Verify include_reasoning=false suppresses reasoning in streaming deltas.
+        use crate::reasoning_parser::DeepSeekR1ReasoningParser;
+
+        let vocab = reasoning_test_vocab();
+        let parser = DeepSeekR1ReasoningParser::new(&vocab).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let mut requests = HashMap::new();
+        let mut state = make_test_request_state(Some(tx));
+        state.reasoning_parser_state = Some(parser.create_streaming_state());
+        state.include_reasoning = false; // <-- suppress reasoning
+        requests.insert("req-1".to_string(), state);
+
+        // Send <think> token.
+        let output = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![100],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok = Some((
+            IncrementalDetokenizer::dummy(),
+            None,
+            Some("<think>".to_string()),
+        ));
+        AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+
+        // Send reasoning text.
+        let output = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![10],
+            finish_reason: None,
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok = Some((
+            IncrementalDetokenizer::dummy(),
+            None,
+            Some("thinking".to_string()),
+        ));
+        AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+
+        // Collect deltas.
+        let mut has_reasoning = false;
+        while let Ok(delta) = rx.try_recv() {
+            if delta.reasoning.is_some() {
+                has_reasoning = true;
+            }
+        }
+
+        assert!(
+            !has_reasoning,
+            "reasoning should be suppressed when include_reasoning=false"
+        );
+    }
+
+    #[test]
+    fn test_streaming_phase3_no_reasoning_parser() {
+        // Without a reasoning parser, streaming deltas should have reasoning=None.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let mut requests = HashMap::new();
+        let state = make_test_request_state(Some(tx));
+        // reasoning_parser_state is None by default.
+        requests.insert("req-1".to_string(), state);
+
+        let output = EngineCoreOutput {
+            request_id: "req-1".to_string(),
+            new_token_ids: vec![42],
+            finish_reason: Some(FinishReason::Stop),
+            stop_reason: None,
+            num_cached_tokens: 0,
+            events: None,
+            new_logprobs: None,
+            new_prompt_logprobs: None,
+            pooler_output: None,
+        };
+        let detok = Some((
+            IncrementalDetokenizer::dummy(),
+            None,
+            Some("hello".to_string()),
+        ));
+
+        AsyncEngine::process_outputs_phase3(&mut requests, vec![output], vec![detok]);
+
+        let delta = rx.try_recv().unwrap();
+        assert!(
+            delta.reasoning.is_none(),
+            "reasoning should be None without parser"
+        );
+        assert_eq!(delta.text, Some("hello".to_string()));
     }
 }

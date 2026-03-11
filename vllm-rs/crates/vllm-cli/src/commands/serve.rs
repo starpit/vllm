@@ -61,6 +61,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     let port = args.port;
     let enable_metrics = args.enable_metrics;
     let tool_call_parser_name = args.tool_call_parser.clone();
+    let reasoning_parser_name = args.reasoning_parser.clone();
 
     print_banner(env!("CARGO_PKG_VERSION"), &model);
     info!("Device: {}, dtype: {}", args.device, args.dtype);
@@ -139,6 +140,21 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
             .expect("engine should not be shared yet")
             .set_tool_parser(parser);
         info!("Tool call parser: {}", parser_name);
+    }
+
+    // 2c. Configure reasoning parser if specified.
+    if let Some(ref parser_name) = reasoning_parser_name {
+        let vocab = stack
+            .engine
+            .tokenizer()
+            .ok_or_else(|| anyhow::anyhow!("reasoning parser requires a tokenizer"))?
+            .get_vocab();
+        let parser = vllm_serve::reasoning_parser::get_reasoning_parser(parser_name, &vocab)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Arc::get_mut(&mut stack.engine)
+            .expect("engine should not be shared yet")
+            .set_reasoning_parser(parser);
+        info!("Reasoning parser: {}", parser_name);
     }
 
     // 3. Spawn the engine step loop.

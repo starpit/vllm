@@ -116,6 +116,11 @@ pub struct ServeArgs {
     #[arg(long)]
     pub tool_call_parser: Option<String>,
 
+    /// Reasoning parser to use (e.g. "deepseek_r1", "qwen3").
+    /// Extracts <think>...</think> blocks into a separate reasoning_content field.
+    #[arg(long)]
+    pub reasoning_parser: Option<String>,
+
     /// Enable automatic tool choice (model decides when to call tools).
     #[arg(long)]
     pub enable_auto_tool_choice: bool,
@@ -390,6 +395,10 @@ pub struct BatchArgs {
     /// Tool call parser to use (e.g. "hermes", "llama3_json").
     #[arg(long)]
     pub tool_call_parser: Option<String>,
+
+    /// Reasoning parser to use (e.g. "deepseek_r1", "qwen3").
+    #[arg(long)]
+    pub reasoning_parser: Option<String>,
 
     /// Specific GGUF filename to download from a HuggingFace repo.
     #[arg(long)]

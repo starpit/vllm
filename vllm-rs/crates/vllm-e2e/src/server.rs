@@ -54,6 +54,7 @@ impl TestServer {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             port: None,
             tool_call_parser: None,
+            reasoning_parser: None,
             lora_adapter: None,
             pooling_strategy: None,
             disable_async_scheduling: false,
@@ -104,6 +105,7 @@ pub struct TestServerBuilder {
     startup_timeout: Duration,
     port: Option<u16>,
     tool_call_parser: Option<String>,
+    reasoning_parser: Option<String>,
     lora_adapter: Option<String>,
     pooling_strategy: Option<String>,
     disable_async_scheduling: bool,
@@ -137,6 +139,12 @@ impl TestServerBuilder {
     /// Set the tool call parser (e.g. "hermes", "llama3_json", "kimi_k2").
     pub fn with_tool_call_parser(mut self, parser: &str) -> Self {
         self.tool_call_parser = Some(parser.to_string());
+        self
+    }
+
+    /// Set the reasoning parser (e.g. "deepseek_r1", "qwen3").
+    pub fn with_reasoning_parser(mut self, parser: &str) -> Self {
+        self.reasoning_parser = Some(parser.to_string());
         self
     }
 
@@ -240,6 +248,10 @@ impl TestServerBuilder {
 
         if let Some(ref parser) = self.tool_call_parser {
             cmd.arg("--tool-call-parser").arg(parser);
+        }
+
+        if let Some(ref parser) = self.reasoning_parser {
+            cmd.arg("--reasoning-parser").arg(parser);
         }
 
         if let Some(ref adapter) = self.lora_adapter {
@@ -367,6 +379,21 @@ impl TestServerBuilder {
                 .expect("engine should not be shared yet")
                 .set_tool_parser(parser);
             tracing::info!("Tool call parser configured: {}", parser_name);
+        }
+
+        // Configure reasoning parser if requested.
+        if let Some(ref parser_name) = self.reasoning_parser {
+            let vocab = stack
+                .engine
+                .tokenizer()
+                .ok_or_else(|| anyhow::anyhow!("reasoning parser requires a tokenizer"))?
+                .get_vocab();
+            let parser = vllm_serve::reasoning_parser::get_reasoning_parser(parser_name, &vocab)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            Arc::get_mut(&mut stack.engine)
+                .expect("engine should not be shared yet")
+                .set_reasoning_parser(parser);
+            tracing::info!("Reasoning parser configured: {}", parser_name);
         }
 
         // Spawn the engine step loop.

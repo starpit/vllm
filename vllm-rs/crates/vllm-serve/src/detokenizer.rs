@@ -68,6 +68,26 @@ pub struct IncrementalDetokenizer {
 }
 
 impl IncrementalDetokenizer {
+    /// Create a minimal detokenizer for testing (no real tokenizer attached).
+    #[cfg(test)]
+    pub(crate) fn dummy() -> Self {
+        use crate::tokenizer::make_test_tokenizer;
+        Self {
+            tokenizer: std::sync::Arc::new(make_test_tokenizer()),
+            all_token_ids: Vec::new(),
+            num_prompt_tokens: 0,
+            prefix_offset: 0,
+            read_offset: 0,
+            output_text: String::new(),
+            last_output_text_offset: 0,
+            stop_strings: Vec::new(),
+            min_tokens: 0,
+            include_stop_str_in_output: false,
+            stop_buffer_length: 0,
+            skip_special_tokens: true,
+        }
+    }
+
     /// Create a new detokenizer for a request.
     ///
     /// `prompt_token_ids` are the tokenized prompt (used as context for

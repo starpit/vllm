@@ -334,6 +334,10 @@ pub struct ChatCompletionRequest {
     /// Must be >= 1 or -1 (meaning use model's max input length).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncate_prompt_tokens: Option<i64>,
+
+    /// Whether to include reasoning content in the response (default true).
+    #[serde(default = "default_true")]
+    pub include_reasoning: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -51,6 +51,7 @@ pub async fn run_batch(args: BatchArgs) -> Result<()> {
         &args.input,
         &args.output,
         args.tool_call_parser.as_deref(),
+        args.reasoning_parser.as_deref(),
     )
     .await
 }
@@ -61,6 +62,7 @@ pub async fn run_batch_from_config(
     input_path: &str,
     output_path: &str,
     tool_call_parser: Option<&str>,
+    reasoning_parser: Option<&str>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -90,6 +92,20 @@ pub async fn run_batch_from_config(
         Arc::get_mut(&mut stack.engine)
             .expect("engine should not be shared yet")
             .set_tool_parser(parser);
+    }
+
+    // 2c. Configure reasoning parser if specified.
+    if let Some(parser_name) = reasoning_parser {
+        let vocab = stack
+            .engine
+            .tokenizer()
+            .ok_or_else(|| anyhow::anyhow!("reasoning parser requires a tokenizer"))?
+            .get_vocab();
+        let parser = vllm_serve::reasoning_parser::get_reasoning_parser(parser_name, &vocab)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Arc::get_mut(&mut stack.engine)
+            .expect("engine should not be shared yet")
+            .set_reasoning_parser(parser);
     }
 
     // 3. Spawn the engine step loop.

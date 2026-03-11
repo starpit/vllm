@@ -92,6 +92,11 @@ impl Tokenizer {
         self.special_ids.contains(&id)
     }
 
+    /// Get the full vocabulary as a token-to-id mapping.
+    pub fn get_vocab(&self) -> std::collections::HashMap<String, u32> {
+        self.inner.get_vocab(true)
+    }
+
     /// Get a reference to the underlying HuggingFace tokenizer.
     pub fn inner(&self) -> &HfTokenizer {
         &self.inner

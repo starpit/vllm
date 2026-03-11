@@ -3862,16 +3862,6 @@ impl CudaWorker {
 
         let block_size = self.config.block_size;
 
-        // Free any leaked GPU tensors from the previous step (h2d inputs,
-        // logits, sampling outputs, etc.). Keep graph output addresses pinned.
-        if let Some(ref mut dev) = self.device {
-            let mut keep: Vec<*const u8> = Vec::new();
-            if let Some(ref runner) = self.graph_runner {
-                keep.extend(runner.pinned_addresses());
-            }
-            unsafe { dev.caching.free_leaked_blocks_except(&keep) };
-        }
-
         // NOTE: pending commit from the previous step is resolved lazily:
         // - Super fast path: resolved AFTER graph launch (overlaps with GPU)
         // - Normal path: resolved below, before prepare_inputs needs it
@@ -4052,6 +4042,15 @@ impl CudaWorker {
                 // Async D2H — enqueue on transfer stream, don't block.
                 let buf_idx = stg.token_buf_idx;
                 Self::d2h_token_ids_async(stg, buf_idx, &replay_out.token_ids, num_active, device)?;
+
+                // Free leaked GPU blocks after graph launch (overlaps with GPU).
+                {
+                    let mut keep: Vec<*const u8> = Vec::new();
+                    if let Some(ref runner) = self.graph_runner {
+                        keep.extend(runner.pinned_addresses());
+                    }
+                    unsafe { device.caching.free_leaked_blocks_except(&keep) };
+                }
 
                 // NOW resolve the pending commit from the previous step.
                 // The GPU is running step N, so this CPU work overlaps with it.
@@ -5117,6 +5116,16 @@ impl CudaWorker {
                 }
             }
         };
+
+        // Free leaked GPU blocks AFTER graph/forward launch, overlapping with GPU execution.
+        // This saves ~200µs per decode step that was previously blocking before graph launch.
+        {
+            let mut keep: Vec<*const u8> = Vec::new();
+            if let Some(ref runner) = self.graph_runner {
+                keep.extend(runner.pinned_addresses());
+            }
+            unsafe { device.caching.free_leaked_blocks_except(&keep) };
+        }
 
         // GPU sampling: handles all cases — greedy, non-greedy, penalties,
         // grammar, logit_bias, logprobs — entirely on GPU. No CPU fallback.

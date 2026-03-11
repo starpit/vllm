@@ -2030,7 +2030,7 @@ fn num_splits_heuristic(
     let max_splits = max_splits.min(num_sm).min(num_n_blocks);
 
     // Python's is_split_eligible: ceildiv(n, s) != ceildiv(n, s-1)
-    let ceildiv = |a: usize, b: usize| (a + b - 1) / b;
+    let ceildiv = |a: usize, b: usize| a.div_ceil(b);
     let is_split_eligible =
         |s: usize| -> bool { s == 1 || ceildiv(num_n_blocks, s) != ceildiv(num_n_blocks, s - 1) };
 
@@ -2347,9 +2347,9 @@ pub unsafe fn flash_attn_paged_ext(
         64
     };
     // Python: (max_seqlen_k + block_n - 1) / block_n (line 307)
-    let num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+    let num_n_blocks = max_seqlen_k.div_ceil(block_n);
     // Python: (max_seqlen_q + 64 - 1) / 64 (line 310)
-    let num_m_blocks = (eff_max_seqlen_q + 63) / 64;
+    let num_m_blocks = eff_max_seqlen_q.div_ceil(64);
 
     let num_splits = if do_swap && num_sm > 0 {
         num_splits_heuristic(
@@ -2979,7 +2979,7 @@ pub unsafe fn sample_gumbel_batched(
     let out = alloc.alloc_tensor(&[batch_size as usize], DType::U32);
 
     // Scratch for multi-block reduction: [batch_size, num_blocks] for vals and indices.
-    let num_blocks = ((vocab_size as usize) + 1023) / 1024;
+    let num_blocks = (vocab_size as usize).div_ceil(1024);
     let scratch_elems = batch_size as usize * num_blocks;
     let scratch_vals = alloc.alloc_tensor(&[scratch_elems], DType::F32);
     let scratch_indices = alloc.alloc_tensor(&[scratch_elems], DType::I32);

@@ -44,6 +44,7 @@ thiserror = { workspace = true }
 tower = { workspace = true }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 uuid = { version = "1", features = ["v4"] }
+rand = { workspace = true }
 http = "1"
 tokenizers = { workspace = true }
 rayon = { workspace = true }

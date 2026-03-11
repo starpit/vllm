@@ -1053,6 +1053,556 @@ impl StreamingToolParserState for KimiK2StreamingState {
 }
 
 // ---------------------------------------------------------------------------
+// Mistral tool parser
+// ---------------------------------------------------------------------------
+
+const MISTRAL_BOT_TOKEN: &str = "[TOOL_CALLS]";
+
+/// Generate a 9-character alphanumeric random ID matching Mistral's format.
+fn mistral_generate_id() -> String {
+    use rand::Rng;
+    const ALPHANUMERIC: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut rng = rand::thread_rng();
+    (0..9)
+        .map(|_| ALPHANUMERIC[rng.gen_range(0..ALPHANUMERIC.len())] as char)
+        .collect()
+}
+
+/// Mistral-style tool call parser.
+///
+/// Supports two formats:
+/// - v11+: `[TOOL_CALLS]func_name{"arg":"val"}[TOOL_CALLS]func2{"arg2":"val2"}`
+/// - Pre-v11: `[TOOL_CALLS] [{"name":"func","arguments":{"arg":"val"}}]`
+///
+/// Format is auto-detected by checking if text after `[TOOL_CALLS]` starts with `[`.
+#[derive(Default)]
+pub struct MistralToolParser;
+
+impl MistralToolParser {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ToolCallParser for MistralToolParser {
+    fn extract_tool_calls(&self, model_output: &str) -> ExtractedToolCallInfo {
+        mistral_extract(model_output)
+    }
+
+    fn create_streaming_state(&self) -> Box<dyn StreamingToolParserState + Send> {
+        Box::new(MistralStreamingState::new())
+    }
+}
+
+fn mistral_extract(text: &str) -> ExtractedToolCallInfo {
+    if !text.contains(MISTRAL_BOT_TOKEN) {
+        return ExtractedToolCallInfo {
+            tools_called: false,
+            tool_calls: Vec::new(),
+            content: Some(text.to_string()),
+        };
+    }
+
+    let parts: Vec<&str> = text.splitn(2, MISTRAL_BOT_TOKEN).collect();
+    let content = parts[0];
+    let rest = parts.get(1).unwrap_or(&"");
+
+    // Auto-detect format: if rest starts with `[` (after trimming), it's pre-v11
+    let trimmed_rest = rest.trim_start();
+    let is_pre_v11 = trimmed_rest.starts_with('[');
+
+    let tool_calls = if is_pre_v11 {
+        // Pre-v11: `[{"name":"func","arguments":{...}}]`
+        mistral_extract_pre_v11(trimmed_rest)
+    } else {
+        // v11+: split on [TOOL_CALLS] for multiple tools
+        // rest is everything after the first [TOOL_CALLS], may contain more [TOOL_CALLS] delimiters
+        let full_tool_text = &text[parts[0].len() + MISTRAL_BOT_TOKEN.len()..];
+        let segments: Vec<&str> = full_tool_text.split(MISTRAL_BOT_TOKEN).collect();
+        let mut calls = Vec::new();
+        for segment in segments {
+            if let Some(brace_pos) = segment.find('{') {
+                let name = &segment[..brace_pos];
+                let args = &segment[brace_pos..];
+                calls.push(protocol::ToolCall {
+                    id: mistral_generate_id(),
+                    call_type: "function".to_string(),
+                    function: protocol::FunctionCall {
+                        name: name.to_string(),
+                        arguments: args.to_string(),
+                    },
+                });
+            }
+        }
+        calls
+    };
+
+    if tool_calls.is_empty() {
+        return ExtractedToolCallInfo {
+            tools_called: false,
+            tool_calls: Vec::new(),
+            content: Some(text.to_string()),
+        };
+    }
+
+    ExtractedToolCallInfo {
+        tools_called: true,
+        tool_calls,
+        content: if content.is_empty() {
+            None
+        } else {
+            Some(content.to_string())
+        },
+    }
+}
+
+fn mistral_extract_pre_v11(json_text: &str) -> Vec<protocol::ToolCall> {
+    // Try direct JSON parse first
+    let parsed: Result<Vec<serde_json::Value>, _> = serde_json::from_str(json_text);
+    let arr = match parsed {
+        Ok(arr) => arr,
+        Err(_) => {
+            // Fallback: find `[{...}]` pattern (matching Python's regex r"\[{.*}\]")
+            let start = json_text.find("[{");
+            let end = json_text.rfind("}]");
+            if let (Some(s), Some(e)) = (start, end) {
+                let substr = &json_text[s..e + 2];
+                match serde_json::from_str::<Vec<serde_json::Value>>(substr) {
+                    Ok(arr) => arr,
+                    Err(_) => return Vec::new(),
+                }
+            } else {
+                return Vec::new();
+            }
+        }
+    };
+
+    arr.into_iter()
+        .filter_map(|val| {
+            let name = val.get("name")?.as_str()?.to_string();
+            let arguments = val.get("arguments")?;
+            let arguments_str = if arguments.is_string() {
+                arguments.as_str().unwrap().to_string()
+            } else {
+                serde_json::to_string(arguments).ok()?
+            };
+            Some(protocol::ToolCall {
+                id: mistral_generate_id(),
+                call_type: "function".to_string(),
+                function: protocol::FunctionCall {
+                    name,
+                    arguments: arguments_str,
+                },
+            })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Mistral streaming state machine
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MistralStreamFormat {
+    Unknown,
+    V11,
+    PreV11,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MistralStreamState {
+    WaitingForToolStart,
+    ParsingName,
+    ParsingArguments,
+}
+
+struct MistralStreamingState {
+    format: MistralStreamFormat,
+    state: MistralStreamState,
+    current_tool_id: i32,
+    current_tool_name: String,
+    /// Buffer for accumulating text until we can determine format or complete a parse unit.
+    buffer: String,
+    /// For pre-v11: brace depth for JSON streaming.
+    brace_depth: i32,
+    /// For pre-v11: whether we're inside a JSON string.
+    in_string: bool,
+    /// For pre-v11: previous char was backslash (escape).
+    escape_next: bool,
+    /// For pre-v11: accumulated arguments JSON for current tool.
+    pre_v11_args_buf: String,
+    /// For pre-v11: accumulated name.
+    pre_v11_key: Option<String>,
+    /// For pre-v11: current JSON key being parsed.
+    pre_v11_parse_state: PreV11ParseState,
+    /// Whether we've seen the bot token at all.
+    bot_token_seen: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreV11ParseState {
+    /// Looking for the start of an object `{`.
+    WaitingForObject,
+    /// Inside an object, looking for keys.
+    InObject,
+    /// Parsing the "name" string value.
+    ParsingNameValue,
+    /// Parsing the "arguments" object.
+    ParsingArgumentsValue,
+    /// Object complete, waiting for next or end of array.
+    ObjectComplete,
+    /// Array complete.
+    Done,
+}
+
+impl MistralStreamingState {
+    fn new() -> Self {
+        Self {
+            format: MistralStreamFormat::Unknown,
+            state: MistralStreamState::WaitingForToolStart,
+            current_tool_id: -1,
+            current_tool_name: String::new(),
+            buffer: String::new(),
+            brace_depth: 0,
+            in_string: false,
+            escape_next: false,
+            pre_v11_args_buf: String::new(),
+            pre_v11_key: None,
+            pre_v11_parse_state: PreV11ParseState::WaitingForObject,
+            bot_token_seen: false,
+        }
+    }
+
+    /// Process v11+ format streaming.
+    fn process_v11(&mut self, text: &str) -> Vec<DeltaToolCall> {
+        let mut deltas = Vec::new();
+        let mut remaining = text;
+
+        loop {
+            match self.state {
+                MistralStreamState::WaitingForToolStart => {
+                    // Look for [TOOL_CALLS] token
+                    if let Some(pos) = remaining.find(MISTRAL_BOT_TOKEN) {
+                        remaining = &remaining[pos + MISTRAL_BOT_TOKEN.len()..];
+                        self.current_tool_id += 1;
+                        self.current_tool_name.clear();
+                        self.state = MistralStreamState::ParsingName;
+                    } else {
+                        break;
+                    }
+                }
+                MistralStreamState::ParsingName => {
+                    if let Some(brace_pos) = remaining.find('{') {
+                        let name_part = &remaining[..brace_pos];
+                        self.current_tool_name.push_str(name_part);
+                        remaining = &remaining[brace_pos..];
+                        self.state = MistralStreamState::ParsingArguments;
+
+                        // Emit name delta with ID
+                        deltas.push(DeltaToolCall {
+                            index: self.current_tool_id as u32,
+                            id: Some(mistral_generate_id()),
+                            call_type: Some("function".to_string()),
+                            function_name: Some(self.current_tool_name.clone()),
+                            function_arguments: None,
+                        });
+                    } else {
+                        // Buffer the name fragment, don't emit yet
+                        self.current_tool_name.push_str(remaining);
+                        break;
+                    }
+                }
+                MistralStreamState::ParsingArguments => {
+                    // Check if there's another [TOOL_CALLS] — means current tool is done
+                    if let Some(pos) = remaining.find(MISTRAL_BOT_TOKEN) {
+                        let args_part = &remaining[..pos];
+                        if !args_part.is_empty() {
+                            deltas.push(DeltaToolCall {
+                                index: self.current_tool_id as u32,
+                                id: None,
+                                call_type: None,
+                                function_name: None,
+                                function_arguments: Some(args_part.to_string()),
+                            });
+                        }
+                        remaining = &remaining[pos..]; // keep [TOOL_CALLS] for next iteration
+                        self.state = MistralStreamState::WaitingForToolStart;
+                    } else {
+                        // All remaining text is arguments
+                        if !remaining.is_empty() {
+                            deltas.push(DeltaToolCall {
+                                index: self.current_tool_id as u32,
+                                id: None,
+                                call_type: None,
+                                function_name: None,
+                                function_arguments: Some(remaining.to_string()),
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        deltas
+    }
+
+    /// Process pre-v11 format streaming using brace-counting.
+    fn process_pre_v11(&mut self, text: &str) -> Vec<DeltaToolCall> {
+        let mut deltas = Vec::new();
+
+        for ch in text.chars() {
+            match self.pre_v11_parse_state {
+                PreV11ParseState::WaitingForObject => {
+                    if ch == '{' {
+                        self.pre_v11_parse_state = PreV11ParseState::InObject;
+                        self.current_tool_id += 1;
+                        self.pre_v11_key = None;
+                        self.current_tool_name.clear();
+                        self.pre_v11_args_buf.clear();
+                        self.brace_depth = 0;
+                        self.in_string = false;
+                        self.escape_next = false;
+                    }
+                    // skip [ , whitespace etc.
+                }
+                PreV11ParseState::InObject => {
+                    // We're inside the top-level object, looking for "name" or "arguments" keys
+                    // Simple approach: accumulate into buffer until we identify key-value pairs
+                    self.buffer.push(ch);
+
+                    // Check if we've accumulated a complete key
+                    if self.buffer.contains("\"name\"") && self.buffer.ends_with(':') {
+                        self.buffer.clear();
+                        self.pre_v11_parse_state = PreV11ParseState::ParsingNameValue;
+                        self.in_string = false;
+                    } else if self.buffer.contains("\"arguments\"") && self.buffer.ends_with(':') {
+                        self.buffer.clear();
+                        self.pre_v11_parse_state = PreV11ParseState::ParsingArgumentsValue;
+                        self.brace_depth = 0;
+                        self.in_string = false;
+                        self.escape_next = false;
+                    } else if ch == '}' && !self.buffer.contains('"') {
+                        // End of object without finding expected keys
+                        self.buffer.clear();
+                        self.pre_v11_parse_state = PreV11ParseState::ObjectComplete;
+                    }
+                }
+                PreV11ParseState::ParsingNameValue => {
+                    // Parse a JSON string value for the name
+                    if ch == '"' && !self.in_string {
+                        self.in_string = true;
+                    } else if self.in_string {
+                        if self.escape_next {
+                            self.current_tool_name.push(ch);
+                            self.escape_next = false;
+                        } else if ch == '\\' {
+                            self.escape_next = true;
+                        } else if ch == '"' {
+                            // Name complete — emit it
+                            deltas.push(DeltaToolCall {
+                                index: self.current_tool_id as u32,
+                                id: Some(mistral_generate_id()),
+                                call_type: Some("function".to_string()),
+                                function_name: Some(self.current_tool_name.clone()),
+                                function_arguments: None,
+                            });
+                            self.in_string = false;
+                            self.pre_v11_parse_state = PreV11ParseState::InObject;
+                            self.buffer.clear();
+                        } else {
+                            self.current_tool_name.push(ch);
+                        }
+                    }
+                }
+                PreV11ParseState::ParsingArgumentsValue => {
+                    // Stream arguments using brace counting
+                    if ch == '{' && !self.in_string {
+                        self.brace_depth += 1;
+                        self.pre_v11_args_buf.push(ch);
+                        if self.brace_depth == 1 {
+                            // Emit the opening brace as first args delta
+                            deltas.push(DeltaToolCall {
+                                index: self.current_tool_id as u32,
+                                id: None,
+                                call_type: None,
+                                function_name: None,
+                                function_arguments: Some("{".to_string()),
+                            });
+                            self.pre_v11_args_buf.clear();
+                        }
+                    } else if ch == '}' && !self.in_string {
+                        self.brace_depth -= 1;
+                        if self.brace_depth == 0 {
+                            // Arguments complete
+                            if !self.pre_v11_args_buf.is_empty() {
+                                deltas.push(DeltaToolCall {
+                                    index: self.current_tool_id as u32,
+                                    id: None,
+                                    call_type: None,
+                                    function_name: None,
+                                    function_arguments: Some(self.pre_v11_args_buf.clone()),
+                                });
+                                self.pre_v11_args_buf.clear();
+                            }
+                            deltas.push(DeltaToolCall {
+                                index: self.current_tool_id as u32,
+                                id: None,
+                                call_type: None,
+                                function_name: None,
+                                function_arguments: Some("}".to_string()),
+                            });
+                            self.pre_v11_parse_state = PreV11ParseState::InObject;
+                            self.buffer.clear();
+                        } else {
+                            self.pre_v11_args_buf.push(ch);
+                        }
+                    } else {
+                        // Handle strings for correct brace counting
+                        if ch == '"' && !self.escape_next {
+                            self.in_string = !self.in_string;
+                        }
+                        self.escape_next = ch == '\\' && self.in_string && !self.escape_next;
+                        if self.brace_depth > 0 {
+                            self.pre_v11_args_buf.push(ch);
+                        }
+                    }
+                }
+                PreV11ParseState::ObjectComplete => {
+                    if ch == '{' {
+                        // Next object
+                        self.pre_v11_parse_state = PreV11ParseState::InObject;
+                        self.current_tool_id += 1;
+                        self.current_tool_name.clear();
+                        self.pre_v11_args_buf.clear();
+                        self.brace_depth = 0;
+                        self.buffer.clear();
+                    } else if ch == ']' {
+                        self.pre_v11_parse_state = PreV11ParseState::Done;
+                    }
+                }
+                PreV11ParseState::Done => {}
+            }
+        }
+
+        // Flush any accumulated args for pre-v11 in-progress arguments
+        if self.pre_v11_parse_state == PreV11ParseState::ParsingArgumentsValue
+            && self.brace_depth > 0
+            && !self.pre_v11_args_buf.is_empty()
+        {
+            deltas.push(DeltaToolCall {
+                index: self.current_tool_id as u32,
+                id: None,
+                call_type: None,
+                function_name: None,
+                function_arguments: Some(self.pre_v11_args_buf.clone()),
+            });
+            self.pre_v11_args_buf.clear();
+        }
+
+        deltas
+    }
+}
+
+impl StreamingToolParserState for MistralStreamingState {
+    fn process_delta(
+        &mut self,
+        _previous_text: &str,
+        current_text: &str,
+        delta_text: &str,
+    ) -> ToolParserDelta {
+        if delta_text.is_empty() {
+            return ToolParserDelta::None;
+        }
+
+        // If we haven't seen the bot token yet, check if it's in current_text
+        if !self.bot_token_seen {
+            if !current_text.contains(MISTRAL_BOT_TOKEN) {
+                return ToolParserDelta::Content(delta_text.to_string());
+            }
+            self.bot_token_seen = true;
+
+            // Extract content before [TOOL_CALLS]
+            if delta_text.contains(MISTRAL_BOT_TOKEN) {
+                let parts: Vec<&str> = delta_text.splitn(2, MISTRAL_BOT_TOKEN).collect();
+                if !parts[0].is_empty() {
+                    // Buffer the post-bot-token text for format detection
+                    let after = parts.get(1).unwrap_or(&"");
+                    if !after.is_empty() {
+                        self.buffer.push_str(after);
+                    }
+                    // Try to detect format now
+                    return self.try_detect_and_flush(Some(parts[0].to_string()));
+                }
+                let after = parts.get(1).unwrap_or(&"");
+                if !after.is_empty() {
+                    self.buffer.push_str(after);
+                }
+            }
+
+            return self.try_detect_and_flush(None);
+        }
+
+        // If format not yet detected, buffer and try again
+        if self.format == MistralStreamFormat::Unknown {
+            self.buffer.push_str(delta_text);
+            return self.try_detect_and_flush(None);
+        }
+
+        // Format detected, process normally
+        let deltas = match self.format {
+            MistralStreamFormat::V11 => self.process_v11(delta_text),
+            MistralStreamFormat::PreV11 => self.process_pre_v11(delta_text),
+            MistralStreamFormat::Unknown => Vec::new(),
+        };
+
+        if deltas.is_empty() {
+            ToolParserDelta::None
+        } else {
+            ToolParserDelta::ToolCalls(deltas)
+        }
+    }
+}
+
+impl MistralStreamingState {
+    /// Try to detect format from buffered text. If detected, flush buffer through parser.
+    fn try_detect_and_flush(&mut self, content_before: Option<String>) -> ToolParserDelta {
+        let trimmed = self.buffer.trim_start();
+        if trimmed.is_empty() {
+            // Not enough data to detect format yet
+            if let Some(content) = content_before {
+                return ToolParserDelta::Content(content);
+            }
+            return ToolParserDelta::None;
+        }
+
+        if trimmed.starts_with('[') {
+            self.format = MistralStreamFormat::PreV11;
+        } else {
+            self.format = MistralStreamFormat::V11;
+        }
+
+        // Flush buffered text through the appropriate parser
+        // For V11, we need to prepend [TOOL_CALLS] since process_v11 expects it
+        let buffered = std::mem::take(&mut self.buffer);
+        let deltas = match self.format {
+            MistralStreamFormat::V11 => {
+                let with_token = format!("{}{}", MISTRAL_BOT_TOKEN, buffered);
+                self.process_v11(&with_token)
+            }
+            MistralStreamFormat::PreV11 => self.process_pre_v11(&buffered),
+            MistralStreamFormat::Unknown => Vec::new(),
+        };
+
+        match (content_before, deltas.is_empty()) {
+            (Some(content), true) => ToolParserDelta::Content(content),
+            (_, false) => ToolParserDelta::ToolCalls(deltas),
+            (None, true) => ToolParserDelta::None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parser registry
 // ---------------------------------------------------------------------------
 
@@ -1062,6 +1612,7 @@ pub fn get_tool_parser(name: &str) -> Result<Arc<dyn ToolCallParser>, String> {
         "hermes" => Ok(Arc::new(HermesToolParser::new())),
         "llama3_json" | "llama4_json" => Ok(Arc::new(LlamaJsonToolParser::new())),
         "kimi_k2" => Ok(Arc::new(KimiK2ToolParser::new())),
+        "mistral" => Ok(Arc::new(MistralToolParser::new())),
         other => Err(format!("Unknown tool call parser: {other}")),
     }
 }
@@ -1501,5 +2052,329 @@ mod tests {
 
         assert!(got_content, "Should have received content");
         assert!(got_tool, "Should have received tool call");
+    }
+
+    // -- Mistral non-streaming tests --
+
+    #[test]
+    fn test_registry_mistral() {
+        assert!(get_tool_parser("mistral").is_ok());
+    }
+
+    #[test]
+    fn test_mistral_id_format() {
+        let id = mistral_generate_id();
+        assert_eq!(id.len(), 9);
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn test_mistral_no_tools() {
+        let parser = MistralToolParser::new();
+        let output = "The weather is sunny today.";
+        let result = parser.extract_tool_calls(output);
+        assert!(!result.tools_called);
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.content.unwrap(), output);
+    }
+
+    #[test]
+    fn test_mistral_single_tool_v11() {
+        let parser = MistralToolParser::new();
+        let output = r#"[TOOL_CALLS]get_weather{"city":"SF"}"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].function.name, "get_weather");
+        assert_eq!(result.tool_calls[0].function.arguments, r#"{"city":"SF"}"#);
+        assert_eq!(result.tool_calls[0].call_type, "function");
+        assert_eq!(result.tool_calls[0].id.len(), 9);
+        assert!(result.content.is_none());
+    }
+
+    #[test]
+    fn test_mistral_single_tool_pre_v11() {
+        let parser = MistralToolParser::new();
+        let output = r#"[TOOL_CALLS] [{"name":"get_weather","arguments":{"city":"SF"}}]"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].function.name, "get_weather");
+        assert_eq!(result.tool_calls[0].function.arguments, r#"{"city":"SF"}"#);
+    }
+
+    #[test]
+    fn test_mistral_multiple_tools_v11() {
+        let parser = MistralToolParser::new();
+        let output = r#"[TOOL_CALLS]get_weather{"city":"SF"}[TOOL_CALLS]search{"q":"rust"}"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].function.name, "get_weather");
+        assert_eq!(result.tool_calls[1].function.name, "search");
+        assert_eq!(result.tool_calls[1].function.arguments, r#"{"q":"rust"}"#);
+    }
+
+    #[test]
+    fn test_mistral_multiple_tools_pre_v11() {
+        let parser = MistralToolParser::new();
+        let output = r#"[TOOL_CALLS] [{"name":"get_weather","arguments":{"city":"SF"}},{"name":"search","arguments":{"q":"rust"}}]"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].function.name, "get_weather");
+        assert_eq!(result.tool_calls[1].function.name, "search");
+    }
+
+    #[test]
+    fn test_mistral_content_before_tools() {
+        let parser = MistralToolParser::new();
+        let output = r#"Let me help you.[TOOL_CALLS]get_weather{"city":"SF"}"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.content.unwrap(), "Let me help you.");
+    }
+
+    #[test]
+    fn test_mistral_complex_arguments() {
+        let parser = MistralToolParser::new();
+        let output = r#"[TOOL_CALLS]create_event{"title":"Meeting","nested":{"key":"val\"ue"},"list":[1,2,3]}"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls[0].function.name, "create_event");
+        assert!(result.tool_calls[0].function.arguments.contains("nested"));
+    }
+
+    #[test]
+    fn test_mistral_pre_v11_malformed_json_fallback() {
+        let parser = MistralToolParser::new();
+        // Malformed JSON with extra text — the `[{...}]` pattern should be found by fallback
+        let output = r#"[TOOL_CALLS] [{"name":"f","arguments":{"a":1}}] extra text"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].function.name, "f");
+    }
+
+    #[test]
+    fn test_mistral_pre_v11_arguments_before_name() {
+        let parser = MistralToolParser::new();
+        let output = r#"[TOOL_CALLS] [{"arguments":{"city":"SF"},"name":"get_weather"}]"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls[0].function.name, "get_weather");
+        assert_eq!(result.tool_calls[0].function.arguments, r#"{"city":"SF"}"#);
+    }
+
+    // -- Mistral streaming tests --
+
+    #[test]
+    fn test_mistral_streaming_no_tools() {
+        let parser = MistralToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let tokens = vec!["Hello", " world", "!"];
+        let mut accumulated = String::new();
+
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            match state.process_delta(&prev, &accumulated, token) {
+                ToolParserDelta::Content(c) => assert_eq!(c, token),
+                other => panic!("Expected Content, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_mistral_streaming_single_tool_v11() {
+        let parser = MistralToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let tokens = vec!["[TOOL_CALLS]", "get_weather", r#"{"city":"#, r#""SF"}"#];
+        let mut accumulated = String::new();
+        let mut got_name = false;
+        let mut args = String::new();
+
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            match state.process_delta(&prev, &accumulated, token) {
+                ToolParserDelta::ToolCalls(calls) => {
+                    for call in &calls {
+                        if let Some(name) = &call.function_name {
+                            got_name = true;
+                            assert_eq!(name, "get_weather");
+                            assert_eq!(call.index, 0);
+                            assert!(call.id.is_some());
+                        }
+                        if let Some(a) = &call.function_arguments {
+                            args.push_str(a);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(got_name, "Should have received function name");
+        assert_eq!(args, r#"{"city":"SF"}"#);
+    }
+
+    #[test]
+    fn test_mistral_streaming_multiple_tools_v11() {
+        let parser = MistralToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let tokens = vec![
+            "[TOOL_CALLS]",
+            "get_weather",
+            r#"{"city":"SF"}"#,
+            "[TOOL_CALLS]",
+            "search",
+            r#"{"q":"rust"}"#,
+        ];
+        let mut accumulated = String::new();
+        let mut names = Vec::new();
+
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            if let ToolParserDelta::ToolCalls(calls) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for call in &calls {
+                    if let Some(name) = &call.function_name {
+                        names.push(name.clone());
+                    }
+                }
+            }
+        }
+
+        assert_eq!(names, vec!["get_weather", "search"]);
+    }
+
+    #[test]
+    fn test_mistral_streaming_content_then_tool() {
+        let parser = MistralToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let tokens = vec!["Sure!", "[TOOL_CALLS]", "f", r#"{"a":1}"#];
+        let mut accumulated = String::new();
+        let mut got_content = false;
+        let mut got_tool = false;
+
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            match state.process_delta(&prev, &accumulated, token) {
+                ToolParserDelta::Content(c) => {
+                    got_content = true;
+                    assert_eq!(c, "Sure!");
+                }
+                ToolParserDelta::ToolCalls(calls) => {
+                    for call in &calls {
+                        if call.function_name.is_some() {
+                            got_tool = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        assert!(got_content);
+        assert!(got_tool);
+    }
+
+    #[test]
+    fn test_mistral_streaming_single_tool_pre_v11() {
+        let parser = MistralToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let tokens = vec![
+            "[TOOL_CALLS]",
+            r#" [{"name"#,
+            r#"": "get_weather", "arguments": {"#,
+            r#""city": "SF""#,
+            "}",
+            "}]",
+        ];
+        let mut accumulated = String::new();
+        let mut got_name = false;
+        let mut got_args = false;
+
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            if let ToolParserDelta::ToolCalls(calls) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for call in &calls {
+                    if let Some(name) = &call.function_name {
+                        got_name = true;
+                        assert_eq!(name, "get_weather");
+                    }
+                    if call.function_arguments.is_some() {
+                        got_args = true;
+                    }
+                }
+            }
+        }
+
+        assert!(got_name, "Should have received function name");
+        assert!(got_args, "Should have received arguments");
+    }
+
+    #[test]
+    fn test_mistral_streaming_multiple_tools_pre_v11() {
+        let parser = MistralToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let tokens = vec![
+            r#"[TOOL_CALLS] [{"name": "f1", "arguments": {"a": 1}}, {"name": "f2", "arguments": {"b": 2}}]"#,
+        ];
+        let mut accumulated = String::new();
+        let mut names = Vec::new();
+
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            if let ToolParserDelta::ToolCalls(calls) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for call in &calls {
+                    if let Some(name) = &call.function_name {
+                        names.push(name.clone());
+                    }
+                }
+            }
+        }
+
+        assert_eq!(names, vec!["f1", "f2"]);
+    }
+
+    #[test]
+    fn test_mistral_streaming_one_chunk_v11() {
+        let parser = MistralToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let full = r#"[TOOL_CALLS]get_weather{"city":"SF"}"#;
+        let mut got_name = false;
+
+        match state.process_delta("", full, full) {
+            ToolParserDelta::ToolCalls(calls) => {
+                for call in &calls {
+                    if let Some(name) = &call.function_name {
+                        got_name = true;
+                        assert_eq!(name, "get_weather");
+                    }
+                }
+            }
+            other => panic!("Expected ToolCalls, got {:?}", other),
+        }
+
+        assert!(got_name);
     }
 }

@@ -68,11 +68,11 @@
 
 | Feature | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| Tensor parallelism (TP) | ✅ | ✅ | CudaWorker: NCCL all-reduce via ThreadPoolExecutor; all dense + MoE archs wired; E2E verified TP=2 Qwen2.5-0.5B + Gemma3-4B on 2x L40S |
+| Tensor parallelism (TP) — single-node | ✅ | ✅ | CudaWorker: NCCL all-reduce via ThreadPoolExecutor; all dense + MoE archs wired; E2E verified TP=2 Qwen2.5-0.5B + Gemma3-4B on 2x L40S |
+| Tensor parallelism (TP) — multi-node | ✅ | ✅ | Rust: TCP rendezvous + NCCL + headless worker mode with bincode control channel |
 | Pipeline parallelism (PP) | ✅ | ❌ |  |
 | Data parallelism (DP) | ✅ | ❌ |  |
 | Expert parallelism (EP) for MoE | ✅ | ❌ | Needed for MoE models where experts are split across GPUs |
-| Multi-node distributed inference | ✅ | ✅ | Rust: TCP rendezvous + NCCL + headless worker mode with bincode control channel |
 | NCCL custom all-reduce | ✅ | ❌ |  |
 | Prefill context parallelism | ✅ | ❌ |  |
 | Decode context parallelism | ✅ | ❌ |  |

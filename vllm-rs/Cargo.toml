@@ -18,6 +18,7 @@ members = [
     "crates/vllm-wgpu",
     "crates/vllm-cuda",
     "crates/vllm-examples",
+    "crates/vllm-page",
 ]
 exclude = []
 

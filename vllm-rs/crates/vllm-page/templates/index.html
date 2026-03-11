@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vllm-rs — High-Performance LLM Inference in Rust</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #121212;
+  --surface: #1e1e1e;
+  --surface-2: #2a2a2a;
+  --surface-3: #333333;
+  --border: #3d3d3d;
+  --border-light: #4a4a4a;
+  --text: #f0f0f0;
+  --text-muted: #b0b0b0;
+  --text-dim: #707070;
+  --accent: #1f78b4;
+  --accent-glow: rgba(31, 120, 180, 0.15);
+  --green: #1f78b4;
+  --green-dim: rgba(31, 120, 180, 0.12);
+  --yellow: #fb9a99;
+  --yellow-dim: rgba(251, 154, 153, 0.2);
+  --red: #e31a1c;
+  --red-dim: rgba(227, 26, 28, 0.1);
+  --purple: #1f78b4;
+  --radius: 12px;
+  --radius-sm: 8px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code { font-family: 'JetBrains Mono', monospace; font-size: 0.85em; background: var(--surface-3); padding: 2px 6px; border-radius: 4px; }
+
+/* Hero */
+.hero {
+  position: relative;
+  padding: 6rem 2rem 5rem;
+  text-align: center;
+  overflow: hidden;
+  background: radial-gradient(ellipse 80% 50% at 50% -20%, rgba(31, 120, 180, 0.08), transparent),
+              var(--bg);
+}
+.hero::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.03'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+  opacity: 1;
+}
+.hero-content { position: relative; z-index: 1; }
+.hero h1 {
+  font-size: 4rem;
+  font-weight: 900;
+  letter-spacing: -2px;
+  margin-bottom: 0.75rem;
+  background: linear-gradient(135deg, #f0f0f0 0%, var(--accent) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.hero .subtitle {
+  font-size: 1.35rem;
+  color: var(--text-muted);
+  max-width: 600px;
+  margin: 0 auto 2rem;
+  font-weight: 400;
+}
+.hero-badges {
+  display: flex;
+  justify-content: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+.hero-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.hero-badge .hb-dot { width: 8px; height: 8px; border-radius: 50%; }
+.hero-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+  max-width: 800px;
+  margin: 2.5rem auto 0;
+  text-align: left;
+}
+.hero-cards .card {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(8px);
+}
+
+/* Nav */
+.nav-bar {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: rgba(18, 18, 18, 0.9);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+  padding: 0 2rem;
+  display: flex;
+  gap: 0;
+}
+.nav-bar a {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  font-weight: 500;
+  padding: 0.85rem 1.25rem;
+  border-bottom: 2px solid transparent;
+  transition: all 0.15s;
+}
+.nav-bar a:hover { color: var(--text); text-decoration: none; }
+.nav-bar a.active { color: var(--accent); border-bottom-color: var(--accent); }
+.nav-bar { border-bottom: 1px solid var(--border); }
+
+.container { max-width: 100%; margin: 0 auto; padding: 3rem 2rem; }
+
+.page { display: none; }
+.page.active { display: block; }
+
+h2 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin-bottom: 1.25rem;
+  letter-spacing: -0.5px;
+}
+h2 a { color: inherit; }
+h2 a:hover { color: var(--accent); text-decoration: none; }
+
+/* Cards */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 3rem;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.card:hover {
+  border-color: var(--border-light);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+}
+.card-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.25rem;
+  margin-bottom: 1rem;
+}
+.card h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+.card p {
+  font-size: 0.875rem;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+/* Overall parity bar */
+.overall-bar {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.75rem 2rem;
+  margin-bottom: 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+}
+.overall-pct {
+  text-align: center;
+  min-width: 90px;
+}
+.overall-pct .num {
+  font-size: 2.75rem;
+  font-weight: 900;
+  letter-spacing: -2px;
+  line-height: 1;
+  background: linear-gradient(135deg, var(--accent), #4a9fd4);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.overall-pct .label { font-size: 0.8rem; color: var(--text-dim); font-weight: 500; text-transform: uppercase; letter-spacing: 1px; margin-top: 4px; }
+.overall-detail { flex: 1; }
+
+/* Progress bar */
+.progress-bar {
+  height: 10px;
+  border-radius: 5px;
+  background: var(--surface-3);
+  overflow: hidden;
+  display: flex;
+}
+.progress-bar .seg-yes { background: var(--green); }
+.progress-bar .seg-partial { background: var(--yellow); }
+.progress-bar .seg-no { background: var(--red); }
+
+.overall-stats {
+  display: flex;
+  gap: 1.5rem;
+  margin-top: 0.75rem;
+  font-size: 0.875rem;
+  color: var(--text-muted);
+  flex-wrap: wrap;
+}
+.overall-stats span { display: flex; align-items: center; gap: 6px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.dot-yes { background: var(--green); }
+.dot-partial { background: var(--yellow); }
+.dot-no { background: var(--red); }
+
+/* Summary grid table */
+.summary-grid-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.summary-grid-table th {
+  background: var(--surface-2);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  font-weight: 600;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.summary-grid-table td {
+  padding: 0;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.summary-grid-table tr:last-child td { border-bottom: none; }
+.summary-grid-table .sg-name {
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 0.3rem 0.75rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.summary-grid-table .sg-name:hover { color: var(--accent); }
+.summary-grid-table .sg-cells { padding: 0.2rem 0.4rem; }
+.sg-cell-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+.sg-cell {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  cursor: pointer;
+  position: relative;
+  transition: transform 0.1s;
+}
+.sg-cell:hover { transform: scale(1.8); z-index: 10; }
+.sg-cell.st-yes { background: var(--green); }
+.sg-cell.st-partial { background: var(--yellow); }
+.sg-cell.st-no { background: var(--red); }
+.sg-cell.st-na { background: var(--surface-3); }
+.sg-cell.st-deprecated { background: var(--surface-3); opacity: 0.4; }
+
+/* Tooltip */
+.sg-tooltip {
+  display: none;
+  position: fixed;
+  background: var(--surface-2);
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.8rem;
+  color: var(--text);
+  max-width: 320px;
+  z-index: 1000;
+  pointer-events: none;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  line-height: 1.4;
+}
+.sg-tooltip.visible { display: block; }
+.sg-tooltip .tt-feature { font-weight: 600; margin-bottom: 4px; }
+.sg-tooltip .tt-status { font-size: 0.75rem; margin-bottom: 2px; }
+.sg-tooltip .tt-notes { font-size: 0.7rem; color: var(--text-muted); }
+
+/* Perf placeholder table reuses same style */
+.summary-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.summary-table th {
+  background: var(--surface-2);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-dim);
+  font-weight: 600;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.summary-table td {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+}
+
+/* Parity detail page */
+.search-box {
+  width: 100%;
+  max-width: 400px;
+  padding: 0.6rem 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 0.95rem;
+  font-family: inherit;
+  margin-bottom: 1.5rem;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.search-box::placeholder { color: var(--text-dim); }
+.search-box:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.section-group { margin-bottom: 1rem; }
+.section-header {
+  background: var(--surface-2);
+  padding: 0.75rem 1.25rem;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  font-weight: 600;
+  font-size: 0.95rem;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  user-select: none;
+  border: 1px solid var(--border);
+  transition: background 0.15s;
+}
+.section-header:hover { background: var(--surface-3); }
+.section-header .chevron { transition: transform 0.2s; font-size: 0.7rem; color: var(--text-dim); }
+.section-header.collapsed .chevron { transform: rotate(-90deg); }
+.section-header .section-count { font-weight: 400; color: var(--text-dim); margin-left: 0.5rem; }
+.section-header .section-parity-mini {
+  display: flex;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--text-muted);
+  margin-left: auto;
+  margin-right: 1rem;
+}
+.section-header .section-parity-mini .sp-yes { color: var(--green); }
+.section-header .section-parity-mini .sp-partial { color: var(--yellow); }
+.section-header .section-parity-mini .sp-no { color: var(--red); }
+
+.section-body {
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  overflow: hidden;
+}
+.section-body.hidden { display: none; }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+th {
+  text-align: left;
+  padding: 0.6rem 1rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+td {
+  padding: 0.55rem 1rem;
+  border-bottom: 1px solid var(--surface-3);
+}
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: rgba(255, 255, 255, 0.03); }
+tr.deprecated td { opacity: 0.4; }
+tr.deprecated td:first-child { text-decoration: line-through; }
+
+.badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 6px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.badge-yes { background: var(--green-dim); color: var(--green); }
+.badge-partial { background: var(--yellow-dim); color: var(--yellow); }
+.badge-no { background: var(--red-dim); color: var(--red); }
+.badge-na { background: var(--surface-3); color: var(--text-dim); }
+
+td.notes-col { font-size: 0.8rem; color: var(--text-dim); max-width: 350px; }
+
+/* Footer */
+.footer {
+  text-align: center;
+  padding: 3rem 2rem;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+  border-top: 1px solid var(--border);
+}
+
+/* Twin tables layout */
+.twin-tables {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  align-items: start;
+  margin-bottom: 3rem;
+}
+.perf-placeholder {
+  text-align: center;
+  color: var(--text-dim);
+  font-style: italic;
+  padding: 2rem 1rem !important;
+}
+
+/* Section dividers */
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1.25rem;
+}
+.section-title h2 { margin-bottom: 0; }
+.section-title .line { flex: 1; height: 1px; background: var(--border); }
+
+/* Responsive */
+@media (max-width: 640px) {
+  .hero h1 { font-size: 2.5rem; }
+  .overall-bar { flex-direction: column; text-align: center; }
+  .overall-stats { justify-content: center; }
+  .card-grid { grid-template-columns: 1fr; }
+  .twin-tables { grid-template-columns: 1fr; }
+  .hero-cards { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<div class="nav-bar">
+  <a href="#/" data-page="main" class="active">Overview</a>
+  <a href="#/parity" data-page="parity">Feature Parity</a>
+</div>
+
+<!-- ==================== MAIN PAGE ==================== -->
+<div id="page-main" class="page active">
+
+<div class="hero">
+  <div class="hero-content">
+    <h1>vllm-rs</h1>
+    <p class="subtitle">High-performance LLM inference, rewritten in Rust. Memory-safe, single-binary, zero Python runtime.</p>
+    <div class="hero-cards">
+      <div class="card">
+        <div class="card-icon" style="background:rgba(89,146,198,0.15);color:var(--accent)">&#9889;</div>
+        <h3>Fast Startup</h3>
+        <p>Native binary starts in milliseconds. No interpreter, no JIT warmup, no import graph to resolve.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon" style="background:rgba(89,146,198,0.15);color:var(--accent)">&#128737;</div>
+        <h3>Memory Safety</h3>
+        <p>Rust's ownership model eliminates data races, use-after-free, and buffer overflows at compile time.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon" style="background:rgba(89,146,198,0.15);color:var(--accent)">&#128230;</div>
+        <h3>Single Binary</h3>
+        <p>One statically-linked executable. No virtualenvs, no pip, no dependency hell. Just <code>./vllm serve</code>.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="container">
+
+  <div class="section-title"><h2><a href="#/parity">Parity with Python vLLM</a></h2><span class="line"></span></div>
+  <div id="overall-summary"></div>
+  <div class="twin-tables">
+    <div class="twin-col">
+      <div id="summary-grid"></div>
+    </div>
+    <div class="twin-col">
+      <div id="perf-grid">
+        <table class="summary-table">
+          <thead><tr><th>Benchmark</th><th>Rust vs Python</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td colspan="3" class="perf-placeholder">Performance benchmarks coming soon</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<!-- ==================== PARITY PAGE ==================== -->
+<div id="page-parity" class="page">
+<div class="container">
+
+  <div class="section-title"><h2>Feature Parity: Rust vs Python vLLM</h2><span class="line"></span></div>
+  <input type="text" class="search-box" id="parity-search" placeholder="Search features, sections, or notes...">
+  <div id="parity-table"></div>
+
+</div>
+</div>
+
+<div class="footer">
+  <a href="https://github.com/vllm-project/vllm">github.com/vllm-project/vllm</a> &middot; vllm-rs
+</div>
+
+<div class="sg-tooltip" id="sg-tooltip">
+  <div class="tt-feature"></div>
+  <div class="tt-status"></div>
+  <div class="tt-notes"></div>
+</div>
+
+<script>
+const ROWS = /*__PARITY_ROWS__*/;
+const SUMMARIES = /*__PARITY_SUMMARIES__*/;
+
+// ---- Routing ----
+function route() {
+  const hash = location.hash || '#/';
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-bar a').forEach(a => a.classList.remove('active'));
+  if (hash === '#/parity') {
+    document.getElementById('page-parity').classList.add('active');
+    document.querySelector('[data-page="parity"]').classList.add('active');
+  } else {
+    document.getElementById('page-main').classList.add('active');
+    document.querySelector('[data-page="main"]').classList.add('active');
+  }
+}
+window.addEventListener('hashchange', route);
+route();
+
+// ---- Overall summary ----
+function renderOverall() {
+  let yes = 0, partial = 0, no = 0;
+  for (const s of Object.values(SUMMARIES)) { yes += s.yes; partial += s.partial; no += s.no; }
+  const total = yes + partial + no;
+  const pct = (total > 0) ? ((yes + partial * 0.5) / total * 100).toFixed(0) : 0;
+  const pctYes = (yes / total * 100).toFixed(1);
+  const pctPartial = (partial / total * 100).toFixed(1);
+  const pctNo = (no / total * 100).toFixed(1);
+  document.getElementById('overall-summary').innerHTML = `
+    <div class="overall-bar">
+      <div class="overall-pct">
+        <div class="num">${pct}%</div>
+        <div class="label">Function Parity</div>
+      </div>
+      <div class="overall-detail">
+        <div class="progress-bar">
+          <div class="seg-yes" style="width:${pctYes}%"></div>
+          <div class="seg-partial" style="width:${pctPartial}%"></div>
+          <div class="seg-no" style="width:${pctNo}%"></div>
+        </div>
+        <div class="overall-stats">
+          <span><span class="dot dot-yes"></span> <strong>${yes}</strong> implemented</span>
+          <span><span class="dot dot-partial"></span> <strong>${partial}</strong> partial</span>
+          <span><span class="dot dot-no"></span> <strong>${no}</strong> not yet</span>
+          <span style="color:var(--text-dim)">${total} total features tracked</span>
+        </div>
+      </div>
+    </div>`;
+}
+renderOverall();
+
+// ---- Summary grid ----
+// Group ROWS by section, preserving order
+const ROWS_BY_SECTION = {};
+for (const row of ROWS) {
+  if (!ROWS_BY_SECTION[row.section]) ROWS_BY_SECTION[row.section] = [];
+  ROWS_BY_SECTION[row.section].push(row);
+}
+
+function statusClass(row) {
+  if ((row.deprecated||'').trim().toLowerCase() === 'yes') return 'st-deprecated';
+  const v = (row.rust||'').trim();
+  if (v === 'yes') return 'st-yes';
+  if (v === 'partial') return 'st-partial';
+  if (v === 'no' || v === '') return 'st-no';
+  return 'st-na';
+}
+
+function statusLabel(row) {
+  const v = (row.rust||'').trim();
+  if (v === 'yes') return 'Implemented';
+  if (v === 'partial') return 'Partial';
+  if (v === 'no' || v === '') return 'Not implemented';
+  if (v === 'na') return 'N/A';
+  return v;
+}
+
+const tooltip = document.getElementById('sg-tooltip');
+let tooltipTimer = null;
+
+function showTooltip(e, row) {
+  clearTimeout(tooltipTimer);
+  const tt = tooltip;
+  tt.querySelector('.tt-feature').textContent = row.feature;
+  tt.querySelector('.tt-status').textContent = statusLabel(row) + (row.python === 'na' ? ' (Rust-only)' : '');
+  tt.querySelector('.tt-notes').textContent = row.notes || '';
+  tt.classList.add('visible');
+  const x = Math.min(e.clientX + 12, window.innerWidth - 340);
+  const y = e.clientY + 16;
+  tt.style.left = x + 'px';
+  tt.style.top = y + 'px';
+}
+
+function hideTooltip() {
+  tooltipTimer = setTimeout(() => tooltip.classList.remove('visible'), 100);
+}
+
+function renderSummary() {
+  const grid = document.getElementById('summary-grid');
+  let trs = '';
+  for (const [section, features] of Object.entries(ROWS_BY_SECTION)) {
+    const esc = section.replace(/'/g, "\\'");
+    let cells = '';
+    features.forEach((row, i) => {
+      const cls = statusClass(row);
+      cells += `<div class="sg-cell ${cls}" data-section="${section}" data-idx="${i}"></div>`;
+    });
+    trs += `<tr>
+      <td class="sg-name" onclick="location.hash='#/parity';setTimeout(()=>highlightSection('${esc}'),100)">${section}</td>
+      <td class="sg-cells"><div class="sg-cell-row">${cells}</div></td>
+    </tr>`;
+  }
+  grid.innerHTML = `<table class="summary-grid-table">
+    <thead><tr><th>Functional Area</th><th>Features</th></tr></thead>
+    <tbody>${trs}</tbody>
+  </table>`;
+
+  // Attach tooltip events
+  grid.querySelectorAll('.sg-cell').forEach(el => {
+    const section = el.dataset.section;
+    const idx = parseInt(el.dataset.idx);
+    const row = ROWS_BY_SECTION[section][idx];
+    el.addEventListener('mouseenter', e => showTooltip(e, row));
+    el.addEventListener('mousemove', e => showTooltip(e, row));
+    el.addEventListener('mouseleave', hideTooltip);
+    el.addEventListener('click', e => {
+      e.stopPropagation();
+      location.hash = '#/parity';
+      setTimeout(() => {
+        highlightSection(section);
+        // Try to highlight specific row
+        const tables = document.querySelectorAll(`[data-section="${section}"] table tbody tr`);
+        if (tables[idx]) {
+          tables[idx].scrollIntoView({ behavior: 'smooth', block: 'center' });
+          tables[idx].style.background = 'var(--accent-glow)';
+          setTimeout(() => tables[idx].style.background = '', 2000);
+        }
+      }, 150);
+    });
+  });
+}
+renderSummary();
+
+// ---- Parity table ----
+function badge(val) {
+  const v = (val || '').trim();
+  if (v === 'yes') return '<span class="badge badge-yes">yes</span>';
+  if (v === 'partial') return '<span class="badge badge-partial">partial</span>';
+  if (v === 'no' || v === '') return '<span class="badge badge-no">no</span>';
+  if (v === 'na') return '<span class="badge badge-na">n/a</span>';
+  return `<span class="badge badge-na">${v}</span>`;
+}
+
+function renderParity(filter) {
+  filter = (filter || '').toLowerCase();
+  const container = document.getElementById('parity-table');
+  const sections = {};
+  for (const row of ROWS) {
+    if (filter && !row.feature.toLowerCase().includes(filter) && !row.section.toLowerCase().includes(filter) && !(row.notes||'').toLowerCase().includes(filter)) continue;
+    if (!sections[row.section]) sections[row.section] = [];
+    sections[row.section].push(row);
+  }
+  let html = '';
+  for (const [section, rows] of Object.entries(sections)) {
+    const count = rows.length;
+    const s = SUMMARIES[section] || {yes:0,partial:0,no:0};
+    html += `<div class="section-group" data-section="${section}">
+      <div class="section-header" onclick="this.classList.toggle('collapsed');this.nextElementSibling.classList.toggle('hidden')">
+        <span>${section}<span class="section-count">(${count})</span></span>
+        <span class="section-parity-mini">
+          <span class="sp-yes">${s.yes}</span>
+          <span class="sp-partial">${s.partial}</span>
+          <span class="sp-no">${s.no}</span>
+        </span>
+        <span class="chevron">&#9660;</span>
+      </div>
+      <div class="section-body">
+        <table>
+          <thead><tr><th style="width:40%">Feature</th><th style="width:10%">Python</th><th style="width:10%">Rust</th><th>Notes</th></tr></thead>
+          <tbody>`;
+    for (const r of rows) {
+      const dep = (r.deprecated||'').trim().toLowerCase() === 'yes';
+      html += `<tr${dep?' class="deprecated"':''}>
+        <td>${r.feature}</td>
+        <td>${badge(r.python)}</td>
+        <td>${badge(r.rust)}</td>
+        <td class="notes-col">${r.notes||''}</td>
+      </tr>`;
+    }
+    html += '</tbody></table></div></div>';
+  }
+  if (!html) html = '<p style="color:var(--text-dim)">No features match your search.</p>';
+  container.innerHTML = html;
+}
+renderParity();
+
+document.getElementById('parity-search').addEventListener('input', function() {
+  renderParity(this.value);
+});
+
+function highlightSection(name) {
+  const el = document.querySelector(`[data-section="${name}"]`);
+  if (el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    el.style.boxShadow = '0 0 0 2px var(--accent), 0 0 20px var(--accent-glow)';
+    setTimeout(() => el.style.boxShadow = '', 2000);
+  }
+}
+</script>
+</body>
+</html>

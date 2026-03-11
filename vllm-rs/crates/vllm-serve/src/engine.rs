@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rayon::prelude::*;
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 #[cfg(feature = "multimodal")]
@@ -42,6 +42,27 @@ use crate::tool_parser::{
 type DetokWork = (Vec<u32>, bool, Option<FinishReason>, IncrementalDetokenizer);
 /// Phase 2 result: (detokenizer, detokenizer_stop_string, delta_text).
 type DetokResult = (IncrementalDetokenizer, Option<String>, Option<String>);
+
+// ---------------------------------------------------------------------------
+// ControlMessage — commands sent to the step loop from HTTP handlers.
+// ---------------------------------------------------------------------------
+
+enum ControlMessage {
+    /// Reset the prefix cache. Returns `true` if successful.
+    ResetPrefixCache(oneshot::Sender<bool>),
+}
+
+/// Bundled arguments for `spawn_step_loop_inner` / `spawn_step_loop_async`.
+struct StepLoopArgs {
+    client: Box<dyn EngineCoreClient + Send>,
+    request_rx: mpsc::UnboundedReceiver<EngineCoreRequest>,
+    embed_rx: mpsc::UnboundedReceiver<EmbedRequest>,
+    control_rx: mpsc::UnboundedReceiver<ControlMessage>,
+    requests: Arc<Mutex<HashMap<String, RequestState>>>,
+    notify: Arc<Notify>,
+    alive: Arc<AtomicBool>,
+    no_progress_timeout: Duration,
+}
 
 // ---------------------------------------------------------------------------
 // RequestState
@@ -165,6 +186,8 @@ pub struct AsyncEngine {
     request_tx: mpsc::UnboundedSender<EngineCoreRequest>,
     /// Channel to send embedding requests to the step loop.
     embed_tx: mpsc::UnboundedSender<EmbedRequest>,
+    /// Channel to send control messages (e.g. reset prefix cache) to the step loop.
+    control_tx: mpsc::UnboundedSender<ControlMessage>,
     /// The engine client + channel receivers, held until `spawn_step_loop`
     /// moves them into the background task. `None` after the loop starts.
     #[allow(clippy::type_complexity)]
@@ -173,6 +196,7 @@ pub struct AsyncEngine {
             Box<dyn EngineCoreClient + Send>,
             mpsc::UnboundedReceiver<EngineCoreRequest>,
             mpsc::UnboundedReceiver<EmbedRequest>,
+            mpsc::UnboundedReceiver<ControlMessage>,
         )>,
     >,
     model_name: String,
@@ -220,12 +244,14 @@ impl AsyncEngine {
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let (embed_tx, embed_rx) = mpsc::unbounded_channel();
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
 
         Self {
             requests: Arc::new(Mutex::new(HashMap::new())),
             request_tx: tx,
             embed_tx,
-            pending_loop: std::sync::Mutex::new(Some((client, rx, embed_rx))),
+            control_tx,
+            pending_loop: std::sync::Mutex::new(Some((client, rx, embed_rx, control_rx))),
             model_name,
             max_model_len,
             notify: Arc::new(Notify::new()),
@@ -252,6 +278,20 @@ impl AsyncEngine {
     /// Whether the engine is in pooling mode.
     pub fn is_pooling(&self) -> bool {
         self.is_pooling
+    }
+
+    /// Reset the prefix cache. Returns `true` if successful, `false` if there
+    /// are running requests blocking the reset.
+    ///
+    /// This sends a control message to the step loop which calls through to the
+    /// engine core client's `reset_prefix_cache`.
+    pub async fn reset_prefix_cache(&self) -> ServeResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlMessage::ResetPrefixCache(tx))
+            .map_err(|_| ServeError::Internal("step loop not running".into()))?;
+        rx.await
+            .map_err(|_| ServeError::Internal("step loop dropped reply".into()))
     }
 
     /// Override the no-progress watchdog timeout (for testing).
@@ -1096,7 +1136,7 @@ impl AsyncEngine {
     ///
     /// Must be called exactly once. Panics if called twice.
     pub fn spawn_step_loop(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let (client, rx, embed_rx) = self
+        let (client, rx, embed_rx, control_rx) = self
             .pending_loop
             .lock()
             .expect("spawn_step_loop lock poisoned")
@@ -1108,41 +1148,46 @@ impl AsyncEngine {
         // sees alive=false before the spawned task starts.
         alive.store(true, Ordering::Release);
 
-        let no_progress_timeout = self.no_progress_timeout;
+        let args = StepLoopArgs {
+            client,
+            request_rx: rx,
+            embed_rx,
+            control_rx,
+            requests: Arc::clone(&self.requests),
+            notify: Arc::clone(&self.notify),
+            alive,
+            no_progress_timeout: self.no_progress_timeout,
+        };
         if self.async_scheduling {
             info!("Async scheduling enabled — overlapping GPU execution with CPU scheduling");
-            Self::spawn_step_loop_async(
-                client,
-                rx,
-                embed_rx,
-                Arc::clone(&self.requests),
-                Arc::clone(&self.notify),
-                alive,
-                no_progress_timeout,
-            )
+            Self::spawn_step_loop_async(args)
         } else {
-            Self::spawn_step_loop_inner(
-                client,
-                rx,
-                embed_rx,
-                Arc::clone(&self.requests),
-                Arc::clone(&self.notify),
-                alive,
-                no_progress_timeout,
-            )
+            Self::spawn_step_loop_inner(args)
+        }
+    }
+
+    /// Handle a control message from the HTTP layer.
+    fn handle_control_message(client: &mut Box<dyn EngineCoreClient + Send>, msg: ControlMessage) {
+        match msg {
+            ControlMessage::ResetPrefixCache(reply) => {
+                let result = client.reset_prefix_cache().unwrap_or(false);
+                let _ = reply.send(result);
+            }
         }
     }
 
     /// Internal: actually spawn the step loop with the client.
-    fn spawn_step_loop_inner(
-        mut client: Box<dyn EngineCoreClient + Send>,
-        mut request_rx: mpsc::UnboundedReceiver<EngineCoreRequest>,
-        mut embed_rx: mpsc::UnboundedReceiver<EmbedRequest>,
-        requests: Arc<Mutex<HashMap<String, RequestState>>>,
-        notify: Arc<Notify>,
-        alive: Arc<AtomicBool>,
-        no_progress_timeout: Duration,
-    ) -> tokio::task::JoinHandle<()> {
+    fn spawn_step_loop_inner(args: StepLoopArgs) -> tokio::task::JoinHandle<()> {
+        let StepLoopArgs {
+            mut client,
+            mut request_rx,
+            mut embed_rx,
+            mut control_rx,
+            requests,
+            notify,
+            alive,
+            no_progress_timeout,
+        } = args;
         tokio::spawn(async move {
             let mut last_progress = Instant::now();
             loop {
@@ -1151,6 +1196,11 @@ impl AsyncEngine {
                     let result =
                         tokio::task::block_in_place(|| client.embed(embed_req.token_id_seqs));
                     let _ = embed_req.reply.send(result.map_err(ServeError::from));
+                }
+
+                // 0b. Drain control messages.
+                while let Ok(msg) = control_rx.try_recv() {
+                    Self::handle_control_message(&mut client, msg);
                 }
 
                 // 1. Drain pending request submissions (non-blocking).
@@ -1188,7 +1238,11 @@ impl AsyncEngine {
                             notify.notify_waiters();
                             continue;
                         }
-                        else => break, // Both channels closed, engine dropped.
+                        Some(msg) = control_rx.recv() => {
+                            Self::handle_control_message(&mut client, msg);
+                            continue;
+                        }
+                        else => break, // All channels closed, engine dropped.
                     }
                 }
 
@@ -1301,15 +1355,17 @@ impl AsyncEngine {
     /// The executor is moved to a dedicated OS thread. The tokio task handles
     /// scheduling, output processing, and request drain concurrently with
     /// GPU execution.
-    fn spawn_step_loop_async(
-        mut client: Box<dyn EngineCoreClient + Send>,
-        mut request_rx: mpsc::UnboundedReceiver<EngineCoreRequest>,
-        mut embed_rx: mpsc::UnboundedReceiver<EmbedRequest>,
-        requests: Arc<Mutex<HashMap<String, RequestState>>>,
-        notify: Arc<Notify>,
-        alive: Arc<AtomicBool>,
-        no_progress_timeout: Duration,
-    ) -> tokio::task::JoinHandle<()> {
+    fn spawn_step_loop_async(args: StepLoopArgs) -> tokio::task::JoinHandle<()> {
+        let StepLoopArgs {
+            mut client,
+            mut request_rx,
+            mut embed_rx,
+            mut control_rx,
+            requests,
+            notify,
+            alive,
+            no_progress_timeout,
+        } = args;
         // Take the executor out of the client for the dedicated thread.
         let executor = client
             .take_executor()
@@ -1362,6 +1418,11 @@ impl AsyncEngine {
                         .await
                         .unwrap_or(Err(ServeError::Internal("embed reply lost".into())));
                     let _ = embed_req.reply.send(result);
+                }
+
+                // 0b. Drain control messages.
+                while let Ok(msg) = control_rx.try_recv() {
+                    Self::handle_control_message(&mut client, msg);
                 }
 
                 // 1. Drain pending request submissions (non-blocking).
@@ -1489,7 +1550,11 @@ impl AsyncEngine {
                                 notify.notify_waiters();
                                 continue;
                             }
-                            else => break, // Both channels closed.
+                            Some(msg) = control_rx.recv() => {
+                                Self::handle_control_message(&mut client, msg);
+                                continue;
+                            }
+                            else => break, // All channels closed.
                         }
                     } else if has_requests && last_progress.elapsed() > no_progress_timeout {
                         // Watchdog: no output tokens for too long with pending
@@ -4257,5 +4322,18 @@ mod tests {
         let result = engine.render_chat_completion(request);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("pooling mode"));
+    }
+
+    #[tokio::test]
+    async fn test_reset_prefix_cache_via_control_channel() {
+        let engine = Arc::new(make_test_engine());
+        engine.spawn_step_loop();
+
+        // No running requests — should succeed.
+        let result = engine.reset_prefix_cache().await.unwrap();
+        assert!(
+            result,
+            "reset_prefix_cache should return true with no running requests"
+        );
     }
 }

@@ -17,7 +17,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -108,6 +108,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
         .route("/health", get(health))
+        .route("/reset_prefix_cache", post(reset_prefix_cache))
         .route("/version", get(version))
         .route("/server_info", get(server_info));
 
@@ -168,6 +169,7 @@ fn log_routes(state: &AppState) {
     info!("Route: /v1/embeddings, Methods: POST");
     info!("Route: /v1/models, Methods: GET");
     info!("Route: /health, Methods: GET");
+    info!("Route: /reset_prefix_cache, Methods: POST");
     info!("Route: /version, Methods: GET");
     info!("Route: /server_info, Methods: GET");
     if state.config.metrics_enabled {
@@ -379,6 +381,23 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<protocol::Model
 /// GET /health
 async fn health() -> Json<protocol::HealthResponse> {
     Json(protocol::HealthResponse { status: "ok" })
+}
+
+/// POST /reset_prefix_cache
+///
+/// Reset the prefix cache. Returns 200 on success.
+/// Query params: `reset_running_requests` (ignored, for Python compat).
+async fn reset_prefix_cache(
+    State(state): State<Arc<AppState>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    info!("Resetting prefix cache...");
+    match state.engine.reset_prefix_cache().await {
+        Ok(_success) => Ok(StatusCode::OK),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to reset prefix cache: {e}"),
+        )),
+    }
 }
 
 /// GET /version
@@ -1667,5 +1686,42 @@ mod tests {
             "actual status: {}",
             response.status()
         );
+    }
+
+    /// Create a test state with the step loop spawned (needed for control messages).
+    fn make_test_state_with_step_loop() -> Arc<AppState> {
+        let state = make_test_state();
+        state.engine.spawn_step_loop();
+        state
+    }
+
+    #[tokio::test]
+    async fn test_reset_prefix_cache_endpoint() {
+        let state = make_test_state_with_step_loop();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/reset_prefix_cache")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_reset_prefix_cache_get_returns_405() {
+        let state = make_test_state_with_step_loop();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/reset_prefix_cache")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 }

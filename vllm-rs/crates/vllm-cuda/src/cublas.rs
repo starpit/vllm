@@ -22,7 +22,7 @@ use cudarc::cublaslt::sys as lt;
 use cudarc::driver::sys::CUstream;
 
 /// cuBLAS workspace size (4 MB — matches Python vLLM).
-const CUBLAS_WORKSPACE_SIZE: usize = 4 * 1024 * 1024;
+const CUBLAS_WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
 
 /// Cache key for a GEMM plan.
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]

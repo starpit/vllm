@@ -4,9 +4,9 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| ✅ 🟦 | Implemented | 145 |
+| ✅ 🟦 | Implemented | 146 |
 | ⚠️ 🟨 | Partial | 3 |
-| ❌ 🟥 | Not implemented | 132 |
+| ❌ 🟥 | Not implemented | 158 |
 
 ---
 
@@ -30,7 +30,7 @@
 | [Attention Backends](#attention-backends) | 🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 3 | 0 | 10 |
 | [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 22 | 0 | 0 |
 | [Structured Output / Guided Decoding](#structured-output--guided-decoding) | 🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥 | 5 | 0 | 5 |
-| [Tool Calling / Function Calling](#tool-calling--function-calling) | 🟦🟦🟦🟦🟦🟦🟦🟦🟥 | 8 | 0 | 1 |
+| [Tool Calling / Function Calling](#tool-calling--function-calling) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 9 | 0 | 27 |
 | [Scheduling](#scheduling) | 🟦🟦🟦🟦🟦🟦🟥 | 6 | 0 | 1 |
 | [KV Cache](#kv-cache) | 🟦🟦🟦🟦🟥🟥🟥🟥 | 4 | 0 | 4 |
 | [LoRA & Adapters](#lora--adapters) | 🟥🟥🟥🟥🟥🟥 | 0 | 0 | 6 |
@@ -42,7 +42,7 @@
 | [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 22 | 0 | 4 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟥 | 6 | 0 | 1 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥 | 7 | 0 | 2 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **145** | **3** | **132** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **146** | **3** | **158** |
 
 ---
 
@@ -327,10 +327,37 @@
 | `auto` / `required` / `none` tool choice | ✅ | ✅ |  |
 | Named tool choice | ✅ | ✅ |  |
 | Parallel tool calls | ✅ | ✅ |  |
-| Hermes tool parser | ✅ | ✅ |  |
-| Llama3 JSON tool parser | ✅ | ✅ |  |
-| Mistral tool parser | ✅ | ✅ | v11+ and pre-v11 formats; auto-detected |
-| 25+ additional model-specific parsers | ✅ | ❌ | DeepSeek, Qwen3, Pythonic, etc. |
+| `hermes` tool parser | ✅ | ✅ |  |
+| `llama3_json` / `llama4_json` tool parser | ✅ | ✅ |  |
+| `mistral` tool parser | ✅ | ✅ | v11+ and pre-v11 formats; auto-detected |
+| `kimi_k2` tool parser | ✅ | ✅ |  |
+| `deepseek_v3` tool parser | ✅ | ❌ | Unicode special-token delimiters + regex |
+| `deepseek_v31` tool parser | ✅ | ❌ | Same as v3 with slightly simpler regex |
+| `deepseek_v32` tool parser | ✅ | ❌ | DSML XML tags + per-parameter type coercion |
+| `granite` tool parser | ✅ | ❌ | `<|tool_call|>` + JSON array + partial_json streaming |
+| `granite-20b-fc` tool parser | ✅ | ❌ | `<function_call>` repeated prefix + sequential JSON objects |
+| `qwen3_coder` tool parser | ✅ | ❌ | XML-like tags (`<tool_call>` `<function=...>` `<parameter=...>`) + type coercion |
+| `qwen3_xml` tool parser | ✅ | ❌ | SAX-style XML parsing via expat; 1318 lines |
+| `pythonic` tool parser | ✅ | ❌ | Python AST parsing (`ast.parse`) for `[func(arg=val)]` syntax |
+| `llama4_pythonic` tool parser | ✅ | ❌ | Python AST parsing + `<|python_start|>` tag |
+| `phi4_mini_json` tool parser | ✅ | ❌ | `functools[...]` regex + JSON; no streaming |
+| `jamba` tool parser | ✅ | ❌ | `<tool_calls>` + JSON array; similar to llama3_json |
+| `internlm` tool parser | ✅ | ❌ | `<|action_start|><|plugin|>` special tokens + partial_json |
+| `xlam` tool parser | ✅ | ❌ | Multi-format detector (JSON / code-block / tool-call tag) |
+| `longcat` tool parser | ✅ | ❌ | Hermes variant with `<longcat_tool_call>` tags |
+| `glm45` tool parser | ✅ | ❌ | `<tool_call>` + arg_key/arg_value tags; incremental string streaming |
+| `glm47` tool parser | ✅ | ❌ | Subclass of glm45 with different regexes |
+| `functiongemma` tool parser | ✅ | ❌ | `<start_function_call>call:name{k:<escape>v}` custom delimiters |
+| `hunyuan_a13b` tool parser | ✅ | ❌ | `<tool_calls>` JSON array with `<think>` region exclusion |
+| `minimax` tool parser | ✅ | ❌ | `<tool_calls>` line-JSON with think-region buffer management |
+| `minimax_m2` tool parser | ✅ | ❌ | Minimax variant |
+| `olmo3` tool parser | ✅ | ❌ | Python AST parsing + XML wrapper + newline-separated calls |
+| `openai` tool parser | ✅ | ❌ | Requires harmony_utils token-ID binary protocol |
+| `seed_oss` tool parser | ✅ | ❌ | `<seed:tool_call>` XML params + think-tag handling |
+| `step3` tool parser | ✅ | ❌ | DeepSeek-style special tokens + steptml XML |
+| `step3p5` tool parser | ✅ | ❌ | SAX-style XML parsing via expat; 1526 lines |
+| `ernie45` tool parser | ✅ | ❌ | `<tool_call>{JSON}</tool_call>` regex + buffer-emit |
+| `gigachat3` tool parser | ✅ | ❌ | `function call{JSON}` regex + string diff |
 | Reasoning parsers (strip CoT tokens) | ✅ | ✅ | DeepSeek-R1, Qwen3; --reasoning-parser CLI arg; streaming + non-streaming |
 
 ---

@@ -19,6 +19,7 @@ members = [
     "crates/vllm-cuda",
     "crates/vllm-examples",
     "crates/vllm-page",
+    "crates/vllm-gce",
 ]
 exclude = []
 
@@ -68,6 +69,7 @@ prometheus = "0.13"
 # Error handling
 thiserror = "2"
 anyhow = "1"
+dotenvy = "0.15"
 
 # System info
 libc = "0.2"
@@ -148,6 +150,7 @@ vllm-e2e = { path = "crates/vllm-e2e" }
 vllm-wgpu = { path = "crates/vllm-wgpu" }
 vllm-cuda = { path = "crates/vllm-cuda" }
 vllm-examples = { path = "crates/vllm-examples" }
+vllm-gce = { path = "crates/vllm-gce" }
 
 # WebGPU
 wgpu = { version = "24", features = ["wgsl"] }

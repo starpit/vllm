@@ -35,6 +35,9 @@ pub enum Commands {
     Chat(ChatArgs),
     /// Collect and print environment information for bug reports.
     CollectEnv(CollectEnvArgs),
+    /// Manage GCE GPU VM instances.
+    #[cfg(feature = "gce")]
+    Gce(GceCommand),
     /// Generate text completions via the running API server.
     Complete(CompleteArgs),
     /// Convert model weights between formats (stub).
@@ -438,6 +441,120 @@ pub struct ConvertArgs {
     /// Target dtype.
     #[arg(long, default_value = "f16")]
     pub dtype: String,
+}
+
+#[cfg(feature = "gce")]
+/// GCE subcommands: `vllm gce up` / `vllm gce down`.
+#[derive(Parser, Debug)]
+pub struct GceCommand {
+    #[command(subcommand)]
+    pub command: GceSubcommand,
+}
+
+#[cfg(feature = "gce")]
+#[derive(Subcommand, Debug)]
+pub enum GceSubcommand {
+    /// Provision a GCE VM with GPUs.
+    Up(Box<GceUpArgs>),
+    /// Tear down a GCE VM.
+    Down(GceDownArgs),
+}
+
+#[cfg(feature = "gce")]
+/// Arguments for `vllm gce up`.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm gce up <NAME> [OPTIONS]")]
+pub struct GceUpArgs {
+    /// Instance name (used for both creation and teardown).
+    pub name: String,
+
+    /// Number of nodes (currently only 1 supported).
+    #[arg(short = 'n', long, default_value_t = 1)]
+    pub nodes: u32,
+
+    /// Number of GPUs per node.
+    #[arg(short = 'c', long, default_value_t = 1)]
+    pub gpu_count: u32,
+
+    /// GPU class: "l40s", "a100-40", "a100-80", "h100".
+    #[arg(short = 'k', long, default_value = "l40s")]
+    pub gpu_class: String,
+
+    /// Local directory to transfer and build on the VM (dev mode).
+    #[arg(long)]
+    pub dev: Option<String>,
+
+    /// Local port for SSH tunnel to remote port 8000.
+    #[arg(short = 'p', long, default_value_t = 8000)]
+    pub local_port: u16,
+
+    /// GCE boot image family.
+    #[arg(
+        long,
+        default_value = "projects/ubuntu-os-accelerator-images/global/images/ubuntu-accelerator-2404-amd64-with-nvidia-580-v20260225"
+    )]
+    pub image: String,
+
+    /// GCE zone.
+    #[arg(long, default_value = "us-central1-a")]
+    pub zone: String,
+
+    /// GCE project.
+    #[arg(long, env = "GCP_PROJECT")]
+    pub project: Option<String>,
+
+    /// Path to GCP service account credentials JSON.
+    #[arg(long, env = "GOOGLE_APPLICATION_CREDENTIALS")]
+    pub gcp_credentials: Option<String>,
+
+    /// GCP service account email to assign to the instance.
+    /// Only set this if the SA key has iam.serviceAccountUser on itself.
+    #[arg(long)]
+    pub gcp_service_account: Option<String>,
+
+    /// HuggingFace token (passed to the VM for model downloads).
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Use preemptible/SPOT VMs (cheaper but may be preempted).
+    #[arg(short = 'P', long)]
+    pub preemptible: bool,
+
+    /// GCS bucket for sccache shared cache.
+    #[arg(long, env = "SCCACHE_GCS_BUCKET")]
+    pub sccache_gcs_bucket: Option<String>,
+
+    /// GCS key prefix for sccache shared cache (default: vllm-rs-dev-$USER).
+    #[arg(long, env = "SCCACHE_GCS_KEY_PREFIX")]
+    pub sccache_gcs_key_prefix: Option<String>,
+
+    /// Model to serve: HuggingFace model ID or path (required).
+    #[arg(short = 'm', long)]
+    pub model: String,
+
+    /// Extra arguments passed to `vllm serve` on the remote VM (after `--`).
+    #[arg(last = true)]
+    pub serve_args: Vec<String>,
+}
+
+#[cfg(feature = "gce")]
+/// Arguments for `vllm gce down`.
+#[derive(Parser, Debug)]
+pub struct GceDownArgs {
+    /// Instance name to delete.
+    pub name: String,
+
+    /// GCE zone.
+    #[arg(long, default_value = "us-central1-a")]
+    pub zone: String,
+
+    /// GCE project.
+    #[arg(long, env = "GCP_PROJECT")]
+    pub project: Option<String>,
+
+    /// Force deletion (treat not-found as success, skip confirmation).
+    #[arg(short = 'f', long)]
+    pub force: bool,
 }
 
 /// Arguments for the `top` subcommand.

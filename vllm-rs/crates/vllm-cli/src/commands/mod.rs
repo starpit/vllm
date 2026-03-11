@@ -9,6 +9,8 @@ pub mod bench;
 pub mod chat;
 pub mod collect_env;
 pub mod convert;
+#[cfg(feature = "gce")]
+pub mod gce;
 pub mod serve;
 #[cfg(feature = "top")]
 pub mod top;

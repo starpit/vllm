@@ -22,8 +22,8 @@
   --accent-glow: rgba(31, 120, 180, 0.15);
   --green: #1f78b4;
   --green-dim: rgba(31, 120, 180, 0.12);
-  --yellow: #fb9a99;
-  --yellow-dim: rgba(251, 154, 153, 0.2);
+  --yellow: #a6cee3;
+  --yellow-dim: rgba(166, 206, 227, 0.2);
   --red: #e31a1c;
   --red-dim: rgba(227, 26, 28, 0.1);
   --purple: #1f78b4;
@@ -273,6 +273,7 @@ h2 a:hover { color: var(--accent); text-decoration: none; }
   white-space: nowrap;
   cursor: pointer;
 }
+.summary-grid-table .sg-done { text-align: center; width: 2rem; padding: 0.3rem 0; }
 .summary-grid-table .sg-name:hover { color: var(--accent); }
 .summary-grid-table .sg-cells { padding: 0.2rem 0.4rem; }
 .sg-cell-row {
@@ -686,17 +687,21 @@ function renderSummary() {
   for (const [section, features] of Object.entries(ROWS_BY_SECTION)) {
     const esc = section.replace(/'/g, "\\'");
     let cells = '';
+    const done = features.every(r => (r.rust||'').trim() === 'yes' || (r.deprecated||'').trim().toLowerCase() === 'yes');
     features.forEach((row, i) => {
       const cls = statusClass(row);
       cells += `<div class="sg-cell ${cls}" data-section="${section}" data-idx="${i}"></div>`;
     });
+    const nameStyle = done ? ' style="text-decoration:line-through;opacity:0.7"' : '';
+    const check = done ? '<span style="color:var(--green);font-size:1.1rem">&#10003;</span>' : '';
     trs += `<tr>
-      <td class="sg-name" onclick="location.hash='#/parity';setTimeout(()=>highlightSection('${esc}'),100)">${section}</td>
+      <td class="sg-done">${check}</td>
+      <td class="sg-name"${nameStyle} onclick="location.hash='#/parity';setTimeout(()=>highlightSection('${esc}'),100)">${section}</td>
       <td class="sg-cells"><div class="sg-cell-row">${cells}</div></td>
     </tr>`;
   }
   grid.innerHTML = `<table class="summary-grid-table">
-    <thead><tr><th>Functional Area</th><th>Features</th></tr></thead>
+    <thead><tr><th style="width:2rem"></th><th>Functional Area</th><th>Features</th></tr></thead>
     <tbody>${trs}</tbody>
   </table>`;
 

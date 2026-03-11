@@ -879,6 +879,28 @@ pub struct RenderEnginePrompt {
 /// Matches Python vLLM's return format exactly.
 pub type ChatCompletionRenderResponse = (Vec<serde_json::Value>, Vec<RenderEnginePrompt>);
 
+/// Query parameters for `GET /server_info`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerInfoParams {
+    /// `"text"` (default) returns `vllm_config` as a human-readable string.
+    /// `"json"` returns it as a structured JSON object.
+    pub config_format: Option<String>,
+}
+
+/// Response for `GET /server_info`.
+///
+/// Mirrors Python vLLM's `/server_info` endpoint with three top-level keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerInfoResponse {
+    /// The VllmConfig used to initialize the stack.
+    /// String when `config_format=text`, structured JSON when `config_format=json`.
+    pub vllm_config: serde_json::Value,
+    /// VLLM_* environment variables (secrets filtered out).
+    pub vllm_env: serde_json::Value,
+    /// Basic system information (OS, version, etc.).
+    pub system_env: serde_json::Value,
+}
+
 /// JSON stats response for the `/stats` endpoint (used by `vllm top`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsResponse {

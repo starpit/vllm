@@ -7,7 +7,8 @@ use anyhow::{Context, Result, bail};
 use vllm_serve::protocol::{
     ChatCompletionRenderResponse, ChatCompletionRequest, ChatCompletionResponse,
     ChatCompletionStreamResponse, CompletionRequest, CompletionResponse, DetokenizeRequest,
-    DetokenizeResponse, ModelList, TokenizeRequest, TokenizeResponse, VersionResponse,
+    DetokenizeResponse, ModelList, ServerInfoResponse, TokenizeRequest, TokenizeResponse,
+    VersionResponse,
 };
 
 /// A thin HTTP client for talking to a running vLLM server.
@@ -45,6 +46,23 @@ impl Client {
         resp.json()
             .await
             .context("failed to parse version response")
+    }
+
+    /// GET /server_info — returns server configuration, env vars, and system info.
+    pub async fn server_info(&self, config_format: Option<&str>) -> Result<ServerInfoResponse> {
+        let mut url = format!("{}/server_info", self.base_url);
+        if let Some(fmt) = config_format {
+            url.push_str(&format!("?config_format={fmt}"));
+        }
+        let resp = self.inner.get(&url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("server_info failed with status {status}: {body}");
+        }
+        resp.json()
+            .await
+            .context("failed to parse server_info response")
     }
 
     /// GET /v1/models — list available models.

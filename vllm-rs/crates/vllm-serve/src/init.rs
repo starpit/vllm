@@ -33,6 +33,7 @@ use candle_core::DType;
 /// Configuration for initializing the vLLM inference stack.
 ///
 /// This is the programmatic API — no CLI dependency needed.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct VllmConfig {
     /// Model path or HuggingFace model ID (required).
     pub model: String,
@@ -48,7 +49,8 @@ pub struct VllmConfig {
     pub block_size: usize,
     /// Fraction of GPU memory to use for KV cache (0.0–1.0).
     pub gpu_memory_utilization: f64,
-    /// HuggingFace token for gated models.
+    /// HuggingFace token for gated models (excluded from serialization).
+    #[serde(skip_serializing)]
     pub hf_token: Option<String>,
     /// Specific GGUF filename to download from a HuggingFace repo.
     pub gguf_file: Option<String>,

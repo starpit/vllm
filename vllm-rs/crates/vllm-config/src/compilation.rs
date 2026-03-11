@@ -6,7 +6,7 @@
 /// When enabled, the engine captures CUDA graphs for decode steps at
 /// power-of-2 batch sizes and replays them instead of launching individual
 /// kernels. This eliminates per-kernel launch overhead (~1-3ms per step).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CudaGraphConfig {
     /// Whether CUDA graphs are enabled. Default: true on CUDA.
     pub enabled: bool,

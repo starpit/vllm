@@ -123,6 +123,9 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         cublas_autotune: args.cublas_autotune,
     };
 
+    // Keep a clone for /server_info (before we move config into the blocking task).
+    let vllm_config_snapshot = config.clone();
+
     let mut stack = tokio::task::spawn_blocking(move || initialize_stack(&config))
         .await
         .expect("initialize_stack panicked")?;
@@ -159,6 +162,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         engine: stack.engine,
         config: server_config,
         is_pooling,
+        vllm_config: Some(vllm_config_snapshot),
     });
     vllm_serve::server::serve(app_state)
         .await

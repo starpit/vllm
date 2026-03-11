@@ -16,7 +16,7 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -88,6 +88,8 @@ pub struct AppState {
     pub config: ServerConfig,
     /// Whether the server is in pooling mode.
     pub is_pooling: bool,
+    /// The VllmConfig used to initialize the stack (for `/server_info`).
+    pub vllm_config: Option<crate::init::VllmConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +108,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/tokenize", post(tokenize))
         .route("/detokenize", post(detokenize))
         .route("/health", get(health))
-        .route("/version", get(version));
+        .route("/version", get(version))
+        .route("/server_info", get(server_info));
 
     #[cfg(feature = "metrics")]
     if state.config.metrics_enabled {
@@ -166,6 +169,7 @@ fn log_routes(state: &AppState) {
     info!("Route: /v1/models, Methods: GET");
     info!("Route: /health, Methods: GET");
     info!("Route: /version, Methods: GET");
+    info!("Route: /server_info, Methods: GET");
     if state.config.metrics_enabled {
         info!("Route: /metrics, Methods: GET");
         #[cfg(feature = "top")]
@@ -381,6 +385,64 @@ async fn health() -> Json<protocol::HealthResponse> {
 async fn version(State(state): State<Arc<AppState>>) -> Json<protocol::VersionResponse> {
     Json(protocol::VersionResponse {
         version: state.config.version.clone(),
+    })
+}
+
+/// GET /server_info — return server configuration, environment variables, and system info.
+///
+/// Mirrors Python vLLM's `/server_info` endpoint. Accepts an optional
+/// `?config_format=text|json` query parameter (default: `"text"`).
+async fn server_info(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<protocol::ServerInfoParams>,
+) -> Json<protocol::ServerInfoResponse> {
+    // vllm_config: either a human-readable string or structured JSON.
+    let vllm_config = match state.vllm_config {
+        Some(ref cfg) => match params.config_format.as_deref().unwrap_or("text") {
+            "json" => serde_json::to_value(cfg).unwrap_or(serde_json::Value::Null),
+            _ => serde_json::Value::String(format!("{cfg:#?}")),
+        },
+        None => serde_json::Value::Null,
+    };
+
+    // vllm_env: collect VLLM_* env vars, excluding secrets.
+    let vllm_env = {
+        let secret_terms = ["secret", "token", "api", "access", "password", "key"];
+        let mut map = serde_json::Map::new();
+        for (k, v) in std::env::vars() {
+            if !k.starts_with("VLLM_") {
+                continue;
+            }
+            if secret_terms.iter().any(|t| k.to_lowercase().contains(t)) {
+                continue;
+            }
+            map.insert(k, serde_json::Value::String(v));
+        }
+        serde_json::Value::Object(map)
+    };
+
+    // system_env: basic system info (matches collect-env output fields).
+    let system_env = {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "os".to_string(),
+            serde_json::Value::String(format!(
+                "{} ({})",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )),
+        );
+        map.insert(
+            "vllm_version".to_string(),
+            serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+        );
+        serde_json::Value::Object(map)
+    };
+
+    Json(protocol::ServerInfoResponse {
+        vllm_config,
+        vllm_env,
+        system_env,
     })
 }
 
@@ -820,6 +882,7 @@ mod tests {
             engine,
             config: ServerConfig::default(),
             is_pooling: false,
+            vllm_config: None,
         })
     }
 
@@ -857,6 +920,147 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let parsed: protocol::VersionResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed.version, "0.1.0-rust");
+    }
+
+    #[tokio::test]
+    async fn test_server_info_text_format() {
+        let state = make_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .uri("/server_info")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: protocol::ServerInfoResponse = serde_json::from_slice(&body).unwrap();
+
+        // vllm_config is null when no config is provided (test state has None).
+        assert!(parsed.vllm_config.is_null());
+        // vllm_env should be an object.
+        assert!(parsed.vllm_env.is_object());
+        // system_env should contain os and vllm_version.
+        let sys = parsed.system_env.as_object().unwrap();
+        assert!(sys.contains_key("os"));
+        assert!(sys.contains_key("vllm_version"));
+    }
+
+    fn make_test_state_with_config() -> Arc<AppState> {
+        use crate::init::VllmConfig;
+
+        let engine_config = EngineCoreConfig {
+            scheduler_config: SchedulerConfig {
+                max_num_batched_tokens: 8192,
+                max_num_seqs: 256,
+                max_num_scheduled_tokens: None,
+                policy: SchedulerPolicy::Fcfs,
+                enable_chunked_prefill: true,
+                long_prefill_token_threshold: 0,
+                ..Default::default()
+            },
+            max_model_len: 4096,
+            num_gpu_blocks: 1024,
+            block_size: 16,
+            engine_index: 0,
+            async_scheduling: false,
+            use_spec_decode: false,
+            ngram_proposer_config: None,
+            eos_token_ids: vec![],
+            is_pooling: false,
+            enable_prefix_caching: false,
+        };
+        let executor = Box::new(NoopExecutor::new(1024));
+        let client = Box::new(InprocClient::new(engine_config, executor));
+        let engine = Arc::new(AsyncEngine::new(client, "test-model".to_string(), 4096));
+
+        Arc::new(AppState {
+            engine,
+            config: ServerConfig::default(),
+            is_pooling: false,
+            vllm_config: Some(VllmConfig {
+                model: "test-model".to_string(),
+                ..VllmConfig::default()
+            }),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_server_info_with_config_text() {
+        let state = make_test_state_with_config();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .uri("/server_info")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: protocol::ServerInfoResponse = serde_json::from_slice(&body).unwrap();
+        // Text format (default): vllm_config should be a debug string.
+        assert!(parsed.vllm_config.is_string());
+        assert!(parsed.vllm_config.as_str().unwrap().contains("test-model"));
+    }
+
+    #[tokio::test]
+    async fn test_server_info_with_config_json() {
+        let state = make_test_state_with_config();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .uri("/server_info?config_format=json")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: protocol::ServerInfoResponse = serde_json::from_slice(&body).unwrap();
+        // JSON format: vllm_config should be a structured object.
+        assert!(parsed.vllm_config.is_object());
+        assert_eq!(parsed.vllm_config["model"], "test-model");
+        // hf_token should NOT appear (skip_serializing).
+        assert!(parsed.vllm_config.get("hf_token").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_server_info_env_filters_secrets() {
+        // Set a secret and a visible VLLM_ var.
+        unsafe {
+            std::env::set_var("VLLM_TEST_API_KEY_X", "secret-value");
+            std::env::set_var("VLLM_TEST_NORMAL_VAR", "visible");
+        }
+
+        let state = make_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .uri("/server_info")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: protocol::ServerInfoResponse = serde_json::from_slice(&body).unwrap();
+
+        let env_obj = parsed.vllm_env.as_object().unwrap();
+        assert!(
+            !env_obj.contains_key("VLLM_TEST_API_KEY_X"),
+            "secrets should be filtered"
+        );
+        assert_eq!(
+            env_obj.get("VLLM_TEST_NORMAL_VAR").and_then(|v| v.as_str()),
+            Some("visible"),
+            "non-secret VLLM_ vars should be present"
+        );
+
+        unsafe {
+            std::env::remove_var("VLLM_TEST_API_KEY_X");
+            std::env::remove_var("VLLM_TEST_NORMAL_VAR");
+        }
     }
 
     #[tokio::test]
@@ -969,6 +1173,7 @@ mod tests {
                 ..ServerConfig::default()
             },
             is_pooling: false,
+            vllm_config: None,
         })
     }
 
@@ -1156,6 +1361,7 @@ mod tests {
                 ..ServerConfig::default()
             },
             is_pooling: false,
+            vllm_config: None,
         })
     }
 
@@ -1331,6 +1537,7 @@ mod tests {
             engine,
             config: ServerConfig::default(),
             is_pooling: true,
+            vllm_config: None,
         })
     }
 

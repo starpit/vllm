@@ -389,6 +389,7 @@ impl TestServerBuilder {
             engine: stack.engine,
             config: server_config,
             is_pooling,
+            vllm_config: None,
         });
 
         // Spawn the HTTP server on a background task.

@@ -293,7 +293,15 @@ h2 a:hover { color: var(--accent); text-decoration: none; }
 .sg-cell.st-partial { background: var(--yellow); }
 .sg-cell.st-no { background: var(--red); }
 .sg-cell.st-na { background: var(--surface-3); }
-.sg-cell.st-deprecated { background: var(--surface-3); opacity: 0.4; }
+.sg-cell.st-deprecated {
+  background: repeating-linear-gradient(
+    -45deg,
+    var(--text-dim) 0px,
+    var(--text-dim) 2px,
+    var(--text-muted) 2px,
+    var(--text-muted) 4px
+  );
+}
 
 /* Tooltip */
 .sg-tooltip {
@@ -312,8 +320,10 @@ h2 a:hover { color: var(--accent); text-decoration: none; }
   line-height: 1.4;
 }
 .sg-tooltip.visible { display: block; }
-.sg-tooltip .tt-feature { font-weight: 600; margin-bottom: 4px; }
-.sg-tooltip .tt-status { font-size: 0.75rem; margin-bottom: 2px; }
+.sg-tooltip .tt-header { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.sg-tooltip .tt-dot { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.sg-tooltip .tt-status-label { font-size: 0.75rem; font-weight: 600; }
+.sg-tooltip .tt-feature { font-weight: 500; margin-bottom: 2px; }
 .sg-tooltip .tt-notes { font-size: 0.7rem; color: var(--text-muted); }
 
 /* Perf placeholder table reuses same style */
@@ -556,8 +566,8 @@ td.notes-col { font-size: 0.8rem; color: var(--text-dim); max-width: 350px; }
 </div>
 
 <div class="sg-tooltip" id="sg-tooltip">
+  <div class="tt-header"><div class="tt-dot"></div><div class="tt-status-label"></div></div>
   <div class="tt-feature"></div>
-  <div class="tt-status"></div>
   <div class="tt-notes"></div>
 </div>
 
@@ -631,6 +641,7 @@ function statusClass(row) {
 }
 
 function statusLabel(row) {
+  if ((row.deprecated||'').trim().toLowerCase() === 'yes') return 'Deprecated Feature';
   const v = (row.rust||'').trim();
   if (v === 'yes') return 'Implemented';
   if (v === 'partial') return 'Partial';
@@ -642,11 +653,21 @@ function statusLabel(row) {
 const tooltip = document.getElementById('sg-tooltip');
 let tooltipTimer = null;
 
+function statusColor(row) {
+  if ((row.deprecated||'').trim().toLowerCase() === 'yes') return 'repeating-linear-gradient(-45deg, var(--text-dim) 0px, var(--text-dim) 2px, var(--text-muted) 2px, var(--text-muted) 4px)';
+  const v = (row.rust||'').trim();
+  if (v === 'yes') return 'var(--green)';
+  if (v === 'partial') return 'var(--yellow)';
+  return 'var(--red)';
+}
+
 function showTooltip(e, row) {
   clearTimeout(tooltipTimer);
   const tt = tooltip;
+  const dot = tt.querySelector('.tt-dot');
+  dot.style.background = statusColor(row);
+  tt.querySelector('.tt-status-label').textContent = statusLabel(row) + (row.python === 'na' ? ' (Rust-only)' : '');
   tt.querySelector('.tt-feature').textContent = row.feature;
-  tt.querySelector('.tt-status').textContent = statusLabel(row) + (row.python === 'na' ? ' (Rust-only)' : '');
   tt.querySelector('.tt-notes').textContent = row.notes || '';
   tt.classList.add('visible');
   const x = Math.min(e.clientX + 12, window.innerWidth - 340);

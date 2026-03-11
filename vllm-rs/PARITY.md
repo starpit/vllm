@@ -1,12 +1,12 @@
 # vLLM Feature Parity: Python vs Rust
 
-> Last updated: 2026-03-05
+> Last updated: 2026-03-11
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| ✅ 🟦 | Implemented | 136 |
-| ⚠️ 🟨 | Partial | 0 |
-| ❌ 🟥 | Not implemented | 128 |
+| ✅ 🟦 | Implemented | 140 |
+| ⚠️ 🟨 | Partial | 3 |
+| ❌ 🟥 | Not implemented | 136 |
 
 ---
 
@@ -16,33 +16,33 @@
 
 | Section | Parity | ✅ | ⚠️ | ❌ |
 |---|---|---:|---:|---:|
-| [Hardware Platforms](#hardware-platforms) | 🟦🟦🟦🟥🟥🟥🟥🟥🟥 | 3 | 0 | 6 |
+| [Hardware Platforms](#hardware-platforms) | 🟦🟦🟥🟥🟥🟥🟥🟥🟥 | 2 | 0 | 7 |
 | [Multi-GPU & Distribution](#multi-gpu--distribution) | 🟦🟦🟥🟥🟥🟥🟥🟥🟥 | 2 | 0 | 7 |
 | [CLI Commands](#cli-commands) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 10 | 0 | 0 |
 | [OpenAI-Compatible API Endpoints](#openai-compatible-api-endpoints) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 9 | 0 | 4 |
 | [Other API Protocols](#other-api-protocols) | 🟥🟥🟥🟥🟥🟥🟥 | 0 | 0 | 7 |
-| [Model Architectures — Decoder-Only LLMs](#model-architectures--decoder-only-llms) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 15 | 0 | 20 |
+| [Model Architectures — Decoder-Only LLMs](#model-architectures--decoder-only-llms) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 13 | 2 | 20 |
 | [Model Architectures — Encoder / Embedding](#model-architectures--encoder--embedding) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
-| [Model Architectures — Vision-Language / Multimodal](#model-architectures--vision-language--multimodal) | 🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 2 | 0 | 9 |
+| [Model Architectures — Vision-Language / Multimodal](#model-architectures--vision-language--multimodal) | 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 0 | 0 | 11 |
 | [Model Architectures — Audio / Speech](#model-architectures--audio--speech) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
 | [Model Architectures — Speculative Decoding Draft Models](#model-architectures--speculative-decoding-draft-models) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
-| [Quantization Methods](#quantization-methods) | 🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥 | 5 | 0 | 7 |
-| [Attention Backends](#attention-backends) | 🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥 | 5 | 0 | 8 |
-| [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥 | 21 | 0 | 1 |
+| [Quantization Methods](#quantization-methods) | 🟦🟦🟦🟦🟨🟥🟥🟥🟥🟥🟥🟥🟥 | 4 | 1 | 8 |
+| [Attention Backends](#attention-backends) | 🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 3 | 0 | 10 |
+| [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 22 | 0 | 0 |
 | [Structured Output / Guided Decoding](#structured-output--guided-decoding) | 🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥 | 5 | 0 | 5 |
 | [Tool Calling / Function Calling](#tool-calling--function-calling) | 🟦🟦🟦🟦🟦🟦🟥🟥 | 6 | 0 | 2 |
 | [Scheduling](#scheduling) | 🟦🟦🟦🟦🟦🟦🟥 | 6 | 0 | 1 |
 | [KV Cache](#kv-cache) | 🟦🟦🟦🟦🟥🟥🟥🟥 | 4 | 0 | 4 |
-| [LoRA & Adapters](#lora--adapters) | 🟦🟦🟥🟥🟥🟥 | 2 | 0 | 4 |
-| [Speculative Decoding](#speculative-decoding) | 🟦🟥🟥🟥🟥🟥 | 1 | 0 | 5 |
-| [Multimodal Input](#multimodal-input) | 🟦🟥🟥🟥🟥 | 1 | 0 | 4 |
+| [LoRA & Adapters](#lora--adapters) | 🟥🟥🟥🟥🟥🟥 | 0 | 0 | 6 |
+| [Speculative Decoding](#speculative-decoding) | 🟥🟥🟥🟥🟥🟥 | 0 | 0 | 6 |
+| [Multimodal Input](#multimodal-input) | 🟥🟥🟥🟥🟥 | 0 | 0 | 5 |
 | [Embeddings & Pooling](#embeddings--pooling) | 🟦🟦🟦🟦🟥🟥🟥 | 4 | 0 | 3 |
 | [Serving Features](#serving-features) | 🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥 | 6 | 0 | 7 |
-| [Performance Optimizations](#performance-optimizations) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 7 | 0 | 4 |
-| [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥 | 9 | 0 | 5 |
+| [Performance Optimizations](#performance-optimizations) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 9 | 0 | 4 |
+| [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 22 | 0 | 4 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟥 | 6 | 0 | 1 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥 | 7 | 0 | 2 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **136** | **0** | **128** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **140** | **3** | **136** |
 
 ---
 
@@ -50,8 +50,8 @@
 
 | Feature | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| CPU inference | ✅ | ✅ | Rust uses candle; Python uses PyTorch CPU |
-| NVIDIA CUDA | ✅ | ✅ | Rust verified on L40S (SM89) |
+| CPU inference | ✅ | ❌ | Removed with CandleWorker; requires CUDA or Metal |
+| NVIDIA CUDA | ✅ | ✅ | CudaWorker verified on L40S (SM89) |
 | Apple Metal (MLX) | ❌ | ✅ | Rust-only; `--features metal` via mlx-rs |
 | WebGPU (wgpu) | ❌ | ✅ | Rust-only; `--features wgpu` via wgpu-rs (Metal/Vulkan/DX12); ~51 tok/s Qwen2.5-0.5B on M1 Max |
 | AMD ROCm / HIP | ✅ | ❌ |  |
@@ -60,7 +60,7 @@
 | AWS Neuron / Inferentia | ✅ | ❌ | Via plugin |
 | Intel OpenVINO | ✅ | ❌ | Via plugin |
 | Habana Gaudi (HPU) | ✅ | ❌ | Via plugin |
-| Device auto-detection | ✅ | ✅ | Rust: Metal > CUDA > wgpu > CPU |
+| Device auto-detection | ✅ | ✅ | Rust: Metal > CUDA > wgpu (no CPU fallback) |
 
 ---
 
@@ -68,10 +68,10 @@
 
 | Feature | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| Tensor parallelism (TP) | ✅ | ✅ | Rust: NCCL all-reduce wired via ThreadPoolExecutor; verified Qwen2.5-14B TP=2 on 2x L40S |
+| Tensor parallelism (TP) | ✅ | ✅ | CudaWorker: NCCL all-reduce via ThreadPoolExecutor; all dense + MoE archs wired; E2E verified TP=2 Qwen2.5-0.5B + Gemma3-4B on 2x L40S |
 | Pipeline parallelism (PP) | ✅ | ❌ |  |
 | Data parallelism (DP) | ✅ | ❌ |  |
-| Expert parallelism (EP) for MoE | ✅ | ❌ |  |
+| Expert parallelism (EP) for MoE | ✅ | ❌ | Needed for MoE models where experts are split across GPUs |
 | Multi-node distributed inference | ✅ | ✅ | Rust: TCP rendezvous + NCCL + headless worker mode with bincode control channel |
 | NCCL custom all-reduce | ✅ | ❌ |  |
 | Prefill context parallelism | ✅ | ❌ |  |
@@ -141,20 +141,20 @@
 | Architecture | Python | Rust (Candle) | Rust (MLX) | Notes |
 |---|:---:|:---:|:---:|---|
 | LLaMA / LLaMA 2 / LLaMA 3 | ✅ | ✅ | ✅ |  |
-| Mistral | ✅ | ✅ | ✅ | Shares LLaMA code path |
+| Mistral | ✅ | ✅ | ✅ | LLaMA alias in CudaWorker |
 | Qwen2 / Qwen2.5 | ✅ | ✅ | ✅ |  |
-| Qwen3 | ✅ | ✅ | ✅ |  |
-| Phi-3 / Phi-4 | ✅ | ✅ | ✅ | LongRoPE for Phi-4 |
+| Qwen3 | ✅ | ✅ | ✅ | LLaMA alias in CudaWorker |
+| Phi-3 / Phi-4 | ✅ | ✅ | ✅ | LLaMA alias in CudaWorker; LongRoPE for Phi-4 |
 | Gemma 2 | ✅ | ✅ | ✅ |  |
-| Gemma 3 (text-only) | ✅ | ✅ | ✅ |  |
-| DeepSeek V2 / V3 (MLA + MoE) | ✅ | ✅ | ✅ |  |
-| Command R (Cohere) | ✅ | ✅ | ✅ |  |
-| Qwen2 MoE | ✅ | ✅ | ✅ |  |
-| Qwen3 MoE | ✅ | ✅ | ✅ |  |
-| Mixtral (MoE) | ✅ | ✅ | ✅ |  |
-| Granite (IBM) | ✅ | ✅ | ✅ |  |
-| Kimi K2.5 | ✅ | ✅ | ✅ | Uses DeepSeek V2 backbone |
-| Qwen3-Next (hybrid GDN + MoE) | ✅ | ✅ | ✅ | Linear attention + full attention |
+| Gemma 3 (text-only) | ✅ | ✅ | ✅ | CUDA graphs supported; Gemma3ForConditionalGeneration resolved as text-only via text_config |
+| DeepSeek V2 / V3 (MLA + MoE) | ✅ | ⚠️ | ✅ | V2/V2-Lite at parity (non-absorbed MLA + 6 CUDA kernels + YaRN RoPE); V3 gaps: grouped top-k routing + sigmoid scoring + e_score_correction_bias + noaux_tc routing |
+| Command R (Cohere) | ✅ | ✅ | ✅ | BNB 4-bit verified on L40S |
+| Qwen2 MoE | ✅ | ✅ | ✅ | MoE + shared expert (gated) |
+| Qwen3 MoE | ✅ | ✅ | ✅ | MoE + shared expert + QK-norm |
+| Mixtral (MoE) | ✅ | ✅ | ✅ | Pure MoE (8 experts top-2) |
+| Granite (IBM) | ✅ | ✅ | ✅ | LLaMA + 4 scalar multipliers |
+| Kimi K2.5 | ✅ | ✅ | ✅ | DeepSeek V2 backbone |
+| Qwen3-Next (hybrid GDN + MoE) | ✅ | ⚠️ | ✅ | Gaps: chunked prefill (uses fused_recurrent not chunk_gated_delta_rule); GDN TP; spec decode token splitting; has_initial_state flag; conv1d bias; L2 norm in recurrence; MTP |
 | GPT-NeoX | ✅ | ❌ | ❌ |  |
 | GPT-J | ✅ | ❌ | ❌ |  |
 | GPT-BigCode / StarCoder2 | ✅ | ❌ | ❌ |  |
@@ -193,8 +193,8 @@
 
 | Architecture | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| Gemma 3 VLM (SigLIP + projector) | ✅ | ✅ |  |
-| Qwen2-VL / Qwen2.5-VL | ✅ | ✅ |  |
+| Gemma 3 VLM (SigLIP + projector) | ✅ | ❌ | Removed with CandleWorker; not ported to CudaWorker |
+| Qwen2-VL / Qwen2.5-VL | ✅ | ❌ | Removed with CandleWorker; not ported to CudaWorker |
 | LLaMA 4 (Mllama4) | ✅ | ❌ |  |
 | Qwen3-VL | ✅ | ❌ |  |
 | Phi-3-Vision / Phi-4-MM | ✅ | ❌ |  |
@@ -233,13 +233,14 @@
 
 | Method | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| GGUF (all k-quant variants) | ✅ | ✅ |  |
-| GPTQ | ✅ | ✅ | Rust: LLaMA-family; Marlin fused GEMM on CUDA SM80+ (dequant fallback on CPU/SM<80) |
-| AWQ | ✅ | ✅ | Rust: LLaMA-family; Marlin fused GEMM on CUDA SM80+ (dequant fallback on CPU/SM<80) |
-| BitsAndBytes NF4 (4-bit) | ✅ | ✅ | Rust: LLaMA-family only |
+| GGUF (all k-quant variants) | ✅ | ✅ | llama.cpp-derived dequant kernels; BS=1 fused dequant-matvec + BS>1 Q8_1 dot products; archs: LLaMA/Qwen2/Qwen3; E2E: Qwen2.5-0.5B + Qwen3-0.6B GGUF; CUDA graphs disabled (incompatible with dynamic allocs) |
+| GPTQ | ✅ | ⚠️ | Marlin W4A16 on SM80+; symmetric only; fused QKV/gate_up at load; post-GEMM bias_add_inplace for linear bias; CUDA graphs work; archs: LLaMA/Qwen2/Gemma2/Granite; gaps: asymmetric (zero-point) + desc_act (g_idx sort+perm) + in-kernel permuted bias |
+| AWQ | ✅ | ✅ | Marlin W4A16 on SM80+; fused QKV/gate_up at load; CUDA graphs work; archs: LLaMA/Qwen2/Gemma2/Granite; E2E verified Qwen2.5-0.5B |
+| BitsAndBytes NF4 (4-bit) | ✅ | ✅ | Dequant-then-cuBLAS GEMM; double quantization supported; per-shard matmuls for QKV and gate/up; archs: LLaMA/Qwen2/Gemma2 (+ aliases Mistral/Qwen3/Phi-3/Granite); E2E verified unsloth/Qwen3-0.6B-bnb-4bit |
+| Quantized MoE (FP8/INT8/INT4 experts) | ✅ | ❌ | CudaWorker MoE kernel is BF16/F16 only; Python supports FP8 W8A8 + INT8 W8A8 + INT4 W4A16 |
 | MLX 4-bit quantized | N/A | ✅ | Rust-only; mlx-community models |
 | FP8 (W8A8 / W8A16) | ✅ | ❌ |  |
-| Marlin kernels (AWQ/GPTQ) | ✅ | ✅ | W4A16 only; auto-converts at load on SM80+ |
+| Marlin kernels (AWQ/GPTQ) | ✅ | ✅ | W4A16 only; auto-converts at load on SM80+; use_fp32_reduce matches Python default |
 | Compressed-tensors (Neural Magic) | ✅ | ❌ |  |
 | TorchAO (int4/int8/fp8) | ✅ | ❌ |  |
 | MXFP4 (microscaling) | ✅ | ❌ |  |
@@ -253,10 +254,10 @@
 
 | Backend | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| Scaled dot-product (CPU) | ✅ | ✅ |  |
-| FlashAttention-2 (single sequence) | ✅ | ✅ | Rust: CUDA only |
-| FlashAttention-2 varlen (batched prefill) | ✅ | ✅ | Rust: used as non-CUDA fallback |
-| Paged FlashAttention-2 (all batches) | ✅ | ✅ | Rust: prefill + decode + mixed; forked candle-flash-attn |
+| Scaled dot-product (CPU) | ✅ | ❌ | Removed with CandleWorker |
+| FlashAttention-2 (single sequence) | ✅ | ✅ | CudaWorker: direct FFI |
+| FlashAttention-2 varlen (batched prefill) | ✅ | ❌ | Removed with CandleWorker |
+| Paged FlashAttention-2 (all batches) | ✅ | ✅ | CudaWorker: direct FFI to vllm-flash-attn fork; prefill + decode + mixed |
 | FlashAttention-3 | ✅ | ❌ |  |
 | FlashInfer | ✅ | ❌ |  |
 | Triton attention | ✅ | ❌ |  |
@@ -265,7 +266,7 @@
 | Triton MLA (DeepSeek) | ✅ | ❌ |  |
 | Tree attention (speculative) | ✅ | ❌ |  |
 | Mamba1 / Mamba2 SSM | ✅ | ❌ |  |
-| GDN (gated diffusion network) | ✅ | ✅ | Rust: Qwen3-Next |
+| GDN (gated diffusion network) | ✅ | ✅ | Rust: Qwen3-Next; gaps: chunked prefill algo + GDN TP |
 | MLX paged decode attention | N/A | ✅ | Rust-only |
 
 ---
@@ -274,30 +275,30 @@
 
 | Feature | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| Greedy (argmax) | ✅ | ✅ |  |
-| Temperature scaling | ✅ | ✅ |  |
-| Top-k | ✅ | ✅ |  |
-| Top-p (nucleus) | ✅ | ✅ |  |
-| Min-p | ✅ | ✅ |  |
-| Repetition penalty | ✅ | ✅ |  |
-| Frequency penalty | ✅ | ✅ |  |
-| Presence penalty | ✅ | ✅ |  |
-| Logit bias | ✅ | ✅ |  |
-| Logprobs (top-N) | ✅ | ✅ |  |
+| Greedy (argmax) | ✅ | ✅ | CudaWorker: in-graph argmax for CUDA graphs |
+| Temperature scaling | ✅ | ✅ | CudaWorker: Gumbel-max (fast) or fused kernel |
+| Top-k | ✅ | ✅ | CudaWorker: fused radix-select kernel |
+| Top-p (nucleus) | ✅ | ✅ | CudaWorker: fused kernel |
+| Min-p | ✅ | ✅ | CudaWorker: fused kernel |
+| Repetition penalty | ✅ | ✅ | CudaWorker: fused GPU kernel (one block per request) |
+| Frequency penalty | ✅ | ✅ | CudaWorker: fused with rep/pres in single kernel |
+| Presence penalty | ✅ | ✅ | CudaWorker: fused with rep/freq in single kernel |
+| Logit bias | ✅ | ✅ | CudaWorker: CSR-packed scatter-add kernel |
+| Logprobs (top-N) | ✅ | ✅ | CudaWorker: fused log-softmax + top-K kernel |
 | Prompt logprobs | ✅ | ✅ |  |
-| Random seed | ✅ | ✅ |  |
+| Random seed | ✅ | ✅ | Per-request StdRng seeded from user seed |
 | Stop strings | ✅ | ✅ |  |
 | Stop token IDs | ✅ | ✅ |  |
 | `ignore_eos` | ✅ | ✅ |  |
-| `min_tokens` | ✅ | ✅ |  |
-| `n > 1` completions | ✅ | ✅ |  |
+| `min_tokens` | ✅ | ✅ | CudaWorker: GPU kernel suppresses EOS/stop tokens until min_tokens reached |
+| `n > 1` completions | ✅ | ✅ | Engine-level (not worker-level) |
 | `echo` (return prompt in output) | ✅ | ✅ |  |
-| `bad_words` blocklist | ✅ | ❌ |  |
-| `allowed_token_ids` whitelist | ✅ | ✅ | Masks non-allowed logits to -inf in sampler |
+| `bad_words` blocklist | ✅ | ✅ | CudaWorker: CPU suffix matching + GPU mask kernel |
+| `allowed_token_ids` whitelist | ✅ | ✅ | CudaWorker: reuses grammar mask kernel (CSR allow-list) |
 | `truncate_prompt_tokens` | ✅ | ✅ | Truncates from left (keeps last N tokens) |
 | ~~Beam search~~ | ✅ | ❌ | ~~Deprecated in Python V1~~ |
 | ~~`best_of` / `n` with rejection~~ | ✅ | ❌ | ~~Deprecated in Python V1~~ |
-| GPU-side fused sampling (CUDA) | ✅ | ✅ | Rust: Gumbel-max + fused top-k/top-p/min-p |
+| GPU-side fused sampling (CUDA) | ✅ | ✅ | CudaWorker: argmax + Gumbel-max + fused top-k/top-p/min-p; in-graph for CUDA graphs; full LogitsProcessor pipeline (no CPU fallback) |
 
 ---
 
@@ -355,7 +356,7 @@
 | Paged KV cache (block pool) | ✅ | ✅ |  |
 | Block allocation / free / reuse | ✅ | ✅ |  |
 | Prefix-cached block lookup | ✅ | ✅ |  |
-| Contiguous KV buffer (CUDA decode opt) | ✅ | ✅ | Rust: avoids Tensor::cat per step |
+| Contiguous KV buffer (CUDA decode opt) | ✅ | ✅ | Avoids Tensor::cat per step |
 | CPU swap space | ✅ | ❌ | Python: default 4 GB |
 | KV cache offloading to CPU | ✅ | ❌ |  |
 | FP8 KV cache | ✅ | ❌ |  |
@@ -367,12 +368,12 @@
 
 | Feature | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| Single LoRA adapter at startup | ✅ | ✅ | PEFT-format safetensors |
+| Single LoRA adapter at startup | ✅ | ❌ | Removed with CandleWorker; not ported to CudaWorker |
 | Multi-LoRA concurrent serving | ✅ | ❌ |  |
 | Dynamic LoRA hot-load/unload (REST API) | ✅ | ❌ |  |
 | Fully sharded LoRA (across TP ranks) | ✅ | ❌ |  |
 | Punica batched LoRA GEMM kernels | ✅ | ❌ |  |
-| rsLoRA scaling | ✅ | ✅ |  |
+| rsLoRA scaling | ✅ | ❌ | Removed with CandleWorker; not ported to CudaWorker |
 
 ---
 
@@ -380,7 +381,7 @@
 
 | Feature | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| N-gram prompt lookup proposer | ✅ | ✅ |  |
+| N-gram prompt lookup proposer | ✅ | ❌ | Removed with CandleWorker; not ported to CudaWorker |
 | Draft model (separate small LM) | ✅ | ❌ |  |
 | EAGLE / EAGLE3 draft heads | ✅ | ❌ |  |
 | Medusa draft heads | ✅ | ❌ |  |
@@ -393,7 +394,7 @@
 
 | Feature | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| Image input (single / batched) | ✅ | ✅ | Rust: Gemma3-MM, Qwen2-VL, Qwen2.5-VL |
+| Image input (single / batched) | ✅ | ❌ | Removed with CandleWorker; not ported to CudaWorker |
 | Video input | ✅ | ❌ |  |
 | Audio input | ✅ | ❌ |  |
 | Image embeddings (pre-encoded) | ✅ | ❌ |  |
@@ -441,12 +442,14 @@
 
 | Feature | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| CUDA graphs (decode) | ✅ | ✅ | Rust: configurable batch sizes |
-| Fused RMS norm + residual add | ✅ | ✅ | CUDA kernel |
+| CUDA graphs (decode) | ✅ | ✅ | CudaWorker: BS=[1-32] with batch padding + in-graph argmax; MoE compatible |
+| Fused RMS norm + residual add | ✅ | ✅ | CUDA kernel; vectorized 128-bit loads |
 | Fused rotary embeddings | ✅ | ✅ | CUDA kernel |
-| Fused MoE gating (top-k) | ✅ | ✅ | CUDA kernel |
+| Fused MoE gating (top-k) | ✅ | ✅ | TRT-LLM topk_softmax kernel with GpuTensor FFI |
 | Fused reshape-and-cache | ✅ | ✅ | CUDA kernel |
-| Fused GPU sampling | ✅ | ✅ | CUDA kernel |
+| Fused GPU sampling | ✅ | ✅ | CUDA kernel; full LogitsProcessor pipeline on GPU |
+| cublasLt with plan caching | ✅ | ✅ | Plans cached by (M K N dtype has_bias); 32MB workspace (matches PyTorch default) |
+| Weight dtype casting at load | ✅ | ✅ | GpuWeights casts F32→BF16/F16 via pinned host memory (matches Python torch_dtype auto-cast) |
 | Triton kernels | ✅ | ❌ | Rust has no Triton equivalent |
 | Torch.compile / inductor | ✅ | ❌ |  |
 | Weight-only INT8/FP8 GEMM | ✅ | ❌ |  |
@@ -459,17 +462,36 @@
 
 | Kernel | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| `fused_add_rms_norm` | ✅ | ✅ | Vectorized 128-bit loads |
+| `fused_add_rms_norm` | ✅ | ✅ | Vectorized 128-bit loads; wired into all model decoder layers |
 | Rotary embedding (fused) | ✅ | ✅ |  |
 | `reshape_and_cache` | ✅ | ✅ |  |
-| MoE top-k gating | ✅ | ✅ |  |
-| GPU sampling (Gumbel-max) | ✅ | ✅ |  |
-| FlashAttention-2 (paged prefill+decode) | ✅ | ✅ | Forked candle-flash-attn |
+| MoE top-k gating | ✅ | ✅ | TRT-LLM topk_softmax kernel |
+| GPU sampling (argmax + Gumbel-max + fused top-k/p/min-p) | ✅ | ✅ | In-graph for CUDA graphs; zero-copy D2D scatter |
+| FlashAttention-2 (paged prefill+decode) | ✅ | ✅ | Direct FFI to vllm-flash-attn fork |
 | Paged attention v1/v2 (PagedAttention) | ✅ | ❌ |  |
 | `silu_and_mul` fused activation | ✅ | ✅ | Vectorized 128-bit loads; combined gate_up variant |
 | `gelu_and_mul` fused activation | ✅ | ✅ | Vectorized 128-bit loads; combined gate_up variant |
-| Fused MoE GEMM | ✅ | ❌ |  |
-| Marlin (INT4 GEMM) | ✅ | ✅ | W4A16 fused dequant+GEMM; 270 kernel instantiations (FP16/BF16 × GPTQ/AWQ) |
+| Fused MoE GEMM | ✅ | ✅ | WMMA tensor-core kernel (128/128/32); BF16/F16 only; perf gaps vs Triton: fixed tile sizes (2-3x some shapes) + WMMA vs native mma PTX (10-30%) + no GROUP_SIZE_M L2 grouping + no chunked processing (OOM risk large batches) |
+| Marlin (INT4 GEMM) | ✅ | ✅ | W4A16 fused dequant+GEMM; 270 kernel instantiations (FP16/BF16 × GPTQ/AWQ); use_fp32_reduce=true |
+| GGUF dequant kernels (k-quants) | ✅ | ✅ | llama.cpp-derived; BS=1 fused dequant-matvec + BS>1 Q8_1 dot products; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2K-Q8K |
+| BitsAndBytes NF4 dequant | ✅ | ✅ | Dequant-then-cuBLAS; double quantization supported; shared dequant scratch buffer |
+| Embedding gather | ❌ | ✅ | Vectorized CUDA kernel |
+| Split QKV | ❌ | ✅ | Separates fused QKV tensor on GPU |
+| Fused QKV + RoPE | ❌ | ✅ | Combined split+rotary in one launch |
+| Apply penalties (fused rep/freq/pres) | ✅ | ✅ | One block per request; no CPU fallback |
+| Apply logit bias (CSR scatter-add) | ✅ | ✅ | Sparse CSR-packed; rebuilt only on batch change |
+| Apply grammar mask (CSR allow-list) | ✅ | ✅ | Shared with allowed_token_ids |
+| Log-softmax + top-K (fused logprobs) | ✅ | ✅ | Single kernel for logprob extraction from raw logits |
+| Apply min_tokens (suppress EOS) | ✅ | ✅ | Scatter -inf to EOS/stop tokens |
+| Cast to f32 | ✅ | ✅ |  |
+| MoE align block size | ✅ | ✅ | Small + large batch paths (ported from Python vLLM); gap: no token_mask support (not used by Mixtral/Qwen MoE) |
+| MoE sum (reduction) | ✅ | ✅ |  |
+| Sigmoid-mul-add (shared expert gate) | ✅ | ✅ | Vectorized 128-bit loads |
+| QK-norm + RoPE (fused) | ❌ | ✅ | Per-head RMS norm + NeoX RoPE; Qwen3 MoE / Gemma3 |
+| MLA CUDA kernels (DeepSeek) | ✅ | ✅ | 6 fused kernels for non-absorbed MLA + YaRN RoPE |
+| Fused recurrent GDN kernel | ❌ | ✅ | Qwen3-Next gated delta rule (fused_recurrent_gated_delta_rule) |
+| QKVZ grouped-head split | ❌ | ✅ | Eliminates 8 CPU round-trips per GDN layer |
+| Conv output split | ❌ | ✅ | Eliminates 3 CPU round-trips per GDN layer |
 | FP8 GEMM | ✅ | ❌ |  |
 | Prefix caching hash kernel | ✅ | ❌ |  |
 | Custom all-reduce | ✅ | ❌ |  |

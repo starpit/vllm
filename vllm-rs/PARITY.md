@@ -4,9 +4,9 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| ✅ 🟦 | Implemented | 140 |
+| ✅ 🟦 | Implemented | 141 |
 | ⚠️ 🟨 | Partial | 3 |
-| ❌ 🟥 | Not implemented | 136 |
+| ❌ 🟥 | Not implemented | 135 |
 
 ---
 
@@ -19,7 +19,7 @@
 | [Hardware Platforms](#hardware-platforms) | 🟦🟦🟥🟥🟥🟥🟥🟥🟥 | 2 | 0 | 7 |
 | [Multi-GPU & Distribution](#multi-gpu--distribution) | 🟦🟦🟥🟥🟥🟥🟥🟥🟥 | 2 | 0 | 7 |
 | [CLI Commands](#cli-commands) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 10 | 0 | 0 |
-| [OpenAI-Compatible API Endpoints](#openai-compatible-api-endpoints) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 9 | 0 | 4 |
+| [OpenAI-Compatible API Endpoints](#openai-compatible-api-endpoints) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥 | 10 | 0 | 3 |
 | [Other API Protocols](#other-api-protocols) | 🟥🟥🟥🟥🟥🟥🟥 | 0 | 0 | 7 |
 | [Model Architectures — Decoder-Only LLMs](#model-architectures--decoder-only-llms) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 13 | 2 | 20 |
 | [Model Architectures — Encoder / Embedding](#model-architectures--encoder--embedding) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
@@ -42,7 +42,7 @@
 | [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 22 | 0 | 4 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟥 | 6 | 0 | 1 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥 | 7 | 0 | 2 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **140** | **3** | **136** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **141** | **3** | **135** |
 
 ---
 
@@ -115,7 +115,7 @@
 | `GET /metrics` (Prometheus) | ✅ | ✅ |  |
 | `POST /tokenize` | ✅ | ✅ | Prompt mode; chat mode with chat-template feature |
 | `POST /detokenize` | ✅ | ✅ |  |
-| `POST /v1/chat/completions/render` | ✅ | ❌ | Render chat to string without generating |
+| `POST /v1/chat/completions/render` | ✅ | ✅ | Renders chat template and returns prompt text + token IDs |
 
 ---
 

@@ -867,6 +867,18 @@ pub struct VersionResponse {
     pub version: String,
 }
 
+/// A single engine prompt returned by `/v1/chat/completions/render`.
+/// Mirrors Python's `ProcessorInputs` (text-only subset).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderEnginePrompt {
+    /// The rendered prompt text (or token IDs when multimodal).
+    pub prompt: serde_json::Value,
+}
+
+/// Response for `/v1/chat/completions/render` — `[conversation, engine_prompts]`.
+/// Matches Python vLLM's return format exactly.
+pub type ChatCompletionRenderResponse = (Vec<serde_json::Value>, Vec<RenderEnginePrompt>);
+
 /// JSON stats response for the `/stats` endpoint (used by `vllm top`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsResponse {

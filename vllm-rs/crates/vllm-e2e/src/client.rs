@@ -5,9 +5,9 @@
 
 use anyhow::{Context, Result, bail};
 use vllm_serve::protocol::{
-    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionStreamResponse, CompletionRequest,
-    CompletionResponse, DetokenizeRequest, DetokenizeResponse, ModelList, TokenizeRequest,
-    TokenizeResponse, VersionResponse,
+    ChatCompletionRenderResponse, ChatCompletionRequest, ChatCompletionResponse,
+    ChatCompletionStreamResponse, CompletionRequest, CompletionResponse, DetokenizeRequest,
+    DetokenizeResponse, ModelList, TokenizeRequest, TokenizeResponse, VersionResponse,
 };
 
 /// A thin HTTP client for talking to a running vLLM server.
@@ -82,6 +82,29 @@ impl Client {
         resp.json()
             .await
             .context("failed to parse chat completion response")
+    }
+
+    /// POST /v1/chat/completions/render — render chat template without generating.
+    pub async fn render_chat_completion(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<ChatCompletionRenderResponse> {
+        let resp = self
+            .inner
+            .post(format!("{}/v1/chat/completions/render", self.base_url))
+            .json(request)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("render chat completion failed with status {status}: {body}");
+        }
+
+        resp.json()
+            .await
+            .context("failed to parse render chat completion response")
     }
 
     /// POST /v1/chat/completions with stream=true — returns collected stream chunks.

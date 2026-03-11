@@ -99,6 +99,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     #[allow(unused_mut)]
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/chat/completions/render", post(render_chat_completion))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))
@@ -159,6 +160,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 fn log_routes(state: &AppState) {
     info!("Available routes are:");
     info!("Route: /v1/chat/completions, Methods: POST");
+    info!("Route: /v1/chat/completions/render, Methods: POST");
     info!("Route: /v1/completions, Methods: POST");
     info!("Route: /v1/embeddings, Methods: POST");
     info!("Route: /v1/models, Methods: GET");
@@ -314,6 +316,21 @@ async fn chat_completions(
             Ok(response) => attach_orca_header(&headers, Json(response).into_response()),
             Err(e) => e.into_response(),
         }
+    }
+}
+
+/// POST /v1/chat/completions/render
+async fn render_chat_completion(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<protocol::ChatCompletionRequest>,
+) -> Response {
+    info!(
+        "POST /v1/chat/completions/render: model={:?}",
+        request.model
+    );
+    match state.engine.render_chat_completion(request) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -1406,5 +1423,42 @@ mod tests {
             .unwrap();
         let response = app2.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_render_chat_completion_bad_json() {
+        let state = make_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions/render")
+            .header("content-type", "application/json")
+            .body(Body::from("not json"))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_render_chat_completion_missing_messages() {
+        let state = make_test_state();
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions/render")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model": "test"}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "actual status: {}",
+            response.status()
+        );
     }
 }

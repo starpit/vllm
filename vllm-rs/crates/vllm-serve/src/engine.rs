@@ -590,6 +590,53 @@ impl AsyncEngine {
         Ok(protocol::ChatCompletionResponse::new(model, choices, usage))
     }
 
+    /// Render a chat completion request: apply the chat template and tokenize,
+    /// but do not generate any tokens.
+    ///
+    /// Returns `[conversation, engine_prompts]` matching Python vLLM's format.
+    ///
+    /// Port of: `POST /v1/chat/completions/render`
+    pub fn render_chat_completion(
+        &self,
+        request: protocol::ChatCompletionRequest,
+    ) -> ServeResult<protocol::ChatCompletionRenderResponse> {
+        if self.is_pooling {
+            return Err(ServeError::Validation(
+                "server is in pooling mode — chat completions are not supported".to_string(),
+            ));
+        }
+
+        // Build conversation: the original messages as JSON values.
+        let conversation: Vec<serde_json::Value> = request
+            .messages
+            .iter()
+            .map(|msg| serde_json::to_value(msg).unwrap_or_default())
+            .collect();
+
+        // Apply chat template + tokenize to get the rendered prompt.
+        let base_id = request
+            .request_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let sampling_params = self.build_sampling_params_from_chat(&request)?;
+        let ec_request = self.chat_to_engine_request(&base_id, &request, &sampling_params)?;
+        let token_ids = ec_request.prompt_token_ids.unwrap_or_default();
+
+        // Decode token IDs back to text for the prompt field.
+        let prompt_text = if let Some(tok) = &self.tokenizer {
+            tok.decode(&token_ids, true)
+                .unwrap_or_else(|_| String::new())
+        } else {
+            String::new()
+        };
+
+        let engine_prompts = vec![protocol::RenderEnginePrompt {
+            prompt: serde_json::Value::String(prompt_text),
+        }];
+
+        Ok((conversation, engine_prompts))
+    }
+
     /// Add a streaming chat completion request.
     ///
     /// Returns a receiver that yields streaming deltas.
@@ -4183,5 +4230,32 @@ mod tests {
                 || err_msg.contains("step loop exited"),
             "unexpected error: {err_msg}"
         );
+    }
+
+    #[test]
+    fn test_render_chat_completion() {
+        let engine = make_test_engine_with_tokenizer();
+        let request = make_chat_request();
+        let (conversation, engine_prompts) = engine.render_chat_completion(request).unwrap();
+
+        // Conversation should contain the original message.
+        assert_eq!(conversation.len(), 1);
+        assert_eq!(conversation[0]["role"], "user");
+        assert_eq!(conversation[0]["content"], "Hello");
+
+        // Engine prompts should have exactly one entry with a non-empty prompt.
+        assert_eq!(engine_prompts.len(), 1);
+        let prompt = engine_prompts[0].prompt.as_str().unwrap();
+        assert!(!prompt.is_empty(), "rendered prompt should not be empty");
+    }
+
+    #[test]
+    fn test_render_chat_completion_pooling_mode_rejected() {
+        let mut engine = make_test_engine();
+        engine.set_is_pooling(true);
+        let request = make_chat_request();
+        let result = engine.render_chat_completion(request);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("pooling mode"));
     }
 }

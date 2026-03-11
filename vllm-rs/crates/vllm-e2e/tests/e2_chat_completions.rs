@@ -661,3 +661,81 @@ async fn test_chat_different_seeds_differ() {
         "different seeds should (almost certainly) produce different output"
     );
 }
+
+// ===========================================================================
+// E2: Render endpoint
+// ===========================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_render_chat_completion() {
+    let (_server, client) = start_smollm().await;
+
+    let request = ChatCompletionRequest {
+        messages: vec![
+            system_msg("You are a helpful assistant."),
+            user_msg("What is 2+2?"),
+        ],
+        max_tokens: Some(10),
+        ..default_chat_request()
+    };
+
+    let (conversation, engine_prompts) = client.render_chat_completion(&request).await.unwrap();
+
+    // Conversation should mirror the input messages.
+    assert_eq!(conversation.len(), 2);
+    assert_eq!(conversation[0]["role"], "system");
+    assert_eq!(conversation[1]["role"], "user");
+    assert_eq!(conversation[1]["content"], "What is 2+2?");
+
+    // Engine prompts should have one entry with a non-empty rendered prompt.
+    assert_eq!(engine_prompts.len(), 1);
+    let prompt = engine_prompts[0]
+        .prompt
+        .as_str()
+        .expect("prompt should be a string");
+    assert!(!prompt.is_empty(), "rendered prompt should not be empty");
+    // The rendered text should contain the user message content.
+    assert!(
+        prompt.contains("2+2"),
+        "rendered prompt should contain the user message: {prompt}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_render_chat_completion_with_tools() {
+    let (_server, client) = start_smollm().await;
+
+    let tools: Vec<serde_json::Value> = serde_json::from_str(
+        r#"[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"]
+            }
+        }
+    }]"#,
+    )
+    .unwrap();
+
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg("What's the weather in Paris?")],
+        tools: Some(serde_json::from_value(serde_json::Value::Array(tools)).unwrap()),
+        max_tokens: Some(10),
+        ..default_chat_request()
+    };
+
+    let (conversation, engine_prompts) = client.render_chat_completion(&request).await.unwrap();
+    assert_eq!(conversation.len(), 1);
+    assert_eq!(engine_prompts.len(), 1);
+    let prompt = engine_prompts[0]
+        .prompt
+        .as_str()
+        .expect("prompt should be a string");
+    assert!(!prompt.is_empty());
+}

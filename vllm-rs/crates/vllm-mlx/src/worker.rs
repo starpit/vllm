@@ -125,9 +125,9 @@ pub struct MlxWorker {
     /// Per-request grammar guide state for constrained decoding.
     #[cfg(feature = "guided-decoding")]
     grammar_states: HashMap<String, vllm_models::grammar::GrammarGuide>,
-    /// Compiled vocabulary for grammar-guided decoding (built once from tokenizer).
+    /// Parser factory for grammar-guided decoding (built once from tokenizer).
     #[cfg(feature = "guided-decoding")]
-    grammar_vocabulary: Option<outlines_core::vocabulary::Vocabulary>,
+    grammar_factory: Option<std::sync::Arc<vllm_models::grammar::LlgParserFactory>>,
 
     /// Resolved pooling strategy for embeddings.
     pooling_strategy: vllm_models::embedding::PoolingStrategy,
@@ -178,7 +178,7 @@ impl MlxWorker {
             #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
-            grammar_vocabulary: None,
+            grammar_factory: None,
             pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
             mm_data_map: HashMap::new(),
             preloaded_tokenizer: None,
@@ -272,10 +272,10 @@ impl MlxWorker {
         self.pooling_strategy = strategy;
     }
 
-    /// Build grammar vocabulary on demand (lazy — deferred from startup).
+    /// Build grammar parser factory on demand (lazy — deferred from startup).
     #[cfg(feature = "guided-decoding")]
-    fn ensure_grammar_vocabulary(&mut self) {
-        if self.grammar_vocabulary.is_some() {
+    fn ensure_grammar_factory(&mut self) {
+        if self.grammar_factory.is_some() {
             return;
         }
         let Some(model_dir) = &self.model_dir else {
@@ -286,29 +286,21 @@ impl MlxWorker {
             info!("MlxWorker: no tokenizer.json found, grammar-guided decoding unavailable");
             return;
         }
-        let tokenizer = match tokenizers::Tokenizer::from_file(&tokenizer_path) {
-            Ok(t) => t,
+        let tokenizer_bytes = match std::fs::read(&tokenizer_path) {
+            Ok(b) => b,
             Err(e) => {
-                warn!("MlxWorker: failed to load tokenizer.json for grammar vocabulary: {e}");
+                warn!("MlxWorker: failed to read tokenizer.json for grammar factory: {e}");
                 return;
             }
         };
 
-        let hf_vocab = tokenizer.get_vocab(true);
-        let eos_token_id = tokenizer.token_to_id("</s>").unwrap_or(0);
-        let tokens: Vec<(u32, String)> = hf_vocab.into_iter().map(|(s, id)| (id, s)).collect();
-
-        match vllm_models::grammar::build_vocabulary(&tokens, eos_token_id) {
-            Ok(vocab) => {
-                info!(
-                    "MlxWorker: grammar vocabulary built ({} tokens, eos={})",
-                    vocab.len(),
-                    eos_token_id
-                );
-                self.grammar_vocabulary = Some(vocab);
+        match vllm_models::grammar::build_parser_factory(&tokenizer_bytes) {
+            Ok(factory) => {
+                info!("MlxWorker: grammar parser factory built");
+                self.grammar_factory = Some(factory);
             }
             Err(e) => {
-                warn!("MlxWorker: failed to build grammar vocabulary: {e}");
+                warn!("MlxWorker: failed to build grammar parser factory: {e}");
             }
         }
     }
@@ -714,7 +706,7 @@ impl Worker for MlxWorker {
                     .is_some_and(|p| p.guided_grammar.is_some())
             });
             if needs_grammar {
-                self.ensure_grammar_vocabulary();
+                self.ensure_grammar_factory();
             }
         }
 
@@ -796,9 +788,9 @@ impl Worker for MlxWorker {
                 // Create grammar guide for constrained decoding if requested.
                 #[cfg(feature = "guided-decoding")]
                 if let Some(ref grammar) = params.guided_grammar {
-                    if let Some(ref vocab) = self.grammar_vocabulary {
+                    if let Some(ref factory) = self.grammar_factory {
                         match vllm_models::grammar::GrammarGuide::from_guided_grammar(
-                            grammar, vocab,
+                            grammar, factory,
                         ) {
                             Ok(guide) => {
                                 self.grammar_states.insert(new_req.req_id.clone(), guide);
@@ -1348,7 +1340,7 @@ impl Worker for MlxWorker {
             #[cfg(feature = "guided-decoding")]
             let has_grammar = self
                 .grammar_states
-                .get(&req_input.req_id)
+                .get_mut(&req_input.req_id)
                 .is_some_and(|g| g.allowed_tokens().is_some());
             #[cfg(not(feature = "guided-decoding"))]
             let has_grammar = false;
@@ -1535,7 +1527,7 @@ impl Worker for MlxWorker {
                 #[cfg(feature = "guided-decoding")]
                 let grammar_allowed: Option<Vec<u32>> = self
                     .grammar_states
-                    .get(&req_input.req_id)
+                    .get_mut(&req_input.req_id)
                     .and_then(|g| g.allowed_tokens());
                 #[cfg(not(feature = "guided-decoding"))]
                 let grammar_allowed: Option<Vec<u32>> = None;

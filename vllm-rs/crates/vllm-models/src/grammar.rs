@@ -1,107 +1,111 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Grammar-guided constrained decoding.
 //!
-//! Wraps `outlines-core` to compile JSON schemas (or generic JSON) into
-//! finite-state automata that mask logits during sampling. Each request
-//! with a `GuidedGrammar` gets its own `GrammarGuide` that tracks the
-//! current FSM state and provides the set of allowed tokens at each step.
+//! Wraps `llguidance` to compile JSON schemas, regex patterns, or Lark/EBNF
+//! grammars into token masks for constrained decoding. Each request with a
+//! `GuidedGrammar` gets its own `GrammarGuide` that tracks parser state and
+//! provides the set of allowed tokens at each step.
 
-use outlines_core::index::Index;
-use outlines_core::json_schema;
-use outlines_core::prelude::{StateId, TokenId, Vocabulary};
+use std::sync::Arc;
+
+use llguidance::api::TopLevelGrammar;
+use llguidance::{Matcher, ParserFactory};
+use toktrie::TokenId;
+use toktrie_hf_tokenizers::ByteTokenizer;
 use vllm_common::sampling::GuidedGrammar;
 
-/// A compiled grammar guide that tracks FSM state for constrained decoding.
+// Re-export for consumers (cuda_worker, mlx_worker).
+pub use llguidance::ParserFactory as LlgParserFactory;
+
+/// A compiled grammar guide that tracks parser state for constrained decoding.
 ///
 /// Created once per request (when `guided_grammar` is set), then queried
 /// and advanced at each decode step.
 pub struct GrammarGuide {
-    index: Index,
-    current_state: StateId,
+    matcher: Matcher,
 }
 
-/// A generic JSON regex that matches any valid JSON value.
-///
-/// This is used for `response_format: { type: "json_object" }` which
-/// requires valid JSON output without a specific schema.
+/// A generic JSON schema that matches any valid JSON object.
 const JSON_OBJECT_SCHEMA: &str = r#"{"type": "object"}"#;
 
 impl GrammarGuide {
     /// Build a grammar guide from a JSON schema.
-    ///
-    /// Compiles `schema` → regex → FSM index using the provided vocabulary.
     pub fn from_json_schema(
         schema: &serde_json::Value,
-        vocabulary: &Vocabulary,
+        factory: &Arc<ParserFactory>,
     ) -> Result<Self, String> {
-        let schema_str = serde_json::to_string(schema).map_err(|e| e.to_string())?;
-        let regex =
-            json_schema::regex_from_str(&schema_str, None, None).map_err(|e| e.to_string())?;
-        let index = Index::new(&regex, vocabulary).map_err(|e| e.to_string())?;
-        let initial_state = index.initial_state();
+        let grammar = TopLevelGrammar::from_json_schema(schema.clone());
+        let parser = factory.create_parser(grammar).map_err(|e| e.to_string())?;
         Ok(Self {
-            index,
-            current_state: initial_state,
+            matcher: Matcher::new(Ok(parser)),
         })
     }
 
     /// Build a grammar guide from an arbitrary regex pattern.
-    ///
-    /// Compiles the regex directly into an FSM index (no JSON schema step).
-    pub fn from_regex(pattern: &str, vocabulary: &Vocabulary) -> Result<Self, String> {
-        let index = Index::new(pattern, vocabulary).map_err(|e| e.to_string())?;
-        let initial_state = index.initial_state();
+    pub fn from_regex(pattern: &str, factory: &Arc<ParserFactory>) -> Result<Self, String> {
+        let grammar = TopLevelGrammar::from_regex(pattern);
+        let parser = factory.create_parser(grammar).map_err(|e| e.to_string())?;
         Ok(Self {
-            index,
-            current_state: initial_state,
+            matcher: Matcher::new(Ok(parser)),
         })
     }
 
     /// Build a grammar guide for generic JSON object output.
-    ///
-    /// Uses a built-in `{"type": "object"}` schema that accepts any JSON object.
-    pub fn from_json_object(vocabulary: &Vocabulary) -> Result<Self, String> {
+    pub fn from_json_object(factory: &Arc<ParserFactory>) -> Result<Self, String> {
         let schema: serde_json::Value =
             serde_json::from_str(JSON_OBJECT_SCHEMA).map_err(|e| e.to_string())?;
-        Self::from_json_schema(&schema, vocabulary)
+        Self::from_json_schema(&schema, factory)
+    }
+
+    /// Build a grammar guide from a Lark/EBNF grammar string.
+    pub fn from_ebnf(grammar: &str, factory: &Arc<ParserFactory>) -> Result<Self, String> {
+        let tlg = TopLevelGrammar::from_lark(grammar.to_string());
+        let parser = factory.create_parser(tlg).map_err(|e| e.to_string())?;
+        Ok(Self {
+            matcher: Matcher::new(Ok(parser)),
+        })
     }
 
     /// Create a `GrammarGuide` from a `GuidedGrammar` specification.
     pub fn from_guided_grammar(
         grammar: &GuidedGrammar,
-        vocabulary: &Vocabulary,
+        factory: &Arc<ParserFactory>,
     ) -> Result<Self, String> {
         match grammar {
-            GuidedGrammar::Json => Self::from_json_object(vocabulary),
-            GuidedGrammar::JsonSchema { schema } => Self::from_json_schema(schema, vocabulary),
-            GuidedGrammar::Regex { pattern } => Self::from_regex(pattern, vocabulary),
+            GuidedGrammar::Json => Self::from_json_object(factory),
+            GuidedGrammar::JsonSchema { schema } => Self::from_json_schema(schema, factory),
+            GuidedGrammar::Regex { pattern } => Self::from_regex(pattern, factory),
+            GuidedGrammar::Ebnf { grammar } => Self::from_ebnf(grammar, factory),
         }
     }
 
     /// Get the set of token IDs allowed at the current state.
     ///
-    /// Returns `None` if the current state has no transitions (should not
-    /// happen during normal generation — it means the FSM is stuck).
-    pub fn allowed_tokens(&self) -> Option<Vec<TokenId>> {
-        self.index.allowed_tokens(&self.current_state)
-    }
-
-    /// Advance the FSM to the next state given a sampled token.
-    ///
-    /// Returns `true` if the transition was valid, `false` if the token
-    /// had no valid transition (the state is left unchanged).
-    pub fn advance(&mut self, token_id: TokenId) -> bool {
-        if let Some(next) = self.index.next_state(&self.current_state, &token_id) {
-            self.current_state = next;
-            true
-        } else {
-            false
+    /// Returns `None` if the parser is in an error/stopped state.
+    pub fn allowed_tokens(&mut self) -> Option<Vec<TokenId>> {
+        if self.matcher.is_stopped() {
+            return None;
+        }
+        match self.matcher.compute_mask() {
+            Ok(mask) => {
+                let mut tokens = Vec::new();
+                mask.iter_set_entries(|idx| tokens.push(idx as TokenId));
+                Some(tokens)
+            }
+            Err(_) => None,
         }
     }
 
-    /// Check if the current state is a final (accepting) state.
+    /// Advance the parser to the next state given a sampled token.
+    ///
+    /// Returns `true` if the transition was valid, `false` on error.
+    pub fn advance(&mut self, token_id: TokenId) -> bool {
+        self.matcher.consume_token(token_id).is_ok()
+    }
+
+    /// Check if the parser is in a finished/stopped state.
     pub fn is_finished(&self) -> bool {
-        self.index.is_final_state(&self.current_state)
+        self.matcher.is_stopped()
     }
 }
 
@@ -126,20 +130,17 @@ pub fn apply_grammar_mask(logits: &mut [f32], allowed: &[TokenId]) {
     }
 }
 
-/// Build an `outlines-core` `Vocabulary` from a list of `(token_id, token_string)` pairs.
+/// Build a `TokEnv` and `ParserFactory` from raw tokenizer.json bytes.
 ///
 /// Workers call this once at model-load time and cache the result.
-pub fn build_vocabulary(tokens: &[(u32, String)], eos_token_id: u32) -> Result<Vocabulary, String> {
-    let mut vocab = Vocabulary::new(eos_token_id);
-    for (token_id, token_str) in tokens {
-        if *token_id == eos_token_id {
-            continue;
-        }
-        vocab
-            .try_insert(token_str.as_str(), *token_id)
-            .map_err(|e| format!("failed to insert token {token_id} ({token_str:?}): {e}"))?;
-    }
-    Ok(vocab)
+/// The `ParserFactory` is expensive to create (builds sliced bias computer)
+/// but is reused across all requests.
+pub fn build_parser_factory(tokenizer_json: &[u8]) -> Result<Arc<ParserFactory>, String> {
+    let byte_tok = ByteTokenizer::from_json_bytes(tokenizer_json).map_err(|e| e.to_string())?;
+    let tok_env = byte_tok.into_tok_env(None).map_err(|e| e.to_string())?;
+    let mut factory = ParserFactory::new_simple(&tok_env).map_err(|e| e.to_string())?;
+    factory.set_stderr_log_level(0);
+    Ok(Arc::new(factory))
 }
 
 // ---------------------------------------------------------------------------
@@ -150,46 +151,71 @@ pub fn build_vocabulary(tokens: &[(u32, String)], eos_token_id: u32) -> Result<V
 mod tests {
     use super::*;
 
-    fn make_test_vocab() -> Vocabulary {
-        // Minimal vocabulary for testing: digits, braces, quotes, colon, comma.
-        let eos = 99;
-        let mut vocab = Vocabulary::new(eos);
-        let tokens = [
-            (0, "{"),
-            (1, "}"),
-            (2, "\""),
-            (3, ":"),
-            (4, ","),
-            (5, " "),
-            (6, "0"),
-            (7, "1"),
-            (8, "2"),
-            (9, "a"),
-            (10, "b"),
-            (11, "n"),
-            (12, "u"),
-            (13, "l"),
-            (14, "t"),
-            (15, "r"),
-            (16, "e"),
-            (17, "f"),
-            (18, "s"),
-            (19, "["),
-            (20, "]"),
-            (21, "."),
-            (22, "-"),
-            (23, "3"),
-            (24, "4"),
-            (25, "5"),
-            (26, "6"),
-            (27, "7"),
-            (28, "8"),
-            (29, "9"),
-        ];
-        for (id, tok) in tokens {
-            vocab.try_insert(tok, id).unwrap();
-        }
-        vocab
+    fn make_test_factory() -> Arc<ParserFactory> {
+        // Use a minimal BPE tokenizer JSON for testing.
+        let tokenizer_json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                {"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 99, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+            ],
+            "normalizer": null,
+            "pre_tokenizer": {
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": true
+            },
+            "post_processor": null,
+            "decoder": {
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": true
+            },
+            "model": {
+                "type": "BPE",
+                "dropout": null,
+                "unk_token": "<unk>",
+                "continuing_subword_prefix": "",
+                "end_of_word_suffix": "",
+                "fuse_unk": false,
+                "vocab": {
+                    "{": 1,
+                    "}": 2,
+                    "\"": 3,
+                    ":": 4,
+                    ",": 5,
+                    " ": 6,
+                    "0": 7,
+                    "1": 8,
+                    "2": 9,
+                    "3": 10,
+                    "a": 11,
+                    "b": 12,
+                    "n": 13,
+                    "u": 14,
+                    "l": 15,
+                    "t": 16,
+                    "r": 17,
+                    "e": 18,
+                    "f": 19,
+                    "s": 20,
+                    "[": 21,
+                    "]": 22,
+                    ".": 23,
+                    "-": 24,
+                    "4": 25,
+                    "5": 26,
+                    "6": 27,
+                    "7": 28,
+                    "8": 29,
+                    "9": 30
+                },
+                "merges": []
+            }
+        }"#;
+        build_parser_factory(tokenizer_json.as_bytes()).unwrap()
     }
 
     #[test]
@@ -224,102 +250,73 @@ mod tests {
     }
 
     #[test]
-    fn test_build_vocabulary() {
-        let tokens = vec![
-            (0, "hello".to_string()),
-            (1, "world".to_string()),
-            (2, "eos".to_string()),
-        ];
-        let vocab = build_vocabulary(&tokens, 2).unwrap();
-        assert!(vocab.token_ids("hello").is_some());
-        assert!(vocab.token_ids("world").is_some());
-        // EOS token should not be inserted.
-        assert!(vocab.token_ids("eos").is_none());
-    }
-
-    #[test]
-    fn test_from_json_schema_compiles() {
-        let vocab = make_test_vocab();
-        let schema: serde_json::Value = serde_json::from_str(
-            r#"{"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}"#,
-        )
-        .unwrap();
-        let guide = GrammarGuide::from_json_schema(&schema, &vocab);
-        // May fail with IncompatibleVocabulary for minimal vocab, that's OK.
-        // We're testing that the compilation path doesn't panic.
-        match guide {
-            Ok(g) => {
-                // Should have allowed tokens at initial state.
-                let allowed = g.allowed_tokens();
-                assert!(allowed.is_some());
-                assert!(!allowed.unwrap().is_empty());
-            }
-            Err(e) => {
-                // IncompatibleVocabulary is expected with a tiny vocab.
-                assert!(
-                    e.contains("incompatible")
-                        || e.contains("Incompatible")
-                        || e.contains("vocabulary"),
-                    "Unexpected error: {e}"
-                );
-            }
-        }
+    fn test_build_parser_factory() {
+        let factory = make_test_factory();
+        // Factory should be usable for creating parsers.
+        let grammar = TopLevelGrammar::from_regex("[0-9]+");
+        assert!(factory.create_parser(grammar).is_ok());
     }
 
     #[test]
     fn test_from_regex_digit_pattern() {
-        let eos = 99;
-        let mut vocab = Vocabulary::new(eos);
-        for (id, tok) in [(0, "0"), (1, "1"), (2, "2"), (3, "3")] {
-            vocab.try_insert(tok, id).unwrap();
-        }
-        let guide = GrammarGuide::from_regex("[0-3]+", &vocab).unwrap();
-        let allowed = guide.allowed_tokens().unwrap();
-        assert!(!allowed.is_empty());
+        let factory = make_test_factory();
+        let mut guide = GrammarGuide::from_regex("[0-9]+", &factory).unwrap();
+        let allowed = guide.allowed_tokens();
+        assert!(allowed.is_some());
+        assert!(!allowed.unwrap().is_empty());
     }
 
     #[test]
     fn test_from_guided_grammar_regex_variant() {
-        let eos = 99;
-        let mut vocab = Vocabulary::new(eos);
-        for (id, tok) in [(0, "0"), (1, "1"), (2, "2"), (3, "3")] {
-            vocab.try_insert(tok, id).unwrap();
-        }
+        let factory = make_test_factory();
         let grammar = GuidedGrammar::Regex {
-            pattern: "[0-3]+".to_string(),
+            pattern: "[0-9]+".to_string(),
         };
-        let guide = GrammarGuide::from_guided_grammar(&grammar, &vocab).unwrap();
-        let allowed = guide.allowed_tokens().unwrap();
-        assert!(!allowed.is_empty());
+        let mut guide = GrammarGuide::from_guided_grammar(&grammar, &factory).unwrap();
+        let allowed = guide.allowed_tokens();
+        assert!(allowed.is_some());
+        assert!(!allowed.unwrap().is_empty());
     }
 
     #[test]
     fn test_advance_and_finish() {
-        // Use a simple integer regex to test state machine transitions.
-        let eos = 99;
-        let mut vocab = Vocabulary::new(eos);
-        for (id, tok) in [(0, "0"), (1, "1"), (2, "2"), (3, "3")] {
-            vocab.try_insert(tok, id).unwrap();
-        }
-
-        let regex = "0|[1-3][0-3]*";
-        let index = Index::new(regex, &vocab).unwrap();
-        let mut guide = GrammarGuide {
-            current_state: index.initial_state(),
-            index,
-        };
+        let factory = make_test_factory();
+        // Use a simple regex: exactly one digit.
+        let mut guide = GrammarGuide::from_regex("[0-9]", &factory).unwrap();
 
         // At initial state, we should have allowed tokens.
         let allowed = guide.allowed_tokens().unwrap();
         assert!(!allowed.is_empty());
 
-        // Advance with "1" (token_id=1).
-        assert!(guide.advance(1));
-        // After "1", the guide should be in a final state (valid integer).
-        assert!(guide.is_finished());
+        // Advance with "1" (token_id=8 in our vocab).
+        assert!(guide.advance(8));
 
-        // Can still advance with more digits.
-        let allowed2 = guide.allowed_tokens();
-        assert!(allowed2.is_some());
+        // After one digit, the guide should be finished (regex fully matched).
+        // Need to call allowed_tokens to trigger stop check.
+        let _ = guide.allowed_tokens();
+        assert!(guide.is_finished());
+    }
+
+    #[test]
+    fn test_from_ebnf_grammar() {
+        let factory = make_test_factory();
+        // Simple Lark grammar for digits.
+        let grammar = r#"start: /[0-9]+/"#;
+        let mut guide = GrammarGuide::from_ebnf(grammar, &factory).unwrap();
+        let allowed = guide.allowed_tokens();
+        assert!(allowed.is_some());
+        assert!(!allowed.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_from_guided_grammar_ebnf_variant() {
+        let factory = make_test_factory();
+        let grammar = GuidedGrammar::Ebnf {
+            grammar: r#"start: /[0-9]+/"#.to_string(),
+        };
+        let mut guide = GrammarGuide::from_guided_grammar(&grammar, &factory).unwrap();
+        let allowed = guide.allowed_tokens();
+        assert!(allowed.is_some());
+        assert!(!allowed.unwrap().is_empty());
     }
 }

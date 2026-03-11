@@ -27,6 +27,8 @@ pub enum GuidedGrammar {
     JsonSchema { schema: serde_json::Value },
     /// `guided_regex` — output must match the given regex pattern.
     Regex { pattern: String },
+    /// `guided_grammar` — output must conform to the given Lark/EBNF grammar.
+    Ebnf { grammar: String },
 }
 
 // ---------------------------------------------------------------------------

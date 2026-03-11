@@ -4,9 +4,9 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| ✅ 🟦 | Implemented | 147 |
+| ✅ 🟦 | Implemented | 148 |
 | ⚠️ 🟨 | Partial | 4 |
-| ❌ 🟥 | Not implemented | 156 |
+| ❌ 🟥 | Not implemented | 154 |
 
 ---
 
@@ -29,7 +29,7 @@
 | [Quantization Methods](#quantization-methods) | 🟦🟦🟦🟦🟨🟥🟥🟥🟥🟥🟥🟥🟥 | 4 | 1 | 8 |
 | [Attention Backends](#attention-backends) | 🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 3 | 0 | 10 |
 | [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 22 | 0 | 0 |
-| [Structured Output / Guided Decoding](#structured-output--guided-decoding) | 🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥 | 5 | 0 | 5 |
+| [Structured Output / Guided Decoding](#structured-output--guided-decoding) | 🟦🟦🟦🟦🟦🟦🟥🟥🟥 | 6 | 0 | 3 |
 | [Tool Calling / Function Calling](#tool-calling--function-calling) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 10 | 1 | 25 |
 | [Scheduling](#scheduling) | 🟦🟦🟦🟦🟦🟦🟥 | 6 | 0 | 1 |
 | [KV Cache](#kv-cache) | 🟦🟦🟦🟦🟥🟥🟥🟥 | 4 | 0 | 4 |
@@ -42,7 +42,7 @@
 | [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 22 | 0 | 4 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟥 | 6 | 0 | 1 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥 | 7 | 0 | 2 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **147** | **4** | **156** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **148** | **4** | **154** |
 
 ---
 
@@ -310,11 +310,11 @@
 | JSON object (freeform) | ✅ | ✅ |  |
 | Regex constraint | ✅ | ✅ |  |
 | Choice (enum) | ✅ | ✅ |  |
-| EBNF grammar | ✅ | ❌ |  |
+| EBNF grammar | ✅ | ✅ | via llguidance Lark parser |
 | Structural tags | ✅ | ❌ |  |
-| Backend: outlines-core FSM | ✅ | ✅ |  |
+| ~~Backend: outlines-core FSM~~ | ✅ | ❌ | ~~Deprecated in Python V1~~ Replaced by llguidance |
 | Backend: xgrammar | ✅ | ❌ |  |
-| Backend: guidance | ✅ | ❌ |  |
+| Backend: guidance / llguidance | ✅ | ✅ | llguidance 1.6 (same engine as Python guidance backend) |
 | Backend: lm-format-enforcer | ✅ | ❌ |  |
 
 ---

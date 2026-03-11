@@ -318,9 +318,13 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 
-    /// Regex pattern for constrained decoding (mutually exclusive with `response_format`).
+    /// Regex pattern for constrained decoding (mutually exclusive with `response_format` and `guided_grammar`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guided_regex: Option<String>,
+
+    /// Lark/EBNF grammar for constrained decoding (mutually exclusive with `response_format` and `guided_regex`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guided_grammar: Option<String>,
 
     /// Only allow sampling from these token IDs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -481,9 +485,13 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 
-    /// Regex pattern for constrained decoding (mutually exclusive with `response_format`).
+    /// Regex pattern for constrained decoding (mutually exclusive with `guided_grammar`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guided_regex: Option<String>,
+
+    /// Lark/EBNF grammar for constrained decoding (mutually exclusive with `guided_regex`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guided_grammar: Option<String>,
 
     /// Only allow sampling from these token IDs.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -2849,9 +2849,12 @@ impl AsyncEngine {
             None
         };
 
-        // Parse response_format → guided_grammar, or guided_regex (mutually exclusive).
-        let guided_grammar =
-            resolve_guided_grammar(&request.response_format, &request.guided_regex)?;
+        // Parse response_format / guided_regex / guided_grammar (mutually exclusive).
+        let guided_grammar = resolve_guided_grammar(
+            &request.response_format,
+            &request.guided_regex,
+            &request.guided_grammar,
+        )?;
 
         // Tokenize bad_words strings into token sequences.
         let bad_words_token_ids = self.tokenize_bad_words(&request.bad_words)?;
@@ -2895,13 +2898,9 @@ impl AsyncEngine {
         // Completion API: logprobs is directly the count.
         let logprobs = request.logprobs.map(|n| n as i32);
 
-        // guided_regex → guided_grammar (completions have no response_format).
-        let guided_grammar = request
-            .guided_regex
-            .as_ref()
-            .map(|pattern| GuidedGrammar::Regex {
-                pattern: pattern.clone(),
-            });
+        // guided_regex / guided_grammar (completions have no response_format).
+        let guided_grammar =
+            resolve_guided_grammar(&None, &request.guided_regex, &request.guided_grammar)?;
 
         // Tokenize bad_words strings into token sequences.
         let bad_words_token_ids = self.tokenize_bad_words(&request.bad_words)?;
@@ -3155,24 +3154,32 @@ fn parse_response_format(
     }
 }
 
-/// Resolve `response_format` and `guided_regex` into a single `GuidedGrammar`.
+/// Resolve `response_format`, `guided_regex`, and `guided_grammar` into a single `GuidedGrammar`.
 ///
-/// These are mutually exclusive — returns an error if both are set.
+/// These are mutually exclusive — returns an error if more than one is set.
 fn resolve_guided_grammar(
     response_format: &Option<protocol::ResponseFormat>,
     guided_regex: &Option<String>,
+    guided_grammar: &Option<String>,
 ) -> ServeResult<Option<GuidedGrammar>> {
     let from_rf = parse_response_format(response_format)?;
     let from_regex = guided_regex.as_ref().map(|pattern| GuidedGrammar::Regex {
         pattern: pattern.clone(),
     });
-    match (from_rf, from_regex) {
-        (Some(_), Some(_)) => Err(ServeError::Validation(
-            "response_format and guided_regex are mutually exclusive".into(),
+    let from_ebnf = guided_grammar.as_ref().map(|grammar| GuidedGrammar::Ebnf {
+        grammar: grammar.clone(),
+    });
+
+    let options: Vec<_> = [from_rf, from_regex, from_ebnf]
+        .into_iter()
+        .flatten()
+        .collect();
+    match options.len() {
+        0 => Ok(None),
+        1 => Ok(Some(options.into_iter().next().unwrap())),
+        _ => Err(ServeError::Validation(
+            "response_format, guided_regex, and guided_grammar are mutually exclusive".into(),
         )),
-        (Some(g), None) => Ok(Some(g)),
-        (None, Some(g)) => Ok(Some(g)),
-        (None, None) => Ok(None),
     }
 }
 
@@ -3413,6 +3420,7 @@ mod tests {
             cache_salt: None,
             request_id: None,
             guided_regex: None,
+            guided_grammar: None,
             allowed_token_ids: None,
             bad_words: None,
             truncate_prompt_tokens: None,
@@ -3505,6 +3513,7 @@ mod tests {
             cache_salt: None,
             request_id: None,
             guided_regex: None,
+            guided_grammar: None,
             allowed_token_ids: None,
             bad_words: None,
             truncate_prompt_tokens: None,
@@ -3557,6 +3566,7 @@ mod tests {
             cache_salt: None,
             request_id: None,
             guided_regex: None,
+            guided_grammar: None,
             allowed_token_ids: None,
             bad_words: None,
             truncate_prompt_tokens: None,
@@ -3788,6 +3798,7 @@ mod tests {
             cache_salt: None,
             request_id: None,
             guided_regex: None,
+            guided_grammar: None,
             allowed_token_ids: None,
             bad_words: None,
             truncate_prompt_tokens: None,
@@ -4125,13 +4136,13 @@ mod tests {
 
     #[test]
     fn test_resolve_guided_grammar_none() {
-        let result = resolve_guided_grammar(&None, &None).unwrap();
+        let result = resolve_guided_grammar(&None, &None, &None).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_resolve_guided_grammar_regex_only() {
-        let result = resolve_guided_grammar(&None, &Some("[0-9]+".to_string())).unwrap();
+        let result = resolve_guided_grammar(&None, &Some("[0-9]+".to_string()), &None).unwrap();
         match result {
             Some(GuidedGrammar::Regex { pattern }) => assert_eq!(pattern, "[0-9]+"),
             other => panic!("expected Regex, got {other:?}"),
@@ -4144,8 +4155,20 @@ mod tests {
             format_type: "json_object".to_string(),
             json_schema: None,
         };
-        let result = resolve_guided_grammar(&Some(rf), &None).unwrap();
+        let result = resolve_guided_grammar(&Some(rf), &None, &None).unwrap();
         assert!(matches!(result, Some(GuidedGrammar::Json)));
+    }
+
+    #[test]
+    fn test_resolve_guided_grammar_ebnf_only() {
+        let result =
+            resolve_guided_grammar(&None, &None, &Some(r#"start: /[0-9]+/"#.to_string())).unwrap();
+        match result {
+            Some(GuidedGrammar::Ebnf { grammar }) => {
+                assert_eq!(grammar, r#"start: /[0-9]+/"#)
+            }
+            other => panic!("expected Ebnf, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4154,7 +4177,17 @@ mod tests {
             format_type: "json_object".to_string(),
             json_schema: None,
         };
-        let result = resolve_guided_grammar(&Some(rf), &Some("[0-9]+".to_string()));
+        let result = resolve_guided_grammar(&Some(rf), &Some("[0-9]+".to_string()), &None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_guided_grammar_regex_and_ebnf_conflict() {
+        let result = resolve_guided_grammar(
+            &None,
+            &Some("[0-9]+".to_string()),
+            &Some("start: /[0-9]+/".to_string()),
+        );
         assert!(result.is_err());
     }
 

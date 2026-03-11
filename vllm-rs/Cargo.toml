@@ -88,7 +88,9 @@ minijinja = { version = "2", features = ["builtins", "json", "loader"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # Structured output / constrained decoding
-outlines-core = { version = "0.2", default-features = false }
+llguidance = { version = "1.6" }
+toktrie = { version = "1.6" }
+toktrie_hf_tokenizers = { version = "1.6" }
 
 # Tensor ops
 candle-core = { version = "0.9", default-features = false }

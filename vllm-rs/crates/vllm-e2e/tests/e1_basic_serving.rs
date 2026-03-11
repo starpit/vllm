@@ -2332,6 +2332,40 @@ async fn test_cuda_grammar_json_object() {
     );
 }
 
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_grammar_ebnf_digits() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Use guided_grammar (Lark/EBNF) to force digit-only output.
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg("Give me a number.")],
+        max_tokens: Some(10),
+        temperature: Some(0.0),
+        guided_grammar: Some(r#"start: /[0-9]+/"#.to_string()),
+        ..default_chat_request()
+    };
+
+    let resp = client.chat_completion(&request).await.unwrap();
+    assert_valid_chat_response(&resp);
+
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(
+        !text.is_empty(),
+        "EBNF grammar-constrained output should not be empty"
+    );
+    assert!(
+        text.chars().all(|c| c.is_ascii_digit()),
+        "guided_grammar digits should produce only digits, got: {text:?}"
+    );
+}
+
 // ===========================================================================
 // LogitsProcessor tests: min_tokens, logit_bias, penalties
 // ===========================================================================

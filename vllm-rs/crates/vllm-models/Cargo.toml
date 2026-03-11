@@ -7,13 +7,15 @@ description = "Shared model infrastructure: sampler, attention metadata, KV cach
 
 [features]
 default = []
-guided-decoding = ["outlines-core"]
+guided-decoding = ["llguidance", "toktrie", "toktrie_hf_tokenizers"]
 
 [dependencies]
 vllm-common = { workspace = true }
 vllm-model = { workspace = true }
 candle-core = { workspace = true }
-outlines-core = { workspace = true, optional = true }
+llguidance = { workspace = true, optional = true }
+toktrie = { workspace = true, optional = true }
+toktrie_hf_tokenizers = { workspace = true, optional = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }

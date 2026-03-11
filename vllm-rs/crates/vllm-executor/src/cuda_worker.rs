@@ -1481,9 +1481,9 @@ pub struct CudaWorker {
     /// Per-request grammar guide state for constrained decoding.
     #[cfg(feature = "guided-decoding")]
     grammar_states: HashMap<String, vllm_models::grammar::GrammarGuide>,
-    /// Compiled vocabulary for grammar-guided decoding (built once from tokenizer).
+    /// Parser factory for grammar-guided decoding (built once from tokenizer).
     #[cfg(feature = "guided-decoding")]
-    grammar_vocabulary: Option<outlines_core::vocabulary::Vocabulary>,
+    grammar_factory: Option<std::sync::Arc<vllm_models::grammar::LlgParserFactory>>,
 
     /// LogitsProcessor pipeline: persistent GPU state, rebuilt only on batch changes.
     logits_pipeline: Option<LogitsProcessorPipeline>,
@@ -1536,7 +1536,7 @@ impl CudaWorker {
             #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
-            grammar_vocabulary: None,
+            grammar_factory: None,
             logits_pipeline: None,
             grammar_processor: GrammarMaskProcessor::new(),
             allowed_token_ids_processor: AllowedTokenIdsProcessor::new(),
@@ -1586,10 +1586,10 @@ impl CudaWorker {
         }
     }
 
-    /// Build grammar vocabulary on demand (lazy — deferred from startup).
+    /// Build grammar parser factory on demand (lazy — deferred from startup).
     #[cfg(feature = "guided-decoding")]
-    fn ensure_grammar_vocabulary(&mut self) {
-        if self.grammar_vocabulary.is_some() {
+    fn ensure_grammar_factory(&mut self) {
+        if self.grammar_factory.is_some() {
             return;
         }
         let Some(model_dir) = &self.model_dir else {
@@ -1600,31 +1600,23 @@ impl CudaWorker {
             info!("CudaWorker: no tokenizer.json found, grammar-guided decoding unavailable");
             return;
         }
-        let tokenizer = match tokenizers::Tokenizer::from_file(&tokenizer_path) {
-            Ok(t) => t,
+        let tokenizer_bytes = match std::fs::read(&tokenizer_path) {
+            Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
-                    "CudaWorker: failed to load tokenizer.json for grammar vocabulary: {e}"
+                    "CudaWorker: failed to read tokenizer.json for grammar factory: {e}"
                 );
                 return;
             }
         };
 
-        let hf_vocab = tokenizer.get_vocab(true);
-        let eos_token_id = tokenizer.token_to_id("</s>").unwrap_or(0);
-        let tokens: Vec<(u32, String)> = hf_vocab.into_iter().map(|(s, id)| (id, s)).collect();
-
-        match vllm_models::grammar::build_vocabulary(&tokens, eos_token_id) {
-            Ok(vocab) => {
-                info!(
-                    "CudaWorker: grammar vocabulary built ({} tokens, eos={})",
-                    vocab.len(),
-                    eos_token_id
-                );
-                self.grammar_vocabulary = Some(vocab);
+        match vllm_models::grammar::build_parser_factory(&tokenizer_bytes) {
+            Ok(factory) => {
+                info!("CudaWorker: grammar parser factory built");
+                self.grammar_factory = Some(factory);
             }
             Err(e) => {
-                tracing::warn!("CudaWorker: failed to build grammar vocabulary: {e}");
+                tracing::warn!("CudaWorker: failed to build grammar parser factory: {e}");
             }
         }
     }
@@ -3893,7 +3885,7 @@ impl CudaWorker {
                     .is_some_and(|p| p.guided_grammar.is_some())
             });
             if needs_grammar {
-                self.ensure_grammar_vocabulary();
+                self.ensure_grammar_factory();
             }
         }
 
@@ -3928,9 +3920,10 @@ impl CudaWorker {
                 }
                 #[cfg(feature = "guided-decoding")]
                 if let Some(ref grammar) = params.guided_grammar
-                    && let Some(ref vocab) = self.grammar_vocabulary
+                    && let Some(ref factory) = self.grammar_factory
                 {
-                    match vllm_models::grammar::GrammarGuide::from_guided_grammar(grammar, vocab) {
+                    match vllm_models::grammar::GrammarGuide::from_guided_grammar(grammar, factory)
+                    {
                         Ok(guide) => {
                             self.grammar_states.insert(new_req.req_id.clone(), guide);
                         }
@@ -4179,7 +4172,7 @@ impl CudaWorker {
                     .enumerate()
                     .filter_map(|(idx, rid)| {
                         self.grammar_states
-                            .get(rid)
+                            .get_mut(rid)
                             .and_then(|g| g.allowed_tokens())
                             .map(|allowed| (idx, allowed))
                     })

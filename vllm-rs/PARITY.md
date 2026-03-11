@@ -94,7 +94,6 @@
 | `bench sweep` | ✅ | ✅ | serve + startup subcommands; plot subcommands omitted (Python-only matplotlib) |
 | Offline batch inference (CLI) | ✅ | ✅ | Python: `run-batch`; Rust: `batch` + `run-batch` alias |
 | `collect-env` | ✅ | ✅ | Rust-tailored: reports rustc/cargo/features instead of PyTorch/pip |
-| `convert` model weights | ❌ | ⚠️ | Rust: argument parsing only (stub) |
 | `top` — live TUI dashboard | ❌ | ✅ | Rust-only; ratatui-based |
 
 ---

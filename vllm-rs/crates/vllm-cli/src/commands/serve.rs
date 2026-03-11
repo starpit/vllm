@@ -53,8 +53,33 @@ fn print_banner(version: &str, model: &str) {
 pub async fn run_serve(args: ServeArgs) -> Result<()> {
     let startup_start = Instant::now();
 
-    // 1. Init tracing.
-    telemetry::init_tracing(&args.log_level);
+    // 1. Init tracing (with optional OpenTelemetry export).
+    #[cfg(feature = "otel")]
+    let _otel_guard = {
+        if let Some(ref endpoint) = args.otlp_traces_endpoint {
+            let otel_config = telemetry::OtelConfig {
+                endpoint: endpoint.clone(),
+            };
+            let guard = telemetry::init_tracing_with_otel(&args.log_level, &otel_config);
+            if guard.is_some() {
+                tracing::info!("OpenTelemetry tracing enabled → {}", endpoint);
+            }
+            guard
+        } else {
+            telemetry::init_tracing(&args.log_level);
+            None
+        }
+    };
+    #[cfg(not(feature = "otel"))]
+    {
+        if args.otlp_traces_endpoint.is_some() {
+            eprintln!(
+                "WARNING: --otlp-traces-endpoint requires building with --features otel. \
+                 Ignoring."
+            );
+        }
+        telemetry::init_tracing(&args.log_level);
+    }
 
     let model = args.resolved_model().map_err(|e| anyhow::anyhow!(e))?;
     let host = args.host.clone();

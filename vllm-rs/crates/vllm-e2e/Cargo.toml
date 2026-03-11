@@ -8,6 +8,7 @@ description = "End-to-end tests for vLLM Rust inference engine"
 [features]
 default = ["guided-decoding", "chat-template", "metrics", "multimodal", "tls"]
 e2e = []
+otel = ["vllm-serve/otel", "vllm-common/otel"]
 cuda = ["vllm-serve/cuda"]
 nccl = ["cuda"]
 metal = ["vllm-serve/metal"]

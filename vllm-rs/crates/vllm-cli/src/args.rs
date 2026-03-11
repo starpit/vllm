@@ -224,6 +224,12 @@ pub struct ServeArgs {
     /// Adds a few seconds to startup. Mainly benefits compute-bound prefill GEMMs.
     #[arg(long)]
     pub cublas_autotune: bool,
+
+    /// Target URL for OpenTelemetry traces (OTLP gRPC endpoint).
+    /// Example: http://localhost:4317
+    /// Requires building with --features otel.
+    #[arg(long, env = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")]
+    pub otlp_traces_endpoint: Option<String>,
 }
 
 impl ServeArgs {

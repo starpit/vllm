@@ -4010,7 +4010,7 @@ mod tests_flash_attn {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 0, // seqlenq_ngroups_swapped = false
-                total_q as i32,
+                batch as i32,
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -4114,7 +4114,7 @@ mod tests_flash_attn {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 0, // seqlenq_ngroups_swapped = false
-                total_q as i32,
+                batch as i32,
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -4295,7 +4295,7 @@ mod tests_flash_attn {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 0, // seqlenq_ngroups_swapped = false
-                total_q as i32,
+                batch as i32,
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -4624,7 +4624,7 @@ mod tests_flash_attn {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 0, // seqlenq_ngroups_swapped = false
-                total_q as i32,
+                batch_size as i32,
                 stream,
             );
         };
@@ -4832,7 +4832,7 @@ mod tests_flash_attn {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 0, // seqlenq_ngroups_swapped = false
-                total_q as i32,
+                1, // total_q = 1 (single query token)
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");

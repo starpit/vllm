@@ -216,7 +216,7 @@ Scheduling,Chunked prefill,yes,yes,,Default on in both,
 Scheduling,Prefix caching (APC),yes,yes,,Hash-based block reuse; default on in both,
 Scheduling,Async scheduling (overlap GPU/CPU),yes,yes,,,
 Scheduling,Preemption (swap to CPU),yes,no,,,yes
-Scheduling,Custom scheduler class (pluggable),yes,no,,,
+Scheduling,Custom scheduler class (pluggable),yes,no,,Python-only: dynamic class loading by import path; even Python marks this unstable,wontfix
 KV Cache,Paged KV cache (block pool),yes,yes,,,
 KV Cache,Block allocation / free / reuse,yes,yes,,,
 KV Cache,Prefix-cached block lookup,yes,yes,,,

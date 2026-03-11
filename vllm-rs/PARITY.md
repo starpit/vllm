@@ -6,7 +6,8 @@
 |--------|---------|------:|
 | ✅ 🟦 | Implemented | 149 |
 | ⚠️ 🟨 | Partial | 4 |
-| ❌ 🟥 | Not implemented | 153 |
+| ❌ 🟥 | Not implemented | 151 |
+| 🚫 | Won't fix | 2 |
 
 ---
 
@@ -16,7 +17,7 @@
 
 | Section | Parity | ✅ | ⚠️ | ❌ |
 |---|---|---:|---:|---:|
-| [Hardware Platforms](#hardware-platforms) | 🟦🟦🟥🟥🟥🟥🟥🟥🟥 | 2 | 0 | 7 |
+| [Hardware Platforms](#hardware-platforms) | 🟦🟦🟥🟥🟥🟥🟥🟥 | 2 | 0 | 6 |
 | [Multi-GPU & Distribution](#multi-gpu--distribution) | 🟦🟥🟥🟥🟥🟥🟥🟥🟥 | 1 | 0 | 8 |
 | [CLI Commands](#cli-commands) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 10 | 0 | 0 |
 | [OpenAI-Compatible API Endpoints](#openai-compatible-api-endpoints) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥 | 10 | 0 | 3 |
@@ -27,7 +28,7 @@
 | [Model Architectures — Audio / Speech](#model-architectures--audio--speech) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
 | [Model Architectures — Speculative Decoding Draft Models](#model-architectures--speculative-decoding-draft-models) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
 | [Quantization Methods](#quantization-methods) | 🟦🟦🟦🟦🟨🟥🟥🟥🟥🟥🟥🟥🟥 | 4 | 1 | 8 |
-| [Attention Backends](#attention-backends) | 🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 3 | 0 | 10 |
+| [Attention Backends](#attention-backends) | 🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 3 | 0 | 9 |
 | [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 22 | 0 | 0 |
 | [Structured Output / Guided Decoding](#structured-output--guided-decoding) | 🟦🟦🟦🟦🟦🟦🟥🟥🟥 | 6 | 0 | 3 |
 | [Tool Calling / Function Calling](#tool-calling--function-calling) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 10 | 1 | 25 |
@@ -42,7 +43,7 @@
 | [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 22 | 0 | 4 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟦 | 7 | 0 | 0 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥 | 7 | 0 | 2 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **149** | **4** | **153** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **149** | **4** | **151** |
 
 ---
 
@@ -50,7 +51,7 @@
 
 | Feature | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| CPU inference | ✅ | ❌ | Removed with CandleWorker; requires CUDA or Metal |
+| ~~CPU inference~~ | ✅ | ❌ | 🚫 Won't fix — Removed with CandleWorker; requires CUDA or Metal |
 | NVIDIA CUDA | ✅ | ✅ | CudaWorker verified on L40S (SM89) |
 | Apple Metal (MLX) | ❌ | ✅ | Rust-only; `--features metal` via mlx-rs |
 | WebGPU (wgpu) | ❌ | ✅ | Rust-only; `--features wgpu` via wgpu-rs (Metal/Vulkan/DX12); ~51 tok/s Qwen2.5-0.5B on M1 Max |
@@ -253,7 +254,7 @@
 
 | Backend | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| Scaled dot-product (CPU) | ✅ | ❌ | Removed with CandleWorker |
+| ~~Scaled dot-product (CPU)~~ | ✅ | ❌ | 🚫 Won't fix — Removed with CandleWorker |
 | FlashAttention-2 (single sequence) | ✅ | ✅ | CudaWorker: direct FFI |
 | FlashAttention-2 varlen (batched prefill) | ✅ | ❌ | Removed with CandleWorker |
 | Paged FlashAttention-2 (all batches) | ✅ | ✅ | CudaWorker: direct FFI to vllm-flash-attn fork; prefill + decode + mixed |

@@ -32,15 +32,17 @@ def load_csv():
                 v = row.get(key, "").strip().lower()
                 row[key] = v if v else ""
             row["notes"] = row.get("notes", "").strip()
-            row["deprecated"] = row.get("deprecated", "").strip().lower() == "yes"
+            dep_val = row.get("deprecated", "").strip().lower()
+            row["deprecated"] = dep_val == "yes"
+            row["wontfix"] = dep_val == "wontfix"
             rows.append(row)
             sections.setdefault(row["section"], []).append(row)
     return rows, sections
 
 
 def active(rows):
-    """Filter to non-deprecated rows."""
-    return [r for r in rows if not r["deprecated"]]
+    """Filter to non-deprecated and non-wontfix rows."""
+    return [r for r in rows if not r["deprecated"] and not r["wontfix"]]
 
 
 def status_icon(val):
@@ -182,9 +184,14 @@ def generate_section(name, rows):
         notes = row["notes"]
         dep = row["deprecated"]
 
+        wontfix = row["wontfix"]
+
         if dep:
             feat = f"~~{feat}~~"
             notes = f"~~Deprecated in Python V1~~" + (f" {notes}" if notes else "")
+        elif wontfix:
+            feat = f"~~{feat}~~"
+            notes = f"🚫 Won't fix" + (f" — {notes}" if notes else "")
 
         if has_mlx:
             mlx = status_icon(row["rust_mlx"])
@@ -209,12 +216,16 @@ def generate_md():
     leg_yes = sum(1 for r in all_rows if r["python"] in ("yes", "partial") and r["rust"] == "yes")
     leg_partial = sum(1 for r in all_rows if r["python"] in ("yes", "partial") and r["rust"] == "partial")
     leg_no = sum(1 for r in all_rows if r["python"] in ("yes", "partial") and r["rust"] == "no")
+    # Count wontfix across all rows (not just active)
+    all_rows_full = [r for rows in sections.values() for r in rows]
+    leg_wontfix = sum(1 for r in all_rows_full if r["wontfix"])
 
     parts.append("| Symbol | Meaning | Count |")
     parts.append("|--------|---------|------:|")
     parts.append(f"| \u2705 \U0001f7e6 | Implemented | {leg_yes} |")
     parts.append(f"| \u26A0\uFE0F \U0001f7e8 | Partial | {leg_partial} |")
     parts.append(f"| \u274C \U0001f7e5 | Not implemented | {leg_no} |")
+    parts.append(f"| \U0001f6ab | Won't fix | {leg_wontfix} |")
     parts.append("")
     parts.append("---")
     parts.append("")

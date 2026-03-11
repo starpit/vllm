@@ -35,10 +35,11 @@ fn main() {
         rows.push(row);
     }
 
-    // Compute per-section summaries (exclude deprecated)
+    // Compute per-section summaries (exclude deprecated and wontfix)
     let mut summaries: BTreeMap<String, SectionSummary> = BTreeMap::new();
     for row in &rows {
-        if row.deprecated.trim().eq_ignore_ascii_case("yes") {
+        let dep = row.deprecated.trim().to_ascii_lowercase();
+        if dep == "yes" || dep == "wontfix" {
             continue;
         }
         let entry = summaries

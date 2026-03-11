@@ -1,5 +1,5 @@
 section,feature,python,rust,rust_mlx,notes,deprecated
-Hardware Platforms,CPU inference,yes,no,,Removed with CandleWorker; requires CUDA or Metal,
+Hardware Platforms,CPU inference,yes,no,,Removed with CandleWorker; requires CUDA or Metal,wontfix
 Hardware Platforms,NVIDIA CUDA,yes,yes,,CudaWorker verified on L40S (SM89),
 Hardware Platforms,Apple Metal (MLX),no,yes,,Rust-only; `--features metal` via mlx-rs,
 Hardware Platforms,WebGPU (wgpu),no,yes,,Rust-only; `--features wgpu` via wgpu-rs (Metal/Vulkan/DX12); ~51 tok/s Qwen2.5-0.5B on M1 Max,
@@ -125,7 +125,7 @@ Quantization Methods,MXFP4 (microscaling),yes,no,,,
 Quantization Methods,ModelOpt (NVIDIA FP4/FP8),yes,no,,,
 Quantization Methods,Quark (AMD),yes,no,,,
 Quantization Methods,FP8 KV cache quantization,yes,no,,,
-Attention Backends,Scaled dot-product (CPU),yes,no,,Removed with CandleWorker,
+Attention Backends,Scaled dot-product (CPU),yes,no,,Removed with CandleWorker,wontfix
 Attention Backends,FlashAttention-2 (single sequence),yes,yes,,CudaWorker: direct FFI,
 Attention Backends,FlashAttention-2 varlen (batched prefill),yes,no,,Removed with CandleWorker,
 Attention Backends,Paged FlashAttention-2 (all batches),yes,yes,,CudaWorker: direct FFI to vllm-flash-attn fork; prefill + decode + mixed,

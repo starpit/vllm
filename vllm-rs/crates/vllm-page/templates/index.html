@@ -303,6 +303,15 @@ h2 a:hover { color: var(--accent); text-decoration: none; }
     var(--text-muted) 4px
   );
 }
+.sg-cell.st-wontfix {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--text-dim) 0px,
+    var(--text-dim) 2px,
+    var(--text-muted) 2px,
+    var(--text-muted) 4px
+  );
+}
 
 /* Tooltip */
 .sg-tooltip {
@@ -433,6 +442,8 @@ tr:last-child td { border-bottom: none; }
 tr:hover td { background: rgba(255, 255, 255, 0.03); }
 tr.deprecated td { opacity: 0.4; }
 tr.deprecated td:first-child { text-decoration: line-through; }
+tr.wontfix td { opacity: 0.5; }
+tr.wontfix td:first-child { text-decoration: line-through; }
 
 .badge {
   display: inline-block;
@@ -633,7 +644,9 @@ for (const row of ROWS) {
 }
 
 function statusClass(row) {
-  if ((row.deprecated||'').trim().toLowerCase() === 'yes') return 'st-deprecated';
+  const dep = (row.deprecated||'').trim().toLowerCase();
+  if (dep === 'yes') return 'st-deprecated';
+  if (dep === 'wontfix') return 'st-wontfix';
   const v = (row.rust||'').trim();
   if (v === 'yes') return 'st-yes';
   if (v === 'partial') return 'st-partial';
@@ -642,7 +655,9 @@ function statusClass(row) {
 }
 
 function statusLabel(row) {
-  if ((row.deprecated||'').trim().toLowerCase() === 'yes') return 'Deprecated Feature';
+  const dep = (row.deprecated||'').trim().toLowerCase();
+  if (dep === 'yes') return 'Deprecated Feature';
+  if (dep === 'wontfix') return "Won't Fix";
   const v = (row.rust||'').trim();
   if (v === 'yes') return 'Implemented';
   if (v === 'partial') return 'Partial';
@@ -655,7 +670,9 @@ const tooltip = document.getElementById('sg-tooltip');
 let tooltipTimer = null;
 
 function statusColor(row) {
-  if ((row.deprecated||'').trim().toLowerCase() === 'yes') return 'repeating-linear-gradient(-45deg, var(--text-dim) 0px, var(--text-dim) 2px, var(--text-muted) 2px, var(--text-muted) 4px)';
+  const dep = (row.deprecated||'').trim().toLowerCase();
+  if (dep === 'yes') return 'repeating-linear-gradient(-45deg, var(--text-dim) 0px, var(--text-dim) 2px, var(--text-muted) 2px, var(--text-muted) 4px)';
+  if (dep === 'wontfix') return 'repeating-linear-gradient(45deg, var(--text-dim) 0px, var(--text-dim) 2px, var(--text-muted) 2px, var(--text-muted) 4px)';
   const v = (row.rust||'').trim();
   if (v === 'yes') return 'var(--green)';
   if (v === 'partial') return 'var(--yellow)';
@@ -687,7 +704,7 @@ function renderSummary() {
   for (const [section, features] of Object.entries(ROWS_BY_SECTION)) {
     const esc = section.replace(/'/g, "\\'");
     let cells = '';
-    const done = features.every(r => (r.rust||'').trim() === 'yes' || (r.deprecated||'').trim().toLowerCase() === 'yes');
+    const done = features.every(r => { const dep = (r.deprecated||'').trim().toLowerCase(); return (r.rust||'').trim() === 'yes' || dep === 'yes' || dep === 'wontfix'; });
     features.forEach((row, i) => {
       const cls = statusClass(row);
       cells += `<div class="sg-cell ${cls}" data-section="${section}" data-idx="${i}"></div>`;
@@ -769,12 +786,14 @@ function renderParity(filter) {
           <thead><tr><th style="width:40%">Feature</th><th style="width:10%">Python</th><th style="width:10%">Rust</th><th>Notes</th></tr></thead>
           <tbody>`;
     for (const r of rows) {
-      const dep = (r.deprecated||'').trim().toLowerCase() === 'yes';
-      html += `<tr${dep?' class="deprecated"':''}>
+      const dep = (r.deprecated||'').trim().toLowerCase();
+      const cls = dep === 'yes' ? ' class="deprecated"' : dep === 'wontfix' ? ' class="wontfix"' : '';
+      const notesText = dep === 'wontfix' ? `🚫 Won't fix${r.notes ? ' — ' + r.notes : ''}` : (r.notes||'');
+      html += `<tr${cls}>
         <td>${r.feature}</td>
         <td>${badge(r.python)}</td>
         <td>${badge(r.rust)}</td>
-        <td class="notes-col">${r.notes||''}</td>
+        <td class="notes-col">${notesText}</td>
       </tr>`;
     }
     html += '</tbody></table></div></div>';

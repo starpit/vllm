@@ -686,9 +686,8 @@ pub fn partial_json_parse(input: &str) -> Option<serde_json::Value> {
         return Some(v);
     }
 
-    // Count unmatched braces/brackets (outside strings).
-    let mut open_braces = 0i32;
-    let mut open_brackets = 0i32;
+    // Track unmatched delimiters in order (outside strings).
+    let mut delimiter_stack: Vec<char> = Vec::new();
     let mut in_string = false;
     let mut prev_backslash = false;
 
@@ -706,33 +705,37 @@ pub fn partial_json_parse(input: &str) -> Option<serde_json::Value> {
         }
         match ch {
             '"' => in_string = true,
-            '{' => open_braces += 1,
-            '}' => open_braces -= 1,
-            '[' => open_brackets += 1,
-            ']' => open_brackets -= 1,
+            '{' => delimiter_stack.push('{'),
+            '}' => {
+                delimiter_stack.pop();
+            }
+            '[' => delimiter_stack.push('['),
+            ']' => {
+                delimiter_stack.pop();
+            }
             _ => {}
         }
         prev_backslash = false;
     }
 
-    if open_braces <= 0 && open_brackets <= 0 {
-        return None; // Not fixable by closing braces.
+    if delimiter_stack.is_empty() && !in_string {
+        return None; // Not fixable by closing delimiters.
     }
 
-    // Try closing the string if we're inside one, then close braces/brackets.
+    // Try closing the string if we're inside one, then close delimiters
+    // in reverse order (innermost first).
     let mut fixed = input.to_string();
 
-    // If we ended inside a string, close it.
     if in_string {
         fixed.push('"');
     }
 
-    // Close brackets then braces (inner-to-outer order).
-    for _ in 0..open_brackets {
-        fixed.push(']');
-    }
-    for _ in 0..open_braces {
-        fixed.push('}');
+    for &delim in delimiter_stack.iter().rev() {
+        match delim {
+            '{' => fixed.push('}'),
+            '[' => fixed.push(']'),
+            _ => {}
+        }
     }
 
     serde_json::from_str(&fixed).ok()
@@ -1603,6 +1606,640 @@ impl MistralStreamingState {
 }
 
 // ---------------------------------------------------------------------------
+// Jamba tool parser
+// ---------------------------------------------------------------------------
+
+const JAMBA_TOOL_CALLS_OPEN: &str = "<tool_calls>";
+const JAMBA_TOOL_CALLS_CLOSE: &str = "</tool_calls>";
+
+/// Jamba-style tool call parser.
+///
+/// Detects tool calls wrapped in `<tool_calls>...</tool_calls>` tags.
+/// The content between tags is a JSON **array** of objects, each with
+/// `name` and `arguments` fields.
+///
+/// Port of: `vllm/tool_parsers/jamba_tool_parser.py`
+#[derive(Default)]
+pub struct JambaToolParser;
+
+impl JambaToolParser {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ToolCallParser for JambaToolParser {
+    fn extract_tool_calls(&self, model_output: &str) -> ExtractedToolCallInfo {
+        jamba_extract(model_output)
+    }
+
+    fn create_streaming_state(&self) -> Box<dyn StreamingToolParserState + Send> {
+        Box::new(JambaStreamingState::new())
+    }
+}
+
+/// Extract tool calls from Jamba-formatted text.
+fn jamba_extract(text: &str) -> ExtractedToolCallInfo {
+    // Check for the open tag.
+    let Some(open_pos) = text.find(JAMBA_TOOL_CALLS_OPEN) else {
+        return ExtractedToolCallInfo {
+            tools_called: false,
+            tool_calls: Vec::new(),
+            content: Some(text.to_string()),
+        };
+    };
+
+    // Content before the open tag.
+    let before = text[..open_pos].trim();
+    let content = if before.is_empty() {
+        None
+    } else {
+        Some(before.to_string())
+    };
+
+    // Extract the JSON array between tags.
+    let json_start = open_pos + JAMBA_TOOL_CALLS_OPEN.len();
+    let json_end = text[json_start..]
+        .find(JAMBA_TOOL_CALLS_CLOSE)
+        .map(|p| json_start + p)
+        .unwrap_or(text.len());
+    let json_str = text[json_start..json_end].trim();
+
+    // Parse as a JSON array.
+    let arr: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
+        Ok(arr) => arr,
+        Err(_) => {
+            return ExtractedToolCallInfo {
+                tools_called: false,
+                tool_calls: Vec::new(),
+                content: Some(text.to_string()),
+            };
+        }
+    };
+
+    let tool_calls: Vec<protocol::ToolCall> = arr
+        .iter()
+        .filter_map(|val| {
+            let name = val.get("name")?.as_str()?.to_string();
+            let arguments = val.get("arguments")?;
+            let arguments_str = if arguments.is_string() {
+                arguments.as_str().unwrap().to_string()
+            } else {
+                serde_json::to_string(arguments).ok()?
+            };
+            Some(protocol::ToolCall {
+                id: format!("call_{}", Uuid::new_v4().simple()),
+                call_type: "function".to_string(),
+                function: protocol::FunctionCall {
+                    name,
+                    arguments: arguments_str,
+                },
+            })
+        })
+        .collect();
+
+    if tool_calls.is_empty() {
+        ExtractedToolCallInfo {
+            tools_called: false,
+            tool_calls: Vec::new(),
+            content: Some(text.to_string()),
+        }
+    } else {
+        ExtractedToolCallInfo {
+            tools_called: true,
+            tool_calls,
+            content,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Jamba streaming state machine
+// ---------------------------------------------------------------------------
+
+struct JambaStreamingState {
+    /// Current tool call index (-1 = no tool call started).
+    current_tool_id: i32,
+    /// Whether the name for the current tool has been sent.
+    current_tool_name_sent: bool,
+    /// Previously parsed tool call array.
+    prev_tool_call_arr: Vec<serde_json::Value>,
+    /// Streamed argument characters for each tool call (for diffing).
+    streamed_args_for_tool: Vec<String>,
+    /// Buffer for partial tag tokens.
+    buffer: String,
+    /// Whether we've seen the open tag yet.
+    seen_open_tag: bool,
+}
+
+impl JambaStreamingState {
+    fn new() -> Self {
+        Self {
+            current_tool_id: -1,
+            current_tool_name_sent: false,
+            prev_tool_call_arr: Vec::new(),
+            streamed_args_for_tool: Vec::new(),
+            buffer: String::new(),
+            seen_open_tag: false,
+        }
+    }
+}
+
+impl StreamingToolParserState for JambaStreamingState {
+    fn process_delta(
+        &mut self,
+        _previous_text: &str,
+        current_text: &str,
+        delta_text: &str,
+    ) -> ToolParserDelta {
+        // Buffer delta for partial tag detection.
+        self.buffer.push_str(delta_text);
+
+        // Check for partial open/close tags.
+        if is_partial_jamba_tag(&self.buffer) {
+            return ToolParserDelta::None;
+        }
+
+        let text_to_process = std::mem::take(&mut self.buffer);
+
+        // If we haven't seen the open tag yet, check for it.
+        if !self.seen_open_tag {
+            if current_text.contains(JAMBA_TOOL_CALLS_OPEN) {
+                self.seen_open_tag = true;
+                // Suppress the open tag token itself.
+                if text_to_process.contains(JAMBA_TOOL_CALLS_OPEN) {
+                    // There might be content before the tag in previous deltas
+                    // (already streamed). Just suppress this delta.
+                    return ToolParserDelta::None;
+                }
+            } else {
+                // No tool calls yet — emit as content.
+                return ToolParserDelta::Content(text_to_process);
+            }
+        }
+
+        // We're inside the <tool_calls> region. Extract the parsable array.
+        let parsable_arr = current_text
+            .split(JAMBA_TOOL_CALLS_OPEN)
+            .last()
+            .unwrap_or("")
+            .split(JAMBA_TOOL_CALLS_CLOSE)
+            .next()
+            .unwrap_or("");
+
+        // Try partial JSON parse of the array.
+        let parsed = partial_json_parse(parsable_arr.trim());
+
+        let Some(val) = parsed else {
+            return ToolParserDelta::None;
+        };
+
+        let Some(tool_call_arr) = val.as_array() else {
+            return ToolParserDelta::None;
+        };
+
+        // Empty array — nothing to stream yet.
+        if tool_call_arr.is_empty() {
+            return ToolParserDelta::None;
+        }
+
+        // Check if a new tool call started (array grew past our cursor).
+        if tool_call_arr.len() as i32 > self.current_tool_id + 1 {
+            // Flush remaining args for the previous tool if any.
+            let flush_delta = if self.current_tool_id >= 0 {
+                let prev_idx = self.current_tool_id as usize;
+                let prev_call = &tool_call_arr[prev_idx];
+                let cur_args = prev_call
+                    .get("arguments")
+                    .map(|a| {
+                        if a.is_string() {
+                            a.as_str().unwrap().to_string()
+                        } else {
+                            serde_json::to_string(a).unwrap_or_default()
+                        }
+                    })
+                    .unwrap_or_default();
+                let prev_streamed = &self.streamed_args_for_tool[prev_idx];
+                if cur_args.len() > prev_streamed.len() {
+                    let diff = cur_args[prev_streamed.len()..].to_string();
+                    self.streamed_args_for_tool[prev_idx] = cur_args;
+                    Some(DeltaToolCall {
+                        index: prev_idx as u32,
+                        id: None,
+                        call_type: None,
+                        function_name: None,
+                        function_arguments: Some(diff),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Advance to the new tool.
+            self.current_tool_id = tool_call_arr.len() as i32 - 1;
+            self.current_tool_name_sent = false;
+            self.streamed_args_for_tool.push(String::new());
+            self.prev_tool_call_arr = tool_call_arr.clone();
+
+            if let Some(flush) = flush_delta {
+                return ToolParserDelta::ToolCalls(vec![flush]);
+            }
+            // Fall through to try sending the name for the new tool.
+        }
+
+        let tool_idx = self.current_tool_id as usize;
+        let current_tool_call = &tool_call_arr[tool_idx];
+
+        // Try to send the name if not yet sent.
+        if !self.current_tool_name_sent {
+            if let Some(name) = current_tool_call.get("name").and_then(|n| n.as_str()) {
+                self.current_tool_name_sent = true;
+                self.prev_tool_call_arr = tool_call_arr.clone();
+                return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
+                    index: tool_idx as u32,
+                    id: Some(format!("call_{}", Uuid::new_v4().simple())),
+                    call_type: Some("function".to_string()),
+                    function_name: Some(name.to_string()),
+                    function_arguments: Some(String::new()),
+                }]);
+            }
+            return ToolParserDelta::None;
+        }
+
+        // Stream arguments diff.
+        let current_args = current_tool_call
+            .get("arguments")
+            .map(|a| {
+                if a.is_string() {
+                    a.as_str().unwrap().to_string()
+                } else {
+                    serde_json::to_string(a).unwrap_or_default()
+                }
+            })
+            .unwrap_or_default();
+
+        let prev_args = &self.streamed_args_for_tool[tool_idx];
+        if current_args.len() > prev_args.len() {
+            let diff = current_args[prev_args.len()..].to_string();
+            self.streamed_args_for_tool[tool_idx] = current_args;
+            self.prev_tool_call_arr = tool_call_arr.clone();
+
+            return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
+                index: tool_idx as u32,
+                id: None,
+                call_type: None,
+                function_name: None,
+                function_arguments: Some(diff),
+            }]);
+        }
+
+        self.prev_tool_call_arr = tool_call_arr.clone();
+        ToolParserDelta::None
+    }
+}
+
+/// Check if text ends with a partial `<tool_calls>` or `</tool_calls>` tag.
+fn is_partial_jamba_tag(text: &str) -> bool {
+    for tag in [JAMBA_TOOL_CALLS_OPEN, JAMBA_TOOL_CALLS_CLOSE] {
+        for i in 1..tag.len() {
+            if text.ends_with(&tag[..i]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Granite tool parser
+// ---------------------------------------------------------------------------
+
+/// Granite 3.0 special token prefix.
+const GRANITE_BOT_TOKEN: &str = "<|tool_call|>";
+/// Granite 3.1 string prefix.
+const GRANITE_BOT_STRING: &str = "<tool_call>";
+
+/// Granite-style tool call parser.
+///
+/// Detects tool calls prefixed by `<|tool_call|>` (Granite 3.0) or
+/// `<tool_call>` (Granite 3.1), followed by a JSON array of objects
+/// with `name` and `arguments` fields.
+///
+/// Port of: `vllm/tool_parsers/granite_tool_parser.py`
+#[derive(Default)]
+pub struct GraniteToolParser;
+
+impl GraniteToolParser {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ToolCallParser for GraniteToolParser {
+    fn extract_tool_calls(&self, model_output: &str) -> ExtractedToolCallInfo {
+        granite_extract(model_output)
+    }
+
+    fn create_streaming_state(&self) -> Box<dyn StreamingToolParserState + Send> {
+        Box::new(GraniteStreamingState::new())
+    }
+}
+
+/// Strip Granite prefix tokens and leading whitespace, returning the
+/// remaining text. Returns `None` if the stripped text doesn't start with `[`.
+fn granite_strip_prefix(text: &str) -> Option<&str> {
+    let mut s = text.trim_start();
+    if let Some(rest) = s.strip_prefix(GRANITE_BOT_TOKEN) {
+        s = rest.trim_start();
+    }
+    if let Some(rest) = s.strip_prefix(GRANITE_BOT_STRING) {
+        s = rest.trim_start();
+    }
+    if s.starts_with('[') { Some(s) } else { None }
+}
+
+/// Extract tool calls from Granite-formatted text.
+fn granite_extract(text: &str) -> ExtractedToolCallInfo {
+    let Some(stripped) = granite_strip_prefix(text) else {
+        return ExtractedToolCallInfo {
+            tools_called: false,
+            tool_calls: Vec::new(),
+            content: Some(text.to_string()),
+        };
+    };
+
+    // Parse as a JSON array.
+    let arr: Vec<serde_json::Value> = match serde_json::from_str(stripped) {
+        Ok(arr) => arr,
+        Err(_) => {
+            return ExtractedToolCallInfo {
+                tools_called: false,
+                tool_calls: Vec::new(),
+                content: Some(text.to_string()),
+            };
+        }
+    };
+
+    let tool_calls: Vec<protocol::ToolCall> = arr
+        .iter()
+        .filter_map(|val| {
+            let name = val.get("name")?.as_str()?.to_string();
+            let arguments = val.get("arguments")?;
+            let arguments_str = if arguments.is_string() {
+                arguments.as_str().unwrap().to_string()
+            } else {
+                serde_json::to_string(arguments).ok()?
+            };
+            Some(protocol::ToolCall {
+                id: format!("call_{}", Uuid::new_v4().simple()),
+                call_type: "function".to_string(),
+                function: protocol::FunctionCall {
+                    name,
+                    arguments: arguments_str,
+                },
+            })
+        })
+        .collect();
+
+    if tool_calls.is_empty() {
+        ExtractedToolCallInfo {
+            tools_called: false,
+            tool_calls: Vec::new(),
+            content: Some(text.to_string()),
+        }
+    } else {
+        ExtractedToolCallInfo {
+            tools_called: true,
+            tool_calls,
+            content: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Granite streaming state machine
+// ---------------------------------------------------------------------------
+
+struct GraniteStreamingState {
+    /// Current tool call index (-1 = no tool call started).
+    current_tool_id: i32,
+    /// Whether the name for the current tool has been sent.
+    current_tool_name_sent: bool,
+    /// Previously parsed tool call array.
+    prev_tool_call_arr: Vec<serde_json::Value>,
+    /// Streamed argument characters for each tool call (for diffing).
+    streamed_args_for_tool: Vec<String>,
+    /// Whether we've found the `[` start of the JSON array.
+    array_started: bool,
+    /// Byte offset where the JSON array begins in current_text.
+    array_start_offset: usize,
+}
+
+impl GraniteStreamingState {
+    fn new() -> Self {
+        Self {
+            current_tool_id: -1,
+            current_tool_name_sent: false,
+            prev_tool_call_arr: Vec::new(),
+            streamed_args_for_tool: Vec::new(),
+            array_started: false,
+            array_start_offset: 0,
+        }
+    }
+}
+
+impl StreamingToolParserState for GraniteStreamingState {
+    fn process_delta(
+        &mut self,
+        _previous_text: &str,
+        current_text: &str,
+        delta_text: &str,
+    ) -> ToolParserDelta {
+        // Find the start of the JSON array if not yet found.
+        if !self.array_started {
+            // Skip prefix tokens and whitespace.
+            let mut s = current_text.trim_start();
+            if let Some(rest) = s.strip_prefix(GRANITE_BOT_TOKEN) {
+                s = rest.trim_start();
+            }
+            if let Some(rest) = s.strip_prefix(GRANITE_BOT_STRING) {
+                s = rest.trim_start();
+            }
+            let offset = current_text.len() - s.len();
+
+            if s.starts_with('[') {
+                self.array_started = true;
+                self.array_start_offset = offset;
+            } else if s.is_empty() {
+                // Still buffering prefix/whitespace.
+                return ToolParserDelta::None;
+            } else {
+                // Not a tool call — regular content.
+                return ToolParserDelta::Content(delta_text.to_string());
+            }
+        }
+
+        // Parse the JSON array portion.
+        let array_text = &current_text[self.array_start_offset..];
+        let parsed = partial_json_parse(array_text.trim());
+
+        let Some(val) = parsed else {
+            return ToolParserDelta::None;
+        };
+
+        let Some(tool_call_arr) = val.as_array() else {
+            return ToolParserDelta::None;
+        };
+
+        if tool_call_arr.is_empty() {
+            return ToolParserDelta::None;
+        }
+
+        // Check completeness of the last element: if the full array_text
+        // parses as valid JSON, the last element is complete.
+        let last_is_complete = serde_json::from_str::<serde_json::Value>(array_text.trim()).is_ok();
+
+        // Check if a new tool call started (array grew past cursor).
+        if tool_call_arr.len() as i32 > self.current_tool_id + 1 {
+            // Flush remaining args for the previous tool.
+            let flush_delta = if self.current_tool_id >= 0 {
+                let prev_idx = self.current_tool_id as usize;
+                let prev_call = &tool_call_arr[prev_idx];
+                let cur_args = prev_call
+                    .get("arguments")
+                    .map(|a| {
+                        if a.is_string() {
+                            a.as_str().unwrap().to_string()
+                        } else {
+                            serde_json::to_string(a).unwrap_or_default()
+                        }
+                    })
+                    .unwrap_or_default();
+                let prev_streamed = &self.streamed_args_for_tool[prev_idx];
+                if cur_args.len() > prev_streamed.len() {
+                    let diff = cur_args[prev_streamed.len()..].to_string();
+                    self.streamed_args_for_tool[prev_idx] = cur_args;
+                    Some(DeltaToolCall {
+                        index: prev_idx as u32,
+                        id: None,
+                        call_type: None,
+                        function_name: None,
+                        function_arguments: Some(diff),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            self.current_tool_id = tool_call_arr.len() as i32 - 1;
+            self.current_tool_name_sent = false;
+            self.streamed_args_for_tool.push(String::new());
+            self.prev_tool_call_arr = tool_call_arr.clone();
+
+            if let Some(flush) = flush_delta {
+                return ToolParserDelta::ToolCalls(vec![flush]);
+            }
+            // Fall through to try sending the name.
+        }
+
+        let tool_idx = self.current_tool_id as usize;
+        let current_tool_call = &tool_call_arr[tool_idx];
+
+        // Try to send the name if not yet sent.
+        if !self.current_tool_name_sent {
+            if let Some(name) = current_tool_call.get("name").and_then(|n| n.as_str()) {
+                self.current_tool_name_sent = true;
+                self.prev_tool_call_arr = tool_call_arr.clone();
+                return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
+                    index: tool_idx as u32,
+                    id: Some(format!("call_{}", Uuid::new_v4().simple())),
+                    call_type: Some("function".to_string()),
+                    function_name: Some(name.to_string()),
+                    function_arguments: Some(String::new()),
+                }]);
+            }
+            return ToolParserDelta::None;
+        }
+
+        // Stream arguments diff.
+        let cur_arguments = current_tool_call.get("arguments");
+        if let Some(cur_args_val) = cur_arguments {
+            let cur_args_json = if cur_args_val.is_string() {
+                cur_args_val.as_str().unwrap().to_string()
+            } else {
+                serde_json::to_string(cur_args_val).unwrap_or_default()
+            };
+
+            let sent = self.streamed_args_for_tool[tool_idx].len();
+
+            // When the tool call JSON is complete, we can send the rest.
+            // When incomplete, use common-prefix diffing to avoid streaming
+            // close-brackets prematurely.
+            let argument_diff = if last_is_complete || tool_idx < tool_call_arr.len() - 1 {
+                // Complete or not the last element — safe to send remainder.
+                if cur_args_json.len() > sent {
+                    Some(cur_args_json[sent..].to_string())
+                } else {
+                    None
+                }
+            } else {
+                // Last element, incomplete — use common prefix with prev.
+                let prev_args_val = self
+                    .prev_tool_call_arr
+                    .get(tool_idx)
+                    .and_then(|v| v.get("arguments"));
+                if let Some(prev_val) = prev_args_val {
+                    let prev_args_json = if prev_val.is_string() {
+                        prev_val.as_str().unwrap().to_string()
+                    } else {
+                        serde_json::to_string(prev_val).unwrap_or_default()
+                    };
+                    if cur_args_json != prev_args_json {
+                        let prefix_len = find_common_prefix_len(&prev_args_json, &cur_args_json);
+                        if prefix_len > sent {
+                            Some(cur_args_json[sent..prefix_len].to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else if cur_args_json.len() > sent {
+                    // No previous args — send what we have.
+                    Some(cur_args_json[sent..].to_string())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(diff) = argument_diff {
+                self.streamed_args_for_tool[tool_idx].push_str(&diff);
+                self.prev_tool_call_arr = tool_call_arr.clone();
+                return ToolParserDelta::ToolCalls(vec![DeltaToolCall {
+                    index: tool_idx as u32,
+                    id: None,
+                    call_type: None,
+                    function_name: None,
+                    function_arguments: Some(diff),
+                }]);
+            }
+        }
+
+        self.prev_tool_call_arr = tool_call_arr.clone();
+        ToolParserDelta::None
+    }
+}
+
+/// Find the length of the common prefix between two strings.
+fn find_common_prefix_len(a: &str, b: &str) -> usize {
+    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
+}
+
+// ---------------------------------------------------------------------------
 // Parser registry
 // ---------------------------------------------------------------------------
 
@@ -1613,6 +2250,8 @@ pub fn get_tool_parser(name: &str) -> Result<Arc<dyn ToolCallParser>, String> {
         "llama3_json" | "llama4_json" => Ok(Arc::new(LlamaJsonToolParser::new())),
         "kimi_k2" => Ok(Arc::new(KimiK2ToolParser::new())),
         "mistral" => Ok(Arc::new(MistralToolParser::new())),
+        "jamba" => Ok(Arc::new(JambaToolParser::new())),
+        "granite" => Ok(Arc::new(GraniteToolParser::new())),
         other => Err(format!("Unknown tool call parser: {other}")),
     }
 }
@@ -2062,6 +2701,11 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_jamba() {
+        assert!(get_tool_parser("jamba").is_ok());
+    }
+
+    #[test]
     fn test_mistral_id_format() {
         let id = mistral_generate_id();
         assert_eq!(id.len(), 9);
@@ -2373,6 +3017,364 @@ mod tests {
                 }
             }
             other => panic!("Expected ToolCalls, got {:?}", other),
+        }
+
+        assert!(got_name);
+    }
+
+    // -- Jamba non-streaming tests --
+
+    #[test]
+    fn test_jamba_single_tool_call() {
+        let parser = JambaToolParser::new();
+        let output =
+            r#"<tool_calls>[{"name":"get_weather","arguments":{"city":"SF"}}]</tool_calls>"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].function.name, "get_weather");
+        assert_eq!(result.tool_calls[0].function.arguments, r#"{"city":"SF"}"#);
+        assert_eq!(result.tool_calls[0].call_type, "function");
+        assert!(result.tool_calls[0].id.starts_with("call_"));
+        assert!(result.content.is_none());
+    }
+
+    #[test]
+    fn test_jamba_two_tool_calls() {
+        let parser = JambaToolParser::new();
+        let output = r#"<tool_calls>[{"name":"search","arguments":{"q":"rust"}},{"name":"fetch","arguments":{"url":"https://example.com"}}]</tool_calls>"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].function.name, "search");
+        assert_eq!(result.tool_calls[1].function.name, "fetch");
+    }
+
+    #[test]
+    fn test_jamba_text_before_tool_calls() {
+        let parser = JambaToolParser::new();
+        let output = r#"I'll help you with that.
+<tool_calls>[{"name":"get_weather","arguments":{"city":"SF"}}]</tool_calls>"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.content.unwrap(), "I'll help you with that.");
+    }
+
+    #[test]
+    fn test_jamba_no_tool_call() {
+        let parser = JambaToolParser::new();
+        let output = "The weather in SF is sunny and 72°F.";
+        let result = parser.extract_tool_calls(output);
+        assert!(!result.tools_called);
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.content.unwrap(), output);
+    }
+
+    #[test]
+    fn test_jamba_malformed_json() {
+        let parser = JambaToolParser::new();
+        let output = r#"<tool_calls>not json at all</tool_calls>"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(!result.tools_called);
+        assert!(result.tool_calls.is_empty());
+        assert!(result.content.is_some());
+    }
+
+    #[test]
+    fn test_jamba_unclosed_tag() {
+        let parser = JambaToolParser::new();
+        let output = r#"<tool_calls>[{"name":"f","arguments":{"a":1}}]"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].function.name, "f");
+    }
+
+    #[test]
+    fn test_jamba_string_arguments() {
+        let parser = JambaToolParser::new();
+        let output = r#"<tool_calls>[{"name":"f","arguments":"{\"a\":1}"}]</tool_calls>"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].function.arguments, r#"{"a":1}"#);
+    }
+
+    // -- Jamba streaming tests --
+
+    #[test]
+    fn test_jamba_streaming_content_then_tool() {
+        let parser = JambaToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        // First token: content.
+        let d1 = state.process_delta("", "Hello", "Hello");
+        assert!(matches!(d1, ToolParserDelta::Content(ref s) if s == "Hello"));
+
+        // Open tag token.
+        let d2 = state.process_delta("Hello", "Hello<tool_calls>", "<tool_calls>");
+        assert!(matches!(d2, ToolParserDelta::None));
+
+        // Start of JSON array with tool name.
+        let d3 = state.process_delta(
+            "Hello<tool_calls>",
+            r#"Hello<tool_calls>[{"name":"get_weather""#,
+            r#"[{"name":"get_weather""#,
+        );
+        // Should get the name.
+        match d3 {
+            ToolParserDelta::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].function_name.as_deref(), Some("get_weather"));
+                assert!(calls[0].id.is_some());
+            }
+            other => panic!("Expected ToolCalls with name, got {:?}", other),
+        }
+
+        // Stream arguments.
+        let d4 = state.process_delta(
+            r#"Hello<tool_calls>[{"name":"get_weather""#,
+            r#"Hello<tool_calls>[{"name":"get_weather","arguments":{"city":"SF"#,
+            r#","arguments":{"city":"SF"#,
+        );
+        match d4 {
+            ToolParserDelta::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert!(calls[0].function_arguments.is_some());
+            }
+            other => panic!("Expected ToolCalls with args, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_jamba_streaming_two_tools() {
+        let parser = JambaToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let tokens = [
+            "<tool_calls>",
+            r#"[{"name":"f1""#,
+            r#","arguments":{"a":1}}"#,
+            r#",{"name":"f2""#,
+            r#","arguments":{"b":2}}"#,
+            "]</tool_calls>",
+        ];
+
+        let mut accumulated = String::new();
+        let mut names = Vec::new();
+
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            if let ToolParserDelta::ToolCalls(calls) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for call in &calls {
+                    if let Some(name) = &call.function_name {
+                        names.push(name.clone());
+                    }
+                }
+            }
+        }
+
+        assert_eq!(names, vec!["f1", "f2"]);
+    }
+
+    // -- Granite non-streaming tests --
+
+    #[test]
+    fn test_granite_single_tool_call_30() {
+        // Granite 3.0 format: <|tool_call|> prefix.
+        let parser = GraniteToolParser::new();
+        let output = r#"<|tool_call|>[{"name":"get_weather","arguments":{"city":"SF"}}]"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].function.name, "get_weather");
+        assert_eq!(result.tool_calls[0].function.arguments, r#"{"city":"SF"}"#);
+        assert_eq!(result.tool_calls[0].call_type, "function");
+        assert!(result.tool_calls[0].id.starts_with("call_"));
+        assert!(result.content.is_none());
+    }
+
+    #[test]
+    fn test_granite_single_tool_call_31() {
+        // Granite 3.1 format: <tool_call> prefix.
+        let parser = GraniteToolParser::new();
+        let output = r#"<tool_call>[{"name":"get_weather","arguments":{"city":"SF"}}]"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn test_granite_two_tool_calls() {
+        let parser = GraniteToolParser::new();
+        let output = r#"<|tool_call|>[{"name":"search","arguments":{"q":"rust"}},{"name":"fetch","arguments":{"url":"https://example.com"}}]"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].function.name, "search");
+        assert_eq!(result.tool_calls[1].function.name, "fetch");
+    }
+
+    #[test]
+    fn test_granite_no_tool_call() {
+        let parser = GraniteToolParser::new();
+        let output = "The weather in SF is sunny and 72°F.";
+        let result = parser.extract_tool_calls(output);
+        assert!(!result.tools_called);
+        assert!(result.tool_calls.is_empty());
+        assert_eq!(result.content.unwrap(), output);
+    }
+
+    #[test]
+    fn test_granite_malformed_json() {
+        let parser = GraniteToolParser::new();
+        let output = r#"<|tool_call|>not json"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(!result.tools_called);
+        assert!(result.content.is_some());
+    }
+
+    #[test]
+    fn test_granite_whitespace_between_prefix_and_array() {
+        let parser = GraniteToolParser::new();
+        let output = "  <|tool_call|>  [  {\"name\":\"f\",\"arguments\":{\"a\":1}}  ]";
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].function.name, "f");
+    }
+
+    #[test]
+    fn test_granite_both_prefixes() {
+        // Both prefixes present (unlikely but handled).
+        let parser = GraniteToolParser::new();
+        let output = r#"<|tool_call|><tool_call>[{"name":"f","arguments":{}}]"#;
+        let result = parser.extract_tool_calls(output);
+        assert!(result.tools_called);
+        assert_eq!(result.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn test_registry_granite() {
+        assert!(get_tool_parser("granite").is_ok());
+    }
+
+    // -- Granite streaming tests --
+
+    #[test]
+    fn test_granite_streaming_basic() {
+        let parser = GraniteToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let tokens = [
+            "<|tool_call|>",
+            r#"[{"name":"get_weather""#,
+            r#","arguments":{"city":"SF"}}]"#,
+        ];
+
+        let mut accumulated = String::new();
+        let mut got_name = false;
+        let mut got_args = false;
+
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            if let ToolParserDelta::ToolCalls(calls) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for call in &calls {
+                    if let Some(name) = &call.function_name {
+                        assert_eq!(name, "get_weather");
+                        got_name = true;
+                    }
+                    if let Some(args) = &call.function_arguments {
+                        if !args.is_empty() {
+                            got_args = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(got_name);
+        assert!(got_args);
+    }
+
+    #[test]
+    fn test_granite_streaming_no_tool() {
+        let parser = GraniteToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let d = state.process_delta("", "Hello world", "Hello world");
+        assert!(matches!(d, ToolParserDelta::Content(ref s) if s == "Hello world"));
+    }
+
+    #[test]
+    fn test_granite_streaming_two_tools() {
+        let parser = GraniteToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let tokens = [
+            "<|tool_call|>",
+            r#"[{"name":"f1""#,
+            r#","arguments":{"a":1}}"#,
+            r#",{"name":"f2""#,
+            r#","arguments":{"b":2}}"#,
+            "]",
+        ];
+
+        let mut accumulated = String::new();
+        let mut names = Vec::new();
+
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            if let ToolParserDelta::ToolCalls(calls) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for call in &calls {
+                    if let Some(name) = &call.function_name {
+                        names.push(name.clone());
+                    }
+                }
+            }
+        }
+
+        assert_eq!(names, vec!["f1", "f2"]);
+    }
+
+    #[test]
+    fn test_granite_streaming_31_prefix() {
+        // Granite 3.1 uses <tool_call> instead of <|tool_call|>.
+        let parser = GraniteToolParser::new();
+        let mut state = parser.create_streaming_state();
+
+        let tokens = [
+            "<tool_call>",
+            r#"[{"name":"f""#,
+            r#","arguments":{"x":1}}]"#,
+        ];
+
+        let mut accumulated = String::new();
+        let mut got_name = false;
+
+        for token in tokens {
+            let prev = accumulated.clone();
+            accumulated.push_str(token);
+            if let ToolParserDelta::ToolCalls(calls) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for call in &calls {
+                    if call.function_name.as_deref() == Some("f") {
+                        got_name = true;
+                    }
+                }
+            }
         }
 
         assert!(got_name);

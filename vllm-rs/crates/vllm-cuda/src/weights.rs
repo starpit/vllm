@@ -2344,6 +2344,85 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_lora_rslora_scaling() {
+        use safetensors::tensor::TensorView;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Base weight: identity-like [2, 2].
+        let base_w: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
+        let base_bytes: Vec<u8> = base_w.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let base_views = vec![(
+            "model.layers.0.self_attn.q_proj.weight",
+            TensorView::new(safetensors::Dtype::F32, vec![2, 2], &base_bytes).unwrap(),
+        )];
+        std::fs::write(
+            dir.path().join("model.safetensors"),
+            safetensors::tensor::serialize(base_views, None).unwrap(),
+        )
+        .unwrap();
+
+        // LoRA with rsLoRA: rank=4, alpha=8 → scaling = 8/sqrt(4) = 4.0
+        // (normal would be 8/4 = 2.0)
+        let adapter_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            adapter_dir.path().join("adapter_config.json"),
+            r#"{"r": 4, "lora_alpha": 8.0, "target_modules": ["q_proj"], "use_rslora": true}"#,
+        )
+        .unwrap();
+
+        // A: [4, 2], B: [2, 4] — simple so B@A = [[1,0],[0,1]] (identity)
+        // A = [[1,0],[0,1],[0,0],[0,0]], B = [[1,0,0,0],[0,1,0,0]]
+        let a_data: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        let b_data: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let a_bytes: Vec<u8> = a_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = b_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        let adapter_views = vec![
+            (
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+                TensorView::new(safetensors::Dtype::F32, vec![4, 2], &a_bytes).unwrap(),
+            ),
+            (
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                TensorView::new(safetensors::Dtype::F32, vec![2, 4], &b_bytes).unwrap(),
+            ),
+        ];
+        std::fs::write(
+            adapter_dir.path().join("adapter_model.safetensors"),
+            safetensors::tensor::serialize(adapter_views, None).unwrap(),
+        )
+        .unwrap();
+
+        let mut gw = GpuWeights {
+            tensors: HashMap::new(),
+            stream: std::ptr::null_mut(),
+            target_dtype: None,
+            cast_pinned: (std::ptr::null_mut(), 0),
+        };
+        gw.load_shard(&dir.path().join("model.safetensors")).unwrap();
+
+        let merged = gw.merge_lora(adapter_dir.path()).unwrap();
+        assert_eq!(merged, 1);
+
+        let (data, shape, _) = gw
+            .take_cpu("model.layers.0.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(shape, vec![2, 2]);
+        let w: Vec<f32> = data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // B@A = identity, scaling = 4.0 (rsLoRA), base = identity
+        // merged = [[1,0],[0,1]] + 4.0 * [[1,0],[0,1]] = [[5,0],[0,5]]
+        assert!((w[0] - 5.0).abs() < 1e-5, "got {}", w[0]);
+        assert!((w[1] - 0.0).abs() < 1e-5, "got {}", w[1]);
+        assert!((w[2] - 0.0).abs() < 1e-5, "got {}", w[2]);
+        assert!((w[3] - 5.0).abs() < 1e-5, "got {}", w[3]);
+    }
+
+    #[test]
     fn test_read_write_f32_roundtrip() {
         let original = vec![1.0f32, -2.5, 3.14, 0.0];
 

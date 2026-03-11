@@ -71,6 +71,8 @@ pub struct CudaWorkerConfig {
     pub tp_world_size: usize,
     /// Optional GGUF file name for HF Hub download (e.g. "model-Q4_K_M.gguf").
     pub gguf_file: Option<String>,
+    /// Optional LoRA adapter path (local directory or HF repo ID).
+    pub lora_adapter: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1851,6 +1853,36 @@ impl CudaWorker {
         )))
     }
 
+    /// Resolve a LoRA adapter path: local directory or HF Hub download.
+    fn resolve_adapter_path(&self, adapter_path: &str) -> ExecutorResult<PathBuf> {
+        let path = Path::new(adapter_path);
+        if path.is_dir() {
+            return Ok(path.to_path_buf());
+        }
+
+        // Download from HuggingFace Hub.
+        info!("Downloading LoRA adapter from HuggingFace Hub: {adapter_path}");
+        let mut builder = hf_hub::api::sync::ApiBuilder::new();
+        if let Some(ref token) = self.config.hf_token {
+            builder = builder.with_token(Some(token.clone()));
+        }
+        let api = builder
+            .build()
+            .map_err(|e| ExecutorError::WorkerInit(format!("HF API: {e}")))?;
+        let repo = api.model(adapter_path.to_string());
+
+        let config_path = repo.get("adapter_config.json").map_err(|e| {
+            ExecutorError::WorkerInit(format!("failed to download adapter_config.json: {e}"))
+        })?;
+        let adapter_dir = config_path.parent().unwrap().to_path_buf();
+
+        repo.get("adapter_model.safetensors").map_err(|e| {
+            ExecutorError::WorkerInit(format!("failed to download adapter_model.safetensors: {e}"))
+        })?;
+
+        Ok(adapter_dir)
+    }
+
     /// H2D copy a u32 slice into a caching-allocator tensor.
     fn h2d_u32(data: &[u32], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
         let t = device.caching.alloc_tensor(&[data.len()], GpuDType::U32);
@@ -2830,11 +2862,26 @@ impl Worker for CudaWorker {
         // torch_dtype and PyTorch auto-casts during weight_loader copy.
         weights.set_target_dtype(dtype);
 
+        // 5b. Merge LoRA adapter weights (CPU-side, before H2D copy).
+        if let Some(ref adapter_path) = self.config.lora_adapter {
+            let adapter_dir = self.resolve_adapter_path(adapter_path)?;
+            let merged = weights
+                .merge_lora(&adapter_dir)
+                .map_err(|e| ExecutorError::WorkerInit(format!("LoRA merge: {e}")))?;
+            info!("CudaWorker: merged {merged} LoRA weight tensors");
+        }
+
         // 6. Detect quantization config.
         let qconfig = quant::detect_quant_config(&model_dir)
             .map_err(|e| ExecutorError::WorkerInit(format!("quant config detection: {e}")))?;
         if qconfig.is_quantized() {
             info!("CudaWorker: detected quantization: {:?}", qconfig);
+            if self.config.lora_adapter.is_some() {
+                return Err(ExecutorError::WorkerInit(
+                    "LoRA with quantized models requires Punica kernels (not yet implemented)"
+                        .into(),
+                ));
+            }
         }
 
         // 7. Construct model based on architecture.

@@ -257,6 +257,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             tp_rank: 0,
             tp_world_size: 1,
             gguf_file: config.gguf_file.clone(),
+            lora_adapter: config.lora_adapter.clone(),
         };
 
         let mut worker = CudaWorker::new(cuda_config);
@@ -713,6 +714,7 @@ fn initialize_stack_tp(
                 tp_rank: rank,
                 tp_world_size: tp_size,
                 gguf_file: config.gguf_file.clone(),
+                lora_adapter: config.lora_adapter.clone(),
             })
             .collect();
 

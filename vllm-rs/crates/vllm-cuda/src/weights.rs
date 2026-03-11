@@ -36,24 +36,98 @@ fn safetensors_dtype(dtype: safetensors::Dtype) -> Result<DType> {
 }
 
 // ---------------------------------------------------------------------------
+// CPU dtype conversion helpers (for LoRA merging)
+// ---------------------------------------------------------------------------
+
+/// Read raw bytes in `dtype` into a pre-allocated f32 slice.
+fn read_to_f32(data: &[u8], dtype: DType, out: &mut [f32]) {
+    match dtype {
+        DType::F32 => {
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, out.len()) };
+            out.copy_from_slice(src);
+        }
+        DType::F16 => {
+            let src =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const half::f16, out.len()) };
+            for (s, d) in src.iter().zip(out.iter_mut()) {
+                *d = s.to_f32();
+            }
+        }
+        DType::BF16 => {
+            let src = unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, out.len())
+            };
+            for (s, d) in src.iter().zip(out.iter_mut()) {
+                *d = s.to_f32();
+            }
+        }
+        _ => panic!("read_to_f32: unsupported dtype {dtype}"),
+    }
+}
+
+/// Write f32 values back to bytes in the given dtype.
+fn write_from_f32(data: &[f32], dtype: DType) -> Vec<u8> {
+    match dtype {
+        DType::F32 => {
+            let mut out = vec![0u8; data.len() * 4];
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut f32, data.len()) };
+            dst.copy_from_slice(data);
+            out
+        }
+        DType::F16 => {
+            let mut out = vec![0u8; data.len() * 2];
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u16, data.len()) };
+            for (s, d) in data.iter().zip(dst.iter_mut()) {
+                *d = half::f16::from_f32(*s).to_bits();
+            }
+            out
+        }
+        DType::BF16 => {
+            let mut out = vec![0u8; data.len() * 2];
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u16, data.len()) };
+            for (s, d) in data.iter().zip(dst.iter_mut()) {
+                *d = half::bf16::from_f32(*s).to_bits();
+            }
+            out
+        }
+        _ => panic!("write_from_f32: unsupported dtype {dtype}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CpuTensorRef — a reference to tensor data in a mmap'd safetensors file
 // ---------------------------------------------------------------------------
 
-/// A CPU-side reference to tensor data in a memory-mapped safetensors file.
+/// A CPU-side reference to tensor data — either mmap'd (read-only) or owned
+/// (e.g. after LoRA merging).
 struct CpuTensorRef {
-    /// The mmap that backs this tensor.
-    mmap: Arc<memmap2::Mmap>,
+    /// The mmap that backs this tensor (None for owned data).
+    mmap: Option<Arc<memmap2::Mmap>>,
     /// Byte offset within the mmap where tensor data starts.
     data_offset: usize,
     /// Size of tensor data in bytes.
     size_bytes: usize,
     shape: Vec<usize>,
     dtype: DType,
+    /// Owned data buffer (used for merged weights). When set, `data()` returns
+    /// this instead of the mmap slice.
+    owned: Option<Arc<Vec<u8>>>,
 }
 
 impl CpuTensorRef {
     fn data(&self) -> &[u8] {
-        &self.mmap[self.data_offset..self.data_offset + self.size_bytes]
+        if let Some(ref buf) = self.owned {
+            buf.as_slice()
+        } else {
+            let mmap = self
+                .mmap
+                .as_ref()
+                .expect("CpuTensorRef: no mmap or owned data");
+            &mmap[self.data_offset..self.data_offset + self.size_bytes]
+        }
     }
 }
 
@@ -184,11 +258,12 @@ impl GpuWeights {
             self.tensors.insert(
                 name.to_string(),
                 CpuTensorRef {
-                    mmap: Arc::clone(&mmap),
+                    mmap: Some(Arc::clone(&mmap)),
                     data_offset,
                     size_bytes,
                     shape,
                     dtype,
+                    owned: None,
                 },
             );
             count += 1;
@@ -474,6 +549,181 @@ impl GpuWeights {
     /// Get the stream used for H2D copies.
     pub fn stream(&self) -> CUstream {
         self.stream
+    }
+
+    // -----------------------------------------------------------------------
+    // LoRA weight merging (CPU-side, before H2D copy)
+    // -----------------------------------------------------------------------
+
+    /// Merge a LoRA adapter's A/B weight pairs into base weights on CPU.
+    ///
+    /// For each LoRA target module, computes `W_merged = W + scaling * B @ A`
+    /// in f32 intermediate precision and replaces the mmap'd `CpuTensorRef`
+    /// with an owned buffer containing the merged result.
+    ///
+    /// Must be called BEFORE `take()`/`take_into()` so that model construction
+    /// picks up already-merged weights (including fused QKV / gate_up).
+    ///
+    /// Returns the number of weight tensors merged.
+    pub fn merge_lora(&mut self, adapter_dir: &Path) -> Result<usize> {
+        use vllm_model::lora::LoraAdapterConfig;
+
+        // 1. Parse adapter config.
+        let config_path = adapter_dir.join("adapter_config.json");
+        let config = LoraAdapterConfig::from_file(&config_path)
+            .map_err(|e| anyhow::anyhow!("LoRA config: {e}"))?;
+        let scaling = config.scaling();
+
+        // 2. Load adapter weights (CPU mmap).
+        let st_path = adapter_dir.join("adapter_model.safetensors");
+        if !st_path.exists() {
+            bail!(
+                "adapter_model.safetensors not found in {}",
+                adapter_dir.display()
+            );
+        }
+        let file = std::fs::File::open(&st_path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file) }?;
+        let st = safetensors::SafeTensors::deserialize(&mmap)
+            .map_err(|e| anyhow::anyhow!("LoRA safetensors: {e}"))?;
+
+        // 3. Group A/B pairs by layer prefix.
+        //    PEFT names: base_model.model.{prefix}.lora_A.weight
+        #[allow(clippy::type_complexity)]
+        let mut pairs: HashMap<
+            String,
+            (Option<&[u8]>, Vec<usize>, Option<&[u8]>, Vec<usize>),
+        > = HashMap::new();
+
+        for name in st.names() {
+            let view = st
+                .tensor(name)
+                .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+            let (prefix, is_a) = if let Some(p) = name.strip_suffix(".lora_A.weight") {
+                (p, true)
+            } else if let Some(p) = name.strip_suffix(".lora_B.weight") {
+                (p, false)
+            } else {
+                continue;
+            };
+            let clean = prefix.strip_prefix("base_model.model.").unwrap_or(prefix);
+            let entry = pairs
+                .entry(clean.to_string())
+                .or_insert((None, vec![], None, vec![]));
+            if is_a {
+                entry.0 = Some(view.data());
+                entry.1 = view.shape().to_vec();
+            } else {
+                entry.2 = Some(view.data());
+                entry.3 = view.shape().to_vec();
+            }
+        }
+
+        // 4. For each pair, merge into the base weight.
+        let mut merged_count = 0usize;
+        for (prefix, (a_data, a_shape, b_data, b_shape)) in &pairs {
+            let a_data = match a_data {
+                Some(d) => d,
+                None => {
+                    tracing::warn!("LoRA: missing lora_A for {prefix}, skipping");
+                    continue;
+                }
+            };
+            let b_data = match b_data {
+                Some(d) => d,
+                None => {
+                    tracing::warn!("LoRA: missing lora_B for {prefix}, skipping");
+                    continue;
+                }
+            };
+
+            // Find matching base weight. The prefix should match a key in self.tensors
+            // (after strip_prefix("model.") has been applied, or not).
+            let base_name = if self.tensors.contains_key(&format!("{prefix}.weight")) {
+                format!("{prefix}.weight")
+            } else {
+                tracing::debug!("LoRA: no base weight for {prefix}, skipping");
+                continue;
+            };
+
+            let base = &self.tensors[&base_name];
+            if base.shape.len() != 2 {
+                tracing::warn!("LoRA: base weight {base_name} is not 2D, skipping");
+                continue;
+            }
+
+            // A: [rank, in], B: [out, rank], W: [out, in]
+            let rank = a_shape[0];
+            let in_feat = a_shape[1];
+            let out_feat = b_shape[0];
+
+            if base.shape != [out_feat, in_feat] {
+                tracing::warn!(
+                    "LoRA: shape mismatch for {base_name}: base {:?} vs LoRA out={out_feat} in={in_feat}",
+                    base.shape
+                );
+                continue;
+            }
+
+            // Read base weight to f32.
+            let numel = out_feat * in_feat;
+            let mut w_f32 = vec![0.0f32; numel];
+            read_to_f32(base.data(), base.dtype, &mut w_f32);
+
+            // Read A to f32 [rank, in_feat].
+            let a_numel = rank * in_feat;
+            let mut a_f32 = vec![0.0f32; a_numel];
+            // LoRA weights are typically F32 in PEFT safetensors.
+            read_to_f32(a_data, DType::F32, &mut a_f32);
+
+            // Read B to f32 [out_feat, rank].
+            let b_numel = out_feat * rank;
+            let mut b_f32 = vec![0.0f32; b_numel];
+            read_to_f32(b_data, DType::F32, &mut b_f32);
+
+            // Compute delta = B @ A → [out_feat, in_feat], then W += scaling * delta.
+            let scaling_f32 = scaling as f32;
+            for i in 0..out_feat {
+                for j in 0..in_feat {
+                    let mut dot = 0.0f32;
+                    for k in 0..rank {
+                        dot += b_f32[i * rank + k] * a_f32[k * in_feat + j];
+                    }
+                    w_f32[i * in_feat + j] += scaling_f32 * dot;
+                }
+            }
+
+            // Write merged weight back in base dtype.
+            let merged_bytes = write_from_f32(&w_f32, base.dtype);
+            let size_bytes = merged_bytes.len();
+            let owned = Arc::new(merged_bytes);
+
+            // Replace CpuTensorRef with one backed by owned data.
+            self.tensors.insert(
+                base_name,
+                CpuTensorRef {
+                    mmap: None,
+                    data_offset: 0,
+                    size_bytes,
+                    shape: vec![out_feat, in_feat],
+                    dtype: base.dtype,
+                    owned: Some(owned),
+                },
+            );
+
+            merged_count += 1;
+            tracing::debug!("LoRA: merged {prefix} → [{out_feat}, {in_feat}]");
+        }
+
+        tracing::info!(
+            "LoRA: merged {} weight tensors (rank={}, alpha={}, scaling={:.4})",
+            merged_count,
+            config.r,
+            config.lora_alpha,
+            scaling,
+        );
+
+        Ok(merged_count)
     }
 
     // -----------------------------------------------------------------------
@@ -1986,6 +2236,137 @@ mod tests {
                 driver::mem_free(gpu_buf).unwrap();
                 driver::stream_destroy(stream).unwrap();
             };
+        }
+    }
+
+    #[test]
+    fn test_merge_lora_f32() {
+        use safetensors::tensor::TensorView;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create base model: single weight "model.layers.0.self_attn.q_proj.weight" [8, 4].
+        let base_w: Vec<f32> = (0..32).map(|i| i as f32 * 0.1).collect();
+        let base_bytes: Vec<u8> = base_w.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        let base_views = vec![(
+            "model.layers.0.self_attn.q_proj.weight",
+            TensorView::new(safetensors::Dtype::F32, vec![8, 4], &base_bytes).unwrap(),
+        )];
+        let base_st = safetensors::tensor::serialize(base_views, None).unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), base_st).unwrap();
+
+        // Create LoRA adapter: rank=2, alpha=4 → scaling=2.0.
+        let adapter_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            adapter_dir.path().join("adapter_config.json"),
+            r#"{"r": 2, "lora_alpha": 4.0, "target_modules": ["q_proj"]}"#,
+        )
+        .unwrap();
+
+        // A: [2, 4], B: [8, 2]
+        let a_data: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]; // identity-ish
+        let b_data: Vec<f32> = vec![
+            0.5, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.5,
+        ];
+        let a_bytes: Vec<u8> = a_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = b_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        let adapter_views = vec![
+            (
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+                TensorView::new(safetensors::Dtype::F32, vec![2, 4], &a_bytes).unwrap(),
+            ),
+            (
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                TensorView::new(safetensors::Dtype::F32, vec![8, 2], &b_bytes).unwrap(),
+            ),
+        ];
+        let adapter_st = safetensors::tensor::serialize(adapter_views, None).unwrap();
+        std::fs::write(
+            adapter_dir.path().join("adapter_model.safetensors"),
+            adapter_st,
+        )
+        .unwrap();
+
+        // Load weights (no GPU needed — merge is CPU-only).
+        let mut gw = GpuWeights {
+            tensors: HashMap::new(),
+            stream: std::ptr::null_mut(),
+            target_dtype: None,
+            cast_pinned: (std::ptr::null_mut(), 0),
+        };
+        gw.load_shard(&dir.path().join("model.safetensors"))
+            .unwrap();
+
+        // Strip "model." prefix to match what CudaWorker does.
+        // Actually, merge_lora looks for "{prefix}.weight" keys, so let's check
+        // what keys we have.
+        let keys: Vec<String> = gw.tensors.keys().cloned().collect();
+        assert!(keys.contains(&"model.layers.0.self_attn.q_proj.weight".to_string()));
+
+        let merged = gw.merge_lora(adapter_dir.path()).unwrap();
+        assert_eq!(merged, 1);
+
+        // Verify merged values: W_merged = W + 2.0 * B @ A
+        // B @ A: [8, 2] @ [2, 4] → [8, 4]
+        // B has pattern: row i = [0.5, 0.0] or [0.0, 0.5] alternating
+        // A = [[1,0,0,0],[0,1,0,0]]
+        // B @ A row 0: 0.5*[1,0,0,0] + 0.0*[0,1,0,0] = [0.5,0,0,0]
+        // B @ A row 1: 0.0*[1,0,0,0] + 0.5*[0,1,0,0] = [0,0.5,0,0]
+        // etc.
+        // delta = 2.0 * B@A
+        let (data, shape, dtype) = gw
+            .take_cpu("model.layers.0.self_attn.q_proj.weight")
+            .unwrap();
+        assert_eq!(shape, vec![8, 4]);
+        assert_eq!(dtype, DType::F32);
+        let merged_w: Vec<f32> = data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // Row 0 of delta: [0.5, 0, 0, 0] * 2 = [1, 0, 0, 0]
+        // Row 0 of W: [0, 0.1, 0.2, 0.3]
+        // Merged: [1.0, 0.1, 0.2, 0.3]
+        assert!((merged_w[0] - 1.0).abs() < 1e-5, "got {}", merged_w[0]);
+        assert!((merged_w[1] - 0.1).abs() < 1e-5);
+        assert!((merged_w[2] - 0.2).abs() < 1e-5);
+        assert!((merged_w[3] - 0.3).abs() < 1e-5);
+
+        // Row 1 of delta: [0, 0.5, 0, 0] * 2 = [0, 1, 0, 0]
+        // Row 1 of W: [0.4, 0.5, 0.6, 0.7]
+        // Merged: [0.4, 1.5, 0.6, 0.7]
+        assert!((merged_w[4] - 0.4).abs() < 1e-5);
+        assert!((merged_w[5] - 1.5).abs() < 1e-5, "got {}", merged_w[5]);
+        assert!((merged_w[6] - 0.6).abs() < 1e-5);
+        assert!((merged_w[7] - 0.7).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_read_write_f32_roundtrip() {
+        let original = vec![1.0f32, -2.5, 3.14, 0.0];
+
+        // F32 roundtrip.
+        let bytes = write_from_f32(&original, DType::F32);
+        let mut out = vec![0.0f32; 4];
+        read_to_f32(&bytes, DType::F32, &mut out);
+        assert_eq!(original, out);
+
+        // BF16 roundtrip (lossy).
+        let bytes = write_from_f32(&original, DType::BF16);
+        let mut out = vec![0.0f32; 4];
+        read_to_f32(&bytes, DType::BF16, &mut out);
+        for (a, b) in original.iter().zip(out.iter()) {
+            assert!((a - b).abs() < 0.1, "BF16 roundtrip: {a} vs {b}");
+        }
+
+        // F16 roundtrip (lossy).
+        let bytes = write_from_f32(&original, DType::F16);
+        let mut out = vec![0.0f32; 4];
+        read_to_f32(&bytes, DType::F16, &mut out);
+        for (a, b) in original.iter().zip(out.iter()) {
+            assert!((a - b).abs() < 0.1, "F16 roundtrip: {a} vs {b}");
         }
     }
 }

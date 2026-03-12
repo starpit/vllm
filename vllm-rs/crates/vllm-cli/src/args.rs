@@ -458,6 +458,111 @@ pub enum GceSubcommand {
     Up(Box<GceUpArgs>),
     /// Tear down a GCE VM.
     Down(GceDownArgs),
+    /// Manage GCE images for vllm-rs.
+    Image(GceImageCommand),
+}
+
+#[cfg(feature = "gce")]
+/// Image subcommands: `vllm gce image build` / `vllm gce image list`.
+#[derive(Parser, Debug)]
+pub struct GceImageCommand {
+    #[command(subcommand)]
+    pub command: GceImageSubcommand,
+}
+
+#[cfg(feature = "gce")]
+#[derive(Subcommand, Debug)]
+pub enum GceImageSubcommand {
+    /// Build a GCE image with dev toolchain pre-installed.
+    Build(GceImageBuildArgs),
+    /// List GCE images tagged for vllm-rs.
+    List(GceImageListArgs),
+    /// List GCE images tagged for vllm-rs (alias for `list`).
+    Ls(GceImageListArgs),
+}
+
+#[cfg(feature = "gce")]
+/// Arguments for `vllm gce image build`.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm gce image build <SOURCE_DIR> [OPTIONS]")]
+pub struct GceImageBuildArgs {
+    /// Path to Rust workspace to upload and build on the VM.
+    pub source_dir: String,
+
+    /// Build a production image: binary installed to /usr/local/bin,
+    /// source and dev toolchain removed.
+    #[arg(short = 'p', long)]
+    pub production: bool,
+
+    /// Base GCE boot image to build from.
+    #[arg(
+        long,
+        default_value = "projects/ubuntu-os-accelerator-images/global/images/ubuntu-accelerator-2404-amd64-with-nvidia-580-v20260225"
+    )]
+    pub image: String,
+
+    /// Image tag (used as label and name prefix).
+    /// Defaults to "vllm-rs-prod" with --production, "vllm-rs-dev" otherwise.
+    #[arg(short = 't', long)]
+    pub tag: Option<String>,
+
+    /// Image version string.
+    /// Defaults to "prod-{YYYYMMDD-HHMMSS}" with --production,
+    /// "dev-{YYYYMMDD-HHMMSS}" otherwise.
+    #[arg(short = 'v', long)]
+    pub version: Option<String>,
+
+    /// GCE project.
+    #[arg(long, env = "GCP_PROJECT")]
+    pub project: Option<String>,
+
+    /// Path to GCP service account credentials JSON.
+    #[arg(long, env = "GOOGLE_APPLICATION_CREDENTIALS")]
+    pub gcp_credentials: Option<String>,
+
+    /// GCP service account email to assign to the builder instance.
+    /// Only set this if the SA key has iam.serviceAccountUser on itself.
+    #[arg(long)]
+    pub gcp_service_account: Option<String>,
+
+    /// GCS bucket for sccache shared cache.
+    #[arg(long, env = "SCCACHE_GCS_BUCKET")]
+    pub sccache_gcs_bucket: Option<String>,
+
+    /// GCS key prefix for sccache shared cache (default: vllm-rs-dev-$USER).
+    #[arg(long, env = "SCCACHE_GCS_KEY_PREFIX")]
+    pub sccache_gcs_key_prefix: Option<String>,
+}
+
+#[cfg(feature = "gce")]
+/// Arguments for `vllm gce image list`.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm gce image list [OPTIONS]")]
+pub struct GceImageListArgs {
+    /// Image tag to filter on (e.g. "vllm-rs-dev", "vllm-rs-prod").
+    /// If omitted, lists all vllm-rs images (dev and prod).
+    #[arg(short = 't', long)]
+    pub tag: Option<String>,
+
+    /// GCE project.
+    #[arg(long, env = "GCP_PROJECT")]
+    pub project: Option<String>,
+
+    /// Path to GCP service account credentials JSON.
+    #[arg(long, env = "GOOGLE_APPLICATION_CREDENTIALS")]
+    pub gcp_credentials: Option<String>,
+
+    /// GCS bucket for sccache shared cache (accepted for compatibility, ignored).
+    #[arg(long, env = "SCCACHE_GCS_BUCKET", hide = true)]
+    pub sccache_gcs_bucket: Option<String>,
+
+    /// GCS key prefix for sccache shared cache (accepted for compatibility, ignored).
+    #[arg(long, env = "SCCACHE_GCS_KEY_PREFIX", hide = true)]
+    pub sccache_gcs_key_prefix: Option<String>,
+
+    /// GCP service account email (accepted for compatibility, ignored).
+    #[arg(long, hide = true)]
+    pub gcp_service_account: Option<String>,
 }
 
 #[cfg(feature = "gce")]
@@ -488,12 +593,10 @@ pub struct GceUpArgs {
     #[arg(short = 'p', long, default_value_t = 8000)]
     pub local_port: u16,
 
-    /// GCE boot image family.
-    #[arg(
-        long,
-        default_value = "projects/ubuntu-os-accelerator-images/global/images/ubuntu-accelerator-2404-amd64-with-nvidia-580-v20260225"
-    )]
-    pub image: String,
+    /// GCE boot image (full self-link). If omitted, auto-selects the latest
+    /// image with tag "vllm-rs-dev" (or "vllm-rs-prod" without --dev).
+    #[arg(long)]
+    pub image: Option<String>,
 
     /// GCE zone.
     #[arg(long, default_value = "us-central1-a")]

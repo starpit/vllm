@@ -8,78 +8,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
+use crate::common::{CreateError, build_zone_list, delete_instance, finish_spinner, spinner};
 use crate::ssh_tunnel::SshSession;
-
-/// Candidate zones for fallback when a zone's resource pool is exhausted.
-const FALLBACK_ZONES: &[(&str, &str)] = &[
-    ("us-west1", "a"),
-    ("us-west1", "b"),
-    ("us-west1", "c"),
-    ("us-central1", "a"),
-    ("us-central1", "b"),
-    ("us-central1", "c"),
-    ("us-east1", "a"),
-    ("us-east1", "b"),
-    ("us-east1", "c"),
-];
-
-/// Error type to distinguish zone-exhaustion from fatal errors.
-enum CreateError {
-    ZoneExhausted(String),
-    Fatal(anyhow::Error),
-}
-
-/// Check if an operation error is a zone-exhaustion, and extract a human-readable message.
-fn zone_exhausted_message(err: &google_cloud_compute_v1::errors::OperationError) -> Option<String> {
-    use google_cloud_compute_v1::errors::OperationError;
-    match err {
-        OperationError::Generic(g) => {
-            let is_exhausted = g.status_code == Some(503)
-                || g.details.as_ref().is_some_and(|d| {
-                    d.errors.iter().any(|e| {
-                        e.code
-                            .as_deref()
-                            .is_some_and(|c| c.contains("ZONE_RESOURCE_POOL_EXHAUSTED"))
-                    })
-                });
-            if !is_exhausted {
-                return None;
-            }
-            if let Some(details) = &g.details {
-                for err_entry in &details.errors {
-                    for detail in &err_entry.error_details {
-                        if let Some(ref lm) = detail.localized_message
-                            && let Some(ref msg) = lm.message
-                        {
-                            return Some(msg.clone());
-                        }
-                    }
-                }
-            }
-            Some("zone resource pool exhausted".to_string())
-        }
-        _ => None,
-    }
-}
-
-fn spinner(multi: &MultiProgress, msg: &str) -> ProgressBar {
-    let pb = multi.add(ProgressBar::new_spinner());
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.cyan} {msg}")
-            .unwrap(),
-    );
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
-    pb.set_message(msg.to_string());
-    pb
-}
-
-/// Finish a spinner: clear it from multi and print the final message as a
-/// static line with consistent indentation.
-fn finish_spinner(multi: &MultiProgress, sp: ProgressBar, msg: impl Into<String>) {
-    sp.finish_and_clear();
-    let _ = multi.println(format!("  {}", msg.into()));
-}
 
 /// Configuration for `vllm gce up`.
 pub struct GceUpConfig {
@@ -95,8 +25,8 @@ pub struct GceUpConfig {
     pub dev: Option<std::path::PathBuf>,
     /// Local port for SSH tunnel to remote port 8000.
     pub local_port: u16,
-    /// GCE boot image (full self-link).
-    pub image: String,
+    /// GCE boot image (full self-link). None = auto-resolved by caller.
+    pub image: Option<String>,
     /// GCE zone (starting zone for fallback search).
     pub zone: String,
     /// GCE project.
@@ -142,8 +72,6 @@ async fn create_instance_in_zone(
         AcceleratorConfig, AccessConfig, AttachedDisk, AttachedDiskInitializeParams, Instance,
         Metadata, NetworkInterface, Scheduling, metadata::Items as MetadataItems,
     };
-    use google_cloud_lro::Poller;
-
     let mut instance = Instance::new()
         .set_name(params.instance_name)
         .set_machine_type(format!(
@@ -221,65 +149,11 @@ async fn create_instance_in_zone(
         instance = instance.set_service_accounts([sa]);
     }
 
-    let result = params
-        .client
-        .insert()
-        .set_project(params.project)
-        .set_zone(zone)
-        .set_body(instance)
-        .poller()
-        .until_done()
-        .await;
-
-    let operation = match result {
-        Ok(op) => op,
-        Err(e) => {
-            let code = e.http_status_code();
-            if code == Some(503) || code == Some(403) {
-                let msg = e
-                    .status()
-                    .map(|s| s.message.clone())
-                    .unwrap_or_else(|| format!("zone unavailable (HTTP {})", code.unwrap_or(0)));
-                return Err(CreateError::ZoneExhausted(msg));
-            }
-            return Err(CreateError::Fatal(e.into()));
-        }
-    };
-
-    match operation.to_result() {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            if let Some(msg) = zone_exhausted_message(&e) {
-                Err(CreateError::ZoneExhausted(msg))
-            } else {
-                Err(CreateError::Fatal(e.into()))
-            }
-        }
-    }
+    crate::common::try_create_instance(params.client, params.project, zone, instance).await
 }
 
-/// Read the user's SSH public key and format it as GCE `ssh-keys` metadata.
-fn read_ssh_public_key() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let home_path = std::path::PathBuf::from(home);
-    let username = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "user".to_string());
-
-    for name in [
-        "google_compute_engine.pub",
-        "id_ed25519.pub",
-        "id_rsa.pub",
-        "id_ecdsa.pub",
-    ] {
-        let path = home_path.join(".ssh").join(name);
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            let key = contents.trim();
-            return Some(format!("{username}:{key}"));
-        }
-    }
-    None
-}
+// read_ssh_public_key is in common.rs
+use crate::common::read_ssh_public_key;
 
 /// Multi-node environment variables for cloud-init.
 struct MultiNodeEnv {
@@ -660,54 +534,6 @@ async fn stream_serial_console(cfg: ConsoleStreamConfig) -> Result<()> {
     Ok(())
 }
 
-/// Build the ordered list of zones to try.
-fn build_zone_list(configured_zone: &str) -> Vec<(String, String)> {
-    let configured_parts: Vec<&str> = configured_zone.rsplitn(2, '-').collect();
-    let configured_pair = if configured_parts.len() == 2 {
-        Some((
-            configured_parts[1].to_string(),
-            configured_parts[0].to_string(),
-        ))
-    } else {
-        None
-    };
-
-    let mut zones: Vec<(String, String)> = Vec::new();
-    if let Some(ref pair) = configured_pair {
-        zones.push(pair.clone());
-    }
-    for &(region, suffix) in FALLBACK_ZONES {
-        if configured_pair
-            .as_ref()
-            .is_some_and(|p| p.0 == region && p.1 == suffix)
-        {
-            continue;
-        }
-        zones.push((region.to_string(), suffix.to_string()));
-    }
-    zones
-}
-
-/// Delete a single instance (best-effort, used for cleanup on partial failures).
-async fn delete_instance(
-    client: &google_cloud_compute_v1::client::Instances,
-    project: &str,
-    zone: &str,
-    name: &str,
-) -> Result<()> {
-    use google_cloud_lro::Poller;
-    client
-        .delete()
-        .set_project(project)
-        .set_zone(zone)
-        .set_instance(name)
-        .poller()
-        .until_done()
-        .await?
-        .to_result()?;
-    Ok(())
-}
-
 /// Provision GCE VM(s), optionally transfer dev dir and start SSH tunnel.
 pub async fn up(config: GceUpConfig) -> Result<()> {
     use google_cloud_compute_v1::client::Instances;
@@ -724,6 +550,12 @@ pub async fn up(config: GceUpConfig) -> Result<()> {
                 "GCP project required: set --project, GCP_PROJECT, or GOOGLE_CLOUD_PROJECT"
             )
         })?;
+
+    let image = config.image.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no image specified — pass --image or let the caller resolve it via latest_image()"
+        )
+    })?;
 
     let username = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
@@ -792,7 +624,7 @@ pub async fn up(config: GceUpConfig) -> Result<()> {
                 project: &project,
                 instance_name,
                 gpu: &gpu,
-                source_image: &config.image,
+                source_image: &image,
                 service_account: config.gcp_service_account.as_deref(),
                 cloud_config: &cloud_config,
                 preemptible: config.preemptible,
@@ -871,7 +703,7 @@ pub async fn up(config: GceUpConfig) -> Result<()> {
                 project: &project,
                 instance_name: node0_name,
                 gpu: &gpu,
-                source_image: &config.image,
+                source_image: &image,
                 service_account: config.gcp_service_account.as_deref(),
                 cloud_config: &node0_cloud_config,
                 preemptible: config.preemptible,
@@ -940,7 +772,7 @@ pub async fn up(config: GceUpConfig) -> Result<()> {
                     project: &project,
                     instance_name: &instance_names[i],
                     gpu: &gpu,
-                    source_image: &config.image,
+                    source_image: &image,
                     service_account: config.gcp_service_account.as_deref(),
                     cloud_config: &worker_cloud_configs[i - 1],
                     preemptible: config.preemptible,

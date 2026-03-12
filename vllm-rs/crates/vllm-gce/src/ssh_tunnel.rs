@@ -195,6 +195,71 @@ impl SshSession {
         Ok((file_count, total_bytes))
     }
 
+    /// Execute a command on the remote host and stream stdout/stderr lines.
+    /// Returns the exit status code.
+    pub async fn exec_streaming(
+        &self,
+        cmd: &str,
+        multi: Option<&indicatif::MultiProgress>,
+    ) -> Result<i32> {
+        use russh::ChannelMsg;
+
+        let guard = self.handle.lock().await;
+        let session = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SSH session closed"))?;
+
+        let mut channel = session.channel_open_session().await?;
+        channel.exec(true, cmd).await?;
+
+        let mut exit_status = 0i32;
+        let mut stdout_buf = String::new();
+        let mut stderr_buf = String::new();
+
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => {
+                    stdout_buf.push_str(&String::from_utf8_lossy(&data));
+                    while let Some(pos) = stdout_buf.find('\n') {
+                        let line = stdout_buf[..pos].to_string();
+                        stdout_buf = stdout_buf[pos + 1..].to_string();
+                        if let Some(m) = multi {
+                            let _ = m.println(format!("    {line}"));
+                        }
+                    }
+                }
+                ChannelMsg::ExtendedData { data, ext } => {
+                    if ext == 1 {
+                        // stderr
+                        stderr_buf.push_str(&String::from_utf8_lossy(&data));
+                        while let Some(pos) = stderr_buf.find('\n') {
+                            let line = stderr_buf[..pos].to_string();
+                            stderr_buf = stderr_buf[pos + 1..].to_string();
+                            if let Some(m) = multi {
+                                let _ = m.println(format!("    {line}"));
+                            }
+                        }
+                    }
+                }
+                ChannelMsg::ExitStatus { exit_status: code } => {
+                    exit_status = code as i32;
+                }
+                _ => {}
+            }
+        }
+
+        // Flush remaining partial lines.
+        for leftover in [&stdout_buf, &stderr_buf] {
+            if !leftover.is_empty()
+                && let Some(m) = multi
+            {
+                let _ = m.println(format!("    {leftover}"));
+            }
+        }
+
+        Ok(exit_status)
+    }
+
     /// Start a TCP port-forwarding tunnel. Returns a handle that accepts connections
     /// in the background. Call `close()` on the returned `SshTunnel` to stop.
     pub fn tunnel(

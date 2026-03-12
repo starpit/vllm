@@ -51,6 +51,12 @@ type DetokResult = (IncrementalDetokenizer, Option<String>, Option<String>);
 enum ControlMessage {
     /// Reset the prefix cache. Returns `true` if successful.
     ResetPrefixCache(oneshot::Sender<bool>),
+    /// Put the engine to sleep (free GPU memory).
+    Sleep(u32, oneshot::Sender<Result<(), String>>),
+    /// Wake the engine from sleep.
+    WakeUp(Option<Vec<String>>, oneshot::Sender<Result<(), String>>),
+    /// Query whether the engine is sleeping.
+    IsSleeping(oneshot::Sender<bool>),
 }
 
 /// Bundled arguments for `spawn_step_loop_inner` / `spawn_step_loop_async`.
@@ -307,6 +313,38 @@ impl AsyncEngine {
         let (tx, rx) = oneshot::channel();
         self.control_tx
             .send(ControlMessage::ResetPrefixCache(tx))
+            .map_err(|_| ServeError::Internal("step loop not running".into()))?;
+        rx.await
+            .map_err(|_| ServeError::Internal("step loop dropped reply".into()))
+    }
+
+    /// Put the engine to sleep, freeing GPU memory.
+    pub async fn sleep(&self, level: u32) -> ServeResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlMessage::Sleep(level, tx))
+            .map_err(|_| ServeError::Internal("step loop not running".into()))?;
+        rx.await
+            .map_err(|_| ServeError::Internal("step loop dropped reply".into()))?
+            .map_err(ServeError::Internal)
+    }
+
+    /// Wake the engine from sleep.
+    pub async fn wake_up(&self, tags: Option<Vec<String>>) -> ServeResult<()> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlMessage::WakeUp(tags, tx))
+            .map_err(|_| ServeError::Internal("step loop not running".into()))?;
+        rx.await
+            .map_err(|_| ServeError::Internal("step loop dropped reply".into()))?
+            .map_err(ServeError::Internal)
+    }
+
+    /// Whether the engine is currently sleeping.
+    pub async fn is_sleeping(&self) -> ServeResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.control_tx
+            .send(ControlMessage::IsSleeping(tx))
             .map_err(|_| ServeError::Internal("step loop not running".into()))?;
         rx.await
             .map_err(|_| ServeError::Internal("step loop dropped reply".into()))
@@ -1356,6 +1394,43 @@ impl AsyncEngine {
                 let result = client.reset_prefix_cache().unwrap_or(false);
                 let _ = reply.send(result);
             }
+            ControlMessage::Sleep(level, reply) => {
+                let result = client.sleep(level).map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+            ControlMessage::WakeUp(tags, reply) => {
+                let result = client.wake_up(tags.as_deref()).map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+            ControlMessage::IsSleeping(reply) => {
+                let _ = reply.send(client.is_sleeping());
+            }
+        }
+    }
+
+    /// Handle a control message in async scheduling mode, routing executor ops
+    /// through the executor thread channel.
+    async fn handle_control_message_async(
+        client: &mut Box<dyn EngineCoreClient + Send>,
+        msg: ControlMessage,
+        executor_tx: &tokio::sync::mpsc::Sender<ExecutorWork>,
+    ) {
+        match msg {
+            ControlMessage::ResetPrefixCache(reply) => {
+                let result = client.reset_prefix_cache().unwrap_or(false);
+                let _ = reply.send(result);
+            }
+            ControlMessage::Sleep(level, reply) => {
+                // Abort running requests first via the client.
+                client.abort_running_requests();
+                let _ = executor_tx.send(ExecutorWork::Sleep(level, reply)).await;
+            }
+            ControlMessage::WakeUp(tags, reply) => {
+                let _ = executor_tx.send(ExecutorWork::WakeUp(tags, reply)).await;
+            }
+            ControlMessage::IsSleeping(reply) => {
+                let _ = executor_tx.send(ExecutorWork::IsSleeping(reply)).await;
+            }
         }
     }
 
@@ -1612,7 +1687,7 @@ impl AsyncEngine {
 
                 // 0b. Drain control messages.
                 while let Ok(msg) = control_rx.try_recv() {
-                    Self::handle_control_message(&mut client, msg);
+                    Self::handle_control_message_async(&mut client, msg, &sched_tx).await;
                 }
 
                 // 1. Drain pending request submissions (non-blocking).
@@ -1741,7 +1816,7 @@ impl AsyncEngine {
                                 continue;
                             }
                             Some(msg) = control_rx.recv() => {
-                                Self::handle_control_message(&mut client, msg);
+                                Self::handle_control_message_async(&mut client, msg, &sched_tx).await;
                                 continue;
                             }
                             else => break, // All channels closed.
@@ -3100,6 +3175,12 @@ enum ExecutorWork {
         Vec<Vec<u32>>,
         tokio::sync::oneshot::Sender<ServeResult<Vec<Vec<f32>>>>,
     ),
+    /// Put the executor to sleep.
+    Sleep(u32, oneshot::Sender<Result<(), String>>),
+    /// Wake the executor from sleep.
+    WakeUp(Option<Vec<String>>, oneshot::Sender<Result<(), String>>),
+    /// Query whether the executor is sleeping.
+    IsSleeping(oneshot::Sender<bool>),
     /// Shut down the executor.
     Shutdown,
 }
@@ -3140,6 +3221,17 @@ fn executor_thread_loop(
                     .embed(seqs)
                     .map_err(|e| ServeError::Engine(e.to_string()));
                 let _ = reply.send(result);
+            }
+            ExecutorWork::Sleep(level, reply) => {
+                let result = executor.sleep(level).map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+            ExecutorWork::WakeUp(tags, reply) => {
+                let result = executor.wake_up(tags.as_deref()).map_err(|e| e.to_string());
+                let _ = reply.send(result);
+            }
+            ExecutorWork::IsSleeping(reply) => {
+                let _ = reply.send(executor.is_sleeping());
             }
             ExecutorWork::Shutdown => {
                 executor.shutdown();
@@ -4570,6 +4662,18 @@ mod tests {
         }
 
         fn is_scheduler_paused(&self) -> bool {
+            false
+        }
+
+        fn sleep(&mut self, _level: u32) -> vllm_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn wake_up(&mut self, _tags: Option<&[String]>) -> vllm_engine::error::EngineResult<()> {
+            Ok(())
+        }
+
+        fn is_sleeping(&self) -> bool {
             false
         }
     }

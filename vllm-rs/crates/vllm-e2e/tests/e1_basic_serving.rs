@@ -2528,3 +2528,55 @@ async fn test_cuda_tp2_gemma3_completion() {
         "TP=2 Gemma3 completion should produce non-empty text"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sleep/wake tests
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_sleep_wake() {
+    let server = TestServer::builder(TestModels::SMOLLM_135M_CUDA)
+        .start()
+        .await
+        .expect("server should start");
+
+    let client = Client::new(server.base_url());
+
+    // 1. Verify working.
+    let request = simple_completion_request("Hello", 10);
+    let resp = client.completion(&request).await.unwrap();
+    assert_valid_completion_response(&resp);
+
+    // 2. Record GPU memory before sleep.
+    let mem_before = client.gpu_memory().await.unwrap();
+    assert!(mem_before.used_bytes > 0, "GPU should have memory in use");
+
+    // 3. Sleep.
+    client.sleep(1).await.unwrap();
+    assert!(
+        client.is_sleeping().await.unwrap(),
+        "engine should be sleeping"
+    );
+
+    // 4. Verify GPU memory dropped significantly.
+    let mem_sleeping = client.gpu_memory().await.unwrap();
+    assert!(
+        mem_sleeping.used_bytes < mem_before.used_bytes / 2,
+        "GPU memory should drop significantly after sleep: before={}, sleeping={}",
+        mem_before.used_bytes,
+        mem_sleeping.used_bytes,
+    );
+
+    // 5. Wake up.
+    client.wake_up(None).await.unwrap();
+    assert!(
+        !client.is_sleeping().await.unwrap(),
+        "engine should be awake"
+    );
+
+    // 6. Verify still works.
+    let resp = client.completion(&request).await.unwrap();
+    assert_valid_completion_response(&resp);
+}

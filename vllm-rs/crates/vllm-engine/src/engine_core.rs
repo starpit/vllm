@@ -761,6 +761,31 @@ impl EngineCore {
         executor.embed(token_id_seqs)
     }
 
+    /// Put the engine to sleep, freeing GPU memory.
+    pub fn sleep(&mut self, level: u32) -> EngineResult<()> {
+        // Abort all running requests first.
+        self.abort_running_requests();
+        let executor = self
+            .executor
+            .as_mut()
+            .ok_or_else(|| EngineError::Executor("executor taken for async scheduling".into()))?;
+        executor.sleep(level)
+    }
+
+    /// Wake the engine from sleep.
+    pub fn wake_up(&mut self, tags: Option<&[String]>) -> EngineResult<()> {
+        let executor = self
+            .executor
+            .as_mut()
+            .ok_or_else(|| EngineError::Executor("executor taken for async scheduling".into()))?;
+        executor.wake_up(tags)
+    }
+
+    /// Whether the engine is currently sleeping.
+    pub fn is_sleeping(&self) -> bool {
+        self.executor.as_ref().is_some_and(|e| e.is_sleeping())
+    }
+
     /// Shut down the engine core.
     pub fn shutdown(&mut self) {
         if self.is_shutdown {

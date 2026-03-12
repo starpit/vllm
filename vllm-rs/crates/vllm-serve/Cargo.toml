@@ -8,7 +8,7 @@ description = "HTTP (axum) and gRPC (tonic) serving layer for vLLM Rust port"
 [features]
 default = []
 otel = ["vllm-common/otel"]
-cuda = ["vllm-executor/cuda"]
+cuda = ["vllm-executor/cuda", "dep:vllm-cuda"]
 nccl = ["cuda", "vllm-cuda/nccl", "vllm-executor/nccl"]
 metal = ["vllm-mlx"]
 wgpu = ["vllm-wgpu"]

@@ -398,6 +398,10 @@ pub struct GpuWeights {
     precast: Option<Arc<PrecastState>>,
     /// Join handle for the background precast thread.
     precast_handle: Option<std::thread::JoinHandle<()>>,
+    /// All GPU allocations made by `take()` / `take_into()` / `take_shard()`.
+    /// Tracked so the caller can free weight memory on sleep without walking
+    /// model structs. Each entry is `(gpu_ptr, size_bytes)`.
+    gpu_allocs: Vec<(*mut u8, usize)>,
 }
 
 // Safety: GPU device pointers accessible from any host thread.
@@ -433,6 +437,7 @@ impl GpuWeights {
             cast_pinned: (std::ptr::null_mut(), 0),
             precast: None,
             precast_handle: None,
+            gpu_allocs: Vec::new(),
         };
         gw.load_shard(path)?;
         Ok(gw)
@@ -475,6 +480,7 @@ impl GpuWeights {
                 cast_pinned: (std::ptr::null_mut(), 0),
                 precast: None,
                 precast_handle: None,
+                gpu_allocs: Vec::new(),
             };
             if let Some(name) = shard_files.first() {
                 gw.load_shard(&dir.join(name))?;
@@ -511,6 +517,7 @@ impl GpuWeights {
             cast_pinned: (std::ptr::null_mut(), 0),
             precast: None,
             precast_handle: None,
+            gpu_allocs: Vec::new(),
         })
     }
 
@@ -717,6 +724,7 @@ impl GpuWeights {
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
 
         let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
+        self.gpu_allocs.push((gpu_ptr, size_bytes));
 
         unsafe {
             driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
@@ -839,6 +847,7 @@ impl GpuWeights {
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
 
         let gpu_ptr = unsafe { driver::mem_alloc(size_bytes).ok()? };
+        self.gpu_allocs.push((gpu_ptr, size_bytes));
 
         unsafe {
             driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream).ok()?;
@@ -863,6 +872,25 @@ impl GpuWeights {
     /// Whether no tensors are loaded.
     pub fn is_empty(&self) -> bool {
         self.tensors.is_empty()
+    }
+
+    /// Record an externally-made GPU allocation so it can be freed on sleep.
+    ///
+    /// Called by quantized weight loaders (AWQ, GPTQ, Marlin, etc.) that
+    /// allocate GPU memory via `driver::mem_alloc` outside of `take()`.
+    pub fn record_alloc(&mut self, ptr: *mut u8, size_bytes: usize) {
+        self.gpu_allocs.push((ptr, size_bytes));
+    }
+
+    /// Remove a previously-recorded allocation (e.g. after repack frees it).
+    pub fn unrecord_alloc(&mut self, ptr: *mut u8) {
+        self.gpu_allocs.retain(|(p, _)| *p != ptr);
+    }
+
+    /// Drain all tracked GPU allocations. The caller takes ownership and is
+    /// responsible for freeing them (e.g. on sleep).
+    pub fn take_gpu_allocs(&mut self) -> Vec<(*mut u8, usize)> {
+        std::mem::take(&mut self.gpu_allocs)
     }
 
     /// Iterator over all tensor names.
@@ -1089,6 +1117,7 @@ impl GpuWeights {
 
         let size_bytes = shard_shape.iter().product::<usize>() * dtype.size_bytes();
         let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
+        self.gpu_allocs.push((gpu_ptr, size_bytes));
         unsafe {
             driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
         }
@@ -1307,9 +1336,11 @@ fn load_awq_marlin_linear(
     let num_u32 = size_k * size_n / 8;
     let repack_nbytes = num_u32 * std::mem::size_of::<u32>();
     let repack_ptr = unsafe { driver::mem_alloc(repack_nbytes)? };
+    weights.record_alloc(repack_ptr, repack_nbytes);
     unsafe {
         crate::kernels::awq_repack_into(qweight_gpu, repack_ptr, size_k, size_n, device_id, stream);
         driver::stream_synchronize(stream)?;
+        weights.unrecord_alloc(qweight_gpu.raw_ptr());
         driver::mem_free(qweight_gpu.raw_ptr())?;
     }
     let qweight_marlin = unsafe { GpuTensor::new(repack_ptr, &[num_u32], DType::U32) };
@@ -1326,6 +1357,7 @@ fn load_awq_marlin_linear(
     let scales_bytes_permuted: Vec<u8> = scales_u16.iter().flat_map(|&v| v.to_le_bytes()).collect();
     let scales_nbytes = scales_bytes_permuted.len();
     let scales_ptr = unsafe { driver::mem_alloc(scales_nbytes)? };
+    weights.record_alloc(scales_ptr, scales_nbytes);
     unsafe {
         driver::memcpy_htod_async(
             scales_ptr,
@@ -1348,6 +1380,7 @@ fn load_awq_marlin_linear(
     let zp_bytes: Vec<u8> = marlin_zp.iter().flat_map(|&v| v.to_le_bytes()).collect();
     let zp_nbytes = zp_bytes.len();
     let zp_ptr = unsafe { driver::mem_alloc(zp_nbytes)? };
+    weights.record_alloc(zp_ptr, zp_nbytes);
     unsafe { driver::memcpy_htod_async(zp_ptr, zp_bytes.as_ptr(), zp_nbytes, stream)? };
     let zeros_gpu = unsafe { GpuTensor::new(zp_ptr, &[num_groups, size_n / 8], DType::U32) };
 
@@ -1441,6 +1474,7 @@ fn load_gptq_marlin_linear(
             let g_idx_bytes: Vec<u8> = sorted_g_idx.iter().flat_map(|&v| v.to_le_bytes()).collect();
             let g_idx_nbytes = g_idx_bytes.len();
             let g_idx_ptr = unsafe { driver::mem_alloc(g_idx_nbytes)? };
+            weights.record_alloc(g_idx_ptr, g_idx_nbytes);
             unsafe {
                 driver::memcpy_htod_async(g_idx_ptr, g_idx_bytes.as_ptr(), g_idx_nbytes, stream)?;
             }
@@ -1450,6 +1484,7 @@ fn load_gptq_marlin_linear(
             let si_bytes: Vec<u8> = sort_indices.iter().flat_map(|&v| v.to_le_bytes()).collect();
             let si_nbytes = si_bytes.len();
             let si_ptr = unsafe { driver::mem_alloc(si_nbytes)? };
+            weights.record_alloc(si_ptr, si_nbytes);
             unsafe { driver::memcpy_htod_async(si_ptr, si_bytes.as_ptr(), si_nbytes, stream)? };
             let sort_indices_gpu = unsafe { GpuTensor::new(si_ptr, &[size_k], DType::I32) };
 
@@ -1473,6 +1508,7 @@ fn load_gptq_marlin_linear(
     let num_u32 = size_k * size_n / 8;
     let repack_nbytes = num_u32 * std::mem::size_of::<u32>();
     let repack_ptr = unsafe { driver::mem_alloc(repack_nbytes)? };
+    weights.record_alloc(repack_ptr, repack_nbytes);
     unsafe {
         crate::kernels::gptq_repack_into(
             qweight_gpu,
@@ -1486,6 +1522,7 @@ fn load_gptq_marlin_linear(
         // Sync so the repack kernel finishes before we free the source qweight
         driver::stream_synchronize(stream)?;
         // Free original qweight (it was raw-allocated by weights.take())
+        weights.unrecord_alloc(qweight_gpu.raw_ptr());
         driver::mem_free(qweight_gpu.raw_ptr())?;
     }
     let qweight_marlin = unsafe { GpuTensor::new(repack_ptr, &[num_u32], DType::U32) };
@@ -1501,6 +1538,7 @@ fn load_gptq_marlin_linear(
     let scales_bytes_permuted: Vec<u8> = scales_u16.iter().flat_map(|&v| v.to_le_bytes()).collect();
     let scales_nbytes = scales_bytes_permuted.len();
     let scales_ptr = unsafe { driver::mem_alloc(scales_nbytes)? };
+    weights.record_alloc(scales_ptr, scales_nbytes);
     unsafe {
         driver::memcpy_htod_async(
             scales_ptr,
@@ -1680,6 +1718,7 @@ fn load_fused_gptq_marlin(
         let g_idx_bytes: Vec<u8> = sorted_g_idx.iter().flat_map(|&v| v.to_le_bytes()).collect();
         let g_idx_nbytes = g_idx_bytes.len();
         let g_idx_ptr = unsafe { driver::mem_alloc(g_idx_nbytes)? };
+        weights.record_alloc(g_idx_ptr, g_idx_nbytes);
         unsafe {
             driver::memcpy_htod_async(g_idx_ptr, g_idx_bytes.as_ptr(), g_idx_nbytes, stream)?;
         }
@@ -1689,6 +1728,7 @@ fn load_fused_gptq_marlin(
         let si_bytes: Vec<u8> = sort_indices.iter().flat_map(|&v| v.to_le_bytes()).collect();
         let si_nbytes = si_bytes.len();
         let si_ptr = unsafe { driver::mem_alloc(si_nbytes)? };
+        weights.record_alloc(si_ptr, si_nbytes);
         unsafe { driver::memcpy_htod_async(si_ptr, si_bytes.as_ptr(), si_nbytes, stream)? };
         let sort_indices_gpu = unsafe { GpuTensor::new(si_ptr, &[size_k], DType::I32) };
 
@@ -1706,6 +1746,7 @@ fn load_fused_gptq_marlin(
     let num_u32 = size_k * size_n / 8;
     let repack_nbytes = num_u32 * std::mem::size_of::<u32>();
     let repack_ptr = unsafe { driver::mem_alloc(repack_nbytes)? };
+    weights.record_alloc(repack_ptr, repack_nbytes);
     unsafe {
         crate::kernels::gptq_repack_into(
             qw_gpu,
@@ -1736,6 +1777,7 @@ fn load_fused_gptq_marlin(
     let scales_bytes_permuted: Vec<u8> = scales_u16.iter().flat_map(|&v| v.to_le_bytes()).collect();
     let scales_nbytes = scales_bytes_permuted.len();
     let scales_ptr = unsafe { driver::mem_alloc(scales_nbytes)? };
+    weights.record_alloc(scales_ptr, scales_nbytes);
     unsafe {
         driver::memcpy_htod_async(
             scales_ptr,
@@ -1825,6 +1867,7 @@ fn load_fused_awq_marlin(
     let num_u32 = size_k * size_n / 8;
     let repack_nbytes = num_u32 * std::mem::size_of::<u32>();
     let repack_ptr = unsafe { driver::mem_alloc(repack_nbytes)? };
+    weights.record_alloc(repack_ptr, repack_nbytes);
     unsafe {
         crate::kernels::awq_repack_into(qw_gpu, repack_ptr, size_k, size_n, device_id, stream);
         driver::stream_synchronize(stream)?;
@@ -1847,6 +1890,7 @@ fn load_fused_awq_marlin(
     let scales_bytes_permuted: Vec<u8> = scales_u16.iter().flat_map(|&v| v.to_le_bytes()).collect();
     let scales_nbytes = scales_bytes_permuted.len();
     let scales_ptr = unsafe { driver::mem_alloc(scales_nbytes)? };
+    weights.record_alloc(scales_ptr, scales_nbytes);
     unsafe {
         driver::memcpy_htod_async(
             scales_ptr,
@@ -1891,6 +1935,7 @@ fn load_fused_awq_marlin(
     let zp_bytes: Vec<u8> = fused_zp.iter().flat_map(|&v| v.to_le_bytes()).collect();
     let zp_nbytes = zp_bytes.len();
     let zp_ptr = unsafe { driver::mem_alloc(zp_nbytes)? };
+    weights.record_alloc(zp_ptr, zp_nbytes);
     unsafe { driver::memcpy_htod_async(zp_ptr, zp_bytes.as_ptr(), zp_nbytes, stream)? };
     let zeros_gpu = unsafe { GpuTensor::new(zp_ptr, &[num_groups, total_n_div8], DType::U32) };
 
@@ -2084,6 +2129,7 @@ pub fn load_bnb4bit_linear(
     // Upload absmax F32 to GPU.
     let absmax_nbytes = absmax_f32.len() * 4;
     let absmax_ptr = unsafe { driver::mem_alloc(absmax_nbytes)? };
+    weights.record_alloc(absmax_ptr, absmax_nbytes);
     unsafe {
         driver::memcpy_htod_async(
             absmax_ptr,
@@ -2216,6 +2262,7 @@ pub fn load_fused_bnb4bit_linear(
     // Upload packed weight to GPU.
     let packed_nbytes = all_packed.len();
     let packed_ptr = unsafe { driver::mem_alloc(packed_nbytes)? };
+    weights.record_alloc(packed_ptr, packed_nbytes);
     unsafe {
         driver::memcpy_htod_async(packed_ptr, all_packed.as_ptr(), packed_nbytes, stream)?;
     }
@@ -2224,6 +2271,7 @@ pub fn load_fused_bnb4bit_linear(
     // Upload absmax F32 to GPU.
     let absmax_nbytes = all_absmax_f32.len() * 4;
     let absmax_ptr = unsafe { driver::mem_alloc(absmax_nbytes)? };
+    weights.record_alloc(absmax_ptr, absmax_nbytes);
     unsafe {
         driver::memcpy_htod_async(
             absmax_ptr,
@@ -2714,6 +2762,7 @@ mod tests {
             cast_pinned: (std::ptr::null_mut(), 0),
             precast: None,
             precast_handle: None,
+            gpu_allocs: Vec::new(),
         };
         gw.load_shard(&dir.path().join("model.safetensors"))
             .unwrap();
@@ -2820,6 +2869,7 @@ mod tests {
             cast_pinned: (std::ptr::null_mut(), 0),
             precast: None,
             precast_handle: None,
+            gpu_allocs: Vec::new(),
         };
         gw.load_shard(&dir.path().join("model.safetensors"))
             .unwrap();

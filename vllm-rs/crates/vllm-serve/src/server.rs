@@ -109,6 +109,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/detokenize", post(detokenize))
         .route("/health", get(health))
         .route("/reset_prefix_cache", post(reset_prefix_cache))
+        .route("/sleep", post(sleep_endpoint))
+        .route("/wake_up", post(wake_up_endpoint))
+        .route("/is_sleeping", get(is_sleeping_endpoint))
+        .route("/gpu_memory", get(gpu_memory_endpoint))
         .route("/version", get(version))
         .route("/server_info", get(server_info));
 
@@ -403,6 +407,99 @@ async fn reset_prefix_cache(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to reset prefix cache: {e}"),
         )),
+    }
+}
+
+/// POST /sleep
+///
+/// Put the engine to sleep, freeing GPU memory.
+/// Body: `{"level": 1}` (default: 1)
+async fn sleep_endpoint(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let level = body
+        .and_then(|Json(v)| v.get("level").and_then(|l| l.as_u64()))
+        .unwrap_or(1) as u32;
+    info!("Sleep requested (level {level})");
+    state.engine.sleep(level).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Sleep failed: {e}"),
+        )
+    })?;
+    Ok(StatusCode::OK)
+}
+
+/// POST /wake_up
+///
+/// Wake the engine from sleep.
+/// Body: `{"tags": null}` or `{"tags": ["weights", "kv_cache"]}`
+async fn wake_up_endpoint(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<serde_json::Value>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let tags: Option<Vec<String>> = body.and_then(|Json(v)| {
+        v.get("tags")
+            .and_then(|t| serde_json::from_value(t.clone()).ok())
+    });
+    info!("Wake up requested (tags: {:?})", tags);
+    state.engine.wake_up(tags).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Wake up failed: {e}"),
+        )
+    })?;
+    Ok(StatusCode::OK)
+}
+
+/// GET /is_sleeping
+///
+/// Returns whether the engine is currently sleeping.
+async fn is_sleeping_endpoint(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let sleeping = state.engine.is_sleeping().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to query sleep state: {e}"),
+        )
+    })?;
+    Ok(Json(serde_json::json!({ "is_sleeping": sleeping })))
+}
+
+/// GET /gpu_memory
+///
+/// Returns current GPU memory usage (for testing sleep/wake).
+async fn gpu_memory_endpoint() -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    #[cfg(feature = "cuda")]
+    {
+        // Ensure CUDA driver is initialized and primary context is current
+        // on this thread (HTTP handlers may run on any tokio worker thread).
+        unsafe { vllm_cuda::driver::init() }
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("CUDA init: {e}")))?;
+        let _ = unsafe { vllm_cuda::driver::ctx_create(0) }
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("CUDA ctx: {e}")))?;
+        let (free, total) = unsafe { vllm_cuda::driver::mem_get_info() }.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to query GPU memory: {e}"),
+            )
+        })?;
+        let used = total - free;
+        Ok(Json(serde_json::json!({
+            "used_bytes": used,
+            "free_bytes": free,
+            "total_bytes": total,
+        })))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Ok(Json(serde_json::json!({
+            "used_bytes": 0,
+            "free_bytes": 0,
+            "total_bytes": 0,
+        })))
     }
 }
 

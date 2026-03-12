@@ -11,6 +11,14 @@ use vllm_serve::protocol::{
     VersionResponse,
 };
 
+/// GPU memory usage info returned by `/gpu_memory`.
+#[derive(Debug, serde::Deserialize)]
+pub struct GpuMemoryInfo {
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
 /// A thin HTTP client for talking to a running vLLM server.
 pub struct Client {
     inner: reqwest::Client,
@@ -252,6 +260,61 @@ impl Client {
         resp.json()
             .await
             .context("failed to parse detokenize response")
+    }
+
+    /// POST /sleep — put the engine to sleep.
+    pub async fn sleep(&self, level: u32) -> Result<()> {
+        let resp = self
+            .inner
+            .post(format!("{}/sleep", self.base_url))
+            .json(&serde_json::json!({ "level": level }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("sleep failed with status {status}: {body}");
+        }
+        Ok(())
+    }
+
+    /// POST /wake_up — wake the engine from sleep.
+    pub async fn wake_up(&self, tags: Option<Vec<String>>) -> Result<()> {
+        let resp = self
+            .inner
+            .post(format!("{}/wake_up", self.base_url))
+            .json(&serde_json::json!({ "tags": tags }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("wake_up failed with status {status}: {body}");
+        }
+        Ok(())
+    }
+
+    /// GET /is_sleeping — query sleep state.
+    pub async fn is_sleeping(&self) -> Result<bool> {
+        let resp = self
+            .inner
+            .get(format!("{}/is_sleeping", self.base_url))
+            .send()
+            .await?;
+        let v: serde_json::Value = resp.json().await?;
+        Ok(v["is_sleeping"].as_bool().unwrap_or(false))
+    }
+
+    /// GET /gpu_memory — query GPU memory usage.
+    pub async fn gpu_memory(&self) -> Result<GpuMemoryInfo> {
+        let resp = self
+            .inner
+            .get(format!("{}/gpu_memory", self.base_url))
+            .send()
+            .await?;
+        resp.json()
+            .await
+            .context("failed to parse gpu_memory response")
     }
 
     /// GET /metrics — returns raw Prometheus text.

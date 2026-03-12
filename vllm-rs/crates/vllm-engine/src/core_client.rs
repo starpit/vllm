@@ -68,6 +68,15 @@ pub trait EngineCoreClient {
     /// Whether the scheduler is paused.
     fn is_scheduler_paused(&self) -> bool;
 
+    /// Put the engine to sleep, freeing GPU memory.
+    fn sleep(&mut self, level: u32) -> EngineResult<()>;
+
+    /// Wake the engine from sleep.
+    fn wake_up(&mut self, tags: Option<&[String]>) -> EngineResult<()>;
+
+    /// Whether the engine is currently sleeping.
+    fn is_sleeping(&self) -> bool;
+
     /// Compute embeddings for the given token ID sequences.
     ///
     /// Bypasses the scheduler — embedding is a single prefill pass with no
@@ -346,6 +355,18 @@ impl EngineCoreClient for InprocClient {
 
     fn is_scheduler_paused(&self) -> bool {
         self.engine.is_scheduler_paused()
+    }
+
+    fn sleep(&mut self, level: u32) -> EngineResult<()> {
+        self.engine.sleep(level)
+    }
+
+    fn wake_up(&mut self, tags: Option<&[String]>) -> EngineResult<()> {
+        self.engine.wake_up(tags)
+    }
+
+    fn is_sleeping(&self) -> bool {
+        self.engine.is_sleeping()
     }
 
     fn embed(&mut self, token_id_seqs: Vec<Vec<u32>>) -> EngineResult<Vec<Vec<f32>>> {

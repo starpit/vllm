@@ -1517,6 +1517,11 @@ pub struct CudaWorker {
     _k_scale_constant: f32,
     /// V scale constant (from env or default 1.0).
     _v_scale_constant: f32,
+    /// GPU weight allocation pointers tracked for sleep/wake lifecycle.
+    /// Each entry is (gpu_ptr, size_bytes). Populated by `load_model()`.
+    weight_gpu_allocs: Vec<(*mut u8, usize)>,
+    /// Saved num_gpu_blocks for re-init after wake.
+    num_gpu_blocks_saved: usize,
 }
 
 unsafe impl Send for CudaWorker {}
@@ -1575,6 +1580,8 @@ impl CudaWorker {
             _calculate_kv_scales: calculate_kv_scales,
             _k_scale_constant: k_scale_constant,
             _v_scale_constant: v_scale_constant,
+            weight_gpu_allocs: Vec::new(),
+            num_gpu_blocks_saved: 0,
         }
     }
 
@@ -3465,6 +3472,9 @@ impl Worker for CudaWorker {
         // Sync to ensure all async H2D weight copies are complete.
         unsafe { driver::stream_synchronize(device.compute_stream) }
             .map_err(|e| ExecutorError::WorkerInit(format!("weight sync: {e}")))?;
+
+        // Collect GPU weight allocation pointers for sleep/wake lifecycle.
+        self.weight_gpu_allocs = weights.take_gpu_allocs();
         drop(weights); // CPU mmaps freed, GPU memory owned by model layers
 
         self.model_dtype = dtype;
@@ -3975,6 +3985,95 @@ impl Worker for CudaWorker {
         Ok(())
     }
 
+    fn sleep(&mut self, level: u32) -> ExecutorResult<()> {
+        if level == 0 {
+            // Level 0 = pause only, handled by the scheduler.
+            return Ok(());
+        }
+
+        info!("CudaWorker: sleeping (level {level}) — freeing GPU memory");
+
+        // Flush any deferred D2H commit.
+        if self.pending_commit.take().is_some()
+            && let Some(ref dev) = self.device
+        {
+            let _ = dev.sync_d2h();
+        }
+
+        // Save num_gpu_blocks for re-init on wake.
+        if let Some(ref kv) = self.kv_cache {
+            self.num_gpu_blocks_saved = kv.num_blocks;
+        }
+
+        // Drop CUDA graphs (Drop impl frees GPU memory).
+        self.graph_runner = None;
+        self.prefill_graph_runner = None;
+        self.last_graph_batch_size = None;
+        self.graph_metadata_valid = false;
+
+        // Drop host staging (Drop impl frees pinned memory).
+        self.host_staging = None;
+
+        // Drop KV cache (Drop impl frees GPU memory).
+        self.kv_cache = None;
+
+        // Drop GDN state pool.
+        self.gdn_state_pool = None;
+
+        // Drop logits pipeline (frees GPU state).
+        self.logits_pipeline = None;
+
+        // Free weight GPU memory and drop model.
+        if let Some(ref dev) = self.device {
+            // Sync to ensure no in-flight ops reference weight memory.
+            let _ = unsafe { driver::stream_synchronize(dev.compute_stream) };
+        }
+        for &(ptr, _) in &self.weight_gpu_allocs {
+            unsafe {
+                let _ = driver::mem_free(ptr);
+            }
+        }
+        self.weight_gpu_allocs.clear();
+        self.model = None;
+
+        // Clear per-request state.
+        self.token_buffers.clear();
+        self.sampling_params_map.clear();
+        self.input_batch = InputBatch::new();
+        self.batch_changed = false;
+        self.batch_req_ids.clear();
+        self.seeded_rngs.clear();
+        #[cfg(feature = "guided-decoding")]
+        self.grammar_states.clear();
+
+        // Free leaked blocks in the caching allocator.
+        if let Some(ref mut dev) = self.device {
+            unsafe { dev.caching.free_leaked_blocks() };
+        }
+
+        info!("CudaWorker: sleep complete — GPU memory released");
+        Ok(())
+    }
+
+    fn wake_up(&mut self, _tags: Option<&[String]>) -> ExecutorResult<()> {
+        info!("CudaWorker: waking up — reloading model and KV cache");
+
+        // Re-load model from disk (mmap'd safetensors, fast).
+        self.load_model()?;
+
+        // Re-init KV cache with saved block count.
+        let num_gpu_blocks = self.num_gpu_blocks_saved;
+        if num_gpu_blocks > 0 {
+            self.initialize_cache(num_gpu_blocks, 0)?;
+        }
+
+        // Re-capture CUDA graphs.
+        self.compile_or_warm_up_model()?;
+
+        info!("CudaWorker: wake complete");
+        Ok(())
+    }
+
     fn shutdown(&mut self) {
         // Flush any deferred D2H commit before dropping the device.
         if self.pending_commit.take().is_some()
@@ -3982,6 +4081,13 @@ impl Worker for CudaWorker {
         {
             let _ = dev.sync_d2h();
         }
+        // Free tracked weight allocations before dropping model.
+        for &(ptr, _) in &self.weight_gpu_allocs {
+            unsafe {
+                let _ = driver::mem_free(ptr);
+            }
+        }
+        self.weight_gpu_allocs.clear();
         self.model = None;
         self.kv_cache = None;
         self.device = None;

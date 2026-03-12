@@ -3351,30 +3351,46 @@ fn parse_logit_bias(
 /// - `type: "text"` → `None` (no constraint)
 /// - `type: "json_object"` → `Some(GuidedGrammar::Json)`
 /// - `type: "json_schema"` → `Some(GuidedGrammar::JsonSchema { schema })`
+/// - `type: "structural_tag"` → `Some(GuidedGrammar::StructuralTag { spec })`
 fn parse_response_format(
     rf: &Option<protocol::ResponseFormat>,
 ) -> ServeResult<Option<GuidedGrammar>> {
     let Some(rf) = rf else {
         return Ok(None);
     };
-    match rf.format_type.as_str() {
-        "text" => Ok(None),
-        "json_object" => Ok(Some(GuidedGrammar::Json)),
-        "json_schema" => {
-            let schema = rf
-                .json_schema
-                .as_ref()
-                .and_then(|js| js.json_schema.clone())
-                .ok_or_else(|| {
-                    ServeError::Validation(
-                        "response_format type 'json_schema' requires json_schema.schema".into(),
-                    )
-                })?;
-            Ok(Some(GuidedGrammar::JsonSchema { schema }))
+    match rf {
+        protocol::ResponseFormat::LegacyStructuralTag(st) => {
+            // Serialize the full object as JSON spec string (Python does the same).
+            let spec = serde_json::to_string(st).map_err(|e| {
+                ServeError::Validation(format!("failed to serialize structural_tag: {e}"))
+            })?;
+            Ok(Some(GuidedGrammar::StructuralTag { spec }))
         }
-        other => Err(ServeError::Validation(format!(
-            "unsupported response_format type: {other:?}. Must be 'text', 'json_object', or 'json_schema'",
-        ))),
+        protocol::ResponseFormat::NewStructuralTag(st) => {
+            let spec = serde_json::to_string(st).map_err(|e| {
+                ServeError::Validation(format!("failed to serialize structural_tag: {e}"))
+            })?;
+            Ok(Some(GuidedGrammar::StructuralTag { spec }))
+        }
+        protocol::ResponseFormat::Standard(rf) => match rf.format_type.as_str() {
+            "text" => Ok(None),
+            "json_object" => Ok(Some(GuidedGrammar::Json)),
+            "json_schema" => {
+                let schema = rf
+                    .json_schema
+                    .as_ref()
+                    .and_then(|js| js.json_schema.clone())
+                    .ok_or_else(|| {
+                        ServeError::Validation(
+                            "response_format type 'json_schema' requires json_schema.schema".into(),
+                        )
+                    })?;
+                Ok(Some(GuidedGrammar::JsonSchema { schema }))
+            }
+            other => Err(ServeError::Validation(format!(
+                "unsupported response_format type: {other:?}. Must be 'text', 'json_object', 'json_schema', or 'structural_tag'",
+            ))),
+        },
     }
 }
 
@@ -4291,20 +4307,20 @@ mod tests {
 
     #[test]
     fn test_parse_response_format_text() {
-        let rf = protocol::ResponseFormat {
+        let rf = protocol::ResponseFormat::Standard(protocol::StandardResponseFormat {
             format_type: "text".to_string(),
             json_schema: None,
-        };
+        });
         let result = parse_response_format(&Some(rf)).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_parse_response_format_json_object() {
-        let rf = protocol::ResponseFormat {
+        let rf = protocol::ResponseFormat::Standard(protocol::StandardResponseFormat {
             format_type: "json_object".to_string(),
             json_schema: None,
-        };
+        });
         let result = parse_response_format(&Some(rf)).unwrap();
         assert!(matches!(result, Some(GuidedGrammar::Json)));
     }
@@ -4316,7 +4332,7 @@ mod tests {
             "properties": { "name": { "type": "string" } },
             "required": ["name"]
         });
-        let rf = protocol::ResponseFormat {
+        let rf = protocol::ResponseFormat::Standard(protocol::StandardResponseFormat {
             format_type: "json_schema".to_string(),
             json_schema: Some(protocol::JsonSchemaResponseFormat {
                 name: "test".to_string(),
@@ -4324,7 +4340,7 @@ mod tests {
                 json_schema: Some(schema.clone()),
                 strict: None,
             }),
-        };
+        });
         let result = parse_response_format(&Some(rf)).unwrap();
         match result {
             Some(GuidedGrammar::JsonSchema { schema: s }) => {
@@ -4336,20 +4352,20 @@ mod tests {
 
     #[test]
     fn test_parse_response_format_json_schema_missing_schema() {
-        let rf = protocol::ResponseFormat {
+        let rf = protocol::ResponseFormat::Standard(protocol::StandardResponseFormat {
             format_type: "json_schema".to_string(),
             json_schema: None,
-        };
+        });
         let result = parse_response_format(&Some(rf));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_response_format_invalid_type() {
-        let rf = protocol::ResponseFormat {
+        let rf = protocol::ResponseFormat::Standard(protocol::StandardResponseFormat {
             format_type: "xml".to_string(),
             json_schema: None,
-        };
+        });
         let result = parse_response_format(&Some(rf));
         assert!(result.is_err());
     }
@@ -4375,10 +4391,10 @@ mod tests {
 
     #[test]
     fn test_resolve_guided_grammar_response_format_only() {
-        let rf = protocol::ResponseFormat {
+        let rf = protocol::ResponseFormat::Standard(protocol::StandardResponseFormat {
             format_type: "json_object".to_string(),
             json_schema: None,
-        };
+        });
         let result = resolve_guided_grammar(&Some(rf), &None, &None).unwrap();
         assert!(matches!(result, Some(GuidedGrammar::Json)));
     }
@@ -4397,10 +4413,10 @@ mod tests {
 
     #[test]
     fn test_resolve_guided_grammar_conflict() {
-        let rf = protocol::ResponseFormat {
+        let rf = protocol::ResponseFormat::Standard(protocol::StandardResponseFormat {
             format_type: "json_object".to_string(),
             json_schema: None,
-        };
+        });
         let result = resolve_guided_grammar(&Some(rf), &Some("[0-9]+".to_string()), &None);
         assert!(result.is_err());
     }
@@ -4413,6 +4429,109 @@ mod tests {
             &Some("start: /[0-9]+/".to_string()),
         );
         assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // structural tag response_format tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_parse_response_format_legacy_structural_tag() {
+        let json_str = r#"{
+            "type": "structural_tag",
+            "structures": [
+                {"begin": "<function=get_weather>", "schema": {"type": "object"}, "end": "</function>"}
+            ],
+            "triggers": ["<function"]
+        }"#;
+        let rf: protocol::ResponseFormat = serde_json::from_str(json_str).unwrap();
+        let result = parse_response_format(&Some(rf)).unwrap();
+        match result {
+            Some(GuidedGrammar::StructuralTag { spec }) => {
+                // The spec should be a valid JSON string containing the structural tag info
+                let parsed: serde_json::Value = serde_json::from_str(&spec).unwrap();
+                assert_eq!(parsed["type"], "structural_tag");
+                assert!(parsed["structures"].is_array());
+                assert!(parsed["triggers"].is_array());
+            }
+            other => panic!("expected StructuralTag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_response_format_new_structural_tag() {
+        let json_str = r#"{
+            "type": "structural_tag",
+            "format": {
+                "structures": [
+                    {"begin": "<fn>", "schema": {"type": "object"}, "end": "</fn>"}
+                ],
+                "triggers": ["<fn>"]
+            }
+        }"#;
+        let rf: protocol::ResponseFormat = serde_json::from_str(json_str).unwrap();
+        let result = parse_response_format(&Some(rf)).unwrap();
+        match result {
+            Some(GuidedGrammar::StructuralTag { spec }) => {
+                let parsed: serde_json::Value = serde_json::from_str(&spec).unwrap();
+                assert_eq!(parsed["type"], "structural_tag");
+                assert!(parsed["format"].is_object());
+            }
+            other => panic!("expected StructuralTag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_guided_grammar_structural_tag_only() {
+        let json_str = r#"{
+            "type": "structural_tag",
+            "structures": [
+                {"begin": "<fn=test>", "schema": {"type": "object"}, "end": "</fn>"}
+            ],
+            "triggers": ["<fn"]
+        }"#;
+        let rf: protocol::ResponseFormat = serde_json::from_str(json_str).unwrap();
+        let result = resolve_guided_grammar(&Some(rf), &None, &None).unwrap();
+        assert!(matches!(result, Some(GuidedGrammar::StructuralTag { .. })));
+    }
+
+    #[test]
+    fn test_resolve_guided_grammar_structural_tag_with_regex_conflict() {
+        let json_str = r#"{
+            "type": "structural_tag",
+            "structures": [
+                {"begin": "<fn=test>", "schema": {"type": "object"}, "end": "</fn>"}
+            ],
+            "triggers": ["<fn"]
+        }"#;
+        let rf: protocol::ResponseFormat = serde_json::from_str(json_str).unwrap();
+        let result = resolve_guided_grammar(&Some(rf), &Some("[0-9]+".to_string()), &None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_protocol_response_format_standard_still_works() {
+        // Ensure standard formats still deserialize correctly through the enum
+        let json_str = r#"{"type": "json_object"}"#;
+        let rf: protocol::ResponseFormat = serde_json::from_str(json_str).unwrap();
+        let result = parse_response_format(&Some(rf)).unwrap();
+        assert!(matches!(result, Some(GuidedGrammar::Json)));
+    }
+
+    #[test]
+    fn test_protocol_response_format_json_schema_still_works() {
+        // Note: the inner `json_schema` field maps to JsonSchemaResponseFormat.json_schema
+        // which expects the key "json_schema" (not "schema") in our struct.
+        let json_str = r#"{
+            "type": "json_schema",
+            "json_schema": {
+                "name": "test",
+                "json_schema": {"type": "object", "properties": {"x": {"type": "integer"}}}
+            }
+        }"#;
+        let rf: protocol::ResponseFormat = serde_json::from_str(json_str).unwrap();
+        let result = parse_response_format(&Some(rf)).unwrap();
+        assert!(matches!(result, Some(GuidedGrammar::JsonSchema { .. })));
     }
 
     // ---------------------------------------------------------------

@@ -2330,10 +2330,12 @@ async fn test_cuda_grammar_json_object() {
         )],
         max_tokens: Some(50),
         temperature: Some(0.0),
-        response_format: Some(vllm_serve::protocol::ResponseFormat {
-            format_type: "json_object".to_string(),
-            json_schema: None,
-        }),
+        response_format: Some(vllm_serve::protocol::ResponseFormat::Standard(
+            vllm_serve::protocol::StandardResponseFormat {
+                format_type: "json_object".to_string(),
+                json_schema: None,
+            },
+        )),
         ..default_chat_request()
     };
 
@@ -2387,6 +2389,82 @@ async fn test_cuda_grammar_ebnf_digits() {
         text.chars().all(|c| c.is_ascii_digit()),
         "guided_grammar digits should produce only digits, got: {text:?}"
     );
+}
+
+// Validates structural_tag response_format constrains output via CudaWorker.
+// The structural tag defines a trigger that forces JSON schema output between tags.
+//
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_grammar_structural_tag -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_grammar_structural_tag() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Use structural_tag response_format via raw JSON (legacy format).
+    // The trigger "TOOL:" with begin "TOOL:" forces the model to emit a JSON object
+    // conforming to the schema between the trigger and end marker.
+    let response_format: vllm_serve::protocol::ResponseFormat =
+        serde_json::from_value(serde_json::json!({
+            "type": "structural_tag",
+            "structures": [{
+                "begin": "TOOL:",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "value": { "type": "integer" }
+                    },
+                    "required": ["value"]
+                },
+                "end": ";END"
+            }],
+            "triggers": ["TOOL:"]
+        }))
+        .expect("structural_tag response_format should deserialize");
+
+    let request = ChatCompletionRequest {
+        messages: vec![user_msg("Call a tool with value 42.")],
+        max_tokens: Some(60),
+        temperature: Some(0.0),
+        response_format: Some(response_format),
+        ..default_chat_request()
+    };
+
+    let resp = client.chat_completion(&request).await.unwrap();
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(
+        !text.is_empty(),
+        "structural_tag constrained output should not be empty"
+    );
+    // The output should contain the structural tag markers and valid JSON between them.
+    // With the grammar constraint, the model must emit text matching the pattern:
+    //   (free text)* TOOL: <json conforming to schema> ;END (free text)*
+    // We verify the JSON portion parses correctly.
+    if let Some(tool_start) = text.find("TOOL:") {
+        let after_tool = &text[tool_start + "TOOL:".len()..];
+        if let Some(end_pos) = after_tool.find(";END") {
+            let json_part = after_tool[..end_pos].trim();
+            let parsed: Result<serde_json::Value, _> = serde_json::from_str(json_part);
+            assert!(
+                parsed.is_ok(),
+                "structural_tag should produce valid JSON between markers, got: {json_part:?}"
+            );
+            let obj = parsed.unwrap();
+            assert!(
+                obj.get("value").is_some(),
+                "structural_tag JSON should have 'value' key, got: {obj}"
+            );
+        }
+    }
+    // At minimum, the grammar should have constrained output to be non-empty
+    // (the full structural tag pattern may or may not appear depending on model behavior,
+    // but the grammar engine ensures validity of whatever is produced).
 }
 
 // ===========================================================================

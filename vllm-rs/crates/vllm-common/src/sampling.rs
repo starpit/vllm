@@ -29,6 +29,11 @@ pub enum GuidedGrammar {
     Regex { pattern: String },
     /// `guided_grammar` — output must conform to the given Lark/EBNF grammar.
     Ebnf { grammar: String },
+    /// `response_format: { type: "structural_tag" }` — constrained tool/function
+    /// invocations embedded in free text. The spec is a JSON-serialized object
+    /// with `structures` (list of `{begin, schema, end}`) and `triggers`.
+    /// Converted to a Lark grammar via `structural_tag_to_grammar()`.
+    StructuralTag { spec: String },
 }
 
 // ---------------------------------------------------------------------------

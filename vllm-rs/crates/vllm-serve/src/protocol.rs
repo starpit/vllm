@@ -118,9 +118,50 @@ pub struct JsonSchemaResponseFormat {
     pub strict: Option<bool>,
 }
 
-/// Response format specification.
+/// A single structural tag definition (legacy format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponseFormat {
+pub struct StructuralTag {
+    pub begin: String,
+    #[serde(alias = "schema")]
+    pub structural_tag_schema: Option<serde_json::Value>,
+    pub end: String,
+}
+
+/// Legacy structural tag response format with explicit structures + triggers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyStructuralTagResponseFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+    pub structures: Vec<StructuralTag>,
+    pub triggers: Vec<String>,
+}
+
+/// New structural tag response format with opaque `format` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewStructuralTagResponseFormat {
+    #[serde(rename = "type")]
+    pub format_type: String,
+    pub format: serde_json::Value,
+}
+
+/// Response format specification.
+///
+/// Supports standard OpenAI types (`text`, `json_object`, `json_schema`)
+/// and vLLM's `structural_tag` type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResponseFormat {
+    /// Legacy structural tag: `{ type: "structural_tag", structures: [...], triggers: [...] }`
+    LegacyStructuralTag(LegacyStructuralTagResponseFormat),
+    /// New structural tag: `{ type: "structural_tag", format: ... }`
+    NewStructuralTag(NewStructuralTagResponseFormat),
+    /// Standard format: `{ type: "text" | "json_object" | "json_schema", json_schema?: ... }`
+    Standard(StandardResponseFormat),
+}
+
+/// Standard response format (text, json_object, json_schema).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StandardResponseFormat {
     /// Must be "text", "json_object", or "json_schema".
     #[serde(rename = "type")]
     pub format_type: String,

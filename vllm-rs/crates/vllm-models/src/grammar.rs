@@ -6,6 +6,7 @@
 //! `GuidedGrammar` gets its own `GrammarGuide` that tracks parser state and
 //! provides the set of allowed tokens at each step.
 
+use std::fmt::Write;
 use std::sync::Arc;
 
 use llguidance::api::TopLevelGrammar;
@@ -28,7 +29,224 @@ pub struct GrammarGuide {
 /// A generic JSON schema that matches any valid JSON object.
 const JSON_OBJECT_SCHEMA: &str = r#"{"type": "object"}"#;
 
+// ---------------------------------------------------------------------------
+// Structural tag → Lark grammar conversion
+// ---------------------------------------------------------------------------
+
+/// A single structural tag definition.
+///
+/// Mirrors Python's `llguidance.StructTag`.
+#[derive(Debug, Clone)]
+struct StructTag {
+    trigger: String,
+    begin: String,
+    grammar: serde_json::Value,
+    end: String,
+}
+
+/// JSON-escape a string for use as a Lark terminal literal (double-quoted).
+fn json_escape(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s))
+}
+
+/// Convert a structural tag spec (JSON string) into a Lark grammar string.
+///
+/// This is a faithful port of Python's `llguidance.StructTag.to_grammar()`.
+/// The spec comes from the API's `response_format` field after JSON serialization
+/// of either `LegacyStructuralTagResponseFormat` or `NewStructuralTagResponseFormat`.
+///
+/// The returned string is either:
+/// - A Lark grammar string (when no side grammars are needed)
+/// - A JSON `{"grammars": [...]}` string (when tags use Lark sub-grammars)
+pub fn structural_tag_to_grammar(spec_json: &str) -> Result<String, String> {
+    let spec: serde_json::Value =
+        serde_json::from_str(spec_json).map_err(|e| format!("invalid structural_tag JSON: {e}"))?;
+
+    // Parse into StructTag list. Support both legacy (structures+triggers) and new (format) shapes.
+    let tags = parse_struct_tags(&spec)?;
+    if tags.is_empty() {
+        return Err("structural_tag must contain at least one tag".into());
+    }
+
+    // Validate: begin must start with trigger
+    for tag in &tags {
+        if !tag.begin.starts_with(&tag.trigger) {
+            return Err(format!(
+                "structural tag begin {:?} must start with trigger {:?}",
+                tag.begin, tag.trigger
+            ));
+        }
+    }
+
+    // Build the Lark grammar — matching Python's StructTag.to_grammar() exactly.
+    let text_regex = r"(.|\n)*";
+    let assume_special = true;
+
+    let tag_options: Vec<String> = (0..tags.len()).map(|i| format!("tag_{i}")).collect();
+    let tag_options_str = tag_options.join(" | ");
+
+    let mut lark = String::new();
+    writeln!(lark, "%llguidance {{}}").unwrap();
+    writeln!(lark, "start: ({tag_options_str})* tag_end").unwrap();
+    writeln!(lark, "tag_end: TAG_TEXT").unwrap();
+    writeln!(lark, "TAG_TEXT: /{text_regex}/").unwrap();
+
+    let mut side_grammars: Vec<serde_json::Value> = Vec::new();
+
+    for (idx, tag) in tags.iter().enumerate() {
+        lark.push('\n');
+        let tag_rule = format!("tag_{idx}");
+
+        // Determine grammar directive
+        let grammar_str = match &tag.grammar {
+            serde_json::Value::String(s) => s.clone(),
+            other => serde_json::to_string(other)
+                .map_err(|e| format!("failed to serialize grammar: {e}"))?,
+        };
+
+        let grm = if grammar_str.trim_start().starts_with('{') {
+            // JSON schema
+            format!("%json {grammar_str}")
+        } else {
+            // Lark sub-grammar — needs side grammar
+            let gname = format!("{tag_rule}_grm");
+            side_grammars.push(serde_json::json!({
+                "name": gname,
+                "lark_grammar": grammar_str
+            }));
+            format!("@{gname}")
+        };
+
+        let beg = &tag.begin[tag.trigger.len()..];
+        let beg_escaped = if beg.is_empty() {
+            String::new()
+        } else {
+            json_escape(beg)
+        };
+        let end_escaped = if tag.end.is_empty() {
+            String::new()
+        } else {
+            json_escape(&tag.end)
+        };
+
+        let body = format!("{beg_escaped} {grm} {end_escaped}")
+            .trim()
+            .to_string();
+
+        if assume_special && tag.trigger.starts_with('<') && tag.trigger.ends_with('>') {
+            // Special token trigger — use directly
+            writeln!(lark, "{tag_rule}: TAG_TEXT {} {body}", tag.trigger).unwrap();
+        } else {
+            // Text trigger — use lazy lexeme
+            let trig_escaped = json_escape(&tag.trigger);
+            writeln!(lark, "{tag_rule}_trig[lazy]: TAG_TEXT {trig_escaped}").unwrap();
+            writeln!(lark, "{tag_rule}: {tag_rule}_trig {body}").unwrap();
+        }
+    }
+
+    let lark = lark.trim_start().to_string();
+
+    if side_grammars.is_empty() {
+        Ok(lark)
+    } else {
+        // Wrap in JSON grammars array with the main grammar first
+        side_grammars.insert(
+            0,
+            serde_json::json!({
+                "name": "struct_tag",
+                "lark_grammar": lark
+            }),
+        );
+        serde_json::to_string(&serde_json::json!({ "grammars": side_grammars }))
+            .map_err(|e| format!("failed to serialize grammars: {e}"))
+    }
+}
+
+/// Parse the structural tag spec into a list of `StructTag`s.
+fn parse_struct_tags(spec: &serde_json::Value) -> Result<Vec<StructTag>, String> {
+    // Legacy format: { type: "structural_tag", structures: [...], triggers: [...] }
+    if let Some(structures) = spec.get("structures") {
+        let structures = structures
+            .as_array()
+            .ok_or("structural_tag 'structures' must be an array")?;
+
+        let triggers: Vec<String> = spec
+            .get("triggers")
+            .and_then(|t| t.as_array())
+            .ok_or("structural_tag 'triggers' must be an array")?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .ok_or("trigger must be a string".to_string())
+                    .map(|s| s.to_string())
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut tags = Vec::new();
+        for s in structures {
+            let begin = s
+                .get("begin")
+                .and_then(|v| v.as_str())
+                .ok_or("structure 'begin' must be a string")?;
+            let end = s
+                .get("end")
+                .and_then(|v| v.as_str())
+                .ok_or("structure 'end' must be a string")?;
+            // Accept both "schema" and "structural_tag_schema" keys
+            let grammar = s
+                .get("schema")
+                .or_else(|| s.get("structural_tag_schema"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+
+            let trigger = triggers
+                .iter()
+                .find(|t| begin.starts_with(t.as_str()))
+                .ok_or_else(|| {
+                    format!(
+                        "no trigger found for begin {:?} in triggers {:?}",
+                        begin, triggers
+                    )
+                })?;
+            tags.push(StructTag {
+                trigger: trigger.clone(),
+                begin: begin.to_string(),
+                grammar,
+                end: end.to_string(),
+            });
+        }
+        return Ok(tags);
+    }
+
+    // New format: { type: "structural_tag", format: { ... } }
+    if let Some(format_val) = spec.get("format") {
+        // The format field can itself contain structures+triggers
+        return parse_struct_tags(format_val);
+    }
+
+    Err("structural_tag spec must contain 'structures' or 'format'".into())
+}
+
 impl GrammarGuide {
+    /// Build a grammar guide from a structural tag spec (JSON string).
+    ///
+    /// Converts the spec to a Lark grammar via `structural_tag_to_grammar()`
+    /// then compiles it.
+    pub fn from_structural_tag(spec: &str, factory: &Arc<ParserFactory>) -> Result<Self, String> {
+        let lark = structural_tag_to_grammar(spec)?;
+        // If the result is JSON (grammars array), use from_lark_or_grammar_list
+        if lark.trim_start().starts_with('{') {
+            let tlg =
+                TopLevelGrammar::from_lark_or_grammar_list(&lark).map_err(|e| e.to_string())?;
+            let parser = factory.create_parser(tlg).map_err(|e| e.to_string())?;
+            Ok(Self {
+                matcher: Matcher::new(Ok(parser)),
+            })
+        } else {
+            Self::from_ebnf(&lark, factory)
+        }
+    }
+
     /// Build a grammar guide from a JSON schema.
     pub fn from_json_schema(
         schema: &serde_json::Value,
@@ -76,6 +294,7 @@ impl GrammarGuide {
             GuidedGrammar::JsonSchema { schema } => Self::from_json_schema(schema, factory),
             GuidedGrammar::Regex { pattern } => Self::from_regex(pattern, factory),
             GuidedGrammar::Ebnf { grammar } => Self::from_ebnf(grammar, factory),
+            GuidedGrammar::StructuralTag { spec } => Self::from_structural_tag(spec, factory),
         }
     }
 
@@ -318,5 +537,307 @@ mod tests {
         let allowed = guide.allowed_tokens();
         assert!(allowed.is_some());
         assert!(!allowed.unwrap().is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // structural_tag_to_grammar tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_structural_tag_special_token_trigger() {
+        // Special token trigger (starts and ends with <>) — should use direct token reference.
+        // This matches Python's StructTag.to_grammar() with assume_special=True.
+        let spec = serde_json::json!({
+            "structures": [{
+                "begin": "<function=get_weather>",
+                "schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+                "end": "</function>"
+            }],
+            "triggers": ["<function"]
+        });
+        let result = structural_tag_to_grammar(&spec.to_string()).unwrap();
+
+        // With a special token trigger, it should use the trigger directly (not lazy)
+        // Python produces: tag_0: TAG_TEXT <function "=get_weather>" %json {...} "</function>"
+        assert!(
+            result.contains("%llguidance {}"),
+            "missing llguidance header: {result}"
+        );
+        assert!(
+            result.contains("start: (tag_0)* tag_end"),
+            "missing start rule: {result}"
+        );
+        assert!(
+            result.contains("tag_end: TAG_TEXT"),
+            "missing tag_end: {result}"
+        );
+        assert!(
+            result.contains(r"TAG_TEXT: /(.|\n)*/"),
+            "missing TAG_TEXT regex: {result}"
+        );
+        // The trigger <function doesn't end with >, so it should use lazy lexeme
+        assert!(
+            result.contains("tag_0_trig[lazy]"),
+            "missing lazy lexeme: {result}"
+        );
+        assert!(result.contains("%json"), "missing json directive: {result}");
+        assert!(
+            result.contains("\"</function>\""),
+            "missing end tag: {result}"
+        );
+    }
+
+    #[test]
+    fn test_structural_tag_special_token_trigger_angle_brackets() {
+        // Trigger that both starts AND ends with <> — true special token
+        let spec = serde_json::json!({
+            "structures": [{
+                "begin": "<|python_tag|>{\"name\":\"foo\",\"parameters\":",
+                "schema": {"type": "object"},
+                "end": "}"
+            }],
+            "triggers": ["<|python_tag|>"]
+        });
+        let result = structural_tag_to_grammar(&spec.to_string()).unwrap();
+
+        // <|python_tag|> starts with < and ends with > — assume_special applies
+        assert!(result.contains("tag_0: TAG_TEXT <|python_tag|>"));
+        // Should NOT have lazy lexeme for this trigger
+        assert!(!result.contains("tag_0_trig[lazy]"));
+    }
+
+    #[test]
+    fn test_structural_tag_text_trigger_uses_lazy_lexeme() {
+        // Text trigger (not special token) — should use lazy lexeme.
+        let spec = serde_json::json!({
+            "structures": [{
+                "begin": "TOOL_CALL: get_weather(",
+                "schema": {"type": "object"},
+                "end": ")"
+            }],
+            "triggers": ["TOOL_CALL:"]
+        });
+        let result = structural_tag_to_grammar(&spec.to_string()).unwrap();
+
+        // Text trigger — should use lazy lexeme
+        assert!(result.contains("tag_0_trig[lazy]: TAG_TEXT \"TOOL_CALL:\""));
+        assert!(result.contains("tag_0: tag_0_trig"));
+    }
+
+    #[test]
+    fn test_structural_tag_multiple_tags() {
+        // Multiple structural tags with different triggers
+        let spec = serde_json::json!({
+            "structures": [
+                {
+                    "begin": "<function=get_weather>",
+                    "schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+                    "end": "</function>"
+                },
+                {
+                    "begin": "<function=search>",
+                    "schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+                    "end": "</function>"
+                }
+            ],
+            "triggers": ["<function"]
+        });
+        let result = structural_tag_to_grammar(&spec.to_string()).unwrap();
+
+        assert!(result.contains("start: (tag_0 | tag_1)* tag_end"));
+        assert!(result.contains("tag_0"));
+        assert!(result.contains("tag_1"));
+    }
+
+    #[test]
+    fn test_structural_tag_empty_end() {
+        // Empty end string — should not produce empty quotes
+        let spec = serde_json::json!({
+            "structures": [{
+                "begin": "<|tool|>",
+                "schema": {"type": "object"},
+                "end": ""
+            }],
+            "triggers": ["<|tool|>"]
+        });
+        let result = structural_tag_to_grammar(&spec.to_string()).unwrap();
+        assert!(result.contains("%json"));
+        // Should not have trailing empty string literal
+        assert!(!result.contains("\"\""));
+    }
+
+    #[test]
+    fn test_structural_tag_new_format() {
+        // New format: { type: "structural_tag", format: { structures: [...], triggers: [...] } }
+        let spec = serde_json::json!({
+            "type": "structural_tag",
+            "format": {
+                "structures": [{
+                    "begin": "<fn=test>",
+                    "schema": {"type": "object"},
+                    "end": "</fn>"
+                }],
+                "triggers": ["<fn"]
+            }
+        });
+        let result = structural_tag_to_grammar(&spec.to_string()).unwrap();
+        assert!(result.contains("tag_0"));
+        assert!(result.contains("%json"));
+    }
+
+    #[test]
+    fn test_structural_tag_error_empty_tags() {
+        let spec = serde_json::json!({
+            "structures": [],
+            "triggers": ["<fn"]
+        });
+        let result = structural_tag_to_grammar(&spec.to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("at least one tag"));
+    }
+
+    #[test]
+    fn test_structural_tag_error_no_matching_trigger() {
+        let spec = serde_json::json!({
+            "structures": [{
+                "begin": "<function=test>",
+                "schema": {"type": "object"},
+                "end": "</function>"
+            }],
+            "triggers": ["<tool"]
+        });
+        let result = structural_tag_to_grammar(&spec.to_string());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no trigger found"));
+    }
+
+    #[test]
+    fn test_structural_tag_error_begin_not_starting_with_trigger() {
+        let spec = serde_json::json!({
+            "structures": [{
+                "begin": "wrong_prefix",
+                "schema": {"type": "object"},
+                "end": ""
+            }],
+            "triggers": ["<tool"]
+        });
+        let result = structural_tag_to_grammar(&spec.to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_structural_tag_error_invalid_json() {
+        let result = structural_tag_to_grammar("not valid json");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid structural_tag JSON"));
+    }
+
+    #[test]
+    fn test_structural_tag_error_missing_structures_and_format() {
+        let spec = serde_json::json!({"type": "structural_tag"});
+        let result = structural_tag_to_grammar(&spec.to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_structural_tag_json_escaping() {
+        // Verify that begin/end strings with special chars are properly escaped
+        let spec = serde_json::json!({
+            "structures": [{
+                "begin": "<fn=\"test\">",
+                "schema": {"type": "object"},
+                "end": "</fn>"
+            }],
+            "triggers": ["<fn"]
+        });
+        let result = structural_tag_to_grammar(&spec.to_string()).unwrap();
+        // The begin suffix should be properly JSON-escaped
+        assert!(result.contains("=\\\"test\\\">")); // escaped quotes
+    }
+
+    #[test]
+    fn test_structural_tag_lark_sub_grammar_produces_grammars_json() {
+        // When grammar is a Lark grammar (not JSON), should produce grammars JSON array
+        let spec = serde_json::json!({
+            "structures": [{
+                "begin": "<fn=calc>",
+                "schema": "start: /[0-9]+/",
+                "end": "</fn>"
+            }],
+            "triggers": ["<fn"]
+        });
+        let result = structural_tag_to_grammar(&spec.to_string()).unwrap();
+
+        // Should be JSON with grammars array
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let grammars = parsed["grammars"].as_array().unwrap();
+        assert_eq!(grammars.len(), 2); // main + side grammar
+        assert_eq!(grammars[0]["name"], "struct_tag");
+        assert_eq!(grammars[1]["name"], "tag_0_grm");
+        assert!(
+            grammars[1]["lark_grammar"]
+                .as_str()
+                .unwrap()
+                .contains("[0-9]+")
+        );
+    }
+
+    #[test]
+    fn test_from_structural_tag_creates_grammar_guide() {
+        // Test that from_structural_tag produces a working GrammarGuide
+        let factory = make_test_factory();
+        let spec = serde_json::json!({
+            "structures": [{
+                "begin": "CALL:",
+                "schema": {"type": "object"},
+                "end": ";END"
+            }],
+            "triggers": ["CALL:"]
+        });
+        let result = GrammarGuide::from_structural_tag(&spec.to_string(), &factory);
+        assert!(
+            result.is_ok(),
+            "from_structural_tag failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_from_guided_grammar_structural_tag_variant() {
+        // Test via the GuidedGrammar dispatch
+        let factory = make_test_factory();
+        let spec = serde_json::json!({
+            "structures": [{
+                "begin": "FN:",
+                "schema": {"type": "object"},
+                "end": ";END"
+            }],
+            "triggers": ["FN:"]
+        });
+        let grammar = GuidedGrammar::StructuralTag {
+            spec: spec.to_string(),
+        };
+        let result = GrammarGuide::from_guided_grammar(&grammar, &factory);
+        assert!(
+            result.is_ok(),
+            "from_guided_grammar(StructuralTag) failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_structural_tag_serde_roundtrip() {
+        // Verify GuidedGrammar::StructuralTag serializes/deserializes correctly
+        let grammar = GuidedGrammar::StructuralTag {
+            spec: r#"{"structures":[]}"#.to_string(),
+        };
+        let json = serde_json::to_string(&grammar).unwrap();
+        let parsed: GuidedGrammar = serde_json::from_str(&json).unwrap();
+        match parsed {
+            GuidedGrammar::StructuralTag { spec } => {
+                assert_eq!(spec, r#"{"structures":[]}"#);
+            }
+            other => panic!("expected StructuralTag, got {other:?}"),
+        }
     }
 }

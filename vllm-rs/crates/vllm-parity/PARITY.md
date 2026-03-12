@@ -7,7 +7,7 @@
 | ✅ 🟦 | Implemented | 160 |
 | ⚠️ 🟨 | Partial | 3 |
 | ❌ 🟥 | Not implemented | 118 |
-| 🚫 | Won't fix | 3 |
+| 🚫 | Won't fix | 4 |
 
 ---
 
@@ -531,7 +531,7 @@
 | In-process engine client | ✅ | ✅ |  |
 | Single-worker executor | ✅ | ✅ |  |
 | Multi-worker executor | ✅ | ✅ | Rust: tokio channels |
-| Ray executor (distributed) | ✅ | wontfix | Ray is a Python-native library with no Rust client; replaced by lightweight Rust launcher + NCCL rendezvous |
+| ~~Ray executor (distributed)~~ | ✅ | ❌ | 🚫 Won't fix — Ray is a Python-native library with no Rust client; replaced by lightweight Rust launcher + NCCL rendezvous |
 | External launcher executor | ✅ | ✅ | --distributed-executor-backend external_launcher; TCP store for NCCL ID exchange + memory allreduce; one CudaWorker per process |
 | PyO3 scheduler bridge | N/A | ✅ | Rust scheduler usable from Python |
 | Offline `LLM` API (programmatic) | ✅ | ✅ | Python: `LLM` class; Rust: `LLM` struct |

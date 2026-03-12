@@ -6,7 +6,7 @@
 |--------|---------|------:|
 | ✅ 🟦 | Implemented | 157 |
 | ⚠️ 🟨 | Partial | 3 |
-| ❌ 🟥 | Not implemented | 141 |
+| ❌ 🟥 | Not implemented | 122 |
 | 🚫 | Won't fix | 3 |
 
 ---
@@ -31,7 +31,7 @@
 | [Attention Backends](#attention-backends) | 🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 3 | 0 | 9 |
 | [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 22 | 0 | 0 |
 | [Structured Output / Guided Decoding](#structured-output--guided-decoding) | 🟦🟦🟦🟦🟦🟦🟦 | 7 | 0 | 0 |
-| [Tool Calling / Function Calling](#tool-calling--function-calling) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 10 | 1 | 25 |
+| [Tool Calling / Function Calling](#tool-calling--function-calling) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥🟥🟥🟥 | 10 | 1 | 6 |
 | [Scheduling](#scheduling) | 🟦🟦🟦🟦🟦🟦 | 6 | 0 | 0 |
 | [KV Cache](#kv-cache) | 🟦🟦🟦🟦🟦🟥🟥🟥 | 5 | 0 | 3 |
 | [LoRA & Adapters](#lora--adapters) | 🟦🟦🟥🟥🟥🟥 | 2 | 0 | 4 |
@@ -43,7 +43,7 @@
 | [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 22 | 0 | 4 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟦 | 7 | 0 | 0 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟥🟥 | 7 | 0 | 2 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **157** | **3** | **141** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **157** | **3** | **122** |
 
 ---
 
@@ -335,29 +335,10 @@
 | `deepseek_v31` tool parser | ✅ | ❌ | Same as v3 with slightly simpler regex |
 | `deepseek_v32` tool parser | ✅ | ❌ | DSML XML tags + per-parameter type coercion |
 | `granite` tool parser | ✅ | ✅ | `<|tool_call|>` / `<tool_call>` + JSON array; streaming + non-streaming; E2E tests |
-| `granite-20b-fc` tool parser | ✅ | ❌ | `<function_call>` repeated prefix + sequential JSON objects |
 | `qwen3_coder` tool parser | ✅ | ❌ | XML-like tags (`<tool_call>` `<function=...>` `<parameter=...>`) + type coercion |
 | `qwen3_xml` tool parser | ✅ | ❌ | SAX-style XML parsing via expat; 1318 lines |
-| `pythonic` tool parser | ✅ | ❌ | Python AST parsing (`ast.parse`) for `[func(arg=val)]` syntax |
-| `llama4_pythonic` tool parser | ✅ | ❌ | Python AST parsing + `<|python_start|>` tag |
-| `phi4_mini_json` tool parser | ✅ | ❌ | `functools[...]` regex + JSON; no streaming |
 | `jamba` tool parser | ✅ | ⚠️ | Parser implemented; needs E2E testing once JambaForCausalLM is supported |
-| `internlm` tool parser | ✅ | ❌ | `<|action_start|><|plugin|>` special tokens + partial_json |
-| `xlam` tool parser | ✅ | ❌ | Multi-format detector (JSON / code-block / tool-call tag) |
-| `longcat` tool parser | ✅ | ❌ | Hermes variant with `<longcat_tool_call>` tags |
-| `glm45` tool parser | ✅ | ❌ | `<tool_call>` + arg_key/arg_value tags; incremental string streaming |
-| `glm47` tool parser | ✅ | ❌ | Subclass of glm45 with different regexes |
-| `functiongemma` tool parser | ✅ | ❌ | `<start_function_call>call:name{k:<escape>v}` custom delimiters |
-| `hunyuan_a13b` tool parser | ✅ | ❌ | `<tool_calls>` JSON array with `<think>` region exclusion |
-| `minimax` tool parser | ✅ | ❌ | `<tool_calls>` line-JSON with think-region buffer management |
-| `minimax_m2` tool parser | ✅ | ❌ | Minimax variant |
-| `olmo3` tool parser | ✅ | ❌ | Python AST parsing + XML wrapper + newline-separated calls |
-| `openai` tool parser | ✅ | ❌ | Requires harmony_utils token-ID binary protocol |
-| `seed_oss` tool parser | ✅ | ❌ | `<seed:tool_call>` XML params + think-tag handling |
-| `step3` tool parser | ✅ | ❌ | DeepSeek-style special tokens + steptml XML |
-| `step3p5` tool parser | ✅ | ❌ | SAX-style XML parsing via expat; 1526 lines |
-| `ernie45` tool parser | ✅ | ❌ | `<tool_call>{JSON}</tool_call>` regex + buffer-emit |
-| `gigachat3` tool parser | ✅ | ❌ | `function call{JSON}` regex + string diff |
+| Other tool parsers (20) | ✅ | ❌ | granite-20b-fc, pythonic, llama4_pythonic, phi4_mini_json, internlm, xlam, longcat, glm45, glm47, functiongemma, hunyuan_a13b, minimax, minimax_m2, olmo3, openai, seed_oss, step3, step3p5, ernie45, gigachat3 |
 | Reasoning parsers (strip CoT tokens) | ✅ | ✅ | DeepSeek-R1, Qwen3; --reasoning-parser CLI arg; streaming + non-streaming |
 
 ---

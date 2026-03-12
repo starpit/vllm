@@ -24,5 +24,8 @@ futures-util = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tokenizers = { workspace = true }
 hf-hub = { workspace = true }
+rand = { workspace = true }
+rand_distr = "0.4"
+serde = { workspace = true }
 shell-words = "1"
 url = "2"

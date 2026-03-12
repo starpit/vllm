@@ -183,6 +183,14 @@ pub struct BenchThroughputArgs {
     #[arg(long, default_value = "auto")]
     pub dtype: String,
 
+    /// Dataset name: "random" (default) or "sharegpt".
+    #[arg(long, default_value = "random")]
+    pub dataset_name: String,
+
+    /// Path to dataset file (required for sharegpt).
+    #[arg(long)]
+    pub dataset_path: Option<String>,
+
     /// Number of prompts to process.
     #[arg(long, default_value_t = 1000)]
     pub num_prompts: usize,
@@ -330,6 +338,24 @@ pub struct BenchServeArgs {
     #[arg(long, default_value = "99")]
     pub metric_percentiles: String,
 
+    /// Burstiness of request arrival pattern.
+    /// 1.0 = Poisson (exponential delays), <1.0 = bursty, >1.0 = more uniform.
+    /// Use "inf" for constant inter-request delay.
+    #[arg(long, default_value_t = 1.0)]
+    pub burstiness: f64,
+
+    /// Number of warmup requests to send before timing.
+    #[arg(long, default_value_t = 0)]
+    pub num_warmups: usize,
+
+    /// Dataset name: "random" (default) or "sharegpt".
+    #[arg(long, default_value = "random")]
+    pub dataset_name: String,
+
+    /// Path to dataset file (required for sharegpt).
+    #[arg(long)]
+    pub dataset_path: Option<String>,
+
     /// Ignore EOS token (force generation to max output length).
     /// Defaults to true for random prompts, matching Python's behavior.
     #[arg(long, default_value_t = true)]
@@ -354,6 +380,22 @@ pub struct BenchServeArgs {
     /// Disable SSL certificate verification.
     #[arg(long)]
     pub insecure: bool,
+
+    /// Save benchmark results to a JSON file (auto-generated filename).
+    #[arg(long)]
+    pub save_result: bool,
+
+    /// Directory to save results in (used with --save-result).
+    #[arg(long)]
+    pub result_dir: Option<String>,
+
+    /// Override auto-generated result filename (used with --save-result).
+    #[arg(long)]
+    pub result_filename: Option<String>,
+
+    /// Label for this benchmark run (used in auto-generated filenames).
+    #[arg(long)]
+    pub label: Option<String>,
 }
 
 /// Arguments for `vllm bench startup`.

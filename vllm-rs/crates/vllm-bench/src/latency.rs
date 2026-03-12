@@ -269,25 +269,42 @@ pub(crate) fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
 
     // JSON output.
     if let Some(ref path) = args.output_json {
-        let json_results: Vec<serde_json::Value> = results
-            .iter()
-            .map(|r| {
-                let pct_map: serde_json::Map<String, serde_json::Value> =
-                    [10.0, 25.0, 50.0, 75.0, 90.0, 99.0]
-                        .iter()
-                        .chain(pcts.iter())
-                        .map(|&p| (format!("{p:.0}"), serde_json::json!(r.percentile_value(p))))
-                        .collect();
-                serde_json::json!({
-                    "model": r.model,
-                    "batch_size": r.batch_size,
-                    "avg_latency": r.avg_latency(),
-                    "percentiles": pct_map,
-                    "latencies": r.latencies,
-                })
+        let output = if results.len() == 1 {
+            // Single model + single batch size: flat format matching Python's output.
+            let r = &results[0];
+            let pct_map: serde_json::Map<String, serde_json::Value> =
+                [10.0, 25.0, 50.0, 75.0, 90.0, 99.0]
+                    .iter()
+                    .chain(pcts.iter())
+                    .map(|&p| (format!("{p:.0}"), serde_json::json!(r.percentile_value(p))))
+                    .collect();
+            serde_json::json!({
+                "avg_latency": r.avg_latency(),
+                "latencies": r.latencies,
+                "percentiles": pct_map,
             })
-            .collect();
-        let output = serde_json::json!({ "results": json_results });
+        } else {
+            // Multi-model or multi-batch: wrapped format (Rust extension).
+            let json_results: Vec<serde_json::Value> = results
+                .iter()
+                .map(|r| {
+                    let pct_map: serde_json::Map<String, serde_json::Value> =
+                        [10.0, 25.0, 50.0, 75.0, 90.0, 99.0]
+                            .iter()
+                            .chain(pcts.iter())
+                            .map(|&p| (format!("{p:.0}"), serde_json::json!(r.percentile_value(p))))
+                            .collect();
+                    serde_json::json!({
+                        "model": r.model,
+                        "batch_size": r.batch_size,
+                        "avg_latency": r.avg_latency(),
+                        "percentiles": pct_map,
+                        "latencies": r.latencies,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "results": json_results })
+        };
         std::fs::write(path, serde_json::to_string_pretty(&output)?)?;
         eprintln!("Results written to {path}");
     }

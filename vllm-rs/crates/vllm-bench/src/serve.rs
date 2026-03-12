@@ -7,6 +7,7 @@
 //! API) and measures per-request latency metrics: TTFT, TPOT, ITL, and
 //! end-to-end latency (E2EL).
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -14,10 +15,13 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::Rng;
+use rand_distr::Gamma;
 use reqwest::Client;
 use tokio::sync::Semaphore;
 
 use crate::args::BenchServeArgs;
+use crate::datasets;
 
 /// Per-request result.
 struct RequestResult {
@@ -29,6 +33,8 @@ struct RequestResult {
     e2el: f64,
     /// Number of output tokens generated.
     output_tokens: usize,
+    /// Timestamp (seconds since benchmark start) when request was sent.
+    start_time: f64,
     success: bool,
 }
 
@@ -43,14 +49,20 @@ async fn get_model_from_server(client: &Client, base_url: &str) -> Result<String
 }
 
 /// Send a single streaming completions request and measure timing.
+#[allow(clippy::too_many_arguments)]
 async fn send_request(
     client: &Client,
     api_url: &str,
     model: &str,
     prompt: &str,
     output_len: usize,
-    args: &BenchServeArgs,
+    ignore_eos: bool,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<i32>,
+    api_key: Option<&str>,
     request_id: &str,
+    bench_start: Instant,
 ) -> RequestResult {
     let mut body = serde_json::json!({
         "model": model,
@@ -62,20 +74,21 @@ async fn send_request(
         "repetition_penalty": 1.0,
     });
 
-    if args.ignore_eos {
+    if ignore_eos {
         body["ignore_eos"] = serde_json::json!(true);
     }
-    if let Some(t) = args.temperature {
+    if let Some(t) = temperature {
         body["temperature"] = serde_json::json!(t);
     }
-    if let Some(p) = args.top_p {
+    if let Some(p) = top_p {
         body["top_p"] = serde_json::json!(p);
     }
-    if let Some(k) = args.top_k {
+    if let Some(k) = top_k {
         body["top_k"] = serde_json::json!(k);
     }
 
     let request_start = Instant::now();
+    let start_time = request_start.duration_since(bench_start).as_secs_f64();
     let mut first_token_time: Option<Instant> = None;
     let mut last_token_time = request_start;
     let mut itl = Vec::new();
@@ -85,7 +98,7 @@ async fn send_request(
         .post(api_url)
         .header("x-request-id", request_id)
         .json(&body);
-    if let Some(ref key) = args.api_key {
+    if let Some(key) = api_key {
         req = req.bearer_auth(key);
     }
 
@@ -98,6 +111,7 @@ async fn send_request(
                 itl: vec![],
                 e2el: request_start.elapsed().as_secs_f64(),
                 output_tokens: 0,
+                start_time,
                 success: false,
             };
         }
@@ -112,6 +126,7 @@ async fn send_request(
             itl: vec![],
             e2el: request_start.elapsed().as_secs_f64(),
             output_tokens: 0,
+            start_time,
             success: false,
         };
     }
@@ -180,17 +195,30 @@ async fn send_request(
         itl,
         e2el,
         output_tokens,
+        start_time,
         success: first_token_time.is_some(),
     }
 }
 
-/// Compute percentile of a sorted slice.
+/// Compute percentile of a sorted slice using linear interpolation
+/// matching numpy.percentile(method='linear').
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
-    let idx = ((p / 100.0) * (sorted.len() - 1) as f64).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
+    let n = sorted.len();
+    if n == 1 {
+        return sorted[0];
+    }
+    let idx = (p / 100.0) * (n - 1) as f64;
+    let lo = idx.floor() as usize;
+    let hi = lo + 1;
+    if hi >= n {
+        sorted[n - 1]
+    } else {
+        let frac = idx - lo as f64;
+        sorted[lo] + frac * (sorted[hi] - sorted[lo])
+    }
 }
 
 /// Compute standard deviation.
@@ -203,18 +231,62 @@ fn std_dev(data: &[f64]) -> f64 {
     variance.sqrt()
 }
 
-/// Sample from exponential distribution using inverse CDF.
-/// Returns -ln(U) / lambda where U is uniform in (0,1).
-fn exponential_sample(rng_state: &mut u64, rate: f64) -> f64 {
-    // xorshift64 → uniform (0,1)
-    *rng_state ^= *rng_state << 13;
-    *rng_state ^= *rng_state >> 7;
-    *rng_state ^= *rng_state << 17;
-    let u = (*rng_state as f64) / (u64::MAX as f64);
-    // Clamp away from 0 to avoid -ln(0) = inf.
-    let u = u.max(1e-15);
-    -u.ln() / rate
+/// Generate inter-request delays using a gamma distribution, matching Python's
+/// `get_request_func()` methodology.
+///
+/// - `burstiness == 1.0`: Gamma(shape=1, scale=1/rate) = exponential (Poisson process)
+/// - `burstiness < 1.0`: more bursty (clustered arrivals)
+/// - `burstiness > 1.0`: more uniform (evenly spaced)
+/// - `burstiness == inf`: constant delay = 1/rate
+///
+/// After generating raw delays, accumulates them cumulatively and normalizes
+/// so that the total time span matches `num_prompts / rate`.
+fn generate_request_delays(num_prompts: usize, rate: f64, burstiness: f64, seed: u64) -> Vec<f64> {
+    if rate.is_infinite() || num_prompts <= 1 {
+        return vec![0.0; num_prompts];
+    }
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+
+    if burstiness.is_infinite() {
+        // Constant delay.
+        let delay = 1.0 / rate;
+        let mut cumulative = vec![0.0];
+        for i in 1..num_prompts {
+            cumulative.push(delay * i as f64);
+        }
+        return cumulative;
+    }
+
+    // Gamma distribution: shape = burstiness, scale = 1 / (rate * burstiness)
+    // When burstiness=1, this reduces to Exponential(rate).
+    let shape = burstiness;
+    let scale = 1.0 / (rate * burstiness);
+    let gamma = Gamma::new(shape, scale).expect("Invalid gamma distribution parameters");
+
+    // Generate raw delays and accumulate.
+    let mut cumulative = Vec::with_capacity(num_prompts);
+    cumulative.push(0.0);
+    for _ in 1..num_prompts {
+        let delay: f64 = rng.sample(gamma);
+        cumulative.push(cumulative.last().unwrap() + delay);
+    }
+
+    // Normalize cumulative delays to match target total time.
+    // Python: intervals *= target / sum(intervals), then cumsum.
+    let actual_total = *cumulative.last().unwrap();
+    let target_total = (num_prompts - 1) as f64 / rate;
+    if actual_total > 0.0 {
+        let scale_factor = target_total / actual_total;
+        for t in &mut cumulative {
+            *t *= scale_factor;
+        }
+    }
+
+    cumulative
 }
+
+use rand::SeedableRng;
 
 pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
     let client_builder = Client::builder().timeout(Duration::from_secs(3600));
@@ -238,7 +310,7 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
     eprintln!("Model: {model}");
     eprintln!("API URL: {api_url}");
     eprintln!(
-        "num_prompts: {}, input_len: {}, output_len: {}, request_rate: {}",
+        "num_prompts: {}, input_len: {}, output_len: {}, request_rate: {}, burstiness: {}",
         args.num_prompts,
         args.input_len,
         args.output_len,
@@ -246,6 +318,11 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
             "inf".to_string()
         } else {
             format!("{:.1}", args.request_rate)
+        },
+        if args.burstiness.is_infinite() {
+            "inf".to_string()
+        } else {
+            format!("{:.2}", args.burstiness)
         }
     );
 
@@ -259,78 +336,94 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
     };
 
-    // Build allowed tokens (exclude special tokens), matching Python's RandomDataset.
-    let vocab_size = tokenizer.get_vocab_size(false) as u32;
-    let special_ids: std::collections::HashSet<u32> = tokenizer
-        .get_added_vocabulary()
-        .get_added_tokens_decoder()
-        .iter()
-        .filter(|(_, t)| t.special)
-        .map(|(id, _)| *id)
-        .collect();
-    let allowed_tokens: Vec<u32> = (0..vocab_size)
-        .filter(|id| !special_ids.contains(id))
-        .collect();
-    let num_allowed = allowed_tokens.len();
-    eprintln!("Tokenizer loaded: vocab_size={vocab_size}, allowed_tokens={num_allowed}");
+    // Generate or load prompts.
+    struct PromptEntry {
+        text: String,
+        output_len: usize,
+    }
 
-    // Generate random text prompts matching Python's RandomDataset.generate_token_sequence:
-    // token_ids = allowed_tokens[(offset + index + arange(input_len)) % num_allowed]
-    // then decode → re-encode → truncate to target length → decode again.
-    eprintln!("Generating {} random prompts...", args.num_prompts);
-    let prompts: Vec<String> = (0..args.num_prompts)
-        .map(|i| {
-            let offset = i * 7 + args.seed as usize; // deterministic offset
-            let token_ids: Vec<u32> = (0..args.input_len)
-                .map(|j| allowed_tokens[(offset + i + j) % num_allowed])
+    let prompt_entries: Vec<PromptEntry> = match args.dataset_name.as_str() {
+        "sharegpt" => {
+            let dataset_path = args.dataset_path.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("--dataset-path is required for sharegpt dataset")
+            })?;
+            eprintln!("Loading ShareGPT dataset from {dataset_path}...");
+            let samples = datasets::load_sharegpt(
+                Path::new(dataset_path),
+                &tokenizer,
+                args.num_prompts,
+                None,
+                args.seed,
+            )?;
+            eprintln!("Loaded {} samples from ShareGPT dataset", samples.len());
+            samples
+                .into_iter()
+                .map(|s| PromptEntry {
+                    text: s.prompt,
+                    output_len: s.expected_output_len,
+                })
+                .collect()
+        }
+        _ => {
+            // Build allowed tokens (exclude special tokens), matching Python's RandomDataset.
+            let vocab_size = tokenizer.get_vocab_size(false) as u32;
+            let special_ids: std::collections::HashSet<u32> = tokenizer
+                .get_added_vocabulary()
+                .get_added_tokens_decoder()
+                .iter()
+                .filter(|(_, t)| t.special)
+                .map(|(id, _)| *id)
                 .collect();
-            // Decode to text.
-            let text = tokenizer.decode(&token_ids, true).unwrap_or_default();
-            // Re-encode to verify length and truncate if needed.
-            let encoding = tokenizer.encode(text.as_str(), false).unwrap();
-            let re_encoded = encoding.get_ids();
-            if re_encoded.len() > args.input_len {
-                // Truncate and decode again.
-                let truncated = &re_encoded[..args.input_len];
-                tokenizer.decode(truncated, true).unwrap_or(text)
-            } else {
-                text
-            }
-        })
-        .collect();
+            let allowed_tokens: Vec<u32> = (0..vocab_size)
+                .filter(|id| !special_ids.contains(id))
+                .collect();
+            let num_allowed = allowed_tokens.len();
+            eprintln!("Tokenizer loaded: vocab_size={vocab_size}, allowed_tokens={num_allowed}");
+
+            // Generate random text prompts matching Python's RandomDataset.generate_token_sequence.
+            eprintln!("Generating {} random prompts...", args.num_prompts);
+            (0..args.num_prompts)
+                .map(|i| {
+                    let offset = i * 7 + args.seed as usize;
+                    let token_ids: Vec<u32> = (0..args.input_len)
+                        .map(|j| allowed_tokens[(offset + i + j) % num_allowed])
+                        .collect();
+                    let text = tokenizer.decode(&token_ids, true).unwrap_or_default();
+                    let encoding = tokenizer.encode(text.as_str(), false).unwrap();
+                    let re_encoded = encoding.get_ids();
+                    let text = if re_encoded.len() > args.input_len {
+                        let truncated = &re_encoded[..args.input_len];
+                        tokenizer.decode(truncated, true).unwrap_or(text)
+                    } else {
+                        text
+                    };
+                    PromptEntry {
+                        text,
+                        output_len: args.output_len,
+                    }
+                })
+                .collect()
+        }
+    };
+
+    let num_prompts = prompt_entries.len();
 
     // Pre-flight check: send one request to verify connectivity.
     eprintln!("Sending pre-flight request to verify connectivity...");
     {
-        let preflight_args = BenchServeArgs {
-            model: Some(model.clone()),
-            base_url: args.base_url.clone(),
-            endpoint: args.endpoint.clone(),
-            num_prompts: 1,
-            input_len: args.input_len,
-            output_len: args.output_len,
-            request_rate: f64::INFINITY,
-            max_concurrency: None,
-            seed: 0,
-            disable_tqdm: true,
-            output_json: None,
-            percentile_metrics: String::new(),
-            metric_percentiles: String::new(),
-            ignore_eos: args.ignore_eos,
-            temperature: args.temperature,
-            top_p: args.top_p,
-            top_k: args.top_k,
-            api_key: args.api_key.clone(),
-            insecure: args.insecure,
-        };
         let result = send_request(
             &client,
             &api_url,
             &model,
-            &prompts[0],
-            args.output_len,
-            &preflight_args,
+            &prompt_entries[0].text,
+            prompt_entries[0].output_len.min(args.output_len),
+            args.ignore_eos,
+            args.temperature,
+            args.top_p,
+            args.top_k,
+            args.api_key.as_deref(),
             "preflight",
+            Instant::now(),
         )
         .await;
         if !result.success {
@@ -339,9 +432,42 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
         eprintln!("Pre-flight request succeeded.");
     }
 
+    // Warmup requests.
+    if args.num_warmups > 0 {
+        eprintln!("Sending {} warmup request(s)...", args.num_warmups);
+        let warmup_pb = ProgressBar::new(args.num_warmups as u64);
+        warmup_pb.set_style(
+            ProgressStyle::with_template(
+                "Warmup {wide_bar:.yellow/blue} {pos}/{len} [{elapsed}<{eta}]",
+            )
+            .unwrap(),
+        );
+        for i in 0..args.num_warmups {
+            let idx = i % num_prompts;
+            send_request(
+                &client,
+                &api_url,
+                &model,
+                &prompt_entries[idx].text,
+                prompt_entries[idx].output_len.min(args.output_len),
+                args.ignore_eos,
+                args.temperature,
+                args.top_p,
+                args.top_k,
+                args.api_key.as_deref(),
+                &format!("warmup-{i}"),
+                Instant::now(),
+            )
+            .await;
+            warmup_pb.inc(1);
+        }
+        warmup_pb.finish_and_clear();
+        eprintln!("Warmup complete.");
+    }
+
     // Progress bar.
     let pb = if !args.disable_tqdm {
-        let pb = ProgressBar::new(args.num_prompts as u64);
+        let pb = ProgressBar::new(num_prompts as u64);
         pb.set_style(
             ProgressStyle::with_template(
                 "Benchmarking {wide_bar:.cyan/blue} {pos}/{len} [{elapsed}<{eta}, {per_sec}]",
@@ -357,17 +483,23 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
     let completed = Arc::new(AtomicUsize::new(0));
     let semaphore = args.max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
 
-    // Separate RNG state for delay sampling.
-    let mut delay_rng: u64 = args.seed.wrapping_add(42).max(1);
+    // Generate request schedule using gamma distribution delays.
+    let cumulative_delays = generate_request_delays(
+        num_prompts,
+        args.request_rate,
+        args.burstiness,
+        args.seed.wrapping_add(42),
+    );
 
     let benchmark_start = Instant::now();
-    let mut handles = Vec::with_capacity(args.num_prompts);
+    let mut handles = Vec::with_capacity(num_prompts);
 
-    for (i, prompt_text) in prompts.into_iter().enumerate() {
-        // Inter-request delay: exponential distribution (Poisson process).
-        if !args.request_rate.is_infinite() && i > 0 {
-            let delay = exponential_sample(&mut delay_rng, args.request_rate);
-            tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+    for (i, entry) in prompt_entries.into_iter().enumerate() {
+        // Wait until the scheduled time for this request.
+        let target_time = Duration::from_secs_f64(cumulative_delays[i]);
+        let elapsed = benchmark_start.elapsed();
+        if target_time > elapsed {
+            tokio::time::sleep(target_time - elapsed).await;
         }
 
         let client = client.clone();
@@ -377,38 +509,13 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
         let pb = pb.clone();
         let sem = semaphore.clone();
         let request_id = format!("bench-{i}");
-
-        // Copy args we need into the task. BenchServeArgs isn't Clone,
-        // so extract the fields we need.
         let ignore_eos = args.ignore_eos;
         let temperature = args.temperature;
         let top_p = args.top_p;
         let top_k = args.top_k;
         let api_key = args.api_key.clone();
-        let insecure = args.insecure;
-        let output_len = args.output_len;
-
-        let task_args = BenchServeArgs {
-            model: Some(model.clone()),
-            base_url: args.base_url.clone(),
-            endpoint: args.endpoint.clone(),
-            num_prompts: args.num_prompts,
-            input_len: args.input_len,
-            output_len,
-            request_rate: args.request_rate,
-            max_concurrency: args.max_concurrency,
-            seed: args.seed,
-            disable_tqdm: args.disable_tqdm,
-            output_json: None,
-            percentile_metrics: args.percentile_metrics.clone(),
-            metric_percentiles: args.metric_percentiles.clone(),
-            ignore_eos,
-            temperature,
-            top_p,
-            top_k,
-            api_key,
-            insecure,
-        };
+        let output_len = entry.output_len;
+        let bench_start = benchmark_start;
 
         handles.push(tokio::spawn(async move {
             let _permit = match &sem {
@@ -419,10 +526,15 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
                 &client,
                 &api_url,
                 &model,
-                &prompt_text,
+                &entry.text,
                 output_len,
-                &task_args,
+                ignore_eos,
+                temperature,
+                top_p,
+                top_k,
+                api_key.as_deref(),
                 &request_id,
+                bench_start,
             )
             .await;
             completed.fetch_add(1, Ordering::Relaxed);
@@ -476,6 +588,12 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
     let mut e2els: Vec<f64> = successful.iter().map(|r| r.e2el).collect();
     e2els.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
+    // Compute peak metrics matching Python's methodology.
+    // Peak output tokens/s: bucket tokens into 1-second intervals.
+    let peak_output_tps = compute_peak_output_tps(&successful, total_time);
+    // Peak concurrent requests.
+    let peak_concurrent = compute_peak_concurrent(&successful);
+
     let selected_metrics: Vec<&str> = args.percentile_metrics.split(',').collect();
     let selected_pcts: Vec<f64> = args
         .metric_percentiles
@@ -518,6 +636,14 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
         "Total token throughput (tok/s):",
         (total_input_tokens + total_output_tokens) as f64 / total_time
     );
+    println!(
+        "{:<40} {:<10.2}",
+        "Peak output token throughput (tok/s):", peak_output_tps
+    );
+    println!(
+        "{:<40} {:<10}",
+        "Peak concurrent requests:", peak_concurrent
+    );
 
     // Print per-metric stats (matches Python's process_one_metric format).
     let print_metric = |name: &str, header: &str, data: &[f64]| {
@@ -526,6 +652,7 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
         }
         let mean = data.iter().sum::<f64>() / data.len() as f64;
         let median = percentile(data, 50.0);
+        let sd = std_dev(data);
         println!("{:-^50}", header);
         println!(
             "{:<40} {:<10.2}",
@@ -537,6 +664,7 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
             format!("Median {name} (ms):"),
             median * 1000.0
         );
+        println!("{:<40} {:<10.2}", format!("Std {name} (ms):"), sd * 1000.0);
         for &p in &selected_pcts {
             let p_word = if p == p.floor() {
                 format!("{}", p as i64)
@@ -562,66 +690,152 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
     }
     println!("{:=^50}", "");
 
-    // JSON output (matches Python's result dict).
-    if let Some(ref path) = args.output_json {
-        let mean = |d: &[f64]| {
-            if d.is_empty() {
-                0.0
-            } else {
-                d.iter().sum::<f64>() / d.len() as f64
+    // Build JSON result object.
+    let mean = |d: &[f64]| {
+        if d.is_empty() {
+            0.0
+        } else {
+            d.iter().sum::<f64>() / d.len() as f64
+        }
+    };
+
+    let mut json = serde_json::json!({
+        "duration": total_time,
+        "completed": num_success,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "request_throughput": num_success as f64 / total_time,
+        "output_throughput": total_output_tokens as f64 / total_time,
+        "total_token_throughput": (total_input_tokens + total_output_tokens) as f64 / total_time,
+        "peak_output_throughput": peak_output_tps,
+        "peak_concurrent_requests": peak_concurrent,
+    });
+    let obj = json.as_object_mut().unwrap();
+
+    let add_metric_json =
+        |obj: &mut serde_json::Map<String, serde_json::Value>, attr: &str, data: &[f64]| {
+            obj.insert(
+                format!("mean_{attr}_ms"),
+                serde_json::json!(mean(data) * 1000.0),
+            );
+            obj.insert(
+                format!("median_{attr}_ms"),
+                serde_json::json!(percentile(data, 50.0) * 1000.0),
+            );
+            obj.insert(
+                format!("std_{attr}_ms"),
+                serde_json::json!(std_dev(data) * 1000.0),
+            );
+            for &p in &selected_pcts {
+                let p_word = if p == p.floor() {
+                    format!("{}", p as i64)
+                } else {
+                    format!("{p}")
+                };
+                obj.insert(
+                    format!("p{p_word}_{attr}_ms"),
+                    serde_json::json!(percentile(data, p) * 1000.0),
+                );
             }
         };
 
-        let mut json = serde_json::json!({
-            "duration": total_time,
-            "completed": num_success,
-            "total_input_tokens": total_input_tokens,
-            "total_output_tokens": total_output_tokens,
-            "request_throughput": num_success as f64 / total_time,
-            "output_throughput": total_output_tokens as f64 / total_time,
-            "total_token_throughput": (total_input_tokens + total_output_tokens) as f64 / total_time,
-        });
-        let obj = json.as_object_mut().unwrap();
-
-        let add_metric_json =
-            |obj: &mut serde_json::Map<String, serde_json::Value>, attr: &str, data: &[f64]| {
-                obj.insert(
-                    format!("mean_{attr}_ms"),
-                    serde_json::json!(mean(data) * 1000.0),
-                );
-                obj.insert(
-                    format!("median_{attr}_ms"),
-                    serde_json::json!(percentile(data, 50.0) * 1000.0),
-                );
-                obj.insert(
-                    format!("std_{attr}_ms"),
-                    serde_json::json!(std_dev(data) * 1000.0),
-                );
-                for &p in &selected_pcts {
-                    let p_word = if p == p.floor() {
-                        format!("{}", p as i64)
-                    } else {
-                        format!("{p}")
-                    };
-                    obj.insert(
-                        format!("p{p_word}_{attr}_ms"),
-                        serde_json::json!(percentile(data, p) * 1000.0),
-                    );
-                }
-            };
-
-        for metric in &selected_metrics {
-            match *metric {
-                "ttft" => add_metric_json(obj, "ttft", &ttfts),
-                "tpot" => add_metric_json(obj, "tpot", &tpots),
-                "itl" => add_metric_json(obj, "itl", &itls),
-                "e2el" => add_metric_json(obj, "e2el", &e2els),
-                _ => {}
-            }
+    for metric in &selected_metrics {
+        match *metric {
+            "ttft" => add_metric_json(obj, "ttft", &ttfts),
+            "tpot" => add_metric_json(obj, "tpot", &tpots),
+            "itl" => add_metric_json(obj, "itl", &itls),
+            "e2el" => add_metric_json(obj, "e2el", &e2els),
+            _ => {}
         }
+    }
+
+    // --output-json: explicit path.
+    if let Some(ref path) = args.output_json {
         std::fs::write(path, serde_json::to_string_pretty(&json)?)?;
         eprintln!("Results written to {path}");
     }
 
+    // --save-result: auto-generated filename.
+    if args.save_result {
+        let label = args.label.as_deref().unwrap_or("openai");
+        let model_basename = model.rsplit('/').next().unwrap_or(&model);
+        let datetime = chrono::Local::now().format("%Y%m%d-%H%M%S");
+
+        let filename = if let Some(ref name) = args.result_filename {
+            name.clone()
+        } else {
+            let rate_str = if args.request_rate.is_infinite() {
+                "inf".to_string()
+            } else {
+                format!("{:.0}", args.request_rate)
+            };
+            format!("{label}-{rate_str}qps-{model_basename}-{datetime}.json")
+        };
+
+        let dir = args.result_dir.as_deref().unwrap_or(".");
+        std::fs::create_dir_all(dir)?;
+        let path = std::path::PathBuf::from(dir).join(&filename);
+        std::fs::write(&path, serde_json::to_string_pretty(&json)?)?;
+        eprintln!("Results saved to {}", path.display());
+    }
+
     Ok(())
+}
+
+/// Compute peak output tokens/s by bucketing tokens into 1-second intervals.
+fn compute_peak_output_tps(results: &[&RequestResult], total_time: f64) -> f64 {
+    if results.is_empty() || total_time <= 0.0 {
+        return 0.0;
+    }
+
+    let num_buckets = total_time.ceil() as usize + 1;
+    let mut buckets = vec![0usize; num_buckets];
+
+    for r in results {
+        // Estimate when each token was generated:
+        // First token at start_time + ttft, subsequent tokens spread via ITL.
+        let first_token_time = r.start_time + r.ttft;
+
+        // First token.
+        let bucket = first_token_time.floor() as usize;
+        if bucket < num_buckets {
+            buckets[bucket] += 1;
+        }
+
+        // Subsequent tokens.
+        let mut t = first_token_time;
+        for &itl in &r.itl {
+            t += itl;
+            let bucket = t.floor() as usize;
+            if bucket < num_buckets {
+                buckets[bucket] += 1;
+            }
+        }
+    }
+
+    buckets.into_iter().max().unwrap_or(0) as f64
+}
+
+/// Compute peak concurrent requests.
+fn compute_peak_concurrent(results: &[&RequestResult]) -> usize {
+    if results.is_empty() {
+        return 0;
+    }
+
+    // Build events: +1 at start_time, -1 at start_time + e2el.
+    let mut events: Vec<(f64, i32)> = Vec::with_capacity(results.len() * 2);
+    for r in results {
+        events.push((r.start_time, 1));
+        events.push((r.start_time + r.e2el, -1));
+    }
+    events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+
+    let mut current = 0i32;
+    let mut peak = 0i32;
+    for (_, delta) in events {
+        current += delta;
+        peak = peak.max(current);
+    }
+
+    peak as usize
 }

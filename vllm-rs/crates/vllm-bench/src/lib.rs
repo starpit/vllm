@@ -7,6 +7,7 @@
 //! driven from any CLI frontend. The canonical entry point is [`run_bench`].
 
 mod args;
+pub(crate) mod datasets;
 mod latency;
 mod serve;
 mod startup;

@@ -56,6 +56,35 @@ impl Drop for GemmPlan {
     }
 }
 
+/// Cache key for an FP8 GEMM plan (input FP8, output BF16/F16).
+#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+struct Fp8PlanKey {
+    m: usize,
+    k: usize,
+    n: usize,
+    output_dtype: DType, // BF16 or F16
+}
+
+/// A cached FP8 GEMM plan. Scale pointers are set per-call.
+struct Fp8GemmPlan {
+    matmul_desc: lt::cublasLtMatmulDesc_t,
+    layout_a: lt::cublasLtMatrixLayout_t,
+    layout_b: lt::cublasLtMatrixLayout_t,
+    layout_c: lt::cublasLtMatrixLayout_t,
+    algo: lt::cublasLtMatmulAlgo_t,
+}
+
+impl Drop for Fp8GemmPlan {
+    fn drop(&mut self) {
+        unsafe {
+            lt::cublasLtMatrixLayoutDestroy(self.layout_a);
+            lt::cublasLtMatrixLayoutDestroy(self.layout_b);
+            lt::cublasLtMatrixLayoutDestroy(self.layout_c);
+            lt::cublasLtMatmulDescDestroy(self.matmul_desc);
+        }
+    }
+}
+
 /// cuBLAS + cublasLt handles bound to a non-default stream with pre-allocated workspace.
 pub struct CublasHandle {
     handle: cublasHandle_t,
@@ -64,6 +93,8 @@ pub struct CublasHandle {
     workspace: *mut u8,
     /// Cached GEMM plans keyed by (M, K, N, dtype, has_bias).
     plans: HashMap<PlanKey, GemmPlan>,
+    /// Cached FP8 GEMM plans keyed by (M, K, N, output_dtype).
+    fp8_plans: HashMap<Fp8PlanKey, Fp8GemmPlan>,
 }
 
 // Safety: cuBLAS handle is thread-safe when each thread uses its own handle
@@ -107,6 +138,7 @@ impl CublasHandle {
             stream,
             workspace,
             plans: HashMap::new(),
+            fp8_plans: HashMap::new(),
         })
     }
 
@@ -494,6 +526,226 @@ impl CublasHandle {
         out
     }
 
+    // -----------------------------------------------------------------------
+    // FP8 GEMM: FP8 activations × FP8 weights → BF16 output with per-tensor scales
+    // -----------------------------------------------------------------------
+
+    /// Ensure a cached FP8 GEMM plan exists, creating it if needed.
+    ///
+    /// FP8 GEMM: A_fp8 [M,K] × B_fp8 [N,K]^T → C_bf16 [M,N]
+    /// with per-tensor scale pointers set per-call.
+    unsafe fn ensure_fp8_plan(&mut self, m: usize, k: usize, n: usize, output_dtype: DType) {
+        let key = Fp8PlanKey {
+            m,
+            k,
+            n,
+            output_dtype,
+        };
+        if self.fp8_plans.contains_key(&key) {
+            return;
+        }
+
+        let lt_compute = lt::cublasComputeType_t::CUBLAS_COMPUTE_32F;
+
+        // Create matmul descriptor with F32 compute and F32 scale type.
+        let mut matmul_desc: lt::cublasLtMatmulDesc_t = std::ptr::null_mut();
+        check_lt(lt::cublasLtMatmulDescCreate(
+            &mut matmul_desc,
+            lt_compute,
+            lt::cudaDataType_t::CUDA_R_32F, // scale type
+        ))
+        .expect("cublasLtMatmulDescCreate (FP8) failed");
+
+        // TRANSA = T (weight [N,K] → col-major), TRANSB = N (activation [M,K]).
+        let transa = cublasOperation_t::CUBLAS_OP_T as i32;
+        let transb = cublasOperation_t::CUBLAS_OP_N as i32;
+        check_lt(lt::cublasLtMatmulDescSetAttribute(
+            matmul_desc,
+            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+            &transa as *const _ as *const _,
+            std::mem::size_of::<i32>(),
+        ))
+        .expect("FP8: set TRANSA");
+        check_lt(lt::cublasLtMatmulDescSetAttribute(
+            matmul_desc,
+            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+            &transb as *const _ as *const _,
+            std::mem::size_of::<i32>(),
+        ))
+        .expect("FP8: set TRANSB");
+
+        let lt_fp8 = lt::cudaDataType_t::CUDA_R_8F_E4M3;
+        let lt_out = match output_dtype {
+            DType::BF16 => lt::cudaDataType_t::CUDA_R_16BF,
+            DType::F16 => lt::cudaDataType_t::CUDA_R_16F,
+            _ => panic!("FP8 GEMM output must be BF16 or F16, got {output_dtype}"),
+        };
+
+        // A (cuBLAS) = weight [N,K] FP8, transposed → rows=K, cols=N, ld=K
+        let mut layout_a: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        check_lt(lt::cublasLtMatrixLayoutCreate(
+            &mut layout_a,
+            lt_fp8,
+            k as u64,
+            n as u64,
+            k as i64,
+        ))
+        .expect("FP8: layout A");
+
+        // B (cuBLAS) = activation [M,K] FP8, not transposed → rows=K, cols=M, ld=K
+        let mut layout_b: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        check_lt(lt::cublasLtMatrixLayoutCreate(
+            &mut layout_b,
+            lt_fp8,
+            k as u64,
+            m as u64,
+            k as i64,
+        ))
+        .expect("FP8: layout B");
+
+        // C/D = output [M,N] in output_dtype → rows=N, cols=M, ld=N
+        let mut layout_c: lt::cublasLtMatrixLayout_t = std::ptr::null_mut();
+        check_lt(lt::cublasLtMatrixLayoutCreate(
+            &mut layout_c,
+            lt_out,
+            n as u64,
+            m as u64,
+            n as i64,
+        ))
+        .expect("FP8: layout C");
+
+        // Get heuristic.
+        let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
+        check_lt(lt::cublasLtMatmulPreferenceCreate(&mut pref)).expect("FP8: pref create");
+        let ws_size = CUBLAS_WORKSPACE_SIZE;
+        check_lt(lt::cublasLtMatmulPreferenceSetAttribute(
+            pref,
+            lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            &ws_size as *const _ as *const _,
+            std::mem::size_of::<usize>(),
+        ))
+        .expect("FP8: set pref workspace");
+
+        let mut heuristic = std::mem::zeroed::<lt::cublasLtMatmulHeuristicResult_t>();
+        let mut algo_count: i32 = 0;
+        check_lt(lt::cublasLtMatmulAlgoGetHeuristic(
+            self.lt_handle,
+            matmul_desc,
+            layout_a,
+            layout_b,
+            layout_c,
+            layout_c,
+            pref,
+            1,
+            &mut heuristic,
+            &mut algo_count,
+        ))
+        .expect("FP8: cublasLtMatmulAlgoGetHeuristic failed");
+        assert!(algo_count > 0, "FP8: no cublasLt algorithm found");
+
+        lt::cublasLtMatmulPreferenceDestroy(pref);
+
+        self.fp8_plans.insert(
+            key,
+            Fp8GemmPlan {
+                matmul_desc,
+                layout_a,
+                layout_b,
+                layout_c,
+                algo: heuristic.algo,
+            },
+        );
+    }
+
+    /// FP8 GEMM: out = A_fp8 @ B_fp8^T * (a_scale * b_scale)
+    ///
+    /// - `a`: `[M, K]` FP8 E4M3 (activations, dynamically quantized)
+    /// - `b`: `[N, K]` FP8 E4M3 (weights)
+    /// - `a_scale`: GPU pointer to f32 scalar (per-tensor activation scale)
+    /// - `b_scale`: GPU pointer to f32 scalar (per-tensor weight scale)
+    /// - `output_dtype`: BF16 or F16
+    /// - Returns: `[M, N]` in output_dtype
+    ///
+    /// Uses cublasLt with `CUBLASLT_MATMUL_DESC_A_SCALE_POINTER` and
+    /// `CUBLASLT_MATMUL_DESC_B_SCALE_POINTER` for fused FP8→output dequantization.
+    ///
+    /// # Safety
+    /// All pointers must be valid GPU memory. Scale pointers must point to valid f32 scalars.
+    pub unsafe fn gemm_fp8(
+        &mut self,
+        a: GpuTensor,
+        b: GpuTensor,
+        a_scale: *const f32,
+        b_scale: *const f32,
+        output_dtype: DType,
+        alloc: &mut CachingAllocator,
+    ) -> OwnedTensor {
+        debug_assert_eq!(a.ndim(), 2);
+        debug_assert_eq!(b.ndim(), 2);
+        debug_assert_eq!(a.dtype(), DType::Fp8E4m3);
+        debug_assert_eq!(b.dtype(), DType::Fp8E4m3);
+        debug_assert_eq!(a.dim(1), b.dim(1), "FP8 GEMM K mismatch");
+
+        let m = a.dim(0);
+        let k = a.dim(1);
+        let n = b.dim(0);
+
+        let out = alloc.alloc_tensor(&[m, n], output_dtype);
+
+        self.ensure_fp8_plan(m, k, n, output_dtype);
+        let key = Fp8PlanKey {
+            m,
+            k,
+            n,
+            output_dtype,
+        };
+        let plan = &self.fp8_plans[&key];
+
+        // Set per-call scale pointers on the matmul descriptor.
+        // These are GPU pointers to f32 scalars.
+        let a_scale_ptr = a_scale as *const std::ffi::c_void;
+        let b_scale_ptr = b_scale as *const std::ffi::c_void;
+        check_lt(lt::cublasLtMatmulDescSetAttribute(
+            plan.matmul_desc,
+            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+            &b_scale_ptr as *const _ as *const _, // cuBLAS A = our weight (b)
+            std::mem::size_of::<*const std::ffi::c_void>(),
+        ))
+        .expect("FP8: set A_SCALE_POINTER");
+        check_lt(lt::cublasLtMatmulDescSetAttribute(
+            plan.matmul_desc,
+            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+            &a_scale_ptr as *const _ as *const _, // cuBLAS B = our activation (a)
+            std::mem::size_of::<*const std::ffi::c_void>(),
+        ))
+        .expect("FP8: set B_SCALE_POINTER");
+
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+
+        check_lt(lt::cublasLtMatmul(
+            self.lt_handle,
+            plan.matmul_desc,
+            &alpha as *const f32 as *const _,
+            b.as_ptr::<u8>() as *const _, // cuBLAS A = weight
+            plan.layout_a,
+            a.as_ptr::<u8>() as *const _, // cuBLAS B = activation
+            plan.layout_b,
+            &beta as *const f32 as *const _,
+            out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
+            plan.layout_c,
+            out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
+            plan.layout_c,
+            &plan.algo,
+            self.workspace as *mut _,
+            CUBLAS_WORKSPACE_SIZE,
+            self.stream as _,
+        ))
+        .expect("FP8 cublasLtMatmul failed");
+
+        out
+    }
+
     /// Benchmark all cached GEMM plans: for each shape, try the top N
     /// algorithms from the heuristic and keep the fastest.
     ///
@@ -692,6 +944,7 @@ impl Drop for CublasHandle {
     fn drop(&mut self) {
         // Drop all cached plans first (they reference the lt_handle indirectly).
         self.plans.clear();
+        self.fp8_plans.clear();
         unsafe {
             let _ = lt::cublasLtDestroy(self.lt_handle);
             let _ = sys::cublasDestroy_v2(self.handle);
@@ -737,6 +990,8 @@ fn check_lt(status: lt::cublasStatus_t) -> Result<()> {
 
 /// Convert cuBLAS data type to cublasLt data type (same enum values, different Rust types).
 fn cublas_to_lt_dtype(dt: sys::cudaDataType_t) -> lt::cudaDataType_t {
+    // The enum values match between cuBLAS and cublasLt bindings but are
+    // separate Rust types in cudarc. Transmute is correct here.
     match dt {
         sys::cudaDataType_t::CUDA_R_16F => lt::cudaDataType_t::CUDA_R_16F,
         sys::cudaDataType_t::CUDA_R_16BF => lt::cudaDataType_t::CUDA_R_16BF,
@@ -1074,6 +1329,97 @@ mod tests {
             handle.ensure_plan(8, 896, 896, DType::BF16, true, true);
             assert_eq!(handle.plans.len(), 3);
 
+            driver::stream_destroy(stream).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_fp8_plan_caching() {
+        let stream = init_cuda();
+        unsafe {
+            let mut handle = CublasHandle::new(stream).unwrap();
+            assert_eq!(handle.fp8_plans.len(), 0);
+
+            // First call creates an FP8 plan.
+            handle.ensure_fp8_plan(8, 896, 896, DType::BF16);
+            assert_eq!(handle.fp8_plans.len(), 1);
+
+            // Second call with same shapes reuses it.
+            handle.ensure_fp8_plan(8, 896, 896, DType::BF16);
+            assert_eq!(handle.fp8_plans.len(), 1);
+
+            // Different shapes create a new plan.
+            handle.ensure_fp8_plan(8, 896, 4864, DType::BF16);
+            assert_eq!(handle.fp8_plans.len(), 2);
+
+            // Different output dtype creates a separate plan.
+            handle.ensure_fp8_plan(8, 896, 896, DType::F16);
+            assert_eq!(handle.fp8_plans.len(), 3);
+
+            driver::stream_destroy(stream).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_gemm_fp8_identity() {
+        // FP8 GEMM with identity-like matrices.
+        // This test verifies the FP8 GEMM path works end-to-end.
+        // A = FP8 [M, K], B = FP8 [N, K], output = BF16 [M, N]
+        let stream = init_cuda();
+        unsafe {
+            let mut handle = CublasHandle::new(stream).unwrap();
+            let mut alloc = crate::alloc::CachingAllocator::new();
+
+            // FP8 cublasLt requires 16-aligned dimensions on SM89.
+            let m = 16;
+            let k = 32;
+            let n = 16;
+
+            // Create FP8 E4M3 data (all 1.0 = 0x38 in FP8 E4M3)
+            let a_data = vec![0x38u8; m * k]; // all 1.0
+            let b_data = vec![0x38u8; n * k]; // all 1.0
+
+            // Upload to GPU
+            let a_ptr = driver::mem_alloc(m * k).unwrap();
+            let b_ptr = driver::mem_alloc(n * k).unwrap();
+            driver::memcpy_htod_async(a_ptr, a_data.as_ptr(), m * k, stream).unwrap();
+            driver::memcpy_htod_async(b_ptr, b_data.as_ptr(), n * k, stream).unwrap();
+
+            let a = GpuTensor::new(a_ptr, &[m, k], DType::Fp8E4m3);
+            let b = GpuTensor::new(b_ptr, &[n, k], DType::Fp8E4m3);
+
+            // Scales = 1.0 (identity scaling)
+            let scale_val = 1.0f32;
+            let scale_ptr = driver::mem_alloc(4).unwrap();
+            driver::memcpy_htod_async(scale_ptr, &scale_val as *const f32 as *const u8, 4, stream)
+                .unwrap();
+
+            let output = handle.gemm_fp8(
+                a,
+                b,
+                scale_ptr as *const f32,
+                scale_ptr as *const f32,
+                DType::BF16,
+                &mut alloc,
+            );
+
+            // Read output: each element should be K (=8) since dot(ones, ones) = K
+            let nbytes = m * n * DType::BF16.size_bytes();
+            let host = driver::mem_alloc_host(nbytes).unwrap();
+            driver::memcpy_dtoh_async(host, output.as_gpu_tensor().raw_ptr(), nbytes, stream)
+                .unwrap();
+            driver::stream_synchronize(stream).unwrap();
+
+            let result = std::slice::from_raw_parts(host as *const half::bf16, m * n);
+            for val in result {
+                let f = val.to_f32();
+                assert!((f - k as f32).abs() < 0.5, "expected ~{k}, got {f}");
+            }
+
+            driver::mem_free_host(host).unwrap();
+            driver::mem_free(a_ptr).unwrap();
+            driver::mem_free(b_ptr).unwrap();
+            driver::mem_free(scale_ptr as *mut u8).unwrap();
             driver::stream_destroy(stream).unwrap();
         }
     }

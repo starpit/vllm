@@ -575,6 +575,100 @@ impl CommandRForCausalLM {
         })
     }
 
+    /// Load an FP8 quantized Command R model.
+    pub fn load_fp8(
+        weights: &mut GpuWeights,
+        config: &CommandRConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let stream = device.compute_stream;
+
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let llama_config = crate::model::llama::LlamaConfig {
+            hidden_size: config.hidden_size,
+            num_attention_heads: config.num_attention_heads,
+            num_kv_heads: config.num_kv_heads,
+            num_hidden_layers: config.num_hidden_layers,
+            intermediate_size: config.intermediate_size,
+            vocab_size: config.vocab_size,
+            max_position_embeddings: config.max_position_embeddings,
+            rms_norm_eps: config.layer_norm_eps,
+            rope_theta: config.rope_theta,
+            head_dim: config.head_dim,
+            tie_word_embeddings: config.tie_word_embeddings,
+            llama3_rope_scaling: None,
+        };
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+
+            // FP8 attention — LlamaAttention already supports load_fp8.
+            let inner_attn = LlamaAttention::load_fp8(
+                weights,
+                &format!("{prefix}.self_attn"),
+                &llama_config,
+                i,
+                dtype,
+                stream,
+            )?;
+            let self_attn = CommandRAttention { inner: inner_attn };
+
+            // FP8 MLP — LlamaMLP already supports load_fp8.
+            let mlp = LlamaMLP::load_fp8(
+                weights,
+                &format!("{prefix}.mlp"),
+                config.intermediate_size,
+                dtype,
+                stream,
+            )?;
+
+            // CohereLayerNorm — always dense (not quantized).
+            let input_layernorm = CohereLayerNorm::load(
+                weights,
+                &format!("{prefix}.input_layernorm"),
+                config.layer_norm_eps,
+            )?;
+
+            layers.push(CommandRDecoderLayer {
+                self_attn,
+                mlp,
+                input_layernorm,
+            });
+        }
+
+        let norm = CohereLayerNorm::load(weights, "model.norm", config.layer_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        let lm_head = if config.tie_word_embeddings {
+            Linear::new(embed_tokens.weight, None)
+        } else {
+            Linear::load(weights, "lm_head")?
+        };
+
+        Ok(Self {
+            model: CommandRModel {
+                embed_tokens,
+                layers,
+                norm,
+                rotary,
+            },
+            lm_head,
+            logit_scale: config.logit_scale,
+        })
+    }
+
     /// Load a BitsAndBytes 4-bit (NF4/FP4) quantized Command R model.
     pub fn load_bnb4bit(
         weights: &mut GpuWeights,

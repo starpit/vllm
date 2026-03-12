@@ -38,6 +38,7 @@ fn safetensors_dtype(dtype: safetensors::Dtype) -> Result<DType> {
         safetensors::Dtype::U32 => Ok(DType::U32),
         safetensors::Dtype::I32 => Ok(DType::I32),
         safetensors::Dtype::U8 => Ok(DType::U8),
+        safetensors::Dtype::F8_E4M3 => Ok(DType::Fp8E4m3),
         other => bail!("unsupported safetensors dtype: {:?}", other),
     }
 }
@@ -1295,6 +1296,7 @@ pub fn load_marlin_linear(
         }
         QuantConfig::None => bail!("load_marlin_linear called with QuantConfig::None"),
         QuantConfig::Bnb4bit(_) => bail!("load_marlin_linear called with Bnb4bit config"),
+        QuantConfig::Fp8(_) => bail!("load_marlin_linear called with Fp8 config"),
     }
 }
 
@@ -1638,6 +1640,7 @@ pub fn load_fused_marlin_linear(
         }
         QuantConfig::None => bail!("load_fused_marlin_linear called with QuantConfig::None"),
         QuantConfig::Bnb4bit(_) => bail!("load_fused_marlin_linear called with Bnb4bit config"),
+        QuantConfig::Fp8(_) => bail!("load_fused_marlin_linear called with Fp8 config"),
     }
 }
 
@@ -2291,6 +2294,404 @@ pub fn load_fused_bnb4bit_linear(
         in_features,
         blocksize,
         bias: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// FP8 Weight Loading
+// ---------------------------------------------------------------------------
+
+/// Ensure a scale tensor is f32. If it's BF16/F16, download → convert → re-upload.
+/// Also flatten `[N, 1]` → `[N]`.
+///
+/// CUTLASS epilogue templates require `float*` scale pointers. Compressed-tensors
+/// models (e.g., RedHatAI, neuralmagic) store `weight_scale` as BF16 `[N, 1]`.
+fn ensure_f32_scale(scale: GpuTensor, stream: CUstream) -> Result<GpuTensor> {
+    // Flatten [N, 1] → [N]
+    let flat = if scale.ndim() == 2 && scale.dim(1) == 1 {
+        scale.reshape(&[scale.dim(0)])
+    } else {
+        scale
+    };
+
+    if flat.dtype() == DType::F32 {
+        return Ok(flat);
+    }
+
+    // Scale tensors are small (at most N elements, e.g., 4096).
+    // Download to CPU, convert BF16/F16 → f32, re-upload.
+    let numel = flat.numel();
+    let src_bytes = numel * flat.dtype().size_bytes();
+    let mut host_src = vec![0u8; src_bytes];
+    unsafe {
+        crate::driver::memcpy_dtoh_async(host_src.as_mut_ptr(), flat.raw_ptr(), src_bytes, stream)?;
+        crate::driver::stream_synchronize(stream)?;
+    }
+
+    let f32_data: Vec<f32> = match flat.dtype() {
+        DType::BF16 => {
+            let u16s =
+                unsafe { std::slice::from_raw_parts(host_src.as_ptr() as *const u16, numel) };
+            u16s.iter()
+                .map(|&bits| half::bf16::from_bits(bits).to_f32())
+                .collect()
+        }
+        DType::F16 => {
+            let u16s =
+                unsafe { std::slice::from_raw_parts(host_src.as_ptr() as *const u16, numel) };
+            u16s.iter()
+                .map(|&bits| half::f16::from_bits(bits).to_f32())
+                .collect()
+        }
+        dt => anyhow::bail!("ensure_f32_scale: unsupported dtype {dt}"),
+    };
+
+    let f32_bytes = numel * 4;
+    let f32_ptr = unsafe { crate::driver::mem_alloc(f32_bytes)? };
+    unsafe {
+        crate::driver::memcpy_htod_async(
+            f32_ptr,
+            f32_data.as_ptr() as *const u8,
+            f32_bytes,
+            stream,
+        )?;
+    }
+
+    let shape_usize: Vec<usize> = flat.shape().iter().map(|&d| d as usize).collect();
+    Ok(unsafe { GpuTensor::new(f32_ptr, &shape_usize, DType::F32) })
+}
+
+/// Load an FP8 linear layer from a serialized FP8 checkpoint.
+///
+/// Expects:
+/// - `{prefix}.weight`: FP8 E4M3 `[out_features, in_features]`
+/// - `{prefix}.weight_scale`: f32 or BF16 (per-tensor `[1]` or per-channel `[N, 1]`)
+/// - `{prefix}.input_scale` (optional): f32 scalar (static activation scale)
+/// - `{prefix}.bias` (optional): BF16/F16 `[out_features]`
+///
+/// Matches Python vLLM's `Fp8LinearMethod.create_weights()` +
+/// `process_weights_after_loading()` for serialized FP8 checkpoints.
+pub fn load_fp8_linear(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    output_dtype: DType,
+) -> Result<crate::layers::Fp8Linear> {
+    let weight_name = format!("{prefix}.weight");
+    let scale_name = format!("{prefix}.weight_scale");
+    let input_scale_name = format!("{prefix}.input_scale");
+    let bias_name = format!("{prefix}.bias");
+
+    let weight = weights.take(&weight_name)?;
+    anyhow::ensure!(weight.ndim() == 2, "FP8 weight must be 2D");
+
+    let stream = weights.stream();
+    let (fp8_weight, weight_scale) = if weight.dtype() == DType::Fp8E4m3 {
+        // Serialized FP8 checkpoint: weight is already FP8, scale is pre-computed.
+        let raw_scale = weights.take(&scale_name)?;
+        // Ensure scale is f32 (CUTLASS epilogue requires float* scales).
+        // compressed-tensors models store weight_scale as BF16 [N, 1].
+        let weight_scale = ensure_f32_scale(raw_scale, stream)?;
+        (weight, weight_scale)
+    } else if weight.dtype() == DType::BF16 || weight.dtype() == DType::F16 {
+        // Online FP8 quantization: BF16/F16 checkpoint → quantize to FP8 at load time.
+        // Matches Python's `Fp8OnlineLinearMethod`.
+        anyhow::ensure!(
+            weight.dtype() == DType::BF16,
+            "Online FP8 quant currently supports BF16 only, got {}",
+            weight.dtype()
+        );
+        let n = weight.dim(0);
+        let k = weight.dim(1);
+        let num_elements = n * k;
+
+        // Allocate FP8 output weight + scale on GPU.
+        let fp8_ptr = unsafe { crate::driver::mem_alloc(num_elements)? };
+        let scale_ptr = unsafe { crate::driver::mem_alloc(4)? };
+
+        // Run online weight quantization kernel (absmax → scale → quantize).
+        unsafe {
+            crate::kernels::fp8_quantize_weight_bf16_raw(
+                weight.as_ptr() as *const u16,
+                fp8_ptr as *mut u8,
+                scale_ptr as *mut f32,
+                num_elements as i32,
+                std::ptr::null_mut(), // null stream = synchronous
+            );
+        }
+
+        let fp8_weight = unsafe { GpuTensor::new(fp8_ptr, &[n, k], DType::Fp8E4m3) };
+        let weight_scale = unsafe { GpuTensor::new(scale_ptr, &[1], DType::F32) };
+
+        // Free the original BF16 weight — we no longer need it.
+        let _ = weight;
+
+        (fp8_weight, weight_scale)
+    } else {
+        anyhow::bail!(
+            "FP8 linear: expected Fp8E4m3 or BF16 weight, got {}",
+            weight.dtype()
+        );
+    };
+
+    let input_scale = if weights.contains(&input_scale_name) {
+        let raw = weights.take(&input_scale_name)?;
+        Some(ensure_f32_scale(raw, stream)?)
+    } else {
+        None
+    };
+
+    let bias = if weights.contains(&bias_name) {
+        Some(weights.take(&bias_name)?)
+    } else {
+        None
+    };
+
+    Ok(crate::layers::Fp8Linear {
+        weight: fp8_weight,
+        weight_scale,
+        input_scale,
+        bias,
+        output_dtype,
+    })
+}
+
+/// Load a fused FP8 linear layer by concatenating multiple FP8 projections.
+///
+/// For fused QKV (3 projections) or gate_up (2 projections), concatenates
+/// FP8 weights along dim=0 and merges per-shard weight scales by taking
+/// the max, then re-quantizes shards with smaller scales to use the unified
+/// max scale (matching Python's `requantize_with_max_scale`).
+///
+/// Also supports online quantization: if weights are BF16, quantizes each
+/// shard to FP8 on the fly (matching Python's `Fp8OnlineLinearMethod`).
+pub fn load_fused_fp8_linear(
+    weights: &mut GpuWeights,
+    prefixes: &[String],
+    output_dtype: DType,
+    stream: CUstream,
+) -> Result<crate::layers::Fp8Linear> {
+    anyhow::ensure!(!prefixes.is_empty(), "load_fused_fp8_linear: no prefixes");
+
+    // Get shapes from first prefix.
+    let first_weight_name = format!("{}.weight", prefixes[0]);
+    let (first_shape, first_dtype) = weights
+        .tensor_info(&first_weight_name)
+        .ok_or_else(|| anyhow::anyhow!("FP8: weight not found: {first_weight_name}"))?;
+    let is_online_quant = first_dtype == DType::BF16 || first_dtype == DType::F16;
+    anyhow::ensure!(
+        first_dtype == DType::Fp8E4m3 || is_online_quant,
+        "FP8 fused weight expected Fp8E4m3 or BF16, got {first_dtype}"
+    );
+    anyhow::ensure!(first_shape.len() == 2, "FP8 fused weight must be 2D");
+    let in_features = first_shape[1];
+
+    // Sum up output dimensions.
+    let mut total_out = 0usize;
+    let mut shard_sizes = Vec::with_capacity(prefixes.len());
+    for prefix in prefixes {
+        let wname = format!("{prefix}.weight");
+        let (shape, _) = weights
+            .tensor_info(&wname)
+            .ok_or_else(|| anyhow::anyhow!("FP8: weight not found: {wname}"))?;
+        shard_sizes.push(shape[0]);
+        total_out += shape[0];
+    }
+
+    let (fused_weight, merged_scale) = if is_online_quant {
+        // Online quantization: load BF16 shards → fuse → quantize entire fused weight to FP8.
+        // This produces a single per-tensor FP8 weight + scale (no re-quantization needed
+        // since we quantize the fused weight as a whole).
+        let bf16_elem_size = first_dtype.size_bytes();
+        let bf16_total_bytes = total_out * in_features * bf16_elem_size;
+        let bf16_ptr = unsafe { crate::driver::mem_alloc(bf16_total_bytes)? };
+
+        // Copy each BF16 shard into the fused buffer.
+        let mut offset = 0usize;
+        for (i, prefix) in prefixes.iter().enumerate() {
+            let wname = format!("{prefix}.weight");
+            let shard_bytes = shard_sizes[i] * in_features * bf16_elem_size;
+            unsafe {
+                weights.take_into(&wname, bf16_ptr.add(offset), stream)?;
+            }
+            offset += shard_bytes;
+        }
+
+        // Allocate FP8 output + scale.
+        let num_elements = total_out * in_features;
+        let fp8_ptr = unsafe { crate::driver::mem_alloc(num_elements)? };
+        let scale_ptr = unsafe { crate::driver::mem_alloc(4)? };
+
+        // Quantize the entire fused BF16 weight to FP8.
+        unsafe {
+            crate::kernels::fp8_quantize_weight_bf16_raw(
+                bf16_ptr as *const u16,
+                fp8_ptr as *mut u8,
+                scale_ptr as *mut f32,
+                num_elements as i32,
+                stream,
+            );
+            // Free the BF16 buffer.
+            crate::driver::mem_free(bf16_ptr)?;
+        }
+
+        let fused_weight =
+            unsafe { GpuTensor::new(fp8_ptr, &[total_out, in_features], DType::Fp8E4m3) };
+        let scale = unsafe { GpuTensor::new(scale_ptr, &[1], DType::F32) };
+
+        // Consume any weight_scale tensors that exist in the checkpoint
+        // (online quant models may or may not have them).
+        for prefix in prefixes {
+            let scale_name = format!("{prefix}.weight_scale");
+            if weights.contains(&scale_name) {
+                let _ = weights.take(&scale_name);
+            }
+        }
+
+        (fused_weight, scale)
+    } else {
+        // Serialized FP8 checkpoint: weights already FP8, merge per-shard scales.
+        let elem_size = DType::Fp8E4m3.size_bytes();
+        let total_bytes = total_out * in_features * elem_size;
+        let fused_ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+
+        // Copy each FP8 shard directly.
+        let mut offset = 0usize;
+        for (i, prefix) in prefixes.iter().enumerate() {
+            let wname = format!("{prefix}.weight");
+            let shard_bytes = shard_sizes[i] * in_features * elem_size;
+            unsafe {
+                weights.take_into(&wname, fused_ptr.add(offset), stream)?;
+            }
+            offset += shard_bytes;
+        }
+
+        let fused_weight =
+            unsafe { GpuTensor::new(fused_ptr, &[total_out, in_features], DType::Fp8E4m3) };
+
+        // Load per-shard scales and determine if they're per-tensor [1] or per-channel [N, 1].
+        let first_scale_name = format!("{}.weight_scale", prefixes[0]);
+        let (first_scale_shape, _first_scale_dtype) = weights
+            .tensor_info(&first_scale_name)
+            .ok_or_else(|| anyhow::anyhow!("FP8: weight_scale not found: {first_scale_name}"))?;
+        let is_per_channel = first_scale_shape.iter().product::<usize>() > 1;
+
+        let merged_scale = if is_per_channel {
+            // Per-channel scales: concatenate along dim=0 and convert to f32.
+            // Each shard has [N_shard, 1] scale → fused is [N_total] f32.
+            let total_scale_f32_bytes = total_out * 4;
+            let scale_ptr = unsafe { crate::driver::mem_alloc(total_scale_f32_bytes)? };
+            let mut f32_offset = 0usize;
+
+            for (i, prefix) in prefixes.iter().enumerate() {
+                let scale_name = format!("{prefix}.weight_scale");
+                let raw_scale = weights.take(&scale_name)?;
+                let shard_scale = ensure_f32_scale(raw_scale, stream)?;
+                let shard_bytes = shard_sizes[i] * 4;
+                unsafe {
+                    crate::driver::memcpy_dtod_async(
+                        scale_ptr.add(f32_offset),
+                        shard_scale.raw_ptr(),
+                        shard_bytes,
+                        stream,
+                    )?;
+                }
+                f32_offset += shard_bytes;
+            }
+
+            unsafe { GpuTensor::new(scale_ptr, &[total_out], DType::F32) }
+        } else {
+            // Per-tensor scales: take max of all per-shard scales, then re-quantize
+            // shards with smaller scales so all rows use the unified max scale.
+            // This matches Python's `requantize_with_max_scale()`.
+            let mut shard_scales = Vec::with_capacity(prefixes.len());
+            let mut max_scale = 0.0f32;
+            for prefix in prefixes {
+                let scale_name = format!("{prefix}.weight_scale");
+                let scale_cpu = weights.take_to_cpu_f32(&scale_name)?;
+                let s = scale_cpu.first().copied().unwrap_or(1.0);
+                if s > max_scale {
+                    max_scale = s;
+                }
+                shard_scales.push(s);
+            }
+
+            // Re-quantize shards whose scale differs from max_scale.
+            let mut row_offset = 0usize;
+            for (i, &shard_scale) in shard_scales.iter().enumerate() {
+                if (shard_scale - max_scale).abs() > 1e-12 {
+                    unsafe {
+                        crate::kernels::fp8_requantize_weight_rows(
+                            fused_weight,
+                            in_features,
+                            row_offset,
+                            shard_sizes[i],
+                            shard_scale,
+                            max_scale,
+                            stream,
+                        );
+                    }
+                }
+                row_offset += shard_sizes[i];
+            }
+
+            // Upload merged scale to GPU.
+            let scale_ptr = unsafe { crate::driver::mem_alloc(4)? };
+            unsafe {
+                crate::driver::memcpy_htod_async(
+                    scale_ptr,
+                    &max_scale as *const f32 as *const u8,
+                    4,
+                    stream,
+                )?;
+            }
+            unsafe { GpuTensor::new(scale_ptr, &[1], DType::F32) }
+        };
+
+        (fused_weight, merged_scale)
+    };
+
+    // Input scale: use first prefix's if available (they should all be the same).
+    let input_scale_name = format!("{}.input_scale", prefixes[0]);
+    let input_scale = if weights.contains(&input_scale_name) {
+        let raw = weights.take(&input_scale_name)?;
+        Some(ensure_f32_scale(raw, stream)?)
+    } else {
+        None
+    };
+
+    // Fuse bias if present.
+    let bias_name = format!("{}.bias", prefixes[0]);
+    let bias = if weights.contains(&bias_name) {
+        let (_bias_shape, bias_dtype) = weights
+            .tensor_info(&bias_name)
+            .ok_or_else(|| anyhow::anyhow!("FP8: bias not found"))?;
+        let bias_elem_size = bias_dtype.size_bytes();
+        let mut total_bias_bytes = 0;
+        for &sz in &shard_sizes[..prefixes.len()] {
+            total_bias_bytes += sz * bias_elem_size;
+        }
+        let bias_ptr = unsafe { crate::driver::mem_alloc(total_bias_bytes)? };
+        let mut boff = 0;
+        for (i, prefix) in prefixes.iter().enumerate() {
+            let bname = format!("{prefix}.bias");
+            let bbytes = shard_sizes[i] * bias_elem_size;
+            unsafe {
+                weights.take_into(&bname, bias_ptr.add(boff), stream)?;
+            }
+            boff += bbytes;
+        }
+        let total_bias_elems = total_bias_bytes / bias_elem_size;
+        Some(unsafe { GpuTensor::new(bias_ptr, &[total_bias_elems], bias_dtype) })
+    } else {
+        None
+    };
+
+    Ok(crate::layers::Fp8Linear {
+        weight: fused_weight,
+        weight_scale: merged_scale,
+        input_scale,
+        bias,
+        output_dtype,
     })
 }
 

@@ -5,8 +5,8 @@
 | Symbol | Meaning | Count |
 |--------|---------|------:|
 | ✅ 🟦 | Implemented | 160 |
-| ⚠️ 🟨 | Partial | 3 |
-| ❌ 🟥 | Not implemented | 118 |
+| ⚠️ 🟨 | Partial | 8 |
+| ❌ 🟥 | Not implemented | 102 |
 | 🚫 | Won't fix | 4 |
 
 ---
@@ -22,12 +22,12 @@
 | [CLI Commands](#cli-commands) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 10 | 0 | 0 |
 | [OpenAI-Compatible API Endpoints](#openai-compatible-api-endpoints) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥 | 10 | 0 | 3 |
 | [Other API Protocols](#other-api-protocols) | 🟦🟦🟥🟥🟥🟥🟥 | 2 | 0 | 5 |
-| [Model Architectures — Decoder-Only LLMs](#model-architectures--decoder-only-llms) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 13 | 2 | 20 |
+| [Model Architectures — Decoder-Only LLMs](#model-architectures--decoder-only-llms) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 13 | 2 | 9 |
 | [Model Architectures — Encoder / Embedding](#model-architectures--encoder--embedding) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
 | [Model Architectures — Vision-Language / Multimodal](#model-architectures--vision-language--multimodal) | 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 0 | 0 | 11 |
 | [Model Architectures — Audio / Speech](#model-architectures--audio--speech) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
 | [Model Architectures — Speculative Decoding Draft Models](#model-architectures--speculative-decoding-draft-models) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
-| [Quantization Methods](#quantization-methods) | 🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥 | 6 | 0 | 7 |
+| [Quantization Methods](#quantization-methods) | 🟦🟦🟦🟦🟦🟦🟨🟨🟨🟥🟥🟥🟥 | 6 | 3 | 4 |
 | [Attention Backends](#attention-backends) | 🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 3 | 0 | 9 |
 | [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 22 | 0 | 0 |
 | [Structured Output / Guided Decoding](#structured-output--guided-decoding) | 🟦🟦🟦🟦🟦🟦🟦 | 7 | 0 | 0 |
@@ -39,11 +39,11 @@
 | [Multimodal Input](#multimodal-input) | 🟥🟥🟥🟥🟥 | 0 | 0 | 5 |
 | [Embeddings & Pooling](#embeddings--pooling) | 🟦🟦🟦🟦🟥🟥🟥 | 4 | 0 | 3 |
 | [Serving Features](#serving-features) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥 | 10 | 0 | 3 |
-| [Performance Optimizations](#performance-optimizations) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 9 | 0 | 4 |
-| [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥🟥 | 22 | 0 | 4 |
+| [Performance Optimizations](#performance-optimizations) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥 | 9 | 1 | 3 |
+| [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥 | 22 | 1 | 3 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟦 | 7 | 0 | 0 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟦 | 8 | 0 | 0 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **160** | **3** | **118** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **160** | **8** | **102** |
 
 ---
 
@@ -156,25 +156,14 @@
 | Kimi K2.5 | ✅ | ✅ | ✅ | DeepSeek V2 backbone |
 | Qwen3-Next (hybrid GDN + MoE) | ✅ | ⚠️ | ✅ | Gaps: chunked prefill (uses fused_recurrent not chunk_gated_delta_rule); GDN TP; spec decode token splitting; has_initial_state flag; conv1d bias; L2 norm in recurrence; MTP |
 | GPT-NeoX | ✅ | ❌ | ❌ |  |
-| GPT-J | ✅ | ❌ | ❌ |  |
 | GPT-BigCode / StarCoder2 | ✅ | ❌ | ❌ |  |
 | Falcon / Falcon-H1 | ✅ | ❌ | ❌ |  |
-| BLOOM | ✅ | ❌ | ❌ |  |
-| OPT | ✅ | ❌ | ❌ |  |
 | OLMo / OLMo2 / OLMoE | ✅ | ❌ | ❌ |  |
-| Nemotron / Nemotron-H | ✅ | ❌ | ❌ |  |
-| Exaone / Exaone4 | ✅ | ❌ | ❌ |  |
-| StableLM | ✅ | ❌ | ❌ |  |
-| Baichuan | ✅ | ❌ | ❌ |  |
-| ChatGLM / GLM-4 | ✅ | ❌ | ❌ |  |
-| DBRX (MoE) | ✅ | ❌ | ❌ |  |
-| Arctic (MoE) | ✅ | ❌ | ❌ |  |
 | Mamba / Bamba / Jamba | ✅ | ❌ | ❌ | SSM-based |
-| Zamba 2 | ✅ | ❌ | ❌ |  |
-| PLaMo 2 / PLaMo 3 | ✅ | ❌ | ❌ |  |
-| ERNIE 4.5 (dense + MoE + MTP) | ✅ | ❌ | ❌ |  |
-| SolarPro | ✅ | ❌ | ❌ |  |
-| 100+ additional architectures | ✅ | ❌ | ❌ | Long tail of niche models |
+| ChatGLM / GLM-4 | ✅ | ❌ | ❌ |  |
+| Nemotron / Nemotron-H | ✅ | ❌ | ❌ |  |
+| DBRX (MoE) | ✅ | ❌ | ❌ |  |
+| 100+ additional architectures | ✅ | ❌ | ❌ | Includes BLOOM, OPT, StableLM, Baichuan, Exaone/Exaone4, Arctic (MoE), Zamba 2, PLaMo 2/3, ERNIE 4.5, SolarPro, GPT-J, and many more |
 
 ---
 
@@ -237,11 +226,11 @@
 | GPTQ | ✅ | ✅ | Marlin W4A16 on SM80+; symmetric + desc_act (activation ordering); fused QKV/gate_up at load; post-GEMM bias_add_inplace for linear bias; CUDA graphs work; archs: LLaMA/Qwen2/Gemma2/Granite; note: asymmetric zero-points not passed (uint4b8 bakes in zp like Python vLLM) |
 | AWQ | ✅ | ✅ | Marlin W4A16 on SM80+; fused QKV/gate_up at load; CUDA graphs work; archs: LLaMA/Qwen2/Gemma2/Granite; E2E verified Qwen2.5-0.5B |
 | BitsAndBytes NF4 (4-bit) | ✅ | ✅ | Dequant-then-cuBLAS GEMM; double quantization supported; per-shard matmuls for QKV and gate/up; archs: LLaMA/Qwen2/Gemma2 (+ aliases Mistral/Qwen3/Phi-3/Granite); E2E verified unsloth/Qwen3-0.6B-bnb-4bit |
-| Quantized MoE (FP8/INT8/INT4 experts) | ✅ | ❌ | CudaWorker MoE kernel is BF16/F16 only; Python supports FP8 W8A8 + INT8 W8A8 + INT4 W4A16 |
+| Quantized MoE (FP8/INT8/INT4 experts) | ✅ | ⚠️ | FP8 MoE: dequant-to-BF16 at load time (correctness path). TODO: native FP8 fused MoE GEMM (per-expert FP8 GEMM with per-expert scales); block-quantized FP8 MoE (DeepSeek-V3 per-block scales per expert); INT8/INT4 quantized MoE experts; fused MoE scale merging at runtime (currently max-merge at load) |
 | MLX 4-bit quantized | N/A | ✅ | Rust-only; mlx-community models |
-| FP8 (W8A8 / W8A16) | ✅ | ❌ |  |
+| FP8 (W8A8 / W8A16) | ✅ | ⚠️ | SM89 W8A8 per-tensor + per-channel via fused CUTLASS cutlass_scaled_mm (c2x EVT epilogue with per-row scale_a / per-tensor scale_b); dynamic activation quantization (scaled_fp8_quant kernel); static activation quantization (pre-calibrated input_scale); compressed-tensors float8 config detection; E2E verified: Qwen2.5-0.5B-FP8 + LLaMA-3.1-8B-FP8. TODO: SM90+ Hopper CUTLASS 3.x c3x kernels (CollectiveMainloop/CollectiveEpilogue — completely different API from c2x); SM100/SM120 Blackwell kernels (scaled_mm_c3x_sm100); block-quantized FP8 GEMM (DeepSeek-V3 weight_block_size — currently dequant-to-BF16 fallback); FP8 + CUDA graphs (needs pre-allocated FP8 activation/scale buffers during graph capture); FP8 W8A16 weight-only (no activation quantization); online FP8 weight quantization (BF16→FP8 at load time for non-serialized checkpoints); Marlin FP8 fallback for SM<89; FP8 E5M2 dtype (only E4M3 implemented); bias epilogue fusion (ScaledEpilogueBias variants); AZP asymmetric zero-point epilogue (ScaledEpilogueAZP for INT8) |
 | Marlin kernels (AWQ/GPTQ) | ✅ | ✅ | W4A16 only; auto-converts at load on SM80+; use_fp32_reduce matches Python default |
-| Compressed-tensors (Neural Magic) | ✅ | ❌ |  |
+| Compressed-tensors (Neural Magic) | ✅ | ⚠️ | FP8 float8 subset only: config detection (config_groups parsing) + weight/scale loading for RedHatAI/neuralmagic models with per-channel BF16→f32 scale conversion. TODO: INT8 W8A8 quantized weights; INT4/W4A16 quantized weights; mixed-precision compressed-tensors (different groups with different quant configs); sparse compressed-tensors (2:4 sparsity); activation quantization strategies beyond dynamic/static; group quantization (per-group scales); compressed-tensors with actorder |
 | TorchAO (int4/int8/fp8) | ✅ | ❌ |  |
 | MXFP4 (microscaling) | ✅ | ❌ |  |
 | ModelOpt (NVIDIA FP4/FP8) | ✅ | ❌ |  |
@@ -461,7 +450,7 @@
 | Weight dtype casting at load | ✅ | ✅ | GpuWeights casts F32→BF16/F16 via pinned host memory (matches Python torch_dtype auto-cast) |
 | Triton kernels | ✅ | ❌ | Rust has no Triton equivalent |
 | Torch.compile / inductor | ✅ | ❌ |  |
-| Weight-only INT8/FP8 GEMM | ✅ | ❌ |  |
+| Weight-only INT8/FP8 GEMM | ✅ | ⚠️ | FP8 W8A8 via fused CUTLASS cutlass_scaled_mm on SM89. TODO: INT8 W8A8 via CUTLASS (same scaled_mm infrastructure with INT8 data types); FP8 W8A16 weight-only quantization; INT8 W8A16 weight-only; SM90+ c3x kernels for both FP8 and INT8; Marlin FP8/INT8 for SM<89 |
 | Fused cross-entropy loss | ✅ | ❌ |  |
 | NVTX profiling annotations | ✅ | ✅ | Rust: `--features profiling` |
 
@@ -501,7 +490,7 @@
 | Fused recurrent GDN kernel | ❌ | ✅ | Qwen3-Next gated delta rule (fused_recurrent_gated_delta_rule) |
 | QKVZ grouped-head split | ❌ | ✅ | Eliminates 8 CPU round-trips per GDN layer |
 | Conv output split | ❌ | ✅ | Eliminates 3 CPU round-trips per GDN layer |
-| FP8 GEMM | ✅ | ❌ |  |
+| FP8 GEMM | ✅ | ⚠️ | SM89 fused CUTLASS 2.x cutlass_scaled_mm with Epilogue Visitor Tree (ScaledEpilogue: VisitorColOrScalarBroadcast for per-row/per-tensor scale_a + VisitorRowOrScalarBroadcast for per-tensor scale_b); 18 tile configs (M16/M32/M64/M128/M256/default × N-range sub-dispatch) matching Python exactly; cublasLt FP8 GEMM fallback; dynamic per-token scaled_fp8_quant kernel. TODO: SM90+ Hopper CUTLASS 3.x c3x kernels (scaled_mm_c3x.cu — CollectiveMainloop/CollectiveEpilogue with TMA; completely different codegen from c2x); SM100/SM120 Blackwell kernels (scaled_mm_c3x_sm100.cu); block-scaled FP8 GEMM kernel (cutlass_block_fp8 / deep_gemm for DeepSeek-V3 weight_block_size); ScaledEpilogueBias variants (bias fused into CUTLASS epilogue); ScaledEpilogueAZP variants (asymmetric zero-point for INT8); INT8 data type support in cutlass_scaled_mm; FP8 E5M2 data type |
 | Prefix caching hash kernel | ✅ | ❌ |  |
 | Custom all-reduce | ✅ | ❌ |  |
 

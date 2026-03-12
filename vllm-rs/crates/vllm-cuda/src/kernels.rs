@@ -2149,6 +2149,494 @@ pub unsafe fn compute_kv_scale(
 }
 
 // ---------------------------------------------------------------------------
+// FP8 Quantization Kernels
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn scaled_fp8_quant_dynamic_bf16(
+        input: *const u16,
+        output: *mut u8,
+        scales: *mut f32,
+        num_tokens: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    );
+    fn scaled_fp8_quant_dynamic_f16(
+        input: *const u16,
+        output: *mut u8,
+        scales: *mut f32,
+        num_tokens: i32,
+        hidden_dim: i32,
+        stream: CUstream,
+    );
+    fn scaled_fp8_quant_static_bf16(
+        input: *const u16,
+        output: *mut u8,
+        scale: *const f32,
+        num_elements: i32,
+        stream: CUstream,
+    );
+    fn scaled_fp8_quant_static_f16(
+        input: *const u16,
+        output: *mut u8,
+        scale: *const f32,
+        num_elements: i32,
+        stream: CUstream,
+    );
+    fn fp8_quantize_weight_bf16(
+        weight: *const u16,
+        output: *mut u8,
+        scale_out: *mut f32,
+        num_elements: i32,
+        stream: CUstream,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// FP8 Post-GEMM Scale + Re-quantization Kernels
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn fp8_row_scale_multiply_bf16(
+        output: *mut u16,
+        scales: *const f32,
+        m: i32,
+        n: i32,
+        stream: CUstream,
+    );
+    fn fp8_row_scale_multiply_f16(
+        output: *mut u16,
+        scales: *const f32,
+        m: i32,
+        n: i32,
+        stream: CUstream,
+    );
+    fn fp8_requantize_rows(
+        weight: *mut u8,
+        k: i32,
+        start_row: i32,
+        num_rows: i32,
+        scale_ratio: f32,
+        stream: CUstream,
+    );
+}
+
+/// Apply per-row activation scales to GEMM output (in-place).
+///
+/// `output[i, :] *= scales[i]`
+///
+/// Used after cublasLt FP8 GEMM with scalar scale to apply per-token
+/// activation scales. Matches the behavior of CUTLASS cutlass_scaled_mm
+/// which fuses per-row scale_a into the GEMM kernel.
+pub unsafe fn fp8_post_scale_multiply(output: GpuTensor, scales: GpuTensor, stream: CUstream) {
+    debug_assert_eq!(output.ndim(), 2);
+    debug_assert_eq!(scales.ndim(), 1);
+    debug_assert_eq!(output.dim(0), scales.dim(0));
+
+    let m = output.dim(0);
+    let n = output.dim(1);
+
+    match output.dtype() {
+        DType::BF16 => fp8_row_scale_multiply_bf16(
+            output.as_mut_ptr(),
+            scales.as_ptr() as *const f32,
+            m as i32,
+            n as i32,
+            stream,
+        ),
+        DType::F16 => fp8_row_scale_multiply_f16(
+            output.as_mut_ptr(),
+            scales.as_ptr() as *const f32,
+            m as i32,
+            n as i32,
+            stream,
+        ),
+        other => panic!("fp8_post_scale_multiply: unsupported dtype {other}"),
+    }
+}
+
+/// Re-quantize FP8 weight rows in-place with a new unified scale.
+///
+/// For fused module scale merging: each shard was quantized with its own
+/// per-tensor scale. After concatenation, all shards must use the max scale.
+/// This re-quantizes rows that had a smaller original scale:
+///   new_fp8[i] = quantize_fp8(old_fp8[i] * old_scale / new_scale)
+///
+/// Matches Python's `requantize_with_max_scale()`.
+pub unsafe fn fp8_requantize_weight_rows(
+    weight: GpuTensor,
+    k: usize,
+    start_row: usize,
+    num_rows: usize,
+    old_scale: f32,
+    new_scale: f32,
+    stream: CUstream,
+) {
+    debug_assert_eq!(weight.dtype(), DType::Fp8E4m3);
+    if num_rows == 0 || (old_scale - new_scale).abs() < 1e-12 {
+        return; // Same scale, no re-quantization needed
+    }
+    let scale_ratio = old_scale / new_scale;
+    fp8_requantize_rows(
+        weight.as_mut_ptr(),
+        k as i32,
+        start_row as i32,
+        num_rows as i32,
+        scale_ratio,
+        stream,
+    );
+}
+
+/// Dynamic per-token FP8 quantization: BF16/F16 → FP8 E4M3 + per-token scales.
+///
+/// * `input`: `[num_tokens, hidden_dim]` BF16 or F16 on GPU
+/// * Returns: `(output_fp8, scales)` — FP8 `[num_tokens, hidden_dim]` + f32 `[num_tokens]`
+///
+/// Each token row gets its own scale derived from absmax / 448.0 (FP8_E4M3_MAX).
+/// Matches Python vLLM's `ops.scaled_fp8_quant(input, scale=None)`.
+pub unsafe fn scaled_fp8_quant_dynamic(
+    input: GpuTensor,
+    alloc: &mut crate::alloc::CachingAllocator,
+    stream: CUstream,
+) -> (crate::alloc::OwnedTensor, crate::alloc::OwnedTensor) {
+    debug_assert_eq!(input.ndim(), 2);
+    let num_tokens = input.dim(0);
+    let hidden_dim = input.dim(1);
+
+    let output = alloc.alloc_tensor(&[num_tokens, hidden_dim], DType::Fp8E4m3);
+    let scales = alloc.alloc_tensor(&[num_tokens], DType::F32);
+
+    match input.dtype() {
+        DType::BF16 => scaled_fp8_quant_dynamic_bf16(
+            input.as_ptr(),
+            output.as_gpu_tensor().as_mut_ptr(),
+            scales.as_gpu_tensor().as_mut_ptr() as *mut f32,
+            num_tokens as i32,
+            hidden_dim as i32,
+            stream,
+        ),
+        DType::F16 => scaled_fp8_quant_dynamic_f16(
+            input.as_ptr(),
+            output.as_gpu_tensor().as_mut_ptr(),
+            scales.as_gpu_tensor().as_mut_ptr() as *mut f32,
+            num_tokens as i32,
+            hidden_dim as i32,
+            stream,
+        ),
+        dt => panic!("scaled_fp8_quant_dynamic: unsupported input dtype {dt}"),
+    }
+
+    (output, scales)
+}
+
+/// Static FP8 quantization: BF16/F16 → FP8 E4M3 with pre-calibrated scale.
+///
+/// * `input`: `[num_tokens, hidden_dim]` BF16 or F16 on GPU
+/// * `scale`: GPU f32 scalar pointer (pre-calibrated input_scale)
+/// * Returns: FP8 `[num_tokens, hidden_dim]`
+///
+/// Matches Python vLLM's `ops.scaled_fp8_quant(input, scale=input_scale)`.
+pub unsafe fn scaled_fp8_quant_static(
+    input: GpuTensor,
+    scale: *const f32,
+    alloc: &mut crate::alloc::CachingAllocator,
+    stream: CUstream,
+) -> crate::alloc::OwnedTensor {
+    debug_assert_eq!(input.ndim(), 2);
+    let num_elements = input.dim(0) * input.dim(1);
+
+    let output = alloc.alloc_tensor(&[input.dim(0), input.dim(1)], DType::Fp8E4m3);
+
+    match input.dtype() {
+        DType::BF16 => scaled_fp8_quant_static_bf16(
+            input.as_ptr(),
+            output.as_gpu_tensor().as_mut_ptr(),
+            scale,
+            num_elements as i32,
+            stream,
+        ),
+        DType::F16 => scaled_fp8_quant_static_f16(
+            input.as_ptr(),
+            output.as_gpu_tensor().as_mut_ptr(),
+            scale,
+            num_elements as i32,
+            stream,
+        ),
+        dt => panic!("scaled_fp8_quant_static: unsupported input dtype {dt}"),
+    }
+
+    output
+}
+
+/// Online weight FP8 quantization: BF16 weight → FP8 E4M3 + per-tensor scale.
+///
+/// * `weight`: `[N, K]` BF16 on GPU
+/// * `scale_out`: GPU f32 scalar (will hold computed scale = absmax / 448.0)
+/// * Returns: FP8 `[N, K]`
+///
+/// Used for online FP8 quantization when checkpoint is BF16 but model
+/// wants FP8 weight format.
+pub unsafe fn fp8_quantize_weight(
+    weight: GpuTensor,
+    scale_out: *mut f32,
+    alloc: &mut crate::alloc::CachingAllocator,
+    stream: CUstream,
+) -> crate::alloc::OwnedTensor {
+    debug_assert_eq!(weight.ndim(), 2);
+    debug_assert_eq!(
+        weight.dtype(),
+        DType::BF16,
+        "online FP8 weight quant requires BF16 input"
+    );
+    let num_elements = weight.dim(0) * weight.dim(1);
+
+    let output = alloc.alloc_tensor(&[weight.dim(0), weight.dim(1)], DType::Fp8E4m3);
+
+    fp8_quantize_weight_bf16(
+        weight.as_ptr(),
+        output.as_gpu_tensor().as_mut_ptr(),
+        scale_out,
+        num_elements as i32,
+        stream,
+    );
+
+    output
+}
+
+/// Raw FFI wrapper for `fp8_quantize_weight_bf16` — used during weight loading
+/// when we don't have a `CachingAllocator` (pre-allocated buffers passed in).
+pub unsafe fn fp8_quantize_weight_bf16_raw(
+    weight: *const u16,
+    output: *mut u8,
+    scale_out: *mut f32,
+    num_elements: i32,
+    stream: CUstream,
+) {
+    fp8_quantize_weight_bf16(weight, output, scale_out, num_elements, stream);
+}
+
+// ---------------------------------------------------------------------------
+// FP8 Block Dequantization Kernels
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn fp8_block_dequant_bf16(
+        weight: *const u8,
+        scale_inv: *const f32,
+        output: *mut u16,
+        n: i32,
+        k: i32,
+        block_n: i32,
+        block_k: i32,
+        stream: CUstream,
+    );
+    fn fp8_block_dequant_f16(
+        weight: *const u8,
+        scale_inv: *const f32,
+        output: *mut u16,
+        n: i32,
+        k: i32,
+        block_n: i32,
+        block_k: i32,
+        stream: CUstream,
+    );
+}
+
+/// Dequantize FP8 block-quantized weight to BF16/F16.
+///
+/// * `weight`: `[N, K]` FP8 E4M3
+/// * `scale_inv`: `[ceil(N/block_n), ceil(K/block_k)]` f32
+/// * `block_size`: `[block_n, block_k]`
+/// * Returns: `[N, K]` in `output_dtype`
+pub unsafe fn fp8_block_dequant(
+    weight: GpuTensor,
+    scale_inv: GpuTensor,
+    block_size: [usize; 2],
+    output_dtype: DType,
+    alloc: &mut crate::alloc::CachingAllocator,
+    stream: CUstream,
+) -> crate::alloc::OwnedTensor {
+    debug_assert_eq!(weight.ndim(), 2);
+    debug_assert_eq!(weight.dtype(), DType::Fp8E4m3);
+    let n = weight.dim(0);
+    let k = weight.dim(1);
+
+    let out = alloc.alloc_tensor(&[n, k], output_dtype);
+
+    match output_dtype {
+        DType::BF16 => fp8_block_dequant_bf16(
+            weight.as_ptr(),
+            scale_inv.as_ptr(),
+            out.as_gpu_tensor().as_mut_ptr(),
+            n as i32,
+            k as i32,
+            block_size[0] as i32,
+            block_size[1] as i32,
+            stream,
+        ),
+        DType::F16 => fp8_block_dequant_f16(
+            weight.as_ptr(),
+            scale_inv.as_ptr(),
+            out.as_gpu_tensor().as_mut_ptr(),
+            n as i32,
+            k as i32,
+            block_size[0] as i32,
+            block_size[1] as i32,
+            stream,
+        ),
+        dt => panic!("fp8_block_dequant: output must be BF16 or F16, got {dt}"),
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// CUTLASS Scaled Matmul (Fused FP8 GEMM with per-row scale epilogue)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    /// CUTLASS 2.x FP8 scaled matmul on SM89 (Ada Lovelace).
+    /// Fuses per-row activation scale and per-tensor weight scale into the GEMM
+    /// epilogue — single kernel launch, matching Python vLLM's cutlass_scaled_mm.
+    fn cutlass_scaled_mm_sm89(
+        c: *mut u8,           // [M, N] output (BF16 or F16)
+        a: *const u8,         // [M, K] FP8 E4M3 row-major
+        b: *const u8,         // [N, K] FP8 E4M3 row-major (= [K,N] col-major)
+        a_scales: *const f32, // [M] per-token or [1] per-tensor
+        a_scales_numel: i32,  // M or 1
+        b_scales: *const f32, // [N] per-channel or [1] per-tensor
+        b_scales_numel: i32,  // N or 1
+        m: i32,
+        n: i32,
+        k: i32,
+        out_dtype: i32, // 0 = BF16, 1 = F16
+        stream: CUstream,
+    );
+
+    /// CUTLASS 2.x FP8 scaled matmul on SM89 with bias.
+    fn cutlass_scaled_mm_bias_sm89(
+        c: *mut u8,
+        a: *const u8,
+        b: *const u8,
+        a_scales: *const f32,
+        a_scales_numel: i32,
+        b_scales: *const f32,
+        b_scales_numel: i32,
+        bias: *const u8, // [N] same dtype as output
+        m: i32,
+        n: i32,
+        k: i32,
+        out_dtype: i32,
+        stream: CUstream,
+    );
+}
+
+/// Fused CUTLASS FP8 GEMM with per-row activation scales.
+///
+/// `output[M, N] = diag(a_scales) @ (A_fp8 @ B_fp8^T) * b_scale`
+///
+/// Single kernel launch — fuses the scale multiply into the GEMM epilogue.
+/// This matches Python vLLM's `cutlass_scaled_mm` exactly.
+///
+/// * `a`: `[M, K]` FP8 E4M3 activations (row-major)
+/// * `b`: `[N, K]` FP8 E4M3 weights (row-major, treated as col-major [K,N])
+/// * `a_scales`: `[M]` f32 per-token scales, or `[1]` for per-tensor
+/// * `b_scales`: `[1]` f32 per-tensor weight scale (or `[N]` per-channel)
+/// * `output_dtype`: BF16 or F16
+///
+/// Returns: `[M, N]` tensor in `output_dtype`
+pub unsafe fn cutlass_scaled_mm(
+    a: GpuTensor,
+    b: GpuTensor,
+    a_scales: GpuTensor,
+    b_scales: GpuTensor,
+    output_dtype: DType,
+    alloc: &mut crate::alloc::CachingAllocator,
+    stream: CUstream,
+) -> crate::alloc::OwnedTensor {
+    debug_assert_eq!(a.ndim(), 2);
+    debug_assert_eq!(b.ndim(), 2);
+    debug_assert_eq!(a.dtype(), DType::Fp8E4m3);
+    debug_assert_eq!(b.dtype(), DType::Fp8E4m3);
+    debug_assert_eq!(a.dim(1), b.dim(1), "A [M,K] and B [N,K] must share K dim");
+
+    let m = a.dim(0);
+    let k = a.dim(1);
+    let n = b.dim(0);
+
+    let output = alloc.alloc_tensor(&[m, n], output_dtype);
+    let out_dtype_code = match output_dtype {
+        DType::BF16 => 0,
+        DType::F16 => 1,
+        dt => panic!("cutlass_scaled_mm: output must be BF16 or F16, got {dt}"),
+    };
+
+    cutlass_scaled_mm_sm89(
+        output.as_gpu_tensor().as_mut_ptr(),
+        a.as_ptr(),
+        b.as_ptr(),
+        a_scales.as_ptr() as *const f32,
+        a_scales.numel() as i32,
+        b_scales.as_ptr() as *const f32,
+        b_scales.numel() as i32,
+        m as i32,
+        n as i32,
+        k as i32,
+        out_dtype_code,
+        stream,
+    );
+
+    output
+}
+
+/// Fused CUTLASS FP8 GEMM with per-row scales and bias.
+pub unsafe fn cutlass_scaled_mm_with_bias(
+    a: GpuTensor,
+    b: GpuTensor,
+    a_scales: GpuTensor,
+    b_scales: GpuTensor,
+    bias: GpuTensor,
+    output_dtype: DType,
+    alloc: &mut crate::alloc::CachingAllocator,
+    stream: CUstream,
+) -> crate::alloc::OwnedTensor {
+    debug_assert_eq!(a.ndim(), 2);
+    debug_assert_eq!(b.ndim(), 2);
+    debug_assert_eq!(a.dtype(), DType::Fp8E4m3);
+    debug_assert_eq!(b.dtype(), DType::Fp8E4m3);
+    debug_assert_eq!(a.dim(1), b.dim(1));
+
+    let m = a.dim(0);
+    let k = a.dim(1);
+    let n = b.dim(0);
+
+    let output = alloc.alloc_tensor(&[m, n], output_dtype);
+    let out_dtype_code = match output_dtype {
+        DType::BF16 => 0,
+        DType::F16 => 1,
+        dt => panic!("cutlass_scaled_mm_with_bias: output must be BF16 or F16, got {dt}"),
+    };
+
+    cutlass_scaled_mm_bias_sm89(
+        output.as_gpu_tensor().as_mut_ptr(),
+        a.as_ptr(),
+        b.as_ptr(),
+        a_scales.as_ptr() as *const f32,
+        a_scales.numel() as i32,
+        b_scales.as_ptr() as *const f32,
+        b_scales.numel() as i32,
+        bias.as_ptr(),
+        m as i32,
+        n as i32,
+        k as i32,
+        out_dtype_code,
+        stream,
+    );
+
+    output
+}
+
+// ---------------------------------------------------------------------------
 // FlashAttention-2 Paged (raw FFI — no candle dependency)
 // ---------------------------------------------------------------------------
 
@@ -7298,6 +7786,153 @@ mod tests_fp8_kv {
 
             assert!((k_scale - 3.14).abs() < 0.001, "k_scale={k_scale}");
             assert!((v_scale - 2.71).abs() < 0.001, "v_scale={v_scale}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP8 quantization kernel tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod tests_fp8_quant {
+    use super::*;
+    use crate::driver;
+    type CUstream = cudarc::driver::sys::CUstream;
+
+    unsafe fn test_init() -> (CachingAllocator, CUstream) {
+        driver::init().expect("CUDA init");
+        let dev = driver::device_get(0).expect("device 0");
+        let _ctx = driver::ctx_create(dev).expect("ctx_create");
+        let stream = driver::stream_create().expect("stream_create");
+        let alloc = CachingAllocator::new();
+        (alloc, stream)
+    }
+
+    unsafe fn upload_bf16(data: &[half::bf16], stream: CUstream) -> GpuTensor {
+        let bytes = data.len() * 2;
+        let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("H2D");
+        GpuTensor::new(ptr, &[data.len()], DType::BF16)
+    }
+
+    unsafe fn download_u8(tensor: GpuTensor, stream: CUstream) -> Vec<u8> {
+        let count = tensor.numel();
+        let host = driver::mem_alloc_host(count).expect("host alloc");
+        driver::memcpy_dtoh_async(host, tensor.raw_ptr(), count, stream).expect("D2H");
+        driver::stream_synchronize(stream).expect("sync");
+        let result = std::slice::from_raw_parts(host, count).to_vec();
+        driver::mem_free_host(host).expect("free");
+        result
+    }
+
+    unsafe fn download_f32(ptr: *mut u8, count: usize, stream: CUstream) -> Vec<f32> {
+        let bytes = count * 4;
+        let host = driver::mem_alloc_host(bytes).expect("host alloc");
+        driver::memcpy_dtoh_async(host, ptr, bytes, stream).expect("D2H");
+        driver::stream_synchronize(stream).expect("sync");
+        let result = std::slice::from_raw_parts(host as *const f32, count).to_vec();
+        driver::mem_free_host(host).expect("free");
+        result
+    }
+
+    #[test]
+    fn test_scaled_fp8_quant_dynamic_bf16() {
+        // Dynamic per-token FP8 quantization: BF16 → FP8 E4M3
+        // Input: 2 tokens, 4 hidden dims
+        // Token 0: [1.0, 2.0, -3.0, 4.0] → absmax=4.0, scale=4.0/448.0
+        // Token 1: [0.5, -1.0, 1.5, 0.0] → absmax=1.5, scale=1.5/448.0
+        unsafe {
+            let (mut alloc, stream) = test_init();
+            let num_tokens = 2;
+            let hidden_dim = 4;
+
+            let data: Vec<half::bf16> = [1.0f32, 2.0, -3.0, 4.0, 0.5, -1.0, 1.5, 0.0]
+                .iter()
+                .map(|&v| half::bf16::from_f32(v))
+                .collect();
+
+            let input = upload_bf16(&data, stream);
+            let input_2d = input.reshape(&[num_tokens, hidden_dim]);
+
+            let (output, scales) = scaled_fp8_quant_dynamic(input_2d, &mut alloc, stream);
+
+            driver::stream_synchronize(stream).expect("sync");
+
+            // Check output shape
+            assert_eq!(output.as_gpu_tensor().dim(0), num_tokens);
+            assert_eq!(output.as_gpu_tensor().dim(1), hidden_dim);
+            assert_eq!(output.as_gpu_tensor().dtype(), DType::Fp8E4m3);
+
+            // Check scales shape
+            assert_eq!(scales.as_gpu_tensor().dim(0), num_tokens);
+
+            // Download scales and verify
+            let host_scales = download_f32(scales.as_gpu_tensor().raw_ptr(), num_tokens, stream);
+            // scale = absmax / 448.0
+            let expected_scale_0 = 4.0 / 448.0;
+            let expected_scale_1 = 1.5 / 448.0;
+            assert!(
+                (host_scales[0] - expected_scale_0).abs() < 0.001,
+                "scale[0]={}, expected ~{expected_scale_0}",
+                host_scales[0]
+            );
+            assert!(
+                (host_scales[1] - expected_scale_1).abs() < 0.001,
+                "scale[1]={}, expected ~{expected_scale_1}",
+                host_scales[1]
+            );
+
+            // Download FP8 output and verify roundtrip
+            let fp8_bytes = download_u8(output.as_gpu_tensor(), stream);
+            assert_eq!(fp8_bytes.len(), num_tokens * hidden_dim);
+            // All bytes should be non-zero (except the 0.0 in token 1)
+            // Token 1, index 3 should be 0x00 (FP8 zero)
+            assert_eq!(fp8_bytes[7], 0, "0.0 should quantize to FP8 zero");
+
+            driver::stream_destroy(stream).expect("destroy");
+        }
+    }
+
+    #[test]
+    fn test_scaled_fp8_quant_static_bf16() {
+        // Static FP8 quantization with a given scale.
+        unsafe {
+            let (mut alloc, stream) = test_init();
+            let num_tokens = 2;
+            let hidden_dim = 4;
+
+            let data: Vec<half::bf16> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+                .iter()
+                .map(|&v| half::bf16::from_f32(v))
+                .collect();
+
+            let input = upload_bf16(&data, stream);
+            let input_2d = input.reshape(&[num_tokens, hidden_dim]);
+
+            // Use scale = 1.0/56.0 (so max representable = 448 * (1/56) = 8.0)
+            let scale_val = 1.0f32 / 56.0;
+            let scale_ptr = driver::mem_alloc(4).unwrap();
+            driver::memcpy_htod_async(scale_ptr, &scale_val as *const f32 as *const u8, 4, stream)
+                .unwrap();
+            let output =
+                scaled_fp8_quant_static(input_2d, scale_ptr as *const f32, &mut alloc, stream);
+
+            driver::stream_synchronize(stream).expect("sync");
+
+            assert_eq!(output.as_gpu_tensor().dim(0), num_tokens);
+            assert_eq!(output.as_gpu_tensor().dim(1), hidden_dim);
+            assert_eq!(output.as_gpu_tensor().dtype(), DType::Fp8E4m3);
+
+            // All elements should be non-zero
+            let fp8_bytes = download_u8(output.as_gpu_tensor(), stream);
+            for (i, &b) in fp8_bytes.iter().enumerate() {
+                assert_ne!(b, 0, "element {i} should not be zero");
+            }
+
+            driver::mem_free(scale_ptr).unwrap();
+            driver::stream_destroy(stream).expect("destroy");
         }
     }
 }

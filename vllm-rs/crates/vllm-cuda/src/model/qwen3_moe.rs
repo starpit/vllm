@@ -334,6 +334,73 @@ impl Qwen3MoeDecoderLayer {
         })
     }
 
+    /// Load an FP8 quantized decoder layer.
+    /// Only attention and dense MLP layers are FP8. MoE expert weights remain dense.
+    /// QK-norm weights are loaded separately (they are tiny and stay dense).
+    pub fn load_fp8(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Qwen3MoeConfig,
+        layer_idx: usize,
+        dtype: DType,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let llama_cfg = config.as_llama_config();
+
+        // Load FP8 attention, then add QK-norm weights on top.
+        let mut self_attn = LlamaAttention::load_fp8(
+            weights,
+            &format!("{prefix}.self_attn"),
+            &llama_cfg,
+            layer_idx,
+            dtype,
+            stream,
+        )?;
+
+        let q_norm_name = format!("{prefix}.self_attn.q_norm.weight");
+        let k_norm_name = format!("{prefix}.self_attn.k_norm.weight");
+        if weights.contains(&q_norm_name) {
+            self_attn.q_norm_weight = Some(weights.take(&q_norm_name)?);
+        }
+        if weights.contains(&k_norm_name) {
+            self_attn.k_norm_weight = Some(weights.take(&k_norm_name)?);
+        }
+        self_attn.qk_norm_eps = config.rms_norm_eps;
+
+        let is_dense = config.mlp_only_layers.contains(&layer_idx);
+        let mlp = if is_dense {
+            let dense = LlamaMLP::load_fp8(
+                weights,
+                &format!("{prefix}.mlp"),
+                config.intermediate_size,
+                dtype,
+                stream,
+            )?;
+            Qwen3MoeMlp::Dense(dense)
+        } else {
+            // MoE expert weights stay dense (BF16).
+            Self::load_moe(weights, &format!("{prefix}.mlp"), config, None, stream)?
+        };
+
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward_owned(
         &self,
@@ -454,6 +521,48 @@ impl Qwen3MoeModel {
         })
     }
 
+    /// Load an FP8 quantized Qwen3 MoE model.
+    /// Only attention and dense MLP layers are FP8. MoE expert weights remain dense.
+    pub fn load_fp8(
+        weights: &mut GpuWeights,
+        config: &Qwen3MoeConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = crate::layers::Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            layers.push(Qwen3MoeDecoderLayer::load_fp8(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                dtype,
+                device.compute_stream,
+            )?);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward_owned(
         &self,
@@ -524,6 +633,23 @@ impl Qwen3MoeForCausalLM {
         device: &GpuDevice,
     ) -> Result<Self> {
         let model = Qwen3MoeModel::load(weights, config, dtype, device)?;
+        let lm_head = if config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.weight, None)
+        } else {
+            Linear::load(weights, "lm_head")?
+        };
+        Ok(Self { model, lm_head })
+    }
+
+    /// Load an FP8 quantized Qwen3 MoE model.
+    /// Only attention and dense MLP layers are FP8. MoE expert weights remain dense.
+    pub fn load_fp8(
+        weights: &mut GpuWeights,
+        config: &Qwen3MoeConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = Qwen3MoeModel::load_fp8(weights, config, dtype, device)?;
         let lm_head = if config.tie_word_embeddings {
             Linear::new(model.embed_tokens.weight, None)
         } else {

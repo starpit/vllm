@@ -232,6 +232,53 @@ impl MixtralDecoderLayer {
         })
     }
 
+    /// Load an FP8 decoder layer.
+    /// Note: Only attention layers are FP8-quantized. MoE expert weights stay dense.
+    pub fn load_fp8(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &MixtralConfig,
+        layer_idx: usize,
+        output_dtype: DType,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let llama_cfg = config.as_llama_config();
+        let self_attn = LlamaAttention::load_fp8(
+            weights,
+            &format!("{prefix}.self_attn"),
+            &llama_cfg,
+            layer_idx,
+            output_dtype,
+            stream,
+        )?;
+
+        let moe = Self::load_moe(
+            weights,
+            &format!("{prefix}.block_sparse_moe"),
+            config,
+            None,
+            stream,
+        )?;
+
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+
+        Ok(Self {
+            self_attn,
+            block_sparse_moe: moe,
+            input_layernorm,
+            post_attention_layernorm,
+        })
+    }
+
     /// Forward pass — identical to LlamaDecoderLayer but with MoE MLP.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward_owned(
@@ -433,6 +480,57 @@ impl MixtralForCausalLM {
         device: &GpuDevice,
     ) -> Result<Self> {
         let model = MixtralModel::load(weights, config, dtype, device)?;
+
+        let lm_head = if config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.weight, None)
+        } else {
+            Linear::load(weights, "lm_head")?
+        };
+
+        Ok(Self { model, lm_head })
+    }
+
+    /// Load an FP8 quantized Mixtral model.
+    /// Note: Only attention layers are FP8. MoE expert weights remain dense.
+    pub fn load_fp8(
+        weights: &mut GpuWeights,
+        config: &MixtralConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = crate::layers::Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let layer = MixtralDecoderLayer::load_fp8(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                dtype,
+                device.compute_stream,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        let model = MixtralModel {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+        };
 
         let lm_head = if config.tie_word_embeddings {
             Linear::new(model.embed_tokens.weight, None)

@@ -3151,6 +3151,13 @@ impl Worker for CudaWorker {
                         bnb_cfg,
                         device,
                     )
+                } else if qconfig.is_fp8() {
+                    vllm_cuda::model::llama::LlamaForCausalLM::load_fp8(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
                 } else if qconfig.is_quantized() {
                     vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
                         &mut weights,
@@ -3194,6 +3201,13 @@ impl Worker for CudaWorker {
                         bnb_cfg,
                         device,
                     )
+                } else if qconfig.is_fp8() {
+                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8(
+                        &mut weights,
+                        &qwen2_config,
+                        dtype,
+                        device,
+                    )
                 } else if qconfig.is_quantized() {
                     vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_quantized(
                         &mut weights,
@@ -3233,6 +3247,13 @@ impl Worker for CudaWorker {
                         &config,
                         dtype,
                         bnb_cfg,
+                        device,
+                    )
+                } else if qconfig.is_fp8() {
+                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_fp8(
+                        &mut weights,
+                        &config,
+                        dtype,
                         device,
                     )
                 } else if qconfig.is_quantized() {
@@ -3316,6 +3337,13 @@ impl Worker for CudaWorker {
                         bnb_cfg,
                         device,
                     )
+                } else if qconfig.is_fp8() {
+                    vllm_cuda::model::llama::LlamaForCausalLM::load_fp8(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
                 } else if qconfig.is_quantized() {
                     vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
                         &mut weights,
@@ -3379,7 +3407,14 @@ impl Worker for CudaWorker {
             }
             "MixtralForCausalLM" => {
                 let config = mixtral_config_from_hf(&hf_config)?;
-                let m = if use_tp {
+                let m = if qconfig.is_fp8() {
+                    vllm_cuda::model::mixtral::MixtralForCausalLM::load_fp8(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                } else if use_tp {
                     vllm_cuda::model::mixtral::MixtralForCausalLM::load_tp(
                         &mut weights,
                         &config,
@@ -3400,7 +3435,14 @@ impl Worker for CudaWorker {
             }
             "Qwen2MoeForCausalLM" => {
                 let config = qwen2_moe_config_from_hf(&hf_config)?;
-                let m = if use_tp {
+                let m = if qconfig.is_fp8() {
+                    vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load_fp8(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                } else if use_tp {
                     vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load_tp(
                         &mut weights,
                         &config,
@@ -3421,7 +3463,14 @@ impl Worker for CudaWorker {
             }
             "Qwen3MoeForCausalLM" => {
                 let config = qwen2_moe_config_from_hf(&hf_config)?;
-                let m = if use_tp {
+                let m = if qconfig.is_fp8() {
+                    vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_fp8(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        device,
+                    )
+                } else if use_tp {
                     vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_tp(
                         &mut weights,
                         &config,
@@ -3485,6 +3534,13 @@ impl Worker for CudaWorker {
                         &config,
                         dtype,
                         bnb_cfg,
+                        device,
+                    )
+                } else if qconfig.is_fp8() {
+                    vllm_cuda::model::commandr::CommandRForCausalLM::load_fp8(
+                        &mut weights,
+                        &config,
+                        dtype,
                         device,
                     )
                 } else {

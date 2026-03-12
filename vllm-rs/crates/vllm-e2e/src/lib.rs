@@ -99,6 +99,10 @@ impl TestModels {
     // Granite GGUF — quantized, candle backend (CUDA)
     pub const GRANITE_3_3_2B_INSTRUCT_GGUF: &str = "ibm-granite/granite-3.3-2b-instruct-GGUF";
 
+    // FP8 quantized models (CUDA-backend, SM89+)
+    pub const QWEN2_0_5B_FP8: &str = "RedHatAI/Qwen2.5-0.5B-FP8-dynamic";
+    pub const LLAMA_3_1_8B_FP8: &str = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8";
+
     // Multimodal (vision-language) models
     // Tier 3: ~2.8 GB — nightly only (QAT = quantization-aware training)
     pub const GEMMA3_4B_IT_QAT_3BIT: &str = "mlx-community/gemma-3-4b-it-qat-3bit";

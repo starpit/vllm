@@ -360,10 +360,138 @@ impl GgmlLinear {
 }
 
 // ---------------------------------------------------------------------------
-// LinearLayer (enum dispatch: Dense, Marlin, or Ggml)
+// Fp8Linear (FP8 E4M3 quantized via cublasLt FP8 GEMM)
 // ---------------------------------------------------------------------------
 
-/// Unified linear layer — dense (cuBLAS), Marlin INT4, or GGML quantized.
+/// FP8 (E4M3) quantized linear layer.
+///
+/// Weights stored as FP8 `[out_features, in_features]` with a per-tensor
+/// f32 weight scale on GPU. Activations are dynamically quantized to FP8
+/// per-token at runtime (or statically if `input_scale` is provided).
+///
+/// Forward: quantize(x) → FP8 GEMM → BF16 output.
+/// Matches Python vLLM's `Fp8LinearMethod`.
+pub struct Fp8Linear {
+    /// FP8 E4M3 weights `[out_features, in_features]`.
+    pub weight: GpuTensor,
+    /// Per-tensor weight scale: single f32 scalar on GPU.
+    pub weight_scale: GpuTensor,
+    /// Pre-calibrated input scale (static activation quantization).
+    /// If `None`, uses dynamic per-token quantization.
+    pub input_scale: Option<GpuTensor>,
+    /// Optional bias `[out_features]` in output dtype (BF16/F16).
+    pub bias: Option<GpuTensor>,
+    /// Output dtype (BF16 or F16) — determines GEMM output and bias dtype.
+    pub output_dtype: crate::dtype::DType,
+}
+
+impl Fp8Linear {
+    /// Forward: quantize activations → CUTLASS FP8 GEMM → output in output_dtype.
+    ///
+    /// Uses fused CUTLASS `cutlass_scaled_mm` (single kernel launch) with per-row
+    /// activation scales and per-tensor weight scale in the epilogue.
+    /// Matches Python vLLM's `cutlass_scaled_mm` exactly.
+    pub unsafe fn forward(
+        &self,
+        x: GpuTensor,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> GpuTensor {
+        self.forward_owned(x, cublas, alloc, stream)
+            .into_gpu_tensor()
+    }
+
+    pub unsafe fn forward_owned(
+        &self,
+        x: GpuTensor,
+        _cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> OwnedTensor {
+        debug_assert_eq!(x.ndim(), 2);
+        debug_assert_eq!(
+            x.dim(1),
+            self.weight.dim(1),
+            "Fp8Linear: input dim mismatch"
+        );
+
+        if let Some(ref input_scale) = self.input_scale {
+            // Static activation quantization: scalar input_scale + scalar weight_scale.
+            // Quantize with pre-calibrated scale, then fused CUTLASS GEMM.
+            let a_scale = input_scale.as_ptr::<f32>();
+            let x_fp8 = crate::kernels::scaled_fp8_quant_static(x, a_scale, alloc, stream);
+            // input_scale is [1] (scalar) — CUTLASS handles scalar a_scale correctly.
+            if let Some(bias) = self.bias {
+                crate::kernels::cutlass_scaled_mm_with_bias(
+                    x_fp8.into_gpu_tensor(),
+                    self.weight,
+                    *input_scale,
+                    self.weight_scale,
+                    bias,
+                    self.output_dtype,
+                    alloc,
+                    stream,
+                )
+            } else {
+                crate::kernels::cutlass_scaled_mm(
+                    x_fp8.into_gpu_tensor(),
+                    self.weight,
+                    *input_scale,
+                    self.weight_scale,
+                    self.output_dtype,
+                    alloc,
+                    stream,
+                )
+            }
+        } else {
+            // Dynamic per-token activation quantization.
+            // Uses CUTLASS cutlass_scaled_mm with fused per-row scale_a epilogue —
+            // single kernel launch, exactly matching Python vLLM.
+            //
+            // 1. Quantize activations: BF16 → FP8 + per-token scales [M]
+            // 2. CUTLASS FP8 GEMM with per-token a_scales + per-tensor b_scale
+            //    fused into the epilogue. ONE kernel launch.
+            let (x_fp8, x_scales) = crate::kernels::scaled_fp8_quant_dynamic(x, alloc, stream);
+            if let Some(bias) = self.bias {
+                crate::kernels::cutlass_scaled_mm_with_bias(
+                    x_fp8.into_gpu_tensor(),
+                    self.weight,
+                    x_scales.into_gpu_tensor(),
+                    self.weight_scale,
+                    bias,
+                    self.output_dtype,
+                    alloc,
+                    stream,
+                )
+            } else {
+                crate::kernels::cutlass_scaled_mm(
+                    x_fp8.into_gpu_tensor(),
+                    self.weight,
+                    x_scales.into_gpu_tensor(),
+                    self.weight_scale,
+                    self.output_dtype,
+                    alloc,
+                    stream,
+                )
+            }
+        }
+    }
+
+    pub fn out_features(&self) -> usize {
+        self.weight.dim(0)
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.weight.dim(1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LinearLayer (enum dispatch: Dense, Marlin, Ggml, Bnb4bit, or Fp8)
+// ---------------------------------------------------------------------------
+
+/// Unified linear layer — dense (cuBLAS), Marlin INT4, GGML quantized, BNB 4-bit, or FP8.
 ///
 /// Models use this everywhere they currently use `Linear`. The factory decides
 /// at load time which variant to create based on weight format.
@@ -372,10 +500,11 @@ pub enum LinearLayer {
     Marlin(Box<MarlinLinear>),
     Ggml(Box<GgmlLinear>),
     Bnb4bit(Box<Bnb4bitLinear>),
+    Fp8(Box<Fp8Linear>),
 }
 
 impl LinearLayer {
-    /// Forward: y = x @ W^T (dense) or marlin_gemm(x, qweight) (quantized).
+    /// Forward: y = x @ W^T (dense) or quantized GEMM variant.
     pub unsafe fn forward(
         &self,
         x: GpuTensor,
@@ -399,6 +528,7 @@ impl LinearLayer {
             Self::Marlin(l) => l.forward_owned(x, alloc, stream),
             Self::Ggml(l) => l.forward_owned(x, alloc, stream),
             Self::Bnb4bit(l) => l.forward_owned(x, cublas, alloc, stream),
+            Self::Fp8(l) => l.forward_owned(x, cublas, alloc, stream),
         }
     }
 
@@ -408,6 +538,7 @@ impl LinearLayer {
             Self::Marlin(l) => l.out_features(),
             Self::Ggml(l) => l.out_features(),
             Self::Bnb4bit(l) => l.out_features(),
+            Self::Fp8(l) => l.out_features(),
         }
     }
 
@@ -417,6 +548,7 @@ impl LinearLayer {
             Self::Marlin(l) => l.in_features(),
             Self::Ggml(l) => l.in_features(),
             Self::Bnb4bit(l) => l.in_features(),
+            Self::Fp8(l) => l.in_features(),
         }
     }
 }
@@ -436,6 +568,98 @@ impl From<MarlinLinear> for LinearLayer {
 impl From<GgmlLinear> for LinearLayer {
     fn from(l: GgmlLinear) -> Self {
         Self::Ggml(Box::new(l))
+    }
+}
+
+impl From<Fp8Linear> for LinearLayer {
+    fn from(l: Fp8Linear) -> Self {
+        Self::Fp8(Box::new(l))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fp8BlockLinear (FP8 E4M3 with per-block scales, e.g. DeepSeek-V3)
+// ---------------------------------------------------------------------------
+
+/// FP8 block-quantized linear layer with per-block weight scales.
+///
+/// Weights are stored as FP8 `[out_features, in_features]` with per-block
+/// scales `[ceil(N/block_n), ceil(K/block_k)]`. Forward dequantizes to BF16
+/// then uses standard cuBLAS GEMM.
+///
+/// PERF GAP: Python uses CUTLASS block-scaled FP8 GEMM (one fused kernel)
+/// or deep_gemm (Hopper). We dequant + cuBLAS which adds an extra memory
+/// round-trip. Functionally correct, but slower for block-quantized models
+/// like DeepSeek-V3. To close: port CUTLASS block-scaled kernel from
+/// `vllm/csrc/quantization/cutlass_w8a8/`.
+///
+/// Matches Python vLLM's `Fp8LinearMethod` with `weight_block_size`.
+pub struct Fp8BlockLinear {
+    /// FP8 E4M3 weights `[out_features, in_features]`.
+    pub weight: GpuTensor,
+    /// Per-block weight scale inverse: `[ceil(N/block_n), ceil(K/block_k)]` f32.
+    pub weight_scale_inv: GpuTensor,
+    /// Block quantization block size `[block_n, block_k]`.
+    pub block_size: [usize; 2],
+    /// Optional bias `[out_features]`.
+    pub bias: Option<GpuTensor>,
+    /// Output dtype (BF16 or F16).
+    pub output_dtype: crate::dtype::DType,
+}
+
+impl Fp8BlockLinear {
+    /// Forward: dequant FP8 → BF16 per block, then cuBLAS GEMM.
+    ///
+    /// Current implementation: CPU-side dequant-then-GEMM for correctness.
+    /// TODO: CUTLASS block-scaled FP8 GEMM for perf parity.
+    pub unsafe fn forward(
+        &self,
+        x: GpuTensor,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> GpuTensor {
+        self.forward_owned(x, cublas, alloc, stream)
+            .into_gpu_tensor()
+    }
+
+    pub unsafe fn forward_owned(
+        &self,
+        x: GpuTensor,
+        cublas: &mut CublasHandle,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> OwnedTensor {
+        debug_assert_eq!(x.ndim(), 2);
+        let k = self.weight.dim(1);
+        debug_assert_eq!(x.dim(1), k, "Fp8BlockLinear: input dim mismatch");
+
+        // Dequantize FP8 weight to BF16/F16 using per-block scales.
+        let dequant_weight = crate::kernels::fp8_block_dequant(
+            self.weight,
+            self.weight_scale_inv,
+            self.block_size,
+            self.output_dtype,
+            alloc,
+            stream,
+        );
+
+        // Standard GEMM: x @ dequant_weight^T
+        let out = cublas.gemm_owned(x, dequant_weight.into_gpu_tensor(), alloc);
+
+        if let Some(bias) = self.bias {
+            crate::kernels::bias_add_inplace(out.as_gpu_tensor(), bias, stream);
+        }
+
+        out
+    }
+
+    pub fn out_features(&self) -> usize {
+        self.weight.dim(0)
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.weight.dim(1)
     }
 }
 
@@ -1421,5 +1645,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_fp8_linear_dimensions() {
+        // Test Fp8Linear struct construction with dummy tensors.
+        let w = unsafe { GpuTensor::new(0x1000 as *mut u8, &[512, 4096], DType::Fp8E4m3) };
+        let s = unsafe { GpuTensor::new(0x2000 as *mut u8, &[1], DType::F32) };
+        let fp8 = Fp8Linear {
+            weight: w,
+            weight_scale: s,
+            input_scale: None,
+            bias: None,
+            output_dtype: DType::BF16,
+        };
+        assert_eq!(fp8.out_features(), 512);
+        assert_eq!(fp8.in_features(), 4096);
+        assert!(fp8.input_scale.is_none());
+        assert!(fp8.bias.is_none());
+    }
+
+    #[test]
+    fn test_fp8_linear_with_static_scale() {
+        let w = unsafe { GpuTensor::new(0x1000 as *mut u8, &[256, 128], DType::Fp8E4m3) };
+        let ws = unsafe { GpuTensor::new(0x2000 as *mut u8, &[1], DType::F32) };
+        let is = unsafe { GpuTensor::new(0x3000 as *mut u8, &[1], DType::F32) };
+        let fp8 = Fp8Linear {
+            weight: w,
+            weight_scale: ws,
+            input_scale: Some(is),
+            bias: None,
+            output_dtype: DType::BF16,
+        };
+        assert!(fp8.input_scale.is_some());
+        assert_eq!(fp8.out_features(), 256);
+    }
+
+    #[test]
+    fn test_linear_layer_fp8_variant() {
+        let w = unsafe { GpuTensor::new(0x1000 as *mut u8, &[512, 4096], DType::Fp8E4m3) };
+        let s = unsafe { GpuTensor::new(0x2000 as *mut u8, &[1], DType::F32) };
+        let fp8 = Fp8Linear {
+            weight: w,
+            weight_scale: s,
+            input_scale: None,
+            bias: None,
+            output_dtype: DType::BF16,
+        };
+        let layer = LinearLayer::Fp8(Box::new(fp8));
+        assert_eq!(layer.out_features(), 512);
+        assert_eq!(layer.in_features(), 4096);
+    }
+
+    #[test]
+    fn test_fp8_block_linear_dimensions() {
+        let w = unsafe { GpuTensor::new(0x1000 as *mut u8, &[512, 4096], DType::Fp8E4m3) };
+        // block_size = [128, 128] → scale shape [4, 32]
+        let s = unsafe { GpuTensor::new(0x2000 as *mut u8, &[4, 32], DType::F32) };
+        let block = Fp8BlockLinear {
+            weight: w,
+            weight_scale_inv: s,
+            block_size: [128, 128],
+            bias: None,
+            output_dtype: DType::BF16,
+        };
+        assert_eq!(block.weight.dim(0), 512);
+        assert_eq!(block.weight.dim(1), 4096);
+        assert_eq!(block.block_size, [128, 128]);
     }
 }

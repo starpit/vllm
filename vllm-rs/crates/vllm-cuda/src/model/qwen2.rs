@@ -80,6 +80,17 @@ impl Qwen2ForCausalLM {
         Ok(Self(model))
     }
 
+    /// Load the model (FP8 quantized).
+    pub fn load_fp8(
+        weights: &mut GpuWeights,
+        config: &Qwen2Config,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = LlamaForCausalLM::load_fp8(weights, &config.0, dtype, device)?;
+        Ok(Self(model))
+    }
+
     /// Load the model (BNB 4-bit).
     pub fn load_bnb4bit(
         weights: &mut GpuWeights,

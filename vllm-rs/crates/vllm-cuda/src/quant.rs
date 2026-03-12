@@ -25,6 +25,35 @@ pub enum QuantConfig {
     Gptq(GptqConfig),
     /// BitsAndBytes 4-bit (NF4/FP4) quantization.
     Bnb4bit(Bnb4bitConfig),
+    /// FP8 (E4M3) weight quantization — per-tensor or per-block scales.
+    Fp8(Fp8Config),
+}
+
+/// FP8 weight quantization config.
+///
+/// Matches Python vLLM's `Fp8Config` / `Fp8LinearMethod`. Supports both
+/// serialized FP8 checkpoints (weights stored as float8_e4m3fn with
+/// pre-computed scales) and online quantization (BF16 weights quantized
+/// to FP8 at load time).
+#[derive(Debug, Clone)]
+pub struct Fp8Config {
+    /// Dynamic (per-token at runtime) vs Static (pre-calibrated input_scale).
+    pub activation_scheme: Fp8ActivationScheme,
+    /// Per-block quantization block size, e.g. `[128, 128]` for DeepSeek-V3.
+    /// `None` means per-tensor scales.
+    pub weight_block_size: Option<[usize; 2]>,
+    /// If true, checkpoint already has FP8 weights + weight_scale tensors.
+    /// If false, weights are BF16/F16 and will be quantized online at load time.
+    pub is_checkpoint_fp8_serialized: bool,
+}
+
+/// FP8 activation quantization scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fp8ActivationScheme {
+    /// Per-token dynamic quantization at runtime (default for SM89+).
+    Dynamic,
+    /// Static quantization using pre-calibrated `input_scale`.
+    Static,
 }
 
 /// BitsAndBytes 4-bit quantization config.
@@ -90,7 +119,7 @@ impl QuantConfig {
 
     pub fn group_size(&self) -> usize {
         match self {
-            Self::None | Self::Bnb4bit(_) => 0,
+            Self::None | Self::Bnb4bit(_) | Self::Fp8(_) => 0,
             Self::Awq(c) => c.group_size,
             Self::Gptq(c) => c.group_size,
         }
@@ -102,6 +131,7 @@ impl QuantConfig {
             Self::Awq(c) => c.bits,
             Self::Gptq(c) => c.bits,
             Self::Bnb4bit(_) => 4,
+            Self::Fp8(_) => 8,
         }
     }
 
@@ -110,7 +140,7 @@ impl QuantConfig {
         match self {
             Self::Awq(_) => 1,
             Self::Gptq(_) => 0,
-            Self::None | Self::Bnb4bit(_) => -1,
+            Self::None | Self::Bnb4bit(_) | Self::Fp8(_) => -1,
         }
     }
 
@@ -119,7 +149,7 @@ impl QuantConfig {
         match self {
             Self::Awq(_) => true,
             Self::Gptq(c) => !c.sym,
-            Self::None | Self::Bnb4bit(_) => false,
+            Self::None | Self::Bnb4bit(_) | Self::Fp8(_) => false,
         }
     }
 
@@ -134,6 +164,11 @@ impl QuantConfig {
     /// Whether this is a BNB 4-bit quantized model.
     pub fn is_bnb4bit(&self) -> bool {
         matches!(self, Self::Bnb4bit(_))
+    }
+
+    /// Whether this is an FP8 quantized model.
+    pub fn is_fp8(&self) -> bool {
+        matches!(self, Self::Fp8(_))
     }
 }
 
@@ -179,8 +214,25 @@ pub fn detect_quant_config(model_dir: impl AsRef<Path>) -> Result<QuantConfig> {
         let data = std::fs::read_to_string(&config_path)?;
         let config: serde_json::Value = serde_json::from_str(&data)?;
         if let Some(qc) = config.get("quantization_config") {
-            // Check for BitsAndBytes first.
-            if let Some("bitsandbytes") = qc.get("quant_method").and_then(|v| v.as_str()) {
+            let method = qc
+                .get("quant_method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            // Check for FP8.
+            if method == "fp8" {
+                return parse_fp8_config(qc);
+            }
+
+            // Check for compressed-tensors (llmcompressor/vllm-quantizer format).
+            // When weights are 8-bit float with symmetric quantization, this is FP8.
+            // Matches Python vLLM's CompressedTensorsConfig → FP8 dispatch.
+            if method == "compressed-tensors" {
+                return parse_compressed_tensors_config(qc);
+            }
+
+            // Check for BitsAndBytes.
+            if method == "bitsandbytes" {
                 let load_4bit = qc
                     .get("load_in_4bit")
                     .and_then(|v| v.as_bool())
@@ -208,6 +260,129 @@ pub fn detect_quant_config(model_dir: impl AsRef<Path>) -> Result<QuantConfig> {
     }
 
     Ok(QuantConfig::None)
+}
+
+/// Parse FP8 quantization config from `config.json → quantization_config`.
+///
+/// Matches Python vLLM's `Fp8Config.from_config()`:
+/// - `activation_scheme`: "dynamic" (default) or "static"
+/// - `weight_block_size`: null or [block_n, block_k] (e.g. [128, 128] for DeepSeek-V3)
+/// - `is_checkpoint_fp8_serialized`: bool (default true for fp8 quant_method)
+fn parse_fp8_config(qc: &serde_json::Value) -> Result<QuantConfig> {
+    let activation_scheme = match qc
+        .get("activation_scheme")
+        .and_then(|v| v.as_str())
+        .unwrap_or("dynamic")
+    {
+        "static" => Fp8ActivationScheme::Static,
+        _ => Fp8ActivationScheme::Dynamic,
+    };
+
+    let weight_block_size = qc
+        .get("weight_block_size")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            if arr.len() == 2 {
+                let a = arr[0].as_u64()? as usize;
+                let b = arr[1].as_u64()? as usize;
+                Some([a, b])
+            } else {
+                None
+            }
+        });
+
+    // Default: if quant_method is "fp8", checkpoint usually has FP8 weights.
+    // Some checkpoints set this explicitly; others rely on weight dtype detection.
+    let is_checkpoint_fp8_serialized = qc
+        .get("is_checkpoint_fp8_serialized")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    tracing::info!(
+        "Detected FP8 quantization: activation_scheme={activation_scheme:?}, \
+         weight_block_size={weight_block_size:?}, serialized={is_checkpoint_fp8_serialized}"
+    );
+
+    Ok(QuantConfig::Fp8(Fp8Config {
+        activation_scheme,
+        weight_block_size,
+        is_checkpoint_fp8_serialized,
+    }))
+}
+
+/// Parse `compressed-tensors` quantization config.
+///
+/// Matches Python vLLM's `CompressedTensorsConfig` → FP8 dispatch.
+/// The config has `config_groups` with weight/input_activations specs.
+/// When weights are 8-bit float, this maps to our FP8 path.
+fn parse_compressed_tensors_config(qc: &serde_json::Value) -> Result<QuantConfig> {
+    // Find the first config group to determine weight/activation quantization.
+    let config_groups = qc
+        .get("config_groups")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| anyhow::anyhow!("compressed-tensors: missing config_groups"))?;
+
+    let group = config_groups
+        .values()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("compressed-tensors: empty config_groups"))?;
+
+    let weights = group
+        .get("weights")
+        .ok_or_else(|| anyhow::anyhow!("compressed-tensors: missing weights in config group"))?;
+
+    let weight_type = weights.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let weight_bits = weights
+        .get("num_bits")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    if weight_type != "float" || weight_bits != 8 {
+        bail!(
+            "compressed-tensors: only float8 weights supported, got type={weight_type}, bits={weight_bits}"
+        );
+    }
+
+    // Determine activation scheme from input_activations.
+    let activation_scheme = if let Some(input_act) = group.get("input_activations") {
+        let dynamic = input_act
+            .get("dynamic")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if dynamic {
+            Fp8ActivationScheme::Dynamic
+        } else {
+            Fp8ActivationScheme::Static
+        }
+    } else {
+        // No input activations quantized — use dynamic (weight-only FP8).
+        Fp8ActivationScheme::Dynamic
+    };
+
+    // Check for block quantization via weight.block_structure.
+    let weight_block_size = weights
+        .get("block_structure")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            if arr.len() == 2 {
+                let a = arr[0].as_u64()? as usize;
+                let b = arr[1].as_u64()? as usize;
+                Some([a, b])
+            } else {
+                None
+            }
+        });
+
+    tracing::info!(
+        "Detected compressed-tensors FP8: activation_scheme={activation_scheme:?}, \
+         weight_block_size={weight_block_size:?}"
+    );
+
+    Ok(QuantConfig::Fp8(Fp8Config {
+        activation_scheme,
+        weight_block_size,
+        is_checkpoint_fp8_serialized: true,
+    }))
 }
 
 fn parse_raw_config(raw: RawQuantConfig) -> Result<QuantConfig> {
@@ -626,6 +801,41 @@ mod tests {
         let none = QuantConfig::None;
         assert!(!none.is_quantized());
         assert_eq!(none.bits(), 0);
+    }
+
+    #[test]
+    fn test_fp8_config_methods() {
+        let fp8 = QuantConfig::Fp8(Fp8Config {
+            activation_scheme: Fp8ActivationScheme::Dynamic,
+            weight_block_size: None,
+            is_checkpoint_fp8_serialized: true,
+        });
+        assert!(fp8.is_quantized());
+        assert!(fp8.is_fp8());
+        assert!(!fp8.is_bnb4bit());
+        assert_eq!(fp8.bits(), 8);
+        assert_eq!(fp8.group_size(), 0);
+        assert!(!fp8.has_zp());
+        assert!(!fp8.has_act_order());
+        assert_eq!(fp8.b_type_id(), -1);
+    }
+
+    #[test]
+    fn test_fp8_config_block_quant() {
+        let fp8_block = QuantConfig::Fp8(Fp8Config {
+            activation_scheme: Fp8ActivationScheme::Dynamic,
+            weight_block_size: Some([128, 128]),
+            is_checkpoint_fp8_serialized: true,
+        });
+        assert!(fp8_block.is_fp8());
+        assert_eq!(fp8_block.bits(), 8);
+
+        let fp8_static = QuantConfig::Fp8(Fp8Config {
+            activation_scheme: Fp8ActivationScheme::Static,
+            weight_block_size: None,
+            is_checkpoint_fp8_serialized: false,
+        });
+        assert!(fp8_static.is_fp8());
     }
 
     // CUDA kernel tests — require GPU

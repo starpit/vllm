@@ -55,6 +55,9 @@ fn cuda_build() {
         "csrc/mla_kernels.cu",
         "csrc/dequant_gather_pages.cu",
         "csrc/fp8_scale_kernels.cu",
+        "csrc/fp8_quant_kernels.cu",
+        "csrc/fp8_block_dequant_kernels.cu",
+        "csrc/fp8_post_scale_kernels.cu",
     ];
     let vllm_watch = ["csrc/vec_utils.cuh", "csrc/fp8_utils.cuh"];
 
@@ -124,7 +127,10 @@ fn cuda_build() {
 
     println!("cargo:rustc-link-lib=static=marlin_kernels");
 
-    // 4. FlashAttention-2 paged kernels (vllm-project fork).
+    // 4. CUTLASS scaled_mm FP8 GEMM kernels (fused per-row scale epilogue).
+    build_cutlass_scaled_mm(&cache_str, &mut rerun_files);
+
+    // 5. FlashAttention-2 paged kernels (vllm-project fork).
     build_flash_attention(&cache_str, &mut rerun_files);
 
     // Emit rerun-if-changed for all tracked files so cargo skips the build
@@ -132,6 +138,44 @@ fn cuda_build() {
     for f in &rerun_files {
         println!("cargo:rerun-if-changed={}", f);
     }
+}
+
+#[cfg(feature = "cuda")]
+fn build_cutlass_scaled_mm(cache_dir: &str, rerun_files: &mut Vec<String>) {
+    // CUTLASS v4.2.1 commit — matches Python vLLM's CUTLASS version.
+    // Different from FlashAttention's CUTLASS (which uses the flash-attn fork).
+    const CUTLASS_COMMIT: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
+
+    let scaled_mm_sources = vec!["csrc/cutlass_scaled_mm/scaled_mm_c2x_sm89.cu".to_string()];
+    let scaled_mm_watch = [
+        "csrc/cutlass_scaled_mm/common.hpp",
+        "csrc/cutlass_scaled_mm/math.hpp",
+        "csrc/cutlass_scaled_mm/scaled_mm_c2x.cuh",
+        "csrc/cutlass_scaled_mm/scaled_mm_c2x_sm89_fp8_dispatch.cuh",
+        "csrc/cutlass_scaled_mm/scaled_mm_epilogues_c2x.hpp",
+        "csrc/cutlass_scaled_mm/broadcast_load_epilogue_c2x.hpp",
+    ];
+
+    rerun_files.extend(scaled_mm_sources.iter().cloned());
+    rerun_files.extend(scaled_mm_watch.iter().map(|s| s.to_string()));
+
+    cudaforge::KernelBuilder::new()
+        .out_dir(cache_dir)
+        .source_files(scaled_mm_sources)
+        .watch(scaled_mm_watch.iter().map(|s| s.to_string()))
+        .include_path("csrc/cutlass_scaled_mm")
+        .with_cutlass(Some(CUTLASS_COMMIT))
+        .arg("-std=c++17")
+        .arg("-O3")
+        .arg("--use_fast_math")
+        .arg("--expt-relaxed-constexpr")
+        .arg("--expt-extended-lambda")
+        .arg("-Xcompiler")
+        .arg("-fPIC")
+        .build_lib(format!("{}/libcutlass_scaled_mm.a", cache_dir))
+        .expect("Failed to build cutlass_scaled_mm");
+
+    println!("cargo:rustc-link-lib=static=cutlass_scaled_mm");
 }
 
 #[cfg(feature = "cuda")]

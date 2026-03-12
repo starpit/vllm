@@ -1301,6 +1301,54 @@ impl LlamaAttention {
             tp_group: None,
         })
     }
+
+    /// Load FP8 quantized attention with fused QKV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fp8(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        output_dtype: DType,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let num_q_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        let qkv = gpu_weights::load_fused_fp8_linear(
+            weights,
+            &[
+                format!("{prefix}.q_proj"),
+                format!("{prefix}.k_proj"),
+                format!("{prefix}.v_proj"),
+            ],
+            output_dtype,
+            stream,
+        )?;
+        let o = gpu_weights::load_fp8_linear(weights, &format!("{prefix}.o_proj"), output_dtype)?;
+
+        Ok(Self {
+            qkv_proj: LinearLayer::Fp8(Box::new(qkv)),
+            k_proj: None,
+            v_proj: None,
+            o_proj: LinearLayer::Fp8(Box::new(o)),
+            q_size,
+            kv_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            layer_idx,
+            q_norm_weight: None,
+            k_norm_weight: None,
+            qk_norm_eps: 0.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
 }
 
 impl LlamaMLP {
@@ -1344,6 +1392,33 @@ impl LlamaMLP {
             tp_group: None,
         })
     }
+
+    /// Load FP8 quantized MLP with fused gate+up.
+    pub fn load_fp8(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        intermediate_size: usize,
+        output_dtype: DType,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let gate_up = gpu_weights::load_fused_fp8_linear(
+            weights,
+            &[format!("{prefix}.gate_proj"), format!("{prefix}.up_proj")],
+            output_dtype,
+            stream,
+        )?;
+        let down =
+            gpu_weights::load_fp8_linear(weights, &format!("{prefix}.down_proj"), output_dtype)?;
+
+        Ok(Self {
+            gate_up_proj: LinearLayer::Fp8(Box::new(gate_up)),
+            up_proj: None,
+            down_proj: LinearLayer::Fp8(Box::new(down)),
+            intermediate_size,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
 }
 
 impl LlamaDecoderLayer {
@@ -1374,6 +1449,50 @@ impl LlamaDecoderLayer {
             qconfig,
             workspace,
             device,
+        )?;
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            residual_multiplier: 1.0,
+        })
+    }
+
+    /// Load an FP8 quantized decoder layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fp8(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        output_dtype: DType,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let self_attn = LlamaAttention::load_fp8(
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            output_dtype,
+            stream,
+        )?;
+        let mlp = LlamaMLP::load_fp8(
+            weights,
+            &format!("{prefix}.mlp"),
+            config.intermediate_size,
+            output_dtype,
+            stream,
         )?;
         let input_layernorm = RmsNorm::load(
             weights,
@@ -1547,6 +1666,65 @@ impl LlamaForCausalLM {
         };
 
         // lm_head is always dense (not quantized)
+        let lm_head = LinearLayer::Dense(if config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.weight, None)
+        } else {
+            Linear::load(weights, "lm_head")?
+        });
+
+        Ok(Self {
+            model,
+            lm_head,
+            logits_scaling: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+
+    /// Load an FP8 quantized model.
+    pub fn load_fp8(
+        weights: &mut GpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+            let layer = LlamaDecoderLayer::load_fp8(
+                weights,
+                &prefix,
+                config,
+                i,
+                dtype,
+                device.compute_stream,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                config.llama3_rope_scaling.as_ref(),
+                dtype,
+                device,
+            )?
+        };
+
+        let model = LlamaModel {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embedding_multiplier: 1.0,
+        };
+
+        // lm_head is always dense (not quantized) — matches Python.
         let lm_head = LinearLayer::Dense(if config.tie_word_embeddings {
             Linear::new(model.embed_tokens.weight, None)
         } else {

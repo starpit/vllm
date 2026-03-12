@@ -269,55 +269,35 @@ impl Gemma3Attention {
         let q_3d = q_flat_rope.reshape(&[num_tokens, self.num_q_heads, self.head_dim]);
         let k_3d = k_flat_rope.reshape(&[num_tokens, self.num_kv_heads, self.head_dim]);
 
-        kernels::reshape_and_cache(
+        crate::model::attention_helpers::write_kv_cache(
             k_3d,
             *v,
-            kv_cache.k_cache(self.layer_idx),
-            kv_cache.v_cache(self.layer_idx),
             slot_mapping,
-            kv_cache.block_size,
+            kv_cache,
+            self.layer_idx,
             device.compute_stream,
         );
 
         let window_left = self.sliding_window.map(|w| w as i32).unwrap_or(-1);
 
-        let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
-        let attn_output = if fresh_prefill {
-            kernels::flash_attn_contiguous(
-                q_3d,
-                k_3d,
-                *v,
-                cu_seqlens_q,
-                cu_seqlens_q,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.scale,
-                true,
-                0.0, // no softcap
-                window_left,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        } else {
-            kernels::flash_attn_paged_ext(
-                q_3d,
-                kv_cache.k_cache(self.layer_idx),
-                kv_cache.v_cache(self.layer_idx),
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.scale,
-                true,
-                0.0, // no softcap
-                window_left,
-                kv_cache.block_size,
-                device.num_sm,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
+        let attn_output = crate::model::attention_helpers::attention_ext(
+            q_3d,
+            k_3d,
+            *v,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            self.scale,
+            0.0,
+            window_left,
+            kv_cache,
+            self.layer_idx,
+            device.num_sm,
+            &mut device.caching,
+            device.compute_stream,
+        );
 
         let attn_flat = attn_output
             .into_gpu_tensor()
@@ -422,57 +402,37 @@ impl Gemma3Attention {
         let q_3d = q_flat_rope.reshape(&[num_tokens, self.num_q_heads, self.head_dim]);
         let k_3d = k_flat_rope.reshape(&[num_tokens, self.num_kv_heads, self.head_dim]);
 
-        kernels::reshape_and_cache(
+        crate::model::attention_helpers::write_kv_cache(
             k_3d,
             *v,
-            kv_cache.k_cache(self.layer_idx),
-            kv_cache.v_cache(self.layer_idx),
             slot_mapping,
-            kv_cache.block_size,
+            kv_cache,
+            self.layer_idx,
             device.compute_stream,
         );
 
         let window_left = self.sliding_window.map(|w| w as i32).unwrap_or(-1);
 
-        let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
-        let attn_output = if fresh_prefill {
-            kernels::flash_attn_contiguous(
-                q_3d,
-                k_3d,
-                *v,
-                cu_seqlens_q,
-                cu_seqlens_q,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.scale,
-                true,
-                0.0,
-                window_left,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        } else {
-            drop(k_normed);
-            drop(v);
-            kernels::flash_attn_paged_ext(
-                q_3d,
-                kv_cache.k_cache(self.layer_idx),
-                kv_cache.v_cache(self.layer_idx),
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.scale,
-                true,
-                0.0,
-                window_left,
-                kv_cache.block_size,
-                device.num_sm,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
+        let attn_output = crate::model::attention_helpers::attention_ext(
+            q_3d,
+            k_3d,
+            *v,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            self.scale,
+            0.0,
+            window_left,
+            kv_cache,
+            self.layer_idx,
+            device.num_sm,
+            &mut device.caching,
+            device.compute_stream,
+        );
+        drop(k_normed);
+        drop(v);
         drop(q_normed);
 
         let attn_flat = attn_output

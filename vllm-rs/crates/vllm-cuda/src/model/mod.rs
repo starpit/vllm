@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Model implementations using `GpuTensor` — no candle dependency.
 
+pub(crate) mod attention_helpers;
 pub mod commandr;
 pub mod deepseek_v2;
 pub mod gemma2;

@@ -445,58 +445,35 @@ impl Gemma2Attention {
             device.compute_stream,
         );
 
-        kernels::reshape_and_cache(
+        crate::model::attention_helpers::write_kv_cache(
             *k,
             *v,
-            kv_cache.k_cache(self.layer_idx),
-            kv_cache.v_cache(self.layer_idx),
             slot_mapping,
-            kv_cache.block_size,
+            kv_cache,
+            self.layer_idx,
             device.compute_stream,
         );
 
         let window_left = self.sliding_window.map(|w| w as i32).unwrap_or(-1);
 
-        // Fresh prefill: contiguous FA2.
-        // Decode / prefix-cached: paged FA2 reading from block cache.
-        let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
-        let attn_output = if fresh_prefill {
-            // Fresh prefill: Q lengths == K lengths, so cu_seqlens_q works for both.
-            kernels::flash_attn_contiguous(
-                *q,
-                *k,
-                *v,
-                cu_seqlens_q,
-                cu_seqlens_q, // Q==K for fresh prefill
-                max_seqlen_q,
-                max_seqlen_k,
-                self.scale,
-                true, // causal
-                self.attn_logit_softcapping,
-                window_left,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        } else {
-            kernels::flash_attn_paged_ext(
-                *q,
-                kv_cache.k_cache(self.layer_idx),
-                kv_cache.v_cache(self.layer_idx),
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.scale,
-                true, // causal
-                self.attn_logit_softcapping,
-                window_left,
-                kv_cache.block_size,
-                device.num_sm,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
+        let attn_output = crate::model::attention_helpers::attention_ext(
+            *q,
+            *k,
+            *v,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            self.scale,
+            self.attn_logit_softcapping,
+            window_left,
+            kv_cache,
+            self.layer_idx,
+            device.num_sm,
+            &mut device.caching,
+            device.compute_stream,
+        );
 
         let attn_flat = attn_output
             .into_gpu_tensor()
@@ -558,58 +535,38 @@ impl Gemma2Attention {
         );
         drop(qkv);
 
-        kernels::reshape_and_cache(
+        crate::model::attention_helpers::write_kv_cache(
             k.as_gpu_tensor(),
             v.as_gpu_tensor(),
-            kv_cache.k_cache(self.layer_idx),
-            kv_cache.v_cache(self.layer_idx),
             slot_mapping,
-            kv_cache.block_size,
+            kv_cache,
+            self.layer_idx,
             device.compute_stream,
         );
 
         let window_left = self.sliding_window.map(|w| w as i32).unwrap_or(-1);
 
-        let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
-        let attn_output = if fresh_prefill {
-            kernels::flash_attn_contiguous(
-                q.as_gpu_tensor(),
-                k.as_gpu_tensor(),
-                v.as_gpu_tensor(),
-                cu_seqlens_q,
-                cu_seqlens_q,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.scale,
-                true,
-                self.attn_logit_softcapping,
-                window_left,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        } else {
-            drop(k);
-            drop(v);
-            kernels::flash_attn_paged_ext(
-                q.as_gpu_tensor(),
-                kv_cache.k_cache(self.layer_idx),
-                kv_cache.v_cache(self.layer_idx),
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.scale,
-                true,
-                self.attn_logit_softcapping,
-                window_left,
-                kv_cache.block_size,
-                device.num_sm,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
+        let attn_output = crate::model::attention_helpers::attention_ext(
+            q.as_gpu_tensor(),
+            k.as_gpu_tensor(),
+            v.as_gpu_tensor(),
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            self.scale,
+            self.attn_logit_softcapping,
+            window_left,
+            kv_cache,
+            self.layer_idx,
+            device.num_sm,
+            &mut device.caching,
+            device.compute_stream,
+        );
         drop(q);
+        drop(k);
+        drop(v);
 
         let attn_flat = attn_output
             .as_gpu_tensor()

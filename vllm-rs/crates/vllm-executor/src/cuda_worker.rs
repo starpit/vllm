@@ -73,6 +73,10 @@ pub struct CudaWorkerConfig {
     pub gguf_file: Option<String>,
     /// Optional LoRA adapter path (local directory or HF repo ID).
     pub lora_adapter: Option<String>,
+    /// KV cache data type: "auto" (use model dtype) or "fp8_e4m3".
+    pub kv_cache_dtype: String,
+    /// Compute KV scales dynamically from the first forward pass.
+    pub calculate_kv_scales: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1504,6 +1508,15 @@ pub struct CudaWorker {
     gdn_state_pool: Option<vllm_cuda::model::qwen3_next::GdnStatePool>,
     /// Qwen3Next config (cached for GDN state pool allocation).
     qwen3_next_config: Option<vllm_cuda::model::qwen3_next::Qwen3NextConfig>,
+
+    /// True when KV cache uses FP8 E4M3 quantization.
+    kv_cache_is_fp8: bool,
+    /// Compute KV scales dynamically (one-shot: set false after first forward).
+    _calculate_kv_scales: bool,
+    /// K scale constant (from env or default 1.0).
+    _k_scale_constant: f32,
+    /// V scale constant (from env or default 1.0).
+    _v_scale_constant: f32,
 }
 
 unsafe impl Send for CudaWorker {}
@@ -1511,6 +1524,17 @@ unsafe impl Send for CudaWorker {}
 impl CudaWorker {
     pub fn new(config: CudaWorkerConfig) -> Self {
         let is_pooling = config.is_pooling;
+        let kv_cache_is_fp8 = config.kv_cache_dtype == "fp8_e4m3" || config.kv_cache_dtype == "fp8";
+        let calculate_kv_scales = config.calculate_kv_scales;
+        // Scale constants: match Python's defaults. Override via env vars.
+        let k_scale_constant = std::env::var("VLLM_FP8_K_SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0_f32);
+        let v_scale_constant = std::env::var("VLLM_FP8_V_SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0_f32);
         Self {
             config,
             device: None,
@@ -1547,6 +1571,10 @@ impl CudaWorker {
             seeded_rngs: HashMap::new(),
             gdn_state_pool: None,
             qwen3_next_config: None,
+            kv_cache_is_fp8,
+            _calculate_kv_scales: calculate_kv_scales,
+            _k_scale_constant: k_scale_constant,
+            _v_scale_constant: v_scale_constant,
         }
     }
 
@@ -3488,6 +3516,13 @@ impl Worker for CudaWorker {
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerInit("model not loaded".into()))?;
 
+        // Resolve KV cache dtype: FP8 E4M3 when configured, otherwise model dtype.
+        let kv_dtype = if self.kv_cache_is_fp8 {
+            GpuDType::Fp8E4m3
+        } else {
+            self.model_dtype
+        };
+
         let pool = unsafe {
             KvCachePool::new(
                 model.num_layers(),
@@ -3495,7 +3530,7 @@ impl Worker for CudaWorker {
                 self.config.block_size,
                 model.num_kv_heads(),
                 model.head_dim(),
-                self.model_dtype,
+                kv_dtype,
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("KvCachePool: {e}")))?;
@@ -3745,6 +3780,13 @@ impl Worker for CudaWorker {
 
         if self.qwen3_next_config.is_some() {
             info!("CudaWorker: Qwen3Next — skipping CUDA graph capture (GDN recurrent state)");
+            return Ok(());
+        }
+
+        if self.kv_cache_is_fp8 {
+            info!(
+                "CudaWorker: FP8 KV cache — skipping CUDA graph capture (variable scratch buffer sizes)"
+            );
             return Ok(());
         }
 

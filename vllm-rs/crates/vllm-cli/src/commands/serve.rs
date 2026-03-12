@@ -147,6 +147,8 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         enforce_eager: args.enforce_eager,
         max_num_batched_tokens: args.max_num_batched_tokens,
         cublas_autotune: args.cublas_autotune,
+        kv_cache_dtype: args.kv_cache_dtype.clone(),
+        calculate_kv_scales: args.calculate_kv_scales,
     };
 
     // Keep a clone for /server_info (before we move config into the blocking task).

@@ -966,55 +966,35 @@ impl Qwen3NextFullAttention {
             stream,
         );
 
-        // 6. Write K/V to paged cache.
-        kernels::reshape_and_cache(
+        // 6. Write K/V to paged cache (BF16→FP8 when FP8 cache).
+        crate::model::attention_helpers::write_kv_cache(
             k.as_gpu_tensor(),
             v.as_gpu_tensor(),
-            kv_cache.k_cache(kv_layer_idx),
-            kv_cache.v_cache(kv_layer_idx),
             slot_mapping,
-            kv_cache.block_size,
+            kv_cache,
+            kv_layer_idx,
             stream,
         );
 
         // 7. FlashAttention-2.
-        let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
-        let attn_output = if fresh_prefill {
-            kernels::flash_attn_contiguous(
-                q.as_gpu_tensor(),
-                k.as_gpu_tensor(),
-                v.as_gpu_tensor(),
-                cu_seqlens_q,
-                cu_seqlens_q,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.inner.scale,
-                true,
-                0.0,
-                -1,
-                &mut device.caching,
-                stream,
-            )
-        } else {
-            drop(k);
-            drop(v);
-            kernels::flash_attn_paged(
-                q.as_gpu_tensor(),
-                kv_cache.k_cache(kv_layer_idx),
-                kv_cache.v_cache(kv_layer_idx),
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.inner.scale,
-                true,
-                kv_cache.block_size,
-                device.num_sm,
-                &mut device.caching,
-                stream,
-            )
-        };
+        let attn_output = crate::model::attention_helpers::attention_standard(
+            q.as_gpu_tensor(),
+            k.as_gpu_tensor(),
+            v.as_gpu_tensor(),
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            self.inner.scale,
+            kv_cache,
+            kv_layer_idx,
+            device.num_sm,
+            &mut device.caching,
+            stream,
+        );
+        drop(k);
+        drop(v);
         drop(q);
 
         // 8. Output gating: sigmoid(gate) * attn_output.

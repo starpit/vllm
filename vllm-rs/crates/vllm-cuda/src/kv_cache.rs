@@ -14,6 +14,9 @@ use anyhow::Result;
 /// Allocates persistent GPU memory for K and V caches at init time.
 /// Block allocation/freeing is managed by the scheduler — this struct
 /// just provides the raw tensor views.
+///
+/// When `cache_dtype` is `Fp8E4m3`, the cache stores 1 byte/element and
+/// per-layer scale factors are maintained for quantization/dequantization.
 pub struct KvCachePool {
     /// K cache per layer: `[num_blocks, block_size, num_kv_heads, head_dim]`
     k_caches: Vec<GpuTensor>,
@@ -27,6 +30,12 @@ pub struct KvCachePool {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub num_layers: usize,
+    /// The dtype stored in cache (may differ from model dtype when FP8).
+    cache_dtype: DType,
+    /// Per-layer K scale: GPU f32 scalar pointers. Only used when FP8.
+    k_scale_ptrs: Vec<*mut f32>,
+    /// Per-layer V scale: GPU f32 scalar pointers. Only used when FP8.
+    v_scale_ptrs: Vec<*mut f32>,
 }
 
 unsafe impl Send for KvCachePool {}
@@ -52,6 +61,8 @@ impl KvCachePool {
         let mut v_caches = Vec::with_capacity(num_layers);
         let mut k_ptrs = Vec::with_capacity(num_layers);
         let mut v_ptrs = Vec::with_capacity(num_layers);
+        let mut k_scale_ptrs = Vec::new();
+        let mut v_scale_ptrs = Vec::new();
 
         let shape = [num_blocks, block_size, num_kv_heads, head_dim];
 
@@ -65,9 +76,40 @@ impl KvCachePool {
             v_ptrs.push(v_ptr);
         }
 
+        // Allocate per-layer scale factors for FP8 cache.
+        if dtype.is_fp8() {
+            for _ in 0..num_layers {
+                // Allocate GPU f32 scalars, initialized to 1.0.
+                let k_scale = driver::mem_alloc(4)? as *mut f32;
+                let v_scale = driver::mem_alloc(4)? as *mut f32;
+                let one: f32 = 1.0;
+                // Use null stream (synchronous) for init-time copy.
+                let null_stream = std::ptr::null_mut();
+                driver::memcpy_htod_async(
+                    k_scale as *mut u8,
+                    &one as *const f32 as *const u8,
+                    4,
+                    null_stream,
+                )?;
+                driver::memcpy_htod_async(
+                    v_scale as *mut u8,
+                    &one as *const f32 as *const u8,
+                    4,
+                    null_stream,
+                )?;
+                k_scale_ptrs.push(k_scale);
+                v_scale_ptrs.push(v_scale);
+            }
+        }
+
         let total_mb = (2 * num_layers * bytes_per_layer) as f64 / (1024.0 * 1024.0);
+        let dtype_label = if dtype.is_fp8() {
+            "FP8 E4M3"
+        } else {
+            &format!("{}", dtype)
+        };
         tracing::info!(
-            "KvCachePool: {num_layers} layers × {num_blocks} blocks × {block_size} slots = {total_mb:.0} MB"
+            "KvCachePool: {num_layers} layers × {num_blocks} blocks × {block_size} slots = {total_mb:.0} MB ({dtype_label})"
         );
 
         Ok(Self {
@@ -80,6 +122,9 @@ impl KvCachePool {
             num_kv_heads,
             head_dim,
             num_layers,
+            cache_dtype: dtype,
+            k_scale_ptrs,
+            v_scale_ptrs,
         })
     }
 
@@ -91,6 +136,74 @@ impl KvCachePool {
     /// Get V cache tensor for a layer.
     pub fn v_cache(&self, layer: usize) -> GpuTensor {
         self.v_caches[layer]
+    }
+
+    /// The dtype used for cache storage.
+    pub fn cache_dtype(&self) -> DType {
+        self.cache_dtype
+    }
+
+    /// Whether this pool stores FP8 data.
+    pub fn is_fp8(&self) -> bool {
+        self.cache_dtype.is_fp8()
+    }
+
+    /// GPU pointer to K scale for a layer (only valid when FP8).
+    pub fn k_scale_ptr(&self, layer: usize) -> *const f32 {
+        self.k_scale_ptrs[layer] as *const f32
+    }
+
+    /// GPU pointer to V scale for a layer (only valid when FP8).
+    pub fn v_scale_ptr(&self, layer: usize) -> *const f32 {
+        self.v_scale_ptrs[layer] as *const f32
+    }
+
+    /// Mutable GPU pointer to K scale for a layer (for writing computed scales).
+    pub fn k_scale_ptr_mut(&self, layer: usize) -> *mut f32 {
+        self.k_scale_ptrs[layer]
+    }
+
+    /// Mutable GPU pointer to V scale for a layer (for writing computed scales).
+    pub fn v_scale_ptr_mut(&self, layer: usize) -> *mut f32 {
+        self.v_scale_ptrs[layer]
+    }
+
+    /// Set K scale for a layer from a host value.
+    ///
+    /// # Safety
+    /// Requires valid CUDA context.
+    pub unsafe fn set_k_scale(
+        &self,
+        layer: usize,
+        val: f32,
+        stream: cudarc::driver::sys::CUstream,
+    ) {
+        driver::memcpy_htod_async(
+            self.k_scale_ptrs[layer] as *mut u8,
+            &val as *const f32 as *const u8,
+            4,
+            stream,
+        )
+        .expect("set_k_scale H2D");
+    }
+
+    /// Set V scale for a layer from a host value.
+    ///
+    /// # Safety
+    /// Requires valid CUDA context.
+    pub unsafe fn set_v_scale(
+        &self,
+        layer: usize,
+        val: f32,
+        stream: cudarc::driver::sys::CUstream,
+    ) {
+        driver::memcpy_htod_async(
+            self.v_scale_ptrs[layer] as *mut u8,
+            &val as *const f32 as *const u8,
+            4,
+            stream,
+        )
+        .expect("set_v_scale H2D");
     }
 
     /// Gather K or V from blocks into a contiguous `[total_tokens, kv_heads, head_dim]` tensor.
@@ -162,6 +275,12 @@ impl Drop for KvCachePool {
         for &ptr in self._k_ptrs.iter().chain(self._v_ptrs.iter()) {
             unsafe {
                 let _ = driver::mem_free(ptr);
+            }
+        }
+        // Free FP8 scale allocations.
+        for &ptr in self.k_scale_ptrs.iter().chain(self.v_scale_ptrs.iter()) {
+            unsafe {
+                let _ = driver::mem_free(ptr as *mut u8);
             }
         }
     }

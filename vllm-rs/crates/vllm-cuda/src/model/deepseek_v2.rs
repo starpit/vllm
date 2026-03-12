@@ -637,55 +637,35 @@ impl DeepSeekV2Attention {
         );
         drop(kv_b_out);
 
-        // Write K, V into paged cache
-        kernels::reshape_and_cache(
+        // Write K, V into paged cache (BF16→FP8 when FP8 cache).
+        crate::model::attention_helpers::write_kv_cache(
             k.as_gpu_tensor(),
             v.as_gpu_tensor(),
-            kv_cache.k_cache(self.layer_idx),
-            kv_cache.v_cache(self.layer_idx),
             slot_mapping,
-            kv_cache.block_size,
+            kv_cache,
+            self.layer_idx,
             stream,
         );
 
         // FlashAttention
-        let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
-        let attn_output = if fresh_prefill {
-            kernels::flash_attn_contiguous(
-                q,
-                k.as_gpu_tensor(),
-                v.as_gpu_tensor(),
-                cu_seqlens_q,
-                cu_seqlens_q,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.scale,
-                true,
-                0.0,
-                -1,
-                &mut device.caching,
-                stream,
-            )
-        } else {
-            drop(k);
-            drop(v);
-            kernels::flash_attn_paged(
-                q,
-                kv_cache.k_cache(self.layer_idx),
-                kv_cache.v_cache(self.layer_idx),
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.scale,
-                true,
-                kv_cache.block_size,
-                device.num_sm,
-                &mut device.caching,
-                stream,
-            )
-        };
+        let attn_output = crate::model::attention_helpers::attention_standard(
+            q,
+            k.as_gpu_tensor(),
+            v.as_gpu_tensor(),
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            self.scale,
+            kv_cache,
+            self.layer_idx,
+            device.num_sm,
+            &mut device.caching,
+            stream,
+        );
+        drop(k);
+        drop(v);
         drop(q_proj_out); // free Q buffer
 
         // attn_output is [num_tokens, num_heads, qk_head_dim]

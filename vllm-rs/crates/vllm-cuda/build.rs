@@ -53,8 +53,10 @@ fn cuda_build() {
         "csrc/gdn_recurrent_kernels.cu",
         "csrc/gdn_split_kernels.cu",
         "csrc/mla_kernels.cu",
+        "csrc/dequant_gather_pages.cu",
+        "csrc/fp8_scale_kernels.cu",
     ];
-    let vllm_watch = ["csrc/vec_utils.cuh"];
+    let vllm_watch = ["csrc/vec_utils.cuh", "csrc/fp8_utils.cuh"];
 
     rerun_files.extend(vllm_sources.iter().map(|s| s.to_string()));
     rerun_files.extend(vllm_watch.iter().map(|s| s.to_string()));

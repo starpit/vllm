@@ -228,6 +228,16 @@ pub struct ServeArgs {
     #[arg(long)]
     pub cublas_autotune: bool,
 
+    /// KV cache data type: "auto" (use model dtype) or "fp8_e4m3" (FP8).
+    /// FP8 halves KV cache memory, doubling capacity.
+    #[arg(long, default_value = "auto")]
+    pub kv_cache_dtype: String,
+
+    /// Compute KV scales dynamically from the first forward pass.
+    /// Only used with --kv-cache-dtype fp8_e4m3.
+    #[arg(long)]
+    pub calculate_kv_scales: bool,
+
     /// Target URL for OpenTelemetry traces (OTLP gRPC endpoint).
     /// Example: http://localhost:4317
     /// Requires building with --features otel.

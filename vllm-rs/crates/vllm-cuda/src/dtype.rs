@@ -12,17 +12,23 @@ pub enum DType {
     I64 = 4,
     I32 = 5,
     U8 = 6,
+    Fp8E4m3 = 7,
 }
 
 impl DType {
     /// Size in bytes of a single element.
     pub const fn size_bytes(self) -> usize {
         match self {
-            DType::U8 => 1,
+            DType::U8 | DType::Fp8E4m3 => 1,
             DType::F16 | DType::BF16 => 2,
             DType::F32 | DType::U32 | DType::I32 => 4,
             DType::I64 => 8,
         }
+    }
+
+    /// Returns true if this is an FP8 type.
+    pub const fn is_fp8(self) -> bool {
+        matches!(self, DType::Fp8E4m3)
     }
 }
 
@@ -36,6 +42,7 @@ impl std::fmt::Display for DType {
             DType::I32 => write!(f, "i32"),
             DType::I64 => write!(f, "i64"),
             DType::U8 => write!(f, "u8"),
+            DType::Fp8E4m3 => write!(f, "fp8_e4m3"),
         }
     }
 }
@@ -81,6 +88,19 @@ mod tests {
     }
 
     #[test]
+    fn test_size_bytes_fp8e4m3() {
+        assert_eq!(DType::Fp8E4m3.size_bytes(), 1);
+    }
+
+    #[test]
+    fn test_is_fp8() {
+        assert!(DType::Fp8E4m3.is_fp8());
+        assert!(!DType::BF16.is_fp8());
+        assert!(!DType::F16.is_fp8());
+        assert!(!DType::F32.is_fp8());
+    }
+
+    #[test]
     fn test_display() {
         assert_eq!(format!("{}", DType::F16), "f16");
         assert_eq!(format!("{}", DType::BF16), "bf16");
@@ -89,6 +109,7 @@ mod tests {
         assert_eq!(format!("{}", DType::I32), "i32");
         assert_eq!(format!("{}", DType::I64), "i64");
         assert_eq!(format!("{}", DType::U8), "u8");
+        assert_eq!(format!("{}", DType::Fp8E4m3), "fp8_e4m3");
     }
 
     #[test]
@@ -123,7 +144,8 @@ mod tests {
         set.insert(DType::I32);
         set.insert(DType::I64);
         set.insert(DType::U8);
-        assert_eq!(set.len(), 7);
+        set.insert(DType::Fp8E4m3);
+        assert_eq!(set.len(), 8);
     }
 
     #[test]
@@ -144,6 +166,7 @@ mod tests {
         assert_eq!(DType::I64 as u8, 4);
         assert_eq!(DType::I32 as u8, 5);
         assert_eq!(DType::U8 as u8, 6);
+        assert_eq!(DType::Fp8E4m3 as u8, 7);
     }
 
     #[test]

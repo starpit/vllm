@@ -1936,6 +1936,219 @@ pub unsafe fn reshape_and_cache(
 }
 
 // ---------------------------------------------------------------------------
+// FP8 KV Cache: reshape_and_cache + dequant_gather + scale computation
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn reshape_and_cache_fp8_bf16(
+        key: *const u16,
+        value: *const u16,
+        key_cache: *mut u8,
+        value_cache: *mut u8,
+        slot_mapping: *const i64,
+        k_scale: *const f32,
+        v_scale: *const f32,
+        num_tokens: i32,
+        num_heads: i32,
+        head_dim: i32,
+        block_size: i32,
+        stream: CUstream,
+    );
+    fn reshape_and_cache_fp8_f16(
+        key: *const u16,
+        value: *const u16,
+        key_cache: *mut u8,
+        value_cache: *mut u8,
+        slot_mapping: *const i64,
+        k_scale: *const f32,
+        v_scale: *const f32,
+        num_tokens: i32,
+        num_heads: i32,
+        head_dim: i32,
+        block_size: i32,
+        stream: CUstream,
+    );
+    fn dequant_gather_pages_bf16(
+        cache: *const u8,
+        block_table: *const i32,
+        cu_seqlens_k: *const i32,
+        scale: f32,
+        total_kv_tokens: i32,
+        num_heads: i32,
+        head_dim: i32,
+        block_size: i32,
+        max_pages_per_seq: i32,
+        batch_size: i32,
+        output: *mut u16,
+        stream: CUstream,
+    );
+    fn dequant_gather_pages_f16(
+        cache: *const u8,
+        block_table: *const i32,
+        cu_seqlens_k: *const i32,
+        scale: f32,
+        total_kv_tokens: i32,
+        num_heads: i32,
+        head_dim: i32,
+        block_size: i32,
+        max_pages_per_seq: i32,
+        batch_size: i32,
+        output: *mut u16,
+        stream: CUstream,
+    );
+    fn compute_abs_max_and_scale_bf16(
+        tensor: *const u16,
+        num_elements: i32,
+        divisor: f32,
+        scale_out: *mut f32,
+        stream: CUstream,
+    );
+}
+
+/// Write BF16/F16 K/V tokens into an FP8 E4M3 paged KV cache.
+///
+/// * `key`, `value`: `[num_tokens, num_kv_heads, head_dim]` (BF16 or F16)
+/// * `key_cache`, `value_cache`: `[num_blocks, block_size, num_kv_heads, head_dim]` (FP8)
+/// * `k_scale`, `v_scale`: GPU f32 scalar pointers
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn reshape_and_cache_fp8(
+    key: GpuTensor,
+    value: GpuTensor,
+    key_cache: GpuTensor,
+    value_cache: GpuTensor,
+    slot_mapping: GpuTensor,
+    k_scale: *const f32,
+    v_scale: *const f32,
+    block_size: usize,
+    stream: CUstream,
+) {
+    let num_tokens = key.dim(0) as i32;
+    let num_heads = key.dim(1) as i32;
+    let head_dim = key.dim(2) as i32;
+    let bs = block_size as i32;
+
+    match key.dtype() {
+        DType::BF16 => reshape_and_cache_fp8_bf16(
+            key.as_ptr(),
+            value.as_ptr(),
+            key_cache.as_mut_ptr(),
+            value_cache.as_mut_ptr(),
+            slot_mapping.as_ptr(),
+            k_scale,
+            v_scale,
+            num_tokens,
+            num_heads,
+            head_dim,
+            bs,
+            stream,
+        ),
+        DType::F16 => reshape_and_cache_fp8_f16(
+            key.as_ptr(),
+            value.as_ptr(),
+            key_cache.as_mut_ptr(),
+            value_cache.as_mut_ptr(),
+            slot_mapping.as_ptr(),
+            k_scale,
+            v_scale,
+            num_tokens,
+            num_heads,
+            head_dim,
+            bs,
+            stream,
+        ),
+        _ => panic!(
+            "reshape_and_cache_fp8: input must be BF16 or F16, got {:?}",
+            key.dtype()
+        ),
+    }
+}
+
+/// Dequantize FP8 pages from KV cache into a contiguous BF16/F16 tensor.
+///
+/// * `cache`: `[num_blocks, block_size, num_heads, head_dim]` (FP8)
+/// * `block_table`: `[batch_size, max_pages_per_seq]` (I32) on GPU
+/// * `cu_seqlens_k`: `[batch_size + 1]` (I32) prefix sum on GPU
+/// * `scale`: scale factor (host float)
+/// * Returns: `[total_kv_tokens, num_heads, head_dim]` in `output_dtype`
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dequant_gather_pages(
+    cache: GpuTensor,
+    block_table: GpuTensor,
+    cu_seqlens_k: GpuTensor,
+    scale: f32,
+    total_kv_tokens: usize,
+    num_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    output_dtype: DType,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let out = alloc.alloc_tensor(&[total_kv_tokens, num_heads, head_dim], output_dtype);
+    let batch_size = cu_seqlens_k.dim(0) - 1;
+    let max_pages = block_table.dim(1);
+
+    match output_dtype {
+        DType::BF16 => dequant_gather_pages_bf16(
+            cache.raw_ptr() as *const u8,
+            block_table.as_ptr(),
+            cu_seqlens_k.as_ptr(),
+            scale,
+            total_kv_tokens as i32,
+            num_heads as i32,
+            head_dim as i32,
+            block_size as i32,
+            max_pages as i32,
+            batch_size as i32,
+            out.as_gpu_tensor().as_mut_ptr(),
+            stream,
+        ),
+        DType::F16 => dequant_gather_pages_f16(
+            cache.raw_ptr() as *const u8,
+            block_table.as_ptr(),
+            cu_seqlens_k.as_ptr(),
+            scale,
+            total_kv_tokens as i32,
+            num_heads as i32,
+            head_dim as i32,
+            block_size as i32,
+            max_pages as i32,
+            batch_size as i32,
+            out.as_gpu_tensor().as_mut_ptr(),
+            stream,
+        ),
+        _ => panic!(
+            "dequant_gather_pages: output must be BF16 or F16, got {:?}",
+            output_dtype
+        ),
+    }
+
+    out
+}
+
+/// Compute the abs-max of a BF16 tensor and write `scale = abs_max / divisor`.
+///
+/// * `tensor`: flat BF16 data on GPU
+/// * `num_elements`: total number of BF16 elements
+/// * `divisor`: FP8 E4M3 max (448.0) or user-provided constant
+/// * `scale_out`: GPU f32 scalar — will contain the computed scale
+pub unsafe fn compute_kv_scale(
+    tensor: GpuTensor,
+    num_elements: usize,
+    divisor: f32,
+    scale_out: *mut f32,
+    stream: CUstream,
+) {
+    compute_abs_max_and_scale_bf16(
+        tensor.as_ptr(),
+        num_elements as i32,
+        divisor,
+        scale_out,
+        stream,
+    );
+}
+
+// ---------------------------------------------------------------------------
 // FlashAttention-2 Paged (raw FFI — no candle dependency)
 // ---------------------------------------------------------------------------
 
@@ -6628,6 +6841,463 @@ mod tests_gdn {
                 "state[1,1]={}, expected 2.0",
                 state[hk + 1]
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP8 KV cache kernel tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod tests_fp8_kv {
+    use super::*;
+    use crate::driver;
+
+    type CUstream = cudarc::driver::sys::CUstream;
+
+    unsafe fn test_init() -> (CachingAllocator, CUstream) {
+        driver::init().expect("CUDA init");
+        let dev = driver::device_get(0).expect("device 0");
+        let _ctx = driver::ctx_create(dev).expect("ctx_create");
+        let stream = driver::stream_create().expect("stream_create");
+        let alloc = CachingAllocator::new();
+        (alloc, stream)
+    }
+
+    unsafe fn upload_bf16(data: &[u16], stream: CUstream) -> *mut u8 {
+        let bytes = data.len() * 2;
+        let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("H2D");
+        ptr
+    }
+
+    unsafe fn upload_i64(data: &[i64], stream: CUstream) -> *mut u8 {
+        let bytes = data.len() * 8;
+        let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("H2D");
+        ptr
+    }
+
+    unsafe fn upload_f32(data: &[f32], stream: CUstream) -> *mut u8 {
+        let bytes = data.len() * 4;
+        let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("H2D");
+        ptr
+    }
+
+    unsafe fn upload_i32(data: &[i32], stream: CUstream) -> *mut u8 {
+        let bytes = data.len() * 4;
+        let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("H2D");
+        ptr
+    }
+
+    fn f32_to_bf16(val: f32) -> u16 {
+        half::bf16::from_f32(val).to_bits()
+    }
+
+    fn bf16_to_f32(bits: u16) -> f32 {
+        half::bf16::from_bits(bits).to_f32()
+    }
+
+    /// Write BF16 → FP8 cache → dequant_gather → compare to original.
+    /// Max error ≤ FP8 quantization step (~0.03 for values near 1.0).
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_fp8_reshape_round_trip() {
+        unsafe {
+            let (mut alloc, stream) = test_init();
+
+            let num_tokens = 2;
+            let num_heads = 2;
+            let head_dim = 8;
+            let block_size = 16;
+            let num_blocks = 1;
+
+            // BF16 input: values in range [-2, 2]
+            let input_f32: Vec<f32> = (0..num_tokens * num_heads * head_dim)
+                .map(|i| (i as f32 - 16.0) * 0.125) // range [-2, 1.875]
+                .collect();
+            let input_bf16: Vec<u16> = input_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+            let key_ptr = upload_bf16(&input_bf16, stream);
+            let value_ptr = upload_bf16(&input_bf16, stream);
+            let key = GpuTensor::new(key_ptr, &[num_tokens, num_heads, head_dim], DType::BF16);
+            let value = GpuTensor::new(value_ptr, &[num_tokens, num_heads, head_dim], DType::BF16);
+
+            // FP8 cache
+            let cache_elems = num_blocks * block_size * num_heads * head_dim;
+            let k_cache_ptr = driver::mem_alloc(cache_elems).expect("alloc k_cache");
+            let v_cache_ptr = driver::mem_alloc(cache_elems).expect("alloc v_cache");
+            let k_cache = GpuTensor::new(
+                k_cache_ptr,
+                &[num_blocks, block_size, num_heads, head_dim],
+                DType::Fp8E4m3,
+            );
+            let v_cache = GpuTensor::new(
+                v_cache_ptr,
+                &[num_blocks, block_size, num_heads, head_dim],
+                DType::Fp8E4m3,
+            );
+
+            // Scale = 1.0 (on GPU)
+            let scale_ptr = upload_f32(&[1.0_f32], stream);
+
+            // Slot mapping: tokens go to slots 0, 1
+            let slots = [0i64, 1];
+            let slot_ptr = upload_i64(&slots, stream);
+            let slot_mapping = GpuTensor::new(slot_ptr, &[num_tokens], DType::I64);
+
+            // Write BF16 → FP8 cache
+            reshape_and_cache_fp8(
+                key,
+                value,
+                k_cache,
+                v_cache,
+                slot_mapping,
+                scale_ptr as *const f32,
+                scale_ptr as *const f32,
+                block_size,
+                stream,
+            );
+
+            // Dequant+gather K from FP8 cache
+            let block_table_data = [0i32]; // single block
+            let block_table_ptr = upload_i32(&block_table_data, stream);
+            let block_table = GpuTensor::new(block_table_ptr, &[1, 1], DType::I32);
+
+            let cu_seqlens = [0i32, num_tokens as i32];
+            let cu_seqlens_ptr = upload_i32(&cu_seqlens, stream);
+            let cu_seqlens_t = GpuTensor::new(cu_seqlens_ptr, &[2], DType::I32);
+
+            let k_out = dequant_gather_pages(
+                k_cache,
+                block_table,
+                cu_seqlens_t,
+                1.0,
+                num_tokens,
+                num_heads,
+                head_dim,
+                block_size,
+                DType::BF16,
+                &mut alloc,
+                stream,
+            );
+
+            // D2H and compare
+            let out_bytes = num_tokens * num_heads * head_dim * 2;
+            let mut out_bf16 = vec![0u16; num_tokens * num_heads * head_dim];
+            driver::memcpy_dtoh_async(
+                out_bf16.as_mut_ptr() as *mut u8,
+                k_out.as_gpu_tensor().raw_ptr() as *const u8,
+                out_bytes,
+                stream,
+            )
+            .expect("D2H");
+            driver::stream_synchronize(stream).expect("sync");
+
+            for i in 0..input_f32.len() {
+                let original = input_f32[i];
+                let recovered = bf16_to_f32(out_bf16[i]);
+                let err = (original - recovered).abs();
+                // FP8 E4M3 has ~0.03 precision for values near 1.0, worse for larger values
+                let tolerance = original.abs() * 0.15 + 0.05; // relative + absolute tolerance
+                assert!(
+                    err <= tolerance,
+                    "element {i}: original={original}, recovered={recovered}, err={err}, tol={tolerance}"
+                );
+            }
+        }
+    }
+
+    /// Verify that slot=-1 (padding) doesn't corrupt the FP8 cache.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_fp8_reshape_slot_neg1_skipped() {
+        unsafe {
+            let (_alloc, stream) = test_init();
+
+            let num_tokens = 2;
+            let num_heads = 1;
+            let head_dim = 8;
+            let block_size = 16;
+            let num_blocks = 1;
+            let n_elems = num_heads * head_dim;
+
+            // Fill cache with 0xFF sentinel
+            let cache_bytes = num_blocks * block_size * n_elems;
+            let k_cache_ptr = driver::mem_alloc(cache_bytes).expect("alloc");
+            let sentinel = vec![0xFFu8; cache_bytes];
+            driver::memcpy_htod_async(k_cache_ptr, sentinel.as_ptr(), cache_bytes, stream)
+                .expect("H2D");
+            let v_cache_ptr = driver::mem_alloc(cache_bytes).expect("alloc");
+            driver::memcpy_htod_async(v_cache_ptr, sentinel.as_ptr(), cache_bytes, stream)
+                .expect("H2D");
+
+            let k_cache = GpuTensor::new(
+                k_cache_ptr,
+                &[num_blocks, block_size, num_heads, head_dim],
+                DType::Fp8E4m3,
+            );
+            let v_cache = GpuTensor::new(
+                v_cache_ptr,
+                &[num_blocks, block_size, num_heads, head_dim],
+                DType::Fp8E4m3,
+            );
+
+            // Input data
+            let input_bf16: Vec<u16> = (0..num_tokens * n_elems)
+                .map(|_| f32_to_bf16(1.0))
+                .collect();
+            let key_ptr = upload_bf16(&input_bf16, stream);
+            let value_ptr = upload_bf16(&input_bf16, stream);
+            let key = GpuTensor::new(key_ptr, &[num_tokens, num_heads, head_dim], DType::BF16);
+            let value = GpuTensor::new(value_ptr, &[num_tokens, num_heads, head_dim], DType::BF16);
+
+            // Slot mapping: first token → slot 0, second → slot -1 (padding)
+            let slots = [0i64, -1i64];
+            let slot_ptr = upload_i64(&slots, stream);
+            let slot_mapping = GpuTensor::new(slot_ptr, &[num_tokens], DType::I64);
+
+            let scale_ptr = upload_f32(&[1.0_f32], stream);
+
+            reshape_and_cache_fp8(
+                key,
+                value,
+                k_cache,
+                v_cache,
+                slot_mapping,
+                scale_ptr as *const f32,
+                scale_ptr as *const f32,
+                block_size,
+                stream,
+            );
+
+            // Verify: slot 0 was written (not sentinel), slot 1 is still sentinel
+            let mut cache_host = vec![0u8; cache_bytes];
+            driver::memcpy_dtoh_async(
+                cache_host.as_mut_ptr(),
+                k_cache_ptr as *const u8,
+                cache_bytes,
+                stream,
+            )
+            .expect("D2H");
+            driver::stream_synchronize(stream).expect("sync");
+
+            // Slot 0 (first n_elems bytes) should NOT be all 0xFF
+            let slot0_all_ff = cache_host[..n_elems].iter().all(|&b| b == 0xFF);
+            assert!(!slot0_all_ff, "slot 0 should have been written");
+
+            // Slot 1 (next n_elems bytes) should still be all 0xFF (padding skipped)
+            let slot1_all_ff = cache_host[n_elems..2 * n_elems].iter().all(|&b| b == 0xFF);
+            assert!(
+                slot1_all_ff,
+                "slot 1 (padding) should not have been written"
+            );
+        }
+    }
+
+    /// Verify KvCachePool FP8 allocates half the memory of BF16.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_kv_pool_fp8_half_memory() {
+        unsafe {
+            let (_alloc, _stream) = test_init();
+
+            let num_layers = 2;
+            let num_blocks = 64;
+            let block_size = 16;
+            let num_kv_heads = 4;
+            let head_dim = 64;
+
+            let fp8_pool = crate::kv_cache::KvCachePool::new(
+                num_layers,
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                head_dim,
+                DType::Fp8E4m3,
+            )
+            .expect("FP8 pool");
+
+            assert!(fp8_pool.is_fp8());
+            assert_eq!(fp8_pool.cache_dtype(), DType::Fp8E4m3);
+
+            // Verify we can access scale pointers
+            let k_scale = fp8_pool.k_scale_ptr(0);
+            assert!(!k_scale.is_null());
+
+            // Read back default scale — should be 1.0
+            let mut scale_val: f32 = 0.0;
+            driver::memcpy_dtoh_async(
+                &mut scale_val as *mut f32 as *mut u8,
+                k_scale as *const u8,
+                4,
+                _stream,
+            )
+            .expect("D2H scale");
+            driver::stream_synchronize(_stream).expect("sync");
+            assert_eq!(scale_val, 1.0, "default K scale should be 1.0");
+        }
+    }
+
+    /// Test compute_abs_max_and_scale: tensor with known max.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_compute_kv_scale() {
+        unsafe {
+            let (_alloc, stream) = test_init();
+
+            // BF16 tensor with max abs value = 1000.0
+            let data: Vec<u16> = vec![
+                f32_to_bf16(100.0),
+                f32_to_bf16(-500.0),
+                f32_to_bf16(1000.0),
+                f32_to_bf16(0.1),
+                f32_to_bf16(-200.0),
+                f32_to_bf16(50.0),
+                f32_to_bf16(0.0),
+                f32_to_bf16(-1000.0),
+            ];
+            let tensor_ptr = upload_bf16(&data, stream);
+            let tensor = GpuTensor::new(tensor_ptr, &[8], DType::BF16);
+
+            let scale_ptr = driver::mem_alloc(4).expect("alloc scale") as *mut f32;
+
+            // divisor = 200.0, so scale = 1000.0 / 200.0 = 5.0
+            compute_kv_scale(tensor, 8, 200.0, scale_ptr, stream);
+
+            let mut scale_val: f32 = 0.0;
+            driver::memcpy_dtoh_async(
+                &mut scale_val as *mut f32 as *mut u8,
+                scale_ptr as *const u8,
+                4,
+                stream,
+            )
+            .expect("D2H");
+            driver::stream_synchronize(stream).expect("sync");
+
+            assert!(
+                (scale_val - 5.0).abs() < 0.1,
+                "expected scale ≈ 5.0, got {scale_val}"
+            );
+        }
+    }
+
+    /// Dequant+gather with multiple sequences of different lengths.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_dequant_gather_multi_seq() {
+        unsafe {
+            let (mut alloc, stream) = test_init();
+
+            let num_heads = 1;
+            let head_dim = 8;
+            let block_size = 4;
+            let num_blocks = 4;
+            let n_elems = num_heads * head_dim;
+
+            // Allocate FP8 cache and fill with known values.
+            let cache_bytes = num_blocks * block_size * n_elems;
+            let cache_ptr = driver::mem_alloc(cache_bytes).expect("alloc");
+
+            // Fill each slot with its slot index cast to FP8 (via BF16→FP8 on host)
+            // For simplicity, fill the entire cache with a known byte pattern.
+            // FP8 E4M3: 0x38 = 1.0, 0x3C = 1.5, 0x40 = 2.0, 0x00 = 0.0
+            let mut cache_data = vec![0u8; cache_bytes];
+            for i in 0..cache_bytes {
+                cache_data[i] = 0x38; // 1.0 in FP8 E4M3
+            }
+            driver::memcpy_htod_async(cache_ptr, cache_data.as_ptr(), cache_bytes, stream)
+                .expect("H2D cache");
+            let cache = GpuTensor::new(
+                cache_ptr,
+                &[num_blocks, block_size, num_heads, head_dim],
+                DType::Fp8E4m3,
+            );
+
+            // Two sequences: seq0 has 3 tokens, seq1 has 2 tokens.
+            // Block table: seq0 uses block 0, seq1 uses block 1.
+            let block_table_data = [0i32, 0, 1, 0]; // [2, 2] padded
+            let block_table_ptr = upload_i32(&block_table_data, stream);
+            let block_table = GpuTensor::new(block_table_ptr, &[2, 2], DType::I32);
+
+            let cu_seqlens = [0i32, 3, 5]; // seq0: 3 tokens, seq1: 2 tokens
+            let cu_seqlens_ptr = upload_i32(&cu_seqlens, stream);
+            let cu_seqlens_t = GpuTensor::new(cu_seqlens_ptr, &[3], DType::I32);
+
+            let total_kv = 5;
+            let out = dequant_gather_pages(
+                cache,
+                block_table,
+                cu_seqlens_t,
+                1.0, // scale
+                total_kv,
+                num_heads,
+                head_dim,
+                block_size,
+                DType::BF16,
+                &mut alloc,
+                stream,
+            );
+
+            // All values should dequant to ~1.0
+            let out_count = total_kv * n_elems;
+            let mut out_bf16 = vec![0u16; out_count];
+            driver::memcpy_dtoh_async(
+                out_bf16.as_mut_ptr() as *mut u8,
+                out.as_gpu_tensor().raw_ptr() as *const u8,
+                out_count * 2,
+                stream,
+            )
+            .expect("D2H");
+            driver::stream_synchronize(stream).expect("sync");
+
+            for i in 0..out_count {
+                let val = bf16_to_f32(out_bf16[i]);
+                assert!(
+                    (val - 1.0).abs() < 0.1,
+                    "element {i}: expected ~1.0, got {val}"
+                );
+            }
+        }
+    }
+
+    /// Set K/V scale on pool and verify via D2H.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_kv_pool_fp8_set_scale() {
+        unsafe {
+            let (_alloc, stream) = test_init();
+
+            let pool = crate::kv_cache::KvCachePool::new(1, 16, 16, 2, 64, DType::Fp8E4m3)
+                .expect("FP8 pool");
+
+            pool.set_k_scale(0, 3.14, stream);
+            pool.set_v_scale(0, 2.71, stream);
+
+            let mut k_scale: f32 = 0.0;
+            let mut v_scale: f32 = 0.0;
+            driver::memcpy_dtoh_async(
+                &mut k_scale as *mut f32 as *mut u8,
+                pool.k_scale_ptr(0) as *const u8,
+                4,
+                stream,
+            )
+            .expect("D2H k_scale");
+            driver::memcpy_dtoh_async(
+                &mut v_scale as *mut f32 as *mut u8,
+                pool.v_scale_ptr(0) as *const u8,
+                4,
+                stream,
+            )
+            .expect("D2H v_scale");
+            driver::stream_synchronize(stream).expect("sync");
+
+            assert!((k_scale - 3.14).abs() < 0.001, "k_scale={k_scale}");
+            assert!((v_scale - 2.71).abs() < 0.001, "v_scale={v_scale}");
         }
     }
 }

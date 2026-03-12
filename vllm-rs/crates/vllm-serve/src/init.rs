@@ -95,6 +95,10 @@ pub struct VllmConfig {
     pub max_num_batched_tokens: Option<usize>,
     /// Benchmark cublasLt algorithms during warmup.
     pub cublas_autotune: bool,
+    /// KV cache data type: "auto" (use model dtype) or "fp8_e4m3".
+    pub kv_cache_dtype: String,
+    /// Compute KV scales dynamically from the first forward pass.
+    pub calculate_kv_scales: bool,
 }
 
 impl Default for VllmConfig {
@@ -127,6 +131,8 @@ impl Default for VllmConfig {
             enforce_eager: true,          // TODO: debug multi-turn — disable CUDA graphs to isolate
             max_num_batched_tokens: None,
             cublas_autotune: false,
+            kv_cache_dtype: "auto".to_string(),
+            calculate_kv_scales: false,
         }
     }
 }
@@ -258,6 +264,8 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             tp_world_size: 1,
             gguf_file: config.gguf_file.clone(),
             lora_adapter: config.lora_adapter.clone(),
+            kv_cache_dtype: config.kv_cache_dtype.clone(),
+            calculate_kv_scales: config.calculate_kv_scales,
         };
 
         let mut worker = CudaWorker::new(cuda_config);
@@ -297,6 +305,7 @@ fn init_cache(
     model_dtype: DType,
     gpu_memory_utilization: f64,
     device: &str,
+    kv_cache_dtype: &str,
 ) -> Result<(Box<dyn Worker>, usize, usize, f64)> {
     let available_memory = worker
         .determine_available_memory()
@@ -335,6 +344,7 @@ fn init_cache(
         hf_config,
         model_dtype,
         utilization,
+        kv_cache_dtype,
     );
     worker
         .initialize_cache(num_gpu_blocks, 0)
@@ -386,6 +396,7 @@ fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
         model_dtype,
         config.gpu_memory_utilization,
         &config.device,
+        &config.kv_cache_dtype,
     )?;
 
     info!(
@@ -721,6 +732,8 @@ fn initialize_stack_tp(
                 tp_world_size: tp_size,
                 gguf_file: config.gguf_file.clone(),
                 lora_adapter: config.lora_adapter.clone(),
+                kv_cache_dtype: config.kv_cache_dtype.clone(),
+                calculate_kv_scales: config.calculate_kv_scales,
             })
             .collect();
 
@@ -835,6 +848,7 @@ fn initialize_stack_tp(
             &hf_config,
             model_dtype,
             config.gpu_memory_utilization,
+            &config.kv_cache_dtype,
         );
 
         // initialize_cache doesn't run forwards, safe to call sequentially.
@@ -1449,6 +1463,7 @@ fn compute_num_blocks(
     hf_config: &HfModelConfig,
     dtype: DType,
     _gpu_memory_utilization: f64,
+    kv_cache_dtype: &str,
 ) -> usize {
     let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
     let num_kv_heads = hf_config.num_kv_heads().unwrap_or(0);
@@ -1456,7 +1471,12 @@ fn compute_num_blocks(
 
     // Each block holds block_size tokens of KV for all layers.
     // KV per token per layer = 2 * num_kv_heads * head_dim * sizeof(dtype)
-    let elem_bytes = vllm_model::tensor::dtype_size(dtype);
+    // FP8 KV cache stores 1 byte/element instead of 2 (BF16), doubling capacity.
+    let elem_bytes = if kv_cache_dtype == "fp8_e4m3" || kv_cache_dtype == "fp8" {
+        1
+    } else {
+        vllm_model::tensor::dtype_size(dtype)
+    };
     let bytes_per_token_per_layer = 2 * num_kv_heads * head_dim * elem_bytes;
     let bytes_per_block = block_size * num_layers * bytes_per_token_per_layer;
 
@@ -1517,7 +1537,8 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F32, 0.9);
+        let blocks =
+            compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F32, 0.9, "auto");
         assert!(blocks >= 16);
     }
 
@@ -1531,8 +1552,10 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks_f32 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F32, 0.9);
-        let blocks_f16 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9);
+        let blocks_f32 =
+            compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F32, 0.9, "auto");
+        let blocks_f16 =
+            compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9, "auto");
         assert!(blocks_f16 > blocks_f32);
         // F16 should give approximately 2x the blocks.
         assert!((blocks_f16 as f64 / blocks_f32 as f64 - 2.0).abs() < 0.1);
@@ -1541,7 +1564,7 @@ mod tests {
     #[test]
     fn test_compute_num_blocks_zero_dim() {
         let config = HfModelConfig::default();
-        let blocks = compute_num_blocks(1024, 16, &config, DType::F32, 0.9);
+        let blocks = compute_num_blocks(1024, 16, &config, DType::F32, 0.9, "auto");
         // Should fall back to 1024.
         assert_eq!(blocks, 1024);
     }
@@ -1558,8 +1581,10 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks_full = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9);
-        let blocks_half = compute_num_blocks(2 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9);
+        let blocks_full =
+            compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9, "auto");
+        let blocks_half =
+            compute_num_blocks(2 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9, "auto");
         let ratio = blocks_half as f64 / blocks_full as f64;
         assert!((ratio - 0.5).abs() < 0.01, "ratio was {ratio}");
     }

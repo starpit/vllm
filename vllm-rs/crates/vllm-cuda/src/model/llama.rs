@@ -549,56 +549,36 @@ impl LlamaAttention {
                 result
             };
 
-        // Write new K/V into paged cache (reads from k, v).
-        kernels::reshape_and_cache(
+        // Write new K/V into paged cache (BF16→FP8 when FP8 cache, else direct copy).
+        crate::model::attention_helpers::write_kv_cache(
             k.as_gpu_tensor(),
             v.as_gpu_tensor(),
-            kv_cache.k_cache(self.layer_idx),
-            kv_cache.v_cache(self.layer_idx),
             slot_mapping,
-            kv_cache.block_size,
+            kv_cache,
+            self.layer_idx,
             device.compute_stream,
         );
 
-        let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
-        let attn_output = if fresh_prefill {
-            kernels::flash_attn_contiguous(
-                q.as_gpu_tensor(),
-                k.as_gpu_tensor(),
-                v.as_gpu_tensor(),
-                cu_seqlens_q,
-                cu_seqlens_q,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.scale,
-                true,
-                0.0,
-                -1,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        } else {
-            // K, V no longer needed after reshape_and_cache (data is in the cache).
-            drop(k);
-            drop(v);
-            kernels::flash_attn_paged(
-                q.as_gpu_tensor(),
-                kv_cache.k_cache(self.layer_idx),
-                kv_cache.v_cache(self.layer_idx),
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
-                max_seqlen_q,
-                max_seqlen_k,
-                self.scale,
-                true,
-                kv_cache.block_size,
-                device.num_sm,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        };
-        drop(q); // free Q
+        // Attention: fresh prefill uses BF16 K/V, decode reads from cache.
+        let attn_output = crate::model::attention_helpers::attention_standard(
+            q.as_gpu_tensor(),
+            k.as_gpu_tensor(),
+            v.as_gpu_tensor(),
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            self.scale,
+            kv_cache,
+            self.layer_idx,
+            device.num_sm,
+            &mut device.caching,
+            device.compute_stream,
+        );
+        drop(q);
+        drop(k);
+        drop(v);
 
         // Reshape to [num_tokens, q_size] and output projection.
         let attn_flat = attn_output

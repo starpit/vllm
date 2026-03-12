@@ -347,9 +347,15 @@ async fn completions(
     Json(request): Json<protocol::CompletionRequest>,
 ) -> Response {
     if request.stream {
-        // Streaming completions skip ORCA headers.
-        match state.engine.completion(request).await {
-            Ok(response) => Json(response).into_response(),
+        let include_usage = request
+            .stream_options
+            .as_ref()
+            .and_then(|o| o.include_usage)
+            .unwrap_or(false);
+        match state.engine.completion_stream(request).await {
+            Ok((request_id, model, rx)) => {
+                stream_completion_response(request_id, model, rx, include_usage).into_response()
+            }
             Err(e) => e.into_response(),
         }
     } else {
@@ -850,6 +856,85 @@ fn stream_chat_response(
     // Append [DONE] sentinel after the stream ends.
     let done_stream = tokio_stream::once(Ok(Event::default().data("[DONE]")));
     let full_stream = stream.chain(done_stream);
+
+    Sse::new(full_stream).keep_alive(KeepAlive::default())
+}
+
+/// Build an SSE stream for text completions.
+fn stream_completion_response(
+    request_id: String,
+    model: String,
+    rx: tokio::sync::mpsc::UnboundedReceiver<StreamDelta>,
+    include_usage: bool,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let total_completion_tokens = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let tc = total_completion_tokens.clone();
+    let req_id = request_id.clone();
+    let model2 = model.clone();
+
+    let stream = UnboundedReceiverStream::new(rx).map(move |delta| {
+        let token_count = delta.new_token_ids.len() as u32;
+        tc.fetch_add(token_count, std::sync::atomic::Ordering::Relaxed);
+
+        let finish_reason_str = delta.finish_reason.map(|r| r.to_string());
+
+        let text = delta.text.unwrap_or_else(|| {
+            use std::fmt::Write;
+            let mut s = String::new();
+            for id in &delta.new_token_ids {
+                let _ = write!(s, "<token_{id}>");
+            }
+            s
+        });
+
+        let chunk = protocol::CompletionStreamResponse::new(
+            format!("cmpl-{}", req_id),
+            model.clone(),
+            vec![protocol::CompletionResponseStreamChoice {
+                index: delta.index,
+                text,
+                logprobs: None,
+                finish_reason: finish_reason_str,
+                stop_reason: delta.stop_reason.map(|sr| match sr {
+                    vllm_common::StopReason::Token(id) => serde_json::Value::Number(id.into()),
+                    vllm_common::StopReason::String(s) => serde_json::Value::String(s),
+                }),
+            }],
+        );
+
+        let data = serde_json::to_string(&chunk).unwrap_or_default();
+        Ok(Event::default().data(data))
+    });
+
+    // After all deltas, optionally emit a usage chunk, then [DONE].
+    let usage_stream: Box<
+        dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + Unpin,
+    > = if include_usage {
+        let req_id2 = request_id.clone();
+        Box::new(tokio_stream::once({
+            let completion_tokens =
+                total_completion_tokens.load(std::sync::atomic::Ordering::Relaxed);
+            let usage = protocol::UsageInfo {
+                prompt_tokens: 0,
+                completion_tokens: Some(completion_tokens),
+                total_tokens: completion_tokens,
+                prompt_tokens_details: None,
+            };
+            let mut chunk = protocol::CompletionStreamResponse::new(
+                format!("cmpl-{}", req_id2),
+                model2.clone(),
+                vec![],
+            );
+            chunk.usage = Some(usage);
+            let data = serde_json::to_string(&chunk).unwrap_or_default();
+            Ok(Event::default().data(data))
+        }))
+    } else {
+        Box::new(tokio_stream::empty())
+    };
+
+    let done_stream = tokio_stream::once(Ok(Event::default().data("[DONE]")));
+    let full_stream = stream.chain(usage_stream).chain(done_stream);
 
     Sse::new(full_stream).keep_alive(KeepAlive::default())
 }

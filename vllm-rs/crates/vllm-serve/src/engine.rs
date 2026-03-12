@@ -1018,6 +1018,124 @@ impl AsyncEngine {
     }
 
     // -----------------------------------------------------------------------
+    // Streaming completions
+    // -----------------------------------------------------------------------
+
+    /// Add a streaming completion request.
+    ///
+    /// Returns `(request_id, model, receiver)` — the receiver yields
+    /// [`StreamDelta`] chunks exactly like `chat_completion_stream`.
+    /// Simpler than chat streaming: no tool parsing, no reasoning parsing.
+    pub async fn completion_stream(
+        &self,
+        request: protocol::CompletionRequest,
+    ) -> ServeResult<(String, String, mpsc::UnboundedReceiver<StreamDelta>)> {
+        if self.is_pooling {
+            return Err(ServeError::Validation(
+                "server is in pooling mode — text completions are not supported".to_string(),
+            ));
+        }
+        let base_id = request
+            .request_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| self.model_name.clone());
+        let n = request.n.max(1) as usize;
+
+        let sampling_params = self.build_sampling_params_from_completion(&request)?;
+
+        // Normalize prompt to Vec<Vec<u32>>.
+        let mut prompts = self.tokenize_completion_prompts(&request)?;
+
+        // Truncate each prompt from the left (keep the last N tokens).
+        for p in &mut prompts {
+            truncate_prompt(p, request.truncate_prompt_tokens)?;
+        }
+        let total = prompts.len() * n;
+
+        // Per-HTTP-request metrics (once).
+        // Per-HTTP-request metrics (once).
+        #[cfg(feature = "metrics")]
+        {
+            let total_prompt_tokens: u32 = prompts.iter().map(|p| p.len() as u32).sum();
+            let metrics = crate::metrics::VllmMetrics::global();
+            metrics.requests_total.inc();
+            metrics
+                .prompt_tokens_total
+                .inc_by(total_prompt_tokens as u64);
+        }
+
+        // All children share one channel.
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        for (p_idx, prompt_ids) in prompts.iter().enumerate() {
+            let num_prompt_tokens = prompt_ids.len() as u32;
+
+            for n_idx in 0..n {
+                let choice_index = (p_idx * n + n_idx) as u32;
+                let child_id = if total == 1 {
+                    base_id.clone()
+                } else {
+                    format!("{base_id}-{choice_index}")
+                };
+
+                let mut sp = sampling_params.clone();
+                sp.seed = sp.seed.map(|s| s.wrapping_add(n_idx as u64));
+                self.resolve_max_tokens(&mut sp, prompt_ids.len());
+
+                let ec_req = EngineCoreRequest {
+                    request_id: child_id.clone(),
+                    prompt_token_ids: Some(prompt_ids.clone()),
+                    sampling_params: Some(sp.clone()),
+                    arrival_time: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs_f64(),
+                    client_index: 0,
+                    priority: request.priority,
+                    cache_salt: request.cache_salt.clone(),
+                    data_parallel_rank: None,
+                    is_pooling: false,
+                    mm_data: None,
+                };
+
+                let detokenizer = self.tokenizer.as_ref().map(|tok| {
+                    IncrementalDetokenizer::new(
+                        Arc::clone(tok),
+                        prompt_ids,
+                        sp.stop.clone(),
+                        sp.min_tokens,
+                        sp.include_stop_str_in_output,
+                        sp.skip_special_tokens,
+                    )
+                });
+
+                self.submit_request(
+                    child_id,
+                    ec_req,
+                    num_prompt_tokens,
+                    Some(tx.clone()),
+                    detokenizer,
+                    choice_index,
+                    None, // no tool parsing for completions
+                    None,
+                    None, // no reasoning parsing for completions
+                    true,
+                )
+                .await?;
+            }
+        }
+
+        // Drop the original sender so rx closes when all children finish.
+        drop(tx);
+
+        Ok((base_id, model, rx))
+    }
+
+    // -----------------------------------------------------------------------
     // Abort
     // -----------------------------------------------------------------------
 

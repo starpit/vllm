@@ -2465,7 +2465,8 @@ mod tests {
             target_dtype: None,
             cast_pinned: (std::ptr::null_mut(), 0),
         };
-        gw.load_shard(&dir.path().join("model.safetensors")).unwrap();
+        gw.load_shard(&dir.path().join("model.safetensors"))
+            .unwrap();
 
         let merged = gw.merge_lora(adapter_dir.path()).unwrap();
         assert_eq!(merged, 1);

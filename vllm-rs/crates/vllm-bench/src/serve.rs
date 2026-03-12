@@ -50,12 +50,15 @@ async fn send_request(
     prompt_tokens: &[u32],
     output_len: usize,
     args: &BenchServeArgs,
+    request_id: &str,
 ) -> RequestResult {
     let mut body = serde_json::json!({
         "model": model,
         "prompt": prompt_tokens,
         "max_tokens": output_len,
         "stream": true,
+        "stream_options": {"include_usage": true},
+        "repetition_penalty": 1.0,
     });
 
     if args.ignore_eos {
@@ -77,7 +80,10 @@ async fn send_request(
     let mut itl = Vec::new();
     let mut output_tokens = 0usize;
 
-    let mut req = client.post(api_url).json(&body);
+    let mut req = client
+        .post(api_url)
+        .header("x-request-id", request_id)
+        .json(&body);
     if let Some(ref key) = args.api_key {
         req = req.bearer_auth(key);
     }
@@ -112,6 +118,7 @@ async fn send_request(
     // Parse SSE stream.
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
+    let mut usage_completion_tokens: Option<usize> = None;
 
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
@@ -133,23 +140,38 @@ async fn send_request(
                 if let Some(data) = line.strip_prefix("data: ")
                     && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data)
                 {
-                    // Check if this chunk has content (a token).
+                    // Check for usage chunk (token count from server).
+                    if let Some(ct) = parsed["usage"]["completion_tokens"].as_u64() {
+                        usage_completion_tokens = Some(ct as usize);
+                    }
+
+                    // Python TTFT: any chunk with `choices` key (even empty text).
+                    let has_choices = parsed.get("choices").is_some_and(|c| c.is_array());
                     let has_content = parsed["choices"][0]["text"]
                         .as_str()
                         .is_some_and(|t| !t.is_empty());
-                    if has_content {
+
+                    if has_choices {
                         let now = Instant::now();
                         if first_token_time.is_none() {
                             first_token_time = Some(now);
-                        } else {
-                            itl.push(now.duration_since(last_token_time).as_secs_f64());
                         }
-                        last_token_time = now;
-                        output_tokens += 1;
+                        if has_content {
+                            if output_tokens > 0 {
+                                itl.push(now.duration_since(last_token_time).as_secs_f64());
+                            }
+                            last_token_time = now;
+                            output_tokens += 1;
+                        }
                     }
                 }
             }
         }
+    }
+
+    // Prefer server-reported token count.
+    if let Some(ct) = usage_completion_tokens {
+        output_tokens = ct;
     }
 
     let e2el = request_start.elapsed().as_secs_f64();
@@ -173,6 +195,29 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     }
     let idx = ((p / 100.0) * (sorted.len() - 1) as f64).round() as usize;
     sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Compute standard deviation.
+fn std_dev(data: &[f64]) -> f64 {
+    if data.len() < 2 {
+        return 0.0;
+    }
+    let mean = data.iter().sum::<f64>() / data.len() as f64;
+    let variance = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / data.len() as f64;
+    variance.sqrt()
+}
+
+/// Sample from exponential distribution using inverse CDF.
+/// Returns -ln(U) / lambda where U is uniform in (0,1).
+fn exponential_sample(rng_state: &mut u64, rate: f64) -> f64 {
+    // xorshift64 → uniform (0,1)
+    *rng_state ^= *rng_state << 13;
+    *rng_state ^= *rng_state >> 7;
+    *rng_state ^= *rng_state << 17;
+    let u = (*rng_state as f64) / (u64::MAX as f64);
+    // Clamp away from 0 to avoid -ln(0) = inf.
+    let u = u.max(1e-15);
+    -u.ln() / rate
 }
 
 pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
@@ -208,8 +253,49 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
         }
     );
 
+    // Pre-flight check: send one request to verify connectivity.
+    eprintln!("Sending pre-flight request to verify connectivity...");
+    {
+        let preflight_prompt: Vec<u32> = (0..args.input_len).map(|i| (i % 10000) as u32).collect();
+        let preflight_args = BenchServeArgs {
+            model: Some(model.clone()),
+            base_url: args.base_url.clone(),
+            endpoint: args.endpoint.clone(),
+            num_prompts: 1,
+            input_len: args.input_len,
+            output_len: 1,
+            request_rate: f64::INFINITY,
+            max_concurrency: None,
+            seed: 0,
+            disable_tqdm: true,
+            output_json: None,
+            percentile_metrics: String::new(),
+            metric_percentiles: String::new(),
+            ignore_eos: args.ignore_eos,
+            temperature: args.temperature,
+            top_p: args.top_p,
+            top_k: args.top_k,
+            api_key: args.api_key.clone(),
+            insecure: args.insecure,
+        };
+        let result = send_request(
+            &client,
+            &api_url,
+            &model,
+            &preflight_prompt,
+            1,
+            &preflight_args,
+            "preflight",
+        )
+        .await;
+        if !result.success {
+            anyhow::bail!("Pre-flight request failed. Check server connectivity and model name.");
+        }
+        eprintln!("Pre-flight request succeeded.");
+    }
+
     // Generate random prompts.
-    let mut rng_state: u64 = args.seed;
+    let mut rng_state: u64 = args.seed.max(1); // avoid 0 for xorshift
     let mut next_rng = || -> u64 {
         rng_state ^= rng_state << 13;
         rng_state ^= rng_state >> 7;
@@ -242,14 +328,16 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
     let completed = Arc::new(AtomicUsize::new(0));
     let semaphore = args.max_concurrency.map(|n| Arc::new(Semaphore::new(n)));
 
+    // Separate RNG state for delay sampling.
+    let mut delay_rng: u64 = args.seed.wrapping_add(42).max(1);
+
     let benchmark_start = Instant::now();
     let mut handles = Vec::with_capacity(args.num_prompts);
 
     for (i, prompt_tokens) in prompts.into_iter().enumerate() {
-        // Inter-request delay (Poisson process).
+        // Inter-request delay: exponential distribution (Poisson process).
         if !args.request_rate.is_infinite() && i > 0 {
-            // Exponential inter-arrival time.
-            let delay = 1.0 / args.request_rate;
+            let delay = exponential_sample(&mut delay_rng, args.request_rate);
             tokio::time::sleep(Duration::from_secs_f64(delay)).await;
         }
 
@@ -259,6 +347,7 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
         let completed = completed.clone();
         let pb = pb.clone();
         let sem = semaphore.clone();
+        let request_id = format!("bench-{i}");
 
         // Copy args we need into the task. BenchServeArgs isn't Clone,
         // so extract the fields we need.
@@ -304,6 +393,7 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
                 &prompt_tokens,
                 output_len,
                 &task_args,
+                &request_id,
             )
             .await;
             completed.fetch_add(1, Ordering::Relaxed);
@@ -364,40 +454,69 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
 
-    // Print summary.
+    // Print summary (matches Python's benchmark_serving.py format).
     println!();
-    println!("============ Serving Benchmark Result ============");
-    println!("Successful requests:     {num_success}");
-    println!("Failed requests:         {num_fail}");
-    println!("Benchmark duration (s):  {total_time:.2}");
-    println!("Total input tokens:      {total_input_tokens}");
-    println!("Total generated tokens:  {total_output_tokens}");
+    println!("{:=^50}", " Serving Benchmark Result ");
+    println!("{:<40} {:<10}", "Successful requests:", num_success);
+    println!("{:<40} {:<10}", "Failed requests:", num_fail);
+    if let Some(mc) = args.max_concurrency {
+        println!("{:<40} {:<10}", "Maximum request concurrency:", mc);
+    }
+    if !args.request_rate.is_infinite() {
+        println!(
+            "{:<40} {:<10.2}",
+            "Request rate configured (RPS):", args.request_rate
+        );
+    }
+    println!("{:<40} {:<10.2}", "Benchmark duration (s):", total_time);
+    println!("{:<40} {:<10}", "Total input tokens:", total_input_tokens);
     println!(
-        "Request throughput:      {:.2} requests/s",
+        "{:<40} {:<10}",
+        "Total generated tokens:", total_output_tokens
+    );
+    println!(
+        "{:<40} {:<10.2}",
+        "Request throughput (req/s):",
         num_success as f64 / total_time
     );
     println!(
-        "Output token throughput: {:.2} tokens/s",
+        "{:<40} {:<10.2}",
+        "Output token throughput (tok/s):",
         total_output_tokens as f64 / total_time
     );
     println!(
-        "Total token throughput:  {:.2} tokens/s",
+        "{:<40} {:<10.2}",
+        "Total token throughput (tok/s):",
         (total_input_tokens + total_output_tokens) as f64 / total_time
     );
 
-    // Print per-metric stats.
-    let print_metric = |name: &str, data: &[f64], unit: &str| {
+    // Print per-metric stats (matches Python's process_one_metric format).
+    let print_metric = |name: &str, header: &str, data: &[f64]| {
         if data.is_empty() {
             return;
         }
         let mean = data.iter().sum::<f64>() / data.len() as f64;
         let median = percentile(data, 50.0);
-        println!("---------------{name}---------------");
-        println!("Mean {name} ({unit}):    {:.2}", mean * 1000.0);
-        println!("Median {name} ({unit}):  {:.2}", median * 1000.0);
+        println!("{:-^50}", header);
+        println!(
+            "{:<40} {:<10.2}",
+            format!("Mean {name} (ms):"),
+            mean * 1000.0
+        );
+        println!(
+            "{:<40} {:<10.2}",
+            format!("Median {name} (ms):"),
+            median * 1000.0
+        );
         for &p in &selected_pcts {
+            let p_word = if p == p.floor() {
+                format!("{}", p as i64)
+            } else {
+                format!("{p}")
+            };
             println!(
-                "P{p:.0} {name} ({unit}):     {:.2}",
+                "{:<40} {:<10.2}",
+                format!("P{p_word} {name} (ms):"),
                 percentile(data, p) * 1000.0
             );
         }
@@ -405,51 +524,70 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
 
     for metric in &selected_metrics {
         match *metric {
-            "ttft" => print_metric("TTFT", &ttfts, "ms"),
-            "tpot" => print_metric("TPOT", &tpots, "ms"),
-            "itl" => print_metric("ITL", &itls, "ms"),
-            "e2el" => print_metric("E2EL", &e2els, "ms"),
+            "ttft" => print_metric("TTFT", "Time to First Token", &ttfts),
+            "tpot" => print_metric("TPOT", "Time per Output Token (excl. 1st token)", &tpots),
+            "itl" => print_metric("ITL", "Inter-token Latency", &itls),
+            "e2el" => print_metric("E2EL", "End-to-end Latency", &e2els),
             _ => eprintln!("Unknown metric: {metric}"),
         }
     }
-    println!("==================================================");
+    println!("{:=^50}", "");
 
-    // JSON output.
+    // JSON output (matches Python's result dict).
     if let Some(ref path) = args.output_json {
+        let mean = |d: &[f64]| {
+            if d.is_empty() {
+                0.0
+            } else {
+                d.iter().sum::<f64>() / d.len() as f64
+            }
+        };
+
         let mut json = serde_json::json!({
             "duration": total_time,
             "completed": num_success,
-            "failed": num_fail,
             "total_input_tokens": total_input_tokens,
             "total_output_tokens": total_output_tokens,
             "request_throughput": num_success as f64 / total_time,
             "output_throughput": total_output_tokens as f64 / total_time,
+            "total_token_throughput": (total_input_tokens + total_output_tokens) as f64 / total_time,
         });
         let obj = json.as_object_mut().unwrap();
-        for &p in &selected_pcts {
-            if selected_metrics.contains(&"ttft") {
+
+        let add_metric_json =
+            |obj: &mut serde_json::Map<String, serde_json::Value>, attr: &str, data: &[f64]| {
                 obj.insert(
-                    format!("ttft_p{p:.0}_ms"),
-                    serde_json::json!(percentile(&ttfts, p) * 1000.0),
+                    format!("mean_{attr}_ms"),
+                    serde_json::json!(mean(data) * 1000.0),
                 );
-            }
-            if selected_metrics.contains(&"tpot") {
                 obj.insert(
-                    format!("tpot_p{p:.0}_ms"),
-                    serde_json::json!(percentile(&tpots, p) * 1000.0),
+                    format!("median_{attr}_ms"),
+                    serde_json::json!(percentile(data, 50.0) * 1000.0),
                 );
-            }
-            if selected_metrics.contains(&"itl") {
                 obj.insert(
-                    format!("itl_p{p:.0}_ms"),
-                    serde_json::json!(percentile(&itls, p) * 1000.0),
+                    format!("std_{attr}_ms"),
+                    serde_json::json!(std_dev(data) * 1000.0),
                 );
-            }
-            if selected_metrics.contains(&"e2el") {
-                obj.insert(
-                    format!("e2el_p{p:.0}_ms"),
-                    serde_json::json!(percentile(&e2els, p) * 1000.0),
-                );
+                for &p in &selected_pcts {
+                    let p_word = if p == p.floor() {
+                        format!("{}", p as i64)
+                    } else {
+                        format!("{p}")
+                    };
+                    obj.insert(
+                        format!("p{p_word}_{attr}_ms"),
+                        serde_json::json!(percentile(data, p) * 1000.0),
+                    );
+                }
+            };
+
+        for metric in &selected_metrics {
+            match *metric {
+                "ttft" => add_metric_json(obj, "ttft", &ttfts),
+                "tpot" => add_metric_json(obj, "tpot", &tpots),
+                "itl" => add_metric_json(obj, "itl", &itls),
+                "e2el" => add_metric_json(obj, "e2el", &e2els),
+                _ => {}
             }
         }
         std::fs::write(path, serde_json::to_string_pretty(&json)?)?;

@@ -37,6 +37,7 @@ vllm-cuda = { workspace = true }
 vllm-gce = { workspace = true, optional = true }
 vllm-mlx = { workspace = true, optional = true }
 vllm-bench = { workspace = true, optional = true }
+chrono = "0.4"
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

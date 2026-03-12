@@ -33,10 +33,16 @@ async fn main() -> anyhow::Result<()> {
         Commands::Convert(args) => commands::convert::run_convert(args).await,
         #[cfg(feature = "gce")]
         Commands::Gce(cmd) => {
-            use crate::args::GceSubcommand;
+            use crate::args::{GceImageSubcommand, GceSubcommand};
             match cmd.command {
                 GceSubcommand::Up(args) => commands::gce::run_up(*args).await,
                 GceSubcommand::Down(args) => commands::gce::run_down(args).await,
+                GceSubcommand::Image(img_cmd) => match img_cmd.command {
+                    GceImageSubcommand::Build(args) => commands::gce::run_image_build(args).await,
+                    GceImageSubcommand::List(args) | GceImageSubcommand::Ls(args) => {
+                        commands::gce::run_image_list(args).await
+                    }
+                },
             }
         }
         #[cfg(feature = "top")]

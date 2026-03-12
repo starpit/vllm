@@ -911,7 +911,7 @@ fn stream_completion_response(
         dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + Unpin,
     > = if include_usage {
         let req_id2 = request_id.clone();
-        Box::new(tokio_stream::once({
+        Box::new(tokio_stream::once(()).map(move |()| {
             let completion_tokens =
                 total_completion_tokens.load(std::sync::atomic::Ordering::Relaxed);
             let usage = protocol::UsageInfo {

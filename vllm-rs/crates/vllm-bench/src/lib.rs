@@ -18,6 +18,18 @@ pub use args::{
     BenchThroughputArgs, SweepCommand, SweepCommands, SweepServeArgs, SweepStartupArgs,
 };
 
+/// Format a rate as `it/s` (fast) or `s/it` (slow), matching Python tqdm style.
+pub(crate) fn fmt_tqdm_rate(state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write) {
+    let per_sec = state.per_sec();
+    if per_sec >= 1.0 {
+        write!(w, "{per_sec:.2}it/s").unwrap();
+    } else if per_sec > 0.0 {
+        write!(w, "{:.2}s/it", 1.0 / per_sec).unwrap();
+    } else {
+        write!(w, "?it/s").unwrap();
+    }
+}
+
 /// Dispatch bench subcommands.
 pub async fn run_bench(cmd: BenchCommand) -> anyhow::Result<()> {
     match cmd.command {

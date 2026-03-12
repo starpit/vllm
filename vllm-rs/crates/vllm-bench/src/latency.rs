@@ -132,17 +132,7 @@ pub(crate) fn run_bench_latency(args: BenchLatencyArgs) -> Result<()> {
                     fmt_duration(state.eta(), w);
                 },
             )
-            .with_key(
-                "per_sec",
-                |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
-                    let per_sec = state.per_sec();
-                    if per_sec > 0.0 {
-                        write!(w, "{:.2}s/it", 1.0 / per_sec).unwrap();
-                    } else {
-                        write!(w, "?s/it").unwrap();
-                    }
-                },
-            )
+            .with_key("per_sec", crate::fmt_tqdm_rate)
     }
 
     let warmup_style = tqdm_keys(

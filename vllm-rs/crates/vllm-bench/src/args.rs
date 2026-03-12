@@ -295,7 +295,7 @@ pub struct BenchServeArgs {
     pub num_prompts: usize,
 
     /// Input prompt length for each request (tokens).
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 1024)]
     pub input_len: usize,
 
     /// Output length for each request (tokens).
@@ -331,7 +331,8 @@ pub struct BenchServeArgs {
     pub metric_percentiles: String,
 
     /// Ignore EOS token (force generation to max output length).
-    #[arg(long)]
+    /// Defaults to true for random prompts, matching Python's behavior.
+    #[arg(long, default_value_t = true)]
     pub ignore_eos: bool,
 
     /// Sampling temperature.

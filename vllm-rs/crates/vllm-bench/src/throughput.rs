@@ -102,7 +102,8 @@ pub(crate) fn run_bench_throughput(args: BenchThroughputArgs) -> Result<()> {
         ProgressStyle::with_template(
             "Rendering prompts: {wide_bar:.cyan/blue} {pos}/{len} [{elapsed}<{eta}, {per_sec}]",
         )
-        .unwrap(),
+        .unwrap()
+        .with_key("per_sec", crate::fmt_tqdm_rate),
     );
 
     // Python vLLM's RandomDataset uses sequential token IDs from "allowed tokens"

@@ -47,15 +47,16 @@ async fn send_request(
     client: &Client,
     api_url: &str,
     model: &str,
-    prompt_tokens: &[u32],
+    prompt: &str,
     output_len: usize,
     args: &BenchServeArgs,
     request_id: &str,
 ) -> RequestResult {
     let mut body = serde_json::json!({
         "model": model,
-        "prompt": prompt_tokens,
+        "prompt": prompt,
         "max_tokens": output_len,
+        "logprobs": null,
         "stream": true,
         "stream_options": {"include_usage": true},
         "repetition_penalty": 1.0,
@@ -140,29 +141,23 @@ async fn send_request(
                 if let Some(data) = line.strip_prefix("data: ")
                     && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data)
                 {
-                    // Check for usage chunk (token count from server).
-                    if let Some(ct) = parsed["usage"]["completion_tokens"].as_u64() {
-                        usage_completion_tokens = Some(ct as usize);
-                    }
-
-                    // Python TTFT: any chunk with `choices` key (even empty text).
-                    let has_choices = parsed.get("choices").is_some_and(|c| c.is_array());
-                    let has_content = parsed["choices"][0]["text"]
-                        .as_str()
-                        .is_some_and(|t| !t.is_empty());
-
-                    if has_choices {
+                    // Match Python's TTFT/ITL logic exactly:
+                    // - First chunk with `choices` → TTFT
+                    // - Every subsequent chunk with `choices` → ITL
+                    // - `most_recent_timestamp` updated on every choices chunk
+                    if parsed
+                        .get("choices")
+                        .is_some_and(|c| c.as_array().is_some_and(|a| !a.is_empty()))
+                    {
                         let now = Instant::now();
                         if first_token_time.is_none() {
                             first_token_time = Some(now);
+                        } else {
+                            itl.push(now.duration_since(last_token_time).as_secs_f64());
                         }
-                        if has_content {
-                            if output_tokens > 0 {
-                                itl.push(now.duration_since(last_token_time).as_secs_f64());
-                            }
-                            last_token_time = now;
-                            output_tokens += 1;
-                        }
+                        last_token_time = now;
+                    } else if let Some(ct) = parsed["usage"]["completion_tokens"].as_u64() {
+                        usage_completion_tokens = Some(ct as usize);
                     }
                 }
             }
@@ -174,7 +169,8 @@ async fn send_request(
         output_tokens = ct;
     }
 
-    let e2el = request_start.elapsed().as_secs_f64();
+    // Python: output.latency = most_recent_timestamp - st (last choices chunk time).
+    let e2el = last_token_time.duration_since(request_start).as_secs_f64();
     let ttft = first_token_time
         .map(|t| t.duration_since(request_start).as_secs_f64())
         .unwrap_or(e2el);
@@ -253,17 +249,66 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
         }
     );
 
+    // Load tokenizer from HuggingFace hub (matches Python's get_tokenizer).
+    eprintln!("Loading tokenizer for {model}...");
+    let tokenizer = {
+        let api = hf_hub::api::sync::Api::new()?;
+        let repo = api.model(model.clone());
+        let tokenizer_path = repo.get("tokenizer.json")?;
+        tokenizers::Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
+    };
+
+    // Build allowed tokens (exclude special tokens), matching Python's RandomDataset.
+    let vocab_size = tokenizer.get_vocab_size(false) as u32;
+    let special_ids: std::collections::HashSet<u32> = tokenizer
+        .get_added_vocabulary()
+        .get_added_tokens_decoder()
+        .iter()
+        .filter(|(_, t)| t.special)
+        .map(|(id, _)| *id)
+        .collect();
+    let allowed_tokens: Vec<u32> = (0..vocab_size)
+        .filter(|id| !special_ids.contains(id))
+        .collect();
+    let num_allowed = allowed_tokens.len();
+    eprintln!("Tokenizer loaded: vocab_size={vocab_size}, allowed_tokens={num_allowed}");
+
+    // Generate random text prompts matching Python's RandomDataset.generate_token_sequence:
+    // token_ids = allowed_tokens[(offset + index + arange(input_len)) % num_allowed]
+    // then decode → re-encode → truncate to target length → decode again.
+    eprintln!("Generating {} random prompts...", args.num_prompts);
+    let prompts: Vec<String> = (0..args.num_prompts)
+        .map(|i| {
+            let offset = i * 7 + args.seed as usize; // deterministic offset
+            let token_ids: Vec<u32> = (0..args.input_len)
+                .map(|j| allowed_tokens[(offset + i + j) % num_allowed])
+                .collect();
+            // Decode to text.
+            let text = tokenizer.decode(&token_ids, true).unwrap_or_default();
+            // Re-encode to verify length and truncate if needed.
+            let encoding = tokenizer.encode(text.as_str(), false).unwrap();
+            let re_encoded = encoding.get_ids();
+            if re_encoded.len() > args.input_len {
+                // Truncate and decode again.
+                let truncated = &re_encoded[..args.input_len];
+                tokenizer.decode(truncated, true).unwrap_or(text)
+            } else {
+                text
+            }
+        })
+        .collect();
+
     // Pre-flight check: send one request to verify connectivity.
     eprintln!("Sending pre-flight request to verify connectivity...");
     {
-        let preflight_prompt: Vec<u32> = (0..args.input_len).map(|i| (i % 10000) as u32).collect();
         let preflight_args = BenchServeArgs {
             model: Some(model.clone()),
             base_url: args.base_url.clone(),
             endpoint: args.endpoint.clone(),
             num_prompts: 1,
             input_len: args.input_len,
-            output_len: 1,
+            output_len: args.output_len,
             request_rate: f64::INFINITY,
             max_concurrency: None,
             seed: 0,
@@ -282,8 +327,8 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
             &client,
             &api_url,
             &model,
-            &preflight_prompt,
-            1,
+            &prompts[0],
+            args.output_len,
             &preflight_args,
             "preflight",
         )
@@ -294,31 +339,15 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
         eprintln!("Pre-flight request succeeded.");
     }
 
-    // Generate random prompts.
-    let mut rng_state: u64 = args.seed.max(1); // avoid 0 for xorshift
-    let mut next_rng = || -> u64 {
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-        rng_state
-    };
-
-    let prompts: Vec<Vec<u32>> = (0..args.num_prompts)
-        .map(|_| {
-            (0..args.input_len)
-                .map(|_| (next_rng() % 10000) as u32)
-                .collect()
-        })
-        .collect();
-
     // Progress bar.
     let pb = if !args.disable_tqdm {
         let pb = ProgressBar::new(args.num_prompts as u64);
         pb.set_style(
             ProgressStyle::with_template(
-                "Benchmarking {wide_bar:.cyan/blue} {pos}/{len} [{elapsed}<{eta}]",
+                "Benchmarking {wide_bar:.cyan/blue} {pos}/{len} [{elapsed}<{eta}, {per_sec}]",
             )
-            .unwrap(),
+            .unwrap()
+            .with_key("per_sec", crate::fmt_tqdm_rate),
         );
         Some(pb)
     } else {
@@ -334,7 +363,7 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
     let benchmark_start = Instant::now();
     let mut handles = Vec::with_capacity(args.num_prompts);
 
-    for (i, prompt_tokens) in prompts.into_iter().enumerate() {
+    for (i, prompt_text) in prompts.into_iter().enumerate() {
         // Inter-request delay: exponential distribution (Poisson process).
         if !args.request_rate.is_infinite() && i > 0 {
             let delay = exponential_sample(&mut delay_rng, args.request_rate);
@@ -390,7 +419,7 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
                 &client,
                 &api_url,
                 &model,
-                &prompt_tokens,
+                &prompt_text,
                 output_len,
                 &task_args,
                 &request_id,

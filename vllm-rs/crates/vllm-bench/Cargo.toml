@@ -22,5 +22,7 @@ indicatif = { workspace = true }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tokenizers = { workspace = true }
+hf-hub = { workspace = true }
 shell-words = "1"
 url = "2"

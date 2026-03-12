@@ -317,6 +317,65 @@ impl Client {
             .context("failed to parse gpu_memory response")
     }
 
+    /// POST /v1/messages — Anthropic Messages API (non-streaming).
+    pub async fn anthropic_messages(
+        &self,
+        request: &vllm_serve::anthropic::MessagesRequest,
+    ) -> Result<vllm_serve::anthropic::MessagesResponse> {
+        let resp = self
+            .inner
+            .post(format!("{}/v1/messages", self.base_url))
+            .json(request)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("anthropic messages failed with status {status}: {body}");
+        }
+
+        resp.json()
+            .await
+            .context("failed to parse Anthropic messages response")
+    }
+
+    /// POST /v1/messages — Anthropic Messages API (raw JSON, for flexible testing).
+    pub async fn anthropic_messages_raw(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        let resp = self
+            .inner
+            .post(format!("{}/v1/messages", self.base_url))
+            .json(body)
+            .send()
+            .await?;
+        Ok(resp)
+    }
+
+    /// POST /v1/messages with stream=true — returns SSE event bodies as JSON values.
+    pub async fn anthropic_messages_stream(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>> {
+        let resp = self
+            .inner
+            .post(format!("{}/v1/messages", self.base_url))
+            .json(body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("anthropic streaming messages failed with status {status}: {body}");
+        }
+
+        let body = resp.text().await?;
+        parse_anthropic_sse_events(&body)
+    }
+
     /// GET /metrics — returns raw Prometheus text.
     pub async fn metrics(&self) -> Result<String> {
         let resp = self
@@ -326,6 +385,21 @@ impl Client {
             .await?;
         resp.text().await.context("failed to read metrics")
     }
+}
+
+/// Parse Anthropic SSE response body into JSON event payloads.
+fn parse_anthropic_sse_events(body: &str) -> Result<Vec<serde_json::Value>> {
+    let mut events = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(data) = line
+            .strip_prefix("data: ")
+            .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+        {
+            events.push(data);
+        }
+    }
+    Ok(events)
 }
 
 /// Parse SSE response body into individual JSON chunks.

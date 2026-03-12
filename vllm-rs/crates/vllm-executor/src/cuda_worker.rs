@@ -3074,6 +3074,11 @@ impl Worker for CudaWorker {
             }
         }
 
+        // 6b. Start background pre-cast pipeline. This pre-faults mmap pages
+        // and casts float tensors into pinned buffers concurrently with model
+        // construction. Must be after set_target_dtype() and merge_lora().
+        weights.start_precast();
+
         // 7. Construct model based on architecture.
         let tp_world = self.config.tp_world_size;
         let tp_rank = self.config.tp_rank;

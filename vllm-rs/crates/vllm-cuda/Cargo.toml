@@ -27,6 +27,7 @@ thiserror = { workspace = true }
 vllm-common = { path = "../vllm-common" }
 vllm-model = { path = "../vllm-model" }
 candle-core = { workspace = true }
+libc = { workspace = true }
 
 [build-dependencies]
 cudaforge = { version = "=0.1.4", optional = true }

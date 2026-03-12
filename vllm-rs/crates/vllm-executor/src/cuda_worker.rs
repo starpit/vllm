@@ -1874,10 +1874,51 @@ impl CudaWorker {
         if let Ok(index_path) = repo.get("model.safetensors.index.json") {
             let index = vllm_model::weight::SafeTensorsIndex::from_file(&index_path)
                 .map_err(|e| ExecutorError::WorkerInit(format!("failed to parse index: {e}")))?;
-            for shard in index.shard_files() {
-                repo.get(&shard).map_err(|e| {
-                    ExecutorError::WorkerInit(format!("failed to download {shard}: {e}"))
-                })?;
+            let sorted_shards = index.shard_files();
+            let total = sorted_shards.len();
+
+            // Filter out shards already present in the cache.
+            let needed: Vec<&String> = sorted_shards
+                .iter()
+                .filter(|s| !model_dir.join(s).exists())
+                .collect();
+
+            if needed.is_empty() {
+                info!("All {total} shard files already cached");
+            } else {
+                info!(
+                    "Downloading {} of {total} shard files (up to 8 in parallel)",
+                    needed.len()
+                );
+
+                let multi = indicatif::MultiProgress::new();
+                const MAX_PARALLEL: usize = 8;
+                let repo = &repo;
+                let multi = &multi;
+
+                for chunk in needed.chunks(MAX_PARALLEL) {
+                    let results: Vec<ExecutorResult<()>> = std::thread::scope(|s| {
+                        let handles: Vec<_> = chunk
+                            .iter()
+                            .map(|shard| {
+                                let bar = multi.add(indicatif::ProgressBar::new(0));
+                                s.spawn(move || {
+                                    repo.download_with_progress(shard, bar).map(|_| ()).map_err(
+                                        |e| {
+                                            ExecutorError::WorkerInit(format!(
+                                                "failed to download {shard}: {e}"
+                                            ))
+                                        },
+                                    )
+                                })
+                            })
+                            .collect();
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
+                    for result in results {
+                        result?;
+                    }
+                }
             }
             return Ok(model_dir);
         }

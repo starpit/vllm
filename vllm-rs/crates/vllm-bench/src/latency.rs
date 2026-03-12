@@ -313,9 +313,12 @@ fn print_single_result(r: &BenchResult, args: &BenchLatencyArgs) {
     println!("Total tokens:    {total_tokens}");
     println!("Throughput:      {throughput:.1} tokens/s");
     println!();
-    println!("Avg latency: {:.4}s", r.avg_latency());
+    println!("Avg latency: {} seconds", r.avg_latency());
     for &p in &[10.0, 25.0, 50.0, 75.0, 90.0, 99.0] {
-        println!("{p:.0}% percentile latency: {:.4}s", r.percentile_value(p));
+        println!(
+            "{p:.0}% percentile latency: {} seconds",
+            r.percentile_value(p)
+        );
     }
 }
 
@@ -452,13 +455,26 @@ fn short_model_name(model: &str) -> String {
     model.rsplit('/').next().unwrap_or(model).to_string()
 }
 
-/// Compute the p-th percentile of a sorted slice. Returns 0 for empty input.
+/// Compute the p-th percentile using linear interpolation, matching
+/// `numpy.percentile` (method='linear', the default).
 fn percentile(data: &[f64], p: f64) -> f64 {
     if data.is_empty() {
         return 0.0;
     }
     let mut sorted = data.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let idx = ((p / 100.0) * (sorted.len() - 1) as f64).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
+    let n = sorted.len();
+    if n == 1 {
+        return sorted[0];
+    }
+    // numpy linear interpolation: virtual index into [0, n-1]
+    let idx = (p / 100.0) * (n - 1) as f64;
+    let lo = idx.floor() as usize;
+    let hi = lo + 1;
+    if hi >= n {
+        sorted[n - 1]
+    } else {
+        let frac = idx - lo as f64;
+        sorted[lo] + frac * (sorted[hi] - sorted[lo])
+    }
 }

@@ -61,6 +61,7 @@ pub mod model;
 #[cfg(feature = "nccl")]
 pub mod nccl;
 pub mod quant;
+pub mod tcp_store;
 #[cfg(feature = "cuda")]
 pub mod weights;
 

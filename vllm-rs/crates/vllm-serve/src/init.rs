@@ -99,6 +99,10 @@ pub struct VllmConfig {
     pub kv_cache_dtype: String,
     /// Compute KV scales dynamically from the first forward pass.
     pub calculate_kv_scales: bool,
+    /// Distributed executor backend: "auto" or "external_launcher".
+    /// "external_launcher" reads RANK/LOCAL_RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT
+    /// from env and uses TCP-based NCCL init for inter-process TP.
+    pub distributed_executor_backend: String,
 }
 
 impl Default for VllmConfig {
@@ -133,6 +137,7 @@ impl Default for VllmConfig {
             cublas_autotune: false,
             kv_cache_dtype: "auto".to_string(),
             calculate_kv_scales: false,
+            distributed_executor_backend: "auto".to_string(),
         }
     }
 }
@@ -545,7 +550,12 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
     let tp_size = config.tensor_parallel_size;
     let model_name = extract_model_name(&config.model).into_owned();
 
-    // TP > 1: multi-GPU path with NCCL.
+    // External launcher: each process is a separate rank with its own GPU.
+    if config.distributed_executor_backend == "external_launcher" {
+        return initialize_stack_external(config, model_name, init_start);
+    }
+
+    // TP > 1: multi-GPU path with NCCL (in-process, thread-per-GPU).
     if tp_size > 1 {
         return initialize_stack_tp(config, model_name, init_start);
     }
@@ -1427,6 +1437,334 @@ fn initialize_stack_tp(
     // }
 }
 
+/// Parsed distributed environment variables for external launcher mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalLauncherEnv {
+    pub rank: usize,
+    pub local_rank: usize,
+    pub world_size: usize,
+    pub master_addr: String,
+    pub master_port: u16,
+}
+
+impl ExternalLauncherEnv {
+    /// Parse distributed env vars (RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT).
+    ///
+    /// Falls back to `config` values for MASTER_ADDR and MASTER_PORT if not set in env.
+    pub fn from_env(config: &VllmConfig) -> Result<Self> {
+        let rank: usize = std::env::var("RANK")
+            .context("RANK env var not set (required for external_launcher)")?
+            .parse()
+            .context("RANK must be an integer")?;
+        let local_rank: usize = std::env::var("LOCAL_RANK")
+            .context("LOCAL_RANK env var not set (required for external_launcher)")?
+            .parse()
+            .context("LOCAL_RANK must be an integer")?;
+        let world_size: usize = std::env::var("WORLD_SIZE")
+            .context("WORLD_SIZE env var not set (required for external_launcher)")?
+            .parse()
+            .context("WORLD_SIZE must be an integer")?;
+        let master_addr =
+            std::env::var("MASTER_ADDR").unwrap_or_else(|_| config.master_addr.clone());
+        let master_port: u16 = std::env::var("MASTER_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(config.master_port);
+
+        // Validate consistency.
+        if config.tensor_parallel_size > 1 && config.tensor_parallel_size != world_size {
+            anyhow::bail!(
+                "--tensor-parallel-size ({}) does not match WORLD_SIZE ({})",
+                config.tensor_parallel_size,
+                world_size
+            );
+        }
+
+        Ok(Self {
+            rank,
+            local_rank,
+            world_size,
+            master_addr,
+            master_port,
+        })
+    }
+}
+
+/// External launcher init path: one process per GPU, NCCL via TCP store.
+///
+/// Used when `--distributed-executor-backend external_launcher`. The job launcher
+/// (torchrun, mpirun, SLURM) spawns N processes, each calling this function.
+/// Each process:
+/// 1. Reads RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT from env.
+/// 2. Sets CUDA device to LOCAL_RANK.
+/// 3. Exchanges NCCL unique ID via TCP store (rank 0 serves, others connect).
+/// 4. Creates a single CudaWorker with TP sharding for this rank.
+/// 5. Coordinates memory allocation via TCP all-reduce MIN.
+/// 6. Wraps in UniProcExecutor (one worker per process).
+/// 7. Builds AsyncEngine and returns the stack.
+///
+/// Each process runs its own HTTP server on a different port (set via --port).
+fn initialize_stack_external(
+    config: &VllmConfig,
+    model_name: String,
+    init_start: Instant,
+) -> Result<InitializedStack> {
+    #[cfg(not(feature = "nccl"))]
+    {
+        let _ = (config, model_name, init_start);
+        anyhow::bail!(
+            "External launcher requires the `nccl` feature; \
+             rebuild with --features nccl"
+        );
+    }
+
+    #[cfg(feature = "nccl")]
+    {
+        use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+
+        let env = ExternalLauncherEnv::from_env(config)
+            .context("failed to read external launcher env vars")?;
+        let rank = env.rank;
+        let local_rank = env.local_rank;
+        let world_size = env.world_size;
+        let master_addr = env.master_addr;
+        let master_port = env.master_port;
+
+        let is_pooling = config.runner == "pooling";
+
+        info!(
+            "External launcher: rank={}, local_rank={}, world_size={}, master={}:{}",
+            rank, local_rank, world_size, master_addr, master_port
+        );
+
+        // Step 1: Exchange NCCL unique ID via TCP store.
+        let nccl_id_bytes =
+            vllm_cuda::tcp_store::exchange_nccl_id(rank, world_size, &master_addr, master_port)
+                .context("failed to exchange NCCL ID via TCP store")?;
+        let nccl_id = vllm_cuda::NcclId::from_raw(nccl_id_bytes);
+        info!("Rank {}: NCCL ID exchanged", rank);
+
+        // Step 2: Create CudaWorker for this rank's GPU.
+        let cuda_config = CudaWorkerConfig {
+            model_path: config.model.clone(),
+            dtype: config.dtype.clone(),
+            hf_token: config.hf_token.clone(),
+            block_size: config.block_size,
+            device_id: local_rank as i32,
+            enforce_eager: config.enforce_eager,
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+            cuda_graph_sizes: config
+                .cuda_graph_config
+                .as_ref()
+                .map(|c| c.capture_sizes.clone())
+                .unwrap_or_default(),
+            cublas_autotune: config.cublas_autotune,
+            gpu_memory_utilization: config.gpu_memory_utilization,
+            pooling_strategy: config.pooling_strategy.clone(),
+            is_pooling,
+            tp_rank: rank,
+            tp_world_size: world_size,
+            gguf_file: config.gguf_file.clone(),
+            lora_adapter: config.lora_adapter.clone(),
+            kv_cache_dtype: config.kv_cache_dtype.clone(),
+            calculate_kv_scales: config.calculate_kv_scales,
+        };
+
+        let mut worker = CudaWorker::new(cuda_config);
+        worker
+            .init_device()
+            .context("failed to initialize CUDA device")?;
+        worker.load_model().context("failed to load model")?;
+
+        let hf_config = worker
+            .hf_config()
+            .context("model config not available after load")?
+            .clone();
+        let model_dir = worker.model_dir().map(|p| p.to_path_buf());
+        let model_dtype = worker.resolved_candle_dtype();
+
+        // Step 3: Create NCCL communicator.
+        let device = worker.device_ref().expect("device not initialized");
+        unsafe {
+            vllm_cuda::driver::ctx_set_current(device.ctx).unwrap();
+        }
+        let nccl_group =
+            vllm_cuda::NcclGroup::new(rank, world_size, nccl_id, device.compute_stream)
+                .context("NCCL comm init failed")?;
+        worker.set_tp_group(std::sync::Arc::new(nccl_group));
+        info!("Rank {}: NCCL communicator created", rank);
+
+        // Step 4: Profile available memory.
+        let available_memory = worker
+            .determine_available_memory()
+            .context("failed to determine available memory")?;
+
+        // Step 5: All-reduce MIN across ranks via TCP store.
+        let min_memory = vllm_cuda::tcp_store::allreduce_min(
+            rank,
+            world_size,
+            available_memory,
+            &master_addr,
+            master_port,
+        )
+        .context("failed to allreduce memory")?;
+
+        let max_model_len = config
+            .max_model_len
+            .or(hf_config.max_position_embeddings)
+            .unwrap_or(4096);
+
+        info!(
+            "Rank {}: available_memory={:.1} GB, min_across_ranks={:.1} GB",
+            rank,
+            available_memory as f64 / (1024.0 * 1024.0 * 1024.0),
+            min_memory as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+
+        // Step 6: Compute block count and initialize cache.
+        let num_gpu_blocks = compute_num_blocks(
+            min_memory,
+            config.block_size,
+            &hf_config,
+            model_dtype,
+            config.gpu_memory_utilization,
+            &config.kv_cache_dtype,
+        );
+
+        let mut worker: Box<dyn Worker> = Box::new(worker);
+        worker
+            .initialize_cache(num_gpu_blocks, 0)
+            .context("failed to initialize cache")?;
+
+        info!(
+            "Rank {}: num_gpu_blocks={}, kv_cache_tokens={}",
+            rank,
+            num_gpu_blocks,
+            num_gpu_blocks * config.block_size,
+        );
+
+        // Step 7: Warm up / CUDA graph capture.
+        worker
+            .compile_or_warm_up_model()
+            .context("failed to compile or warm up model")?;
+
+        // Step 8: Wrap in UniProcExecutor (single worker per process).
+        let executor = UniProcExecutor::new_pre_initialized(worker);
+
+        // Step 9: Build engine.
+        let eos_token_ids: Vec<u32> = hf_config
+            .extra
+            .get("eos_token_id")
+            .map(|v| {
+                if let Some(id) = v.as_u64() {
+                    vec![id as u32]
+                } else if let Some(arr) = v.as_array() {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|id| id as u32))
+                        .collect()
+                } else {
+                    vec![]
+                }
+            })
+            .unwrap_or_default();
+
+        let use_async_scheduling = !config.disable_async_scheduling;
+        let enable_prefix_caching = config.enable_prefix_caching;
+        let engine_config = EngineCoreConfig {
+            scheduler_config: SchedulerConfig {
+                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+                max_num_seqs: config.max_num_seqs,
+                policy: SchedulerPolicy::Fcfs,
+                enable_chunked_prefill: true,
+                async_scheduling: Some(use_async_scheduling),
+                num_lookahead_tokens: if config.speculative_model.is_some() {
+                    config.num_speculative_tokens
+                } else {
+                    0
+                },
+                ..Default::default()
+            },
+            max_model_len,
+            num_gpu_blocks,
+            block_size: config.block_size,
+            engine_index: 0,
+            async_scheduling: use_async_scheduling,
+            use_spec_decode: config.speculative_model.is_some(),
+            ngram_proposer_config: None,
+            eos_token_ids,
+            is_pooling: config.runner == "pooling",
+            enable_prefix_caching,
+        };
+
+        let client: Box<dyn vllm_engine::core_client::EngineCoreClient + Send> =
+            Box::new(InprocClient::new(engine_config, Box::new(executor)));
+
+        // Load tokenizer and build engine.
+        let tokenizer = model_dir
+            .as_ref()
+            .and_then(|dir| try_load_tokenizer(dir).ok());
+
+        let mut engine = if let Some(tok) = tokenizer {
+            let tokenizer = Arc::new(tok);
+            #[cfg(feature = "chat-template")]
+            {
+                if let Some(ref dir) = model_dir {
+                    if let Some(ct) = try_load_chat_template(dir) {
+                        info!("Chat template loaded from tokenizer_config.json");
+                        AsyncEngine::with_tokenizer_and_template(
+                            client,
+                            model_name.clone(),
+                            max_model_len,
+                            tokenizer,
+                            Arc::new(ct),
+                        )
+                    } else {
+                        AsyncEngine::with_tokenizer(
+                            client,
+                            model_name.clone(),
+                            max_model_len,
+                            tokenizer,
+                        )
+                    }
+                } else {
+                    AsyncEngine::with_tokenizer(
+                        client,
+                        model_name.clone(),
+                        max_model_len,
+                        tokenizer,
+                    )
+                }
+            }
+            #[cfg(not(feature = "chat-template"))]
+            {
+                AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
+            }
+        } else {
+            AsyncEngine::new(client, model_name.clone(), max_model_len)
+        };
+
+        if !config.disable_async_scheduling {
+            engine.set_async_scheduling(true);
+        }
+        if config.runner == "pooling" {
+            engine.set_is_pooling(true);
+        }
+
+        info!(
+            "Rank {}: stack initialized in {:.1}s (external launcher, world_size={})",
+            rank,
+            init_start.elapsed().as_secs_f64(),
+            world_size,
+        );
+
+        Ok(InitializedStack {
+            engine: Arc::new(engine),
+            model_name,
+            max_model_len,
+        })
+    }
+}
+
 /// Try to load a HuggingFace tokenizer from a model directory.
 fn try_load_tokenizer(model_dir: &Path) -> Result<Tokenizer> {
     let tokenizer_path = model_dir.join("tokenizer.json");
@@ -1617,5 +1955,265 @@ mod tests {
             ..VllmConfig::default()
         };
         assert_eq!(config.max_num_batched_tokens, Some(4096));
+    }
+
+    #[test]
+    fn test_vllm_config_default_distributed_backend() {
+        let config = VllmConfig::default();
+        assert_eq!(config.distributed_executor_backend, "auto");
+    }
+
+    #[test]
+    fn test_vllm_config_external_launcher() {
+        let config = VllmConfig {
+            distributed_executor_backend: "external_launcher".to_string(),
+            ..VllmConfig::default()
+        };
+        assert_eq!(config.distributed_executor_backend, "external_launcher");
+    }
+
+    // -- ExternalLauncherEnv tests --
+    // Note: these tests manipulate env vars, which is inherently global state.
+    // We use a mutex to serialize them and restore original values.
+
+    use std::sync::Mutex;
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Helper: set env vars, run closure, restore originals.
+    fn with_env_vars<F, R>(vars: &[(&str, Option<&str>)], f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        let mut originals = Vec::new();
+        for &(key, val) in vars {
+            originals.push((key, std::env::var(key).ok()));
+            // SAFETY: we hold ENV_MUTEX, serializing all env var access in tests.
+            unsafe {
+                match val {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        let result = f();
+        for (key, original) in originals {
+            // SAFETY: same mutex guard still held.
+            unsafe {
+                match original {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn test_external_launcher_env_all_vars_set() {
+        with_env_vars(
+            &[
+                ("RANK", Some("1")),
+                ("LOCAL_RANK", Some("1")),
+                ("WORLD_SIZE", Some("4")),
+                ("MASTER_ADDR", Some("10.0.0.1")),
+                ("MASTER_PORT", Some("29600")),
+            ],
+            || {
+                let config = VllmConfig::default();
+                let env = ExternalLauncherEnv::from_env(&config).unwrap();
+                assert_eq!(env.rank, 1);
+                assert_eq!(env.local_rank, 1);
+                assert_eq!(env.world_size, 4);
+                assert_eq!(env.master_addr, "10.0.0.1");
+                assert_eq!(env.master_port, 29600);
+            },
+        );
+    }
+
+    #[test]
+    fn test_external_launcher_env_fallback_master_addr() {
+        with_env_vars(
+            &[
+                ("RANK", Some("0")),
+                ("LOCAL_RANK", Some("0")),
+                ("WORLD_SIZE", Some("2")),
+                ("MASTER_ADDR", None),
+                ("MASTER_PORT", None),
+            ],
+            || {
+                let config = VllmConfig {
+                    master_addr: "my-host".to_string(),
+                    master_port: 12345,
+                    ..VllmConfig::default()
+                };
+                let env = ExternalLauncherEnv::from_env(&config).unwrap();
+                assert_eq!(env.master_addr, "my-host");
+                assert_eq!(env.master_port, 12345);
+            },
+        );
+    }
+
+    #[test]
+    fn test_external_launcher_env_missing_rank() {
+        with_env_vars(
+            &[
+                ("RANK", None),
+                ("LOCAL_RANK", Some("0")),
+                ("WORLD_SIZE", Some("2")),
+            ],
+            || {
+                let config = VllmConfig::default();
+                let err = ExternalLauncherEnv::from_env(&config).unwrap_err();
+                assert!(
+                    err.to_string().contains("RANK"),
+                    "error should mention RANK: {}",
+                    err
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_external_launcher_env_missing_local_rank() {
+        with_env_vars(
+            &[
+                ("RANK", Some("0")),
+                ("LOCAL_RANK", None),
+                ("WORLD_SIZE", Some("2")),
+            ],
+            || {
+                let config = VllmConfig::default();
+                let err = ExternalLauncherEnv::from_env(&config).unwrap_err();
+                assert!(
+                    err.to_string().contains("LOCAL_RANK"),
+                    "error should mention LOCAL_RANK: {}",
+                    err
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_external_launcher_env_missing_world_size() {
+        with_env_vars(
+            &[
+                ("RANK", Some("0")),
+                ("LOCAL_RANK", Some("0")),
+                ("WORLD_SIZE", None),
+            ],
+            || {
+                let config = VllmConfig::default();
+                let err = ExternalLauncherEnv::from_env(&config).unwrap_err();
+                assert!(
+                    err.to_string().contains("WORLD_SIZE"),
+                    "error should mention WORLD_SIZE: {}",
+                    err
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_external_launcher_env_invalid_rank() {
+        with_env_vars(
+            &[
+                ("RANK", Some("not_a_number")),
+                ("LOCAL_RANK", Some("0")),
+                ("WORLD_SIZE", Some("2")),
+            ],
+            || {
+                let config = VllmConfig::default();
+                let err = ExternalLauncherEnv::from_env(&config).unwrap_err();
+                assert!(
+                    err.to_string().contains("integer"),
+                    "error should mention integer: {}",
+                    err
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_external_launcher_env_tp_mismatch() {
+        with_env_vars(
+            &[
+                ("RANK", Some("0")),
+                ("LOCAL_RANK", Some("0")),
+                ("WORLD_SIZE", Some("4")),
+                ("MASTER_ADDR", Some("127.0.0.1")),
+                ("MASTER_PORT", Some("29500")),
+            ],
+            || {
+                let config = VllmConfig {
+                    tensor_parallel_size: 2, // mismatch with WORLD_SIZE=4
+                    ..VllmConfig::default()
+                };
+                let err = ExternalLauncherEnv::from_env(&config).unwrap_err();
+                assert!(
+                    err.to_string().contains("does not match"),
+                    "error should mention mismatch: {}",
+                    err
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_external_launcher_env_tp_size_one_no_mismatch() {
+        // tp_size=1 (default) should NOT conflict with any WORLD_SIZE.
+        with_env_vars(
+            &[
+                ("RANK", Some("0")),
+                ("LOCAL_RANK", Some("0")),
+                ("WORLD_SIZE", Some("8")),
+                ("MASTER_ADDR", Some("127.0.0.1")),
+                ("MASTER_PORT", Some("29500")),
+            ],
+            || {
+                let config = VllmConfig::default(); // tp_size=1
+                let env = ExternalLauncherEnv::from_env(&config).unwrap();
+                assert_eq!(env.world_size, 8);
+            },
+        );
+    }
+
+    #[test]
+    fn test_external_launcher_env_tp_matches_world_size() {
+        with_env_vars(
+            &[
+                ("RANK", Some("0")),
+                ("LOCAL_RANK", Some("0")),
+                ("WORLD_SIZE", Some("4")),
+                ("MASTER_ADDR", Some("127.0.0.1")),
+                ("MASTER_PORT", Some("29500")),
+            ],
+            || {
+                let config = VllmConfig {
+                    tensor_parallel_size: 4, // matches WORLD_SIZE=4
+                    ..VllmConfig::default()
+                };
+                let env = ExternalLauncherEnv::from_env(&config).unwrap();
+                assert_eq!(env.world_size, 4);
+            },
+        );
+    }
+
+    #[test]
+    fn test_external_launcher_env_rank0() {
+        with_env_vars(
+            &[
+                ("RANK", Some("0")),
+                ("LOCAL_RANK", Some("0")),
+                ("WORLD_SIZE", Some("1")),
+            ],
+            || {
+                let config = VllmConfig::default();
+                let env = ExternalLauncherEnv::from_env(&config).unwrap();
+                assert_eq!(env.rank, 0);
+                assert_eq!(env.local_rank, 0);
+                assert_eq!(env.world_size, 1);
+            },
+        );
     }
 }

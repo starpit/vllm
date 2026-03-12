@@ -218,6 +218,13 @@ pub struct ServeArgs {
     #[arg(long)]
     pub enforce_eager: bool,
 
+    /// Distributed executor backend: "auto" (default) or "external_launcher".
+    /// With "external_launcher", the job launcher (torchrun, mpirun, SLURM)
+    /// spawns N processes. Each reads RANK, LOCAL_RANK, WORLD_SIZE,
+    /// MASTER_ADDR, MASTER_PORT from env and runs its own engine instance.
+    #[arg(long, default_value = "auto")]
+    pub distributed_executor_backend: String,
+
     /// Disable prefix caching (KV cache reuse for shared prompt prefixes).
     /// By default, prefix caching is enabled.
     #[arg(long)]
@@ -1172,5 +1179,55 @@ mod tests {
     fn test_collect_env_no_args() {
         let cli = Cli::parse_from(["vllm", "collect-env"]);
         assert!(matches!(cli.command, Commands::CollectEnv(_)));
+    }
+
+    // -- distributed-executor-backend tests --
+
+    #[test]
+    fn test_serve_distributed_backend_default() {
+        let cli = Cli::parse_from(["vllm", "serve", "some-model"]);
+        match cli.command {
+            Commands::Serve(args) => {
+                assert_eq!(args.distributed_executor_backend, "auto");
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_serve_distributed_backend_external_launcher() {
+        let cli = Cli::parse_from([
+            "vllm",
+            "serve",
+            "some-model",
+            "--distributed-executor-backend",
+            "external_launcher",
+        ]);
+        match cli.command {
+            Commands::Serve(args) => {
+                assert_eq!(args.distributed_executor_backend, "external_launcher");
+            }
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_serve_distributed_backend_with_tp() {
+        let cli = Cli::parse_from([
+            "vllm",
+            "serve",
+            "some-model",
+            "--distributed-executor-backend",
+            "external_launcher",
+            "--tensor-parallel-size",
+            "4",
+        ]);
+        match cli.command {
+            Commands::Serve(args) => {
+                assert_eq!(args.distributed_executor_backend, "external_launcher");
+                assert_eq!(args.tensor_parallel_size, 4);
+            }
+            _ => panic!("expected Serve command"),
+        }
     }
 }

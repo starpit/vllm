@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Safetensors weight loading — streaming from CPU to GPU.
+//! Safetensors weight loading — pipelined from CPU to GPU.
 //!
-//! Matches Python vLLM's approach: weights stay on CPU (mmap'd) and are copied
-//! to GPU one at a time via `take()`. This ensures GPU memory usage during model
-//! loading is minimal — only the final model weights live on GPU, with no
-//! intermediate shard-level GPU buffers.
+//! Weights are memory-mapped on CPU. On first access, the OS pages data in from
+//! disk. We beat Python vLLM's default (serial mmap + synchronous H2D) with:
+//!
+//! 1. **madvise(WILLNEED)** on every shard at mmap time — OS starts prefetching
+//!    all pages from disk immediately, overlapping I/O across shards.
+//! 2. **Parallel shard loading** — multi-shard models parse headers concurrently.
+//! 3. **Background pre-cast pipeline** — a thread pool pre-faults mmap pages and
+//!    casts float tensors (F32→BF16/F16) into pinned host buffers ahead of
+//!    `take()` calls. The main thread just enqueues H2D DMAs from ready buffers,
+//!    overlapping CPU work with PCIe transfers.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
 use cudarc::driver::sys::CUstream;
@@ -135,29 +142,262 @@ impl CpuTensorRef {
 // GpuWeights
 // ---------------------------------------------------------------------------
 
-/// Model weights loaded lazily from CPU (mmap) to GPU.
+/// Parse a single shard file into a map of tensor references.
 ///
-/// Matches Python vLLM's streaming weight loading: weights are memory-mapped
-/// on CPU and copied to GPU one at a time when requested via `take()`.
-/// No shard-level GPU buffers are allocated.
+/// Mmaps the file, issues madvise(WILLNEED) + madvise(SEQUENTIAL) to trigger
+/// OS readahead, and parses the safetensors header. Returns tensor references
+/// pointing into the mmap — no data is copied.
+///
+/// This is a free function (not `&mut self`) so it can be called from parallel
+/// threads during multi-shard loading.
+fn load_shard_into_map(path: &Path) -> Result<HashMap<String, CpuTensorRef>> {
+    let file = std::fs::File::open(path)?;
+    let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file) }?);
+
+    // Tell the kernel to start paging in the entire shard from disk.
+    // This overlaps disk I/O with header parsing and subsequent shard loads.
+    #[cfg(unix)]
+    unsafe {
+        libc::madvise(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::MADV_WILLNEED,
+        );
+        // Sequential access hint for better readahead chunk sizes.
+        libc::madvise(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::MADV_SEQUENTIAL,
+        );
+    }
+
+    // Parse safetensors header to find tensor offsets.
+    let st = safetensors::SafeTensors::deserialize(&mmap)
+        .map_err(|e| anyhow::anyhow!("{}: {}", path.display(), e))?;
+
+    let mut tensors = HashMap::new();
+    for name in st.names() {
+        let view = st
+            .tensor(name)
+            .map_err(|e| anyhow::anyhow!("{}: {}", name, e))?;
+        let dtype = safetensors_dtype(view.dtype())?;
+        let data = view.data();
+        let size_bytes = data.len();
+        let shape: Vec<usize> = view.shape().to_vec();
+
+        let data_offset = data.as_ptr() as usize - mmap.as_ptr() as usize;
+
+        tensors.insert(
+            name.to_string(),
+            CpuTensorRef {
+                mmap: Some(Arc::clone(&mmap)),
+                data_offset,
+                size_bytes,
+                shape,
+                dtype,
+                owned: None,
+            },
+        );
+    }
+
+    tracing::info!(
+        "Parsed shard {}: {} tensors (mmap + madvise WILLNEED)",
+        path.display(),
+        tensors.len(),
+    );
+
+    Ok(tensors)
+}
+
+// ---------------------------------------------------------------------------
+// Pre-cast pipeline — background thread pre-faults + casts tensors into pinned
+// buffers so take() just enqueues a DMA from already-ready pinned memory.
+// ---------------------------------------------------------------------------
+
+/// Background worker: iterates through tensors, pre-faults mmap pages, casts
+/// float data into per-tensor pinned buffers, and stores results in `state.ready`.
+fn precast_worker(
+    state: Arc<PrecastState>,
+    target_dtype: Option<DType>,
+    work: Vec<(String, Arc<memmap2::Mmap>, usize, usize, DType)>,
+) {
+    let mut precast_count = 0usize;
+    let mut prefault_count = 0usize;
+
+    for (name, mmap, data_offset, size_bytes, dtype) in &work {
+        if state.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let data = &mmap[*data_offset..*data_offset + *size_bytes];
+
+        // Determine if this tensor needs casting.
+        let needs_cast = match target_dtype {
+            Some(target) => {
+                matches!(dtype, DType::F32 | DType::F16 | DType::BF16) && *dtype != target
+            }
+            None => false,
+        };
+
+        if needs_cast {
+            let target = target_dtype.unwrap();
+            // Cast into a freshly allocated pinned buffer.
+            match cast_into_pinned(data, *dtype, target) {
+                Ok(entry) => {
+                    state.ready.lock().unwrap().insert(name.clone(), entry);
+                    precast_count += 1;
+                }
+                Err(e) => {
+                    // Non-fatal — take() will fall back to synchronous path.
+                    tracing::debug!("Precast failed for {name}: {e}");
+                }
+            }
+        } else {
+            // No casting needed, but pre-fault the mmap pages by reading
+            // through the data. This ensures pages are in the page cache
+            // by the time take() does the H2D DMA.
+            prefault_pages(data);
+            prefault_count += 1;
+        }
+    }
+
+    tracing::info!(
+        "Precast pipeline done: {precast_count} tensors cast into pinned buffers, \
+         {prefault_count} tensors pre-faulted"
+    );
+}
+
+/// Pre-fault mmap pages by reading through the data at page-stride intervals.
+/// This triggers page faults now so take() doesn't block on disk I/O later.
+fn prefault_pages(data: &[u8]) {
+    // Read one byte per page (4KB) to fault each page into the page cache.
+    // The volatile read prevents the compiler from optimizing this away.
+    let page_size = 4096;
+    let mut offset = 0;
+    while offset < data.len() {
+        unsafe {
+            std::ptr::read_volatile(&data[offset]);
+        }
+        offset += page_size;
+    }
+}
+
+/// Cast tensor data into a new pinned host buffer.
+fn cast_into_pinned(data: &[u8], src_dtype: DType, target: DType) -> Result<PrecastEntry> {
+    let numel = data.len() / src_dtype.size_bytes();
+    let cast_size = numel * target.size_bytes();
+
+    // Allocate pinned host memory for this tensor.
+    let alloc_size = cast_size.next_power_of_two().max(4096);
+    let pinned_ptr = unsafe { driver::mem_alloc_host(alloc_size) }
+        .map_err(|e| anyhow::anyhow!("pinned alloc for precast: {e}"))?;
+
+    // Dispatch the cast.
+    match (src_dtype, target) {
+        (DType::F32, DType::BF16) => {
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, numel) };
+            let dst = unsafe { std::slice::from_raw_parts_mut(pinned_ptr as *mut u16, numel) };
+            for (s, d) in src.iter().zip(dst.iter_mut()) {
+                *d = half::bf16::from_f32(*s).to_bits();
+            }
+        }
+        (DType::F32, DType::F16) => {
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, numel) };
+            let dst = unsafe { std::slice::from_raw_parts_mut(pinned_ptr as *mut u16, numel) };
+            for (s, d) in src.iter().zip(dst.iter_mut()) {
+                *d = half::f16::from_f32(*s).to_bits();
+            }
+        }
+        (DType::F16, DType::BF16) => {
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, numel) };
+            let dst = unsafe { std::slice::from_raw_parts_mut(pinned_ptr as *mut u16, numel) };
+            for (s, d) in src.iter().zip(dst.iter_mut()) {
+                *d = half::bf16::from_f32(half::f16::from_bits(*s).to_f32()).to_bits();
+            }
+        }
+        (DType::BF16, DType::F16) => {
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, numel) };
+            let dst = unsafe { std::slice::from_raw_parts_mut(pinned_ptr as *mut u16, numel) };
+            for (s, d) in src.iter().zip(dst.iter_mut()) {
+                *d = half::f16::from_f32(half::bf16::from_bits(*s).to_f32()).to_bits();
+            }
+        }
+        (DType::BF16 | DType::F16, DType::F32) => {
+            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, numel) };
+            let dst = unsafe { std::slice::from_raw_parts_mut(pinned_ptr as *mut f32, numel) };
+            if src_dtype == DType::BF16 {
+                for (s, d) in src.iter().zip(dst.iter_mut()) {
+                    *d = half::bf16::from_bits(*s).to_f32();
+                }
+            } else {
+                for (s, d) in src.iter().zip(dst.iter_mut()) {
+                    *d = half::f16::from_bits(*s).to_f32();
+                }
+            }
+        }
+        _ => {
+            // Free and bail — shouldn't happen for float types.
+            unsafe { driver::mem_free_host(pinned_ptr).ok() };
+            bail!("unhandled cast: {src_dtype:?} → {target:?}");
+        }
+    }
+
+    Ok(PrecastEntry {
+        pinned_ptr,
+        size_bytes: cast_size,
+        dtype: target,
+    })
+}
+
+/// A pre-cast tensor ready for H2D DMA. Data lives in a pinned host buffer.
+struct PrecastEntry {
+    /// Pinned host buffer containing the (possibly cast) tensor data.
+    pinned_ptr: *mut u8,
+    /// Size of valid data in bytes.
+    size_bytes: usize,
+    /// The effective dtype after casting.
+    dtype: DType,
+}
+
+// Safety: pinned host memory is accessible from any thread.
+unsafe impl Send for PrecastEntry {}
+
+/// Shared state for the pre-cast pipeline.
+struct PrecastState {
+    /// Pre-cast tensors ready for take(). Protected by mutex — contention is
+    /// low because the producer adds entries one at a time and the consumer
+    /// (take()) removes them.
+    ready: Mutex<HashMap<String, PrecastEntry>>,
+    /// Signal for the background thread to stop (e.g. on drop).
+    shutdown: AtomicBool,
+}
+
+/// Model weights loaded from CPU (mmap) to GPU with pipelined pre-casting.
+///
+/// Weights are memory-mapped on CPU with madvise(WILLNEED) to trigger OS
+/// readahead. When `start_precast()` is called, a background thread pool
+/// pre-faults mmap pages and casts float tensors into pinned host buffers.
+/// `take()` checks for pre-cast data first — if ready, it just enqueues an
+/// async H2D DMA without blocking on page faults or CPU casting.
 ///
 /// GPU memory allocated by `take()` is NOT freed on drop — ownership transfers
-/// to the caller (model layers). This matches Python where `nn.Parameter` owns
-/// the weight tensors, not the loader.
+/// to the caller (model layers).
 pub struct GpuWeights {
     /// Per-tensor CPU references, keyed by tensor name.
     tensors: HashMap<String, CpuTensorRef>,
     /// Stream used for H2D copies.
     stream: CUstream,
     /// Target dtype for floating-point weights. When set, F32 weights are cast
-    /// to this dtype on CPU before H2D copy — matching Python vLLM where model
-    /// parameters are initialized with torch_dtype and PyTorch auto-casts during
-    /// `param.data.copy_(loaded_weight)`.
+    /// to this dtype on CPU before H2D copy.
     target_dtype: Option<DType>,
-    /// Reusable pinned host buffer for dtype casting. Using pinned memory
-    /// enables async DMA transfers, matching PyTorch's copy_ behavior.
+    /// Reusable pinned host buffer for synchronous dtype casting (fallback
+    /// when precast pipeline hasn't processed a tensor yet).
     /// (ptr, capacity_bytes). Grown as needed, never shrunk.
     cast_pinned: (*mut u8, usize),
+    /// Pre-cast pipeline state, shared with background thread.
+    precast: Option<Arc<PrecastState>>,
+    /// Join handle for the background precast thread.
+    precast_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 // Safety: GPU device pointers accessible from any host thread.
@@ -191,12 +431,18 @@ impl GpuWeights {
             stream,
             target_dtype: None,
             cast_pinned: (std::ptr::null_mut(), 0),
+            precast: None,
+            precast_handle: None,
         };
         gw.load_shard(path)?;
         Ok(gw)
     }
 
     /// Load from a sharded model (index.json) (CPU-only).
+    ///
+    /// Multiple shards are loaded in parallel — each thread mmaps a shard,
+    /// issues madvise(WILLNEED) to start readahead, and parses the header.
+    /// This overlaps disk I/O across shards.
     pub fn from_index(index_path: impl AsRef<Path>, stream: CUstream) -> Result<Self> {
         let index_path = index_path.as_ref();
         let dir = index_path
@@ -218,63 +464,59 @@ impl GpuWeights {
         shard_files.sort();
         shard_files.dedup();
 
-        let mut gw = Self {
-            tensors: HashMap::new(),
+        let total = shard_files.len();
+
+        if total <= 1 {
+            // Single shard — no need for threading.
+            let mut gw = Self {
+                tensors: HashMap::new(),
+                stream,
+                target_dtype: None,
+                cast_pinned: (std::ptr::null_mut(), 0),
+                precast: None,
+                precast_handle: None,
+            };
+            if let Some(name) = shard_files.first() {
+                gw.load_shard(&dir.join(name))?;
+            }
+            return Ok(gw);
+        }
+
+        // Multiple shards — load in parallel. Each thread mmaps a shard,
+        // triggers madvise(WILLNEED), and parses the header. This overlaps
+        // disk I/O and CPU-side parsing across shards.
+        tracing::info!("Loading {total} shards in parallel");
+
+        let shard_results: Vec<Result<HashMap<String, CpuTensorRef>>> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = shard_files
+                    .iter()
+                    .map(|shard_name| {
+                        let shard_path = dir.join(shard_name);
+                        scope.spawn(move || load_shard_into_map(&shard_path))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+        let mut tensors = HashMap::new();
+        for result in shard_results {
+            tensors.extend(result?);
+        }
+
+        Ok(Self {
+            tensors,
             stream,
             target_dtype: None,
             cast_pinned: (std::ptr::null_mut(), 0),
-        };
-
-        for shard_name in &shard_files {
-            let shard_path = dir.join(shard_name);
-            gw.load_shard(&shard_path)?;
-        }
-
-        Ok(gw)
+            precast: None,
+            precast_handle: None,
+        })
     }
 
-    /// Parse a shard file and store CPU-side tensor references.
+    /// Parse a shard file, madvise(WILLNEED), and store tensor references.
     fn load_shard(&mut self, path: &Path) -> Result<()> {
-        let file = std::fs::File::open(path)?;
-        let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file) }?);
-
-        // Parse safetensors header to find tensor offsets.
-        let st = safetensors::SafeTensors::deserialize(&mmap)
-            .map_err(|e| anyhow::anyhow!("{}: {}", path.display(), e))?;
-
-        let mut count = 0;
-        for name in st.names() {
-            let view = st
-                .tensor(name)
-                .map_err(|e| anyhow::anyhow!("{}: {}", name, e))?;
-            let dtype = safetensors_dtype(view.dtype())?;
-            let data = view.data();
-            let size_bytes = data.len();
-            let shape: Vec<usize> = view.shape().to_vec();
-
-            // Compute the offset of this tensor's data within the mmap.
-            let data_offset = data.as_ptr() as usize - mmap.as_ptr() as usize;
-
-            self.tensors.insert(
-                name.to_string(),
-                CpuTensorRef {
-                    mmap: Some(Arc::clone(&mmap)),
-                    data_offset,
-                    size_bytes,
-                    shape,
-                    dtype,
-                    owned: None,
-                },
-            );
-            count += 1;
-        }
-
-        tracing::info!(
-            "Parsed shard {}: {} tensors (CPU mmap, no GPU allocation)",
-            path.display(),
-            count,
-        );
-
+        self.tensors.extend(load_shard_into_map(path)?);
         Ok(())
     }
 
@@ -390,16 +632,88 @@ impl GpuWeights {
         self.target_dtype = Some(dtype);
     }
 
+    /// Start the background pre-cast pipeline.
+    ///
+    /// Spawns a thread that iterates through all tensors (largest first),
+    /// pre-faults their mmap pages (triggering disk I/O), and casts float
+    /// tensors into individual pinned host buffers. This runs concurrently
+    /// with model construction code calling `take()`.
+    ///
+    /// For tensors that don't need casting (already in target dtype), the
+    /// thread still pre-faults the mmap pages so they're resident in the page
+    /// cache by the time `take()` does the H2D DMA.
+    ///
+    /// Must be called after `set_target_dtype()`. Safe to call multiple times
+    /// (subsequent calls are no-ops if already running).
+    pub fn start_precast(&mut self) {
+        if self.precast.is_some() {
+            return; // Already running.
+        }
+
+        let target_dtype = self.target_dtype;
+
+        // Collect tensor metadata for the background thread. We give it
+        // clones of the CpuTensorRef data it needs (Arc<Mmap> is cheap to clone).
+        // Sort largest first so the biggest tensors start pre-faulting early.
+        let mut work: Vec<(String, Arc<memmap2::Mmap>, usize, usize, DType)> = self
+            .tensors
+            .iter()
+            .filter_map(|(name, r)| {
+                let mmap = r.mmap.as_ref()?.clone();
+                Some((name.clone(), mmap, r.data_offset, r.size_bytes, r.dtype))
+            })
+            .collect();
+        work.sort_by(|a, b| b.3.cmp(&a.3)); // Largest first.
+
+        let state = Arc::new(PrecastState {
+            ready: Mutex::new(HashMap::new()),
+            shutdown: AtomicBool::new(false),
+        });
+        self.precast = Some(Arc::clone(&state));
+
+        let handle = std::thread::Builder::new()
+            .name("weight-precast".into())
+            .spawn(move || {
+                precast_worker(state, target_dtype, work);
+            })
+            .expect("failed to spawn precast thread");
+        self.precast_handle = Some(handle);
+    }
+
     /// Remove a tensor by name and copy it to GPU. Returns a GPU tensor.
     ///
-    /// This is the primary weight loading method — matches Python's streaming
-    /// approach where each weight is copied to GPU on demand.
+    /// If the pre-cast pipeline has already processed this tensor, the H2D
+    /// DMA uses the pre-cast pinned buffer (fast path — no page faults or
+    /// CPU casting on the hot path). Otherwise falls back to synchronous
+    /// cast from the mmap.
     pub fn take(&mut self, name: &str) -> Result<GpuTensor> {
         let cpu_ref = self
             .tensors
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
 
+        // Fast path: check if precast pipeline has this tensor ready.
+        if let Some(entry) = self.take_precast(name) {
+            let gpu_ptr = unsafe { driver::mem_alloc(entry.size_bytes)? };
+            unsafe {
+                driver::memcpy_htod_async(
+                    gpu_ptr,
+                    entry.pinned_ptr as *const u8,
+                    entry.size_bytes,
+                    self.stream,
+                )?;
+            }
+            let tensor = unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, entry.dtype) };
+            // Free pinned buffer after DMA completes. We synchronize the stream
+            // to ensure the DMA has finished reading from the pinned buffer.
+            unsafe {
+                driver::stream_synchronize(self.stream)?;
+                driver::mem_free_host(entry.pinned_ptr).ok();
+            }
+            return Ok(tensor);
+        }
+
+        // Slow path: synchronous pre-fault + cast + DMA.
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
 
         let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
@@ -426,11 +740,29 @@ impl GpuWeights {
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
 
+        // Fast path: use pre-cast data if available.
+        if let Some(entry) = self.take_precast(name) {
+            driver::memcpy_htod_async(dst, entry.pinned_ptr as *const u8, entry.size_bytes, stream)?;
+            let size = entry.size_bytes;
+            // Sync before freeing the pinned source buffer.
+            driver::stream_synchronize(stream)?;
+            driver::mem_free_host(entry.pinned_ptr).ok();
+            return Ok(size);
+        }
+
+        // Slow path.
         let (data, size_bytes, _dtype) = self.maybe_cast_cpu(&cpu_ref);
 
         driver::memcpy_htod_async(dst, data, size_bytes, stream)?;
 
         Ok(size_bytes)
+    }
+
+    /// Try to take a pre-cast entry for the given tensor name.
+    fn take_precast(&self, name: &str) -> Option<PrecastEntry> {
+        let state = self.precast.as_ref()?;
+        let mut ready = state.ready.lock().ok()?;
+        ready.remove(name)
     }
 
     /// Take a tensor and return its data as a CPU `Vec<f32>`.
@@ -865,7 +1197,22 @@ impl GpuWeights {
 
 impl Drop for GpuWeights {
     fn drop(&mut self) {
-        // Free pinned cast buffer if allocated.
+        // Signal precast thread to stop and wait for it.
+        if let Some(state) = &self.precast {
+            state.shutdown.store(true, Ordering::Relaxed);
+        }
+        if let Some(handle) = self.precast_handle.take() {
+            handle.join().ok();
+        }
+        // Free any unconsumed precast pinned buffers.
+        if let Some(state) = &self.precast {
+            if let Ok(mut ready) = state.ready.lock() {
+                for (_name, entry) in ready.drain() {
+                    unsafe { driver::mem_free_host(entry.pinned_ptr).ok() };
+                }
+            }
+        }
+        // Free the synchronous pinned cast buffer if allocated.
         if !self.cast_pinned.0.is_null() {
             unsafe { driver::mem_free_host(self.cast_pinned.0).ok() };
         }
@@ -2360,6 +2707,8 @@ mod tests {
             stream: std::ptr::null_mut(),
             target_dtype: None,
             cast_pinned: (std::ptr::null_mut(), 0),
+            precast: None,
+            precast_handle: None,
         };
         gw.load_shard(&dir.path().join("model.safetensors"))
             .unwrap();
@@ -2464,6 +2813,8 @@ mod tests {
             stream: std::ptr::null_mut(),
             target_dtype: None,
             cast_pinned: (std::ptr::null_mut(), 0),
+            precast: None,
+            precast_handle: None,
         };
         gw.load_shard(&dir.path().join("model.safetensors"))
             .unwrap();

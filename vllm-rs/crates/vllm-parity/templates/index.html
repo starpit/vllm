@@ -494,6 +494,73 @@ td.notes-col { font-size: 0.8rem; color: var(--text-dim); max-width: 350px; }
 .section-title h2 { margin-bottom: 0; }
 .section-title .line { flex: 1; height: 1px; background: var(--border); }
 
+/* Heatmap styles */
+.heatmap-section { margin-bottom: 2.5rem; }
+.heatmap-section h3 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  color: var(--text-muted);
+}
+.heatmap-row {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 2rem;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+.plotly-hm {
+  background: transparent;
+  border-radius: var(--radius);
+}
+
+/* Block size selector */
+.bs-selector {
+  display: inline-flex;
+  gap: 0;
+  margin-bottom: 1.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.bs-selector button {
+  background: var(--surface);
+  border: none;
+  color: var(--text-muted);
+  padding: 0.4rem 1rem;
+  font-size: 0.8rem;
+  font-family: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  border-right: 1px solid var(--border);
+  transition: all 0.15s;
+}
+.bs-selector button:last-child { border-right: none; }
+.bs-selector button:hover { background: var(--surface-2); color: var(--text); }
+.bs-selector button.active {
+  background: var(--accent);
+  color: #fff;
+}
+.perf-legend {
+  display: flex;
+  gap: 1.5rem;
+  align-items: center;
+  margin-bottom: 1.5rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  flex-wrap: wrap;
+}
+.perf-legend-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.perf-legend-gradient {
+  width: 140px;
+  height: 14px;
+  border-radius: 3px;
+}
+
 /* Responsive */
 @media (max-width: 640px) {
   .hero h1 { font-size: 2.5rem; }
@@ -502,6 +569,7 @@ td.notes-col { font-size: 0.8rem; color: var(--text-dim); max-width: 350px; }
   .card-grid { grid-template-columns: 1fr; }
   .twin-tables { grid-template-columns: 1fr; }
   .hero-cards { grid-template-columns: 1fr; }
+  .heatmap-row { flex-direction: column; }
 }
 </style>
 </head>
@@ -548,14 +616,20 @@ td.notes-col { font-size: 0.8rem; color: var(--text-dim); max-width: 350px; }
       <div id="summary-grid"></div>
     </div>
     <div class="twin-col">
-      <div id="perf-grid">
-        <table class="summary-table">
-          <thead><tr><th>Benchmark</th><th>Rust vs Python</th><th>Status</th></tr></thead>
-          <tbody>
-            <tr><td colspan="3" class="perf-placeholder">Performance benchmarks coming soon</td></tr>
-          </tbody>
-        </table>
+      <div class="perf-legend">
+        <div class="perf-legend-bar">
+          <span>Rust slower</span>
+          <div class="perf-legend-gradient" style="background:linear-gradient(to right, #8c510a, #dfc27d, #f5f5f5, #80cdc1, #01665e)"></div>
+          <span>Rust faster</span>
+        </div>
+        <span style="color:var(--text-dim)">L40S GPU &middot; Qwen2.5 &middot; bs=</span>
+        <div class="bs-selector" id="bs-selector">
+          <button class="active" data-bs="16">16</button>
+          <button data-bs="32">32</button>
+        </div>
       </div>
+      <div id="perf-heatmaps"></div>
+      <div id="serve-heatmaps"></div>
     </div>
   </div>
 
@@ -573,6 +647,7 @@ td.notes-col { font-size: 0.8rem; color: var(--text-dim); max-width: 350px; }
 </div>
 </div>
 
+
 <div class="footer">
   <a href="https://github.com/vllm-project/vllm">github.com/vllm-project/vllm</a> &middot; vllm-rs
 </div>
@@ -586,6 +661,7 @@ td.notes-col { font-size: 0.8rem; color: var(--text-dim); max-width: 350px; }
 <script>
 const ROWS = /*__PARITY_ROWS__*/;
 const SUMMARIES = /*__PARITY_SUMMARIES__*/;
+const BENCH = /*__BENCH_DATA__*/;
 
 // ---- Routing ----
 function route() {
@@ -815,6 +891,286 @@ function highlightSection(name) {
     setTimeout(() => el.style.boxShadow = '', 2000);
   }
 }
+
+// ---- Performance heatmaps (SVG) ----
+
+// BrBG 9-stop diverging: brown (Rust slower) -> white -> teal (Rust faster)
+const BRBG = ['#8c510a','#bf812d','#dfc27d','#f6e8c3','#f5f5f5','#c7eae5','#80cdc1','#35978f','#01665e'];
+// Sequential blue for absolute serve metrics
+const SEQ = ['#1e1e2e','#2d4a7a','#3b7dd8','#64b5f6','#e1f5fe'];
+
+function shortModel(name) { return name.split('/').pop(); }
+
+function parseHex(hex) {
+  return [parseInt(hex.slice(1,3),16), parseInt(hex.slice(3,5),16), parseInt(hex.slice(5,7),16)];
+}
+
+function lerpColor(stops, t) {
+  t = Math.max(0, Math.min(1, t));
+  const n = stops.length - 1;
+  const i = Math.min(Math.floor(t * n), n - 1);
+  const f = t * n - i;
+  const a = parseHex(stops[i]), b = parseHex(stops[i + 1]);
+  const r = Math.round(a[0] + (b[0]-a[0])*f);
+  const g = Math.round(a[1] + (b[1]-a[1])*f);
+  const bl = Math.round(a[2] + (b[2]-a[2])*f);
+  return `rgb(${r},${g},${bl})`;
+}
+
+// Returns black or white depending on background luminance
+function textColor(bgHex) {
+  const [r,g,b] = typeof bgHex === 'string' && bgHex.startsWith('#') ? parseHex(bgHex) :
+    bgHex.match(/\d+/g).map(Number);
+  return (r*0.299 + g*0.587 + b*0.114) > 150 ? '#111' : '#fff';
+}
+
+function buildDeltaGrids(pyRows, rsRows, field, blockSize) {
+  const pyIdx = {}, rsIdx = {};
+  for (const r of pyRows) {
+    const m = shortModel(r.model);
+    if (String(r.block_size) !== String(blockSize)) continue;
+    if (!pyIdx[m]) pyIdx[m] = {};
+    pyIdx[m][`${r.input_len},${r.output_len}`] = r[field];
+  }
+  for (const r of rsRows) {
+    const m = shortModel(r.model);
+    if (String(r.block_size) !== String(blockSize)) continue;
+    if (!rsIdx[m]) rsIdx[m] = {};
+    rsIdx[m][`${r.input_len},${r.output_len}`] = r[field];
+  }
+  const result = [];
+  for (const model of Object.keys(rsIdx).sort()) {
+    const py = pyIdx[model] || {};
+    const rs = rsIdx[model];
+    const allKeys = new Set([...Object.keys(py), ...Object.keys(rs)]);
+    const ils = [...new Set([...allKeys].map(k => +k.split(',')[0]))].sort((a,b) => a-b);
+    const ols = [...new Set([...allKeys].map(k => +k.split(',')[1]))].sort((a,b) => a-b);
+    const grid = [];
+    for (const il of ils) {
+      const row = [];
+      for (const ol of ols) {
+        const key = `${il},${ol}`;
+        const pv = py[key], rv = rs[key];
+        if (pv !== undefined && rv !== undefined && pv !== 0) {
+          row.push(+((rv - pv) / pv * 100).toFixed(2));
+        } else {
+          row.push(null);
+        }
+      }
+      grid.push(row);
+    }
+    result.push({ model, input_lens: ils, output_lens: ols, grid });
+  }
+  return result;
+}
+
+function buildServeGrids(rows, field) {
+  const idx = {};
+  for (const r of rows) {
+    const m = shortModel(r.model);
+    if (!idx[m]) idx[m] = {};
+    idx[m][`${r.input_len},${r.output_len}`] = r[field];
+  }
+  const result = [];
+  for (const model of Object.keys(idx).sort()) {
+    const data = idx[model];
+    const keys = Object.keys(data);
+    const ils = [...new Set(keys.map(k => +k.split(',')[0]))].sort((a,b) => a-b);
+    const ols = [...new Set(keys.map(k => +k.split(',')[1]))].sort((a,b) => a-b);
+    const grid = [];
+    for (const il of ils) {
+      const row = [];
+      for (const ol of ols) {
+        const v = data[`${il},${ol}`];
+        row.push(v !== undefined ? +v : null);
+      }
+      grid.push(row);
+    }
+    result.push({ model, input_lens: ils, output_lens: ols, grid });
+  }
+  return result;
+}
+
+function svgHeatmap(data, opts) {
+  const { title, subtitle, colorFn, fmt, colorbarStops, colorbarLabels } = opts;
+  const nR = data.input_lens.length, nC = data.output_lens.length;
+  // Square grid: pick cell size so total grid is square
+  const gridSide = 320;
+  const cellW = gridSide / nC, cellH = gridSide / nR;
+  const cbW = 14, cbGap = 12; // colorbar width and gap
+  const pad = { l: 72, r: cbGap + cbW + 40, t: 44, b: 52 };
+  const w = pad.l + gridSide + pad.r;
+  const h = pad.t + gridSide + pad.b;
+
+  let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" style="font-family:'JetBrains Mono','Inter',monospace">`;
+
+  // Title
+  svg += `<text x="${pad.l + gridSide/2}" y="18" text-anchor="middle" fill="#f0f0f0" font-size="13" font-weight="600" font-family="Inter,sans-serif">${title}</text>`;
+  if (subtitle) {
+    svg += `<text x="${pad.l + gridSide/2}" y="33" text-anchor="middle" fill="#707070" font-size="10" font-family="Inter,sans-serif">${subtitle}</text>`;
+  }
+
+  // Cells — no borders
+  for (let r = 0; r < nR; r++) {
+    for (let c = 0; c < nC; c++) {
+      const v = data.grid[r][c];
+      const x = pad.l + c * cellW, y = pad.t + r * cellH;
+      if (v === null) {
+        svg += `<rect x="${x}" y="${y}" width="${cellW}" height="${cellH}" fill="#2a2a2a"/>`;
+      } else {
+        const bg = colorFn(v);
+        const fg = textColor(bg);
+        svg += `<rect x="${x}" y="${y}" width="${cellW}" height="${cellH}" fill="${bg}"/>`;
+        svg += `<text x="${x+cellW/2}" y="${y+cellH/2+4}" text-anchor="middle" fill="${fg}" font-size="11" font-weight="700">${fmt(v)}</text>`;
+      }
+    }
+  }
+
+  // Y-axis labels (input_lens)
+  for (let r = 0; r < nR; r++) {
+    svg += `<text x="${pad.l-6}" y="${pad.t + r*cellH + cellH/2 + 4}" text-anchor="end" fill="#b0b0b0" font-size="11">${data.input_lens[r]}</text>`;
+  }
+  // X-axis labels (output_lens)
+  for (let c = 0; c < nC; c++) {
+    svg += `<text x="${pad.l + c*cellW + cellW/2}" y="${pad.t + gridSide + 16}" text-anchor="middle" fill="#b0b0b0" font-size="11">${data.output_lens[c]}</text>`;
+  }
+
+  // Axis titles
+  svg += `<text x="${pad.l + gridSide/2}" y="${h-4}" text-anchor="middle" fill="#707070" font-size="10" font-family="Inter,sans-serif">Output Length</text>`;
+  svg += `<text x="12" y="${pad.t + gridSide/2}" text-anchor="middle" fill="#707070" font-size="10" font-family="Inter,sans-serif" transform="rotate(-90,12,${pad.t + gridSide/2})">Input Length</text>`;
+
+  // Colorbar
+  if (colorbarStops && colorbarLabels) {
+    const cbX = pad.l + gridSide + cbGap;
+    const cbH = gridSide;
+    const gradId = 'cg' + Math.random().toString(36).slice(2,8);
+    svg += `<defs><linearGradient id="${gradId}" x1="0" y1="0" x2="0" y2="1">`;
+    for (let i = 0; i < colorbarStops.length; i++) {
+      const pct = (i / (colorbarStops.length - 1) * 100).toFixed(1);
+      svg += `<stop offset="${pct}%" stop-color="${colorbarStops[i]}"/>`;
+    }
+    svg += `</linearGradient></defs>`;
+    svg += `<rect x="${cbX}" y="${pad.t}" width="${cbW}" height="${cbH}" fill="url(#${gradId})"/>`;
+    // Labels: top, middle, bottom
+    for (let i = 0; i < colorbarLabels.length; i++) {
+      const yPos = pad.t + (i / (colorbarLabels.length - 1)) * cbH + 4;
+      svg += `<text x="${cbX + cbW + 4}" y="${yPos}" fill="#b0b0b0" font-size="9" font-family="Inter,sans-serif">${colorbarLabels[i]}</text>`;
+    }
+  }
+
+  svg += '</svg>';
+  return svg;
+}
+
+function deltaColorFn(inverted) {
+  return function(v, vmax) {
+    // map v from [-vmax, vmax] to [0, 1]
+    let t = (v + vmax) / (2 * vmax);
+    if (inverted) t = 1 - t; // latency: positive = bad = brown
+    return lerpColor(BRBG, t);
+  };
+}
+
+function seqColorFn(vmin, vmax) {
+  return function(v) {
+    const t = vmax > vmin ? (v - vmin) / (vmax - vmin) : 0.5;
+    return lerpColor(SEQ, t);
+  };
+}
+
+let currentBlockSize = '16';
+
+function renderPerfHeatmaps() {
+  const bs = currentBlockSize;
+  const container = document.getElementById('perf-heatmaps');
+
+  const latGrids = buildDeltaGrids(BENCH.latency_python, BENCH.latency_rust, 'avg', bs);
+  const tpReqGrids = buildDeltaGrids(BENCH.throughput_python, BENCH.throughput_rust, 'req_per_s', bs);
+  const allModels = [...new Set([...latGrids, ...tpReqGrids].map(g => g.model))].sort();
+
+  let html = '';
+  for (const model of allModels) {
+    const lat = latGrids.find(g => g.model === model);
+    const tpReq = tpReqGrids.find(g => g.model === model);
+    html += `<div class="heatmap-section"><h3>${model}</h3><div class="heatmap-row">`;
+
+    for (const [data, title, subtitle, inverted] of [
+      [lat, 'Latency Δ%', '(+ = Rust slower)', true],
+      [tpReq, 'Throughput req/s Δ%', '(+ = Rust faster)', false],
+    ]) {
+      if (!data) continue;
+      const flat = data.grid.flat().filter(v => v !== null);
+      const vmax = Math.max(1, ...flat.map(v => Math.abs(v)));
+      const cfn = deltaColorFn(inverted);
+      const vmaxR = Math.round(vmax);
+      // Always: teal (faster) at top, brown (slower) at bottom
+      // BRBG = brown→teal, so reverse it to get teal(top)→brown(bottom)
+      const cbStops = [...BRBG].reverse();
+      // Labels: top=faster, bottom=slower
+      // Latency (inverted): faster = negative delta; Throughput: faster = positive delta
+      const cbLabels = inverted
+        ? [`−${vmaxR}%`, '0%', `+${vmaxR}%`]
+        : [`+${vmaxR}%`, '0%', `−${vmaxR}%`];
+      html += `<div class="plotly-hm">${svgHeatmap(data, {
+        title, subtitle,
+        colorFn: v => cfn(v, vmax),
+        fmt: v => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`,
+        colorbarStops: cbStops,
+        colorbarLabels: cbLabels,
+      })}</div>`;
+    }
+    html += '</div></div>';
+  }
+  container.innerHTML = html;
+}
+
+function renderServeHeatmaps() {
+  const container = document.getElementById('serve-heatmaps');
+  const allServe = [...BENCH.serve_rust, ...BENCH.serve_rust_14b];
+
+  const metrics = [
+    { field: 'output_tok_per_s', title: 'Output tok/s', unit: ' tok/s', decimals: 0 },
+    { field: 'req_per_s', title: 'Requests/s', unit: ' req/s', decimals: 1 },
+    { field: 'median_tpot_ms', title: 'Median TPOT', unit: ' ms', decimals: 1 },
+    { field: 'median_ttft_ms', title: 'Median TTFT', unit: ' ms', decimals: 0 },
+  ];
+
+  let html = '';
+  for (const { field, title, unit, decimals } of metrics) {
+    const grids = buildServeGrids(allServe, field);
+    if (grids.length === 0) continue;
+
+    html += `<div class="heatmap-section"><h3>${title}</h3><div class="heatmap-row">`;
+    for (const data of grids) {
+      const flat = data.grid.flat().filter(v => v !== null);
+      const vmin = Math.min(...flat), vmax = Math.max(...flat);
+      const cfn = seqColorFn(vmin, vmax);
+      const fmtLabel = v => decimals === 0 ? Math.round(v).toLocaleString() : v.toFixed(decimals);
+      html += `<div class="plotly-hm">${svgHeatmap(data, {
+        title: data.model, subtitle: null,
+        colorFn: v => cfn(v),
+        fmt: fmtLabel,
+        colorbarStops: SEQ,
+        colorbarLabels: [fmtLabel(vmin), fmtLabel((vmin+vmax)/2), fmtLabel(vmax)],
+      })}</div>`;
+    }
+    html += '</div></div>';
+  }
+  container.innerHTML = html;
+}
+
+// Block size selector
+document.getElementById('bs-selector').addEventListener('click', function(e) {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  this.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  currentBlockSize = btn.dataset.bs;
+  renderPerfHeatmaps();
+});
+
+renderPerfHeatmaps();
+renderServeHeatmaps();
 </script>
 </body>
 </html>

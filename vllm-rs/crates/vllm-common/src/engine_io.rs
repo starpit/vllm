@@ -206,7 +206,7 @@ impl EngineCoreOutput {
 
 /// Scheduler statistics piggybacked on engine-core outputs so the serving
 /// layer can update Prometheus gauges without direct access to the engine.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerStats {
     /// Number of requests currently running.
     pub num_running_reqs: usize,
@@ -220,6 +220,23 @@ pub struct SchedulerStats {
     pub gpu_cache_blocks_total: usize,
     /// Number of blocks retained in the prefix cache.
     pub num_cached_blocks: usize,
+    /// Speculative decoding metrics (None when spec decode is disabled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_decode_stats: Option<SpecDecodingStats>,
+}
+
+/// Speculative decoding metrics, matching Python's `SpecDecodingStats`.
+///
+/// Tracks acceptance rates and draft token counts for monitoring spec decode
+/// performance. Updated after each engine step.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpecDecodingStats {
+    /// Number of requests that had draft tokens this step.
+    pub num_drafts: usize,
+    /// Total draft tokens proposed across all requests.
+    pub num_draft_tokens: usize,
+    /// Total draft tokens accepted across all requests.
+    pub num_accepted_tokens: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +536,7 @@ mod tests {
             gpu_cache_blocks_used: 100,
             gpu_cache_blocks_total: 1024,
             num_cached_blocks: 0,
+            spec_decode_stats: None,
         };
         assert_eq!(stats.num_running_reqs, 5);
         assert_eq!(stats.num_waiting_reqs, 3);

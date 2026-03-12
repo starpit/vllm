@@ -60,6 +60,14 @@ pub struct VllmMetrics {
     pub gpu_cache_blocks_total: IntGauge,
     /// Number of blocks retained in the prefix cache.
     pub prefix_cache_blocks: IntGauge,
+
+    // -- Speculative decoding counters --
+    /// Total number of spec decode draft rounds.
+    pub spec_decode_num_drafts: IntCounter,
+    /// Total number of draft tokens proposed.
+    pub spec_decode_num_draft_tokens: IntCounter,
+    /// Total number of draft tokens accepted.
+    pub spec_decode_num_accepted_tokens: IntCounter,
 }
 
 impl VllmMetrics {
@@ -189,6 +197,27 @@ impl VllmMetrics {
             )
             .unwrap();
 
+            let spec_decode_num_drafts = register_int_counter_with_registry!(
+                "spec_decode_num_drafts",
+                "Total number of spec decode draft rounds",
+                registry
+            )
+            .unwrap();
+
+            let spec_decode_num_draft_tokens = register_int_counter_with_registry!(
+                "spec_decode_num_draft_tokens",
+                "Total number of draft tokens proposed",
+                registry
+            )
+            .unwrap();
+
+            let spec_decode_num_accepted_tokens = register_int_counter_with_registry!(
+                "spec_decode_num_accepted_tokens",
+                "Total number of draft tokens accepted",
+                registry
+            )
+            .unwrap();
+
             VllmMetrics {
                 registry,
                 requests_total,
@@ -206,6 +235,9 @@ impl VllmMetrics {
                 gpu_cache_blocks_used,
                 gpu_cache_blocks_total,
                 prefix_cache_blocks,
+                spec_decode_num_drafts,
+                spec_decode_num_draft_tokens,
+                spec_decode_num_accepted_tokens,
             }
         })
     }

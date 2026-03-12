@@ -107,6 +107,12 @@ pub struct SchedulerConfig {
     /// The interval (or buffer size) for streaming in terms of token length.
     #[serde(default = "one")]
     pub stream_interval: usize,
+
+    /// Number of lookahead tokens for speculative decoding.
+    /// Set to `num_speculative_tokens` when spec decode is enabled, 0 otherwise.
+    /// Used by the KV cache allocator to reserve extra blocks for draft tokens.
+    #[serde(default)]
+    pub num_lookahead_tokens: usize,
 }
 
 fn one() -> usize {
@@ -161,6 +167,7 @@ impl Default for SchedulerConfig {
             disable_hybrid_kv_cache_manager: None,
             async_scheduling: None,
             stream_interval: 1,
+            num_lookahead_tokens: 0,
         }
     }
 }

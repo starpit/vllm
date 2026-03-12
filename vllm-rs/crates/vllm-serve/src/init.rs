@@ -448,6 +448,11 @@ fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,
             async_scheduling: Some(use_async_scheduling),
+            num_lookahead_tokens: if config.speculative_model.is_some() {
+                config.num_speculative_tokens
+            } else {
+                0
+            },
             ..Default::default()
         },
         max_model_len,
@@ -461,6 +466,7 @@ fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
                 num_speculative_tokens: config.num_speculative_tokens,
                 max_ngram_size: config.ngram_prompt_lookup_max,
                 min_ngram_size: config.ngram_prompt_lookup_min,
+                max_model_len,
             })
         } else {
             None
@@ -891,6 +897,11 @@ fn initialize_stack_tp(
                 policy: SchedulerPolicy::Fcfs,
                 enable_chunked_prefill: true,
                 async_scheduling: Some(use_async_scheduling),
+                num_lookahead_tokens: if config.speculative_model.is_some() {
+                    config.num_speculative_tokens
+                } else {
+                    0
+                },
                 ..Default::default()
             },
             max_model_len,

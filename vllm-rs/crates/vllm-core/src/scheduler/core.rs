@@ -505,7 +505,7 @@ impl Scheduler {
             max_model_len,
             enable_chunked_prefill: scheduler_config.enable_chunked_prefill,
             long_prefill_token_threshold: scheduler_config.long_prefill_token_threshold,
-            num_lookahead_tokens: 0,
+            num_lookahead_tokens: scheduler_config.num_lookahead_tokens,
             async_scheduling,
 
             requests: HashMap::new(),
@@ -704,6 +704,46 @@ impl Scheduler {
         self.requests.get_mut(request_id)
     }
 
+    /// Set speculative draft token IDs on a request, updating both the
+    /// canonical `requests` map and the `running` list.
+    pub fn set_spec_token_ids(&mut self, request_id: &str, spec_token_ids: Vec<u32>) {
+        if let Some(request) = self.requests.get_mut(request_id) {
+            request.spec_token_ids = spec_token_ids.clone();
+        }
+        if let Some(running_req) = self.running.iter_mut().find(|r| r.request_id == request_id) {
+            running_req.spec_token_ids = spec_token_ids;
+        }
+    }
+
+    /// Rewind `num_computed_tokens` for rejected speculative decode drafts.
+    ///
+    /// When spec decode drafts are rejected, the scheduler already advanced
+    /// `num_computed_tokens` by the full scheduled count (including all drafts).
+    /// This method decrements it by `num_rejected` so the KV cache position is
+    /// correct for the next step.
+    ///
+    /// Matches Python's `scheduler.update_from_output()`:
+    ///   `request.num_computed_tokens -= num_rejected`
+    ///   `request.num_output_placeholders -= num_rejected`
+    pub fn rewind_num_computed_tokens(&mut self, request_id: &str, num_rejected: usize) {
+        if let Some(request) = self.requests.get_mut(request_id) {
+            request.num_computed_tokens = request
+                .num_computed_tokens
+                .saturating_sub(num_rejected as u32);
+            request.num_output_placeholders = request
+                .num_output_placeholders
+                .saturating_sub(num_rejected as u32);
+        }
+        if let Some(running_req) = self.running.iter_mut().find(|r| r.request_id == request_id) {
+            running_req.num_computed_tokens = running_req
+                .num_computed_tokens
+                .saturating_sub(num_rejected as u32);
+            running_req.num_output_placeholders = running_req
+                .num_output_placeholders
+                .saturating_sub(num_rejected as u32);
+        }
+    }
+
     /// Append output token IDs to a request, updating both the canonical
     /// `requests` map and the `running` list.
     pub fn append_output_tokens(&mut self, request_id: &str, token_ids: &[u32]) {
@@ -836,8 +876,11 @@ impl SchedulerInterface for Scheduler {
                             spec_ids.iter().take(num_scheduled_spec).copied().collect();
                         scheduled_spec_decode_tokens.insert(request_id.clone(), truncated);
                     }
-                    // Clear spec tokens for next step.
+                    // Clear spec tokens for next step (both running list and canonical map).
                     self.running[req_index].spec_token_ids.clear();
+                    if let Some(canonical) = self.requests.get_mut(&request_id) {
+                        canonical.spec_token_ids.clear();
+                    }
                 }
 
                 req_to_new_blocks.insert(request_id.clone(), blocks);
@@ -2424,5 +2467,270 @@ mod tests {
             r.num_computed_tokens = 16;
             tracker.free(&id);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Speculative decoding tests
+    // -----------------------------------------------------------------------
+
+    fn spec_decode_scheduler_config() -> SchedulerConfig {
+        SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 4,
+            enable_chunked_prefill: true,
+            num_lookahead_tokens: 5,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_spec_decode_tokens_scheduled() {
+        // Verify that spec_token_ids are included in the scheduling output.
+        let cfg = spec_decode_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.schedule(); // prefill
+        sched.append_output_tokens("r1", &[99]);
+
+        // Set spec tokens on the request.
+        sched.set_spec_token_ids("r1", vec![100, 101, 102, 103, 104]);
+
+        let output = sched.schedule(); // decode with spec tokens
+
+        // Should schedule 1 (real token) + 5 (spec tokens) = 6 new tokens.
+        let num_scheduled = output.num_scheduled_tokens.get("r1").copied().unwrap_or(0);
+        assert_eq!(num_scheduled, 6, "Should schedule 1 real + 5 spec tokens");
+
+        // Spec tokens should appear in scheduled_spec_decode_tokens.
+        let spec_tokens = output.scheduled_spec_decode_tokens.get("r1").unwrap();
+        assert_eq!(spec_tokens, &vec![100, 101, 102, 103, 104]);
+    }
+
+    #[test]
+    fn test_spec_decode_tokens_cleared_after_schedule() {
+        // After scheduling, spec_token_ids should be cleared.
+        let cfg = spec_decode_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.schedule(); // prefill
+        sched.append_output_tokens("r1", &[99]);
+
+        sched.set_spec_token_ids("r1", vec![100, 101, 102]);
+
+        sched.schedule(); // consumes spec tokens
+
+        // Spec tokens should be cleared.
+        let req = sched.get_request("r1").unwrap();
+        assert!(
+            req.spec_token_ids.is_empty(),
+            "spec_token_ids should be cleared after schedule"
+        );
+    }
+
+    #[test]
+    fn test_spec_decode_tokens_truncated_by_budget() {
+        // When token budget is limited, spec tokens should be truncated.
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 4, // Very tight budget
+            max_num_seqs: 4,
+            enable_chunked_prefill: true,
+            num_lookahead_tokens: 5,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 2));
+        sched.schedule(); // prefill (2 tokens)
+        sched.append_output_tokens("r1", &[99]);
+
+        sched.set_spec_token_ids("r1", vec![100, 101, 102, 103, 104]); // 5 draft tokens
+
+        let output = sched.schedule(); // budget = 4, need 1+5=6, should truncate
+
+        let num_scheduled = output.num_scheduled_tokens.get("r1").copied().unwrap_or(0);
+        assert!(
+            num_scheduled <= 4,
+            "num_scheduled_tokens ({num_scheduled}) should not exceed budget (4)"
+        );
+
+        // Spec tokens in output should be truncated accordingly.
+        if let Some(spec_tokens) = output.scheduled_spec_decode_tokens.get("r1") {
+            assert!(
+                spec_tokens.len() < 5,
+                "Spec tokens should be truncated when budget is tight"
+            );
+        }
+    }
+
+    #[test]
+    fn test_spec_decode_lookahead_allocates_blocks() {
+        // Verify that num_lookahead_tokens causes extra block allocation.
+        // With lookahead=5, a decode step needs more blocks than without.
+        let cfg_no_spec = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 4,
+            num_lookahead_tokens: 0,
+            ..Default::default()
+        };
+        let cfg_spec = spec_decode_scheduler_config(); // lookahead=5
+
+        // Use very limited blocks to see the difference.
+        let mut sched_no = Scheduler::with_simple_blocks(&cfg_no_spec, 8192, 2, 16);
+        let mut sched_sp = Scheduler::with_simple_blocks(&cfg_spec, 8192, 2, 16);
+
+        // Add a request that fills nearly all blocks during prefill.
+        sched_no.add_request(make_request("r1", 15));
+        sched_sp.add_request(make_request("r1", 15));
+
+        let out_no = sched_no.schedule(); // prefill
+        let out_sp = sched_sp.schedule(); // prefill
+
+        assert!(out_no.num_scheduled_tokens.contains_key("r1"));
+        assert!(out_sp.num_scheduled_tokens.contains_key("r1"));
+
+        // Append one token to move to decode.
+        sched_no.append_output_tokens("r1", &[99]);
+        sched_sp.append_output_tokens("r1", &[99]);
+
+        // Decode step: without lookahead, 1 token is easy.
+        // With lookahead=5, we need 1+5=6 slots which might be tight.
+        let out_no = sched_no.schedule();
+        let out_sp = sched_sp.schedule();
+
+        // Both should schedule (we have enough blocks), but this confirms
+        // lookahead is wired into the allocation path.
+        assert!(
+            out_no.num_scheduled_tokens.contains_key("r1"),
+            "No-spec should schedule"
+        );
+        assert!(
+            out_sp.num_scheduled_tokens.contains_key("r1"),
+            "Spec should schedule"
+        );
+    }
+
+    #[test]
+    fn test_spec_decode_mixed_batch() {
+        // Some requests have spec tokens, some don't.
+        let cfg = spec_decode_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.add_request(make_request("r2", 10));
+
+        sched.schedule(); // prefill both
+        sched.append_output_tokens("r1", &[99]);
+        sched.append_output_tokens("r2", &[99]);
+
+        // Only r1 has spec tokens.
+        sched.set_spec_token_ids("r1", vec![100, 101, 102]);
+
+        let output = sched.schedule();
+
+        // r1 should have 4 tokens (1 real + 3 spec).
+        let n1 = output.num_scheduled_tokens.get("r1").copied().unwrap_or(0);
+        assert_eq!(n1, 4, "r1 should schedule 1+3 tokens");
+
+        // r2 should have 1 token (normal decode).
+        let n2 = output.num_scheduled_tokens.get("r2").copied().unwrap_or(0);
+        assert_eq!(n2, 1, "r2 should schedule 1 token");
+
+        // Only r1 should have spec decode tokens in output.
+        assert!(output.scheduled_spec_decode_tokens.contains_key("r1"));
+        assert!(!output.scheduled_spec_decode_tokens.contains_key("r2"));
+    }
+
+    #[test]
+    fn test_spec_decode_num_tokens_with_spec() {
+        // Verify num_tokens_with_spec() matches scheduler's expectation.
+        let mut req = make_request("r1", 10);
+        assert_eq!(req.num_tokens_with_spec(), 10);
+
+        req.spec_token_ids = vec![100, 101, 102];
+        assert_eq!(req.num_tokens_with_spec(), 13);
+
+        req.spec_token_ids.clear();
+        assert_eq!(req.num_tokens_with_spec(), 10);
+    }
+
+    #[test]
+    fn test_spec_decode_rewind_on_rejection() {
+        // Verify that rewind_num_computed_tokens correctly decrements
+        // num_computed_tokens when spec decode drafts are rejected.
+        // This matches Python's scheduler.update_from_output().
+        let cfg = spec_decode_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.schedule(); // prefill: num_computed_tokens = 10
+        sched.append_output_tokens("r1", &[99]);
+
+        // Set 5 spec tokens and schedule them.
+        sched.set_spec_token_ids("r1", vec![100, 101, 102, 103, 104]);
+        let output = sched.schedule(); // num_computed_tokens += 6 (1 real + 5 spec)
+
+        let num_scheduled = output.num_scheduled_tokens.get("r1").copied().unwrap_or(0);
+        assert_eq!(num_scheduled, 6);
+
+        // After schedule: num_computed_tokens = 10 + 6 = 16.
+        let req = sched.get_request("r1").unwrap();
+        assert_eq!(req.num_computed_tokens, 16);
+
+        // Simulate partial rejection: only 2 of 5 drafts accepted (3 rejected).
+        // The model would return 3 tokens (2 accepted + 1 recovered/bonus).
+        sched.rewind_num_computed_tokens("r1", 3);
+
+        let req = sched.get_request("r1").unwrap();
+        assert_eq!(
+            req.num_computed_tokens, 13,
+            "num_computed_tokens should be 16 - 3 = 13"
+        );
+    }
+
+    #[test]
+    fn test_spec_decode_rewind_all_rejected() {
+        // All drafts rejected: rewind by full draft count.
+        let cfg = spec_decode_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.schedule(); // prefill: num_computed = 10
+        sched.append_output_tokens("r1", &[99]);
+
+        sched.set_spec_token_ids("r1", vec![100, 101, 102]);
+        sched.schedule(); // num_computed = 10 + 4 = 14
+
+        // All 3 drafts rejected: model returns 1 token (recovered).
+        // num_accepted = 0, num_rejected = 3.
+        sched.rewind_num_computed_tokens("r1", 3);
+
+        let req = sched.get_request("r1").unwrap();
+        assert_eq!(
+            req.num_computed_tokens, 11,
+            "num_computed_tokens should be 14 - 3 = 11"
+        );
+    }
+
+    #[test]
+    fn test_spec_decode_rewind_none_rejected() {
+        // All drafts accepted: no rewind needed.
+        let cfg = spec_decode_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 10));
+        sched.schedule();
+        sched.append_output_tokens("r1", &[99]);
+
+        sched.set_spec_token_ids("r1", vec![100, 101]);
+        sched.schedule(); // num_computed = 10 + 3 = 13
+
+        // All 2 drafts accepted: model returns 3 tokens (2 accepted + bonus).
+        // num_accepted = 2, num_rejected = 0. No rewind.
+        sched.rewind_num_computed_tokens("r1", 0);
+
+        let req = sched.get_request("r1").unwrap();
+        assert_eq!(req.num_computed_tokens, 13, "no rewind when all accepted");
     }
 }

@@ -374,6 +374,7 @@ impl EngineCore {
             gpu_cache_blocks_used: self.scheduler.num_used_blocks(),
             gpu_cache_blocks_total: self.scheduler.num_total_blocks(),
             num_cached_blocks: self.scheduler.num_cached_blocks(),
+            spec_decode_stats: None,
         };
 
         // 2. Process any pending aborts.
@@ -399,17 +400,67 @@ impl EngineCore {
                     .all_token_ids
                     .clone();
                 let drafts = proposer.propose(&all_token_ids);
-                if !drafts.is_empty()
-                    && let Some(req_mut) = self.scheduler.get_request_mut(req_id)
-                {
-                    req_mut.spec_token_ids = drafts;
+                if !drafts.is_empty() {
+                    self.scheduler.set_spec_token_ids(req_id, drafts);
                 }
             }
         }
 
-        // 5. Attach pre-captured scheduler stats to outputs.
+        // 5. Compute spec decode metrics.
+        let spec_decode_stats = if !scheduler_output.scheduled_spec_decode_tokens.is_empty() {
+            let mut num_drafts = 0usize;
+            let mut num_draft_tokens = 0usize;
+            let mut num_accepted_tokens = 0usize;
+
+            for (req_id, draft_tokens) in &scheduler_output.scheduled_spec_decode_tokens {
+                if draft_tokens.is_empty() {
+                    continue;
+                }
+                num_drafts += 1;
+                num_draft_tokens += draft_tokens.len();
+
+                // Count accepted: compare draft tokens against actual output.
+                if let Some(output_tokens) = model_output.get_tokens(req_id) {
+                    // output_tokens = [accepted_0, accepted_1, ..., bonus_or_recovered]
+                    // draft_tokens = [draft_0, draft_1, ...]
+                    // Accepted = min(output_tokens.len() - 1, draft_tokens.len())
+                    // because output always has at least 1 token (the bonus/recovered).
+                    let accepted = output_tokens
+                        .len()
+                        .saturating_sub(1)
+                        .min(draft_tokens.len());
+                    num_accepted_tokens += accepted;
+                }
+            }
+
+            if num_drafts > 0 {
+                let acceptance_rate = if num_draft_tokens > 0 {
+                    num_accepted_tokens as f64 / num_draft_tokens as f64
+                } else {
+                    0.0
+                };
+                debug!(
+                    "Spec decode: {num_drafts} reqs, {num_draft_tokens} drafts, \
+                     {num_accepted_tokens} accepted ({:.1}%)",
+                    acceptance_rate * 100.0
+                );
+                Some(vllm_common::SpecDecodingStats {
+                    num_drafts,
+                    num_draft_tokens,
+                    num_accepted_tokens,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 6. Attach pre-captured scheduler stats to outputs.
+        let mut stats = stats;
+        stats.spec_decode_stats = spec_decode_stats;
         for engine_outputs in outputs.values_mut() {
-            engine_outputs.scheduler_stats = Some(stats);
+            engine_outputs.scheduler_stats = Some(stats.clone());
         }
 
         outputs
@@ -481,6 +532,27 @@ impl EngineCore {
             if !new_token_ids_slice.is_empty() {
                 self.scheduler
                     .append_output_tokens(req_id, new_token_ids_slice);
+            }
+
+            // Rewind num_computed_tokens for rejected spec decode drafts.
+            // The scheduler already advanced num_computed_tokens by num_scheduled_tokens
+            // (which includes ALL draft tokens) in update_after_schedule(). If some
+            // drafts were rejected, we must rewind by num_rejected so the KV cache
+            // position is correct for the next step.
+            // Matches Python: scheduler.update_from_output() lines 1324-1338.
+            if let Some(scheduled_spec_ids) = scheduler_output
+                .scheduled_spec_decode_tokens
+                .get(req_id)
+                .filter(|ids| !ids.is_empty())
+                && !new_token_ids_slice.is_empty()
+            {
+                let num_draft_tokens = scheduled_spec_ids.len();
+                let num_accepted = new_token_ids_slice.len().saturating_sub(1);
+                let num_rejected = num_draft_tokens.saturating_sub(num_accepted);
+                if num_rejected > 0 {
+                    self.scheduler
+                        .rewind_num_computed_tokens(req_id, num_rejected);
+                }
             }
 
             // Check stop criteria against the updated request state.
@@ -1253,6 +1325,7 @@ mod tests {
                 num_speculative_tokens: 3,
                 max_ngram_size: 3,
                 min_ngram_size: 1,
+                max_model_len: 4096,
             }),
             eos_token_ids: vec![],
             is_pooling: false,

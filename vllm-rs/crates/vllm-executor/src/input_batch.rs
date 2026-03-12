@@ -205,6 +205,16 @@ impl InputBatch {
         (&self.req_ids, &self.block_tables, &self.tokens_in_pool)
     }
 
+    /// Token counts for the super-fast graph path's `PendingCommit`.
+    ///
+    /// The super-fast path is always a pure decode batch (all q_len=1), so each
+    /// request contributes exactly 1 input token. This MUST return `vec![1; n]`,
+    /// NOT `tokens_in_pool` — using cumulative `tokens_in_pool` would cause
+    /// exponential growth when later passed to `commit_step` as `input_token_count`.
+    pub fn fast_path_token_counts(&self) -> Vec<usize> {
+        vec![1; self.req_ids.len()]
+    }
+
     /// Prepare model inputs for the current step.
     ///
     /// Returns `(req_inputs, attn_meta, batch_block_ids, batch_tokens_before)`
@@ -373,19 +383,21 @@ impl InputBatch {
 
         // Update tokens_in_pool.
         let new_tokens_in_cache = if was_spec_decode {
-            // Spec decode: only accepted tokens get cached.
+            // Spec decode: only accepted tokens get cached (input tokens up to
+            // the first rejection). `sampled_tokens.len()` == num_accepted + 1
+            // which also equals the number of input tokens correctly in cache
+            // (last_token + accepted drafts).
             sampled_tokens.len()
         } else {
             input_token_count
         };
         self.tokens_in_pool[slot] = tb + new_tokens_in_cache;
 
-        // Update position to the end of the sequence.
-        // After this step, the next decode position = tb + new_tokens_in_cache.
-        // The position we feed is the position of the last token in the
-        // sequence, which is total_tokens - 1.
-        let total_tokens = self.tokens_in_pool[slot] + sampled_tokens.len();
-        self.positions[slot] = (total_tokens - 1) as u32;
+        // Update position for the next decode step.
+        // The next input token (last sampled) sits at position = tokens_in_pool.
+        // For normal decode: tokens_in_pool + 1 - 1 = tokens_in_pool. ✓
+        // For spec decode: tokens_in_pool (accepted tokens are already counted). ✓
+        self.positions[slot] = self.tokens_in_pool[slot] as u32;
 
         // Store the last sampled token for the next decode step.
         if let Some(&last) = sampled_tokens.last() {
@@ -455,6 +467,66 @@ pub struct ReqSlice {
     pub token_count: usize,
     /// Speculative decode draft tokens (empty for normal decode/prefill).
     pub spec_token_ids: Vec<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// Greedy rejection sampling (pure, no GPU dependency)
+// ---------------------------------------------------------------------------
+
+/// Result of greedy rejection sampling for a single request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RejectionResult {
+    /// Accepted token IDs (target argmax values). Length is 1..=num_drafts+1.
+    /// On full acceptance: K target-verified tokens + 1 bonus token.
+    /// On partial acceptance: M target-verified tokens + 1 recovered token.
+    /// On first rejection: 1 recovered token.
+    pub accepted_tokens: Vec<u32>,
+    /// Number of draft tokens that were accepted (0..=num_drafts).
+    pub num_accepted_drafts: usize,
+}
+
+/// Perform greedy rejection sampling for one request.
+///
+/// Given `target_ids` (argmax of the model's logits at each position) and
+/// `draft_token_ids` (proposed draft tokens), accept the longest prefix of
+/// matching drafts and return the accepted tokens.
+///
+/// Layout:
+/// - `target_ids[0]` = argmax at the real token position (verifies draft[0])
+/// - `target_ids[i]` = argmax at draft[i-1] position (verifies draft[i])
+/// - `target_ids[K]` = bonus token (only used if all K drafts accepted)
+///
+/// This matches Python vLLM's `_rejection_sample_kernel` for greedy decoding.
+pub fn greedy_rejection_sample(target_ids: &[u32], draft_token_ids: &[u32]) -> RejectionResult {
+    if draft_token_ids.is_empty() {
+        // Normal request: no drafts, just 1 token.
+        return RejectionResult {
+            accepted_tokens: vec![target_ids[0]],
+            num_accepted_drafts: 0,
+        };
+    }
+
+    let mut accepted = Vec::with_capacity(draft_token_ids.len() + 1);
+
+    for i in 0..draft_token_ids.len() {
+        let target = target_ids[i];
+        accepted.push(target);
+        if target != draft_token_ids[i] {
+            // Mismatch: target is the recovered token. Stop.
+            return RejectionResult {
+                num_accepted_drafts: i,
+                accepted_tokens: accepted,
+            };
+        }
+    }
+
+    // All drafts accepted — append bonus token from the last logit position.
+    let bonus = target_ids[draft_token_ids.len()];
+    accepted.push(bonus);
+    RejectionResult {
+        num_accepted_drafts: draft_token_ids.len(),
+        accepted_tokens: accepted,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -700,6 +772,57 @@ mod tests {
     }
 
     #[test]
+    fn test_spec_decode_multi_token_commit() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20, 30], vec![0], 0);
+        let spec = HashMap::new();
+
+        // Prefill.
+        let _ = batch.prepare_inputs(&spec);
+        batch.commit_step("r1", &[40], 3, false);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 3);
+
+        // Decode step: normal.
+        let _ = batch.prepare_inputs(&spec);
+        batch.commit_step("r1", &[50], 1, false);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 4);
+
+        // Spec decode: 4 input tokens [50, d0, d1, d2], all 3 accepted + bonus.
+        // sampled = [d0, d1, d2, bonus] = 4 tokens.
+        batch.commit_step("r1", &[60, 70, 80, 90], 4, true);
+        // tokens_in_pool += 4 (the 4 input tokens are all correctly cached).
+        assert_eq!(batch.tokens_in_pool_for("r1"), 8);
+
+        // Next decode should use the last sampled token (90) at position 8.
+        let prepared = batch.prepare_inputs(&spec);
+        assert_eq!(prepared.flat_token_ids, &[90]);
+        assert_eq!(prepared.flat_positions, &[8]);
+    }
+
+    #[test]
+    fn test_spec_decode_partial_accept_commit() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20], vec![0], 0);
+        let spec = HashMap::new();
+
+        // Prefill.
+        let _ = batch.prepare_inputs(&spec);
+        batch.commit_step("r1", &[30], 2, false);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 2);
+
+        // Spec decode: 4 input tokens [30, d0, d1, d2], only 1 accepted.
+        // sampled = [d0, recovered] = 2 tokens.
+        batch.commit_step("r1", &[40, 50], 4, true);
+        // tokens_in_pool += 2 (30 and d0 are correctly cached).
+        assert_eq!(batch.tokens_in_pool_for("r1"), 4);
+
+        // Next decode should use the last sampled token (50) at position 4.
+        let prepared = batch.prepare_inputs(&spec);
+        assert_eq!(prepared.flat_token_ids, &[50]);
+        assert_eq!(prepared.flat_positions, &[4]);
+    }
+
+    #[test]
     fn test_query_start_loc_consistency() {
         let mut batch = InputBatch::new();
         batch.add_request("r1".into(), &[10, 20], vec![0], 0);
@@ -716,6 +839,293 @@ mod tests {
                 meta.query_start_loc[i + 1] - meta.query_start_loc[i],
                 meta.q_lens[i]
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Greedy rejection sampling tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rejection_no_drafts() {
+        // Normal request: no draft tokens, single target token.
+        let result = greedy_rejection_sample(&[42], &[]);
+        assert_eq!(result.accepted_tokens, vec![42]);
+        assert_eq!(result.num_accepted_drafts, 0);
+    }
+
+    #[test]
+    fn test_rejection_all_accept() {
+        // All 3 draft tokens match target argmax → 3 accepted + 1 bonus = 4 tokens.
+        // Drafts:     [10, 20, 30]
+        // Target IDs: [10, 20, 30, 99]  (99 = bonus)
+        let result = greedy_rejection_sample(&[10, 20, 30, 99], &[10, 20, 30]);
+        assert_eq!(result.accepted_tokens, vec![10, 20, 30, 99]);
+        assert_eq!(result.num_accepted_drafts, 3);
+    }
+
+    #[test]
+    fn test_rejection_first_reject() {
+        // First draft doesn't match → output 1 recovered token.
+        // Drafts:     [10, 20, 30]
+        // Target IDs: [77, ...]  (77 != 10)
+        let result = greedy_rejection_sample(&[77, 20, 30, 99], &[10, 20, 30]);
+        assert_eq!(result.accepted_tokens, vec![77]);
+        assert_eq!(result.num_accepted_drafts, 0);
+    }
+
+    #[test]
+    fn test_rejection_partial_accept_middle() {
+        // First 2 drafts match, 3rd doesn't → 2 accepted + 1 recovered = 3 tokens.
+        // Drafts:     [10, 20, 30]
+        // Target IDs: [10, 20, 55, 99]  (55 != 30)
+        let result = greedy_rejection_sample(&[10, 20, 55, 99], &[10, 20, 30]);
+        assert_eq!(result.accepted_tokens, vec![10, 20, 55]);
+        assert_eq!(result.num_accepted_drafts, 2);
+    }
+
+    #[test]
+    fn test_rejection_partial_accept_second() {
+        // First draft matches, second doesn't → 1 accepted + 1 recovered = 2 tokens.
+        // Drafts:     [10, 20, 30]
+        // Target IDs: [10, 88, 30, 99]  (88 != 20)
+        let result = greedy_rejection_sample(&[10, 88, 30, 99], &[10, 20, 30]);
+        assert_eq!(result.accepted_tokens, vec![10, 88]);
+        assert_eq!(result.num_accepted_drafts, 1);
+    }
+
+    #[test]
+    fn test_rejection_single_draft_accept() {
+        // Single draft token, matches.
+        let result = greedy_rejection_sample(&[10, 99], &[10]);
+        assert_eq!(result.accepted_tokens, vec![10, 99]);
+        assert_eq!(result.num_accepted_drafts, 1);
+    }
+
+    #[test]
+    fn test_rejection_single_draft_reject() {
+        // Single draft token, doesn't match.
+        let result = greedy_rejection_sample(&[77, 99], &[10]);
+        assert_eq!(result.accepted_tokens, vec![77]);
+        assert_eq!(result.num_accepted_drafts, 0);
+    }
+
+    #[test]
+    fn test_rejection_five_drafts_all_accept() {
+        // 5 drafts, all match → 5 accepted + 1 bonus = 6 tokens.
+        let drafts = vec![1, 2, 3, 4, 5];
+        let targets = vec![1, 2, 3, 4, 5, 99];
+        let result = greedy_rejection_sample(&targets, &drafts);
+        assert_eq!(result.accepted_tokens, vec![1, 2, 3, 4, 5, 99]);
+        assert_eq!(result.num_accepted_drafts, 5);
+    }
+
+    #[test]
+    fn test_rejection_five_drafts_last_reject() {
+        // 5 drafts, last one doesn't match → 4 accepted + 1 recovered = 5 tokens.
+        let drafts = vec![1, 2, 3, 4, 5];
+        let targets = vec![1, 2, 3, 4, 77, 99];
+        let result = greedy_rejection_sample(&targets, &drafts);
+        assert_eq!(result.accepted_tokens, vec![1, 2, 3, 4, 77]);
+        assert_eq!(result.num_accepted_drafts, 4);
+    }
+
+    /// Regression test for the super-fast graph path deferred commit bug.
+    ///
+    /// Simulates the deferred commit pattern from CudaWorker's super-fast
+    /// graph path. Each iteration:
+    ///   1. Capture `token_counts` via `fast_path_token_counts()` BEFORE
+    ///      resolving the previous step's pending commit.
+    ///   2. Resolve the previous step with its captured `token_counts`.
+    ///   3. Store the new `token_counts` for the next iteration.
+    ///
+    /// The old code used `tokens_in_pool` instead of `fast_path_token_counts()`,
+    /// causing Fibonacci-like exponential growth of `tokens_in_pool`.
+    /// With the fix, `fast_path_token_counts()` returns `[1; n]` and growth
+    /// is linear (exactly +1 per step).
+    #[test]
+    fn test_fast_path_token_counts_linear_growth() {
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
+        let spec = HashMap::new();
+
+        // Step 1: prefill.
+        let _ = batch.prepare_inputs(&spec);
+        batch.commit_step("r1", &[40], 3, false);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 3);
+
+        // Step 2: first graph decode (normal path). Deferred, token_count=1.
+        let mut pending_tc = vec![1usize];
+
+        // Steps 3..20: super-fast path loop.
+        for step in 3..=20 {
+            // Capture token_counts BEFORE resolving the previous pending commit.
+            // This is the line that was buggy: old code did tokens_in_pool.to_vec().
+            let new_pending_tc = batch.fast_path_token_counts();
+            assert_eq!(
+                new_pending_tc,
+                vec![1],
+                "fast_path_token_counts must always be [1]"
+            );
+
+            // Resolve previous step's deferred commit.
+            batch.commit_step("r1", &[40 + step], pending_tc[0], false);
+
+            // tokens_in_pool should be exactly: prompt_len + (step - 2)
+            // because we've resolved (step - 2) decode commits so far.
+            let expected = 3 + (step - 2) as usize;
+            assert_eq!(
+                batch.tokens_in_pool_for("r1"),
+                expected,
+                "step {step}: tokens_in_pool should be {expected} (linear), got {}",
+                batch.tokens_in_pool_for("r1")
+            );
+
+            pending_tc = new_pending_tc;
+        }
+
+        // After 18 super-fast steps, tokens_in_pool should be 3 + 18 = 21.
+        assert_eq!(batch.tokens_in_pool_for("r1"), 21);
+    }
+
+    #[test]
+    fn test_rejection_output_length_invariants() {
+        // For K drafts:
+        //   - All accept: output length = K + 1
+        //   - First reject: output length = 1
+        //   - M accepted (0 < M < K): output length = M + 1
+        for k in 1..=8 {
+            let drafts: Vec<u32> = (1..=k).collect();
+
+            // All accept
+            let mut targets: Vec<u32> = (1..=k).collect();
+            targets.push(99); // bonus
+            let result = greedy_rejection_sample(&targets, &drafts);
+            assert_eq!(
+                result.accepted_tokens.len(),
+                k as usize + 1,
+                "all-accept with {k} drafts should produce {0} tokens",
+                k + 1
+            );
+            assert_eq!(result.num_accepted_drafts, k as usize);
+
+            // First reject
+            let mut targets: Vec<u32> = vec![0]; // mismatch (draft[0] = 1)
+            targets.extend(2..=k);
+            targets.push(99);
+            let result = greedy_rejection_sample(&targets, &drafts);
+            assert_eq!(
+                result.accepted_tokens.len(),
+                1,
+                "first-reject with {k} drafts should produce 1 token"
+            );
+            assert_eq!(result.num_accepted_drafts, 0);
+        }
+    }
+
+    #[test]
+    fn test_rejection_mixed_batch_simulation() {
+        // Simulate a mixed batch: some requests have drafts, some don't.
+        struct ReqInput {
+            target_ids: Vec<u32>,
+            draft_ids: Vec<u32>,
+        }
+
+        let batch = vec![
+            // Normal request (no drafts)
+            ReqInput {
+                target_ids: vec![42],
+                draft_ids: vec![],
+            },
+            // Spec decode, all accept (3 drafts)
+            ReqInput {
+                target_ids: vec![10, 20, 30, 99],
+                draft_ids: vec![10, 20, 30],
+            },
+            // Spec decode, partial accept (5 drafts, first 2 match)
+            ReqInput {
+                target_ids: vec![1, 2, 77, 4, 5, 99],
+                draft_ids: vec![1, 2, 3, 4, 5],
+            },
+            // Normal request (no drafts)
+            ReqInput {
+                target_ids: vec![55],
+                draft_ids: vec![],
+            },
+            // Spec decode, first reject (2 drafts)
+            ReqInput {
+                target_ids: vec![88, 20, 99],
+                draft_ids: vec![10, 20],
+            },
+        ];
+
+        let results: Vec<_> = batch
+            .iter()
+            .map(|r| greedy_rejection_sample(&r.target_ids, &r.draft_ids))
+            .collect();
+
+        // Normal: 1 token
+        assert_eq!(results[0].accepted_tokens, vec![42]);
+        assert_eq!(results[0].num_accepted_drafts, 0);
+
+        // All accept: 4 tokens (3 + bonus)
+        assert_eq!(results[1].accepted_tokens, vec![10, 20, 30, 99]);
+        assert_eq!(results[1].num_accepted_drafts, 3);
+
+        // Partial: 3 tokens (2 accepted + recovered)
+        assert_eq!(results[2].accepted_tokens, vec![1, 2, 77]);
+        assert_eq!(results[2].num_accepted_drafts, 2);
+
+        // Normal: 1 token
+        assert_eq!(results[3].accepted_tokens, vec![55]);
+        assert_eq!(results[3].num_accepted_drafts, 0);
+
+        // First reject: 1 token
+        assert_eq!(results[4].accepted_tokens, vec![88]);
+        assert_eq!(results[4].num_accepted_drafts, 0);
+    }
+
+    #[test]
+    fn test_rejection_bonus_token_differs_from_drafts() {
+        // Verify the bonus token comes from target_ids[K], not from drafts.
+        let drafts = vec![10, 20];
+        let targets = vec![10, 20, 777]; // bonus = 777
+        let result = greedy_rejection_sample(&targets, &drafts);
+        assert_eq!(result.accepted_tokens, vec![10, 20, 777]);
+        assert_eq!(*result.accepted_tokens.last().unwrap(), 777);
+    }
+
+    #[test]
+    fn test_rejection_recovered_token_is_target_not_draft() {
+        // On rejection at position i, output target_ids[i] (not draft_ids[i]).
+        let drafts = vec![10, 20, 30];
+        let targets = vec![10, 55, 30, 99]; // reject at position 1: target=55, draft=20
+        let result = greedy_rejection_sample(&targets, &drafts);
+        assert_eq!(result.accepted_tokens, vec![10, 55]);
+        assert_eq!(result.accepted_tokens[1], 55); // recovered token is target, not draft (20)
+    }
+
+    #[test]
+    fn test_rejection_num_accepted_plus_output_len() {
+        // Invariant: accepted_tokens.len() = num_accepted_drafts + 1
+        for num_drafts in 1u32..=6 {
+            let drafts: Vec<u32> = (1..=num_drafts).collect();
+
+            // Test every possible rejection point
+            for reject_at in 0..=num_drafts {
+                let mut targets: Vec<u32> = (1..=num_drafts).collect();
+                targets.push(99); // bonus
+                if reject_at < num_drafts {
+                    targets[reject_at as usize] = 0; // force mismatch
+                }
+
+                let result = greedy_rejection_sample(&targets, &drafts);
+                assert_eq!(
+                    result.accepted_tokens.len(),
+                    result.num_accepted_drafts + 1,
+                    "invariant: len = num_accepted + 1 (drafts={num_drafts}, reject_at={reject_at})"
+                );
+            }
         }
     }
 }

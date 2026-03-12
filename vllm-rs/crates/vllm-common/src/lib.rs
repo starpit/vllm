@@ -25,7 +25,7 @@ pub mod telemetry;
 
 pub use engine_io::{
     EngineCoreEvent, EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
-    FinishReason, SchedulerStats, StopReason,
+    FinishReason, SchedulerStats, SpecDecodingStats, StopReason,
 };
 pub use error::{VllmError, VllmResult};
 pub use multimodal::MultimodalData;

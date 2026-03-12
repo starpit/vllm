@@ -1938,6 +1938,39 @@ impl CudaWorker {
     ) -> ExecutorResult<(GpuTensor, GpuTensor, GpuTensor, GpuTensor, usize, usize)> {
         let num_reqs = meta.num_reqs;
 
+        // Invariant checks on attention metadata.
+        debug_assert_eq!(meta.query_start_loc.len(), num_reqs + 1);
+        debug_assert_eq!(meta.seq_lens.len(), num_reqs);
+        debug_assert_eq!(meta.q_lens.len(), num_reqs);
+        debug_assert_eq!(meta.block_ids.len(), num_reqs);
+        debug_assert_eq!(meta.tokens_before.len(), num_reqs);
+        debug_assert_eq!(
+            meta.q_lens.iter().sum::<usize>(),
+            meta.total_tokens,
+            "sum(q_lens) != total_tokens"
+        );
+        debug_assert_eq!(*meta.query_start_loc.last().unwrap(), meta.total_tokens);
+        for i in 0..num_reqs {
+            debug_assert!(
+                meta.seq_lens[i] >= meta.q_lens[i],
+                "req {i}: seq_len={} < q_len={}",
+                meta.seq_lens[i],
+                meta.q_lens[i]
+            );
+            let needed_blocks = meta.seq_lens[i].div_ceil(block_size);
+            debug_assert!(
+                meta.block_ids[i].len() >= needed_blocks,
+                "req {i}: block_ids.len()={} < needed_blocks={} for seq_len={} block_size={} \
+                 tokens_before={} q_len={}",
+                meta.block_ids[i].len(),
+                needed_blocks,
+                meta.seq_lens[i],
+                block_size,
+                meta.tokens_before[i],
+                meta.q_lens[i]
+            );
+        }
+
         // cu_seqlens_q: cumulative query lengths [num_reqs + 1].
         let cu_seqlens_q: Vec<i32> = meta.query_start_loc.iter().map(|&x| x as i32).collect();
         let gpu_cu_seqlens_q = Self::h2d_i32(&cu_seqlens_q, device)?;
@@ -2270,6 +2303,27 @@ impl CudaWorker {
     ) -> ExecutorResult<ModelRunnerOutput> {
         use rand::Rng;
         let num_reqs = prepared.req_inputs.len();
+        let total_tokens = prepared.flat_token_ids.len();
+        let any_spec_decode = prepared
+            .req_inputs
+            .iter()
+            .any(|r| !r.spec_token_ids.is_empty());
+
+        // --- Spec decode path: greedy rejection sampling ---
+        // When any request has draft tokens, logits shape is [total_tokens, vocab_size]
+        // (all positions). We argmax all rows, then do CPU greedy rejection.
+        if any_spec_decode && all_greedy {
+            return Self::spec_decode_greedy_sample(
+                logits,
+                total_tokens,
+                prepared,
+                device,
+                host_staging,
+                input_batch,
+                token_buffers,
+            );
+        }
+
         // Helper: get random value using per-request seeded RNG if available.
         let mut thread_rng = rand::thread_rng();
         let mut gen_random = |req_id: &str| -> f32 {
@@ -2738,6 +2792,114 @@ impl CudaWorker {
         } else {
             vec![0u8; min_bytes].leak().as_mut_ptr()
         }
+    }
+
+    /// Greedy rejection sampling for speculative decoding.
+    ///
+    /// When any request has draft tokens, the forward pass produces logits for
+    /// ALL token positions `[total_tokens, vocab_size]`. This method:
+    /// 1. Argmax all logit rows on GPU → `[total_tokens]` target token IDs
+    /// 2. D2H sync all target IDs
+    /// 3. CPU greedy rejection: for each spec decode request, compare target
+    ///    argmax at each draft position against the draft token. Accept the
+    ///    prefix of matches + 1 bonus/recovered token.
+    /// 4. Build multi-token ModelRunnerOutput and commit_step.
+    ///
+    /// Matches Python vLLM's `rejection_sample()` with greedy (no draft probs).
+    #[allow(clippy::too_many_arguments)]
+    fn spec_decode_greedy_sample(
+        logits: GpuTensor,
+        total_tokens: usize,
+        prepared: PreparedInputs,
+        device: &mut GpuDevice,
+        _host_staging: &Option<HostStaging>,
+        input_batch: &mut InputBatch,
+        token_buffers: &mut HashMap<String, Vec<u32>>,
+    ) -> ExecutorResult<ModelRunnerOutput> {
+        // Sync compute stream to catch any prior kernel errors.
+        unsafe { vllm_cuda::driver::stream_synchronize(device.compute_stream) }.map_err(|e| {
+            ExecutorError::WorkerExecution(format!("spec decode pre-argmax sync: {e}"))
+        })?;
+
+        // Validate logits shape matches total_tokens.
+        let logits_dim0 = logits.dim(0);
+        assert_eq!(
+            logits_dim0,
+            total_tokens,
+            "spec_decode_greedy_sample: logits dim0 ({}) != total_tokens ({}), num_reqs={}, \
+             q_lens={:?}, spec_counts={:?}",
+            logits_dim0,
+            total_tokens,
+            prepared.req_inputs.len(),
+            prepared.attn_meta.q_lens,
+            prepared
+                .req_inputs
+                .iter()
+                .map(|r| r.spec_token_ids.len())
+                .collect::<Vec<_>>(),
+        );
+
+        // 1. Argmax all logit rows on GPU.
+        let token_ids_owned = unsafe {
+            vllm_cuda::kernels::argmax_batched(logits, &mut device.caching, device.compute_stream)
+        };
+        let token_ids_gpu = token_ids_owned.as_gpu_tensor();
+
+        // Sync compute stream to catch argmax kernel errors before D2H.
+        unsafe { vllm_cuda::driver::stream_synchronize(device.compute_stream) }.map_err(|e| {
+            ExecutorError::WorkerExecution(format!("spec decode post-argmax sync: {e}"))
+        })?;
+
+        // 2. D2H all target argmax IDs.
+        // Bypass pinned staging — total_tokens (with drafts) may exceed staging capacity.
+        let all_target_ids =
+            Self::d2h_token_ids_sync(None, 0, &token_ids_gpu, total_tokens, device)?;
+
+        // 3. Greedy rejection sampling per request.
+        let num_reqs = prepared.req_inputs.len();
+        let mut req_ids = Vec::with_capacity(num_reqs);
+        let mut sampled_token_ids = Vec::with_capacity(num_reqs);
+        let mut req_id_to_index = HashMap::with_capacity(num_reqs);
+
+        let mut flat_offset = 0usize;
+        for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+            let req_id = &req_slice.req_id;
+            let n_tokens = req_slice.token_count; // 1 + num_drafts for spec, 1 for normal
+            let target_ids = &all_target_ids[flat_offset..flat_offset + n_tokens];
+
+            let rejection =
+                crate::input_batch::greedy_rejection_sample(target_ids, &req_slice.spec_token_ids);
+            let accepted_tokens = rejection.accepted_tokens;
+
+            // 4. Commit step with accepted tokens.
+            input_batch.commit_step(
+                req_id,
+                &accepted_tokens,
+                req_slice.token_count,
+                !req_slice.spec_token_ids.is_empty(),
+            );
+            if let Some(buf) = token_buffers.get_mut(req_id) {
+                buf.extend_from_slice(&accepted_tokens);
+            }
+
+            req_id_to_index.insert(req_id.clone(), req_idx);
+            req_ids.push(req_id.clone());
+            sampled_token_ids.push(accepted_tokens);
+            flat_offset += n_tokens;
+        }
+
+        input_batch.reclaim_buffers(prepared);
+
+        Ok(ModelRunnerOutput {
+            req_ids,
+            req_id_to_index,
+            sampled_token_ids,
+            logprobs: None,
+            prompt_logprobs_dict: HashMap::new(),
+            draft_token_ids: None,
+            pooler_output: None,
+            d2h_resolver: None,
+        })
     }
 
     /// D2H + sync + commit_step helper (static to avoid borrow conflicts).
@@ -4033,9 +4195,9 @@ impl CudaWorker {
             && let Some(ref mut device) = self.device
         {
             // Collect info from InputBatch upfront (immutable borrow ends here).
-            let (req_ids, block_tables, tokens_in_pool) = self.input_batch.fast_path_info();
+            let (req_ids, block_tables, _tokens_in_pool) = self.input_batch.fast_path_info();
             let out_req_ids: Vec<String> = req_ids.to_vec();
-            let token_counts: Vec<usize> = tokens_in_pool.to_vec();
+            let token_counts = self.input_batch.fast_path_token_counts();
 
             // Check all-greedy and no-logprobs/grammar without prepare_inputs.
             let all_greedy_fast = out_req_ids.iter().all(|rid| {
@@ -4349,8 +4511,12 @@ impl CudaWorker {
         // most requests are decode (q_len=1) but a few are prefill chunks.
         // ---------------------------------------------------------------------------
         let has_decode = prepared.attn_meta.q_lens.contains(&1);
+        let any_spec_in_batch = prepared
+            .req_inputs
+            .iter()
+            .any(|r| !r.spec_token_ids.is_empty());
         let is_mixed = !is_decode && has_decode;
-        let decode_graph_bs = if is_mixed {
+        let decode_graph_bs = if is_mixed && !any_spec_in_batch {
             self.graph_runner.as_ref().and_then(|r| {
                 let n_decode = prepared
                     .attn_meta
@@ -5077,6 +5243,33 @@ impl CudaWorker {
                 // Eager forward path (multi-request prefill or uncaptured size).
                 // Caching allocator: no reset needed — tensors freed on drop.
 
+                // DEBUG: sync before forward to isolate errors from previous steps.
+                {
+                    let any_spec = prepared
+                        .req_inputs
+                        .iter()
+                        .any(|r| !r.spec_token_ids.is_empty());
+                    if any_spec {
+                        unsafe { vllm_cuda::driver::stream_synchronize(device.compute_stream) }
+                            .map_err(|e| {
+                                ExecutorError::WorkerExecution(format!(
+                                    "eager pre-forward sync (spec batch): {e}"
+                                ))
+                            })?;
+                        let meta = &prepared.attn_meta;
+                        tracing::warn!(
+                            "spec decode eager forward: num_reqs={}, total_tokens={}, q_lens={:?}, \
+                             seq_lens={:?}, tokens_before={:?}, block_ids_lens={:?}",
+                            meta.num_reqs,
+                            meta.total_tokens,
+                            meta.q_lens,
+                            meta.seq_lens,
+                            meta.tokens_before,
+                            meta.block_ids.iter().map(|b| b.len()).collect::<Vec<_>>(),
+                        );
+                    }
+                }
+
                 let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
                 let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
 
@@ -5089,7 +5282,19 @@ impl CudaWorker {
                     max_seqlen_k,
                 ) = Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
 
-                let last_token_indices = if num_reqs < total_tokens {
+                // For spec decode: skip last_token_indices so we get logits
+                // for ALL token positions (needed for rejection sampling).
+                // For normal batches: gather only the last token per request.
+                let any_spec_decode = prepared
+                    .req_inputs
+                    .iter()
+                    .any(|r| !r.spec_token_ids.is_empty());
+
+                let last_token_indices = if any_spec_decode {
+                    // Spec decode: need logits for all positions, not just last.
+                    // Model returns [total_tokens, vocab_size].
+                    None
+                } else if num_reqs < total_tokens {
                     let mut indices = Vec::with_capacity(num_reqs);
                     let mut offset = 0u32;
                     for req_slice in &prepared.req_inputs {
@@ -5157,13 +5362,33 @@ impl CudaWorker {
             }
         };
 
+        // DEBUG: sync after forward to catch forward errors.
+        {
+            let any_spec = prepared
+                .req_inputs
+                .iter()
+                .any(|r| !r.spec_token_ids.is_empty());
+            if any_spec {
+                unsafe { vllm_cuda::driver::stream_synchronize(device.compute_stream) }.map_err(
+                    |e| {
+                        ExecutorError::WorkerExecution(format!(
+                            "eager post-forward sync (spec batch): {e}"
+                        ))
+                    },
+                )?;
+            }
+        }
+
         // Free leaked GPU blocks AFTER graph/forward launch, overlapping with GPU execution.
         // This saves ~200µs per decode step that was previously blocking before graph launch.
+        // IMPORTANT: keep the logits pointer alive — it was "leaked" by forward_owned's
+        // into_gpu_tensor() and must survive until sampling completes.
         {
             let mut keep: Vec<*const u8> = Vec::new();
             if let Some(ref runner) = self.graph_runner {
                 keep.extend(runner.pinned_addresses());
             }
+            keep.push(logits.raw_ptr() as *const u8);
             unsafe { device.caching.free_leaked_blocks_except(&keep) };
         }
 

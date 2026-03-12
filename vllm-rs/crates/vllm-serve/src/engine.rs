@@ -1447,6 +1447,13 @@ impl AsyncEngine {
                             m.gpu_cache_blocks_total
                                 .set(stats.gpu_cache_blocks_total as i64);
                             m.prefix_cache_blocks.set(stats.num_cached_blocks as i64);
+                            if let Some(sd) = &stats.spec_decode_stats {
+                                m.spec_decode_num_drafts.inc_by(sd.num_drafts as u64);
+                                m.spec_decode_num_draft_tokens
+                                    .inc_by(sd.num_draft_tokens as u64);
+                                m.spec_decode_num_accepted_tokens
+                                    .inc_by(sd.num_accepted_tokens as u64);
+                            }
                         }
 
                         // 5. Route outputs to requests (brief lock).
@@ -3162,6 +3169,13 @@ async fn route_step_outputs(
             m.gpu_cache_blocks_total
                 .set(stats.gpu_cache_blocks_total as i64);
             m.prefix_cache_blocks.set(stats.num_cached_blocks as i64);
+            if let Some(sd) = &stats.spec_decode_stats {
+                m.spec_decode_num_drafts.inc_by(sd.num_drafts as u64);
+                m.spec_decode_num_draft_tokens
+                    .inc_by(sd.num_draft_tokens as u64);
+                m.spec_decode_num_accepted_tokens
+                    .inc_by(sd.num_accepted_tokens as u64);
+            }
         }
 
         if !engine_outputs.outputs.is_empty() {

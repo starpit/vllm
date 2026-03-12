@@ -100,10 +100,56 @@ async fn find_instance_zone(
     Ok(None)
 }
 
-/// Delete a GCE instance.
+/// Find all instances belonging to this name (single-node or multi-node cluster).
+/// Returns a list of (instance_name, zone) pairs.
+async fn find_cluster_instances(
+    client: &google_cloud_compute_v1::client::Instances,
+    project: &str,
+    name: &str,
+    preferred_zone: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut found = Vec::new();
+
+    // Check single-node instance name.
+    if let Some(zone) = find_instance_zone(client, project, name, preferred_zone).await? {
+        found.push((name.to_string(), zone));
+        return Ok(found);
+    }
+
+    // Check multi-node names: {name}-0, {name}-1, ... up to a reasonable max.
+    // First find node 0 to confirm it's a multi-node cluster.
+    let node0 = format!("{name}-0");
+    let zone = match find_instance_zone(client, project, &node0, preferred_zone).await? {
+        Some(z) => z,
+        None => return Ok(found), // No instances found at all.
+    };
+
+    found.push((node0, zone.clone()));
+
+    // Search for remaining nodes in the same zone (multi-node must be co-located).
+    for i in 1..64 {
+        let node_name = format!("{name}-{i}");
+        match client
+            .get()
+            .set_project(project)
+            .set_zone(&zone)
+            .set_instance(&node_name)
+            .send()
+            .await
+        {
+            Ok(_) => found.push((node_name, zone.clone())),
+            Err(e) if is_not_found(&e) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(found)
+}
+
+/// Delete GCE instance(s).
 ///
-/// When `force` is true, a "not found" error is treated as success.
-/// If the instance isn't in the specified zone, searches fallback zones.
+/// Handles both single-node (`{name}`) and multi-node (`{name}-0`, `{name}-1`, ...)
+/// clusters. When `force` is true, a "not found" error is treated as success.
 pub async fn down(config: GceDownConfig) -> Result<()> {
     use google_cloud_compute_v1::client::Instances;
     use google_cloud_lro::Poller;
@@ -118,41 +164,42 @@ pub async fn down(config: GceDownConfig) -> Result<()> {
             )
         })?;
 
-    let sp = spinner(&format!("Looking up instance '{}'...", config.name));
+    let sp = spinner(&format!("Looking up instance(s) '{}'...", config.name));
     let client = Instances::builder().build().await?;
 
-    let zone = match find_instance_zone(&client, &project, &config.name, &config.zone).await? {
-        Some(z) => {
-            sp.finish_and_clear();
-            if z != config.zone {
-                eprintln!(
-                    "  Instance '{}' found in {} (not {})",
-                    config.name, z, config.zone
-                );
-            } else {
-                eprintln!("  Instance '{}' found in {}", config.name, z);
-            }
-            z
-        }
-        None => {
-            sp.finish_and_clear();
-            if config.force {
-                eprintln!(
-                    "  Instance '{}' not found in any zone (ignored due to --force)",
-                    config.name
-                );
-                return Ok(());
-            }
-            eprintln!("  Instance '{}' not found", config.name);
-            return Err(anyhow::anyhow!(
-                "instance '{}' not found in any zone",
+    let instances = find_cluster_instances(&client, &project, &config.name, &config.zone).await?;
+
+    sp.finish_and_clear();
+
+    if instances.is_empty() {
+        if config.force {
+            eprintln!(
+                "  Instance(s) '{}' not found in any zone (ignored due to --force)",
                 config.name
-            ));
+            );
+            return Ok(());
         }
-    };
+        eprintln!("  Instance(s) '{}' not found", config.name);
+        return Err(anyhow::anyhow!(
+            "instance(s) '{}' not found in any zone",
+            config.name
+        ));
+    }
+
+    // Show what will be deleted.
+    for (name, zone) in &instances {
+        eprintln!("  Found '{name}' in {zone}");
+    }
 
     if !config.force {
-        eprint!("  Delete instance '{}' in {}? [y/N] ", config.name, zone);
+        if instances.len() == 1 {
+            eprint!(
+                "  Delete instance '{}' in {}? [y/N] ",
+                instances[0].0, instances[0].1
+            );
+        } else {
+            eprint!("  Delete {} instances? [y/N] ", instances.len());
+        }
         std::io::Write::flush(&mut std::io::stderr()).ok();
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
@@ -162,21 +209,52 @@ pub async fn down(config: GceDownConfig) -> Result<()> {
         }
     }
 
-    let sp = spinner(&format!(
-        "Deleting instance '{}' in {}...",
-        config.name, zone
-    ));
-    client
-        .delete()
-        .set_project(&project)
-        .set_zone(&zone)
-        .set_instance(&config.name)
-        .poller()
-        .until_done()
-        .await?
-        .to_result()?;
+    // Delete all instances in parallel.
+    let sp = spinner(&format!("Deleting {} instance(s)...", instances.len()));
 
+    let mut futs = Vec::new();
+    for (name, zone) in &instances {
+        let client = &client;
+        let project = &project;
+        futs.push(async move {
+            let result = client
+                .delete()
+                .set_project(project)
+                .set_zone(zone)
+                .set_instance(name)
+                .poller()
+                .until_done()
+                .await;
+            match result {
+                Ok(op) => match op.to_result() {
+                    Ok(_) => Ok(name.clone()),
+                    Err(e) => Err(anyhow::anyhow!("failed to delete '{name}': {e}")),
+                },
+                Err(e) => Err(anyhow::anyhow!("failed to delete '{name}': {e}")),
+            }
+        });
+    }
+
+    let results = futures::future::join_all(futs).await;
     sp.finish_and_clear();
-    eprintln!("  Instance '{}' deleted", config.name);
+
+    let mut errors = Vec::new();
+    for result in results {
+        match result {
+            Ok(name) => eprintln!("  Instance '{name}' deleted"),
+            Err(e) => errors.push(e),
+        }
+    }
+
+    if !errors.is_empty() {
+        for e in &errors {
+            eprintln!("  Error: {e}");
+        }
+        return Err(anyhow::anyhow!(
+            "{} instance(s) failed to delete",
+            errors.len()
+        ));
+    }
+
     Ok(())
 }

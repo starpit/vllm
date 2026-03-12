@@ -468,7 +468,7 @@ pub struct GceUpArgs {
     /// Instance name (used for both creation and teardown).
     pub name: String,
 
-    /// Number of nodes (currently only 1 supported).
+    /// Number of nodes (>1 for multi-node tensor parallelism).
     #[arg(short = 'n', long, default_value_t = 1)]
     pub nodes: u32,
 

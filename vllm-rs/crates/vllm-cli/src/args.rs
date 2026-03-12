@@ -42,6 +42,14 @@ pub enum Commands {
     Complete(CompleteArgs),
     /// Convert model weights between formats (stub).
     Convert(ConvertArgs),
+    /// Download a model from HuggingFace Hub without starting the server.
+    Pull(PullArgs),
+    /// List cached models.
+    Ls(ListArgs),
+    /// List cached models.
+    List(ListArgs),
+    /// Remove a cached model.
+    Rm(RmArgs),
     /// Live TUI dashboard — monitor a running vllm server.
     #[cfg(feature = "top")]
     Top(TopArgs),
@@ -458,6 +466,49 @@ pub struct ConvertArgs {
     /// Target dtype.
     #[arg(long, default_value = "f16")]
     pub dtype: String,
+}
+
+/// Arguments for `vllm rm`.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm rm <MODEL>")]
+pub struct RmArgs {
+    /// Model to remove (e.g. "google/gemma-2-2b"). Must match the model ID shown by `vllm ls`.
+    pub model: String,
+}
+
+/// Arguments for `vllm ls` / `vllm list`.
+#[derive(Parser, Debug)]
+pub struct ListArgs {
+    /// Sort order: "name" (default) or "size".
+    #[arg(short = 's', long, default_value = "name")]
+    pub sort: ListSort,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+pub enum ListSort {
+    Name,
+    Size,
+}
+
+/// Arguments for the `pull` subcommand.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm pull <MODEL> [OPTIONS]")]
+pub struct PullArgs {
+    /// HuggingFace model ID or local path (e.g. "meta-llama/Llama-3.2-1B").
+    pub model: String,
+
+    /// HuggingFace API token for gated models.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Specific GGUF filename to download (for GGUF repos).
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+
+    /// GGUF quantization to prefer (e.g. Q4_K_M, Q8_0). Case-insensitive.
+    /// When set, auto-selects the matching GGUF file from the repo.
+    #[arg(short = 'q', long)]
+    pub quantization: Option<String>,
 }
 
 #[cfg(feature = "gce")]

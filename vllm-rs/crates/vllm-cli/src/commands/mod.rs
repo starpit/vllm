@@ -11,6 +11,8 @@ pub mod collect_env;
 pub mod convert;
 #[cfg(feature = "gce")]
 pub mod gce;
+pub mod model;
+pub mod pull;
 pub mod serve;
 #[cfg(feature = "top")]
 pub mod top;

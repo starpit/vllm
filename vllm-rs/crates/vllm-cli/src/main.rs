@@ -31,6 +31,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::CollectEnv(args) => commands::collect_env::run_collect_env(args).await,
         Commands::Complete(args) => commands::chat::run_complete(args).await,
         Commands::Convert(args) => commands::convert::run_convert(args).await,
+        Commands::Pull(args) => commands::pull::run_pull(args).await,
+        Commands::Ls(args) | Commands::List(args) => commands::model::run_model_list(args).await,
+        Commands::Rm(args) => commands::model::run_model_rm(args).await,
         #[cfg(feature = "gce")]
         Commands::Gce(cmd) => {
             use crate::args::{GceImageSubcommand, GceSubcommand};

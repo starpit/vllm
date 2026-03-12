@@ -25,7 +25,7 @@ struct SectionSummary {
 
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let csv_path = Path::new(&manifest_dir).join("../../parity.csv");
+    let csv_path = Path::new(&manifest_dir).join("parity.csv");
     println!("cargo:rerun-if-changed={}", csv_path.display());
 
     let mut rdr = csv::Reader::from_path(&csv_path).expect("failed to open parity.csv");

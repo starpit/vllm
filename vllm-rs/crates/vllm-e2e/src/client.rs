@@ -376,6 +376,39 @@ impl Client {
         parse_anthropic_sse_events(&body)
     }
 
+    /// POST /v1/responses — raw response.
+    pub async fn responses_raw(&self, body: &serde_json::Value) -> Result<reqwest::Response> {
+        let resp = self
+            .inner
+            .post(format!("{}/v1/responses", self.base_url))
+            .json(body)
+            .send()
+            .await?;
+        Ok(resp)
+    }
+
+    /// POST /v1/responses with stream=true — returns SSE event bodies as JSON values.
+    pub async fn responses_stream(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>> {
+        let resp = self
+            .inner
+            .post(format!("{}/v1/responses", self.base_url))
+            .json(body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("responses streaming failed with status {status}: {body}");
+        }
+
+        let body = resp.text().await?;
+        parse_anthropic_sse_events(&body)
+    }
+
     /// GET /metrics — returns raw Prometheus text.
     pub async fn metrics(&self) -> Result<String> {
         let resp = self

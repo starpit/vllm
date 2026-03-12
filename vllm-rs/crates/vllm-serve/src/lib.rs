@@ -24,6 +24,7 @@ pub mod metrics;
 pub mod orca;
 pub mod protocol;
 pub mod reasoning_parser;
+pub mod responses;
 pub mod server;
 pub mod tokenizer;
 pub mod tool_parser;

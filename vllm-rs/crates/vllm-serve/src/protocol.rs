@@ -25,7 +25,7 @@ fn random_uuid() -> String {
     Uuid::new_v4().to_string()
 }
 
-fn unix_timestamp() -> i64 {
+pub fn unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

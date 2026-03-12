@@ -103,6 +103,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/chat/completions/render", post(render_chat_completion))
         .route("/v1/messages", post(crate::anthropic::messages))
+        .route("/v1/responses", post(crate::responses::responses))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))

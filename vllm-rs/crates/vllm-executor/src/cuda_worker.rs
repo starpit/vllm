@@ -4120,19 +4120,19 @@ impl Worker for CudaWorker {
         // Like Python vLLM: profile peak activation memory with a dummy forward
         // pass, then subtract it from available memory for KV cache sizing.
         //
-        // We measure free memory at two points:
-        //   free_after_load: after model load, before profiling allocations
-        //     → used for weights_and_overhead = total - free_after_load
-        //   free_before_fwd: after dummy KV + inputs, before forward pass
-        //     → peak_activations = free_before_fwd - free_after_fwd
+        // Python uses `allocated_bytes.all.peak` (peak ACTIVE PyTorch allocations
+        // during the profiling forward) + `non_torch_increase` (non-PyTorch CUDA
+        // memory that persisted after the forward, e.g. cuBLAS workspace).
         //
-        // This avoids counting the dummy KV cache as "activations" (which was
-        // previously stealing ~1.5 GiB from the real KV cache budget).
-        let (free_after_load, _) = cudarc::driver::result::mem_get_info()
+        // We mirror this with:
+        //   torch_peak     = caching.peak_active_bytes()  (peak live allocations)
+        //   non_torch      = (total - free_after_trim) - caching.memory_reserved()
+        //   peak_activations = torch_peak + non_torch
+        let (free_before, _total) = cudarc::driver::result::mem_get_info()
             .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
         info!(
             "CudaWorker: {:.0} MB free VRAM",
-            free_after_load as f64 / 1_048_576.0
+            free_before as f64 / 1_048_576.0
         );
 
         let device = self
@@ -4220,10 +4220,9 @@ impl Worker for CudaWorker {
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("dummy KvCachePool: {e}")))?;
 
-        // Measure free memory AFTER allocating dummy KV + inputs, so only
-        // the forward pass activations (+ cuBLAS workspace) are counted.
-        let (free_before_fwd, _) = cudarc::driver::result::mem_get_info()
-            .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
+        // Reset peak stats immediately before the profiling forward so we measure
+        // only the allocations made during this forward pass.
+        device.caching.reset_peak_stats();
 
         // Run the forward pass to warm up cuBLAS and measure peak memory.
         unsafe {
@@ -4245,32 +4244,48 @@ impl Worker for CudaWorker {
             }
         }
 
-        // Measure memory after profile run — the difference is peak activations.
-        let (free_after, _) = cudarc::driver::result::mem_get_info()
-            .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
+        // Capture peak active bytes from caching allocator — mirrors Python's
+        // `allocated_bytes.all.peak` (peak ACTIVE allocations, freed blocks not
+        // counted).
+        let torch_peak = device.caching.peak_active_bytes();
 
-        // Free the dummy KV cache and all cached allocator blocks.
+        // Free the dummy KV cache and all cached allocator blocks, then trim to
+        // return segments to the driver so cuMemGetInfo reflects only permanent
+        // allocations (cuBLAS workspace, NCCL, etc.).
         drop(dummy_kv);
         unsafe { device.caching.free_leaked_blocks() };
         device.caching.trim();
 
-        let peak_activation_bytes = free_before_fwd.saturating_sub(free_after);
+        // non_torch_increase = memory permanently held outside the caching
+        // allocator after the profiling forward (cuBLAS workspace, etc.).
+        // After trim(), caching.memory_reserved() == 0 for segments that were
+        // released.  We compare against free_before to catch anything that
+        // persisted.
+        let (free_after_trim, total_memory) = cudarc::driver::result::mem_get_info()
+            .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
+        // memory_reserved() = bytes still held by caching allocator after trim
+        // (private pool, graph capture pool, etc.)
+        let caching_reserved = device.caching.memory_reserved();
+        // non_torch = new permanent non-caching-allocator memory since free_before
+        // (e.g. cuBLAS workspace created during forward).  Can be negative if
+        // something was freed; clamp to 0.
+        let used_after_trim = total_memory.saturating_sub(free_after_trim);
+        let used_before = total_memory.saturating_sub(free_before);
+        let non_torch = used_after_trim
+            .saturating_sub(used_before)
+            .saturating_sub(caching_reserved);
+
+        let peak_activation_bytes = torch_peak + non_torch;
 
         // Match Python vLLM's memory calculation exactly.
         //
         // Python's flow (gpu_worker.py + mem_utils.py):
-        //   init_snapshot = MemorySnapshot taken BEFORE model load
-        //   requested = total_memory * gpu_memory_utilization
-        //   non_kv_cache = weights + peak_activations + non_torch + 150 MiB
+        //   non_kv_cache = weights_memory + torch_peak + non_torch + 150 MiB
         //   available_kv_bytes = requested - non_kv_cache
-        //   num_blocks = available_kv_bytes / bytes_per_block  (no extra util)
         //
-        // free_after_load is measured AFTER model load (before profiling).
-        // So (total - free_after_load) captures model weights + CUDA context +
-        // cuBLAS workspace — equivalent to Python's (weights + non_torch).
-        let (_, total_memory) = cudarc::driver::result::mem_get_info()
-            .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
-        let weights_and_overhead = total_memory.saturating_sub(free_after_load);
+        // Our free_before is measured AFTER model load (before profile run).
+        // So (total - free_before) = weights + persistent pre-existing overhead.
+        let weights_and_overhead = total_memory.saturating_sub(free_before);
 
         let utilization = self.config.gpu_memory_utilization;
         let available_kv_bytes = compute_available_kv_bytes(
@@ -4282,9 +4297,11 @@ impl Worker for CudaWorker {
 
         info!(
             "Memory profiling: total={:.1} GiB, weights+overhead={:.1} GiB, \
-             peak_activations={:.1} GiB",
+             torch_peak={:.1} GiB, non_torch={:.1} GiB, peak_activations={:.1} GiB",
             total_memory as f64 / 1_073_741_824.0,
             weights_and_overhead as f64 / 1_073_741_824.0,
+            torch_peak as f64 / 1_073_741_824.0,
+            non_torch as f64 / 1_073_741_824.0,
             peak_activation_bytes as f64 / 1_073_741_824.0,
         );
         info!(

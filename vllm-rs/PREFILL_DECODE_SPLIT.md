@@ -1,5 +1,12 @@
 # Prefill/Decode Split for Mixed Batches
 
+> **SUPERSEDED**: The prefill/decode split was removed. Mixed batches now run
+> through a single unified eager forward pass, matching Python vLLM's behavior.
+> The `max_num_batched_tokens` default was updated from 1024 to 2048.
+> The historical analysis below is kept for reference.
+
+---
+
 ## Problem
 
 With chunked prefill enabled (the default), nearly every scheduler step is a

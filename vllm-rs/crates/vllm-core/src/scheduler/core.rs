@@ -474,6 +474,8 @@ pub struct Scheduler {
     waiting: Box<dyn RequestQueue>,
     /// Requests currently in the running state.
     running: Vec<Request>,
+    /// Index: `req_id -> index in running`. Kept in sync for O(1) lookup.
+    running_req_idx: HashMap<String, usize>,
     /// Request IDs finished between the previous and current steps.
     finished_req_ids: HashSet<String>,
     /// Scheduling pause state.
@@ -517,6 +519,7 @@ impl Scheduler {
             requests: HashMap::new(),
             waiting: create_request_queue(policy),
             running: Vec::new(),
+            running_req_idx: HashMap::new(),
             finished_req_ids: HashSet::new(),
             pause_state: PauseState::Unpaused,
 
@@ -558,6 +561,31 @@ impl Scheduler {
     }
 
     // -- Internal helpers --
+
+    /// Push a request onto the running queue and update the O(1) index.
+    fn running_push(&mut self, request: Request) {
+        let idx = self.running.len();
+        self.running_req_idx
+            .insert(request.request_id.clone(), idx);
+        self.running.push(request);
+    }
+
+    /// Remove the request at `pos` from the running queue and repair the index.
+    ///
+    /// After `Vec::remove(pos)`, every element at index > pos shifts down by
+    /// one.  We fix those up in O(n) — acceptable because removals are rare
+    /// (only on finish / preemption).
+    fn running_remove(&mut self, pos: usize) -> Request {
+        let req = self.running.remove(pos);
+        self.running_req_idx.remove(&req.request_id);
+        // Decrement indices for all elements that shifted.
+        for idx in self.running_req_idx.values_mut() {
+            if *idx > pos {
+                *idx -= 1;
+            }
+        }
+        req
+    }
 
     /// Preempt a request: free its KV cache blocks, mark it as preempted,
     /// and move it back to the waiting queue.
@@ -695,8 +723,8 @@ impl Scheduler {
         let req_id = request.request_id.clone();
 
         // Remove from running queue.
-        if let Some(pos) = self.running.iter().position(|r| r.request_id == request_id) {
-            let mut request = self.running.remove(pos);
+        if let Some(&pos) = self.running_req_idx.get(request_id) {
+            let mut request = self.running_remove(pos);
             self.kv_cache.free(&request.request_id);
             request.status = status;
             self.requests.insert(request.request_id.clone(), request);
@@ -730,8 +758,8 @@ impl Scheduler {
         if let Some(request) = self.requests.get_mut(request_id) {
             request.spec_token_ids = spec_token_ids.clone();
         }
-        if let Some(running_req) = self.running.iter_mut().find(|r| r.request_id == request_id) {
-            running_req.spec_token_ids = spec_token_ids;
+        if let Some(&idx) = self.running_req_idx.get(request_id) {
+            self.running[idx].spec_token_ids = spec_token_ids;
         }
     }
 
@@ -754,7 +782,8 @@ impl Scheduler {
                 .num_output_placeholders
                 .saturating_sub(num_rejected as u32);
         }
-        if let Some(running_req) = self.running.iter_mut().find(|r| r.request_id == request_id) {
+        if let Some(&idx) = self.running_req_idx.get(request_id) {
+            let running_req = &mut self.running[idx];
             running_req.num_computed_tokens = running_req
                 .num_computed_tokens
                 .saturating_sub(num_rejected as u32);
@@ -775,8 +804,9 @@ impl Scheduler {
                 .num_output_placeholders
                 .saturating_sub(token_ids.len() as u32);
         }
-        // Also update the running list copy.
-        if let Some(running_req) = self.running.iter_mut().find(|r| r.request_id == request_id) {
+        // Also update the running list copy via O(1) index lookup.
+        if let Some(&idx) = self.running_req_idx.get(request_id) {
+            let running_req = &mut self.running[idx];
             running_req.append_output_token_ids(token_ids);
             running_req.num_output_placeholders = running_req
                 .num_output_placeholders
@@ -922,7 +952,7 @@ impl SchedulerInterface for Scheduler {
                 if preempt_idx == req_index {
                     // The request we're trying to schedule is the last one;
                     // preempt it.
-                    let mut preempted = self.running.remove(preempt_idx);
+                    let mut preempted = self.running_remove(preempt_idx);
                     self.preempt_request(&mut preempted);
 
                     // Remove from scheduled lists if it was already scheduled.
@@ -939,7 +969,7 @@ impl SchedulerInterface for Scheduler {
                     preempted_reqs.push(preempted);
                     break;
                 } else {
-                    let mut preempted = self.running.remove(preempt_idx);
+                    let mut preempted = self.running_remove(preempt_idx);
                     self.preempt_request(&mut preempted);
 
                     // Restore budget if this request was scheduled.
@@ -1063,7 +1093,7 @@ impl SchedulerInterface for Scheduler {
                         }
 
                         // Move to running list (no extra clone).
-                        self.running.push(request);
+                        self.running_push(request);
 
                         req_to_new_blocks.insert(request_id.clone(), blocks);
                         num_scheduled_tokens.insert(request_id.clone(), num_new_tokens);
@@ -1216,6 +1246,7 @@ impl SchedulerInterface for Scheduler {
 
     fn shutdown(&mut self) {
         // Free all running requests via drain to avoid intermediate Vec<String>.
+        self.running_req_idx.clear();
         for req in self.running.drain(..) {
             self.kv_cache.free(&req.request_id);
         }
@@ -1493,12 +1524,7 @@ mod tests {
         assert_eq!(output1.scheduled_new_reqs[0].req_id, "r1");
 
         // Simulate r1 generating an output token.
-        if let Some(r) = sched.running.iter_mut().find(|r| r.request_id == "r1") {
-            r.append_output_token_ids(&[99]);
-        }
-        if let Some(r) = sched.requests.get_mut("r1") {
-            r.append_output_token_ids(&[99]);
-        }
+        sched.append_output_tokens("r1", &[99]);
 
         // Second step: r1 is running (needs 1 token), schedule it.
         let output2 = sched.schedule();
@@ -1532,12 +1558,7 @@ mod tests {
         assert_eq!(sched.get_request_counts(), (1, 0));
 
         // Simulate r1 producing a token.
-        if let Some(r) = sched.running.iter_mut().find(|r| r.request_id == "r1") {
-            r.append_output_token_ids(&[99]);
-        }
-        if let Some(r) = sched.requests.get_mut("r1") {
-            r.append_output_token_ids(&[99]);
-        }
+        sched.append_output_tokens("r1", &[99]);
 
         // Now pause new requests and add r2.
         sched.add_request(make_request("r2", 10));

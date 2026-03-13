@@ -125,6 +125,12 @@ pub struct CachingAllocator {
     /// Private pool redirect (for CUDA graph capture).
     private_small_pool: Option<BlockPool>,
     private_large_pool: Option<BlockPool>,
+    /// Bytes currently live (allocated but not freed). Mirrors PyTorch's
+    /// `allocated_bytes.all.current`.
+    active_bytes: usize,
+    /// Peak value of `active_bytes` since last `reset_peak_stats()`. Mirrors
+    /// PyTorch's `allocated_bytes.all.peak`.
+    peak_active_bytes: usize,
 }
 
 unsafe impl Send for CachingAllocator {}
@@ -146,7 +152,20 @@ impl CachingAllocator {
             active_blocks: std::collections::HashMap::new(),
             private_small_pool: None,
             private_large_pool: None,
+            active_bytes: 0,
+            peak_active_bytes: 0,
         }
+    }
+
+    /// Reset peak-active counter (call before a section you want to profile).
+    pub fn reset_peak_stats(&mut self) {
+        self.peak_active_bytes = self.active_bytes;
+    }
+
+    /// Peak active bytes since last `reset_peak_stats()`. Mirrors PyTorch's
+    /// `allocated_bytes.all.peak` stat.
+    pub fn peak_active_bytes(&self) -> usize {
+        self.peak_active_bytes
     }
 
     /// Begin allocating to a private pool (for CUDA graph capture).
@@ -255,6 +274,10 @@ impl CachingAllocator {
 
             block.allocated = true;
             self.active_blocks.insert(block.ptr as usize, block_ptr);
+            self.active_bytes += size;
+            if self.active_bytes > self.peak_active_bytes {
+                self.peak_active_bytes = self.active_bytes;
+            }
             return block.ptr;
         }
 
@@ -295,6 +318,10 @@ impl CachingAllocator {
 
                 block.allocated = true;
                 self.active_blocks.insert(block.ptr as usize, block_ptr);
+                self.active_bytes += size;
+                if self.active_bytes > self.peak_active_bytes {
+                    self.peak_active_bytes = self.active_bytes;
+                }
                 return block.ptr;
             }
         }
@@ -347,6 +374,10 @@ impl CachingAllocator {
 
         b.allocated = true;
         self.active_blocks.insert(b.ptr as usize, block);
+        self.active_bytes += size;
+        if self.active_bytes > self.peak_active_bytes {
+            self.peak_active_bytes = self.active_bytes;
+        }
         b.ptr
     }
 
@@ -358,6 +389,7 @@ impl CachingAllocator {
 
         let block = &mut *block_ptr;
         block.allocated = false;
+        self.active_bytes = self.active_bytes.saturating_sub(block.size);
 
         // Try merge with prev.
         if !block.prev.is_null() {
@@ -529,6 +561,12 @@ impl CachingAllocator {
 
     pub fn free_block_count(&self) -> usize {
         self.small_pool.free_blocks.len() + self.large_pool.free_blocks.len()
+    }
+
+    /// Total bytes currently held from the CUDA driver (allocated + free pool).
+    /// Mirrors PyTorch's `reserved_bytes.all.current`.
+    pub fn memory_reserved(&self) -> usize {
+        self.segments.iter().map(|&(_, sz)| sz).sum()
     }
 
     pub fn total_block_count(&self) -> usize {

@@ -249,13 +249,9 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             block_size: config.block_size,
             device_id,
             enforce_eager: config.enforce_eager,
-            // Default 1024 (not 8192 like Python). Our CudaWorker splits mixed
-            // batches into a decode CUDA-graph pass + a prefill eager pass.
-            // Smaller prefill chunks keep the eager pass fast (~25ms for 1024
-            // tokens) while decode runs through the captured graph (~5ms).
-            // Benchmarked: 1024 → 21.8 req/s vs 8192 → 12.1 req/s on Qwen2.5-3B.
-            // See PREFILL_DECODE_SPLIT.md for the full analysis.
-            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+            // Default 2048. Mixed batches run through the unified eager path
+            // (no prefill/decode split). See PREFILL_DECODE_SPLIT.md for history.
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
             cuda_graph_sizes: config
                 .cuda_graph_config
                 .as_ref()
@@ -457,11 +453,9 @@ fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
 
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
-            // Default 1024 to keep prefill chunks small in mixed batches.
-            // CudaWorker splits mixed batches into decode (CUDA graph) +
-            // prefill (eager); 1024 tokens keeps the eager pass fast (~25ms).
-            // See PREFILL_DECODE_SPLIT.md for tuning data.
-            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+            // Default 2048. Mixed batches use the unified eager path.
+            // See PREFILL_DECODE_SPLIT.md for history.
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
             max_num_seqs: config.max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,
@@ -1520,7 +1514,7 @@ fn initialize_stack_tp(
                 block_size: config.block_size,
                 device_id: rank as i32,
                 enforce_eager: config.enforce_eager,
-                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
                 cuda_graph_sizes: config
                     .cuda_graph_config
                     .as_ref()
@@ -1710,7 +1704,7 @@ fn initialize_stack_tp(
         let enable_prefix_caching = config.enable_prefix_caching;
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
-                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
                 max_num_seqs: config.max_num_seqs,
                 policy: SchedulerPolicy::Fcfs,
                 enable_chunked_prefill: true,
@@ -1907,7 +1901,7 @@ fn initialize_stack_external(
             block_size: config.block_size,
             device_id: local_rank as i32,
             enforce_eager: config.enforce_eager,
-            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
             cuda_graph_sizes: config
                 .cuda_graph_config
                 .as_ref()
@@ -2029,7 +2023,7 @@ fn initialize_stack_external(
         let enable_prefix_caching = config.enable_prefix_caching;
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
-                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
                 max_num_seqs: config.max_num_seqs,
                 policy: SchedulerPolicy::Fcfs,
                 enable_chunked_prefill: true,

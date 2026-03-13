@@ -1,11 +1,11 @@
 # vLLM Feature Parity: Python vs Rust
 
-> Last updated: 2026-03-12
+> Last updated: 2026-03-13
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
 | ✅ 🟦 | Implemented | 160 |
-| ⚠️ 🟨 | Partial | 8 |
+| ⚠️ 🟨 | Partial | 9 |
 | ❌ 🟥 | Not implemented | 102 |
 | 🚫 | Won't fix | 4 |
 
@@ -27,7 +27,7 @@
 | [Model Architectures — Vision-Language / Multimodal](#model-architectures--vision-language--multimodal) | 🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 0 | 0 | 11 |
 | [Model Architectures — Audio / Speech](#model-architectures--audio--speech) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
 | [Model Architectures — Speculative Decoding Draft Models](#model-architectures--speculative-decoding-draft-models) | 🟥🟥🟥🟥 | 0 | 0 | 4 |
-| [Quantization Methods](#quantization-methods) | 🟦🟦🟦🟦🟦🟦🟨🟨🟨🟥🟥🟥🟥 | 6 | 3 | 4 |
+| [Quantization Methods](#quantization-methods) | 🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟥🟥🟥🟥 | 6 | 4 | 4 |
 | [Attention Backends](#attention-backends) | 🟦🟦🟦🟥🟥🟥🟥🟥🟥🟥🟥🟥 | 3 | 0 | 9 |
 | [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 22 | 0 | 0 |
 | [Structured Output / Guided Decoding](#structured-output--guided-decoding) | 🟦🟦🟦🟦🟦🟦🟦 | 7 | 0 | 0 |
@@ -43,7 +43,7 @@
 | [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥 | 22 | 1 | 3 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟦 | 7 | 0 | 0 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟦 | 8 | 0 | 0 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **160** | **8** | **102** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟨🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **160** | **9** | **102** |
 
 ---
 
@@ -223,6 +223,7 @@
 | Method | Python | Rust | Notes |
 |---|:---:|:---:|---|
 | GGUF (all k-quant variants) | ✅ | ✅ | llama.cpp-derived dequant kernels; BS=1 fused dequant-matvec + BS>1 Q8_1 dot products; archs: LLaMA/Qwen2/Qwen3; E2E: Qwen2.5-0.5B + Qwen3-0.6B GGUF; CUDA graphs disabled (incompatible with dynamic allocs) |
+| GGUF IQ quants (importance-matrix) | ✅ | ⚠️ | IQ4_NL + IQ4_XS done (Phase 1); remaining: IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S; llama.cpp-derived lookup-table dequant kernels |
 | GPTQ | ✅ | ✅ | Marlin W4A16 on SM80+; symmetric + desc_act (activation ordering); fused QKV/gate_up at load; post-GEMM bias_add_inplace for linear bias; CUDA graphs work; archs: LLaMA/Qwen2/Gemma2/Granite; note: asymmetric zero-points not passed (uint4b8 bakes in zp like Python vLLM) |
 | AWQ | ✅ | ✅ | Marlin W4A16 on SM80+; fused QKV/gate_up at load; CUDA graphs work; archs: LLaMA/Qwen2/Gemma2/Granite; E2E verified Qwen2.5-0.5B |
 | BitsAndBytes NF4 (4-bit) | ✅ | ✅ | Dequant-then-cuBLAS GEMM; double quantization supported; per-shard matmuls for QKV and gate/up; archs: LLaMA/Qwen2/Gemma2 (+ aliases Mistral/Qwen3/Phi-3/Granite); E2E verified unsloth/Qwen3-0.6B-bnb-4bit |

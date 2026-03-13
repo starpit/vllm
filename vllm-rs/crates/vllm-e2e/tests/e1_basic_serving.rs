@@ -2658,3 +2658,48 @@ async fn test_cuda_sleep_wake() {
     let resp = client.completion(&request).await.unwrap();
     assert_valid_completion_response(&resp);
 }
+
+// ===========================================================================
+// CUDA GGUF IQ4 E2E tests — IQ (importance-matrix) quantized models on GPU
+// ===========================================================================
+// Tests IQ4_XS quantization support via the Q8_1 MMVQ path.
+//
+// Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gguf_iq4 -- --ignored --test-threads=1
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_iq4_qwen3_server_starts() {
+    let server = TestServer::builder(TestModels::QWEN3_0_6B_GGUF)
+        .with_args(&["--gguf-file", "Qwen3-0.6B-IQ4_XS.gguf"])
+        .start()
+        .await
+        .expect("CUDA Qwen3 0.6B IQ4_XS GGUF server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let models = client.list_models().await.unwrap();
+    assert_eq!(models.data.len(), 1);
+}
+
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_gguf_iq4_qwen3_chat() {
+    let server = TestServer::builder(TestModels::QWEN3_0_6B_GGUF)
+        .with_args(&["--gguf-file", "Qwen3-0.6B-IQ4_XS.gguf"])
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_chat_request("Say hello in one sentence.", Some(50));
+    let resp = client.chat_completion(&request).await.unwrap();
+
+    assert_valid_chat_response(&resp);
+    assert!(
+        resp.usage.completion_tokens.unwrap_or(0) > 0,
+        "should generate at least one token"
+    );
+}

@@ -445,6 +445,46 @@ typedef struct {
 } block_q8_K;
 static_assert(sizeof(block_q8_K) == sizeof(float) + QK_K + QK_K/16*sizeof(int16_t), "wrong q8_K block size/padding");
 
+// ---------------------------------------------------------------------------
+// IQ4 types — importance-matrix 4-bit quantization
+// ---------------------------------------------------------------------------
+
+#define QK4_NL 32
+#define QR4_NL 2
+#define QI4_NL (QK4_NL / (4*QR4_NL))
+typedef struct {
+    half d;
+    uint8_t qs[QK4_NL/2];
+} block_iq4_nl;
+static_assert(sizeof(block_iq4_nl) == sizeof(ggml_fp16_t) + QK4_NL/2, "wrong iq4_nl block size/padding");
+
+#define QR4_XS 8
+#define QI4_XS (QK_K / (4*QR4_XS))
+typedef struct {
+    half d;
+    uint16_t scales_h;
+    uint8_t  scales_l[QK_K/64];
+    uint8_t  qs[QK_K/2];
+} block_iq4_xs;
+static_assert(sizeof(block_iq4_xs) == sizeof(ggml_fp16_t) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
+
+// IQ4_NL non-linear lookup table (16-entry codebook)
+static const __device__ int8_t kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+// Helper: expand 4-bit indices via 16-entry table lookup, pack for __dp4a
+static __device__ __forceinline__ void get_int_from_table_16(const uint32_t & q4, const uint8_t * values,
+        int & val1, int & val2) {
+
+    uint32_t aux32; const uint8_t * q8 = (const uint8_t *)&aux32;
+    aux32 = q4 & 0x0f0f0f0f;
+    uint16_t v1 = values[q8[0]] | (values[q8[1]] << 8);
+    uint16_t v2 = values[q8[2]] | (values[q8[3]] << 8);
+    val1 = v1 | (v2 << 16);
+    aux32 = (q4 >> 4) & 0x0f0f0f0f;
+    v1 = values[q8[0]] | (values[q8[1]] << 8);
+    v2 = values[q8[2]] | (values[q8[3]] << 8);
+    val2 = v1 | (v2 << 16);
+}
 
 template <int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x, int mmq_y, int nwarps,
               allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
@@ -1168,6 +1208,48 @@ DEQUANTIZE(q4_1)
 DEQUANTIZE(q5_0)
 DEQUANTIZE(q5_1)
 DEQUANTIZE(q8_0)
+
+// ---------------------------------------------------------------------------
+// IQ4 dequantize kernels
+// ---------------------------------------------------------------------------
+
+template<typename dst_t>
+static __device__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+
+    const auto i   = blockIdx.x;
+    const block_iq4_nl * x = (const block_iq4_nl *) vx + i*(QK_K/QK4_NL);
+
+    const auto tid = threadIdx.x;
+    const int il = tid/8; // 0...3
+    const int ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
+    const uint8_t  * q4 = x[ib].qs + 4*il;
+    const float d = __half2float(x[ib].d);
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = d * kvalues_iq4nl[q4[j] & 0xf];
+        y[j+16] = d * kvalues_iq4nl[q4[j] >>  4];
+    }
+}
+
+template<typename dst_t>
+static __device__ void dequantize_block_iq4_xs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const auto i   = blockIdx.x;
+    const block_iq4_xs * x = (const block_iq4_xs *)vx;
+
+    const auto tid = threadIdx.x;
+    const int il = tid/8; // 0...3
+    const int ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
+    const uint8_t  * q4 = x[i].qs + 16*ib + 4*il;
+    const float d = __half2float(x[i].d) * ((((x[i].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[i].scales_h >> 2*ib) & 3) << 4)) - 32);
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = d * kvalues_iq4nl[q4[j] & 0xf];
+        y[j+16] = d * kvalues_iq4nl[q4[j] >>  4];
+    }
+}
+
+DEQUANTIZE_K(iq4_nl)
+DEQUANTIZE_K(iq4_xs)
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static __device__ void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows) {
@@ -2788,6 +2870,70 @@ extern "C" __global__ void mul_mat_vec_q6_K_q8_1_cuda1(
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
 
     mul_mat_vec_q<1, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
+        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+
+// ---------------------------------------------------------------------------
+// IQ4 vec_dot + MMVQ kernels
+// ---------------------------------------------------------------------------
+
+static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+
+    const block_iq4_nl * bq = (const block_iq4_nl *) vbq;
+
+    const uint16_t * q4 = (const uint16_t *)bq->qs + 2*iqs;
+    const int32_t  * q8 = (const int32_t  *)bq8_1->qs + iqs;
+
+    const uint8_t * values = (const uint8_t *)kvalues_iq4nl;
+
+    int v1, v2;
+    int sumi1 = 0, sumi2 = 0;
+    for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
+        const uint32_t aux = q4[2*l] | (q4[2*l+1] << 16);
+        get_int_from_table_16(aux, values, v1, v2);
+        sumi1 = __dp4a(v1, q8[l+0], sumi1);
+        sumi2 = __dp4a(v2, q8[l+4], sumi2);
+    }
+    const float d = __half2float(bq->d) * __low2float(bq8_1->ds);
+    return d * (sumi1 + sumi2);
+}
+
+static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs) {
+
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq;
+    const uint8_t * values = (const uint8_t *)kvalues_iq4nl;
+
+    // iqs is 0...7
+    const int ib32 = iqs;
+    const int32_t  * q8 = (const int *)bq8_1[ib32].qs;
+    const uint32_t * q4 = (const uint32_t *)bq4->qs + 4*ib32;
+    const int8_t ls = ((bq4->scales_l[ib32/2] >> 4*(ib32%2)) & 0xf) | (((bq4->scales_h >> 2*ib32) & 3) << 4);
+    const float d = __half2float(bq4->d) * (ls - 32) * __low2float(bq8_1[ib32].ds);
+    int v1, v2;
+    int sumi1 = 0, sumi2 = 0;
+    for (int j = 0; j < 4; ++j) {
+        get_int_from_table_16(q4[j], values, v1, v2);
+        sumi1 = __dp4a(v1, q8[j+0], sumi1);
+        sumi2 = __dp4a(v2, q8[j+4], sumi2);
+    }
+    return d * (sumi1 + sumi2);
+}
+
+extern "C" __global__ void mul_mat_vec_iq4_nl_q8_1_cuda1(
+    const void * vx, const void * vy, float * dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    mul_mat_vec_q<1, QK4_NL, QI4_NL, block_iq4_nl, VDR_Q4_0_Q8_1_MMVQ, vec_dot_iq4_nl_q8_1>
+        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+
+extern "C" __global__ void mul_mat_vec_iq4_xs_q8_1_cuda1(
+    const void * vx, const void * vy, float * dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    mul_mat_vec_q<1, QK_K, QI4_XS, block_iq4_xs, 1, vec_dot_iq4_xs_q8_1>
         (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
@@ -4933,6 +5079,60 @@ void launch_dequantize_block_q8_K_f16(
 {
     int nb = (elem_count + 255) / 256;
     dequantize_block_q8_K_f16<<<nb, 32, 0, stream>>>(vx, dst);
+}
+
+// --- IQ4 mul_mat_vec launch wrappers ---
+
+void launch_mul_mat_vec_iq4_nl_q8_1(
+    const void* vx, const void* vy, float* dst,
+    int ncols_x, int nrows_x, int nrows_y, int nrows_dst,
+    cudaStream_t stream)
+{
+    dim3 grid(nrows_x, 1, 1);
+    dim3 block(WARP_SIZE, 4, 1);
+    mul_mat_vec_iq4_nl_q8_1_cuda1<<<grid, block, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+
+void launch_mul_mat_vec_iq4_xs_q8_1(
+    const void* vx, const void* vy, float* dst,
+    int ncols_x, int nrows_x, int nrows_y, int nrows_dst,
+    cudaStream_t stream)
+{
+    dim3 grid(nrows_x, 1, 1);
+    dim3 block(WARP_SIZE, 4, 1);
+    mul_mat_vec_iq4_xs_q8_1_cuda1<<<grid, block, 0, stream>>>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+
+// --- IQ4 dequantize launch wrappers (f32) ---
+
+void launch_dequantize_block_iq4_nl_f32(
+    const void* vx, float* dst, int elem_count, cudaStream_t stream)
+{
+    int nb = (elem_count + 255) / 256;
+    dequantize_block_iq4_nl_f32<<<nb, 32, 0, stream>>>(vx, dst);
+}
+
+void launch_dequantize_block_iq4_xs_f32(
+    const void* vx, float* dst, int elem_count, cudaStream_t stream)
+{
+    int nb = (elem_count + 255) / 256;
+    dequantize_block_iq4_xs_f32<<<nb, 32, 0, stream>>>(vx, dst);
+}
+
+// --- IQ4 dequantize launch wrappers (f16) ---
+
+void launch_dequantize_block_iq4_nl_f16(
+    const void* vx, __half* dst, int elem_count, cudaStream_t stream)
+{
+    int nb = (elem_count + 255) / 256;
+    dequantize_block_iq4_nl_f16<<<nb, 32, 0, stream>>>(vx, dst);
+}
+
+void launch_dequantize_block_iq4_xs_f16(
+    const void* vx, __half* dst, int elem_count, cudaStream_t stream)
+{
+    int nb = (elem_count + 255) / 256;
+    dequantize_block_iq4_xs_f16<<<nb, 32, 0, stream>>>(vx, dst);
 }
 
 } // extern "C"

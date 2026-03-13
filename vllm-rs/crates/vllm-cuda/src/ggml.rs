@@ -38,6 +38,8 @@ pub enum GgmlDType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
+    IQ4NL = 20,
+    IQ4XS = 23,
 }
 
 impl GgmlDType {
@@ -56,6 +58,8 @@ impl GgmlDType {
             13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
             15 => Some(Self::Q8K),
+            20 => Some(Self::IQ4NL),
+            23 => Some(Self::IQ4XS),
             _ => None,
         }
     }
@@ -82,14 +86,24 @@ impl GgmlDType {
             Self::Q5K => 176,
             Self::Q6K => 210,
             Self::Q8K => 292,
+            Self::IQ4NL => 18,
+            Self::IQ4XS => 136,
         }
     }
 
     /// Number of elements per quantization block.
     pub const fn block_size(self) -> usize {
         match self {
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
+            Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_0
+            | Self::Q8_1
+            | Self::IQ4NL => 32,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K | Self::IQ4XS => {
+                256
+            }
         }
     }
 
@@ -99,6 +113,14 @@ impl GgmlDType {
             self,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K
         )
+    }
+
+    /// Whether this is an IQ (importance-matrix) quantization type.
+    ///
+    /// IQ types lack the fused dequant+dot BS=1 kernel — they must always go
+    /// through the Q8_1 intermediate quantization path.
+    pub const fn is_iq_quant(self) -> bool {
+        matches!(self, Self::IQ4NL | Self::IQ4XS)
     }
 }
 
@@ -117,6 +139,8 @@ impl std::fmt::Display for GgmlDType {
             Self::Q5K => write!(f, "Q5K"),
             Self::Q6K => write!(f, "Q6K"),
             Self::Q8K => write!(f, "Q8K"),
+            Self::IQ4NL => write!(f, "IQ4_NL"),
+            Self::IQ4XS => write!(f, "IQ4_XS"),
         }
     }
 }
@@ -514,6 +538,56 @@ unsafe extern "C" {
         elem_count: i32,
         stream: CUstream,
     );
+
+    // --- IQ4 mul_mat_vec Q*×Q8_1 wrappers ---
+    fn launch_mul_mat_vec_iq4_nl_q8_1(
+        vx: *const u8,
+        vy: *const u8,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        nrows_y: i32,
+        nrows_dst: i32,
+        stream: CUstream,
+    );
+    fn launch_mul_mat_vec_iq4_xs_q8_1(
+        vx: *const u8,
+        vy: *const u8,
+        dst: *mut f32,
+        ncols_x: i32,
+        nrows_x: i32,
+        nrows_y: i32,
+        nrows_dst: i32,
+        stream: CUstream,
+    );
+
+    // --- IQ4 dequantize to f32 ---
+    fn launch_dequantize_block_iq4_nl_f32(
+        vx: *const u8,
+        dst: *mut f32,
+        elem_count: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq4_xs_f32(
+        vx: *const u8,
+        dst: *mut f32,
+        elem_count: i32,
+        stream: CUstream,
+    );
+
+    // --- IQ4 dequantize to f16 ---
+    fn launch_dequantize_block_iq4_nl_f16(
+        vx: *const u8,
+        dst: *mut u16,
+        elem_count: i32,
+        stream: CUstream,
+    );
+    fn launch_dequantize_block_iq4_xs_f16(
+        vx: *const u8,
+        dst: *mut u16,
+        elem_count: i32,
+        stream: CUstream,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +622,10 @@ pub unsafe fn ggml_dequant_mul_mat_vec(
         GgmlDType::Q4K => launch_dequantize_mul_mat_vec_q4_k(vx, x, dst, ncols, nrows, stream),
         GgmlDType::Q5K => launch_dequantize_mul_mat_vec_q5_k(vx, x, dst, ncols, nrows, stream),
         GgmlDType::Q6K => launch_dequantize_mul_mat_vec_q6_k(vx, x, dst, ncols, nrows, stream),
+        dt if dt.is_iq_quant() => panic!(
+            "IQ types must use Q8_1 path, not dequant_mul_mat_vec: {}",
+            storage.dtype
+        ),
         _ => panic!(
             "unsupported dtype for dequant_mul_mat_vec: {}",
             storage.dtype
@@ -579,6 +657,8 @@ pub unsafe fn ggml_dequantize_f32(
         GgmlDType::Q5K => launch_dequantize_block_q5_K_f32(src, dst, n, stream),
         GgmlDType::Q6K => launch_dequantize_block_q6_K_f32(src, dst, n, stream),
         GgmlDType::Q8K => launch_dequantize_block_q8_K_f32(src, dst, n, stream),
+        GgmlDType::IQ4NL => launch_dequantize_block_iq4_nl_f32(src, dst, n, stream),
+        GgmlDType::IQ4XS => launch_dequantize_block_iq4_xs_f32(src, dst, n, stream),
         _ => panic!("unsupported dtype for dequantize_f32: {}", dtype),
     }
 }
@@ -607,6 +687,8 @@ pub unsafe fn ggml_dequantize_f16(
         GgmlDType::Q5K => launch_dequantize_block_q5_K_f16(src, dst, n, stream),
         GgmlDType::Q6K => launch_dequantize_block_q6_K_f16(src, dst, n, stream),
         GgmlDType::Q8K => launch_dequantize_block_q8_K_f16(src, dst, n, stream),
+        GgmlDType::IQ4NL => launch_dequantize_block_iq4_nl_f16(src, dst, n, stream),
+        GgmlDType::IQ4XS => launch_dequantize_block_iq4_xs_f16(src, dst, n, stream),
         _ => panic!("unsupported dtype for dequantize_f16: {}", dtype),
     }
 }
@@ -760,6 +842,12 @@ pub unsafe fn ggml_mul_mat_vec_q8_1(
             GgmlDType::Q6K => launch_mul_mat_vec_q6_K_q8_1(
                 vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
             ),
+            GgmlDType::IQ4NL => launch_mul_mat_vec_iq4_nl_q8_1(
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+            ),
+            GgmlDType::IQ4XS => launch_mul_mat_vec_iq4_xs_q8_1(
+                vx, y_offset, dst_offset, ncols_x, nrows_x, nrows_y, nrows_dst, stream,
+            ),
             _ => panic!("unsupported dtype for mul_mat_vec_q8_1: {}", storage.dtype),
         }
     }
@@ -793,9 +881,12 @@ pub unsafe fn ggml_matmul(
     let out = alloc.alloc_tensor(&[num_tokens, storage.nrows], DType::F32);
     let dst = out.as_gpu_tensor().raw_ptr() as *mut f32;
 
-    if num_tokens == 1 {
+    if num_tokens == 1 && !storage.dtype.is_iq_quant() {
+        // Fast path: fused dequant+dot for standard quant types at BS=1.
         ggml_dequant_mul_mat_vec(storage, x.as_ptr::<f32>(), dst, stream);
     } else {
+        // IQ types always use Q8_1 path (no fused dequant+dot kernel).
+        // Standard types use Q8_1 path for BS>1.
         let ncols_padded = pad(storage.ncols, MATRIX_ROW_PADDING);
         let (q8_ptr, _q8_bytes) =
             ggml_quantize_q8_1_alloc(x.as_ptr::<f32>(), storage.ncols, num_tokens, alloc, stream);
@@ -1129,6 +1220,38 @@ mod tests {
         assert!(!GgmlDType::Q4_0.is_k_quant());
         assert!(GgmlDType::Q4K.is_k_quant());
         assert!(GgmlDType::Q6K.is_k_quant());
+    }
+
+    #[test]
+    fn test_ggml_dtype_iq4_from_u32() {
+        assert_eq!(GgmlDType::from_u32(20), Some(GgmlDType::IQ4NL));
+        assert_eq!(GgmlDType::from_u32(23), Some(GgmlDType::IQ4XS));
+    }
+
+    #[test]
+    fn test_ggml_dtype_iq4_type_size() {
+        assert_eq!(GgmlDType::IQ4NL.type_size(), 18);
+        assert_eq!(GgmlDType::IQ4XS.type_size(), 136);
+    }
+
+    #[test]
+    fn test_ggml_dtype_iq4_block_size() {
+        assert_eq!(GgmlDType::IQ4NL.block_size(), 32);
+        assert_eq!(GgmlDType::IQ4XS.block_size(), 256);
+    }
+
+    #[test]
+    fn test_ggml_dtype_is_iq_quant() {
+        assert!(GgmlDType::IQ4NL.is_iq_quant());
+        assert!(GgmlDType::IQ4XS.is_iq_quant());
+        assert!(!GgmlDType::Q4_0.is_iq_quant());
+        assert!(!GgmlDType::Q4K.is_iq_quant());
+    }
+
+    #[test]
+    fn test_ggml_dtype_iq4_display() {
+        assert_eq!(format!("{}", GgmlDType::IQ4NL), "IQ4_NL");
+        assert_eq!(format!("{}", GgmlDType::IQ4XS), "IQ4_XS");
     }
 
     #[test]

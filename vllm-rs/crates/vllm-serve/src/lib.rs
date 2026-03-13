@@ -10,7 +10,6 @@
 //! Port of: `vllm/entrypoints/openai/` (subset)
 
 pub mod anthropic;
-#[cfg(feature = "chat-template")]
 pub mod chat_template;
 pub mod detokenizer;
 pub mod engine;

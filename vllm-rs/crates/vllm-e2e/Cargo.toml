@@ -6,7 +6,7 @@ license.workspace = true
 description = "End-to-end tests for vLLM Rust inference engine"
 
 [features]
-default = ["guided-decoding", "chat-template", "metrics", "multimodal", "tls"]
+default = ["guided-decoding", "metrics", "multimodal", "tls"]
 e2e = []
 otel = ["vllm-serve/otel", "vllm-common/otel"]
 cuda = ["vllm-serve/cuda"]
@@ -14,7 +14,6 @@ nccl = ["cuda"]
 metal = ["vllm-serve/metal"]
 guided-decoding = ["vllm-serve/guided-decoding"]
 multimodal = ["vllm-serve/multimodal"]
-chat-template = ["vllm-serve/chat-template"]
 tls = ["vllm-serve/tls"]
 metrics = ["vllm-serve/metrics"]
 multiproc = ["vllm-serve/multiproc"]

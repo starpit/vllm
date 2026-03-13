@@ -24,7 +24,6 @@ use vllm_common::{EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingPar
 use vllm_engine::core_client::EngineCoreClient;
 use vllm_engine::executor::{Executor, ModelRunnerOutput};
 
-#[cfg(feature = "chat-template")]
 use crate::chat_template::ChatTemplate;
 use crate::detokenizer::IncrementalDetokenizer;
 use crate::error::{ServeError, ServeResult};
@@ -227,7 +226,6 @@ pub struct AsyncEngine {
     /// Optional tokenizer for encoding prompts and decoding outputs.
     tokenizer: Option<Arc<Tokenizer>>,
     /// Optional chat template for formatting chat messages.
-    #[cfg(feature = "chat-template")]
     chat_template: Option<Arc<ChatTemplate>>,
     /// Optional tool call parser for extracting structured tool calls from output.
     tool_parser: Option<Arc<dyn ToolCallParser>>,
@@ -279,7 +277,6 @@ impl AsyncEngine {
             max_model_len,
             notify: Arc::new(Notify::new()),
             tokenizer: None,
-            #[cfg(feature = "chat-template")]
             chat_template: None,
             tool_parser: None,
             reasoning_parser: None,
@@ -369,7 +366,6 @@ impl AsyncEngine {
     }
 
     /// Create a new `AsyncEngine` with a tokenizer and chat template.
-    #[cfg(feature = "chat-template")]
     pub fn with_tokenizer_and_template(
         client: Box<dyn EngineCoreClient + Send>,
         model_name: String,
@@ -441,7 +437,6 @@ impl AsyncEngine {
     }
 
     /// Get a reference to the chat template, if available.
-    #[cfg(feature = "chat-template")]
     pub fn chat_template(&self) -> Option<&Arc<ChatTemplate>> {
         self.chat_template.as_ref()
     }
@@ -2720,7 +2715,6 @@ impl AsyncEngine {
         sampling_params: &SamplingParams,
     ) -> ServeResult<EngineCoreRequest> {
         // Build text from chat messages — using chat template if available.
-        #[cfg(feature = "chat-template")]
         let text = if let Some(template) = &self.chat_template {
             // Convert messages to JSON values so templates can access all fields
             // (tool_calls, tool_call_id, name, etc.).
@@ -2776,23 +2770,6 @@ impl AsyncEngine {
             }
             text
         };
-        #[cfg(not(feature = "chat-template"))]
-        let text = {
-            // Fallback: concatenate messages with newlines.
-            let mut text = String::new();
-            for msg in &request.messages {
-                if let Some(content) = &msg.content
-                    && let Some(s) = content.as_str()
-                {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(s);
-                }
-            }
-            text
-        };
-
         // Tokenize the text, or fall back to byte-value IDs.
         #[allow(unused_mut)]
         let mut token_ids = if let Some(tok) = &self.tokenizer {

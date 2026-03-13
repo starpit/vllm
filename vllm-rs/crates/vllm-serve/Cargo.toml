@@ -14,7 +14,6 @@ metal = ["vllm-mlx"]
 wgpu = ["vllm-wgpu"]
 guided-decoding = ["vllm-executor/guided-decoding", "vllm-mlx?/guided-decoding"]
 multimodal = ["vllm-model/multimodal"]
-chat-template = ["minijinja", "minijinja-contrib", "chrono"]
 tls = ["axum-server", "rustls", "rustls-pemfile"]
 metrics = ["prometheus"]
 top = ["metrics"]
@@ -50,9 +49,9 @@ tokenizers = { workspace = true }
 rayon = { workspace = true }
 bincode = { workspace = true }
 libc = { workspace = true }
-minijinja = { workspace = true, optional = true }
-minijinja-contrib = { workspace = true, optional = true }
-chrono = { workspace = true, optional = true }
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
+chrono = { workspace = true }
 prometheus = { workspace = true, optional = true }
 indicatif = { workspace = true }
 

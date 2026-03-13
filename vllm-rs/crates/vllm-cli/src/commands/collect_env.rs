@@ -256,9 +256,8 @@ fn get_build_features() -> String {
     if cfg!(feature = "guided-decoding") {
         features.push("guided-decoding");
     }
-    if cfg!(feature = "chat-template") {
-        features.push("chat-template");
-    }
+    // chat-template is always enabled (built into vllm-serve).
+    features.push("chat-template");
     if cfg!(feature = "metrics") {
         features.push("metrics");
     }

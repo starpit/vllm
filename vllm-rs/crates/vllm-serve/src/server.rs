@@ -592,7 +592,6 @@ async fn tokenize(
     let text = if let Some(prompt) = &request.prompt {
         prompt.clone()
     } else if let Some(messages) = &request.messages {
-        #[cfg(feature = "chat-template")]
         {
             let template = match state.engine.chat_template() {
                 Some(t) => t,
@@ -620,16 +619,6 @@ async fn tokenize(
                     .into_response();
                 }
             }
-        }
-        #[cfg(not(feature = "chat-template"))]
-        {
-            let _ = messages;
-            return Json(protocol::ErrorResponse::new(
-                "Chat-style tokenize requires the chat-template feature",
-                "BadRequestError",
-                400,
-            ))
-            .into_response();
         }
     } else {
         return Json(protocol::ErrorResponse::new(
@@ -1344,6 +1333,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[cfg(feature = "metrics")]
     fn make_test_state_with_metrics() -> Arc<AppState> {
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
@@ -1381,6 +1371,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn test_metrics_endpoint_enabled() {
         let state = make_test_state_with_metrics();
@@ -1429,6 +1420,7 @@ mod tests {
 
     // -- ORCA header attachment tests --
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn test_attach_orca_header_with_text_format() {
         use axum::http::{HeaderMap, HeaderValue};
@@ -1454,6 +1446,7 @@ mod tests {
         assert!(val.contains("num_requests_waiting="));
     }
 
+    #[cfg(feature = "metrics")]
     #[test]
     fn test_attach_orca_header_with_json_format() {
         use axum::http::{HeaderMap, HeaderValue};

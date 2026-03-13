@@ -20,7 +20,6 @@ use vllm_executor::uniproc::UniProcExecutor;
 use vllm_executor::worker::Worker;
 use vllm_model::weight::HfModelConfig;
 
-#[cfg(feature = "chat-template")]
 use crate::chat_template::ChatTemplate;
 use crate::engine::AsyncEngine;
 use crate::tokenizer::Tokenizer;
@@ -567,7 +566,6 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
     let max_model_len = core.max_model_len;
 
     let engine = if let Some(tokenizer) = core.tokenizer {
-        #[cfg(feature = "chat-template")]
         {
             let chat_template = core
                 .model_dir
@@ -586,11 +584,6 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
                 info!("No chat template found, using plain concatenation");
                 AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
             }
-        }
-        #[cfg(not(feature = "chat-template"))]
-        {
-            info!("No chat template found, using plain concatenation");
-            AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
         }
     } else {
         AsyncEngine::new(client, model_name.clone(), max_model_len)
@@ -948,26 +941,16 @@ fn initialize_stack_tp(
 
         let mut engine = if let Some(tok) = tokenizer {
             let tokenizer = Arc::new(tok);
-            #[cfg(feature = "chat-template")]
-            {
-                if let Some(ref dir) = model_dir {
-                    if let Some(ct) = try_load_chat_template(dir) {
-                        info!("Chat template loaded from tokenizer_config.json");
-                        AsyncEngine::with_tokenizer_and_template(
-                            client,
-                            model_name.clone(),
-                            max_model_len,
-                            tokenizer,
-                            Arc::new(ct),
-                        )
-                    } else {
-                        AsyncEngine::with_tokenizer(
-                            client,
-                            model_name.clone(),
-                            max_model_len,
-                            tokenizer,
-                        )
-                    }
+            if let Some(ref dir) = model_dir {
+                if let Some(ct) = try_load_chat_template(dir) {
+                    info!("Chat template loaded from tokenizer_config.json");
+                    AsyncEngine::with_tokenizer_and_template(
+                        client,
+                        model_name.clone(),
+                        max_model_len,
+                        tokenizer,
+                        Arc::new(ct),
+                    )
                 } else {
                     AsyncEngine::with_tokenizer(
                         client,
@@ -976,9 +959,7 @@ fn initialize_stack_tp(
                         tokenizer,
                     )
                 }
-            }
-            #[cfg(not(feature = "chat-template"))]
-            {
+            } else {
                 AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
             }
         } else {
@@ -1704,26 +1685,16 @@ fn initialize_stack_external(
 
         let mut engine = if let Some(tok) = tokenizer {
             let tokenizer = Arc::new(tok);
-            #[cfg(feature = "chat-template")]
-            {
-                if let Some(ref dir) = model_dir {
-                    if let Some(ct) = try_load_chat_template(dir) {
-                        info!("Chat template loaded from tokenizer_config.json");
-                        AsyncEngine::with_tokenizer_and_template(
-                            client,
-                            model_name.clone(),
-                            max_model_len,
-                            tokenizer,
-                            Arc::new(ct),
-                        )
-                    } else {
-                        AsyncEngine::with_tokenizer(
-                            client,
-                            model_name.clone(),
-                            max_model_len,
-                            tokenizer,
-                        )
-                    }
+            if let Some(ref dir) = model_dir {
+                if let Some(ct) = try_load_chat_template(dir) {
+                    info!("Chat template loaded from tokenizer_config.json");
+                    AsyncEngine::with_tokenizer_and_template(
+                        client,
+                        model_name.clone(),
+                        max_model_len,
+                        tokenizer,
+                        Arc::new(ct),
+                    )
                 } else {
                     AsyncEngine::with_tokenizer(
                         client,
@@ -1732,9 +1703,7 @@ fn initialize_stack_external(
                         tokenizer,
                     )
                 }
-            }
-            #[cfg(not(feature = "chat-template"))]
-            {
+            } else {
                 AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
             }
         } else {
@@ -1774,7 +1743,6 @@ fn try_load_tokenizer(model_dir: &Path) -> Result<Tokenizer> {
 }
 
 /// Try to load a chat template from `tokenizer_config.json` in the model dir.
-#[cfg(feature = "chat-template")]
 fn try_load_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
     let config_path = model_dir.join("tokenizer_config.json");
     match ChatTemplate::from_tokenizer_config(&config_path) {

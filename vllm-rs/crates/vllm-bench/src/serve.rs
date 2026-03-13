@@ -327,10 +327,13 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
     );
 
     // Load tokenizer from HuggingFace hub (matches Python's get_tokenizer).
-    eprintln!("Loading tokenizer for {model}...");
+    // --tokenizer overrides the model name for tokenizer resolution, useful
+    // when the model name isn't a valid HF repo (e.g. Ollama "llama3.2:3b").
+    let tokenizer_id = args.tokenizer.as_deref().unwrap_or(&model);
+    eprintln!("Loading tokenizer for {tokenizer_id}...");
     let tokenizer = {
         let api = hf_hub::api::sync::Api::new()?;
-        let repo = api.model(model.clone());
+        let repo = api.model(tokenizer_id.to_string());
         let tokenizer_path = repo.get("tokenizer.json")?;
         tokenizers::Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?

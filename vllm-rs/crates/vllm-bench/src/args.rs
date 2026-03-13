@@ -290,6 +290,13 @@ pub struct BenchServeArgs {
     #[arg(long)]
     pub model: Option<String>,
 
+    /// Tokenizer to use for prompt generation / length filtering.
+    /// Defaults to the model name. Useful when the model name is not a
+    /// HuggingFace repo (e.g. Ollama-style names like "llama3.2:3b") —
+    /// set this to the corresponding HF repo ID.
+    #[arg(long)]
+    pub tokenizer: Option<String>,
+
     /// Server base URL.
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     pub base_url: String,

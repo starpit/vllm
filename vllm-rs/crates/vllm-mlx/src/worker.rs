@@ -437,45 +437,6 @@ impl MlxWorker {
 
         Ok(model_dir)
     }
-
-    /// Greedy decode: take argmax of logits (CPU side, after eval).
-    fn greedy_sample(logits: &Array) -> ExecutorResult<Vec<u32>> {
-        let indices = mlx_rs::ops::indexing::argmax_axis(logits, -1, None)
-            .map_err(|e| ExecutorError::WorkerExecution(format!("argmax error: {e}")))?;
-        indices
-            .eval()
-            .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
-
-        // Extract as u32 values.
-        let flat = indices.as_slice::<u32>();
-        Ok(flat.to_vec())
-    }
-
-    /// Sample with temperature from logits.
-    fn sample_with_temperature(logits: &Array, temperature: f32) -> ExecutorResult<Vec<u32>> {
-        if temperature < 1e-5 {
-            return Self::greedy_sample(logits);
-        }
-
-        // Scale logits by temperature.
-        let logits_f32 = logits
-            .as_dtype(Dtype::Float32)
-            .map_err(|e| ExecutorError::WorkerExecution(format!("dtype cast error: {e}")))?;
-        let scaled = logits_f32
-            .divide(Array::from_f32(temperature))
-            .map_err(|e| ExecutorError::WorkerExecution(format!("scale error: {e}")))?;
-
-        // categorical() expects logits and applies softmax internally.
-        let sampled = mlx_rs::random::categorical(&scaled, None, None, None)
-            .map_err(|e| ExecutorError::WorkerExecution(format!("categorical error: {e}")))?;
-
-        sampled
-            .eval()
-            .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
-
-        let flat = sampled.as_slice::<u32>();
-        Ok(flat.to_vec())
-    }
 }
 
 impl Worker for MlxWorker {
@@ -1080,6 +1041,106 @@ impl Worker for MlxWorker {
             }
         }
 
+        // --- Fast path: single greedy decode request (the ITL-critical path) ---
+        // When there's exactly one batchable request doing a single-token greedy decode
+        // with no special needs, use forward_greedy() to fuse forward + argmax into one
+        // lazy graph. MLX can then avoid materializing the full vocab-size logits tensor.
+        if batch_indices.len() == 1 && fallback_indices.is_empty() {
+            let ri = &req_inputs[batch_indices[0]];
+            let is_single_token = ri.token_ids.len() == 1;
+            let no_spec = ri.spec_token_ids.is_empty();
+            let no_prompt_logprobs = !ri.is_prefill
+                || self
+                    .sampling_params_map
+                    .get(&ri.req_id)
+                    .and_then(|p| p.prompt_logprobs)
+                    .is_none();
+            let params = self.sampling_params_map.get(&ri.req_id);
+            let is_greedy = params
+                .map(|p| (p.temperature as f32) < 1e-5)
+                .unwrap_or(true);
+
+            #[cfg(feature = "guided-decoding")]
+            let has_grammar = self
+                .grammar_states
+                .get_mut(&ri.req_id)
+                .is_some_and(|g| g.allowed_tokens().is_some());
+            #[cfg(not(feature = "guided-decoding"))]
+            let has_grammar = false;
+
+            let no_cpu_needs = !has_grammar
+                && params
+                    .map(|p| {
+                        p.repetition_penalty == 1.0
+                            && p.frequency_penalty == 0.0
+                            && p.presence_penalty == 0.0
+                            && p.min_p <= 0.0
+                            && p.logit_bias.is_none()
+                            && p.logprobs.is_none()
+                            && p.top_k <= 0
+                            && p.top_p >= 1.0
+                    })
+                    .unwrap_or(true);
+
+            if is_single_token && no_spec && no_prompt_logprobs && is_greedy && no_cpu_needs {
+                let req_id = &ri.req_id;
+
+                let input_ids = Array::from_iter(
+                    ri.token_ids.iter().map(|&t| t as i32),
+                    &[ri.token_ids.len() as i32],
+                );
+                let positions =
+                    Array::from_iter(ri.positions.iter().copied(), &[ri.positions.len() as i32]);
+                let rope_offset = ri.positions.iter().copied().min();
+
+                let kv_cache = self
+                    .kv_caches
+                    .entry(req_id.clone())
+                    .or_insert_with(|| cache::empty_kv_cache(num_layers));
+
+                // forward_greedy: forward + argmax fused into single lazy graph.
+                let token_ids_arr = model
+                    .forward_greedy(&input_ids, &positions, kv_cache, rope_offset)
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("forward_greedy failed: {e}"))
+                    })?;
+
+                // Single eval: entire forward + argmax in one Metal command buffer.
+                token_ids_arr
+                    .eval()
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
+
+                let flat = token_ids_arr.as_slice::<u32>();
+                token_map.insert(req_id.clone(), flat.to_vec());
+
+                // Update token buffer.
+                if let Some(buf) = self.token_buffers.get_mut(req_id) {
+                    buf.extend_from_slice(flat);
+                }
+
+                // Advance grammar state (none in this fast path, but be consistent).
+                #[cfg(feature = "guided-decoding")]
+                if let Some(guide) = self.grammar_states.get_mut(req_id)
+                    && let Some(&token_id) = flat.first()
+                {
+                    guide.advance(token_id);
+                }
+
+                let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+                self.step_count += 1;
+                if ri.is_prefill {
+                    self.prefill_count += 1;
+                    self.total_prefill_ms += step_ms;
+                } else {
+                    self.decode_count += 1;
+                    self.total_decode_ms += step_ms;
+                }
+
+                let output = ModelRunnerOutput::from_token_map(token_map);
+                return Ok(output);
+            }
+        }
+
         // Pre-allocate output slots.
         for _ in 0..req_inputs.len() {
             lazy_outputs.push(LazyReqOutput {
@@ -1112,13 +1173,14 @@ impl Worker for MlxWorker {
             let input_ids_arr = Array::from_iter(flat_token_ids, &[total]);
             let positions_arr = Array::from_iter(flat_positions, &[total]);
 
-            // Extract KV caches from HashMap into ordered Vec.
+            // Extract KV caches via mem::take (avoids HashMap remove+insert rehashing).
             let mut batch_kv_caches: Vec<cache::MlxKvCache> = batch_indices
                 .iter()
                 .map(|&idx| {
                     let req_id = &req_inputs[idx].req_id;
                     self.kv_caches
-                        .remove(req_id)
+                        .get_mut(req_id)
+                        .map(std::mem::take)
                         .unwrap_or_else(|| cache::empty_kv_cache(num_layers))
                 })
                 .collect();
@@ -1135,10 +1197,14 @@ impl Worker for MlxWorker {
                     ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
                 })?;
 
-            // Put KV caches back.
+            // Put KV caches back (direct assignment avoids HashMap rehashing for existing keys).
             for &idx in &batch_indices {
-                let req_id = req_inputs[idx].req_id.clone();
-                self.kv_caches.insert(req_id, batch_kv_caches.remove(0));
+                let kv = batch_kv_caches.remove(0);
+                if let Some(slot) = self.kv_caches.get_mut(&req_inputs[idx].req_id) {
+                    *slot = kv;
+                } else {
+                    self.kv_caches.insert(req_inputs[idx].req_id.clone(), kv);
+                }
             }
 
             // Split output logits per-request.
@@ -1285,53 +1351,14 @@ impl Worker for MlxWorker {
             };
         }
 
-        // --- Phase B: Single batch eval materializes all graphs at once ---
-        {
-            let mut arrays_to_eval: Vec<&Array> = Vec::new();
-            for out in &lazy_outputs {
-                arrays_to_eval.push(&out.last_logits);
-                if let Some(ref f32_logits) = out.full_logits_f32 {
-                    arrays_to_eval.push(f32_logits);
-                }
-            }
-            mlx_rs::transforms::eval(arrays_to_eval)
-                .map_err(|e| ExecutorError::WorkerExecution(format!("batch eval error: {e}")))?;
-        }
-
-        // --- Phase C: Sampling on now-materialized arrays ---
-        // First pass: compute prompt logprobs and classify requests for batched
-        // vs CPU-fallback sampling.
-
-        // Indices of requests that can be GPU-sampled (greedy or temperature-only).
+        // --- Phase B: Classify requests BEFORE eval ---
+        // Classification only checks sampling_params, grammar_states, and spec_token_ids —
+        // none of which depend on logit values. Safe to run on lazy (unevaluated) arrays.
         let mut gpu_greedy: Vec<usize> = Vec::new();
-        // (req_idx, temperature) for GPU temp sampling, grouped later.
         let mut gpu_temp: Vec<(usize, f32)> = Vec::new();
-        // Indices that need per-request CPU sampling or speculative verification.
         let mut cpu_fallback: Vec<usize> = Vec::new();
 
         for (req_idx, req_input) in req_inputs.iter().enumerate() {
-            let lazy_out = &lazy_outputs[req_idx];
-
-            // Compute prompt logprobs if requested (arrays are already materialized).
-            if let Some((top_n, ref token_ids)) = lazy_out.prompt_logprobs_info {
-                let full_logits_f32 = lazy_out.full_logits_f32.as_ref().unwrap();
-                let num_positions = token_ids.len() - 1;
-                let vocab_size = full_logits_f32.dim(-1) as usize;
-                let flat = full_logits_f32.as_slice::<f32>();
-                let mut plps = Vec::with_capacity(num_positions);
-                for i in 0..num_positions {
-                    let row = &flat[i * vocab_size..(i + 1) * vocab_size];
-                    let actual_token = token_ids[i + 1];
-                    plps.push(vllm_models::sampler::compute_logprobs(
-                        row,
-                        actual_token,
-                        top_n,
-                    ));
-                }
-                prompt_logprobs_map.insert(req_input.req_id.clone(), plps);
-            }
-
-            // Classify: speculative → CPU, grammar/penalties → CPU, else GPU.
             if !req_input.spec_token_ids.is_empty() {
                 cpu_fallback.push(req_idx);
                 continue;
@@ -1371,32 +1398,38 @@ impl Worker for MlxWorker {
             }
         }
 
-        // --- Batched GPU greedy sampling: single argmax over stacked logits ---
-        if gpu_greedy.len() > 1 {
+        // --- Phase C: Build lazy sampling ops (extend compute graph, no Metal work yet) ---
+        // For gpu_greedy: lazy argmax on lazy logits.
+        // For gpu_temp: lazy divide + categorical on lazy logits.
+        // These extend the forward graph so everything fuses into one Metal command buffer.
+
+        let gpu_greedy_result: Option<Array> = if gpu_greedy.len() > 1 {
             let logit_refs: Vec<Array> = gpu_greedy
                 .iter()
                 .map(|&i| lazy_outputs[i].last_logits.clone())
                 .collect();
             let stacked = mlx_rs::ops::stack_axis(&logit_refs, 0)
                 .map_err(|e| ExecutorError::WorkerExecution(format!("stack error: {e}")))?;
-            let indices = mlx_rs::ops::indexing::argmax_axis(&stacked, -1, None)
-                .map_err(|e| ExecutorError::WorkerExecution(format!("argmax error: {e}")))?;
-            indices
-                .eval()
-                .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
-            let flat = indices.as_slice::<u32>();
-            for (batch_pos, &req_idx) in gpu_greedy.iter().enumerate() {
-                token_map.insert(req_inputs[req_idx].req_id.clone(), vec![flat[batch_pos]]);
-            }
+            Some(
+                mlx_rs::ops::indexing::argmax_axis(&stacked, -1, None)
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("argmax error: {e}")))?,
+            )
         } else if gpu_greedy.len() == 1 {
-            let req_idx = gpu_greedy[0];
-            let sampled = Self::greedy_sample(&lazy_outputs[req_idx].last_logits)?;
-            token_map.insert(req_inputs[req_idx].req_id.clone(), sampled);
-        }
+            Some(
+                mlx_rs::ops::indexing::argmax_axis(
+                    &lazy_outputs[gpu_greedy[0]].last_logits,
+                    -1,
+                    None,
+                )
+                .map_err(|e| ExecutorError::WorkerExecution(format!("argmax error: {e}")))?,
+            )
+        } else {
+            None
+        };
 
-        // --- Batched GPU temperature sampling: group by temp, single categorical per group ---
+        // Build lazy temp sampling ops, grouped by temperature.
+        let mut gpu_temp_results: Vec<(Vec<usize>, Array)> = Vec::new();
         if !gpu_temp.is_empty() {
-            // Group by temperature (quantize to 0.01 to allow batching of near-equal temps).
             let mut temp_groups: HashMap<i32, Vec<usize>> = HashMap::new();
             for &(req_idx, temp) in &gpu_temp {
                 let key = (temp * 100.0).round() as i32;
@@ -1405,49 +1438,97 @@ impl Worker for MlxWorker {
 
             for (temp_key, group) in &temp_groups {
                 let temp = *temp_key as f32 / 100.0;
-                if group.len() > 1 {
-                    let logit_refs: Vec<Array> = group
-                        .iter()
-                        .map(|&i| lazy_outputs[i].last_logits.clone())
-                        .collect();
-                    let stacked = mlx_rs::ops::stack_axis(&logit_refs, 0)
-                        .map_err(|e| ExecutorError::WorkerExecution(format!("stack error: {e}")))?;
-                    let scaled = if temp < 1e-5 {
-                        stacked
-                    } else {
-                        stacked
-                            .as_dtype(Dtype::Float32)
-                            .and_then(|s| s.divide(Array::from_f32(temp)))
-                            .map_err(|e| {
-                                ExecutorError::WorkerExecution(format!("scale error: {e}"))
-                            })?
-                    };
-                    let sampled = if temp < 1e-5 {
-                        mlx_rs::ops::indexing::argmax_axis(&scaled, -1, None).map_err(|e| {
-                            ExecutorError::WorkerExecution(format!("argmax error: {e}"))
-                        })?
-                    } else {
-                        mlx_rs::random::categorical(&scaled, None, None, None).map_err(|e| {
-                            ExecutorError::WorkerExecution(format!("categorical error: {e}"))
-                        })?
-                    };
-                    sampled
-                        .eval()
-                        .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
-                    let flat = sampled.as_slice::<u32>();
-                    for (batch_pos, &req_idx) in group.iter().enumerate() {
-                        token_map.insert(req_inputs[req_idx].req_id.clone(), vec![flat[batch_pos]]);
-                    }
+                let logit_refs: Vec<Array> = group
+                    .iter()
+                    .map(|&i| lazy_outputs[i].last_logits.clone())
+                    .collect();
+                let logits = if logit_refs.len() > 1 {
+                    mlx_rs::ops::stack_axis(&logit_refs, 0)
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("stack error: {e}")))?
                 } else {
-                    let req_idx = group[0];
-                    let sampled =
-                        Self::sample_with_temperature(&lazy_outputs[req_idx].last_logits, temp)?;
-                    token_map.insert(req_inputs[req_idx].req_id.clone(), sampled);
-                }
+                    logit_refs.into_iter().next().unwrap()
+                };
+                let sampled = if temp < 1e-5 {
+                    mlx_rs::ops::indexing::argmax_axis(&logits, -1, None)
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("argmax error: {e}")))?
+                } else {
+                    let scaled = logits
+                        .as_dtype(Dtype::Float32)
+                        .and_then(|s| s.divide(Array::from_f32(temp)))
+                        .map_err(|e| ExecutorError::WorkerExecution(format!("scale error: {e}")))?;
+                    mlx_rs::random::categorical(&scaled, None, None, None).map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("categorical error: {e}"))
+                    })?
+                };
+                gpu_temp_results.push((group.clone(), sampled));
             }
         }
 
-        // --- CPU fallback: per-request sampling for speculative/grammar/penalties ---
+        // --- Phase D: Single eval materializes forward + sampling in one Metal command buffer ---
+        {
+            let mut arrays_to_eval: Vec<&Array> = Vec::new();
+            // Include forward logits needed by cpu_fallback (as_slice needs eval'd data).
+            for &idx in &cpu_fallback {
+                arrays_to_eval.push(&lazy_outputs[idx].last_logits);
+            }
+            // Include full logits for prompt_logprobs / speculative decode.
+            for out in &lazy_outputs {
+                if let Some(ref f32_logits) = out.full_logits_f32 {
+                    arrays_to_eval.push(f32_logits);
+                }
+            }
+            // Include lazy GPU sampling results.
+            if let Some(ref arr) = gpu_greedy_result {
+                arrays_to_eval.push(arr);
+            }
+            for (_, arr) in &gpu_temp_results {
+                arrays_to_eval.push(arr);
+            }
+            mlx_rs::transforms::eval(arrays_to_eval)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("batch eval error: {e}")))?;
+        }
+
+        // --- Phase E: Read materialized results ---
+
+        // Prompt logprobs (needs materialized full_logits_f32).
+        for (req_idx, req_input) in req_inputs.iter().enumerate() {
+            let lazy_out = &lazy_outputs[req_idx];
+            if let Some((top_n, ref token_ids)) = lazy_out.prompt_logprobs_info {
+                let full_logits_f32 = lazy_out.full_logits_f32.as_ref().unwrap();
+                let num_positions = token_ids.len() - 1;
+                let vocab_size = full_logits_f32.dim(-1) as usize;
+                let flat = full_logits_f32.as_slice::<f32>();
+                let mut plps = Vec::with_capacity(num_positions);
+                for i in 0..num_positions {
+                    let row = &flat[i * vocab_size..(i + 1) * vocab_size];
+                    let actual_token = token_ids[i + 1];
+                    plps.push(vllm_models::sampler::compute_logprobs(
+                        row,
+                        actual_token,
+                        top_n,
+                    ));
+                }
+                prompt_logprobs_map.insert(req_input.req_id.clone(), plps);
+            }
+        }
+
+        // GPU greedy: read from materialized argmax result.
+        if let Some(ref greedy_result) = gpu_greedy_result {
+            let flat = greedy_result.as_slice::<u32>();
+            for (batch_pos, &req_idx) in gpu_greedy.iter().enumerate() {
+                token_map.insert(req_inputs[req_idx].req_id.clone(), vec![flat[batch_pos]]);
+            }
+        }
+
+        // GPU temperature: read from materialized categorical results.
+        for (group, sampled) in &gpu_temp_results {
+            let flat = sampled.as_slice::<u32>();
+            for (batch_pos, &req_idx) in group.iter().enumerate() {
+                token_map.insert(req_inputs[req_idx].req_id.clone(), vec![flat[batch_pos]]);
+            }
+        }
+
+        // CPU fallback: per-request sampling on materialized logits.
         for &req_idx in &cpu_fallback {
             let req_input = &req_inputs[req_idx];
             let lazy_out = &lazy_outputs[req_idx];
@@ -1532,13 +1613,7 @@ impl Worker for MlxWorker {
                 #[cfg(not(feature = "guided-decoding"))]
                 let grammar_allowed: Option<Vec<u32>> = None;
 
-                let logits_f32 = lazy_out.last_logits.as_dtype(Dtype::Float32).map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("dtype cast error: {e}"))
-                })?;
-                logits_f32
-                    .eval()
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
-                let flat = logits_f32.as_slice::<f32>();
+                let flat = lazy_out.last_logits.as_slice::<f32>();
 
                 let p = self.sampling_params_map.get(&req_input.req_id).unwrap();
                 let prev_tokens = self

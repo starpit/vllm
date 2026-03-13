@@ -103,6 +103,25 @@ pub trait MlxModel: Send {
     /// Inject previously-saved recurrent state into all GDN layers.
     fn inject_recurrent_state(&self, _state: &[Option<(Array, Array)>]) {}
 
+    /// Run forward pass and return argmax token IDs (fused greedy decode).
+    ///
+    /// For greedy decode, the full `[num_tokens, vocab_size]` logits tensor is
+    /// never materialized — MLX fuses the lm_head matmul + argmax into a single
+    /// kernel, avoiding the huge vocab-sized intermediate.
+    ///
+    /// Default implementation: `forward()` → `argmax(axis=-1)`. Models can
+    /// override for deeper fusion.
+    fn forward_greedy(
+        &mut self,
+        input_ids: &Array,
+        positions: &Array,
+        kv_cache: &mut MlxKvCache,
+        rope_offset: Option<i32>,
+    ) -> mlx_rs::error::Result<Array> {
+        let logits = self.forward(input_ids, positions, kv_cache, rope_offset)?;
+        mlx_rs::ops::indexing::argmax_axis(&logits, -1, None)
+    }
+
     /// Run a batched forward pass over concatenated tokens from multiple requests.
     ///
     /// Default implementation falls back to per-request `forward()` calls.

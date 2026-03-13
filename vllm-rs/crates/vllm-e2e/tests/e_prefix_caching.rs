@@ -7,9 +7,8 @@
 //! output — exercising the full path from HTTP → scheduler (with cached
 //! prefix lookup) → worker (token slicing) → model → response.
 //!
-//! CPU tests force `device=cpu` + `dtype=f32` to use the CandleWorker path
-//! (paged KV cache). MLX tests use `device=metal` with the worker-level
-//! prefix cache pool.
+//! MLX tests use `device=metal` with the worker-level prefix cache pool.
+//! CUDA tests use `device=cuda` with paged KV cache.
 //!
 //! Run with: `cargo test -p vllm-e2e --features e2e --test e_prefix_caching -- --ignored`
 

@@ -11,8 +11,8 @@
 //!
 //! ```text
 //!   ThreadPoolExecutor
-//!     ├── OS Thread (rank 0) ──► CandleWorker + NcclProcessGroup
-//!     └── OS Thread (rank 1) ──► CandleWorker + NcclProcessGroup
+//!     ├── OS Thread (rank 0) ──► Worker + NcclProcessGroup
+//!     └── OS Thread (rank 1) ──► Worker + NcclProcessGroup
 //! ```
 //!
 //! The executor broadcasts scheduler outputs to all workers via channels,

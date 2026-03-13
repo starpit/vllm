@@ -1468,7 +1468,7 @@ pub struct CudaWorker {
     /// Initialized after graph capture in `compile_or_warm_up_model`.
     host_staging: Option<HostStaging>,
 
-    // Per-request state (mirrors CandleWorker).
+    // Per-request state.
     token_buffers: HashMap<String, Vec<u32>>,
     sampling_params_map: HashMap<String, SamplingParams>,
     input_batch: InputBatch,

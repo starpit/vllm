@@ -629,6 +629,7 @@ td.notes-col { font-size: 0.8rem; color: var(--text-dim); max-width: 350px; }
       </div>
       <div id="perf-heatmaps"></div>
       <div id="serve-heatmaps"></div>
+      <div id="startup-heatmaps"></div>
     </div>
   </div>
 
@@ -981,20 +982,21 @@ function buildAbsGrid(rows, field) {
 function svgHeatmap(data, opts) {
   const { title, subtitle, colorFn, fmt, colorbarStops, colorbarLabels } = opts;
   const nR = data.input_lens.length, nC = data.output_lens.length;
-  // Square grid: pick cell size so total grid is square
-  const gridSide = 320;
-  const cellW = gridSide / nC, cellH = gridSide / nR;
-  const cbW = 14, cbGap = 12; // colorbar width and gap
+  const gridW = opts.gridW || 320;
+  const gridH = opts.gridH || 320;
+  const cellW = gridW / nC, cellH = gridH / nR;
+  const xLabelEvery = opts.xLabelEvery || 1;
+  const cbW = 14, cbGap = 12;
   const pad = { l: 72, r: cbGap + cbW + 40, t: 44, b: 52 };
-  const w = pad.l + gridSide + pad.r;
-  const h = pad.t + gridSide + pad.b;
+  const w = pad.l + gridW + pad.r;
+  const h = pad.t + gridH + pad.b;
 
   let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" style="font-family:'JetBrains Mono','Inter',monospace">`;
 
   // Title
-  svg += `<text x="${pad.l + gridSide/2}" y="18" text-anchor="middle" fill="#f0f0f0" font-size="13" font-weight="600" font-family="Inter,sans-serif">${title}</text>`;
+  svg += `<text x="${pad.l + gridW/2}" y="18" text-anchor="middle" fill="#f0f0f0" font-size="13" font-weight="600" font-family="Inter,sans-serif">${title}</text>`;
   if (subtitle) {
-    svg += `<text x="${pad.l + gridSide/2}" y="33" text-anchor="middle" fill="#707070" font-size="14" font-family="Inter,sans-serif">${subtitle}</text>`;
+    svg += `<text x="${pad.l + gridW/2}" y="33" text-anchor="middle" fill="#707070" font-size="14" font-family="Inter,sans-serif">${subtitle}</text>`;
   }
 
   // Cells — no borders
@@ -1008,7 +1010,9 @@ function svgHeatmap(data, opts) {
         const bg = colorFn(v);
         const fg = textColor(bg);
         svg += `<rect x="${x}" y="${y}" width="${cellW}" height="${cellH}" fill="${bg}"/>`;
-        svg += `<text x="${x+cellW/2}" y="${y+cellH/2+4}" text-anchor="middle" fill="${fg}" font-size="11" font-weight="700">${fmt(v)}</text>`;
+        if (cellW >= 10 && cellH >= 12) {
+          svg += `<text x="${x+cellW/2}" y="${y+cellH/2+4}" text-anchor="middle" fill="${fg}" font-size="11" font-weight="700">${fmt(v)}</text>`;
+        }
       }
     }
   }
@@ -1019,17 +1023,18 @@ function svgHeatmap(data, opts) {
   }
   // X-axis labels (output_lens)
   for (let c = 0; c < nC; c++) {
-    svg += `<text x="${pad.l + c*cellW + cellW/2}" y="${pad.t + gridSide + 16}" text-anchor="middle" fill="#b0b0b0" font-size="11">${data.output_lens[c]}</text>`;
+    if (c % xLabelEvery !== 0 && c !== nC - 1) continue;
+    svg += `<text x="${pad.l + c*cellW + cellW/2}" y="${pad.t + gridH + 16}" text-anchor="middle" fill="#b0b0b0" font-size="11">${data.output_lens[c]}</text>`;
   }
 
   // Axis titles
-  svg += `<text x="${pad.l + gridSide/2}" y="${h-4}" text-anchor="middle" fill="#707070" font-size="14" font-family="Inter,sans-serif">Output Length</text>`;
-  svg += `<text x="12" y="${pad.t + gridSide/2}" text-anchor="middle" fill="#707070" font-size="14" font-family="Inter,sans-serif" transform="rotate(-90,12,${pad.t + gridSide/2})">Input Length</text>`;
+  svg += `<text x="${pad.l + gridW/2}" y="${h-4}" text-anchor="middle" fill="#707070" font-size="14" font-family="Inter,sans-serif">${opts.xAxisLabel || 'Output Length'}</text>`;
+  svg += `<text x="12" y="${pad.t + gridH/2}" text-anchor="middle" fill="#707070" font-size="14" font-family="Inter,sans-serif" transform="rotate(-90,12,${pad.t + gridH/2})">${opts.yAxisLabel || 'Input Length'}</text>`;
 
   // Colorbar
   if (colorbarStops && colorbarLabels) {
-    const cbX = pad.l + gridSide + cbGap;
-    const cbH = gridSide;
+    const cbX = pad.l + gridW + cbGap;
+    const cbH = gridH;
     const gradId = 'cg' + Math.random().toString(36).slice(2,8);
     svg += `<defs><linearGradient id="${gradId}" x1="0" y1="0" x2="0" y2="1">`;
     for (let i = 0; i < colorbarStops.length; i++) {
@@ -1207,6 +1212,114 @@ document.getElementById('bs-selector').addEventListener('click', function(e) {
 
 renderPerfHeatmaps();
 renderServeHeatmaps();
+
+function logTicks(xmin, xmax) {
+  const candidates = [0.5, 1, 2, 3, 5, 10, 15, 20, 25, 30, 40, 50, 60, 70];
+  return candidates.filter(v => v >= xmin * 0.85 && v <= xmax * 1.15);
+}
+
+function svgCdf(pyVals, rsVals, title) {
+  const W = 420, H = 280;
+  const pad = { l: 44, r: 16, t: 36, b: 44 };
+  const plotW = W - pad.l - pad.r, plotH = H - pad.t - pad.b;
+
+  function computeCdf(vals) {
+    return [...vals].sort((a, b) => a - b).map((v, i, a) => ({ x: v, y: (i + 1) / a.length }));
+  }
+
+  const pyCdf = computeCdf(pyVals);
+  const rsCdf = computeCdf(rsVals);
+  const allVals = [...pyVals, ...rsVals];
+  const xmin = Math.min(...allVals), xmax = Math.max(...allVals);
+  const lxmin = Math.log10(xmin * 0.9), lxmax = Math.log10(xmax * 1.1);
+
+  const mx = v => pad.l + (Math.log10(v) - lxmin) / (lxmax - lxmin) * plotW;
+  const my = v => pad.t + (1 - v) * plotH;
+  const clip = v => Math.max(0, Math.min(1, v));
+
+  let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" style="font-family:'Inter',sans-serif">`;
+
+  // Plot area
+  svg += `<rect x="${pad.l}" y="${pad.t}" width="${plotW}" height="${plotH}" fill="#1e1e1e" stroke="#3d3d3d" stroke-width="1"/>`;
+  svg += `<defs><clipPath id="cp${title.replace(/\W/g,'')}"><rect x="${pad.l}" y="${pad.t}" width="${plotW}" height="${plotH}"/></clipPath></defs>`;
+  const cp = `clip-path="url(#cp${title.replace(/\W/g,'')})"`;
+
+  // Y grid + labels
+  for (const yv of [0, 0.25, 0.5, 0.75, 1.0]) {
+    const y = my(yv);
+    svg += `<line x1="${pad.l}" y1="${y}" x2="${pad.l+plotW}" y2="${y}" stroke="#2d2d2d" stroke-width="1"/>`;
+    svg += `<text x="${pad.l-5}" y="${y+4}" text-anchor="end" fill="#707070" font-size="10">${yv}</text>`;
+  }
+
+  // X grid + labels
+  for (const xt of logTicks(xmin, xmax)) {
+    const x = mx(xt);
+    if (x < pad.l - 1 || x > pad.l + plotW + 1) continue;
+    svg += `<line x1="${x}" y1="${pad.t}" x2="${x}" y2="${pad.t+plotH}" stroke="#2d2d2d" stroke-width="1"/>`;
+    svg += `<text x="${x}" y="${pad.t+plotH+14}" text-anchor="middle" fill="#707070" font-size="10">${xt}s</text>`;
+  }
+
+  // CDF lines
+  function polyline(cdf, color) {
+    const pts = cdf.map(p => `${mx(p.x).toFixed(1)},${my(p.y).toFixed(1)}`).join(' ');
+    return `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" ${cp}/>`;
+  }
+  svg += polyline(pyCdf, '#e06c75');
+  svg += polyline(rsCdf, '#61afef');
+
+  // Median dots + speedup annotation
+  function median(vals) { const s = [...vals].sort((a,b)=>a-b); return s[Math.floor(s.length/2)]; }
+  const pyMed = median(pyVals), rsMed = median(rsVals);
+  const xPy = mx(pyMed), xRs = mx(rsMed), y50 = my(0.5);
+
+  // Connecting line between the two medians
+  const speedup = (pyMed / rsMed).toFixed(1);
+  const xMid = (xPy + xRs) / 2;
+  svg += `<line x1="${xRs}" y1="${y50}" x2="${xPy}" y2="${y50}" stroke="#aaa" stroke-width="1.5" stroke-dasharray="4,3" ${cp}/>`;
+  // Arrowheads (left pointing toward Rust, right pointing toward Python)
+  svg += `<polygon points="${xRs+1},${y50} ${xRs+8},${y50-4} ${xRs+8},${y50+4}" fill="#aaa" ${cp}/>`;
+  svg += `<polygon points="${xPy-1},${y50} ${xPy-8},${y50-4} ${xPy-8},${y50+4}" fill="#aaa" ${cp}/>`;
+  // Label above the midpoint
+  svg += `<text x="${xMid}" y="${y50-8}" text-anchor="middle" fill="#e0e0e0" font-size="11" font-weight="600">${speedup}× faster</text>`;
+
+  // Median dots
+  for (const [x, color] of [[xPy,'#e06c75'],[xRs,'#61afef']]) {
+    svg += `<circle cx="${x}" cy="${y50}" r="3.5" fill="${color}" ${cp}/>`;
+  }
+
+  // Legend
+  const lx = pad.l + 8;
+  svg += `<line x1="${lx}" y1="${pad.t+10}" x2="${lx+16}" y2="${pad.t+10}" stroke="#e06c75" stroke-width="2"/>`;
+  svg += `<text x="${lx+20}" y="${pad.t+14}" fill="#b0b0b0" font-size="11">Python (med: ${pyMed.toFixed(1)}s)</text>`;
+  svg += `<line x1="${lx}" y1="${pad.t+24}" x2="${lx+16}" y2="${pad.t+24}" stroke="#61afef" stroke-width="2"/>`;
+  svg += `<text x="${lx+20}" y="${pad.t+28}" fill="#b0b0b0" font-size="11">Rust (med: ${rsMed.toFixed(2)}s)</text>`;
+
+  // Title + axis labels
+  svg += `<text x="${W/2}" y="20" text-anchor="middle" fill="#f0f0f0" font-size="13" font-weight="600">${title}</text>`;
+  svg += `<text x="${pad.l+plotW/2}" y="${H-4}" text-anchor="middle" fill="#707070" font-size="11">startup time (s, log scale)</text>`;
+  svg += `<text x="10" y="${pad.t+plotH/2}" text-anchor="middle" fill="#707070" font-size="11" transform="rotate(-90,10,${pad.t+plotH/2})">CDF</text>`;
+
+  svg += '</svg>';
+  return svg;
+}
+
+function renderStartupCdfs() {
+  const container = document.getElementById('startup-heatmaps');
+  const keys = Object.keys(BENCH.startup_warm || {}).sort((a, b) => modelSortKey(a) - modelSortKey(b));
+  if (keys.length === 0) { container.innerHTML = ''; return; }
+
+  let html = `<div class="heatmap-section"><h3>Startup time CDF — warm <span style="font-weight:400;color:var(--text-dim)">(100 iterations, log scale)</span></h3><div class="heatmap-row">`;
+  for (const key of keys) {
+    const rows = BENCH.startup_warm[key];
+    const pyVals = rows.filter(r => r.engine === 'python' && typeof r.startup_s === 'number').map(r => r.startup_s);
+    const rsVals = rows.filter(r => r.engine === 'rust'   && typeof r.startup_s === 'number').map(r => r.startup_s);
+    if (rsVals.length === 0 || pyVals.length === 0) continue;
+    html += `<div class="plotly-hm">${svgCdf(pyVals, rsVals, modelLabel(key))}</div>`;
+  }
+  html += '</div></div>';
+  container.innerHTML = html;
+}
+renderStartupCdfs();
 </script>
 </body>
 </html>

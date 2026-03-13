@@ -110,8 +110,13 @@ fn main() {
     println!("cargo:rerun-if-changed={}", l40s_dir.display());
 
     let mut bench_obj = serde_json::Map::new();
-    for btype in &["latency", "throughput", "serve"] {
-        let type_dir = l40s_dir.join(btype);
+    for (key, subpath) in &[
+        ("latency", "latency"),
+        ("throughput", "throughput"),
+        ("serve", "serve"),
+        ("startup_warm", "startup/warm"),
+    ] {
+        let type_dir = l40s_dir.join(subpath);
         let mut type_obj = serde_json::Map::new();
         if let Ok(rd) = fs::read_dir(&type_dir) {
             let mut paths: Vec<_> = rd
@@ -128,7 +133,7 @@ fn main() {
                 type_obj.insert(stem, json_val);
             }
         }
-        bench_obj.insert(btype.to_string(), serde_json::Value::Object(type_obj));
+        bench_obj.insert(key.to_string(), serde_json::Value::Object(type_obj));
     }
     let bench_json = serde_json::to_string(&serde_json::Value::Object(bench_obj)).unwrap();
     fs::write(Path::new(&out_dir).join("bench_data.json"), bench_json).unwrap();

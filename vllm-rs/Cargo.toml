@@ -8,7 +8,6 @@ members = [
     "crates/vllm-serve",
     "crates/vllm-executor",
     "crates/vllm-model",
-    "crates/vllm-models",
     "crates/vllm-protocol",
     "crates/vllm-pyo3",
     "crates/vllm-bench",
@@ -144,7 +143,6 @@ vllm-engine = { path = "crates/vllm-engine" }
 vllm-serve = { path = "crates/vllm-serve" }
 vllm-executor = { path = "crates/vllm-executor" }
 vllm-model = { path = "crates/vllm-model" }
-vllm-models = { path = "crates/vllm-models" }
 vllm-protocol = { path = "crates/vllm-protocol" }
 vllm-bench = { path = "crates/vllm-bench" }
 vllm-cli = { path = "crates/vllm-cli" }

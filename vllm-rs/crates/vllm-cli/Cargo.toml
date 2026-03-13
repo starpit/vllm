@@ -32,7 +32,6 @@ vllm-common = { workspace = true }
 vllm-config = { workspace = true }
 vllm-serve = { workspace = true }
 vllm-executor = { workspace = true }
-vllm-models = { workspace = true }
 vllm-model = { workspace = true }
 vllm-cuda = { workspace = true }
 vllm-gce = { workspace = true, optional = true }

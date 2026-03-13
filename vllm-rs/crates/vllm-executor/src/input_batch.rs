@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use vllm_models::AttentionMetadata;
+use vllm_model::AttentionMetadata;
 
 // ---------------------------------------------------------------------------
 // InputBatch

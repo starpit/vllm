@@ -8,6 +8,7 @@ description = "Model loading, weight management, and tensor abstractions for vLL
 [features]
 default = []
 multimodal = ["image"]
+guided-decoding = ["llguidance", "toktrie", "toktrie_hf_tokenizers"]
 
 [dependencies]
 vllm-common = { workspace = true }
@@ -17,8 +18,12 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 byteorder = { workspace = true }
+rand = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
+llguidance = { workspace = true, optional = true }
+toktrie = { workspace = true, optional = true }
+toktrie_hf_tokenizers = { workspace = true, optional = true }
 
 [dev-dependencies]
-rand = { workspace = true }
 tempfile = { workspace = true }
+safetensors = { workspace = true }

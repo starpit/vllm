@@ -124,13 +124,13 @@ pub struct MlxWorker {
 
     /// Per-request grammar guide state for constrained decoding.
     #[cfg(feature = "guided-decoding")]
-    grammar_states: HashMap<String, vllm_models::grammar::GrammarGuide>,
+    grammar_states: HashMap<String, vllm_model::grammar::GrammarGuide>,
     /// Parser factory for grammar-guided decoding (built once from tokenizer).
     #[cfg(feature = "guided-decoding")]
-    grammar_factory: Option<std::sync::Arc<vllm_models::grammar::LlgParserFactory>>,
+    grammar_factory: Option<std::sync::Arc<vllm_model::grammar::LlgParserFactory>>,
 
     /// Resolved pooling strategy for embeddings.
-    pooling_strategy: vllm_models::embedding::PoolingStrategy,
+    pooling_strategy: vllm_model::embedding::PoolingStrategy,
     /// Per-request multimodal data, consumed on first forward (prefill).
     mm_data_map: HashMap<String, vllm_common::MultimodalData>,
 
@@ -179,7 +179,7 @@ impl MlxWorker {
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
             grammar_factory: None,
-            pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
+            pooling_strategy: vllm_model::embedding::PoolingStrategy::Last,
             mm_data_map: HashMap::new(),
             preloaded_tokenizer: None,
             is_pooling,
@@ -245,7 +245,7 @@ impl MlxWorker {
 
     /// Resolve the pooling strategy from config or auto-detect.
     fn resolve_pooling_strategy(&mut self) {
-        use vllm_models::embedding::{PoolingStrategy, detect_pooling_strategy};
+        use vllm_model::embedding::{PoolingStrategy, detect_pooling_strategy};
 
         let strategy = match self.config.pooling_strategy.as_str() {
             "auto" => {
@@ -294,7 +294,7 @@ impl MlxWorker {
             }
         };
 
-        match vllm_models::grammar::build_parser_factory(&tokenizer_bytes) {
+        match vllm_model::grammar::build_parser_factory(&tokenizer_bytes) {
             Ok(factory) => {
                 info!("MlxWorker: grammar parser factory built");
                 self.grammar_factory = Some(factory);
@@ -750,7 +750,7 @@ impl Worker for MlxWorker {
                 #[cfg(feature = "guided-decoding")]
                 if let Some(ref grammar) = params.guided_grammar {
                     if let Some(ref factory) = self.grammar_factory {
-                        match vllm_models::grammar::GrammarGuide::from_guided_grammar(
+                        match vllm_model::grammar::GrammarGuide::from_guided_grammar(
                             grammar, factory,
                         ) {
                             Ok(guide) => {
@@ -915,7 +915,7 @@ impl Worker for MlxWorker {
 
         // --- Pooling mode: run hidden_states + pool + normalize ---
         if self.is_pooling {
-            use vllm_models::embedding::PoolingStrategy;
+            use vllm_model::embedding::PoolingStrategy;
             let strategy = self.pooling_strategy;
 
             let mut pooler_map: HashMap<String, Vec<f32>> = HashMap::new();
@@ -1010,7 +1010,7 @@ impl Worker for MlxWorker {
         });
 
         // CPU sampler for penalty/min_p/logit_bias/logprobs support.
-        let mut cpu_sampler = vllm_models::Sampler::new();
+        let mut cpu_sampler = vllm_model::Sampler::new();
 
         let step_start = Instant::now();
 
@@ -1359,6 +1359,28 @@ impl Worker for MlxWorker {
         let mut cpu_fallback: Vec<usize> = Vec::new();
 
         for (req_idx, req_input) in req_inputs.iter().enumerate() {
+            let lazy_out = &lazy_outputs[req_idx];
+
+            // Compute prompt logprobs if requested (arrays are already materialized).
+            if let Some((top_n, ref token_ids)) = lazy_out.prompt_logprobs_info {
+                let full_logits_f32 = lazy_out.full_logits_f32.as_ref().unwrap();
+                let num_positions = token_ids.len() - 1;
+                let vocab_size = full_logits_f32.dim(-1) as usize;
+                let flat = full_logits_f32.as_slice::<f32>();
+                let mut plps = Vec::with_capacity(num_positions);
+                for i in 0..num_positions {
+                    let row = &flat[i * vocab_size..(i + 1) * vocab_size];
+                    let actual_token = token_ids[i + 1];
+                    plps.push(vllm_model::sampler::compute_logprobs(
+                        row,
+                        actual_token,
+                        top_n,
+                    ));
+                }
+                prompt_logprobs_map.insert(req_input.req_id.clone(), plps);
+            }
+
+            // Classify: speculative → CPU, grammar/penalties → CPU, else GPU.
             if !req_input.spec_token_ids.is_empty() {
                 cpu_fallback.push(req_idx);
                 continue;
@@ -1502,7 +1524,7 @@ impl Worker for MlxWorker {
                 for i in 0..num_positions {
                     let row = &flat[i * vocab_size..(i + 1) * vocab_size];
                     let actual_token = token_ids[i + 1];
-                    plps.push(vllm_models::sampler::compute_logprobs(
+                    plps.push(vllm_model::sampler::compute_logprobs(
                         row,
                         actual_token,
                         top_n,
@@ -1687,7 +1709,7 @@ impl Worker for MlxWorker {
         token_id_seqs: &[&[u32]],
     ) -> vllm_executor::error::ExecutorResult<Vec<Vec<f32>>> {
         use vllm_executor::error::ExecutorError;
-        use vllm_models::embedding::PoolingStrategy;
+        use vllm_model::embedding::PoolingStrategy;
 
         let strategy = self.pooling_strategy;
         let model = self

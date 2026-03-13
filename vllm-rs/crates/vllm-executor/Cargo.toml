@@ -9,7 +9,7 @@ description = "Worker/process management and distributed coordination for vLLM R
 default = []
 cuda = ["vllm-cuda/cuda", "cudarc"]
 nccl = ["cuda", "vllm-cuda/nccl"]
-guided-decoding = ["vllm-models/guided-decoding"]
+guided-decoding = ["vllm-model/guided-decoding"]
 
 [dependencies]
 vllm-common = { workspace = true }
@@ -17,7 +17,6 @@ vllm-config = { workspace = true }
 vllm-core = { workspace = true }
 vllm-engine = { workspace = true }
 vllm-model = { workspace = true }
-vllm-models = { workspace = true }
 vllm-cuda = { workspace = true, optional = true }
 half = { workspace = true }
 tokenizers = { workspace = true }

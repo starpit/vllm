@@ -1476,7 +1476,7 @@ pub struct CudaWorker {
     /// Set once per thread to avoid redundant `ctx_set_current` driver calls.
     ctx_set_on_thread: bool,
     /// Resolved pooling strategy for embedding mode.
-    pooling_strategy: vllm_models::embedding::PoolingStrategy,
+    pooling_strategy: vllm_model::embedding::PoolingStrategy,
     /// Whether executing in pooling mode (--runner pooling).
     is_pooling: bool,
 
@@ -1486,10 +1486,10 @@ pub struct CudaWorker {
 
     /// Per-request grammar guide state for constrained decoding.
     #[cfg(feature = "guided-decoding")]
-    grammar_states: HashMap<String, vllm_models::grammar::GrammarGuide>,
+    grammar_states: HashMap<String, vllm_model::grammar::GrammarGuide>,
     /// Parser factory for grammar-guided decoding (built once from tokenizer).
     #[cfg(feature = "guided-decoding")]
-    grammar_factory: Option<std::sync::Arc<vllm_models::grammar::LlgParserFactory>>,
+    grammar_factory: Option<std::sync::Arc<vllm_model::grammar::LlgParserFactory>>,
 
     /// LogitsProcessor pipeline: persistent GPU state, rebuilt only on batch changes.
     logits_pipeline: Option<LogitsProcessorPipeline>,
@@ -1561,7 +1561,7 @@ impl CudaWorker {
             input_batch: InputBatch::new(),
             preloaded_tokenizer: None,
             ctx_set_on_thread: false,
-            pooling_strategy: vllm_models::embedding::PoolingStrategy::Last,
+            pooling_strategy: vllm_model::embedding::PoolingStrategy::Last,
             is_pooling,
             pending_commit: None,
             #[cfg(feature = "guided-decoding")]
@@ -1642,7 +1642,7 @@ impl CudaWorker {
             }
         };
 
-        match vllm_models::grammar::build_parser_factory(&tokenizer_bytes) {
+        match vllm_model::grammar::build_parser_factory(&tokenizer_bytes) {
             Ok(factory) => {
                 info!("CudaWorker: grammar parser factory built");
                 self.grammar_factory = Some(factory);
@@ -1757,11 +1757,11 @@ impl CudaWorker {
 
         // Pooling strategy.
         self.pooling_strategy = match self.config.pooling_strategy.as_str() {
-            "last" => vllm_models::embedding::PoolingStrategy::Last,
-            "cls" => vllm_models::embedding::PoolingStrategy::Cls,
-            "mean" => vllm_models::embedding::PoolingStrategy::Mean,
-            _ => vllm_models::embedding::detect_pooling_strategy(&model_dir)
-                .unwrap_or(vllm_models::embedding::PoolingStrategy::Last),
+            "last" => vllm_model::embedding::PoolingStrategy::Last,
+            "cls" => vllm_model::embedding::PoolingStrategy::Cls,
+            "mean" => vllm_model::embedding::PoolingStrategy::Mean,
+            _ => vllm_model::embedding::detect_pooling_strategy(&model_dir)
+                .unwrap_or(vllm_model::embedding::PoolingStrategy::Last),
         };
 
         // Tokenizer.
@@ -2003,7 +2003,7 @@ impl CudaWorker {
     /// Returns `(slot_mapping, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, max_seqlen_k)`.
     /// `seqused_k` has per-sequence K lengths `[num_reqs]` for the paged FA2 splitkv kernel.
     fn build_attention_tensors(
-        meta: &vllm_models::AttentionMetadata,
+        meta: &vllm_model::AttentionMetadata,
         block_size: usize,
         device: &mut GpuDevice,
     ) -> ExecutorResult<(GpuTensor, GpuTensor, GpuTensor, GpuTensor, usize, usize)> {
@@ -2103,7 +2103,7 @@ impl CudaWorker {
     /// state_indices: [num_seqs] i32 — slot index per sequence (= batch index).
     /// cu_seqlens: [num_seqs + 1] i32 — cumulative query lengths.
     fn build_gdn_tensors(
-        meta: &vllm_models::AttentionMetadata,
+        meta: &vllm_model::AttentionMetadata,
         device: &mut GpuDevice,
     ) -> ExecutorResult<(GpuTensor, GpuTensor, usize)> {
         let num_seqs = meta.num_reqs;
@@ -2168,10 +2168,10 @@ impl CudaWorker {
     fn pool_and_normalize(
         hidden_states: GpuTensor,
         num_tokens: usize,
-        strategy: vllm_models::embedding::PoolingStrategy,
+        strategy: vllm_model::embedding::PoolingStrategy,
         device: &mut GpuDevice,
     ) -> ExecutorResult<Vec<f32>> {
-        use vllm_models::embedding::PoolingStrategy;
+        use vllm_model::embedding::PoolingStrategy;
 
         let hidden_size = hidden_states.dim(1);
 
@@ -2357,7 +2357,7 @@ impl CudaWorker {
         sampling_params_map: &HashMap<String, SamplingParams>,
         #[cfg(feature = "guided-decoding")] grammar_states: &mut HashMap<
             String,
-            vllm_models::grammar::GrammarGuide,
+            vllm_model::grammar::GrammarGuide,
         >,
         grammar_processor: &GrammarMaskProcessor,
         allowed_token_ids_processor: &AllowedTokenIdsProcessor,
@@ -3577,13 +3577,13 @@ impl Worker for CudaWorker {
 
         // Resolve pooling strategy.
         self.pooling_strategy = match self.config.pooling_strategy.as_str() {
-            "last" => vllm_models::embedding::PoolingStrategy::Last,
-            "cls" => vllm_models::embedding::PoolingStrategy::Cls,
-            "mean" => vllm_models::embedding::PoolingStrategy::Mean,
+            "last" => vllm_model::embedding::PoolingStrategy::Last,
+            "cls" => vllm_model::embedding::PoolingStrategy::Cls,
+            "mean" => vllm_model::embedding::PoolingStrategy::Mean,
             _ => {
                 // "auto": detect from 1_Pooling/config.json, default to Last.
-                vllm_models::embedding::detect_pooling_strategy(&model_dir)
-                    .unwrap_or(vllm_models::embedding::PoolingStrategy::Last)
+                vllm_model::embedding::detect_pooling_strategy(&model_dir)
+                    .unwrap_or(vllm_model::embedding::PoolingStrategy::Last)
             }
         };
 
@@ -4376,8 +4376,7 @@ impl CudaWorker {
                 if let Some(ref grammar) = params.guided_grammar
                     && let Some(ref factory) = self.grammar_factory
                 {
-                    match vllm_models::grammar::GrammarGuide::from_guided_grammar(grammar, factory)
-                    {
+                    match vllm_model::grammar::GrammarGuide::from_guided_grammar(grammar, factory) {
                         Ok(guide) => {
                             self.grammar_states.insert(new_req.req_id.clone(), guide);
                         }
@@ -4896,7 +4895,7 @@ impl CudaWorker {
                 }
                 let pf_total_tokens = pf_token_ids.len();
 
-                let pf_meta = vllm_models::AttentionMetadata::new(
+                let pf_meta = vllm_model::AttentionMetadata::new(
                     n_prefill,
                     pf_total_tokens,
                     pf_query_start_loc,

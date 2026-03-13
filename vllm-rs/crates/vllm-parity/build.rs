@@ -115,6 +115,7 @@ fn main() {
         ("throughput", "throughput"),
         ("serve", "serve"),
         ("startup_warm", "startup/warm"),
+        ("startup_cold", "startup/cold"),
     ] {
         let type_dir = l40s_dir.join(subpath);
         let mut type_obj = serde_json::Map::new();

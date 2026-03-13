@@ -1259,13 +1259,20 @@ function svgCdf(pyVals, rsVals, title) {
     svg += `<text x="${x}" y="${pad.t+plotH+14}" text-anchor="middle" fill="#707070" font-size="10">${xt}s</text>`;
   }
 
-  // CDF lines
-  function polyline(cdf, color) {
-    const pts = cdf.map(p => `${mx(p.x).toFixed(1)},${my(p.y).toFixed(1)}`).join(' ');
-    return `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" ${cp}/>`;
+  // CDF area + line
+  function cdfShape(cdf, color) {
+    const pts = cdf.map(p => `${mx(p.x).toFixed(1)},${my(p.y).toFixed(1)}`);
+    const yBase = my(0);
+    const xFirst = mx(cdf[0].x).toFixed(1);
+    const xLast  = mx(cdf[cdf.length - 1].x).toFixed(1);
+    const areaPts = [`${xFirst},${yBase}`, ...pts, `${xLast},${yBase}`].join(' ');
+    return [
+      `<polygon points="${areaPts}" fill="${color}" fill-opacity="0.12" stroke="none" ${cp}/>`,
+      `<polyline points="${pts.join(' ')}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" ${cp}/>`,
+    ].join('');
   }
-  svg += polyline(pyCdf, '#e06c75');
-  svg += polyline(rsCdf, '#61afef');
+  svg += cdfShape(pyCdf, '#e06c75');
+  svg += cdfShape(rsCdf, '#61afef');
 
   // Median dots + speedup annotation
   function median(vals) { const s = [...vals].sort((a,b)=>a-b); return s[Math.floor(s.length/2)]; }
@@ -1305,11 +1312,14 @@ function svgCdf(pyVals, rsVals, title) {
 
 function renderStartupCdfs() {
   const container = document.getElementById('startup-heatmaps');
-  const keys = Object.keys(BENCH.startup_warm || {}).sort((a, b) => modelSortKey(a) - modelSortKey(b));
-  if (keys.length === 0) { container.innerHTML = ''; return; }
+  const warmKeys = Object.keys(BENCH.startup_warm || {}).sort((a, b) => modelSortKey(a) - modelSortKey(b));
+  if (warmKeys.length === 0) { container.innerHTML = ''; return; }
 
-  let html = `<div class="heatmap-section"><h3>Startup time CDF — warm <span style="font-weight:400;color:var(--text-dim)">(100 iterations, log scale)</span></h3><div class="heatmap-row">`;
-  for (const key of keys) {
+  let html = '';
+
+  // Warm chart
+  html += `<div class="heatmap-section"><h3>Startup time CDF — warm <span style="font-weight:400;color:var(--text-dim)">(100 iterations, log scale)</span></h3><div class="heatmap-row">`;
+  for (const key of warmKeys) {
     const rows = BENCH.startup_warm[key];
     const pyVals = rows.filter(r => r.engine === 'python' && typeof r.startup_s === 'number').map(r => r.startup_s);
     const rsVals = rows.filter(r => r.engine === 'rust'   && typeof r.startup_s === 'number').map(r => r.startup_s);
@@ -1317,6 +1327,22 @@ function renderStartupCdfs() {
     html += `<div class="plotly-hm">${svgCdf(pyVals, rsVals, modelLabel(key))}</div>`;
   }
   html += '</div></div>';
+
+  // Cold chart — Python cold vs Rust warm (warm ≈ cold for Rust)
+  const coldKeys = Object.keys(BENCH.startup_cold || {}).sort((a, b) => modelSortKey(a) - modelSortKey(b));
+  if (coldKeys.length > 0) {
+    html += `<div class="heatmap-section"><h3>Startup time CDF — cold <span style="font-weight:400;color:var(--text-dim)">(100 iterations, log scale; Rust uses warm data)</span></h3><div class="heatmap-row">`;
+    for (const key of coldKeys) {
+      const coldRows = BENCH.startup_cold[key];
+      const warmRows = (BENCH.startup_warm[key] || []);
+      const pyVals = coldRows.filter(r => r.engine === 'python' && typeof r.startup_s === 'number').map(r => r.startup_s);
+      const rsVals = warmRows.filter(r => r.engine === 'rust'   && typeof r.startup_s === 'number').map(r => r.startup_s);
+      if (pyVals.length === 0 || rsVals.length === 0) continue;
+      html += `<div class="plotly-hm">${svgCdf(pyVals, rsVals, modelLabel(key))}</div>`;
+    }
+    html += '</div></div>';
+  }
+
   container.innerHTML = html;
 }
 renderStartupCdfs();

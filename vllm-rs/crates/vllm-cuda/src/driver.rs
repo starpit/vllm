@@ -52,6 +52,24 @@ pub unsafe fn device_get_num_sm(device: CUdevice) -> Result<i32> {
     Ok(value)
 }
 
+/// Get the SM version (compute capability) as a single number: major*10 + minor.
+/// E.g. SM89 (Ada) → 89, SM80 (Ampere) → 80, SM90 (Hopper) → 90.
+pub unsafe fn device_get_sm_version(device: CUdevice) -> Result<u32> {
+    let mut major = 0i32;
+    let mut minor = 0i32;
+    check(sys::cuDeviceGetAttribute(
+        &mut major,
+        sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+        device,
+    ))?;
+    check(sys::cuDeviceGetAttribute(
+        &mut minor,
+        sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+        device,
+    ))?;
+    Ok((major * 10 + minor) as u32)
+}
+
 /// Retain the primary CUDA context on the given device.
 ///
 /// Uses the primary context (shared with the CUDA runtime API) rather than

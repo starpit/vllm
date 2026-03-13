@@ -19,7 +19,7 @@ use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Linear, LinearLayer, RmsNorm};
-use crate::layers_moe::{FusedMoELayer, MarlinSharedFusedMoELayer};
+use crate::layers_moe::{Fp8FusedMoELayer, FusedMoELayer, MarlinSharedFusedMoELayer};
 use crate::model::llama::{LlamaAttention, LlamaMLP, RotaryCache, TpConfig};
 #[cfg(feature = "nccl")]
 use crate::nccl::NcclGroup;
@@ -47,6 +47,13 @@ pub enum Qwen3MoeMlp {
         shared_intermediate_size: usize,
     },
     QuantizedMoE(MarlinSharedFusedMoELayer),
+    Fp8MoE {
+        moe: Fp8FusedMoELayer,
+        shared_gate_up: Option<Linear>,
+        shared_down: Option<Linear>,
+        shared_expert_gate: Option<Linear>,
+        shared_intermediate_size: usize,
+    },
 }
 
 impl Qwen3MoeMlp {
@@ -117,6 +124,61 @@ impl Qwen3MoeMlp {
                 }
             }
             Self::QuantizedMoE(layer) => layer.forward_owned(hidden_states, device),
+            Self::Fp8MoE {
+                moe,
+                shared_gate_up,
+                shared_down,
+                shared_expert_gate,
+                shared_intermediate_size,
+            } => {
+                let stream = device.compute_stream;
+                let moe_out = moe.forward_owned(hidden_states, device);
+
+                if let (Some(shared_gu_w), Some(shared_down_w), Some(shared_gate_w)) =
+                    (shared_gate_up, shared_down, shared_expert_gate)
+                {
+                    let shared_gu = shared_gu_w.forward_owned(
+                        hidden_states,
+                        &mut device.cublas,
+                        &mut device.caching,
+                    );
+                    let shared_activated = kernels::silu_and_mul_fused(
+                        shared_gu.as_gpu_tensor(),
+                        *shared_intermediate_size,
+                        &mut device.caching,
+                        stream,
+                    );
+                    drop(shared_gu);
+
+                    let shared_out = shared_down_w.forward_owned(
+                        shared_activated.as_gpu_tensor(),
+                        &mut device.cublas,
+                        &mut device.caching,
+                    );
+                    drop(shared_activated);
+
+                    let gate_logits = shared_gate_w.forward_owned(
+                        hidden_states,
+                        &mut device.cublas,
+                        &mut device.caching,
+                    );
+
+                    let result = kernels::sigmoid_mul_add(
+                        moe_out.as_gpu_tensor(),
+                        shared_out.as_gpu_tensor(),
+                        gate_logits.as_gpu_tensor(),
+                        &mut device.caching,
+                        stream,
+                    );
+                    drop(moe_out);
+                    drop(shared_out);
+                    drop(gate_logits);
+
+                    result
+                } else {
+                    moe_out
+                }
+            }
         }
     }
 }
@@ -381,8 +443,68 @@ impl Qwen3MoeDecoderLayer {
             )?;
             Qwen3MoeMlp::Dense(dense)
         } else {
-            // MoE expert weights stay dense (BF16).
-            Self::load_moe(weights, &format!("{prefix}.mlp"), config, None, stream)?
+            // Check if expert weights are FP8.
+            let moe_prefix = format!("{prefix}.mlp");
+            let first_gate_name = format!("{moe_prefix}.experts.0.gate_proj.weight");
+            let is_fp8 = weights
+                .tensor_info(&first_gate_name)
+                .map(|(_, dt)| dt == DType::Fp8E4m3)
+                .unwrap_or(false);
+
+            if is_fp8 {
+                let fp8_moe = gpu_weights::load_fp8_moe_experts(
+                    weights,
+                    &moe_prefix,
+                    config.num_experts,
+                    config.moe_intermediate_size,
+                    config.hidden_size,
+                    config.num_experts_per_tok,
+                    true, // Qwen3 MoE renormalizes
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                )?;
+
+                // Load shared expert (dense BF16).
+                let shared_inter = config.shared_expert_intermediate_size;
+                let (shared_gate_up, shared_down, shared_expert_gate) = if shared_inter > 0 {
+                    let gate_up = {
+                        let gate_name = format!("{moe_prefix}.shared_expert.gate_proj.weight");
+                        let up_name = format!("{moe_prefix}.shared_expert.up_proj.weight");
+                        let (_, se_dtype) = weights
+                            .tensor_info(&gate_name)
+                            .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
+                        let se_elem = se_dtype.size_bytes();
+                        let hidden = config.hidden_size;
+                        let gate_proj_bytes = shared_inter * hidden * se_elem;
+                        let total = 2 * gate_proj_bytes;
+                        let ptr = unsafe { crate::driver::mem_alloc(total)? };
+                        unsafe {
+                            weights.take_into(&gate_name, ptr, stream)?;
+                            weights.take_into(&up_name, ptr.add(gate_proj_bytes), stream)?;
+                        }
+                        let w =
+                            unsafe { GpuTensor::new(ptr, &[2 * shared_inter, hidden], se_dtype) };
+                        Linear::new(w, None)
+                    };
+                    let down =
+                        Linear::load(weights, &format!("{moe_prefix}.shared_expert.down_proj"))?;
+                    let gate = Linear::load(weights, &format!("{moe_prefix}.shared_expert_gate"))?;
+                    (Some(gate_up), Some(down), Some(gate))
+                } else {
+                    (None, None, None)
+                };
+
+                Qwen3MoeMlp::Fp8MoE {
+                    moe: fp8_moe,
+                    shared_gate_up,
+                    shared_down,
+                    shared_expert_gate,
+                    shared_intermediate_size: shared_inter,
+                }
+            } else {
+                Self::load_moe(weights, &moe_prefix, config, None, stream)?
+            }
         };
 
         let input_layernorm = RmsNorm::load(
@@ -1044,6 +1166,9 @@ impl Qwen3MoeForCausalLM {
                 }
                 Qwen3MoeMlp::QuantizedMoE(layer) => {
                     layer.moe.tp_group = Some(Arc::clone(&group));
+                }
+                Qwen3MoeMlp::Fp8MoE { moe, .. } => {
+                    moe.tp_group = Some(Arc::clone(&group));
                 }
             }
         }

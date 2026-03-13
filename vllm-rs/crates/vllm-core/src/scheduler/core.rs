@@ -565,8 +565,7 @@ impl Scheduler {
     /// Push a request onto the running queue and update the O(1) index.
     fn running_push(&mut self, request: Request) {
         let idx = self.running.len();
-        self.running_req_idx
-            .insert(request.request_id.clone(), idx);
+        self.running_req_idx.insert(request.request_id.clone(), idx);
         self.running.push(request);
     }
 

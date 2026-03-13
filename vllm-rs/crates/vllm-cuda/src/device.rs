@@ -29,6 +29,8 @@ pub struct GpuDevice {
     pub d2h_done: CUevent,
     /// Number of streaming multiprocessors on this device.
     pub num_sm: i32,
+    /// SM version (compute capability): major*10 + minor. E.g. 89 for L40S, 80 for A100.
+    pub sm_version: u32,
 }
 
 impl GpuDevice {
@@ -49,11 +51,13 @@ impl GpuDevice {
             let cublas = CublasHandle::new(compute_stream)?;
             let caching = CachingAllocator::new();
             let num_sm = driver::device_get_num_sm(cu_device)?;
+            let sm_version = driver::device_get_sm_version(cu_device)?;
 
             tracing::info!(
-                "GpuDevice initialized: device={}, SMs={}",
+                "GpuDevice initialized: device={}, SMs={}, SM{}",
                 device_id,
                 num_sm,
+                sm_version,
             );
 
             Ok(Self {
@@ -66,6 +70,7 @@ impl GpuDevice {
                 transfer_done,
                 d2h_done,
                 num_sm,
+                sm_version,
             })
         }
     }

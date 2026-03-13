@@ -505,6 +505,7 @@ impl GpuWeights {
         // disk I/O and CPU-side parsing across shards.
         tracing::info!("Loading {total} shards in parallel");
 
+        #[allow(clippy::type_complexity)]
         let shard_results: Vec<Result<(HashMap<String, CpuTensorRef>, Arc<memmap2::Mmap>)>> =
             std::thread::scope(|scope| {
                 let handles: Vec<_> = shard_files
@@ -2824,10 +2825,187 @@ pub fn load_fused_fp8_linear(
 }
 
 // ---------------------------------------------------------------------------
-// Marlin MoE Expert Weight Loading (AWQ/GPTQ INT4)
+// FP8 MoE Expert Weight Loading
 // ---------------------------------------------------------------------------
 
 use crate::layers::Linear;
+use crate::layers_moe::Fp8FusedMoELayer;
+
+/// Load FP8 MoE expert weights and per-expert scales.
+///
+/// Stacks per-expert FP8 E4M3 weights into `[E, N, K]` tensors and merges
+/// gate/up scales with max() (matching Python's `process_fp8_weight_tensor_strategy_moe`).
+///
+/// Returns `Fp8FusedMoELayer` with FP8 weights + f32 per-expert scales.
+///
+/// Weight naming conventions (per-expert):
+/// - `gate_name`: "w1" (Mixtral) or "gate_proj" (Qwen/DeepSeek)
+/// - `up_name`: "w3" (Mixtral) or "up_proj" (Qwen/DeepSeek)
+/// - `down_name`: "w2" (Mixtral) or "down_proj" (Qwen/DeepSeek)
+#[allow(clippy::too_many_arguments)]
+pub fn load_fp8_moe_experts(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    num_experts: usize,
+    intermediate_size: usize,
+    hidden_size: usize,
+    top_k: usize,
+    renormalize: bool,
+    gate_name: &str,
+    up_name: &str,
+    down_name: &str,
+) -> Result<Fp8FusedMoELayer> {
+    let stream = weights.stream();
+
+    // Gate weight — always dense BF16.
+    let gate = Linear::load(weights, &format!("{prefix}.gate"))?;
+
+    // Allocate stacked FP8 expert weight buffers.
+    // w1: [E, 2*inter, hidden] FP8 (1 byte/elem)
+    // w2: [E, hidden, inter] FP8
+    let w1_bytes = num_experts * 2 * intermediate_size * hidden_size;
+    let w2_bytes = num_experts * hidden_size * intermediate_size;
+    let w1_ptr = unsafe { crate::driver::mem_alloc(w1_bytes)? };
+    let w2_ptr = unsafe { crate::driver::mem_alloc(w2_bytes)? };
+    weights.record_alloc(w1_ptr, w1_bytes);
+    weights.record_alloc(w2_ptr, w2_bytes);
+
+    // Per-expert scales (f32).
+    let mut w1_scales_host = vec![0.0f32; num_experts];
+    let mut w2_scales_host = vec![0.0f32; num_experts];
+
+    for e in 0..num_experts {
+        let gate_prefix = format!("{prefix}.experts.{e}.{gate_name}");
+        let up_prefix = format!("{prefix}.experts.{e}.{up_name}");
+        let down_prefix = format!("{prefix}.experts.{e}.{down_name}");
+
+        // Copy gate_proj FP8 weight into w1[e, 0..inter, :]
+        let expert_w1_offset = e * 2 * intermediate_size * hidden_size;
+        let gate_proj_bytes = intermediate_size * hidden_size;
+        unsafe {
+            weights.take_into(
+                &format!("{gate_prefix}.weight"),
+                w1_ptr.add(expert_w1_offset),
+                stream,
+            )?;
+            // Copy up_proj FP8 weight into w1[e, inter..2*inter, :]
+            weights.take_into(
+                &format!("{up_prefix}.weight"),
+                w1_ptr.add(expert_w1_offset + gate_proj_bytes),
+                stream,
+            )?;
+            // Copy down_proj FP8 weight into w2[e, :, :]
+            let expert_w2_offset = e * hidden_size * intermediate_size;
+            weights.take_into(
+                &format!("{down_prefix}.weight"),
+                w2_ptr.add(expert_w2_offset),
+                stream,
+            )?;
+        }
+
+        // Load per-expert scales.
+        // gate_proj.weight_scale and up_proj.weight_scale → w1_scale = max(gate, up)
+        // down_proj.weight_scale → w2_scale
+        let gate_scale = read_f32_scale(weights, &format!("{gate_prefix}.weight_scale"), stream)?;
+        let up_scale = read_f32_scale(weights, &format!("{up_prefix}.weight_scale"), stream)?;
+        let down_scale = read_f32_scale(weights, &format!("{down_prefix}.weight_scale"), stream)?;
+
+        w1_scales_host[e] = gate_scale.max(up_scale);
+        w2_scales_host[e] = down_scale;
+    }
+
+    // Upload per-expert scale vectors to GPU.
+    let w1_scale_bytes = num_experts * 4;
+    let w1_scale_ptr = unsafe { crate::driver::mem_alloc(w1_scale_bytes)? };
+    let w2_scale_ptr = unsafe { crate::driver::mem_alloc(w1_scale_bytes)? };
+    weights.record_alloc(w1_scale_ptr, w1_scale_bytes);
+    weights.record_alloc(w2_scale_ptr, w1_scale_bytes);
+    unsafe {
+        crate::driver::memcpy_htod_async(
+            w1_scale_ptr,
+            w1_scales_host.as_ptr() as *const u8,
+            w1_scale_bytes,
+            stream,
+        )?;
+        crate::driver::memcpy_htod_async(
+            w2_scale_ptr,
+            w2_scales_host.as_ptr() as *const u8,
+            w1_scale_bytes,
+            stream,
+        )?;
+    }
+
+    let w1 = unsafe {
+        GpuTensor::new(
+            w1_ptr,
+            &[num_experts, 2 * intermediate_size, hidden_size],
+            DType::Fp8E4m3,
+        )
+    };
+    let w2 = unsafe {
+        GpuTensor::new(
+            w2_ptr,
+            &[num_experts, hidden_size, intermediate_size],
+            DType::Fp8E4m3,
+        )
+    };
+    let w1_scale = unsafe { GpuTensor::new(w1_scale_ptr, &[num_experts], DType::F32) };
+    let w2_scale = unsafe { GpuTensor::new(w2_scale_ptr, &[num_experts], DType::F32) };
+
+    Ok(Fp8FusedMoELayer {
+        gate,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        num_experts,
+        top_k,
+        intermediate_size,
+        hidden_size,
+        renormalize,
+        #[cfg(feature = "nccl")]
+        tp_group: None,
+    })
+}
+
+/// Read a single f32 scalar scale from a weight tensor.
+/// Handles the case where the scale is stored as f32, BF16, or F16.
+fn read_f32_scale(weights: &mut GpuWeights, name: &str, stream: CUstream) -> Result<f32> {
+    let scale_tensor = weights.take(name)?;
+    let num_bytes = scale_tensor.numel() * scale_tensor.dtype().size_bytes();
+    let mut host_buf = vec![0u8; num_bytes];
+    unsafe {
+        crate::driver::memcpy_dtoh_async(
+            host_buf.as_mut_ptr(),
+            scale_tensor.raw_ptr(),
+            num_bytes,
+            stream,
+        )?;
+        crate::driver::stream_synchronize(stream)?;
+    }
+
+    let val = match scale_tensor.dtype() {
+        DType::F32 => {
+            let p = host_buf.as_ptr() as *const f32;
+            unsafe { *p }
+        }
+        DType::BF16 => {
+            let bits = u16::from_le_bytes([host_buf[0], host_buf[1]]);
+            half::bf16::from_bits(bits).to_f32()
+        }
+        DType::F16 => {
+            let bits = u16::from_le_bytes([host_buf[0], host_buf[1]]);
+            half::f16::from_bits(bits).to_f32()
+        }
+        dt => anyhow::bail!("read_f32_scale: unsupported dtype {dt}"),
+    };
+    Ok(val)
+}
+
+// ---------------------------------------------------------------------------
+// Marlin MoE Expert Weight Loading (AWQ/GPTQ INT4)
+// ---------------------------------------------------------------------------
+
 use crate::layers_moe::MarlinFusedMoELayer;
 
 /// Load MoE expert weights in AWQ/GPTQ INT4 format and repack to Marlin.

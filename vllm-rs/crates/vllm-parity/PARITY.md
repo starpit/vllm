@@ -5,8 +5,8 @@
 | Symbol | Meaning | Count |
 |--------|---------|------:|
 | ✅ 🟦 | Implemented | 161 |
-| ⚠️ 🟨 | Partial | 9 |
-| ❌ 🟥 | Not implemented | 101 |
+| ⚠️ 🟨 | Partial | 10 |
+| ❌ 🟥 | Not implemented | 100 |
 | 🚫 | Won't fix | 4 |
 
 ---
@@ -18,7 +18,7 @@
 | Section | Parity | ✅ | ⚠️ | ❌ |
 |---|---|---:|---:|---:|
 | [Hardware Platforms](#hardware-platforms) | 🟦🟦🟥🟥🟥🟥🟥🟥 | 2 | 0 | 6 |
-| [Multi-GPU & Distribution](#multi-gpu--distribution) | 🟦🟦🟥🟥🟥🟥🟥🟥🟥 | 2 | 0 | 7 |
+| [Multi-GPU & Distribution](#multi-gpu--distribution) | 🟦🟦🟨🟥🟥🟥🟥🟥🟥 | 2 | 1 | 6 |
 | [CLI Commands](#cli-commands) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 10 | 0 | 0 |
 | [OpenAI-Compatible API Endpoints](#openai-compatible-api-endpoints) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟥🟥🟥 | 10 | 0 | 3 |
 | [Other API Protocols](#other-api-protocols) | 🟦🟦🟥🟥🟥🟥🟥 | 2 | 0 | 5 |
@@ -43,7 +43,7 @@
 | [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥 | 22 | 1 | 3 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟦 | 7 | 0 | 0 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟦 | 8 | 0 | 0 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟨🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **161** | **9** | **101** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **161** | **10** | **100** |
 
 ---
 
@@ -71,7 +71,7 @@
 |---|:---:|:---:|---|
 | Tensor parallelism (TP) — single-node | ✅ | ✅ | CudaWorker: NCCL all-reduce via ThreadPoolExecutor; all dense + MoE archs wired; E2E verified TP=2 Qwen2.5-0.5B + Gemma3-4B on 2x L40S |
 | Tensor parallelism (TP) — multi-node | ✅ | ✅ | TCP control plane + NCCL data plane (mp backend); E2E verified TP=2 Qwen2.5-3B-Instruct across 2x L40S pods |
-| Pipeline parallelism (PP) | ✅ | ❌ |  |
+| Pipeline parallelism (PP) | ✅ | ⚠️ | LLaMA/Qwen2 PP=2 E2E verified (sync scheduling). TODO: async scheduling token broadcast; CUDA graphs with PP (currently enforce-eager only); PP for Gemma2/Gemma3/CommandR/Mixtral/Qwen2Moe/Qwen3Moe/Qwen3Next/DeepSeekV2 models; TP+PP combined (load_tp_pp exists for LLaMA/Qwen2 but untested); memory profiling uses fixed 512MB estimate instead of real profiling; PP E2E test automation; GGUF/quantized PP |
 | Data parallelism (DP) | ✅ | ❌ |  |
 | Expert parallelism (EP) for MoE | ✅ | ❌ | Needed for MoE models where experts are split across GPUs |
 | NCCL custom all-reduce | ✅ | ❌ |  |
@@ -227,7 +227,7 @@
 | GPTQ | ✅ | ✅ | Marlin W4A16 on SM80+; symmetric + desc_act (activation ordering); fused QKV/gate_up at load; post-GEMM bias_add_inplace for linear bias; CUDA graphs work; archs: LLaMA/Qwen2/Gemma2/Granite; note: asymmetric zero-points not passed (uint4b8 bakes in zp like Python vLLM) |
 | AWQ | ✅ | ✅ | Marlin W4A16 on SM80+; fused QKV/gate_up at load; CUDA graphs work; archs: LLaMA/Qwen2/Gemma2/Granite; E2E verified Qwen2.5-0.5B |
 | BitsAndBytes NF4 (4-bit) | ✅ | ✅ | Dequant-then-cuBLAS GEMM; double quantization supported; per-shard matmuls for QKV and gate/up; archs: LLaMA/Qwen2/Gemma2 (+ aliases Mistral/Qwen3/Phi-3/Granite); E2E verified unsloth/Qwen3-0.6B-bnb-4bit |
-| Quantized MoE (FP8/INT8/INT4 experts) | ✅ | ⚠️ | INT4 MoE: Marlin MoE W4A16 kernel (AWQ/GPTQ) for Qwen3MoE/Qwen2MoE/Mixtral with dynamic moe_block_size [8/16]; FP8 MoE: dequant-to-BF16 at load time (correctness path). TODO: native FP8 fused MoE GEMM (per-expert FP8 scales at runtime); block-quantized FP8 MoE (DeepSeek-V3 per-block scales); INT8 W8A8 MoE experts (Marlin INT8 MoE kernel); fused MoE scale merging at runtime (currently max-merge at load); moe_block_size 32/48/64 for large-batch prefill |
+| Quantized MoE (FP8/INT8/INT4 experts) | ✅ | ⚠️ | INT4 MoE: Marlin MoE W4A16 kernel (AWQ/GPTQ) for Qwen3MoE/Qwen2MoE/Mixtral with dynamic moe_block_size [8/16]; FP8 MoE: fused_moe_fp8_gemm kernel with per-token activation scales + per-expert weight scales (dequant-to-BF16 compute path for SM80+; FP8 storage → 2x bandwidth savings); Fp8FusedMoELayer + Fp8SharedFusedMoELayer wired into Mixtral/Qwen2MoE/Qwen3MoE/DeepSeekV2; load_fp8_moe_experts with scale merging (max gate/up per expert); E2E verified fxmarty/Mixtral-8x7B-FP8-2-layers. TODO: native SM89+ FP8 tensor core mma.m16n8k32 PTX (parked — 0.5x output bug in fragment layout; would give 2x compute on top of 2x bandwidth); block-quantized FP8 MoE (DeepSeek-V3 per-block weight_block_size scales); INT8 W8A8 MoE experts (Marlin INT8 MoE kernel); per-channel FP8 MoE scales (w_scale shape [E x N] instead of [E]); moe_block_size 32/48/64 for large-batch prefill; FP8 MoE + CUDA graphs (needs pre-allocated FP8 activation/scale buffers) |
 | MLX 4-bit quantized | N/A | ✅ | Rust-only; mlx-community models |
 | FP8 (W8A8 / W8A16) | ✅ | ⚠️ | SM89 W8A8 per-tensor + per-channel via fused CUTLASS cutlass_scaled_mm (c2x EVT epilogue with per-row scale_a / per-tensor scale_b); dynamic activation quantization (scaled_fp8_quant kernel); static activation quantization (pre-calibrated input_scale); compressed-tensors float8 config detection; E2E verified: Qwen2.5-0.5B-FP8 + LLaMA-3.1-8B-FP8. TODO: SM90+ Hopper CUTLASS 3.x c3x kernels (CollectiveMainloop/CollectiveEpilogue — completely different API from c2x); SM100/SM120 Blackwell kernels (scaled_mm_c3x_sm100); block-quantized FP8 GEMM (DeepSeek-V3 weight_block_size — currently dequant-to-BF16 fallback); FP8 + CUDA graphs (needs pre-allocated FP8 activation/scale buffers during graph capture); FP8 W8A16 weight-only (no activation quantization); online FP8 weight quantization (BF16→FP8 at load time for non-serialized checkpoints); Marlin FP8 fallback for SM<89; FP8 E5M2 dtype (only E4M3 implemented); bias epilogue fusion (ScaledEpilogueBias variants); AZP asymmetric zero-point epilogue (ScaledEpilogueAZP for INT8) |
 | Marlin kernels (AWQ/GPTQ) | ✅ | ✅ | W4A16 dense + MoE; auto-converts at load on SM80+; use_fp32_reduce matches Python default; MoE: Marlin MoE WNA16 kernel with fused expert routing + topk weight multiply |
@@ -470,7 +470,7 @@
 | Paged attention v1/v2 (PagedAttention) | ✅ | ❌ |  |
 | `silu_and_mul` fused activation | ✅ | ✅ | Vectorized 128-bit loads; combined gate_up variant |
 | `gelu_and_mul` fused activation | ✅ | ✅ | Vectorized 128-bit loads; combined gate_up variant |
-| Fused MoE GEMM | ✅ | ✅ | WMMA tensor-core kernel (128/128/32); BF16/F16 only; perf gaps vs Triton: fixed tile sizes (2-3x some shapes) + WMMA vs native mma PTX (10-30%) + no GROUP_SIZE_M L2 grouping + no chunked processing (OOM risk large batches) |
+| Fused MoE GEMM | ✅ | ✅ | WMMA tensor-core kernel (128/128/32); BF16/F16 + FP8 E4M3 (dequant-to-BF16 compute with per-token a_scale × per-expert w_scale epilogue); perf gaps vs Triton: fixed tile sizes (2-3x some shapes) + WMMA vs native mma PTX (10-30%) + no GROUP_SIZE_M L2 grouping + no chunked processing (OOM risk large batches); FP8 gap: SM89 native mma.m16n8k32.e4m3 PTX parked (0.5x output bug) |
 | Marlin (INT4 GEMM) | ✅ | ✅ | W4A16 fused dequant+GEMM; 270 kernel instantiations (FP16/BF16 × GPTQ/AWQ); use_fp32_reduce=true |
 | GGUF dequant kernels (k-quants) | ✅ | ✅ | llama.cpp-derived; BS=1 fused dequant-matvec + BS>1 Q8_1 dot products; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2K-Q8K |
 | BitsAndBytes NF4 dequant | ✅ | ✅ | Dequant-then-cuBLAS; double quantization supported; shared dequant scratch buffer |

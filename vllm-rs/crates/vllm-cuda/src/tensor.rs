@@ -106,7 +106,9 @@ impl GpuTensor {
     /// Total number of elements. Returns 0 for null/empty tensors.
     pub fn numel(self) -> usize {
         if self.ndim == 0 {
-            return 0;
+            // Null tensor (ptr==null, ndim==0) → 0 elements.
+            // Scalar tensor (ptr!=null, ndim==0) → 1 element.
+            return if self.ptr.is_null() { 0 } else { 1 };
         }
         self.shape[..self.ndim as usize]
             .iter()

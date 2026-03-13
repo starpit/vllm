@@ -22,9 +22,10 @@ use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Embedding, Linear, RmsNorm};
-use crate::layers_moe::FusedMoELayer;
+use crate::layers_moe::{Fp8FusedMoELayer, FusedMoELayer};
 use crate::model::llama::{LlamaMLP, RotaryCache, TpConfig};
 use crate::tensor::GpuTensor;
+use crate::weights as gpu_weights;
 use crate::weights::GpuWeights;
 
 #[cfg(feature = "nccl")]
@@ -777,6 +778,59 @@ impl DeepSeekV2MoE {
     }
 }
 
+pub struct DeepSeekV2Fp8MoE {
+    pub moe: Fp8FusedMoELayer,
+    pub shared_gate_up: Linear,
+    pub shared_down: Linear,
+    pub shared_intermediate_size: usize,
+    pub routed_scaling_factor: f64,
+}
+
+impl DeepSeekV2Fp8MoE {
+    pub unsafe fn forward_owned(
+        &self,
+        hidden_states: GpuTensor,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        let stream = device.compute_stream;
+
+        let moe_out = self.moe.forward_owned(hidden_states, device);
+
+        if self.routed_scaling_factor != 1.0 {
+            kernels::scale_inplace(
+                moe_out.as_gpu_tensor(),
+                self.routed_scaling_factor as f32,
+                &device.cublas,
+            );
+        }
+
+        let shared_gu = self.shared_gate_up.forward_owned(
+            hidden_states,
+            &mut device.cublas,
+            &mut device.caching,
+        );
+        let shared_activated = kernels::silu_and_mul_fused(
+            shared_gu.as_gpu_tensor(),
+            self.shared_intermediate_size,
+            &mut device.caching,
+            stream,
+        );
+        drop(shared_gu);
+
+        let shared_out = self.shared_down.forward_owned(
+            shared_activated.as_gpu_tensor(),
+            &mut device.cublas,
+            &mut device.caching,
+        );
+        drop(shared_activated);
+
+        kernels::add_inplace(moe_out.as_gpu_tensor(), shared_out.as_gpu_tensor(), stream);
+        drop(shared_out);
+
+        moe_out
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Decoder Layer
 // ---------------------------------------------------------------------------
@@ -784,6 +838,7 @@ impl DeepSeekV2MoE {
 enum DeepSeekV2Mlp {
     Dense(LlamaMLP),
     MoE(DeepSeekV2MoE),
+    Fp8MoE(DeepSeekV2Fp8MoE),
 }
 
 impl DeepSeekV2Mlp {
@@ -795,6 +850,7 @@ impl DeepSeekV2Mlp {
         match self {
             Self::Dense(mlp) => mlp.forward_owned(hidden_states, device),
             Self::MoE(moe) => moe.forward_owned(hidden_states, device),
+            Self::Fp8MoE(moe) => moe.forward_owned(hidden_states, device),
         }
     }
 }
@@ -827,8 +883,20 @@ impl DeepSeekV2DecoderLayer {
             )?;
             DeepSeekV2Mlp::Dense(dense)
         } else {
-            let moe = Self::load_moe(weights, &format!("{prefix}.mlp"), config, None, stream)?;
-            DeepSeekV2Mlp::MoE(moe)
+            let moe_prefix = format!("{prefix}.mlp");
+            let first_gate_name = format!("{moe_prefix}.experts.0.gate_proj.weight");
+            let is_fp8 = weights
+                .tensor_info(&first_gate_name)
+                .map(|(_, dt)| dt == DType::Fp8E4m3)
+                .unwrap_or(false);
+
+            if is_fp8 {
+                let fp8_moe = Self::load_fp8_moe(weights, &moe_prefix, config, stream)?;
+                DeepSeekV2Mlp::Fp8MoE(fp8_moe)
+            } else {
+                let moe = Self::load_moe(weights, &moe_prefix, config, None, stream)?;
+                DeepSeekV2Mlp::MoE(moe)
+            }
         };
 
         let input_layernorm = RmsNorm::load(
@@ -991,6 +1059,58 @@ impl DeepSeekV2DecoderLayer {
             shared_gate_up,
             shared_down,
             shared_intermediate_size: sipp,
+            routed_scaling_factor: config.routed_scaling_factor,
+        })
+    }
+
+    fn load_fp8_moe(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &DeepSeekV2Config,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<DeepSeekV2Fp8MoE> {
+        let fp8_moe = gpu_weights::load_fp8_moe_experts(
+            weights,
+            prefix,
+            config.n_routed_experts,
+            config.moe_intermediate_size,
+            config.hidden_size,
+            config.num_experts_per_tok,
+            config.norm_topk_prob,
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        )?;
+
+        // Shared expert (dense BF16, unconditional — no sigmoid gate)
+        let shared_inter = config.n_shared_experts * config.moe_intermediate_size;
+        let hidden = config.hidden_size;
+
+        let shared_gate_up = {
+            let gate_name = format!("{prefix}.shared_experts.gate_proj.weight");
+            let up_name = format!("{prefix}.shared_experts.up_proj.weight");
+            let (_, dtype) = weights
+                .tensor_info(&gate_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
+            let elem = dtype.size_bytes();
+            let gate_proj_bytes = shared_inter * hidden * elem;
+            let total = 2 * gate_proj_bytes;
+            let ptr = unsafe { driver::mem_alloc(total)? };
+            unsafe {
+                weights.take_into(&gate_name, ptr, stream)?;
+                weights.take_into(&up_name, ptr.add(gate_proj_bytes), stream)?;
+            }
+            let w = unsafe { GpuTensor::new(ptr, &[2 * shared_inter, hidden], dtype) };
+            Linear::new(w, None)
+        };
+
+        let shared_down = Linear::load(weights, &format!("{prefix}.shared_experts.down_proj"))?;
+
+        Ok(DeepSeekV2Fp8MoE {
+            moe: fp8_moe,
+            shared_gate_up,
+            shared_down,
+            shared_intermediate_size: shared_inter,
             routed_scaling_factor: config.routed_scaling_factor,
         })
     }
@@ -1256,11 +1376,16 @@ impl DeepSeekV2ForCausalLM {
     pub fn set_tp_group(&mut self, group: Arc<NcclGroup>) {
         for layer in &mut self.model.layers {
             layer.self_attn.tp_group = Some(Arc::clone(&group));
-            if let DeepSeekV2Mlp::MoE(ref mut moe) = layer.mlp {
-                moe.moe.tp_group = Some(Arc::clone(&group));
-            }
-            if let DeepSeekV2Mlp::Dense(ref mut mlp) = layer.mlp {
-                mlp.tp_group = Some(Arc::clone(&group));
+            match &mut layer.mlp {
+                DeepSeekV2Mlp::MoE(ref mut moe) => {
+                    moe.moe.tp_group = Some(Arc::clone(&group));
+                }
+                DeepSeekV2Mlp::Dense(ref mut mlp) => {
+                    mlp.tp_group = Some(Arc::clone(&group));
+                }
+                DeepSeekV2Mlp::Fp8MoE(ref mut moe) => {
+                    moe.moe.tp_group = Some(Arc::clone(&group));
+                }
             }
         }
     }

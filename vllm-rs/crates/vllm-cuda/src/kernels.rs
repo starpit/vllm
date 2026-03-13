@@ -559,6 +559,46 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Fused MoE GEMM — FP8 E4M3 (SM89+ true FP8 tensor cores)
+    // TODO: fix PTX fragment layout bug (currently produces 0.5x output)
+    #[allow(dead_code)]
+    fn fused_moe_fp8_gemm_sm89(
+        output: *mut c_void,
+        input: *const c_void,
+        weights: *const c_void,
+        a_scales: *const f32,
+        w_scales: *const f32,
+        topk_weights: *const f32,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        num_tokens_post_padded: *const i32,
+        num_valid_tokens: c_int,
+        in_features: c_int,
+        out_features: c_int,
+        top_k: c_int,
+        apply_weights: c_int,
+        stream: CUstream,
+    );
+
+    // Fused MoE GEMM — FP8 E4M3 (SM80+ dequant fallback)
+    fn fused_moe_fp8_gemm_dequant(
+        output: *mut c_void,
+        input: *const c_void,
+        weights: *const c_void,
+        a_scales: *const f32,
+        w_scales: *const f32,
+        topk_weights: *const f32,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        num_tokens_post_padded: *const i32,
+        num_valid_tokens: c_int,
+        in_features: c_int,
+        out_features: c_int,
+        top_k: c_int,
+        apply_weights: c_int,
+        stream: CUstream,
+    );
+
     // Fused sigmoid_mul_add: out = a + sigmoid(gate) * b
     fn sigmoid_mul_add_bf16(
         out: *mut c_void,
@@ -4346,6 +4386,72 @@ pub unsafe fn fused_moe_gemm(
         ),
         _ => panic!("fused_moe_gemm: unsupported dtype {:?}", input.dtype()),
     }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// FP8 Fused MoE GEMM
+// ---------------------------------------------------------------------------
+
+/// FP8 E4M3 fused MoE GEMM with per-token/expert scale application.
+///
+/// * `input`: `[num_tokens, in_features]` — FP8 E4M3 hidden states (already quantized)
+/// * `weights`: `[num_experts, out_features, in_features]` — FP8 E4M3 stacked expert weights
+/// * `a_scales`: `[num_tokens]` — f32 per-token activation scales
+/// * `w_scales`: `[num_experts]` — f32 per-expert weight scales
+/// * `topk_weights`: `[num_tokens, top_k]` (F32) — routing weights
+/// * `sorted_token_ids`, `expert_ids`, `num_tokens_post_padded`: from `moe_align_block_size`
+/// * `apply_weights`: if true, multiply output by routing weight
+/// * `sm_version`: GPU SM version (e.g. 89 for L40S). >= 89 uses FP8 tensor cores.
+///
+/// Returns `[num_tokens * top_k, out_features]` BF16.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn fused_moe_fp8_gemm(
+    input: GpuTensor,    // FP8 E4M3
+    weights: GpuTensor,  // FP8 E4M3
+    a_scales: GpuTensor, // f32
+    w_scales: GpuTensor, // f32
+    topk_weights: GpuTensor,
+    sorted_token_ids: GpuTensor,
+    expert_ids: GpuTensor,
+    num_tokens_post_padded: GpuTensor,
+    num_tokens: usize,
+    top_k: usize,
+    _block_size: usize,
+    apply_weights: bool,
+    sm_version: u32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let in_features = input.dim(1);
+    let out_features = weights.dim(1);
+
+    let out = alloc.alloc_tensor(&[num_tokens * top_k, out_features], DType::BF16);
+
+    // Use dequant path for all SM versions.
+    // SM89+ PTX FP8 tensor core path has a fragment layout bug (0.5x output);
+    // dequant path gives correct results and still gets 2x bandwidth from FP8 storage.
+    // TODO: fix SM89 PTX path for additional compute throughput.
+    let _ = sm_version;
+    let ffi_fn = fused_moe_fp8_gemm_dequant;
+
+    ffi_fn(
+        out.as_mut_ptr() as *mut c_void,
+        input.as_ptr() as *const c_void,
+        weights.as_ptr() as *const c_void,
+        a_scales.as_ptr() as *const f32,
+        w_scales.as_ptr() as *const f32,
+        topk_weights.as_ptr() as *const f32,
+        sorted_token_ids.as_ptr() as *const i32,
+        expert_ids.as_ptr() as *const i32,
+        num_tokens_post_padded.as_ptr() as *const i32,
+        num_tokens as c_int,
+        in_features as c_int,
+        out_features as c_int,
+        top_k as c_int,
+        apply_weights as c_int,
+        stream,
+    );
     out
 }
 
@@ -8151,6 +8257,450 @@ mod tests_fp8_quant {
             }
 
             driver::mem_free(scale_ptr).unwrap();
+            driver::stream_destroy(stream).expect("destroy");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP8 Fused MoE GEMM tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod tests_fp8_moe_gemm {
+    use super::*;
+    use crate::driver;
+
+    unsafe fn test_init() -> (CachingAllocator, cudarc::driver::sys::CUstream, u32) {
+        driver::init().expect("CUDA init");
+        let dev = driver::device_get(0).expect("device 0");
+        let _ctx = driver::ctx_create(dev).expect("ctx_create");
+        let stream = driver::stream_create().expect("stream_create");
+        let sm = driver::device_get_sm_version(dev).expect("sm version");
+        (CachingAllocator::new(), stream, sm)
+    }
+
+    unsafe fn upload_slice<T: Copy>(data: &[T], stream: cudarc::driver::sys::CUstream) -> *mut u8 {
+        let bytes = data.len() * std::mem::size_of::<T>();
+        let ptr = driver::mem_alloc(bytes).expect("alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("h2d");
+        driver::stream_synchronize(stream).expect("sync");
+        ptr
+    }
+
+    unsafe fn download_bf16(
+        tensor: GpuTensor,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Vec<half::bf16> {
+        let count = tensor.numel();
+        let bytes = count * 2;
+        let mut host = vec![half::bf16::ZERO; count];
+        driver::memcpy_dtoh_async(host.as_mut_ptr() as *mut u8, tensor.as_ptr(), bytes, stream)
+            .expect("d2h");
+        driver::stream_synchronize(stream).expect("sync");
+        host
+    }
+
+    unsafe fn download_f32(tensor: GpuTensor, stream: cudarc::driver::sys::CUstream) -> Vec<f32> {
+        let count = tensor.numel();
+        let bytes = count * 4;
+        let mut host = vec![0.0f32; count];
+        driver::memcpy_dtoh_async(host.as_mut_ptr() as *mut u8, tensor.as_ptr(), bytes, stream)
+            .expect("d2h");
+        driver::stream_synchronize(stream).expect("sync");
+        host
+    }
+
+    /// Test FP8 dequant fallback path (SM80) — same setup as basic test.
+    #[test]
+    #[ignore]
+    fn test_cuda_fused_moe_fp8_gemm_dequant() {
+        unsafe {
+            let (mut alloc, stream, _sm) = test_init();
+
+            let num_tokens: usize = 4;
+            let top_k: usize = 1;
+            let num_experts: usize = 2;
+            let k: usize = 128;
+            let n: usize = 64;
+            let block_size: usize = 128;
+
+            let fp8_one: u8 = 0x38; // 1.0 in FP8 E4M3
+            let fp8_half: u8 = 0x30; // 0.5 in FP8 E4M3
+
+            let input_ptr = upload_slice(&vec![fp8_one; num_tokens * k], stream);
+            let input = GpuTensor::new(input_ptr, &[num_tokens, k], DType::Fp8E4m3);
+
+            let weight_ptr = upload_slice(&vec![fp8_half; num_experts * n * k], stream);
+            let weights = GpuTensor::new(weight_ptr, &[num_experts, n, k], DType::Fp8E4m3);
+
+            let a_scales_ptr = upload_slice(&vec![1.0f32; num_tokens], stream);
+            let a_scales = GpuTensor::new(a_scales_ptr, &[num_tokens], DType::F32);
+            let w_scales_ptr = upload_slice(&vec![1.0f32; num_experts], stream);
+            let w_scales = GpuTensor::new(w_scales_ptr, &[num_experts], DType::F32);
+            let topk_weights_ptr = upload_slice(&vec![1.0f32; num_tokens * top_k], stream);
+            let topk_weights = GpuTensor::new(topk_weights_ptr, &[num_tokens, top_k], DType::F32);
+
+            let topk_ids_ptr = upload_slice(&vec![0i32, 0, 1, 1], stream);
+            let topk_ids = GpuTensor::new(topk_ids_ptr, &[num_tokens, top_k], DType::I32);
+
+            let (sorted, experts, ntpp) =
+                moe_align_block_size(topk_ids, num_experts, block_size, &mut alloc, stream);
+
+            // Force dequant path by passing sm_version=80
+            let output = fused_moe_fp8_gemm(
+                input,
+                weights,
+                a_scales,
+                w_scales,
+                topk_weights,
+                sorted.as_gpu_tensor(),
+                experts.as_gpu_tensor(),
+                ntpp.as_gpu_tensor(),
+                num_tokens,
+                top_k,
+                block_size,
+                false,
+                80,
+                &mut alloc,
+                stream,
+            );
+
+            let result = download_bf16(output.as_gpu_tensor(), stream);
+            let expected = 64.0f32; // 1.0 * 0.5 * 128 = 64.0
+            for (i, &val) in result.iter().enumerate() {
+                let v = val.to_f32();
+                assert!(
+                    (v - expected).abs() < 2.0,
+                    "dequant element {i}: got {v}, expected {expected}"
+                );
+            }
+
+            driver::stream_destroy(stream).expect("destroy");
+        }
+    }
+
+    /// Test FP8 fused MoE GEMM kernel.
+    ///
+    /// Setup: 4 tokens, 2 experts, top_k=1, K=128, N=128.
+    /// All input values = 1.0 (FP8), all weight values = 0.5 (FP8).
+    /// a_scales = 1.0, w_scales = 1.0 (identity).
+    /// Expected output = 1.0 * 0.5 * 128 = 64.0 per element.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_fused_moe_fp8_gemm_basic() {
+        unsafe {
+            let (mut alloc, stream, sm) = test_init();
+
+            let num_tokens: usize = 4;
+            let top_k: usize = 1;
+            let num_experts: usize = 2;
+            let k: usize = 128;
+            let n: usize = 128;
+            let block_size: usize = 128;
+
+            // FP8 E4M3 encoding: 0.5 = 0x38, 0.25 = 0x30
+            let fp8_one: u8 = 0x38; // 1.0 in FP8 E4M3
+            let fp8_half: u8 = 0x30; // 0.5 in FP8 E4M3
+
+            // Input: [num_tokens, K] FP8
+            let input_data = vec![fp8_one; num_tokens * k];
+            let input_ptr = upload_slice(&input_data, stream);
+            let input = GpuTensor::new(input_ptr, &[num_tokens, k], DType::Fp8E4m3);
+
+            // Weights: [num_experts, N, K] FP8
+            let weight_data = vec![fp8_half; num_experts * n * k];
+            let weight_ptr = upload_slice(&weight_data, stream);
+            let weights = GpuTensor::new(weight_ptr, &[num_experts, n, k], DType::Fp8E4m3);
+
+            // a_scales: [num_tokens] = 1.0
+            let a_scales_data = vec![1.0f32; num_tokens];
+            let a_scales_ptr = upload_slice(&a_scales_data, stream);
+            let a_scales = GpuTensor::new(a_scales_ptr, &[num_tokens], DType::F32);
+
+            // w_scales: [num_experts] = 1.0
+            let w_scales_data = vec![1.0f32; num_experts];
+            let w_scales_ptr = upload_slice(&w_scales_data, stream);
+            let w_scales = GpuTensor::new(w_scales_ptr, &[num_experts], DType::F32);
+
+            // topk_weights: [num_tokens, top_k] = 1.0
+            let topk_weights_data = vec![1.0f32; num_tokens * top_k];
+            let topk_weights_ptr = upload_slice(&topk_weights_data, stream);
+            let topk_weights = GpuTensor::new(topk_weights_ptr, &[num_tokens, top_k], DType::F32);
+
+            // topk_ids: tokens 0,1 → expert 0; tokens 2,3 → expert 1
+            let topk_ids_data: Vec<i32> = vec![0, 0, 1, 1];
+            let topk_ids_ptr = upload_slice(&topk_ids_data, stream);
+            let topk_ids = GpuTensor::new(topk_ids_ptr, &[num_tokens, top_k], DType::I32);
+
+            // moe_align_block_size
+            let (sorted_token_ids, expert_ids, num_tokens_post_padded) =
+                moe_align_block_size(topk_ids, num_experts, block_size, &mut alloc, stream);
+
+            // Run FP8 GEMM
+            let output = fused_moe_fp8_gemm(
+                input,
+                weights,
+                a_scales,
+                w_scales,
+                topk_weights,
+                sorted_token_ids.as_gpu_tensor(),
+                expert_ids.as_gpu_tensor(),
+                num_tokens_post_padded.as_gpu_tensor(),
+                num_tokens,
+                top_k,
+                block_size,
+                false, // don't apply routing weights
+                sm,
+                &mut alloc,
+                stream,
+            );
+
+            assert_eq!(
+                output.as_gpu_tensor().shape(),
+                &[(num_tokens * top_k) as u32, n as u32]
+            );
+            assert_eq!(output.as_gpu_tensor().dtype(), DType::BF16);
+
+            let result = download_bf16(output.as_gpu_tensor(), stream);
+
+            // Expected: 1.0 * 0.5 * 128 = 64.0
+            let expected = 64.0f32;
+            for (i, &val) in result.iter().enumerate() {
+                let v = val.to_f32();
+                assert!(
+                    (v - expected).abs() < 2.0,
+                    "element {i}: got {v}, expected {expected}"
+                );
+            }
+
+            driver::stream_destroy(stream).expect("destroy");
+        }
+    }
+
+    /// Test FP8 MoE GEMM with scale application.
+    /// a_scale=2.0, w_scale=3.0 → output should be 6x the identity-scale result.
+    #[test]
+    #[ignore]
+    fn test_cuda_fused_moe_fp8_gemm_scales() {
+        unsafe {
+            let (mut alloc, stream, sm) = test_init();
+
+            let num_tokens: usize = 2;
+            let top_k: usize = 1;
+            let num_experts: usize = 1;
+            let k: usize = 128;
+            let n: usize = 64;
+            let block_size: usize = 128;
+
+            let fp8_one: u8 = 0x38; // 1.0 in FP8 E4M3
+            let fp8_half: u8 = 0x30; // 0.5 in FP8 E4M3
+
+            let input_ptr = upload_slice(&vec![fp8_one; num_tokens * k], stream);
+            let input = GpuTensor::new(input_ptr, &[num_tokens, k], DType::Fp8E4m3);
+
+            let weight_ptr = upload_slice(&vec![fp8_half; num_experts * n * k], stream);
+            let weights = GpuTensor::new(weight_ptr, &[num_experts, n, k], DType::Fp8E4m3);
+
+            // a_scale = 2.0 per token, w_scale = 3.0 per expert
+            let a_scales_ptr = upload_slice(&vec![2.0f32; num_tokens], stream);
+            let a_scales = GpuTensor::new(a_scales_ptr, &[num_tokens], DType::F32);
+
+            let w_scales_ptr = upload_slice(&vec![3.0f32; num_experts], stream);
+            let w_scales = GpuTensor::new(w_scales_ptr, &[num_experts], DType::F32);
+
+            let topk_weights_ptr = upload_slice(&vec![1.0f32; num_tokens * top_k], stream);
+            let topk_weights = GpuTensor::new(topk_weights_ptr, &[num_tokens, top_k], DType::F32);
+
+            let topk_ids_ptr = upload_slice(&vec![0i32; num_tokens], stream);
+            let topk_ids = GpuTensor::new(topk_ids_ptr, &[num_tokens, top_k], DType::I32);
+
+            let (sorted, experts, ntpp) =
+                moe_align_block_size(topk_ids, num_experts, block_size, &mut alloc, stream);
+
+            let output = fused_moe_fp8_gemm(
+                input,
+                weights,
+                a_scales,
+                w_scales,
+                topk_weights,
+                sorted.as_gpu_tensor(),
+                experts.as_gpu_tensor(),
+                ntpp.as_gpu_tensor(),
+                num_tokens,
+                top_k,
+                block_size,
+                false,
+                sm,
+                &mut alloc,
+                stream,
+            );
+
+            let result = download_bf16(output.as_gpu_tensor(), stream);
+
+            // Base = 1.0 * 0.5 * 128 = 64.0, scaled = 64.0 * 2.0 * 3.0 = 384.0
+            let expected = 384.0f32;
+            for (i, &val) in result.iter().enumerate() {
+                let v = val.to_f32();
+                assert!(
+                    (v - expected).abs() < 4.0,
+                    "element {i}: got {v}, expected {expected}"
+                );
+            }
+
+            driver::stream_destroy(stream).expect("destroy");
+        }
+    }
+
+    /// Test full FP8 MoE pipeline: quant → align → gemm1 → silu_and_mul → quant → gemm2 → sum.
+    /// Uses random-ish BF16 input, quantizes to FP8, runs through the full pipeline.
+    /// Checks that the output has the right shape and non-zero values.
+    #[test]
+    #[ignore]
+    fn test_cuda_fused_moe_fp8_pipeline() {
+        unsafe {
+            let (mut alloc, stream, sm) = test_init();
+
+            let num_tokens: usize = 4;
+            let top_k: usize = 2;
+            let num_experts: usize = 4;
+            let hidden: usize = 128;
+            let inter: usize = 64;
+            let block_size: usize = 128;
+
+            // BF16 input: small positive values
+            let input_bf16: Vec<u16> = (0..num_tokens * hidden)
+                .map(|i| half::bf16::from_f32(0.01 * ((i % 100) as f32 + 1.0)).to_bits())
+                .collect();
+            let input_ptr = upload_slice(&input_bf16, stream);
+            let input = GpuTensor::new(input_ptr, &[num_tokens, hidden], DType::BF16);
+
+            // FP8 expert weights: small values
+            let fp8_val: u8 = 0x20; // ~0.0625 in FP8 E4M3
+            let w1_data = vec![fp8_val; num_experts * 2 * inter * hidden];
+            let w1_ptr = upload_slice(&w1_data, stream);
+            let w1 = GpuTensor::new(w1_ptr, &[num_experts, 2 * inter, hidden], DType::Fp8E4m3);
+
+            let w2_data = vec![fp8_val; num_experts * hidden * inter];
+            let w2_ptr = upload_slice(&w2_data, stream);
+            let w2 = GpuTensor::new(w2_ptr, &[num_experts, hidden, inter], DType::Fp8E4m3);
+
+            // Scales = 1.0
+            let w1_scale_ptr = upload_slice(&vec![1.0f32; num_experts], stream);
+            let w1_scale = GpuTensor::new(w1_scale_ptr, &[num_experts], DType::F32);
+            let w2_scale_ptr = upload_slice(&vec![1.0f32; num_experts], stream);
+            let w2_scale = GpuTensor::new(w2_scale_ptr, &[num_experts], DType::F32);
+
+            // Gate output: [num_tokens, num_experts] — BF16, make expert 0 and 1 highest
+            let mut gate_data = vec![half::bf16::from_f32(0.1).to_bits(); num_tokens * num_experts];
+            for t in 0..num_tokens {
+                gate_data[t * num_experts] = half::bf16::from_f32(2.0).to_bits();
+                gate_data[t * num_experts + 1] = half::bf16::from_f32(1.5).to_bits();
+            }
+            let gate_ptr = upload_slice(&gate_data, stream);
+            let gate_output = GpuTensor::new(gate_ptr, &[num_tokens, num_experts], DType::BF16);
+
+            // Step 1: topk_softmax
+            let (topk_weights, topk_ids) =
+                topk_softmax(gate_output, top_k, true, &mut alloc, stream);
+
+            // Step 2: scaled_fp8_quant_dynamic
+            let (fp8_input, a1_scales) = scaled_fp8_quant_dynamic(input, &mut alloc, stream);
+
+            // Step 3: moe_align_block_size
+            let (sorted, experts, ntpp) = moe_align_block_size(
+                topk_ids.as_gpu_tensor(),
+                num_experts,
+                block_size,
+                &mut alloc,
+                stream,
+            );
+
+            // Step 4: GEMM 1 (no routing weights)
+            let intermediate = fused_moe_fp8_gemm(
+                fp8_input.as_gpu_tensor(),
+                w1,
+                a1_scales.as_gpu_tensor(),
+                w1_scale,
+                topk_weights.as_gpu_tensor(),
+                sorted.as_gpu_tensor(),
+                experts.as_gpu_tensor(),
+                ntpp.as_gpu_tensor(),
+                num_tokens,
+                top_k,
+                block_size,
+                false,
+                sm,
+                &mut alloc,
+                stream,
+            );
+            drop(fp8_input);
+            drop(a1_scales);
+
+            // Step 5: silu_and_mul
+            let activated =
+                silu_and_mul_fused(intermediate.as_gpu_tensor(), inter, &mut alloc, stream);
+            drop(intermediate);
+
+            // Step 6: quant activated
+            let (fp8_act, a2_scales) =
+                scaled_fp8_quant_dynamic(activated.as_gpu_tensor(), &mut alloc, stream);
+            drop(activated);
+
+            // Step 7: GEMM 2 (with routing weights, top_k=1 for moe_sum compat)
+            // Re-align for the activated tensor shape
+            let (sorted2, experts2, ntpp2) = moe_align_block_size(
+                topk_ids.as_gpu_tensor(),
+                num_experts,
+                block_size,
+                &mut alloc,
+                stream,
+            );
+
+            let output2 = fused_moe_fp8_gemm(
+                fp8_act.as_gpu_tensor(),
+                w2,
+                a2_scales.as_gpu_tensor(),
+                w2_scale,
+                topk_weights.as_gpu_tensor(),
+                sorted2.as_gpu_tensor(),
+                experts2.as_gpu_tensor(),
+                ntpp2.as_gpu_tensor(),
+                num_tokens,
+                top_k,
+                block_size,
+                true, // apply routing weights
+                sm,
+                &mut alloc,
+                stream,
+            );
+            drop(fp8_act);
+            drop(a2_scales);
+
+            // Step 8: moe_sum
+            let final_out = moe_sum(
+                output2.as_gpu_tensor(),
+                num_tokens,
+                hidden,
+                top_k,
+                &mut alloc,
+                stream,
+            );
+
+            assert_eq!(
+                final_out.as_gpu_tensor().shape(),
+                &[num_tokens as u32, hidden as u32]
+            );
+            assert_eq!(final_out.as_gpu_tensor().dtype(), DType::BF16);
+
+            let result = download_bf16(final_out.as_gpu_tensor(), stream);
+            // Just check non-NaN and finite
+            for (i, &val) in result.iter().enumerate() {
+                let v = val.to_f32();
+                assert!(v.is_finite(), "element {i} is not finite: {v}");
+            }
+
             driver::stream_destroy(stream).expect("destroy");
         }
     }

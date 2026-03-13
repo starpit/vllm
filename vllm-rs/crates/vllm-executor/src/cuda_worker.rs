@@ -1596,6 +1596,7 @@ pub struct CudaWorker {
     pp_recv_res_buf: Option<vllm_cuda::GpuTensor>,
     /// Whether a PP send from the previous iteration is pending.
     /// Sync at start of next execute_model to ensure send completed.
+    #[allow(dead_code)]
     pp_send_pending: bool,
 }
 
@@ -4882,10 +4883,10 @@ impl CudaWorker {
         let cached = &scheduler_output.scheduled_cached_reqs;
         if !cached.new_token_ids.is_empty() {
             for (i, req_id) in cached.req_ids.iter().enumerate() {
-                if let Some(tokens) = cached.new_token_ids.get(i) {
-                    if let Some(&last_token) = tokens.last() {
-                        self.input_batch.set_last_token(req_id, last_token);
-                    }
+                if let Some(tokens) = cached.new_token_ids.get(i)
+                    && let Some(&last_token) = tokens.last()
+                {
+                    self.input_batch.set_last_token(req_id, last_token);
                 }
             }
         }

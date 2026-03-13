@@ -18,7 +18,7 @@ use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Linear, RmsNorm};
-use crate::layers_moe::{FusedMoELayer, MarlinFusedMoELayer};
+use crate::layers_moe::{Fp8FusedMoELayer, FusedMoELayer, MarlinFusedMoELayer};
 use crate::model::llama::{LlamaAttention, LlamaConfig, RotaryCache, TpConfig};
 #[cfg(feature = "nccl")]
 use crate::nccl::NcclGroup;
@@ -77,6 +77,7 @@ impl MixtralConfig {
 enum MixtralMoE {
     Dense(FusedMoELayer),
     Quantized(MarlinFusedMoELayer),
+    Fp8(Fp8FusedMoELayer),
 }
 
 impl MixtralMoE {
@@ -88,6 +89,7 @@ impl MixtralMoE {
         match self {
             Self::Dense(moe) => moe.forward_owned(hidden_states, device),
             Self::Quantized(moe) => moe.forward_owned(hidden_states, device),
+            Self::Fp8(moe) => moe.forward_owned(hidden_states, device),
         }
     }
 }
@@ -253,7 +255,8 @@ impl MixtralDecoderLayer {
     }
 
     /// Load an FP8 decoder layer.
-    /// Note: Only attention layers are FP8-quantized. MoE expert weights stay dense.
+    /// Detects FP8 expert weights and constructs Fp8FusedMoELayer if present,
+    /// otherwise falls back to dense BF16 MoE.
     pub fn load_fp8(
         weights: &mut GpuWeights,
         prefix: &str,
@@ -272,13 +275,33 @@ impl MixtralDecoderLayer {
             stream,
         )?;
 
-        let moe = Self::load_moe(
-            weights,
-            &format!("{prefix}.block_sparse_moe"),
-            config,
-            None,
-            stream,
-        )?;
+        let moe_prefix = format!("{prefix}.block_sparse_moe");
+
+        // Detect FP8 expert weights.
+        let first_w1_name = format!("{moe_prefix}.experts.0.w1.weight");
+        let is_fp8 = weights
+            .tensor_info(&first_w1_name)
+            .map(|(_, dt)| dt == DType::Fp8E4m3)
+            .unwrap_or(false);
+
+        let block_sparse_moe = if is_fp8 {
+            let fp8_moe = gpu_weights::load_fp8_moe_experts(
+                weights,
+                &moe_prefix,
+                config.num_local_experts,
+                config.intermediate_size,
+                config.hidden_size,
+                config.num_experts_per_tok,
+                false, // Mixtral does NOT renormalize
+                "w1",
+                "w3",
+                "w2",
+            )?;
+            MixtralMoE::Fp8(fp8_moe)
+        } else {
+            let moe = Self::load_moe(weights, &moe_prefix, config, None, stream)?;
+            MixtralMoE::Dense(moe)
+        };
 
         let input_layernorm = RmsNorm::load(
             weights,
@@ -293,7 +316,7 @@ impl MixtralDecoderLayer {
 
         Ok(Self {
             self_attn,
-            block_sparse_moe: MixtralMoE::Dense(moe),
+            block_sparse_moe,
             input_layernorm,
             post_attention_layernorm,
         })
@@ -856,6 +879,9 @@ impl MixtralForCausalLM {
                     moe.tp_group = Some(Arc::clone(&group));
                 }
                 MixtralMoE::Quantized(moe) => {
+                    moe.tp_group = Some(Arc::clone(&group));
+                }
+                MixtralMoE::Fp8(moe) => {
                     moe.tp_group = Some(Arc::clone(&group));
                 }
             }

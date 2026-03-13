@@ -103,6 +103,10 @@ impl TestModels {
     pub const QWEN2_0_5B_FP8: &str = "RedHatAI/Qwen2.5-0.5B-FP8-dynamic";
     pub const LLAMA_3_1_8B_FP8: &str = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8";
 
+    // FP8 MoE models (CUDA-backend, SM89+)
+    // 2-layer Mixtral 8x7B FP8 (~3GB) — small enough for single L40S
+    pub const MIXTRAL_8X7B_FP8_2L: &str = "fxmarty/Mixtral-8x7B-Instruct-v0.1-FP8-KV-2-layers";
+
     // Multimodal (vision-language) models
     // Tier 3: ~2.8 GB — nightly only (QAT = quantization-aware training)
     pub const GEMMA3_4B_IT_QAT_3BIT: &str = "mlx-community/gemma-3-4b-it-qat-3bit";

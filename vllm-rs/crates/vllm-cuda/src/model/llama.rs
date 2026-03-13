@@ -2770,7 +2770,7 @@ impl LlamaModel {
             };
 
         // Run this stage's layers.
-        for (layer_i, layer) in self.layers.iter().enumerate() {
+        for layer in self.layers.iter() {
             let (hs, res) = layer.forward_owned(
                 hidden_states,
                 residual,

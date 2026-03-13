@@ -103,15 +103,33 @@ fn main() {
     )
     .unwrap();
 
-    // --- Bench data CSVs ---
-    let bench_json = format!(
-        r#"{{"latency_python":{},"latency_rust":{},"throughput_python":{},"throughput_rust":{},"serve_rust":{},"serve_rust_14b":{}}}"#,
-        load_csv_as_json(&bench_dir.join("latency_python.csv")),
-        load_csv_as_json(&bench_dir.join("latency_rust.csv")),
-        load_csv_as_json(&bench_dir.join("throughput_python.csv")),
-        load_csv_as_json(&bench_dir.join("throughput_rust.csv")),
-        load_csv_as_json(&bench_dir.join("serve_rust.csv")),
-        load_csv_as_json(&bench_dir.join("serve_rust_14b.csv")),
-    );
+    // --- Bench data CSVs (per-model directory structure) ---
+    // bench_data/cuda/L40s/{latency,throughput,serve}/ModelName.csv
+    // Each CSV has an `engine` column ("python" or "rust"); rows from both are combined.
+    let l40s_dir = bench_dir.join("cuda").join("L40s");
+    println!("cargo:rerun-if-changed={}", l40s_dir.display());
+
+    let mut bench_obj = serde_json::Map::new();
+    for btype in &["latency", "throughput", "serve"] {
+        let type_dir = l40s_dir.join(btype);
+        let mut type_obj = serde_json::Map::new();
+        if let Ok(rd) = fs::read_dir(&type_dir) {
+            let mut paths: Vec<_> = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().map_or(false, |e| e == "csv"))
+                .collect();
+            paths.sort();
+            for path in paths {
+                println!("cargo:rerun-if-changed={}", path.display());
+                let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+                let json_str = load_csv_as_json(&path);
+                let json_val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+                type_obj.insert(stem, json_val);
+            }
+        }
+        bench_obj.insert(btype.to_string(), serde_json::Value::Object(type_obj));
+    }
+    let bench_json = serde_json::to_string(&serde_json::Value::Object(bench_obj)).unwrap();
     fs::write(Path::new(&out_dir).join("bench_data.json"), bench_json).unwrap();
 }

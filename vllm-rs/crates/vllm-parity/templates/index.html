@@ -270,7 +270,6 @@ h2 a:hover { color: var(--accent); text-decoration: none; }
   font-size: 0.75rem;
   font-weight: 500;
   padding: 0.3rem 0.75rem;
-  white-space: nowrap;
   cursor: pointer;
 }
 .summary-grid-table .sg-done { text-align: center; width: 2rem; padding: 0.3rem 0; }
@@ -472,7 +471,7 @@ td.notes-col { font-size: 0.8rem; color: var(--text-dim); max-width: 350px; }
 /* Twin tables layout */
 .twin-tables {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 2.5fr 7fr;
   gap: 1.5rem;
   align-items: start;
   margin-bottom: 3rem;
@@ -567,7 +566,7 @@ td.notes-col { font-size: 0.8rem; color: var(--text-dim); max-width: 350px; }
   .overall-bar { flex-direction: column; text-align: center; }
   .overall-stats { justify-content: center; }
   .card-grid { grid-template-columns: 1fr; }
-  .twin-tables { grid-template-columns: 1fr; }
+  .twin-tables { grid-template-columns: 1fr 1fr; }
   .hero-cards { grid-template-columns: 1fr; }
   .heatmap-row { flex-direction: column; }
 }
@@ -587,7 +586,7 @@ td.notes-col { font-size: 0.8rem; color: var(--text-dim); max-width: 350px; }
   <div class="hero-content">
     <h1>vllm-rs</h1>
     <p class="subtitle">High-performance LLM inference, rewritten in Rust. Memory-safe, single-binary, zero Python runtime.</p>
-    <div class="hero-cards">
+<!--    <div class="hero-cards">
       <div class="card">
         <div class="card-icon" style="background:rgba(89,146,198,0.15);color:var(--accent)">&#9889;</div>
         <h3>Fast Startup</h3>
@@ -603,26 +602,26 @@ td.notes-col { font-size: 0.8rem; color: var(--text-dim); max-width: 350px; }
         <h3>Single Binary</h3>
         <p>One statically-linked executable. No virtualenvs, no pip, no dependency hell. Just <code>./vllm serve</code>.</p>
       </div>
-    </div>
+    </div>-->
   </div>
 </div>
 
 <div class="container">
 
   <div class="section-title"><h2><a href="#/parity">Parity with Python vLLM</a></h2><span class="line"></span></div>
-  <div id="overall-summary"></div>
   <div class="twin-tables">
     <div class="twin-col">
+  <div id="overall-summary"></div>
       <div id="summary-grid"></div>
     </div>
     <div class="twin-col">
       <div class="perf-legend">
         <div class="perf-legend-bar">
           <span>Rust slower</span>
-          <div class="perf-legend-gradient" style="background:linear-gradient(to right, #8c510a, #dfc27d, #f5f5f5, #80cdc1, #01665e)"></div>
+          <div class="perf-legend-gradient" style="background:linear-gradient(to right, #d73027, #dfc27d, #f5f5f5, #80cdc1, #1a9850)"></div>
           <span>Rust faster</span>
         </div>
-        <span style="color:var(--text-dim)">L40S GPU &middot; Qwen2.5 &middot; bs=</span>
+        <span style="color:var(--text-dim)">L40S GPU &middot; latency &amp; throughput &middot; bs=</span>
         <div class="bs-selector" id="bs-selector">
           <button class="active" data-bs="16">16</button>
           <button data-bs="32">32</button>
@@ -895,11 +894,29 @@ function highlightSection(name) {
 // ---- Performance heatmaps (SVG) ----
 
 // BrBG 9-stop diverging: brown (Rust slower) -> white -> teal (Rust faster)
-const BRBG = ['#8c510a','#bf812d','#dfc27d','#f6e8c3','#f5f5f5','#c7eae5','#80cdc1','#35978f','#01665e'];
+    //const BRBG = ['#8c510a','#bf812d','#dfc27d','#f6e8c3','#f5f5f5','#c7eae5','#80cdc1','#35978f','#01665e'];
+    const BRBG = ['#d73027',
+'#f46d43',
+'#fdae61',
+'#fee08b',
+'#ffffbf',
+'#d9ef8b',
+'#a6d96a',
+'#66bd63',
+'#1a9850'];
 // Sequential blue for absolute serve metrics
 const SEQ = ['#1e1e2e','#2d4a7a','#3b7dd8','#64b5f6','#e1f5fe'];
 
-function shortModel(name) { return name.split('/').pop(); }
+// "Qwen_Qwen2.5-3B-Instruct" -> "Qwen2.5-3B-Instruct"
+function modelLabel(key) {
+  const i = key.indexOf('_');
+  return i >= 0 ? key.slice(i + 1) : key;
+}
+
+function modelSortKey(key) {
+  const m = key.match(/(\d+)B/i);
+  return m ? parseInt(m[1]) : 0;
+}
 
 function parseHex(hex) {
   return [parseInt(hex.slice(1,3),16), parseInt(hex.slice(3,5),16), parseInt(hex.slice(5,7),16)];
@@ -924,71 +941,41 @@ function textColor(bgHex) {
   return (r*0.299 + g*0.587 + b*0.114) > 150 ? '#111' : '#fff';
 }
 
-function buildDeltaGrids(pyRows, rsRows, field, blockSize) {
+// Build a Δ% grid from a combined rows array (both engines), filtered by block_size.
+function buildDeltaGrid(rows, field, blockSize) {
   const pyIdx = {}, rsIdx = {};
-  for (const r of pyRows) {
-    const m = shortModel(r.model);
-    if (String(r.block_size) !== String(blockSize)) continue;
-    if (!pyIdx[m]) pyIdx[m] = {};
-    pyIdx[m][`${r.input_len},${r.output_len}`] = r[field];
+  for (const r of rows) {
+    if (blockSize !== null && String(r.block_size) !== String(blockSize)) continue;
+    const key = `${r.input_len},${r.output_len}`;
+    const v = typeof r[field] === 'number' ? r[field] : null;
+    if (r.engine === 'python' && v !== null) pyIdx[key] = v;
+    else if (r.engine === 'rust' && v !== null) rsIdx[key] = v;
   }
-  for (const r of rsRows) {
-    const m = shortModel(r.model);
-    if (String(r.block_size) !== String(blockSize)) continue;
-    if (!rsIdx[m]) rsIdx[m] = {};
-    rsIdx[m][`${r.input_len},${r.output_len}`] = r[field];
-  }
-  const result = [];
-  for (const model of Object.keys(rsIdx).sort()) {
-    const py = pyIdx[model] || {};
-    const rs = rsIdx[model];
-    const allKeys = new Set([...Object.keys(py), ...Object.keys(rs)]);
-    const ils = [...new Set([...allKeys].map(k => +k.split(',')[0]))].sort((a,b) => a-b);
-    const ols = [...new Set([...allKeys].map(k => +k.split(',')[1]))].sort((a,b) => a-b);
-    const grid = [];
-    for (const il of ils) {
-      const row = [];
-      for (const ol of ols) {
-        const key = `${il},${ol}`;
-        const pv = py[key], rv = rs[key];
-        if (pv !== undefined && rv !== undefined && pv !== 0) {
-          row.push(+((rv - pv) / pv * 100).toFixed(2));
-        } else {
-          row.push(null);
-        }
-      }
-      grid.push(row);
-    }
-    result.push({ model, input_lens: ils, output_lens: ols, grid });
-  }
-  return result;
+  const ils = [...new Set(Object.keys(rsIdx).map(k => +k.split(',')[0]))].sort((a,b) => a-b);
+  const ols = [...new Set(Object.keys(rsIdx).map(k => +k.split(',')[1]))].sort((a,b) => a-b);
+  const grid = ils.map(il => ols.map(ol => {
+    const key = `${il},${ol}`;
+    const pv = pyIdx[key], rv = rsIdx[key];
+    return (pv !== undefined && rv !== undefined && pv !== 0)
+      ? +((rv - pv) / pv * 100).toFixed(2) : null;
+  }));
+  return { input_lens: ils, output_lens: ols, grid };
 }
 
-function buildServeGrids(rows, field) {
+// Build an absolute value grid from rust rows only.
+function buildAbsGrid(rows, field) {
   const idx = {};
   for (const r of rows) {
-    const m = shortModel(r.model);
-    if (!idx[m]) idx[m] = {};
-    idx[m][`${r.input_len},${r.output_len}`] = r[field];
+    if (r.engine !== 'rust') continue;
+    const v = typeof r[field] === 'number' ? r[field] : null;
+    if (v !== null) idx[`${r.input_len},${r.output_len}`] = v;
   }
-  const result = [];
-  for (const model of Object.keys(idx).sort()) {
-    const data = idx[model];
-    const keys = Object.keys(data);
-    const ils = [...new Set(keys.map(k => +k.split(',')[0]))].sort((a,b) => a-b);
-    const ols = [...new Set(keys.map(k => +k.split(',')[1]))].sort((a,b) => a-b);
-    const grid = [];
-    for (const il of ils) {
-      const row = [];
-      for (const ol of ols) {
-        const v = data[`${il},${ol}`];
-        row.push(v !== undefined ? +v : null);
-      }
-      grid.push(row);
-    }
-    result.push({ model, input_lens: ils, output_lens: ols, grid });
-  }
-  return result;
+  const keys = Object.keys(idx);
+  if (keys.length === 0) return null;
+  const ils = [...new Set(keys.map(k => +k.split(',')[0]))].sort((a,b) => a-b);
+  const ols = [...new Set(keys.map(k => +k.split(',')[1]))].sort((a,b) => a-b);
+  const grid = ils.map(il => ols.map(ol => { const v = idx[`${il},${ol}`]; return v !== undefined ? v : null; }));
+  return { input_lens: ils, output_lens: ols, grid };
 }
 
 function svgHeatmap(data, opts) {
@@ -1007,7 +994,7 @@ function svgHeatmap(data, opts) {
   // Title
   svg += `<text x="${pad.l + gridSide/2}" y="18" text-anchor="middle" fill="#f0f0f0" font-size="13" font-weight="600" font-family="Inter,sans-serif">${title}</text>`;
   if (subtitle) {
-    svg += `<text x="${pad.l + gridSide/2}" y="33" text-anchor="middle" fill="#707070" font-size="10" font-family="Inter,sans-serif">${subtitle}</text>`;
+    svg += `<text x="${pad.l + gridSide/2}" y="33" text-anchor="middle" fill="#707070" font-size="14" font-family="Inter,sans-serif">${subtitle}</text>`;
   }
 
   // Cells — no borders
@@ -1036,8 +1023,8 @@ function svgHeatmap(data, opts) {
   }
 
   // Axis titles
-  svg += `<text x="${pad.l + gridSide/2}" y="${h-4}" text-anchor="middle" fill="#707070" font-size="10" font-family="Inter,sans-serif">Output Length</text>`;
-  svg += `<text x="12" y="${pad.t + gridSide/2}" text-anchor="middle" fill="#707070" font-size="10" font-family="Inter,sans-serif" transform="rotate(-90,12,${pad.t + gridSide/2})">Input Length</text>`;
+  svg += `<text x="${pad.l + gridSide/2}" y="${h-4}" text-anchor="middle" fill="#707070" font-size="14" font-family="Inter,sans-serif">Output Length</text>`;
+  svg += `<text x="12" y="${pad.t + gridSide/2}" text-anchor="middle" fill="#707070" font-size="14" font-family="Inter,sans-serif" transform="rotate(-90,12,${pad.t + gridSide/2})">Input Length</text>`;
 
   // Colorbar
   if (colorbarStops && colorbarLabels) {
@@ -1054,7 +1041,7 @@ function svgHeatmap(data, opts) {
     // Labels: top, middle, bottom
     for (let i = 0; i < colorbarLabels.length; i++) {
       const yPos = pad.t + (i / (colorbarLabels.length - 1)) * cbH + 4;
-      svg += `<text x="${cbX + cbW + 4}" y="${yPos}" fill="#b0b0b0" font-size="9" font-family="Inter,sans-serif">${colorbarLabels[i]}</text>`;
+      svg += `<text x="${cbX + cbW + 4}" y="${yPos}" fill="#b0b0b0" font-size="11" font-family="Inter,sans-serif">${colorbarLabels[i]}</text>`;
     }
   }
 
@@ -1083,76 +1070,125 @@ let currentBlockSize = '16';
 function renderPerfHeatmaps() {
   const bs = currentBlockSize;
   const container = document.getElementById('perf-heatmaps');
-
-  const latGrids = buildDeltaGrids(BENCH.latency_python, BENCH.latency_rust, 'avg', bs);
-  const tpReqGrids = buildDeltaGrids(BENCH.throughput_python, BENCH.throughput_rust, 'req_per_s', bs);
-  const allModels = [...new Set([...latGrids, ...tpReqGrids].map(g => g.model))].sort();
+  const allKeys = [...new Set([
+    ...Object.keys(BENCH.latency || {}),
+    ...Object.keys(BENCH.throughput || {}),
+  ])].sort((a, b) => modelSortKey(a) - modelSortKey(b));
 
   let html = '';
-  for (const model of allModels) {
-    const lat = latGrids.find(g => g.model === model);
-    const tpReq = tpReqGrids.find(g => g.model === model);
-    html += `<div class="heatmap-section"><h3>${model}</h3><div class="heatmap-row">`;
 
-    for (const [data, title, subtitle, inverted] of [
-      [lat, 'Latency Δ%', '(+ = Rust slower)', true],
-      [tpReq, 'Throughput req/s Δ%', '(+ = Rust faster)', false],
-    ]) {
-      if (!data) continue;
-      const flat = data.grid.flat().filter(v => v !== null);
-      const vmax = Math.max(1, ...flat.map(v => Math.abs(v)));
-      const cfn = deltaColorFn(inverted);
-      const vmaxR = Math.round(vmax);
-      // Always: teal (faster) at top, brown (slower) at bottom
-      // BRBG = brown→teal, so reverse it to get teal(top)→brown(bottom)
-      const cbStops = [...BRBG].reverse();
-      // Labels: top=faster, bottom=slower
-      // Latency (inverted): faster = negative delta; Throughput: faster = positive delta
-      const cbLabels = inverted
-        ? [`−${vmaxR}%`, '0%', `+${vmaxR}%`]
-        : [`+${vmaxR}%`, '0%', `−${vmaxR}%`];
-      html += `<div class="plotly-hm">${svgHeatmap(data, {
-        title, subtitle,
-        colorFn: v => cfn(v, vmax),
-        fmt: v => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`,
-        colorbarStops: cbStops,
-        colorbarLabels: cbLabels,
-      })}</div>`;
-    }
-    html += '</div></div>';
+  // One heatmap per latency CSV (one per model)
+  html += `<div class="heatmap-section"><h3>Latency avg Δ% vs Python <span style="font-weight:400;color:var(--text-dim)">(+ = Rust slower)</span></h3><div class="heatmap-row">`;
+  for (const key of allKeys) {
+    const rows = (BENCH.latency || {})[key];
+    if (!rows) continue;
+    const data = buildDeltaGrid(rows, 'avg', bs);
+    const flat = data.grid.flat().filter(v => v !== null);
+    if (flat.length === 0) continue;
+    const vmax = Math.max(1, ...flat.map(v => Math.abs(v)));
+    const vmaxR = Math.round(vmax);
+    const cfn = deltaColorFn(true);
+    html += `<div class="plotly-hm">${svgHeatmap(data, {
+      title: modelLabel(key), subtitle: null,
+      colorFn: v => cfn(v, vmax),
+      fmt: v => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`,
+      colorbarStops: [...BRBG].reverse(),
+      colorbarLabels: [`−${vmaxR}%`, '0%', `+${vmaxR}%`],
+    })}</div>`;
   }
+  html += '</div></div>';
+
+  // One heatmap per throughput CSV (one per model)
+  html += `<div class="heatmap-section"><h3>Throughput req/s Δ% vs Python <span style="font-weight:400;color:var(--text-dim)">(+ = Rust faster)</span></h3><div class="heatmap-row">`;
+  for (const key of allKeys) {
+    const rows = (BENCH.throughput || {})[key];
+    if (!rows) continue;
+    const data = buildDeltaGrid(rows, 'req_per_s', bs);
+    const flat = data.grid.flat().filter(v => v !== null);
+    if (flat.length === 0) continue;
+    const vmax = Math.max(1, ...flat.map(v => Math.abs(v)));
+    const vmaxR = Math.round(vmax);
+    const cfn = deltaColorFn(false);
+    html += `<div class="plotly-hm">${svgHeatmap(data, {
+      title: modelLabel(key), subtitle: null,
+      colorFn: v => cfn(v, vmax),
+      fmt: v => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`,
+      colorbarStops: [...BRBG].reverse(),
+      colorbarLabels: [`+${vmaxR}%`, '0%', `−${vmaxR}%`],
+    })}</div>`;
+  }
+  html += '</div></div>';
+
   container.innerHTML = html;
 }
 
 function renderServeHeatmaps() {
   const container = document.getElementById('serve-heatmaps');
-  const allServe = [...BENCH.serve_rust, ...BENCH.serve_rust_14b];
+  const serveKeys = Object.keys(BENCH.serve || {}).sort((a, b) => modelSortKey(a) - modelSortKey(b));
 
+  // inverted=true  → positive delta = bad (lower-is-better metrics: TPOT, TTFT)
+  // inverted=false → positive delta = good (higher-is-better metrics: tok/s, req/s)
   const metrics = [
-    { field: 'output_tok_per_s', title: 'Output tok/s', unit: ' tok/s', decimals: 0 },
-    { field: 'req_per_s', title: 'Requests/s', unit: ' req/s', decimals: 1 },
-    { field: 'median_tpot_ms', title: 'Median TPOT', unit: ' ms', decimals: 1 },
-    { field: 'median_ttft_ms', title: 'Median TTFT', unit: ' ms', decimals: 0 },
+    { field: 'output_tok_per_s', label: 'Serve output tok/s Δ% vs Python', inverted: false, sign: '+ = Rust faster', decimals: 0 },
+    { field: 'req_per_s',        label: 'Serve req/s Δ% vs Python',         inverted: false, sign: '+ = Rust faster', decimals: 1 },
+    { field: 'median_tpot_ms',   label: 'Serve median TPOT Δ% vs Python',   inverted: true,  sign: '+ = Rust slower', decimals: 1 },
+    { field: 'median_ttft_ms',   label: 'Serve median TTFT Δ% vs Python',   inverted: true,  sign: '+ = Rust slower', decimals: 0 },
   ];
 
   let html = '';
-  for (const { field, title, unit, decimals } of metrics) {
-    const grids = buildServeGrids(allServe, field);
-    if (grids.length === 0) continue;
+  for (const { field, label, inverted, sign } of metrics) {
+    // Check if any model has real python data for this metric
+    const hasDelta = serveKeys.some(key => {
+      const d = buildDeltaGrid(BENCH.serve[key], field, null);
+      return d.grid.flat().some(v => v !== null);
+    });
 
-    html += `<div class="heatmap-section"><h3>${title}</h3><div class="heatmap-row">`;
-    for (const data of grids) {
-      const flat = data.grid.flat().filter(v => v !== null);
-      const vmin = Math.min(...flat), vmax = Math.max(...flat);
-      const cfn = seqColorFn(vmin, vmax);
-      const fmtLabel = v => decimals === 0 ? Math.round(v).toLocaleString() : v.toFixed(decimals);
-      html += `<div class="plotly-hm">${svgHeatmap(data, {
-        title: data.model, subtitle: null,
-        colorFn: v => cfn(v),
-        fmt: fmtLabel,
-        colorbarStops: SEQ,
-        colorbarLabels: [fmtLabel(vmin), fmtLabel((vmin+vmax)/2), fmtLabel(vmax)],
-      })}</div>`;
+    const sectionSubtitle = hasDelta
+      ? `<span style="font-weight:400;color:var(--text-dim)">(${sign})</span>`
+      : `<span style="font-weight:400;color:var(--text-dim)">(Rust, L40S)</span>`;
+    html += `<div class="heatmap-section"><h3>${label.replace(' Δ% vs Python', hasDelta ? ' Δ% vs Python' : '')} ${sectionSubtitle}</h3><div class="heatmap-row">`;
+
+    // Compute shared scale across all models for absolute fallback
+    const absGrids = hasDelta ? null : serveKeys.map(key => buildAbsGrid(BENCH.serve[key], field)).filter(Boolean);
+    const absAllVals = absGrids ? absGrids.flatMap(d => d.grid.flat().filter(v => v !== null)) : [];
+    const absVmin = absAllVals.length ? Math.min(...absAllVals) : 0;
+    const absVmax = absAllVals.length ? Math.max(...absAllVals) : 1;
+    const absFmt = v => decimals === 0 ? Math.round(v).toLocaleString() : v.toFixed(decimals);
+
+    let absIdx = 0;
+    for (const key of serveKeys) {
+      if (hasDelta) {
+        const data = buildDeltaGrid(BENCH.serve[key], field, null);
+        const flat = data.grid.flat().filter(v => v !== null);
+        if (flat.length === 0) continue;
+        const vmax = Math.max(1, ...flat.map(v => Math.abs(v)));
+        const vmaxR = Math.round(vmax);
+        const cfn = deltaColorFn(inverted);
+        html += `<div class="plotly-hm">${svgHeatmap(data, {
+          title: modelLabel(key), subtitle: null,
+          colorFn: v => cfn(v, vmax),
+          fmt: v => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`,
+          colorbarStops: [...BRBG].reverse(),
+          colorbarLabels: inverted
+            ? [`−${vmaxR}%`, '0%', `+${vmaxR}%`]
+            : [`+${vmaxR}%`, '0%', `−${vmaxR}%`],
+        })}</div>`;
+      } else {
+        const data = absGrids[absIdx++];
+        if (!data) continue;
+        const colorFn = inverted
+          ? v => seqColorFn(absVmax, absVmin)(v)
+          : seqColorFn(absVmin, absVmax);
+        const stops = inverted ? [...SEQ].reverse() : SEQ;
+        html += `<div class="plotly-hm">${svgHeatmap(data, {
+          title: modelLabel(key), subtitle: null,
+          colorFn, fmt: absFmt,
+          colorbarStops: stops,
+          colorbarLabels: inverted
+            ? [absFmt(absVmax), absFmt((absVmin+absVmax)/2), absFmt(absVmin)]
+            : [absFmt(absVmin), absFmt((absVmin+absVmax)/2), absFmt(absVmax)],
+        })}</div>`;
+      }
     }
     html += '</div></div>';
   }

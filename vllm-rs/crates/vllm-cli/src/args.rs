@@ -186,6 +186,12 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 1)]
     pub tensor_parallel_size: usize,
 
+    /// Number of GPU stages for pipeline parallelism (default: 1).
+    /// Splits model layers across N GPU stages using NCCL P2P send/recv.
+    /// Total GPUs used = tensor_parallel_size * pipeline_parallel_size.
+    #[arg(long, default_value_t = 1)]
+    pub pipeline_parallel_size: usize,
+
     /// Number of nodes for multi-node tensor parallelism (default: 1).
     /// When > 1, GPUs are split across nodes using TCP rendezvous for NCCL.
     #[arg(long, default_value_t = 1)]

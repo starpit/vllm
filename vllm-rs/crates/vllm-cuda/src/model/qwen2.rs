@@ -9,10 +9,12 @@
 
 use anyhow::Result;
 
+use crate::OwnedTensor;
 use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kv_cache::KvCachePool;
-use crate::model::llama::{LlamaConfig, LlamaForCausalLM, TpConfig};
+use crate::model::llama::{ForwardOutput, LlamaConfig, LlamaForCausalLM, TpConfig};
+use crate::pp::PpConfig;
 use crate::quant::QuantConfig;
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
@@ -121,6 +123,64 @@ impl Qwen2ForCausalLM {
     ) -> GpuTensor {
         self.0.forward(
             input_ids,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            device,
+            last_token_indices,
+        )
+    }
+
+    /// Load with PP (no TP).
+    pub fn load_pp(
+        weights: &mut GpuWeights,
+        config: &Qwen2Config,
+        dtype: DType,
+        pp: PpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = LlamaForCausalLM::load_pp(weights, &config.0, dtype, pp, device)?;
+        Ok(Self(model))
+    }
+
+    /// Load with TP + PP.
+    pub fn load_tp_pp(
+        weights: &mut GpuWeights,
+        config: &Qwen2Config,
+        dtype: DType,
+        tp: TpConfig,
+        pp: PpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = LlamaForCausalLM::load_tp_pp(weights, &config.0, dtype, tp, pp, device)?;
+        Ok(Self(model))
+    }
+
+    /// PP-aware forward pass.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_pp(
+        &self,
+        input_ids: Option<GpuTensor>,
+        intermediate: Option<(OwnedTensor, OwnedTensor)>,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+        last_token_indices: Option<GpuTensor>,
+    ) -> ForwardOutput {
+        self.0.forward_pp(
+            input_ids,
+            intermediate,
             positions,
             slot_mapping,
             cu_seqlens_q,

@@ -151,7 +151,7 @@ impl CpuTensorRef {
 ///
 /// This is a free function (not `&mut self`) so it can be called from parallel
 /// threads during multi-shard loading.
-fn load_shard_into_map(path: &Path) -> Result<HashMap<String, CpuTensorRef>> {
+fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Arc<memmap2::Mmap>)> {
     let file = std::fs::File::open(path)?;
     let mmap = Arc::new(unsafe { memmap2::Mmap::map(&file) }?);
 
@@ -207,7 +207,7 @@ fn load_shard_into_map(path: &Path) -> Result<HashMap<String, CpuTensorRef>> {
         tensors.len(),
     );
 
-    Ok(tensors)
+    Ok((tensors, mmap))
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +403,15 @@ pub struct GpuWeights {
     /// Tracked so the caller can free weight memory on sleep without walking
     /// model structs. Each entry is `(gpu_ptr, size_bytes)`.
     gpu_allocs: Vec<(*mut u8, usize)>,
+    /// Keep mmaps alive for the lifetime of GpuWeights.
+    ///
+    /// `take()` and `take_into()` use `memcpy_htod_async` which reads from
+    /// mmap'd memory asynchronously. The `CpuTensorRef` holding the `Arc<Mmap>`
+    /// is dropped at the end of those functions. If that was the last reference,
+    /// the mmap would be unmapped while the async DMA is still in flight,
+    /// causing silent data corruption on GPU. This field retains all mmaps
+    /// until the GpuWeights struct is dropped (after model loading completes).
+    _mmaps: Vec<Arc<memmap2::Mmap>>,
 }
 
 // Safety: GPU device pointers accessible from any host thread.
@@ -439,6 +448,7 @@ impl GpuWeights {
             precast: None,
             precast_handle: None,
             gpu_allocs: Vec::new(),
+            _mmaps: Vec::new(),
         };
         gw.load_shard(path)?;
         Ok(gw)
@@ -482,6 +492,7 @@ impl GpuWeights {
                 precast: None,
                 precast_handle: None,
                 gpu_allocs: Vec::new(),
+                _mmaps: Vec::new(),
             };
             if let Some(name) = shard_files.first() {
                 gw.load_shard(&dir.join(name))?;
@@ -494,7 +505,7 @@ impl GpuWeights {
         // disk I/O and CPU-side parsing across shards.
         tracing::info!("Loading {total} shards in parallel");
 
-        let shard_results: Vec<Result<HashMap<String, CpuTensorRef>>> =
+        let shard_results: Vec<Result<(HashMap<String, CpuTensorRef>, Arc<memmap2::Mmap>)>> =
             std::thread::scope(|scope| {
                 let handles: Vec<_> = shard_files
                     .iter()
@@ -507,8 +518,11 @@ impl GpuWeights {
             });
 
         let mut tensors = HashMap::new();
+        let mut mmaps = Vec::with_capacity(shard_results.len());
         for result in shard_results {
-            tensors.extend(result?);
+            let (shard_tensors, mmap) = result?;
+            tensors.extend(shard_tensors);
+            mmaps.push(mmap);
         }
 
         Ok(Self {
@@ -519,12 +533,15 @@ impl GpuWeights {
             precast: None,
             precast_handle: None,
             gpu_allocs: Vec::new(),
+            _mmaps: mmaps,
         })
     }
 
     /// Parse a shard file, madvise(WILLNEED), and store tensor references.
     fn load_shard(&mut self, path: &Path) -> Result<()> {
-        self.tensors.extend(load_shard_into_map(path)?);
+        let (shard_tensors, mmap) = load_shard_into_map(path)?;
+        self.tensors.extend(shard_tensors);
+        self._mmaps.push(mmap);
         Ok(())
     }
 
@@ -3891,6 +3908,7 @@ mod tests {
             precast: None,
             precast_handle: None,
             gpu_allocs: Vec::new(),
+            _mmaps: Vec::new(),
         };
         gw.load_shard(&dir.path().join("model.safetensors"))
             .unwrap();
@@ -3998,6 +4016,7 @@ mod tests {
             precast: None,
             precast_handle: None,
             gpu_allocs: Vec::new(),
+            _mmaps: Vec::new(),
         };
         gw.load_shard(&dir.path().join("model.safetensors"))
             .unwrap();

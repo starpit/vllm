@@ -462,6 +462,10 @@ pub struct Scheduler {
     /// for non-prefill requests so the next `schedule()` call accounts for
     /// tokens that are in-flight on the GPU but not yet finalized.
     async_scheduling: bool,
+    /// Whether pipeline parallelism is active. When true and
+    /// `async_scheduling` is false, the scheduler populates `new_token_ids`
+    /// in `CachedRequestData`.
+    use_pp: bool,
 
     // -- Request state --
     /// All tracked requests: `req_id -> Request`.
@@ -498,6 +502,7 @@ impl Scheduler {
             .unwrap_or(scheduler_config.max_num_batched_tokens);
 
         let async_scheduling = scheduler_config.async_scheduling.unwrap_or(false);
+        let use_pp = scheduler_config.use_pp;
 
         Self {
             max_num_running_reqs: scheduler_config.max_num_seqs,
@@ -507,6 +512,7 @@ impl Scheduler {
             long_prefill_token_threshold: scheduler_config.long_prefill_token_threshold,
             num_lookahead_tokens: scheduler_config.num_lookahead_tokens,
             async_scheduling,
+            use_pp,
 
             requests: HashMap::new(),
             waiting: create_request_queue(policy),
@@ -585,15 +591,21 @@ impl Scheduler {
         &self,
         running_reqs: &[Request],
         resumed_reqs: &[Request],
-        _num_scheduled_tokens: &HashMap<String, usize>,
+        num_scheduled_tokens: &HashMap<String, usize>,
         req_to_new_blocks: &HashMap<String, Vec<Vec<usize>>>,
     ) -> CachedRequestData {
         let mut req_ids = Vec::new();
         let mut resumed_req_ids = HashSet::new();
-        let new_token_ids = Vec::new(); // PP not implemented yet.
+        let mut new_token_ids = Vec::new();
         let mut new_block_ids = Vec::new();
         let mut num_computed_tokens_vec = Vec::new();
         let mut num_output_tokens_vec = Vec::new();
+
+        // When PP is active and async scheduling is off, the scheduler sends
+        // sampled tokens back because there's no direct communication between
+        // the first-stage worker and the last-stage worker.
+        // Matches Python: vllm/v1/core/sched/scheduler.py _make_cached_request_data
+        let send_pp_tokens = self.use_pp && !self.async_scheduling;
 
         for (idx, req) in running_reqs.iter().chain(resumed_reqs.iter()).enumerate() {
             let is_resumed = idx >= running_reqs.len();
@@ -601,6 +613,14 @@ impl Scheduler {
 
             if is_resumed {
                 resumed_req_ids.insert(req_id.clone());
+            }
+
+            if send_pp_tokens {
+                let num_tokens = num_scheduled_tokens.get(&req_id).copied().unwrap_or(0);
+                let start = req.num_computed_tokens as usize;
+                let end = (start + num_tokens).min(req.all_token_ids.len());
+                let token_ids = req.all_token_ids[start..end].to_vec();
+                new_token_ids.push(token_ids);
             }
 
             // Block IDs: convert to the output format. Look up before moving req_id.
@@ -2732,5 +2752,164 @@ mod tests {
 
         let req = sched.get_request("r1").unwrap();
         assert_eq!(req.num_computed_tokens, 13, "no rewind when all accepted");
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline parallelism tests
+    // -----------------------------------------------------------------------
+
+    fn pp_scheduler_config() -> SchedulerConfig {
+        SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 4,
+            enable_chunked_prefill: true,
+            long_prefill_token_threshold: 0,
+            async_scheduling: Some(false),
+            use_pp: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_pp_new_token_ids_populated_on_decode() {
+        // When use_pp=true and async_scheduling=false, the scheduler must
+        // populate new_token_ids in CachedRequestData so non-last PP stages
+        // can embed the correct token.
+        let cfg = pp_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        // Add request with 10 prompt tokens.
+        sched.add_request(make_request("r1", 10));
+
+        // Step 1: Prefill. No cached reqs yet.
+        let output1 = sched.schedule();
+        assert_eq!(output1.scheduled_new_reqs.len(), 1);
+        assert!(output1.scheduled_cached_reqs.req_ids.is_empty());
+
+        // Simulate prefill producing token 42.
+        sched.append_output_tokens("r1", &[42]);
+
+        // Step 2: Decode. Request is now cached.
+        let output2 = sched.schedule();
+        assert_eq!(output2.scheduled_cached_reqs.req_ids.len(), 1);
+        assert_eq!(output2.scheduled_cached_reqs.req_ids[0], "r1");
+
+        // new_token_ids should contain the token the worker needs to embed.
+        assert_eq!(output2.scheduled_cached_reqs.new_token_ids.len(), 1);
+        assert!(
+            !output2.scheduled_cached_reqs.new_token_ids[0].is_empty(),
+            "PP sync scheduling must populate new_token_ids for cached requests"
+        );
+        // The token should be 42 (the one we appended).
+        assert!(
+            output2.scheduled_cached_reqs.new_token_ids[0].contains(&42),
+            "new_token_ids should contain the sampled token"
+        );
+    }
+
+    #[test]
+    fn test_pp_new_token_ids_multiple_decode_steps() {
+        // Verify new_token_ids is correct across multiple decode steps.
+        let cfg = pp_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 5));
+
+        // Prefill.
+        sched.schedule();
+        sched.append_output_tokens("r1", &[100]);
+
+        // Decode step 1: should see token 100.
+        let out1 = sched.schedule();
+        assert_eq!(out1.scheduled_cached_reqs.new_token_ids.len(), 1);
+        assert!(out1.scheduled_cached_reqs.new_token_ids[0].contains(&100));
+
+        // Simulate decode producing token 200.
+        sched.append_output_tokens("r1", &[200]);
+
+        // Decode step 2: should see token 200.
+        let out2 = sched.schedule();
+        assert_eq!(out2.scheduled_cached_reqs.new_token_ids.len(), 1);
+        assert!(out2.scheduled_cached_reqs.new_token_ids[0].contains(&200));
+
+        // Simulate decode producing token 300.
+        sched.append_output_tokens("r1", &[300]);
+
+        // Decode step 3: should see token 300.
+        let out3 = sched.schedule();
+        assert_eq!(out3.scheduled_cached_reqs.new_token_ids.len(), 1);
+        assert!(out3.scheduled_cached_reqs.new_token_ids[0].contains(&300));
+    }
+
+    #[test]
+    fn test_pp_new_token_ids_multiple_requests() {
+        // Verify new_token_ids works with multiple concurrent requests.
+        let cfg = pp_scheduler_config();
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 5));
+        sched.add_request(make_request("r2", 5));
+
+        // Prefill both.
+        sched.schedule();
+        sched.append_output_tokens("r1", &[10]);
+        sched.append_output_tokens("r2", &[20]);
+
+        // Decode: both should have their correct new_token_ids.
+        let out = sched.schedule();
+        assert_eq!(out.scheduled_cached_reqs.req_ids.len(), 2);
+        assert_eq!(out.scheduled_cached_reqs.new_token_ids.len(), 2);
+
+        // Find which index is which request.
+        for (i, req_id) in out.scheduled_cached_reqs.req_ids.iter().enumerate() {
+            let tokens = &out.scheduled_cached_reqs.new_token_ids[i];
+            match req_id.as_str() {
+                "r1" => assert!(tokens.contains(&10), "r1 should have token 10"),
+                "r2" => assert!(tokens.contains(&20), "r2 should have token 20"),
+                _ => panic!("unexpected req_id"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_pp_no_new_token_ids_without_pp() {
+        // Without use_pp, new_token_ids should be empty.
+        let cfg = test_scheduler_config(); // use_pp = false
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 5));
+        sched.schedule();
+        sched.append_output_tokens("r1", &[42]);
+
+        let out = sched.schedule();
+        assert!(
+            out.scheduled_cached_reqs.new_token_ids.is_empty(),
+            "Without PP, new_token_ids should be empty"
+        );
+    }
+
+    #[test]
+    fn test_pp_no_new_token_ids_with_async_scheduling() {
+        // With use_pp + async_scheduling, new_token_ids should be empty
+        // (tokens go via GPU broadcast instead).
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 256,
+            max_num_seqs: 4,
+            enable_chunked_prefill: true,
+            async_scheduling: Some(true),
+            use_pp: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 100, 16);
+
+        sched.add_request(make_request("r1", 5));
+        sched.schedule();
+        sched.append_output_tokens("r1", &[42]);
+
+        let out = sched.schedule();
+        assert!(
+            out.scheduled_cached_reqs.new_token_ids.is_empty(),
+            "PP + async scheduling should NOT populate new_token_ids (uses GPU broadcast)"
+        );
     }
 }

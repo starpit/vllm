@@ -15,6 +15,7 @@ use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Embedding, Linear, LinearLayer, RmsNorm};
+use crate::pp::PpConfig;
 use crate::quant::QuantConfig;
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
@@ -24,6 +25,24 @@ use crate::weights::{self as gpu_weights};
 use crate::nccl::NcclGroup;
 #[cfg(feature = "nccl")]
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// ForwardOutput — PP-aware return type
+// ---------------------------------------------------------------------------
+
+/// Output of a model forward pass. For single-GPU or the last PP stage,
+/// this is `Logits`. For non-last PP stages, it's `Intermediate` containing
+/// the hidden states and residual to pass to the next stage.
+pub enum ForwardOutput {
+    /// Final logits `[num_reqs, vocab_size]` — only from the last PP stage.
+    Logits(GpuTensor),
+    /// Intermediate hidden states + residual to send to next PP stage.
+    /// Both are `[num_tokens, hidden_size]` in the model's compute dtype.
+    Intermediate {
+        hidden_states: OwnedTensor,
+        residual: OwnedTensor,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -881,6 +900,8 @@ pub struct LlamaForCausalLM {
     /// NCCL group for TP all-gather after lm_head (column parallel).
     #[cfg(feature = "nccl")]
     pub tp_group: Option<Arc<NcclGroup>>,
+    /// Pipeline parallelism config. None = single GPU / PP=1.
+    pub pp_config: Option<PpConfig>,
 }
 
 impl LlamaForCausalLM {
@@ -1621,6 +1642,7 @@ impl LlamaForCausalLM {
             logits_scaling: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
+            pp_config: None,
         })
     }
 
@@ -1678,6 +1700,7 @@ impl LlamaForCausalLM {
             logits_scaling: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
+            pp_config: None,
         })
     }
 
@@ -1737,6 +1760,7 @@ impl LlamaForCausalLM {
             logits_scaling: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
+            pp_config: None,
         })
     }
 }
@@ -2077,6 +2101,7 @@ impl LlamaForCausalLM {
             logits_scaling: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
+            pp_config: None,
         })
     }
 
@@ -2242,6 +2267,7 @@ impl LlamaForCausalLM {
             logits_scaling: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
+            pp_config: None,
         })
     }
 
@@ -2334,6 +2360,7 @@ impl LlamaForCausalLM {
             logits_scaling: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
+            pp_config: None,
         })
     }
 }
@@ -2554,5 +2581,391 @@ impl LlamaMLP {
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline Parallelism — PP-aware load + forward
+// ---------------------------------------------------------------------------
+
+impl LlamaModel {
+    /// Load backbone with PP: only loads this stage's layers, embedding
+    /// (first stage only), and norm (last stage only). Skips all other weights.
+    pub fn load_pp(
+        weights: &mut GpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        pp: PpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        // Embedding: only first stage.
+        let embed_tokens = if pp.is_first_stage() {
+            Embedding::load(weights, "model.embed_tokens")?
+        } else {
+            // Dummy 1-element embedding. Never used — non-first stages receive
+            // intermediate hidden states instead of input_ids.
+            let w = unsafe {
+                let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                GpuTensor::new(ptr, &[1, 1], dtype)
+            };
+            Embedding::new(w)
+        };
+
+        // Only load layers in [start_layer, end_layer).
+        // Use local index (0-based) for KV cache access, but absolute index for weight names.
+        let mut layers = Vec::with_capacity(pp.num_layers());
+        for i in pp.start_layer..pp.end_layer {
+            let local_idx = i - pp.start_layer;
+            let layer = LlamaDecoderLayer::load(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                local_idx,
+                device.compute_stream,
+            )?;
+            layers.push(layer);
+        }
+
+        // Final norm: only last stage.
+        let norm = if pp.is_last_stage() {
+            RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?
+        } else {
+            // Dummy norm — never used on non-last stages.
+            let w = unsafe {
+                let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                GpuTensor::new(ptr, &[1], dtype)
+            };
+            RmsNorm::new(w, config.rms_norm_eps)
+        };
+
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                config.llama3_rope_scaling.as_ref(),
+                dtype,
+                device,
+            )?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embedding_multiplier: 1.0,
+        })
+    }
+
+    /// Load backbone with TP + PP sharding.
+    pub fn load_tp_pp(
+        weights: &mut GpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        tp: TpConfig,
+        pp: PpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = if pp.is_first_stage() {
+            Embedding::load(weights, "model.embed_tokens")?
+        } else {
+            let w = unsafe {
+                let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                GpuTensor::new(ptr, &[1, 1], dtype)
+            };
+            Embedding::new(w)
+        };
+
+        let mut layers = Vec::with_capacity(pp.num_layers());
+        for i in pp.start_layer..pp.end_layer {
+            let local_idx = i - pp.start_layer;
+            let layer = LlamaDecoderLayer::load_tp(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                local_idx,
+                tp,
+                device.compute_stream,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = if pp.is_last_stage() {
+            RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?
+        } else {
+            let w = unsafe {
+                let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                GpuTensor::new(ptr, &[1], dtype)
+            };
+            RmsNorm::new(w, config.rms_norm_eps)
+        };
+
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                config.llama3_rope_scaling.as_ref(),
+                dtype,
+                device,
+            )?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embedding_multiplier: 1.0,
+        })
+    }
+
+    /// PP-aware forward: handles embedding (first stage), layer subset,
+    /// and final norm (last stage).
+    ///
+    /// - First stage: embeds `input_ids`, runs layers, returns (hs, residual)
+    /// - Middle stages: takes (hs, residual), runs layers, returns (hs, residual)
+    /// - Last stage: takes (hs, residual), runs layers + final norm, returns hidden_states
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_pp(
+        &self,
+        pp: &PpConfig,
+        // First stage only — input token IDs.
+        input_ids: Option<GpuTensor>,
+        // Non-first stages — received from previous stage.
+        intermediate: Option<(OwnedTensor, OwnedTensor)>,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+    ) -> ForwardOutput {
+        let (mut hidden_states, mut residual): (OwnedTensor, Option<OwnedTensor>) =
+            if pp.is_first_stage() {
+                // First stage: embedding lookup.
+                let input_ids = input_ids.expect("first PP stage requires input_ids");
+                let hs = kernels::embedding_gather(
+                    self.embed_tokens.weight,
+                    input_ids,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                if self.embedding_multiplier != 1.0 {
+                    kernels::scale_inplace(
+                        hs.as_gpu_tensor(),
+                        self.embedding_multiplier,
+                        &device.cublas,
+                    );
+                }
+                (hs, None)
+            } else {
+                // Non-first stage: use received intermediate tensors.
+                let (hs, res) = intermediate.expect("non-first PP stage requires intermediate");
+                (hs, Some(res))
+            };
+
+        // Run this stage's layers.
+        for (layer_i, layer) in self.layers.iter().enumerate() {
+            let (hs, res) = layer.forward_owned(
+                hidden_states,
+                residual,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                kv_cache,
+                &self.rotary,
+                device,
+            );
+            hidden_states = hs;
+            residual = Some(res);
+        }
+
+        if pp.is_last_stage() {
+            // Last stage: final norm → return hidden_states for lm_head.
+            let hs_gpu = *hidden_states;
+            let res_gpu = residual.as_ref().unwrap().as_gpu_tensor();
+            kernels::fused_add_rms_norm_inplace(
+                hs_gpu,
+                res_gpu,
+                self.norm.weight,
+                self.norm.eps,
+                device.compute_stream,
+            );
+            drop(residual);
+            ForwardOutput::Logits(hidden_states.into_gpu_tensor())
+        } else {
+            // Non-last stage: pass hidden_states + residual to next stage.
+            ForwardOutput::Intermediate {
+                hidden_states,
+                residual: residual.unwrap(),
+            }
+        }
+    }
+}
+
+impl LlamaForCausalLM {
+    /// Load with PP (no TP).
+    pub fn load_pp(
+        weights: &mut GpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        pp: PpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = LlamaModel::load_pp(weights, config, dtype, pp, device)?;
+
+        let lm_head = if pp.is_last_stage() {
+            if config.tie_word_embeddings {
+                // For PP last stage with tied embeddings, we need to load the
+                // embedding weight separately for lm_head since embed_tokens
+                // might be a dummy on this stage.
+                let embed_w = weights.take("model.embed_tokens.weight")?;
+                LinearLayer::Dense(Linear::new(embed_w, None))
+            } else {
+                LinearLayer::Dense(Linear::load(weights, "lm_head")?)
+            }
+        } else {
+            // Dummy lm_head — never used on non-last stages.
+            let w = unsafe {
+                let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                GpuTensor::new(ptr, &[1, 1], dtype)
+            };
+            LinearLayer::Dense(Linear::new(w, None))
+        };
+
+        Ok(Self {
+            model,
+            lm_head,
+            logits_scaling: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+            pp_config: Some(pp),
+        })
+    }
+
+    /// Load with TP + PP.
+    pub fn load_tp_pp(
+        weights: &mut GpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        tp: TpConfig,
+        pp: PpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = LlamaModel::load_tp_pp(weights, config, dtype, tp, pp, device)?;
+
+        let lm_head = if pp.is_last_stage() {
+            if config.tie_word_embeddings {
+                LinearLayer::Dense(Linear::new(model.embed_tokens.weight, None))
+            } else {
+                let lm_w = weights.take_shard("lm_head.weight", 0, tp.rank, tp.world_size)?;
+                LinearLayer::Dense(Linear::new(lm_w, None))
+            }
+        } else {
+            let w = unsafe {
+                let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                GpuTensor::new(ptr, &[1, 1], dtype)
+            };
+            LinearLayer::Dense(Linear::new(w, None))
+        };
+
+        Ok(Self {
+            model,
+            lm_head,
+            logits_scaling: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+            pp_config: Some(pp),
+        })
+    }
+
+    /// PP-aware forward pass.
+    ///
+    /// Returns `ForwardOutput::Logits` on the last stage, or
+    /// `ForwardOutput::Intermediate` on non-last stages.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_pp(
+        &self,
+        input_ids: Option<GpuTensor>,
+        intermediate: Option<(OwnedTensor, OwnedTensor)>,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+        last_token_indices: Option<GpuTensor>,
+    ) -> ForwardOutput {
+        let pp = self
+            .pp_config
+            .as_ref()
+            .expect("forward_pp called without pp_config");
+
+        // Run backbone with PP routing.
+        let backbone_out = self.model.forward_pp(
+            pp,
+            input_ids,
+            intermediate,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            device,
+        );
+
+        match backbone_out {
+            ForwardOutput::Intermediate { .. } => backbone_out,
+            ForwardOutput::Logits(hidden_states) => {
+                // Last stage: lm_head projection.
+                let hidden_states = if let Some(indices) = last_token_indices {
+                    let gathered = kernels::embedding_gather(
+                        hidden_states,
+                        indices,
+                        &mut device.caching,
+                        device.compute_stream,
+                    );
+                    gathered.into_gpu_tensor()
+                } else {
+                    hidden_states
+                };
+
+                let logits = self.lm_head.forward_owned(
+                    hidden_states,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                #[allow(unused_mut)]
+                let mut logits = logits.into_gpu_tensor();
+
+                // TP: all-gather logits.
+                #[cfg(feature = "nccl")]
+                if let Some(ref group) = self.tp_group {
+                    logits = group.all_gather(logits, &mut device.caching);
+                }
+
+                if self.logits_scaling != 1.0 {
+                    kernels::scale_inplace(logits, self.logits_scaling.recip(), &device.cublas);
+                }
+
+                ForwardOutput::Logits(logits)
+            }
+        }
     }
 }

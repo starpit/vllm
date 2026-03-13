@@ -11,9 +11,6 @@
 //!
 //! Port of: `vllm/model_executor/models/qwen3_next.py`
 
-#[cfg(feature = "nccl")]
-use std::sync::Arc;
-
 use anyhow::Result;
 
 use crate::alloc::OwnedTensor;
@@ -27,9 +24,6 @@ use crate::model::llama::{LlamaAttention, LlamaConfig, LlamaMLP, RotaryCache};
 use crate::model::qwen3_moe::{Qwen3MoeConfig, Qwen3MoeDecoderLayer, Qwen3MoeMlp};
 use crate::tensor::GpuTensor;
 use crate::weights::GpuWeights;
-
-#[cfg(feature = "nccl")]
-use crate::nccl::NcclGroup;
 
 // ---------------------------------------------------------------------------
 // Config

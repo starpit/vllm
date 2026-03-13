@@ -241,7 +241,7 @@ impl Executor for ThreadPoolExecutor {
     }
 
     fn max_concurrent_batches(&self) -> usize {
-        1
+        self.parallel_config.pp_group.world_size
     }
 
     fn initialize_cache(

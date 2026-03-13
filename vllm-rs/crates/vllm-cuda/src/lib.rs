@@ -60,6 +60,7 @@ pub mod logits_processor;
 pub mod model;
 #[cfg(feature = "nccl")]
 pub mod nccl;
+pub mod pp;
 pub mod quant;
 pub mod tcp_store;
 pub use tcp_store::TcpControlChannel;
@@ -85,5 +86,6 @@ pub use layers::{
 pub use layers_moe::{MarlinFusedMoELayer, MarlinSharedFusedMoELayer};
 #[cfg(feature = "nccl")]
 pub use nccl::{NcclGroup, NcclId};
+pub use pp::PpConfig;
 #[cfg(feature = "cuda")]
 pub use weights::GpuWeights;

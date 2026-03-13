@@ -225,6 +225,12 @@ impl LLMBuilder {
         self
     }
 
+    /// Set the number of GPU stages for pipeline parallelism.
+    pub fn pipeline_parallel_size(mut self, n: usize) -> Self {
+        self.config.pipeline_parallel_size = n;
+        self
+    }
+
     /// Set the number of nodes for multi-node TP.
     pub fn num_nodes(mut self, n: usize) -> Self {
         self.config.num_nodes = n;

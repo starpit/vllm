@@ -1128,4 +1128,86 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Pipeline parallelism: set_last_token overrides commit_step's dummy token
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_last_token_overrides_commit_step() {
+        // Simulates PP non-last stage: commit_step with dummy 0, then
+        // set_last_token with the real sampled token from the scheduler.
+        let mut batch = InputBatch::new();
+        batch.add_request("r1".into(), &[10, 20, 30], vec![0, 1], 0);
+
+        // Simulate prefill → decode transition.
+        let no_spec = std::collections::HashMap::new();
+        let prepared = batch.prepare_inputs(&no_spec);
+        assert_eq!(prepared.flat_token_ids, vec![10, 20, 30]);
+        batch.commit_step("r1", &[99], 3, false); // normal commit with real token
+
+        // Verify decode uses token 99.
+        let prepared2 = batch.prepare_inputs(&no_spec);
+        assert_eq!(prepared2.flat_token_ids, vec![99]);
+        batch.reclaim_buffers(prepared2);
+
+        // Now simulate PP non-last stage: commit with dummy 0.
+        batch.commit_step("r1", &[0], 1, false);
+
+        // Without fix: next decode would use token 0.
+        // With fix: set_last_token overrides it.
+        batch.set_last_token("r1", 42);
+
+        let prepared3 = batch.prepare_inputs(&no_spec);
+        assert_eq!(
+            prepared3.flat_token_ids,
+            vec![42],
+            "set_last_token must override the dummy 0 from commit_step"
+        );
+        batch.reclaim_buffers(prepared3);
+    }
+
+    #[test]
+    fn test_set_last_token_multiple_requests() {
+        // Multiple requests in PP mode, each getting different real tokens.
+        let mut batch = InputBatch::new();
+        let no_spec = std::collections::HashMap::new();
+        batch.add_request("r1".into(), &[10, 20], vec![0, 1], 0);
+        batch.add_request("r2".into(), &[30, 40], vec![2, 3], 0);
+
+        let _ = batch.prepare_inputs(&no_spec);
+        batch.commit_step("r1", &[100], 2, false);
+        batch.commit_step("r2", &[200], 2, false);
+
+        // Decode step: commit with dummy 0 (PP non-last stage).
+        let p2 = batch.prepare_inputs(&no_spec);
+        batch.reclaim_buffers(p2);
+        batch.commit_step("r1", &[0], 1, false);
+        batch.commit_step("r2", &[0], 1, false);
+
+        // Override with real tokens.
+        batch.set_last_token("r1", 101);
+        batch.set_last_token("r2", 201);
+
+        let prepared = batch.prepare_inputs(&no_spec);
+        // Both requests should use their real tokens.
+        assert!(
+            prepared.flat_token_ids.contains(&101),
+            "r1 should embed token 101, got {:?}",
+            prepared.flat_token_ids
+        );
+        assert!(
+            prepared.flat_token_ids.contains(&201),
+            "r2 should embed token 201, got {:?}",
+            prepared.flat_token_ids
+        );
+        batch.reclaim_buffers(prepared);
+    }
+
+    #[test]
+    fn test_set_last_token_nonexistent_request_is_noop() {
+        let mut batch = InputBatch::new();
+        // Should not panic.
+        batch.set_last_token("nonexistent", 42);
+    }
 }

@@ -123,6 +123,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         lora_adapter: args.lora_adapter.clone(),
         pooling_strategy: args.pooling_strategy.clone(),
         tensor_parallel_size: args.tensor_parallel_size,
+        pipeline_parallel_size: args.pipeline_parallel_size,
         num_nodes: args.num_nodes,
         node_rank: args.node_rank,
         master_addr: args.master_addr.clone(),

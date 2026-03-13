@@ -69,6 +69,10 @@ pub struct CudaWorkerConfig {
     pub tp_rank: usize,
     /// Tensor parallelism world size (1 = no TP).
     pub tp_world_size: usize,
+    /// Pipeline parallelism rank (0 = first stage).
+    pub pp_rank: usize,
+    /// Pipeline parallelism size (1 = no PP).
+    pub pp_size: usize,
     /// Optional GGUF file name for HF Hub download (e.g. "model-Q4_K_M.gguf").
     pub gguf_file: Option<String>,
     /// Optional LoRA adapter path (local directory or HF repo ID).
@@ -703,6 +707,64 @@ impl CudaModel {
                 )
             },
             _ => panic!("forward_qwen3_next called on non-Qwen3Next model"),
+        }
+    }
+
+    /// PP-aware forward: routes to the model's forward_pp method.
+    /// Returns ForwardOutput::Logits on last stage, ForwardOutput::Intermediate otherwise.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn forward_pp(
+        &self,
+        input_ids: Option<GpuTensor>,
+        intermediate: Option<(vllm_cuda::OwnedTensor, vllm_cuda::OwnedTensor)>,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+        last_token_indices: Option<GpuTensor>,
+    ) -> vllm_cuda::model::llama::ForwardOutput {
+        match self {
+            Self::Llama(m) => unsafe {
+                m.forward_pp(
+                    input_ids,
+                    intermediate,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            Self::Qwen2(m) => unsafe {
+                m.forward_pp(
+                    input_ids,
+                    intermediate,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            _ => panic!(
+                "Pipeline parallelism not yet supported for {:?}",
+                std::mem::discriminant(self)
+            ),
         }
     }
 }
@@ -1520,6 +1582,21 @@ pub struct CudaWorker {
     weight_gpu_allocs: Vec<(*mut u8, usize)>,
     /// Saved num_gpu_blocks for re-init after wake.
     num_gpu_blocks_saved: usize,
+
+    // Pipeline parallelism state.
+    /// PP NCCL communicator for P2P send/recv between stages.
+    #[cfg(feature = "nccl")]
+    pp_group: Option<std::sync::Arc<vllm_cuda::nccl::NcclGroup>>,
+    /// PP config for this worker (None if PP=1).
+    pp_config: Option<vllm_cuda::PpConfig>,
+    /// Persistent recv buffer for hidden_states `[max_num_tokens, hidden_size]`.
+    /// Pre-allocated on non-first stages for CUDA graph compatibility.
+    pp_recv_hs_buf: Option<vllm_cuda::GpuTensor>,
+    /// Persistent recv buffer for residual `[max_num_tokens, hidden_size]`.
+    pp_recv_res_buf: Option<vllm_cuda::GpuTensor>,
+    /// Whether a PP send from the previous iteration is pending.
+    /// Sync at start of next execute_model to ensure send completed.
+    pp_send_pending: bool,
 }
 
 unsafe impl Send for CudaWorker {}
@@ -1580,6 +1657,12 @@ impl CudaWorker {
             _v_scale_constant: v_scale_constant,
             weight_gpu_allocs: Vec::new(),
             num_gpu_blocks_saved: 0,
+            #[cfg(feature = "nccl")]
+            pp_group: None,
+            pp_config: None,
+            pp_recv_hs_buf: None,
+            pp_recv_res_buf: None,
+            pp_send_pending: false,
         }
     }
 
@@ -1594,6 +1677,271 @@ impl CudaWorker {
         if let Some(ref mut model) = self.model {
             model.set_tp_group(group);
         }
+    }
+
+    /// Inject NCCL process group for PP P2P communication.
+    #[cfg(feature = "nccl")]
+    pub fn set_pp_group(&mut self, group: std::sync::Arc<vllm_cuda::nccl::NcclGroup>) {
+        self.pp_group = Some(group);
+    }
+
+    /// Set PP config for this worker.
+    pub fn set_pp_config(&mut self, pp: vllm_cuda::PpConfig) {
+        self.pp_config = Some(pp);
+    }
+
+    /// Allocate persistent PP recv buffers after model is loaded and
+    /// hidden_size is known. Called during init on non-first PP stages.
+    pub fn allocate_pp_recv_buffers(&mut self) {
+        let pp = match self.pp_config {
+            Some(pp) if !pp.is_first_stage() => pp,
+            _ => return, // No recv buffers needed on first stage or no PP.
+        };
+        let _ = pp; // used just for gating
+
+        let model = self.model.as_ref().expect("model must be loaded first");
+        let hidden_size = model.hidden_size();
+        let max_tokens = self.config.max_num_batched_tokens;
+        let gpu_dtype = self.model_dtype;
+
+        let nbytes = max_tokens * hidden_size * gpu_dtype.size_bytes();
+        unsafe {
+            let hs_ptr =
+                vllm_cuda::driver::mem_alloc(nbytes).expect("failed to allocate PP recv hs buffer");
+            self.pp_recv_hs_buf = Some(vllm_cuda::GpuTensor::new(
+                hs_ptr,
+                &[max_tokens, hidden_size],
+                gpu_dtype,
+            ));
+
+            let res_ptr = vllm_cuda::driver::mem_alloc(nbytes)
+                .expect("failed to allocate PP recv res buffer");
+            self.pp_recv_res_buf = Some(vllm_cuda::GpuTensor::new(
+                res_ptr,
+                &[max_tokens, hidden_size],
+                gpu_dtype,
+            ));
+        }
+    }
+
+    /// Recv intermediate tensors from previous PP stage into persistent buffers,
+    /// then copy the active slice `[:num_tokens]` into OwnedTensors for the model.
+    ///
+    /// Returns `(hidden_states, residual)` as OwnedTensors.
+    /// Takes explicit field references to avoid &mut self borrow conflicts.
+    #[cfg(feature = "nccl")]
+    fn pp_recv_intermediates(
+        pp_group: &vllm_cuda::nccl::NcclGroup,
+        pp_recv_hs_buf: &vllm_cuda::GpuTensor,
+        pp_recv_res_buf: &vllm_cuda::GpuTensor,
+        pp: vllm_cuda::PpConfig,
+        num_tokens: usize,
+        device: &mut GpuDevice,
+    ) -> ExecutorResult<(vllm_cuda::OwnedTensor, vllm_cuda::OwnedTensor)> {
+        let hs_buf = pp_recv_hs_buf;
+        let res_buf = pp_recv_res_buf;
+
+        let hidden_size = hs_buf.shape()[1] as usize;
+        let dtype = hs_buf.dtype();
+        let prev_pp_rank = pp.pp_rank - 1;
+
+        // Slice persistent buffers to [:num_tokens].
+        let hs_slice = hs_buf.narrow_dim0(0, num_tokens);
+        let res_slice = res_buf.narrow_dim0(0, num_tokens);
+
+        // Non-blocking recv into persistent buffers (on PP NCCL stream).
+        unsafe {
+            pp_group
+                .recv(hs_slice, prev_pp_rank)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("PP recv hs: {e}")))?;
+            pp_group
+                .recv(res_slice, prev_pp_rank)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("PP recv res: {e}")))?;
+        }
+
+        // Sync the NCCL stream to ensure recv completes before forward.
+        unsafe {
+            vllm_cuda::driver::stream_synchronize(pp_group.stream())
+                .map_err(|e| ExecutorError::WorkerExecution(format!("PP recv stream sync: {e}")))?;
+        }
+
+        // Copy received data into OwnedTensors from caching allocator.
+        let hs_owned = device
+            .caching
+            .alloc_tensor(&[num_tokens, hidden_size], dtype);
+        let res_owned = device
+            .caching
+            .alloc_tensor(&[num_tokens, hidden_size], dtype);
+
+        let nbytes = num_tokens * hidden_size * dtype.size_bytes();
+        unsafe {
+            vllm_cuda::driver::memcpy_dtod_async(
+                hs_owned.as_gpu_tensor().raw_ptr(),
+                hs_slice.raw_ptr(),
+                nbytes,
+                device.compute_stream,
+            )
+            .map_err(|e| ExecutorError::WorkerExecution(format!("PP copy hs: {e}")))?;
+            vllm_cuda::driver::memcpy_dtod_async(
+                res_owned.as_gpu_tensor().raw_ptr(),
+                res_slice.raw_ptr(),
+                nbytes,
+                device.compute_stream,
+            )
+            .map_err(|e| ExecutorError::WorkerExecution(format!("PP copy res: {e}")))?;
+        }
+
+        Ok((hs_owned, res_owned))
+    }
+
+    /// Execute forward pass for a non-last PP stage:
+    /// 1. Sync previous sends
+    /// 2. Recv intermediates (if not first stage)
+    /// 3. Run forward_pp (eager)
+    /// 4. Send intermediates to next stage
+    /// 5. Commit step + return dummy output
+    #[cfg(feature = "nccl")]
+    fn execute_pp_non_last_stage(
+        &mut self,
+        pp: vllm_cuda::PpConfig,
+        prepared: PreparedInputs,
+        block_size: usize,
+    ) -> ExecutorResult<ModelRunnerOutput> {
+        let num_reqs = prepared.req_inputs.len();
+        let total_tokens = prepared.flat_token_ids.len();
+        let next_pp_rank = pp.pp_rank + 1;
+        // Step 0: Sync previous PP send (if pending).
+        if self.pp_send_pending {
+            let pp_group = self.pp_group.as_ref().unwrap();
+            unsafe {
+                vllm_cuda::driver::stream_synchronize(pp_group.stream())
+                    .map_err(|e| ExecutorError::WorkerExecution(format!("PP send sync: {e}")))?;
+            }
+            self.pp_send_pending = false;
+        }
+
+        // Step 1: Recv intermediates (if not first stage).
+        // Done before destructuring to avoid borrow conflicts.
+        let intermediate = if !pp.is_first_stage() {
+            let pp_group = self.pp_group.as_ref().unwrap();
+            let hs_buf = self.pp_recv_hs_buf.as_ref().unwrap();
+            let res_buf = self.pp_recv_res_buf.as_ref().unwrap();
+            let device = self
+                .device
+                .as_mut()
+                .ok_or_else(|| ExecutorError::WorkerExecution("device not initialized".into()))?;
+            Some(Self::pp_recv_intermediates(
+                pp_group,
+                hs_buf,
+                res_buf,
+                pp,
+                total_tokens,
+                device,
+            )?)
+        } else {
+            None
+        };
+
+        let (model, kv_cache, device) = match (&self.model, &self.kv_cache, &mut self.device) {
+            (Some(m), Some(kv), Some(d)) => (m, kv, d),
+            _ => {
+                return Err(ExecutorError::WorkerExecution(
+                    "model, KV cache, or device not initialized".into(),
+                ));
+            }
+        };
+
+        // Step 2: Prepare GPU inputs.
+        let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
+        let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
+        let (slot_mapping, cu_seqlens_q, seqused_k, block_table, max_seqlen_q, max_seqlen_k) =
+            Self::build_attention_tensors(&prepared.attn_meta, block_size, device)?;
+
+        // For prefills, compute last_token_indices.
+        let last_token_indices = if num_reqs < total_tokens {
+            let mut indices = Vec::with_capacity(num_reqs);
+            let mut offset = 0u32;
+            for req_slice in &prepared.req_inputs {
+                indices.push(offset + req_slice.token_count as u32 - 1);
+                offset += req_slice.token_count as u32;
+            }
+            Some(Self::h2d_u32(&indices, device)?)
+        } else {
+            None
+        };
+
+        let input_ids = if pp.is_first_stage() {
+            Some(gpu_input_ids)
+        } else {
+            None
+        };
+
+        // Step 3: Forward pass.
+        let result = unsafe {
+            model.forward_pp(
+                input_ids,
+                intermediate,
+                gpu_positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                kv_cache,
+                device,
+                last_token_indices,
+            )
+        };
+
+        // Step 4: Send intermediates to next stage.
+        let (hs, res) = match result {
+            vllm_cuda::model::llama::ForwardOutput::Intermediate {
+                hidden_states,
+                residual,
+            } => (hidden_states, residual),
+            vllm_cuda::model::llama::ForwardOutput::Logits(_) => {
+                unreachable!("non-last PP stage should return Intermediate");
+            }
+        };
+
+        let pp_group = self.pp_group.as_ref().unwrap();
+        // Sync compute stream before sending on NCCL stream — ensures forward
+        // output is complete before NCCL reads from the tensors.
+        unsafe {
+            vllm_cuda::driver::stream_synchronize(device.compute_stream).map_err(|e| {
+                ExecutorError::WorkerExecution(format!("PP compute sync before send: {e}"))
+            })?;
+        }
+        unsafe {
+            pp_group
+                .send(hs.as_gpu_tensor(), next_pp_rank)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("PP send hs: {e}")))?;
+            pp_group
+                .send(res.as_gpu_tensor(), next_pp_rank)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("PP send res: {e}")))?;
+        }
+        self.pp_send_pending = true;
+        // Drop OwnedTensors after sends are enqueued (non-blocking).
+        // The NCCL stream will hold a reference to the GPU memory.
+        drop(hs);
+        drop(res);
+
+        // Step 5: Commit step for all requests (dummy token 0 — last stage
+        // broadcasts real tokens back in async scheduling mode; for sync
+        // scheduling the scheduler provides them via CachedRequestData).
+        for req_slice in &prepared.req_inputs {
+            self.input_batch.commit_step(
+                &req_slice.req_id,
+                &[0], // dummy token
+                req_slice.token_count,
+                false,
+            );
+        }
+        self.input_batch.reclaim_buffers(prepared);
+
+        // Return dummy output — only the output_rank's result matters.
+        Ok(ModelRunnerOutput::from_token_map(HashMap::new()))
     }
 
     /// Update max_num_batched_tokens (used for GPU-aware auto-detection).
@@ -3128,6 +3476,17 @@ impl Worker for CudaWorker {
             rank: tp_rank,
             world_size: tp_world,
         };
+        let use_pp = self.config.pp_size > 1;
+        let pp_config = if use_pp {
+            let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
+            Some(vllm_cuda::PpConfig::new(
+                num_layers,
+                self.config.pp_rank,
+                self.config.pp_size,
+            ))
+        } else {
+            None
+        };
 
         let model = match arch.as_str() {
             "LlamaForCausalLM" | "MistralForCausalLM" | "Qwen3ForCausalLM" | "Phi3ForCausalLM" => {
@@ -3157,6 +3516,23 @@ impl Worker for CudaWorker {
                         &config,
                         dtype,
                         &qconfig,
+                        device,
+                    )
+                } else if use_tp && use_pp {
+                    vllm_cuda::model::llama::LlamaForCausalLM::load_tp_pp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        tp,
+                        pp_config.unwrap(),
+                        device,
+                    )
+                } else if use_pp {
+                    vllm_cuda::model::llama::LlamaForCausalLM::load_pp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        pp_config.unwrap(),
                         device,
                     )
                 } else if use_tp {
@@ -3207,6 +3583,23 @@ impl Worker for CudaWorker {
                         &qwen2_config,
                         dtype,
                         &qconfig,
+                        device,
+                    )
+                } else if use_tp && use_pp {
+                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_tp_pp(
+                        &mut weights,
+                        &qwen2_config,
+                        dtype,
+                        tp,
+                        pp_config.unwrap(),
+                        device,
+                    )
+                } else if use_pp {
+                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_pp(
+                        &mut weights,
+                        &qwen2_config,
+                        dtype,
+                        pp_config.unwrap(),
                         device,
                     )
                 } else if use_tp {
@@ -3596,6 +3989,7 @@ impl Worker for CudaWorker {
         self.model = Some(model);
         self.model_dir = Some(model_dir.clone());
         self.hf_config = Some(hf_config);
+        self.pp_config = pp_config;
 
         // Resolve pooling strategy.
         self.pooling_strategy = match self.config.pooling_strategy.as_str() {
@@ -3693,8 +4087,15 @@ impl Worker for CudaWorker {
         // attention cause CUDA errors during the dummy forward pass (the profiling
         // forward triggers an illegal memory access in flash attention). Use a
         // conservative fixed estimate instead.
-        if self.uses_ggml || self.qwen3_next_config.is_some() {
-            let tag = if self.uses_ggml { "GGML" } else { "Qwen3Next" };
+        let pp_active = self.pp_config.is_some_and(|pp| pp.pp_size > 1);
+        if self.uses_ggml || self.qwen3_next_config.is_some() || pp_active {
+            let tag = if self.uses_ggml {
+                "GGML"
+            } else if pp_active {
+                "PP"
+            } else {
+                "Qwen3Next"
+            };
             info!("CudaWorker: {tag} model — skipping activation profiling, using fixed estimate");
             let (free, total) = cudarc::driver::result::mem_get_info()
                 .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
@@ -4455,6 +4856,24 @@ impl CudaWorker {
         }
 
         // ---------------------------------------------------------------
+        // PP token fixup: when the scheduler provides new_token_ids (PP sync
+        // scheduling), overwrite last_token_ids in the input batch so that
+        // non-last PP stages embed the correct token instead of the dummy 0
+        // committed in the previous step.
+        // Matches Python: gpu_model_runner.py _update_states lines 1143-1150.
+        // ---------------------------------------------------------------
+        let cached = &scheduler_output.scheduled_cached_reqs;
+        if !cached.new_token_ids.is_empty() {
+            for (i, req_id) in cached.req_ids.iter().enumerate() {
+                if let Some(tokens) = cached.new_token_ids.get(i) {
+                    if let Some(&last_token) = tokens.last() {
+                        self.input_batch.set_last_token(req_id, last_token);
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
         // Super fast path: skip prepare_inputs entirely when the graph
         // has valid metadata from the previous step. This avoids ~50μs
         // of CPU work and, critically, lets us defer commit_step(N-1)
@@ -4614,6 +5033,56 @@ impl CudaWorker {
             return Ok(ModelRunnerOutput::from_token_map(HashMap::new()));
         }
 
+        let num_reqs = prepared.req_inputs.len();
+        let total_tokens = prepared.flat_token_ids.len();
+        let pp_active = self.pp_config.is_some_and(|pp| pp.pp_size > 1);
+
+        // -------------------------------------------------------------------
+        // Pipeline parallelism: non-last stages
+        // Run eager forward, send intermediates, return dummy output.
+        // Must be before the model/kv/device destructuring to avoid borrow conflicts.
+        // -------------------------------------------------------------------
+        #[cfg(feature = "nccl")]
+        if pp_active {
+            let pp = self.pp_config.unwrap();
+            if !pp.is_last_stage() {
+                return self.execute_pp_non_last_stage(pp, prepared, block_size);
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // PP last stage: recv intermediates from previous stage before forward.
+        // Must be before the model/kv/device destructuring to avoid borrow conflicts.
+        // -------------------------------------------------------------------
+        #[cfg(feature = "nccl")]
+        let pp_intermediate: Option<(vllm_cuda::OwnedTensor, vllm_cuda::OwnedTensor)> = if pp_active
+        {
+            let pp = self.pp_config.unwrap();
+            debug_assert!(pp.is_last_stage());
+            if !pp.is_first_stage() {
+                let pp_group = self.pp_group.as_ref().unwrap();
+                let hs_buf = self.pp_recv_hs_buf.as_ref().unwrap();
+                let res_buf = self.pp_recv_res_buf.as_ref().unwrap();
+                let device = self.device.as_mut().ok_or_else(|| {
+                    ExecutorError::WorkerExecution("device not initialized".into())
+                })?;
+                Some(Self::pp_recv_intermediates(
+                    pp_group,
+                    hs_buf,
+                    res_buf,
+                    pp,
+                    total_tokens,
+                    device,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "nccl"))]
+        let pp_intermediate: Option<(vllm_cuda::OwnedTensor, vllm_cuda::OwnedTensor)> = None;
+
         // Split borrows: model + kv_cache (shared) vs device (mutable).
         // Use direct field access so the borrow checker sees disjoint borrows.
         let gdn_pool_ref = self.gdn_state_pool.as_ref();
@@ -4625,8 +5094,6 @@ impl CudaWorker {
                 ));
             }
         };
-        let num_reqs = prepared.req_inputs.len();
-        let total_tokens = prepared.flat_token_ids.len();
 
         // Build batch_req_ids and update logits processor pipeline.
         self.batch_req_ids.clear();
@@ -4763,8 +5230,11 @@ impl CudaWorker {
 
         // Check if this is a pure decode batch (all q_len=1) and we have a graph.
         // We allow padding to the nearest captured graph size (e.g. BS=3 → graph BS=4).
+        // PP last stage: skip CUDA graphs for now — use eager forward with forward_pp.
         let is_decode = prepared.attn_meta.q_lens.iter().all(|&q| q == 1);
-        let graph_bs = if is_decode {
+        let graph_bs = if pp_active {
+            None // PP stages use eager forward only
+        } else if is_decode {
             self.graph_runner
                 .as_ref()
                 .and_then(|r| r.nearest_graph_size(num_reqs))
@@ -4796,7 +5266,9 @@ impl CudaWorker {
             .iter()
             .any(|r| !r.spec_token_ids.is_empty());
         let is_mixed = !is_decode && has_decode;
-        let decode_graph_bs = if is_mixed && !any_spec_in_batch {
+        let decode_graph_bs = if pp_active {
+            None // PP stages use eager forward only
+        } else if is_mixed && !any_spec_in_batch {
             self.graph_runner.as_ref().and_then(|r| {
                 let n_decode = prepared
                     .attn_meta
@@ -5621,6 +6093,35 @@ impl CudaWorker {
                             device,
                             last_token_indices,
                         )
+                    }
+                } else if pp_active {
+                    // PP last stage: use forward_pp with received intermediates.
+                    let input_ids = if self.pp_config.unwrap().is_first_stage() {
+                        Some(gpu_input_ids)
+                    } else {
+                        None
+                    };
+                    let result = unsafe {
+                        model.forward_pp(
+                            input_ids,
+                            pp_intermediate,
+                            gpu_positions,
+                            slot_mapping,
+                            cu_seqlens_q,
+                            seqused_k,
+                            block_table,
+                            max_seqlen_q,
+                            max_seqlen_k,
+                            kv_cache,
+                            device,
+                            last_token_indices,
+                        )
+                    };
+                    match result {
+                        vllm_cuda::model::llama::ForwardOutput::Logits(t) => t,
+                        vllm_cuda::model::llama::ForwardOutput::Intermediate { .. } => {
+                            unreachable!("last PP stage should return Logits");
+                        }
                     }
                 } else {
                     unsafe {

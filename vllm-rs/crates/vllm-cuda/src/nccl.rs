@@ -117,6 +117,76 @@ impl NcclGroup {
         Ok(())
     }
 
+    /// Point-to-point send to `peer` rank. Non-blocking on the host.
+    ///
+    /// Enqueued on the comm's CUDA stream. Matches Python's `ncclSend` —
+    /// no `ncclGroupStart/End` wrapping (each tensor gets its own call).
+    pub unsafe fn send(&self, tensor: GpuTensor, peer: usize) -> Result<()> {
+        let numel = tensor.numel();
+        let nccl_dtype = gpu_dtype_to_nccl(tensor.dtype())?;
+        let ptr = tensor.raw_ptr() as *const c_void;
+
+        nccl_result::send(
+            ptr,
+            numel,
+            nccl_dtype,
+            peer as i32,
+            self.comm,
+            self.stream as nccl_sys::cudaStream_t,
+        )
+        .map_err(|e| anyhow::anyhow!("ncclSend to peer {peer} failed: {:?}", e))?;
+        Ok(())
+    }
+
+    /// Point-to-point recv from `peer` rank into a pre-allocated buffer.
+    /// Non-blocking on the host.
+    ///
+    /// The tensor must be pre-allocated with the correct shape and dtype.
+    /// Enqueued on the comm's CUDA stream.
+    pub unsafe fn recv(&self, tensor: GpuTensor, peer: usize) -> Result<()> {
+        let numel = tensor.numel();
+        let nccl_dtype = gpu_dtype_to_nccl(tensor.dtype())?;
+        let ptr = tensor.raw_ptr() as *mut c_void;
+
+        nccl_result::recv(
+            ptr,
+            numel,
+            nccl_dtype,
+            peer as i32,
+            self.comm,
+            self.stream as nccl_sys::cudaStream_t,
+        )
+        .map_err(|e| anyhow::anyhow!("ncclRecv from peer {peer} failed: {:?}", e))?;
+        Ok(())
+    }
+
+    /// In-place broadcast from `root` to all ranks. Non-blocking on the host.
+    ///
+    /// The root rank's tensor data is broadcast to all other ranks.
+    /// All ranks must call with the same shape, dtype, and root.
+    pub unsafe fn broadcast_inplace(&self, tensor: GpuTensor, root: usize) -> Result<()> {
+        let numel = tensor.numel();
+        let nccl_dtype = gpu_dtype_to_nccl(tensor.dtype())?;
+        let ptr = tensor.raw_ptr() as *mut c_void;
+
+        nccl_result::broadcast(
+            ptr as *const c_void,
+            ptr,
+            numel,
+            nccl_dtype,
+            root as i32,
+            self.comm,
+            self.stream as nccl_sys::cudaStream_t,
+        )
+        .map_err(|e| anyhow::anyhow!("ncclBroadcast from root {root} failed: {:?}", e))?;
+        Ok(())
+    }
+
+    /// Get the CUDA stream associated with this communicator.
+    pub fn stream(&self) -> CUstream {
+        self.stream
+    }
+
     /// All-gather along dim=0: each rank contributes `tensor` (same shape),
     /// output is `[world_size * dim0, ...]`.
     ///

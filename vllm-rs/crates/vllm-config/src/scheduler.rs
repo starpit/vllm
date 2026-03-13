@@ -113,6 +113,12 @@ pub struct SchedulerConfig {
     /// Used by the KV cache allocator to reserve extra blocks for draft tokens.
     #[serde(default)]
     pub num_lookahead_tokens: usize,
+
+    /// Whether pipeline parallelism is active. When true and async_scheduling
+    /// is false, the scheduler populates `new_token_ids` in
+    /// `CachedRequestData` so non-last PP stages can embed the correct tokens.
+    #[serde(default)]
+    pub use_pp: bool,
 }
 
 fn one() -> usize {
@@ -168,6 +174,7 @@ impl Default for SchedulerConfig {
             async_scheduling: None,
             stream_interval: 1,
             num_lookahead_tokens: 0,
+            use_pp: false,
         }
     }
 }

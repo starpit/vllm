@@ -3718,11 +3718,20 @@ impl Worker for CudaWorker {
 
         // Like Python vLLM: profile peak activation memory with a dummy forward
         // pass, then subtract it from available memory for KV cache sizing.
-        let (free_before, _total) = cudarc::driver::result::mem_get_info()
+        //
+        // We measure free memory at two points:
+        //   free_after_load: after model load, before profiling allocations
+        //     → used for weights_and_overhead = total - free_after_load
+        //   free_before_fwd: after dummy KV + inputs, before forward pass
+        //     → peak_activations = free_before_fwd - free_after_fwd
+        //
+        // This avoids counting the dummy KV cache as "activations" (which was
+        // previously stealing ~1.5 GiB from the real KV cache budget).
+        let (free_after_load, _) = cudarc::driver::result::mem_get_info()
             .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
         info!(
             "CudaWorker: {:.0} MB free VRAM",
-            free_before as f64 / 1_048_576.0
+            free_after_load as f64 / 1_048_576.0
         );
 
         let device = self
@@ -3810,6 +3819,11 @@ impl Worker for CudaWorker {
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("dummy KvCachePool: {e}")))?;
 
+        // Measure free memory AFTER allocating dummy KV + inputs, so only
+        // the forward pass activations (+ cuBLAS workspace) are counted.
+        let (free_before_fwd, _) = cudarc::driver::result::mem_get_info()
+            .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
+
         // Run the forward pass to warm up cuBLAS and measure peak memory.
         unsafe {
             let _ = model.forward_owned(
@@ -3839,7 +3853,7 @@ impl Worker for CudaWorker {
         unsafe { device.caching.free_leaked_blocks() };
         device.caching.trim();
 
-        let peak_activation_bytes = free_before.saturating_sub(free_after);
+        let peak_activation_bytes = free_before_fwd.saturating_sub(free_after);
 
         // Match Python vLLM's memory calculation exactly.
         //
@@ -3850,12 +3864,12 @@ impl Worker for CudaWorker {
         //   available_kv_bytes = requested - non_kv_cache
         //   num_blocks = available_kv_bytes / bytes_per_block  (no extra util)
         //
-        // Our free_before is measured AFTER model load (before profile run).
-        // So (total - free_before) captures model weights + CUDA context +
+        // free_after_load is measured AFTER model load (before profiling).
+        // So (total - free_after_load) captures model weights + CUDA context +
         // cuBLAS workspace — equivalent to Python's (weights + non_torch).
         let (_, total_memory) = cudarc::driver::result::mem_get_info()
             .map_err(|e| ExecutorError::WorkerInit(format!("cuMemGetInfo: {e}")))?;
-        let weights_and_overhead = total_memory.saturating_sub(free_before);
+        let weights_and_overhead = total_memory.saturating_sub(free_after_load);
 
         let utilization = self.config.gpu_memory_utilization;
         let available_kv_bytes = compute_available_kv_bytes(

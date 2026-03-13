@@ -6,7 +6,7 @@ license.workspace = true
 description = "CLI binary for vLLM Rust inference engine"
 
 [features]
-default = ["bench", "guided-decoding", "chat-template", "metrics", "multimodal", "tls", "gce"]
+default = ["bench", "guided-decoding", "chat-template", "metrics", "multimodal", "tls"]
 otel = ["vllm-serve/otel"]
 gce = ["vllm-gce"]
 bench = ["vllm-bench"]

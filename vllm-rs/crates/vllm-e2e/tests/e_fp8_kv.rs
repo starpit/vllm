@@ -157,6 +157,124 @@ async fn test_cuda_fp8_kv_multi_turn_chat() {
     assert!(!text3.is_empty(), "turn 3 should not be empty");
 }
 
+// ---------------------------------------------------------------------------
+// CUDA graph tests (no --enforce-eager)
+// ---------------------------------------------------------------------------
+
+/// FP8 KV cache with CUDA graphs: server starts and captures graphs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_fp8_kv_graph_server_starts() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .with_args(&["--kv-cache-dtype", "fp8_e4m3"])
+        .start()
+        .await
+        .expect("FP8 KV + CUDA graph server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+}
+
+/// FP8 KV cache with CUDA graphs: single completion.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_fp8_kv_graph_completion() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .with_args(&["--kv-cache-dtype", "fp8_e4m3"])
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+    let request = simple_completion_request("The meaning of life is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    assert!(
+        !resp.choices[0].text.is_empty(),
+        "FP8 KV graph completion should not be empty"
+    );
+}
+
+/// FP8 KV cache with CUDA graphs: multi-turn chat exercises decode dequant
+/// through the graph replay path (both full replay and fast replay).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_fp8_kv_graph_multi_turn() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .with_args(&["--kv-cache-dtype", "fp8_e4m3"])
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Turn 1
+    let req1 = simple_chat_request("What is 2+2?", Some(30));
+    let resp1 = client.chat_completion(&req1).await.unwrap();
+    assert_valid_chat_response(&resp1);
+    let text1 = resp1.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(!text1.is_empty(), "turn 1 should not be empty");
+
+    // Turn 2 (exercises steady-state graph decode with growing seqused_k)
+    let req2 = simple_chat_request("What is 3+3?", Some(30));
+    let resp2 = client.chat_completion(&req2).await.unwrap();
+    assert_valid_chat_response(&resp2);
+    let text2 = resp2.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(!text2.is_empty(), "turn 2 should not be empty");
+
+    // Turn 3
+    let req3 = simple_chat_request("What is 4+4?", Some(30));
+    let resp3 = client.chat_completion(&req3).await.unwrap();
+    assert_valid_chat_response(&resp3);
+    let text3 = resp3.choices[0].message.content.as_deref().unwrap_or("");
+    assert!(!text3.is_empty(), "turn 3 should not be empty");
+}
+
+/// FP8 KV cache with CUDA graphs: concurrent requests exercises batch > 1
+/// decode through the graph, triggering batch-padded replay.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_fp8_kv_graph_concurrent() {
+    let server = TestServer::builder(TestModels::QWEN2_0_5B_CUDA)
+        .with_args(&["--kv-cache-dtype", "fp8_e4m3"])
+        .start()
+        .await
+        .unwrap();
+
+    let client = Client::new(server.base_url());
+
+    // Launch 3 concurrent completions to exercise batch > 1 decode graphs.
+    let futs: Vec<_> = (0..3)
+        .map(|i| {
+            let c = Client::new(server.base_url());
+            let prompt = format!("Count from {i} to ten:");
+            tokio::spawn(async move {
+                let req = CompletionRequest {
+                    prompt: Some(CompletionPrompt::Single(prompt)),
+                    max_tokens: Some(20),
+                    temperature: Some(0.0),
+                    ..serde_json::from_str(r#"{}"#).unwrap()
+                };
+                c.completion(&req).await
+            })
+        })
+        .collect();
+
+    for (i, fut) in futs.into_iter().enumerate() {
+        let resp = fut.await.unwrap().unwrap();
+        assert_valid_completion_response(&resp);
+        assert!(
+            !resp.choices[0].text.is_empty(),
+            "concurrent request {i} should not be empty"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block count comparison
+// ---------------------------------------------------------------------------
+
 /// FP8 KV cache should allocate approximately 2x the blocks of BF16.
 /// We compare the server_info endpoint's num_gpu_blocks between the two.
 #[tokio::test(flavor = "multi_thread")]

@@ -53,6 +53,10 @@ __global__ void dequant_gather_pages_bf16_kernel(
     }
     seq_idx = lo;
 
+    // Bounds check: blocks beyond actual total_kv_tokens exit early.
+    // This enables over-sized grid launch during CUDA graph capture.
+    if (seq_idx >= batch_size) return;
+
     // Position within this sequence
     const int pos_in_seq = token_flat - cu_seqlens_k[seq_idx];
 
@@ -128,6 +132,9 @@ __global__ void dequant_gather_pages_f16_kernel(
         }
     }
     seq_idx = lo;
+
+    // Bounds check: blocks beyond actual total_kv_tokens exit early.
+    if (seq_idx >= batch_size) return;
 
     const int pos_in_seq = token_flat - cu_seqlens_k[seq_idx];
     const int page_idx = pos_in_seq / block_size;

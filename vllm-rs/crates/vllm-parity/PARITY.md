@@ -236,7 +236,7 @@
 | MXFP4 (microscaling) | ✅ | ❌ |  |
 | ModelOpt (NVIDIA FP4/FP8) | ✅ | ❌ |  |
 | Quark (AMD) | ✅ | ❌ |  |
-| FP8 KV cache quantization | ✅ | ✅ | CudaWorker: FP8 E4M3 KV cache with dequant-gather + contiguous FA2 |
+| FP8 KV cache quantization | ✅ | ✅ | CudaWorker: FP8 E4M3 KV cache with dequant-gather + contiguous FA2; CUDA graphs supported (pre-allocated dequant buffers + GPU prefix-sum cu_seqlens_k). TODO: native FP8 paged FA2 (avoid dequant to BF16); per-channel KV scales (currently per-tensor); online KV scale calibration (calculate_kv_scales dynamic update during inference) |
 
 ---
 
@@ -358,7 +358,7 @@
 | Contiguous KV buffer (CUDA decode opt) | ✅ | ✅ | Avoids Tensor::cat per step |
 | CPU swap space | ✅ | ❌ | Python: default 4 GB |
 | KV cache offloading to CPU | ✅ | ❌ |  |
-| FP8 KV cache | ✅ | ✅ | --kv-cache-dtype fp8_e4m3 + --calculate-kv-scales; 2x block capacity |
+| FP8 KV cache | ✅ | ✅ | --kv-cache-dtype fp8_e4m3 + --calculate-kv-scales; 2x block capacity; CUDA graphs supported |
 | KV transfer / disaggregated prefill | ✅ | ❌ | Python: NCCL, LMCache, NIXL, Mooncake connectors |
 
 ---
@@ -441,7 +441,7 @@
 
 | Feature | Python | Rust | Notes |
 |---|:---:|:---:|---|
-| CUDA graphs (decode) | ✅ | ✅ | CudaWorker: BS=[1-32] with batch padding + in-graph argmax; MoE compatible |
+| CUDA graphs (decode) | ✅ | ✅ | CudaWorker: BS=[1-32] with batch padding + in-graph argmax; MoE compatible; FP8 KV cache compatible (pre-allocated dequant buffers) |
 | Fused RMS norm + residual add | ✅ | ✅ | CUDA kernel; vectorized 128-bit loads |
 | Fused rotary embeddings | ✅ | ✅ | CUDA kernel |
 | Fused MoE gating (top-k) | ✅ | ✅ | TRT-LLM topk_softmax kernel with GpuTensor FFI |

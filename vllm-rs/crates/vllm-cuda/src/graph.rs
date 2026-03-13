@@ -53,6 +53,23 @@ pub struct CudaGraphRunner {
     max_batch: usize,
     dtype: DType,
     vocab_size: usize,
+
+    // --- FP8 KV cache dequant buffers (None when KV cache is BF16/F16) ---
+    /// `[max_total_kv, num_kv_heads, head_dim]` in model dtype — pre-allocated
+    /// contiguous K buffer for FP8 dequant during graph capture/replay.
+    fp8_k_buf: Option<*mut u8>,
+    /// Same shape — pre-allocated contiguous V buffer.
+    fp8_v_buf: Option<*mut u8>,
+    /// `[max_batch + 1]` i32 — persistent cu_seqlens_k for FP8 dequant.
+    fp8_cu_seqlens_k: Option<*mut u8>,
+    /// Max total KV tokens = max_batch * padded_max_seqlen_k.
+    fp8_max_total_kv: usize,
+    fp8_num_kv_heads: usize,
+    fp8_head_dim: usize,
+    /// Per-layer cached K scales (host-side). Read once during warmup.
+    fp8_k_scales: Vec<f32>,
+    /// Per-layer cached V scales (host-side).
+    fp8_v_scales: Vec<f32>,
 }
 
 unsafe impl Send for CudaGraphRunner {}
@@ -81,11 +98,138 @@ impl CudaGraphRunner {
             max_batch,
             dtype,
             vocab_size,
+            fp8_k_buf: None,
+            fp8_v_buf: None,
+            fp8_cu_seqlens_k: None,
+            fp8_max_total_kv: 0,
+            fp8_num_kv_heads: 0,
+            fp8_head_dim: 0,
+            fp8_k_scales: Vec::new(),
+            fp8_v_scales: Vec::new(),
         })
     }
 
     pub fn has_graph(&self, batch_size: usize) -> bool {
         self.graphs.contains_key(&batch_size)
+    }
+
+    /// Allocate FP8 dequant buffers for CUDA graph capture/replay.
+    ///
+    /// Call once after construction when `kv_cache_is_fp8`. Allocates persistent
+    /// K/V contiguous buffers and cu_seqlens_k at max capacity.
+    ///
+    /// # Safety
+    /// CUDA context must be current.
+    pub unsafe fn init_fp8_buffers(
+        &mut self,
+        padded_max_seqlen_k: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        model_dtype: DType,
+    ) -> Result<()> {
+        let max_total_kv = self.max_batch * padded_max_seqlen_k;
+        let elem_bytes = model_dtype.size_bytes();
+        let buf_bytes = max_total_kv * num_kv_heads * head_dim * elem_bytes;
+
+        let k_buf = driver::mem_alloc(buf_bytes)?;
+        let v_buf = driver::mem_alloc(buf_bytes)?;
+        let cu_seqlens_k = driver::mem_alloc((self.max_batch + 1) * 4)?;
+
+        self.fp8_k_buf = Some(k_buf);
+        self.fp8_v_buf = Some(v_buf);
+        self.fp8_cu_seqlens_k = Some(cu_seqlens_k);
+        self.fp8_max_total_kv = max_total_kv;
+        self.fp8_num_kv_heads = num_kv_heads;
+        self.fp8_head_dim = head_dim;
+
+        let buf_mb = (2 * buf_bytes) as f64 / (1024.0 * 1024.0);
+        tracing::info!(
+            "FP8 graph dequant buffers allocated: {buf_mb:.1} MB \
+             (max_total_kv={max_total_kv}, heads={num_kv_heads}, dim={head_dim})"
+        );
+
+        Ok(())
+    }
+
+    /// Cache per-layer FP8 KV scales from GPU. Call after graph warmup.
+    ///
+    /// # Safety
+    /// Scale pointers must be valid. CUDA context must be current.
+    pub unsafe fn cache_fp8_scales(
+        &mut self,
+        kv_cache: &crate::kv_cache::KvCachePool,
+        stream: CUstream,
+    ) -> Result<()> {
+        let num_layers = kv_cache.num_layers;
+        self.fp8_k_scales.resize(num_layers, 1.0);
+        self.fp8_v_scales.resize(num_layers, 1.0);
+
+        for layer in 0..num_layers {
+            driver::memcpy_dtoh_async(
+                &mut self.fp8_k_scales[layer] as *mut f32 as *mut u8,
+                kv_cache.k_scale_ptr(layer) as *const u8,
+                4,
+                stream,
+            )?;
+            driver::memcpy_dtoh_async(
+                &mut self.fp8_v_scales[layer] as *mut f32 as *mut u8,
+                kv_cache.v_scale_ptr(layer) as *const u8,
+                4,
+                stream,
+            )?;
+        }
+        driver::stream_synchronize(stream)?;
+
+        tracing::debug!(
+            "Cached FP8 scales for {num_layers} layers: k[0]={}, v[0]={}",
+            self.fp8_k_scales[0],
+            self.fp8_v_scales[0],
+        );
+        Ok(())
+    }
+
+    /// Build an [`Fp8GraphCtx`] for the thread-local. Returns `None` if FP8
+    /// buffers are not allocated.
+    pub fn fp8_graph_ctx(&self) -> Option<crate::model::attention_helpers::Fp8GraphCtx> {
+        let k_buf = self.fp8_k_buf?;
+        let v_buf = self.fp8_v_buf?;
+        let cu_seqlens_k = self.fp8_cu_seqlens_k?;
+        Some(crate::model::attention_helpers::Fp8GraphCtx {
+            k_buf,
+            v_buf,
+            cu_seqlens_k,
+            max_total_kv: self.fp8_max_total_kv,
+            num_kv_heads: self.fp8_num_kv_heads,
+            head_dim: self.fp8_head_dim,
+            output_dtype: self.dtype,
+            k_scales: self.fp8_k_scales.as_ptr(),
+            v_scales: self.fp8_v_scales.as_ptr(),
+        })
+    }
+
+    /// Upload cu_seqlens_k to the persistent FP8 buffer. Call before replay.
+    ///
+    /// # Safety
+    /// FP8 buffers must be initialized.
+    pub unsafe fn upload_fp8_cu_seqlens_k(
+        &self,
+        cu_seqlens_k: &[i32],
+        stream: CUstream,
+    ) -> Result<()> {
+        if let Some(ptr) = self.fp8_cu_seqlens_k {
+            driver::memcpy_htod_async(
+                ptr,
+                cu_seqlens_k.as_ptr() as *const u8,
+                cu_seqlens_k.len() * 4,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Whether FP8 dequant buffers are allocated.
+    pub fn has_fp8_buffers(&self) -> bool {
+        self.fp8_k_buf.is_some()
     }
 
     pub fn nearest_graph_size(&self, batch_size: usize) -> Option<usize> {
@@ -247,6 +391,20 @@ impl CudaGraphRunner {
             xfer,
         )?;
 
+        // FP8: compute cu_seqlens_k from seqused_k (CPU prefix sum) and upload.
+        if let Some(cu_k_ptr) = self.fp8_cu_seqlens_k {
+            let mut cu_seqlens_k_host = vec![0i32; batch_size + 1];
+            for i in 0..batch_size {
+                cu_seqlens_k_host[i + 1] = cu_seqlens_k_host[i] + seqused_k[i];
+            }
+            driver::memcpy_htod_async(
+                cu_k_ptr,
+                cu_seqlens_k_host.as_ptr() as *const u8,
+                (batch_size + 1) * 4,
+                xfer,
+            )?;
+        }
+
         device.sync_transfer_to_compute()?;
 
         // No allocator reset needed — graph uses baked-in addresses.
@@ -311,6 +469,16 @@ impl CudaGraphRunner {
             stream,
         );
 
+        // FP8: compute cu_seqlens_k from seqused_k on GPU (prefix sum kernel).
+        if let Some(cu_k_ptr) = self.fp8_cu_seqlens_k {
+            kernels::compute_cu_seqlens_k_gpu(
+                self.seqused_k as *const u8,
+                cu_k_ptr,
+                batch_size,
+                stream,
+            );
+        }
+
         driver::graph_launch(graph.exec, stream)?;
 
         let logits = GpuTensor::new(
@@ -359,6 +527,18 @@ impl CudaGraphRunner {
             batch_size * MAX_BLOCKS_PER_SEQ * 4,
             stream,
         )?;
+
+        // Fill FP8 cu_seqlens_k with dummy prefix sums matching seqused_k=[1,1,...].
+        if let Some(cu_k_ptr) = self.fp8_cu_seqlens_k {
+            let cu_k: Vec<i32> = (0..=batch_size as i32).collect();
+            driver::memcpy_htod_async(
+                cu_k_ptr,
+                cu_k.as_ptr() as *const u8,
+                (batch_size + 1) * 4,
+                stream,
+            )?;
+        }
+
         Ok(())
     }
 
@@ -398,6 +578,15 @@ impl Drop for CudaGraphRunner {
             let _ = driver::mem_free(self.block_table);
             let _ = driver::mem_free(self.shared_logits);
             let _ = driver::mem_free(self.shared_argmax);
+            if let Some(p) = self.fp8_k_buf {
+                let _ = driver::mem_free(p);
+            }
+            if let Some(p) = self.fp8_v_buf {
+                let _ = driver::mem_free(p);
+            }
+            if let Some(p) = self.fp8_cu_seqlens_k {
+                let _ = driver::mem_free(p);
+            }
         }
     }
 }

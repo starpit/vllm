@@ -4345,13 +4345,6 @@ impl Worker for CudaWorker {
             return Ok(());
         }
 
-        if self.kv_cache_is_fp8 {
-            info!(
-                "CudaWorker: FP8 KV cache — skipping CUDA graph capture (variable scratch buffer sizes)"
-            );
-            return Ok(());
-        }
-
         let (model, kv_cache, device) = match (&self.model, &self.kv_cache, &mut self.device) {
             (Some(m), Some(kv), Some(d)) => (m, kv, d),
             _ => return Ok(()), // Not fully initialized yet.
@@ -4388,9 +4381,37 @@ impl Worker for CudaWorker {
         let mut runner = unsafe { CudaGraphRunner::new(max_bs, vocab_size, self.model_dtype) }
             .map_err(|e| ExecutorError::WorkerInit(format!("CudaGraphRunner::new: {e}")))?;
 
+        // Capture with max_seqlen_k padded to 2048. Paged FA2 uses per-sequence
+        // lengths from seqused_k and iterates via block_table, so a large
+        // max_seqlen_k just over-allocates workspace — correctness is maintained.
+        // This avoids re-capture as sequences grow during inference.
+        let padded_max_seqlen_k: usize = 2048;
+
+        // FP8 KV cache: allocate persistent dequant buffers and cache scales.
+        if self.kv_cache_is_fp8 {
+            unsafe {
+                runner
+                    .init_fp8_buffers(
+                        padded_max_seqlen_k,
+                        kv_cache.num_kv_heads,
+                        kv_cache.head_dim,
+                        self.model_dtype,
+                    )
+                    .map_err(|e| ExecutorError::WorkerInit(format!("init_fp8_buffers: {e}")))?;
+                runner
+                    .cache_fp8_scales(kv_cache, device.compute_stream)
+                    .map_err(|e| ExecutorError::WorkerInit(format!("cache_fp8_scales: {e}")))?;
+            }
+        }
+
         // Begin private pool for ALL graph captures (like PyTorch's shared graph pool).
         // One pool is shared across all batch sizes so blocks are reused.
         device.caching.begin_allocate_to_pool();
+
+        // Set FP8 graph context thread-local so attention helpers use pre-allocated path.
+        if let Some(ctx) = runner.fp8_graph_ctx() {
+            vllm_cuda::model::attention_helpers::set_fp8_graph_ctx(ctx);
+        }
 
         // Capture largest batch sizes first (matching Python vLLM). The first
         // capture establishes the pool's high-water mark; subsequent smaller
@@ -4400,12 +4421,6 @@ impl Worker for CudaWorker {
             info!("Capturing CUDA graph for batch_size={bs}...");
             let kv_ref = kv_cache;
             let model_ref = model;
-
-            // Capture with max_seqlen_k padded to 2048. Paged FA2 uses per-sequence
-            // lengths from seqused_k and iterates via block_table, so a large
-            // max_seqlen_k just over-allocates workspace — correctness is maintained.
-            // This avoids re-capture as sequences grow during inference.
-            let padded_max_seqlen_k: usize = 2048;
 
             let result = unsafe {
                 runner.capture(bs, device, |inputs, dev| {
@@ -4434,6 +4449,9 @@ impl Worker for CudaWorker {
                 }
             }
         }
+
+        // Clear FP8 graph context thread-local.
+        vllm_cuda::model::attention_helpers::clear_fp8_graph_ctx();
 
         // End private pool after all captures. Blocks in the pool that are
         // still free are effectively owned by the captured graphs.

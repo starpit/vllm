@@ -4,6 +4,12 @@
 //! All model attention modules call these instead of directly invoking
 //! reshape_and_cache/flash_attn to get FP8 quantize-on-write and
 //! dequant-on-read behavior transparently.
+//!
+//! During CUDA graph capture/replay, the [`Fp8GraphCtx`] thread-local provides
+//! pre-allocated dequant buffers and cached scales, eliminating the D2H syncs
+//! and variable-size allocations that would otherwise break graph capture.
+
+use std::cell::Cell;
 
 use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::dtype::DType;
@@ -12,6 +18,61 @@ use crate::kv_cache::KvCachePool;
 use crate::tensor::GpuTensor;
 
 type CUstream = cudarc::driver::sys::CUstream;
+
+// ---------------------------------------------------------------------------
+// FP8 CUDA graph context (thread-local)
+// ---------------------------------------------------------------------------
+
+/// Pre-allocated buffers and cached scales for FP8 decode during graph
+/// capture/replay. Set via [`set_fp8_graph_ctx`] before capture, cleared after.
+///
+/// All pointer fields are persistent GPU allocations owned by [`CudaGraphRunner`].
+#[derive(Clone, Copy)]
+pub struct Fp8GraphCtx {
+    /// `[max_total_kv, num_kv_heads, head_dim]` in model dtype (BF16/F16).
+    pub k_buf: *mut u8,
+    /// Same shape as `k_buf`.
+    pub v_buf: *mut u8,
+    /// `[max_batch + 1]` i32 — prefix-sum of per-sequence KV lengths.
+    pub cu_seqlens_k: *mut u8,
+    /// Grid launch size for dequant kernels (= buffer capacity in tokens).
+    pub max_total_kv: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub output_dtype: DType,
+    /// Host-side per-layer K scales (len = num_layers). Pointer into a Vec
+    /// owned by CudaGraphRunner — valid for the duration of the graph ctx.
+    pub k_scales: *const f32,
+    /// Host-side per-layer V scales.
+    pub v_scales: *const f32,
+}
+
+// Raw pointers are Send — the buffers are GPU-side and only accessed on the
+// thread that owns the CUDA context.
+unsafe impl Send for Fp8GraphCtx {}
+
+thread_local! {
+    static FP8_GRAPH_CTX: Cell<Option<Fp8GraphCtx>> = const { Cell::new(None) };
+}
+
+/// Set the FP8 graph context for the current thread. Call before graph capture.
+pub fn set_fp8_graph_ctx(ctx: Fp8GraphCtx) {
+    FP8_GRAPH_CTX.set(Some(ctx));
+}
+
+/// Clear the FP8 graph context. Call after graph capture completes.
+pub fn clear_fp8_graph_ctx() {
+    FP8_GRAPH_CTX.set(None);
+}
+
+/// Returns `true` if the FP8 graph context is active on this thread.
+pub fn has_fp8_graph_ctx() -> bool {
+    FP8_GRAPH_CTX.get().is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 /// Write K/V into the paged cache, handling both BF16 and FP8 paths.
 ///
@@ -211,11 +272,18 @@ pub unsafe fn attention_ext(
     }
 }
 
+// ---------------------------------------------------------------------------
+// FP8 decode internals
+// ---------------------------------------------------------------------------
+
 /// FP8 decode path: dequant KV pages → contiguous BF16 → FA2.
 ///
-/// Builds cu_seqlens_k from seqused_k on CPU (small — batch sizes ≤ 512),
-/// uploads to GPU, then runs dequant_gather_pages for K and V, followed
-/// by contiguous flash attention.
+/// Two modes:
+/// 1. **Normal** (no graph ctx): D2H seqused_k + scales, allocate dequant buffers,
+///    run dequant+FA2. Used during eager decode.
+/// 2. **Graphed** (thread-local [`Fp8GraphCtx`] set): uses pre-allocated buffers
+///    and cached scales — no D2H syncs, no dynamic allocations. Used during CUDA
+///    graph capture.
 #[allow(clippy::too_many_arguments)]
 unsafe fn fp8_decode_attention(
     q: GpuTensor,
@@ -232,6 +300,27 @@ unsafe fn fp8_decode_attention(
     alloc: &mut CachingAllocator,
     stream: CUstream,
 ) -> OwnedTensor {
+    // Check for pre-allocated graph context.
+    if let Some(ctx) = FP8_GRAPH_CTX.get() {
+        return fp8_decode_attention_graphed(
+            q,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale,
+            softcap,
+            window_size_left,
+            kv_cache,
+            layer_idx,
+            ctx,
+            alloc,
+            stream,
+        );
+    }
+
+    // --- Normal (eager) path ---
     let batch_size = seqused_k.dim(0);
     let num_kv_heads = kv_cache.num_kv_heads;
     let head_dim = kv_cache.head_dim;
@@ -339,6 +428,99 @@ unsafe fn fp8_decode_attention(
         v_contiguous.as_gpu_tensor(),
         cu_seqlens_q,
         cu_seqlens_k_gpu.as_gpu_tensor(),
+        max_seqlen_q,
+        max_seqlen_k,
+        scale,
+        true,
+        softcap,
+        window_size_left,
+        alloc,
+        stream,
+    )
+}
+
+/// FP8 decode path for CUDA graph capture: uses pre-allocated buffers and cached
+/// scales. No D2H syncs, no dynamic allocations — all addresses are fixed.
+///
+/// The dequant kernel is launched with `ctx.max_total_kv` grid blocks. Blocks
+/// beyond the actual total (determined by `cu_seqlens_k`) exit early via the
+/// kernel's bounds check (`seq_idx >= batch_size`).
+#[allow(clippy::too_many_arguments)]
+unsafe fn fp8_decode_attention_graphed(
+    q: GpuTensor,
+    cu_seqlens_q: GpuTensor,
+    _seqused_k: GpuTensor,
+    block_table: GpuTensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    scale: f32,
+    softcap: f32,
+    window_size_left: i32,
+    kv_cache: &KvCachePool,
+    layer_idx: usize,
+    ctx: Fp8GraphCtx,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let batch_size = cu_seqlens_q.dim(0) - 1;
+
+    // Use cached host-side scales (no D2H sync needed).
+    let k_scale = *ctx.k_scales.add(layer_idx);
+    let v_scale = *ctx.v_scales.add(layer_idx);
+
+    // cu_seqlens_k lives in the graph runner's persistent buffer.
+    // During capture: filled with dummy prefix sums by fill_dummy_decode_fp8.
+    // During replay: updated by cuda_worker before graph launch.
+    let cu_seqlens_k_gpu = GpuTensor::new(ctx.cu_seqlens_k, &[batch_size + 1], DType::I32);
+
+    // Dequant into pre-allocated buffers with over-sized grid.
+    // Blocks beyond actual total_kv_tokens exit early (kernel bounds check).
+    kernels::dequant_gather_pages_into(
+        kv_cache.k_cache(layer_idx),
+        block_table,
+        cu_seqlens_k_gpu,
+        k_scale,
+        ctx.max_total_kv,
+        ctx.num_kv_heads,
+        ctx.head_dim,
+        kv_cache.block_size,
+        ctx.output_dtype,
+        ctx.k_buf,
+        stream,
+    );
+    kernels::dequant_gather_pages_into(
+        kv_cache.v_cache(layer_idx),
+        block_table,
+        cu_seqlens_k_gpu,
+        v_scale,
+        ctx.max_total_kv,
+        ctx.num_kv_heads,
+        ctx.head_dim,
+        kv_cache.block_size,
+        ctx.output_dtype,
+        ctx.v_buf,
+        stream,
+    );
+
+    // Create tensor views into the pre-allocated buffers.
+    let k_contiguous = GpuTensor::new(
+        ctx.k_buf,
+        &[ctx.max_total_kv, ctx.num_kv_heads, ctx.head_dim],
+        ctx.output_dtype,
+    );
+    let v_contiguous = GpuTensor::new(
+        ctx.v_buf,
+        &[ctx.max_total_kv, ctx.num_kv_heads, ctx.head_dim],
+        ctx.output_dtype,
+    );
+
+    // Contiguous FA2 on the dequantized K/V.
+    kernels::flash_attn_contiguous(
+        q,
+        k_contiguous,
+        v_contiguous,
+        cu_seqlens_q,
+        cu_seqlens_k_gpu,
         max_seqlen_q,
         max_seqlen_k,
         scale,

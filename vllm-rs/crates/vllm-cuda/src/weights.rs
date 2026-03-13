@@ -506,17 +506,18 @@ impl GpuWeights {
         tracing::info!("Loading {total} shards in parallel");
 
         #[allow(clippy::type_complexity)]
-        let shard_results: Vec<Result<(HashMap<String, CpuTensorRef>, Arc<memmap2::Mmap>)>> =
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = shard_files
-                    .iter()
-                    .map(|shard_name| {
-                        let shard_path = dir.join(shard_name);
-                        scope.spawn(move || load_shard_into_map(&shard_path))
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
+        let shard_results: Vec<
+            Result<(HashMap<String, CpuTensorRef>, Arc<memmap2::Mmap>)>,
+        > = std::thread::scope(|scope| {
+            let handles: Vec<_> = shard_files
+                .iter()
+                .map(|shard_name| {
+                    let shard_path = dir.join(shard_name);
+                    scope.spawn(move || load_shard_into_map(&shard_path))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
 
         let mut tensors = HashMap::new();
         let mut mmaps = Vec::with_capacity(shard_results.len());

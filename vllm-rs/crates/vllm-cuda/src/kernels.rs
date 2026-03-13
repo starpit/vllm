@@ -364,6 +364,14 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Prefix sum of seqused_k → cu_seqlens_k on GPU (single thread, batch ≤512)
+    fn prefix_sum_seqused_k_gpu(
+        seqused_k: *const i32,
+        cu_seqlens_k: *mut i32,
+        num_reqs: c_int,
+        stream: CUstream,
+    );
+
     // Split fused QKV
     fn split_qkv_f16(
         q: *mut u16,
@@ -1870,6 +1878,27 @@ pub unsafe fn update_decode_metadata_gpu(
     );
 }
 
+/// Compute cu_seqlens_k (prefix sum) from seqused_k on GPU.
+///
+/// `cu_seqlens_k` must have at least `num_reqs + 1` i32 elements.
+/// Single-thread kernel — batch sizes ≤512, sub-microsecond.
+///
+/// # Safety
+/// Pointers must be valid GPU memory. CUDA context must be current.
+pub unsafe fn compute_cu_seqlens_k_gpu(
+    seqused_k: *const u8,
+    cu_seqlens_k: *mut u8,
+    num_reqs: usize,
+    stream: CUstream,
+) {
+    prefix_sum_seqused_k_gpu(
+        seqused_k as *const i32,
+        cu_seqlens_k as *mut i32,
+        num_reqs as c_int,
+        stream,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Reshape and Cache (write new K/V tokens into paged KV cache)
 // ---------------------------------------------------------------------------
@@ -2164,6 +2193,68 @@ pub unsafe fn dequant_gather_pages(
     }
 
     out
+}
+
+/// Like [`dequant_gather_pages`] but writes into a caller-supplied output buffer
+/// instead of allocating. Used for CUDA graph capture where buffer addresses must
+/// be fixed.
+///
+/// `grid_total_kv` is the grid launch size (may exceed actual `total_kv_tokens`
+/// from `cu_seqlens_k` — the kernel bounds-checks via `seq_idx >= batch_size`).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dequant_gather_pages_into(
+    cache: GpuTensor,
+    block_table: GpuTensor,
+    cu_seqlens_k: GpuTensor,
+    scale: f32,
+    grid_total_kv: usize,
+    num_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    output_dtype: DType,
+    output_ptr: *mut u8,
+    stream: CUstream,
+) {
+    if grid_total_kv == 0 {
+        return;
+    }
+    let batch_size = cu_seqlens_k.dim(0) - 1;
+    let max_pages = block_table.dim(1);
+
+    match output_dtype {
+        DType::BF16 => dequant_gather_pages_bf16(
+            cache.raw_ptr() as *const u8,
+            block_table.as_ptr(),
+            cu_seqlens_k.as_ptr(),
+            scale,
+            grid_total_kv as i32,
+            num_heads as i32,
+            head_dim as i32,
+            block_size as i32,
+            max_pages as i32,
+            batch_size as i32,
+            output_ptr as *mut u16,
+            stream,
+        ),
+        DType::F16 => dequant_gather_pages_f16(
+            cache.raw_ptr() as *const u8,
+            block_table.as_ptr(),
+            cu_seqlens_k.as_ptr(),
+            scale,
+            grid_total_kv as i32,
+            num_heads as i32,
+            head_dim as i32,
+            block_size as i32,
+            max_pages as i32,
+            batch_size as i32,
+            output_ptr as *mut u16,
+            stream,
+        ),
+        _ => panic!(
+            "dequant_gather_pages_into: output must be BF16 or F16, got {:?}",
+            output_dtype
+        ),
+    }
 }
 
 /// Compute the abs-max of a BF16 tensor and write `scale = abs_max / divisor`.
@@ -8111,6 +8202,158 @@ mod tests_fp8_kv {
 
             assert!((k_scale - 3.14).abs() < 0.001, "k_scale={k_scale}");
             assert!((v_scale - 2.71).abs() < 0.001, "v_scale={v_scale}");
+        }
+    }
+
+    /// `dequant_gather_pages_into` writes to a pre-allocated output buffer.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_dequant_gather_pages_into() {
+        unsafe {
+            let (_alloc, stream) = test_init();
+
+            let num_heads = 1;
+            let head_dim = 8;
+            let block_size = 4;
+            let num_blocks = 2;
+            let n_elems = num_heads * head_dim;
+
+            // FP8 cache filled with 0x38 (1.0 in E4M3).
+            let cache_bytes = num_blocks * block_size * n_elems;
+            let cache_ptr = driver::mem_alloc(cache_bytes).expect("alloc");
+            let cache_data = vec![0x38u8; cache_bytes];
+            driver::memcpy_htod_async(cache_ptr, cache_data.as_ptr(), cache_bytes, stream)
+                .expect("H2D");
+            let cache = GpuTensor::new(
+                cache_ptr,
+                &[num_blocks, block_size, num_heads, head_dim],
+                DType::Fp8E4m3,
+            );
+
+            // 1 sequence, 3 tokens → block 0.
+            let bt = [0i32, 0];
+            let bt_ptr = upload_i32(&bt, stream);
+            let block_table = GpuTensor::new(bt_ptr, &[1, 2], DType::I32);
+
+            let cu = [0i32, 3];
+            let cu_ptr = upload_i32(&cu, stream);
+            let cu_t = GpuTensor::new(cu_ptr, &[2], DType::I32);
+
+            // Pre-allocate output buffer larger than needed (simulating graph capture).
+            let max_total = 8; // capacity > actual 3
+            let out_ptr = driver::mem_alloc(max_total * n_elems * 2).expect("alloc out");
+            // Zero it to detect writes.
+            driver::memset_d8(out_ptr, 0, max_total * n_elems * 2, stream).expect("memset");
+
+            dequant_gather_pages_into(
+                cache,
+                block_table,
+                cu_t,
+                1.0,
+                max_total, // over-sized grid
+                num_heads,
+                head_dim,
+                block_size,
+                DType::BF16,
+                out_ptr,
+                stream,
+            );
+
+            let out_count = max_total * n_elems;
+            let mut out_bf16 = vec![0u16; out_count];
+            driver::memcpy_dtoh_async(
+                out_bf16.as_mut_ptr() as *mut u8,
+                out_ptr as *const u8,
+                out_count * 2,
+                stream,
+            )
+            .expect("D2H");
+            driver::stream_synchronize(stream).expect("sync");
+
+            // First 3 tokens (24 elements) should be ~1.0.
+            for i in 0..(3 * n_elems) {
+                let val = bf16_to_f32(out_bf16[i]);
+                assert!(
+                    (val - 1.0).abs() < 0.1,
+                    "element {i}: expected ~1.0, got {val}"
+                );
+            }
+            // Elements beyond actual total should remain zero (bounds check worked).
+            for i in (3 * n_elems)..(max_total * n_elems) {
+                let val = bf16_to_f32(out_bf16[i]);
+                assert!(
+                    val.abs() < 0.001,
+                    "element {i} beyond total: expected ~0.0, got {val}"
+                );
+            }
+
+            let _ = driver::mem_free(cache_ptr);
+            let _ = driver::mem_free(bt_ptr);
+            let _ = driver::mem_free(cu_ptr);
+            let _ = driver::mem_free(out_ptr);
+        }
+    }
+
+    /// `prefix_sum_seqused_k_gpu` computes correct cu_seqlens_k on GPU.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_prefix_sum_seqused_k() {
+        unsafe {
+            let (_alloc, stream) = test_init();
+
+            let seqused = [5i32, 3, 8, 1];
+            let num_reqs = seqused.len();
+            let seqused_ptr = upload_i32(&seqused, stream);
+
+            let cu_ptr = driver::mem_alloc((num_reqs + 1) * 4).expect("alloc cu");
+            driver::memset_d8(cu_ptr, 0xFF, (num_reqs + 1) * 4, stream).expect("memset");
+
+            compute_cu_seqlens_k_gpu(seqused_ptr as *const u8, cu_ptr, num_reqs, stream);
+
+            let mut result = vec![0i32; num_reqs + 1];
+            driver::memcpy_dtoh_async(
+                result.as_mut_ptr() as *mut u8,
+                cu_ptr as *const u8,
+                (num_reqs + 1) * 4,
+                stream,
+            )
+            .expect("D2H");
+            driver::stream_synchronize(stream).expect("sync");
+
+            assert_eq!(result, [0, 5, 8, 16, 17], "prefix sum mismatch: {result:?}");
+
+            let _ = driver::mem_free(seqused_ptr);
+            let _ = driver::mem_free(cu_ptr);
+        }
+    }
+
+    /// `prefix_sum_seqused_k_gpu` with batch_size=1.
+    #[test]
+    #[ignore] // requires CUDA GPU
+    fn test_cuda_prefix_sum_seqused_k_single() {
+        unsafe {
+            let (_alloc, stream) = test_init();
+
+            let seqused = [42i32];
+            let seqused_ptr = upload_i32(&seqused, stream);
+            let cu_ptr = driver::mem_alloc(2 * 4).expect("alloc");
+
+            compute_cu_seqlens_k_gpu(seqused_ptr as *const u8, cu_ptr, 1, stream);
+
+            let mut result = vec![0i32; 2];
+            driver::memcpy_dtoh_async(
+                result.as_mut_ptr() as *mut u8,
+                cu_ptr as *const u8,
+                8,
+                stream,
+            )
+            .expect("D2H");
+            driver::stream_synchronize(stream).expect("sync");
+
+            assert_eq!(result, [0, 42]);
+
+            let _ = driver::mem_free(seqused_ptr);
+            let _ = driver::mem_free(cu_ptr);
         }
     }
 }

@@ -157,6 +157,38 @@ void update_decode_metadata(
 }  // extern "C"
 
 // ---------------------------------------------------------------------------
+// Prefix sum of seqused_k → cu_seqlens_k on GPU.
+// Single thread — batch sizes ≤512, so this is sub-microsecond.
+// ---------------------------------------------------------------------------
+
+__global__ void prefix_sum_seqused_k_kernel(
+    const int32_t* __restrict__ seqused_k,
+    int32_t* __restrict__ cu_seqlens_k,
+    int num_reqs
+) {
+    if (threadIdx.x != 0) return;
+    cu_seqlens_k[0] = 0;
+    for (int i = 0; i < num_reqs; i++) {
+        cu_seqlens_k[i + 1] = cu_seqlens_k[i] + seqused_k[i];
+    }
+}
+
+extern "C" {
+
+void prefix_sum_seqused_k_gpu(
+    const int32_t* seqused_k,
+    int32_t* cu_seqlens_k,
+    int num_reqs,
+    cudaStream_t stream
+) {
+    if (num_reqs == 0) return;
+    prefix_sum_seqused_k_kernel<<<1, 1, 0, stream>>>(
+        seqused_k, cu_seqlens_k, num_reqs);
+}
+
+}  // extern "C"
+
+// ---------------------------------------------------------------------------
 // Split fused QKV: [num_tokens, q_size + 2*kv_size] → Q, K, V contiguous
 // One thread per element.
 // ---------------------------------------------------------------------------

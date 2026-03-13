@@ -5,30 +5,44 @@
 //!
 //! After NCCL init, node_rank > 0 enters this blocking loop instead of
 //! starting an engine/scheduler/HTTP server. Rank 0 broadcasts
-//! `ControlMessage`s via NCCL; this loop receives them (on the worker
-//! thread, which owns the correct CUDA context) and dispatches to the
-//! local `ThreadPoolExecutor`.
+//! `ControlMessage`s via TCP; this loop receives them and dispatches to
+//! the local `UniProcExecutor`.
+//!
+//! NCCL collectives in the model forward pass synchronize tensor data
+//! between ranks automatically — no explicit NCCL calls needed here.
 
+#[cfg(feature = "nccl")]
 use tracing::{error, info};
+#[cfg(feature = "nccl")]
+use vllm_cuda::TcpControlChannel;
+#[cfg(feature = "nccl")]
 use vllm_engine::executor::Executor;
+#[cfg(feature = "nccl")]
 use vllm_executor::multinode::ControlMessage;
-use vllm_executor::threadpool::ThreadPoolExecutor;
+#[cfg(feature = "nccl")]
+use vllm_executor::uniproc::UniProcExecutor;
 
 /// Run the headless worker loop. Blocks forever (or until shutdown).
 ///
-/// Loops on NCCL broadcast (via worker thread): receive ControlMessage
-/// from rank 0, dispatch to local executor, discard output, repeat.
-pub fn run_headless(mut executor: ThreadPoolExecutor) -> anyhow::Result<()> {
-    info!("Headless worker: entering NCCL broadcast loop");
+/// Loops on TCP control channel: receive `ControlMessage` from rank 0,
+/// dispatch to local executor, discard output, repeat.
+#[cfg(feature = "nccl")]
+pub fn run_headless(
+    mut executor: UniProcExecutor,
+    mut channel: TcpControlChannel,
+) -> anyhow::Result<()> {
+    info!("Headless worker: entering TCP control channel loop");
 
     loop {
-        // Receive broadcast from rank 0 via NCCL (on the worker thread).
-        let data = executor
-            .nccl_broadcast(&[], 0)
-            .map_err(|e| anyhow::anyhow!("NCCL broadcast recv failed: {e}"))?;
+        // Receive broadcast from rank 0 via TCP.
+        let data = channel.recv()?;
 
-        let msg: ControlMessage = bincode::deserialize(&data)
-            .map_err(|e| anyhow::anyhow!("failed to deserialize control message: {e}"))?;
+        let msg: ControlMessage = bincode::deserialize(&data).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to deserialize control message ({} bytes): {e}",
+                data.len(),
+            )
+        })?;
 
         match msg {
             ControlMessage::ExecuteModel(scheduler_output) => {
@@ -46,6 +60,12 @@ pub fn run_headless(mut executor: ThreadPoolExecutor) -> anyhow::Result<()> {
                 );
                 if let Err(e) = executor.initialize_cache(num_gpu_blocks, num_cpu_blocks) {
                     error!("Headless worker: initialize_cache failed: {e}");
+                }
+            }
+            ControlMessage::Warmup => {
+                info!("Headless worker: warming up model");
+                if let Err(e) = executor.worker_mut().compile_or_warm_up_model() {
+                    error!("Headless worker: warmup failed: {e}");
                 }
             }
             ControlMessage::Shutdown => {

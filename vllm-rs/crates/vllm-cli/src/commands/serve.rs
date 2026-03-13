@@ -152,6 +152,21 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         distributed_executor_backend: args.distributed_executor_backend.clone(),
     };
 
+    // Multi-node follower: run headless (no engine, no HTTP server).
+    // This blocks until the leader sends a Shutdown command.
+    #[cfg(feature = "nccl")]
+    if config.num_nodes > 1 && config.node_rank > 0 {
+        info!(
+            "Follower node (rank {}): entering headless mode",
+            config.node_rank
+        );
+        return tokio::task::spawn_blocking(move || {
+            vllm_serve::init::initialize_and_run_follower(&config)
+        })
+        .await
+        .expect("initialize_and_run_follower panicked");
+    }
+
     // Keep a clone for /server_info (before we move config into the blocking task).
     let vllm_config_snapshot = config.clone();
 

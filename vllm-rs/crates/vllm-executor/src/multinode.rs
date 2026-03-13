@@ -1,24 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! Multi-node executor: wraps a local `ThreadPoolExecutor` and broadcasts
-//! `SchedulerOutput` to all ranks via NCCL before each forward step.
+//! Multi-node executor: wraps a local executor and broadcasts
+//! `SchedulerOutput` to all remote follower nodes via TCP before each
+//! forward step.
 //!
-//! Uses NCCL broadcast (a collective) routed through the worker thread
-//! (which owns the correct CUDA context). Eliminates TCP control channel.
+//! TCP is used for the control plane (scheduler output broadcast).
+//! NCCL is used only for the data plane (model forward-pass collectives).
+//! This matches Python vLLM's `mp` backend architecture.
 
 use serde::{Deserialize, Serialize};
 use vllm_core::scheduler::output::SchedulerOutput;
+use vllm_cuda::TcpControlChannel;
 use vllm_engine::error::{EngineError, EngineResult};
 use vllm_engine::executor::{Executor, ModelRunnerOutput};
 
-use crate::threadpool::ThreadPoolExecutor;
-
 // ---------------------------------------------------------------------------
-// Control protocol (serialized via bincode, broadcast via NCCL)
+// Control protocol (serialized via bincode, broadcast via TCP)
 // ---------------------------------------------------------------------------
 
-/// Messages broadcast from rank 0 to all ranks via NCCL.
+/// Messages broadcast from rank 0 to all follower nodes via TCP.
 #[derive(Serialize, Deserialize)]
 pub enum ControlMessage {
     /// Execute a forward pass with this scheduler output.
@@ -28,6 +29,8 @@ pub enum ControlMessage {
         num_gpu_blocks: usize,
         num_cpu_blocks: usize,
     },
+    /// Warm up / compile the model (CUDA graph capture).
+    Warmup,
     /// Shut down the remote worker loop.
     Shutdown,
 }
@@ -36,28 +39,30 @@ pub enum ControlMessage {
 // MultiNodeExecutor
 // ---------------------------------------------------------------------------
 
-/// Wraps a local `ThreadPoolExecutor` and broadcasts scheduler outputs to
-/// all ranks via NCCL before each local `execute_model` call.
+/// Wraps a local executor and broadcasts scheduler outputs to all remote
+/// follower nodes via TCP before each local `execute_model` call.
 ///
-/// NCCL broadcast is dispatched to the worker thread (correct CUDA context)
-/// via `ThreadPoolExecutor::nccl_broadcast`.
+/// The TCP control channel carries serialized `ControlMessage`s. NCCL
+/// collectives in the model forward pass synchronize the actual tensor
+/// data between ranks.
 pub struct MultiNodeExecutor {
-    inner: ThreadPoolExecutor,
+    inner: Box<dyn Executor>,
+    channel: TcpControlChannel,
 }
 
 impl MultiNodeExecutor {
-    pub fn new(inner: ThreadPoolExecutor) -> Self {
-        Self { inner }
+    pub fn new(inner: Box<dyn Executor>, channel: TcpControlChannel) -> Self {
+        Self { inner, channel }
     }
 
-    /// Serialize and broadcast a control message via NCCL (rank 0 sends).
-    fn broadcast_msg(&self, msg: &ControlMessage) -> EngineResult<()> {
+    /// Serialize and broadcast a control message via TCP (rank 0 sends).
+    fn broadcast_msg(&mut self, msg: &ControlMessage) -> EngineResult<()> {
         let data = bincode::serialize(msg).map_err(|e| {
             EngineError::Executor(format!("failed to serialize control message: {e}"))
         })?;
-        self.inner
-            .nccl_broadcast(&data, 0)
-            .map_err(|e| EngineError::Executor(format!("NCCL broadcast failed: {e}")))?;
+        self.channel
+            .broadcast(&data)
+            .map_err(|e| EngineError::Executor(format!("TCP broadcast failed: {e}")))?;
         Ok(())
     }
 }
@@ -67,7 +72,7 @@ impl Executor for MultiNodeExecutor {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> EngineResult<ModelRunnerOutput> {
-        // Broadcast to all ranks so remote workers start their forward pass.
+        // Broadcast to all followers so they start their forward pass.
         let msg = ControlMessage::ExecuteModel(Box::new(scheduler_output.clone()));
         self.broadcast_msg(&msg)?;
         // Execute locally — NCCL collectives in the model synchronize ranks.

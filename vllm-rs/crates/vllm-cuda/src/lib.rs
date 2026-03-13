@@ -62,6 +62,7 @@ pub mod model;
 pub mod nccl;
 pub mod quant;
 pub mod tcp_store;
+pub use tcp_store::TcpControlChannel;
 #[cfg(feature = "cuda")]
 pub mod weights;
 

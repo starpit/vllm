@@ -250,6 +250,167 @@ fn allreduce_min_worker(value: usize, master_addr: &str, port: u16) -> Result<us
 }
 
 // ---------------------------------------------------------------------------
+// Persistent TCP control channel (multi-node scheduler output broadcast)
+// ---------------------------------------------------------------------------
+
+/// Persistent TCP control channel for broadcasting scheduler output from rank 0
+/// to all follower nodes. Unlike the one-shot NCCL ID exchange above, this
+/// maintains persistent connections for the entire lifetime of the inference
+/// server.
+///
+/// Uses `master_port + 2` to avoid conflicts with NCCL ID exchange (port+0)
+/// and allreduce_min (port+1).
+pub struct TcpControlChannel {
+    /// Rank 0 holds connections to all followers.
+    /// Followers hold a single connection to rank 0.
+    role: ChannelRole,
+}
+
+enum ChannelRole {
+    /// Rank 0: one TCP stream per follower (indexed 0..world_size-2).
+    Leader { streams: Vec<TcpStream> },
+    /// Rank > 0: single TCP stream to rank 0.
+    Follower { stream: TcpStream },
+}
+
+impl TcpControlChannel {
+    /// Establish the control channel.
+    ///
+    /// - Rank 0: listens and accepts `world_size - 1` connections.
+    /// - Rank > 0: connects to rank 0 with retry.
+    ///
+    /// Uses `master_port + 2`.
+    pub fn establish(
+        rank: usize,
+        world_size: usize,
+        master_addr: &str,
+        master_port: u16,
+    ) -> Result<Self> {
+        let port = master_port + 2;
+
+        if rank == 0 {
+            let bind_addr = format!("{master_addr}:{port}");
+            let listener = TcpListener::bind(&bind_addr).with_context(|| {
+                format!("rank 0: failed to bind control channel on {bind_addr}")
+            })?;
+            info!(
+                "Control channel: rank 0 listening on {} for {} follower(s)",
+                bind_addr,
+                world_size - 1
+            );
+
+            let mut streams = Vec::with_capacity(world_size - 1);
+            for i in 1..world_size {
+                let (stream, peer) = listener.accept().with_context(|| {
+                    format!("rank 0: failed to accept control channel connection {i}")
+                })?;
+                // Disable Nagle's algorithm for low-latency framing.
+                stream.set_nodelay(true).ok();
+                info!("Control channel: accepted follower {} from {}", i, peer);
+                streams.push(stream);
+            }
+
+            Ok(Self {
+                role: ChannelRole::Leader { streams },
+            })
+        } else {
+            let addr = format!("{master_addr}:{port}");
+            let stream = connect_with_retry(&addr, 30, 500)?;
+            stream.set_nodelay(true).ok();
+            info!("Control channel: rank {} connected to {}", rank, addr);
+            Ok(Self {
+                role: ChannelRole::Follower { stream },
+            })
+        }
+    }
+
+    /// Broadcast a length-prefixed frame from rank 0 to all followers.
+    ///
+    /// Only callable on rank 0 (leader). Sends a 4-byte big-endian length
+    /// prefix followed by the payload to each follower.
+    pub fn broadcast(&mut self, data: &[u8]) -> Result<()> {
+        match &mut self.role {
+            ChannelRole::Leader { streams } => {
+                let len = (data.len() as u32).to_be_bytes();
+                for (i, stream) in streams.iter_mut().enumerate() {
+                    stream.write_all(&len).with_context(|| {
+                        format!("control channel: failed to write len to follower {}", i + 1)
+                    })?;
+                    stream.write_all(data).with_context(|| {
+                        format!(
+                            "control channel: failed to write data to follower {}",
+                            i + 1
+                        )
+                    })?;
+                    stream.flush().with_context(|| {
+                        format!("control channel: failed to flush to follower {}", i + 1)
+                    })?;
+                }
+                Ok(())
+            }
+            ChannelRole::Follower { .. } => {
+                anyhow::bail!("broadcast() called on follower (rank > 0)")
+            }
+        }
+    }
+
+    /// Receive a length-prefixed frame from rank 0.
+    ///
+    /// Only callable on followers (rank > 0). Blocks until a full frame is
+    /// received. Returns the raw payload bytes.
+    pub fn recv(&mut self) -> Result<Vec<u8>> {
+        match &mut self.role {
+            ChannelRole::Follower { stream } => {
+                let mut len_buf = [0u8; 4];
+                stream
+                    .read_exact(&mut len_buf)
+                    .context("control channel: failed to read frame length")?;
+                let len = u32::from_be_bytes(len_buf) as usize;
+
+                let mut buf = vec![0u8; len];
+                stream
+                    .read_exact(&mut buf)
+                    .context("control channel: failed to read frame data")?;
+                Ok(buf)
+            }
+            ChannelRole::Leader { .. } => {
+                anyhow::bail!("recv() called on leader (rank 0)")
+            }
+        }
+    }
+}
+
+/// Connect to a TCP address with retry and backoff.
+fn connect_with_retry(addr: &str, max_attempts: usize, delay_ms: u64) -> Result<TcpStream> {
+    for attempt in 0..max_attempts {
+        match TcpStream::connect(addr) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                if attempt < max_attempts - 1 {
+                    let delay = std::time::Duration::from_millis(delay_ms);
+                    info!(
+                        "Control channel: connection to {} failed (attempt {}): {}, retrying in {:?}",
+                        addr,
+                        attempt + 1,
+                        e,
+                        delay
+                    );
+                    std::thread::sleep(delay);
+                } else {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "control channel: failed to connect to {} after {} attempts",
+                            addr, max_attempts
+                        )
+                    });
+                }
+            }
+        }
+    }
+    unreachable!()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -415,6 +576,100 @@ mod tests {
             assert_eq!(v1, 100); // min(100, 101)
             assert_eq!(v2, 200); // min(200, 201)
         }
+    }
+
+    #[test]
+    fn test_control_channel_basic() {
+        let port: u16 = portpicker::pick_unused_port().unwrap_or(19890);
+        let world_size = 2;
+
+        let leader = std::thread::spawn(move || {
+            let mut ch = TcpControlChannel::establish(0, world_size, "127.0.0.1", port).unwrap();
+            ch.broadcast(b"hello followers").unwrap();
+            ch.broadcast(b"second message").unwrap();
+        });
+
+        let follower = std::thread::spawn(move || {
+            let mut ch = TcpControlChannel::establish(1, world_size, "127.0.0.1", port).unwrap();
+            let msg1 = ch.recv().unwrap();
+            let msg2 = ch.recv().unwrap();
+            (msg1, msg2)
+        });
+
+        leader.join().unwrap();
+        let (msg1, msg2) = follower.join().unwrap();
+        assert_eq!(msg1, b"hello followers");
+        assert_eq!(msg2, b"second message");
+    }
+
+    #[test]
+    fn test_control_channel_multiple_followers() {
+        let port: u16 = portpicker::pick_unused_port().unwrap_or(19891);
+        let world_size = 4;
+        let payload = b"broadcast to all";
+
+        let leader = std::thread::spawn(move || {
+            let mut ch = TcpControlChannel::establish(0, world_size, "127.0.0.1", port).unwrap();
+            ch.broadcast(payload).unwrap();
+        });
+
+        let followers: Vec<_> = (1..world_size)
+            .map(|rank| {
+                std::thread::spawn(move || {
+                    let mut ch =
+                        TcpControlChannel::establish(rank, world_size, "127.0.0.1", port).unwrap();
+                    ch.recv().unwrap()
+                })
+            })
+            .collect();
+
+        leader.join().unwrap();
+        for f in followers {
+            assert_eq!(f.join().unwrap(), payload);
+        }
+    }
+
+    #[test]
+    fn test_control_channel_large_payload() {
+        let port: u16 = portpicker::pick_unused_port().unwrap_or(19892);
+        let world_size = 2;
+        // 1MB payload to test chunked reads.
+        let payload: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
+        let payload_clone = payload.clone();
+
+        let leader = std::thread::spawn(move || {
+            let mut ch = TcpControlChannel::establish(0, world_size, "127.0.0.1", port).unwrap();
+            ch.broadcast(&payload_clone).unwrap();
+        });
+
+        let follower = std::thread::spawn(move || {
+            let mut ch = TcpControlChannel::establish(1, world_size, "127.0.0.1", port).unwrap();
+            ch.recv().unwrap()
+        });
+
+        leader.join().unwrap();
+        let received = follower.join().unwrap();
+        assert_eq!(received, payload);
+    }
+
+    #[test]
+    fn test_control_channel_empty_payload() {
+        let port: u16 = portpicker::pick_unused_port().unwrap_or(19893);
+        let world_size = 2;
+
+        let leader = std::thread::spawn(move || {
+            let mut ch = TcpControlChannel::establish(0, world_size, "127.0.0.1", port).unwrap();
+            ch.broadcast(b"").unwrap();
+        });
+
+        let follower = std::thread::spawn(move || {
+            let mut ch = TcpControlChannel::establish(1, world_size, "127.0.0.1", port).unwrap();
+            ch.recv().unwrap()
+        });
+
+        leader.join().unwrap();
+        let received = follower.join().unwrap();
+        assert!(received.is_empty());
     }
 
     #[test]

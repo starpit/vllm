@@ -148,24 +148,20 @@ pub struct SamplingParams {
 
     /// Per-token logit bias: add the bias value to the logit for each
     /// specified token ID before sampling.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub logit_bias: Option<HashMap<u32, f32>>,
 
     /// Grammar constraint for structured output (constrained decoding).
     /// When set, the sampler masks logits so that only tokens allowed by
     /// the grammar are sampled.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub guided_grammar: Option<GuidedGrammar>,
 
     /// When set, only these token IDs may be sampled. All other logits
     /// are masked to `-inf`. Similar to grammar masking but static.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_token_ids: Option<Vec<u32>>,
 
     /// Pre-tokenized bad word sequences. If the output ends with the prefix
     /// of a bad word, the completing token is suppressed (logit set to `-inf`).
     /// Each inner `Vec<u32>` is one bad word as a token sequence.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub bad_words_token_ids: Option<Vec<Vec<u32>>>,
 }
 

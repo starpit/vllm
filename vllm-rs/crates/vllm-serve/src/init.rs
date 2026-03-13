@@ -552,6 +552,15 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         return initialize_stack_external(config, model_name, init_start);
     }
 
+    // Multi-node TP ("mp" backend): leader runs engine+scheduler, followers
+    // run headless. TCP for control plane, NCCL for data plane.
+    // Followers (node_rank > 0) should use `initialize_and_run_follower` instead.
+    if (config.num_nodes > 1 || config.distributed_executor_backend == "mp")
+        && config.node_rank == 0
+    {
+        return initialize_stack_multinode(config, model_name, init_start);
+    }
+
     // TP > 1: multi-GPU path with NCCL (in-process, thread-per-GPU).
     if tp_size > 1 {
         return initialize_stack_tp(config, model_name, init_start);
@@ -673,6 +682,427 @@ pub fn initialize_stack(config: &VllmConfig) -> Result<InitializedStack> {
         model_name,
         max_model_len,
     })
+}
+
+/// Multi-node init flow ("mp" backend): leader creates engine+scheduler and
+/// broadcasts scheduler output via TCP. Follower runs headless, receiving
+/// commands via TCP and participating in NCCL collectives during forward.
+///
+/// - Leader (node_rank=0): Creates CudaWorker, NCCL comm, cache init,
+///   warmup, wraps in `MultiNodeExecutor`, returns `InitializedStack`.
+/// - Follower (node_rank>0): Handled by [`initialize_and_run_follower`].
+fn initialize_stack_multinode(
+    config: &VllmConfig,
+    model_name: String,
+    init_start: Instant,
+) -> Result<InitializedStack> {
+    #[cfg(not(feature = "nccl"))]
+    {
+        let _ = (config, model_name, init_start);
+        anyhow::bail!(
+            "Multi-node TP requires the `nccl` feature; \
+             rebuild with --features nccl"
+        );
+    }
+
+    #[cfg(feature = "nccl")]
+    {
+        use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+        use vllm_executor::multinode::MultiNodeExecutor;
+
+        let tp_size = config.tensor_parallel_size;
+        let node_rank = config.node_rank;
+        let num_nodes = config.num_nodes;
+        let is_pooling = config.runner == "pooling";
+
+        if node_rank != 0 {
+            anyhow::bail!(
+                "initialize_stack_multinode called on follower (node_rank={}). \
+                 Use initialize_and_run_follower instead.",
+                node_rank
+            );
+        }
+
+        info!(
+            "Multi-node TP: leader node, tp_size={}, num_nodes={}, master={}:{}",
+            tp_size, num_nodes, config.master_addr, config.master_port
+        );
+
+        // Step 1: Exchange NCCL unique ID via TCP store.
+        let nccl_id_bytes = vllm_cuda::tcp_store::exchange_nccl_id(
+            0,
+            tp_size,
+            &config.master_addr,
+            config.master_port,
+        )
+        .context("failed to exchange NCCL ID via TCP store")?;
+        let nccl_id = vllm_cuda::NcclId::from_raw(nccl_id_bytes);
+        info!("Leader: NCCL ID exchanged");
+
+        // Step 2: Create CudaWorker for this node's GPU (rank 0).
+        let cuda_config = CudaWorkerConfig {
+            model_path: config.model.clone(),
+            dtype: config.dtype.clone(),
+            hf_token: config.hf_token.clone(),
+            block_size: config.block_size,
+            device_id: 0,
+            enforce_eager: config.enforce_eager,
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+            cuda_graph_sizes: config
+                .cuda_graph_config
+                .as_ref()
+                .map(|c| c.capture_sizes.clone())
+                .unwrap_or_default(),
+            cublas_autotune: config.cublas_autotune,
+            gpu_memory_utilization: config.gpu_memory_utilization,
+            pooling_strategy: config.pooling_strategy.clone(),
+            is_pooling,
+            tp_rank: 0,
+            tp_world_size: tp_size,
+            gguf_file: config.gguf_file.clone(),
+            lora_adapter: config.lora_adapter.clone(),
+            kv_cache_dtype: config.kv_cache_dtype.clone(),
+            calculate_kv_scales: config.calculate_kv_scales,
+        };
+
+        let mut worker = CudaWorker::new(cuda_config);
+        worker
+            .init_device()
+            .context("failed to initialize CUDA device")?;
+        worker.load_model().context("failed to load model")?;
+
+        let hf_config = worker
+            .hf_config()
+            .context("model config not available after load")?
+            .clone();
+        let model_dir = worker.model_dir().map(|p| p.to_path_buf());
+        let dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
+
+        // Step 3: Create NCCL communicator (collective — all ranks participate).
+        let device = worker.device_ref().expect("device not initialized");
+        unsafe {
+            vllm_cuda::driver::ctx_set_current(device.ctx).unwrap();
+        }
+        let nccl_group = vllm_cuda::NcclGroup::new(0, tp_size, nccl_id, device.compute_stream)
+            .context("NCCL comm init failed")?;
+        worker.set_tp_group(std::sync::Arc::new(nccl_group));
+        info!("Leader: NCCL communicator created");
+
+        // Step 4: Profile available memory.
+        let available_memory = worker
+            .determine_available_memory()
+            .context("failed to determine available memory")?;
+
+        // Step 5: All-reduce MIN across ranks via TCP store.
+        let min_memory = vllm_cuda::tcp_store::allreduce_min(
+            0,
+            tp_size,
+            available_memory,
+            &config.master_addr,
+            config.master_port,
+        )
+        .context("failed to allreduce memory")?;
+
+        let max_model_len = config
+            .max_model_len
+            .or(hf_config.max_position_embeddings)
+            .unwrap_or(4096);
+
+        info!(
+            "Leader: available_memory={:.1} GB, min_across_ranks={:.1} GB",
+            available_memory as f64 / (1024.0 * 1024.0 * 1024.0),
+            min_memory as f64 / (1024.0 * 1024.0 * 1024.0),
+        );
+
+        // Step 6: Compute block count.
+        let num_gpu_blocks = compute_num_blocks(
+            min_memory,
+            config.block_size,
+            &hf_config,
+            dtype_elem_bytes,
+            config.gpu_memory_utilization,
+            &config.kv_cache_dtype,
+        );
+
+        info!(
+            "Leader: num_gpu_blocks={}, kv_cache_tokens={}",
+            num_gpu_blocks,
+            num_gpu_blocks * config.block_size,
+        );
+
+        // Step 7: Establish TCP control channel (persistent connections).
+        let mut channel = vllm_cuda::TcpControlChannel::establish(
+            0,
+            tp_size,
+            &config.master_addr,
+            config.master_port,
+        )
+        .context("failed to establish TCP control channel")?;
+        info!("Leader: TCP control channel established");
+
+        // Step 8: Initialize cache — broadcast command to followers first,
+        // then run locally. Both sides participate in any NCCL collectives.
+        {
+            use vllm_executor::multinode::ControlMessage;
+            let msg = ControlMessage::InitCache {
+                num_gpu_blocks,
+                num_cpu_blocks: 0,
+            };
+            let data = bincode::serialize(&msg).context("serialize InitCache")?;
+            channel.broadcast(&data).context("broadcast InitCache")?;
+        }
+        let mut worker: Box<dyn Worker> = Box::new(worker);
+        worker
+            .initialize_cache(num_gpu_blocks, 0)
+            .context("failed to initialize cache")?;
+
+        // Step 9: Warm up — broadcast to followers, then run locally.
+        // Both sides' forward passes hit NCCL collectives simultaneously.
+        {
+            use vllm_executor::multinode::ControlMessage;
+            let msg = ControlMessage::Warmup;
+            let data = bincode::serialize(&msg).context("serialize Warmup")?;
+            channel.broadcast(&data).context("broadcast Warmup")?;
+        }
+        worker
+            .compile_or_warm_up_model()
+            .context("failed to compile or warm up model")?;
+
+        // Step 10: Wrap in UniProcExecutor → MultiNodeExecutor.
+        let executor = UniProcExecutor::new_pre_initialized(worker);
+        let multi_executor = MultiNodeExecutor::new(Box::new(executor), channel);
+
+        // Step 11: Build engine.
+        let eos_token_ids: Vec<u32> = hf_config
+            .extra
+            .get("eos_token_id")
+            .map(|v| {
+                if let Some(id) = v.as_u64() {
+                    vec![id as u32]
+                } else if let Some(arr) = v.as_array() {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|id| id as u32))
+                        .collect()
+                } else {
+                    vec![]
+                }
+            })
+            .unwrap_or_default();
+
+        let use_async_scheduling = !config.disable_async_scheduling;
+        let enable_prefix_caching = config.enable_prefix_caching;
+        let engine_config = EngineCoreConfig {
+            scheduler_config: SchedulerConfig {
+                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+                max_num_seqs: config.max_num_seqs,
+                policy: SchedulerPolicy::Fcfs,
+                enable_chunked_prefill: true,
+                async_scheduling: Some(use_async_scheduling),
+                num_lookahead_tokens: if config.speculative_model.is_some() {
+                    config.num_speculative_tokens
+                } else {
+                    0
+                },
+                ..Default::default()
+            },
+            max_model_len,
+            num_gpu_blocks,
+            block_size: config.block_size,
+            engine_index: 0,
+            async_scheduling: use_async_scheduling,
+            use_spec_decode: config.speculative_model.is_some(),
+            ngram_proposer_config: None,
+            eos_token_ids,
+            is_pooling: config.runner == "pooling",
+            enable_prefix_caching,
+        };
+
+        let client: Box<dyn vllm_engine::core_client::EngineCoreClient + Send> =
+            Box::new(InprocClient::new(engine_config, Box::new(multi_executor)));
+
+        // Load tokenizer and build engine.
+        let tokenizer = model_dir
+            .as_ref()
+            .and_then(|dir| try_load_tokenizer(dir).ok());
+
+        let mut engine = if let Some(tok) = tokenizer {
+            let tokenizer = Arc::new(tok);
+            #[cfg(feature = "chat-template")]
+            {
+                if let Some(ref dir) = model_dir {
+                    if let Some(ct) = try_load_chat_template(dir) {
+                        info!("Chat template loaded from tokenizer_config.json");
+                        AsyncEngine::with_tokenizer_and_template(
+                            client,
+                            model_name.clone(),
+                            max_model_len,
+                            tokenizer,
+                            Arc::new(ct),
+                        )
+                    } else {
+                        AsyncEngine::with_tokenizer(
+                            client,
+                            model_name.clone(),
+                            max_model_len,
+                            tokenizer,
+                        )
+                    }
+                } else {
+                    AsyncEngine::with_tokenizer(
+                        client,
+                        model_name.clone(),
+                        max_model_len,
+                        tokenizer,
+                    )
+                }
+            }
+            #[cfg(not(feature = "chat-template"))]
+            {
+                AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
+            }
+        } else {
+            AsyncEngine::new(client, model_name.clone(), max_model_len)
+        };
+
+        if !config.disable_async_scheduling {
+            engine.set_async_scheduling(true);
+        }
+        if config.runner == "pooling" {
+            engine.set_is_pooling(true);
+        }
+
+        info!(
+            "Leader: stack initialized in {:.1}s (multi-node, tp_size={})",
+            init_start.elapsed().as_secs_f64(),
+            tp_size,
+        );
+
+        Ok(InitializedStack {
+            engine: Arc::new(engine),
+            model_name,
+            max_model_len,
+        })
+    }
+}
+
+/// Initialize a follower node and run the headless worker loop.
+///
+/// This function does NOT return (blocks forever in the headless loop)
+/// until the leader sends a Shutdown command or the connection drops.
+///
+/// Called from the CLI when `node_rank > 0` and `num_nodes > 1`.
+#[cfg(feature = "nccl")]
+pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
+    use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+
+    let tp_size = config.tensor_parallel_size;
+    let node_rank = config.node_rank;
+    let is_pooling = config.runner == "pooling";
+
+    info!(
+        "Multi-node TP: follower node_rank={}, tp_size={}, master={}:{}",
+        node_rank, tp_size, config.master_addr, config.master_port
+    );
+
+    // Step 1: Exchange NCCL unique ID via TCP store.
+    let nccl_id_bytes = vllm_cuda::tcp_store::exchange_nccl_id(
+        node_rank,
+        tp_size,
+        &config.master_addr,
+        config.master_port,
+    )
+    .context("failed to exchange NCCL ID via TCP store")?;
+    let nccl_id = vllm_cuda::NcclId::from_raw(nccl_id_bytes);
+    info!("Follower {}: NCCL ID exchanged", node_rank);
+
+    // Step 2: Create CudaWorker for this node's GPU.
+    let cuda_config = CudaWorkerConfig {
+        model_path: config.model.clone(),
+        dtype: config.dtype.clone(),
+        hf_token: config.hf_token.clone(),
+        block_size: config.block_size,
+        device_id: 0, // Each node has 1 GPU at device 0.
+        enforce_eager: config.enforce_eager,
+        max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+        cuda_graph_sizes: config
+            .cuda_graph_config
+            .as_ref()
+            .map(|c| c.capture_sizes.clone())
+            .unwrap_or_default(),
+        cublas_autotune: config.cublas_autotune,
+        gpu_memory_utilization: config.gpu_memory_utilization,
+        pooling_strategy: config.pooling_strategy.clone(),
+        is_pooling,
+        tp_rank: node_rank,
+        tp_world_size: tp_size,
+        gguf_file: config.gguf_file.clone(),
+        lora_adapter: config.lora_adapter.clone(),
+        kv_cache_dtype: config.kv_cache_dtype.clone(),
+        calculate_kv_scales: config.calculate_kv_scales,
+    };
+
+    let mut worker = CudaWorker::new(cuda_config);
+    worker
+        .init_device()
+        .context("failed to initialize CUDA device")?;
+    worker.load_model().context("failed to load model")?;
+
+    // Step 3: Create NCCL communicator (collective — all ranks participate).
+    let device = worker.device_ref().expect("device not initialized");
+    unsafe {
+        vllm_cuda::driver::ctx_set_current(device.ctx).unwrap();
+    }
+    let nccl_group = vllm_cuda::NcclGroup::new(node_rank, tp_size, nccl_id, device.compute_stream)
+        .context("NCCL comm init failed")?;
+    worker.set_tp_group(std::sync::Arc::new(nccl_group));
+    info!("Follower {}: NCCL communicator created", node_rank);
+
+    // Step 4: Profile available memory.
+    let available_memory = worker
+        .determine_available_memory()
+        .context("failed to determine available memory")?;
+
+    // Step 5: All-reduce MIN across ranks via TCP store.
+    let min_memory = vllm_cuda::tcp_store::allreduce_min(
+        node_rank,
+        tp_size,
+        available_memory,
+        &config.master_addr,
+        config.master_port,
+    )
+    .context("failed to allreduce memory")?;
+
+    info!(
+        "Follower {}: available_memory={:.1} GB, min_across_ranks={:.1} GB",
+        node_rank,
+        available_memory as f64 / (1024.0 * 1024.0 * 1024.0),
+        min_memory as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+
+    // Step 6: Establish TCP control channel.
+    let channel = vllm_cuda::TcpControlChannel::establish(
+        node_rank,
+        tp_size,
+        &config.master_addr,
+        config.master_port,
+    )
+    .context("failed to establish TCP control channel")?;
+    info!("Follower {}: TCP control channel established", node_rank);
+
+    // Step 7: Wrap in UniProcExecutor and enter headless loop.
+    // The headless loop receives InitCache, Warmup, ExecuteModel, and Shutdown
+    // commands from the leader via TCP. NCCL collectives in the forward pass
+    // synchronize with the leader automatically.
+    let executor = UniProcExecutor::new_pre_initialized(Box::new(worker));
+
+    info!("Follower {}: entering headless loop", node_rank,);
+    crate::headless::run_headless(executor, channel)?;
+
+    info!(
+        "Follower {}: headless loop exited, shutting down",
+        node_rank
+    );
+    Ok(())
 }
 
 /// Multi-GPU init flow: creates N workers (one per GPU rank), inits NCCL,

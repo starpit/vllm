@@ -17,6 +17,7 @@
 pub mod cuda_worker;
 pub mod error;
 pub mod input_batch;
+#[cfg(feature = "nccl")]
 pub mod multinode;
 pub mod parallel;
 pub mod threadpool;

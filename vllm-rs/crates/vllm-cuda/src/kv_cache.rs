@@ -2,7 +2,7 @@
 //! Paged KV cache pool using `GpuTensor` — persistent GPU memory.
 //!
 //! Layout per layer: `[num_blocks, block_size, num_kv_heads, head_dim]`
-//! Same layout as the candle-based `KvBlockPool` in vllm-models.
+//! Paged KV cache pool for GPU inference.
 
 use crate::driver;
 use crate::dtype::DType;

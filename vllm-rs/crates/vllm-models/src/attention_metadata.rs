@@ -7,15 +7,12 @@
 //! tensors while all other ops (embedding, projections, norms, MLP, lm_head)
 //! run on the full batched tensor.
 
-use std::cell::OnceCell;
-
-use candle_core::{Device, Tensor};
-
 /// Metadata describing a batch of requests packed into flat tensors.
 ///
 /// All token IDs and positions are concatenated in request order:
 /// `[req_0_tokens..., req_1_tokens..., ...]`. The `query_start_loc` offsets
 /// let attention layers narrow to per-request slices.
+#[derive(Debug, Clone)]
 pub struct AttentionMetadata {
     /// Number of requests in this batch.
     pub num_reqs: usize,
@@ -37,66 +34,10 @@ pub struct AttentionMetadata {
     pub is_prefill: Vec<bool>,
     /// Request IDs in batch order.
     pub req_ids: Vec<String>,
-
-    // -- Lazily-computed GPU tensor caches (avoid per-layer H2D copies) --
-    /// `cu_seqlens_q` as a GPU tensor — same across all layers in a step.
-    cu_seqlens_q_cache: OnceCell<Tensor>,
-    /// `cu_seqlens_k` as a GPU tensor — valid only when there is no sliding window
-    /// (i.e. `kv_len == seq_lens[i]` for every request).
-    cu_seqlens_k_cache: OnceCell<Tensor>,
-    /// Block table as a GPU tensor: `[batch_size, max_pages_per_seq]` u32.
-    /// Cached to avoid per-layer H2D copies. Built on first access.
-    block_table_cache: OnceCell<Tensor>,
-    /// Decode slot_mapping as a GPU tensor: `[num_reqs]` i64.
-    /// For all-decode batches, maps each request's new token to its flat cache slot.
-    /// Cached to avoid per-layer H2D copies (28 layers × 128 decode steps).
-    decode_slot_mapping_cache: OnceCell<Tensor>,
-    /// Full slot_mapping as a GPU tensor: `[total_tokens]` i64.
-    /// Maps every token (prefill + decode) to its flat cache slot in the paged pool.
-    /// Cached to avoid per-layer H2D copies.
-    slot_mapping_cache: OnceCell<Tensor>,
-}
-
-impl std::fmt::Debug for AttentionMetadata {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AttentionMetadata")
-            .field("num_reqs", &self.num_reqs)
-            .field("total_tokens", &self.total_tokens)
-            .field("query_start_loc", &self.query_start_loc)
-            .field("q_lens", &self.q_lens)
-            .field("seq_lens", &self.seq_lens)
-            .field("block_ids", &self.block_ids)
-            .field("tokens_before", &self.tokens_before)
-            .field("is_prefill", &self.is_prefill)
-            .field("req_ids", &self.req_ids)
-            .finish()
-    }
-}
-
-impl Clone for AttentionMetadata {
-    fn clone(&self) -> Self {
-        Self {
-            num_reqs: self.num_reqs,
-            total_tokens: self.total_tokens,
-            query_start_loc: self.query_start_loc.clone(),
-            q_lens: self.q_lens.clone(),
-            seq_lens: self.seq_lens.clone(),
-            block_ids: self.block_ids.clone(),
-            tokens_before: self.tokens_before.clone(),
-            is_prefill: self.is_prefill.clone(),
-            req_ids: self.req_ids.clone(),
-            // Don't clone cached GPU tensors — they'll be recomputed if needed.
-            cu_seqlens_q_cache: OnceCell::new(),
-            cu_seqlens_k_cache: OnceCell::new(),
-            block_table_cache: OnceCell::new(),
-            decode_slot_mapping_cache: OnceCell::new(),
-            slot_mapping_cache: OnceCell::new(),
-        }
-    }
 }
 
 impl AttentionMetadata {
-    /// Create a new `AttentionMetadata` with empty GPU caches.
+    /// Create a new `AttentionMetadata`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_reqs: usize,
@@ -119,11 +60,6 @@ impl AttentionMetadata {
             tokens_before,
             is_prefill,
             req_ids,
-            cu_seqlens_q_cache: OnceCell::new(),
-            cu_seqlens_k_cache: OnceCell::new(),
-            block_table_cache: OnceCell::new(),
-            decode_slot_mapping_cache: OnceCell::new(),
-            slot_mapping_cache: OnceCell::new(),
         }
     }
 
@@ -200,159 +136,6 @@ impl AttentionMetadata {
             full_is_prefill,
             full_req_ids,
         )
-    }
-
-    /// Lazily compute and cache `cu_seqlens_q` as a GPU u32 tensor.
-    ///
-    /// This is derived from `query_start_loc` and is the same for every
-    /// attention layer in a step.  Caching it avoids re-creating the tensor
-    /// (CPU→GPU copy) on every layer call.
-    pub fn cu_seqlens_q_gpu(&self, device: &Device) -> candle_core::Result<&Tensor> {
-        if let Some(t) = self.cu_seqlens_q_cache.get() {
-            return Ok(t);
-        }
-        let vals: Vec<u32> = self.query_start_loc.iter().map(|&x| x as u32).collect();
-        let t = Tensor::from_slice(&vals, vals.len(), device)?;
-        let _ = self.cu_seqlens_q_cache.set(t);
-        Ok(self.cu_seqlens_q_cache.get().unwrap())
-    }
-
-    /// Lazily compute and cache `cu_seqlens_k` as a GPU u32 tensor.
-    ///
-    /// Without sliding window, the KV sequence length per request equals
-    /// `seq_lens[i]`, so `cu_seqlens_k = cumsum(seq_lens)`.  This is
-    /// layer-independent and can be cached.
-    ///
-    /// With sliding window, the actual KV length may differ per layer,
-    /// so callers should compute it from the gathered KV lengths instead.
-    pub fn cu_seqlens_k_gpu(&self, device: &Device) -> candle_core::Result<&Tensor> {
-        if let Some(t) = self.cu_seqlens_k_cache.get() {
-            return Ok(t);
-        }
-        let mut cumlen: Vec<u32> = Vec::with_capacity(self.num_reqs + 1);
-        cumlen.push(0);
-        for &sl in &self.seq_lens {
-            cumlen.push(cumlen.last().unwrap() + sl as u32);
-        }
-        let t = Tensor::from_slice(&cumlen, cumlen.len(), device)?;
-        let _ = self.cu_seqlens_k_cache.set(t);
-        Ok(self.cu_seqlens_k_cache.get().unwrap())
-    }
-
-    /// Build and cache the block table as a GPU u32 tensor.
-    ///
-    /// Returns a tensor of shape `[batch_size, max_pages_per_seq]` where each
-    /// row contains the block IDs for that request, zero-padded to the maximum
-    /// number of pages across all requests in the batch.
-    ///
-    /// This is computed once per step and cached for all layers.
-    pub fn block_table_gpu(&self, device: &Device) -> candle_core::Result<&Tensor> {
-        if let Some(t) = self.block_table_cache.get() {
-            return Ok(t);
-        }
-
-        let max_pages = self
-            .block_ids
-            .iter()
-            .map(|ids| ids.len())
-            .max()
-            .unwrap_or(0);
-
-        if max_pages == 0 || self.num_reqs == 0 {
-            let t = Tensor::zeros((self.num_reqs, 1), candle_core::DType::U32, device)?;
-            let _ = self.block_table_cache.set(t);
-            return Ok(self.block_table_cache.get().unwrap());
-        }
-
-        // Build flat [batch_size * max_pages] array, zero-padded.
-        let mut flat: Vec<u32> = vec![0u32; self.num_reqs * max_pages];
-        for (i, ids) in self.block_ids.iter().enumerate() {
-            for (j, &bid) in ids.iter().enumerate() {
-                flat[i * max_pages + j] = bid as u32;
-            }
-        }
-
-        let t = Tensor::from_slice(&flat, (self.num_reqs, max_pages), device)?;
-        let _ = self.block_table_cache.set(t);
-        Ok(self.block_table_cache.get().unwrap())
-    }
-
-    /// Build and cache the decode slot_mapping as a GPU i64 tensor.
-    ///
-    /// For all-decode batches (q_len=1 per request), returns a tensor of shape
-    /// `[num_reqs]` where `slot_mapping[i]` is the flat cache slot for request
-    /// `i`'s new token: `block_ids[i][pos / block_size] * block_size + pos % block_size`.
-    ///
-    /// Cached per step to avoid per-layer H2D copies.
-    pub fn decode_slot_mapping_gpu(
-        &self,
-        block_size: usize,
-        device: &Device,
-    ) -> candle_core::Result<&Tensor> {
-        if let Some(t) = self.decode_slot_mapping_cache.get() {
-            return Ok(t);
-        }
-
-        let mut slots = Vec::with_capacity(self.num_reqs);
-        for req_idx in 0..self.num_reqs {
-            let global_pos = self.tokens_before[req_idx];
-            let block_offset = global_pos / block_size;
-            let position_in_block = global_pos % block_size;
-            let block_ids = &self.block_ids[req_idx];
-            if block_offset < block_ids.len() {
-                let bid = block_ids[block_offset];
-                slots.push((bid * block_size + position_in_block) as i64);
-            } else {
-                slots.push(-1);
-            }
-        }
-
-        let t = Tensor::new(slots.as_slice(), device)?;
-        let _ = self.decode_slot_mapping_cache.set(t);
-        Ok(self.decode_slot_mapping_cache.get().unwrap())
-    }
-
-    /// Build and cache the full slot_mapping as a GPU i64 tensor.
-    ///
-    /// Returns a tensor of shape `[total_tokens]` where every token in every
-    /// request (prefill and decode) is mapped to its flat cache slot in the
-    /// paged block pool: `block_ids[block_offset] * block_size + pos_in_block`.
-    ///
-    /// For decode requests (q_len=1), `tokens_before` is the global position.
-    /// For prefill requests (q_len>1), positions `tokens_before..tokens_before+q_len`
-    /// are mapped.
-    ///
-    /// Cached per step to avoid per-layer H2D copies.
-    pub fn slot_mapping_gpu(
-        &self,
-        block_size: usize,
-        device: &Device,
-    ) -> candle_core::Result<&Tensor> {
-        if let Some(t) = self.slot_mapping_cache.get() {
-            return Ok(t);
-        }
-
-        let mut slots = Vec::with_capacity(self.total_tokens);
-        for req_idx in 0..self.num_reqs {
-            let q_len = self.q_lens[req_idx];
-            let tokens_before = self.tokens_before[req_idx];
-            let block_ids = &self.block_ids[req_idx];
-            for token_offset in 0..q_len {
-                let global_pos = tokens_before + token_offset;
-                let block_offset = global_pos / block_size;
-                let position_in_block = global_pos % block_size;
-                if block_offset < block_ids.len() {
-                    let bid = block_ids[block_offset];
-                    slots.push((bid * block_size + position_in_block) as i64);
-                } else {
-                    slots.push(-1);
-                }
-            }
-        }
-
-        let t = Tensor::new(slots.as_slice(), device)?;
-        let _ = self.slot_mapping_cache.set(t);
-        Ok(self.slot_mapping_cache.get().unwrap())
     }
 }
 

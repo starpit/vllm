@@ -4,7 +4,7 @@
 //! E2E tests for GPTQ quantized models.
 //!
 //! Uses `Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4` (~459 MB).
-//! Runs on the candle backend (CPU), NOT MLX.
+//! Runs on CPU, NOT MLX.
 //!
 //! Run with: `cargo test -p vllm-e2e --features e2e --test e_gptq -- --ignored --test-threads=1`
 

@@ -4,7 +4,7 @@
 //! MLX backend for Apple Silicon GPU acceleration.
 //!
 //! This crate provides an alternative worker implementation backed by Apple's
-//! MLX framework (via `mlx-rs`). Unlike candle's eager execution model which
+//! MLX framework (via `mlx-rs`). Unlike eager execution which
 //! creates ~1200 individual Metal kernel dispatches per forward pass, MLX uses
 //! lazy evaluation with graph fusion — operations build a compute graph, then
 //! `eval()` submits the entire graph as minimal Metal command buffers.

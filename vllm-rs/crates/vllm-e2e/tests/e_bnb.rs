@@ -5,7 +5,7 @@
 //!
 //! NF4: `unsloth/Llama-3.2-1B-Instruct-bnb-4bit` (~600 MB)
 //! INT8: `Jiqing/TinyLlama-1.1B-Chat-v1.0-bnb-8bit` (~1.1 GB)
-//! Runs on the candle backend (CPU), NOT MLX.
+//! Runs on CPU, NOT MLX.
 //!
 //! Run with: `cargo test -p vllm-e2e --features e2e --test e_bnb -- --ignored --test-threads=1`
 

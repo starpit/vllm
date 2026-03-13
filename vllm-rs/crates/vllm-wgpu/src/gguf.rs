@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Minimal GGUF format parser from `&[u8]`.
 //!
-//! No-std friendly, WASM compatible — no filesystem access, no `candle-core` dependency.
+//! No-std friendly, WASM compatible — no filesystem access.
 //! Parses the GGUF v3 binary format: header, metadata, tensor info, data section.
 
 use std::collections::HashMap;

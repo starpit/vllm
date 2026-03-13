@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `CudaWorker`: a `Worker` implementation using the vllm-cuda backend.
 //!
-//! Replaces candle as the GPU runtime with `GpuTensor`/`GpuDevice`/`ScratchArena`
+//! Purpose-built GPU runtime with `GpuTensor`/`GpuDevice`/`ScratchArena`
 //! for zero-allocation inference. Uses the same paged FlashAttention-2 kernels,
-//! but through raw FFI instead of candle CustomOps.
+//! but through raw FFI instead of CustomOps.
 //!
 //! This worker is gated behind the `cuda-backend` feature flag.
 
@@ -1613,14 +1613,9 @@ impl CudaWorker {
         self.model_dir.as_deref()
     }
 
-    /// Resolved dtype as candle DType (for init.rs compatibility).
-    pub fn resolved_candle_dtype(&self) -> candle_core::DType {
-        match self.model_dtype {
-            GpuDType::F16 => candle_core::DType::F16,
-            GpuDType::BF16 => candle_core::DType::BF16,
-            GpuDType::F32 => candle_core::DType::F32,
-            _ => candle_core::DType::BF16,
-        }
+    /// Bytes per element for the model's KV cache dtype.
+    pub fn resolved_dtype_elem_bytes(&self) -> usize {
+        self.model_dtype.size_bytes()
     }
 
     /// Build grammar parser factory on demand (lazy — deferred from startup).

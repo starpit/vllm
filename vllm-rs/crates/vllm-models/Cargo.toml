@@ -11,8 +11,6 @@ guided-decoding = ["llguidance", "toktrie", "toktrie_hf_tokenizers"]
 
 [dependencies]
 vllm-common = { workspace = true }
-vllm-model = { workspace = true }
-candle-core = { workspace = true }
 llguidance = { workspace = true, optional = true }
 toktrie = { workspace = true, optional = true }
 toktrie_hf_tokenizers = { workspace = true, optional = true }

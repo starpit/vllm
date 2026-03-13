@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! LLaMA model using `GpuTensor` — zero-allocation forward pass.
 //!
-//! All intermediate tensors are arena-allocated. No candle dependency.
+//! All intermediate tensors are arena-allocated.
 //! The same CUDA kernels from vllm-kernels are called via raw FFI with
 //! `GpuTensor::as_ptr()` — one line per pointer extraction instead of ten.
 //!
-//! Port of the candle-based `LlamaForCausalLM` in `vllm-models/src/llama.rs`.
+//! Port of `LlamaForCausalLM`.
 
 use anyhow::Result;
 
@@ -29,7 +29,7 @@ use std::sync::Arc;
 // Config
 // ---------------------------------------------------------------------------
 
-/// Parsed LLaMA config (mirrors the candle version but no candle types).
+/// Parsed LLaMA config (mirrors the HF config).
 /// Llama 3.x rope_scaling parameters.
 #[derive(Debug, Clone)]
 pub struct Llama3RopeScaling {

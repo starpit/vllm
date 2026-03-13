@@ -6,7 +6,7 @@
 //! Key difference from CandleWorker: all model ops are lazy. The forward pass
 //! builds a compute graph, and a single `eval()` call materializes the entire
 //! graph as minimal Metal command buffers. This eliminates the ~42ms of
-//! per-dispatch overhead seen with candle's eager execution on Metal.
+//! per-dispatch overhead seen with eager execution on Metal.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};

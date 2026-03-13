@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! GGUF file loading, config extraction, and tensor name mapping.
 //!
-//! Thin wrapper around `candle_core::quantized::gguf_file::Content` that
-//! provides typed metadata accessors and maps GGUF tensor names to the
-//! HuggingFace convention used by the rest of the crate.
+//! Wraps `gguf_format::Content` (our vendored GGUF parser) and provides
+//! typed metadata accessors and maps GGUF tensor names to the HuggingFace
+//! convention used by the rest of the crate.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -12,11 +12,8 @@ use std::path::Path;
 
 use tracing::info;
 
-use candle_core::Device;
-use candle_core::quantized::QTensor;
-use candle_core::quantized::gguf_file::{Content, Value};
-
 use crate::error::{ModelError, ModelResult};
+use crate::gguf_format::{Content, Value};
 use crate::weight::HfModelConfig;
 
 // ---------------------------------------------------------------------------
@@ -25,8 +22,7 @@ use crate::weight::HfModelConfig;
 
 /// Opened GGUF file with parsed header and lazy tensor reads.
 pub struct GgufFile {
-    content: Content,
-    reader: BufReader<File>,
+    pub(crate) content: Content,
 }
 
 impl GgufFile {
@@ -39,14 +35,7 @@ impl GgufFile {
         let content = Content::read(&mut reader).map_err(|e| {
             ModelError::Other(format!("failed to parse GGUF {}: {e}", path.display()))
         })?;
-        Ok(Self { content, reader })
-    }
-
-    /// Read a quantized tensor by name.
-    pub fn tensor(&mut self, name: &str, device: &Device) -> ModelResult<QTensor> {
-        self.content
-            .tensor(&mut self.reader, name, device)
-            .map_err(|e| ModelError::Other(format!("failed to read tensor '{name}': {e}")))
+        Ok(Self { content })
     }
 
     /// List all tensor names in the GGUF file.
@@ -75,7 +64,6 @@ impl GgufFile {
     /// Get a u32 metadata value (auto-upcasts from smaller int types).
     pub fn get_metadata_u32(&self, key: &str) -> Option<u32> {
         self.content.metadata.get(key).and_then(|v| {
-            // Try u32 first, then upcast from smaller types.
             if let Ok(val) = v.to_u32() {
                 Some(val)
             } else if let Ok(val) = v.to_u64() {
@@ -110,7 +98,6 @@ impl GgufFile {
 
     /// Get the length of an array metadata value.
     pub fn get_metadata_array_len(&self, key: &str) -> Option<usize> {
-        use candle_core::quantized::gguf_file::Value;
         self.content.metadata.get(key).and_then(|v| {
             if let Value::Array(arr) = v {
                 Some(arr.len())
@@ -285,13 +272,6 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
             );
         }
         // linear_key_head_dim: derive from ssm.inner_size.
-        // inner_size = value_dim = num_v_heads * head_v_dim.
-        // The attn_qkv output dim = 2*key_dim + 2*value_dim, where key_dim = num_k_heads * head_k_dim.
-        // We can derive: head_k_dim = (qkvz_dim - 2*inner_size) / (2*num_k_heads)
-        // But since we don't have qkvz_dim in metadata, use the embedding_length relationship:
-        // For Qwen3.5-0.8B: embedding=1024, inner_size=2048, num_k_heads=16
-        //   => qkvz_dim = 6144 from actual tensor, key_dim = (6144-4096)/2 = 1024, head_k_dim = 64
-        // We store inner_size so the model loader can derive head_k_dim from the actual weight shape.
         if let Some(inner) = gguf.get_metadata_u32(&format!("{arch}.ssm.inner_size")) {
             config
                 .extra
@@ -377,43 +357,31 @@ pub fn gguf_to_hf_name(gguf_name: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Multimodal GGUF: mmproj detection and loading
+// Multimodal GGUF: mmproj detection
 // ---------------------------------------------------------------------------
 
 /// Detect a sibling mmproj GGUF file next to a main GGUF file.
 ///
 /// Looks for files matching `mmproj*.gguf` in the same directory as
 /// `main_gguf_path`. Returns the first match, if any.
-///
-/// This matches the Python `detect_gguf_multimodal()` behavior.
 pub fn detect_mmproj_gguf(main_gguf_path: &Path) -> Option<std::path::PathBuf> {
     let parent = main_gguf_path.parent()?;
     let entries = std::fs::read_dir(parent).ok()?;
     for entry in entries.flatten() {
         let fname = entry.file_name();
         let fname_str = fname.to_string_lossy();
-        if fname_str.starts_with("mmproj") && fname_str.ends_with(".gguf") {
-            // Skip the main GGUF file itself if it happens to start with "mmproj".
-            if entry.path() != main_gguf_path {
-                return Some(entry.path());
-            }
+        if fname_str.starts_with("mmproj")
+            && fname_str.ends_with(".gguf")
+            && entry.path() != main_gguf_path
+        {
+            return Some(entry.path());
         }
     }
     None
 }
 
 /// Map an mmproj GGUF tensor name to the HuggingFace convention.
-///
-/// mmproj GGUFs use a compact naming scheme:
-/// - `v.blk.{i}.attn_q.weight` → vision_tower.vision_model.encoder.layers.{i}.self_attn.q_proj.weight
-/// - `v.blk.{i}.ln1.weight` → ...layer_norm1.weight
-/// - `v.blk.{i}.ffn_up.weight` → ...mlp.fc1.weight
-/// - `v.patch_embd.weight` → ...embeddings.patch_embedding.weight
-/// - `v.position_embd.weight` → ...embeddings.position_embedding.weight
-/// - `v.post_ln.weight` → ...post_layernorm.weight
-/// - `mm.0.weight` → multi_modal_projector.mm_input_projection_weight
-/// - `mm.model_norm.weight` → multi_modal_projector.mm_soft_emb_norm.weight
-fn mmproj_gguf_to_hf_name(gguf_name: &str) -> String {
+pub fn mmproj_gguf_to_hf_name(gguf_name: &str) -> String {
     // Projector tensors.
     if gguf_name == "mm.0.weight" {
         return "multi_modal_projector.mm_input_projection_weight".to_string();
@@ -472,36 +440,6 @@ fn mmproj_gguf_to_hf_name(gguf_name: &str) -> String {
 
     // Unknown — pass through unchanged.
     gguf_name.to_string()
-}
-
-/// Load an mmproj GGUF file and return dequantized weights as a `ModelWeights`.
-///
-/// All tensors are dequantized to f32 and mapped from GGUF mmproj naming
-/// convention to HuggingFace naming convention.
-pub fn load_mmproj_as_model_weights(
-    mmproj_path: &Path,
-    device: &Device,
-) -> ModelResult<crate::weight::ModelWeights> {
-    use std::collections::HashMap;
-
-    info!("Loading mmproj GGUF from {}", mmproj_path.display());
-
-    let mut gguf = GgufFile::open(mmproj_path)?;
-    let tensor_names: Vec<String> = gguf.tensor_names().iter().map(|s| s.to_string()).collect();
-
-    info!("mmproj GGUF has {} tensors", tensor_names.len());
-
-    let mut tensors: HashMap<String, candle_core::Tensor> = HashMap::new();
-    for name in &tensor_names {
-        let qt = gguf.tensor(name, device)?;
-        let t = qt
-            .dequantize(device)
-            .map_err(|e| ModelError::Other(format!("dequantize mmproj tensor '{name}': {e}")))?;
-        let hf_name = mmproj_gguf_to_hf_name(name);
-        tensors.insert(hf_name, t);
-    }
-
-    Ok(crate::weight::ModelWeights::from_tensors(tensors))
 }
 
 /// Extract vision config from mmproj GGUF metadata and populate the
@@ -583,8 +521,6 @@ pub fn extract_mmproj_vision_config(
         ) {
             let patches_per_side = img_size / patch_size;
             let num_patches = patches_per_side * patches_per_side;
-            // Default mm_tokens_per_image is num_patches (before any pooling).
-            // Gemma3 uses 256 by default (after avg pool).
             if !config.extra.contains_key("mm_tokens_per_image") {
                 config.extra.insert(
                     "mm_tokens_per_image".to_string(),
@@ -726,7 +662,6 @@ mod tests {
 
     #[test]
     fn test_gguf_to_hf_name_unknown_layer_suffix() {
-        // Unknown per-layer suffix passes through with model.layers prefix.
         assert_eq!(
             gguf_to_hf_name("blk.0.some_unknown.weight"),
             "model.layers.0.some_unknown.weight"

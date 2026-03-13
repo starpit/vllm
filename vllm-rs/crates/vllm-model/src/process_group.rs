@@ -1,26 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Process group trait for distributed collective communication.
 //!
-//! Defines the `ProcessGroup` trait used by tensor-parallel linear layers
-//! to perform all-reduce and all-gather across GPU ranks.
+//! Defines the `ProcessGroup` trait used by tensor-parallel workers
+//! to broadcast config/metadata across ranks during init.
 //!
-//! The concrete implementation (`NcclProcessGroup`) lives in `vllm-kernels`
-//! to avoid circular dependencies. Layers reference it via `Arc<dyn ProcessGroup>`.
+//! GPU-level collectives (all-reduce, all-gather) live in the backend
+//! crates (e.g. `NcclGroup` in vllm-cuda) operating on native tensor types.
 
-use candle_core::Tensor;
-
-/// Abstraction over collective communication for tensor parallelism.
+/// Abstraction over collective communication for multi-process init.
 ///
-/// Implemented by `NcclProcessGroup` in `vllm-kernels` for NVIDIA GPUs.
-/// Layers hold an `Option<Arc<dyn ProcessGroup>>` — when `None` (TP=1),
+/// Workers hold an `Option<Arc<dyn ProcessGroup>>` — when `None` (TP=1),
 /// no communication is performed.
 pub trait ProcessGroup: Send + Sync + std::fmt::Debug {
-    /// Sum-reduce a tensor across all ranks (each rank gets the full result).
-    fn all_reduce(&self, tensor: &Tensor) -> candle_core::Result<Tensor>;
-
-    /// Gather a tensor from all ranks along `dim` (each rank gets the full result).
-    fn all_gather(&self, tensor: &Tensor, dim: usize) -> candle_core::Result<Tensor>;
-
     /// This rank's index (0-based).
     fn rank(&self) -> usize;
 
@@ -30,7 +21,7 @@ pub trait ProcessGroup: Send + Sync + std::fmt::Debug {
     /// Broadcast a byte buffer from `root` to all ranks (collective).
     /// On root: sends `data`. On non-root: returns received data.
     /// Default: no-op passthrough (single-node).
-    fn broadcast_bytes(&self, data: &[u8], _root: usize) -> candle_core::Result<Vec<u8>> {
+    fn broadcast_bytes(&self, data: &[u8], _root: usize) -> Result<Vec<u8>, String> {
         Ok(data.to_vec())
     }
 }

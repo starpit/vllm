@@ -68,7 +68,7 @@ impl ModelConfig {
 // ---------------------------------------------------------------------------
 
 /// A linear layer: weight [out, in], optional bias [out].
-/// Computes y = x @ W^T + bias, matching candle/PyTorch convention.
+/// Computes y = x @ W^T + bias, matching PyTorch convention.
 /// Stores a pre-transposed copy of the weight for coalesced matvec access.
 pub struct WgpuLinear {
     pub weight: WgpuTensor,

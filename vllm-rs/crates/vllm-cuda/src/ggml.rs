@@ -6,7 +6,7 @@
 //! - `GgmlStorage`: raw quantized bytes on GPU + metadata
 //! - FFI wrappers calling the llama.cpp-derived kernels in `csrc/quantized.cu`
 //!
-//! Launch configs match candle's `quantized/cuda.rs` exactly.
+//! Launch configs match llama.cpp's quantized kernel configs.
 
 use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::dtype::DType;
@@ -20,7 +20,7 @@ type CUstream = cudarc::driver::sys::CUstream;
 
 /// GGML quantization data types.
 ///
-/// Matches `candle_core::quantized::GgmlDType` enum values and the GGUF
+/// Matches the GGUF
 /// on-disk format tags. Each variant knows its `type_size()` (bytes per block)
 /// and `block_size()` (elements per block).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,29 +60,14 @@ impl GgmlDType {
         }
     }
 
-    /// Convert from candle's GgmlDType (matching by variant name).
-    pub fn from_candle(dt: candle_core::quantized::GgmlDType) -> Option<Self> {
-        use candle_core::quantized::GgmlDType as C;
-        match dt {
-            C::Q4_0 => Some(Self::Q4_0),
-            C::Q4_1 => Some(Self::Q4_1),
-            C::Q5_0 => Some(Self::Q5_0),
-            C::Q5_1 => Some(Self::Q5_1),
-            C::Q8_0 => Some(Self::Q8_0),
-            C::Q8_1 => Some(Self::Q8_1),
-            C::Q2K => Some(Self::Q2K),
-            C::Q3K => Some(Self::Q3K),
-            C::Q4K => Some(Self::Q4K),
-            C::Q5K => Some(Self::Q5K),
-            C::Q6K => Some(Self::Q6K),
-            C::Q8K => Some(Self::Q8K),
-            _ => None,
-        }
+    /// Convert from a vendored GgufDType tag.
+    pub fn from_gguf(dt: vllm_model::gguf_format::GgufDType) -> Option<Self> {
+        Self::from_u32(dt.0)
     }
 
     /// Size in bytes of one quantization block.
     ///
-    /// Values match candle's `GgmlDType::type_size()` / llama.cpp block structs.
+    /// Values match llama.cpp block structs.
     pub const fn type_size(self) -> usize {
         match self {
             Self::Q4_0 => 18,
@@ -186,7 +171,7 @@ impl std::fmt::Debug for GgmlStorage {
 }
 
 // ---------------------------------------------------------------------------
-// Constants (match candle's quantized/cuda.rs)
+// Constants (match llama.cpp quantized kernels)
 // ---------------------------------------------------------------------------
 
 const MATRIX_ROW_PADDING: usize = 512;
@@ -864,7 +849,7 @@ impl GgufGpuWeights {
         alloc: &mut CachingAllocator,
         stream: CUstream,
     ) -> anyhow::Result<Self> {
-        use candle_core::quantized::gguf_file::Content;
+        use vllm_model::gguf_format::Content;
 
         let file = std::fs::File::open(path)?;
         let mut reader = BufReader::new(file);
@@ -891,10 +876,10 @@ impl GgufGpuWeights {
             let hf_name = vllm_model::gguf::gguf_to_hf_name(gguf_name);
             let dims = info.shape.dims();
             let elem_count = info.shape.elem_count();
-            let candle_dtype = info.ggml_dtype;
+            let gguf_dtype = info.ggml_dtype;
 
-            // Map candle GgmlDType to our GgmlDType.
-            let our_dtype = GgmlDType::from_candle(candle_dtype);
+            // Map GGUF dtype tag to our quantized GgmlDType (None for float types).
+            let our_dtype = GgmlDType::from_gguf(gguf_dtype);
 
             // Determine if this is a norm or embedding (dequantize) vs linear (keep quantized).
             // Layer norms (RmsNorm) → f32; QK norms → model dtype; embeddings → model dtype.
@@ -907,16 +892,11 @@ impl GgufGpuWeights {
             let is_norm = is_layer_norm || is_qk_norm;
             let is_embedding = hf_name == "model.embed_tokens.weight";
             let is_lm_head = hf_name == "lm_head.weight";
-            let is_f32_or_f16 = matches!(
-                candle_dtype,
-                candle_core::quantized::GgmlDType::F32
-                    | candle_core::quantized::GgmlDType::F16
-                    | candle_core::quantized::GgmlDType::BF16
-            );
+            let is_f32_or_f16 = gguf_dtype.is_float();
 
             // Read raw bytes from disk.
-            let bs = candle_dtype.block_size();
-            let ts = candle_dtype.type_size();
+            let bs = gguf_dtype.block_size();
+            let ts = gguf_dtype.type_size();
             let size_bytes = (elem_count / bs) * ts;
             reader.seek(SeekFrom::Start(tensor_data_offset + info.offset))?;
             let host_slice = std::slice::from_raw_parts_mut(host_buf, size_bytes);
@@ -930,7 +910,7 @@ impl GgufGpuWeights {
                     let dtype_size = ts; // 4 for f32, 2 for f16/bf16
                     let source_dtype = if dtype_size == 4 {
                         DType::F32
-                    } else if matches!(candle_dtype, candle_core::quantized::GgmlDType::BF16) {
+                    } else if gguf_dtype == vllm_model::gguf_format::GgufDType::BF16 {
                         DType::BF16
                     } else {
                         DType::F16
@@ -1028,7 +1008,7 @@ impl GgufGpuWeights {
                 } else {
                     anyhow::bail!(
                         "unsupported GGUF dtype {:?} for tensor {}",
-                        candle_dtype,
+                        gguf_dtype,
                         gguf_name
                     );
                 }
@@ -1056,7 +1036,7 @@ impl GgufGpuWeights {
             } else {
                 anyhow::bail!(
                     "unsupported GGUF dtype {:?} for tensor {}",
-                    candle_dtype,
+                    gguf_dtype,
                     gguf_name
                 );
             }

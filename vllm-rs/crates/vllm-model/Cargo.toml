@@ -7,8 +7,6 @@ description = "Model loading, weight management, and tensor abstractions for vLL
 
 [features]
 default = []
-cuda = ["candle-core/cuda"]
-metal = ["candle-core/metal"]
 multimodal = ["image"]
 
 [dependencies]
@@ -18,11 +16,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-candle-core = { workspace = true }
-safetensors = { workspace = true }
-half = { workspace = true }
-memmap2 = { workspace = true }
-indicatif = { workspace = true }
+byteorder = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"], optional = true }
 
 [dev-dependencies]

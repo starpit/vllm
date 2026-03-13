@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Model layers using `GpuTensor` — no candle dependency.
+//! Model layers using `GpuTensor`.
 //!
 //! These are minimal, inference-only layer types. Weights are stored as
 //! `GpuTensor` (raw GPU pointers). Forward passes use cuBLAS GEMM from

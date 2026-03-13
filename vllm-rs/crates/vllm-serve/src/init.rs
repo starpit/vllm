@@ -28,8 +28,6 @@ use crate::tokenizer::Tokenizer;
 #[cfg(feature = "metal")]
 use vllm_mlx::worker::{MlxWorker, MlxWorkerConfig};
 
-use candle_core::DType;
-
 /// Configuration for initializing the vLLM inference stack.
 ///
 /// This is the programmatic API — no CLI dependency needed.
@@ -176,11 +174,13 @@ fn should_use_mlx(device: &str) -> bool {
 }
 
 /// Result of worker creation: the worker plus metadata needed for init.
+///
+/// The `usize` is the KV cache element size in bytes (e.g. 2 for F16/BF16, 4 for F32).
 type WorkerCreationResult = (
     Box<dyn Worker>,
     HfModelConfig,
     Option<std::path::PathBuf>,
-    DType,
+    usize,
 );
 
 /// Create the appropriate worker based on backend selection.
@@ -218,15 +218,13 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             .clone();
         let model_dir = worker.model_dir().map(|p| p.to_path_buf());
 
-        // Map MLX dtype to candle DType for compute_num_blocks.
-        // We resolve via the string representation to avoid depending on mlx_rs directly.
-        let model_dtype = match config.dtype.as_str() {
-            "f32" | "float32" => DType::F32,
-            "bf16" | "bfloat16" => DType::BF16,
-            _ => DType::F16, // Default: f16 for Metal
+        // KV cache element size in bytes for compute_num_blocks.
+        let dtype_elem_bytes = match config.dtype.as_str() {
+            "f32" | "float32" => 4,
+            _ => 2, // f16, bf16 — default for Metal
         };
 
-        return Ok((Box::new(worker), hf_config, model_dir, model_dtype));
+        return Ok((Box::new(worker), hf_config, model_dir, dtype_elem_bytes));
     }
 
     // Try the purpose-built CUDA backend when feature is enabled and device is CUDA.
@@ -285,9 +283,9 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             .context("model config not available after CUDA load")?
             .clone();
         let model_dir = worker.model_dir().map(|p| p.to_path_buf());
-        let model_dtype = worker.resolved_candle_dtype();
+        let dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
 
-        return Ok((Box::new(worker), hf_config, model_dir, model_dtype));
+        return Ok((Box::new(worker), hf_config, model_dir, dtype_elem_bytes));
     }
 
     // No backend available.
@@ -307,7 +305,7 @@ fn init_cache(
     mut worker: Box<dyn Worker>,
     block_size: usize,
     hf_config: &HfModelConfig,
-    model_dtype: DType,
+    dtype_elem_bytes: usize,
     gpu_memory_utilization: f64,
     device: &str,
     kv_cache_dtype: &str,
@@ -347,7 +345,7 @@ fn init_cache(
         kv_cache_bytes,
         block_size,
         hf_config,
-        model_dtype,
+        dtype_elem_bytes,
         utilization,
         kv_cache_dtype,
     );
@@ -779,7 +777,7 @@ fn initialize_stack_tp(
         let mut cuda_workers: Vec<CudaWorker> = Vec::with_capacity(tp_size);
         let mut hf_config = None;
         let mut model_dir = None;
-        let mut model_dtype = DType::BF16;
+        let mut dtype_elem_bytes: usize = 2; // BF16 default
 
         for (rank, handle) in handles.into_iter().enumerate() {
             let worker = handle
@@ -790,7 +788,7 @@ fn initialize_stack_tp(
             if rank == 0 {
                 hf_config = worker.hf_config().cloned();
                 model_dir = worker.model_dir().map(|p| p.to_path_buf());
-                model_dtype = worker.resolved_candle_dtype();
+                dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
             }
             cuda_workers.push(worker);
         }
@@ -856,7 +854,7 @@ fn initialize_stack_tp(
             min_avail,
             config.block_size,
             &hf_config,
-            model_dtype,
+            dtype_elem_bytes,
             config.gpu_memory_utilization,
             &config.kv_cache_dtype,
         );
@@ -1214,7 +1212,7 @@ fn initialize_stack_tp(
     //     let model_dir = workers[0].model_dir().map(|p| p.to_path_buf());
     //     let model_dtype = workers[0]
     //         .resolved_dtype()
-    //         .unwrap_or(candle_core::DType::F32);
+    //         .unwrap_or(F32);
     //     let preloaded_tokenizer = {
     //         // Only take tokenizer from mutable ref to rank 0.
     //         // We can't mutate here since workers is Vec<CandleWorker> not Vec<&mut>.
@@ -1581,7 +1579,7 @@ fn initialize_stack_external(
             .context("model config not available after load")?
             .clone();
         let model_dir = worker.model_dir().map(|p| p.to_path_buf());
-        let model_dtype = worker.resolved_candle_dtype();
+        let dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
 
         // Step 3: Create NCCL communicator.
         let device = worker.device_ref().expect("device not initialized");
@@ -1626,7 +1624,7 @@ fn initialize_stack_external(
             min_memory,
             config.block_size,
             &hf_config,
-            model_dtype,
+            dtype_elem_bytes,
             config.gpu_memory_utilization,
             &config.kv_cache_dtype,
         );
@@ -1799,7 +1797,7 @@ fn compute_num_blocks(
     available_bytes: usize,
     block_size: usize,
     hf_config: &HfModelConfig,
-    dtype: DType,
+    dtype_elem_bytes: usize,
     _gpu_memory_utilization: f64,
     kv_cache_dtype: &str,
 ) -> usize {
@@ -1813,7 +1811,7 @@ fn compute_num_blocks(
     let elem_bytes = if kv_cache_dtype == "fp8_e4m3" || kv_cache_dtype == "fp8" {
         1
     } else {
-        vllm_model::tensor::dtype_size(dtype)
+        dtype_elem_bytes
     };
     let bytes_per_token_per_layer = 2 * num_kv_heads * head_dim * elem_bytes;
     let bytes_per_block = block_size * num_layers * bytes_per_token_per_layer;
@@ -1875,8 +1873,7 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks =
-            compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F32, 0.9, "auto");
+        let blocks = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, 4, 0.9, "auto");
         assert!(blocks >= 16);
     }
 
@@ -1890,10 +1887,8 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks_f32 =
-            compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F32, 0.9, "auto");
-        let blocks_f16 =
-            compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9, "auto");
+        let blocks_f32 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, 4, 0.9, "auto");
+        let blocks_f16 = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, 2, 0.9, "auto");
         assert!(blocks_f16 > blocks_f32);
         // F16 should give approximately 2x the blocks.
         assert!((blocks_f16 as f64 / blocks_f32 as f64 - 2.0).abs() < 0.1);
@@ -1902,7 +1897,7 @@ mod tests {
     #[test]
     fn test_compute_num_blocks_zero_dim() {
         let config = HfModelConfig::default();
-        let blocks = compute_num_blocks(1024, 16, &config, DType::F32, 0.9, "auto");
+        let blocks = compute_num_blocks(1024, 16, &config, 4, 0.9, "auto");
         // Should fall back to 1024.
         assert_eq!(blocks, 1024);
     }
@@ -1919,10 +1914,8 @@ mod tests {
             hidden_size: Some(4096),
             ..Default::default()
         };
-        let blocks_full =
-            compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9, "auto");
-        let blocks_half =
-            compute_num_blocks(2 * 1024 * 1024 * 1024, 16, &config, DType::F16, 0.9, "auto");
+        let blocks_full = compute_num_blocks(4 * 1024 * 1024 * 1024, 16, &config, 2, 0.9, "auto");
+        let blocks_half = compute_num_blocks(2 * 1024 * 1024 * 1024, 16, &config, 2, 0.9, "auto");
         let ratio = blocks_half as f64 / blocks_full as f64;
         assert!((ratio - 0.5).abs() < 0.01, "ratio was {ratio}");
     }

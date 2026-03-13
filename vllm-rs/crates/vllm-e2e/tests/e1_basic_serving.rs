@@ -1065,7 +1065,7 @@ async fn test_cuda_gemma3_chat() {
 // ===========================================================================
 // CUDA GGUF E2E tests — quantized GGUF models on GPU
 // ===========================================================================
-// Uses vllm-cuda's GGML kernel FFI for quantized inference (no candle).
+// Uses vllm-cuda's GGML kernel FFI for quantized inference (raw FFI).
 //
 // Run with: cargo test -p vllm-e2e --features e2e,cuda --release --test e1_basic_serving test_cuda_gguf -- --ignored
 

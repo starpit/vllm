@@ -26,7 +26,6 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 vllm-common = { path = "../vllm-common" }
 vllm-model = { path = "../vllm-model" }
-candle-core = { workspace = true }
 libc = { workspace = true }
 
 [build-dependencies]

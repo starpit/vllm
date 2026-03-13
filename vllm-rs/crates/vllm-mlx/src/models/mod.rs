@@ -191,7 +191,7 @@ pub type MlxModelFactory =
 pub struct MlxModelRegistry {
     models: HashMap<String, MlxModelFactory>,
     /// Separate map for quantized model factories (checked first when config has
-    /// a `"quantization"` field). Mirrors the candle `gguf_models` pattern.
+    /// a `"quantization"` field). Mirrors the `gguf_models` pattern.
     quantized_models: HashMap<String, MlxModelFactory>,
     /// GPTQ model factories, keyed by HF architecture name.
     gptq_models: HashMap<String, MlxModelFactory>,

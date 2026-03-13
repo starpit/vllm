@@ -1,34 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Layer abstractions for building model architectures.
+//! Quantization config types for AWQ, BitsAndBytes, and GPTQ.
 //!
-//! Provides traits and implementations for common neural network layers:
-//! - `Module`: base trait for forward pass
-//! - `Linear`: dense linear layer (with column/row parallel variants)
-//! - `RmsNorm`: RMS normalization
-//! - `Embedding`: token embedding lookup
-//! - Activation functions (SiLU, GELU, etc.)
-//! - `RotaryEmbedding`: Rotary Position Embedding (RoPE)
-//!
-//! Port of: `vllm/model_executor/layers/`
+//! The actual model layers (Linear, RmsNorm, Embedding, RoPE, activations)
+//! live in each backend crate (vllm-cuda, vllm-mlx).
 
-pub mod activation;
 pub mod awq;
 pub mod bnb;
-pub mod embedding;
 pub mod gptq;
-pub mod linear;
-pub mod norm;
-pub mod quantized_linear;
-pub mod rotary;
 
-pub use activation::{Activation, gelu, relu, silu};
-pub use awq::{AwqConfig, AwqLinear};
-pub use bnb::{BnbInt8Linear, BnbLayerConfig, BnbLinear, BnbNf4Config, BnbNf4Linear, BnbQuantType};
-pub use embedding::{Embedding, VocabParallelEmbedding};
-pub use gptq::{GptqConfig, GptqLinear};
-pub use linear::{
-    ColumnParallelLinear, Linear, RowParallelLinear, load_fused_gate_up, load_fused_qkv,
-};
-pub use norm::{CohereLayerNorm, GemmaRmsNorm, LayerNorm, RmsNorm};
-pub use quantized_linear::QuantizedLinear;
-pub use rotary::{RotaryEmbedding, apply_rotary_to_tensor};
+pub use awq::AwqConfig;
+pub use bnb::{BnbLayerConfig, BnbNf4Config, BnbQuantType};
+pub use gptq::GptqConfig;

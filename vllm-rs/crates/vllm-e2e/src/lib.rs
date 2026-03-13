@@ -46,10 +46,10 @@ impl TestModels {
     // Float16 variants for non-quantized testing
     pub const SMOLLM_135M_F16: &str = "mlx-community/SmolLM2-135M-Instruct";
 
-    // GPTQ quantized models (candle backend, not MLX)
+    // GPTQ quantized models (CPU, not MLX)
     pub const QWEN2_0_5B_GPTQ_INT4: &str = "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4";
 
-    // AWQ quantized models (candle backend, not MLX)
+    // AWQ quantized models (CPU, not MLX)
     pub const QWEN2_0_5B_AWQ: &str = "Qwen/Qwen2.5-0.5B-Instruct-AWQ";
 
     // Gemma2 GPTQ quantized models (ungated)
@@ -58,11 +58,11 @@ impl TestModels {
     // GPTQ with desc_act (activation ordering) — tests g_idx sort + perm pipeline
     pub const TINYLLAMA_1B_GPTQ_DESC_ACT: &str = "TheBloke/TinyLlama-1.1B-Chat-v0.3-GPTQ";
 
-    // BitsAndBytes quantized models (MLX dequant-at-load or candle)
+    // BitsAndBytes quantized models (MLX dequant-at-load or CPU)
     pub const LLAMA_3_2_1B_BNB_4BIT: &str = "unsloth/Llama-3.2-1B-Instruct-bnb-4bit";
     pub const TINYLLAMA_1B_BNB_8BIT: &str = "Jiqing/TinyLlama-1.1B-Chat-v1.0-bnb-8bit";
 
-    // GGUF quantized models (candle backend, not MLX)
+    // GGUF quantized models (CPU, not MLX)
     pub const GEMMA3_270M_GGUF: &str = "unsloth/gemma-3-270m-it-qat-GGUF";
     pub const GEMMA3_1B_GGUF: &str = "unsloth/gemma-3-1b-it-GGUF";
     pub const QWEN2_0_5B_GGUF: &str = "Qwen/Qwen2.5-0.5B-Instruct-GGUF";
@@ -94,9 +94,9 @@ impl TestModels {
 
     // Granite (IBM) — MLX 4-bit quantized
     pub const GRANITE_3_3_2B_4BIT: &str = "mlx-community/granite-3.3-2b-instruct-4bit";
-    // Granite (IBM) — safetensors BF16, candle backend (CUDA)
+    // Granite (IBM) — safetensors BF16, CUDA
     pub const GRANITE_3_3_2B_INSTRUCT: &str = "ibm-granite/granite-3.3-2b-instruct";
-    // Granite GGUF — quantized, candle backend (CUDA)
+    // Granite GGUF — quantized, CUDA
     pub const GRANITE_3_3_2B_INSTRUCT_GGUF: &str = "ibm-granite/granite-3.3-2b-instruct-GGUF";
 
     // FP8 quantized models (CUDA-backend, SM89+)

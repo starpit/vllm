@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! MoE (Mixture of Experts) layers using `GpuTensor` — no candle dependency.
+//! MoE (Mixture of Experts) layers using `GpuTensor`.
 //!
 //! Implements the full Python vLLM fused MoE pipeline:
 //! 1. Gate → router logits

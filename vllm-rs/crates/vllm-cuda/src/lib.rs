@@ -16,7 +16,7 @@
 //! 1. **Caching allocator**: Like PyTorch — free-list based, tensors freed on
 //!    drop. Zero D2D copies between layers.
 //! 2. **Always contiguous**: `GpuTensor` has no strides — eliminates
-//!    `.contiguous()` copies that plague the candle backend.
+//!    `.contiguous()` copies.
 //! 3. **Own streams**: Non-default compute and transfer streams enable
 //!    CUDA graph capture and async scheduling overlap.
 //! 4. **Minimal tensor type**: `GpuTensor` is 32 bytes, `Copy`, no `Drop`.

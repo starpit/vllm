@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Direct kernel dispatch for `GpuTensor` — no candle dependency.
+//! Direct kernel dispatch for `GpuTensor`.
 //!
 //! These wrap the same CUDA FFI functions from `vllm-kernels/csrc/` but
 //! dispatch from `GpuTensor::as_ptr()` instead of extracting raw pointers
-//! from candle `Tensor` (which takes ~10 lines per tensor). Here it's one line.
+//! Here it's one line.
 
 use core::ffi::{c_int, c_void};
 
@@ -2637,7 +2637,7 @@ pub unsafe fn cutlass_scaled_mm_with_bias(
 }
 
 // ---------------------------------------------------------------------------
-// FlashAttention-2 Paged (raw FFI — no candle dependency)
+// FlashAttention-2 Paged (raw FFI)
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" {

@@ -846,9 +846,7 @@ fn qwen2_moe_config_from_hf(
         .extra
         .get("shared_expert_intermediate_size")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| {
-            ExecutorError::WorkerInit("missing shared_expert_intermediate_size".into())
-        })? as usize;
+        .unwrap_or(0) as usize;
     let mlp_only_layers: Vec<usize> = hf
         .extra
         .get("decoder_sparse_step")
@@ -3402,7 +3400,15 @@ impl Worker for CudaWorker {
             }
             "MixtralForCausalLM" => {
                 let config = mixtral_config_from_hf(&hf_config)?;
-                let m = if qconfig.is_fp8() {
+                let m = if qconfig.is_quantized() && !qconfig.is_fp8() && !qconfig.is_bnb4bit() {
+                    vllm_cuda::model::mixtral::MixtralForCausalLM::load_quantized(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        &qconfig,
+                        device,
+                    )
+                } else if qconfig.is_fp8() {
                     vllm_cuda::model::mixtral::MixtralForCausalLM::load_fp8(
                         &mut weights,
                         &config,
@@ -3430,7 +3436,15 @@ impl Worker for CudaWorker {
             }
             "Qwen2MoeForCausalLM" => {
                 let config = qwen2_moe_config_from_hf(&hf_config)?;
-                let m = if qconfig.is_fp8() {
+                let m = if qconfig.is_quantized() && !qconfig.is_fp8() && !qconfig.is_bnb4bit() {
+                    vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load_quantized(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        &qconfig,
+                        device,
+                    )
+                } else if qconfig.is_fp8() {
                     vllm_cuda::model::qwen2_moe::Qwen2MoeForCausalLM::load_fp8(
                         &mut weights,
                         &config,
@@ -3458,7 +3472,15 @@ impl Worker for CudaWorker {
             }
             "Qwen3MoeForCausalLM" => {
                 let config = qwen2_moe_config_from_hf(&hf_config)?;
-                let m = if qconfig.is_fp8() {
+                let m = if qconfig.is_quantized() && !qconfig.is_fp8() && !qconfig.is_bnb4bit() {
+                    vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_quantized(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        &qconfig,
+                        device,
+                    )
+                } else if qconfig.is_fp8() {
                     vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_fp8(
                         &mut weights,
                         &config,

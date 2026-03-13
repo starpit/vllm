@@ -179,7 +179,9 @@ impl QuantConfig {
 /// Raw JSON structure for `quantize_config.json` (shared by AWQ and GPTQ).
 #[derive(Debug, Deserialize)]
 struct RawQuantConfig {
+    #[serde(alias = "w_bit")]
     bits: usize,
+    #[serde(alias = "q_group_size")]
     group_size: usize,
     #[serde(default)]
     quant_method: Option<String>,
@@ -204,6 +206,14 @@ pub fn detect_quant_config(model_dir: impl AsRef<Path>) -> Result<QuantConfig> {
     let qc_path = dir.join("quantize_config.json");
     if qc_path.exists() {
         let data = std::fs::read_to_string(&qc_path)?;
+        let raw: RawQuantConfig = serde_json::from_str(&data)?;
+        return parse_raw_config(raw);
+    }
+
+    // Try quant_config.json (used by some AWQ models).
+    let qc_path2 = dir.join("quant_config.json");
+    if qc_path2.exists() {
+        let data = std::fs::read_to_string(&qc_path2)?;
         let raw: RawQuantConfig = serde_json::from_str(&data)?;
         return parse_raw_config(raw);
     }
@@ -337,10 +347,34 @@ fn parse_compressed_tensors_config(qc: &serde_json::Value) -> Result<QuantConfig
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    if weight_type != "float" || weight_bits != 8 {
-        bail!(
-            "compressed-tensors: only float8 weights supported, got type={weight_type}, bits={weight_bits}"
+    // INT4 quantization (WNA16 — weight-only INT4, FP16 activations).
+    // compressed-tensors pack-quantized format is equivalent to GPTQ packing.
+    // Symmetric quantization → no zero points → b_type_id=0 (uint4b8).
+    if weight_type == "int" && weight_bits == 4 {
+        let group_size = weights
+            .get("group_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(128) as usize;
+        let symmetric = weights
+            .get("symmetric")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let desc_act = false; // compressed-tensors doesn't use activation ordering
+
+        tracing::info!(
+            "Detected compressed-tensors INT4: group_size={group_size}, symmetric={symmetric}"
         );
+
+        return Ok(QuantConfig::Gptq(GptqConfig {
+            bits: 4,
+            group_size,
+            desc_act,
+            sym: symmetric,
+        }));
+    }
+
+    if weight_type != "float" || weight_bits != 8 {
+        bail!("compressed-tensors: unsupported weight type={weight_type}, bits={weight_bits}");
     }
 
     // Determine activation scheme from input_activations.

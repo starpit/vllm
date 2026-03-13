@@ -127,6 +127,39 @@ fn cuda_build() {
 
     println!("cargo:rustc-link-lib=static=marlin_kernels");
 
+    // 3b. Marlin MoE W4A16 fused GEMM kernels (expert-routed variant).
+    let marlin_moe_sources = [
+        "csrc/marlin_moe/marlin_moe_gemm.cu",
+        "csrc/marlin_moe/sm80_kernel_float16_u4_float16.cu",
+        "csrc/marlin_moe/sm80_kernel_bfloat16_u4_bfloat16.cu",
+        "csrc/marlin_moe/sm80_kernel_float16_u4b8_float16.cu",
+        "csrc/marlin_moe/sm80_kernel_bfloat16_u4b8_bfloat16.cu",
+    ];
+    let marlin_moe_watch = [
+        "csrc/marlin_moe/kernel.h",
+        "csrc/marlin_moe/kernel_selector.h",
+        "csrc/marlin_moe/marlin_template.h",
+    ];
+
+    rerun_files.extend(marlin_moe_sources.iter().map(|s| s.to_string()));
+    rerun_files.extend(marlin_moe_watch.iter().map(|s| s.to_string()));
+
+    cudaforge::KernelBuilder::new()
+        .out_dir(&cache_dir)
+        .source_files(marlin_moe_sources.iter().map(|s| s.to_string()))
+        .watch(marlin_moe_watch.iter().map(|s| s.to_string()))
+        .include_path("csrc/marlin_moe")
+        .include_path("csrc/marlin")
+        .include_path("csrc")
+        .arg("-O3")
+        .arg("--use_fast_math")
+        .arg("-std=c++17")
+        .arg("--expt-relaxed-constexpr")
+        .build_lib(format!("{}/libmarlin_moe_kernels.a", cache_str))
+        .expect("Failed to build marlin_moe_kernels");
+
+    println!("cargo:rustc-link-lib=static=marlin_moe_kernels");
+
     // 4. CUTLASS scaled_mm FP8 GEMM kernels (fused per-row scale epilogue).
     build_cutlass_scaled_mm(&cache_str, &mut rerun_files);
 

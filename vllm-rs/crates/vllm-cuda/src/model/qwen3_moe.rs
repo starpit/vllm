@@ -18,13 +18,14 @@ use crate::device::GpuDevice;
 use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
-use crate::layers::{Linear, RmsNorm};
-use crate::layers_moe::FusedMoELayer;
+use crate::layers::{Linear, LinearLayer, RmsNorm};
+use crate::layers_moe::{FusedMoELayer, MarlinSharedFusedMoELayer};
 use crate::model::llama::{LlamaAttention, LlamaMLP, RotaryCache, TpConfig};
 #[cfg(feature = "nccl")]
 use crate::nccl::NcclGroup;
+use crate::quant::QuantConfig;
 use crate::tensor::GpuTensor;
-use crate::weights::GpuWeights;
+use crate::weights::{self as gpu_weights, GpuWeights};
 
 pub use crate::model::qwen2_moe::Qwen2MoeConfig;
 
@@ -45,6 +46,7 @@ pub enum Qwen3MoeMlp {
         shared_expert_gate: Option<Linear>,
         shared_intermediate_size: usize,
     },
+    QuantizedMoE(MarlinSharedFusedMoELayer),
 }
 
 impl Qwen3MoeMlp {
@@ -114,6 +116,7 @@ impl Qwen3MoeMlp {
                     moe_out
                 }
             }
+            Self::QuantizedMoE(layer) => layer.forward_owned(hidden_states, device),
         }
     }
 }
@@ -401,6 +404,150 @@ impl Qwen3MoeDecoderLayer {
         })
     }
 
+    /// Load a quantized (AWQ/GPTQ → Marlin) decoder layer.
+    /// Attention uses Marlin linear layers. MoE uses MarlinFusedMoELayer.
+    /// Shared experts (if any) use Marlin linear layers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Qwen3MoeConfig,
+        layer_idx: usize,
+        qconfig: &QuantConfig,
+        workspace: GpuTensor,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let llama_cfg = config.as_llama_config();
+
+        // Load quantized attention, then add QK-norm weights on top.
+        let mut self_attn = LlamaAttention::load_quantized(
+            weights,
+            &format!("{prefix}.self_attn"),
+            &llama_cfg,
+            layer_idx,
+            qconfig,
+            workspace,
+            device,
+        )?;
+
+        let q_norm_name = format!("{prefix}.self_attn.q_norm.weight");
+        let k_norm_name = format!("{prefix}.self_attn.k_norm.weight");
+        if weights.contains(&q_norm_name) {
+            self_attn.q_norm_weight = Some(weights.take(&q_norm_name)?);
+        }
+        if weights.contains(&k_norm_name) {
+            self_attn.k_norm_weight = Some(weights.take(&k_norm_name)?);
+        }
+        self_attn.qk_norm_eps = config.rms_norm_eps;
+
+        let is_dense = config.mlp_only_layers.contains(&layer_idx);
+        let mlp = if is_dense {
+            let dense = LlamaMLP::load_quantized(
+                weights,
+                &format!("{prefix}.mlp"),
+                config.intermediate_size,
+                qconfig,
+                workspace,
+                device,
+            )?;
+            Qwen3MoeMlp::Dense(dense)
+        } else {
+            Self::load_quantized_moe(
+                weights,
+                &format!("{prefix}.mlp"),
+                config,
+                qconfig,
+                workspace,
+                device,
+            )?
+        };
+
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        })
+    }
+
+    /// Load quantized MoE layer (experts + optional shared expert).
+    #[allow(clippy::too_many_arguments)]
+    fn load_quantized_moe(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Qwen3MoeConfig,
+        qconfig: &QuantConfig,
+        workspace: GpuTensor,
+        device: &GpuDevice,
+    ) -> Result<Qwen3MoeMlp> {
+        let moe = gpu_weights::load_marlin_moe_layer(
+            weights,
+            prefix,
+            config.num_experts,
+            config.moe_intermediate_size,
+            config.hidden_size,
+            config.num_experts_per_tok,
+            true, // renormalize
+            qconfig,
+            device.device_id as i32,
+        )?;
+
+        let shared_inter = config.shared_expert_intermediate_size;
+
+        // Load shared expert as Marlin linear layers (if present).
+        let (shared_gate_up, shared_down, shared_expert_gate) = if shared_inter > 0 {
+            let mut alloc = crate::alloc::CachingAllocator::new();
+            let gate_up = gpu_weights::load_fused_marlin_linear(
+                weights,
+                &[
+                    format!("{prefix}.shared_expert.gate_proj"),
+                    format!("{prefix}.shared_expert.up_proj"),
+                ],
+                qconfig,
+                workspace,
+                device.device_id,
+                &mut alloc,
+            )?;
+            let down = gpu_weights::load_marlin_linear(
+                weights,
+                &format!("{prefix}.shared_expert.down_proj"),
+                qconfig,
+                workspace,
+                device.device_id,
+                &mut alloc,
+            )?;
+
+            let gate = Linear::load(weights, &format!("{prefix}.shared_expert_gate"))?;
+
+            (
+                Some(LinearLayer::Marlin(Box::new(gate_up))),
+                Some(LinearLayer::Marlin(Box::new(down))),
+                Some(gate),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        Ok(Qwen3MoeMlp::QuantizedMoE(MarlinSharedFusedMoELayer {
+            moe,
+            shared_gate_up,
+            shared_down,
+            shared_expert_gate,
+            intermediate_size: shared_inter,
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward_owned(
         &self,
@@ -563,6 +710,51 @@ impl Qwen3MoeModel {
         })
     }
 
+    /// Load a quantized (AWQ/GPTQ → Marlin) Qwen3 MoE model.
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        config: &Qwen3MoeConfig,
+        dtype: DType,
+        qconfig: &QuantConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let workspace = gpu_weights::alloc_marlin_workspace(device.num_sm, device.compute_stream)?;
+
+        let embed_tokens = crate::layers::Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            layers.push(Qwen3MoeDecoderLayer::load_quantized(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                qconfig,
+                workspace,
+                device,
+            )?);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward_owned(
         &self,
@@ -650,6 +842,23 @@ impl Qwen3MoeForCausalLM {
         device: &GpuDevice,
     ) -> Result<Self> {
         let model = Qwen3MoeModel::load_fp8(weights, config, dtype, device)?;
+        let lm_head = if config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.weight, None)
+        } else {
+            Linear::load(weights, "lm_head")?
+        };
+        Ok(Self { model, lm_head })
+    }
+
+    /// Load a quantized (AWQ/GPTQ → Marlin) Qwen3 MoE model.
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        config: &Qwen3MoeConfig,
+        dtype: DType,
+        qconfig: &QuantConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = Qwen3MoeModel::load_quantized(weights, config, dtype, qconfig, device)?;
         let lm_head = if config.tie_word_embeddings {
             Linear::new(model.embed_tokens.weight, None)
         } else {
@@ -832,6 +1041,9 @@ impl Qwen3MoeForCausalLM {
                 }
                 Qwen3MoeMlp::MoE { moe, .. } => {
                     moe.tp_group = Some(Arc::clone(&group));
+                }
+                Qwen3MoeMlp::QuantizedMoE(layer) => {
+                    layer.moe.tp_group = Some(Arc::clone(&group));
                 }
             }
         }

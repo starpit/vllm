@@ -1427,16 +1427,25 @@ fn load_gptq_marlin_linear(
     stream: CUstream,
 ) -> Result<MarlinLinear> {
     // GPTQ qweight: [K/8, N] i32 — packed along input dim
+    // compressed-tensors: weight_packed [N, K/8] — needs transpose
     let qw_name = format!("{prefix}.qweight");
-    let scales_name = format!("{prefix}.scales");
-    let qzeros_name = format!("{prefix}.qzeros");
+    let ct_qw_name = format!("{prefix}.weight_packed");
+    let is_compressed_tensors = !weights.contains(&qw_name) && weights.contains(&ct_qw_name);
 
-    let (qw_shape, _qw_dtype) = weights
-        .tensor_info(&qw_name)
-        .ok_or_else(|| anyhow::anyhow!("weight not found: {qw_name}"))?;
-    let qw_shape = qw_shape.to_vec();
-    let size_k = qw_shape[0] * 8; // 4-bit: 8 values packed per i32
-    let size_n = qw_shape[1];
+    let (size_k, size_n) = if is_compressed_tensors {
+        let (shape, _) = weights
+            .tensor_info(&ct_qw_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {ct_qw_name}"))?;
+        // compressed-tensors: [N, K/8]
+        (shape[1] * 8, shape[0])
+    } else {
+        let (shape, _) = weights
+            .tensor_info(&qw_name)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {qw_name}"))?;
+        // GPTQ: [K/8, N]
+        (shape[0] * 8, shape[1])
+    };
+
     let group_size = cfg.group_size;
     let num_groups = if group_size > 0 {
         size_k / group_size
@@ -1446,12 +1455,14 @@ fn load_gptq_marlin_linear(
 
     // GPTQ uses uint4b8 scalar type which bakes in the zero-point (bias=8).
     // Python vLLM never passes zero-points for GPTQ — just consume and discard.
+    let qzeros_name = format!("{prefix}.qzeros");
     if weights.contains(&qzeros_name) {
         let _ = weights.take(&qzeros_name);
     }
 
     // Handle g_idx for desc_act (activation ordering).
     // Must be done BEFORE repack because repack needs `perm` (sort_indices) on GPU.
+    // compressed-tensors doesn't use desc_act.
     let g_idx_name = format!("{prefix}.g_idx");
     let (g_idx_gpu, sort_indices_gpu, has_act_order) =
         if cfg.desc_act && weights.contains(&g_idx_name) {
@@ -1499,8 +1510,25 @@ fn load_gptq_marlin_linear(
             (None, None, false)
         };
 
-    // Upload qweight to GPU (raw alloc — will be freed after repack)
-    let qweight_gpu = weights.take(&qw_name)?;
+    // Upload qweight to GPU (raw alloc — will be freed after repack).
+    // For compressed-tensors, transpose from [N, K/8] to [K/8, N] on CPU first.
+    let qweight_gpu = if is_compressed_tensors {
+        let (qw_bytes, qw_shape, qw_dtype) = weights.take_cpu(&ct_qw_name)?;
+        let n = qw_shape[0];
+        let k_packed = qw_shape[1];
+        let transposed = transpose_2d_cpu(&qw_bytes, n, k_packed, qw_dtype.size_bytes());
+        // Consume weight_shape if present
+        let shape_name = format!("{prefix}.weight_shape");
+        if weights.contains(&shape_name) {
+            let _ = weights.take_cpu(&shape_name);
+        }
+        let nbytes = transposed.len();
+        let ptr = unsafe { driver::mem_alloc(nbytes)? };
+        unsafe { driver::memcpy_htod_async(ptr, transposed.as_ptr(), nbytes, stream)? };
+        unsafe { GpuTensor::new(ptr, &[k_packed, n], qw_dtype) }
+    } else {
+        weights.take(&qw_name)?
+    };
 
     // Repack GPTQ → Marlin tiled layout on GPU.
     // When has_act_order, pass sort_indices as perm so the repack kernel
@@ -1529,9 +1557,22 @@ fn load_gptq_marlin_linear(
     }
     let qweight_marlin = unsafe { GpuTensor::new(repack_ptr, &[num_u32], DType::U32) };
 
-    // Load and permute scales (CPU)
-    let (scales_bytes, _scales_shape, scales_dtype) = weights.take_cpu(&scales_name)?;
+    // Load and permute scales (CPU).
+    // For compressed-tensors, transpose from [N, num_groups] to [num_groups, N] first.
+    let scales_bytes = if is_compressed_tensors {
+        let ct_scales_name = format!("{prefix}.weight_scale");
+        let (sc_bytes, sc_shape, sc_dtype) = weights.take_cpu(&ct_scales_name)?;
+        let sc_n = sc_shape[0];
+        let sc_groups = sc_shape[1];
+        let transposed = transpose_2d_cpu(&sc_bytes, sc_n, sc_groups, sc_dtype.size_bytes());
+        (transposed, vec![sc_groups, sc_n], sc_dtype)
+    } else {
+        let scales_name = format!("{prefix}.scales");
+        weights.take_cpu(&scales_name)?
+    };
+    let scales_dtype = scales_bytes.2;
     let mut scales_u16: Vec<u16> = scales_bytes
+        .0
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
@@ -1661,18 +1702,46 @@ fn load_fused_gptq_marlin(
     let mut qw_parts: Vec<(Vec<u8>, Vec<usize>, DType)> = Vec::new();
     let mut sc_parts: Vec<(Vec<u8>, Vec<usize>, DType)> = Vec::new();
     let mut g_idx_i32: Option<Vec<i32>> = None;
+    let mut bias_parts: Vec<Vec<u8>> = Vec::new();
+    let mut bias_dtype: Option<DType> = None;
 
     for (i, prefix) in prefixes.iter().enumerate() {
         let qw_name = format!("{prefix}.qweight");
-        let scales_name = format!("{prefix}.scales");
-        let qzeros_name = format!("{prefix}.qzeros");
+        let ct_qw_name = format!("{prefix}.weight_packed");
+        let is_ct = !weights.contains(&qw_name) && weights.contains(&ct_qw_name);
 
-        qw_parts.push(weights.take_cpu(&qw_name)?);
-        sc_parts.push(weights.take_cpu(&scales_name)?);
+        if is_ct {
+            // compressed-tensors: weight_packed [N, K/8] → transpose to [K/8, N]
+            let (qw_bytes, qw_shape, qw_dtype) = weights.take_cpu(&ct_qw_name)?;
+            let n = qw_shape[0];
+            let k_packed = qw_shape[1];
+            let transposed = transpose_2d_cpu(&qw_bytes, n, k_packed, qw_dtype.size_bytes());
+            qw_parts.push((transposed, vec![k_packed, n], qw_dtype));
 
-        // GPTQ uses uint4b8 scalar type — never pass zero-points. Consume and discard.
-        if weights.contains(&qzeros_name) {
-            let _ = weights.take_cpu(&qzeros_name);
+            // weight_scale [N, num_groups] → transpose to [num_groups, N]
+            let ct_sc_name = format!("{prefix}.weight_scale");
+            let (sc_bytes, sc_shape, sc_dtype) = weights.take_cpu(&ct_sc_name)?;
+            let sc_n = sc_shape[0];
+            let sc_groups = sc_shape[1];
+            let sc_transposed = transpose_2d_cpu(&sc_bytes, sc_n, sc_groups, sc_dtype.size_bytes());
+            sc_parts.push((sc_transposed, vec![sc_groups, sc_n], sc_dtype));
+
+            // Consume weight_shape if present
+            let shape_name = format!("{prefix}.weight_shape");
+            if weights.contains(&shape_name) {
+                let _ = weights.take_cpu(&shape_name);
+            }
+        } else {
+            let scales_name = format!("{prefix}.scales");
+            let qzeros_name = format!("{prefix}.qzeros");
+
+            qw_parts.push(weights.take_cpu(&qw_name)?);
+            sc_parts.push(weights.take_cpu(&scales_name)?);
+
+            // GPTQ uses uint4b8 scalar type — never pass zero-points. Consume and discard.
+            if weights.contains(&qzeros_name) {
+                let _ = weights.take_cpu(&qzeros_name);
+            }
         }
 
         // For desc_act: all sub-layers share the same K dimension → same g_idx.
@@ -1690,6 +1759,14 @@ fn load_fused_gptq_marlin(
             } else {
                 let _ = weights.take_cpu(&g_idx_name);
             }
+        }
+
+        // Collect bias if present (e.g. Qwen3 MoE attention has QKV bias).
+        let bias_name = format!("{prefix}.bias");
+        if weights.contains(&bias_name) {
+            let (b_data, _b_shape, b_dtype) = weights.take_cpu(&bias_name)?;
+            bias_parts.push(b_data);
+            bias_dtype = Some(b_dtype);
         }
     }
 
@@ -1808,7 +1885,7 @@ fn load_fused_gptq_marlin(
         has_act_order,
         b_type_id: 0, // GPTQ = uint4b8
         device_id,
-        bias: None, // Fused layers don't have bias in GPTQ models
+        bias: fuse_bias_parts(&bias_parts, bias_dtype, weights, stream)?,
     })
 }
 
@@ -1829,6 +1906,8 @@ fn load_fused_awq_marlin(
     let mut qw_parts: Vec<(Vec<u8>, Vec<usize>, DType)> = Vec::new();
     let mut sc_parts: Vec<(Vec<u8>, Vec<usize>, DType)> = Vec::new();
     let mut qz_parts: Vec<(Vec<u8>, Vec<usize>, DType)> = Vec::new();
+    let mut bias_parts: Vec<Vec<u8>> = Vec::new();
+    let mut bias_dtype: Option<DType> = None;
 
     // Track per-part N sizes for zero-point handling.
     let mut part_n_sizes: Vec<usize> = Vec::new();
@@ -1844,6 +1923,14 @@ fn load_fused_awq_marlin(
         qw_parts.push((qw_data, qw_shape, qw_dt));
         sc_parts.push(weights.take_cpu(&scales_name)?);
         qz_parts.push(weights.take_cpu(&qzeros_name)?);
+
+        // Collect bias if present.
+        let bias_name = format!("{prefix}.bias");
+        if weights.contains(&bias_name) {
+            let (b_data, _b_shape, b_dtype) = weights.take_cpu(&bias_name)?;
+            bias_parts.push(b_data);
+            bias_dtype = Some(b_dtype);
+        }
     }
 
     // Concat qweights along dim1: [K, N1/8] + [K, N2/8] + ... → [K, N_total/8]
@@ -1959,8 +2046,32 @@ fn load_fused_awq_marlin(
         has_act_order: false,
         b_type_id: 1, // AWQ = uint4
         device_id,
-        bias: None,
+        bias: fuse_bias_parts(&bias_parts, bias_dtype, weights, stream)?,
     })
+}
+
+/// Concatenate bias parts and upload to GPU. Returns `None` if no bias parts.
+fn fuse_bias_parts(
+    bias_parts: &[Vec<u8>],
+    bias_dtype: Option<DType>,
+    weights: &mut GpuWeights,
+    stream: CUstream,
+) -> Result<Option<GpuTensor>> {
+    if bias_parts.is_empty() {
+        return Ok(None);
+    }
+    let dtype = bias_dtype.unwrap();
+    // Simple byte concatenation — biases are 1D vectors, concat = append.
+    let total_bytes: usize = bias_parts.iter().map(|b| b.len()).sum();
+    let mut fused = Vec::with_capacity(total_bytes);
+    for part in bias_parts {
+        fused.extend_from_slice(part);
+    }
+    let num_elements = total_bytes / dtype.size_bytes();
+    let ptr = unsafe { driver::mem_alloc(total_bytes)? };
+    weights.record_alloc(ptr, total_bytes);
+    unsafe { driver::memcpy_htod_async(ptr, fused.as_ptr(), total_bytes, stream)? };
+    Ok(Some(unsafe { GpuTensor::new(ptr, &[num_elements], dtype) }))
 }
 
 /// Allocate the shared Marlin workspace buffer `[num_sms]` i32.
@@ -2693,6 +2804,622 @@ pub fn load_fused_fp8_linear(
         bias,
         output_dtype,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Marlin MoE Expert Weight Loading (AWQ/GPTQ INT4)
+// ---------------------------------------------------------------------------
+
+use crate::layers::Linear;
+use crate::layers_moe::MarlinFusedMoELayer;
+
+/// Load MoE expert weights in AWQ/GPTQ INT4 format and repack to Marlin.
+///
+/// For each expert, loads gate+up (concat along N) → repack → w1[e],
+/// and down → repack → w2[e]. Scales and zero points are similarly
+/// processed per-expert and stacked.
+///
+/// Returns a `MarlinFusedMoELayer` with all expert weights in
+/// `[num_experts, ...]` stacked Marlin-packed format.
+#[allow(clippy::too_many_arguments)]
+pub fn load_marlin_moe_layer(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    num_experts: usize,
+    intermediate_size: usize,
+    hidden_size: usize,
+    top_k: usize,
+    renormalize: bool,
+    qconfig: &crate::quant::QuantConfig,
+    device_id: i32,
+) -> Result<MarlinFusedMoELayer> {
+    let stream = weights.stream();
+
+    let (group_size, has_zp, b_type_id) = match qconfig {
+        crate::quant::QuantConfig::Awq(cfg) => (cfg.group_size, true, 1i32),
+        crate::quant::QuantConfig::Gptq(cfg) => (cfg.group_size, false, 0i32),
+        _ => bail!(
+            "load_marlin_moe_layer: unsupported quant config {:?}",
+            qconfig
+        ),
+    };
+
+    let num_groups_w1 = if group_size > 0 {
+        hidden_size / group_size
+    } else {
+        1
+    };
+    let num_groups_w2 = if group_size > 0 {
+        intermediate_size / group_size
+    } else {
+        1
+    };
+
+    // Marlin tile size: each u32 contains 8 INT4 values (4 bits each).
+    // Marlin-packed shape for [K, N]: [K*N/8] u32.
+    // We store [E, K*N/8] for the stacked experts.
+    let w1_n = 2 * intermediate_size; // gate+up fused
+    let w1_packed_per_expert = hidden_size * w1_n / 8; // u32 count
+    let w2_packed_per_expert = intermediate_size * hidden_size / 8;
+
+    // Allocate stacked expert weight buffers (persistent alloc).
+    let w1_total_bytes = num_experts * w1_packed_per_expert * 4;
+    let w2_total_bytes = num_experts * w2_packed_per_expert * 4;
+    let w1_ptr = unsafe { driver::mem_alloc(w1_total_bytes)? };
+    let w2_ptr = unsafe { driver::mem_alloc(w2_total_bytes)? };
+    weights.record_alloc(w1_ptr, w1_total_bytes);
+    weights.record_alloc(w2_ptr, w2_total_bytes);
+
+    // Determine scale dtype from first expert's scales.
+    // Try standard GPTQ/AWQ naming first, then compressed-tensors naming.
+    let first_scales_name = format!("{prefix}.experts.0.gate_proj.scales");
+    let first_ct_scales_name = format!("{prefix}.experts.0.gate_proj.weight_scale");
+    let scales_dtype = weights
+        .tensor_info(&first_scales_name)
+        .or_else(|| weights.tensor_info(&first_ct_scales_name))
+        .map(|(_, dt)| dt)
+        .unwrap_or(DType::BF16);
+    let scale_elem = scales_dtype.size_bytes();
+
+    // Allocate stacked scales.
+    let w1_scales_bytes = num_experts * num_groups_w1 * w1_n * scale_elem;
+    let w2_scales_bytes = num_experts * num_groups_w2 * hidden_size * scale_elem;
+    let w1_scales_ptr = unsafe { driver::mem_alloc(w1_scales_bytes)? };
+    let w2_scales_ptr = unsafe { driver::mem_alloc(w2_scales_bytes)? };
+    weights.record_alloc(w1_scales_ptr, w1_scales_bytes);
+    weights.record_alloc(w2_scales_ptr, w2_scales_bytes);
+
+    // Allocate stacked zero points (AWQ only).
+    let (w1_zeros_ptr, w2_zeros_ptr) = if has_zp {
+        let w1_zp_bytes = num_experts * num_groups_w1 * (w1_n / 8) * 4; // u32
+        let w2_zp_bytes = num_experts * num_groups_w2 * (hidden_size / 8) * 4;
+        let p1 = unsafe { driver::mem_alloc(w1_zp_bytes)? };
+        let p2 = unsafe { driver::mem_alloc(w2_zp_bytes)? };
+        weights.record_alloc(p1, w1_zp_bytes);
+        weights.record_alloc(p2, w2_zp_bytes);
+        (Some(p1), Some(p2))
+    } else {
+        (None, None)
+    };
+
+    let is_gptq = b_type_id == 0;
+
+    for e in 0..num_experts {
+        let gate_prefix = format!("{prefix}.experts.{e}.gate_proj");
+        let up_prefix = format!("{prefix}.experts.{e}.up_proj");
+        let down_prefix = format!("{prefix}.experts.{e}.down_proj");
+
+        if is_gptq {
+            // GPTQ / compressed-tensors path: qweight [K/8, N], gptq_repack_into
+            let (gate_qw, gate_sc) = load_expert_gptq_cpu(weights, &gate_prefix)?;
+            let (up_qw, up_sc) = load_expert_gptq_cpu(weights, &up_prefix)?;
+
+            // GPTQ qweight is [K/8, N] — concat along dim1 gives [K/8, N1+N2]
+            let k_packed = gate_qw.1[0]; // K/8
+            let fused_k = k_packed * 8;
+            let fused_n = intermediate_size * 2;
+
+            let fused_qw = {
+                let gate_n = gate_qw.1[1];
+                let up_n = up_qw.1[1];
+                let elem = 4usize; // i32
+                let row_gate = gate_n * elem;
+                let row_up = up_n * elem;
+                let row_out = (gate_n + up_n) * elem;
+                let mut out = vec![0u8; k_packed * row_out];
+                for r in 0..k_packed {
+                    out[r * row_out..r * row_out + row_gate]
+                        .copy_from_slice(&gate_qw.0[r * row_gate..(r + 1) * row_gate]);
+                    out[r * row_out + row_gate..r * row_out + row_out]
+                        .copy_from_slice(&up_qw.0[r * row_up..(r + 1) * row_up]);
+                }
+                out
+            };
+
+            // Upload fused qweight to GPU for repack.
+            let qw_nbytes = fused_qw.len();
+            let qw_gpu_ptr = unsafe { driver::mem_alloc(qw_nbytes)? };
+            unsafe {
+                driver::memcpy_htod_async(qw_gpu_ptr, fused_qw.as_ptr(), qw_nbytes, stream)?;
+            }
+            let qw_gpu = unsafe { GpuTensor::new(qw_gpu_ptr, &[k_packed, fused_n], DType::I32) };
+
+            // Repack GPTQ → Marlin into the stacked buffer at expert offset.
+            let expert_w1_offset = e * w1_packed_per_expert * 4;
+            unsafe {
+                crate::kernels::gptq_repack_into(
+                    qw_gpu,
+                    None, // no sort_indices for MoE experts
+                    w1_ptr.add(expert_w1_offset),
+                    fused_k,
+                    fused_n,
+                    device_id,
+                    stream,
+                );
+                driver::stream_synchronize(stream)?;
+                driver::mem_free(qw_gpu_ptr)?;
+            }
+
+            // Fuse and permute scales: [num_groups, N1] + [num_groups, N2] → [num_groups, N_total]
+            let fused_sc =
+                concat_u16_dim1(&gate_sc.0, &up_sc.0, gate_sc.1[0], gate_sc.1[1], up_sc.1[1]);
+            let mut scales_u16 = fused_sc;
+            crate::quant::marlin_permute_scales(&mut scales_u16, fused_k, fused_n, group_size);
+
+            let expert_scales_offset = e * num_groups_w1 * fused_n * scale_elem;
+            let scales_bytes: Vec<u8> = scales_u16.iter().flat_map(|&v| v.to_le_bytes()).collect();
+            unsafe {
+                driver::memcpy_htod_async(
+                    w1_scales_ptr.add(expert_scales_offset),
+                    scales_bytes.as_ptr(),
+                    scales_bytes.len(),
+                    stream,
+                )?;
+            }
+
+            // --- w2: down proj ---
+            let (down_qw, down_sc) = load_expert_gptq_cpu(weights, &down_prefix)?;
+            let down_k_packed = down_qw.1[0]; // K/8
+            let down_k = down_k_packed * 8;
+            let down_n = down_qw.1[1];
+
+            let down_qw_nbytes = down_qw.0.len();
+            let down_qw_gpu_ptr = unsafe { driver::mem_alloc(down_qw_nbytes)? };
+            unsafe {
+                driver::memcpy_htod_async(
+                    down_qw_gpu_ptr,
+                    down_qw.0.as_ptr(),
+                    down_qw_nbytes,
+                    stream,
+                )?;
+            }
+            let down_qw_gpu =
+                unsafe { GpuTensor::new(down_qw_gpu_ptr, &[down_k_packed, down_n], DType::I32) };
+
+            let expert_w2_offset = e * w2_packed_per_expert * 4;
+            unsafe {
+                crate::kernels::gptq_repack_into(
+                    down_qw_gpu,
+                    None,
+                    w2_ptr.add(expert_w2_offset),
+                    down_k,
+                    down_n,
+                    device_id,
+                    stream,
+                );
+                driver::stream_synchronize(stream)?;
+                driver::mem_free(down_qw_gpu_ptr)?;
+            }
+
+            let mut down_scales_u16 = bytes_to_u16(&down_sc.0);
+            crate::quant::marlin_permute_scales(&mut down_scales_u16, down_k, down_n, group_size);
+            let expert_w2_scales_offset = e * num_groups_w2 * hidden_size * scale_elem;
+            let down_scales_bytes: Vec<u8> = down_scales_u16
+                .iter()
+                .flat_map(|&v| v.to_le_bytes())
+                .collect();
+            unsafe {
+                driver::memcpy_htod_async(
+                    w2_scales_ptr.add(expert_w2_scales_offset),
+                    down_scales_bytes.as_ptr(),
+                    down_scales_bytes.len(),
+                    stream,
+                )?;
+            }
+        } else {
+            // AWQ path: qweight [K, N/8], awq_repack_into
+            // --- w1: gate + up fused ---
+            let (gate_qw, gate_sc, gate_zp) = load_expert_awq_cpu(weights, &gate_prefix)?;
+            let (up_qw, up_sc, up_zp) = load_expert_awq_cpu(weights, &up_prefix)?;
+
+            // AWQ qweight is [K, N/8] — concat along dim1 gives [K, (N1+N2)/8]
+            let fused_qw =
+                concat_bytes_dim1(&gate_qw.0, &up_qw.0, gate_qw.1[0], gate_qw.1[1], up_qw.1[1]);
+
+            // Upload fused qweight to GPU for repack.
+            let fused_k = gate_qw.1[0]; // K
+            let fused_n = intermediate_size * 2; // gate_N + up_N
+            let qw_nbytes = fused_qw.len();
+            let qw_gpu_ptr = unsafe { driver::mem_alloc(qw_nbytes)? };
+            unsafe {
+                driver::memcpy_htod_async(qw_gpu_ptr, fused_qw.as_ptr(), qw_nbytes, stream)?;
+            }
+            let qw_gpu = unsafe { GpuTensor::new(qw_gpu_ptr, &[fused_k, fused_n / 8], DType::U32) };
+
+            // Repack AWQ → Marlin into the stacked buffer at expert offset.
+            let expert_w1_offset = e * w1_packed_per_expert * 4;
+            unsafe {
+                crate::kernels::awq_repack_into(
+                    qw_gpu,
+                    w1_ptr.add(expert_w1_offset),
+                    fused_k,
+                    fused_n,
+                    device_id,
+                    stream,
+                );
+                driver::stream_synchronize(stream)?;
+                driver::mem_free(qw_gpu_ptr)?;
+            }
+
+            // Fuse and permute scales.
+            let fused_sc =
+                concat_u16_dim1(&gate_sc.0, &up_sc.0, gate_sc.1[0], gate_sc.1[1], up_sc.1[1]);
+            let mut scales_u16 = fused_sc;
+            crate::quant::marlin_permute_scales(&mut scales_u16, fused_k, fused_n, group_size);
+
+            let expert_scales_offset = e * num_groups_w1 * fused_n * scale_elem;
+            let scales_bytes: Vec<u8> = scales_u16.iter().flat_map(|&v| v.to_le_bytes()).collect();
+            unsafe {
+                driver::memcpy_htod_async(
+                    w1_scales_ptr.add(expert_scales_offset),
+                    scales_bytes.as_ptr(),
+                    scales_bytes.len(),
+                    stream,
+                )?;
+            }
+
+            // Zero points (AWQ only).
+            if has_zp && let (Some(gate_zp), Some(up_zp)) = (gate_zp, up_zp) {
+                let fused_zp_u32 =
+                    concat_u32_dim1(&gate_zp.0, &up_zp.0, gate_zp.1[0], gate_zp.1[1], up_zp.1[1]);
+                let marlin_zp =
+                    crate::quant::awq_to_marlin_zero_points(&fused_zp_u32, num_groups_w1, fused_n);
+                let zp_bytes: Vec<u8> = marlin_zp.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                let expert_zp_offset = e * num_groups_w1 * (fused_n / 8) * 4;
+                unsafe {
+                    driver::memcpy_htod_async(
+                        w1_zeros_ptr.unwrap().add(expert_zp_offset),
+                        zp_bytes.as_ptr(),
+                        zp_bytes.len(),
+                        stream,
+                    )?;
+                }
+            }
+
+            // --- w2: down proj ---
+            let (down_qw, down_sc, down_zp) = load_expert_awq_cpu(weights, &down_prefix)?;
+            let down_k = down_qw.1[0];
+            let down_n = down_qw.1[1] * 8;
+
+            // Upload and repack.
+            let down_qw_nbytes = down_qw.0.len();
+            let down_qw_gpu_ptr = unsafe { driver::mem_alloc(down_qw_nbytes)? };
+            unsafe {
+                driver::memcpy_htod_async(
+                    down_qw_gpu_ptr,
+                    down_qw.0.as_ptr(),
+                    down_qw_nbytes,
+                    stream,
+                )?;
+            }
+            let down_qw_gpu =
+                unsafe { GpuTensor::new(down_qw_gpu_ptr, &[down_k, down_n / 8], DType::U32) };
+
+            let expert_w2_offset = e * w2_packed_per_expert * 4;
+            unsafe {
+                crate::kernels::awq_repack_into(
+                    down_qw_gpu,
+                    w2_ptr.add(expert_w2_offset),
+                    down_k,
+                    down_n,
+                    device_id,
+                    stream,
+                );
+                driver::stream_synchronize(stream)?;
+                driver::mem_free(down_qw_gpu_ptr)?;
+            }
+
+            // Down scales.
+            let mut down_scales_u16 = bytes_to_u16(&down_sc.0);
+            crate::quant::marlin_permute_scales(&mut down_scales_u16, down_k, down_n, group_size);
+            let expert_w2_scales_offset = e * num_groups_w2 * hidden_size * scale_elem;
+            let down_scales_bytes: Vec<u8> = down_scales_u16
+                .iter()
+                .flat_map(|&v| v.to_le_bytes())
+                .collect();
+            unsafe {
+                driver::memcpy_htod_async(
+                    w2_scales_ptr.add(expert_w2_scales_offset),
+                    down_scales_bytes.as_ptr(),
+                    down_scales_bytes.len(),
+                    stream,
+                )?;
+            }
+
+            // Down zero points.
+            if has_zp && let Some(down_zp) = down_zp {
+                let down_zp_u32 = bytes_to_u32(&down_zp.0);
+                let marlin_zp =
+                    crate::quant::awq_to_marlin_zero_points(&down_zp_u32, num_groups_w2, down_n);
+                let zp_bytes: Vec<u8> = marlin_zp.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                let expert_w2_zp_offset = e * num_groups_w2 * (hidden_size / 8) * 4;
+                unsafe {
+                    driver::memcpy_htod_async(
+                        w2_zeros_ptr.unwrap().add(expert_w2_zp_offset),
+                        zp_bytes.as_ptr(),
+                        zp_bytes.len(),
+                        stream,
+                    )?;
+                }
+            }
+        }
+    }
+
+    unsafe { driver::stream_synchronize(stream)? };
+
+    // Build stacked tensors.
+    let w1_gpu =
+        unsafe { GpuTensor::new(w1_ptr, &[num_experts, w1_packed_per_expert], DType::U32) };
+    let w2_gpu =
+        unsafe { GpuTensor::new(w2_ptr, &[num_experts, w2_packed_per_expert], DType::U32) };
+    let w1_scales_gpu = unsafe {
+        GpuTensor::new(
+            w1_scales_ptr,
+            &[num_experts, num_groups_w1, w1_n],
+            scales_dtype,
+        )
+    };
+    let w2_scales_gpu = unsafe {
+        GpuTensor::new(
+            w2_scales_ptr,
+            &[num_experts, num_groups_w2, hidden_size],
+            scales_dtype,
+        )
+    };
+
+    let w1_zeros_gpu = w1_zeros_ptr
+        .map(|p| unsafe { GpuTensor::new(p, &[num_experts, num_groups_w1, w1_n / 8], DType::U32) });
+    let w2_zeros_gpu = w2_zeros_ptr.map(|p| unsafe {
+        GpuTensor::new(
+            p,
+            &[num_experts, num_groups_w2, hidden_size / 8],
+            DType::U32,
+        )
+    });
+
+    // Allocate workspace (barrier locks for Marlin kernel).
+    // Python uses sms * 4. We use a fixed upper bound; the kernel clamps internally.
+    let workspace_bytes = 256 * 4 * std::mem::size_of::<i32>(); // 256 SMs * 4
+    let workspace_ptr = unsafe { driver::mem_alloc(workspace_bytes)? };
+    weights.record_alloc(workspace_ptr, workspace_bytes);
+    let workspace_gpu =
+        unsafe { GpuTensor::new(workspace_ptr, &[workspace_bytes / 4], DType::I32) };
+
+    // Load router gate (always dense).
+    let gate = Linear::load(weights, &format!("{prefix}.gate"))?;
+
+    Ok(MarlinFusedMoELayer {
+        gate,
+        w1: w1_gpu,
+        w2: w2_gpu,
+        w1_scales: w1_scales_gpu,
+        w2_scales: w2_scales_gpu,
+        w1_zeros: w1_zeros_gpu,
+        w2_zeros: w2_zeros_gpu,
+        workspace: workspace_gpu,
+        num_experts,
+        top_k,
+        intermediate_size,
+        hidden_size,
+        group_size,
+        has_zp,
+        b_type_id,
+        renormalize,
+        #[cfg(feature = "nccl")]
+        tp_group: None,
+    })
+}
+
+/// Load AWQ expert tensors to CPU: (qweight, scales, qzeros).
+/// Each returns (bytes, shape, dtype).
+#[allow(clippy::type_complexity)]
+pub fn load_expert_awq_cpu(
+    weights: &mut GpuWeights,
+    prefix: &str,
+) -> Result<(
+    (Vec<u8>, Vec<usize>, DType),
+    (Vec<u8>, Vec<usize>, DType),
+    Option<(Vec<u8>, Vec<usize>, DType)>,
+)> {
+    let qw_name = format!("{prefix}.qweight");
+    let scales_name = format!("{prefix}.scales");
+    let qzeros_name = format!("{prefix}.qzeros");
+
+    let qw = weights.take_cpu(&qw_name)?;
+    let sc = weights.take_cpu(&scales_name)?;
+    let zp = if weights.contains(&qzeros_name) {
+        Some(weights.take_cpu(&qzeros_name)?)
+    } else {
+        None
+    };
+
+    Ok((qw, sc, zp))
+}
+
+/// Concat two row-major 2D byte arrays along dim1.
+/// a: [rows, cols_a * elem_size], b: [rows, cols_b * elem_size]
+/// → [rows, (cols_a + cols_b) * elem_size]
+pub fn concat_bytes_dim1(a: &[u8], b: &[u8], rows: usize, cols_a: usize, cols_b: usize) -> Vec<u8> {
+    let elem = 4usize; // u32 for qweight
+    let row_a = cols_a * elem;
+    let row_b = cols_b * elem;
+    let row_out = (cols_a + cols_b) * elem;
+    let mut out = vec![0u8; rows * row_out];
+    for r in 0..rows {
+        out[r * row_out..r * row_out + row_a].copy_from_slice(&a[r * row_a..(r + 1) * row_a]);
+        out[r * row_out + row_a..r * row_out + row_out]
+            .copy_from_slice(&b[r * row_b..(r + 1) * row_b]);
+    }
+    out
+}
+
+/// Concat two 2D u16 arrays (stored as bytes) along dim1.
+pub fn concat_u16_dim1(
+    a_bytes: &[u8],
+    b_bytes: &[u8],
+    rows: usize,
+    cols_a: usize,
+    cols_b: usize,
+) -> Vec<u16> {
+    let a: Vec<u16> = a_bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let b: Vec<u16> = b_bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let mut out = vec![0u16; rows * (cols_a + cols_b)];
+    for r in 0..rows {
+        out[r * (cols_a + cols_b)..r * (cols_a + cols_b) + cols_a]
+            .copy_from_slice(&a[r * cols_a..(r + 1) * cols_a]);
+        out[r * (cols_a + cols_b) + cols_a..(r + 1) * (cols_a + cols_b)]
+            .copy_from_slice(&b[r * cols_b..(r + 1) * cols_b]);
+    }
+    out
+}
+
+/// Concat two 2D u32 arrays (stored as bytes) along dim1.
+pub fn concat_u32_dim1(
+    a_bytes: &[u8],
+    b_bytes: &[u8],
+    rows: usize,
+    cols_a: usize,
+    cols_b: usize,
+) -> Vec<u32> {
+    let a: Vec<u32> = a_bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let b: Vec<u32> = b_bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let mut out = vec![0u32; rows * (cols_a + cols_b)];
+    for r in 0..rows {
+        out[r * (cols_a + cols_b)..r * (cols_a + cols_b) + cols_a]
+            .copy_from_slice(&a[r * cols_a..(r + 1) * cols_a]);
+        out[r * (cols_a + cols_b) + cols_a..(r + 1) * (cols_a + cols_b)]
+            .copy_from_slice(&b[r * cols_b..(r + 1) * cols_b]);
+    }
+    out
+}
+
+pub fn bytes_to_u16(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
+pub fn bytes_to_u32(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Transpose a 2D byte array from `[rows, cols]` to `[cols, rows]`.
+/// `elem_size` is the size of each element in bytes (e.g. 4 for i32/u32, 2 for bf16/f16).
+fn transpose_2d_cpu(data: &[u8], rows: usize, cols: usize, elem_size: usize) -> Vec<u8> {
+    let row_bytes = cols * elem_size;
+    assert_eq!(
+        data.len(),
+        rows * row_bytes,
+        "transpose: data size mismatch"
+    );
+    let mut out = vec![0u8; cols * rows * elem_size];
+    for r in 0..rows {
+        for c in 0..cols {
+            let src_off = r * row_bytes + c * elem_size;
+            let dst_off = c * rows * elem_size + r * elem_size;
+            out[dst_off..dst_off + elem_size].copy_from_slice(&data[src_off..src_off + elem_size]);
+        }
+    }
+    out
+}
+
+/// Load quantized expert tensors to CPU with compressed-tensors name fallback.
+///
+/// Tries standard GPTQ names (`{prefix}.qweight`, `{prefix}.scales`) first,
+/// then falls back to compressed-tensors names (`{prefix}.weight_packed`,
+/// `{prefix}.weight_scale`). For compressed-tensors, transposes from
+/// `[N, K/8]` to `[K/8, N]` for qweight and `[N, num_groups]` to
+/// `[num_groups, N]` for scales (matching GPTQ layout).
+///
+/// Returns (qweight, scales) — no zero points for GPTQ/compressed-tensors (symmetric).
+#[allow(clippy::type_complexity)]
+pub fn load_expert_gptq_cpu(
+    weights: &mut GpuWeights,
+    prefix: &str,
+) -> Result<((Vec<u8>, Vec<usize>, DType), (Vec<u8>, Vec<usize>, DType))> {
+    let qw_name = format!("{prefix}.qweight");
+    let ct_qw_name = format!("{prefix}.weight_packed");
+
+    if weights.contains(&qw_name) {
+        // Standard GPTQ naming: qweight [K/8, N], scales [num_groups, N]
+        let qw = weights.take_cpu(&qw_name)?;
+        let scales_name = format!("{prefix}.scales");
+        let sc = weights.take_cpu(&scales_name)?;
+        // Consume qzeros if present (GPTQ symmetric discards them)
+        let qzeros_name = format!("{prefix}.qzeros");
+        if weights.contains(&qzeros_name) {
+            let _ = weights.take_cpu(&qzeros_name);
+        }
+        // Consume g_idx if present
+        let g_idx_name = format!("{prefix}.g_idx");
+        if weights.contains(&g_idx_name) {
+            let _ = weights.take_cpu(&g_idx_name);
+        }
+        Ok((qw, sc))
+    } else if weights.contains(&ct_qw_name) {
+        // compressed-tensors naming: weight_packed [N, K/8], weight_scale [N, num_groups]
+        let (qw_bytes, qw_shape, qw_dtype) = weights.take_cpu(&ct_qw_name)?;
+        let scales_name = format!("{prefix}.weight_scale");
+        let (sc_bytes, sc_shape, sc_dtype) = weights.take_cpu(&scales_name)?;
+        // Consume weight_shape if present
+        let shape_name = format!("{prefix}.weight_shape");
+        if weights.contains(&shape_name) {
+            let _ = weights.take_cpu(&shape_name);
+        }
+
+        // Transpose qweight from [N, K/8] to [K/8, N]
+        let n = qw_shape[0];
+        let k_packed = qw_shape[1]; // K/8
+        let qw_transposed = transpose_2d_cpu(&qw_bytes, n, k_packed, qw_dtype.size_bytes());
+
+        // Transpose scales from [N, num_groups] to [num_groups, N]
+        let sc_n = sc_shape[0];
+        let num_groups = sc_shape[1];
+        let sc_transposed = transpose_2d_cpu(&sc_bytes, sc_n, num_groups, sc_dtype.size_bytes());
+
+        Ok((
+            (qw_transposed, vec![k_packed, n], qw_dtype),
+            (sc_transposed, vec![num_groups, sc_n], sc_dtype),
+        ))
+    } else {
+        bail!("weight not found: neither {qw_name} nor {ct_qw_name} exists");
+    }
 }
 
 // ---------------------------------------------------------------------------

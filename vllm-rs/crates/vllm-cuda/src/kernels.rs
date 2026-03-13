@@ -6369,6 +6369,225 @@ pub unsafe fn gptq_repack(
 }
 
 // ---------------------------------------------------------------------------
+// Marlin MoE INT4 GEMM (AWQ/GPTQ MoE → Marlin format)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn marlin_moe_gemm_bf16(
+        a: *const c_void,
+        c: *mut c_void,
+        c_tmp: *mut c_void,
+        b_q_weight: *const c_void,
+        b_scales: *const c_void,
+        b_zeros: *const c_void,
+        g_idx: *const c_void,
+        perm: *const c_void,
+        a_tmp: *mut c_void,
+        workspace: *mut c_void,
+        sorted_token_ids: *const c_void,
+        expert_ids: *const c_void,
+        num_tokens_past_padded: *const c_void,
+        topk_weights: *const c_void,
+        moe_block_size: c_int,
+        num_experts: c_int,
+        top_k: c_int,
+        mul_topk_weights: bool,
+        size_m: c_int,
+        size_n: c_int,
+        size_k: c_int,
+        num_groups: c_int,
+        group_size: c_int,
+        has_act_order: bool,
+        is_k_full: bool,
+        has_zp: bool,
+        is_zp_float: bool,
+        use_fp32_reduce: bool,
+        b_type_id: c_int,
+        stream: CUstream,
+        device_id: c_int,
+    );
+
+    fn marlin_moe_gemm_f16(
+        a: *const c_void,
+        c: *mut c_void,
+        c_tmp: *mut c_void,
+        b_q_weight: *const c_void,
+        b_scales: *const c_void,
+        b_zeros: *const c_void,
+        g_idx: *const c_void,
+        perm: *const c_void,
+        a_tmp: *mut c_void,
+        workspace: *mut c_void,
+        sorted_token_ids: *const c_void,
+        expert_ids: *const c_void,
+        num_tokens_past_padded: *const c_void,
+        topk_weights: *const c_void,
+        moe_block_size: c_int,
+        num_experts: c_int,
+        top_k: c_int,
+        mul_topk_weights: bool,
+        size_m: c_int,
+        size_n: c_int,
+        size_k: c_int,
+        num_groups: c_int,
+        group_size: c_int,
+        has_act_order: bool,
+        is_k_full: bool,
+        has_zp: bool,
+        is_zp_float: bool,
+        use_fp32_reduce: bool,
+        b_type_id: c_int,
+        stream: CUstream,
+        device_id: c_int,
+    );
+}
+
+/// Marlin MoE fused INT4 GEMM — routes tokens to experts via sorted IDs.
+///
+/// * `a`:            `[M, K]` activation tensor (BF16 or F16)
+/// * `b_q_weight`:   `[E, K/tile, N*tile]` Marlin-packed expert weights
+/// * `b_scales`:     `[E, num_groups, N]` scales
+/// * `b_zeros`:      `[E, num_groups, N/8]` zero points (AWQ) or None
+/// * `workspace`:    barrier locks, at least `[sms * 4]` i32
+/// * `sorted_token_ids`, `expert_ids`, `num_tokens_past_padded`: from `moe_align_block_size`
+/// * `topk_weights`: `[M, top_k]` f32
+/// * Returns: `[M * top_k, N]` output tensor
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn marlin_moe_gemm(
+    a: GpuTensor,
+    b_q_weight: GpuTensor,
+    b_scales: GpuTensor,
+    b_zeros: Option<GpuTensor>,
+    g_idx: Option<GpuTensor>,
+    perm: Option<GpuTensor>,
+    workspace: GpuTensor,
+    sorted_token_ids: GpuTensor,
+    expert_ids: GpuTensor,
+    num_tokens_past_padded: GpuTensor,
+    topk_weights: GpuTensor,
+    moe_block_size: usize,
+    num_experts: usize,
+    top_k: usize,
+    mul_topk_weights: bool,
+    size_m: usize,
+    size_n: usize,
+    size_k: usize,
+    num_groups: usize,
+    group_size: usize,
+    has_act_order: bool,
+    has_zp: bool,
+    b_type_id: i32,
+    device_id: i32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let out = alloc.alloc_tensor(&[size_m * top_k, size_n], a.dtype());
+
+    // FP32 reduction buffer for global_reduce_fp32 — sized to match Python vLLM's
+    // ops.cu: min(size_n * sorted_token_ids.size(0), sms * 4 * moe_block_size * max_thread_n)
+    // Each threadblock slice needs its own c_tmp region indexed by locks_off.
+    let sorted_token_count = sorted_token_ids.dim(0);
+    let sms = unsafe { crate::driver::device_get_num_sm(device_id) }.unwrap_or(128) as usize;
+    const MAX_THREAD_N: usize = 256; // from marlin.cuh
+    let max_c_tmp_size = std::cmp::min(
+        size_n * sorted_token_count,
+        sms * 4 * moe_block_size * MAX_THREAD_N,
+    );
+    let max_c_tmp_size = if moe_block_size == 8 {
+        max_c_tmp_size * 2
+    } else {
+        max_c_tmp_size
+    };
+    let c_tmp = alloc.alloc_tensor(&[max_c_tmp_size], DType::F32);
+
+    // Temp buffer for act_order column permutation
+    let a_tmp_ptr: *mut c_void = if has_act_order {
+        let a_tmp = alloc.alloc_tensor(&[size_m * top_k, size_k], a.dtype());
+        a_tmp.raw_ptr() as *mut c_void
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let zeros_ptr = b_zeros.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
+    let g_idx_ptr = g_idx.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
+    let perm_ptr = perm.map_or(std::ptr::null(), |t| t.raw_ptr() as *const c_void);
+
+    let is_k_full = true;
+
+    match a.dtype() {
+        DType::BF16 => marlin_moe_gemm_bf16(
+            a.raw_ptr() as *const c_void,
+            out.raw_ptr() as *mut c_void,
+            c_tmp.raw_ptr() as *mut c_void,
+            b_q_weight.raw_ptr() as *const c_void,
+            b_scales.raw_ptr() as *const c_void,
+            zeros_ptr,
+            g_idx_ptr,
+            perm_ptr,
+            a_tmp_ptr,
+            workspace.raw_ptr() as *mut c_void,
+            sorted_token_ids.raw_ptr() as *const c_void,
+            expert_ids.raw_ptr() as *const c_void,
+            num_tokens_past_padded.raw_ptr() as *const c_void,
+            topk_weights.raw_ptr() as *const c_void,
+            moe_block_size as c_int,
+            num_experts as c_int,
+            top_k as c_int,
+            mul_topk_weights,
+            size_m as c_int,
+            size_n as c_int,
+            size_k as c_int,
+            num_groups as c_int,
+            group_size as c_int,
+            has_act_order,
+            is_k_full,
+            has_zp,
+            false, // is_zp_float
+            true,  // use_fp32_reduce
+            b_type_id as c_int,
+            stream,
+            device_id,
+        ),
+        DType::F16 => marlin_moe_gemm_f16(
+            a.raw_ptr() as *const c_void,
+            out.raw_ptr() as *mut c_void,
+            c_tmp.raw_ptr() as *mut c_void,
+            b_q_weight.raw_ptr() as *const c_void,
+            b_scales.raw_ptr() as *const c_void,
+            zeros_ptr,
+            g_idx_ptr,
+            perm_ptr,
+            a_tmp_ptr,
+            workspace.raw_ptr() as *mut c_void,
+            sorted_token_ids.raw_ptr() as *const c_void,
+            expert_ids.raw_ptr() as *const c_void,
+            num_tokens_past_padded.raw_ptr() as *const c_void,
+            topk_weights.raw_ptr() as *const c_void,
+            moe_block_size as c_int,
+            num_experts as c_int,
+            top_k as c_int,
+            mul_topk_weights,
+            size_m as c_int,
+            size_n as c_int,
+            size_k as c_int,
+            num_groups as c_int,
+            group_size as c_int,
+            has_act_order,
+            is_k_full,
+            has_zp,
+            false, // is_zp_float
+            true,  // use_fp32_reduce
+            b_type_id as c_int,
+            stream,
+            device_id,
+        ),
+        _ => panic!("marlin_moe_gemm: unsupported dtype {:?}", a.dtype()),
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // BitsAndBytes NF4/FP4 dequantization
 // ---------------------------------------------------------------------------
 

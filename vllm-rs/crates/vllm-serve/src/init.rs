@@ -1750,7 +1750,31 @@ fn try_load_chat_template(model_dir: &Path) -> Option<ChatTemplate> {
     let config_path = model_dir.join("tokenizer_config.json");
     match ChatTemplate::from_tokenizer_config(&config_path) {
         Ok(Some(tpl)) => Some(tpl),
-        Ok(None) => None,
+        Ok(None) => {
+            // Fallback: some models (e.g. AWQ quantized) store the template in a
+            // separate Jinja file instead of embedding it in tokenizer_config.json.
+            let jinja_path = model_dir.join("chat_template.jinja");
+            if jinja_path.exists() {
+                match std::fs::read_to_string(&jinja_path) {
+                    Ok(template_str) => match ChatTemplate::new(template_str) {
+                        Ok(tpl) => {
+                            info!("Chat template loaded from chat_template.jinja");
+                            Some(tpl)
+                        }
+                        Err(e) => {
+                            info!("Failed to parse chat_template.jinja: {e}");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        info!("Failed to read chat_template.jinja: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
         Err(e) => {
             info!("Failed to parse chat template: {e}");
             None

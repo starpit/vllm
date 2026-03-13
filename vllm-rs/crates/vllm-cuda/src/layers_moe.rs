@@ -326,6 +326,297 @@ pub fn load_fp8_moe_weights_dequant(
 }
 
 // ---------------------------------------------------------------------------
+// MarlinFusedMoELayer (AWQ/GPTQ INT4 quantized MoE)
+// ---------------------------------------------------------------------------
+
+/// Dynamic block size selection for Marlin MoE GEMM tiling.
+/// Matches Python vLLM's `_fused_marlin_moe` logic:
+///   for block_size_m in [8, 16, 32, 48, 64]:
+///       if M * topk / E / block_size_m < 0.9: break
+/// Only thread_m_blocks=1 kernels are instantiated → max block_size = 16.
+fn select_moe_block_size(num_tokens: usize, top_k: usize, num_experts: usize) -> usize {
+    for &bs in &[8usize, 16] {
+        if ((num_tokens * top_k) as f64 / num_experts as f64 / bs as f64) < 0.9 {
+            return bs;
+        }
+    }
+    16 // max with thread_m_blocks=1
+}
+
+/// Fused Mixture of Experts layer using Marlin INT4 quantized weights.
+///
+/// Uses the `marlin_moe_gemm` kernel which fuses expert routing + Marlin
+/// INT4 GEMM + topk weight multiply into a single kernel per pass.
+///
+/// Forward matches Python vLLM's `_fused_marlin_moe` two-pass pattern.
+pub struct MarlinFusedMoELayer {
+    /// Gate projection: `[hidden_size, num_experts]` — always dense.
+    pub gate: Linear,
+    /// Stacked gate+up weights: `[E, K/tile, 2N*tile]` Marlin-packed.
+    pub w1: GpuTensor,
+    /// Stacked down weights: `[E, N/tile, K*tile]` Marlin-packed.
+    pub w2: GpuTensor,
+    /// Scales for w1: `[E, num_groups_w1, 2*intermediate_size]`.
+    pub w1_scales: GpuTensor,
+    /// Scales for w2: `[E, num_groups_w2, hidden_size]`.
+    pub w2_scales: GpuTensor,
+    /// Zero points for w1 (AWQ only): `[E, num_groups_w1, 2*intermediate/8]`.
+    pub w1_zeros: Option<GpuTensor>,
+    /// Zero points for w2 (AWQ only): `[E, num_groups_w2, hidden/8]`.
+    pub w2_zeros: Option<GpuTensor>,
+    /// Workspace for barrier synchronization: `[sms * 4]` i32.
+    pub workspace: GpuTensor,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub intermediate_size: usize,
+    pub hidden_size: usize,
+    pub group_size: usize,
+    pub has_zp: bool,
+    /// 1 = kU4 (AWQ), 0 = kU4B8 (GPTQ).
+    pub b_type_id: i32,
+    pub renormalize: bool,
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
+}
+
+impl MarlinFusedMoELayer {
+    /// Forward pass — full Marlin MoE pipeline.
+    ///
+    /// * `hidden_states`: `[num_tokens, hidden_size]`
+    ///
+    /// Returns: `[num_tokens, hidden_size]`
+    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
+        self.forward_owned(hidden_states, device).into_gpu_tensor()
+    }
+
+    pub unsafe fn forward_owned(
+        &self,
+        hidden_states: GpuTensor,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        let num_tokens = hidden_states.dim(0);
+        let stream = device.compute_stream;
+
+        // 1. Gate: router_logits = hidden_states @ gate_weight^T
+        let router_logits =
+            self.gate
+                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+
+        // 2. Top-K softmax
+        let (topk_weights, topk_ids) = kernels::topk_softmax(
+            router_logits.as_gpu_tensor(),
+            self.top_k,
+            self.renormalize,
+            &mut device.caching,
+            stream,
+        );
+        drop(router_logits);
+
+        // 3. Dynamic block size selection (matches Python vLLM)
+        let moe_block_size = select_moe_block_size(num_tokens, self.top_k, self.num_experts);
+
+        // Align block size: sort tokens by expert for fused GEMM
+        let (sorted_token_ids, expert_ids, num_tokens_post_padded) = kernels::moe_align_block_size(
+            topk_ids.as_gpu_tensor(),
+            self.num_experts,
+            moe_block_size,
+            &mut device.caching,
+            stream,
+        );
+        drop(topk_ids);
+
+        let num_groups_w1 = self.w1_scales.dim(1);
+        let num_groups_w2 = self.w2_scales.dim(1);
+        let group_size_w1 = if num_groups_w1 > 1 {
+            self.hidden_size / num_groups_w1
+        } else {
+            -1i64 as usize
+        };
+        let group_size_w2 = if num_groups_w2 > 1 {
+            self.intermediate_size / num_groups_w2
+        } else {
+            -1i64 as usize
+        };
+
+        // 4. GEMM 1: hidden_states × w1^T → [num_tokens * top_k, 2 * intermediate]
+        //    No topk weight applied (mul_topk_weights=false).
+        let intermediate1 = kernels::marlin_moe_gemm(
+            hidden_states,
+            self.w1,
+            self.w1_scales,
+            self.w1_zeros,
+            None, // g_idx
+            None, // perm
+            self.workspace,
+            sorted_token_ids.as_gpu_tensor(),
+            expert_ids.as_gpu_tensor(),
+            num_tokens_post_padded.as_gpu_tensor(),
+            topk_weights.as_gpu_tensor(),
+            moe_block_size,
+            self.num_experts,
+            self.top_k,
+            false, // don't apply weights on first GEMM
+            num_tokens,
+            2 * self.intermediate_size,
+            self.hidden_size,
+            num_groups_w1,
+            group_size_w1,
+            false, // has_act_order
+            self.has_zp,
+            self.b_type_id,
+            device.device_id as i32,
+            &mut device.caching,
+            stream,
+        );
+
+        // 5. Activation: SiLU(gate) * up → [num_tokens * top_k, intermediate]
+        let activated = kernels::silu_and_mul_fused(
+            intermediate1.as_gpu_tensor(),
+            self.intermediate_size,
+            &mut device.caching,
+            stream,
+        );
+        drop(intermediate1);
+
+        // 6. GEMM 2: activated × w2^T → [num_tokens * top_k, hidden_size]
+        //    Reuse same sorted_token_ids/expert_ids/num_tokens_post_padded from pass 1.
+        //    Set top_k=1 because input is already expanded to [M*top_k, intermediate].
+        //    Apply routing weights (mul_topk_weights=true). Matches Python vLLM's
+        //    _fused_marlin_moe second pass.
+        //    Apply routing weight here (mul_topk_weights=true).
+        let intermediate2 = kernels::marlin_moe_gemm(
+            activated.as_gpu_tensor(),
+            self.w2,
+            self.w2_scales,
+            self.w2_zeros,
+            None, // g_idx
+            None, // perm
+            self.workspace,
+            sorted_token_ids.as_gpu_tensor(),
+            expert_ids.as_gpu_tensor(),
+            num_tokens_post_padded.as_gpu_tensor(),
+            topk_weights.as_gpu_tensor(),
+            moe_block_size,
+            self.num_experts,
+            1,    // top_k=1 for pass 2 (input already expanded)
+            true, // apply routing weights
+            num_tokens * self.top_k,
+            self.hidden_size,
+            self.intermediate_size,
+            num_groups_w2,
+            group_size_w2,
+            false, // has_act_order
+            self.has_zp,
+            self.b_type_id,
+            device.device_id as i32,
+            &mut device.caching,
+            stream,
+        );
+        drop(activated);
+        drop(topk_weights);
+        drop(sorted_token_ids);
+        drop(expert_ids);
+        drop(num_tokens_post_padded);
+
+        // 7. Reduce: sum across top_k experts → [num_tokens, hidden_size]
+        let output = kernels::moe_sum(
+            intermediate2.as_gpu_tensor(),
+            num_tokens,
+            self.hidden_size,
+            self.top_k,
+            &mut device.caching,
+            stream,
+        );
+        drop(intermediate2);
+
+        // 9. TP all-reduce
+        #[cfg(feature = "nccl")]
+        if let Some(ref nccl) = self.tp_group {
+            nccl.all_reduce_inplace(output.as_gpu_tensor())
+                .expect("MoE all_reduce failed");
+        }
+
+        output
+    }
+}
+
+/// MoE layer with optional shared expert, using Marlin quantized weights.
+pub struct MarlinSharedFusedMoELayer {
+    pub moe: MarlinFusedMoELayer,
+    /// Shared expert: fused gate+up (Marlin-quantized or dense Linear).
+    pub shared_gate_up: Option<crate::layers::LinearLayer>,
+    /// Shared expert: down projection.
+    pub shared_down: Option<crate::layers::LinearLayer>,
+    /// Shared expert gate: `[1, hidden]` — sigmoid gate for shared expert output.
+    pub shared_expert_gate: Option<Linear>,
+    pub intermediate_size: usize,
+}
+
+impl MarlinSharedFusedMoELayer {
+    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
+        self.forward_owned(hidden_states, device).into_gpu_tensor()
+    }
+
+    pub unsafe fn forward_owned(
+        &self,
+        hidden_states: GpuTensor,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        let stream = device.compute_stream;
+
+        // MoE path.
+        let moe_out = self.moe.forward_owned(hidden_states, device);
+
+        // Shared expert path (if present).
+        if let (Some(shared_gate_up), Some(shared_down), Some(shared_gate)) = (
+            &self.shared_gate_up,
+            &self.shared_down,
+            &self.shared_expert_gate,
+        ) {
+            let shared_gu = shared_gate_up.forward_owned(
+                hidden_states,
+                &mut device.cublas,
+                &mut device.caching,
+                stream,
+            );
+            let shared_activated = kernels::silu_and_mul_fused(
+                shared_gu.as_gpu_tensor(),
+                self.intermediate_size,
+                &mut device.caching,
+                stream,
+            );
+            drop(shared_gu);
+
+            let shared_out = shared_down.forward_owned(
+                shared_activated.as_gpu_tensor(),
+                &mut device.cublas,
+                &mut device.caching,
+                stream,
+            );
+            drop(shared_activated);
+
+            let gate_logits =
+                shared_gate.forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+
+            let result = kernels::sigmoid_mul_add(
+                moe_out.as_gpu_tensor(),
+                shared_out.as_gpu_tensor(),
+                gate_logits.as_gpu_tensor(),
+                &mut device.caching,
+                stream,
+            );
+            drop(moe_out);
+            drop(shared_out);
+            drop(gate_logits);
+
+            result
+        } else {
+            moe_out
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

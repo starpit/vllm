@@ -81,6 +81,8 @@ pub use layers::{
     Bnb4bitLinear, ColumnParallelLinear, Embedding, GgmlLinear, Linear, LinearLayer, MarlinLinear,
     RmsNorm, RowParallelLinear, VocabParallelEmbedding,
 };
+#[cfg(feature = "cuda")]
+pub use layers_moe::{MarlinFusedMoELayer, MarlinSharedFusedMoELayer};
 #[cfg(feature = "nccl")]
 pub use nccl::{NcclGroup, NcclId};
 #[cfg(feature = "cuda")]

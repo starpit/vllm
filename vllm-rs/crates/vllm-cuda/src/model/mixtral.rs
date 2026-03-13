@@ -18,12 +18,13 @@ use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Linear, RmsNorm};
-use crate::layers_moe::FusedMoELayer;
+use crate::layers_moe::{FusedMoELayer, MarlinFusedMoELayer};
 use crate::model::llama::{LlamaAttention, LlamaConfig, RotaryCache, TpConfig};
 #[cfg(feature = "nccl")]
 use crate::nccl::NcclGroup;
+use crate::quant::QuantConfig;
 use crate::tensor::GpuTensor;
-use crate::weights::GpuWeights;
+use crate::weights::{self as gpu_weights, GpuWeights};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -72,9 +73,28 @@ impl MixtralConfig {
 // MixtralDecoderLayer
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::large_enum_variant)]
+enum MixtralMoE {
+    Dense(FusedMoELayer),
+    Quantized(MarlinFusedMoELayer),
+}
+
+impl MixtralMoE {
+    unsafe fn forward_owned(
+        &self,
+        hidden_states: GpuTensor,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        match self {
+            Self::Dense(moe) => moe.forward_owned(hidden_states, device),
+            Self::Quantized(moe) => moe.forward_owned(hidden_states, device),
+        }
+    }
+}
+
 pub struct MixtralDecoderLayer {
     pub self_attn: LlamaAttention,
-    block_sparse_moe: FusedMoELayer,
+    block_sparse_moe: MixtralMoE,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -117,7 +137,7 @@ impl MixtralDecoderLayer {
 
         Ok(Self {
             self_attn,
-            block_sparse_moe: moe,
+            block_sparse_moe: MixtralMoE::Dense(moe),
             input_layernorm,
             post_attention_layernorm,
         })
@@ -273,7 +293,84 @@ impl MixtralDecoderLayer {
 
         Ok(Self {
             self_attn,
-            block_sparse_moe: moe,
+            block_sparse_moe: MixtralMoE::Dense(moe),
+            input_layernorm,
+            post_attention_layernorm,
+        })
+    }
+
+    /// Load a quantized (AWQ/GPTQ → Marlin) decoder layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &MixtralConfig,
+        layer_idx: usize,
+        qconfig: &QuantConfig,
+        workspace: GpuTensor,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let llama_cfg = config.as_llama_config();
+        let self_attn = LlamaAttention::load_quantized(
+            weights,
+            &format!("{prefix}.self_attn"),
+            &llama_cfg,
+            layer_idx,
+            qconfig,
+            workspace,
+            device,
+        )?;
+
+        // Mixtral uses w1/w3/w2 naming (not gate_proj/up_proj/down_proj).
+        // load_marlin_moe_layer expects gate_proj/up_proj/down_proj naming.
+        // We need to handle the naming difference. Check which naming is present.
+        let moe_prefix = format!("{prefix}.block_sparse_moe");
+        let uses_w1w3 = weights.contains(&format!("{moe_prefix}.experts.0.w1.qweight"));
+
+        let moe = if uses_w1w3 {
+            // Mixtral naming: w1=gate_proj, w3=up_proj, w2=down_proj.
+            // We can't directly use load_marlin_moe_layer since it expects gate_proj/up_proj/down_proj.
+            // Instead, build it manually using the same approach.
+            load_marlin_moe_layer_mixtral(
+                weights,
+                &moe_prefix,
+                config.num_local_experts,
+                config.intermediate_size,
+                config.hidden_size,
+                config.num_experts_per_tok,
+                false, // Mixtral does NOT renormalize
+                qconfig,
+                device.device_id as i32,
+            )?
+        } else {
+            // Some quantized Mixtral models use standard naming.
+            gpu_weights::load_marlin_moe_layer(
+                weights,
+                &moe_prefix,
+                config.num_local_experts,
+                config.intermediate_size,
+                config.hidden_size,
+                config.num_experts_per_tok,
+                false, // Mixtral does NOT renormalize
+                qconfig,
+                device.device_id as i32,
+            )?
+        };
+
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+
+        Ok(Self {
+            self_attn,
+            block_sparse_moe: MixtralMoE::Quantized(moe),
             input_layernorm,
             post_attention_layernorm,
         })
@@ -541,6 +638,59 @@ impl MixtralForCausalLM {
         Ok(Self { model, lm_head })
     }
 
+    /// Load a quantized (AWQ/GPTQ → Marlin) Mixtral model.
+    pub fn load_quantized(
+        weights: &mut GpuWeights,
+        config: &MixtralConfig,
+        dtype: DType,
+        qconfig: &QuantConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let workspace = gpu_weights::alloc_marlin_workspace(device.num_sm, device.compute_stream)?;
+
+        let embed_tokens = crate::layers::Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            layers.push(MixtralDecoderLayer::load_quantized(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                qconfig,
+                workspace,
+                device,
+            )?);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        let model = MixtralModel {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+        };
+
+        let lm_head = if config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.weight, None)
+        } else {
+            Linear::load(weights, "lm_head")?
+        };
+
+        Ok(Self { model, lm_head })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
@@ -630,7 +780,7 @@ impl MixtralDecoderLayer {
 
         Ok(Self {
             self_attn,
-            block_sparse_moe: moe,
+            block_sparse_moe: MixtralMoE::Dense(moe),
             input_layernorm,
             post_attention_layernorm,
         })
@@ -701,7 +851,416 @@ impl MixtralForCausalLM {
     pub fn set_tp_group(&mut self, group: Arc<NcclGroup>) {
         for layer in &mut self.model.layers {
             layer.self_attn.tp_group = Some(Arc::clone(&group));
-            layer.block_sparse_moe.tp_group = Some(Arc::clone(&group));
+            match &mut layer.block_sparse_moe {
+                MixtralMoE::Dense(moe) => {
+                    moe.tp_group = Some(Arc::clone(&group));
+                }
+                MixtralMoE::Quantized(moe) => {
+                    moe.tp_group = Some(Arc::clone(&group));
+                }
+            }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mixtral-specific Marlin MoE weight loading
+// ---------------------------------------------------------------------------
+
+/// Load Marlin MoE weights using Mixtral's `w1`/`w3`/`w2` naming convention.
+///
+/// Mixtral uses: `experts.{e}.w1` (gate), `experts.{e}.w3` (up), `experts.{e}.w2` (down).
+/// This is equivalent to `gate_proj`/`up_proj`/`down_proj` in other MoE models.
+#[allow(clippy::too_many_arguments)]
+fn load_marlin_moe_layer_mixtral(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    num_experts: usize,
+    intermediate_size: usize,
+    hidden_size: usize,
+    top_k: usize,
+    renormalize: bool,
+    qconfig: &QuantConfig,
+    device_id: i32,
+) -> Result<MarlinFusedMoELayer> {
+    use crate::driver;
+    use crate::weights::{
+        bytes_to_u16, bytes_to_u32, concat_bytes_dim1, concat_u16_dim1, concat_u32_dim1,
+        load_expert_awq_cpu, load_expert_gptq_cpu,
+    };
+
+    let stream = weights.stream();
+
+    let (group_size, has_zp, b_type_id) = match qconfig {
+        QuantConfig::Awq(cfg) => (cfg.group_size, true, 1i32),
+        QuantConfig::Gptq(cfg) => (cfg.group_size, false, 0i32),
+        _ => anyhow::bail!(
+            "load_marlin_moe_layer_mixtral: unsupported quant config {:?}",
+            qconfig
+        ),
+    };
+
+    let num_groups_w1 = if group_size > 0 {
+        hidden_size / group_size
+    } else {
+        1
+    };
+    let num_groups_w2 = if group_size > 0 {
+        intermediate_size / group_size
+    } else {
+        1
+    };
+
+    let w1_n = 2 * intermediate_size;
+    let w1_packed_per_expert = hidden_size * w1_n / 8;
+    let w2_packed_per_expert = intermediate_size * hidden_size / 8;
+
+    let w1_total_bytes = num_experts * w1_packed_per_expert * 4;
+    let w2_total_bytes = num_experts * w2_packed_per_expert * 4;
+    let w1_ptr = unsafe { driver::mem_alloc(w1_total_bytes)? };
+    let w2_ptr = unsafe { driver::mem_alloc(w2_total_bytes)? };
+    weights.record_alloc(w1_ptr, w1_total_bytes);
+    weights.record_alloc(w2_ptr, w2_total_bytes);
+
+    // Determine scale dtype from first expert's scales.
+    // Try standard naming first, then compressed-tensors naming.
+    let first_scales_name = format!("{prefix}.experts.0.w1.scales");
+    let first_ct_scales_name = format!("{prefix}.experts.0.w1.weight_scale");
+    let scales_dtype = weights
+        .tensor_info(&first_scales_name)
+        .or_else(|| weights.tensor_info(&first_ct_scales_name))
+        .map(|(_, dt)| dt)
+        .unwrap_or(DType::BF16);
+    let scale_elem = scales_dtype.size_bytes();
+
+    let w1_scales_bytes = num_experts * num_groups_w1 * w1_n * scale_elem;
+    let w2_scales_bytes = num_experts * num_groups_w2 * hidden_size * scale_elem;
+    let w1_scales_ptr = unsafe { driver::mem_alloc(w1_scales_bytes)? };
+    let w2_scales_ptr = unsafe { driver::mem_alloc(w2_scales_bytes)? };
+    weights.record_alloc(w1_scales_ptr, w1_scales_bytes);
+    weights.record_alloc(w2_scales_ptr, w2_scales_bytes);
+
+    let (w1_zeros_ptr, w2_zeros_ptr) = if has_zp {
+        let w1_zp_bytes = num_experts * num_groups_w1 * (w1_n / 8) * 4;
+        let w2_zp_bytes = num_experts * num_groups_w2 * (hidden_size / 8) * 4;
+        let p1 = unsafe { driver::mem_alloc(w1_zp_bytes)? };
+        let p2 = unsafe { driver::mem_alloc(w2_zp_bytes)? };
+        weights.record_alloc(p1, w1_zp_bytes);
+        weights.record_alloc(p2, w2_zp_bytes);
+        (Some(p1), Some(p2))
+    } else {
+        (None, None)
+    };
+
+    let is_gptq = b_type_id == 0;
+
+    for e in 0..num_experts {
+        // Mixtral naming: w1=gate_proj, w3=up_proj, w2=down_proj
+        let gate_prefix = format!("{prefix}.experts.{e}.w1");
+        let up_prefix = format!("{prefix}.experts.{e}.w3");
+        let down_prefix = format!("{prefix}.experts.{e}.w2");
+
+        if is_gptq {
+            // GPTQ / compressed-tensors path
+            let (gate_qw, gate_sc) = load_expert_gptq_cpu(weights, &gate_prefix)?;
+            let (up_qw, up_sc) = load_expert_gptq_cpu(weights, &up_prefix)?;
+
+            // GPTQ qweight is [K/8, N] — concat along dim1 gives [K/8, N1+N2]
+            let k_packed = gate_qw.1[0];
+            let fused_k = k_packed * 8;
+            let fused_n = intermediate_size * 2;
+
+            let fused_qw = {
+                let gate_n = gate_qw.1[1];
+                let up_n = up_qw.1[1];
+                let elem = 4usize;
+                let row_gate = gate_n * elem;
+                let row_up = up_n * elem;
+                let row_out = (gate_n + up_n) * elem;
+                let mut out = vec![0u8; k_packed * row_out];
+                for r in 0..k_packed {
+                    out[r * row_out..r * row_out + row_gate]
+                        .copy_from_slice(&gate_qw.0[r * row_gate..(r + 1) * row_gate]);
+                    out[r * row_out + row_gate..r * row_out + row_out]
+                        .copy_from_slice(&up_qw.0[r * row_up..(r + 1) * row_up]);
+                }
+                out
+            };
+
+            let qw_nbytes = fused_qw.len();
+            let qw_gpu_ptr = unsafe { driver::mem_alloc(qw_nbytes)? };
+            unsafe {
+                driver::memcpy_htod_async(qw_gpu_ptr, fused_qw.as_ptr(), qw_nbytes, stream)?;
+            }
+            let qw_gpu = unsafe { GpuTensor::new(qw_gpu_ptr, &[k_packed, fused_n], DType::I32) };
+
+            let expert_w1_offset = e * w1_packed_per_expert * 4;
+            unsafe {
+                crate::kernels::gptq_repack_into(
+                    qw_gpu,
+                    None,
+                    w1_ptr.add(expert_w1_offset),
+                    fused_k,
+                    fused_n,
+                    device_id,
+                    stream,
+                );
+                driver::stream_synchronize(stream)?;
+                driver::mem_free(qw_gpu_ptr)?;
+            }
+
+            let fused_sc =
+                concat_u16_dim1(&gate_sc.0, &up_sc.0, gate_sc.1[0], gate_sc.1[1], up_sc.1[1]);
+            let mut scales_u16 = fused_sc;
+            crate::quant::marlin_permute_scales(&mut scales_u16, fused_k, fused_n, group_size);
+
+            let expert_scales_offset = e * num_groups_w1 * fused_n * scale_elem;
+            let scales_bytes: Vec<u8> = scales_u16.iter().flat_map(|&v| v.to_le_bytes()).collect();
+            unsafe {
+                driver::memcpy_htod_async(
+                    w1_scales_ptr.add(expert_scales_offset),
+                    scales_bytes.as_ptr(),
+                    scales_bytes.len(),
+                    stream,
+                )?;
+            }
+
+            // --- w2: down proj ---
+            let (down_qw, down_sc) = load_expert_gptq_cpu(weights, &down_prefix)?;
+            let down_k_packed = down_qw.1[0];
+            let down_k = down_k_packed * 8;
+            let down_n = down_qw.1[1];
+
+            let down_qw_nbytes = down_qw.0.len();
+            let down_qw_gpu_ptr = unsafe { driver::mem_alloc(down_qw_nbytes)? };
+            unsafe {
+                driver::memcpy_htod_async(
+                    down_qw_gpu_ptr,
+                    down_qw.0.as_ptr(),
+                    down_qw_nbytes,
+                    stream,
+                )?;
+            }
+            let down_qw_gpu =
+                unsafe { GpuTensor::new(down_qw_gpu_ptr, &[down_k_packed, down_n], DType::I32) };
+
+            let expert_w2_offset = e * w2_packed_per_expert * 4;
+            unsafe {
+                crate::kernels::gptq_repack_into(
+                    down_qw_gpu,
+                    None,
+                    w2_ptr.add(expert_w2_offset),
+                    down_k,
+                    down_n,
+                    device_id,
+                    stream,
+                );
+                driver::stream_synchronize(stream)?;
+                driver::mem_free(down_qw_gpu_ptr)?;
+            }
+
+            let mut down_scales_u16 = bytes_to_u16(&down_sc.0);
+            crate::quant::marlin_permute_scales(&mut down_scales_u16, down_k, down_n, group_size);
+            let expert_w2_scales_offset = e * num_groups_w2 * hidden_size * scale_elem;
+            let down_scales_bytes: Vec<u8> = down_scales_u16
+                .iter()
+                .flat_map(|&v| v.to_le_bytes())
+                .collect();
+            unsafe {
+                driver::memcpy_htod_async(
+                    w2_scales_ptr.add(expert_w2_scales_offset),
+                    down_scales_bytes.as_ptr(),
+                    down_scales_bytes.len(),
+                    stream,
+                )?;
+            }
+        } else {
+            // AWQ path
+            let (gate_qw, gate_sc, gate_zp) = load_expert_awq_cpu(weights, &gate_prefix)?;
+            let (up_qw, up_sc, up_zp) = load_expert_awq_cpu(weights, &up_prefix)?;
+
+            let fused_qw =
+                concat_bytes_dim1(&gate_qw.0, &up_qw.0, gate_qw.1[0], gate_qw.1[1], up_qw.1[1]);
+
+            let fused_k = gate_qw.1[0];
+            let fused_n = intermediate_size * 2;
+            let qw_nbytes = fused_qw.len();
+            let qw_gpu_ptr = unsafe { driver::mem_alloc(qw_nbytes)? };
+            unsafe {
+                driver::memcpy_htod_async(qw_gpu_ptr, fused_qw.as_ptr(), qw_nbytes, stream)?;
+            }
+            let qw_gpu = unsafe { GpuTensor::new(qw_gpu_ptr, &[fused_k, fused_n / 8], DType::U32) };
+
+            let expert_w1_offset = e * w1_packed_per_expert * 4;
+            unsafe {
+                crate::kernels::awq_repack_into(
+                    qw_gpu,
+                    w1_ptr.add(expert_w1_offset),
+                    fused_k,
+                    fused_n,
+                    device_id,
+                    stream,
+                );
+                driver::stream_synchronize(stream)?;
+                driver::mem_free(qw_gpu_ptr)?;
+            }
+
+            let fused_sc =
+                concat_u16_dim1(&gate_sc.0, &up_sc.0, gate_sc.1[0], gate_sc.1[1], up_sc.1[1]);
+            let mut scales_u16 = fused_sc;
+            crate::quant::marlin_permute_scales(&mut scales_u16, fused_k, fused_n, group_size);
+
+            let expert_scales_offset = e * num_groups_w1 * fused_n * scale_elem;
+            let scales_bytes: Vec<u8> = scales_u16.iter().flat_map(|&v| v.to_le_bytes()).collect();
+            unsafe {
+                driver::memcpy_htod_async(
+                    w1_scales_ptr.add(expert_scales_offset),
+                    scales_bytes.as_ptr(),
+                    scales_bytes.len(),
+                    stream,
+                )?;
+            }
+
+            if has_zp && let (Some(gate_zp), Some(up_zp)) = (gate_zp, up_zp) {
+                let fused_zp_u32 =
+                    concat_u32_dim1(&gate_zp.0, &up_zp.0, gate_zp.1[0], gate_zp.1[1], up_zp.1[1]);
+                let marlin_zp =
+                    crate::quant::awq_to_marlin_zero_points(&fused_zp_u32, num_groups_w1, fused_n);
+                let zp_bytes: Vec<u8> = marlin_zp.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                let expert_zp_offset = e * num_groups_w1 * (fused_n / 8) * 4;
+                unsafe {
+                    driver::memcpy_htod_async(
+                        w1_zeros_ptr.unwrap().add(expert_zp_offset),
+                        zp_bytes.as_ptr(),
+                        zp_bytes.len(),
+                        stream,
+                    )?;
+                }
+            }
+
+            // --- w2: down proj ---
+            let (down_qw, down_sc, down_zp) = load_expert_awq_cpu(weights, &down_prefix)?;
+            let down_k = down_qw.1[0];
+            let down_n = down_qw.1[1] * 8;
+
+            let down_qw_nbytes = down_qw.0.len();
+            let down_qw_gpu_ptr = unsafe { driver::mem_alloc(down_qw_nbytes)? };
+            unsafe {
+                driver::memcpy_htod_async(
+                    down_qw_gpu_ptr,
+                    down_qw.0.as_ptr(),
+                    down_qw_nbytes,
+                    stream,
+                )?;
+            }
+            let down_qw_gpu =
+                unsafe { GpuTensor::new(down_qw_gpu_ptr, &[down_k, down_n / 8], DType::U32) };
+
+            let expert_w2_offset = e * w2_packed_per_expert * 4;
+            unsafe {
+                crate::kernels::awq_repack_into(
+                    down_qw_gpu,
+                    w2_ptr.add(expert_w2_offset),
+                    down_k,
+                    down_n,
+                    device_id,
+                    stream,
+                );
+                driver::stream_synchronize(stream)?;
+                driver::mem_free(down_qw_gpu_ptr)?;
+            }
+
+            let mut down_scales_u16 = bytes_to_u16(&down_sc.0);
+            crate::quant::marlin_permute_scales(&mut down_scales_u16, down_k, down_n, group_size);
+            let expert_w2_scales_offset = e * num_groups_w2 * hidden_size * scale_elem;
+            let down_scales_bytes: Vec<u8> = down_scales_u16
+                .iter()
+                .flat_map(|&v| v.to_le_bytes())
+                .collect();
+            unsafe {
+                driver::memcpy_htod_async(
+                    w2_scales_ptr.add(expert_w2_scales_offset),
+                    down_scales_bytes.as_ptr(),
+                    down_scales_bytes.len(),
+                    stream,
+                )?;
+            }
+
+            if has_zp && let Some(down_zp) = down_zp {
+                let down_zp_u32 = bytes_to_u32(&down_zp.0);
+                let marlin_zp =
+                    crate::quant::awq_to_marlin_zero_points(&down_zp_u32, num_groups_w2, down_n);
+                let zp_bytes: Vec<u8> = marlin_zp.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                let expert_w2_zp_offset = e * num_groups_w2 * (hidden_size / 8) * 4;
+                unsafe {
+                    driver::memcpy_htod_async(
+                        w2_zeros_ptr.unwrap().add(expert_w2_zp_offset),
+                        zp_bytes.as_ptr(),
+                        zp_bytes.len(),
+                        stream,
+                    )?;
+                }
+            }
+        }
+    }
+
+    unsafe { driver::stream_synchronize(stream)? };
+
+    let w1_gpu =
+        unsafe { GpuTensor::new(w1_ptr, &[num_experts, w1_packed_per_expert], DType::U32) };
+    let w2_gpu =
+        unsafe { GpuTensor::new(w2_ptr, &[num_experts, w2_packed_per_expert], DType::U32) };
+    let w1_scales_gpu = unsafe {
+        GpuTensor::new(
+            w1_scales_ptr,
+            &[num_experts, num_groups_w1, w1_n],
+            scales_dtype,
+        )
+    };
+    let w2_scales_gpu = unsafe {
+        GpuTensor::new(
+            w2_scales_ptr,
+            &[num_experts, num_groups_w2, hidden_size],
+            scales_dtype,
+        )
+    };
+
+    let w1_zeros_gpu = w1_zeros_ptr
+        .map(|p| unsafe { GpuTensor::new(p, &[num_experts, num_groups_w1, w1_n / 8], DType::U32) });
+    let w2_zeros_gpu = w2_zeros_ptr.map(|p| unsafe {
+        GpuTensor::new(
+            p,
+            &[num_experts, num_groups_w2, hidden_size / 8],
+            DType::U32,
+        )
+    });
+
+    let workspace_bytes = 256 * 4 * std::mem::size_of::<i32>();
+    let workspace_ptr = unsafe { driver::mem_alloc(workspace_bytes)? };
+    weights.record_alloc(workspace_ptr, workspace_bytes);
+    let workspace_gpu =
+        unsafe { GpuTensor::new(workspace_ptr, &[workspace_bytes / 4], DType::I32) };
+
+    let gate = Linear::load(weights, &format!("{prefix}.gate"))?;
+
+    Ok(MarlinFusedMoELayer {
+        gate,
+        w1: w1_gpu,
+        w2: w2_gpu,
+        w1_scales: w1_scales_gpu,
+        w2_scales: w2_scales_gpu,
+        w1_zeros: w1_zeros_gpu,
+        w2_zeros: w2_zeros_gpu,
+        workspace: workspace_gpu,
+        num_experts,
+        top_k,
+        intermediate_size,
+        hidden_size,
+        group_size,
+        has_zp,
+        b_type_id,
+        renormalize,
+        #[cfg(feature = "nccl")]
+        tp_group: None,
+    })
 }

@@ -117,7 +117,7 @@ fn main() {
             let mut paths: Vec<_> = rd
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| p.extension().map_or(false, |e| e == "csv"))
+                .filter(|p| p.extension().is_some_and(|e| e == "csv"))
                 .collect();
             paths.sort();
             for path in paths {

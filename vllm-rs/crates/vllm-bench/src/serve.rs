@@ -368,42 +368,24 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
                 .collect()
         }
         _ => {
-            // Build allowed tokens (exclude special tokens), matching Python's RandomDataset.
-            let vocab_size = tokenizer.get_vocab_size(false) as u32;
-            let special_ids: std::collections::HashSet<u32> = tokenizer
-                .get_added_vocabulary()
-                .get_added_tokens_decoder()
-                .iter()
-                .filter(|(_, t)| t.special)
-                .map(|(id, _)| *id)
-                .collect();
-            let allowed_tokens: Vec<u32> = (0..vocab_size)
-                .filter(|id| !special_ids.contains(id))
-                .collect();
-            let num_allowed = allowed_tokens.len();
-            eprintln!("Tokenizer loaded: vocab_size={vocab_size}, allowed_tokens={num_allowed}");
-
-            // Generate random text prompts matching Python's RandomDataset.generate_token_sequence.
-            eprintln!("Generating {} random prompts...", args.num_prompts);
-            (0..args.num_prompts)
-                .map(|i| {
-                    let offset = i * 7 + args.seed as usize;
-                    let token_ids: Vec<u32> = (0..args.input_len)
-                        .map(|j| allowed_tokens[(offset + i + j) % num_allowed])
-                        .collect();
-                    let text = tokenizer.decode(&token_ids, true).unwrap_or_default();
-                    let encoding = tokenizer.encode(text.as_str(), false).unwrap();
-                    let re_encoded = encoding.get_ids();
-                    let text = if re_encoded.len() > args.input_len {
-                        let truncated = &re_encoded[..args.input_len];
-                        tokenizer.decode(truncated, true).unwrap_or(text)
-                    } else {
-                        text
-                    };
-                    PromptEntry {
-                        text,
-                        output_len: args.output_len,
-                    }
+            eprintln!(
+                "Generating {} random prompts (matching Python RandomDataset)...",
+                args.num_prompts
+            );
+            let samples = datasets::generate_random(
+                &tokenizer,
+                args.num_prompts,
+                args.input_len,
+                args.output_len,
+                args.random_range_ratio,
+                args.random_prefix_len,
+                args.seed,
+            )?;
+            samples
+                .into_iter()
+                .map(|s| PromptEntry {
+                    text: s.prompt,
+                    output_len: s.expected_output_len,
                 })
                 .collect()
         }

@@ -10,7 +10,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
-use indicatif::{ProgressBar, ProgressStyle};
 use vllm_common::telemetry;
 use vllm_config::CudaGraphConfig;
 use vllm_serve::llm::{LLM, LLMBuilder, Prompt, SamplingParams};
@@ -117,69 +116,27 @@ pub(crate) fn run_bench_throughput(args: BenchThroughputArgs) -> Result<()> {
                 required_len,
             );
 
-            let mut rng_state: u64 = args.seed;
-            let mut next_rng = || -> u64 {
-                rng_state ^= rng_state << 13;
-                rng_state ^= rng_state >> 7;
-                rng_state ^= rng_state << 17;
-                rng_state
-            };
-
-            let pb = ProgressBar::new(args.num_prompts as u64);
-            pb.set_style(
-                ProgressStyle::with_template(
-                    "Rendering prompts: {wide_bar:.cyan/blue} {pos}/{len} [{elapsed}<{eta}, {per_sec}]",
-                )
-                .unwrap()
-                .with_key("per_sec", crate::fmt_tqdm_rate),
+            eprintln!(
+                "Generating {} random prompts (matching Python RandomDataset)...",
+                args.num_prompts
             );
+            let samples = datasets::generate_random(
+                tokenizer.inner(),
+                args.num_prompts,
+                args.input_len,
+                args.output_len,
+                args.random_range_ratio,
+                args.random_prefix_len,
+                args.seed,
+            )?;
 
-            let allowed_tokens: Vec<u32> = (0..tokenizer.vocab_size() as u32)
-                .filter(|&t| !tokenizer.is_special_token(t))
-                .collect();
-            let num_allowed = allowed_tokens.len().max(1) as u64;
-
-            let result: Vec<PromptEntry> = (0..args.num_prompts)
-                .map(|prompt_idx| {
-                    let offset = next_rng();
-                    let target_len = args.input_len;
-                    let mut token_ids: Vec<u32> = (0..target_len)
-                        .map(|i| {
-                            allowed_tokens
-                                [((offset + prompt_idx as u64 + i as u64) % num_allowed) as usize]
-                        })
-                        .collect();
-                    let mut text = String::new();
-                    for _ in 0..10 {
-                        text = tokenizer
-                            .decode(&token_ids, true)
-                            .unwrap_or_else(|_| String::from("?"));
-                        let re_encoded = tokenizer.encode(text.as_str(), false).unwrap_or_default();
-                        if re_encoded.len() == target_len {
-                            break;
-                        } else if re_encoded.len() < target_len {
-                            token_ids = re_encoded;
-                            let mut extra_offset = token_ids.len() as u64;
-                            while token_ids.len() < target_len {
-                                token_ids.push(
-                                    allowed_tokens
-                                        [((next_rng() + extra_offset) % num_allowed) as usize],
-                                );
-                                extra_offset += 1;
-                            }
-                        } else {
-                            token_ids = re_encoded[..target_len].to_vec();
-                        }
-                    }
-                    pb.inc(1);
-                    PromptEntry {
-                        prompt: Prompt::Text(text),
-                        output_len: args.output_len,
-                    }
+            samples
+                .into_iter()
+                .map(|s| PromptEntry {
+                    prompt: Prompt::Text(s.prompt),
+                    output_len: s.expected_output_len,
                 })
-                .collect();
-            pb.finish();
-            result
+                .collect()
         }
     };
 

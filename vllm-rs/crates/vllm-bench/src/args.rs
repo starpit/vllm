@@ -266,6 +266,18 @@ pub struct BenchThroughputArgs {
     /// Random seed for prompt generation.
     #[arg(long, default_value_t = 0)]
     pub seed: u64,
+
+    /// Range ratio for sampling input/output lengths (random dataset only).
+    /// Defines a symmetric range [len*(1-r), len*(1+r)]. Default 0.0 = fixed length.
+    /// Must be in [0, 1). Matches Python's `--random-range-ratio`.
+    #[arg(long, default_value_t = 0.0)]
+    pub random_range_ratio: f64,
+
+    /// Number of fixed prefix tokens prepended to each random prompt.
+    /// Total input length = prefix_len + sampled input_len.
+    /// Matches Python's `--random-prefix-len`.
+    #[arg(long, default_value_t = 0)]
+    pub random_prefix_len: usize,
 }
 
 impl BenchThroughputArgs {
@@ -387,6 +399,18 @@ pub struct BenchServeArgs {
     /// API key for authentication.
     #[arg(long, env = "OPENAI_API_KEY")]
     pub api_key: Option<String>,
+
+    /// Range ratio for sampling input/output lengths (random dataset only).
+    /// Defines a symmetric range [len*(1-r), len*(1+r)]. Default 0.0 = fixed length.
+    /// Must be in [0, 1). Matches Python's `--random-range-ratio`.
+    #[arg(long, default_value_t = 0.0)]
+    pub random_range_ratio: f64,
+
+    /// Number of fixed prefix tokens prepended to each random prompt.
+    /// Total input length = prefix_len + sampled input_len.
+    /// Matches Python's `--random-prefix-len`.
+    #[arg(long, default_value_t = 0)]
+    pub random_prefix_len: usize,
 
     /// Disable SSL certificate verification.
     #[arg(long)]

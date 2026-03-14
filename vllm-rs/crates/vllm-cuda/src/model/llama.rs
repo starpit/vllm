@@ -550,8 +550,87 @@ impl LlamaAttention {
                     device.compute_stream,
                 );
                 (q, k, v)
+            } else if max_seqlen_q == 1 {
+                // Decode path: fused QKV split + RoPE + cache write.
+                // K/V go directly into paged cache — no intermediate allocation.
+                let q = if kv_cache.is_fp8() {
+                    kernels::fused_qkv_rope_cache_fp8(
+                        qkv.as_gpu_tensor(),
+                        positions,
+                        rotary.cos_sin_cache,
+                        slot_mapping,
+                        kv_cache.k_cache(self.layer_idx),
+                        kv_cache.v_cache(self.layer_idx),
+                        kv_cache.k_scale_ptr(self.layer_idx),
+                        kv_cache.v_scale_ptr(self.layer_idx),
+                        self.q_size,
+                        self.kv_size,
+                        self.num_q_heads,
+                        self.head_dim,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                } else {
+                    kernels::fused_qkv_rope_cache(
+                        qkv.as_gpu_tensor(),
+                        positions,
+                        rotary.cos_sin_cache,
+                        slot_mapping,
+                        kv_cache.k_cache(self.layer_idx),
+                        kv_cache.v_cache(self.layer_idx),
+                        self.q_size,
+                        self.kv_size,
+                        self.num_q_heads,
+                        self.head_dim,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                };
+                drop(qkv);
+
+                // Decode attention reads from cache (K/V already written by fused kernel).
+                // Use attention_standard which handles both BF16 paged and FP8 dequant paths.
+                let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
+                    q.as_gpu_tensor(),
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    self.scale,
+                    0.0,
+                    -1,
+                    kv_cache,
+                    self.layer_idx,
+                    device.num_sm,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(q);
+
+                // Reshape to [num_tokens, q_size] and output projection.
+                let attn_flat = attn_output
+                    .as_gpu_tensor()
+                    .reshape(&[num_tokens, self.q_size]);
+                let result = self.o_proj.forward_owned(
+                    attn_flat,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(attn_output);
+
+                // TP: all-reduce o_proj output (row parallel).
+                #[cfg(feature = "nccl")]
+                if let Some(ref group) = self.tp_group {
+                    group
+                        .all_reduce_inplace(result.as_gpu_tensor())
+                        .expect("o_proj all_reduce failed");
+                }
+
+                return result;
             } else {
-                // Standard path: fused QKV split + RoPE.
+                // Prefill path: standard fused QKV split + RoPE.
                 let result = kernels::fused_qkv_rope(
                     qkv.as_gpu_tensor(),
                     positions,

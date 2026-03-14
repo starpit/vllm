@@ -170,8 +170,74 @@ impl CommandRAttention {
                 // models don't use QK-norm (use_qk_norm=false by default).
                 // TODO: implement fused interleaved QK-norm+RoPE kernel when needed.
                 (q, k, v)
+            } else if max_seqlen_q == 1 {
+                // Decode path: fused interleaved QKV split + RoPE + cache write.
+                let q = if kv_cache.is_fp8() {
+                    kernels::fused_qkv_interleaved_rope_cache_fp8(
+                        qkv.as_gpu_tensor(),
+                        positions,
+                        rotary.cos_sin_cache,
+                        slot_mapping,
+                        kv_cache.k_cache(attn.layer_idx),
+                        kv_cache.v_cache(attn.layer_idx),
+                        kv_cache.k_scale_ptr(attn.layer_idx),
+                        kv_cache.v_scale_ptr(attn.layer_idx),
+                        attn.q_size,
+                        attn.kv_size,
+                        attn.num_q_heads,
+                        attn.head_dim,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                } else {
+                    kernels::fused_qkv_interleaved_rope_cache(
+                        qkv.as_gpu_tensor(),
+                        positions,
+                        rotary.cos_sin_cache,
+                        slot_mapping,
+                        kv_cache.k_cache(attn.layer_idx),
+                        kv_cache.v_cache(attn.layer_idx),
+                        attn.q_size,
+                        attn.kv_size,
+                        attn.num_q_heads,
+                        attn.head_dim,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                };
+                drop(qkv);
+
+                let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
+                    q.as_gpu_tensor(),
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    attn.scale,
+                    0.0, // no softcap for Command R
+                    -1,  // no sliding window
+                    kv_cache,
+                    attn.layer_idx,
+                    device.num_sm,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(q);
+
+                let attn_flat = attn_output
+                    .as_gpu_tensor()
+                    .reshape(&[num_tokens, attn.q_size]);
+                let result = attn.o_proj.forward_owned(
+                    attn_flat,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(attn_output);
+                return result;
             } else {
-                // Standard path: fused QKV split + interleaved RoPE.
+                // Prefill or FP8 path: standard fused QKV split + interleaved RoPE.
                 let result = kernels::fused_qkv_interleaved_rope(
                     qkv.as_gpu_tensor(),
                     positions,

@@ -194,6 +194,82 @@ pub unsafe fn attention_standard(
     }
 }
 
+/// Decode-only attention from cache (K/V already written by fused kernel).
+///
+/// Handles both BF16 paged and FP8 dequant paths. Does NOT support prefill
+/// (caller must ensure max_seqlen_q == 1).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn attention_decode_from_cache(
+    q: GpuTensor,
+    cu_seqlens_q: GpuTensor,
+    seqused_k: GpuTensor,
+    block_table: GpuTensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    scale: f32,
+    softcap: f32,
+    window_size_left: i32,
+    kv_cache: &KvCachePool,
+    layer_idx: usize,
+    num_sm: i32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    if kv_cache.is_fp8() {
+        fp8_decode_attention(
+            q,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale,
+            softcap,
+            window_size_left,
+            kv_cache,
+            layer_idx,
+            alloc,
+            stream,
+        )
+    } else if softcap != 0.0 || window_size_left >= 0 {
+        kernels::flash_attn_paged_ext(
+            q,
+            kv_cache.k_cache(layer_idx),
+            kv_cache.v_cache(layer_idx),
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale,
+            true,
+            softcap,
+            window_size_left,
+            kv_cache.block_size,
+            num_sm,
+            alloc,
+            stream,
+        )
+    } else {
+        kernels::flash_attn_paged(
+            q,
+            kv_cache.k_cache(layer_idx),
+            kv_cache.v_cache(layer_idx),
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale,
+            true,
+            kv_cache.block_size,
+            num_sm,
+            alloc,
+            stream,
+        )
+    }
+}
+
 /// Run attention with softcap and/or sliding window (Gemma2/Gemma3).
 ///
 /// Uses `flash_attn_paged_ext` for the BF16 decode path.

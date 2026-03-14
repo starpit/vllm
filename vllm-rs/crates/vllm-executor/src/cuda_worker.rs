@@ -4948,6 +4948,12 @@ impl CudaWorker {
         }
 
         // Update cached requests' block tables. Track if any changed.
+        // Also detect running prefill-chunk requests: a cached request is still
+        // in prefill mode when num_computed_tokens < token_buffers.len().  After
+        // commit_step cleared is_prefill for the previous chunk, we must re-arm
+        // it here so prepare_inputs emits the full chunk rather than a single
+        // decode token.  This mirrors Python InputBatch which stores all prompt
+        // tokens persistently and slices via num_computed_tokens each step.
         let mut blocks_changed = !scheduler_output.scheduled_new_reqs.is_empty();
         for (i, req_id) in scheduler_output
             .scheduled_cached_reqs
@@ -4955,6 +4961,11 @@ impl CudaWorker {
             .iter()
             .enumerate()
         {
+            let is_resumed = scheduler_output
+                .scheduled_cached_reqs
+                .resumed_req_ids
+                .contains(req_id);
+
             if let Some(Some(new_blocks)) =
                 scheduler_output.scheduled_cached_reqs.new_block_ids.get(i)
                 && let Some(group0) = new_blocks.first()
@@ -4962,7 +4973,55 @@ impl CudaWorker {
                 if !group0.is_empty() {
                     blocks_changed = true;
                 }
-                self.input_batch.update_blocks(req_id, group0.clone());
+                // Resumed requests' block tables are set by add_request in the
+                // preemption/resumption fixup below — skip update_blocks here.
+                if !is_resumed {
+                    self.input_batch.update_blocks(req_id, group0.clone());
+                }
+            }
+
+            // Running prefill-chunk continuation: if there are still unprocessed
+            // tokens in token_buffers, re-arm this slot for another prefill step.
+            // Skipped for resumed requests (they go through add_request below).
+            if !is_resumed {
+                let num_computed = scheduler_output
+                    .scheduled_cached_reqs
+                    .num_computed_tokens
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0) as usize;
+                let buf_len = self.token_buffers.get(req_id).map(|b| b.len()).unwrap_or(0);
+                if num_computed < buf_len {
+                    // Still in prefill — re-arm with the next chunk.
+                    let num_scheduled = scheduler_output
+                        .num_scheduled_tokens
+                        .get(req_id)
+                        .copied()
+                        .unwrap_or(0);
+                    let tokens: Vec<u32> = self
+                        .token_buffers
+                        .get(req_id)
+                        .map(|buf| {
+                            let end = (num_computed + num_scheduled).min(buf.len());
+                            buf[num_computed..end].to_vec()
+                        })
+                        .unwrap_or_default();
+                    if !tokens.is_empty() {
+                        blocks_changed = true;
+                        // A prefill step is coming — CUDA graph metadata from
+                        // the previous decode step is no longer valid.  Without
+                        // this, the super-fast graph path (checked below at
+                        // fast_graph_bs) could replay a decode graph on a batch
+                        // that includes a multi-token prefill request.
+                        self.last_graph_batch_size = None;
+                        self.graph_metadata_valid = false;
+                        self.input_batch.set_prefill_continuation(
+                            req_id,
+                            tokens,
+                            num_computed as u32,
+                        );
+                    }
+                }
             }
         }
 

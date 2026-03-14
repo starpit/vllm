@@ -418,6 +418,25 @@ impl InputBatch {
         }
     }
 
+    /// Re-enter prefill mode for a request that has more prompt/sequence
+    /// tokens to process (chunked prefill continuation).
+    ///
+    /// Called when a running request still has tokens in `token_buffers` beyond
+    /// `tokens_in_pool` — i.e., it is mid-prefill and the scheduler has
+    /// allocated new blocks for the next chunk.  `tokens` is the slice to
+    /// process this step; `pos_offset` is `num_computed_tokens` (= tokens
+    /// already in the KV cache = current `tokens_in_pool`).
+    ///
+    /// Matches Python InputBatch behaviour: prompt token IDs are stored
+    /// persistently and sliced each step via `num_computed_tokens`.
+    pub fn set_prefill_continuation(&mut self, req_id: &str, tokens: Vec<u32>, pos_offset: u32) {
+        if let Some(&slot) = self.req_id_to_slot.get(req_id) {
+            self.is_prefill[slot] = true;
+            self.prefill_tokens[slot] = Some(tokens);
+            self.prefill_pos_offset[slot] = pos_offset;
+        }
+    }
+
     /// Reclaim reusable buffers from a consumed `PreparedInputs`.
     ///
     /// Call this at the end of `execute_model` to return Vec capacity back to
@@ -1615,14 +1634,9 @@ mod tests {
         // Resumed prefill: 2 tokens already cached.
         batch.add_request("r2".into(), &[10, 20, 30], vec![2, 3], 2);
         let p2 = batch.prepare_inputs(&spec);
-        let r2_idx = p2
-            .req_inputs
-            .iter()
-            .position(|r| r.req_id == "r2")
-            .unwrap();
+        let r2_idx = p2.req_inputs.iter().position(|r| r.req_id == "r2").unwrap();
         assert_eq!(
-            p2.attn_meta.seq_lens[r2_idx],
-            5,
+            p2.attn_meta.seq_lens[r2_idx], 5,
             "seq_lens = 2 (cached) + 3 (tokens) = 5"
         );
     }
@@ -2197,13 +2211,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            prepared.attn_meta.tokens_before[r1_idx],
-            0,
+            prepared.attn_meta.tokens_before[r1_idx], 0,
             "r1 resumed from scratch: tokens_before must be 0"
         );
         assert_eq!(
-            prepared.attn_meta.tokens_before[r2_idx],
-            6,
+            prepared.attn_meta.tokens_before[r2_idx], 6,
             "r2 with prefix cache: tokens_before must be 6"
         );
     }
@@ -2297,10 +2309,98 @@ mod tests {
 
         let prepared = batch.prepare_inputs(&spec);
         assert_eq!(
-            prepared.attn_meta.seq_lens[0],
-            1,
+            prepared.attn_meta.seq_lens[0], 1,
             "single-token resumed prefill: seq_lens must be 1"
         );
         assert!(prepared.attn_meta.is_prefill[0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // set_prefill_continuation — running multi-chunk prefill
+    // -----------------------------------------------------------------------
+
+    /// Verify that set_prefill_continuation re-arms a decode slot for prefill.
+    /// Simulates a running request whose prompt spans two scheduler chunks.
+    #[test]
+    fn test_set_prefill_continuation_basic() {
+        let mut batch = InputBatch::new();
+        let spec = HashMap::new();
+
+        // Chunk 1: tokens 0..5 of a 10-token prompt.
+        batch.add_request("r1".into(), &[0, 1, 2, 3, 4], vec![0], 0);
+        let p1 = batch.prepare_inputs(&spec);
+        assert_eq!(p1.req_inputs[0].token_count, 5);
+        assert!(p1.attn_meta.is_prefill[0]);
+        batch.commit_step("r1", &[99], 5, false);
+        assert_eq!(batch.tokens_in_pool_for("r1"), 5);
+
+        // After commit, slot is in decode mode.
+        let p_dec = batch.prepare_inputs(&spec);
+        assert!(!p_dec.attn_meta.is_prefill[0]);
+        assert_eq!(p_dec.attn_meta.q_lens[0], 1); // decode: 1 token
+
+        // Scheduler sends chunk 2: tokens 5..10.
+        batch.set_prefill_continuation("r1", vec![5, 6, 7, 8, 9], 5);
+
+        // Now prepare_inputs must emit the full 5-token chunk as prefill.
+        let p2 = batch.prepare_inputs(&spec);
+        assert!(
+            p2.attn_meta.is_prefill[0],
+            "must be prefill after continuation"
+        );
+        assert_eq!(p2.req_inputs[0].token_count, 5);
+        assert_eq!(p2.attn_meta.seq_lens[0], 5 + 5); // tokens_in_pool + chunk
+        // Positions: 5, 6, 7, 8, 9.
+        assert_eq!(p2.attn_meta.query_start_loc[0], 0);
+    }
+
+    /// Verify tokens_in_pool, positions, and seq_lens after two-chunk prefill
+    /// followed by a decode step.
+    #[test]
+    fn test_set_prefill_continuation_then_decode() {
+        let mut batch = InputBatch::new();
+        let spec = HashMap::new();
+
+        // Chunk 1: tokens 0..4.
+        batch.add_request("r1".into(), &[10, 20, 30, 40], vec![0], 0);
+        let _ = batch.prepare_inputs(&spec);
+        batch.commit_step("r1", &[50], 4, false); // tokens_in_pool = 4
+
+        // Chunk 2: tokens 4..8.
+        batch.set_prefill_continuation("r1", vec![50, 60, 70, 80], 4);
+        let p2 = batch.prepare_inputs(&spec);
+        assert_eq!(p2.req_inputs[0].token_count, 4);
+        assert_eq!(p2.attn_meta.seq_lens[0], 8);
+        batch.commit_step("r1", &[90], 4, false); // tokens_in_pool = 8
+
+        // Now in decode mode — emit one token at position 8.
+        let pd = batch.prepare_inputs(&spec);
+        assert!(!pd.attn_meta.is_prefill[0]);
+        assert_eq!(pd.attn_meta.q_lens[0], 1);
+        assert_eq!(pd.attn_meta.seq_lens[0], 9); // tokens_in_pool + 1
+    }
+
+    /// Verify slot_mapping validity invariant: seq_lens ≤ blocks * block_size.
+    #[test]
+    fn test_set_prefill_continuation_slot_mapping_invariant() {
+        let block_size = 4usize;
+        let mut batch = InputBatch::new();
+        let spec = HashMap::new();
+
+        // 2 blocks, 8 token capacity.  Chunk 1: tokens 0..4 (1 block).
+        batch.add_request("r1".into(), &[0, 1, 2, 3], vec![0], 0);
+        let _ = batch.prepare_inputs(&spec);
+        batch.commit_step("r1", &[99], 4, false);
+
+        // Chunk 2: tokens 4..8 (block 1 appended).
+        batch.update_blocks("r1", vec![0, 1]);
+        batch.set_prefill_continuation("r1", vec![4, 5, 6, 7], 4);
+        let p2 = batch.prepare_inputs(&spec);
+        // seq_lens = 4 + 4 = 8.  Blocks cover 8 tokens.  No -1 slot.
+        assert_eq!(p2.attn_meta.seq_lens[0], 8);
+        assert!(
+            p2.attn_meta.seq_lens[0] <= p2.attn_meta.block_ids[0].len() * block_size,
+            "seq_lens must not exceed block capacity"
+        );
     }
 }

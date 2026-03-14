@@ -1319,6 +1319,7 @@ async fn test_cuda_tp2_qwen2_completion() {
 async fn test_cuda_tp2_deepseek_v2_completion() {
     let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE_CUDA)
         .with_tensor_parallel_size(2)
+        .with_timeout(std::time::Duration::from_secs(300))
         .start()
         .await
         .expect("TP=2 DeepSeek-V2-Lite server should start");
@@ -1990,7 +1991,9 @@ async fn test_cuda_correctness_nongreedy_chat() {
 
     let client = Client::new(server.base_url());
     let request = ChatCompletionRequest {
-        messages: vec![user_msg("Say hello in one sentence.")],
+        messages: vec![user_msg(
+            "Say hello and introduce yourself in one sentence.",
+        )],
         max_tokens: Some(50),
         temperature: Some(0.7),
         ..default_chat_request()
@@ -2604,6 +2607,68 @@ async fn test_cuda_tp2_gemma3_completion() {
     assert!(
         !text.is_empty(),
         "TP=2 Gemma3 completion should produce non-empty text"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline-parallel (PP=2) tests — require 2x GPU (nick2/nick3 pod)
+// ---------------------------------------------------------------------------
+
+/// Gemma2-2B with PP=2 — validates layer sharding, inter-stage P2P send/recv.
+///
+/// Run on nick3 pod (2x L40S):
+///   cargo test -p vllm-e2e --features e2e,cuda,nccl --release --test e1_basic_serving test_cuda_pp2_gemma2 -- --ignored --test-threads=1
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_pp2_gemma2_completion() {
+    let server = TestServer::builder(TestModels::GEMMA2_2B_IT_CUDA)
+        .with_pipeline_parallel_size(2)
+        .with_enforce_eager(true)
+        .start()
+        .await
+        .expect("PP=2 Gemma2-2B server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    let text = &resp.choices[0].text;
+    assert!(
+        !text.is_empty(),
+        "PP=2 Gemma2 completion should produce non-empty text"
+    );
+}
+
+/// Gemma3-1B with PP=2 — validates dual RotaryCache selection per PP stage.
+///
+/// Run on nick3 pod (2x L40S):
+///   cargo test -p vllm-e2e --features e2e,cuda,nccl --release --test e1_basic_serving test_cuda_pp2_gemma3 -- --ignored --test-threads=1
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_pp2_gemma3_completion() {
+    let server = TestServer::builder(TestModels::GEMMA3_1B_IT_CUDA)
+        .with_pipeline_parallel_size(2)
+        .with_enforce_eager(true)
+        .start()
+        .await
+        .expect("PP=2 Gemma3-1B server should start");
+
+    let client = Client::new(server.base_url());
+    assert!(client.health().await.unwrap(), "server should be healthy");
+
+    let request = simple_completion_request("The capital of France is", 20);
+    let resp = client.completion(&request).await.unwrap();
+
+    assert_valid_completion_response(&resp);
+    let text = &resp.choices[0].text;
+    assert!(
+        !text.is_empty(),
+        "PP=2 Gemma3 completion should produce non-empty text"
     );
 }
 

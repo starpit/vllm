@@ -761,6 +761,38 @@ impl CudaModel {
                     last_token_indices,
                 )
             },
+            Self::Gemma2(m) => unsafe {
+                m.forward_pp(
+                    input_ids,
+                    intermediate,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
+            Self::Gemma3(m) => unsafe {
+                m.forward_pp(
+                    input_ids,
+                    intermediate,
+                    positions,
+                    slot_mapping,
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    kv_cache,
+                    device,
+                    last_token_indices,
+                )
+            },
             _ => panic!(
                 "Pipeline parallelism not yet supported for {:?}",
                 std::mem::discriminant(self)
@@ -3651,6 +3683,23 @@ impl Worker for CudaWorker {
                         &qconfig,
                         device,
                     )
+                } else if use_tp && use_pp {
+                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_tp_pp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        tp,
+                        pp_config.unwrap(),
+                        device,
+                    )
+                } else if use_pp {
+                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_pp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        pp_config.unwrap(),
+                        device,
+                    )
                 } else if use_tp {
                     vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_tp(
                         &mut weights,
@@ -3691,7 +3740,24 @@ impl Worker for CudaWorker {
                 if arch == "Gemma3ForConditionalGeneration" {
                     weights.strip_prefix("language_model.");
                 }
-                let m = if use_tp {
+                let m = if use_tp && use_pp {
+                    vllm_cuda::model::gemma3::Gemma3ForCausalLM::load_tp_pp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        tp,
+                        pp_config.unwrap(),
+                        device,
+                    )
+                } else if use_pp {
+                    vllm_cuda::model::gemma3::Gemma3ForCausalLM::load_pp(
+                        &mut weights,
+                        &config,
+                        dtype,
+                        pp_config.unwrap(),
+                        device,
+                    )
+                } else if use_tp {
                     vllm_cuda::model::gemma3::Gemma3ForCausalLM::load_tp(
                         &mut weights,
                         &config,

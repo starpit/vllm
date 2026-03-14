@@ -60,6 +60,7 @@ impl TestServer {
             disable_async_scheduling: false,
             runner: "generate".to_string(),
             tensor_parallel_size: 1,
+            pipeline_parallel_size: 1,
             dtype: None,
             device: None,
             spawn: should_spawn(),
@@ -113,6 +114,7 @@ pub struct TestServerBuilder {
     dtype: Option<String>,
     device: Option<String>,
     tensor_parallel_size: usize,
+    pipeline_parallel_size: usize,
     spawn: bool,
     enforce_eager: Option<bool>,
 }
@@ -180,6 +182,12 @@ impl TestServerBuilder {
         self
     }
 
+    /// Set the pipeline parallel size (number of pipeline stages).
+    pub fn with_pipeline_parallel_size(mut self, pp: usize) -> Self {
+        self.pipeline_parallel_size = pp;
+        self
+    }
+
     /// Override the weight dtype (e.g. "f32", "f16", "bf16").
     pub fn with_dtype(mut self, dtype: &str) -> Self {
         self.dtype = Some(dtype.to_string());
@@ -244,6 +252,11 @@ impl TestServerBuilder {
         if self.tensor_parallel_size > 1 {
             cmd.arg("--tensor-parallel-size")
                 .arg(self.tensor_parallel_size.to_string());
+        }
+
+        if self.pipeline_parallel_size > 1 {
+            cmd.arg("--pipeline-parallel-size")
+                .arg(self.pipeline_parallel_size.to_string());
         }
 
         if let Some(ref parser) = self.tool_call_parser {
@@ -344,6 +357,7 @@ impl TestServerBuilder {
             lora_adapter: self.lora_adapter.clone(),
             pooling_strategy,
             tensor_parallel_size: self.tensor_parallel_size,
+            pipeline_parallel_size: self.pipeline_parallel_size,
             disable_async_scheduling: self.disable_async_scheduling,
             runner: runner.clone(),
             ..Default::default()

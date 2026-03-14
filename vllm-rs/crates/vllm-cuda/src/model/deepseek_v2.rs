@@ -1377,13 +1377,13 @@ impl DeepSeekV2ForCausalLM {
         for layer in &mut self.model.layers {
             layer.self_attn.tp_group = Some(Arc::clone(&group));
             match &mut layer.mlp {
-                DeepSeekV2Mlp::MoE(ref mut moe) => {
+                DeepSeekV2Mlp::MoE(moe) => {
                     moe.moe.tp_group = Some(Arc::clone(&group));
                 }
-                DeepSeekV2Mlp::Dense(ref mut mlp) => {
+                DeepSeekV2Mlp::Dense(mlp) => {
                     mlp.tp_group = Some(Arc::clone(&group));
                 }
-                DeepSeekV2Mlp::Fp8MoE(ref mut moe) => {
+                DeepSeekV2Mlp::Fp8MoE(moe) => {
                     moe.moe.tp_group = Some(Arc::clone(&group));
                 }
             }

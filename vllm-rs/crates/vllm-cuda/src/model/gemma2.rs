@@ -21,9 +21,10 @@ use crate::kernels;
 
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Embedding, Linear, LinearLayer, RmsNorm};
-use crate::model::llama::RotaryCache;
+use crate::model::llama::{ForwardOutput, RotaryCache};
 #[cfg(feature = "nccl")]
 use crate::nccl::NcclGroup;
+use crate::pp::PpConfig;
 use crate::quant::QuantConfig;
 use crate::tensor::GpuTensor;
 use crate::weights::{self as gpu_weights, GpuWeights};
@@ -1504,6 +1505,8 @@ pub struct Gemma2ForCausalLM {
     final_logit_softcapping: Option<f32>,
     #[cfg(feature = "nccl")]
     pub tp_group: Option<Arc<NcclGroup>>,
+    /// Pipeline parallelism config. None = single GPU / PP=1.
+    pub pp_config: Option<PpConfig>,
 }
 
 impl Gemma2ForCausalLM {
@@ -1524,6 +1527,7 @@ impl Gemma2ForCausalLM {
             final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
             #[cfg(feature = "nccl")]
             tp_group: None,
+            pp_config: None,
         })
     }
 
@@ -1586,6 +1590,7 @@ impl Gemma2ForCausalLM {
             final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
             #[cfg(feature = "nccl")]
             tp_group: None,
+            pp_config: None,
         })
     }
 
@@ -1670,6 +1675,7 @@ impl Gemma2ForCausalLM {
             final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
             #[cfg(feature = "nccl")]
             tp_group: None,
+            pp_config: None,
         })
     }
 
@@ -1727,6 +1733,7 @@ impl Gemma2ForCausalLM {
             final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
             #[cfg(feature = "nccl")]
             tp_group: None,
+            pp_config: None,
         })
     }
 
@@ -2127,6 +2134,379 @@ impl Gemma2ForCausalLM {
             final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
             #[cfg(feature = "nccl")]
             tp_group: None,
+            pp_config: None,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline-parallel loading and forward pass
+// ---------------------------------------------------------------------------
+
+impl Gemma2Model {
+    /// Load backbone with PP layer sharding (no TP).
+    pub fn load_pp(
+        weights: &mut GpuWeights,
+        config: &Gemma2Config,
+        dtype: DType,
+        pp: PpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = if pp.is_first_stage() {
+            Embedding::load(weights, "model.embed_tokens")?
+        } else {
+            // Dummy 1-element embedding. Never used — non-first stages receive
+            // intermediate hidden states instead of input_ids.
+            let w = unsafe {
+                let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                GpuTensor::new(ptr, &[1, 1], dtype)
+            };
+            Embedding::new(w)
+        };
+
+        let mut layers = Vec::with_capacity(pp.num_layers());
+        for i in pp.start_layer..pp.end_layer {
+            let local_idx = i - pp.start_layer;
+            let is_sliding = i < config.layer_is_sliding.len() && config.layer_is_sliding[i];
+            let layer = Gemma2DecoderLayer::load(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                local_idx,
+                is_sliding,
+                dtype,
+                device,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = if pp.is_last_stage() {
+            GemmaRmsNorm::load(weights, "model.norm", config.rms_norm_eps, dtype, device)?
+        } else {
+            // Dummy norm — never used on non-last stages.
+            let w = unsafe {
+                let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                GpuTensor::new(ptr, &[1], dtype)
+            };
+            GemmaRmsNorm {
+                inner: RmsNorm::new(w, config.rms_norm_eps),
+            }
+        };
+
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embed_scale: (config.hidden_size as f32).sqrt(),
+        })
+    }
+
+    /// Load backbone with TP + PP sharding.
+    pub fn load_tp_pp(
+        weights: &mut GpuWeights,
+        config: &Gemma2Config,
+        dtype: DType,
+        tp: TpConfig,
+        pp: PpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = if pp.is_first_stage() {
+            Embedding::load(weights, "model.embed_tokens")?
+        } else {
+            let w = unsafe {
+                let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                GpuTensor::new(ptr, &[1, 1], dtype)
+            };
+            Embedding::new(w)
+        };
+
+        let mut layers = Vec::with_capacity(pp.num_layers());
+        for i in pp.start_layer..pp.end_layer {
+            let local_idx = i - pp.start_layer;
+            let is_sliding = i < config.layer_is_sliding.len() && config.layer_is_sliding[i];
+            let layer = Gemma2DecoderLayer::load_tp(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                local_idx,
+                is_sliding,
+                tp,
+                dtype,
+                device,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = if pp.is_last_stage() {
+            GemmaRmsNorm::load(weights, "model.norm", config.rms_norm_eps, dtype, device)?
+        } else {
+            let w = unsafe {
+                let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                GpuTensor::new(ptr, &[1], dtype)
+            };
+            GemmaRmsNorm {
+                inner: RmsNorm::new(w, config.rms_norm_eps),
+            }
+        };
+
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embed_scale: (config.hidden_size as f32).sqrt(),
+        })
+    }
+
+    /// PP-aware forward:
+    /// - First stage: embed input_ids + scale, run layers, return (hs, residual).
+    /// - Middle stages: take (hs, residual), run layers, return (hs, residual).
+    /// - Last stage: take (hs, residual), run layers + final norm, return logits tensor.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_pp(
+        &self,
+        pp: &PpConfig,
+        input_ids: Option<GpuTensor>,
+        intermediate: Option<(OwnedTensor, OwnedTensor)>,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+    ) -> ForwardOutput {
+        let (mut hidden_states, mut residual): (OwnedTensor, Option<OwnedTensor>) =
+            if pp.is_first_stage() {
+                let input_ids = input_ids.expect("first PP stage requires input_ids");
+                let hs = kernels::embedding_gather(
+                    self.embed_tokens.weight,
+                    input_ids,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                kernels::scale_inplace(hs.as_gpu_tensor(), self.embed_scale, &device.cublas);
+                (hs, None)
+            } else {
+                let (hs, res) = intermediate.expect("non-first PP stage requires intermediate");
+                (hs, Some(res))
+            };
+
+        for layer in &self.layers {
+            let (hs, res) = layer.forward_owned(
+                hidden_states,
+                residual,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                kv_cache,
+                &self.rotary,
+                device,
+            );
+            hidden_states = hs;
+            residual = Some(res);
+        }
+
+        if pp.is_last_stage() {
+            let hs_gpu = *hidden_states;
+            let res_gpu = residual.as_ref().unwrap().as_gpu_tensor();
+            kernels::fused_add_rms_norm_inplace(
+                hs_gpu,
+                res_gpu,
+                self.norm.inner.weight,
+                self.norm.inner.eps,
+                device.compute_stream,
+            );
+            drop(residual);
+            ForwardOutput::Logits(hidden_states.into_gpu_tensor())
+        } else {
+            ForwardOutput::Intermediate {
+                hidden_states,
+                residual: residual.unwrap(),
+            }
+        }
+    }
+}
+
+impl Gemma2ForCausalLM {
+    /// Load with PP (no TP).
+    pub fn load_pp(
+        weights: &mut GpuWeights,
+        config: &Gemma2Config,
+        dtype: DType,
+        pp: PpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = Gemma2Model::load_pp(weights, config, dtype, pp, device)?;
+
+        // Gemma2 always uses tied embeddings — embed_tokens weight IS lm_head.
+        // On the last stage, if it is also the first stage, model.embed_tokens was
+        // loaded already. If it's NOT the first stage (PP=2+), embed_tokens is a
+        // dummy [1,1] tensor — load the weight separately from disk.
+        let lm_head = if pp.is_last_stage() {
+            if pp.is_first_stage() {
+                Linear::new(model.embed_tokens.weight, None)
+            } else {
+                let embed_w = weights.take("model.embed_tokens.weight")?;
+                Linear::new(embed_w, None)
+            }
+        } else {
+            let w = unsafe {
+                let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                GpuTensor::new(ptr, &[1, 1], dtype)
+            };
+            Linear::new(w, None)
+        };
+
+        Ok(Self {
+            model,
+            lm_head,
+            final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+            pp_config: Some(pp),
+        })
+    }
+
+    /// Load with TP + PP.
+    pub fn load_tp_pp(
+        weights: &mut GpuWeights,
+        config: &Gemma2Config,
+        dtype: DType,
+        tp: TpConfig,
+        pp: PpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = Gemma2Model::load_tp_pp(weights, config, dtype, tp, pp, device)?;
+
+        let lm_head = if pp.is_last_stage() {
+            if pp.is_first_stage() {
+                Linear::new(model.embed_tokens.weight, None)
+            } else {
+                let embed_w = weights.take("model.embed_tokens.weight")?;
+                Linear::new(embed_w, None)
+            }
+        } else {
+            let w = unsafe {
+                let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                GpuTensor::new(ptr, &[1, 1], dtype)
+            };
+            Linear::new(w, None)
+        };
+
+        Ok(Self {
+            model,
+            lm_head,
+            final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+            pp_config: Some(pp),
+        })
+    }
+
+    /// PP-aware forward pass.
+    ///
+    /// Returns `ForwardOutput::Logits` on the last stage, or
+    /// `ForwardOutput::Intermediate` on non-last stages.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_pp(
+        &self,
+        input_ids: Option<GpuTensor>,
+        intermediate: Option<(OwnedTensor, OwnedTensor)>,
+        positions: GpuTensor,
+        slot_mapping: GpuTensor,
+        cu_seqlens_q: GpuTensor,
+        seqused_k: GpuTensor,
+        block_table: GpuTensor,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+        last_token_indices: Option<GpuTensor>,
+    ) -> ForwardOutput {
+        let pp = self
+            .pp_config
+            .as_ref()
+            .expect("forward_pp called without pp_config");
+
+        let backbone_out = self.model.forward_pp(
+            pp,
+            input_ids,
+            intermediate,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            device,
+        );
+
+        match backbone_out {
+            ForwardOutput::Intermediate { .. } => backbone_out,
+            ForwardOutput::Logits(hidden_states) => {
+                // Last stage: gather last tokens then lm_head.
+                let hidden_states = if let Some(indices) = last_token_indices {
+                    kernels::embedding_gather(
+                        hidden_states,
+                        indices,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                    .into_gpu_tensor()
+                } else {
+                    hidden_states
+                };
+
+                let logits = self.lm_head.forward_owned(
+                    hidden_states,
+                    &mut device.cublas,
+                    &mut device.caching,
+                );
+                let logits = logits.into_gpu_tensor();
+
+                let _ = self.final_logit_softcapping;
+
+                #[allow(unused_mut)]
+                let mut logits = logits;
+                #[cfg(feature = "nccl")]
+                if let Some(ref group) = self.tp_group {
+                    logits = group.all_gather(logits, &mut device.caching);
+                }
+
+                ForwardOutput::Logits(logits)
+            }
+        }
     }
 }

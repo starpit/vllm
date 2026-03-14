@@ -1,6 +1,6 @@
 # vLLM Feature Parity: Python vs Rust
 
-> Last updated: 2026-03-13
+> Last updated: 2026-03-14
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
@@ -71,7 +71,7 @@
 |---|:---:|:---:|---|
 | Tensor parallelism (TP) — single-node | ✅ | ✅ | CudaWorker: NCCL all-reduce via ThreadPoolExecutor; all dense + MoE archs wired; E2E verified TP=2 Qwen2.5-0.5B + Gemma3-4B on 2x L40S |
 | Tensor parallelism (TP) — multi-node | ✅ | ✅ | TCP control plane + NCCL data plane (mp backend); E2E verified TP=2 Qwen2.5-3B-Instruct across 2x L40S pods |
-| Pipeline parallelism (PP) | ✅ | ⚠️ | LLaMA/Qwen2 PP=2 E2E verified (sync scheduling). TODO: async scheduling token broadcast; CUDA graphs with PP (currently enforce-eager only); PP for Gemma2/Gemma3/CommandR/Mixtral/Qwen2Moe/Qwen3Moe/Qwen3Next/DeepSeekV2 models; TP+PP combined (load_tp_pp exists for LLaMA/Qwen2 but untested); memory profiling uses fixed 512MB estimate instead of real profiling; PP E2E test automation; GGUF/quantized PP |
+| Pipeline parallelism (PP) | ✅ | ⚠️ | LLaMA/Qwen2/Gemma2/Gemma3 PP=2 E2E verified (sync scheduling). TODO: async scheduling token broadcast; CUDA graphs with PP (currently enforce-eager only); PP for CommandR/Mixtral/Qwen2Moe/Qwen3Moe/Qwen3Next/DeepSeekV2 models; TP+PP combined (load_tp_pp exists for LLaMA/Qwen2/Gemma2/Gemma3 but untested E2E); memory profiling uses fixed 512MB estimate instead of real profiling; GGUF/quantized PP |
 | Data parallelism (DP) | ✅ | ❌ |  |
 | Expert parallelism (EP) for MoE | ✅ | ❌ | Needed for MoE models where experts are split across GPUs |
 | NCCL custom all-reduce | ✅ | ❌ |  |

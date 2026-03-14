@@ -234,21 +234,6 @@ impl SimpleBlockTracker {
         }
         self.ref_cnt[block_id] += 1;
     }
-
-    /// Free blocks: decrement ref_cnt for each block. Blocks whose ref_cnt
-    /// drops to 0 are appended to the free queue.
-    ///
-    /// Matches Python's `BlockPool.free_blocks()`.
-    fn free_blocks(&mut self, block_ids: &[usize]) {
-        for &bid in block_ids {
-            debug_assert!(self.ref_cnt[bid] > 0, "double-free of block {bid}");
-            self.ref_cnt[bid] -= 1;
-            if self.ref_cnt[bid] == 0 {
-                self.num_free_blocks += 1;
-                self.free_queue.push_back(bid);
-            }
-        }
-    }
 }
 
 impl KVCacheManagerOps for SimpleBlockTracker {
@@ -398,11 +383,17 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             // free queue first and are evicted first, while prefix blocks
             // survive longest. Matches Python's `reversed(req_blocks)`.
             //
-            // Uses free_blocks() which decrements ref_cnt and only adds to
-            // free queue when ref_cnt drops to 0 (shared blocks stay allocated).
+            // Decrements ref_cnt and only adds to the free queue when
+            // ref_cnt drops to 0 (shared blocks stay allocated).
             for group in &block_ids_groups {
-                let reversed: Vec<usize> = group.iter().rev().copied().collect();
-                self.free_blocks(&reversed);
+                for &bid in group.iter().rev() {
+                    debug_assert!(self.ref_cnt[bid] > 0, "double-free of block {bid}");
+                    self.ref_cnt[bid] -= 1;
+                    if self.ref_cnt[bid] == 0 {
+                        self.num_free_blocks += 1;
+                        self.free_queue.push_back(bid);
+                    }
+                }
             }
         }
     }
@@ -636,7 +627,9 @@ impl Scheduler {
     ///
     /// After `Vec::remove(pos)`, every element at index > pos shifts down by
     /// one.  We fix those up in O(n) — acceptable because removals are rare
-    /// (only on finish / preemption).
+    /// (only on finish / abort by request_id).
+    ///
+    /// For tail removal (preemption), prefer `running_pop_tail()` which is O(1).
     fn running_remove(&mut self, pos: usize) -> Request {
         let req = self.running.remove(pos);
         self.running_req_idx.remove(&req.request_id);
@@ -646,6 +639,15 @@ impl Scheduler {
                 *idx -= 1;
             }
         }
+        req
+    }
+
+    /// Remove the last request from the running queue. O(1).
+    ///
+    /// Used for FCFS preemption which always evicts the tail.
+    fn running_pop_tail(&mut self) -> Request {
+        let req = self.running.pop().expect("running queue is non-empty");
+        self.running_req_idx.remove(&req.request_id);
         req
     }
 
@@ -1010,11 +1012,12 @@ impl SchedulerInterface for Scheduler {
                 }
 
                 // Preempt the last request (lowest priority in FCFS order).
+                // Both branches pop the tail, so use running_pop_tail() — O(1).
                 let preempt_idx = self.running.len() - 1;
                 if preempt_idx == req_index {
                     // The request we're trying to schedule is the last one;
                     // preempt it.
-                    let mut preempted = self.running_remove(preempt_idx);
+                    let mut preempted = self.running_pop_tail();
                     self.preempt_request(&mut preempted);
 
                     // Remove from scheduled lists if it was already scheduled.
@@ -1031,7 +1034,7 @@ impl SchedulerInterface for Scheduler {
                     preempted_reqs.push(preempted);
                     break;
                 } else {
-                    let mut preempted = self.running_remove(preempt_idx);
+                    let mut preempted = self.running_pop_tail();
                     self.preempt_request(&mut preempted);
 
                     // Restore budget if this request was scheduled.
@@ -3048,5 +3051,182 @@ mod tests {
         assert_eq!(cached_tokens, 64);
         assert_eq!(cached_blocks[0].len(), 4);
         assert_eq!(cached_blocks[0], original_block_ids);
+    }
+
+    // ----- running_pop_tail / running_req_idx consistency tests -----
+
+    /// FCFS preemption always evicts the tail request.
+    /// Setup: 2 blocks. r1+r2 fill them. Append 1 decode token each.
+    /// Step 2: r1's decode needs a second block (ceil(17/16)=2), no free blocks
+    /// → preempt r2 (tail). r1 gets r2's block. Only r2 is preempted.
+    #[test]
+    fn test_preemption_evicts_tail_fcfs() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 512,
+            max_num_seqs: 10,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 2, 16);
+
+        sched.add_request(make_request("r1", 16));
+        sched.add_request(make_request("r2", 16));
+        let out1 = sched.schedule();
+        assert_eq!(out1.scheduled_new_reqs.len(), 2);
+
+        sched.append_output_tokens("r1", &[1]);
+        sched.append_output_tokens("r2", &[2]);
+
+        // r3 is a bystander sitting in waiting — should never be touched.
+        sched.add_request(make_request("r3", 16));
+        let out2 = sched.schedule();
+
+        // r2 (tail) must be preempted; r1 and r3 must not be.
+        let preempted = out2
+            .preempted_req_ids
+            .as_ref()
+            .expect("preemption expected");
+        assert!(
+            preempted.contains("r2"),
+            "expected r2 (tail) preempted, got {preempted:?}"
+        );
+        assert!(!preempted.contains("r1"), "r1 should not be preempted");
+        assert!(!preempted.contains("r3"), "r3 was never running");
+
+        let (running, _) = sched.get_request_counts();
+        assert_eq!(running, 1, "only r1 should be running");
+    }
+
+    /// After tail preemption the running_req_idx for the remaining requests
+    /// must still be correct (no stale indices from a skipped O(n) sweep).
+    #[test]
+    fn test_running_req_idx_consistent_after_tail_preemption() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 512,
+            max_num_seqs: 10,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 2, 16);
+
+        sched.add_request(make_request("r1", 16));
+        sched.add_request(make_request("r2", 16));
+        let _out1 = sched.schedule();
+
+        sched.append_output_tokens("r1", &[10]);
+        sched.append_output_tokens("r2", &[20]);
+
+        sched.add_request(make_request("r3", 16));
+        let _out2 = sched.schedule(); // r2 preempted (tail)
+
+        // Finish r1. If running_req_idx has a stale/wrong entry this panics
+        // inside running_remove().
+        sched.finish_requests(&["r1"], RequestStatus::FinishedStopped);
+
+        // r2 (waiting/preempted) + r3 (waiting) remain.
+        assert_eq!(sched.get_num_unfinished_requests(), 2);
+    }
+
+    // ----- block free ordering test -----
+
+    /// When a request's blocks are freed, tail blocks enter the free queue
+    /// first (evicted soonest), preserving prefix blocks longest.
+    /// Use an exact-fit pool (4 blocks, block_size=4) so after freeing the
+    /// queue contains only the freed blocks in the expected order.
+    #[test]
+    fn test_block_free_reverse_order() {
+        // 4 blocks of size 4 — exactly fits a 16-token request.
+        let mut tracker = SimpleBlockTracker::new(4, 4);
+        let req = make_request("r1", 16);
+
+        let alloc = tracker
+            .allocate_slots(&req, 16, 0)
+            .expect("should allocate");
+        let block_ids = alloc[0].clone(); // [0, 1, 2, 3]
+        assert_eq!(block_ids.len(), 4);
+        assert_eq!(tracker.num_free_blocks(), 0);
+
+        tracker.free("r1");
+        assert_eq!(tracker.num_free_blocks(), 4);
+
+        // Allocate all 4 back: they should come out tail-first (block_ids[3]
+        // first) because free() pushes in reverse order.
+        let fresh = tracker.allocate_fresh_blocks(4).expect("allocate 4");
+        assert_eq!(
+            fresh[0], block_ids[3],
+            "tail block (index 3) should be evicted first, got block {}",
+            fresh[0]
+        );
+        assert_eq!(fresh[3], block_ids[0], "head block (index 0) evicted last");
+    }
+
+    /// Preempted requests are prepended to the waiting queue so they are
+    /// re-admitted before newly arrived requests.
+    ///
+    /// Setup: 2 blocks. r1+r2 fill them. Step 2 decode grows r1 beyond 1
+    /// block → r2 (tail) is preempted. r_new arrived while r1/r2 were
+    /// running, so waiting = [r2(preempted), r_new].
+    /// After finishing r1, 2 blocks are freed. r2 needs 2 blocks
+    /// (ceil(17/16)) and gets them both; r_new gets nothing. Confirms r2
+    /// (preempted) is ahead of r_new in the waiting queue.
+    #[test]
+    fn test_preempted_request_returns_to_front_of_waiting() {
+        let cfg = SchedulerConfig {
+            max_num_batched_tokens: 512,
+            max_num_seqs: 10,
+            enable_chunked_prefill: true,
+            ..Default::default()
+        };
+        // 2 blocks of 16 tokens each.
+        let mut sched = Scheduler::with_simple_blocks(&cfg, 8192, 2, 16);
+
+        sched.add_request(make_request("r1", 16));
+        sched.add_request(make_request("r2", 16));
+        // schedule() internally calls update_after_schedule → num_computed = 16.
+        let out1 = sched.schedule();
+        assert_eq!(out1.scheduled_new_reqs.len(), 2);
+
+        // Append 1 decode token: all_token_ids grows to 17, so next step
+        // needs ceil(17/16)=2 blocks → triggers block allocation → preemption.
+        sched.append_output_tokens("r1", &[1]);
+        sched.append_output_tokens("r2", &[2]);
+
+        // r_new arrives while r1/r2 are running.
+        sched.add_request(make_request("r_new", 16));
+
+        // Step 2: r1 decode needs a 2nd block; 0 free → preempt r2 (tail).
+        // r1 gets r2's freed block.
+        let out2 = sched.schedule();
+        let preempted2 = out2
+            .preempted_req_ids
+            .as_ref()
+            .expect("preemption expected");
+        assert!(
+            preempted2.contains("r2"),
+            "r2 should be preempted: {preempted2:?}"
+        );
+        assert!(!preempted2.contains("r1"));
+
+        // waiting = [r2 (preempted, at front), r_new]. 0 free blocks (r1 holds both).
+        // Finish r1 to release its 2 blocks.
+        sched.finish_requests(&["r1"], RequestStatus::FinishedStopped);
+
+        // Step 3: Phase 2 tries r2 first (it was prepended). r2 needs
+        // ceil(17/16)=2 blocks — gets both. r_new gets nothing.
+        let out3 = sched.schedule();
+        let resumed: Vec<&str> = out3
+            .scheduled_cached_reqs
+            .resumed_req_ids
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert!(
+            resumed.contains(&"r2"),
+            "preempted r2 should be re-admitted: {resumed:?}"
+        );
+        assert!(
+            !out3.num_scheduled_tokens.contains_key("r_new"),
+            "r_new should still be waiting (r2 consumed all free blocks)"
+        );
     }
 }

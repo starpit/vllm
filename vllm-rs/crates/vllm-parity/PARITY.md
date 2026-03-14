@@ -4,8 +4,8 @@
 
 | Symbol | Meaning | Count |
 |--------|---------|------:|
-| ✅ 🟦 | Implemented | 161 |
-| ⚠️ 🟨 | Partial | 10 |
+| ✅ 🟦 | Implemented | 160 |
+| ⚠️ 🟨 | Partial | 11 |
 | ❌ 🟥 | Not implemented | 100 |
 | 🚫 | Won't fix | 4 |
 
@@ -32,7 +32,7 @@
 | [Sampling & Decoding](#sampling--decoding) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 | 22 | 0 | 0 |
 | [Structured Output / Guided Decoding](#structured-output--guided-decoding) | 🟦🟦🟦🟦🟦🟦🟦 | 7 | 0 | 0 |
 | [Tool Calling / Function Calling](#tool-calling--function-calling) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥🟥🟥🟥 | 10 | 1 | 6 |
-| [Scheduling](#scheduling) | 🟦🟦🟦🟦🟦🟦 | 6 | 0 | 0 |
+| [Scheduling](#scheduling) | 🟦🟦🟦🟦🟦🟨 | 5 | 1 | 0 |
 | [KV Cache](#kv-cache) | 🟦🟦🟦🟦🟦🟥🟥🟥 | 5 | 0 | 3 |
 | [LoRA & Adapters](#lora--adapters) | 🟦🟦🟥🟥🟥🟥 | 2 | 0 | 4 |
 | [Speculative Decoding](#speculative-decoding) | 🟦🟥🟥🟥🟥🟥 | 1 | 0 | 5 |
@@ -43,7 +43,7 @@
 | [CUDA Compute Kernels](#cuda-compute-kernels) | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟥🟥🟥 | 22 | 1 | 3 |
 | [Observability & Operations](#observability--operations) | 🟦🟦🟦🟦🟦🟦🟦 | 7 | 0 | 0 |
 | [Engine & Architecture](#engine--architecture) | 🟦🟦🟦🟦🟦🟦🟦🟦 | 8 | 0 | 0 |
-| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **161** | **10** | **100** |
+| **Total** | 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥 | **160** | **11** | **100** |
 
 ---
 
@@ -339,7 +339,7 @@
 |---|:---:|:---:|---|
 | Continuous batching | ✅ | ✅ |  |
 | FCFS scheduling policy | ✅ | ✅ |  |
-| Priority scheduling policy | ✅ | ✅ |  |
+| Priority scheduling policy | ✅ | ⚠️ | Waiting queue uses priority heap (correct); preemption victim selection always pops tail (FCFS) instead of picking lowest-priority running request |
 | Chunked prefill | ✅ | ✅ | Default on in both |
 | Prefix caching (APC) | ✅ | ✅ | Hash-based block reuse; default on in both |
 | Async scheduling (overlap GPU/CPU) | ✅ | ✅ |  |

@@ -4878,17 +4878,6 @@ impl CudaWorker {
         self.input_batch
             .remove_finished(&scheduler_output.finished_req_ids);
 
-        // Remove preempted requests from InputBatch (but NOT from token_buffers /
-        // sampling_params_map / seeded_rngs — they will be re-admitted later and
-        // need their state preserved).  Without this the preempted request remains
-        // a zombie in the GPU batch: its freed KV blocks get reused by new requests
-        // while it still writes into them, causing CUDA_ERROR_ILLEGAL_ADDRESS.
-        if let Some(preempted) = &scheduler_output.preempted_req_ids {
-            for req_id in preempted {
-                self.input_batch.remove_request(req_id);
-            }
-        }
-
         // Ensure grammar vocabulary is built if any new request needs it.
         #[cfg(feature = "guided-decoding")]
         {
@@ -4959,9 +4948,6 @@ impl CudaWorker {
         }
 
         // Update cached requests' block tables. Track if any changed.
-        // For resumed requests (returned from preemption) we must re-add them
-        // to InputBatch via add_request rather than update_blocks, because they
-        // were removed above and are no longer present in the batch.
         let mut blocks_changed = !scheduler_output.scheduled_new_reqs.is_empty();
         for (i, req_id) in scheduler_output
             .scheduled_cached_reqs
@@ -4969,42 +4955,14 @@ impl CudaWorker {
             .iter()
             .enumerate()
         {
-            let is_resumed = scheduler_output
-                .scheduled_cached_reqs
-                .resumed_req_ids
-                .contains(req_id);
-
-            let new_block_ids: Vec<usize> = scheduler_output
-                .scheduled_cached_reqs
-                .new_block_ids
-                .get(i)
-                .and_then(|opt| opt.as_ref())
-                .and_then(|groups| groups.first())
-                .cloned()
-                .unwrap_or_default();
-
-            if is_resumed {
-                // Re-add to InputBatch using the preserved token buffer.
-                // num_computed_tokens tells us how many KV entries are valid.
-                let num_computed = scheduler_output
-                    .scheduled_cached_reqs
-                    .num_computed_tokens
-                    .get(i)
-                    .copied()
-                    .unwrap_or(0);
-                let tokens = self
-                    .token_buffers
-                    .get(req_id)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                if !new_block_ids.is_empty() {
+            if let Some(Some(new_blocks)) =
+                scheduler_output.scheduled_cached_reqs.new_block_ids.get(i)
+                && let Some(group0) = new_blocks.first()
+            {
+                if !group0.is_empty() {
                     blocks_changed = true;
                 }
-                self.input_batch
-                    .add_request(req_id.clone(), tokens, new_block_ids, num_computed);
-            } else if !new_block_ids.is_empty() {
-                blocks_changed = true;
-                self.input_batch.update_blocks(req_id, new_block_ids);
+                self.input_batch.update_blocks(req_id, group0.clone());
             }
         }
 
@@ -5176,6 +5134,82 @@ impl CudaWorker {
                     }
                 }
             }
+        }
+
+        // ---------------------------------------------------------------
+        // Preemption/resumption fixup — done AFTER pending_commit resolution
+        // so that token_buffers has the final token from the previous step
+        // before we rebuild the prefill sequence.
+        //
+        // Preempted requests: remove from InputBatch to stop zombie GPU writes
+        // into blocks that have been freed and reallocated.  We keep
+        // token_buffers / sampling_params_map / seeded_rngs so the request
+        // can be cleanly re-admitted.
+        //
+        // Resumed requests: re-add to InputBatch as a fresh prefill using the
+        // complete token sequence (prompt + all output tokens generated so
+        // far).  The pending_commit above has already appended the very last
+        // token to token_buffers, so the sequence is complete.
+        //
+        // Matches Python gpu_model_runner._update_states: unscheduled requests
+        // are removed, resumed requests are re-added via add_request.
+        // ---------------------------------------------------------------
+        if let Some(preempted) = &scheduler_output.preempted_req_ids {
+            for req_id in preempted {
+                self.input_batch.remove_request(req_id);
+            }
+        }
+        for (i, req_id) in scheduler_output
+            .scheduled_cached_reqs
+            .req_ids
+            .iter()
+            .enumerate()
+        {
+            if !scheduler_output
+                .scheduled_cached_reqs
+                .resumed_req_ids
+                .contains(req_id)
+            {
+                continue;
+            }
+            // Re-add the resumed request as a fresh prefill.
+            let new_block_ids: Vec<usize> = scheduler_output
+                .scheduled_cached_reqs
+                .new_block_ids
+                .get(i)
+                .and_then(|opt| opt.as_ref())
+                .and_then(|groups| groups.first())
+                .cloned()
+                .unwrap_or_default();
+            let num_computed = scheduler_output
+                .scheduled_cached_reqs
+                .num_computed_tokens
+                .get(i)
+                .copied()
+                .unwrap_or(0);
+            // Truncate to the scheduled chunk: scheduler allocated blocks for
+            // exactly `num_scheduled_tokens` tokens starting from `num_computed`.
+            // Passing the full token_buffers (prompt + all outputs) would give
+            // seq_lens > available blocks → slot_mapping = -1 → GPU fault.
+            // This mirrors the new-request chunked-prefill logic (lines ~4906-4908).
+            let num_scheduled = scheduler_output
+                .num_scheduled_tokens
+                .get(req_id)
+                .copied()
+                .unwrap_or(0);
+            let tokens: Vec<u32> = self
+                .token_buffers
+                .get(req_id)
+                .map(|buf| {
+                    let start = num_computed as usize;
+                    let end = (start + num_scheduled).min(buf.len());
+                    buf[start..end].to_vec()
+                })
+                .unwrap_or_default();
+            // Remove the old (zombie) slot first, then re-add as prefill.
+            self.input_batch.remove_request(req_id);
+            self.input_batch
+                .add_request(req_id.clone(), &tokens, new_block_ids, num_computed);
         }
 
         // Prepare flat inputs from InputBatch.

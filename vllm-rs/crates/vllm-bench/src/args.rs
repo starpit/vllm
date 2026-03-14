@@ -107,10 +107,14 @@ pub struct BenchLatencyArgs {
     #[arg(long, default_value_t = 1)]
     pub tensor_parallel_size: usize,
 
-    /// Enable prefix caching (KV cache reuse for shared prompt prefixes).
-    /// Disabled by default for benchmarking — prefix caching skews latency
-    /// because repeated prompts get cache hits.
+    /// Disable prefix caching (KV cache reuse for shared prompt prefixes).
+    /// Prefix caching is enabled by default, matching Python vLLM.
     #[arg(long)]
+    pub no_prefix_caching: bool,
+
+    /// Enable prefix caching (kept for compatibility; prefix caching is
+    /// already enabled by default). Use --no-prefix-caching to disable.
+    #[arg(long, hide = true)]
     pub enable_prefix_caching: bool,
 
     /// Specific GGUF filename to download from a HuggingFace repo.
@@ -255,9 +259,9 @@ pub struct BenchThroughputArgs {
     #[arg(long, default_value = "auto")]
     pub cuda_graph_sizes: String,
 
-    /// Enable prefix caching.
+    /// Disable prefix caching.
     #[arg(long)]
-    pub enable_prefix_caching: bool,
+    pub no_prefix_caching: bool,
 
     /// Random seed for prompt generation.
     #[arg(long, default_value_t = 0)]
@@ -471,9 +475,9 @@ pub struct BenchStartupArgs {
     #[arg(long, default_value_t = 1)]
     pub tensor_parallel_size: usize,
 
-    /// Enable prefix caching.
+    /// Disable prefix caching.
     #[arg(long)]
-    pub enable_prefix_caching: bool,
+    pub no_prefix_caching: bool,
 
     /// Specific GGUF filename to download from a HuggingFace repo.
     #[arg(long)]

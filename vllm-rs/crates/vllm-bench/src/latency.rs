@@ -26,7 +26,7 @@ fn create_llm(args: &BenchLatencyArgs, model: &str) -> Result<LLM> {
         .max_num_seqs(args.max_num_seqs)
         .block_size(args.block_size)
         .tensor_parallel_size(args.tensor_parallel_size)
-        .enable_prefix_caching(args.enable_prefix_caching)
+        .enable_prefix_caching(!args.no_prefix_caching)
         .enforce_eager(args.enforce_eager);
 
     // Default max_num_batched_tokens to cover the full batch prefill in one

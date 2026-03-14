@@ -87,32 +87,63 @@ pub trait KVCacheManagerOps: Send {
 // SimpleBlockTracker -- a minimal KV cache manager for initial bring-up
 // ---------------------------------------------------------------------------
 
-/// A minimal block tracker that satisfies [`KVCacheManagerOps`].
+/// A block tracker that satisfies [`KVCacheManagerOps`].
 ///
-/// Uses a free list of block IDs (0..total_blocks) that are recycled when
-/// freed. Optionally supports prefix caching: when `enable_caching` is
-/// true, freed full blocks are retained in a hash-indexed cache so that
-/// subsequent requests with the same prompt prefix can reuse them.
+/// Full Python parity with `vllm/v1/core/block_pool.py`:
+///
+/// - **Reference counting**: Each block has a `ref_cnt`. Multiple requests
+///   sharing a cached prefix share the same block (ref_cnt > 1).
+/// - **Free queue**: Doubly-linked list emulated via `VecDeque`. Blocks enter
+///   the free queue only when ref_cnt drops to 0. Stale entries (blocks
+///   reclaimed via `touch()`) are skipped lazily on pop.
+/// - **Lazy eviction**: Hash→block mappings persist after `free()` and are
+///   only removed when the block is popped from the free queue for a new
+///   allocation (`_maybe_evict_cached_block`).
+/// - **`touch()`**: Increments ref_cnt. If ref_cnt was 0 (block in free queue),
+///   the block is logically removed from the free queue (stale entry skipped
+///   lazily).
+/// - **`free_blocks()`**: Decrements ref_cnt. Blocks with ref_cnt == 0 are
+///   appended to the free queue.
+/// - Blocks are freed in reverse order so tail (decode) blocks are evicted
+///   first and prefix blocks survive longest (matching Python's
+///   `reversed(req_blocks)` in `SingleTypeKVCacheManager.free()`).
 pub struct SimpleBlockTracker {
     total_blocks: usize,
     block_size: usize,
-    /// Free block IDs available for allocation (recycled on free).
-    free_list: VecDeque<usize>,
+
+    /// Per-block reference count. ref_cnt > 0 means allocated (possibly shared).
+    /// ref_cnt == 0 means in free queue (eviction candidate).
+    /// Matches Python's `KVCacheBlock.ref_cnt`.
+    ref_cnt: Vec<usize>,
+
+    /// Number of blocks with ref_cnt == 0. Maintained incrementally to avoid
+    /// O(n) scans.
+    num_free_blocks: usize,
+
+    /// Eviction queue: blocks with ref_cnt == 0. Pop from front (LRU).
+    /// May contain stale entries (blocks whose ref_cnt > 0 due to `touch()`);
+    /// these are skipped during `allocate_fresh_blocks`.
+    free_queue: VecDeque<usize>,
+
     /// request_id -> (block_ids, num_blocks_held)
     allocations: HashMap<String, (Vec<Vec<usize>>, usize)>,
 
     // --- Prefix caching fields ---
     /// Whether prefix caching is enabled.
     enable_caching: bool,
+
     /// Hash of a full block's token content → block ID.
-    /// Only full blocks (block_size tokens) are cached.
+    /// Persists after free(). Only removed when the block is popped
+    /// from the free queue and given to a new allocation
+    /// (lazy eviction, matching Python's `_maybe_evict_cached_block`).
     block_hash_to_id: HashMap<u64, usize>,
-    /// Request ID → ordered list of block hashes (for cleanup on free).
+
+    /// Reverse mapping: block ID → hash. For O(1) hash cleanup when
+    /// a block is evicted during allocation.
+    block_id_to_hash: HashMap<usize, u64>,
+
+    /// Request ID → ordered list of block hashes.
     req_to_hashes: HashMap<String, Vec<u64>>,
-    /// Block IDs that are freed but retained for cache reuse (evicted FIFO).
-    cached_block_ids: VecDeque<usize>,
-    /// Number of cached (retained) blocks.
-    num_cached_blocks: usize,
 }
 
 impl SimpleBlockTracker {
@@ -122,13 +153,14 @@ impl SimpleBlockTracker {
         Self {
             total_blocks: num_gpu_blocks,
             block_size,
-            free_list: (0..num_gpu_blocks).collect(),
+            ref_cnt: vec![0; num_gpu_blocks],
+            num_free_blocks: num_gpu_blocks,
+            free_queue: (0..num_gpu_blocks).collect(),
             allocations: HashMap::new(),
             enable_caching: false,
             block_hash_to_id: HashMap::new(),
+            block_id_to_hash: HashMap::new(),
             req_to_hashes: HashMap::new(),
-            cached_block_ids: VecDeque::new(),
-            num_cached_blocks: 0,
         }
     }
 
@@ -137,11 +169,6 @@ impl SimpleBlockTracker {
         let mut tracker = Self::new(num_gpu_blocks, block_size);
         tracker.enable_caching = true;
         tracker
-    }
-
-    /// Number of blocks currently retained in the prefix cache.
-    pub fn num_cached_blocks(&self) -> usize {
-        self.num_cached_blocks
     }
 
     /// Compute how many blocks a request needs for the given number of tokens.
@@ -159,40 +186,68 @@ impl SimpleBlockTracker {
         hasher.finish()
     }
 
-    /// Evict one cached block to make room for a new allocation.
-    /// Returns true if a block was evicted, false if cache is empty.
-    fn evict_one_cached_block(&mut self) -> bool {
-        if let Some(block_id) = self.cached_block_ids.pop_front() {
-            // Remove from hash map (find the hash that maps to this block).
-            self.block_hash_to_id.retain(|_, &mut bid| bid != block_id);
-            self.num_cached_blocks -= 1;
-            // Recycle the block ID back to the free list.
-            self.free_list.push_back(block_id);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Try to allocate `count` block IDs, evicting cached blocks if needed.
-    /// Returns recycled IDs from the free list (bounded by total_blocks).
+    /// Try to allocate `count` fresh block IDs from the free queue.
+    ///
+    /// Pops blocks from the front of `free_queue`, skipping stale entries
+    /// (blocks with ref_cnt > 0, already reclaimed via `touch()`). When a
+    /// popped block has a hash mapping, the mapping is removed (lazy eviction
+    /// matching Python's `_maybe_evict_cached_block`).
     fn allocate_fresh_blocks(&mut self, count: usize) -> Option<Vec<usize>> {
-        // Evict cached blocks as needed to make room.
-        while self.free_list.len() < count {
-            if !self.evict_one_cached_block() {
-                return None; // truly out of blocks
-            }
+        if self.num_free_blocks < count {
+            return None;
         }
 
         let mut ids = Vec::with_capacity(count);
-        for _ in 0..count {
-            let id = self
-                .free_list
-                .pop_front()
-                .expect("free_list not empty after check");
-            ids.push(id);
+        while ids.len() < count {
+            let block_id = self.free_queue.pop_front()?;
+
+            // Skip stale entries: blocks reclaimed via touch() have ref_cnt > 0.
+            if self.ref_cnt[block_id] > 0 {
+                continue;
+            }
+
+            // Set ref_cnt to 1 (allocated).
+            self.ref_cnt[block_id] = 1;
+            self.num_free_blocks -= 1;
+
+            // Lazy eviction: remove hash mapping if this block was cached.
+            // Matches Python's `_maybe_evict_cached_block`.
+            if let Some(hash) = self.block_id_to_hash.remove(&block_id) {
+                self.block_hash_to_id.remove(&hash);
+            }
+
+            ids.push(block_id);
         }
         Some(ids)
+    }
+
+    /// Touch a block: increment ref_cnt. If ref_cnt was 0 (block in free
+    /// queue), the block is logically removed — the stale entry in
+    /// `free_queue` is skipped lazily on the next `allocate_fresh_blocks`.
+    ///
+    /// Matches Python's `BlockPool.touch()`.
+    fn touch_block(&mut self, block_id: usize) {
+        if self.ref_cnt[block_id] == 0 {
+            // Block was free, now allocated — decrement free count.
+            // The stale free_queue entry will be skipped lazily.
+            self.num_free_blocks -= 1;
+        }
+        self.ref_cnt[block_id] += 1;
+    }
+
+    /// Free blocks: decrement ref_cnt for each block. Blocks whose ref_cnt
+    /// drops to 0 are appended to the free queue.
+    ///
+    /// Matches Python's `BlockPool.free_blocks()`.
+    fn free_blocks(&mut self, block_ids: &[usize]) {
+        for &bid in block_ids {
+            debug_assert!(self.ref_cnt[bid] > 0, "double-free of block {bid}");
+            self.ref_cnt[bid] -= 1;
+            if self.ref_cnt[bid] == 0 {
+                self.num_free_blocks += 1;
+                self.free_queue.push_back(bid);
+            }
+        }
     }
 }
 
@@ -214,26 +269,23 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             .map(|(_, n)| *n)
             .unwrap_or(0);
 
-        // If this is a new request with cached prefix, seed the allocation
-        // with the cached block IDs (they're already populated with KV data).
+        // If this is a new/re-admitted request with cached prefix, seed the
+        // allocation with the cached block IDs (they still hold KV data).
+        // Touch each cached block to increment ref_cnt (block sharing).
         if currently_held == 0 && self.enable_caching && request.num_computed_tokens > 0 {
             let num_cached_blocks = request.num_computed_tokens as usize / self.block_size;
             if num_cached_blocks > 0 {
-                // Look up cached blocks from the prompt hashes.
-                let prompt = &request.prompt_token_ids;
+                let all_tokens = &request.all_token_ids;
                 let mut cached_ids = Vec::new();
                 let mut hashes = Vec::new();
                 for i in 0..num_cached_blocks {
                     let start = i * self.block_size;
                     let end = start + self.block_size;
-                    if end <= prompt.len() {
-                        let hash = Self::hash_block(&prompt[start..end]);
+                    if end <= all_tokens.len() {
+                        let hash = Self::hash_block(&all_tokens[start..end]);
                         if let Some(&bid) = self.block_hash_to_id.get(&hash) {
                             cached_ids.push(bid);
                             hashes.push(hash);
-                            // Remove from the eviction queue (it's now in use).
-                            self.cached_block_ids.retain(|&id| id != bid);
-                            self.num_cached_blocks = self.num_cached_blocks.saturating_sub(1);
                         } else {
                             break;
                         }
@@ -244,6 +296,26 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                     let cached_count = cached_ids.len();
                     let additional = needed.saturating_sub(cached_count);
 
+                    // Python checks free capacity BEFORE touching cached
+                    // blocks. Touching moves ref_cnt 0→1 which removes
+                    // blocks from the free pool. Count how many cached
+                    // blocks are evictable (ref_cnt==0) — those will be
+                    // "consumed" from the free pool when touched.
+                    // Matches Python's `_get_num_evictable_blocks` +
+                    // `get_num_blocks_to_allocate`.
+                    let num_evictable: usize = cached_ids
+                        .iter()
+                        .filter(|&&bid| self.ref_cnt[bid] == 0)
+                        .count();
+                    if additional + num_evictable > self.num_free_blocks {
+                        return None;
+                    }
+
+                    // Now safe to touch — we verified capacity above.
+                    for &bid in &cached_ids {
+                        self.touch_block(bid);
+                    }
+
                     let fresh_ids = if additional > 0 {
                         self.allocate_fresh_blocks(additional)?
                     } else {
@@ -253,7 +325,6 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                     let mut all_ids = cached_ids;
                     all_ids.extend(fresh_ids);
 
-                    // Record hashes for this request (for cache cleanup on free).
                     self.req_to_hashes
                         .insert(request.request_id.clone(), hashes);
 
@@ -287,21 +358,23 @@ impl KVCacheManagerOps for SimpleBlockTracker {
 
         // When caching is enabled, record block hashes for full blocks.
         if self.enable_caching {
-            let prompt = &request.prompt_token_ids;
+            let all_tokens = &request.all_token_ids;
             let all_block_ids = &entry.0[0];
             let mut hashes = self
                 .req_to_hashes
                 .remove(&request.request_id)
                 .unwrap_or_default();
 
-            // Hash all full blocks that we haven't hashed yet.
+            // Hash all full blocks (prompt + decode) that we haven't hashed yet.
             let num_full_blocks = total_tokens / self.block_size;
             for i in hashes.len()..num_full_blocks {
                 let start = i * self.block_size;
                 let end = start + self.block_size;
-                if end <= prompt.len() && i < all_block_ids.len() {
-                    let hash = Self::hash_block(&prompt[start..end]);
-                    self.block_hash_to_id.insert(hash, all_block_ids[i]);
+                if end <= all_tokens.len() && i < all_block_ids.len() {
+                    let hash = Self::hash_block(&all_tokens[start..end]);
+                    let bid = all_block_ids[i];
+                    self.block_hash_to_id.insert(hash, bid);
+                    self.block_id_to_hash.insert(bid, hash);
                     hashes.push(hash);
                 }
             }
@@ -318,33 +391,18 @@ impl KVCacheManagerOps for SimpleBlockTracker {
 
     fn free(&mut self, request_id: &str) {
         if let Some((block_ids_groups, _num_blocks)) = self.allocations.remove(request_id) {
-            if self.enable_caching {
-                // Check which blocks have associated hashes (full blocks).
-                let hashes = self.req_to_hashes.remove(request_id).unwrap_or_default();
-                let cached_block_set: HashSet<usize> = hashes
-                    .iter()
-                    .filter_map(|h| self.block_hash_to_id.get(h).copied())
-                    .collect();
+            // Remove per-request hash tracking (hashes stay in block_hash_to_id).
+            self.req_to_hashes.remove(request_id);
 
-                // Full cached blocks go to the retained cache; partial blocks
-                // are recycled back to the free list.
-                for group in &block_ids_groups {
-                    for &bid in group {
-                        if cached_block_set.contains(&bid) {
-                            self.cached_block_ids.push_back(bid);
-                            self.num_cached_blocks += 1;
-                        } else {
-                            self.free_list.push_back(bid);
-                        }
-                    }
-                }
-            } else {
-                // No caching — recycle all block IDs to the free list.
-                for group in &block_ids_groups {
-                    for &bid in group {
-                        self.free_list.push_back(bid);
-                    }
-                }
+            // Free blocks in REVERSE order so tail (decode) blocks enter the
+            // free queue first and are evicted first, while prefix blocks
+            // survive longest. Matches Python's `reversed(req_blocks)`.
+            //
+            // Uses free_blocks() which decrements ref_cnt and only adds to
+            // free queue when ref_cnt drops to 0 (shared blocks stay allocated).
+            for group in &block_ids_groups {
+                let reversed: Vec<usize> = group.iter().rev().copied().collect();
+                self.free_blocks(&reversed);
             }
         }
     }
@@ -361,23 +419,28 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             return (0, vec![Vec::new()]);
         }
 
-        // Hash full-block-sized chunks of the prompt and look for cached matches.
-        let prompt = &request.prompt_token_ids;
+        // Hash full-block-sized chunks of all tokens (prompt + decode) and
+        // look for cached matches. A block is a hit if the hash exists in
+        // the cache — it may be in the free queue (ref_cnt==0) or shared
+        // (ref_cnt>0), both are valid cache hits.
+        // Matches Python's `find_longest_cache_hit` which calls
+        // `block_pool.get_cached_block()` — returns block regardless of
+        // whether it's in the free queue.
+        let all_tokens = &request.all_token_ids;
         let mut matched_block_ids = Vec::new();
         let mut num_matched_tokens = 0u32;
 
-        let num_full_blocks = prompt.len() / self.block_size;
+        let num_full_blocks = all_tokens.len() / self.block_size;
         for i in 0..num_full_blocks {
             let start = i * self.block_size;
             let end = start + self.block_size;
-            let chunk = &prompt[start..end];
+            let chunk = &all_tokens[start..end];
             let hash = Self::hash_block(chunk);
 
             if let Some(&block_id) = self.block_hash_to_id.get(&hash) {
                 matched_block_ids.push(block_id);
                 num_matched_tokens += self.block_size as u32;
             } else {
-                // Stop at first miss — prefix caching requires contiguous match.
                 break;
             }
         }
@@ -393,18 +456,14 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         if !self.enable_caching {
             return true;
         }
-        // Recycle all cached block IDs back to the free list.
-        while let Some(bid) = self.cached_block_ids.pop_front() {
-            self.free_list.push_back(bid);
-        }
         self.block_hash_to_id.clear();
+        self.block_id_to_hash.clear();
         self.req_to_hashes.clear();
-        self.num_cached_blocks = 0;
         true
     }
 
     fn num_free_blocks(&self) -> usize {
-        self.free_list.len()
+        self.num_free_blocks
     }
 
     fn num_total_blocks(&self) -> usize {
@@ -419,11 +478,15 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         if self.total_blocks == 0 {
             return 0.0;
         }
-        1.0 - self.free_list.len() as f64 / self.total_blocks as f64
+        1.0 - self.num_free_blocks as f64 / self.total_blocks as f64
     }
 
     fn num_cached_blocks(&self) -> usize {
-        self.num_cached_blocks
+        // Cached blocks = free blocks that have a hash mapping.
+        self.block_id_to_hash
+            .keys()
+            .filter(|&&bid| self.ref_cnt[bid] == 0)
+            .count()
     }
 }
 
@@ -2931,5 +2994,59 @@ mod tests {
             out.scheduled_cached_reqs.new_token_ids.is_empty(),
             "PP + async scheduling should NOT populate new_token_ids (uses GPU broadcast)"
         );
+    }
+
+    #[test]
+    fn test_decode_blocks_cached_after_preemption() {
+        // After preemption, decode blocks should be recoverable from the cache.
+        let block_size = 16;
+        let mut tracker = SimpleBlockTracker::with_caching(20, block_size);
+
+        // 32-token prompt + 32 decode tokens = 64 tokens = 4 full blocks.
+        let prompt: Vec<u32> = (0..32).collect();
+        let mut r1 = Request::new(
+            "r1".into(),
+            prompt,
+            SamplingParams {
+                max_tokens: Some(100),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+
+        // Allocate prompt blocks (2 blocks for 32 tokens).
+        let blocks = tracker.allocate_slots(&r1, 32, 0).unwrap();
+        assert_eq!(blocks[0].len(), 2);
+        r1.num_computed_tokens = 32;
+
+        // Simulate 32 decode tokens, one at a time, allocating as needed.
+        for i in 0..32u32 {
+            r1.append_output_token_ids(&[100 + i]);
+            r1.num_computed_tokens += 1;
+            let _ = tracker.allocate_slots(&r1, 1, 0).unwrap();
+        }
+
+        // We have 4 full blocks + 1 partial (the last allocate_slots added a 5th
+        // block for the partial tail). Only the 4 full blocks get hashed.
+        let alloc = tracker.get_blocks("r1");
+        assert_eq!(alloc[0].len(), 5);
+        let original_block_ids: Vec<usize> = alloc[0][..4].to_vec();
+
+        // Preempt: free blocks, reset computed tokens (but all_token_ids survives).
+        tracker.free("r1");
+        r1.num_computed_tokens = 0;
+        r1.status = RequestStatus::Preempted;
+
+        // 4 full blocks should be in the cache; the partial block goes to free list.
+        assert_eq!(tracker.num_cached_blocks(), 4);
+
+        // Re-admission: get_computed_blocks should find all 4 cached blocks.
+        let (cached_tokens, cached_blocks) = tracker.get_computed_blocks(&r1);
+        assert_eq!(cached_tokens, 64);
+        assert_eq!(cached_blocks[0].len(), 4);
+        assert_eq!(cached_blocks[0], original_block_ids);
     }
 }

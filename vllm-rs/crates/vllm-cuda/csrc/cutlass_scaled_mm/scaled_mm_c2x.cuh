@@ -129,9 +129,9 @@ inline void cutlass_gemm_caller(
   };
 
   typename Gemm::Op::Arguments args{
-      cutlass::gemm::GemmUniversalMode::kGemmSplitKParallel,
+      cutlass::gemm::GemmUniversalMode::kGemm,  // Standard GEMM mode (not split-K)
       problem_size,
-      1,  // batch count (split-K = 1)
+      1,  // batch count
       epilogue_args,
       a,
       b,
@@ -149,10 +149,15 @@ inline void cutlass_gemm_caller(
   typename Gemm::Op gemm_op;
   size_t workspace_size = gemm_op.get_workspace_size(args);
 
-  // Allocate workspace if needed (typically 0 for split-K=1).
+  // Use cudaMallocAsync for graph-capture compatibility
   void* workspace = nullptr;
   if (workspace_size > 0) {
-    cudaMalloc(&workspace, workspace_size);
+    cudaError_t malloc_err = cudaMallocAsync(&workspace, workspace_size, stream);
+    if (malloc_err != cudaSuccess) {
+      fprintf(stderr, "FATAL: cudaMallocAsync failed: %s (size=%zu)\n",
+              cudaGetErrorString(malloc_err), workspace_size);
+      abort();
+    }
   }
 
   CUTLASS_CHECK(gemm_op.can_implement(args));
@@ -160,7 +165,7 @@ inline void cutlass_gemm_caller(
   CUTLASS_CHECK(status);
 
   if (workspace != nullptr) {
-    cudaFree(workspace);
+    cudaFreeAsync(workspace, stream);
   }
 }
 

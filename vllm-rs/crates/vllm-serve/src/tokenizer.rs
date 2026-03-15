@@ -102,6 +102,24 @@ impl Tokenizer {
         &self.inner
     }
 
+    /// Create a DecodeStream for incremental decoding.
+    ///
+    /// The DecodeStream maintains state for streaming decode, allowing efficient
+    /// incremental detokenization as tokens are generated.
+    pub fn decode_stream(
+        &self,
+        skip_special_tokens: bool,
+    ) -> tokenizers::tokenizer::DecodeStream<
+        '_,
+        impl tokenizers::Model,
+        impl tokenizers::Normalizer,
+        impl tokenizers::PreTokenizer,
+        impl tokenizers::PostProcessor,
+        impl tokenizers::Decoder,
+    > {
+        self.inner.decode_stream(skip_special_tokens)
+    }
+
     /// Collect all special token IDs from the tokenizer.
     fn collect_special_ids(tokenizer: &HfTokenizer) -> HashSet<u32> {
         let mut ids = HashSet::new();

@@ -716,8 +716,14 @@ impl LLM {
                 }
 
                 // Incremental detokenize and stream.
+                // Match Python logic (output_processor.py line 628):
+                //   stop_string = req_state.detokenizer.update(
+                //       new_token_ids, finish_reason == FinishReason.STOP
+                //   )
                 if let Some(ref mut d) = detok {
-                    d.update(&output.new_token_ids, false);
+                    use vllm_common::engine_io::FinishReason;
+                    let stop_terminated = output.finish_reason == Some(FinishReason::Stop);
+                    d.update(&output.new_token_ids, stop_terminated);
                     let new_text = d.get_next_output_text(false, true);
                     if !new_text.is_empty() {
                         on_token(&new_text);

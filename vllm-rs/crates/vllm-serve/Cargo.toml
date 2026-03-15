@@ -46,6 +46,7 @@ uuid = { version = "1", features = ["v4"] }
 rand = { workspace = true }
 http = "1"
 tokenizers = { workspace = true }
+ouroboros = "0.18"
 rayon = { workspace = true }
 bincode = { workspace = true }
 libc = { workspace = true }

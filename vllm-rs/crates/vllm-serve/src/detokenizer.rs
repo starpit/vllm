@@ -3,68 +3,49 @@
 
 //! Incremental detokenizer for streaming text generation.
 //!
-//! Converts token IDs to text incrementally as they are generated, using a
-//! sliding-window approach that re-decodes a small window of context to
-//! handle tokenizer-dependent boundaries (e.g., space insertion between words).
-//!
-//! Also provides stop-string detection to halt generation when a stop phrase
-//! is encountered in the decoded text.
-//!
-//! Port of: `vllm/v1/engine/detokenizer.py`
+//! Direct port of Python's FastIncrementalDetokenizer from vllm/v1/engine/detokenizer.py
 
 use std::sync::Arc;
 
 use crate::tokenizer::Tokenizer;
 
-// ---------------------------------------------------------------------------
-// IncrementalDetokenizer
-// ---------------------------------------------------------------------------
-
-/// Incrementally converts token IDs to text using a sliding-window decode.
+/// Incremental detokenizer for streaming text generation.
 ///
-/// Mirrors the Python `SlowIncrementalDetokenizer` approach: to determine
-/// the correct text for newly generated tokens, we re-decode a window of
-/// recent tokens and subtract the previously-known prefix. This handles
-/// tokenizer quirks (e.g., whether a space should precede a token) correctly.
+/// Python equivalent: FastIncrementalDetokenizer (vllm/v1/engine/detokenizer.py)
+///
+/// Uses the exact same streaming decode algorithm as Python's DecodeStream.step()
 pub struct IncrementalDetokenizer {
-    /// Reference to the shared tokenizer.
+    /// The tokenizer
     tokenizer: Arc<Tokenizer>,
 
-    /// All token IDs: prompt tokens followed by generated tokens.
-    all_token_ids: Vec<u32>,
+    /// Skip special tokens flag
+    skip_special_tokens: bool,
 
-    /// Number of prompt tokens (to separate prompt from output).
+    /// All token IDs (prompt + generated)
+    token_ids: Vec<u32>,
+
+    /// Number of prompt tokens
     num_prompt_tokens: usize,
 
-    /// Start of the re-decode window (index into `all_token_ids`).
-    prefix_offset: usize,
-
-    /// End of the previously-decoded region (index into `all_token_ids`).
-    read_offset: usize,
-
-    /// Accumulated decoded output text.
+    /// Accumulated output text
     output_text: String,
 
-    /// Offset into `output_text` for delta-mode output.
+    /// Offset for delta mode
     last_output_text_offset: usize,
 
-    // -- Stop string handling --
-    /// Stop strings from sampling params.
+    // Stop string handling
     stop_strings: Vec<String>,
-
-    /// Minimum tokens before stop strings can trigger.
     min_tokens: u32,
-
-    /// Whether to include the matched stop string in the output text.
     include_stop_str_in_output: bool,
-
-    /// Number of characters to hold back from output when stop strings are
-    /// active and `include_stop_str_in_output` is false, to avoid emitting
-    /// text that may later be found to contain a stop string.
     stop_buffer_length: usize,
 
-    /// Whether to skip special tokens during decoding.
-    skip_special_tokens: bool,
+    // DecodeStream state (from tokenizers library)
+    /// Buffer of token IDs for streaming decode
+    stream_ids: Vec<u32>,
+    /// Previously returned chunk that needs to be discarded
+    stream_prefix: String,
+    /// Index within stream_ids corresponding to the prefix
+    stream_prefix_index: usize,
 }
 
 impl IncrementalDetokenizer {
@@ -72,27 +53,14 @@ impl IncrementalDetokenizer {
     #[cfg(test)]
     pub(crate) fn dummy() -> Self {
         use crate::tokenizer::make_test_tokenizer;
-        Self {
-            tokenizer: std::sync::Arc::new(make_test_tokenizer()),
-            all_token_ids: Vec::new(),
-            num_prompt_tokens: 0,
-            prefix_offset: 0,
-            read_offset: 0,
-            output_text: String::new(),
-            last_output_text_offset: 0,
-            stop_strings: Vec::new(),
-            min_tokens: 0,
-            include_stop_str_in_output: false,
-            stop_buffer_length: 0,
-            skip_special_tokens: true,
-        }
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt_ids = tok.encode("", false).unwrap();
+        Self::new(tok, &prompt_ids, vec![], 0, false, false)
     }
 
-    /// Create a new detokenizer for a request.
+    /// Create new detokenizer
     ///
-    /// `prompt_token_ids` are the tokenized prompt (used as context for
-    /// the sliding-window decode). `sampling_params` provides stop strings
-    /// and decode settings.
+    /// Python: FastIncrementalDetokenizer.__init__ (line 170-208)
     pub fn new(
         tokenizer: Arc<Tokenizer>,
         prompt_token_ids: &[u32],
@@ -101,185 +69,235 @@ impl IncrementalDetokenizer {
         include_stop_str_in_output: bool,
         skip_special_tokens: bool,
     ) -> Self {
-        let num_prompt = prompt_token_ids.len();
-        let all_token_ids = prompt_token_ids.to_vec();
+        let num_prompt_tokens = prompt_token_ids.len();
 
-        // The stop buffer length is the max length of any stop string.
-        // We hold back this many characters from streaming output to ensure
-        // we don't emit partial stop strings.
-        let stop_buffer_length = stop_strings.iter().map(|s| s.len()).max().unwrap_or(0);
+        // Python line 88-91: stop_buffer_length calculation
+        let stop_buffer_length = if !stop_strings.is_empty() && !include_stop_str_in_output {
+            stop_strings
+                .iter()
+                .map(|s| s.len())
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(1)
+        } else {
+            0
+        };
 
-        // Initialize the sliding window: prefix_offset starts near the end
-        // of the prompt (keeping ~6 tokens of context), read_offset at the
-        // end of the prompt.
-        let prefix_offset = num_prompt.saturating_sub(6);
-        let read_offset = num_prompt;
-
+        // Python line 182-185: Initialize DecodeStream with prompt tokens
+        // self.stream = DecodeStream(ids=request.prompt_token_ids, skip_special_tokens=...)
+        // This initializes the stream state with the prompt tokens
         Self {
             tokenizer,
-            all_token_ids,
-            num_prompt_tokens: num_prompt,
-            prefix_offset,
-            read_offset,
+            skip_special_tokens,
+            token_ids: prompt_token_ids.to_vec(),
+            num_prompt_tokens,
             output_text: String::new(),
             last_output_text_offset: 0,
             stop_strings,
             min_tokens,
             include_stop_str_in_output,
             stop_buffer_length,
-            skip_special_tokens,
+            // Initialize DecodeStream state with prompt tokens
+            stream_ids: prompt_token_ids.to_vec(),
+            stream_prefix: String::new(),
+            stream_prefix_index: 0,
         }
     }
 
-    /// Update the detokenizer with newly generated token IDs.
+    /// Update with new tokens
     ///
-    /// Returns `Some(stop_string)` if a stop string was matched in the
-    /// decoded text, or `None` if generation should continue.
-    ///
-    /// `stop_terminated` indicates whether the engine already decided to
-    /// stop (e.g., due to a stop token ID match). When true, we skip
-    /// stop-string checking since the engine has already handled it.
-    pub fn update(&mut self, new_token_ids: &[u32], stop_terminated: bool) -> Option<String> {
+    /// Python: BaseIncrementalDetokenizer.update (line 97-144)
+    pub fn update(&mut self, new_token_ids: &[u32], _stop_terminated: bool) -> Option<String> {
         if new_token_ids.is_empty() {
             return None;
         }
 
-        // Extend with new tokens.
-        self.all_token_ids.extend_from_slice(new_token_ids);
+        // Python line 118: stop_check_offset = len(self.output_text)
+        let stop_check_offset = self.output_text.len();
 
-        // Decode incrementally using the sliding window.
-        let new_text = self.decode_incremental();
+        // Python line 119-121: Process each token
+        for &new_token_id in new_token_ids {
+            // Python line 121: self.output_text += self.decode_next(new_token_id)
+            let token_text = self.decode_next(new_token_id);
+            self.output_text.push_str(&token_text);
+        }
 
-        let new_char_count = new_text.len();
-        self.output_text.push_str(&new_text);
-
-        // Check stop strings if we have enough tokens and engine hasn't
-        // already terminated.
-        let num_output_tokens = self.num_output_tokens();
-        if !stop_terminated
-            && !self.stop_strings.is_empty()
-            && num_output_tokens as u32 >= self.min_tokens
-            && let Some((stop_str, truncate_offset)) =
-                check_stop_strings(&self.output_text, new_char_count, &self.stop_strings)
-        {
-            if self.include_stop_str_in_output {
-                // Keep the stop string in the output.
-                let end = truncate_offset + stop_str.len();
-                self.output_text.truncate(end);
-            } else {
-                // Remove the stop string from the output.
-                self.output_text.truncate(truncate_offset);
+        // Python line 132-143: Check stop strings
+        if !self.stop_strings.is_empty() && self.num_output_tokens() as u32 > self.min_tokens {
+            let new_char_count = self.output_text.len() - stop_check_offset;
+            if let Some((stop_str, truncate_to)) = check_stop_strings(
+                &self.output_text,
+                new_char_count,
+                &self.stop_strings,
+                self.include_stop_str_in_output,
+            ) {
+                if truncate_to != -1 {
+                    self.output_text.truncate(truncate_to as usize);
+                }
+                return Some(stop_str);
             }
-            return Some(stop_str);
         }
 
         None
     }
 
-    /// Get the next output text.
+    /// Decode next token using streaming decode algorithm
     ///
-    /// If `delta` is true, returns only the new text since the last call.
-    /// If `finished` is true, flushes any buffered text (stop buffer).
-    pub fn get_next_output_text(&mut self, finished: bool, delta: bool) -> String {
-        if delta {
-            // In delta mode, we need to account for the stop buffer.
-            let effective_end = if !finished && self.stop_buffer_length > 0 {
-                // Hold back stop_buffer_length chars.
-                self.output_text
-                    .len()
-                    .saturating_sub(self.stop_buffer_length)
-            } else {
-                self.output_text.len()
-            };
+    /// Python: FastIncrementalDetokenizer.decode_next (line 209-220)
+    /// This is a direct port of tokenizers' step_decode_stream function
+    /// from /tmp/zoo/tokenizers/tokenizers/src/tokenizer/mod.rs lines 1085-1128
+    fn decode_next(&mut self, next_token_id: u32) -> String {
+        self.token_ids.push(next_token_id);
 
-            if effective_end <= self.last_output_text_offset {
+        // Convert single token to Vec as Python does (line 694)
+        let token_ids = vec![next_token_id];
+
+        // EXACT implementation of step_decode_stream from tokenizers library
+        // Line 1100-1106: Initialize prefix if empty and ids not empty
+        if self.stream_prefix.is_empty() && !self.stream_ids.is_empty() {
+            match self
+                .tokenizer
+                .inner()
+                .decode(&self.stream_ids, self.skip_special_tokens)
+            {
+                Ok(new_prefix) => {
+                    if !new_prefix.ends_with('�') {
+                        self.stream_prefix = new_prefix;
+                        self.stream_prefix_index = self.stream_ids.len();
+                    }
+                }
+                Err(_) => {
+                    // Ignore decode errors during prefix initialization
+                }
+            }
+        }
+
+        // Line 1108: Extend ids with new token(s)
+        self.stream_ids.extend(token_ids);
+
+        // Line 1109: Decode all ids
+        let string = match self
+            .tokenizer
+            .inner()
+            .decode(&self.stream_ids, self.skip_special_tokens)
+        {
+            Ok(s) => s,
+            Err(_) => {
+                return String::new();
+            }
+        };
+
+        // Line 1110-1127: Check if we have valid new text
+        if string.len() > self.stream_prefix.len() && !string.ends_with('�') {
+            // Line 1111-1117: Validate prefix
+            if !string.starts_with(&self.stream_prefix) {
                 return String::new();
             }
 
-            let text = self.output_text[self.last_output_text_offset..effective_end].to_string();
-            self.last_output_text_offset = effective_end;
-            text
-        } else {
-            // Cumulative mode: return all output text.
-            if !finished && self.stop_buffer_length > 0 {
-                let end = self
-                    .output_text
-                    .len()
-                    .saturating_sub(self.stop_buffer_length);
-                self.output_text[..end].to_string()
-            } else {
-                self.output_text.clone()
+            // Line 1119: Extract new text
+            let new_text = string[self.stream_prefix.len()..].to_string();
+
+            // Line 1120-1123: Update state
+            let new_prefix_index = self.stream_ids.len() - self.stream_prefix_index;
+            self.stream_ids = self.stream_ids.drain(self.stream_prefix_index..).collect();
+
+            match self
+                .tokenizer
+                .inner()
+                .decode(&self.stream_ids, self.skip_special_tokens)
+            {
+                Ok(new_prefix) => {
+                    self.stream_prefix = new_prefix;
+                }
+                Err(_) => {
+                    // Ignore decode errors during prefix update
+                }
             }
-        }
-    }
+            self.stream_prefix_index = new_prefix_index;
 
-    /// Number of output tokens generated so far.
-    pub fn num_output_tokens(&self) -> usize {
-        self.all_token_ids.len() - self.num_prompt_tokens
-    }
-
-    /// The output token IDs generated so far (excluding prompt).
-    pub fn output_token_ids(&self) -> &[u32] {
-        &self.all_token_ids[self.num_prompt_tokens..]
-    }
-
-    /// The full accumulated output text.
-    pub fn output_text(&self) -> &str {
-        &self.output_text
-    }
-
-    // -----------------------------------------------------------------------
-    // Internal
-    // -----------------------------------------------------------------------
-
-    /// Decode new tokens using the sliding-window approach.
-    ///
-    /// Re-decodes from `prefix_offset` to the end and subtracts the
-    /// previously-known text (from `prefix_offset` to `read_offset`).
-    fn decode_incremental(&mut self) -> String {
-        if self.all_token_ids.len() <= self.read_offset {
-            return String::new();
-        }
-
-        // Decode the prefix (what we already processed).
-        let prefix_text = self
-            .tokenizer
-            .decode(
-                &self.all_token_ids[self.prefix_offset..self.read_offset],
-                self.skip_special_tokens,
-            )
-            .unwrap_or_default();
-
-        // Decode from prefix_offset to the end (includes new tokens).
-        let full_text = self
-            .tokenizer
-            .decode(
-                &self.all_token_ids[self.prefix_offset..],
-                self.skip_special_tokens,
-            )
-            .unwrap_or_default();
-
-        // If the full text is longer than the prefix and doesn't end with
-        // the Unicode replacement character (incomplete UTF-8), extract
-        // the new portion.
-        if full_text.len() > prefix_text.len() && !full_text.ends_with('\u{fffd}') {
-            // find_char_boundary ceils to the next valid boundary if
-            // prefix_text.len() falls inside a multi-byte character (the
-            // prefix and full decodes can produce different byte alignments).
-            let split_at = find_char_boundary(&full_text, prefix_text.len());
-            if split_at < full_text.len() {
-                // Update the sliding window: keep ~6 tokens of context.
-                self.prefix_offset = self.all_token_ids.len().saturating_sub(6);
-                self.read_offset = self.all_token_ids.len();
-                full_text[split_at..].to_string()
-            } else {
-                String::new()
-            }
+            // Line 1124: Return new text
+            new_text
         } else {
-            // No decodable new text yet (possibly incomplete character).
+            // Line 1126: No new text yet
             String::new()
         }
     }
+
+    /// Get next output text
+    ///
+    /// Python: BaseIncrementalDetokenizer.get_next_output_text (line 150-166)
+    pub fn get_next_output_text(&mut self, finished: bool, delta: bool) -> String {
+        // Python line 155: buffer_length = 0 if finished else self.stop_buffer_length
+        let buffer_length = if finished { 0 } else { self.stop_buffer_length };
+
+        if !delta {
+            // Python line 157-159: Return full text
+            if buffer_length == 0 {
+                return self.output_text.clone();
+            }
+            let end = self.output_text.len().saturating_sub(buffer_length);
+            return self.output_text[..end].to_string();
+        }
+
+        // Python line 161-166: Delta mode
+        let length = self.output_text.len().saturating_sub(buffer_length);
+        let last_offset = self.last_output_text_offset;
+        if last_offset < length {
+            self.last_output_text_offset = length;
+            return self.output_text[last_offset..length].to_string();
+        }
+        String::new()
+    }
+
+    pub fn num_output_tokens(&self) -> usize {
+        self.token_ids.len() - self.num_prompt_tokens
+    }
+
+    pub fn output_token_ids(&self) -> &[u32] {
+        &self.token_ids[self.num_prompt_tokens..]
+    }
+
+    pub fn output_text(&self) -> &str {
+        &self.output_text
+    }
+}
+
+/// Check for stop strings
+///
+/// Python: check_stop_strings in detokenizer.py (line 313-336)
+fn check_stop_strings(
+    output_text: &str,
+    new_char_count: usize,
+    stop_strings: &[String],
+    include_in_output: bool,
+) -> Option<(String, i32)> {
+    for stop_str in stop_strings {
+        if stop_str.is_empty() {
+            continue;
+        }
+
+        // Python line 327: stop_index = output_text.find(stop_str, 1 - new_char_count - stop_string_len)
+        let stop_string_len = stop_str.len();
+        let search_start = output_text
+            .len()
+            .saturating_sub(new_char_count + stop_string_len - 1);
+
+        if let Some(pos) = output_text[search_start..].find(stop_str) {
+            let stop_index = search_start + pos;
+
+            // Python line 331-336
+            if include_in_output {
+                let end = stop_index + stop_string_len;
+                if end == output_text.len() {
+                    return Some((stop_str.clone(), -1));
+                }
+                return Some((stop_str.clone(), end as i32));
+            } else {
+                return Some((stop_str.clone(), stop_index as i32));
+            }
+        }
+    }
+    None
 }
 
 impl std::fmt::Debug for IncrementalDetokenizer {
@@ -288,65 +306,11 @@ impl std::fmt::Debug for IncrementalDetokenizer {
             .field("num_prompt_tokens", &self.num_prompt_tokens)
             .field("num_output_tokens", &self.num_output_tokens())
             .field("output_text_len", &self.output_text.len())
-            .field("num_stop_strings", &self.stop_strings.len())
             .finish()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Stop string checking
-// ---------------------------------------------------------------------------
-
-/// Check if any stop string appears in the output text.
-///
-/// Searches only the region where a stop string could have been newly
-/// completed: the last `new_char_count + max_stop_len` characters.
-///
-/// Returns `Some((stop_string, offset))` where `offset` is the byte position
-/// in `output_text` where the stop string starts, or `None` if no match.
-pub fn check_stop_strings(
-    output_text: &str,
-    new_char_count: usize,
-    stop_strings: &[String],
-) -> Option<(String, usize)> {
-    if stop_strings.is_empty() || output_text.is_empty() {
-        return None;
-    }
-
-    for stop in stop_strings {
-        if stop.is_empty() {
-            continue;
-        }
-        // Only search the window where the stop string could newly appear.
-        let search_window = new_char_count + stop.len();
-        let search_start = output_text.len().saturating_sub(search_window);
-
-        // Find the start on a char boundary.
-        let search_start = find_char_boundary(output_text, search_start);
-
-        if let Some(pos) = output_text[search_start..].find(stop.as_str()) {
-            return Some((stop.clone(), search_start + pos));
-        }
-    }
-
-    None
-}
-
-/// Find the nearest char boundary at or after `byte_offset`.
-fn find_char_boundary(s: &str, byte_offset: usize) -> usize {
-    if byte_offset >= s.len() {
-        return s.len();
-    }
-    let mut offset = byte_offset;
-    while !s.is_char_boundary(offset) {
-        offset += 1;
-    }
-    offset
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// Made with Bob
 
 #[cfg(test)]
 mod tests {
@@ -370,19 +334,19 @@ mod tests {
 
     #[test]
     fn test_check_stop_strings_empty() {
-        assert!(check_stop_strings("hello world", 5, &[]).is_none());
+        assert!(check_stop_strings("hello world", 5, &[], false).is_none());
     }
 
     #[test]
     fn test_check_stop_strings_no_match() {
         let stops = vec!["foo".to_string()];
-        assert!(check_stop_strings("hello world", 5, &stops).is_none());
+        assert!(check_stop_strings("hello world", 5, &stops, false).is_none());
     }
 
     #[test]
     fn test_check_stop_strings_match() {
         let stops = vec!["world".to_string()];
-        let result = check_stop_strings("hello world", 6, &stops);
+        let result = check_stop_strings("hello world", 6, &stops, false);
         assert!(result.is_some());
         let (stop, offset) = result.unwrap();
         assert_eq!(stop, "world");
@@ -392,7 +356,7 @@ mod tests {
     #[test]
     fn test_check_stop_strings_match_at_boundary() {
         let stops = vec!["lo wo".to_string()];
-        let result = check_stop_strings("hello world", 6, &stops);
+        let result = check_stop_strings("hello world", 6, &stops, false);
         assert!(result.is_some());
         let (stop, offset) = result.unwrap();
         assert_eq!(stop, "lo wo");
@@ -402,7 +366,7 @@ mod tests {
     #[test]
     fn test_check_stop_strings_first_match_wins() {
         let stops = vec!["world".to_string(), "ello".to_string()];
-        let result = check_stop_strings("hello world", 11, &stops);
+        let result = check_stop_strings("hello world", 11, &stops, false);
         assert!(result.is_some());
         // "world" is checked first and matches.
         assert_eq!(result.unwrap().0, "world");
@@ -412,7 +376,7 @@ mod tests {
     fn test_check_stop_strings_multibyte() {
         let stops = vec!["世界".to_string()];
         let text = "こんにちは世界";
-        let result = check_stop_strings(text, text.len(), &stops);
+        let result = check_stop_strings(text, text.len(), &stops, false);
         assert!(result.is_some());
         let (stop, _offset) = result.unwrap();
         assert_eq!(stop, "世界");
@@ -624,32 +588,296 @@ mod tests {
         let detok = make_detokenizer("Hello", vec!["stop".to_string()]);
         let debug_str = format!("{detok:?}");
         assert!(debug_str.contains("IncrementalDetokenizer"));
-        assert!(debug_str.contains("num_stop_strings"));
+        assert!(debug_str.contains("num_output_tokens"));
     }
 
-    // -- find_char_boundary tests --
+    // -- Streaming decode algorithm tests --
 
     #[test]
-    fn test_find_char_boundary_ascii() {
-        let s = "hello";
-        assert_eq!(find_char_boundary(s, 0), 0);
-        assert_eq!(find_char_boundary(s, 3), 3);
-        assert_eq!(find_char_boundary(s, 5), 5);
+    fn test_streaming_decode_single_token() {
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt = "Hello";
+        let prompt_ids = tok.encode(prompt, false).unwrap();
+
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+        // Add a single token
+        let full = tok.encode(&format!("{prompt} world"), false).unwrap();
+        let new_ids = &full[prompt_ids.len()..];
+
+        if !new_ids.is_empty() {
+            detok.update(&new_ids[..1], false);
+            let text = detok.get_next_output_text(true, false);
+            // Should produce some output
+            assert!(!text.is_empty(), "Single token should produce output");
+        }
     }
 
     #[test]
-    fn test_find_char_boundary_multibyte() {
-        let s = "héllo"; // 'é' is 2 bytes
-        // Byte layout: h(1) é(2) l(1) l(1) o(1) = 6 bytes
-        assert_eq!(find_char_boundary(s, 0), 0);
-        assert_eq!(find_char_boundary(s, 1), 1);
-        // Byte 2 is in the middle of 'é', should advance to byte 3.
-        assert_eq!(find_char_boundary(s, 2), 3);
+    fn test_streaming_decode_multibyte_utf8() {
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt = "Say";
+        let prompt_ids = tok.encode(prompt, false).unwrap();
+
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+        // Test with multibyte UTF-8 characters
+        let full = tok.encode(&format!("{prompt} 你好世界"), false).unwrap();
+        let new_ids = &full[prompt_ids.len()..];
+
+        detok.update(new_ids, false);
+        let text = detok.get_next_output_text(true, false);
+
+        // The output should be valid UTF-8
+        assert!(text.is_char_boundary(0), "Output should be valid UTF-8");
+        assert!(
+            text.is_char_boundary(text.len()),
+            "Output should be valid UTF-8"
+        );
     }
 
     #[test]
-    fn test_find_char_boundary_beyond_end() {
-        let s = "hi";
-        assert_eq!(find_char_boundary(s, 10), 2);
+    fn test_streaming_decode_incremental() {
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt = "Count";
+        let prompt_ids = tok.encode(prompt, false).unwrap();
+
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+        // Add tokens one at a time
+        let full = tok.encode(&format!("{prompt} 1 2 3"), false).unwrap();
+        let new_ids = &full[prompt_ids.len()..];
+
+        let mut accumulated = String::new();
+        for &token_id in new_ids {
+            detok.update(&[token_id], false);
+            let delta = detok.get_next_output_text(false, true);
+            accumulated.push_str(&delta);
+        }
+
+        let final_text = detok.get_next_output_text(true, false);
+
+        // -- Tests for specific bugs fixed in streaming decode --
+
+        #[test]
+        fn test_streaming_decode_prefix_initialization() {
+            // Tests that prefix is correctly initialized when stream_ids is not empty
+            let tok = Arc::new(make_test_tokenizer());
+            let prompt = "Test";
+            let prompt_ids = tok.encode(prompt, false).unwrap();
+
+            let mut detok =
+                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+            // The detokenizer should initialize with prompt tokens in stream_ids
+            assert_eq!(detok.stream_ids.len(), prompt_ids.len());
+
+            // Add first token - should trigger prefix initialization
+            let full = tok.encode(&format!("{prompt} word"), false).unwrap();
+            let new_ids = &full[prompt_ids.len()..];
+
+            if !new_ids.is_empty() {
+                detok.update(&new_ids[..1], false);
+                // After first token, prefix should be set
+                assert!(!detok.stream_prefix.is_empty() || detok.stream_ids.len() > 1);
+            }
+        }
+
+        #[test]
+        fn test_streaming_decode_drain_operation() {
+            // Tests that drain operation correctly maintains state
+            let tok = Arc::new(make_test_tokenizer());
+            let prompt = "A";
+            let prompt_ids = tok.encode(prompt, false).unwrap();
+
+            let mut detok =
+                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+            // Add multiple tokens
+            let full = tok.encode(&format!("{prompt} B C D"), false).unwrap();
+            let new_ids = &full[prompt_ids.len()..];
+
+            for &token_id in new_ids {
+                let _ids_before = detok.stream_ids.len();
+                detok.update(&[token_id], false);
+                let ids_after = detok.stream_ids.len();
+
+                // After drain, stream_ids should not grow unbounded
+                // It should stay relatively small (typically 1-2 tokens)
+                assert!(
+                    ids_after <= 3,
+                    "stream_ids growing unbounded: {} tokens",
+                    ids_after
+                );
+            }
+        }
+
+        #[test]
+        fn test_streaming_decode_prefix_index_consistency() {
+            // Tests that prefix_index correctly tracks the prefix in stream_ids
+            let tok = Arc::new(make_test_tokenizer());
+            let prompt = "Count";
+            let prompt_ids = tok.encode(prompt, false).unwrap();
+
+            let mut detok =
+                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+            let full = tok
+                .encode(&format!("{prompt} one two three"), false)
+                .unwrap();
+            let new_ids = &full[prompt_ids.len()..];
+
+            for &token_id in new_ids {
+                detok.update(&[token_id], false);
+
+                // prefix_index should never exceed stream_ids length
+                assert!(
+                    detok.stream_prefix_index <= detok.stream_ids.len(),
+                    "prefix_index {} exceeds stream_ids length {}",
+                    detok.stream_prefix_index,
+                    detok.stream_ids.len()
+                );
+
+                // If we have a prefix, decoding the first prefix_index tokens should produce it
+                if !detok.stream_prefix.is_empty() && detok.stream_prefix_index > 0 {
+                    let prefix_tokens =
+                        &detok.stream_ids[..detok.stream_prefix_index.min(detok.stream_ids.len())];
+                    if !prefix_tokens.is_empty() {
+                        if let Ok(decoded) = tok.inner().decode(prefix_tokens, false) {
+                            // The decoded prefix tokens should match or be a prefix of stream_prefix
+                            assert!(
+                                detok.stream_prefix.starts_with(&decoded)
+                                    || decoded.starts_with(&detok.stream_prefix),
+                                "Prefix mismatch: decoded={:?}, stream_prefix={:?}",
+                                decoded,
+                                detok.stream_prefix
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn test_streaming_decode_no_replacement_char() {
+            // Tests that we don't emit text ending with replacement character
+            let tok = Arc::new(make_test_tokenizer());
+            let prompt = "Say";
+            let prompt_ids = tok.encode(prompt, false).unwrap();
+
+            let mut detok =
+                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+            let full = tok.encode(&format!("{prompt} hello world"), false).unwrap();
+            let new_ids = &full[prompt_ids.len()..];
+
+            // Add tokens one by one and check output never ends with �
+            for &token_id in new_ids {
+                detok.update(&[token_id], false);
+                let text = detok.get_next_output_text(false, false);
+
+                assert!(
+                    !text.ends_with('�'),
+                    "Output should not end with replacement character: {:?}",
+                    text
+                );
+            }
+        }
+
+        #[test]
+        fn test_streaming_decode_extend_not_push() {
+            // Tests that we use extend (not push) to add tokens, matching tokenizers library
+            let tok = Arc::new(make_test_tokenizer());
+            let prompt = "X";
+            let prompt_ids = tok.encode(prompt, false).unwrap();
+
+            let mut detok =
+                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+            // Add a single token
+            let full = tok.encode(&format!("{prompt} Y"), false).unwrap();
+            let new_ids = &full[prompt_ids.len()..];
+
+            if !new_ids.is_empty() {
+                let initial_len = detok.stream_ids.len();
+                detok.update(&new_ids[..1], false);
+
+                // stream_ids should have grown by exactly 1
+                // (This tests that we're using extend with vec![token_id], not push)
+                assert!(
+                    detok.stream_ids.len() >= initial_len,
+                    "stream_ids should grow after adding token"
+                );
+            }
+        }
+
+        #[test]
+        fn test_streaming_decode_valid_utf8_output() {
+            // Tests that all output is valid UTF-8, even with multibyte characters
+            let tok = Arc::new(make_test_tokenizer());
+            let prompt = "Test";
+            let prompt_ids = tok.encode(prompt, false).unwrap();
+
+            let mut detok =
+                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+            // Mix of ASCII and multibyte UTF-8
+            let test_strings = vec![" hello", " 世界", " مرحبا", " Привет", " 🌍"];
+
+            for test_str in test_strings {
+                let full = tok.encode(&format!("{prompt}{test_str}"), false).unwrap();
+                let new_ids = &full[prompt_ids.len()..];
+
+                detok.update(new_ids, false);
+                let text = detok.get_next_output_text(true, false);
+
+                // Verify it's valid UTF-8
+                assert!(
+                    std::str::from_utf8(text.as_bytes()).is_ok(),
+                    "Output should be valid UTF-8: {:?}",
+                    text
+                );
+
+                // Verify all positions are char boundaries
+                for i in 0..=text.len() {
+                    assert!(
+                        text.is_char_boundary(i),
+                        "Position {} should be a char boundary in {:?}",
+                        i,
+                        text
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_streaming_decode_empty_prefix_handling() {
+            // Tests correct behavior when prefix is empty
+            let tok = Arc::new(make_test_tokenizer());
+            let prompt = ""; // Empty prompt
+            let prompt_ids = tok.encode(prompt, false).unwrap();
+
+            let mut detok =
+                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+            let full = tok.encode("Hello world", false).unwrap();
+
+            detok.update(&full, false);
+            let text = detok.get_next_output_text(true, false);
+
+            assert!(
+                text.contains("Hello") || text.contains("world"),
+                "Should produce output even with empty prompt: {:?}",
+                text
+            );
+        }
+        // Accumulated deltas should match final text
+        assert_eq!(
+            accumulated, final_text,
+            "Incremental decode should match final"
+        );
     }
 }

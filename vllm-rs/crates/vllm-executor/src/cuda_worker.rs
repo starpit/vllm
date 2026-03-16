@@ -6242,7 +6242,7 @@ impl CudaWorker {
                 // Caching allocator: no reset needed — tensors freed on drop.
 
                 // DEBUG: sync before forward to isolate errors from previous steps.
-                {
+                /* {
                     let any_spec = prepared
                         .req_inputs
                         .iter()
@@ -6266,7 +6266,7 @@ impl CudaWorker {
                             meta.block_ids.iter().map(|b| b.len()).collect::<Vec<_>>(),
                         );
                     }
-                }
+                } */
 
                 let gpu_input_ids = Self::h2d_u32(&prepared.flat_token_ids, device)?;
                 let gpu_positions = Self::h2d_u32(&prepared.flat_positions, device)?;
@@ -6390,7 +6390,7 @@ impl CudaWorker {
         };
 
         // DEBUG: sync after forward to catch forward errors.
-        {
+        /* {
             let any_spec = prepared
                 .req_inputs
                 .iter()
@@ -6404,7 +6404,7 @@ impl CudaWorker {
                     },
                 )?;
             }
-        }
+        } */
 
         // Free leaked GPU blocks AFTER graph/forward launch, overlapping with GPU execution.
         // This saves ~200µs per decode step that was previously blocking before graph launch.

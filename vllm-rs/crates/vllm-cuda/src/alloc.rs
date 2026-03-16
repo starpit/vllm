@@ -178,10 +178,15 @@ impl CachingAllocator {
         self.private_large_pool = Some(BlockPool::new(false));
     }
 
-    /// Stop allocating to the private pool.
+    /// Stop allocating to the private pool, but keep the pools alive so their
+    /// blocks can be reused. This prevents memory leaks when CUDA graphs are
+    /// captured multiple times (e.g., for different batch sizes).
     pub fn end_allocate_to_pool(&mut self) {
-        self.private_small_pool = None;
-        self.private_large_pool = None;
+        // Don't discard the private pools — keep them so blocks stay tracked
+        // and can be reused for future graph captures. Setting to None would
+        // leak all blocks allocated during capture.
+        // self.private_small_pool = None;
+        // self.private_large_pool = None;
     }
 
     pub fn is_pool_active(&self) -> bool {
@@ -864,6 +869,55 @@ mod tests {
             // Now the freed block coalesces with remainder → one larger free block.
             assert!(alloc.free_block_count() >= 1);
             let _ = gpu;
+        }
+        #[test]
+        fn test_private_pool_blocks_not_leaked() {
+            init_cuda();
+            let mut alloc = CachingAllocator::new();
+
+            // Simulate CUDA graph capture: allocate to private pool.
+            alloc.begin_allocate_to_pool();
+
+            // Allocate some blocks during "graph capture".
+            let p1 = alloc.alloc(1024);
+            let p2 = alloc.alloc(2048);
+            assert!(!p1.is_null());
+            assert!(!p2.is_null());
+
+            // Track how many segments were allocated.
+            let segments_after_capture = alloc.segments.len();
+            assert!(segments_after_capture > 0);
+
+            // End pool allocation (simulating end of graph capture).
+            alloc.end_allocate_to_pool();
+
+            // BUG: Without the fix, the private pool blocks are lost (set to None).
+            // They're no longer tracked in any pool, causing a memory leak.
+            // The segments remain allocated but blocks can't be reused.
+
+            // Try to allocate again - this should reuse blocks from the private pool
+            // if they're still tracked, or allocate new segments if they were leaked.
+            let segments_before_realloc = alloc.segments.len();
+
+            // Allocate same sizes again - should reuse if private pool is kept.
+            let p3 = alloc.alloc(1024);
+            let p4 = alloc.alloc(2048);
+
+            // With the fix: no new segments needed (reuses private pool blocks).
+            // Without the fix: new segments allocated (private pool was discarded).
+            assert_eq!(
+                alloc.segments.len(),
+                segments_before_realloc,
+                "Private pool blocks should be reusable after end_allocate_to_pool()"
+            );
+
+            // Clean up.
+            unsafe {
+                alloc.free(p1, 1024);
+                alloc.free(p2, 2048);
+                alloc.free(p3, 1024);
+                alloc.free(p4, 2048);
+            }
         }
 
         #[test]

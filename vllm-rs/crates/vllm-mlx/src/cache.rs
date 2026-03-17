@@ -1,132 +1,74 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright contributors to the vLLM project
 
-//! MLX KV cache — pre-allocated per-layer cache using `mlx_rs::Array`.
+//! MLX KV cache — simple concatenation cache matching mlx-lm's pattern.
 //!
-//! Pre-allocates KV buffers with extra capacity so that decode steps can
-//! use `slice_update` (O(1) write) instead of `concatenate` (O(seq) copy).
-//! MLX can perform slice_update in-place when the buffer has a single owner
-//! (refcount=1), avoiding allocation and data movement entirely.
+//! Each decode step concatenates the new K/V token onto the existing cache.
+//! This is the same approach as mlx-lm's `ConcatenateKVCache` / `KVCache`.
+//! MLX can fuse the concatenation into the forward pass graph so it executes
+//! as part of the single eval() — no separate kernel dispatches for cache
+//! management.
 
 use mlx_rs::Array;
 use mlx_rs::error::Exception;
-use mlx_rs::ops::indexing::TryIndexMutOp;
-use mlx_rs::ops::indexing::TryIndexOp;
 
-/// Extra capacity added beyond the initial sequence length when pre-allocating.
-/// 256 covers typical decode lengths (64–128) with room to spare.
-const PREALLOC_HEADROOM: usize = 256;
-
-/// Per-layer KV cache with pre-allocated buffers.
+/// Per-layer KV cache using concatenation.
 ///
-/// Keys and values have shape `[1, num_kv_heads, capacity, head_dim]`.
-/// Only `seq_len` positions are filled; the rest is padding (zeros).
+/// Keys and values have shape `[1, num_kv_heads, seq_len, head_dim]`.
+/// On each update, new tokens are concatenated along dim 2.
 #[derive(Clone)]
 pub struct MlxLayerKvCache {
     k: Array,
     v: Array,
     seq_len: usize,
-    capacity: usize,
 }
 
 impl MlxLayerKvCache {
     /// Create from initial K/V arrays (typically from prefill).
-    ///
-    /// Pre-allocates extra capacity beyond the initial sequence length.
-    fn new(k: &Array, v: &Array) -> Result<Self, Exception> {
+    fn new(k: Array, v: Array) -> Self {
         let seq_len = k.dim(2) as usize;
-        let capacity = seq_len + PREALLOC_HEADROOM;
-
-        let padded_k = pad_seq_dim(k, capacity)?;
-        let padded_v = pad_seq_dim(v, capacity)?;
-
-        Ok(Self {
-            k: padded_k,
-            v: padded_v,
-            seq_len,
-            capacity,
-        })
+        Self { k, v, seq_len }
     }
 
-    /// Grow the buffer to at least `min_capacity`.
-    fn grow(&mut self, min_capacity: usize) -> Result<(), Exception> {
-        let new_capacity = min_capacity + PREALLOC_HEADROOM;
-        let new_k = pad_seq_dim(&self.k_view()?, new_capacity)?;
-        let new_v = pad_seq_dim(&self.v_view()?, new_capacity)?;
-        self.k = new_k;
-        self.v = new_v;
-        self.capacity = new_capacity;
-        Ok(())
-    }
-
-    /// Write new K/V tokens into the buffer and return views of the full cache.
+    /// Concatenate new K/V tokens and return the full cache.
     ///
     /// `new_k` and `new_v` have shape `[1, heads, new_len, dim]`.
-    /// Returns `(k_view, v_view)` covering `[0..seq_len+new_len]`.
+    /// Returns `(full_k, full_v)` covering all cached positions.
     pub fn update_and_view(
         &mut self,
         new_k: &Array,
         new_v: &Array,
     ) -> Result<(Array, Array), Exception> {
-        let new_len = new_k.dim(2) as usize;
-
-        if self.seq_len + new_len > self.capacity {
-            self.grow(self.seq_len + new_len)?;
-        }
-
-        let start = self.seq_len as i32;
-        let end = (self.seq_len + new_len) as i32;
-
-        // Slice update — MLX can do this in-place when refcount=1.
-        self.k.try_index_mut((.., .., start..end, ..), new_k)?;
-        self.v.try_index_mut((.., .., start..end, ..), new_v)?;
-
-        self.seq_len += new_len;
-
-        Ok((self.k_view()?, self.v_view()?))
+        self.k = mlx_rs::ops::concatenate_axis(&[&self.k, new_k], 2)?;
+        self.v = mlx_rs::ops::concatenate_axis(&[&self.v, new_v], 2)?;
+        self.seq_len = self.k.dim(2) as usize;
+        Ok((self.k.clone(), self.v.clone()))
     }
 
-    /// Number of cached sequence positions (logical length, not buffer capacity).
+    /// Number of cached sequence positions.
     pub fn seq_len(&self) -> usize {
         self.seq_len
     }
 
-    /// Reset the logical length without touching the buffer.
+    /// Truncate to a shorter sequence length.
     ///
     /// Used when cloning a cached KV for a new request that only matches
     /// a prefix of the original sequence.
     pub fn truncate(&mut self, new_seq_len: usize) {
+        use mlx_rs::ops::indexing::TryIndexOp;
         assert!(new_seq_len <= self.seq_len);
-        self.seq_len = new_seq_len;
+        if new_seq_len < self.seq_len {
+            self.k = self
+                .k
+                .try_index((.., .., ..new_seq_len as i32, ..))
+                .unwrap();
+            self.v = self
+                .v
+                .try_index((.., .., ..new_seq_len as i32, ..))
+                .unwrap();
+            self.seq_len = new_seq_len;
+        }
     }
-
-    /// View of the filled K portion: `[1, heads, seq_len, dim]`.
-    fn k_view(&self) -> Result<Array, Exception> {
-        self.k.try_index((.., .., ..self.seq_len as i32, ..))
-    }
-
-    /// View of the filled V portion: `[1, heads, seq_len, dim]`.
-    fn v_view(&self) -> Result<Array, Exception> {
-        self.v.try_index((.., .., ..self.seq_len as i32, ..))
-    }
-}
-
-/// Pad (or create) an array to have `capacity` along dim 2 (sequence dim).
-///
-/// Input shape: `[1, heads, current_len, dim]`
-/// Output shape: `[1, heads, capacity, dim]`
-fn pad_seq_dim(arr: &Array, capacity: usize) -> Result<Array, Exception> {
-    let current_len = arr.dim(2) as usize;
-    if current_len >= capacity {
-        return Ok(arr.clone());
-    }
-    let pad_len = capacity - current_len;
-    let batch = arr.dim(0);
-    let heads = arr.dim(1);
-    let dim = arr.dim(3);
-    let padding =
-        mlx_rs::Array::zeros::<f32>(&[batch, heads, pad_len as i32, dim])?.as_dtype(arr.dtype())?;
-    mlx_rs::ops::concatenate_axis(&[arr.clone(), padding], 2)
 }
 
 /// Batch information for batched forward passes across multiple requests.
@@ -179,10 +121,10 @@ pub fn empty_kv_cache(num_layers: usize) -> MlxKvCache {
     (0..num_layers).map(|_| None).collect()
 }
 
-/// Update a per-layer KV cache entry and return views for attention.
+/// Update a per-layer KV cache entry and return the full cache for attention.
 ///
-/// On first call (cache=None): pre-allocates a buffer and stores K/V.
-/// On subsequent calls: uses slice_update for O(1) writes.
+/// On first call (cache=None): stores K/V directly.
+/// On subsequent calls: concatenates new tokens onto existing cache.
 ///
 /// Returns `(full_k, full_v)` covering all cached positions.
 pub fn kv_cache_update(
@@ -193,11 +135,11 @@ pub fn kv_cache_update(
     match cache {
         Some(entry) => entry.update_and_view(new_k, new_v),
         None => {
-            let entry = MlxLayerKvCache::new(new_k, new_v)?;
-            let k_view = entry.k_view()?;
-            let v_view = entry.v_view()?;
+            let entry = MlxLayerKvCache::new(new_k.clone(), new_v.clone());
+            let k = entry.k.clone();
+            let v = entry.v.clone();
             *cache = Some(entry);
-            Ok((k_view, v_view))
+            Ok((k, v))
         }
     }
 }
@@ -216,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prealloc_kv_cache_prefill() {
+    fn test_kv_cache_prefill() {
         let k = Array::zeros::<f32>(&[1, 4, 8, 16]).unwrap();
         let v = Array::zeros::<f32>(&[1, 4, 8, 16]).unwrap();
 
@@ -227,12 +169,11 @@ mod tests {
         assert!(cache.is_some());
         assert_eq!(kv.shape(), &[1, 4, 8, 16]);
         assert_eq!(vv.shape(), &[1, 4, 8, 16]);
-        assert_eq!(cache.as_ref().unwrap().seq_len, 8);
-        assert_eq!(cache.as_ref().unwrap().capacity, 8 + PREALLOC_HEADROOM);
+        assert_eq!(cache.as_ref().unwrap().seq_len(), 8);
     }
 
     #[test]
-    fn test_prealloc_kv_cache_decode_steps() {
+    fn test_kv_cache_decode_steps() {
         // Prefill: 4 tokens
         let k = Array::ones::<f32>(&[1, 2, 4, 8]).unwrap();
         let v = Array::ones::<f32>(&[1, 2, 4, 8]).unwrap();
@@ -262,7 +203,7 @@ mod tests {
         let k = Array::zeros::<f32>(&[1, 4, 16, 8]).unwrap();
         let v = Array::zeros::<f32>(&[1, 4, 16, 8]).unwrap();
 
-        let mut entry = MlxLayerKvCache::new(&k, &v).unwrap();
+        let mut entry = MlxLayerKvCache::new(k, v);
         assert_eq!(entry.seq_len(), 16);
 
         entry.truncate(10);
@@ -282,7 +223,7 @@ mod tests {
     fn test_truncate_panics_on_larger() {
         let k = Array::zeros::<f32>(&[1, 4, 8, 8]).unwrap();
         let v = Array::zeros::<f32>(&[1, 4, 8, 8]).unwrap();
-        let mut entry = MlxLayerKvCache::new(&k, &v).unwrap();
+        let mut entry = MlxLayerKvCache::new(k, v);
         entry.truncate(16); // larger than seq_len=8 → panic
     }
 }

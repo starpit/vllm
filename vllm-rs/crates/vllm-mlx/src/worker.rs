@@ -27,6 +27,32 @@ use crate::cache::{self, MlxKvCache};
 use crate::models::{MlxModel, MlxModelRegistry};
 
 // ---------------------------------------------------------------------------
+// Async eval double-buffering
+// ---------------------------------------------------------------------------
+
+/// State from a previous fast-path decode step whose GPU work was enqueued
+/// via `async_eval` but whose results have not yet been read.
+///
+/// This enables the mlx-lm double-buffering pattern: the *current* step's
+/// lazy graph is built on top of the still-in-flight previous step, then
+/// `async_eval`'d.  Only *after* enqueueing the current step do we read the
+/// previous step's token (which is guaranteed to be ready by then since MLX
+/// serializes work on the same stream).  This eliminates GPU idle time
+/// between decode steps.
+struct PendingFastDecode {
+    /// Request ID this pending result belongs to.
+    req_id: String,
+    /// Lazy argmax result from `forward_greedy` — shape `[1]`, dtype u32.
+    /// Will be materialized when we call `as_slice` after the *next* step's
+    /// `async_eval`.
+    token_arr: Array,
+    /// The position value for the *next* decode step.  Because we defer the
+    /// token-buffer append, `buf.len() - 1` would be off by one; we track the
+    /// correct value explicitly.
+    next_position: i32,
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -148,6 +174,10 @@ pub struct MlxWorker {
     /// Block size for prefix hashing (must match scheduler block size).
     prefix_block_size: usize,
 
+    /// Pending fast-path decode result from the previous step.
+    /// See [`PendingFastDecode`] for the double-buffering design.
+    pending_fast_decode: Option<PendingFastDecode>,
+
     // Timing instrumentation.
     step_count: usize,
     prefill_count: usize,
@@ -186,6 +216,7 @@ impl MlxWorker {
             kv_cache_pool: HashMap::new(),
             enable_prefix_caching,
             prefix_block_size,
+            pending_fast_decode: None,
             step_count: 0,
             prefill_count: 0,
             decode_count: 0,
@@ -239,6 +270,34 @@ impl MlxWorker {
             0.0
         } else {
             self.total_decode_ms / self.decode_count as f64
+        }
+    }
+
+    /// Resolve the pending fast-path decode from the previous step.
+    ///
+    /// Reads the lazily-computed token array (blocking until the GPU finishes),
+    /// appends the token to the request's buffer, and advances grammar state.
+    /// Must be called before building the *next* step's inputs so that
+    /// `token_buffers` is up-to-date for non-fast-path fallback, and before
+    /// cleaning up finished requests that might reference the pending request.
+    fn resolve_pending_fast_decode(&mut self) {
+        if let Some(pending) = self.pending_fast_decode.take() {
+            // Blocks until the previous async_eval completes (should already
+            // be done since an entire step's worth of CPU work has elapsed).
+            let flat = pending.token_arr.as_slice::<u32>();
+
+            // Update token buffer.
+            if let Some(buf) = self.token_buffers.get_mut(&pending.req_id) {
+                buf.extend_from_slice(flat);
+            }
+
+            // Advance grammar state.
+            #[cfg(feature = "guided-decoding")]
+            if let Some(guide) = self.grammar_states.get_mut(&pending.req_id)
+                && let Some(&token_id) = flat.first()
+            {
+                guide.advance(token_id);
+            }
         }
     }
 
@@ -656,6 +715,12 @@ impl Worker for MlxWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
+        // NOTE: we do NOT resolve_pending_fast_decode() here eagerly.
+        // The fast path below will use the pending lazy array directly as
+        // input to the next step (double-buffering), then resolve after
+        // async_eval.  If we fall through to the non-fast path, we resolve
+        // there instead.  See the `resolve_pending_before_batch` label below.
+
         // Lazily build grammar vocabulary if any new request needs constrained decoding.
         // Done before borrowing self.model to satisfy the borrow checker.
         #[cfg(feature = "guided-decoding")]
@@ -676,6 +741,33 @@ impl Worker for MlxWorker {
             .ok_or_else(|| ExecutorError::WorkerExecution("model not loaded".to_string()))?;
 
         let num_layers = model.num_layers();
+
+        // If the pending fast-path request is being finished (or aborted),
+        // resolve it now so that the token buffer is complete for prefix
+        // cache hashing and cleanup below.  Inlined to avoid &mut self
+        // conflict with the `model` borrow above.
+        {
+            let should_resolve = self.pending_fast_decode.as_ref().is_some_and(|p| {
+                scheduler_output
+                    .finished_req_ids
+                    .iter()
+                    .any(|id| id == &p.req_id)
+            });
+            if should_resolve {
+                if let Some(prev) = self.pending_fast_decode.take() {
+                    let flat = prev.token_arr.as_slice::<u32>();
+                    if let Some(buf) = self.token_buffers.get_mut(&prev.req_id) {
+                        buf.extend_from_slice(flat);
+                    }
+                    #[cfg(feature = "guided-decoding")]
+                    if let Some(guide) = self.grammar_states.get_mut(&prev.req_id)
+                        && let Some(&token_id) = flat.first()
+                    {
+                        guide.advance(token_id);
+                    }
+                }
+            }
+        }
 
         // Clean up finished requests — stash KV caches for prefix reuse.
         for req_id in &scheduler_output.finished_req_ids {
@@ -827,6 +919,33 @@ impl Worker for MlxWorker {
             .iter()
             .map(|r| r.req_id.as_str())
             .collect();
+
+        // If there are multiple requests being scheduled (new + cached), the
+        // single-request fast path won't fire, so resolve any pending decode
+        // now to ensure token_buffers are accurate for input construction.
+        // When exactly one cached request is scheduled (and no new), the fast
+        // path may fire and use the pending lazy array directly.
+        let num_cached = scheduler_output
+            .scheduled_cached_reqs
+            .req_ids
+            .iter()
+            .filter(|id| !new_req_ids.contains(id.as_str()))
+            .count();
+        if !req_inputs.is_empty() || num_cached > 1 {
+            // Inlined to avoid &mut self borrow conflict with `model`.
+            if let Some(prev) = self.pending_fast_decode.take() {
+                let flat = prev.token_arr.as_slice::<u32>();
+                if let Some(buf) = self.token_buffers.get_mut(&prev.req_id) {
+                    buf.extend_from_slice(flat);
+                }
+                #[cfg(feature = "guided-decoding")]
+                if let Some(guide) = self.grammar_states.get_mut(&prev.req_id)
+                    && let Some(&token_id) = flat.first()
+                {
+                    guide.advance(token_id);
+                }
+            }
+        }
 
         for req_id in scheduler_output.scheduled_cached_reqs.req_ids.iter() {
             if new_req_ids.contains(req_id.as_str()) {
@@ -1083,14 +1202,51 @@ impl Worker for MlxWorker {
 
             if is_single_token && no_spec && no_prompt_logprobs && is_greedy && no_cpu_needs {
                 let req_id = &ri.req_id;
+                let is_prefill = ri.is_prefill;
 
-                let input_ids = Array::from_iter(
-                    ri.token_ids.iter().map(|&t| t as i32),
-                    &[ri.token_ids.len() as i32],
-                );
-                let positions =
-                    Array::from_iter(ri.positions.iter().copied(), &[ri.positions.len() as i32]);
-                let rope_offset = ri.positions.iter().copied().min();
+                // Check if we can use the pending lazy token from the previous
+                // step as input (double-buffering).  This avoids materializing
+                // the token between steps — the GPU chains the computations.
+                let (input_ids, positions, rope_offset, next_pos) = if let Some(ref pending) =
+                    self.pending_fast_decode
+                {
+                    if pending.req_id == *req_id && !is_prefill {
+                        // Use the *lazy* token array from the previous
+                        // async_eval as input — no eval/sync required.
+                        let lazy_input = pending.token_arr.as_dtype(Dtype::Int32).map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("pending as_dtype failed: {e}"))
+                        })?;
+                        let pos = pending.next_position;
+                        let positions = Array::from_iter([pos], &[1]);
+                        (lazy_input, positions, Some(pos), pos + 1)
+                    } else {
+                        // Different request or prefill — fall through to
+                        // normal input construction.
+                        let input_ids = Array::from_iter(
+                            ri.token_ids.iter().map(|&t| t as i32),
+                            &[ri.token_ids.len() as i32],
+                        );
+                        let positions = Array::from_iter(
+                            ri.positions.iter().copied(),
+                            &[ri.positions.len() as i32],
+                        );
+                        let rope_offset = ri.positions.iter().copied().min();
+                        let next_pos = ri.positions.last().copied().unwrap_or(0) + 1;
+                        (input_ids, positions, rope_offset, next_pos)
+                    }
+                } else {
+                    let input_ids = Array::from_iter(
+                        ri.token_ids.iter().map(|&t| t as i32),
+                        &[ri.token_ids.len() as i32],
+                    );
+                    let positions = Array::from_iter(
+                        ri.positions.iter().copied(),
+                        &[ri.positions.len() as i32],
+                    );
+                    let rope_offset = ri.positions.iter().copied().min();
+                    let next_pos = ri.positions.last().copied().unwrap_or(0) + 1;
+                    (input_ids, positions, rope_offset, next_pos)
+                };
 
                 let kv_cache = self
                     .kv_caches
@@ -1104,30 +1260,48 @@ impl Worker for MlxWorker {
                         ExecutorError::WorkerExecution(format!("forward_greedy failed: {e}"))
                     })?;
 
-                // Single eval: entire forward + argmax in one Metal command buffer.
-                token_ids_arr
-                    .eval()
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("eval error: {e}")))?;
+                // Enqueue GPU work and return immediately — the GPU starts
+                // computing while we do CPU bookkeeping below.
+                mlx_rs::transforms::async_eval(std::iter::once(&token_ids_arr)).map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("async_eval error: {e}"))
+                })?;
 
-                let flat = token_ids_arr.as_slice::<u32>();
-                token_map.insert(req_id.clone(), flat.to_vec());
-
-                // Update token buffer.
-                if let Some(buf) = self.token_buffers.get_mut(req_id) {
-                    buf.extend_from_slice(flat);
+                // The previous pending was consumed when we built input_ids
+                // above (we used its lazy token_arr).  Now that the current
+                // step is async_eval'd, resolve the previous pending to update
+                // token_buffers / grammar state.  The GPU work for the previous
+                // step completed while we were building this step's graph.
+                //
+                // NOTE: we inline this instead of calling
+                // resolve_pending_fast_decode() to avoid a &mut self borrow
+                // that conflicts with the outstanding `model` borrow above.
+                if let Some(prev) = self.pending_fast_decode.take() {
+                    let flat = prev.token_arr.as_slice::<u32>();
+                    if let Some(buf) = self.token_buffers.get_mut(&prev.req_id) {
+                        buf.extend_from_slice(flat);
+                    }
+                    #[cfg(feature = "guided-decoding")]
+                    if let Some(guide) = self.grammar_states.get_mut(&prev.req_id)
+                        && let Some(&token_id) = flat.first()
+                    {
+                        guide.advance(token_id);
+                    }
                 }
 
-                // Advance grammar state (none in this fast path, but be consistent).
-                #[cfg(feature = "guided-decoding")]
-                if let Some(guide) = self.grammar_states.get_mut(req_id)
-                    && let Some(&token_id) = flat.first()
-                {
-                    guide.advance(token_id);
-                }
+                // Return the *current* step's result via d2h_resolver so the
+                // engine can overlap finalize + schedule with GPU work.
+                let resolver_arr = token_ids_arr.clone();
+
+                // Store pending state for the *next* step's double-buffering.
+                self.pending_fast_decode = Some(PendingFastDecode {
+                    req_id: req_id.clone(),
+                    token_arr: token_ids_arr,
+                    next_position: next_pos,
+                });
 
                 let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
                 self.step_count += 1;
-                if ri.is_prefill {
+                if is_prefill {
                     self.prefill_count += 1;
                     self.total_prefill_ms += step_ms;
                 } else {
@@ -1135,8 +1309,30 @@ impl Worker for MlxWorker {
                     self.total_decode_ms += step_ms;
                 }
 
-                let output = ModelRunnerOutput::from_token_map(token_map);
+                let output = ModelRunnerOutput::deferred(
+                    vec![req_id.clone()],
+                    Box::new(move || {
+                        let flat = resolver_arr.as_slice::<u32>();
+                        flat.to_vec()
+                    }),
+                );
                 return Ok(output);
+            }
+        }
+
+        // If we reach here, the fast path didn't fire.  Resolve any pending
+        // fast-path decode so that token_buffers are up-to-date for the batch
+        // path below.  (Inlined to avoid &mut self borrow conflict with `model`.)
+        if let Some(prev) = self.pending_fast_decode.take() {
+            let flat = prev.token_arr.as_slice::<u32>();
+            if let Some(buf) = self.token_buffers.get_mut(&prev.req_id) {
+                buf.extend_from_slice(flat);
+            }
+            #[cfg(feature = "guided-decoding")]
+            if let Some(guide) = self.grammar_states.get_mut(&prev.req_id)
+                && let Some(&token_id) = flat.first()
+            {
+                guide.advance(token_id);
             }
         }
 
@@ -1782,6 +1978,8 @@ impl Worker for MlxWorker {
     }
 
     fn shutdown(&mut self) {
+        // Flush any pending async_eval before dropping the model.
+        self.resolve_pending_fast_decode();
         self.is_shutdown = true;
         self.model = None;
         info!("MlxWorker: shut down");

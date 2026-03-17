@@ -397,8 +397,12 @@ impl MlxQuantizedLlamaAttention {
         let v = self.v_proj.forward(hidden_states)?;
 
         // Reshape: [seq, hidden] -> [seq, heads, head_dim]
-        let q = q.reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?;
-        let k = k.reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
+        let nh = self.num_heads as i32;
+        let nkv = self.num_kv_heads as i32;
+        let hd = self.head_dim as i32;
+
+        let q = q.reshape(&[1, seq_len, nh, hd])?;
+        let k = k.reshape(&[1, seq_len, nkv, hd])?;
 
         // Apply optional per-head QK norms (Qwen3).
         let q = if let Some(ref mut norm) = self.q_norm {
@@ -412,13 +416,11 @@ impl MlxQuantizedLlamaAttention {
             k
         };
 
-        // [seq, heads, head_dim] -> [1, heads, seq, head_dim]
-        let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let q = q.transpose_axes(&[0, 2, 1, 3])?;
+        let mut k = k.transpose_axes(&[0, 2, 1, 3])?;
         let v = v
-            .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
-            .transpose_axes(&[1, 0, 2])?
-            .expand_dims(0)?;
+            .reshape(&[1, seq_len, nkv, hd])?
+            .transpose_axes(&[0, 2, 1, 3])?;
 
         // RoPE: offset passed from caller (avoids .item() sync in MLX).
         let q = self.rope.forward((&q, rope_offset))?;
@@ -449,8 +451,7 @@ impl MlxQuantizedLlamaAttention {
         // out: [1, heads, seq, head_dim] -> [seq, hidden]
         let hidden = (self.num_heads * self.head_dim) as i32;
         let out = out
-            .squeeze_axes(&[0])?
-            .transpose_axes(&[1, 0, 2])?
+            .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[seq_len, hidden])?;
 
         self.o_proj.forward(&out)
@@ -489,8 +490,12 @@ impl MlxQuantizedLlamaAttention {
             let k = k_all.try_index((start..start + seq_len, ..))?;
             let v = v_all.try_index((start..start + seq_len, ..))?;
 
-            let q = q.reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?;
-            let k = k.reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
+            let nh = self.num_heads as i32;
+            let nkv = self.num_kv_heads as i32;
+            let hd = self.head_dim as i32;
+
+            let q = q.reshape(&[1, seq_len, nh, hd])?;
+            let k = k.reshape(&[1, seq_len, nkv, hd])?;
 
             let q = if let Some(ref mut norm) = self.q_norm {
                 norm.forward(&q)?
@@ -503,12 +508,11 @@ impl MlxQuantizedLlamaAttention {
                 k
             };
 
-            let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-            let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+            let q = q.transpose_axes(&[0, 2, 1, 3])?;
+            let mut k = k.transpose_axes(&[0, 2, 1, 3])?;
             let v = v
-                .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
-                .transpose_axes(&[1, 0, 2])?
-                .expand_dims(0)?;
+                .reshape(&[1, seq_len, nkv, hd])?
+                .transpose_axes(&[0, 2, 1, 3])?;
 
             let q = self.rope.forward((&q, offset))?;
             k = self.rope.forward((&k, offset))?;
@@ -568,8 +572,7 @@ impl MlxQuantizedLlamaAttention {
 
                 let hidden = (self.num_heads * self.head_dim) as i32;
                 let out = out
-                    .squeeze_axes(&[0])?
-                    .transpose_axes(&[1, 0, 2])?
+                    .transpose_axes(&[0, 2, 1, 3])?
                     .reshape(&[seq_len, hidden])?;
                 attn_outputs.push(out);
             }

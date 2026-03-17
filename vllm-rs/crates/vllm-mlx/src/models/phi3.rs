@@ -257,8 +257,7 @@ impl MlxPhi3MLP {
         let gate_up = self.gate_up_proj.forward(x)?;
         // Split along last dim: [seq, 2*intermediate] → gate [seq, intermediate], up [seq, intermediate]
         let parts = gate_up.split_axis(&[self.intermediate_size as i32], -1)?;
-        let gate = nn::silu(&parts[0])?;
-        let hidden = gate.multiply(&parts[1])?;
+        let hidden = super::llama::compiled_swiglu(&parts[0], &parts[1])?;
         self.down_proj.forward(&hidden)
     }
 }
@@ -812,8 +811,7 @@ impl MlxQuantizedPhi3MLP {
     fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate_up = self.gate_up_proj.forward(x)?;
         let parts = gate_up.split_axis(&[self.intermediate_size as i32], -1)?;
-        let gate = nn::silu(&parts[0])?;
-        let hidden = gate.multiply(&parts[1])?;
+        let hidden = super::llama::compiled_swiglu(&parts[0], &parts[1])?;
         self.down_proj.forward(&hidden)
     }
 }

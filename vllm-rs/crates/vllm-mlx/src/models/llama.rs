@@ -17,6 +17,7 @@ use mlx_rs::error::Exception;
 use mlx_rs::module::{Module, Param};
 use mlx_rs::nn;
 use mlx_rs::ops::indexing::TryIndexOp;
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
 
 use crate::cache::{MlxBatchInfo, MlxKvCache, MlxLayerKvCache};
@@ -201,6 +202,32 @@ pub(crate) fn assign_weight(
 }
 
 // ---------------------------------------------------------------------------
+// Compiled SwiGLU activation
+// ---------------------------------------------------------------------------
+
+/// Compiled SwiGLU: `silu(gate) * up` fused into a single Metal kernel.
+///
+/// Matches mlx-lm's `@partial(mx.compile, shapeless=True)` on swiglu.
+/// Without compilation, MLX dispatches separate kernels for silu and multiply
+/// per transformer layer.  For a 32-layer model this adds ~100μs of kernel
+/// dispatch overhead per decode step (~10-12% of ITL).
+///
+/// The closure is `Copy + 'static` so `compile()` caches the compiled graph
+/// across calls.  `shapeless=true` means the compiled function works for any
+/// input shape (batch size changes between steps).
+pub fn compiled_swiglu(gate: &Array, up: &Array) -> Result<Array, Exception> {
+    // `compile` caches by function identity (type_id), so repeated calls
+    // reuse the same compiled graph — no recompilation.
+    let mut f = compile(
+        |(gate, up): (&Array, &Array)| -> Result<Array, Exception> {
+            nn::silu(gate)?.multiply(up)
+        },
+        true, // shapeless
+    );
+    f((gate, up))
+}
+
+// ---------------------------------------------------------------------------
 // MlxLlamaMLP
 // ---------------------------------------------------------------------------
 
@@ -249,9 +276,8 @@ impl MlxLlamaMLP {
     /// Forward pass: gate_proj(x) → SiLU → * up_proj(x) → down_proj
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = nn::silu(&gate)?;
         let up = self.up_proj.forward(x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = compiled_swiglu(&gate, &up)?;
         self.down_proj.forward(&hidden)
     }
 }

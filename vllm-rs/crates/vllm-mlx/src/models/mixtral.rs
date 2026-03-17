@@ -144,9 +144,8 @@ impl MlxMixtralExpertMLP {
 
     fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = self.w1.forward(x)?;
-        let gate = nn::silu(&gate)?;
         let up = self.w3.forward(x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = super::llama::compiled_swiglu(&gate, &up)?;
         self.w2.forward(&hidden)
     }
 }
@@ -521,9 +520,8 @@ impl MlxQuantizedMixtralExpertMLP {
 
     fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = self.w1.forward(x)?;
-        let gate = nn::silu(&gate)?;
         let up = self.w3.forward(x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = super::llama::compiled_swiglu(&gate, &up)?;
         self.w2.forward(&hidden)
     }
 }

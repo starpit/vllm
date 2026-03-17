@@ -301,9 +301,8 @@ impl MlxQwen25VisionBlock {
         let x = self.norm2.forward(&hidden_states)?;
         // SwiGLU: silu(gate_proj(x)) * up_proj(x) → down_proj
         let gate = self.gate_proj.forward(&x)?;
-        let gate = nn::silu(&gate)?;
         let up = self.up_proj.forward(&x)?;
-        let x = gate.multiply(&up)?;
+        let x = super::llama::compiled_swiglu(&gate, &up)?;
         let x = self.down_proj.forward(&x)?;
         residual.add(&x)
     }

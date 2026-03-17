@@ -2,7 +2,6 @@
 
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Override root *.csv ignore for parity data
 !crates/vllm-parity/**/*.csv

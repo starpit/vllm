@@ -1320,7 +1320,13 @@ impl WgpuWorker {
 
         let sync = || {
             self.device.flush();
-            self.device.device.poll(wgpu::Maintain::Wait);
+            self.device
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .ok();
         };
 
         // 1. Embedding

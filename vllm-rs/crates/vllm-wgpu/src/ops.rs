@@ -974,7 +974,13 @@ async fn readback_u32(device: &WgpuDevice, src: &WgpuTensor) -> Result<u32, Wgpu
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
-    device.device.poll(wgpu::Maintain::Wait);
+    device
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .ok();
     rx.await
         .map_err(|_| WgpuError::BufferMap)?
         .map_err(|_| WgpuError::BufferMap)?;

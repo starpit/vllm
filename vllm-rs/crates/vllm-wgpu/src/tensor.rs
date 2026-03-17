@@ -184,7 +184,13 @@ impl WgpuTensor {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        self.device.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .ok();
         rx.await
             .map_err(|_| WgpuError::BufferMap)?
             .map_err(|_| WgpuError::BufferMap)?;

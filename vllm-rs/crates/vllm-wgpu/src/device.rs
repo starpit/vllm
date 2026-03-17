@@ -202,7 +202,7 @@ impl WgpuDevice {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or(WgpuError::NoAdapter)?;
+            .map_err(|_| WgpuError::NoAdapter)?;
 
         let adapter_limits = adapter.limits();
         tracing::info!(
@@ -217,25 +217,23 @@ impl WgpuDevice {
         );
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("vllm-wgpu"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits {
-                        max_buffer_size: adapter_limits.max_buffer_size,
-                        max_storage_buffer_binding_size: adapter_limits
-                            .max_storage_buffer_binding_size,
-                        max_compute_workgroup_storage_size: adapter_limits
-                            .max_compute_workgroup_storage_size,
-                        max_compute_invocations_per_workgroup: adapter_limits
-                            .max_compute_invocations_per_workgroup,
-                        max_compute_workgroup_size_x: adapter_limits.max_compute_workgroup_size_x,
-                        ..wgpu::Limits::default()
-                    },
-                    memory_hints: wgpu::MemoryHints::Performance,
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("vllm-wgpu"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits {
+                    max_buffer_size: adapter_limits.max_buffer_size,
+                    max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+                    max_compute_workgroup_storage_size: adapter_limits
+                        .max_compute_workgroup_storage_size,
+                    max_compute_invocations_per_workgroup: adapter_limits
+                        .max_compute_invocations_per_workgroup,
+                    max_compute_workgroup_size_x: adapter_limits.max_compute_workgroup_size_x,
+                    ..wgpu::Limits::default()
                 },
-                None,
-            )
+                memory_hints: wgpu::MemoryHints::Performance,
+                experimental_features: Default::default(),
+                trace: Default::default(),
+            })
             .await
             .map_err(|e| WgpuError::DeviceCreation(e.to_string()))?;
 

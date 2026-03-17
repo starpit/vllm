@@ -17,7 +17,7 @@ worker = [
 ]
 
 [dependencies]
-wgpu = { version = "24", features = ["wgsl"] }
+wgpu = { version = "28", features = ["wgsl"] }
 bytemuck = { version = "1", features = ["derive"] }
 thiserror.workspace = true
 tracing.workspace = true

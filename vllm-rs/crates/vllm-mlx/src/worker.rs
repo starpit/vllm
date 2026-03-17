@@ -30,25 +30,26 @@ use crate::models::{MlxModel, MlxModelRegistry};
 // Async eval double-buffering
 // ---------------------------------------------------------------------------
 
-/// State from a previous fast-path decode step whose GPU work was enqueued
-/// via `async_eval` but whose results have not yet been read.
+/// Accumulated state from fast-path decode steps whose GPU work was enqueued
+/// via `async_eval` but whose token results have not yet been read back.
 ///
 /// This enables the mlx-lm double-buffering pattern: the *current* step's
 /// lazy graph is built on top of the still-in-flight previous step, then
-/// `async_eval`'d.  Only *after* enqueueing the current step do we read the
-/// previous step's token (which is guaranteed to be ready by then since MLX
-/// serializes work on the same stream).  This eliminates GPU idle time
-/// between decode steps.
+/// `async_eval`'d.  We **never** block on the GPU inside `execute_model` —
+/// the token arrays accumulate here and are only materialized when the
+/// request finishes or exits the fast path.
 struct PendingFastDecode {
-    /// Request ID this pending result belongs to.
+    /// Request ID this pending state belongs to.
     req_id: String,
-    /// Lazy argmax result from `forward_greedy` — shape `[1]`, dtype u32.
-    /// Will be materialized when we call `as_slice` after the *next* step's
-    /// `async_eval`.
-    token_arr: Array,
-    /// The position value for the *next* decode step.  Because we defer the
-    /// token-buffer append, `buf.len() - 1` would be off by one; we track the
-    /// correct value explicitly.
+    /// Token arrays from completed async_eval steps, not yet materialized.
+    /// Each entry is a shape-`[1]` u32 array (argmax result).  Flushed into
+    /// `token_buffers` when the request finishes or leaves the fast path.
+    deferred_tokens: Vec<Array>,
+    /// The most recent lazy argmax result — used as input to the *next* step
+    /// via `as_dtype(Int32)`.  Also pushed onto `deferred_tokens` when the
+    /// next step arrives.
+    latest_token_arr: Array,
+    /// The position value for the *next* decode step.
     next_position: i32,
 }
 
@@ -282,21 +283,24 @@ impl MlxWorker {
     /// cleaning up finished requests that might reference the pending request.
     fn resolve_pending_fast_decode(&mut self) {
         if let Some(pending) = self.pending_fast_decode.take() {
-            // Blocks until the previous async_eval completes (should already
-            // be done since an entire step's worth of CPU work has elapsed).
-            let flat = pending.token_arr.as_slice::<u32>();
-
-            // Update token buffer.
             if let Some(buf) = self.token_buffers.get_mut(&pending.req_id) {
-                buf.extend_from_slice(flat);
-            }
+                // Flush ALL accumulated tokens into the buffer.
+                for arr in pending
+                    .deferred_tokens
+                    .iter()
+                    .chain(std::iter::once(&pending.latest_token_arr))
+                {
+                    let flat = arr.as_slice::<u32>();
+                    buf.extend_from_slice(flat);
 
-            // Advance grammar state.
-            #[cfg(feature = "guided-decoding")]
-            if let Some(guide) = self.grammar_states.get_mut(&pending.req_id)
-                && let Some(&token_id) = flat.first()
-            {
-                guide.advance(token_id);
+                    // Advance grammar state for each token.
+                    #[cfg(feature = "guided-decoding")]
+                    if let Some(guide) = self.grammar_states.get_mut(&pending.req_id)
+                        && let Some(&token_id) = flat.first()
+                    {
+                        guide.advance(token_id);
+                    }
+                }
             }
         }
     }
@@ -755,15 +759,17 @@ impl Worker for MlxWorker {
             });
             if should_resolve {
                 if let Some(prev) = self.pending_fast_decode.take() {
-                    let flat = prev.token_arr.as_slice::<u32>();
                     if let Some(buf) = self.token_buffers.get_mut(&prev.req_id) {
-                        buf.extend_from_slice(flat);
-                    }
-                    #[cfg(feature = "guided-decoding")]
-                    if let Some(guide) = self.grammar_states.get_mut(&prev.req_id)
-                        && let Some(&token_id) = flat.first()
-                    {
-                        guide.advance(token_id);
+                        for arr in prev.deferred_tokens.iter().chain(std::iter::once(&prev.latest_token_arr)) {
+                            let flat = arr.as_slice::<u32>();
+                            buf.extend_from_slice(flat);
+                            #[cfg(feature = "guided-decoding")]
+                            if let Some(guide) = self.grammar_states.get_mut(&prev.req_id)
+                                && let Some(&token_id) = flat.first()
+                            {
+                                guide.advance(token_id);
+                            }
+                        }
                     }
                 }
             }
@@ -934,15 +940,17 @@ impl Worker for MlxWorker {
         if !req_inputs.is_empty() || num_cached > 1 {
             // Inlined to avoid &mut self borrow conflict with `model`.
             if let Some(prev) = self.pending_fast_decode.take() {
-                let flat = prev.token_arr.as_slice::<u32>();
                 if let Some(buf) = self.token_buffers.get_mut(&prev.req_id) {
-                    buf.extend_from_slice(flat);
-                }
-                #[cfg(feature = "guided-decoding")]
-                if let Some(guide) = self.grammar_states.get_mut(&prev.req_id)
-                    && let Some(&token_id) = flat.first()
-                {
-                    guide.advance(token_id);
+                    for arr in prev.deferred_tokens.iter().chain(std::iter::once(&prev.latest_token_arr)) {
+                        let flat = arr.as_slice::<u32>();
+                        buf.extend_from_slice(flat);
+                        #[cfg(feature = "guided-decoding")]
+                        if let Some(guide) = self.grammar_states.get_mut(&prev.req_id)
+                            && let Some(&token_id) = flat.first()
+                        {
+                            guide.advance(token_id);
+                        }
+                    }
                 }
             }
         }
@@ -1213,7 +1221,7 @@ impl Worker for MlxWorker {
                     if pending.req_id == *req_id && !is_prefill {
                         // Use the *lazy* token array from the previous
                         // async_eval as input — no eval/sync required.
-                        let lazy_input = pending.token_arr.as_dtype(Dtype::Int32).map_err(|e| {
+                        let lazy_input = pending.latest_token_arr.as_dtype(Dtype::Int32).map_err(|e| {
                             ExecutorError::WorkerExecution(format!("pending as_dtype failed: {e}"))
                         })?;
                         let pos = pending.next_position;
@@ -1266,38 +1274,29 @@ impl Worker for MlxWorker {
                     ExecutorError::WorkerExecution(format!("async_eval error: {e}"))
                 })?;
 
-                // The previous pending was consumed when we built input_ids
-                // above (we used its lazy token_arr).  Now that the current
-                // step is async_eval'd, resolve the previous pending to update
-                // token_buffers / grammar state.  The GPU work for the previous
-                // step completed while we were building this step's graph.
-                //
-                // NOTE: we inline this instead of calling
-                // resolve_pending_fast_decode() to avoid a &mut self borrow
-                // that conflicts with the outstanding `model` borrow above.
-                if let Some(prev) = self.pending_fast_decode.take() {
-                    let flat = prev.token_arr.as_slice::<u32>();
-                    if let Some(buf) = self.token_buffers.get_mut(&prev.req_id) {
-                        buf.extend_from_slice(flat);
-                    }
-                    #[cfg(feature = "guided-decoding")]
-                    if let Some(guide) = self.grammar_states.get_mut(&prev.req_id)
-                        && let Some(&token_id) = flat.first()
-                    {
-                        guide.advance(token_id);
-                    }
-                }
-
-                // Return the *current* step's result via d2h_resolver so the
-                // engine can overlap finalize + schedule with GPU work.
+                // Do NOT resolve/block here.  The previous pending's
+                // latest_token_arr was used as lazy input above; push it onto
+                // deferred_tokens and replace with the new token_ids_arr.
+                // Token buffers are only flushed when the request finishes or
+                // exits the fast path — during steady-state decode the GPU
+                // runs back-to-back with zero idle gaps.
                 let resolver_arr = token_ids_arr.clone();
 
-                // Store pending state for the *next* step's double-buffering.
-                self.pending_fast_decode = Some(PendingFastDecode {
-                    req_id: req_id.clone(),
-                    token_arr: token_ids_arr,
-                    next_position: next_pos,
-                });
+                self.pending_fast_decode = if let Some(mut prev) = self.pending_fast_decode.take() {
+                    // Accumulate: move the old latest into deferred, set new latest.
+                    prev.deferred_tokens.push(prev.latest_token_arr);
+                    prev.latest_token_arr = token_ids_arr;
+                    prev.next_position = next_pos;
+                    Some(prev)
+                } else {
+                    // First fast-path step for this request.
+                    Some(PendingFastDecode {
+                        req_id: req_id.clone(),
+                        deferred_tokens: Vec::new(),
+                        latest_token_arr: token_ids_arr,
+                        next_position: next_pos,
+                    })
+                };
 
                 let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
                 self.step_count += 1;
@@ -1324,15 +1323,17 @@ impl Worker for MlxWorker {
         // fast-path decode so that token_buffers are up-to-date for the batch
         // path below.  (Inlined to avoid &mut self borrow conflict with `model`.)
         if let Some(prev) = self.pending_fast_decode.take() {
-            let flat = prev.token_arr.as_slice::<u32>();
             if let Some(buf) = self.token_buffers.get_mut(&prev.req_id) {
-                buf.extend_from_slice(flat);
-            }
-            #[cfg(feature = "guided-decoding")]
-            if let Some(guide) = self.grammar_states.get_mut(&prev.req_id)
-                && let Some(&token_id) = flat.first()
-            {
-                guide.advance(token_id);
+                for arr in prev.deferred_tokens.iter().chain(std::iter::once(&prev.latest_token_arr)) {
+                    let flat = arr.as_slice::<u32>();
+                    buf.extend_from_slice(flat);
+                    #[cfg(feature = "guided-decoding")]
+                    if let Some(guide) = self.grammar_states.get_mut(&prev.req_id)
+                        && let Some(&token_id) = flat.first()
+                    {
+                        guide.advance(token_id);
+                    }
+                }
             }
         }
 

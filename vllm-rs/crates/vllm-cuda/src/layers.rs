@@ -660,7 +660,10 @@ impl Fp8BlockLinear {
         );
 
         // Standard GEMM: x @ dequant_weight^T
-        let out = cublas.gemm_owned(x, dequant_weight.into_gpu_tensor(), alloc);
+        // Use as_gpu_tensor() to borrow — dequant_weight drops after GEMM,
+        // returning the buffer to the caching allocator.
+        let out = cublas.gemm_owned(x, dequant_weight.as_gpu_tensor(), alloc);
+        drop(dequant_weight);
 
         if let Some(bias) = self.bias {
             crate::kernels::bias_add_inplace(out.as_gpu_tensor(), bias, stream);
@@ -1724,8 +1727,341 @@ mod tests {
             bias: None,
             output_dtype: DType::BF16,
         };
-        assert_eq!(block.weight.dim(0), 512);
-        assert_eq!(block.weight.dim(1), 4096);
+        assert_eq!(block.out_features(), 512);
+        assert_eq!(block.in_features(), 4096);
         assert_eq!(block.block_size, [128, 128]);
+    }
+
+    #[test]
+    fn test_linear_layer_fp8_block_variant() {
+        let w = unsafe { GpuTensor::new(0x1000 as *mut u8, &[256, 1024], DType::Fp8E4m3) };
+        let s = unsafe { GpuTensor::new(0x2000 as *mut u8, &[2, 8], DType::F32) };
+        let block = Fp8BlockLinear {
+            weight: w,
+            weight_scale_inv: s,
+            block_size: [128, 128],
+            bias: None,
+            output_dtype: DType::BF16,
+        };
+        let layer = LinearLayer::Fp8Block(Box::new(block));
+        assert_eq!(layer.out_features(), 256);
+        assert_eq!(layer.in_features(), 1024);
+    }
+
+    #[test]
+    fn test_fp8_block_linear_from_impl() {
+        let w = unsafe { GpuTensor::new(0x1000 as *mut u8, &[64, 128], DType::Fp8E4m3) };
+        let s = unsafe { GpuTensor::new(0x2000 as *mut u8, &[1, 1], DType::F32) };
+        let block = Fp8BlockLinear {
+            weight: w,
+            weight_scale_inv: s,
+            block_size: [64, 128],
+            bias: None,
+            output_dtype: DType::BF16,
+        };
+        let layer: LinearLayer = block.into();
+        assert!(matches!(layer, LinearLayer::Fp8Block(_)));
+        assert_eq!(layer.out_features(), 64);
+        assert_eq!(layer.in_features(), 128);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CUDA tests for FP8 block-quantized linear
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod fp8_block_tests {
+    use super::*;
+    use crate::DType;
+    use crate::driver;
+
+    fn init_cuda() -> cudarc::driver::sys::CUstream {
+        unsafe {
+            driver::init().expect("CUDA init");
+            let dev = driver::device_get(0).expect("device");
+            let _ctx = driver::ctx_create(dev).expect("context");
+            driver::stream_create().expect("stream")
+        }
+    }
+
+    /// Test Fp8BlockLinear forward with a known weight/scale pattern.
+    ///
+    /// Weight [4, 4] FP8 with block_size=[2, 2], scale [2, 2].
+    /// Verify dequant + GEMM produces correct output.
+    #[test]
+    fn test_fp8_block_linear_forward() {
+        let stream = init_cuda();
+        unsafe {
+            let mut cublas = CublasHandle::new(stream).unwrap();
+            let mut alloc = CachingAllocator::new();
+
+            let n = 4usize;
+            let k = 4usize;
+            let block_n = 2usize;
+            let block_k = 2usize;
+
+            // FP8 E4M3 weight: encode small integer values that are exact in FP8.
+            // E4M3 can represent integers 0-8 exactly.
+            // Weight matrix [4, 4] = [[1,2,1,2], [3,4,3,4], [1,2,1,2], [3,4,3,4]]
+            let weight_vals: Vec<f32> = vec![
+                1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0,
+            ];
+            let weight_fp8: Vec<u8> = weight_vals
+                .iter()
+                .map(|&v| half::f8e4m3fn::from_f32(v).to_bits())
+                .collect();
+
+            // Scale [2, 2] — all 1.0 so dequant(w) = w * scale = w.
+            let scale_vals: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
+
+            // Upload weight.
+            let gpu_w = driver::mem_alloc(n * k).unwrap();
+            driver::memcpy_htod_async(gpu_w, weight_fp8.as_ptr() as *const u8, n * k, stream)
+                .unwrap();
+            let w = GpuTensor::new(gpu_w, &[n, k], DType::Fp8E4m3);
+
+            // Upload scale.
+            let gpu_s = driver::mem_alloc(4 * 4).unwrap(); // 4 f32s
+            driver::memcpy_htod_async(gpu_s, scale_vals.as_ptr() as *const u8, 4 * 4, stream)
+                .unwrap();
+            let s = GpuTensor::new(gpu_s, &[2, 2], DType::F32);
+
+            let layer = Fp8BlockLinear {
+                weight: w,
+                weight_scale_inv: s,
+                block_size: [block_n, block_k],
+                bias: None,
+                output_dtype: DType::BF16,
+            };
+
+            // Input [1, 4] BF16 = [1, 1, 1, 1]
+            let input_f32: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];
+            let input_bf16: Vec<u16> = input_f32
+                .iter()
+                .map(|&v| half::bf16::from_f32(v).to_bits())
+                .collect();
+            let gpu_x = driver::mem_alloc(k * 2).unwrap();
+            driver::memcpy_htod_async(gpu_x, input_bf16.as_ptr() as *const u8, k * 2, stream)
+                .unwrap();
+            let x = GpuTensor::new(gpu_x, &[1, k], DType::BF16);
+
+            // Forward: y = x @ W^T, x=[1,4] all-ones, W=[4,4]
+            // y[j] = sum_k(W[j][k]) = row sum
+            // Row sums: [6, 14, 6, 14]
+            let out = layer.forward_owned(x, &mut cublas, &mut alloc, stream);
+            assert_eq!(out.as_gpu_tensor().dim(0), 1);
+            assert_eq!(out.as_gpu_tensor().dim(1), n);
+
+            let host_out = driver::mem_alloc_host(n * 2).unwrap();
+            driver::memcpy_dtoh_async(host_out, out.as_gpu_tensor().raw_ptr(), n * 2, stream)
+                .unwrap();
+            driver::stream_synchronize(stream).unwrap();
+
+            let out_bf16 = std::slice::from_raw_parts(host_out as *const u16, n);
+            let actual: Vec<f32> = out_bf16
+                .iter()
+                .map(|&bits| half::bf16::from_bits(bits).to_f32())
+                .collect();
+            let expected = [6.0, 14.0, 6.0, 14.0];
+            for (i, (&got, &exp)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (got - exp).abs() < 0.5,
+                    "fp8_block forward[{i}]: expected {exp}, got {got}"
+                );
+            }
+
+            driver::mem_free_host(host_out).unwrap();
+            driver::stream_destroy(stream).unwrap();
+        }
+    }
+
+    /// Regression test: Fp8BlockLinear::forward_owned must not leak
+    /// the dequantized weight buffer. Running forward twice should NOT
+    /// increase active_bytes (the caching allocator recycles the buffer).
+    #[test]
+    fn test_fp8_block_linear_no_leak() {
+        let stream = init_cuda();
+        unsafe {
+            let mut cublas = CublasHandle::new(stream).unwrap();
+            let mut alloc = CachingAllocator::new();
+
+            let n = 128usize;
+            let k = 128usize;
+
+            // Create trivial FP8 weight and scale.
+            let weight_fp8: Vec<u8> = vec![0u8; n * k]; // all zeros
+            let scale_vals: Vec<f32> = vec![1.0; 1]; // single block
+
+            let gpu_w = driver::mem_alloc(n * k).unwrap();
+            driver::memcpy_htod_async(gpu_w, weight_fp8.as_ptr() as *const u8, n * k, stream)
+                .unwrap();
+            let w = GpuTensor::new(gpu_w, &[n, k], DType::Fp8E4m3);
+
+            let gpu_s = driver::mem_alloc(4).unwrap();
+            driver::memcpy_htod_async(gpu_s, scale_vals.as_ptr() as *const u8, 4, stream).unwrap();
+            let s = GpuTensor::new(gpu_s, &[1, 1], DType::F32);
+
+            let layer = Fp8BlockLinear {
+                weight: w,
+                weight_scale_inv: s,
+                block_size: [n, k],
+                bias: None,
+                output_dtype: DType::BF16,
+            };
+
+            // Input [1, k] BF16
+            let input_bf16: Vec<u16> = vec![0u16; k];
+            let gpu_x = driver::mem_alloc(k * 2).unwrap();
+            driver::memcpy_htod_async(gpu_x, input_bf16.as_ptr() as *const u8, k * 2, stream)
+                .unwrap();
+
+            // First forward — establishes the allocator's pool.
+            let x1 = GpuTensor::new(gpu_x, &[1, k], DType::BF16);
+            let out1 = layer.forward_owned(x1, &mut cublas, &mut alloc, stream);
+            drop(out1);
+            driver::stream_synchronize(stream).unwrap();
+            let bytes_after_first = alloc.active_bytes();
+
+            // Second forward — should reuse pools, NOT grow active_bytes.
+            let x2 = GpuTensor::new(gpu_x, &[1, k], DType::BF16);
+            let out2 = layer.forward_owned(x2, &mut cublas, &mut alloc, stream);
+            drop(out2);
+            driver::stream_synchronize(stream).unwrap();
+            let bytes_after_second = alloc.active_bytes();
+
+            assert_eq!(
+                bytes_after_first, bytes_after_second,
+                "FP8 block forward leaked: {} bytes after first, {} after second",
+                bytes_after_first, bytes_after_second
+            );
+
+            driver::stream_destroy(stream).unwrap();
+        }
+    }
+
+    /// Test load_fp8_block_linear from safetensors.
+    #[test]
+    fn test_load_fp8_block_linear_safetensors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+
+        // Create FP8 weight [8, 16] and scale [1, 2] (block_size = [8, 8]).
+        let n = 8usize;
+        let k = 16usize;
+        let weight_data: Vec<u8> = vec![0u8; n * k]; // FP8 zeros
+        let scale_data: Vec<f32> = vec![1.0, 1.0]; // [1, 2] scale
+        let scale_bytes: Vec<u8> = scale_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        let tensors = vec![
+            (
+                "proj.weight",
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F8_E4M3,
+                    vec![n, k],
+                    &weight_data,
+                )
+                .unwrap(),
+            ),
+            (
+                "proj.weight_scale_inv",
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F32,
+                    vec![1, 2],
+                    &scale_bytes,
+                )
+                .unwrap(),
+            ),
+        ];
+        safetensors::serialize_to_file(tensors, None, &path).unwrap();
+
+        let stream = init_cuda();
+        let mut gw = crate::weights::GpuWeights::from_single_file(&path, stream).unwrap();
+        unsafe { driver::stream_synchronize(stream).unwrap() };
+
+        let layer = crate::weights::load_fp8_block_linear(&mut gw, "proj", DType::BF16).unwrap();
+
+        assert_eq!(layer.out_features(), n);
+        assert_eq!(layer.in_features(), k);
+        assert_eq!(layer.block_size, [8, 8]); // n/scale_rows=8/1=8, k/scale_cols=16/2=8
+        assert!(layer.bias.is_none());
+
+        unsafe { driver::stream_destroy(stream).unwrap() };
+    }
+
+    /// Test load_fused_fp8_block_linear from safetensors (2 shards).
+    #[test]
+    fn test_load_fused_fp8_block_linear_safetensors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+
+        // Two shards: gate [8, 16] and up [8, 16], block_size=[8, 8].
+        let n = 8usize;
+        let k = 16usize;
+        let weight_data: Vec<u8> = vec![0u8; n * k];
+        let scale_data: Vec<f32> = vec![1.0, 1.0]; // [1, 2]
+        let scale_bytes: Vec<u8> = scale_data.iter().flat_map(|f| f.to_le_bytes()).collect();
+
+        let tensors = vec![
+            (
+                "gate.weight",
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F8_E4M3,
+                    vec![n, k],
+                    &weight_data,
+                )
+                .unwrap(),
+            ),
+            (
+                "gate.weight_scale_inv",
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F32,
+                    vec![1, 2],
+                    &scale_bytes,
+                )
+                .unwrap(),
+            ),
+            (
+                "up.weight",
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F8_E4M3,
+                    vec![n, k],
+                    &weight_data,
+                )
+                .unwrap(),
+            ),
+            (
+                "up.weight_scale_inv",
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F32,
+                    vec![1, 2],
+                    &scale_bytes,
+                )
+                .unwrap(),
+            ),
+        ];
+        safetensors::serialize_to_file(tensors, None, &path).unwrap();
+
+        let stream = init_cuda();
+        let mut gw = crate::weights::GpuWeights::from_single_file(&path, stream).unwrap();
+        unsafe { driver::stream_synchronize(stream).unwrap() };
+
+        let layer = crate::weights::load_fused_fp8_block_linear(
+            &mut gw,
+            &["gate".to_string(), "up".to_string()],
+            DType::BF16,
+            stream,
+        )
+        .unwrap();
+
+        // Fused: [8+8, 16] = [16, 16]
+        assert_eq!(layer.out_features(), 2 * n);
+        assert_eq!(layer.in_features(), k);
+        assert_eq!(layer.block_size, [8, 8]);
+        // Scale should be [2, 2] (2 shards × 1 scale row each, 2 cols)
+        assert_eq!(layer.weight_scale_inv.dim(0), 2);
+        assert_eq!(layer.weight_scale_inv.dim(1), 2);
+
+        unsafe { driver::stream_destroy(stream).unwrap() };
     }
 }

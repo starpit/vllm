@@ -162,6 +162,12 @@ impl CachingAllocator {
         self.peak_active_bytes = self.active_bytes;
     }
 
+    /// Bytes currently allocated and not yet freed. Mirrors PyTorch's
+    /// `allocated_bytes.all.current` stat.
+    pub fn active_bytes(&self) -> usize {
+        self.active_bytes
+    }
+
     /// Peak active bytes since last `reset_peak_stats()`. Mirrors PyTorch's
     /// `allocated_bytes.all.peak` stat.
     pub fn peak_active_bytes(&self) -> usize {

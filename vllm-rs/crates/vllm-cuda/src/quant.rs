@@ -241,6 +241,11 @@ pub fn detect_quant_config(model_dir: impl AsRef<Path>) -> Result<QuantConfig> {
                 return parse_compressed_tensors_config(qc);
             }
 
+            // No quant_method or explicitly null → not quantized.
+            if method.is_empty() {
+                return Ok(QuantConfig::None);
+            }
+
             // Check for BitsAndBytes.
             if method == "bitsandbytes" {
                 let load_4bit = qc
@@ -686,6 +691,19 @@ mod tests {
     fn test_detect_no_quant() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), r#"{"hidden_size": 4096}"#).unwrap();
+        let config = detect_quant_config(dir.path()).unwrap();
+        assert!(matches!(config, QuantConfig::None));
+    }
+
+    #[test]
+    fn test_detect_quant_method_null() {
+        // Some HF models have quantization_config with quant_method: null
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"quantization_config": {"quant_method": null}}"#,
+        )
+        .unwrap();
         let config = detect_quant_config(dir.path()).unwrap();
         assert!(matches!(config, QuantConfig::None));
     }

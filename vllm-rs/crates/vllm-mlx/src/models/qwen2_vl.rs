@@ -154,7 +154,7 @@ impl MlxQwen2VisionAttention {
             .reshape(&[1, num_heads, seq_len, head_dim])?;
 
         let scale = (self.head_dim as f32).powf(-0.5);
-        let attn_output = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, None)?;
+        let attn_output = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?;
 
         // Remove batch dim: [1, num_heads, seq_len, head_dim] → [seq_len, hidden]
         let attn_output = attn_output

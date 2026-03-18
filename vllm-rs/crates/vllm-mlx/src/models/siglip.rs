@@ -284,7 +284,7 @@ impl MlxSiglipEncoderLayer {
 
         // Scaled dot-product attention (no mask = bidirectional).
         let scale = (self.head_dim as f32).powf(-0.5);
-        let attn_output = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, None)?;
+        let attn_output = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?;
 
         // Reshape back to [B, S, hidden_size].
         let hidden = num_heads * head_dim;

@@ -355,7 +355,7 @@ impl MlxGemma2Attention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None::<&Array>)?;
 
         // [1, heads, seq, head_dim] -> [seq, hidden]
         let hidden = (self.num_heads * self.head_dim) as i32;
@@ -435,7 +435,7 @@ impl MlxGemma2Attention {
 
             // Single SDPA: q_len=1 decode -> no mask needed.
             let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
+                &q_stacked, &k_stacked, &v_stacked, self.scale, None, None::<&Array>,
             )?;
 
             // out: [batch, heads, 1, head_dim] -> [batch, heads*head_dim]
@@ -471,6 +471,7 @@ impl MlxGemma2Attention {
                     &v,
                     self.scale,
                     mask,
+                    None::<&Array>,
                 )?;
 
                 let hidden = (self.num_heads * self.head_dim) as i32;
@@ -962,7 +963,7 @@ impl MlxQuantizedGemma2Attention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None::<&Array>)?;
 
         let hidden = (self.num_heads * self.head_dim) as i32;
         let out = out
@@ -1038,7 +1039,7 @@ impl MlxQuantizedGemma2Attention {
             let v_stacked = mlx_rs::ops::concatenate_axis(&per_req_v, 0)?;
 
             let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
+                &q_stacked, &k_stacked, &v_stacked, self.scale, None, None::<&Array>,
             )?;
 
             let hidden = (self.num_heads * self.head_dim) as i32;
@@ -1072,6 +1073,7 @@ impl MlxQuantizedGemma2Attention {
                     &v,
                     self.scale,
                     mask,
+                    None::<&Array>,
                 )?;
 
                 let hidden = (self.num_heads * self.head_dim) as i32;

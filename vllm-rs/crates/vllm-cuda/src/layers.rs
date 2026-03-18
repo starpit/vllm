@@ -422,9 +422,9 @@ impl Fp8Linear {
             let a_scale = input_scale.as_ptr::<f32>();
             let x_fp8 = crate::kernels::scaled_fp8_quant_static(x, a_scale, alloc, stream);
             // input_scale is [1] (scalar) — CUTLASS handles scalar a_scale correctly.
-            if let Some(bias) = self.bias {
+            let result = if let Some(bias) = self.bias {
                 crate::kernels::cutlass_scaled_mm_with_bias(
-                    x_fp8.into_gpu_tensor(),
+                    x_fp8.as_gpu_tensor(),
                     self.weight,
                     *input_scale,
                     self.weight_scale,
@@ -435,7 +435,7 @@ impl Fp8Linear {
                 )
             } else {
                 crate::kernels::cutlass_scaled_mm(
-                    x_fp8.into_gpu_tensor(),
+                    x_fp8.as_gpu_tensor(),
                     self.weight,
                     *input_scale,
                     self.weight_scale,
@@ -443,7 +443,9 @@ impl Fp8Linear {
                     alloc,
                     stream,
                 )
-            }
+            };
+            drop(x_fp8);
+            result
         } else {
             // Dynamic per-token activation quantization.
             // Uses CUTLASS cutlass_scaled_mm with fused per-row scale_a epilogue —
@@ -453,11 +455,11 @@ impl Fp8Linear {
             // 2. CUTLASS FP8 GEMM with per-token a_scales + per-tensor b_scale
             //    fused into the epilogue. ONE kernel launch.
             let (x_fp8, x_scales) = crate::kernels::scaled_fp8_quant_dynamic(x, alloc, stream);
-            if let Some(bias) = self.bias {
+            let result = if let Some(bias) = self.bias {
                 crate::kernels::cutlass_scaled_mm_with_bias(
-                    x_fp8.into_gpu_tensor(),
+                    x_fp8.as_gpu_tensor(),
                     self.weight,
-                    x_scales.into_gpu_tensor(),
+                    x_scales.as_gpu_tensor(),
                     self.weight_scale,
                     bias,
                     self.output_dtype,
@@ -466,15 +468,18 @@ impl Fp8Linear {
                 )
             } else {
                 crate::kernels::cutlass_scaled_mm(
-                    x_fp8.into_gpu_tensor(),
+                    x_fp8.as_gpu_tensor(),
                     self.weight,
-                    x_scales.into_gpu_tensor(),
+                    x_scales.as_gpu_tensor(),
                     self.weight_scale,
                     self.output_dtype,
                     alloc,
                     stream,
                 )
-            }
+            };
+            drop(x_fp8);
+            drop(x_scales);
+            result
         }
     }
 

@@ -3326,7 +3326,11 @@ pub unsafe fn flash_attn_paged_ext(
     // Python: (max_seqlen_q + 64 - 1) / 64 (line 310)
     let num_m_blocks = eff_max_seqlen_q.div_ceil(64);
 
-    let num_splits = if do_swap && num_sm > 0 {
+    // Split-K heuristic: parallelize K blocks across SMs when there aren't
+    // enough CTAs to fill the GPU. Matches Python vLLM which passes
+    // num_splits=0 (auto) to FA2. Previously gated on do_swap (decode only),
+    // but partial prefill with few query tokens also needs this.
+    let num_splits = if num_sm > 0 {
         num_splits_heuristic(
             batch_size * eff_num_heads * num_m_blocks,
             (num_sm as usize) * 2,

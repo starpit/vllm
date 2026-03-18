@@ -23,8 +23,27 @@ use vllm_executor::error::{ExecutorError, ExecutorResult};
 use vllm_executor::worker::Worker;
 use vllm_model::weight::HfModelConfig;
 
-use crate::cache::{self, MlxKvCache};
+use crate::cache::{self, BatchMlxLayerKvCache, MlxKvCache};
 use crate::models::{MlxModel, MlxModelRegistry};
+
+/// State saved between execute_model calls for double-buffered async_eval.
+///
+/// After async_eval submits the current step, we store the unread GPU
+/// sampling arrays and the pre-built output.  At the start of the NEXT
+/// execute_model call, we read these arrays (instant — GPU finished during
+/// the main thread's finalize + schedule), update token_buffers, and
+/// return the stored output.
+struct PendingStep {
+    /// Pre-built output for the previous step (req_ids, sampled_token_ids
+    /// are NOT yet populated — token_ids_placeholder is empty vecs).
+    req_ids: Vec<String>,
+    /// GPU greedy result array (unread).  `None` if no greedy requests.
+    greedy_result: Option<Array>,
+    /// Per-request index into greedy_result's flat output.
+    greedy_mapping: Vec<(String, usize)>, // (req_id, batch_pos)
+    /// GPU temperature result arrays (unread), one per temperature group.
+    temp_results: Vec<(Vec<(String, usize)>, Array)>, // ([(req_id, batch_pos)], array)
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -82,94 +101,29 @@ impl MlxWorkerConfig {
 /// Maximum number of KV caches retained in the prefix cache pool.
 const PREFIX_CACHE_POOL_MAX: usize = 32;
 
-/// Hash the block-aligned prefix of a prompt.
+/// Persistent batched KV caches for decode.
+///
+/// Persists across steps when the batch composition is stable (same request IDs
+/// in the same order). Rebuilt when requests join or leave.
+struct BatchedDecodeCache {
+    /// Ordered request IDs in this batch.
+    req_ids: Vec<String>,
+    /// One batched KV cache per model layer.
+    layer_caches: Vec<BatchMlxLayerKvCache>,
+    /// Per layer, per request left-padding offset.
+    left_padding: Vec<Vec<usize>>,
+}
+
+/// Hash the block-aligned prefix of a prompt (same logic as `SimpleBlockTracker::hash_block`).
 ///
 /// Only full blocks are hashed — trailing partial blocks are ignored so that
 /// the hash matches the scheduler's prefix lookup.
-///
-/// When `spans_config` is enabled, hashing uses parent-chain semantics:
-/// - Blocks starting with `token_plus` reset the parent hash (fan-in).
-/// - Blocks starting with `token_cross` fold all prior tokens into the hash.
-fn hash_prefix(prompt: &[u32], block_size: usize, spans: &vllm_config::SpansConfig) -> u64 {
+fn hash_prefix(prompt: &[u32], block_size: usize) -> u64 {
     let num_full_blocks = prompt.len() / block_size;
-    if num_full_blocks == 0 {
-        return 0;
-    }
-
-    if !spans.enabled {
-        // Original fast path: single hash over the entire block-aligned prefix.
-        let prefix_len = num_full_blocks * block_size;
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        prompt[..prefix_len].hash(&mut hasher);
-        return hasher.finish();
-    }
-
-    // Span-aware: chain block hashes with fan-in / cross-context logic.
-    // The final hash of the last full block represents the entire prefix.
-    const NONE_HASH: u64 = 0;
-    let mut parent_hash = NONE_HASH;
-
-    for i in 0..num_full_blocks {
-        let start = i * block_size;
-        let end = start + block_size;
-        let block = &prompt[start..end];
-        let first_token = block[0];
-
-        // Fan-in: reset parent if block starts with token_plus.
-        let effective_parent = if spans.has_fan_in() && Some(first_token) == spans.token_plus {
-            NONE_HASH
-        } else {
-            parent_hash
-        };
-
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        effective_parent.hash(&mut hasher);
-        block.hash(&mut hasher);
-
-        // Cross-context: fold all preceding tokens into the hash.
-        if spans.has_cross() && Some(first_token) == spans.token_cross {
-            prompt[..start].hash(&mut hasher);
-        }
-
-        parent_hash = hasher.finish();
-    }
-
-    parent_hash
-}
-
-/// Compute per-block hashes for a token sequence.
-/// Returns one hash per full block, using span-aware parent chaining.
-fn hash_blocks(tokens: &[u32], block_size: usize, spans: &vllm_config::SpansConfig) -> Vec<u64> {
-    let num_full_blocks = tokens.len() / block_size;
-    let mut hashes = Vec::with_capacity(num_full_blocks);
-    const NONE_HASH: u64 = 0;
-    let mut parent_hash = NONE_HASH;
-
-    for i in 0..num_full_blocks {
-        let start = i * block_size;
-        let end = start + block_size;
-        let block = &tokens[start..end];
-        let first_token = block[0];
-
-        let effective_parent =
-            if spans.enabled && spans.has_fan_in() && Some(first_token) == spans.token_plus {
-                NONE_HASH
-            } else {
-                parent_hash
-            };
-
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        effective_parent.hash(&mut hasher);
-        block.hash(&mut hasher);
-
-        if spans.has_cross() && Some(first_token) == spans.token_cross {
-            tokens[..start].hash(&mut hasher);
-        }
-
-        parent_hash = hasher.finish();
-        hashes.push(parent_hash);
-    }
-    hashes
+    let prefix_len = num_full_blocks * block_size;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    prompt[..prefix_len].hash(&mut hasher);
+    hasher.finish()
 }
 
 /// A worker backed by MLX for Apple Silicon GPU inference.
@@ -225,13 +179,16 @@ pub struct MlxWorker {
     enable_prefix_caching: bool,
     /// Block size for prefix hashing (must match scheduler block size).
     prefix_block_size: usize,
-    /// Spans (relocatable KV cache blocks) configuration.
-    spans_config: vllm_config::SpansConfig,
 
-    /// Per-block KV cache pool for span-aware prefix caching.
-    /// Maps per-block hash → per-layer `(K_block, V_block)` arrays.
-    /// K/V shape: `[1, heads, block_size, head_dim]`.
-    block_kv_pool: HashMap<u64, Vec<(mlx_rs::Array, mlx_rs::Array)>>,
+    /// Persistent batched KV caches for decode. Persists across steps when
+    /// the batch composition is stable. Rebuilt when requests join/leave.
+    batched_decode_cache: Option<BatchedDecodeCache>,
+
+    /// Double-buffer state: previous step's unread GPU sampling arrays and
+    /// the pre-built ModelRunnerOutput.  On the next execute_model call, we
+    /// read these arrays (instant — GPU already finished), update
+    /// token_buffers, and return this output.  See `project_double_buffer_design`.
+    pending_step: Option<PendingStep>,
 
     // Timing instrumentation.
     step_count: usize,
@@ -271,8 +228,8 @@ impl MlxWorker {
             kv_cache_pool: HashMap::new(),
             enable_prefix_caching,
             prefix_block_size,
-            spans_config: vllm_config::SpansConfig::from_env(),
-            block_kv_pool: HashMap::new(),
+            batched_decode_cache: None,
+            pending_step: None,
             step_count: 0,
             prefill_count: 0,
             decode_count: 0,
@@ -743,6 +700,44 @@ impl Worker for MlxWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
+        // --- Double-buffer flush: read PREVIOUS step's GPU results ---
+        // These were async_eval'd last call.  By now the GPU is done (the main
+        // thread did finalize + schedule in between).  as_slice is instant.
+        let prev_output = if let Some(pending) = self.pending_step.take() {
+            let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
+            if let Some(ref greedy_result) = pending.greedy_result {
+                let flat = greedy_result.as_slice::<u32>();
+                for (req_id, batch_pos) in &pending.greedy_mapping {
+                    let token_id = flat[*batch_pos];
+                    token_map.insert(req_id.clone(), vec![token_id]);
+                    if let Some(buf) = self.token_buffers.get_mut(req_id) {
+                        buf.push(token_id);
+                    }
+                    #[cfg(feature = "guided-decoding")]
+                    if let Some(guide) = self.grammar_states.get_mut(req_id) {
+                        guide.advance(token_id);
+                    }
+                }
+            }
+            for (mapping, arr) in &pending.temp_results {
+                let flat = arr.as_slice::<u32>();
+                for (req_id, batch_pos) in mapping {
+                    let token_id = flat[*batch_pos];
+                    token_map.insert(req_id.clone(), vec![token_id]);
+                    if let Some(buf) = self.token_buffers.get_mut(req_id) {
+                        buf.push(token_id);
+                    }
+                    #[cfg(feature = "guided-decoding")]
+                    if let Some(guide) = self.grammar_states.get_mut(req_id) {
+                        guide.advance(token_id);
+                    }
+                }
+            }
+            Some(ModelRunnerOutput::from_token_map(token_map))
+        } else {
+            None
+        };
+
         // Lazily build grammar vocabulary if any new request needs constrained decoding.
         // Done before borrowing self.model to satisfy the borrow checker.
         #[cfg(feature = "guided-decoding")]
@@ -765,6 +760,38 @@ impl Worker for MlxWorker {
         let num_layers = model.num_layers();
 
         // Clean up finished requests — stash KV caches for prefix reuse.
+        // If a finished request's cache lives in the persistent batched cache,
+        // extract it first, then invalidate the batched cache.
+        if !scheduler_output.finished_req_ids.is_empty() {
+            let any_finished_in_batch = self
+                .batched_decode_cache
+                .as_ref()
+                .is_some_and(|bdc| {
+                    scheduler_output
+                        .finished_req_ids
+                        .iter()
+                        .any(|rid| bdc.req_ids.contains(rid))
+                });
+
+            if any_finished_in_batch {
+                // Extract ALL individual caches from the batch.
+                // Finished ones will be cleaned up below; remaining ones
+                // are available for the next batch formation.
+                let bdc = self.batched_decode_cache.take().unwrap();
+                for (idx, rid) in bdc.req_ids.iter().enumerate() {
+                    let mut per_req_kv: MlxKvCache = Vec::with_capacity(num_layers);
+                    for layer_idx in 0..num_layers {
+                        let left_pad = bdc.left_padding[layer_idx][idx];
+                        let layer_cache = bdc.layer_caches[layer_idx]
+                            .extract_individual(idx, left_pad)
+                            .ok();
+                        per_req_kv.push(layer_cache);
+                    }
+                    self.kv_caches.insert(rid.clone(), per_req_kv);
+                }
+            }
+        }
+
         for req_id in &scheduler_output.finished_req_ids {
             if self.enable_prefix_caching {
                 if let (Some(prompt), Some(kv_cache)) = (
@@ -772,48 +799,15 @@ impl Worker for MlxWorker {
                     self.kv_caches.remove(req_id),
                 ) {
                     if prompt.len() >= self.prefix_block_size {
-                        let h = hash_prefix(prompt, self.prefix_block_size, &self.spans_config);
+                        let h = hash_prefix(prompt, self.prefix_block_size);
                         if !self.kv_cache_pool.contains_key(&h) {
+                            // FIFO eviction when pool is full.
                             if self.kv_cache_pool.len() >= PREFIX_CACHE_POOL_MAX
                                 && let Some(&oldest) = self.kv_cache_pool.keys().next()
                             {
                                 self.kv_cache_pool.remove(&oldest);
                             }
-                            self.kv_cache_pool.insert(h, kv_cache.clone());
-                        }
-
-                        // Spans: store per-block KV chunks for block-level reuse.
-                        // Only store PLUS (fan-in) blocks — they're relocatable.
-                        // CROSS blocks are position-dependent and only match when
-                        // all prior context is identical (handled by whole-prefix pool).
-                        if self.spans_config.has_fan_in() {
-                            let block_hashes =
-                                hash_blocks(prompt, self.prefix_block_size, &self.spans_config);
-                            for (bi, bh) in block_hashes.iter().enumerate() {
-                                if self.block_kv_pool.contains_key(bh) {
-                                    continue;
-                                }
-                                // Only cache blocks starting with token_plus.
-                                let block_start = bi * self.prefix_block_size;
-                                let is_span_block = block_start < prompt.len()
-                                    && Some(prompt[block_start]) == self.spans_config.token_plus;
-                                if !is_span_block {
-                                    continue;
-                                }
-                                let start = block_start as i32;
-                                let end = start + self.prefix_block_size as i32;
-                                let mut block_layers = Vec::with_capacity(kv_cache.len());
-                                for layer in kv_cache.iter().flatten() {
-                                    let k_block = layer.k_slice(start, end);
-                                    let v_block = layer.v_slice(start, end);
-                                    if let (Ok(kb), Ok(vb)) = (k_block, v_block) {
-                                        block_layers.push((kb, vb));
-                                    }
-                                }
-                                if !block_layers.is_empty() {
-                                    self.block_kv_pool.insert(*bh, block_layers);
-                                }
-                            }
+                            self.kv_cache_pool.insert(h, kv_cache);
                         }
                     }
                 } else {
@@ -896,9 +890,9 @@ impl Worker for MlxWorker {
             // Try to reuse a cached KV from the prefix pool.
             let kv_cache = if num_computed > 0 && self.enable_prefix_caching {
                 let prefix = &prompt_ids[..num_computed];
-                let h = hash_prefix(prefix, self.prefix_block_size, &self.spans_config);
+                let h = hash_prefix(prefix, self.prefix_block_size);
                 if let Some(cached) = self.kv_cache_pool.get(&h) {
-                    // Whole-prefix hit: clone (MLX copy-on-write) and truncate.
+                    // Clone (MLX copy-on-write) and truncate to the matched prefix length.
                     let mut kv = cached.clone();
                     for layer in kv.iter_mut().flatten() {
                         if layer.seq_len() > num_computed {
@@ -910,92 +904,6 @@ impl Worker for MlxWorker {
                         new_req.req_id, num_computed
                     );
                     kv
-                } else if self.spans_config.has_fan_in() && !self.block_kv_pool.is_empty() {
-                    // Spans: try per-block matching. Check each block independently.
-                    let block_hashes =
-                        hash_blocks(prompt_ids, self.prefix_block_size, &self.spans_config);
-                    let num_full_blocks = prompt_ids.len() / self.prefix_block_size;
-
-                    // Count how many contiguous blocks from the start we can match.
-                    // We need contiguous because the scheduler expects a contiguous
-                    // num_computed_tokens prefix.
-                    let mut matched_blocks = 0usize;
-                    for bh in &block_hashes[..num_full_blocks] {
-                        if self.block_kv_pool.contains_key(bh) {
-                            matched_blocks += 1;
-                        } else {
-                            break; // For now, require contiguous match from start.
-                            // With spans, all doc blocks should match even if
-                            // the last block (query) doesn't.
-                        }
-                    }
-
-                    if matched_blocks > 0 {
-                        // Reassemble KV cache from per-block cached chunks.
-                        let matched_tokens = matched_blocks * self.prefix_block_size;
-                        let first_block_kv = self.block_kv_pool.get(&block_hashes[0]).unwrap();
-                        let num_kv_layers = first_block_kv.len();
-
-                        // Concatenate per-block K/V along the sequence dimension.
-                        let mut assembled_kv: MlxKvCache = Vec::with_capacity(num_kv_layers);
-                        for layer_idx in 0..num_kv_layers {
-                            let mut k_parts = Vec::with_capacity(matched_blocks);
-                            let mut v_parts = Vec::with_capacity(matched_blocks);
-                            for bh in &block_hashes[..matched_blocks] {
-                                if let Some(block_kv) = self.block_kv_pool.get(bh) {
-                                    let (ref kb, ref vb) = block_kv[layer_idx];
-                                    k_parts.push(kb.clone());
-                                    v_parts.push(vb.clone());
-                                }
-                            }
-                            if k_parts.len() == matched_blocks {
-                                let k_cat = mlx_rs::ops::concatenate_axis(&k_parts, 2);
-                                let v_cat = mlx_rs::ops::concatenate_axis(&v_parts, 2);
-                                if let (Ok(k), Ok(v)) = (k_cat, v_cat) {
-                                    assembled_kv.push(Some(
-                                        cache::MlxLayerKvCache::from_kv(&k, &v)
-                                            .unwrap_or_else(|_| {
-                                                // Fallback: return None for this layer.
-                                                panic!("failed to create MlxLayerKvCache from block KVs")
-                                            }),
-                                    ));
-                                } else {
-                                    assembled_kv.push(None);
-                                }
-                            } else {
-                                assembled_kv.push(None);
-                            }
-                        }
-
-                        // Materialize the concatenated arrays to avoid
-                        // lazy-evaluation overhead during the forward pass.
-                        let mut eval_targets = Vec::new();
-                        for layer in assembled_kv.iter().flatten() {
-                            if let (Ok(k), Ok(v)) = (
-                                layer.k_slice(0, matched_tokens as i32),
-                                layer.v_slice(0, matched_tokens as i32),
-                            ) {
-                                eval_targets.push(k);
-                                eval_targets.push(v);
-                            }
-                        }
-                        if !eval_targets.is_empty() {
-                            let refs: Vec<&mlx_rs::Array> = eval_targets.iter().collect();
-                            let _ = mlx_rs::transforms::eval(refs);
-                        }
-
-                        debug!(
-                            "per-block cache hit for req {} ({} blocks = {} tokens matched)",
-                            new_req.req_id, matched_blocks, matched_tokens
-                        );
-                        assembled_kv
-                    } else {
-                        debug!(
-                            "prefix cache miss for req {} ({} computed tokens, forwarding all)",
-                            new_req.req_id, num_computed
-                        );
-                        cache::empty_kv_cache(num_layers)
-                    }
                 } else {
                     debug!(
                         "prefix cache miss for req {} ({} computed tokens, forwarding all)",
@@ -1378,39 +1286,199 @@ impl Worker for MlxWorker {
             let input_ids_arr = Array::from_iter(flat_token_ids, &[total]);
             let positions_arr = Array::from_iter(flat_positions, &[total]);
 
-            // Extract KV caches via mem::take (avoids HashMap remove+insert rehashing).
-            let mut batch_kv_caches: Vec<cache::MlxKvCache> = batch_indices
+            // Check if we can use the persistent batched decode cache.
+            let batch_req_ids: Vec<String> = batch_indices
                 .iter()
-                .map(|&idx| {
-                    let req_id = &req_inputs[idx].req_id;
-                    self.kv_caches
-                        .get_mut(req_id)
-                        .map(std::mem::take)
-                        .unwrap_or_else(|| cache::empty_kv_cache(num_layers))
-                })
+                .map(|&idx| req_inputs[idx].req_id.clone())
                 .collect();
+            let all_decode = batch_info.q_lens.iter().all(|&ql| ql == 1)
+                && batch_indices.len() > 1
+                && model.supports_batch_decode();
+            let cache_matches = self
+                .batched_decode_cache
+                .as_ref()
+                .is_some_and(|c| c.req_ids == batch_req_ids);
 
-            // Single batched forward call.
-            let all_logits = model
-                .forward_batch(
+            let all_logits = if all_decode && cache_matches {
+                // === Fast path: reuse persistent batched cache ===
+                // Only a single slice_update per layer (no from_individual, no write_back).
+                // Take the cache out to satisfy the borrow checker (model borrows self.model,
+                // bdc borrows self.batched_decode_cache — must not overlap through self).
+                let mut bdc = self.batched_decode_cache.take().unwrap();
+                let result = model.forward_batch_decode(
                     &input_ids_arr,
-                    &positions_arr,
                     &batch_info,
-                    &mut batch_kv_caches,
-                )
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
-                })?;
-
-            // Put KV caches back (direct assignment avoids HashMap rehashing for existing keys).
-            for &idx in &batch_indices {
-                let kv = batch_kv_caches.remove(0);
-                if let Some(slot) = self.kv_caches.get_mut(&req_inputs[idx].req_id) {
-                    *slot = kv;
-                } else {
-                    self.kv_caches.insert(req_inputs[idx].req_id.clone(), kv);
+                    &mut bdc.layer_caches,
+                    &bdc.left_padding,
+                );
+                // Put the cache back BEFORE propagating errors.
+                self.batched_decode_cache = Some(bdc);
+                result.map_err(|e| {
+                    ExecutorError::WorkerExecution(format!(
+                        "batched decode forward failed: {e}"
+                    ))
+                })?
+            } else if all_decode {
+                // === Build new persistent batched cache ===
+                // First, invalidate existing batched cache, writing back to per-request.
+                if let Some(old_bdc) = self.batched_decode_cache.take() {
+                    for (idx, rid) in old_bdc.req_ids.iter().enumerate() {
+                        let mut per_req_kv: MlxKvCache = Vec::with_capacity(num_layers);
+                        for layer_idx in 0..num_layers {
+                            let left_pad = old_bdc.left_padding[layer_idx][idx];
+                            let layer_cache = old_bdc.layer_caches[layer_idx]
+                                .extract_individual(idx, left_pad)
+                                .ok();
+                            per_req_kv.push(layer_cache);
+                        }
+                        self.kv_caches.insert(rid.clone(), per_req_kv);
+                    }
                 }
-            }
+
+                // Re-check after invalidation.
+                let all_have_caches = batch_req_ids.iter().all(|rid| {
+                    self.kv_caches
+                        .get(rid)
+                        .is_some_and(|kv| !kv.is_empty() && kv.iter().all(|c| c.is_some()))
+                });
+
+                if all_have_caches {
+                    // Build batched caches for ALL layers.
+                    let mut layer_caches: Vec<BatchMlxLayerKvCache> =
+                        Vec::with_capacity(num_layers);
+                    let mut left_paddings: Vec<Vec<usize>> = Vec::with_capacity(num_layers);
+
+                    for layer_idx in 0..num_layers {
+                        let cache_refs: Vec<&cache::MlxLayerKvCache> = batch_req_ids
+                            .iter()
+                            .map(|rid| {
+                                self.kv_caches.get(rid).unwrap()[layer_idx]
+                                    .as_ref()
+                                    .expect("decode requires cache")
+                            })
+                            .collect();
+                        let max_seq =
+                            cache_refs.iter().map(|c| c.seq_len()).max().unwrap_or(0);
+                        let left_pad: Vec<usize> =
+                            cache_refs.iter().map(|c| max_seq - c.seq_len()).collect();
+                        layer_caches.push(
+                            BatchMlxLayerKvCache::from_individual(&cache_refs).map_err(
+                                |e| {
+                                    ExecutorError::WorkerExecution(format!(
+                                        "batch cache build failed: {e}"
+                                    ))
+                                },
+                            )?,
+                        );
+                        left_paddings.push(left_pad);
+                    }
+
+                    let mut bdc = BatchedDecodeCache {
+                        req_ids: batch_req_ids.clone(),
+                        layer_caches,
+                        left_padding: left_paddings,
+                    };
+
+                    // Run model with the new batched cache.
+                    let logits = model
+                        .forward_batch_decode(
+                            &input_ids_arr,
+                            &batch_info,
+                            &mut bdc.layer_caches,
+                            &bdc.left_padding,
+                        )
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "batched decode forward failed: {e}"
+                            ))
+                        })?;
+
+                    // Store the persistent batched cache.
+                    self.batched_decode_cache = Some(bdc);
+
+                    // Remove per-request caches (they're now in the batch).
+                    for rid in &batch_req_ids {
+                        if let Some(slot) = self.kv_caches.get_mut(rid) {
+                            *slot = Vec::new();
+                        }
+                    }
+
+                    logits
+                } else {
+                    // Some per-request caches missing — fall back to per-request path.
+                    let mut batch_kv_caches: Vec<cache::MlxKvCache> = batch_indices
+                        .iter()
+                        .map(|&idx| {
+                            let req_id = &req_inputs[idx].req_id;
+                            self.kv_caches
+                                .get_mut(req_id)
+                                .map(std::mem::take)
+                                .unwrap_or_else(|| cache::empty_kv_cache(num_layers))
+                        })
+                        .collect();
+                    let logits = model
+                        .forward_batch(
+                            &input_ids_arr, &positions_arr, &batch_info,
+                            &mut batch_kv_caches,
+                        )
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
+                        })?;
+                    for &idx in &batch_indices {
+                        let kv = batch_kv_caches.remove(0);
+                        if let Some(slot) = self.kv_caches.get_mut(&req_inputs[idx].req_id) {
+                            *slot = kv;
+                        } else {
+                            self.kv_caches.insert(req_inputs[idx].req_id.clone(), kv);
+                        }
+                    }
+                    logits
+                }
+            } else {
+                // === Per-request path (prefill, mixed, or single request) ===
+                // Invalidate persistent batched cache if it exists.
+                if let Some(old_bdc) = self.batched_decode_cache.take() {
+                    for (idx, rid) in old_bdc.req_ids.iter().enumerate() {
+                        let mut per_req_kv: MlxKvCache = Vec::with_capacity(num_layers);
+                        for layer_idx in 0..num_layers {
+                            let left_pad = old_bdc.left_padding[layer_idx][idx];
+                            let layer_cache = old_bdc.layer_caches[layer_idx]
+                                .extract_individual(idx, left_pad)
+                                .ok();
+                            per_req_kv.push(layer_cache);
+                        }
+                        self.kv_caches.insert(rid.clone(), per_req_kv);
+                    }
+                }
+
+                let mut batch_kv_caches: Vec<cache::MlxKvCache> = batch_indices
+                    .iter()
+                    .map(|&idx| {
+                        let req_id = &req_inputs[idx].req_id;
+                        self.kv_caches
+                            .get_mut(req_id)
+                            .map(std::mem::take)
+                            .unwrap_or_else(|| cache::empty_kv_cache(num_layers))
+                    })
+                    .collect();
+                let logits = model
+                    .forward_batch(
+                        &input_ids_arr, &positions_arr, &batch_info,
+                        &mut batch_kv_caches,
+                    )
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
+                    })?;
+                for &idx in &batch_indices {
+                    let kv = batch_kv_caches.remove(0);
+                    if let Some(slot) = self.kv_caches.get_mut(&req_inputs[idx].req_id) {
+                        *slot = kv;
+                    } else {
+                        self.kv_caches.insert(req_inputs[idx].req_id.clone(), kv);
+                    }
+                }
+                logits
+            };
 
             // Split output logits per-request.
             for (i, &idx) in batch_indices.iter().enumerate() {
@@ -1691,20 +1759,88 @@ impl Worker for MlxWorker {
             }
         }
 
-        // --- Phase D: Single eval materializes forward + sampling in one Metal command buffer ---
+        // --- Phase D: Submit GPU work ---
+        //
+        // Double-buffering (mlx-lm _next() pattern): when we can defer
+        // (no cpu_fallback, no prompt_logprobs) AND have a previous output
+        // to return, use async_eval + store pending + return previous.
+        // Otherwise fall back to synchronous eval.
+        let can_defer = cpu_fallback.is_empty()
+            && !any_logprobs_requested
+            && lazy_outputs.iter().all(|o| o.prompt_logprobs_info.is_none())
+            && prev_output.is_some();
+
+        if can_defer {
+            // async_eval: submit GPU work, don't wait.
+            let mut arrays_to_eval: Vec<&Array> = Vec::new();
+            if let Some(ref arr) = gpu_greedy_result {
+                arrays_to_eval.push(arr);
+            }
+            for (_, arr) in &gpu_temp_results {
+                arrays_to_eval.push(arr);
+            }
+            mlx_rs::transforms::async_eval(arrays_to_eval)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("async_eval error: {e}")))?;
+
+            // Store unread GPU arrays as pending for next call.
+            let greedy_mapping: Vec<(String, usize)> = gpu_greedy
+                .iter()
+                .enumerate()
+                .map(|(batch_pos, &req_idx)| (req_inputs[req_idx].req_id.clone(), batch_pos))
+                .collect();
+            let temp_pending: Vec<(Vec<(String, usize)>, Array)> = gpu_temp_results
+                .into_iter()
+                .map(|(group, arr)| {
+                    let mapping: Vec<(String, usize)> = group
+                        .iter()
+                        .enumerate()
+                        .map(|(batch_pos, &req_idx)| {
+                            (req_inputs[req_idx].req_id.clone(), batch_pos)
+                        })
+                        .collect();
+                    (mapping, arr)
+                })
+                .collect();
+
+            self.pending_step = Some(PendingStep {
+                req_ids: req_inputs.iter().map(|r| r.req_id.clone()).collect(),
+                greedy_result: gpu_greedy_result,
+                greedy_mapping,
+                temp_results: temp_pending,
+            });
+
+            // Timing.
+            let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+            let num_prefills = req_inputs.iter().filter(|r| r.is_prefill).count();
+            let num_decodes = req_inputs.len() - num_prefills;
+            self.step_count += req_inputs.len();
+            if num_prefills > 0 {
+                self.prefill_count += num_prefills;
+                self.total_prefill_ms +=
+                    step_ms * (num_prefills as f64 / req_inputs.len() as f64);
+            }
+            if num_decodes > 0 {
+                self.decode_count += num_decodes;
+                self.total_decode_ms +=
+                    step_ms * (num_decodes as f64 / req_inputs.len() as f64);
+            }
+
+            // Return PREVIOUS step's output.  Current step's output will
+            // be read and returned at the start of the next execute_model.
+            return Ok(prev_output.unwrap());
+        }
+
+        // --- Synchronous fallback ---
         {
             let mut arrays_to_eval: Vec<&Array> = Vec::new();
-            // Include forward logits needed by cpu_fallback (as_slice needs eval'd data).
             for &idx in &cpu_fallback {
                 arrays_to_eval.push(&lazy_outputs[idx].last_logits);
             }
-            // Include full logits for prompt_logprobs / speculative decode.
             for out in &lazy_outputs {
                 if let Some(ref f32_logits) = out.full_logits_f32 {
                     arrays_to_eval.push(f32_logits);
                 }
             }
-            // Include lazy GPU sampling results.
             if let Some(ref arr) = gpu_greedy_result {
                 arrays_to_eval.push(arr);
             }
@@ -1988,6 +2124,7 @@ impl Worker for MlxWorker {
     }
 
     fn shutdown(&mut self) {
+        self.pending_step = None;
         self.is_shutdown = true;
         self.model = None;
         info!("MlxWorker: shut down");

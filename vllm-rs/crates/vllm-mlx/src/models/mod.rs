@@ -29,7 +29,7 @@ use mlx_rs::Array;
 #[allow(unused_imports)]
 use mlx_rs::ops::indexing::IndexOp;
 
-use crate::cache::{MlxBatchInfo, MlxKvCache};
+use crate::cache::{BatchMlxLayerKvCache, MlxBatchInfo, MlxKvCache};
 use vllm_model::weight::HfModelConfig;
 
 /// Per-GDN-layer recurrent state for MLX models: `(conv_state, ssm_state)`.
@@ -159,6 +159,40 @@ pub trait MlxModel: Send {
             let refs: Vec<Array> = logit_parts;
             mlx_rs::ops::concatenate_axis(&refs, 0)
         }
+    }
+
+    /// Whether this model supports the persistent batched decode path.
+    ///
+    /// Models that implement `forward_batch_decode` should return `true`.
+    /// Default: `false`.
+    fn supports_batch_decode(&self) -> bool {
+        false
+    }
+
+    /// Run a batched decode forward pass using persistent batched KV caches.
+    ///
+    /// All requests must be decode (q_len=1). The batched caches are updated
+    /// in-place with a single `slice_update` per layer — no per-request
+    /// KV cache writes or write-back needed.
+    ///
+    /// * `input_ids` — flat token IDs, shape `[num_reqs]` (one per request)
+    /// * `batch_info` — per-request lengths, offsets, and RoPE offsets
+    /// * `layer_caches` — persistent batched KV caches, one per layer
+    /// * `left_padding` — per layer, per request left-padding offsets
+    ///
+    /// Returns logits of shape `[num_reqs, vocab_size]` (lazy).
+    ///
+    /// Default: returns an error (model must override to support this path).
+    fn forward_batch_decode(
+        &mut self,
+        _input_ids: &Array,
+        _batch_info: &MlxBatchInfo,
+        _layer_caches: &mut [BatchMlxLayerKvCache],
+        _left_padding: &[Vec<usize>],
+    ) -> mlx_rs::error::Result<Array> {
+        Err(mlx_rs::error::Exception::custom(
+            "forward_batch_decode not supported by this model",
+        ))
     }
 
     /// Run the model backbone and return hidden states (before lm_head).

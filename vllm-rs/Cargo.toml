@@ -111,7 +111,7 @@ half = "2.7"
 memmap2 = "0.9"
 
 # MLX (Apple Silicon)
-mlx-rs = { version = "0.25", features = ["metal", "accelerate", "safetensors"] }
+mlx-rs = { path = "third_party/mlx-rs/mlx-rs", features = ["metal", "accelerate", "safetensors"] }
 
 # HuggingFace Hub
 hf-hub = "0.4"

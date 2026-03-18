@@ -23,7 +23,7 @@ use mlx_rs::nn;
 use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
-use crate::cache::{MlxBatchInfo, MlxKvCache, MlxLayerKvCache};
+use crate::cache::{BatchMlxLayerKvCache, MlxBatchInfo, MlxKvCache, MlxLayerKvCache};
 use crate::models::llama::{LlamaConfig, load_safetensors_weights};
 use vllm_model::weight::HfModelConfig;
 
@@ -284,12 +284,11 @@ impl MlxQuantizedLlamaMLP {
         }
     }
 
-    /// Forward pass: gate_proj(x) → SiLU → * up_proj(x) → down_proj
+    /// Forward pass: gate_proj(x) → SwiGLU(gate, up) → down_proj
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = nn::silu(&gate)?;
         let up = self.up_proj.forward(x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = super::llama::swiglu(&gate, &up)?;
         self.down_proj.forward(&hidden)
     }
 }
@@ -445,7 +444,7 @@ impl MlxQuantizedLlamaAttention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None::<&Array>)?;
 
         // out: [1, heads, seq, head_dim] -> [seq, hidden]
         let hidden = (self.num_heads * self.head_dim) as i32;
@@ -480,46 +479,90 @@ impl MlxQuantizedLlamaAttention {
         let mut per_req_v = Vec::with_capacity(batch_info.num_reqs);
         let mut kv_lens = Vec::with_capacity(batch_info.num_reqs);
 
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..batch_info.num_reqs {
-            let start = batch_info.offsets[i] as i32;
-            let seq_len = batch_info.q_lens[i] as i32;
-            let offset = batch_info.rope_offsets[i];
+        if all_decode {
+            let n = batch_info.num_reqs as i32;
+            let nh = self.num_heads as i32;
+            let nkv = self.num_kv_heads as i32;
+            let hd = self.head_dim as i32;
 
-            let q = q_all.try_index((start..start + seq_len, ..))?;
-            let k = k_all.try_index((start..start + seq_len, ..))?;
-            let v = v_all.try_index((start..start + seq_len, ..))?;
+            let mut q = q_all.reshape(&[n, nh, 1, hd])?;
+            let mut k = k_all.reshape(&[n, nkv, 1, hd])?;
+            let v = v_all.reshape(&[n, nkv, 1, hd])?;
 
-            let q = q.reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?;
-            let k = k.reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
+            if let Some(ref mut norm) = self.q_norm {
+                q = norm.forward(&q.squeeze_axes(&[2])?)?.expand_dims(2)?;
+            }
+            if let Some(ref mut norm) = self.k_norm {
+                k = norm.forward(&k.squeeze_axes(&[2])?)?.expand_dims(2)?;
+            }
 
-            let q = if let Some(ref mut norm) = self.q_norm {
-                norm.forward(&q)?
-            } else {
-                q
-            };
-            let k = if let Some(ref mut norm) = self.k_norm {
-                norm.forward(&k)?
-            } else {
-                k
-            };
+            let offsets_arr = Array::from_iter(
+                batch_info.rope_offsets.iter().copied(),
+                &[n],
+            );
+            q = mlx_rs::fast::rope_dynamic(
+                &q, self.rope.dimensions, self.rope.traditional,
+                self.rope.base, self.rope.scale, &offsets_arr, None::<&Array>,
+            )?;
+            k = mlx_rs::fast::rope_dynamic(
+                &k, self.rope.dimensions, self.rope.traditional,
+                self.rope.base, self.rope.scale, &offsets_arr, None::<&Array>,
+            )?;
 
-            let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-            let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-            let v = v
-                .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
-                .transpose_axes(&[1, 0, 2])?
-                .expand_dims(0)?;
+            for i in 0..batch_info.num_reqs {
+                let ii = i as i32;
+                let qi = q.try_index((ii..ii + 1, .., .., ..))?;
+                let ki = k.try_index((ii..ii + 1, .., .., ..))?;
+                let vi = v.try_index((ii..ii + 1, .., .., ..))?;
 
-            let q = self.rope.forward((&q, offset))?;
-            k = self.rope.forward((&k, offset))?;
+                let (ki, vi) = crate::cache::kv_cache_update(&mut caches[i], &ki, &vi)?;
+                kv_lens.push(ki.dim(2) as usize);
+                per_req_q.push(qi);
+                per_req_k.push(ki);
+                per_req_v.push(vi);
+            }
+        } else {
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..batch_info.num_reqs {
+                let start = batch_info.offsets[i] as i32;
+                let seq_len = batch_info.q_lens[i] as i32;
+                let offset = batch_info.rope_offsets[i];
 
-            let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                let q = q_all.try_index((start..start + seq_len, ..))?;
+                let k = k_all.try_index((start..start + seq_len, ..))?;
+                let v = v_all.try_index((start..start + seq_len, ..))?;
 
-            kv_lens.push(k.dim(2) as usize);
-            per_req_q.push(q);
-            per_req_k.push(k);
-            per_req_v.push(v);
+                let q = q.reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?;
+                let k = k.reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
+
+                let q = if let Some(ref mut norm) = self.q_norm {
+                    norm.forward(&q)?
+                } else {
+                    q
+                };
+                let k = if let Some(ref mut norm) = self.k_norm {
+                    norm.forward(&k)?
+                } else {
+                    k
+                };
+
+                let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+                let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+                let v = v
+                    .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
+                    .transpose_axes(&[1, 0, 2])?
+                    .expand_dims(0)?;
+
+                let q = self.rope.forward((&q, offset))?;
+                k = self.rope.forward((&k, offset))?;
+
+                let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+
+                kv_lens.push(k.dim(2) as usize);
+                per_req_q.push(q);
+                per_req_k.push(k);
+                per_req_v.push(v);
+            }
         }
 
         let can_batch_sdpa =
@@ -531,7 +574,7 @@ impl MlxQuantizedLlamaAttention {
             let v_stacked = mlx_rs::ops::concatenate_axis(&per_req_v, 0)?;
 
             let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
+                &q_stacked, &k_stacked, &v_stacked, self.scale, None, None::<&Array>,
             )?;
 
             let hidden = (self.num_heads * self.head_dim) as i32;
@@ -565,6 +608,7 @@ impl MlxQuantizedLlamaAttention {
                     &v,
                     self.scale,
                     mask,
+                    None::<&Array>,
                 )?;
 
                 let hidden = (self.num_heads * self.head_dim) as i32;
@@ -583,6 +627,79 @@ impl MlxQuantizedLlamaAttention {
         };
 
         self.o_proj.forward(&concat)
+    }
+
+    /// Batched decode forward: all N sequences processed with a single KV cache
+    /// update and a single SDPA kernel launch.
+    ///
+    /// Requires: all requests are decode (q_len=1), no sliding window.
+    /// `batch_cache` holds the persistent batched [B, heads, kv_len, dim] cache for this layer.
+    /// `left_padding` contains per-request left-padding offsets.
+    pub fn forward_batch_decode(
+        &mut self,
+        hidden_states: &Array,
+        batch_info: &MlxBatchInfo,
+        batch_cache: &mut BatchMlxLayerKvCache,
+        left_padding: &[usize],
+    ) -> Result<Array, Exception> {
+        let n = batch_info.num_reqs as i32;
+        let nh = self.num_heads as i32;
+        let nkv = self.num_kv_heads as i32;
+        let hd = self.head_dim as i32;
+
+        // Batched Q/K/V projections: [N, hidden] -> ...
+        let q_all = self.q_proj.forward(hidden_states)?;
+        let k_all = self.k_proj.forward(hidden_states)?;
+        let v_all = self.v_proj.forward(hidden_states)?;
+
+        // Reshape to [N, heads, 1, hd]
+        let mut q = q_all.reshape(&[n, nh, 1, hd])?;
+        let mut k = k_all.reshape(&[n, nkv, 1, hd])?;
+        let v = v_all.reshape(&[n, nkv, 1, hd])?;
+
+        // Optional QK norms (batched).
+        if let Some(ref mut norm) = self.q_norm {
+            q = norm.forward(&q.squeeze_axes(&[2])?)?.expand_dims(2)?;
+        }
+        if let Some(ref mut norm) = self.k_norm {
+            k = norm.forward(&k.squeeze_axes(&[2])?)?.expand_dims(2)?;
+        }
+
+        // Batched RoPE via rope_dynamic.
+        let offsets_arr = Array::from_iter(
+            batch_info.rope_offsets.iter().copied(),
+            &[n],
+        );
+        q = mlx_rs::fast::rope_dynamic(
+            &q, self.rope.dimensions, self.rope.traditional,
+            self.rope.base, self.rope.scale, &offsets_arr, None::<&Array>,
+        )?;
+        k = mlx_rs::fast::rope_dynamic(
+            &k, self.rope.dimensions, self.rope.traditional,
+            self.rope.base, self.rope.scale, &offsets_arr, None::<&Array>,
+        )?;
+
+        // Single batched KV cache update for all B sequences.
+        let (k_cached, v_cached) = batch_cache.update_and_view(&k, &v)?;
+
+        // Build left-padding mask if needed: [B, 1, 1, kv_len]
+        let kv_len = batch_cache.kv_len();
+        let mask = BatchMlxLayerKvCache::build_left_padding_mask(left_padding, kv_len, q.dtype())?;
+
+        // Single SDPA for all B sequences.
+        let sdpa_mask = mask.as_ref().map(|m| {
+            mlx_rs::fast::ScaledDotProductAttentionMask::Array(m)
+        });
+        let out = mlx_rs::fast::scaled_dot_product_attention(
+            &q, &k_cached, &v_cached, self.scale, sdpa_mask, None::<&Array>,
+        )?;
+
+        // out: [B, heads, 1, hd] -> [B, hidden]
+        let hidden = (self.num_heads * self.head_dim) as i32;
+        let out = out.squeeze_axes(&[2])?
+            .reshape(&[n, hidden])?;
+
+        self.o_proj.forward(&out)
     }
 }
 
@@ -665,6 +782,28 @@ impl MlxQuantizedLlamaDecoderLayer {
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(hidden_states)?;
         let attn_output = self.self_attn.forward_batch(&normed, batch_info, caches)?;
+        let hidden_states = hidden_states.add(&attn_output)?;
+
+        let normed = self.post_attention_layernorm.forward(&hidden_states)?;
+        let mlp_output = self.mlp.forward(&normed)?;
+        hidden_states.add(&mlp_output)
+    }
+
+    /// Batched decode forward using a persistent batched KV cache for this layer.
+    pub fn forward_batch_decode(
+        &mut self,
+        hidden_states: &Array,
+        batch_info: &MlxBatchInfo,
+        batch_cache: &mut BatchMlxLayerKvCache,
+        left_padding: &[usize],
+    ) -> Result<Array, Exception> {
+        let normed = self.input_layernorm.forward(hidden_states)?;
+        let attn_output = self.self_attn.forward_batch_decode(
+            &normed,
+            batch_info,
+            batch_cache,
+            left_padding,
+        )?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
         let normed = self.post_attention_layernorm.forward(&hidden_states)?;
@@ -868,6 +1007,10 @@ impl super::MlxModel for MlxQuantizedLlamaForCausalLM {
         self.layers.len()
     }
 
+    fn supports_batch_decode(&self) -> bool {
+        true
+    }
+
     fn forward_batch(
         &mut self,
         input_ids: &Array,
@@ -889,6 +1032,35 @@ impl super::MlxModel for MlxQuantizedLlamaForCausalLM {
             for (dst, src) in layer_caches.iter_mut().zip(temp_caches.into_iter()) {
                 **dst = src;
             }
+        }
+
+        hidden_states = self.norm.forward(&hidden_states)?;
+
+        let logits = if self.tie_word_embeddings {
+            self.embed_tokens.as_linear(&hidden_states)?
+        } else {
+            self.lm_head.as_mut().unwrap().forward(&hidden_states)?
+        };
+
+        Ok(logits)
+    }
+
+    fn forward_batch_decode(
+        &mut self,
+        input_ids: &Array,
+        batch_info: &MlxBatchInfo,
+        layer_caches: &mut [BatchMlxLayerKvCache],
+        left_padding: &[Vec<usize>],
+    ) -> mlx_rs::error::Result<Array> {
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            hidden_states = layer.forward_batch_decode(
+                &hidden_states,
+                batch_info,
+                &mut layer_caches[layer_idx],
+                &left_padding[layer_idx],
+            )?;
         }
 
         hidden_states = self.norm.forward(&hidden_states)?;

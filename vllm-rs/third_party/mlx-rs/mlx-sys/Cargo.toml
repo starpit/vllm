@@ -1,0 +1,27 @@
+[package]
+name = "mlx-sys"
+version = "0.2.0"
+edition = "2021"
+description = "Low-level interface and binding generation for the mlx library"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[package.metadata.docs.rs]
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-apple-ios",
+  "aarch64-apple-ios-sim",
+]
+
+[features]
+default = ["accelerate", "metal"]
+
+accelerate = []
+metal = []
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.70"
+cmake = "0.1"
+cc = "1"

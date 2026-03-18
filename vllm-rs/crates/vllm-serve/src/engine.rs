@@ -2090,18 +2090,28 @@ impl AsyncEngine {
     /// concurrently across a thread pool, removing tokenizer decode calls
     /// from the critical path.
     fn parallel_detokenize(work: Vec<Option<DetokWork>>) -> Vec<Option<DetokResult>> {
-        work.into_par_iter()
-            .map(|item| {
-                item.map(
-                    |(new_token_ids, stop_terminated, finish_reason, mut detok)| {
-                        let detok_stop = detok.update(&new_token_ids, stop_terminated);
-                        let is_finished = finish_reason.is_some() || detok_stop.is_some();
-                        let delta_text = detok.get_next_output_text(is_finished, true);
-                        (detok, detok_stop, Some(delta_text))
-                    },
-                )
-            })
-            .collect()
+        // For small batches, sequential iteration avoids rayon thread pool
+        // overhead (wake/sleep/contention costs ~7% of wall time for batch≤6).
+        // For large batches (e.g. CUDA with 64+ requests), rayon parallelism
+        // amortizes the pool overhead and keeps detokenization off the critical path.
+        const PAR_THRESHOLD: usize = 16;
+
+        let map_fn = |item: Option<DetokWork>| -> Option<DetokResult> {
+            item.map(
+                |(new_token_ids, stop_terminated, finish_reason, mut detok)| {
+                    let detok_stop = detok.update(&new_token_ids, stop_terminated);
+                    let is_finished = finish_reason.is_some() || detok_stop.is_some();
+                    let delta_text = detok.get_next_output_text(is_finished, true);
+                    (detok, detok_stop, Some(delta_text))
+                },
+            )
+        };
+
+        if work.len() >= PAR_THRESHOLD {
+            work.into_par_iter().map(map_fn).collect()
+        } else {
+            work.into_iter().map(map_fn).collect()
+        }
     }
 
     /// Phase 3: Under lock — put detokenizers back, apply detok results,

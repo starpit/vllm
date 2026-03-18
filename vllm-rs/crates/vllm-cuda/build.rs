@@ -255,7 +255,22 @@ fn build_flash_attention(cache_dir: &str, rerun_files: &mut Vec<String>) {
         fa_src.join("flash_fwd_launch_template.h"),
         fa_src.join("static_switch.h"),
         shim_dir.join("ffi_shim.cu"),
-        shim_dir.join("compat").join("ATen").join("ATen.h"),
+        shim_dir
+            .join("compat")
+            .join("ATen")
+            .join("cuda")
+            .join("CUDAGeneratorImpl.h"),
+        shim_dir
+            .join("compat")
+            .join("ATen")
+            .join("cuda")
+            .join("detail")
+            .join("UnpackRaw.cuh"),
+        shim_dir
+            .join("compat")
+            .join("c10")
+            .join("cuda")
+            .join("CUDAException.h"),
     ]
     .into_iter()
     .map(|p| p.to_string_lossy().into_owned())

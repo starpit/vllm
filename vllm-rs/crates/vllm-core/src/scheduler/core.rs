@@ -260,18 +260,12 @@ impl SimpleBlockTracker {
     /// per full block. Handles span fan-in and cross-context semantics.
     fn hash_all_blocks(&self, all_tokens: &[u32]) -> Vec<u64> {
         let num_full_blocks = all_tokens.len() / self.block_size;
-        if !self.spans_config.enabled {
-            // Fast path: no span logic, hash each block independently.
-            let mut hashes = Vec::with_capacity(num_full_blocks);
-            for i in 0..num_full_blocks {
-                let start = i * self.block_size;
-                let end = start + self.block_size;
-                hashes.push(Self::hash_block(&all_tokens[start..end]));
-            }
-            return hashes;
-        }
-
-        // Span-aware path: chain parent hashes.
+        // Always chain parent hashes (matching Python vLLM's hash_block_tokens).
+        // This ensures the same block content at different positions produces
+        // different hashes — preventing false cache hits with wrong RoPE.
+        // When spans are enabled, hash_block_with_parent handles fan-in
+        // (TOKEN_PLUS resets parent) and cross-context (TOKEN_CROSS folds
+        // all prior tokens).
         let mut hashes = Vec::with_capacity(num_full_blocks);
         let mut parent_hash = Self::NONE_HASH;
         for i in 0..num_full_blocks {
@@ -3375,15 +3369,22 @@ mod tests {
     }
 
     #[test]
-    fn test_span_hash_all_blocks_no_spans() {
-        // Without spans, hash_all_blocks should produce same hashes as hash_block.
+    fn test_span_hash_all_blocks_chains_parents() {
+        // hash_all_blocks chains parent hashes, so the same block content
+        // at different positions produces different hashes.
         let tracker = SimpleBlockTracker::new(16, 4);
         let tokens: Vec<u32> = (0..12).collect(); // 3 full blocks of size 4
         let hashes = tracker.hash_all_blocks(&tokens);
         assert_eq!(hashes.len(), 3);
-        assert_eq!(hashes[0], SimpleBlockTracker::hash_block(&tokens[0..4]));
-        assert_eq!(hashes[1], SimpleBlockTracker::hash_block(&tokens[4..8]));
-        assert_eq!(hashes[2], SimpleBlockTracker::hash_block(&tokens[8..12]));
+        // Block 0 has parent NONE_HASH, so its hash includes NONE_HASH + content.
+        // Block 1 chains from block 0's hash, block 2 from block 1's.
+        // All three should be distinct.
+        assert_ne!(hashes[0], hashes[1]);
+        assert_ne!(hashes[1], hashes[2]);
+        assert_ne!(hashes[0], hashes[2]);
+        // Same tokens, same order → same hashes.
+        let hashes2 = tracker.hash_all_blocks(&tokens);
+        assert_eq!(hashes, hashes2);
     }
 
     #[test]
@@ -3483,17 +3484,22 @@ mod tests {
     }
 
     #[test]
-    fn test_span_disabled_uses_original_hashing() {
-        // When spans are disabled, hash_all_blocks should match hash_block
-        // (no parent chaining).
+    fn test_span_disabled_still_chains_parents() {
+        // Even with spans disabled, parent hashing is used (matching Python vLLM).
+        // Same block content at different positions should produce different hashes.
         let tracker = SimpleBlockTracker::with_spans_config(
             16,
             4,
             SpansConfig::default(), // disabled
         );
-        let tokens: Vec<u32> = (0..8).collect();
-        let hashes = tracker.hash_all_blocks(&tokens);
-        assert_eq!(hashes[0], SimpleBlockTracker::hash_block(&tokens[0..4]));
-        assert_eq!(hashes[1], SimpleBlockTracker::hash_block(&tokens[4..8]));
+        // [A, B] and [B, A] — block content is the same but order differs.
+        let seq1: Vec<u32> = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let seq2: Vec<u32> = vec![4, 5, 6, 7, 0, 1, 2, 3];
+        let hashes1 = tracker.hash_all_blocks(&seq1);
+        let hashes2 = tracker.hash_all_blocks(&seq2);
+        // Block 0 differs (different content).
+        assert_ne!(hashes1[0], hashes2[0]);
+        // Block 1 also differs (same content but different parent).
+        assert_ne!(hashes1[1], hashes2[1]);
     }
 }

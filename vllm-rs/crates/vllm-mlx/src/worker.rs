@@ -763,15 +763,12 @@ impl Worker for MlxWorker {
         // If a finished request's cache lives in the persistent batched cache,
         // extract it first, then invalidate the batched cache.
         if !scheduler_output.finished_req_ids.is_empty() {
-            let any_finished_in_batch = self
-                .batched_decode_cache
-                .as_ref()
-                .is_some_and(|bdc| {
-                    scheduler_output
-                        .finished_req_ids
-                        .iter()
-                        .any(|rid| bdc.req_ids.contains(rid))
-                });
+            let any_finished_in_batch = self.batched_decode_cache.as_ref().is_some_and(|bdc| {
+                scheduler_output
+                    .finished_req_ids
+                    .iter()
+                    .any(|rid| bdc.req_ids.contains(rid))
+            });
 
             if any_finished_in_batch {
                 // Extract ALL individual caches from the batch.
@@ -1314,9 +1311,7 @@ impl Worker for MlxWorker {
                 // Put the cache back BEFORE propagating errors.
                 self.batched_decode_cache = Some(bdc);
                 result.map_err(|e| {
-                    ExecutorError::WorkerExecution(format!(
-                        "batched decode forward failed: {e}"
-                    ))
+                    ExecutorError::WorkerExecution(format!("batched decode forward failed: {e}"))
                 })?
             } else if all_decode {
                 // === Build new persistent batched cache ===
@@ -1357,18 +1352,15 @@ impl Worker for MlxWorker {
                                     .expect("decode requires cache")
                             })
                             .collect();
-                        let max_seq =
-                            cache_refs.iter().map(|c| c.seq_len()).max().unwrap_or(0);
+                        let max_seq = cache_refs.iter().map(|c| c.seq_len()).max().unwrap_or(0);
                         let left_pad: Vec<usize> =
                             cache_refs.iter().map(|c| max_seq - c.seq_len()).collect();
                         layer_caches.push(
-                            BatchMlxLayerKvCache::from_individual(&cache_refs).map_err(
-                                |e| {
-                                    ExecutorError::WorkerExecution(format!(
-                                        "batch cache build failed: {e}"
-                                    ))
-                                },
-                            )?,
+                            BatchMlxLayerKvCache::from_individual(&cache_refs).map_err(|e| {
+                                ExecutorError::WorkerExecution(format!(
+                                    "batch cache build failed: {e}"
+                                ))
+                            })?,
                         );
                         left_paddings.push(left_pad);
                     }
@@ -1418,7 +1410,9 @@ impl Worker for MlxWorker {
                         .collect();
                     let logits = model
                         .forward_batch(
-                            &input_ids_arr, &positions_arr, &batch_info,
+                            &input_ids_arr,
+                            &positions_arr,
+                            &batch_info,
                             &mut batch_kv_caches,
                         )
                         .map_err(|e| {
@@ -1463,7 +1457,9 @@ impl Worker for MlxWorker {
                     .collect();
                 let logits = model
                     .forward_batch(
-                        &input_ids_arr, &positions_arr, &batch_info,
+                        &input_ids_arr,
+                        &positions_arr,
+                        &batch_info,
                         &mut batch_kv_caches,
                     )
                     .map_err(|e| {
@@ -1767,7 +1763,9 @@ impl Worker for MlxWorker {
         // Otherwise fall back to synchronous eval.
         let can_defer = cpu_fallback.is_empty()
             && !any_logprobs_requested
-            && lazy_outputs.iter().all(|o| o.prompt_logprobs_info.is_none())
+            && lazy_outputs
+                .iter()
+                .all(|o| o.prompt_logprobs_info.is_none())
             && prev_output.is_some();
 
         if can_defer {
@@ -1816,13 +1814,11 @@ impl Worker for MlxWorker {
             self.step_count += req_inputs.len();
             if num_prefills > 0 {
                 self.prefill_count += num_prefills;
-                self.total_prefill_ms +=
-                    step_ms * (num_prefills as f64 / req_inputs.len() as f64);
+                self.total_prefill_ms += step_ms * (num_prefills as f64 / req_inputs.len() as f64);
             }
             if num_decodes > 0 {
                 self.decode_count += num_decodes;
-                self.total_decode_ms +=
-                    step_ms * (num_decodes as f64 / req_inputs.len() as f64);
+                self.total_decode_ms += step_ms * (num_decodes as f64 / req_inputs.len() as f64);
             }
 
             // Return PREVIOUS step's output.  Current step's output will

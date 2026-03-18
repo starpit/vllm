@@ -445,7 +445,14 @@ impl MlxLlamaAttention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None::<&Array>)?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            self.scale,
+            mask,
+            None::<&Array>,
+        )?;
 
         // out: [1, heads, seq, head_dim] -> [seq, hidden]
         let hidden = (self.num_heads * self.head_dim) as i32;
@@ -505,10 +512,7 @@ impl MlxLlamaAttention {
             }
 
             // Single batched RoPE via rope_dynamic (array offset).
-            let offsets_arr = Array::from_iter(
-                batch_info.rope_offsets.iter().copied(),
-                &[n],
-            );
+            let offsets_arr = Array::from_iter(batch_info.rope_offsets.iter().copied(), &[n]);
             q = mlx_rs::fast::rope_dynamic(
                 &q,
                 self.rope.dimensions,
@@ -598,7 +602,12 @@ impl MlxLlamaAttention {
 
             // Single SDPA: q_len=1 decode → no mask needed.
             let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked, &k_stacked, &v_stacked, self.scale, None, None::<&Array>,
+                &q_stacked,
+                &k_stacked,
+                &v_stacked,
+                self.scale,
+                None,
+                None::<&Array>,
             )?;
 
             // out: [batch, heads, 1, head_dim] -> [batch, heads*head_dim]
@@ -692,17 +701,24 @@ impl MlxLlamaAttention {
         }
 
         // Batched RoPE via rope_dynamic.
-        let offsets_arr = Array::from_iter(
-            batch_info.rope_offsets.iter().copied(),
-            &[n],
-        );
+        let offsets_arr = Array::from_iter(batch_info.rope_offsets.iter().copied(), &[n]);
         q = mlx_rs::fast::rope_dynamic(
-            &q, self.rope.dimensions, self.rope.traditional,
-            self.rope.base, self.rope.scale, &offsets_arr, None::<&Array>,
+            &q,
+            self.rope.dimensions,
+            self.rope.traditional,
+            self.rope.base,
+            self.rope.scale,
+            &offsets_arr,
+            None::<&Array>,
         )?;
         k = mlx_rs::fast::rope_dynamic(
-            &k, self.rope.dimensions, self.rope.traditional,
-            self.rope.base, self.rope.scale, &offsets_arr, None::<&Array>,
+            &k,
+            self.rope.dimensions,
+            self.rope.traditional,
+            self.rope.base,
+            self.rope.scale,
+            &offsets_arr,
+            None::<&Array>,
         )?;
 
         // Single batched KV cache update for all B sequences.
@@ -713,17 +729,21 @@ impl MlxLlamaAttention {
         let mask = BatchMlxLayerKvCache::build_left_padding_mask(left_padding, kv_len, q.dtype())?;
 
         // Single SDPA for all B sequences.
-        let sdpa_mask = mask.as_ref().map(|m| {
-            mlx_rs::fast::ScaledDotProductAttentionMask::Array(m)
-        });
+        let sdpa_mask = mask
+            .as_ref()
+            .map(|m| mlx_rs::fast::ScaledDotProductAttentionMask::Array(m));
         let out = mlx_rs::fast::scaled_dot_product_attention(
-            &q, &k_cached, &v_cached, self.scale, sdpa_mask, None::<&Array>,
+            &q,
+            &k_cached,
+            &v_cached,
+            self.scale,
+            sdpa_mask,
+            None::<&Array>,
         )?;
 
         // out: [B, heads, 1, hd] -> [B, hidden]
         let hidden = (self.num_heads * self.head_dim) as i32;
-        let out = out.squeeze_axes(&[2])?
-            .reshape(&[n, hidden])?;
+        let out = out.squeeze_axes(&[2])?.reshape(&[n, hidden])?;
 
         self.o_proj.forward(&out)
     }
@@ -822,12 +842,9 @@ impl MlxLlamaDecoderLayer {
         left_padding: &[usize],
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output = self.self_attn.forward_batch_decode(
-            &normed,
-            batch_info,
-            batch_cache,
-            left_padding,
-        )?;
+        let attn_output =
+            self.self_attn
+                .forward_batch_decode(&normed, batch_info, batch_cache, left_padding)?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
         let normed = self.post_attention_layernorm.forward(&hidden_states)?;

@@ -63,7 +63,7 @@ pub fn quantize_device(
             group_size,
             bits,
             DEFAULT_MODE.as_ptr(),
-            mlx_sys::mlx_array_new(),  // global_scale (null array = not used)
+            mlx_sys::mlx_array_new(), // global_scale (null array = not used)
             stream.as_ref().as_ptr(),
         )
     })?;
@@ -152,7 +152,7 @@ pub fn dequantize_device<'a>(
             group_size,
             bits,
             DEFAULT_MODE.as_ptr(),
-            mlx_sys::mlx_array_new(),  // global_scale (null array = not used)
+            mlx_sys::mlx_array_new(), // global_scale (null array = not used)
             optional_dtype_none(),
             stream.as_ref().as_ptr(),
         )

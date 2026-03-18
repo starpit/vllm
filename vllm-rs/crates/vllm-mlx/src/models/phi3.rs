@@ -371,7 +371,14 @@ impl MlxPhi3Attention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None::<&Array>)?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            self.scale,
+            mask,
+            None::<&Array>,
+        )?;
 
         let hidden = (self.num_heads * self.head_dim) as i32;
         let out = out
@@ -460,7 +467,12 @@ impl MlxPhi3Attention {
 
             // Single SDPA: q_len=1 decode -> no mask needed.
             let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked, &k_stacked, &v_stacked, self.scale, None, None::<&Array>,
+                &q_stacked,
+                &k_stacked,
+                &v_stacked,
+                self.scale,
+                None,
+                None::<&Array>,
             )?;
 
             // out: [batch, heads, 1, head_dim] -> [batch, heads*head_dim]
@@ -911,7 +923,14 @@ impl MlxQuantizedPhi3Attention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None::<&Array>)?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            self.scale,
+            mask,
+            None::<&Array>,
+        )?;
 
         let hidden = (self.num_heads * self.head_dim) as i32;
         let out = out
@@ -986,7 +1005,12 @@ impl MlxQuantizedPhi3Attention {
             let v_stacked = mlx_rs::ops::concatenate_axis(&per_req_v, 0)?;
 
             let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked, &k_stacked, &v_stacked, self.scale, None, None::<&Array>,
+                &q_stacked,
+                &k_stacked,
+                &v_stacked,
+                self.scale,
+                None,
+                None::<&Array>,
             )?;
 
             let hidden = (self.num_heads * self.head_dim) as i32;

@@ -200,8 +200,8 @@ impl BatchMlxLayerKvCache {
 
             if left_pad > 0 {
                 // Left-pad with zeros: [1, heads, left_pad, dim]
-                let padding = Array::zeros::<f32>(&[1, heads, left_pad as i32, dim])?
-                    .as_dtype(kv.dtype())?;
+                let padding =
+                    Array::zeros::<f32>(&[1, heads, left_pad as i32, dim])?.as_dtype(kv.dtype())?;
                 let padded_k = mlx_rs::ops::concatenate_axis(&[padding.clone(), kv], 2)?;
                 let padded_v = mlx_rs::ops::concatenate_axis(&[padding, vv], 2)?;
                 k_parts.push(padded_k);

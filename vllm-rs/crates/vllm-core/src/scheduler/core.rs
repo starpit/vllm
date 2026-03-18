@@ -200,13 +200,6 @@ impl SimpleBlockTracker {
     /// in a sequence and for fan-in span blocks.
     const NONE_HASH: u64 = 0;
 
-    /// Hash a block-sized chunk of token IDs (no parent chain).
-    fn hash_block(tokens: &[u32]) -> u64 {
-        let mut hasher = std::hash::DefaultHasher::new();
-        tokens.hash(&mut hasher);
-        hasher.finish()
-    }
-
     /// Hash a block with parent-chain awareness for spans.
     ///
     /// - If spans are enabled and the block starts with `token_plus`, the

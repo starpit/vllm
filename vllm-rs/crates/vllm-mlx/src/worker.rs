@@ -782,7 +782,10 @@ impl Worker for MlxWorker {
                             self.kv_cache_pool.insert(h, kv_cache.clone());
                         }
 
-                        // Spans: also store per-block KV chunks for block-level reuse.
+                        // Spans: store per-block KV chunks for block-level reuse.
+                        // Only store PLUS (fan-in) blocks — they're relocatable.
+                        // CROSS blocks are position-dependent and only match when
+                        // all prior context is identical (handled by whole-prefix pool).
                         if self.spans_config.has_fan_in() {
                             let block_hashes =
                                 hash_blocks(prompt, self.prefix_block_size, &self.spans_config);
@@ -790,9 +793,15 @@ impl Worker for MlxWorker {
                                 if self.block_kv_pool.contains_key(bh) {
                                     continue;
                                 }
-                                let start = (bi * self.prefix_block_size) as i32;
+                                // Only cache blocks starting with token_plus.
+                                let block_start = bi * self.prefix_block_size;
+                                let is_span_block = block_start < prompt.len()
+                                    && Some(prompt[block_start]) == self.spans_config.token_plus;
+                                if !is_span_block {
+                                    continue;
+                                }
+                                let start = block_start as i32;
                                 let end = start + self.prefix_block_size as i32;
-                                // Extract per-layer KV slices for this block.
                                 let mut block_layers = Vec::with_capacity(kv_cache.len());
                                 for layer in kv_cache.iter().flatten() {
                                     let k_block = layer.k_slice(start, end);

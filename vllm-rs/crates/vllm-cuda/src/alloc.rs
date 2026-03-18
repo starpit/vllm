@@ -584,6 +584,39 @@ impl CachingAllocator {
         self.all_blocks.len()
     }
 
+    /// Release all GPU memory and reset the allocator to its initial state.
+    ///
+    /// Frees every segment back to the CUDA driver, deallocates all Block
+    /// structs, and clears private pools. After this call the allocator is
+    /// empty — equivalent to a freshly constructed `CachingAllocator::new()`.
+    ///
+    /// Used during sleep/wake cycles where all GPU resources are torn down
+    /// and will be re-created from scratch on wake.
+    ///
+    /// # Safety
+    /// All pointers previously returned by `alloc()` become invalid.
+    /// Callers must ensure no live references to allocated memory remain.
+    pub unsafe fn release_all(&mut self) {
+        // Free all segments back to the CUDA driver.
+        for &(ptr, _) in &self.segments {
+            let _ = driver::mem_free(ptr);
+        }
+        // Free all Block structs.
+        for &bp in &self.all_blocks {
+            let _ = Box::from_raw(bp);
+        }
+        // Reset to initial state.
+        self.small_pool = BlockPool::new(true);
+        self.large_pool = BlockPool::new(false);
+        self.segments.clear();
+        self.all_blocks.clear();
+        self.active_blocks.clear();
+        self.private_small_pool = None;
+        self.private_large_pool = None;
+        self.active_bytes = 0;
+        self.peak_active_bytes = 0;
+    }
+
     /// Release all free, unsplit segments back to the CUDA driver.
     /// Matches PyTorch's `torch.cuda.empty_cache()` / `release_cached_blocks()`.
     pub fn trim(&mut self) {

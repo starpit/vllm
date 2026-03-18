@@ -4707,9 +4707,11 @@ impl Worker for CudaWorker {
         #[cfg(feature = "guided-decoding")]
         self.grammar_states.clear();
 
-        // Free leaked blocks in the caching allocator.
+        // Release all GPU memory held by the caching allocator (segments,
+        // blocks, private pools). This returns memory to the CUDA driver and
+        // resets the allocator so begin_allocate_to_pool() works on wake.
         if let Some(ref mut dev) = self.device {
-            unsafe { dev.caching.free_leaked_blocks() };
+            unsafe { dev.caching.release_all() };
         }
 
         info!("CudaWorker: sleep complete — GPU memory released");

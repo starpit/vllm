@@ -1153,63 +1153,77 @@ impl LlamaAttention {
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
 
-        // Get shapes/dtypes from CPU metadata to pre-allocate fused tensor.
-        let q_name = format!("{prefix}.q_proj.weight");
-        let k_name = format!("{prefix}.k_proj.weight");
-        let v_name = format!("{prefix}.v_proj.weight");
-
-        let (q_shape, q_dtype) = weights
-            .tensor_info(&q_name)
-            .ok_or_else(|| anyhow::anyhow!("weight not found: {q_name}"))?;
-        let hidden = if q_shape.len() == 2 { q_shape[1] } else { 1 };
-        let elem_size = q_dtype.size_bytes();
-        let q_bytes = q_size * hidden * elem_size;
-        let kv_bytes = kv_size * hidden * elem_size;
-        let total_bytes = q_bytes + 2 * kv_bytes;
-
-        // Pre-allocate fused QKV tensor on GPU.
-        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
-
-        // Stream each component directly from CPU → GPU offset.
-        unsafe {
-            weights.take_into(&q_name, ptr, stream)?;
-            weights.take_into(&k_name, ptr.add(q_bytes), stream)?;
-            weights.take_into(&v_name, ptr.add(q_bytes + kv_bytes), stream)?;
-        }
-
-        let qkv_w = unsafe { GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden], q_dtype) };
-
-        // Fuse QKV bias if present (Qwen2 has QKV bias, LLaMA doesn't).
-        let q_bias_name = format!("{prefix}.q_proj.bias");
-        let k_bias_name = format!("{prefix}.k_proj.bias");
-        let v_bias_name = format!("{prefix}.v_proj.bias");
-        let qkv_bias = if weights.contains(&q_bias_name) {
-            let (q_b_shape, q_b_dtype) = weights
-                .tensor_info(&q_bias_name)
-                .ok_or_else(|| anyhow::anyhow!("weight not found: {q_bias_name}"))?;
-            let q_b_bytes = q_b_shape.iter().product::<usize>() * q_b_dtype.size_bytes();
-            let (k_b_shape, _) = weights
-                .tensor_info(&k_bias_name)
-                .ok_or_else(|| anyhow::anyhow!("weight not found: {k_bias_name}"))?;
-            let k_b_bytes = k_b_shape.iter().product::<usize>() * q_b_dtype.size_bytes();
-            let (v_b_shape, _) = weights
-                .tensor_info(&v_bias_name)
-                .ok_or_else(|| anyhow::anyhow!("weight not found: {v_bias_name}"))?;
-            let v_b_bytes = v_b_shape.iter().product::<usize>() * q_b_dtype.size_bytes();
-            let total_bias_bytes = q_b_bytes + k_b_bytes + v_b_bytes;
-            let total_elems = total_bias_bytes / q_b_dtype.size_bytes();
-
-            let bias_ptr = unsafe { crate::driver::mem_alloc(total_bias_bytes)? };
-            unsafe {
-                weights.take_into(&q_bias_name, bias_ptr, stream)?;
-                weights.take_into(&k_bias_name, bias_ptr.add(q_b_bytes), stream)?;
-                weights.take_into(&v_bias_name, bias_ptr.add(q_b_bytes + k_b_bytes), stream)?;
-            }
-            Some(unsafe { GpuTensor::new(bias_ptr, &[total_elems], q_b_dtype) })
+        // Try pre-fused qkv_proj first (Phi-4 / Phi-3 models), then fall back
+        // to separate q/k/v (standard Llama/Qwen2/Mistral).
+        let fused_name = format!("{prefix}.qkv_proj.weight");
+        let qkv_proj = if weights.contains(&fused_name) {
+            let w = weights.take(&fused_name)?;
+            let bias_name = format!("{prefix}.qkv_proj.bias");
+            let bias = if weights.contains(&bias_name) {
+                Some(weights.take(&bias_name)?)
+            } else {
+                None
+            };
+            LinearLayer::Dense(Linear::new(w, bias))
         } else {
-            None
+            // Get shapes/dtypes from CPU metadata to pre-allocate fused tensor.
+            let q_name = format!("{prefix}.q_proj.weight");
+            let k_name = format!("{prefix}.k_proj.weight");
+            let v_name = format!("{prefix}.v_proj.weight");
+
+            let (q_shape, q_dtype) = weights
+                .tensor_info(&q_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {q_name}"))?;
+            let hidden = if q_shape.len() == 2 { q_shape[1] } else { 1 };
+            let elem_size = q_dtype.size_bytes();
+            let q_bytes = q_size * hidden * elem_size;
+            let kv_bytes = kv_size * hidden * elem_size;
+            let total_bytes = q_bytes + 2 * kv_bytes;
+
+            // Pre-allocate fused QKV tensor on GPU.
+            let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+
+            // Stream each component directly from CPU → GPU offset.
+            unsafe {
+                weights.take_into(&q_name, ptr, stream)?;
+                weights.take_into(&k_name, ptr.add(q_bytes), stream)?;
+                weights.take_into(&v_name, ptr.add(q_bytes + kv_bytes), stream)?;
+            }
+
+            let qkv_w = unsafe { GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden], q_dtype) };
+
+            // Fuse QKV bias if present (Qwen2 has QKV bias, LLaMA doesn't).
+            let q_bias_name = format!("{prefix}.q_proj.bias");
+            let k_bias_name = format!("{prefix}.k_proj.bias");
+            let v_bias_name = format!("{prefix}.v_proj.bias");
+            let qkv_bias = if weights.contains(&q_bias_name) {
+                let (q_b_shape, q_b_dtype) = weights
+                    .tensor_info(&q_bias_name)
+                    .ok_or_else(|| anyhow::anyhow!("weight not found: {q_bias_name}"))?;
+                let q_b_bytes = q_b_shape.iter().product::<usize>() * q_b_dtype.size_bytes();
+                let (k_b_shape, _) = weights
+                    .tensor_info(&k_bias_name)
+                    .ok_or_else(|| anyhow::anyhow!("weight not found: {k_bias_name}"))?;
+                let k_b_bytes = k_b_shape.iter().product::<usize>() * q_b_dtype.size_bytes();
+                let (v_b_shape, _) = weights
+                    .tensor_info(&v_bias_name)
+                    .ok_or_else(|| anyhow::anyhow!("weight not found: {v_bias_name}"))?;
+                let v_b_bytes = v_b_shape.iter().product::<usize>() * q_b_dtype.size_bytes();
+                let total_bias_bytes = q_b_bytes + k_b_bytes + v_b_bytes;
+                let total_elems = total_bias_bytes / q_b_dtype.size_bytes();
+
+                let bias_ptr = unsafe { crate::driver::mem_alloc(total_bias_bytes)? };
+                unsafe {
+                    weights.take_into(&q_bias_name, bias_ptr, stream)?;
+                    weights.take_into(&k_bias_name, bias_ptr.add(q_b_bytes), stream)?;
+                    weights.take_into(&v_bias_name, bias_ptr.add(q_b_bytes + k_b_bytes), stream)?;
+                }
+                Some(unsafe { GpuTensor::new(bias_ptr, &[total_elems], q_b_dtype) })
+            } else {
+                None
+            };
+            LinearLayer::Dense(Linear::new(qkv_w, qkv_bias))
         };
-        let qkv_proj = LinearLayer::Dense(Linear::new(qkv_w, qkv_bias));
 
         let o_proj = LinearLayer::Dense(Linear::load(weights, &format!("{prefix}.o_proj"))?);
 
@@ -1300,32 +1314,40 @@ impl LlamaMLP {
         intermediate_size: usize,
         stream: cudarc::driver::sys::CUstream,
     ) -> Result<Self> {
-        let gate_name = format!("{prefix}.gate_proj.weight");
-        let up_name = format!("{prefix}.up_proj.weight");
-
-        let (gate_shape, gate_dtype) = weights
-            .tensor_info(&gate_name)
-            .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
-        let hidden = if gate_shape.len() == 2 {
-            gate_shape[1]
+        // Try pre-fused gate_up_proj first (Phi-4 / Phi-3 models), then fall
+        // back to separate gate/up (standard Llama/Mistral).
+        let fused_name = format!("{prefix}.gate_up_proj.weight");
+        let gate_up_proj = if weights.contains(&fused_name) {
+            let w = weights.take(&fused_name)?;
+            LinearLayer::Dense(Linear::new(w, None))
         } else {
-            1
+            let gate_name = format!("{prefix}.gate_proj.weight");
+            let up_name = format!("{prefix}.up_proj.weight");
+
+            let (gate_shape, gate_dtype) = weights
+                .tensor_info(&gate_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
+            let hidden = if gate_shape.len() == 2 {
+                gate_shape[1]
+            } else {
+                1
+            };
+            let elem_size = gate_dtype.size_bytes();
+            let gate_bytes = gate_shape.iter().product::<usize>() * elem_size;
+            let up_bytes = gate_bytes; // same shape
+
+            let total_bytes = gate_bytes + up_bytes;
+            let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+
+            unsafe {
+                weights.take_into(&gate_name, ptr, stream)?;
+                weights.take_into(&up_name, ptr.add(gate_bytes), stream)?;
+            }
+
+            let gate_up_w =
+                unsafe { GpuTensor::new(ptr, &[2 * intermediate_size, hidden], gate_dtype) };
+            LinearLayer::Dense(Linear::new(gate_up_w, None))
         };
-        let elem_size = gate_dtype.size_bytes();
-        let gate_bytes = gate_shape.iter().product::<usize>() * elem_size;
-        let up_bytes = gate_bytes; // same shape
-
-        let total_bytes = gate_bytes + up_bytes;
-        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
-
-        unsafe {
-            weights.take_into(&gate_name, ptr, stream)?;
-            weights.take_into(&up_name, ptr.add(gate_bytes), stream)?;
-        }
-
-        let gate_up_w =
-            unsafe { GpuTensor::new(ptr, &[2 * intermediate_size, hidden], gate_dtype) };
-        let gate_up_proj = LinearLayer::Dense(Linear::new(gate_up_w, None));
 
         let down_proj = LinearLayer::Dense(Linear::load(weights, &format!("{prefix}.down_proj"))?);
         Ok(Self {
@@ -2097,92 +2119,107 @@ impl LlamaAttention {
         let q_size = num_q_heads * head_dim;
         let kv_size = num_kv_heads * head_dim;
 
-        // Get dtype from weight metadata.
-        let q_name = format!("{prefix}.q_proj.weight");
-        let k_name = format!("{prefix}.k_proj.weight");
-        let v_name = format!("{prefix}.v_proj.weight");
+        // Try pre-fused qkv_proj first (Phi-4 / Phi-3 models), then fall back
+        // to separate q/k/v.
+        let fused_name = format!("{prefix}.qkv_proj.weight");
+        let qkv_proj = if weights.contains(&fused_name) {
+            // Pre-fused: shard the single qkv_proj along dim=0.
+            let w = weights.take_shard(&fused_name, 0, tp.rank, tp.world_size)?;
+            let bias_name = format!("{prefix}.qkv_proj.bias");
+            let bias = if weights.contains(&bias_name) {
+                Some(weights.take_shard(&bias_name, 0, tp.rank, tp.world_size)?)
+            } else {
+                None
+            };
+            LinearLayer::Dense(Linear::new(w, bias))
+        } else {
+            // Get dtype from weight metadata.
+            let q_name = format!("{prefix}.q_proj.weight");
+            let k_name = format!("{prefix}.k_proj.weight");
+            let v_name = format!("{prefix}.v_proj.weight");
 
-        let (_q_shape, q_dtype) = weights
-            .tensor_info(&q_name)
-            .ok_or_else(|| anyhow::anyhow!("weight not found: {q_name}"))?;
-        let hidden = _q_shape[1];
-        let elem_size = q_dtype.size_bytes();
+            let (_q_shape, q_dtype) = weights
+                .tensor_info(&q_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {q_name}"))?;
+            let hidden = _q_shape[1];
+            let elem_size = q_dtype.size_bytes();
 
-        // Pre-allocate fused QKV tensor for this rank's shard.
-        let q_bytes = q_size * hidden * elem_size;
-        let kv_bytes = kv_size * hidden * elem_size;
-        let total_bytes = q_bytes + 2 * kv_bytes;
-        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+            // Pre-allocate fused QKV tensor for this rank's shard.
+            let q_bytes = q_size * hidden * elem_size;
+            let kv_bytes = kv_size * hidden * elem_size;
+            let total_bytes = q_bytes + 2 * kv_bytes;
+            let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
 
-        // Shard each component along dim=0 and stream into fused buffer.
-        unsafe {
-            weights.take_shard_into(&q_name, 0, tp.rank, tp.world_size, ptr, stream)?;
-            weights.take_shard_into(
-                &k_name,
-                0,
-                tp.rank,
-                tp.world_size,
-                ptr.add(q_bytes),
-                stream,
-            )?;
-            weights.take_shard_into(
-                &v_name,
-                0,
-                tp.rank,
-                tp.world_size,
-                ptr.add(q_bytes + kv_bytes),
-                stream,
-            )?;
-        }
-
-        let qkv_w = unsafe { GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden], q_dtype) };
-
-        // Fuse QKV bias if present (Qwen2), also sharded.
-        let q_bias_name = format!("{prefix}.q_proj.bias");
-        let k_bias_name = format!("{prefix}.k_proj.bias");
-        let v_bias_name = format!("{prefix}.v_proj.bias");
-        let qkv_bias = if weights.contains(&q_bias_name) {
-            let (_, q_b_dtype) = weights
-                .tensor_info(&q_bias_name)
-                .ok_or_else(|| anyhow::anyhow!("weight not found: {q_bias_name}"))?;
-            let q_b_bytes = q_size * q_b_dtype.size_bytes();
-            let k_b_bytes = kv_size * q_b_dtype.size_bytes();
-            let v_b_bytes = kv_size * q_b_dtype.size_bytes();
-            let total_bias_bytes = q_b_bytes + k_b_bytes + v_b_bytes;
-            let total_elems = total_bias_bytes / q_b_dtype.size_bytes();
-
-            let bias_ptr = unsafe { crate::driver::mem_alloc(total_bias_bytes)? };
+            // Shard each component along dim=0 and stream into fused buffer.
             unsafe {
+                weights.take_shard_into(&q_name, 0, tp.rank, tp.world_size, ptr, stream)?;
                 weights.take_shard_into(
-                    &q_bias_name,
+                    &k_name,
                     0,
                     tp.rank,
                     tp.world_size,
-                    bias_ptr,
+                    ptr.add(q_bytes),
                     stream,
                 )?;
                 weights.take_shard_into(
-                    &k_bias_name,
+                    &v_name,
                     0,
                     tp.rank,
                     tp.world_size,
-                    bias_ptr.add(q_b_bytes),
-                    stream,
-                )?;
-                weights.take_shard_into(
-                    &v_bias_name,
-                    0,
-                    tp.rank,
-                    tp.world_size,
-                    bias_ptr.add(q_b_bytes + k_b_bytes),
+                    ptr.add(q_bytes + kv_bytes),
                     stream,
                 )?;
             }
-            Some(unsafe { GpuTensor::new(bias_ptr, &[total_elems], q_b_dtype) })
-        } else {
-            None
+
+            let qkv_w = unsafe { GpuTensor::new(ptr, &[q_size + 2 * kv_size, hidden], q_dtype) };
+
+            // Fuse QKV bias if present (Qwen2), also sharded.
+            let q_bias_name = format!("{prefix}.q_proj.bias");
+            let k_bias_name = format!("{prefix}.k_proj.bias");
+            let v_bias_name = format!("{prefix}.v_proj.bias");
+            let qkv_bias = if weights.contains(&q_bias_name) {
+                let (_, q_b_dtype) = weights
+                    .tensor_info(&q_bias_name)
+                    .ok_or_else(|| anyhow::anyhow!("weight not found: {q_bias_name}"))?;
+                let q_b_bytes = q_size * q_b_dtype.size_bytes();
+                let k_b_bytes = kv_size * q_b_dtype.size_bytes();
+                let v_b_bytes = kv_size * q_b_dtype.size_bytes();
+                let total_bias_bytes = q_b_bytes + k_b_bytes + v_b_bytes;
+                let total_elems = total_bias_bytes / q_b_dtype.size_bytes();
+
+                let bias_ptr = unsafe { crate::driver::mem_alloc(total_bias_bytes)? };
+                unsafe {
+                    weights.take_shard_into(
+                        &q_bias_name,
+                        0,
+                        tp.rank,
+                        tp.world_size,
+                        bias_ptr,
+                        stream,
+                    )?;
+                    weights.take_shard_into(
+                        &k_bias_name,
+                        0,
+                        tp.rank,
+                        tp.world_size,
+                        bias_ptr.add(q_b_bytes),
+                        stream,
+                    )?;
+                    weights.take_shard_into(
+                        &v_bias_name,
+                        0,
+                        tp.rank,
+                        tp.world_size,
+                        bias_ptr.add(q_b_bytes + k_b_bytes),
+                        stream,
+                    )?;
+                }
+                Some(unsafe { GpuTensor::new(bias_ptr, &[total_elems], q_b_dtype) })
+            } else {
+                None
+            };
+            LinearLayer::Dense(Linear::new(qkv_w, qkv_bias))
         };
-        let qkv_proj = LinearLayer::Dense(Linear::new(qkv_w, qkv_bias));
 
         // o_proj: shard along dim=1 (row parallel — input is split across ranks).
         let o_name = format!("{prefix}.o_proj.weight");
@@ -2231,35 +2268,43 @@ impl LlamaMLP {
     ) -> Result<Self> {
         let shard_intermediate = intermediate_size / tp.world_size;
 
-        let gate_name = format!("{prefix}.gate_proj.weight");
-        let up_name = format!("{prefix}.up_proj.weight");
+        // Try pre-fused gate_up_proj first (Phi-4 / Phi-3 models), then fall
+        // back to separate gate/up.
+        let fused_name = format!("{prefix}.gate_up_proj.weight");
+        let gate_up_proj = if weights.contains(&fused_name) {
+            let w = weights.take_shard(&fused_name, 0, tp.rank, tp.world_size)?;
+            LinearLayer::Dense(Linear::new(w, None))
+        } else {
+            let gate_name = format!("{prefix}.gate_proj.weight");
+            let up_name = format!("{prefix}.up_proj.weight");
 
-        let (gate_shape, gate_dtype) = weights
-            .tensor_info(&gate_name)
-            .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
-        let hidden = gate_shape[1];
-        let elem_size = gate_dtype.size_bytes();
+            let (gate_shape, gate_dtype) = weights
+                .tensor_info(&gate_name)
+                .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
+            let hidden = gate_shape[1];
+            let elem_size = gate_dtype.size_bytes();
 
-        // Each shard: [shard_intermediate, hidden].
-        let shard_bytes = shard_intermediate * hidden * elem_size;
-        let total_bytes = 2 * shard_bytes;
-        let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+            // Each shard: [shard_intermediate, hidden].
+            let shard_bytes = shard_intermediate * hidden * elem_size;
+            let total_bytes = 2 * shard_bytes;
+            let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
 
-        unsafe {
-            weights.take_shard_into(&gate_name, 0, tp.rank, tp.world_size, ptr, stream)?;
-            weights.take_shard_into(
-                &up_name,
-                0,
-                tp.rank,
-                tp.world_size,
-                ptr.add(shard_bytes),
-                stream,
-            )?;
-        }
+            unsafe {
+                weights.take_shard_into(&gate_name, 0, tp.rank, tp.world_size, ptr, stream)?;
+                weights.take_shard_into(
+                    &up_name,
+                    0,
+                    tp.rank,
+                    tp.world_size,
+                    ptr.add(shard_bytes),
+                    stream,
+                )?;
+            }
 
-        let gate_up_w =
-            unsafe { GpuTensor::new(ptr, &[2 * shard_intermediate, hidden], gate_dtype) };
-        let gate_up_proj = LinearLayer::Dense(Linear::new(gate_up_w, None));
+            let gate_up_w =
+                unsafe { GpuTensor::new(ptr, &[2 * shard_intermediate, hidden], gate_dtype) };
+            LinearLayer::Dense(Linear::new(gate_up_w, None))
+        };
 
         // down_proj: shard along dim=1 (row parallel).
         let down_name = format!("{prefix}.down_proj.weight");

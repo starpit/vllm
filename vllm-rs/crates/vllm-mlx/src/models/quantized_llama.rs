@@ -479,46 +479,90 @@ impl MlxQuantizedLlamaAttention {
         let mut per_req_v = Vec::with_capacity(batch_info.num_reqs);
         let mut kv_lens = Vec::with_capacity(batch_info.num_reqs);
 
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..batch_info.num_reqs {
-            let start = batch_info.offsets[i] as i32;
-            let seq_len = batch_info.q_lens[i] as i32;
-            let offset = batch_info.rope_offsets[i];
+        if all_decode {
+            let n = batch_info.num_reqs as i32;
+            let nh = self.num_heads as i32;
+            let nkv = self.num_kv_heads as i32;
+            let hd = self.head_dim as i32;
 
-            let q = q_all.try_index((start..start + seq_len, ..))?;
-            let k = k_all.try_index((start..start + seq_len, ..))?;
-            let v = v_all.try_index((start..start + seq_len, ..))?;
+            let mut q = q_all.reshape(&[n, nh, 1, hd])?;
+            let mut k = k_all.reshape(&[n, nkv, 1, hd])?;
+            let v = v_all.reshape(&[n, nkv, 1, hd])?;
 
-            let q = q.reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?;
-            let k = k.reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
+            if let Some(ref mut norm) = self.q_norm {
+                q = norm.forward(&q.squeeze_axes(&[2])?)?.expand_dims(2)?;
+            }
+            if let Some(ref mut norm) = self.k_norm {
+                k = norm.forward(&k.squeeze_axes(&[2])?)?.expand_dims(2)?;
+            }
 
-            let q = if let Some(ref mut norm) = self.q_norm {
-                norm.forward(&q)?
-            } else {
-                q
-            };
-            let k = if let Some(ref mut norm) = self.k_norm {
-                norm.forward(&k)?
-            } else {
-                k
-            };
+            let offsets_arr = Array::from_iter(
+                batch_info.rope_offsets.iter().copied(),
+                &[n],
+            );
+            q = mlx_rs::fast::rope_dynamic(
+                &q, self.rope.dimensions, self.rope.traditional,
+                self.rope.base, self.rope.scale, &offsets_arr, None::<&Array>,
+            )?;
+            k = mlx_rs::fast::rope_dynamic(
+                &k, self.rope.dimensions, self.rope.traditional,
+                self.rope.base, self.rope.scale, &offsets_arr, None::<&Array>,
+            )?;
 
-            let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-            let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-            let v = v
-                .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
-                .transpose_axes(&[1, 0, 2])?
-                .expand_dims(0)?;
+            for i in 0..batch_info.num_reqs {
+                let ii = i as i32;
+                let qi = q.try_index((ii..ii + 1, .., .., ..))?;
+                let ki = k.try_index((ii..ii + 1, .., .., ..))?;
+                let vi = v.try_index((ii..ii + 1, .., .., ..))?;
 
-            let q = self.rope.forward((&q, offset))?;
-            k = self.rope.forward((&k, offset))?;
+                let (ki, vi) = crate::cache::kv_cache_update(&mut caches[i], &ki, &vi)?;
+                kv_lens.push(ki.dim(2) as usize);
+                per_req_q.push(qi);
+                per_req_k.push(ki);
+                per_req_v.push(vi);
+            }
+        } else {
+            #[allow(clippy::needless_range_loop)]
+            for i in 0..batch_info.num_reqs {
+                let start = batch_info.offsets[i] as i32;
+                let seq_len = batch_info.q_lens[i] as i32;
+                let offset = batch_info.rope_offsets[i];
 
-            let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                let q = q_all.try_index((start..start + seq_len, ..))?;
+                let k = k_all.try_index((start..start + seq_len, ..))?;
+                let v = v_all.try_index((start..start + seq_len, ..))?;
 
-            kv_lens.push(k.dim(2) as usize);
-            per_req_q.push(q);
-            per_req_k.push(k);
-            per_req_v.push(v);
+                let q = q.reshape(&[seq_len, self.num_heads as i32, self.head_dim as i32])?;
+                let k = k.reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
+
+                let q = if let Some(ref mut norm) = self.q_norm {
+                    norm.forward(&q)?
+                } else {
+                    q
+                };
+                let k = if let Some(ref mut norm) = self.k_norm {
+                    norm.forward(&k)?
+                } else {
+                    k
+                };
+
+                let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+                let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+                let v = v
+                    .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
+                    .transpose_axes(&[1, 0, 2])?
+                    .expand_dims(0)?;
+
+                let q = self.rope.forward((&q, offset))?;
+                k = self.rope.forward((&k, offset))?;
+
+                let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+
+                kv_lens.push(k.dim(2) as usize);
+                per_req_q.push(q);
+                per_req_k.push(k);
+                per_req_v.push(v);
+            }
         }
 
         let can_batch_sdpa =

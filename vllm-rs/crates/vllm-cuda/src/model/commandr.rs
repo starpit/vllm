@@ -678,6 +678,7 @@ impl CommandRForCausalLM {
                 &llama_config,
                 i,
                 dtype,
+                0.0, // CommandR uses separate QK-norm loading
                 stream,
             )?;
             let self_attn = CommandRAttention { inner: inner_attn };

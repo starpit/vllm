@@ -3537,12 +3537,27 @@ impl Worker for CudaWorker {
                         device,
                     )
                 } else if qconfig.is_fp8() {
-                    vllm_cuda::model::llama::LlamaForCausalLM::load_fp8(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
+                    let fp8_cfg = match &qconfig {
+                        vllm_cuda::quant::QuantConfig::Fp8(c) => c,
+                        _ => unreachable!(),
+                    };
+                    if fp8_cfg.weight_block_size.is_some() {
+                        vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            config.rms_norm_eps,
+                            device,
+                        )
+                    } else {
+                        vllm_cuda::model::llama::LlamaForCausalLM::load_fp8(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            config.rms_norm_eps,
+                            device,
+                        )
+                    }
                 } else if qconfig.is_quantized() {
                     vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
                         &mut weights,
@@ -3791,12 +3806,27 @@ impl Worker for CudaWorker {
                         device,
                     )
                 } else if qconfig.is_fp8() {
-                    vllm_cuda::model::llama::LlamaForCausalLM::load_fp8(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
+                    let fp8_cfg = match &qconfig {
+                        vllm_cuda::quant::QuantConfig::Fp8(c) => c,
+                        _ => unreachable!(),
+                    };
+                    if fp8_cfg.weight_block_size.is_some() {
+                        vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            config.rms_norm_eps,
+                            device,
+                        )
+                    } else {
+                        vllm_cuda::model::llama::LlamaForCausalLM::load_fp8(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            config.rms_norm_eps,
+                            device,
+                        )
+                    }
                 } else if qconfig.is_quantized() {
                     vllm_cuda::model::llama::LlamaForCausalLM::load_quantized(
                         &mut weights,

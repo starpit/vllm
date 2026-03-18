@@ -412,25 +412,16 @@ impl Qwen3MoeDecoderLayer {
     ) -> Result<Self> {
         let llama_cfg = config.as_llama_config();
 
-        // Load FP8 attention, then add QK-norm weights on top.
-        let mut self_attn = LlamaAttention::load_fp8(
+        // Load FP8 attention with QK-norm weights.
+        let self_attn = LlamaAttention::load_fp8(
             weights,
             &format!("{prefix}.self_attn"),
             &llama_cfg,
             layer_idx,
             dtype,
+            config.rms_norm_eps,
             stream,
         )?;
-
-        let q_norm_name = format!("{prefix}.self_attn.q_norm.weight");
-        let k_norm_name = format!("{prefix}.self_attn.k_norm.weight");
-        if weights.contains(&q_norm_name) {
-            self_attn.q_norm_weight = Some(weights.take(&q_norm_name)?);
-        }
-        if weights.contains(&k_norm_name) {
-            self_attn.k_norm_weight = Some(weights.take(&k_norm_name)?);
-        }
-        self_attn.qk_norm_eps = config.rms_norm_eps;
 
         let is_dense = config.mlp_only_layers.contains(&layer_idx);
         let mlp = if is_dense {

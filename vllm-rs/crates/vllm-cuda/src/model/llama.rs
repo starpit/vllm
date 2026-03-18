@@ -1410,6 +1410,7 @@ impl LlamaAttention {
         config: &LlamaConfig,
         layer_idx: usize,
         output_dtype: DType,
+        qk_norm_eps: f32,
         stream: cudarc::driver::sys::CUstream,
     ) -> Result<Self> {
         let num_q_heads = config.num_attention_heads;
@@ -1430,6 +1431,19 @@ impl LlamaAttention {
         )?;
         let o = gpu_weights::load_fp8_linear(weights, &format!("{prefix}.o_proj"), output_dtype)?;
 
+        let q_norm_name = format!("{prefix}.q_norm.weight");
+        let k_norm_name = format!("{prefix}.k_norm.weight");
+        let q_norm_weight = if weights.contains(&q_norm_name) {
+            Some(weights.take(&q_norm_name)?)
+        } else {
+            None
+        };
+        let k_norm_weight = if weights.contains(&k_norm_name) {
+            Some(weights.take(&k_norm_name)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             qkv_proj: LinearLayer::Fp8(Box::new(qkv)),
             k_proj: None,
@@ -1442,9 +1456,72 @@ impl LlamaAttention {
             head_dim,
             scale: 1.0 / (head_dim as f32).sqrt(),
             layer_idx,
-            q_norm_weight: None,
-            k_norm_weight: None,
-            qk_norm_eps: 0.0,
+            q_norm_weight,
+            k_norm_weight,
+            qk_norm_eps,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+
+    /// Load FP8 block-quantized attention with fused QKV.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fp8_block(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        output_dtype: DType,
+        qk_norm_eps: f32,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let num_q_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        let qkv = gpu_weights::load_fused_fp8_block_linear(
+            weights,
+            &[
+                format!("{prefix}.q_proj"),
+                format!("{prefix}.k_proj"),
+                format!("{prefix}.v_proj"),
+            ],
+            output_dtype,
+            stream,
+        )?;
+        let o =
+            gpu_weights::load_fp8_block_linear(weights, &format!("{prefix}.o_proj"), output_dtype)?;
+
+        let q_norm_name = format!("{prefix}.q_norm.weight");
+        let k_norm_name = format!("{prefix}.k_norm.weight");
+        let q_norm_weight = if weights.contains(&q_norm_name) {
+            Some(weights.take(&q_norm_name)?)
+        } else {
+            None
+        };
+        let k_norm_weight = if weights.contains(&k_norm_name) {
+            Some(weights.take(&k_norm_name)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            qkv_proj: LinearLayer::Fp8Block(Box::new(qkv)),
+            k_proj: None,
+            v_proj: None,
+            o_proj: LinearLayer::Fp8Block(Box::new(o)),
+            q_size,
+            kv_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            layer_idx,
+            q_norm_weight,
+            k_norm_weight,
+            qk_norm_eps,
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -1519,6 +1596,36 @@ impl LlamaMLP {
             tp_group: None,
         })
     }
+
+    /// Load FP8 block-quantized MLP with fused gate+up.
+    pub fn load_fp8_block(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        intermediate_size: usize,
+        output_dtype: DType,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let gate_up = gpu_weights::load_fused_fp8_block_linear(
+            weights,
+            &[format!("{prefix}.gate_proj"), format!("{prefix}.up_proj")],
+            output_dtype,
+            stream,
+        )?;
+        let down = gpu_weights::load_fp8_block_linear(
+            weights,
+            &format!("{prefix}.down_proj"),
+            output_dtype,
+        )?;
+
+        Ok(Self {
+            gate_up_proj: LinearLayer::Fp8Block(Box::new(gate_up)),
+            up_proj: None,
+            down_proj: LinearLayer::Fp8Block(Box::new(down)),
+            intermediate_size,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
 }
 
 impl LlamaDecoderLayer {
@@ -1577,6 +1684,7 @@ impl LlamaDecoderLayer {
         config: &LlamaConfig,
         layer_idx: usize,
         output_dtype: DType,
+        qk_norm_eps: f32,
         stream: cudarc::driver::sys::CUstream,
     ) -> Result<Self> {
         let self_attn = LlamaAttention::load_fp8(
@@ -1585,9 +1693,56 @@ impl LlamaDecoderLayer {
             config,
             layer_idx,
             output_dtype,
+            qk_norm_eps,
             stream,
         )?;
         let mlp = LlamaMLP::load_fp8(
+            weights,
+            &format!("{prefix}.mlp"),
+            config.intermediate_size,
+            output_dtype,
+            stream,
+        )?;
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            residual_multiplier: 1.0,
+        })
+    }
+
+    /// Load an FP8 block-quantized decoder layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fp8_block(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        output_dtype: DType,
+        qk_norm_eps: f32,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let self_attn = LlamaAttention::load_fp8_block(
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            output_dtype,
+            qk_norm_eps,
+            stream,
+        )?;
+        let mlp = LlamaMLP::load_fp8_block(
             weights,
             &format!("{prefix}.mlp"),
             config.intermediate_size,
@@ -1788,6 +1943,7 @@ impl LlamaForCausalLM {
         weights: &mut GpuWeights,
         config: &LlamaConfig,
         dtype: DType,
+        qk_norm_eps: f32,
         device: &GpuDevice,
     ) -> Result<Self> {
         let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
@@ -1801,6 +1957,69 @@ impl LlamaForCausalLM {
                 config,
                 i,
                 dtype,
+                qk_norm_eps,
+                device.compute_stream,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                config.llama3_rope_scaling.as_ref(),
+                dtype,
+                device,
+            )?
+        };
+
+        let model = LlamaModel {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embedding_multiplier: 1.0,
+        };
+
+        // lm_head is always dense (not quantized) — matches Python.
+        let lm_head = LinearLayer::Dense(if config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.weight, None)
+        } else {
+            Linear::load(weights, "lm_head")?
+        });
+
+        Ok(Self {
+            model,
+            lm_head,
+            logits_scaling: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+            pp_config: None,
+        })
+    }
+
+    /// Load an FP8 block-quantized model (e.g. Qwen3-8B-FP8).
+    pub fn load_fp8_block(
+        weights: &mut GpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        qk_norm_eps: f32,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+            let layer = LlamaDecoderLayer::load_fp8_block(
+                weights,
+                &prefix,
+                config,
+                i,
+                dtype,
+                qk_norm_eps,
                 device.compute_stream,
             )?;
             layers.push(layer);

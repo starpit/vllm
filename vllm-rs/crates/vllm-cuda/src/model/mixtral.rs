@@ -272,6 +272,7 @@ impl MixtralDecoderLayer {
             &llama_cfg,
             layer_idx,
             output_dtype,
+            0.0, // Mixtral does not use QK-norm
             stream,
         )?;
 

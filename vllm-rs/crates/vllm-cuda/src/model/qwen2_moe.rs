@@ -438,6 +438,7 @@ impl Qwen2MoeDecoderLayer {
             &llama_cfg,
             layer_idx,
             dtype,
+            0.0, // Qwen2 MoE does not use QK-norm
             stream,
         )?;
 

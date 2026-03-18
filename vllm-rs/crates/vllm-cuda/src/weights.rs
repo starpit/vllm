@@ -2826,6 +2826,222 @@ pub fn load_fused_fp8_linear(
 }
 
 // ---------------------------------------------------------------------------
+// FP8 Block-quantized Weight Loading
+// ---------------------------------------------------------------------------
+
+/// Load a single FP8 block-quantized linear layer.
+///
+/// Expects:
+/// - `{prefix}.weight`: FP8 E4M3 `[out_features, in_features]`
+/// - `{prefix}.weight_scale_inv`: f32 2D block scale `[ceil(N/block_n), ceil(K/block_k)]`
+/// - `{prefix}.input_scale` (optional): not used for block quant but consumed if present
+/// - `{prefix}.bias` (optional)
+///
+/// Derives `block_size` from the ratio of weight shape to scale shape.
+pub fn load_fp8_block_linear(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    output_dtype: DType,
+) -> Result<crate::layers::Fp8BlockLinear> {
+    let weight_name = format!("{prefix}.weight");
+    let scale_name = format!("{prefix}.weight_scale_inv");
+    let input_scale_name = format!("{prefix}.input_scale");
+    let bias_name = format!("{prefix}.bias");
+
+    let weight = weights.take(&weight_name)?;
+    anyhow::ensure!(weight.ndim() == 2, "FP8 block weight must be 2D");
+    anyhow::ensure!(
+        weight.dtype() == DType::Fp8E4m3,
+        "FP8 block linear: expected Fp8E4m3 weight, got {}. \
+         Online block quantization is not yet supported in the Rust backend.",
+        weight.dtype()
+    );
+
+    let n = weight.dim(0);
+    let k = weight.dim(1);
+
+    let stream = weights.stream();
+    let raw_scale = weights.take(&scale_name)?;
+    let scale = ensure_f32_scale(raw_scale, stream)?;
+    anyhow::ensure!(
+        scale.ndim() == 2,
+        "FP8 block scale must be 2D, got {}D",
+        scale.ndim()
+    );
+
+    let scale_rows = scale.dim(0);
+    let scale_cols = scale.dim(1);
+    let block_n = n / scale_rows;
+    let block_k = k / scale_cols;
+
+    // Consume input_scale if present (block quant uses dynamic activation).
+    if weights.contains(&input_scale_name) {
+        let _ = weights.take(&input_scale_name);
+    }
+
+    let bias = if weights.contains(&bias_name) {
+        Some(weights.take(&bias_name)?)
+    } else {
+        None
+    };
+
+    Ok(crate::layers::Fp8BlockLinear {
+        weight,
+        weight_scale_inv: scale,
+        block_size: [block_n, block_k],
+        bias,
+        output_dtype,
+    })
+}
+
+/// Load a fused FP8 block-quantized linear layer (QKV or gate_up).
+///
+/// Concatenates multiple FP8 weight shards along dim=0 and their 2D block
+/// scales along dim=0. All shards share the same in_features, so scale dim=1
+/// (input blocks) is identical across shards.
+pub fn load_fused_fp8_block_linear(
+    weights: &mut GpuWeights,
+    prefixes: &[String],
+    output_dtype: DType,
+    stream: CUstream,
+) -> Result<crate::layers::Fp8BlockLinear> {
+    anyhow::ensure!(
+        !prefixes.is_empty(),
+        "load_fused_fp8_block_linear: no prefixes"
+    );
+
+    // Get shapes from first prefix.
+    let first_weight_name = format!("{}.weight", prefixes[0]);
+    let (first_shape, first_dtype) = weights
+        .tensor_info(&first_weight_name)
+        .ok_or_else(|| anyhow::anyhow!("FP8 block: weight not found: {first_weight_name}"))?;
+    anyhow::ensure!(
+        first_dtype == DType::Fp8E4m3,
+        "FP8 block fused: expected Fp8E4m3 weight, got {first_dtype}. \
+         Online block quantization is not yet supported in the Rust backend."
+    );
+    anyhow::ensure!(first_shape.len() == 2, "FP8 block fused weight must be 2D");
+    let in_features = first_shape[1];
+
+    // Derive block_size from first shard's weight and scale shapes.
+    let first_scale_name = format!("{}.weight_scale_inv", prefixes[0]);
+    let (first_scale_shape, _) = weights
+        .tensor_info(&first_scale_name)
+        .ok_or_else(|| anyhow::anyhow!("FP8 block: scale not found: {first_scale_name}"))?;
+    anyhow::ensure!(
+        first_scale_shape.len() == 2,
+        "FP8 block scale must be 2D, got {}D",
+        first_scale_shape.len()
+    );
+    let block_n = first_shape[0] / first_scale_shape[0];
+    let block_k = first_shape[1] / first_scale_shape[1];
+    let scale_cols = first_scale_shape[1]; // same for all shards
+
+    // Sum up output dimensions and scale rows.
+    let mut total_out = 0usize;
+    let mut total_scale_rows = 0usize;
+    let mut shard_sizes = Vec::with_capacity(prefixes.len());
+    let mut shard_scale_rows = Vec::with_capacity(prefixes.len());
+    for prefix in prefixes {
+        let wname = format!("{prefix}.weight");
+        let (shape, _) = weights
+            .tensor_info(&wname)
+            .ok_or_else(|| anyhow::anyhow!("FP8 block: weight not found: {wname}"))?;
+        shard_sizes.push(shape[0]);
+        total_out += shape[0];
+
+        let sname = format!("{prefix}.weight_scale_inv");
+        let (sshape, _) = weights
+            .tensor_info(&sname)
+            .ok_or_else(|| anyhow::anyhow!("FP8 block: scale not found: {sname}"))?;
+        shard_scale_rows.push(sshape[0]);
+        total_scale_rows += sshape[0];
+    }
+
+    // Allocate fused FP8 weight buffer.
+    let elem_size = DType::Fp8E4m3.size_bytes();
+    let total_bytes = total_out * in_features * elem_size;
+    let fused_ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+
+    // Copy each FP8 shard into the fused buffer.
+    let mut offset = 0usize;
+    for (i, prefix) in prefixes.iter().enumerate() {
+        let wname = format!("{prefix}.weight");
+        let shard_bytes = shard_sizes[i] * in_features * elem_size;
+        unsafe {
+            weights.take_into(&wname, fused_ptr.add(offset), stream)?;
+        }
+        offset += shard_bytes;
+    }
+
+    let fused_weight =
+        unsafe { GpuTensor::new(fused_ptr, &[total_out, in_features], DType::Fp8E4m3) };
+
+    // Allocate fused scale buffer and concat scale shards along dim=0.
+    let total_scale_bytes = total_scale_rows * scale_cols * 4; // f32
+    let scale_ptr = unsafe { crate::driver::mem_alloc(total_scale_bytes)? };
+    let mut scale_offset = 0usize;
+    for (i, prefix) in prefixes.iter().enumerate() {
+        let sname = format!("{prefix}.weight_scale_inv");
+        let raw_scale = weights.take(&sname)?;
+        let shard_scale = ensure_f32_scale(raw_scale, stream)?;
+        let shard_bytes = shard_scale_rows[i] * scale_cols * 4;
+        unsafe {
+            crate::driver::memcpy_dtod_async(
+                scale_ptr.add(scale_offset),
+                shard_scale.raw_ptr(),
+                shard_bytes,
+                stream,
+            )?;
+        }
+        scale_offset += shard_bytes;
+    }
+    let fused_scale =
+        unsafe { GpuTensor::new(scale_ptr, &[total_scale_rows, scale_cols], DType::F32) };
+
+    // Consume input_scale if present (block quant uses dynamic activation).
+    let input_scale_name = format!("{}.input_scale", prefixes[0]);
+    if weights.contains(&input_scale_name) {
+        let _ = weights.take(&input_scale_name);
+    }
+
+    // Fuse bias if present.
+    let bias_name = format!("{}.bias", prefixes[0]);
+    let bias = if weights.contains(&bias_name) {
+        let (_bias_shape, bias_dtype) = weights
+            .tensor_info(&bias_name)
+            .ok_or_else(|| anyhow::anyhow!("FP8 block: bias not found"))?;
+        let bias_elem_size = bias_dtype.size_bytes();
+        let mut total_bias_bytes = 0;
+        for &sz in &shard_sizes {
+            total_bias_bytes += sz * bias_elem_size;
+        }
+        let bias_ptr = unsafe { crate::driver::mem_alloc(total_bias_bytes)? };
+        let mut boff = 0;
+        for (i, prefix) in prefixes.iter().enumerate() {
+            let bname = format!("{prefix}.bias");
+            let bbytes = shard_sizes[i] * bias_elem_size;
+            unsafe {
+                weights.take_into(&bname, bias_ptr.add(boff), stream)?;
+            }
+            boff += bbytes;
+        }
+        let total_bias_elems = total_bias_bytes / bias_elem_size;
+        Some(unsafe { GpuTensor::new(bias_ptr, &[total_bias_elems], bias_dtype) })
+    } else {
+        None
+    };
+
+    Ok(crate::layers::Fp8BlockLinear {
+        weight: fused_weight,
+        weight_scale_inv: fused_scale,
+        block_size: [block_n, block_k],
+        bias,
+        output_dtype,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // FP8 MoE Expert Weight Loading
 // ---------------------------------------------------------------------------
 

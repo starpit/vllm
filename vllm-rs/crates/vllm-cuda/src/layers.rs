@@ -506,6 +506,7 @@ pub enum LinearLayer {
     Ggml(Box<GgmlLinear>),
     Bnb4bit(Box<Bnb4bitLinear>),
     Fp8(Box<Fp8Linear>),
+    Fp8Block(Box<Fp8BlockLinear>),
 }
 
 impl LinearLayer {
@@ -534,6 +535,7 @@ impl LinearLayer {
             Self::Ggml(l) => l.forward_owned(x, alloc, stream),
             Self::Bnb4bit(l) => l.forward_owned(x, cublas, alloc, stream),
             Self::Fp8(l) => l.forward_owned(x, cublas, alloc, stream),
+            Self::Fp8Block(l) => l.forward_owned(x, cublas, alloc, stream),
         }
     }
 
@@ -544,6 +546,7 @@ impl LinearLayer {
             Self::Ggml(l) => l.out_features(),
             Self::Bnb4bit(l) => l.out_features(),
             Self::Fp8(l) => l.out_features(),
+            Self::Fp8Block(l) => l.out_features(),
         }
     }
 
@@ -554,6 +557,7 @@ impl LinearLayer {
             Self::Ggml(l) => l.in_features(),
             Self::Bnb4bit(l) => l.in_features(),
             Self::Fp8(l) => l.in_features(),
+            Self::Fp8Block(l) => l.in_features(),
         }
     }
 }
@@ -579,6 +583,12 @@ impl From<GgmlLinear> for LinearLayer {
 impl From<Fp8Linear> for LinearLayer {
     fn from(l: Fp8Linear) -> Self {
         Self::Fp8(Box::new(l))
+    }
+}
+
+impl From<Fp8BlockLinear> for LinearLayer {
+    fn from(l: Fp8BlockLinear) -> Self {
+        Self::Fp8Block(Box::new(l))
     }
 }
 

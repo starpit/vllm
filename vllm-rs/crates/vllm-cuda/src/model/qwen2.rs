@@ -89,7 +89,7 @@ impl Qwen2ForCausalLM {
         dtype: DType,
         device: &GpuDevice,
     ) -> Result<Self> {
-        let model = LlamaForCausalLM::load_fp8(weights, &config.0, dtype, device)?;
+        let model = LlamaForCausalLM::load_fp8(weights, &config.0, dtype, 0.0, device)?;
         Ok(Self(model))
     }
 

@@ -657,21 +657,26 @@ pub struct BenchSpansArgs {
     #[arg(long, default_value = "auto")]
     pub dtype: String,
 
-    /// Number of document blocks to preload.
-    #[arg(long, default_value_t = 4)]
+    /// Number of documents to preload.
+    #[arg(long, default_value_t = 3)]
     pub num_docs: usize,
 
-    /// KV cache block size in tokens (each document = 1 block).
+    /// Number of cache blocks per document.
+    /// Each document is `doc_blocks x block_size` tokens.
+    #[arg(long, default_value_t = 4)]
+    pub doc_blocks: usize,
+
+    /// KV cache block size in tokens.
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,
 
     /// Number of query tokens appended after documents.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = 32)]
     pub query_len: usize,
 
-    /// Number of iterations (forward + reversed) to run.
-    #[arg(long, default_value_t = 5)]
-    pub num_iters: usize,
+    /// Maximum number of permutations to test (all if n! <= this).
+    #[arg(long, default_value_t = 24)]
+    pub max_perms: usize,
 
     /// Token ID used as the span marker (first token of each document block).
     #[arg(long, default_value_t = 10)]

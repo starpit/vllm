@@ -533,13 +533,13 @@ impl MlxLlamaAttention {
             )?;
 
             // Per-request KV cache update (loop, but only slice + cache ops).
-            for i in 0..batch_info.num_reqs {
+            for (i, cache) in caches.iter_mut().enumerate().take(batch_info.num_reqs) {
                 let ii = i as i32;
                 let qi = q.try_index((ii..ii + 1, .., .., ..))?;
                 let ki = k.try_index((ii..ii + 1, .., .., ..))?;
                 let vi = v.try_index((ii..ii + 1, .., .., ..))?;
 
-                let (ki, vi) = crate::cache::kv_cache_update(&mut caches[i], &ki, &vi)?;
+                let (ki, vi) = crate::cache::kv_cache_update(cache, &ki, &vi)?;
                 kv_lens.push(ki.dim(2) as usize);
                 per_req_q.push(qi);
                 per_req_k.push(ki);
@@ -731,7 +731,7 @@ impl MlxLlamaAttention {
         // Single SDPA for all B sequences.
         let sdpa_mask = mask
             .as_ref()
-            .map(|m| mlx_rs::fast::ScaledDotProductAttentionMask::Array(m));
+            .map(mlx_rs::fast::ScaledDotProductAttentionMask::Array);
         let out = mlx_rs::fast::scaled_dot_product_attention(
             &q,
             &k_cached,

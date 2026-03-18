@@ -288,7 +288,7 @@ impl BatchMlxLayerKvCache {
                 }
             }
         }
-        let mask = Array::from_iter(mask_data.into_iter(), &[b as i32, 1, 1, kv_len as i32]);
+        let mask = Array::from_iter(mask_data, &[b as i32, 1, 1, kv_len as i32]);
         // Cast to match model dtype (e.g. float16) so SDPA doesn't reject it.
         let mask = mask.as_dtype(dtype)?;
         Ok(Some(mask))

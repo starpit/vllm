@@ -34,9 +34,6 @@ use crate::models::{MlxModel, MlxModelRegistry};
 /// the main thread's finalize + schedule), update token_buffers, and
 /// return the stored output.
 struct PendingStep {
-    /// Pre-built output for the previous step (req_ids, sampled_token_ids
-    /// are NOT yet populated — token_ids_placeholder is empty vecs).
-    req_ids: Vec<String>,
     /// GPU greedy result array (unread).  `None` if no greedy requests.
     greedy_result: Option<Array>,
     /// Per-request index into greedy_result's flat output.
@@ -1801,7 +1798,6 @@ impl Worker for MlxWorker {
                 .collect();
 
             self.pending_step = Some(PendingStep {
-                req_ids: req_inputs.iter().map(|r| r.req_id.clone()).collect(),
                 greedy_result: gpu_greedy_result,
                 greedy_mapping,
                 temp_results: temp_pending,

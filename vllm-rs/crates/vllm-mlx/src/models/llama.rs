@@ -669,13 +669,15 @@ impl MlxLlamaAttention {
     ///
     /// Requires: all requests are decode (q_len=1), no sliding window.
     /// `batch_cache` holds the persistent batched [B, heads, kv_len, dim] cache for this layer.
-    /// `left_padding` contains per-request left-padding offsets.
+    /// `mask` is the pre-built left-padding mask (shared across all layers).
+    /// `offsets_arr` is the pre-built rope offsets array (shared across all layers).
     pub fn forward_batch_decode(
         &mut self,
         hidden_states: &Array,
         batch_info: &MlxBatchInfo,
         batch_cache: &mut BatchMlxLayerKvCache,
-        left_padding: &[usize],
+        mask: &Option<Array>,
+        offsets_arr: &Array,
     ) -> Result<Array, Exception> {
         let n = batch_info.num_reqs as i32;
         let nh = self.num_heads as i32;
@@ -700,15 +702,14 @@ impl MlxLlamaAttention {
             k = norm.forward(&k.squeeze_axes(&[2])?)?.expand_dims(2)?;
         }
 
-        // Batched RoPE via rope_dynamic.
-        let offsets_arr = Array::from_iter(batch_info.rope_offsets.iter().copied(), &[n]);
+        // Batched RoPE via rope_dynamic (offsets_arr built once, shared across layers).
         q = mlx_rs::fast::rope_dynamic(
             &q,
             self.rope.dimensions,
             self.rope.traditional,
             self.rope.base,
             self.rope.scale,
-            &offsets_arr,
+            offsets_arr,
             None::<&Array>,
         )?;
         k = mlx_rs::fast::rope_dynamic(
@@ -717,18 +718,14 @@ impl MlxLlamaAttention {
             self.rope.traditional,
             self.rope.base,
             self.rope.scale,
-            &offsets_arr,
+            offsets_arr,
             None::<&Array>,
         )?;
 
         // Single batched KV cache update for all B sequences.
         let (k_cached, v_cached) = batch_cache.update_and_view(&k, &v)?;
 
-        // Build left-padding mask if needed: [B, 1, 1, kv_len]
-        let kv_len = batch_cache.kv_len();
-        let mask = BatchMlxLayerKvCache::build_left_padding_mask(left_padding, kv_len, q.dtype())?;
-
-        // Single SDPA for all B sequences.
+        // Single SDPA for all B sequences (mask built once, shared across layers).
         let sdpa_mask = mask
             .as_ref()
             .map(mlx_rs::fast::ScaledDotProductAttentionMask::Array);
@@ -839,12 +836,17 @@ impl MlxLlamaDecoderLayer {
         hidden_states: &Array,
         batch_info: &MlxBatchInfo,
         batch_cache: &mut BatchMlxLayerKvCache,
-        left_padding: &[usize],
+        mask: &Option<Array>,
+        offsets_arr: &Array,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(hidden_states)?;
-        let attn_output =
-            self.self_attn
-                .forward_batch_decode(&normed, batch_info, batch_cache, left_padding)?;
+        let attn_output = self.self_attn.forward_batch_decode(
+            &normed,
+            batch_info,
+            batch_cache,
+            mask,
+            offsets_arr,
+        )?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
         let normed = self.post_attention_layernorm.forward(&hidden_states)?;
@@ -1110,12 +1112,26 @@ impl super::MlxModel for MlxLlamaForCausalLM {
     ) -> mlx_rs::error::Result<Array> {
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
+        // Hoist rope offsets: create once, reuse across all layers.
+        let n = batch_info.num_reqs as i32;
+        let offsets_arr = Array::from_iter(batch_info.rope_offsets.iter().copied(), &[n]);
+
+        // Hoist mask: compute expected post-update kv_len and build once.
+        // Decode appends 1 token, so post-update kv_len = current + 1.
+        let kv_len = layer_caches[0].kv_len() + 1;
+        let mask = BatchMlxLayerKvCache::build_left_padding_mask(
+            &left_padding[0],
+            kv_len,
+            hidden_states.dtype(),
+        )?;
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             hidden_states = layer.forward_batch_decode(
                 &hidden_states,
                 batch_info,
                 &mut layer_caches[layer_idx],
-                &left_padding[layer_idx],
+                &mask,
+                &offsets_arr,
             )?;
         }
 

@@ -263,8 +263,10 @@ impl BatchMlxLayerKvCache {
 
     /// Build a left-padding attention mask: `[B, 1, 1, kv_len]`.
     ///
-    /// Positions in the left-padding region get -inf (f32::NEG_INFINITY)
-    /// so SDPA doesn't attend to the zero-padded slots.
+    /// Uses lazy MLX ops (arange + broadcast comparison) so the mask stays
+    /// in the GPU compute graph and can be fused with SDPA — no CPU
+    /// materialization. Matches mlx-lm's `create_causal_mask` approach.
+    ///
     /// If no request has any padding, returns `None`.
     pub fn build_left_padding_mask(
         left_padding: &[usize],
@@ -276,20 +278,23 @@ impl BatchMlxLayerKvCache {
             return Ok(None);
         }
 
-        let b = left_padding.len();
-        // Build [B * kv_len] flat mask, then reshape to [B, 1, 1, kv_len].
-        let mut mask_data = Vec::with_capacity(b * kv_len);
-        for &pad in left_padding {
-            for j in 0..kv_len {
-                if j < pad {
-                    mask_data.push(f32::NEG_INFINITY);
-                } else {
-                    mask_data.push(0.0f32);
-                }
-            }
-        }
-        let mask = Array::from_iter(mask_data, &[b as i32, 1, 1, kv_len as i32]);
-        // Cast to match model dtype (e.g. float16) so SDPA doesn't reject it.
+        let b = left_padding.len() as i32;
+        // [B] -> [B, 1, 1, 1]
+        let pad_arr = Array::from_iter(left_padding.iter().map(|&p| p as i32), &[b])
+            .reshape(&[b, 1, 1, 1])?;
+        // [kv_len] -> [1, 1, 1, kv_len]  (lazy)
+        let positions = Array::arange::<_, i32>(None, kv_len as i32, None)?.reshape(&[
+            1,
+            1,
+            1,
+            kv_len as i32,
+        ])?;
+        // broadcast compare: True where position >= left_padding (valid position)
+        let valid = pad_arr.le(&positions)?; // [B, 1, 1, kv_len]
+        // where valid -> 0.0, else -> -inf
+        let zero = Array::from_f32(0.0);
+        let neg_inf = Array::from_f32(f32::NEG_INFINITY);
+        let mask = mlx_rs::ops::r#where(&valid, &zero, &neg_inf)?;
         let mask = mask.as_dtype(dtype)?;
         Ok(Some(mask))
     }

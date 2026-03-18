@@ -284,12 +284,11 @@ impl MlxQuantizedLlamaMLP {
         }
     }
 
-    /// Forward pass: gate_proj(x) → SiLU → * up_proj(x) → down_proj
+    /// Forward pass: gate_proj(x) → SwiGLU(gate, up) → down_proj
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = nn::silu(&gate)?;
         let up = self.up_proj.forward(x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = super::llama::swiglu(&gate, &up)?;
         self.down_proj.forward(&hidden)
     }
 }

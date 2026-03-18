@@ -17,10 +17,27 @@ use mlx_rs::error::Exception;
 use mlx_rs::module::{Module, Param};
 use mlx_rs::nn;
 use mlx_rs::ops::indexing::TryIndexOp;
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
 
 use crate::cache::{MlxBatchInfo, MlxKvCache, MlxLayerKvCache};
 use vllm_model::weight::HfModelConfig;
+
+/// Compiled SwiGLU: `silu(gate) * up` in a single compiled function.
+///
+/// Matches mlx-lm's `@partial(mx.compile, shapeless=True) def swiglu`.
+/// Uses raw `sigmoid(gate) * gate * up` to avoid `nn::silu`'s own compile
+/// wrapper, which would add a second compile dispatch per call.
+pub fn swiglu(gate: &Array, up: &Array) -> Result<Array, Exception> {
+    let mut f = compile(
+        |(g, u): (&Array, &Array)| -> Result<Array, Exception> {
+            let sig = mlx_rs::ops::sigmoid(g)?;
+            sig.multiply(g)?.multiply(u)
+        },
+        true, // shapeless
+    );
+    f((gate, up))
+}
 
 // ---------------------------------------------------------------------------
 // LlamaConfig
@@ -246,12 +263,15 @@ impl MlxLlamaMLP {
         );
     }
 
-    /// Forward pass: gate_proj(x) → SiLU → * up_proj(x) → down_proj
+    /// Forward pass: gate_proj(x) → SwiGLU(gate, up) → down_proj
+    ///
+    /// Uses a single compiled swiglu (silu(gate) * up) matching mlx-lm's
+    /// `activations.py`, instead of separate compiled_silu + multiply which
+    /// doubles the compile dispatch overhead per layer.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = nn::silu(&gate)?;
         let up = self.up_proj.forward(x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = swiglu(&gate, &up)?;
         self.down_proj.forward(&hidden)
     }
 }

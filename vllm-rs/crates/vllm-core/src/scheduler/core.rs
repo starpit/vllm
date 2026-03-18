@@ -17,7 +17,7 @@ use std::hash::{Hash, Hasher};
 
 use tracing::warn;
 use vllm_common::{Request, RequestStatus};
-use vllm_config::{SchedulerConfig, SchedulerPolicy};
+use vllm_config::{SchedulerConfig, SchedulerPolicy, SpansConfig};
 
 use super::interface::{PauseState, SchedulerInterface};
 use super::output::{CachedRequestData, NewRequestData, SchedulerOutput};
@@ -144,6 +144,9 @@ pub struct SimpleBlockTracker {
 
     /// Request ID → ordered list of block hashes.
     req_to_hashes: HashMap<String, Vec<u64>>,
+
+    /// Spans (relocatable KV cache block) configuration.
+    spans_config: SpansConfig,
 }
 
 impl SimpleBlockTracker {
@@ -161,6 +164,7 @@ impl SimpleBlockTracker {
             block_hash_to_id: HashMap::new(),
             block_id_to_hash: HashMap::new(),
             req_to_hashes: HashMap::new(),
+            spans_config: SpansConfig::from_env(),
         }
     }
 
@@ -168,6 +172,19 @@ impl SimpleBlockTracker {
     pub fn with_caching(num_gpu_blocks: usize, block_size: usize) -> Self {
         let mut tracker = Self::new(num_gpu_blocks, block_size);
         tracker.enable_caching = true;
+        tracker
+    }
+
+    /// Create a new block tracker with a specific spans configuration.
+    #[cfg(test)]
+    pub fn with_spans_config(
+        num_gpu_blocks: usize,
+        block_size: usize,
+        spans_config: SpansConfig,
+    ) -> Self {
+        let mut tracker = Self::new(num_gpu_blocks, block_size);
+        tracker.enable_caching = true;
+        tracker.spans_config = spans_config;
         tracker
     }
 
@@ -179,11 +196,94 @@ impl SimpleBlockTracker {
         num_tokens.div_ceil(block_size)
     }
 
-    /// Hash a block-sized chunk of token IDs.
+    /// Sentinel hash representing "no parent" — used for the first block
+    /// in a sequence and for fan-in span blocks.
+    const NONE_HASH: u64 = 0;
+
+    /// Hash a block-sized chunk of token IDs (no parent chain).
     fn hash_block(tokens: &[u32]) -> u64 {
         let mut hasher = std::hash::DefaultHasher::new();
         tokens.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// Hash a block with parent-chain awareness for spans.
+    ///
+    /// - If spans are enabled and the block starts with `token_plus`, the
+    ///   parent hash is reset to `NONE_HASH` (fan-in: block is cacheable
+    ///   independently of preceding context).
+    /// - If spans are enabled and the block starts with `token_cross`, all
+    ///   tokens up to this block are folded into the hash (recompute if
+    ///   context differs).
+    /// - Otherwise, the parent hash is chained in.
+    fn hash_block_with_parent(
+        &self,
+        parent_hash: u64,
+        block_tokens: &[u32],
+        all_tokens_before_block: &[u32],
+    ) -> u64 {
+        let cfg = &self.spans_config;
+        let first_token = block_tokens.first().copied();
+
+        // Determine effective parent hash.
+        let effective_parent = if cfg.has_fan_in() && first_token == cfg.token_plus {
+            if cfg.debug {
+                tracing::debug!(
+                    "[SPANS] Fan-in: resetting parent hash for block starting with token {:?}",
+                    first_token
+                );
+            }
+            Self::NONE_HASH
+        } else {
+            parent_hash
+        };
+
+        let mut hasher = std::hash::DefaultHasher::new();
+        effective_parent.hash(&mut hasher);
+        block_tokens.hash(&mut hasher);
+
+        // Cross-context: fold all preceding tokens into the hash.
+        if cfg.has_cross() && first_token == cfg.token_cross {
+            if cfg.debug {
+                tracing::debug!(
+                    "[SPANS] Cross: including {} previous tokens in block hash",
+                    all_tokens_before_block.len()
+                );
+            }
+            all_tokens_before_block.hash(&mut hasher);
+        }
+
+        hasher.finish()
+    }
+
+    /// Compute block hashes for an entire token sequence, returning one hash
+    /// per full block. Handles span fan-in and cross-context semantics.
+    fn hash_all_blocks(&self, all_tokens: &[u32]) -> Vec<u64> {
+        let num_full_blocks = all_tokens.len() / self.block_size;
+        if !self.spans_config.enabled {
+            // Fast path: no span logic, hash each block independently.
+            let mut hashes = Vec::with_capacity(num_full_blocks);
+            for i in 0..num_full_blocks {
+                let start = i * self.block_size;
+                let end = start + self.block_size;
+                hashes.push(Self::hash_block(&all_tokens[start..end]));
+            }
+            return hashes;
+        }
+
+        // Span-aware path: chain parent hashes.
+        let mut hashes = Vec::with_capacity(num_full_blocks);
+        let mut parent_hash = Self::NONE_HASH;
+        for i in 0..num_full_blocks {
+            let start = i * self.block_size;
+            let end = start + self.block_size;
+            let block_tokens = &all_tokens[start..end];
+            let tokens_before = &all_tokens[..start];
+            let hash = self.hash_block_with_parent(parent_hash, block_tokens, tokens_before);
+            parent_hash = hash;
+            hashes.push(hash);
+        }
+        hashes
     }
 
     /// Try to allocate `count` fresh block IDs from the free queue.
@@ -261,19 +361,19 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             let num_cached_blocks = request.num_computed_tokens as usize / self.block_size;
             if num_cached_blocks > 0 {
                 let all_tokens = &request.all_token_ids;
+                let all_hashes = self.hash_all_blocks(all_tokens);
                 let mut cached_ids = Vec::new();
                 let mut hashes = Vec::new();
                 for i in 0..num_cached_blocks {
-                    let start = i * self.block_size;
-                    let end = start + self.block_size;
-                    if end <= all_tokens.len() {
-                        let hash = Self::hash_block(&all_tokens[start..end]);
+                    if i < all_hashes.len() {
+                        let hash = all_hashes[i];
                         if let Some(&bid) = self.block_hash_to_id.get(&hash) {
                             cached_ids.push(bid);
                             hashes.push(hash);
-                        } else {
+                        } else if !self.spans_config.has_fan_in() {
                             break;
                         }
+                        // With fan-in, continue scanning past gaps.
                     }
                 }
 
@@ -331,6 +431,13 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             );
         }
 
+        // Pre-compute block hashes before mutably borrowing allocations.
+        let all_hashes = if self.enable_caching {
+            Some(self.hash_all_blocks(&request.all_token_ids))
+        } else {
+            None
+        };
+
         let new_block_ids = self.allocate_fresh_blocks(additional)?;
 
         // Merge with existing allocation.
@@ -342,21 +449,17 @@ impl KVCacheManagerOps for SimpleBlockTracker {
         entry.1 = needed;
 
         // When caching is enabled, record block hashes for full blocks.
-        if self.enable_caching {
-            let all_tokens = &request.all_token_ids;
+        if let Some(all_hashes) = all_hashes {
             let all_block_ids = &entry.0[0];
             let mut hashes = self
                 .req_to_hashes
                 .remove(&request.request_id)
                 .unwrap_or_default();
 
-            // Hash all full blocks (prompt + decode) that we haven't hashed yet.
             let num_full_blocks = total_tokens / self.block_size;
             for i in hashes.len()..num_full_blocks {
-                let start = i * self.block_size;
-                let end = start + self.block_size;
-                if end <= all_tokens.len() && i < all_block_ids.len() {
-                    let hash = Self::hash_block(&all_tokens[start..end]);
+                if i < all_hashes.len() && i < all_block_ids.len() {
+                    let hash = all_hashes[i];
                     let bid = all_block_ids[i];
                     self.block_hash_to_id.insert(hash, bid);
                     self.block_id_to_hash.insert(bid, hash);
@@ -410,33 +513,60 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             return (0, vec![Vec::new()]);
         }
 
-        // Hash full-block-sized chunks of all tokens (prompt + decode) and
-        // look for cached matches. A block is a hit if the hash exists in
-        // the cache — it may be in the free queue (ref_cnt==0) or shared
-        // (ref_cnt>0), both are valid cache hits.
-        // Matches Python's `find_longest_cache_hit` which calls
-        // `block_pool.get_cached_block()` — returns block regardless of
-        // whether it's in the free queue.
         let all_tokens = &request.all_token_ids;
+        let hashes = self.hash_all_blocks(all_tokens);
+
+        if !self.spans_config.enabled {
+            // Original behavior: find longest contiguous prefix of cache hits.
+            let mut matched_block_ids = Vec::new();
+            let mut num_matched_tokens = 0u32;
+
+            for hash in &hashes {
+                if let Some(&block_id) = self.block_hash_to_id.get(hash) {
+                    matched_block_ids.push(block_id);
+                    num_matched_tokens += self.block_size as u32;
+                } else {
+                    break;
+                }
+            }
+
+            return (num_matched_tokens, vec![matched_block_ids]);
+        }
+
+        // Span-aware path: fan-in blocks can be cached independently, so we
+        // don't break on first miss. Instead, we track which blocks are hits
+        // vs. misses. num_computed_tokens is the count of tokens in cached
+        // blocks (they need not be contiguous).
+        //
+        // However, the scheduler uses num_computed_tokens to skip prefill
+        // tokens, so we can only report the longest *contiguous* prefix of
+        // hits from the start, plus any fan-in blocks that are hits.
+        //
+        // For now, report the longest contiguous prefix (conservative).
+        // Fan-in blocks after a gap still get their cached block_ids so they
+        // don't need fresh allocation, but the tokens are "recomputed".
+        // Track which blocks are cache hits vs misses.
         let mut matched_block_ids = Vec::new();
-        let mut num_matched_tokens = 0u32;
+        let mut is_hit = Vec::new();
 
-        let num_full_blocks = all_tokens.len() / self.block_size;
-        for i in 0..num_full_blocks {
-            let start = i * self.block_size;
-            let end = start + self.block_size;
-            let chunk = &all_tokens[start..end];
-            let hash = Self::hash_block(chunk);
-
-            if let Some(&block_id) = self.block_hash_to_id.get(&hash) {
+        for hash in &hashes {
+            if let Some(&block_id) = self.block_hash_to_id.get(hash) {
                 matched_block_ids.push(block_id);
-                num_matched_tokens += self.block_size as u32;
+                is_hit.push(true);
+            } else if self.spans_config.has_fan_in() {
+                // Continue scanning — fan-in blocks after this gap may hit.
+                matched_block_ids.push(usize::MAX); // placeholder
+                is_hit.push(false);
             } else {
                 break;
             }
         }
 
-        (num_matched_tokens, vec![matched_block_ids])
+        // Count the longest contiguous prefix of cache hits.
+        let contiguous_hits = is_hit.iter().take_while(|&&hit| hit).count();
+        let contiguous_tokens = (contiguous_hits * self.block_size) as u32;
+
+        (contiguous_tokens, vec![matched_block_ids])
     }
 
     fn new_step_starts(&mut self) {
@@ -3228,5 +3358,142 @@ mod tests {
             !out3.num_scheduled_tokens.contains_key("r_new"),
             "r_new should still be waiting (r2 consumed all free blocks)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Span-aware hashing tests
+    // -----------------------------------------------------------------------
+
+    fn spans_config_plus_cross() -> SpansConfig {
+        SpansConfig {
+            enabled: true,
+            debug: false,
+            token_plus: Some(10),
+            token_cross: Some(31),
+            disable_reposition: false,
+        }
+    }
+
+    #[test]
+    fn test_span_hash_all_blocks_no_spans() {
+        // Without spans, hash_all_blocks should produce same hashes as hash_block.
+        let tracker = SimpleBlockTracker::new(16, 4);
+        let tokens: Vec<u32> = (0..12).collect(); // 3 full blocks of size 4
+        let hashes = tracker.hash_all_blocks(&tokens);
+        assert_eq!(hashes.len(), 3);
+        assert_eq!(hashes[0], SimpleBlockTracker::hash_block(&tokens[0..4]));
+        assert_eq!(hashes[1], SimpleBlockTracker::hash_block(&tokens[4..8]));
+        assert_eq!(hashes[2], SimpleBlockTracker::hash_block(&tokens[8..12]));
+    }
+
+    #[test]
+    fn test_span_fan_in_resets_parent_hash() {
+        let cfg = spans_config_plus_cross();
+        let tracker = SimpleBlockTracker::with_spans_config(16, 4, cfg);
+
+        // Block starting with token_plus (10) should hash independently.
+        // Two different prefixes followed by the same fan-in block should
+        // produce the same hash for that block.
+        let seq_a: Vec<u32> = vec![0, 1, 2, 3, 10, 100, 101, 102];
+        let seq_b: Vec<u32> = vec![9, 8, 7, 6, 10, 100, 101, 102];
+
+        let hashes_a = tracker.hash_all_blocks(&seq_a);
+        let hashes_b = tracker.hash_all_blocks(&seq_b);
+
+        // First blocks differ (different tokens).
+        assert_ne!(hashes_a[0], hashes_b[0]);
+        // Second blocks (fan-in) should be identical — same content, parent reset.
+        assert_eq!(hashes_a[1], hashes_b[1]);
+    }
+
+    #[test]
+    fn test_span_cross_includes_context() {
+        let cfg = spans_config_plus_cross();
+        let tracker = SimpleBlockTracker::with_spans_config(16, 4, cfg);
+
+        // Block starting with token_cross (31) should differ when preceded
+        // by different tokens.
+        let seq_a: Vec<u32> = vec![0, 1, 2, 3, 31, 100, 101, 102];
+        let seq_b: Vec<u32> = vec![9, 8, 7, 6, 31, 100, 101, 102];
+
+        let hashes_a = tracker.hash_all_blocks(&seq_a);
+        let hashes_b = tracker.hash_all_blocks(&seq_b);
+
+        // First blocks differ.
+        assert_ne!(hashes_a[0], hashes_b[0]);
+        // Second blocks (cross) should differ because preceding tokens differ.
+        assert_ne!(hashes_a[1], hashes_b[1]);
+    }
+
+    #[test]
+    fn test_span_fan_in_cache_reuse() {
+        // Simulate: preload doc_a, then query [doc_a, doc_b, query].
+        // doc_a's block should be a cache hit for the second request.
+        let cfg = spans_config_plus_cross();
+        let mut tracker = SimpleBlockTracker::with_spans_config(64, 4, cfg);
+
+        let doc_a: Vec<u32> = vec![10, 100, 101, 102]; // fan-in block
+        let doc_b: Vec<u32> = vec![10, 200, 201, 202]; // fan-in block
+        let query: Vec<u32> = vec![31, 300, 301, 302]; // cross block
+
+        // Request 1: [doc_a, query]
+        let mut seq1 = Vec::new();
+        seq1.extend_from_slice(&doc_a);
+        seq1.extend_from_slice(&query);
+        let req1 = Request::new(
+            "r1".into(),
+            seq1,
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+        let blocks = tracker.allocate_slots(&req1, req1.all_token_ids.len(), 0);
+        assert!(blocks.is_some());
+
+        // Free request 1 — blocks stay in cache.
+        tracker.free("r1");
+
+        // Request 2: [doc_a, doc_b, query]
+        let mut seq2 = Vec::new();
+        seq2.extend_from_slice(&doc_a);
+        seq2.extend_from_slice(&doc_b);
+        seq2.extend_from_slice(&query);
+        let req2 = Request::new(
+            "r2".into(),
+            seq2,
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+
+        // doc_a's block should be a cache hit (fan-in, same content).
+        let (num_computed, cached_ids) = tracker.get_computed_blocks(&req2);
+        assert_eq!(num_computed, 4); // one full block of size 4
+        assert!(!cached_ids[0].is_empty());
+    }
+
+    #[test]
+    fn test_span_disabled_uses_original_hashing() {
+        // When spans are disabled, hash_all_blocks should match hash_block
+        // (no parent chaining).
+        let tracker = SimpleBlockTracker::with_spans_config(
+            16,
+            4,
+            SpansConfig::default(), // disabled
+        );
+        let tokens: Vec<u32> = (0..8).collect();
+        let hashes = tracker.hash_all_blocks(&tokens);
+        assert_eq!(hashes[0], SimpleBlockTracker::hash_block(&tokens[0..4]));
+        assert_eq!(hashes[1], SimpleBlockTracker::hash_block(&tokens[4..8]));
     }
 }

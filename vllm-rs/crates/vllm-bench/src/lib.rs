@@ -10,13 +10,15 @@ mod args;
 pub(crate) mod datasets;
 mod latency;
 mod serve;
+mod spans;
 mod startup;
 mod sweep;
 mod throughput;
 
 pub use args::{
-    BenchCommand, BenchCommands, BenchLatencyArgs, BenchServeArgs, BenchStartupArgs,
-    BenchThroughputArgs, SweepCommand, SweepCommands, SweepServeArgs, SweepStartupArgs,
+    BenchCommand, BenchCommands, BenchLatencyArgs, BenchServeArgs, BenchSpansArgs,
+    BenchStartupArgs, BenchThroughputArgs, SweepCommand, SweepCommands, SweepServeArgs,
+    SweepStartupArgs,
 };
 
 /// Format a rate as `it/s` (fast) or `s/it` (slow), matching Python tqdm style.
@@ -51,6 +53,10 @@ pub async fn run_bench(cmd: BenchCommand) -> anyhow::Result<()> {
         }
         BenchCommands::Throughput(args) => {
             tokio::task::spawn_blocking(move || throughput::run_bench_throughput(args)).await??;
+            Ok(())
+        }
+        BenchCommands::Spans(args) => {
+            tokio::task::spawn_blocking(move || spans::run_bench_spans(args)).await??;
             Ok(())
         }
     }

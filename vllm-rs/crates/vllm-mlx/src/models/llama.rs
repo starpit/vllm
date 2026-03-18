@@ -276,6 +276,10 @@ pub struct MlxLlamaAttention {
     head_dim: usize,
     scale: f32,
     sliding_window: Option<usize>,
+    /// When true, keys are stored unrotated in the KV cache and RoPE is
+    /// applied to the full cached keys during attention. This enables
+    /// relocatable (span) blocks.
+    fuse_rope: bool,
 }
 
 impl MlxLlamaAttention {
@@ -306,6 +310,7 @@ impl MlxLlamaAttention {
             head_dim: config.head_dim,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
             sliding_window: config.sliding_window,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
         })
     }
 
@@ -404,12 +409,21 @@ impl MlxLlamaAttention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        // RoPE: offset passed from caller (avoids .item() sync in MLX).
+        // RoPE: always rotate Q. Rotate K only when not fusing RoPE into attention.
         let q = self.rope.forward((&q, rope_offset))?;
-        k = self.rope.forward((&k, rope_offset))?;
+        if !self.fuse_rope {
+            k = self.rope.forward((&k, rope_offset))?;
+        }
 
         // KV cache update — pre-allocated buffer with O(1) slice_update.
+        // When fuse_rope is true, K is stored unrotated.
         let (mut k, mut v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+
+        // When fuse_rope is true, apply RoPE to all cached keys now.
+        // Position 0..kv_len: each key gets rotated by its actual sequence position.
+        if self.fuse_rope {
+            k = self.rope.forward((&k, 0i32))?;
+        }
 
         // Sliding window: trim K/V to only the last `w` positions.
         // The stored cache remains full (future tokens may still be in window),
@@ -503,9 +517,16 @@ impl MlxLlamaAttention {
                 .expand_dims(0)?;
 
             let q = self.rope.forward((&q, offset))?;
-            k = self.rope.forward((&k, offset))?;
+            if !self.fuse_rope {
+                k = self.rope.forward((&k, offset))?;
+            }
 
-            let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+            let (mut k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+
+            // When fuse_rope, apply RoPE to all cached keys at their actual positions.
+            if self.fuse_rope {
+                k = self.rope.forward((&k, 0i32))?;
+            }
 
             kv_lens.push(k.dim(2) as usize);
             per_req_q.push(q);

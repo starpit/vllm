@@ -16,6 +16,7 @@ pub mod compilation;
 pub mod model;
 pub mod parallel;
 pub mod scheduler;
+pub mod spans;
 
 // Re-export top-level types for convenience.
 pub use cache::{
@@ -26,3 +27,4 @@ pub use compilation::CudaGraphConfig;
 pub use model::{AttnType, ModelConfig, ModelDType};
 pub use parallel::ParallelConfig;
 pub use scheduler::{RunnerType, SchedulerConfig, SchedulerPolicy};
+pub use spans::SpansConfig;

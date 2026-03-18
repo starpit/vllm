@@ -24,6 +24,8 @@ pub enum BenchCommands {
     Sweep(SweepCommand),
     /// Benchmark offline throughput (batch generation).
     Throughput(BenchThroughputArgs),
+    /// Benchmark relocatable KV cache blocks (spans) for RAG workloads.
+    Spans(BenchSpansArgs),
 }
 
 /// Arguments for `vllm bench latency`.
@@ -630,4 +632,91 @@ pub struct SweepStartupArgs {
     /// Show stdout from sub-processes.
     #[arg(long)]
     pub show_stdout: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Spans benchmark args
+// ---------------------------------------------------------------------------
+
+/// Arguments for `vllm bench spans`.
+#[derive(Parser, Debug)]
+#[command(override_usage = "vllm bench spans [MODEL] [OPTIONS]")]
+pub struct BenchSpansArgs {
+    /// Model: local path or HuggingFace model ID.
+    pub model_tag: Option<String>,
+
+    /// Model (--model flag or VLLM_MODEL env).
+    #[arg(short = 'm', long = "model", env = "VLLM_MODEL")]
+    pub model: Option<String>,
+
+    /// Device: "cpu", "cuda:N", "metal", or "auto".
+    #[arg(long, default_value = "auto")]
+    pub device: String,
+
+    /// Weight dtype: "auto", "float16", "bfloat16", "float32".
+    #[arg(long, default_value = "auto")]
+    pub dtype: String,
+
+    /// Number of document blocks to preload.
+    #[arg(long, default_value_t = 4)]
+    pub num_docs: usize,
+
+    /// KV cache block size in tokens (each document = 1 block).
+    #[arg(long, default_value_t = 16)]
+    pub block_size: usize,
+
+    /// Number of query tokens appended after documents.
+    #[arg(long, default_value_t = 16)]
+    pub query_len: usize,
+
+    /// Number of iterations (forward + reversed) to run.
+    #[arg(long, default_value_t = 5)]
+    pub num_iters: usize,
+
+    /// Token ID used as the span marker (first token of each document block).
+    #[arg(long, default_value_t = 10)]
+    pub span_token: u32,
+
+    /// Token ID used for padding blocks to block_size boundaries.
+    #[arg(long, default_value_t = 0)]
+    pub pad_token: u32,
+
+    /// HuggingFace token for gated models.
+    #[arg(long, env = "HF_TOKEN")]
+    pub hf_token: Option<String>,
+
+    /// Fraction of GPU memory to use for KV cache.
+    #[arg(long, default_value_t = 0.9)]
+    pub gpu_memory_utilization: f64,
+
+    /// Maximum number of concurrent sequences.
+    #[arg(long, default_value_t = 256)]
+    pub max_num_seqs: usize,
+
+    /// Maximum model context length override.
+    #[arg(long)]
+    pub max_model_len: Option<usize>,
+
+    /// GGUF filename for quantized models.
+    #[arg(long)]
+    pub gguf_file: Option<String>,
+
+    /// Disable CUDA graphs (use eager mode).
+    #[arg(long)]
+    pub enforce_eager: bool,
+
+    /// Log level.
+    #[arg(long, default_value = "warn")]
+    pub log_level: String,
+}
+
+impl BenchSpansArgs {
+    /// Resolve the model path from positional or --model args.
+    pub fn resolved_model(&self) -> Result<String, String> {
+        match (&self.model_tag, &self.model) {
+            (Some(tag), _) => Ok(tag.clone()),
+            (None, Some(m)) => Ok(m.clone()),
+            (None, None) => Err("No model specified. Use positional arg or --model.".into()),
+        }
+    }
 }

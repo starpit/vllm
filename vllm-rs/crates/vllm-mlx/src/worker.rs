@@ -82,16 +82,94 @@ impl MlxWorkerConfig {
 /// Maximum number of KV caches retained in the prefix cache pool.
 const PREFIX_CACHE_POOL_MAX: usize = 32;
 
-/// Hash the block-aligned prefix of a prompt (same logic as `SimpleBlockTracker::hash_block`).
+/// Hash the block-aligned prefix of a prompt.
 ///
 /// Only full blocks are hashed — trailing partial blocks are ignored so that
 /// the hash matches the scheduler's prefix lookup.
-fn hash_prefix(prompt: &[u32], block_size: usize) -> u64 {
+///
+/// When `spans_config` is enabled, hashing uses parent-chain semantics:
+/// - Blocks starting with `token_plus` reset the parent hash (fan-in).
+/// - Blocks starting with `token_cross` fold all prior tokens into the hash.
+fn hash_prefix(prompt: &[u32], block_size: usize, spans: &vllm_config::SpansConfig) -> u64 {
     let num_full_blocks = prompt.len() / block_size;
-    let prefix_len = num_full_blocks * block_size;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    prompt[..prefix_len].hash(&mut hasher);
-    hasher.finish()
+    if num_full_blocks == 0 {
+        return 0;
+    }
+
+    if !spans.enabled {
+        // Original fast path: single hash over the entire block-aligned prefix.
+        let prefix_len = num_full_blocks * block_size;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        prompt[..prefix_len].hash(&mut hasher);
+        return hasher.finish();
+    }
+
+    // Span-aware: chain block hashes with fan-in / cross-context logic.
+    // The final hash of the last full block represents the entire prefix.
+    const NONE_HASH: u64 = 0;
+    let mut parent_hash = NONE_HASH;
+
+    for i in 0..num_full_blocks {
+        let start = i * block_size;
+        let end = start + block_size;
+        let block = &prompt[start..end];
+        let first_token = block[0];
+
+        // Fan-in: reset parent if block starts with token_plus.
+        let effective_parent = if spans.has_fan_in() && Some(first_token) == spans.token_plus {
+            NONE_HASH
+        } else {
+            parent_hash
+        };
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        effective_parent.hash(&mut hasher);
+        block.hash(&mut hasher);
+
+        // Cross-context: fold all preceding tokens into the hash.
+        if spans.has_cross() && Some(first_token) == spans.token_cross {
+            prompt[..start].hash(&mut hasher);
+        }
+
+        parent_hash = hasher.finish();
+    }
+
+    parent_hash
+}
+
+/// Compute per-block hashes for a token sequence.
+/// Returns one hash per full block, using span-aware parent chaining.
+fn hash_blocks(tokens: &[u32], block_size: usize, spans: &vllm_config::SpansConfig) -> Vec<u64> {
+    let num_full_blocks = tokens.len() / block_size;
+    let mut hashes = Vec::with_capacity(num_full_blocks);
+    const NONE_HASH: u64 = 0;
+    let mut parent_hash = NONE_HASH;
+
+    for i in 0..num_full_blocks {
+        let start = i * block_size;
+        let end = start + block_size;
+        let block = &tokens[start..end];
+        let first_token = block[0];
+
+        let effective_parent =
+            if spans.enabled && spans.has_fan_in() && Some(first_token) == spans.token_plus {
+                NONE_HASH
+            } else {
+                parent_hash
+            };
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        effective_parent.hash(&mut hasher);
+        block.hash(&mut hasher);
+
+        if spans.has_cross() && Some(first_token) == spans.token_cross {
+            tokens[..start].hash(&mut hasher);
+        }
+
+        parent_hash = hasher.finish();
+        hashes.push(parent_hash);
+    }
+    hashes
 }
 
 /// A worker backed by MLX for Apple Silicon GPU inference.
@@ -147,6 +225,13 @@ pub struct MlxWorker {
     enable_prefix_caching: bool,
     /// Block size for prefix hashing (must match scheduler block size).
     prefix_block_size: usize,
+    /// Spans (relocatable KV cache blocks) configuration.
+    spans_config: vllm_config::SpansConfig,
+
+    /// Per-block KV cache pool for span-aware prefix caching.
+    /// Maps per-block hash → per-layer `(K_block, V_block)` arrays.
+    /// K/V shape: `[1, heads, block_size, head_dim]`.
+    block_kv_pool: HashMap<u64, Vec<(mlx_rs::Array, mlx_rs::Array)>>,
 
     // Timing instrumentation.
     step_count: usize,
@@ -186,6 +271,8 @@ impl MlxWorker {
             kv_cache_pool: HashMap::new(),
             enable_prefix_caching,
             prefix_block_size,
+            spans_config: vllm_config::SpansConfig::from_env(),
+            block_kv_pool: HashMap::new(),
             step_count: 0,
             prefill_count: 0,
             decode_count: 0,
@@ -685,15 +772,39 @@ impl Worker for MlxWorker {
                     self.kv_caches.remove(req_id),
                 ) {
                     if prompt.len() >= self.prefix_block_size {
-                        let h = hash_prefix(prompt, self.prefix_block_size);
+                        let h = hash_prefix(prompt, self.prefix_block_size, &self.spans_config);
                         if !self.kv_cache_pool.contains_key(&h) {
-                            // FIFO eviction when pool is full.
                             if self.kv_cache_pool.len() >= PREFIX_CACHE_POOL_MAX
                                 && let Some(&oldest) = self.kv_cache_pool.keys().next()
                             {
                                 self.kv_cache_pool.remove(&oldest);
                             }
-                            self.kv_cache_pool.insert(h, kv_cache);
+                            self.kv_cache_pool.insert(h, kv_cache.clone());
+                        }
+
+                        // Spans: also store per-block KV chunks for block-level reuse.
+                        if self.spans_config.has_fan_in() {
+                            let block_hashes =
+                                hash_blocks(prompt, self.prefix_block_size, &self.spans_config);
+                            for (bi, bh) in block_hashes.iter().enumerate() {
+                                if self.block_kv_pool.contains_key(bh) {
+                                    continue;
+                                }
+                                let start = (bi * self.prefix_block_size) as i32;
+                                let end = start + self.prefix_block_size as i32;
+                                // Extract per-layer KV slices for this block.
+                                let mut block_layers = Vec::with_capacity(kv_cache.len());
+                                for layer in kv_cache.iter().flatten() {
+                                    let k_block = layer.k_slice(start, end);
+                                    let v_block = layer.v_slice(start, end);
+                                    if let (Ok(kb), Ok(vb)) = (k_block, v_block) {
+                                        block_layers.push((kb, vb));
+                                    }
+                                }
+                                if !block_layers.is_empty() {
+                                    self.block_kv_pool.insert(*bh, block_layers);
+                                }
+                            }
                         }
                     }
                 } else {
@@ -776,9 +887,9 @@ impl Worker for MlxWorker {
             // Try to reuse a cached KV from the prefix pool.
             let kv_cache = if num_computed > 0 && self.enable_prefix_caching {
                 let prefix = &prompt_ids[..num_computed];
-                let h = hash_prefix(prefix, self.prefix_block_size);
+                let h = hash_prefix(prefix, self.prefix_block_size, &self.spans_config);
                 if let Some(cached) = self.kv_cache_pool.get(&h) {
-                    // Clone (MLX copy-on-write) and truncate to the matched prefix length.
+                    // Whole-prefix hit: clone (MLX copy-on-write) and truncate.
                     let mut kv = cached.clone();
                     for layer in kv.iter_mut().flatten() {
                         if layer.seq_len() > num_computed {
@@ -790,6 +901,92 @@ impl Worker for MlxWorker {
                         new_req.req_id, num_computed
                     );
                     kv
+                } else if self.spans_config.has_fan_in() && !self.block_kv_pool.is_empty() {
+                    // Spans: try per-block matching. Check each block independently.
+                    let block_hashes =
+                        hash_blocks(prompt_ids, self.prefix_block_size, &self.spans_config);
+                    let num_full_blocks = prompt_ids.len() / self.prefix_block_size;
+
+                    // Count how many contiguous blocks from the start we can match.
+                    // We need contiguous because the scheduler expects a contiguous
+                    // num_computed_tokens prefix.
+                    let mut matched_blocks = 0usize;
+                    for bh in &block_hashes[..num_full_blocks] {
+                        if self.block_kv_pool.contains_key(bh) {
+                            matched_blocks += 1;
+                        } else {
+                            break; // For now, require contiguous match from start.
+                            // With spans, all doc blocks should match even if
+                            // the last block (query) doesn't.
+                        }
+                    }
+
+                    if matched_blocks > 0 {
+                        // Reassemble KV cache from per-block cached chunks.
+                        let matched_tokens = matched_blocks * self.prefix_block_size;
+                        let first_block_kv = self.block_kv_pool.get(&block_hashes[0]).unwrap();
+                        let num_kv_layers = first_block_kv.len();
+
+                        // Concatenate per-block K/V along the sequence dimension.
+                        let mut assembled_kv: MlxKvCache = Vec::with_capacity(num_kv_layers);
+                        for layer_idx in 0..num_kv_layers {
+                            let mut k_parts = Vec::with_capacity(matched_blocks);
+                            let mut v_parts = Vec::with_capacity(matched_blocks);
+                            for bh in &block_hashes[..matched_blocks] {
+                                if let Some(block_kv) = self.block_kv_pool.get(bh) {
+                                    let (ref kb, ref vb) = block_kv[layer_idx];
+                                    k_parts.push(kb.clone());
+                                    v_parts.push(vb.clone());
+                                }
+                            }
+                            if k_parts.len() == matched_blocks {
+                                let k_cat = mlx_rs::ops::concatenate_axis(&k_parts, 2);
+                                let v_cat = mlx_rs::ops::concatenate_axis(&v_parts, 2);
+                                if let (Ok(k), Ok(v)) = (k_cat, v_cat) {
+                                    assembled_kv.push(Some(
+                                        cache::MlxLayerKvCache::from_kv(&k, &v)
+                                            .unwrap_or_else(|_| {
+                                                // Fallback: return None for this layer.
+                                                panic!("failed to create MlxLayerKvCache from block KVs")
+                                            }),
+                                    ));
+                                } else {
+                                    assembled_kv.push(None);
+                                }
+                            } else {
+                                assembled_kv.push(None);
+                            }
+                        }
+
+                        // Materialize the concatenated arrays to avoid
+                        // lazy-evaluation overhead during the forward pass.
+                        let mut eval_targets = Vec::new();
+                        for layer in assembled_kv.iter().flatten() {
+                            if let (Ok(k), Ok(v)) = (
+                                layer.k_slice(0, matched_tokens as i32),
+                                layer.v_slice(0, matched_tokens as i32),
+                            ) {
+                                eval_targets.push(k);
+                                eval_targets.push(v);
+                            }
+                        }
+                        if !eval_targets.is_empty() {
+                            let refs: Vec<&mlx_rs::Array> = eval_targets.iter().collect();
+                            let _ = mlx_rs::transforms::eval(refs);
+                        }
+
+                        debug!(
+                            "per-block cache hit for req {} ({} blocks = {} tokens matched)",
+                            new_req.req_id, matched_blocks, matched_tokens
+                        );
+                        assembled_kv
+                    } else {
+                        debug!(
+                            "prefix cache miss for req {} ({} computed tokens, forwarding all)",
+                            new_req.req_id, num_computed
+                        );
+                        cache::empty_kv_cache(num_layers)
+                    }
                 } else {
                     debug!(
                         "prefix cache miss for req {} ({} computed tokens, forwarding all)",

@@ -30,6 +30,13 @@ pub struct MlxLayerKvCache {
 }
 
 impl MlxLayerKvCache {
+    /// Create from pre-existing K/V arrays (e.g., assembled from per-block cache).
+    ///
+    /// Pre-allocates extra capacity beyond the initial sequence length.
+    pub fn from_kv(k: &Array, v: &Array) -> Result<Self, Exception> {
+        Self::new(k, v)
+    }
+
     /// Create from initial K/V arrays (typically from prefill).
     ///
     /// Pre-allocates extra capacity beyond the initial sequence length.
@@ -108,6 +115,16 @@ impl MlxLayerKvCache {
     /// View of the filled V portion: `[1, heads, seq_len, dim]`.
     fn v_view(&self) -> Result<Array, Exception> {
         self.v.try_index((.., .., ..self.seq_len as i32, ..))
+    }
+
+    /// Slice K for a range of positions: `[1, heads, end-start, dim]`.
+    pub fn k_slice(&self, start: i32, end: i32) -> Result<Array, Exception> {
+        self.k.try_index((.., .., start..end, ..))
+    }
+
+    /// Slice V for a range of positions: `[1, heads, end-start, dim]`.
+    pub fn v_slice(&self, start: i32, end: i32) -> Result<Array, Exception> {
+        self.v.try_index((.., .., start..end, ..))
     }
 }
 

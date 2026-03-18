@@ -129,6 +129,196 @@ fn pad_seq_dim(arr: &Array, capacity: usize) -> Result<Array, Exception> {
     mlx_rs::ops::concatenate_axis(&[arr.clone(), padding], 2)
 }
 
+// ---------------------------------------------------------------------------
+// BatchMlxLayerKvCache — persistent batched KV cache for decode
+// ---------------------------------------------------------------------------
+
+/// Batched per-layer KV cache for decode: `[B, heads, capacity, dim]`.
+///
+/// Built from N individual per-request caches by left-padding shorter sequences
+/// so all are right-aligned to the same `kv_len`. Persists across decode steps
+/// on the worker — only a single `update_and_view` (slice_update) per layer per step.
+///
+/// When a request leaves the batch, `extract_individual` extracts its cache
+/// back to an `MlxLayerKvCache`. There is no `write_back_layer` — that was the
+/// previous design's performance killer (copying ALL KV data every step).
+pub struct BatchMlxLayerKvCache {
+    k: Array,
+    v: Array,
+    /// Logical sequence length (all sequences padded to this length).
+    seq_len: usize,
+    /// Pre-allocated capacity along dim 2.
+    capacity: usize,
+    /// Number of sequences (batch dimension).
+    #[allow(dead_code)]
+    batch_size: usize,
+}
+
+impl BatchMlxLayerKvCache {
+    /// Build a batched cache from N individual per-request caches for one layer.
+    ///
+    /// Left-pads shorter caches with zeros so all sequences are right-aligned
+    /// to `max_seq_len`. Pre-allocates extra capacity for future decode steps.
+    pub fn from_individual(caches: &[&MlxLayerKvCache]) -> Result<Self, Exception> {
+        assert!(!caches.is_empty());
+        let max_seq = caches.iter().map(|c| c.seq_len).max().unwrap();
+        let capacity = max_seq + PREALLOC_HEADROOM;
+        let batch_size = caches.len();
+
+        // Get shape info from first cache.
+        let heads = caches[0].k.dim(1);
+        let dim = caches[0].k.dim(3);
+
+        // Build padded arrays for each request, then stack.
+        let mut k_parts = Vec::with_capacity(batch_size);
+        let mut v_parts = Vec::with_capacity(batch_size);
+
+        for cache in caches {
+            let seq = cache.seq_len;
+            let left_pad = max_seq - seq;
+
+            // Get the filled portion: [1, heads, seq, dim]
+            let kv = cache.k_view()?;
+            let vv = cache.v_view()?;
+
+            if left_pad > 0 {
+                // Left-pad with zeros: [1, heads, left_pad, dim]
+                let padding = Array::zeros::<f32>(&[1, heads, left_pad as i32, dim])?
+                    .as_dtype(kv.dtype())?;
+                let padded_k = mlx_rs::ops::concatenate_axis(&[padding.clone(), kv], 2)?;
+                let padded_v = mlx_rs::ops::concatenate_axis(&[padding, vv], 2)?;
+                k_parts.push(padded_k);
+                v_parts.push(padded_v);
+            } else {
+                k_parts.push(kv);
+                v_parts.push(vv);
+            }
+        }
+
+        // Stack along batch dim: [B, heads, max_seq, dim]
+        let k_stacked = mlx_rs::ops::concatenate_axis(&k_parts, 0)?;
+        let v_stacked = mlx_rs::ops::concatenate_axis(&v_parts, 0)?;
+
+        // Pad to capacity along seq dim: [B, heads, capacity, dim]
+        let k_padded = pad_seq_dim(&k_stacked, capacity)?;
+        let v_padded = pad_seq_dim(&v_stacked, capacity)?;
+
+        Ok(Self {
+            k: k_padded,
+            v: v_padded,
+            seq_len: max_seq,
+            capacity,
+            batch_size,
+        })
+    }
+
+    /// Write new K/V tokens for all B sequences in a single slice_update.
+    ///
+    /// `new_k` and `new_v` have shape `[B, heads, 1, dim]` (one token per sequence).
+    /// Returns `(k_view, v_view)` of shape `[B, heads, seq_len+1, dim]`.
+    pub fn update_and_view(
+        &mut self,
+        new_k: &Array,
+        new_v: &Array,
+    ) -> Result<(Array, Array), Exception> {
+        let new_len = new_k.dim(2) as usize;
+
+        if self.seq_len + new_len > self.capacity {
+            self.grow(self.seq_len + new_len)?;
+        }
+
+        let start = self.seq_len as i32;
+        let end = (self.seq_len + new_len) as i32;
+
+        // Single slice_update for all B sequences at once.
+        self.k.try_index_mut((.., .., start..end, ..), new_k)?;
+        self.v.try_index_mut((.., .., start..end, ..), new_v)?;
+
+        self.seq_len += new_len;
+
+        Ok((self.k_view()?, self.v_view()?))
+    }
+
+    /// Number of cached sequence positions (logical length, including left padding).
+    pub fn kv_len(&self) -> usize {
+        self.seq_len
+    }
+
+    /// Build a left-padding attention mask: `[B, 1, 1, kv_len]`.
+    ///
+    /// Positions in the left-padding region get -inf (f32::NEG_INFINITY)
+    /// so SDPA doesn't attend to the zero-padded slots.
+    /// If no request has any padding, returns `None`.
+    pub fn build_left_padding_mask(
+        left_padding: &[usize],
+        kv_len: usize,
+        dtype: mlx_rs::Dtype,
+    ) -> Result<Option<Array>, Exception> {
+        let has_padding = left_padding.iter().any(|&p| p > 0);
+        if !has_padding {
+            return Ok(None);
+        }
+
+        let b = left_padding.len();
+        // Build [B * kv_len] flat mask, then reshape to [B, 1, 1, kv_len].
+        let mut mask_data = Vec::with_capacity(b * kv_len);
+        for &pad in left_padding {
+            for j in 0..kv_len {
+                if j < pad {
+                    mask_data.push(f32::NEG_INFINITY);
+                } else {
+                    mask_data.push(0.0f32);
+                }
+            }
+        }
+        let mask = Array::from_iter(mask_data.into_iter(), &[b as i32, 1, 1, kv_len as i32]);
+        // Cast to match model dtype (e.g. float16) so SDPA doesn't reject it.
+        let mask = mask.as_dtype(dtype)?;
+        Ok(Some(mask))
+    }
+
+    /// Extract a single request's cache from the batched buffer.
+    ///
+    /// Used when a request leaves the batch (finishes or transitions to prefill).
+    /// Returns the un-padded `MlxLayerKvCache` for the request at index `i`.
+    pub fn extract_individual(
+        &self,
+        i: usize,
+        left_padding: usize,
+    ) -> Result<MlxLayerKvCache, Exception> {
+        let ii = i as i32;
+        let pad_i32 = left_padding as i32;
+        let seq_end = self.seq_len as i32;
+
+        // Extract [1, heads, actual_seq_len, dim] from the batched buffer.
+        let ki = self.k.try_index((ii..ii + 1, .., pad_i32..seq_end, ..))?;
+        let vi = self.v.try_index((ii..ii + 1, .., pad_i32..seq_end, ..))?;
+
+        MlxLayerKvCache::new(&ki, &vi)
+    }
+
+    /// View of the filled K portion: `[B, heads, seq_len, dim]`.
+    fn k_view(&self) -> Result<Array, Exception> {
+        self.k.try_index((.., .., ..self.seq_len as i32, ..))
+    }
+
+    /// View of the filled V portion: `[B, heads, seq_len, dim]`.
+    fn v_view(&self) -> Result<Array, Exception> {
+        self.v.try_index((.., .., ..self.seq_len as i32, ..))
+    }
+
+    /// Grow the buffer to at least `min_capacity`.
+    fn grow(&mut self, min_capacity: usize) -> Result<(), Exception> {
+        let new_capacity = min_capacity + PREALLOC_HEADROOM;
+        let new_k = pad_seq_dim(&self.k_view()?, new_capacity)?;
+        let new_v = pad_seq_dim(&self.v_view()?, new_capacity)?;
+        self.k = new_k;
+        self.v = new_v;
+        self.capacity = new_capacity;
+        Ok(())
+    }
+}
+
 /// Batch information for batched forward passes across multiple requests.
 ///
 /// Enables running a single `forward_batch` call over concatenated tokens from

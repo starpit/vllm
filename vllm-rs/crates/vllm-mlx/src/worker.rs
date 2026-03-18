@@ -23,7 +23,7 @@ use vllm_executor::error::{ExecutorError, ExecutorResult};
 use vllm_executor::worker::Worker;
 use vllm_model::weight::HfModelConfig;
 
-use crate::cache::{self, MlxKvCache};
+use crate::cache::{self, BatchMlxLayerKvCache, MlxKvCache};
 use crate::models::{MlxModel, MlxModelRegistry};
 
 /// State saved between execute_model calls for double-buffered async_eval.
@@ -101,6 +101,19 @@ impl MlxWorkerConfig {
 /// Maximum number of KV caches retained in the prefix cache pool.
 const PREFIX_CACHE_POOL_MAX: usize = 32;
 
+/// Persistent batched KV caches for decode.
+///
+/// Persists across steps when the batch composition is stable (same request IDs
+/// in the same order). Rebuilt when requests join or leave.
+struct BatchedDecodeCache {
+    /// Ordered request IDs in this batch.
+    req_ids: Vec<String>,
+    /// One batched KV cache per model layer.
+    layer_caches: Vec<BatchMlxLayerKvCache>,
+    /// Per layer, per request left-padding offset.
+    left_padding: Vec<Vec<usize>>,
+}
+
 /// Hash the block-aligned prefix of a prompt (same logic as `SimpleBlockTracker::hash_block`).
 ///
 /// Only full blocks are hashed — trailing partial blocks are ignored so that
@@ -167,6 +180,10 @@ pub struct MlxWorker {
     /// Block size for prefix hashing (must match scheduler block size).
     prefix_block_size: usize,
 
+    /// Persistent batched KV caches for decode. Persists across steps when
+    /// the batch composition is stable. Rebuilt when requests join/leave.
+    batched_decode_cache: Option<BatchedDecodeCache>,
+
     /// Double-buffer state: previous step's unread GPU sampling arrays and
     /// the pre-built ModelRunnerOutput.  On the next execute_model call, we
     /// read these arrays (instant — GPU already finished), update
@@ -211,6 +228,7 @@ impl MlxWorker {
             kv_cache_pool: HashMap::new(),
             enable_prefix_caching,
             prefix_block_size,
+            batched_decode_cache: None,
             pending_step: None,
             step_count: 0,
             prefill_count: 0,
@@ -742,6 +760,38 @@ impl Worker for MlxWorker {
         let num_layers = model.num_layers();
 
         // Clean up finished requests — stash KV caches for prefix reuse.
+        // If a finished request's cache lives in the persistent batched cache,
+        // extract it first, then invalidate the batched cache.
+        if !scheduler_output.finished_req_ids.is_empty() {
+            let any_finished_in_batch = self
+                .batched_decode_cache
+                .as_ref()
+                .is_some_and(|bdc| {
+                    scheduler_output
+                        .finished_req_ids
+                        .iter()
+                        .any(|rid| bdc.req_ids.contains(rid))
+                });
+
+            if any_finished_in_batch {
+                // Extract ALL individual caches from the batch.
+                // Finished ones will be cleaned up below; remaining ones
+                // are available for the next batch formation.
+                let bdc = self.batched_decode_cache.take().unwrap();
+                for (idx, rid) in bdc.req_ids.iter().enumerate() {
+                    let mut per_req_kv: MlxKvCache = Vec::with_capacity(num_layers);
+                    for layer_idx in 0..num_layers {
+                        let left_pad = bdc.left_padding[layer_idx][idx];
+                        let layer_cache = bdc.layer_caches[layer_idx]
+                            .extract_individual(idx, left_pad)
+                            .ok();
+                        per_req_kv.push(layer_cache);
+                    }
+                    self.kv_caches.insert(rid.clone(), per_req_kv);
+                }
+            }
+        }
+
         for req_id in &scheduler_output.finished_req_ids {
             if self.enable_prefix_caching {
                 if let (Some(prompt), Some(kv_cache)) = (
@@ -1236,39 +1286,199 @@ impl Worker for MlxWorker {
             let input_ids_arr = Array::from_iter(flat_token_ids, &[total]);
             let positions_arr = Array::from_iter(flat_positions, &[total]);
 
-            // Extract KV caches via mem::take (avoids HashMap remove+insert rehashing).
-            let mut batch_kv_caches: Vec<cache::MlxKvCache> = batch_indices
+            // Check if we can use the persistent batched decode cache.
+            let batch_req_ids: Vec<String> = batch_indices
                 .iter()
-                .map(|&idx| {
-                    let req_id = &req_inputs[idx].req_id;
-                    self.kv_caches
-                        .get_mut(req_id)
-                        .map(std::mem::take)
-                        .unwrap_or_else(|| cache::empty_kv_cache(num_layers))
-                })
+                .map(|&idx| req_inputs[idx].req_id.clone())
                 .collect();
+            let all_decode = batch_info.q_lens.iter().all(|&ql| ql == 1)
+                && batch_indices.len() > 1
+                && model.supports_batch_decode();
+            let cache_matches = self
+                .batched_decode_cache
+                .as_ref()
+                .is_some_and(|c| c.req_ids == batch_req_ids);
 
-            // Single batched forward call.
-            let all_logits = model
-                .forward_batch(
+            let all_logits = if all_decode && cache_matches {
+                // === Fast path: reuse persistent batched cache ===
+                // Only a single slice_update per layer (no from_individual, no write_back).
+                // Take the cache out to satisfy the borrow checker (model borrows self.model,
+                // bdc borrows self.batched_decode_cache — must not overlap through self).
+                let mut bdc = self.batched_decode_cache.take().unwrap();
+                let result = model.forward_batch_decode(
                     &input_ids_arr,
-                    &positions_arr,
                     &batch_info,
-                    &mut batch_kv_caches,
-                )
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
-                })?;
-
-            // Put KV caches back (direct assignment avoids HashMap rehashing for existing keys).
-            for &idx in &batch_indices {
-                let kv = batch_kv_caches.remove(0);
-                if let Some(slot) = self.kv_caches.get_mut(&req_inputs[idx].req_id) {
-                    *slot = kv;
-                } else {
-                    self.kv_caches.insert(req_inputs[idx].req_id.clone(), kv);
+                    &mut bdc.layer_caches,
+                    &bdc.left_padding,
+                );
+                // Put the cache back BEFORE propagating errors.
+                self.batched_decode_cache = Some(bdc);
+                result.map_err(|e| {
+                    ExecutorError::WorkerExecution(format!(
+                        "batched decode forward failed: {e}"
+                    ))
+                })?
+            } else if all_decode {
+                // === Build new persistent batched cache ===
+                // First, invalidate existing batched cache, writing back to per-request.
+                if let Some(old_bdc) = self.batched_decode_cache.take() {
+                    for (idx, rid) in old_bdc.req_ids.iter().enumerate() {
+                        let mut per_req_kv: MlxKvCache = Vec::with_capacity(num_layers);
+                        for layer_idx in 0..num_layers {
+                            let left_pad = old_bdc.left_padding[layer_idx][idx];
+                            let layer_cache = old_bdc.layer_caches[layer_idx]
+                                .extract_individual(idx, left_pad)
+                                .ok();
+                            per_req_kv.push(layer_cache);
+                        }
+                        self.kv_caches.insert(rid.clone(), per_req_kv);
+                    }
                 }
-            }
+
+                // Re-check after invalidation.
+                let all_have_caches = batch_req_ids.iter().all(|rid| {
+                    self.kv_caches
+                        .get(rid)
+                        .is_some_and(|kv| !kv.is_empty() && kv.iter().all(|c| c.is_some()))
+                });
+
+                if all_have_caches {
+                    // Build batched caches for ALL layers.
+                    let mut layer_caches: Vec<BatchMlxLayerKvCache> =
+                        Vec::with_capacity(num_layers);
+                    let mut left_paddings: Vec<Vec<usize>> = Vec::with_capacity(num_layers);
+
+                    for layer_idx in 0..num_layers {
+                        let cache_refs: Vec<&cache::MlxLayerKvCache> = batch_req_ids
+                            .iter()
+                            .map(|rid| {
+                                self.kv_caches.get(rid).unwrap()[layer_idx]
+                                    .as_ref()
+                                    .expect("decode requires cache")
+                            })
+                            .collect();
+                        let max_seq =
+                            cache_refs.iter().map(|c| c.seq_len()).max().unwrap_or(0);
+                        let left_pad: Vec<usize> =
+                            cache_refs.iter().map(|c| max_seq - c.seq_len()).collect();
+                        layer_caches.push(
+                            BatchMlxLayerKvCache::from_individual(&cache_refs).map_err(
+                                |e| {
+                                    ExecutorError::WorkerExecution(format!(
+                                        "batch cache build failed: {e}"
+                                    ))
+                                },
+                            )?,
+                        );
+                        left_paddings.push(left_pad);
+                    }
+
+                    let mut bdc = BatchedDecodeCache {
+                        req_ids: batch_req_ids.clone(),
+                        layer_caches,
+                        left_padding: left_paddings,
+                    };
+
+                    // Run model with the new batched cache.
+                    let logits = model
+                        .forward_batch_decode(
+                            &input_ids_arr,
+                            &batch_info,
+                            &mut bdc.layer_caches,
+                            &bdc.left_padding,
+                        )
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "batched decode forward failed: {e}"
+                            ))
+                        })?;
+
+                    // Store the persistent batched cache.
+                    self.batched_decode_cache = Some(bdc);
+
+                    // Remove per-request caches (they're now in the batch).
+                    for rid in &batch_req_ids {
+                        if let Some(slot) = self.kv_caches.get_mut(rid) {
+                            *slot = Vec::new();
+                        }
+                    }
+
+                    logits
+                } else {
+                    // Some per-request caches missing — fall back to per-request path.
+                    let mut batch_kv_caches: Vec<cache::MlxKvCache> = batch_indices
+                        .iter()
+                        .map(|&idx| {
+                            let req_id = &req_inputs[idx].req_id;
+                            self.kv_caches
+                                .get_mut(req_id)
+                                .map(std::mem::take)
+                                .unwrap_or_else(|| cache::empty_kv_cache(num_layers))
+                        })
+                        .collect();
+                    let logits = model
+                        .forward_batch(
+                            &input_ids_arr, &positions_arr, &batch_info,
+                            &mut batch_kv_caches,
+                        )
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
+                        })?;
+                    for &idx in &batch_indices {
+                        let kv = batch_kv_caches.remove(0);
+                        if let Some(slot) = self.kv_caches.get_mut(&req_inputs[idx].req_id) {
+                            *slot = kv;
+                        } else {
+                            self.kv_caches.insert(req_inputs[idx].req_id.clone(), kv);
+                        }
+                    }
+                    logits
+                }
+            } else {
+                // === Per-request path (prefill, mixed, or single request) ===
+                // Invalidate persistent batched cache if it exists.
+                if let Some(old_bdc) = self.batched_decode_cache.take() {
+                    for (idx, rid) in old_bdc.req_ids.iter().enumerate() {
+                        let mut per_req_kv: MlxKvCache = Vec::with_capacity(num_layers);
+                        for layer_idx in 0..num_layers {
+                            let left_pad = old_bdc.left_padding[layer_idx][idx];
+                            let layer_cache = old_bdc.layer_caches[layer_idx]
+                                .extract_individual(idx, left_pad)
+                                .ok();
+                            per_req_kv.push(layer_cache);
+                        }
+                        self.kv_caches.insert(rid.clone(), per_req_kv);
+                    }
+                }
+
+                let mut batch_kv_caches: Vec<cache::MlxKvCache> = batch_indices
+                    .iter()
+                    .map(|&idx| {
+                        let req_id = &req_inputs[idx].req_id;
+                        self.kv_caches
+                            .get_mut(req_id)
+                            .map(std::mem::take)
+                            .unwrap_or_else(|| cache::empty_kv_cache(num_layers))
+                    })
+                    .collect();
+                let logits = model
+                    .forward_batch(
+                        &input_ids_arr, &positions_arr, &batch_info,
+                        &mut batch_kv_caches,
+                    )
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("batched forward failed: {e}"))
+                    })?;
+                for &idx in &batch_indices {
+                    let kv = batch_kv_caches.remove(0);
+                    if let Some(slot) = self.kv_caches.get_mut(&req_inputs[idx].req_id) {
+                        *slot = kv;
+                    } else {
+                        self.kv_caches.insert(req_inputs[idx].req_id.clone(), kv);
+                    }
+                }
+                logits
+            };
 
             // Split output logits per-request.
             for (i, &idx) in batch_indices.iter().enumerate() {

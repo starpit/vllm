@@ -15,9 +15,92 @@ pub use client::Client;
 pub use server::TestServer;
 
 /// Test models by architecture (smallest available for CI).
+///
+/// # Backend-portable constants
+///
+/// Constants like `SMOLLM` resolve to the right model for the active backend:
+/// MLX 4-bit on `metal`, safetensors BF16 on `cuda`. Use these in tests that
+/// should run on **both** backends.
+///
+/// Backend-specific constants (`*_4BIT`, `*_CUDA`, etc.) are still available
+/// for tests that target a single backend.
 pub struct TestModels;
 
 impl TestModels {
+    // -----------------------------------------------------------------------
+    // Backend-portable models — use these in cross-platform tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "metal")]
+    pub const SMOLLM: &str = "mlx-community/SmolLM-135M-Instruct-4bit";
+    #[cfg(feature = "cuda")]
+    pub const SMOLLM: &str = "HuggingFaceTB/SmolLM2-135M-Instruct";
+
+    #[cfg(feature = "metal")]
+    pub const QWEN2: &str = "mlx-community/Qwen2.5-0.5B-Instruct-4bit";
+    #[cfg(feature = "cuda")]
+    pub const QWEN2: &str = "Qwen/Qwen2.5-0.5B";
+
+    #[cfg(feature = "metal")]
+    pub const QWEN3: &str = "mlx-community/Qwen3-0.6B-4bit";
+    #[cfg(feature = "cuda")]
+    pub const QWEN3: &str = "Qwen/Qwen3-0.6B";
+
+    #[cfg(feature = "metal")]
+    pub const GEMMA2: &str = "mlx-community/gemma-2-2b-it-4bit";
+    #[cfg(feature = "cuda")]
+    pub const GEMMA2: &str = "unsloth/gemma-2-2b-it";
+
+    #[cfg(feature = "metal")]
+    pub const DEEPSEEK_V2_LITE: &str = "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx";
+    #[cfg(feature = "cuda")]
+    pub const DEEPSEEK_V2_LITE: &str = "deepseek-ai/DeepSeek-V2-Lite";
+
+    #[cfg(feature = "metal")]
+    pub const GRANITE: &str = "mlx-community/granite-3.3-2b-instruct-4bit";
+    #[cfg(feature = "cuda")]
+    pub const GRANITE: &str = "ibm-granite/granite-3.3-2b-instruct";
+
+    #[cfg(feature = "metal")]
+    pub const LLAMA_3_2: &str = "mlx-community/Llama-3.2-1B-Instruct-4bit";
+    #[cfg(feature = "cuda")]
+    pub const LLAMA_3_2: &str = "unsloth/Llama-3.2-1B-Instruct";
+
+    #[cfg(feature = "metal")]
+    pub const GEMMA3: &str = "mlx-community/gemma-3-270m-it-qat-4bit";
+    #[cfg(feature = "cuda")]
+    pub const GEMMA3: &str = "unsloth/gemma-3-270m-it";
+
+    #[cfg(feature = "metal")]
+    pub const PHI3_5: &str = "mlx-community/Phi-3.5-mini-instruct-4bit";
+    #[cfg(feature = "cuda")]
+    pub const PHI3_5: &str = "unsloth/Phi-3.5-mini-instruct";
+
+    #[cfg(feature = "metal")]
+    pub const PHI4: &str = "mlx-community/Unsloth-Phi-4-mini-instruct-4bit";
+    #[cfg(feature = "cuda")]
+    pub const PHI4: &str = "unsloth/Phi-4-mini-instruct";
+
+    #[cfg(feature = "metal")]
+    pub const MISTRAL: &str = "mlx-community/Mistral-7B-Instruct-v0.3-4bit";
+    #[cfg(feature = "cuda")]
+    pub const MISTRAL: &str = "unsloth/mistral-7b-instruct-v0.3";
+
+    #[cfg(feature = "metal")]
+    pub const GEMMA3_VLM: &str = "mlx-community/gemma-3-4b-it-qat-3bit";
+    #[cfg(feature = "cuda")]
+    pub const GEMMA3_VLM: &str = "unsloth/gemma-3-4b-it";
+
+    #[cfg(feature = "metal")]
+    pub const QWEN3_MOE: &str =
+        "justneedsomeavailableusername/Qwen3-MOE-4x0.6B-2.4B-Writing-Thunder-V1.2-mlx-4Bit";
+    #[cfg(feature = "cuda")]
+    pub const QWEN3_MOE: &str = "TroyDoesAI/Qwen3-MoE-3B";
+
+    // -----------------------------------------------------------------------
+    // MLX-only models (metal backend)
+    // -----------------------------------------------------------------------
+
     // Tier 1: Tiny (<500 MB) — run on every PR
     pub const SMOLLM_135M_4BIT: &str = "mlx-community/SmolLM-135M-Instruct-4bit";
     pub const QWEN2_0_5B_4BIT: &str = "mlx-community/Qwen2.5-0.5B-Instruct-4bit";
@@ -46,6 +129,10 @@ impl TestModels {
     // Float16 variants for non-quantized testing
     pub const SMOLLM_135M_F16: &str = "mlx-community/SmolLM2-135M-Instruct";
 
+    // -----------------------------------------------------------------------
+    // GPTQ / AWQ / BNB / GGUF quantized models
+    // -----------------------------------------------------------------------
+
     // GPTQ quantized models (CPU, not MLX)
     pub const QWEN2_0_5B_GPTQ_INT4: &str = "Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4";
 
@@ -69,7 +156,10 @@ impl TestModels {
     pub const QWEN3_0_6B_GGUF: &str = "unsloth/Qwen3-0.6B-GGUF";
     pub const QWEN3_NEXT_0_8B_GGUF: &str = "unsloth/Qwen3.5-0.8B-GGUF";
 
-    // CUDA-compatible safetensors models (non-quantized, run on GPU)
+    // -----------------------------------------------------------------------
+    // CUDA-only models (safetensors BF16)
+    // -----------------------------------------------------------------------
+
     pub const SMOLLM_135M_CUDA: &str = "HuggingFaceTB/SmolLM2-135M-Instruct";
     pub const QWEN2_0_5B_CUDA: &str = "Qwen/Qwen2.5-0.5B";
     // MoE models for CUDA — safetensors BF16

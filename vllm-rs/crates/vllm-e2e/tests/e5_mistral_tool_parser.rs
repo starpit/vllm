@@ -38,7 +38,7 @@ fn test_model() -> &'static str {
     if cfg!(feature = "cuda") {
         TestModels::SMOLLM_135M_CUDA
     } else {
-        TestModels::SMOLLM_135M_4BIT
+        TestModels::SMOLLM
     }
 }
 

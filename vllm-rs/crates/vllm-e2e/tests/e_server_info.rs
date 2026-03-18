@@ -16,7 +16,7 @@ use vllm_e2e::{Client, TestModels, TestServer};
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_server_info_default() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");
@@ -46,7 +46,7 @@ async fn test_server_info_default() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_server_info_json_format() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");

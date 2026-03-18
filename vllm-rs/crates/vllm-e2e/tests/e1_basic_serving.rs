@@ -69,13 +69,13 @@ fn default_completion_request() -> CompletionRequest {
 }
 
 // ===========================================================================
-// SmolLM-135M-Instruct-4bit (LlamaForCausalLM, quantized) — Tier 1
+// SmolLM (LlamaForCausalLM) — Tier 1
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t1_smollm_server_starts() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");
@@ -89,8 +89,8 @@ async fn test_t1_smollm_server_starts() {
     let models = client.list_models().await.unwrap();
     assert_eq!(models.data.len(), 1);
     assert!(
-        models.data[0].id.contains("SmolLM"),
-        "model name should contain 'SmolLM', got: {}",
+        models.data[0].id.contains("molLM") || models.data[0].id.contains("SmolLM2"),
+        "model name should contain SmolLM variant, got: {}",
         models.data[0].id
     );
 }
@@ -98,7 +98,7 @@ async fn test_t1_smollm_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t1_smollm_chat_basic() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .unwrap();
@@ -115,7 +115,7 @@ async fn test_t1_smollm_chat_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t1_smollm_completion_basic() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .unwrap();
@@ -134,7 +134,7 @@ async fn test_t1_smollm_completion_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t1_smollm_max_tokens() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .unwrap();
@@ -154,7 +154,7 @@ async fn test_t1_smollm_max_tokens() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t1_smollm_version() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .unwrap();
@@ -176,7 +176,7 @@ async fn test_t1_smollm_version() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t1_qwen2_server_starts() {
-    let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
+    let server = TestServer::builder(TestModels::QWEN2)
         .start()
         .await
         .expect("server should start");
@@ -191,7 +191,7 @@ async fn test_t1_qwen2_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t1_qwen2_chat_basic() {
-    let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
+    let server = TestServer::builder(TestModels::QWEN2)
         .start()
         .await
         .unwrap();
@@ -208,7 +208,7 @@ async fn test_t1_qwen2_chat_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t1_qwen2_completion_basic() {
-    let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
+    let server = TestServer::builder(TestModels::QWEN2)
         .start()
         .await
         .unwrap();
@@ -228,7 +228,7 @@ async fn test_t1_qwen2_completion_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t1_qwen3_server_starts() {
-    let server = TestServer::builder(TestModels::QWEN3_0_6B_4BIT)
+    let server = TestServer::builder(TestModels::QWEN3)
         .start()
         .await
         .expect("server should start");
@@ -243,7 +243,7 @@ async fn test_t1_qwen3_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t1_qwen3_chat_basic() {
-    let server = TestServer::builder(TestModels::QWEN3_0_6B_4BIT)
+    let server = TestServer::builder(TestModels::QWEN3)
         .start()
         .await
         .unwrap();
@@ -258,13 +258,13 @@ async fn test_t1_qwen3_chat_basic() {
 }
 
 // ===========================================================================
-// Llama-3.2-1B-Instruct-4bit (LlamaForCausalLM) — Tier 2
+// Llama-3.2-1B (LlamaForCausalLM) — Tier 2
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t2_llama3_server_starts() {
-    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_4BIT)
+    let server = TestServer::builder(TestModels::LLAMA_3_2)
         .start()
         .await
         .expect("server should start");
@@ -279,7 +279,7 @@ async fn test_t2_llama3_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t2_llama3_chat_basic() {
-    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_4BIT)
+    let server = TestServer::builder(TestModels::LLAMA_3_2)
         .start()
         .await
         .unwrap();
@@ -296,7 +296,7 @@ async fn test_t2_llama3_chat_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t2_llama3_completion_basic() {
-    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_4BIT)
+    let server = TestServer::builder(TestModels::LLAMA_3_2)
         .start()
         .await
         .unwrap();
@@ -312,7 +312,7 @@ async fn test_t2_llama3_completion_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t2_llama3_max_tokens() {
-    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_4BIT)
+    let server = TestServer::builder(TestModels::LLAMA_3_2)
         .start()
         .await
         .unwrap();
@@ -326,13 +326,13 @@ async fn test_t2_llama3_max_tokens() {
 }
 
 // ===========================================================================
-// Gemma3-270M (Gemma3ForCausalLM, quantized) — Tier 2
+// Gemma3 (Gemma3ForCausalLM) — Tier 2
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t2_gemma3_server_starts() {
-    let server = TestServer::builder(TestModels::GEMMA3_270M_4BIT)
+    let server = TestServer::builder(TestModels::GEMMA3)
         .start()
         .await
         .expect("Gemma3 server should start");
@@ -347,7 +347,7 @@ async fn test_t2_gemma3_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t2_gemma3_chat_basic() {
-    let server = TestServer::builder(TestModels::GEMMA3_270M_4BIT)
+    let server = TestServer::builder(TestModels::GEMMA3)
         .start()
         .await
         .unwrap();
@@ -364,7 +364,7 @@ async fn test_t2_gemma3_chat_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t2_gemma3_completion_basic() {
-    let server = TestServer::builder(TestModels::GEMMA3_270M_4BIT)
+    let server = TestServer::builder(TestModels::GEMMA3)
         .start()
         .await
         .unwrap();
@@ -383,7 +383,7 @@ async fn test_t2_gemma3_completion_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t2_gemma3_max_tokens() {
-    let server = TestServer::builder(TestModels::GEMMA3_270M_4BIT)
+    let server = TestServer::builder(TestModels::GEMMA3)
         .start()
         .await
         .unwrap();
@@ -407,7 +407,7 @@ async fn test_t2_gemma3_max_tokens() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t3_gemma2_server_starts() {
-    let server = TestServer::builder(TestModels::GEMMA2_2B_4BIT)
+    let server = TestServer::builder(TestModels::GEMMA2)
         .start()
         .await
         .expect("server should start");
@@ -419,7 +419,7 @@ async fn test_t3_gemma2_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t3_gemma2_chat_basic() {
-    let server = TestServer::builder(TestModels::GEMMA2_2B_4BIT)
+    let server = TestServer::builder(TestModels::GEMMA2)
         .start()
         .await
         .unwrap();
@@ -440,7 +440,7 @@ async fn test_t3_gemma2_chat_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t3_phi3_server_starts() {
-    let server = TestServer::builder(TestModels::PHI3_5_MINI_4BIT)
+    let server = TestServer::builder(TestModels::PHI3_5)
         .start()
         .await
         .expect("server should start");
@@ -452,7 +452,7 @@ async fn test_t3_phi3_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t3_phi3_chat_basic() {
-    let server = TestServer::builder(TestModels::PHI3_5_MINI_4BIT)
+    let server = TestServer::builder(TestModels::PHI3_5)
         .start()
         .await
         .unwrap();
@@ -473,7 +473,7 @@ async fn test_t3_phi3_chat_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t3_phi4_mini_server_starts() {
-    let server = TestServer::builder(TestModels::PHI4_MINI_4BIT)
+    let server = TestServer::builder(TestModels::PHI4)
         .start()
         .await
         .expect("Phi-4 mini server should start");
@@ -488,10 +488,7 @@ async fn test_t3_phi4_mini_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t3_phi4_mini_chat_basic() {
-    let server = TestServer::builder(TestModels::PHI4_MINI_4BIT)
-        .start()
-        .await
-        .unwrap();
+    let server = TestServer::builder(TestModels::PHI4).start().await.unwrap();
 
     let client = Client::new(server.base_url());
     let request = simple_chat_request("Say hello in one sentence.", Some(50));
@@ -505,10 +502,7 @@ async fn test_t3_phi4_mini_chat_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t3_phi4_mini_completion_basic() {
-    let server = TestServer::builder(TestModels::PHI4_MINI_4BIT)
-        .start()
-        .await
-        .unwrap();
+    let server = TestServer::builder(TestModels::PHI4).start().await.unwrap();
 
     let client = Client::new(server.base_url());
     let request = simple_completion_request("The capital of France is", 20);
@@ -524,10 +518,7 @@ async fn test_t3_phi4_mini_completion_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t3_phi4_mini_max_tokens() {
-    let server = TestServer::builder(TestModels::PHI4_MINI_4BIT)
-        .start()
-        .await
-        .unwrap();
+    let server = TestServer::builder(TestModels::PHI4).start().await.unwrap();
 
     let client = Client::new(server.base_url());
     let request = simple_chat_request("Write a long story about a cat.", Some(5));
@@ -548,7 +539,7 @@ async fn test_t3_phi4_mini_max_tokens() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t4_mistral_server_starts() {
-    let server = TestServer::builder(TestModels::MISTRAL_7B_4BIT)
+    let server = TestServer::builder(TestModels::MISTRAL)
         .start()
         .await
         .expect("server should start");
@@ -560,7 +551,7 @@ async fn test_t4_mistral_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t4_mistral_chat_basic() {
-    let server = TestServer::builder(TestModels::MISTRAL_7B_4BIT)
+    let server = TestServer::builder(TestModels::MISTRAL)
         .start()
         .await
         .unwrap();
@@ -581,7 +572,7 @@ async fn test_t4_mistral_chat_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t4_deepseek_server_starts() {
-    let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE_4BIT)
+    let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE)
         .start()
         .await
         .expect("server should start");
@@ -593,7 +584,7 @@ async fn test_t4_deepseek_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t4_deepseek_chat_basic() {
-    let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE_4BIT)
+    let server = TestServer::builder(TestModels::DEEPSEEK_V2_LITE)
         .start()
         .await
         .unwrap();
@@ -608,13 +599,13 @@ async fn test_t4_deepseek_chat_basic() {
 }
 
 // ===========================================================================
-// Qwen3 MoE 4x0.6B (Qwen3MoeForCausalLM) — MoE architecture
+// Qwen3 MoE (Qwen3MoeForCausalLM) — MoE architecture
 // ===========================================================================
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_qwen3_moe_server_starts() {
-    let server = TestServer::builder(TestModels::QWEN3_MOE_4X06B_4BIT)
+    let server = TestServer::builder(TestModels::QWEN3_MOE)
         .start()
         .await
         .expect("Qwen3 MoE server should start");
@@ -629,7 +620,7 @@ async fn test_qwen3_moe_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_qwen3_moe_chat_basic() {
-    let server = TestServer::builder(TestModels::QWEN3_MOE_4X06B_4BIT)
+    let server = TestServer::builder(TestModels::QWEN3_MOE)
         .start()
         .await
         .unwrap();
@@ -646,7 +637,7 @@ async fn test_qwen3_moe_chat_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_qwen3_moe_completion_basic() {
-    let server = TestServer::builder(TestModels::QWEN3_MOE_4X06B_4BIT)
+    let server = TestServer::builder(TestModels::QWEN3_MOE)
         .start()
         .await
         .unwrap();
@@ -665,7 +656,7 @@ async fn test_qwen3_moe_completion_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_qwen3_moe_max_tokens() {
-    let server = TestServer::builder(TestModels::QWEN3_MOE_4X06B_4BIT)
+    let server = TestServer::builder(TestModels::QWEN3_MOE)
         .start()
         .await
         .unwrap();
@@ -683,9 +674,10 @@ async fn test_qwen3_moe_max_tokens() {
 }
 
 // ===========================================================================
-// E1b: Float16 vs quantized comparison
+// E1b: Float16 vs quantized comparison (MLX-only)
 // ===========================================================================
 
+#[cfg(feature = "metal")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t1_float16_server_starts() {
@@ -698,6 +690,7 @@ async fn test_t1_float16_server_starts() {
     assert!(client.health().await.unwrap());
 }
 
+#[cfg(feature = "metal")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_t1_float16_chat_basic() {
@@ -723,7 +716,7 @@ async fn test_t1_float16_chat_basic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_sync_scheduling_smollm_chat() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_sync_scheduling()
         .start()
         .await
@@ -742,14 +735,14 @@ async fn test_sync_scheduling_smollm_chat() {
 // Granite (IBM) — GraniteForCausalLM, MLX 4-bit quantized (~1.3 GB)
 // ===========================================================================
 // Granite is architecturally identical to LLaMA with 4 scalar multipliers.
-// MLX 4-bit quantized model for Apple Silicon testing.
 //
 // Run with: cargo test -p vllm-e2e --features e2e,metal --release --test e1_basic_serving test_granite -- --ignored
+//       or: cargo test -p vllm-e2e --features e2e,cuda  --release --test e1_basic_serving test_granite -- --ignored
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_granite_server_starts() {
-    let server = TestServer::builder(TestModels::GRANITE_3_3_2B_4BIT)
+    let server = TestServer::builder(TestModels::GRANITE)
         .start()
         .await
         .expect("Granite server should start");
@@ -769,7 +762,7 @@ async fn test_granite_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_granite_completion() {
-    let server = TestServer::builder(TestModels::GRANITE_3_3_2B_4BIT)
+    let server = TestServer::builder(TestModels::GRANITE)
         .start()
         .await
         .unwrap();
@@ -790,7 +783,7 @@ async fn test_granite_completion() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_granite_completion_coherent() {
-    let server = TestServer::builder(TestModels::GRANITE_3_3_2B_4BIT)
+    let server = TestServer::builder(TestModels::GRANITE)
         .start()
         .await
         .unwrap();

@@ -138,7 +138,7 @@ fn create_synthetic_adapter(rank: usize) -> tempfile::TempDir {
 async fn test_lora_synthetic_server_starts() {
     let adapter_dir = create_synthetic_adapter(4);
 
-    let server = TestServer::builder(TestModels::SMOLLM_135M_F16)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_lora_adapter(adapter_dir.path().to_str().unwrap())
         .start()
         .await
@@ -157,7 +157,7 @@ async fn test_lora_synthetic_server_starts() {
 async fn test_lora_synthetic_chat() {
     let adapter_dir = create_synthetic_adapter(4);
 
-    let server = TestServer::builder(TestModels::SMOLLM_135M_F16)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_lora_adapter(adapter_dir.path().to_str().unwrap())
         .start()
         .await
@@ -178,7 +178,7 @@ async fn test_lora_synthetic_chat() {
 async fn test_lora_synthetic_completion() {
     let adapter_dir = create_synthetic_adapter(4);
 
-    let server = TestServer::builder(TestModels::SMOLLM_135M_F16)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_lora_adapter(adapter_dir.path().to_str().unwrap())
         .start()
         .await
@@ -208,7 +208,7 @@ async fn test_lora_synthetic_output_differs() {
     let prompt = "The meaning of life is";
 
     // Base model (no LoRA).
-    let base_server = TestServer::builder(TestModels::SMOLLM_135M_F16)
+    let base_server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .unwrap();
@@ -224,7 +224,7 @@ async fn test_lora_synthetic_output_differs() {
     drop(base_server);
 
     // LoRA model (synthetic adapter).
-    let lora_server = TestServer::builder(TestModels::SMOLLM_135M_F16)
+    let lora_server = TestServer::builder(TestModels::SMOLLM)
         .with_lora_adapter(adapter_dir.path().to_str().unwrap())
         .start()
         .await

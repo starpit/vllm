@@ -367,8 +367,8 @@ impl TestServerBuilder {
         }
 
         // Initialize the full stack (blocking — downloads model, loads weights).
-        // Timeout after 90s so hangs in CUDA graph capture / model load are caught.
-        let init_timeout = Duration::from_secs(90);
+        // 5 min timeout: first run may need to download multi-GB model weights.
+        let init_timeout = Duration::from_secs(300);
         eprintln!("[E2E] starting initialize_stack for {model}...");
         let mut stack = tokio::time::timeout(
             init_timeout,

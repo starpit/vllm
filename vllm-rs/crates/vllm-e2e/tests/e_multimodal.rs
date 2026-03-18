@@ -73,7 +73,7 @@ fn user_msg_with_image(text: &str, image_base64: &str) -> ChatCompletionMessageP
 }
 
 async fn start_gemma3_vlm() -> (TestServer, Client) {
-    let server = TestServer::builder(TestModels::GEMMA3_4B_IT_QAT_3BIT)
+    let server = TestServer::builder(TestModels::GEMMA3_VLM)
         .start()
         .await
         .expect("Gemma 3 VLM server should start");

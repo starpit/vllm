@@ -199,13 +199,9 @@ async fn test_batch_chat_completions() {
     let output_path = dir.path().join("output.jsonl");
     let output_str = output_path.to_str().unwrap();
 
-    run_batch(
-        test_config(TestModels::SMOLLM_135M_4BIT),
-        &input_path,
-        output_str,
-    )
-    .await
-    .expect("batch should succeed");
+    run_batch(test_config(TestModels::SMOLLM), &input_path, output_str)
+        .await
+        .expect("batch should succeed");
 
     let outputs = read_output_jsonl(output_str);
     assert_eq!(outputs.len(), 3);
@@ -273,13 +269,9 @@ async fn test_batch_completions() {
     let output_path = dir.path().join("output.jsonl");
     let output_str = output_path.to_str().unwrap();
 
-    run_batch(
-        test_config(TestModels::SMOLLM_135M_4BIT),
-        &input_path,
-        output_str,
-    )
-    .await
-    .expect("batch should succeed");
+    run_batch(test_config(TestModels::SMOLLM), &input_path, output_str)
+        .await
+        .expect("batch should succeed");
 
     let outputs = read_output_jsonl(output_str);
     assert_eq!(outputs.len(), 2);
@@ -333,13 +325,9 @@ async fn test_batch_embeddings() {
     let output_path = dir.path().join("output.jsonl");
     let output_str = output_path.to_str().unwrap();
 
-    run_batch(
-        test_config(TestModels::SMOLLM_135M_4BIT),
-        &input_path,
-        output_str,
-    )
-    .await
-    .expect("batch should succeed");
+    run_batch(test_config(TestModels::SMOLLM), &input_path, output_str)
+        .await
+        .expect("batch should succeed");
 
     let outputs = read_output_jsonl(output_str);
     assert_eq!(outputs.len(), 2);
@@ -409,13 +397,9 @@ async fn test_batch_mixed_endpoints() {
     let output_path = dir.path().join("output.jsonl");
     let output_str = output_path.to_str().unwrap();
 
-    run_batch(
-        test_config(TestModels::SMOLLM_135M_4BIT),
-        &input_path,
-        output_str,
-    )
-    .await
-    .expect("batch should succeed");
+    run_batch(test_config(TestModels::SMOLLM), &input_path, output_str)
+        .await
+        .expect("batch should succeed");
 
     let outputs = read_output_jsonl(output_str);
     assert_eq!(outputs.len(), 3);
@@ -476,13 +460,9 @@ async fn test_batch_invalid_url() {
     let output_path = dir.path().join("output.jsonl");
     let output_str = output_path.to_str().unwrap();
 
-    run_batch(
-        test_config(TestModels::SMOLLM_135M_4BIT),
-        &input_path,
-        output_str,
-    )
-    .await
-    .expect("batch should complete without crashing");
+    run_batch(test_config(TestModels::SMOLLM), &input_path, output_str)
+        .await
+        .expect("batch should complete without crashing");
 
     let outputs = read_output_jsonl(output_str);
     assert_eq!(outputs.len(), 2);
@@ -520,13 +500,9 @@ async fn test_batch_malformed_body() {
     let output_path = dir.path().join("output.jsonl");
     let output_str = output_path.to_str().unwrap();
 
-    run_batch(
-        test_config(TestModels::SMOLLM_135M_4BIT),
-        &input_path,
-        output_str,
-    )
-    .await
-    .expect("batch should complete without crashing");
+    run_batch(test_config(TestModels::SMOLLM), &input_path, output_str)
+        .await
+        .expect("batch should complete without crashing");
 
     let outputs = read_output_jsonl(output_str);
     assert_eq!(outputs.len(), 1);

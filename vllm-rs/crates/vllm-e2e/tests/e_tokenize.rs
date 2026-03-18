@@ -17,7 +17,7 @@ use vllm_serve::protocol::{DetokenizeRequest, TokenizeRequest};
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_tokenize_prompt() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");
@@ -41,7 +41,7 @@ async fn test_tokenize_prompt() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_tokenize_with_token_strs() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");
@@ -66,7 +66,7 @@ async fn test_tokenize_with_token_strs() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_tokenize_empty_prompt() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");
@@ -89,7 +89,7 @@ async fn test_tokenize_empty_prompt() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_detokenize() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");
@@ -120,7 +120,7 @@ async fn test_detokenize() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_detokenize_empty() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");

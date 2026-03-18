@@ -30,7 +30,7 @@ fn embed_request(input: EmbeddingInput) -> EmbeddingRequest {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_embedding_single_string() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");
@@ -52,7 +52,7 @@ async fn test_embedding_single_string() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_embedding_multiple_strings() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");
@@ -80,7 +80,7 @@ async fn test_embedding_multiple_strings() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_embedding_dimensions() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");
@@ -98,7 +98,7 @@ async fn test_embedding_dimensions() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_embedding_normalized() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");
@@ -121,7 +121,7 @@ async fn test_embedding_normalized() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_embedding_different_inputs() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");
@@ -153,7 +153,7 @@ async fn test_embedding_different_inputs() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_embedding_mean_pooling() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_pooling_strategy("mean")
         .start()
         .await
@@ -181,7 +181,7 @@ async fn test_embedding_mean_pooling() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_embedding_cls_pooling() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_pooling_strategy("cls")
         .start()
         .await
@@ -209,13 +209,13 @@ async fn test_embedding_cls_pooling() {
 #[ignore]
 async fn test_embedding_mean_vs_last_differ() {
     // Mean and last-token pooling should produce different embeddings.
-    let server_mean = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server_mean = TestServer::builder(TestModels::SMOLLM)
         .with_pooling_strategy("mean")
         .start()
         .await
         .expect("server should start");
 
-    let server_last = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server_last = TestServer::builder(TestModels::SMOLLM)
         .with_pooling_strategy("last")
         .start()
         .await
@@ -432,7 +432,7 @@ async fn test_cuda_embedding_cls_pooling() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_embedding_qwen2() {
-    let server = TestServer::builder(TestModels::QWEN2_0_5B_4BIT)
+    let server = TestServer::builder(TestModels::QWEN2)
         .start()
         .await
         .expect("server should start");
@@ -459,7 +459,7 @@ async fn test_embedding_qwen2() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_embedding_llama3() {
-    let server = TestServer::builder(TestModels::LLAMA_3_2_1B_4BIT)
+    let server = TestServer::builder(TestModels::LLAMA_3_2)
         .start()
         .await
         .expect("server should start");

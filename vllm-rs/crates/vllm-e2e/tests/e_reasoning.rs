@@ -41,7 +41,7 @@ fn default_chat_request() -> ChatCompletionRequest {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_reasoning_parser_deepseek_r1_nonstreaming() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_reasoning_parser("deepseek_r1")
         .start()
         .await
@@ -74,7 +74,7 @@ async fn test_reasoning_parser_deepseek_r1_nonstreaming() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_reasoning_parser_deepseek_r1_streaming() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_reasoning_parser("deepseek_r1")
         .start()
         .await
@@ -123,7 +123,7 @@ async fn test_reasoning_parser_deepseek_r1_streaming() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_reasoning_parser_qwen3_nonstreaming() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_reasoning_parser("qwen3")
         .start()
         .await
@@ -152,7 +152,7 @@ async fn test_reasoning_parser_qwen3_nonstreaming() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_reasoning_parser_qwen3_streaming() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_reasoning_parser("qwen3")
         .start()
         .await
@@ -198,7 +198,7 @@ async fn test_reasoning_parser_qwen3_streaming() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_include_reasoning_false_nonstreaming() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_reasoning_parser("deepseek_r1")
         .start()
         .await
@@ -228,7 +228,7 @@ async fn test_include_reasoning_false_nonstreaming() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_include_reasoning_false_streaming() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_reasoning_parser("deepseek_r1")
         .start()
         .await
@@ -265,7 +265,7 @@ async fn test_include_reasoning_false_streaming() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_no_reasoning_parser_nonstreaming() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");
@@ -293,7 +293,7 @@ async fn test_no_reasoning_parser_nonstreaming() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_no_reasoning_parser_streaming() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("server should start");

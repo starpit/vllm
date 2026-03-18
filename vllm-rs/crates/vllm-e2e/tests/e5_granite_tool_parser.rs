@@ -63,7 +63,7 @@ fn weather_tool() -> ChatCompletionToolsParam {
 }
 
 async fn start_smollm_with_granite_parser() -> (TestServer, Client) {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_tool_call_parser("granite")
         .start()
         .await

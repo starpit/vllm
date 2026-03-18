@@ -15,7 +15,7 @@ use vllm_e2e::{Client, TestModels, TestServer};
 // ---------------------------------------------------------------------------
 
 async fn start_smollm() -> (TestServer, Client) {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .start()
         .await
         .expect("SmolLM server should start");

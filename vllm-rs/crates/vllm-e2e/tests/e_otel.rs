@@ -35,7 +35,7 @@ async fn start_otel_server() -> (u16, String, OtelTestServer) {
     };
     let _otel_guard = vllm_common::telemetry::init_tracing_with_otel("info", &otel_config);
 
-    let model = vllm_e2e::TestModels::SMOLLM_135M_4BIT;
+    let model = vllm_e2e::TestModels::SMOLLM;
     let config = vllm_serve::init::VllmConfig {
         model: model.to_string(),
         device: "auto".to_string(),

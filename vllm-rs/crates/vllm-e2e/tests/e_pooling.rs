@@ -30,7 +30,7 @@ fn embed_request(input: EmbeddingInput) -> EmbeddingRequest {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_pooling_server_starts() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_runner("pooling")
         .start()
         .await
@@ -49,7 +49,7 @@ async fn test_pooling_server_starts() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_pooling_single_embedding() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_runner("pooling")
         .start()
         .await
@@ -72,7 +72,7 @@ async fn test_pooling_single_embedding() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_pooling_multiple_embeddings() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_runner("pooling")
         .start()
         .await
@@ -98,7 +98,7 @@ async fn test_pooling_multiple_embeddings() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_pooling_embedding_normalized() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_runner("pooling")
         .start()
         .await
@@ -122,7 +122,7 @@ async fn test_pooling_embedding_normalized() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_pooling_embedding_dimensions() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_runner("pooling")
         .start()
         .await
@@ -148,7 +148,7 @@ async fn test_pooling_embedding_dimensions() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_pooling_different_inputs_differ() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_runner("pooling")
         .start()
         .await
@@ -185,7 +185,7 @@ async fn test_pooling_different_inputs_differ() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_pooling_rejects_chat_completions() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_runner("pooling")
         .start()
         .await
@@ -208,7 +208,7 @@ async fn test_pooling_rejects_chat_completions() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_pooling_rejects_completions() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_runner("pooling")
         .start()
         .await
@@ -233,7 +233,7 @@ async fn test_pooling_rejects_completions() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_pooling_mean_strategy() {
-    let server = TestServer::builder(TestModels::SMOLLM_135M_4BIT)
+    let server = TestServer::builder(TestModels::SMOLLM)
         .with_runner("pooling")
         .with_pooling_strategy("mean")
         .start()

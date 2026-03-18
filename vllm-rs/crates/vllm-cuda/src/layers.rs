@@ -59,21 +59,11 @@ impl Linear {
     /// Forward: y = x @ W^T (+ bias)
     ///
     /// `x`: `[num_tokens, in_features]`
-    /// Returns: `[num_tokens, out_features]` as GpuTensor (leaked from caching allocator).
+    /// Returns: `[num_tokens, out_features]` as OwnedTensor from caching allocator.
     ///
     /// # Safety
     /// All tensors must be valid GPU memory. cuBLAS handle must be on the correct stream.
     pub unsafe fn forward(
-        &self,
-        x: GpuTensor,
-        cublas: &mut CublasHandle,
-        alloc: &mut CachingAllocator,
-    ) -> GpuTensor {
-        self.forward_owned(x, cublas, alloc).into_gpu_tensor()
-    }
-
-    /// Forward returning `OwnedTensor` from caching allocator.
-    pub unsafe fn forward_owned(
         &self,
         x: GpuTensor,
         cublas: &mut CublasHandle,
@@ -83,9 +73,9 @@ impl Linear {
         debug_assert_eq!(x.dim(1), self.weight.dim(1), "Linear: input dim mismatch");
 
         if let Some(bias) = self.bias {
-            cublas.gemm_bias_owned(x, self.weight, bias, alloc)
+            cublas.gemm_bias(x, self.weight, bias, alloc)
         } else {
-            cublas.gemm_owned(x, self.weight, alloc)
+            cublas.gemm(x, self.weight, alloc)
         }
     }
 
@@ -145,15 +135,6 @@ impl MarlinLinear {
     /// `x`: `[num_tokens, size_k]` (F16 or BF16)
     /// Returns: `[num_tokens, size_n]`
     pub unsafe fn forward(
-        &self,
-        x: GpuTensor,
-        alloc: &mut CachingAllocator,
-        stream: cudarc::driver::sys::CUstream,
-    ) -> GpuTensor {
-        self.forward_owned(x, alloc, stream).into_gpu_tensor()
-    }
-
-    pub unsafe fn forward_owned(
         &self,
         x: GpuTensor,
         alloc: &mut CachingAllocator,
@@ -246,17 +227,6 @@ impl Bnb4bitLinear {
         cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
-    ) -> GpuTensor {
-        self.forward_owned(x, cublas, alloc, stream)
-            .into_gpu_tensor()
-    }
-
-    pub unsafe fn forward_owned(
-        &self,
-        x: GpuTensor,
-        cublas: &mut CublasHandle,
-        alloc: &mut CachingAllocator,
-        stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
         // BNB stores weights in [out_features, in_features] order (same as original W).
         // Dequant produces the flat W data, reshape as [out, in], then cuBLAS does x @ W^T.
@@ -276,9 +246,9 @@ impl Bnb4bitLinear {
 
         // cuBLAS GEMM: x @ weight_view^T
         if let Some(bias) = self.bias {
-            cublas.gemm_bias_owned(x, weight_view, bias, alloc)
+            cublas.gemm_bias(x, weight_view, bias, alloc)
         } else {
-            cublas.gemm_owned(x, weight_view, alloc)
+            cublas.gemm(x, weight_view, alloc)
         }
     }
 
@@ -316,27 +286,23 @@ impl GgmlLinear {
         x: GpuTensor,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
-    ) -> GpuTensor {
-        self.forward_owned(x, alloc, stream).into_gpu_tensor()
-    }
-
-    pub unsafe fn forward_owned(
-        &self,
-        x: GpuTensor,
-        alloc: &mut CachingAllocator,
-        stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
         let input_dtype = x.dtype();
 
         // GGML kernels require f32 activations — cast if needed.
-        let x_f32 = if input_dtype != crate::dtype::DType::F32 {
-            let cast = crate::kernels::cast_logits_to_f32(x, alloc, stream);
-            cast.into_gpu_tensor()
+        let cast_buf = if input_dtype != crate::dtype::DType::F32 {
+            Some(crate::kernels::cast_logits_to_f32(x, alloc, stream))
+        } else {
+            None
+        };
+        let x_f32 = if let Some(ref cast) = cast_buf {
+            cast.as_gpu_tensor()
         } else {
             x
         };
 
         let out_f32 = crate::ggml::ggml_matmul(&self.storage, x_f32, alloc, stream);
+        drop(cast_buf);
 
         if let Some(bias) = self.bias {
             crate::kernels::bias_add_inplace(out_f32.as_gpu_tensor(), bias, stream);
@@ -344,7 +310,10 @@ impl GgmlLinear {
 
         // Cast back to original dtype if we converted to f32.
         if input_dtype != crate::dtype::DType::F32 {
-            crate::kernels::cast_from_f32(out_f32.into_gpu_tensor(), input_dtype, alloc, stream)
+            let out_f32_gpu = out_f32.as_gpu_tensor();
+            let result = crate::kernels::cast_from_f32(out_f32_gpu, input_dtype, alloc, stream);
+            drop(out_f32);
+            result
         } else {
             out_f32
         }
@@ -392,17 +361,6 @@ impl Fp8Linear {
     /// activation scales and per-tensor weight scale in the epilogue.
     /// Matches Python vLLM's `cutlass_scaled_mm` exactly.
     pub unsafe fn forward(
-        &self,
-        x: GpuTensor,
-        cublas: &mut CublasHandle,
-        alloc: &mut CachingAllocator,
-        stream: cudarc::driver::sys::CUstream,
-    ) -> GpuTensor {
-        self.forward_owned(x, cublas, alloc, stream)
-            .into_gpu_tensor()
-    }
-
-    pub unsafe fn forward_owned(
         &self,
         x: GpuTensor,
         _cublas: &mut CublasHandle,
@@ -517,25 +475,14 @@ impl LinearLayer {
         cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
-    ) -> GpuTensor {
-        self.forward_owned(x, cublas, alloc, stream)
-            .into_gpu_tensor()
-    }
-
-    pub unsafe fn forward_owned(
-        &self,
-        x: GpuTensor,
-        cublas: &mut CublasHandle,
-        alloc: &mut CachingAllocator,
-        stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
         match self {
-            Self::Dense(l) => l.forward_owned(x, cublas, alloc),
-            Self::Marlin(l) => l.forward_owned(x, alloc, stream),
-            Self::Ggml(l) => l.forward_owned(x, alloc, stream),
-            Self::Bnb4bit(l) => l.forward_owned(x, cublas, alloc, stream),
-            Self::Fp8(l) => l.forward_owned(x, cublas, alloc, stream),
-            Self::Fp8Block(l) => l.forward_owned(x, cublas, alloc, stream),
+            Self::Dense(l) => l.forward(x, cublas, alloc),
+            Self::Marlin(l) => l.forward(x, alloc, stream),
+            Self::Ggml(l) => l.forward(x, alloc, stream),
+            Self::Bnb4bit(l) => l.forward(x, cublas, alloc, stream),
+            Self::Fp8(l) => l.forward(x, cublas, alloc, stream),
+            Self::Fp8Block(l) => l.forward(x, cublas, alloc, stream),
         }
     }
 
@@ -633,17 +580,6 @@ impl Fp8BlockLinear {
         cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
-    ) -> GpuTensor {
-        self.forward_owned(x, cublas, alloc, stream)
-            .into_gpu_tensor()
-    }
-
-    pub unsafe fn forward_owned(
-        &self,
-        x: GpuTensor,
-        cublas: &mut CublasHandle,
-        alloc: &mut CachingAllocator,
-        stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
         debug_assert_eq!(x.ndim(), 2);
         let k = self.weight.dim(1);
@@ -662,7 +598,7 @@ impl Fp8BlockLinear {
         // Standard GEMM: x @ dequant_weight^T
         // Use as_gpu_tensor() to borrow — dequant_weight drops after GEMM,
         // returning the buffer to the caching allocator.
-        let out = cublas.gemm_owned(x, dequant_weight.as_gpu_tensor(), alloc);
+        let out = cublas.gemm(x, dequant_weight.as_gpu_tensor(), alloc);
         drop(dequant_weight);
 
         if let Some(bias) = self.bias {
@@ -803,14 +739,16 @@ impl ColumnParallelLinear {
         cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
-    ) -> GpuTensor {
+    ) -> OwnedTensor {
         let out = self.inner.forward(x, cublas, alloc, stream);
 
         #[cfg(feature = "nccl")]
         if self.gather_output
             && let Some(ref group) = self.tp_group
         {
-            return group.all_gather(out, alloc);
+            let gathered = group.all_gather(out.as_gpu_tensor(), alloc);
+            drop(out);
+            return gathered;
         }
 
         out
@@ -859,16 +797,18 @@ impl RowParallelLinear {
         cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
-    ) -> GpuTensor {
+    ) -> OwnedTensor {
         let out = self.inner.forward(x, cublas, alloc, stream);
 
         #[cfg(feature = "nccl")]
         if let Some(ref group) = self.tp_group {
-            group.all_reduce_inplace(out).expect("all_reduce failed");
+            group
+                .all_reduce_inplace(out.as_gpu_tensor())
+                .expect("all_reduce failed");
         }
 
         if let Some(bias) = self.bias {
-            crate::kernels::bias_add_inplace(out, bias, stream);
+            crate::kernels::bias_add_inplace(out.as_gpu_tensor(), bias, stream);
         }
 
         out
@@ -1280,7 +1220,7 @@ mod tests {
                 };
 
                 // Forward.
-                let output = layer.forward_owned(x, &mut cublas, &mut alloc, stream);
+                let output = layer.forward(x, &mut cublas, &mut alloc, stream);
                 let out_t = output.as_gpu_tensor();
                 assert_eq!(out_t.dim(0), 1);
                 assert_eq!(out_t.dim(1), out_features);
@@ -1467,7 +1407,7 @@ mod tests {
                     bias: None,
                 };
 
-                let output = layer.forward_owned(x, &mut cublas, &mut alloc, stream);
+                let output = layer.forward(x, &mut cublas, &mut alloc, stream);
                 let out_t = output.as_gpu_tensor();
                 assert_eq!(out_t.dim(0), 1);
                 assert_eq!(out_t.dim(1), total_out);
@@ -1849,7 +1789,7 @@ mod fp8_block_tests {
             // Forward: y = x @ W^T, x=[1,4] all-ones, W=[4,4]
             // y[j] = sum_k(W[j][k]) = row sum
             // Row sums: [6, 14, 6, 14]
-            let out = layer.forward_owned(x, &mut cublas, &mut alloc, stream);
+            let out = layer.forward(x, &mut cublas, &mut alloc, stream);
             assert_eq!(out.as_gpu_tensor().dim(0), 1);
             assert_eq!(out.as_gpu_tensor().dim(1), n);
 
@@ -1876,7 +1816,7 @@ mod fp8_block_tests {
         }
     }
 
-    /// Regression test: Fp8BlockLinear::forward_owned must not leak
+    /// Regression test: Fp8BlockLinear::forward must not leak
     /// the dequantized weight buffer. Running forward twice should NOT
     /// increase active_bytes (the caching allocator recycles the buffer).
     #[test]
@@ -1918,14 +1858,14 @@ mod fp8_block_tests {
 
             // First forward — establishes the allocator's pool.
             let x1 = GpuTensor::new(gpu_x, &[1, k], DType::BF16);
-            let out1 = layer.forward_owned(x1, &mut cublas, &mut alloc, stream);
+            let out1 = layer.forward(x1, &mut cublas, &mut alloc, stream);
             drop(out1);
             driver::stream_synchronize(stream).unwrap();
             let bytes_after_first = alloc.active_bytes();
 
             // Second forward — should reuse pools, NOT grow active_bytes.
             let x2 = GpuTensor::new(gpu_x, &[1, k], DType::BF16);
-            let out2 = layer.forward_owned(x2, &mut cublas, &mut alloc, stream);
+            let out2 = layer.forward(x2, &mut cublas, &mut alloc, stream);
             drop(out2);
             driver::stream_synchronize(stream).unwrap();
             let bytes_after_second = alloc.active_bytes();

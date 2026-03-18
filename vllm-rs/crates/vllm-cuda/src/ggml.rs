@@ -705,7 +705,7 @@ pub unsafe fn ggml_dequantize_to_tensor(
     shape: &[usize],
     alloc: &mut CachingAllocator,
     stream: CUstream,
-) -> GpuTensor {
+) -> OwnedTensor {
     let elem_count = shape.iter().product::<usize>();
     let out = alloc.alloc_tensor(shape, target_dtype);
     let dst_ptr = out.as_gpu_tensor().raw_ptr();
@@ -740,7 +740,7 @@ pub unsafe fn ggml_dequantize_to_tensor(
                 stream,
             );
             drop(out);
-            return f32_out.into_gpu_tensor();
+            return f32_out;
         }
         _ => panic!(
             "unsupported target dtype for dequantize: {:?}",
@@ -748,7 +748,7 @@ pub unsafe fn ggml_dequantize_to_tensor(
         ),
     }
 
-    out.into_gpu_tensor()
+    out
 }
 
 /// Quantize f32 activations to Q8_1 format on GPU.
@@ -1095,7 +1095,9 @@ impl GgufGpuWeights {
                     crate::driver::stream_synchronize(stream)?;
                     // Free the raw quantized buffer since we dequantized.
                     crate::driver::mem_free(gpu_raw)?;
-                    weights.insert(hf_name, GgufWeight::Dense(tensor));
+                    // Weight tensors are permanent — leak from allocator tracking.
+                    let gpu_tensor = tensor.into_gpu_tensor();
+                    weights.insert(hf_name, GgufWeight::Dense(gpu_tensor));
                 } else {
                     anyhow::bail!(
                         "unsupported GGUF dtype {:?} for tensor {}",

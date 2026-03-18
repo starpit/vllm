@@ -287,22 +287,17 @@ pub struct LlamaMLP {
 }
 
 impl LlamaMLP {
-    /// Forward pass.
-    pub unsafe fn forward(&self, x: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
-        self.forward_owned(x, device).into_gpu_tensor()
-    }
-
     /// Forward pass returning `OwnedTensor` (caching-allocator path).
-    pub unsafe fn forward_owned(&self, x: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(&self, x: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
         let gate_up = if let Some(ref up_proj) = self.up_proj {
             // Quantized: separate gate + up GEMMs, then concat
-            let gate_out = self.gate_up_proj.forward_owned(
+            let gate_out = self.gate_up_proj.forward(
                 x,
                 &mut device.cublas,
                 &mut device.caching,
                 device.compute_stream,
             );
-            let up_out = up_proj.forward_owned(
+            let up_out = up_proj.forward(
                 x,
                 &mut device.cublas,
                 &mut device.caching,
@@ -320,7 +315,7 @@ impl LlamaMLP {
             concat
         } else {
             // Dense: single fused gate+up GEMM
-            self.gate_up_proj.forward_owned(
+            self.gate_up_proj.forward(
                 x,
                 &mut device.cublas,
                 &mut device.caching,
@@ -336,7 +331,7 @@ impl LlamaMLP {
         );
         drop(gate_up);
 
-        let result = self.down_proj.forward_owned(
+        let result = self.down_proj.forward(
             activated.as_gpu_tensor(),
             &mut device.cublas,
             &mut device.caching,
@@ -413,7 +408,7 @@ impl LlamaAttention {
         anyhow::bail!("QKV fusion not yet implemented — use load_fused instead")
     }
 
-    /// Forward pass with paged KV cache and FlashAttention-2.
+    /// Forward pass with paged KV cache and FlashAttention-2, returning OwnedTensor.
     ///
     /// * `hidden_states`: `[num_tokens, hidden_size]`
     /// * `positions`: `[num_tokens]` (U32)
@@ -423,39 +418,8 @@ impl LlamaAttention {
     /// * `block_table`: `[batch_size, max_blocks_per_seq]` (U32) — page table
     /// * `max_seqlen_q` / `max_seqlen_k`: max sequence lengths in batch
     /// * `kv_cache`: the paged KV cache pool
-    pub unsafe fn forward(
-        &self,
-        hidden_states: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
-        max_seqlen_q: usize,
-        max_seqlen_k: usize,
-        kv_cache: &KvCachePool,
-        rotary: &RotaryCache,
-        device: &mut GpuDevice,
-    ) -> GpuTensor {
-        self.forward_owned(
-            hidden_states,
-            positions,
-            slot_mapping,
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
-            max_seqlen_q,
-            max_seqlen_k,
-            kv_cache,
-            rotary,
-            device,
-        )
-        .into_gpu_tensor()
-    }
-
-    /// Forward pass returning `OwnedTensor` (caching-allocator path).
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         hidden_states: GpuTensor,
         positions: GpuTensor,
@@ -475,19 +439,19 @@ impl LlamaAttention {
         let qkv = if let (Some(k_proj), Some(v_proj)) = (self.k_proj.as_ref(), self.v_proj.as_ref())
         {
             // Quantized: separate Q, K, V GEMMs → concat
-            let q_out = self.qkv_proj.forward_owned(
+            let q_out = self.qkv_proj.forward(
                 hidden_states,
                 &mut device.cublas,
                 &mut device.caching,
                 device.compute_stream,
             );
-            let k_out = k_proj.forward_owned(
+            let k_out = k_proj.forward(
                 hidden_states,
                 &mut device.cublas,
                 &mut device.caching,
                 device.compute_stream,
             );
-            let v_out = v_proj.forward_owned(
+            let v_out = v_proj.forward(
                 hidden_states,
                 &mut device.cublas,
                 &mut device.caching,
@@ -513,7 +477,7 @@ impl LlamaAttention {
             qkv
         } else {
             // Dense: single fused QKV GEMM
-            self.qkv_proj.forward_owned(
+            self.qkv_proj.forward(
                 hidden_states,
                 &mut device.cublas,
                 &mut device.caching,
@@ -612,7 +576,7 @@ impl LlamaAttention {
                 let attn_flat = attn_output
                     .as_gpu_tensor()
                     .reshape(&[num_tokens, self.q_size]);
-                let result = self.o_proj.forward_owned(
+                let result = self.o_proj.forward(
                     attn_flat,
                     &mut device.cublas,
                     &mut device.caching,
@@ -682,7 +646,7 @@ impl LlamaAttention {
         let attn_flat = attn_output
             .as_gpu_tensor()
             .reshape(&[num_tokens, self.q_size]);
-        let result = self.o_proj.forward_owned(
+        let result = self.o_proj.forward(
             attn_flat,
             &mut device.cublas,
             &mut device.caching,
@@ -736,7 +700,7 @@ impl LlamaDecoderLayer {
     ///
     /// Returns `(mlp_output: OwnedTensor, residual: OwnedTensor)`.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         hidden_states: OwnedTensor,
         residual: Option<OwnedTensor>,
@@ -783,7 +747,7 @@ impl LlamaDecoderLayer {
         };
 
         // Attention reads normed values from hidden_states buffer.
-        let attn_output = self.self_attn.forward_owned(
+        let attn_output = self.self_attn.forward(
             *normed, // GpuTensor copy — kernel reads from this buffer
             positions,
             slot_mapping,
@@ -817,7 +781,7 @@ impl LlamaDecoderLayer {
         // attn_output buffer now contains post-normed values.
 
         // MLP reads post-normed from attn_output buffer.
-        let mlp_output = self.mlp.forward_owned(*attn_output, device);
+        let mlp_output = self.mlp.forward(*attn_output, device);
         // attn_output consumed by MLP — free it.
         drop(attn_output);
 
@@ -845,17 +809,13 @@ pub struct LlamaModel {
 }
 
 impl LlamaModel {
-    /// Forward pass with paged attention.
+    /// Forward pass using caching allocator — zero D2D copies between layers.
     ///
-    /// * `input_ids`: `[num_tokens]` (U32 on GPU)
-    /// * `positions`: `[num_tokens]` (U32 on GPU)
-    /// * `slot_mapping`: `[num_tokens]` (I64) — slot indices for new tokens
-    /// * `cu_seqlens_q`: `[batch_size + 1]` (U32) — cumulative Q lengths
-    /// * `seqused_k`: `[batch_size]` (U32) — per-sequence K lengths
-    /// * `block_table`: `[batch_size, max_blocks_per_seq]` (U32)
-    /// * `kv_cache`: paged KV cache pool
+    /// This matches Python's PyTorch flow: intermediates are freed on drop,
+    /// `fused_add_rms_norm` mutates in-place, and only hidden_states + residual
+    /// survive between layers.
     ///
-    /// Returns hidden states `[num_tokens, hidden_size]`.
+    /// Returns hidden states `[num_tokens, hidden_size]` as OwnedTensor.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
@@ -869,41 +829,7 @@ impl LlamaModel {
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-    ) -> GpuTensor {
-        // Delegates to forward_owned (caching allocator, zero D2D copies).
-        self.forward_owned(
-            input_ids,
-            positions,
-            slot_mapping,
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
-            max_seqlen_q,
-            max_seqlen_k,
-            kv_cache,
-            device,
-        )
-    }
-
-    /// Forward pass using caching allocator — zero D2D copies between layers.
-    ///
-    /// This matches Python's PyTorch flow: intermediates are freed on drop,
-    /// `fused_add_rms_norm` mutates in-place, and only hidden_states + residual
-    /// survive between layers.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
-        &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
-        max_seqlen_q: usize,
-        max_seqlen_k: usize,
-        kv_cache: &KvCachePool,
-        device: &mut GpuDevice,
-    ) -> GpuTensor {
+    ) -> OwnedTensor {
         // Embedding lookup — owned, survives into first layer.
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
@@ -928,7 +854,7 @@ impl LlamaModel {
         let mut residual: Option<OwnedTensor> = None;
 
         for layer in self.layers.iter() {
-            let (hs, res) = layer.forward_owned(
+            let (hs, res) = layer.forward(
                 hidden_states,
                 residual,
                 positions,
@@ -962,7 +888,7 @@ impl LlamaModel {
         // Drop residual (frees the embedding/residual buffer).
         drop(residual);
         // Return hidden_states — caller owns this memory.
-        hidden_states.into_gpu_tensor()
+        hidden_states
     }
 }
 
@@ -1004,7 +930,7 @@ impl LlamaForCausalLM {
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
         last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
+    ) -> OwnedTensor {
         let hidden_states = self.model.forward(
             input_ids,
             positions,
@@ -1020,97 +946,38 @@ impl LlamaForCausalLM {
         // Gather only last-token hidden states before the expensive lm_head GEMM.
         let hidden_states = if let Some(indices) = last_token_indices {
             kernels::embedding_gather(
-                hidden_states,
+                hidden_states.as_gpu_tensor(),
                 indices,
                 &mut device.caching,
                 device.compute_stream,
             )
-            .into_gpu_tensor()
         } else {
             hidden_states
         };
         #[allow(unused_mut)]
         let mut logits = self.lm_head.forward(
-            hidden_states,
+            hidden_states.as_gpu_tensor(),
             &mut device.cublas,
             &mut device.caching,
             device.compute_stream,
         );
+        drop(hidden_states);
 
         // TP: all-gather logits (column parallel lm_head).
         #[cfg(feature = "nccl")]
         if let Some(ref group) = self.tp_group {
-            logits = group.all_gather(logits, &mut device.caching);
+            let gathered = group.all_gather(logits.as_gpu_tensor(), &mut device.caching);
+            drop(logits);
+            logits = gathered;
         }
 
         // Granite: scale logits by 1/logits_scaling.
         if self.logits_scaling != 1.0 {
-            kernels::scale_inplace(logits, 1.0 / self.logits_scaling, &device.cublas);
-        }
-
-        logits
-    }
-
-    /// Forward using caching allocator (zero D2D copies between layers).
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
-        &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
-        max_seqlen_q: usize,
-        max_seqlen_k: usize,
-        kv_cache: &KvCachePool,
-        device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
-        let hidden_states = self.model.forward_owned(
-            input_ids,
-            positions,
-            slot_mapping,
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
-            max_seqlen_q,
-            max_seqlen_k,
-            kv_cache,
-            device,
-        );
-
-        // Gather last-token hidden states.
-        let hidden_states = if let Some(indices) = last_token_indices {
-            let gathered = kernels::embedding_gather(
-                hidden_states,
-                indices,
-                &mut device.caching,
-                device.compute_stream,
+            kernels::scale_inplace(
+                logits.as_gpu_tensor(),
+                self.logits_scaling.recip(),
+                &device.cublas,
             );
-            gathered.into_gpu_tensor()
-        } else {
-            hidden_states
-        };
-
-        // lm_head: logits = hidden_states @ lm_head_weight^T
-        let logits = self.lm_head.forward_owned(
-            hidden_states,
-            &mut device.cublas,
-            &mut device.caching,
-            device.compute_stream,
-        );
-        #[allow(unused_mut)]
-        let mut logits = logits.into_gpu_tensor();
-
-        // TP: all-gather logits (column parallel lm_head — each rank has vocab shard).
-        #[cfg(feature = "nccl")]
-        if let Some(ref group) = self.tp_group {
-            logits = group.all_gather(logits, &mut device.caching);
-        }
-
-        if self.logits_scaling != 1.0 {
-            kernels::scale_inplace(logits, self.logits_scaling.recip(), &device.cublas);
         }
 
         logits
@@ -3114,7 +2981,7 @@ impl LlamaModel {
 
         // Run this stage's layers.
         for layer in self.layers.iter() {
-            let (hs, res) = layer.forward_owned(
+            let (hs, res) = layer.forward(
                 hidden_states,
                 residual,
                 positions,
@@ -3276,38 +3143,47 @@ impl LlamaForCausalLM {
             ForwardOutput::Intermediate { .. } => backbone_out,
             ForwardOutput::Logits(hidden_states) => {
                 // Last stage: lm_head projection.
-                let hidden_states = if let Some(indices) = last_token_indices {
-                    let gathered = kernels::embedding_gather(
+                let gathered = if let Some(indices) = last_token_indices {
+                    Some(kernels::embedding_gather(
                         hidden_states,
                         indices,
                         &mut device.caching,
                         device.compute_stream,
-                    );
-                    gathered.into_gpu_tensor()
+                    ))
+                } else {
+                    None
+                };
+                let hs_gpu = if let Some(ref g) = gathered {
+                    g.as_gpu_tensor()
                 } else {
                     hidden_states
                 };
 
-                let logits = self.lm_head.forward_owned(
-                    hidden_states,
+                #[allow(unused_mut)]
+                let mut logits = self.lm_head.forward(
+                    hs_gpu,
                     &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,
                 );
-                #[allow(unused_mut)]
-                let mut logits = logits.into_gpu_tensor();
 
                 // TP: all-gather logits.
                 #[cfg(feature = "nccl")]
                 if let Some(ref group) = self.tp_group {
-                    logits = group.all_gather(logits, &mut device.caching);
+                    let gathered = group.all_gather(logits.as_gpu_tensor(), &mut device.caching);
+                    drop(logits);
+                    logits = gathered;
                 }
 
                 if self.logits_scaling != 1.0 {
-                    kernels::scale_inplace(logits, self.logits_scaling.recip(), &device.cublas);
+                    kernels::scale_inplace(
+                        logits.as_gpu_tensor(),
+                        self.logits_scaling.recip(),
+                        &device.cublas,
+                    );
                 }
 
-                ForwardOutput::Logits(logits)
+                ForwardOutput::Logits(logits.into_gpu_tensor())
             }
         }
     }

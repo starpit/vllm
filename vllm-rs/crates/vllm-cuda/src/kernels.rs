@@ -1170,7 +1170,7 @@ pub unsafe fn fused_add_rms_norm(
     eps: f32,
     alloc: &mut CachingAllocator,
     stream: cudarc::driver::sys::CUstream,
-) -> (GpuTensor, GpuTensor) {
+) -> (OwnedTensor, GpuTensor) {
     // Allocate a copy of input for the normed output.
     let normed_buf = alloc.alloc_tensor(&[input.dim(0), input.dim(1)], input.dtype());
     crate::driver::memcpy_dtod_async(
@@ -1181,7 +1181,12 @@ pub unsafe fn fused_add_rms_norm(
     )
     .expect("fused_add_rms_norm: D2D copy failed");
 
-    fused_add_rms_norm_inplace(normed_buf.into_gpu_tensor(), residual, weight, eps, stream)
+    // Run in-place kernel on normed_buf (which is a copy of input).
+    let normed_gpu = normed_buf.as_gpu_tensor();
+    fused_add_rms_norm_inplace(normed_gpu, residual, weight, eps, stream);
+
+    // normed_buf now contains normed output, residual is updated in-place.
+    (normed_buf, residual)
 }
 
 // ---------------------------------------------------------------------------

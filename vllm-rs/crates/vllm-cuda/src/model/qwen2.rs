@@ -120,7 +120,7 @@ impl Qwen2ForCausalLM {
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
         last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
+    ) -> OwnedTensor {
         self.0.forward(
             input_ids,
             positions,
@@ -181,37 +181,6 @@ impl Qwen2ForCausalLM {
         self.0.forward_pp(
             input_ids,
             intermediate,
-            positions,
-            slot_mapping,
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
-            max_seqlen_q,
-            max_seqlen_k,
-            kv_cache,
-            device,
-            last_token_indices,
-        )
-    }
-
-    /// Forward using caching allocator (zero D2D copies between layers).
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
-        &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
-        max_seqlen_q: usize,
-        max_seqlen_k: usize,
-        kv_cache: &KvCachePool,
-        device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
-        self.0.forward_owned(
-            input_ids,
             positions,
             slot_mapping,
             cu_seqlens_q,

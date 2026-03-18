@@ -62,7 +62,7 @@ pub struct CommandRAttention {
 impl CommandRAttention {
     /// Forward pass with interleaved RoPE.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         hidden_states: GpuTensor,
         positions: GpuTensor,
@@ -83,19 +83,19 @@ impl CommandRAttention {
         let qkv = if let (Some(k_proj), Some(v_proj)) = (attn.k_proj.as_ref(), attn.v_proj.as_ref())
         {
             // Quantized: separate Q, K, V GEMMs → concat
-            let q_out = attn.qkv_proj.forward_owned(
+            let q_out = attn.qkv_proj.forward(
                 hidden_states,
                 &mut device.cublas,
                 &mut device.caching,
                 device.compute_stream,
             );
-            let k_out = k_proj.forward_owned(
+            let k_out = k_proj.forward(
                 hidden_states,
                 &mut device.cublas,
                 &mut device.caching,
                 device.compute_stream,
             );
-            let v_out = v_proj.forward_owned(
+            let v_out = v_proj.forward(
                 hidden_states,
                 &mut device.cublas,
                 &mut device.caching,
@@ -120,7 +120,7 @@ impl CommandRAttention {
             qkv
         } else {
             // Dense: single fused QKV GEMM
-            attn.qkv_proj.forward_owned(
+            attn.qkv_proj.forward(
                 hidden_states,
                 &mut device.cublas,
                 &mut device.caching,
@@ -228,7 +228,7 @@ impl CommandRAttention {
                 let attn_flat = attn_output
                     .as_gpu_tensor()
                     .reshape(&[num_tokens, attn.q_size]);
-                let result = attn.o_proj.forward_owned(
+                let result = attn.o_proj.forward(
                     attn_flat,
                     &mut device.cublas,
                     &mut device.caching,
@@ -288,7 +288,7 @@ impl CommandRAttention {
         let attn_flat = attn_output
             .as_gpu_tensor()
             .reshape(&[num_tokens, attn.q_size]);
-        let result = attn.o_proj.forward_owned(
+        let result = attn.o_proj.forward(
             attn_flat,
             &mut device.cublas,
             &mut device.caching,
@@ -328,7 +328,7 @@ impl CommandRDecoderLayer {
     ///
     /// Returns output hidden_states.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         hidden_states: OwnedTensor,
         positions: GpuTensor,
@@ -357,7 +357,7 @@ impl CommandRDecoderLayer {
         // attn and mlp will read from it before either writes.
         let normed_gpu = normed.as_gpu_tensor();
 
-        let attn_output = self.self_attn.forward_owned(
+        let attn_output = self.self_attn.forward(
             normed_gpu,
             positions,
             slot_mapping,
@@ -371,7 +371,7 @@ impl CommandRDecoderLayer {
             device,
         );
 
-        let mlp_output = self.mlp.forward_owned(normed_gpu, device);
+        let mlp_output = self.mlp.forward(normed_gpu, device);
         drop(normed); // free normed buffer
 
         // hidden_states = residual + attn_output + mlp_output
@@ -410,7 +410,7 @@ pub struct CommandRModel {
 impl CommandRModel {
     /// Forward pass with paged attention.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         input_ids: GpuTensor,
         positions: GpuTensor,
@@ -422,7 +422,7 @@ impl CommandRModel {
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-    ) -> GpuTensor {
+    ) -> OwnedTensor {
         // Embedding lookup.
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
@@ -434,7 +434,7 @@ impl CommandRModel {
         let mut hidden_states: OwnedTensor = hidden_states;
 
         for layer in self.layers.iter() {
-            hidden_states = layer.forward_owned(
+            hidden_states = layer.forward(
                 hidden_states,
                 positions,
                 slot_mapping,
@@ -458,7 +458,7 @@ impl CommandRModel {
             device.compute_stream,
         );
         drop(hidden_states);
-        normed.into_gpu_tensor()
+        normed
     }
 }
 
@@ -479,7 +479,7 @@ pub struct CommandRForCausalLM {
 impl CommandRForCausalLM {
     /// Forward pass: input_ids → logits.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         input_ids: GpuTensor,
         positions: GpuTensor,
@@ -492,8 +492,8 @@ impl CommandRForCausalLM {
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
         last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
-        let hidden_states = self.model.forward_owned(
+    ) -> OwnedTensor {
+        let hidden_states = self.model.forward(
             input_ids,
             positions,
             slot_mapping,
@@ -508,13 +508,12 @@ impl CommandRForCausalLM {
 
         // Gather last-token hidden states.
         let hidden_states = if let Some(indices) = last_token_indices {
-            let gathered = kernels::embedding_gather(
-                hidden_states,
+            kernels::embedding_gather(
+                *hidden_states,
                 indices,
                 &mut device.caching,
                 device.compute_stream,
-            );
-            gathered.into_gpu_tensor()
+            )
         } else {
             hidden_states
         };
@@ -522,11 +521,11 @@ impl CommandRForCausalLM {
         // lm_head: logits = hidden_states @ lm_head_weight^T
         let logits = self
             .lm_head
-            .forward(hidden_states, &mut device.cublas, &mut device.caching);
+            .forward(*hidden_states, &mut device.cublas, &mut device.caching);
 
         // Apply logit scaling.
         if self.logit_scale != 1.0 {
-            kernels::scale_inplace(logits, self.logit_scale, &device.cublas);
+            kernels::scale_inplace(logits.as_gpu_tensor(), self.logit_scale, &device.cublas);
         }
 
         logits

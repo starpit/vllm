@@ -416,7 +416,7 @@ impl DeepSeekV2Attention {
     ///
     /// Matches Python `DeepseekV2Attention.forward` (non-absorbed path).
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         hidden_states: GpuTensor,
         positions: GpuTensor,
@@ -438,8 +438,7 @@ impl DeepSeekV2Attention {
         let q_proj_out =
             if let (Some(q_a_proj), Some(q_a_ln)) = (&self.q_a_proj, &self.q_a_layernorm) {
                 // q = q_a_proj(hidden_states)  → [num_tokens, q_lora_rank]
-                let q_a =
-                    q_a_proj.forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+                let q_a = q_a_proj.forward(hidden_states, &mut device.cublas, &mut device.caching);
                 // q = q_a_layernorm(q_a) → [num_tokens, q_lora_rank]
                 let q_normed = kernels::rms_norm(
                     q_a.as_gpu_tensor(),
@@ -450,7 +449,7 @@ impl DeepSeekV2Attention {
                 );
                 drop(q_a);
                 // q = q_b_proj(q_normed) → [num_tokens, num_heads * qk_head_dim]
-                let q = self.q_b_proj.forward_owned(
+                let q = self.q_b_proj.forward(
                     q_normed.as_gpu_tensor(),
                     &mut device.cublas,
                     &mut device.caching,
@@ -460,7 +459,7 @@ impl DeepSeekV2Attention {
             } else {
                 // Direct: q_proj(hidden_states) → [num_tokens, num_heads * qk_head_dim]
                 self.q_b_proj
-                    .forward_owned(hidden_states, &mut device.cublas, &mut device.caching)
+                    .forward(hidden_states, &mut device.cublas, &mut device.caching)
             };
 
         // Reshape Q to [num_tokens, num_heads, qk_head_dim]
@@ -473,11 +472,9 @@ impl DeepSeekV2Attention {
 
         // ===== KV path =====
         // kv_a_proj_with_mqa(hidden_states) → [num_tokens, kv_lora_rank + rope_dim]
-        let kv_a_out = self.kv_a_proj_with_mqa.forward_owned(
-            hidden_states,
-            &mut device.cublas,
-            &mut device.caching,
-        );
+        let kv_a_out =
+            self.kv_a_proj_with_mqa
+                .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
         // Split into latent [kv_lora_rank] and k_pe_compressed [rope_dim]
         // latent_cache = kv_a_out (we keep both parts, split is virtual)
@@ -517,7 +514,7 @@ impl DeepSeekV2Attention {
         drop(kv_a_latent);
 
         // kv_b_proj(kv_a_normed) → [num_tokens, num_heads * (nope_dim + v_head_dim)]
-        let kv_b_out = self.kv_b_proj.forward_owned(
+        let kv_b_out = self.kv_b_proj.forward(
             kv_a_normed.as_gpu_tensor(),
             &mut device.cublas,
             &mut device.caching,
@@ -694,7 +691,7 @@ impl DeepSeekV2Attention {
         };
 
         // o_proj: [num_tokens, num_heads * v_head_dim] → [num_tokens, hidden_size]
-        let result = self.o_proj.forward_owned(
+        let result = self.o_proj.forward(
             o_input.as_gpu_tensor(),
             &mut device.cublas,
             &mut device.caching,
@@ -730,15 +727,11 @@ pub struct DeepSeekV2MoE {
 }
 
 impl DeepSeekV2MoE {
-    pub unsafe fn forward_owned(
-        &self,
-        hidden_states: GpuTensor,
-        device: &mut GpuDevice,
-    ) -> OwnedTensor {
+    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
         let stream = device.compute_stream;
 
         // MoE path
-        let moe_out = self.moe.forward_owned(hidden_states, device);
+        let moe_out = self.moe.forward(hidden_states, device);
 
         // Scale routed output by routed_scaling_factor (Python: final_hidden_states *= routed_scaling_factor)
         if self.routed_scaling_factor != 1.0 {
@@ -750,11 +743,9 @@ impl DeepSeekV2MoE {
         }
 
         // Shared expert path (unconditional, no sigmoid gate)
-        let shared_gu = self.shared_gate_up.forward_owned(
-            hidden_states,
-            &mut device.cublas,
-            &mut device.caching,
-        );
+        let shared_gu =
+            self.shared_gate_up
+                .forward(hidden_states, &mut device.cublas, &mut device.caching);
         let shared_activated = kernels::silu_and_mul_fused(
             shared_gu.as_gpu_tensor(),
             self.shared_intermediate_size,
@@ -763,7 +754,7 @@ impl DeepSeekV2MoE {
         );
         drop(shared_gu);
 
-        let shared_out = self.shared_down.forward_owned(
+        let shared_out = self.shared_down.forward(
             shared_activated.as_gpu_tensor(),
             &mut device.cublas,
             &mut device.caching,
@@ -787,14 +778,10 @@ pub struct DeepSeekV2Fp8MoE {
 }
 
 impl DeepSeekV2Fp8MoE {
-    pub unsafe fn forward_owned(
-        &self,
-        hidden_states: GpuTensor,
-        device: &mut GpuDevice,
-    ) -> OwnedTensor {
+    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
         let stream = device.compute_stream;
 
-        let moe_out = self.moe.forward_owned(hidden_states, device);
+        let moe_out = self.moe.forward(hidden_states, device);
 
         if self.routed_scaling_factor != 1.0 {
             kernels::scale_inplace(
@@ -804,11 +791,9 @@ impl DeepSeekV2Fp8MoE {
             );
         }
 
-        let shared_gu = self.shared_gate_up.forward_owned(
-            hidden_states,
-            &mut device.cublas,
-            &mut device.caching,
-        );
+        let shared_gu =
+            self.shared_gate_up
+                .forward(hidden_states, &mut device.cublas, &mut device.caching);
         let shared_activated = kernels::silu_and_mul_fused(
             shared_gu.as_gpu_tensor(),
             self.shared_intermediate_size,
@@ -817,7 +802,7 @@ impl DeepSeekV2Fp8MoE {
         );
         drop(shared_gu);
 
-        let shared_out = self.shared_down.forward_owned(
+        let shared_out = self.shared_down.forward(
             shared_activated.as_gpu_tensor(),
             &mut device.cublas,
             &mut device.caching,
@@ -842,15 +827,11 @@ enum DeepSeekV2Mlp {
 }
 
 impl DeepSeekV2Mlp {
-    unsafe fn forward_owned(
-        &self,
-        hidden_states: GpuTensor,
-        device: &mut GpuDevice,
-    ) -> OwnedTensor {
+    unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
         match self {
-            Self::Dense(mlp) => mlp.forward_owned(hidden_states, device),
-            Self::MoE(moe) => moe.forward_owned(hidden_states, device),
-            Self::Fp8MoE(moe) => moe.forward_owned(hidden_states, device),
+            Self::Dense(mlp) => mlp.forward(hidden_states, device),
+            Self::MoE(moe) => moe.forward(hidden_states, device),
+            Self::Fp8MoE(moe) => moe.forward(hidden_states, device),
         }
     }
 }
@@ -1116,7 +1097,7 @@ impl DeepSeekV2DecoderLayer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         hidden_states: OwnedTensor,
         residual: Option<OwnedTensor>,
@@ -1153,7 +1134,7 @@ impl DeepSeekV2DecoderLayer {
             (normed, hidden_states)
         };
 
-        let attn_output = self.self_attn.forward_owned(
+        let attn_output = self.self_attn.forward(
             *normed,
             positions,
             slot_mapping,
@@ -1177,7 +1158,7 @@ impl DeepSeekV2DecoderLayer {
             device.compute_stream,
         );
 
-        let mlp_output = self.mlp.forward_owned(*attn_output, device);
+        let mlp_output = self.mlp.forward(*attn_output, device);
         drop(attn_output);
 
         (mlp_output, residual)
@@ -1250,7 +1231,7 @@ impl DeepSeekV2Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         input_ids: GpuTensor,
         positions: GpuTensor,
@@ -1262,7 +1243,7 @@ impl DeepSeekV2Model {
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-    ) -> GpuTensor {
+    ) -> OwnedTensor {
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
             input_ids,
@@ -1274,7 +1255,7 @@ impl DeepSeekV2Model {
         let mut residual: Option<OwnedTensor> = None;
 
         for layer in &self.layers {
-            let (hs, res) = layer.forward_owned(
+            let (hs, res) = layer.forward(
                 hidden_states,
                 residual,
                 positions,
@@ -1302,7 +1283,7 @@ impl DeepSeekV2Model {
             device.compute_stream,
         );
         drop(residual);
-        hidden_states.into_gpu_tensor()
+        hidden_states
     }
 }
 
@@ -1341,8 +1322,8 @@ impl DeepSeekV2ForCausalLM {
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
         last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
-        let hidden_states = self.model.forward_owned(
+    ) -> OwnedTensor {
+        let hidden_states = self.model.forward(
             input_ids,
             positions,
             slot_mapping,
@@ -1357,18 +1338,17 @@ impl DeepSeekV2ForCausalLM {
 
         let hidden_states = if let Some(indices) = last_token_indices {
             kernels::embedding_gather(
-                hidden_states,
+                *hidden_states,
                 indices,
                 &mut device.caching,
                 device.compute_stream,
             )
-            .into_gpu_tensor()
         } else {
             hidden_states
         };
 
         self.lm_head
-            .forward(hidden_states, &mut device.cublas, &mut device.caching)
+            .forward(*hidden_states, &mut device.cublas, &mut device.caching)
     }
 
     /// Set TP group on all layers.

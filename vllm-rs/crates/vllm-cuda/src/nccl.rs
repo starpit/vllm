@@ -12,7 +12,7 @@ use anyhow::Result;
 use cudarc::driver::sys::CUstream;
 use cudarc::nccl::{result as nccl_result, sys as nccl_sys};
 
-use crate::alloc::CachingAllocator;
+use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::dtype::DType;
 use crate::tensor::GpuTensor;
 
@@ -191,7 +191,11 @@ impl NcclGroup {
     /// output is `[world_size * dim0, ...]`.
     ///
     /// Allocates output from `alloc`. Non-blocking on the host.
-    pub unsafe fn all_gather(&self, tensor: GpuTensor, alloc: &mut CachingAllocator) -> GpuTensor {
+    pub unsafe fn all_gather(
+        &self,
+        tensor: GpuTensor,
+        alloc: &mut CachingAllocator,
+    ) -> OwnedTensor {
         let numel = tensor.numel();
         let nccl_dtype =
             gpu_dtype_to_nccl(tensor.dtype()).expect("unsupported dtype for NCCL all_gather");
@@ -213,7 +217,7 @@ impl NcclGroup {
         )
         .expect("ncclAllGather failed");
 
-        out.into_gpu_tensor()
+        out
     }
 }
 

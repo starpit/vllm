@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use cudarc::driver::sys::{CUgraphExec, CUstream};
 
+use crate::alloc::OwnedTensor;
 use crate::device::GpuDevice;
 use crate::driver;
 use crate::dtype::DType;
@@ -269,7 +270,7 @@ impl CudaGraphRunner {
         mut forward_fn: F,
     ) -> Result<()>
     where
-        F: FnMut(InputTensors, &mut GpuDevice) -> GpuTensor,
+        F: FnMut(InputTensors, &mut GpuDevice) -> OwnedTensor,
     {
         assert!(batch_size <= self.max_batch);
 
@@ -278,11 +279,14 @@ impl CudaGraphRunner {
         // Warm up: populates cuBLAS plans and fills the pool.
         // The caller must have already called begin_allocate_to_pool().
         let warmup_logits = forward_fn(self.input_tensors(batch_size), device);
-        let warmup_argmax =
-            kernels::argmax_batched(warmup_logits, &mut device.caching, device.compute_stream);
+        let warmup_argmax = kernels::argmax_batched(
+            warmup_logits.as_gpu_tensor(),
+            &mut device.caching,
+            device.compute_stream,
+        );
         driver::stream_synchronize(device.compute_stream)?;
         drop(warmup_argmax);
-        device.caching.free_leaked_blocks();
+        drop(warmup_logits);
         let inputs = self.input_tensors(batch_size);
 
         let logits_bytes = batch_size * self.vocab_size * self.dtype.size_bytes();
@@ -290,12 +294,15 @@ impl CudaGraphRunner {
 
         driver::stream_begin_capture(device.compute_stream)?;
         let logits = forward_fn(inputs, device);
-        let argmax_out =
-            kernels::argmax_batched(logits, &mut device.caching, device.compute_stream);
+        let argmax_out = kernels::argmax_batched(
+            logits.as_gpu_tensor(),
+            &mut device.caching,
+            device.compute_stream,
+        );
         // Copy logits and argmax into shared buffers (recorded in graph).
         driver::memcpy_dtod_async(
             self.shared_logits,
-            logits.raw_ptr() as *const u8,
+            logits.as_gpu_tensor().raw_ptr() as *const u8,
             logits_bytes,
             device.compute_stream,
         )?;
@@ -316,9 +323,8 @@ impl CudaGraphRunner {
 
         let exec = driver::graph_instantiate(graph)?;
         driver::graph_destroy(graph)?;
-
-        // Free all leaked blocks from this capture — shared buffers are outside the pool.
-        device.caching.free_leaked_blocks();
+        drop(logits);
+        drop(argmax_out);
 
         let captured = CapturedGraph { exec, batch_size };
         self.graphs.insert(batch_size, captured);
@@ -547,15 +553,6 @@ impl CudaGraphRunner {
         sizes.sort();
         sizes
     }
-
-    /// Get all GPU addresses that must be kept alive (not freed).
-    /// With shared buffers, only the two shared output pointers need pinning.
-    pub fn pinned_addresses(&self) -> Vec<*const u8> {
-        vec![
-            self.shared_logits as *const u8,
-            self.shared_argmax as *const u8,
-        ]
-    }
 }
 
 /// Output from a graph replay.
@@ -705,7 +702,7 @@ impl PrefillGraphRunner {
         mut forward_fn: F,
     ) -> Result<()>
     where
-        F: FnMut(PrefillInputTensors, &mut GpuDevice) -> GpuTensor,
+        F: FnMut(PrefillInputTensors, &mut GpuDevice) -> OwnedTensor,
     {
         assert!(num_tokens <= self.max_tokens);
 
@@ -714,11 +711,14 @@ impl PrefillGraphRunner {
         // Warm up: fills the pool. The caller manages begin/end_allocate_to_pool.
         let inputs = self.input_tensors(num_tokens);
         let warmup_logits = forward_fn(inputs, device);
-        let warmup_argmax =
-            kernels::argmax_batched(warmup_logits, &mut device.caching, device.compute_stream);
+        let warmup_argmax = kernels::argmax_batched(
+            warmup_logits.as_gpu_tensor(),
+            &mut device.caching,
+            device.compute_stream,
+        );
         driver::stream_synchronize(device.compute_stream)?;
         drop(warmup_argmax);
-        device.caching.free_leaked_blocks();
+        drop(warmup_logits);
         let inputs = self.input_tensors(num_tokens);
 
         let logits_bytes = self.vocab_size * self.dtype.size_bytes(); // [1, vocab]
@@ -726,12 +726,15 @@ impl PrefillGraphRunner {
 
         driver::stream_begin_capture(device.compute_stream)?;
         let logits = forward_fn(inputs, device);
-        let argmax_out =
-            kernels::argmax_batched(logits, &mut device.caching, device.compute_stream);
+        let argmax_out = kernels::argmax_batched(
+            logits.as_gpu_tensor(),
+            &mut device.caching,
+            device.compute_stream,
+        );
         // Copy into shared buffers (recorded in graph).
         driver::memcpy_dtod_async(
             self.shared_logits,
-            logits.raw_ptr() as *const u8,
+            logits.as_gpu_tensor().raw_ptr() as *const u8,
             logits_bytes,
             device.compute_stream,
         )?;
@@ -745,9 +748,8 @@ impl PrefillGraphRunner {
 
         let exec = driver::graph_instantiate(graph)?;
         driver::graph_destroy(graph)?;
-
-        // Free all leaked blocks — shared buffers are outside the pool.
-        device.caching.free_leaked_blocks();
+        drop(logits);
+        drop(argmax_out);
 
         self.graphs
             .insert(num_tokens, CapturedPrefillGraph { exec, num_tokens });

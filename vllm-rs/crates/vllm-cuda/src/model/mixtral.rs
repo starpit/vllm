@@ -81,15 +81,11 @@ enum MixtralMoE {
 }
 
 impl MixtralMoE {
-    unsafe fn forward_owned(
-        &self,
-        hidden_states: GpuTensor,
-        device: &mut GpuDevice,
-    ) -> OwnedTensor {
+    unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
         match self {
-            Self::Dense(moe) => moe.forward_owned(hidden_states, device),
-            Self::Quantized(moe) => moe.forward_owned(hidden_states, device),
-            Self::Fp8(moe) => moe.forward_owned(hidden_states, device),
+            Self::Dense(moe) => moe.forward(hidden_states, device),
+            Self::Quantized(moe) => moe.forward(hidden_states, device),
+            Self::Fp8(moe) => moe.forward(hidden_states, device),
         }
     }
 }
@@ -402,7 +398,7 @@ impl MixtralDecoderLayer {
 
     /// Forward pass — identical to LlamaDecoderLayer but with MoE MLP.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         hidden_states: OwnedTensor,
         residual: Option<OwnedTensor>,
@@ -441,7 +437,7 @@ impl MixtralDecoderLayer {
         };
 
         // Attention.
-        let attn_output = self.self_attn.forward_owned(
+        let attn_output = self.self_attn.forward(
             *normed,
             positions,
             slot_mapping,
@@ -467,7 +463,7 @@ impl MixtralDecoderLayer {
         );
 
         // MoE MLP.
-        let mlp_output = self.block_sparse_moe.forward_owned(*attn_output, device);
+        let mlp_output = self.block_sparse_moe.forward(*attn_output, device);
         drop(attn_output);
 
         (mlp_output, residual)
@@ -528,7 +524,7 @@ impl MixtralModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         input_ids: GpuTensor,
         positions: GpuTensor,
@@ -540,7 +536,7 @@ impl MixtralModel {
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-    ) -> GpuTensor {
+    ) -> OwnedTensor {
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
             input_ids,
@@ -552,7 +548,7 @@ impl MixtralModel {
         let mut residual: Option<OwnedTensor> = None;
 
         for layer in &self.layers {
-            let (hs, res) = layer.forward_owned(
+            let (hs, res) = layer.forward(
                 hidden_states,
                 residual,
                 positions,
@@ -580,7 +576,7 @@ impl MixtralModel {
             device.compute_stream,
         );
         drop(residual);
-        hidden_states.into_gpu_tensor()
+        hidden_states
     }
 }
 
@@ -729,8 +725,8 @@ impl MixtralForCausalLM {
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
         last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
-        let hidden_states = self.model.forward_owned(
+    ) -> OwnedTensor {
+        let hidden_states = self.model.forward(
             input_ids,
             positions,
             slot_mapping,
@@ -745,18 +741,17 @@ impl MixtralForCausalLM {
 
         let hidden_states = if let Some(indices) = last_token_indices {
             kernels::embedding_gather(
-                hidden_states,
+                *hidden_states,
                 indices,
                 &mut device.caching,
                 device.compute_stream,
             )
-            .into_gpu_tensor()
         } else {
             hidden_states
         };
 
         self.lm_head
-            .forward(hidden_states, &mut device.cublas, &mut device.caching)
+            .forward(*hidden_states, &mut device.cublas, &mut device.caching)
     }
 }
 

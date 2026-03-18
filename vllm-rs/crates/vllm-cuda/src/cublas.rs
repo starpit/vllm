@@ -311,40 +311,6 @@ impl CublasHandle {
         a: GpuTensor,
         b: GpuTensor,
         alloc: &mut CachingAllocator,
-    ) -> GpuTensor {
-        self.gemm_owned(a, b, alloc).into_gpu_tensor()
-    }
-
-    /// GEMM with fused bias add: out = A @ B^T + bias
-    ///
-    /// Uses cublasLt with `CUBLASLT_EPILOGUE_BIAS` to fuse the bias add into
-    /// the GEMM kernel — zero extra kernel launches, zero extra memory traffic.
-    ///
-    /// - `a`: `[M, K]` row-major (activations)
-    /// - `b`: `[N, K]` row-major (weight, transposed internally)
-    /// - `bias`: `[N]` (broadcast along M dimension)
-    /// - Returns: `[M, N]` allocated from `arena`
-    ///
-    /// # Safety
-    /// All tensors must be valid GPU memory with compatible dtypes.
-    pub unsafe fn gemm_bias(
-        &mut self,
-        a: GpuTensor,
-        b: GpuTensor,
-        bias: GpuTensor,
-        alloc: &mut CachingAllocator,
-    ) -> GpuTensor {
-        self.gemm_bias_owned(a, b, bias, alloc).into_gpu_tensor()
-    }
-
-    /// GEMM returning `OwnedTensor` allocated from caching allocator.
-    ///
-    /// Same semantics as `gemm()` but memory is freed on drop.
-    pub unsafe fn gemm_owned(
-        &mut self,
-        a: GpuTensor,
-        b: GpuTensor,
-        alloc: &mut CachingAllocator,
     ) -> OwnedTensor {
         debug_assert_eq!(a.ndim(), 2);
         debug_assert_eq!(b.ndim(), 2);
@@ -394,8 +360,11 @@ impl CublasHandle {
         out
     }
 
-    /// GEMM with fused bias add, returning `OwnedTensor`.
-    pub unsafe fn gemm_bias_owned(
+    /// GEMM with fused bias add: out = A @ B^T + bias
+    ///
+    /// Uses cublasLt with `CUBLASLT_EPILOGUE_BIAS` to fuse the bias add into
+    /// the GEMM kernel — zero extra kernel launches, zero extra memory traffic.
+    pub unsafe fn gemm_bias(
         &mut self,
         a: GpuTensor,
         b: GpuTensor,
@@ -472,7 +441,7 @@ impl CublasHandle {
     ///
     /// # Safety
     /// `a` and `b` must be valid GPU tensors with compatible dtypes and shapes.
-    pub unsafe fn gemm_owned_nt(
+    pub unsafe fn gemm_nt(
         &mut self,
         a: GpuTensor,
         b: GpuTensor,

@@ -213,10 +213,10 @@ impl CudaModel {
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-    ) -> GpuTensor {
+    ) -> vllm_cuda::OwnedTensor {
         match self {
             Self::Llama(m) => unsafe {
-                m.model.forward_owned(
+                m.model.forward(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -230,7 +230,7 @@ impl CudaModel {
                 )
             },
             Self::Qwen2(m) => unsafe {
-                m.0.model.forward_owned(
+                m.0.model.forward(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -244,7 +244,7 @@ impl CudaModel {
                 )
             },
             Self::Gemma2(m) => unsafe {
-                m.model.forward_owned(
+                m.model.forward(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -258,7 +258,7 @@ impl CudaModel {
                 )
             },
             Self::Gemma3(m) => unsafe {
-                m.model.forward_owned(
+                m.model.forward(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -272,7 +272,7 @@ impl CudaModel {
                 )
             },
             Self::Mixtral(m) => unsafe {
-                m.model.forward_owned(
+                m.model.forward(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -286,7 +286,7 @@ impl CudaModel {
                 )
             },
             Self::Qwen2Moe(m) => unsafe {
-                m.model.forward_owned(
+                m.model.forward(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -300,7 +300,7 @@ impl CudaModel {
                 )
             },
             Self::Qwen3Moe(m) => unsafe {
-                m.model.forward_owned(
+                m.model.forward(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -314,7 +314,7 @@ impl CudaModel {
                 )
             },
             Self::CommandR(m) => unsafe {
-                m.model.forward_owned(
+                m.model.forward(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -328,10 +328,10 @@ impl CudaModel {
                 )
             },
             Self::Qwen3Next(_) => {
-                panic!("Qwen3Next: use forward_owned with GDN context");
+                panic!("Qwen3Next: use forward with GDN context");
             }
             Self::DeepSeekV2(m) => unsafe {
-                m.model.forward_owned(
+                m.model.forward(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -347,11 +347,9 @@ impl CudaModel {
         }
     }
 
-    /// Run forward pass, returning logits `[num_reqs, vocab_size]`.
-    ///
-    /// # Safety
-    /// All GpuTensors must be valid. CUDA context must be current.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    /// Forward using caching allocator (zero D2D copies between layers).
+    /// Returns an `OwnedTensor` whose drop frees the logits allocation.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn forward(
         &self,
         input_ids: GpuTensor,
@@ -365,7 +363,7 @@ impl CudaModel {
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
         last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
+    ) -> vllm_cuda::OwnedTensor {
         match self {
             Self::Llama(m) => unsafe {
                 m.forward(
@@ -398,7 +396,7 @@ impl CudaModel {
                 )
             },
             Self::Gemma2(m) => unsafe {
-                m.forward_owned(
+                m.forward(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -413,7 +411,7 @@ impl CudaModel {
                 )
             },
             Self::Gemma3(m) => unsafe {
-                m.forward_owned(
+                m.forward(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -473,165 +471,7 @@ impl CudaModel {
                 )
             },
             Self::CommandR(m) => unsafe {
-                m.forward_owned(
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                    last_token_indices,
-                )
-            },
-            Self::Qwen3Next(_) => {
-                panic!("Qwen3Next: use forward_qwen3_next directly");
-            }
-            Self::DeepSeekV2(m) => unsafe {
                 m.forward(
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                    last_token_indices,
-                )
-            },
-        }
-    }
-
-    /// Forward using caching allocator (zero D2D copies between layers).
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn forward_owned(
-        &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
-        max_seqlen_q: usize,
-        max_seqlen_k: usize,
-        kv_cache: &KvCachePool,
-        device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
-        match self {
-            Self::Llama(m) => unsafe {
-                m.forward_owned(
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                    last_token_indices,
-                )
-            },
-            Self::Qwen2(m) => unsafe {
-                m.forward_owned(
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                    last_token_indices,
-                )
-            },
-            Self::Gemma2(m) => unsafe {
-                m.forward_owned(
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                    last_token_indices,
-                )
-            },
-            Self::Gemma3(m) => unsafe {
-                m.forward_owned(
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                    last_token_indices,
-                )
-            },
-            Self::Mixtral(m) => unsafe {
-                m.forward(
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                    last_token_indices,
-                )
-            },
-            Self::Qwen2Moe(m) => unsafe {
-                m.forward(
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                    last_token_indices,
-                )
-            },
-            Self::Qwen3Moe(m) => unsafe {
-                m.forward(
-                    input_ids,
-                    positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    kv_cache,
-                    device,
-                    last_token_indices,
-                )
-            },
-            Self::CommandR(m) => unsafe {
-                m.forward_owned(
                     input_ids,
                     positions,
                     slot_mapping,
@@ -685,7 +525,7 @@ impl CudaModel {
         num_seqs: usize,
         device: &mut GpuDevice,
         last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
+    ) -> vllm_cuda::OwnedTensor {
         match self {
             Self::Qwen3Next(m) => unsafe {
                 m.forward(
@@ -4323,7 +4163,7 @@ impl Worker for CudaWorker {
 
         // Run the forward pass to warm up cuBLAS and measure peak memory.
         unsafe {
-            let _ = model.forward_owned(
+            let _ = model.forward(
                 dummy_ids,
                 dummy_pos,
                 dummy_slots,
@@ -4350,7 +4190,6 @@ impl Worker for CudaWorker {
         // return segments to the driver so cuMemGetInfo reflects only permanent
         // allocations (cuBLAS workspace, NCCL, etc.).
         drop(dummy_kv);
-        unsafe { device.caching.free_leaked_blocks() };
         device.caching.trim();
 
         // non_torch_increase = memory permanently held outside the caching
@@ -4520,7 +4359,7 @@ impl Worker for CudaWorker {
 
             let result = unsafe {
                 runner.capture(bs, device, |inputs, dev| {
-                    model_ref.forward_owned(
+                    model_ref.forward(
                         inputs.input_ids,
                         inputs.positions,
                         inputs.slot_mapping,
@@ -4596,7 +4435,7 @@ impl Worker for CudaWorker {
 
                         let result = unsafe {
                             prefill_runner.capture(num_tokens, device, |inputs, dev| {
-                                model_ref.forward_owned(
+                                model_ref.forward(
                                     inputs.input_ids,
                                     inputs.positions,
                                     inputs.slot_mapping,
@@ -4851,12 +4690,10 @@ impl Worker for CudaWorker {
                 )
             };
 
-            // Pool + normalize.
-            let embedding = Self::pool_and_normalize(hidden_states, num_tokens, strategy, device)?;
+            // Pool + normalize. Dereference OwnedTensor → GpuTensor (Copy).
+            let embedding = Self::pool_and_normalize(*hidden_states, num_tokens, strategy, device)?;
             results.push(embedding);
-
-            // Free leaked tensors from this iteration.
-            unsafe { device.caching.free_leaked_blocks() };
+            // OwnedTensor dropped here — memory returns to caching allocator.
         }
 
         Ok(results)
@@ -5086,15 +4923,6 @@ impl CudaWorker {
                 // Async D2H — enqueue on transfer stream, don't block.
                 let buf_idx = stg.token_buf_idx;
                 Self::d2h_token_ids_async(stg, buf_idx, &replay_out.token_ids, num_active, device)?;
-
-                // Free leaked GPU blocks after graph launch (overlaps with GPU).
-                {
-                    let mut keep: Vec<*const u8> = Vec::new();
-                    if let Some(ref runner) = self.graph_runner {
-                        keep.extend(runner.pinned_addresses());
-                    }
-                    unsafe { device.caching.free_leaked_blocks_except(&keep) };
-                }
 
                 // NOW resolve the pending commit from the previous step.
                 // The GPU is running step N, so this CPU work overlaps with it.
@@ -5663,7 +5491,7 @@ impl CudaWorker {
                 };
 
                 unsafe {
-                    model.forward_owned(
+                    model.forward(
                         gpu_input_ids,
                         gpu_positions,
                         slot_mapping,
@@ -5713,9 +5541,9 @@ impl CudaWorker {
 
             // Drop the sub-logits so their memory returns to the caching allocator.
             // (decode_logits is a view into graph output — not owned. prefill_logits is
-            // from forward_owned, also a view. merged_owned keeps the merged allocation.)
+            // an OwnedTensor from forward(). merged_owned keeps the merged allocation.)
             let _ = decode_logits;
-            let _ = prefill_logits;
+            drop(prefill_logits);
 
             // Fall through to sampling with merged logits.
             let logits = merged;
@@ -5973,7 +5801,9 @@ impl CudaWorker {
         }
 
         // Non-greedy graph path or eager path: need separate sampling.
-        let logits = if use_graph {
+        // `_logits_owned` keeps the OwnedTensor alive for eager-forward paths
+        // so the GPU memory backing `logits` survives until sampling completes.
+        let (_logits_owned, logits) = if use_graph {
             // CUDA graph replay (non-greedy: in-graph argmax result is
             // discarded; we re-sample with temperature on the logits).
             let graph_bs = graph_bs.unwrap();
@@ -6138,11 +5968,12 @@ impl CudaWorker {
             self.graph_metadata_valid = true;
 
             // Slice logits to only the real requests (discard padded rows).
-            if graph_bs > num_reqs {
+            let logits = if graph_bs > num_reqs {
                 replay_out.logits.narrow_dim0(0, num_reqs)
             } else {
                 replay_out.logits
-            }
+            };
+            (None, logits)
         } else {
             // Non-decode path: try prefill graph, fall back to eager.
             self.last_graph_batch_size = None;
@@ -6209,7 +6040,7 @@ impl CudaWorker {
                     ExecutorError::WorkerExecution(format!("prefill graph replay: {e}"))
                 })?;
 
-                replay_out.logits
+                (None, replay_out.logits)
             } else {
                 // Eager forward path (multi-request prefill or uncaptured size).
                 // Caching allocator: no reset needed — tensors freed on drop.
@@ -6294,7 +6125,7 @@ impl CudaWorker {
 
                     let (gdn_state_indices, gdn_cu_seqlens, num_seqs) =
                         Self::build_gdn_tensors(meta, device)?;
-                    unsafe {
+                    let logits = unsafe {
                         model.forward_qwen3_next(
                             gpu_input_ids,
                             gpu_positions,
@@ -6312,7 +6143,9 @@ impl CudaWorker {
                             device,
                             last_token_indices,
                         )
-                    }
+                    };
+                    let logits_gpu = *logits;
+                    (Some(logits), logits_gpu)
                 } else if pp_active {
                     // PP last stage: use forward_pp with received intermediates.
                     let input_ids = if self.pp_config.unwrap().is_first_stage() {
@@ -6336,15 +6169,16 @@ impl CudaWorker {
                             last_token_indices,
                         )
                     };
-                    match result {
+                    let logits = match result {
                         vllm_cuda::model::llama::ForwardOutput::Logits(t) => t,
                         vllm_cuda::model::llama::ForwardOutput::Intermediate { .. } => {
                             unreachable!("last PP stage should return Logits");
                         }
-                    }
+                    };
+                    (None, logits)
                 } else {
-                    unsafe {
-                        model.forward_owned(
+                    let owned = unsafe {
+                        model.forward(
                             gpu_input_ids,
                             gpu_positions,
                             slot_mapping,
@@ -6357,7 +6191,9 @@ impl CudaWorker {
                             device,
                             last_token_indices,
                         )
-                    }
+                    };
+                    let logits = *owned;
+                    (Some(owned), logits)
                 }
             }
         };
@@ -6379,18 +6215,9 @@ impl CudaWorker {
             }
         } */
 
-        // Free leaked GPU blocks AFTER graph/forward launch, overlapping with GPU execution.
-        // This saves ~200µs per decode step that was previously blocking before graph launch.
-        // IMPORTANT: keep the logits pointer alive — it was "leaked" by forward_owned's
-        // into_gpu_tensor() and must survive until sampling completes.
-        {
-            let mut keep: Vec<*const u8> = Vec::new();
-            if let Some(ref runner) = self.graph_runner {
-                keep.extend(runner.pinned_addresses());
-            }
-            keep.push(logits.raw_ptr() as *const u8);
-            unsafe { device.caching.free_leaked_blocks_except(&keep) };
-        }
+        // _logits_owned (if Some) keeps the OwnedTensor alive until after sampling.
+        // It will be dropped at the end of this function, returning memory to the
+        // caching allocator.
 
         // GPU sampling: handles all cases — greedy, non-greedy, penalties,
         // grammar, logit_bias, logprobs — entirely on GPU. No CPU fallback.

@@ -59,16 +59,7 @@ impl FusedMoELayer {
     /// # Safety
     /// All tensors must be valid GPU memory. Device must be properly initialized.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
-        self.forward_owned(hidden_states, device).into_gpu_tensor()
-    }
-
-    /// Forward pass returning `OwnedTensor`.
-    pub unsafe fn forward_owned(
-        &self,
-        hidden_states: GpuTensor,
-        device: &mut GpuDevice,
-    ) -> OwnedTensor {
+    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
         let num_tokens = hidden_states.dim(0);
         let stream = device.compute_stream;
 
@@ -76,7 +67,7 @@ impl FusedMoELayer {
         //    router_logits: [num_tokens, num_experts]
         let router_logits =
             self.gate
-                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
         // 2. Top-K softmax: select top_k experts per token
         let (topk_weights, topk_ids) = kernels::topk_softmax(
@@ -194,19 +185,11 @@ pub struct SharedFusedMoELayer {
 
 impl SharedFusedMoELayer {
     /// Forward pass — MoE + shared expert.
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
-        self.forward_owned(hidden_states, device).into_gpu_tensor()
-    }
-
-    pub unsafe fn forward_owned(
-        &self,
-        hidden_states: GpuTensor,
-        device: &mut GpuDevice,
-    ) -> OwnedTensor {
+    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
         let stream = device.compute_stream;
 
         // MoE path.
-        let moe_out = self.moe.forward_owned(hidden_states, device);
+        let moe_out = self.moe.forward(hidden_states, device);
 
         // Shared expert path (if present).
         if let (Some(shared_gate_up), Some(shared_down), Some(shared_gate)) = (
@@ -215,11 +198,8 @@ impl SharedFusedMoELayer {
             &self.shared_expert_gate,
         ) {
             // shared_gate_up(hidden_states) → [num_tokens, 2*intermediate]
-            let shared_gu = shared_gate_up.forward_owned(
-                hidden_states,
-                &mut device.cublas,
-                &mut device.caching,
-            );
+            let shared_gu =
+                shared_gate_up.forward(hidden_states, &mut device.cublas, &mut device.caching);
             // SiLU-and-mul → [num_tokens, intermediate]
             let shared_activated = kernels::silu_and_mul_fused(
                 shared_gu.as_gpu_tensor(),
@@ -230,7 +210,7 @@ impl SharedFusedMoELayer {
             drop(shared_gu);
 
             // down_proj → [num_tokens, hidden]
-            let shared_out = shared_down.forward_owned(
+            let shared_out = shared_down.forward(
                 shared_activated.as_gpu_tensor(),
                 &mut device.cublas,
                 &mut device.caching,
@@ -239,7 +219,7 @@ impl SharedFusedMoELayer {
 
             // Gate: sigmoid(shared_expert_gate(hidden_states)) * shared_out
             let gate_logits =
-                shared_gate.forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate.forward(hidden_states, &mut device.cublas, &mut device.caching);
 
             // Fused: out = moe_out + sigmoid(gate_logits) * shared_out
             let result = kernels::sigmoid_mul_add(
@@ -298,15 +278,7 @@ pub struct Fp8FusedMoELayer {
 
 impl Fp8FusedMoELayer {
     /// Forward pass — full FP8 MoE pipeline.
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
-        self.forward_owned(hidden_states, device).into_gpu_tensor()
-    }
-
-    pub unsafe fn forward_owned(
-        &self,
-        hidden_states: GpuTensor,
-        device: &mut GpuDevice,
-    ) -> OwnedTensor {
+    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
         let num_tokens = hidden_states.dim(0);
         let stream = device.compute_stream;
         let sm_version = device.sm_version;
@@ -314,7 +286,7 @@ impl Fp8FusedMoELayer {
         // 1. Gate: router_logits = hidden_states @ gate_weight^T
         let router_logits =
             self.gate
-                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
         // 2. Top-K softmax
         let (topk_weights, topk_ids) = kernels::topk_softmax(
@@ -443,29 +415,18 @@ pub struct Fp8SharedFusedMoELayer {
 }
 
 impl Fp8SharedFusedMoELayer {
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
-        self.forward_owned(hidden_states, device).into_gpu_tensor()
-    }
-
-    pub unsafe fn forward_owned(
-        &self,
-        hidden_states: GpuTensor,
-        device: &mut GpuDevice,
-    ) -> OwnedTensor {
+    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
         let stream = device.compute_stream;
 
-        let moe_out = self.moe.forward_owned(hidden_states, device);
+        let moe_out = self.moe.forward(hidden_states, device);
 
         if let (Some(shared_gate_up), Some(shared_down), Some(shared_gate)) = (
             &self.shared_gate_up,
             &self.shared_down,
             &self.shared_expert_gate,
         ) {
-            let shared_gu = shared_gate_up.forward_owned(
-                hidden_states,
-                &mut device.cublas,
-                &mut device.caching,
-            );
+            let shared_gu =
+                shared_gate_up.forward(hidden_states, &mut device.cublas, &mut device.caching);
             let shared_activated = kernels::silu_and_mul_fused(
                 shared_gu.as_gpu_tensor(),
                 self.intermediate_size,
@@ -474,7 +435,7 @@ impl Fp8SharedFusedMoELayer {
             );
             drop(shared_gu);
 
-            let shared_out = shared_down.forward_owned(
+            let shared_out = shared_down.forward(
                 shared_activated.as_gpu_tensor(),
                 &mut device.cublas,
                 &mut device.caching,
@@ -482,7 +443,7 @@ impl Fp8SharedFusedMoELayer {
             drop(shared_activated);
 
             let gate_logits =
-                shared_gate.forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate.forward(hidden_states, &mut device.cublas, &mut device.caching);
 
             let result = kernels::sigmoid_mul_add(
                 moe_out.as_gpu_tensor(),
@@ -627,22 +588,14 @@ impl MarlinFusedMoELayer {
     /// * `hidden_states`: `[num_tokens, hidden_size]`
     ///
     /// Returns: `[num_tokens, hidden_size]`
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
-        self.forward_owned(hidden_states, device).into_gpu_tensor()
-    }
-
-    pub unsafe fn forward_owned(
-        &self,
-        hidden_states: GpuTensor,
-        device: &mut GpuDevice,
-    ) -> OwnedTensor {
+    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
         let num_tokens = hidden_states.dim(0);
         let stream = device.compute_stream;
 
         // 1. Gate: router_logits = hidden_states @ gate_weight^T
         let router_logits =
             self.gate
-                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
         // 2. Top-K softmax
         let (topk_weights, topk_ids) = kernels::topk_softmax(
@@ -795,19 +748,11 @@ pub struct MarlinSharedFusedMoELayer {
 }
 
 impl MarlinSharedFusedMoELayer {
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> GpuTensor {
-        self.forward_owned(hidden_states, device).into_gpu_tensor()
-    }
-
-    pub unsafe fn forward_owned(
-        &self,
-        hidden_states: GpuTensor,
-        device: &mut GpuDevice,
-    ) -> OwnedTensor {
+    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
         let stream = device.compute_stream;
 
         // MoE path.
-        let moe_out = self.moe.forward_owned(hidden_states, device);
+        let moe_out = self.moe.forward(hidden_states, device);
 
         // Shared expert path (if present).
         if let (Some(shared_gate_up), Some(shared_down), Some(shared_gate)) = (
@@ -815,7 +760,7 @@ impl MarlinSharedFusedMoELayer {
             &self.shared_down,
             &self.shared_expert_gate,
         ) {
-            let shared_gu = shared_gate_up.forward_owned(
+            let shared_gu = shared_gate_up.forward(
                 hidden_states,
                 &mut device.cublas,
                 &mut device.caching,
@@ -829,7 +774,7 @@ impl MarlinSharedFusedMoELayer {
             );
             drop(shared_gu);
 
-            let shared_out = shared_down.forward_owned(
+            let shared_out = shared_down.forward(
                 shared_activated.as_gpu_tensor(),
                 &mut device.cublas,
                 &mut device.caching,
@@ -838,7 +783,7 @@ impl MarlinSharedFusedMoELayer {
             drop(shared_activated);
 
             let gate_logits =
-                shared_gate.forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+                shared_gate.forward(hidden_states, &mut device.cublas, &mut device.caching);
 
             let result = kernels::sigmoid_mul_add(
                 moe_out.as_gpu_tensor(),

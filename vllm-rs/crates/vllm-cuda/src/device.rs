@@ -282,7 +282,7 @@ mod tests {
             let a = GpuTensor::new(gpu_a, &[2, 2], DType::F32);
             let b = GpuTensor::new(gpu_b, &[2, 2], DType::F32);
 
-            let c = dev.cublas.gemm_owned(a, b, &mut dev.caching);
+            let c = dev.cublas.gemm(a, b, &mut dev.caching);
 
             let host_c = driver::mem_alloc_host(16).unwrap();
             driver::memcpy_dtoh_async(host_c, c.as_gpu_tensor().raw_ptr(), 16, dev.compute_stream)

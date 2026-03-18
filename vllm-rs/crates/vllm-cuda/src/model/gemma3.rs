@@ -201,145 +201,13 @@ impl Gemma3Attention {
         kv_cache: &KvCachePool,
         rotary: &RotaryCache,
         device: &mut GpuDevice,
-    ) -> GpuTensor {
-        let num_tokens = hidden_states.dim(0);
-
-        // QKV projection.
-        let qkv = self
-            .qkv_proj
-            .forward(hidden_states, &mut device.cublas, &mut device.caching);
-
-        // Split QKV (no RoPE yet — we need to apply QK norms first).
-        let (q, k, v) = kernels::split_qkv(
-            qkv,
-            self.q_size,
-            self.kv_size,
-            self.num_q_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            &mut device.caching,
-            device.compute_stream,
-        );
-
-        // Per-head QK norms: reshape [T, heads, head_dim] → [T*heads, head_dim],
-        // apply RMS norm, reshape back.
-        let q_flat = q
-            .as_gpu_tensor()
-            .reshape(&[num_tokens * self.num_q_heads, self.head_dim]);
-        let q_normed = kernels::rms_norm(
-            q_flat,
-            self.q_norm.inner.weight,
-            self.q_norm.inner.eps,
-            &mut device.caching,
-            device.compute_stream,
-        );
-        let q_3d =
-            q_normed
-                .into_gpu_tensor()
-                .reshape(&[num_tokens, self.num_q_heads, self.head_dim]);
-
-        let k_flat = k
-            .as_gpu_tensor()
-            .reshape(&[num_tokens * self.num_kv_heads, self.head_dim]);
-        let k_normed = kernels::rms_norm(
-            k_flat,
-            self.k_norm.inner.weight,
-            self.k_norm.inner.eps,
-            &mut device.caching,
-            device.compute_stream,
-        );
-        let k_3d =
-            k_normed
-                .into_gpu_tensor()
-                .reshape(&[num_tokens, self.num_kv_heads, self.head_dim]);
-
-        // RoPE (in-place on the normed q/k).
-        // rotary_embedding_inplace expects [T, total_dim] flat layout.
-        let q_flat_rope = q_3d.reshape(&[num_tokens, self.q_size]);
-        let k_flat_rope = k_3d.reshape(&[num_tokens, self.kv_size]);
-        kernels::rotary_embedding_inplace(
-            q_flat_rope,
-            k_flat_rope,
-            positions,
-            rotary.cos_sin_cache,
-            self.head_dim,
-            device.compute_stream,
-        );
-
-        // Reshape back to 3D for attention.
-        let q_3d = q_flat_rope.reshape(&[num_tokens, self.num_q_heads, self.head_dim]);
-        let k_3d = k_flat_rope.reshape(&[num_tokens, self.num_kv_heads, self.head_dim]);
-
-        crate::model::attention_helpers::write_kv_cache(
-            k_3d,
-            *v,
-            slot_mapping,
-            kv_cache,
-            self.layer_idx,
-            device.compute_stream,
-        );
-
-        let window_left = self.sliding_window.map(|w| w as i32).unwrap_or(-1);
-
-        let attn_output = crate::model::attention_helpers::attention_ext(
-            q_3d,
-            k_3d,
-            *v,
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
-            max_seqlen_q,
-            max_seqlen_k,
-            self.scale,
-            0.0,
-            window_left,
-            kv_cache,
-            self.layer_idx,
-            device.num_sm,
-            &mut device.caching,
-            device.compute_stream,
-        );
-
-        let attn_flat = attn_output
-            .into_gpu_tensor()
-            .reshape(&[num_tokens, self.q_size]);
-        let out = self
-            .o_proj
-            .forward(attn_flat, &mut device.cublas, &mut device.caching);
-
-        // TP: all-reduce o_proj output (row parallel).
-        #[cfg(feature = "nccl")]
-        if let Some(ref group) = self.tp_group {
-            group
-                .all_reduce_inplace(out)
-                .expect("o_proj all_reduce failed");
-        }
-
-        out
-    }
-
-    /// Forward pass returning `OwnedTensor` (caching-allocator path).
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
-        &self,
-        hidden_states: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
-        max_seqlen_q: usize,
-        max_seqlen_k: usize,
-        kv_cache: &KvCachePool,
-        rotary: &RotaryCache,
-        device: &mut GpuDevice,
     ) -> OwnedTensor {
         let num_tokens = hidden_states.dim(0);
 
         // QKV projection → owned.
-        let qkv =
-            self.qkv_proj
-                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+        let qkv = self
+            .qkv_proj
+            .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
         // Split QKV (no RoPE yet — we need to apply QK norms first).
         let (q, k, v) = kernels::split_qkv(
@@ -441,7 +309,7 @@ impl Gemma3Attention {
             .reshape(&[num_tokens, self.q_size]);
         let result = self
             .o_proj
-            .forward_owned(attn_flat, &mut device.cublas, &mut device.caching);
+            .forward(attn_flat, &mut device.cublas, &mut device.caching);
         drop(attn_output);
 
         // TP: all-reduce o_proj output (row parallel).
@@ -535,93 +403,6 @@ impl Gemma3DecoderLayer {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        hidden_states: GpuTensor,
-        residual: Option<GpuTensor>,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
-        max_seqlen_q: usize,
-        max_seqlen_k: usize,
-        kv_cache: &KvCachePool,
-        rotary: &RotaryCache,
-        device: &mut GpuDevice,
-    ) -> (GpuTensor, GpuTensor) {
-        // 1. Pre-attention norm with fused residual add.
-        let (normed, residual) = if let Some(residual) = residual {
-            kernels::fused_add_rms_norm(
-                hidden_states,
-                residual,
-                self.input_layernorm.inner.weight,
-                self.input_layernorm.inner.eps,
-                &mut device.caching,
-                device.compute_stream,
-            )
-        } else {
-            let normed = kernels::rms_norm(
-                hidden_states,
-                self.input_layernorm.inner.weight,
-                self.input_layernorm.inner.eps,
-                &mut device.caching,
-                device.compute_stream,
-            );
-            (normed.into_gpu_tensor(), hidden_states)
-        };
-
-        // 2. Attention.
-        let attn_output = self.self_attn.forward(
-            normed,
-            positions,
-            slot_mapping,
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
-            max_seqlen_q,
-            max_seqlen_k,
-            kv_cache,
-            rotary,
-            device,
-        );
-
-        // 3. Post-attention norm (standalone, no residual add).
-        let attn_normed = kernels::rms_norm(
-            attn_output,
-            self.post_attention_layernorm.inner.weight,
-            self.post_attention_layernorm.inner.eps,
-            &mut device.caching,
-            device.compute_stream,
-        );
-
-        // 4. Pre-feedforward norm with fused residual add.
-        let (normed, residual) = kernels::fused_add_rms_norm(
-            *attn_normed,
-            residual,
-            self.pre_feedforward_layernorm.inner.weight,
-            self.pre_feedforward_layernorm.inner.eps,
-            &mut device.caching,
-            device.compute_stream,
-        );
-
-        // 5. MLP.
-        let mlp_output = self.mlp.forward(normed, device);
-
-        // 6. Post-feedforward norm (standalone, no residual add).
-        let mlp_normed = kernels::rms_norm(
-            mlp_output,
-            self.post_feedforward_layernorm.inner.weight,
-            self.post_feedforward_layernorm.inner.eps,
-            &mut device.caching,
-            device.compute_stream,
-        );
-
-        (mlp_normed.into_gpu_tensor(), residual)
-    }
-
-    /// Forward using caching allocator with proper Rust ownership.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
-        &self,
         hidden_states: OwnedTensor,
         residual: Option<OwnedTensor>,
         positions: GpuTensor,
@@ -659,7 +440,7 @@ impl Gemma3DecoderLayer {
         };
 
         // 2. Attention.
-        let attn_output = self.self_attn.forward_owned(
+        let attn_output = self.self_attn.forward(
             *normed,
             positions,
             slot_mapping,
@@ -695,7 +476,7 @@ impl Gemma3DecoderLayer {
         );
 
         // 5. MLP.
-        let mlp_output = self.mlp.forward_owned(*attn_normed, device);
+        let mlp_output = self.mlp.forward(*attn_normed, device);
         drop(attn_normed);
 
         // 6. Post-feedforward norm (standalone — allocates, drops input).
@@ -797,104 +578,7 @@ impl Gemma3Model {
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-    ) -> GpuTensor {
-        // Embedding lookup + Gemma scaling.
-        let hidden_states = kernels::embedding_gather(
-            self.embed_tokens.weight,
-            input_ids,
-            &mut device.caching,
-            device.compute_stream,
-        );
-        let hidden_states = hidden_states.into_gpu_tensor();
-        kernels::scale_inplace(hidden_states, self.embed_scale, &device.cublas);
-
-        // Per-layer arena scoping.
-        let num_tokens = hidden_states.dim(0);
-        let hidden_size = hidden_states.dim(1);
-        let dtype = hidden_states.dtype();
-        let hs_buf = device
-            .caching
-            .alloc_gpu_tensor(&[num_tokens, hidden_size], dtype);
-        let res_buf = device
-            .caching
-            .alloc_gpu_tensor(&[num_tokens, hidden_size], dtype);
-        crate::driver::memcpy_dtod_async(
-            hs_buf.raw_ptr() as *mut u8,
-            hidden_states.raw_ptr() as *const u8,
-            hidden_states.size_bytes(),
-            device.compute_stream,
-        )
-        .expect("dtod copy initial hidden_states");
-
-        let mut residual: Option<GpuTensor> = None;
-        for (i, layer) in self.layers.iter().enumerate() {
-            let is_sliding = i < self.layer_is_sliding.len() && self.layer_is_sliding[i];
-            let rotary = if is_sliding {
-                &self.rotary_local
-            } else {
-                &self.rotary_global
-            };
-            let (hs, res) = layer.forward(
-                hs_buf,
-                residual,
-                positions,
-                slot_mapping,
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
-                max_seqlen_q,
-                max_seqlen_k,
-                kv_cache,
-                rotary,
-                device,
-            );
-            if res.raw_ptr() != res_buf.raw_ptr() {
-                crate::driver::memcpy_dtod_async(
-                    res_buf.raw_ptr() as *mut u8,
-                    res.raw_ptr() as *const u8,
-                    res.size_bytes(),
-                    device.compute_stream,
-                )
-                .expect("dtod copy residual");
-            }
-            crate::driver::memcpy_dtod_async(
-                hs_buf.raw_ptr() as *mut u8,
-                hs.raw_ptr() as *const u8,
-                hs.size_bytes(),
-                device.compute_stream,
-            )
-            .expect("dtod copy hidden_states");
-            residual = Some(res_buf);
-        }
-        let hidden_states = hs_buf;
-
-        // Final norm with fused residual add.
-        let (normed, _) = kernels::fused_add_rms_norm(
-            hidden_states,
-            residual.unwrap(),
-            self.norm.inner.weight,
-            self.norm.inner.eps,
-            &mut device.caching,
-            device.compute_stream,
-        );
-        normed
-    }
-
-    /// Forward using caching allocator — zero D2D copies between layers.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
-        &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
-        max_seqlen_q: usize,
-        max_seqlen_k: usize,
-        kv_cache: &KvCachePool,
-        device: &mut GpuDevice,
-    ) -> GpuTensor {
+    ) -> OwnedTensor {
         // Embedding lookup + Gemma scaling.
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
@@ -918,7 +602,7 @@ impl Gemma3Model {
             } else {
                 &self.rotary_global
             };
-            let (hs, res) = layer.forward_owned(
+            let (hs, res) = layer.forward(
                 hidden_states,
                 residual,
                 positions,
@@ -947,7 +631,7 @@ impl Gemma3Model {
             device.compute_stream,
         );
         drop(residual);
-        hidden_states.into_gpu_tensor()
+        hidden_states
     }
 }
 
@@ -995,7 +679,7 @@ impl Gemma3ForCausalLM {
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
         last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
+    ) -> OwnedTensor {
         let hidden_states = self.model.forward(
             input_ids,
             positions,
@@ -1012,66 +696,17 @@ impl Gemma3ForCausalLM {
         // Gather only last-token hidden states before the expensive lm_head GEMM.
         let hidden_states = if let Some(indices) = last_token_indices {
             crate::kernels::embedding_gather(
-                hidden_states,
+                *hidden_states,
                 indices,
                 &mut device.caching,
                 device.compute_stream,
             )
-            .into_gpu_tensor()
         } else {
             hidden_states
         };
 
         self.lm_head
-            .forward(hidden_states, &mut device.cublas, &mut device.caching)
-    }
-
-    /// Forward using caching allocator (zero D2D copies between layers).
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
-        &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
-        max_seqlen_q: usize,
-        max_seqlen_k: usize,
-        kv_cache: &KvCachePool,
-        device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
-        let hidden_states = self.model.forward_owned(
-            input_ids,
-            positions,
-            slot_mapping,
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
-            max_seqlen_q,
-            max_seqlen_k,
-            kv_cache,
-            device,
-        );
-
-        // Gather only last-token hidden states before the expensive lm_head GEMM.
-        let hidden_states = if let Some(indices) = last_token_indices {
-            crate::kernels::embedding_gather(
-                hidden_states,
-                indices,
-                &mut device.caching,
-                device.compute_stream,
-            )
-            .into_gpu_tensor()
-        } else {
-            hidden_states
-        };
-
-        let logits =
-            self.lm_head
-                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
-        logits.into_gpu_tensor()
+            .forward(*hidden_states, &mut device.cublas, &mut device.caching)
     }
 }
 
@@ -1614,7 +1249,7 @@ impl Gemma3Model {
                 &self.rotary_global
             };
 
-            let (hs, res) = layer.forward_owned(
+            let (hs, res) = layer.forward(
                 hidden_states,
                 residual,
                 positions,
@@ -1774,11 +1409,9 @@ impl Gemma3ForCausalLM {
                     hidden_states
                 };
 
-                let logits = self.lm_head.forward_owned(
-                    hidden_states,
-                    &mut device.cublas,
-                    &mut device.caching,
-                );
+                let logits =
+                    self.lm_head
+                        .forward(hidden_states, &mut device.cublas, &mut device.caching);
                 ForwardOutput::Logits(logits.into_gpu_tensor())
             }
         }

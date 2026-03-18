@@ -458,7 +458,7 @@ impl GdnWeights {
     /// # Safety
     /// All GpuTensors must be valid.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         hidden_states: GpuTensor,
         gdn_state_pool: &GdnStatePool,
@@ -473,10 +473,10 @@ impl GdnWeights {
         // 1. Input projections on GPU.
         let qkvz =
             self.in_proj_qkvz
-                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
-        let ba =
-            self.in_proj_ba
-                .forward_owned(hidden_states, &mut device.cublas, &mut device.caching);
+                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+        let ba = self
+            .in_proj_ba
+            .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
         // 2. Split QKVZ and BA on GPU using fused kernel (no CPU round-trip).
         let key_dim = self.key_dim;
@@ -686,7 +686,7 @@ impl GdnWeights {
             normed
         };
         // 7. Output projection on GPU.
-        let result = self.out_proj.forward_owned(
+        let result = self.out_proj.forward(
             proj_input.as_gpu_tensor().reshape(&[num_tokens, value_dim]),
             &mut device.cublas,
             &mut device.caching,
@@ -830,7 +830,7 @@ impl Qwen3NextFullAttention {
 
     /// Forward pass with output gating and partial RoPE.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         hidden_states: GpuTensor,
         positions: GpuTensor,
@@ -850,7 +850,7 @@ impl Qwen3NextFullAttention {
 
         // 1. QKV projection → [num_tokens, q_size + 2*kv_size].
         //    Where q_size = 2*true_q_size if attn_output_gate.
-        let qkv = self.inner.qkv_proj.forward_owned(
+        let qkv = self.inner.qkv_proj.forward(
             hidden_states,
             &mut device.cublas,
             &mut device.caching,
@@ -1013,12 +1013,10 @@ impl Qwen3NextFullAttention {
         };
 
         // 9. Output projection.
-        let result = self.inner.o_proj.forward_owned(
-            attn_flat,
-            &mut device.cublas,
-            &mut device.caching,
-            stream,
-        );
+        let result =
+            self.inner
+                .o_proj
+                .forward(attn_flat, &mut device.cublas, &mut device.caching, stream);
         drop(attn_output);
 
         // TP all-reduce.
@@ -1066,7 +1064,7 @@ pub struct Qwen3NextDecoderLayer {
 
 impl Qwen3NextDecoderLayer {
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         hidden_states: OwnedTensor,
         residual: Option<OwnedTensor>,
@@ -1116,7 +1114,7 @@ impl Qwen3NextDecoderLayer {
                 let kv_idx = self
                     .kv_layer_idx
                     .expect("full attn layer must have kv_layer_idx");
-                attn.forward_owned(
+                attn.forward(
                     *normed,
                     positions,
                     slot_mapping,
@@ -1131,7 +1129,7 @@ impl Qwen3NextDecoderLayer {
                     device,
                 )
             }
-            Qwen3NextAttnVariant::LinearAttention(gdn) => gdn.forward_owned(
+            Qwen3NextAttnVariant::LinearAttention(gdn) => gdn.forward(
                 *normed,
                 gdn_state_pool,
                 gdn_state_indices,
@@ -1160,8 +1158,8 @@ impl Qwen3NextDecoderLayer {
 
         // MLP.
         let mlp_output = match &self.mlp {
-            Qwen3NextMlpVariant::Dense(mlp) => mlp.forward_owned(*attn_output, device),
-            Qwen3NextMlpVariant::MoE(moe) => moe.forward_owned(*attn_output, device),
+            Qwen3NextMlpVariant::Dense(mlp) => mlp.forward(*attn_output, device),
+            Qwen3NextMlpVariant::MoE(moe) => moe.forward(*attn_output, device),
         };
         drop(attn_output);
 
@@ -1327,7 +1325,7 @@ impl Qwen3NextModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward_owned(
+    pub unsafe fn forward(
         &self,
         input_ids: GpuTensor,
         positions: GpuTensor,
@@ -1343,7 +1341,7 @@ impl Qwen3NextModel {
         gdn_cu_seqlens: GpuTensor,
         num_seqs: usize,
         device: &mut GpuDevice,
-    ) -> GpuTensor {
+    ) -> OwnedTensor {
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
             input_ids,
@@ -1355,7 +1353,7 @@ impl Qwen3NextModel {
         let mut residual: Option<OwnedTensor> = None;
 
         for layer in &self.layers {
-            let (hs, res) = layer.forward_owned(
+            let (hs, res) = layer.forward(
                 hidden_states,
                 residual,
                 positions,
@@ -1388,7 +1386,7 @@ impl Qwen3NextModel {
             device.compute_stream,
         );
         drop(residual);
-        hidden_states.into_gpu_tensor()
+        hidden_states
     }
 }
 
@@ -1435,8 +1433,8 @@ impl Qwen3NextForCausalLM {
         num_seqs: usize,
         device: &mut GpuDevice,
         last_token_indices: Option<GpuTensor>,
-    ) -> GpuTensor {
-        let hidden_states = self.model.forward_owned(
+    ) -> OwnedTensor {
+        let hidden_states = self.model.forward(
             input_ids,
             positions,
             slot_mapping,
@@ -1455,23 +1453,21 @@ impl Qwen3NextForCausalLM {
 
         let hidden_states = if let Some(indices) = last_token_indices {
             kernels::embedding_gather(
-                hidden_states,
+                *hidden_states,
                 indices,
                 &mut device.caching,
                 device.compute_stream,
             )
-            .into_gpu_tensor()
         } else {
             hidden_states
         };
 
-        let logits = self.lm_head.forward_owned(
-            hidden_states,
+        self.lm_head.forward(
+            *hidden_states,
             &mut device.cublas,
             &mut device.caching,
             device.compute_stream,
-        );
-        logits.into_gpu_tensor()
+        )
     }
 
     /// Number of full attention layers (for KV cache sizing).

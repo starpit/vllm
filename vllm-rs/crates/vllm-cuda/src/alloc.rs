@@ -480,96 +480,6 @@ impl CachingAllocator {
         }
     }
 
-    /// Free all leaked blocks (blocks that are allocated but not in active_blocks
-    /// because they were leaked via into_gpu_tensor). Blocks in `keep` are skipped.
-    pub unsafe fn free_leaked_blocks_except(&mut self, keep: &[*const u8]) {
-        let keep_set: std::collections::HashSet<usize> = keep.iter().map(|&p| p as usize).collect();
-
-        // Find leaked blocks: allocated, not in active_blocks, not in keep.
-        let leaked_ptrs: Vec<*mut Block> = self
-            .all_blocks
-            .iter()
-            .filter_map(|&bp| {
-                let b = &*bp;
-                if b.allocated
-                    && !self.active_blocks.contains_key(&(b.ptr as usize))
-                    && !keep_set.contains(&(b.ptr as usize))
-                {
-                    Some(bp)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Free each leaked block directly (bypass active_blocks lookup).
-        for block_ptr in leaked_ptrs {
-            let block = &mut *block_ptr;
-            block.allocated = false;
-
-            // Try merge with prev.
-            if !block.prev.is_null() {
-                let prev = &*block.prev;
-                if !prev.allocated {
-                    self.get_pool_by_flag(prev.pool_is_small).remove(block.prev);
-                    let prev = &mut *block.prev;
-                    prev.size += block.size;
-                    prev.next = block.next;
-                    if !block.next.is_null() {
-                        (*block.next).prev = block.prev;
-                    }
-                    // Try merge prev with next.
-                    if !prev.next.is_null() {
-                        let next = &*prev.next;
-                        if !next.allocated {
-                            self.get_pool_by_flag(next.pool_is_small).remove(prev.next);
-                            prev.size += next.size;
-                            let next_next = (*prev.next).next;
-                            prev.next = next_next;
-                            if !next_next.is_null() {
-                                (*next_next).prev = block.prev;
-                            }
-                        }
-                    }
-                    self.get_pool_by_flag(prev.pool_is_small).insert(block.prev);
-                    continue;
-                }
-            }
-
-            // Try merge with next.
-            if !block.next.is_null() {
-                let next = &*block.next;
-                if !next.allocated {
-                    self.get_pool_by_flag(next.pool_is_small).remove(block.next);
-                    block.size += (*block.next).size;
-                    let next_next = (*block.next).next;
-                    block.next = next_next;
-                    if !next_next.is_null() {
-                        (*next_next).prev = block_ptr;
-                    }
-                }
-            }
-
-            self.get_pool_by_flag(block.pool_is_small).insert(block_ptr);
-        }
-    }
-
-    /// Free all leaked blocks.
-    pub unsafe fn free_leaked_blocks(&mut self) {
-        let before = self
-            .all_blocks
-            .iter()
-            .filter(|&&bp| {
-                let b = &*bp;
-                b.allocated && !self.active_blocks.contains_key(&(b.ptr as usize))
-            })
-            .count();
-        self.free_leaked_blocks_except(&[]);
-        if before > 0 {
-            tracing::debug!("free_leaked_blocks: freed {before} leaked blocks");
-        }
-    }
-
     pub fn free_block_count(&self) -> usize {
         self.small_pool.free_blocks.len() + self.large_pool.free_blocks.len()
     }
@@ -722,19 +632,6 @@ impl OwnedTensor {
         }
         std::mem::forget(self);
         t
-    }
-
-    /// Create from raw parts.
-    pub unsafe fn from_raw(
-        inner: GpuTensor,
-        alloc: *mut CachingAllocator,
-        size_bytes: usize,
-    ) -> Self {
-        Self {
-            inner,
-            alloc,
-            size_bytes,
-        }
     }
 }
 
@@ -903,10 +800,6 @@ mod tests {
             // free_block_count unchanged (remainder is still there, leaked block is not freed).
             assert_eq!(alloc.free_block_count(), free_before);
             assert_eq!(alloc.active_blocks.len(), 0); // removed by into_gpu_tensor
-            // Manually free leaked block back.
-            unsafe { alloc.free_leaked_blocks() };
-            // Now the freed block coalesces with remainder → one larger free block.
-            assert!(alloc.free_block_count() >= 1);
             let _ = gpu;
         }
         #[test]

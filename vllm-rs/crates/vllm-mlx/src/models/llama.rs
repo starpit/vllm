@@ -17,26 +17,20 @@ use mlx_rs::error::Exception;
 use mlx_rs::module::{Module, Param};
 use mlx_rs::nn;
 use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
 
 use crate::cache::{BatchMlxLayerKvCache, MlxBatchInfo, MlxKvCache, MlxLayerKvCache};
 use vllm_model::weight::HfModelConfig;
 
-/// Compiled SwiGLU: `silu(gate) * up` in a single compiled function.
+/// SwiGLU activation: `silu(gate) * up = sigmoid(gate) * gate * up`.
 ///
-/// Matches mlx-lm's `@partial(mx.compile, shapeless=True) def swiglu`.
-/// Uses raw `sigmoid(gate) * gate * up` to avoid `nn::silu`'s own compile
-/// wrapper, which would add a second compile dispatch per call.
+/// Uses raw MLX ops without `compile()` wrapper. The compile dispatch
+/// overhead (closure creation + mlx_closure_apply + compile_trace/fuse)
+/// is ~8% of single-request decode time — more expensive than the
+/// fusion benefit for small tensors.
 pub fn swiglu(gate: &Array, up: &Array) -> Result<Array, Exception> {
-    let mut f = compile(
-        |(g, u): (&Array, &Array)| -> Result<Array, Exception> {
-            let sig = mlx_rs::ops::sigmoid(g)?;
-            sig.multiply(g)?.multiply(u)
-        },
-        true, // shapeless
-    );
-    f((gate, up))
+    let sig = mlx_rs::ops::sigmoid(gate)?;
+    sig.multiply(gate)?.multiply(up)
 }
 
 // ---------------------------------------------------------------------------

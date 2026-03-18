@@ -26,6 +26,25 @@ use vllm_model::weight::HfModelConfig;
 use crate::cache::{self, MlxKvCache};
 use crate::models::{MlxModel, MlxModelRegistry};
 
+/// State saved between execute_model calls for double-buffered async_eval.
+///
+/// After async_eval submits the current step, we store the unread GPU
+/// sampling arrays and the pre-built output.  At the start of the NEXT
+/// execute_model call, we read these arrays (instant — GPU finished during
+/// the main thread's finalize + schedule), update token_buffers, and
+/// return the stored output.
+struct PendingStep {
+    /// Pre-built output for the previous step (req_ids, sampled_token_ids
+    /// are NOT yet populated — token_ids_placeholder is empty vecs).
+    req_ids: Vec<String>,
+    /// GPU greedy result array (unread).  `None` if no greedy requests.
+    greedy_result: Option<Array>,
+    /// Per-request index into greedy_result's flat output.
+    greedy_mapping: Vec<(String, usize)>, // (req_id, batch_pos)
+    /// GPU temperature result arrays (unread), one per temperature group.
+    temp_results: Vec<(Vec<(String, usize)>, Array)>, // ([(req_id, batch_pos)], array)
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -148,6 +167,12 @@ pub struct MlxWorker {
     /// Block size for prefix hashing (must match scheduler block size).
     prefix_block_size: usize,
 
+    /// Double-buffer state: previous step's unread GPU sampling arrays and
+    /// the pre-built ModelRunnerOutput.  On the next execute_model call, we
+    /// read these arrays (instant — GPU already finished), update
+    /// token_buffers, and return this output.  See `project_double_buffer_design`.
+    pending_step: Option<PendingStep>,
+
     // Timing instrumentation.
     step_count: usize,
     prefill_count: usize,
@@ -186,6 +211,7 @@ impl MlxWorker {
             kv_cache_pool: HashMap::new(),
             enable_prefix_caching,
             prefix_block_size,
+            pending_step: None,
             step_count: 0,
             prefill_count: 0,
             decode_count: 0,
@@ -656,6 +682,44 @@ impl Worker for MlxWorker {
         &mut self,
         scheduler_output: &SchedulerOutput,
     ) -> ExecutorResult<ModelRunnerOutput> {
+        // --- Double-buffer flush: read PREVIOUS step's GPU results ---
+        // These were async_eval'd last call.  By now the GPU is done (the main
+        // thread did finalize + schedule in between).  as_slice is instant.
+        let prev_output = if let Some(pending) = self.pending_step.take() {
+            let mut token_map: HashMap<String, Vec<u32>> = HashMap::new();
+            if let Some(ref greedy_result) = pending.greedy_result {
+                let flat = greedy_result.as_slice::<u32>();
+                for (req_id, batch_pos) in &pending.greedy_mapping {
+                    let token_id = flat[*batch_pos];
+                    token_map.insert(req_id.clone(), vec![token_id]);
+                    if let Some(buf) = self.token_buffers.get_mut(req_id) {
+                        buf.push(token_id);
+                    }
+                    #[cfg(feature = "guided-decoding")]
+                    if let Some(guide) = self.grammar_states.get_mut(req_id) {
+                        guide.advance(token_id);
+                    }
+                }
+            }
+            for (mapping, arr) in &pending.temp_results {
+                let flat = arr.as_slice::<u32>();
+                for (req_id, batch_pos) in mapping {
+                    let token_id = flat[*batch_pos];
+                    token_map.insert(req_id.clone(), vec![token_id]);
+                    if let Some(buf) = self.token_buffers.get_mut(req_id) {
+                        buf.push(token_id);
+                    }
+                    #[cfg(feature = "guided-decoding")]
+                    if let Some(guide) = self.grammar_states.get_mut(req_id) {
+                        guide.advance(token_id);
+                    }
+                }
+            }
+            Some(ModelRunnerOutput::from_token_map(token_map))
+        } else {
+            None
+        };
+
         // Lazily build grammar vocabulary if any new request needs constrained decoding.
         // Done before borrowing self.model to satisfy the borrow checker.
         #[cfg(feature = "guided-decoding")]
@@ -1485,20 +1549,88 @@ impl Worker for MlxWorker {
             }
         }
 
-        // --- Phase D: Single eval materializes forward + sampling in one Metal command buffer ---
+        // --- Phase D: Submit GPU work ---
+        //
+        // Double-buffering (mlx-lm _next() pattern): when we can defer
+        // (no cpu_fallback, no prompt_logprobs) AND have a previous output
+        // to return, use async_eval + store pending + return previous.
+        // Otherwise fall back to synchronous eval.
+        let can_defer = cpu_fallback.is_empty()
+            && !any_logprobs_requested
+            && lazy_outputs.iter().all(|o| o.prompt_logprobs_info.is_none())
+            && prev_output.is_some();
+
+        if can_defer {
+            // async_eval: submit GPU work, don't wait.
+            let mut arrays_to_eval: Vec<&Array> = Vec::new();
+            if let Some(ref arr) = gpu_greedy_result {
+                arrays_to_eval.push(arr);
+            }
+            for (_, arr) in &gpu_temp_results {
+                arrays_to_eval.push(arr);
+            }
+            mlx_rs::transforms::async_eval(arrays_to_eval)
+                .map_err(|e| ExecutorError::WorkerExecution(format!("async_eval error: {e}")))?;
+
+            // Store unread GPU arrays as pending for next call.
+            let greedy_mapping: Vec<(String, usize)> = gpu_greedy
+                .iter()
+                .enumerate()
+                .map(|(batch_pos, &req_idx)| (req_inputs[req_idx].req_id.clone(), batch_pos))
+                .collect();
+            let temp_pending: Vec<(Vec<(String, usize)>, Array)> = gpu_temp_results
+                .into_iter()
+                .map(|(group, arr)| {
+                    let mapping: Vec<(String, usize)> = group
+                        .iter()
+                        .enumerate()
+                        .map(|(batch_pos, &req_idx)| {
+                            (req_inputs[req_idx].req_id.clone(), batch_pos)
+                        })
+                        .collect();
+                    (mapping, arr)
+                })
+                .collect();
+
+            self.pending_step = Some(PendingStep {
+                req_ids: req_inputs.iter().map(|r| r.req_id.clone()).collect(),
+                greedy_result: gpu_greedy_result,
+                greedy_mapping,
+                temp_results: temp_pending,
+            });
+
+            // Timing.
+            let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+            let num_prefills = req_inputs.iter().filter(|r| r.is_prefill).count();
+            let num_decodes = req_inputs.len() - num_prefills;
+            self.step_count += req_inputs.len();
+            if num_prefills > 0 {
+                self.prefill_count += num_prefills;
+                self.total_prefill_ms +=
+                    step_ms * (num_prefills as f64 / req_inputs.len() as f64);
+            }
+            if num_decodes > 0 {
+                self.decode_count += num_decodes;
+                self.total_decode_ms +=
+                    step_ms * (num_decodes as f64 / req_inputs.len() as f64);
+            }
+
+            // Return PREVIOUS step's output.  Current step's output will
+            // be read and returned at the start of the next execute_model.
+            return Ok(prev_output.unwrap());
+        }
+
+        // --- Synchronous fallback ---
         {
             let mut arrays_to_eval: Vec<&Array> = Vec::new();
-            // Include forward logits needed by cpu_fallback (as_slice needs eval'd data).
             for &idx in &cpu_fallback {
                 arrays_to_eval.push(&lazy_outputs[idx].last_logits);
             }
-            // Include full logits for prompt_logprobs / speculative decode.
             for out in &lazy_outputs {
                 if let Some(ref f32_logits) = out.full_logits_f32 {
                     arrays_to_eval.push(f32_logits);
                 }
             }
-            // Include lazy GPU sampling results.
             if let Some(ref arr) = gpu_greedy_result {
                 arrays_to_eval.push(arr);
             }
@@ -1782,6 +1914,7 @@ impl Worker for MlxWorker {
     }
 
     fn shutdown(&mut self) {
+        self.pending_step = None;
         self.is_shutdown = true;
         self.model = None;
         info!("MlxWorker: shut down");

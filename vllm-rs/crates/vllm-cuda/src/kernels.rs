@@ -3265,11 +3265,14 @@ pub unsafe fn flash_attn_paged_ext(
     // Python line 588: then compute window_size_right
     let window_size_right = if is_causal { 0 } else { -1_i32 };
 
-    // --- seqlenq_ngroups_swapped ---
-    // DISABLED: requires Q/output padded to seqlen_q_rounded per batch (Python
-    // does this, we don't yet). TODO: re-enable with proper padding.
+    // --- seqlenq_ngroups_swapped (matching Python flash_api.cpp lines 594-601) ---
     let ngroups = num_heads_orig / num_kv_heads;
-    let do_swap = false;
+    let do_swap = max_seqlen_q == 1
+        && num_heads_orig > num_kv_heads
+        && window_size_left < 0
+        && window_size_right < 0
+        && softcap == 0.0
+        && head_dim.is_multiple_of(8);
     let (eff_max_seqlen_q, eff_num_heads, eff_total_q) = if do_swap {
         (ngroups, num_kv_heads, batch_size * ngroups)
     } else {
@@ -3315,15 +3318,44 @@ pub unsafe fn flash_attn_paged_ext(
 
     let softmax_lse = alloc.alloc_tensor(&[eff_num_heads * eff_total_q], DType::F32);
 
-    let q_swapped_buf: Option<OwnedTensor> = None; // do_swap is disabled
+    // Transpose Q if swapped: [B, H, D] -> [B*ngroups, Hk, D]
+    // Python: q.reshape({B, Hk, ngroups, D}).transpose(1,2).reshape({B*ngroups, Hk, D})
+    // The reshape after transpose triggers a clone (contiguous copy).
+    let q_swapped_buf = if do_swap {
+        let buf = alloc.alloc_tensor(&[eff_total_q, eff_num_heads, head_dim], q.dtype());
+        ngroups_transpose_q(
+            q.raw_ptr() as *const c_void,
+            buf.raw_ptr() as *mut c_void,
+            batch_size as i32,
+            num_heads_orig as i32,
+            num_kv_heads as i32,
+            ngroups as i32,
+            head_dim as i32,
+            _stream,
+        );
+        Some(buf)
+    } else {
+        None
+    };
 
-    let (q_ptr, q_row_stride, q_head_stride) = (
-        q_padded.raw_ptr() as *mut c_void,
-        (num_heads_orig * head_dim) as i64,
-        head_dim as i64,
-    );
+    let (q_ptr, q_row_stride, q_head_stride) = match &q_swapped_buf {
+        Some(buf) => (
+            buf.raw_ptr() as *mut c_void,
+            (num_kv_heads * head_dim) as i64, // contiguous [B*ngroups, Hk, D]
+            head_dim as i64,
+        ),
+        None => (
+            q_padded.raw_ptr() as *mut c_void,
+            (num_heads_orig * head_dim) as i64,
+            head_dim as i64,
+        ),
+    };
 
-    let o_row_stride = (num_heads_orig * head_dim) as i64;
+    let o_row_stride = if do_swap {
+        (eff_num_heads * head_dim) as i64
+    } else {
+        (num_heads_orig * head_dim) as i64
+    };
     let o_head_stride = head_dim as i64;
 
     // K/V cache: [num_blocks, block_size, num_kv_heads, head_dim]

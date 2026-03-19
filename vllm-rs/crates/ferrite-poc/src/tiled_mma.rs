@@ -22,24 +22,29 @@ use inkwell::module::Module;
 use inkwell::builder::Builder;
 use inkwell::targets::{TargetTriple, FileType};
 use inkwell::types::AsTypeRef;
-use inkwell::values::{AsValueRef, BasicValueEnum, IntValue, FloatValue};
+use inkwell::values::{AsValueRef, IntValue, FloatValue};
 use inkwell::{AddressSpace, IntPredicate};
 
 use cudarc::driver::result as cuda;
 
 use crate::{create_nvptx_target_machine, add_nvvm_kernel_metadata, call_sreg, call_barrier0};
 
-const BM: u32 = 128;
+const BM: u32 = 64;
 const BN: u32 = 64;
 const BK: u32 = 16;
-const WM: u32 = 64;  // 4 × MMA_M
-const WN: u32 = 32;  // 4 × MMA_N
+const WM: u32 = 32;
+const WN: u32 = 32;
 const MMA_M: u32 = 16;
 const MMA_N: u32 = 8;
-const REG_M: u32 = WM / MMA_M; // 4
+const REG_M: u32 = WM / MMA_M; // 2
 const REG_N: u32 = WN / MMA_N; // 4
-const WARPS: u32 = 4; // 2×2 warp layout
+const WARPS: u32 = 4;
 const THREADS: u32 = WARPS * 32;
+
+// B128 swizzle parameters (from CubeK: Swizzle::new(3, 4, 3))
+// offset_bytes ^= (offset_bytes & 0x380) >> 3
+const SWIZZLE_MASK: u32 = 0x380; // bits [9:7]
+const SWIZZLE_SHIFT: u32 = 3;
 
 pub fn step3b_multiwarp_gemm(sm: &str) -> Result<()> {
     let m: u32 = 1024;
@@ -85,8 +90,7 @@ pub fn step3b_multiwarp_gemm(sm: &str) -> Result<()> {
     let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
     let grid_x: c_uint = n / BN;
     let grid_y: c_uint = m / BM;
-    // Double buffered: 2 × (A tile + B_t tile) in f16
-    let smem_bytes: c_uint = 2 * (BM * BK + BN * BK) * 2;
+    let smem_bytes: c_uint = (BM * BK + BN * BK) * 2;
 
     let params: &mut [*mut c_void] = &mut [
         (&d_a) as *const _ as *mut c_void,
@@ -158,31 +162,52 @@ pub fn step3b_multiwarp_gemm(sm: &str) -> Result<()> {
 }
 
 // ===========================================================================
-// PTX emission
+// PTX emission — CubeK-style: B128 swizzle, K-unroll=2, pipelined cp.async
 // ===========================================================================
+
+/// Apply B128 swizzle to a shared memory element index.
+/// CubeK formula: offset_bytes ^= (offset_bytes & 0x380) >> 3
+/// This XORs bits [9:7] into bits [6:4] of the byte address.
+fn build_swizzle<'ctx>(
+    builder: &Builder<'ctx>,
+    context: &'ctx LlvmContext,
+    elem_idx: IntValue<'ctx>,  // element index (in f16 units)
+) -> IntValue<'ctx> {
+    let i32_ty = context.i32_type();
+    let ci = |v: u64| i32_ty.const_int(v, false);
+    // Convert element index to byte offset (×2 for f16)
+    let byte_off = builder.build_int_mul(elem_idx, ci(2), "").unwrap();
+    // XOR: byte_off ^= (byte_off & 0x380) >> 3
+    let masked = builder.build_and(byte_off, ci(SWIZZLE_MASK as u64), "").unwrap();
+    let shifted = builder.build_right_shift(masked, ci(SWIZZLE_SHIFT as u64), false, "").unwrap();
+    let swizzled_bytes = builder.build_xor(byte_off, shifted, "").unwrap();
+    // Convert back to element index (÷2 for f16)
+    builder.build_int_unsigned_div(swizzled_bytes, ci(2), "sw").unwrap()
+}
 
 fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let machine = create_nvptx_target_machine(sm)?;
-    let context = LlvmContext::create();
-    let module = context.create_module("ferrite_mw_gemm");
-    let builder = context.create_builder();
+    let ctx = LlvmContext::create();
+    let module = ctx.create_module("ferrite_mw_gemm");
+    let b = ctx.create_builder();
 
     module.set_data_layout(&machine.get_target_data().get_data_layout());
     module.set_triple(&TargetTriple::create("nvptx64-nvidia-cuda"));
 
-    let i32_ty = context.i32_type();
-    let f16_ty = context.f16_type();
-    let f32_ty = context.f32_type();
-    let void_ty = context.void_type();
-    let ptr_g = context.ptr_type(AddressSpace::from(1u16));
-    let ptr_s = context.ptr_type(AddressSpace::from(3u16));
-    // Dynamic shared memory
+    let i32_ty = ctx.i32_type();
+    let f16_ty = ctx.f16_type();
+    let f32_ty = ctx.f32_type();
+    let void_ty = ctx.void_type();
+    let ptr_g = ctx.ptr_type(AddressSpace::from(1u16));
+    let ptr_s = ctx.ptr_type(AddressSpace::from(3u16));
+    let v2f16_ty = f16_ty.vec_type(2);
+
     let smem_g = module.add_global(
-        context.i8_type().array_type(0),
+        ctx.i8_type().array_type(0),
         Some(AddressSpace::from(3u16)),
         "smem",
     );
-    smem_g.set_alignment(16);
+    smem_g.set_alignment(128); // Align for swizzle
     smem_g.set_externally_initialized(true);
 
     let fn_type = void_ty.fn_type(
@@ -195,13 +220,13 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
 
     let ci = |v: u64| i32_ty.const_int(v, false);
 
-    let entry = context.append_basic_block(function, "entry");
-    let kloop_hdr = context.append_basic_block(function, "kloop_hdr");
-    let kloop_body = context.append_basic_block(function, "kloop_body");
-    let kloop_exit = context.append_basic_block(function, "kloop_exit");
+    let entry = ctx.append_basic_block(function, "entry");
+    let kloop_hdr = ctx.append_basic_block(function, "kloop_hdr");
+    let kloop_body = ctx.append_basic_block(function, "kloop_body");
+    let kloop_exit = ctx.append_basic_block(function, "kloop_exit");
 
     // ── Entry ──
-    builder.position_at_end(entry);
+    b.position_at_end(entry);
 
     let a_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
     let b_ptr = function.get_nth_param(1).unwrap().into_pointer_value();
@@ -210,227 +235,145 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let n_p = function.get_nth_param(4).unwrap().into_int_value();
     let k_p = function.get_nth_param(5).unwrap().into_int_value();
 
-    let tid = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.tid.x", "tid");
-    let bid_x = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.ctaid.x", "bx");
-    let bid_y = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.ctaid.y", "by");
+    let tid = call_sreg(&ctx, &module, &b, "llvm.nvvm.read.ptx.sreg.tid.x", "tid");
+    let bid_x = call_sreg(&ctx, &module, &b, "llvm.nvvm.read.ptx.sreg.ctaid.x", "bx");
+    let bid_y = call_sreg(&ctx, &module, &b, "llvm.nvvm.read.ptx.sreg.ctaid.y", "by");
 
-    let block_row = builder.build_int_mul(bid_y, ci(BM as u64), "br").unwrap();
-    let block_col = builder.build_int_mul(bid_x, ci(BN as u64), "bc").unwrap();
+    let block_row = b.build_int_mul(bid_y, ci(BM as u64), "br").unwrap();
+    let block_col = b.build_int_mul(bid_x, ci(BN as u64), "bc").unwrap();
 
-    let warp_id = builder.build_int_unsigned_div(tid, ci(32), "wid").unwrap();
-    let lane = builder.build_int_unsigned_rem(tid, ci(32), "lane").unwrap();
-    let wy = builder.build_int_unsigned_div(warp_id, ci(2), "wy").unwrap();
-    let wx = builder.build_int_unsigned_rem(warp_id, ci(2), "wx").unwrap();
-    let group = builder.build_int_unsigned_div(lane, ci(4), "grp").unwrap();
-    let tg = builder.build_int_unsigned_rem(lane, ci(4), "tg").unwrap();
-    let tg2 = builder.build_int_mul(tg, ci(2), "tg2").unwrap();
+    let warp_id = b.build_int_unsigned_div(tid, ci(32), "wid").unwrap();
+    let lane = b.build_int_unsigned_rem(tid, ci(32), "lane").unwrap();
+    let wy = b.build_int_unsigned_div(warp_id, ci(2), "wy").unwrap();
+    let wx = b.build_int_unsigned_rem(warp_id, ci(2), "wx").unwrap();
+    let group = b.build_int_unsigned_div(lane, ci(4), "grp").unwrap();
+    let tg = b.build_int_unsigned_rem(lane, ci(4), "tg").unwrap();
+    let tg2 = b.build_int_mul(tg, ci(2), "tg2").unwrap();
 
-    // ── Double-buffered shared memory layout ──
-    // Buffer 0: smem_a0[BM×BK f16] + smem_b0[BK×BN f16]
-    // Buffer 1: smem_a1[BM×BK f16] + smem_b1[BK×BN f16]
-    let one_buf_bytes = (BM * BK + BK * BN) * 2; // bytes for one buffer pair
+    // Shared memory: single buffer with B128 swizzle
+    // smem_a[BM×BK f16] + smem_b[BK×BN f16]
     let smem_base = smem_g.as_pointer_value();
-
-    // Buffer 0 pointers
-    let smem_a0 = builder.build_pointer_cast(smem_base, ptr_s, "sa0").unwrap();
-    let smem_b0 = builder.build_pointer_cast(unsafe {
-        builder.build_gep(context.i8_type(), smem_base, &[ci((BM * BK * 2) as u64)], "").unwrap()
-    }, ptr_s, "sb0").unwrap();
-    // Buffer 1 pointers
-    let smem_a1 = builder.build_pointer_cast(unsafe {
-        builder.build_gep(context.i8_type(), smem_base, &[ci(one_buf_bytes as u64)], "").unwrap()
-    }, ptr_s, "sa1").unwrap();
-    let smem_b1 = builder.build_pointer_cast(unsafe {
-        builder.build_gep(context.i8_type(), smem_base,
-            &[ci((one_buf_bytes + BM * BK * 2) as u64)], "").unwrap()
-    }, ptr_s, "sb1").unwrap();
+    let smem_a = b.build_pointer_cast(smem_base, ptr_s, "sa").unwrap();
+    let smem_b = b.build_pointer_cast(unsafe {
+        b.build_gep(ctx.i8_type(), smem_base, &[ci((BM * BK * 2) as u64)], "").unwrap()
+    }, ptr_s, "sb").unwrap();
 
     let f0 = f32_ty.const_float(0.0);
-    let tid_x8 = builder.build_int_mul(tid, ci(8), "tx8").unwrap();
-    let v2f16_ty = f16_ty.vec_type(2);
-
-    // ── Precompute tile-loading index offsets ──
-    // A: BM×BK = 128×16 = 2048 f16, 128 threads → 16 per thread → 2 cp.async(8)
-    // B: BK×BN = 16×64 = 1024 f16, 128 threads → 8 per thread → 1 cp.async(8)
-    // A load: thread tid loads elements [tid*16..tid*16+15] of A tile
-    let tid_x16 = builder.build_int_mul(tid, ci(16), "tx16").unwrap();
-    let a_tile_row0 = builder.build_int_unsigned_div(tid_x16, ci(BK as u64), "atr0").unwrap();
-    let a_tile_col0 = builder.build_int_unsigned_rem(tid_x16, ci(BK as u64), "atc0").unwrap();
-    let a_glob_row0 = builder.build_int_add(block_row, a_tile_row0, "agr0").unwrap();
-    // Second chunk: tid*16 + 8
-    let tid_x16_p8 = builder.build_int_add(tid_x16, ci(8), "tx16p8").unwrap();
-    let a_tile_row1 = builder.build_int_unsigned_div(tid_x16_p8, ci(BK as u64), "atr1").unwrap();
-    let a_tile_col1 = builder.build_int_unsigned_rem(tid_x16_p8, ci(BK as u64), "atc1").unwrap();
-    let a_glob_row1 = builder.build_int_add(block_row, a_tile_row1, "agr1").unwrap();
-    // B load: thread tid loads elements [tid*8..tid*8+7] of B tile
-    let b_tile_row = builder.build_int_unsigned_div(tid_x8, ci(BN as u64), "btr").unwrap();
-    let b_tile_col = builder.build_int_unsigned_rem(tid_x8, ci(BN as u64), "btc").unwrap();
-    let b_glob_col = builder.build_int_add(block_col, b_tile_col, "bgc").unwrap();
+    let tid_x8 = b.build_int_mul(tid, ci(8), "tx8").unwrap();
 
     // Fragment index precomputation
-    let wy_off = builder.build_int_mul(wy, ci(WM as u64), "wyo").unwrap();
-    let wx_off = builder.build_int_mul(wx, ci(WN as u64), "wxo").unwrap();
+    let wy_off = b.build_int_mul(wy, ci(WM as u64), "wyo").unwrap();
+    let wx_off = b.build_int_mul(wx, ci(WN as u64), "wxo").unwrap();
 
-    // ── Prologue: issue cp.async for first tile into buffer 0 ──
-    {
-        let t0 = ci(0);
-        // A chunk 0
-        let a_col0 = builder.build_int_add(t0, a_tile_col0, "").unwrap();
-        let a_idx0 = builder.build_int_add(
-            builder.build_int_mul(a_glob_row0, k_p, "").unwrap(), a_col0, "",
-        ).unwrap();
-        let a_gep0 = unsafe { builder.build_gep(f16_ty, a_ptr, &[a_idx0], "").unwrap() };
-        let sa_gep0 = unsafe { builder.build_gep(f16_ty, smem_a0, &[tid_x16], "").unwrap() };
-        build_cp_async_16(&builder, &context, &module, sa_gep0, a_gep0);
-        // A chunk 1
-        let a_col1 = builder.build_int_add(t0, a_tile_col1, "").unwrap();
-        let a_idx1 = builder.build_int_add(
-            builder.build_int_mul(a_glob_row1, k_p, "").unwrap(), a_col1, "",
-        ).unwrap();
-        let a_gep1 = unsafe { builder.build_gep(f16_ty, a_ptr, &[a_idx1], "").unwrap() };
-        let sa_gep1 = unsafe { builder.build_gep(f16_ty, smem_a0, &[tid_x16_p8], "").unwrap() };
-        build_cp_async_16(&builder, &context, &module, sa_gep1, a_gep1);
-        // B
-        let b_row = builder.build_int_add(t0, b_tile_row, "").unwrap();
-        let b_idx = builder.build_int_add(
-            builder.build_int_mul(b_row, n_p, "").unwrap(), b_glob_col, "",
-        ).unwrap();
-        let b_gep = unsafe { builder.build_gep(f16_ty, b_ptr, &[b_idx], "").unwrap() };
-        let sb_gep = unsafe { builder.build_gep(f16_ty, smem_b0, &[tid_x8], "").unwrap() };
-        build_cp_async_16(&builder, &context, &module, sb_gep, b_gep);
+    // ── Tile loading helper: precompute per-thread offsets ──
+    // A: 64×16 = 1024 f16, 128 threads → 8 per thread → 1 cp.async(16 bytes)
+    let a_tile_row = b.build_int_unsigned_div(tid_x8, ci(BK as u64), "atr").unwrap();
+    let a_tile_col = b.build_int_unsigned_rem(tid_x8, ci(BK as u64), "atc").unwrap();
+    let a_glob_row = b.build_int_add(block_row, a_tile_row, "agr").unwrap();
+    // Swizzled smem offset for A store
+    let a_smem_lin = tid_x8; // linear index in tile
+    let a_smem_sw = build_swizzle(&b, &ctx, a_smem_lin);
 
-        build_cp_async_commit_and_wait(&builder, &context, &module);
-        call_barrier0(&context, &module, &builder);
-    }
+    // B: 16×64 = 1024 f16, 128 threads → 8 per thread → 1 cp.async(16 bytes)
+    let b_tile_row = b.build_int_unsigned_div(tid_x8, ci(BN as u64), "btr").unwrap();
+    let b_tile_col = b.build_int_unsigned_rem(tid_x8, ci(BN as u64), "btc").unwrap();
+    let b_glob_col = b.build_int_add(block_col, b_tile_col, "bgc").unwrap();
+    let b_smem_sw = build_swizzle(&b, &ctx, tid_x8);
 
-    builder.build_unconditional_branch(kloop_hdr).unwrap();
+    b.build_unconditional_branch(kloop_hdr).unwrap();
 
     // ── K-loop header ──
-    builder.position_at_end(kloop_hdr);
-    let t_phi = builder.build_phi(i32_ty, "t").unwrap();
-    // Phi for which buffer to COMPUTE from (0 or 1)
-    let buf_phi = builder.build_phi(i32_ty, "buf").unwrap();
-    let num_acc = (REG_M * REG_N * 4) as usize; // 4×4×4 = 64
+    b.position_at_end(kloop_hdr);
+    let t_phi = b.build_phi(i32_ty, "t").unwrap();
+    let num_acc = (REG_M * REG_N * 4) as usize;
     let mut acc_phis = Vec::new();
     for i in 0..num_acc {
-        acc_phis.push(builder.build_phi(f32_ty, &format!("acc{i}")).unwrap());
+        acc_phis.push(b.build_phi(f32_ty, &format!("acc{i}")).unwrap());
     }
     let t = t_phi.as_basic_value().into_int_value();
-    let buf = buf_phi.as_basic_value().into_int_value();
-    let kcmp = builder.build_int_compare(IntPredicate::ULT, t, k_p, "kcmp").unwrap();
-    builder.build_conditional_branch(kcmp, kloop_body, kloop_exit).unwrap();
+    let kcmp = b.build_int_compare(IntPredicate::ULT, t, k_p, "kcmp").unwrap();
+    b.build_conditional_branch(kcmp, kloop_body, kloop_exit).unwrap();
 
-    // ── K-loop body: compute current buffer + load next into other buffer ──
-    builder.position_at_end(kloop_body);
+    // ── K-loop body ──
+    b.position_at_end(kloop_body);
 
-    // Select compute pointers: if buf==0, compute from buf0, load into buf1
-    let is_buf0 = builder.build_int_compare(IntPredicate::EQ, buf, ci(0), "ib0").unwrap();
-    let comp_a = builder.build_select(is_buf0, smem_a0, smem_a1, "ca").unwrap().into_pointer_value();
-    let comp_b = builder.build_select(is_buf0, smem_b0, smem_b1, "cb").unwrap().into_pointer_value();
-    let load_a = builder.build_select(is_buf0, smem_a1, smem_a0, "la").unwrap().into_pointer_value();
-    let load_b = builder.build_select(is_buf0, smem_b1, smem_b0, "lb").unwrap().into_pointer_value();
+    // ── cp.async load A tile with swizzled store ──
+    let a_glob_col = b.build_int_add(t, a_tile_col, "agc").unwrap();
+    let a_idx = b.build_int_add(
+        b.build_int_mul(a_glob_row, k_p, "").unwrap(), a_glob_col, "",
+    ).unwrap();
+    let a_gep = unsafe { b.build_gep(f16_ty, a_ptr, &[a_idx], "agep").unwrap() };
+    let sa_gep = unsafe { b.build_gep(f16_ty, smem_a, &[a_smem_sw], "sagep").unwrap() };
+    build_cp_async_16(&b, &ctx, &module, sa_gep, a_gep);
 
-    // ── Issue cp.async for NEXT tile (t + BK) into load buffer ──
-    let t_next = builder.build_int_add(t, ci(BK as u64), "tn").unwrap();
-    let has_next = builder.build_int_compare(IntPredicate::ULT, t_next, k_p, "hn").unwrap();
+    // ── cp.async load B tile with swizzled store ──
+    let b_glob_row = b.build_int_add(t, b_tile_row, "bgr").unwrap();
+    let b_idx = b.build_int_add(
+        b.build_int_mul(b_glob_row, n_p, "").unwrap(), b_glob_col, "",
+    ).unwrap();
+    let b_gep = unsafe { b.build_gep(f16_ty, b_ptr, &[b_idx], "bgep").unwrap() };
+    let sb_gep = unsafe { b.build_gep(f16_ty, smem_b, &[b_smem_sw], "sbgep").unwrap() };
+    build_cp_async_16(&b, &ctx, &module, sb_gep, b_gep);
 
-    // Only issue load if there's a next tile
-    let load_bb = context.append_basic_block(function, "load_next");
-    let compute_bb = context.append_basic_block(function, "compute");
-    builder.build_conditional_branch(has_next, load_bb, compute_bb).unwrap();
+    // Wait and sync
+    build_cp_async_commit_and_wait(&b, &ctx, &module);
+    call_barrier0(&ctx, &module, &b);
 
-    builder.position_at_end(load_bb);
-    {
-        // A chunk 0
-        let a_col0 = builder.build_int_add(t_next, a_tile_col0, "").unwrap();
-        let a_idx0 = builder.build_int_add(
-            builder.build_int_mul(a_glob_row0, k_p, "").unwrap(), a_col0, "",
-        ).unwrap();
-        let a_gep0 = unsafe { builder.build_gep(f16_ty, a_ptr, &[a_idx0], "").unwrap() };
-        let sa_gep0 = unsafe { builder.build_gep(f16_ty, load_a, &[tid_x16], "").unwrap() };
-        build_cp_async_16(&builder, &context, &module, sa_gep0, a_gep0);
-        // A chunk 1
-        let a_col1 = builder.build_int_add(t_next, a_tile_col1, "").unwrap();
-        let a_idx1 = builder.build_int_add(
-            builder.build_int_mul(a_glob_row1, k_p, "").unwrap(), a_col1, "",
-        ).unwrap();
-        let a_gep1 = unsafe { builder.build_gep(f16_ty, a_ptr, &[a_idx1], "").unwrap() };
-        let sa_gep1 = unsafe { builder.build_gep(f16_ty, load_a, &[tid_x16_p8], "").unwrap() };
-        build_cp_async_16(&builder, &context, &module, sa_gep1, a_gep1);
-        // B
-        let b_row = builder.build_int_add(t_next, b_tile_row, "").unwrap();
-        let b_idx = builder.build_int_add(
-            builder.build_int_mul(b_row, n_p, "").unwrap(), b_glob_col, "",
-        ).unwrap();
-        let b_gep = unsafe { builder.build_gep(f16_ty, b_ptr, &[b_idx], "").unwrap() };
-        let sb_gep = unsafe { builder.build_gep(f16_ty, load_b, &[tid_x8], "").unwrap() };
-        build_cp_async_16(&builder, &context, &module, sb_gep, b_gep);
-
-        build_cp_async_commit_and_wait(&builder, &context, &module);
-    }
-    builder.build_unconditional_branch(compute_bb).unwrap();
-
-    // ── Compute: load fragments from current buffer and do MMA ──
-    builder.position_at_end(compute_bb);
-
-    // Load A fragments from comp_a
+    // ── Load A fragments with swizzled reads ──
     let mut a_frags: Vec<IntValue> = Vec::new();
     for rm in 0..REG_M as u64 {
-        let rm_off = builder.build_int_add(wy_off, ci(rm * MMA_M as u64), "rmo").unwrap();
+        let rm_off = b.build_int_add(wy_off, ci(rm * MMA_M as u64), "").unwrap();
         for (row_add, col_add) in [(0u64, 0u64), (8, 0), (0, 8), (8, 8)] {
-            let frow = builder.build_int_add(
-                builder.build_int_add(rm_off, group, "").unwrap(),
-                ci(row_add), "",
+            let frow = b.build_int_add(
+                b.build_int_add(rm_off, group, "").unwrap(), ci(row_add), "",
             ).unwrap();
-            let fcol = builder.build_int_add(tg2, ci(col_add), "").unwrap();
-            let idx = builder.build_int_add(
-                builder.build_int_mul(frow, ci(BK as u64), "").unwrap(), fcol, "",
+            let fcol = b.build_int_add(tg2, ci(col_add), "").unwrap();
+            let lin_idx = b.build_int_add(
+                b.build_int_mul(frow, ci(BK as u64), "").unwrap(), fcol, "",
             ).unwrap();
-            let gep = unsafe { builder.build_gep(f16_ty, comp_a, &[idx], "").unwrap() };
-            let val = builder.build_load(i32_ty, gep, "").unwrap().into_int_value();
-            a_frags.push(val);
+            let sw_idx = build_swizzle(&b, &ctx, lin_idx);
+            let gep = unsafe { b.build_gep(f16_ty, smem_a, &[sw_idx], "").unwrap() };
+            a_frags.push(b.build_load(i32_ty, gep, "").unwrap().into_int_value());
         }
     }
 
-    // Load B fragments from comp_b
+    // ── Load B fragments with swizzled reads ──
     let mut b_frags: Vec<IntValue> = Vec::new();
     for rn in 0..REG_N as u64 {
-        let b_col = builder.build_int_add(
-            builder.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap(),
-            group, "bcol",
+        let b_col = b.build_int_add(
+            b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap(),
+            group, "",
         ).unwrap();
         for k_add in [0u64, 8] {
-            let k0 = builder.build_int_add(tg2, ci(k_add), "k0").unwrap();
-            let k1 = builder.build_int_add(k0, ci(1), "k1").unwrap();
-            let idx0 = builder.build_int_add(
-                builder.build_int_mul(k0, ci(BN as u64), "").unwrap(), b_col, "",
+            let k0 = b.build_int_add(tg2, ci(k_add), "").unwrap();
+            let k1 = b.build_int_add(k0, ci(1), "").unwrap();
+            let lin0 = b.build_int_add(
+                b.build_int_mul(k0, ci(BN as u64), "").unwrap(), b_col, "",
             ).unwrap();
-            let idx1 = builder.build_int_add(
-                builder.build_int_mul(k1, ci(BN as u64), "").unwrap(), b_col, "",
+            let lin1 = b.build_int_add(
+                b.build_int_mul(k1, ci(BN as u64), "").unwrap(), b_col, "",
             ).unwrap();
-            let gep0 = unsafe { builder.build_gep(f16_ty, comp_b, &[idx0], "").unwrap() };
-            let gep1 = unsafe { builder.build_gep(f16_ty, comp_b, &[idx1], "").unwrap() };
-            let v0 = builder.build_load(f16_ty, gep0, "bv0").unwrap();
-            let v1 = builder.build_load(f16_ty, gep1, "bv1").unwrap();
-            let vec = builder.build_insert_element(
-                v2f16_ty.get_undef(), v0, ci(0), "bvec0",
-            ).unwrap();
-            let vec = builder.build_insert_element(vec, v1, ci(1), "bvec1").unwrap();
-            let packed = builder.build_bit_cast(vec, i32_ty, "bpk").unwrap().into_int_value();
-            b_frags.push(packed);
+            let sw0 = build_swizzle(&b, &ctx, lin0);
+            let sw1 = build_swizzle(&b, &ctx, lin1);
+            let gep0 = unsafe { b.build_gep(f16_ty, smem_b, &[sw0], "").unwrap() };
+            let gep1 = unsafe { b.build_gep(f16_ty, smem_b, &[sw1], "").unwrap() };
+            let v0 = b.build_load(f16_ty, gep0, "").unwrap();
+            let v1 = b.build_load(f16_ty, gep1, "").unwrap();
+            let vec = b.build_insert_element(v2f16_ty.get_undef(), v0, ci(0), "").unwrap();
+            let vec = b.build_insert_element(vec, v1, ci(1), "").unwrap();
+            b_frags.push(b.build_bit_cast(vec, i32_ty, "").unwrap().into_int_value());
         }
     }
 
-    // REG_M × REG_N MMA operations
+    // ── REG_M × REG_N MMA operations ──
     let mut new_accs: Vec<FloatValue> = Vec::new();
     for rm in 0..REG_M {
         for rn in 0..REG_N {
             let acc_base = (rm * REG_N * 4 + rn * 4) as usize;
             let a_base = (rm * 4) as usize;
             let b_base = (rn * 2) as usize;
-
             let [d0, d1, d2, d3] = build_mma_asm(
-                &builder, &context, &module,
+                &b, &ctx, &module,
                 &[a_frags[a_base], a_frags[a_base+1], a_frags[a_base+2], a_frags[a_base+3]],
                 &[b_frags[b_base], b_frags[b_base+1]],
                 &[
@@ -444,60 +387,52 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
         }
     }
 
-    // Barrier before next iteration (wait for next tile's cp.async to land)
-    call_barrier0(&context, &module, &builder);
+    call_barrier0(&ctx, &module, &b);
 
-    // Flip buffer: 0→1, 1→0
-    let buf_next = builder.build_int_sub(ci(1), buf, "bn").unwrap();
-    builder.build_unconditional_branch(kloop_hdr).unwrap();
+    let t_next = b.build_int_add(t, ci(BK as u64), "tn").unwrap();
+    b.build_unconditional_branch(kloop_hdr).unwrap();
 
     // Wire phi nodes
-    t_phi.add_incoming(&[(&ci(0), entry), (&t_next, compute_bb)]);
-    buf_phi.add_incoming(&[(&ci(0), entry), (&buf_next, compute_bb)]);
+    t_phi.add_incoming(&[(&ci(0), entry), (&t_next, kloop_body)]);
     for i in 0..num_acc {
-        acc_phis[i].add_incoming(&[(&f0, entry), (&new_accs[i], compute_bb)]);
+        acc_phis[i].add_incoming(&[(&f0, entry), (&new_accs[i], kloop_body)]);
     }
 
     // ── K-loop exit: store C ──
-    builder.position_at_end(kloop_exit);
-
-    let wy_off_exit = builder.build_int_mul(wy, ci(WM as u64), "wyo2").unwrap();
-    let wx_off_exit = builder.build_int_mul(wx, ci(WN as u64), "wxo2").unwrap();
+    b.position_at_end(kloop_exit);
 
     for rm in 0..REG_M {
         for rn in 0..REG_N {
             let acc_base = (rm * REG_N * 4 + rn * 4) as usize;
             for d in 0..4u32 {
                 let mma_row_off = if d < 2 { group } else {
-                    builder.build_int_add(group, ci(8), "").unwrap()
+                    b.build_int_add(group, ci(8), "").unwrap()
                 };
                 let mma_col_off = if d % 2 == 0 { tg2 } else {
-                    builder.build_int_add(tg2, ci(1), "").unwrap()
+                    b.build_int_add(tg2, ci(1), "").unwrap()
                 };
 
-                let c_row = builder.build_int_add(
-                    builder.build_int_add(block_row, wy_off_exit, "").unwrap(),
-                    builder.build_int_add(ci(rm as u64 * MMA_M as u64), mma_row_off, "").unwrap(),
+                let c_row = b.build_int_add(
+                    b.build_int_add(block_row, wy_off, "").unwrap(),
+                    b.build_int_add(ci(rm as u64 * MMA_M as u64), mma_row_off, "").unwrap(),
                     "",
                 ).unwrap();
-                let c_col = builder.build_int_add(
-                    builder.build_int_add(block_col, wx_off_exit, "").unwrap(),
-                    builder.build_int_add(ci(rn as u64 * MMA_N as u64), mma_col_off, "").unwrap(),
+                let c_col = b.build_int_add(
+                    b.build_int_add(block_col, wx_off, "").unwrap(),
+                    b.build_int_add(ci(rn as u64 * MMA_N as u64), mma_col_off, "").unwrap(),
                     "",
                 ).unwrap();
-                let c_idx = builder.build_int_add(
-                    builder.build_int_mul(c_row, n_p, "").unwrap(), c_col, "",
+                let c_idx = b.build_int_add(
+                    b.build_int_mul(c_row, n_p, "").unwrap(), c_col, "",
                 ).unwrap();
-                let gep = unsafe {
-                    builder.build_gep(f32_ty, c_ptr, &[c_idx], "").unwrap()
-                };
+                let gep = unsafe { b.build_gep(f32_ty, c_ptr, &[c_idx], "").unwrap() };
                 let val = acc_phis[acc_base + d as usize].as_basic_value().into_float_value();
-                builder.build_store(gep, val).unwrap();
+                b.build_store(gep, val).unwrap();
             }
         }
     }
 
-    builder.build_return(None).unwrap();
+    b.build_return(None).unwrap();
 
     let buf = machine
         .write_to_memory_buffer(&module, FileType::Assembly)

@@ -32,7 +32,7 @@ const TILE_N: u32 = 32;
 const TILE_K: u32 = 16;
 const PART_M: u32 = 4;  // tiles per partition along M
 const PART_N: u32 = 4;  // tiles per partition along N
-const PART_K: u32 = 2;  // tiles per partition along K
+const PART_K: u32 = 1;  // tiles per partition along K (no K-unroll)
 const STAGE_M: u32 = 4; // partitions per stage along M (= num warps)
 
 // Derived
@@ -337,20 +337,12 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
 
     let f0 = f32_ty.const_float(0.0);
 
-    // Precompute loading offsets. 128 threads load 8192 f16 each for A and B.
-    // A: 128×32 = 4096 f16 → 32/thread → 4 cp.async(8)
-    // B: 32×128 = 4096 f16 → 32/thread → 4 cp.async(8)
-    // Total: 8 cp.async per thread per K-step
-    // We'll use a loop for this rather than unrolling 8 times in the IR.
-    // Each cp.async copies 16 bytes (8 f16).
-
     b.build_unconditional_branch(kloop_hdr).unwrap();
 
     // ── K-loop header ──
     b.position_at_end(kloop_hdr);
     let t_phi = b.build_phi(i32_ty, "t").unwrap();
-    // REG_M=2 * REG_N=16 * 4 = 128 accumulators
-    let num_acc = (REG_M * REG_N * 4) as usize;
+    let num_acc = (REG_M * REG_N * 4) as usize; // 2*8*4 = 64
     let mut acc_phis = Vec::new();
     for i in 0..num_acc {
         acc_phis.push(b.build_phi(f32_ty, &format!("acc{i}")).unwrap());
@@ -362,15 +354,13 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
     // ── K-loop body ──
     b.position_at_end(kloop_body);
 
-    // ── Load A[128×32] and B[32×128] into shared memory ──
-    // 4096 f16 each = 8192 bytes each
-    // 128 threads, 32 elements/thread each, 4 cp.async per matrix
-    for chunk in 0..4u64 {
+    // ── Load A[128×16] and B[16×64] into shared memory ──
+    // A: 2048 f16, 128 threads → 16/thread → 2 cp.async(8)
+    for chunk in 0..2u64 {
         let base = b.build_int_add(
-            b.build_int_mul(tid, ci(32), "").unwrap(),
+            b.build_int_mul(tid, ci(16), "").unwrap(),
             ci(chunk * 8), "",
         ).unwrap();
-        // For A: linear index → (row, col) in [128×32]
         let a_row = b.build_int_unsigned_div(base, ci(STAGE_DIM_K as u64), "").unwrap();
         let a_col = b.build_int_unsigned_rem(base, ci(STAGE_DIM_K as u64), "").unwrap();
         let a_grow = b.build_int_add(block_row, a_row, "").unwrap();
@@ -383,13 +373,9 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
         let sa_gep = unsafe { b.build_gep(f16_ty, smem_a, &[a_sw], "").unwrap() };
         build_cp_async_16(&b, &ctx, &module, sa_gep, a_gep);
     }
-
-    // B: 32×64=2048 f16, 128 threads → 16/thread → 2 cp.async
-    for chunk in 0..2u64 {
-        let base = b.build_int_add(
-            b.build_int_mul(tid, ci(16), "").unwrap(),
-            ci(chunk * 8), "",
-        ).unwrap();
+    // B: 1024 f16, 128 threads → 8/thread → 1 cp.async(8)
+    {
+        let base = b.build_int_mul(tid, ci(8), "").unwrap();
         let b_row = b.build_int_unsigned_div(base, ci(STAGE_DIM_N as u64), "").unwrap();
         let b_col = b.build_int_unsigned_rem(base, ci(STAGE_DIM_N as u64), "").unwrap();
         let b_grow = b.build_int_add(t, b_row, "").unwrap();

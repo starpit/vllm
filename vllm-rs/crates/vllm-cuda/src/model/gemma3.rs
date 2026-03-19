@@ -1274,7 +1274,7 @@ impl Gemma3Model {
                 device.compute_stream,
             );
             drop(residual);
-            ForwardOutput::Logits(hidden_states.into_gpu_tensor())
+            ForwardOutput::Logits(hidden_states)
         } else {
             ForwardOutput::Intermediate {
                 hidden_states,
@@ -1393,24 +1393,29 @@ impl Gemma3ForCausalLM {
         match backbone_out {
             ForwardOutput::Intermediate { .. } => backbone_out,
             ForwardOutput::Logits(hidden_states) => {
-                let hidden_states = if let Some(indices) = last_token_indices {
-                    kernels::embedding_gather(
-                        hidden_states,
+                let gathered = if let Some(indices) = last_token_indices {
+                    Some(kernels::embedding_gather(
+                        *hidden_states,
                         *indices,
                         &mut device.caching,
                         device.compute_stream,
-                    )
-                    .into_gpu_tensor()
+                    ))
                 } else {
-                    hidden_states
+                    None
+                };
+                let hs_view = if let Some(ref g) = gathered {
+                    g.view()
+                } else {
+                    hidden_states.view()
                 };
 
-                let logits = self.lm_head.forward(
-                    TensorView::from_raw(hidden_states),
-                    &mut device.cublas,
-                    &mut device.caching,
-                );
-                ForwardOutput::Logits(logits.into_gpu_tensor())
+                let logits = self
+                    .lm_head
+                    .forward(hs_view, &mut device.cublas, &mut device.caching);
+                // hidden_states can be freed now.
+                drop(gathered);
+                drop(hidden_states);
+                ForwardOutput::Logits(logits)
             }
         }
     }

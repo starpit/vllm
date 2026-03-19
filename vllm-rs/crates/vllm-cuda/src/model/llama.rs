@@ -35,7 +35,8 @@ use std::sync::Arc;
 /// the hidden states and residual to pass to the next stage.
 pub enum ForwardOutput {
     /// Final logits `[num_reqs, vocab_size]` — only from the last PP stage.
-    Logits(GpuTensor),
+    /// Wrapped in `OwnedTensor` so GPU memory is freed on drop (RAII).
+    Logits(OwnedTensor),
     /// Intermediate hidden states + residual to send to next PP stage.
     /// Both are `[num_tokens, hidden_size]` in the model's compute dtype.
     Intermediate {
@@ -3007,7 +3008,7 @@ impl LlamaModel {
                 device.compute_stream,
             );
             drop(residual);
-            ForwardOutput::Logits(hidden_states.into_gpu_tensor())
+            ForwardOutput::Logits(hidden_states)
         } else {
             // Non-last stage: pass hidden_states + residual to next stage.
             ForwardOutput::Intermediate {
@@ -3141,7 +3142,7 @@ impl LlamaForCausalLM {
                 // Last stage: lm_head projection.
                 let gathered = if let Some(indices) = last_token_indices {
                     Some(kernels::embedding_gather(
-                        hidden_states,
+                        *hidden_states,
                         *indices,
                         &mut device.caching,
                         device.compute_stream,
@@ -3152,9 +3153,7 @@ impl LlamaForCausalLM {
                 let hs_view = if let Some(ref g) = gathered {
                     g.view()
                 } else {
-                    // Safety: hidden_states GpuTensor from ForwardOutput is valid
-                    // for this scope — the underlying memory is alive.
-                    unsafe { TensorView::from_raw(hidden_states) }
+                    hidden_states.view()
                 };
 
                 #[allow(unused_mut)]
@@ -3164,6 +3163,9 @@ impl LlamaForCausalLM {
                     &mut device.caching,
                     device.compute_stream,
                 );
+                // hidden_states can be freed now.
+                drop(gathered);
+                drop(hidden_states);
 
                 // TP: all-gather logits.
                 #[cfg(feature = "nccl")]
@@ -3181,7 +3183,7 @@ impl LlamaForCausalLM {
                     );
                 }
 
-                ForwardOutput::Logits(logits.into_gpu_tensor())
+                ForwardOutput::Logits(logits)
             }
         }
     }

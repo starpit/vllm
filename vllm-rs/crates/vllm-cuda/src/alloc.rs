@@ -77,6 +77,10 @@ struct BlockPool {
     is_small: bool,
 }
 
+// Safety: BlockPool contains raw pointers to Block structs and GPU memory,
+// but these are only accessed through &mut self methods. The allocator is
+// single-threaded; Send is needed so CachingAllocator (which owns pools) can
+// be moved to the worker thread.
 unsafe impl Send for BlockPool {}
 
 impl BlockPool {
@@ -133,6 +137,11 @@ pub struct CachingAllocator {
     peak_active_bytes: usize,
 }
 
+// Safety: CachingAllocator contains raw pointers to GPU memory and Block
+// structs. All mutation goes through &mut self, so there is no interior
+// mutability. The allocator is created on the main thread and moved to the
+// GPU worker thread (Send). Sync is needed because &CachingAllocator may be
+// read from diagnostic/stats paths while the worker holds &mut.
 unsafe impl Send for CachingAllocator {}
 unsafe impl Sync for CachingAllocator {}
 
@@ -603,6 +612,125 @@ impl Drop for CachingAllocator {
 }
 
 // ---------------------------------------------------------------------------
+// RawGpuAlloc — RAII wrapper for raw driver::mem_alloc() GPU memory
+// ---------------------------------------------------------------------------
+
+/// RAII wrapper for GPU memory allocated directly via `driver::mem_alloc()`.
+///
+/// Unlike `OwnedTensor` (which returns memory to the caching allocator),
+/// `RawGpuAlloc` calls `driver::mem_free()` on drop, matching the raw
+/// allocation. Used for persistent buffers (e.g. PP recv buffers) that
+/// are not managed by the caching allocator.
+pub struct RawGpuAlloc {
+    inner: GpuTensor,
+    size_bytes: usize,
+}
+
+// Safety: GPU device pointers are accessible from any host thread after the
+// CUDA context is established. The GpuTensor inside is a plain pointer+metadata
+// with no thread-local state.
+unsafe impl Send for RawGpuAlloc {}
+unsafe impl Sync for RawGpuAlloc {}
+
+impl RawGpuAlloc {
+    /// Allocate raw GPU memory and wrap it in a `GpuTensor` with the given shape/dtype.
+    ///
+    /// # Safety
+    /// Requires an active CUDA context on the current thread.
+    pub unsafe fn new(shape: &[usize], dtype: DType) -> anyhow::Result<Self> {
+        let numel: usize = shape.iter().product();
+        let size_bytes = numel * dtype.size_bytes();
+        let ptr = driver::mem_alloc(size_bytes)?;
+        let inner = GpuTensor::new(ptr, shape, dtype);
+        Ok(Self { inner, size_bytes })
+    }
+
+    /// Access the underlying `GpuTensor` (non-owning, Copy).
+    pub fn as_gpu_tensor(&self) -> GpuTensor {
+        self.inner
+    }
+
+    /// Borrow as a lifetime-checked `TensorView`.
+    pub fn view(&self) -> TensorView<'_> {
+        // Safety: self owns the GPU memory; the view borrows &self.
+        unsafe { TensorView::from_raw(self.inner) }
+    }
+}
+
+impl Drop for RawGpuAlloc {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = driver::mem_free(self.inner.raw_ptr());
+        }
+    }
+}
+
+impl std::ops::Deref for RawGpuAlloc {
+    type Target = GpuTensor;
+    fn deref(&self) -> &GpuTensor {
+        &self.inner
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RawGpuMem — RAII wrapper for raw GPU pointer + size (no tensor metadata)
+// ---------------------------------------------------------------------------
+
+/// RAII wrapper for a raw GPU allocation (pointer + size) without tensor metadata.
+///
+/// Used for weight memory tracked by `GpuWeights` — each allocation is a raw
+/// `driver::mem_alloc()` call, and this wrapper ensures `driver::mem_free()` is
+/// called on drop. If the memory should be kept alive beyond the wrapper's
+/// lifetime, call `leak()` to take ownership and prevent the Drop.
+pub struct RawGpuMem {
+    ptr: *mut u8,
+    size: usize,
+}
+
+// Safety: GPU device pointers are accessible from any host thread after the
+// CUDA context is established. No thread-local state.
+unsafe impl Send for RawGpuMem {}
+unsafe impl Sync for RawGpuMem {}
+
+impl RawGpuMem {
+    /// Create from a raw GPU pointer and size. The caller transfers ownership.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid GPU allocation from `driver::mem_alloc()` with
+    /// the given `size`, and the caller must not free it separately.
+    pub unsafe fn new(ptr: *mut u8, size: usize) -> Self {
+        Self { ptr, size }
+    }
+
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Take ownership of the raw pointer, preventing `Drop` from freeing it.
+    /// Returns `(ptr, size)`.
+    pub fn leak(mut self) -> (*mut u8, usize) {
+        let result = (self.ptr, self.size);
+        self.ptr = std::ptr::null_mut();
+        std::mem::forget(self);
+        result
+    }
+}
+
+impl Drop for RawGpuMem {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                let _ = driver::mem_free(self.ptr);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OwnedTensor
 // ---------------------------------------------------------------------------
 
@@ -614,6 +742,11 @@ pub struct OwnedTensor {
     size_bytes: usize,
 }
 
+// Safety: OwnedTensor contains a GpuTensor (raw GPU pointer, Copy) and a raw
+// pointer to its parent CachingAllocator. GPU device pointers are thread-safe
+// after CUDA context setup. The allocator pointer is only used on Drop (via
+// &mut), and OwnedTensor is always dropped on the same worker thread that
+// created it — the pointer is not dereferenced across threads.
 unsafe impl Send for OwnedTensor {}
 unsafe impl Sync for OwnedTensor {}
 

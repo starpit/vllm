@@ -1450,9 +1450,9 @@ pub struct CudaWorker {
     _k_scale_constant: f32,
     /// V scale constant (from env or default 1.0).
     _v_scale_constant: f32,
-    /// GPU weight allocation pointers tracked for sleep/wake lifecycle.
-    /// Each entry is (gpu_ptr, size_bytes). Populated by `load_model()`.
-    weight_gpu_allocs: Vec<(*mut u8, usize)>,
+    /// GPU weight allocations tracked for sleep/wake lifecycle.
+    /// RAII: `RawGpuMem` calls `driver::mem_free` on drop.
+    weight_gpu_allocs: Vec<vllm_cuda::RawGpuMem>,
     /// Saved num_gpu_blocks for re-init after wake.
     num_gpu_blocks_saved: usize,
 
@@ -1464,15 +1464,23 @@ pub struct CudaWorker {
     pp_config: Option<vllm_cuda::PpConfig>,
     /// Persistent recv buffer for hidden_states `[max_num_tokens, hidden_size]`.
     /// Pre-allocated on non-first stages for CUDA graph compatibility.
-    pp_recv_hs_buf: Option<vllm_cuda::GpuTensor>,
+    /// RAII: `RawGpuAlloc` calls `driver::mem_free` on drop.
+    pp_recv_hs_buf: Option<vllm_cuda::RawGpuAlloc>,
     /// Persistent recv buffer for residual `[max_num_tokens, hidden_size]`.
-    pp_recv_res_buf: Option<vllm_cuda::GpuTensor>,
+    /// RAII: `RawGpuAlloc` calls `driver::mem_free` on drop.
+    pp_recv_res_buf: Option<vllm_cuda::RawGpuAlloc>,
     /// Whether a PP send from the previous iteration is pending.
     /// Sync at start of next execute_model to ensure send completed.
     #[allow(dead_code)]
     pp_send_pending: bool,
 }
 
+// Safety: CudaWorker contains raw GPU pointers (via GpuDevice, model weights,
+// KV cache, PP buffers, CUDA graphs) and raw pointer fields in OwnedTensor /
+// RawGpuAlloc / RawGpuMem. All GPU resources are allocated on a single CUDA
+// context and accessed exclusively from the worker thread. Send is required
+// because the worker is created on the main thread and moved to its dedicated
+// worker thread via the executor's spawn.
 unsafe impl Send for CudaWorker {}
 
 impl CudaWorker {
@@ -1578,23 +1586,16 @@ impl CudaWorker {
         let max_tokens = self.config.max_num_batched_tokens;
         let gpu_dtype = self.model_dtype;
 
-        let nbytes = max_tokens * hidden_size * gpu_dtype.size_bytes();
         unsafe {
-            let hs_ptr =
-                vllm_cuda::driver::mem_alloc(nbytes).expect("failed to allocate PP recv hs buffer");
-            self.pp_recv_hs_buf = Some(vllm_cuda::GpuTensor::new(
-                hs_ptr,
-                &[max_tokens, hidden_size],
-                gpu_dtype,
-            ));
+            self.pp_recv_hs_buf = Some(
+                vllm_cuda::RawGpuAlloc::new(&[max_tokens, hidden_size], gpu_dtype)
+                    .expect("failed to allocate PP recv hs buffer"),
+            );
 
-            let res_ptr = vllm_cuda::driver::mem_alloc(nbytes)
-                .expect("failed to allocate PP recv res buffer");
-            self.pp_recv_res_buf = Some(vllm_cuda::GpuTensor::new(
-                res_ptr,
-                &[max_tokens, hidden_size],
-                gpu_dtype,
-            ));
+            self.pp_recv_res_buf = Some(
+                vllm_cuda::RawGpuAlloc::new(&[max_tokens, hidden_size], gpu_dtype)
+                    .expect("failed to allocate PP recv res buffer"),
+            );
         }
     }
 
@@ -1606,8 +1607,8 @@ impl CudaWorker {
     #[cfg(feature = "nccl")]
     fn pp_recv_intermediates(
         pp_group: &vllm_cuda::nccl::NcclGroup,
-        pp_recv_hs_buf: &vllm_cuda::GpuTensor,
-        pp_recv_res_buf: &vllm_cuda::GpuTensor,
+        pp_recv_hs_buf: &vllm_cuda::RawGpuAlloc,
+        pp_recv_res_buf: &vllm_cuda::RawGpuAlloc,
         pp: vllm_cuda::PpConfig,
         num_tokens: usize,
         device: &mut GpuDevice,
@@ -4537,11 +4538,7 @@ impl Worker for CudaWorker {
             // Sync to ensure no in-flight ops reference weight memory.
             let _ = unsafe { driver::stream_synchronize(dev.compute_stream) };
         }
-        for &(ptr, _) in &self.weight_gpu_allocs {
-            unsafe {
-                let _ = driver::mem_free(ptr);
-            }
-        }
+        // Drop tracked weight allocations (RawGpuMem::Drop frees GPU memory).
         self.weight_gpu_allocs.clear();
         self.model = None;
 
@@ -4592,12 +4589,7 @@ impl Worker for CudaWorker {
         {
             let _ = dev.sync_d2h();
         }
-        // Free tracked weight allocations before dropping model.
-        for &(ptr, _) in &self.weight_gpu_allocs {
-            unsafe {
-                let _ = driver::mem_free(ptr);
-            }
-        }
+        // Drop tracked weight allocations (RawGpuMem::Drop frees GPU memory).
         self.weight_gpu_allocs.clear();
         self.model = None;
         self.kv_cache = None;
@@ -6153,13 +6145,14 @@ impl CudaWorker {
                             last_token_indices.as_ref().map(|t| t.view()),
                         )
                     };
-                    let logits = match result {
+                    let owned = match result {
                         vllm_cuda::model::llama::ForwardOutput::Logits(t) => t,
                         vllm_cuda::model::llama::ForwardOutput::Intermediate { .. } => {
                             unreachable!("last PP stage should return Logits");
                         }
                     };
-                    (None, logits)
+                    let logits = *owned;
+                    (Some(owned), logits)
                 } else {
                     let owned = unsafe {
                         model.forward(

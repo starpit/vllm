@@ -401,8 +401,8 @@ pub struct GpuWeights {
     precast_handle: Option<std::thread::JoinHandle<()>>,
     /// All GPU allocations made by `take()` / `take_into()` / `take_shard()`.
     /// Tracked so the caller can free weight memory on sleep without walking
-    /// model structs. Each entry is `(gpu_ptr, size_bytes)`.
-    gpu_allocs: Vec<(*mut u8, usize)>,
+    /// model structs. RAII: `RawGpuMem` calls `driver::mem_free` on drop.
+    gpu_allocs: Vec<crate::alloc::RawGpuMem>,
     /// Keep mmaps alive for the lifetime of GpuWeights.
     ///
     /// `take()` and `take_into()` use `memcpy_htod_async` which reads from
@@ -722,6 +722,8 @@ impl GpuWeights {
         // Fast path: check if precast pipeline has this tensor ready.
         if let Some(entry) = self.take_precast(name) {
             let gpu_ptr = unsafe { driver::mem_alloc(entry.size_bytes)? };
+            self.gpu_allocs
+                .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, entry.size_bytes) });
             unsafe {
                 driver::memcpy_htod_async(
                     gpu_ptr,
@@ -744,7 +746,8 @@ impl GpuWeights {
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
 
         let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
-        self.gpu_allocs.push((gpu_ptr, size_bytes));
+        self.gpu_allocs
+            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
 
         unsafe {
             driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
@@ -867,7 +870,8 @@ impl GpuWeights {
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
 
         let gpu_ptr = unsafe { driver::mem_alloc(size_bytes).ok()? };
-        self.gpu_allocs.push((gpu_ptr, size_bytes));
+        self.gpu_allocs
+            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
 
         unsafe {
             driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream).ok()?;
@@ -899,17 +903,23 @@ impl GpuWeights {
     /// Called by quantized weight loaders (AWQ, GPTQ, Marlin, etc.) that
     /// allocate GPU memory via `driver::mem_alloc` outside of `take()`.
     pub fn record_alloc(&mut self, ptr: *mut u8, size_bytes: usize) {
-        self.gpu_allocs.push((ptr, size_bytes));
+        self.gpu_allocs
+            .push(unsafe { crate::alloc::RawGpuMem::new(ptr, size_bytes) });
     }
 
-    /// Remove a previously-recorded allocation (e.g. after repack frees it).
+    /// Remove a previously-recorded allocation from tracking (e.g. after repack
+    /// frees it separately). The removed `RawGpuMem` is leaked — caller is
+    /// responsible for freeing the GPU memory.
     pub fn unrecord_alloc(&mut self, ptr: *mut u8) {
-        self.gpu_allocs.retain(|(p, _)| *p != ptr);
+        if let Some(pos) = self.gpu_allocs.iter().position(|m| m.ptr() == ptr) {
+            let removed = self.gpu_allocs.swap_remove(pos);
+            removed.leak(); // prevent Drop from freeing — caller will free
+        }
     }
 
-    /// Drain all tracked GPU allocations. The caller takes ownership and is
-    /// responsible for freeing them (e.g. on sleep).
-    pub fn take_gpu_allocs(&mut self) -> Vec<(*mut u8, usize)> {
+    /// Drain all tracked GPU allocations. The caller takes ownership of the
+    /// `RawGpuMem` wrappers — dropping them frees the GPU memory.
+    pub fn take_gpu_allocs(&mut self) -> Vec<crate::alloc::RawGpuMem> {
         std::mem::take(&mut self.gpu_allocs)
     }
 
@@ -1137,7 +1147,8 @@ impl GpuWeights {
 
         let size_bytes = shard_shape.iter().product::<usize>() * dtype.size_bytes();
         let gpu_ptr = unsafe { driver::mem_alloc(size_bytes)? };
-        self.gpu_allocs.push((gpu_ptr, size_bytes));
+        self.gpu_allocs
+            .push(unsafe { crate::alloc::RawGpuMem::new(gpu_ptr, size_bytes) });
         unsafe {
             driver::memcpy_htod_async(gpu_ptr, data, size_bytes, self.stream)?;
         }

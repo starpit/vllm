@@ -2063,7 +2063,7 @@ impl Gemma2Model {
                 device.compute_stream,
             );
             drop(residual);
-            ForwardOutput::Logits(hidden_states.into_gpu_tensor())
+            ForwardOutput::Logits(hidden_states)
         } else {
             ForwardOutput::Intermediate {
                 hidden_states,
@@ -2193,33 +2193,37 @@ impl Gemma2ForCausalLM {
             ForwardOutput::Intermediate { .. } => backbone_out,
             ForwardOutput::Logits(hidden_states) => {
                 // Last stage: gather last tokens then lm_head.
-                let hidden_states = if let Some(indices) = last_token_indices {
-                    kernels::embedding_gather(
-                        hidden_states,
+                let gathered = if let Some(indices) = last_token_indices {
+                    Some(kernels::embedding_gather(
+                        *hidden_states,
                         *indices,
                         &mut device.caching,
                         device.compute_stream,
-                    )
-                    .into_gpu_tensor()
+                    ))
                 } else {
-                    hidden_states
+                    None
+                };
+                let hs_view = if let Some(ref g) = gathered {
+                    g.view()
+                } else {
+                    hidden_states.view()
                 };
 
-                let hs_view = TensorView::from_raw(hidden_states);
-                let logits = self
-                    .lm_head
-                    .forward(hs_view, &mut device.cublas, &mut device.caching);
-                let logits = logits.into_gpu_tensor();
+                #[allow(unused_mut)]
+                let mut logits =
+                    self.lm_head
+                        .forward(hs_view, &mut device.cublas, &mut device.caching);
+                // hidden_states can be freed now.
+                drop(gathered);
+                drop(hidden_states);
 
                 let _ = self.final_logit_softcapping;
 
-                #[allow(unused_mut)]
-                let mut logits = logits;
                 #[cfg(feature = "nccl")]
                 if let Some(ref group) = self.tp_group {
-                    logits = group
-                        .all_gather(logits, &mut device.caching)
-                        .into_gpu_tensor();
+                    let gathered = group.all_gather(logits.as_gpu_tensor(), &mut device.caching);
+                    drop(logits);
+                    logits = gathered;
                 }
 
                 ForwardOutput::Logits(logits)

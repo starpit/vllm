@@ -38,6 +38,10 @@ pub struct KvCachePool {
     v_scale_ptrs: Vec<*mut f32>,
 }
 
+// Safety: KvCachePool holds GPU device pointers (GpuTensor arrays and raw
+// *mut f32 scale pointers). These are allocated via the CUDA driver and are
+// accessible from any host thread after context setup. The pool is created
+// once and moved to the worker thread; no concurrent mutation occurs.
 unsafe impl Send for KvCachePool {}
 unsafe impl Sync for KvCachePool {}
 

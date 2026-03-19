@@ -73,6 +73,10 @@ pub struct CudaGraphRunner {
     fp8_v_scales: Vec<f32>,
 }
 
+// Safety: CudaGraphRunner holds GPU device pointers (input/output tensors) and
+// a captured CUDA graph handle. These are CUDA driver objects that are
+// thread-safe after context setup. The runner is created and used exclusively
+// on the GPU worker thread.
 unsafe impl Send for CudaGraphRunner {}
 
 impl CudaGraphRunner {
@@ -630,6 +634,9 @@ pub struct PrefillGraphRunner {
     vocab_size: usize,
 }
 
+// Safety: PrefillGraphRunner holds GPU device pointers and a captured CUDA
+// graph handle, same as CudaGraphRunner. Created and used on the GPU worker
+// thread only.
 unsafe impl Send for PrefillGraphRunner {}
 
 #[derive(Clone, Copy)]

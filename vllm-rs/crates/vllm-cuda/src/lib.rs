@@ -68,7 +68,7 @@ pub use tcp_store::TcpControlChannel;
 pub mod weights;
 
 #[cfg(feature = "cuda")]
-pub use alloc::{CachingAllocator, OwnedTensor};
+pub use alloc::{CachingAllocator, OwnedTensor, RawGpuAlloc, RawGpuMem};
 #[cfg(feature = "cuda")]
 pub use cpu_gpu_buf::{CpuGpuBuf, PinnedBuf};
 #[cfg(feature = "cuda")]

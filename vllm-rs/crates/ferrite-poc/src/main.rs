@@ -7,9 +7,13 @@
 //
 //   LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo run -p ferrite-poc --release
 
+#[allow(unused)]
 mod mma_gemm;
+#[allow(unused)]
 mod tiled_mma;
+#[allow(unused)]
 mod cubek_gemm;
+#[allow(unused, unsafe_op_in_unsafe_fn)]
 mod sweep;
 
 use anyhow::{Context, Result, bail};

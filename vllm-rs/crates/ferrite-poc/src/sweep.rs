@@ -210,7 +210,11 @@ fn emit_kernel_inner(sm: &str, bm: u32, bn: u32, bk: u32, wm_: u32, wn_: u32, do
     }, ptr_s, "").unwrap();
 
     let acc_phi_ty = if acc_f16 { i32_ty.as_basic_type_enum() } else { f32_ty.as_basic_type_enum() };
-    let acc_zero = if acc_f16 { i32_ty.const_int(0, false).into() } else { f32_ty.const_float(0.0).into() };
+    let acc_zero: inkwell::values::BasicValueEnum = if acc_f16 {
+        i32_ty.const_int(0, false).into()
+    } else {
+        f32_ty.const_float(0.0).into()
+    };
 
     let ea = bm * bk; let eb = bk * bn;
     let pa = ea / threads; let pb = eb / threads;

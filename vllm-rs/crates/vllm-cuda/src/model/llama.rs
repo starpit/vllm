@@ -379,6 +379,9 @@ pub struct LlamaAttention {
     pub q_norm_weight: Option<GpuTensor>,
     pub k_norm_weight: Option<GpuTensor>,
     pub qk_norm_eps: f32,
+    /// When true, K is stored unrotated in cache and FA2 applies RoPE in
+    /// shared memory during attention (fused RoPE for spans).
+    pub fuse_rope: bool,
     /// NCCL group for TP all-reduce after o_proj (row parallel).
     #[cfg(feature = "nccl")]
     pub tp_group: Option<Arc<NcclGroup>>,
@@ -515,8 +518,85 @@ impl LlamaAttention {
                     device.compute_stream,
                 );
                 (q, k, v)
+            } else if max_seqlen_q == 1 && self.fuse_rope {
+                // Fused RoPE decode: store K unrotated, FA2 rotates in shared mem.
+                let (q, k, v) = kernels::split_qkv(
+                    qkv.as_gpu_tensor(),
+                    self.q_size,
+                    self.kv_size,
+                    self.num_q_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(qkv);
+
+                // Apply RoPE to Q only — K stays unrotated for FA2 fused path.
+                kernels::rotary_embedding_q_only(
+                    q.as_gpu_tensor(),
+                    *positions,
+                    rotary.cos_sin_cache,
+                    self.num_q_heads,
+                    self.head_dim,
+                    device.compute_stream,
+                );
+
+                // Write unrotated K and V to cache.
+                crate::model::attention_helpers::write_kv_cache(
+                    k.view(),
+                    v.view(),
+                    slot_mapping,
+                    kv_cache,
+                    self.layer_idx,
+                    device.compute_stream,
+                );
+                drop(k);
+                drop(v);
+
+                // FA2 with fused RoPE: pass cos_sin_cache so kernel rotates
+                // cached K in shared memory during attention.
+                let rotary_dim = rotary.cos_sin_cache.dim(1);
+                let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
+                    q.view(),
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    self.scale,
+                    0.0,
+                    -1,
+                    kv_cache,
+                    self.layer_idx,
+                    device.num_sm,
+                    &mut device.caching,
+                    device.compute_stream,
+                    rotary.cos_sin_cache.raw_ptr() as *const u8,
+                    rotary_dim,
+                );
+                drop(q);
+
+                // Reshape to [num_tokens, q_size] and output projection.
+                let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
+                let result = self.o_proj.forward(
+                    attn_flat,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(attn_output);
+
+                #[cfg(feature = "nccl")]
+                if let Some(ref group) = self.tp_group {
+                    group
+                        .all_reduce_inplace(result.as_gpu_tensor())
+                        .expect("o_proj all_reduce failed");
+                }
+
+                return result;
             } else if max_seqlen_q == 1 {
-                // Decode path: fused QKV split + RoPE + cache write.
+                // Standard decode: fused QKV split + RoPE + cache write.
                 // K/V go directly into paged cache — no intermediate allocation.
                 let q = if kv_cache.is_fp8() {
                     kernels::fused_qkv_rope_cache_fp8(
@@ -553,23 +633,36 @@ impl LlamaAttention {
                 };
                 drop(qkv);
 
-                // Decode attention reads from cache (K/V already written by fused kernel).
-                // Use attention_standard which handles both BF16 paged and FP8 dequant paths.
-                let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
-                    q.view(),
+                // Decode attention with span rotation (external kernel pre/post).
+                let attn_output = crate::model::attention_helpers::with_span_rotation(
+                    kv_cache,
+                    self.layer_idx,
+                    TensorView::from_raw(rotary.cos_sin_cache),
                     cu_seqlens_q,
                     seqused_k,
                     block_table,
-                    max_seqlen_q,
                     max_seqlen_k,
-                    self.scale,
-                    0.0,
-                    -1,
-                    kv_cache,
-                    self.layer_idx,
-                    device.num_sm,
-                    &mut device.caching,
                     device.compute_stream,
+                    || {
+                        crate::model::attention_helpers::attention_decode_from_cache(
+                            q.view(),
+                            cu_seqlens_q,
+                            seqused_k,
+                            block_table,
+                            max_seqlen_q,
+                            max_seqlen_k,
+                            self.scale,
+                            0.0,
+                            -1,
+                            kv_cache,
+                            self.layer_idx,
+                            device.num_sm,
+                            &mut device.caching,
+                            device.compute_stream,
+                            std::ptr::null(),
+                            0,
+                        )
+                    },
                 );
                 drop(q);
 
@@ -583,7 +676,94 @@ impl LlamaAttention {
                 );
                 drop(attn_output);
 
-                // TP: all-reduce o_proj output (row parallel).
+                #[cfg(feature = "nccl")]
+                if let Some(ref group) = self.tp_group {
+                    group
+                        .all_reduce_inplace(result.as_gpu_tensor())
+                        .expect("o_proj all_reduce failed");
+                }
+
+                return result;
+            } else if self.fuse_rope {
+                // Fused RoPE prefill: split QKV, apply RoPE to Q only, store K
+                // unrotated. FA2 paged path rotates cached K in shared memory.
+                // For fresh prefill (contiguous path), K is also passed directly
+                // to FA2 contiguous which does NOT fuse RoPE — so we apply full
+                // RoPE to both Q and K here. The unrotated K written to cache is
+                // what matters for future paged reads.
+                let (q, k, v) = kernels::split_qkv(
+                    qkv.as_gpu_tensor(),
+                    self.q_size,
+                    self.kv_size,
+                    self.num_q_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(qkv);
+
+                // Apply RoPE to both Q and K for correct fresh-prefill attention.
+                // K in cache will be unrotated (written before RoPE is applied
+                // in-place, since write_kv_cache happens after this block returns
+                // the (q, k, v) tuple... but wait, k is modified in-place here).
+                //
+                // We need K unrotated in cache but rotated for fresh attention.
+                // Solution: write K to cache FIRST (unrotated), then apply RoPE
+                // to both Q and K for the contiguous attention path.
+                crate::model::attention_helpers::write_kv_cache(
+                    k.view(),
+                    v.view(),
+                    slot_mapping,
+                    kv_cache,
+                    self.layer_idx,
+                    device.compute_stream,
+                );
+
+                // Now apply RoPE to both Q and K in-place (for fresh attention).
+                kernels::rotary_embedding_inplace(
+                    q.as_gpu_tensor(),
+                    k.as_gpu_tensor(),
+                    *positions,
+                    rotary.cos_sin_cache,
+                    self.head_dim,
+                    device.compute_stream,
+                );
+
+                // Attention: fresh prefill uses contiguous rotated K directly;
+                // paged path uses fused RoPE on cached (unrotated) K.
+                let rotary_dim = rotary.cos_sin_cache.dim(1);
+                let attn_output = crate::model::attention_helpers::attention_standard(
+                    q.view(),
+                    k.view(),
+                    v.view(),
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    self.scale,
+                    kv_cache,
+                    self.layer_idx,
+                    device.num_sm,
+                    &mut device.caching,
+                    device.compute_stream,
+                    rotary.cos_sin_cache.raw_ptr() as *const u8,
+                    rotary_dim,
+                );
+                drop(q);
+                drop(k);
+                drop(v);
+
+                let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
+                let result = self.o_proj.forward(
+                    attn_flat,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(attn_output);
+
                 #[cfg(feature = "nccl")]
                 if let Some(ref group) = self.tp_group {
                     group
@@ -593,7 +773,7 @@ impl LlamaAttention {
 
                 return result;
             } else {
-                // Prefill path: standard fused QKV split + RoPE.
+                // Standard prefill: fused QKV split + RoPE (rotates both Q and K).
                 let result = kernels::fused_qkv_rope(
                     qkv.as_gpu_tensor(),
                     *positions,
@@ -610,7 +790,7 @@ impl LlamaAttention {
                 result
             };
 
-        // Write new K/V into paged cache (BF16→FP8 when FP8 cache, else direct copy).
+        // Write new K/V into paged cache.
         crate::model::attention_helpers::write_kv_cache(
             k.view(),
             v.view(),
@@ -620,22 +800,36 @@ impl LlamaAttention {
             device.compute_stream,
         );
 
-        // Attention: fresh prefill uses BF16 K/V, decode reads from cache.
-        let attn_output = crate::model::attention_helpers::attention_standard(
-            q.view(),
-            k.view(),
-            v.view(),
+        // Standard prefill attention with span rotation (external kernel pre/post).
+        let attn_output = crate::model::attention_helpers::with_span_rotation(
+            kv_cache,
+            self.layer_idx,
+            TensorView::from_raw(rotary.cos_sin_cache),
             cu_seqlens_q,
             seqused_k,
             block_table,
-            max_seqlen_q,
             max_seqlen_k,
-            self.scale,
-            kv_cache,
-            self.layer_idx,
-            device.num_sm,
-            &mut device.caching,
             device.compute_stream,
+            || {
+                crate::model::attention_helpers::attention_standard(
+                    q.view(),
+                    k.view(),
+                    v.view(),
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    self.scale,
+                    kv_cache,
+                    self.layer_idx,
+                    device.num_sm,
+                    &mut device.caching,
+                    device.compute_stream,
+                    std::ptr::null(),
+                    0,
+                )
+            },
         );
         drop(q);
         drop(k);
@@ -1106,6 +1300,7 @@ impl LlamaAttention {
             q_norm_weight: None,
             k_norm_weight: None,
             qk_norm_eps: 0.0,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -1283,6 +1478,7 @@ impl LlamaAttention {
             q_norm_weight: None,
             k_norm_weight: None,
             qk_norm_eps: 0.0,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -1345,6 +1541,7 @@ impl LlamaAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -1408,6 +1605,7 @@ impl LlamaAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -2112,6 +2310,7 @@ impl LlamaAttention {
             q_norm_weight: None,
             k_norm_weight: None,
             qk_norm_eps: 0.0,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -2398,6 +2597,7 @@ impl LlamaForCausalLM {
                 q_norm_weight,
                 k_norm_weight,
                 qk_norm_eps,
+                fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
                 #[cfg(feature = "nccl")]
                 tp_group: None,
             };
@@ -2723,6 +2923,7 @@ impl LlamaAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps: 1e-6,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
             #[cfg(feature = "nccl")]
             tp_group: None,
         })

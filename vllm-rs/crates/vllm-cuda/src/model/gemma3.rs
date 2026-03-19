@@ -298,6 +298,8 @@ impl Gemma3Attention {
             device.num_sm,
             &mut device.caching,
             device.compute_stream,
+            std::ptr::null(),
+            0,
         );
         drop(k_normed);
         drop(v);

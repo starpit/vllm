@@ -39,33 +39,28 @@ const BOLD: &str = "\x1b[1m";
 const BLOCK_CHAR: char = '\u{2588}'; // full block: █
 
 /// Render a permutation as color-coded block characters.
-fn render_perm(perm: &[usize], doc_blocks: usize) -> String {
+fn render_perm(perm: &[usize], _doc_blocks: usize) -> String {
     let mut s = String::new();
     for &doc_idx in perm {
         let color = DOC_COLORS[doc_idx % DOC_COLORS.len()];
-        for _ in 0..doc_blocks {
-            s.push_str(color);
-            s.push(BLOCK_CHAR);
-        }
+        s.push_str(color);
+        s.push(BLOCK_CHAR);
     }
     s.push_str(RST);
     s
 }
 
 /// Render the document legend.
-fn render_legend(num_docs: usize, doc_blocks: usize) -> String {
+fn render_legend(num_docs: usize, _doc_blocks: usize) -> String {
     let mut s = String::new();
-    let show = doc_blocks.min(2);
     for i in 0..num_docs {
         if i > 0 {
             s.push_str("  ");
         }
         let color = DOC_COLORS[i % DOC_COLORS.len()];
         s.push_str(&format!("Doc {i}="));
-        for _ in 0..show {
-            s.push_str(color);
-            s.push(BLOCK_CHAR);
-        }
+        s.push_str(color);
+        s.push(BLOCK_CHAR);
         s.push_str(RST);
     }
     s
@@ -229,8 +224,17 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
     let total_cached = num_docs * doc_tokens;
     let max_perms = args.max_perms;
 
-    let documents: Vec<Vec<u32>> = (0..num_docs as u32)
+    // Documents WITH span tokens (order-independent caching).
+    let docs_with_spans: Vec<Vec<u32>> = (0..num_docs as u32)
         .map(|i| make_document(i, block_size, doc_blocks, span_token, pad_token))
+        .collect();
+
+    // Documents WITHOUT span tokens (normal prefix caching, order-dependent).
+    // Use a regular filler token instead of the span token so block hashes
+    // chain normally — reordering breaks cache hits.
+    let no_span_filler = span_token.wrapping_add(1); // any token that isn't span_token
+    let docs_no_spans: Vec<Vec<u32>> = (0..num_docs as u32)
+        .map(|i| make_document(i, block_size, doc_blocks, no_span_filler, pad_token))
         .collect();
 
     let perms = permutations(num_docs, max_perms);
@@ -247,7 +251,7 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
 
     let canonical: Vec<usize> = (0..num_docs).collect();
 
-    let spinner_style = ProgressStyle::with_template("{spinner:.cyan} {msg}")
+    let spinner_style = ProgressStyle::with_template("  {spinner:.cyan} {msg}")
         .unwrap()
         .tick_strings(&[
             "\u{28fb}", "\u{28fd}", "\u{28fe}", "\u{28f7}", "\u{28ef}", "\u{28df}", "\u{287f}",
@@ -268,74 +272,90 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
     }
 
     // -----------------------------------------------------------------------
-    // Baseline
+    // Helper: run a sequence of permutations and return per-perm latencies.
+    // First request (canonical) populates cache; remaining are measured.
+    // -----------------------------------------------------------------------
+    let run_perms = |llm: &mut LLM,
+                     docs: &[Vec<u32>],
+                     perms: &[Vec<usize>],
+                     query_base_start: u32,
+                     label: &str|
+     -> Result<(f64, Vec<f64>)> {
+        // Populate cache with canonical order.
+        llm.reset_prefix_cache()?;
+        let perm_str = render_perm(&canonical, doc_blocks);
+        let pb = ProgressBar::new_spinner()
+            .with_style(spinner_style.clone())
+            .with_message(format!("{perm_str}  {DIM}populate ({label})...{RST}"));
+        pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
+        let populate_prompt = build_prompt(docs, &canonical, query_base_start, query_len);
+        let pop_start = Instant::now();
+        llm.generate(&[Prompt::TokenIds(populate_prompt)], Some(sampling.clone()))?;
+        let populate_ms = pop_start.elapsed().as_secs_f64() * 1000.0;
+
+        pb.finish_and_clear();
+        eprintln!("    {perm_str}  {BOLD}{populate_ms:>8.1}ms{RST}  {DIM}populate ({label}){RST}");
+
+        // Run each permutation and measure.
+        let mut latencies = Vec::with_capacity(perms.len());
+        for (pi, perm) in perms.iter().enumerate() {
+            let perm_str = render_perm(perm, doc_blocks);
+            let query_base = query_base_start + 1000 + (pi as u32) * 1000;
+
+            let pb = ProgressBar::new_spinner()
+                .with_style(spinner_style.clone())
+                .with_message(format!(
+                    "{perm_str}  {DIM}{}/{} ({label})...{RST}",
+                    pi + 1,
+                    perms.len()
+                ));
+            pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
+            let prompt = build_prompt(docs, perm, query_base, query_len);
+            let start = Instant::now();
+            llm.generate(&[Prompt::TokenIds(prompt)], Some(sampling.clone()))?;
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+
+            pb.finish_and_clear();
+            eprintln!("    {perm_str}  {BOLD}{ms:>8.1}ms{RST}  {DIM}{label}{RST}");
+            latencies.push(ms);
+        }
+        Ok((populate_ms, latencies))
+    };
+
+    // -----------------------------------------------------------------------
+    // Without spans: documents use a regular token instead of span_token.
+    // Normal prefix caching — block hashes chain by position, so reordering
+    // documents breaks cache hits.
     // -----------------------------------------------------------------------
     eprintln!();
-    eprintln!("{BOLD}Baseline{RST} {DIM}(no prefix caching){RST}");
-
-    unsafe {
-        std::env::set_var("VLLM_V1_SPANS_ENABLED", "false");
-    }
-
-    let mut llm_baseline = build_llm(&args, false)?;
-
-    let perm_str = render_perm(&canonical, doc_blocks);
-    let pb = ProgressBar::new_spinner()
-        .with_style(spinner_style.clone())
-        .with_message(format!("  {perm_str}  full prefill..."));
-    pb.enable_steady_tick(std::time::Duration::from_millis(80));
-
-    let prompt = build_prompt(&documents, &canonical, 50000, query_len);
-    let start = Instant::now();
-    llm_baseline.generate(&[Prompt::TokenIds(prompt)], Some(sampling.clone()))?;
-    let baseline_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-    pb.finish_and_clear();
-    eprintln!("  {perm_str}  {BOLD}{baseline_ms:>8.1}ms{RST}  {DIM}no cache{RST}");
-    drop(llm_baseline);
-
-    // -----------------------------------------------------------------------
-    // Spans: all permutations
-    // -----------------------------------------------------------------------
-    eprintln!();
-    eprintln!("{BOLD}Spans{RST} {DIM}(per-block KV cache reuse){RST}");
+    eprintln!("{BOLD}Without spans{RST} {DIM}(prefix caching, order-dependent){RST}");
 
     unsafe {
         std::env::set_var("VLLM_V1_SPANS_ENABLED", "true");
         std::env::set_var("VLLM_V1_SPANS_TOKEN_PLUS", span_token.to_string());
     }
 
-    let mut llm_spans = build_llm(&args, true)?;
+    let mut llm = build_llm(&args, true)?;
+    // Skip perms[0] (canonical order) — it's the populate step and would
+    // always cache-hit even without spans, biasing results.
+    let test_perms: Vec<Vec<usize>> = perms.iter().filter(|p| *p != &canonical).cloned().collect();
+    let (no_spans_populate, no_spans_latencies) =
+        run_perms(&mut llm, &docs_no_spans, &test_perms, 50000, "no spans")?;
 
-    // Populate cache with canonical order.
-    let canonical_prompt = build_prompt(&documents, &canonical, 40000, query_len);
-    llm_spans.generate(
-        &[Prompt::TokenIds(canonical_prompt)],
-        Some(sampling.clone()),
-    )?;
+    // -----------------------------------------------------------------------
+    // With spans: documents use span_token at block boundaries.
+    // Span-aware hashing resets parent chain — blocks cache independently
+    // of position, so reordering still gets full cache hits.
+    // -----------------------------------------------------------------------
+    eprintln!();
+    eprintln!("{BOLD}With spans{RST} {DIM}(prefix caching, order-independent){RST}");
 
-    let mut spans_latencies = Vec::with_capacity(num_perms);
+    let (spans_populate, spans_latencies) =
+        run_perms(&mut llm, &docs_with_spans, &test_perms, 60000, "spans")?;
 
-    for (pi, perm) in perms.iter().enumerate() {
-        let perm_str = render_perm(perm, doc_blocks);
-        let query_base = 60000 + (pi as u32) * 1000;
-
-        let pb = ProgressBar::new_spinner()
-            .with_style(spinner_style.clone())
-            .with_message(format!("  {perm_str}  {DIM}{}/{num_perms}...{RST}", pi + 1));
-        pb.enable_steady_tick(std::time::Duration::from_millis(80));
-
-        let prompt = build_prompt(&documents, perm, query_base, query_len);
-        let start = Instant::now();
-        llm_spans.generate(&[Prompt::TokenIds(prompt)], Some(sampling.clone()))?;
-        let ms = start.elapsed().as_secs_f64() * 1000.0;
-
-        pb.finish_and_clear();
-        eprintln!("  {perm_str}  {BOLD}{ms:>8.1}ms{RST}  {DIM}spans{RST}");
-
-        spans_latencies.push(ms);
-    }
-    drop(llm_spans);
+    drop(llm);
 
     unsafe {
         std::env::remove_var("VLLM_V1_SPANS_ENABLED");
@@ -345,24 +365,44 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
     // -----------------------------------------------------------------------
     // Summary
     // -----------------------------------------------------------------------
-    let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
-    let min_f = |v: &[f64]| v.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_f = |v: &[f64]| v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let spans_avg = avg(&spans_latencies);
-    let speedup = baseline_ms / spans_avg;
+    // Compute per-permutation speedups: no_spans[i] / spans[i]
+    let mut speedups: Vec<f64> = no_spans_latencies
+        .iter()
+        .zip(spans_latencies.iter())
+        .map(|(&ns, &sp)| ns / sp)
+        .collect();
+    speedups.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let p50 = |v: &[f64]| {
+        let mid = v.len() / 2;
+        if v.len() % 2 == 0 && v.len() > 1 {
+            (v[mid - 1] + v[mid]) / 2.0
+        } else {
+            v[mid]
+        }
+    };
+
+    let no_spans_avg = no_spans_latencies.iter().sum::<f64>() / no_spans_latencies.len() as f64;
+    let spans_avg = spans_latencies.iter().sum::<f64>() / spans_latencies.len() as f64;
 
     eprintln!();
-    println!("{BOLD}=== Results ==={RST}");
+    println!("{BOLD}=== Results ({} perms) ==={RST}", test_perms.len());
     println!();
-    println!("  Baseline (full prefill):  {BOLD}{baseline_ms:>8.1}ms{RST}");
     println!(
-        "  Spans avg ({num_perms} perms):    {BOLD}{:>8.1}ms{RST}  (min {:.1}, max {:.1})",
-        spans_avg,
-        min_f(&spans_latencies),
-        max_f(&spans_latencies),
+        "  Without spans:  avg {no_spans_avg:>7.1}ms  {DIM}({:.1}x vs populate){RST}",
+        no_spans_populate / no_spans_avg
+    );
+    println!(
+        "  With spans:     avg {spans_avg:>7.1}ms  {DIM}({:.1}x vs populate){RST}",
+        spans_populate / spans_avg
     );
     println!();
-    println!("  {BOLD}Speedup: {speedup:.1}x{RST}");
+    println!(
+        "  {BOLD}Spans speedup{RST}  min {BOLD}{:.1}x{RST}  p50 {BOLD}{:.1}x{RST}  max {BOLD}{:.1}x{RST}",
+        speedups.first().unwrap_or(&0.0),
+        p50(&speedups),
+        speedups.last().unwrap_or(&0.0),
+    );
     println!();
 
     Ok(())

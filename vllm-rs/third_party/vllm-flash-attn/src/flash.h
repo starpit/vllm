@@ -133,6 +133,10 @@ struct Flash_fwd_params : public Qkv_params {
 
     bool is_rotary_interleaved;
 
+    // When true, apply rotary embedding to K read from paged cache during
+    // attention (for relocatable KV cache blocks / spans).
+    bool rotate_cached_k;
+
     int num_splits;  // For split-KV version
 
     void * __restrict__ alibi_slopes_ptr;

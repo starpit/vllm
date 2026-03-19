@@ -326,6 +326,40 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Paged KV cache RoPE (for spans: rotate unrotated K in paged cache)
+    fn rotary_paged_k_cache_f16(
+        k_cache: *mut u16,
+        cos_sin_cache: *const u16,
+        block_table: *const i32,
+        seqused_k: *const i32,
+        block_flags: *const u8, // per-physical-block flag, or null for all blocks
+        batch_size: i32,
+        max_seqlen_k: i32,
+        max_blocks_per_seq: i32,
+        page_block_size: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        inverse: i32,
+        stream: CUstream,
+    );
+    fn rotary_paged_k_cache_bf16(
+        k_cache: *mut u16,
+        cos_sin_cache: *const u16,
+        block_table: *const i32,
+        seqused_k: *const i32,
+        block_flags: *const u8,
+        batch_size: i32,
+        max_seqlen_k: i32,
+        max_blocks_per_seq: i32,
+        page_block_size: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        inverse: i32,
+        stream: CUstream,
+    );
+
     // Embedding gather
     fn embedding_gather_f16(
         out: *mut u16,
@@ -2960,6 +2994,13 @@ unsafe extern "C" {
         out_accum_ptr: *mut c_void,
         seqlenq_ngroups_swapped: i32,
         total_q: i32,
+
+        // Spans: fused RoPE for cached K reads.
+        rotary_cos_ptr: *const c_void,
+        rotary_sin_ptr: *const c_void,
+        rotary_dim: i32,
+        rotate_cached_k: i32,
+
         stream: CUstream,
     );
 }
@@ -3120,6 +3161,10 @@ pub unsafe fn flash_attn_contiguous(
         std::ptr::null_mut(),
         0, // seqlenq_ngroups_swapped = false
         total_q as i32,
+        std::ptr::null(), // rotary_cos_ptr (spans)
+        std::ptr::null(), // rotary_sin_ptr (spans)
+        0,                // rotary_dim (spans)
+        0,                // rotate_cached_k (spans)
         stream,
     );
 
@@ -3171,6 +3216,8 @@ pub unsafe fn flash_attn_paged(
         num_sm,
         alloc,
         _stream,
+        std::ptr::null(),
+        0,
     )
 }
 
@@ -3179,6 +3226,9 @@ pub unsafe fn flash_attn_paged(
 /// Calls upstream mha_varlen_fwd which forces the splitkv kernel for paged KV.
 /// Matches Python vLLM's flash_attn_varlen_func calling convention exactly.
 #[allow(clippy::too_many_arguments)]
+/// `cos_sin_cache_ptr`: when non-null, pointer to `[max_pos, rotary_dim]` cos/sin
+///   cache. Used with `rotary_dim > 0` to apply fused RoPE to cached K during
+///   attention (for spans / relocatable KV blocks).
 pub unsafe fn flash_attn_paged_ext(
     q: GpuTensor,
     k_cache: GpuTensor,
@@ -3196,6 +3246,8 @@ pub unsafe fn flash_attn_paged_ext(
     num_sm: i32,
     alloc: &mut CachingAllocator,
     _stream: CUstream,
+    cos_sin_cache_ptr: *const u8,
+    rotary_dim: usize,
 ) -> OwnedTensor {
     let total_q = q.dim(0);
     let num_heads_orig = q.dim(1);
@@ -3401,6 +3453,15 @@ pub unsafe fn flash_attn_paged_ext(
         out_accum_ptr,
         if do_swap { 1 } else { 0 },
         eff_total_q as i32,
+        // Spans: fused RoPE for cached K reads.
+        cos_sin_cache_ptr as *const c_void, // rotary_cos_ptr (combined cos|sin cache)
+        std::ptr::null(),                   // rotary_sin_ptr (unused, kernel uses combined)
+        rotary_dim as i32,
+        if cos_sin_cache_ptr.is_null() || rotary_dim == 0 {
+            0
+        } else {
+            1
+        }, // rotate_cached_k
         _stream,
     );
 
@@ -3710,6 +3771,145 @@ pub unsafe fn split_qkv(
     }
 
     (q, k, v)
+}
+
+/// Apply RoPE in-place to Q only (K is left unrotated).
+///
+/// Used by spans: keys are stored without positional encoding so that KV cache
+/// blocks are relocatable. Q still needs rotation for correct attention scores.
+///
+/// * `q`: `[num_tokens, num_q_heads, head_dim]` — rotated in-place
+/// * `positions`: `[num_tokens]` u32
+/// * `cos_sin_cache`: `[max_pos, rotary_dim]`
+pub unsafe fn rotary_embedding_q_only(
+    q: GpuTensor,
+    positions: GpuTensor,
+    cos_sin_cache: GpuTensor,
+    num_q_heads: usize,
+    head_dim: usize,
+    stream: CUstream,
+) {
+    let num_tokens = q.dim(0);
+    let total_q_dim = (num_q_heads * head_dim) as i32;
+    let rotary_dim = cos_sin_cache.dim(1) as i32;
+
+    // Call the standard RoPE kernel with total_k_dim=0 so it skips K rotation.
+    // The key pointer is set to the query pointer (unused when total_k_dim=0).
+    match q.dtype() {
+        DType::F16 => rotary_embedding_f16(
+            positions.as_ptr(),
+            q.as_mut_ptr(),
+            q.as_mut_ptr(), // dummy K ptr (not used when total_k_dim=0)
+            cos_sin_cache.as_ptr(),
+            rotary_dim,
+            total_q_dim,
+            0, // total_k_dim = 0 → skip K rotation
+            head_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        DType::BF16 => rotary_embedding_bf16(
+            positions.as_ptr(),
+            q.as_mut_ptr(),
+            q.as_mut_ptr(),
+            cos_sin_cache.as_ptr(),
+            rotary_dim,
+            total_q_dim,
+            0,
+            head_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        DType::F32 => rotary_embedding_f32(
+            positions.as_ptr(),
+            q.as_mut_ptr() as *mut f32,
+            q.as_mut_ptr() as *mut f32,
+            cos_sin_cache.as_ptr() as *const f32,
+            rotary_dim,
+            total_q_dim,
+            0,
+            head_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        _ => panic!("rotary_embedding_q_only: unsupported dtype {:?}", q.dtype()),
+    }
+}
+
+/// Apply RoPE in-place to K tokens in a paged KV cache.
+///
+/// For spans (relocatable KV cache blocks): keys are stored without positional
+/// encoding. This kernel rotates cached K using each token's actual sequence
+/// position, so that FA2 reads correctly rotated keys.
+///
+/// Use with `inverse=false` before attention (rotate), then `inverse=true`
+/// after attention (un-rotate) to restore the cache to its unrotated state.
+///
+/// * `k_cache`: `[num_blocks, block_size, num_kv_heads, head_dim]`
+/// * `cos_sin_cache`: `[max_pos, rotary_dim]`
+/// * `block_table`: `[batch_size, max_blocks_per_seq]` (I32)
+/// * `seqused_k`: `[batch_size]` (I32) — actual K lengths per sequence
+/// * `block_flags`: optional GPU `[num_physical_blocks]` u8 array. When
+///   provided, only blocks with `flag != 0` are rotated (span blocks).
+///   Pass `std::ptr::null()` to rotate all blocks.
+/// * `inverse`: if true, apply inverse rotation (un-rotate)
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rotary_paged_k_cache(
+    k_cache: GpuTensor,
+    cos_sin_cache: GpuTensor,
+    block_table: GpuTensor,
+    seqused_k: GpuTensor,
+    block_flags: *const u8,
+    batch_size: usize,
+    max_seqlen_k: usize,
+    max_blocks_per_seq: usize,
+    page_block_size: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    inverse: bool,
+    stream: CUstream,
+) {
+    let rotary_dim = cos_sin_cache.dim(1) as i32;
+    let inv = if inverse { 1i32 } else { 0i32 };
+
+    match k_cache.dtype() {
+        DType::F16 => rotary_paged_k_cache_f16(
+            k_cache.as_mut_ptr(),
+            cos_sin_cache.as_ptr(),
+            block_table.as_ptr() as *const i32,
+            seqused_k.as_ptr() as *const i32,
+            block_flags,
+            batch_size as i32,
+            max_seqlen_k as i32,
+            max_blocks_per_seq as i32,
+            page_block_size as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            rotary_dim,
+            inv,
+            stream,
+        ),
+        DType::BF16 => rotary_paged_k_cache_bf16(
+            k_cache.as_mut_ptr(),
+            cos_sin_cache.as_ptr(),
+            block_table.as_ptr() as *const i32,
+            seqused_k.as_ptr() as *const i32,
+            block_flags,
+            batch_size as i32,
+            max_seqlen_k as i32,
+            max_blocks_per_seq as i32,
+            page_block_size as i32,
+            num_kv_heads as i32,
+            head_dim as i32,
+            rotary_dim,
+            inv,
+            stream,
+        ),
+        _ => panic!(
+            "rotary_paged_k_cache: unsupported dtype {:?}",
+            k_cache.dtype()
+        ),
+    }
 }
 
 /// Fused QKV split + RoPE: reads from the fused QKV GEMM output, applies
@@ -5252,6 +5452,10 @@ mod tests_flash_attn {
                 std::ptr::null_mut(),
                 0, // seqlenq_ngroups_swapped = false
                 total_q as i32,
+                std::ptr::null(), // rotary_cos_ptr (spans)
+                std::ptr::null(), // rotary_sin_ptr (spans)
+                0,                // rotary_dim (spans)
+                0,                // rotate_cached_k (spans)
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -5329,6 +5533,10 @@ mod tests_flash_attn {
                 std::ptr::null_mut(),
                 0, // seqlenq_ngroups_swapped = false
                 batch as i32,
+                std::ptr::null(), // rotary_cos_ptr (spans)
+                std::ptr::null(), // rotary_sin_ptr (spans)
+                0,                // rotary_dim (spans)
+                0,                // rotate_cached_k (spans)
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -5433,6 +5641,10 @@ mod tests_flash_attn {
                 std::ptr::null_mut(),
                 0, // seqlenq_ngroups_swapped = false
                 batch as i32,
+                std::ptr::null(), // rotary_cos_ptr (spans)
+                std::ptr::null(), // rotary_sin_ptr (spans)
+                0,                // rotary_dim (spans)
+                0,                // rotate_cached_k (spans)
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -5525,6 +5737,10 @@ mod tests_flash_attn {
                 std::ptr::null_mut(),
                 0, // seqlenq_ngroups_swapped = false
                 total_q as i32,
+                std::ptr::null(), // rotary_cos_ptr (spans)
+                std::ptr::null(), // rotary_sin_ptr (spans)
+                0,                // rotary_dim (spans)
+                0,                // rotate_cached_k (spans)
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -5614,6 +5830,10 @@ mod tests_flash_attn {
                 std::ptr::null_mut(),
                 0, // seqlenq_ngroups_swapped = false
                 batch as i32,
+                std::ptr::null(), // rotary_cos_ptr (spans)
+                std::ptr::null(), // rotary_sin_ptr (spans)
+                0,                // rotary_dim (spans)
+                0,                // rotate_cached_k (spans)
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -5746,8 +5966,12 @@ mod tests_flash_attn {
                     1, // num_splits
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    0, // seqlenq_ngroups_swapped = false
-                    1, // total_q
+                    0,                // seqlenq_ngroups_swapped = false
+                    1,                // total_q
+                    std::ptr::null(), // rotary_cos_ptr (spans)
+                    std::ptr::null(), // rotary_sin_ptr (spans)
+                    0,                // rotary_dim (spans)
+                    0,                // rotate_cached_k (spans)
                     stream,
                 );
             };
@@ -5943,6 +6167,10 @@ mod tests_flash_attn {
                 std::ptr::null_mut(),
                 0, // seqlenq_ngroups_swapped = false
                 batch_size as i32,
+                std::ptr::null(), // rotary_cos_ptr (spans)
+                std::ptr::null(), // rotary_sin_ptr (spans)
+                0,                // rotary_dim (spans)
+                0,                // rotate_cached_k (spans)
                 stream,
             );
         };
@@ -6149,8 +6377,12 @@ mod tests_flash_attn {
                 1,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                0, // seqlenq_ngroups_swapped = false
-                1, // total_q = 1 (single query token)
+                0,                // seqlenq_ngroups_swapped = false
+                1,                // total_q = 1 (single query token)
+                std::ptr::null(), // rotary_cos_ptr (spans)
+                std::ptr::null(), // rotary_sin_ptr (spans)
+                0,                // rotary_dim (spans)
+                0,                // rotate_cached_k (spans)
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");

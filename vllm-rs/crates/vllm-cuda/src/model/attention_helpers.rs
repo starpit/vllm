@@ -121,6 +121,8 @@ pub unsafe fn write_kv_cache(
 /// buffers, then runs contiguous FA2. Fresh prefill always uses BF16 K/V
 /// from the QKV projection directly.
 #[allow(clippy::too_many_arguments)]
+/// `cos_sin_cache_ptr`: optional pointer to `[max_pos, rotary_dim]` cos/sin cache
+///   for fused RoPE on cached K (spans). Pass `std::ptr::null()` when not using spans.
 pub unsafe fn attention_standard(
     q: TensorView<'_>,
     k: TensorView<'_>,
@@ -136,11 +138,14 @@ pub unsafe fn attention_standard(
     num_sm: i32,
     alloc: &mut CachingAllocator,
     stream: CUstream,
+    cos_sin_cache_ptr: *const u8,
+    rotary_dim: usize,
 ) -> OwnedTensor {
     let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
 
     if fresh_prefill {
         // Fresh prefill: use BF16 K/V from QKV projection (no cache read).
+        // No fused RoPE needed — fresh K is already rotated.
         kernels::flash_attn_contiguous(
             *q,
             *k,
@@ -158,6 +163,7 @@ pub unsafe fn attention_standard(
         )
     } else if kv_cache.is_fp8() {
         // FP8 decode: dequant pages → contiguous FA2.
+        // TODO: fused RoPE not yet supported for FP8 path.
         fp8_decode_attention(
             *q,
             *cu_seqlens_q,
@@ -174,8 +180,8 @@ pub unsafe fn attention_standard(
             stream,
         )
     } else {
-        // BF16 decode: paged FA2 directly on cache.
-        kernels::flash_attn_paged(
+        // BF16 paged FA2 — with optional fused RoPE for spans.
+        kernels::flash_attn_paged_ext(
             *q,
             *kv_cache.k_cache(layer_idx),
             *kv_cache.v_cache(layer_idx),
@@ -186,10 +192,14 @@ pub unsafe fn attention_standard(
             max_seqlen_k,
             scale,
             true,
+            0.0,
+            -1,
             kv_cache.block_size,
             num_sm,
             alloc,
             stream,
+            cos_sin_cache_ptr,
+            rotary_dim,
         )
     }
 }
@@ -214,6 +224,8 @@ pub unsafe fn attention_decode_from_cache(
     num_sm: i32,
     alloc: &mut CachingAllocator,
     stream: CUstream,
+    cos_sin_cache_ptr: *const u8,
+    rotary_dim: usize,
 ) -> OwnedTensor {
     if kv_cache.is_fp8() {
         fp8_decode_attention(
@@ -231,7 +243,7 @@ pub unsafe fn attention_decode_from_cache(
             alloc,
             stream,
         )
-    } else if softcap != 0.0 || window_size_left >= 0 {
+    } else {
         kernels::flash_attn_paged_ext(
             *q,
             *kv_cache.k_cache(layer_idx),
@@ -249,23 +261,8 @@ pub unsafe fn attention_decode_from_cache(
             num_sm,
             alloc,
             stream,
-        )
-    } else {
-        kernels::flash_attn_paged(
-            *q,
-            *kv_cache.k_cache(layer_idx),
-            *kv_cache.v_cache(layer_idx),
-            *cu_seqlens_q,
-            *seqused_k,
-            *block_table,
-            max_seqlen_q,
-            max_seqlen_k,
-            scale,
-            true,
-            kv_cache.block_size,
-            num_sm,
-            alloc,
-            stream,
+            cos_sin_cache_ptr,
+            rotary_dim,
         )
     }
 }
@@ -291,6 +288,8 @@ pub unsafe fn attention_ext(
     num_sm: i32,
     alloc: &mut CachingAllocator,
     stream: CUstream,
+    cos_sin_cache_ptr: *const u8,
+    rotary_dim: usize,
 ) -> OwnedTensor {
     let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
 
@@ -344,6 +343,8 @@ pub unsafe fn attention_ext(
             num_sm,
             alloc,
             stream,
+            cos_sin_cache_ptr,
+            rotary_dim,
         )
     }
 }
@@ -606,4 +607,85 @@ unsafe fn fp8_decode_attention_graphed(
         alloc,
         stream,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Spans: pre/post rotation helpers
+// ---------------------------------------------------------------------------
+
+/// Rotate span blocks in the KV cache before attention, run the attention
+/// function, then un-rotate span blocks after. This is a no-op when spans
+/// are disabled (both GPU flag pointers are null).
+///
+/// All model architectures should use this instead of calling attention
+/// functions directly when spans may be active.
+///
+/// `cos_sin_cache`: `[max_pos, rotary_dim]` — the model's rotary cache.
+/// `attn_fn`: closure that runs the actual attention (any variant).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn with_span_rotation<F>(
+    kv_cache: &KvCachePool,
+    layer_idx: usize,
+    cos_sin_cache: TensorView<'_>,
+    cu_seqlens_q: TensorView<'_>,
+    seqused_k: TensorView<'_>,
+    block_table: TensorView<'_>,
+    max_seqlen_k: usize,
+    stream: CUstream,
+    attn_fn: F,
+) -> OwnedTensor
+where
+    F: FnOnce() -> OwnedTensor,
+{
+    let unrotated_flags = kv_cache.block_unrotated_gpu();
+    let span_flags = kv_cache.block_span_gpu();
+    let has_spans = !unrotated_flags.is_null() && !span_flags.is_null();
+
+    if has_spans {
+        let batch_size = cu_seqlens_q.dim(0) as usize - 1;
+        let max_blocks = block_table.dim(1) as usize;
+
+        // Pre-attention: rotate blocks that are currently unrotated.
+        kernels::rotary_paged_k_cache(
+            *kv_cache.k_cache(layer_idx),
+            *cos_sin_cache,
+            *block_table,
+            *seqused_k,
+            unrotated_flags,
+            batch_size,
+            max_seqlen_k,
+            max_blocks,
+            kv_cache.block_size,
+            kv_cache.num_kv_heads,
+            kv_cache.head_dim,
+            false, // forward rotation
+            stream,
+        );
+    }
+
+    let result = attn_fn();
+
+    if has_spans {
+        let batch_size = cu_seqlens_q.dim(0) as usize - 1;
+        let max_blocks = block_table.dim(1) as usize;
+
+        // Post-attention: un-rotate all span blocks.
+        kernels::rotary_paged_k_cache(
+            *kv_cache.k_cache(layer_idx),
+            *cos_sin_cache,
+            *block_table,
+            *seqused_k,
+            span_flags,
+            batch_size,
+            max_seqlen_k,
+            max_blocks,
+            kv_cache.block_size,
+            kv_cache.num_kv_heads,
+            kv_cache.head_dim,
+            true, // inverse rotation
+            stream,
+        );
+    }
+
+    result
 }

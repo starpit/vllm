@@ -481,6 +481,8 @@ impl Gemma2Attention {
                 device.num_sm,
                 &mut device.caching,
                 device.compute_stream,
+                std::ptr::null(),
+                0,
             );
             drop(q);
 
@@ -545,6 +547,8 @@ impl Gemma2Attention {
             device.num_sm,
             &mut device.caching,
             device.compute_stream,
+            std::ptr::null(),
+            0,
         );
         drop(q);
         drop(k);

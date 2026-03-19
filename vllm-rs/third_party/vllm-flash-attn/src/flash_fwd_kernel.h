@@ -23,6 +23,43 @@
 
 namespace FLASH_NAMESPACE {
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Spans: apply NeoX-style RoPE rotation to K in shared memory after async load.
+//
+// sK has layout [kBlockN, kHeadDim] (swizzled). Each row is one K position
+// within the current n_block. We rotate using cos/sin indexed by the
+// absolute sequence position: pos = n_block * kBlockN + row.
+//
+// Uses all threads in the block; each thread handles multiple (row, dim) pairs.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Element, typename SmemLayout>
+__forceinline__ __device__ void rotate_k_smem_contiguous(
+    cute::Tensor<cute::ViewEngine<cute::smem_ptr<Element*>>, SmemLayout> &sK,
+    const Element* __restrict__ cos_sin_cache,  // [max_pos, rotary_dim]
+    int n_block, int kBlockN, int head_dim, int rotary_dim,
+    int tidx, int num_threads)
+{
+    const int half_dim = rotary_dim / 2;
+    const int total_work = kBlockN * half_dim;
+    for (int idx = tidx; idx < total_work; idx += num_threads) {
+        const int row = idx / half_dim;
+        const int d = idx % half_dim;
+        const int pos = n_block * kBlockN + row;
+
+        // cos_sin_cache layout: [pos, 0..half_dim] = cos, [pos, half_dim..rotary_dim] = sin
+        const float cos_val = static_cast<float>(cos_sin_cache[pos * rotary_dim + d]);
+        const float sin_val = static_cast<float>(cos_sin_cache[pos * rotary_dim + half_dim + d]);
+
+        // NeoX layout: first half and second half are at [row, d] and [row, d + half_dim]
+        const float x = static_cast<float>(sK(row, d));
+        const float y = static_cast<float>(sK(row, d + half_dim));
+
+        sK(row, d)            = static_cast<Element>(x * cos_val - y * sin_val);
+        sK(row, d + half_dim) = static_cast<Element>(y * cos_val + x * sin_val);
+    }
+}
+
 using namespace cute;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -882,6 +919,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
 
+        // Spans: rotate K in shared memory before Q×K^T.
+        if (params.rotate_cached_k && params.rotary_dim > 0) {
+            FLASH_NAMESPACE::rotate_k_smem_contiguous(
+                sK,
+                reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                n_block, kBlockN, params.d, params.rotary_dim,
+                tidx, Kernel_traits::kNThreads);
+            __syncthreads();
+        }
+
         // Advance gV
         if (masking_step > 0) {
             if (block_table == nullptr) {
@@ -959,11 +1006,22 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         clear(acc_s);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+
+        // Spans: rotate K in shared memory before Q×K^T.
+        if (params.rotate_cached_k && params.rotary_dim > 0) {
+            FLASH_NAMESPACE::rotate_k_smem_contiguous(
+                sK,
+                reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                n_block, kBlockN, params.d, params.rotary_dim,
+                tidx, Kernel_traits::kNThreads);
+            __syncthreads();
+        }
+
         // Advance gV
         if (block_table == nullptr) {
             tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
         } else {
-            tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, 
+            tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
                 block_table, params.v_batch_stride, params.v_row_stride);
         }
 

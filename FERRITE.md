@@ -295,25 +295,26 @@ independently.
 │  HuggingFace config → specialized inference binary          │
 ├─────────────────────────────────────────────────────────────┤
 │  Layer 3: Fusion Engine (libfuse)                           │
-│  Proc macro + compiler: dataflow graph → megakernel         │
-│  SAT-solver-based warp scheduling (Twill-inspired)          │
+│  Proc macro: dataflow graph → fused Rust GPU kernel source  │
 ├─────────────────────────────────────────────────────────────┤
 │  Layer 2: Operation Library (libops)                        │
 │  GEMM, FlashAttention, RMSNorm, Rotary, SwiGLU, etc.       │
-│  Each op: Rust trait with tile-level implementation          │
+│  Each op: Rust GPU function using Layer 0/1 primitives      │
+│  GEMM patterns ported from CubeK (tile configs, scheduling) │
 ├─────────────────────────────────────────────────────────────┤
 │  Layer 1: Tile Engine (libtile)                             │
-│  CuTe-equivalent: layout algebra, copy/MMA atoms,           │
-│  software pipelining, shared memory with swizzle             │
+│  Shared memory management, swizzle, tiling abstractions     │
+│  Software pipelining, double buffering helpers              │
 ├─────────────────────────────────────────────────────────────┤
 │  Layer 0: PTX Intrinsic Library (libptx)                    │
-│  Safe Rust wrappers around inline PTX asm                    │
-│  ~50 intrinsics: wgmma, TMA, mbarrier, elect, setmaxnreg   │
+│  Safe Rust wrappers around asm!() inline PTX                │
+│  mma.sync, ldmatrix, cp.async, mbarrier, etc.              │
 └─────────────────────────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  LLVM IR (via inkwell) → NVPTX backend → PTX → ptxas → SASS│
+│  rust-cuda (rustc_codegen_nvvm) → libnvvm → PTX → ptxas    │
+│  NVIDIA's own optimizer — nvcc-quality register allocation  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -530,8 +531,32 @@ This generates:
 
 ## The Codegen Path
 
-Based on extensive research, we bypass rustc's nvptx target entirely and emit LLVM
-IR directly via inkwell.
+### Phase 0 Results: inkwell/LLVM IR path (tested, limited)
+
+The original plan was to emit LLVM IR via inkwell → NVPTX backend → PTX. Phase 0
+validated this path on an L40S (sm_89):
+
+- ✅ Vector add, tiled GEMM, tensor core MMA via inline PTX asm — all work
+- ✅ B128 shared memory swizzle, cp.async — work and improve performance
+- ❌ **Peak GEMM: 75 TFLOPS (41.5% of L40S f16 peak)** — below the 70% threshold
+
+**Root cause**: LLVM's NVPTX backend generates 64-bit pointer arithmetic for
+shared memory by default, causing register bloat. At 64×64 tiles (80 registers),
+performance is decent. At 128×128 tiles (255 registers, needed for compute-to-memory
+ratio), occupancy drops to 1 block/SM and performance collapses.
+
+Triton works around this with `-nvptx-short-ptr` (p3:32:32 data layout) and
+extensive custom optimization passes built over years. We don't have those passes.
+
+**Conclusion**: inkwell/LLVM IR is viable for simple kernels but cannot match
+nvcc/libnvvm codegen quality for high-performance GEMM without years of compiler
+work. The plan's own risk assessment predicted this: "If <70%: the LLVM NVPTX
+codegen path may not be viable for peak perf."
+
+### Revised Path: rust-cuda (rustc_codegen_nvvm)
+
+The revised codegen path uses **rust-cuda** (`~/git/rust-cuda`), which compiles
+actual Rust code through NVIDIA's `libnvvm` optimizer — the same backend nvcc uses.
 
 ```
 Ferrite proc macro (compile time, pure Rust)
@@ -539,53 +564,52 @@ Ferrite proc macro (compile time, pure Rust)
     ├─ Dataflow graph analysis
     ├─ Fusion decisions
     ├─ Shared memory planning
-    ├─ Warp scheduling (SAT solver)
     │
     ▼
-inkwell (Rust LLVM bindings, mature, LLVM 8-21)
+Generates Rust GPU kernel code (#[kernel] functions)
     │
-    ├─ LLVM IR with NVVM intrinsics (TMA, barriers, etc.)
-    ├─ Inline PTX asm blocks (wgmma, tcgen05)
-    ├─ LLVM optimization passes (inlining, DCE, loop unrolling)
+    ├─ Fused operations inlined into one function
+    ├─ Shared memory via #[address_space(shared)]
+    ├─ MMA/ldmatrix/cp.async via asm!() inline PTX
     │
     ▼
-LLVM NVPTX backend
+rustc_codegen_nvvm (rust-cuda's custom rustc backend)
     │
-    ├─ Register allocation
-    ├─ Instruction scheduling
+    ├─ Rust → NVVM IR (NVIDIA's LLVM fork)
+    │
+    ▼
+libnvvm (NVIDIA's proprietary optimizer — same as nvcc)
+    │
+    ├─ Register allocation (nvcc quality)
+    ├─ Instruction scheduling (nvcc quality)
+    ├─ Shared memory is native 32-bit
     ├─ PTX emission
     │
     ▼
-ptxas (NVIDIA proprietary, required)
-    │
-    ├─ Final SASS optimization
-    ├─ Architecture-specific tuning
-    │
-    ▼
-CUBIN (embedded in Rust binary via include_bytes!())
+ptxas → SASS → CUBIN (embedded at build time via cuda_builder)
 ```
 
-### Why inkwell, not rustc nvptx?
+### Why rust-cuda, not inkwell?
 
-| | rustc nvptx | inkwell → LLVM NVPTX |
+| | inkwell → LLVM NVPTX | rust-cuda → libnvvm |
 |---|---|---|
-| Intrinsic access | `core::arch::nvptx` (bare minimum) | Full LLVM IR + inline asm |
-| Stability | Nightly-only, tier 2 | Stable crate, LLVM 8-21 |
-| Control | Limited (compiler decides codegen) | Full control over IR |
-| Layout | Rust's memory layout rules apply | We define the layout |
-| Dependencies | Requires rustc nightly | Requires LLVM + ptxas |
+| Register allocation | LLVM (inferior for GPU) | libnvvm/nvcc (production quality) |
+| Shared memory ptrs | 64-bit by default (register bloat) | Native 32-bit |
+| Kernel authoring | LLVM IR builder API (verbose) | Actual Rust code |
+| Inline PTX asm | Works but awkward via llvm-sys | Native `asm!()` macro |
+| Fusion model | Generate LLVM IR programmatically | Generate Rust source, compile as one unit |
+| Maturity | POC validated, 41% peak | Active project, nightly-2025-08-04 |
 
-### Why not CubeCL's approach (emit CUDA C → NVRTC)?
+### Why rust-cuda, not CubeCL?
 
-CubeCL emits CUDA C source strings and compiles via NVRTC at runtime. This works
-for individual kernels but is problematic for megakernels:
+CubeCL compiles per-operation via NVRTC. rust-cuda compiles the entire fused kernel
+as one Rust function through libnvvm. The fusion boundary is at the Rust source
+level — the proc macro generates one `#[kernel]` function containing all fused
+operations. libnvvm sees the complete kernel and optimizes globally.
 
-- NVRTC adds runtime compilation latency
-- Less control over barrier placement and warp scheduling
-- Can't embed compiled cubins at build time
-- CUDA C has its own abstraction overhead for low-level intrinsics
-
-By going through LLVM IR directly, we get compile-time codegen with precise control.
+CubeK's matmul implementation (tile configs, swizzle patterns, partition scheduling)
+is the reference for the GEMM tiles within fused kernels. We port their patterns
+into Rust GPU code rather than reinventing them.
 
 ---
 
@@ -978,125 +1002,160 @@ strictly broader than TensorRT-LLM's current fusions.
 
 ---
 
-## Risk Assessment
+## Risk Assessment (Updated post-Phase 0)
 
-### Technical risks
+### Retired risks
+
+| Risk | Status | Notes |
+|------|--------|-------|
+| LLVM NVPTX codegen quality insufficient | **CONFIRMED** | 41.5% of peak. Pivoted to libnvvm via rust-cuda. |
+| inkwell doesn't expose needed features | **Moot** | Worked fine, but the backend itself was the bottleneck. |
+
+### Active technical risks
 
 | Risk | Severity | Likelihood | Mitigation |
 |------|----------|------------|------------|
-| LLVM NVPTX codegen quality insufficient | High | Low | Triton proves it works. Phase 0 validates. |
-| inkwell doesn't expose needed LLVM features | Medium | Low | Mature crate; fallback to llvm-sys (raw FFI). |
-| Register pressure in megakernels | High | Medium | SAT solver models register budget. Split if exceeded. |
+| rust-cuda maturity (nightly, early dev) | High | Medium | Active project, recent reboot. Contribute fixes upstream. |
+| libnvvm version lag vs CUDA toolkit | Medium | Medium | rust-cuda tracks CUDA 13.0+. |
+| Register pressure in fused megakernels | High | Medium | libnvvm handles this much better than upstream LLVM. CubeK proves 128-reg kernels work through libnvvm. |
 | Shared memory limits prevent full-layer fusion | Medium | Medium | Graceful degradation to partial fusion. |
-| ptxas dependency | Low | Certain | Universal — every GPU toolchain needs it. |
-| New GPU arch requires significant rework | Medium | Certain | Layered design isolates arch code to Layer 0-1. |
-| Inline PTX asm from Rust is fragile | Medium | Medium | Comprehensive test suite against reference PTX. |
+| ptxas dependency | Low | Certain | Universal. |
+| New GPU arch requires rework | Medium | Certain | Layer 0 isolates arch-specific asm!(). |
+| rust-cuda `asm!()` for MMA is unproven | Medium | Medium | Phase 1 step 1 validates this immediately. |
 
 ### Organizational risks
 
 | Risk | Severity | Likelihood | Mitigation |
 |------|----------|------------|------------|
-| Hiring Rust+GPU+compiler engineers | **Very high** | **High** | ~50-100 people worldwide have this intersection. Consider training GPU engineers in Rust or Rust engineers in GPU. |
-| Scope creep (supporting every model/arch) | High | High | Strict scoping: Llama-class transformers on Hopper/Blackwell first. |
-| NVIDIA changes PTX ISA significantly | Medium | Low | PTX is backwards-compatible by design. |
-| Megakernel research proves impractical at scale | High | Low | Multiple independent groups show it works. |
-| CubeCL/Burn reaches our goals first | Medium | Low | Different approach (JIT vs AOT) with different tradeoffs. |
+| Hiring Rust+GPU engineers | **Very high** | **High** | rust-cuda lowers the GPU side — kernel code is Rust, not LLVM IR. |
+| Scope creep | High | High | Strict: Llama-class on Ada/Hopper first. |
+| rust-cuda project dies or diverges | Medium | Low | Fork if necessary; libnvvm is the actual dependency. |
 
-### The "honest assessment" risk
+### Lessons from Phase 0
 
-Building a GPU compiler is a multi-year, multi-person effort. Triton took 6+ years
-with backing from OpenAI, Meta, NVIDIA, AMD, and Microsoft. We are scoping to ~20%
-of Triton's problem space (inference only, transformers only, NVIDIA only), but even
-that 20% is a serious engineering undertaking.
-
-The most likely failure mode is not "it doesn't work" but "it takes 3x longer than
-estimated and we ship something useful but less ambitious than the full vision."
+1. **Don't fight the toolchain.** LLVM's NVPTX backend is not nvcc. Years of
+   custom passes (Triton) or using nvcc directly (CubeK) are the proven paths.
+2. **Study existing implementations first.** CubeK's matmul architecture (tile
+   configs, swizzle, partition scheduling) is the reference. Port it, don't reinvent.
+3. **The GEMM is solved.** CubeK/Burn achieve cuBLAS parity. Our value is fusion.
+4. **Register pressure is the #1 GPU performance constraint.** Every design
+   decision must account for register budget.
 
 ---
 
-## Team and Timeline
+## Team and Timeline (Revised)
 
-### No-expenses-spared version
-
-| Phase | Duration | People | Deliverable |
-|-------|----------|--------|-------------|
-| **Phase 0** | 3 months | 2 senior GPU engineers | Proof of concept: inkwell → GEMM → benchmark vs cuBLAS |
-| **Phase 1** | 6 months | 3-4 engineers | Layer 0 + Layer 1. One GEMM matching CUTLASS. |
-| **Phase 2** | 6 months | 3-4 engineers (parallel) | Layer 2. FlashAttention, all dtypes, quantized GEMM. |
-| **Phase 3** | 12 months | 2-3 compiler engineers | Layer 3. Fusion engine + SAT scheduler. First megakernel. |
-| **Phase 4** | 6 months | 2 engineers | Layer 4. HuggingFace → binary. Llama, Mistral, DeepSeek. |
-| **Phase 5** | Ongoing | Full team | Blackwell, new models, optimization, production hardening. |
-
-**Total to first megakernel**: ~18 months
-**Total to production model compiler**: ~24 months
-**Team size**: 6-8 engineers
-
-### Pragmatic version
-
-If the full vision is too ambitious, a reduced scope that still delivers value:
+### Updated plan
 
 | Phase | Duration | People | Deliverable |
 |-------|----------|--------|-------------|
-| **Phase 0** | 3 months | 2 engineers | Proof of concept (same as above) |
-| **Phase 1** | 6 months | 2-3 engineers | Layer 0 + individual kernels (GEMM, attention) via inkwell |
-| **Phase 2** | 6 months | 2-3 engineers | Targeted fusions: norm+linear, GEMM+activation, attention block |
+| **Phase 0** | ~~3 months~~ 1 day | 1 | ✅ DONE. inkwell path validated, <70% threshold triggered. |
+| **Phase 1** | 2-4 weeks | 1-2 | rust-cuda GEMM matching cuBLAS + first fused kernel |
+| **Phase 2** | 2-3 months | 2-3 | Layer 0-2: MMA wrappers, tile engine, operation library |
+| **Phase 3** | 3-6 months | 2-3 | Layer 3: Fusion proc macro. First auto-fused megakernel. |
+| **Phase 4** | 3-6 months | 2 | Layer 4: Model compiler. Llama, Mistral, DeepSeek. |
+| **Phase 5** | Ongoing | Full team | Hopper/Blackwell, new models, production hardening. |
 
-This delivers torch.compile-level fusion (but at compile time) without attempting
-full megakernels. Still valuable, still novel for Rust.
+**Total to first fused kernel**: ~1 month (Phase 1)
+**Total to auto-fused megakernels**: ~6-9 months (Phase 3)
+**Total to production model compiler**: ~12-18 months (Phase 4)
+
+Timeline is significantly shorter than the original plan because:
+1. Phase 0 is done (1 day instead of 3 months)
+2. rust-cuda eliminates the need to build a codegen backend
+3. CubeK provides the GEMM reference implementation to port
+4. The GEMM is a port, not original research
 
 ---
 
-## Phase 0: Proof of Concept
+## Phase 0: Proof of Concept — COMPLETE
 
-The critical experiment that validates (or kills) the entire plan.
+### Results (2026-03-19, NVIDIA L40S sm_89)
+
+| Step | Result | TFLOPS | % peak |
+|------|--------|--------|--------|
+| Vector add (inkwell → PTX) | ✅ Correct, 3069 GB/s | — | — |
+| Tiled GEMM (shared memory, f32) | ✅ Correct | 4.41 | 20% of f32 |
+| MMA GEMM (inline PTX asm, tensor cores) | ✅ Correct | 5.35 | 3.0% |
+| Multi-warp + register tiling (64×64) | ✅ Correct | 52.72 | 29.1% |
+| + cp.async both tiles | ✅ | 60.12 | 33.2% |
+| + B128 swizzle | ✅ | **75.06** | **41.5%** |
+| 128×128 CubeK-style | ✅ Correct but 255 regs | 45.99 | 25.4% |
+
+**Success criterion was ≥85%. Result: 41.5%. Outcome: <70% threshold triggered.**
+
+### What Phase 0 proved
+
+- ✅ inkwell → LLVM IR → NVPTX → PTX pipeline works end-to-end
+- ✅ Inline PTX asm for mma.sync works from Rust-generated LLVM IR
+- ✅ B128 swizzle, cp.async, shared memory all work correctly
+- ✅ Tensor cores can be driven from Rust through LLVM
+- ❌ LLVM NVPTX codegen quality is insufficient for peak GEMM performance
+- ❌ 64-bit shared memory pointers cause register bloat at larger tiles
+- ❌ `-nvptx-short-ptr` (Triton's fix) helps addressing but doesn't solve instruction count
+
+### Key discovery: the LLVM NVPTX limitation
+
+The fundamental issue: LLVM's NVPTX backend uses 64-bit pointer arithmetic for
+shared memory and generates excessive instructions for fragment loading. At 64×64
+tiles (80 registers), occupancy is good. At 128×128 tiles (255 registers, needed
+for adequate compute-to-memory ratio), occupancy drops to 1 block/SM.
+
+CubeK achieves cuBLAS parity through NVRTC (which uses nvcc's backend). Triton
+achieves ~70-90% of CUTLASS through years of custom LLVM optimization passes.
+Neither path was available to us in the Phase 0 timeframe.
+
+### Decision: pivot to rust-cuda backend
+
+The plan's risk assessment correctly predicted this outcome. The revised path uses
+rust-cuda (`rustc_codegen_nvvm`) which compiles Rust through libnvvm — NVIDIA's
+own optimizer, the same backend as nvcc. This gives nvcc-quality register allocation
+and instruction scheduling while keeping everything in Rust.
+
+## Phase 1: rust-cuda Megakernel Prototype
 
 ### Goal
 
-Emit a single GEMM kernel (f16, 128x256x64 tiles, wgmma, 3-stage pipeline) via
-inkwell → LLVM IR → PTX → ptxas → cubin, launch from Rust, benchmark vs cuBLAS.
-
-**Success criterion**: ≥85% of cuBLAS throughput on H100 for M=N=K=4096 f16 GEMM.
+Write a fused RMSNorm → GEMM → SiLU kernel in Rust using rust-cuda, compiled
+through libnvvm. Benchmark the GEMM alone for parity with cuBLAS, then benchmark
+the fused kernel against unfused cuBLAS + separate norm/activation.
 
 ### Steps
 
-1. **Set up inkwell with NVPTX target**
-   - Build LLVM 21 with NVPTX backend enabled
-   - Create Rust project with inkwell dependency
-   - Verify we can emit LLVM IR and compile to PTX
+1. **Set up rust-cuda compilation for vllm-rs**
+   - Add rust-cuda as a build dependency
+   - Write a standalone GEMM kernel in Rust GPU code with `asm!()` for mma.sync
+   - Port CubeK's tile config (128×128, partition 4×4×2, B128 swizzle)
+   - Benchmark: target ≥85% of cuBLAS (libnvvm should handle register allocation)
 
-2. **Emit a trivial kernel**
-   - Vector add: load two arrays, add, store result
-   - Compile to PTX, load via cudarc, verify correctness
-   - This validates the full pipeline without GPU complexity
+2. **Add MMA wrapper library**
+   - Safe Rust wrappers around `asm!()` for mma.sync, ldmatrix, cp.async
+   - Swizzle helpers matching CubeK's patterns
+   - Shared memory tile abstractions
 
-3. **Emit a naive GEMM**
-   - Simple tiled GEMM without tensor cores
-   - Shared memory tiling, no software pipelining
-   - Benchmark: expect ~20-30% of cuBLAS
+3. **Write the first fused kernel**
+   - RMSNorm → GEMM → SiLU in one `#[kernel]` function
+   - Norm output stays in shared memory, feeds directly into GEMM tiles
+   - SiLU applied in registers before writing to global memory
+   - Benchmark against: cuBLAS GEMM + separate norm kernel + separate SiLU kernel
 
-4. **Add wgmma via inline PTX asm in LLVM IR**
-   - Emit `InlineAsm` nodes in LLVM IR for wgmma instructions
-   - Add TMA loads for A and B operands
-   - Add mbarrier synchronization
-   - Benchmark: expect ~60-80% of cuBLAS
+4. **Wire into vllm-rs**
+   - `#[cfg(feature = "ferrite")]` in model/llama.rs
+   - Replace one MLP block with the fused kernel
+   - End-to-end inference benchmark
 
-5. **Add software pipelining**
-   - 3-stage async pipeline with double-buffered shared memory
-   - TMA prefetch for next iteration
-   - Benchmark: target ≥85% of cuBLAS
+5. **Build the proc macro**
+   - Analyze Rust function body → dataflow graph
+   - Identify fusible operation sequences
+   - Generate fused `#[kernel]` Rust GPU code
+   - cuda_builder compiles at build time, cubin embedded in binary
 
-6. **Evaluate**
-   - If ≥85%: proceed to Phase 1
-   - If 70-85%: investigate gaps (register spills? instruction scheduling?)
-   - If <70%: the LLVM NVPTX codegen path may not be viable for peak perf
+### What Phase 1 proves
 
-### What Phase 0 proves
-
-- inkwell can target NVPTX and produce correct PTX
-- Inline PTX asm for wgmma works from LLVM IR emitted by Rust
-- LLVM's optimization passes handle the non-asm code well
-- The cudarc launch path works for custom cubins
-- We have a realistic performance ceiling for the LLVM path
+- rust-cuda/libnvvm achieves cuBLAS-parity GEMM from Rust code
+- Cross-operation fusion (norm → GEMM → activation) works in one kernel
+- The fused kernel beats unfused cuBLAS + separate kernels
+- The proc macro can automatically generate fused kernels
 
 ---
 
@@ -1113,6 +1172,9 @@ inkwell → LLVM IR → PTX → ptxas → cubin, launch from Rust, benchmark vs 
 - [Bringing Blackwell GPU support to LLVM/MLIR](https://llvm.org/devmtg/2025-04/slides/technical_talk/ozen_blackwell.pdf)
 
 ### Rust GPU ecosystem
+- [Rust-CUDA (rustc_codegen_nvvm)](https://github.com/Rust-GPU/Rust-CUDA) — compiles Rust to GPU via libnvvm
+- [Rust-CUDA reboot announcement](https://rust-gpu.github.io/blog/2025/01/27/rust-cuda-reboot/)
+- [CubeK (cubek-matmul)](https://github.com/tracel-ai/cubek) — CubeCL's matmul kernel library (reference for tile configs)
 - [rustc nvptx64-nvidia-cuda docs](https://doc.rust-lang.org/rustc/platform-support/nvptx64-nvidia-cuda.html)
 - [Compiler team issue #965](https://github.com/rust-lang/compiler-team/issues/965)
 - [core::arch::nvptx tracking issue #111199](https://github.com/rust-lang/rust/issues/111199)

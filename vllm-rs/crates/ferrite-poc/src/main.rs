@@ -21,7 +21,7 @@ use inkwell::targets::{
     InitializationConfig, Target, TargetMachine, TargetTriple,
     RelocMode, CodeModel, FileType,
 };
-use inkwell::values::{FunctionValue, IntValue};
+use inkwell::values::{AsValueRef, BasicValueEnum, FunctionValue, IntValue};
 use inkwell::{AddressSpace, OptimizationLevel, IntPredicate};
 
 // ---------------------------------------------------------------------------
@@ -312,14 +312,11 @@ fn call_sreg<'ctx>(
     let func = module
         .get_function(intrinsic)
         .unwrap_or_else(|| module.add_function(intrinsic, fn_type, None));
-    let call = builder.build_call(func, &[], name).unwrap();
-    // try_as_basic_value returns Either<BasicValueEnum, InstructionValue> or similar.
-    // We need the left (value) side.
-    let val = call.try_as_basic_value();
-    match val {
-        either::Either::Left(v) => v.into_int_value(),
-        _ => panic!("NVPTX sreg intrinsic {} returned void", intrinsic),
-    }
+    let call_site = builder.build_call(func, &[], name).unwrap();
+    // Wrap the raw LLVMValueRef as a BasicValueEnum, then extract IntValue.
+    // A non-void call instruction IS its return value in LLVM SSA.
+    let raw: llvm_sys::prelude::LLVMValueRef = call_site.as_value_ref();
+    unsafe { BasicValueEnum::new(raw) }.into_int_value()
 }
 
 /// NVVM metadata: !nvvm.annotations = !{!0}

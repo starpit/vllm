@@ -17,7 +17,7 @@ path = "src/main.rs"
 inkwell = { version = "0.8", features = ["llvm20-1", "target-nvptx"] }
 
 # CUDA driver API — we use nvrtc feature for Ptx type, but load raw PTX via driver API
-cudarc = { workspace = true, features = ["nvrtc"] }
+cudarc = { workspace = true, features = ["nvrtc", "dynamic-linking", "cuda-version-from-build-system"] }
 
 half = { workspace = true }
 anyhow = { workspace = true }

@@ -186,6 +186,14 @@ extern "C" void mha_varlen_fwd(
     // total number of Q tokens (Python: q.sizes()[0])
     int32_t total_q,
 
+    // Spans: fused RoPE for cached K reads.
+    // When rotate_cached_k != 0 and rotary_cos/sin are non-null,
+    // apply rotary embedding to K in shared memory during attention.
+    void *rotary_cos_ptr,
+    void *rotary_sin_ptr,
+    int32_t rotary_dim,
+    int32_t rotate_cached_k,
+
     cudaStream_t stream
 ) {
     // --- Parameter setup matches vllm-flash-attn flash_api.cu exactly ---
@@ -284,6 +292,15 @@ extern "C" void mha_varlen_fwd(
         params.block_table_batch_stride = block_table_batch_stride;
     }
     params.page_block_size = page_block_size;
+
+    // Spans: fused RoPE for cached K reads.
+    // rotary_cos_ptr points to the combined [max_pos, rotary_dim] cos|sin cache.
+    // The kernel reads cos at [pos, 0..half] and sin at [pos, half..rotary_dim].
+    params.rotary_cos_ptr = rotary_cos_ptr;
+    params.rotary_sin_ptr = nullptr;  // unused; kernel uses single combined cache
+    params.rotary_dim = rotary_dim;
+    params.rotate_cached_k = (rotate_cached_k != 0);
+    params.is_rotary_interleaved = false;
 
     // Split-K accumulators (for num_splits > 1)
     params.softmax_lseaccum_ptr = softmax_lse_accum_ptr;

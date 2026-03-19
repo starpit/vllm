@@ -1247,3 +1247,123 @@ void rotary_embedding_interleaved_bf16(
 }
 
 } // extern "C"
+
+// ---------------------------------------------------------------------------
+// Paged KV cache RoPE: apply rotary embedding to K stored in paged blocks.
+//
+// For spans (relocatable KV cache blocks): keys are stored unrotated.
+// Before attention, this kernel rotates all cached K in-place using each
+// token's actual sequence position.
+//
+// Grid: one block per (sequence, kv_head) pair.
+// Each thread handles multiple tokens and rotation dimensions.
+// ---------------------------------------------------------------------------
+
+// Template parameter `Inverse`: when false, apply forward rotation:
+//   [x, y] -> [x*cos - y*sin, y*cos + x*sin]
+// When true, apply inverse rotation (negate sin):
+//   [x, y] -> [x*cos + y*sin, y*cos - x*sin]
+//
+// `block_flags`: per-physical-block flag array. If non-null, only blocks
+// with block_flags[physical_block_id] != 0 are processed (span blocks).
+// If null, all blocks are processed.
+template <typename T, bool Inverse = false>
+__global__ void rotary_paged_k_cache_kernel(
+    T* __restrict__ k_cache,                 // [num_blocks, block_size, num_kv_heads, head_dim]
+    const T* __restrict__ cos_sin_cache,     // [max_pos, rotary_dim]
+    const int32_t* __restrict__ block_table, // [batch_size, max_blocks_per_seq]
+    const int32_t* __restrict__ seqused_k,   // [batch_size] actual K lengths
+    const uint8_t* __restrict__ block_flags, // [num_physical_blocks] or nullptr
+    int max_blocks_per_seq,
+    int page_block_size,
+    int num_kv_heads,
+    int head_dim,
+    int rotary_dim)
+{
+    const int seq_idx = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int seq_len = seqused_k[seq_idx];
+    const int half_rot = rotary_dim / 2;
+
+    const int32_t* seq_block_table = block_table + seq_idx * max_blocks_per_seq;
+
+    // Each thread processes multiple positions.
+    for (int pos = threadIdx.x; pos < seq_len; pos += blockDim.x) {
+        // Resolve paged block address.
+        const int block_idx = pos / page_block_size;
+        const int block_offset = pos % page_block_size;
+        const int physical_block = seq_block_table[block_idx];
+
+        // Skip blocks that are not flagged (already rotated / not span blocks).
+        if (block_flags != nullptr && block_flags[physical_block] == 0) {
+            continue;
+        }
+
+        // K layout: [num_blocks, block_size, num_kv_heads, head_dim]
+        T* k_ptr = k_cache
+            + (int64_t)physical_block * page_block_size * num_kv_heads * head_dim
+            + block_offset * num_kv_heads * head_dim
+            + head_idx * head_dim;
+
+        // cos/sin for this position.
+        const T* cos_ptr = cos_sin_cache + pos * rotary_dim;
+        const T* sin_ptr = cos_ptr + half_rot;
+
+        const int half = (half_rot < head_dim / 2) ? half_rot : (head_dim / 2);
+        for (int d = 0; d < half; d++) {
+            float x = static_cast<float>(k_ptr[d]);
+            float y = static_cast<float>(k_ptr[d + half]);
+            float c = static_cast<float>(cos_ptr[d]);
+            float s = static_cast<float>(sin_ptr[d]);
+            if constexpr (Inverse) {
+                k_ptr[d]        = static_cast<T>(x * c + y * s);
+                k_ptr[d + half] = static_cast<T>(y * c - x * s);
+            } else {
+                k_ptr[d]        = static_cast<T>(x * c - y * s);
+                k_ptr[d + half] = static_cast<T>(y * c + x * s);
+            }
+        }
+    }
+}
+
+#define LAUNCH_ROTARY_PAGED(T, INV)                                        \
+    do {                                                                   \
+        dim3 grid(batch_size, num_kv_heads);                               \
+        int threads = min(max_seqlen_k, 256);                              \
+        rotary_paged_k_cache_kernel<T, INV><<<grid, threads, 0, stream>>>( \
+            reinterpret_cast<T*>(k_cache),                                 \
+            reinterpret_cast<const T*>(cos_sin_cache),                     \
+            reinterpret_cast<const int32_t*>(block_table),                 \
+            reinterpret_cast<const int32_t*>(seqused_k),                   \
+            reinterpret_cast<const uint8_t*>(block_flags),                 \
+            max_blocks_per_seq, page_block_size, num_kv_heads,             \
+            head_dim, rotary_dim);                                         \
+    } while (0)
+
+extern "C" {
+
+void rotary_paged_k_cache_f16(
+    void* k_cache, const void* cos_sin_cache,
+    const void* block_table, const void* seqused_k,
+    const void* block_flags,
+    int batch_size, int max_seqlen_k, int max_blocks_per_seq,
+    int page_block_size, int num_kv_heads, int head_dim, int rotary_dim,
+    int inverse, cudaStream_t stream)
+{
+    if (inverse) { LAUNCH_ROTARY_PAGED(__half, true); }
+    else         { LAUNCH_ROTARY_PAGED(__half, false); }
+}
+
+void rotary_paged_k_cache_bf16(
+    void* k_cache, const void* cos_sin_cache,
+    const void* block_table, const void* seqused_k,
+    const void* block_flags,
+    int batch_size, int max_seqlen_k, int max_blocks_per_seq,
+    int page_block_size, int num_kv_heads, int head_dim, int rotary_dim,
+    int inverse, cudaStream_t stream)
+{
+    if (inverse) { LAUNCH_ROTARY_PAGED(__nv_bfloat16, true); }
+    else         { LAUNCH_ROTARY_PAGED(__nv_bfloat16, false); }
+}
+
+} // extern "C"

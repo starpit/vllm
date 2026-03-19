@@ -6510,6 +6510,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "vllm-common",
+ "vllm-config",
  "vllm-model",
 ]
 

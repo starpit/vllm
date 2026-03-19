@@ -1450,6 +1450,8 @@ pub struct CudaWorker {
     _k_scale_constant: f32,
     /// V scale constant (from env or default 1.0).
     _v_scale_constant: f32,
+    /// Spans (relocatable KV cache blocks) configuration.
+    spans_config: vllm_config::SpansConfig,
     /// GPU weight allocations tracked for sleep/wake lifecycle.
     /// RAII: `RawGpuMem` calls `driver::mem_free` on drop.
     weight_gpu_allocs: Vec<vllm_cuda::RawGpuMem>,
@@ -1537,6 +1539,7 @@ impl CudaWorker {
             _calculate_kv_scales: calculate_kv_scales,
             _k_scale_constant: k_scale_constant,
             _v_scale_constant: v_scale_constant,
+            spans_config: vllm_config::SpansConfig::from_env(),
             weight_gpu_allocs: Vec::new(),
             num_gpu_blocks_saved: 0,
             #[cfg(feature = "nccl")]
@@ -4776,6 +4779,15 @@ impl CudaWorker {
             let end = (start + num_tokens).min(prompt_ids.len());
             let tokens_to_use = &prompt_ids[start..end];
 
+            tracing::info!(
+                req_id = %new_req.req_id,
+                prompt_len = prompt_ids.len(),
+                cached = start,
+                new = tokens_to_use.len(),
+                hit_rate = format_args!("{:.0}%", if prompt_ids.is_empty() { 0.0 } else { start as f64 / prompt_ids.len() as f64 * 100.0 }),
+                "KV cache hit",
+            );
+
             self.token_buffers
                 .insert(new_req.req_id.clone(), prompt_ids.to_vec());
             if let Some(ref params) = new_req.sampling_params {
@@ -5129,6 +5141,59 @@ impl CudaWorker {
         };
         #[cfg(not(feature = "nccl"))]
         let pp_intermediate: Option<(vllm_cuda::OwnedTensor, vllm_cuda::OwnedTensor)> = None;
+
+        // Spans: mark per-block rotation flags based on token content.
+        //
+        // `block_is_unrotated[physical_block] = true` means:
+        //   "this span block's K is CURRENTLY stored unrotated (from a prior
+        //    step's post-attention un-rotation pass)."
+        //
+        // Blocks being written THIS step are marked false — their K will be
+        // written rotated by fused_qkv_rope. The post-attention un-rotation
+        // pass will then flip them to unrotated.
+        //
+        // Non-span blocks are always false (rotated, never touched).
+        if self.spans_config.fuse_rope() {
+            if let (Some(token_plus), Some(kv_cache)) =
+                (self.spans_config.token_plus, self.kv_cache.as_mut())
+            {
+                let meta = &prepared.attn_meta;
+                for i in 0..meta.num_reqs {
+                    let req_id = &meta.req_ids[i];
+                    if let Some(all_tokens) = self.token_buffers.get(req_id) {
+                        let block_ids = &meta.block_ids[i];
+                        let tokens_before = meta.tokens_before[i];
+                        let seq_len = meta.seq_lens[i];
+                        for (block_idx, &physical_block) in block_ids.iter().enumerate() {
+                            let block_start_pos = block_idx * block_size;
+                            if block_start_pos >= seq_len {
+                                break; // past the end of the sequence
+                            }
+                            let is_span = block_start_pos < all_tokens.len()
+                                && all_tokens[block_start_pos] == token_plus;
+                            // Block was written in a PRIOR step if its last
+                            // token position < tokens_before (i.e., fully cached).
+                            let block_end_pos = (block_start_pos + block_size).min(seq_len);
+                            let was_previously_written = block_end_pos <= tokens_before;
+                            // is_unrotated: span blocks from prior steps have
+                            // unrotated K (from the post-attention un-rotation pass).
+                            // Freshly written blocks have rotated K.
+                            let is_unrotated = is_span && was_previously_written;
+                            kv_cache.mark_block(physical_block, is_span, is_unrotated);
+                        }
+                    }
+                }
+                // Upload flags to GPU for the attention kernel.
+                unsafe {
+                    let stream = self
+                        .device
+                        .as_ref()
+                        .map(|d| d.compute_stream)
+                        .unwrap_or(std::ptr::null_mut());
+                    kv_cache.sync_block_flags_to_gpu(stream);
+                }
+            }
+        }
 
         // Split borrows: model + kv_cache (shared) vs device (mutable).
         // Use direct field access so the borrow checker sees disjoint borrows.

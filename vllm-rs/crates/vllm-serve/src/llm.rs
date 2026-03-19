@@ -397,6 +397,11 @@ impl LLM {
         self.generate_impl(prompts, params, false)
     }
 
+    /// Reset the prefix cache, evicting all cached KV blocks.
+    pub fn reset_prefix_cache(&mut self) -> Result<bool> {
+        Ok(self.client.reset_prefix_cache()?)
+    }
+
     /// Like [`generate`](Self::generate), but with a tqdm-style progress bar
     /// showing estimated input/output token throughput — mirrors Python's
     /// `LLM.generate(use_tqdm=True)`.

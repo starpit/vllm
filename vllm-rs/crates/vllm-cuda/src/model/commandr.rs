@@ -222,6 +222,8 @@ impl CommandRAttention {
                     device.num_sm,
                     &mut device.caching,
                     device.compute_stream,
+                    std::ptr::null(),
+                    0,
                 );
                 drop(q);
 
@@ -277,6 +279,8 @@ impl CommandRAttention {
             device.num_sm,
             &mut device.caching,
             device.compute_stream,
+            std::ptr::null(),
+            0,
         );
         drop(q);
         drop(k);

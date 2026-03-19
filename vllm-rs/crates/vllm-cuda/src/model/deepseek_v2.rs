@@ -652,6 +652,8 @@ impl DeepSeekV2Attention {
             device.num_sm,
             &mut device.caching,
             stream,
+            std::ptr::null(),
+            0,
         );
         drop(k);
         drop(v);

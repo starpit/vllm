@@ -36,6 +36,21 @@ pub struct KvCachePool {
     k_scale_ptrs: Vec<*mut f32>,
     /// Per-layer V scale: GPU f32 scalar pointers. Only used when FP8.
     v_scale_ptrs: Vec<*mut f32>,
+
+    /// Per-physical-block flag: `true` = K is **currently** stored unrotated.
+    /// Used by the pre-attention rotation kernel (rotate these blocks).
+    /// Indexed by physical block ID.
+    pub block_is_unrotated: Vec<bool>,
+
+    /// Per-physical-block flag: `true` = this is a span block (should be
+    /// stored unrotated in the resting state between steps).
+    /// Used by the post-attention un-rotation kernel (un-rotate these blocks).
+    pub block_is_span: Vec<bool>,
+
+    /// GPU mirror of `block_is_unrotated` — for pre-attention forward rotation.
+    block_unrotated_gpu_ptr: Option<*mut u8>,
+    /// GPU mirror of `block_is_span` — for post-attention inverse rotation.
+    block_span_gpu_ptr: Option<*mut u8>,
 }
 
 // Safety: KvCachePool holds GPU device pointers (GpuTensor arrays and raw
@@ -129,6 +144,18 @@ impl KvCachePool {
             cache_dtype: dtype,
             k_scale_ptrs,
             v_scale_ptrs,
+            block_is_unrotated: vec![false; num_blocks],
+            block_is_span: vec![false; num_blocks],
+            block_unrotated_gpu_ptr: if vllm_config::SpansConfig::from_env().fuse_rope() {
+                driver::mem_alloc(num_blocks).ok()
+            } else {
+                None
+            },
+            block_span_gpu_ptr: if vllm_config::SpansConfig::from_env().fuse_rope() {
+                driver::mem_alloc(num_blocks).ok()
+            } else {
+                None
+            },
         })
     }
 
@@ -274,6 +301,49 @@ impl KvCachePool {
 
         out
     }
+
+    /// Mark a physical block's current rotation state and span identity.
+    pub fn mark_block(&mut self, physical_block_id: usize, is_span: bool, is_unrotated: bool) {
+        if physical_block_id < self.block_is_unrotated.len() {
+            self.block_is_span[physical_block_id] = is_span;
+            self.block_is_unrotated[physical_block_id] = is_unrotated;
+        }
+    }
+
+    /// Upload both flag arrays to GPU.
+    ///
+    /// # Safety
+    /// Requires valid CUDA context and stream.
+    pub unsafe fn sync_block_flags_to_gpu(&self, stream: cudarc::driver::sys::CUstream) {
+        if let Some(gpu_ptr) = self.block_unrotated_gpu_ptr {
+            let flags: Vec<u8> = self
+                .block_is_unrotated
+                .iter()
+                .map(|&b| u8::from(b))
+                .collect();
+            driver::memcpy_htod_async(gpu_ptr, flags.as_ptr(), flags.len(), stream)
+                .expect("sync block_unrotated H2D");
+        }
+        if let Some(gpu_ptr) = self.block_span_gpu_ptr {
+            let flags: Vec<u8> = self.block_is_span.iter().map(|&b| u8::from(b)).collect();
+            driver::memcpy_htod_async(gpu_ptr, flags.as_ptr(), flags.len(), stream)
+                .expect("sync block_span H2D");
+        }
+    }
+
+    /// GPU pointer to `block_is_unrotated` flags (for pre-attention rotation).
+    pub fn block_unrotated_gpu(&self) -> *const u8 {
+        self.block_unrotated_gpu_ptr
+            .map(|p| p as *const u8)
+            .unwrap_or(std::ptr::null())
+    }
+
+    /// GPU pointer to `block_is_span` flags (for post-attention un-rotation).
+    pub fn block_span_gpu(&self) -> *const u8 {
+        self.block_span_gpu_ptr
+            .map(|p| p as *const u8)
+            .unwrap_or(std::ptr::null())
+    }
 }
 
 impl Drop for KvCachePool {
@@ -287,6 +357,15 @@ impl Drop for KvCachePool {
         for &ptr in self.k_scale_ptrs.iter().chain(self.v_scale_ptrs.iter()) {
             unsafe {
                 let _ = driver::mem_free(ptr as *mut u8);
+            }
+        }
+        // Free block flags GPU buffers.
+        for ptr in [self.block_unrotated_gpu_ptr, self.block_span_gpu_ptr]
+            .into_iter()
+            .flatten()
+        {
+            unsafe {
+                let _ = driver::mem_free(ptr);
             }
         }
     }

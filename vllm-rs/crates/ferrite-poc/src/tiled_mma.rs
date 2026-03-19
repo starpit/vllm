@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Multi-warp MMA GEMM with register tiling.
+// Multi-warp MMA GEMM with register tiling and vectorized loads.
 //
 // 4 warps (128 threads), 2×2 warp layout.
-// Each warp computes 32×32 of C via 2×4 register tiling of m16n8k16 MMAs.
+// Each warp: 32×32 of C via 2×4 register tiling of m16n8k16 MMAs.
 // Block tile: 64×64. K-step: 16.
 //
-// Shared memory per K-step:
-//   smem_a[64×16] f16 = 2048 bytes
-//   smem_bt[64×16] f16 = 2048 bytes (B transposed for contiguous fragment loads)
-//   Total: 4096 bytes
-//
-// Compute per K-step per block: 4 warps × 8 MMAs × (16×8×16×2) = 131072 FLOPs
-// Compute-to-memory ratio: 131072 / 4096 = 32 FLOPs/byte
+// Vectorized 128-bit global loads (8 f16 per load instruction).
+// B transposed during shared memory store for contiguous MMA fragment loads.
 
 use anyhow::{Context, Result, bail};
 use std::ffi::{CString, c_uint, c_void};
@@ -23,23 +18,21 @@ use inkwell::module::Module;
 use inkwell::builder::Builder;
 use inkwell::targets::{TargetTriple, FileType};
 use inkwell::types::AsTypeRef;
-use inkwell::values::{AsValueRef, BasicValueEnum, IntValue, FloatValue};
+use inkwell::values::{AsValueRef, BasicValueEnum, IntValue, FloatValue, VectorValue};
 use inkwell::{AddressSpace, IntPredicate};
 
 use cudarc::driver::result as cuda;
 
 use crate::{create_nvptx_target_machine, add_nvvm_kernel_metadata, call_sreg, call_barrier0};
 
-// Tile configuration
-const BM: u32 = 64;  // block tile M
-const BN: u32 = 64;  // block tile N
-const BK: u32 = 16;  // block tile K (= MMA K)
-const WM: u32 = 32;  // warp tile M (2 × 16)
-const WN: u32 = 32;  // warp tile N (4 × 8)
+const BM: u32 = 64;
+const BN: u32 = 64;
+const BK: u32 = 16;
+const WM: u32 = 32;
+const WN: u32 = 32;
 const MMA_M: u32 = 16;
 const MMA_N: u32 = 8;
-const MMA_K: u32 = 16;
-const WARPS: u32 = 4; // 2×2 warp layout
+const WARPS: u32 = 4;
 const THREADS: u32 = WARPS * 32;
 
 pub fn step3b_multiwarp_gemm(sm: &str) -> Result<()> {
@@ -86,7 +79,7 @@ pub fn step3b_multiwarp_gemm(sm: &str) -> Result<()> {
     let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
     let grid_x: c_uint = n / BN;
     let grid_y: c_uint = m / BM;
-    let smem_bytes: c_uint = (BM * BK + BN * BK) * 2; // f16
+    let smem_bytes: c_uint = (BM * BK + BN * BK) * 2;
 
     let params: &mut [*mut c_void] = &mut [
         (&d_a) as *const _ as *mut c_void,
@@ -143,7 +136,7 @@ pub fn step3b_multiwarp_gemm(sm: &str) -> Result<()> {
 
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = flops / (us_per * 1e-6) / 1e12;
-    let pct = tflops / 181.0 * 100.0; // L40S f16 TC peak
+    let pct = tflops / 181.0 * 100.0;
     println!("  {:.1} μs, {:.2} TFLOPS ({:.1}% of L40S peak)", us_per, tflops, pct);
 
     unsafe {
@@ -176,6 +169,8 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let void_ty = context.void_type();
     let ptr_g = context.ptr_type(AddressSpace::from(1u16));
     let ptr_s = context.ptr_type(AddressSpace::from(3u16));
+    // Vector type: <8 x f16> for 128-bit loads
+    let v8f16_ty = f16_ty.vec_type(8);
 
     // Dynamic shared memory
     let smem_g = module.add_global(
@@ -194,7 +189,6 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let function = module.add_function("multiwarp_gemm", fn_type, None);
     add_nvvm_kernel_metadata(&module, &function);
 
-    // Constants
     let ci = |v: u64| i32_ty.const_int(v, false);
 
     let entry = context.append_basic_block(function, "entry");
@@ -219,20 +213,14 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let block_row = builder.build_int_mul(bid_y, ci(BM as u64), "br").unwrap();
     let block_col = builder.build_int_mul(bid_x, ci(BN as u64), "bc").unwrap();
 
-    // Warp ID and lane
     let warp_id = builder.build_int_unsigned_div(tid, ci(32), "wid").unwrap();
     let lane = builder.build_int_unsigned_rem(tid, ci(32), "lane").unwrap();
-
-    // 2×2 warp layout: wy = warp_id / 2, wx = warp_id % 2
     let wy = builder.build_int_unsigned_div(warp_id, ci(2), "wy").unwrap();
     let wx = builder.build_int_unsigned_rem(warp_id, ci(2), "wx").unwrap();
-
-    // MMA thread mapping
     let group = builder.build_int_unsigned_div(lane, ci(4), "grp").unwrap();
     let tg = builder.build_int_unsigned_rem(lane, ci(4), "tg").unwrap();
     let tg2 = builder.build_int_mul(tg, ci(2), "tg2").unwrap();
 
-    // Shared memory pointers
     let smem_base = smem_g.as_pointer_value();
     let smem_a = builder.build_pointer_cast(smem_base, ptr_s, "sa").unwrap();
     let smem_bt_off = unsafe {
@@ -243,7 +231,6 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     };
     let smem_bt = builder.build_pointer_cast(smem_bt_off, ptr_s, "sbt").unwrap();
 
-    // Initialize accumulator: 2×4×4 = 32 f32 values (register tiling)
     let f0 = f32_ty.const_float(0.0);
 
     builder.build_unconditional_branch(kloop_hdr).unwrap();
@@ -251,14 +238,10 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     // ── K-loop header ──
     builder.position_at_end(kloop_hdr);
     let t_phi = builder.build_phi(i32_ty, "t").unwrap();
-
-    // 32 accumulator phi nodes: acc[rm][rn][d] for rm in 0..2, rn in 0..4, d in 0..4
     let mut acc_phis = Vec::new();
     for i in 0..32 {
-        let phi = builder.build_phi(f32_ty, &format!("acc{i}")).unwrap();
-        acc_phis.push(phi);
+        acc_phis.push(builder.build_phi(f32_ty, &format!("acc{i}")).unwrap());
     }
-
     let t = t_phi.as_basic_value().into_int_value();
     let kcmp = builder.build_int_compare(IntPredicate::ULT, t, k_p, "kcmp").unwrap();
     builder.build_conditional_branch(kcmp, kloop_body, kloop_exit).unwrap();
@@ -266,117 +249,113 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     // ── K-loop body ──
     builder.position_at_end(kloop_body);
 
-    // ── Load A tile [BM×BK f16] into shared memory ──
-    // 128 threads, BM*BK=1024 elements → 8 per thread
+    // ── VECTORIZED load A tile [64×16 f16] ──
+    // 128 threads, 1024 f16 elements. Each thread loads 8 f16 = one <8 x f16> = 128 bits.
+    // Thread tid loads elements [tid*8 .. tid*8+7] in row-major linear order.
+    // These 8 elements are contiguous: same row, consecutive columns (since BK=16 > 8).
+    // Layout: tid*8/16 = row, tid*8%16 = start col → loads cols [start..start+8) of that row.
     let tid_x8 = builder.build_int_mul(tid, ci(8), "tx8").unwrap();
-    for j in 0..8u64 {
-        let lin = builder.build_int_add(tid_x8, ci(j), "").unwrap();
-        let row_t = builder.build_int_unsigned_div(lin, ci(BK as u64), "").unwrap();
-        let col_t = builder.build_int_unsigned_rem(lin, ci(BK as u64), "").unwrap();
-        let a_row = builder.build_int_add(block_row, row_t, "").unwrap();
-        let a_col = builder.build_int_add(t, col_t, "").unwrap();
-        let a_idx = builder.build_int_add(
-            builder.build_int_mul(a_row, k_p, "").unwrap(), a_col, "",
-        ).unwrap();
-        let agep = unsafe { builder.build_gep(f16_ty, a_ptr, &[a_idx], "").unwrap() };
-        let av = builder.build_load(f16_ty, agep, "").unwrap();
-        let sagep = unsafe { builder.build_gep(f16_ty, smem_a, &[lin], "").unwrap() };
-        builder.build_store(sagep, av).unwrap();
-    }
+    let a_tile_row = builder.build_int_unsigned_div(tid_x8, ci(BK as u64), "atr").unwrap();
+    let a_tile_col = builder.build_int_unsigned_rem(tid_x8, ci(BK as u64), "atc").unwrap();
+    let a_glob_row = builder.build_int_add(block_row, a_tile_row, "agr").unwrap();
+    let a_glob_col = builder.build_int_add(t, a_tile_col, "agc").unwrap();
+    let a_idx = builder.build_int_add(
+        builder.build_int_mul(a_glob_row, k_p, "").unwrap(), a_glob_col, "ai",
+    ).unwrap();
+    // Vector load: load <8 x f16> from A[a_idx]
+    let a_gep = unsafe { builder.build_gep(f16_ty, a_ptr, &[a_idx], "agep").unwrap() };
+    let a_vec = builder.build_load(v8f16_ty, a_gep, "avec").unwrap().into_vector_value();
+    // Vector store to shared memory
+    let sa_gep = unsafe { builder.build_gep(f16_ty, smem_a, &[tid_x8], "sagep").unwrap() };
+    builder.build_store(sa_gep, a_vec).unwrap();
 
-    // ── Load B tile [BK×BN f16] transposed into smem_bt [BN×BK f16] ──
-    // 128 threads, BK*BN=1024 elements → 8 per thread
+    // ── VECTORIZED load B tile [16×64 f16] → transposed store to smem_bt [64×16 f16] ──
+    // 128 threads, 1024 elements, 8 per thread.
+    // Load 8 contiguous f16 from B (same row, consecutive cols).
+    // Then scatter-store transposed: each f16 goes to a different row of smem_bt.
+    let b_tile_row = builder.build_int_unsigned_div(tid_x8, ci(BN as u64), "btr").unwrap();
+    let b_tile_col = builder.build_int_unsigned_rem(tid_x8, ci(BN as u64), "btc").unwrap();
+    let b_glob_row = builder.build_int_add(t, b_tile_row, "bgr").unwrap();
+    let b_glob_col = builder.build_int_add(block_col, b_tile_col, "bgc").unwrap();
+    let b_idx = builder.build_int_add(
+        builder.build_int_mul(b_glob_row, n_p, "").unwrap(), b_glob_col, "bi",
+    ).unwrap();
+    let b_gep = unsafe { builder.build_gep(f16_ty, b_ptr, &[b_idx], "bgep").unwrap() };
+    let b_vec = builder.build_load(v8f16_ty, b_gep, "bvec").unwrap().into_vector_value();
+
+    // Scatter-store transposed: smem_bt[(b_tile_col + j) * BK + b_tile_row] for j in 0..8
     for j in 0..8u64 {
-        let lin = builder.build_int_add(tid_x8, ci(j), "").unwrap();
-        let row_b = builder.build_int_unsigned_div(lin, ci(BN as u64), "").unwrap();
-        let col_b = builder.build_int_unsigned_rem(lin, ci(BN as u64), "").unwrap();
-        let b_row = builder.build_int_add(t, row_b, "").unwrap();
-        let b_col = builder.build_int_add(block_col, col_b, "").unwrap();
-        let b_idx = builder.build_int_add(
-            builder.build_int_mul(b_row, n_p, "").unwrap(), b_col, "",
+        let elem = builder.build_extract_element(
+            b_vec, ci(j), &format!("be{j}"),
         ).unwrap();
-        let bgep = unsafe { builder.build_gep(f16_ty, b_ptr, &[b_idx], "").unwrap() };
-        let bv = builder.build_load(f16_ty, bgep, "").unwrap();
-        // Transposed index: smem_bt[col_b * BK + row_b]
+        let dst_col = builder.build_int_add(b_tile_col, ci(j), "").unwrap();
         let bt_idx = builder.build_int_add(
-            builder.build_int_mul(col_b, ci(BK as u64), "").unwrap(), row_b, "",
+            builder.build_int_mul(dst_col, ci(BK as u64), "").unwrap(),
+            b_tile_row, "",
         ).unwrap();
-        let sbtgep = unsafe { builder.build_gep(f16_ty, smem_bt, &[bt_idx], "").unwrap() };
-        builder.build_store(sbtgep, bv).unwrap();
+        let sbt_gep = unsafe { builder.build_gep(f16_ty, smem_bt, &[bt_idx], "").unwrap() };
+        builder.build_store(sbt_gep, elem).unwrap();
     }
 
     call_barrier0(&context, &module, &builder);
 
-    // ── Load A fragments: a[rm][0..3] for rm in 0..2 ──
-    // a[rm][i] = *(i32*)&smem_a[(wy*WM + rm*MMA_M + frag_row) * BK + frag_col]
+    // ── Load A fragments ──
     let wy_off = builder.build_int_mul(wy, ci(WM as u64), "wyo").unwrap();
-    let mut a_frags: Vec<IntValue> = Vec::new(); // 2 * 4 = 8 values
-
+    let mut a_frags: Vec<IntValue> = Vec::new();
     for rm in 0..2u64 {
         let rm_off = builder.build_int_add(wy_off, ci(rm * MMA_M as u64), "rmo").unwrap();
-        // Fragment rows: group, group+8
-        // Fragment cols: tg*2, tg*2+8
-        for (fi, (row_add, col_add)) in [(0u64, 0u64), (8, 0), (0, 8), (8, 8)].iter().enumerate() {
+        for (row_add, col_add) in [(0u64, 0u64), (8, 0), (0, 8), (8, 8)] {
             let frow = builder.build_int_add(
                 builder.build_int_add(rm_off, group, "").unwrap(),
-                ci(*row_add), "",
+                ci(row_add), "",
             ).unwrap();
-            let fcol = builder.build_int_add(tg2, ci(*col_add), "").unwrap();
+            let fcol = builder.build_int_add(tg2, ci(col_add), "").unwrap();
             let idx = builder.build_int_add(
                 builder.build_int_mul(frow, ci(BK as u64), "").unwrap(), fcol, "",
             ).unwrap();
             let gep = unsafe { builder.build_gep(f16_ty, smem_a, &[idx], "").unwrap() };
-            let val = builder.build_load(i32_ty, gep, &format!("a{rm}_{fi}")).unwrap().into_int_value();
+            let val = builder.build_load(i32_ty, gep, "").unwrap().into_int_value();
             a_frags.push(val);
         }
     }
 
-    // ── Load B fragments: b[rn][0..1] for rn in 0..4 ──
+    // ── Load B fragments ──
     let wx_off = builder.build_int_mul(wx, ci(WN as u64), "wxo").unwrap();
-    let mut b_frags: Vec<IntValue> = Vec::new(); // 4 * 2 = 8 values
-
+    let mut b_frags: Vec<IntValue> = Vec::new();
     for rn in 0..4u64 {
         let rn_off = builder.build_int_add(wx_off, ci(rn * MMA_N as u64), "rno").unwrap();
-        // b[rn] col = rn_off + group → smem_bt[(rn_off + group) * BK + tg*2]
         let bt_row = builder.build_int_add(rn_off, group, "").unwrap();
-        for (bi, col_add) in [0u64, 8].iter().enumerate() {
-            let fcol = builder.build_int_add(tg2, ci(*col_add), "").unwrap();
+        for col_add in [0u64, 8] {
+            let fcol = builder.build_int_add(tg2, ci(col_add), "").unwrap();
             let idx = builder.build_int_add(
                 builder.build_int_mul(bt_row, ci(BK as u64), "").unwrap(), fcol, "",
             ).unwrap();
             let gep = unsafe { builder.build_gep(f16_ty, smem_bt, &[idx], "").unwrap() };
-            let val = builder.build_load(i32_ty, gep, &format!("b{rn}_{bi}")).unwrap().into_int_value();
+            let val = builder.build_load(i32_ty, gep, "").unwrap().into_int_value();
             b_frags.push(val);
         }
     }
 
-    // ── Execute 2×4 = 8 MMA operations ──
+    // ── 2×4 MMA operations ──
     let mut new_accs: Vec<FloatValue> = Vec::new();
     for rm in 0..2u32 {
         for rn in 0..4u32 {
-            let acc_base = (rm * 4 * 4 + rn * 4) as usize; // index into acc_phis
+            let acc_base = (rm * 4 * 4 + rn * 4) as usize;
             let a_base = (rm * 4) as usize;
             let b_base = (rn * 2) as usize;
 
-            let a_regs = [
-                a_frags[a_base], a_frags[a_base + 1],
-                a_frags[a_base + 2], a_frags[a_base + 3],
-            ];
-            let b_regs = [b_frags[b_base], b_frags[b_base + 1]];
-            let c_regs = [
-                acc_phis[acc_base].as_basic_value().into_float_value(),
-                acc_phis[acc_base + 1].as_basic_value().into_float_value(),
-                acc_phis[acc_base + 2].as_basic_value().into_float_value(),
-                acc_phis[acc_base + 3].as_basic_value().into_float_value(),
-            ];
-
             let [d0, d1, d2, d3] = build_mma_asm(
-                &builder, &context, &module, &a_regs, &b_regs, &c_regs,
+                &builder, &context, &module,
+                &[a_frags[a_base], a_frags[a_base+1], a_frags[a_base+2], a_frags[a_base+3]],
+                &[b_frags[b_base], b_frags[b_base+1]],
+                &[
+                    acc_phis[acc_base].as_basic_value().into_float_value(),
+                    acc_phis[acc_base+1].as_basic_value().into_float_value(),
+                    acc_phis[acc_base+2].as_basic_value().into_float_value(),
+                    acc_phis[acc_base+3].as_basic_value().into_float_value(),
+                ],
             );
-            new_accs.push(d0);
-            new_accs.push(d1);
-            new_accs.push(d2);
-            new_accs.push(d3);
+            new_accs.push(d0); new_accs.push(d1); new_accs.push(d2); new_accs.push(d3);
         }
     }
 
@@ -385,7 +364,7 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let t_next = builder.build_int_add(t, ci(BK as u64), "tn").unwrap();
     builder.build_unconditional_branch(kloop_hdr).unwrap();
 
-    // ── Wire phi nodes ──
+    // Wire phi nodes
     t_phi.add_incoming(&[(&ci(0), entry), (&t_next, kloop_body)]);
     for i in 0..32 {
         acc_phis[i].add_incoming(&[(&f0, entry), (&new_accs[i], kloop_body)]);
@@ -394,14 +373,12 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     // ── K-loop exit: store C ──
     builder.position_at_end(kloop_exit);
 
+    let wy_off_exit = builder.build_int_mul(wy, ci(WM as u64), "wyo2").unwrap();
+    let wx_off_exit = builder.build_int_mul(wx, ci(WN as u64), "wxo2").unwrap();
+
     for rm in 0..2u32 {
         for rn in 0..4u32 {
             let acc_base = (rm * 4 * 4 + rn * 4) as usize;
-            // MMA output fragment layout:
-            // d[0] → row = group,     col = tg*2
-            // d[1] → row = group,     col = tg*2 + 1
-            // d[2] → row = group + 8, col = tg*2
-            // d[3] → row = group + 8, col = tg*2 + 1
             for d in 0..4u32 {
                 let mma_row_off = if d < 2 { group } else {
                     builder.build_int_add(group, ci(8), "").unwrap()
@@ -411,12 +388,12 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
                 };
 
                 let c_row = builder.build_int_add(
-                    builder.build_int_add(block_row, wy_off, "").unwrap(),
+                    builder.build_int_add(block_row, wy_off_exit, "").unwrap(),
                     builder.build_int_add(ci(rm as u64 * MMA_M as u64), mma_row_off, "").unwrap(),
                     "",
                 ).unwrap();
                 let c_col = builder.build_int_add(
-                    builder.build_int_add(block_col, wx_off, "").unwrap(),
+                    builder.build_int_add(block_col, wx_off_exit, "").unwrap(),
                     builder.build_int_add(ci(rn as u64 * MMA_N as u64), mma_col_off, "").unwrap(),
                     "",
                 ).unwrap();
@@ -442,7 +419,7 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
 }
 
 // ===========================================================================
-// Inline asm for mma.sync (same mechanism as step 3)
+// Inline asm for mma.sync
 // ===========================================================================
 
 fn build_mma_asm<'ctx>(
@@ -507,10 +484,10 @@ fn build_mma_asm<'ctx>(
         );
 
         let n = |s: &[u8]| s.as_ptr() as *const _;
-        let d0 = llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 0, n(b"d0\0"));
-        let d1 = llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 1, n(b"d1\0"));
-        let d2 = llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 2, n(b"d2\0"));
-        let d3 = llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 3, n(b"d3\0"));
+        let d0 = llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 0, n(b"\0"));
+        let d1 = llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 1, n(b"\0"));
+        let d2 = llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 2, n(b"\0"));
+        let d3 = llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 3, n(b"\0"));
 
         [FloatValue::new(d0), FloatValue::new(d1), FloatValue::new(d2), FloatValue::new(d3)]
     }

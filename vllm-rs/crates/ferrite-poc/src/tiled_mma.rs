@@ -344,7 +344,7 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
             let addr_ptr = unsafe {
                 b.build_gep(ctx.i8_type(), smem_a, &[byte_off], "").unwrap()
             };
-            let addr_i32 = b.build_ptr_to_int(addr_ptr, i32_ty, "aaddr").unwrap();
+            let addr_i32 = build_cvta_shared_to_u32(&b, &ctx, &module, addr_ptr);
             let [r0, r1, r2, r3] = build_ldmatrix_x4_asm(&b, &ctx, &module, addr_i32);
             a_frags.push(r0); a_frags.push(r1); a_frags.push(r2); a_frags.push(r3);
         }
@@ -549,6 +549,49 @@ fn build_cp_async_commit_and_wait<'ctx>(
             builder_ref, fn_type, wait,
             std::ptr::null_mut(), 0, b"\0".as_ptr() as *const _,
         );
+    }
+}
+
+/// Convert a shared memory pointer to a 32-bit shared address via cvta.
+/// Equivalent to: static_cast<uint32>(__cvta_generic_to_shared(ptr))
+fn build_cvta_shared_to_u32<'ctx>(
+    builder: &Builder<'ctx>,
+    context: &'ctx LlvmContext,
+    module: &Module<'ctx>,
+    ptr: inkwell::values::PointerValue<'ctx>,
+) -> IntValue<'ctx> {
+    let i32_ty = context.i32_type();
+    let i64_ty = context.i64_type();
+    unsafe {
+        let mod_ref = module.as_mut_ptr();
+        let ctx_ref = llvm_sys::core::LLVMGetModuleContext(mod_ref);
+        let builder_ref = builder.as_mut_ptr();
+
+        let mut param_types = [i64_ty.as_type_ref()];
+        let fn_type = llvm_sys::core::LLVMFunctionType(
+            i32_ty.as_type_ref(), param_types.as_mut_ptr(), 1, 0,
+        );
+
+        let asm_str = b"cvta.to.shared.u32 $0, $1;\0";
+        let constraints = b"=r,l\0";
+
+        let asm_val = llvm_sys::core::LLVMGetInlineAsm(
+            fn_type,
+            asm_str.as_ptr() as *const _, asm_str.len() - 1,
+            constraints.as_ptr() as *const _, constraints.len() - 1,
+            0, 0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
+        );
+
+        let ptr_i64 = builder.build_ptr_to_int(ptr, i64_ty, "p64").unwrap();
+        let mut args = [ptr_i64.as_value_ref()];
+        let call = llvm_sys::core::LLVMBuildCall2(
+            builder_ref, fn_type, asm_val,
+            args.as_mut_ptr(), 1, b"saddr\0".as_ptr() as *const _,
+        );
+
+        IntValue::new(call)
     }
 }
 

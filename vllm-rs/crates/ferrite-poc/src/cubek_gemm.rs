@@ -265,7 +265,18 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
     let module = ctx.create_module("ferrite_cubek_gemm");
     let b = ctx.create_builder();
 
-    module.set_data_layout(&machine.get_target_data().get_data_layout());
+    // Set data layout with p3:32:32 (Triton's -nvptx-short-ptr trick).
+    // This makes addrspace(3) shared memory pointers 32-bit instead of 64-bit,
+    // critically reducing register usage for shared memory access.
+    {
+        let base = machine.get_target_data().get_data_layout();
+        let base_str = base.as_str().to_string_lossy();
+        let layout_str = format!("{}-p3:32:32-p4:32:32-p5:32:32", base_str);
+        let layout_cstr = std::ffi::CString::new(layout_str).unwrap();
+        unsafe {
+            llvm_sys::core::LLVMSetDataLayout(module.as_mut_ptr(), layout_cstr.as_ptr());
+        }
+    }
     module.set_triple(&TargetTriple::create("nvptx64-nvidia-cuda"));
 
     let i32_ty = ctx.i32_type();
@@ -421,7 +432,7 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
     for ki in 0..PART_K as u64 {
         let k_off = ci(ki * MMA_K as u64);
 
-        // Load all A fragments via 32-bit shared memory loads
+        // Load all A fragments (with p3:32:32, these use 32-bit addressing automatically)
         let mut a_frags: Vec<IntValue> = Vec::new();
         for rm in 0..REG_M as u64 {
             let rm_off = b.build_int_add(wy_off, ci(rm * MMA_M as u64), "").unwrap();
@@ -436,11 +447,12 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
                     b.build_int_mul(frow, ci(STAGE_DIM_K as u64), "").unwrap(), fcol, "",
                 ).unwrap();
                 let sw = build_swizzle(&b, &ctx, lin);
-                a_frags.push(build_ld_shared_u32(&b, &ctx, &module, smem_a, sw));
+                let gep = unsafe { b.build_gep(f16_ty, smem_a, &[sw], "").unwrap() };
+                a_frags.push(b.build_load(i32_ty, gep, "").unwrap().into_int_value());
             }
         }
 
-        // For each N-tile: load B via 32-bit shared loads, MMA all M
+        // For each N-tile: load B, MMA all M
         for rn in 0..REG_N as u64 {
             let b_col = b.build_int_add(ci(rn * MMA_N as u64), group, "").unwrap();
 
@@ -458,8 +470,10 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
                 ).unwrap();
                 let sw0 = build_swizzle(&b, &ctx, lin0);
                 let sw1 = build_swizzle(&b, &ctx, lin1);
-                let v0 = build_ld_shared_f16(&b, &ctx, &module, smem_b, sw0);
-                let v1 = build_ld_shared_f16(&b, &ctx, &module, smem_b, sw1);
+                let gep0 = unsafe { b.build_gep(f16_ty, smem_b, &[sw0], "").unwrap() };
+                let gep1 = unsafe { b.build_gep(f16_ty, smem_b, &[sw1], "").unwrap() };
+                let v0 = b.build_load(f16_ty, gep0, "").unwrap();
+                let v1 = b.build_load(f16_ty, gep1, "").unwrap();
                 let vec = b.build_insert_element(v2f16_ty.get_undef(), v0, ci(0), "").unwrap();
                 let vec = b.build_insert_element(vec, v1, ci(1), "").unwrap();
                 b_frag.push(b.build_bit_cast(vec, i32_ty, "").unwrap().into_int_value());

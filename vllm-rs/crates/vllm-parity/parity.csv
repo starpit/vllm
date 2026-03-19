@@ -60,7 +60,7 @@ Model Architectures — Decoder-Only LLMs,Qwen3,yes,yes,yes,LLaMA alias in CudaW
 Model Architectures — Decoder-Only LLMs,Phi-3 / Phi-4,yes,yes,yes,LLaMA alias in CudaWorker; LongRoPE for Phi-4,
 Model Architectures — Decoder-Only LLMs,Gemma 2,yes,yes,yes,,
 Model Architectures — Decoder-Only LLMs,Gemma 3 (text-only),yes,yes,yes,CUDA graphs supported; Gemma3ForConditionalGeneration resolved as text-only via text_config,
-Model Architectures — Decoder-Only LLMs,DeepSeek V2 / V3 (MLA + MoE),yes,partial,yes,V2/V2-Lite at parity (non-absorbed MLA + 6 CUDA kernels + YaRN RoPE); GGUF quantized MoE (expert weights stay compressed via indexed_moe_forward kernels; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2K-Q6K); V3 gaps: grouped top-k routing + sigmoid scoring + e_score_correction_bias + noaux_tc routing,
+Model Architectures — Decoder-Only LLMs,DeepSeek V2 / V3 (MLA + MoE),yes,partial,yes,V2/V2-Lite at parity (non-absorbed MLA + 6 CUDA kernels + YaRN RoPE); FP8 MoE (expert weights as FP8 E4M3 via Fp8FusedMoELayer; attention projections remain BF16 Linear — no FP8 MLA yet); GGUF quantized MoE (expert weights stay compressed via indexed_moe_forward kernels; Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2K-Q6K); V3 gaps: grouped top-k routing + sigmoid scoring + e_score_correction_bias + noaux_tc routing; FP8 gaps: FP8 attention projections (MLA q_a/q_b/kv_a/kv_b/o_proj use plain Linear not Fp8Linear); FP8 dense MLP layers (first_k_dense_replace layers use load_fused not load_fp8),
 Model Architectures — Decoder-Only LLMs,Command R (Cohere),yes,yes,yes,BNB 4-bit verified on L40S,
 Model Architectures — Decoder-Only LLMs,Qwen2 MoE,yes,yes,yes,MoE + shared expert (gated),
 Model Architectures — Decoder-Only LLMs,Qwen3 MoE,yes,yes,yes,MoE + shared expert + QK-norm,
@@ -118,7 +118,7 @@ Quantization Methods,FP8 KV cache quantization,yes,yes,,CudaWorker: FP8 E4M3 KV 
 Attention Backends,Scaled dot-product (CPU),yes,no,,Removed with CandleWorker,wontfix
 Attention Backends,FlashAttention-2 (single sequence),yes,yes,,CudaWorker: direct FFI,
 Attention Backends,FlashAttention-2 varlen (batched prefill),yes,no,,Removed with CandleWorker,
-Attention Backends,Paged FlashAttention-2 (all batches),yes,yes,,CudaWorker: direct FFI to vllm-flash-attn fork; prefill + decode + mixed,
+Attention Backends,Paged FlashAttention-2 (all batches),yes,yes,,CudaWorker: direct FFI to vllm-flash-attn fork; prefill + decode + mixed; Q buffer padded +128 rows for splitkv unconditional vectorized loads (PyTorch over-allocates so Python never needs this); seqlenq_ngroups_swapped disabled (requires per-batch Q/output padding to seqlen_q_rounded — TODO),
 Attention Backends,FlashAttention-3,yes,no,,,
 Attention Backends,FlashInfer,yes,no,,,
 Attention Backends,Triton attention,yes,no,,,

@@ -1719,6 +1719,34 @@ mod fp8_block_tests {
     use crate::DType;
     use crate::driver;
 
+    /// Convert f32 to FP8 E4M3 (1 sign + 4 exponent + 3 mantissa, bias=7).
+    /// Only handles normal/subnormal positive values in the representable range.
+    fn f32_to_fp8e4m3(val: f32) -> u8 {
+        let bits = val.to_bits();
+        let sign = (bits >> 31) & 1;
+        let exp = ((bits >> 23) & 0xFF) as i32;
+        let frac = bits & 0x7F_FFFF;
+
+        if exp == 0 && frac == 0 {
+            return (sign << 7) as u8; // ±0
+        }
+
+        // Re-bias: FP32 bias=127, FP8E4M3 bias=7
+        let new_exp = exp - 127 + 7;
+        if new_exp <= 0 {
+            // subnormal in fp8
+            let shift = 1 - new_exp;
+            let mantissa = (frac | 0x80_0000) >> (20 + shift as u32);
+            return ((sign << 7) | mantissa) as u8;
+        }
+        if new_exp >= 15 {
+            // max normal value (no inf/nan in e4m3fn): 0_1111_110 = 0x7E
+            return ((sign << 7) | 0x7E) as u8;
+        }
+        let mantissa = frac >> 20; // top 3 bits of f32 mantissa
+        ((sign << 7) | ((new_exp as u32) << 3) | mantissa) as u8
+    }
+
     fn init_cuda() -> cudarc::driver::sys::CUstream {
         unsafe {
             driver::init().expect("CUDA init");
@@ -1750,10 +1778,7 @@ mod fp8_block_tests {
             let weight_vals: Vec<f32> = vec![
                 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0,
             ];
-            let weight_fp8: Vec<u8> = weight_vals
-                .iter()
-                .map(|&v| half::f8e4m3fn::from_f32(v).to_bits())
-                .collect();
+            let weight_fp8: Vec<u8> = weight_vals.iter().map(|&v| f32_to_fp8e4m3(v)).collect();
 
             // Scale [2, 2] — all 1.0 so dequant(w) = w * scale = w.
             let scale_vals: Vec<f32> = vec![1.0, 1.0, 1.0, 1.0];

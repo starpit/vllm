@@ -47,6 +47,8 @@ pub mod ggml;
 #[cfg(feature = "cuda")]
 pub mod graph;
 #[cfg(feature = "cuda")]
+pub mod graph_piece;
+#[cfg(feature = "cuda")]
 pub mod kernels;
 #[cfg(feature = "cuda")]
 pub mod kv_cache;

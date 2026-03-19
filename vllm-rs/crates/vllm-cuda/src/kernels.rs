@@ -3046,9 +3046,8 @@ fn num_splits_heuristic(
     let max_splits = max_splits.min(num_sm).min(num_n_blocks);
 
     // Python's is_split_eligible: ceildiv(n, s) != ceildiv(n, s-1)
-    let ceildiv = |a: usize, b: usize| a.div_ceil(b);
     let is_split_eligible =
-        |s: usize| -> bool { s == 1 || ceildiv(num_n_blocks, s) != ceildiv(num_n_blocks, s - 1) };
+        |s: usize| -> bool { s == 1 || num_n_blocks.div_ceil(s) != num_n_blocks.div_ceil(s - 1) };
 
     // Pass 1: compute efficiencies, find max
     let mut max_efficiency = 0.0_f32;
@@ -5522,6 +5521,7 @@ mod tests_flash_attn {
             let seqused_ptr = upload(&[kv_len as i32], stream);
             let bt_ptr = upload(&[0i32], stream);
 
+            let total_q = batch * q_len;
             mha_varlen_fwd(
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,
@@ -5630,6 +5630,7 @@ mod tests_flash_attn {
             // block_table = [2, 0]: tokens 0-15 in block 2, tokens 16-31 in block 0
             let bt_ptr = upload(&[2i32, 0], stream);
 
+            let total_q = batch * q_len;
             mha_varlen_fwd(
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,
@@ -5819,6 +5820,7 @@ mod tests_flash_attn {
             let seqused_ptr = upload(&[kv_len as i32], stream);
             let bt_ptr = upload(&[0i32], stream);
 
+            let total_q = batch * q_len;
             mha_varlen_fwd(
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,
@@ -6156,6 +6158,7 @@ mod tests_flash_attn {
         let q_head_stride = head_dim as i64;
 
         let call = |k_ptr, v_ptr, bt_ptr, out_ptr, lse_ptr| {
+            let total_q = batch_size;
             mha_varlen_fwd(
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,
@@ -6368,6 +6371,7 @@ mod tests_flash_attn {
             let cu_q = upload(&[0i32, 1], stream);
             let cu_k = upload(&[0i32, kv_len as i32], stream);
 
+            let total_q = 1usize;
             mha_varlen_fwd(
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,

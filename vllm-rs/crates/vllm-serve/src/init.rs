@@ -13,6 +13,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use tracing::info;
+#[cfg(feature = "cuda")]
+use vllm_config::CudaGraphMode;
 use vllm_config::{CudaGraphConfig, SchedulerConfig, SchedulerPolicy};
 use vllm_engine::core_client::InprocClient;
 use vllm_engine::engine_core::EngineCoreConfig;
@@ -89,6 +91,9 @@ pub struct VllmConfig {
     /// Disable CUDA graph capture and run all steps eagerly.
     /// Default: false.
     pub enforce_eager: bool,
+    /// CUDA graph mode: controls piecewise vs monolithic graph capture.
+    /// Default: "full" (maintains current behavior).
+    pub cuda_graph_mode: String,
     /// Maximum number of tokens processed in a single scheduler iteration.
     /// None = auto (min(max_model_len, 8192)).
     pub max_num_batched_tokens: Option<usize>,
@@ -128,6 +133,7 @@ impl Default for VllmConfig {
             node_rank: 0,
             master_addr: "localhost".to_string(),
             master_port: 29500,
+            cuda_graph_mode: "full-and-piecewise".to_string(),
             disable_async_scheduling: false,
             runner: "generate".to_string(),
             cuda_graph_config: None,
@@ -249,9 +255,17 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             block_size: config.block_size,
             device_id,
             enforce_eager: config.enforce_eager,
-            // Default 2048. Mixed batches run through the unified eager path
-            // (no prefill/decode split). See PREFILL_DECODE_SPLIT.md for history.
-            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
+            cuda_graph_mode: config
+                .cuda_graph_mode
+                .parse()
+                .unwrap_or(CudaGraphMode::FullAndPiecewise),
+            // Default 1024 (not 8192 like Python). Our CudaWorker splits mixed
+            // batches into a decode CUDA-graph pass + a prefill eager pass.
+            // Smaller prefill chunks keep the eager pass fast (~25ms for 1024
+            // tokens) while decode runs through the captured graph (~5ms).
+            // Benchmarked: 1024 → 21.8 req/s vs 8192 → 12.1 req/s on Qwen2.5-3B.
+            // See PREFILL_DECODE_SPLIT.md for the full analysis.
+            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
             cuda_graph_sizes: config
                 .cuda_graph_config
                 .as_ref()

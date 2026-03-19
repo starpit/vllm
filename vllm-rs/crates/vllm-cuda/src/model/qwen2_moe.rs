@@ -78,7 +78,7 @@ impl Qwen2MoeConfig {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::large_enum_variant)]
-enum Qwen2MoeMlp {
+pub enum Qwen2MoeMlp {
     Dense(LlamaMLP),
     MoE {
         moe: FusedMoELayer,
@@ -98,7 +98,7 @@ enum Qwen2MoeMlp {
 }
 
 impl Qwen2MoeMlp {
-    unsafe fn forward(&self, hidden_states: TensorView<'_>, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(&self, hidden_states: TensorView<'_>, device: &mut GpuDevice) -> OwnedTensor {
         match self {
             Self::Dense(mlp) => mlp.forward(hidden_states, device),
             Self::MoE {
@@ -209,9 +209,9 @@ impl Qwen2MoeMlp {
 
 pub struct Qwen2MoeDecoderLayer {
     pub self_attn: LlamaAttention,
-    mlp: Qwen2MoeMlp,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    pub mlp: Qwen2MoeMlp,
+    pub input_layernorm: RmsNorm,
+    pub post_attention_layernorm: RmsNorm,
 }
 
 impl Qwen2MoeDecoderLayer {

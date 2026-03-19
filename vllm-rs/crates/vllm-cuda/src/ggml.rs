@@ -1000,19 +1000,19 @@ pub unsafe fn ggml_matmul(
 
 /// Indexed MoE forward: quantized expert weights × Q8_1 inputs → f32 outputs.
 ///
-/// `storage`: 3D quantized expert weights `[num_experts, n, k]` flattened into GgmlStorage
+/// - `storage`: 3D quantized expert weights `[num_experts, n, k]` flattened into GgmlStorage
 ///   where nrows = num_experts * n, ncols = k.
-/// `q8_input`: Q8_1-quantized input, layout depends on `input_dim1`:
+/// - `q8_input`: Q8_1-quantized input, layout depends on `input_dim1`:
 ///   - `input_dim1 == 1`: `[batch, k_padded]` (shared across topk per batch item)
 ///   - `input_dim1 != 1`: `[batch * topk, k_padded]` (unique per task)
-/// `indices`: `[batch * topk]` u32 expert indices.
-/// `output`: `[batch * topk, n]` f32 output buffer.
-/// `n`: output features per expert (nrows per expert).
-/// `k`: input features per expert (ncols).
-/// `batch`: batch size.
-/// `topk`: number of experts per token.
-/// `k_padded`: padded input dimension (for Q8_1 alignment).
-/// `input_dim1`: controls input sharing. 1 = all topk experts for a batch item share
+/// - `indices`: `[batch * topk]` u32 expert indices.
+/// - `output`: `[batch * topk, n]` f32 output buffer.
+/// - `n`: output features per expert (nrows per expert).
+/// - `k`: input features per expert (ncols).
+/// - `batch`: batch size.
+/// - `topk`: number of experts per token.
+/// - `k_padded`: padded input dimension (for Q8_1 alignment).
+/// - `input_dim1`: controls input sharing. 1 = all topk experts for a batch item share
 ///   the same input row. Otherwise each task_id indexes a unique input row.
 ///
 /// # Safety

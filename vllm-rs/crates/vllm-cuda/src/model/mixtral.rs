@@ -74,14 +74,14 @@ impl MixtralConfig {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::large_enum_variant)]
-enum MixtralMoE {
+pub enum MixtralMoE {
     Dense(FusedMoELayer),
     Quantized(MarlinFusedMoELayer),
     Fp8(Fp8FusedMoELayer),
 }
 
 impl MixtralMoE {
-    unsafe fn forward(&self, hidden_states: TensorView<'_>, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(&self, hidden_states: TensorView<'_>, device: &mut GpuDevice) -> OwnedTensor {
         match self {
             Self::Dense(moe) => moe.forward(hidden_states, device),
             Self::Quantized(moe) => moe.forward(hidden_states, device),
@@ -92,9 +92,9 @@ impl MixtralMoE {
 
 pub struct MixtralDecoderLayer {
     pub self_attn: LlamaAttention,
-    block_sparse_moe: MixtralMoE,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    pub block_sparse_moe: MixtralMoE,
+    pub input_layernorm: RmsNorm,
+    pub post_attention_layernorm: RmsNorm,
 }
 
 impl MixtralDecoderLayer {

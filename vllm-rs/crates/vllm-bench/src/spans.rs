@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
-use vllm_config::CudaGraphConfig;
+use vllm_config::{CudaGraphConfig, CudaGraphMode};
 use vllm_serve::llm::{LLM, LLMBuilder, Prompt, SamplingParams};
 
 use crate::args::BenchSpansArgs;
@@ -198,6 +198,7 @@ fn build_llm(args: &BenchSpansArgs, prefix_caching: bool) -> Result<LLM> {
         if !sizes.is_empty() {
             builder = builder.cuda_graph_config(CudaGraphConfig {
                 enabled: true,
+                mode: CudaGraphMode::default(),
                 capture_sizes: sizes,
                 num_warmups: 3,
             });

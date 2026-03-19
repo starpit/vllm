@@ -183,9 +183,9 @@ impl Qwen3MoeMlp {
 
 pub struct Qwen3MoeDecoderLayer {
     pub self_attn: LlamaAttention,
-    mlp: Qwen3MoeMlp,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    pub mlp: Qwen3MoeMlp,
+    pub input_layernorm: RmsNorm,
+    pub post_attention_layernorm: RmsNorm,
 }
 
 impl Qwen3MoeDecoderLayer {

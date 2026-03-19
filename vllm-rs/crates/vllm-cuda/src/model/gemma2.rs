@@ -769,11 +769,11 @@ impl Gemma2Attention {
 
 pub struct Gemma2DecoderLayer {
     pub self_attn: Gemma2Attention,
-    mlp: Gemma2MLP,
-    input_layernorm: GemmaRmsNorm,
-    post_attention_layernorm: GemmaRmsNorm,
-    pre_feedforward_layernorm: GemmaRmsNorm,
-    post_feedforward_layernorm: GemmaRmsNorm,
+    pub mlp: Gemma2MLP,
+    pub input_layernorm: GemmaRmsNorm,
+    pub post_attention_layernorm: GemmaRmsNorm,
+    pub pre_feedforward_layernorm: GemmaRmsNorm,
+    pub post_feedforward_layernorm: GemmaRmsNorm,
 }
 
 impl Gemma2DecoderLayer {
@@ -1155,11 +1155,11 @@ impl Gemma2DecoderLayer {
 // ---------------------------------------------------------------------------
 
 pub struct Gemma2Model {
-    embed_tokens: Embedding,
+    pub embed_tokens: Embedding,
     pub layers: Vec<Gemma2DecoderLayer>,
-    norm: GemmaRmsNorm,
-    rotary: RotaryCache,
-    embed_scale: f32,
+    pub norm: GemmaRmsNorm,
+    pub rotary: RotaryCache,
+    pub embed_scale: f32,
 }
 
 impl Gemma2Model {

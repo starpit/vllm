@@ -23,7 +23,7 @@ pub use cache::{
     CacheConfig, CacheDType, KVCacheConfig, KVCacheGroupSpec, KVCacheSpec, KVCacheSpecType,
     KVCacheTensor, MambaCacheMode, PrefixCachingHashAlgo,
 };
-pub use compilation::CudaGraphConfig;
+pub use compilation::{CudaGraphConfig, CudaGraphMode};
 pub use model::{AttnType, ModelConfig, ModelDType};
 pub use parallel::ParallelConfig;
 pub use scheduler::{RunnerType, SchedulerConfig, SchedulerPolicy};

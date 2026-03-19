@@ -299,41 +299,48 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
 
     call_barrier0(&context, &module, &builder);
 
-    // ── Load A fragments ──
+    // ── Load A fragments via ldmatrix ──
+    // ldmatrix.sync.aligned.m8n8.x4.shared.b16 loads 4 registers (16×16 f16 tile)
+    // Each thread provides addr for row (lane % 16) of the tile.
+    // For m16n8k16 MMA, we need the A fragment from a 16×16 sub-tile.
     let wy_off = builder.build_int_mul(wy, ci(WM as u64), "wyo").unwrap();
+    let lane_mod16 = builder.build_int_unsigned_rem(lane, ci(16), "lm16").unwrap();
+
     let mut a_frags: Vec<IntValue> = Vec::new();
     for rm in 0..2u64 {
         let rm_off = builder.build_int_add(wy_off, ci(rm * MMA_M as u64), "rmo").unwrap();
-        for (row_add, col_add) in [(0u64, 0u64), (8, 0), (0, 8), (8, 8)] {
-            let frow = builder.build_int_add(
-                builder.build_int_add(rm_off, group, "").unwrap(),
-                ci(row_add), "",
-            ).unwrap();
-            let fcol = builder.build_int_add(tg2, ci(col_add), "").unwrap();
-            let idx = builder.build_int_add(
-                builder.build_int_mul(frow, ci(BK as u64), "").unwrap(), fcol, "",
-            ).unwrap();
-            let gep = unsafe { builder.build_gep(f16_ty, smem_a, &[idx], "").unwrap() };
-            let val = builder.build_load(i32_ty, gep, "").unwrap().into_int_value();
-            a_frags.push(val);
-        }
+        // Row in shared memory for this thread's ldmatrix address
+        let smem_row = builder.build_int_add(rm_off, lane_mod16, "asr").unwrap();
+        // Byte offset: row * BK * sizeof(f16) = row * BK * 2
+        let byte_off = builder.build_int_mul(
+            builder.build_int_mul(smem_row, ci(BK as u64), "").unwrap(),
+            ci(2), "abo",
+        ).unwrap();
+        let [r0, r1, r2, r3] = build_ldmatrix_x4_asm(
+            &builder, &context, &module, smem_a, byte_off,
+        );
+        a_frags.push(r0); a_frags.push(r1); a_frags.push(r2); a_frags.push(r3);
     }
 
-    // ── Load B fragments ──
+    // ── Load B fragments via ldmatrix with transpose ──
+    // B is stored transposed in smem_bt[BN×BK]. Each column of original B = one row of smem_bt.
+    // ldmatrix.sync.aligned.m8n8.x2.trans loads 2 registers with auto-transpose.
     let wx_off = builder.build_int_mul(wx, ci(WN as u64), "wxo").unwrap();
+
     let mut b_frags: Vec<IntValue> = Vec::new();
     for rn in 0..4u64 {
         let rn_off = builder.build_int_add(wx_off, ci(rn * MMA_N as u64), "rno").unwrap();
-        let bt_row = builder.build_int_add(rn_off, group, "").unwrap();
-        for col_add in [0u64, 8] {
-            let fcol = builder.build_int_add(tg2, ci(col_add), "").unwrap();
-            let idx = builder.build_int_add(
-                builder.build_int_mul(bt_row, ci(BK as u64), "").unwrap(), fcol, "",
-            ).unwrap();
-            let gep = unsafe { builder.build_gep(f16_ty, smem_bt, &[idx], "").unwrap() };
-            let val = builder.build_load(i32_ty, gep, "").unwrap().into_int_value();
-            b_frags.push(val);
-        }
+        // For .trans ldmatrix, each thread provides address for col (lane % 8) of the tile
+        let lane_mod8 = builder.build_int_unsigned_rem(lane, ci(8), "lm8").unwrap();
+        let bt_row = builder.build_int_add(rn_off, lane_mod8, "btr").unwrap();
+        let byte_off = builder.build_int_mul(
+            builder.build_int_mul(bt_row, ci(BK as u64), "").unwrap(),
+            ci(2), "bbo",
+        ).unwrap();
+        let [r0, r1] = build_ldmatrix_x2_trans_asm(
+            &builder, &context, &module, smem_bt, byte_off,
+        );
+        b_frags.push(r0); b_frags.push(r1);
     }
 
     // ── 2×4 MMA operations ──
@@ -421,6 +428,124 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
 // ===========================================================================
 // Inline asm for mma.sync
 // ===========================================================================
+
+/// ldmatrix.sync.aligned.m8n8.x4.shared.b16 — loads 4 × i32 from shared memory.
+/// `smem_ptr` is the base shared pointer, `byte_offset` is the per-thread byte offset.
+fn build_ldmatrix_x4_asm<'ctx>(
+    builder: &Builder<'ctx>,
+    context: &'ctx LlvmContext,
+    module: &Module<'ctx>,
+    smem_ptr: inkwell::values::PointerValue<'ctx>,
+    byte_offset: IntValue<'ctx>,
+) -> [IntValue<'ctx>; 4] {
+    let i32_ty = context.i32_type();
+    unsafe {
+        let mod_ref = module.as_mut_ptr();
+        let ctx_ref = llvm_sys::core::LLVMGetModuleContext(mod_ref);
+        let builder_ref = builder.as_mut_ptr();
+
+        // Return type: {i32, i32, i32, i32}
+        let mut ret_members = [
+            i32_ty.as_type_ref(), i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(), i32_ty.as_type_ref(),
+        ];
+        let ret_struct = llvm_sys::core::LLVMStructTypeInContext(
+            ctx_ref, ret_members.as_mut_ptr(), 4, 0,
+        );
+        // Input: i32 (shared memory address as 32-bit)
+        let mut param_types = [i32_ty.as_type_ref()];
+        let fn_type = llvm_sys::core::LLVMFunctionType(
+            ret_struct, param_types.as_mut_ptr(), 1, 0,
+        );
+
+        // Convert shared pointer + byte offset to 32-bit shared address via cvta
+        // We'll compute the address in LLVM IR and pass it as i32 to the asm.
+        let addr_ptr = unsafe {
+            builder.build_gep(context.i8_type(), smem_ptr, &[byte_offset], "ldm_addr").unwrap()
+        };
+        let addr_i32 = builder.build_ptr_to_int(addr_ptr, i32_ty, "addr32").unwrap();
+
+        let asm_str = b"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0,$1,$2,$3}, [$4];\0";
+        let constraints = b"=r,=r,=r,=r,r\0";
+
+        let asm_val = llvm_sys::core::LLVMGetInlineAsm(
+            fn_type,
+            asm_str.as_ptr() as *const _, asm_str.len() - 1,
+            constraints.as_ptr() as *const _, constraints.len() - 1,
+            1, 0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
+        );
+
+        let mut args = [addr_i32.as_value_ref()];
+        let call = llvm_sys::core::LLVMBuildCall2(
+            builder_ref, fn_type, asm_val,
+            args.as_mut_ptr(), 1, b"\0".as_ptr() as *const _,
+        );
+
+        let n = |s: &[u8]| s.as_ptr() as *const _;
+        [
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 0, n(b"\0"))),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 1, n(b"\0"))),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 2, n(b"\0"))),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 3, n(b"\0"))),
+        ]
+    }
+}
+
+/// ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 — loads 2 × i32 with transpose.
+fn build_ldmatrix_x2_trans_asm<'ctx>(
+    builder: &Builder<'ctx>,
+    context: &'ctx LlvmContext,
+    module: &Module<'ctx>,
+    smem_ptr: inkwell::values::PointerValue<'ctx>,
+    byte_offset: IntValue<'ctx>,
+) -> [IntValue<'ctx>; 2] {
+    let i32_ty = context.i32_type();
+    unsafe {
+        let mod_ref = module.as_mut_ptr();
+        let ctx_ref = llvm_sys::core::LLVMGetModuleContext(mod_ref);
+        let builder_ref = builder.as_mut_ptr();
+
+        let mut ret_members = [i32_ty.as_type_ref(), i32_ty.as_type_ref()];
+        let ret_struct = llvm_sys::core::LLVMStructTypeInContext(
+            ctx_ref, ret_members.as_mut_ptr(), 2, 0,
+        );
+        let mut param_types = [i32_ty.as_type_ref()];
+        let fn_type = llvm_sys::core::LLVMFunctionType(
+            ret_struct, param_types.as_mut_ptr(), 1, 0,
+        );
+
+        let addr_ptr = unsafe {
+            builder.build_gep(context.i8_type(), smem_ptr, &[byte_offset], "ldmt_addr").unwrap()
+        };
+        let addr_i32 = builder.build_ptr_to_int(addr_ptr, i32_ty, "addr32t").unwrap();
+
+        let asm_str = b"ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {$0,$1}, [$2];\0";
+        let constraints = b"=r,=r,r\0";
+
+        let asm_val = llvm_sys::core::LLVMGetInlineAsm(
+            fn_type,
+            asm_str.as_ptr() as *const _, asm_str.len() - 1,
+            constraints.as_ptr() as *const _, constraints.len() - 1,
+            1, 0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
+        );
+
+        let mut args = [addr_i32.as_value_ref()];
+        let call = llvm_sys::core::LLVMBuildCall2(
+            builder_ref, fn_type, asm_val,
+            args.as_mut_ptr(), 1, b"\0".as_ptr() as *const _,
+        );
+
+        let n = |s: &[u8]| s.as_ptr() as *const _;
+        [
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 0, n(b"\0"))),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 1, n(b"\0"))),
+        ]
+    }
+}
 
 fn build_mma_asm<'ctx>(
     builder: &Builder<'ctx>,

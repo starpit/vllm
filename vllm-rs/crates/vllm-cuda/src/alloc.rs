@@ -623,7 +623,6 @@ impl Drop for CachingAllocator {
 /// are not managed by the caching allocator.
 pub struct RawGpuAlloc {
     inner: GpuTensor,
-    size_bytes: usize,
 }
 
 // Safety: GPU device pointers are accessible from any host thread after the
@@ -639,10 +638,9 @@ impl RawGpuAlloc {
     /// Requires an active CUDA context on the current thread.
     pub unsafe fn new(shape: &[usize], dtype: DType) -> anyhow::Result<Self> {
         let numel: usize = shape.iter().product();
-        let size_bytes = numel * dtype.size_bytes();
-        let ptr = driver::mem_alloc(size_bytes)?;
+        let ptr = driver::mem_alloc(numel * dtype.size_bytes())?;
         let inner = GpuTensor::new(ptr, shape, dtype);
-        Ok(Self { inner, size_bytes })
+        Ok(Self { inner })
     }
 
     /// Access the underlying `GpuTensor` (non-owning, Copy).

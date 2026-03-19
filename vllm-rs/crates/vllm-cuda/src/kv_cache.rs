@@ -4,6 +4,7 @@
 //! Layout per layer: `[num_blocks, block_size, num_kv_heads, head_dim]`
 //! Paged KV cache pool for GPU inference.
 
+use crate::alloc::RawGpuMem;
 use crate::driver;
 use crate::dtype::DType;
 use crate::tensor::{GpuTensor, TensorView};
@@ -22,9 +23,9 @@ pub struct KvCachePool {
     k_caches: Vec<GpuTensor>,
     /// V cache per layer: same layout
     v_caches: Vec<GpuTensor>,
-    /// Raw pointers for deallocation.
-    _k_ptrs: Vec<*mut u8>,
-    _v_ptrs: Vec<*mut u8>,
+    /// RAII wrappers for KV cache GPU allocations — auto-freed on drop.
+    _k_ptrs: Vec<RawGpuMem>,
+    _v_ptrs: Vec<RawGpuMem>,
     pub num_blocks: usize,
     pub block_size: usize,
     pub num_kv_heads: usize,
@@ -32,10 +33,10 @@ pub struct KvCachePool {
     pub num_layers: usize,
     /// The dtype stored in cache (may differ from model dtype when FP8).
     cache_dtype: DType,
-    /// Per-layer K scale: GPU f32 scalar pointers. Only used when FP8.
-    k_scale_ptrs: Vec<*mut f32>,
-    /// Per-layer V scale: GPU f32 scalar pointers. Only used when FP8.
-    v_scale_ptrs: Vec<*mut f32>,
+    /// Per-layer K scale: GPU f32 scalar RAII wrappers. Only used when FP8.
+    k_scale_ptrs: Vec<RawGpuMem>,
+    /// Per-layer V scale: GPU f32 scalar RAII wrappers. Only used when FP8.
+    v_scale_ptrs: Vec<RawGpuMem>,
 
     /// Per-physical-block flag: `true` = K is **currently** stored unrotated.
     /// Used by the pre-attention rotation kernel (rotate these blocks).
@@ -48,9 +49,9 @@ pub struct KvCachePool {
     pub block_is_span: Vec<bool>,
 
     /// GPU mirror of `block_is_unrotated` — for pre-attention forward rotation.
-    block_unrotated_gpu_ptr: Option<*mut u8>,
+    block_unrotated_gpu_ptr: Option<RawGpuMem>,
     /// GPU mirror of `block_is_span` — for post-attention inverse rotation.
-    block_span_gpu_ptr: Option<*mut u8>,
+    block_span_gpu_ptr: Option<RawGpuMem>,
 }
 
 // Safety: KvCachePool holds GPU device pointers (GpuTensor arrays and raw
@@ -91,33 +92,33 @@ impl KvCachePool {
 
             k_caches.push(GpuTensor::new(k_ptr, &shape, dtype));
             v_caches.push(GpuTensor::new(v_ptr, &shape, dtype));
-            k_ptrs.push(k_ptr);
-            v_ptrs.push(v_ptr);
+            k_ptrs.push(RawGpuMem::new(k_ptr, bytes_per_layer));
+            v_ptrs.push(RawGpuMem::new(v_ptr, bytes_per_layer));
         }
 
         // Allocate per-layer scale factors for FP8 cache.
         if dtype.is_fp8() {
             for _ in 0..num_layers {
                 // Allocate GPU f32 scalars, initialized to 1.0.
-                let k_scale = driver::mem_alloc(4)? as *mut f32;
-                let v_scale = driver::mem_alloc(4)? as *mut f32;
+                let k_scale_ptr = driver::mem_alloc(4)?;
+                let v_scale_ptr = driver::mem_alloc(4)?;
                 let one: f32 = 1.0;
                 // Use null stream (synchronous) for init-time copy.
                 let null_stream = std::ptr::null_mut();
                 driver::memcpy_htod_async(
-                    k_scale as *mut u8,
+                    k_scale_ptr,
                     &one as *const f32 as *const u8,
                     4,
                     null_stream,
                 )?;
                 driver::memcpy_htod_async(
-                    v_scale as *mut u8,
+                    v_scale_ptr,
                     &one as *const f32 as *const u8,
                     4,
                     null_stream,
                 )?;
-                k_scale_ptrs.push(k_scale);
-                v_scale_ptrs.push(v_scale);
+                k_scale_ptrs.push(RawGpuMem::new(k_scale_ptr, 4));
+                v_scale_ptrs.push(RawGpuMem::new(v_scale_ptr, 4));
             }
         }
 
@@ -147,12 +148,12 @@ impl KvCachePool {
             block_is_unrotated: vec![false; num_blocks],
             block_is_span: vec![false; num_blocks],
             block_unrotated_gpu_ptr: if vllm_config::SpansConfig::from_env().fuse_rope() {
-                driver::mem_alloc(num_blocks).ok()
+                driver::mem_alloc(num_blocks).ok().map(|p| RawGpuMem::new(p, num_blocks))
             } else {
                 None
             },
             block_span_gpu_ptr: if vllm_config::SpansConfig::from_env().fuse_rope() {
-                driver::mem_alloc(num_blocks).ok()
+                driver::mem_alloc(num_blocks).ok().map(|p| RawGpuMem::new(p, num_blocks))
             } else {
                 None
             },
@@ -183,22 +184,22 @@ impl KvCachePool {
 
     /// GPU pointer to K scale for a layer (only valid when FP8).
     pub fn k_scale_ptr(&self, layer: usize) -> *const f32 {
-        self.k_scale_ptrs[layer] as *const f32
+        self.k_scale_ptrs[layer].ptr() as *const f32
     }
 
     /// GPU pointer to V scale for a layer (only valid when FP8).
     pub fn v_scale_ptr(&self, layer: usize) -> *const f32 {
-        self.v_scale_ptrs[layer] as *const f32
+        self.v_scale_ptrs[layer].ptr() as *const f32
     }
 
     /// Mutable GPU pointer to K scale for a layer (for writing computed scales).
     pub fn k_scale_ptr_mut(&self, layer: usize) -> *mut f32 {
-        self.k_scale_ptrs[layer]
+        self.k_scale_ptrs[layer].ptr() as *mut f32
     }
 
     /// Mutable GPU pointer to V scale for a layer (for writing computed scales).
     pub fn v_scale_ptr_mut(&self, layer: usize) -> *mut f32 {
-        self.v_scale_ptrs[layer]
+        self.v_scale_ptrs[layer].ptr() as *mut f32
     }
 
     /// Set K scale for a layer from a host value.
@@ -212,7 +213,7 @@ impl KvCachePool {
         stream: cudarc::driver::sys::CUstream,
     ) {
         driver::memcpy_htod_async(
-            self.k_scale_ptrs[layer] as *mut u8,
+            self.k_scale_ptrs[layer].ptr(),
             &val as *const f32 as *const u8,
             4,
             stream,
@@ -231,7 +232,7 @@ impl KvCachePool {
         stream: cudarc::driver::sys::CUstream,
     ) {
         driver::memcpy_htod_async(
-            self.v_scale_ptrs[layer] as *mut u8,
+            self.v_scale_ptrs[layer].ptr(),
             &val as *const f32 as *const u8,
             4,
             stream,
@@ -315,18 +316,18 @@ impl KvCachePool {
     /// # Safety
     /// Requires valid CUDA context and stream.
     pub unsafe fn sync_block_flags_to_gpu(&self, stream: cudarc::driver::sys::CUstream) {
-        if let Some(gpu_ptr) = self.block_unrotated_gpu_ptr {
+        if let Some(ref mem) = self.block_unrotated_gpu_ptr {
             let flags: Vec<u8> = self
                 .block_is_unrotated
                 .iter()
                 .map(|&b| u8::from(b))
                 .collect();
-            driver::memcpy_htod_async(gpu_ptr, flags.as_ptr(), flags.len(), stream)
+            driver::memcpy_htod_async(mem.ptr(), flags.as_ptr(), flags.len(), stream)
                 .expect("sync block_unrotated H2D");
         }
-        if let Some(gpu_ptr) = self.block_span_gpu_ptr {
+        if let Some(ref mem) = self.block_span_gpu_ptr {
             let flags: Vec<u8> = self.block_is_span.iter().map(|&b| u8::from(b)).collect();
-            driver::memcpy_htod_async(gpu_ptr, flags.as_ptr(), flags.len(), stream)
+            driver::memcpy_htod_async(mem.ptr(), flags.as_ptr(), flags.len(), stream)
                 .expect("sync block_span H2D");
         }
     }
@@ -334,39 +335,20 @@ impl KvCachePool {
     /// GPU pointer to `block_is_unrotated` flags (for pre-attention rotation).
     pub fn block_unrotated_gpu(&self) -> *const u8 {
         self.block_unrotated_gpu_ptr
-            .map(|p| p as *const u8)
+            .as_ref()
+            .map(|m| m.ptr() as *const u8)
             .unwrap_or(std::ptr::null())
     }
 
     /// GPU pointer to `block_is_span` flags (for post-attention un-rotation).
     pub fn block_span_gpu(&self) -> *const u8 {
         self.block_span_gpu_ptr
-            .map(|p| p as *const u8)
+            .as_ref()
+            .map(|m| m.ptr() as *const u8)
             .unwrap_or(std::ptr::null())
     }
 }
 
-impl Drop for KvCachePool {
-    fn drop(&mut self) {
-        for &ptr in self._k_ptrs.iter().chain(self._v_ptrs.iter()) {
-            unsafe {
-                let _ = driver::mem_free(ptr);
-            }
-        }
-        // Free FP8 scale allocations.
-        for &ptr in self.k_scale_ptrs.iter().chain(self.v_scale_ptrs.iter()) {
-            unsafe {
-                let _ = driver::mem_free(ptr as *mut u8);
-            }
-        }
-        // Free block flags GPU buffers.
-        for ptr in [self.block_unrotated_gpu_ptr, self.block_span_gpu_ptr]
-            .into_iter()
-            .flatten()
-        {
-            unsafe {
-                let _ = driver::mem_free(ptr);
-            }
-        }
-    }
-}
+// All GPU allocations (_k_ptrs, _v_ptrs, k_scale_ptrs, v_scale_ptrs,
+// block_unrotated_gpu_ptr, block_span_gpu_ptr) are RawGpuMem and freed
+// automatically via Drop — no manual impl needed.

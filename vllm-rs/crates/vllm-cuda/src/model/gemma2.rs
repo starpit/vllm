@@ -162,6 +162,7 @@ impl Gemma2MLP {
         let gate_bytes = gate_shape.iter().product::<usize>() * gate_dtype.size_bytes();
         let total_bytes = gate_bytes * 2;
         let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+        weights.record_alloc(ptr, total_bytes);
         unsafe {
             weights.take_into(&gate_name, ptr, stream)?;
             weights.take_into(&up_name, ptr.add(gate_bytes), stream)?;
@@ -370,6 +371,7 @@ impl Gemma2Attention {
         let kv_bytes = kv_size * hidden * elem_size;
         let total_bytes = q_bytes + 2 * kv_bytes;
         let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+        weights.record_alloc(ptr, total_bytes);
         unsafe {
             weights.take_into(&q_name, ptr, stream)?;
             weights.take_into(&k_name, ptr.add(q_bytes), stream)?;
@@ -1196,6 +1198,11 @@ impl Gemma2Model {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         Ok(Self {
             embed_tokens,
@@ -1343,6 +1350,11 @@ impl Gemma2ForCausalLM {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         let model = Gemma2Model {
             embed_tokens,
@@ -1429,6 +1441,11 @@ impl Gemma2ForCausalLM {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         let model = Gemma2Model {
             embed_tokens,
@@ -1486,6 +1503,11 @@ impl Gemma2ForCausalLM {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         let model = Gemma2Model {
             embed_tokens,
@@ -1617,6 +1639,7 @@ impl Gemma2Attention {
         let kv_bytes = kv_size * hidden * elem_size;
         let total_bytes = q_bytes + 2 * kv_bytes;
         let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+        weights.record_alloc(ptr, total_bytes);
         unsafe {
             weights.take_shard_into(&q_name, 0, tp.rank, tp.world_size, ptr, stream)?;
             weights.take_shard_into(
@@ -1689,6 +1712,7 @@ impl Gemma2MLP {
         let shard_bytes = shard_intermediate * hidden * elem_size;
         let total_bytes = 2 * shard_bytes;
         let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+        weights.record_alloc(ptr, total_bytes);
         unsafe {
             weights.take_shard_into(&gate_name, 0, tp.rank, tp.world_size, ptr, stream)?;
             weights.take_shard_into(
@@ -1825,6 +1849,11 @@ impl Gemma2Model {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         Ok(Self {
             embed_tokens,
@@ -1879,6 +1908,7 @@ impl Gemma2Model {
             // intermediate hidden states instead of input_ids.
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 GpuTensor::new(ptr, &[1, 1], dtype)
             };
             Embedding::new(w)
@@ -1906,6 +1936,7 @@ impl Gemma2Model {
             // Dummy norm — never used on non-last stages.
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 GpuTensor::new(ptr, &[1], dtype)
             };
             GemmaRmsNorm {
@@ -1923,6 +1954,11 @@ impl Gemma2Model {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         Ok(Self {
             embed_tokens,
@@ -1947,6 +1983,7 @@ impl Gemma2Model {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 GpuTensor::new(ptr, &[1, 1], dtype)
             };
             Embedding::new(w)
@@ -1974,6 +2011,7 @@ impl Gemma2Model {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 GpuTensor::new(ptr, &[1], dtype)
             };
             GemmaRmsNorm {
@@ -1991,6 +2029,11 @@ impl Gemma2Model {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         Ok(Self {
             embed_tokens,
@@ -2102,6 +2145,7 @@ impl Gemma2ForCausalLM {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 GpuTensor::new(ptr, &[1, 1], dtype)
             };
             Linear::new(w, None)
@@ -2138,6 +2182,7 @@ impl Gemma2ForCausalLM {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 GpuTensor::new(ptr, &[1, 1], dtype)
             };
             Linear::new(w, None)

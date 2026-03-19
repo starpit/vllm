@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use cudarc::driver::sys::{CUgraphExec, CUstream};
 
-use crate::alloc::OwnedTensor;
+use crate::alloc::{OwnedTensor, RawGpuMem};
 use crate::device::GpuDevice;
 use crate::driver;
 use crate::dtype::DType;
@@ -40,17 +40,17 @@ struct CapturedGraph {
 /// CUDA graph runner for decode batches.
 pub struct CudaGraphRunner {
     graphs: HashMap<usize, CapturedGraph>,
-    input_ids: *mut u8,
-    positions: *mut u8,
-    slot_mapping: *mut u8,
-    cu_seqlens_q: *mut u8,
-    seqused_k: *mut u8,
-    block_table: *mut u8,
+    input_ids: RawGpuMem,
+    positions: RawGpuMem,
+    slot_mapping: RawGpuMem,
+    cu_seqlens_q: RawGpuMem,
+    seqused_k: RawGpuMem,
+    block_table: RawGpuMem,
     /// Shared output buffer for logits — `[max_batch, vocab_size]` in model dtype.
     /// All captured graphs copy their logits here, so we only keep one allocation.
-    shared_logits: *mut u8,
+    shared_logits: RawGpuMem,
     /// Shared output buffer for argmax token IDs — `[max_batch]` in U32.
-    shared_argmax: *mut u8,
+    shared_argmax: RawGpuMem,
     max_batch: usize,
     dtype: DType,
     vocab_size: usize,
@@ -58,11 +58,11 @@ pub struct CudaGraphRunner {
     // --- FP8 KV cache dequant buffers (None when KV cache is BF16/F16) ---
     /// `[max_total_kv, num_kv_heads, head_dim]` in model dtype — pre-allocated
     /// contiguous K buffer for FP8 dequant during graph capture/replay.
-    fp8_k_buf: Option<*mut u8>,
+    fp8_k_buf: Option<RawGpuMem>,
     /// Same shape — pre-allocated contiguous V buffer.
-    fp8_v_buf: Option<*mut u8>,
+    fp8_v_buf: Option<RawGpuMem>,
     /// `[max_batch + 1]` i32 — persistent cu_seqlens_k for FP8 dequant.
-    fp8_cu_seqlens_k: Option<*mut u8>,
+    fp8_cu_seqlens_k: Option<RawGpuMem>,
     /// Max total KV tokens = max_batch * padded_max_seqlen_k.
     fp8_max_total_kv: usize,
     fp8_num_kv_heads: usize,
@@ -81,14 +81,20 @@ unsafe impl Send for CudaGraphRunner {}
 
 impl CudaGraphRunner {
     pub unsafe fn new(max_batch: usize, vocab_size: usize, dtype: DType) -> Result<Self> {
-        let input_ids = driver::mem_alloc(max_batch * 4)?;
-        let positions = driver::mem_alloc(max_batch * 4)?;
-        let slot_mapping = driver::mem_alloc(max_batch * 8)?;
-        let cu_seqlens_q = driver::mem_alloc((max_batch + 1) * 4)?;
-        let seqused_k = driver::mem_alloc(max_batch * 4)?;
-        let block_table = driver::mem_alloc(max_batch * MAX_BLOCKS_PER_SEQ * 4)?;
-        let shared_logits = driver::mem_alloc(max_batch * vocab_size * dtype.size_bytes())?;
-        let shared_argmax = driver::mem_alloc(max_batch * 4)?;
+        let input_ids = RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
+        let positions = RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
+        let slot_mapping = RawGpuMem::new(driver::mem_alloc(max_batch * 8)?, max_batch * 8);
+        let cu_seqlens_q =
+            RawGpuMem::new(driver::mem_alloc((max_batch + 1) * 4)?, (max_batch + 1) * 4);
+        let seqused_k = RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
+        let block_table = RawGpuMem::new(
+            driver::mem_alloc(max_batch * MAX_BLOCKS_PER_SEQ * 4)?,
+            max_batch * MAX_BLOCKS_PER_SEQ * 4,
+        );
+        let shared_logits_size = max_batch * vocab_size * dtype.size_bytes();
+        let shared_logits =
+            RawGpuMem::new(driver::mem_alloc(shared_logits_size)?, shared_logits_size);
+        let shared_argmax = RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
 
         Ok(Self {
             graphs: HashMap::new(),
@@ -136,9 +142,10 @@ impl CudaGraphRunner {
         let elem_bytes = model_dtype.size_bytes();
         let buf_bytes = max_total_kv * num_kv_heads * head_dim * elem_bytes;
 
-        let k_buf = driver::mem_alloc(buf_bytes)?;
-        let v_buf = driver::mem_alloc(buf_bytes)?;
-        let cu_seqlens_k = driver::mem_alloc((self.max_batch + 1) * 4)?;
+        let k_buf = RawGpuMem::new(driver::mem_alloc(buf_bytes)?, buf_bytes);
+        let v_buf = RawGpuMem::new(driver::mem_alloc(buf_bytes)?, buf_bytes);
+        let cu_seqlens_k_size = (self.max_batch + 1) * 4;
+        let cu_seqlens_k = RawGpuMem::new(driver::mem_alloc(cu_seqlens_k_size)?, cu_seqlens_k_size);
 
         self.fp8_k_buf = Some(k_buf);
         self.fp8_v_buf = Some(v_buf);
@@ -196,9 +203,9 @@ impl CudaGraphRunner {
     /// Build an [`Fp8GraphCtx`] for the thread-local. Returns `None` if FP8
     /// buffers are not allocated.
     pub fn fp8_graph_ctx(&self) -> Option<crate::model::attention_helpers::Fp8GraphCtx> {
-        let k_buf = self.fp8_k_buf?;
-        let v_buf = self.fp8_v_buf?;
-        let cu_seqlens_k = self.fp8_cu_seqlens_k?;
+        let k_buf = self.fp8_k_buf.as_ref()?.ptr();
+        let v_buf = self.fp8_v_buf.as_ref()?.ptr();
+        let cu_seqlens_k = self.fp8_cu_seqlens_k.as_ref()?.ptr();
         Some(crate::model::attention_helpers::Fp8GraphCtx {
             k_buf,
             v_buf,
@@ -221,9 +228,9 @@ impl CudaGraphRunner {
         cu_seqlens_k: &[i32],
         stream: CUstream,
     ) -> Result<()> {
-        if let Some(ptr) = self.fp8_cu_seqlens_k {
+        if let Some(ref mem) = self.fp8_cu_seqlens_k {
             driver::memcpy_htod_async(
-                ptr,
+                mem.ptr(),
                 cu_seqlens_k.as_ptr() as *const u8,
                 cu_seqlens_k.len() * 4,
                 stream,
@@ -248,13 +255,17 @@ impl CudaGraphRunner {
     fn input_tensors(&self, batch_size: usize) -> InputTensors {
         unsafe {
             InputTensors {
-                input_ids: GpuTensor::new(self.input_ids, &[batch_size], DType::U32),
-                positions: GpuTensor::new(self.positions, &[batch_size], DType::U32),
-                slot_mapping: GpuTensor::new(self.slot_mapping, &[batch_size], DType::I64),
-                cu_seqlens_q: GpuTensor::new(self.cu_seqlens_q, &[batch_size + 1], DType::I32),
-                seqused_k: GpuTensor::new(self.seqused_k, &[batch_size], DType::I32),
+                input_ids: GpuTensor::new(self.input_ids.ptr(), &[batch_size], DType::U32),
+                positions: GpuTensor::new(self.positions.ptr(), &[batch_size], DType::U32),
+                slot_mapping: GpuTensor::new(self.slot_mapping.ptr(), &[batch_size], DType::I64),
+                cu_seqlens_q: GpuTensor::new(
+                    self.cu_seqlens_q.ptr(),
+                    &[batch_size + 1],
+                    DType::I32,
+                ),
+                seqused_k: GpuTensor::new(self.seqused_k.ptr(), &[batch_size], DType::I32),
                 block_table: GpuTensor::new(
-                    self.block_table,
+                    self.block_table.ptr(),
                     &[batch_size, MAX_BLOCKS_PER_SEQ],
                     DType::I32,
                 ),
@@ -305,21 +316,21 @@ impl CudaGraphRunner {
         );
         // Copy logits and argmax into shared buffers (recorded in graph).
         driver::memcpy_dtod_async(
-            self.shared_logits,
+            self.shared_logits.ptr(),
             logits.as_gpu_tensor().raw_ptr() as *const u8,
             logits_bytes,
             device.compute_stream,
         )?;
         driver::memcpy_dtod_async(
-            self.shared_argmax,
+            self.shared_argmax.ptr(),
             argmax_out.as_gpu_tensor().raw_ptr() as *const u8,
             argmax_bytes,
             device.compute_stream,
         )?;
         // Scatter sampled token IDs into persistent input_ids for the next step.
         driver::memcpy_dtod_async(
-            self.input_ids,
-            self.shared_argmax as *const u8,
+            self.input_ids.ptr(),
+            self.shared_argmax.ptr() as *const u8,
             argmax_bytes,
             device.compute_stream,
         )?;
@@ -364,51 +375,51 @@ impl CudaGraphRunner {
 
         if !skip_input_ids_h2d {
             driver::memcpy_htod_async(
-                self.input_ids,
+                self.input_ids.ptr(),
                 input_ids.as_ptr() as *const u8,
                 batch_size * 4,
                 xfer,
             )?;
         }
         driver::memcpy_htod_async(
-            self.positions,
+            self.positions.ptr(),
             positions.as_ptr() as *const u8,
             batch_size * 4,
             xfer,
         )?;
         driver::memcpy_htod_async(
-            self.slot_mapping,
+            self.slot_mapping.ptr(),
             slot_mapping.as_ptr() as *const u8,
             batch_size * 8,
             xfer,
         )?;
         driver::memcpy_htod_async(
-            self.cu_seqlens_q,
+            self.cu_seqlens_q.ptr(),
             cu_seqlens_q.as_ptr() as *const u8,
             (batch_size + 1) * 4,
             xfer,
         )?;
         driver::memcpy_htod_async(
-            self.seqused_k,
+            self.seqused_k.ptr(),
             seqused_k.as_ptr() as *const u8,
             batch_size * 4,
             xfer,
         )?;
         driver::memcpy_htod_async(
-            self.block_table,
+            self.block_table.ptr(),
             block_table.as_ptr() as *const u8,
             batch_size * MAX_BLOCKS_PER_SEQ * 4,
             xfer,
         )?;
 
         // FP8: compute cu_seqlens_k from seqused_k (CPU prefix sum) and upload.
-        if let Some(cu_k_ptr) = self.fp8_cu_seqlens_k {
+        if let Some(ref cu_k) = self.fp8_cu_seqlens_k {
             let mut cu_seqlens_k_host = vec![0i32; batch_size + 1];
             for i in 0..batch_size {
                 cu_seqlens_k_host[i + 1] = cu_seqlens_k_host[i] + seqused_k[i];
             }
             driver::memcpy_htod_async(
-                cu_k_ptr,
+                cu_k.ptr(),
                 cu_seqlens_k_host.as_ptr() as *const u8,
                 (batch_size + 1) * 4,
                 xfer,
@@ -421,11 +432,11 @@ impl CudaGraphRunner {
         driver::graph_launch(graph.exec, device.compute_stream)?;
 
         let logits = GpuTensor::new(
-            self.shared_logits,
+            self.shared_logits.ptr(),
             &[batch_size, self.vocab_size],
             self.dtype,
         );
-        let token_ids = GpuTensor::new(self.shared_argmax, &[batch_size], DType::U32);
+        let token_ids = GpuTensor::new(self.shared_argmax.ptr(), &[batch_size], DType::U32);
 
         Ok(ReplayOutput { logits, token_ids })
     }
@@ -448,7 +459,7 @@ impl CudaGraphRunner {
 
         if let Some(ids) = input_ids {
             driver::memcpy_htod_async(
-                self.input_ids,
+                self.input_ids.ptr(),
                 ids.as_ptr() as *const u8,
                 batch_size * 4,
                 device.transfer_stream,
@@ -457,7 +468,7 @@ impl CudaGraphRunner {
 
         if let Some(bt) = new_block_table {
             driver::memcpy_htod_async(
-                self.block_table,
+                self.block_table.ptr(),
                 bt.as_ptr() as *const u8,
                 bt.len() * 4,
                 device.transfer_stream,
@@ -469,10 +480,10 @@ impl CudaGraphRunner {
         }
 
         kernels::update_decode_metadata_gpu(
-            self.positions,
-            self.slot_mapping,
-            self.seqused_k,
-            self.block_table as *const u8,
+            self.positions.ptr(),
+            self.slot_mapping.ptr(),
+            self.seqused_k.ptr(),
+            self.block_table.ptr() as *const u8,
             batch_size,
             block_size,
             MAX_BLOCKS_PER_SEQ,
@@ -480,10 +491,10 @@ impl CudaGraphRunner {
         );
 
         // FP8: compute cu_seqlens_k from seqused_k on GPU (prefix sum kernel).
-        if let Some(cu_k_ptr) = self.fp8_cu_seqlens_k {
+        if let Some(ref cu_k) = self.fp8_cu_seqlens_k {
             kernels::compute_cu_seqlens_k_gpu(
-                self.seqused_k as *const u8,
-                cu_k_ptr,
+                self.seqused_k.ptr() as *const u8,
+                cu_k.ptr(),
                 batch_size,
                 stream,
             );
@@ -492,58 +503,58 @@ impl CudaGraphRunner {
         driver::graph_launch(graph.exec, stream)?;
 
         let logits = GpuTensor::new(
-            self.shared_logits,
+            self.shared_logits.ptr(),
             &[batch_size, self.vocab_size],
             self.dtype,
         );
-        let token_ids = GpuTensor::new(self.shared_argmax, &[batch_size], DType::U32);
+        let token_ids = GpuTensor::new(self.shared_argmax.ptr(), &[batch_size], DType::U32);
 
         Ok(ReplayOutput { logits, token_ids })
     }
 
     unsafe fn fill_dummy_decode(&self, batch_size: usize, stream: CUstream) -> Result<()> {
-        driver::memset_d8(self.input_ids, 0, batch_size * 4, stream)?;
+        driver::memset_d8(self.input_ids.ptr(), 0, batch_size * 4, stream)?;
         let positions: Vec<u32> = (0..batch_size as u32).collect();
         driver::memcpy_htod_async(
-            self.positions,
+            self.positions.ptr(),
             positions.as_ptr() as *const u8,
             batch_size * 4,
             stream,
         )?;
         let slots: Vec<i64> = (0..batch_size as i64).collect();
         driver::memcpy_htod_async(
-            self.slot_mapping,
+            self.slot_mapping.ptr(),
             slots.as_ptr() as *const u8,
             batch_size * 8,
             stream,
         )?;
         let cu_q: Vec<i32> = (0..=batch_size as i32).collect();
         driver::memcpy_htod_async(
-            self.cu_seqlens_q,
+            self.cu_seqlens_q.ptr(),
             cu_q.as_ptr() as *const u8,
             (batch_size + 1) * 4,
             stream,
         )?;
         let seqused_k: Vec<i32> = vec![1; batch_size];
         driver::memcpy_htod_async(
-            self.seqused_k,
+            self.seqused_k.ptr(),
             seqused_k.as_ptr() as *const u8,
             batch_size * 4,
             stream,
         )?;
         driver::memset_d8(
-            self.block_table,
+            self.block_table.ptr(),
             0,
             batch_size * MAX_BLOCKS_PER_SEQ * 4,
             stream,
         )?;
 
         // Fill FP8 cu_seqlens_k with dummy prefix sums matching seqused_k=[1,1,...].
-        if let Some(cu_k_ptr) = self.fp8_cu_seqlens_k {
-            let cu_k: Vec<i32> = (0..=batch_size as i32).collect();
+        if let Some(ref cu_k) = self.fp8_cu_seqlens_k {
+            let cu_k_data: Vec<i32> = (0..=batch_size as i32).collect();
             driver::memcpy_htod_async(
-                cu_k_ptr,
-                cu_k.as_ptr() as *const u8,
+                cu_k.ptr(),
+                cu_k_data.as_ptr() as *const u8,
                 (batch_size + 1) * 4,
                 stream,
             )?;
@@ -571,23 +582,7 @@ impl Drop for CudaGraphRunner {
             for (_, g) in self.graphs.drain() {
                 let _ = driver::graph_exec_destroy(g.exec);
             }
-            let _ = driver::mem_free(self.input_ids);
-            let _ = driver::mem_free(self.positions);
-            let _ = driver::mem_free(self.slot_mapping);
-            let _ = driver::mem_free(self.cu_seqlens_q);
-            let _ = driver::mem_free(self.seqused_k);
-            let _ = driver::mem_free(self.block_table);
-            let _ = driver::mem_free(self.shared_logits);
-            let _ = driver::mem_free(self.shared_argmax);
-            if let Some(p) = self.fp8_k_buf {
-                let _ = driver::mem_free(p);
-            }
-            if let Some(p) = self.fp8_v_buf {
-                let _ = driver::mem_free(p);
-            }
-            if let Some(p) = self.fp8_cu_seqlens_k {
-                let _ = driver::mem_free(p);
-            }
+            // RawGpuMem fields are freed automatically via Drop.
         }
     }
 }
@@ -618,17 +613,17 @@ struct CapturedPrefillGraph {
 
 pub struct PrefillGraphRunner {
     graphs: HashMap<usize, CapturedPrefillGraph>,
-    input_ids: *mut u8,
-    positions: *mut u8,
-    slot_mapping: *mut u8,
-    cu_seqlens_q: *mut u8,
-    seqused_k: *mut u8,
-    block_table: *mut u8,
-    last_token_indices: *mut u8,
+    input_ids: RawGpuMem,
+    positions: RawGpuMem,
+    slot_mapping: RawGpuMem,
+    cu_seqlens_q: RawGpuMem,
+    seqused_k: RawGpuMem,
+    block_table: RawGpuMem,
+    last_token_indices: RawGpuMem,
     /// Shared output buffer for logits — `[1, vocab_size]` in model dtype (prefill = 1 output).
-    shared_logits: *mut u8,
+    shared_logits: RawGpuMem,
     /// Shared output buffer for argmax — `[1]` in U32.
-    shared_argmax: *mut u8,
+    shared_argmax: RawGpuMem,
     max_tokens: usize,
     dtype: DType,
     vocab_size: usize,
@@ -652,16 +647,21 @@ pub struct PrefillInputTensors {
 
 impl PrefillGraphRunner {
     pub unsafe fn new(max_tokens: usize, vocab_size: usize, dtype: DType) -> Result<Self> {
-        let input_ids = driver::mem_alloc(max_tokens * 4)?;
-        let positions = driver::mem_alloc(max_tokens * 4)?;
-        let slot_mapping = driver::mem_alloc(max_tokens * 8)?;
-        let cu_seqlens_q = driver::mem_alloc(2 * 4)?;
-        let seqused_k = driver::mem_alloc(4)?;
-        let block_table = driver::mem_alloc(MAX_BLOCKS_PER_SEQ * 4)?;
-        let last_token_indices = driver::mem_alloc(4)?;
+        let input_ids = RawGpuMem::new(driver::mem_alloc(max_tokens * 4)?, max_tokens * 4);
+        let positions = RawGpuMem::new(driver::mem_alloc(max_tokens * 4)?, max_tokens * 4);
+        let slot_mapping = RawGpuMem::new(driver::mem_alloc(max_tokens * 8)?, max_tokens * 8);
+        let cu_seqlens_q = RawGpuMem::new(driver::mem_alloc(2 * 4)?, 2 * 4);
+        let seqused_k = RawGpuMem::new(driver::mem_alloc(4)?, 4);
+        let block_table = RawGpuMem::new(
+            driver::mem_alloc(MAX_BLOCKS_PER_SEQ * 4)?,
+            MAX_BLOCKS_PER_SEQ * 4,
+        );
+        let last_token_indices = RawGpuMem::new(driver::mem_alloc(4)?, 4);
         // Prefill extracts 1 token's logits, so shared buffer is [1, vocab_size].
-        let shared_logits = driver::mem_alloc(vocab_size * dtype.size_bytes())?;
-        let shared_argmax = driver::mem_alloc(4)?;
+        let shared_logits_size = vocab_size * dtype.size_bytes();
+        let shared_logits =
+            RawGpuMem::new(driver::mem_alloc(shared_logits_size)?, shared_logits_size);
+        let shared_argmax = RawGpuMem::new(driver::mem_alloc(4)?, 4);
 
         Ok(Self {
             graphs: HashMap::new(),
@@ -691,13 +691,17 @@ impl PrefillGraphRunner {
     fn input_tensors(&self, num_tokens: usize) -> PrefillInputTensors {
         unsafe {
             PrefillInputTensors {
-                input_ids: GpuTensor::new(self.input_ids, &[num_tokens], DType::U32),
-                positions: GpuTensor::new(self.positions, &[num_tokens], DType::U32),
-                slot_mapping: GpuTensor::new(self.slot_mapping, &[num_tokens], DType::I64),
-                cu_seqlens_q: GpuTensor::new(self.cu_seqlens_q, &[2], DType::I32),
-                seqused_k: GpuTensor::new(self.seqused_k, &[1], DType::I32),
-                block_table: GpuTensor::new(self.block_table, &[1, MAX_BLOCKS_PER_SEQ], DType::I32),
-                last_token_indices: GpuTensor::new(self.last_token_indices, &[1], DType::U32),
+                input_ids: GpuTensor::new(self.input_ids.ptr(), &[num_tokens], DType::U32),
+                positions: GpuTensor::new(self.positions.ptr(), &[num_tokens], DType::U32),
+                slot_mapping: GpuTensor::new(self.slot_mapping.ptr(), &[num_tokens], DType::I64),
+                cu_seqlens_q: GpuTensor::new(self.cu_seqlens_q.ptr(), &[2], DType::I32),
+                seqused_k: GpuTensor::new(self.seqused_k.ptr(), &[1], DType::I32),
+                block_table: GpuTensor::new(
+                    self.block_table.ptr(),
+                    &[1, MAX_BLOCKS_PER_SEQ],
+                    DType::I32,
+                ),
+                last_token_indices: GpuTensor::new(self.last_token_indices.ptr(), &[1], DType::U32),
             }
         }
     }
@@ -740,13 +744,13 @@ impl PrefillGraphRunner {
         );
         // Copy into shared buffers (recorded in graph).
         driver::memcpy_dtod_async(
-            self.shared_logits,
+            self.shared_logits.ptr(),
             logits.as_gpu_tensor().raw_ptr() as *const u8,
             logits_bytes,
             device.compute_stream,
         )?;
         driver::memcpy_dtod_async(
-            self.shared_argmax,
+            self.shared_argmax.ptr(),
             argmax_out.as_gpu_tensor().raw_ptr() as *const u8,
             argmax_bytes,
             device.compute_stream,
@@ -790,20 +794,20 @@ impl PrefillGraphRunner {
         let num_real = input_ids.len();
 
         if num_real < padded_tokens {
-            driver::memset_d8(self.input_ids, 0, padded_tokens * 4, xfer)?;
+            driver::memset_d8(self.input_ids.ptr(), 0, padded_tokens * 4, xfer)?;
         }
         driver::memcpy_htod_async(
-            self.input_ids,
+            self.input_ids.ptr(),
             input_ids.as_ptr() as *const u8,
             num_real * 4,
             xfer,
         )?;
 
         if num_real < padded_tokens {
-            driver::memset_d8(self.positions, 0, padded_tokens * 4, xfer)?;
+            driver::memset_d8(self.positions.ptr(), 0, padded_tokens * 4, xfer)?;
         }
         driver::memcpy_htod_async(
-            self.positions,
+            self.positions.ptr(),
             positions.as_ptr() as *const u8,
             num_real * 4,
             xfer,
@@ -812,7 +816,7 @@ impl PrefillGraphRunner {
         let mut padded_slots = vec![-1i64; padded_tokens];
         padded_slots[..num_real].copy_from_slice(slot_mapping);
         driver::memcpy_htod_async(
-            self.slot_mapping,
+            self.slot_mapping.ptr(),
             padded_slots.as_ptr() as *const u8,
             padded_tokens * 8,
             xfer,
@@ -820,18 +824,23 @@ impl PrefillGraphRunner {
 
         let cu_q: [i32; 2] = [0, padded_tokens as i32];
         let seqused_k_val: [i32; 1] = [seq_len as i32];
-        driver::memcpy_htod_async(self.cu_seqlens_q, cu_q.as_ptr() as *const u8, 8, xfer)?;
-        driver::memcpy_htod_async(self.seqused_k, seqused_k_val.as_ptr() as *const u8, 4, xfer)?;
+        driver::memcpy_htod_async(self.cu_seqlens_q.ptr(), cu_q.as_ptr() as *const u8, 8, xfer)?;
+        driver::memcpy_htod_async(
+            self.seqused_k.ptr(),
+            seqused_k_val.as_ptr() as *const u8,
+            4,
+            xfer,
+        )?;
 
         driver::memcpy_htod_async(
-            self.block_table,
+            self.block_table.ptr(),
             block_table.as_ptr() as *const u8,
             block_table.len().min(MAX_BLOCKS_PER_SEQ) * 4,
             xfer,
         )?;
 
         driver::memcpy_htod_async(
-            self.last_token_indices,
+            self.last_token_indices.ptr(),
             &last_token_idx as *const u32 as *const u8,
             4,
             xfer,
@@ -840,36 +849,46 @@ impl PrefillGraphRunner {
         device.sync_transfer_to_compute()?;
         driver::graph_launch(graph.exec, device.compute_stream)?;
 
-        let logits = GpuTensor::new(self.shared_logits, &[1, self.vocab_size], self.dtype);
-        let token_ids = GpuTensor::new(self.shared_argmax, &[1], DType::U32);
+        let logits = GpuTensor::new(self.shared_logits.ptr(), &[1, self.vocab_size], self.dtype);
+        let token_ids = GpuTensor::new(self.shared_argmax.ptr(), &[1], DType::U32);
 
         Ok(PrefillReplayOutput { logits, token_ids })
     }
 
     unsafe fn fill_dummy_prefill(&self, num_tokens: usize, stream: CUstream) -> Result<()> {
-        driver::memset_d8(self.input_ids, 0, num_tokens * 4, stream)?;
+        driver::memset_d8(self.input_ids.ptr(), 0, num_tokens * 4, stream)?;
         let positions: Vec<u32> = (0..num_tokens as u32).collect();
         driver::memcpy_htod_async(
-            self.positions,
+            self.positions.ptr(),
             positions.as_ptr() as *const u8,
             num_tokens * 4,
             stream,
         )?;
         let slots: Vec<i64> = (0..num_tokens as i64).collect();
         driver::memcpy_htod_async(
-            self.slot_mapping,
+            self.slot_mapping.ptr(),
             slots.as_ptr() as *const u8,
             num_tokens * 8,
             stream,
         )?;
         let cu_q: [i32; 2] = [0, num_tokens as i32];
         let seqused_k: [i32; 1] = [num_tokens as i32];
-        driver::memcpy_htod_async(self.cu_seqlens_q, cu_q.as_ptr() as *const u8, 8, stream)?;
-        driver::memcpy_htod_async(self.seqused_k, seqused_k.as_ptr() as *const u8, 4, stream)?;
-        driver::memset_d8(self.block_table, 0, MAX_BLOCKS_PER_SEQ * 4, stream)?;
+        driver::memcpy_htod_async(
+            self.cu_seqlens_q.ptr(),
+            cu_q.as_ptr() as *const u8,
+            8,
+            stream,
+        )?;
+        driver::memcpy_htod_async(
+            self.seqused_k.ptr(),
+            seqused_k.as_ptr() as *const u8,
+            4,
+            stream,
+        )?;
+        driver::memset_d8(self.block_table.ptr(), 0, MAX_BLOCKS_PER_SEQ * 4, stream)?;
         let last_idx = (num_tokens - 1) as u32;
         driver::memcpy_htod_async(
-            self.last_token_indices,
+            self.last_token_indices.ptr(),
             &last_idx as *const u32 as *const u8,
             4,
             stream,
@@ -895,15 +914,7 @@ impl Drop for PrefillGraphRunner {
             for (_, g) in self.graphs.drain() {
                 let _ = driver::graph_exec_destroy(g.exec);
             }
-            let _ = driver::mem_free(self.input_ids);
-            let _ = driver::mem_free(self.positions);
-            let _ = driver::mem_free(self.slot_mapping);
-            let _ = driver::mem_free(self.cu_seqlens_q);
-            let _ = driver::mem_free(self.seqused_k);
-            let _ = driver::mem_free(self.block_table);
-            let _ = driver::mem_free(self.last_token_indices);
-            let _ = driver::mem_free(self.shared_logits);
-            let _ = driver::mem_free(self.shared_argmax);
+            // RawGpuMem fields are freed automatically via Drop.
         }
     }
 }

@@ -33,7 +33,13 @@ impl CpuGpuBuf {
     pub unsafe fn new(capacity_elements: usize, dtype: DType) -> Result<Self> {
         let bytes = capacity_elements * dtype.size_bytes();
         let cpu = driver::mem_alloc_host(bytes)?;
-        let gpu = driver::mem_alloc(bytes)?;
+        let gpu = match driver::mem_alloc(bytes) {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = driver::mem_free_host(cpu);
+                return Err(e);
+            }
+        };
         Ok(Self {
             cpu,
             gpu,

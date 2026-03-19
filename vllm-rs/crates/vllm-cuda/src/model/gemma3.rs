@@ -104,6 +104,7 @@ impl Gemma3Attention {
         let kv_bytes = kv_size * hidden * elem_size;
         let total_bytes = q_bytes + 2 * kv_bytes;
         let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+        weights.record_alloc(ptr, total_bytes);
         unsafe {
             weights.take_into(&q_name, ptr, device.compute_stream)?;
             weights.take_into(&k_name, ptr.add(q_bytes), device.compute_stream)?;
@@ -119,6 +120,7 @@ impl Gemma3Attention {
             if weights.contains(&q_bias_name) {
                 let bias_bytes = (q_size + 2 * kv_size) * elem_size;
                 let bias_ptr = unsafe { crate::driver::mem_alloc(bias_bytes)? };
+                weights.record_alloc(bias_ptr, bias_bytes);
                 let q_bias_bytes = q_size * elem_size;
                 let kv_bias_bytes = kv_size * elem_size;
                 unsafe {
@@ -542,6 +544,10 @@ impl Gemma3Model {
                 device,
             )?
         };
+        weights.record_alloc(
+            rotary_global.cos_sin_cache.raw_ptr(),
+            rotary_global.cos_sin_cache.size_bytes(),
+        );
         let rotary_local = unsafe {
             RotaryCache::new(
                 config.head_dim,
@@ -552,6 +558,10 @@ impl Gemma3Model {
                 device,
             )?
         };
+        weights.record_alloc(
+            rotary_local.cos_sin_cache.raw_ptr(),
+            rotary_local.cos_sin_cache.size_bytes(),
+        );
 
         Ok(Self {
             embed_tokens,
@@ -744,6 +754,7 @@ impl Gemma3Attention {
         let kv_bytes = kv_size * hidden * elem_size;
         let total_bytes = q_bytes + 2 * kv_bytes;
         let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+        weights.record_alloc(ptr, total_bytes);
         unsafe {
             weights.take_shard_into(
                 &q_name,
@@ -780,6 +791,7 @@ impl Gemma3Attention {
             if weights.contains(&q_bias_name) {
                 let bias_bytes = (q_size + 2 * kv_size) * elem_size;
                 let bias_ptr = unsafe { crate::driver::mem_alloc(bias_bytes)? };
+                weights.record_alloc(bias_ptr, bias_bytes);
                 let q_bias_bytes = q_size * elem_size;
                 let kv_bias_bytes = kv_size * elem_size;
                 unsafe {
@@ -983,6 +995,10 @@ impl Gemma3Model {
                 device,
             )?
         };
+        weights.record_alloc(
+            rotary_global.cos_sin_cache.raw_ptr(),
+            rotary_global.cos_sin_cache.size_bytes(),
+        );
         let rotary_local = unsafe {
             RotaryCache::new(
                 config.head_dim,
@@ -993,6 +1009,10 @@ impl Gemma3Model {
                 device,
             )?
         };
+        weights.record_alloc(
+            rotary_local.cos_sin_cache.raw_ptr(),
+            rotary_local.cos_sin_cache.size_bytes(),
+        );
 
         Ok(Self {
             embed_tokens,
@@ -1053,6 +1073,7 @@ impl Gemma3Model {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 crate::tensor::GpuTensor::new(ptr, &[1, 1], dtype)
             };
             Embedding::new(w)
@@ -1079,6 +1100,7 @@ impl Gemma3Model {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 crate::tensor::GpuTensor::new(ptr, &[1], dtype)
             };
             GemmaRmsNorm {
@@ -1096,6 +1118,10 @@ impl Gemma3Model {
                 device,
             )?
         };
+        weights.record_alloc(
+            rotary_global.cos_sin_cache.raw_ptr(),
+            rotary_global.cos_sin_cache.size_bytes(),
+        );
         let rotary_local = unsafe {
             RotaryCache::new(
                 config.head_dim,
@@ -1106,6 +1132,10 @@ impl Gemma3Model {
                 device,
             )?
         };
+        weights.record_alloc(
+            rotary_local.cos_sin_cache.raw_ptr(),
+            rotary_local.cos_sin_cache.size_bytes(),
+        );
 
         Ok(Self {
             embed_tokens,
@@ -1132,6 +1162,7 @@ impl Gemma3Model {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 crate::tensor::GpuTensor::new(ptr, &[1, 1], dtype)
             };
             Embedding::new(w)
@@ -1159,6 +1190,7 @@ impl Gemma3Model {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 crate::tensor::GpuTensor::new(ptr, &[1], dtype)
             };
             GemmaRmsNorm {
@@ -1176,6 +1208,10 @@ impl Gemma3Model {
                 device,
             )?
         };
+        weights.record_alloc(
+            rotary_global.cos_sin_cache.raw_ptr(),
+            rotary_global.cos_sin_cache.size_bytes(),
+        );
         let rotary_local = unsafe {
             RotaryCache::new(
                 config.head_dim,
@@ -1186,6 +1222,10 @@ impl Gemma3Model {
                 device,
             )?
         };
+        weights.record_alloc(
+            rotary_local.cos_sin_cache.raw_ptr(),
+            rotary_local.cos_sin_cache.size_bytes(),
+        );
 
         Ok(Self {
             embed_tokens,
@@ -1307,6 +1347,7 @@ impl Gemma3ForCausalLM {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 crate::tensor::GpuTensor::new(ptr, &[1, 1], dtype)
             };
             Linear::new(w, None)
@@ -1340,6 +1381,7 @@ impl Gemma3ForCausalLM {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 crate::tensor::GpuTensor::new(ptr, &[1, 1], dtype)
             };
             Linear::new(w, None)

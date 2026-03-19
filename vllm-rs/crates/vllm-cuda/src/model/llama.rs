@@ -1240,6 +1240,7 @@ impl LlamaAttention {
 
             // Pre-allocate fused QKV tensor on GPU.
             let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+            weights.record_alloc(ptr, total_bytes);
 
             // Stream each component directly from CPU → GPU offset.
             unsafe {
@@ -1271,6 +1272,7 @@ impl LlamaAttention {
                 let total_elems = total_bias_bytes / q_b_dtype.size_bytes();
 
                 let bias_ptr = unsafe { crate::driver::mem_alloc(total_bias_bytes)? };
+                weights.record_alloc(bias_ptr, total_bias_bytes);
                 unsafe {
                     weights.take_into(&q_bias_name, bias_ptr, stream)?;
                     weights.take_into(&k_bias_name, bias_ptr.add(q_b_bytes), stream)?;
@@ -1397,6 +1399,7 @@ impl LlamaMLP {
 
             let total_bytes = gate_bytes + up_bytes;
             let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+            weights.record_alloc(ptr, total_bytes);
 
             unsafe {
                 weights.take_into(&gate_name, ptr, stream)?;
@@ -1927,6 +1930,11 @@ impl LlamaModel {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         Ok(Self {
             embed_tokens,
@@ -1996,6 +2004,11 @@ impl LlamaForCausalLM {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         let model = LlamaModel {
             embed_tokens,
@@ -2058,6 +2071,11 @@ impl LlamaForCausalLM {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         let model = LlamaModel {
             embed_tokens,
@@ -2120,6 +2138,11 @@ impl LlamaForCausalLM {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         let model = LlamaModel {
             embed_tokens,
@@ -2211,6 +2234,7 @@ impl LlamaAttention {
             let kv_bytes = kv_size * hidden * elem_size;
             let total_bytes = q_bytes + 2 * kv_bytes;
             let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+            weights.record_alloc(ptr, total_bytes);
 
             // Shard each component along dim=0 and stream into fused buffer.
             unsafe {
@@ -2250,6 +2274,7 @@ impl LlamaAttention {
                 let total_elems = total_bias_bytes / q_b_dtype.size_bytes();
 
                 let bias_ptr = unsafe { crate::driver::mem_alloc(total_bias_bytes)? };
+                weights.record_alloc(bias_ptr, total_bias_bytes);
                 unsafe {
                     weights.take_shard_into(
                         &q_bias_name,
@@ -2351,6 +2376,7 @@ impl LlamaMLP {
             let shard_bytes = shard_intermediate * hidden * elem_size;
             let total_bytes = 2 * shard_bytes;
             let ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+            weights.record_alloc(ptr, total_bytes);
 
             unsafe {
                 weights.take_shard_into(&gate_name, 0, tp.rank, tp.world_size, ptr, stream)?;
@@ -2470,6 +2496,11 @@ impl LlamaModel {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         Ok(Self {
             embed_tokens,
@@ -2746,6 +2777,11 @@ impl LlamaForCausalLM {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         let model = LlamaModel {
             embed_tokens,
@@ -3014,6 +3050,7 @@ impl LlamaModel {
             // intermediate hidden states instead of input_ids.
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 GpuTensor::new(ptr, &[1, 1], dtype)
             };
             Embedding::new(w)
@@ -3041,6 +3078,7 @@ impl LlamaModel {
             // Dummy norm — never used on non-last stages.
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 GpuTensor::new(ptr, &[1], dtype)
             };
             RmsNorm::new(w, config.rms_norm_eps)
@@ -3056,6 +3094,11 @@ impl LlamaModel {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         Ok(Self {
             embed_tokens,
@@ -3080,6 +3123,7 @@ impl LlamaModel {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 GpuTensor::new(ptr, &[1, 1], dtype)
             };
             Embedding::new(w)
@@ -3104,6 +3148,7 @@ impl LlamaModel {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 GpuTensor::new(ptr, &[1], dtype)
             };
             RmsNorm::new(w, config.rms_norm_eps)
@@ -3119,6 +3164,11 @@ impl LlamaModel {
                 device,
             )?
         };
+        // Track rotary cache GPU allocation for sleep/wake.
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
 
         Ok(Self {
             embed_tokens,
@@ -3245,6 +3295,7 @@ impl LlamaForCausalLM {
             // Dummy lm_head — never used on non-last stages.
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 GpuTensor::new(ptr, &[1, 1], dtype)
             };
             LinearLayer::Dense(Linear::new(w, None))
@@ -3281,6 +3332,7 @@ impl LlamaForCausalLM {
         } else {
             let w = unsafe {
                 let ptr = crate::driver::mem_alloc(dtype.size_bytes())?;
+                weights.record_alloc(ptr, dtype.size_bytes());
                 GpuTensor::new(ptr, &[1, 1], dtype)
             };
             LinearLayer::Dense(Linear::new(w, None))

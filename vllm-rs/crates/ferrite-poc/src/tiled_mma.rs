@@ -341,7 +341,7 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
                 v2f16_ty.get_undef(), v0, ci(0), "bvec0",
             ).unwrap();
             let vec = builder.build_insert_element(vec, v1, ci(1), "bvec1").unwrap();
-            let packed = builder.build_bitcast(vec, i32_ty, "bpk").unwrap().into_int_value();
+            let packed = builder.build_bit_cast(vec, i32_ty, "bpk").unwrap().into_int_value();
             b_frags.push(packed);
         }
     }

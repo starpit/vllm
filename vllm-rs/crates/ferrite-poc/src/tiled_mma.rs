@@ -29,14 +29,16 @@ use cudarc::driver::result as cuda;
 
 use crate::{create_nvptx_target_machine, add_nvvm_kernel_metadata, call_sreg, call_barrier0};
 
-const BM: u32 = 64;
+const BM: u32 = 128;
 const BN: u32 = 64;
 const BK: u32 = 16;
-const WM: u32 = 32;
-const WN: u32 = 32;
+const WM: u32 = 64;  // 4 × MMA_M
+const WN: u32 = 32;  // 4 × MMA_N
 const MMA_M: u32 = 16;
 const MMA_N: u32 = 8;
-const WARPS: u32 = 4;
+const REG_M: u32 = WM / MMA_M; // 4
+const REG_N: u32 = WN / MMA_N; // 4
+const WARPS: u32 = 4; // 2×2 warp layout
 const THREADS: u32 = WARPS * 32;
 
 pub fn step3b_multiwarp_gemm(sm: &str) -> Result<()> {
@@ -247,10 +249,20 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let tid_x8 = builder.build_int_mul(tid, ci(8), "tx8").unwrap();
     let v2f16_ty = f16_ty.vec_type(2);
 
-    // ── Precompute tile-loading index offsets (invariant across K-loop) ──
-    let a_tile_row = builder.build_int_unsigned_div(tid_x8, ci(BK as u64), "atr").unwrap();
-    let a_tile_col = builder.build_int_unsigned_rem(tid_x8, ci(BK as u64), "atc").unwrap();
-    let a_glob_row = builder.build_int_add(block_row, a_tile_row, "agr").unwrap();
+    // ── Precompute tile-loading index offsets ──
+    // A: BM×BK = 128×16 = 2048 f16, 128 threads → 16 per thread → 2 cp.async(8)
+    // B: BK×BN = 16×64 = 1024 f16, 128 threads → 8 per thread → 1 cp.async(8)
+    // A load: thread tid loads elements [tid*16..tid*16+15] of A tile
+    let tid_x16 = builder.build_int_mul(tid, ci(16), "tx16").unwrap();
+    let a_tile_row0 = builder.build_int_unsigned_div(tid_x16, ci(BK as u64), "atr0").unwrap();
+    let a_tile_col0 = builder.build_int_unsigned_rem(tid_x16, ci(BK as u64), "atc0").unwrap();
+    let a_glob_row0 = builder.build_int_add(block_row, a_tile_row0, "agr0").unwrap();
+    // Second chunk: tid*16 + 8
+    let tid_x16_p8 = builder.build_int_add(tid_x16, ci(8), "tx16p8").unwrap();
+    let a_tile_row1 = builder.build_int_unsigned_div(tid_x16_p8, ci(BK as u64), "atr1").unwrap();
+    let a_tile_col1 = builder.build_int_unsigned_rem(tid_x16_p8, ci(BK as u64), "atc1").unwrap();
+    let a_glob_row1 = builder.build_int_add(block_row, a_tile_row1, "agr1").unwrap();
+    // B load: thread tid loads elements [tid*8..tid*8+7] of B tile
     let b_tile_row = builder.build_int_unsigned_div(tid_x8, ci(BN as u64), "btr").unwrap();
     let b_tile_col = builder.build_int_unsigned_rem(tid_x8, ci(BN as u64), "btc").unwrap();
     let b_glob_col = builder.build_int_add(block_col, b_tile_col, "bgc").unwrap();
@@ -262,14 +274,23 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     // ── Prologue: issue cp.async for first tile into buffer 0 ──
     {
         let t0 = ci(0);
-        let a_col = builder.build_int_add(t0, a_tile_col, "").unwrap();
-        let a_idx = builder.build_int_add(
-            builder.build_int_mul(a_glob_row, k_p, "").unwrap(), a_col, "",
+        // A chunk 0
+        let a_col0 = builder.build_int_add(t0, a_tile_col0, "").unwrap();
+        let a_idx0 = builder.build_int_add(
+            builder.build_int_mul(a_glob_row0, k_p, "").unwrap(), a_col0, "",
         ).unwrap();
-        let a_gep = unsafe { builder.build_gep(f16_ty, a_ptr, &[a_idx], "").unwrap() };
-        let sa_gep = unsafe { builder.build_gep(f16_ty, smem_a0, &[tid_x8], "").unwrap() };
-        build_cp_async_16(&builder, &context, &module, sa_gep, a_gep);
-
+        let a_gep0 = unsafe { builder.build_gep(f16_ty, a_ptr, &[a_idx0], "").unwrap() };
+        let sa_gep0 = unsafe { builder.build_gep(f16_ty, smem_a0, &[tid_x16], "").unwrap() };
+        build_cp_async_16(&builder, &context, &module, sa_gep0, a_gep0);
+        // A chunk 1
+        let a_col1 = builder.build_int_add(t0, a_tile_col1, "").unwrap();
+        let a_idx1 = builder.build_int_add(
+            builder.build_int_mul(a_glob_row1, k_p, "").unwrap(), a_col1, "",
+        ).unwrap();
+        let a_gep1 = unsafe { builder.build_gep(f16_ty, a_ptr, &[a_idx1], "").unwrap() };
+        let sa_gep1 = unsafe { builder.build_gep(f16_ty, smem_a0, &[tid_x16_p8], "").unwrap() };
+        build_cp_async_16(&builder, &context, &module, sa_gep1, a_gep1);
+        // B
         let b_row = builder.build_int_add(t0, b_tile_row, "").unwrap();
         let b_idx = builder.build_int_add(
             builder.build_int_mul(b_row, n_p, "").unwrap(), b_glob_col, "",
@@ -289,8 +310,9 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let t_phi = builder.build_phi(i32_ty, "t").unwrap();
     // Phi for which buffer to COMPUTE from (0 or 1)
     let buf_phi = builder.build_phi(i32_ty, "buf").unwrap();
+    let num_acc = (REG_M * REG_N * 4) as usize; // 4×4×4 = 64
     let mut acc_phis = Vec::new();
-    for i in 0..32 {
+    for i in 0..num_acc {
         acc_phis.push(builder.build_phi(f32_ty, &format!("acc{i}")).unwrap());
     }
     let t = t_phi.as_basic_value().into_int_value();
@@ -319,14 +341,23 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
 
     builder.position_at_end(load_bb);
     {
-        let a_col = builder.build_int_add(t_next, a_tile_col, "").unwrap();
-        let a_idx = builder.build_int_add(
-            builder.build_int_mul(a_glob_row, k_p, "").unwrap(), a_col, "",
+        // A chunk 0
+        let a_col0 = builder.build_int_add(t_next, a_tile_col0, "").unwrap();
+        let a_idx0 = builder.build_int_add(
+            builder.build_int_mul(a_glob_row0, k_p, "").unwrap(), a_col0, "",
         ).unwrap();
-        let a_gep = unsafe { builder.build_gep(f16_ty, a_ptr, &[a_idx], "").unwrap() };
-        let sa_gep = unsafe { builder.build_gep(f16_ty, load_a, &[tid_x8], "").unwrap() };
-        build_cp_async_16(&builder, &context, &module, sa_gep, a_gep);
-
+        let a_gep0 = unsafe { builder.build_gep(f16_ty, a_ptr, &[a_idx0], "").unwrap() };
+        let sa_gep0 = unsafe { builder.build_gep(f16_ty, load_a, &[tid_x16], "").unwrap() };
+        build_cp_async_16(&builder, &context, &module, sa_gep0, a_gep0);
+        // A chunk 1
+        let a_col1 = builder.build_int_add(t_next, a_tile_col1, "").unwrap();
+        let a_idx1 = builder.build_int_add(
+            builder.build_int_mul(a_glob_row1, k_p, "").unwrap(), a_col1, "",
+        ).unwrap();
+        let a_gep1 = unsafe { builder.build_gep(f16_ty, a_ptr, &[a_idx1], "").unwrap() };
+        let sa_gep1 = unsafe { builder.build_gep(f16_ty, load_a, &[tid_x16_p8], "").unwrap() };
+        build_cp_async_16(&builder, &context, &module, sa_gep1, a_gep1);
+        // B
         let b_row = builder.build_int_add(t_next, b_tile_row, "").unwrap();
         let b_idx = builder.build_int_add(
             builder.build_int_mul(b_row, n_p, "").unwrap(), b_glob_col, "",
@@ -344,7 +375,7 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
 
     // Load A fragments from comp_a
     let mut a_frags: Vec<IntValue> = Vec::new();
-    for rm in 0..2u64 {
+    for rm in 0..REG_M as u64 {
         let rm_off = builder.build_int_add(wy_off, ci(rm * MMA_M as u64), "rmo").unwrap();
         for (row_add, col_add) in [(0u64, 0u64), (8, 0), (0, 8), (8, 8)] {
             let frow = builder.build_int_add(
@@ -363,7 +394,7 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
 
     // Load B fragments from comp_b
     let mut b_frags: Vec<IntValue> = Vec::new();
-    for rn in 0..4u64 {
+    for rn in 0..REG_N as u64 {
         let b_col = builder.build_int_add(
             builder.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap(),
             group, "bcol",
@@ -390,11 +421,11 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
         }
     }
 
-    // 2×4 MMA operations
+    // REG_M × REG_N MMA operations
     let mut new_accs: Vec<FloatValue> = Vec::new();
-    for rm in 0..2u32 {
-        for rn in 0..4u32 {
-            let acc_base = (rm * 4 * 4 + rn * 4) as usize;
+    for rm in 0..REG_M {
+        for rn in 0..REG_N {
+            let acc_base = (rm * REG_N * 4 + rn * 4) as usize;
             let a_base = (rm * 4) as usize;
             let b_base = (rn * 2) as usize;
 
@@ -423,7 +454,7 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     // Wire phi nodes
     t_phi.add_incoming(&[(&ci(0), entry), (&t_next, compute_bb)]);
     buf_phi.add_incoming(&[(&ci(0), entry), (&buf_next, compute_bb)]);
-    for i in 0..32 {
+    for i in 0..num_acc {
         acc_phis[i].add_incoming(&[(&f0, entry), (&new_accs[i], compute_bb)]);
     }
 
@@ -433,9 +464,9 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let wy_off_exit = builder.build_int_mul(wy, ci(WM as u64), "wyo2").unwrap();
     let wx_off_exit = builder.build_int_mul(wx, ci(WN as u64), "wxo2").unwrap();
 
-    for rm in 0..2u32 {
-        for rn in 0..4u32 {
-            let acc_base = (rm * 4 * 4 + rn * 4) as usize;
+    for rm in 0..REG_M {
+        for rn in 0..REG_N {
+            let acc_base = (rm * REG_N * 4 + rn * 4) as usize;
             for d in 0..4u32 {
                 let mma_row_off = if d < 2 { group } else {
                     builder.build_int_add(group, ci(8), "").unwrap()

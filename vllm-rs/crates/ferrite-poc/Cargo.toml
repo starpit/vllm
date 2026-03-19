@@ -14,7 +14,7 @@ path = "src/main.rs"
 # On Ubuntu: `apt install llvm-21-dev` then use llvm21-1.
 # On macOS: `brew install llvm@21` then use llvm21-1.
 # Set LLVM_SYS_211_PREFIX=/path/to/llvm if not auto-detected.
-inkwell = { version = "0.8", features = ["llvm20-1", "target-nvptx"] }
+inkwell = { version = "0.8", features = ["llvm20-1", "llvm20-1-force-dynamic", "target-nvptx"] }
 
 # CUDA driver API — we use nvrtc feature for Ptx type, but load raw PTX via driver API
 cudarc = { workspace = true, features = ["nvrtc", "dynamic-linking", "cuda-version-from-build-system"] }

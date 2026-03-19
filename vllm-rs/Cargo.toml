@@ -20,7 +20,6 @@ members = [
     "crates/vllm-parity",
     "crates/vllm-gce",
     "crates/ferrite-poc",
-    "crates/ferrite-rc",
 ]
 exclude = []
 

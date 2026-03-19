@@ -1,0 +1,19 @@
+[package]
+name = "ferrite"
+version = "0.1.0"
+edition = "2024"
+description = "Ferrite: Rust-native megakernel compiler for LLM inference"
+
+[[bin]]
+name = "ferrite"
+path = "src/main.rs"
+
+[dependencies]
+cudarc = { version = "0.19", default-features = false, features = [
+    "std", "driver", "f16", "nvrtc", "dynamic-linking", "cuda-version-from-build-system"
+] }
+half = "2.7"
+anyhow = "1"
+
+[build-dependencies]
+cuda_builder = { git = "https://github.com/Rust-GPU/Rust-CUDA", package = "cuda_builder", features = ["rustc_codegen_nvvm"] }

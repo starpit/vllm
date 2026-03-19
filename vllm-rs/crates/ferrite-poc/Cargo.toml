@@ -21,3 +21,5 @@ cudarc = { workspace = true, features = ["nvrtc", "dynamic-linking", "cuda-versi
 
 half = { workspace = true }
 anyhow = { workspace = true }
+llvm-sys = { version = "201", features = ["force-dynamic"] }
+either = "1"

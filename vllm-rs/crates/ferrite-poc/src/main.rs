@@ -128,7 +128,7 @@ fn step1_vector_add(sm: &str) -> Result<()> {
             )?;
         }
     }
-    cuda::stream::synchronize(stream)?;
+    unsafe { cuda::stream::synchronize(stream)?; }
 
     // Benchmark
     let iters = 100;
@@ -145,7 +145,7 @@ fn step1_vector_add(sm: &str) -> Result<()> {
             )?;
         }
     }
-    cuda::stream::synchronize(stream)?;
+    unsafe { cuda::stream::synchronize(stream)?; }
     let elapsed = start.elapsed();
     let us_per_launch = elapsed.as_micros() as f64 / iters as f64;
 
@@ -175,8 +175,8 @@ fn step1_vector_add(sm: &str) -> Result<()> {
     );
 
     // Cleanup
-    cuda::stream::destroy(stream)?;
     unsafe {
+        cuda::stream::destroy(stream)?;
         cuda::free_sync(d_a)?;
         cuda::free_sync(d_b)?;
         cuda::free_sync(d_c)?;
@@ -313,28 +313,57 @@ fn call_sreg<'ctx>(
         .get_function(intrinsic)
         .unwrap_or_else(|| module.add_function(intrinsic, fn_type, None));
     let call = builder.build_call(func, &[], name).unwrap();
-    match call.try_as_basic_value() {
-        Either::Left(val) => val.into_int_value(),
-        Either::Right(_) => panic!("NVPTX sreg intrinsic {} returned void", intrinsic),
+    // try_as_basic_value returns Either<BasicValueEnum, InstructionValue> or similar.
+    // We need the left (value) side.
+    let val = call.try_as_basic_value();
+    match val {
+        either::Either::Left(v) => v.into_int_value(),
+        _ => panic!("NVPTX sreg intrinsic {} returned void", intrinsic),
     }
 }
 
 /// NVVM metadata: !nvvm.annotations = !{!0}
 ///                !0 = !{ptr @func, !"kernel", i32 1}
+///
+/// Uses raw LLVM C API because inkwell's named metadata API varies by version.
 fn add_nvvm_kernel_metadata<'ctx>(module: &Module<'ctx>, function: &FunctionValue<'ctx>) {
-    let context = module.get_context();
-    let i32_type = context.i32_type();
+    use llvm_sys;
+    use std::ffi::CStr;
 
-    let fn_val = function.as_global_value().as_pointer_value().into();
-    let kernel_str = context.metadata_string("kernel");
-    let one = i32_type.const_int(1, false);
+    unsafe {
+        // Get raw LLVM pointers from inkwell types
+        let mod_ref: llvm_sys::prelude::LLVMModuleRef = module.as_mut_ptr();
+        let ctx_ref = llvm_sys::core::LLVMGetModuleContext(mod_ref);
 
-    let node = context.metadata_node(&[fn_val, kernel_str.into(), one.into()]);
+        // Build metadata: !{ptr @function, !"kernel", i32 1}
+        let fn_val: llvm_sys::prelude::LLVMValueRef = function.as_value_ref();
+        let fn_md = llvm_sys::core::LLVMValueAsMetadata(fn_val);
 
-    // Use get_or_insert_named_metadata + add_node pattern
-    let named_md = module.get_or_insert_named_metadata("nvvm.annotations");
-    named_md.add_node(node);
+        let kernel_cstr = CStr::from_bytes_with_nul(b"kernel\0").unwrap();
+        let kernel_md = llvm_sys::core::LLVMMDStringInContext2(
+            ctx_ref,
+            kernel_cstr.as_ptr(),
+            6, // length of "kernel"
+        );
+
+        let i32_ty = llvm_sys::core::LLVMInt32TypeInContext(ctx_ref);
+        let one_val = llvm_sys::core::LLVMConstInt(i32_ty, 1, 0);
+        let one_md = llvm_sys::core::LLVMValueAsMetadata(one_val);
+
+        let mut ops = [fn_md, kernel_md, one_md];
+        let node = llvm_sys::core::LLVMMDNodeInContext2(ctx_ref, ops.as_mut_ptr(), 3);
+
+        let annot_name = CStr::from_bytes_with_nul(b"nvvm.annotations\0").unwrap();
+        let named_md = llvm_sys::core::LLVMGetOrInsertNamedMetadata(
+            mod_ref,
+            annot_name.as_ptr(),
+            16, // length of "nvvm.annotations"
+        );
+        llvm_sys::core::LLVMAddNamedMetadataOperand(
+            mod_ref,
+            annot_name.as_ptr(),
+            llvm_sys::core::LLVMMetadataAsValue(ctx_ref, node),
+        );
+        let _ = named_md; // only needed to ensure it exists
+    }
 }
-
-// Re-export Either for the call_sreg match
-use inkwell::either::Either;

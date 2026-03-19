@@ -29,15 +29,15 @@ use cudarc::driver::result as cuda;
 
 use crate::{create_nvptx_target_machine, add_nvvm_kernel_metadata, call_sreg, call_barrier0};
 
-const BM: u32 = 128;
-const BN: u32 = 128;
+const BM: u32 = 64;
+const BN: u32 = 64;
 const BK: u32 = 16;
-const WM: u32 = 64;
-const WN: u32 = 64;
+const WM: u32 = 32;
+const WN: u32 = 32;
 const MMA_M: u32 = 16;
 const MMA_N: u32 = 8;
-const REG_M: u32 = WM / MMA_M; // 4
-const REG_N: u32 = WN / MMA_N; // 8
+const REG_M: u32 = WM / MMA_M; // 2
+const REG_N: u32 = WN / MMA_N; // 4
 const K_UNROLL: u32 = 1;
 const WARPS: u32 = 4;
 const THREADS: u32 = WARPS * 32;
@@ -267,27 +267,16 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let wx_off = b.build_int_mul(wx, ci(WN as u64), "wxo").unwrap();
 
     // ── Tile loading: precompute per-thread offsets ──
-    // A: 128×16=2048 f16, B: 16×128=2048 f16 → 16 per thread → 2 cp.async each
-    let tid_x16 = b.build_int_mul(tid, ci(16), "tx16").unwrap();
-    let tid_x16_p8 = b.build_int_add(tid_x16, ci(8), "tx16p8").unwrap();
-    // A chunk 0 and 1
-    let a_row0 = b.build_int_unsigned_div(tid_x16, ci(BK as u64), "ar0").unwrap();
-    let a_col0 = b.build_int_unsigned_rem(tid_x16, ci(BK as u64), "ac0").unwrap();
-    let a_grow0 = b.build_int_add(block_row, a_row0, "agr0").unwrap();
-    let a_sw0 = build_swizzle(&b, &ctx, tid_x16);
-    let a_row1 = b.build_int_unsigned_div(tid_x16_p8, ci(BK as u64), "ar1").unwrap();
-    let a_col1 = b.build_int_unsigned_rem(tid_x16_p8, ci(BK as u64), "ac1").unwrap();
-    let a_grow1 = b.build_int_add(block_row, a_row1, "agr1").unwrap();
-    let a_sw1 = build_swizzle(&b, &ctx, tid_x16_p8);
-    // B chunk 0 and 1
-    let b_row0 = b.build_int_unsigned_div(tid_x16, ci(BN as u64), "br0").unwrap();
-    let b_col0 = b.build_int_unsigned_rem(tid_x16, ci(BN as u64), "bc0").unwrap();
-    let b_gcol0 = b.build_int_add(block_col, b_col0, "bgc0").unwrap();
-    let b_sw0 = build_swizzle(&b, &ctx, tid_x16);
-    let b_row1 = b.build_int_unsigned_div(tid_x16_p8, ci(BN as u64), "br1").unwrap();
-    let b_col1 = b.build_int_unsigned_rem(tid_x16_p8, ci(BN as u64), "bc1").unwrap();
-    let b_gcol1 = b.build_int_add(block_col, b_col1, "bgc1").unwrap();
-    let b_sw1 = build_swizzle(&b, &ctx, tid_x16_p8);
+    // A: 64×16=1024 f16, B: 16×64=1024 f16 → 8 per thread → 1 cp.async each
+    let a_tile_row = b.build_int_unsigned_div(tid_x8, ci(BK as u64), "atr").unwrap();
+    let a_tile_col = b.build_int_unsigned_rem(tid_x8, ci(BK as u64), "atc").unwrap();
+    let a_glob_row = b.build_int_add(block_row, a_tile_row, "agr").unwrap();
+    let a_smem_sw = build_swizzle(&b, &ctx, tid_x8);
+
+    let b_tile_row = b.build_int_unsigned_div(tid_x8, ci(BN as u64), "btr").unwrap();
+    let b_tile_col = b.build_int_unsigned_rem(tid_x8, ci(BN as u64), "btc").unwrap();
+    let b_glob_col = b.build_int_add(block_col, b_tile_col, "bgc").unwrap();
+    let b_smem_sw = build_swizzle(&b, &ctx, tid_x8);
 
     b.build_unconditional_branch(kloop_hdr).unwrap();
 
@@ -306,31 +295,23 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     // ── K-loop body ──
     b.position_at_end(kloop_body);
 
-    // ── cp.async load A tile [BM×BK] — 2 cp.async per thread ──
-    let a_gc0 = b.build_int_add(t, a_col0, "").unwrap();
-    let a_i0 = b.build_int_add(b.build_int_mul(a_grow0, k_p, "").unwrap(), a_gc0, "").unwrap();
-    let a_gp0 = unsafe { b.build_gep(f16_ty, a_ptr, &[a_i0], "").unwrap() };
-    let sa_gp0 = unsafe { b.build_gep(f16_ty, smem_a, &[a_sw0], "").unwrap() };
-    build_cp_async_16(&b, &ctx, &module, sa_gp0, a_gp0);
+    // ── cp.async load A tile [BM×BK] — 1 cp.async per thread ──
+    let a_glob_col = b.build_int_add(t, a_tile_col, "agc").unwrap();
+    let a_idx = b.build_int_add(
+        b.build_int_mul(a_glob_row, k_p, "").unwrap(), a_glob_col, "",
+    ).unwrap();
+    let a_gep = unsafe { b.build_gep(f16_ty, a_ptr, &[a_idx], "").unwrap() };
+    let sa_gep = unsafe { b.build_gep(f16_ty, smem_a, &[a_smem_sw], "").unwrap() };
+    build_cp_async_16(&b, &ctx, &module, sa_gep, a_gep);
 
-    let a_gc1 = b.build_int_add(t, a_col1, "").unwrap();
-    let a_i1 = b.build_int_add(b.build_int_mul(a_grow1, k_p, "").unwrap(), a_gc1, "").unwrap();
-    let a_gp1 = unsafe { b.build_gep(f16_ty, a_ptr, &[a_i1], "").unwrap() };
-    let sa_gp1 = unsafe { b.build_gep(f16_ty, smem_a, &[a_sw1], "").unwrap() };
-    build_cp_async_16(&b, &ctx, &module, sa_gp1, a_gp1);
-
-    // ── cp.async load B tile [BK×BN] — 2 cp.async per thread ──
-    let b_gr0 = b.build_int_add(t, b_row0, "").unwrap();
-    let b_i0 = b.build_int_add(b.build_int_mul(b_gr0, n_p, "").unwrap(), b_gcol0, "").unwrap();
-    let b_gp0 = unsafe { b.build_gep(f16_ty, b_ptr, &[b_i0], "").unwrap() };
-    let sb_gp0 = unsafe { b.build_gep(f16_ty, smem_b, &[b_sw0], "").unwrap() };
-    build_cp_async_16(&b, &ctx, &module, sb_gp0, b_gp0);
-
-    let b_gr1 = b.build_int_add(t, b_row1, "").unwrap();
-    let b_i1 = b.build_int_add(b.build_int_mul(b_gr1, n_p, "").unwrap(), b_gcol1, "").unwrap();
-    let b_gp1 = unsafe { b.build_gep(f16_ty, b_ptr, &[b_i1], "").unwrap() };
-    let sb_gp1 = unsafe { b.build_gep(f16_ty, smem_b, &[b_sw1], "").unwrap() };
-    build_cp_async_16(&b, &ctx, &module, sb_gp1, b_gp1);
+    // ── cp.async load B tile [BK×BN] — 1 cp.async per thread ──
+    let b_glob_row = b.build_int_add(t, b_tile_row, "bgr").unwrap();
+    let b_idx = b.build_int_add(
+        b.build_int_mul(b_glob_row, n_p, "").unwrap(), b_glob_col, "",
+    ).unwrap();
+    let b_gep = unsafe { b.build_gep(f16_ty, b_ptr, &[b_idx], "").unwrap() };
+    let sb_gep = unsafe { b.build_gep(f16_ty, smem_b, &[b_smem_sw], "").unwrap() };
+    build_cp_async_16(&b, &ctx, &module, sb_gep, b_gep);
 
     build_cp_async_commit_and_wait(&b, &ctx, &module);
     call_barrier0(&ctx, &module, &b);

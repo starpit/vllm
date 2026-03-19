@@ -3265,27 +3265,44 @@ pub unsafe fn flash_attn_paged_ext(
     // Python line 588: then compute window_size_right
     let window_size_right = if is_causal { 0 } else { -1_i32 };
 
-    // --- seqlenq_ngroups_swapped (matching Python flash_api.cpp lines 594-601) ---
+    // --- seqlenq_ngroups_swapped ---
+    // DISABLED: requires Q/output padded to seqlen_q_rounded per batch (Python
+    // does this, we don't yet). TODO: re-enable with proper padding.
     let ngroups = num_heads_orig / num_kv_heads;
-    let do_swap = max_seqlen_q == 1
-        && num_heads_orig > num_kv_heads
-        && window_size_left < 0
-        && window_size_right < 0
-        && softcap == 0.0
-        && head_dim.is_multiple_of(8);
-    // Working dimensions after swap
+    let do_swap = false;
     let (eff_max_seqlen_q, eff_num_heads, eff_total_q) = if do_swap {
         (ngroups, num_kv_heads, batch_size * ngroups)
     } else {
         (max_seqlen_q, num_heads_orig, total_q)
     };
 
+    // --- Pad Q for the splitkv kernel ---
+    // The splitkv kernel (always used for paged KV) reads kBlockM rows (up to 128)
+    // per M-tile via unconditional vectorized loads, even when seqlen_q < kBlockM.
+    // Only the output writes are masked to seqlen_q. With tight allocations from
+    // our caching allocator, the reads go OOB into unmapped memory.
+    // Fix: copy Q into a buffer with 128 extra rows of zero padding.
+    // (PyTorch's allocator over-allocates so Python never hits this.)
+    const Q_PAD_ROWS: usize = 128; // >= max kBlockM across all FA kernel configs
+    let q_padded = alloc.alloc_tensor(
+        &[eff_total_q + Q_PAD_ROWS, eff_num_heads, head_dim],
+        q.dtype(),
+    );
+    // Zero the entire padded buffer, then copy actual Q data.
+    crate::driver::memset_d8(q_padded.raw_ptr(), 0, q_padded.size_bytes(), _stream)
+        .expect("memset q_padded");
+    crate::driver::memcpy_dtod_async(
+        q_padded.raw_ptr(),
+        q.raw_ptr() as *const u8,
+        eff_total_q * eff_num_heads * head_dim * q.dtype().size_bytes(),
+        _stream,
+    )
+    .expect("copy Q into padded buffer");
+
     // --- Allocate all temporaries up front so they stay alive past mha_varlen_fwd ---
 
-    // Output in original layout [total_q, num_heads_orig, head_dim]
     let final_out = alloc.alloc_tensor(&[total_q, num_heads_orig, head_dim], q.dtype());
 
-    // If swapped, kernel writes to a temp buffer; otherwise directly to final_out
     let kernel_out_buf = if do_swap {
         Some(alloc.alloc_tensor(&[eff_total_q, eff_num_heads, head_dim], q.dtype()))
     } else {
@@ -3296,47 +3313,17 @@ pub unsafe fn flash_attn_paged_ext(
         None => final_out.raw_ptr() as *mut c_void,
     };
 
-    // softmax_lse: Python uses [num_heads, total_q] with unpadded_lse=true
     let softmax_lse = alloc.alloc_tensor(&[eff_num_heads * eff_total_q], DType::F32);
 
-    // Transpose Q if swapped: [B, H, D] -> [B*ngroups, Hk, D]
-    // Python: q.reshape({B, Hk, ngroups, D}).transpose(1,2).reshape({B*ngroups, Hk, D})
-    // The reshape after transpose triggers a clone (contiguous copy).
-    let q_swapped_buf = if do_swap {
-        let buf = alloc.alloc_tensor(&[eff_total_q, eff_num_heads, head_dim], q.dtype());
-        ngroups_transpose_q(
-            q.raw_ptr() as *const c_void,
-            buf.raw_ptr() as *mut c_void,
-            batch_size as i32,
-            num_heads_orig as i32,
-            num_kv_heads as i32,
-            ngroups as i32,
-            head_dim as i32,
-            _stream,
-        );
-        Some(buf)
-    } else {
-        None
-    };
+    let q_swapped_buf: Option<OwnedTensor> = None; // do_swap is disabled
 
-    let (q_ptr, q_row_stride, q_head_stride) = match &q_swapped_buf {
-        Some(buf) => (
-            buf.raw_ptr() as *mut c_void,
-            (num_kv_heads * head_dim) as i64, // contiguous [B*ngroups, Hk, D]
-            head_dim as i64,
-        ),
-        None => (
-            q.raw_ptr() as *mut c_void,
-            (num_heads_orig * head_dim) as i64,
-            head_dim as i64,
-        ),
-    };
+    let (q_ptr, q_row_stride, q_head_stride) = (
+        q_padded.raw_ptr() as *mut c_void,
+        (num_heads_orig * head_dim) as i64,
+        head_dim as i64,
+    );
 
-    let o_row_stride = if do_swap {
-        (eff_num_heads * head_dim) as i64
-    } else {
-        (num_heads_orig * head_dim) as i64
-    };
+    let o_row_stride = (num_heads_orig * head_dim) as i64;
     let o_head_stride = head_dim as i64;
 
     // K/V cache: [num_blocks, block_size, num_kv_heads, head_dim]
@@ -3392,10 +3379,15 @@ pub unsafe fn flash_attn_paged_ext(
         1
     };
 
-    // Allocate split-K accum buffers — keep alive past mha_varlen_fwd
+    // Allocate split-K accum buffers — keep alive past mha_varlen_fwd.
+    // Must use seqlen_q_rounded (not eff_max_seqlen_q) because the splitkv
+    // kernel writes kBlockM rows per tile, and kBlockM is rounded up to 128.
+    // With seqlenq_ngroups_swapped, eff_max_seqlen_q can be as small as 4
+    // (= ngroups) while kBlockM = 128, causing massive buffer overflow.
+    let seqlen_q_rounded = round_multiple(eff_max_seqlen_q, 128);
     let lse_accum_buf = if num_splits > 1 {
         Some(alloc.alloc_tensor(
-            &[num_splits * batch_size * eff_num_heads * eff_max_seqlen_q],
+            &[num_splits * batch_size * eff_num_heads * seqlen_q_rounded],
             DType::F32,
         ))
     } else {
@@ -3403,7 +3395,7 @@ pub unsafe fn flash_attn_paged_ext(
     };
     let out_accum_buf = if num_splits > 1 {
         Some(alloc.alloc_tensor(
-            &[num_splits * batch_size * eff_num_heads * eff_max_seqlen_q * head_size_rounded],
+            &[num_splits * batch_size * eff_num_heads * seqlen_q_rounded * head_size_rounded],
             DType::F32,
         ))
     } else {
@@ -3468,6 +3460,7 @@ pub unsafe fn flash_attn_paged_ext(
     drop(lse_accum_buf);
     drop(out_accum_buf);
     drop(q_swapped_buf);
+    drop(q_padded);
 
     // Untranspose output if swapped: [B*ngroups, Hk, D] -> [B, H, D]
     // Python: out.reshape({B, ngroups, Hk, D}).transpose(1,2) then copy_ to original out

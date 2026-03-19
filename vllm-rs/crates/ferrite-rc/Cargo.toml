@@ -1,0 +1,18 @@
+[package]
+name = "ferrite-rc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferrite Phase 1: rust-cuda backend for high-performance fused GPU kernels"
+
+[[bin]]
+name = "ferrite-rc"
+path = "src/main.rs"
+
+[dependencies]
+cudarc = { workspace = true, features = ["nvrtc", "dynamic-linking", "cuda-version-from-build-system"] }
+half = { workspace = true }
+anyhow = { workspace = true }
+
+[build-dependencies]
+cuda_builder = { git = "https://github.com/Rust-GPU/Rust-CUDA", package = "cuda_builder" }

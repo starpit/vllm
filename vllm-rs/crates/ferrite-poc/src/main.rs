@@ -10,6 +10,7 @@
 mod mma_gemm;
 mod tiled_mma;
 mod cubek_gemm;
+mod sweep;
 
 use anyhow::{Context, Result, bail};
 use std::ffi::{CString, c_uint, c_void};
@@ -76,6 +77,9 @@ fn main() -> Result<()> {
 
     println!("\n[4/4] CubeK-style GEMM (128×128, K=32, 4 warps×32 MMAs, B128 swizzle)");
     cubek_gemm::step_cubek_gemm(&sm)?;
+
+    println!("\n[SWEEP] Parameter sweep across tile configurations");
+    sweep::run_sweep(&sm)?;
 
     println!("\n═══════════════════════════════════");
     println!("Phase 0 complete.");

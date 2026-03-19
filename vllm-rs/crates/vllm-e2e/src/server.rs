@@ -516,11 +516,16 @@ fn resolve_binary_path() -> Result<std::path::PathBuf> {
             .is_some_and(|n| n == "release");
 
         let mut cmd = std::process::Command::new("cargo");
-        // Clear CARGO_MANIFEST_DIR — the test runner sets it to vllm-e2e's
-        // directory, but if it leaks into this nested cargo build, ring's
-        // build script records the wrong value in its fingerprint, causing
-        // every subsequent `cargo build` to recompile the entire TLS stack.
-        cmd.env_remove("CARGO_MANIFEST_DIR");
+        // Clear CARGO_PKG_* and CARGO_MANIFEST_DIR env vars that the test
+        // harness sets for vllm-e2e. If these leak into the nested cargo
+        // build, ring's build.rs records them via rerun-if-env-changed and
+        // on the next build (where they're absent) cargo sees them as
+        // changed, marking ring dirty and recompiling the entire TLS stack.
+        for (key, _) in std::env::vars() {
+            if key.starts_with("CARGO_PKG_") || key == "CARGO_MANIFEST_DIR" {
+                cmd.env_remove(&key);
+            }
+        }
         cmd.arg("build").arg("-p").arg("vllm-cli");
         if is_release {
             cmd.arg("--release");

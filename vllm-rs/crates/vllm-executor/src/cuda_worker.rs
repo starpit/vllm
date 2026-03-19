@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 use vllm_common::SamplingParams;
 use vllm_core::scheduler::output::SchedulerOutput;
+use vllm_cuda::OwnedTensor;
 use vllm_cuda::cpu_gpu_buf::PinnedBuf;
 use vllm_cuda::device::GpuDevice;
 use vllm_cuda::driver;
@@ -1744,7 +1745,7 @@ impl CudaWorker {
         };
 
         let input_ids = if pp.is_first_stage() {
-            Some(gpu_input_ids)
+            Some(*gpu_input_ids)
         } else {
             None
         };
@@ -1754,16 +1755,16 @@ impl CudaWorker {
             model.forward_pp(
                 input_ids,
                 intermediate,
-                gpu_positions,
-                slot_mapping,
-                cu_seqlens_q,
-                seqused_k,
-                block_table,
+                *gpu_positions,
+                *slot_mapping,
+                *cu_seqlens_q,
+                *seqused_k,
+                *block_table,
                 max_seqlen_q,
                 max_seqlen_k,
                 kv_cache,
                 device,
-                last_token_indices,
+                last_token_indices.as_deref().copied(),
             )
         };
 
@@ -2174,7 +2175,7 @@ impl CudaWorker {
     }
 
     /// H2D copy a u32 slice into a caching-allocator tensor.
-    fn h2d_u32(data: &[u32], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
+    fn h2d_u32(data: &[u32], device: &mut GpuDevice) -> ExecutorResult<OwnedTensor> {
         let t = device.caching.alloc_tensor(&[data.len()], GpuDType::U32);
         unsafe {
             driver::memcpy_htod_async(
@@ -2185,11 +2186,11 @@ impl CudaWorker {
             )
         }
         .map_err(|e| ExecutorError::WorkerExecution(format!("H2D u32: {e}")))?;
-        Ok(t.into_gpu_tensor())
+        Ok(t)
     }
 
     /// H2D copy an i32 slice into a caching-allocator tensor.
-    fn h2d_i32(data: &[i32], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
+    fn h2d_i32(data: &[i32], device: &mut GpuDevice) -> ExecutorResult<OwnedTensor> {
         let t = device.caching.alloc_tensor(&[data.len()], GpuDType::I32);
         unsafe {
             driver::memcpy_htod_async(
@@ -2200,10 +2201,10 @@ impl CudaWorker {
             )
         }
         .map_err(|e| ExecutorError::WorkerExecution(format!("H2D i32: {e}")))?;
-        Ok(t.into_gpu_tensor())
+        Ok(t)
     }
 
-    fn h2d_i64(data: &[i64], device: &mut GpuDevice) -> ExecutorResult<GpuTensor> {
+    fn h2d_i64(data: &[i64], device: &mut GpuDevice) -> ExecutorResult<OwnedTensor> {
         let t = device.caching.alloc_tensor(&[data.len()], GpuDType::I64);
         unsafe {
             driver::memcpy_htod_async(
@@ -2214,7 +2215,7 @@ impl CudaWorker {
             )
         }
         .map_err(|e| ExecutorError::WorkerExecution(format!("H2D i64: {e}")))?;
-        Ok(t.into_gpu_tensor())
+        Ok(t)
     }
 
     /// Build attention metadata tensors from `AttentionMetadata`.
@@ -2225,7 +2226,14 @@ impl CudaWorker {
         meta: &vllm_model::AttentionMetadata,
         block_size: usize,
         device: &mut GpuDevice,
-    ) -> ExecutorResult<(GpuTensor, GpuTensor, GpuTensor, GpuTensor, usize, usize)> {
+    ) -> ExecutorResult<(
+        OwnedTensor,
+        OwnedTensor,
+        OwnedTensor,
+        OwnedTensor,
+        usize,
+        usize,
+    )> {
         let num_reqs = meta.num_reqs;
 
         // Invariant checks on attention metadata.
@@ -2300,10 +2308,11 @@ impl CudaWorker {
                     block_table[i * max_blocks + j] = bid as i32;
                 }
             }
-            let t = Self::h2d_i32(&block_table, device)?;
-            unsafe { GpuTensor::new(t.raw_ptr(), &[num_reqs, max_blocks], GpuDType::I32) }
+            let mut t = Self::h2d_i32(&block_table, device)?;
+            unsafe { t.reshape(&[num_reqs, max_blocks], GpuDType::I32) };
+            t
         } else {
-            unsafe { GpuTensor::new(std::ptr::null_mut(), &[0, 0], GpuDType::I32) }
+            device.caching.alloc_tensor(&[0], GpuDType::I32)
         };
 
         Ok((
@@ -2324,7 +2333,7 @@ impl CudaWorker {
     fn build_gdn_tensors(
         meta: &vllm_model::AttentionMetadata,
         device: &mut GpuDevice,
-    ) -> ExecutorResult<(GpuTensor, GpuTensor, usize)> {
+    ) -> ExecutorResult<(OwnedTensor, OwnedTensor, usize)> {
         let num_seqs = meta.num_reqs;
 
         // State indices: sequence i uses slot i in the GDN state pool.
@@ -4670,19 +4679,18 @@ impl Worker for CudaWorker {
             // Block table: [1, max_blocks].
             let max_blocks = num_tokens.div_ceil(block_size);
             let block_table: Vec<i32> = (0..max_blocks as i32).collect();
-            let gpu_bt = Self::h2d_i32(&block_table, device)?;
-            let gpu_bt =
-                unsafe { GpuTensor::new(gpu_bt.raw_ptr(), &[1, max_blocks], GpuDType::I32) };
+            let mut gpu_bt = Self::h2d_i32(&block_table, device)?;
+            unsafe { gpu_bt.reshape(&[1, max_blocks], GpuDType::I32) };
 
             // Forward pass (backbone only).
             let hidden_states = unsafe {
                 model.hidden_states(
-                    gpu_input_ids,
-                    gpu_positions,
-                    gpu_slot_mapping,
-                    gpu_cu_q,
-                    gpu_seqused_k,
-                    gpu_bt,
+                    *gpu_input_ids,
+                    *gpu_positions,
+                    *gpu_slot_mapping,
+                    *gpu_cu_q,
+                    *gpu_seqused_k,
+                    *gpu_bt,
                     num_tokens,
                     num_tokens,
                     kv_cache,
@@ -5220,12 +5228,12 @@ impl CudaWorker {
 
             let hidden_states = unsafe {
                 model.hidden_states(
-                    gpu_input_ids,
-                    gpu_positions,
-                    slot_mapping,
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table_gpu,
+                    *gpu_input_ids,
+                    *gpu_positions,
+                    *slot_mapping,
+                    *cu_seqlens_q,
+                    *seqused_k,
+                    *block_table_gpu,
                     max_seqlen_q,
                     max_seqlen_k,
                     kv_cache,
@@ -5492,17 +5500,17 @@ impl CudaWorker {
 
                 unsafe {
                     model.forward(
-                        gpu_input_ids,
-                        gpu_positions,
-                        slot_mapping,
-                        cu_seqlens_q,
-                        seqused_k,
-                        block_table_gpu,
+                        *gpu_input_ids,
+                        *gpu_positions,
+                        *slot_mapping,
+                        *cu_seqlens_q,
+                        *seqused_k,
+                        *block_table_gpu,
                         max_seqlen_q,
                         max_seqlen_k,
                         kv_cache,
                         device,
-                        last_token_indices,
+                        last_token_indices.as_deref().copied(),
                     )
                 }
             };
@@ -6143,21 +6151,21 @@ impl CudaWorker {
                         Self::build_gdn_tensors(meta, device)?;
                     let logits = unsafe {
                         model.forward_qwen3_next(
-                            gpu_input_ids,
-                            gpu_positions,
-                            slot_mapping,
-                            cu_seqlens_q,
-                            seqused_k,
-                            block_table,
+                            *gpu_input_ids,
+                            *gpu_positions,
+                            *slot_mapping,
+                            *cu_seqlens_q,
+                            *seqused_k,
+                            *block_table,
                             max_seqlen_q,
                             max_seqlen_k,
                             kv_cache,
                             gdn_pool,
-                            gdn_state_indices,
-                            gdn_cu_seqlens,
+                            *gdn_state_indices,
+                            *gdn_cu_seqlens,
                             num_seqs,
                             device,
-                            last_token_indices,
+                            last_token_indices.as_deref().copied(),
                         )
                     };
                     let logits_gpu = *logits;
@@ -6165,7 +6173,7 @@ impl CudaWorker {
                 } else if pp_active {
                     // PP last stage: use forward_pp with received intermediates.
                     let input_ids = if self.pp_config.unwrap().is_first_stage() {
-                        Some(gpu_input_ids)
+                        Some(*gpu_input_ids)
                     } else {
                         None
                     };
@@ -6173,16 +6181,16 @@ impl CudaWorker {
                         model.forward_pp(
                             input_ids,
                             pp_intermediate,
-                            gpu_positions,
-                            slot_mapping,
-                            cu_seqlens_q,
-                            seqused_k,
-                            block_table,
+                            *gpu_positions,
+                            *slot_mapping,
+                            *cu_seqlens_q,
+                            *seqused_k,
+                            *block_table,
                             max_seqlen_q,
                             max_seqlen_k,
                             kv_cache,
                             device,
-                            last_token_indices,
+                            last_token_indices.as_deref().copied(),
                         )
                     };
                     let logits = match result {
@@ -6195,17 +6203,17 @@ impl CudaWorker {
                 } else {
                     let owned = unsafe {
                         model.forward(
-                            gpu_input_ids,
-                            gpu_positions,
-                            slot_mapping,
-                            cu_seqlens_q,
-                            seqused_k,
-                            block_table,
+                            *gpu_input_ids,
+                            *gpu_positions,
+                            *slot_mapping,
+                            *cu_seqlens_q,
+                            *seqused_k,
+                            *block_table,
                             max_seqlen_q,
                             max_seqlen_k,
                             kv_cache,
                             device,
-                            last_token_indices,
+                            last_token_indices.as_deref().copied(),
                         )
                     };
                     let logits = *owned;

@@ -633,6 +633,12 @@ impl OwnedTensor {
         std::mem::forget(self);
         t
     }
+
+    /// Reshape this tensor in-place, keeping the same underlying memory.
+    /// The caller must ensure the new shape is compatible with the allocated size.
+    pub unsafe fn reshape(&mut self, shape: &[usize], dtype: DType) {
+        self.inner = GpuTensor::new(self.inner.raw_ptr(), shape, dtype);
+    }
 }
 
 impl Drop for OwnedTensor {

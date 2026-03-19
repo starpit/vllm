@@ -289,6 +289,7 @@ fn emit_kernel(sm: &str, bm: u32, bn: u32, bk: u32, wm_: u32, wn_: u32, do_sw: b
 fn bench_one(sm: &str, bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, do_sw: bool, do_cp: bool) -> Result<Option<f64>> {
     let m: u32 = 1024; let n: u32 = 1024; let k: u32 = 1024;
     if m%bm!=0 || n%bn!=0 || k%bk!=0 || wm<16 || wn<8 { return Ok(None); }
+    if bm%wm!=0 || bn%wn!=0 { return Ok(None); } // warp must tile block evenly
     let warps_m = bm/wm; let warps_n = bn/wn;
     let threads = warps_m*warps_n*32;
     if threads < 32 || threads > 1024 { return Ok(None); }
@@ -321,10 +322,14 @@ fn bench_one(sm: &str, bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, do_sw: bool,
     for _ in 0..3 { unsafe { cuda::launch_kernel(func,(gx,gy,1),(threads,1,1),smem,stream,params)?; } }
     unsafe { cuda::stream::synchronize(stream)?; cuda::memcpy_dtoh_sync(&mut hc, dc)?; }
 
-    // Quick verify
+    // Verify — check corners and middle to catch partial-tile bugs
     let mut ok = true;
-    for r in 0..8usize {
-        for c in 0..8usize {
+    let check_rows = [0usize, 1, 31, 32, 47, 48, 63, 127, (m-1) as usize];
+    let check_cols = [0usize, 1, 31, 32, 47, 48, 63, 127, (n-1) as usize];
+    for &r in &check_rows {
+        if r >= m as usize { continue; }
+        for &c in &check_cols {
+            if c >= n as usize { continue; }
             let mut e = 0.0f32;
             for kk in 0..k as usize { e += ha[r*k as usize+kk].to_f32() * hb[kk*n as usize+c].to_f32(); }
             if (hc[r*n as usize+c]-e).abs() > 1.0 { ok = false; break; }
@@ -357,41 +362,48 @@ pub fn run_sweep(sm: &str) -> Result<()> {
 
     let configs: Vec<(u32,u32,u32,u32,u32,bool,bool)> = vec![
         // (bm, bn, bk, wm, wn, swizzle, cp_async)
-        // ── Explore around the winner: 64×64 w64×16 ──
-        (64,64,16,64,16,true,true),   // winner from round 1
-        (64,64,16,64,16,false,true),  // no swizzle
-        (64,64,16,64,16,true,false),  // no cp.async
-        // Tall warp variations at 64×64
-        (64,64,16,64,8,true,true),    // w64×8 = 4×1 = 4 MMAs (very tall)
-        (64,64,16,64,32,true,true),   // w64×32 = 4×4 = 16 MMAs
-        // Other warp shapes at 64×64
-        (64,64,16,32,32,true,true),   // baseline
-        (64,64,16,16,64,true,true),   // wide
-        (64,64,16,48,16,true,true),   // 3×2 if valid
-        // ── Asymmetric block tiles with w64×16 ──
-        (64,32,16,64,16,true,true),   // narrow block
-        (64,48,16,64,16,true,true),   // medium block (may not divide)
-        (64,128,16,64,16,true,true),  // wide block (8 warps)
-        (128,32,16,64,16,true,true),  // tall block
-        (128,64,16,64,16,true,true),  // tall-wide (8 warps)
-        // ── 96×64 and 64×96 (non-power-of-2) ──
-        (96,64,16,48,32,true,true),
-        (64,96,16,32,48,true,true),
-        // ── Larger tiles with tall warps ──
-        (128,64,16,64,32,true,true),
-        (128,64,16,128,16,true,true), // very tall warp
+        // ── Round 1 winners ──
+        (64,64,16,64,16,true,true),   // 79 TFLOPS
+        (64,64,16,32,32,true,true),   // 75 TFLOPS
+        // ── Tall-narrow warps (the winning direction) ──
+        (64,64,16,64,8,true,true),    // 4×1 = 4 MMAs, 1 warp × 8 warps
+        (64,64,16,64,32,true,true),   // 4×4 = 16 MMAs
+        // ── 64×64 with different warp counts ──
+        (64,64,16,16,16,true,true),   // 16 warps (if valid)
+        (64,64,16,32,16,true,true),   // 2 warps × 4 warps
+        // ── 96×96 (non-power-of-2 block, divides 1024? No. Skip.) ──
+        // ── 128×32 with tall warps ──
+        (128,32,16,32,16,true,true),  // 4×2 warps
+        (128,32,16,64,16,true,true),  // 2×2 warps
+        (128,32,16,128,16,true,true), // 1×2 warps
+        (128,32,16,32,32,true,true),  // 4×1 warps
+        (128,32,16,64,32,true,true),  // 2×1 warps
+        (128,32,16,128,32,true,true), // 1×1 warp (32 threads)
+        // ── 128×64 ──
+        (128,64,16,64,16,true,true),  // 2×4 warps
+        (128,64,16,64,32,true,true),  // 2×2 warps
+        (128,64,16,128,16,true,true), // 1×4 warps
+        (128,64,16,128,32,true,true), // 1×2 warps
+        (128,64,16,128,64,true,true), // 1×1 warp
+        (128,64,16,32,32,true,true),  // 4×2 warps
+        // ── 64×128 ──
+        (64,128,16,64,32,true,true),  // 1×4 warps
+        (64,128,16,32,64,true,true),  // 2×2 warps
+        (64,128,16,64,64,true,true),  // 1×2 warps
+        (64,128,16,64,128,true,true), // 1×1 warp
+        (64,128,16,32,32,true,true),  // 2×4 warps
+        // ── 128×128 ──
         (128,128,16,64,32,true,true),
-        (128,128,16,128,16,true,true),
-        // ── BK variations on the winner ──
+        (128,128,16,128,32,true,true),
+        (128,128,16,64,64,true,true),
+        (128,128,16,128,64,true,true),
+        (128,128,16,128,128,true,true), // 1 warp
+        // ── 256×32 (very tall block) ──
+        (256,32,16,64,16,true,true),
+        (256,32,16,128,16,true,true),
+        (256,32,16,64,32,true,true),
+        // ── BK=32 with winner ──
         (64,64,32,64,16,true,true),
-        (64,64,8,64,16,true,true),    // smaller BK
-        // ── 2 warps only ──
-        (64,32,16,64,16,true,true),
-        (32,64,16,32,32,true,true),
-        (64,16,16,64,16,true,true),   // very narrow
-        // ── 8 warps ──
-        (64,64,16,32,8,true,true),    // 8 warps in 2×4
-        (64,64,16,16,8,true,true),    // 8 warps in 4×2 ... wait that's 16×8=2 MMAs
     ];
 
     for (bm,bn,bk,wm,wn,sw,cp) in &configs {

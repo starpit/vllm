@@ -31,13 +31,15 @@ use crate::{create_nvptx_target_machine, add_nvvm_kernel_metadata, call_sreg, ca
 
 const BM: u32 = 64;
 const BN: u32 = 64;
-const BK: u32 = 16;
+const BK: u32 = 32;  // 2 × MMA_K — K-unroll=2
 const WM: u32 = 32;
 const WN: u32 = 32;
 const MMA_M: u32 = 16;
 const MMA_N: u32 = 8;
+const MMA_K: u32 = 16;
 const REG_M: u32 = WM / MMA_M; // 2
 const REG_N: u32 = WN / MMA_N; // 4
+const K_UNROLL: u32 = BK / MMA_K; // 2
 const WARPS: u32 = 4;
 const THREADS: u32 = WARPS * 32;
 
@@ -265,20 +267,34 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let wy_off = b.build_int_mul(wy, ci(WM as u64), "wyo").unwrap();
     let wx_off = b.build_int_mul(wx, ci(WN as u64), "wxo").unwrap();
 
-    // ── Tile loading helper: precompute per-thread offsets ──
-    // A: 64×16 = 1024 f16, 128 threads → 8 per thread → 1 cp.async(16 bytes)
-    let a_tile_row = b.build_int_unsigned_div(tid_x8, ci(BK as u64), "atr").unwrap();
-    let a_tile_col = b.build_int_unsigned_rem(tid_x8, ci(BK as u64), "atc").unwrap();
-    let a_glob_row = b.build_int_add(block_row, a_tile_row, "agr").unwrap();
-    // Swizzled smem offset for A store
-    let a_smem_lin = tid_x8; // linear index in tile
-    let a_smem_sw = build_swizzle(&b, &ctx, a_smem_lin);
+    // ── Tile loading: precompute per-thread offsets ──
+    // With BK=32: A is 64×32=2048 f16, B is 32×64=2048 f16
+    // 128 threads → 16 elements each → 2 cp.async(8 f16 = 16 bytes) per matrix
+    let tid_x16 = b.build_int_mul(tid, ci(16), "tx16").unwrap();
 
-    // B: 16×64 = 1024 f16, 128 threads → 8 per thread → 1 cp.async(16 bytes)
-    let b_tile_row = b.build_int_unsigned_div(tid_x8, ci(BN as u64), "btr").unwrap();
-    let b_tile_col = b.build_int_unsigned_rem(tid_x8, ci(BN as u64), "btc").unwrap();
-    let b_glob_col = b.build_int_add(block_col, b_tile_col, "bgc").unwrap();
-    let b_smem_sw = build_swizzle(&b, &ctx, tid_x8);
+    // A: two chunks of 8 f16 at offsets tid*16 and tid*16+8
+    let a_lin0 = tid_x16;
+    let a_lin1 = b.build_int_add(tid_x16, ci(8), "al1").unwrap();
+    let a_row0 = b.build_int_unsigned_div(a_lin0, ci(BK as u64), "ar0").unwrap();
+    let a_col0 = b.build_int_unsigned_rem(a_lin0, ci(BK as u64), "ac0").unwrap();
+    let a_row1 = b.build_int_unsigned_div(a_lin1, ci(BK as u64), "ar1").unwrap();
+    let a_col1 = b.build_int_unsigned_rem(a_lin1, ci(BK as u64), "ac1").unwrap();
+    let a_grow0 = b.build_int_add(block_row, a_row0, "agr0").unwrap();
+    let a_grow1 = b.build_int_add(block_row, a_row1, "agr1").unwrap();
+    let a_sw0 = build_swizzle(&b, &ctx, a_lin0);
+    let a_sw1 = build_swizzle(&b, &ctx, a_lin1);
+
+    // B: two chunks of 8 f16 at offsets tid*16 and tid*16+8
+    let b_lin0 = tid_x16;
+    let b_lin1 = b.build_int_add(tid_x16, ci(8), "bl1").unwrap();
+    let b_row0 = b.build_int_unsigned_div(b_lin0, ci(BN as u64), "br0").unwrap();
+    let b_col0 = b.build_int_unsigned_rem(b_lin0, ci(BN as u64), "bc0").unwrap();
+    let b_row1 = b.build_int_unsigned_div(b_lin1, ci(BN as u64), "br1").unwrap();
+    let b_col1 = b.build_int_unsigned_rem(b_lin1, ci(BN as u64), "bc1").unwrap();
+    let b_gcol0 = b.build_int_add(block_col, b_col0, "bgc0").unwrap();
+    let b_gcol1 = b.build_int_add(block_col, b_col1, "bgc1").unwrap();
+    let b_sw0 = build_swizzle(&b, &ctx, b_lin0);
+    let b_sw1 = build_swizzle(&b, &ctx, b_lin1);
 
     b.build_unconditional_branch(kloop_hdr).unwrap();
 
@@ -297,95 +313,115 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     // ── K-loop body ──
     b.position_at_end(kloop_body);
 
-    // ── cp.async load A tile with swizzled store ──
-    let a_glob_col = b.build_int_add(t, a_tile_col, "agc").unwrap();
-    let a_idx = b.build_int_add(
-        b.build_int_mul(a_glob_row, k_p, "").unwrap(), a_glob_col, "",
-    ).unwrap();
-    let a_gep = unsafe { b.build_gep(f16_ty, a_ptr, &[a_idx], "agep").unwrap() };
-    let sa_gep = unsafe { b.build_gep(f16_ty, smem_a, &[a_smem_sw], "sagep").unwrap() };
-    build_cp_async_16(&b, &ctx, &module, sa_gep, a_gep);
+    // ── cp.async load A tile [BM×BK] — 2 cp.async per thread ──
+    // Chunk 0
+    let a_gcol0 = b.build_int_add(t, a_col0, "").unwrap();
+    let a_idx0 = b.build_int_add(b.build_int_mul(a_grow0, k_p, "").unwrap(), a_gcol0, "").unwrap();
+    let a_gep0 = unsafe { b.build_gep(f16_ty, a_ptr, &[a_idx0], "").unwrap() };
+    let sa_gep0 = unsafe { b.build_gep(f16_ty, smem_a, &[a_sw0], "").unwrap() };
+    build_cp_async_16(&b, &ctx, &module, sa_gep0, a_gep0);
+    // Chunk 1
+    let a_gcol1 = b.build_int_add(t, a_col1, "").unwrap();
+    let a_idx1 = b.build_int_add(b.build_int_mul(a_grow1, k_p, "").unwrap(), a_gcol1, "").unwrap();
+    let a_gep1 = unsafe { b.build_gep(f16_ty, a_ptr, &[a_idx1], "").unwrap() };
+    let sa_gep1 = unsafe { b.build_gep(f16_ty, smem_a, &[a_sw1], "").unwrap() };
+    build_cp_async_16(&b, &ctx, &module, sa_gep1, a_gep1);
 
-    // ── cp.async load B tile with swizzled store ──
-    let b_glob_row = b.build_int_add(t, b_tile_row, "bgr").unwrap();
-    let b_idx = b.build_int_add(
-        b.build_int_mul(b_glob_row, n_p, "").unwrap(), b_glob_col, "",
-    ).unwrap();
-    let b_gep = unsafe { b.build_gep(f16_ty, b_ptr, &[b_idx], "bgep").unwrap() };
-    let sb_gep = unsafe { b.build_gep(f16_ty, smem_b, &[b_smem_sw], "sbgep").unwrap() };
-    build_cp_async_16(&b, &ctx, &module, sb_gep, b_gep);
+    // ── cp.async load B tile [BK×BN] — 2 cp.async per thread ──
+    let b_grow0 = b.build_int_add(t, b_row0, "").unwrap();
+    let b_idx0 = b.build_int_add(b.build_int_mul(b_grow0, n_p, "").unwrap(), b_gcol0, "").unwrap();
+    let b_gp0 = unsafe { b.build_gep(f16_ty, b_ptr, &[b_idx0], "").unwrap() };
+    let sb_gp0 = unsafe { b.build_gep(f16_ty, smem_b, &[b_sw0], "").unwrap() };
+    build_cp_async_16(&b, &ctx, &module, sb_gp0, b_gp0);
+    let b_grow1 = b.build_int_add(t, b_row1, "").unwrap();
+    let b_idx1 = b.build_int_add(b.build_int_mul(b_grow1, n_p, "").unwrap(), b_gcol1, "").unwrap();
+    let b_gp1 = unsafe { b.build_gep(f16_ty, b_ptr, &[b_idx1], "").unwrap() };
+    let sb_gp1 = unsafe { b.build_gep(f16_ty, smem_b, &[b_sw1], "").unwrap() };
+    build_cp_async_16(&b, &ctx, &module, sb_gp1, b_gp1);
 
-    // Wait and sync
     build_cp_async_commit_and_wait(&b, &ctx, &module);
     call_barrier0(&ctx, &module, &b);
 
-    // ── Load A fragments with swizzled reads ──
-    let mut a_frags: Vec<IntValue> = Vec::new();
-    for rm in 0..REG_M as u64 {
-        let rm_off = b.build_int_add(wy_off, ci(rm * MMA_M as u64), "").unwrap();
-        for (row_add, col_add) in [(0u64, 0u64), (8, 0), (0, 8), (8, 8)] {
-            let frow = b.build_int_add(
-                b.build_int_add(rm_off, group, "").unwrap(), ci(row_add), "",
-            ).unwrap();
-            let fcol = b.build_int_add(tg2, ci(col_add), "").unwrap();
-            let lin_idx = b.build_int_add(
-                b.build_int_mul(frow, ci(BK as u64), "").unwrap(), fcol, "",
-            ).unwrap();
-            let sw_idx = build_swizzle(&b, &ctx, lin_idx);
-            let gep = unsafe { b.build_gep(f16_ty, smem_a, &[sw_idx], "").unwrap() };
-            a_frags.push(b.build_load(i32_ty, gep, "").unwrap().into_int_value());
+    // ── K-unroll: 2 rounds of fragment load + MMA from the same smem tile ──
+    // First round uses K offset 0, second uses K offset MMA_K=16
+    let mut cur_accs: Vec<FloatValue> = (0..num_acc)
+        .map(|i| acc_phis[i].as_basic_value().into_float_value())
+        .collect();
+
+    for ki in 0..K_UNROLL as u64 {
+        let k_off = ci(ki * MMA_K as u64); // 0 or 16
+
+        // Load A fragments for this K-slice
+        let mut a_frags: Vec<IntValue> = Vec::new();
+        for rm in 0..REG_M as u64 {
+            let rm_off = b.build_int_add(wy_off, ci(rm * MMA_M as u64), "").unwrap();
+            for (row_add, col_add) in [(0u64, 0u64), (8, 0), (0, 8), (8, 8)] {
+                let frow = b.build_int_add(
+                    b.build_int_add(rm_off, group, "").unwrap(), ci(row_add), "",
+                ).unwrap();
+                let fcol = b.build_int_add(
+                    b.build_int_add(tg2, ci(col_add), "").unwrap(), k_off, "",
+                ).unwrap();
+                let lin = b.build_int_add(
+                    b.build_int_mul(frow, ci(BK as u64), "").unwrap(), fcol, "",
+                ).unwrap();
+                let sw = build_swizzle(&b, &ctx, lin);
+                let gep = unsafe { b.build_gep(f16_ty, smem_a, &[sw], "").unwrap() };
+                a_frags.push(b.build_load(i32_ty, gep, "").unwrap().into_int_value());
+            }
         }
+
+        // Load B fragments for this K-slice
+        let mut b_frags: Vec<IntValue> = Vec::new();
+        for rn in 0..REG_N as u64 {
+            let b_col = b.build_int_add(
+                b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap(),
+                group, "",
+            ).unwrap();
+            for fk_add in [0u64, 8] {
+                let k0 = b.build_int_add(
+                    b.build_int_add(tg2, ci(fk_add), "").unwrap(), k_off, "",
+                ).unwrap();
+                let k1 = b.build_int_add(k0, ci(1), "").unwrap();
+                let lin0 = b.build_int_add(
+                    b.build_int_mul(k0, ci(BN as u64), "").unwrap(), b_col, "",
+                ).unwrap();
+                let lin1 = b.build_int_add(
+                    b.build_int_mul(k1, ci(BN as u64), "").unwrap(), b_col, "",
+                ).unwrap();
+                let sw0 = build_swizzle(&b, &ctx, lin0);
+                let sw1 = build_swizzle(&b, &ctx, lin1);
+                let gep0 = unsafe { b.build_gep(f16_ty, smem_b, &[sw0], "").unwrap() };
+                let gep1 = unsafe { b.build_gep(f16_ty, smem_b, &[sw1], "").unwrap() };
+                let v0 = b.build_load(f16_ty, gep0, "").unwrap();
+                let v1 = b.build_load(f16_ty, gep1, "").unwrap();
+                let vec = b.build_insert_element(v2f16_ty.get_undef(), v0, ci(0), "").unwrap();
+                let vec = b.build_insert_element(vec, v1, ci(1), "").unwrap();
+                b_frags.push(b.build_bit_cast(vec, i32_ty, "").unwrap().into_int_value());
+            }
+        }
+
+        // REG_M × REG_N MMA operations
+        let mut next_accs: Vec<FloatValue> = Vec::new();
+        for rm in 0..REG_M {
+            for rn in 0..REG_N {
+                let acc_base = (rm * REG_N * 4 + rn * 4) as usize;
+                let a_base = (rm * 4) as usize;
+                let b_base = (rn * 2) as usize;
+                let [d0, d1, d2, d3] = build_mma_asm(
+                    &b, &ctx, &module,
+                    &[a_frags[a_base], a_frags[a_base+1], a_frags[a_base+2], a_frags[a_base+3]],
+                    &[b_frags[b_base], b_frags[b_base+1]],
+                    &[cur_accs[acc_base], cur_accs[acc_base+1],
+                      cur_accs[acc_base+2], cur_accs[acc_base+3]],
+                );
+                next_accs.push(d0); next_accs.push(d1); next_accs.push(d2); next_accs.push(d3);
+            }
+        }
+        cur_accs = next_accs;
     }
 
-    // ── Load B fragments with swizzled reads ──
-    let mut b_frags: Vec<IntValue> = Vec::new();
-    for rn in 0..REG_N as u64 {
-        let b_col = b.build_int_add(
-            b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap(),
-            group, "",
-        ).unwrap();
-        for k_add in [0u64, 8] {
-            let k0 = b.build_int_add(tg2, ci(k_add), "").unwrap();
-            let k1 = b.build_int_add(k0, ci(1), "").unwrap();
-            let lin0 = b.build_int_add(
-                b.build_int_mul(k0, ci(BN as u64), "").unwrap(), b_col, "",
-            ).unwrap();
-            let lin1 = b.build_int_add(
-                b.build_int_mul(k1, ci(BN as u64), "").unwrap(), b_col, "",
-            ).unwrap();
-            let sw0 = build_swizzle(&b, &ctx, lin0);
-            let sw1 = build_swizzle(&b, &ctx, lin1);
-            let gep0 = unsafe { b.build_gep(f16_ty, smem_b, &[sw0], "").unwrap() };
-            let gep1 = unsafe { b.build_gep(f16_ty, smem_b, &[sw1], "").unwrap() };
-            let v0 = b.build_load(f16_ty, gep0, "").unwrap();
-            let v1 = b.build_load(f16_ty, gep1, "").unwrap();
-            let vec = b.build_insert_element(v2f16_ty.get_undef(), v0, ci(0), "").unwrap();
-            let vec = b.build_insert_element(vec, v1, ci(1), "").unwrap();
-            b_frags.push(b.build_bit_cast(vec, i32_ty, "").unwrap().into_int_value());
-        }
-    }
-
-    // ── REG_M × REG_N MMA operations ──
-    let mut new_accs: Vec<FloatValue> = Vec::new();
-    for rm in 0..REG_M {
-        for rn in 0..REG_N {
-            let acc_base = (rm * REG_N * 4 + rn * 4) as usize;
-            let a_base = (rm * 4) as usize;
-            let b_base = (rn * 2) as usize;
-            let [d0, d1, d2, d3] = build_mma_asm(
-                &b, &ctx, &module,
-                &[a_frags[a_base], a_frags[a_base+1], a_frags[a_base+2], a_frags[a_base+3]],
-                &[b_frags[b_base], b_frags[b_base+1]],
-                &[
-                    acc_phis[acc_base].as_basic_value().into_float_value(),
-                    acc_phis[acc_base+1].as_basic_value().into_float_value(),
-                    acc_phis[acc_base+2].as_basic_value().into_float_value(),
-                    acc_phis[acc_base+3].as_basic_value().into_float_value(),
-                ],
-            );
-            new_accs.push(d0); new_accs.push(d1); new_accs.push(d2); new_accs.push(d3);
-        }
-    }
+    let new_accs = cur_accs;
 
     call_barrier0(&ctx, &module, &b);
 

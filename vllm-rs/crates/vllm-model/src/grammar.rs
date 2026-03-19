@@ -22,8 +22,17 @@ pub use llguidance::ParserFactory as LlgParserFactory;
 ///
 /// Created once per request (when `guided_grammar` is set), then queried
 /// and advanced at each decode step.
+///
+/// Matches Python's `GuidanceGrammar` in `backend_guidance.py`:
+/// - `terminated` is set when EOS is consumed while the matcher is stopped.
+/// - Until terminated, `allowed_tokens()` returns EOS-only when stopped
+///   (via `compute_mask_or_eos`), allowing the model to naturally sample EOS.
+/// - After terminated, `allowed_tokens()` returns `None` (no mask needed).
 pub struct GrammarGuide {
     matcher: Matcher,
+    /// Set to `true` once EOS has been consumed while the matcher is stopped.
+    /// Mirrors Python's `GuidanceGrammar.terminated`.
+    terminated: bool,
 }
 
 /// A generic JSON schema that matches any valid JSON object.
@@ -241,6 +250,7 @@ impl GrammarGuide {
             let parser = factory.create_parser(tlg).map_err(|e| e.to_string())?;
             Ok(Self {
                 matcher: Matcher::new(Ok(parser)),
+                terminated: false,
             })
         } else {
             Self::from_ebnf(&lark, factory)
@@ -256,6 +266,7 @@ impl GrammarGuide {
         let parser = factory.create_parser(grammar).map_err(|e| e.to_string())?;
         Ok(Self {
             matcher: Matcher::new(Ok(parser)),
+            terminated: false,
         })
     }
 
@@ -265,6 +276,7 @@ impl GrammarGuide {
         let parser = factory.create_parser(grammar).map_err(|e| e.to_string())?;
         Ok(Self {
             matcher: Matcher::new(Ok(parser)),
+            terminated: false,
         })
     }
 
@@ -281,6 +293,7 @@ impl GrammarGuide {
         let parser = factory.create_parser(tlg).map_err(|e| e.to_string())?;
         Ok(Self {
             matcher: Matcher::new(Ok(parser)),
+            terminated: false,
         })
     }
 
@@ -300,12 +313,17 @@ impl GrammarGuide {
 
     /// Get the set of token IDs allowed at the current state.
     ///
-    /// Returns `None` if the parser is in an error/stopped state.
+    /// Returns `None` only when terminated (EOS already consumed after grammar
+    /// stopped). When the grammar is stopped but not yet terminated, returns
+    /// EOS-only mask so the model naturally samples EOS.
+    ///
+    /// Matches Python's `_fill_bitmasks` + `fill_next_token_bitmask` flow:
+    /// `compute_mask_or_eos()` returns EOS-only when stopped, normal mask otherwise.
     pub fn allowed_tokens(&mut self) -> Option<Vec<TokenId>> {
-        if self.matcher.is_stopped() {
+        if self.terminated {
             return None;
         }
-        match self.matcher.compute_mask() {
+        match self.matcher.compute_mask_or_eos() {
             Ok(mask) => {
                 let mut tokens = Vec::new();
                 mask.iter_set_entries(|idx| tokens.push(idx as TokenId));
@@ -317,14 +335,32 @@ impl GrammarGuide {
 
     /// Advance the parser to the next state given a sampled token.
     ///
+    /// Mirrors Python's `GuidanceGrammar.accept_tokens()`:
+    /// - If the matcher is already stopped, marks as terminated and returns
+    ///   early (the EOS token was the signal to stop).
+    /// - Otherwise, consumes the token normally.
+    ///
     /// Returns `true` if the transition was valid, `false` on error.
     pub fn advance(&mut self, token_id: TokenId) -> bool {
+        if self.matcher.is_stopped() {
+            // Grammar already stopped — this token is EOS (or garbage after
+            // stopped). Mark terminated so `allowed_tokens()` returns None.
+            self.terminated = true;
+            return true;
+        }
         self.matcher.consume_token(token_id).is_ok()
     }
 
     /// Check if the parser is in a finished/stopped state.
     pub fn is_finished(&self) -> bool {
         self.matcher.is_stopped()
+    }
+
+    /// Check if the grammar has been terminated (EOS consumed after stop).
+    ///
+    /// Mirrors Python's `GuidanceGrammar.is_terminated()`.
+    pub fn is_terminated(&self) -> bool {
+        self.terminated
     }
 }
 
@@ -511,9 +547,29 @@ mod tests {
         assert!(guide.advance(8));
 
         // After one digit, the guide should be finished (regex fully matched).
-        // Need to call allowed_tokens to trigger stop check.
-        let _ = guide.allowed_tokens();
+        // The matcher is stopped, but NOT terminated — allowed_tokens should
+        // return EOS-only mask (matching Python's compute_mask_or_eos behavior).
         assert!(guide.is_finished());
+        assert!(!guide.is_terminated());
+        let eos_allowed = guide.allowed_tokens();
+        assert!(
+            eos_allowed.is_some(),
+            "stopped but not terminated should return EOS-only mask"
+        );
+        let eos_tokens = eos_allowed.unwrap();
+        assert!(
+            !eos_tokens.is_empty(),
+            "EOS-only mask should contain at least one token"
+        );
+
+        // Advance with EOS — now terminated.
+        let eos_token = eos_tokens[0];
+        assert!(guide.advance(eos_token));
+        assert!(guide.is_terminated());
+        assert!(
+            guide.allowed_tokens().is_none(),
+            "terminated grammar should return None"
+        );
     }
 
     #[test]

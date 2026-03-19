@@ -4551,7 +4551,7 @@ __device__ void indexed_moe_forward(
     // Calculate strides
     const size_t weight_block_size = sizeof(block_q_t);
     const size_t input_block_size = sizeof(block_q8_1);
-    const size_t weight_expert_stride_bytes = (size_t)(n * k) / QK_K * weight_block_size;
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
     const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
     const size_t output_task_stride_elems = n;
 
@@ -5133,6 +5133,86 @@ void launch_dequantize_block_iq4_xs_f16(
 {
     int nb = (elem_count + 255) / 256;
     dequantize_block_iq4_xs_f16<<<nb, 32, 0, stream>>>(vx, dst);
+}
+
+// --- indexed_moe_forward launch wrappers ---
+
+void launch_indexed_moe_forward_q2k_q8_1(
+    const void* all_weights, const void* all_inputs,
+    const unsigned int* indices, float* all_outputs,
+    int n, int k, int batch, int topk, int k_padded, int input_dim1,
+    cudaStream_t stream)
+{
+    dim3 grid(n, batch, topk);
+    dim3 block(WARP_SIZE, 4, 1);
+    indexed_moe_forward_q2k_q8_1<<<grid, block, 0, stream>>>(
+        all_weights, all_inputs, indices, all_outputs,
+        n, k, batch, topk, k_padded, input_dim1);
+}
+
+void launch_indexed_moe_forward_q3k_q8_1(
+    const void* all_weights, const void* all_inputs,
+    const unsigned int* indices, float* all_outputs,
+    int n, int k, int batch, int topk, int k_padded, int input_dim1,
+    cudaStream_t stream)
+{
+    dim3 grid(n, batch, topk);
+    dim3 block(WARP_SIZE, 4, 1);
+    indexed_moe_forward_q3k_q8_1<<<grid, block, 0, stream>>>(
+        all_weights, all_inputs, indices, all_outputs,
+        n, k, batch, topk, k_padded, input_dim1);
+}
+
+void launch_indexed_moe_forward_q4k_q8_1(
+    const void* all_weights, const void* all_inputs,
+    const unsigned int* indices, float* all_outputs,
+    int n, int k, int batch, int topk, int k_padded, int input_dim1,
+    cudaStream_t stream)
+{
+    dim3 grid(n, batch, topk);
+    dim3 block(WARP_SIZE, 4, 1);
+    indexed_moe_forward_q4k_q8_1<<<grid, block, 0, stream>>>(
+        all_weights, all_inputs, indices, all_outputs,
+        n, k, batch, topk, k_padded, input_dim1);
+}
+
+void launch_indexed_moe_forward_q5k_q8_1(
+    const void* all_weights, const void* all_inputs,
+    const unsigned int* indices, float* all_outputs,
+    int n, int k, int batch, int topk, int k_padded, int input_dim1,
+    cudaStream_t stream)
+{
+    dim3 grid(n, batch, topk);
+    dim3 block(WARP_SIZE, 4, 1);
+    indexed_moe_forward_q5k_q8_1<<<grid, block, 0, stream>>>(
+        all_weights, all_inputs, indices, all_outputs,
+        n, k, batch, topk, k_padded, input_dim1);
+}
+
+void launch_indexed_moe_forward_q6k_q8_1(
+    const void* all_weights, const void* all_inputs,
+    const unsigned int* indices, float* all_outputs,
+    int n, int k, int batch, int topk, int k_padded, int input_dim1,
+    cudaStream_t stream)
+{
+    dim3 grid(n, batch, topk);
+    dim3 block(WARP_SIZE, 4, 1);
+    indexed_moe_forward_q6k_q8_1<<<grid, block, 0, stream>>>(
+        all_weights, all_inputs, indices, all_outputs,
+        n, k, batch, topk, k_padded, input_dim1);
+}
+
+void launch_indexed_moe_forward_q8_0_q8_1(
+    const void* all_weights, const void* all_inputs,
+    const unsigned int* indices, float* all_outputs,
+    int n, int k, int batch, int topk, int k_padded, int input_dim1,
+    cudaStream_t stream)
+{
+    dim3 grid(n, batch, topk);
+    dim3 block(WARP_SIZE, 4, 1);
+    indexed_moe_forward_q8_0_q8_1<<<grid, block, 0, stream>>>(
+        all_weights, all_inputs, indices, all_outputs,
+        n, k, batch, topk, k_padded, input_dim1);
 }
 
 } // extern "C"

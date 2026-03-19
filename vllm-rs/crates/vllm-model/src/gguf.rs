@@ -145,6 +145,7 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
         "gemma2" | "gemma" => "Gemma2ForCausalLM",
         "mistral" => "MistralForCausalLM",
         "phi3" | "phi" => "Phi3ForCausalLM",
+        "deepseek2" => "DeepseekV2ForCausalLM",
         other => other, // pass through as-is
     };
     config.architectures = vec![hf_arch.to_string()];
@@ -279,6 +280,89 @@ pub fn gguf_model_config(gguf: &GgufFile) -> ModelResult<HfModelConfig> {
         }
     }
 
+    // DeepSeek V2/V3 specific metadata (MLA + MoE fields).
+    if arch == "deepseek2" {
+        // MLA attention dimensions
+        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.attention.q_lora_rank")) {
+            config
+                .extra
+                .insert("q_lora_rank".to_string(), serde_json::json!(v));
+        }
+        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.attention.kv_lora_rank")) {
+            config
+                .extra
+                .insert("kv_lora_rank".to_string(), serde_json::json!(v));
+        }
+        // MLA head dimensions: try key_length_mla (new llama.cpp), then derive from
+        // key_length + kv_lora_rank (older GGUF), then fall back to DeepSeek defaults.
+        let rope_dim = gguf
+            .get_metadata_u32(&format!("{arch}.rope.dimension_count"))
+            .unwrap_or(64); // All DeepSeek V2/V3 variants use 64
+        if let Some(key_len_mla) =
+            gguf.get_metadata_u32(&format!("{arch}.attention.key_length_mla"))
+        {
+            // New format: key_length_mla = qk_nope + qk_rope
+            let nope_dim = key_len_mla.saturating_sub(rope_dim);
+            config
+                .extra
+                .insert("qk_nope_head_dim".to_string(), serde_json::json!(nope_dim));
+            config
+                .extra
+                .insert("qk_rope_head_dim".to_string(), serde_json::json!(rope_dim));
+        } else {
+            // Older GGUF without key_length_mla: all DeepSeek V2/V3 variants
+            // use qk_nope_head_dim=128, qk_rope_head_dim=64.
+            config
+                .extra
+                .insert("qk_nope_head_dim".to_string(), serde_json::json!(128u32));
+            config
+                .extra
+                .insert("qk_rope_head_dim".to_string(), serde_json::json!(rope_dim));
+        }
+        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.attention.value_length_mla")) {
+            config
+                .extra
+                .insert("v_head_dim".to_string(), serde_json::json!(v));
+        } else {
+            // All DeepSeek V2/V3 variants use v_head_dim=128
+            config
+                .extra
+                .insert("v_head_dim".to_string(), serde_json::json!(128u32));
+        }
+        // MoE fields
+        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.expert_count")) {
+            config
+                .extra
+                .insert("n_routed_experts".to_string(), serde_json::json!(v));
+        }
+        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.expert_used_count")) {
+            config
+                .extra
+                .insert("num_experts_per_tok".to_string(), serde_json::json!(v));
+        }
+        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.expert_shared_count")) {
+            config
+                .extra
+                .insert("n_shared_experts".to_string(), serde_json::json!(v));
+        }
+        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.expert_feed_forward_length")) {
+            config
+                .extra
+                .insert("moe_intermediate_size".to_string(), serde_json::json!(v));
+        }
+        if let Some(v) = gguf.get_metadata_u32(&format!("{arch}.leading_dense_block_count")) {
+            config
+                .extra
+                .insert("first_k_dense_replace".to_string(), serde_json::json!(v));
+        }
+        if let Some(v) = gguf.get_metadata_f32(&format!("{arch}.expert_weights_scale")) {
+            config.extra.insert(
+                "routed_scaling_factor".to_string(),
+                serde_json::json!(v as f64),
+            );
+        }
+    }
+
     // EOS token ID (stored in tokenizer.ggml.eos_token_id or general.eos_token_id).
     if let Some(eos) = gguf.get_metadata_u32("tokenizer.ggml.eos_token_id") {
         config
@@ -335,17 +419,38 @@ pub fn gguf_to_hf_name(gguf_name: &str) -> String {
         let suffix = &rest[dot_pos + 1..];
 
         let hf_suffix = match suffix {
+            // Standard attention
             "attn_q.weight" => "self_attn.q_proj.weight",
             "attn_k.weight" => "self_attn.k_proj.weight",
             "attn_v.weight" => "self_attn.v_proj.weight",
-            "attn_output.weight" => "self_attn.o_proj.weight",
+            "attn_output.weight" | "attn_o.weight" => "self_attn.o_proj.weight",
             "attn_norm.weight" => "input_layernorm.weight",
+            "attn_q_norm.weight" => "self_attn.q_norm.weight",
+            "attn_k_norm.weight" => "self_attn.k_norm.weight",
+            // MLA attention (DeepSeek V2/V3)
+            "attn_q_a.weight" => "self_attn.q_a_proj.weight",
+            "attn_q_a_norm.weight" => "self_attn.q_a_layernorm.weight",
+            "attn_q_b.weight" => "self_attn.q_b_proj.weight",
+            "attn_kv_a_mqa.weight" => "self_attn.kv_a_proj_with_mqa.weight",
+            "attn_kv_a_norm.weight" => "self_attn.kv_a_layernorm.weight",
+            "attn_kv_b.weight" => "self_attn.kv_b_proj.weight",
+            // Standard MLP
             "ffn_gate.weight" => "mlp.gate_proj.weight",
             "ffn_up.weight" => "mlp.up_proj.weight",
             "ffn_down.weight" => "mlp.down_proj.weight",
             "ffn_norm.weight" => "post_attention_layernorm.weight",
-            "attn_q_norm.weight" => "self_attn.q_norm.weight",
-            "attn_k_norm.weight" => "self_attn.k_norm.weight",
+            // MoE router gate
+            "ffn_gate_inp.weight" => "mlp.gate.weight",
+            // Fused 3D expert weights (kept as fused_ prefix for loader to handle)
+            "ffn_gate_exps.weight" => "mlp.experts.fused_gate_exps.weight",
+            "ffn_up_exps.weight" => "mlp.experts.fused_up_exps.weight",
+            "ffn_down_exps.weight" => "mlp.experts.fused_down_exps.weight",
+            // Shared experts (DeepSeek V2/V3)
+            "ffn_gate_shexp.weight" => "mlp.shared_experts.gate_proj.weight",
+            "ffn_up_shexp.weight" => "mlp.shared_experts.up_proj.weight",
+            "ffn_down_shexp.weight" => "mlp.shared_experts.down_proj.weight",
+            // DeepSeek V3 score correction bias
+            "exp_probs_b.bias" => "mlp.gate.e_score_correction_bias",
             other => return format!("model.layers.{layer_num}.{other}"),
         };
 
@@ -649,6 +754,80 @@ mod tests {
         assert_eq!(
             gguf_to_hf_name("blk.0.ffn_down.weight"),
             "model.layers.0.mlp.down_proj.weight"
+        );
+    }
+
+    #[test]
+    fn test_gguf_to_hf_name_deepseek_mla() {
+        // MLA attention
+        assert_eq!(
+            gguf_to_hf_name("blk.0.attn_q_a.weight"),
+            "model.layers.0.self_attn.q_a_proj.weight"
+        );
+        assert_eq!(
+            gguf_to_hf_name("blk.0.attn_q_a_norm.weight"),
+            "model.layers.0.self_attn.q_a_layernorm.weight"
+        );
+        assert_eq!(
+            gguf_to_hf_name("blk.0.attn_q_b.weight"),
+            "model.layers.0.self_attn.q_b_proj.weight"
+        );
+        assert_eq!(
+            gguf_to_hf_name("blk.0.attn_kv_a_mqa.weight"),
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight"
+        );
+        assert_eq!(
+            gguf_to_hf_name("blk.0.attn_kv_a_norm.weight"),
+            "model.layers.0.self_attn.kv_a_layernorm.weight"
+        );
+        assert_eq!(
+            gguf_to_hf_name("blk.0.attn_kv_b.weight"),
+            "model.layers.0.self_attn.kv_b_proj.weight"
+        );
+        // DeepSeek uses attn_o (not attn_output)
+        assert_eq!(
+            gguf_to_hf_name("blk.0.attn_o.weight"),
+            "model.layers.0.self_attn.o_proj.weight"
+        );
+    }
+
+    #[test]
+    fn test_gguf_to_hf_name_deepseek_moe() {
+        // Router gate
+        assert_eq!(
+            gguf_to_hf_name("blk.5.ffn_gate_inp.weight"),
+            "model.layers.5.mlp.gate.weight"
+        );
+        // Fused expert weights
+        assert_eq!(
+            gguf_to_hf_name("blk.5.ffn_gate_exps.weight"),
+            "model.layers.5.mlp.experts.fused_gate_exps.weight"
+        );
+        assert_eq!(
+            gguf_to_hf_name("blk.5.ffn_up_exps.weight"),
+            "model.layers.5.mlp.experts.fused_up_exps.weight"
+        );
+        assert_eq!(
+            gguf_to_hf_name("blk.5.ffn_down_exps.weight"),
+            "model.layers.5.mlp.experts.fused_down_exps.weight"
+        );
+        // Shared experts
+        assert_eq!(
+            gguf_to_hf_name("blk.5.ffn_gate_shexp.weight"),
+            "model.layers.5.mlp.shared_experts.gate_proj.weight"
+        );
+        assert_eq!(
+            gguf_to_hf_name("blk.5.ffn_up_shexp.weight"),
+            "model.layers.5.mlp.shared_experts.up_proj.weight"
+        );
+        assert_eq!(
+            gguf_to_hf_name("blk.5.ffn_down_shexp.weight"),
+            "model.layers.5.mlp.shared_experts.down_proj.weight"
+        );
+        // Score correction bias
+        assert_eq!(
+            gguf_to_hf_name("blk.5.exp_probs_b.bias"),
+            "model.layers.5.mlp.gate.e_score_correction_bias"
         );
     }
 

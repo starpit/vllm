@@ -480,6 +480,205 @@ impl Fp8SharedFusedMoELayer {
 }
 
 // ---------------------------------------------------------------------------
+// GgmlFusedMoELayer (GGML quantized MoE)
+// ---------------------------------------------------------------------------
+
+/// Fused Mixture of Experts layer with GGML-quantized expert weights.
+///
+/// Uses the `indexed_moe_forward` kernels which handle expert routing
+/// internally via an index array: `blockIdx.y = batch_idx`, `blockIdx.z = topk_idx`,
+/// expert looked up from `indices[batch * topk + topk_idx]`.
+///
+/// Forward pass:
+/// 1. Gate → router logits (dense matmul)
+/// 2. topk_softmax → topk_weights, topk_ids
+/// 3. Quantize hidden_states to Q8_1
+/// 4. indexed_moe_forward(w1, q8_input, indices) → [batch*topk, 2*inter] f32
+/// 5. silu_and_mul → [batch*topk, inter] f32
+/// 6. Quantize activated to Q8_1
+/// 7. indexed_moe_forward(w2, q8_activated, indices) → [batch*topk, hidden] f32
+/// 8. Scale by topk_weights, sum across topk → [batch, hidden] f32
+pub struct GgmlFusedMoELayer {
+    /// Gate projection: `[hidden_size, num_experts]`.
+    pub gate: Linear,
+    /// Stacked gate+up weights: `[num_experts, 2*intermediate_size, hidden_size]` quantized.
+    /// GgmlStorage with nrows = num_experts * 2 * intermediate_size, ncols = hidden_size.
+    pub w1: crate::ggml::GgmlStorage,
+    /// Stacked down weights: `[num_experts, hidden_size, intermediate_size]` quantized.
+    /// GgmlStorage with nrows = num_experts * hidden_size, ncols = intermediate_size.
+    pub w2: crate::ggml::GgmlStorage,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub intermediate_size: usize,
+    pub hidden_size: usize,
+    pub renormalize: bool,
+}
+
+impl GgmlFusedMoELayer {
+    /// Forward pass — full quantized MoE pipeline.
+    ///
+    /// * `hidden_states`: `[num_tokens, hidden_size]` in any dtype (cast to f32 internally).
+    ///
+    /// Returns: `[num_tokens, hidden_size]` in same dtype as input.
+    ///
+    /// # Safety
+    /// All tensors must be valid GPU memory.
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        use crate::dtype::DType;
+        use crate::ggml::{MATRIX_ROW_PADDING, ggml_moe_forward, ggml_quantize_q8_1_alloc};
+
+        let input_dtype = hidden_states.dtype();
+        let num_tokens = hidden_states.dim(0);
+        let stream = device.compute_stream;
+
+        // 1. Gate: router_logits = hidden_states @ gate_weight^T
+        let router_logits =
+            self.gate
+                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+
+        // 2. Top-K softmax
+        let (topk_weights, topk_ids) = kernels::topk_softmax(
+            router_logits.as_gpu_tensor(),
+            self.top_k,
+            self.renormalize,
+            &mut device.caching,
+            stream,
+        );
+        drop(router_logits);
+
+        // Expert indices: [num_tokens, top_k] i32 viewed as u32 (expert ids are non-negative).
+        let indices_ptr = topk_ids.as_gpu_tensor().raw_ptr() as *const u32;
+
+        // 3. Cast hidden_states to f32 if needed, then quantize to Q8_1.
+        let hs_f32 = if input_dtype != DType::F32 {
+            Some(kernels::cast_logits_to_f32(
+                *hidden_states,
+                &mut device.caching,
+                stream,
+            ))
+        } else {
+            None
+        };
+        let hs_f32_ptr = if let Some(ref cast) = hs_f32 {
+            cast.as_gpu_tensor().raw_ptr() as *const f32
+        } else {
+            hidden_states.as_ptr::<f32>()
+        };
+        let k = self.hidden_size;
+        let k_padded = crate::ggml::pad(k, MATRIX_ROW_PADDING);
+        let (q8_hidden, _) =
+            ggml_quantize_q8_1_alloc(hs_f32_ptr, k, num_tokens, &mut device.caching, stream);
+        drop(hs_f32);
+
+        // 4. GEMM 1: w1 × q8_input → [num_tokens * top_k, 2*intermediate] f32
+        // The indexed_moe_forward kernel uses input_dim1 to determine input sharing:
+        //   input_idx = (input_dim1 == 1) ? current_batch : task_id
+        // We pass input_dim1=1 so all topk experts for a token share the same
+        // quantized input row (no replication needed).
+        let out1 = device.caching.alloc_tensor(
+            &[num_tokens * self.top_k, 2 * self.intermediate_size],
+            crate::dtype::DType::F32,
+        );
+        ggml_moe_forward(
+            &self.w1,
+            q8_hidden,
+            indices_ptr,
+            out1.as_gpu_tensor().raw_ptr() as *mut f32,
+            2 * self.intermediate_size,
+            k,
+            num_tokens,
+            self.top_k,
+            k_padded,
+            1, // input_dim1=1: share input across topk per batch item
+            stream,
+        );
+
+        // 5. SiLU-and-mul → [num_tokens * top_k, intermediate] f32
+        let activated = kernels::silu_and_mul_fused(
+            out1.as_gpu_tensor(),
+            self.intermediate_size,
+            &mut device.caching,
+            stream,
+        );
+        drop(out1);
+
+        // 6. Quantize activated to Q8_1
+        let inter = self.intermediate_size;
+        let inter_padded = crate::ggml::pad(inter, MATRIX_ROW_PADDING);
+        let (q8_act, _) = ggml_quantize_q8_1_alloc(
+            activated.as_gpu_tensor().raw_ptr() as *const f32,
+            inter,
+            num_tokens * self.top_k,
+            &mut device.caching,
+            stream,
+        );
+        drop(activated);
+
+        // 7. GEMM 2: w2 × q8_act → [num_tokens * top_k, hidden_size] f32
+        // For GEMM 2, each task has its own unique input row (the activated output),
+        // so input_dim1 = batch * topk (i.e. not 1).
+        let out2 = device.caching.alloc_tensor(
+            &[num_tokens * self.top_k, self.hidden_size],
+            crate::dtype::DType::F32,
+        );
+        ggml_moe_forward(
+            &self.w2,
+            q8_act,
+            indices_ptr,
+            out2.as_gpu_tensor().raw_ptr() as *mut f32,
+            self.hidden_size,
+            inter,
+            num_tokens,
+            self.top_k,
+            inter_padded,
+            num_tokens * self.top_k, // input_dim1: each task has unique input
+            stream,
+        );
+        drop(topk_ids); // indices no longer needed
+
+        // 8. Scale by topk_weights and sum across topk → [num_tokens, hidden_size] f32
+        // broadcast_mul_inplace: out2[row, :] *= topk_weights_flat[row]
+        // topk_weights is [num_tokens, topk] f32 (num_tokens*topk contiguous elements),
+        // out2 is [num_tokens*topk, hidden] f32. Pass topk_weights directly — the kernel
+        // just reads num_rows scalar values from the scale pointer.
+        kernels::broadcast_mul_inplace(
+            out2.as_gpu_tensor(),
+            *topk_weights.view(), // [num_tokens, topk] — num_tokens*topk contiguous f32s
+            stream,
+        );
+        drop(topk_weights);
+
+        let output = kernels::moe_sum(
+            out2.as_gpu_tensor(),
+            num_tokens,
+            self.hidden_size,
+            self.top_k,
+            &mut device.caching,
+            stream,
+        );
+        drop(out2);
+
+        // Cast back to original dtype if we converted to f32.
+        if input_dtype != DType::F32 {
+            let result = kernels::cast_from_f32(
+                output.as_gpu_tensor(),
+                input_dtype,
+                &mut device.caching,
+                stream,
+            );
+            drop(output);
+            result
+        } else {
+            output
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FP8 MoE Weight Loading Helpers
 // ---------------------------------------------------------------------------
 

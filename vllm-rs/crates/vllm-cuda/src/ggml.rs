@@ -198,9 +198,9 @@ impl std::fmt::Debug for GgmlStorage {
 // Constants (match llama.cpp quantized kernels)
 // ---------------------------------------------------------------------------
 
-const MATRIX_ROW_PADDING: usize = 512;
+pub const MATRIX_ROW_PADDING: usize = 512;
 
-fn pad(p: usize, q: usize) -> usize {
+pub fn pad(p: usize, q: usize) -> usize {
     p.div_ceil(q) * q
 }
 
@@ -588,6 +588,86 @@ unsafe extern "C" {
         elem_count: i32,
         stream: CUstream,
     );
+
+    // --- indexed_moe_forward wrappers ---
+    fn launch_indexed_moe_forward_q2k_q8_1(
+        all_weights: *const u8,
+        all_inputs: *const u8,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: CUstream,
+    );
+    fn launch_indexed_moe_forward_q3k_q8_1(
+        all_weights: *const u8,
+        all_inputs: *const u8,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: CUstream,
+    );
+    fn launch_indexed_moe_forward_q4k_q8_1(
+        all_weights: *const u8,
+        all_inputs: *const u8,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: CUstream,
+    );
+    fn launch_indexed_moe_forward_q5k_q8_1(
+        all_weights: *const u8,
+        all_inputs: *const u8,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: CUstream,
+    );
+    fn launch_indexed_moe_forward_q6k_q8_1(
+        all_weights: *const u8,
+        all_inputs: *const u8,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: CUstream,
+    );
+    fn launch_indexed_moe_forward_q8_0_q8_1(
+        all_weights: *const u8,
+        all_inputs: *const u8,
+        indices: *const u32,
+        all_outputs: *mut f32,
+        n: i32,
+        k: i32,
+        batch: i32,
+        topk: i32,
+        k_padded: i32,
+        input_dim1: i32,
+        stream: CUstream,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -896,6 +976,129 @@ pub unsafe fn ggml_matmul(
     out
 }
 
+/// Indexed MoE forward: quantized expert weights × Q8_1 inputs → f32 outputs.
+///
+/// `storage`: 3D quantized expert weights `[num_experts, n, k]` flattened into GgmlStorage
+///   where nrows = num_experts * n, ncols = k.
+/// `q8_input`: Q8_1-quantized input, layout depends on `input_dim1`:
+///   - `input_dim1 == 1`: `[batch, k_padded]` (shared across topk per batch item)
+///   - `input_dim1 != 1`: `[batch * topk, k_padded]` (unique per task)
+/// `indices`: `[batch * topk]` u32 expert indices.
+/// `output`: `[batch * topk, n]` f32 output buffer.
+/// `n`: output features per expert (nrows per expert).
+/// `k`: input features per expert (ncols).
+/// `batch`: batch size.
+/// `topk`: number of experts per token.
+/// `k_padded`: padded input dimension (for Q8_1 alignment).
+/// `input_dim1`: controls input sharing. 1 = all topk experts for a batch item share
+///   the same input row. Otherwise each task_id indexes a unique input row.
+///
+/// # Safety
+/// All pointers must be valid GPU memory. `storage.dtype` must be a supported MoE quant type.
+pub unsafe fn ggml_moe_forward(
+    storage: &GgmlStorage,
+    q8_input: *const u8,
+    indices: *const u32,
+    output: *mut f32,
+    n: usize,
+    k: usize,
+    batch: usize,
+    topk: usize,
+    k_padded: usize,
+    input_dim1: usize,
+    stream: CUstream,
+) {
+    let n_i = n as i32;
+    let k_i = k as i32;
+    let batch_i = batch as i32;
+    let topk_i = topk as i32;
+    let k_padded_i = k_padded as i32;
+    let input_dim1_i = input_dim1 as i32;
+    let vx = storage.ptr as *const u8;
+
+    match storage.dtype {
+        GgmlDType::Q2K => launch_indexed_moe_forward_q2k_q8_1(
+            vx,
+            q8_input,
+            indices,
+            output,
+            n_i,
+            k_i,
+            batch_i,
+            topk_i,
+            k_padded_i,
+            input_dim1_i,
+            stream,
+        ),
+        GgmlDType::Q3K => launch_indexed_moe_forward_q3k_q8_1(
+            vx,
+            q8_input,
+            indices,
+            output,
+            n_i,
+            k_i,
+            batch_i,
+            topk_i,
+            k_padded_i,
+            input_dim1_i,
+            stream,
+        ),
+        GgmlDType::Q4K => launch_indexed_moe_forward_q4k_q8_1(
+            vx,
+            q8_input,
+            indices,
+            output,
+            n_i,
+            k_i,
+            batch_i,
+            topk_i,
+            k_padded_i,
+            input_dim1_i,
+            stream,
+        ),
+        GgmlDType::Q5K => launch_indexed_moe_forward_q5k_q8_1(
+            vx,
+            q8_input,
+            indices,
+            output,
+            n_i,
+            k_i,
+            batch_i,
+            topk_i,
+            k_padded_i,
+            input_dim1_i,
+            stream,
+        ),
+        GgmlDType::Q6K => launch_indexed_moe_forward_q6k_q8_1(
+            vx,
+            q8_input,
+            indices,
+            output,
+            n_i,
+            k_i,
+            batch_i,
+            topk_i,
+            k_padded_i,
+            input_dim1_i,
+            stream,
+        ),
+        GgmlDType::Q8_0 => launch_indexed_moe_forward_q8_0_q8_1(
+            vx,
+            q8_input,
+            indices,
+            output,
+            n_i,
+            k_i,
+            batch_i,
+            topk_i,
+            k_padded_i,
+            input_dim1_i,
+            stream,
+        ),
+        _ => panic!("unsupported dtype for ggml_moe_forward: {}", storage.dtype),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GGUF weight loading — raw quantized bytes from GGUF → GPU
 // ---------------------------------------------------------------------------
@@ -1110,12 +1313,13 @@ impl GgufGpuWeights {
                 let gpu_ptr = crate::driver::mem_alloc(size_bytes)?;
                 crate::driver::memcpy_htod_async(gpu_ptr, host_buf, size_bytes, stream)?;
 
-                let (nrows, ncols) = if dims.len() == 2 {
-                    (dims[0], dims[1])
-                } else if dims.len() == 1 {
-                    (1, dims[0])
-                } else {
-                    anyhow::bail!("unexpected shape {:?} for weight {}", dims, gguf_name);
+                // For 3D tensors (fused MoE experts), flatten first dims:
+                // [num_experts, output_dim, input_dim] → nrows = num_experts * output_dim.
+                let (nrows, ncols) = match dims.len() {
+                    3 => (dims[0] * dims[1], dims[2]),
+                    2 => (dims[0], dims[1]),
+                    1 => (1, dims[0]),
+                    _ => anyhow::bail!("unexpected shape {:?} for weight {}", dims, gguf_name),
                 };
 
                 let storage = GgmlStorage {

@@ -22,7 +22,7 @@ use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Embedding, Linear, RmsNorm};
-use crate::layers_moe::{Fp8FusedMoELayer, FusedMoELayer};
+use crate::layers_moe::{Fp8FusedMoELayer, FusedMoELayer, GgmlFusedMoELayer};
 use crate::model::llama::{LlamaMLP, RotaryCache, TpConfig};
 use crate::tensor::{GpuTensor, TensorView};
 use crate::weights as gpu_weights;
@@ -764,6 +764,68 @@ impl DeepSeekV2MoE {
     }
 }
 
+/// DeepSeek V2 MoE layer with GGML-quantized expert weights.
+///
+/// Expert weights stay quantized (no dequantization to dense). Uses
+/// `indexed_moe_forward` quantized kernels for compute.
+/// Shared expert weights also stay quantized, using `GgmlLinear`.
+pub struct DeepSeekV2GgmlMoE {
+    pub moe: GgmlFusedMoELayer,
+    /// Shared expert: quantized fused gate+up `[2*intermediate, hidden]`.
+    pub shared_gate_up: crate::layers::GgmlLinear,
+    /// Shared expert: quantized down `[hidden, intermediate]`.
+    pub shared_down: crate::layers::GgmlLinear,
+    pub shared_intermediate_size: usize,
+    pub routed_scaling_factor: f64,
+}
+
+impl DeepSeekV2GgmlMoE {
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        let stream = device.compute_stream;
+
+        // MoE path (operates in f32 internally, handles cast inside)
+        let moe_out = self.moe.forward(hidden_states, device);
+
+        // Scale routed output by routed_scaling_factor
+        if self.routed_scaling_factor != 1.0 {
+            kernels::scale_inplace(
+                *moe_out.view(),
+                self.routed_scaling_factor as f32,
+                &device.cublas,
+            );
+        }
+
+        // Shared expert path — GgmlLinear handles BF16→f32 cast internally.
+        // gate+up: [2*inter, hidden] × hidden_states → [num_tokens, 2*inter]
+        let shared_gu = self
+            .shared_gate_up
+            .forward(hidden_states, &mut device.caching, stream);
+        let shared_activated = kernels::silu_and_mul_fused(
+            shared_gu.as_gpu_tensor(),
+            self.shared_intermediate_size,
+            &mut device.caching,
+            stream,
+        );
+        drop(shared_gu);
+
+        // down: [hidden, inter] × activated → [num_tokens, hidden]
+        let shared_out =
+            self.shared_down
+                .forward(shared_activated.view(), &mut device.caching, stream);
+        drop(shared_activated);
+
+        // output = moe_out + shared_out
+        kernels::add_inplace(*moe_out.view(), *shared_out.view(), stream);
+        drop(shared_out);
+
+        moe_out
+    }
+}
+
 pub struct DeepSeekV2Fp8MoE {
     pub moe: Fp8FusedMoELayer,
     pub shared_gate_up: Linear,
@@ -823,6 +885,7 @@ enum DeepSeekV2Mlp {
     Dense(LlamaMLP),
     MoE(DeepSeekV2MoE),
     Fp8MoE(DeepSeekV2Fp8MoE),
+    GgmlMoE(DeepSeekV2GgmlMoE),
 }
 
 impl DeepSeekV2Mlp {
@@ -831,6 +894,7 @@ impl DeepSeekV2Mlp {
             Self::Dense(mlp) => mlp.forward(hidden_states, device),
             Self::MoE(moe) => moe.forward(hidden_states, device),
             Self::Fp8MoE(moe) => moe.forward(hidden_states, device),
+            Self::GgmlMoE(moe) => moe.forward(hidden_states, device),
         }
     }
 }
@@ -1353,6 +1417,348 @@ impl DeepSeekV2ForCausalLM {
         )
     }
 
+    /// Load from GGUF quantized weights.
+    ///
+    /// All weights are dequantized to dense at load time because the DeepSeek
+    /// model uses `Linear` (not `LinearLayer`) for all projections. Fused 3D
+    /// MoE expert weights are already dequantized by the GGUF loader; remaining
+    /// quantized weights (attention projections etc.) are dequantized here.
+    pub fn load_gguf(
+        gguf_weights: &mut crate::ggml::GgufGpuWeights,
+        config: &DeepSeekV2Config,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        use crate::ggml::GgufWeight;
+
+        let stream = device.compute_stream;
+
+        // Helper: dequantize a GGUF weight to a dense Linear.
+        // Quantized weights are dequantized to F16 on GPU (direct kernel).
+        // Dense weights are used as-is.
+        let dequant_linear = |w: GgufWeight| -> Result<Linear> {
+            match w {
+                GgufWeight::Dense(t) => Ok(Linear::new(t, None)),
+                GgufWeight::Quantized(s) => {
+                    let nrows = s.nrows;
+                    let ncols = s.ncols;
+                    let elem_count = nrows * ncols;
+                    let out_dtype = DType::F16;
+                    let out_bytes = elem_count * out_dtype.size_bytes();
+                    let gpu_ptr = unsafe { driver::mem_alloc(out_bytes)? };
+                    unsafe {
+                        crate::ggml::ggml_dequantize_f16(
+                            s.ptr,
+                            gpu_ptr as *mut u16,
+                            s.dtype,
+                            elem_count,
+                            stream,
+                        );
+                        driver::stream_synchronize(stream)?;
+                        driver::mem_free(s.ptr)?;
+                    }
+                    let tensor = unsafe { GpuTensor::new(gpu_ptr, &[nrows, ncols], out_dtype) };
+                    Ok(Linear::new(tensor, None))
+                }
+            }
+        };
+
+        // Helper: take a weight or bail.
+        let take_weight =
+            |weights: &mut crate::ggml::GgufGpuWeights, name: &str| -> Result<GgufWeight> {
+                weights
+                    .take(name)
+                    .ok_or_else(|| anyhow::anyhow!("missing weight: {name}"))
+            };
+
+        // Embedding.
+        let embed_w = gguf_weights.take_dense("model.embed_tokens.weight")?;
+        let embed_tokens = Embedding::new(embed_w);
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+
+            // --- MLA Attention ---
+            let num_heads = config.num_attention_heads;
+            let qk_nope_head_dim = config.qk_nope_head_dim;
+            let qk_rope_head_dim = config.qk_rope_head_dim;
+            let qk_head_dim = config.qk_head_dim();
+            let v_head_dim = config.v_head_dim;
+            let kv_lora_rank = config.kv_lora_rank;
+
+            let (q_a_proj, q_a_layernorm, q_b_proj) = if config.q_lora_rank.is_some() {
+                let q_a_w =
+                    take_weight(gguf_weights, &format!("{prefix}.self_attn.q_a_proj.weight"))?;
+                let q_a = dequant_linear(q_a_w)?;
+                let q_a_ln_w =
+                    gguf_weights.take_dense(&format!("{prefix}.self_attn.q_a_layernorm.weight"))?;
+                let q_a_ln = RmsNorm::new(q_a_ln_w, config.rms_norm_eps);
+                let q_b_w =
+                    take_weight(gguf_weights, &format!("{prefix}.self_attn.q_b_proj.weight"))?;
+                let q_b = dequant_linear(q_b_w)?;
+                (Some(q_a), Some(q_a_ln), q_b)
+            } else {
+                let q_w = take_weight(gguf_weights, &format!("{prefix}.self_attn.q_proj.weight"))?;
+                let q = dequant_linear(q_w)?;
+                (None, None, q)
+            };
+
+            let kv_a_w = take_weight(
+                gguf_weights,
+                &format!("{prefix}.self_attn.kv_a_proj_with_mqa.weight"),
+            )?;
+            let kv_a = dequant_linear(kv_a_w)?;
+            let kv_a_ln_w =
+                gguf_weights.take_dense(&format!("{prefix}.self_attn.kv_a_layernorm.weight"))?;
+            let kv_a_ln = RmsNorm::new(kv_a_ln_w, config.rms_norm_eps);
+            let kv_b_w = take_weight(
+                gguf_weights,
+                &format!("{prefix}.self_attn.kv_b_proj.weight"),
+            )?;
+            let kv_b = dequant_linear(kv_b_w)?;
+
+            let o_w = take_weight(gguf_weights, &format!("{prefix}.self_attn.o_proj.weight"))?;
+            let o = dequant_linear(o_w)?;
+
+            let mut scale = 1.0 / (qk_head_dim as f32).sqrt();
+            if let Some(ref yarn) = config.yarn_rope_scaling {
+                let mscale = yarn_get_mscale(yarn.factor, yarn.mscale_all_dim);
+                scale *= (mscale * mscale) as f32;
+            }
+
+            let self_attn = DeepSeekV2Attention {
+                q_a_proj,
+                q_a_layernorm,
+                q_b_proj,
+                kv_a_proj_with_mqa: kv_a,
+                kv_a_layernorm: kv_a_ln,
+                kv_b_proj: kv_b,
+                o_proj: o,
+                num_heads,
+                qk_nope_head_dim,
+                qk_rope_head_dim,
+                qk_head_dim,
+                v_head_dim,
+                kv_lora_rank,
+                scale,
+                layer_idx: i,
+                #[cfg(feature = "nccl")]
+                tp_group: None,
+            };
+
+            // --- MLP ---
+            let is_dense = i < config.first_k_dense_replace;
+            let mlp = if is_dense {
+                // Dense MLP layers: separate gate, up, down.
+                let gate_w = take_weight(gguf_weights, &format!("{prefix}.mlp.gate_proj.weight"))?;
+                let up_w = take_weight(gguf_weights, &format!("{prefix}.mlp.up_proj.weight"))?;
+                let down_w = take_weight(gguf_weights, &format!("{prefix}.mlp.down_proj.weight"))?;
+                DeepSeekV2Mlp::Dense(LlamaMLP::from_parts(
+                    dequant_linear(gate_w)?.into(),
+                    Some(dequant_linear(up_w)?.into()),
+                    dequant_linear(down_w)?.into(),
+                    config.intermediate_size,
+                ))
+            } else {
+                // MoE layers: fused 3D expert weights + shared experts.
+                // Keep all expert weights quantized — use indexed_moe_forward kernels.
+                let moe_prefix = format!("{prefix}.mlp");
+                let num_experts = config.n_routed_experts;
+                let inter = config.moe_intermediate_size;
+                let hidden = config.hidden_size;
+
+                // Router gate (small 2D weight — dequantize to dense for gate matmul).
+                let gate_w = take_weight(gguf_weights, &format!("{moe_prefix}.gate.weight"))?;
+                let gate = dequant_linear(gate_w)?;
+
+                // Fused expert weights: [n_experts, dim, hidden] — stay quantized.
+                let gate_exps = gguf_weights
+                    .take_quantized(&format!("{moe_prefix}.experts.fused_gate_exps.weight"))?;
+                let up_exps = gguf_weights
+                    .take_quantized(&format!("{moe_prefix}.experts.fused_up_exps.weight"))?;
+                let down_exps = gguf_weights
+                    .take_quantized(&format!("{moe_prefix}.experts.fused_down_exps.weight"))?;
+
+                let qdtype = gate_exps.dtype;
+                let bs = qdtype.block_size();
+                let ts = qdtype.type_size();
+
+                // Interleave gate + up → w1 [n_experts, 2*inter, hidden] in quantized form.
+                // Each expert's gate slab: [inter, hidden] quantized (inter*hidden/bs * ts bytes).
+                // Each expert's up slab:   [inter, hidden] quantized (same size).
+                // w1 expert slab:          [2*inter, hidden] quantized.
+                let expert_slab_bytes = (inter * hidden / bs) * ts;
+                let w1_expert_bytes = 2 * expert_slab_bytes;
+                let w1_total_bytes = num_experts * w1_expert_bytes;
+                let w1_ptr = unsafe { driver::mem_alloc(w1_total_bytes)? };
+
+                for e in 0..num_experts {
+                    let gate_offset = e * expert_slab_bytes;
+                    let up_offset = e * expert_slab_bytes;
+                    let w1_gate_offset = e * w1_expert_bytes;
+                    let w1_up_offset = w1_gate_offset + expert_slab_bytes;
+
+                    unsafe {
+                        driver::memcpy_dtod_async(
+                            w1_ptr.add(w1_gate_offset),
+                            gate_exps.ptr.add(gate_offset),
+                            expert_slab_bytes,
+                            device.compute_stream,
+                        )?;
+                        driver::memcpy_dtod_async(
+                            w1_ptr.add(w1_up_offset),
+                            up_exps.ptr.add(up_offset),
+                            expert_slab_bytes,
+                            device.compute_stream,
+                        )?;
+                    }
+                }
+
+                // Free gate_exps and up_exps now that w1 is assembled.
+                unsafe {
+                    driver::mem_free(gate_exps.ptr)?;
+                    driver::mem_free(up_exps.ptr)?;
+                }
+
+                let w1 = crate::ggml::GgmlStorage {
+                    ptr: w1_ptr,
+                    len: w1_total_bytes,
+                    dtype: qdtype,
+                    nrows: num_experts * 2 * inter,
+                    ncols: hidden,
+                };
+                // w2 = down_exps: [n_experts, hidden, inter] quantized.
+                // GgmlStorage already has nrows = num_experts * hidden, ncols = inter.
+                let w2 = down_exps;
+
+                let moe = GgmlFusedMoELayer {
+                    gate,
+                    w1,
+                    w2,
+                    num_experts,
+                    top_k: config.num_experts_per_tok,
+                    intermediate_size: inter,
+                    hidden_size: hidden,
+                    renormalize: config.norm_topk_prob,
+                };
+
+                // Shared experts — keep quantized, use GgmlLinear.
+                let shared_inter = config.n_shared_experts * config.moe_intermediate_size;
+                let shared_gate_s = gguf_weights
+                    .take_quantized(&format!("{moe_prefix}.shared_experts.gate_proj.weight"))?;
+                let shared_up_s = gguf_weights
+                    .take_quantized(&format!("{moe_prefix}.shared_experts.up_proj.weight"))?;
+                let shared_down_s = gguf_weights
+                    .take_quantized(&format!("{moe_prefix}.shared_experts.down_proj.weight"))?;
+
+                // Shared experts may use a different quant type than routed experts.
+                let se_qdtype = shared_gate_s.dtype;
+                let se_bs = se_qdtype.block_size();
+                let se_ts = se_qdtype.type_size();
+
+                // Fuse gate+up into [2*shared_inter, hidden] in quantized form.
+                let se_slab_bytes = (shared_inter * hidden / se_bs) * se_ts;
+                let se_total_bytes = 2 * se_slab_bytes;
+                let se_ptr = unsafe { driver::mem_alloc(se_total_bytes)? };
+                unsafe {
+                    driver::memcpy_dtod_async(
+                        se_ptr,
+                        shared_gate_s.ptr,
+                        se_slab_bytes,
+                        device.compute_stream,
+                    )?;
+                    driver::memcpy_dtod_async(
+                        se_ptr.add(se_slab_bytes),
+                        shared_up_s.ptr,
+                        se_slab_bytes,
+                        device.compute_stream,
+                    )?;
+                    driver::mem_free(shared_gate_s.ptr)?;
+                    driver::mem_free(shared_up_s.ptr)?;
+                }
+                let shared_gate_up = crate::layers::GgmlLinear {
+                    storage: crate::ggml::GgmlStorage {
+                        ptr: se_ptr,
+                        len: se_total_bytes,
+                        dtype: se_qdtype,
+                        nrows: 2 * shared_inter,
+                        ncols: hidden,
+                    },
+                    bias: None,
+                };
+                let shared_down = crate::layers::GgmlLinear {
+                    storage: shared_down_s,
+                    bias: None,
+                };
+
+                DeepSeekV2Mlp::GgmlMoE(DeepSeekV2GgmlMoE {
+                    moe,
+                    shared_gate_up,
+                    shared_down,
+                    shared_intermediate_size: shared_inter,
+                    routed_scaling_factor: config.routed_scaling_factor,
+                })
+            };
+
+            // Norms.
+            let input_ln_w =
+                gguf_weights.take_dense(&format!("{prefix}.input_layernorm.weight"))?;
+            let post_ln_w =
+                gguf_weights.take_dense(&format!("{prefix}.post_attention_layernorm.weight"))?;
+
+            layers.push(DeepSeekV2DecoderLayer {
+                self_attn,
+                mlp,
+                input_layernorm: RmsNorm::new(input_ln_w, config.rms_norm_eps),
+                post_attention_layernorm: RmsNorm::new(post_ln_w, config.rms_norm_eps),
+            });
+        }
+
+        let norm_w = gguf_weights.take_dense("model.norm.weight")?;
+        let norm = RmsNorm::new(norm_w, config.rms_norm_eps);
+
+        let rotary = if let Some(ref yarn) = config.yarn_rope_scaling {
+            unsafe {
+                yarn_rotary_cache(
+                    config.qk_rope_head_dim,
+                    config.max_position_embeddings,
+                    config.rope_theta,
+                    yarn,
+                    dtype,
+                    device,
+                )?
+            }
+        } else {
+            unsafe {
+                RotaryCache::new(
+                    config.qk_rope_head_dim,
+                    config.max_position_embeddings,
+                    config.rope_theta,
+                    None,
+                    dtype,
+                    device,
+                )?
+            }
+        };
+
+        let model = DeepSeekV2Model {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+        };
+
+        let lm_head = if config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.weight, None)
+        } else {
+            let w = take_weight(gguf_weights, "lm_head.weight")?;
+            dequant_linear(w)?
+        };
+
+        Ok(Self { model, lm_head })
+    }
+
     /// Set TP group on all layers.
     #[cfg(feature = "nccl")]
     pub fn set_tp_group(&mut self, group: Arc<NcclGroup>) {
@@ -1367,6 +1773,9 @@ impl DeepSeekV2ForCausalLM {
                 }
                 DeepSeekV2Mlp::Fp8MoE(moe) => {
                     moe.moe.tp_group = Some(Arc::clone(&group));
+                }
+                DeepSeekV2Mlp::GgmlMoE(_) => {
+                    // GGML MoE does not support TP yet.
                 }
             }
         }

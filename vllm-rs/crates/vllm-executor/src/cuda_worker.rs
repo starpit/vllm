@@ -5150,67 +5150,10 @@ impl CudaWorker {
             }
         };
 
-        // Build batch_req_ids and update logits processor pipeline.
+        // Build batch_req_ids for this step (used by processor updates after forward).
         self.batch_req_ids.clear();
         self.batch_req_ids
             .extend(prepared.req_inputs.iter().map(|r| r.req_id.clone()));
-        {
-            let batch_update = if self.batch_changed {
-                Some(BatchUpdate {
-                    batch_size: num_reqs,
-                    added: Vec::new(),
-                    removed: Vec::new(),
-                })
-            } else {
-                None
-            };
-
-            if let Some(ref mut pipeline) = self.logits_pipeline {
-                pipeline.update_state(
-                    batch_update.as_ref(),
-                    &self.sampling_params_map,
-                    &self.token_buffers,
-                    &self.batch_req_ids,
-                    device,
-                );
-            }
-
-            #[cfg(feature = "guided-decoding")]
-            {
-                let grammar_reqs: Vec<(usize, Vec<u32>)> = self
-                    .batch_req_ids
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, rid)| {
-                        self.grammar_states
-                            .get_mut(rid)
-                            .and_then(|g| g.allowed_tokens())
-                            .map(|allowed| (idx, allowed))
-                    })
-                    .collect();
-                let refs: Vec<(usize, &[u32])> = grammar_reqs
-                    .iter()
-                    .map(|(idx, v)| (*idx, v.as_slice()))
-                    .collect();
-                self.grammar_processor
-                    .update_from_allowed_tokens(&refs, device);
-            }
-            #[cfg(not(feature = "guided-decoding"))]
-            {
-                let empty: Vec<(usize, &[u32])> = Vec::new();
-                self.grammar_processor
-                    .update_from_allowed_tokens(&empty, device);
-            }
-
-            // Update allowed_token_ids processor.
-            self.allowed_token_ids_processor.update_state(
-                batch_update.as_ref(),
-                &self.sampling_params_map,
-                &self.token_buffers,
-                &self.batch_req_ids,
-                device,
-            );
-        }
 
         // --- Pooling mode: run backbone, pool, return embeddings ---
         if self.is_pooling {
@@ -5556,6 +5499,21 @@ impl CudaWorker {
             // Fall through to sampling with merged logits.
             let logits = merged;
 
+            // Update logits processors after forward, before sampling.
+            Self::update_logits_processors(
+                self.batch_changed,
+                num_reqs,
+                self.logits_pipeline.as_mut(),
+                &self.sampling_params_map,
+                &self.token_buffers,
+                &self.batch_req_ids,
+                #[cfg(feature = "guided-decoding")]
+                &mut self.grammar_states,
+                &mut self.grammar_processor,
+                &mut self.allowed_token_ids_processor,
+                device,
+            );
+
             // GPU sampling for mixed prefill+decode merged logits.
             return Self::gpu_sample_and_finalize(
                 &self.sampling_params_map,
@@ -5578,18 +5536,20 @@ impl CudaWorker {
 
         // Check if any request needs logprobs, grammar, or logit processors
         // (these require the full GPU sampling pipeline instead of in-graph argmax).
-        // Also gates CUDA graph replay: processor GPU tensors (allocated from the
-        // caching allocator) can collide with graph-captured intermediate addresses.
+        // Uses request-level state (sampling_params_map, grammar_states) rather than
+        // processor GPU state, since processors are updated after forward/graph replay.
         let any_needs_full_sampling = prepared.req_inputs.iter().any(|r| {
-            self.sampling_params_map
-                .get(&r.req_id)
-                .is_some_and(|p| p.logprobs.is_some())
-        }) || self
-            .logits_pipeline
-            .as_ref()
-            .is_some_and(|p| p.any_active())
-            || self.grammar_processor.is_active()
-            || self.allowed_token_ids_processor.is_active();
+            self.sampling_params_map.get(&r.req_id).is_some_and(|p| {
+                p.logprobs.is_some()
+                    || p.logit_bias.is_some()
+                    || p.frequency_penalty != 0.0
+                    || p.presence_penalty != 0.0
+                    || p.repetition_penalty != 1.0
+                    || p.min_tokens > 0
+                    || p.bad_words_token_ids.is_some()
+                    || p.allowed_token_ids.is_some()
+            })
+        }) || !self.grammar_states.is_empty();
 
         if use_graph && all_greedy && !any_needs_full_sampling {
             // Fast path: CUDA graph with in-graph argmax. No separate sampling
@@ -5815,19 +5775,9 @@ impl CudaWorker {
         // IMPORTANT: skip graph replay when any logits processor or grammar is
         // active. CUDA graphs replay kernels at captured memory addresses —
         // intermediate forward-pass buffers reuse the same addresses as during
-        // capture. If the grammar/processor GPU tensors (allocated from the
-        // caching allocator's free pool) happen to land on those captured
-        // addresses, the graph replay overwrites them, causing the mask kernel
-        // to read garbage and trigger an illegal-address fault.
-        //
-        // TODO: make grammar/processors compatible with CUDA graphs by
-        // moving processor tensor allocation AFTER graph replay (matching
-        // Python vLLM's architecture where processors are applied after the
-        // forward pass, not before).
-        //
         // `_logits_owned` keeps the OwnedTensor alive for eager-forward paths
         // so the GPU memory backing `logits` survives until sampling completes.
-        let (_logits_owned, logits) = if use_graph && !any_needs_full_sampling {
+        let (_logits_owned, logits) = if use_graph {
             // CUDA graph replay (non-greedy: in-graph argmax result is
             // discarded; we re-sample with temperature on the logits).
             let graph_bs = graph_bs.unwrap();
@@ -6009,7 +5959,6 @@ impl CudaWorker {
             let meta = &prepared.attn_meta;
             let use_prefill_graph = num_reqs == 1
                 && meta.tokens_before[0] == 0
-                && !any_needs_full_sampling
                 && self
                     .prefill_graph_runner
                     .as_ref()
@@ -6243,6 +6192,23 @@ impl CudaWorker {
         // It will be dropped at the end of this function, returning memory to the
         // caching allocator.
 
+        // Update logits processors after forward/graph replay, before sampling.
+        // This ensures processor GPU tensor allocations don't collide with CUDA
+        // graph intermediate addresses.
+        Self::update_logits_processors(
+            self.batch_changed,
+            num_reqs,
+            self.logits_pipeline.as_mut(),
+            &self.sampling_params_map,
+            &self.token_buffers,
+            &self.batch_req_ids,
+            #[cfg(feature = "guided-decoding")]
+            &mut self.grammar_states,
+            &mut self.grammar_processor,
+            &mut self.allowed_token_ids_processor,
+            device,
+        );
+
         // GPU sampling: handles all cases — greedy, non-greedy, penalties,
         // grammar, logit_bias, logprobs — entirely on GPU. No CPU fallback.
         Self::gpu_sample_and_finalize(
@@ -6262,6 +6228,77 @@ impl CudaWorker {
             all_greedy,
             vocab_size,
         )
+    }
+    /// Update logits processor pipeline, grammar, and allowed_token_ids state.
+    /// Called after forward/graph replay and before sampling, so processor GPU
+    /// tensor allocations don't conflict with CUDA graph intermediate addresses
+    /// (matching Python vLLM's architecture).
+    fn update_logits_processors(
+        batch_changed: bool,
+        num_reqs: usize,
+        logits_pipeline: Option<&mut LogitsProcessorPipeline>,
+        sampling_params_map: &HashMap<String, SamplingParams>,
+        token_buffers: &HashMap<String, Vec<u32>>,
+        batch_req_ids: &[String],
+        #[cfg(feature = "guided-decoding")] grammar_states: &mut HashMap<
+            String,
+            vllm_model::grammar::GrammarGuide,
+        >,
+        grammar_processor: &mut GrammarMaskProcessor,
+        allowed_token_ids_processor: &mut AllowedTokenIdsProcessor,
+        device: &mut GpuDevice,
+    ) {
+        let batch_update = if batch_changed {
+            Some(BatchUpdate {
+                batch_size: num_reqs,
+                added: Vec::new(),
+                removed: Vec::new(),
+            })
+        } else {
+            None
+        };
+
+        if let Some(pipeline) = logits_pipeline {
+            pipeline.update_state(
+                batch_update.as_ref(),
+                sampling_params_map,
+                token_buffers,
+                batch_req_ids,
+                device,
+            );
+        }
+
+        #[cfg(feature = "guided-decoding")]
+        {
+            let grammar_reqs: Vec<(usize, Vec<u32>)> = batch_req_ids
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, rid)| {
+                    grammar_states
+                        .get_mut(rid)
+                        .and_then(|g| g.allowed_tokens())
+                        .map(|allowed| (idx, allowed))
+                })
+                .collect();
+            let refs: Vec<(usize, &[u32])> = grammar_reqs
+                .iter()
+                .map(|(idx, v)| (*idx, v.as_slice()))
+                .collect();
+            grammar_processor.update_from_allowed_tokens(&refs, device);
+        }
+        #[cfg(not(feature = "guided-decoding"))]
+        {
+            let empty: Vec<(usize, &[u32])> = Vec::new();
+            grammar_processor.update_from_allowed_tokens(&empty, device);
+        }
+
+        allowed_token_ids_processor.update_state(
+            batch_update.as_ref(),
+            sampling_params_map,
+            token_buffers,
+            batch_req_ids,
+            device,
+        );
     }
 } // end impl CudaWorker (execute_model_inner)
 

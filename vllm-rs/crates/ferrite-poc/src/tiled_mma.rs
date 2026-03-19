@@ -10,7 +10,7 @@
 // Key optimizations (learned from CubeK/Burn):
 // - cp.async.cg.shared.global for async global→shared loads
 // - Double buffering: load buffer N+1 while computing buffer N
-// - B128 swizzle: XOR-based shared memory addressing for bank conflict avoidance
+// - B stored non-transposed in shared memory (enables cp.async for both A and B)
 // - 128-bit vectorized global loads (8 f16 per load)
 
 use anyhow::{Context, Result, bail};
@@ -22,7 +22,7 @@ use inkwell::module::Module;
 use inkwell::builder::Builder;
 use inkwell::targets::{TargetTriple, FileType};
 use inkwell::types::AsTypeRef;
-use inkwell::values::{AsValueRef, BasicValueEnum, IntValue, FloatValue, VectorValue};
+use inkwell::values::{AsValueRef, BasicValueEnum, IntValue, FloatValue};
 use inkwell::{AddressSpace, IntPredicate};
 
 use cudarc::driver::result as cuda;
@@ -174,9 +174,6 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let void_ty = context.void_type();
     let ptr_g = context.ptr_type(AddressSpace::from(1u16));
     let ptr_s = context.ptr_type(AddressSpace::from(3u16));
-    // Vector type: <8 x f16> for 128-bit loads
-    let v8f16_ty = f16_ty.vec_type(8);
-
     // Dynamic shared memory
     let smem_g = module.add_global(
         context.i8_type().array_type(0),
@@ -272,8 +269,9 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     // Issue cp.async: 16 bytes (128 bits = 8 f16)
     build_cp_async_16(&builder, &context, &module, sa_gep, a_gep);
 
-    // ── B tile: vectorized load + transposed store (can't use cp.async for transpose) ──
-    // cp.async copies contiguously; transpose requires scatter. So we still do load+store.
+    // ── cp.async load B tile [16×64 f16] into smem_b (non-transposed, row-major) ──
+    // 128 threads, 1024 f16 = 2048 bytes. Each thread copies 16 bytes.
+    // smem_b layout: [BK × BN] row-major = [16 × 64] f16
     let b_tile_row = builder.build_int_unsigned_div(tid_x8, ci(BN as u64), "btr").unwrap();
     let b_tile_col = builder.build_int_unsigned_rem(tid_x8, ci(BN as u64), "btc").unwrap();
     let b_glob_row = builder.build_int_add(t, b_tile_row, "bgr").unwrap();
@@ -282,18 +280,9 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
         builder.build_int_mul(b_glob_row, n_p, "").unwrap(), b_glob_col, "bi",
     ).unwrap();
     let b_gep = unsafe { builder.build_gep(f16_ty, b_ptr, &[b_idx], "bgep").unwrap() };
-    let b_vec = builder.build_load(v8f16_ty, b_gep, "bvec").unwrap().into_vector_value();
-
-    for j in 0..8u64 {
-        let elem = builder.build_extract_element(b_vec, ci(j), &format!("be{j}")).unwrap();
-        let dst_col = builder.build_int_add(b_tile_col, ci(j), "").unwrap();
-        let bt_idx = builder.build_int_add(
-            builder.build_int_mul(dst_col, ci(BK as u64), "").unwrap(),
-            b_tile_row, "",
-        ).unwrap();
-        let sbt_gep = unsafe { builder.build_gep(f16_ty, smem_bt, &[bt_idx], "").unwrap() };
-        builder.build_store(sbt_gep, elem).unwrap();
-    }
+    // smem_b stored at same offset as smem_bt was
+    let sb_gep = unsafe { builder.build_gep(f16_ty, smem_bt, &[tid_x8], "sbgep").unwrap() };
+    build_cp_async_16(&builder, &context, &module, sb_gep, b_gep);
 
     // Commit cp.async group and wait
     build_cp_async_commit_and_wait(&builder, &context, &module);
@@ -319,20 +308,41 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
         }
     }
 
-    // ── Load B fragments (manual, 2 i32 per register tile col) ──
+    // ── Load B fragments from non-transposed smem_b[BK×BN] ──
+    // For MMA .col access, b[rn][i] packs two f16 from different rows of B:
+    //   b[rn][0] = pack(B[tg*2][col], B[tg*2+1][col])     where col = wx*WN + rn*8 + group
+    //   b[rn][1] = pack(B[tg*2+8][col], B[tg*2+9][col])
+    // In smem_b row-major [BK×BN]: element B[k][n] = smem_b[k * BN + n]
+    // Two values are BN f16 apart — must load individually and pack.
+    let v2f16_ty = f16_ty.vec_type(2);
     let wx_off = builder.build_int_mul(wx, ci(WN as u64), "wxo").unwrap();
     let mut b_frags: Vec<IntValue> = Vec::new();
     for rn in 0..4u64 {
-        let rn_off = builder.build_int_add(wx_off, ci(rn * MMA_N as u64), "rno").unwrap();
-        let bt_row = builder.build_int_add(rn_off, group, "").unwrap();
-        for col_add in [0u64, 8] {
-            let fcol = builder.build_int_add(tg2, ci(col_add), "").unwrap();
-            let idx = builder.build_int_add(
-                builder.build_int_mul(bt_row, ci(BK as u64), "").unwrap(), fcol, "",
+        let b_col = builder.build_int_add(
+            builder.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap(),
+            group, "bcol",
+        ).unwrap();
+        for k_add in [0u64, 8] {
+            let k0 = builder.build_int_add(tg2, ci(k_add), "k0").unwrap();
+            let k1 = builder.build_int_add(k0, ci(1), "k1").unwrap();
+            // Load two f16 from strided positions
+            let idx0 = builder.build_int_add(
+                builder.build_int_mul(k0, ci(BN as u64), "").unwrap(), b_col, "",
             ).unwrap();
-            let gep = unsafe { builder.build_gep(f16_ty, smem_bt, &[idx], "").unwrap() };
-            let val = builder.build_load(i32_ty, gep, "").unwrap().into_int_value();
-            b_frags.push(val);
+            let idx1 = builder.build_int_add(
+                builder.build_int_mul(k1, ci(BN as u64), "").unwrap(), b_col, "",
+            ).unwrap();
+            let gep0 = unsafe { builder.build_gep(f16_ty, smem_bt, &[idx0], "").unwrap() };
+            let gep1 = unsafe { builder.build_gep(f16_ty, smem_bt, &[idx1], "").unwrap() };
+            let v0 = builder.build_load(f16_ty, gep0, "bv0").unwrap();
+            let v1 = builder.build_load(f16_ty, gep1, "bv1").unwrap();
+            // Pack into <2 x f16> then bitcast to i32
+            let vec = builder.build_insert_element(
+                v2f16_ty.get_undef(), v0, ci(0), "bvec0",
+            ).unwrap();
+            let vec = builder.build_insert_element(vec, v1, ci(1), "bvec1").unwrap();
+            let packed = builder.build_bitcast(vec, i32_ty, "bpk").unwrap().into_int_value();
+            b_frags.push(packed);
         }
     }
 

@@ -8,6 +8,7 @@
 //   LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo run -p ferrite-poc --release
 
 mod mma_gemm;
+mod tiled_mma;
 
 use anyhow::{Context, Result, bail};
 use std::ffi::{CString, c_uint, c_void};
@@ -68,6 +69,9 @@ fn main() -> Result<()> {
 
     println!("\n[3/4] MMA GEMM (M=N=K=1024, f16→f32, mma.sync tensor cores)");
     mma_gemm::step3_mma_gemm(&sm)?;
+
+    println!("\n[3b/4] Multi-warp MMA GEMM (4 warps, 64×64 tile, register tiling)");
+    tiled_mma::step3b_multiwarp_gemm(&sm)?;
 
     println!("\n═══════════════════════════════════");
     println!("Phase 0 complete.");

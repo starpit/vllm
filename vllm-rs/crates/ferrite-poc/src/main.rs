@@ -46,7 +46,7 @@ fn main() -> Result<()> {
             b"ferrite\0".as_ptr() as *const i8,
             b"-nvptx-short-ptr\0".as_ptr() as *const i8,
         ];
-        llvm_sys::core::LLVMParseCommandLineOptions(
+        llvm_sys::support::LLVMParseCommandLineOptions(
             2,
             args.as_ptr(),
             std::ptr::null(),

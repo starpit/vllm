@@ -37,7 +37,7 @@ const STAGE_M: u32 = 4; // partitions per stage along M (= num warps)
 
 // Derived
 const STAGE_DIM_M: u32 = STAGE_M * PART_M * TILE_M;  // 4*4*8 = 128
-const STAGE_DIM_N: u32 = PART_N * TILE_N;              // 4*32 = 128
+const STAGE_DIM_N: u32 = 64;                           // Half of CubeK's 128
 const STAGE_DIM_K: u32 = PART_K * TILE_K;              // 2*16 = 32
 const WARPS: u32 = STAGE_M;                            // 4
 const THREADS: u32 = WARPS * 32;                       // 128
@@ -107,15 +107,15 @@ const MMA_K: u32 = 16;
 // and see what happens.
 
 // Warp tile using m16n8k16: each warp does REG_M × REG_N MMAs per K-slice
-const WM: u32 = 32;    // 2 * MMA_M = 32 rows per warp
-const WN: u32 = 128;   // 16 * MMA_N = 128 cols per warp (all cols, warps tile along M only)
+const WM: u32 = 32;    // 2 * MMA_M
+const WN: u32 = 64;    // 8 * MMA_N
 const REG_M: u32 = WM / MMA_M;  // 2
-const REG_N: u32 = WN / MMA_N;  // 16
-// Warps arranged: 4 along M (4*32=128), 1 along N (128)
+const REG_N: u32 = WN / MMA_N;  // 8
+// 4 warps along M (4*32=128), 1 along N (64)
 const WARPS_M: u32 = 4;
 const WARPS_N: u32 = 1;
-// Total MMAs per warp per K-slice: 2*16 = 32 ← matches CubeK!
-// Total MMAs per warp per K-step (2 K-slices): 32*2 = 64
+// MMAs per warp per K-slice: 2*8 = 16
+// MMAs per warp per K-step (2 K-slices): 16*2 = 32
 
 // Swizzle
 const SWIZZLE_MASK: u32 = 0x380;
@@ -384,12 +384,12 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
         build_cp_async_16(&b, &ctx, &module, sa_gep, a_gep);
     }
 
-    for chunk in 0..4u64 {
+    // B: 32×64=2048 f16, 128 threads → 16/thread → 2 cp.async
+    for chunk in 0..2u64 {
         let base = b.build_int_add(
-            b.build_int_mul(tid, ci(32), "").unwrap(),
+            b.build_int_mul(tid, ci(16), "").unwrap(),
             ci(chunk * 8), "",
         ).unwrap();
-        // For B: linear index → (row, col) in [32×128]
         let b_row = b.build_int_unsigned_div(base, ci(STAGE_DIM_N as u64), "").unwrap();
         let b_col = b.build_int_unsigned_rem(base, ci(STAGE_DIM_N as u64), "").unwrap();
         let b_grow = b.build_int_add(t, b_row, "").unwrap();

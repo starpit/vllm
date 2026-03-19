@@ -3888,6 +3888,13 @@ impl CudaWorker {
                 // fields, but the borrow checker can't verify that, so we use a raw
                 // pointer for the shared model access.
                 let self_ptr: *const Self = self;
+
+                // Begin private pool for piecewise captures — blocks allocated during
+                // graph capture stay permanently allocated (matching PyTorch's private
+                // graph pool). Without this, captured graphs hold dangling pointers to
+                // blocks that the caching allocator may reuse.
+                self.device.as_mut().unwrap().caching.begin_allocate_to_pool();
+
                 for &bs in capture_sizes.iter().rev() {
                     info!("Capturing piecewise graphs for batch_size={bs}...");
                     let dev = self.device.as_mut().unwrap();
@@ -3911,6 +3918,9 @@ impl CudaWorker {
                         }
                     }
                 }
+
+                // End private pool — blocks stay tracked for graph lifetime.
+                self.device.as_mut().unwrap().caching.end_allocate_to_pool();
                 if !piecewise_runner.captured_sizes().is_empty() {
                     info!(
                         "Piecewise CUDA graphs captured for batch sizes: {:?}",

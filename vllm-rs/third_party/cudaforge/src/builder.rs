@@ -331,9 +331,15 @@ impl KernelBuilder {
             BuildCache::default()
         };
 
-        // Calculate args hash for cache
+        // Calculate args hash for cache — includes watch file contents so that
+        // header changes (e.g. flash.h struct layout) invalidate all .o files.
         let mut all_args = self.extra_args.clone();
         all_args.extend(dep_args.clone());
+        for watch_path in self.sources.watch_paths() {
+            if let Ok(h) = crate::hash::hash_file(&watch_path) {
+                all_args.push(h);
+            }
+        }
         let args_hash = hash_args(&all_args);
 
         // Determine which files need compilation

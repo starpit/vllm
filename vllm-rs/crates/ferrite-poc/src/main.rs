@@ -38,8 +38,23 @@ fn main() -> Result<()> {
     println!("Ferrite Phase 0 — Proof of Concept");
     println!("═══════════════════════════════════\n");
 
+    // Set -nvptx-short-ptr BEFORE initializing NVPTX target.
+    // This makes addrspace(3) shared memory pointers 32-bit instead of 64-bit.
+    // Critical for register usage — same trick Triton uses.
+    unsafe {
+        let args: [*const i8; 2] = [
+            b"ferrite\0".as_ptr() as *const i8,
+            b"-nvptx-short-ptr\0".as_ptr() as *const i8,
+        ];
+        llvm_sys::core::LLVMParseCommandLineOptions(
+            2,
+            args.as_ptr(),
+            std::ptr::null(),
+        );
+    }
+
     Target::initialize_nvptx(&InitializationConfig::default());
-    println!("[llvm] NVPTX target initialized");
+    println!("[llvm] NVPTX target initialized (with -nvptx-short-ptr)");
 
     cuda::init()?;
     let device = cuda::device::get(0)?;

@@ -265,18 +265,7 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
     let module = ctx.create_module("ferrite_cubek_gemm");
     let b = ctx.create_builder();
 
-    // Set data layout with p3:32:32 (Triton's -nvptx-short-ptr trick).
-    // This makes addrspace(3) shared memory pointers 32-bit instead of 64-bit,
-    // critically reducing register usage for shared memory access.
-    {
-        let base = machine.get_target_data().get_data_layout();
-        let base_str = base.as_str().to_string_lossy();
-        let layout_str = format!("{}-p3:32:32-p4:32:32-p5:32:32", base_str);
-        let layout_cstr = std::ffi::CString::new(layout_str).unwrap();
-        unsafe {
-            llvm_sys::core::LLVMSetDataLayout(module.as_mut_ptr(), layout_cstr.as_ptr());
-        }
-    }
+    module.set_data_layout(&machine.get_target_data().get_data_layout());
     module.set_triple(&TargetTriple::create("nvptx64-nvidia-cuda"));
 
     let i32_ty = ctx.i32_type();

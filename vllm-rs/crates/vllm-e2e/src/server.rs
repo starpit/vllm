@@ -516,6 +516,11 @@ fn resolve_binary_path() -> Result<std::path::PathBuf> {
             .is_some_and(|n| n == "release");
 
         let mut cmd = std::process::Command::new("cargo");
+        // Clear CARGO_MANIFEST_DIR — the test runner sets it to vllm-e2e's
+        // directory, but if it leaks into this nested cargo build, ring's
+        // build script records the wrong value in its fingerprint, causing
+        // every subsequent `cargo build` to recompile the entire TLS stack.
+        cmd.env_remove("CARGO_MANIFEST_DIR");
         cmd.arg("build").arg("-p").arg("vllm-cli");
         if is_release {
             cmd.arg("--release");

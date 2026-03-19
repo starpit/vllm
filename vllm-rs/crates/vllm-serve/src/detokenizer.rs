@@ -778,9 +778,7 @@ mod tests {
         let mut detok =
             IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
 
-        let full = tok
-            .encode(&format!("{prompt} hello world"), false)
-            .unwrap();
+        let full = tok.encode(&format!("{prompt} hello world"), false).unwrap();
         let new_ids = &full[prompt_ids.len()..];
 
         // Add tokens one by one and check output never ends with replacement char
@@ -834,12 +832,16 @@ mod tests {
             IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
 
         // Mix of ASCII and multibyte UTF-8
-        let test_strings = vec![" hello", " \u{4e16}\u{754c}", " \u{645}\u{631}\u{62d}\u{628}\u{627}", " \u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}", " \u{1f30d}"];
+        let test_strings = vec![
+            " hello",
+            " \u{4e16}\u{754c}",
+            " \u{645}\u{631}\u{62d}\u{628}\u{627}",
+            " \u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}",
+            " \u{1f30d}",
+        ];
 
         for test_str in test_strings {
-            let full = tok
-                .encode(&format!("{prompt}{test_str}"), false)
-                .unwrap();
+            let full = tok.encode(&format!("{prompt}{test_str}"), false).unwrap();
             let new_ids = &full[prompt_ids.len()..];
 
             detok.update(new_ids, false);

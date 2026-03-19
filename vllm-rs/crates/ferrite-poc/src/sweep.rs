@@ -357,28 +357,41 @@ pub fn run_sweep(sm: &str) -> Result<()> {
 
     let configs: Vec<(u32,u32,u32,u32,u32,bool,bool)> = vec![
         // (bm, bn, bk, wm, wn, swizzle, cp_async)
-        // 32×32
-        (32,32,16,16,16,true,true), (32,32,16,16,16,false,true), (32,32,16,16,16,true,false),
-        // 64×32, 32×64
-        (64,32,16,32,16,true,true), (64,32,16,32,32,true,true),
-        (32,64,16,16,32,true,true), (32,64,16,32,32,true,true),
-        // 64×64 — various warp layouts
-        (64,64,16,32,32,true,true), (64,64,16,32,32,false,true), (64,64,16,32,32,true,false), (64,64,16,32,32,false,false),
-        (64,64,16,64,16,true,true), (64,64,16,16,64,true,true),
-        (64,64,16,32,16,true,true), (64,64,16,16,32,true,true),
-        // 128×32
-        (128,32,16,32,16,true,true), (128,32,16,32,32,true,true),
-        // 32×128
-        (32,128,16,16,32,true,true), (32,128,16,32,32,true,true),
-        // 128×64
-        (128,64,16,32,32,true,true), (128,64,16,64,32,true,true), (128,64,16,32,64,true,true),
-        // 64×128
-        (64,128,16,32,32,true,true), (64,128,16,32,64,true,true), (64,128,16,64,32,true,true),
-        // 128×128
-        (128,128,16,32,32,true,true), (128,128,16,64,32,true,true), (128,128,16,32,64,true,true),
-        (128,128,16,64,64,true,true),
-        // BK=32
-        (64,64,32,32,32,true,true), (64,64,32,32,32,false,true),
+        // ── Explore around the winner: 64×64 w64×16 ──
+        (64,64,16,64,16,true,true),   // winner from round 1
+        (64,64,16,64,16,false,true),  // no swizzle
+        (64,64,16,64,16,true,false),  // no cp.async
+        // Tall warp variations at 64×64
+        (64,64,16,64,8,true,true),    // w64×8 = 4×1 = 4 MMAs (very tall)
+        (64,64,16,64,32,true,true),   // w64×32 = 4×4 = 16 MMAs
+        // Other warp shapes at 64×64
+        (64,64,16,32,32,true,true),   // baseline
+        (64,64,16,16,64,true,true),   // wide
+        (64,64,16,48,16,true,true),   // 3×2 if valid
+        // ── Asymmetric block tiles with w64×16 ──
+        (64,32,16,64,16,true,true),   // narrow block
+        (64,48,16,64,16,true,true),   // medium block (may not divide)
+        (64,128,16,64,16,true,true),  // wide block (8 warps)
+        (128,32,16,64,16,true,true),  // tall block
+        (128,64,16,64,16,true,true),  // tall-wide (8 warps)
+        // ── 96×64 and 64×96 (non-power-of-2) ──
+        (96,64,16,48,32,true,true),
+        (64,96,16,32,48,true,true),
+        // ── Larger tiles with tall warps ──
+        (128,64,16,64,32,true,true),
+        (128,64,16,128,16,true,true), // very tall warp
+        (128,128,16,64,32,true,true),
+        (128,128,16,128,16,true,true),
+        // ── BK variations on the winner ──
+        (64,64,32,64,16,true,true),
+        (64,64,8,64,16,true,true),    // smaller BK
+        // ── 2 warps only ──
+        (64,32,16,64,16,true,true),
+        (32,64,16,32,32,true,true),
+        (64,16,16,64,16,true,true),   // very narrow
+        // ── 8 warps ──
+        (64,64,16,32,8,true,true),    // 8 warps in 2×4
+        (64,64,16,16,8,true,true),    // 8 warps in 4×2 ... wait that's 16×8=2 MMAs
     ];
 
     for (bm,bn,bk,wm,wn,sw,cp) in &configs {

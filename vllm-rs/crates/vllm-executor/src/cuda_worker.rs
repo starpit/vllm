@@ -3653,7 +3653,9 @@ impl CudaWorker {
                         layer.post_attention_layernorm.eps,
                         device.compute_stream,
                     );
-                    layer.block_sparse_moe.forward(TensorView::from_raw(attn_out), device)
+                    layer
+                        .block_sparse_moe
+                        .forward(TensorView::from_raw(attn_out), device)
                 }
             }
             _ => {
@@ -3748,8 +3750,11 @@ impl CudaWorker {
                         m.model.norm.inner.eps,
                         device.compute_stream,
                     );
-                    m.lm_head
-                        .forward(TensorView::from_raw(hidden), &mut device.cublas, &mut device.caching)
+                    m.lm_head.forward(
+                        TensorView::from_raw(hidden),
+                        &mut device.cublas,
+                        &mut device.caching,
+                    )
                 }
             }
             Some(CudaModel::Gemma3(m)) => unsafe {
@@ -3760,8 +3765,11 @@ impl CudaWorker {
                     m.model.norm.inner.eps,
                     device.compute_stream,
                 );
-                m.lm_head
-                    .forward(TensorView::from_raw(hidden), &mut device.cublas, &mut device.caching)
+                m.lm_head.forward(
+                    TensorView::from_raw(hidden),
+                    &mut device.cublas,
+                    &mut device.caching,
+                )
             },
             Some(CudaModel::Qwen3Moe(m)) => unsafe {
                 vllm_cuda::kernels::fused_add_rms_norm_inplace(
@@ -3771,8 +3779,11 @@ impl CudaWorker {
                     m.model.norm.eps,
                     device.compute_stream,
                 );
-                m.lm_head
-                    .forward(TensorView::from_raw(hidden), &mut device.cublas, &mut device.caching)
+                m.lm_head.forward(
+                    TensorView::from_raw(hidden),
+                    &mut device.cublas,
+                    &mut device.caching,
+                )
             },
             Some(CudaModel::Qwen2Moe(m)) => unsafe {
                 vllm_cuda::kernels::fused_add_rms_norm_inplace(
@@ -3782,8 +3793,11 @@ impl CudaWorker {
                     m.model.norm.eps,
                     device.compute_stream,
                 );
-                m.lm_head
-                    .forward(TensorView::from_raw(hidden), &mut device.cublas, &mut device.caching)
+                m.lm_head.forward(
+                    TensorView::from_raw(hidden),
+                    &mut device.cublas,
+                    &mut device.caching,
+                )
             },
             Some(CudaModel::Mixtral(m)) => unsafe {
                 vllm_cuda::kernels::fused_add_rms_norm_inplace(
@@ -3793,8 +3807,11 @@ impl CudaWorker {
                     m.model.norm.eps,
                     device.compute_stream,
                 );
-                m.lm_head
-                    .forward(TensorView::from_raw(hidden), &mut device.cublas, &mut device.caching)
+                m.lm_head.forward(
+                    TensorView::from_raw(hidden),
+                    &mut device.cublas,
+                    &mut device.caching,
+                )
             },
             _ => {
                 return Err(ExecutorError::WorkerExecution(
@@ -3940,63 +3957,57 @@ impl CudaWorker {
                 let layer = &m.model.layers[layer_idx];
                 let rotary = &m.model.rotary;
                 Ok(unsafe {
-                    layer
-                        .self_attn
-                        .forward(
-                            TensorView::from_raw(attn_input),
-                            TensorView::from_raw(positions),
-                            TensorView::from_raw(slot_mapping),
-                            TensorView::from_raw(cu_seqlens_q),
-                            TensorView::from_raw(seqused_k),
-                            TensorView::from_raw(block_table),
-                            max_seqlen_q,
-                            max_seqlen_k,
-                            kv_cache,
-                            rotary,
-                            device,
-                        )
+                    layer.self_attn.forward(
+                        TensorView::from_raw(attn_input),
+                        TensorView::from_raw(positions),
+                        TensorView::from_raw(slot_mapping),
+                        TensorView::from_raw(cu_seqlens_q),
+                        TensorView::from_raw(seqused_k),
+                        TensorView::from_raw(block_table),
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        kv_cache,
+                        rotary,
+                        device,
+                    )
                 })
             }
             Some(CudaModel::Qwen2(m)) => {
                 let layer = &m.0.model.layers[layer_idx];
                 let rotary = &m.0.model.rotary;
                 Ok(unsafe {
-                    layer
-                        .self_attn
-                        .forward(
-                            TensorView::from_raw(attn_input),
-                            TensorView::from_raw(positions),
-                            TensorView::from_raw(slot_mapping),
-                            TensorView::from_raw(cu_seqlens_q),
-                            TensorView::from_raw(seqused_k),
-                            TensorView::from_raw(block_table),
-                            max_seqlen_q,
-                            max_seqlen_k,
-                            kv_cache,
-                            rotary,
-                            device,
-                        )
+                    layer.self_attn.forward(
+                        TensorView::from_raw(attn_input),
+                        TensorView::from_raw(positions),
+                        TensorView::from_raw(slot_mapping),
+                        TensorView::from_raw(cu_seqlens_q),
+                        TensorView::from_raw(seqused_k),
+                        TensorView::from_raw(block_table),
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        kv_cache,
+                        rotary,
+                        device,
+                    )
                 })
             }
             Some(CudaModel::Gemma2(m)) => {
                 let layer = &m.model.layers[layer_idx];
                 let rotary = &m.model.rotary;
                 Ok(unsafe {
-                    layer
-                        .self_attn
-                        .forward(
-                            TensorView::from_raw(attn_input),
-                            TensorView::from_raw(positions),
-                            TensorView::from_raw(slot_mapping),
-                            TensorView::from_raw(cu_seqlens_q),
-                            TensorView::from_raw(seqused_k),
-                            TensorView::from_raw(block_table),
-                            max_seqlen_q,
-                            max_seqlen_k,
-                            kv_cache,
-                            rotary,
-                            device,
-                        )
+                    layer.self_attn.forward(
+                        TensorView::from_raw(attn_input),
+                        TensorView::from_raw(positions),
+                        TensorView::from_raw(slot_mapping),
+                        TensorView::from_raw(cu_seqlens_q),
+                        TensorView::from_raw(seqused_k),
+                        TensorView::from_raw(block_table),
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        kv_cache,
+                        rotary,
+                        device,
+                    )
                 })
             }
             Some(CudaModel::Gemma3(m)) => {
@@ -4009,84 +4020,76 @@ impl CudaWorker {
                     &m.model.rotary_global
                 };
                 Ok(unsafe {
-                    layer
-                        .self_attn
-                        .forward(
-                            TensorView::from_raw(attn_input),
-                            TensorView::from_raw(positions),
-                            TensorView::from_raw(slot_mapping),
-                            TensorView::from_raw(cu_seqlens_q),
-                            TensorView::from_raw(seqused_k),
-                            TensorView::from_raw(block_table),
-                            max_seqlen_q,
-                            max_seqlen_k,
-                            kv_cache,
-                            rotary,
-                            device,
-                        )
+                    layer.self_attn.forward(
+                        TensorView::from_raw(attn_input),
+                        TensorView::from_raw(positions),
+                        TensorView::from_raw(slot_mapping),
+                        TensorView::from_raw(cu_seqlens_q),
+                        TensorView::from_raw(seqused_k),
+                        TensorView::from_raw(block_table),
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        kv_cache,
+                        rotary,
+                        device,
+                    )
                 })
             }
             Some(CudaModel::Qwen3Moe(m)) => {
                 let layer = &m.model.layers[layer_idx];
                 let rotary = &m.model.rotary;
                 Ok(unsafe {
-                    layer
-                        .self_attn
-                        .forward(
-                            TensorView::from_raw(attn_input),
-                            TensorView::from_raw(positions),
-                            TensorView::from_raw(slot_mapping),
-                            TensorView::from_raw(cu_seqlens_q),
-                            TensorView::from_raw(seqused_k),
-                            TensorView::from_raw(block_table),
-                            max_seqlen_q,
-                            max_seqlen_k,
-                            kv_cache,
-                            rotary,
-                            device,
-                        )
+                    layer.self_attn.forward(
+                        TensorView::from_raw(attn_input),
+                        TensorView::from_raw(positions),
+                        TensorView::from_raw(slot_mapping),
+                        TensorView::from_raw(cu_seqlens_q),
+                        TensorView::from_raw(seqused_k),
+                        TensorView::from_raw(block_table),
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        kv_cache,
+                        rotary,
+                        device,
+                    )
                 })
             }
             Some(CudaModel::Qwen2Moe(m)) => {
                 let layer = &m.model.layers[layer_idx];
                 let rotary = &m.model.rotary;
                 Ok(unsafe {
-                    layer
-                        .self_attn
-                        .forward(
-                            TensorView::from_raw(attn_input),
-                            TensorView::from_raw(positions),
-                            TensorView::from_raw(slot_mapping),
-                            TensorView::from_raw(cu_seqlens_q),
-                            TensorView::from_raw(seqused_k),
-                            TensorView::from_raw(block_table),
-                            max_seqlen_q,
-                            max_seqlen_k,
-                            kv_cache,
-                            rotary,
-                            device,
-                        )
+                    layer.self_attn.forward(
+                        TensorView::from_raw(attn_input),
+                        TensorView::from_raw(positions),
+                        TensorView::from_raw(slot_mapping),
+                        TensorView::from_raw(cu_seqlens_q),
+                        TensorView::from_raw(seqused_k),
+                        TensorView::from_raw(block_table),
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        kv_cache,
+                        rotary,
+                        device,
+                    )
                 })
             }
             Some(CudaModel::Mixtral(m)) => {
                 let layer = &m.model.layers[layer_idx];
                 let rotary = &m.model.rotary;
                 Ok(unsafe {
-                    layer
-                        .self_attn
-                        .forward(
-                            TensorView::from_raw(attn_input),
-                            TensorView::from_raw(positions),
-                            TensorView::from_raw(slot_mapping),
-                            TensorView::from_raw(cu_seqlens_q),
-                            TensorView::from_raw(seqused_k),
-                            TensorView::from_raw(block_table),
-                            max_seqlen_q,
-                            max_seqlen_k,
-                            kv_cache,
-                            rotary,
-                            device,
-                        )
+                    layer.self_attn.forward(
+                        TensorView::from_raw(attn_input),
+                        TensorView::from_raw(positions),
+                        TensorView::from_raw(slot_mapping),
+                        TensorView::from_raw(cu_seqlens_q),
+                        TensorView::from_raw(seqused_k),
+                        TensorView::from_raw(block_table),
+                        max_seqlen_q,
+                        max_seqlen_k,
+                        kv_cache,
+                        rotary,
+                        device,
+                    )
                 })
             }
             _ => Err(ExecutorError::WorkerExecution(
@@ -5513,10 +5516,11 @@ impl Worker for CudaWorker {
             return Ok(());
         }
 
-        let (mut model, mut kv_cache, mut device) = match (&self.model, &self.kv_cache, &mut self.device) {
-            (Some(m), Some(kv), Some(d)) => (m, kv, d),
-            _ => return Ok(()), // Not fully initialized yet.
-        };
+        let (mut model, mut kv_cache, mut device) =
+            match (&self.model, &self.kv_cache, &mut self.device) {
+                (Some(m), Some(kv), Some(d)) => (m, kv, d),
+                _ => return Ok(()), // Not fully initialized yet.
+            };
 
         unsafe { driver::ctx_set_current(device.ctx) }
             .map_err(|e| ExecutorError::WorkerInit(format!("ctx_set_current: {e}")))?;
@@ -5617,111 +5621,109 @@ impl Worker for CudaWorker {
         if !should_capture_monolithic {
             // Skip to prefill graphs / cublas autotune.
         } else {
+            let mut runner = unsafe { CudaGraphRunner::new(max_bs, vocab_size, self.model_dtype) }
+                .map_err(|e| ExecutorError::WorkerInit(format!("CudaGraphRunner::new: {e}")))?;
 
-        let mut runner = unsafe { CudaGraphRunner::new(max_bs, vocab_size, self.model_dtype) }
-            .map_err(|e| ExecutorError::WorkerInit(format!("CudaGraphRunner::new: {e}")))?;
-
-        // FP8 KV cache: allocate persistent dequant buffers and cache scales.
-        if self.kv_cache_is_fp8 {
-            unsafe {
-                runner
-                    .init_fp8_buffers(
-                        padded_max_seqlen_k,
-                        kv_cache.num_kv_heads,
-                        kv_cache.head_dim,
-                        self.model_dtype,
-                    )
-                    .map_err(|e| ExecutorError::WorkerInit(format!("init_fp8_buffers: {e}")))?;
-                runner
-                    .cache_fp8_scales(kv_cache, device.compute_stream)
-                    .map_err(|e| ExecutorError::WorkerInit(format!("cache_fp8_scales: {e}")))?;
-            }
-        }
-
-        // Begin private pool for ALL graph captures (like PyTorch's shared graph pool).
-        // One pool is shared across all batch sizes so blocks are reused.
-        device.caching.begin_allocate_to_pool();
-
-        // Set FP8 graph context thread-local so attention helpers use pre-allocated path.
-        if let Some(ctx) = runner.fp8_graph_ctx() {
-            vllm_cuda::model::attention_helpers::set_fp8_graph_ctx(ctx);
-        }
-
-        // Capture largest batch sizes first (matching Python vLLM). The first
-        // capture establishes the pool's high-water mark; subsequent smaller
-        // captures reuse the same memory — preventing incremental pool growth
-        // that could OOM the driver.
-        for &bs in capture_sizes.iter().rev() {
-            info!("Capturing CUDA graph for batch_size={bs}...");
-            let kv_ref = kv_cache;
-            let model_ref = model;
-
-            let result = unsafe {
-                runner.capture(bs, device, |inputs, dev| {
-                    model_ref.forward(
-                        TensorView::from_raw(inputs.input_ids),
-                        TensorView::from_raw(inputs.positions),
-                        TensorView::from_raw(inputs.slot_mapping),
-                        TensorView::from_raw(inputs.cu_seqlens_q),
-                        TensorView::from_raw(inputs.seqused_k),
-                        TensorView::from_raw(inputs.block_table),
-                        1, // max_seqlen_q = 1 for decode
-                        padded_max_seqlen_k,
-                        kv_ref,
-                        dev,
-                        None, // no last_token_indices (decode: all tokens are last)
-                    )
-                })
-            };
-
-            match result {
-                Ok(()) => info!("CUDA graph captured for batch_size={bs}"),
-                Err(e) => {
-                    tracing::warn!("Failed to capture CUDA graph for bs={bs}: {e}");
-                    // Stop immediately — CUDA_ERROR_ILLEGAL_ADDRESS poisons the
-                    // entire CUDA context. Piecewise graphs are the fallback.
-                    monolithic_failed = true;
-                    break;
+            // FP8 KV cache: allocate persistent dequant buffers and cache scales.
+            if self.kv_cache_is_fp8 {
+                unsafe {
+                    runner
+                        .init_fp8_buffers(
+                            padded_max_seqlen_k,
+                            kv_cache.num_kv_heads,
+                            kv_cache.head_dim,
+                            self.model_dtype,
+                        )
+                        .map_err(|e| ExecutorError::WorkerInit(format!("init_fp8_buffers: {e}")))?;
+                    runner
+                        .cache_fp8_scales(kv_cache, device.compute_stream)
+                        .map_err(|e| ExecutorError::WorkerInit(format!("cache_fp8_scales: {e}")))?;
                 }
             }
-        }
 
-        // Clear FP8 graph context thread-local.
-        vllm_cuda::model::attention_helpers::clear_fp8_graph_ctx();
+            // Begin private pool for ALL graph captures (like PyTorch's shared graph pool).
+            // One pool is shared across all batch sizes so blocks are reused.
+            device.caching.begin_allocate_to_pool();
 
-        // End private pool after all captures. Blocks in the pool that are
-        // still free are effectively owned by the captured graphs.
-        device.caching.end_allocate_to_pool();
+            // Set FP8 graph context thread-local so attention helpers use pre-allocated path.
+            if let Some(ctx) = runner.fp8_graph_ctx() {
+                vllm_cuda::model::attention_helpers::set_fp8_graph_ctx(ctx);
+            }
 
-        if monolithic_failed {
-            // Context is poisoned — discard any partially captured graphs.
-            // Don't attempt staging allocation. Piecewise is the fallback.
-            tracing::warn!(
-                "Discarding monolithic graphs (context poisoned). \
+            // Capture largest batch sizes first (matching Python vLLM). The first
+            // capture establishes the pool's high-water mark; subsequent smaller
+            // captures reuse the same memory — preventing incremental pool growth
+            // that could OOM the driver.
+            for &bs in capture_sizes.iter().rev() {
+                info!("Capturing CUDA graph for batch_size={bs}...");
+                let kv_ref = kv_cache;
+                let model_ref = model;
+
+                let result = unsafe {
+                    runner.capture(bs, device, |inputs, dev| {
+                        model_ref.forward(
+                            TensorView::from_raw(inputs.input_ids),
+                            TensorView::from_raw(inputs.positions),
+                            TensorView::from_raw(inputs.slot_mapping),
+                            TensorView::from_raw(inputs.cu_seqlens_q),
+                            TensorView::from_raw(inputs.seqused_k),
+                            TensorView::from_raw(inputs.block_table),
+                            1, // max_seqlen_q = 1 for decode
+                            padded_max_seqlen_k,
+                            kv_ref,
+                            dev,
+                            None, // no last_token_indices (decode: all tokens are last)
+                        )
+                    })
+                };
+
+                match result {
+                    Ok(()) => info!("CUDA graph captured for batch_size={bs}"),
+                    Err(e) => {
+                        tracing::warn!("Failed to capture CUDA graph for bs={bs}: {e}");
+                        // Stop immediately — CUDA_ERROR_ILLEGAL_ADDRESS poisons the
+                        // entire CUDA context. Piecewise graphs are the fallback.
+                        monolithic_failed = true;
+                        break;
+                    }
+                }
+            }
+
+            // Clear FP8 graph context thread-local.
+            vllm_cuda::model::attention_helpers::clear_fp8_graph_ctx();
+
+            // End private pool after all captures. Blocks in the pool that are
+            // still free are effectively owned by the captured graphs.
+            device.caching.end_allocate_to_pool();
+
+            if monolithic_failed {
+                // Context is poisoned — discard any partially captured graphs.
+                // Don't attempt staging allocation. Piecewise is the fallback.
+                tracing::warn!(
+                    "Discarding monolithic graphs (context poisoned). \
                  Piecewise graphs will handle all decode batches."
-            );
-        } else if !runner.captured_sizes().is_empty() {
-            info!(
-                "CUDA graphs captured for batch sizes: {:?}",
-                runner.captured_sizes()
-            );
-            // Allocate pinned host staging buffers sized for the largest captured graph.
-            let staging_max_bs = *runner.captured_sizes().last().unwrap();
-            match unsafe { HostStaging::new(staging_max_bs) } {
-                Ok(staging) => {
-                    info!(
-                        "Pinned host staging allocated for max_batch={}",
-                        staging_max_bs
-                    );
-                    self.host_staging = Some(staging);
+                );
+            } else if !runner.captured_sizes().is_empty() {
+                info!(
+                    "CUDA graphs captured for batch sizes: {:?}",
+                    runner.captured_sizes()
+                );
+                // Allocate pinned host staging buffers sized for the largest captured graph.
+                let staging_max_bs = *runner.captured_sizes().last().unwrap();
+                match unsafe { HostStaging::new(staging_max_bs) } {
+                    Ok(staging) => {
+                        info!(
+                            "Pinned host staging allocated for max_batch={}",
+                            staging_max_bs
+                        );
+                        self.host_staging = Some(staging);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to allocate pinned staging: {e}");
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to allocate pinned staging: {e}");
-                }
+                self.graph_runner = Some(runner);
             }
-            self.graph_runner = Some(runner);
-        }
-
         } // end should_capture_monolithic
 
         // -----------------------------------------------------------------------
@@ -6461,41 +6463,41 @@ impl CudaWorker {
             && let (Some(token_plus), Some(kv_cache)) =
                 (self.spans_config.token_plus, self.kv_cache.as_mut())
         {
-                let meta = &prepared.attn_meta;
-                for i in 0..meta.num_reqs {
-                    let req_id = &meta.req_ids[i];
-                    if let Some(all_tokens) = self.token_buffers.get(req_id) {
-                        let block_ids = &meta.block_ids[i];
-                        let tokens_before = meta.tokens_before[i];
-                        let seq_len = meta.seq_lens[i];
-                        for (block_idx, &physical_block) in block_ids.iter().enumerate() {
-                            let block_start_pos = block_idx * block_size;
-                            if block_start_pos >= seq_len {
-                                break; // past the end of the sequence
-                            }
-                            let is_span = block_start_pos < all_tokens.len()
-                                && all_tokens[block_start_pos] == token_plus;
-                            // Block was written in a PRIOR step if its last
-                            // token position < tokens_before (i.e., fully cached).
-                            let block_end_pos = (block_start_pos + block_size).min(seq_len);
-                            let was_previously_written = block_end_pos <= tokens_before;
-                            // is_unrotated: span blocks from prior steps have
-                            // unrotated K (from the post-attention un-rotation pass).
-                            // Freshly written blocks have rotated K.
-                            let is_unrotated = is_span && was_previously_written;
-                            kv_cache.mark_block(physical_block, is_span, is_unrotated);
+            let meta = &prepared.attn_meta;
+            for i in 0..meta.num_reqs {
+                let req_id = &meta.req_ids[i];
+                if let Some(all_tokens) = self.token_buffers.get(req_id) {
+                    let block_ids = &meta.block_ids[i];
+                    let tokens_before = meta.tokens_before[i];
+                    let seq_len = meta.seq_lens[i];
+                    for (block_idx, &physical_block) in block_ids.iter().enumerate() {
+                        let block_start_pos = block_idx * block_size;
+                        if block_start_pos >= seq_len {
+                            break; // past the end of the sequence
                         }
+                        let is_span = block_start_pos < all_tokens.len()
+                            && all_tokens[block_start_pos] == token_plus;
+                        // Block was written in a PRIOR step if its last
+                        // token position < tokens_before (i.e., fully cached).
+                        let block_end_pos = (block_start_pos + block_size).min(seq_len);
+                        let was_previously_written = block_end_pos <= tokens_before;
+                        // is_unrotated: span blocks from prior steps have
+                        // unrotated K (from the post-attention un-rotation pass).
+                        // Freshly written blocks have rotated K.
+                        let is_unrotated = is_span && was_previously_written;
+                        kv_cache.mark_block(physical_block, is_span, is_unrotated);
                     }
                 }
-                // Upload flags to GPU for the attention kernel.
-                unsafe {
-                    let stream = self
-                        .device
-                        .as_ref()
-                        .map(|d| d.compute_stream)
-                        .unwrap_or(std::ptr::null_mut());
-                    kv_cache.sync_block_flags_to_gpu(stream);
-                }
+            }
+            // Upload flags to GPU for the attention kernel.
+            unsafe {
+                let stream = self
+                    .device
+                    .as_ref()
+                    .map(|d| d.compute_stream)
+                    .unwrap_or(std::ptr::null_mut());
+                kv_cache.sync_block_flags_to_gpu(stream);
+            }
         }
 
         // Split borrows: model + kv_cache (shared) vs device (mutable).

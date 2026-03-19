@@ -4656,14 +4656,15 @@ pub unsafe fn cast_from_f32_into(
     let n_i = n as c_int;
     match target_dtype {
         DType::F32 => {
-            crate::driver::memcpy_dtod_async(
-                output, input as *const u8, n * 4, stream,
-            )
-            .expect("cast_from_f32_into: D2D copy failed");
+            crate::driver::memcpy_dtod_async(output, input as *const u8, n * 4, stream)
+                .expect("cast_from_f32_into: D2D copy failed");
         }
         DType::F16 => cast_from_f32_f16(output as *mut u16, input, n_i, stream),
         DType::BF16 => cast_from_f32_bf16(output as *mut u16, input, n_i, stream),
-        _ => panic!("cast_from_f32_into: unsupported target dtype {:?}", target_dtype),
+        _ => panic!(
+            "cast_from_f32_into: unsupported target dtype {:?}",
+            target_dtype
+        ),
     }
 }
 

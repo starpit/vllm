@@ -1449,7 +1449,11 @@ impl DeepSeekV2ForCausalLM {
                         let out_ptr = unsafe { driver::mem_alloc(out_bytes)? };
                         unsafe {
                             crate::ggml::ggml_dequantize_f16(
-                                s.ptr, out_ptr as *mut u16, s.dtype, elem_count, stream,
+                                s.ptr,
+                                out_ptr as *mut u16,
+                                s.dtype,
+                                elem_count,
+                                stream,
                             );
                             driver::stream_synchronize(stream)?;
                             driver::mem_free(s.ptr)?;
@@ -1463,7 +1467,11 @@ impl DeepSeekV2ForCausalLM {
                         let f32_ptr = unsafe { driver::mem_alloc(f32_bytes)? };
                         unsafe {
                             crate::ggml::ggml_dequantize_f32(
-                                s.ptr, f32_ptr as *mut f32, s.dtype, elem_count, stream,
+                                s.ptr,
+                                f32_ptr as *mut f32,
+                                s.dtype,
+                                elem_count,
+                                stream,
                             );
                             driver::stream_synchronize(stream)?;
                             driver::mem_free(s.ptr)?;
@@ -1481,8 +1489,7 @@ impl DeepSeekV2ForCausalLM {
                             driver::stream_synchronize(stream)?;
                             driver::mem_free(f32_ptr)?;
                         }
-                        let tensor =
-                            unsafe { GpuTensor::new(out_ptr, &[nrows, ncols], dtype) };
+                        let tensor = unsafe { GpuTensor::new(out_ptr, &[nrows, ncols], dtype) };
                         Ok(Linear::new(tensor, None))
                     }
                 }

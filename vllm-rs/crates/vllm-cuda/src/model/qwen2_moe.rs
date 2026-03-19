@@ -98,7 +98,11 @@ pub enum Qwen2MoeMlp {
 }
 
 impl Qwen2MoeMlp {
-    pub unsafe fn forward(&self, hidden_states: TensorView<'_>, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
         match self {
             Self::Dense(mlp) => mlp.forward(hidden_states, device),
             Self::MoE {

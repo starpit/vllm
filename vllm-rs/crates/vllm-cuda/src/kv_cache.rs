@@ -148,12 +148,16 @@ impl KvCachePool {
             block_is_unrotated: vec![false; num_blocks],
             block_is_span: vec![false; num_blocks],
             block_unrotated_gpu_ptr: if vllm_config::SpansConfig::from_env().fuse_rope() {
-                driver::mem_alloc(num_blocks).ok().map(|p| RawGpuMem::new(p, num_blocks))
+                driver::mem_alloc(num_blocks)
+                    .ok()
+                    .map(|p| RawGpuMem::new(p, num_blocks))
             } else {
                 None
             },
             block_span_gpu_ptr: if vllm_config::SpansConfig::from_env().fuse_rope() {
-                driver::mem_alloc(num_blocks).ok().map(|p| RawGpuMem::new(p, num_blocks))
+                driver::mem_alloc(num_blocks)
+                    .ok()
+                    .map(|p| RawGpuMem::new(p, num_blocks))
             } else {
                 None
             },

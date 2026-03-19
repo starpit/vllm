@@ -404,6 +404,20 @@ pub fn run_sweep(sm: &str) -> Result<()> {
         (256,32,16,64,32,true,true),
         // ── BK=32 with winner ──
         (64,64,32,64,16,true,true),
+        // ── 8 warps (256 threads) — fewer MMAs per warp ──
+        (64,64,16,16,8,true,true),    // 4×8 warps, 1×1=1 MMA each, 4 acc
+        (64,64,16,32,8,true,true),    // 2×8 warps, 2×1=2 MMAs, 8 acc
+        (64,64,16,16,32,true,true),   // 4×2 warps, 1×4=4 MMAs, 16 acc
+        (64,64,16,32,16,true,true),   // 2×4 warps, 2×2=4 MMAs, 16 acc
+        // ── 16 warps (512 threads) ──
+        (64,64,16,16,16,true,true),   // 4×4 warps, 1×2=2 MMAs, 8 acc
+        // ── 64×64 with 2 warps (64 threads) — more MMAs per warp ──
+        (64,64,16,64,32,true,true),   // 1×2 warps, 4×4=16 MMAs, 64 acc
+        // ── Larger blocks with many warps ──
+        (128,64,16,32,16,true,true),  // 4×4=16 warps? No, 256 threads
+        (128,64,16,16,16,true,true),  // 8×4=32 warps? Too many
+        (64,128,16,16,32,true,true),  // 4×4=16 warps
+        (64,128,16,16,16,true,true),  // 4×8=32 warps? Too many
     ];
 
     for (bm,bn,bk,wm,wn,sw,cp) in &configs {

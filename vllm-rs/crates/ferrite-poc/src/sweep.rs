@@ -60,7 +60,9 @@ unsafe fn emit_cp_async_commit_wait<'ctx>(
     }
 }
 
-unsafe fn emit_mma<'ctx>(
+// f32 accumulation: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+// 4 f32 outputs, 4 i32 A, 2 i32 B, 4 f32 C
+unsafe fn emit_mma_f32<'ctx>(
     b: &Builder<'ctx>, ctx: &'ctx LlvmContext, module: &inkwell::module::Module<'ctx>,
     a: &[IntValue<'ctx>; 4], br: &[IntValue<'ctx>; 2], c: &[FloatValue<'ctx>; 4],
 ) -> [FloatValue<'ctx>; 4] {
@@ -91,6 +93,34 @@ unsafe fn emit_mma<'ctx>(
      FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(bref, call, 3, n(b"\0")))]
 }
 
+// f16 accumulation: mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16
+// 2 i32 outputs (packed f16x2), 4 i32 A, 2 i32 B, 2 i32 C (packed f16x2)
+unsafe fn emit_mma_f16<'ctx>(
+    b: &Builder<'ctx>, ctx: &'ctx LlvmContext, module: &inkwell::module::Module<'ctx>,
+    a: &[IntValue<'ctx>; 4], br: &[IntValue<'ctx>; 2], c: &[IntValue<'ctx>; 2],
+) -> [IntValue<'ctx>; 2] {
+    let i32_ty = ctx.i32_type();
+    let mr = module.as_mut_ptr();
+    let cr = llvm_sys::core::LLVMGetModuleContext(mr);
+    let bref = b.as_mut_ptr();
+    let mut rm = [i32_ty.as_type_ref(); 2];
+    let rs = llvm_sys::core::LLVMStructTypeInContext(cr, rm.as_mut_ptr(), 2, 0);
+    let mut pt = [i32_ty.as_type_ref(); 8]; // 4 A + 2 B + 2 C
+    let ft = llvm_sys::core::LLVMFunctionType(rs, pt.as_mut_ptr(), 8, 0);
+    let s = b"mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {$0,$1}, {$2,$3,$4,$5}, {$6,$7}, {$8,$9};\0";
+    let con = b"=r,=r,r,r,r,r,r,r,r,r\0";
+    let av = llvm_sys::core::LLVMGetInlineAsm(ft, s.as_ptr() as *const _, s.len()-1,
+        con.as_ptr() as *const _, con.len()-1, 1, 0,
+        llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0);
+    let mut args = [a[0].as_value_ref(), a[1].as_value_ref(), a[2].as_value_ref(), a[3].as_value_ref(),
+        br[0].as_value_ref(), br[1].as_value_ref(),
+        c[0].as_value_ref(), c[1].as_value_ref()];
+    let call = llvm_sys::core::LLVMBuildCall2(bref, ft, av, args.as_mut_ptr(), 8, b"\0".as_ptr() as *const _);
+    let n = |s: &[u8]| s.as_ptr() as *const _;
+    [IntValue::new(llvm_sys::core::LLVMBuildExtractValue(bref, call, 0, n(b"\0"))),
+     IntValue::new(llvm_sys::core::LLVMBuildExtractValue(bref, call, 1, n(b"\0")))]
+}
+
 // ── Swizzle ──
 fn sw<'ctx>(elem: IntValue<'ctx>, b: &Builder<'ctx>, ctx: &'ctx LlvmContext, do_sw: bool) -> IntValue<'ctx> {
     if !do_sw { return elem; }
@@ -103,7 +133,16 @@ fn sw<'ctx>(elem: IntValue<'ctx>, b: &Builder<'ctx>, ctx: &'ctx LlvmContext, do_
 }
 
 // ── Kernel emitter ──
+// acc_f16: if true, use f16 accumulation (2 i32 regs per MMA vs 4 f32), output is f16
 fn emit_kernel(sm: &str, bm: u32, bn: u32, bk: u32, wm_: u32, wn_: u32, do_sw: bool, do_cp: bool) -> Result<String> {
+    emit_kernel_inner(sm, bm, bn, bk, wm_, wn_, do_sw, do_cp, false)
+}
+
+fn emit_kernel_f16acc(sm: &str, bm: u32, bn: u32, bk: u32, wm_: u32, wn_: u32, do_sw: bool, do_cp: bool) -> Result<String> {
+    emit_kernel_inner(sm, bm, bn, bk, wm_, wn_, do_sw, do_cp, true)
+}
+
+fn emit_kernel_inner(sm: &str, bm: u32, bn: u32, bk: u32, wm_: u32, wn_: u32, do_sw: bool, do_cp: bool, acc_f16: bool) -> Result<String> {
     let machine = create_nvptx_target_machine(sm)?;
     let ctx = LlvmContext::create();
     let module = ctx.create_module("sw");
@@ -124,7 +163,8 @@ fn emit_kernel(sm: &str, bm: u32, bn: u32, bk: u32, wm_: u32, wn_: u32, do_sw: b
     let warps_m = bm / wm_;
     let warps_n = bn / wn_;
     let threads = warps_m * warps_n * 32;
-    let num_acc = (reg_m * reg_n * 4) as usize;
+    let acc_per_mma = if acc_f16 { 2u32 } else { 4u32 }; // i32 packed f16×2 vs 4 f32
+    let num_acc = (reg_m * reg_n * acc_per_mma) as usize;
 
     let smem_g = module.add_global(ctx.i8_type().array_type(0), Some(AddressSpace::from(3u16)), "smem");
     smem_g.set_alignment(128);
@@ -168,7 +208,9 @@ fn emit_kernel(sm: &str, bm: u32, bn: u32, bk: u32, wm_: u32, wn_: u32, do_sw: b
         b.build_gep(ctx.i8_type(), smem_base, &[ci((bm * bk * 2) as u64)], "").unwrap()
     }, ptr_s, "").unwrap();
 
-    let f0 = f32_ty.const_float(0.0);
+    let acc_phi_ty = if acc_f16 { i32_ty.as_basic_type_enum() } else { f32_ty.as_basic_type_enum() };
+    let acc_zero = if acc_f16 { i32_ty.const_int(0, false).into() } else { f32_ty.const_float(0.0).into() };
+
     let ea = bm * bk; let eb = bk * bn;
     let pa = ea / threads; let pb = eb / threads;
     let ta = b.build_int_mul(tid, ci(pa as u64), "").unwrap();
@@ -178,7 +220,14 @@ fn emit_kernel(sm: &str, bm: u32, bn: u32, bk: u32, wm_: u32, wn_: u32, do_sw: b
     b.position_at_end(kh);
     let t_phi = b.build_phi(i32_ty, "t").unwrap();
     let mut acc_phis = Vec::new();
-    for i in 0..num_acc { acc_phis.push(b.build_phi(f32_ty, &format!("a{i}")).unwrap()); }
+    for i in 0..num_acc {
+        let phi = if acc_f16 {
+            b.build_phi(i32_ty, &format!("a{i}")).unwrap()
+        } else {
+            b.build_phi(f32_ty, &format!("a{i}")).unwrap()
+        };
+        acc_phis.push(phi);
+    }
     let t = t_phi.as_basic_value().into_int_value();
     let cmp = b.build_int_compare(IntPredicate::ULT, t, k_p, "").unwrap();
     b.build_conditional_branch(cmp, kb, ke).unwrap();
@@ -216,7 +265,10 @@ fn emit_kernel(sm: &str, bm: u32, bn: u32, bk: u32, wm_: u32, wn_: u32, do_sw: b
     call_barrier0(&ctx, &module, &b);
 
     // Fragments + MMA
-    let mut cur: Vec<FloatValue> = (0..num_acc).map(|i| acc_phis[i].as_basic_value().into_float_value()).collect();
+    // Use a uniform Vec<BasicValueEnum> for accumulator to handle both f16 (IntValue) and f32 (FloatValue)
+    let mut cur: Vec<inkwell::values::BasicValueEnum> = (0..num_acc)
+        .map(|i| acc_phis[i].as_basic_value())
+        .collect();
     let mut af: Vec<IntValue> = Vec::new();
     for rm in 0..reg_m as u64 {
         let ro = b.build_int_add(wyo, ci(rm*16), "").unwrap();
@@ -248,12 +300,21 @@ fn emit_kernel(sm: &str, bm: u32, bn: u32, bk: u32, wm_: u32, wn_: u32, do_sw: b
             bf.push(b.build_bit_cast(vec, i32_ty, "").unwrap().into_int_value());
         }
         for rm in 0..reg_m as u64 {
-            let ai = (rm as u32 * reg_n * 4 + rn as u32 * 4) as usize;
             let ab = (rm * 4) as usize;
-            let [d0,d1,d2,d3] = unsafe { emit_mma(&b, &ctx, &module,
-                &[af[ab],af[ab+1],af[ab+2],af[ab+3]], &[bf[0],bf[1]],
-                &[cur[ai],cur[ai+1],cur[ai+2],cur[ai+3]]) };
-            cur[ai]=d0; cur[ai+1]=d1; cur[ai+2]=d2; cur[ai+3]=d3;
+            if acc_f16 {
+                let ai = (rm as u32 * reg_n * acc_per_mma + rn as u32 * acc_per_mma) as usize;
+                let [d0,d1] = unsafe { emit_mma_f16(&b, &ctx, &module,
+                    &[af[ab],af[ab+1],af[ab+2],af[ab+3]], &[bf[0],bf[1]],
+                    &[cur[ai].into_int_value(), cur[ai+1].into_int_value()]) };
+                cur[ai] = d0.into(); cur[ai+1] = d1.into();
+            } else {
+                let ai = (rm as u32 * reg_n * acc_per_mma + rn as u32 * acc_per_mma) as usize;
+                let [d0,d1,d2,d3] = unsafe { emit_mma_f32(&b, &ctx, &module,
+                    &[af[ab],af[ab+1],af[ab+2],af[ab+3]], &[bf[0],bf[1]],
+                    &[cur[ai].into_float_value(), cur[ai+1].into_float_value(),
+                      cur[ai+2].into_float_value(), cur[ai+3].into_float_value()]) };
+                cur[ai] = d0.into(); cur[ai+1] = d1.into(); cur[ai+2] = d2.into(); cur[ai+3] = d3.into();
+            }
         }
     }
 
@@ -261,22 +322,49 @@ fn emit_kernel(sm: &str, bm: u32, bn: u32, bk: u32, wm_: u32, wn_: u32, do_sw: b
     let tn = b.build_int_add(t, ci(bk as u64), "").unwrap();
     b.build_unconditional_branch(kh).unwrap();
     t_phi.add_incoming(&[(&ci(0), entry), (&tn, kb)]);
-    for i in 0..num_acc { acc_phis[i].add_incoming(&[(&f0, entry), (&cur[i], kb)]); }
+    for i in 0..num_acc {
+        acc_phis[i].add_incoming(&[(&acc_zero, entry), (&cur[i], kb)]);
+    }
 
     b.position_at_end(ke);
+    // Output type: f16 for acc_f16, f32 otherwise
+    let out_elem_ty = if acc_f16 { f16_ty.as_basic_type_enum() } else { f32_ty.as_basic_type_enum() };
     for rm in 0..reg_m {
         for rn in 0..reg_n {
-            let ai = (rm*reg_n*4+rn*4) as usize;
-            for d in 0..4u32 {
-                let mro = if d<2 { grp } else { b.build_int_add(grp,ci(8),"").unwrap() };
-                let mco = if d%2==0 { tg2 } else { b.build_int_add(tg2,ci(1),"").unwrap() };
-                let cr_ = b.build_int_add(b.build_int_add(br,wyo,"").unwrap(),
-                    b.build_int_add(ci(rm as u64*16),mro,"").unwrap(),"").unwrap();
-                let cc = b.build_int_add(b.build_int_add(bc,wxo,"").unwrap(),
-                    b.build_int_add(ci(rn as u64*8),mco,"").unwrap(),"").unwrap();
-                let ci_ = b.build_int_add(b.build_int_mul(cr_,n_p,"").unwrap(),cc,"").unwrap();
-                let gep = unsafe { b.build_gep(f32_ty, c_ptr, &[ci_], "").unwrap() };
-                b.build_store(gep, acc_phis[ai+d as usize].as_basic_value().into_float_value()).unwrap();
+            if acc_f16 {
+                // 2 i32 per MMA tile, each holds 2 f16 → 4 elements: (group, tg*2), (group, tg*2+1), (group+8, tg*2), (group+8, tg*2+1)
+                let ai = (rm * reg_n * acc_per_mma + rn * acc_per_mma) as usize;
+                // Unpack: bitcast i32 → <2 x f16>, extract elements
+                for reg_idx in 0..2u32 {
+                    let packed = acc_phis[ai + reg_idx as usize].as_basic_value().into_int_value();
+                    let vec = b.build_bit_cast(packed, v2f16, "").unwrap().into_vector_value();
+                    for elem in 0..2u32 {
+                        let d = reg_idx * 2 + elem; // 0,1,2,3
+                        let mro = if d < 2 { grp } else { b.build_int_add(grp, ci(8), "").unwrap() };
+                        let mco = if d % 2 == 0 { tg2 } else { b.build_int_add(tg2, ci(1), "").unwrap() };
+                        let cr_ = b.build_int_add(b.build_int_add(br, wyo, "").unwrap(),
+                            b.build_int_add(ci(rm as u64 * 16), mro, "").unwrap(), "").unwrap();
+                        let cc = b.build_int_add(b.build_int_add(bc, wxo, "").unwrap(),
+                            b.build_int_add(ci(rn as u64 * 8), mco, "").unwrap(), "").unwrap();
+                        let ci_ = b.build_int_add(b.build_int_mul(cr_, n_p, "").unwrap(), cc, "").unwrap();
+                        let gep = unsafe { b.build_gep(f16_ty, c_ptr, &[ci_], "").unwrap() };
+                        let val = b.build_extract_element(vec, ci(elem as u64), "").unwrap();
+                        b.build_store(gep, val).unwrap();
+                    }
+                }
+            } else {
+                let ai = (rm * reg_n * acc_per_mma + rn * acc_per_mma) as usize;
+                for d in 0..4u32 {
+                    let mro = if d < 2 { grp } else { b.build_int_add(grp, ci(8), "").unwrap() };
+                    let mco = if d % 2 == 0 { tg2 } else { b.build_int_add(tg2, ci(1), "").unwrap() };
+                    let cr_ = b.build_int_add(b.build_int_add(br, wyo, "").unwrap(),
+                        b.build_int_add(ci(rm as u64 * 16), mro, "").unwrap(), "").unwrap();
+                    let cc = b.build_int_add(b.build_int_add(bc, wxo, "").unwrap(),
+                        b.build_int_add(ci(rn as u64 * 8), mco, "").unwrap(), "").unwrap();
+                    let ci_ = b.build_int_add(b.build_int_mul(cr_, n_p, "").unwrap(), cc, "").unwrap();
+                    let gep = unsafe { b.build_gep(f32_ty, c_ptr, &[ci_], "").unwrap() };
+                    b.build_store(gep, acc_phis[ai + d as usize].as_basic_value().into_float_value()).unwrap();
+                }
             }
         }
     }
@@ -287,27 +375,41 @@ fn emit_kernel(sm: &str, bm: u32, bn: u32, bk: u32, wm_: u32, wn_: u32, do_sw: b
 }
 
 fn bench_one(sm: &str, bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, do_sw: bool, do_cp: bool) -> Result<Option<f64>> {
+    bench_one_inner(sm, bm, bn, bk, wm, wn, do_sw, do_cp, false)
+}
+
+fn bench_one_f16(sm: &str, bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, do_sw: bool, do_cp: bool) -> Result<Option<f64>> {
+    bench_one_inner(sm, bm, bn, bk, wm, wn, do_sw, do_cp, true)
+}
+
+fn bench_one_inner(sm: &str, bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, do_sw: bool, do_cp: bool, acc_f16: bool) -> Result<Option<f64>> {
     let m: u32 = 1024; let n: u32 = 1024; let k: u32 = 1024;
     if m%bm!=0 || n%bn!=0 || k%bk!=0 || wm<16 || wn<8 { return Ok(None); }
-    if bm%wm!=0 || bn%wn!=0 { return Ok(None); } // warp must tile block evenly
+    if bm%wm!=0 || bn%wn!=0 { return Ok(None); }
     let warps_m = bm/wm; let warps_n = bn/wn;
     let threads = warps_m*warps_n*32;
     if threads < 32 || threads > 1024 { return Ok(None); }
     let per_a = (bm*bk)/threads; let per_b = (bk*bn)/threads;
     if per_a < 8 || per_b < 8 || per_a%8!=0 || per_b%8!=0 { return Ok(None); }
 
-    let ptx = emit_kernel(sm, bm, bn, bk, wm, wn, do_sw, do_cp)?;
+    let ptx = if acc_f16 {
+        emit_kernel_f16acc(sm, bm, bn, bk, wm, wn, do_sw, do_cp)?
+    } else {
+        emit_kernel(sm, bm, bn, bk, wm, wn, do_sw, do_cp)?
+    };
     let ptx_c = CString::new(ptx.as_bytes())?;
     let module = unsafe { cuda::module::load_data(ptx_c.as_ptr() as *const _)? };
     let func = unsafe { cuda::module::get_function(module, CString::new("gemm_sweep").unwrap())? };
 
     let sa = (m*k) as usize; let sb = (k*n) as usize; let sc = (m*n) as usize;
+    let out_elem_size = if acc_f16 { 2usize } else { 4usize };
     let da = unsafe { cuda::malloc_sync(sa*2)? };
     let db = unsafe { cuda::malloc_sync(sb*2)? };
-    let dc = unsafe { cuda::malloc_sync(sc*4)? };
+    let dc = unsafe { cuda::malloc_sync(sc*out_elem_size)? };
     let ha: Vec<half::f16> = (0..sa).map(|i| half::f16::from_f32(((i%7) as f32-3.0)*0.1)).collect();
     let hb: Vec<half::f16> = (0..sb).map(|i| half::f16::from_f32(((i%5) as f32-2.0)*0.1)).collect();
-    let mut hc = vec![0.0f32; sc];
+    let mut hc_f32 = vec![0.0f32; sc];
+    let mut hc_f16: Vec<half::f16> = vec![half::f16::ZERO; sc];
     unsafe { cuda::memcpy_htod_sync(da, &ha)?; cuda::memcpy_htod_sync(db, &hb)?; }
 
     let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
@@ -320,21 +422,37 @@ fn bench_one(sm: &str, bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, do_sw: bool,
     ];
 
     for _ in 0..3 { unsafe { cuda::launch_kernel(func,(gx,gy,1),(threads,1,1),smem,stream,params)?; } }
-    unsafe { cuda::stream::synchronize(stream)?; cuda::memcpy_dtoh_sync(&mut hc, dc)?; }
+    unsafe { cuda::stream::synchronize(stream)?; }
 
-    // Verify — check corners and middle to catch partial-tile bugs
+    // Verify
     let mut ok = true;
     let check_rows = [0usize, 1, 31, 32, 47, 48, 63, 127, (m-1) as usize];
     let check_cols = [0usize, 1, 31, 32, 47, 48, 63, 127, (n-1) as usize];
-    for &r in &check_rows {
-        if r >= m as usize { continue; }
-        for &c in &check_cols {
-            if c >= n as usize { continue; }
-            let mut e = 0.0f32;
-            for kk in 0..k as usize { e += ha[r*k as usize+kk].to_f32() * hb[kk*n as usize+c].to_f32(); }
-            if (hc[r*n as usize+c]-e).abs() > 1.0 { ok = false; break; }
+
+    if acc_f16 {
+        unsafe { cuda::memcpy_dtoh_sync(&mut hc_f16, dc)?; }
+        for &r in &check_rows {
+            if r >= m as usize { continue; }
+            for &c in &check_cols {
+                if c >= n as usize { continue; }
+                let mut e = 0.0f32;
+                for kk in 0..k as usize { e += ha[r*k as usize+kk].to_f32() * hb[kk*n as usize+c].to_f32(); }
+                if (hc_f16[r*n as usize+c].to_f32()-e).abs() > 2.0 { ok = false; break; } // f16 has less precision
+            }
+            if !ok { break; }
         }
-        if !ok { break; }
+    } else {
+        unsafe { cuda::memcpy_dtoh_sync(&mut hc_f32, dc)?; }
+        for &r in &check_rows {
+            if r >= m as usize { continue; }
+            for &c in &check_cols {
+                if c >= n as usize { continue; }
+                let mut e = 0.0f32;
+                for kk in 0..k as usize { e += ha[r*k as usize+kk].to_f32() * hb[kk*n as usize+c].to_f32(); }
+                if (hc_f32[r*n as usize+c]-e).abs() > 1.0 { ok = false; break; }
+            }
+            if !ok { break; }
+        }
     }
     if !ok {
         unsafe { cuda::stream::destroy(stream)?; cuda::free_sync(da)?; cuda::free_sync(db)?; cuda::free_sync(dc)?; cuda::module::unload(module)?; }
@@ -435,6 +553,46 @@ pub fn run_sweep(sm: &str) -> Result<()> {
         }
     }
 
-    println!("\n  ★ Best: {} — {:.1} TFLOPS ({:.1}%)", best_name, best, best/181.0*100.0);
+    println!("\n  ★ Best (f32 acc): {} — {:.1} TFLOPS ({:.1}%)", best_name, best, best/162.0*100.0);
+
+    // ── F16 accumulation sweep ──
+    println!("\n  ── f16 accumulation (half the acc registers) ──");
+    println!("  {:>45} {:>8} {:>6}", "Config", "TFLOPS", "% cuBLAS");
+    println!("  {}", "-".repeat(63));
+
+    let f16_configs: Vec<(u32,u32,u32,u32,u32)> = vec![
+        // Best f32 configs, now with f16 acc
+        (64,64,16,64,16),
+        (64,64,16,32,32),
+        // Larger tiles that were register-limited with f32 acc
+        (128,64,16,64,16),
+        (128,64,16,64,32),
+        (128,64,16,128,16),
+        (64,128,16,64,32),
+        (64,128,16,64,16),
+        (128,128,16,64,32),
+        (128,128,16,128,32),
+        (128,128,16,64,64),
+        // Very large tiles
+        (256,64,16,64,16),
+        (256,64,16,128,16),
+        (128,256,16,64,32),
+    ];
+
+    for (bm,bn,bk,wm,wn) in &f16_configs {
+        let name = format!("{}x{}_bk{}_w{}x{}_f16acc", bm, bn, bk, wm, wn);
+        match bench_one_f16(sm, *bm, *bn, *bk, *wm, *wn, true, true) {
+            Ok(Some(tf)) => {
+                let pct = tf / 162.0 * 100.0;
+                let star = if tf > best { " ★" } else { "" };
+                println!("  {:>45} {:>7.1} {:>5.1}%{}", name, tf, pct, star);
+                if tf > best { best = tf; best_name = name; }
+            }
+            Ok(None) => println!("  {:>45} {:>7} {:>6}", name, "SKIP", ""),
+            Err(_) => println!("  {:>45} {:>7} {:>6}", name, "ERR", ""),
+        }
+    }
+
+    println!("\n  ★ Overall best: {} — {:.1} TFLOPS ({:.1}% of cuBLAS)", best_name, best, best/162.0*100.0);
     Ok(())
 }

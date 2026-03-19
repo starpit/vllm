@@ -325,24 +325,28 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     for ki in 0..K_UNROLL as u64 {
         let k_off = ci(ki * 16); // MMA K dimension = 16
 
-        // Load A fragments for this K-slice
+        // Load A fragments via ldmatrix.sync.aligned.m8n8.x4.shared.b16
+        // Each thread provides the address of row (lane % 16) in the 16×BK sub-tile.
+        // ldmatrix loads 4 registers (the full m16n8k16 A fragment) in 1 instruction.
+        let lane_mod16 = b.build_int_unsigned_rem(lane, ci(16), "lm16").unwrap();
         let mut a_frags: Vec<IntValue> = Vec::new();
         for rm in 0..REG_M as u64 {
-            let rm_off = b.build_int_add(wy_off, ci(rm * MMA_M as u64), "").unwrap();
-            for (row_add, col_add) in [(0u64, 0u64), (8, 0), (0, 8), (8, 8)] {
-                let frow = b.build_int_add(
-                    b.build_int_add(rm_off, group, "").unwrap(), ci(row_add), "",
-                ).unwrap();
-                let fcol = b.build_int_add(
-                    b.build_int_add(tg2, ci(col_add), "").unwrap(), k_off, "",
-                ).unwrap();
-                let lin = b.build_int_add(
-                    b.build_int_mul(frow, ci(BK as u64), "").unwrap(), fcol, "",
-                ).unwrap();
-                let sw = build_swizzle(&b, &ctx, lin);
-                let gep = unsafe { b.build_gep(f16_ty, smem_a, &[sw], "").unwrap() };
-                a_frags.push(b.build_load(i32_ty, gep, "").unwrap().into_int_value());
-            }
+            let rm_base = b.build_int_add(wy_off, ci(rm * MMA_M as u64), "").unwrap();
+            let row_in_tile = b.build_int_add(rm_base, lane_mod16, "arow").unwrap();
+            // Linear f16 offset of this row's start in smem_a
+            let lin_off = b.build_int_add(
+                b.build_int_mul(row_in_tile, ci(BK as u64), "").unwrap(),
+                k_off, "",
+            ).unwrap();
+            // Apply swizzle, then convert to byte offset
+            let sw_off = build_swizzle(&b, &ctx, lin_off);
+            let byte_off = b.build_int_mul(sw_off, ci(2), "abo").unwrap();
+            let addr_ptr = unsafe {
+                b.build_gep(ctx.i8_type(), smem_a, &[byte_off], "").unwrap()
+            };
+            let addr_i32 = b.build_ptr_to_int(addr_ptr, i32_ty, "aaddr").unwrap();
+            let [r0, r1, r2, r3] = build_ldmatrix_x4_asm(&b, &ctx, &module, addr_i32);
+            a_frags.push(r0); a_frags.push(r1); a_frags.push(r2); a_frags.push(r3);
         }
 
         // Load B fragments for this K-slice
@@ -545,6 +549,60 @@ fn build_cp_async_commit_and_wait<'ctx>(
             builder_ref, fn_type, wait,
             std::ptr::null_mut(), 0, b"\0".as_ptr() as *const _,
         );
+    }
+}
+
+/// ldmatrix.sync.aligned.m8n8.x4.shared.b16 — loads 4 × i32.
+/// Takes a pre-computed i32 shared memory address.
+fn build_ldmatrix_x4_asm<'ctx>(
+    builder: &Builder<'ctx>,
+    context: &'ctx LlvmContext,
+    module: &Module<'ctx>,
+    addr_i32: IntValue<'ctx>,
+) -> [IntValue<'ctx>; 4] {
+    let i32_ty = context.i32_type();
+    unsafe {
+        let mod_ref = module.as_mut_ptr();
+        let ctx_ref = llvm_sys::core::LLVMGetModuleContext(mod_ref);
+        let builder_ref = builder.as_mut_ptr();
+
+        let mut ret_members = [
+            i32_ty.as_type_ref(), i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(), i32_ty.as_type_ref(),
+        ];
+        let ret_struct = llvm_sys::core::LLVMStructTypeInContext(
+            ctx_ref, ret_members.as_mut_ptr(), 4, 0,
+        );
+        let mut param_types = [i32_ty.as_type_ref()];
+        let fn_type = llvm_sys::core::LLVMFunctionType(
+            ret_struct, param_types.as_mut_ptr(), 1, 0,
+        );
+
+        let asm_str = b"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0,$1,$2,$3}, [$4];\0";
+        let constraints = b"=r,=r,=r,=r,r\0";
+
+        let asm_val = llvm_sys::core::LLVMGetInlineAsm(
+            fn_type,
+            asm_str.as_ptr() as *const _, asm_str.len() - 1,
+            constraints.as_ptr() as *const _, constraints.len() - 1,
+            1, 0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
+        );
+
+        let mut args = [addr_i32.as_value_ref()];
+        let call = llvm_sys::core::LLVMBuildCall2(
+            builder_ref, fn_type, asm_val,
+            args.as_mut_ptr(), 1, b"\0".as_ptr() as *const _,
+        );
+
+        let n = |s: &[u8]| s.as_ptr() as *const _;
+        [
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 0, n(b"\0"))),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 1, n(b"\0"))),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 2, n(b"\0"))),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 3, n(b"\0"))),
+        ]
     }
 }
 

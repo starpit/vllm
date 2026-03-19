@@ -9,8 +9,8 @@ fn panic(_: &PanicInfo) -> ! {
     loop {}
 }
 
-//! Minimal MMA GEMM kernel compiled via rustc nightly → nvptx64.
-//! Tests whether LLVM 22's NVPTX backend produces better codegen than LLVM 20.
+// Minimal MMA GEMM kernel compiled via rustc nightly → nvptx64.
+// Tests whether LLVM 22's NVPTX backend produces better codegen than LLVM 20.
 
 use core::arch::asm;
 

@@ -92,7 +92,7 @@ unsafe fn emit_mma<'ctx>(
 }
 
 // ── Swizzle ──
-fn sw(elem: IntValue, b: &Builder, ctx: &LlvmContext, do_sw: bool) -> IntValue {
+fn sw<'ctx>(elem: IntValue<'ctx>, b: &Builder<'ctx>, ctx: &'ctx LlvmContext, do_sw: bool) -> IntValue<'ctx> {
     if !do_sw { return elem; }
     let ci = |v: u64| ctx.i32_type().const_int(v, false);
     let bo = b.build_int_mul(elem, ci(2), "").unwrap();

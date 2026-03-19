@@ -7,6 +7,8 @@
 //
 //   LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo run -p ferrite-poc --release
 
+mod mma_gemm;
+
 use anyhow::{Context, Result, bail};
 use std::ffi::{CString, c_uint, c_void};
 use std::time::Instant;
@@ -63,6 +65,9 @@ fn main() -> Result<()> {
 
     println!("\n[2/4] Tiled GEMM (M=N=K=1024, f32, shared memory, no tensor cores)");
     step2_tiled_gemm(&sm)?;
+
+    println!("\n[3/4] MMA GEMM (M=N=K=1024, f16→f32, mma.sync tensor cores)");
+    mma_gemm::step3_mma_gemm(&sm)?;
 
     println!("\n═══════════════════════════════════");
     println!("Phase 0 complete.");
@@ -325,7 +330,7 @@ fn step2_tiled_gemm(sm: &str) -> Result<()> {
 // PTX generation via inkwell
 // ===========================================================================
 
-fn create_nvptx_target_machine(sm: &str) -> Result<TargetMachine> {
+pub fn create_nvptx_target_machine(sm: &str) -> Result<TargetMachine> {
     let triple = TargetTriple::create("nvptx64-nvidia-cuda");
     let target = Target::from_triple(&triple)
         .map_err(|e| anyhow::anyhow!("NVPTX target: {}", e))?;
@@ -537,7 +542,6 @@ fn emit_tiled_gemm_ptx(sm: &str) -> Result<String> {
 
     // Shared memory pointers: As = &smem[0], Bs = &smem[TILE*TILE*4]
     let smem_ptr = smem_global.as_pointer_value();
-    let tile_sq = i32_type.const_int((TILE * TILE) as u64, false);
     let tile_sq_bytes = i32_type.const_int((TILE * TILE * 4) as u64, false);
     let as_ptr = builder.build_pointer_cast(smem_ptr, ptr_shared, "as_ptr").unwrap();
     let bs_offset = unsafe {
@@ -689,7 +693,7 @@ fn emit_tiled_gemm_ptx(sm: &str) -> Result<String> {
 // NVPTX helpers
 // ---------------------------------------------------------------------------
 
-fn call_sreg<'ctx>(
+pub fn call_sreg<'ctx>(
     context: &'ctx LlvmContext,
     module: &Module<'ctx>,
     builder: &Builder<'ctx>,
@@ -709,7 +713,7 @@ fn call_sreg<'ctx>(
 }
 
 /// Call @llvm.nvvm.barrier0() — equivalent to __syncthreads().
-fn call_barrier0<'ctx>(
+pub fn call_barrier0<'ctx>(
     context: &'ctx LlvmContext,
     module: &Module<'ctx>,
     builder: &Builder<'ctx>,
@@ -726,7 +730,7 @@ fn call_barrier0<'ctx>(
 ///                !0 = !{ptr @func, !"kernel", i32 1}
 ///
 /// Uses raw LLVM C API because inkwell's named metadata API varies by version.
-fn add_nvvm_kernel_metadata<'ctx>(module: &Module<'ctx>, function: &FunctionValue<'ctx>) {
+pub fn add_nvvm_kernel_metadata<'ctx>(module: &Module<'ctx>, function: &FunctionValue<'ctx>) {
     use llvm_sys;
     use std::ffi::CStr;
 

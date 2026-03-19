@@ -288,23 +288,6 @@ pub struct LlamaMLP {
 }
 
 impl LlamaMLP {
-    /// Build an MLP from pre-constructed linear layers (used by DeepSeek dense layers).
-    pub fn from_parts(
-        gate_up_proj: LinearLayer,
-        up_proj: Option<LinearLayer>,
-        down_proj: LinearLayer,
-        intermediate_size: usize,
-    ) -> Self {
-        Self {
-            gate_up_proj,
-            up_proj,
-            down_proj,
-            intermediate_size,
-            #[cfg(feature = "nccl")]
-            tp_group: None,
-        }
-    }
-
     /// Forward pass returning `OwnedTensor` (caching-allocator path).
     pub unsafe fn forward(&self, x: TensorView<'_>, device: &mut GpuDevice) -> OwnedTensor {
         let gate_up = if let Some(ref up_proj) = self.up_proj {

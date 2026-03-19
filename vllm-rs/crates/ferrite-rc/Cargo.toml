@@ -15,4 +15,4 @@ half = { workspace = true }
 anyhow = { workspace = true }
 
 [build-dependencies]
-cuda_builder = { git = "https://github.com/Rust-GPU/Rust-CUDA", package = "cuda_builder" }
+cuda_builder = { git = "https://github.com/Rust-GPU/Rust-CUDA", package = "cuda_builder", features = ["rustc_codegen_nvvm"] }

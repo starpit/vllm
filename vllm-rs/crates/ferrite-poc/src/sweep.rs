@@ -11,6 +11,7 @@ use inkwell::context::Context as LlvmContext;
 use inkwell::builder::Builder;
 use inkwell::targets::{TargetTriple, FileType};
 use inkwell::types::AsTypeRef;
+use inkwell::types::BasicType;
 use inkwell::values::{AsValueRef, IntValue, FloatValue};
 use inkwell::{AddressSpace, IntPredicate};
 

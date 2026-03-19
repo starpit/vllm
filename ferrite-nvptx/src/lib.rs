@@ -134,7 +134,7 @@ pub unsafe extern "ptx-kernel" fn mma_gemm(
     let wy_off = wy * WM;
     let wx_off = wx * WN;
 
-    let smem_a = SMEM.as_mut_ptr() as *mut u16;
+    let smem_a = core::ptr::addr_of_mut!(SMEM) as *mut u16;
     let smem_b = smem_a.add((BM * BK) as usize);
 
     // Accumulators: REG_M=4 × REG_N=2 × 4 f32 = 32

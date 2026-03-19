@@ -660,224 +660,231 @@ mod tests {
 
         let final_text = detok.get_next_output_text(true, false);
 
-        // -- Tests for specific bugs fixed in streaming decode --
-
-        #[test]
-        fn test_streaming_decode_prefix_initialization() {
-            // Tests that prefix is correctly initialized when stream_ids is not empty
-            let tok = Arc::new(make_test_tokenizer());
-            let prompt = "Test";
-            let prompt_ids = tok.encode(prompt, false).unwrap();
-
-            let mut detok =
-                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
-
-            // The detokenizer should initialize with prompt tokens in stream_ids
-            assert_eq!(detok.stream_ids.len(), prompt_ids.len());
-
-            // Add first token - should trigger prefix initialization
-            let full = tok.encode(&format!("{prompt} word"), false).unwrap();
-            let new_ids = &full[prompt_ids.len()..];
-
-            if !new_ids.is_empty() {
-                detok.update(&new_ids[..1], false);
-                // After first token, prefix should be set
-                assert!(!detok.stream_prefix.is_empty() || detok.stream_ids.len() > 1);
-            }
-        }
-
-        #[test]
-        fn test_streaming_decode_drain_operation() {
-            // Tests that drain operation correctly maintains state
-            let tok = Arc::new(make_test_tokenizer());
-            let prompt = "A";
-            let prompt_ids = tok.encode(prompt, false).unwrap();
-
-            let mut detok =
-                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
-
-            // Add multiple tokens
-            let full = tok.encode(&format!("{prompt} B C D"), false).unwrap();
-            let new_ids = &full[prompt_ids.len()..];
-
-            for &token_id in new_ids {
-                let _ids_before = detok.stream_ids.len();
-                detok.update(&[token_id], false);
-                let ids_after = detok.stream_ids.len();
-
-                // After drain, stream_ids should not grow unbounded
-                // It should stay relatively small (typically 1-2 tokens)
-                assert!(
-                    ids_after <= 3,
-                    "stream_ids growing unbounded: {} tokens",
-                    ids_after
-                );
-            }
-        }
-
-        #[test]
-        fn test_streaming_decode_prefix_index_consistency() {
-            // Tests that prefix_index correctly tracks the prefix in stream_ids
-            let tok = Arc::new(make_test_tokenizer());
-            let prompt = "Count";
-            let prompt_ids = tok.encode(prompt, false).unwrap();
-
-            let mut detok =
-                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
-
-            let full = tok
-                .encode(&format!("{prompt} one two three"), false)
-                .unwrap();
-            let new_ids = &full[prompt_ids.len()..];
-
-            for &token_id in new_ids {
-                detok.update(&[token_id], false);
-
-                // prefix_index should never exceed stream_ids length
-                assert!(
-                    detok.stream_prefix_index <= detok.stream_ids.len(),
-                    "prefix_index {} exceeds stream_ids length {}",
-                    detok.stream_prefix_index,
-                    detok.stream_ids.len()
-                );
-
-                // If we have a prefix, decoding the first prefix_index tokens should produce it
-                if !detok.stream_prefix.is_empty() && detok.stream_prefix_index > 0 {
-                    let prefix_tokens =
-                        &detok.stream_ids[..detok.stream_prefix_index.min(detok.stream_ids.len())];
-                    if !prefix_tokens.is_empty() {
-                        if let Ok(decoded) = tok.inner().decode(prefix_tokens, false) {
-                            // The decoded prefix tokens should match or be a prefix of stream_prefix
-                            assert!(
-                                detok.stream_prefix.starts_with(&decoded)
-                                    || decoded.starts_with(&detok.stream_prefix),
-                                "Prefix mismatch: decoded={:?}, stream_prefix={:?}",
-                                decoded,
-                                detok.stream_prefix
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        #[test]
-        fn test_streaming_decode_no_replacement_char() {
-            // Tests that we don't emit text ending with replacement character
-            let tok = Arc::new(make_test_tokenizer());
-            let prompt = "Say";
-            let prompt_ids = tok.encode(prompt, false).unwrap();
-
-            let mut detok =
-                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
-
-            let full = tok.encode(&format!("{prompt} hello world"), false).unwrap();
-            let new_ids = &full[prompt_ids.len()..];
-
-            // Add tokens one by one and check output never ends with �
-            for &token_id in new_ids {
-                detok.update(&[token_id], false);
-                let text = detok.get_next_output_text(false, false);
-
-                assert!(
-                    !text.ends_with('�'),
-                    "Output should not end with replacement character: {:?}",
-                    text
-                );
-            }
-        }
-
-        #[test]
-        fn test_streaming_decode_extend_not_push() {
-            // Tests that we use extend (not push) to add tokens, matching tokenizers library
-            let tok = Arc::new(make_test_tokenizer());
-            let prompt = "X";
-            let prompt_ids = tok.encode(prompt, false).unwrap();
-
-            let mut detok =
-                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
-
-            // Add a single token
-            let full = tok.encode(&format!("{prompt} Y"), false).unwrap();
-            let new_ids = &full[prompt_ids.len()..];
-
-            if !new_ids.is_empty() {
-                let initial_len = detok.stream_ids.len();
-                detok.update(&new_ids[..1], false);
-
-                // stream_ids should have grown by exactly 1
-                // (This tests that we're using extend with vec![token_id], not push)
-                assert!(
-                    detok.stream_ids.len() >= initial_len,
-                    "stream_ids should grow after adding token"
-                );
-            }
-        }
-
-        #[test]
-        fn test_streaming_decode_valid_utf8_output() {
-            // Tests that all output is valid UTF-8, even with multibyte characters
-            let tok = Arc::new(make_test_tokenizer());
-            let prompt = "Test";
-            let prompt_ids = tok.encode(prompt, false).unwrap();
-
-            let mut detok =
-                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
-
-            // Mix of ASCII and multibyte UTF-8
-            let test_strings = vec![" hello", " 世界", " مرحبا", " Привет", " 🌍"];
-
-            for test_str in test_strings {
-                let full = tok.encode(&format!("{prompt}{test_str}"), false).unwrap();
-                let new_ids = &full[prompt_ids.len()..];
-
-                detok.update(new_ids, false);
-                let text = detok.get_next_output_text(true, false);
-
-                // Verify it's valid UTF-8
-                assert!(
-                    std::str::from_utf8(text.as_bytes()).is_ok(),
-                    "Output should be valid UTF-8: {:?}",
-                    text
-                );
-
-                // Verify all positions are char boundaries
-                for i in 0..=text.len() {
-                    assert!(
-                        text.is_char_boundary(i),
-                        "Position {} should be a char boundary in {:?}",
-                        i,
-                        text
-                    );
-                }
-            }
-        }
-
-        #[test]
-        fn test_streaming_decode_empty_prefix_handling() {
-            // Tests correct behavior when prefix is empty
-            let tok = Arc::new(make_test_tokenizer());
-            let prompt = ""; // Empty prompt
-            let prompt_ids = tok.encode(prompt, false).unwrap();
-
-            let mut detok =
-                IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
-
-            let full = tok.encode("Hello world", false).unwrap();
-
-            detok.update(&full, false);
-            let text = detok.get_next_output_text(true, false);
-
-            assert!(
-                text.contains("Hello") || text.contains("world"),
-                "Should produce output even with empty prompt: {:?}",
-                text
-            );
-        }
         // Accumulated deltas should match final text
         assert_eq!(
             accumulated, final_text,
             "Incremental decode should match final"
+        );
+    }
+
+    // -- Tests for specific bugs fixed in streaming decode --
+
+    #[test]
+    fn test_streaming_decode_prefix_initialization() {
+        // Tests that prefix is correctly initialized when stream_ids is not empty
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt = "Test";
+        let prompt_ids = tok.encode(prompt, false).unwrap();
+
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+        // The detokenizer should initialize with prompt tokens in stream_ids
+        assert_eq!(detok.stream_ids.len(), prompt_ids.len());
+
+        // Add first token - should trigger prefix initialization
+        let full = tok.encode(&format!("{prompt} word"), false).unwrap();
+        let new_ids = &full[prompt_ids.len()..];
+
+        if !new_ids.is_empty() {
+            detok.update(&new_ids[..1], false);
+            // After first token, prefix should be set
+            assert!(!detok.stream_prefix.is_empty() || detok.stream_ids.len() > 1);
+        }
+    }
+
+    #[test]
+    fn test_streaming_decode_drain_operation() {
+        // Tests that drain operation correctly maintains state
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt = "A";
+        let prompt_ids = tok.encode(prompt, false).unwrap();
+
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+        // Add multiple tokens
+        let full = tok.encode(&format!("{prompt} B C D"), false).unwrap();
+        let new_ids = &full[prompt_ids.len()..];
+
+        for &token_id in new_ids {
+            let _ids_before = detok.stream_ids.len();
+            detok.update(&[token_id], false);
+            let ids_after = detok.stream_ids.len();
+
+            // After drain, stream_ids should not grow unbounded
+            // It should stay relatively small (typically 1-2 tokens)
+            assert!(
+                ids_after <= 3,
+                "stream_ids growing unbounded: {} tokens",
+                ids_after
+            );
+        }
+    }
+
+    #[test]
+    fn test_streaming_decode_prefix_index_consistency() {
+        // Tests that prefix_index correctly tracks the prefix in stream_ids
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt = "Count";
+        let prompt_ids = tok.encode(prompt, false).unwrap();
+
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+        let full = tok
+            .encode(&format!("{prompt} one two three"), false)
+            .unwrap();
+        let new_ids = &full[prompt_ids.len()..];
+
+        for &token_id in new_ids {
+            detok.update(&[token_id], false);
+
+            // prefix_index should never exceed stream_ids length
+            assert!(
+                detok.stream_prefix_index <= detok.stream_ids.len(),
+                "prefix_index {} exceeds stream_ids length {}",
+                detok.stream_prefix_index,
+                detok.stream_ids.len()
+            );
+
+            // If we have a prefix, decoding the first prefix_index tokens should produce it
+            if !detok.stream_prefix.is_empty() && detok.stream_prefix_index > 0 {
+                let prefix_tokens =
+                    &detok.stream_ids[..detok.stream_prefix_index.min(detok.stream_ids.len())];
+                if !prefix_tokens.is_empty() {
+                    if let Ok(decoded) = tok.inner().decode(prefix_tokens, false) {
+                        // The decoded prefix tokens should match or be a prefix of stream_prefix
+                        assert!(
+                            detok.stream_prefix.starts_with(&decoded)
+                                || decoded.starts_with(&detok.stream_prefix),
+                            "Prefix mismatch: decoded={:?}, stream_prefix={:?}",
+                            decoded,
+                            detok.stream_prefix
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_streaming_decode_no_replacement_char() {
+        // Tests that we don't emit text ending with replacement character
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt = "Say";
+        let prompt_ids = tok.encode(prompt, false).unwrap();
+
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+        let full = tok
+            .encode(&format!("{prompt} hello world"), false)
+            .unwrap();
+        let new_ids = &full[prompt_ids.len()..];
+
+        // Add tokens one by one and check output never ends with replacement char
+        for &token_id in new_ids {
+            detok.update(&[token_id], false);
+            let text = detok.get_next_output_text(false, false);
+
+            assert!(
+                !text.ends_with('\u{FFFD}'),
+                "Output should not end with replacement character: {:?}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn test_streaming_decode_extend_not_push() {
+        // Tests that we use extend (not push) to add tokens, matching tokenizers library
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt = "X";
+        let prompt_ids = tok.encode(prompt, false).unwrap();
+
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+        // Add a single token
+        let full = tok.encode(&format!("{prompt} Y"), false).unwrap();
+        let new_ids = &full[prompt_ids.len()..];
+
+        if !new_ids.is_empty() {
+            let initial_len = detok.stream_ids.len();
+            detok.update(&new_ids[..1], false);
+
+            // stream_ids should have grown by exactly 1
+            // (This tests that we're using extend with vec![token_id], not push)
+            assert!(
+                detok.stream_ids.len() >= initial_len,
+                "stream_ids should grow after adding token"
+            );
+        }
+    }
+
+    #[test]
+    fn test_streaming_decode_valid_utf8_output() {
+        // Tests that all output is valid UTF-8, even with multibyte characters
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt = "Test";
+        let prompt_ids = tok.encode(prompt, false).unwrap();
+
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+        // Mix of ASCII and multibyte UTF-8
+        let test_strings = vec![" hello", " \u{4e16}\u{754c}", " \u{645}\u{631}\u{62d}\u{628}\u{627}", " \u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}", " \u{1f30d}"];
+
+        for test_str in test_strings {
+            let full = tok
+                .encode(&format!("{prompt}{test_str}"), false)
+                .unwrap();
+            let new_ids = &full[prompt_ids.len()..];
+
+            detok.update(new_ids, false);
+            let text = detok.get_next_output_text(true, false);
+
+            // Verify it's valid UTF-8 (Rust strings are always valid UTF-8,
+            // but this guards against unsafe code or decoder bugs).
+            assert!(
+                std::str::from_utf8(text.as_bytes()).is_ok(),
+                "Output should be valid UTF-8: {:?}",
+                text
+            );
+
+            // Verify char boundary consistency: every char boundary index
+            // returned by char_indices should be a valid boundary.
+            for (i, _) in text.char_indices() {
+                assert!(
+                    text.is_char_boundary(i),
+                    "char_indices position {} should be a char boundary in {:?}",
+                    i,
+                    text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_streaming_decode_empty_prefix_handling() {
+        // Tests correct behavior when prefix is empty
+        let tok = Arc::new(make_test_tokenizer());
+        let prompt = ""; // Empty prompt
+        let prompt_ids = tok.encode(prompt, false).unwrap();
+
+        let mut detok =
+            IncrementalDetokenizer::new(Arc::clone(&tok), &prompt_ids, vec![], 0, false, false);
+
+        let full = tok.encode("Hello world", false).unwrap();
+
+        detok.update(&full, false);
+        let text = detok.get_next_output_text(true, false);
+
+        assert!(
+            text.contains("Hello") || text.contains("world"),
+            "Should produce output even with empty prompt: {:?}",
+            text
         );
     }
 }

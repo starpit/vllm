@@ -5501,12 +5501,14 @@ impl CudaWorker {
 
             // Update logits processors after forward, before sampling.
             Self::update_logits_processors(
-                self.batch_changed,
-                num_reqs,
+                &LogitsUpdateCtx {
+                    batch_changed: self.batch_changed,
+                    num_reqs,
+                    sampling_params_map: &self.sampling_params_map,
+                    token_buffers: &self.token_buffers,
+                    batch_req_ids: &self.batch_req_ids,
+                },
                 self.logits_pipeline.as_mut(),
-                &self.sampling_params_map,
-                &self.token_buffers,
-                &self.batch_req_ids,
                 #[cfg(feature = "guided-decoding")]
                 &mut self.grammar_states,
                 &mut self.grammar_processor,
@@ -6205,12 +6207,14 @@ impl CudaWorker {
         // This ensures processor GPU tensor allocations don't collide with CUDA
         // graph intermediate addresses.
         Self::update_logits_processors(
-            self.batch_changed,
-            num_reqs,
+            &LogitsUpdateCtx {
+                batch_changed: self.batch_changed,
+                num_reqs,
+                sampling_params_map: &self.sampling_params_map,
+                token_buffers: &self.token_buffers,
+                batch_req_ids: &self.batch_req_ids,
+            },
             self.logits_pipeline.as_mut(),
-            &self.sampling_params_map,
-            &self.token_buffers,
-            &self.batch_req_ids,
             #[cfg(feature = "guided-decoding")]
             &mut self.grammar_states,
             &mut self.grammar_processor,
@@ -6243,12 +6247,8 @@ impl CudaWorker {
     /// tensor allocations don't conflict with CUDA graph intermediate addresses
     /// (matching Python vLLM's architecture).
     fn update_logits_processors(
-        batch_changed: bool,
-        num_reqs: usize,
+        ctx: &LogitsUpdateCtx<'_>,
         logits_pipeline: Option<&mut LogitsProcessorPipeline>,
-        sampling_params_map: &HashMap<String, SamplingParams>,
-        token_buffers: &HashMap<String, Vec<u32>>,
-        batch_req_ids: &[String],
         #[cfg(feature = "guided-decoding")] grammar_states: &mut HashMap<
             String,
             vllm_model::grammar::GrammarGuide,
@@ -6257,9 +6257,9 @@ impl CudaWorker {
         allowed_token_ids_processor: &mut AllowedTokenIdsProcessor,
         device: &mut GpuDevice,
     ) {
-        let batch_update = if batch_changed {
+        let batch_update = if ctx.batch_changed {
             Some(BatchUpdate {
-                batch_size: num_reqs,
+                batch_size: ctx.num_reqs,
                 added: Vec::new(),
                 removed: Vec::new(),
             })
@@ -6270,16 +6270,17 @@ impl CudaWorker {
         if let Some(pipeline) = logits_pipeline {
             pipeline.update_state(
                 batch_update.as_ref(),
-                sampling_params_map,
-                token_buffers,
-                batch_req_ids,
+                ctx.sampling_params_map,
+                ctx.token_buffers,
+                ctx.batch_req_ids,
                 device,
             );
         }
 
         #[cfg(feature = "guided-decoding")]
         {
-            let grammar_reqs: Vec<(usize, Vec<u32>)> = batch_req_ids
+            let grammar_reqs: Vec<(usize, Vec<u32>)> = ctx
+                .batch_req_ids
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, rid)| {
@@ -6303,13 +6304,22 @@ impl CudaWorker {
 
         allowed_token_ids_processor.update_state(
             batch_update.as_ref(),
-            sampling_params_map,
-            token_buffers,
-            batch_req_ids,
+            ctx.sampling_params_map,
+            ctx.token_buffers,
+            ctx.batch_req_ids,
             device,
         );
     }
 } // end impl CudaWorker (execute_model_inner)
+
+/// Read-only batch context passed to `update_logits_processors`.
+struct LogitsUpdateCtx<'a> {
+    batch_changed: bool,
+    num_reqs: usize,
+    sampling_params_map: &'a HashMap<String, SamplingParams>,
+    token_buffers: &'a HashMap<String, Vec<u32>>,
+    batch_req_ids: &'a [String],
+}
 
 /// Compute KV cache budget matching Python vLLM's formula exactly:
 ///   requested = total_memory * gpu_memory_utilization

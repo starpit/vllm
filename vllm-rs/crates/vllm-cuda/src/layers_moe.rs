@@ -19,7 +19,7 @@ use crate::kernels;
 use crate::layers::Linear;
 #[cfg(feature = "nccl")]
 use crate::nccl::NcclGroup;
-use crate::tensor::GpuTensor;
+use crate::tensor::{GpuTensor, TensorView};
 
 /// Block size for MoE GEMM tiling. Must match BLOCK_M in fused_moe_gemm_kernels.cu.
 const MOE_BLOCK_SIZE: usize = 128;
@@ -59,7 +59,11 @@ impl FusedMoELayer {
     /// # Safety
     /// All tensors must be valid GPU memory. Device must be properly initialized.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
         let num_tokens = hidden_states.dim(0);
         let stream = device.compute_stream;
 
@@ -92,7 +96,7 @@ impl FusedMoELayer {
         // 4. GEMM 1: hidden_states × w1^T → [num_tokens * top_k, 2*intermediate]
         //    No routing weight applied yet (apply_weights=false).
         let intermediate1 = kernels::fused_moe_gemm(
-            hidden_states,
+            *hidden_states,
             self.w1,
             topk_weights.as_gpu_tensor(),
             sorted_token_ids.as_gpu_tensor(),
@@ -185,7 +189,11 @@ pub struct SharedFusedMoELayer {
 
 impl SharedFusedMoELayer {
     /// Forward pass — MoE + shared expert.
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
         let stream = device.compute_stream;
 
         // MoE path.
@@ -211,7 +219,7 @@ impl SharedFusedMoELayer {
 
             // down_proj → [num_tokens, hidden]
             let shared_out = shared_down.forward(
-                shared_activated.as_gpu_tensor(),
+                shared_activated.view(),
                 &mut device.cublas,
                 &mut device.caching,
             );
@@ -278,7 +286,11 @@ pub struct Fp8FusedMoELayer {
 
 impl Fp8FusedMoELayer {
     /// Forward pass — full FP8 MoE pipeline.
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
         let num_tokens = hidden_states.dim(0);
         let stream = device.compute_stream;
         let sm_version = device.sm_version;
@@ -300,7 +312,7 @@ impl Fp8FusedMoELayer {
 
         // 3. Quantize hidden states to FP8 with per-token dynamic scales.
         let (fp8_input, a1_scales) =
-            kernels::scaled_fp8_quant_dynamic(hidden_states, &mut device.caching, stream);
+            kernels::scaled_fp8_quant_dynamic(*hidden_states, &mut device.caching, stream);
 
         // 4. Align block size: sort tokens by expert
         let (sorted_token_ids, expert_ids, num_tokens_post_padded) = kernels::moe_align_block_size(
@@ -415,7 +427,11 @@ pub struct Fp8SharedFusedMoELayer {
 }
 
 impl Fp8SharedFusedMoELayer {
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
         let stream = device.compute_stream;
 
         let moe_out = self.moe.forward(hidden_states, device);
@@ -436,7 +452,7 @@ impl Fp8SharedFusedMoELayer {
             drop(shared_gu);
 
             let shared_out = shared_down.forward(
-                shared_activated.as_gpu_tensor(),
+                shared_activated.view(),
                 &mut device.cublas,
                 &mut device.caching,
             );
@@ -588,7 +604,11 @@ impl MarlinFusedMoELayer {
     /// * `hidden_states`: `[num_tokens, hidden_size]`
     ///
     /// Returns: `[num_tokens, hidden_size]`
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
         let num_tokens = hidden_states.dim(0);
         let stream = device.compute_stream;
 
@@ -636,7 +656,7 @@ impl MarlinFusedMoELayer {
         // 4. GEMM 1: hidden_states × w1^T → [num_tokens * top_k, 2 * intermediate]
         //    No topk weight applied (mul_topk_weights=false).
         let intermediate1 = kernels::marlin_moe_gemm(
-            hidden_states,
+            *hidden_states,
             self.w1,
             self.w1_scales,
             self.w1_zeros,
@@ -748,7 +768,11 @@ pub struct MarlinSharedFusedMoELayer {
 }
 
 impl MarlinSharedFusedMoELayer {
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
         let stream = device.compute_stream;
 
         // MoE path.
@@ -775,7 +799,7 @@ impl MarlinSharedFusedMoELayer {
             drop(shared_gu);
 
             let shared_out = shared_down.forward(
-                shared_activated.as_gpu_tensor(),
+                shared_activated.view(),
                 &mut device.cublas,
                 &mut device.caching,
                 stream,

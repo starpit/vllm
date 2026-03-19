@@ -26,7 +26,7 @@ use vllm_cuda::logits_processor::{
     PenaltiesProcessor,
 };
 use vllm_cuda::quant;
-use vllm_cuda::tensor::GpuTensor;
+use vllm_cuda::tensor::{GpuTensor, TensorView};
 use vllm_cuda::weights::GpuWeights;
 use vllm_engine::executor::ModelRunnerOutput;
 use vllm_model::weight::HfModelConfig;
@@ -204,12 +204,12 @@ impl CudaModel {
     #[allow(clippy::too_many_arguments)]
     unsafe fn hidden_states(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -353,17 +353,17 @@ impl CudaModel {
     #[allow(clippy::too_many_arguments)]
     unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> vllm_cuda::OwnedTensor {
         match self {
             Self::Llama(m) => unsafe {
@@ -511,21 +511,21 @@ impl CudaModel {
     #[allow(clippy::too_many_arguments)]
     unsafe fn forward_qwen3_next(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         gdn_state_pool: &vllm_cuda::model::qwen3_next::GdnStatePool,
-        gdn_state_indices: GpuTensor,
-        gdn_cu_seqlens: GpuTensor,
+        gdn_state_indices: TensorView<'_>,
+        gdn_cu_seqlens: TensorView<'_>,
         num_seqs: usize,
         device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> vllm_cuda::OwnedTensor {
         match self {
             Self::Qwen3Next(m) => unsafe {
@@ -556,18 +556,18 @@ impl CudaModel {
     #[allow(clippy::too_many_arguments)]
     unsafe fn forward_pp(
         &self,
-        input_ids: Option<GpuTensor>,
+        input_ids: Option<TensorView<'_>>,
         intermediate: Option<(vllm_cuda::OwnedTensor, vllm_cuda::OwnedTensor)>,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> vllm_cuda::model::llama::ForwardOutput {
         match self {
             Self::Llama(m) => unsafe {
@@ -1745,7 +1745,7 @@ impl CudaWorker {
         };
 
         let input_ids = if pp.is_first_stage() {
-            Some(*gpu_input_ids)
+            Some(gpu_input_ids.view())
         } else {
             None
         };
@@ -1755,16 +1755,16 @@ impl CudaWorker {
             model.forward_pp(
                 input_ids,
                 intermediate,
-                *gpu_positions,
-                *slot_mapping,
-                *cu_seqlens_q,
-                *seqused_k,
-                *block_table,
+                gpu_positions.view(),
+                slot_mapping.view(),
+                cu_seqlens_q.view(),
+                seqused_k.view(),
+                block_table.view(),
                 max_seqlen_q,
                 max_seqlen_k,
                 kv_cache,
                 device,
-                last_token_indices.as_deref().copied(),
+                last_token_indices.as_ref().map(|t| t.view()),
             )
         };
 
@@ -4173,12 +4173,12 @@ impl Worker for CudaWorker {
         // Run the forward pass to warm up cuBLAS and measure peak memory.
         unsafe {
             let _ = model.forward(
-                dummy_ids,
-                dummy_pos,
-                dummy_slots,
-                gpu_cu_q,
-                dummy_seqused,
-                dummy_bt,
+                TensorView::from_raw(dummy_ids),
+                TensorView::from_raw(dummy_pos),
+                TensorView::from_raw(dummy_slots),
+                TensorView::from_raw(gpu_cu_q),
+                TensorView::from_raw(dummy_seqused),
+                TensorView::from_raw(dummy_bt),
                 prefill_tokens,
                 prefill_tokens,
                 &dummy_kv,
@@ -4369,12 +4369,12 @@ impl Worker for CudaWorker {
             let result = unsafe {
                 runner.capture(bs, device, |inputs, dev| {
                     model_ref.forward(
-                        inputs.input_ids,
-                        inputs.positions,
-                        inputs.slot_mapping,
-                        inputs.cu_seqlens_q,
-                        inputs.seqused_k,
-                        inputs.block_table,
+                        TensorView::from_raw(inputs.input_ids),
+                        TensorView::from_raw(inputs.positions),
+                        TensorView::from_raw(inputs.slot_mapping),
+                        TensorView::from_raw(inputs.cu_seqlens_q),
+                        TensorView::from_raw(inputs.seqused_k),
+                        TensorView::from_raw(inputs.block_table),
                         1, // max_seqlen_q = 1 for decode
                         padded_max_seqlen_k,
                         kv_ref,
@@ -4445,17 +4445,17 @@ impl Worker for CudaWorker {
                         let result = unsafe {
                             prefill_runner.capture(num_tokens, device, |inputs, dev| {
                                 model_ref.forward(
-                                    inputs.input_ids,
-                                    inputs.positions,
-                                    inputs.slot_mapping,
-                                    inputs.cu_seqlens_q,
-                                    inputs.seqused_k,
-                                    inputs.block_table,
+                                    TensorView::from_raw(inputs.input_ids),
+                                    TensorView::from_raw(inputs.positions),
+                                    TensorView::from_raw(inputs.slot_mapping),
+                                    TensorView::from_raw(inputs.cu_seqlens_q),
+                                    TensorView::from_raw(inputs.seqused_k),
+                                    TensorView::from_raw(inputs.block_table),
                                     num_tokens, // max_seqlen_q
                                     num_tokens, // max_seqlen_k
                                     kv_ref,
                                     dev,
-                                    Some(inputs.last_token_indices),
+                                    Some(TensorView::from_raw(inputs.last_token_indices)),
                                 )
                             })
                         };
@@ -4685,12 +4685,12 @@ impl Worker for CudaWorker {
             // Forward pass (backbone only).
             let hidden_states = unsafe {
                 model.hidden_states(
-                    *gpu_input_ids,
-                    *gpu_positions,
-                    *gpu_slot_mapping,
-                    *gpu_cu_q,
-                    *gpu_seqused_k,
-                    *gpu_bt,
+                    gpu_input_ids.view(),
+                    gpu_positions.view(),
+                    gpu_slot_mapping.view(),
+                    gpu_cu_q.view(),
+                    gpu_seqused_k.view(),
+                    gpu_bt.view(),
                     num_tokens,
                     num_tokens,
                     kv_cache,
@@ -5171,12 +5171,12 @@ impl CudaWorker {
 
             let hidden_states = unsafe {
                 model.hidden_states(
-                    *gpu_input_ids,
-                    *gpu_positions,
-                    *slot_mapping,
-                    *cu_seqlens_q,
-                    *seqused_k,
-                    *block_table_gpu,
+                    gpu_input_ids.view(),
+                    gpu_positions.view(),
+                    slot_mapping.view(),
+                    cu_seqlens_q.view(),
+                    seqused_k.view(),
+                    block_table_gpu.view(),
                     max_seqlen_q,
                     max_seqlen_k,
                     kv_cache,
@@ -5443,17 +5443,17 @@ impl CudaWorker {
 
                 unsafe {
                     model.forward(
-                        *gpu_input_ids,
-                        *gpu_positions,
-                        *slot_mapping,
-                        *cu_seqlens_q,
-                        *seqused_k,
-                        *block_table_gpu,
+                        gpu_input_ids.view(),
+                        gpu_positions.view(),
+                        slot_mapping.view(),
+                        cu_seqlens_q.view(),
+                        seqused_k.view(),
+                        block_table_gpu.view(),
                         max_seqlen_q,
                         max_seqlen_k,
                         kv_cache,
                         device,
-                        last_token_indices.as_deref().copied(),
+                        last_token_indices.as_ref().map(|t| t.view()),
                     )
                 }
             };
@@ -6111,21 +6111,21 @@ impl CudaWorker {
                         Self::build_gdn_tensors(meta, device)?;
                     let logits = unsafe {
                         model.forward_qwen3_next(
-                            *gpu_input_ids,
-                            *gpu_positions,
-                            *slot_mapping,
-                            *cu_seqlens_q,
-                            *seqused_k,
-                            *block_table,
+                            gpu_input_ids.view(),
+                            gpu_positions.view(),
+                            slot_mapping.view(),
+                            cu_seqlens_q.view(),
+                            seqused_k.view(),
+                            block_table.view(),
                             max_seqlen_q,
                             max_seqlen_k,
                             kv_cache,
                             gdn_pool,
-                            *gdn_state_indices,
-                            *gdn_cu_seqlens,
+                            gdn_state_indices.view(),
+                            gdn_cu_seqlens.view(),
                             num_seqs,
                             device,
-                            last_token_indices.as_deref().copied(),
+                            last_token_indices.as_ref().map(|t| t.view()),
                         )
                     };
                     let logits_gpu = *logits;
@@ -6133,7 +6133,7 @@ impl CudaWorker {
                 } else if pp_active {
                     // PP last stage: use forward_pp with received intermediates.
                     let input_ids = if self.pp_config.unwrap().is_first_stage() {
-                        Some(*gpu_input_ids)
+                        Some(gpu_input_ids.view())
                     } else {
                         None
                     };
@@ -6141,16 +6141,16 @@ impl CudaWorker {
                         model.forward_pp(
                             input_ids,
                             pp_intermediate,
-                            *gpu_positions,
-                            *slot_mapping,
-                            *cu_seqlens_q,
-                            *seqused_k,
-                            *block_table,
+                            gpu_positions.view(),
+                            slot_mapping.view(),
+                            cu_seqlens_q.view(),
+                            seqused_k.view(),
+                            block_table.view(),
                             max_seqlen_q,
                             max_seqlen_k,
                             kv_cache,
                             device,
-                            last_token_indices.as_deref().copied(),
+                            last_token_indices.as_ref().map(|t| t.view()),
                         )
                     };
                     let logits = match result {
@@ -6163,17 +6163,17 @@ impl CudaWorker {
                 } else {
                     let owned = unsafe {
                         model.forward(
-                            *gpu_input_ids,
-                            *gpu_positions,
-                            *slot_mapping,
-                            *cu_seqlens_q,
-                            *seqused_k,
-                            *block_table,
+                            gpu_input_ids.view(),
+                            gpu_positions.view(),
+                            slot_mapping.view(),
+                            cu_seqlens_q.view(),
+                            seqused_k.view(),
+                            block_table.view(),
                             max_seqlen_q,
                             max_seqlen_k,
                             kv_cache,
                             device,
-                            last_token_indices.as_deref().copied(),
+                            last_token_indices.as_ref().map(|t| t.view()),
                         )
                     };
                     let logits = *owned;

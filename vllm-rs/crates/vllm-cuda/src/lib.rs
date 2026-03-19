@@ -27,7 +27,7 @@ pub mod dtype;
 pub mod tensor;
 
 pub use dtype::DType;
-pub use tensor::GpuTensor;
+pub use tensor::{GpuTensor, TensorView};
 
 // CUDA runtime (requires CUDA toolkit).
 #[cfg(feature = "cuda")]

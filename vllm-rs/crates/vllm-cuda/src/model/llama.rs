@@ -17,7 +17,7 @@ use crate::kv_cache::KvCachePool;
 use crate::layers::{Embedding, Linear, LinearLayer, RmsNorm};
 use crate::pp::PpConfig;
 use crate::quant::QuantConfig;
-use crate::tensor::GpuTensor;
+use crate::tensor::{GpuTensor, TensorView};
 use crate::weights::GpuWeights;
 use crate::weights::{self as gpu_weights};
 
@@ -288,7 +288,7 @@ pub struct LlamaMLP {
 
 impl LlamaMLP {
     /// Forward pass returning `OwnedTensor` (caching-allocator path).
-    pub unsafe fn forward(&self, x: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(&self, x: TensorView<'_>, device: &mut GpuDevice) -> OwnedTensor {
         let gate_up = if let Some(ref up_proj) = self.up_proj {
             // Quantized: separate gate + up GEMMs, then concat
             let gate_out = self.gate_up_proj.forward(
@@ -332,7 +332,7 @@ impl LlamaMLP {
         drop(gate_up);
 
         let result = self.down_proj.forward(
-            activated.as_gpu_tensor(),
+            activated.view(),
             &mut device.cublas,
             &mut device.caching,
             device.compute_stream,
@@ -421,12 +421,12 @@ impl LlamaAttention {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        hidden_states: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        hidden_states: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -506,7 +506,7 @@ impl LlamaAttention {
                     q_norm_w,
                     k_norm_w,
                     rotary.cos_sin_cache,
-                    positions,
+                    *positions,
                     self.num_q_heads,
                     self.num_kv_heads,
                     self.head_dim,
@@ -520,11 +520,11 @@ impl LlamaAttention {
                 let q = if kv_cache.is_fp8() {
                     kernels::fused_qkv_rope_cache_fp8(
                         qkv.as_gpu_tensor(),
-                        positions,
+                        *positions,
                         rotary.cos_sin_cache,
-                        slot_mapping,
-                        kv_cache.k_cache(self.layer_idx),
-                        kv_cache.v_cache(self.layer_idx),
+                        *slot_mapping,
+                        *kv_cache.k_cache(self.layer_idx),
+                        *kv_cache.v_cache(self.layer_idx),
                         kv_cache.k_scale_ptr(self.layer_idx),
                         kv_cache.v_scale_ptr(self.layer_idx),
                         self.q_size,
@@ -537,11 +537,11 @@ impl LlamaAttention {
                 } else {
                     kernels::fused_qkv_rope_cache(
                         qkv.as_gpu_tensor(),
-                        positions,
+                        *positions,
                         rotary.cos_sin_cache,
-                        slot_mapping,
-                        kv_cache.k_cache(self.layer_idx),
-                        kv_cache.v_cache(self.layer_idx),
+                        *slot_mapping,
+                        *kv_cache.k_cache(self.layer_idx),
+                        *kv_cache.v_cache(self.layer_idx),
                         self.q_size,
                         self.kv_size,
                         self.num_q_heads,
@@ -555,7 +555,7 @@ impl LlamaAttention {
                 // Decode attention reads from cache (K/V already written by fused kernel).
                 // Use attention_standard which handles both BF16 paged and FP8 dequant paths.
                 let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
-                    q.as_gpu_tensor(),
+                    q.view(),
                     cu_seqlens_q,
                     seqused_k,
                     block_table,
@@ -573,9 +573,7 @@ impl LlamaAttention {
                 drop(q);
 
                 // Reshape to [num_tokens, q_size] and output projection.
-                let attn_flat = attn_output
-                    .as_gpu_tensor()
-                    .reshape(&[num_tokens, self.q_size]);
+                let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
                 let result = self.o_proj.forward(
                     attn_flat,
                     &mut device.cublas,
@@ -597,7 +595,7 @@ impl LlamaAttention {
                 // Prefill path: standard fused QKV split + RoPE.
                 let result = kernels::fused_qkv_rope(
                     qkv.as_gpu_tensor(),
-                    positions,
+                    *positions,
                     rotary.cos_sin_cache,
                     self.q_size,
                     self.kv_size,
@@ -613,8 +611,8 @@ impl LlamaAttention {
 
         // Write new K/V into paged cache (BF16→FP8 when FP8 cache, else direct copy).
         crate::model::attention_helpers::write_kv_cache(
-            k.as_gpu_tensor(),
-            v.as_gpu_tensor(),
+            k.view(),
+            v.view(),
             slot_mapping,
             kv_cache,
             self.layer_idx,
@@ -623,9 +621,9 @@ impl LlamaAttention {
 
         // Attention: fresh prefill uses BF16 K/V, decode reads from cache.
         let attn_output = crate::model::attention_helpers::attention_standard(
-            q.as_gpu_tensor(),
-            k.as_gpu_tensor(),
-            v.as_gpu_tensor(),
+            q.view(),
+            k.view(),
+            v.view(),
             cu_seqlens_q,
             seqused_k,
             block_table,
@@ -643,9 +641,7 @@ impl LlamaAttention {
         drop(v);
 
         // Reshape to [num_tokens, q_size] and output projection.
-        let attn_flat = attn_output
-            .as_gpu_tensor()
-            .reshape(&[num_tokens, self.q_size]);
+        let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
         let result = self.o_proj.forward(
             attn_flat,
             &mut device.cublas,
@@ -704,11 +700,11 @@ impl LlamaDecoderLayer {
         &self,
         hidden_states: OwnedTensor,
         residual: Option<OwnedTensor>,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -748,7 +744,7 @@ impl LlamaDecoderLayer {
 
         // Attention reads normed values from hidden_states buffer.
         let attn_output = self.self_attn.forward(
-            *normed, // GpuTensor copy — kernel reads from this buffer
+            normed.view(), // TensorView — kernel reads from this buffer
             positions,
             slot_mapping,
             cu_seqlens_q,
@@ -781,7 +777,7 @@ impl LlamaDecoderLayer {
         // attn_output buffer now contains post-normed values.
 
         // MLP reads post-normed from attn_output buffer.
-        let mlp_output = self.mlp.forward(*attn_output, device);
+        let mlp_output = self.mlp.forward(attn_output.view(), device);
         // attn_output consumed by MLP — free it.
         drop(attn_output);
 
@@ -819,12 +815,12 @@ impl LlamaModel {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -833,7 +829,7 @@ impl LlamaModel {
         // Embedding lookup — owned, survives into first layer.
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
-            input_ids,
+            *input_ids,
             &mut device.caching,
             device.compute_stream,
         );
@@ -919,17 +915,17 @@ impl LlamaForCausalLM {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> OwnedTensor {
         let hidden_states = self.model.forward(
             input_ids,
@@ -947,7 +943,7 @@ impl LlamaForCausalLM {
         let hidden_states = if let Some(indices) = last_token_indices {
             kernels::embedding_gather(
                 hidden_states.as_gpu_tensor(),
-                indices,
+                *indices,
                 &mut device.caching,
                 device.compute_stream,
             )
@@ -956,7 +952,7 @@ impl LlamaForCausalLM {
         };
         #[allow(unused_mut)]
         let mut logits = self.lm_head.forward(
-            hidden_states.as_gpu_tensor(),
+            hidden_states.view(),
             &mut device.cublas,
             &mut device.caching,
             device.compute_stream,
@@ -2942,14 +2938,14 @@ impl LlamaModel {
         &self,
         pp: &PpConfig,
         // First stage only — input token IDs.
-        input_ids: Option<GpuTensor>,
+        input_ids: Option<TensorView<'_>>,
         // Non-first stages — received from previous stage.
         intermediate: Option<(OwnedTensor, OwnedTensor)>,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -2961,7 +2957,7 @@ impl LlamaModel {
                 let input_ids = input_ids.expect("first PP stage requires input_ids");
                 let hs = kernels::embedding_gather(
                     self.embed_tokens.weight,
-                    input_ids,
+                    *input_ids,
                     &mut device.caching,
                     device.compute_stream,
                 );
@@ -3105,18 +3101,18 @@ impl LlamaForCausalLM {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward_pp(
         &self,
-        input_ids: Option<GpuTensor>,
+        input_ids: Option<TensorView<'_>>,
         intermediate: Option<(OwnedTensor, OwnedTensor)>,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> ForwardOutput {
         let pp = self
             .pp_config
@@ -3146,22 +3142,24 @@ impl LlamaForCausalLM {
                 let gathered = if let Some(indices) = last_token_indices {
                     Some(kernels::embedding_gather(
                         hidden_states,
-                        indices,
+                        *indices,
                         &mut device.caching,
                         device.compute_stream,
                     ))
                 } else {
                     None
                 };
-                let hs_gpu = if let Some(ref g) = gathered {
-                    g.as_gpu_tensor()
+                let hs_view = if let Some(ref g) = gathered {
+                    g.view()
                 } else {
-                    hidden_states
+                    // Safety: hidden_states GpuTensor from ForwardOutput is valid
+                    // for this scope — the underlying memory is alive.
+                    unsafe { TensorView::from_raw(hidden_states) }
                 };
 
                 #[allow(unused_mut)]
                 let mut logits = self.lm_head.forward(
-                    hs_gpu,
+                    hs_view,
                     &mut device.cublas,
                     &mut device.caching,
                     device.compute_stream,

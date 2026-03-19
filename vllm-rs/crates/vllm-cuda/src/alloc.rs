@@ -11,7 +11,7 @@
 
 use crate::driver;
 use crate::dtype::DType;
-use crate::tensor::GpuTensor;
+use crate::tensor::{GpuTensor, TensorView};
 use std::collections::BTreeSet;
 use std::ptr;
 
@@ -638,6 +638,33 @@ impl OwnedTensor {
     /// The caller must ensure the new shape is compatible with the allocated size.
     pub unsafe fn reshape(&mut self, shape: &[usize], dtype: DType) {
         self.inner = GpuTensor::new(self.inner.raw_ptr(), shape, dtype);
+    }
+
+    /// Borrow this tensor as a lifetime-checked `TensorView`.
+    ///
+    /// The returned view borrows `&self`, so the compiler guarantees the
+    /// `OwnedTensor` (and its GPU memory) outlives the view.
+    pub fn view(&self) -> TensorView<'_> {
+        // Safety: the OwnedTensor owns the memory; the view borrows &self.
+        unsafe { TensorView::from_raw(self.inner) }
+    }
+
+    /// Create a sub-view at a byte offset into this tensor's memory.
+    ///
+    /// Useful for the packed sampling parameter pattern where one `OwnedTensor`
+    /// backs multiple logical tensors at different offsets.
+    ///
+    /// # Safety
+    /// `byte_offset + numel(new_shape) * dtype.size_bytes()` must not exceed
+    /// the allocated size of this tensor.
+    pub unsafe fn view_offset(
+        &self,
+        byte_offset: usize,
+        new_shape: &[usize],
+        dtype: DType,
+    ) -> TensorView<'_> {
+        let inner = GpuTensor::new(self.inner.raw_ptr().add(byte_offset), new_shape, dtype);
+        TensorView::from_raw(inner)
     }
 }
 

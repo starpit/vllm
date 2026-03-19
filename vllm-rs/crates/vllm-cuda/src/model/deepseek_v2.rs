@@ -24,7 +24,7 @@ use crate::kv_cache::KvCachePool;
 use crate::layers::{Embedding, Linear, RmsNorm};
 use crate::layers_moe::{Fp8FusedMoELayer, FusedMoELayer};
 use crate::model::llama::{LlamaMLP, RotaryCache, TpConfig};
-use crate::tensor::GpuTensor;
+use crate::tensor::{GpuTensor, TensorView};
 use crate::weights as gpu_weights;
 use crate::weights::GpuWeights;
 
@@ -418,12 +418,12 @@ impl DeepSeekV2Attention {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        hidden_states: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        hidden_states: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -441,7 +441,7 @@ impl DeepSeekV2Attention {
                 let q_a = q_a_proj.forward(hidden_states, &mut device.cublas, &mut device.caching);
                 // q = q_a_layernorm(q_a) → [num_tokens, q_lora_rank]
                 let q_normed = kernels::rms_norm(
-                    q_a.as_gpu_tensor(),
+                    *q_a.view(),
                     q_a_ln.weight,
                     q_a_ln.eps,
                     &mut device.caching,
@@ -449,11 +449,9 @@ impl DeepSeekV2Attention {
                 );
                 drop(q_a);
                 // q = q_b_proj(q_normed) → [num_tokens, num_heads * qk_head_dim]
-                let q = self.q_b_proj.forward(
-                    q_normed.as_gpu_tensor(),
-                    &mut device.cublas,
-                    &mut device.caching,
-                );
+                let q =
+                    self.q_b_proj
+                        .forward(q_normed.view(), &mut device.cublas, &mut device.caching);
                 drop(q_normed);
                 q
             } else {
@@ -483,20 +481,19 @@ impl DeepSeekV2Attention {
 
         // For RMS norm on the latent part, we need a contiguous [num_tokens, kv_lora_rank] tensor.
         // Split kv_a_out into two parts.
-        let kv_a_latent = device.caching.alloc_tensor(
-            &[num_tokens, self.kv_lora_rank],
-            kv_a_out.as_gpu_tensor().dtype(),
-        );
+        let kv_a_latent = device
+            .caching
+            .alloc_tensor(&[num_tokens, self.kv_lora_rank], kv_a_out.view().dtype());
         let k_pe_compressed = device.caching.alloc_tensor(
             &[num_tokens, self.qk_rope_head_dim],
-            kv_a_out.as_gpu_tensor().dtype(),
+            kv_a_out.view().dtype(),
         );
 
         // Split kv_a_out[:, :kv_lora_rank] → kv_a_latent, kv_a_out[:, kv_lora_rank:] → k_pe
         kernels::mla_split_kv_a(
-            kv_a_out.as_gpu_tensor(),
-            kv_a_latent.as_gpu_tensor(),
-            k_pe_compressed.as_gpu_tensor(),
+            *kv_a_out.view(),
+            *kv_a_latent.view(),
+            *k_pe_compressed.view(),
             self.kv_lora_rank,
             self.qk_rope_head_dim,
             stream,
@@ -505,7 +502,7 @@ impl DeepSeekV2Attention {
 
         // kv_a_layernorm on latent → [num_tokens, kv_lora_rank]
         let kv_a_normed = kernels::rms_norm(
-            kv_a_latent.as_gpu_tensor(),
+            *kv_a_latent.view(),
             self.kv_a_layernorm.weight,
             self.kv_a_layernorm.eps,
             &mut device.caching,
@@ -514,11 +511,9 @@ impl DeepSeekV2Attention {
         drop(kv_a_latent);
 
         // kv_b_proj(kv_a_normed) → [num_tokens, num_heads * (nope_dim + v_head_dim)]
-        let kv_b_out = self.kv_b_proj.forward(
-            kv_a_normed.as_gpu_tensor(),
-            &mut device.cublas,
-            &mut device.caching,
-        );
+        let kv_b_out =
+            self.kv_b_proj
+                .forward(kv_a_normed.view(), &mut device.cublas, &mut device.caching);
         drop(kv_a_normed);
 
         // kv_b_out is [num_tokens, num_heads * (nope_dim + v_head_dim)]
@@ -546,8 +541,9 @@ impl DeepSeekV2Attention {
 
         // Extract q_pe from q_proj_out: for each head h, the last rope_dim elements
         kernels::mla_extract_q_pe(
-            q_proj_out.as_gpu_tensor(),
-            q_pe.as_gpu_tensor()
+            *q_proj_out.view(),
+            *q_pe
+                .view()
                 .reshape(&[num_tokens, self.num_heads * self.qk_rope_head_dim]),
             self.num_heads,
             self.qk_head_dim,
@@ -559,15 +555,15 @@ impl DeepSeekV2Attention {
         // Apply interleaved RoPE to q_pe [num_tokens, num_heads * rope_dim]
         // and k_pe [num_tokens, 1 * rope_dim]
         let q_pe_2d = q_pe
-            .as_gpu_tensor()
+            .view()
             .reshape(&[num_tokens, self.num_heads * self.qk_rope_head_dim]);
         let k_pe_2d = k_pe_compressed
-            .as_gpu_tensor()
+            .view()
             .reshape(&[num_tokens, self.qk_rope_head_dim]);
         kernels::rotary_embedding_interleaved_inplace(
-            q_pe_2d,
-            k_pe_2d,
-            positions,
+            *q_pe_2d,
+            *k_pe_2d,
+            *positions,
             rotary.cos_sin_cache,
             self.qk_rope_head_dim,
             stream,
@@ -575,9 +571,10 @@ impl DeepSeekV2Attention {
 
         // Write q_pe back into q_proj_out (the rope portion of each head)
         kernels::mla_write_q_pe(
-            q_pe.as_gpu_tensor()
+            *q_pe
+                .view()
                 .reshape(&[num_tokens, self.num_heads * self.qk_rope_head_dim]),
-            q_proj_out.as_gpu_tensor(),
+            *q_proj_out.view(),
             self.num_heads,
             self.qk_head_dim,
             self.qk_nope_head_dim,
@@ -589,7 +586,7 @@ impl DeepSeekV2Attention {
         // Now q_proj_out has the full Q with RoPE applied to the pe portion.
         // Reshape to [num_tokens, num_heads, qk_head_dim]
         let q = q_proj_out
-            .as_gpu_tensor()
+            .view()
             .reshape(&[num_tokens, self.num_heads, self.qk_head_dim]);
 
         // Assemble K: [k_nope | k_pe_broadcast] → [num_tokens, num_heads, qk_head_dim]
@@ -597,9 +594,9 @@ impl DeepSeekV2Attention {
             .caching
             .alloc_tensor(&[num_tokens, self.num_heads, self.qk_head_dim], dtype);
         kernels::mla_assemble_k(
-            kv_b_out.as_gpu_tensor(),
-            k_pe_compressed.as_gpu_tensor(),
-            k.as_gpu_tensor()
+            *kv_b_out.view(),
+            *k_pe_compressed.view(),
+            *k.view()
                 .reshape(&[num_tokens, self.num_heads * self.qk_head_dim]),
             self.num_heads,
             self.qk_nope_head_dim,
@@ -615,17 +612,11 @@ impl DeepSeekV2Attention {
             .caching
             .alloc_tensor(&[num_tokens, self.num_heads, self.qk_head_dim], dtype);
         // Zero the entire V buffer first
-        driver::memset_d8(
-            v.as_gpu_tensor().raw_ptr(),
-            0,
-            v.as_gpu_tensor().size_bytes(),
-            stream,
-        )
-        .expect("memset V");
+        driver::memset_d8(v.view().raw_ptr(), 0, v.view().size_bytes(), stream).expect("memset V");
         // Copy v_head_dim portion from kv_b_out
         kernels::mla_assemble_v(
-            kv_b_out.as_gpu_tensor(),
-            v.as_gpu_tensor()
+            *kv_b_out.view(),
+            *v.view()
                 .reshape(&[num_tokens, self.num_heads * self.qk_head_dim]),
             self.num_heads,
             self.qk_nope_head_dim,
@@ -637,8 +628,8 @@ impl DeepSeekV2Attention {
 
         // Write K, V into paged cache (BF16→FP8 when FP8 cache).
         crate::model::attention_helpers::write_kv_cache(
-            k.as_gpu_tensor(),
-            v.as_gpu_tensor(),
+            k.view(),
+            v.view(),
             slot_mapping,
             kv_cache,
             self.layer_idx,
@@ -648,8 +639,8 @@ impl DeepSeekV2Attention {
         // FlashAttention
         let attn_output = crate::model::attention_helpers::attention_standard(
             q,
-            k.as_gpu_tensor(),
-            v.as_gpu_tensor(),
+            k.view(),
+            v.view(),
             cu_seqlens_q,
             seqused_k,
             block_table,
@@ -674,10 +665,10 @@ impl DeepSeekV2Attention {
                 .caching
                 .alloc_tensor(&[num_tokens, self.num_heads * self.v_head_dim], dtype);
             kernels::mla_slice_attn_output(
-                attn_output
-                    .as_gpu_tensor()
+                *attn_output
+                    .view()
                     .reshape(&[num_tokens, self.num_heads * self.qk_head_dim]),
-                sliced.as_gpu_tensor(),
+                *sliced.view(),
                 self.num_heads,
                 self.qk_head_dim,
                 self.v_head_dim,
@@ -691,18 +682,16 @@ impl DeepSeekV2Attention {
         };
 
         // o_proj: [num_tokens, num_heads * v_head_dim] → [num_tokens, hidden_size]
-        let result = self.o_proj.forward(
-            o_input.as_gpu_tensor(),
-            &mut device.cublas,
-            &mut device.caching,
-        );
+        let result = self
+            .o_proj
+            .forward(o_input.view(), &mut device.cublas, &mut device.caching);
         drop(o_input);
 
         // TP all-reduce
         #[cfg(feature = "nccl")]
         if let Some(ref group) = self.tp_group {
             group
-                .all_reduce_inplace(result.as_gpu_tensor())
+                .all_reduce_inplace(*result.view())
                 .expect("o_proj all_reduce failed");
         }
 
@@ -727,7 +716,11 @@ pub struct DeepSeekV2MoE {
 }
 
 impl DeepSeekV2MoE {
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
         let stream = device.compute_stream;
 
         // MoE path
@@ -736,7 +729,7 @@ impl DeepSeekV2MoE {
         // Scale routed output by routed_scaling_factor (Python: final_hidden_states *= routed_scaling_factor)
         if self.routed_scaling_factor != 1.0 {
             kernels::scale_inplace(
-                moe_out.as_gpu_tensor(),
+                *moe_out.view(),
                 self.routed_scaling_factor as f32,
                 &device.cublas,
             );
@@ -747,7 +740,7 @@ impl DeepSeekV2MoE {
             self.shared_gate_up
                 .forward(hidden_states, &mut device.cublas, &mut device.caching);
         let shared_activated = kernels::silu_and_mul_fused(
-            shared_gu.as_gpu_tensor(),
+            *shared_gu.view(),
             self.shared_intermediate_size,
             &mut device.caching,
             stream,
@@ -755,14 +748,14 @@ impl DeepSeekV2MoE {
         drop(shared_gu);
 
         let shared_out = self.shared_down.forward(
-            shared_activated.as_gpu_tensor(),
+            shared_activated.view(),
             &mut device.cublas,
             &mut device.caching,
         );
         drop(shared_activated);
 
         // output = moe_out + shared_out (simple add, no sigmoid gate)
-        kernels::add_inplace(moe_out.as_gpu_tensor(), shared_out.as_gpu_tensor(), stream);
+        kernels::add_inplace(*moe_out.view(), *shared_out.view(), stream);
         drop(shared_out);
 
         moe_out
@@ -778,14 +771,18 @@ pub struct DeepSeekV2Fp8MoE {
 }
 
 impl DeepSeekV2Fp8MoE {
-    pub unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
         let stream = device.compute_stream;
 
         let moe_out = self.moe.forward(hidden_states, device);
 
         if self.routed_scaling_factor != 1.0 {
             kernels::scale_inplace(
-                moe_out.as_gpu_tensor(),
+                *moe_out.view(),
                 self.routed_scaling_factor as f32,
                 &device.cublas,
             );
@@ -795,7 +792,7 @@ impl DeepSeekV2Fp8MoE {
             self.shared_gate_up
                 .forward(hidden_states, &mut device.cublas, &mut device.caching);
         let shared_activated = kernels::silu_and_mul_fused(
-            shared_gu.as_gpu_tensor(),
+            *shared_gu.view(),
             self.shared_intermediate_size,
             &mut device.caching,
             stream,
@@ -803,13 +800,13 @@ impl DeepSeekV2Fp8MoE {
         drop(shared_gu);
 
         let shared_out = self.shared_down.forward(
-            shared_activated.as_gpu_tensor(),
+            shared_activated.view(),
             &mut device.cublas,
             &mut device.caching,
         );
         drop(shared_activated);
 
-        kernels::add_inplace(moe_out.as_gpu_tensor(), shared_out.as_gpu_tensor(), stream);
+        kernels::add_inplace(*moe_out.view(), *shared_out.view(), stream);
         drop(shared_out);
 
         moe_out
@@ -827,7 +824,7 @@ enum DeepSeekV2Mlp {
 }
 
 impl DeepSeekV2Mlp {
-    unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
+    unsafe fn forward(&self, hidden_states: TensorView<'_>, device: &mut GpuDevice) -> OwnedTensor {
         match self {
             Self::Dense(mlp) => mlp.forward(hidden_states, device),
             Self::MoE(moe) => moe.forward(hidden_states, device),
@@ -1101,11 +1098,11 @@ impl DeepSeekV2DecoderLayer {
         &self,
         hidden_states: OwnedTensor,
         residual: Option<OwnedTensor>,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -1135,7 +1132,7 @@ impl DeepSeekV2DecoderLayer {
         };
 
         let attn_output = self.self_attn.forward(
-            *normed,
+            normed.view(),
             positions,
             slot_mapping,
             cu_seqlens_q,
@@ -1158,7 +1155,7 @@ impl DeepSeekV2DecoderLayer {
             device.compute_stream,
         );
 
-        let mlp_output = self.mlp.forward(*attn_output, device);
+        let mlp_output = self.mlp.forward(attn_output.view(), device);
         drop(attn_output);
 
         (mlp_output, residual)
@@ -1233,12 +1230,12 @@ impl DeepSeekV2Model {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -1246,7 +1243,7 @@ impl DeepSeekV2Model {
     ) -> OwnedTensor {
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
-            input_ids,
+            *input_ids,
             &mut device.caching,
             device.compute_stream,
         );
@@ -1274,7 +1271,7 @@ impl DeepSeekV2Model {
         }
 
         let hs_gpu = *hidden_states;
-        let res_gpu = residual.as_ref().unwrap().as_gpu_tensor();
+        let res_gpu = *residual.as_ref().unwrap().view();
         kernels::fused_add_rms_norm_inplace(
             hs_gpu,
             res_gpu,
@@ -1311,17 +1308,17 @@ impl DeepSeekV2ForCausalLM {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> OwnedTensor {
         let hidden_states = self.model.forward(
             input_ids,
@@ -1339,7 +1336,7 @@ impl DeepSeekV2ForCausalLM {
         let hidden_states = if let Some(indices) = last_token_indices {
             kernels::embedding_gather(
                 *hidden_states,
-                indices,
+                *indices,
                 &mut device.caching,
                 device.compute_stream,
             )
@@ -1347,8 +1344,11 @@ impl DeepSeekV2ForCausalLM {
             hidden_states
         };
 
-        self.lm_head
-            .forward(*hidden_states, &mut device.cublas, &mut device.caching)
+        self.lm_head.forward(
+            hidden_states.view(),
+            &mut device.cublas,
+            &mut device.caching,
+        )
     }
 
     /// Set TP group on all layers.

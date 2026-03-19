@@ -22,7 +22,7 @@ use crate::layers::{Embedding, Linear, LinearLayer};
 use crate::model::gemma2::{GemmaRmsNorm, add_one_to_weight};
 use crate::model::llama::{LlamaAttention, LlamaConfig, LlamaMLP, RotaryCache};
 use crate::model::qwen3_moe::{Qwen3MoeConfig, Qwen3MoeDecoderLayer, Qwen3MoeMlp};
-use crate::tensor::GpuTensor;
+use crate::tensor::{GpuTensor, TensorView};
 use crate::weights::GpuWeights;
 
 // ---------------------------------------------------------------------------
@@ -460,10 +460,10 @@ impl GdnWeights {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        hidden_states: GpuTensor,
+        hidden_states: TensorView<'_>,
         gdn_state_pool: &GdnStatePool,
-        state_indices: GpuTensor, // [batch_size] i32 — slot indices into pool
-        cu_seqlens: GpuTensor,    // [batch_size + 1] i32 — cumulative seq lens
+        state_indices: TensorView<'_>, // [batch_size] i32 — slot indices into pool
+        cu_seqlens: TensorView<'_>,    // [batch_size + 1] i32 — cumulative seq lens
         num_seqs: usize,
         device: &mut GpuDevice,
     ) -> OwnedTensor {
@@ -489,8 +489,8 @@ impl GdnWeights {
 
         let (_q_split, _k_split, _v_split, z_owned, a_owned, b_owned, mixed_owned) =
             kernels::gdn_qkvz_split(
-                qkvz.as_gpu_tensor(),
-                ba.as_gpu_tensor(),
+                *qkvz.view(),
+                *ba.view(),
                 num_tokens,
                 num_k_heads,
                 num_v_heads,
@@ -505,17 +505,17 @@ impl GdnWeights {
         drop(qkvz);
         drop(ba);
 
-        let mixed_qkv_gpu = mixed_owned.as_gpu_tensor();
-        let a_gpu = a_owned.as_gpu_tensor();
-        let b_gpu = b_owned.as_gpu_tensor();
-        let z_gpu = z_owned.as_gpu_tensor();
+        let mixed_qkv_gpu = *mixed_owned.view();
+        let a_gpu = *a_owned.view();
+        let b_gpu = *b_owned.view();
+        let z_gpu = *z_owned.view();
 
         // Transform state_indices: slot * num_gdn_layers + gdn_layer_idx
         // for proper per-layer indexing into the state pool.
         let num_gdn_layers = gdn_state_pool.num_gdn_layers;
         let gdn_layer_idx = self.gdn_layer_idx;
         let adjusted_indices = if num_gdn_layers > 1 {
-            let indices_cpu = download_to_cpu_i32(state_indices, stream);
+            let indices_cpu = download_to_cpu_i32(*state_indices, stream);
             let adjusted: Vec<i32> = indices_cpu
                 .iter()
                 .map(|&s| s * num_gdn_layers as i32 + gdn_layer_idx as i32)
@@ -526,7 +526,7 @@ impl GdnWeights {
         } else {
             None
         };
-        let eff_state_indices = adjusted_indices.as_ref().map_or(state_indices, |t| *t);
+        let eff_state_indices = adjusted_indices.as_ref().map_or(*state_indices, |t| *t);
 
         // 3. Causal conv1d on GPU.
         let conv_out = device
@@ -538,7 +538,7 @@ impl GdnWeights {
                 gdn_state_pool.conv_states,
                 mixed_qkv_gpu,
                 self.conv1d_weight,
-                conv_out.as_gpu_tensor(),
+                *conv_out.view(),
                 eff_state_indices,
                 conv_dim,
                 self.conv_kernel_size,
@@ -548,8 +548,8 @@ impl GdnWeights {
         } else {
             // Prefill path: iterate per sequence using cu_seqlens and state_indices.
             // Read cu_seqlens and state_indices to CPU (small arrays).
-            let cu_seqlens_cpu = download_to_cpu_i32(cu_seqlens, stream);
-            let state_indices_cpu = download_to_cpu_i32(state_indices, stream);
+            let cu_seqlens_cpu = download_to_cpu_i32(*cu_seqlens, stream);
+            let state_indices_cpu = download_to_cpu_i32(*state_indices, stream);
 
             for s in 0..num_seqs {
                 let seq_start = cu_seqlens_cpu[s] as usize;
@@ -569,7 +569,7 @@ impl GdnWeights {
                     DType::F32,
                 );
                 let out_view = GpuTensor::new(
-                    conv_out.as_gpu_tensor().raw_ptr().add(byte_offset),
+                    conv_out.view().raw_ptr().add(byte_offset),
                     &[seq_len, conv_dim],
                     DType::F32,
                 );
@@ -590,7 +590,7 @@ impl GdnWeights {
 
         // Split conv output into Q, K, V on GPU (no CPU round-trip).
         let (q_owned, k_owned, v_owned) = kernels::gdn_conv_split(
-            conv_out.as_gpu_tensor(),
+            *conv_out.view(),
             num_tokens,
             num_k_heads,
             num_v_heads,
@@ -604,9 +604,9 @@ impl GdnWeights {
         );
         drop(conv_out);
 
-        let q_gpu = q_owned.as_gpu_tensor();
-        let k_gpu = k_owned.as_gpu_tensor();
-        let v_gpu = v_owned.as_gpu_tensor();
+        let q_gpu = *q_owned.view();
+        let k_gpu = *k_owned.view();
+        let v_gpu = *v_owned.view();
 
         // 4. Fused gating: g, beta on GPU.
         let g_gpu = device
@@ -616,8 +616,8 @@ impl GdnWeights {
             .caching
             .alloc_tensor(&[num_tokens, num_v_heads], DType::F32);
         kernels::gdn_gating(
-            g_gpu.as_gpu_tensor(),
-            beta_gpu.as_gpu_tensor(),
+            *g_gpu.view(),
+            *beta_gpu.view(),
             self.a_log,
             a_gpu,
             b_gpu,
@@ -636,12 +636,12 @@ impl GdnWeights {
             q_gpu,
             k_gpu,
             v_gpu,
-            g_gpu.as_gpu_tensor(),
-            beta_gpu.as_gpu_tensor(),
-            o_gpu.as_gpu_tensor(),
+            *g_gpu.view(),
+            *beta_gpu.view(),
+            *o_gpu.view(),
             gdn_state_pool.ssm_states,
             eff_state_indices,
-            cu_seqlens,
+            *cu_seqlens,
             scale,
             num_seqs,
             num_tokens,
@@ -658,16 +658,16 @@ impl GdnWeights {
         // o_gpu: [num_tokens, num_v_heads, head_v_dim] → reshape to [num_tokens * num_v_heads, head_v_dim]
         // z_gpu: [num_tokens, value_dim] → reshape to [num_tokens * num_v_heads, head_v_dim]
         let total_rows = num_tokens * num_v_heads;
-        let o_flat = o_gpu.as_gpu_tensor().reshape(&[total_rows, head_v_dim]);
+        let o_flat = o_gpu.view().reshape(&[total_rows, head_v_dim]);
         let z_flat = z_gpu.reshape(&[total_rows, head_v_dim]);
         let normed = device
             .caching
             .alloc_tensor(&[total_rows, head_v_dim], DType::F32);
         kernels::gdn_rms_norm_gated(
-            o_flat,
+            *o_flat,
             z_flat,
             self.norm_weight,
-            normed.as_gpu_tensor(),
+            *normed.view(),
             self.norm_eps,
             head_v_dim,
             total_rows,
@@ -676,18 +676,18 @@ impl GdnWeights {
         drop(o_gpu);
 
         // Reshape normed to [num_tokens, value_dim] for output projection.
-        let normed_flat = normed.as_gpu_tensor().reshape(&[num_tokens, value_dim]);
+        let normed_flat = normed.view().reshape(&[num_tokens, value_dim]);
 
         // Cast f32 GDN output back to model dtype before out_proj GEMM
         // (matches Python which stores recurrence output in model dtype).
         let proj_input = if self.model_dtype != DType::F32 {
-            kernels::cast_from_f32(normed_flat, self.model_dtype, &mut device.caching, stream)
+            kernels::cast_from_f32(*normed_flat, self.model_dtype, &mut device.caching, stream)
         } else {
             normed
         };
         // 7. Output projection on GPU.
         let result = self.out_proj.forward(
-            proj_input.as_gpu_tensor().reshape(&[num_tokens, value_dim]),
+            proj_input.view().reshape(&[num_tokens, value_dim]),
             &mut device.cublas,
             &mut device.caching,
         );
@@ -832,12 +832,12 @@ impl Qwen3NextFullAttention {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        hidden_states: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        hidden_states: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -865,7 +865,7 @@ impl Qwen3NextFullAttention {
         let num_kv_heads = self.inner.num_kv_heads;
 
         let (q, k, v) = kernels::split_qkv(
-            qkv.as_gpu_tensor(),
+            *qkv.view(),
             q_size,
             kv_size,
             if self.attn_output_gate {
@@ -884,7 +884,7 @@ impl Qwen3NextFullAttention {
         let (q, gate) = if self.attn_output_gate {
             // q is [num_tokens, 2*num_q_heads, head_dim].
             // Split into q [num_tokens, num_q_heads, head_dim] and gate [num_tokens, num_q_heads, head_dim].
-            let q_tensor = q.as_gpu_tensor();
+            let q_tensor = *q.view();
             let total_elems = num_tokens * num_q_heads * head_dim;
             let elem_bytes = q_tensor.dtype().size_bytes();
 
@@ -936,8 +936,8 @@ impl Qwen3NextFullAttention {
         {
             // Apply per-head RMS norm to Q and K.
             kernels::qk_norm_inplace(
-                q.as_gpu_tensor(),
-                k.as_gpu_tensor(),
+                *q.view(),
+                *k.view(),
                 q_norm_w,
                 k_norm_w,
                 num_q_heads,
@@ -950,10 +950,10 @@ impl Qwen3NextFullAttention {
 
         // 5. Apply partial RoPE to Q and K in-place.
         kernels::apply_rope_qk_inplace(
-            q.as_gpu_tensor(),
-            k.as_gpu_tensor(),
+            *q.view(),
+            *k.view(),
             rotary.cos_sin_cache,
-            positions,
+            *positions,
             num_q_heads,
             num_kv_heads,
             head_dim,
@@ -962,8 +962,8 @@ impl Qwen3NextFullAttention {
 
         // 6. Write K/V to paged cache (BF16→FP8 when FP8 cache).
         crate::model::attention_helpers::write_kv_cache(
-            k.as_gpu_tensor(),
-            v.as_gpu_tensor(),
+            k.view(),
+            v.view(),
             slot_mapping,
             kv_cache,
             kv_layer_idx,
@@ -972,9 +972,9 @@ impl Qwen3NextFullAttention {
 
         // 7. FlashAttention-2.
         let attn_output = crate::model::attention_helpers::attention_standard(
-            q.as_gpu_tensor(),
-            k.as_gpu_tensor(),
-            v.as_gpu_tensor(),
+            q.view(),
+            k.view(),
+            v.view(),
             cu_seqlens_q,
             seqused_k,
             block_table,
@@ -997,19 +997,15 @@ impl Qwen3NextFullAttention {
             // gate is [num_tokens, num_q_heads, head_dim]
             // Apply sigmoid(gate) * attn_output element-wise.
             kernels::sigmoid_mul_inplace(
-                attn_output.as_gpu_tensor(),
-                gate.as_gpu_tensor(),
+                *attn_output.view(),
+                *gate.view(),
                 &mut device.caching,
                 stream,
             );
             drop(gate);
-            attn_output
-                .as_gpu_tensor()
-                .reshape(&[num_tokens, self.true_q_size])
+            attn_output.view().reshape(&[num_tokens, self.true_q_size])
         } else {
-            attn_output
-                .as_gpu_tensor()
-                .reshape(&[num_tokens, self.true_q_size])
+            attn_output.view().reshape(&[num_tokens, self.true_q_size])
         };
 
         // 9. Output projection.
@@ -1023,7 +1019,7 @@ impl Qwen3NextFullAttention {
         #[cfg(feature = "nccl")]
         if let Some(ref group) = self.inner.tp_group {
             group
-                .all_reduce_inplace(result.as_gpu_tensor())
+                .all_reduce_inplace(*result.view())
                 .expect("o_proj all_reduce failed");
         }
 
@@ -1068,18 +1064,18 @@ impl Qwen3NextDecoderLayer {
         &self,
         hidden_states: OwnedTensor,
         residual: Option<OwnedTensor>,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         rotary: &RotaryCache,
         gdn_state_pool: &GdnStatePool,
-        gdn_state_indices: GpuTensor, // [batch] i32 — slot indices for GDN state
-        gdn_cu_seqlens: GpuTensor,    // [batch+1] i32 — cumsum of seq lens
+        gdn_state_indices: TensorView<'_>, // [batch] i32 — slot indices for GDN state
+        gdn_cu_seqlens: TensorView<'_>,    // [batch+1] i32 — cumsum of seq lens
         num_seqs: usize,
         device: &mut GpuDevice,
     ) -> (OwnedTensor, OwnedTensor) {
@@ -1115,7 +1111,7 @@ impl Qwen3NextDecoderLayer {
                     .kv_layer_idx
                     .expect("full attn layer must have kv_layer_idx");
                 attn.forward(
-                    *normed,
+                    normed.view(),
                     positions,
                     slot_mapping,
                     cu_seqlens_q,
@@ -1130,7 +1126,7 @@ impl Qwen3NextDecoderLayer {
                 )
             }
             Qwen3NextAttnVariant::LinearAttention(gdn) => gdn.forward(
-                *normed,
+                normed.view(),
                 gdn_state_pool,
                 gdn_state_indices,
                 gdn_cu_seqlens,
@@ -1158,8 +1154,8 @@ impl Qwen3NextDecoderLayer {
 
         // MLP.
         let mlp_output = match &self.mlp {
-            Qwen3NextMlpVariant::Dense(mlp) => mlp.forward(*attn_output, device),
-            Qwen3NextMlpVariant::MoE(moe) => moe.forward(*attn_output, device),
+            Qwen3NextMlpVariant::Dense(mlp) => mlp.forward(attn_output.view(), device),
+            Qwen3NextMlpVariant::MoE(moe) => moe.forward(attn_output.view(), device),
         };
         drop(attn_output);
 
@@ -1327,24 +1323,24 @@ impl Qwen3NextModel {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         gdn_state_pool: &GdnStatePool,
-        gdn_state_indices: GpuTensor,
-        gdn_cu_seqlens: GpuTensor,
+        gdn_state_indices: TensorView<'_>,
+        gdn_cu_seqlens: TensorView<'_>,
         num_seqs: usize,
         device: &mut GpuDevice,
     ) -> OwnedTensor {
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
-            input_ids,
+            *input_ids,
             &mut device.caching,
             device.compute_stream,
         );
@@ -1377,7 +1373,7 @@ impl Qwen3NextModel {
 
         // Final norm.
         let hs_gpu = *hidden_states;
-        let res_gpu = residual.as_ref().unwrap().as_gpu_tensor();
+        let res_gpu = *residual.as_ref().unwrap().view();
         kernels::fused_add_rms_norm_inplace(
             hs_gpu,
             res_gpu,
@@ -1418,21 +1414,21 @@ impl Qwen3NextForCausalLM {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         gdn_state_pool: &GdnStatePool,
-        gdn_state_indices: GpuTensor,
-        gdn_cu_seqlens: GpuTensor,
+        gdn_state_indices: TensorView<'_>,
+        gdn_cu_seqlens: TensorView<'_>,
         num_seqs: usize,
         device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> OwnedTensor {
         let hidden_states = self.model.forward(
             input_ids,
@@ -1454,7 +1450,7 @@ impl Qwen3NextForCausalLM {
         let hidden_states = if let Some(indices) = last_token_indices {
             kernels::embedding_gather(
                 *hidden_states,
-                indices,
+                *indices,
                 &mut device.caching,
                 device.compute_stream,
             )
@@ -1463,7 +1459,7 @@ impl Qwen3NextForCausalLM {
         };
 
         self.lm_head.forward(
-            *hidden_states,
+            hidden_states.view(),
             &mut device.cublas,
             &mut device.caching,
             device.compute_stream,

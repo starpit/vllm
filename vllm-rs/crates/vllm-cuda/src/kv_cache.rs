@@ -6,7 +6,7 @@
 
 use crate::driver;
 use crate::dtype::DType;
-use crate::tensor::GpuTensor;
+use crate::tensor::{GpuTensor, TensorView};
 use anyhow::Result;
 
 /// Paged KV cache pool for all transformer layers.
@@ -128,14 +128,16 @@ impl KvCachePool {
         })
     }
 
-    /// Get K cache tensor for a layer.
-    pub fn k_cache(&self, layer: usize) -> GpuTensor {
-        self.k_caches[layer]
+    /// Get K cache tensor for a layer as a lifetime-checked view.
+    pub fn k_cache(&self, layer: usize) -> TensorView<'_> {
+        // Safety: KvCachePool owns the memory via _k_ptrs; view borrows &self.
+        unsafe { TensorView::from_raw(self.k_caches[layer]) }
     }
 
-    /// Get V cache tensor for a layer.
-    pub fn v_cache(&self, layer: usize) -> GpuTensor {
-        self.v_caches[layer]
+    /// Get V cache tensor for a layer as a lifetime-checked view.
+    pub fn v_cache(&self, layer: usize) -> TensorView<'_> {
+        // Safety: KvCachePool owns the memory via _v_ptrs; view borrows &self.
+        unsafe { TensorView::from_raw(self.v_caches[layer]) }
     }
 
     /// The dtype used for cache storage.

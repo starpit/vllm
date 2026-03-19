@@ -15,7 +15,7 @@ use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
-use crate::tensor::GpuTensor;
+use crate::tensor::{GpuTensor, TensorView};
 
 type CUstream = cudarc::driver::sys::CUstream;
 
@@ -80,20 +80,20 @@ pub fn has_fp8_graph_ctx() -> bool {
 /// When BF16/F16, performs a direct copy (existing path).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn write_kv_cache(
-    k: GpuTensor,
-    v: GpuTensor,
-    slot_mapping: GpuTensor,
+    k: TensorView<'_>,
+    v: TensorView<'_>,
+    slot_mapping: TensorView<'_>,
     kv_cache: &KvCachePool,
     layer_idx: usize,
     stream: CUstream,
 ) {
     if kv_cache.is_fp8() {
         kernels::reshape_and_cache_fp8(
-            k,
-            v,
-            kv_cache.k_cache(layer_idx),
-            kv_cache.v_cache(layer_idx),
-            slot_mapping,
+            *k,
+            *v,
+            *kv_cache.k_cache(layer_idx),
+            *kv_cache.v_cache(layer_idx),
+            *slot_mapping,
             kv_cache.k_scale_ptr(layer_idx),
             kv_cache.v_scale_ptr(layer_idx),
             kv_cache.block_size,
@@ -101,11 +101,11 @@ pub unsafe fn write_kv_cache(
         );
     } else {
         kernels::reshape_and_cache(
-            k,
-            v,
-            kv_cache.k_cache(layer_idx),
-            kv_cache.v_cache(layer_idx),
-            slot_mapping,
+            *k,
+            *v,
+            *kv_cache.k_cache(layer_idx),
+            *kv_cache.v_cache(layer_idx),
+            *slot_mapping,
             kv_cache.block_size,
             stream,
         );
@@ -122,12 +122,12 @@ pub unsafe fn write_kv_cache(
 /// from the QKV projection directly.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn attention_standard(
-    q: GpuTensor,
-    k: GpuTensor,
-    v: GpuTensor,
-    cu_seqlens_q: GpuTensor,
-    seqused_k: GpuTensor,
-    block_table: GpuTensor,
+    q: TensorView<'_>,
+    k: TensorView<'_>,
+    v: TensorView<'_>,
+    cu_seqlens_q: TensorView<'_>,
+    seqused_k: TensorView<'_>,
+    block_table: TensorView<'_>,
     max_seqlen_q: usize,
     max_seqlen_k: usize,
     scale: f32,
@@ -142,11 +142,11 @@ pub unsafe fn attention_standard(
     if fresh_prefill {
         // Fresh prefill: use BF16 K/V from QKV projection (no cache read).
         kernels::flash_attn_contiguous(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_q,
+            *q,
+            *k,
+            *v,
+            *cu_seqlens_q,
+            *cu_seqlens_q,
             max_seqlen_q,
             max_seqlen_k,
             scale,
@@ -159,10 +159,10 @@ pub unsafe fn attention_standard(
     } else if kv_cache.is_fp8() {
         // FP8 decode: dequant pages → contiguous FA2.
         fp8_decode_attention(
-            q,
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
+            *q,
+            *cu_seqlens_q,
+            *seqused_k,
+            *block_table,
             max_seqlen_q,
             max_seqlen_k,
             scale,
@@ -176,12 +176,12 @@ pub unsafe fn attention_standard(
     } else {
         // BF16 decode: paged FA2 directly on cache.
         kernels::flash_attn_paged(
-            q,
-            kv_cache.k_cache(layer_idx),
-            kv_cache.v_cache(layer_idx),
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
+            *q,
+            *kv_cache.k_cache(layer_idx),
+            *kv_cache.v_cache(layer_idx),
+            *cu_seqlens_q,
+            *seqused_k,
+            *block_table,
             max_seqlen_q,
             max_seqlen_k,
             scale,
@@ -200,10 +200,10 @@ pub unsafe fn attention_standard(
 /// (caller must ensure max_seqlen_q == 1).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn attention_decode_from_cache(
-    q: GpuTensor,
-    cu_seqlens_q: GpuTensor,
-    seqused_k: GpuTensor,
-    block_table: GpuTensor,
+    q: TensorView<'_>,
+    cu_seqlens_q: TensorView<'_>,
+    seqused_k: TensorView<'_>,
+    block_table: TensorView<'_>,
     max_seqlen_q: usize,
     max_seqlen_k: usize,
     scale: f32,
@@ -217,10 +217,10 @@ pub unsafe fn attention_decode_from_cache(
 ) -> OwnedTensor {
     if kv_cache.is_fp8() {
         fp8_decode_attention(
-            q,
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
+            *q,
+            *cu_seqlens_q,
+            *seqused_k,
+            *block_table,
             max_seqlen_q,
             max_seqlen_k,
             scale,
@@ -233,12 +233,12 @@ pub unsafe fn attention_decode_from_cache(
         )
     } else if softcap != 0.0 || window_size_left >= 0 {
         kernels::flash_attn_paged_ext(
-            q,
-            kv_cache.k_cache(layer_idx),
-            kv_cache.v_cache(layer_idx),
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
+            *q,
+            *kv_cache.k_cache(layer_idx),
+            *kv_cache.v_cache(layer_idx),
+            *cu_seqlens_q,
+            *seqused_k,
+            *block_table,
             max_seqlen_q,
             max_seqlen_k,
             scale,
@@ -252,12 +252,12 @@ pub unsafe fn attention_decode_from_cache(
         )
     } else {
         kernels::flash_attn_paged(
-            q,
-            kv_cache.k_cache(layer_idx),
-            kv_cache.v_cache(layer_idx),
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
+            *q,
+            *kv_cache.k_cache(layer_idx),
+            *kv_cache.v_cache(layer_idx),
+            *cu_seqlens_q,
+            *seqused_k,
+            *block_table,
             max_seqlen_q,
             max_seqlen_k,
             scale,
@@ -275,12 +275,12 @@ pub unsafe fn attention_decode_from_cache(
 /// Uses `flash_attn_paged_ext` for the BF16 decode path.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn attention_ext(
-    q: GpuTensor,
-    k: GpuTensor,
-    v: GpuTensor,
-    cu_seqlens_q: GpuTensor,
-    seqused_k: GpuTensor,
-    block_table: GpuTensor,
+    q: TensorView<'_>,
+    k: TensorView<'_>,
+    v: TensorView<'_>,
+    cu_seqlens_q: TensorView<'_>,
+    seqused_k: TensorView<'_>,
+    block_table: TensorView<'_>,
     max_seqlen_q: usize,
     max_seqlen_k: usize,
     scale: f32,
@@ -296,11 +296,11 @@ pub unsafe fn attention_ext(
 
     if fresh_prefill {
         kernels::flash_attn_contiguous(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_q,
+            *q,
+            *k,
+            *v,
+            *cu_seqlens_q,
+            *cu_seqlens_q,
             max_seqlen_q,
             max_seqlen_k,
             scale,
@@ -312,10 +312,10 @@ pub unsafe fn attention_ext(
         )
     } else if kv_cache.is_fp8() {
         fp8_decode_attention(
-            q,
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
+            *q,
+            *cu_seqlens_q,
+            *seqused_k,
+            *block_table,
             max_seqlen_q,
             max_seqlen_k,
             scale,
@@ -328,12 +328,12 @@ pub unsafe fn attention_ext(
         )
     } else {
         kernels::flash_attn_paged_ext(
-            q,
-            kv_cache.k_cache(layer_idx),
-            kv_cache.v_cache(layer_idx),
-            cu_seqlens_q,
-            seqused_k,
-            block_table,
+            *q,
+            *kv_cache.k_cache(layer_idx),
+            *kv_cache.v_cache(layer_idx),
+            *cu_seqlens_q,
+            *seqused_k,
+            *block_table,
             max_seqlen_q,
             max_seqlen_k,
             scale,
@@ -471,7 +471,7 @@ unsafe fn fp8_decode_attention(
 
     // Dequant+gather K and V from FP8 cache pages to contiguous BF16.
     let k_contiguous = kernels::dequant_gather_pages(
-        kv_cache.k_cache(layer_idx),
+        *kv_cache.k_cache(layer_idx),
         block_table,
         cu_seqlens_k_gpu.as_gpu_tensor(),
         k_scale_host,
@@ -484,7 +484,7 @@ unsafe fn fp8_decode_attention(
         stream,
     );
     let v_contiguous = kernels::dequant_gather_pages(
-        kv_cache.v_cache(layer_idx),
+        *kv_cache.v_cache(layer_idx),
         block_table,
         cu_seqlens_k_gpu.as_gpu_tensor(),
         v_scale_host,
@@ -552,7 +552,7 @@ unsafe fn fp8_decode_attention_graphed(
     // Dequant into pre-allocated buffers with over-sized grid.
     // Blocks beyond actual total_kv_tokens exit early (kernel bounds check).
     kernels::dequant_gather_pages_into(
-        kv_cache.k_cache(layer_idx),
+        *kv_cache.k_cache(layer_idx),
         block_table,
         cu_seqlens_k_gpu,
         k_scale,
@@ -565,7 +565,7 @@ unsafe fn fp8_decode_attention_graphed(
         stream,
     );
     kernels::dequant_gather_pages_into(
-        kv_cache.v_cache(layer_idx),
+        *kv_cache.v_cache(layer_idx),
         block_table,
         cu_seqlens_k_gpu,
         v_scale,

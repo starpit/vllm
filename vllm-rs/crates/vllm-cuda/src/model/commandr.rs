@@ -20,7 +20,7 @@ use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::layers::{CohereLayerNorm, Embedding, Linear};
 use crate::model::llama::{LlamaAttention, LlamaMLP, RotaryCache};
-use crate::tensor::GpuTensor;
+use crate::tensor::TensorView;
 use crate::weights::GpuWeights;
 use crate::weights::{self as gpu_weights};
 
@@ -64,12 +64,12 @@ impl CommandRAttention {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        hidden_states: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        hidden_states: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -102,16 +102,16 @@ impl CommandRAttention {
                 device.compute_stream,
             );
             let qk = kernels::concat_dim1(
-                q_out.as_gpu_tensor(),
-                k_out.as_gpu_tensor(),
+                *q_out.view(),
+                *k_out.view(),
                 &mut device.caching,
                 device.compute_stream,
             );
             drop(q_out);
             drop(k_out);
             let qkv = kernels::concat_dim1(
-                qk.as_gpu_tensor(),
-                v_out.as_gpu_tensor(),
+                *qk.view(),
+                *v_out.view(),
                 &mut device.caching,
                 device.compute_stream,
             );
@@ -136,7 +136,7 @@ impl CommandRAttention {
                 // Note: qk_norm_rope_inplace uses NeoX RoPE — for QK-norm + interleaved
                 // we'd need a separate kernel. For now, split + norm + interleaved rope.
                 let (q, k, v) = kernels::split_qkv(
-                    qkv.as_gpu_tensor(),
+                    *qkv.view(),
                     attn.q_size,
                     attn.kv_size,
                     attn.num_q_heads,
@@ -153,12 +153,12 @@ impl CommandRAttention {
                 // RoPE applied separately afterward.
                 // TODO: fused QK-norm + interleaved RoPE kernel for full optimization.
                 kernels::qk_norm_rope_inplace(
-                    q.as_gpu_tensor(),
-                    k.as_gpu_tensor(),
+                    *q.view(),
+                    *k.view(),
                     q_norm_w,
                     k_norm_w,
                     rotary.cos_sin_cache,
-                    positions,
+                    *positions,
                     attn.num_q_heads,
                     attn.num_kv_heads,
                     attn.head_dim,
@@ -174,12 +174,12 @@ impl CommandRAttention {
                 // Decode path: fused interleaved QKV split + RoPE + cache write.
                 let q = if kv_cache.is_fp8() {
                     kernels::fused_qkv_interleaved_rope_cache_fp8(
-                        qkv.as_gpu_tensor(),
-                        positions,
+                        *qkv.view(),
+                        *positions,
                         rotary.cos_sin_cache,
-                        slot_mapping,
-                        kv_cache.k_cache(attn.layer_idx),
-                        kv_cache.v_cache(attn.layer_idx),
+                        *slot_mapping,
+                        *kv_cache.k_cache(attn.layer_idx),
+                        *kv_cache.v_cache(attn.layer_idx),
                         kv_cache.k_scale_ptr(attn.layer_idx),
                         kv_cache.v_scale_ptr(attn.layer_idx),
                         attn.q_size,
@@ -191,12 +191,12 @@ impl CommandRAttention {
                     )
                 } else {
                     kernels::fused_qkv_interleaved_rope_cache(
-                        qkv.as_gpu_tensor(),
-                        positions,
+                        *qkv.view(),
+                        *positions,
                         rotary.cos_sin_cache,
-                        slot_mapping,
-                        kv_cache.k_cache(attn.layer_idx),
-                        kv_cache.v_cache(attn.layer_idx),
+                        *slot_mapping,
+                        *kv_cache.k_cache(attn.layer_idx),
+                        *kv_cache.v_cache(attn.layer_idx),
                         attn.q_size,
                         attn.kv_size,
                         attn.num_q_heads,
@@ -208,7 +208,7 @@ impl CommandRAttention {
                 drop(qkv);
 
                 let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
-                    q.as_gpu_tensor(),
+                    q.view(),
                     cu_seqlens_q,
                     seqused_k,
                     block_table,
@@ -225,9 +225,7 @@ impl CommandRAttention {
                 );
                 drop(q);
 
-                let attn_flat = attn_output
-                    .as_gpu_tensor()
-                    .reshape(&[num_tokens, attn.q_size]);
+                let attn_flat = attn_output.view().reshape(&[num_tokens, attn.q_size]);
                 let result = attn.o_proj.forward(
                     attn_flat,
                     &mut device.cublas,
@@ -239,8 +237,8 @@ impl CommandRAttention {
             } else {
                 // Prefill or FP8 path: standard fused QKV split + interleaved RoPE.
                 let result = kernels::fused_qkv_interleaved_rope(
-                    qkv.as_gpu_tensor(),
-                    positions,
+                    *qkv.view(),
+                    *positions,
                     rotary.cos_sin_cache,
                     attn.q_size,
                     attn.kv_size,
@@ -256,8 +254,8 @@ impl CommandRAttention {
 
         // Write new K/V into paged cache (BF16→FP8 when FP8 cache).
         crate::model::attention_helpers::write_kv_cache(
-            k.as_gpu_tensor(),
-            v.as_gpu_tensor(),
+            k.view(),
+            v.view(),
             slot_mapping,
             kv_cache,
             attn.layer_idx,
@@ -265,9 +263,9 @@ impl CommandRAttention {
         );
 
         let attn_output = crate::model::attention_helpers::attention_standard(
-            q.as_gpu_tensor(),
-            k.as_gpu_tensor(),
-            v.as_gpu_tensor(),
+            q.view(),
+            k.view(),
+            v.view(),
             cu_seqlens_q,
             seqused_k,
             block_table,
@@ -285,9 +283,7 @@ impl CommandRAttention {
         drop(v);
 
         // Reshape to [num_tokens, q_size] and output projection.
-        let attn_flat = attn_output
-            .as_gpu_tensor()
-            .reshape(&[num_tokens, attn.q_size]);
+        let attn_flat = attn_output.view().reshape(&[num_tokens, attn.q_size]);
         let result = attn.o_proj.forward(
             attn_flat,
             &mut device.cublas,
@@ -331,11 +327,11 @@ impl CommandRDecoderLayer {
     pub unsafe fn forward(
         &self,
         hidden_states: OwnedTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -355,10 +351,10 @@ impl CommandRDecoderLayer {
         // Parallel attention and MLP, both reading from normed.
         // normed (GpuTensor) is a view into normed (OwnedTensor) — both
         // attn and mlp will read from it before either writes.
-        let normed_gpu = normed.as_gpu_tensor();
+        let normed_view = normed.view();
 
         let attn_output = self.self_attn.forward(
-            normed_gpu,
+            normed_view,
             positions,
             slot_mapping,
             cu_seqlens_q,
@@ -371,24 +367,16 @@ impl CommandRDecoderLayer {
             device,
         );
 
-        let mlp_output = self.mlp.forward(normed_gpu, device);
+        let mlp_output = self.mlp.forward(normed_view, device);
         drop(normed); // free normed buffer
 
         // hidden_states = residual + attn_output + mlp_output
         // Add attn_output into hidden_states in-place.
-        kernels::add_inplace(
-            *hidden_states,
-            attn_output.as_gpu_tensor(),
-            device.compute_stream,
-        );
+        kernels::add_inplace(*hidden_states, *attn_output.view(), device.compute_stream);
         drop(attn_output);
 
         // Add mlp_output into hidden_states in-place.
-        kernels::add_inplace(
-            *hidden_states,
-            mlp_output.as_gpu_tensor(),
-            device.compute_stream,
-        );
+        kernels::add_inplace(*hidden_states, *mlp_output.view(), device.compute_stream);
         drop(mlp_output);
 
         hidden_states
@@ -412,12 +400,12 @@ impl CommandRModel {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -426,7 +414,7 @@ impl CommandRModel {
         // Embedding lookup.
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
-            input_ids,
+            *input_ids,
             &mut device.caching,
             device.compute_stream,
         );
@@ -481,17 +469,17 @@ impl CommandRForCausalLM {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> OwnedTensor {
         let hidden_states = self.model.forward(
             input_ids,
@@ -510,7 +498,7 @@ impl CommandRForCausalLM {
         let hidden_states = if let Some(indices) = last_token_indices {
             kernels::embedding_gather(
                 *hidden_states,
-                indices,
+                *indices,
                 &mut device.caching,
                 device.compute_stream,
             )
@@ -519,13 +507,15 @@ impl CommandRForCausalLM {
         };
 
         // lm_head: logits = hidden_states @ lm_head_weight^T
-        let logits = self
-            .lm_head
-            .forward(*hidden_states, &mut device.cublas, &mut device.caching);
+        let logits = self.lm_head.forward(
+            hidden_states.view(),
+            &mut device.cublas,
+            &mut device.caching,
+        );
 
         // Apply logit scaling.
         if self.logit_scale != 1.0 {
-            kernels::scale_inplace(logits.as_gpu_tensor(), self.logit_scale, &device.cublas);
+            kernels::scale_inplace(*logits.view(), self.logit_scale, &device.cublas);
         }
 
         logits

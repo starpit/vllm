@@ -26,7 +26,7 @@ use crate::model::llama::{LlamaAttention, LlamaConfig, LlamaMLP, RotaryCache, Tp
 #[cfg(feature = "nccl")]
 use crate::nccl::NcclGroup;
 use crate::quant::QuantConfig;
-use crate::tensor::GpuTensor;
+use crate::tensor::{GpuTensor, TensorView};
 use crate::weights::{self as gpu_weights, GpuWeights};
 
 // ---------------------------------------------------------------------------
@@ -98,7 +98,7 @@ enum Qwen2MoeMlp {
 }
 
 impl Qwen2MoeMlp {
-    unsafe fn forward(&self, hidden_states: GpuTensor, device: &mut GpuDevice) -> OwnedTensor {
+    unsafe fn forward(&self, hidden_states: TensorView<'_>, device: &mut GpuDevice) -> OwnedTensor {
         match self {
             Self::Dense(mlp) => mlp.forward(hidden_states, device),
             Self::MoE {
@@ -117,7 +117,7 @@ impl Qwen2MoeMlp {
                 let shared_gu =
                     shared_gate_up.forward(hidden_states, &mut device.cublas, &mut device.caching);
                 let shared_activated = kernels::silu_and_mul_fused(
-                    shared_gu.as_gpu_tensor(),
+                    *shared_gu.view(),
                     *shared_intermediate_size,
                     &mut device.caching,
                     stream,
@@ -125,7 +125,7 @@ impl Qwen2MoeMlp {
                 drop(shared_gu);
 
                 let shared_out = shared_down.forward(
-                    shared_activated.as_gpu_tensor(),
+                    shared_activated.view(),
                     &mut device.cublas,
                     &mut device.caching,
                 );
@@ -140,9 +140,9 @@ impl Qwen2MoeMlp {
 
                 // out = moe_out + sigmoid(gate_logits) * shared_out
                 let result = kernels::sigmoid_mul_add(
-                    moe_out.as_gpu_tensor(),
-                    shared_out.as_gpu_tensor(),
-                    gate_logits.as_gpu_tensor(),
+                    *moe_out.view(),
+                    *shared_out.view(),
+                    *gate_logits.view(),
                     &mut device.caching,
                     stream,
                 );
@@ -166,7 +166,7 @@ impl Qwen2MoeMlp {
                 let shared_gu =
                     shared_gate_up.forward(hidden_states, &mut device.cublas, &mut device.caching);
                 let shared_activated = kernels::silu_and_mul_fused(
-                    shared_gu.as_gpu_tensor(),
+                    *shared_gu.view(),
                     *shared_intermediate_size,
                     &mut device.caching,
                     stream,
@@ -174,7 +174,7 @@ impl Qwen2MoeMlp {
                 drop(shared_gu);
 
                 let shared_out = shared_down.forward(
-                    shared_activated.as_gpu_tensor(),
+                    shared_activated.view(),
                     &mut device.cublas,
                     &mut device.caching,
                 );
@@ -187,9 +187,9 @@ impl Qwen2MoeMlp {
                 );
 
                 let result = kernels::sigmoid_mul_add(
-                    moe_out.as_gpu_tensor(),
-                    shared_out.as_gpu_tensor(),
-                    gate_logits.as_gpu_tensor(),
+                    *moe_out.view(),
+                    *shared_out.view(),
+                    *gate_logits.view(),
                     &mut device.caching,
                     stream,
                 );
@@ -644,11 +644,11 @@ impl Qwen2MoeDecoderLayer {
         &self,
         hidden_states: OwnedTensor,
         residual: Option<OwnedTensor>,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -678,7 +678,7 @@ impl Qwen2MoeDecoderLayer {
         };
 
         let attn_output = self.self_attn.forward(
-            *normed,
+            normed.view(),
             positions,
             slot_mapping,
             cu_seqlens_q,
@@ -701,7 +701,7 @@ impl Qwen2MoeDecoderLayer {
             device.compute_stream,
         );
 
-        let mlp_output = self.mlp.forward(*attn_output, device);
+        let mlp_output = self.mlp.forward(attn_output.view(), device);
         drop(attn_output);
 
         (mlp_output, residual)
@@ -849,12 +849,12 @@ impl Qwen2MoeModel {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -862,7 +862,7 @@ impl Qwen2MoeModel {
     ) -> OwnedTensor {
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
-            input_ids,
+            *input_ids,
             &mut device.caching,
             device.compute_stream,
         );
@@ -890,7 +890,7 @@ impl Qwen2MoeModel {
         }
 
         let hs_gpu = *hidden_states;
-        let res_gpu = residual.as_ref().unwrap().as_gpu_tensor();
+        let res_gpu = *residual.as_ref().unwrap().view();
         kernels::fused_add_rms_norm_inplace(
             hs_gpu,
             res_gpu,
@@ -961,17 +961,17 @@ impl Qwen2MoeForCausalLM {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> OwnedTensor {
         let hidden_states = self.model.forward(
             input_ids,
@@ -989,7 +989,7 @@ impl Qwen2MoeForCausalLM {
         let hidden_states = if let Some(indices) = last_token_indices {
             kernels::embedding_gather(
                 *hidden_states,
-                indices,
+                *indices,
                 &mut device.caching,
                 device.compute_stream,
             )
@@ -997,8 +997,11 @@ impl Qwen2MoeForCausalLM {
             hidden_states
         };
 
-        self.lm_head
-            .forward(*hidden_states, &mut device.cublas, &mut device.caching)
+        self.lm_head.forward(
+            hidden_states.view(),
+            &mut device.cublas,
+            &mut device.caching,
+        )
     }
 }
 

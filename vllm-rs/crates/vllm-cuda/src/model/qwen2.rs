@@ -16,7 +16,7 @@ use crate::kv_cache::KvCachePool;
 use crate::model::llama::{ForwardOutput, LlamaConfig, LlamaForCausalLM, TpConfig};
 use crate::pp::PpConfig;
 use crate::quant::QuantConfig;
-use crate::tensor::GpuTensor;
+use crate::tensor::TensorView;
 use crate::weights::GpuWeights;
 
 // ---------------------------------------------------------------------------
@@ -109,17 +109,17 @@ impl Qwen2ForCausalLM {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> OwnedTensor {
         self.0.forward(
             input_ids,
@@ -165,18 +165,18 @@ impl Qwen2ForCausalLM {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward_pp(
         &self,
-        input_ids: Option<GpuTensor>,
+        input_ids: Option<TensorView<'_>>,
         intermediate: Option<(OwnedTensor, OwnedTensor)>,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> ForwardOutput {
         self.0.forward_pp(
             input_ids,

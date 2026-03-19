@@ -9,7 +9,7 @@ use anyhow::Result;
 
 use crate::alloc::{CachingAllocator, OwnedTensor};
 use crate::cublas::CublasHandle;
-use crate::tensor::GpuTensor;
+use crate::tensor::{GpuTensor, TensorView};
 use crate::weights::GpuWeights;
 
 #[cfg(feature = "nccl")]
@@ -65,7 +65,7 @@ impl Linear {
     /// All tensors must be valid GPU memory. cuBLAS handle must be on the correct stream.
     pub unsafe fn forward(
         &self,
-        x: GpuTensor,
+        x: TensorView<'_>,
         cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
     ) -> OwnedTensor {
@@ -73,9 +73,9 @@ impl Linear {
         debug_assert_eq!(x.dim(1), self.weight.dim(1), "Linear: input dim mismatch");
 
         if let Some(bias) = self.bias {
-            cublas.gemm_bias(x, self.weight, bias, alloc)
+            cublas.gemm_bias(*x, self.weight, bias, alloc)
         } else {
-            cublas.gemm(x, self.weight, alloc)
+            cublas.gemm(*x, self.weight, alloc)
         }
     }
 
@@ -136,7 +136,7 @@ impl MarlinLinear {
     /// Returns: `[num_tokens, size_n]`
     pub unsafe fn forward(
         &self,
-        x: GpuTensor,
+        x: TensorView<'_>,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
@@ -151,7 +151,7 @@ impl MarlinLinear {
         // Don't pass bias to Marlin kernel (would need permutation).
         // Instead, add bias after the GEMM with a simple broadcast add.
         let out = crate::kernels::marlin_gemm(
-            x,
+            *x,
             self.qweight,
             self.scales,
             self.zeros,
@@ -223,7 +223,7 @@ impl Bnb4bitLinear {
     /// Returns: `[num_tokens, out_features]`
     pub unsafe fn forward(
         &self,
-        x: GpuTensor,
+        x: TensorView<'_>,
         cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
@@ -246,9 +246,9 @@ impl Bnb4bitLinear {
 
         // cuBLAS GEMM: x @ weight_view^T
         if let Some(bias) = self.bias {
-            cublas.gemm_bias(x, weight_view, bias, alloc)
+            cublas.gemm_bias(*x, weight_view, bias, alloc)
         } else {
-            cublas.gemm(x, weight_view, alloc)
+            cublas.gemm(*x, weight_view, alloc)
         }
     }
 
@@ -283,7 +283,7 @@ impl GgmlLinear {
     /// Output is f32 `[num_tokens, out_features]`.
     pub unsafe fn forward(
         &self,
-        x: GpuTensor,
+        x: TensorView<'_>,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
@@ -291,14 +291,14 @@ impl GgmlLinear {
 
         // GGML kernels require f32 activations — cast if needed.
         let cast_buf = if input_dtype != crate::dtype::DType::F32 {
-            Some(crate::kernels::cast_logits_to_f32(x, alloc, stream))
+            Some(crate::kernels::cast_logits_to_f32(*x, alloc, stream))
         } else {
             None
         };
         let x_f32 = if let Some(ref cast) = cast_buf {
             cast.as_gpu_tensor()
         } else {
-            x
+            *x
         };
 
         let out_f32 = crate::ggml::ggml_matmul(&self.storage, x_f32, alloc, stream);
@@ -362,7 +362,7 @@ impl Fp8Linear {
     /// Matches Python vLLM's `cutlass_scaled_mm` exactly.
     pub unsafe fn forward(
         &self,
-        x: GpuTensor,
+        x: TensorView<'_>,
         _cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
@@ -378,7 +378,7 @@ impl Fp8Linear {
             // Static activation quantization: scalar input_scale + scalar weight_scale.
             // Quantize with pre-calibrated scale, then fused CUTLASS GEMM.
             let a_scale = input_scale.as_ptr::<f32>();
-            let x_fp8 = crate::kernels::scaled_fp8_quant_static(x, a_scale, alloc, stream);
+            let x_fp8 = crate::kernels::scaled_fp8_quant_static(*x, a_scale, alloc, stream);
             // input_scale is [1] (scalar) — CUTLASS handles scalar a_scale correctly.
             let result = if let Some(bias) = self.bias {
                 crate::kernels::cutlass_scaled_mm_with_bias(
@@ -412,7 +412,7 @@ impl Fp8Linear {
             // 1. Quantize activations: BF16 → FP8 + per-token scales [M]
             // 2. CUTLASS FP8 GEMM with per-token a_scales + per-tensor b_scale
             //    fused into the epilogue. ONE kernel launch.
-            let (x_fp8, x_scales) = crate::kernels::scaled_fp8_quant_dynamic(x, alloc, stream);
+            let (x_fp8, x_scales) = crate::kernels::scaled_fp8_quant_dynamic(*x, alloc, stream);
             let result = if let Some(bias) = self.bias {
                 crate::kernels::cutlass_scaled_mm_with_bias(
                     x_fp8.as_gpu_tensor(),
@@ -471,7 +471,7 @@ impl LinearLayer {
     /// Forward: y = x @ W^T (dense) or quantized GEMM variant.
     pub unsafe fn forward(
         &self,
-        x: GpuTensor,
+        x: TensorView<'_>,
         cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
@@ -576,7 +576,7 @@ impl Fp8BlockLinear {
     /// TODO: CUTLASS block-scaled FP8 GEMM for perf parity.
     pub unsafe fn forward(
         &self,
-        x: GpuTensor,
+        x: TensorView<'_>,
         cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
@@ -598,7 +598,7 @@ impl Fp8BlockLinear {
         // Standard GEMM: x @ dequant_weight^T
         // Use as_gpu_tensor() to borrow — dequant_weight drops after GEMM,
         // returning the buffer to the caching allocator.
-        let out = cublas.gemm(x, dequant_weight.as_gpu_tensor(), alloc);
+        let out = cublas.gemm(*x, dequant_weight.as_gpu_tensor(), alloc);
         drop(dequant_weight);
 
         if let Some(bias) = self.bias {
@@ -660,7 +660,7 @@ impl Embedding {
     /// This currently uses a simple gather kernel (TODO: implement via CUDA kernel).
     pub unsafe fn forward(
         &self,
-        _input_ids: GpuTensor,
+        _input_ids: TensorView<'_>,
         _alloc: &mut CachingAllocator,
         _stream: cudarc::driver::sys::CUstream,
     ) -> GpuTensor {
@@ -735,7 +735,7 @@ impl ColumnParallelLinear {
     /// Forward: y = x @ W_shard^T, optionally all-gather.
     pub unsafe fn forward(
         &self,
-        x: GpuTensor,
+        x: TensorView<'_>,
         cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
@@ -793,7 +793,7 @@ impl RowParallelLinear {
     /// Forward: y = all_reduce(x @ W_shard^T) + bias.
     pub unsafe fn forward(
         &self,
-        x: GpuTensor,
+        x: TensorView<'_>,
         cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
@@ -1028,10 +1028,11 @@ mod tests {
                 let gpu_x = driver::mem_alloc(48).unwrap();
                 driver::memcpy_htod_async(gpu_x, host_x, 48, stream).unwrap();
                 let x = GpuTensor::new(gpu_x, &[4, 3], DType::F32);
+                let x_view = TensorView::from_raw(x);
 
                 // Forward: x @ W^T = [4,3] @ [3,2] = [4,2]
                 // Expected: [[1,2],[4,5],[7,8],[10,11]]
-                let y = linear.forward(x, &mut cublas, &mut arena);
+                let y = linear.forward(x_view, &mut cublas, &mut arena);
                 assert_eq!(y.dim(0), 4);
                 assert_eq!(y.dim(1), 2);
 
@@ -1206,6 +1207,7 @@ mod tests {
                 )
                 .unwrap();
                 let x = GpuTensor::new(x_ptr, &[1, in_features], DType::BF16);
+                let x_view = TensorView::from_raw(x);
 
                 // Build Bnb4bitLinear.
                 let layer = Bnb4bitLinear {
@@ -1220,7 +1222,7 @@ mod tests {
                 };
 
                 // Forward.
-                let output = layer.forward(x, &mut cublas, &mut alloc, stream);
+                let output = layer.forward(x_view, &mut cublas, &mut alloc, stream);
                 let out_t = output.as_gpu_tensor();
                 assert_eq!(out_t.dim(0), 1);
                 assert_eq!(out_t.dim(1), out_features);
@@ -1395,6 +1397,7 @@ mod tests {
                 )
                 .unwrap();
                 let x = GpuTensor::new(x_ptr, &[1, in_features], DType::BF16);
+                let x_view = TensorView::from_raw(x);
 
                 let layer = Bnb4bitLinear {
                     packed_weight: packed_gpu,
@@ -1407,7 +1410,7 @@ mod tests {
                     bias: None,
                 };
 
-                let output = layer.forward(x, &mut cublas, &mut alloc, stream);
+                let output = layer.forward(x_view, &mut cublas, &mut alloc, stream);
                 let out_t = output.as_gpu_tensor();
                 assert_eq!(out_t.dim(0), 1);
                 assert_eq!(out_t.dim(1), total_out);
@@ -1785,11 +1788,12 @@ mod fp8_block_tests {
             driver::memcpy_htod_async(gpu_x, input_bf16.as_ptr() as *const u8, k * 2, stream)
                 .unwrap();
             let x = GpuTensor::new(gpu_x, &[1, k], DType::BF16);
+            let x_view = TensorView::from_raw(x);
 
             // Forward: y = x @ W^T, x=[1,4] all-ones, W=[4,4]
             // y[j] = sum_k(W[j][k]) = row sum
             // Row sums: [6, 14, 6, 14]
-            let out = layer.forward(x, &mut cublas, &mut alloc, stream);
+            let out = layer.forward(x_view, &mut cublas, &mut alloc, stream);
             assert_eq!(out.as_gpu_tensor().dim(0), 1);
             assert_eq!(out.as_gpu_tensor().dim(1), n);
 
@@ -1857,14 +1861,14 @@ mod fp8_block_tests {
                 .unwrap();
 
             // First forward — establishes the allocator's pool.
-            let x1 = GpuTensor::new(gpu_x, &[1, k], DType::BF16);
+            let x1 = TensorView::from_raw(GpuTensor::new(gpu_x, &[1, k], DType::BF16));
             let out1 = layer.forward(x1, &mut cublas, &mut alloc, stream);
             drop(out1);
             driver::stream_synchronize(stream).unwrap();
             let bytes_after_first = alloc.active_bytes();
 
             // Second forward — should reuse pools, NOT grow active_bytes.
-            let x2 = GpuTensor::new(gpu_x, &[1, k], DType::BF16);
+            let x2 = TensorView::from_raw(GpuTensor::new(gpu_x, &[1, k], DType::BF16));
             let out2 = layer.forward(x2, &mut cublas, &mut alloc, stream);
             drop(out2);
             driver::stream_synchronize(stream).unwrap();

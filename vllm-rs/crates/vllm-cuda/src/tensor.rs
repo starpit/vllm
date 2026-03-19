@@ -5,6 +5,8 @@
 //! Memory lifetime is managed by the owning region (weights, arena, KV pool),
 //! not by the tensor itself.
 
+use std::marker::PhantomData;
+
 use crate::dtype::DType;
 
 /// Maximum number of dimensions (sufficient for LLM inference).
@@ -182,6 +184,108 @@ impl GpuTensor {
             ndim: new_shape.len() as u8,
             dtype: self.dtype,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TensorView<'a> — lifetime-checked borrowed reference to GPU memory
+// ---------------------------------------------------------------------------
+
+/// A borrowed view into GPU memory, tied to the lifetime of its owner.
+///
+/// `TensorView<'a>` provides the same shape/dtype/pointer accessors as `GpuTensor`,
+/// but the `'a` lifetime ties the view to the memory owner (`OwnedTensor`, `KvCachePool`,
+/// `ScratchArena`, weight layers, etc.). The borrow checker enforces that no view
+/// outlives the memory it references.
+///
+/// At the kernel FFI boundary, dereference to `&GpuTensor` via `Deref` or call
+/// `.as_raw()` to obtain the inner `GpuTensor` for passing into `unsafe` kernel
+/// launch functions.
+///
+/// # Examples
+/// ```ignore
+/// let owned = alloc.alloc_tensor(&[32, 4096], DType::BF16);
+/// let view = owned.view();              // borrows &owned
+/// let narrowed = view.narrow_dim0(0, 16); // still borrows &owned
+/// kernel_launch(*narrowed, ...);         // deref to GpuTensor for FFI
+/// drop(owned);                           // narrowed can't be used after this
+/// ```
+pub struct TensorView<'a> {
+    inner: GpuTensor,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+// TensorView is Send/Sync for the same reason GpuTensor is — GPU device pointers
+// are accessible from any host thread.
+unsafe impl Send for TensorView<'_> {}
+unsafe impl Sync for TensorView<'_> {}
+
+impl<'a> TensorView<'a> {
+    /// Create a view from a raw `GpuTensor` with an explicit lifetime.
+    ///
+    /// # Safety
+    /// The caller must guarantee that the memory referenced by `inner` remains
+    /// valid for the lifetime `'a`.
+    pub unsafe fn from_raw(inner: GpuTensor) -> Self {
+        Self {
+            inner,
+            _lifetime: PhantomData,
+        }
+    }
+
+    /// Get the underlying `GpuTensor` descriptor.
+    ///
+    /// Use this at the kernel FFI boundary inside `unsafe {}` blocks.
+    pub fn as_raw(&self) -> GpuTensor {
+        self.inner
+    }
+
+    /// Narrow on dimension 0, preserving the borrow lifetime.
+    pub fn narrow_dim0(&self, start: usize, len: usize) -> TensorView<'a> {
+        TensorView {
+            inner: self.inner.narrow_dim0(start, len),
+            _lifetime: PhantomData,
+        }
+    }
+
+    /// Reshape (metadata only), preserving the borrow lifetime.
+    pub fn reshape(&self, new_shape: &[usize]) -> TensorView<'a> {
+        TensorView {
+            inner: self.inner.reshape(new_shape),
+            _lifetime: PhantomData,
+        }
+    }
+
+    /// View with a byte offset, preserving the borrow lifetime.
+    ///
+    /// # Safety
+    /// Caller must ensure the resulting pointer + shape stays within valid memory.
+    pub unsafe fn offset_bytes(&self, byte_offset: usize, new_shape: &[usize]) -> TensorView<'a> {
+        TensorView {
+            inner: self.inner.offset_bytes(byte_offset, new_shape),
+            _lifetime: PhantomData,
+        }
+    }
+}
+
+impl std::ops::Deref for TensorView<'_> {
+    type Target = GpuTensor;
+    fn deref(&self) -> &GpuTensor {
+        &self.inner
+    }
+}
+
+impl Clone for TensorView<'_> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl Copy for TensorView<'_> {}
+
+impl std::fmt::Debug for TensorView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TensorView({:?})", self.inner)
     }
 }
 
@@ -581,5 +685,172 @@ mod tests {
         let size = std::mem::size_of::<GpuTensor>();
         // ptr(8) + shape(16) + ndim(1) + dtype(1) + padding = should be <= 32
         assert!(size <= 32, "GpuTensor is {} bytes, expected <= 32", size);
+    }
+
+    // -----------------------------------------------------------------------
+    // TensorView
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tensor_view_deref() {
+        let t = unsafe { GpuTensor::new(0x1000 as *mut u8, &[4, 128], DType::F16) };
+        let view = unsafe { TensorView::from_raw(t) };
+        // Deref gives access to GpuTensor methods.
+        assert_eq!(view.ndim(), 2);
+        assert_eq!(view.dim(0), 4);
+        assert_eq!(view.dim(1), 128);
+        assert_eq!(view.numel(), 512);
+        assert_eq!(view.dtype(), DType::F16);
+    }
+
+    #[test]
+    fn test_tensor_view_as_raw() {
+        let t = unsafe { GpuTensor::new(0x1000 as *mut u8, &[8, 64], DType::BF16) };
+        let view = unsafe { TensorView::from_raw(t) };
+        let raw = view.as_raw();
+        assert_eq!(raw.raw_ptr(), t.raw_ptr());
+        assert_eq!(raw.numel(), t.numel());
+    }
+
+    #[test]
+    fn test_tensor_view_narrow_dim0() {
+        let t = unsafe { GpuTensor::new(0x1000 as *mut u8, &[8, 64], DType::F32) };
+        let view = unsafe { TensorView::from_raw(t) };
+        let narrowed = view.narrow_dim0(2, 3);
+        assert_eq!(narrowed.dim(0), 3);
+        assert_eq!(narrowed.dim(1), 64);
+        assert_eq!(narrowed.raw_ptr() as usize, 0x1000 + 2 * 64 * 4);
+    }
+
+    #[test]
+    fn test_tensor_view_reshape() {
+        let t = unsafe { GpuTensor::new(0x1000 as *mut u8, &[4, 128], DType::BF16) };
+        let view = unsafe { TensorView::from_raw(t) };
+        let reshaped = view.reshape(&[2, 2, 128]);
+        assert_eq!(reshaped.ndim(), 3);
+        assert_eq!(reshaped.numel(), 512);
+        assert_eq!(reshaped.raw_ptr(), t.raw_ptr());
+    }
+
+    #[test]
+    fn test_tensor_view_offset_bytes() {
+        let t = unsafe { GpuTensor::new(0x1000 as *mut u8, &[8, 256], DType::F16) };
+        let view = unsafe { TensorView::from_raw(t) };
+        let sub = unsafe { view.offset_bytes(1024, &[4, 128]) };
+        assert_eq!(sub.raw_ptr() as usize, 0x1000 + 1024);
+        assert_eq!(sub.dim(0), 4);
+        assert_eq!(sub.dim(1), 128);
+    }
+
+    #[test]
+    fn test_tensor_view_copy() {
+        let t = unsafe { GpuTensor::new(0x1000 as *mut u8, &[4, 128], DType::F16) };
+        let v1 = unsafe { TensorView::from_raw(t) };
+        let v2 = v1; // Copy
+        let v3 = v1; // Copy again
+        assert_eq!(v1.raw_ptr(), v2.raw_ptr());
+        assert_eq!(v1.numel(), v3.numel());
+    }
+
+    #[test]
+    fn test_tensor_view_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<TensorView<'static>>();
+    }
+
+    #[test]
+    fn test_tensor_view_debug() {
+        let t = unsafe { GpuTensor::new(0x1000 as *mut u8, &[4, 128], DType::F16) };
+        let view = unsafe { TensorView::from_raw(t) };
+        let s = format!("{:?}", view);
+        assert!(s.contains("TensorView"));
+        assert!(s.contains("[4, 128]"));
+    }
+
+    #[test]
+    fn test_tensor_view_narrow_then_reshape() {
+        // Chained view operations should preserve the same base lifetime.
+        let t = unsafe { GpuTensor::new(0x1000 as *mut u8, &[8, 64], DType::F32) };
+        let view = unsafe { TensorView::from_raw(t) };
+        let narrowed = view.narrow_dim0(2, 4); // [4, 64]
+        let reshaped = narrowed.reshape(&[2, 2, 64]); // [2, 2, 64]
+
+        assert_eq!(reshaped.ndim(), 3);
+        assert_eq!(reshaped.dim(0), 2);
+        assert_eq!(reshaped.dim(1), 2);
+        assert_eq!(reshaped.dim(2), 64);
+        assert_eq!(reshaped.numel(), 256);
+        // Pointer should be at row 2 of original
+        assert_eq!(reshaped.raw_ptr() as usize, 0x1000 + 2 * 64 * 4);
+    }
+
+    #[test]
+    fn test_tensor_view_deref_to_gpu_tensor() {
+        // Verify that *view yields a GpuTensor (the FFI conversion pattern).
+        let t = unsafe { GpuTensor::new(0x2000 as *mut u8, &[4, 128], DType::BF16) };
+        let view = unsafe { TensorView::from_raw(t) };
+
+        // *view should produce a GpuTensor with the same metadata.
+        let gpu: GpuTensor = *view;
+        assert_eq!(gpu.raw_ptr(), t.raw_ptr());
+        assert_eq!(gpu.numel(), t.numel());
+        assert_eq!(gpu.dtype(), t.dtype());
+        assert_eq!(gpu.ndim(), t.ndim());
+    }
+
+    #[test]
+    fn test_tensor_view_narrow_deref_preserves_offset() {
+        // The FFI pattern: narrow a view, then deref to GpuTensor for kernel launch.
+        let t = unsafe { GpuTensor::new(0x1000 as *mut u8, &[16, 4096], DType::BF16) };
+        let view = unsafe { TensorView::from_raw(t) };
+        let sub = view.narrow_dim0(4, 8);
+
+        // Deref to GpuTensor for kernel FFI.
+        let gpu: GpuTensor = *sub;
+        assert_eq!(gpu.dim(0), 8);
+        assert_eq!(gpu.dim(1), 4096);
+        assert_eq!(gpu.raw_ptr() as usize, 0x1000 + 4 * 4096 * 2);
+    }
+
+    #[test]
+    fn test_tensor_view_reshape_narrow_composition() {
+        // Reshape then narrow — models often do this for attention head splitting.
+        let t = unsafe { GpuTensor::new(0x1000 as *mut u8, &[4, 256], DType::F16) };
+        let view = unsafe { TensorView::from_raw(t) };
+
+        // Reshape [4, 256] → [4, 4, 64] (4 heads × 64 dim)
+        let heads = view.reshape(&[4, 4, 64]);
+        assert_eq!(heads.ndim(), 3);
+        assert_eq!(heads.numel(), 1024);
+
+        // Narrow to first 2 tokens
+        let first_two = heads.narrow_dim0(0, 2);
+        assert_eq!(first_two.dim(0), 2);
+        assert_eq!(first_two.dim(1), 4);
+        assert_eq!(first_two.dim(2), 64);
+        assert_eq!(first_two.raw_ptr(), t.raw_ptr()); // Same base
+    }
+
+    /// Compile-time test: verify TensorView can be used in the typical model pattern:
+    /// create a view from an "owner", pass to functions, sub-view creation.
+    #[test]
+    fn test_tensor_view_model_pattern() {
+        let base = unsafe { GpuTensor::new(0x5000 as *mut u8, &[32, 4096], DType::BF16) };
+
+        // Simulate: OwnedTensor::view() would create this.
+        let hidden_states = unsafe { TensorView::from_raw(base) };
+
+        // Pass through a layer (simulate by creating sub-views).
+        let narrowed = hidden_states.narrow_dim0(0, 16);
+        let reshaped = narrowed.reshape(&[16, 4096]);
+
+        // At kernel FFI boundary, extract GpuTensor.
+        let for_kernel: GpuTensor = *reshaped;
+        assert_eq!(for_kernel.dim(0), 16);
+        assert_eq!(for_kernel.dim(1), 4096);
+        assert_eq!(for_kernel.raw_ptr() as usize, 0x5000);
+
+        // Original view still usable (Copy semantics).
+        assert_eq!(hidden_states.dim(0), 32);
     }
 }

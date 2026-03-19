@@ -24,7 +24,7 @@ use crate::model::llama::{ForwardOutput, RotaryCache, TpConfig};
 #[cfg(feature = "nccl")]
 use crate::nccl::NcclGroup;
 use crate::pp::PpConfig;
-use crate::tensor::GpuTensor;
+use crate::tensor::{GpuTensor, TensorView};
 use crate::weights::GpuWeights;
 
 // ---------------------------------------------------------------------------
@@ -190,12 +190,12 @@ impl Gemma3Attention {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        hidden_states: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        hidden_states: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -211,7 +211,7 @@ impl Gemma3Attention {
 
         // Split QKV (no RoPE yet — we need to apply QK norms first).
         let (q, k, v) = kernels::split_qkv(
-            qkv.as_gpu_tensor(),
+            *qkv.view(),
             self.q_size,
             self.kv_size,
             self.num_q_heads,
@@ -225,10 +225,10 @@ impl Gemma3Attention {
         // Per-head QK norms: reshape [T, heads, head_dim] → [T*heads, head_dim],
         // apply RMS norm, reshape back.
         let q_flat = q
-            .as_gpu_tensor()
+            .view()
             .reshape(&[num_tokens * self.num_q_heads, self.head_dim]);
         let q_normed = kernels::rms_norm(
-            q_flat,
+            *q_flat,
             self.q_norm.inner.weight,
             self.q_norm.inner.eps,
             &mut device.caching,
@@ -236,32 +236,31 @@ impl Gemma3Attention {
         );
         drop(q);
         let q_3d = q_normed
-            .as_gpu_tensor()
+            .view()
             .reshape(&[num_tokens, self.num_q_heads, self.head_dim]);
 
         let k_flat = k
-            .as_gpu_tensor()
+            .view()
             .reshape(&[num_tokens * self.num_kv_heads, self.head_dim]);
         let k_normed = kernels::rms_norm(
-            k_flat,
+            *k_flat,
             self.k_norm.inner.weight,
             self.k_norm.inner.eps,
             &mut device.caching,
             device.compute_stream,
         );
         drop(k);
-        let k_3d =
-            k_normed
-                .as_gpu_tensor()
-                .reshape(&[num_tokens, self.num_kv_heads, self.head_dim]);
+        let k_3d = k_normed
+            .view()
+            .reshape(&[num_tokens, self.num_kv_heads, self.head_dim]);
 
         // RoPE (in-place on the normed q/k).
         let q_flat_rope = q_3d.reshape(&[num_tokens, self.q_size]);
         let k_flat_rope = k_3d.reshape(&[num_tokens, self.kv_size]);
         kernels::rotary_embedding_inplace(
-            q_flat_rope,
-            k_flat_rope,
-            positions,
+            *q_flat_rope,
+            *k_flat_rope,
+            *positions,
             rotary.cos_sin_cache,
             self.head_dim,
             device.compute_stream,
@@ -273,7 +272,7 @@ impl Gemma3Attention {
 
         crate::model::attention_helpers::write_kv_cache(
             k_3d,
-            *v,
+            v.view(),
             slot_mapping,
             kv_cache,
             self.layer_idx,
@@ -285,7 +284,7 @@ impl Gemma3Attention {
         let attn_output = crate::model::attention_helpers::attention_ext(
             q_3d,
             k_3d,
-            *v,
+            v.view(),
             cu_seqlens_q,
             seqused_k,
             block_table,
@@ -304,9 +303,7 @@ impl Gemma3Attention {
         drop(v);
         drop(q_normed);
 
-        let attn_flat = attn_output
-            .as_gpu_tensor()
-            .reshape(&[num_tokens, self.q_size]);
+        let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
         let result = self
             .o_proj
             .forward(attn_flat, &mut device.cublas, &mut device.caching);
@@ -316,7 +313,7 @@ impl Gemma3Attention {
         #[cfg(feature = "nccl")]
         if let Some(ref group) = self.tp_group {
             group
-                .all_reduce_inplace(result.as_gpu_tensor())
+                .all_reduce_inplace(*result.view())
                 .expect("o_proj all_reduce failed");
         }
 
@@ -405,11 +402,11 @@ impl Gemma3DecoderLayer {
         &self,
         hidden_states: OwnedTensor,
         residual: Option<OwnedTensor>,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -441,7 +438,7 @@ impl Gemma3DecoderLayer {
 
         // 2. Attention.
         let attn_output = self.self_attn.forward(
-            *normed,
+            normed.view(),
             positions,
             slot_mapping,
             cu_seqlens_q,
@@ -476,7 +473,7 @@ impl Gemma3DecoderLayer {
         );
 
         // 5. MLP.
-        let mlp_output = self.mlp.forward(*attn_normed, device);
+        let mlp_output = self.mlp.forward(attn_normed.view(), device);
         drop(attn_normed);
 
         // 6. Post-feedforward norm (standalone — allocates, drops input).
@@ -568,12 +565,12 @@ impl Gemma3Model {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
@@ -582,15 +579,11 @@ impl Gemma3Model {
         // Embedding lookup + Gemma scaling.
         let hidden_states = kernels::embedding_gather(
             self.embed_tokens.weight,
-            input_ids,
+            *input_ids,
             &mut device.caching,
             device.compute_stream,
         );
-        kernels::scale_inplace(
-            hidden_states.as_gpu_tensor(),
-            self.embed_scale,
-            &device.cublas,
-        );
+        kernels::scale_inplace(*hidden_states.view(), self.embed_scale, &device.cublas);
 
         let mut hidden_states: OwnedTensor = hidden_states;
         let mut residual: Option<OwnedTensor> = None;
@@ -622,7 +615,7 @@ impl Gemma3Model {
 
         // Final norm: mutates hidden_states and residual in-place.
         let hs_gpu = *hidden_states;
-        let res_gpu = residual.as_ref().unwrap().as_gpu_tensor();
+        let res_gpu = *residual.as_ref().unwrap().view();
         kernels::fused_add_rms_norm_inplace(
             hs_gpu,
             res_gpu,
@@ -668,17 +661,17 @@ impl Gemma3ForCausalLM {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward(
         &self,
-        input_ids: GpuTensor,
-        positions: GpuTensor,
-        slot_mapping: GpuTensor,
-        cu_seqlens_q: GpuTensor,
-        seqused_k: GpuTensor,
-        block_table: GpuTensor,
+        input_ids: TensorView<'_>,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &KvCachePool,
         device: &mut GpuDevice,
-        last_token_indices: Option<GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> OwnedTensor {
         let hidden_states = self.model.forward(
             input_ids,
@@ -697,7 +690,7 @@ impl Gemma3ForCausalLM {
         let hidden_states = if let Some(indices) = last_token_indices {
             crate::kernels::embedding_gather(
                 *hidden_states,
-                indices,
+                *indices,
                 &mut device.caching,
                 device.compute_stream,
             )
@@ -705,8 +698,11 @@ impl Gemma3ForCausalLM {
             hidden_states
         };
 
-        self.lm_head
-            .forward(*hidden_states, &mut device.cublas, &mut device.caching)
+        self.lm_head.forward(
+            hidden_states.view(),
+            &mut device.cublas,
+            &mut device.caching,
+        )
     }
 }
 
@@ -1211,13 +1207,13 @@ impl Gemma3Model {
     pub unsafe fn forward_pp(
         &self,
         pp: &PpConfig,
-        input_ids: Option<crate::tensor::GpuTensor>,
+        input_ids: Option<TensorView<'_>>,
         intermediate: Option<(OwnedTensor, OwnedTensor)>,
-        positions: crate::tensor::GpuTensor,
-        slot_mapping: crate::tensor::GpuTensor,
-        cu_seqlens_q: crate::tensor::GpuTensor,
-        seqused_k: crate::tensor::GpuTensor,
-        block_table: crate::tensor::GpuTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &crate::kv_cache::KvCachePool,
@@ -1228,11 +1224,11 @@ impl Gemma3Model {
                 let input_ids = input_ids.expect("first PP stage requires input_ids");
                 let hs = kernels::embedding_gather(
                     self.embed_tokens.weight,
-                    input_ids,
+                    *input_ids,
                     &mut device.caching,
                     device.compute_stream,
                 );
-                kernels::scale_inplace(hs.as_gpu_tensor(), self.embed_scale, &device.cublas);
+                kernels::scale_inplace(*hs.view(), self.embed_scale, &device.cublas);
                 (hs, None)
             } else {
                 let (hs, res) = intermediate.expect("non-first PP stage requires intermediate");
@@ -1269,7 +1265,7 @@ impl Gemma3Model {
 
         if pp.is_last_stage() {
             let hs_gpu = *hidden_states;
-            let res_gpu = residual.as_ref().unwrap().as_gpu_tensor();
+            let res_gpu = *residual.as_ref().unwrap().view();
             kernels::fused_add_rms_norm_inplace(
                 hs_gpu,
                 res_gpu,
@@ -1361,18 +1357,18 @@ impl Gemma3ForCausalLM {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn forward_pp(
         &self,
-        input_ids: Option<crate::tensor::GpuTensor>,
+        input_ids: Option<TensorView<'_>>,
         intermediate: Option<(OwnedTensor, OwnedTensor)>,
-        positions: crate::tensor::GpuTensor,
-        slot_mapping: crate::tensor::GpuTensor,
-        cu_seqlens_q: crate::tensor::GpuTensor,
-        seqused_k: crate::tensor::GpuTensor,
-        block_table: crate::tensor::GpuTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
         max_seqlen_q: usize,
         max_seqlen_k: usize,
         kv_cache: &crate::kv_cache::KvCachePool,
         device: &mut crate::device::GpuDevice,
-        last_token_indices: Option<crate::tensor::GpuTensor>,
+        last_token_indices: Option<TensorView<'_>>,
     ) -> ForwardOutput {
         let pp = self
             .pp_config
@@ -1400,7 +1396,7 @@ impl Gemma3ForCausalLM {
                 let hidden_states = if let Some(indices) = last_token_indices {
                     kernels::embedding_gather(
                         hidden_states,
-                        indices,
+                        *indices,
                         &mut device.caching,
                         device.compute_stream,
                     )
@@ -1409,9 +1405,11 @@ impl Gemma3ForCausalLM {
                     hidden_states
                 };
 
-                let logits =
-                    self.lm_head
-                        .forward(hidden_states, &mut device.cublas, &mut device.caching);
+                let logits = self.lm_head.forward(
+                    TensorView::from_raw(hidden_states),
+                    &mut device.cublas,
+                    &mut device.caching,
+                );
                 ForwardOutput::Logits(logits.into_gpu_tensor())
             }
         }

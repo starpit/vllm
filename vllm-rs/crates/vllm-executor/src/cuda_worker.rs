@@ -5549,7 +5549,16 @@ impl CudaWorker {
                     || p.bad_words_token_ids.is_some()
                     || p.allowed_token_ids.is_some()
             })
-        }) || !self.grammar_states.is_empty();
+        }) || {
+            #[cfg(feature = "guided-decoding")]
+            {
+                !self.grammar_states.is_empty()
+            }
+            #[cfg(not(feature = "guided-decoding"))]
+            {
+                false
+            }
+        };
 
         if use_graph && all_greedy && !any_needs_full_sampling {
             // Fast path: CUDA graph with in-graph argmax. No separate sampling

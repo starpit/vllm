@@ -421,7 +421,7 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
     for ki in 0..PART_K as u64 {
         let k_off = ci(ki * MMA_K as u64);
 
-        // Load all A fragments for this K-slice
+        // Load all A fragments via 32-bit shared memory loads
         let mut a_frags: Vec<IntValue> = Vec::new();
         for rm in 0..REG_M as u64 {
             let rm_off = b.build_int_add(wy_off, ci(rm * MMA_M as u64), "").unwrap();
@@ -436,12 +436,11 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
                     b.build_int_mul(frow, ci(STAGE_DIM_K as u64), "").unwrap(), fcol, "",
                 ).unwrap();
                 let sw = build_swizzle(&b, &ctx, lin);
-                let gep = unsafe { b.build_gep(f16_ty, smem_a, &[sw], "").unwrap() };
-                a_frags.push(b.build_load(i32_ty, gep, "").unwrap().into_int_value());
+                a_frags.push(build_ld_shared_u32(&b, &ctx, &module, smem_a, sw));
             }
         }
 
-        // For each N-tile: load B, MMA all M
+        // For each N-tile: load B via 32-bit shared loads, MMA all M
         for rn in 0..REG_N as u64 {
             let b_col = b.build_int_add(ci(rn * MMA_N as u64), group, "").unwrap();
 
@@ -459,10 +458,8 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
                 ).unwrap();
                 let sw0 = build_swizzle(&b, &ctx, lin0);
                 let sw1 = build_swizzle(&b, &ctx, lin1);
-                let gep0 = unsafe { b.build_gep(f16_ty, smem_b, &[sw0], "").unwrap() };
-                let gep1 = unsafe { b.build_gep(f16_ty, smem_b, &[sw1], "").unwrap() };
-                let v0 = b.build_load(f16_ty, gep0, "").unwrap();
-                let v1 = b.build_load(f16_ty, gep1, "").unwrap();
+                let v0 = build_ld_shared_f16(&b, &ctx, &module, smem_b, sw0);
+                let v1 = build_ld_shared_f16(&b, &ctx, &module, smem_b, sw1);
                 let vec = b.build_insert_element(v2f16_ty.get_undef(), v0, ci(0), "").unwrap();
                 let vec = b.build_insert_element(vec, v1, ci(1), "").unwrap();
                 b_frag.push(b.build_bit_cast(vec, i32_ty, "").unwrap().into_int_value());
@@ -544,6 +541,93 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
 // ===========================================================================
 // Inline asm helpers (same as tiled_mma.rs)
 // ===========================================================================
+
+/// Load i32 from shared memory using 32-bit addressing.
+/// Avoids LLVM's 64-bit pointer expansion that wastes registers.
+/// smem_base is the shared pointer base, byte_off is a 32-bit byte offset.
+fn build_ld_shared_u32<'ctx>(
+    builder: &Builder<'ctx>,
+    context: &'ctx LlvmContext,
+    module: &Module<'ctx>,
+    smem_base: inkwell::values::PointerValue<'ctx>,
+    elem_off: IntValue<'ctx>, // offset in f16 elements
+) -> IntValue<'ctx> {
+    let i32_ty = context.i32_type();
+    unsafe {
+        let mod_ref = module.as_mut_ptr();
+        let ctx_ref = llvm_sys::core::LLVMGetModuleContext(mod_ref);
+        let builder_ref = builder.as_mut_ptr();
+
+        // Compute 32-bit byte address: ptrtoint(base) + elem_off * 2
+        let base_i32 = builder.build_ptr_to_int(smem_base, i32_ty, "").unwrap();
+        let byte_off = builder.build_int_mul(elem_off, i32_ty.const_int(2, false), "").unwrap();
+        let addr = builder.build_int_add(base_i32, byte_off, "").unwrap();
+
+        let mut param_types = [i32_ty.as_type_ref()];
+        let fn_type = llvm_sys::core::LLVMFunctionType(
+            i32_ty.as_type_ref(), param_types.as_mut_ptr(), 1, 0,
+        );
+
+        let asm_str = b"ld.shared.u32 $0, [$1];\0";
+        let constraints = b"=r,r\0";
+
+        let asm_val = llvm_sys::core::LLVMGetInlineAsm(
+            fn_type, asm_str.as_ptr() as *const _, asm_str.len() - 1,
+            constraints.as_ptr() as *const _, constraints.len() - 1,
+            0, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0,
+        );
+
+        let mut args = [addr.as_value_ref()];
+        let call = llvm_sys::core::LLVMBuildCall2(
+            builder_ref, fn_type, asm_val, args.as_mut_ptr(), 1, b"\0".as_ptr() as *const _,
+        );
+
+        IntValue::new(call)
+    }
+}
+
+/// Load f16 from shared memory using 32-bit addressing.
+fn build_ld_shared_f16<'ctx>(
+    builder: &Builder<'ctx>,
+    context: &'ctx LlvmContext,
+    module: &Module<'ctx>,
+    smem_base: inkwell::values::PointerValue<'ctx>,
+    elem_off: IntValue<'ctx>,
+) -> inkwell::values::BasicValueEnum<'ctx> {
+    let i32_ty = context.i32_type();
+    let f16_ty = context.f16_type();
+    unsafe {
+        let mod_ref = module.as_mut_ptr();
+        let ctx_ref = llvm_sys::core::LLVMGetModuleContext(mod_ref);
+        let builder_ref = builder.as_mut_ptr();
+
+        let base_i32 = builder.build_ptr_to_int(smem_base, i32_ty, "").unwrap();
+        let byte_off = builder.build_int_mul(elem_off, i32_ty.const_int(2, false), "").unwrap();
+        let addr = builder.build_int_add(base_i32, byte_off, "").unwrap();
+
+        let mut param_types = [i32_ty.as_type_ref()];
+        let fn_type = llvm_sys::core::LLVMFunctionType(
+            f16_ty.as_type_ref(), param_types.as_mut_ptr(), 1, 0,
+        );
+
+        let asm_str = b"ld.shared.b16 $0, [$1];\0";
+        let constraints = b"=h,r\0"; // h = 16-bit register
+
+        let asm_val = llvm_sys::core::LLVMGetInlineAsm(
+            fn_type, asm_str.as_ptr() as *const _, asm_str.len() - 1,
+            constraints.as_ptr() as *const _, constraints.len() - 1,
+            0, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0,
+        );
+
+        let mut args = [addr.as_value_ref()];
+        let call = llvm_sys::core::LLVMBuildCall2(
+            builder_ref, fn_type, asm_val, args.as_mut_ptr(), 1, b"\0".as_ptr() as *const _,
+        );
+
+        // Wrap raw LLVMValueRef as BasicValueEnum
+        inkwell::values::BasicValueEnum::new(call)
+    }
+}
 
 fn build_cp_async_16<'ctx>(
     builder: &Builder<'ctx>,

@@ -1,5 +1,13 @@
 #![no_std]
 #![feature(abi_ptx, asm_experimental_arch)]
+#![allow(unsafe_op_in_unsafe_fn)]
+
+use core::panic::PanicInfo;
+
+#[panic_handler]
+fn panic(_: &PanicInfo) -> ! {
+    loop {}
+}
 
 //! Minimal MMA GEMM kernel compiled via rustc nightly → nvptx64.
 //! Tests whether LLVM 22's NVPTX backend produces better codegen than LLVM 20.
@@ -93,11 +101,11 @@ unsafe fn mma_sync(a: [u32; 4], b: [u32; 2], c: [f32; 4]) -> [f32; 4] {
 
 // Shared memory — declared as a large static array
 // On nvptx64, address space 3 = shared
-#[link_section = ".shared"]
+#[unsafe(link_section = ".shared")]
 static mut SMEM: [u8; (BM * BK + BK * BN) as usize * 2] =
     [0u8; (BM * BK + BK * BN) as usize * 2];
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn mma_gemm(
     a_ptr: *const u16,
     b_ptr: *const u16,

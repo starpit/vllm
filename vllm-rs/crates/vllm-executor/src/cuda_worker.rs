@@ -5570,6 +5570,8 @@ impl CudaWorker {
 
         // Check if any request needs logprobs, grammar, or logit processors
         // (these require the full GPU sampling pipeline instead of in-graph argmax).
+        // Also gates CUDA graph replay: processor GPU tensors (allocated from the
+        // caching allocator) can collide with graph-captured intermediate addresses.
         let any_needs_full_sampling = prepared.req_inputs.iter().any(|r| {
             self.sampling_params_map
                 .get(&r.req_id)
@@ -5578,7 +5580,8 @@ impl CudaWorker {
             .logits_pipeline
             .as_ref()
             .is_some_and(|p| p.any_active())
-            || self.grammar_processor.is_active();
+            || self.grammar_processor.is_active()
+            || self.allowed_token_ids_processor.is_active();
 
         if use_graph && all_greedy && !any_needs_full_sampling {
             // Fast path: CUDA graph with in-graph argmax. No separate sampling
@@ -5801,9 +5804,22 @@ impl CudaWorker {
         }
 
         // Non-greedy graph path or eager path: need separate sampling.
+        // IMPORTANT: skip graph replay when any logits processor or grammar is
+        // active. CUDA graphs replay kernels at captured memory addresses —
+        // intermediate forward-pass buffers reuse the same addresses as during
+        // capture. If the grammar/processor GPU tensors (allocated from the
+        // caching allocator's free pool) happen to land on those captured
+        // addresses, the graph replay overwrites them, causing the mask kernel
+        // to read garbage and trigger an illegal-address fault.
+        //
+        // TODO: make grammar/processors compatible with CUDA graphs by
+        // moving processor tensor allocation AFTER graph replay (matching
+        // Python vLLM's architecture where processors are applied after the
+        // forward pass, not before).
+        //
         // `_logits_owned` keeps the OwnedTensor alive for eager-forward paths
         // so the GPU memory backing `logits` survives until sampling completes.
-        let (_logits_owned, logits) = if use_graph {
+        let (_logits_owned, logits) = if use_graph && !any_needs_full_sampling {
             // CUDA graph replay (non-greedy: in-graph argmax result is
             // discarded; we re-sample with temperature on the logits).
             let graph_bs = graph_bs.unwrap();

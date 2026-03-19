@@ -668,6 +668,22 @@ unsafe extern "C" {
         input_dim1: i32,
         stream: CUstream,
     );
+    fn launch_indexed_moe_forward_q4_0_q8_1(
+        all_weights: *const u8, all_inputs: *const u8, indices: *const u32, all_outputs: *mut f32,
+        n: i32, k: i32, batch: i32, topk: i32, k_padded: i32, input_dim1: i32, stream: CUstream,
+    );
+    fn launch_indexed_moe_forward_q4_1_q8_1(
+        all_weights: *const u8, all_inputs: *const u8, indices: *const u32, all_outputs: *mut f32,
+        n: i32, k: i32, batch: i32, topk: i32, k_padded: i32, input_dim1: i32, stream: CUstream,
+    );
+    fn launch_indexed_moe_forward_q5_0_q8_1(
+        all_weights: *const u8, all_inputs: *const u8, indices: *const u32, all_outputs: *mut f32,
+        n: i32, k: i32, batch: i32, topk: i32, k_padded: i32, input_dim1: i32, stream: CUstream,
+    );
+    fn launch_indexed_moe_forward_q5_1_q8_1(
+        all_weights: *const u8, all_inputs: *const u8, indices: *const u32, all_outputs: *mut f32,
+        n: i32, k: i32, batch: i32, topk: i32, k_padded: i32, input_dim1: i32, stream: CUstream,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -810,17 +826,23 @@ pub unsafe fn ggml_dequantize_to_tensor(
             );
         }
         DType::BF16 => {
-            // Dequant to f32 first. Norms are tiny, f32 is fine for RmsNorm.
-            let f32_out = alloc.alloc_tensor(shape, DType::F32);
+            // No direct quant→BF16 kernel. Dequant to F32, then cast F32→BF16.
+            let f32_tmp = alloc.alloc_tensor(shape, DType::F32);
             ggml_dequantize_f32(
                 storage.ptr,
-                f32_out.as_gpu_tensor().raw_ptr() as *mut f32,
+                f32_tmp.as_gpu_tensor().raw_ptr() as *mut f32,
                 storage.dtype,
                 elem_count,
                 stream,
             );
-            drop(out);
-            return f32_out;
+            crate::kernels::cast_from_f32_into(
+                f32_tmp.as_gpu_tensor().raw_ptr() as *const f32,
+                out.as_gpu_tensor().raw_ptr(),
+                DType::BF16,
+                elem_count,
+                stream,
+            );
+            drop(f32_tmp);
         }
         _ => panic!(
             "unsupported target dtype for dequantize: {:?}",
@@ -1094,6 +1116,22 @@ pub unsafe fn ggml_moe_forward(
             k_padded_i,
             input_dim1_i,
             stream,
+        ),
+        GgmlDType::Q4_0 => launch_indexed_moe_forward_q4_0_q8_1(
+            vx, q8_input, indices, output,
+            n_i, k_i, batch_i, topk_i, k_padded_i, input_dim1_i, stream,
+        ),
+        GgmlDType::Q4_1 => launch_indexed_moe_forward_q4_1_q8_1(
+            vx, q8_input, indices, output,
+            n_i, k_i, batch_i, topk_i, k_padded_i, input_dim1_i, stream,
+        ),
+        GgmlDType::Q5_0 => launch_indexed_moe_forward_q5_0_q8_1(
+            vx, q8_input, indices, output,
+            n_i, k_i, batch_i, topk_i, k_padded_i, input_dim1_i, stream,
+        ),
+        GgmlDType::Q5_1 => launch_indexed_moe_forward_q5_1_q8_1(
+            vx, q8_input, indices, output,
+            n_i, k_i, batch_i, topk_i, k_padded_i, input_dim1_i, stream,
         ),
         _ => panic!("unsupported dtype for ggml_moe_forward: {}", storage.dtype),
     }

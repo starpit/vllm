@@ -1443,22 +1443,48 @@ impl DeepSeekV2ForCausalLM {
                     let nrows = s.nrows;
                     let ncols = s.ncols;
                     let elem_count = nrows * ncols;
-                    let out_dtype = DType::F16;
-                    let out_bytes = elem_count * out_dtype.size_bytes();
-                    let gpu_ptr = unsafe { driver::mem_alloc(out_bytes)? };
-                    unsafe {
-                        crate::ggml::ggml_dequantize_f16(
-                            s.ptr,
-                            gpu_ptr as *mut u16,
-                            s.dtype,
-                            elem_count,
-                            stream,
-                        );
-                        driver::stream_synchronize(stream)?;
-                        driver::mem_free(s.ptr)?;
+                    if dtype == DType::F16 {
+                        // Direct quant → F16.
+                        let out_bytes = elem_count * DType::F16.size_bytes();
+                        let out_ptr = unsafe { driver::mem_alloc(out_bytes)? };
+                        unsafe {
+                            crate::ggml::ggml_dequantize_f16(
+                                s.ptr, out_ptr as *mut u16, s.dtype, elem_count, stream,
+                            );
+                            driver::stream_synchronize(stream)?;
+                            driver::mem_free(s.ptr)?;
+                        }
+                        let tensor =
+                            unsafe { GpuTensor::new(out_ptr, &[nrows, ncols], DType::F16) };
+                        Ok(Linear::new(tensor, None))
+                    } else {
+                        // quant → F32 → cast to model dtype (BF16, etc.)
+                        let f32_bytes = elem_count * DType::F32.size_bytes();
+                        let f32_ptr = unsafe { driver::mem_alloc(f32_bytes)? };
+                        unsafe {
+                            crate::ggml::ggml_dequantize_f32(
+                                s.ptr, f32_ptr as *mut f32, s.dtype, elem_count, stream,
+                            );
+                            driver::stream_synchronize(stream)?;
+                            driver::mem_free(s.ptr)?;
+                        }
+                        let out_bytes = elem_count * dtype.size_bytes();
+                        let out_ptr = unsafe { driver::mem_alloc(out_bytes)? };
+                        unsafe {
+                            crate::kernels::cast_from_f32_into(
+                                f32_ptr as *const f32,
+                                out_ptr,
+                                dtype,
+                                elem_count,
+                                stream,
+                            );
+                            driver::stream_synchronize(stream)?;
+                            driver::mem_free(f32_ptr)?;
+                        }
+                        let tensor =
+                            unsafe { GpuTensor::new(out_ptr, &[nrows, ncols], dtype) };
+                        Ok(Linear::new(tensor, None))
                     }
-                    let tensor = unsafe { GpuTensor::new(gpu_ptr, &[nrows, ncols], out_dtype) };
-                    Ok(Linear::new(tensor, None))
                 }
             }
         };

@@ -4643,6 +4643,31 @@ pub unsafe fn cast_from_f32(
     out
 }
 
+/// Cast f32 data into a pre-allocated buffer of target dtype.
+///
+/// # Safety
+/// `input` must point to `n` f32 values. `output` must have room for `n` elements of `target_dtype`.
+pub unsafe fn cast_from_f32_into(
+    input: *const f32,
+    output: *mut u8,
+    target_dtype: DType,
+    n: usize,
+    stream: CUstream,
+) {
+    let n_i = n as c_int;
+    match target_dtype {
+        DType::F32 => {
+            crate::driver::memcpy_dtod_async(
+                output, input as *const u8, n * 4, stream,
+            )
+            .expect("cast_from_f32_into: D2D copy failed");
+        }
+        DType::F16 => cast_from_f32_f16(output as *mut u16, input, n_i, stream),
+        DType::BF16 => cast_from_f32_bf16(output as *mut u16, input, n_i, stream),
+        _ => panic!("cast_from_f32_into: unsupported target dtype {:?}", target_dtype),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MoE top-k softmax
 // ---------------------------------------------------------------------------

@@ -115,14 +115,14 @@ pub fn run(sm: &str) -> Result<()> {
     Ok(())
 }
 
-// ── Swizzle ──
-fn swizzle<'ctx>(b: &Builder<'ctx>, ctx: &'ctx LlvmContext, idx: IntValue<'ctx>) -> IntValue<'ctx> {
+// ── Swizzle (returns byte offset, no division) ──
+fn swizzle_bytes<'ctx>(b: &Builder<'ctx>, ctx: &'ctx LlvmContext, elem_idx: IntValue<'ctx>) -> IntValue<'ctx> {
     let ci = |v: u64| ctx.i32_type().const_int(v, false);
-    let byte = b.build_int_mul(idx, ci(2), "").unwrap();
+    // elem_idx * 2 → byte offset, apply XOR swizzle, return bytes
+    let byte = b.build_shl(elem_idx, ci(1), "").unwrap(); // ×2 via shift, not mul
     let masked = b.build_and(byte, ci(SWIZZLE_MASK as u64), "").unwrap();
     let shifted = b.build_right_shift(masked, ci(SWIZZLE_SHIFT as u64), false, "").unwrap();
-    let swizzled = b.build_xor(byte, shifted, "").unwrap();
-    b.build_int_unsigned_div(swizzled, ci(2), "").unwrap()
+    b.build_xor(byte, shifted, "").unwrap() // returns byte offset
 }
 
 // ── ldmatrix.sync.aligned.m8n8.x4.shared.b16 ──
@@ -157,6 +157,40 @@ fn ldmatrix_x4<'ctx>(
         let call = llvm_sys::core::LLVMBuildCall2(br, ft, av,
             args.as_mut_ptr(), 1, b"\0".as_ptr() as *const _);
 
+        [
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 0, b"\0".as_ptr() as *const _)),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 1, b"\0".as_ptr() as *const _)),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 2, b"\0".as_ptr() as *const _)),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 3, b"\0".as_ptr() as *const _)),
+        ]
+    }
+}
+
+// ── ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 (for B fragments) ──
+fn ldmatrix_x4_trans<'ctx>(
+    b: &Builder<'ctx>, ctx: &'ctx LlvmContext, module: &Module<'ctx>,
+    smem_ptr: inkwell::values::PointerValue<'ctx>, byte_offset: IntValue<'ctx>,
+) -> [IntValue<'ctx>; 4] {
+    let i32_ty = ctx.i32_type();
+    unsafe {
+        let mr = module.as_mut_ptr();
+        let cr = llvm_sys::core::LLVMGetModuleContext(mr);
+        let br = b.as_mut_ptr();
+        let ptr = b.build_gep(ctx.i8_type(), smem_ptr, &[byte_offset], "").unwrap();
+        let addr = b.build_ptr_to_int(ptr, i32_ty, "").unwrap();
+        let mut rm = [i32_ty.as_type_ref(); 4];
+        let rs = llvm_sys::core::LLVMStructTypeInContext(cr, rm.as_mut_ptr(), 4, 0);
+        let mut pt = [i32_ty.as_type_ref()];
+        let ft = llvm_sys::core::LLVMFunctionType(rs, pt.as_mut_ptr(), 1, 0);
+        let asm_str = b"ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {$0,$1,$2,$3}, [$4];\0";
+        let con = b"=r,=r,=r,=r,r\0";
+        let av = llvm_sys::core::LLVMGetInlineAsm(ft,
+            asm_str.as_ptr() as *const _, asm_str.len() - 1,
+            con.as_ptr() as *const _, con.len() - 1,
+            1, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0);
+        let mut args = [addr.as_value_ref()];
+        let call = llvm_sys::core::LLVMBuildCall2(br, ft, av,
+            args.as_mut_ptr(), 1, b"\0".as_ptr() as *const _);
         [
             IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 0, b"\0".as_ptr() as *const _)),
             IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 1, b"\0".as_ptr() as *const _)),
@@ -343,8 +377,8 @@ fn emit_ptx(sm: &str) -> Result<String> {
         let gcol = b.build_int_add(t, col, "").unwrap();
         let gidx = b.build_int_add(b.build_int_mul(grow, k_p, "").unwrap(), gcol, "").unwrap();
         let gep = unsafe { b.build_gep(f16_ty, a_ptr, &[gidx], "").unwrap() };
-        let sw = swizzle(&b, &ctx, base);
-        let sgep = unsafe { b.build_gep(f16_ty, smem_a, &[sw], "").unwrap() };
+        let sw_bytes = swizzle_bytes(&b, &ctx, base);
+        let sgep = unsafe { b.build_gep(ctx.i8_type(), smem_a, &[sw_bytes], "").unwrap() };
         cp_async_16(&b, &ctx, &module, sgep, gep);
     }
     for chunk in 0..2u64 {
@@ -355,59 +389,59 @@ fn emit_ptx(sm: &str) -> Result<String> {
         let gcol = b.build_int_add(block_col, col, "").unwrap();
         let gidx = b.build_int_add(b.build_int_mul(grow, n_p, "").unwrap(), gcol, "").unwrap();
         let gep = unsafe { b.build_gep(f16_ty, b_ptr, &[gidx], "").unwrap() };
-        let sw = swizzle(&b, &ctx, base);
-        let sgep = unsafe { b.build_gep(f16_ty, smem_b, &[sw], "").unwrap() };
+        let sw_bytes = swizzle_bytes(&b, &ctx, base);
+        let sgep = unsafe { b.build_gep(ctx.i8_type(), smem_b, &[sw_bytes], "").unwrap() };
         cp_async_16(&b, &ctx, &module, sgep, gep);
     }
     cp_async_commit(&b, &ctx, &module);
     cp_async_wait_group(&b, &ctx, &module, 0);
     call_barrier0(&ctx, &module, &b);
 
-    // ── 2 K-iterations (K_ITERS=2), each with ldmatrix + MMA ──
+    // ── 2 K-iterations, each with ldmatrix (A) + ldmatrix.trans (B) + MMA ──
     let mut cur: Vec<FloatValue> = (0..num_acc).map(|i| acc_phis[i].as_basic_value().into_float_value()).collect();
 
     let lane_mod16 = b.build_int_unsigned_rem(lane, ci(16), "lm16").unwrap();
+    let lane_mod8 = b.build_int_unsigned_rem(lane, ci(8), "lm8").unwrap();
 
     for ki in 0..K_ITERS as u64 {
         let k_off = ci(ki * MMA_K as u64); // 0 or 16
 
-        // Load A fragments via ldmatrix (1 per REG_M row)
+        // Load A fragments via ldmatrix.x4 (1 per REG_M row)
         let mut a_frags: Vec<[IntValue; 4]> = Vec::new();
         for rm in 0..REG_M as u64 {
             let row = b.build_int_add(ci(rm * MMA_M as u64), lane_mod16, "").unwrap();
-            // Byte offset in smem_a: (row * BK + k_off) * 2
             let elem_off = b.build_int_add(
                 b.build_int_mul(row, ci(BK as u64), "").unwrap(), k_off, "",
             ).unwrap();
-            let sw = swizzle(&b, &ctx, elem_off);
-            let byte_off = b.build_int_mul(sw, ci(2), "").unwrap();
+            let byte_off = swizzle_bytes(&b, &ctx, elem_off);
             let frag = ldmatrix_x4(&b, &ctx, &module, smem_a, byte_off);
             a_frags.push(frag);
         }
 
-        // For each N tile: load B fragments via scalar loads + MMA
+        // Load B fragments via ldmatrix.x4.trans (1 per REG_N col)
+        // For .trans, each thread provides the row address for lane % 8
+        let mut b_frags: Vec<[IntValue; 4]> = Vec::new();
         for rn in 0..REG_N as u64 {
-            let b_col = b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap();
-            let b_col_g = b.build_int_add(b_col, group, "").unwrap();
+            let col = b.build_int_add(
+                b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap(),
+                lane_mod8, "",
+            ).unwrap();
+            // B is stored as [BK×BN] row-major. For column `col`, row `k_off`:
+            // elem = k_off * BN + col → byte offset via swizzle
+            let elem_off = b.build_int_add(
+                b.build_int_mul(k_off, ci(BN as u64), "").unwrap(), col, "",
+            ).unwrap();
+            let byte_off = swizzle_bytes(&b, &ctx, elem_off);
+            let frag = ldmatrix_x4_trans(&b, &ctx, &module, smem_b, byte_off);
+            // ldmatrix.x4.trans returns 4 regs, but MMA B needs only 2.
+            // For m16n8k16: B fragment = 2 regs. ldmatrix.x4.trans loads 2 tiles.
+            b_frags.push(frag);
+        }
 
-            let mut b_frag = [ci(0), ci(0)];
-            for (fi, fk_add) in [0u64, 8].iter().enumerate() {
-                let k0 = b.build_int_add(b.build_int_add(tg2, ci(*fk_add), "").unwrap(), k_off, "").unwrap();
-                let k1 = b.build_int_add(k0, ci(1), "").unwrap();
-                let lin0 = b.build_int_add(b.build_int_mul(k0, ci(BN as u64), "").unwrap(), b_col_g, "").unwrap();
-                let lin1 = b.build_int_add(b.build_int_mul(k1, ci(BN as u64), "").unwrap(), b_col_g, "").unwrap();
-                let sw0 = swizzle(&b, &ctx, lin0);
-                let sw1 = swizzle(&b, &ctx, lin1);
-                let gep0 = unsafe { b.build_gep(f16_ty, smem_b, &[sw0], "").unwrap() };
-                let gep1 = unsafe { b.build_gep(f16_ty, smem_b, &[sw1], "").unwrap() };
-                let v0 = b.build_load(f16_ty, gep0, "").unwrap();
-                let v1 = b.build_load(f16_ty, gep1, "").unwrap();
-                let v2f16 = f16_ty.vec_type(2);
-                let vec = b.build_insert_element(v2f16.get_undef(), v0, ci(0), "").unwrap();
-                let vec = b.build_insert_element(vec, v1, ci(1), "").unwrap();
-                b_frag[fi] = b.build_bit_cast(vec, i32_ty, "").unwrap().into_int_value();
-            }
-
+        // MMA: REG_M × REG_N
+        for rn in 0..REG_N as u64 {
+            // B frag: first 2 regs from ldmatrix.x4.trans
+            let b_frag = [b_frags[rn as usize][0], b_frags[rn as usize][1]];
             for rm in 0..REG_M as u64 {
                 let ai = (rm as u32 * REG_N * 4 + rn as u32 * 4) as usize;
                 let [d0,d1,d2,d3] = mma_sync(&b, &ctx, &module,

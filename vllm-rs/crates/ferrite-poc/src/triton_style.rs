@@ -119,7 +119,7 @@ pub fn run(sm: &str) -> Result<()> {
 fn swizzle_bytes<'ctx>(b: &Builder<'ctx>, ctx: &'ctx LlvmContext, elem_idx: IntValue<'ctx>) -> IntValue<'ctx> {
     let ci = |v: u64| ctx.i32_type().const_int(v, false);
     // elem_idx * 2 → byte offset, apply XOR swizzle, return bytes
-    let byte = b.build_shl(elem_idx, ci(1), "").unwrap(); // ×2 via shift, not mul
+    let byte = b.build_left_shift(elem_idx, ci(1), "").unwrap(); // ×2 via shift
     let masked = b.build_and(byte, ci(SWIZZLE_MASK as u64), "").unwrap();
     let shifted = b.build_right_shift(masked, ci(SWIZZLE_SHIFT as u64), false, "").unwrap();
     b.build_xor(byte, shifted, "").unwrap() // returns byte offset

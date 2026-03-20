@@ -5249,16 +5249,22 @@ impl Worker for CudaWorker {
                 .map_err(|e| ExecutorError::WorkerInit(format!("ctx_set_current: {e}")))?;
         }
 
-        // Skip profiling forward for GGML models — the GGML kernels with flash
-        // attention cause CUDA errors during the dummy forward pass (the profiling
-        // forward triggers an illegal memory access in flash attention). Use a
-        // conservative fixed estimate instead.
+        // Skip profiling forward for models where the dummy forward is
+        // incompatible or too expensive:
+        // - GGML: flash attention triggers illegal memory access
+        // - Qwen3Next: similar profiling issues
+        // - PP: multi-rank profiling not supported
+        // - MoE: fused path uses ~55 MB/layer (OK), but profiling with
+        //   max_num_batched_tokens can still OOM on the attention side
         let pp_active = self.pp_config.is_some_and(|pp| pp.pp_size > 1);
-        if self.uses_ggml || self.qwen3_next_config.is_some() || pp_active {
+        let is_moe = self.model.as_ref().is_some_and(|m| m.is_moe());
+        if self.uses_ggml || self.qwen3_next_config.is_some() || pp_active || is_moe {
             let tag = if self.uses_ggml {
                 "GGML"
             } else if pp_active {
                 "PP"
+            } else if is_moe {
+                "MoE"
             } else {
                 "Qwen3Next"
             };

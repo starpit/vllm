@@ -20,6 +20,9 @@ members = [
     "crates/vllm-parity",
     "crates/vllm-gce",
     "crates/ferrite-poc",
+    "crates/ferrite-ptx",
+    "crates/ferrite-runtime",
+    "crates/ferrite-macros",
 ]
 exclude = []
 

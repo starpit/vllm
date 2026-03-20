@@ -1,0 +1,17 @@
+[package]
+name = "ferrite-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferrite proc-macro crate: #[fuse] attribute for kernel fusion"
+
+[lib]
+proc-macro = true
+name = "ferrite_macros"
+path = "src/lib.rs"
+
+[dependencies]
+syn = { version = "2", features = ["full", "parsing", "printing"] }
+quote = "1"
+proc-macro2 = "1"
+ferrite-ptx = { path = "../ferrite-ptx" }

@@ -1,0 +1,14 @@
+[package]
+name = "ferrite-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferrite runtime: JIT kernel compilation and tensor wrappers over cudarc"
+
+[lib]
+name = "ferrite_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+cudarc = { workspace = true, features = ["nvrtc", "dynamic-linking", "cuda-version-from-build-system"] }
+half = { workspace = true }

@@ -9,6 +9,14 @@ description = "Ferrite Phase 0: proof-of-concept LLVM IR → PTX → GPU kernel 
 name = "ferrite-poc"
 path = "src/main.rs"
 
+[[bin]]
+name = "ferrite-fuse-test"
+path = "src/fuse_test.rs"
+
+[[bin]]
+name = "ferrite-fuse-bench"
+path = "src/fuse_bench.rs"
+
 [dependencies]
 # LLVM bindings — pick the feature matching your installed LLVM version.
 # On Ubuntu: `apt install llvm-21-dev` then use llvm21-1.
@@ -22,3 +30,8 @@ cudarc = { workspace = true, features = ["nvrtc", "dynamic-linking", "cuda-versi
 half = { workspace = true }
 anyhow = { workspace = true }
 llvm-sys = { version = "201", features = ["force-dynamic"] }
+
+# Ferrite crates for proc-macro integration
+ferrite-ptx = { path = "../ferrite-ptx" }
+ferrite-macros = { path = "../ferrite-macros" }
+ferrite-runtime = { path = "../ferrite-runtime" }

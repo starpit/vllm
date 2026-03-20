@@ -1,0 +1,10 @@
+[package]
+name = "ferrite-ptx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferrite PTX code generation library — pure Rust, no CUDA deps"
+
+[lib]
+name = "ferrite_ptx"
+path = "src/lib.rs"

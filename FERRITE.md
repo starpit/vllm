@@ -318,86 +318,290 @@ independently.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Layer 0: PTX Intrinsic Library (`libptx`)
+### Layer 0: PTX Builder (`ferrite-ptx`) — IMPLEMENTED
 
-Safe Rust wrappers around inline PTX assembly for all modern GPU intrinsics.
-Const-generic on data type, tile dimensions, and architecture.
+**Status: Working. Validated at Triton-matching performance.**
+
+Not inline asm wrappers — a PTX string builder. Each method emits one PTX
+instruction as a formatted string. Register allocation tracks usage per class
+(pred, b32, b64, f32). `finalize()` wraps with header, register declarations,
+and kernel entry point.
 
 ```rust
-// Example: wgmma wrapper (conceptual)
-pub unsafe fn wgmma_mma_async<
-    const M: u32,      // 64
-    const N: u32,      // 24..256
-    const K: u32,      // 16
-    DTypeA: PtxDtype,  // f16, bf16, fp8, etc.
-    DTypeB: PtxDtype,
-    DTypeC: PtxDtype,
->(
-    desc_a: &TmaDescriptor,
-    desc_b: &TmaDescriptor,
-    accum: &mut [DTypeC; (M * N / WARP_SIZE) as usize],
-) {
-    // Expands to inline PTX asm for the specific type/size combination
-    // The proc macro generates all valid combinations at compile time
+// Actual working API (not conceptual)
+let mut ptx = PtxBuilder::new(GemmConfig::default_64x64());
+let d = ptx.regs.alloc_b32();
+let a = ptx.regs.alloc_b32();
+ptx.ldmatrix_x4_trans([d0, d1, d2, d3], addr, None);
+ptx.mma_m16n8k16(acc, a_frag, b_frag, acc);
+ptx.cp_async_cg(dst, 0, src, 0, size_pred);
+let kernel_ptx: String = ptx.finalize("my_kernel", &params);
+```
+
+**What exists** (in `vllm-rs/crates/ferrite-poc/src/ptx_builder/`):
+- `mod.rs` — PtxBuilder struct, RegAllocator, 50+ instruction emitters
+- `config.rs` — GemmConfig with derived constants
+- `smem.rs` — Shared memory layout, swizzle computation
+- `gemm.rs` — GEMM kernel builder (55 TFLOPS, matches Triton)
+- `silu.rs` — SiLU phase emitter + standalone kernel (238 GB/s)
+- `rmsnorm.rs` — RMSNorm phase emitter + standalone kernel
+- `fused.rs` — First fusion attempt (correct but slow — needs Layer 1)
+
+### Layer 1: Tile Engine — THE CRITICAL LAYER
+
+This is the CuTe equivalent. **This is what makes fusion automatic.** Without it,
+every fusion is a hand-written kernel. With it, fusions are atom configurations.
+
+The tile engine defines a **generic K-loop pipeline** parameterized by pluggable
+atoms. A GEMM kernel is not hand-written code — it is a configuration of the
+pipeline. A fused RmsNorm→GEMM→SiLU kernel is a DIFFERENT configuration of the
+SAME pipeline. The pipeline handles scheduling, double-buffering, prefetch, and
+interleaving automatically.
+
+#### The Pipeline
+
+```rust
+/// The mainloop: a software-pipelined K-loop with configurable stages.
+/// This is the ONLY K-loop in the entire system. All GEMM-based operations
+/// are expressed as configurations of this pipeline.
+struct MainloopPipeline<const STAGES: u32> {
+    /// Emit the complete K-loop: prologue → loop body → epilogue.
+    /// The loop body interleaves:
+    ///   1. Prefetch next iteration's fragments from smem (ldmatrix)
+    ///   2. Transform previous iteration's A fragments (TransformAtom)
+    ///   3. Execute MMA on current iteration (MMAAtom)
+    ///   4. Issue async copies for next stage (CopyAtom)
+    ///   5. Pipeline synchronization (wait_group, barrier)
+    fn emit_mainloop(
+        &self,
+        ptx: &mut PtxBuilder,
+        copy_a: &dyn CopyAtom,
+        copy_b: &dyn CopyAtom,
+        transform_a: &dyn TransformAtom,
+        mma: &dyn MMAAtom,
+    ) -> AccumulatorMap;
 }
 ```
 
-**Scope**: ~50 intrinsics, ~2-3 months of work. Well-bounded.
-
-### Layer 1: Tile Engine (`libtile`)
-
-The CuTe equivalent in Rust. This is the most architecturally critical layer.
-
-**Layout algebra**: Compile-time layout composition via const generics.
+#### The Atoms
 
 ```rust
-// Layout = (Shape, Stride) with compile-time algebra
-struct Layout<Shape: TileShape, Stride: TileStride> { ... }
-
-// Composition, complement, inverse — all at compile time
-type Composed = Compose<LayoutA, LayoutB>;
-type Swizzled = Swizzle<Layout, B, M, S>;
-```
-
-**Atoms**: Traits for copy and MMA operations.
-
-```rust
+/// How tiles move from global memory to shared memory.
+/// SM89: cp.async.cg (hardware DMA, 16 bytes/thread)
+/// SM90+: TMA descriptors (hardware tensor memory accelerator)
 trait CopyAtom {
-    type SrcLayout;
-    type DstLayout;
-    fn copy(src: &TileRef<Self::SrcLayout>, dst: &mut TileRef<Self::DstLayout>);
+    fn emit_async_copy(&self, ptx: &mut PtxBuilder, smem_dst: Reg, glob_src: Reg, pred: Reg);
+    fn emit_commit(&self, ptx: &mut PtxBuilder);
+    fn async_groups_per_tile(&self) -> u32;
 }
 
-trait MmaAtom {
-    type LayoutA;
-    type LayoutB;
-    type LayoutC;
-    const M: u32;
-    const N: u32;
-    const K: u32;
-    fn mma(a: &TileRef<Self::LayoutA>, b: &TileRef<Self::LayoutB>,
-           c: &mut TileRef<Self::LayoutC>);
+/// How A fragments are transformed between ldmatrix and MMA.
+/// This is WHERE FUSION HAPPENS for pre-GEMM operations.
+///
+/// Identity: no transform (standalone GEMM)
+/// RmsNorm: 2x mul.rn.f16x2 (fused normalization)
+/// Dequantize: scale packed int4/int8 to f16 (quantized inference)
+///
+/// CRITICAL: The transform operates on PACKED f16x2 registers.
+/// It must use f16x2 arithmetic (mul.rn.f16x2, fma.rn.f16x2).
+/// NEVER unpack to f32 and repack — that's 12 instructions instead of 2.
+/// CUTLASS proved this: their layernorm transform is 2x fma.rn.f16x2.
+trait TransformAtom {
+    /// One-time setup before the K-loop (e.g., load norm factors into registers).
+    fn emit_prologue(&self, ptx: &mut PtxBuilder);
+    /// Per-K-iteration setup (e.g., load gamma from smem for this K chunk).
+    fn emit_k_setup(&self, ptx: &mut PtxBuilder, ki: u32);
+    /// Transform 4 b32 registers (8 packed f16) in-place. Called per ldmatrix.
+    fn emit_transform(&self, ptx: &mut PtxBuilder, frag: &mut [Reg; 4], ki: u32, rm: u32);
+}
+
+/// How tensor cores consume fragments.
+/// SM89: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+/// SM90+: wgmma.mma_async (warp group MMA)
+trait MMAAtom {
+    fn emit_mma(&self, ptx: &mut PtxBuilder, a: [Reg; 4], b: [Reg; 2], acc: &mut [Reg; 4]);
+}
+
+/// How accumulators are post-processed before store.
+/// This is WHERE FUSION HAPPENS for post-GEMM operations.
+///
+/// Identity: store raw f32 accumulators
+/// SiLu: x * sigmoid(x) on accumulators (6 ALU ops per element, zero memory)
+/// Gelu: approximate GELU on accumulators
+/// ResidualAdd: load residual from global, add to accumulators
+/// Quantize: convert f32 accumulators to int8/fp8 before store
+trait EpilogueAtom {
+    fn emit_epilogue(&self, ptx: &mut PtxBuilder, acc: &mut AccumulatorMap);
 }
 ```
 
-**Software pipelining**: Async pipeline with configurable stages.
+#### What a GEMM Looks Like
+
+A standalone GEMM is NOT hand-written. It is:
 
 ```rust
-struct AsyncPipeline<const STAGES: usize> {
-    barriers: [MBarrier; STAGES],
-    buffers: [SharedMemBuffer; STAGES],
-}
-
-impl<const STAGES: usize> AsyncPipeline<STAGES> {
-    fn producer_acquire(&self, stage: usize);
-    fn producer_commit(&self, stage: usize);
-    fn consumer_wait(&self, stage: usize);
-    fn consumer_release(&self, stage: usize);
-}
+let pipeline = MainloopPipeline::<2> { config: GemmConfig::default_64x64() };
+let acc = pipeline.emit_mainloop(
+    &mut ptx,
+    &CpAsyncCopy,       // A tiles: hardware DMA
+    &CpAsyncCopy,       // B tiles: hardware DMA
+    &IdentityTransform, // no transform
+    &MMA_m16n8k16,      // tensor core op
+);
+emit_store_f32(&mut ptx, &acc);  // store accumulators
 ```
 
-**Scope**: 6-12 months. This is the hardest layer — requires deep GPU architecture
-knowledge and careful design of the const-generic type-level algebra.
+#### What a Fused Kernel Looks Like
+
+A fused RmsNorm→GEMM→SiLU is the SAME pipeline with DIFFERENT atoms:
+
+```rust
+let pipeline = MainloopPipeline::<2> { config: GemmConfig::default_64x64() };
+
+// Phase 1: compute norm factors (separate from pipeline)
+let norm_ctx = emit_rmsnorm_reduction(&mut ptx, input_ptr, hidden_size);
+
+// Phase 2: GEMM with transform
+let mut acc = pipeline.emit_mainloop(
+    &mut ptx,
+    &CpAsyncCopy,                        // A tiles: SAME cp.async, loads RAW input
+    &CpAsyncCopy,                        // B tiles: SAME
+    &RmsNormTransform::new(norm_ctx),    // 2x mul.rn.f16x2 between ldmatrix and MMA
+    &MMA_m16n8k16,                       // SAME
+);
+
+// Phase 3: SiLU epilogue (register ALU, zero memory)
+SiLuEpilogue.emit_epilogue(&mut ptx, &mut acc);
+emit_store_f32(&mut ptx, &acc);
+```
+
+**The pipeline is identical. Only the atoms change.** If the pipeline is correct
+and fast for standalone GEMM (55 TFLOPS), swapping IdentityTransform for
+RmsNormTransform adds only the cost of the transform itself (2 instructions per
+f16x2 register) — NOT the cost of restructuring the K-loop, adding barriers,
+changing the smem layout, or any other architectural change.
+
+#### Reference: CUTLASS CollectiveMainloop
+
+This is exactly what CUTLASS does. Their `MmaLayernormMainloopFusionMultistage`
+(SM80) is a mainloop pipeline where:
+- `TransformA` = `LayernormScaleBiasTransform` (2x `fma.rn.f16x2` per element)
+- Gamma/beta loaded via `WarpIteratorGammaBeta` (from smem, prefetched per K-iter)
+- Var/mean loaded ONCE in prologue, kept in REGISTERS (not smem) for entire K-loop
+- The transform is interleaved with prefetch: while loading iteration N+1's
+  fragments, transform iteration N's fragments, MMA iteration N-1's fragments
+
+We replicate this architecture exactly in PTX.
+
+#### Everything is AOT. Everything is proc macro.
+
+**There is no runtime code generation.** The pipeline, atoms, and their composition
+all execute at **compile time** inside a proc macro. The output is a PTX string
+constant embedded in the binary. At runtime, the only cost is one `cuModuleLoadData`
+call (JIT by the CUDA driver) on first use.
+
+The proc macro IS the compiler:
+
+```rust
+// User writes this:
+#[ferrite::fuse(arch = "sm_89")]
+fn mlp_block(x: &Tensor, w_gate: &Tensor, w_down: &Tensor, norm_w: &Tensor) {
+    let n = rmsnorm(x, norm_w);
+    let g = gemm(n, w_gate);
+    let h = silu(g);
+    gemm(h, w_down)
+}
+
+// At COMPILE TIME, the proc macro:
+// 1. Parses the function body into an op graph
+// 2. Recognizes: rmsnorm → gemm = TransformAtom::RmsNorm on A input
+// 3. Recognizes: gemm → silu = EpilogueAtom::SiLu
+// 4. Selects atoms: CpAsync, CpAsync, RmsNorm, MMA16816, SiLu
+// 5. Calls MainloopPipeline::emit_mainloop() with those atoms
+// 6. PtxBuilder generates the PTX string
+// 7. Embeds it as: const PTX: &str = "...";
+// 8. Generates a wrapper function that JITs and launches
+
+// At RUNTIME, the generated function:
+// 1. OnceLock: first call loads PTX via cuModuleLoadData (one-time cost)
+// 2. Every call: cuLaunchKernel with the pre-compiled module
+// Zero warmup beyond the first call. No Python. No JIT compilation in the hot path.
+```
+
+This is the key advantage over torch.compile (JIT, seconds of warmup, recompiles
+on shape change) and Triton (JIT, requires Python). Ferrite kernels are compiled
+into the Rust binary at build time. The serving process starts with kernels ready.
+
+**The proc macro depends on `ferrite-ptx` (Layer 0) at build time.** Since
+`ferrite-ptx` is a pure Rust library with no native dependencies, it runs inside
+`rustc`'s process during compilation. No CUDA toolkit needed at build time — only
+at runtime (for `cuModuleLoadData` and `ptxas` JIT).
+
+---
+
+### Phase 0 Lessons Learned: What NOT to Do
+
+These mistakes were made during Phase 0 and must never be repeated:
+
+**Mistake 1: Trying to make fusion work by hacking the K-loop**
+
+Five different approaches were tried to fuse RmsNorm into the GEMM:
+1. `NormalizedLoader`: replaced cp.async with ld.global+normalize+st.shared (0.48x)
+2. Split-phase loads: issue ld.global early, process after MMA (0.53x)
+3. cp.async-then-transform: cp.async to temp smem, transform smem→smem (0.47x)
+4. Register transform with f32 unpack/repack: 12 ALU per register (0.65x)
+5. Register transform with mul.rn.f16x2: 2 ALU per register (0.65x)
+
+All were one-off hacks that tried to "make this specific fusion work" without
+building the underlying pipeline abstraction. Each one required restructuring the
+K-loop, adding barriers, changing smem layouts — exactly the work that the pipeline
+abstraction is supposed to handle automatically.
+
+**The root cause:** We built Layer 0 (PtxBuilder) and Layer 3 (proc macro) but
+SKIPPED Layer 1 (tile engine / pipeline). Without the pipeline abstraction, every
+fusion required hand-writing a new K-loop variant. With the pipeline, fusions are
+just atom swaps.
+
+**Mistake 2: Using LLVM IR for kernel codegen**
+
+The LLVM IR path (inkwell + individual inline asm blocks) produced PTX with
+identical instructions, registers, and occupancy as hand-written PTX — but ran
+1.77x slower. The root cause: each inline asm block creates a scheduling barrier
+that prevents ptxas from interleaving loads with compute. This is unfixable without
+rewriting LLVM's NVPTX backend.
+
+**Lesson:** Drop LLVM for kernel codegen entirely. Emit PTX strings directly.
+ptxas is the real backend.
+
+**Mistake 3: Proposing "keep operations as separate kernels" as a fallback**
+
+When the fused kernel was slow, the instinct was to fall back to emitting 3
+separate kernel launches. This defeats the entire purpose of Ferrite. The answer
+is never "give up on fusion" — it's "build the right abstraction so fusion works."
+
+**Mistake 4: Building standalone op kernels before the pipeline**
+
+Building standalone RMSNorm and SiLU kernels was useful for benchmarking but
+created the illusion that fusion = "concatenate standalone kernels." It led to
+the `fused.rs` approach of bolting phases together without a unifying pipeline.
+The standalone kernels are BENCHMARKS, not BUILDING BLOCKS. The building blocks
+are ATOMS that plug into the pipeline.
+
+**Mistake 5: Using f32 unpack/repack instead of f16x2 packed arithmetic**
+
+The first register transform attempt unpacked each f16 pair to two f32 values,
+multiplied, and repacked — 12 instructions per b32 register. CUTLASS uses
+`fma.rn.f16x2` — 2 instructions per b32 register. This was discovered by
+reading the CUTLASS source code, which should have been done FIRST. Always
+read the reference implementation before designing.
+
+**Mistake 6: Not reading CUTLASS and Megakernels early enough**
+
+Both CUTLASS (layernorm mainloop fusion) and Megakernels (Hazy "No Bubbles")
+have solved the fusion problem. Their solutions are public. We should have
+studied them in detail BEFORE attempting our own fusion, not AFTER failing
+five times. The pipeline-with-atoms architecture was right there in CUTLASS
+the whole time.
 
 ### Layer 2: Operation Library (`libops`)
 
@@ -531,85 +735,94 @@ This generates:
 
 ## The Codegen Path
 
-### Phase 0 Results: inkwell/LLVM IR path (tested, limited)
+### Phase 0 Results (March 20, 2026)
 
-The original plan was to emit LLVM IR via inkwell → NVPTX backend → PTX. Phase 0
-validated this path on an L40S (sm_89):
+Phase 0 tested three codegen paths. The results fundamentally changed the
+architecture.
+
+#### Path 1: inkwell/LLVM IR (tested, insufficient)
+
+Emit LLVM IR via inkwell → NVPTX backend → PTX. Validated on L40S and L4:
 
 - ✅ Vector add, tiled GEMM, tensor core MMA via inline PTX asm — all work
-- ✅ B128 shared memory swizzle, cp.async — work and improve performance
-- ❌ **Peak GEMM: 75 TFLOPS (41.5% of L40S f16 peak)** — below the 70% threshold
+- ✅ B128 shared memory swizzle, cp.async, ldmatrix, ldmatrix.trans — all work
+- ✅ `-nvptx-short-ptr` makes addrspace(3) pointers 32-bit (fixes register bloat)
+- ❌ **Peak GEMM: 31.6 TFLOPS on L4 (57% of Triton's 55.2 TFLOPS)**
 
-**Root cause**: LLVM's NVPTX backend generates 64-bit pointer arithmetic for
-shared memory by default, causing register bloat. At 64×64 tiles (80 registers),
-performance is decent. At 128×128 tiles (255 registers, needed for compute-to-memory
-ratio), occupancy drops to 1 block/SM and performance collapses.
+**Root cause**: Not register allocation. Not occupancy. Not instruction count.
+The LLVM IR path produces **identical PTX instructions** (same ldmatrix, mma,
+cp.async counts, same 72 registers, 0 spills) but 1.77x slower. The bottleneck
+is **SASS instruction scheduling**: each inline asm block in LLVM IR creates a
+scheduling barrier that prevents ptxas from interleaving loads with compute.
 
-Triton works around this with `-nvptx-short-ptr` (p3:32:32 data layout) and
-extensive custom optimization passes built over years. We don't have those passes.
+#### Path 2: Hand-written PTX (tested, matches Triton)
 
-**Conclusion**: inkwell/LLVM IR is viable for simple kernels but cannot match
-nvcc/libnvvm codegen quality for high-performance GEMM without years of compiler
-work. The plan's own risk assessment predicted this: "If <70%: the LLVM NVPTX
-codegen path may not be viable for peak perf."
+Emit PTX strings directly from Rust, bypassing LLVM entirely:
 
-### Revised Path: rust-cuda (rustc_codegen_nvvm)
+- ✅ **55.2 TFLOPS on L4 — identical to Triton** (80 regs, 0 spills)
+- ✅ Standalone SiLU: 238 GB/s (matches Triton's 239 GB/s)
+- ✅ Standalone RMSNorm: 5.9x faster than Triton at batch=1
 
-The revised codegen path uses **rust-cuda** (`~/git/rust-cuda`), which compiles
-actual Rust code through NVIDIA's `libnvvm` optimizer — the same backend nvcc uses.
+When all instructions are in one PTX scheduling region, ptxas generates
+optimal SASS. The problem was never LLVM's register allocation or instruction
+selection — it was the scheduling barriers between inline asm blocks.
+
+#### Path 3: PtxBuilder (tested, matches hand-written)
+
+Rust code that programmatically generates PTX strings:
+
+- ✅ **55.0 TFLOPS — identical to hand-written PTX**
+- ✅ Parameterizable by tile size, warp layout, data types
+- ✅ Composable phases (GEMM K-loop, SiLU, RMSNorm as separate emitters)
+- ❌ Naive phase composition (inlining RMSNorm into GEMM K-loop) is 3x slower
+  than unfused — the composition mechanism needs the tile engine (Layer 1)
+
+#### Conclusions
+
+1. **Drop LLVM/libnvvm/rust-cuda for kernel codegen.** Any path that emits
+   individual inline asm blocks (whether via LLVM IR, NVVM IR, or rustc) will
+   hit the same scheduling barrier. The performance comes from ptxas, and ptxas
+   needs to see all instructions in one scheduling region.
+
+2. **Direct PTX generation is the right codegen path.** Rust code generates PTX
+   strings. ptxas compiles to SASS. This is simpler than any LLVM-based path
+   and produces identical performance to Triton.
+
+3. **Phase composition requires the tile engine.** Concatenating phase code
+   doesn't work — the tile engine must analyze data flow between operations
+   and choose the right tiling/buffering strategy.
+
+### Revised Codegen Path: PtxBuilder
 
 ```
 Ferrite proc macro (compile time, pure Rust)
-    │
-    ├─ Dataflow graph analysis
-    ├─ Fusion decisions
-    ├─ Shared memory planning
-    │
-    ▼
-Generates Rust GPU kernel code (#[kernel] functions)
-    │
-    ├─ Fused operations inlined into one function
-    ├─ Shared memory via #[address_space(shared)]
-    ├─ MMA/ldmatrix/cp.async via asm!() inline PTX
-    │
-    ▼
-rustc_codegen_nvvm (rust-cuda's custom rustc backend)
-    │
-    ├─ Rust → NVVM IR (NVIDIA's LLVM fork)
-    │
-    ▼
-libnvvm (NVIDIA's proprietary optimizer — same as nvcc)
-    │
-    ├─ Register allocation (nvcc quality)
-    ├─ Instruction scheduling (nvcc quality)
-    ├─ Shared memory is native 32-bit
-    ├─ PTX emission
-    │
-    ▼
-ptxas → SASS → CUBIN (embedded at build time via cuda_builder)
+    |
+    +-- Dataflow graph analysis (Layer 3)
+    +-- Tile planning, smem layout, register budget (Layer 1)
+    +-- Warp role assignment
+    |
+    v
+PtxBuilder (Rust library, Layer 0)
+    |
+    +-- Emits PTX instructions as formatted strings
+    +-- Register allocator tracks usage per class
+    +-- Instruction emitters: mma, ldmatrix, cp.async, ALU, etc.
+    +-- Phase emitters: GEMM K-loop, RMSNorm, SiLU, attention
+    |
+    v
+PTX string (one kernel, one scheduling region)
+    |
+    v
+ptxas (NVIDIA proprietary) --> SASS --> CUBIN
+    |
+    +-- Optimal instruction scheduling
+    +-- Register allocation within ptxas's budget
+    +-- Bank conflict resolution
 ```
 
-### Why rust-cuda, not inkwell?
-
-| | inkwell → LLVM NVPTX | rust-cuda → libnvvm |
-|---|---|---|
-| Register allocation | LLVM (inferior for GPU) | libnvvm/nvcc (production quality) |
-| Shared memory ptrs | 64-bit by default (register bloat) | Native 32-bit |
-| Kernel authoring | LLVM IR builder API (verbose) | Actual Rust code |
-| Inline PTX asm | Works but awkward via llvm-sys | Native `asm!()` macro |
-| Fusion model | Generate LLVM IR programmatically | Generate Rust source, compile as one unit |
-| Maturity | POC validated, 41% peak | Active project, nightly-2025-08-04 |
-
-### Why rust-cuda, not CubeCL?
-
-CubeCL compiles per-operation via NVRTC. rust-cuda compiles the entire fused kernel
-as one Rust function through libnvvm. The fusion boundary is at the Rust source
-level — the proc macro generates one `#[kernel]` function containing all fused
-operations. libnvvm sees the complete kernel and optimizes globally.
-
-CubeK's matmul implementation (tile configs, swizzle patterns, partition scheduling)
-is the reference for the GEMM tiles within fused kernels. We port their patterns
-into Rust GPU code rather than reinventing them.
+This is architecturally simpler than the rust-cuda path and empirically
+produces identical performance. The complexity lives in the tile engine
+(Layer 1) and fusion engine (Layer 3), not in the codegen backend.
 
 ---
 

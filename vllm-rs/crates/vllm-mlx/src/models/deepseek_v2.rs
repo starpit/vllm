@@ -283,6 +283,7 @@ struct MlxDeepSeekV2Attention {
     v_head_dim: usize,
     kv_lora_rank: usize,
     scale: f32,
+    fuse_rope: bool,
 }
 
 impl MlxDeepSeekV2Attention {
@@ -358,6 +359,7 @@ impl MlxDeepSeekV2Attention {
             v_head_dim,
             kv_lora_rank,
             scale,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
         })
     }
 
@@ -468,8 +470,16 @@ impl MlxDeepSeekV2Attention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        let q_pe = self.rope.forward((&q_pe, rope_offset))?;
-        let k_pe = self.rope.forward((&k_pe, rope_offset))?;
+        let q_pe = if self.fuse_rope {
+            crate::models::llama::apply_rope_to_cached_k(&q_pe, &self.rope, rope_offset)?
+        } else {
+            self.rope.forward((&q_pe, rope_offset))?
+        };
+        let k_pe = if !self.fuse_rope {
+            self.rope.forward((&k_pe, rope_offset))?
+        } else {
+            k_pe
+        };
 
         // Back to [seq, heads, dim] layout for assembly.
         let q_pe = q_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
@@ -502,7 +512,19 @@ impl MlxDeepSeekV2Attention {
         let v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
 
         // KV cache update — pre-allocated buffer with O(1) slice_update.
+        // When fuse_rope, K is stored without RoPE (position-independent).
         let (k, v_sdpa) = crate::cache::kv_cache_update(cache, &k, &v_sdpa)?;
+
+        // When fuse_rope, apply RoPE to the PE portion of cached K with offset 0.
+        let k = if self.fuse_rope {
+            let nope_dim = self.qk_nope_head_dim as i32;
+            let k_nope = k.try_index((.., .., .., ..nope_dim))?;
+            let k_pe = k.try_index((.., .., .., nope_dim..))?;
+            let k_pe = crate::models::llama::apply_rope_to_cached_k(&k_pe, &self.rope, 0)?;
+            mlx_rs::ops::concatenate_axis(&[k_nope, k_pe], -1)?
+        } else {
+            k
+        };
 
         // Fused SDPA
         let mask = if seq_len > 1 {
@@ -608,8 +630,16 @@ impl MlxDeepSeekV2Attention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let q_pe = self.rope.forward((&q_pe, offset))?;
-            let k_pe = self.rope.forward((&k_pe, offset))?;
+            let q_pe = if self.fuse_rope {
+                crate::models::llama::apply_rope_to_cached_k(&q_pe, &self.rope, offset)?
+            } else {
+                self.rope.forward((&q_pe, offset))?
+            };
+            let k_pe = if !self.fuse_rope {
+                self.rope.forward((&k_pe, offset))?
+            } else {
+                k_pe
+            };
 
             let q_pe = q_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
             let k_pe = k_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
@@ -639,7 +669,19 @@ impl MlxDeepSeekV2Attention {
             let v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
 
             // KV cache update.
+            // When fuse_rope, K is stored without RoPE (position-independent).
             let (k, v_sdpa) = crate::cache::kv_cache_update(&mut caches[i], &k, &v_sdpa)?;
+
+            // When fuse_rope, apply RoPE to the PE portion of cached K with offset 0.
+            let k = if self.fuse_rope {
+                let nope_dim = self.qk_nope_head_dim as i32;
+                let k_nope = k.try_index((.., .., .., ..nope_dim))?;
+                let k_pe = k.try_index((.., .., .., nope_dim..))?;
+                let k_pe = crate::models::llama::apply_rope_to_cached_k(&k_pe, &self.rope, 0)?;
+                mlx_rs::ops::concatenate_axis(&[k_nope, k_pe], -1)?
+            } else {
+                k
+            };
 
             kv_lens.push(k.dim(2) as usize);
             per_req_q.push(q);
@@ -1110,6 +1152,7 @@ struct MlxQuantizedDeepSeekV2Attention {
     v_head_dim: usize,
     kv_lora_rank: usize,
     scale: f32,
+    fuse_rope: bool,
 }
 
 impl MlxQuantizedDeepSeekV2Attention {
@@ -1201,6 +1244,7 @@ impl MlxQuantizedDeepSeekV2Attention {
             v_head_dim,
             kv_lora_rank,
             scale,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
         })
     }
 
@@ -1256,8 +1300,16 @@ impl MlxQuantizedDeepSeekV2Attention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        let q_pe = self.rope.forward((&q_pe, rope_offset))?;
-        let k_pe = self.rope.forward((&k_pe, rope_offset))?;
+        let q_pe = if self.fuse_rope {
+            crate::models::llama::apply_rope_to_cached_k(&q_pe, &self.rope, rope_offset)?
+        } else {
+            self.rope.forward((&q_pe, rope_offset))?
+        };
+        let k_pe = if !self.fuse_rope {
+            self.rope.forward((&k_pe, rope_offset))?
+        } else {
+            k_pe
+        };
 
         let q_pe = q_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
         let k_pe = k_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
@@ -1288,7 +1340,19 @@ impl MlxQuantizedDeepSeekV2Attention {
         let v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
 
         // KV cache update — pre-allocated buffer with O(1) slice_update.
+        // When fuse_rope, K is stored without RoPE (position-independent).
         let (k, v_sdpa) = crate::cache::kv_cache_update(cache, &k, &v_sdpa)?;
+
+        // When fuse_rope, apply RoPE to the PE portion of cached K with offset 0.
+        let k = if self.fuse_rope {
+            let nope_dim = self.qk_nope_head_dim as i32;
+            let k_nope = k.try_index((.., .., .., ..nope_dim))?;
+            let k_pe = k.try_index((.., .., .., nope_dim..))?;
+            let k_pe = crate::models::llama::apply_rope_to_cached_k(&k_pe, &self.rope, 0)?;
+            mlx_rs::ops::concatenate_axis(&[k_nope, k_pe], -1)?
+        } else {
+            k
+        };
 
         // Fused SDPA
         let mask = if seq_len > 1 {
@@ -1393,8 +1457,16 @@ impl MlxQuantizedDeepSeekV2Attention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let q_pe = self.rope.forward((&q_pe, offset))?;
-            let k_pe = self.rope.forward((&k_pe, offset))?;
+            let q_pe = if self.fuse_rope {
+                crate::models::llama::apply_rope_to_cached_k(&q_pe, &self.rope, offset)?
+            } else {
+                self.rope.forward((&q_pe, offset))?
+            };
+            let k_pe = if !self.fuse_rope {
+                self.rope.forward((&k_pe, offset))?
+            } else {
+                k_pe
+            };
 
             let q_pe = q_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
             let k_pe = k_pe.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
@@ -1424,7 +1496,19 @@ impl MlxQuantizedDeepSeekV2Attention {
             let v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
 
             // KV cache update.
+            // When fuse_rope, K is stored without RoPE (position-independent).
             let (k, v_sdpa) = crate::cache::kv_cache_update(&mut caches[i], &k, &v_sdpa)?;
+
+            // When fuse_rope, apply RoPE to the PE portion of cached K with offset 0.
+            let k = if self.fuse_rope {
+                let nope_dim = self.qk_nope_head_dim as i32;
+                let k_nope = k.try_index((.., .., .., ..nope_dim))?;
+                let k_pe = k.try_index((.., .., .., nope_dim..))?;
+                let k_pe = crate::models::llama::apply_rope_to_cached_k(&k_pe, &self.rope, 0)?;
+                mlx_rs::ops::concatenate_axis(&[k_nope, k_pe], -1)?
+            } else {
+                k
+            };
 
             kv_lens.push(k.dim(2) as usize);
             per_req_q.push(q);
@@ -2314,6 +2398,7 @@ mod tests {
                 v_head_dim: config.v_head_dim,
                 kv_lora_rank: config.kv_lora_rank,
                 scale: 1.0 / (config.qk_head_dim() as f32).sqrt(),
+                fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
             };
 
             // Build quantized MLP (dense for this test config — no MoE).

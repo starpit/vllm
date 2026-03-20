@@ -128,6 +128,74 @@ impl Phi3Rope {
             }
         }
     }
+
+    /// Apply RoPE to Q only (used with fuse_rope).
+    fn apply_q_only(&mut self, q: &Array, offset: i32) -> Result<Array, Exception> {
+        match self {
+            Self::Standard(rope) => rope.forward((q, offset)),
+            Self::Custom {
+                inv_freq,
+                mscale,
+                rotary_dim,
+                head_dim,
+            } => {
+                let seq_len = q.dim(2);
+                let half_dim = (*rotary_dim / 2) as i32;
+
+                let positions: Vec<f32> = (0..seq_len).map(|i| (offset + i) as f32).collect();
+                let pos = Array::from_slice(&positions, &[seq_len]);
+
+                let freqs = pos
+                    .reshape(&[seq_len, 1])?
+                    .matmul(&inv_freq.reshape(&[1, half_dim])?)?;
+
+                let cos_half = freqs.cos()?.multiply(Array::from_f32(*mscale))?;
+                let sin_half = freqs.sin()?.multiply(Array::from_f32(*mscale))?;
+
+                let cos = concatenate_axis(&[&cos_half, &cos_half], -1)?;
+                let sin = concatenate_axis(&[&sin_half, &sin_half], -1)?;
+
+                let cos_b = cos.reshape(&[1, 1, seq_len, *rotary_dim as i32])?;
+                let sin_b = sin.reshape(&[1, 1, seq_len, *rotary_dim as i32])?;
+
+                apply_partial_rope(q, &cos_b, &sin_b, *rotary_dim, *head_dim)
+            }
+        }
+    }
+
+    /// Apply RoPE to K only (used with fuse_rope after cache update).
+    fn apply_k_only(&mut self, k: &Array, offset: i32) -> Result<Array, Exception> {
+        match self {
+            Self::Standard(rope) => rope.forward((k, offset)),
+            Self::Custom {
+                inv_freq,
+                mscale,
+                rotary_dim,
+                head_dim,
+            } => {
+                let seq_len = k.dim(2);
+                let half_dim = (*rotary_dim / 2) as i32;
+
+                let positions: Vec<f32> = (0..seq_len).map(|i| (offset + i) as f32).collect();
+                let pos = Array::from_slice(&positions, &[seq_len]);
+
+                let freqs = pos
+                    .reshape(&[seq_len, 1])?
+                    .matmul(&inv_freq.reshape(&[1, half_dim])?)?;
+
+                let cos_half = freqs.cos()?.multiply(Array::from_f32(*mscale))?;
+                let sin_half = freqs.sin()?.multiply(Array::from_f32(*mscale))?;
+
+                let cos = concatenate_axis(&[&cos_half, &cos_half], -1)?;
+                let sin = concatenate_axis(&[&sin_half, &sin_half], -1)?;
+
+                let cos_b = cos.reshape(&[1, 1, seq_len, *rotary_dim as i32])?;
+                let sin_b = sin.reshape(&[1, 1, seq_len, *rotary_dim as i32])?;
+
+                apply_partial_rope(k, &cos_b, &sin_b, *rotary_dim, *head_dim)
+            }
+        }
+    }
 }
 
 /// Compute inverse frequencies and mscale for LongRoPE.
@@ -278,6 +346,7 @@ struct MlxPhi3Attention {
     q_size: usize,
     kv_size: usize,
     sliding_window: Option<usize>,
+    fuse_rope: bool,
 }
 
 impl MlxPhi3Attention {
@@ -302,6 +371,7 @@ impl MlxPhi3Attention {
             q_size,
             kv_size,
             sliding_window: config.sliding_window,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
         })
     }
 
@@ -349,10 +419,31 @@ impl MlxPhi3Attention {
             .expand_dims(0)?;
 
         // RoPE (supports partial rotation + LongRoPE).
-        let (q, k) = self.rope.apply(&q, &k, rope_offset)?;
+        let (q, k) = if self.fuse_rope {
+            let q = match &self.rope {
+                Phi3Rope::Standard(rope) => {
+                    crate::models::llama::apply_rope_to_cached_k(&q, rope, rope_offset)?
+                }
+                Phi3Rope::Custom { .. } => self.rope.apply_q_only(&q, rope_offset)?,
+            };
+            (q, k)
+        } else {
+            self.rope.apply(&q, &k, rope_offset)?
+        };
 
         // KV cache update — pre-allocated buffer with O(1) slice_update.
+        // When fuse_rope, K is stored without RoPE (position-independent).
         let (mut k, mut v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+
+        // When fuse_rope, apply RoPE to full cached K with offset 0.
+        if self.fuse_rope {
+            k = match &self.rope {
+                Phi3Rope::Standard(rope) => {
+                    crate::models::llama::apply_rope_to_cached_k(&k, rope, 0)?
+                }
+                Phi3Rope::Custom { .. } => self.rope.apply_k_only(&k, 0)?,
+            };
+        }
 
         // Sliding window: trim K/V to only the last `w` positions.
         if let Some(w) = self.sliding_window {
@@ -444,10 +535,33 @@ impl MlxPhi3Attention {
                 .expand_dims(0)?;
 
             // RoPE (supports partial rotation + LongRoPE).
-            let (q, k) = self.rope.apply(&q, &k, offset)?;
+            let (q, k) = if self.fuse_rope {
+                let q = match &self.rope {
+                    Phi3Rope::Standard(rope) => {
+                        crate::models::llama::apply_rope_to_cached_k(&q, rope, offset)?
+                    }
+                    Phi3Rope::Custom { .. } => self.rope.apply_q_only(&q, offset)?,
+                };
+                (q, k)
+            } else {
+                self.rope.apply(&q, &k, offset)?
+            };
 
             // KV cache update.
+            // When fuse_rope, K is stored without RoPE (position-independent).
             let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+
+            // When fuse_rope, apply RoPE to full cached K with offset 0.
+            let k = if self.fuse_rope {
+                match &self.rope {
+                    Phi3Rope::Standard(rope) => {
+                        crate::models::llama::apply_rope_to_cached_k(&k, rope, 0)?
+                    }
+                    Phi3Rope::Custom { .. } => self.rope.apply_k_only(&k, 0)?,
+                }
+            } else {
+                k
+            };
 
             kv_lens.push(k.dim(2) as usize);
             per_req_q.push(q);
@@ -842,6 +956,7 @@ struct MlxQuantizedPhi3Attention {
     q_size: usize,
     kv_size: usize,
     sliding_window: Option<usize>,
+    fuse_rope: bool,
 }
 
 impl MlxQuantizedPhi3Attention {
@@ -872,6 +987,7 @@ impl MlxQuantizedPhi3Attention {
             q_size: config.num_attention_heads * config.head_dim,
             kv_size: config.num_kv_heads * config.head_dim,
             sliding_window: config.sliding_window,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
         }
     }
 
@@ -902,10 +1018,31 @@ impl MlxQuantizedPhi3Attention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        let (q, k) = self.rope.apply(&q, &k, rope_offset)?;
+        let (q, k) = if self.fuse_rope {
+            let q = match &self.rope {
+                Phi3Rope::Standard(rope) => {
+                    crate::models::llama::apply_rope_to_cached_k(&q, rope, rope_offset)?
+                }
+                Phi3Rope::Custom { .. } => self.rope.apply_q_only(&q, rope_offset)?,
+            };
+            (q, k)
+        } else {
+            self.rope.apply(&q, &k, rope_offset)?
+        };
 
         // KV cache update — pre-allocated buffer with O(1) slice_update.
+        // When fuse_rope, K is stored without RoPE (position-independent).
         let (mut k, mut v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+
+        // When fuse_rope, apply RoPE to full cached K with offset 0.
+        if self.fuse_rope {
+            k = match &self.rope {
+                Phi3Rope::Standard(rope) => {
+                    crate::models::llama::apply_rope_to_cached_k(&k, rope, 0)?
+                }
+                Phi3Rope::Custom { .. } => self.rope.apply_k_only(&k, 0)?,
+            };
+        }
 
         // Sliding window: trim K/V to only the last `w` positions.
         if let Some(w) = self.sliding_window {
@@ -986,9 +1123,32 @@ impl MlxQuantizedPhi3Attention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let (q, k) = self.rope.apply(&q, &k, offset)?;
+            let (q, k) = if self.fuse_rope {
+                let q = match &self.rope {
+                    Phi3Rope::Standard(rope) => {
+                        crate::models::llama::apply_rope_to_cached_k(&q, rope, offset)?
+                    }
+                    Phi3Rope::Custom { .. } => self.rope.apply_q_only(&q, offset)?,
+                };
+                (q, k)
+            } else {
+                self.rope.apply(&q, &k, offset)?
+            };
 
+            // When fuse_rope, K is stored without RoPE (position-independent).
             let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+
+            // When fuse_rope, apply RoPE to full cached K with offset 0.
+            let k = if self.fuse_rope {
+                match &self.rope {
+                    Phi3Rope::Standard(rope) => {
+                        crate::models::llama::apply_rope_to_cached_k(&k, rope, 0)?
+                    }
+                    Phi3Rope::Custom { .. } => self.rope.apply_k_only(&k, 0)?,
+                }
+            } else {
+                k
+            };
 
             kv_lens.push(k.dim(2) as usize);
             per_req_q.push(q);

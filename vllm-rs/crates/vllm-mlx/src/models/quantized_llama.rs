@@ -313,6 +313,9 @@ pub struct MlxQuantizedLlamaAttention {
     head_dim: usize,
     pub(crate) scale: f32,
     sliding_window: Option<usize>,
+    /// When true, K is stored without RoPE and RoPE is applied to the full
+    /// cached K at attention time (relocatable span blocks).
+    fuse_rope: bool,
 }
 
 impl MlxQuantizedLlamaAttention {
@@ -378,6 +381,7 @@ impl MlxQuantizedLlamaAttention {
             head_dim: config.head_dim,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
             sliding_window: config.sliding_window,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
         }
     }
 
@@ -420,12 +424,21 @@ impl MlxQuantizedLlamaAttention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        // RoPE: offset passed from caller (avoids .item() sync in MLX).
-        let q = self.rope.forward((&q, rope_offset))?;
-        k = self.rope.forward((&k, rope_offset))?;
-
-        // KV cache update — pre-allocated buffer with O(1) slice_update.
-        let (mut k, mut v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+        // RoPE + KV cache update.
+        // When fuse_rope: use rope_dynamic (via apply_rope_to_cached_k) for both Q and K
+        // to ensure consistency. MLX's fast::rope and fast::rope_dynamic produce
+        // different values for the same position, so Q and K must use the same impl.
+        let (q, mut k, mut v) = if self.fuse_rope {
+            let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, rope_offset)?;
+            let (mut k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
+            (q, k, v)
+        } else {
+            let q = self.rope.forward((&q, rope_offset))?;
+            k = self.rope.forward((&k, rope_offset))?;
+            let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            (q, k, v)
+        };
 
         // Sliding window: trim K/V to only the last `w` positions.
         if let Some(w) = self.sliding_window {
@@ -513,15 +526,17 @@ impl MlxQuantizedLlamaAttention {
                 &offsets_arr,
                 None::<&Array>,
             )?;
-            k = mlx_rs::fast::rope_dynamic(
-                &k,
-                self.rope.dimensions,
-                self.rope.traditional,
-                self.rope.base,
-                self.rope.scale,
-                &offsets_arr,
-                None::<&Array>,
-            )?;
+            if !self.fuse_rope {
+                k = mlx_rs::fast::rope_dynamic(
+                    &k,
+                    self.rope.dimensions,
+                    self.rope.traditional,
+                    self.rope.base,
+                    self.rope.scale,
+                    &offsets_arr,
+                    None::<&Array>,
+                )?;
+            }
 
             for (i, cache) in caches.iter_mut().enumerate().take(batch_info.num_reqs) {
                 let ii = i as i32;
@@ -530,6 +545,11 @@ impl MlxQuantizedLlamaAttention {
                 let vi = v.try_index((ii..ii + 1, .., .., ..))?;
 
                 let (ki, vi) = crate::cache::kv_cache_update(cache, &ki, &vi)?;
+                let ki = if self.fuse_rope {
+                    crate::models::llama::apply_rope_to_cached_k(&ki, &self.rope, 0)?
+                } else {
+                    ki
+                };
                 kv_lens.push(ki.dim(2) as usize);
                 per_req_q.push(qi);
                 per_req_k.push(ki);
@@ -567,10 +587,17 @@ impl MlxQuantizedLlamaAttention {
                     .transpose_axes(&[1, 0, 2])?
                     .expand_dims(0)?;
 
-                let q = self.rope.forward((&q, offset))?;
-                k = self.rope.forward((&k, offset))?;
-
-                let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                let (q, k, v) = if self.fuse_rope {
+                    let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, offset)?;
+                    let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                    let k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
+                    (q, k, v)
+                } else {
+                    let q = self.rope.forward((&q, offset))?;
+                    k = self.rope.forward((&k, offset))?;
+                    let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                    (q, k, v)
+                };
 
                 kv_lens.push(k.dim(2) as usize);
                 per_req_q.push(q);
@@ -655,6 +682,7 @@ impl MlxQuantizedLlamaAttention {
     /// `batch_cache` holds the persistent batched [B, heads, kv_len, dim] cache for this layer.
     /// `mask` is the pre-built left-padding mask (shared across all layers).
     /// `offsets_arr` is the pre-built rope offsets array (shared across all layers).
+    /// `left_pads` — per-request left-padding counts (needed for fuse_rope negative offsets).
     pub fn forward_batch_decode(
         &mut self,
         hidden_states: &Array,
@@ -662,6 +690,7 @@ impl MlxQuantizedLlamaAttention {
         batch_cache: &mut BatchMlxLayerKvCache,
         mask: &Option<Array>,
         offsets_arr: &Array,
+        left_pads: &[usize],
     ) -> Result<Array, Exception> {
         let n = batch_info.num_reqs as i32;
         let nh = self.num_heads as i32;
@@ -696,18 +725,34 @@ impl MlxQuantizedLlamaAttention {
             offsets_arr,
             None::<&Array>,
         )?;
-        k = mlx_rs::fast::rope_dynamic(
-            &k,
-            self.rope.dimensions,
-            self.rope.traditional,
-            self.rope.base,
-            self.rope.scale,
-            offsets_arr,
-            None::<&Array>,
-        )?;
+        if !self.fuse_rope {
+            k = mlx_rs::fast::rope_dynamic(
+                &k,
+                self.rope.dimensions,
+                self.rope.traditional,
+                self.rope.base,
+                self.rope.scale,
+                offsets_arr,
+                None::<&Array>,
+            )?;
+        }
 
         // Single batched KV cache update for all B sequences.
+        // When fuse_rope, K is stored unrotated (position-independent).
         let (k_cached, v_cached) = batch_cache.update_and_view(&k, &v)?;
+
+        // When fuse_rope, apply RoPE to full cached K via apply_rope_to_cached_k_batched.
+        // The negative left_pads become start positions so real tokens get 0-based positions.
+        let k_cached = if self.fuse_rope {
+            let start_positions: Vec<i32> = left_pads.iter().map(|&p| -(p as i32)).collect();
+            crate::models::llama::apply_rope_to_cached_k_batched(
+                &k_cached,
+                &self.rope,
+                &start_positions,
+            )?
+        } else {
+            k_cached
+        };
 
         // Single SDPA for all B sequences (mask built once, shared across layers).
         let sdpa_mask = mask
@@ -824,6 +869,7 @@ impl MlxQuantizedLlamaDecoderLayer {
         batch_cache: &mut BatchMlxLayerKvCache,
         mask: &Option<Array>,
         offsets_arr: &Array,
+        left_pads: &[usize],
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(hidden_states)?;
         let attn_output = self.self_attn.forward_batch_decode(
@@ -832,6 +878,7 @@ impl MlxQuantizedLlamaDecoderLayer {
             batch_cache,
             mask,
             offsets_arr,
+            left_pads,
         )?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
@@ -1103,6 +1150,7 @@ impl super::MlxModel for MlxQuantizedLlamaForCausalLM {
                 &mut layer_caches[layer_idx],
                 &mask,
                 &offsets_arr,
+                &left_padding[0],
             )?;
         }
 
@@ -1244,6 +1292,7 @@ mod tests {
                 head_dim: config.head_dim,
                 scale: 1.0 / (config.head_dim as f32).sqrt(),
                 sliding_window: config.sliding_window,
+                fuse_rope: false,
             };
 
             let mlp = MlxQuantizedLlamaMLP {

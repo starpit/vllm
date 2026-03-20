@@ -250,6 +250,7 @@ struct MlxQwen3NextAttention {
     head_dim: usize,
     rotary_dim: usize,
     scale: f32,
+    fuse_rope: bool,
 }
 
 impl MlxQwen3NextAttention {
@@ -287,6 +288,7 @@ impl MlxQwen3NextAttention {
             head_dim: config.head_dim,
             rotary_dim,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
         })
     }
 
@@ -362,28 +364,48 @@ impl MlxQwen3NextAttention {
         // Apply partial RoPE (offset threaded from caller — no sync needed).
         let offset = rope_offset;
 
-        // RoPE only applies to the first rotary_dim dimensions (handled by nn::Rope
-        // which was initialized with rotary_dim). For partial RoPE, we split, apply, concat.
-        let q = if self.rotary_dim < self.head_dim {
-            let q_rot = q.try_index((.., .., .., ..self.rotary_dim as i32))?;
-            let q_pass = q.try_index((.., .., .., self.rotary_dim as i32..))?;
-            let q_rot = self.rope.forward((&q_rot, offset))?;
-            mlx_rs::ops::concatenate_axis(&[q_rot, q_pass], -1)?
+        // RoPE + KV cache. When fuse_rope, use apply_rope_to_cached_k for consistent
+        // rope_dynamic values across Q and K.
+        let (q, k, v) = if self.fuse_rope {
+            let q = if self.rotary_dim < self.head_dim {
+                let q_rot = q.try_index((.., .., .., ..self.rotary_dim as i32))?;
+                let q_pass = q.try_index((.., .., .., self.rotary_dim as i32..))?;
+                let q_rot =
+                    crate::models::llama::apply_rope_to_cached_k(&q_rot, &self.rope, offset)?;
+                mlx_rs::ops::concatenate_axis(&[q_rot, q_pass], -1)?
+            } else {
+                crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, offset)?
+            };
+            let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            let k = if self.rotary_dim < self.head_dim {
+                let k_rot = k.try_index((.., .., .., ..self.rotary_dim as i32))?;
+                let k_pass = k.try_index((.., .., .., self.rotary_dim as i32..))?;
+                let k_rot = crate::models::llama::apply_rope_to_cached_k(&k_rot, &self.rope, 0)?;
+                mlx_rs::ops::concatenate_axis(&[k_rot, k_pass], -1)?
+            } else {
+                crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?
+            };
+            (q, k, v)
         } else {
-            self.rope.forward((&q, offset))?
+            let q = if self.rotary_dim < self.head_dim {
+                let q_rot = q.try_index((.., .., .., ..self.rotary_dim as i32))?;
+                let q_pass = q.try_index((.., .., .., self.rotary_dim as i32..))?;
+                let q_rot = self.rope.forward((&q_rot, offset))?;
+                mlx_rs::ops::concatenate_axis(&[q_rot, q_pass], -1)?
+            } else {
+                self.rope.forward((&q, offset))?
+            };
+            let k = if self.rotary_dim < self.head_dim {
+                let k_rot = k.try_index((.., .., .., ..self.rotary_dim as i32))?;
+                let k_pass = k.try_index((.., .., .., self.rotary_dim as i32..))?;
+                let k_rot = self.rope.forward((&k_rot, offset))?;
+                mlx_rs::ops::concatenate_axis(&[k_rot, k_pass], -1)?
+            } else {
+                self.rope.forward((&k, offset))?
+            };
+            let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            (q, k, v)
         };
-
-        let k = if self.rotary_dim < self.head_dim {
-            let k_rot = k.try_index((.., .., .., ..self.rotary_dim as i32))?;
-            let k_pass = k.try_index((.., .., .., self.rotary_dim as i32..))?;
-            let k_rot = self.rope.forward((&k_rot, offset))?;
-            mlx_rs::ops::concatenate_axis(&[k_rot, k_pass], -1)?
-        } else {
-            self.rope.forward((&k, offset))?
-        };
-
-        // KV cache update — pre-allocated buffer with O(1) slice_update.
-        let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
 
         // Scaled dot-product attention.
         let mask = if seq_len > 1 {
@@ -1102,6 +1124,7 @@ struct MlxQuantizedQwen3NextAttention {
     head_dim: usize,
     rotary_dim: usize,
     scale: f32,
+    fuse_rope: bool,
 }
 
 impl MlxQuantizedQwen3NextAttention {
@@ -1154,6 +1177,7 @@ impl MlxQuantizedQwen3NextAttention {
             head_dim: config.head_dim,
             rotary_dim,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
         }
     }
 
@@ -1196,28 +1220,50 @@ impl MlxQuantizedQwen3NextAttention {
 
         // Apply partial RoPE (offset threaded from caller — no sync needed).
         let offset = rope_offset;
-
         let rd = self.rotary_dim as i32;
-        let q = if self.rotary_dim < self.head_dim {
-            let q_rot = q.try_index((.., .., .., ..rd))?;
-            let q_pass = q.try_index((.., .., .., rd..))?;
-            let q_rot = self.rope.forward((&q_rot, offset))?;
-            mlx_rs::ops::concatenate_axis(&[q_rot, q_pass], -1)?
-        } else {
-            self.rope.forward((&q, offset))?
-        };
 
-        let k = if self.rotary_dim < self.head_dim {
-            let k_rot = k.try_index((.., .., .., ..rd))?;
-            let k_pass = k.try_index((.., .., .., rd..))?;
-            let k_rot = self.rope.forward((&k_rot, offset))?;
-            mlx_rs::ops::concatenate_axis(&[k_rot, k_pass], -1)?
+        // RoPE + KV cache. When fuse_rope, use apply_rope_to_cached_k for consistent
+        // rope_dynamic values across Q and K.
+        let (q, k, v) = if self.fuse_rope {
+            let q = if self.rotary_dim < self.head_dim {
+                let q_rot = q.try_index((.., .., .., ..rd))?;
+                let q_pass = q.try_index((.., .., .., rd..))?;
+                let q_rot =
+                    crate::models::llama::apply_rope_to_cached_k(&q_rot, &self.rope, offset)?;
+                mlx_rs::ops::concatenate_axis(&[q_rot, q_pass], -1)?
+            } else {
+                crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, offset)?
+            };
+            let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            let k = if self.rotary_dim < self.head_dim {
+                let k_rot = k.try_index((.., .., .., ..rd))?;
+                let k_pass = k.try_index((.., .., .., rd..))?;
+                let k_rot = crate::models::llama::apply_rope_to_cached_k(&k_rot, &self.rope, 0)?;
+                mlx_rs::ops::concatenate_axis(&[k_rot, k_pass], -1)?
+            } else {
+                crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?
+            };
+            (q, k, v)
         } else {
-            self.rope.forward((&k, offset))?
+            let q = if self.rotary_dim < self.head_dim {
+                let q_rot = q.try_index((.., .., .., ..rd))?;
+                let q_pass = q.try_index((.., .., .., rd..))?;
+                let q_rot = self.rope.forward((&q_rot, offset))?;
+                mlx_rs::ops::concatenate_axis(&[q_rot, q_pass], -1)?
+            } else {
+                self.rope.forward((&q, offset))?
+            };
+            let k = if self.rotary_dim < self.head_dim {
+                let k_rot = k.try_index((.., .., .., ..rd))?;
+                let k_pass = k.try_index((.., .., .., rd..))?;
+                let k_rot = self.rope.forward((&k_rot, offset))?;
+                mlx_rs::ops::concatenate_axis(&[k_rot, k_pass], -1)?
+            } else {
+                self.rope.forward((&k, offset))?
+            };
+            let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            (q, k, v)
         };
-
-        // KV cache update — pre-allocated buffer with O(1) slice_update.
-        let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
 
         // Scaled dot-product attention.
         let mask = if seq_len > 1 {

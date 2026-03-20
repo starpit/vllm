@@ -244,6 +244,9 @@ struct MlxGemma2Attention {
     attn_logit_softcapping: Option<f32>,
     /// Per-layer sliding window. `Some(w)` for sliding-attention layers, `None` for full.
     sliding_window: Option<usize>,
+    /// When true, K is stored without RoPE and RoPE is applied to the full
+    /// cached K at attention time (relocatable span blocks).
+    fuse_rope: bool,
 }
 
 impl MlxGemma2Attention {
@@ -279,6 +282,7 @@ impl MlxGemma2Attention {
             scale: config.query_pre_attn_scalar.powf(-0.5),
             attn_logit_softcapping: config.attn_logit_softcapping,
             sliding_window: layer_sliding_window,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
         })
     }
 
@@ -331,12 +335,18 @@ impl MlxGemma2Attention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        // RoPE
-        let q = self.rope.forward((&q, rope_offset))?;
-        let k = self.rope.forward((&k, rope_offset))?;
-
-        // KV cache update — pre-allocated buffer with O(1) slice_update.
-        let (mut k, mut v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+        // RoPE + KV cache
+        let (q, mut k, mut v) = if self.fuse_rope {
+            let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, rope_offset)?;
+            let (mut k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
+            (q, k, v)
+        } else {
+            let q = self.rope.forward((&q, rope_offset))?;
+            let k = self.rope.forward((&k, rope_offset))?;
+            let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            (q, k, v)
+        };
 
         // Sliding window: trim K/V to only the last `w` positions.
         if let Some(w) = self.sliding_window {
@@ -419,10 +429,17 @@ impl MlxGemma2Attention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let q = self.rope.forward((&q, offset))?;
-            k = self.rope.forward((&k, offset))?;
-
-            let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+            let (q, k, v) = if self.fuse_rope {
+                let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, offset)?;
+                let (mut k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
+                (q, k, v)
+            } else {
+                let q = self.rope.forward((&q, offset))?;
+                k = self.rope.forward((&k, offset))?;
+                let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                (q, k, v)
+            };
 
             kv_lens.push(k.dim(2) as usize);
             per_req_q.push(q);
@@ -879,6 +896,9 @@ struct MlxQuantizedGemma2Attention {
     attn_logit_softcapping: Option<f32>,
     /// Per-layer sliding window. `Some(w)` for sliding-attention layers, `None` for full.
     sliding_window: Option<usize>,
+    /// When true, K is stored without RoPE and RoPE is applied to the full
+    /// cached K at attention time (relocatable span blocks).
+    fuse_rope: bool,
 }
 
 impl MlxQuantizedGemma2Attention {
@@ -925,6 +945,7 @@ impl MlxQuantizedGemma2Attention {
             scale: config.query_pre_attn_scalar.powf(-0.5),
             attn_logit_softcapping: config.attn_logit_softcapping,
             sliding_window: layer_sliding_window,
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
         }
     }
 
@@ -953,11 +974,18 @@ impl MlxQuantizedGemma2Attention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        let q = self.rope.forward((&q, rope_offset))?;
-        let k = self.rope.forward((&k, rope_offset))?;
-
-        // KV cache update — pre-allocated buffer with O(1) slice_update.
-        let (mut k, mut v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+        // RoPE + KV cache
+        let (q, mut k, mut v) = if self.fuse_rope {
+            let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, rope_offset)?;
+            let (mut k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
+            (q, k, v)
+        } else {
+            let q = self.rope.forward((&q, rope_offset))?;
+            let k = self.rope.forward((&k, rope_offset))?;
+            let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            (q, k, v)
+        };
 
         // Sliding window: trim K/V to only the last `w` positions.
         if let Some(w) = self.sliding_window {
@@ -1037,10 +1065,17 @@ impl MlxQuantizedGemma2Attention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let q = self.rope.forward((&q, offset))?;
-            k = self.rope.forward((&k, offset))?;
-
-            let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+            let (q, k, v) = if self.fuse_rope {
+                let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, offset)?;
+                let (mut k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
+                (q, k, v)
+            } else {
+                let q = self.rope.forward((&q, offset))?;
+                k = self.rope.forward((&k, offset))?;
+                let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                (q, k, v)
+            };
 
             kv_lens.push(k.dim(2) as usize);
             per_req_q.push(q);

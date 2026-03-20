@@ -157,6 +157,7 @@ struct MlxCommandRAttention {
     num_kv_heads: usize,
     head_dim: usize,
     scale: f32,
+    fuse_rope: bool,
 }
 
 impl MlxCommandRAttention {
@@ -196,6 +197,7 @@ impl MlxCommandRAttention {
             num_kv_heads: c.num_kv_heads,
             head_dim: c.head_dim,
             scale: 1.0 / (c.head_dim as f32).sqrt(),
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
         })
     }
 
@@ -261,18 +263,24 @@ impl MlxCommandRAttention {
 
         // [seq, heads, head_dim] -> [1, heads, seq, head_dim]
         let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
         let v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        // RoPE (interleaved via traditional=true): offset passed from caller (avoids .item() sync).
-        let q = self.rope.forward((&q, rope_offset))?;
-        let k = self.rope.forward((&k, rope_offset))?;
-
-        // KV cache update — pre-allocated buffer with O(1) slice_update.
-        let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+        // RoPE + KV cache
+        let (q, k, v) = if self.fuse_rope {
+            let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, rope_offset)?;
+            let (mut k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
+            (q, k, v)
+        } else {
+            let q = self.rope.forward((&q, rope_offset))?;
+            k = self.rope.forward((&k, rope_offset))?;
+            let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            (q, k, v)
+        };
 
         // Fused SDPA.
         let mask = if seq_len > 1 {
@@ -352,10 +360,17 @@ impl MlxCommandRAttention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let q = self.rope.forward((&q, offset))?;
-            k = self.rope.forward((&k, offset))?;
-
-            let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+            let (q, k, v) = if self.fuse_rope {
+                let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, offset)?;
+                let (mut k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
+                (q, k, v)
+            } else {
+                let q = self.rope.forward((&q, offset))?;
+                k = self.rope.forward((&k, offset))?;
+                let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                (q, k, v)
+            };
 
             kv_lens.push(k.dim(2) as usize);
             per_req_q.push(q);
@@ -725,6 +740,7 @@ struct MlxQuantizedCommandRAttention {
     num_kv_heads: usize,
     head_dim: usize,
     scale: f32,
+    fuse_rope: bool,
 }
 
 impl MlxQuantizedCommandRAttention {
@@ -787,6 +803,7 @@ impl MlxQuantizedCommandRAttention {
             num_kv_heads: c.num_kv_heads,
             head_dim: c.head_dim,
             scale: 1.0 / (c.head_dim as f32).sqrt(),
+            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
         })
     }
 
@@ -814,18 +831,24 @@ impl MlxQuantizedCommandRAttention {
         }
 
         let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
         let v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        // RoPE (interleaved via traditional=true): offset passed from caller (avoids .item() sync).
-        let q = self.rope.forward((&q, rope_offset))?;
-        let k = self.rope.forward((&k, rope_offset))?;
-
-        // KV cache update — pre-allocated buffer with O(1) slice_update.
-        let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+        // RoPE + KV cache
+        let (q, k, v) = if self.fuse_rope {
+            let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, rope_offset)?;
+            let (mut k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
+            (q, k, v)
+        } else {
+            let q = self.rope.forward((&q, rope_offset))?;
+            k = self.rope.forward((&k, rope_offset))?;
+            let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
+            (q, k, v)
+        };
 
         let mask = if seq_len > 1 {
             Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
@@ -903,10 +926,17 @@ impl MlxQuantizedCommandRAttention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let q = self.rope.forward((&q, offset))?;
-            k = self.rope.forward((&k, offset))?;
-
-            let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+            let (q, k, v) = if self.fuse_rope {
+                let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, offset)?;
+                let (mut k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
+                (q, k, v)
+            } else {
+                let q = self.rope.forward((&q, offset))?;
+                k = self.rope.forward((&k, offset))?;
+                let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
+                (q, k, v)
+            };
 
             kv_lens.push(k.dim(2) as usize);
             per_req_q.push(q);

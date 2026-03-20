@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 
 use crate::alloc::{CachingAllocator, OwnedTensor};
-use crate::driver;
 use crate::dtype::DType;
 use crate::tensor::GpuTensor;
 use anyhow::{Result, bail};
@@ -360,7 +359,14 @@ impl CublasHandle {
         }
 
         // Outside capture: use cublasLt with cached plans.
-        self.ensure_plan(key.m, key.k, key.n, key.dtype, key.has_bias, key.weight_trans);
+        self.ensure_plan(
+            key.m,
+            key.k,
+            key.n,
+            key.dtype,
+            key.has_bias,
+            key.weight_trans,
+        );
         let plan = &self.plans[&key];
         self.run_matmul_with_fallback(plan, a_ptr, b_ptr, out_ptr);
     }
@@ -501,10 +507,12 @@ impl CublasHandle {
             _compute_type,
             sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
         );
-        check(status).expect(&format!(
-            "cublasGemmEx failed for GEMM [M={}, K={}, N={}] {:?}",
-            k.m, k.k, k.n, k.dtype,
-        ));
+        check(status).unwrap_or_else(|_| {
+            panic!(
+                "cublasGemmEx failed for GEMM [M={}, K={}, N={}] {:?}",
+                k.m, k.k, k.n, k.dtype,
+            )
+        });
     }
 
     /// GEMM: out = A @ B^T

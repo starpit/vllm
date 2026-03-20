@@ -265,6 +265,13 @@ extern "C" void moe_align_block_size_i32(
         int total_threads = 1024;
         int stride_count = total_threads - fill_threads;
         int shared_bytes = ((stride_count + 1) * num_experts + num_experts + 1) * sizeof(int32_t);
+        // Request extended shared memory if needed (default limit is 48 KB).
+        if (shared_bytes > 48 * 1024) {
+            cudaFuncSetAttribute(
+                vllm::moe::moe_align_block_size_small_batch_kernel<fill_threads>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                shared_bytes);
+        }
         vllm::moe::moe_align_block_size_small_batch_kernel<fill_threads>
             <<<1, total_threads, shared_bytes, stream>>>(
                 topk_ids, sorted_token_ids, expert_ids, total_tokens_post_pad,

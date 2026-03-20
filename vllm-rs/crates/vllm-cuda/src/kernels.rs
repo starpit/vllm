@@ -718,7 +718,7 @@ unsafe extern "C" {
         in_features: c_int,
         out_features: c_int,
         top_k: c_int,
-        block_size: c_int,
+        num_tokens_padded_total: c_int,
         apply_weights: c_int,
         stream: CUstream,
     );
@@ -734,7 +734,7 @@ unsafe extern "C" {
         in_features: c_int,
         out_features: c_int,
         top_k: c_int,
-        block_size: c_int,
+        num_tokens_padded_total: c_int,
         apply_weights: c_int,
         stream: CUstream,
     );
@@ -5098,7 +5098,7 @@ pub unsafe fn moe_align_block_size(
     let numel = topk_ids.numel();
     // Max padded size: each expert's tokens padded to block_size
     let max_num_tokens_padded = numel + num_experts * block_size;
-    let max_num_m_blocks = max_num_tokens_padded / block_size;
+    let max_num_m_blocks = max_num_tokens_padded.div_ceil(block_size);
 
     let sorted_token_ids = alloc.alloc_tensor(&[max_num_tokens_padded], DType::I32);
     let expert_ids = alloc.alloc_tensor(&[max_num_m_blocks], DType::I32);
@@ -5144,15 +5144,16 @@ pub unsafe fn fused_moe_gemm(
     num_tokens_post_padded: GpuTensor,
     num_tokens: usize,
     top_k: usize,
-    block_size: usize,
     apply_weights: bool,
     alloc: &mut CachingAllocator,
     stream: CUstream,
 ) -> OwnedTensor {
     let in_features = input.dim(1);
     let out_features = weights.dim(1);
+    let num_valid_tokens = num_tokens * top_k;
+    let num_tokens_padded_total = sorted_token_ids.numel();
 
-    let out = alloc.alloc_tensor(&[num_tokens * top_k, out_features], input.dtype());
+    let out = alloc.alloc_tensor(&[num_valid_tokens, out_features], input.dtype());
 
     match input.dtype() {
         DType::BF16 => fused_moe_gemm_bf16(
@@ -5163,11 +5164,11 @@ pub unsafe fn fused_moe_gemm(
             sorted_token_ids.as_ptr() as *const i32,
             expert_ids.as_ptr() as *const i32,
             num_tokens_post_padded.as_ptr() as *const i32,
-            num_tokens as c_int,
+            num_valid_tokens as c_int,
             in_features as c_int,
             out_features as c_int,
             top_k as c_int,
-            block_size as c_int,
+            num_tokens_padded_total as c_int,
             apply_weights as c_int,
             stream,
         ),
@@ -5179,11 +5180,11 @@ pub unsafe fn fused_moe_gemm(
             sorted_token_ids.as_ptr() as *const i32,
             expert_ids.as_ptr() as *const i32,
             num_tokens_post_padded.as_ptr() as *const i32,
-            num_tokens as c_int,
+            num_valid_tokens as c_int,
             in_features as c_int,
             out_features as c_int,
             top_k as c_int,
-            block_size as c_int,
+            num_tokens_padded_total as c_int,
             apply_weights as c_int,
             stream,
         ),

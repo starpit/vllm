@@ -9,9 +9,9 @@
  * - Output C: [num_tokens * top_k, N]
  * - Token dispatch via sorted_token_ids, expert dispatch via expert_ids
  *
- * Three kernel variants:
- * 1. BF16 WMMA (SM80+): BF16 inputs/weights, BF16 output
- * 2. F16  WMMA (SM70+): F16 inputs/weights, F16 output
+ * Kernel variants:
+ * 1. BF16 tiled (SM80+): per-thread FP32 accumulation, BF16 output
+ * 2. F16  tiled (SM70+): per-thread FP32 accumulation, F16 output
  * 3. FP8  (SM89+): FP8 E4M3 inputs/weights, BF16 output, with per-token/expert scales
  *    - SM89+: True FP8 tensor core compute via PTX mma.sync m16n8k32
  *    - SM80-SM88: FP8 storage + dequant-to-BF16 in shared memory + BF16 WMMA compute
@@ -28,18 +28,23 @@
 
 using namespace nvcuda;
 
-// Tile sizes — tuned for SM80+ tensor cores
+// Tile sizes
 #define BLOCK_M 128
 #define BLOCK_N 128
 #define BLOCK_K 32
 
-// WMMA fragment size (BF16/F16)
+// Per-thread tile for BF16/F16 tiled kernels
+// 256 threads: 16 threads in M × 16 threads in N
+// Each thread handles TM×TN = 8×8 = 64 output elements
+#define TM 8
+#define TN 8
+
+// WMMA fragment size (used by FP8 dequant kernel)
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
 
-// Thread block size: 8 warps (256 threads).
-// Each warp handles 1 WMMA_M tile in M, iterates over all N tiles.
+// Thread block size: 256 threads.
 #define THREADS_PER_BLOCK 256
 #define WARPS_PER_BLOCK (THREADS_PER_BLOCK / 32)
 
@@ -56,11 +61,14 @@ namespace vllm {
 namespace moe {
 
 // =========================================================================
-// WMMA tensor-core kernel for BF16 (SM80+)
+// BF16 tiled GEMM kernel — per-thread FP32 accumulation (no WMMA)
+//
+// Faithful port of Python vLLM's Triton fused_moe_kernel.
+// Each thread computes TM×TN output elements via shared-memory tiled GEMM.
 // =========================================================================
 
 __global__ void __launch_bounds__(THREADS_PER_BLOCK)
-fused_moe_gemm_bf16_wmma(
+fused_moe_gemm_bf16_tiled(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ weights,
@@ -86,21 +94,23 @@ fused_moe_gemm_bf16_wmma(
 
     const __nv_bfloat16* expert_w = weights + (int64_t)expert_id * N * K;
 
-    const int warp_id = threadIdx.x / 32;
-    const int lane_id = threadIdx.x % 32;
+    // Thread-to-element mapping: 256 threads cover 128×128 tile
+    const int thread_m = threadIdx.x / 16;  // 0..15
+    const int thread_n = threadIdx.x % 16;  // 0..15
 
     __shared__ __nv_bfloat16 smem_a[BLOCK_M][BLOCK_K];
     __shared__ __nv_bfloat16 smem_b[BLOCK_K][BLOCK_N];
 
-    const int warp_m = warp_id;
-
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[WARP_TILES_N];
+    // FP32 accumulators: TM×TN = 64 per thread
+    float acc[TM][TN];
     #pragma unroll
-    for (int wn = 0; wn < WARP_TILES_N; ++wn) {
-        wmma::fill_fragment(acc[wn], 0.0f);
-    }
+    for (int mi = 0; mi < TM; mi++)
+        #pragma unroll
+        for (int ni = 0; ni < TN; ni++)
+            acc[mi][ni] = 0.0f;
 
     for (int32_t k_start = 0; k_start < K; k_start += BLOCK_K) {
+        // Cooperative load A tile [BLOCK_M × BLOCK_K]
         for (int32_t idx = threadIdx.x; idx < BLOCK_M * BLOCK_K; idx += THREADS_PER_BLOCK) {
             int32_t m_local = idx / BLOCK_K;
             int32_t k_local = idx % BLOCK_K;
@@ -110,14 +120,14 @@ fused_moe_gemm_bf16_wmma(
             __nv_bfloat16 val = __float2bfloat16(0.0f);
             if (global_m < total_padded && global_k < K) {
                 int32_t token_id = sorted_token_ids[global_m];
-                if (token_id < num_valid_tokens * top_k) {
-                    int32_t orig_token = token_id / top_k;
-                    val = input[orig_token * K + global_k];
+                if (token_id < num_valid_tokens) {
+                    val = input[(int64_t)(token_id / top_k) * K + global_k];
                 }
             }
             smem_a[m_local][k_local] = val;
         }
 
+        // Cooperative load B tile [BLOCK_K × BLOCK_N]
         for (int32_t idx = threadIdx.x; idx < BLOCK_K * BLOCK_N; idx += THREADS_PER_BLOCK) {
             int32_t k_local = idx / BLOCK_N;
             int32_t n_local = idx % BLOCK_N;
@@ -126,63 +136,63 @@ fused_moe_gemm_bf16_wmma(
 
             __nv_bfloat16 val = __float2bfloat16(0.0f);
             if (global_k < K && global_n < N) {
-                val = expert_w[global_n * K + global_k];
+                val = expert_w[(int64_t)global_n * K + global_k];
             }
             smem_b[k_local][n_local] = val;
         }
 
         __syncthreads();
 
+        // Per-thread multiply-accumulate over K tile
         #pragma unroll
-        for (int32_t ki = 0; ki < BLOCK_K; ki += WMMA_K) {
-            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
-            wmma::load_matrix_sync(a_frag, &smem_a[warp_m * WMMA_M][ki], BLOCK_K);
-
+        for (int k = 0; k < BLOCK_K; k++) {
+            float b_vals[TN];
             #pragma unroll
-            for (int wn = 0; wn < WARP_TILES_N; ++wn) {
-                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
-                wmma::load_matrix_sync(b_frag, &smem_b[ki][wn * WMMA_N], BLOCK_N);
-                wmma::mma_sync(acc[wn], a_frag, b_frag, acc[wn]);
+            for (int ni = 0; ni < TN; ni++)
+                b_vals[ni] = __bfloat162float(smem_b[k][thread_n * TN + ni]);
+            #pragma unroll
+            for (int mi = 0; mi < TM; mi++) {
+                float a_val = __bfloat162float(smem_a[thread_m * TM + mi][k]);
+                #pragma unroll
+                for (int ni = 0; ni < TN; ni++)
+                    acc[mi][ni] += a_val * b_vals[ni];
             }
         }
 
         __syncthreads();
     }
 
-    __shared__ float warp_staging[WARPS_PER_BLOCK][WMMA_M * WMMA_N];
-
+    // Epilogue: apply routing weight and write output
     #pragma unroll
-    for (int wn = 0; wn < WARP_TILES_N; ++wn) {
-        wmma::store_matrix_sync(
-            &warp_staging[warp_id][0], acc[wn], WMMA_N, wmma::mem_row_major);
-        __syncwarp();
+    for (int mi = 0; mi < TM; mi++) {
+        int32_t m_local = thread_m * TM + mi;
+        int32_t global_m = pid_m * BLOCK_M + m_local;
+        if (global_m >= total_padded) continue;
 
-        for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
-            int32_t m_local = warp_m * WMMA_M + i / WMMA_N;
-            int32_t n_local = wn * WMMA_N + i % WMMA_N;
-            int32_t global_m = pid_m * BLOCK_M + m_local;
-            int32_t global_n = pid_n * BLOCK_N + n_local;
+        int32_t token_id = sorted_token_ids[global_m];
+        if (token_id >= num_valid_tokens) continue;
 
-            if (global_m >= total_padded || global_n >= N) continue;
+        float tw = 1.0f;
+        if (apply_weights) {
+            tw = topk_weights[token_id];
+        }
 
-            int32_t token_id = sorted_token_ids[global_m];
-            if (token_id >= num_valid_tokens * top_k) continue;
+        #pragma unroll
+        for (int ni = 0; ni < TN; ni++) {
+            int32_t global_n = pid_n * BLOCK_N + thread_n * TN + ni;
+            if (global_n >= N) continue;
 
-            float val = warp_staging[warp_id][i];
-            if (apply_weights) {
-                val *= topk_weights[token_id];
-            }
-            output[(int64_t)token_id * N + global_n] = __float2bfloat16(val);
+            output[(int64_t)token_id * N + global_n] = __float2bfloat16(acc[mi][ni] * tw);
         }
     }
 }
 
 // =========================================================================
-// WMMA tensor-core kernel for F16 (SM70+)
+// F16 tiled GEMM kernel — per-thread FP32 accumulation (no WMMA)
 // =========================================================================
 
 __global__ void __launch_bounds__(THREADS_PER_BLOCK)
-fused_moe_gemm_f16_wmma(
+fused_moe_gemm_f16_tiled(
     __half* __restrict__ output,
     const __half* __restrict__ input,
     const __half* __restrict__ weights,
@@ -208,19 +218,18 @@ fused_moe_gemm_f16_wmma(
 
     const __half* expert_w = weights + (int64_t)expert_id * N * K;
 
-    const int warp_id = threadIdx.x / 32;
-    const int lane_id = threadIdx.x % 32;
+    const int thread_m = threadIdx.x / 16;
+    const int thread_n = threadIdx.x % 16;
 
     __shared__ __half smem_a[BLOCK_M][BLOCK_K];
     __shared__ __half smem_b[BLOCK_K][BLOCK_N];
 
-    const int warp_m = warp_id;
-
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[WARP_TILES_N];
+    float acc[TM][TN];
     #pragma unroll
-    for (int wn = 0; wn < WARP_TILES_N; ++wn) {
-        wmma::fill_fragment(acc[wn], 0.0f);
-    }
+    for (int mi = 0; mi < TM; mi++)
+        #pragma unroll
+        for (int ni = 0; ni < TN; ni++)
+            acc[mi][ni] = 0.0f;
 
     for (int32_t k_start = 0; k_start < K; k_start += BLOCK_K) {
         for (int32_t idx = threadIdx.x; idx < BLOCK_M * BLOCK_K; idx += THREADS_PER_BLOCK) {
@@ -232,8 +241,8 @@ fused_moe_gemm_f16_wmma(
             __half val = __float2half(0.0f);
             if (global_m < total_padded && global_k < K) {
                 int32_t token_id = sorted_token_ids[global_m];
-                if (token_id < num_valid_tokens * top_k) {
-                    val = input[(token_id / top_k) * K + global_k];
+                if (token_id < num_valid_tokens) {
+                    val = input[(int64_t)(token_id / top_k) * K + global_k];
                 }
             }
             smem_a[m_local][k_local] = val;
@@ -247,7 +256,7 @@ fused_moe_gemm_f16_wmma(
 
             __half val = __float2half(0.0f);
             if (global_k < K && global_n < N) {
-                val = expert_w[global_n * K + global_k];
+                val = expert_w[(int64_t)global_n * K + global_k];
             }
             smem_b[k_local][n_local] = val;
         }
@@ -255,43 +264,43 @@ fused_moe_gemm_f16_wmma(
         __syncthreads();
 
         #pragma unroll
-        for (int32_t ki = 0; ki < BLOCK_K; ki += WMMA_K) {
-            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag;
-            wmma::load_matrix_sync(a_frag, &smem_a[warp_m * WMMA_M][ki], BLOCK_K);
-
+        for (int k = 0; k < BLOCK_K; k++) {
+            float b_vals[TN];
             #pragma unroll
-            for (int wn = 0; wn < WARP_TILES_N; ++wn) {
-                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> b_frag;
-                wmma::load_matrix_sync(b_frag, &smem_b[ki][wn * WMMA_N], BLOCK_N);
-                wmma::mma_sync(acc[wn], a_frag, b_frag, acc[wn]);
+            for (int ni = 0; ni < TN; ni++)
+                b_vals[ni] = __half2float(smem_b[k][thread_n * TN + ni]);
+            #pragma unroll
+            for (int mi = 0; mi < TM; mi++) {
+                float a_val = __half2float(smem_a[thread_m * TM + mi][k]);
+                #pragma unroll
+                for (int ni = 0; ni < TN; ni++)
+                    acc[mi][ni] += a_val * b_vals[ni];
             }
         }
 
         __syncthreads();
     }
 
-    __shared__ float warp_staging[WARPS_PER_BLOCK][WMMA_M * WMMA_N];
-
     #pragma unroll
-    for (int wn = 0; wn < WARP_TILES_N; ++wn) {
-        wmma::store_matrix_sync(&warp_staging[warp_id][0], acc[wn], WMMA_N, wmma::mem_row_major);
-        __syncwarp();
+    for (int mi = 0; mi < TM; mi++) {
+        int32_t m_local = thread_m * TM + mi;
+        int32_t global_m = pid_m * BLOCK_M + m_local;
+        if (global_m >= total_padded) continue;
 
-        for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
-            int32_t m_local = warp_m * WMMA_M + i / WMMA_N;
-            int32_t n_local = wn * WMMA_N + i % WMMA_N;
-            int32_t global_m = pid_m * BLOCK_M + m_local;
-            int32_t global_n = pid_n * BLOCK_N + n_local;
+        int32_t token_id = sorted_token_ids[global_m];
+        if (token_id >= num_valid_tokens) continue;
 
-            if (global_m >= total_padded || global_n >= N) continue;
-            int32_t token_id = sorted_token_ids[global_m];
-            if (token_id >= num_valid_tokens * top_k) continue;
+        float tw = 1.0f;
+        if (apply_weights) {
+            tw = topk_weights[token_id];
+        }
 
-            float val = warp_staging[warp_id][i];
-            if (apply_weights) {
-                val *= topk_weights[token_id];
-            }
-            output[(int64_t)token_id * N + global_n] = __float2half(val);
+        #pragma unroll
+        for (int ni = 0; ni < TN; ni++) {
+            int32_t global_n = pid_n * BLOCK_N + thread_n * TN + ni;
+            if (global_n >= N) continue;
+
+            output[(int64_t)token_id * N + global_n] = __float2half(acc[mi][ni] * tw);
         }
     }
 }
@@ -664,16 +673,15 @@ extern "C" void fused_moe_gemm_bf16(
     int in_features,
     int out_features,
     int top_k,
-    int block_size,
+    int num_tokens_padded_total,
     int apply_weights,
     cudaStream_t stream)
 {
-    int max_m_blocks = CEILDIV(num_valid_tokens * top_k, BLOCK_M) + 64;
+    int max_m_blocks = CEILDIV(num_tokens_padded_total, BLOCK_M);
     int num_n_blocks = CEILDIV(out_features, BLOCK_N);
     int grid = max_m_blocks * num_n_blocks;
-    (void)block_size;
 
-    vllm::moe::fused_moe_gemm_bf16_wmma
+    vllm::moe::fused_moe_gemm_bf16_tiled
         <<<grid, THREADS_PER_BLOCK, 0, stream>>>(
             reinterpret_cast<__nv_bfloat16*>(output),
             reinterpret_cast<const __nv_bfloat16*>(input),
@@ -694,16 +702,15 @@ extern "C" void fused_moe_gemm_f16(
     int in_features,
     int out_features,
     int top_k,
-    int block_size,
+    int num_tokens_padded_total,
     int apply_weights,
     cudaStream_t stream)
 {
-    int max_m_blocks = CEILDIV(num_valid_tokens * top_k, BLOCK_M) + 64;
+    int max_m_blocks = CEILDIV(num_tokens_padded_total, BLOCK_M);
     int num_n_blocks = CEILDIV(out_features, BLOCK_N);
     int grid = max_m_blocks * num_n_blocks;
-    (void)block_size;
 
-    vllm::moe::fused_moe_gemm_f16_wmma
+    vllm::moe::fused_moe_gemm_f16_tiled
         <<<grid, THREADS_PER_BLOCK, 0, stream>>>(
             reinterpret_cast<__half*>(output),
             reinterpret_cast<const __half*>(input),
@@ -816,7 +823,9 @@ extern "C" void moe_expert_gather_bf16(
 }
 
 // Gather top_k experts' w2 outputs, weight, and sum across top_k.
-// all_expert_out: [num_experts, num_tokens * top_k, out_features] (BF16)
+// all_expert_out: [num_experts, rows_per_expert, out_features] (BF16)
+//   Each expert has rows_per_expert rows. Token t's data for expert e
+//   is at row (e * rows_per_expert + t).
 // topk_ids:      [num_tokens * top_k] (int32)
 // topk_weights:  [num_tokens * top_k] (float32)
 // output:        [num_tokens, out_features] (BF16)
@@ -837,7 +846,7 @@ __global__ void moe_expert_gather_weighted_sum_bf16_kernel(
             int expert_id = topk_ids[idx];
             float w = topk_weights[idx];
             acc += w * __bfloat162float(
-                all_expert_out[((int64_t)expert_id * rows_per_expert + idx) * out_features + f]);
+                all_expert_out[((int64_t)expert_id * rows_per_expert + t) * out_features + f]);
         }
         dst[f] = __float2bfloat16(acc);
     }

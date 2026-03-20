@@ -52,6 +52,9 @@ pub struct FusedMoELayer {
 impl FusedMoELayer {
     /// Forward pass — full MoE pipeline.
     ///
+    /// Always uses `forward_fused` (WMMA kernel). The fused kernel is a plain
+    /// CUDA kernel launch, fully compatible with CUDA graph capture.
+    ///
     /// * `hidden_states`: `[num_tokens, hidden_size]`
     ///
     /// Returns: `[num_tokens, hidden_size]`
@@ -64,16 +67,10 @@ impl FusedMoELayer {
         hidden_states: TensorView<'_>,
         device: &mut GpuDevice,
     ) -> OwnedTensor {
-        // Always use unfused path — the fused WMMA kernel and cuBLAS both
-        // poison CUDA graph capture when encountering shapes not warmed up.
-        // Using unfused for both warmup and capture ensures cuBLAS sees the
-        // same shapes in both passes.
-        // TODO: restore fused path for prefill (large num_tokens) where
-        // graph capture is not used.
-        self.forward_unfused(hidden_states, device)
+        self.forward_fused(hidden_states, device)
     }
 
-    /// Fused MoE forward — uses custom WMMA kernel. Fast but not graph-capturable.
+    /// Fused MoE forward — uses custom tiled GEMM kernel. Graph-capturable.
     #[allow(clippy::too_many_arguments)]
     unsafe fn forward_fused(
         &self,
@@ -114,7 +111,6 @@ impl FusedMoELayer {
             num_tokens_post_padded.as_gpu_tensor(),
             num_tokens,
             self.top_k,
-            MOE_BLOCK_SIZE,
             false,
             &mut device.caching,
             stream,
@@ -137,11 +133,11 @@ impl FusedMoELayer {
             num_tokens_post_padded.as_gpu_tensor(),
             num_tokens * self.top_k,
             1,
-            MOE_BLOCK_SIZE,
             true,
             &mut device.caching,
             stream,
         );
+
         drop(activated);
         drop(topk_weights);
         drop(sorted_token_ids);
@@ -165,53 +161,6 @@ impl FusedMoELayer {
         }
 
         output
-    }
-
-    /// Unfused MoE forward — per-expert cuBLAS GEMMs. Graph-capture-safe.
-    ///
-    /// ABLATION: just one expert GEMM to test if cuBLAS works during capture
-    /// for expert weight shapes.
-    unsafe fn forward_unfused(
-        &self,
-        hidden_states: TensorView<'_>,
-        device: &mut GpuDevice,
-    ) -> OwnedTensor {
-        let num_tokens = hidden_states.dim(0);
-        let stream = device.compute_stream;
-        let out_features_w1 = self.w1.dim(1);
-
-        // Gate + topk (known capture-safe)
-        let router_logits =
-            self.gate
-                .forward(hidden_states, &mut device.cublas, &mut device.caching);
-        let (topk_weights, topk_ids) = kernels::topk_softmax(
-            router_logits.as_gpu_tensor(),
-            self.top_k,
-            self.renormalize,
-            &mut device.caching,
-            stream,
-        );
-        drop(router_logits);
-        drop(topk_weights);
-        drop(topk_ids);
-
-        // ONE expert GEMM: input @ w1[0]^T
-        let expert_w = self.w1.narrow_dim0(0, 1).reshape(&[out_features_w1, self.hidden_size]);
-        let expert_out = device.cublas.gemm(
-            *hidden_states,
-            expert_w,
-            &mut device.caching,
-        );
-        drop(expert_out);
-
-        // Return zeros
-        let out = device.caching.alloc_tensor(
-            &[num_tokens, self.hidden_size],
-            hidden_states.dtype(),
-        );
-        crate::driver::memset_d8(out.raw_ptr(), 0, out.size_bytes(), stream)
-            .expect("memset");
-        out
     }
 }
 

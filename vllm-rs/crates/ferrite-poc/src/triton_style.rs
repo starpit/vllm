@@ -419,22 +419,21 @@ fn emit_ptx(sm: &str) -> Result<String> {
         }
 
         // Load B fragments via ldmatrix.x4.trans (1 per REG_N col)
-        // For .trans, each thread provides the row address for lane % 8
+        // For .trans with m8n8: each thread provides address of row (lane % 8)
+        // in an 8×8 sub-tile. The instruction loads 8 elements per row and transposes.
+        // B is [BK×BN] row-major. Sub-tile at (k_off, rn*8+wx_off):
+        //   row r starts at elem: (k_off + r) * BN + (wx_off + rn*8)
+        //   where r = lane % 8
         let mut b_frags: Vec<[IntValue; 4]> = Vec::new();
         for rn in 0..REG_N as u64 {
-            let col = b.build_int_add(
-                b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap(),
-                lane_mod8, "",
-            ).unwrap();
-            // B is stored as [BK×BN] row-major. For column `col`, row `k_off`:
-            // elem = k_off * BN + col → byte offset via swizzle
+            let tile_col = b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap();
+            let row_in_tile = lane_mod8; // each thread loads its row
+            let k_row = b.build_int_add(k_off, row_in_tile, "").unwrap();
             let elem_off = b.build_int_add(
-                b.build_int_mul(k_off, ci(BN as u64), "").unwrap(), col, "",
+                b.build_int_mul(k_row, ci(BN as u64), "").unwrap(), tile_col, "",
             ).unwrap();
             let byte_off = swizzle_bytes(&b, &ctx, elem_off);
             let frag = ldmatrix_x4_trans(&b, &ctx, &module, smem_b, byte_off);
-            // ldmatrix.x4.trans returns 4 regs, but MMA B needs only 2.
-            // For m16n8k16: B fragment = 2 regs. ldmatrix.x4.trans loads 2 tiles.
             b_frags.push(frag);
         }
 

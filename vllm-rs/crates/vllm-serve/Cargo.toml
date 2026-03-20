@@ -55,6 +55,7 @@ minijinja-contrib = { workspace = true }
 chrono = { workspace = true }
 prometheus = { workspace = true, optional = true }
 indicatif = { workspace = true }
+spnl-core = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

@@ -5513,6 +5513,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "spnl-core"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c9354a188789b586b724dc1241bc4d91947c06db0edd2614fe5a2832b17f356"
+dependencies = [
+ "anyhow",
+ "clap",
+ "derive_builder",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ssh-cipher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6716,6 +6729,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "spnl-core",
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.22.2",

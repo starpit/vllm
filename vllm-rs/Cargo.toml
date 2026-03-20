@@ -113,6 +113,9 @@ memmap2 = "0.9"
 # MLX (Apple Silicon)
 mlx-rs = { path = "third_party/mlx-rs/mlx-rs", features = ["metal", "accelerate", "safetensors"] }
 
+# Span query language
+spnl-core = { version = "0.22", default-features = false }
+
 # HuggingFace Hub
 hf-hub = "0.4"
 indicatif = "0.17"

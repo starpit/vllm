@@ -25,5 +25,6 @@ pub mod protocol;
 pub mod reasoning_parser;
 pub mod responses;
 pub mod server;
+pub mod spans;
 pub mod tokenizer;
 pub mod tool_parser;

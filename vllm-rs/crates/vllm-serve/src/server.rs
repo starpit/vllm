@@ -105,6 +105,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/messages", post(crate::anthropic::messages))
         .route("/v1/responses", post(crate::responses::responses))
         .route("/v1/completions", post(completions))
+        .route("/v1/query/execute", post(crate::spans::execute_query))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))
         .route("/tokenize", post(tokenize))
@@ -173,6 +174,7 @@ fn log_routes(state: &AppState) {
     info!("Route: /v1/chat/completions/render, Methods: POST");
     info!("Route: /v1/messages, Methods: POST");
     info!("Route: /v1/completions, Methods: POST");
+    info!("Route: /v1/query/execute, Methods: POST");
     info!("Route: /v1/embeddings, Methods: POST");
     info!("Route: /v1/models, Methods: GET");
     info!("Route: /health, Methods: GET");

@@ -15,6 +15,8 @@ mod tiled_mma;
 mod cubek_gemm;
 #[allow(unused, unsafe_op_in_unsafe_fn)]
 mod sweep;
+#[allow(unused, unsafe_op_in_unsafe_fn)]
+mod triton_style;
 
 use anyhow::{Context, Result, bail};
 use std::ffi::{CString, c_uint, c_void};
@@ -43,8 +45,17 @@ fn main() -> Result<()> {
     println!("Ferrite Phase 0 — Proof of Concept");
     println!("═══════════════════════════════════\n");
 
+    // Enable 32-bit shared memory pointers — required for ldmatrix.
+    // Same flag Triton uses (confirmed: their ldmatrix uses %r not %rd).
+    unsafe {
+        let args: [*const i8; 2] = [
+            b"ferrite\0".as_ptr() as *const i8,
+            b"-nvptx-short-ptr\0".as_ptr() as *const i8,
+        ];
+        llvm_sys::support::LLVMParseCommandLineOptions(2, args.as_ptr(), std::ptr::null());
+    }
     Target::initialize_nvptx(&InitializationConfig::default());
-    println!("[llvm] NVPTX target initialized");
+    println!("[llvm] NVPTX target initialized (short-ptr enabled)");
 
     cuda::init()?;
     let device = cuda::device::get(0)?;
@@ -82,8 +93,8 @@ fn main() -> Result<()> {
     println!("\n[4/4] CubeK-style GEMM (128×128, K=32, 4 warps×32 MMAs, B128 swizzle)");
     cubek_gemm::step_cubek_gemm(&sm)?;
 
-    println!("\n[SWEEP] Parameter sweep across tile configurations");
-    sweep::run_sweep(&sm)?;
+    println!("\n[5/5] Triton-style GEMM (BK=32, ldmatrix, short-ptr)");
+    triton_style::run(&sm)?;
 
     println!("\n═══════════════════════════════════");
     println!("Phase 0 complete.");

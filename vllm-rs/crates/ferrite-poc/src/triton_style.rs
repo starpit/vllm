@@ -403,10 +403,25 @@ fn emit_ptx(sm: &str) -> Result<String> {
     let lane_mod16 = b.build_int_unsigned_rem(lane, ci(16), "lm16").unwrap();
     let lane_mod8 = b.build_int_unsigned_rem(lane, ci(8), "lm8").unwrap();
 
-    for ki in 0..K_ITERS as u64 {
-        let k_off = ci(ki * MMA_K as u64); // 0 or 16
+    // Load B fragments ONCE via ldmatrix.x4.trans — covers BOTH K-iterations.
+    // ldmatrix.x4.trans returns 4 regs: [0,1] for k=0, [2,3] for k=16.
+    // Address: row (lane%8) at k=0, the instruction loads 16 elements spanning k=0..15 and k=16..31.
+    let mut b_frags_all: Vec<[IntValue; 4]> = Vec::new();
+    for rn in 0..REG_N as u64 {
+        let tile_col = b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap();
+        let row_in_tile = lane_mod8;
+        // Address at k=0 row
+        let elem_off = b.build_int_add(
+            b.build_int_mul(row_in_tile, ci(BN as u64), "").unwrap(), tile_col, "",
+        ).unwrap();
+        let byte_off = swizzle_bytes(&b, &ctx, elem_off);
+        b_frags_all.push(ldmatrix_x4_trans(&b, &ctx, &module, smem_b, byte_off));
+    }
 
-        // Load A fragments via ldmatrix.x4 (1 per REG_M row)
+    for ki in 0..K_ITERS as u64 {
+        let k_off = ci(ki * MMA_K as u64);
+
+        // Load A fragments via ldmatrix.x4 (1 per REG_M row, per K-iter)
         let mut a_frags: Vec<[IntValue; 4]> = Vec::new();
         for rm in 0..REG_M as u64 {
             let row = b.build_int_add(ci(rm * MMA_M as u64), lane_mod16, "").unwrap();
@@ -414,33 +429,14 @@ fn emit_ptx(sm: &str) -> Result<String> {
                 b.build_int_mul(row, ci(BK as u64), "").unwrap(), k_off, "",
             ).unwrap();
             let byte_off = swizzle_bytes(&b, &ctx, elem_off);
-            let frag = ldmatrix_x4(&b, &ctx, &module, smem_a, byte_off);
-            a_frags.push(frag);
-        }
-
-        // Load B fragments via ldmatrix.x4.trans (1 per REG_N col)
-        // For .trans with m8n8: each thread provides address of row (lane % 8)
-        // in an 8×8 sub-tile. The instruction loads 8 elements per row and transposes.
-        // B is [BK×BN] row-major. Sub-tile at (k_off, rn*8+wx_off):
-        //   row r starts at elem: (k_off + r) * BN + (wx_off + rn*8)
-        //   where r = lane % 8
-        let mut b_frags: Vec<[IntValue; 4]> = Vec::new();
-        for rn in 0..REG_N as u64 {
-            let tile_col = b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap();
-            let row_in_tile = lane_mod8; // each thread loads its row
-            let k_row = b.build_int_add(k_off, row_in_tile, "").unwrap();
-            let elem_off = b.build_int_add(
-                b.build_int_mul(k_row, ci(BN as u64), "").unwrap(), tile_col, "",
-            ).unwrap();
-            let byte_off = swizzle_bytes(&b, &ctx, elem_off);
-            let frag = ldmatrix_x4_trans(&b, &ctx, &module, smem_b, byte_off);
-            b_frags.push(frag);
+            a_frags.push(ldmatrix_x4(&b, &ctx, &module, smem_a, byte_off));
         }
 
         // MMA: REG_M × REG_N
+        // B fragment: regs [0,1] for ki=0, regs [2,3] for ki=1
+        let b_reg_off = (ki * 2) as usize;
         for rn in 0..REG_N as u64 {
-            // B frag: first 2 regs from ldmatrix.x4.trans
-            let b_frag = [b_frags[rn as usize][0], b_frags[rn as usize][1]];
+            let b_frag = [b_frags_all[rn as usize][b_reg_off], b_frags_all[rn as usize][b_reg_off + 1]];
             for rm in 0..REG_M as u64 {
                 let ai = (rm as u32 * REG_N * 4 + rn as u32 * 4) as usize;
                 let [d0,d1,d2,d3] = mma_sync(&b, &ctx, &module,

@@ -352,8 +352,70 @@ fn emit_ptx(sm: &str) -> Result<String> {
     let num_acc = (REG_M * REG_N * 4) as usize; // 4×2×4 = 32
 
     // Loading: A[64×32]=2048 f16, B[32×64]=2048 f16
-    // 128 threads → 16 per thread → 2 cp.async(8) each = 4 cp.async total per thread
     let tid_x16 = b.build_int_mul(tid, ci(16), "").unwrap();
+
+    // ── PRECOMPUTE all byte offsets (Triton-style: AND/OR/XOR, no div/mul in loop) ──
+
+    // cp.async store offsets (2 for A, 2 for B) — swizzled byte offsets
+    let mut cp_a_byte_offs = Vec::new();
+    let mut cp_a_glob_info = Vec::new(); // (row, col) for global address
+    for chunk in 0..2u64 {
+        let base = b.build_int_add(tid_x16, ci(chunk * 8), "").unwrap();
+        let row = b.build_int_unsigned_div(base, ci(BK as u64), "").unwrap();
+        let col = b.build_int_unsigned_rem(base, ci(BK as u64), "").unwrap();
+        let grow = b.build_int_add(block_row, row, "").unwrap();
+        cp_a_byte_offs.push(swizzle_bytes(&b, &ctx, base));
+        cp_a_glob_info.push((grow, col));
+    }
+    let mut cp_b_byte_offs = Vec::new();
+    let mut cp_b_glob_info = Vec::new();
+    for chunk in 0..2u64 {
+        let base = b.build_int_add(tid_x16, ci(chunk * 8), "").unwrap();
+        let row = b.build_int_unsigned_div(base, ci(BN as u64), "").unwrap();
+        let col = b.build_int_unsigned_rem(base, ci(BN as u64), "").unwrap();
+        let gcol = b.build_int_add(block_col, col, "").unwrap();
+        cp_b_byte_offs.push(swizzle_bytes(&b, &ctx, base));
+        cp_b_glob_info.push((row, gcol));
+    }
+
+    // A ldmatrix byte offsets: REG_M × K_ITERS = 4×2 = 8 offsets
+    let lane_mod16 = b.build_int_unsigned_rem(lane, ci(16), "lm16").unwrap();
+    let mut a_ldm_byte_offs = Vec::new();
+    for ki in 0..K_ITERS as u64 {
+        let k_off = ci(ki * MMA_K as u64);
+        for rm in 0..REG_M as u64 {
+            let row = b.build_int_add(ci(rm * MMA_M as u64), lane_mod16, "").unwrap();
+            let elem_off = b.build_int_add(
+                b.build_int_mul(row, ci(BK as u64), "").unwrap(), k_off, "",
+            ).unwrap();
+            a_ldm_byte_offs.push(swizzle_bytes(&b, &ctx, elem_off));
+        }
+    }
+
+    // B scalar load byte offsets: REG_N × 2 × K_ITERS pairs
+    let mut b_load_byte_pairs = Vec::new();
+    for ki in 0..K_ITERS as u64 {
+        let k_off = ci(ki * MMA_K as u64);
+        for rn in 0..REG_N as u64 {
+            let b_col_g = b.build_int_add(
+                b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap(),
+                group, "",
+            ).unwrap();
+            for fk_add in [0u64, 8] {
+                let k0 = b.build_int_add(
+                    b.build_int_add(tg2, ci(fk_add), "").unwrap(), k_off, "",
+                ).unwrap();
+                let k1 = b.build_int_add(k0, ci(1), "").unwrap();
+                let lin0 = b.build_int_add(
+                    b.build_int_mul(k0, ci(BN as u64), "").unwrap(), b_col_g, "",
+                ).unwrap();
+                let lin1 = b.build_int_add(
+                    b.build_int_mul(k1, ci(BN as u64), "").unwrap(), b_col_g, "",
+                ).unwrap();
+                b_load_byte_pairs.push((swizzle_bytes(&b, &ctx, lin0), swizzle_bytes(&b, &ctx, lin1)));
+            }
+        }
+    }
 
     b.build_unconditional_branch(kh).unwrap();
 
@@ -368,71 +430,54 @@ fn emit_ptx(sm: &str) -> Result<String> {
 
     b.position_at_end(kb);
 
-    // ── Load A and B via cp.async (4 cp.async per thread) ──
-    for chunk in 0..2u64 {
-        let base = b.build_int_add(tid_x16, ci(chunk * 8), "").unwrap();
-        let row = b.build_int_unsigned_div(base, ci(BK as u64), "").unwrap();
-        let col = b.build_int_unsigned_rem(base, ci(BK as u64), "").unwrap();
-        let grow = b.build_int_add(block_row, row, "").unwrap();
-        let gcol = b.build_int_add(t, col, "").unwrap();
-        let gidx = b.build_int_add(b.build_int_mul(grow, k_p, "").unwrap(), gcol, "").unwrap();
+    // ── cp.async using PRECOMPUTED byte offsets (only global addr depends on t) ──
+    for chunk in 0..2 {
+        let (grow, col) = &cp_a_glob_info[chunk];
+        let gcol = b.build_int_add(t, *col, "").unwrap();
+        let gidx = b.build_int_add(b.build_int_mul(*grow, k_p, "").unwrap(), gcol, "").unwrap();
         let gep = unsafe { b.build_gep(f16_ty, a_ptr, &[gidx], "").unwrap() };
-        let sw_bytes = swizzle_bytes(&b, &ctx, base);
-        let sgep = unsafe { b.build_gep(ctx.i8_type(), smem_a, &[sw_bytes], "").unwrap() };
+        let sgep = unsafe { b.build_gep(ctx.i8_type(), smem_a, &[cp_a_byte_offs[chunk]], "").unwrap() };
         cp_async_16(&b, &ctx, &module, sgep, gep);
     }
-    for chunk in 0..2u64 {
-        let base = b.build_int_add(tid_x16, ci(chunk * 8), "").unwrap();
-        let row = b.build_int_unsigned_div(base, ci(BN as u64), "").unwrap();
-        let col = b.build_int_unsigned_rem(base, ci(BN as u64), "").unwrap();
-        let grow = b.build_int_add(t, row, "").unwrap();
-        let gcol = b.build_int_add(block_col, col, "").unwrap();
-        let gidx = b.build_int_add(b.build_int_mul(grow, n_p, "").unwrap(), gcol, "").unwrap();
+    for chunk in 0..2 {
+        let (row, gcol) = &cp_b_glob_info[chunk];
+        let grow = b.build_int_add(t, *row, "").unwrap();
+        let gidx = b.build_int_add(b.build_int_mul(grow, n_p, "").unwrap(), *gcol, "").unwrap();
         let gep = unsafe { b.build_gep(f16_ty, b_ptr, &[gidx], "").unwrap() };
-        let sw_bytes = swizzle_bytes(&b, &ctx, base);
-        let sgep = unsafe { b.build_gep(ctx.i8_type(), smem_b, &[sw_bytes], "").unwrap() };
+        let sgep = unsafe { b.build_gep(ctx.i8_type(), smem_b, &[cp_b_byte_offs[chunk]], "").unwrap() };
         cp_async_16(&b, &ctx, &module, sgep, gep);
     }
     cp_async_commit(&b, &ctx, &module);
     cp_async_wait_group(&b, &ctx, &module, 0);
     call_barrier0(&ctx, &module, &b);
 
-    // ── 2 K-iterations, each with ldmatrix (A) + ldmatrix.trans (B) + MMA ──
+    // ── K-iterations using PRECOMPUTED offsets (zero swizzle ALU in loop) ──
     let mut cur: Vec<FloatValue> = (0..num_acc).map(|i| acc_phis[i].as_basic_value().into_float_value()).collect();
 
-    let lane_mod16 = b.build_int_unsigned_rem(lane, ci(16), "lm16").unwrap();
-    let lane_mod8 = b.build_int_unsigned_rem(lane, ci(8), "lm8").unwrap();
-
     for ki in 0..K_ITERS as u64 {
-        let k_off = ci(ki * MMA_K as u64); // 0 or 16
-
-        // Load A fragments via ldmatrix.x4 (1 per REG_M row)
+        // A ldmatrix from precomputed byte offsets
         let mut a_frags: Vec<[IntValue; 4]> = Vec::new();
         for rm in 0..REG_M as u64 {
-            let row = b.build_int_add(ci(rm * MMA_M as u64), lane_mod16, "").unwrap();
-            let elem_off = b.build_int_add(
-                b.build_int_mul(row, ci(BK as u64), "").unwrap(), k_off, "",
-            ).unwrap();
-            let byte_off = swizzle_bytes(&b, &ctx, elem_off);
-            a_frags.push(ldmatrix_x4(&b, &ctx, &module, smem_a, byte_off));
+            let off_idx = (ki * REG_M as u64 + rm) as usize;
+            a_frags.push(ldmatrix_x4(&b, &ctx, &module, smem_a, a_ldm_byte_offs[off_idx]));
         }
 
-        // Load B fragments via ldmatrix.x4.trans (1 per REG_N col, per K-iter)
-        // Each thread provides row (lane%8 + k_off) of the sub-tile
-        let mut b_frags: Vec<[IntValue; 4]> = Vec::new();
+        // B scalar loads from precomputed byte offset pairs
         for rn in 0..REG_N as u64 {
-            let tile_col = b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap();
-            let k_row = b.build_int_add(k_off, lane_mod8, "").unwrap();
-            let elem_off = b.build_int_add(
-                b.build_int_mul(k_row, ci(BN as u64), "").unwrap(), tile_col, "",
-            ).unwrap();
-            let byte_off = swizzle_bytes(&b, &ctx, elem_off);
-            b_frags.push(ldmatrix_x4_trans(&b, &ctx, &module, smem_b, byte_off));
-        }
+            let pair_base = (ki * REG_N as u64 * 2 + rn * 2) as usize;
+            let mut b_frag = [ci(0), ci(0)];
+            for fi in 0..2 {
+                let (sw0, sw1) = b_load_byte_pairs[pair_base + fi];
+                let gep0 = unsafe { b.build_gep(ctx.i8_type(), smem_b, &[sw0], "").unwrap() };
+                let gep1 = unsafe { b.build_gep(ctx.i8_type(), smem_b, &[sw1], "").unwrap() };
+                let v0 = b.build_load(f16_ty, gep0, "").unwrap();
+                let v1 = b.build_load(f16_ty, gep1, "").unwrap();
+                let v2f16 = f16_ty.vec_type(2);
+                let vec = b.build_insert_element(v2f16.get_undef(), v0, ci(0), "").unwrap();
+                let vec = b.build_insert_element(vec, v1, ci(1), "").unwrap();
+                b_frag[fi] = b.build_bit_cast(vec, i32_ty, "").unwrap().into_int_value();
+            }
 
-        // MMA: REG_M × REG_N, using [0,1] from each B ldmatrix.trans
-        for rn in 0..REG_N as u64 {
-            let b_frag = [b_frags[rn as usize][0], b_frags[rn as usize][1]];
             for rm in 0..REG_M as u64 {
                 let ai = (rm as u32 * REG_N * 4 + rn as u32 * 4) as usize;
                 let [d0,d1,d2,d3] = mma_sync(&b, &ctx, &module,

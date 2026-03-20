@@ -739,6 +739,28 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // MoE expert gather kernels (graph-capture-safe unfused path)
+    fn moe_expert_gather_bf16(
+        output: *mut c_void,
+        all_expert_out: *const c_void,
+        topk_ids: *const i32,
+        num_tokens: c_int,
+        top_k: c_int,
+        out_features: c_int,
+        stream: CUstream,
+    );
+    fn moe_expert_gather_weighted_sum_bf16(
+        output: *mut c_void,
+        all_expert_out: *const c_void,
+        topk_ids: *const i32,
+        topk_weights: *const f32,
+        num_tokens: c_int,
+        top_k: c_int,
+        out_features: c_int,
+        rows_per_expert: c_int,
+        stream: CUstream,
+    );
+
     // Fused MoE GEMM — FP8 E4M3 (SM89+ true FP8 tensor cores)
     // TODO: fix PTX fragment layout bug (currently produces 0.5x output)
     #[allow(dead_code)]
@@ -3265,9 +3287,25 @@ pub unsafe fn flash_attn_paged_ext(
     // Python line 588: then compute window_size_right
     let window_size_right = if is_causal { 0 } else { -1_i32 };
 
+    // Detect if we're in CUDA graph capture mode.
+    // During capture, we disable seqlenq_ngroups_swapped and force num_splits=1
+    // to match Python vLLM's behavior — Python doesn't use do_swap at all and
+    // uses a fixed max_num_splits=1 during graph capture.
+    let is_graph_capture = {
+        let mut status = cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+        let ret = cudarc::driver::sys::cuStreamIsCapturing(_stream, &mut status);
+        ret == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            && status == cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+    };
+
     // --- seqlenq_ngroups_swapped (matching Python flash_api.cpp lines 594-601) ---
+    // Disabled during graph capture: Python vLLM doesn't use this optimization,
+    // and the extra transpose kernels + allocations cause CUDA graph failures
+    // for models where num_attention_heads > num_kv_heads (e.g. Qwen3 MoE).
+    // FA2 handles GQA natively via num_heads != num_heads_k.
     let ngroups = num_heads_orig / num_kv_heads;
-    let do_swap = max_seqlen_q == 1
+    let do_swap = !is_graph_capture
+        && max_seqlen_q == 1
         && num_heads_orig > num_kv_heads
         && window_size_left < 0
         && window_size_right < 0
@@ -3397,10 +3435,14 @@ pub unsafe fn flash_attn_paged_ext(
     let num_m_blocks = eff_max_seqlen_q.div_ceil(64);
 
     // Split-K heuristic: parallelize K blocks across SMs when there aren't
-    // enough CTAs to fill the GPU. Matches Python vLLM which passes
-    // num_splits=0 (auto) to FA2. Previously gated on do_swap (decode only),
-    // but partial prefill with few query tokens also needs this.
-    let num_splits = if num_sm > 0 {
+    // enough CTAs to fill the GPU.
+    // During graph capture, force num_splits=1 to match Python vLLM which uses
+    // flash_attn_max_num_splits_for_cuda_graph=1 during capture. The dynamic
+    // heuristic varies by batch size, causing different-sized split-K buffers
+    // per capture which wastes memory and can trigger allocation failures.
+    let num_splits = if is_graph_capture {
+        1
+    } else if num_sm > 0 {
         num_splits_heuristic(
             batch_size * eff_num_heads * num_m_blocks,
             (num_sm as usize) * 2,
@@ -5151,6 +5193,76 @@ pub unsafe fn fused_moe_gemm(
 }
 
 // ---------------------------------------------------------------------------
+// MoE expert gather (graph-capture-safe unfused path)
+// ---------------------------------------------------------------------------
+
+/// Gather top_k experts' outputs from an all-expert buffer.
+///
+/// * `all_expert_out`: `[num_experts * num_tokens, out_features]` (BF16)
+/// * `topk_ids`: `[num_tokens, top_k]` (I32) — selected expert IDs per token
+///
+/// Returns `[num_tokens * top_k, out_features]` (BF16).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn moe_expert_gather(
+    all_expert_out: GpuTensor,
+    topk_ids: GpuTensor,
+    num_tokens: usize,
+    num_experts: usize,
+    top_k: usize,
+    out_features: usize,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    debug_assert_eq!(all_expert_out.dim(0), num_experts * num_tokens);
+    debug_assert_eq!(all_expert_out.dim(1), out_features);
+    let out = alloc.alloc_tensor(&[num_tokens * top_k, out_features], DType::BF16);
+    moe_expert_gather_bf16(
+        out.raw_ptr() as *mut c_void,
+        all_expert_out.raw_ptr() as *const c_void,
+        topk_ids.as_ptr::<i32>(),
+        num_tokens as c_int,
+        top_k as c_int,
+        out_features as c_int,
+        stream,
+    );
+    out
+}
+
+/// Gather top_k experts' w2 outputs, apply routing weights, and sum across top_k.
+///
+/// * `all_expert_out`: `[num_experts * rows_per_expert, out_features]` (BF16)
+/// * `topk_ids`: `[num_tokens * top_k]` (I32) — flat
+/// * `topk_weights`: `[num_tokens * top_k]` (F32) — flat
+///
+/// Returns `[num_tokens, out_features]` (BF16).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn moe_expert_gather_weighted_sum(
+    all_expert_out: GpuTensor,
+    topk_ids: GpuTensor,
+    topk_weights: GpuTensor,
+    num_tokens: usize,
+    top_k: usize,
+    out_features: usize,
+    rows_per_expert: usize,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let out = alloc.alloc_tensor(&[num_tokens, out_features], DType::BF16);
+    moe_expert_gather_weighted_sum_bf16(
+        out.raw_ptr() as *mut c_void,
+        all_expert_out.raw_ptr() as *const c_void,
+        topk_ids.as_ptr::<i32>(),
+        topk_weights.as_ptr::<f32>(),
+        num_tokens as c_int,
+        top_k as c_int,
+        out_features as c_int,
+        rows_per_expert as c_int,
+        stream,
+    );
+    out
+}
+
+// ---------------------------------------------------------------------------
 // FP8 Fused MoE GEMM
 // ---------------------------------------------------------------------------
 
@@ -6846,7 +6958,7 @@ mod tests_pooling {
         unsafe {
             let stream = test_init();
             let mut alloc = CachingAllocator::new();
-            let cublas = crate::cublas::CublasHandle::new(stream).expect("cublas");
+            let cublas = crate::cublas::CublasHandle::new(stream, &mut alloc).expect("cublas");
 
             // 3 tokens, hidden_size=3
             // row0=[1,2,3], row1=[3,4,5], row2=[5,6,7] → mean=[3,4,5]
@@ -6871,7 +6983,7 @@ mod tests_pooling {
         unsafe {
             let stream = test_init();
             let mut alloc = CachingAllocator::new();
-            let cublas = crate::cublas::CublasHandle::new(stream).expect("cublas");
+            let cublas = crate::cublas::CublasHandle::new(stream, &mut alloc).expect("cublas");
 
             let data: Vec<f32> = vec![7.0, 8.0, 9.0, 10.0];
             let ptr = upload_f32(&data, stream);
@@ -6892,7 +7004,7 @@ mod tests_pooling {
         unsafe {
             let stream = test_init();
             let mut alloc = CachingAllocator::new();
-            let cublas = crate::cublas::CublasHandle::new(stream).expect("cublas");
+            let cublas = crate::cublas::CublasHandle::new(stream, &mut alloc).expect("cublas");
 
             // [0, 4] and [2, 6] → mean [1, 5]
             let data: Vec<f32> = vec![0.0, 4.0, 2.0, 6.0];

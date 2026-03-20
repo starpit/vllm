@@ -75,8 +75,6 @@ impl Qwen3MoeMlp {
 
                 let moe_out = moe.forward(hidden_states, device);
 
-                // Shared expert is optional (shared_expert_intermediate_size == 0
-                // means no shared expert, matching Python).
                 if let (Some(shared_gu_w), Some(shared_down_w), Some(shared_gate_w)) =
                     (shared_gate_up, shared_down, shared_expert_gate)
                 {
@@ -116,7 +114,6 @@ impl Qwen3MoeMlp {
 
                     result
                 } else {
-                    // No shared expert — MoE output is the final output.
                     moe_out
                 }
             }

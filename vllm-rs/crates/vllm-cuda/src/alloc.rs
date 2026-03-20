@@ -12,8 +12,40 @@
 use crate::driver;
 use crate::dtype::DType;
 use crate::tensor::{GpuTensor, TensorView};
+use cudarc::driver::sys as cuda_sys;
 use std::collections::BTreeSet;
 use std::ptr;
+
+// ---------------------------------------------------------------------------
+// Capture mode guard (matches PyTorch's CUDAStreamCaptureModeGuard)
+// ---------------------------------------------------------------------------
+
+/// RAII guard that switches the thread-local stream capture mode to RELAXED,
+/// restoring the previous mode on drop.
+///
+/// During CUDA graph capture, cudaMalloc is only allowed in relaxed mode.
+/// PyTorch uses the same pattern (CUDAStreamCaptureModeGuard) in its caching
+/// allocator to allow new segment allocations during capture.
+pub struct RelaxedCaptureModeGuard {
+    prev_mode: cuda_sys::CUstreamCaptureMode,
+}
+
+impl RelaxedCaptureModeGuard {
+    pub unsafe fn new() -> Self {
+        let mut mode = cuda_sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED;
+        // Exchange: sets relaxed, returns previous mode.
+        let _ = cuda_sys::cuThreadExchangeStreamCaptureMode(&mut mode);
+        Self { prev_mode: mode }
+    }
+}
+
+impl Drop for RelaxedCaptureModeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = cuda_sys::cuThreadExchangeStreamCaptureMode(&mut self.prev_mode);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants (matching PyTorch exactly)
@@ -347,6 +379,12 @@ impl CachingAllocator {
         }
 
         // 3. Allocate a new segment from the CUDA driver.
+        //
+        // During CUDA graph capture, cudaMalloc is only allowed in relaxed
+        // capture mode. PyTorch does the same: CUDAStreamCaptureModeGuard
+        // switches to relaxed before allocating (CUDACachingAllocator.cpp:1177).
+        // The allocated VA is captured into the graph but the allocation itself
+        // is replayed as a no-op — safe as long as we never cudaFree before replay.
         let alloc_size = Self::get_allocation_size(size);
         tracing::debug!(
             "CachingAllocator: cudaMalloc {alloc_size} bytes for request of {size} bytes \
@@ -356,8 +394,11 @@ impl CachingAllocator {
             self.private_small_pool.is_some(),
             self.segments.len(),
         );
-        let segment_ptr =
-            unsafe { driver::mem_alloc(alloc_size) }.expect("CachingAllocator: GPU OOM");
+        let segment_ptr = unsafe {
+            let _guard = RelaxedCaptureModeGuard::new();
+            driver::mem_alloc(alloc_size)
+        }
+        .expect("CachingAllocator: GPU OOM");
         self.segments.push((segment_ptr, alloc_size));
 
         let block = Box::into_raw(Box::new(Block {

@@ -48,8 +48,8 @@ impl GpuDevice {
             let transfer_done = driver::event_create_disable_timing()?;
             let d2h_done = driver::event_create_disable_timing()?;
 
-            let cublas = CublasHandle::new(compute_stream)?;
-            let caching = CachingAllocator::new();
+            let mut caching = CachingAllocator::new();
+            let cublas = CublasHandle::new(compute_stream, &mut caching)?;
             let num_sm = driver::device_get_num_sm(cu_device)?;
             let sm_version = driver::device_get_sm_version(cu_device)?;
 

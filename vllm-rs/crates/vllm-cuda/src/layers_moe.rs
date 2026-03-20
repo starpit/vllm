@@ -64,16 +64,29 @@ impl FusedMoELayer {
         hidden_states: TensorView<'_>,
         device: &mut GpuDevice,
     ) -> OwnedTensor {
+        // Always use unfused path — the fused WMMA kernel and cuBLAS both
+        // poison CUDA graph capture when encountering shapes not warmed up.
+        // Using unfused for both warmup and capture ensures cuBLAS sees the
+        // same shapes in both passes.
+        // TODO: restore fused path for prefill (large num_tokens) where
+        // graph capture is not used.
+        self.forward_unfused(hidden_states, device)
+    }
+
+    /// Fused MoE forward — uses custom WMMA kernel. Fast but not graph-capturable.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn forward_fused(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
         let num_tokens = hidden_states.dim(0);
         let stream = device.compute_stream;
 
-        // 1. Gate: router_logits = hidden_states @ gate_weight^T
-        //    router_logits: [num_tokens, num_experts]
         let router_logits =
             self.gate
                 .forward(hidden_states, &mut device.cublas, &mut device.caching);
 
-        // 2. Top-K softmax: select top_k experts per token
         let (topk_weights, topk_ids) = kernels::topk_softmax(
             router_logits.as_gpu_tensor(),
             self.top_k,
@@ -83,7 +96,6 @@ impl FusedMoELayer {
         );
         drop(router_logits);
 
-        // 3. Align block size: sort tokens by expert for fused GEMM
         let (sorted_token_ids, expert_ids, num_tokens_post_padded) = kernels::moe_align_block_size(
             topk_ids.as_gpu_tensor(),
             self.num_experts,
@@ -93,8 +105,6 @@ impl FusedMoELayer {
         );
         drop(topk_ids);
 
-        // 4. GEMM 1: hidden_states × w1^T → [num_tokens * top_k, 2*intermediate]
-        //    No routing weight applied yet (apply_weights=false).
         let intermediate1 = kernels::fused_moe_gemm(
             *hidden_states,
             self.w1,
@@ -105,12 +115,11 @@ impl FusedMoELayer {
             num_tokens,
             self.top_k,
             MOE_BLOCK_SIZE,
-            false, // don't apply weights on first GEMM
+            false,
             &mut device.caching,
             stream,
         );
 
-        // 5. Activation: SiLU(gate) * up → [num_tokens * top_k, intermediate]
         let activated = kernels::silu_and_mul_fused(
             intermediate1.as_gpu_tensor(),
             self.intermediate_size,
@@ -119,11 +128,6 @@ impl FusedMoELayer {
         );
         drop(intermediate1);
 
-        // 6. GEMM 2: activated × w2^T → [num_tokens * top_k, hidden_size]
-        //    Apply routing weight here (apply_weights=true).
-        //    top_k=1 because the input is already [num_tokens * top_k, intermediate],
-        //    so sorted_token_ids should index directly (token_id / 1 = token_id).
-        //    Matches Python vLLM fused_experts_impl line 1907.
         let intermediate2 = kernels::fused_moe_gemm(
             activated.as_gpu_tensor(),
             self.w2,
@@ -131,10 +135,10 @@ impl FusedMoELayer {
             sorted_token_ids.as_gpu_tensor(),
             expert_ids.as_gpu_tensor(),
             num_tokens_post_padded.as_gpu_tensor(),
-            num_tokens * self.top_k, // M*top_k tokens in expanded input
-            1,                       // top_k=1: index directly into expanded input
+            num_tokens * self.top_k,
+            1,
             MOE_BLOCK_SIZE,
-            true, // apply routing weights
+            true,
             &mut device.caching,
             stream,
         );
@@ -144,7 +148,6 @@ impl FusedMoELayer {
         drop(expert_ids);
         drop(num_tokens_post_padded);
 
-        // 7. Reduce: sum across top_k experts → [num_tokens, hidden_size]
         let output = kernels::moe_sum(
             intermediate2.as_gpu_tensor(),
             num_tokens,
@@ -155,7 +158,6 @@ impl FusedMoELayer {
         );
         drop(intermediate2);
 
-        // 8. TP all-reduce: combine partial expert results across ranks.
         #[cfg(feature = "nccl")]
         if let Some(ref nccl) = self.tp_group {
             nccl.all_reduce_inplace(output.as_gpu_tensor())
@@ -163,6 +165,53 @@ impl FusedMoELayer {
         }
 
         output
+    }
+
+    /// Unfused MoE forward — per-expert cuBLAS GEMMs. Graph-capture-safe.
+    ///
+    /// ABLATION: just one expert GEMM to test if cuBLAS works during capture
+    /// for expert weight shapes.
+    unsafe fn forward_unfused(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        let num_tokens = hidden_states.dim(0);
+        let stream = device.compute_stream;
+        let out_features_w1 = self.w1.dim(1);
+
+        // Gate + topk (known capture-safe)
+        let router_logits =
+            self.gate
+                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+        let (topk_weights, topk_ids) = kernels::topk_softmax(
+            router_logits.as_gpu_tensor(),
+            self.top_k,
+            self.renormalize,
+            &mut device.caching,
+            stream,
+        );
+        drop(router_logits);
+        drop(topk_weights);
+        drop(topk_ids);
+
+        // ONE expert GEMM: input @ w1[0]^T
+        let expert_w = self.w1.narrow_dim0(0, 1).reshape(&[out_features_w1, self.hidden_size]);
+        let expert_out = device.cublas.gemm(
+            *hidden_states,
+            expert_w,
+            &mut device.caching,
+        );
+        drop(expert_out);
+
+        // Return zeros
+        let out = device.caching.alloc_tensor(
+            &[num_tokens, self.hidden_size],
+            hidden_states.dtype(),
+        );
+        crate::driver::memset_d8(out.raw_ptr(), 0, out.size_bytes(), stream)
+            .expect("memset");
+        out
     }
 }
 

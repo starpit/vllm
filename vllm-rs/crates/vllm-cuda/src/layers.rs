@@ -1007,8 +1007,8 @@ mod tests {
         fn test_linear_forward_f32() {
             let stream = init_cuda();
             unsafe {
-                let mut cublas = CublasHandle::new(stream).unwrap();
                 let mut arena = CachingAllocator::new();
+                let mut cublas = CublasHandle::new(stream, &mut arena).unwrap();
 
                 // Weight [2, 3] = [[1,0,0],[0,1,0]] (identity-ish)
                 let host_w = driver::mem_alloc_host(24).unwrap();
@@ -1120,8 +1120,8 @@ mod tests {
 
             let stream = init_cuda();
             unsafe {
-                let mut cublas = crate::cublas::CublasHandle::new(stream).unwrap();
                 let mut alloc = crate::alloc::CachingAllocator::new();
+                let mut cublas = crate::cublas::CublasHandle::new(stream, &mut alloc).unwrap();
 
                 // Weight shape: [out=8, in=8] → 64 elements → 32 packed bytes.
                 // Use blocksize=64 so all elements are in one block.
@@ -1300,8 +1300,8 @@ mod tests {
 
             let stream = init_cuda();
             unsafe {
-                let mut cublas = crate::cublas::CublasHandle::new(stream).unwrap();
                 let mut alloc = crate::alloc::CachingAllocator::new();
+                let mut cublas = crate::cublas::CublasHandle::new(stream, &mut alloc).unwrap();
 
                 // Simulate: q=[128, 64], k=[64, 64], v=[64, 64], blocksize=64
                 let in_features = 64usize;
@@ -1764,8 +1764,8 @@ mod fp8_block_tests {
     fn test_fp8_block_linear_forward() {
         let stream = init_cuda();
         unsafe {
-            let mut cublas = CublasHandle::new(stream).unwrap();
             let mut alloc = CachingAllocator::new();
+            let mut cublas = CublasHandle::new(stream, &mut alloc).unwrap();
 
             let n = 4usize;
             let k = 4usize;
@@ -1852,8 +1852,8 @@ mod fp8_block_tests {
     fn test_fp8_block_linear_no_leak() {
         let stream = init_cuda();
         unsafe {
-            let mut cublas = CublasHandle::new(stream).unwrap();
             let mut alloc = CachingAllocator::new();
+            let mut cublas = CublasHandle::new(stream, &mut alloc).unwrap();
 
             let n = 128usize;
             let k = 128usize;

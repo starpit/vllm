@@ -779,3 +779,78 @@ extern "C" void fused_moe_fp8_gemm_dequant(
             sorted_token_ids, expert_ids, num_tokens_post_padded,
             num_valid_tokens, in_features, out_features, top_k, apply_weights);
 }
+
+// =====================================================================
+// Gather kernels for unfused (graph-capture-safe) MoE path
+// =====================================================================
+
+// Gather top_k experts' outputs for each token from all-expert buffer.
+// all_expert_out: [num_experts, num_tokens, out_features] (BF16, row-major)
+// topk_ids:      [num_tokens * top_k] (int32, flat view of [num_tokens, top_k])
+// output:        [num_tokens * top_k, out_features] (BF16)
+__global__ void moe_expert_gather_bf16_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ all_expert_out,
+    const int32_t* __restrict__ topk_ids,
+    int num_tokens, int top_k, int out_features)
+{
+    int row = blockIdx.x;
+    if (row >= num_tokens * top_k) return;
+    int t = row / top_k;
+    int expert_id = topk_ids[row];
+    const __nv_bfloat16* src = all_expert_out + ((int64_t)expert_id * num_tokens + t) * out_features;
+    __nv_bfloat16* dst = output + (int64_t)row * out_features;
+    for (int f = threadIdx.x; f < out_features; f += blockDim.x)
+        dst[f] = src[f];
+}
+
+extern "C" void moe_expert_gather_bf16(
+    void* output, const void* all_expert_out, const int32_t* topk_ids,
+    int num_tokens, int top_k, int out_features, cudaStream_t stream)
+{
+    int num_rows = num_tokens * top_k;
+    int threads = out_features < 256 ? out_features : 256;
+    moe_expert_gather_bf16_kernel<<<num_rows, threads, 0, stream>>>(
+        (__nv_bfloat16*)output, (const __nv_bfloat16*)all_expert_out,
+        topk_ids, num_tokens, top_k, out_features);
+}
+
+// Gather top_k experts' w2 outputs, weight, and sum across top_k.
+// all_expert_out: [num_experts, num_tokens * top_k, out_features] (BF16)
+// topk_ids:      [num_tokens * top_k] (int32)
+// topk_weights:  [num_tokens * top_k] (float32)
+// output:        [num_tokens, out_features] (BF16)
+__global__ void moe_expert_gather_weighted_sum_bf16_kernel(
+    __nv_bfloat16* __restrict__ output,
+    const __nv_bfloat16* __restrict__ all_expert_out,
+    const int32_t* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights,
+    int num_tokens, int top_k, int out_features, int rows_per_expert)
+{
+    int t = blockIdx.x;
+    if (t >= num_tokens) return;
+    __nv_bfloat16* dst = output + (int64_t)t * out_features;
+    for (int f = threadIdx.x; f < out_features; f += blockDim.x) {
+        float acc = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+            int idx = t * top_k + k;
+            int expert_id = topk_ids[idx];
+            float w = topk_weights[idx];
+            acc += w * __bfloat162float(
+                all_expert_out[((int64_t)expert_id * rows_per_expert + idx) * out_features + f]);
+        }
+        dst[f] = __float2bfloat16(acc);
+    }
+}
+
+extern "C" void moe_expert_gather_weighted_sum_bf16(
+    void* output, const void* all_expert_out,
+    const int32_t* topk_ids, const float* topk_weights,
+    int num_tokens, int top_k, int out_features, int rows_per_expert,
+    cudaStream_t stream)
+{
+    int threads = out_features < 256 ? out_features : 256;
+    moe_expert_gather_weighted_sum_bf16_kernel<<<num_tokens, threads, 0, stream>>>(
+        (__nv_bfloat16*)output, (const __nv_bfloat16*)all_expert_out,
+        topk_ids, topk_weights, num_tokens, top_k, out_features, rows_per_expert);
+}

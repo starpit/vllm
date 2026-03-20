@@ -21,7 +21,7 @@ use cudarc::cublas::sys::{self, cublasComputeType_t, cublasHandle_t, cublasOpera
 use cudarc::cublaslt::sys as lt;
 use cudarc::driver::sys::CUstream;
 
-/// cuBLAS workspace size (4 MB — matches Python vLLM).
+/// cuBLAS workspace size (32 MB — matches Python vLLM).
 const CUBLAS_WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
 
 /// Cache key for a GEMM plan.
@@ -36,13 +36,23 @@ struct PlanKey {
     weight_trans: bool,
 }
 
-/// A cached cublasLt GEMM plan — holds pre-created descriptors and the best algorithm.
+/// Maximum number of candidate algorithms to request from the cuBLAS heuristic.
+/// If the top-ranked algorithm fails at runtime (e.g. during CUDA graph capture),
+/// we fall back to the next candidate.
+const MAX_ALGO_CANDIDATES: usize = 4;
+
+/// A cached cublasLt GEMM plan — holds pre-created descriptors and candidate algorithms.
+/// The first algorithm in `algos` is the heuristic's top pick; subsequent entries are
+/// fallbacks tried in order if the primary fails.
 struct GemmPlan {
     matmul_desc: lt::cublasLtMatmulDesc_t,
     layout_a: lt::cublasLtMatrixLayout_t,
     layout_b: lt::cublasLtMatrixLayout_t,
     layout_c: lt::cublasLtMatrixLayout_t,
-    algo: lt::cublasLtMatmulAlgo_t,
+    /// Candidate algorithms in heuristic-ranked order.
+    algos: Vec<lt::cublasLtMatmulAlgo_t>,
+    /// GEMM dimensions (for diagnostic messages on failure).
+    key: PlanKey,
 }
 
 impl Drop for GemmPlan {
@@ -105,9 +115,14 @@ unsafe impl Sync for CublasHandle {}
 impl CublasHandle {
     /// Create a new cuBLAS handle bound to `stream` with a pre-allocated workspace.
     ///
+    /// Workspace is allocated from the caching allocator (not raw cudaMalloc)
+    /// so it participates in the graph-aware memory pool during CUDA graph
+    /// capture — matching PyTorch's CublasHandlePool.cpp:getNewWorkspace()
+    /// which allocates via CUDACachingAllocator::get()->allocate().
+    ///
     /// # Safety
     /// `stream` must be a valid non-default CUDA stream.
-    pub unsafe fn new(stream: CUstream) -> Result<Self> {
+    pub unsafe fn new(stream: CUstream, alloc: &mut CachingAllocator) -> Result<Self> {
         let mut handle: cublasHandle_t = std::ptr::null_mut();
         check(sys::cublasCreate_v2(&mut handle))?;
 
@@ -120,8 +135,9 @@ impl CublasHandle {
             sys::cublasMath_t::CUBLAS_TF32_TENSOR_OP_MATH,
         ))?;
 
-        // Pre-allocate workspace (fixes CUDA graph capture).
-        let workspace = driver::mem_alloc(CUBLAS_WORKSPACE_SIZE)?;
+        // Allocate workspace from the caching allocator so it's part of the
+        // graph-aware pool during CUDA graph capture.
+        let workspace = alloc.alloc(CUBLAS_WORKSPACE_SIZE);
         check(sys::cublasSetWorkspace_v2(
             handle,
             workspace as *mut _,
@@ -253,7 +269,7 @@ impl CublasHandle {
         ))
         .expect("layout C");
 
-        // Get heuristic for best algorithm.
+        // Get heuristic for candidate algorithms (request multiple for fallback).
         let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
         check_lt(lt::cublasLtMatmulPreferenceCreate(&mut pref)).expect("pref create");
         let ws_size = CUBLAS_WORKSPACE_SIZE;
@@ -265,7 +281,8 @@ impl CublasHandle {
         ))
         .expect("set pref workspace");
 
-        let mut heuristic = std::mem::zeroed::<lt::cublasLtMatmulHeuristicResult_t>();
+        let mut heuristics =
+            vec![std::mem::zeroed::<lt::cublasLtMatmulHeuristicResult_t>(); MAX_ALGO_CANDIDATES];
         let mut algo_count: i32 = 0;
         check_lt(lt::cublasLtMatmulAlgoGetHeuristic(
             self.lt_handle,
@@ -275,8 +292,8 @@ impl CublasHandle {
             layout_c,
             layout_c, // D layout = C layout
             pref,
-            1,
-            &mut heuristic,
+            MAX_ALGO_CANDIDATES as i32,
+            heuristics.as_mut_ptr(),
             &mut algo_count,
         ))
         .expect("cublasLtMatmulAlgoGetHeuristic failed");
@@ -284,15 +301,210 @@ impl CublasHandle {
 
         lt::cublasLtMatmulPreferenceDestroy(pref);
 
+        let algos: Vec<lt::cublasLtMatmulAlgo_t> = heuristics[..algo_count as usize]
+            .iter()
+            .map(|h| h.algo)
+            .collect();
+
         let plan = GemmPlan {
             matmul_desc,
             layout_a,
             layout_b,
             layout_c,
-            algo: heuristic.algo,
+            algos,
+            key,
         };
 
         self.plans.insert(key, plan);
+    }
+
+    /// Execute a GEMM, handling both capture and non-capture paths.
+    ///
+    /// During CUDA graph capture, goes straight to cublasGemmEx without
+    /// creating cublasLt plans (plan creation via cublasLtMatmulAlgoGetHeuristic
+    /// can poison the capture). Outside capture, creates/caches cublasLt plans
+    /// for optimal algorithm selection.
+    unsafe fn run_gemm(
+        &mut self,
+        key: PlanKey,
+        a_ptr: *const std::ffi::c_void,
+        b_ptr: *const std::ffi::c_void,
+        out_ptr: *mut std::ffi::c_void,
+    ) {
+        let _capture_guard = crate::alloc::RelaxedCaptureModeGuard::new();
+
+        let is_capturing = {
+            let mut status =
+                cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+            let ret = cudarc::driver::sys::cuStreamIsCapturing(self.stream, &mut status);
+            if ret == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                match status {
+                    cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE => true,
+                    cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_INVALIDATED => {
+                        panic!(
+                            "CUDA graph capture already INVALIDATED before GEMM [M={}, K={}, N={}] {:?}",
+                            key.m, key.k, key.n, key.dtype,
+                        );
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            }
+        };
+
+        if is_capturing {
+            // Skip ensure_plan — cublasLtMatmulAlgoGetHeuristic can poison capture.
+            self.gemm_ex(&key, a_ptr, b_ptr, out_ptr);
+            return;
+        }
+
+        // Outside capture: use cublasLt with cached plans.
+        self.ensure_plan(key.m, key.k, key.n, key.dtype, key.has_bias, key.weight_trans);
+        let plan = &self.plans[&key];
+        self.run_matmul_with_fallback(plan, a_ptr, b_ptr, out_ptr);
+    }
+
+    /// Run a GEMM using cublasLt with fallback to cublasGemmEx.
+    /// Only called outside CUDA graph capture (capture path uses run_gemm directly).
+    unsafe fn run_matmul_with_fallback(
+        &self,
+        plan: &GemmPlan,
+        a_ptr: *const std::ffi::c_void,
+        b_ptr: *const std::ffi::c_void,
+        out_ptr: *mut std::ffi::c_void,
+    ) {
+        let k = &plan.key;
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+
+        for (i, algo) in plan.algos.iter().enumerate() {
+            let status = lt::cublasLtMatmul(
+                self.lt_handle,
+                plan.matmul_desc,
+                &alpha as *const f32 as *const _,
+                a_ptr,
+                plan.layout_a,
+                b_ptr,
+                plan.layout_b,
+                &beta as *const f32 as *const _,
+                out_ptr,
+                plan.layout_c,
+                out_ptr,
+                plan.layout_c,
+                algo,
+                self.workspace as *mut _,
+                CUBLAS_WORKSPACE_SIZE,
+                self.stream as _,
+            );
+            if status == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                if i > 0 {
+                    tracing::warn!(
+                        "cublasLtMatmul: primary algo failed for GEMM [M={}, K={}, N={}] {:?}, \
+                         fell back to candidate #{}",
+                        k.m,
+                        k.k,
+                        k.n,
+                        k.dtype,
+                        i + 1
+                    );
+                }
+                return;
+            }
+            tracing::debug!(
+                "cublasLtMatmul algo #{} failed ({:?}) for GEMM [M={}, K={}, N={}] {:?}",
+                i + 1,
+                status,
+                k.m,
+                k.k,
+                k.n,
+                k.dtype,
+            );
+        }
+
+        // All cublasLt algorithms failed outside capture — fall back to cublasGemmEx.
+        tracing::warn!(
+            "cublasLtMatmul: all {} algos failed for GEMM [M={}, K={}, N={}] {:?}, \
+             falling back to cublasGemmEx",
+            plan.algos.len(),
+            k.m,
+            k.k,
+            k.n,
+            k.dtype,
+        );
+        self.gemm_ex(k, a_ptr, b_ptr, out_ptr);
+    }
+
+    /// cublasGemmEx — always capture-safe.
+    ///
+    /// Uses CUBLAS_GEMM_DEFAULT which lets cuBLAS pick the algorithm
+    /// internally, matching PyTorch's default GEMM path.
+    /// Primary path during CUDA graph capture; fallback outside capture.
+    unsafe fn gemm_ex(
+        &self,
+        k: &PlanKey,
+        a_ptr: *const std::ffi::c_void,
+        b_ptr: *const std::ffi::c_void,
+        out_ptr: *mut std::ffi::c_void,
+    ) {
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+
+        let (_compute_type, data_type) = gemm_types(k.dtype);
+
+        // cublasGemmEx uses column-major convention.
+        // Our row-major C = A @ B^T becomes col-major C^T = B @ A^T.
+        //   cuBLAS op: C_col(N,M) = B_col(N,K) * A_col^T(K,M)
+        //     transa = T (transpose A_col to get K×M → M×K → matches our A row-major)
+        //     transb = N (B_col is K×N which is B row-major [N,K] reinterpreted)
+        //
+        // Wait — this is the same mapping as cublasLt:
+        //   cuBLAS A = our weight b [N,K] row = [K,N] col, transa = T → [N,K]
+        //   cuBLAS B = our activation a [M,K] row = [K,M] col, transb = N → [K,M]
+        //   result: [N,K] × [K,M] = [N,M] col = [M,N] row ✓
+        let (transa, transb) = if k.weight_trans {
+            (
+                cublasOperation_t::CUBLAS_OP_T,
+                cublasOperation_t::CUBLAS_OP_N,
+            )
+        } else {
+            (
+                cublasOperation_t::CUBLAS_OP_N,
+                cublasOperation_t::CUBLAS_OP_N,
+            )
+        };
+
+        let (lda, ldb) = if k.weight_trans {
+            (k.k as i32, k.k as i32) // weight [N,K] col has ld=K; activation [M,K] col has ld=K
+        } else {
+            (k.n as i32, k.k as i32) // weight [K,N] col has ld=N; activation [M,K] col has ld=K
+        };
+
+        let status = sys::cublasGemmEx(
+            self.handle,
+            transa,
+            transb,
+            k.n as i32, // M in col-major = N (output rows)
+            k.m as i32, // N in col-major = M (output cols)
+            k.k as i32, // K
+            &alpha as *const f32 as *const _,
+            a_ptr, // cuBLAS A = our weight (b)
+            data_type,
+            lda,
+            b_ptr, // cuBLAS B = our activation (a)
+            data_type,
+            ldb,
+            &beta as *const f32 as *const _,
+            out_ptr,
+            data_type,
+            k.n as i32, // ldc = N (output leading dim in col-major)
+            _compute_type,
+            sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        );
+        check(status).expect(&format!(
+            "cublasGemmEx failed for GEMM [M={}, K={}, N={}] {:?}",
+            k.m, k.k, k.n, k.dtype,
+        ));
     }
 
     /// GEMM: out = A @ B^T
@@ -322,8 +534,6 @@ impl CublasHandle {
         let dtype = a.dtype();
 
         let out = alloc.alloc_tensor(&[m, n], dtype);
-
-        self.ensure_plan(m, k, n, dtype, false, true);
         let key = PlanKey {
             m,
             k,
@@ -332,30 +542,13 @@ impl CublasHandle {
             has_bias: false,
             weight_trans: true,
         };
-        let plan = &self.plans[&key];
 
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-
-        check_lt(lt::cublasLtMatmul(
-            self.lt_handle,
-            plan.matmul_desc,
-            &alpha as *const f32 as *const _,
+        self.run_gemm(
+            key,
             b.as_ptr::<u8>() as *const _,
-            plan.layout_a,
             a.as_ptr::<u8>() as *const _,
-            plan.layout_b,
-            &beta as *const f32 as *const _,
             out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
-            plan.layout_c,
-            out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
-            plan.layout_c,
-            &plan.algo,
-            self.workspace as *mut _,
-            CUBLAS_WORKSPACE_SIZE,
-            self.stream as _,
-        ))
-        .expect("cublasLtMatmul failed");
+        );
 
         out
     }
@@ -383,8 +576,6 @@ impl CublasHandle {
         let dtype = a.dtype();
 
         let out = alloc.alloc_tensor(&[m, n], dtype);
-
-        self.ensure_plan(m, k, n, dtype, true, true);
         let key = PlanKey {
             m,
             k,
@@ -393,6 +584,10 @@ impl CublasHandle {
             has_bias: true,
             weight_trans: true,
         };
+
+        // Bias requires cublasLt (not supported by gemm_ex fallback).
+        // ensure_plan + cublasLt path; shapes should be cached from warmup.
+        self.ensure_plan(m, k, n, dtype, true, true);
         let plan = &self.plans[&key];
 
         let bias_ptr = bias.raw_ptr() as *const std::ffi::c_void;
@@ -404,28 +599,12 @@ impl CublasHandle {
         ))
         .expect("set BIAS_POINTER failed");
 
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-
-        check_lt(lt::cublasLtMatmul(
-            self.lt_handle,
-            plan.matmul_desc,
-            &alpha as *const f32 as *const _,
+        self.run_matmul_with_fallback(
+            plan,
             b.as_ptr::<u8>() as *const _,
-            plan.layout_a,
             a.as_ptr::<u8>() as *const _,
-            plan.layout_b,
-            &beta as *const f32 as *const _,
             out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
-            plan.layout_c,
-            out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
-            plan.layout_c,
-            &plan.algo,
-            self.workspace as *mut _,
-            CUBLAS_WORKSPACE_SIZE,
-            self.stream as _,
-        ))
-        .expect("cublasLtMatmul failed");
+        );
 
         out
     }
@@ -457,8 +636,6 @@ impl CublasHandle {
         let dtype = a.dtype();
 
         let out = alloc.alloc_tensor(&[m, n], dtype);
-
-        self.ensure_plan(m, k, n, dtype, false, false);
         let key = PlanKey {
             m,
             k,
@@ -467,30 +644,13 @@ impl CublasHandle {
             has_bias: false,
             weight_trans: false,
         };
-        let plan = &self.plans[&key];
 
-        let alpha: f32 = 1.0;
-        let beta: f32 = 0.0;
-
-        check_lt(lt::cublasLtMatmul(
-            self.lt_handle,
-            plan.matmul_desc,
-            &alpha as *const f32 as *const _,
+        self.run_gemm(
+            key,
             b.as_ptr::<u8>() as *const _,
-            plan.layout_a,
             a.as_ptr::<u8>() as *const _,
-            plan.layout_b,
-            &beta as *const f32 as *const _,
             out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
-            plan.layout_c,
-            out.as_gpu_tensor().as_mut_ptr::<u8>() as *mut _,
-            plan.layout_c,
-            &plan.algo,
-            self.workspace as *mut _,
-            CUBLAS_WORKSPACE_SIZE,
-            self.stream as _,
-        ))
-        .expect("cublasLtMatmul failed");
+        );
 
         out
     }
@@ -877,10 +1037,10 @@ impl CublasHandle {
                 }
             }
 
-            // Update the plan with the best algorithm.
+            // Update the plan: move the best algorithm to the front.
             if best_algo_idx != 0 {
                 let plan = self.plans.get_mut(key).unwrap();
-                plan.algo = heuristics[best_algo_idx].algo;
+                plan.algos.swap(0, best_algo_idx);
                 let speedup = (1.0 - best_time / heuristic_time) * 100.0;
                 tracing::info!(
                     "  GEMM M={} K={} N={}: algo #{} is {:.1}% faster ({:.3}ms vs {:.3}ms)",
@@ -917,7 +1077,8 @@ impl Drop for CublasHandle {
         unsafe {
             let _ = lt::cublasLtDestroy(self.lt_handle);
             let _ = sys::cublasDestroy_v2(self.handle);
-            let _ = driver::mem_free(self.workspace);
+            // workspace is owned by the CachingAllocator — freed when
+            // the allocator is dropped or release_all() is called.
         }
     }
 }
@@ -1031,7 +1192,7 @@ mod tests {
     #[test]
     fn test_cublas_create_and_drop() {
         let stream = init_cuda();
-        let handle = unsafe { CublasHandle::new(stream).unwrap() };
+        let handle = unsafe { CublasHandle::new(stream, &mut CachingAllocator::new()).unwrap() };
         assert!(!handle.raw_handle().is_null());
         drop(handle);
         unsafe { driver::stream_destroy(stream).unwrap() };
@@ -1041,7 +1202,7 @@ mod tests {
     fn test_gemm_f32_identity() {
         let stream = init_cuda();
         unsafe {
-            let mut handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream, &mut CachingAllocator::new()).unwrap();
             let mut arena = CachingAllocator::new();
 
             // A = [2, 3], B = identity-like [3, 3]
@@ -1102,7 +1263,7 @@ mod tests {
     fn test_gemm_f32_known_values() {
         let stream = init_cuda();
         unsafe {
-            let mut handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream, &mut CachingAllocator::new()).unwrap();
             let mut arena = CachingAllocator::new();
 
             // A = [[1, 2], [3, 4]] (2x2)
@@ -1151,7 +1312,7 @@ mod tests {
     fn test_gemm_non_square() {
         let stream = init_cuda();
         unsafe {
-            let mut handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream, &mut CachingAllocator::new()).unwrap();
             let mut arena = CachingAllocator::new();
 
             // A = [4, 8], B = [16, 8] → C = [4, 16]
@@ -1194,7 +1355,7 @@ mod tests {
     fn test_gemm_output_from_arena() {
         let stream = init_cuda();
         unsafe {
-            let mut handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream, &mut CachingAllocator::new()).unwrap();
             let mut arena = CachingAllocator::new();
 
             let gpu_a = driver::mem_alloc(64).unwrap();
@@ -1223,7 +1384,7 @@ mod tests {
     fn test_gemm_bias_f32() {
         let stream = init_cuda();
         unsafe {
-            let mut handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream, &mut CachingAllocator::new()).unwrap();
             let mut arena = CachingAllocator::new();
 
             // A = [[1, 2], [3, 4]] (2x2)
@@ -1279,7 +1440,7 @@ mod tests {
     fn test_plan_caching() {
         let stream = init_cuda();
         unsafe {
-            let mut handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream, &mut CachingAllocator::new()).unwrap();
             assert_eq!(handle.plans.len(), 0);
 
             // First call creates a plan.
@@ -1306,7 +1467,7 @@ mod tests {
     fn test_fp8_plan_caching() {
         let stream = init_cuda();
         unsafe {
-            let mut handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream, &mut CachingAllocator::new()).unwrap();
             assert_eq!(handle.fp8_plans.len(), 0);
 
             // First call creates an FP8 plan.
@@ -1336,7 +1497,7 @@ mod tests {
         // A = FP8 [M, K], B = FP8 [N, K], output = BF16 [M, N]
         let stream = init_cuda();
         unsafe {
-            let mut handle = CublasHandle::new(stream).unwrap();
+            let mut handle = CublasHandle::new(stream, &mut CachingAllocator::new()).unwrap();
             let mut alloc = crate::alloc::CachingAllocator::new();
 
             // FP8 cublasLt requires 16-aligned dimensions on SM89.

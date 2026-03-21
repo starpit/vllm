@@ -2181,6 +2181,25 @@ pub fn emit_store_c(
     let row_b0_x_n = ptx.regs.alloc_b32();
     ptx.mul_lo_s32(row_b0_x_n, row_b0, n_param);
 
+    // Hoist constant "4" register out of the inner loops (constant folding).
+    let four = ptx.regs.alloc_b32();
+    ptx.mov_b32_imm(four, 4);
+
+    // Pre-allocate reusable registers for store address computation.
+    // These are dead-after-use and can be reused across (rm, rn) iterations.
+    let col_base = ptx.regs.alloc_b32();
+    let col0 = ptx.regs.alloc_b32();
+    let idx0 = ptx.regs.alloc_b32();
+    let idx2 = ptx.regs.alloc_b32();
+    // Reusable b64 address registers: one for row_a, one for row_b.
+    // We use st.global.v2.b32 to store (d0,d1) and (d2,d3) together,
+    // since they are at adjacent columns (tg*2 and tg*2+1) in the same row.
+    let addr_a = ptx.regs.alloc_b64();
+    let addr_b = ptx.regs.alloc_b64();
+    // Row stride in bytes for advancing between rm groups: N * 4 bytes (f32 output)
+    let n_stride = ptx.regs.alloc_b64();
+    ptx.mul_wide_u32(n_stride, n_param, four);
+
     for rm in 0..acc.reg_m {
         let (ra_x_n, rb_x_n) = if rm == 0 {
             (row_a0_x_n, row_b0_x_n)
@@ -2198,40 +2217,24 @@ pub fn emit_store_c(
 
         for rn in 0..acc.reg_n {
             let ai = (rm * acc.reg_n + rn) as usize;
-            let col_base = ptx.regs.alloc_b32();
             if rn > 0 {
                 ptx.add_s32_imm(col_base, warp_col_base, (rn * c.mma_n) as i32);
             } else {
                 ptx.mov_b32(col_base, warp_col_base);
             }
-            let col0 = ptx.regs.alloc_b32();
             ptx.add_s32(col0, col_base, tg2);
 
-            let idx0 = ptx.regs.alloc_b32();
+            // row_a address: output_ptr + (ra_x_n + col0) * 4
             ptx.add_s32(idx0, ra_x_n, col0);
-            let idx1 = ptx.regs.alloc_b32();
-            ptx.add_s32_imm(idx1, idx0, 1);
-            let idx2 = ptx.regs.alloc_b32();
+            ptx.mad_wide_s32(addr_a, idx0, four, output_ptr);
+            // Store d0,d1 as v2 (adjacent columns tg*2 and tg*2+1)
+            ptx.st_global_v2_b32(addr_a, 0, acc.regs[ai][0], acc.regs[ai][1]);
+
+            // row_b address: output_ptr + (rb_x_n + col0) * 4
             ptx.add_s32(idx2, rb_x_n, col0);
-            let idx3 = ptx.regs.alloc_b32();
-            ptx.add_s32_imm(idx3, idx2, 1);
-
-            let four = ptx.regs.alloc_b32();
-            ptx.mov_b32_imm(four, 4);
-
-            let addr0 = ptx.regs.alloc_b64();
-            ptx.mad_wide_s32(addr0, idx0, four, output_ptr);
-            let addr1 = ptx.regs.alloc_b64();
-            ptx.mad_wide_s32(addr1, idx1, four, output_ptr);
-            let addr2 = ptx.regs.alloc_b64();
-            ptx.mad_wide_s32(addr2, idx2, four, output_ptr);
-            let addr3 = ptx.regs.alloc_b64();
-            ptx.mad_wide_s32(addr3, idx3, four, output_ptr);
-
-            ptx.st_global_b32(addr0, 0, acc.regs[ai][0]);
-            ptx.st_global_b32(addr1, 0, acc.regs[ai][1]);
-            ptx.st_global_b32(addr2, 0, acc.regs[ai][2]);
-            ptx.st_global_b32(addr3, 0, acc.regs[ai][3]);
+            ptx.mad_wide_s32(addr_b, idx2, four, output_ptr);
+            // Store d2,d3 as v2 (adjacent columns tg*2 and tg*2+1, row+8)
+            ptx.st_global_v2_b32(addr_b, 0, acc.regs[ai][2], acc.regs[ai][3]);
         }
     }
 }

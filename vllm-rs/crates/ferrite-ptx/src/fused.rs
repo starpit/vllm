@@ -386,6 +386,7 @@ pub fn build_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
     let k_offset_reg = ptx.regs.alloc_b32();
     ptx.mov_b32_imm(k_offset_reg, 0);
 
+    let k_warp_iters = c.bk / c.mma_k;
     let transform = RmsNormAtom::new(
         &mut ptx,
         norm_factors_base,
@@ -394,6 +395,7 @@ pub fn build_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
         setup.tg,
         k_offset_reg,
         c.reg_m(),
+        k_warp_iters,
         warp_m_offset,
     );
 

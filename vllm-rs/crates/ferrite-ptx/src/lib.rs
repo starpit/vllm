@@ -519,6 +519,16 @@ impl PtxBuilder {
             self.w(&format!("st.global.b32 \t[{addr}+{offset}], {val};"));
         }
     }
+    /// Store two b32 values as a vector pair (st.global.v2.b32).
+    /// The two values are stored at consecutive 4-byte addresses starting at [addr+offset].
+    pub fn st_global_v2_b32(&mut self, addr: Reg, offset: i32, val0: Reg, val1: Reg) {
+        let addr_str = if offset == 0 {
+            format!("[{addr}]")
+        } else {
+            format!("[{addr}+{offset}]")
+        };
+        self.w(&format!("st.global.v2.b32 \t{addr_str}, {{{val0}, {val1}}};"));
+    }
 
     // -- Vectorized loads --
 

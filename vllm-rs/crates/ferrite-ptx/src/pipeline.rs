@@ -26,6 +26,16 @@ use crate::gemm::{GemmSetup, AccumulatorMap};
 //
 // The atoms don't know about double-buffering, pipeline stages, or sync.
 // The pipeline does ALL scheduling.
+//
+// Compiler optimizations applied:
+// 1. Register reuse: K-loop temporaries (buf_base, b_addr, a_addr, cp dst
+//    regs) are allocated ONCE before the loop and reused each iteration.
+// 2. CSE: cp.async smem destinations use pre-swizzled offsets (a_cp_off,
+//    b_cp_off) added to write_buf_base only once, not per-chunk.
+// 3. LICM: ldmatrix swizzle offsets, B column group strides, and all
+//    constant address components are computed before the loop.
+// 4. Constant folding: b_start, chunk offsets, and rm offsets are folded
+//    into immediate operands of add/ldmatrix instructions.
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub struct MainloopPipeline {
@@ -159,20 +169,26 @@ impl MainloopPipeline {
 
         // ═══════════════════════════════════════════════════════════════
         // PROLOGUE: Load (stages-1) tiles into shared memory
+        //
+        // OPTIMIZATION: Instead of creating separate ga_cur/gb_cur copies
+        // and then ga_loop/gb_loop copies, we allocate the loop pointers
+        // first and use them directly for prologue loads. This eliminates
+        // cp_chunks_a + cp_chunks_b extra b64 register allocations.
         // ═══════════════════════════════════════════════════════════════
 
-        // Track current global pointers (will advance through prologue)
-        let mut ga_cur: Vec<Reg> = Vec::new();
+        // Allocate the loop global pointers (these will be advanced through
+        // prologue and then used in the K-loop)
+        let mut ga_loop: Vec<Reg> = Vec::new();
         for &g in &ga_all {
             let r = ptx.regs.alloc_b64();
             ptx.mov_b64(r, g);
-            ga_cur.push(r);
+            ga_loop.push(r);
         }
-        let mut gb_cur: Vec<Reg> = Vec::new();
+        let mut gb_loop: Vec<Reg> = Vec::new();
         for &g in &gb_all {
             let r = ptx.regs.alloc_b64();
             ptx.mov_b64(r, g);
-            gb_cur.push(r);
+            gb_loop.push(r);
         }
 
         for stage in 0..stages - 1 {
@@ -187,7 +203,7 @@ impl MainloopPipeline {
             for i in 0..cp_chunks_a as usize {
                 let a_dst = ptx.regs.alloc_b32();
                 ptx.add_s32_imm(a_dst, a_st[i], (stage * a_tile_bytes) as i32);
-                copy_a.emit_async_copy(ptx, a_dst, ga_cur[i], sz);
+                copy_a.emit_async_copy(ptx, a_dst, ga_loop[i], sz);
             }
             copy_a.emit_commit(ptx);
 
@@ -195,47 +211,23 @@ impl MainloopPipeline {
             for i in 0..cp_chunks_b as usize {
                 let b_dst = ptx.regs.alloc_b32();
                 ptx.add_s32_imm(b_dst, b_cp[i], (stage * b_tile_bytes) as i32);
-                copy_b.emit_async_copy(ptx, b_dst, gb_cur[i], sz);
+                copy_b.emit_async_copy(ptx, b_dst, gb_loop[i], sz);
             }
             copy_b.emit_commit(ptx);
             ptx.blank();
 
-            // Advance global pointers to next tile (if not last prologue stage)
-            if stage < stages - 2 {
-                ptx.comment(&format!("Advance global pointers for tile {}", stage + 1));
-                for g in &ga_cur {
-                    ptx.add_s64_imm(*g, *g, (c.bk * 2) as i64);
-                }
-                for g in &gb_cur {
-                    ptx.add_s64(*g, *g, b_stride_bytes);
-                }
-                // Advance extra state
-                if let Some(adv) = extra_advance {
-                    adv(ptx);
-                }
+            // Advance global pointers to next tile
+            ptx.comment(&format!("Advance global pointers for tile {}", stage + 1));
+            for g in &ga_loop {
+                ptx.add_s64_imm(*g, *g, (c.bk * 2) as i64);
             }
-        }
-
-        // ═══════════════════════════════════════════════════════════════
-        // Advance global ptrs past prologue (for the loop's async copies)
-        // ga_cur currently points at tile (stages-2). Advance once more.
-        // ═══════════════════════════════════════════════════════════════
-        ptx.comment(&format!("Advance global ptrs to tile {} position (for loop's loads)", stages - 1));
-        let mut ga_loop: Vec<Reg> = Vec::new();
-        for &g in &ga_cur {
-            let r = ptx.regs.alloc_b64();
-            ptx.add_s64_imm(r, g, (c.bk * 2) as i64);
-            ga_loop.push(r);
-        }
-        let mut gb_loop: Vec<Reg> = Vec::new();
-        for &g in &gb_cur {
-            let r = ptx.regs.alloc_b64();
-            ptx.add_s64(r, g, b_stride_bytes);
-            gb_loop.push(r);
-        }
-        // Advance extra state for the last prologue-to-loop transition
-        if let Some(adv) = extra_advance {
-            adv(ptx);
+            for g in &gb_loop {
+                ptx.add_s64(*g, *g, b_stride_bytes);
+            }
+            // Advance extra state
+            if let Some(adv) = extra_advance {
+                adv(ptx);
+            }
         }
         ptx.blank();
 
@@ -415,6 +407,60 @@ impl MainloopPipeline {
         let wait_count = total_async_per_tile * (stages - 2);
 
         // ═══════════════════════════════════════════════════════════════
+        // Pre-allocate K-loop temporary registers (OPTIMIZATION: register reuse)
+        //
+        // Instead of allocating new registers inside the K-loop body
+        // (which inflates the register declaration and prevents reuse),
+        // we allocate them once here and reuse them every iteration.
+        // This matches the hand-written PTX pattern where a fixed set of
+        // registers is reused across iterations.
+        // ═══════════════════════════════════════════════════════════════
+        let buf_base = ptx.regs.alloc_b32();       // read buffer base (smem)
+        let read_off = ptx.regs.alloc_b32();        // read_stage * tile_bytes
+        let write_buf_base = ptx.regs.alloc_b32();  // write buffer base (smem)
+        let write_off = ptx.regs.alloc_b32();       // write_stage * tile_bytes
+        let b_addr = ptx.regs.alloc_b32();          // reused for each B ldmatrix address
+        let a_addr = ptx.regs.alloc_b32();          // reused for each A ldmatrix address
+
+        // Pre-allocate cp.async destination registers (one per chunk, reused each iter)
+        let mut a_dst_regs: Vec<Reg> = Vec::with_capacity(cp_chunks_a as usize);
+        for _ in 0..cp_chunks_a {
+            a_dst_regs.push(ptx.regs.alloc_b32());
+        }
+        let mut b_dst_regs: Vec<Reg> = Vec::with_capacity(cp_chunks_b as usize);
+        for _ in 0..cp_chunks_b {
+            b_dst_regs.push(ptx.regs.alloc_b32());
+        }
+
+        // Pre-allocate cp_size and predicates for the loop
+        let cp_size = ptx.regs.alloc_b32();
+        let p_load = ptx.regs.alloc_pred();
+        let next_read = ptx.regs.alloc_b32();
+        let p_wrap_r = ptx.regs.alloc_pred();
+        let next_write = ptx.regs.alloc_b32();
+        let p_wrap_w = ptx.regs.alloc_pred();
+        let p_loop = ptx.regs.alloc_pred();
+
+        // Pre-allocate A fragment registers (4 regs per ldmatrix, reused each ki/rm)
+        let mut a_frag = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+                          ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+
+        // Pre-allocate B fragment registers.
+        // Each rn needs 4*b_ld_groups registers. These are all live simultaneously
+        // during the MMA phase, so they cannot be reused across rn values.
+        // However, they CAN be reused across K-loop iterations.
+        let mut b_frags: Vec<Vec<Reg>> = Vec::new();
+        for _rn in 0..reg_n as usize {
+            let mut frag_regs = Vec::new();
+            for _grp in 0..b_ld_groups as usize {
+                for _ in 0..4 {
+                    frag_regs.push(ptx.regs.alloc_b32());
+                }
+            }
+            b_frags.push(frag_regs);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
         // K-LOOP
         // ═══════════════════════════════════════════════════════════════
         ptx.label("$L_KLOOP");
@@ -424,12 +470,9 @@ impl MainloopPipeline {
         ptx.bar_sync(0);
 
         // Compute read buffer base: smem_base + read_stage * a_tile_bytes
-        let buf_base = ptx.regs.alloc_b32();
-        {
-            let read_off = ptx.regs.alloc_b32();
-            ptx.shl_b32(read_off, read_stage, a_tile_bytes.trailing_zeros());
-            ptx.add_s32(buf_base, smem_base, read_off);
-        }
+        // (OPTIMIZATION: reuses pre-allocated buf_base and read_off)
+        ptx.shl_b32(read_off, read_stage, a_tile_bytes.trailing_zeros());
+        ptx.add_s32(buf_base, smem_base, read_off);
         ptx.blank();
 
         // ── ldmatrix.trans B ──
@@ -437,41 +480,35 @@ impl MainloopPipeline {
         // Group 0: rows 0-31 (4 regs), Group 1: rows 32-63 (4 more regs).
         // b_frags[rn] has 4*b_ld_groups registers total.
         //
-        // For BN=128, the B column group offset differs from the K-row group offset.
-        // The ldmatrix.trans addresses use b_off[rn] which already encodes the
-        // column group offset. The K-row group offset (for BK>32) is at
-        // grp * 32 * BN * 2 bytes from the B region start.
+        // OPTIMIZATION: reuse single b_addr register for all rn values.
+        // Each b_addr computation (buf_base + b_off[rn]) produces a value
+        // that is consumed immediately by ldmatrix, then dead.
         ptx.comment(&format!("ldmatrix.trans B -- {} loads x {} groups", reg_n, b_ld_groups));
-        let mut b_frags: Vec<Vec<Reg>> = Vec::new();
         for rn in 0..reg_n as usize {
-            let mut frag_regs = Vec::new();
             for grp in 0..b_ld_groups as usize {
-                let b_addr = ptx.regs.alloc_b32();
                 ptx.add_s32(b_addr, buf_base, b_off[rn]);
                 // Add offset for additional K-row groups:
                 // Group 0 is at b_start (rows 0-31).
                 // Group 1 is at b_start + 32*BN*2 (rows 32-63).
                 let grp_off = b_start + (grp as i32) * (32 * c.bn as i32 * 2);
-                let frag = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                            ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+                let frag_base = grp * 4;
+                let frag = [b_frags[rn][frag_base], b_frags[rn][frag_base + 1],
+                            b_frags[rn][frag_base + 2], b_frags[rn][frag_base + 3]];
                 ptx.ldmatrix_x4_trans(frag, b_addr, Some(grp_off));
-                frag_regs.extend_from_slice(&frag);
             }
-            b_frags.push(frag_regs);
         }
         ptx.blank();
 
         // ── Unrolled ki loop: for each ki, load A, transform, MMA ──
+        // OPTIMIZATION: reuse a_addr and a_frag registers across ki/rm iterations.
+        // a_frag values are consumed by MMA before the next ldmatrix overwrites them.
         for ki in 0..k_warp_iters as usize {
             ptx.comment(&format!("ki={ki}: ldmatrix A + transform + MMA"));
             transform_a.emit_k_setup(ptx, ki as u32);
-            let a_addr = ptx.regs.alloc_b32();
             ptx.add_s32(a_addr, buf_base, a_off[ki]);
 
             // A fragments for each rm, immediately consumed by MMA
             for rm in 0..reg_m as usize {
-                let mut a_frag = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                                  ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
                 // Each rm occupies a 2048-byte chunk within the A tile.
                 // rm=0 at +0, rm=1 at +2048, rm=2 at +4096, rm=3 at +6144.
                 let a_rm_off = if rm == 0 { None } else { Some((rm as i32) * 2048_i32) };
@@ -490,65 +527,52 @@ impl MainloopPipeline {
         }
 
         // ── Predicated loads for next tile ──
-        let p_load = ptx.regs.alloc_pred();
+        // OPTIMIZATION: reuse pre-allocated p_load, cp_size, write_buf_base,
+        // a_dst_regs, b_dst_regs, next_read/write, p_wrap registers
         ptx.setp_lt_s32(p_load, k_counter, k_minus_stages_bk);
 
         ptx.comment("Predicated loads for next tile");
-        let cp_size = ptx.regs.alloc_b32();
         ptx.selp_b32(cp_size, 16, 0, p_load);
 
         // Compute write buffer base: smem_base + write_stage * a_tile_bytes
-        let write_buf_base = ptx.regs.alloc_b32();
-        {
-            let write_off = ptx.regs.alloc_b32();
-            ptx.shl_b32(write_off, write_stage, a_tile_bytes.trailing_zeros());
-            ptx.add_s32(write_buf_base, smem_base, write_off);
-        }
+        ptx.shl_b32(write_off, write_stage, a_tile_bytes.trailing_zeros());
+        ptx.add_s32(write_buf_base, smem_base, write_off);
 
         ptx.bar_sync(0);
 
         // A next tile
-        for i in 0..cp_chunks_a as usize {
-            let a_dst = ptx.regs.alloc_b32();
-            ptx.add_s32(a_dst, write_buf_base, a_cp_off);
-            if i > 0 {
-                ptx.add_s32_imm(a_dst, a_dst, (i * 2048) as i32);
-            }
-            copy_a.emit_async_copy(ptx, a_dst, ga_loop[i], cp_size);
+        // OPTIMIZATION: compute write_buf_base + a_cp_off once into a_dst_regs[0],
+        // then offset subsequent chunks from it.
+        ptx.add_s32(a_dst_regs[0], write_buf_base, a_cp_off);
+        copy_a.emit_async_copy(ptx, a_dst_regs[0], ga_loop[0], cp_size);
+        for i in 1..cp_chunks_a as usize {
+            ptx.add_s32_imm(a_dst_regs[i], a_dst_regs[0], (i * 2048) as i32);
+            copy_a.emit_async_copy(ptx, a_dst_regs[i], ga_loop[i], cp_size);
         }
         copy_a.emit_commit(ptx);
 
-        // B next tile: write_stage * b_tile_bytes offset into B region
-        for i in 0..cp_chunks_b as usize {
-            let b_dst = ptx.regs.alloc_b32();
-            ptx.add_s32(b_dst, write_buf_base, b_cp_off);
-            // B region offset: b_start + write_stage * b_tile_bytes + chunk * 2048
-            // But write_buf_base already has write_stage * a_tile_bytes from smem_base.
-            // Since a_tile_bytes == b_tile_bytes (BM==BN), the write_stage offset is
-            // correct for both A and B with the same shift. But b_start accounts for
-            // the A/B region separation.
-            ptx.add_s32_imm(b_dst, b_dst, b_start + (i as i32 * 2048));
-            copy_b.emit_async_copy(ptx, b_dst, gb_loop[i], cp_size);
+        // B next tile
+        // OPTIMIZATION: compute write_buf_base + b_cp_off + b_start once into b_dst_regs[0],
+        // then offset subsequent chunks from it.
+        ptx.add_s32(b_dst_regs[0], write_buf_base, b_cp_off);
+        ptx.add_s32_imm(b_dst_regs[0], b_dst_regs[0], b_start);
+        copy_b.emit_async_copy(ptx, b_dst_regs[0], gb_loop[0], cp_size);
+        for i in 1..cp_chunks_b as usize {
+            ptx.add_s32_imm(b_dst_regs[i], b_dst_regs[0], i as i32 * 2048);
+            copy_b.emit_async_copy(ptx, b_dst_regs[i], gb_loop[i], cp_size);
         }
         copy_b.emit_commit(ptx);
         ptx.blank();
 
         // ── Advance circular buffer stage indices ──
         ptx.comment("Advance circular buffer stage indices");
-        {
-            let next_read = ptx.regs.alloc_b32();
-            ptx.add_s32_imm(next_read, read_stage, 1);
-            let p_wrap_r = ptx.regs.alloc_pred();
-            ptx.setp_gt_s32_imm(p_wrap_r, next_read, stages as i32 - 1);
-            ptx.selp_b32_imm_reg(read_stage, 0, next_read, p_wrap_r);
-        }
-        {
-            let next_write = ptx.regs.alloc_b32();
-            ptx.add_s32_imm(next_write, write_stage, 1);
-            let p_wrap_w = ptx.regs.alloc_pred();
-            ptx.setp_gt_s32_imm(p_wrap_w, next_write, stages as i32 - 1);
-            ptx.selp_b32_imm_reg(write_stage, 0, next_write, p_wrap_w);
-        }
+        ptx.add_s32_imm(next_read, read_stage, 1);
+        ptx.setp_gt_s32_imm(p_wrap_r, next_read, stages as i32 - 1);
+        ptx.selp_b32_imm_reg(read_stage, 0, next_read, p_wrap_r);
+
+        ptx.add_s32_imm(next_write, write_stage, 1);
+        ptx.setp_gt_s32_imm(p_wrap_w, next_write, stages as i32 - 1);
+        ptx.selp_b32_imm_reg(write_stage, 0, next_write, p_wrap_w);
 
         // ── Advance loop state ──
         ptx.comment("Advance loop state");
@@ -565,7 +589,6 @@ impl MainloopPipeline {
             adv(ptx);
         }
 
-        let p_loop = ptx.regs.alloc_pred();
         ptx.setp_lt_s32(p_loop, k_counter, k_param);
         ptx.w(&format!("@{p_loop} bra \t$L_KLOOP;"));
         ptx.blank();

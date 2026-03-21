@@ -1,34 +1,36 @@
 // Flash Attention Forward kernel — hand-written PTX
 //
-// BLOCK_M=64, BLOCK_N=64, HEAD_DIM=64, 128 threads (4 warps)
+// BLOCK_M=128, BLOCK_N=64, HEAD_DIM=64, 256 threads (8 warps)
 // No causal mask, no paged KV cache, contiguous Q/K/V/O layout
 //
 // Q,K,V,O: [batch*heads, seq, 64] contiguous f16 (stride_seq = 64)
 //
-// Grid: (ceil(seq_q / 64), batch * heads, 1)
+// Grid: (ceil(seq_q / 128), batch * heads, 1)
 //
-// Smem layout:
-//   Q region:  0..8191     (64 rows × 64 cols × 2B = 8192)
-//   KV region: 8192..16383 (64 × 64 × 2B) — K then V reuse same space
-//   Total: 16384 bytes
+// Smem layout (with B128 swizzle):
+//   Q region:  0..16383    (128 rows × 64 cols × 2B = 16384)
+//   KV buf 0:  16384..24575 (64 × 64 × 2B = 8192)
+//   KV buf 1:  24576..32767 (64 × 64 × 2B = 8192)
+//   Total: 32768 bytes
 //
 // MMA config: m16n8k16
-//   Q@K^T: S[64×64] from Q[64×64] × K^T[64×64]
-//   P@V: O[64×64] from P[64×64] × V[64×64]
+//   Q@K^T: S[128×64] from Q[128×64] × K^T[64×64]  — 8 warps, each handles 1 m-tile
+//   P@V: O[128×64] from P[128×64] × V[64×64]
 //
-// Key optimization: P stays in registers (no smem round-trip)
-//   After softmax, P values are converted to f16x2 and used directly
-//   as MMA A operands for P@V, matching Triton's approach.
-//
-// V load is overlapped with softmax computation.
+// Key optimizations over previous version:
+//   1. BLOCK_M=128 with 8 warps for better latency hiding
+//   2. B128 XOR swizzle on shared memory to eliminate bank conflicts
+//   3. K/V double-buffering: cp.async for next K while computing current Q@K^T
+//   4. P stays in registers (no smem round-trip)
+//   5. V load overlapped with softmax computation
 
 pub fn emit_flash_attn_fwd() -> String {
-    let mut s = String::with_capacity(200 * 1024);
+    let mut s = String::with_capacity(400 * 1024);
     emit_kernel(&mut s);
     s
 }
 
-pub const SMEM_BYTES: u32 = 16384;
+pub const SMEM_BYTES: u32 = 32768;
 
 fn emit_kernel(s: &mut String) {
     // ─── Header ───
@@ -48,10 +50,10 @@ fn emit_kernel(s: &mut String) {
 	.param .f32 param_scale,
 	.param .u32 param_stride_batch
 )
-.reqntid 128
+.reqntid 256
 {
 	.reg .pred 	%p<30>;
-	.reg .b32 	%r<700>;
+	.reg .b32 	%r<800>;
 	.reg .b64 	%rd<80>;
 
 "#,
@@ -70,8 +72,8 @@ fn emit_kernel(s: &mut String) {
     // ─── Indexing ───
     w(s, "mov.u32 \t%r4, %ctaid.x;"); // block_m index
     w(s, "mov.u32 \t%r5, %ctaid.y;"); // batch_head index
-    w(s, "mov.u32 \t%r6, %tid.x;"); // thread id
-    w(s, "shl.b32 \t%r7, %r4, 6;"); // block_m_start = block_m * 64
+    w(s, "mov.u32 \t%r6, %tid.x;"); // thread id (0..255)
+    w(s, "shl.b32 \t%r7, %r4, 7;"); // block_m_start = block_m * 128
     blank(s);
 
     // Base pointers adjusted for batch/head
@@ -82,76 +84,143 @@ fn emit_kernel(s: &mut String) {
     w(s, "mad.wide.s32 \t%rd13, %r8, 2, %rd4;"); // O_base
     blank(s);
 
-    // ─── cp.async thread decomposition ───
-    w(s, "shr.u32 \t%r9, %r6, 2;"); // cp_row (0..31)
-    w(s, "and.b32 \t%r10, %r6, 3;"); // cp_col_group
-    w(s, "shl.b32 \t%r11, %r10, 4;"); // col_bytes = group * 16
+    // ─── cp.async thread decomposition for 128×64 Q tile ───
+    // 256 threads, each loads 16 bytes. 128*64*2 = 16384 bytes total.
+    // 16384 / 16 = 1024 loads needed. 256 threads → 4 loads per thread.
+    // Decompose: tid/4 = row (0..63), tid%4 = col_group (0..3), col_bytes = group*16
+    // Each thread loads 4 rows: row, row+64, but we need 128 rows × 4 col_groups.
+    // Actually: 256 threads × 16 bytes = 4096 bytes per round. Need 4 rounds.
+    // Simpler: tid/2 = row (0..127), tid%2 = col_half (0 or 1), col_bytes = half*16
+    // But 64 cols × 2B = 128 bytes per row. 128/16 = 8 loads per row.
+    // 128 rows × 8 loads = 1024 total. 256 threads → 4 loads/thread.
+    //
+    // Use: cp_row = tid % 64 (0..63), cp_col_group = tid / 64 (0..3)
+    // Each thread loads rows [cp_row, cp_row+64] with cp_col_group * 16 bytes offset.
+    // That's 2 loads × 4 col_groups... no.
+    //
+    // Simplest: cp_row = tid / 8 (0..31), cp_pass = tid % 8 → col_bytes = (tid%8)*16
+    // But that's only 32 rows. Need 4 passes for 128 rows.
+    //
+    // Better: 256 threads load 128×64 f16 = 16384 bytes.
+    // Row-major, 128 bytes per row.
+    // tid → byte_offset = tid * 16 (within a 4096 byte chunk)
+    // Round 0: bytes 0..4095 (rows 0..31)
+    // Round 1: bytes 4096..8191 (rows 32..63)
+    // Round 2: bytes 8192..12287 (rows 64..95)
+    // Round 3: bytes 12288..16383 (rows 96..127)
+    // Within each round: cp_row = (tid*16)/128 = tid/8, col_bytes = (tid%8)*16
+    // But tid/8 only gives 0..31, which is exactly 32 rows per round. 4 rounds × 32 = 128 rows.
+    //
+    // With swizzle: smem_byte = linear_byte ^ ((linear_byte & 0x380) >> 3)
+    // where linear_byte = row * 128 + col_bytes
+
+    w(s, "shr.u32 \t%r9, %r6, 3;"); // cp_row_in_chunk = tid/8 (0..31)
+    w(s, "and.b32 \t%r10, %r6, 7;"); // cp_col_idx = tid%8
+    w(s, "shl.b32 \t%r11, %r10, 4;"); // col_bytes = cp_col_idx * 16
     w(s, "mov.b32 \t%r12, global_smem;");
     blank(s);
 
-    // ─── Load Q → smem (offset 0) ───
-    emit_cp_async_tile(s, "Q", 0, "%rd10");
+    // ─── Load Q → smem (offset 0) with B128 swizzle ───
+    // 4 rounds: rows 0..31, 32..63, 64..95, 96..127
+    for round in 0..4u32 {
+        let row_base = round * 32;
+        // Global address: Q_base + (block_m_start + row_base + cp_row) * 128 + col_bytes
+        w(s, &format!("add.s32 \t%r60, %r7, %r9;")); // block_m_start + cp_row_in_chunk
+        if row_base > 0 {
+            w(s, &format!("add.s32 \t%r60, %r60, {};", row_base));
+        }
+        // Bounds check
+        w(s, "setp.lt.s32 \t%p20, %r60, %r1;");
+        w(s, "selp.b32 \t%r72, 16, 0, %p20;");
+        // Global byte offset
+        w(s, "shl.b32 \t%r62, %r60, 7;"); // row * 128
+        w(s, "add.s32 \t%r63, %r62, %r11;"); // + col_bytes
+        w(s, "cvt.u64.u32 \t%rd20, %r63;");
+        w(s, "add.s64 \t%rd21, %rd10, %rd20;"); // global addr
+
+        // Smem address with swizzle: linear_byte = (row_base + cp_row)*128 + col_bytes
+        let smem_row_base = row_base * 128; // byte offset for this round's rows
+        w(s, "shl.b32 \t%r64, %r9, 7;"); // cp_row_in_chunk * 128
+        w(s, &format!("add.s32 \t%r65, %r64, %r11;")); // + col_bytes
+        if smem_row_base > 0 {
+            w(s, &format!("add.s32 \t%r65, %r65, {};", smem_row_base));
+        }
+        // Apply B128 swizzle: swizzled = byte ^ ((byte & 0x380) >> 3)
+        w(s, "and.b32 \t%r66, %r65, 896;"); // 0x380
+        w(s, "shr.u32 \t%r67, %r66, 3;");
+        w(s, "xor.b32 \t%r68, %r65, %r67;");
+        w(s, "add.s32 \t%r69, %r68, %r12;"); // + smem base
+        s.push_str("\tcp.async.cg.shared.global [ %r69 + 0 ], [ %rd21 + 0 ], 0x10, %r72;\n");
+    }
     w(s, "cp.async.commit_group;");
     w(s, "cp.async.wait_group \t0;");
     w(s, "bar.sync \t0;");
     blank(s);
 
     // ─── Warp/lane decomposition ───
-    w(s, "shr.u32 \t%r30, %r6, 5;"); // warp_id (0..3)
+    w(s, "shr.u32 \t%r30, %r6, 5;"); // warp_id (0..7)
     w(s, "and.b32 \t%r31, %r6, 31;"); // lane_id (0..31)
     blank(s);
 
-    // ─── Q ldmatrix addresses ───
+    // ─── Q ldmatrix addresses (with B128 swizzle) ───
+    // Each warp owns 16 rows of Q (warp_id * 16).
+    // MMA m16n8k16 A operand: ldmatrix.x4 loads 4 matrices of 8x8 elements.
+    // Thread lane maps to row_in_frag = lane % 8, frag_id = lane / 8.
+    // frag_id: bits [1]=row_half (0,1 → +0,+8 rows), [0]=col_half (0,1 → +0,+16 bytes)
     w(s, "and.b32 \t%r32, %r31, 7;"); // row_in_frag = lane % 8
-    w(s, "shr.u32 \t%r33, %r31, 3;"); // frag_id = lane / 8
+    w(s, "shr.u32 \t%r33, %r31, 3;"); // frag_id = lane / 8 (0..3)
     w(s, "shr.u32 \t%r34, %r33, 1;"); // row_half (0 or 1)
     w(s, "and.b32 \t%r35, %r33, 1;"); // col_half (0 or 1)
 
     w(s, "shl.b32 \t%r36, %r30, 4;"); // warp_id * 16
     w(s, "shl.b32 \t%r37, %r34, 3;"); // row_half * 8
     w(s, "add.s32 \t%r38, %r36, %r37;"); // warp_id*16 + row_half*8
-    w(s, "add.s32 \t%r39, %r38, %r32;"); // + row_in_frag = Q row
+    w(s, "add.s32 \t%r39, %r38, %r32;"); // + row_in_frag = Q smem row
 
+    // Q linear byte offset for k=0: row * 128 + col_half * 16
     w(s, "shl.b32 \t%r40, %r35, 4;"); // col_half * 16 bytes
-    w(s, "shl.b32 \t%r41, %r39, 7;"); // row * 128
-    w(s, "add.s32 \t%r42, %r41, %r40;"); // + col_bytes = linear offset
-    w(s, "add.s32 \t%r43, %r42, %r12;"); // + smem base = Q smem addr for k=0
+    w(s, "shl.b32 \t%r41, %r39, 7;"); // row * 128 bytes
+    w(s, "add.s32 \t%r42, %r41, %r40;"); // linear byte offset
     blank(s);
 
     // Load Q fragments (stay live for entire KV-loop):
-    // Q_frag: %r100..%r115 (4 × 4 regs)
+    // Q_frag: %r100..%r115 (4 k-iters × 4 regs)
+    // Each k-iter advances by 32 bytes (16 cols × 2B)
     for ki in 0..4u32 {
         let base = 100 + ki * 4;
         let k_byte_off = ki * 32;
-        if k_byte_off > 0 {
-            s.push_str(&format!(
-                "\tldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%r{}, %r{}, %r{}, %r{}}}, [%r43+{}];\n",
-                base, base + 1, base + 2, base + 3, k_byte_off
-            ));
-        } else {
-            s.push_str(&format!(
-                "\tldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%r{}, %r{}, %r{}, %r{}}}, [%r43];\n",
-                base, base + 1, base + 2, base + 3
-            ));
-        }
+        // Apply swizzle to each k-iter's linear byte offset
+        w(s, &format!("add.s32 \t%r70, %r42, {};", k_byte_off));
+        w(s, "and.b32 \t%r71, %r70, 896;"); // 0x380
+        w(s, "shr.u32 \t%r72, %r71, 3;");
+        w(s, "xor.b32 \t%r73, %r70, %r72;");
+        w(s, "add.s32 \t%r74, %r73, %r12;"); // + smem base
+        s.push_str(&format!(
+            "\tldmatrix.sync.aligned.m8n8.x4.shared.b16 {{%r{}, %r{}, %r{}, %r{}}}, [%r74];\n",
+            base, base + 1, base + 2, base + 3
+        ));
     }
     blank(s);
 
-    // ─── K/V ldmatrix addressing (smem offset 8192) ───
+    // ─── K/V ldmatrix addressing ───
+    // For K (B operand, transposed): ldmatrix.trans.x4
+    // The K tile is at smem offset 16384 (buf 0) or 24576 (buf 1).
+    // B operand thread mapping for ldmatrix.trans:
+    //   row_in_frag = lane % 8, frag_id = lane / 8
+    //   base linear_byte = row_in_frag * 128 + frag_id * 16
     w(s, "shl.b32 \t%r44, %r33, 4;"); // frag_id * 16 bytes
     w(s, "shl.b32 \t%r45, %r32, 7;"); // (lane%8) * 128
-    w(s, "add.s32 \t%r46, %r45, %r44;"); // + frag_col_bytes
-    w(s, "add.s32 \t%r47, %r46, 8192;"); // + K/V smem offset
-    w(s, "add.s32 \t%r47, %r47, %r12;"); // + smem base
+    w(s, "add.s32 \t%r46, %r45, %r44;"); // base linear byte within KV tile
     blank(s);
 
     // ─── Initialize accumulators ───
-    // O accum: %r200..%r231 (32 regs)
+    // O accum: %r200..%r231 (8 warps × 1 m-tile × 8 n-tiles × 4 regs)
+    // But each warp only has 8 n-tiles × 4 regs = 32 regs
     w(s, "mov.b32 \t%r199, 0;");
     for i in 200..232u32 {
         s.push_str(&format!("\tmov.b32 \t%r{i}, %r199;\n"));
     }
-    // m_i: %r232, %r233 — initialized to -inf
+    // m_i: %r232, %r233 — initialized to -inf (two row groups per warp)
     w(s, "mov.b32 \t%r232, 0xFF800000;");
     w(s, "mov.b32 \t%r233, 0xFF800000;");
     // l_i: %r234, %r235 — initialized to 0
@@ -159,47 +228,77 @@ fn emit_kernel(s: &mut String) {
     w(s, "mov.b32 \t%r235, 0x00000000;");
     blank(s);
 
-    // Precompute negative scale for FMA: neg_scale = -scale
-    // We'll use FMA: result = scale * score + (-m_new) = scale*score - m_new
-    // Actually simpler: just negate m_new when needed. Keep scale as-is.
-    blank(s);
-
-    // ─── KV-loop ───
+    // ─── KV-loop with double-buffered K/V ───
+    // Load first K block into buf 0
     w(s, "mov.b32 \t%r236, 0;"); // kv_start
     w(s, "setp.lt.s32 \t%p1, %r236, %r1;");
     w(s, "@!%p1 bra \t$L_EPILOGUE;");
     blank(s);
 
-    s.push_str("$L_KV_LOOP:\n");
-    blank(s);
-
-    // ─── Load K block → smem[8192] ───
-    emit_cp_async_kv(s, "K", 8192, "%rd11");
+    // Load K[0] into KV buf 0 (smem offset 16384)
+    emit_cp_async_kv_swizzled(s, 16384, "%rd11", false);
     w(s, "cp.async.commit_group;");
     w(s, "cp.async.wait_group \t0;");
     w(s, "bar.sync \t0;");
     blank(s);
 
-    // ─── ldmatrix K (B operand for Q@K^T) ───
-    // 8 n-tiles × 2 k-pairs = 16 ldmatrix.trans.x4 calls
-    // K_frag at %r300..%r363 (64 regs)
+    s.push_str("$L_KV_LOOP:\n");
+    blank(s);
+
+    // ─── Issue cp.async for NEXT K block into alternate buffer ───
+    // Current KV is at buf = (kv_start/64) % 2
+    // Next KV goes into other buf
+    // Compute next_kv_start
+    w(s, "add.s32 \t%r237, %r236, 64;"); // next_kv_start
+    w(s, "setp.lt.s32 \t%p2, %r237, %r1;"); // has_next_k?
+
+    // Compute current buffer offset: buf = (kv_start >> 6) & 1
+    w(s, "shr.u32 \t%r238, %r236, 6;"); // kv_start / 64
+    w(s, "and.b32 \t%r239, %r238, 1;"); // buf index (0 or 1)
+    w(s, "shl.b32 \t%r240, %r239, 13;"); // buf * 8192
+    w(s, "add.s32 \t%r241, %r240, 16384;"); // current KV smem offset
+
+    // Next buffer
+    w(s, "xor.b32 \t%r242, %r239, 1;"); // next buf index
+    w(s, "shl.b32 \t%r243, %r242, 13;"); // next_buf * 8192
+    w(s, "add.s32 \t%r244, %r243, 16384;"); // next KV smem offset
+
+    // Pipeline: start loading next K while we compute with current K
+    // (Only if there's a next block)
+    w(s, "@!%p2 bra \t$L_SKIP_NEXT_K;");
+    // Load next K into next buffer
+    // We need to use %r237 as kv_start for the next load
+    w(s, "mov.b32 \t%r250, %r236;"); // save current kv_start
+    w(s, "mov.b32 \t%r236, %r237;"); // temporarily set kv_start to next
+    emit_cp_async_kv_swizzled_dynamic(s, "%r244", "%rd11");
+    w(s, "cp.async.commit_group;");
+    w(s, "mov.b32 \t%r236, %r250;"); // restore kv_start
+    s.push_str("$L_SKIP_NEXT_K:\n");
+    blank(s);
+
+    // ─── ldmatrix K from current buffer (B operand for Q@K^T) ───
+    // K_frag at %r300..%r363 (8 n-tiles × 2 k-pairs × 4 regs = 64 regs)
     for n in 0..8u32 {
         for kp in 0..2u32 {
             let base = 300 + (n * 2 + kp) * 4;
+            // Linear byte offset within KV tile: n*8 rows + kp*64 bytes
+            // n_off = n * 8 rows * 128 bytes/row = n * 1024
+            // kp_off = kp * 64 bytes (skip 32 cols = 64 bytes for second k-pair)
             let n_off = n * 1024;
             let kp_off = kp * 64;
             let total_off = n_off + kp_off;
-            if total_off > 0 {
-                s.push_str(&format!(
-                    "\tldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {{%r{}, %r{}, %r{}, %r{}}}, [%r47+{}];\n",
-                    base, base + 1, base + 2, base + 3, total_off
-                ));
-            } else {
-                s.push_str(&format!(
-                    "\tldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {{%r{}, %r{}, %r{}, %r{}}}, [%r47];\n",
-                    base, base + 1, base + 2, base + 3
-                ));
-            }
+            // linear byte = %r46 (base within tile) + total_off
+            // Then apply swizzle, then add current buffer offset + smem base
+            w(s, &format!("add.s32 \t%r70, %r46, {};", total_off));
+            w(s, "and.b32 \t%r71, %r70, 896;");
+            w(s, "shr.u32 \t%r72, %r71, 3;");
+            w(s, "xor.b32 \t%r73, %r70, %r72;");
+            w(s, "add.s32 \t%r74, %r73, %r241;"); // + current buf offset
+            w(s, "add.s32 \t%r74, %r74, %r12;"); // + smem base
+            s.push_str(&format!(
+                "\tldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {{%r{}, %r{}, %r{}, %r{}}}, [%r74];\n",
+                base, base + 1, base + 2, base + 3
+            ));
         }
     }
     blank(s);
@@ -237,11 +336,15 @@ fn emit_kernel(s: &mut String) {
     }
     blank(s);
 
+    // Wait for next K load to complete (if it was issued)
+    w(s, "cp.async.wait_group \t0;");
+    w(s, "bar.sync \t0;");
+    blank(s);
+
     // ─── Online softmax ───
     // S is in %r370..%r401 (32 f32 regs)
 
-    // Step 1: Scale S using FMA: scaled = scale * raw_score + 0
-    // Actually just mul is fine, we'll use FMA for scale*score - m_new later
+    // Step 1: Scale S
     for i in 370..402u32 {
         s.push_str(&format!("\tmul.f32 \t%r{i}, %r{i}, %r2;\n"));
     }
@@ -279,8 +382,7 @@ fn emit_kernel(s: &mut String) {
     w(s, "ex2.approx.ftz.f32 \t%r413, %r411;");
     blank(s);
 
-    // Step 5: P = exp2(S*scale - m_new)
-    // Negate m_new for FMA-style subtraction
+    // Step 5: P = exp2(S_scaled - m_new)
     for n in 0..8u32 {
         let base = 370 + n * 4;
         s.push_str(&format!("\tsub.f32 \t%r{b}, %r{b}, %r408;\n", b = base));
@@ -331,52 +433,27 @@ fn emit_kernel(s: &mut String) {
     w(s, "mov.b32 \t%r233, %r409;");
     blank(s);
 
-    // ─── Convert P to f16x2 in registers for P@V MMA (NO smem round-trip!) ───
-    // P is in %r370..%r401 (f32), 8 n-tiles × 4 regs per tile
-    // MMA output layout per thread:
-    //   d0: row=(lane/4), col=n_tile*8+(lane%4)*2       (row_group 0)
-    //   d1: row=(lane/4), col=n_tile*8+(lane%4)*2+1     (row_group 0)
-    //   d2: row=(lane/4)+8, col=n_tile*8+(lane%4)*2     (row_group 1)
-    //   d3: row=(lane/4)+8, col=n_tile*8+(lane%4)*2+1   (row_group 1)
-    //
-    // For P@V, P is the A operand. A fragment for m16n8k16:
-    //   Thread t needs: rows (t/4, t/4+8) × k = (t%4)*2, (t%4)*2+1
-    //   For k16 covering n-tiles j,j+1:
-    //     r0 = {f16(P[row0, j*8+(l%4)*2]), f16(P[row0, j*8+(l%4)*2+1])} = from d0,d1 of n-tile j
-    //     r1 = {f16(P[row0, (j+1)*8+(l%4)*2]), f16(P[row0, (j+1)*8+(l%4)*2+1])} = from d0,d1 of n-tile j+1
-    //     r2 = {f16(P[row1, j*8+(l%4)*2]), f16(P[row1, j*8+(l%4)*2+1])} = from d2,d3 of n-tile j
-    //     r3 = {f16(P[row1, (j+1)*8+(l%4)*2]), f16(P[row1, (j+1)*8+(l%4)*2+1])} = from d2,d3 of n-tile j+1
-    //
+    // ─── Convert P to f16x2 in registers for P@V MMA ───
     // P_frag: %r460..%r475 (4 k-iters × 4 regs)
-    // k-iter 0: n-tiles 0,1 → k=0..15
-    // k-iter 1: n-tiles 2,3 → k=16..31
-    // k-iter 2: n-tiles 4,5 → k=32..47
-    // k-iter 3: n-tiles 6,7 → k=48..63
-
     for ki in 0..4u32 {
-        let n_lo = ki * 2;     // first n-tile in this k16 step
-        let n_hi = n_lo + 1;   // second n-tile
+        let n_lo = ki * 2;
+        let n_hi = n_lo + 1;
         let p_base = 460 + ki * 4;
+        let s_lo = 370 + n_lo * 4;
+        let s_hi = 370 + n_hi * 4;
 
-        let s_lo = 370 + n_lo * 4; // S/P regs for n_lo
-        let s_hi = 370 + n_hi * 4; // S/P regs for n_hi
-
-        // r0 = pack(d1_nlo, d0_nlo) — row_group 0, n-tile lo
         s.push_str(&format!(
             "\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n",
             p_base, s_lo + 1, s_lo
         ));
-        // r1 = pack(d1_nhi, d0_nhi) — row_group 0, n-tile hi
         s.push_str(&format!(
             "\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n",
             p_base + 1, s_hi + 1, s_hi
         ));
-        // r2 = pack(d3_nlo, d2_nlo) — row_group 1, n-tile lo
         s.push_str(&format!(
             "\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n",
             p_base + 2, s_lo + 3, s_lo + 2
         ));
-        // r3 = pack(d3_nhi, d2_nhi) — row_group 1, n-tile hi
         s.push_str(&format!(
             "\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n",
             p_base + 3, s_hi + 3, s_hi + 2
@@ -384,15 +461,15 @@ fn emit_kernel(s: &mut String) {
     }
     blank(s);
 
-    // ─── Load V block → smem[8192] (reusing K's region) ───
-    emit_cp_async_kv(s, "V", 8192, "%rd12");
+    // ─── Load V block → current KV buffer (reusing K's space) ───
+    // V goes into the CURRENT buffer (K is done being read from it)
+    emit_cp_async_kv_swizzled_dynamic(s, "%r241", "%rd12");
     w(s, "cp.async.commit_group;");
     w(s, "cp.async.wait_group \t0;");
     w(s, "bar.sync \t0;");
     blank(s);
 
-    // ─── ldmatrix V (B operand for P@V) ───
-    // V at smem[8192], using %r47 base address
+    // ─── ldmatrix V (B operand for P@V) from current buffer ───
     // V_frag: %r480..%r543 (8 n-tiles × 2 k-pairs × 4 regs = 64 regs)
     for n in 0..8u32 {
         for kp in 0..2u32 {
@@ -400,24 +477,21 @@ fn emit_kernel(s: &mut String) {
             let n_off = n * 1024;
             let kp_off = kp * 64;
             let total_off = n_off + kp_off;
-            if total_off > 0 {
-                s.push_str(&format!(
-                    "\tldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {{%r{}, %r{}, %r{}, %r{}}}, [%r47+{}];\n",
-                    base, base + 1, base + 2, base + 3, total_off
-                ));
-            } else {
-                s.push_str(&format!(
-                    "\tldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {{%r{}, %r{}, %r{}, %r{}}}, [%r47];\n",
-                    base, base + 1, base + 2, base + 3
-                ));
-            }
+            w(s, &format!("add.s32 \t%r70, %r46, {};", total_off));
+            w(s, "and.b32 \t%r71, %r70, 896;");
+            w(s, "shr.u32 \t%r72, %r71, 3;");
+            w(s, "xor.b32 \t%r73, %r70, %r72;");
+            w(s, "add.s32 \t%r74, %r73, %r241;"); // current buf offset
+            w(s, "add.s32 \t%r74, %r74, %r12;"); // + smem base
+            s.push_str(&format!(
+                "\tldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {{%r{}, %r{}, %r{}, %r{}}}, [%r74];\n",
+                base, base + 1, base + 2, base + 3
+            ));
         }
     }
     blank(s);
 
     // ─── MMA: O += P @ V ───
-    // P_frag at %r460..%r475 (in registers, no smem!)
-    // Each k-iter uses 4 P regs from the pack above
     for ki in 0..4u32 {
         let p_base = 460 + ki * 4;
         for n in 0..8u32 {
@@ -528,56 +602,68 @@ fn emit_kernel(s: &mut String) {
     s.push_str("}\n");
 }
 
-/// Emit cp.async to load a 64×64 f16 tile to smem.
-fn emit_cp_async_tile(s: &mut String, _name: &str, smem_offset: u32, base_ptr: &str) {
-    w(s, &format!("add.s32 \t%r60, %r7, %r9;")); // row_h0 = block_m_start + cp_row
-    w(s, "add.s32 \t%r61, %r60, 32;"); // row_h1
-    w(s, "shl.b32 \t%r62, %r60, 7;"); // row_h0 * 128
-    w(s, "add.s32 \t%r63, %r62, %r11;");
-    w(s, &format!("cvt.u64.u32 \t%rd20, %r63;"));
-    w(s, &format!("add.s64 \t%rd21, {base_ptr}, %rd20;"));
-    w(s, "shl.b32 \t%r64, %r61, 7;");
-    w(s, "add.s32 \t%r65, %r64, %r11;");
-    w(s, "cvt.u64.u32 \t%rd22, %r65;");
-    w(s, &format!("add.s64 \t%rd23, {base_ptr}, %rd22;"));
-    w(s, &format!("add.s32 \t%r66, %r12, {};", smem_offset));
-    w(s, "shl.b32 \t%r67, %r9, 7;");
-    w(s, "add.s32 \t%r68, %r67, %r11;");
-    w(s, "add.s32 \t%r69, %r66, %r68;");
-    w(s, "add.s32 \t%r70, %r68, 4096;");
-    w(s, "add.s32 \t%r71, %r66, %r70;");
-    w(s, "setp.lt.s32 \t%p20, %r60, %r1;");
-    w(s, "setp.lt.s32 \t%p21, %r61, %r1;");
-    w(s, "selp.b32 \t%r72, 16, 0, %p20;");
-    w(s, "selp.b32 \t%r73, 16, 0, %p21;");
-    s.push_str("\tcp.async.cg.shared.global [ %r69 + 0 ], [ %rd21 + 0 ], 0x10, %r72;\n");
-    s.push_str("\tcp.async.cg.shared.global [ %r71 + 0 ], [ %rd23 + 0 ], 0x10, %r73;\n");
+/// Emit cp.async for K or V tile with B128 swizzle.
+/// Uses kv_start from %r236. Loads 64×64 tile into smem at given offset.
+/// 256 threads × 16 bytes = 4096 per round. Need 8192/4096 = 2 rounds.
+fn emit_cp_async_kv_swizzled(s: &mut String, smem_offset: u32, base_ptr: &str, _commit: bool) {
+    // cp_row = tid/8 (0..31), cp_col_idx = tid%8, col_bytes = idx*16
+    // Round 0: rows 0..31, Round 1: rows 32..63
+    for round in 0..2u32 {
+        let row_off = round * 32;
+        w(s, "add.s32 \t%r60, %r236, %r9;"); // kv_start + cp_row_in_chunk
+        if row_off > 0 {
+            w(s, &format!("add.s32 \t%r60, %r60, {};", row_off));
+        }
+        w(s, "setp.lt.s32 \t%p20, %r60, %r1;");
+        w(s, "selp.b32 \t%r72, 16, 0, %p20;");
+        // Global addr
+        w(s, "shl.b32 \t%r62, %r60, 7;"); // row * 128
+        w(s, "add.s32 \t%r63, %r62, %r11;"); // + col_bytes
+        w(s, "cvt.u64.u32 \t%rd20, %r63;");
+        w(s, &format!("add.s64 \t%rd21, {base_ptr}, %rd20;"));
+        // Smem with swizzle
+        let smem_row_off = row_off * 128;
+        w(s, "shl.b32 \t%r64, %r9, 7;"); // cp_row * 128
+        w(s, "add.s32 \t%r65, %r64, %r11;"); // + col_bytes
+        if smem_row_off > 0 {
+            w(s, &format!("add.s32 \t%r65, %r65, {};", smem_row_off));
+        }
+        w(s, "and.b32 \t%r66, %r65, 896;"); // 0x380
+        w(s, "shr.u32 \t%r67, %r66, 3;");
+        w(s, "xor.b32 \t%r68, %r65, %r67;");
+        w(s, &format!("add.s32 \t%r69, %r68, {};", smem_offset));
+        w(s, "add.s32 \t%r69, %r69, %r12;");
+        s.push_str("\tcp.async.cg.shared.global [ %r69 + 0 ], [ %rd21 + 0 ], 0x10, %r72;\n");
+    }
 }
 
-/// Emit cp.async for K or V tile (uses kv_start from %r236).
-fn emit_cp_async_kv(s: &mut String, _name: &str, smem_offset: u32, base_ptr: &str) {
-    w(s, "add.s32 \t%r60, %r236, %r9;");
-    w(s, "add.s32 \t%r61, %r60, 32;");
-    w(s, "shl.b32 \t%r62, %r60, 7;");
-    w(s, "add.s32 \t%r63, %r62, %r11;");
-    w(s, "cvt.u64.u32 \t%rd20, %r63;");
-    w(s, &format!("add.s64 \t%rd21, {base_ptr}, %rd20;"));
-    w(s, "shl.b32 \t%r64, %r61, 7;");
-    w(s, "add.s32 \t%r65, %r64, %r11;");
-    w(s, "cvt.u64.u32 \t%rd22, %r65;");
-    w(s, &format!("add.s64 \t%rd23, {base_ptr}, %rd22;"));
-    w(s, &format!("add.s32 \t%r66, %r12, {};", smem_offset));
-    w(s, "shl.b32 \t%r67, %r9, 7;");
-    w(s, "add.s32 \t%r68, %r67, %r11;");
-    w(s, "add.s32 \t%r69, %r66, %r68;");
-    w(s, "add.s32 \t%r70, %r68, 4096;");
-    w(s, "add.s32 \t%r71, %r66, %r70;");
-    w(s, "setp.lt.s32 \t%p20, %r60, %r1;");
-    w(s, "setp.lt.s32 \t%p21, %r61, %r1;");
-    w(s, "selp.b32 \t%r72, 16, 0, %p20;");
-    w(s, "selp.b32 \t%r73, 16, 0, %p21;");
-    s.push_str("\tcp.async.cg.shared.global [ %r69 + 0 ], [ %rd21 + 0 ], 0x10, %r72;\n");
-    s.push_str("\tcp.async.cg.shared.global [ %r71 + 0 ], [ %rd23 + 0 ], 0x10, %r73;\n");
+/// Same as above but with dynamic smem offset in a register.
+fn emit_cp_async_kv_swizzled_dynamic(s: &mut String, smem_off_reg: &str, base_ptr: &str) {
+    for round in 0..2u32 {
+        let row_off = round * 32;
+        w(s, "add.s32 \t%r60, %r236, %r9;");
+        if row_off > 0 {
+            w(s, &format!("add.s32 \t%r60, %r60, {};", row_off));
+        }
+        w(s, "setp.lt.s32 \t%p20, %r60, %r1;");
+        w(s, "selp.b32 \t%r72, 16, 0, %p20;");
+        w(s, "shl.b32 \t%r62, %r60, 7;");
+        w(s, "add.s32 \t%r63, %r62, %r11;");
+        w(s, "cvt.u64.u32 \t%rd20, %r63;");
+        w(s, &format!("add.s64 \t%rd21, {base_ptr}, %rd20;"));
+        let smem_row_off = row_off * 128;
+        w(s, "shl.b32 \t%r64, %r9, 7;");
+        w(s, "add.s32 \t%r65, %r64, %r11;");
+        if smem_row_off > 0 {
+            w(s, &format!("add.s32 \t%r65, %r65, {};", smem_row_off));
+        }
+        w(s, "and.b32 \t%r66, %r65, 896;");
+        w(s, "shr.u32 \t%r67, %r66, 3;");
+        w(s, "xor.b32 \t%r68, %r65, %r67;");
+        w(s, &format!("add.s32 \t%r69, %r68, {};", smem_off_reg));
+        w(s, "add.s32 \t%r69, %r69, %r12;");
+        s.push_str("\tcp.async.cg.shared.global [ %r69 + 0 ], [ %rd21 + 0 ], 0x10, %r72;\n");
+    }
 }
 
 fn w(s: &mut String, line: &str) {
@@ -713,8 +799,8 @@ mod tests {
     #[test]
     fn test_flash_attn_reqntid() {
         let (ptx, _) = load_and_query_kernel();
-        assert!(ptx.contains(".reqntid 128"),
-            "Must require 128 threads per block");
+        assert!(ptx.contains(".reqntid 256"),
+            "Must require 256 threads per block");
     }
 
     // ═══════════════════════════════════════════════════════════════

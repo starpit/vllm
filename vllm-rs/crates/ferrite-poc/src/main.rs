@@ -179,7 +179,7 @@ fn main() -> Result<()> {
     run_mlp_block_128x128(device)?;
 
     // Flash Attention forward
-    println!("\nFlash Attention Forward (BLOCK_M=64, BLOCK_N=64, HD=64)");
+    println!("\nFlash Attention Forward (BLOCK_M=128, BLOCK_N=64, HD=64)");
     run_flash_attn_fwd()?;
 
     println!("\n═══════════════════════════════════");
@@ -3002,9 +3002,9 @@ fn run_flash_attn_fwd() -> Result<()> {
         )?;
     }
 
-    let grid_x = (seq_len + 63) / 64; // ceil(seq_len / BLOCK_M)
+    let grid_x = (seq_len + 127) / 128; // ceil(seq_len / BLOCK_M)
     let grid_y = batch * heads;
-    let threads: u32 = 128;
+    let threads: u32 = 256;
 
     let params: &mut [*mut c_void] = &mut [
         (&d_q) as *const _ as *mut c_void,
@@ -3152,7 +3152,7 @@ fn run_flash_attn_fwd() -> Result<()> {
 
         let scale2: f32 = 1.0 / (head_dim as f32).sqrt() * 1.44269504;
         let stride2: u32 = bench_seq * head_dim;
-        let gx2 = (bench_seq + 63) / 64;
+        let gx2 = (bench_seq + 127) / 128;
         let gy2 = bench_batch * bench_heads;
 
         let params2: &mut [*mut c_void] = &mut [

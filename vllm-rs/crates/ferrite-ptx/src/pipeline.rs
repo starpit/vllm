@@ -3,9 +3,11 @@ use crate::config::GemmConfig;
 use crate::atoms::{CopyAtom, TransformAtom, MmaAtom};
 use crate::gemm::{GemmSetup, AccumulatorMap};
 
-// Hard-coded register tile dimensions matching the existing GEMM.
-const REG_M: u32 = 2;
-const REG_N: u32 = 4;
+// REG_M and REG_N are now derived from the GemmConfig:
+//   REG_M = config.reg_m() = wm / mma_m
+//   REG_N = config.reg_n() = wn / mma_n
+// For 64×64:  REG_M=4, REG_N=2 (wm=64,wn=16)
+// For 128×128: REG_M=4, REG_N=8 (wm=64,wn=64)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MainloopPipeline — THE single K-loop implementation
@@ -50,8 +52,8 @@ impl MainloopPipeline {
     /// - `copy_a`, `copy_b`: how tiles are loaded from global to shared memory
     /// - `transform_a`: how A fragments are transformed after ldmatrix
     /// - `mma`: how tensor cores consume fragments
-    /// - `ga0, ga1`: A global pointers for chunk 0/1 (rows 0-31, 32-63 of first 32 K-cols)
-    /// - `gb0, gb1`: B global pointers for chunk 0/1 (rows 0-15, 16-31)
+    /// - `ga_chunks`: global A pointers, one per cp.async chunk (e.g., 2 for BM=64/BK=32, 4 for BM=128/BK=32)
+    /// - `gb_chunks`: global B pointers, one per cp.async chunk
     /// - `a_cp_off, b_cp_off`: swizzled smem offsets for A and B
     /// - `n_param, k_param`: matrix dimensions
     /// - `extra_advance`: optional closure for additional per-iteration state advance
@@ -66,9 +68,9 @@ impl MainloopPipeline {
         transform_a: &dyn TransformAtom,
         mma: &dyn MmaAtom,
         // Memory addresses
-        ga0: Reg, ga1: Reg,
+        ga_chunks: Vec<Reg>,
         a_cp_off: Reg,
-        gb0: Reg, gb1: Reg,
+        gb_chunks: Vec<Reg>,
         b_cp_off: Reg,
         // Params
         n_param: Reg,
@@ -104,15 +106,14 @@ impl MainloopPipeline {
         let tid_x16 = ptx.regs.alloc_b32();
         ptx.shl_b32(tid_x16, tid, 4);
 
+        assert_eq!(ga_chunks.len(), cp_chunks_a as usize,
+            "Expected {} A global pointers, got {}", cp_chunks_a, ga_chunks.len());
+        assert_eq!(gb_chunks.len(), cp_chunks_b as usize,
+            "Expected {} B global pointers, got {}", cp_chunks_b, gb_chunks.len());
+
         // ═══════════════════════════════════════════════════════════════
         // A smem base addresses for cp.async (buffer 0, all chunks)
-        //
-        // For BK=32: chunks at +0, +2048 (ga0 -> rows 0-31, ga1 -> rows 32-63)
-        // For BK=64: chunks at +0, +2048, +4096, +6144
-        //   ga0 -> chunk 0 (rows 0-31, K-cols 0-31)
-        //   ga1 -> chunk 1 (rows 32-63, K-cols 0-31)
-        //   ga2 -> chunk 2 (rows 0-31, K-cols 32-63) = ga0 + 64 bytes
-        //   ga3 -> chunk 3 (rows 32-63, K-cols 32-63) = ga1 + 64 bytes
+        // Each chunk is 2048 bytes apart in smem.
         // ═══════════════════════════════════════════════════════════════
         let mut a_st: Vec<Reg> = Vec::with_capacity(cp_chunks_a as usize);
         let a_st0 = ptx.regs.alloc_b32();
@@ -124,23 +125,8 @@ impl MainloopPipeline {
             a_st.push(r);
         }
 
-        // Build ga_all: all global A source pointers for cp.async chunks.
-        // For BK=32: [ga0, ga1]
-        // For BK=64: [ga0, ga1, ga0+64, ga1+64]
-        let mut ga_all: Vec<Reg> = vec![ga0, ga1];
-        for i in 2..cp_chunks_a {
-            let r = ptx.regs.alloc_b64();
-            // Extra chunks cover additional K-columns of the same rows.
-            // Chunk i corresponds to the same row-half as chunk (i%2), but
-            // offset by ((i/2) * 32) K-columns, where each f16 element = 2 bytes.
-            // But global A is row-major with stride K (full), not BK.
-            // Since each thread reads contiguous 16 bytes from its row position,
-            // advancing by 32 K-cols means adding 32*2 = 64 bytes to the
-            // thread's starting address.
-            let base = if i % 2 == 0 { ga0 } else { ga1 };
-            ptx.add_s64_imm(r, base, ((i / 2) * 64) as i64);
-            ga_all.push(r);
-        }
+        // ga_all: use the caller-provided global pointers directly
+        let ga_all = ga_chunks;
 
         // B smem base addresses for cp.async (buffer 0, all chunks)
         let b_cp_base_smem = ptx.regs.alloc_b32();
@@ -155,39 +141,8 @@ impl MainloopPipeline {
             b_cp.push(r);
         }
 
-        // Build gb_all: all global B source pointers for cp.async chunks.
-        // For BK=32: [gb0, gb1] (rows 0-15, 16-31)
-        // For BK=64: [gb0, gb1, gb2, gb3] (rows 0-15, 16-31, 32-47, 48-63)
-        //   gb2 = gb0 + 32*N*2 (advance 32 rows in B, each row is N elements)
-        //   gb3 = gb1 + 32*N*2
-        let mut gb_all: Vec<Reg> = vec![gb0, gb1];
-        if cp_chunks_b > 2 {
-            // Compute 32*N*2 = 64*N as byte offset for extra B rows
-            let b_row32_stride = ptx.regs.alloc_b64();
-            {
-                let n_x64 = ptx.regs.alloc_b32();
-                ptx.shl_b32(n_x64, n_param, 6); // N * 64
-                let two_r = ptx.regs.alloc_b32();
-                ptx.mov_b32_imm(two_r, 1);
-                ptx.mul_wide_s32(b_row32_stride, n_x64, two_r);
-            }
-            for i in 2..cp_chunks_b {
-                let r = ptx.regs.alloc_b64();
-                let base = if i % 2 == 0 { gb0 } else { gb1 };
-                // For chunk i, add (i/2)*32 rows worth of stride.
-                // Since chunks 0,1 are rows 0-15 and 16-31 (first 32 rows),
-                // chunks 2,3 are rows 32-47 and 48-63.
-                // The offset is (i/2) * 32*N*2 but we already computed 32*N*2.
-                // For i=2,3: (i/2)=1, so add 1 * b_row32_stride.
-                if i / 2 == 1 {
-                    ptx.add_s64(r, base, b_row32_stride);
-                } else {
-                    // For even larger BK, would need i/2 * stride. Not needed for BK=64.
-                    panic!("BK > 64 not supported (would need multi-stride B offsets)");
-                }
-                gb_all.push(r);
-            }
-        }
+        // gb_all: use the caller-provided global pointers directly
+        let gb_all = gb_chunks;
         ptx.blank();
 
         // ═══════════════════════════════════════════════════════════════
@@ -284,11 +239,17 @@ impl MainloopPipeline {
         }
         ptx.blank();
 
+        let reg_m = c.reg_m();
+        let reg_n = c.reg_n();
+
         // ═══════════════════════════════════════════════════════════════
         // Precompute ldmatrix swizzle offsets (constant across K-loop)
         // ═══════════════════════════════════════════════════════════════
         ptx.comment("ldmatrix swizzle offsets");
 
+        // A ldmatrix offsets: same for 64×64 and 128×128
+        // The formula only depends on BK (controls ki XOR) and BM (controls rm chunk stride).
+        // For BM=128, we have 4 rm groups at +0, +2048, +4096, +6144 within each ki chunk-pair.
         let tid_x64 = ptx.regs.alloc_b32();
         ptx.shl_b32(tid_x64, tid, 6);
         let a_ld_r0 = ptx.regs.alloc_b32();
@@ -329,11 +290,21 @@ impl MainloopPipeline {
             a_off.push(off);
         }
 
+        // B ldmatrix offsets: depend on BN.
+        // b_ld_row shift = log2(BN*2), mask = 31 * BN * 2
+        // For BN=64:  shift=7, mask=3968
+        // For BN=128: shift=8, mask=7936
         let lane = setup.lane;
-        let tid_x128 = ptx.regs.alloc_b32();
-        ptx.shl_b32(tid_x128, tid, 7);
+        let b_row_shift = (c.bn * 2).trailing_zeros();
+        let b_row_mask = 31 * c.bn * 2;
+        let tid_shifted_b = ptx.regs.alloc_b32();
+        ptx.shl_b32(tid_shifted_b, tid, b_row_shift);
         let b_ld_row = ptx.regs.alloc_b32();
-        ptx.and_b32(b_ld_row, tid_x128, 3968);
+        ptx.and_b32(b_ld_row, tid_shifted_b, b_row_mask);
+
+        // b_ld_col: same formula for all configs
+        // For BN=64:  (lane & 7) << 4   (using lane)
+        // For BN=128: (tid << 4) & 112   (equivalent to (tid & 7) << 4 = (lane & 7) << 4)
         let lane_and7 = ptx.regs.alloc_b32();
         ptx.and_b32(lane_and7, lane, 7);
         let b_ld_col = ptx.regs.alloc_b32();
@@ -344,15 +315,33 @@ impl MainloopPipeline {
         ptx.and_b32(b_ld_swiz, tid_shr1, 16);
         let b_col_xor = ptx.regs.alloc_b32();
         ptx.xor_b32(b_col_xor, b_ld_col, b_ld_swiz);
-        let b_off_rn0 = ptx.regs.alloc_b32();
-        ptx.or_b32(b_off_rn0, b_col_xor, b_ld_row);
-        let b_off_rn1 = ptx.regs.alloc_b32();
-        ptx.xor_b32_imm(b_off_rn1, b_off_rn0, 32);
-        let b_off_rn2 = ptx.regs.alloc_b32();
-        ptx.xor_b32_imm(b_off_rn2, b_off_rn0, 64);
-        let b_off_rn3 = ptx.regs.alloc_b32();
-        ptx.xor_b32_imm(b_off_rn3, b_off_rn0, 96);
-        let b_off = [b_off_rn0, b_off_rn1, b_off_rn2, b_off_rn3];
+        let b_off_base = ptx.regs.alloc_b32();
+        ptx.or_b32(b_off_base, b_col_xor, b_ld_row);
+
+        // Build b_off array for all rn values.
+        // Within each column group of 4, use XOR 0,32,64,96.
+        // Across column groups, add b_col_group_stride (128 bytes).
+        let b_col_group_stride = c.b_col_group_stride();
+        let mut b_off: Vec<Reg> = Vec::with_capacity(reg_n as usize);
+        for rn in 0..reg_n {
+            let group = rn / 4;
+            let within = rn % 4;
+            let xor_val = within * 32;
+            let group_off = group * b_col_group_stride;
+            let r = ptx.regs.alloc_b32();
+            if xor_val == 0 && group_off == 0 {
+                ptx.mov_b32(r, b_off_base);
+            } else if group_off == 0 {
+                ptx.xor_b32_imm(r, b_off_base, xor_val);
+            } else if xor_val == 0 {
+                ptx.add_s32_imm(r, b_off_base, group_off as i32);
+            } else {
+                let tmp = ptx.regs.alloc_b32();
+                ptx.xor_b32_imm(tmp, b_off_base, xor_val);
+                ptx.add_s32_imm(r, tmp, group_off as i32);
+            }
+            b_off.push(r);
+        }
         ptx.blank();
 
         // ═══════════════════════════════════════════════════════════════
@@ -380,11 +369,11 @@ impl MainloopPipeline {
         // ═══════════════════════════════════════════════════════════════
         // Initialize accumulators
         // ═══════════════════════════════════════════════════════════════
-        ptx.comment("Initialize accumulators to 0.0f");
+        ptx.comment(&format!("Initialize accumulators to 0.0f (REG_M={}, REG_N={}, {} tiles)", reg_m, reg_n, reg_m * reg_n));
         let zero = ptx.regs.alloc_b32();
         ptx.mov_b32_imm(zero, 0x00000000);
 
-        let num_tiles = (REG_M * REG_N) as usize;
+        let num_tiles = (reg_m * reg_n) as usize;
         let mut acc_regs: Vec<[Reg; 4]> = Vec::with_capacity(num_tiles);
         for _ in 0..num_tiles {
             let tile = [
@@ -398,8 +387,8 @@ impl MainloopPipeline {
         }
         let acc = AccumulatorMap {
             regs: acc_regs,
-            reg_m: REG_M,
-            reg_n: REG_N,
+            reg_m,
+            reg_n,
         };
         ptx.blank();
 
@@ -447,16 +436,21 @@ impl MainloopPipeline {
         // For each rn, issue b_ld_groups ldmatrix.x4.trans calls.
         // Group 0: rows 0-31 (4 regs), Group 1: rows 32-63 (4 more regs).
         // b_frags[rn] has 4*b_ld_groups registers total.
-        ptx.comment(&format!("ldmatrix.trans B -- {} loads x {} groups", REG_N, b_ld_groups));
+        //
+        // For BN=128, the B column group offset differs from the K-row group offset.
+        // The ldmatrix.trans addresses use b_off[rn] which already encodes the
+        // column group offset. The K-row group offset (for BK>32) is at
+        // grp * 32 * BN * 2 bytes from the B region start.
+        ptx.comment(&format!("ldmatrix.trans B -- {} loads x {} groups", reg_n, b_ld_groups));
         let mut b_frags: Vec<Vec<Reg>> = Vec::new();
-        for rn in 0..REG_N as usize {
+        for rn in 0..reg_n as usize {
             let mut frag_regs = Vec::new();
             for grp in 0..b_ld_groups as usize {
                 let b_addr = ptx.regs.alloc_b32();
                 ptx.add_s32(b_addr, buf_base, b_off[rn]);
                 // Add offset for additional K-row groups:
                 // Group 0 is at b_start (rows 0-31).
-                // Group 1 is at b_start + 32*BN*2 = b_start + 4096 (rows 32-63).
+                // Group 1 is at b_start + 32*BN*2 (rows 32-63).
                 let grp_off = b_start + (grp as i32) * (32 * c.bn as i32 * 2);
                 let frag = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
                             ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
@@ -475,19 +469,18 @@ impl MainloopPipeline {
             ptx.add_s32(a_addr, buf_base, a_off[ki]);
 
             // A fragments for each rm, immediately consumed by MMA
-            for rm in 0..REG_M as usize {
+            for rm in 0..reg_m as usize {
                 let mut a_frag = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
                                   ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
-                // rm=1 data is in the next 2048-byte chunk from rm=0 within
-                // the same K-column group. This is always +2048 regardless of BK.
-                // (Chunks are laid out as: rm=0-K0, rm=1-K0, rm=0-K1, rm=1-K1, ...)
-                let a_rm_off = if rm == 0 { None } else { Some(2048_i32) };
+                // Each rm occupies a 2048-byte chunk within the A tile.
+                // rm=0 at +0, rm=1 at +2048, rm=2 at +4096, rm=3 at +6144.
+                let a_rm_off = if rm == 0 { None } else { Some((rm as i32) * 2048_i32) };
                 ptx.ldmatrix_x4(a_frag, a_addr, a_rm_off);
                 transform_a.emit_transform(ptx, &mut a_frag, ki as u32, rm as u32);
 
                 // MMA with all rn for this rm
-                for rn in 0..REG_N as usize {
-                    let ai = rm * REG_N as usize + rn;
+                for rn in 0..reg_n as usize {
+                    let ai = rm * reg_n as usize + rn;
                     let mut acc_tile = acc.regs[ai];
                     let b_sel = [b_frags[rn][ki * 2], b_frags[rn][ki * 2 + 1]];
                     mma.emit_mma(ptx, a_frag, b_sel, &mut acc_tile);

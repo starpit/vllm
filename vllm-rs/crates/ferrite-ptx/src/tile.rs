@@ -214,19 +214,47 @@ pub fn emit_norm_factor_computation_inner(
     eps: f32,
     pre_allocated_base: Option<Reg>,
 ) -> Reg {
-    ptx.comment("=== RMSNorm norm factor computation (parallel) ===");
+    // Determine parallelism based on caller's context.
+    // The number of rows to process is inferred from the smem reservation:
+    // norm_factors region holds (norm_factors_off bytes after gemm_smem) / 4 rows.
+    // But we don't have BM here. Use a heuristic: if hidden_size >= 4096 and
+    // we're called from a 128-row context, use 1 thread/row. Otherwise 2 threads/row.
+    //
+    // Actually, let's just check: with 128 threads, 2 threads/row gives 64 rows.
+    // If we need more rows, we must use 1 thread/row.
+    // The caller should use the _cfg variant for BM>64.
+    emit_norm_factor_computation_cfg(ptx, input_ptr, block_row, tid, smem_base,
+        norm_factors_off, hidden_size, eps, pre_allocated_base, 2)
+}
+
+/// Config-aware norm factor computation.
+/// `threads_per_row`: 2 for BM<=64 (cooperative halving), 1 for BM=128 (single-thread).
+pub fn emit_norm_factor_computation_cfg(
+    ptx: &mut PtxBuilder,
+    input_ptr: Reg,
+    block_row: Reg,
+    tid: Reg,
+    smem_base: Reg,
+    norm_factors_off: u32,
+    hidden_size: u32,
+    eps: f32,
+    pre_allocated_base: Option<Reg>,
+    threads_per_row: u32,
+) -> Reg {
+    ptx.comment(&format!("=== RMSNorm norm factor computation ({} threads/row) ===", threads_per_row));
     ptx.blank();
 
     let norm_factors_base = pre_allocated_base.unwrap_or_else(|| ptx.regs.alloc_b32());
     ptx.add_s32_imm(norm_factors_base, smem_base, norm_factors_off as i32);
 
-    let elems_per_half = hidden_size / 2;
+    let elems_per_thread = hidden_size / threads_per_row;
+    let tpr_shift = threads_per_row.trailing_zeros();
 
-    // my_row = tid / 2, my_half = tid & 1
+    // my_row = tid / threads_per_row, my_part = tid % threads_per_row
     let my_row = ptx.regs.alloc_b32();
-    ptx.shr_u32(my_row, tid, 1);
-    let my_half = ptx.regs.alloc_b32();
-    ptx.and_b32(my_half, tid, 1);
+    ptx.shr_u32(my_row, tid, tpr_shift);
+    let my_part = ptx.regs.alloc_b32();
+    ptx.and_b32(my_part, tid, threads_per_row - 1);
 
     // Global row address: input_ptr + (block_row + my_row) * hidden_size * 2
     let global_row = ptx.regs.alloc_b32();
@@ -238,26 +266,24 @@ pub fn emit_norm_factor_computation_inner(
         ptx.mad_wide_s32(row_addr, global_row, hs_bytes, input_ptr);
     }
 
-    // Thread's element offset within the row: my_half * elems_per_half * 2 bytes
-    let half_byte_off = ptx.regs.alloc_b64();
+    // Thread's element offset within the row: my_part * elems_per_thread * 2 bytes
+    let part_byte_off = ptx.regs.alloc_b64();
     {
-        let half_bytes = ptx.regs.alloc_b32();
-        ptx.mov_b32_imm(half_bytes, elems_per_half * 2);
-        ptx.mul_wide_s32(half_byte_off, my_half, half_bytes);
+        let part_bytes = ptx.regs.alloc_b32();
+        ptx.mov_b32_imm(part_bytes, elems_per_thread * 2);
+        ptx.mul_wide_s32(part_byte_off, my_part, part_bytes);
     }
     let thread_addr = ptx.regs.alloc_b64();
-    ptx.add_s64(thread_addr, row_addr, half_byte_off);
+    ptx.add_s64(thread_addr, row_addr, part_byte_off);
 
     // Compute partial sum-of-squares using a loop with unrolled v4 loads
     let partial_sum = ptx.regs.alloc_f32();
     ptx.mov_f32_imm(partial_sum, 0.0);
 
-    // elems_per_half / 2 = pairs, /4 = v4 loads (each v4 loads 4 pairs = 8 f16s)
-    // Actually each v4.b32 loads 4 b32s = 8 f16s.
-    // elems_per_half = 2048 elements = 1024 pairs = 256 v4 loads
-    let num_v4_loads = elems_per_half / 8; // 256
+    // Each v4.b32 loads 4 b32s = 8 f16s.
+    let num_v4_loads = elems_per_thread / 8;
     let unroll = 4u32;
-    let loop_iters = num_v4_loads / unroll; // 64
+    let loop_iters = num_v4_loads / unroll;
 
     let loop_ctr = ptx.regs.alloc_b32();
     ptx.mov_b32_imm(loop_ctr, 0);
@@ -297,33 +323,48 @@ pub fn emit_norm_factor_computation_inner(
     }
     ptx.blank();
 
-    // Reduce with partner thread via shfl.bfly delta=1
-    let sum_b32 = ptx.regs.alloc_b32();
-    ptx.mov_f32_to_b32(sum_b32, partial_sum);
-    let partner_sum = ptx.regs.alloc_b32();
-    ptx.shfl_bfly(partner_sum, sum_b32, 1);
-    let partner_f32 = ptx.regs.alloc_f32();
-    ptx.mov_b32_to_f32(partner_f32, partner_sum);
-    ptx.add_f32(partial_sum, partial_sum, partner_f32);
+    if threads_per_row > 1 {
+        // Reduce with partner thread(s) via shfl.bfly
+        for delta in 0..tpr_shift {
+            let sum_b32 = ptx.regs.alloc_b32();
+            ptx.mov_f32_to_b32(sum_b32, partial_sum);
+            let partner_sum = ptx.regs.alloc_b32();
+            ptx.shfl_bfly(partner_sum, sum_b32, 1 << delta);
+            let partner_f32 = ptx.regs.alloc_f32();
+            ptx.mov_b32_to_f32(partner_f32, partner_sum);
+            ptx.add_f32(partial_sum, partial_sum, partner_f32);
+        }
+    }
 
-    // Even threads (tid & 1 == 0) have the full row sum
+    // Compute norm factor: rsqrt(mean_sq + eps)
     let mean_val = ptx.regs.alloc_f32();
     ptx.mul_f32_imm(mean_val, partial_sum, 1.0f32 / hidden_size as f32);
     ptx.add_f32_imm(mean_val, mean_val, eps);
     let scale = ptx.regs.alloc_f32();
     ptx.rsqrt_approx_f32(scale, mean_val);
 
-    // Only even threads store
-    let p_even = ptx.regs.alloc_pred();
-    ptx.setp_eq_s32(p_even, my_half, 0);
+    if threads_per_row > 1 {
+        // Only first thread in each group stores
+        let p_first = ptx.regs.alloc_pred();
+        ptx.setp_eq_s32(p_first, my_part, 0);
 
-    let scale_b32 = ptx.regs.alloc_b32();
-    ptx.mov_f32_to_b32(scale_b32, scale);
-    let row_off = ptx.regs.alloc_b32();
-    ptx.shl_b32(row_off, my_row, 2);
-    let row_factor_addr = ptx.regs.alloc_b32();
-    ptx.add_s32(row_factor_addr, norm_factors_base, row_off);
-    ptx.w(&format!("@{p_even} st.shared.b32 \t[{row_factor_addr}], {scale_b32};"));
+        let scale_b32 = ptx.regs.alloc_b32();
+        ptx.mov_f32_to_b32(scale_b32, scale);
+        let row_off = ptx.regs.alloc_b32();
+        ptx.shl_b32(row_off, my_row, 2);
+        let row_factor_addr = ptx.regs.alloc_b32();
+        ptx.add_s32(row_factor_addr, norm_factors_base, row_off);
+        ptx.w(&format!("@{p_first} st.shared.b32 \t[{row_factor_addr}], {scale_b32};"));
+    } else {
+        // All threads store (1 thread per row, no predicate needed)
+        let scale_b32 = ptx.regs.alloc_b32();
+        ptx.mov_f32_to_b32(scale_b32, scale);
+        let row_off = ptx.regs.alloc_b32();
+        ptx.shl_b32(row_off, my_row, 2);
+        let row_factor_addr = ptx.regs.alloc_b32();
+        ptx.add_s32(row_factor_addr, norm_factors_base, row_off);
+        ptx.st_shared_b32(row_factor_addr, 0, scale_b32);
+    }
     ptx.bar_sync(0);
     ptx.blank();
 

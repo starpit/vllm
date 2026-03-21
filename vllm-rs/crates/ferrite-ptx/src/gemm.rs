@@ -164,7 +164,9 @@ pub struct AccumulatorMap {
     pub reg_n: u32,
 }
 
-// Hard-coded register tile dimensions matching the hand-written PTX.
+// Legacy hard-coded register tile dimensions for the emit_gemm_with_loaders path.
+// These match the original 64×64 hand-written kernel constants.
+// The new pipeline-based path (MainloopPipeline) derives REG_M/REG_N from GemmConfig.
 const REG_M: u32 = 2;
 const REG_N: u32 = 4;
 
@@ -2134,20 +2136,45 @@ pub fn emit_store_c(
 
     let tg2 = ptx.regs.alloc_b32();
     ptx.shl_b32(tg2, setup.tg, 1);
-    let tg2p1 = ptx.regs.alloc_b32();
-    ptx.add_s32_imm(tg2p1, tg2, 1);
     let group8 = ptx.regs.alloc_b32();
     ptx.add_s32_imm(group8, setup.group, 8);
 
+    // Warp layout decomposition.
+    // For 1×4 (warps_n=4): warp_m = 0, warp_n = warp_id
+    // For 2×2 (warps_n=2): warp_m = warp_id/2, warp_n = warp_id%2
+    let warps_n = c.warps_n();
+    let warps_n_shift = warps_n.trailing_zeros();
+
+    let warp_m = ptx.regs.alloc_b32();
+    ptx.shr_u32(warp_m, setup.warp_id, warps_n_shift);
+    let warp_n = ptx.regs.alloc_b32();
+    ptx.and_b32(warp_n, setup.warp_id, warps_n - 1);
+
+    // Column base: block_col + warp_n * WN + tg*2
     let warp_col_base = ptx.regs.alloc_b32();
-    let warp_x16 = ptx.regs.alloc_b32();
-    ptx.shl_b32(warp_x16, setup.warp_id, 4);
-    ptx.add_s32(warp_col_base, setup.block_col, warp_x16);
+    let warp_n_off = ptx.regs.alloc_b32();
+    ptx.shl_b32(warp_n_off, warp_n, c.wn.trailing_zeros());
+    ptx.add_s32(warp_col_base, setup.block_col, warp_n_off);
+
+    // Row base: block_row + warp_m * MMA_M + group
+    //
+    // For the MMA m16n8k16 accumulator layout:
+    //   d0 = C[group_id, tg*2]         (group_id = lane / 4, 0..7)
+    //   d1 = C[group_id, tg*2+1]
+    //   d2 = C[group_id+8, tg*2]       (+8 rows in the m16 tile)
+    //   d3 = C[group_id+8, tg*2+1]
+    //
+    // warp_m * MMA_M gives the base row offset within the warp's M-region.
+    // Each rm adds MMA_M * 2 = 32 rows (one m16 tile covers rows [base..base+15]).
+    let warp_m_off = ptx.regs.alloc_b32();
+    ptx.shl_b32(warp_m_off, warp_m, c.mma_m.trailing_zeros());
 
     let row_a0 = ptx.regs.alloc_b32();
-    ptx.add_s32(row_a0, setup.block_row, setup.group);
+    ptx.add_s32(row_a0, setup.block_row, warp_m_off);
+    ptx.add_s32(row_a0, row_a0, setup.group);
     let row_b0 = ptx.regs.alloc_b32();
-    ptx.add_s32(row_b0, setup.block_row, group8);
+    ptx.add_s32(row_b0, setup.block_row, warp_m_off);
+    ptx.add_s32(row_b0, row_b0, group8);
 
     let row_a0_x_n = ptx.regs.alloc_b32();
     ptx.mul_lo_s32(row_a0_x_n, row_a0, n_param);
@@ -2339,6 +2366,159 @@ pub fn emit_b_global_addrs(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Config-aware address computation for the pipeline path
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Emit cp.async swizzle address computation, config-aware.
+/// For BN=128, the B swizzle mask differs from BN=64.
+pub fn emit_cpasync_swizzle_cfg(ptx: &mut PtxBuilder, c: &GemmConfig, tid: Reg) -> (Reg, Reg) {
+    ptx.comment("cp.async swizzle addresses (config-aware)");
+    let tid_x16 = ptx.regs.alloc_b32();
+    ptx.shl_b32(tid_x16, tid, 4);
+    let cp_base = ptx.regs.alloc_b32();
+    ptx.and_b32(cp_base, tid_x16, 2032);
+
+    // A swizzle: (tid & (BK-8)) << 1, masked to 48 for BK=32
+    // For BK=32: a_swiz = (tid << 1) & 48 = ((tid & 24) << 1)
+    // This is equivalent to: tid & (BK-8) gives the 2-bit K-group index, shift left for byte offset
+    let tid_x2 = ptx.regs.alloc_b32();
+    ptx.shl_b32(tid_x2, tid, 1);
+    let a_swiz = ptx.regs.alloc_b32();
+    ptx.and_b32(a_swiz, tid_x2, 48);
+    let a_cp_off = ptx.regs.alloc_b32();
+    ptx.xor_b32(a_cp_off, cp_base, a_swiz);
+
+    // B swizzle depends on BN:
+    // For BN=64:  b_swiz = (tid << 1) & 112   (threads_per_row=8, 3-bit row index)
+    // For BN=128: b_swiz = tid & 112           (threads_per_row=16, different mapping)
+    let b_threads_per_row = c.bn / 8;
+    let b_swiz = ptx.regs.alloc_b32();
+    if b_threads_per_row <= 8 {
+        // BN <= 64: use (tid << 1) & 112
+        ptx.and_b32(b_swiz, tid_x2, 112);
+    } else {
+        // BN >= 128: use tid & 112 directly
+        ptx.and_b32(b_swiz, tid, 112);
+    }
+    let b_cp_off = ptx.regs.alloc_b32();
+    ptx.xor_b32(b_cp_off, cp_base, b_swiz);
+    ptx.blank();
+
+    (a_cp_off, b_cp_off)
+}
+
+/// Emit A global address computation, returning one pointer per cp.async chunk.
+///
+/// For BM=64: returns 2 pointers (rows 0-31, 32-63)
+/// For BM=128: returns 4 pointers (rows 0-31, 32-63, 64-95, 96-127)
+/// For BK=64: returns 4 pointers (rows 0-31/K0-31, rows 32-63/K0-31, rows 0-31/K32-63, rows 32-63/K32-63)
+pub fn emit_a_global_addrs_cfg(
+    ptx: &mut PtxBuilder,
+    c: &GemmConfig,
+    block_row: Reg, k_param: Reg, a_ptr: Reg, tid: Reg,
+) -> Vec<Reg> {
+    ptx.comment(&format!("Global addresses for A ({}x{}, {} chunks)", c.bm, c.bk, c.cp_chunks_a()));
+    let a_tid_and3 = ptx.regs.alloc_b32();
+    ptx.and_b32(a_tid_and3, tid, 3);
+    let a_tid_col = ptx.regs.alloc_b32();
+    ptx.shl_b32(a_tid_col, a_tid_and3, 3);
+    let a_tid_row = ptx.regs.alloc_b32();
+    ptx.shr_u32(a_tid_row, tid, 2);
+
+    let row_chunks = c.bm / 32;   // 2 for BM=64, 4 for BM=128
+    let kcol_chunks = c.bk / 32;   // 1 for BK=32, 2 for BK=64
+
+    // First chunk: grow = block_row + a_tid_row, gidx = grow * K + a_tid_col
+    let grow_base = ptx.regs.alloc_b32();
+    ptx.add_s32(grow_base, block_row, a_tid_row);
+
+    // Compute row stride for A: 32 rows * K * 2 bytes
+    let a_row_stride = ptx.regs.alloc_b64();
+    {
+        let k_x32 = ptx.regs.alloc_b32();
+        ptx.shl_b32(k_x32, k_param, 5); // K * 32
+        let two_r = ptx.regs.alloc_b32();
+        ptx.mov_b32_imm(two_r, 2);
+        ptx.mul_wide_s32(a_row_stride, k_x32, two_r); // K * 32 * 2 bytes
+    }
+
+    let mut ga_all = Vec::new();
+    for rc in 0..row_chunks {
+        let grow = ptx.regs.alloc_b32();
+        if rc == 0 {
+            ptx.mov_b32(grow, grow_base);
+        } else {
+            ptx.add_s32_imm(grow, grow_base, (rc * 32) as i32);
+        }
+
+        let gidx = ptx.regs.alloc_b32();
+        ptx.mul_lo_s32(gidx, grow, k_param);
+        ptx.add_s32(gidx, gidx, a_tid_col);
+        let ga = ptx.regs.alloc_b64();
+        ptx.mad_wide_s32_imm(ga, gidx, 2, a_ptr);
+        ga_all.push(ga);
+
+        // Additional K-column chunks for this row group
+        for kc in 1..kcol_chunks {
+            let ga_k = ptx.regs.alloc_b64();
+            ptx.add_s64_imm(ga_k, ga, (kc * 64) as i64);
+            ga_all.push(ga_k);
+        }
+    }
+    ptx.blank();
+
+    assert_eq!(ga_all.len(), c.cp_chunks_a() as usize);
+    ga_all
+}
+
+/// Emit B global address computation, returning one pointer per cp.async chunk.
+///
+/// For BN=64: returns 2 pointers (B rows 0-15, 16-31)
+/// For BN=128: returns 4 pointers (B rows 0-7, 8-15, 16-23, 24-31)
+pub fn emit_b_global_addrs_cfg(
+    ptx: &mut PtxBuilder,
+    c: &GemmConfig,
+    block_col: Reg, n_param: Reg, b_ptr: Reg, tid: Reg,
+) -> Vec<Reg> {
+    let threads = c.threads();
+    let b_threads_per_row = c.bn / 8;  // 8 for BN=64, 16 for BN=128
+    let b_rows_per_chunk = threads / b_threads_per_row;  // 16 for BN=64, 8 for BN=128
+    let cp_chunks = c.cp_chunks_b();
+
+    ptx.comment(&format!("Global addresses for B ({} rows/chunk, {} chunks)", b_rows_per_chunk, cp_chunks));
+
+    let b_tid_col_idx = ptx.regs.alloc_b32();
+    ptx.and_b32(b_tid_col_idx, tid, b_threads_per_row - 1);
+    let b_tid_col = ptx.regs.alloc_b32();
+    ptx.shl_b32(b_tid_col, b_tid_col_idx, 3);
+    let b_tid_row = ptx.regs.alloc_b32();
+    ptx.shr_u32(b_tid_row, tid, b_threads_per_row.trailing_zeros());
+
+    let gcol_b = ptx.regs.alloc_b32();
+    ptx.add_s32(gcol_b, block_col, b_tid_col);
+
+    let mut gb_all = Vec::new();
+    for chunk in 0..cp_chunks {
+        let brow = ptx.regs.alloc_b32();
+        if chunk == 0 {
+            ptx.add_s32_imm(brow, b_tid_row, 0);
+        } else {
+            ptx.add_s32_imm(brow, b_tid_row, (chunk * b_rows_per_chunk) as i32);
+        }
+
+        let gidx = ptx.regs.alloc_b32();
+        ptx.mul_lo_s32(gidx, brow, n_param);
+        ptx.add_s32(gidx, gidx, gcol_b);
+        let gb = ptx.regs.alloc_b64();
+        ptx.mad_wide_s32_imm(gb, gidx, 2, b_ptr);
+        gb_all.push(gb);
+    }
+    ptx.blank();
+
+    gb_all
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // build_gemm — standalone GEMM kernel using CpAsyncLoader for both A and B
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2418,7 +2598,7 @@ fn gemm_params() -> Vec<(&'static str, &'static str)> {
 
 /// Build a complete GEMM kernel PTX string using the MainloopPipeline.
 /// This produces identical behavior to build_gemm() but uses the
-/// pluggable atom architecture.
+/// pluggable atom architecture. Supports any config (64×64, 128×128, etc).
 pub fn build_gemm_pipeline(config: &GemmConfig) -> String {
     use crate::atoms::{CpAsyncCopy, IdentityTransform, Mma16816, IdentityEpilogue, EpilogueAtom};
     use crate::pipeline::MainloopPipeline;
@@ -2445,15 +2625,15 @@ pub fn build_gemm_pipeline(config: &GemmConfig) -> String {
     // Phase 2: Thread/block setup
     let setup = emit_gemm_setup(&mut ptx, c);
 
-    // Phase 3: cp.async swizzle addresses
-    let (a_cp_off, b_cp_off) = emit_cpasync_swizzle(&mut ptx, setup.tid);
+    // Phase 3: cp.async swizzle addresses (config-aware)
+    let (a_cp_off, b_cp_off) = emit_cpasync_swizzle_cfg(&mut ptx, c, setup.tid);
 
-    // Phase 4: Global addresses
-    let (ga0, ga1, _, _) = emit_a_global_addrs(
-        &mut ptx, setup.block_row, k_param, a_ptr, setup.tid,
+    // Phase 4: Global addresses (config-aware, returns Vec)
+    let ga_chunks = emit_a_global_addrs_cfg(
+        &mut ptx, c, setup.block_row, k_param, a_ptr, setup.tid,
     );
-    let (gb0, gb1) = emit_b_global_addrs(
-        &mut ptx, setup.block_col, n_param, b_ptr, setup.tid,
+    let gb_chunks = emit_b_global_addrs_cfg(
+        &mut ptx, c, setup.block_col, n_param, b_ptr, setup.tid,
     );
 
     // Phase 5: Pipeline with Identity atoms (standalone GEMM)
@@ -2464,8 +2644,8 @@ pub fn build_gemm_pipeline(config: &GemmConfig) -> String {
         &CpAsyncCopy,          // copy_b
         &IdentityTransform,    // no transform
         &Mma16816,             // tensor core MMA
-        ga0, ga1, a_cp_off,
-        gb0, gb1, b_cp_off,
+        ga_chunks, a_cp_off,
+        gb_chunks, b_cp_off,
         n_param, k_param,
         None,                  // no extra advance
     );

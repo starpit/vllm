@@ -85,12 +85,10 @@ fn generate_rmsnorm_gemm_silu(
     let fn_attrs = &input_fn.attrs;
     let _ = (norm_idx, gemm_idx, silu_idx); // used for graph analysis
 
-    // Generate PTX at compile time.
-    // We use the default 64x64 config with the user-specified architecture.
-    // The hidden_size is passed as a runtime parameter (K dimension).
+    // Generate PTX at compile time using 128×128 tiles for the fused megakernel.
     let config = ferrite_ptx::config::GemmConfig {
-        bm: 64, bn: 64, bk: 64,
-        wm: 64, wn: 16,
+        bm: 128, bn: 128, bk: 32,
+        wm: 64, wn: 64,
         mma_m: 16, mma_n: 8, mma_k: 16,
         num_stages: 2,
         sm_arch: arch.clone(),
@@ -103,7 +101,7 @@ fn generate_rmsnorm_gemm_silu(
 
     let ptx_string = ferrite_ptx::fused::build_fused_pipeline(&config, hidden_size);
 
-    // GEMM smem (num_stages * buf_stride) + scratch (32) + norm factors (256) + gamma preload (8192)
+    // Shared memory: GEMM tiles + norm scratch (32) + norm factors (BM*4) + gamma preload (hidden*2)
     let smem_bytes = (config.smem_total() + 32 + config.bm * 4 + hidden_size * 2) as u32;
     let threads = config.threads() as u32;
 
@@ -136,8 +134,8 @@ fn generate_rmsnorm_gemm_silu(
             //   param_output: ptr to output tensor (batch x out_features, f32)
             //   param_N:      out_features (u32)
             //   param_K:      hidden_size (u32)
-            let grid_x = (out_feat + 63) / 64;
-            let grid_y = (batch + 63) / 64;
+            let grid_x = (out_feat + 127) / 128;
+            let grid_y = (batch + 127) / 128;
             let grid = (grid_x, grid_y, 1u32);
             let block = (#threads, 1u32, 1u32);
             let shared_mem = #smem_bytes as u32;

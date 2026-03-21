@@ -254,12 +254,13 @@ pub fn build_fused_rmsnorm_gemm_silu(config: &GemmConfig, hidden_size: u32) -> S
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Build a fused RMSNorm -> GEMM -> SiLU kernel using the MainloopPipeline.
+/// Supports any GemmConfig (64×64, 128×128, etc).
 pub fn build_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
     use crate::atoms::{CpAsyncCopy, RmsNormAtom, Mma16816, SiLuEpilogue, EpilogueAtom};
     use crate::pipeline::MainloopPipeline;
     use crate::gemm::{
-        emit_gemm_setup, emit_cpasync_swizzle, emit_a_global_addrs,
-        emit_b_global_addrs, emit_store_c,
+        emit_gemm_setup, emit_cpasync_swizzle_cfg, emit_a_global_addrs_cfg,
+        emit_b_global_addrs_cfg, emit_store_c,
     };
 
     let mut ptx = PtxBuilder::new(config.clone());
@@ -273,12 +274,12 @@ pub fn build_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
     let gemm_smem = c.smem_total();               // num_stages * buf_stride
     let norm_scratch_off = gemm_smem;
     let norm_factors_off = norm_scratch_off + 32;
-    let gamma_smem_off = norm_factors_off + bm * 4; // 16672
+    let gamma_smem_off = norm_factors_off + bm * 4;
     let _gamma_smem_bytes = hidden_size * 2;
 
     ptx.comment("=== Fused RMSNorm -> GEMM -> SiLU (MainloopPipeline) ===");
     ptx.comment(&format!("BM={}, BN={}, BK={}, threads={}", bm, c.bn, bk, threads));
-    ptx.comment(&format!("hidden_size={}", hidden_size));
+    ptx.comment(&format!("hidden_size={}, REG_M={}, REG_N={}", hidden_size, c.reg_m(), c.reg_n()));
     ptx.blank();
 
     // Phase 1: Load parameters
@@ -300,11 +301,14 @@ pub fn build_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
     let setup = emit_gemm_setup(&mut ptx, c);
 
     // Phase A: RMSNorm — compute norm factors for all BM rows
+    // For BM<=64: 2 threads per row (cooperative halving)
+    // For BM=128: 1 thread per row (each thread processes full hidden_size)
+    let threads_per_row = if bm <= 64 { 2u32 } else { 1u32 };
     // Allocate norm_factors_base OUTSIDE the scope so it survives end_scope()
     let norm_factors_base = ptx.regs.alloc_b32();
     ptx.begin_scope();  // --- norm reduction temporaries: native PTX block scope ---
     let eps: f32 = 1e-6;
-    crate::tile::emit_norm_factor_computation_inner(
+    crate::tile::emit_norm_factor_computation_cfg(
         &mut ptx,
         input_ptr,
         setup.block_row,
@@ -314,6 +318,7 @@ pub fn build_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
         hidden_size,
         eps,
         Some(norm_factors_base),
+        threads_per_row,
     );
     ptx.end_scope();   // --- norm reduction temps die here (ptxas sees }) ---
 
@@ -360,16 +365,24 @@ pub fn build_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
     ptx.comment("=== Phase B: GEMM with RmsNormAtom via MainloopPipeline ===");
     ptx.blank();
 
-    let (a_cp_off, b_cp_off) = emit_cpasync_swizzle(&mut ptx, setup.tid);
+    let (a_cp_off, b_cp_off) = emit_cpasync_swizzle_cfg(&mut ptx, c, setup.tid);
 
-    let (ga0, ga1, _, _) = emit_a_global_addrs(
-        &mut ptx, setup.block_row, k_param, input_ptr, setup.tid,
+    let ga_chunks = emit_a_global_addrs_cfg(
+        &mut ptx, c, setup.block_row, k_param, input_ptr, setup.tid,
     );
-    let (gb0, gb1) = emit_b_global_addrs(
-        &mut ptx, setup.block_col, n_param, wgemm_ptr, setup.tid,
+    let gb_chunks = emit_b_global_addrs_cfg(
+        &mut ptx, c, setup.block_col, n_param, wgemm_ptr, setup.tid,
     );
 
-    // Create the RmsNormAtom k_setup
+    // Compute warp_m_offset for the RmsNormAtom.
+    // warp_m = warp_id / warps_n, warp_m_offset = warp_m * WM
+    let warps_n = c.warps_n();
+    let warp_m = ptx.regs.alloc_b32();
+    ptx.shr_u32(warp_m, setup.warp_id, warps_n.trailing_zeros());
+    let warp_m_offset = ptx.regs.alloc_b32();
+    ptx.shl_b32(warp_m_offset, warp_m, c.wm.trailing_zeros());
+
+    // Create the RmsNormAtom
     let k_offset_reg = ptx.regs.alloc_b32();
     ptx.mov_b32_imm(k_offset_reg, 0);
 
@@ -380,6 +393,8 @@ pub fn build_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
         setup.group,
         setup.tg,
         k_offset_reg,
+        c.reg_m(),
+        warp_m_offset,
     );
 
     // Extra advance: bump k_offset_reg by BK each iteration
@@ -395,8 +410,8 @@ pub fn build_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
         &CpAsyncCopy,
         &transform,
         &Mma16816,
-        ga0, ga1, a_cp_off,
-        gb0, gb1, b_cp_off,
+        ga_chunks, a_cp_off,
+        gb_chunks, b_cp_off,
         n_param, k_param,
         Some(&advance_fn),
     );
@@ -978,9 +993,11 @@ mod tests {
         let kloop_end = ptx.find("$L_K0_FALLTHROUGH:").expect("K0 fallthrough");
         let kloop = &ptx[kloop_start..kloop_end];
         let ldmatrix_trans_count = kloop.matches("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16").count();
-        // REG_N=4 rn positions * 2 groups = 8 ldmatrix.trans calls
-        assert_eq!(ldmatrix_trans_count, 8,
-            "BK=64 must have 8 ldmatrix.trans calls (4 rn x 2 groups), got {}", ldmatrix_trans_count);
+        // REG_N = wn/mma_n = 16/8 = 2 rn positions * 2 groups (BK=64) = 4 ldmatrix.trans calls
+        let expected = config.reg_n() * (config.bk / config.mma_k / 2);
+        assert_eq!(ldmatrix_trans_count, expected as usize,
+            "BK=64 must have {} ldmatrix.trans calls ({} rn x {} groups), got {}",
+            expected, config.reg_n(), config.bk / config.mma_k / 2, ldmatrix_trans_count);
 
         let entry_count = ptx.matches(".visible .entry").count();
         assert_eq!(entry_count, 1);
@@ -1010,6 +1027,106 @@ mod tests {
         assert!(ptx.contains("ki=3"));
 
         println!("BK=64 3-stage Pipeline GEMM PTX: {} bytes, {} lines",
+            ptx.len(), ptx.lines().count());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Tests for the 128×128 pipeline path
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_pipeline_128x128_gemm_generates_valid_ptx() {
+        let config = GemmConfig::default_128x128();
+        let ptx = crate::gemm::build_gemm_pipeline(&config);
+
+        assert!(ptx.contains(".visible .entry triton_style_gemm("),
+            "PTX must contain kernel entry point");
+
+        // Verify tile dimensions in comments
+        assert!(ptx.contains("config-aware"));
+
+        // 128×128 with BK=32: 4 cp.async chunks per A tile, 4 per B tile
+        assert_eq!(config.cp_chunks_a(), 4);
+        assert_eq!(config.cp_chunks_b(), 4);
+        assert_eq!(config.reg_m(), 4);
+        assert_eq!(config.reg_n(), 8);
+        assert_eq!(config.threads(), 128);
+
+        // Must have MMA instructions
+        assert!(ptx.contains("mma.sync.aligned.m16n8k16"));
+
+        // Must have ldmatrix (non-trans for A, trans for B)
+        assert!(ptx.contains("ldmatrix.sync.aligned.m8n8.x4.shared.b16"));
+        assert!(ptx.contains("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16"));
+
+        // K-loop should have ki=0 and ki=1 (BK=32, k_warp_iters=2)
+        assert!(ptx.contains("ki=0"));
+        assert!(ptx.contains("ki=1"));
+
+        // REG_M=4, REG_N=8 → 32 accumulator tiles → 128 acc registers
+        assert_eq!(config.num_acc(), 128);
+
+        // Single kernel
+        let entry_count = ptx.matches(".visible .entry").count();
+        assert_eq!(entry_count, 1);
+
+        println!("128x128 Pipeline GEMM PTX: {} bytes, {} lines",
+            ptx.len(), ptx.lines().count());
+    }
+
+    #[test]
+    fn test_pipeline_128x128_fused_generates_valid_ptx() {
+        let config = GemmConfig::default_128x128();
+        let ptx = build_fused_pipeline(&config, 4096);
+
+        assert!(ptx.contains(".visible .entry fused_rmsnorm_gemm_silu("),
+            "PTX must contain fused kernel entry point");
+
+        // Must have all phases
+        assert!(ptx.contains("rsqrt.approx.f32"),
+            "PTX must have RMSNorm");
+        assert!(ptx.contains("mma.sync.aligned.m16n8k16"),
+            "PTX must have MMA instructions");
+        assert!(ptx.contains("ex2.approx.f32"),
+            "PTX must have SiLU sigmoid");
+        assert!(ptx.contains("cp.async.cg.shared.global"),
+            "PTX must use cp.async");
+
+        // RmsNormAtom should load norm factors for all 4 rm values
+        assert!(ptx.contains("RmsNormAtom prologue: load norm factors into REGISTERS (REG_M=4)"),
+            "Must load norm factors for REG_M=4");
+
+        // K-loop with ki=0, ki=1 (BK=32)
+        assert!(ptx.contains("ki=0"));
+        assert!(ptx.contains("ki=1"));
+
+        // B ldmatrix: REG_N=8 loads × 1 group (BK=32) = 8 ldmatrix.trans
+        let kloop_start = ptx.find("$L_KLOOP:").expect("K-loop label");
+        let kloop_end = ptx.find("$L_K0_FALLTHROUGH:").expect("K0 fallthrough");
+        let kloop = &ptx[kloop_start..kloop_end];
+        let ldmatrix_trans_count = kloop.matches("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16").count();
+        assert_eq!(ldmatrix_trans_count, 8,
+            "128×128 must have 8 ldmatrix.trans calls (8 rn × 1 group), got {}", ldmatrix_trans_count);
+
+        // A ldmatrix: 4 rm × 2 ki = 8 ldmatrix calls
+        let ldmatrix_a_count = kloop.matches("ldmatrix.sync.aligned.m8n8.x4.shared.b16").count();
+        assert_eq!(ldmatrix_a_count, 8,
+            "128×128 must have 8 ldmatrix A calls (4 rm × 2 ki), got {}", ldmatrix_a_count);
+
+        // MMA count: 4 rm × 8 rn × 2 ki = 64 MMA instructions
+        let mma_count = kloop.matches("mma.sync.aligned.m16n8k16").count();
+        assert_eq!(mma_count, 64,
+            "128×128 must have 64 MMA instructions (4×8×2), got {}", mma_count);
+
+        // Single kernel
+        let entry_count = ptx.matches(".visible .entry").count();
+        assert_eq!(entry_count, 1);
+
+        // Smem: gemm(32768) + norm_scratch(32) + norm_factors(128*4=512) + gamma(4096*2=8192)
+        let expected_smem = config.smem_total() + 32 + config.bm * 4 + 4096 * 2;
+        assert_eq!(expected_smem, 32768 + 32 + 512 + 8192);
+
+        println!("128x128 Pipeline fused PTX: {} bytes, {} lines",
             ptx.len(), ptx.lines().count());
     }
 }

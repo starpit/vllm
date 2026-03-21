@@ -629,14 +629,22 @@ obsession with beating our own optimized unfused baseline obscured the real win.
 
 **Validated against real-world baselines (L4 GPU, SM89):**
 
-| Kernel (batch=1024, hidden=4096) | Time | TFLOPS | vs PyTorch |
-|----------------------------------|------|--------|-----------|
-| PyTorch unfused (RMSNorm+GEMM+SiLU) | 1151 μs | 29.9 | 1.0× |
-| Ferrite fused RmsNorm→GEMM→SiLU (hand-written) | 703 μs | 48.6 | **1.6× faster** |
-| Ferrite fused RmsNorm→GEMM→SiLU (proc macro) | ~660 μs | ~42 | **~1.7× faster** |
-| Ferrite MLP block (norm→GEMM→SiLU→GEMM, hand-written) | 1370 μs | 50.2 | **~1.7× faster** |
-| Ferrite MLP block (proc macro, DAG-composed) | 1229 μs | — | **1.5× faster** |
-| PyTorch MLP (norm+GEMM+SiLU+GEMM) | 1826 μs | 37.6 | 1.0× (MLP) |
+| MLP (batch=1024, hidden=inter=out=4096) | Time | TFLOPS | vs torch.compile |
+|------------------------------------------|------|--------|-----------------|
+| PyTorch eager (norm+GEMM+SiLU+GEMM) | 1729 μs | 40 | — |
+| PyTorch torch.compile | 1679 μs | 41 | 1.0× |
+| Ferrite MLP (proc macro, DAG-composed) | 1229 μs | 50 | **1.37× faster** |
+| Ferrite MLP (hand-written) | 1370 μs | 50 | **1.23× faster** |
+
+| MLP (batch=4096) | Time | TFLOPS | vs torch.compile |
+|-------------------|------|--------|-----------------|
+| PyTorch torch.compile | 6324 μs | 44 | 1.0× |
+| Ferrite MLP (proc macro) | 5221 μs | 53 | **1.21× faster** |
+
+| Fused RmsNorm→GEMM→SiLU (batch=1024) | Time | TFLOPS | vs eager |
+|---------------------------------------|------|--------|---------|
+| PyTorch eager | 1151 μs | 30 | 1.0× |
+| Ferrite fused (hand-written 128×128) | 703 μs | 49 | **1.6× faster** |
 
 | Kernel (batch=4096) | Time | TFLOPS | vs PyTorch |
 |---------------------|------|--------|-----------|

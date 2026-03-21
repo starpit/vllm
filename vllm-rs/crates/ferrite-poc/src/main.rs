@@ -90,6 +90,10 @@ fn main() -> Result<()> {
     println!("\nGEMM 128x128 (targeting 48+ TFLOPS)");
     run_gemm_128x128()?;
 
+    // Fused RmsNorm→GEMM→SiLU megakernel
+    println!("\nFused RmsNorm→GEMM→SiLU 128x128");
+    run_fused_128x128()?;
+
     println!("\n═══════════════════════════════════");
     println!("Phase 0 complete.");
     Ok(())
@@ -371,6 +375,221 @@ fn run_gemm_128x128() -> Result<()> {
     }
 
     unsafe { cuda::module::unload(module)?; }
+    Ok(())
+}
+
+// ===========================================================================
+// Fused RmsNorm→GEMM→SiLU 128×128 benchmark
+// ===========================================================================
+
+fn run_fused_128x128() -> Result<()> {
+    let ptx = gemm_128x128::emit_fused_128x128();
+    println!("  Generated {} bytes of PTX", ptx.len());
+
+    std::fs::write("/tmp/ferrite_fused_128x128.ptx", &ptx).ok();
+    println!("  [debug] PTX dumped to /tmp/ferrite_fused_128x128.ptx");
+
+    let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
+    let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
+    let func = unsafe {
+        cuda::module::get_function(module, CString::new("fused_rmsnorm_gemm_silu").unwrap())?
+    };
+
+    use cudarc::driver::sys::CUfunction_attribute as FA;
+    let nregs = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let local_bytes = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)? };
+    println!("  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)", nregs, local_bytes);
+
+    // Also load standalone GEMM for unfused comparison
+    let ptx_gemm = gemm_128x128::emit_ptx_128x128();
+    let ptx_gemm_cstr = CString::new(ptx_gemm.as_bytes()).context("PTX null")?;
+    let module_gemm = unsafe { cuda::module::load_data(ptx_gemm_cstr.as_ptr() as *const _)? };
+    let func_gemm = unsafe {
+        cuda::module::get_function(module_gemm, CString::new("gemm_128x128").unwrap())?
+    };
+
+    let bm: u32 = 128;
+    let bn: u32 = 128;
+    let threads: u32 = 128;
+    let smem_fused: c_uint = 41504;
+    let smem_gemm: c_uint = 32768;
+
+    unsafe {
+        cuda_sys::cuFuncSetAttribute(
+            func,
+            cuda_sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem_fused as i32,
+        );
+    }
+
+    // CPU reference helpers
+    fn silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
+    fn rmsnorm_row(input: &[half::f16], gamma: &[half::f16], eps: f32) -> Vec<f32> {
+        let n = input.len();
+        let sum_sq: f32 = input.iter().map(|x| { let xf = x.to_f32(); xf * xf }).sum();
+        let rms_inv = 1.0 / ((sum_sq / n as f32) + eps).sqrt();
+        input.iter().zip(gamma.iter())
+            .map(|(x, g)| x.to_f32() * rms_inv * g.to_f32())
+            .collect()
+    }
+
+    for &m in &[256u32, 1024, 4096] {
+        let k: u32 = 4096;
+        let n: u32 = 4096;
+        println!("  --- batch={}, hidden={}, out={} ---", m, k, n);
+
+        let sa = (m * k) as usize;
+        let sw = k as usize;
+        let sb = (k * n) as usize;
+        let sc = (m * n) as usize;
+
+        let d_input  = unsafe { cuda::malloc_sync(sa * 2)? };
+        let d_wnorm  = unsafe { cuda::malloc_sync(sw * 2)? };
+        let d_wgemm  = unsafe { cuda::malloc_sync(sb * 2)? };
+        let d_output = unsafe { cuda::malloc_sync(sc * 4)? };
+        let d_gemm_out = unsafe { cuda::malloc_sync(sc * 4)? };
+
+        let h_input: Vec<half::f16> = (0..sa).map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1)).collect();
+        let h_wnorm: Vec<half::f16> = (0..sw).map(|i| half::f16::from_f32(0.5 + ((i % 100) as f32) * 0.01)).collect();
+        let h_wgemm: Vec<half::f16> = (0..sb).map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1)).collect();
+        let mut h_output: Vec<f32> = vec![0.0; sc];
+
+        unsafe {
+            cuda::memcpy_htod_sync(d_input, &h_input)?;
+            cuda::memcpy_htod_sync(d_wnorm, &h_wnorm)?;
+            cuda::memcpy_htod_sync(d_wgemm, &h_wgemm)?;
+        }
+
+        let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
+        let gx = n / bn;
+        let gy = m / bm;
+
+        let params: &mut [*mut c_void] = &mut [
+            (&d_input)  as *const _ as *mut c_void,
+            (&d_wnorm)  as *const _ as *mut c_void,
+            (&d_wgemm)  as *const _ as *mut c_void,
+            (&d_output) as *const _ as *mut c_void,
+            (&n)        as *const _ as *mut c_void,
+            (&k)        as *const _ as *mut c_void,
+        ];
+
+        // Warmup
+        for _ in 0..10 {
+            unsafe { cuda::launch_kernel(func, (gx, gy, 1), (threads, 1, 1), smem_fused, stream, params)?; }
+        }
+        unsafe { cuda::stream::synchronize(stream)?; }
+
+        // Benchmark fused
+        let iters = 100;
+        let start = Instant::now();
+        for _ in 0..iters {
+            unsafe { cuda::launch_kernel(func, (gx, gy, 1), (threads, 1, 1), smem_fused, stream, params)?; }
+        }
+        unsafe { cuda::stream::synchronize(stream)?; }
+        let us_fused = start.elapsed().as_micros() as f64 / iters as f64;
+
+        // Verify (only for first size to save time)
+        if m == 256 {
+            unsafe { cuda::memcpy_dtoh_sync(&mut h_output, d_output)?; }
+            let mut max_err: f32 = 0.0;
+            for r in [0usize, 1, 31, 63, 64, 127, 128, 255] {
+                if r >= m as usize { continue; }
+                let row_start = r * k as usize;
+                let row_end = row_start + k as usize;
+                let normed = rmsnorm_row(&h_input[row_start..row_end], &h_wnorm, 1e-6);
+                for c in [0usize, 1, 31, 63, 64, 127, 511, 1023, 4095] {
+                    if c >= n as usize { continue; }
+                    let mut dot = 0.0f32;
+                    for kk in 0..k as usize {
+                        dot += normed[kk] * h_wgemm[kk * n as usize + c].to_f32();
+                    }
+                    let expected = silu(dot);
+                    let got = h_output[r * n as usize + c];
+                    let err = (got - expected).abs();
+                    if err > max_err { max_err = err; }
+                }
+            }
+            if max_err < 2.0 {
+                println!("  Correct (max err: {:.4})", max_err);
+            } else {
+                for r in [0, 1] {
+                    let row_start = r * k as usize;
+                    let row_end = row_start + k as usize;
+                    let normed = rmsnorm_row(&h_input[row_start..row_end], &h_wnorm, 1e-6);
+                    for c in [0, 1, 64, 127] {
+                        if c >= n as usize { continue; }
+                        let mut dot = 0.0f32;
+                        for kk in 0..k as usize {
+                            dot += normed[kk] * h_wgemm[kk * n as usize + c].to_f32();
+                        }
+                        let expected = silu(dot);
+                        let got = h_output[r * n as usize + c];
+                        println!("    C[{r}][{c}]: got={got:.4} expected={expected:.4}");
+                    }
+                }
+                bail!("  Max error: {:.4}", max_err);
+            }
+        }
+
+        let tf = 2.0 * m as f64 * n as f64 * k as f64 / (us_fused * 1e-6) / 1e12;
+        println!("  Fused: {:.1} us, {:.1} TFLOPS (GEMM equiv)", us_fused, tf);
+
+        // Benchmark standalone GEMM (unfused baseline)
+        let params_gemm: &mut [*mut c_void] = &mut [
+            (&d_input)    as *const _ as *mut c_void,
+            (&d_wgemm)    as *const _ as *mut c_void,
+            (&d_gemm_out) as *const _ as *mut c_void,
+            (&m)          as *const _ as *mut c_void,
+            (&n)          as *const _ as *mut c_void,
+            (&k)          as *const _ as *mut c_void,
+        ];
+
+        for _ in 0..10 {
+            unsafe { cuda::launch_kernel(func_gemm, (gx, gy, 1), (threads, 1, 1), smem_gemm, stream, params_gemm)?; }
+        }
+        unsafe { cuda::stream::synchronize(stream)?; }
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            unsafe { cuda::launch_kernel(func_gemm, (gx, gy, 1), (threads, 1, 1), smem_gemm, stream, params_gemm)?; }
+        }
+        unsafe { cuda::stream::synchronize(stream)?; }
+        let us_gemm_only = start.elapsed().as_micros() as f64 / iters as f64;
+
+        // Unfused estimate: GEMM + norm read/write M*K*2*2 + SiLU read/write M*N*4*2
+        // At ~300 GB/s L4 bandwidth:
+        let norm_bytes = m as f64 * k as f64 * 2.0 * 2.0; // read + write f16
+        let silu_bytes = m as f64 * n as f64 * 4.0 * 2.0; // read + write f32
+        let bw_gbs = 300.0; // L4 ~300 GB/s
+        let us_norm_est = norm_bytes / (bw_gbs * 1e3); // us
+        let us_silu_est = silu_bytes / (bw_gbs * 1e3); // us
+        let us_unfused_est = us_gemm_only + us_norm_est + us_silu_est;
+
+        let tf_gemm = 2.0 * m as f64 * n as f64 * k as f64 / (us_gemm_only * 1e-6) / 1e12;
+        println!("  Standalone GEMM: {:.1} us, {:.1} TFLOPS", us_gemm_only, tf_gemm);
+        println!("  Unfused estimate (GEMM+norm+SiLU): {:.1} us (norm: {:.1} us, SiLU: {:.1} us)",
+            us_unfused_est, us_norm_est, us_silu_est);
+        let speedup = us_unfused_est / us_fused;
+        if speedup >= 1.0 {
+            println!("  Fused speedup vs unfused: {:.1}x FASTER", speedup);
+        } else {
+            println!("  Fused vs unfused: {:.1}% overhead", (1.0/speedup - 1.0) * 100.0);
+        }
+
+        unsafe {
+            cuda::stream::destroy(stream)?;
+            cuda::free_sync(d_input)?;
+            cuda::free_sync(d_wnorm)?;
+            cuda::free_sync(d_wgemm)?;
+            cuda::free_sync(d_output)?;
+            cuda::free_sync(d_gemm_out)?;
+        }
+    }
+
+    unsafe {
+        cuda::module::unload(module)?;
+        cuda::module::unload(module_gemm)?;
+    }
     Ok(())
 }
 

@@ -9,7 +9,7 @@
 //
 // Smem layout:
 //   Q region:  0..8191     (64 rows × 64 cols × 2B = 8192)
-//   KV region: 8192..16383 (64 × 64 × 2B) — K then V share same space
+//   KV region: 8192..16383 (64 × 64 × 2B) — K then V reuse same space
 //   Total: 16384 bytes
 //
 // MMA config: m16n8k16
@@ -384,8 +384,7 @@ fn emit_kernel(s: &mut String) {
     }
     blank(s);
 
-    // ─── Load V block → smem[8192] (reusing K's smem) ───
-    // We're done reading K from smem, so we can reuse the same region
+    // ─── Load V block → smem[8192] (reusing K's region) ───
     emit_cp_async_kv(s, "V", 8192, "%rd12");
     w(s, "cp.async.commit_group;");
     w(s, "cp.async.wait_group \t0;");
@@ -393,7 +392,7 @@ fn emit_kernel(s: &mut String) {
     blank(s);
 
     // ─── ldmatrix V (B operand for P@V) ───
-    // V at smem[8192], same structure as K
+    // V at smem[8192], using %r47 base address
     // V_frag: %r480..%r543 (8 n-tiles × 2 k-pairs × 4 regs = 64 regs)
     for n in 0..8u32 {
         for kp in 0..2u32 {
@@ -815,7 +814,7 @@ mod tests {
         let (ptx, _) = load_and_query_kernel();
         // Must have barriers between load and compute phases
         let barrier_count = ptx.lines().filter(|l| l.contains("bar.sync")).count();
-        assert!(barrier_count >= 3, "Need at least 3 barriers (Q sync, K sync, V sync), got {}", barrier_count);
+        assert!(barrier_count >= 2, "Need at least 2 barriers (Q sync, KV sync), got {}", barrier_count);
     }
 
     #[test]

@@ -991,7 +991,7 @@ pub fn emit_gemm_with_loaders(
     // ── MMA instructions ──
     ptx.comment("MMA -- 16 total");
     for rn in 0..REG_N as usize {
-        let ai = 0 * REG_N as usize + rn;
+        let ai = rn;
         ptx.mma_m16n8k16(
             acc.regs[ai],
             a_frag_ki0_rm0,
@@ -1009,7 +1009,7 @@ pub fn emit_gemm_with_loaders(
         );
     }
     for rn in 0..REG_N as usize {
-        let ai = 0 * REG_N as usize + rn;
+        let ai = rn;
         ptx.mma_m16n8k16(
             acc.regs[ai],
             a_frag_ki1_rm0,
@@ -1475,7 +1475,7 @@ pub fn emit_gemm_register_transform_a(
     // MMA instructions
     ptx.comment("MMA -- 16 total (hides ld.global latency from step 2)");
     for rn in 0..REG_N as usize {
-        let ai = 0 * REG_N as usize + rn;
+        let ai = rn;
         ptx.mma_m16n8k16(
             acc.regs[ai],
             a_frag_ki0_rm0,
@@ -1493,7 +1493,7 @@ pub fn emit_gemm_register_transform_a(
         );
     }
     for rn in 0..REG_N as usize {
-        let ai = 0 * REG_N as usize + rn;
+        let ai = rn;
         ptx.mma_m16n8k16(
             acc.regs[ai],
             a_frag_ki1_rm0,
@@ -2207,7 +2207,7 @@ pub fn emit_gemm_cpasync_transform_a(
     // MMA instructions
     ptx.comment("MMA -- 16 total");
     for rn in 0..REG_N as usize {
-        let ai = 0 * REG_N as usize + rn;
+        let ai = rn;
         ptx.mma_m16n8k16(
             acc.regs[ai],
             a_frag_ki0_rm0,
@@ -2225,7 +2225,7 @@ pub fn emit_gemm_cpasync_transform_a(
         );
     }
     for rn in 0..REG_N as usize {
-        let ai = 0 * REG_N as usize + rn;
+        let ai = rn;
         ptx.mma_m16n8k16(
             acc.regs[ai],
             a_frag_ki1_rm0,

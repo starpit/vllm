@@ -627,34 +627,37 @@ obsession with beating our own optimized unfused baseline obscured the real win.
 
 ### Phase 0 Results Summary (March 21, 2026)
 
-**Validated against real-world baselines:**
+**Validated against real-world baselines (L4 GPU, SM89):**
 
-| Benchmark (batch=1024) | Time | vs PyTorch |
-|------------------------|------|-----------|
-| PyTorch unfused (RMSNorm+GEMM+SiLU) | 1151 μs | 1.0× |
-| Ferrite hand-written fused 128×128 | 703 μs | **1.6× faster** |
-| Ferrite proc macro fused (pipeline) | ~660 μs | **~1.7× faster** |
+| Kernel (batch=1024, hidden=4096) | Time | TFLOPS | vs PyTorch |
+|----------------------------------|------|--------|-----------|
+| PyTorch unfused (RMSNorm+GEMM+SiLU) | 1151 μs | 29.9 | 1.0× |
+| Ferrite fused RmsNorm→GEMM→SiLU (hand-written) | 703 μs | 48.6 | **1.6× faster** |
+| Ferrite fused RmsNorm→GEMM→SiLU (proc macro) | ~660 μs | ~42 | **~1.7× faster** |
+| Ferrite MLP block (norm→GEMM→SiLU→GEMM) | 1370 μs | 50.2 | **~1.7× faster** |
 
-| Benchmark (batch=4096) | Time | vs PyTorch |
-|------------------------|------|-----------|
-| PyTorch unfused | 7015 μs | 1.0× |
-| Ferrite hand-written fused | 2926 μs | **2.4× faster** |
+| Kernel (batch=4096) | Time | TFLOPS | vs PyTorch |
+|---------------------|------|--------|-----------|
+| PyTorch unfused (RMSNorm+GEMM+SiLU) | 7015 μs | 19.6 | 1.0× |
+| Ferrite fused RmsNorm→GEMM→SiLU | 2926 μs | 47.0 | **2.4× faster** |
+| Ferrite MLP block (norm→GEMM→SiLU→GEMM) | 5221 μs | 52.6 | **~2× faster** |
 
-**Standalone building blocks (L4 GPU):**
+**Standalone building blocks:**
 
-| Kernel | Performance |
-|--------|------------|
-| GEMM 64×64 (hand-written PTX) | 55 TFLOPS (matches Triton) |
-| GEMM 128×128 (hand-written PTX) | 48 TFLOPS (matches Triton) |
-| SiLU standalone | 238 GB/s (matches Triton) |
-| RMSNorm standalone | 5.9× faster than Triton at batch=1 |
-| CUTLASS fused GEMM→LayerNorm→GEMM | 74.6 TFLOPS (reference) |
+| Kernel | Performance | vs Reference |
+|--------|------------|-------------|
+| GEMM 64×64 (hand-written PTX) | 55 TFLOPS | matches Triton |
+| GEMM 128×128 (hand-written PTX) | 48 TFLOPS | matches Triton |
+| SiLU standalone | 238 GB/s | matches Triton |
+| RMSNorm standalone | 152 GB/s (batch=32) | 5.9× faster than Triton at batch=1 |
+| CUTLASS fused GEMM→LayerNorm→GEMM | 74.6 TFLOPS | reference implementation |
 
 **Architecture validated:**
 - Direct PTX generation beats LLVM IR path by 1.77×
 - Pipeline + atoms abstraction: zero overhead for standalone GEMM (55 TFLOPS)
 - 128×128 tiles + CUTLASS composition pattern: fusion overhead <3% at scale
 - `fma.rn.f16x2` / `mul.rn.f16x2` in-place transforms: zero extra registers
+- MLP block (GEMM→GEMM chain) via intermediate in global/L2: ~50 TFLOPS
 - Proc macro generates PTX at compile time, embeds as const string
 - One kernel, one launch, intermediates in registers
 

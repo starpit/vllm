@@ -852,28 +852,30 @@ fn run_fused_128x128() -> Result<()> {
 
 fn run_mlp_block_128x128(_device: cuda_sys::CUdevice) -> Result<()> {
     let (ptx_g1, ptx_cvt, ptx_g2) = gemm_128x128::emit_mlp_block_128x128();
-    println!("  Generated GEMM1: {} bytes, CVT: {} bytes, GEMM2: {} bytes", ptx_g1.len(), ptx_cvt.len(), ptx_g2.len());
+    println!(
+        "  Generated GEMM1: {} bytes, CVT: {} bytes, GEMM2: {} bytes",
+        ptx_g1.len(),
+        ptx_cvt.len(),
+        ptx_g2.len()
+    );
 
     std::fs::write("/tmp/ferrite_mlp_gemm1.ptx", &ptx_g1).ok();
     std::fs::write("/tmp/ferrite_mlp_gemm2.ptx", &ptx_g2).ok();
 
     let ptx_g1_cstr = CString::new(ptx_g1.as_bytes()).context("PTX null")?;
     let module_g1 = unsafe { cuda::module::load_data(ptx_g1_cstr.as_ptr() as *const _)? };
-    let func_g1 = unsafe {
-        cuda::module::get_function(module_g1, CString::new("mlp_gemm1_silu").unwrap())?
-    };
+    let func_g1 =
+        unsafe { cuda::module::get_function(module_g1, CString::new("mlp_gemm1_silu").unwrap())? };
 
     let ptx_cvt_cstr = CString::new(ptx_cvt.as_bytes()).context("PTX null")?;
     let module_cvt = unsafe { cuda::module::load_data(ptx_cvt_cstr.as_ptr() as *const _)? };
-    let func_cvt = unsafe {
-        cuda::module::get_function(module_cvt, CString::new("cvt_f32_to_f16").unwrap())?
-    };
+    let func_cvt =
+        unsafe { cuda::module::get_function(module_cvt, CString::new("cvt_f32_to_f16").unwrap())? };
 
     let ptx_g2_cstr = CString::new(ptx_g2.as_bytes()).context("PTX null")?;
     let module_g2 = unsafe { cuda::module::load_data(ptx_g2_cstr.as_ptr() as *const _)? };
-    let func_g2 = unsafe {
-        cuda::module::get_function(module_g2, CString::new("mlp_gemm2").unwrap())?
-    };
+    let func_g2 =
+        unsafe { cuda::module::get_function(module_g2, CString::new("mlp_gemm2").unwrap())? };
 
     use cudarc::driver::sys::CUfunction_attribute as FA;
     let nregs_g1 =
@@ -1021,11 +1023,25 @@ fn run_mlp_block_128x128(_device: cuda_sys::CUdevice) -> Result<()> {
          -> anyhow::Result<()> {
             unsafe {
                 // GEMM1: RmsNorm → GEMM → SiLU → f32
-                cuda::launch_kernel(func_g1, (gx1, gy, 1), (threads, 1, 1), smem_fused, stream, p_g1)?;
+                cuda::launch_kernel(
+                    func_g1,
+                    (gx1, gy, 1),
+                    (threads, 1, 1),
+                    smem_fused,
+                    stream,
+                    p_g1,
+                )?;
                 // CVT: f32 → f16
                 cuda::launch_kernel(func_cvt, (cvt_grid, 1, 1), (256, 1, 1), 0, stream, p_cvt)?;
                 // GEMM2: f16 → f32
-                cuda::launch_kernel(func_g2, (gx2, gy, 1), (threads, 1, 1), smem_gemm, stream, p_g2)?;
+                cuda::launch_kernel(
+                    func_g2,
+                    (gx2, gy, 1),
+                    (threads, 1, 1),
+                    smem_gemm,
+                    stream,
+                    p_g2,
+                )?;
             }
             Ok(())
         };
@@ -1033,7 +1049,9 @@ fn run_mlp_block_128x128(_device: cuda_sys::CUdevice) -> Result<()> {
         // Warmup
         for _ in 0..10 {
             launch_mlp(stream, params_g1, params_cvt, params_g2)?;
-            unsafe { cuda::stream::synchronize(stream)?; }
+            unsafe {
+                cuda::stream::synchronize(stream)?;
+            }
         }
 
         // Benchmark MLP block
@@ -1041,7 +1059,9 @@ fn run_mlp_block_128x128(_device: cuda_sys::CUdevice) -> Result<()> {
         let start = Instant::now();
         for _ in 0..iters {
             launch_mlp(stream, params_g1, params_cvt, params_g2)?;
-            unsafe { cuda::stream::synchronize(stream)?; }
+            unsafe {
+                cuda::stream::synchronize(stream)?;
+            }
         }
         let us_mlp = start.elapsed().as_micros() as f64 / iters as f64;
 
@@ -1130,7 +1150,10 @@ fn run_mlp_block_128x128(_device: cuda_sys::CUdevice) -> Result<()> {
         let flops_gemm2 = 2.0 * m as f64 * n2 as f64 * n1 as f64;
         let total_flops = flops_gemm1 + flops_gemm2;
         let tf = total_flops / (us_mlp * 1e-6) / 1e12;
-        println!("  MLP fused: {:.1} us, {:.1} TFLOPS (both GEMMs)", us_mlp, tf);
+        println!(
+            "  MLP fused: {:.1} us, {:.1} TFLOPS (both GEMMs)",
+            us_mlp, tf
+        );
 
         // Benchmark unfused: 2x standalone GEMM + norm + SiLU memory traffic
         let params_gemm1: &mut [*mut c_void] = &mut [
@@ -1155,7 +1178,9 @@ fn run_mlp_block_128x128(_device: cuda_sys::CUdevice) -> Result<()> {
                 )?;
             }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
 
         let start = Instant::now();
         for _ in 0..iters {
@@ -1170,13 +1195,15 @@ fn run_mlp_block_128x128(_device: cuda_sys::CUdevice) -> Result<()> {
                 )?;
             }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let us_gemm1 = start.elapsed().as_micros() as f64 / iters as f64;
 
         // GEMM2 timing (same dimensions for square case)
         let params_gemm2: &mut [*mut c_void] = &mut [
-            (&d_inter) as *const _ as *mut c_void,  // A = intermediate
-            (&d_wdown) as *const _ as *mut c_void,   // B = w_down
+            (&d_inter) as *const _ as *mut c_void, // A = intermediate
+            (&d_wdown) as *const _ as *mut c_void, // B = w_down
             (&d_gemm_out) as *const _ as *mut c_void,
             (&m) as *const _ as *mut c_void,
             (&n2) as *const _ as *mut c_void,
@@ -1195,7 +1222,9 @@ fn run_mlp_block_128x128(_device: cuda_sys::CUdevice) -> Result<()> {
                 )?;
             }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
 
         let start = Instant::now();
         for _ in 0..iters {
@@ -1210,7 +1239,9 @@ fn run_mlp_block_128x128(_device: cuda_sys::CUdevice) -> Result<()> {
                 )?;
             }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let us_gemm2 = start.elapsed().as_micros() as f64 / iters as f64;
 
         // Unfused estimate: 2 GEMMs + norm + SiLU + intermediate store/load

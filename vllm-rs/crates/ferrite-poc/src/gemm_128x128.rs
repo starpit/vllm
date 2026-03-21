@@ -1684,7 +1684,10 @@ fn emit_mlp_gemm1_kernel(s: &mut String) {
     s.push_str("$L_NORM_LOOP:\n");
     w(s, "mul.wide.s32 \t%rd81, %r402, 2;");
     w(s, "add.s64 \t%rd82, %rd80, %rd81;");
-    w(s, "ld.global.v4.b32 \t{%r500, %r501, %r502, %r503}, [%rd82];");
+    w(
+        s,
+        "ld.global.v4.b32 \t{%r500, %r501, %r502, %r503}, [%rd82];",
+    );
     w(s, "mov.b32 \t{%h0, %h1}, %r500;");
     w(s, "cvt.f32.f16 \t%f1, %h0;");
     w(s, "cvt.f32.f16 \t%f2, %h1;");
@@ -1800,7 +1803,8 @@ pub fn emit_mlp_block_test() -> String {
 {
 	ret;
 }
-"#.to_string()
+"#
+    .to_string()
 }
 
 // Dead code: original single-kernel MLP attempt (preserved for reference)
@@ -1843,12 +1847,12 @@ fn _emit_mlp_kernel_old(s: &mut String) {
     );
 
     // ─── Parameter loads ───
-    w(s, "ld.param.b64 \t%rd1, [param_input];");   // A [M, K1] f16
-    w(s, "ld.param.b64 \t%rd2, [param_wgate];");   // B [K1, N1] f16
-    w(s, "ld.param.b64 \t%rd5, [param_wdown];");   // B2 [N1, N2] f16
-    w(s, "ld.param.b64 \t%rd6, [param_inter];");   // intermediate [M, N1] f16
-    w(s, "ld.param.b64 \t%rd3, [param_output];");  // C [M, N2] f32
-    w(s, "ld.param.b64 \t%rd4, [param_wnorm];");   // gamma [K1] f16
+    w(s, "ld.param.b64 \t%rd1, [param_input];"); // A [M, K1] f16
+    w(s, "ld.param.b64 \t%rd2, [param_wgate];"); // B [K1, N1] f16
+    w(s, "ld.param.b64 \t%rd5, [param_wdown];"); // B2 [N1, N2] f16
+    w(s, "ld.param.b64 \t%rd6, [param_inter];"); // intermediate [M, N1] f16
+    w(s, "ld.param.b64 \t%rd3, [param_output];"); // C [M, N2] f32
+    w(s, "ld.param.b64 \t%rd4, [param_wnorm];"); // gamma [K1] f16
     w(s, "ld.param.b64 \t%rd7, [param_barrier];"); // barrier counter
     w(s, "ld.param.b32 \t%r2, [param_N1];");
     w(s, "ld.param.b32 \t%r3, [param_K1];");
@@ -1858,8 +1862,8 @@ fn _emit_mlp_kernel_old(s: &mut String) {
     // ─── Thread/block indexing ───
     w(s, "mov.u32 \t%r4, %ctaid.x;"); // block_n
     w(s, "mov.u32 \t%r5, %ctaid.y;"); // block_m
-    w(s, "shl.b32 \t%r7, %r4, 7;");   // block_col = block_n * 128
-    w(s, "shl.b32 \t%r8, %r5, 7;");   // block_row = block_m * 128
+    w(s, "shl.b32 \t%r7, %r4, 7;"); // block_col = block_n * 128
+    w(s, "shl.b32 \t%r8, %r5, 7;"); // block_row = block_m * 128
     w(s, "mov.u32 \t%r6, %tid.x;");
     blank(s);
 
@@ -1881,7 +1885,10 @@ fn _emit_mlp_kernel_old(s: &mut String) {
     s.push_str("$L_NORM_LOOP:\n");
     w(s, "mul.wide.s32 \t%rd81, %r402, 2;");
     w(s, "add.s64 \t%rd82, %rd80, %rd81;");
-    w(s, "ld.global.v4.b32 \t{%r500, %r501, %r502, %r503}, [%rd82];");
+    w(
+        s,
+        "ld.global.v4.b32 \t{%r500, %r501, %r502, %r503}, [%rd82];",
+    );
     for reg in [500, 501, 502, 503] {
         s.push_str(&format!("\tmov.b32 \t{{%h0, %h1}}, %r{reg};\n"));
         s.push_str("\tcvt.f32.f16 \t%f1, %h0;\n");
@@ -1923,10 +1930,16 @@ fn _emit_mlp_kernel_old(s: &mut String) {
     w(s, "@!%p12 bra \t$L_GAMMA_DONE;");
     w(s, "mul.wide.s32 \t%rd83, %r410, 2;");
     w(s, "add.s64 \t%rd84, %rd4, %rd83;");
-    w(s, "ld.global.v4.b32 \t{%r500, %r501, %r502, %r503}, [%rd84];");
+    w(
+        s,
+        "ld.global.v4.b32 \t{%r500, %r501, %r502, %r503}, [%rd84];",
+    );
     w(s, "shl.b32 \t%r412, %r410, 1;");
     w(s, "add.s32 \t%r413, %r420, %r412;");
-    w(s, "st.shared.v4.b32 \t[%r413], {%r500, %r501, %r502, %r503};");
+    w(
+        s,
+        "st.shared.v4.b32 \t[%r413], {%r500, %r501, %r502, %r503};",
+    );
     w(s, "add.s32 \t%r410, %r410, 8;");
     w(s, "bra.uni \t$L_GAMMA_LOAD;");
     blank(s);
@@ -2116,7 +2129,11 @@ enum GemmPhase {
 ///   %rd1=input, %rd2=w_gate, %rd5=w_down, %rd6=inter
 fn emit_gemm_phase(s: &mut String, phase: GemmPhase) {
     let prefix = if phase == GemmPhase::Gemm1 { "" } else { "G2_" };
-    let silu_label = if phase == GemmPhase::Gemm1 { "$L_SILU" } else { "$L_G2_STORE" };
+    let silu_label = if phase == GemmPhase::Gemm1 {
+        "$L_SILU"
+    } else {
+        "$L_G2_STORE"
+    };
     let k0_label = format!("$L_{prefix}K0_FALLTHROUGH");
     let loop_setup_label = format!("$L_{prefix}LOOP_SETUP");
     let kloop_label = format!("$L_{prefix}KLOOP");
@@ -2194,7 +2211,8 @@ fn emit_gemm_phase(s: &mut String, phase: GemmPhase) {
             s.push_str(&format!("\tadd.s32 \t%r{}, %r38, {off};\n", 42 + i - 1));
             s.push_str(&format!(
                 "\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r41;\n",
-                42 + i - 1, 15 + i
+                42 + i - 1,
+                15 + i
             ));
         } else {
             s.push_str("\tcp.async.cg.shared.global [ %r38 + 0 ], [ %rd15 + 0 ], 0x10, %r41;\n");
@@ -2205,7 +2223,8 @@ fn emit_gemm_phase(s: &mut String, phase: GemmPhase) {
         s.push_str(&format!("\tadd.s32 \t%r{}, %r40, {off};\n", 45 + i));
         s.push_str(&format!(
             "\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r41;\n",
-            45 + i, 24 + i
+            45 + i,
+            24 + i
         ));
     }
     w(s, "cp.async.commit_group;");
@@ -2231,7 +2250,8 @@ fn emit_gemm_phase(s: &mut String, phase: GemmPhase) {
         s.push_str(&format!("\tadd.s32 \t%r{}, %r38, {off};\n", 50 + i));
         s.push_str(&format!(
             "\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r49;\n",
-            50 + i, 28 + i
+            50 + i,
+            28 + i
         ));
     }
     w(s, "cp.async.commit_group;");
@@ -2239,7 +2259,8 @@ fn emit_gemm_phase(s: &mut String, phase: GemmPhase) {
         s.push_str(&format!("\tadd.s32 \t%r{}, %r40, {off};\n", 54 + i));
         s.push_str(&format!(
             "\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r49;\n",
-            54 + i, 33 + i
+            54 + i,
+            33 + i
         ));
     }
     w(s, "cp.async.commit_group;");
@@ -2336,87 +2357,211 @@ fn emit_gemm_phase(s: &mut String, phase: GemmPhase) {
 
     // ldmatrix A (8 loads)
     w(s, "add.s32 \t%r107, %r106, %r67;");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r108, %r109, %r110, %r111}, [%r107];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r112, %r113, %r114, %r115}, [%r107+2048];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r116, %r117, %r118, %r119}, [%r107+4096];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r120, %r121, %r122, %r123}, [%r107+6144];");
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r108, %r109, %r110, %r111}, [%r107];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r112, %r113, %r114, %r115}, [%r107+2048];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r116, %r117, %r118, %r119}, [%r107+4096];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r120, %r121, %r122, %r123}, [%r107+6144];",
+    );
     w(s, "add.s32 \t%r124, %r106, %r68;");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r125, %r126, %r127, %r128}, [%r124];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r129, %r130, %r131, %r132}, [%r124+2048];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r133, %r134, %r135, %r136}, [%r124+4096];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r137, %r138, %r139, %r140}, [%r124+6144];");
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r125, %r126, %r127, %r128}, [%r124];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r129, %r130, %r131, %r132}, [%r124+2048];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r133, %r134, %r135, %r136}, [%r124+4096];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r137, %r138, %r139, %r140}, [%r124+6144];",
+    );
     blank(s);
 
     if phase == GemmPhase::Gemm1 {
         // RmsNorm transform on A fragments
         let a_ki0_regs = [
-            [108, 109, 110, 111], [112, 113, 114, 115],
-            [116, 117, 118, 119], [120, 121, 122, 123],
+            [108, 109, 110, 111],
+            [112, 113, 114, 115],
+            [116, 117, 118, 119],
+            [120, 121, 122, 123],
         ];
         let a_ki1_regs = [
-            [125, 126, 127, 128], [129, 130, 131, 132],
-            [133, 134, 135, 136], [137, 138, 139, 140],
+            [125, 126, 127, 128],
+            [129, 130, 131, 132],
+            [133, 134, 135, 136],
+            [137, 138, 139, 140],
         ];
         for rm in 0..4u32 {
             let norm_lo = 470 + rm * 2;
             let norm_hi = 471 + rm * 2;
             let regs = &a_ki0_regs[rm as usize];
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[0], n=norm_lo));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r487;\n", r=regs[0]));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[1], n=norm_hi));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r487;\n", r=regs[1]));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[2], n=norm_lo));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r491;\n", r=regs[2]));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[3], n=norm_hi));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r491;\n", r=regs[3]));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+                r = regs[0],
+                n = norm_lo
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r487;\n",
+                r = regs[0]
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+                r = regs[1],
+                n = norm_hi
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r487;\n",
+                r = regs[1]
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+                r = regs[2],
+                n = norm_lo
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r491;\n",
+                r = regs[2]
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+                r = regs[3],
+                n = norm_hi
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r491;\n",
+                r = regs[3]
+            ));
         }
         for rm in 0..4u32 {
             let norm_lo = 470 + rm * 2;
             let norm_hi = 471 + rm * 2;
             let regs = &a_ki1_regs[rm as usize];
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[0], n=norm_lo));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r490;\n", r=regs[0]));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[1], n=norm_hi));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r490;\n", r=regs[1]));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[2], n=norm_lo));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r492;\n", r=regs[2]));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[3], n=norm_hi));
-            s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r492;\n", r=regs[3]));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+                r = regs[0],
+                n = norm_lo
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r490;\n",
+                r = regs[0]
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+                r = regs[1],
+                n = norm_hi
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r490;\n",
+                r = regs[1]
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+                r = regs[2],
+                n = norm_lo
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r492;\n",
+                r = regs[2]
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+                r = regs[3],
+                n = norm_hi
+            ));
+            s.push_str(&format!(
+                "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r492;\n",
+                r = regs[3]
+            ));
         }
         blank(s);
     }
 
     // ldmatrix B transposed (8 loads)
     w(s, "add.s32 \t%r141, %r106, %r75;");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r142, %r143, %r144, %r145}, [%r141+16384];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r146, %r147, %r148, %r149}, [%r141+16512];");
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r142, %r143, %r144, %r145}, [%r141+16384];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r146, %r147, %r148, %r149}, [%r141+16512];",
+    );
     w(s, "add.s32 \t%r150, %r106, %r76;");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r151, %r152, %r153, %r154}, [%r150+16384];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r155, %r156, %r157, %r158}, [%r150+16512];");
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r151, %r152, %r153, %r154}, [%r150+16384];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r155, %r156, %r157, %r158}, [%r150+16512];",
+    );
     w(s, "add.s32 \t%r159, %r106, %r77;");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r160, %r161, %r162, %r163}, [%r159+16384];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r164, %r165, %r166, %r167}, [%r159+16512];");
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r160, %r161, %r162, %r163}, [%r159+16384];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r164, %r165, %r166, %r167}, [%r159+16512];",
+    );
     w(s, "add.s32 \t%r168, %r106, %r78;");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r169, %r170, %r171, %r172}, [%r168+16384];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r173, %r174, %r175, %r176}, [%r168+16512];");
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r169, %r170, %r171, %r172}, [%r168+16384];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r173, %r174, %r175, %r176}, [%r168+16512];",
+    );
     blank(s);
 
     // MMA (64 total)
     let a_ki0 = [
-        [108, 109, 110, 111], [112, 113, 114, 115],
-        [116, 117, 118, 119], [120, 121, 122, 123],
+        [108, 109, 110, 111],
+        [112, 113, 114, 115],
+        [116, 117, 118, 119],
+        [120, 121, 122, 123],
     ];
     let b_ki0 = [
-        [142, 143], [151, 152], [160, 161], [169, 170],
-        [146, 147], [155, 156], [164, 165], [173, 174],
+        [142, 143],
+        [151, 152],
+        [160, 161],
+        [169, 170],
+        [146, 147],
+        [155, 156],
+        [164, 165],
+        [173, 174],
     ];
     let a_ki1 = [
-        [125, 126, 127, 128], [129, 130, 131, 132],
-        [133, 134, 135, 136], [137, 138, 139, 140],
+        [125, 126, 127, 128],
+        [129, 130, 131, 132],
+        [133, 134, 135, 136],
+        [137, 138, 139, 140],
     ];
     let b_ki1 = [
-        [144, 145], [153, 154], [162, 163], [171, 172],
-        [148, 149], [157, 158], [166, 167], [175, 176],
+        [144, 145],
+        [153, 154],
+        [162, 163],
+        [171, 172],
+        [148, 149],
+        [157, 158],
+        [166, 167],
+        [175, 176],
     ];
 
     let mut acc = 200u32;
@@ -2455,24 +2600,48 @@ fn emit_gemm_phase(s: &mut String, phase: GemmPhase) {
     w(s, "add.s32 \t%r180, %r179, %r36;");
     w(s, "selp.b32 \t%r181, 16, 0, %p3;");
 
-    w(s, "cp.async.cg.shared.global [ %r180 + 0 ], [ %rd50 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r180 + 0 ], [ %rd50 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r182, %r180, 2048;");
-    w(s, "cp.async.cg.shared.global [ %r182 + 0 ], [ %rd51 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r182 + 0 ], [ %rd51 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r183, %r180, 4096;");
-    w(s, "cp.async.cg.shared.global [ %r183 + 0 ], [ %rd52 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r183 + 0 ], [ %rd52 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r184, %r180, 6144;");
-    w(s, "cp.async.cg.shared.global [ %r184 + 0 ], [ %rd53 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r184 + 0 ], [ %rd53 + 0 ], 0x10, %r181;",
+    );
     w(s, "cp.async.commit_group;");
 
     w(s, "add.s32 \t%r185, %r179, %r39;");
     w(s, "add.s32 \t%r186, %r185, 16384;");
-    w(s, "cp.async.cg.shared.global [ %r186 + 0 ], [ %rd54 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r186 + 0 ], [ %rd54 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r187, %r185, 18432;");
-    w(s, "cp.async.cg.shared.global [ %r187 + 0 ], [ %rd55 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r187 + 0 ], [ %rd55 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r188, %r185, 20480;");
-    w(s, "cp.async.cg.shared.global [ %r188 + 0 ], [ %rd56 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r188 + 0 ], [ %rd56 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r189, %r185, 22528;");
-    w(s, "cp.async.cg.shared.global [ %r189 + 0 ], [ %rd57 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r189 + 0 ], [ %rd57 + 0 ], 0x10, %r181;",
+    );
     w(s, "cp.async.commit_group;");
     blank(s);
 

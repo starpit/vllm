@@ -89,7 +89,7 @@ fn generate_rmsnorm_gemm_silu(
     // We use the default 64x64 config with the user-specified architecture.
     // The hidden_size is passed as a runtime parameter (K dimension).
     let config = ferrite_ptx::config::GemmConfig {
-        bm: 64, bn: 64, bk: 32,
+        bm: 64, bn: 64, bk: 64,
         wm: 64, wn: 16,
         mma_m: 16, mma_n: 8, mma_k: 16,
         num_stages: 2,
@@ -103,7 +103,7 @@ fn generate_rmsnorm_gemm_silu(
 
     let ptx_string = ferrite_ptx::fused::build_fused_pipeline(&config, hidden_size);
 
-    // GEMM smem (16384) + scratch (32) + norm factors (256) + gamma preload (8192)
+    // GEMM smem (num_stages * buf_stride) + scratch (32) + norm factors (256) + gamma preload (8192)
     let smem_bytes = (config.smem_total() + 32 + config.bm * 4 + hidden_size * 2) as u32;
     let threads = config.threads() as u32;
 

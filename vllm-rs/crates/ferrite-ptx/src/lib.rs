@@ -15,32 +15,61 @@ use config::GemmConfig;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegClass { Pred, B32, B64, F32 }
 
-/// A typed register handle.
+/// Register prefix letters per scope depth.
+/// Outer (0): %r, %rd, %f, %p
+/// Scope 1:   %t, %td, %tf, %tp
+/// Scope 2:   %u, %ud, %uf, %up
+/// Scope 3:   %v, %vd, %vf, %vp
+/// Scope 4+:  %w, %wd, %wf, %wp (etc.)
+const SCOPE_PREFIXES: &[&[&str]] = &[
+    // [pred, b32, b64, f32]
+    &["p",  "r",  "rd",  "f"],    // scope 0 (outer)
+    &["tp", "t",  "td",  "tf"],   // scope 1
+    &["up", "u",  "ud",  "uf"],   // scope 2
+    &["vp", "v",  "vd",  "vf"],   // scope 3
+    &["wp", "w",  "wd",  "wf"],   // scope 4
+    &["xp", "x",  "xd",  "xf"],   // scope 5
+];
+
+fn scope_prefix(scope_id: u16, class: RegClass) -> &'static str {
+    let idx = scope_id as usize;
+    assert!(idx < SCOPE_PREFIXES.len(), "Too many nested scopes (max {})", SCOPE_PREFIXES.len());
+    match class {
+        RegClass::Pred => SCOPE_PREFIXES[idx][0],
+        RegClass::B32  => SCOPE_PREFIXES[idx][1],
+        RegClass::B64  => SCOPE_PREFIXES[idx][2],
+        RegClass::F32  => SCOPE_PREFIXES[idx][3],
+    }
+}
+
+/// A typed register handle with scope information.
 #[derive(Clone, Copy, Debug)]
 pub struct Reg {
     pub class: RegClass,
     pub index: u32,
+    /// Scope depth: 0 = outer (kernel-level), 1+ = block-scoped.
+    pub scope_id: u16,
 }
 
 impl Reg {
-    pub fn pred(i: u32) -> Self { Self { class: RegClass::Pred, index: i } }
-    pub fn r(i: u32) -> Self { Self { class: RegClass::B32, index: i } }
-    pub fn rd(i: u32) -> Self { Self { class: RegClass::B64, index: i } }
-    pub fn f(i: u32) -> Self { Self { class: RegClass::F32, index: i } }
+    pub fn pred(i: u32) -> Self { Self { class: RegClass::Pred, index: i, scope_id: 0 } }
+    pub fn r(i: u32) -> Self { Self { class: RegClass::B32, index: i, scope_id: 0 } }
+    pub fn rd(i: u32) -> Self { Self { class: RegClass::B64, index: i, scope_id: 0 } }
+    pub fn f(i: u32) -> Self { Self { class: RegClass::F32, index: i, scope_id: 0 } }
+
+    fn with_scope(class: RegClass, index: u32, scope_id: u16) -> Self {
+        Self { class, index, scope_id }
+    }
 }
 
 impl std::fmt::Display for Reg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.class {
-            RegClass::Pred => write!(f, "%p{}", self.index),
-            RegClass::B32 => write!(f, "%r{}", self.index),
-            RegClass::B64 => write!(f, "%rd{}", self.index),
-            RegClass::F32 => write!(f, "%f{}", self.index),
-        }
+        let prefix = scope_prefix(self.scope_id, self.class);
+        write!(f, "%{}{}", prefix, self.index)
     }
 }
 
-/// Saved register allocator state for scope push/pop.
+/// Saved register allocator state for scope push/pop (legacy soft scoping).
 #[derive(Clone, Debug)]
 struct ScopeState {
     pred_next: u32,
@@ -51,28 +80,28 @@ struct ScopeState {
 
 /// Tracks peak register usage per class.
 ///
-/// Supports `push_scope()` / `pop_scope()` to allow register name reuse
-/// across independent code phases. When a scope is popped, allocation
-/// counters reset to their values at push time, so subsequent allocations
-/// reuse the same `%r` / `%rd` / `%f` / `%p` names. The `.reg` declaration
-/// uses the high-water mark (maximum counter value ever reached).
+/// Supports `push_scope()` / `pop_scope()` for soft scoping (register name
+/// reuse without PTX block boundaries) and `begin_scope()` / `end_scope()`
+/// for native PTX block scoping with `{ .reg ... }`.
 ///
-/// This is critical for fused kernels where phases like norm reduction
-/// and gamma preload allocate many temporary registers that are dead
-/// before the K-loop starts. Without scoping, ptxas sees 300+ unique
-/// virtual registers and generates suboptimal SASS.
+/// Native block scoping gives ptxas explicit register lifetime information:
+/// registers declared inside `{ }` are guaranteed dead at the closing brace.
+/// This allows ptxas to reuse physical registers across phases (e.g., norm
+/// reduction phase and K-loop phase share the same hardware registers).
 pub struct RegAllocator {
     pred_next: u32,
     b32_next: u32,
     b64_next: u32,
     f32_next: u32,
-    // High-water marks for .reg declarations
+    // High-water marks for .reg declarations (outer scope only)
     pred_hwm: u32,
     b32_hwm: u32,
     b64_hwm: u32,
     f32_hwm: u32,
-    // Scope stack
+    // Soft scope stack (legacy push_scope/pop_scope)
     scope_stack: Vec<ScopeState>,
+    // Current native block scope depth (0 = outer)
+    block_scope_depth: u16,
 }
 
 impl RegAllocator {
@@ -81,17 +110,14 @@ impl RegAllocator {
             pred_next: 1, b32_next: 1, b64_next: 1, f32_next: 1,
             pred_hwm: 1, b32_hwm: 1, b64_hwm: 1, f32_hwm: 1,
             scope_stack: Vec::new(),
+            block_scope_depth: 0,
         }
     }
 
-    /// Save the current allocation counters. All registers allocated after
-    /// this call and before the matching `pop_scope()` will have their names
-    /// freed for reuse.
-    ///
-    /// Registers allocated BEFORE `push_scope()` are unaffected — they remain
-    /// live across the scope boundary.
+    /// Save the current allocation counters (legacy soft scoping).
+    /// Registers allocated after this call and before the matching `pop_scope()`
+    /// will have their names freed for reuse.
     pub fn push_scope(&mut self) {
-        // Record high-water marks before saving
         self.pred_hwm = self.pred_hwm.max(self.pred_next);
         self.b32_hwm = self.b32_hwm.max(self.b32_next);
         self.b64_hwm = self.b64_hwm.max(self.b64_next);
@@ -104,12 +130,8 @@ impl RegAllocator {
         });
     }
 
-    /// Restore allocation counters to the state saved by `push_scope()`.
-    /// Subsequent allocations will reuse the same register names that
-    /// were allocated within the popped scope. The `.reg` declaration
-    /// uses the high-water mark, so all names remain valid in the PTX.
+    /// Restore allocation counters (legacy soft scoping).
     pub fn pop_scope(&mut self) {
-        // Update high-water marks with current values before resetting
         self.pred_hwm = self.pred_hwm.max(self.pred_next);
         self.b32_hwm = self.b32_hwm.max(self.b32_next);
         self.b64_hwm = self.b64_hwm.max(self.b64_next);
@@ -122,14 +144,38 @@ impl RegAllocator {
         self.f32_next = state.f32_next;
     }
 
+    /// Enter a new native block scope. Resets counters to 1 and increments scope depth.
+    /// Returns the new scope depth.
+    fn enter_block_scope(&mut self) -> u16 {
+        // Flush HWM before entering (for outer scope tracking)
+        if self.block_scope_depth == 0 {
+            self.pred_hwm = self.pred_hwm.max(self.pred_next);
+            self.b32_hwm = self.b32_hwm.max(self.b32_next);
+            self.b64_hwm = self.b64_hwm.max(self.b64_next);
+            self.f32_hwm = self.f32_hwm.max(self.f32_next);
+        }
+        self.block_scope_depth += 1;
+        // Block-scoped registers start fresh at index 1
+        // The outer scope counters are saved on the BlockScopeState in PtxBuilder
+        self.block_scope_depth
+    }
+
+    /// Exit a native block scope. Returns (pred_count, b32_count, b64_count, f32_count)
+    /// for the scope that was just closed.
+    fn exit_block_scope(&mut self) -> (u32, u32, u32, u32) {
+        let counts = (self.pred_next, self.b32_next, self.b64_next, self.f32_next);
+        self.block_scope_depth -= 1;
+        counts
+    }
+
     pub fn alloc_pred(&mut self) -> Reg {
-        let r = Reg::pred(self.pred_next);
+        let r = Reg::with_scope(RegClass::Pred, self.pred_next, self.block_scope_depth);
         self.pred_next += 1;
         r
     }
 
     pub fn alloc_b32(&mut self) -> Reg {
-        let r = Reg::r(self.b32_next);
+        let r = Reg::with_scope(RegClass::B32, self.b32_next, self.block_scope_depth);
         self.b32_next += 1;
         r
     }
@@ -139,13 +185,13 @@ impl RegAllocator {
     }
 
     pub fn alloc_b64(&mut self) -> Reg {
-        let r = Reg::rd(self.b64_next);
+        let r = Reg::with_scope(RegClass::B64, self.b64_next, self.block_scope_depth);
         self.b64_next += 1;
         r
     }
 
     pub fn alloc_f32(&mut self) -> Reg {
-        let r = Reg::f(self.f32_next);
+        let r = Reg::with_scope(RegClass::F32, self.f32_next, self.block_scope_depth);
         self.f32_next += 1;
         r
     }
@@ -156,11 +202,28 @@ impl RegAllocator {
     pub fn f32_count(&self) -> u32 { self.f32_hwm.max(self.f32_next) }
 }
 
+/// Saved state for a native PTX block scope.
+#[derive(Clone, Debug)]
+struct BlockScopeState {
+    /// Byte offset in `body` where the `{` was emitted. We insert `.reg`
+    /// declarations right after this position when `end_scope()` is called.
+    body_insert_pos: usize,
+    /// Outer scope's register counters (to restore on end_scope).
+    pred_next: u32,
+    b32_next: u32,
+    b64_next: u32,
+    f32_next: u32,
+    /// The scope_id for registers allocated in this scope.
+    scope_id: u16,
+}
+
 /// PTX code builder -- emits instructions as formatted strings.
 pub struct PtxBuilder {
     pub config: GemmConfig,
     pub regs: RegAllocator,
     pub body: String,
+    /// Stack of native block scope states.
+    block_scope_stack: Vec<BlockScopeState>,
 }
 
 impl PtxBuilder {
@@ -169,19 +232,99 @@ impl PtxBuilder {
             config,
             regs: RegAllocator::new(),
             body: String::with_capacity(32 * 1024),
+            block_scope_stack: Vec::new(),
         }
     }
 
-    /// Save register allocation state. Registers allocated within the scope
-    /// can be reused after `pop_scope()`.
+    /// Save register allocation state (legacy soft scoping).
+    /// Registers allocated within the scope can be reused after `pop_scope()`.
     pub fn push_scope(&mut self) {
         self.regs.push_scope();
     }
 
-    /// Restore register allocation state, freeing names allocated since
-    /// the matching `push_scope()`.
+    /// Restore register allocation state (legacy soft scoping).
     pub fn pop_scope(&mut self) {
         self.regs.pop_scope();
+    }
+
+    /// Open a new PTX native block scope.
+    ///
+    /// Emits `{` to the PTX body and switches to a new register allocator
+    /// with scope-specific prefixes. Registers allocated after this call
+    /// get unique names (e.g., `%t1`, `%td1` for scope 1) and will have
+    /// `.reg` declarations emitted inside the block.
+    ///
+    /// Outer-scope registers remain accessible inside the block.
+    /// Block-local registers MUST NOT be referenced after `end_scope()`.
+    ///
+    /// ptxas sees the `{ .reg ... }` and knows inner registers are dead
+    /// at the closing brace, enabling physical register reuse across blocks.
+    pub fn begin_scope(&mut self) {
+        // Emit the opening brace
+        writeln!(self.body, "\t{{").unwrap();
+        // Record position where .reg declarations will be inserted
+        let insert_pos = self.body.len();
+        // Save outer scope counters
+        let state = BlockScopeState {
+            body_insert_pos: insert_pos,
+            pred_next: self.regs.pred_next,
+            b32_next: self.regs.b32_next,
+            b64_next: self.regs.b64_next,
+            f32_next: self.regs.f32_next,
+            scope_id: self.regs.enter_block_scope(),
+        };
+        // Reset counters for the new scope
+        self.regs.pred_next = 1;
+        self.regs.b32_next = 1;
+        self.regs.b64_next = 1;
+        self.regs.f32_next = 1;
+        self.block_scope_stack.push(state);
+    }
+
+    /// Close the current PTX native block scope.
+    ///
+    /// Inserts `.reg` declarations for block-local registers at the start
+    /// of the block and emits `}`. All block-local registers die here.
+    pub fn end_scope(&mut self) {
+        let state = self.block_scope_stack.pop()
+            .expect("end_scope() called without matching begin_scope()");
+        let scope_id = state.scope_id;
+
+        // Get final counts for this scope
+        let (pred_count, b32_count, b64_count, f32_count) = self.regs.exit_block_scope();
+
+        // Build .reg declaration string
+        let mut reg_decls = String::new();
+        if pred_count > 1 {
+            let prefix = scope_prefix(scope_id, RegClass::Pred);
+            writeln!(reg_decls, "\t.reg .pred \t%{}<{}>;", prefix, pred_count).unwrap();
+        }
+        if b32_count > 1 {
+            let prefix = scope_prefix(scope_id, RegClass::B32);
+            writeln!(reg_decls, "\t.reg .b32 \t%{}<{}>;", prefix, b32_count).unwrap();
+        }
+        if b64_count > 1 {
+            let prefix = scope_prefix(scope_id, RegClass::B64);
+            writeln!(reg_decls, "\t.reg .b64 \t%{}<{}>;", prefix, b64_count).unwrap();
+        }
+        if f32_count > 1 {
+            let prefix = scope_prefix(scope_id, RegClass::F32);
+            writeln!(reg_decls, "\t.reg .f32 \t%{}<{}>;", prefix, f32_count).unwrap();
+        }
+
+        // Insert declarations at the saved position (right after `{`)
+        if !reg_decls.is_empty() {
+            self.body.insert_str(state.body_insert_pos, &reg_decls);
+        }
+
+        // Restore outer scope counters
+        self.regs.pred_next = state.pred_next;
+        self.regs.b32_next = state.b32_next;
+        self.regs.b64_next = state.b64_next;
+        self.regs.f32_next = state.f32_next;
+
+        // Emit closing brace
+        writeln!(self.body, "\t}}").unwrap();
     }
 
     pub fn w(&mut self, s: &str) {
@@ -607,5 +750,101 @@ impl PtxBuilder {
         writeln!(out).unwrap();
         writeln!(out, "}}").unwrap();
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::GemmConfig;
+
+    #[test]
+    fn test_block_scoping_emits_braces_and_reg_declarations() {
+        let config = GemmConfig::default_64x64();
+        let mut ptx = PtxBuilder::new(config);
+
+        // Allocate outer-scope registers
+        let outer_r1 = ptx.regs.alloc_b32();
+        let _outer_rd1 = ptx.regs.alloc_b64();
+        ptx.mov_b32_imm(outer_r1, 42);
+
+        // Open a scope
+        ptx.begin_scope();
+        let inner_r1 = ptx.regs.alloc_b32();
+        let inner_f1 = ptx.regs.alloc_f32();
+        ptx.mov_b32_imm(inner_r1, 99);
+        ptx.mov_f32_imm(inner_f1, 1.0);
+        ptx.end_scope();
+
+        // After end_scope, outer counters should be restored
+        let outer_r2 = ptx.regs.alloc_b32();
+        assert_eq!(outer_r2.scope_id, 0);
+        assert_eq!(outer_r2.index, 2); // continues from where outer left off
+
+        // Verify inner registers have scope_id=1
+        assert_eq!(inner_r1.scope_id, 1);
+        assert_eq!(inner_r1.index, 1);
+        assert_eq!(inner_f1.scope_id, 1);
+
+        // Verify the body contains { .reg ... } block
+        let body = &ptx.body;
+        assert!(body.contains("{"), "Body should contain opening brace");
+        assert!(body.contains("}"), "Body should contain closing brace");
+        assert!(body.contains(".reg .b32 \t%t<2>;"), "Body should contain block-local b32 .reg decl, got: {}", body);
+        assert!(body.contains(".reg .f32 \t%tf<2>;"), "Body should contain block-local f32 .reg decl, got: {}", body);
+
+        // Verify inner register names use scope prefix
+        assert!(body.contains("%t1"), "Body should reference %t1 (scope 1 b32)");
+        assert!(body.contains("%tf1"), "Body should reference %tf1 (scope 1 f32)");
+
+        // Verify outer registers use standard prefix
+        assert!(body.contains("%r1"), "Body should reference %r1 (outer b32)");
+    }
+
+    #[test]
+    fn test_multiple_block_scopes_sequential() {
+        let config = GemmConfig::default_64x64();
+        let mut ptx = PtxBuilder::new(config);
+
+        // Scope 1
+        ptx.begin_scope();
+        let _s1_r1 = ptx.regs.alloc_b32();
+        let _s1_r2 = ptx.regs.alloc_b32();
+        ptx.end_scope();
+
+        // Scope 2 (reuses scope_id 1 since we're at the same depth)
+        // Actually, scope_id is based on block_scope_depth which goes 0->1->0->1
+        ptx.begin_scope();
+        let s2_r1 = ptx.regs.alloc_b32();
+        ptx.end_scope();
+
+        // Both scopes should have scope_id=1 (same depth)
+        assert_eq!(s2_r1.scope_id, 1);
+        assert_eq!(s2_r1.index, 1);
+
+        // Body should contain two { } blocks
+        let body = &ptx.body;
+        let open_count = body.matches("\t{").count();
+        let close_count = body.matches("\t}").count();
+        assert_eq!(open_count, 2, "Should have 2 opening braces");
+        assert_eq!(close_count, 2, "Should have 2 closing braces");
+    }
+
+    #[test]
+    fn test_outer_scope_reg_counts_unaffected_by_block_scope() {
+        let config = GemmConfig::default_64x64();
+        let mut ptx = PtxBuilder::new(config);
+
+        // Allocate 5 outer regs
+        for _ in 0..5 { ptx.regs.alloc_b32(); }
+
+        // Block scope with 100 inner regs
+        ptx.begin_scope();
+        for _ in 0..100 { ptx.regs.alloc_b32(); }
+        ptx.end_scope();
+
+        // Outer scope should still report 5 (well, 6 because count is next index)
+        // The HWM should be max(5+1, 5+1) = 6 since block scope doesn't affect outer HWM
+        assert_eq!(ptx.regs.b32_count(), 6, "Outer b32 count should be 6");
     }
 }

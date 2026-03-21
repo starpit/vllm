@@ -129,25 +129,26 @@ impl EpilogueAtom for SiLuEpilogue {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Scratch registers for the RmsNorm transform. Pre-allocated ONCE, reused every call.
+///
+/// Register-pressure-optimized design:
+/// - Norm factors loaded once in prologue (4 regs, constant across K-loop)
+/// - Gamma loaded per-ki in k_setup (2 regs)
+/// - Multi-purpose scratch regs shared across computation phases
+///   instead of separate named regs for each intermediate value
 pub struct RmsNormAtomScratch {
     // Norm factor registers (computed in prologue, kept for entire K-loop)
     pub nf_packed_row0: Reg,     // b32: norm_factor for rows 0/1 packed as f16x2
     pub nf_packed_row8: Reg,     // b32: norm_factor for rows 8/9 packed as f16x2
     pub nf_packed_rm1_row0: Reg, // b32: norm_factor for rm=1 rows packed as f16x2
     pub nf_packed_rm1_row8: Reg, // b32: norm_factor for rm=1 rows packed as f16x2
-    // Gamma lookup scratch
-    pub gamma_k: Reg,       // b32: k-column index
-    pub gamma_byte: Reg,    // b32: byte offset into gamma smem
-    pub gamma_addr: Reg,    // b32: smem address for gamma
+    // Gamma values (loaded in k_setup, live through both rm transforms)
     pub gamma_packed: Reg,  // b32: gamma[k], gamma[k+1] as packed f16x2
-    pub gamma_addr2: Reg,   // b32: smem address for second gamma pair
     pub gamma_packed2: Reg, // b32: gamma[k+8], gamma[k+9] as packed f16x2
-    // Temporaries
-    pub nf_f16: Reg,        // b32: temp for f32→f16 conversion
-    pub nf_off: Reg,        // b32: byte offset for norm factor lookup
-    pub nf_addr: Reg,       // b32: smem address for norm factor
-    pub nf_b32: Reg,        // b32: raw f32 norm factor from smem
-    pub tg2: Reg,           // b32: tg * 2, precomputed
+    // Multi-purpose scratch (reused across all computation phases)
+    pub tmp0: Reg,          // b32: address/offset computation
+    pub nf_f16: Reg,        // b32: f32→f16 conversion temp
+    // Precomputed
+    pub tg2: Reg,           // b32: tg * 2
 }
 
 /// RmsNorm transform atom.
@@ -165,6 +166,13 @@ pub struct RmsNormAtom {
 
 impl RmsNormAtom {
     /// Create a new RmsNormAtom, allocating scratch registers.
+    ///
+    /// Only 9 scratch registers total (down from 15):
+    /// - 4 nf_packed (prologue-loaded, constant across K-loop)
+    /// - 2 gamma_packed (loaded per-ki in k_setup)
+    /// - 1 multi-purpose tmp0
+    /// - 1 nf_f16 conversion temp
+    /// - 1 tg2 precomputed
     pub fn new(
         ptx: &mut PtxBuilder,
         norm_factors_smem: Reg,
@@ -178,16 +186,10 @@ impl RmsNormAtom {
             nf_packed_row8: ptx.regs.alloc_b32(),
             nf_packed_rm1_row0: ptx.regs.alloc_b32(),
             nf_packed_rm1_row8: ptx.regs.alloc_b32(),
-            gamma_k: ptx.regs.alloc_b32(),
-            gamma_byte: ptx.regs.alloc_b32(),
-            gamma_addr: ptx.regs.alloc_b32(),
             gamma_packed: ptx.regs.alloc_b32(),
-            gamma_addr2: ptx.regs.alloc_b32(),
             gamma_packed2: ptx.regs.alloc_b32(),
+            tmp0: ptx.regs.alloc_b32(),
             nf_f16: ptx.regs.alloc_b32(),
-            nf_off: ptx.regs.alloc_b32(),
-            nf_addr: ptx.regs.alloc_b32(),
-            nf_b32: ptx.regs.alloc_b32(),
             tg2: ptx.regs.alloc_b32(),
         };
         // Precompute tg * 2
@@ -197,6 +199,7 @@ impl RmsNormAtom {
 
     /// Load norm factors from smem and pack as f16x2 into registers.
     /// Called once before the K-loop — norm factors stay in registers for the entire loop.
+    /// Uses tmp0 as multi-purpose scratch for address computation.
     fn load_norm_factors(&self, ptx: &mut PtxBuilder, rm: u32) {
         let s = &self.scratch;
         let (nf_packed, nf_packed8) = if rm == 0 {
@@ -205,20 +208,17 @@ impl RmsNormAtom {
             (s.nf_packed_rm1_row0, s.nf_packed_rm1_row8)
         };
 
-        // norm_factor for group_id row
-        ptx.shl_b32(s.nf_off, self.group_id, 2);
+        // norm_factor for group_id row: tmp0 = norm_factors_smem + group_id * 4 [+ rm*128]
+        ptx.shl_b32(s.tmp0, self.group_id, 2);
         if rm > 0 {
-            ptx.add_s32_imm(s.nf_off, s.nf_off, (rm * 32 * 4) as i32);
+            ptx.add_s32_imm(s.tmp0, s.tmp0, (rm * 32 * 4) as i32);
         }
-        ptx.add_s32(s.nf_addr, self.norm_factors_smem, s.nf_off);
-        ptx.ld_shared_b32(s.nf_b32, s.nf_addr, 0);
-        ptx.mov_b32_to_f32(nf_packed, s.nf_b32);
+        ptx.add_s32(s.tmp0, self.norm_factors_smem, s.tmp0);
+        ptx.ld_shared_b32(nf_packed, s.tmp0, 0);     // load f32 directly into dest
         ptx.pack_f16x2_from_f32(nf_packed, nf_packed, s.nf_f16);
 
         // norm_factor for group_id + 8 row
-        ptx.add_s32_imm(s.nf_addr, s.nf_addr, 8 * 4);
-        ptx.ld_shared_b32(s.nf_b32, s.nf_addr, 0);
-        ptx.mov_b32_to_f32(nf_packed8, s.nf_b32);
+        ptx.ld_shared_b32(nf_packed8, s.tmp0, 8 * 4); // use immediate offset
         ptx.pack_f16x2_from_f32(nf_packed8, nf_packed8, s.nf_f16);
     }
 }
@@ -236,16 +236,16 @@ impl TransformAtom for RmsNormAtom {
         ptx.comment(&format!("RmsNormAtom k_setup: load gamma for ki={ki}"));
         // Load gamma for this ki — shared across rm=0 and rm=1
         // Gamma for a0/a2: gamma[k_counter + ki*16 + tg*2] as packed f16x2
-        ptx.add_s32(s.gamma_k, self.k_counter, s.tg2);
+        // Use tmp0 for address computation (dead after loads complete)
+        ptx.add_s32(s.tmp0, self.k_counter, s.tg2);
         if ki > 0 {
-            ptx.add_s32_imm(s.gamma_k, s.gamma_k, (ki * 16) as i32);
+            ptx.add_s32_imm(s.tmp0, s.tmp0, (ki * 16) as i32);
         }
-        ptx.shl_b32(s.gamma_byte, s.gamma_k, 1);
-        ptx.add_s32(s.gamma_addr, self.gamma_smem, s.gamma_byte);
-        ptx.ld_shared_b32(s.gamma_packed, s.gamma_addr, 0);
-        // Gamma for a1/a3: gamma[k+8] as packed f16x2
-        ptx.add_s32_imm(s.gamma_addr2, s.gamma_addr, 8 * 2);
-        ptx.ld_shared_b32(s.gamma_packed2, s.gamma_addr2, 0);
+        ptx.shl_b32(s.tmp0, s.tmp0, 1);  // byte offset
+        ptx.add_s32(s.tmp0, self.gamma_smem, s.tmp0);  // smem address
+        ptx.ld_shared_b32(s.gamma_packed, s.tmp0, 0);
+        // Gamma for a1/a3: gamma[k+8] as packed f16x2 (offset = 8*2 = 16 bytes)
+        ptx.ld_shared_b32(s.gamma_packed2, s.tmp0, 8 * 2);
     }
 
     fn emit_transform(&self, ptx: &mut PtxBuilder, frag: &mut [Reg; 4], _ki: u32, rm: u32) {

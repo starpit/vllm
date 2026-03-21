@@ -2457,7 +2457,7 @@ pub fn build_gemm_pipeline(config: &GemmConfig) -> String {
     );
 
     // Phase 5: Pipeline with Identity atoms (standalone GEMM)
-    let pipeline = MainloopPipeline::new(2);
+    let pipeline = MainloopPipeline::new(c.num_stages);
     let result = pipeline.emit(
         &mut ptx, c, &setup,
         &CpAsyncCopy,          // copy_a

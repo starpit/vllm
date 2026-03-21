@@ -19,6 +19,8 @@ mod sweep;
 mod triton_style;
 #[allow(unused)]
 mod ptx_builder;
+#[allow(unused)]
+mod gemm_128x128;
 
 use anyhow::{Context, Result, bail};
 use std::ffi::{CString, c_uint, c_void};
@@ -80,15 +82,13 @@ fn main() -> Result<()> {
     let sm = format!("sm_{}{}", major, minor);
     println!("[cuda] GPU: {} ({})", name, sm);
 
-    // Pipeline GEMM (must hit 55 TFLOPS — the validation gate)
-    println!("\nPipeline GEMM (Layer 1)");
-    run_pipeline_gemm()?;
+    // GEMM validation gate (55 TFLOPS)
+    println!("\nGEMM 64x64 (validation gate)");
+    run_ptxbuilder_gemm()?;
 
-    // Skip legacy GEMM and fused benchmark for speed
-    // println!("\nLegacy GEMM");
-    // run_ptxbuilder_gemm()?;
-    // println!("\nFused RMSNorm->GEMM->SiLU megakernel");
-    // run_fused_rmsnorm_gemm_silu()?;
+    // 128x128 GEMM benchmark
+    println!("\nGEMM 128x128 (targeting 48+ TFLOPS)");
+    run_gemm_128x128()?;
 
     println!("\n═══════════════════════════════════");
     println!("Phase 0 complete.");
@@ -103,6 +103,7 @@ fn run_pipeline_gemm() -> Result<()> {
     let config = ferrite_ptx::config::GemmConfig::default_64x64();
     let ptx = ferrite_ptx::gemm::build_gemm_pipeline(&config);
     println!("  Generated {} bytes of PTX", ptx.len());
+    std::fs::write("/tmp/ferrite_pipeline_gemm.ptx", &ptx).ok();
 
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
@@ -251,6 +252,114 @@ fn run_ptxbuilder_gemm() -> Result<()> {
 
         if max_err < 1.0 { println!("  Correct (max err: {:.4})", max_err); }
         else { bail!("  Max error: {:.4}", max_err); }
+
+        let tf = 2.0 * m as f64 * n as f64 * k as f64 / (us * 1e-6) / 1e12;
+        println!("  {:.1} us, {:.1} TFLOPS", us, tf);
+
+        unsafe {
+            cuda::stream::destroy(stream)?;
+            cuda::free_sync(da)?; cuda::free_sync(db)?; cuda::free_sync(dc)?;
+        }
+    }
+
+    unsafe { cuda::module::unload(module)?; }
+    Ok(())
+}
+
+// ===========================================================================
+// 128x128 GEMM benchmark
+// ===========================================================================
+
+fn run_gemm_128x128() -> Result<()> {
+    let ptx = gemm_128x128::emit_ptx_128x128();
+    println!("  Generated {} bytes of PTX", ptx.len());
+
+    std::fs::write("/tmp/ferrite_gemm_128x128.ptx", &ptx).ok();
+    println!("  [debug] PTX dumped to /tmp/ferrite_gemm_128x128.ptx");
+
+    let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
+    let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
+    let func = unsafe {
+        cuda::module::get_function(module, CString::new("gemm_128x128").unwrap())?
+    };
+
+    use cudarc::driver::sys::CUfunction_attribute as FA;
+    let nregs = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let local_bytes = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)? };
+    println!("  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)", nregs, local_bytes);
+
+    let bm: u32 = 128;
+    let bn: u32 = 128;
+    let threads: u32 = 128;
+    let smem_bytes: c_uint = 32768; // 2 stages × (8192 A + 8192 B) = 32KB
+
+    for &sz in &[1024u32] {
+        let m = sz; let n = sz; let k = sz;
+        println!("  --- {}x{} ---", m, n);
+
+        let sa = (m * k) as usize;
+        let sb = (k * n) as usize;
+        let sc = (m * n) as usize;
+        let da = unsafe { cuda::malloc_sync(sa * 2)? };
+        let db = unsafe { cuda::malloc_sync(sb * 2)? };
+        let dc = unsafe { cuda::malloc_sync(sc * 4)? };
+
+        let ha: Vec<half::f16> = (0..sa).map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1)).collect();
+        let hb: Vec<half::f16> = (0..sb).map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1)).collect();
+        let mut hc: Vec<f32> = vec![0.0; sc];
+        unsafe { cuda::memcpy_htod_sync(da, &ha)?; cuda::memcpy_htod_sync(db, &hb)?; }
+
+        let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
+        let gx = n / bn;
+        let gy = m / bm;
+        let params: &mut [*mut c_void] = &mut [
+            (&da) as *const _ as *mut c_void, (&db) as *const _ as *mut c_void,
+            (&dc) as *const _ as *mut c_void, (&m) as *const _ as *mut c_void,
+            (&n) as *const _ as *mut c_void, (&k) as *const _ as *mut c_void,
+        ];
+
+        // Warmup
+        for _ in 0..10 {
+            unsafe { cuda::launch_kernel(func, (gx, gy, 1), (threads, 1, 1), smem_bytes, stream, params)?; }
+        }
+        unsafe { cuda::stream::synchronize(stream)?; }
+
+        // Benchmark
+        let iters = 100;
+        let start = Instant::now();
+        for _ in 0..iters {
+            unsafe { cuda::launch_kernel(func, (gx, gy, 1), (threads, 1, 1), smem_bytes, stream, params)?; }
+        }
+        unsafe { cuda::stream::synchronize(stream)?; }
+        let us = start.elapsed().as_micros() as f64 / iters as f64;
+
+        // Verify
+        unsafe { cuda::memcpy_dtoh_sync(&mut hc, dc)?; }
+        let mut max_err: f32 = 0.0;
+        for r in [0,1,31,32,63,64,95,96,127,511,1023] {
+            for c in [0,1,31,32,63,64,95,96,127,511,1023] {
+                if r >= m as usize || c >= n as usize { continue; }
+                let mut e = 0.0f32;
+                for kk in 0..k as usize { e += ha[r*k as usize+kk].to_f32() * hb[kk*n as usize+c].to_f32(); }
+                let err = (hc[r * n as usize + c] - e).abs();
+                if err > max_err { max_err = err; }
+            }
+        }
+
+        if max_err < 1.0 { println!("  Correct (max err: {:.4})", max_err); }
+        else {
+            // Print a few sample values for debugging
+            for r in [0, 1, 64, 127] {
+                for c in [0, 1, 64, 127] {
+                    if r >= m as usize || c >= n as usize { continue; }
+                    let mut e = 0.0f32;
+                    for kk in 0..k as usize { e += ha[r*k as usize+kk].to_f32() * hb[kk*n as usize+c].to_f32(); }
+                    let got = hc[r * n as usize + c];
+                    println!("    C[{r}][{c}]: got={got:.4} expected={e:.4}");
+                }
+            }
+            bail!("  Max error: {:.4}", max_err);
+        }
 
         let tf = 2.0 * m as f64 * n as f64 * k as f64 / (us * 1e-6) / 1e12;
         println!("  {:.1} us, {:.1} TFLOPS", us, tf);

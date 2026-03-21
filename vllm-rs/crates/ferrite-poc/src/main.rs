@@ -10,6 +10,8 @@
 #[allow(unused)]
 mod cubek_gemm;
 #[allow(unused)]
+mod flash_attn;
+#[allow(unused)]
 mod gemm_128x128;
 #[allow(unused)]
 mod mma_gemm;
@@ -175,6 +177,10 @@ fn main() -> Result<()> {
     // MLP Block: RmsNorm→GEMM→SiLU→GEMM (full down-projection)
     println!("\nMLP Block: RmsNorm→GEMM→SiLU→GEMM 128x128");
     run_mlp_block_128x128(device)?;
+
+    // Flash Attention forward
+    println!("\nFlash Attention Forward (BLOCK_M=64, BLOCK_N=64, HD=64)");
+    run_flash_attn_fwd()?;
 
     println!("\n═══════════════════════════════════");
     println!("Phase 0 complete.");
@@ -2919,4 +2925,311 @@ pub fn add_nvvm_kernel_metadata<'ctx>(module: &Module<'ctx>, function: &Function
         );
         let _ = named_md; // only needed to ensure it exists
     }
+}
+
+// ===========================================================================
+// Flash Attention Forward
+// ===========================================================================
+
+fn run_flash_attn_fwd() -> Result<()> {
+    let ptx = flash_attn::emit_flash_attn_fwd();
+    println!("  Generated {} bytes of PTX", ptx.len());
+
+    std::fs::write("/tmp/ferrite_flash_attn.ptx", &ptx).ok();
+    println!("  [debug] PTX dumped to /tmp/ferrite_flash_attn.ptx");
+
+    let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
+    let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
+    let func =
+        unsafe { cuda::module::get_function(module, CString::new("flash_attn_fwd").unwrap())? };
+
+    use cudarc::driver::sys::CUfunction_attribute as FA;
+    let nregs =
+        unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let local_bytes = unsafe {
+        cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?
+    };
+    println!(
+        "  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)",
+        nregs, local_bytes
+    );
+
+    // Test parameters
+    let batch: u32 = 1;
+    let heads: u32 = 1;
+    let seq_len: u32 = 128; // Start small for correctness
+    let head_dim: u32 = 64;
+
+    let n_q = (batch * heads * seq_len * head_dim) as usize;
+    let n_kv = n_q; // Same seq_len for K, V
+    let n_o = n_q;
+
+    // Allocate
+    let d_q = unsafe { cuda::malloc_sync(n_q * 2)? };
+    let d_k = unsafe { cuda::malloc_sync(n_kv * 2)? };
+    let d_v = unsafe { cuda::malloc_sync(n_kv * 2)? };
+    let d_o = unsafe { cuda::malloc_sync(n_o * 2)? };
+
+    // Initialize Q, K, V with small random-ish values
+    let h_q: Vec<half::f16> = (0..n_q)
+        .map(|i| half::f16::from_f32(((i % 17) as f32 - 8.0) * 0.05))
+        .collect();
+    let h_k: Vec<half::f16> = (0..n_kv)
+        .map(|i| half::f16::from_f32(((i % 13) as f32 - 6.0) * 0.05))
+        .collect();
+    let h_v: Vec<half::f16> = (0..n_kv)
+        .map(|i| half::f16::from_f32(((i % 11) as f32 - 5.0) * 0.05))
+        .collect();
+
+    unsafe {
+        cuda::memcpy_htod_sync(d_q, &h_q)?;
+        cuda::memcpy_htod_sync(d_k, &h_k)?;
+        cuda::memcpy_htod_sync(d_v, &h_v)?;
+        cuda::memset_d8_sync(d_o, 0, n_o * 2)?;
+    }
+
+    let scale: f32 = 1.0 / (head_dim as f32).sqrt() * 1.44269504; // sm_scale * log2(e)
+    let stride_batch: u32 = seq_len * head_dim; // Elements per batch*head
+
+    let smem_bytes: c_uint = flash_attn::SMEM_BYTES;
+
+    // Set max dynamic shared memory
+    unsafe {
+        cuda::function::set_function_attribute(
+            func,
+            FA::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem_bytes as i32,
+        )?;
+    }
+
+    let grid_x = (seq_len + 63) / 64; // ceil(seq_len / BLOCK_M)
+    let grid_y = batch * heads;
+    let threads: u32 = 128;
+
+    let params: &mut [*mut c_void] = &mut [
+        (&d_q) as *const _ as *mut c_void,
+        (&d_k) as *const _ as *mut c_void,
+        (&d_v) as *const _ as *mut c_void,
+        (&d_o) as *const _ as *mut c_void,
+        (&seq_len) as *const _ as *mut c_void,
+        (&scale) as *const _ as *mut c_void,
+        (&stride_batch) as *const _ as *mut c_void,
+    ];
+
+    let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
+
+    // Launch
+    unsafe {
+        cuda::launch_kernel(
+            func,
+            (grid_x, grid_y, 1),
+            (threads, 1, 1),
+            smem_bytes,
+            stream,
+            params,
+        )?;
+        cuda::stream::synchronize(stream)?;
+    }
+
+    // Read output
+    let mut h_o: Vec<half::f16> = vec![half::f16::ZERO; n_o];
+    unsafe {
+        cuda::memcpy_dtoh_sync(&mut h_o, d_o)?;
+    }
+
+    // CPU reference: standard attention
+    // O = softmax(Q @ K^T / sqrt(d)) @ V
+    let sd = seq_len as usize;
+    let dd = head_dim as usize;
+    let mut max_err: f32 = 0.0;
+    let sm_scale = 1.0 / (dd as f32).sqrt();
+
+    for row in [0usize, 1, 31, 32, 63, 64, 95, 127] {
+        if row >= sd {
+            continue;
+        }
+
+        // Compute scores S[row][col] = sum_k Q[row][k] * K[col][k] * sm_scale
+        let mut scores = vec![0.0f32; sd];
+        for col in 0..sd {
+            let mut dot = 0.0f32;
+            for k in 0..dd {
+                dot += h_q[row * dd + k].to_f32() * h_k[col * dd + k].to_f32();
+            }
+            scores[col] = dot * sm_scale;
+        }
+
+        // Softmax
+        let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut exp_sum = 0.0f32;
+        for s in &mut scores {
+            *s = (*s - max_s).exp();
+            exp_sum += *s;
+        }
+        for s in &mut scores {
+            *s /= exp_sum;
+        }
+
+        // O[row] = scores @ V
+        for d in [0usize, 1, 31, 32, 63] {
+            if d >= dd {
+                continue;
+            }
+            let mut o_val = 0.0f32;
+            for col in 0..sd {
+                o_val += scores[col] * h_v[col * dd + d].to_f32();
+            }
+            let got = h_o[row * dd + d].to_f32();
+            let err = (got - o_val).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+    }
+
+    if max_err < 0.1 {
+        println!("  Correct (max err: {:.6})", max_err);
+    } else {
+        // Print diagnostic values
+        for row in [0, 1, 63] {
+            for d in [0, 1, 63] {
+                if row >= sd || d >= dd {
+                    continue;
+                }
+                let mut scores = vec![0.0f32; sd];
+                for col in 0..sd {
+                    let mut dot = 0.0f32;
+                    for k in 0..dd {
+                        dot += h_q[row * dd + k].to_f32() * h_k[col * dd + k].to_f32();
+                    }
+                    scores[col] = dot * sm_scale;
+                }
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut exp_sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - max_s).exp();
+                    exp_sum += *s;
+                }
+                for s in &mut scores {
+                    *s /= exp_sum;
+                }
+                let mut o_val = 0.0f32;
+                for col in 0..sd {
+                    o_val += scores[col] * h_v[col * dd + d].to_f32();
+                }
+                let got = h_o[row * dd + d].to_f32();
+                println!(
+                    "    O[{row}][{d}]: got={got:.6} expected={o_val:.6} err={:.6}",
+                    (got - o_val).abs()
+                );
+            }
+        }
+        println!("  Max error: {:.6} (FAIL)", max_err);
+    }
+
+    // Benchmark with larger sizes and multi-head
+    for &(bench_batch, bench_heads, bench_seq) in &[
+        (1u32, 1u32, 512u32),
+        (1, 1, 1024),
+        (1, 32, 512),
+        (1, 32, 1024),
+        (4, 32, 512),
+    ] {
+        let n_total = (bench_batch * bench_heads * bench_seq * head_dim) as usize;
+        let d_q2 = unsafe { cuda::malloc_sync(n_total * 2)? };
+        let d_k2 = unsafe { cuda::malloc_sync(n_total * 2)? };
+        let d_v2 = unsafe { cuda::malloc_sync(n_total * 2)? };
+        let d_o2 = unsafe { cuda::malloc_sync(n_total * 2)? };
+
+        let h_data: Vec<half::f16> = (0..n_total)
+            .map(|i| half::f16::from_f32(((i % 17) as f32 - 8.0) * 0.05))
+            .collect();
+        unsafe {
+            cuda::memcpy_htod_sync(d_q2, &h_data)?;
+            cuda::memcpy_htod_sync(d_k2, &h_data)?;
+            cuda::memcpy_htod_sync(d_v2, &h_data)?;
+        }
+
+        let scale2: f32 = 1.0 / (head_dim as f32).sqrt() * 1.44269504;
+        let stride2: u32 = bench_seq * head_dim;
+        let gx2 = (bench_seq + 63) / 64;
+        let gy2 = bench_batch * bench_heads;
+
+        let params2: &mut [*mut c_void] = &mut [
+            (&d_q2) as *const _ as *mut c_void,
+            (&d_k2) as *const _ as *mut c_void,
+            (&d_v2) as *const _ as *mut c_void,
+            (&d_o2) as *const _ as *mut c_void,
+            (&bench_seq) as *const _ as *mut c_void,
+            (&scale2) as *const _ as *mut c_void,
+            (&stride2) as *const _ as *mut c_void,
+        ];
+
+        // Warmup
+        for _ in 0..10 {
+            unsafe {
+                cuda::launch_kernel(
+                    func,
+                    (gx2, gy2, 1),
+                    (threads, 1, 1),
+                    smem_bytes,
+                    stream,
+                    params2,
+                )?;
+            }
+        }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
+
+        let iters = 100;
+        let start = Instant::now();
+        for _ in 0..iters {
+            unsafe {
+                cuda::launch_kernel(
+                    func,
+                    (gx2, gy2, 1),
+                    (threads, 1, 1),
+                    smem_bytes,
+                    stream,
+                    params2,
+                )?;
+            }
+        }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
+        let us = start.elapsed().as_micros() as f64 / iters as f64;
+
+        // Flash attention FLOPs: 2 * seq_q * seq_kv * head_dim * 2 (Q@K^T and P@V)
+        let flops = 4.0
+            * bench_seq as f64
+            * bench_seq as f64
+            * head_dim as f64
+            * bench_batch as f64
+            * bench_heads as f64;
+        let tflops = flops / (us * 1e-6) / 1e12;
+        println!(
+            "  B={} H={} seq={}: {:.1} us, {:.2} TFLOPS",
+            bench_batch, bench_heads, bench_seq, us, tflops
+        );
+
+        unsafe {
+            cuda::free_sync(d_q2)?;
+            cuda::free_sync(d_k2)?;
+            cuda::free_sync(d_v2)?;
+            cuda::free_sync(d_o2)?;
+        }
+    }
+
+    unsafe {
+        cuda::stream::destroy(stream)?;
+        cuda::free_sync(d_q)?;
+        cuda::free_sync(d_k)?;
+        cuda::free_sync(d_v)?;
+        cuda::free_sync(d_o)?;
+        cuda::module::unload(module)?;
+    }
+
+    Ok(())
 }

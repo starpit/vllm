@@ -3717,21 +3717,47 @@ fn run_silu_mul() -> Result<()> {
     let d_out = unsafe { cuda::malloc_sync(n as usize * 2)? };
     let h_gate: Vec<half::f16> = (0..n as usize).map(|i| half::f16::from_f32(((i % 17) as f32 - 8.0) * 0.1)).collect();
     let h_up: Vec<half::f16> = (0..n as usize).map(|i| half::f16::from_f32(((i % 13) as f32 - 6.0) * 0.1)).collect();
-    unsafe { cuda::memcpy_htod_sync(d_gate, &h_gate)?; cuda::memcpy_htod_sync(d_up, &h_up)?; cuda::memset_d8_sync(d_out, 0, n as usize * 2)?; }
+    unsafe { cuda::memcpy_htod_sync(d_gate, &h_gate)?; cuda::memcpy_htod_sync(d_up, &h_up)?; }
     let grid_x = (n + 1023) / 1024;
-    let params: &mut [*mut c_void] = &mut [(&d_out) as *const _ as *mut c_void, (&d_gate) as *const _ as *mut c_void, (&d_up) as *const _ as *mut c_void, (&n) as *const _ as *mut c_void];
-    let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
-    unsafe { cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?; cuda::stream::synchronize(stream)?; }
+    let params: &mut [*mut c_void] = &mut [
+        (&d_out) as *const _ as *mut c_void,
+        (&d_gate) as *const _ as *mut c_void,
+        (&d_up) as *const _ as *mut c_void,
+        (&n) as *const _ as *mut c_void,
+    ];
+    // Use null stream (blocking) to avoid sync issues with memcpy on stream 0
+    let stream = std::ptr::null_mut();
+    unsafe {
+        cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?;
+        cuda::stream::synchronize(stream)?;
+    }
     let mut h_out: Vec<half::f16> = vec![half::f16::ZERO; n as usize];
     unsafe { cuda::memcpy_dtoh_sync(&mut h_out, d_out)?; }
+
     let mut max_err: f32 = 0.0;
-    for i in (0..n as usize).step_by(1000) {
-        let g = h_gate[i].to_f32(); let u = h_up[i].to_f32();
+    for i in 0..n as usize {
+        let g = h_gate[i].to_f32();
+        let u = h_up[i].to_f32();
         let expected = g / (1.0 + (-g).exp()) * u;
-        let err = (h_out[i].to_f32() - expected).abs();
-        if err > max_err { max_err = err; }
+        let got = h_out[i].to_f32();
+        let err = (got - expected).abs();
+        if err > max_err || err.is_nan() {
+            max_err = if err.is_nan() { f32::MAX } else { err };
+            if err > 0.01 { println!("    BIG ERR at i={}: got={:.6} exp={:.6} gate={:.4} up={:.4}", i, got, expected, g, u); }
+        }
     }
-    if max_err < 0.05 { println!("  Correct (max err: {:.6})", max_err); } else { println!("  FAIL (max err: {:.6})", max_err); }
+    // Debug: print first 4 values
+    for i in 0..4 {
+        let g = h_gate[i].to_f32();
+        let u = h_up[i].to_f32();
+        let expected = g / (1.0 + (-g).exp()) * u;
+        println!("  out[{}]: got={:.6} exp={:.6} err={:.6}", i, h_out[i].to_f32(), expected, (h_out[i].to_f32() - expected).abs());
+    }
+    if max_err < 0.01 {
+        println!("  Correct (max err: {:.6})", max_err);
+    } else {
+        println!("  FAIL (max err: {:.6})", max_err);
+    }
     for _ in 0..10 { unsafe { cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?; } }
     unsafe { cuda::stream::synchronize(stream)?; }
     let iters = 100;
@@ -3741,7 +3767,11 @@ fn run_silu_mul() -> Result<()> {
     let us = start.elapsed().as_micros() as f64 / iters as f64;
     let gb_s = 3.0 * n as f64 * 2.0 / (us * 1e-6) / 1e9;
     println!("  n={}: {:.1} us, {:.1} GB/s", n, us, gb_s);
-    unsafe { cuda::stream::destroy(stream)?; cuda::free_sync(d_gate)?; cuda::free_sync(d_up)?; cuda::free_sync(d_out)?; cuda::module::unload(module)?; }
+    unsafe {
+        // stream is null (default stream), don't destroy
+        cuda::free_sync(d_gate)?; cuda::free_sync(d_up)?; cuda::free_sync(d_out)?;
+        cuda::module::unload(module)?;
+    }
     Ok(())
 }
 
@@ -3762,7 +3792,7 @@ fn run_rotary() -> Result<()> {
     let total_half: u32 = seqlen * nheads * half_dim; let nheads_x_half_dim: u32 = nheads * half_dim;
     let grid_x = (total_half + 511) / 512;
     let params: &mut [*mut c_void] = &mut [(&d_out) as *const _ as *mut c_void, (&d_x) as *const _ as *mut c_void, (&d_cos) as *const _ as *mut c_void, (&d_sin) as *const _ as *mut c_void, (&total_half) as *const _ as *mut c_void, (&half_dim) as *const _ as *mut c_void, (&headdim) as *const _ as *mut c_void, (&nheads_x_half_dim) as *const _ as *mut c_void];
-    let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
+    let stream = std::ptr::null_mut(); // use default stream for sync with memcpy
     unsafe { cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?; cuda::stream::synchronize(stream)?; }
     let mut h_out: Vec<half::f16> = vec![half::f16::ZERO; n_x];
     unsafe { cuda::memcpy_dtoh_sync(&mut h_out, d_out)?; }
@@ -3792,6 +3822,6 @@ fn run_rotary() -> Result<()> {
     let bytes = 2.0 * n_x as f64 * 2.0 + 2.0 * n_cs as f64 * 4.0;
     let gb_s = bytes / (us * 1e-6) / 1e9;
     println!("  S={} H={} D={}: {:.1} us, {:.1} GB/s", seqlen, nheads, headdim, us, gb_s);
-    unsafe { cuda::stream::destroy(stream)?; cuda::free_sync(d_x)?; cuda::free_sync(d_out)?; cuda::free_sync(d_cos)?; cuda::free_sync(d_sin)?; cuda::module::unload(module)?; }
+    unsafe { cuda::free_sync(d_x)?; cuda::free_sync(d_out)?; cuda::free_sync(d_cos)?; cuda::free_sync(d_sin)?; cuda::module::unload(module)?; }
     Ok(())
 }

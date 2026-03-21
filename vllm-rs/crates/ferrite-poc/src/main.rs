@@ -95,6 +95,83 @@ fn main() -> Result<()> {
     println!("\nFused RmsNorm→GEMM→SiLU 128x128");
     run_fused_128x128()?;
 
+    // Quick GELU benchmark
+    println!("\nGELU standalone (16M elements)");
+    {
+        let ptx = ferrite_ptx::gelu::build_gelu_kernel(256, 4);
+        let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
+        let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
+        let func =
+            unsafe { cuda::module::get_function(module, CString::new("gelu_kernel").unwrap())? };
+        let n: u32 = 16_000_000;
+        let d = unsafe { cuda::malloc_sync(n as usize * 4)? };
+        let h: Vec<f32> = (0..n as usize)
+            .map(|i| ((i % 1000) as f32 - 500.0) * 0.01)
+            .collect();
+        unsafe {
+            cuda::memcpy_htod_sync(d, &h)?;
+        }
+        let grid = (n + 1023) / 1024;
+        let params: &mut [*mut c_void] = &mut [
+            (&d) as *const _ as *mut c_void,
+            (&n) as *const _ as *mut c_void,
+        ];
+        for _ in 0..10 {
+            unsafe {
+                cuda::launch_kernel(
+                    func,
+                    (grid, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    std::ptr::null_mut(),
+                    params,
+                )?;
+            }
+        }
+        unsafe {
+            cuda::stream::synchronize(std::ptr::null_mut())?;
+        }
+        let iters = 100;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            unsafe {
+                cuda::launch_kernel(
+                    func,
+                    (grid, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    std::ptr::null_mut(),
+                    params,
+                )?;
+            }
+        }
+        unsafe {
+            cuda::stream::synchronize(std::ptr::null_mut())?;
+        }
+        let us = start.elapsed().as_micros() as f64 / iters as f64;
+        let bw = (n as f64 * 8.0) / (us * 1e-6) / 1e9; // read + write = 2 * 4 bytes
+        println!("  {:.1} us, {:.1} GB/s", us, bw);
+        // Correctness
+        let mut h_out: Vec<f32> = vec![0.0; n as usize];
+        unsafe {
+            cuda::memcpy_dtoh_sync(&mut h_out, d)?;
+        }
+        let mut max_err: f32 = 0.0;
+        for i in [0, 1, 100, 1000, 999999] {
+            let x = h[i];
+            let expected = x * (1.0 / (1.0 + (-1.702 * x).exp())); // fast gelu
+            let err = (h_out[i] - expected).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        println!("  Correct (max err: {:.6})", max_err);
+        unsafe {
+            cuda::free_sync(d)?;
+            cuda::module::unload(module)?;
+        }
+    }
+
     // MLP Block: RmsNorm→GEMM→SiLU→GEMM (full down-projection)
     println!("\nMLP Block: RmsNorm→GEMM→SiLU→GEMM 128x128");
     run_mlp_block_128x128(device)?;

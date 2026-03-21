@@ -96,7 +96,7 @@ fn launch_standalone_gemm(
     unsafe {
         cuda::launch_kernel(
             f,
-            ((n + 63) / 64, (m + 63) / 64, 1),
+            ((n + 127) / 128, (m + 127) / 128, 1),
             (128, 1, 1),
             smem,
             cuda::stream::null(),
@@ -150,16 +150,18 @@ fn bench_fused_vs_unfused(batch: u32, hidden: u32, out_feat: u32, warmup: u32, i
 
     let stream = cuda::stream::null();
 
-    // Generate the standalone kernel PTXes
-    let config = ferrite_ptx::config::GemmConfig::default_64x64();
+    // Generate the standalone kernel PTXes (128×128 GEMM for fair comparison)
+    #[path = "gemm_128x128.rs"]
+    mod gemm_128x128;
+    let gemm_ptx = gemm_128x128::emit_ptx_128x128();
     let rmsnorm_ptx = ferrite_ptx::rmsnorm::build_rmsnorm_kernel(128, hidden);
-    let gemm_ptx = ferrite_ptx::gemm::build_gemm(&config);
     let silu_ptx = ferrite_ptx::silu::build_silu_kernel(256, 4);
+    let config = ferrite_ptx::config::GemmConfig::default_128x128();
     let smem = config.smem_total();
 
     // Pre-load kernel functions (don't count JIT time)
     let rmsnorm_f = load_kernel(&rmsnorm_ptx, "rmsnorm_kernel");
-    let gemm_f = load_kernel(&gemm_ptx, "triton_style_gemm");
+    let gemm_f = load_kernel(&gemm_ptx, "gemm_128x128");
     let silu_f = load_kernel(&silu_ptx, "silu_kernel");
 
     // Allocate device memory
@@ -267,8 +269,8 @@ fn main() {
     let iters = 100;
 
     // LLaMA dimensions: hidden=4096, out=4096
-    bench_fused_vs_unfused(64, 4096, 4096, warmup, iters);
     bench_fused_vs_unfused(256, 4096, 4096, warmup, iters);
+    bench_fused_vs_unfused(1024, 4096, 4096, warmup, iters);
 
     println!("\n===================================");
     println!("Benchmark complete.");

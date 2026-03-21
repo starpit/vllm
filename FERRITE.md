@@ -634,7 +634,9 @@ obsession with beating our own optimized unfused baseline obscured the real win.
 | PyTorch unfused (RMSNorm+GEMM+SiLU) | 1151 μs | 29.9 | 1.0× |
 | Ferrite fused RmsNorm→GEMM→SiLU (hand-written) | 703 μs | 48.6 | **1.6× faster** |
 | Ferrite fused RmsNorm→GEMM→SiLU (proc macro) | ~660 μs | ~42 | **~1.7× faster** |
-| Ferrite MLP block (norm→GEMM→SiLU→GEMM) | 1370 μs | 50.2 | **~1.7× faster** |
+| Ferrite MLP block (norm→GEMM→SiLU→GEMM, hand-written) | 1370 μs | 50.2 | **~1.7× faster** |
+| Ferrite MLP block (proc macro, DAG-composed) | 1229 μs | — | **1.5× faster** |
+| PyTorch MLP (norm+GEMM+SiLU+GEMM) | 1826 μs | 37.6 | 1.0× (MLP) |
 
 | Kernel (batch=4096) | Time | TFLOPS | vs PyTorch |
 |---------------------|------|--------|-----------|
@@ -648,7 +650,8 @@ obsession with beating our own optimized unfused baseline obscured the real win.
 |--------|------------|-------------|
 | GEMM 64×64 (hand-written PTX) | 55 TFLOPS | matches Triton |
 | GEMM 128×128 (hand-written PTX) | 48 TFLOPS | matches Triton |
-| SiLU standalone | 238 GB/s | matches Triton |
+| SiLU standalone | 238 GB/s | matches PyTorch (232 GB/s) |
+| GELU standalone | 237 GB/s | matches PyTorch (232 GB/s) |
 | RMSNorm standalone | 152 GB/s (batch=32) | 5.9× faster than Triton at batch=1 |
 | CUTLASS fused GEMM→LayerNorm→GEMM | 74.6 TFLOPS | reference implementation |
 
@@ -659,7 +662,18 @@ obsession with beating our own optimized unfused baseline obscured the real win.
 - `fma.rn.f16x2` / `mul.rn.f16x2` in-place transforms: zero extra registers
 - MLP block (GEMM→GEMM chain) via intermediate in global/L2: ~50 TFLOPS
 - Proc macro generates PTX at compile time, embeds as const string
-- One kernel, one launch, intermediates in registers
+- DAG-based composition: adding GELU/ResidualAdd required zero strategy changes
+- 49 unit tests across ferrite-macros (19) and ferrite-ptx (30)
+
+**Supported operations (all composable via DAG edge classification):**
+
+| Op | OpClass | As Prologue (TransformAtom) | As Epilogue (EpilogueAtom) | Standalone |
+|----|---------|---------------------------|--------------------------|-----------|
+| RmsNorm | Elementwise | Yes (2× mul.rn.f16x2) | — | Yes |
+| Gemm | Matmul | — | — | Yes (128×128) |
+| SiLU | Elementwise | — | Yes (6 ALU/elem) | Yes (238 GB/s) |
+| GELU | Elementwise | — | Yes (7 ALU/elem) | Yes (237 GB/s) |
+| ResidualAdd | Elementwise | — | Future | Yes |
 
 ---
 

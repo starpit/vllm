@@ -652,12 +652,21 @@ obsession with beating our own optimized unfused baseline obscured the real win.
 | Ferrite fused RmsNorm→GEMM→SiLU | 2926 μs | 47.0 | **2.4× faster** |
 | Ferrite MLP block (norm→GEMM→SiLU→GEMM) | 5221 μs | 52.6 | **~2× faster** |
 
+**Flash Attention (L4 GPU, d=64):**
+
+| Config | Ferrite | PyTorch FA2 | Ratio |
+|--------|---------|------------|-------|
+| B=4 H=32 seq=512 | **71.0 TFLOPS** | 68.2 TFLOPS | **1.04× faster** |
+| B=1 H=32 seq=1024 | **71.5 TFLOPS** | 68.4 TFLOPS | **1.05× faster** |
+| B=1 H=1 seq=512 | 4.3 TFLOPS | 2.1 TFLOPS | **2.05× faster** |
+
 **Standalone building blocks:**
 
 | Kernel | Performance | vs Reference |
 |--------|------------|-------------|
 | GEMM 64×64 (hand-written PTX) | 55 TFLOPS | matches Triton |
 | GEMM 128×128 (hand-written PTX) | 48 TFLOPS | matches Triton |
+| Flash Attention (hand-written PTX) | 71 TFLOPS | **exceeds FA2 (68 TF)** |
 | SiLU standalone | 238 GB/s | matches PyTorch (232 GB/s) |
 | GELU standalone | 237 GB/s | matches PyTorch (232 GB/s) |
 | RMSNorm standalone | 152 GB/s (batch=32) | 5.9× faster than Triton at batch=1 |
@@ -669,9 +678,10 @@ obsession with beating our own optimized unfused baseline obscured the real win.
 - 128×128 tiles + CUTLASS composition pattern: fusion overhead <3% at scale
 - `fma.rn.f16x2` / `mul.rn.f16x2` in-place transforms: zero extra registers
 - MLP block (GEMM→GEMM chain) via intermediate in global/L2: ~50 TFLOPS
+- Flash attention: 4 warps, BLOCK_M=128, double-buffered K/V, B128 swizzle
 - Proc macro generates PTX at compile time, embeds as const string
 - DAG-based composition: adding GELU/ResidualAdd required zero strategy changes
-- 49 unit tests across ferrite-macros (19) and ferrite-ptx (30)
+- 155 unit tests (19 macros + 111 ptx + 25 flash attn)
 
 **Supported operations (all composable via DAG edge classification):**
 
@@ -679,6 +689,7 @@ obsession with beating our own optimized unfused baseline obscured the real win.
 |----|---------|---------------------------|--------------------------|-----------|
 | RmsNorm | Elementwise | Yes (2× mul.rn.f16x2) | — | Yes |
 | Gemm | Matmul | — | — | Yes (128×128) |
+| FlashAttention | Attention | — | — | Yes (71 TFLOPS) |
 | SiLU | Elementwise | — | Yes (6 ALU/elem) | Yes (238 GB/s) |
 | GELU | Elementwise | — | Yes (7 ALU/elem) | Yes (237 GB/s) |
 | ResidualAdd | Elementwise | — | Future | Yes |

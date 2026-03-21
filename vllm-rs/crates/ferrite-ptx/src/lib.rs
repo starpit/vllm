@@ -2,6 +2,7 @@ pub mod atoms;
 pub mod config;
 pub mod convert;
 pub mod fused;
+pub mod gelu;
 pub mod gemm;
 pub mod pipeline;
 pub mod rmsnorm;

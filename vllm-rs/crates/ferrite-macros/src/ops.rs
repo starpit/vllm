@@ -13,7 +13,11 @@ pub enum OpKind {
     Gemm,
     /// Elementwise activation: y = silu(x)
     Silu,
-    // Future: Gelu, RotaryEmbed, Attention, ResidualAdd, Quantize, etc.
+    /// Elementwise activation: y = gelu(x)  [fast sigmoid approximation]
+    Gelu,
+    /// Elementwise addition: y = x + residual
+    ResidualAdd,
+    // Future: RotaryEmbed, Attention, Quantize, etc.
 }
 
 impl OpKind {
@@ -22,6 +26,8 @@ impl OpKind {
             OpKind::RmsNorm => "rmsnorm",
             OpKind::Gemm => "gemm",
             OpKind::Silu => "silu",
+            OpKind::Gelu => "gelu",
+            OpKind::ResidualAdd => "residual_add",
         }
     }
 }
@@ -42,6 +48,8 @@ impl OpKind {
         match self {
             OpKind::RmsNorm => OpClass::Elementwise,
             OpKind::Silu => OpClass::Elementwise,
+            OpKind::Gelu => OpClass::Elementwise,
+            OpKind::ResidualAdd => OpClass::Elementwise,
             OpKind::Gemm => OpClass::Matmul,
         }
     }
@@ -288,6 +296,8 @@ mod tests {
     fn test_op_class_classification() {
         assert_eq!(OpKind::RmsNorm.class(), OpClass::Elementwise);
         assert_eq!(OpKind::Silu.class(), OpClass::Elementwise);
+        assert_eq!(OpKind::Gelu.class(), OpClass::Elementwise);
+        assert_eq!(OpKind::ResidualAdd.class(), OpClass::Elementwise);
         assert_eq!(OpKind::Gemm.class(), OpClass::Matmul);
     }
 
@@ -296,5 +306,94 @@ mod tests {
         let g = build_mlp_graph();
         assert_eq!(g.output, 3);
         assert_eq!(g.nodes[g.output].kind, OpKind::Gemm);
+    }
+
+    #[test]
+    fn test_dag_gelu_edges() {
+        // gemm(x, w) → gelu(g)
+        let mut g = OpGraph::new();
+        g.params.push(ParamInfo {
+            name: "x".into(),
+            ty: "DevicePtr".into(),
+        });
+        g.params.push(ParamInfo {
+            name: "w".into(),
+            ty: "DevicePtr".into(),
+        });
+        g.nodes.push(OpNode {
+            id: 0,
+            kind: OpKind::Gemm,
+            class: OpClass::Matmul,
+            inputs: vec![
+                Edge {
+                    src: PARAM,
+                    port: InputPort::Primary,
+                    src_name: "x".into(),
+                },
+                Edge {
+                    src: PARAM,
+                    port: InputPort::Weight,
+                    src_name: "w".into(),
+                },
+            ],
+            result_name: Some("g".into()),
+        });
+        g.nodes.push(OpNode {
+            id: 1,
+            kind: OpKind::Gelu,
+            class: OpClass::Elementwise,
+            inputs: vec![Edge {
+                src: 0,
+                port: InputPort::Primary,
+                src_name: "g".into(),
+            }],
+            result_name: None,
+        });
+        g.output = 1;
+
+        // GELU gets input from GEMM
+        assert_eq!(g.input_node(1, InputPort::Primary), Some(0));
+        // GEMM is consumed by GELU
+        assert_eq!(g.consumers_of(0), vec![1]);
+        // GELU has no consumers
+        assert_eq!(g.consumers_of(1), vec![]);
+    }
+
+    #[test]
+    fn test_dag_residual_add_edges() {
+        // residual_add(x, r) — two inputs, both from params
+        let mut g = OpGraph::new();
+        g.params.push(ParamInfo {
+            name: "x".into(),
+            ty: "DevicePtr".into(),
+        });
+        g.params.push(ParamInfo {
+            name: "r".into(),
+            ty: "DevicePtr".into(),
+        });
+        g.nodes.push(OpNode {
+            id: 0,
+            kind: OpKind::ResidualAdd,
+            class: OpClass::Elementwise,
+            inputs: vec![
+                Edge {
+                    src: PARAM,
+                    port: InputPort::Primary,
+                    src_name: "x".into(),
+                },
+                Edge {
+                    src: PARAM,
+                    port: InputPort::Weight,
+                    src_name: "r".into(),
+                },
+            ],
+            result_name: None,
+        });
+        g.output = 0;
+
+        // Both inputs come from PARAM
+        assert_eq!(g.input_node(0, InputPort::Primary), None);
+        assert_eq!(g.input_node(0, InputPort::Weight), None);
+        assert_eq!(g.nodes[0].kind, OpKind::ResidualAdd);
     }
 }

@@ -121,6 +121,31 @@ pub fn parse_fn_body(func: &ItemFn) -> syn::Result<OpGraph> {
                 )?];
                 (OpKind::Silu, inputs)
             }
+            "gelu" => {
+                if call.args.len() != 1 {
+                    return Err(syn::Error::new(call.span, "gelu expects 1 argument"));
+                }
+                let inputs = vec![resolve_edge(
+                    &graph,
+                    &call.args[0],
+                    InputPort::Primary,
+                    call.span,
+                )?];
+                (OpKind::Gelu, inputs)
+            }
+            "residual_add" => {
+                if call.args.len() != 2 {
+                    return Err(syn::Error::new(
+                        call.span,
+                        "residual_add expects 2 arguments",
+                    ));
+                }
+                let inputs = vec![
+                    resolve_edge(&graph, &call.args[0], InputPort::Primary, call.span)?,
+                    resolve_edge(&graph, &call.args[1], InputPort::Weight, call.span)?,
+                ];
+                (OpKind::ResidualAdd, inputs)
+            }
             other => {
                 return Err(syn::Error::new(call.span, format!("unknown op: {other}")));
             }

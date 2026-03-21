@@ -124,6 +124,21 @@ impl EpilogueAtom for SiLuEpilogue {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// GeluEpilogue — x * sigmoid(1.702 * x) on accumulators (7 ALU ops per element)
+//
+// Fast GELU approximation used by many frameworks (GELU_FAST / GELU_PYTORCH_TANH):
+//   GELU(x) ≈ x * sigmoid(1.702 * x)
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct GeluEpilogue;
+
+impl EpilogueAtom for GeluEpilogue {
+    fn emit_epilogue(&self, ptx: &mut PtxBuilder, acc: &mut AccumulatorMap) {
+        crate::gelu::emit_gelu_phase(ptx, acc);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // RmsNormTransform — 2x mul.rn.f16x2 per b32 register
 //
 // Norm factor in REGISTERS (loaded once in prologue, kept entire K-loop).

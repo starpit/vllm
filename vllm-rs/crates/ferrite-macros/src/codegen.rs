@@ -77,9 +77,30 @@ fn generate_single_stage(
                 stage.gemm,
             )
         }
+        (Some(OpKind::RmsNorm), Some(OpKind::Gelu)) => {
+            // Transform(RmsNorm) + GEMM + Epilogue(GELU)
+            generate_rmsnorm_gemm_gelu(
+                attr,
+                input_fn,
+                graph,
+                stage.prologue_transform.unwrap(),
+                stage.gemm,
+                stage.epilogue_transform.unwrap(),
+            )
+        }
         (None, Some(OpKind::Silu)) => {
             // GEMM + Epilogue(SiLU)
             generate_gemm_silu(
+                attr,
+                input_fn,
+                graph,
+                stage.gemm,
+                stage.epilogue_transform.unwrap(),
+            )
+        }
+        (None, Some(OpKind::Gelu)) => {
+            // GEMM + Epilogue(GELU)
+            generate_gemm_gelu(
                 attr,
                 input_fn,
                 graph,
@@ -135,9 +156,17 @@ fn generate_two_stage(
         ((Some(OpKind::RmsNorm), Some(OpKind::Silu)), (None, None)) => {
             generate_mlp_block(attr, input_fn, graph, stage1, stage2)
         }
+        ((Some(OpKind::RmsNorm), Some(OpKind::Gelu)), (None, None)) => {
+            // RmsNorm+GEMM+GELU -> GEMM
+            generate_rmsnorm_gemm_gelu_gemm_block(attr, input_fn, graph, stage1, stage2)
+        }
         ((None, Some(OpKind::Silu)), (None, None)) => {
             // GEMM+SiLU -> GEMM (no rmsnorm)
             generate_gemm_silu_gemm_block(attr, input_fn, graph, stage1, stage2)
+        }
+        ((None, Some(OpKind::Gelu)), (None, None)) => {
+            // GEMM+GELU -> GEMM (no rmsnorm)
+            generate_gemm_gelu_gemm_block(attr, input_fn, graph, stage1, stage2)
         }
         ((None, None), (None, None)) => {
             // GEMM -> GEMM chain
@@ -515,6 +544,67 @@ fn generate_standalone_gemm(
     Err(syn::Error::new_spanned(
         &input_fn.sig.ident,
         "Standalone GEMM not yet implemented via proc macro. Use ferrite_ptx::gemm::build_gemm() directly.",
+    ))
+}
+
+/// Generate code for fused RmsNorm -> GEMM -> GELU megakernel.
+fn generate_rmsnorm_gemm_gelu(
+    _attr: &FuseAttr,
+    input_fn: &syn::ItemFn,
+    _graph: &OpGraph,
+    _norm_id: usize,
+    _gemm_id: usize,
+    _gelu_id: usize,
+) -> syn::Result<TokenStream> {
+    Err(syn::Error::new_spanned(
+        &input_fn.sig.ident,
+        "RmsNorm -> GEMM -> GELU fusion not yet implemented. \
+         The strategy engine correctly identifies this pattern; codegen is pending.",
+    ))
+}
+
+/// Generate code for fused GEMM -> GELU.
+fn generate_gemm_gelu(
+    _attr: &FuseAttr,
+    input_fn: &syn::ItemFn,
+    _graph: &OpGraph,
+    _gemm_id: usize,
+    _gelu_id: usize,
+) -> syn::Result<TokenStream> {
+    Err(syn::Error::new_spanned(
+        &input_fn.sig.ident,
+        "Standalone GEMM+GELU fusion not yet implemented. \
+         The strategy engine correctly identifies this pattern; codegen is pending.",
+    ))
+}
+
+/// Generate code for RmsNorm+GEMM+GELU -> GEMM 2-stage plan.
+fn generate_rmsnorm_gemm_gelu_gemm_block(
+    _attr: &FuseAttr,
+    input_fn: &syn::ItemFn,
+    _graph: &OpGraph,
+    _stage1: &Stage,
+    _stage2: &Stage,
+) -> syn::Result<TokenStream> {
+    Err(syn::Error::new_spanned(
+        &input_fn.sig.ident,
+        "RmsNorm+GEMM+GELU -> GEMM 2-stage fusion not yet implemented. \
+         The strategy engine correctly identifies this pattern; codegen is pending.",
+    ))
+}
+
+/// Generate code for GEMM+GELU -> GEMM 2-stage plan.
+fn generate_gemm_gelu_gemm_block(
+    _attr: &FuseAttr,
+    input_fn: &syn::ItemFn,
+    _graph: &OpGraph,
+    _stage1: &Stage,
+    _stage2: &Stage,
+) -> syn::Result<TokenStream> {
+    Err(syn::Error::new_spanned(
+        &input_fn.sig.ident,
+        "GEMM+GELU -> GEMM 2-stage fusion not yet implemented. \
+         The strategy engine correctly identifies this pattern; codegen is pending.",
     ))
 }
 

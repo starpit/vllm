@@ -439,4 +439,153 @@ mod tests {
         assert_eq!(plan.stages[1].prologue_transform, None);
         assert_eq!(plan.stages[1].epilogue_transform, None);
     }
+
+    // ── GELU and ResidualAdd strategy tests ──
+
+    #[test]
+    fn test_gemm_gelu_fuses_as_one_stage() {
+        // let g = gemm(x, w);
+        // gelu(g)
+        let graph = build_graph(vec![
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: Some("g"),
+                inputs: vec![
+                    (PARAM, InputPort::Primary, "x"),
+                    (PARAM, InputPort::Weight, "w"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Gelu,
+                result_name: None,
+                inputs: vec![(0, InputPort::Primary, "g")],
+            },
+        ]);
+
+        let plan = evaluate_strategy(&graph);
+
+        assert_eq!(plan.stages.len(), 1, "GEMM+GELU must fuse into one stage");
+        let stage = &plan.stages[0];
+        assert_eq!(stage.gemm, 0);
+        assert_eq!(stage.prologue_transform, None);
+        assert_eq!(stage.epilogue_transform, Some(1), "GELU should be epilogue");
+    }
+
+    #[test]
+    fn test_rmsnorm_gemm_gelu_gemm_two_stages() {
+        // rmsnorm → gemm → gelu → gemm  (MLP with GELU instead of SiLU)
+        let graph = build_graph(vec![
+            NodeDesc {
+                kind: OpKind::RmsNorm,
+                result_name: Some("n"),
+                inputs: vec![
+                    (PARAM, InputPort::Primary, "x"),
+                    (PARAM, InputPort::Weight, "w"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: Some("g"),
+                inputs: vec![
+                    (0, InputPort::Primary, "n"),
+                    (PARAM, InputPort::Weight, "w2"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Gelu,
+                result_name: Some("h"),
+                inputs: vec![(1, InputPort::Primary, "g")],
+            },
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: None,
+                inputs: vec![
+                    (2, InputPort::Primary, "h"),
+                    (PARAM, InputPort::Weight, "w3"),
+                ],
+            },
+        ]);
+
+        let plan = evaluate_strategy(&graph);
+
+        assert_eq!(plan.stages.len(), 2, "Must produce two stages");
+
+        // Stage 0: Transform(RmsNorm) + GEMM + Epilogue(GELU)
+        assert_eq!(plan.stages[0].gemm, 1);
+        assert_eq!(plan.stages[0].prologue_transform, Some(0));
+        assert_eq!(
+            plan.stages[0].epilogue_transform,
+            Some(2),
+            "GELU should be epilogue of first stage"
+        );
+
+        // Stage 1: standalone GEMM
+        assert_eq!(plan.stages[1].gemm, 3);
+        assert_eq!(plan.stages[1].prologue_transform, None);
+        assert_eq!(plan.stages[1].epilogue_transform, None);
+    }
+
+    #[test]
+    fn test_residual_add_standalone_not_fused() {
+        // residual_add has no GEMM, so it should produce zero stages
+        // (standalone elementwise kernels are not yet GEMM stages)
+        let graph = build_graph(vec![NodeDesc {
+            kind: OpKind::ResidualAdd,
+            result_name: None,
+            inputs: vec![
+                (PARAM, InputPort::Primary, "x"),
+                (PARAM, InputPort::Weight, "w"),
+            ],
+        }]);
+
+        let plan = evaluate_strategy(&graph);
+
+        // ResidualAdd without a GEMM produces no stages (it's elementwise-only,
+        // not attached to any Matmul node).
+        assert_eq!(
+            plan.stages.len(),
+            0,
+            "Standalone ResidualAdd should not produce a GEMM stage"
+        );
+    }
+
+    #[test]
+    fn test_rmsnorm_gemm_gelu_fuses_into_one_stage() {
+        // rmsnorm → gemm → gelu (single stage, GELU as epilogue)
+        let graph = build_graph(vec![
+            NodeDesc {
+                kind: OpKind::RmsNorm,
+                result_name: Some("n"),
+                inputs: vec![
+                    (PARAM, InputPort::Primary, "x"),
+                    (PARAM, InputPort::Weight, "w"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: Some("g"),
+                inputs: vec![
+                    (0, InputPort::Primary, "n"),
+                    (PARAM, InputPort::Weight, "w2"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Gelu,
+                result_name: None,
+                inputs: vec![(1, InputPort::Primary, "g")],
+            },
+        ]);
+
+        let plan = evaluate_strategy(&graph);
+
+        assert_eq!(plan.stages.len(), 1, "Must produce exactly ONE stage");
+        let stage = &plan.stages[0];
+        assert_eq!(stage.gemm, 1);
+        assert_eq!(
+            stage.prologue_transform,
+            Some(0),
+            "RmsNorm should be prologue"
+        );
+        assert_eq!(stage.epilogue_transform, Some(2), "GELU should be epilogue");
+    }
 }

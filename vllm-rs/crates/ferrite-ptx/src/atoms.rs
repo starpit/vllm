@@ -312,3 +312,417 @@ impl TransformAtom for RmsNormAtom {
         ptx.mul_rn_f16x2(frag[3], frag[3], gamma_packed2);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::GemmConfig;
+
+    fn default_config() -> GemmConfig {
+        GemmConfig::default_64x64()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // CpAsyncCopy tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_cp_async_copy_emits_cp_async_cg() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let smem_dst = ptx.regs.alloc_b32();
+        let glob_src = ptx.regs.alloc_b64();
+        let pred_size = ptx.regs.alloc_b32();
+
+        CpAsyncCopy.emit_async_copy(&mut ptx, smem_dst, glob_src, pred_size);
+        assert!(
+            ptx.body.contains("cp.async.cg.shared.global"),
+            "CpAsyncCopy must emit cp.async.cg instruction"
+        );
+    }
+
+    #[test]
+    fn test_cp_async_copy_emits_commit() {
+        let mut ptx = PtxBuilder::new(default_config());
+        CpAsyncCopy.emit_commit(&mut ptx);
+        assert!(
+            ptx.body.contains("cp.async.commit_group"),
+            "CpAsyncCopy must emit cp.async.commit_group"
+        );
+    }
+
+    #[test]
+    fn test_cp_async_copy_returns_one_async_group() {
+        assert_eq!(
+            CpAsyncCopy.async_groups_per_tile(),
+            1,
+            "CpAsyncCopy must return exactly 1 async group per tile"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // IdentityTransform tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_identity_transform_emits_zero_instructions() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let body_before = ptx.body.len();
+        let mut frag = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
+        IdentityTransform.emit_transform(&mut ptx, &mut frag, 0, 0);
+        assert_eq!(
+            ptx.body.len(),
+            body_before,
+            "IdentityTransform must emit zero instructions"
+        );
+    }
+
+    #[test]
+    fn test_identity_transform_prologue_emits_nothing() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let body_before = ptx.body.len();
+        IdentityTransform.emit_prologue(&mut ptx);
+        assert_eq!(
+            ptx.body.len(),
+            body_before,
+            "IdentityTransform prologue must emit zero instructions"
+        );
+    }
+
+    #[test]
+    fn test_identity_transform_k_setup_emits_nothing() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let body_before = ptx.body.len();
+        IdentityTransform.emit_k_setup(&mut ptx, 0);
+        assert_eq!(
+            ptx.body.len(),
+            body_before,
+            "IdentityTransform k_setup must emit zero instructions"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Mma16816 tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_mma16816_emits_mma_sync() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let a = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
+        let b = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+        let mut acc = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
+        Mma16816.emit_mma(&mut ptx, a, b, &mut acc);
+        assert!(
+            ptx.body.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
+            "Mma16816 must emit mma.sync.aligned.m16n8k16"
+        );
+    }
+
+    #[test]
+    fn test_mma16816_emits_exactly_one_mma() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let a = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
+        let b = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+        let mut acc = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
+        Mma16816.emit_mma(&mut ptx, a, b, &mut acc);
+        let count = ptx.body.matches("mma.sync.aligned").count();
+        assert_eq!(count, 1, "Mma16816 must emit exactly one MMA instruction");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // IdentityEpilogue tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_identity_epilogue_emits_zero_instructions() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let body_before = ptx.body.len();
+        let mut acc = AccumulatorMap {
+            regs: vec![[
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+            ]],
+            reg_m: 1,
+            reg_n: 1,
+        };
+        IdentityEpilogue.emit_epilogue(&mut ptx, &mut acc);
+        assert_eq!(
+            ptx.body.len(),
+            body_before,
+            "IdentityEpilogue must emit zero instructions"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SiLuEpilogue tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_silu_epilogue_emits_6_alu_ops_per_element() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let mut acc = AccumulatorMap {
+            regs: vec![[
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+            ]],
+            reg_m: 1,
+            reg_n: 1,
+        };
+        SiLuEpilogue.emit_epilogue(&mut ptx, &mut acc);
+        let body = &ptx.body;
+
+        // 4 accumulators, 6 ALU ops each: neg, mul(log2e), ex2, add, rcp, mul(x*sig)
+        assert_eq!(body.matches("neg.f32").count(), 4, "4 neg.f32 (one per acc element)");
+        assert_eq!(body.matches("ex2.approx.f32").count(), 4, "4 ex2.approx.f32");
+        assert_eq!(body.matches("rcp.approx.f32").count(), 4, "4 rcp.approx.f32");
+        // mul.f32 count: 2 per element (mul by log2e + mul x*sigmoid) = 8
+        assert_eq!(body.matches("mul.f32").count(), 8, "8 mul.f32 (2 per element * 4 elements)");
+    }
+
+    #[test]
+    fn test_silu_epilogue_no_f16x2_ops() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let mut acc = AccumulatorMap {
+            regs: vec![[
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+            ]],
+            reg_m: 1,
+            reg_n: 1,
+        };
+        SiLuEpilogue.emit_epilogue(&mut ptx, &mut acc);
+        assert!(
+            !ptx.body.contains("f16x2"),
+            "SiLU epilogue operates on f32 accumulators, must NOT use f16x2"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // GeluEpilogue tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_gelu_epilogue_emits_7_alu_ops_per_element() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let mut acc = AccumulatorMap {
+            regs: vec![[
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+            ]],
+            reg_m: 1,
+            reg_n: 1,
+        };
+        GeluEpilogue.emit_epilogue(&mut ptx, &mut acc);
+        let body = &ptx.body;
+
+        // 4 accumulators, 7 ALU ops each: mul(1.702*x), neg, mul(log2e), ex2, add, rcp, mul(x*sig)
+        assert_eq!(body.matches("neg.f32").count(), 4, "4 neg.f32");
+        assert_eq!(body.matches("ex2.approx.f32").count(), 4, "4 ex2.approx.f32");
+        assert_eq!(body.matches("rcp.approx.f32").count(), 4, "4 rcp.approx.f32");
+        // mul.f32 count: 3 per element (1.702*x, log2e, x*sig) = 12
+        assert_eq!(body.matches("mul.f32").count(), 12, "12 mul.f32 (3 per element * 4)");
+    }
+
+    #[test]
+    fn test_gelu_epilogue_uses_ex2_approx() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let mut acc = AccumulatorMap {
+            regs: vec![[
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+            ]],
+            reg_m: 1,
+            reg_n: 1,
+        };
+        GeluEpilogue.emit_epilogue(&mut ptx, &mut acc);
+        assert!(ptx.body.contains("ex2.approx.f32"), "GELU must use ex2.approx");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // RmsNormAtom tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_rmsnorm_atom_transform_uses_f16x2_only() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let norm_factors_smem = ptx.regs.alloc_b32();
+        let gamma_smem = ptx.regs.alloc_b32();
+        let group_id = ptx.regs.alloc_b32();
+        let tg = ptx.regs.alloc_b32();
+        let k_counter = ptx.regs.alloc_b32();
+        let warp_m_offset = ptx.regs.alloc_b32();
+
+        let atom = RmsNormAtom::new(
+            &mut ptx, norm_factors_smem, gamma_smem, group_id, tg,
+            k_counter, 4, 2, warp_m_offset,
+        );
+
+        // Clear body to isolate transform output
+        ptx.body.clear();
+        let mut frag = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
+        atom.emit_transform(&mut ptx, &mut frag, 0, 0);
+
+        assert!(
+            ptx.body.contains("mul.rn.f16x2"),
+            "RmsNormAtom must use mul.rn.f16x2 (packed ops)"
+        );
+        assert!(
+            !ptx.body.contains("cvt.f32.f16"),
+            "RmsNormAtom must NOT unpack to f32"
+        );
+    }
+
+    #[test]
+    fn test_rmsnorm_atom_transform_emits_8_mul_f16x2() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let norm_factors_smem = ptx.regs.alloc_b32();
+        let gamma_smem = ptx.regs.alloc_b32();
+        let group_id = ptx.regs.alloc_b32();
+        let tg = ptx.regs.alloc_b32();
+        let k_counter = ptx.regs.alloc_b32();
+        let warp_m_offset = ptx.regs.alloc_b32();
+
+        let atom = RmsNormAtom::new(
+            &mut ptx, norm_factors_smem, gamma_smem, group_id, tg,
+            k_counter, 4, 2, warp_m_offset,
+        );
+
+        ptx.body.clear();
+        let mut frag = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
+        atom.emit_transform(&mut ptx, &mut frag, 0, 0);
+
+        let count = ptx.body.matches("mul.rn.f16x2").count();
+        assert_eq!(count, 8, "RmsNormAtom must emit 8 mul.rn.f16x2 (2 per register * 4 regs)");
+    }
+
+    #[test]
+    fn test_rmsnorm_atom_prologue_loads_norm_factors() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let norm_factors_smem = ptx.regs.alloc_b32();
+        let gamma_smem = ptx.regs.alloc_b32();
+        let group_id = ptx.regs.alloc_b32();
+        let tg = ptx.regs.alloc_b32();
+        let k_counter = ptx.regs.alloc_b32();
+        let warp_m_offset = ptx.regs.alloc_b32();
+
+        let atom = RmsNormAtom::new(
+            &mut ptx, norm_factors_smem, gamma_smem, group_id, tg,
+            k_counter, 4, 2, warp_m_offset,
+        );
+
+        ptx.body.clear();
+        atom.emit_prologue(&mut ptx);
+
+        assert!(
+            ptx.body.contains("RmsNormAtom prologue: load norm factors into REGISTERS"),
+            "Prologue must load norm factors into registers"
+        );
+        // Should load from shared memory (ld.shared.b32)
+        assert!(
+            ptx.body.contains("ld.shared.b32"),
+            "Prologue must load norm factors from smem"
+        );
+        // Should NOT load from global memory
+        assert!(
+            !ptx.body.contains("ld.global"),
+            "Prologue must load from smem, not global"
+        );
+    }
+
+    #[test]
+    fn test_rmsnorm_atom_k_setup_loads_gamma_from_smem() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let norm_factors_smem = ptx.regs.alloc_b32();
+        let gamma_smem = ptx.regs.alloc_b32();
+        let group_id = ptx.regs.alloc_b32();
+        let tg = ptx.regs.alloc_b32();
+        let k_counter = ptx.regs.alloc_b32();
+        let warp_m_offset = ptx.regs.alloc_b32();
+
+        let atom = RmsNormAtom::new(
+            &mut ptx, norm_factors_smem, gamma_smem, group_id, tg,
+            k_counter, 4, 2, warp_m_offset,
+        );
+
+        ptx.body.clear();
+        atom.emit_k_setup(&mut ptx, 0);
+
+        assert!(
+            ptx.body.contains("ld.shared.b32"),
+            "k_setup must load gamma from shared memory"
+        );
+        assert!(
+            ptx.body.contains("batch load gamma"),
+            "k_setup at ki=0 must batch load all gamma values"
+        );
+    }
+
+    #[test]
+    fn test_rmsnorm_atom_k_setup_ki1_is_noop() {
+        let mut ptx = PtxBuilder::new(default_config());
+        let norm_factors_smem = ptx.regs.alloc_b32();
+        let gamma_smem = ptx.regs.alloc_b32();
+        let group_id = ptx.regs.alloc_b32();
+        let tg = ptx.regs.alloc_b32();
+        let k_counter = ptx.regs.alloc_b32();
+        let warp_m_offset = ptx.regs.alloc_b32();
+
+        let atom = RmsNormAtom::new(
+            &mut ptx, norm_factors_smem, gamma_smem, group_id, tg,
+            k_counter, 4, 2, warp_m_offset,
+        );
+
+        ptx.body.clear();
+        let body_before = ptx.body.len();
+        atom.emit_k_setup(&mut ptx, 1);
+        assert_eq!(
+            ptx.body.len(),
+            body_before,
+            "k_setup at ki>0 must be a no-op (gamma already loaded)"
+        );
+    }
+}

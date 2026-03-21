@@ -665,3 +665,236 @@ impl MainloopPipeline {
         PipelineResult { acc, k_counter }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::GemmConfig;
+
+    /// Helper: build a pipeline GEMM with the given config and return the full PTX string.
+    fn build_pipeline_ptx(config: &GemmConfig) -> String {
+        crate::gemm::build_gemm_pipeline(config)
+    }
+
+    #[test]
+    fn test_pipeline_identity_transform_no_transform_instructions() {
+        let config = GemmConfig::default_64x64();
+        let ptx = build_pipeline_ptx(&config);
+
+        let kloop_start = ptx.find("$L_KLOOP:").expect("K-loop label");
+        let kloop_end = ptx.find("$L_K0_FALLTHROUGH:").expect("K0 fallthrough");
+        let kloop = &ptx[kloop_start..kloop_end];
+
+        assert!(
+            !kloop.contains("mul.rn.f16x2"),
+            "Pipeline with IdentityTransform must emit zero transform instructions"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_with_rmsnorm_produces_f16x2_in_kloop() {
+        let config = GemmConfig::default_64x64();
+        let ptx = crate::fused::build_fused_pipeline(&config, 4096);
+
+        let kloop_start = ptx.find("$L_KLOOP:").expect("K-loop label");
+        let kloop_end = ptx.find("$L_K0_FALLTHROUGH:").expect("K0 fallthrough");
+        let kloop = &ptx[kloop_start..kloop_end];
+
+        assert!(
+            kloop.contains("mul.rn.f16x2"),
+            "Pipeline with RmsNormAtom must produce mul.rn.f16x2 in K-loop"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_64x64_mma_count() {
+        let config = GemmConfig::default_64x64();
+        let ptx = build_pipeline_ptx(&config);
+
+        let kloop_start = ptx.find("$L_KLOOP:").expect("K-loop label");
+        let kloop_end = ptx.find("$L_K0_FALLTHROUGH:").expect("K0 fallthrough");
+        let kloop = &ptx[kloop_start..kloop_end];
+
+        // 64x64: REG_M=4, REG_N=2, k_iters=2 => 4*2*2 = 16 MMA instructions
+        let mma_count = kloop.matches("mma.sync.aligned.m16n8k16").count();
+        assert_eq!(
+            mma_count, 16,
+            "64x64 pipeline must have 16 MMA instructions (4*2*2), got {}",
+            mma_count
+        );
+    }
+
+    #[test]
+    fn test_pipeline_128x128_mma_count() {
+        let config = GemmConfig::default_128x128();
+        let ptx = build_pipeline_ptx(&config);
+
+        let kloop_start = ptx.find("$L_KLOOP:").expect("K-loop label");
+        let kloop_end = ptx.find("$L_K0_FALLTHROUGH:").expect("K0 fallthrough");
+        let kloop = &ptx[kloop_start..kloop_end];
+
+        // 128x128: REG_M=4, REG_N=8, k_iters=2 => 4*8*2 = 64 MMA instructions
+        let mma_count = kloop.matches("mma.sync.aligned.m16n8k16").count();
+        assert_eq!(
+            mma_count, 64,
+            "128x128 pipeline must have 64 MMA instructions (4*8*2), got {}",
+            mma_count
+        );
+    }
+
+    #[test]
+    fn test_pipeline_64x64_ldmatrix_a_count() {
+        let config = GemmConfig::default_64x64();
+        let ptx = build_pipeline_ptx(&config);
+
+        let kloop_start = ptx.find("$L_KLOOP:").expect("K-loop label");
+        let kloop_end = ptx.find("$L_K0_FALLTHROUGH:").expect("K0 fallthrough");
+        let kloop = &ptx[kloop_start..kloop_end];
+
+        // 64x64: REG_M=4, k_iters=2 => 4*2 = 8 ldmatrix A calls
+        let ldm_a_count = kloop
+            .matches("ldmatrix.sync.aligned.m8n8.x4.shared.b16")
+            .count();
+        assert_eq!(
+            ldm_a_count, 8,
+            "64x64 pipeline must have 8 ldmatrix A calls (4 rm * 2 ki), got {}",
+            ldm_a_count
+        );
+    }
+
+    #[test]
+    fn test_pipeline_64x64_cp_async_count() {
+        let config = GemmConfig::default_64x64();
+        let ptx = build_pipeline_ptx(&config);
+
+        let kloop_start = ptx.find("$L_KLOOP:").expect("K-loop label");
+        let kloop_end = ptx.find("$L_K0_FALLTHROUGH:").expect("K0 fallthrough");
+        let kloop = &ptx[kloop_start..kloop_end];
+
+        // 64x64: 2 chunks for A + 2 chunks for B = 4 cp.async per K-iter
+        let cp_count = kloop.matches("cp.async.cg.shared.global").count();
+        assert_eq!(
+            cp_count, 4,
+            "64x64 pipeline must have 4 cp.async per K-iteration (2 A + 2 B), got {}",
+            cp_count
+        );
+    }
+
+    #[test]
+    fn test_pipeline_128x128_cp_async_count() {
+        let config = GemmConfig::default_128x128();
+        let ptx = build_pipeline_ptx(&config);
+
+        let kloop_start = ptx.find("$L_KLOOP:").expect("K-loop label");
+        let kloop_end = ptx.find("$L_K0_FALLTHROUGH:").expect("K0 fallthrough");
+        let kloop = &ptx[kloop_start..kloop_end];
+
+        // 128x128: 4 chunks for A + 4 chunks for B = 8 cp.async per K-iter
+        let cp_count = kloop.matches("cp.async.cg.shared.global").count();
+        assert_eq!(
+            cp_count, 8,
+            "128x128 pipeline must have 8 cp.async per K-iteration (4 A + 4 B), got {}",
+            cp_count
+        );
+    }
+
+    #[test]
+    fn test_pipeline_produces_correct_accumulator_count_64x64() {
+        let config = GemmConfig::default_64x64();
+        let ptx = build_pipeline_ptx(&config);
+
+        // 64x64: REG_M=4, REG_N=2 => 8 tiles * 4 regs = 32 accumulator registers
+        // The pipeline initializes accumulators to zero. Count "mov.b32" with 0 value
+        // in the accumulator init region
+        assert_eq!(config.num_acc(), 32);
+        assert!(ptx.contains("Initialize accumulators to 0.0f (REG_M=4, REG_N=2, 8 tiles)"));
+    }
+
+    #[test]
+    fn test_pipeline_produces_correct_accumulator_count_128x128() {
+        let config = GemmConfig::default_128x128();
+        let ptx = build_pipeline_ptx(&config);
+
+        // 128x128: REG_M=4, REG_N=8 => 32 tiles * 4 regs = 128 accumulator registers
+        assert_eq!(config.num_acc(), 128);
+        assert!(ptx.contains("Initialize accumulators to 0.0f (REG_M=4, REG_N=8, 32 tiles)"));
+    }
+
+    #[test]
+    fn test_pipeline_wait_group_matches_stages_2() {
+        let config = GemmConfig::default_64x64();
+        assert_eq!(config.num_stages, 2);
+        let ptx = build_pipeline_ptx(&config);
+
+        // With 2 stages and 1 async group per tile for A + 1 for B = 2 groups per tile,
+        // wait_count = total_async_per_tile * (stages - 2) = 2 * 0 = 0
+        assert!(
+            ptx.contains("cp.async.wait_group \t0"),
+            "2-stage pipeline must wait for group 0 in K-loop"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_wait_group_matches_stages_3() {
+        let config = GemmConfig {
+            num_stages: 3,
+            ..GemmConfig::default_64x64()
+        };
+        let ptx = build_pipeline_ptx(&config);
+
+        // With 3 stages: wait_count = 2 * (3 - 2) = 2
+        assert!(
+            ptx.contains("cp.async.wait_group \t2"),
+            "3-stage pipeline must wait for group 2 in K-loop"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_has_prologue_and_epilogue() {
+        let config = GemmConfig::default_64x64();
+        let ptx = build_pipeline_ptx(&config);
+
+        assert!(ptx.contains("Pipeline prologue: load tile 0"), "Must have prologue tile 0");
+        assert!(ptx.contains("$L_EPILOGUE:"), "Must have epilogue label");
+        assert!(ptx.contains("$L_KLOOP:"), "Must have K-loop label");
+        assert!(ptx.contains("$L_K0_FALLTHROUGH:"), "Must have K0 fallthrough");
+    }
+
+    #[test]
+    fn test_pipeline_2_stage_loads_1_prologue_tile() {
+        let config = GemmConfig::default_64x64();
+        assert_eq!(config.num_stages, 2);
+        let ptx = build_pipeline_ptx(&config);
+
+        // 2 stages: prologue loads stages-1 = 1 tile
+        assert!(ptx.contains("Pipeline prologue: load tile 0 into buffer 0"));
+        assert!(!ptx.contains("Pipeline prologue: load tile 1 into buffer 1"));
+    }
+
+    #[test]
+    fn test_pipeline_3_stage_loads_2_prologue_tiles() {
+        let config = GemmConfig {
+            num_stages: 3,
+            ..GemmConfig::default_64x64()
+        };
+        let ptx = build_pipeline_ptx(&config);
+
+        assert!(ptx.contains("Pipeline prologue: load tile 0 into buffer 0"));
+        assert!(ptx.contains("Pipeline prologue: load tile 1 into buffer 1"));
+        assert!(!ptx.contains("Pipeline prologue: load tile 2 into buffer 2"));
+    }
+
+    #[test]
+    fn test_pipeline_new_requires_at_least_2_stages() {
+        // This should succeed
+        let _p = MainloopPipeline::new(2);
+        let _p = MainloopPipeline::new(3);
+        let _p = MainloopPipeline::new(4);
+    }
+
+    #[test]
+    #[should_panic(expected = "Pipeline requires at least 2 stages")]
+    fn test_pipeline_new_panics_on_1_stage() {
+        let _p = MainloopPipeline::new(1);
+    }
+}

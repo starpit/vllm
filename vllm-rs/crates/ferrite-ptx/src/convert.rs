@@ -94,4 +94,63 @@ mod tests {
         }
         println!("CVT PTX: {} bytes", ptx.len());
     }
+
+    #[test]
+    fn test_cvt_kernel_has_vectorized_load() {
+        let ptx = build_cvt_f32_to_f16_kernel("sm_89");
+        assert!(
+            ptx.contains("ld.global.v4.f32"),
+            "Must use vectorized v4 load for 4 f32 elements"
+        );
+    }
+
+    #[test]
+    fn test_cvt_kernel_has_vectorized_store() {
+        let ptx = build_cvt_f32_to_f16_kernel("sm_89");
+        assert!(
+            ptx.contains("st.global.v2.b32"),
+            "Must use vectorized v2 store for packed f16 pairs"
+        );
+    }
+
+    #[test]
+    fn test_cvt_kernel_has_bounds_check() {
+        let ptx = build_cvt_f32_to_f16_kernel("sm_89");
+        assert!(ptx.contains("setp.ge.u32"), "Must have bounds check");
+        assert!(ptx.contains("$L_DONE"), "Must have done label for bounds skip");
+    }
+
+    #[test]
+    fn test_cvt_kernel_has_4_conversions() {
+        let ptx = build_cvt_f32_to_f16_kernel("sm_89");
+        let count = ptx.matches("cvt.rn.f16.f32").count();
+        assert_eq!(count, 4, "Must have 4 f32-to-f16 conversions (4 elements per thread)");
+    }
+
+    #[test]
+    fn test_cvt_kernel_has_correct_params() {
+        let ptx = build_cvt_f32_to_f16_kernel("sm_89");
+        assert!(ptx.contains("param_in"), "Must have input parameter");
+        assert!(ptx.contains("param_out"), "Must have output parameter");
+        assert!(ptx.contains("param_N"), "Must have N parameter");
+    }
+
+    #[test]
+    fn test_cvt_kernel_targets_correct_arch() {
+        let ptx = build_cvt_f32_to_f16_kernel("sm_90");
+        assert!(ptx.contains(".target sm_90"), "Must target the specified architecture");
+    }
+
+    #[test]
+    fn test_cvt_kernel_single_entry() {
+        let ptx = build_cvt_f32_to_f16_kernel("sm_89");
+        let entry_count = ptx.matches(".visible .entry").count();
+        assert_eq!(entry_count, 1, "Must generate exactly one kernel");
+    }
+
+    #[test]
+    fn test_cvt_kernel_reqntid() {
+        let ptx = build_cvt_f32_to_f16_kernel("sm_89");
+        assert!(ptx.contains(".reqntid 256"), "Must request 256 threads per block");
+    }
 }

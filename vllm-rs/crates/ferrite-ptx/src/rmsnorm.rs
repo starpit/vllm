@@ -581,3 +581,117 @@ pub fn build_rmsnorm_kernel(block_size: u32, hidden_size: u32) -> String {
     // Need shared memory for warp reduction scratch (num_warps * 4 bytes)
     ptx.finalize("rmsnorm_kernel", &params)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rmsnorm_standalone_valid_ptx() {
+        let ptx = build_rmsnorm_kernel(128, 4096);
+        assert!(ptx.contains(".version"), "Must have PTX version");
+        assert!(ptx.contains(".visible .entry rmsnorm_kernel("), "Must have entry point");
+        assert!(ptx.contains("param_output"), "Must have output parameter");
+        assert!(ptx.contains("param_input"), "Must have input parameter");
+        assert!(ptx.contains("param_weight"), "Must have weight parameter");
+        assert!(ptx.contains("param_eps"), "Must have eps parameter");
+    }
+
+    #[test]
+    fn test_rmsnorm_standalone_has_rsqrt() {
+        let ptx = build_rmsnorm_kernel(128, 4096);
+        assert!(
+            ptx.contains("rsqrt.approx.f32"),
+            "RMSNorm must use rsqrt.approx.f32 for normalization"
+        );
+    }
+
+    #[test]
+    fn test_rmsnorm_standalone_has_shuffle_reduction() {
+        let ptx = build_rmsnorm_kernel(128, 4096);
+        assert!(
+            ptx.contains("shfl.sync.bfly.b32"),
+            "RMSNorm must use butterfly shuffle for warp reduction"
+        );
+        // 5 shuffle stages: offsets 16, 8, 4, 2, 1
+        let shfl_count = ptx.matches("shfl.sync.bfly.b32").count();
+        assert_eq!(shfl_count, 5, "Must have 5 butterfly shuffle stages for 32-lane warp reduction");
+    }
+
+    #[test]
+    fn test_rmsnorm_standalone_has_cross_warp_reduction() {
+        let ptx = build_rmsnorm_kernel(128, 4096);
+        assert!(
+            ptx.contains("Cross-warp reduction"),
+            "Must have cross-warp reduction phase"
+        );
+        assert!(
+            ptx.contains("bar.sync"),
+            "Cross-warp reduction requires barriers"
+        );
+    }
+
+    #[test]
+    fn test_rmsnorm_standalone_has_fma_for_sum_of_squares() {
+        let ptx = build_rmsnorm_kernel(128, 4096);
+        assert!(
+            ptx.contains("fma.rn.f32"),
+            "Must use fma for sum-of-squares computation (x*x + sum)"
+        );
+    }
+
+    #[test]
+    fn test_rmsnorm_standalone_has_f16_conversion() {
+        let ptx = build_rmsnorm_kernel(128, 4096);
+        assert!(
+            ptx.contains("cvt.f32.f16"),
+            "Must convert input f16 to f32 for computation"
+        );
+        assert!(
+            ptx.contains("cvt.rn.f16.f32"),
+            "Must convert result f32 back to f16 for output"
+        );
+    }
+
+    #[test]
+    fn test_rmsnorm_standalone_single_kernel() {
+        let ptx = build_rmsnorm_kernel(128, 4096);
+        let entry_count = ptx.matches(".visible .entry").count();
+        assert_eq!(entry_count, 1, "Must generate exactly one kernel");
+    }
+
+    #[test]
+    fn test_rmsnorm_standalone_256_threads() {
+        let ptx = build_rmsnorm_kernel(256, 4096);
+        assert!(ptx.contains(".visible .entry rmsnorm_kernel("), "Must have entry point");
+        assert!(ptx.contains("rsqrt.approx.f32"), "Must have rsqrt");
+    }
+
+    #[test]
+    fn test_rmsnorm_phase_emits_key_instructions() {
+        let config = GemmConfig {
+            bm: 128, bn: 32, bk: 1, wm: 32, wn: 32,
+            mma_m: 16, mma_n: 8, mma_k: 16, num_stages: 1,
+            sm_arch: "sm_89".into(),
+        };
+        let mut ptx = PtxBuilder::new(config);
+        let input_ptr = ptx.regs.alloc_b64();
+        let weight_ptr = ptx.regs.alloc_b64();
+        let smem_out = ptx.regs.alloc_b32();
+        let tid = ptx.regs.alloc_b32();
+        let lane = ptx.regs.alloc_b32();
+        let warp_id = ptx.regs.alloc_b32();
+        let cfg = RmsNormPhaseConfig {
+            hidden_size: 512,
+            threads: 128,
+            eps: 1e-6,
+        };
+        emit_rmsnorm_phase(&mut ptx, input_ptr, weight_ptr, smem_out, tid, lane, warp_id, &cfg);
+        let body = &ptx.body;
+
+        assert!(body.contains("RMSNorm phase"), "Must have RMSNorm phase comment");
+        assert!(body.contains("rsqrt.approx.f32"), "Must compute rsqrt");
+        assert!(body.contains("shfl.sync.bfly.b32"), "Must use shuffle reduction");
+        assert!(body.contains("fma.rn.f32"), "Must use fma for sum-of-squares");
+    }
+}

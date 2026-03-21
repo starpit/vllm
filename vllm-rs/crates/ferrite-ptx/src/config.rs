@@ -106,3 +106,170 @@ impl GemmConfig {
         128
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // default_64x64 derived values
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_64x64_reg_m() {
+        let c = GemmConfig::default_64x64();
+        assert_eq!(c.reg_m(), 4, "64x64: reg_m = wm/mma_m = 64/16 = 4");
+    }
+
+    #[test]
+    fn test_64x64_reg_n() {
+        let c = GemmConfig::default_64x64();
+        assert_eq!(c.reg_n(), 2, "64x64: reg_n = wn/mma_n = 16/8 = 2");
+    }
+
+    #[test]
+    fn test_64x64_k_iters() {
+        let c = GemmConfig::default_64x64();
+        assert_eq!(c.k_iters(), 2, "64x64: k_iters = bk/mma_k = 32/16 = 2");
+    }
+
+    #[test]
+    fn test_64x64_warps() {
+        let c = GemmConfig::default_64x64();
+        assert_eq!(c.warps(), 4, "64x64: warps = (64/64) * (64/16) = 1 * 4 = 4");
+    }
+
+    #[test]
+    fn test_64x64_threads() {
+        let c = GemmConfig::default_64x64();
+        assert_eq!(c.threads(), 128, "64x64: threads = 4 warps * 32 = 128");
+    }
+
+    #[test]
+    fn test_64x64_num_acc() {
+        let c = GemmConfig::default_64x64();
+        assert_eq!(c.num_acc(), 32, "64x64: num_acc = 4 * 2 * 4 = 32");
+    }
+
+    #[test]
+    fn test_64x64_smem_a_bytes() {
+        let c = GemmConfig::default_64x64();
+        assert_eq!(c.smem_a_bytes(), 4096, "64x64: smem_a = 64 * 32 * 2 = 4096");
+    }
+
+    #[test]
+    fn test_64x64_smem_b_bytes() {
+        let c = GemmConfig::default_64x64();
+        assert_eq!(c.smem_b_bytes(), 4096, "64x64: smem_b = 32 * 64 * 2 = 4096");
+    }
+
+    #[test]
+    fn test_64x64_smem_total() {
+        let c = GemmConfig::default_64x64();
+        assert_eq!(c.smem_total(), 16384, "64x64: smem_total = (4096 + 4096) * 2 = 16384");
+    }
+
+    #[test]
+    fn test_64x64_cp_chunks() {
+        let c = GemmConfig::default_64x64();
+        assert_eq!(c.cp_chunks_a(), 2, "64x64: cp_chunks_a = 4096 / (128 * 16) = 2");
+        assert_eq!(c.cp_chunks_b(), 2, "64x64: cp_chunks_b = 4096 / (128 * 16) = 2");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // default_128x128 derived values
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_128x128_reg_m() {
+        let c = GemmConfig::default_128x128();
+        assert_eq!(c.reg_m(), 4, "128x128: reg_m = wm/mma_m = 64/16 = 4");
+    }
+
+    #[test]
+    fn test_128x128_reg_n() {
+        let c = GemmConfig::default_128x128();
+        assert_eq!(c.reg_n(), 8, "128x128: reg_n = wn/mma_n = 64/8 = 8");
+    }
+
+    #[test]
+    fn test_128x128_k_iters() {
+        let c = GemmConfig::default_128x128();
+        assert_eq!(c.k_iters(), 2, "128x128: k_iters = bk/mma_k = 32/16 = 2");
+    }
+
+    #[test]
+    fn test_128x128_warps() {
+        let c = GemmConfig::default_128x128();
+        assert_eq!(c.warps(), 4, "128x128: warps = (128/64) * (128/64) = 2 * 2 = 4");
+    }
+
+    #[test]
+    fn test_128x128_threads() {
+        let c = GemmConfig::default_128x128();
+        assert_eq!(c.threads(), 128, "128x128: threads = 4 warps * 32 = 128");
+    }
+
+    #[test]
+    fn test_128x128_num_acc() {
+        let c = GemmConfig::default_128x128();
+        assert_eq!(c.num_acc(), 128, "128x128: num_acc = 4 * 8 * 4 = 128");
+    }
+
+    #[test]
+    fn test_128x128_smem_a_bytes() {
+        let c = GemmConfig::default_128x128();
+        assert_eq!(c.smem_a_bytes(), 8192, "128x128: smem_a = 128 * 32 * 2 = 8192");
+    }
+
+    #[test]
+    fn test_128x128_smem_b_bytes() {
+        let c = GemmConfig::default_128x128();
+        assert_eq!(c.smem_b_bytes(), 8192, "128x128: smem_b = 32 * 128 * 2 = 8192");
+    }
+
+    #[test]
+    fn test_128x128_smem_total() {
+        let c = GemmConfig::default_128x128();
+        assert_eq!(c.smem_total(), 32768, "128x128: smem_total = (8192 + 8192) * 2 = 32768");
+    }
+
+    #[test]
+    fn test_128x128_cp_chunks() {
+        let c = GemmConfig::default_128x128();
+        assert_eq!(c.cp_chunks_a(), 4, "128x128: cp_chunks_a = 8192 / (128 * 16) = 4");
+        assert_eq!(c.cp_chunks_b(), 4, "128x128: cp_chunks_b = 8192 / (128 * 16) = 4");
+    }
+
+    #[test]
+    fn test_128x128_b_col_groups() {
+        let c = GemmConfig::default_128x128();
+        assert_eq!(c.b_col_groups(), 2, "128x128: b_col_groups = ceil(8/4) = 2");
+    }
+
+    #[test]
+    fn test_64x64_b_col_groups() {
+        let c = GemmConfig::default_64x64();
+        assert_eq!(c.b_col_groups(), 1, "64x64: b_col_groups = ceil(2/4) = 1");
+    }
+
+    #[test]
+    fn test_buf_stride() {
+        let c64 = GemmConfig::default_64x64();
+        assert_eq!(c64.buf_stride(), 8192, "64x64: buf_stride = 4096 + 4096 = 8192");
+
+        let c128 = GemmConfig::default_128x128();
+        assert_eq!(c128.buf_stride(), 16384, "128x128: buf_stride = 8192 + 8192 = 16384");
+    }
+
+    #[test]
+    fn test_warps_m_and_n() {
+        let c64 = GemmConfig::default_64x64();
+        assert_eq!(c64.warps_m(), 1, "64x64: warps_m = 64/64 = 1");
+        assert_eq!(c64.warps_n(), 4, "64x64: warps_n = 64/16 = 4");
+
+        let c128 = GemmConfig::default_128x128();
+        assert_eq!(c128.warps_m(), 2, "128x128: warps_m = 128/64 = 2");
+        assert_eq!(c128.warps_n(), 2, "128x128: warps_n = 128/64 = 2");
+    }
+}

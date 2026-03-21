@@ -157,3 +157,102 @@ pub fn build_silu_kernel(block_size: u32, elems_per_thread: u32) -> String {
 
     ptx.finalize("silu_kernel", &params)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_silu_phase_emits_correct_instructions() {
+        let config = GemmConfig {
+            bm: 64, bn: 64, bk: 32, wm: 64, wn: 64,
+            mma_m: 16, mma_n: 8, mma_k: 16, num_stages: 2,
+            sm_arch: "sm_89".into(),
+        };
+        let mut ptx = PtxBuilder::new(config);
+        let mut acc = AccumulatorMap {
+            regs: vec![[
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+            ]],
+            reg_m: 1,
+            reg_n: 1,
+        };
+        emit_silu_phase(&mut ptx, &mut acc);
+        let body = &ptx.body;
+
+        assert!(body.contains("neg.f32"), "SiLU must negate for -x");
+        assert!(body.contains("ex2.approx.f32"), "SiLU must use ex2.approx for exp(-x)");
+        assert!(body.contains("rcp.approx.f32"), "SiLU must use rcp.approx for 1/(1+exp(-x))");
+        assert!(body.contains("add.f32"), "SiLU must add 1.0");
+        assert!(body.contains("mul.f32"), "SiLU must multiply x * sigmoid(x)");
+    }
+
+    #[test]
+    fn test_silu_phase_6_ops_per_element() {
+        let config = GemmConfig {
+            bm: 64, bn: 64, bk: 32, wm: 64, wn: 64,
+            mma_m: 16, mma_n: 8, mma_k: 16, num_stages: 2,
+            sm_arch: "sm_89".into(),
+        };
+        let mut ptx = PtxBuilder::new(config);
+        // Single element (1 tile with 4 regs)
+        let mut acc = AccumulatorMap {
+            regs: vec![[
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+            ]],
+            reg_m: 1,
+            reg_n: 1,
+        };
+        emit_silu_phase(&mut ptx, &mut acc);
+        let body = &ptx.body;
+
+        // Per element: neg, mul(log2e), ex2, add(1.0), rcp, mul(x*sig) = 6 ALU ops
+        // 4 elements total
+        assert_eq!(body.matches("neg.f32").count(), 4);
+        assert_eq!(body.matches("ex2.approx.f32").count(), 4);
+        assert_eq!(body.matches("rcp.approx.f32").count(), 4);
+        assert_eq!(body.matches("add.f32").count(), 4);
+        // mul.f32 = 2 per element (log2e multiply + final multiply)
+        assert_eq!(body.matches("mul.f32").count(), 8);
+    }
+
+    #[test]
+    fn test_silu_standalone_kernel_valid_ptx() {
+        let ptx = build_silu_kernel(256, 4);
+
+        assert!(ptx.contains(".version"), "Must have PTX version");
+        assert!(ptx.contains("silu_kernel"), "Must have entry point name");
+        assert!(ptx.contains("param_data"), "Must have data parameter");
+        assert!(ptx.contains("param_N"), "Must have N parameter");
+        assert!(ptx.contains(".visible .entry silu_kernel("), "Must have visible entry");
+    }
+
+    #[test]
+    fn test_silu_standalone_has_ex2_and_rcp() {
+        let ptx = build_silu_kernel(256, 4);
+        assert!(ptx.contains("ex2.approx.f32"), "Must use fast exp2");
+        assert!(ptx.contains("rcp.approx.f32"), "Must use fast reciprocal");
+    }
+
+    #[test]
+    fn test_silu_standalone_load_store_counts() {
+        let ptx = build_silu_kernel(256, 8);
+        let ld_count = ptx.matches("ld.global.f32").count();
+        let st_count = ptx.matches("st.global.f32").count();
+        assert_eq!(ld_count, 8, "Expected 8 global loads for 8 elems/thread");
+        assert_eq!(st_count, 8, "Expected 8 global stores for 8 elems/thread");
+    }
+
+    #[test]
+    fn test_silu_standalone_has_bounds_check() {
+        let ptx = build_silu_kernel(256, 4);
+        assert!(ptx.contains("setp.lt.s32"), "Must have bounds check predicate");
+        assert!(ptx.contains("$L_DONE"), "Must have done label for bounds skip");
+    }
+}

@@ -79,8 +79,8 @@ pub struct NormProducerCtx {
 /// ld.global.v4.b32 for the weight to maximize throughput.
 pub fn emit_normalized_chunk_store(
     ptx: &mut PtxBuilder,
-    global_addr: Reg,      // .b64: global address for this chunk's 16 bytes
-    wnorm_addr: Reg,       // .b64: weight address for same K-range
+    global_addr: Reg,       // .b64: global address for this chunk's 16 bytes
+    wnorm_addr: Reg,        // .b64: weight address for same K-range
     smem_addr: Reg,         // .b32: swizzled smem destination
     row_id: Reg,            // .b32: global row index
     norm_factors_base: Reg, // .b32: base of norm factor array
@@ -102,13 +102,17 @@ pub fn emit_normalized_chunk_store(
     // Load 16 bytes from input using ld.global.v4.b32
     // Each b32 holds a pair of f16 values (4 pairs = 8 f16s = 16 bytes)
     let raw_in = [
-        ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-        ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
     ];
     // Load 16 bytes from weight
     let raw_wt = [
-        ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-        ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
     ];
 
     if let Some(pred) = predicate {
@@ -194,8 +198,15 @@ pub fn emit_norm_factor_computation(
     eps: f32,
 ) -> Reg {
     emit_norm_factor_computation_inner(
-        ptx, input_ptr, block_row, tid, smem_base, norm_factors_off,
-        hidden_size, eps, None,
+        ptx,
+        input_ptr,
+        block_row,
+        tid,
+        smem_base,
+        norm_factors_off,
+        hidden_size,
+        eps,
+        None,
     )
 }
 
@@ -223,8 +234,18 @@ pub fn emit_norm_factor_computation_inner(
     // Actually, let's just check: with 128 threads, 2 threads/row gives 64 rows.
     // If we need more rows, we must use 1 thread/row.
     // The caller should use the _cfg variant for BM>64.
-    emit_norm_factor_computation_cfg(ptx, input_ptr, block_row, tid, smem_base,
-        norm_factors_off, hidden_size, eps, pre_allocated_base, 2)
+    emit_norm_factor_computation_cfg(
+        ptx,
+        input_ptr,
+        block_row,
+        tid,
+        smem_base,
+        norm_factors_off,
+        hidden_size,
+        eps,
+        pre_allocated_base,
+        2,
+    )
 }
 
 /// Config-aware norm factor computation.
@@ -241,7 +262,10 @@ pub fn emit_norm_factor_computation_cfg(
     pre_allocated_base: Option<Reg>,
     threads_per_row: u32,
 ) -> Reg {
-    ptx.comment(&format!("=== RMSNorm norm factor computation ({} threads/row) ===", threads_per_row));
+    ptx.comment(&format!(
+        "=== RMSNorm norm factor computation ({} threads/row) ===",
+        threads_per_row
+    ));
     ptx.blank();
 
     let norm_factors_base = pre_allocated_base.unwrap_or_else(|| ptx.regs.alloc_b32());
@@ -297,8 +321,10 @@ pub fn emit_norm_factor_computation_cfg(
     {
         for u in 0..unroll {
             let data = [
-                ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
             ];
             ptx.ld_global_v4_b32(data, cur_addr, (u * 16) as i32);
 
@@ -354,7 +380,9 @@ pub fn emit_norm_factor_computation_cfg(
         ptx.shl_b32(row_off, my_row, 2);
         let row_factor_addr = ptx.regs.alloc_b32();
         ptx.add_s32(row_factor_addr, norm_factors_base, row_off);
-        ptx.w(&format!("@{p_first} st.shared.b32 \t[{row_factor_addr}], {scale_b32};"));
+        ptx.w(&format!(
+            "@{p_first} st.shared.b32 \t[{row_factor_addr}], {scale_b32};"
+        ));
     } else {
         // All threads store (1 thread per row, no predicate needed)
         let scale_b32 = ptx.regs.alloc_b32();

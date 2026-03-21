@@ -1,5 +1,5 @@
-use crate::{PtxBuilder, Reg};
 use crate::gemm::AccumulatorMap;
+use crate::{PtxBuilder, Reg};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Atom traits — the pluggable components of the MainloopPipeline
@@ -67,7 +67,9 @@ impl CopyAtom for CpAsyncCopy {
         ptx.cp_async_commit();
     }
 
-    fn async_groups_per_tile(&self) -> u32 { 1 }
+    fn async_groups_per_tile(&self) -> u32 {
+        1
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -138,17 +140,17 @@ impl EpilogueAtom for SiLuEpilogue {
 pub struct RmsNormAtomScratch {
     // Norm factor registers (computed in prologue, kept for entire K-loop)
     // nf_packed[rm][0] = norm_factor for group_id rows, nf_packed[rm][1] = group_id+8 rows
-    pub nf_packed: Vec<[Reg; 2]>,   // [REG_M] × 2 regs each
+    pub nf_packed: Vec<[Reg; 2]>, // [REG_M] × 2 regs each
     // Gamma values — one pair per ki, all loaded at once in k_setup(ki=0).
     // gamma_all[ki] = [gamma_packed, gamma_packed2] for that ki value.
     // This matches the hand-written PTX which loads all gamma values before
     // any ldmatrix, enabling better instruction scheduling.
-    pub gamma_all: Vec<[Reg; 2]>,   // [k_warp_iters] × 2 regs each
+    pub gamma_all: Vec<[Reg; 2]>, // [k_warp_iters] × 2 regs each
     // Multi-purpose scratch (reused across all computation phases)
-    pub tmp0: Reg,          // b32: address/offset computation
-    pub nf_f16: Reg,        // b32: f32→f16 conversion temp
+    pub tmp0: Reg,   // b32: address/offset computation
+    pub nf_f16: Reg, // b32: f32→f16 conversion temp
     // Precomputed
-    pub tg2: Reg,           // b32: tg * 2
+    pub tg2: Reg, // b32: tg * 2
 }
 
 /// RmsNorm transform atom.
@@ -156,16 +158,16 @@ pub struct RmsNormAtomScratch {
 /// Multiplies each f16 element by norm_factor (per-row, in REGISTERS) * gamma (per-k-column, from smem).
 /// Uses packed f16x2 ops only — 2x mul.rn.f16x2 per b32 register.
 pub struct RmsNormAtom {
-    pub norm_factors_smem: Reg,  // smem base of norm factors array
-    pub gamma_smem: Reg,         // smem base of preloaded gamma weights
-    pub group_id: Reg,           // lane group within warp (lane >> 2)
-    pub tg: Reg,                 // thread group (lane & 3)
-    pub k_counter: Reg,          // k-loop counter register
-    pub reg_m: u32,              // number of M register tiles (from config)
-    pub k_warp_iters: u32,       // BK/MMA_K (2 for BK=32, 4 for BK=64)
+    pub norm_factors_smem: Reg, // smem base of norm factors array
+    pub gamma_smem: Reg,        // smem base of preloaded gamma weights
+    pub group_id: Reg,          // lane group within warp (lane >> 2)
+    pub tg: Reg,                // thread group (lane & 3)
+    pub k_counter: Reg,         // k-loop counter register
+    pub reg_m: u32,             // number of M register tiles (from config)
+    pub k_warp_iters: u32,      // BK/MMA_K (2 for BK=32, 4 for BK=64)
     /// For 128×128 with 2×2 warp layout, each warp handles 64 rows.
     /// The warp_m_offset (0 or 64) needs to be added to norm factor lookups.
-    pub warp_m_offset: Reg,      // b32: warp_m * WM (e.g., 0 or 64)
+    pub warp_m_offset: Reg, // b32: warp_m * WM (e.g., 0 or 64)
     pub scratch: RmsNormAtomScratch,
 }
 
@@ -206,7 +208,17 @@ impl RmsNormAtom {
         };
         // Precompute tg * 2
         ptx.shl_b32(scratch.tg2, tg, 1);
-        Self { norm_factors_smem, gamma_smem, group_id, tg, k_counter, reg_m, k_warp_iters, warp_m_offset, scratch }
+        Self {
+            norm_factors_smem,
+            gamma_smem,
+            group_id,
+            tg,
+            k_counter,
+            reg_m,
+            k_warp_iters,
+            warp_m_offset,
+            scratch,
+        }
     }
 
     /// Load norm factors from smem and pack as f16x2 into registers.
@@ -222,9 +234,9 @@ impl RmsNormAtom {
         if rm > 0 {
             ptx.add_s32_imm(s.tmp0, s.tmp0, (rm * 16) as i32);
         }
-        ptx.shl_b32(s.tmp0, s.tmp0, 2);  // row * 4 bytes
+        ptx.shl_b32(s.tmp0, s.tmp0, 2); // row * 4 bytes
         ptx.add_s32(s.tmp0, self.norm_factors_smem, s.tmp0);
-        ptx.ld_shared_b32(nf_packed, s.tmp0, 0);     // load f32 directly into dest
+        ptx.ld_shared_b32(nf_packed, s.tmp0, 0); // load f32 directly into dest
         ptx.pack_f16x2_from_f32(nf_packed, nf_packed, s.nf_f16);
 
         // norm_factor for group_id + 8 row
@@ -235,7 +247,10 @@ impl RmsNormAtom {
 
 impl TransformAtom for RmsNormAtom {
     fn emit_prologue(&self, ptx: &mut PtxBuilder) {
-        ptx.comment(&format!("RmsNormAtom prologue: load norm factors into REGISTERS (REG_M={})", self.reg_m));
+        ptx.comment(&format!(
+            "RmsNormAtom prologue: load norm factors into REGISTERS (REG_M={})",
+            self.reg_m
+        ));
         for rm in 0..self.reg_m {
             self.load_norm_factors(ptx, rm);
         }
@@ -247,16 +262,19 @@ impl TransformAtom for RmsNormAtom {
         // For ki>0, the values are already in registers. This matches the hand-written
         // PTX pattern and eliminates redundant address computation per ki.
         if ki == 0 {
-            ptx.comment(&format!("RmsNormAtom k_setup: batch load gamma for all {} ki values", self.k_warp_iters));
+            ptx.comment(&format!(
+                "RmsNormAtom k_setup: batch load gamma for all {} ki values",
+                self.k_warp_iters
+            ));
             // Compute base gamma address: gamma_smem + (k_counter + tg*2) * 2
             ptx.add_s32(s.tmp0, self.k_counter, s.tg2);
-            ptx.shl_b32(s.tmp0, s.tmp0, 1);  // byte offset
-            ptx.add_s32(s.tmp0, self.gamma_smem, s.tmp0);  // smem address
+            ptx.shl_b32(s.tmp0, s.tmp0, 1); // byte offset
+            ptx.add_s32(s.tmp0, self.gamma_smem, s.tmp0); // smem address
             // Load gamma for all ki values using immediate offsets from the base address.
             // Each ki is 16 elements apart = 32 bytes.
             // Within each ki: gamma_packed at +0, gamma_packed2 at +16.
             for k in 0..self.k_warp_iters {
-                let base_off = (k * 16 * 2) as i32;  // ki * 16 elements * 2 bytes
+                let base_off = (k * 16 * 2) as i32; // ki * 16 elements * 2 bytes
                 ptx.ld_shared_b32(s.gamma_all[k as usize][0], s.tmp0, base_off);
                 ptx.ld_shared_b32(s.gamma_all[k as usize][1], s.tmp0, base_off + 8 * 2);
             }

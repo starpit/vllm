@@ -2,19 +2,11 @@
 #[derive(Debug, Clone)]
 pub enum Op {
     /// RMSNorm: `rmsnorm(input, weight)`
-    RmsNorm {
-        input: String,
-        weight: String,
-    },
+    RmsNorm { input: String, weight: String },
     /// Matrix multiply: `gemm(a, b)`
-    Gemm {
-        a: String,
-        b: String,
-    },
+    Gemm { a: String, b: String },
     /// SiLU activation: `silu(x)`
-    Silu {
-        input: String,
-    },
+    Silu { input: String },
 }
 
 impl Op {
@@ -57,8 +49,8 @@ impl OpGraph {
 
     /// Find the node that produces a given variable name.
     pub fn producer_of(&self, name: &str) -> Option<usize> {
-        self.nodes.iter().position(|n| {
-            n.result_name.as_deref() == Some(name)
-        })
+        self.nodes
+            .iter()
+            .position(|n| n.result_name.as_deref() == Some(name))
     }
 }

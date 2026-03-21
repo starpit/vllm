@@ -177,7 +177,7 @@ pub fn evaluate_strategy(graph: &OpGraph) -> FusionPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::{OpNode, OpGraph};
+    use crate::ops::{OpGraph, OpNode};
 
     fn make_graph(nodes: Vec<(Option<&str>, Op)>) -> OpGraph {
         let mut graph = OpGraph::new();
@@ -194,8 +194,20 @@ mod tests {
     #[test]
     fn test_rmsnorm_gemm_silu_fuses_into_one_kernel() {
         let graph = make_graph(vec![
-            (Some("n"), Op::RmsNorm { input: "x".into(), weight: "w".into() }),
-            (Some("g"), Op::Gemm { a: "n".into(), b: "w2".into() }),
+            (
+                Some("n"),
+                Op::RmsNorm {
+                    input: "x".into(),
+                    weight: "w".into(),
+                },
+            ),
+            (
+                Some("g"),
+                Op::Gemm {
+                    a: "n".into(),
+                    b: "w2".into(),
+                },
+            ),
             (None, Op::Silu { input: "g".into() }),
         ]);
 
@@ -203,26 +215,39 @@ mod tests {
 
         assert_eq!(plan.kernels.len(), 1, "Must produce exactly ONE kernel");
         match &plan.kernels[0] {
-            KernelKind::RmsNormGemmSilu { norm_idx, gemm_idx, silu_idx } => {
+            KernelKind::RmsNormGemmSilu {
+                norm_idx,
+                gemm_idx,
+                silu_idx,
+            } => {
                 assert_eq!(*norm_idx, 0);
                 assert_eq!(*gemm_idx, 1);
                 assert_eq!(*silu_idx, 2);
             }
-            other => panic!("Expected RmsNormGemmSilu, got {:?}", match other {
-                KernelKind::RmsNorm { .. } => "RmsNorm",
-                KernelKind::Gemm { .. } => "Gemm",
-                KernelKind::Silu { .. } => "Silu",
-                KernelKind::GemmSilu { .. } => "GemmSilu",
-                KernelKind::RmsNormGemm { .. } => "RmsNormGemm",
-                _ => "Unknown",
-            }),
+            other => panic!(
+                "Expected RmsNormGemmSilu, got {:?}",
+                match other {
+                    KernelKind::RmsNorm { .. } => "RmsNorm",
+                    KernelKind::Gemm { .. } => "Gemm",
+                    KernelKind::Silu { .. } => "Silu",
+                    KernelKind::GemmSilu { .. } => "GemmSilu",
+                    KernelKind::RmsNormGemm { .. } => "RmsNormGemm",
+                    _ => "Unknown",
+                }
+            ),
         }
     }
 
     #[test]
     fn test_gemm_silu_fuses_without_norm() {
         let graph = make_graph(vec![
-            (Some("g"), Op::Gemm { a: "x".into(), b: "w".into() }),
+            (
+                Some("g"),
+                Op::Gemm {
+                    a: "x".into(),
+                    b: "w".into(),
+                },
+            ),
             (None, Op::Silu { input: "g".into() }),
         ]);
 
@@ -235,8 +260,20 @@ mod tests {
     #[test]
     fn test_rmsnorm_gemm_fuses_without_silu() {
         let graph = make_graph(vec![
-            (Some("n"), Op::RmsNorm { input: "x".into(), weight: "w".into() }),
-            (None, Op::Gemm { a: "n".into(), b: "w2".into() }),
+            (
+                Some("n"),
+                Op::RmsNorm {
+                    input: "x".into(),
+                    weight: "w".into(),
+                },
+            ),
+            (
+                None,
+                Op::Gemm {
+                    a: "n".into(),
+                    b: "w2".into(),
+                },
+            ),
         ]);
 
         let plan = evaluate_strategy(&graph);
@@ -247,9 +284,13 @@ mod tests {
 
     #[test]
     fn test_standalone_ops_not_fused() {
-        let graph = make_graph(vec![
-            (None, Op::Gemm { a: "x".into(), b: "w".into() }),
-        ]);
+        let graph = make_graph(vec![(
+            None,
+            Op::Gemm {
+                a: "x".into(),
+                b: "w".into(),
+            },
+        )]);
 
         let plan = evaluate_strategy(&graph);
 

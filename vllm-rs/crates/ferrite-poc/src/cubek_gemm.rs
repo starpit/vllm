@@ -14,33 +14,33 @@ use anyhow::{Context, Result, bail};
 use std::ffi::{CString, c_uint, c_void};
 use std::time::Instant;
 
+use inkwell::builder::Builder;
 use inkwell::context::Context as LlvmContext;
 use inkwell::module::Module;
-use inkwell::builder::Builder;
-use inkwell::targets::{TargetTriple, FileType};
+use inkwell::targets::{FileType, TargetTriple};
 use inkwell::types::AsTypeRef;
-use inkwell::values::{AsValueRef, IntValue, FloatValue};
+use inkwell::values::{AsValueRef, FloatValue, IntValue};
 use inkwell::{AddressSpace, IntPredicate};
 
 use cudarc::driver::result as cuda;
 
-use crate::{create_nvptx_target_machine, add_nvvm_kernel_metadata, call_sreg, call_barrier0};
+use crate::{add_nvvm_kernel_metadata, call_barrier0, call_sreg, create_nvptx_target_machine};
 
 // CubeK config: tile 8×32×16, partition 4×4×2, stage 4×1×1
 const TILE_M: u32 = 8;
 const TILE_N: u32 = 32;
 const TILE_K: u32 = 16;
-const PART_M: u32 = 4;  // tiles per partition along M
-const PART_N: u32 = 4;  // tiles per partition along N
-const PART_K: u32 = 1;  // tiles per partition along K (no K-unroll)
+const PART_M: u32 = 4; // tiles per partition along M
+const PART_N: u32 = 4; // tiles per partition along N
+const PART_K: u32 = 1; // tiles per partition along K (no K-unroll)
 const STAGE_M: u32 = 4; // partitions per stage along M (= num warps)
 
 // Derived
-const STAGE_DIM_M: u32 = STAGE_M * PART_M * TILE_M;  // 4*4*8 = 128
-const STAGE_DIM_N: u32 = 64;                           // Half of CubeK's 128
-const STAGE_DIM_K: u32 = PART_K * TILE_K;              // 2*16 = 32
-const WARPS: u32 = STAGE_M;                            // 4
-const THREADS: u32 = WARPS * 32;                       // 128
+const STAGE_DIM_M: u32 = STAGE_M * PART_M * TILE_M; // 4*4*8 = 128
+const STAGE_DIM_N: u32 = 64; // Half of CubeK's 128
+const STAGE_DIM_K: u32 = PART_K * TILE_K; // 2*16 = 32
+const WARPS: u32 = STAGE_M; // 4
+const THREADS: u32 = WARPS * 32; // 128
 
 // MMA: m16n8k16 (the actual hardware instruction CubeK maps 8×32×16 tiles to)
 const MMA_M: u32 = 16;
@@ -107,10 +107,10 @@ const MMA_K: u32 = 16;
 // and see what happens.
 
 // Warp tile using m16n8k16: each warp does REG_M × REG_N MMAs per K-slice
-const WM: u32 = 32;    // 2 * MMA_M
-const WN: u32 = 64;    // 8 * MMA_N
-const REG_M: u32 = WM / MMA_M;  // 2
-const REG_N: u32 = WN / MMA_N;  // 8
+const WM: u32 = 32; // 2 * MMA_M
+const WN: u32 = 64; // 8 * MMA_N
+const REG_M: u32 = WM / MMA_M; // 2
+const REG_N: u32 = WN / MMA_N; // 8
 // 4 warps along M (4*32=128), 1 along N (64)
 const WARPS_M: u32 = 4;
 const WARPS_N: u32 = 1;
@@ -136,9 +136,7 @@ pub fn step_cubek_gemm(sm: &str) -> Result<()> {
 
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
-    let func = unsafe {
-        cuda::module::get_function(module, CString::new("cubek_gemm").unwrap())?
-    };
+    let func = unsafe { cuda::module::get_function(module, CString::new("cubek_gemm").unwrap())? };
     println!("  [cuda] Module loaded, function resolved");
 
     let size_a = (m * k) as usize;
@@ -163,8 +161,8 @@ pub fn step_cubek_gemm(sm: &str) -> Result<()> {
     }
 
     let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
-    let grid_x: c_uint = n / STAGE_DIM_N;    // 1024/128 = 8
-    let grid_y: c_uint = m / STAGE_DIM_M;    // 1024/128 = 8
+    let grid_x: c_uint = n / STAGE_DIM_N; // 1024/128 = 8
+    let grid_y: c_uint = m / STAGE_DIM_M; // 1024/128 = 8
     // smem: A[128×32 f16] + B[32×128 f16] = 8192 + 8192 = 16384 bytes
     let smem_bytes: c_uint = (STAGE_DIM_M * STAGE_DIM_K + STAGE_DIM_K * STAGE_DIM_N) * 2;
 
@@ -180,37 +178,55 @@ pub fn step_cubek_gemm(sm: &str) -> Result<()> {
     for _ in 0..5 {
         unsafe {
             cuda::launch_kernel(
-                func, (grid_x, grid_y, 1), (THREADS, 1, 1), smem_bytes, stream, params,
+                func,
+                (grid_x, grid_y, 1),
+                (THREADS, 1, 1),
+                smem_bytes,
+                stream,
+                params,
             )?;
         }
     }
-    unsafe { cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::stream::synchronize(stream)?;
+    }
 
     let iters = 100;
     let start = Instant::now();
     for _ in 0..iters {
         unsafe {
             cuda::launch_kernel(
-                func, (grid_x, grid_y, 1), (THREADS, 1, 1), smem_bytes, stream, params,
+                func,
+                (grid_x, grid_y, 1),
+                (THREADS, 1, 1),
+                smem_bytes,
+                stream,
+                params,
             )?;
         }
     }
-    unsafe { cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::stream::synchronize(stream)?;
+    }
     let elapsed = start.elapsed();
     let us_per = elapsed.as_micros() as f64 / iters as f64;
 
-    unsafe { cuda::memcpy_dtoh_sync(&mut h_c, d_c)?; }
+    unsafe {
+        cuda::memcpy_dtoh_sync(&mut h_c, d_c)?;
+    }
 
     let mut max_err: f32 = 0.0;
     for row in 0..m as usize {
         for col in 0..n as usize {
             let mut expected: f32 = 0.0;
             for kk in 0..k as usize {
-                expected += h_a[row * k as usize + kk].to_f32()
-                    * h_b[kk * n as usize + col].to_f32();
+                expected +=
+                    h_a[row * k as usize + kk].to_f32() * h_b[kk * n as usize + col].to_f32();
             }
             let err = (h_c[row * n as usize + col] - expected).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
         }
     }
 
@@ -224,7 +240,10 @@ pub fn step_cubek_gemm(sm: &str) -> Result<()> {
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = flops / (us_per * 1e-6) / 1e12;
     let pct = tflops / 181.0 * 100.0;
-    println!("  {:.1} μs, {:.2} TFLOPS ({:.1}% of L40S peak)", us_per, tflops, pct);
+    println!(
+        "  {:.1} μs, {:.2} TFLOPS ({:.1}% of L40S peak)",
+        us_per, tflops, pct
+    );
 
     unsafe {
         cuda::stream::destroy(stream)?;
@@ -250,7 +269,9 @@ fn build_swizzle<'ctx>(
     let ci = |v: u64| i32_ty.const_int(v, false);
     let byte_off = b.build_int_mul(elem_idx, ci(2), "").unwrap();
     let masked = b.build_and(byte_off, ci(SWIZZLE_MASK as u64), "").unwrap();
-    let shifted = b.build_right_shift(masked, ci(SWIZZLE_SHIFT as u64), false, "").unwrap();
+    let shifted = b
+        .build_right_shift(masked, ci(SWIZZLE_SHIFT as u64), false, "")
+        .unwrap();
     let swizzled = b.build_xor(byte_off, shifted, "").unwrap();
     b.build_int_unsigned_div(swizzled, ci(2), "sw").unwrap()
 }
@@ -285,8 +306,14 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
     smem_g.set_externally_initialized(true);
 
     let fn_type = void_ty.fn_type(
-        &[ptr_g.into(), ptr_g.into(), ptr_g.into(),
-          i32_ty.into(), i32_ty.into(), i32_ty.into()],
+        &[
+            ptr_g.into(),
+            ptr_g.into(),
+            ptr_g.into(),
+            i32_ty.into(),
+            i32_ty.into(),
+            i32_ty.into(),
+        ],
         false,
     );
     let function = module.add_function("cubek_gemm", fn_type, None);
@@ -313,8 +340,12 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
     let bid_x = call_sreg(&ctx, &module, &b, "llvm.nvvm.read.ptx.sreg.ctaid.x", "bx");
     let bid_y = call_sreg(&ctx, &module, &b, "llvm.nvvm.read.ptx.sreg.ctaid.y", "by");
 
-    let block_row = b.build_int_mul(bid_y, ci(STAGE_DIM_M as u64), "br").unwrap();
-    let block_col = b.build_int_mul(bid_x, ci(STAGE_DIM_N as u64), "bc").unwrap();
+    let block_row = b
+        .build_int_mul(bid_y, ci(STAGE_DIM_M as u64), "br")
+        .unwrap();
+    let block_col = b
+        .build_int_mul(bid_x, ci(STAGE_DIM_N as u64), "bc")
+        .unwrap();
 
     let warp_id = b.build_int_unsigned_div(tid, ci(32), "wid").unwrap();
     let lane = b.build_int_unsigned_rem(tid, ci(32), "lane").unwrap();
@@ -330,10 +361,21 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
     // Shared memory: smem_a[128×32 f16] + smem_b[32×128 f16]
     let smem_base = smem_g.as_pointer_value();
     let smem_a = b.build_pointer_cast(smem_base, ptr_s, "sa").unwrap();
-    let smem_b = b.build_pointer_cast(unsafe {
-        b.build_gep(ctx.i8_type(), smem_base,
-            &[ci((STAGE_DIM_M * STAGE_DIM_K * 2) as u64)], "").unwrap()
-    }, ptr_s, "sb").unwrap();
+    let smem_b = b
+        .build_pointer_cast(
+            unsafe {
+                b.build_gep(
+                    ctx.i8_type(),
+                    smem_base,
+                    &[ci((STAGE_DIM_M * STAGE_DIM_K * 2) as u64)],
+                    "",
+                )
+                .unwrap()
+            },
+            ptr_s,
+            "sb",
+        )
+        .unwrap();
 
     let f0 = f32_ty.const_float(0.0);
 
@@ -348,8 +390,11 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
         acc_phis.push(b.build_phi(f32_ty, &format!("acc{i}")).unwrap());
     }
     let t = t_phi.as_basic_value().into_int_value();
-    let kcmp = b.build_int_compare(IntPredicate::ULT, t, k_p, "kcmp").unwrap();
-    b.build_conditional_branch(kcmp, kloop_body, kloop_exit).unwrap();
+    let kcmp = b
+        .build_int_compare(IntPredicate::ULT, t, k_p, "kcmp")
+        .unwrap();
+    b.build_conditional_branch(kcmp, kloop_body, kloop_exit)
+        .unwrap();
 
     // ── K-loop body ──
     b.position_at_end(kloop_body);
@@ -357,17 +402,20 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
     // ── Load A[128×16] and B[16×64] into shared memory ──
     // A: 2048 f16, 128 threads → 16/thread → 2 cp.async(8)
     for chunk in 0..2u64 {
-        let base = b.build_int_add(
-            b.build_int_mul(tid, ci(16), "").unwrap(),
-            ci(chunk * 8), "",
-        ).unwrap();
-        let a_row = b.build_int_unsigned_div(base, ci(STAGE_DIM_K as u64), "").unwrap();
-        let a_col = b.build_int_unsigned_rem(base, ci(STAGE_DIM_K as u64), "").unwrap();
+        let base = b
+            .build_int_add(b.build_int_mul(tid, ci(16), "").unwrap(), ci(chunk * 8), "")
+            .unwrap();
+        let a_row = b
+            .build_int_unsigned_div(base, ci(STAGE_DIM_K as u64), "")
+            .unwrap();
+        let a_col = b
+            .build_int_unsigned_rem(base, ci(STAGE_DIM_K as u64), "")
+            .unwrap();
         let a_grow = b.build_int_add(block_row, a_row, "").unwrap();
         let a_gcol = b.build_int_add(t, a_col, "").unwrap();
-        let a_idx = b.build_int_add(
-            b.build_int_mul(a_grow, k_p, "").unwrap(), a_gcol, "",
-        ).unwrap();
+        let a_idx = b
+            .build_int_add(b.build_int_mul(a_grow, k_p, "").unwrap(), a_gcol, "")
+            .unwrap();
         let a_gep = unsafe { b.build_gep(f16_ty, a_ptr, &[a_idx], "").unwrap() };
         let a_sw = build_swizzle(&b, &ctx, base);
         let sa_gep = unsafe { b.build_gep(f16_ty, smem_a, &[a_sw], "").unwrap() };
@@ -376,13 +424,17 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
     // B: 1024 f16, 128 threads → 8/thread → 1 cp.async(8)
     {
         let base = b.build_int_mul(tid, ci(8), "").unwrap();
-        let b_row = b.build_int_unsigned_div(base, ci(STAGE_DIM_N as u64), "").unwrap();
-        let b_col = b.build_int_unsigned_rem(base, ci(STAGE_DIM_N as u64), "").unwrap();
+        let b_row = b
+            .build_int_unsigned_div(base, ci(STAGE_DIM_N as u64), "")
+            .unwrap();
+        let b_col = b
+            .build_int_unsigned_rem(base, ci(STAGE_DIM_N as u64), "")
+            .unwrap();
         let b_grow = b.build_int_add(t, b_row, "").unwrap();
         let b_gcol = b.build_int_add(block_col, b_col, "").unwrap();
-        let b_idx = b.build_int_add(
-            b.build_int_mul(b_grow, n_p, "").unwrap(), b_gcol, "",
-        ).unwrap();
+        let b_idx = b
+            .build_int_add(b.build_int_mul(b_grow, n_p, "").unwrap(), b_gcol, "")
+            .unwrap();
         let b_gep = unsafe { b.build_gep(f16_ty, b_ptr, &[b_idx], "").unwrap() };
         let b_sw = build_swizzle(&b, &ctx, base);
         let sb_gep = unsafe { b.build_gep(f16_ty, smem_b, &[b_sw], "").unwrap() };
@@ -412,15 +464,19 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
         for rm in 0..REG_M as u64 {
             let rm_off = b.build_int_add(wy_off, ci(rm * MMA_M as u64), "").unwrap();
             for (row_add, col_add) in [(0u64, 0u64), (8, 0), (0, 8), (8, 8)] {
-                let frow = b.build_int_add(
-                    b.build_int_add(rm_off, group, "").unwrap(), ci(row_add), "",
-                ).unwrap();
-                let fcol = b.build_int_add(
-                    b.build_int_add(tg2, ci(col_add), "").unwrap(), k_off, "",
-                ).unwrap();
-                let lin = b.build_int_add(
-                    b.build_int_mul(frow, ci(STAGE_DIM_K as u64), "").unwrap(), fcol, "",
-                ).unwrap();
+                let frow = b
+                    .build_int_add(b.build_int_add(rm_off, group, "").unwrap(), ci(row_add), "")
+                    .unwrap();
+                let fcol = b
+                    .build_int_add(b.build_int_add(tg2, ci(col_add), "").unwrap(), k_off, "")
+                    .unwrap();
+                let lin = b
+                    .build_int_add(
+                        b.build_int_mul(frow, ci(STAGE_DIM_K as u64), "").unwrap(),
+                        fcol,
+                        "",
+                    )
+                    .unwrap();
                 let sw = build_swizzle(&b, &ctx, lin);
                 let gep = unsafe { b.build_gep(f16_ty, smem_a, &[sw], "").unwrap() };
                 a_frags.push(b.build_load(i32_ty, gep, "").unwrap().into_int_value());
@@ -433,23 +489,33 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
 
             let mut b_frag = Vec::new();
             for fk_add in [0u64, 8] {
-                let k0 = b.build_int_add(
-                    b.build_int_add(tg2, ci(fk_add), "").unwrap(), k_off, "",
-                ).unwrap();
+                let k0 = b
+                    .build_int_add(b.build_int_add(tg2, ci(fk_add), "").unwrap(), k_off, "")
+                    .unwrap();
                 let k1 = b.build_int_add(k0, ci(1), "").unwrap();
-                let lin0 = b.build_int_add(
-                    b.build_int_mul(k0, ci(STAGE_DIM_N as u64), "").unwrap(), b_col, "",
-                ).unwrap();
-                let lin1 = b.build_int_add(
-                    b.build_int_mul(k1, ci(STAGE_DIM_N as u64), "").unwrap(), b_col, "",
-                ).unwrap();
+                let lin0 = b
+                    .build_int_add(
+                        b.build_int_mul(k0, ci(STAGE_DIM_N as u64), "").unwrap(),
+                        b_col,
+                        "",
+                    )
+                    .unwrap();
+                let lin1 = b
+                    .build_int_add(
+                        b.build_int_mul(k1, ci(STAGE_DIM_N as u64), "").unwrap(),
+                        b_col,
+                        "",
+                    )
+                    .unwrap();
                 let sw0 = build_swizzle(&b, &ctx, lin0);
                 let sw1 = build_swizzle(&b, &ctx, lin1);
                 let gep0 = unsafe { b.build_gep(f16_ty, smem_b, &[sw0], "").unwrap() };
                 let gep1 = unsafe { b.build_gep(f16_ty, smem_b, &[sw1], "").unwrap() };
                 let v0 = b.build_load(f16_ty, gep0, "").unwrap();
                 let v1 = b.build_load(f16_ty, gep1, "").unwrap();
-                let vec = b.build_insert_element(v2f16_ty.get_undef(), v0, ci(0), "").unwrap();
+                let vec = b
+                    .build_insert_element(v2f16_ty.get_undef(), v0, ci(0), "")
+                    .unwrap();
                 let vec = b.build_insert_element(vec, v1, ci(1), "").unwrap();
                 b_frag.push(b.build_bit_cast(vec, i32_ty, "").unwrap().into_int_value());
             }
@@ -458,16 +524,27 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
                 let acc_idx = (rm as u32 * REG_N * 4 + rn as u32 * 4) as usize;
                 let a_base = (rm * 4) as usize;
                 let [d0, d1, d2, d3] = build_mma_asm(
-                    &b, &ctx, &module,
-                    &[a_frags[a_base], a_frags[a_base+1], a_frags[a_base+2], a_frags[a_base+3]],
+                    &b,
+                    &ctx,
+                    &module,
+                    &[
+                        a_frags[a_base],
+                        a_frags[a_base + 1],
+                        a_frags[a_base + 2],
+                        a_frags[a_base + 3],
+                    ],
                     &[b_frag[0], b_frag[1]],
-                    &[cur_accs[acc_idx], cur_accs[acc_idx+1],
-                      cur_accs[acc_idx+2], cur_accs[acc_idx+3]],
+                    &[
+                        cur_accs[acc_idx],
+                        cur_accs[acc_idx + 1],
+                        cur_accs[acc_idx + 2],
+                        cur_accs[acc_idx + 3],
+                    ],
                 );
                 cur_accs[acc_idx] = d0;
-                cur_accs[acc_idx+1] = d1;
-                cur_accs[acc_idx+2] = d2;
-                cur_accs[acc_idx+3] = d3;
+                cur_accs[acc_idx + 1] = d1;
+                cur_accs[acc_idx + 2] = d2;
+                cur_accs[acc_idx + 3] = d3;
             }
         }
     }
@@ -492,27 +569,40 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
         for rn in 0..REG_N {
             let acc_base = (rm * REG_N * 4 + rn * 4) as usize;
             for d in 0..4u32 {
-                let mma_row_off = if d < 2 { group } else {
+                let mma_row_off = if d < 2 {
+                    group
+                } else {
                     b.build_int_add(group, ci(8), "").unwrap()
                 };
-                let mma_col_off = if d % 2 == 0 { tg2 } else {
+                let mma_col_off = if d % 2 == 0 {
+                    tg2
+                } else {
                     b.build_int_add(tg2, ci(1), "").unwrap()
                 };
 
-                let c_row = b.build_int_add(
-                    b.build_int_add(block_row, wy_off, "").unwrap(),
-                    b.build_int_add(ci(rm as u64 * MMA_M as u64), mma_row_off, "").unwrap(),
-                    "",
-                ).unwrap();
-                let c_col = b.build_int_add(
-                    b.build_int_add(block_col, ci(rn as u64 * MMA_N as u64), "").unwrap(),
-                    mma_col_off, "",
-                ).unwrap();
-                let c_idx = b.build_int_add(
-                    b.build_int_mul(c_row, n_p, "").unwrap(), c_col, "",
-                ).unwrap();
+                let c_row = b
+                    .build_int_add(
+                        b.build_int_add(block_row, wy_off, "").unwrap(),
+                        b.build_int_add(ci(rm as u64 * MMA_M as u64), mma_row_off, "")
+                            .unwrap(),
+                        "",
+                    )
+                    .unwrap();
+                let c_col = b
+                    .build_int_add(
+                        b.build_int_add(block_col, ci(rn as u64 * MMA_N as u64), "")
+                            .unwrap(),
+                        mma_col_off,
+                        "",
+                    )
+                    .unwrap();
+                let c_idx = b
+                    .build_int_add(b.build_int_mul(c_row, n_p, "").unwrap(), c_col, "")
+                    .unwrap();
                 let gep = unsafe { b.build_gep(f32_ty, c_ptr, &[c_idx], "").unwrap() };
-                let val = acc_phis[acc_base + d as usize].as_basic_value().into_float_value();
+                let val = acc_phis[acc_base + d as usize]
+                    .as_basic_value()
+                    .into_float_value();
                 b.build_store(gep, val).unwrap();
             }
         }
@@ -523,7 +613,9 @@ fn emit_cubek_gemm_ptx(sm: &str) -> Result<String> {
     let buf = machine
         .write_to_memory_buffer(&module, FileType::Assembly)
         .map_err(|e| anyhow::anyhow!("PTX emission: {}", e))?;
-    let ptx = std::str::from_utf8(buf.as_slice()).context("PTX not UTF-8")?.to_string();
+    let ptx = std::str::from_utf8(buf.as_slice())
+        .context("PTX not UTF-8")?
+        .to_string();
     Ok(ptx)
 }
 
@@ -549,26 +641,38 @@ fn build_ld_shared_u32<'ctx>(
 
         // Compute 32-bit byte address: ptrtoint(base) + elem_off * 2
         let base_i32 = builder.build_ptr_to_int(smem_base, i32_ty, "").unwrap();
-        let byte_off = builder.build_int_mul(elem_off, i32_ty.const_int(2, false), "").unwrap();
+        let byte_off = builder
+            .build_int_mul(elem_off, i32_ty.const_int(2, false), "")
+            .unwrap();
         let addr = builder.build_int_add(base_i32, byte_off, "").unwrap();
 
         let mut param_types = [i32_ty.as_type_ref()];
-        let fn_type = llvm_sys::core::LLVMFunctionType(
-            i32_ty.as_type_ref(), param_types.as_mut_ptr(), 1, 0,
-        );
+        let fn_type =
+            llvm_sys::core::LLVMFunctionType(i32_ty.as_type_ref(), param_types.as_mut_ptr(), 1, 0);
 
         let asm_str = b"ld.shared.u32 $0, [$1];\0";
         let constraints = b"=r,r\0";
 
         let asm_val = llvm_sys::core::LLVMGetInlineAsm(
-            fn_type, asm_str.as_ptr() as *const _, asm_str.len() - 1,
-            constraints.as_ptr() as *const _, constraints.len() - 1,
-            0, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0,
+            fn_type,
+            asm_str.as_ptr() as *const _,
+            asm_str.len() - 1,
+            constraints.as_ptr() as *const _,
+            constraints.len() - 1,
+            0,
+            0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
         );
 
         let mut args = [addr.as_value_ref()];
         let call = llvm_sys::core::LLVMBuildCall2(
-            builder_ref, fn_type, asm_val, args.as_mut_ptr(), 1, b"\0".as_ptr() as *const _,
+            builder_ref,
+            fn_type,
+            asm_val,
+            args.as_mut_ptr(),
+            1,
+            b"\0".as_ptr() as *const _,
         );
 
         IntValue::new(call)
@@ -591,26 +695,38 @@ fn build_ld_shared_f16<'ctx>(
         let builder_ref = builder.as_mut_ptr();
 
         let base_i32 = builder.build_ptr_to_int(smem_base, i32_ty, "").unwrap();
-        let byte_off = builder.build_int_mul(elem_off, i32_ty.const_int(2, false), "").unwrap();
+        let byte_off = builder
+            .build_int_mul(elem_off, i32_ty.const_int(2, false), "")
+            .unwrap();
         let addr = builder.build_int_add(base_i32, byte_off, "").unwrap();
 
         let mut param_types = [i32_ty.as_type_ref()];
-        let fn_type = llvm_sys::core::LLVMFunctionType(
-            f16_ty.as_type_ref(), param_types.as_mut_ptr(), 1, 0,
-        );
+        let fn_type =
+            llvm_sys::core::LLVMFunctionType(f16_ty.as_type_ref(), param_types.as_mut_ptr(), 1, 0);
 
         let asm_str = b"ld.shared.b16 $0, [$1];\0";
         let constraints = b"=h,r\0"; // h = 16-bit register
 
         let asm_val = llvm_sys::core::LLVMGetInlineAsm(
-            fn_type, asm_str.as_ptr() as *const _, asm_str.len() - 1,
-            constraints.as_ptr() as *const _, constraints.len() - 1,
-            0, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0,
+            fn_type,
+            asm_str.as_ptr() as *const _,
+            asm_str.len() - 1,
+            constraints.as_ptr() as *const _,
+            constraints.len() - 1,
+            0,
+            0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
         );
 
         let mut args = [addr.as_value_ref()];
         let call = llvm_sys::core::LLVMBuildCall2(
-            builder_ref, fn_type, asm_val, args.as_mut_ptr(), 1, b"\0".as_ptr() as *const _,
+            builder_ref,
+            fn_type,
+            asm_val,
+            args.as_mut_ptr(),
+            1,
+            b"\0".as_ptr() as *const _,
         );
 
         // Wrap raw LLVMValueRef as BasicValueEnum
@@ -639,13 +755,24 @@ fn build_cp_async_16<'ctx>(
         let asm_str = b"cp.async.cg.shared.global [$0], [$1], 16;\0";
         let constraints = b"r,l\0";
         let asm_val = llvm_sys::core::LLVMGetInlineAsm(
-            fn_type, asm_str.as_ptr() as *const _, asm_str.len() - 1,
-            constraints.as_ptr() as *const _, constraints.len() - 1,
-            1, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0,
+            fn_type,
+            asm_str.as_ptr() as *const _,
+            asm_str.len() - 1,
+            constraints.as_ptr() as *const _,
+            constraints.len() - 1,
+            1,
+            0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
         );
         let mut args = [dst_i32.as_value_ref(), src_i64.as_value_ref()];
         llvm_sys::core::LLVMBuildCall2(
-            builder_ref, fn_type, asm_val, args.as_mut_ptr(), 2, b"\0".as_ptr() as *const _,
+            builder_ref,
+            fn_type,
+            asm_val,
+            args.as_mut_ptr(),
+            2,
+            b"\0".as_ptr() as *const _,
         );
     }
 }
@@ -662,14 +789,28 @@ fn build_cp_async_commit_and_wait<'ctx>(
         let void_ty = llvm_sys::core::LLVMVoidTypeInContext(ctx_ref);
         let fn_type = llvm_sys::core::LLVMFunctionType(void_ty, std::ptr::null_mut(), 0, 0);
         let empty = b"\0";
-        for asm_str in [b"cp.async.commit_group;\0" as &[u8], b"cp.async.wait_group 0;\0"] {
+        for asm_str in [
+            b"cp.async.commit_group;\0" as &[u8],
+            b"cp.async.wait_group 0;\0",
+        ] {
             let asm_val = llvm_sys::core::LLVMGetInlineAsm(
-                fn_type, asm_str.as_ptr() as *const _, asm_str.len() - 1,
-                empty.as_ptr() as *const _, empty.len() - 1,
-                1, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0,
+                fn_type,
+                asm_str.as_ptr() as *const _,
+                asm_str.len() - 1,
+                empty.as_ptr() as *const _,
+                empty.len() - 1,
+                1,
+                0,
+                llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+                0,
             );
             llvm_sys::core::LLVMBuildCall2(
-                builder_ref, fn_type, asm_val, std::ptr::null_mut(), 0, b"\0".as_ptr() as *const _,
+                builder_ref,
+                fn_type,
+                asm_val,
+                std::ptr::null_mut(),
+                0,
+                b"\0".as_ptr() as *const _,
             );
         }
     }
@@ -690,39 +831,85 @@ fn build_mma_asm<'ctx>(
         let ctx_ref = llvm_sys::core::LLVMGetModuleContext(mod_ref);
         let builder_ref = builder.as_mut_ptr();
         let mut ret_members = [
-            f32_ty.as_type_ref(), f32_ty.as_type_ref(),
-            f32_ty.as_type_ref(), f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
         ];
-        let ret_struct = llvm_sys::core::LLVMStructTypeInContext(ctx_ref, ret_members.as_mut_ptr(), 4, 0);
+        let ret_struct =
+            llvm_sys::core::LLVMStructTypeInContext(ctx_ref, ret_members.as_mut_ptr(), 4, 0);
         let mut param_types = [
-            i32_ty.as_type_ref(), i32_ty.as_type_ref(), i32_ty.as_type_ref(), i32_ty.as_type_ref(),
-            i32_ty.as_type_ref(), i32_ty.as_type_ref(),
-            f32_ty.as_type_ref(), f32_ty.as_type_ref(), f32_ty.as_type_ref(), f32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
         ];
         let fn_type = llvm_sys::core::LLVMFunctionType(ret_struct, param_types.as_mut_ptr(), 10, 0);
         let asm_str = b"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13};\0";
         let constraints = b"=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f\0";
         let asm_val = llvm_sys::core::LLVMGetInlineAsm(
-            fn_type, asm_str.as_ptr() as *const _, asm_str.len() - 1,
-            constraints.as_ptr() as *const _, constraints.len() - 1,
-            1, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0,
+            fn_type,
+            asm_str.as_ptr() as *const _,
+            asm_str.len() - 1,
+            constraints.as_ptr() as *const _,
+            constraints.len() - 1,
+            1,
+            0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
         );
         let mut args = [
-            a_regs[0].as_value_ref(), a_regs[1].as_value_ref(),
-            a_regs[2].as_value_ref(), a_regs[3].as_value_ref(),
-            b_regs[0].as_value_ref(), b_regs[1].as_value_ref(),
-            c_regs[0].as_value_ref(), c_regs[1].as_value_ref(),
-            c_regs[2].as_value_ref(), c_regs[3].as_value_ref(),
+            a_regs[0].as_value_ref(),
+            a_regs[1].as_value_ref(),
+            a_regs[2].as_value_ref(),
+            a_regs[3].as_value_ref(),
+            b_regs[0].as_value_ref(),
+            b_regs[1].as_value_ref(),
+            c_regs[0].as_value_ref(),
+            c_regs[1].as_value_ref(),
+            c_regs[2].as_value_ref(),
+            c_regs[3].as_value_ref(),
         ];
         let call = llvm_sys::core::LLVMBuildCall2(
-            builder_ref, fn_type, asm_val, args.as_mut_ptr(), 10, b"\0".as_ptr() as *const _,
+            builder_ref,
+            fn_type,
+            asm_val,
+            args.as_mut_ptr(),
+            10,
+            b"\0".as_ptr() as *const _,
         );
         let n = |s: &[u8]| s.as_ptr() as *const _;
         [
-            FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 0, n(b"\0"))),
-            FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 1, n(b"\0"))),
-            FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 2, n(b"\0"))),
-            FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 3, n(b"\0"))),
+            FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                builder_ref,
+                call,
+                0,
+                n(b"\0"),
+            )),
+            FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                builder_ref,
+                call,
+                1,
+                n(b"\0"),
+            )),
+            FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                builder_ref,
+                call,
+                2,
+                n(b"\0"),
+            )),
+            FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                builder_ref,
+                call,
+                3,
+                n(b"\0"),
+            )),
         ]
     }
 }

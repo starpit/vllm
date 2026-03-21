@@ -1,5 +1,5 @@
+use crate::ops::{Op, OpGraph, OpNode};
 use syn::{self, Expr, ItemFn, Stmt, spanned::Spanned};
-use crate::ops::{Op, OpNode, OpGraph};
 
 /// Parsed `#[fuse(arch = "sm_89")]` attribute.
 #[derive(Debug)]
@@ -50,8 +50,9 @@ pub fn parse_fn_body(func: &ItemFn) -> syn::Result<OpGraph> {
             Stmt::Local(local) => {
                 // `let x = op(args...);`
                 let result_name = pat_to_string(&local.pat)?;
-                let init = local.init.as_ref()
-                    .ok_or_else(|| syn::Error::new(local.span(), "let binding must have initializer"))?;
+                let init = local.init.as_ref().ok_or_else(|| {
+                    syn::Error::new(local.span(), "let binding must have initializer")
+                })?;
                 let op = parse_call_expr(&init.expr)?;
                 let index = graph.nodes.len();
                 graph.nodes.push(OpNode {
@@ -71,7 +72,10 @@ pub fn parse_fn_body(func: &ItemFn) -> syn::Result<OpGraph> {
                 });
             }
             _ => {
-                return Err(syn::Error::new(stmt.span(), "unsupported statement in fuse function"));
+                return Err(syn::Error::new(
+                    stmt.span(),
+                    "unsupported statement in fuse function",
+                ));
             }
         }
     }
@@ -84,7 +88,9 @@ fn parse_call_expr(expr: &Expr) -> syn::Result<Op> {
     match expr {
         Expr::Call(call) => {
             let func_name = expr_to_ident(&call.func)?;
-            let args: Vec<String> = call.args.iter()
+            let args: Vec<String> = call
+                .args
+                .iter()
                 .map(|a| expr_to_string(a))
                 .collect::<syn::Result<_>>()?;
 
@@ -115,35 +121,38 @@ fn parse_call_expr(expr: &Expr) -> syn::Result<Op> {
                         input: args[0].clone(),
                     })
                 }
-                other => {
-                    Err(syn::Error::new(call.span(), format!("unknown op: {other}")))
-                }
+                other => Err(syn::Error::new(call.span(), format!("unknown op: {other}"))),
             }
         }
-        _ => {
-            Err(syn::Error::new(expr.span(), "expected a function call expression"))
-        }
+        _ => Err(syn::Error::new(
+            expr.span(),
+            "expected a function call expression",
+        )),
     }
 }
 
 fn expr_to_ident(expr: &Expr) -> syn::Result<String> {
     match expr {
-        Expr::Path(p) => {
-            Ok(p.path.segments.last()
-                .ok_or_else(|| syn::Error::new(p.span(), "empty path"))?
-                .ident.to_string())
-        }
+        Expr::Path(p) => Ok(p
+            .path
+            .segments
+            .last()
+            .ok_or_else(|| syn::Error::new(p.span(), "empty path"))?
+            .ident
+            .to_string()),
         _ => Err(syn::Error::new(expr.span(), "expected identifier")),
     }
 }
 
 fn expr_to_string(expr: &Expr) -> syn::Result<String> {
     match expr {
-        Expr::Path(p) => {
-            Ok(p.path.segments.last()
-                .ok_or_else(|| syn::Error::new(p.span(), "empty path"))?
-                .ident.to_string())
-        }
+        Expr::Path(p) => Ok(p
+            .path
+            .segments
+            .last()
+            .ok_or_else(|| syn::Error::new(p.span(), "empty path"))?
+            .ident
+            .to_string()),
         _ => Err(syn::Error::new(expr.span(), "expected identifier")),
     }
 }

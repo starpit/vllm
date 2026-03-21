@@ -15,7 +15,8 @@ pub fn emit_ptx_128x128() -> String {
 
 fn emit_kernel(s: &mut String) {
     // ─── Header ───
-    s.push_str(r#".version 8.7
+    s.push_str(
+        r#".version 8.7
 .target sm_89
 .address_size 64
 
@@ -35,15 +36,16 @@ fn emit_kernel(s: &mut String) {
 	.reg .b32 	%r<500>;
 	.reg .b64 	%rd<120>;
 
-"#);
+"#,
+    );
 
     // ─── Parameter loads ───
     w(s, "ld.param.b64 \t%rd1, [param_A];");
     w(s, "ld.param.b64 \t%rd2, [param_B];");
     w(s, "ld.param.b64 \t%rd3, [param_C];");
     w(s, "ld.param.b32 \t%r1, [param_M];");
-    w(s, "ld.param.b32 \t%r2, [param_N];");   // N = C stride, B col stride
-    w(s, "ld.param.b32 \t%r3, [param_K];");   // K = A col stride
+    w(s, "ld.param.b32 \t%r2, [param_N];"); // N = C stride, B col stride
+    w(s, "ld.param.b32 \t%r3, [param_K];"); // K = A col stride
     blank(s);
 
     // ─── Thread/block indexing ───
@@ -58,23 +60,23 @@ fn emit_kernel(s: &mut String) {
 
     // ─── cp.async thread mapping ───
     // A: row=bfe(tid,2,5), col=(tid&3)*8
-    w(s, "bfe.u32 \t%r9, %r6, 2, 5;");       // A_row within chunk
+    w(s, "bfe.u32 \t%r9, %r6, 2, 5;"); // A_row within chunk
     w(s, "and.b32 \t%r18, %r6, 3;");
-    w(s, "shl.b32 \t%r19, %r18, 3;");         // A_col = (tid&3)*8
+    w(s, "shl.b32 \t%r19, %r18, 3;"); // A_col = (tid&3)*8
     // B: row=bfe(tid,4,3), col=(tid&15)*8
-    w(s, "bfe.u32 \t%r11, %r6, 4, 3;");       // B_row within chunk
-    w(s, "or.b32 \t%r12, %r11, 8;");           // B_row+8
-    w(s, "or.b32 \t%r13, %r11, 16;");          // B_row+16
-    w(s, "or.b32 \t%r14, %r11, 24;");          // B_row+24
+    w(s, "bfe.u32 \t%r11, %r6, 4, 3;"); // B_row within chunk
+    w(s, "or.b32 \t%r12, %r11, 8;"); // B_row+8
+    w(s, "or.b32 \t%r13, %r11, 16;"); // B_row+16
+    w(s, "or.b32 \t%r14, %r11, 24;"); // B_row+24
     w(s, "and.b32 \t%r15, %r6, 15;");
-    w(s, "shl.b32 \t%r16, %r15, 3;");          // B_col = (tid&15)*8
+    w(s, "shl.b32 \t%r16, %r15, 3;"); // B_col = (tid&15)*8
     blank(s);
 
     // ─── A global pointers (4 chunks × 32 rows) ───
     // A[row][col] @ A + (row*K + col)*2
-    w(s, "or.b32 \t%r17, %r9, %r8;");          // row0 = block_row | A_row
-    w(s, "mul.lo.s32 \t%r20, %r3, %r17;");     // row0 * K
-    w(s, "shl.b32 \t%r21, %r3, 5;");            // K * 32
+    w(s, "or.b32 \t%r17, %r9, %r8;"); // row0 = block_row | A_row
+    w(s, "mul.lo.s32 \t%r20, %r3, %r17;"); // row0 * K
+    w(s, "shl.b32 \t%r21, %r3, 5;"); // K * 32
     w(s, "add.s32 \t%r22, %r20, %r21;");
     w(s, "add.s32 \t%r23, %r22, %r21;");
     w(s, "add.s32 \t%r24, %r23, %r21;");
@@ -91,9 +93,9 @@ fn emit_kernel(s: &mut String) {
 
     // ─── B global pointers (4 chunks × 8 rows) ───
     // B[row][col] @ B + (row*N + col)*2
-    w(s, "or.b32 \t%r25, %r16, %r7;");         // B_col = block_col | tid_col
-    w(s, "mul.lo.s32 \t%r26, %r2, %r11;");     // brow0 * N
-    w(s, "shl.b32 \t%r27, %r2, 3;");            // N * 8
+    w(s, "or.b32 \t%r25, %r16, %r7;"); // B_col = block_col | tid_col
+    w(s, "mul.lo.s32 \t%r26, %r2, %r11;"); // brow0 * N
+    w(s, "shl.b32 \t%r27, %r2, 3;"); // N * 8
     w(s, "add.s32 \t%r28, %r26, %r27;");
     w(s, "add.s32 \t%r29, %r28, %r27;");
     w(s, "add.s32 \t%r30, %r29, %r27;");
@@ -106,20 +108,20 @@ fn emit_kernel(s: &mut String) {
     w(s, "add.s64 \t%rd25, %rd21, %rd19;");
     w(s, "add.s64 \t%rd26, %rd22, %rd19;");
     w(s, "add.s64 \t%rd27, %rd23, %rd19;");
-    w(s, "shl.b32 \t%r31, %r2, 5;");            // N*32 (B K-stride)
+    w(s, "shl.b32 \t%r31, %r2, 5;"); // N*32 (B K-stride)
     blank(s);
 
     // ─── Smem swizzle for cp.async (matching Triton) ───
-    w(s, "shl.b32 \t%r32, %r6, 4;");            // tid*16
+    w(s, "shl.b32 \t%r32, %r6, 4;"); // tid*16
     w(s, "and.b32 \t%r33, %r32, 2032;");
     w(s, "and.b32 \t%r34, %r6, 24;");
     w(s, "shl.b32 \t%r35, %r34, 1;");
-    w(s, "xor.b32 \t%r36, %r33, %r35;");        // A cp swizzle
+    w(s, "xor.b32 \t%r36, %r33, %r35;"); // A cp swizzle
     w(s, "mov.b32 \t%r37, global_smem;");
-    w(s, "add.s32 \t%r38, %r37, %r36;");        // A smem base
-    w(s, "and.b32 \t%r10, %r6, 112;");           // tid & 0x70
-    w(s, "xor.b32 \t%r39, %r33, %r10;");        // B cp swizzle
-    w(s, "add.s32 \t%r40, %r37, %r39;");         // B smem base
+    w(s, "add.s32 \t%r38, %r37, %r36;"); // A smem base
+    w(s, "and.b32 \t%r10, %r6, 112;"); // tid & 0x70
+    w(s, "xor.b32 \t%r39, %r33, %r10;"); // B cp swizzle
+    w(s, "add.s32 \t%r40, %r37, %r39;"); // B smem base
     blank(s);
 
     // ─── Prologue: load tile 0 ───
@@ -129,27 +131,37 @@ fn emit_kernel(s: &mut String) {
     for (i, off) in [0i32, 2048, 4096, 6144].iter().enumerate() {
         if *off > 0 {
             s.push_str(&format!("\tadd.s32 \t%r{}, %r38, {off};\n", 42 + i - 1));
-            s.push_str(&format!("\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r41;\n", 42 + i - 1, 15 + i));
+            s.push_str(&format!(
+                "\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r41;\n",
+                42 + i - 1,
+                15 + i
+            ));
         } else {
-            s.push_str(&format!("\tcp.async.cg.shared.global [ %r38 + 0 ], [ %rd15 + 0 ], 0x10, %r41;\n"));
+            s.push_str(&format!(
+                "\tcp.async.cg.shared.global [ %r38 + 0 ], [ %rd15 + 0 ], 0x10, %r41;\n"
+            ));
         }
     }
     w(s, "cp.async.commit_group;");
     // B tile 0 (4 cp.async, B region starts at 16384)
     for (i, off) in [16384i32, 18432, 20480, 22528].iter().enumerate() {
         s.push_str(&format!("\tadd.s32 \t%r{}, %r40, {off};\n", 45 + i));
-        s.push_str(&format!("\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r41;\n", 45 + i, 24 + i));
+        s.push_str(&format!(
+            "\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r41;\n",
+            45 + i,
+            24 + i
+        ));
     }
     w(s, "cp.async.commit_group;");
     blank(s);
 
     // ─── Advance for tile 1 ───
     w(s, "setp.gt.s32 \t%p2, %r3, 32;");
-    w(s, "add.s64 \t%rd28, %rd15, 64;");        // A + BK*2
+    w(s, "add.s64 \t%rd28, %rd15, 64;"); // A + BK*2
     w(s, "add.s64 \t%rd29, %rd16, 64;");
     w(s, "add.s64 \t%rd30, %rd17, 64;");
     w(s, "add.s64 \t%rd31, %rd18, 64;");
-    w(s, "mul.wide.s32 \t%rd32, %r31, 2;");     // N*32*2 bytes
+    w(s, "mul.wide.s32 \t%rd32, %r31, 2;"); // N*32*2 bytes
     w(s, "add.s64 \t%rd33, %rd24, %rd32;");
     w(s, "add.s64 \t%rd34, %rd25, %rd32;");
     w(s, "add.s64 \t%rd35, %rd26, %rd32;");
@@ -162,13 +174,21 @@ fn emit_kernel(s: &mut String) {
     // A tile 1 (buffer 1 = +8192)
     for (i, off) in [8192i32, 10240, 12288, 14336].iter().enumerate() {
         s.push_str(&format!("\tadd.s32 \t%r{}, %r38, {off};\n", 50 + i));
-        s.push_str(&format!("\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r49;\n", 50 + i, 28 + i));
+        s.push_str(&format!(
+            "\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r49;\n",
+            50 + i,
+            28 + i
+        ));
     }
     w(s, "cp.async.commit_group;");
     // B tile 1 (buffer 1 = +8192 from B base)
     for (i, off) in [24576i32, 26624, 28672, 30720].iter().enumerate() {
         s.push_str(&format!("\tadd.s32 \t%r{}, %r40, {off};\n", 54 + i));
-        s.push_str(&format!("\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r49;\n", 54 + i, 33 + i));
+        s.push_str(&format!(
+            "\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r49;\n",
+            54 + i,
+            33 + i
+        ));
     }
     w(s, "cp.async.commit_group;");
     blank(s);
@@ -179,40 +199,40 @@ fn emit_kernel(s: &mut String) {
     blank(s);
 
     s.push_str("$L_LOOP_SETUP:\n");
-    w(s, "add.s32 \t%r60, %r3, -64;");          // K - 2*BK
+    w(s, "add.s32 \t%r60, %r3, -64;"); // K - 2*BK
 
     // A ldmatrix offsets (matching Triton lines 216-232)
-    w(s, "shl.b32 \t%r58, %r6, 3;");            // tid*8
-    w(s, "and.b32 \t%r59, %r6, 16;");           // tid & 16
-    w(s, "shl.b32 \t%r62, %r15, 6;");           // (tid&15)<<6
-    w(s, "and.b32 \t%r63, %r58, 48;");           // (tid*8)&48
-    w(s, "and.b32 \t%r64, %r32, 1024;");         // (tid*16)&1024
+    w(s, "shl.b32 \t%r58, %r6, 3;"); // tid*8
+    w(s, "and.b32 \t%r59, %r6, 16;"); // tid & 16
+    w(s, "shl.b32 \t%r62, %r15, 6;"); // (tid&15)<<6
+    w(s, "and.b32 \t%r63, %r58, 48;"); // (tid*8)&48
+    w(s, "and.b32 \t%r64, %r32, 1024;"); // (tid*16)&1024
     w(s, "or.b32 \t%r65, %r62, %r63;");
     w(s, "xor.b32 \t%r66, %r65, %r59;");
-    w(s, "or.b32 \t%r67, %r66, %r64;");          // a_off_ki0
-    w(s, "xor.b32 \t%r68, %r67, 32;");           // a_off_ki1
+    w(s, "or.b32 \t%r67, %r66, %r64;"); // a_off_ki0
+    w(s, "xor.b32 \t%r68, %r67, 32;"); // a_off_ki1
     blank(s);
 
     // B ldmatrix offsets (matching Triton lines 223-232)
-    w(s, "shl.b32 \t%r69, %r6, 8;");             // tid<<8
+    w(s, "shl.b32 \t%r69, %r6, 8;"); // tid<<8
     w(s, "and.b32 \t%r70, %r69, 7936;");
-    w(s, "and.b32 \t%r71, %r32, 112;");          // (tid*16)&112
+    w(s, "and.b32 \t%r71, %r32, 112;"); // (tid*16)&112
     w(s, "shr.u32 \t%r72, %r6, 1;");
     w(s, "and.b32 \t%r73, %r72, 16;");
     w(s, "xor.b32 \t%r74, %r71, %r73;");
-    w(s, "or.b32 \t%r75, %r74, %r70;");          // b_off_rn0
+    w(s, "or.b32 \t%r75, %r74, %r70;"); // b_off_rn0
     w(s, "xor.b32 \t%r76, %r75, 32;");
     w(s, "xor.b32 \t%r77, %r75, 64;");
     w(s, "xor.b32 \t%r78, %r75, 96;");
     blank(s);
 
     // Loop pointers: start at tile 2 (after 2 prologue loads)
-    w(s, "add.s64 \t%rd50, %rd15, 128;");        // A tile2
+    w(s, "add.s64 \t%rd50, %rd15, 128;"); // A tile2
     w(s, "add.s64 \t%rd51, %rd16, 128;");
     w(s, "add.s64 \t%rd52, %rd17, 128;");
     w(s, "add.s64 \t%rd53, %rd18, 128;");
-    w(s, "shl.b64 \t%rd45, %rd32, 1;");          // 2 × N*32*2
-    w(s, "add.s64 \t%rd54, %rd24, %rd45;");       // B tile2
+    w(s, "shl.b64 \t%rd45, %rd32, 1;"); // 2 × N*32*2
+    w(s, "add.s64 \t%rd54, %rd24, %rd45;"); // B tile2
     w(s, "add.s64 \t%rd55, %rd25, %rd45;");
     w(s, "add.s64 \t%rd56, %rd26, %rd45;");
     w(s, "add.s64 \t%rd57, %rd27, %rd45;");
@@ -226,16 +246,16 @@ fn emit_kernel(s: &mut String) {
     blank(s);
 
     // Buffer toggle
-    w(s, "mov.b32 \t%r101, 1;");                 // read_ctr
-    w(s, "mov.b32 \t%r102, -1;");                // write_ctr
-    w(s, "mov.b32 \t%r103, 0;");                 // k_counter
+    w(s, "mov.b32 \t%r101, 1;"); // read_ctr
+    w(s, "mov.b32 \t%r102, -1;"); // write_ctr
+    w(s, "mov.b32 \t%r103, 0;"); // k_counter
     blank(s);
 
     // ═══════════════════════════════════════════════════════════════
     // K-LOOP
     // ═══════════════════════════════════════════════════════════════
     s.push_str("$L_KLOOP:\n");
-    w(s, "setp.lt.s32 \t%p3, %r103, %r60;");    // k_counter < K-64
+    w(s, "setp.lt.s32 \t%p3, %r103, %r60;"); // k_counter < K-64
 
     // Toggle read buffer
     w(s, "add.s32 \t%r104, %r101, 1;");
@@ -251,40 +271,116 @@ fn emit_kernel(s: &mut String) {
     blank(s);
 
     // ─── ldmatrix A (8 loads) ───
-    w(s, "add.s32 \t%r107, %r106, %r67;");       // A ki0 addr
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r108, %r109, %r110, %r111}, [%r107];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r112, %r113, %r114, %r115}, [%r107+2048];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r116, %r117, %r118, %r119}, [%r107+4096];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r120, %r121, %r122, %r123}, [%r107+6144];");
-    w(s, "add.s32 \t%r124, %r106, %r68;");       // A ki1 addr
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r125, %r126, %r127, %r128}, [%r124];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r129, %r130, %r131, %r132}, [%r124+2048];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r133, %r134, %r135, %r136}, [%r124+4096];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r137, %r138, %r139, %r140}, [%r124+6144];");
+    w(s, "add.s32 \t%r107, %r106, %r67;"); // A ki0 addr
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r108, %r109, %r110, %r111}, [%r107];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r112, %r113, %r114, %r115}, [%r107+2048];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r116, %r117, %r118, %r119}, [%r107+4096];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r120, %r121, %r122, %r123}, [%r107+6144];",
+    );
+    w(s, "add.s32 \t%r124, %r106, %r68;"); // A ki1 addr
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r125, %r126, %r127, %r128}, [%r124];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r129, %r130, %r131, %r132}, [%r124+2048];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r133, %r134, %r135, %r136}, [%r124+4096];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r137, %r138, %r139, %r140}, [%r124+6144];",
+    );
     blank(s);
 
     // ─── ldmatrix B transposed (8 loads) ───
-    w(s, "add.s32 \t%r141, %r106, %r75;");       // B rn0
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r142, %r143, %r144, %r145}, [%r141+16384];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r146, %r147, %r148, %r149}, [%r141+16512];");
-    w(s, "add.s32 \t%r150, %r106, %r76;");       // B rn1
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r151, %r152, %r153, %r154}, [%r150+16384];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r155, %r156, %r157, %r158}, [%r150+16512];");
-    w(s, "add.s32 \t%r159, %r106, %r77;");       // B rn2
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r160, %r161, %r162, %r163}, [%r159+16384];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r164, %r165, %r166, %r167}, [%r159+16512];");
-    w(s, "add.s32 \t%r168, %r106, %r78;");       // B rn3
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r169, %r170, %r171, %r172}, [%r168+16384];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r173, %r174, %r175, %r176}, [%r168+16512];");
+    w(s, "add.s32 \t%r141, %r106, %r75;"); // B rn0
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r142, %r143, %r144, %r145}, [%r141+16384];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r146, %r147, %r148, %r149}, [%r141+16512];",
+    );
+    w(s, "add.s32 \t%r150, %r106, %r76;"); // B rn1
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r151, %r152, %r153, %r154}, [%r150+16384];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r155, %r156, %r157, %r158}, [%r150+16512];",
+    );
+    w(s, "add.s32 \t%r159, %r106, %r77;"); // B rn2
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r160, %r161, %r162, %r163}, [%r159+16384];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r164, %r165, %r166, %r167}, [%r159+16512];",
+    );
+    w(s, "add.s32 \t%r168, %r106, %r78;"); // B rn3
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r169, %r170, %r171, %r172}, [%r168+16384];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r173, %r174, %r175, %r176}, [%r168+16512];",
+    );
     blank(s);
 
     // ─── MMA (64 total) ───
     // ki0: A{0..3} × B_ki0{0..7}
-    let a_ki0 = [[108,109,110,111],[112,113,114,115],[116,117,118,119],[120,121,122,123]];
+    let a_ki0 = [
+        [108, 109, 110, 111],
+        [112, 113, 114, 115],
+        [116, 117, 118, 119],
+        [120, 121, 122, 123],
+    ];
     // B ki0: from ldmatrix.trans first 2 regs of each
-    let b_ki0 = [[142,143],[151,152],[160,161],[169,170],[146,147],[155,156],[164,165],[173,174]];
-    let a_ki1 = [[125,126,127,128],[129,130,131,132],[133,134,135,136],[137,138,139,140]];
-    let b_ki1 = [[144,145],[153,154],[162,163],[171,172],[148,149],[157,158],[166,167],[175,176]];
+    let b_ki0 = [
+        [142, 143],
+        [151, 152],
+        [160, 161],
+        [169, 170],
+        [146, 147],
+        [155, 156],
+        [164, 165],
+        [173, 174],
+    ];
+    let a_ki1 = [
+        [125, 126, 127, 128],
+        [129, 130, 131, 132],
+        [133, 134, 135, 136],
+        [137, 138, 139, 140],
+    ];
+    let b_ki1 = [
+        [144, 145],
+        [153, 154],
+        [162, 163],
+        [171, 172],
+        [148, 149],
+        [157, 158],
+        [166, 167],
+        [175, 176],
+    ];
 
     let mut acc = 200u32;
     for am in 0..4 {
@@ -319,29 +415,53 @@ fn emit_kernel(s: &mut String) {
     w(s, "shl.b32 \t%r178, %r102, 13;");
     w(s, "add.s32 \t%r179, %r37, %r178;");
     w(s, "bar.sync \t0;");
-    w(s, "add.s32 \t%r180, %r179, %r36;");       // write A base
+    w(s, "add.s32 \t%r180, %r179, %r36;"); // write A base
     w(s, "selp.b32 \t%r181, 16, 0, %p3;");
 
     // A next-tile (4 cp.async)
-    w(s, "cp.async.cg.shared.global [ %r180 + 0 ], [ %rd50 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r180 + 0 ], [ %rd50 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r182, %r180, 2048;");
-    w(s, "cp.async.cg.shared.global [ %r182 + 0 ], [ %rd51 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r182 + 0 ], [ %rd51 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r183, %r180, 4096;");
-    w(s, "cp.async.cg.shared.global [ %r183 + 0 ], [ %rd52 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r183 + 0 ], [ %rd52 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r184, %r180, 6144;");
-    w(s, "cp.async.cg.shared.global [ %r184 + 0 ], [ %rd53 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r184 + 0 ], [ %rd53 + 0 ], 0x10, %r181;",
+    );
     w(s, "cp.async.commit_group;");
 
     // B next-tile (4 cp.async)
     w(s, "add.s32 \t%r185, %r179, %r39;");
     w(s, "add.s32 \t%r186, %r185, 16384;");
-    w(s, "cp.async.cg.shared.global [ %r186 + 0 ], [ %rd54 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r186 + 0 ], [ %rd54 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r187, %r185, 18432;");
-    w(s, "cp.async.cg.shared.global [ %r187 + 0 ], [ %rd55 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r187 + 0 ], [ %rd55 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r188, %r185, 20480;");
-    w(s, "cp.async.cg.shared.global [ %r188 + 0 ], [ %rd56 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r188 + 0 ], [ %rd56 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r189, %r185, 22528;");
-    w(s, "cp.async.cg.shared.global [ %r189 + 0 ], [ %rd57 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r189 + 0 ], [ %rd57 + 0 ], 0x10, %r181;",
+    );
     w(s, "cp.async.commit_group;");
     blank(s);
 
@@ -395,25 +515,25 @@ fn emit_kernel(s: &mut String) {
     //   global_col_d0 = block_col + warp_n*64 + bn*8 + mma_col
     //   global_col_d1 = global_col_d0 + 1
 
-    w(s, "and.b32 \t%r328, %r6, 31;");           // lane
-    w(s, "shr.u32 \t%r329, %r6, 5;");            // warp_id
-    w(s, "shr.u32 \t%r330, %r329, 1;");           // warp_m (0 or 1)
-    w(s, "and.b32 \t%r331, %r329, 1;");           // warp_n (0 or 1)
-    w(s, "shr.u32 \t%r332, %r328, 2;");           // mma_row (0..7)
-    w(s, "and.b32 \t%r333, %r328, 3;");           // lane & 3
-    w(s, "shl.b32 \t%r334, %r333, 1;");           // mma_col (0,2,4,6)
+    w(s, "and.b32 \t%r328, %r6, 31;"); // lane
+    w(s, "shr.u32 \t%r329, %r6, 5;"); // warp_id
+    w(s, "shr.u32 \t%r330, %r329, 1;"); // warp_m (0 or 1)
+    w(s, "and.b32 \t%r331, %r329, 1;"); // warp_n (0 or 1)
+    w(s, "shr.u32 \t%r332, %r328, 2;"); // mma_row (0..7)
+    w(s, "and.b32 \t%r333, %r328, 3;"); // lane & 3
+    w(s, "shl.b32 \t%r334, %r333, 1;"); // mma_col (0,2,4,6)
     blank(s);
 
     // base_row = block_row + warp_m*16 + mma_row
-    w(s, "shl.b32 \t%r335, %r330, 4;");           // warp_m * 16
-    w(s, "add.s32 \t%r336, %r8, %r335;");         // block_row + warp_m*16
-    w(s, "add.s32 \t%r337, %r336, %r332;");       // + mma_row = base_row
+    w(s, "shl.b32 \t%r335, %r330, 4;"); // warp_m * 16
+    w(s, "add.s32 \t%r336, %r8, %r335;"); // block_row + warp_m*16
+    w(s, "add.s32 \t%r337, %r336, %r332;"); // + mma_row = base_row
     blank(s);
 
     // base_col = block_col + warp_n*64 + mma_col
-    w(s, "shl.b32 \t%r338, %r331, 6;");           // warp_n * 64
-    w(s, "add.s32 \t%r339, %r7, %r338;");         // block_col + warp_n*64
-    w(s, "add.s32 \t%r340, %r339, %r334;");       // + mma_col = base_col
+    w(s, "shl.b32 \t%r338, %r331, 6;"); // warp_n * 64
+    w(s, "add.s32 \t%r339, %r7, %r338;"); // block_col + warp_n*64
+    w(s, "add.s32 \t%r340, %r339, %r334;"); // + mma_col = base_col
     blank(s);
 
     // For each tile (am=0..3, bn=0..7):
@@ -457,8 +577,12 @@ fn emit_kernel(s: &mut String) {
             s.push_str("\tadd.s64 \t%rd74, %rd71, %rd72;\n");
 
             // st.global.v2.b32 for (d0, d1) and (d2, d3)
-            s.push_str(&format!("\tst.global.v2.b32 [ %rd73 + 0 ], {{ %r{d0}, %r{d1} }};\n"));
-            s.push_str(&format!("\tst.global.v2.b32 [ %rd74 + 0 ], {{ %r{d2}, %r{d3} }};\n"));
+            s.push_str(&format!(
+                "\tst.global.v2.b32 [ %rd73 + 0 ], {{ %r{d0}, %r{d1} }};\n"
+            ));
+            s.push_str(&format!(
+                "\tst.global.v2.b32 [ %rd74 + 0 ], {{ %r{d2}, %r{d3} }};\n"
+            ));
 
             acc += 4;
         }
@@ -485,7 +609,8 @@ pub fn emit_fused_128x128() -> String {
 
 fn emit_fused_kernel(s: &mut String) {
     // ─── Header ───
-    s.push_str(r#".version 8.7
+    s.push_str(
+        r#".version 8.7
 .target sm_89
 .address_size 64
 
@@ -507,29 +632,30 @@ fn emit_fused_kernel(s: &mut String) {
 	.reg .b32 	%r<520>;
 	.reg .b64 	%rd<130>;
 
-"#);
+"#,
+    );
 
     // ─── Parameter loads ───
     // param_input  = A matrix [M, K] f16  (to be RmsNorm'd)
     // param_wnorm  = gamma [K] f16
     // param_wgemm  = B matrix [K, N] f16
     // param_output = C matrix [M, N] f32
-    w(s, "ld.param.b64 \t%rd1, [param_input];");     // A (input)
-    w(s, "ld.param.b64 \t%rd2, [param_wgemm];");     // B (gemm weight)
-    w(s, "ld.param.b64 \t%rd3, [param_output];");    // C (output)
-    w(s, "ld.param.b64 \t%rd4, [param_wnorm];");     // gamma (rmsnorm weight)
-    w(s, "ld.param.b32 \t%r2, [param_N];");           // N
-    w(s, "ld.param.b32 \t%r3, [param_K];");           // K
+    w(s, "ld.param.b64 \t%rd1, [param_input];"); // A (input)
+    w(s, "ld.param.b64 \t%rd2, [param_wgemm];"); // B (gemm weight)
+    w(s, "ld.param.b64 \t%rd3, [param_output];"); // C (output)
+    w(s, "ld.param.b64 \t%rd4, [param_wnorm];"); // gamma (rmsnorm weight)
+    w(s, "ld.param.b32 \t%r2, [param_N];"); // N
+    w(s, "ld.param.b32 \t%r3, [param_K];"); // K
     blank(s);
 
     // ─── Thread/block indexing ───
     // For the fused kernel, block_y selects rows (batch dimension)
     // block_x selects output columns
-    w(s, "mov.u32 \t%r4, %ctaid.x;");    // block_n
-    w(s, "mov.u32 \t%r5, %ctaid.y;");    // block_m
-    w(s, "shl.b32 \t%r7, %r4, 7;");      // block_col = block_n * 128
-    w(s, "shl.b32 \t%r8, %r5, 7;");      // block_row = block_m * 128
-    w(s, "mov.u32 \t%r6, %tid.x;");      // tid
+    w(s, "mov.u32 \t%r4, %ctaid.x;"); // block_n
+    w(s, "mov.u32 \t%r5, %ctaid.y;"); // block_m
+    w(s, "shl.b32 \t%r7, %r4, 7;"); // block_col = block_n * 128
+    w(s, "shl.b32 \t%r8, %r5, 7;"); // block_row = block_m * 128
+    w(s, "mov.u32 \t%r6, %tid.x;"); // tid
     blank(s);
 
     // ═══════════════════════════════════════════════════════════════
@@ -542,17 +668,17 @@ fn emit_fused_kernel(s: &mut String) {
     // Then preload gamma[0..K-1] f16 at smem[33280..33280+2*K-1].
 
     // Row index for this thread's norm computation
-    w(s, "add.s32 \t%r400, %r8, %r6;");   // global_row = block_row + tid
+    w(s, "add.s32 \t%r400, %r8, %r6;"); // global_row = block_row + tid
 
     // Pointer to this row in input: input + global_row * K * 2
-    w(s, "mul.lo.s32 \t%r401, %r400, %r3;");  // global_row * K
-    w(s, "mad.wide.s32 \t%rd80, %r401, 2, %rd1;");  // &input[global_row][0]
+    w(s, "mul.lo.s32 \t%r401, %r400, %r3;"); // global_row * K
+    w(s, "mad.wide.s32 \t%rd80, %r401, 2, %rd1;"); // &input[global_row][0]
     blank(s);
 
     // Sum of squares over K elements (loop with f32 accumulation)
     // Process 8 f16 elements per iteration (= 16 bytes = ld.global.v4.b32)
-    w(s, "mov.f32 \t%f0, 0f00000000;");   // sum_sq = 0.0
-    w(s, "mov.s32 \t%r402, 0;");           // k_idx = 0 (in elements)
+    w(s, "mov.f32 \t%f0, 0f00000000;"); // sum_sq = 0.0
+    w(s, "mov.s32 \t%r402, 0;"); // k_idx = 0 (in elements)
     w(s, "setp.gt.s32 \t%p10, %r3, 0;");
     w(s, "@!%p10 bra \t$L_NORM_DONE;");
     blank(s);
@@ -561,7 +687,10 @@ fn emit_fused_kernel(s: &mut String) {
     // Load 8 f16 elements (4 × b32) per iteration via v4.b32
     w(s, "mul.wide.s32 \t%rd81, %r402, 2;");
     w(s, "add.s64 \t%rd82, %rd80, %rd81;");
-    w(s, "ld.global.v4.b32 \t{%r500, %r501, %r502, %r503}, [%rd82];");
+    w(
+        s,
+        "ld.global.v4.b32 \t{%r500, %r501, %r502, %r503}, [%rd82];",
+    );
     // Unpack all 8 f16 to f32 and accumulate
     w(s, "mov.b32 \t{%h0, %h1}, %r500;");
     w(s, "cvt.f32.f16 \t%f1, %h0;");
@@ -590,18 +719,18 @@ fn emit_fused_kernel(s: &mut String) {
 
     s.push_str("$L_NORM_DONE:\n");
     // norm_factor = rsqrt(sum_sq / K + eps)
-    w(s, "cvt.rn.f32.s32 \t%f3, %r3;");           // K as float
-    w(s, "div.rn.f32 \t%f4, %f0, %f3;");           // mean_sq = sum_sq / K
-    w(s, "add.f32 \t%f4, %f4, 0f358637BD;");       // + eps (1e-6)
-    w(s, "rsqrt.approx.f32 \t%f5, %f4;");          // rsqrt(mean_sq + eps)
+    w(s, "cvt.rn.f32.s32 \t%f3, %r3;"); // K as float
+    w(s, "div.rn.f32 \t%f4, %f0, %f3;"); // mean_sq = sum_sq / K
+    w(s, "add.f32 \t%f4, %f4, 0f358637BD;"); // + eps (1e-6)
+    w(s, "rsqrt.approx.f32 \t%f5, %f4;"); // rsqrt(mean_sq + eps)
     blank(s);
 
     // Store norm factor to smem[32768 + tid * 4]
     // %r404 = global_smem base (reused throughout)
     w(s, "mov.b32 \t%r404, global_smem;");
-    w(s, "shl.b32 \t%r405, %r6, 2;");              // tid * 4
-    w(s, "add.s32 \t%r419, %r404, 32768;");         // norm_smem_base = smem + 32768
-    w(s, "add.s32 \t%r406, %r419, %r405;");         // norm_smem_base + tid*4
+    w(s, "shl.b32 \t%r405, %r6, 2;"); // tid * 4
+    w(s, "add.s32 \t%r419, %r404, 32768;"); // norm_smem_base = smem + 32768
+    w(s, "add.s32 \t%r406, %r419, %r405;"); // norm_smem_base + tid*4
     w(s, "st.shared.f32 \t[%r406], %f5;");
     blank(s);
 
@@ -610,24 +739,30 @@ fn emit_fused_kernel(s: &mut String) {
     // For K=4096, each thread loads 32 elements = 4 iterations of 8.
     // gamma smem base = smem + 33280
     w(s, "bar.sync \t0;");
-    w(s, "add.s32 \t%r420, %r404, 33280;");         // gamma_smem_base
-    w(s, "shr.u32 \t%r407, %r3, 7;");              // K / 128 (elems per thread)
-    w(s, "mul.lo.s32 \t%r408, %r6, %r407;");       // tid * (K/128) = start elem
-    w(s, "add.s32 \t%r409, %r408, %r407;");         // end elem
-    w(s, "mov.s32 \t%r410, %r408;");                // loop var (element index)
+    w(s, "add.s32 \t%r420, %r404, 33280;"); // gamma_smem_base
+    w(s, "shr.u32 \t%r407, %r3, 7;"); // K / 128 (elems per thread)
+    w(s, "mul.lo.s32 \t%r408, %r6, %r407;"); // tid * (K/128) = start elem
+    w(s, "add.s32 \t%r409, %r408, %r407;"); // end elem
+    w(s, "mov.s32 \t%r410, %r408;"); // loop var (element index)
     blank(s);
 
     s.push_str("$L_GAMMA_LOAD:\n");
     w(s, "setp.lt.s32 \t%p12, %r410, %r409;");
     w(s, "@!%p12 bra \t$L_GAMMA_DONE;");
     // Load 8 f16 elements (v4.b32 = 16 bytes) from global
-    w(s, "mul.wide.s32 \t%rd83, %r410, 2;");       // byte offset
+    w(s, "mul.wide.s32 \t%rd83, %r410, 2;"); // byte offset
     w(s, "add.s64 \t%rd84, %rd4, %rd83;");
-    w(s, "ld.global.v4.b32 \t{%r500, %r501, %r502, %r503}, [%rd84];");
+    w(
+        s,
+        "ld.global.v4.b32 \t{%r500, %r501, %r502, %r503}, [%rd84];",
+    );
     // Store 16 bytes to smem as v4.b32
-    w(s, "shl.b32 \t%r412, %r410, 1;");             // element * 2 = byte offset
+    w(s, "shl.b32 \t%r412, %r410, 1;"); // element * 2 = byte offset
     w(s, "add.s32 \t%r413, %r420, %r412;");
-    w(s, "st.shared.v4.b32 \t[%r413], {%r500, %r501, %r502, %r503};");
+    w(
+        s,
+        "st.shared.v4.b32 \t[%r413], {%r500, %r501, %r502, %r503};",
+    );
     w(s, "add.s32 \t%r410, %r410, 8;");
     w(s, "bra.uni \t$L_GAMMA_LOAD;");
     blank(s);
@@ -652,11 +787,11 @@ fn emit_fused_kernel(s: &mut String) {
     // We need norm factors for these 8 rows (4 rm × 2 halves).
     // Load them from smem and pack as f16x2 (same value in both halves).
 
-    w(s, "shr.u32 \t%r329, %r6, 5;");              // warp_id
-    w(s, "shr.u32 \t%r330, %r329, 1;");             // warp_m
-    w(s, "and.b32 \t%r331, %r329, 1;");             // warp_n
-    w(s, "and.b32 \t%r328, %r6, 31;");              // lane
-    w(s, "shr.u32 \t%r415, %r328, 2;");             // group_id = lane / 4
+    w(s, "shr.u32 \t%r329, %r6, 5;"); // warp_id
+    w(s, "shr.u32 \t%r330, %r329, 1;"); // warp_m
+    w(s, "and.b32 \t%r331, %r329, 1;"); // warp_n
+    w(s, "and.b32 \t%r328, %r6, 31;"); // lane
+    w(s, "shr.u32 \t%r415, %r328, 2;"); // group_id = lane / 4
     blank(s);
 
     // warp_m_offset = warp_m * 64
@@ -693,15 +828,15 @@ fn emit_fused_kernel(s: &mut String) {
     // ═══════════════════════════════════════════════════════════════
 
     // ─── cp.async thread mapping ───
-    w(s, "bfe.u32 \t%r9, %r6, 2, 5;");       // A_row within chunk
+    w(s, "bfe.u32 \t%r9, %r6, 2, 5;"); // A_row within chunk
     w(s, "and.b32 \t%r18, %r6, 3;");
-    w(s, "shl.b32 \t%r19, %r18, 3;");         // A_col = (tid&3)*8
-    w(s, "bfe.u32 \t%r11, %r6, 4, 3;");       // B_row within chunk
+    w(s, "shl.b32 \t%r19, %r18, 3;"); // A_col = (tid&3)*8
+    w(s, "bfe.u32 \t%r11, %r6, 4, 3;"); // B_row within chunk
     w(s, "or.b32 \t%r12, %r11, 8;");
     w(s, "or.b32 \t%r13, %r11, 16;");
     w(s, "or.b32 \t%r14, %r11, 24;");
     w(s, "and.b32 \t%r15, %r6, 15;");
-    w(s, "shl.b32 \t%r16, %r15, 3;");          // B_col = (tid&15)*8
+    w(s, "shl.b32 \t%r16, %r15, 3;"); // B_col = (tid&15)*8
     blank(s);
 
     // ─── A global pointers (4 chunks × 32 rows) ───
@@ -760,7 +895,11 @@ fn emit_fused_kernel(s: &mut String) {
     for (i, off) in [0i32, 2048, 4096, 6144].iter().enumerate() {
         if *off > 0 {
             s.push_str(&format!("\tadd.s32 \t%r{}, %r38, {off};\n", 42 + i - 1));
-            s.push_str(&format!("\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r41;\n", 42 + i - 1, 15 + i));
+            s.push_str(&format!(
+                "\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r41;\n",
+                42 + i - 1,
+                15 + i
+            ));
         } else {
             s.push_str("\tcp.async.cg.shared.global [ %r38 + 0 ], [ %rd15 + 0 ], 0x10, %r41;\n");
         }
@@ -768,7 +907,11 @@ fn emit_fused_kernel(s: &mut String) {
     w(s, "cp.async.commit_group;");
     for (i, off) in [16384i32, 18432, 20480, 22528].iter().enumerate() {
         s.push_str(&format!("\tadd.s32 \t%r{}, %r40, {off};\n", 45 + i));
-        s.push_str(&format!("\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r41;\n", 45 + i, 24 + i));
+        s.push_str(&format!(
+            "\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r41;\n",
+            45 + i,
+            24 + i
+        ));
     }
     w(s, "cp.async.commit_group;");
     blank(s);
@@ -791,12 +934,20 @@ fn emit_fused_kernel(s: &mut String) {
     w(s, "selp.b32 \t%r49, 16, 0, %p2;");
     for (i, off) in [8192i32, 10240, 12288, 14336].iter().enumerate() {
         s.push_str(&format!("\tadd.s32 \t%r{}, %r38, {off};\n", 50 + i));
-        s.push_str(&format!("\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r49;\n", 50 + i, 28 + i));
+        s.push_str(&format!(
+            "\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r49;\n",
+            50 + i,
+            28 + i
+        ));
     }
     w(s, "cp.async.commit_group;");
     for (i, off) in [24576i32, 26624, 28672, 30720].iter().enumerate() {
         s.push_str(&format!("\tadd.s32 \t%r{}, %r40, {off};\n", 54 + i));
-        s.push_str(&format!("\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r49;\n", 54 + i, 33 + i));
+        s.push_str(&format!(
+            "\tcp.async.cg.shared.global [ %r{} + 0 ], [ %rd{} + 0 ], 0x10, %r49;\n",
+            54 + i,
+            33 + i
+        ));
     }
     w(s, "cp.async.commit_group;");
     blank(s);
@@ -892,31 +1043,55 @@ fn emit_fused_kernel(s: &mut String) {
     //   gamma_ki1_lo: gamma[k_counter + 16 + tg*2]  (for reg0, reg1 of ki1)
     //   gamma_ki1_hi: gamma[k_counter + 24 + tg*2]  (for reg2, reg3 of ki1)
 
-    w(s, "and.b32 \t%r480, %r6, 3;");              // tg = tid & 3
-    w(s, "shl.b32 \t%r481, %r480, 1;");             // tg * 2
-    w(s, "add.s32 \t%r482, %r103, %r481;");         // k_counter + tg*2
+    w(s, "and.b32 \t%r480, %r6, 3;"); // tg = tid & 3
+    w(s, "shl.b32 \t%r481, %r480, 1;"); // tg * 2
+    w(s, "add.s32 \t%r482, %r103, %r481;"); // k_counter + tg*2
 
     // gamma smem base in %r420 (already computed: smem + 33280)
     // gamma smem byte addr = gamma_smem_base + element_index * 2
-    w(s, "shl.b32 \t%r484, %r482, 1;");             // (k_counter + tg*2) * 2
-    w(s, "add.s32 \t%r486, %r420, %r484;");          // &gamma[k_counter + tg*2]
-    w(s, "ld.shared.b32 \t%r487, [%r486];");         // gamma_ki0_lo
-    w(s, "ld.shared.b32 \t%r491, [%r486 + 16];");   // gamma_ki0_hi (+8 elems * 2 bytes)
-    w(s, "ld.shared.b32 \t%r490, [%r486 + 32];");   // gamma_ki1_lo (+16 elems * 2 bytes)
-    w(s, "ld.shared.b32 \t%r492, [%r486 + 48];");   // gamma_ki1_hi (+24 elems * 2 bytes)
+    w(s, "shl.b32 \t%r484, %r482, 1;"); // (k_counter + tg*2) * 2
+    w(s, "add.s32 \t%r486, %r420, %r484;"); // &gamma[k_counter + tg*2]
+    w(s, "ld.shared.b32 \t%r487, [%r486];"); // gamma_ki0_lo
+    w(s, "ld.shared.b32 \t%r491, [%r486 + 16];"); // gamma_ki0_hi (+8 elems * 2 bytes)
+    w(s, "ld.shared.b32 \t%r490, [%r486 + 32];"); // gamma_ki1_lo (+16 elems * 2 bytes)
+    w(s, "ld.shared.b32 \t%r492, [%r486 + 48];"); // gamma_ki1_hi (+24 elems * 2 bytes)
     blank(s);
 
     // ─── ldmatrix A (8 loads) + in-place RmsNorm transform ───
     w(s, "add.s32 \t%r107, %r106, %r67;");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r108, %r109, %r110, %r111}, [%r107];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r112, %r113, %r114, %r115}, [%r107+2048];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r116, %r117, %r118, %r119}, [%r107+4096];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r120, %r121, %r122, %r123}, [%r107+6144];");
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r108, %r109, %r110, %r111}, [%r107];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r112, %r113, %r114, %r115}, [%r107+2048];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r116, %r117, %r118, %r119}, [%r107+4096];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r120, %r121, %r122, %r123}, [%r107+6144];",
+    );
     w(s, "add.s32 \t%r124, %r106, %r68;");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r125, %r126, %r127, %r128}, [%r124];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r129, %r130, %r131, %r132}, [%r124+2048];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r133, %r134, %r135, %r136}, [%r124+4096];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r137, %r138, %r139, %r140}, [%r124+6144];");
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r125, %r126, %r127, %r128}, [%r124];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r129, %r130, %r131, %r132}, [%r124+2048];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r133, %r134, %r135, %r136}, [%r124+4096];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r137, %r138, %r139, %r140}, [%r124+6144];",
+    );
     blank(s);
 
     // ─── In-place RmsNorm transform on A fragments ───
@@ -950,10 +1125,16 @@ fn emit_fused_kernel(s: &mut String) {
     // ki0 fragments: regs 108-123 (4 groups of 4)
     // rm=0: 108,109,110,111  rm=1: 112,113,114,115  rm=2: 116,117,118,119  rm=3: 120,121,122,123
     let a_ki0_regs = [
-        [108,109,110,111], [112,113,114,115], [116,117,118,119], [120,121,122,123]
+        [108, 109, 110, 111],
+        [112, 113, 114, 115],
+        [116, 117, 118, 119],
+        [120, 121, 122, 123],
     ];
     let a_ki1_regs = [
-        [125,126,127,128], [129,130,131,132], [133,134,135,136], [137,138,139,140]
+        [125, 126, 127, 128],
+        [129, 130, 131, 132],
+        [133, 134, 135, 136],
+        [137, 138, 139, 140],
     ];
 
     // Apply norm + gamma to ki0 fragments
@@ -964,17 +1145,45 @@ fn emit_fused_kernel(s: &mut String) {
         let norm_hi = 471 + rm * 2; // norm for row = group_id+8 (regs 1,3)
         let regs = &a_ki0_regs[rm as usize];
         // reg0 (row_lo, k_lo): norm_lo * gamma_ki0_lo
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[0], n=norm_lo));
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r487;\n", r=regs[0]));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+            r = regs[0],
+            n = norm_lo
+        ));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r487;\n",
+            r = regs[0]
+        ));
         // reg1 (row_hi, k_lo): norm_hi * gamma_ki0_lo
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[1], n=norm_hi));
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r487;\n", r=regs[1]));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+            r = regs[1],
+            n = norm_hi
+        ));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r487;\n",
+            r = regs[1]
+        ));
         // reg2 (row_lo, k_hi): norm_lo * gamma_ki0_hi
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[2], n=norm_lo));
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r491;\n", r=regs[2]));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+            r = regs[2],
+            n = norm_lo
+        ));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r491;\n",
+            r = regs[2]
+        ));
         // reg3 (row_hi, k_hi): norm_hi * gamma_ki0_hi
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[3], n=norm_hi));
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r491;\n", r=regs[3]));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+            r = regs[3],
+            n = norm_hi
+        ));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r491;\n",
+            r = regs[3]
+        ));
     }
     // Apply norm + gamma to ki1 fragments
     for rm in 0..4u32 {
@@ -982,40 +1191,120 @@ fn emit_fused_kernel(s: &mut String) {
         let norm_hi = 471 + rm * 2;
         let regs = &a_ki1_regs[rm as usize];
         // reg0 (row_lo, k_lo): norm_lo * gamma_ki1_lo
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[0], n=norm_lo));
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r490;\n", r=regs[0]));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+            r = regs[0],
+            n = norm_lo
+        ));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r490;\n",
+            r = regs[0]
+        ));
         // reg1 (row_hi, k_lo): norm_hi * gamma_ki1_lo
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[1], n=norm_hi));
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r490;\n", r=regs[1]));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+            r = regs[1],
+            n = norm_hi
+        ));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r490;\n",
+            r = regs[1]
+        ));
         // reg2 (row_lo, k_hi): norm_lo * gamma_ki1_hi
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[2], n=norm_lo));
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r492;\n", r=regs[2]));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+            r = regs[2],
+            n = norm_lo
+        ));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r492;\n",
+            r = regs[2]
+        ));
         // reg3 (row_hi, k_hi): norm_hi * gamma_ki1_hi
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n", r=regs[3], n=norm_hi));
-        s.push_str(&format!("\tmul.rn.f16x2 \t%r{r}, %r{r}, %r492;\n", r=regs[3]));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r{n};\n",
+            r = regs[3],
+            n = norm_hi
+        ));
+        s.push_str(&format!(
+            "\tmul.rn.f16x2 \t%r{r}, %r{r}, %r492;\n",
+            r = regs[3]
+        ));
     }
     blank(s);
 
     // ─── ldmatrix B transposed (8 loads) ───
     w(s, "add.s32 \t%r141, %r106, %r75;");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r142, %r143, %r144, %r145}, [%r141+16384];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r146, %r147, %r148, %r149}, [%r141+16512];");
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r142, %r143, %r144, %r145}, [%r141+16384];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r146, %r147, %r148, %r149}, [%r141+16512];",
+    );
     w(s, "add.s32 \t%r150, %r106, %r76;");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r151, %r152, %r153, %r154}, [%r150+16384];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r155, %r156, %r157, %r158}, [%r150+16512];");
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r151, %r152, %r153, %r154}, [%r150+16384];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r155, %r156, %r157, %r158}, [%r150+16512];",
+    );
     w(s, "add.s32 \t%r159, %r106, %r77;");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r160, %r161, %r162, %r163}, [%r159+16384];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r164, %r165, %r166, %r167}, [%r159+16512];");
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r160, %r161, %r162, %r163}, [%r159+16384];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r164, %r165, %r166, %r167}, [%r159+16512];",
+    );
     w(s, "add.s32 \t%r168, %r106, %r78;");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r169, %r170, %r171, %r172}, [%r168+16384];");
-    w(s, "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r173, %r174, %r175, %r176}, [%r168+16512];");
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r169, %r170, %r171, %r172}, [%r168+16384];",
+    );
+    w(
+        s,
+        "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%r173, %r174, %r175, %r176}, [%r168+16512];",
+    );
     blank(s);
 
     // ─── MMA (64 total) ───
-    let a_ki0 = [[108,109,110,111],[112,113,114,115],[116,117,118,119],[120,121,122,123]];
-    let b_ki0 = [[142,143],[151,152],[160,161],[169,170],[146,147],[155,156],[164,165],[173,174]];
-    let a_ki1 = [[125,126,127,128],[129,130,131,132],[133,134,135,136],[137,138,139,140]];
-    let b_ki1 = [[144,145],[153,154],[162,163],[171,172],[148,149],[157,158],[166,167],[175,176]];
+    let a_ki0 = [
+        [108, 109, 110, 111],
+        [112, 113, 114, 115],
+        [116, 117, 118, 119],
+        [120, 121, 122, 123],
+    ];
+    let b_ki0 = [
+        [142, 143],
+        [151, 152],
+        [160, 161],
+        [169, 170],
+        [146, 147],
+        [155, 156],
+        [164, 165],
+        [173, 174],
+    ];
+    let a_ki1 = [
+        [125, 126, 127, 128],
+        [129, 130, 131, 132],
+        [133, 134, 135, 136],
+        [137, 138, 139, 140],
+    ];
+    let b_ki1 = [
+        [144, 145],
+        [153, 154],
+        [162, 163],
+        [171, 172],
+        [148, 149],
+        [157, 158],
+        [166, 167],
+        [175, 176],
+    ];
 
     let mut acc = 200u32;
     for am in 0..4 {
@@ -1053,24 +1342,48 @@ fn emit_fused_kernel(s: &mut String) {
     w(s, "add.s32 \t%r180, %r179, %r36;");
     w(s, "selp.b32 \t%r181, 16, 0, %p3;");
 
-    w(s, "cp.async.cg.shared.global [ %r180 + 0 ], [ %rd50 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r180 + 0 ], [ %rd50 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r182, %r180, 2048;");
-    w(s, "cp.async.cg.shared.global [ %r182 + 0 ], [ %rd51 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r182 + 0 ], [ %rd51 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r183, %r180, 4096;");
-    w(s, "cp.async.cg.shared.global [ %r183 + 0 ], [ %rd52 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r183 + 0 ], [ %rd52 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r184, %r180, 6144;");
-    w(s, "cp.async.cg.shared.global [ %r184 + 0 ], [ %rd53 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r184 + 0 ], [ %rd53 + 0 ], 0x10, %r181;",
+    );
     w(s, "cp.async.commit_group;");
 
     w(s, "add.s32 \t%r185, %r179, %r39;");
     w(s, "add.s32 \t%r186, %r185, 16384;");
-    w(s, "cp.async.cg.shared.global [ %r186 + 0 ], [ %rd54 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r186 + 0 ], [ %rd54 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r187, %r185, 18432;");
-    w(s, "cp.async.cg.shared.global [ %r187 + 0 ], [ %rd55 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r187 + 0 ], [ %rd55 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r188, %r185, 20480;");
-    w(s, "cp.async.cg.shared.global [ %r188 + 0 ], [ %rd56 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r188 + 0 ], [ %rd56 + 0 ], 0x10, %r181;",
+    );
     w(s, "add.s32 \t%r189, %r185, 22528;");
-    w(s, "cp.async.cg.shared.global [ %r189 + 0 ], [ %rd57 + 0 ], 0x10, %r181;");
+    w(
+        s,
+        "cp.async.cg.shared.global [ %r189 + 0 ], [ %rd57 + 0 ], 0x10, %r181;",
+    );
     w(s, "cp.async.commit_group;");
     blank(s);
 
@@ -1125,7 +1438,7 @@ fn emit_fused_kernel(s: &mut String) {
         s.push_str("\tex2.approx.f32 \t%f121, %f121;\n");
         s.push_str("\tadd.f32 \t%f121, %f121, 0F3F800000;\n"); // 1.0
         s.push_str("\trcp.approx.f32 \t%f121, %f121;\n");
-        s.push_str("\tmul.f32 \t%f120, %f120, %f121;\n");       // x * sigmoid(x)
+        s.push_str("\tmul.f32 \t%f120, %f120, %f121;\n"); // x * sigmoid(x)
         s.push_str(&format!("\tmov.b32 \t%r{i}, %f120;\n"));
     }
     blank(s);
@@ -1134,17 +1447,17 @@ fn emit_fused_kernel(s: &mut String) {
     // Store C (f32) — identical to standalone kernel
     // ═══════════════════════════════════════════════════════════════
     // warp_m, warp_n, lane already computed above (%r328..%r331)
-    w(s, "shr.u32 \t%r332, %r328, 2;");           // mma_row
+    w(s, "shr.u32 \t%r332, %r328, 2;"); // mma_row
     w(s, "and.b32 \t%r333, %r328, 3;");
-    w(s, "shl.b32 \t%r334, %r333, 1;");           // mma_col
+    w(s, "shl.b32 \t%r334, %r333, 1;"); // mma_col
 
-    w(s, "shl.b32 \t%r335, %r330, 4;");           // warp_m * 16
+    w(s, "shl.b32 \t%r335, %r330, 4;"); // warp_m * 16
     w(s, "add.s32 \t%r336, %r8, %r335;");
-    w(s, "add.s32 \t%r337, %r336, %r332;");       // base_row
+    w(s, "add.s32 \t%r337, %r336, %r332;"); // base_row
 
-    w(s, "shl.b32 \t%r338, %r331, 6;");           // warp_n * 64
+    w(s, "shl.b32 \t%r338, %r331, 6;"); // warp_n * 64
     w(s, "add.s32 \t%r339, %r7, %r338;");
-    w(s, "add.s32 \t%r340, %r339, %r334;");       // base_col
+    w(s, "add.s32 \t%r340, %r339, %r334;"); // base_col
     blank(s);
 
     acc = 200;
@@ -1166,8 +1479,12 @@ fn emit_fused_kernel(s: &mut String) {
             s.push_str("\tmul.wide.u32 \t%rd72, %r354, 4;\n");
             s.push_str("\tadd.s64 \t%rd73, %rd70, %rd72;\n");
             s.push_str("\tadd.s64 \t%rd74, %rd71, %rd72;\n");
-            s.push_str(&format!("\tst.global.v2.b32 [ %rd73 + 0 ], {{ %r{d0}, %r{d1} }};\n"));
-            s.push_str(&format!("\tst.global.v2.b32 [ %rd74 + 0 ], {{ %r{d2}, %r{d3} }};\n"));
+            s.push_str(&format!(
+                "\tst.global.v2.b32 [ %rd73 + 0 ], {{ %r{d0}, %r{d1} }};\n"
+            ));
+            s.push_str(&format!(
+                "\tst.global.v2.b32 [ %rd74 + 0 ], {{ %r{d2}, %r{d3} }};\n"
+            ));
 
             acc += 4;
         }

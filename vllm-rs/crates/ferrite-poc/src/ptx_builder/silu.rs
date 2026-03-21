@@ -1,6 +1,6 @@
-use super::{PtxBuilder, Reg};
-use super::gemm::AccumulatorMap;
 use super::config::GemmConfig;
+use super::gemm::AccumulatorMap;
+use super::{PtxBuilder, Reg};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SiLU phase emitter — operates on AccumulatorMap registers in-place
@@ -65,9 +65,14 @@ pub fn build_silu_kernel(block_size: u32, elems_per_thread: u32) -> String {
     // threads = (bm/wm) * (bn/wn) * 32, so we need (bm/wm)*(bn/wn) = block_size/32
     let num_warps = block_size / 32;
     let config = GemmConfig {
-        bm: num_warps * 32, bn: 32, bk: 1,
-        wm: 32, wn: 32,
-        mma_m: 16, mma_n: 8, mma_k: 16,
+        bm: num_warps * 32,
+        bn: 32,
+        bk: 1,
+        wm: 32,
+        wn: 32,
+        mma_m: 16,
+        mma_n: 8,
+        mma_k: 16,
         num_stages: 1,
         sm_arch: "sm_89".into(),
     };

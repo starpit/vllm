@@ -17,17 +17,17 @@ use anyhow::{Context, Result, bail};
 use std::ffi::{CString, c_uint, c_void};
 use std::time::Instant;
 
+use inkwell::builder::Builder;
 use inkwell::context::Context as LlvmContext;
 use inkwell::module::Module;
-use inkwell::builder::Builder;
-use inkwell::targets::{TargetTriple, FileType};
+use inkwell::targets::{FileType, TargetTriple};
 use inkwell::types::AsTypeRef;
-use inkwell::values::{AsValueRef, IntValue, FloatValue};
+use inkwell::values::{AsValueRef, FloatValue, IntValue};
 use inkwell::{AddressSpace, IntPredicate};
 
 use cudarc::driver::result as cuda;
 
-use crate::{create_nvptx_target_machine, add_nvvm_kernel_metadata, call_sreg, call_barrier0};
+use crate::{add_nvvm_kernel_metadata, call_barrier0, call_sreg, create_nvptx_target_machine};
 
 const BM: u32 = 64;
 const BN: u32 = 64;
@@ -62,9 +62,8 @@ pub fn step3b_multiwarp_gemm(sm: &str) -> Result<()> {
 
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
-    let func = unsafe {
-        cuda::module::get_function(module, CString::new("multiwarp_gemm").unwrap())?
-    };
+    let func =
+        unsafe { cuda::module::get_function(module, CString::new("multiwarp_gemm").unwrap())? };
     println!("  [cuda] Module loaded, function resolved");
 
     let size_a = (m * k) as usize;
@@ -105,37 +104,55 @@ pub fn step3b_multiwarp_gemm(sm: &str) -> Result<()> {
     for _ in 0..5 {
         unsafe {
             cuda::launch_kernel(
-                func, (grid_x, grid_y, 1), (THREADS, 1, 1), smem_bytes, stream, params,
+                func,
+                (grid_x, grid_y, 1),
+                (THREADS, 1, 1),
+                smem_bytes,
+                stream,
+                params,
             )?;
         }
     }
-    unsafe { cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::stream::synchronize(stream)?;
+    }
 
     let iters = 100;
     let start = Instant::now();
     for _ in 0..iters {
         unsafe {
             cuda::launch_kernel(
-                func, (grid_x, grid_y, 1), (THREADS, 1, 1), smem_bytes, stream, params,
+                func,
+                (grid_x, grid_y, 1),
+                (THREADS, 1, 1),
+                smem_bytes,
+                stream,
+                params,
             )?;
         }
     }
-    unsafe { cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::stream::synchronize(stream)?;
+    }
     let elapsed = start.elapsed();
     let us_per = elapsed.as_micros() as f64 / iters as f64;
 
-    unsafe { cuda::memcpy_dtoh_sync(&mut h_c, d_c)?; }
+    unsafe {
+        cuda::memcpy_dtoh_sync(&mut h_c, d_c)?;
+    }
 
     let mut max_err: f32 = 0.0;
     for row in 0..m as usize {
         for col in 0..n as usize {
             let mut expected: f32 = 0.0;
             for kk in 0..k as usize {
-                expected += h_a[row * k as usize + kk].to_f32()
-                    * h_b[kk * n as usize + col].to_f32();
+                expected +=
+                    h_a[row * k as usize + kk].to_f32() * h_b[kk * n as usize + col].to_f32();
             }
             let err = (h_c[row * n as usize + col] - expected).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
         }
     }
 
@@ -149,7 +166,10 @@ pub fn step3b_multiwarp_gemm(sm: &str) -> Result<()> {
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = flops / (us_per * 1e-6) / 1e12;
     let pct = tflops / 181.0 * 100.0;
-    println!("  {:.1} μs, {:.2} TFLOPS ({:.1}% of L40S peak)", us_per, tflops, pct);
+    println!(
+        "  {:.1} μs, {:.2} TFLOPS ({:.1}% of L40S peak)",
+        us_per, tflops, pct
+    );
 
     unsafe {
         cuda::stream::destroy(stream)?;
@@ -172,18 +192,24 @@ pub fn step3b_multiwarp_gemm(sm: &str) -> Result<()> {
 fn build_swizzle<'ctx>(
     builder: &Builder<'ctx>,
     context: &'ctx LlvmContext,
-    elem_idx: IntValue<'ctx>,  // element index (in f16 units)
+    elem_idx: IntValue<'ctx>, // element index (in f16 units)
 ) -> IntValue<'ctx> {
     let i32_ty = context.i32_type();
     let ci = |v: u64| i32_ty.const_int(v, false);
     // Convert element index to byte offset (×2 for f16)
     let byte_off = builder.build_int_mul(elem_idx, ci(2), "").unwrap();
     // XOR: byte_off ^= (byte_off & 0x380) >> 3
-    let masked = builder.build_and(byte_off, ci(SWIZZLE_MASK as u64), "").unwrap();
-    let shifted = builder.build_right_shift(masked, ci(SWIZZLE_SHIFT as u64), false, "").unwrap();
+    let masked = builder
+        .build_and(byte_off, ci(SWIZZLE_MASK as u64), "")
+        .unwrap();
+    let shifted = builder
+        .build_right_shift(masked, ci(SWIZZLE_SHIFT as u64), false, "")
+        .unwrap();
     let swizzled_bytes = builder.build_xor(byte_off, shifted, "").unwrap();
     // Convert back to element index (÷2 for f16)
-    builder.build_int_unsigned_div(swizzled_bytes, ci(2), "sw").unwrap()
+    builder
+        .build_int_unsigned_div(swizzled_bytes, ci(2), "sw")
+        .unwrap()
 }
 
 fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
@@ -212,8 +238,14 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     smem_g.set_externally_initialized(true);
 
     let fn_type = void_ty.fn_type(
-        &[ptr_g.into(), ptr_g.into(), ptr_g.into(),
-          i32_ty.into(), i32_ty.into(), i32_ty.into()],
+        &[
+            ptr_g.into(),
+            ptr_g.into(),
+            ptr_g.into(),
+            i32_ty.into(),
+            i32_ty.into(),
+            i32_ty.into(),
+        ],
         false,
     );
     let function = module.add_function("multiwarp_gemm", fn_type, None);
@@ -255,9 +287,16 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     // smem_a[BM×BK f16] + smem_b[BK×BN f16]
     let smem_base = smem_g.as_pointer_value();
     let smem_a = b.build_pointer_cast(smem_base, ptr_s, "sa").unwrap();
-    let smem_b = b.build_pointer_cast(unsafe {
-        b.build_gep(ctx.i8_type(), smem_base, &[ci((BM * BK * 2) as u64)], "").unwrap()
-    }, ptr_s, "sb").unwrap();
+    let smem_b = b
+        .build_pointer_cast(
+            unsafe {
+                b.build_gep(ctx.i8_type(), smem_base, &[ci((BM * BK * 2) as u64)], "")
+                    .unwrap()
+            },
+            ptr_s,
+            "sb",
+        )
+        .unwrap();
 
     let f0 = f32_ty.const_float(0.0);
     let tid_x8 = b.build_int_mul(tid, ci(8), "tx8").unwrap();
@@ -268,13 +307,21 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
 
     // ── Tile loading: precompute per-thread offsets ──
     // A: 64×16=1024 f16, B: 16×64=1024 f16 → 8 per thread → 1 cp.async each
-    let a_tile_row = b.build_int_unsigned_div(tid_x8, ci(BK as u64), "atr").unwrap();
-    let a_tile_col = b.build_int_unsigned_rem(tid_x8, ci(BK as u64), "atc").unwrap();
+    let a_tile_row = b
+        .build_int_unsigned_div(tid_x8, ci(BK as u64), "atr")
+        .unwrap();
+    let a_tile_col = b
+        .build_int_unsigned_rem(tid_x8, ci(BK as u64), "atc")
+        .unwrap();
     let a_glob_row = b.build_int_add(block_row, a_tile_row, "agr").unwrap();
     let a_smem_sw = build_swizzle(&b, &ctx, tid_x8);
 
-    let b_tile_row = b.build_int_unsigned_div(tid_x8, ci(BN as u64), "btr").unwrap();
-    let b_tile_col = b.build_int_unsigned_rem(tid_x8, ci(BN as u64), "btc").unwrap();
+    let b_tile_row = b
+        .build_int_unsigned_div(tid_x8, ci(BN as u64), "btr")
+        .unwrap();
+    let b_tile_col = b
+        .build_int_unsigned_rem(tid_x8, ci(BN as u64), "btc")
+        .unwrap();
     let b_glob_col = b.build_int_add(block_col, b_tile_col, "bgc").unwrap();
     let b_smem_sw = build_swizzle(&b, &ctx, tid_x8);
 
@@ -289,26 +336,37 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
         acc_phis.push(b.build_phi(f32_ty, &format!("acc{i}")).unwrap());
     }
     let t = t_phi.as_basic_value().into_int_value();
-    let kcmp = b.build_int_compare(IntPredicate::ULT, t, k_p, "kcmp").unwrap();
-    b.build_conditional_branch(kcmp, kloop_body, kloop_exit).unwrap();
+    let kcmp = b
+        .build_int_compare(IntPredicate::ULT, t, k_p, "kcmp")
+        .unwrap();
+    b.build_conditional_branch(kcmp, kloop_body, kloop_exit)
+        .unwrap();
 
     // ── K-loop body ──
     b.position_at_end(kloop_body);
 
     // ── cp.async load A tile [BM×BK] — 1 cp.async per thread ──
     let a_glob_col = b.build_int_add(t, a_tile_col, "agc").unwrap();
-    let a_idx = b.build_int_add(
-        b.build_int_mul(a_glob_row, k_p, "").unwrap(), a_glob_col, "",
-    ).unwrap();
+    let a_idx = b
+        .build_int_add(
+            b.build_int_mul(a_glob_row, k_p, "").unwrap(),
+            a_glob_col,
+            "",
+        )
+        .unwrap();
     let a_gep = unsafe { b.build_gep(f16_ty, a_ptr, &[a_idx], "").unwrap() };
     let sa_gep = unsafe { b.build_gep(f16_ty, smem_a, &[a_smem_sw], "").unwrap() };
     build_cp_async_16(&b, &ctx, &module, sa_gep, a_gep);
 
     // ── cp.async load B tile [BK×BN] — 1 cp.async per thread ──
     let b_glob_row = b.build_int_add(t, b_tile_row, "bgr").unwrap();
-    let b_idx = b.build_int_add(
-        b.build_int_mul(b_glob_row, n_p, "").unwrap(), b_glob_col, "",
-    ).unwrap();
+    let b_idx = b
+        .build_int_add(
+            b.build_int_mul(b_glob_row, n_p, "").unwrap(),
+            b_glob_col,
+            "",
+        )
+        .unwrap();
     let b_gep = unsafe { b.build_gep(f16_ty, b_ptr, &[b_idx], "").unwrap() };
     let sb_gep = unsafe { b.build_gep(f16_ty, smem_b, &[b_smem_sw], "").unwrap() };
     build_cp_async_16(&b, &ctx, &module, sb_gep, b_gep);
@@ -330,15 +388,15 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
         for rm in 0..REG_M as u64 {
             let rm_off = b.build_int_add(wy_off, ci(rm * MMA_M as u64), "").unwrap();
             for (row_add, col_add) in [(0u64, 0u64), (8, 0), (0, 8), (8, 8)] {
-                let frow = b.build_int_add(
-                    b.build_int_add(rm_off, group, "").unwrap(), ci(row_add), "",
-                ).unwrap();
-                let fcol = b.build_int_add(
-                    b.build_int_add(tg2, ci(col_add), "").unwrap(), k_off, "",
-                ).unwrap();
-                let lin = b.build_int_add(
-                    b.build_int_mul(frow, ci(BK as u64), "").unwrap(), fcol, "",
-                ).unwrap();
+                let frow = b
+                    .build_int_add(b.build_int_add(rm_off, group, "").unwrap(), ci(row_add), "")
+                    .unwrap();
+                let fcol = b
+                    .build_int_add(b.build_int_add(tg2, ci(col_add), "").unwrap(), k_off, "")
+                    .unwrap();
+                let lin = b
+                    .build_int_add(b.build_int_mul(frow, ci(BK as u64), "").unwrap(), fcol, "")
+                    .unwrap();
                 let sw = build_swizzle(&b, &ctx, lin);
                 let gep = unsafe { b.build_gep(f16_ty, smem_a, &[sw], "").unwrap() };
                 a_frags.push(b.build_load(i32_ty, gep, "").unwrap().into_int_value());
@@ -348,28 +406,33 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
         // Load B fragments for this K-slice
         let mut b_frags: Vec<IntValue> = Vec::new();
         for rn in 0..REG_N as u64 {
-            let b_col = b.build_int_add(
-                b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap(),
-                group, "",
-            ).unwrap();
+            let b_col = b
+                .build_int_add(
+                    b.build_int_add(wx_off, ci(rn * MMA_N as u64), "").unwrap(),
+                    group,
+                    "",
+                )
+                .unwrap();
             for fk_add in [0u64, 8] {
-                let k0 = b.build_int_add(
-                    b.build_int_add(tg2, ci(fk_add), "").unwrap(), k_off, "",
-                ).unwrap();
+                let k0 = b
+                    .build_int_add(b.build_int_add(tg2, ci(fk_add), "").unwrap(), k_off, "")
+                    .unwrap();
                 let k1 = b.build_int_add(k0, ci(1), "").unwrap();
-                let lin0 = b.build_int_add(
-                    b.build_int_mul(k0, ci(BN as u64), "").unwrap(), b_col, "",
-                ).unwrap();
-                let lin1 = b.build_int_add(
-                    b.build_int_mul(k1, ci(BN as u64), "").unwrap(), b_col, "",
-                ).unwrap();
+                let lin0 = b
+                    .build_int_add(b.build_int_mul(k0, ci(BN as u64), "").unwrap(), b_col, "")
+                    .unwrap();
+                let lin1 = b
+                    .build_int_add(b.build_int_mul(k1, ci(BN as u64), "").unwrap(), b_col, "")
+                    .unwrap();
                 let sw0 = build_swizzle(&b, &ctx, lin0);
                 let sw1 = build_swizzle(&b, &ctx, lin1);
                 let gep0 = unsafe { b.build_gep(f16_ty, smem_b, &[sw0], "").unwrap() };
                 let gep1 = unsafe { b.build_gep(f16_ty, smem_b, &[sw1], "").unwrap() };
                 let v0 = b.build_load(f16_ty, gep0, "").unwrap();
                 let v1 = b.build_load(f16_ty, gep1, "").unwrap();
-                let vec = b.build_insert_element(v2f16_ty.get_undef(), v0, ci(0), "").unwrap();
+                let vec = b
+                    .build_insert_element(v2f16_ty.get_undef(), v0, ci(0), "")
+                    .unwrap();
                 let vec = b.build_insert_element(vec, v1, ci(1), "").unwrap();
                 b_frags.push(b.build_bit_cast(vec, i32_ty, "").unwrap().into_int_value());
             }
@@ -383,13 +446,27 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
                 let a_base = (rm * 4) as usize;
                 let b_base = (rn * 2) as usize;
                 let [d0, d1, d2, d3] = build_mma_asm(
-                    &b, &ctx, &module,
-                    &[a_frags[a_base], a_frags[a_base+1], a_frags[a_base+2], a_frags[a_base+3]],
-                    &[b_frags[b_base], b_frags[b_base+1]],
-                    &[cur_accs[acc_base], cur_accs[acc_base+1],
-                      cur_accs[acc_base+2], cur_accs[acc_base+3]],
+                    &b,
+                    &ctx,
+                    &module,
+                    &[
+                        a_frags[a_base],
+                        a_frags[a_base + 1],
+                        a_frags[a_base + 2],
+                        a_frags[a_base + 3],
+                    ],
+                    &[b_frags[b_base], b_frags[b_base + 1]],
+                    &[
+                        cur_accs[acc_base],
+                        cur_accs[acc_base + 1],
+                        cur_accs[acc_base + 2],
+                        cur_accs[acc_base + 3],
+                    ],
                 );
-                next_accs.push(d0); next_accs.push(d1); next_accs.push(d2); next_accs.push(d3);
+                next_accs.push(d0);
+                next_accs.push(d1);
+                next_accs.push(d2);
+                next_accs.push(d3);
             }
         }
         cur_accs = next_accs;
@@ -415,28 +492,40 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
         for rn in 0..REG_N {
             let acc_base = (rm * REG_N * 4 + rn * 4) as usize;
             for d in 0..4u32 {
-                let mma_row_off = if d < 2 { group } else {
+                let mma_row_off = if d < 2 {
+                    group
+                } else {
                     b.build_int_add(group, ci(8), "").unwrap()
                 };
-                let mma_col_off = if d % 2 == 0 { tg2 } else {
+                let mma_col_off = if d % 2 == 0 {
+                    tg2
+                } else {
                     b.build_int_add(tg2, ci(1), "").unwrap()
                 };
 
-                let c_row = b.build_int_add(
-                    b.build_int_add(block_row, wy_off, "").unwrap(),
-                    b.build_int_add(ci(rm as u64 * MMA_M as u64), mma_row_off, "").unwrap(),
-                    "",
-                ).unwrap();
-                let c_col = b.build_int_add(
-                    b.build_int_add(block_col, wx_off, "").unwrap(),
-                    b.build_int_add(ci(rn as u64 * MMA_N as u64), mma_col_off, "").unwrap(),
-                    "",
-                ).unwrap();
-                let c_idx = b.build_int_add(
-                    b.build_int_mul(c_row, n_p, "").unwrap(), c_col, "",
-                ).unwrap();
+                let c_row = b
+                    .build_int_add(
+                        b.build_int_add(block_row, wy_off, "").unwrap(),
+                        b.build_int_add(ci(rm as u64 * MMA_M as u64), mma_row_off, "")
+                            .unwrap(),
+                        "",
+                    )
+                    .unwrap();
+                let c_col = b
+                    .build_int_add(
+                        b.build_int_add(block_col, wx_off, "").unwrap(),
+                        b.build_int_add(ci(rn as u64 * MMA_N as u64), mma_col_off, "")
+                            .unwrap(),
+                        "",
+                    )
+                    .unwrap();
+                let c_idx = b
+                    .build_int_add(b.build_int_mul(c_row, n_p, "").unwrap(), c_col, "")
+                    .unwrap();
                 let gep = unsafe { b.build_gep(f32_ty, c_ptr, &[c_idx], "").unwrap() };
-                let val = acc_phis[acc_base + d as usize].as_basic_value().into_float_value();
+                let val = acc_phis[acc_base + d as usize]
+                    .as_basic_value()
+                    .into_float_value();
                 b.build_store(gep, val).unwrap();
             }
         }
@@ -447,7 +536,9 @@ fn emit_multiwarp_gemm_ptx(sm: &str) -> Result<String> {
     let buf = machine
         .write_to_memory_buffer(&module, FileType::Assembly)
         .map_err(|e| anyhow::anyhow!("PTX emission: {}", e))?;
-    let ptx = std::str::from_utf8(buf.as_slice()).context("PTX not UTF-8")?.to_string();
+    let ptx = std::str::from_utf8(buf.as_slice())
+        .context("PTX not UTF-8")?
+        .to_string();
     Ok(ptx)
 }
 
@@ -473,30 +564,39 @@ fn build_cp_async_16<'ctx>(
 
         let void_ty = llvm_sys::core::LLVMVoidTypeInContext(ctx_ref);
         let mut param_types = [i32_ty.as_type_ref(), i64_ty.as_type_ref()];
-        let fn_type = llvm_sys::core::LLVMFunctionType(
-            void_ty, param_types.as_mut_ptr(), 2, 0,
-        );
+        let fn_type = llvm_sys::core::LLVMFunctionType(void_ty, param_types.as_mut_ptr(), 2, 0);
 
         // Convert pointers to integer addresses for the asm
-        let dst_i32 = builder.build_ptr_to_int(dst_shared, i32_ty, "cp_dst").unwrap();
-        let src_i64 = builder.build_ptr_to_int(src_global, i64_ty, "cp_src").unwrap();
+        let dst_i32 = builder
+            .build_ptr_to_int(dst_shared, i32_ty, "cp_dst")
+            .unwrap();
+        let src_i64 = builder
+            .build_ptr_to_int(src_global, i64_ty, "cp_src")
+            .unwrap();
 
         let asm_str = b"cp.async.cg.shared.global [$0], [$1], 16;\0";
         let constraints = b"r,l\0";
 
         let asm_val = llvm_sys::core::LLVMGetInlineAsm(
             fn_type,
-            asm_str.as_ptr() as *const _, asm_str.len() - 1,
-            constraints.as_ptr() as *const _, constraints.len() - 1,
-            1, 0,
+            asm_str.as_ptr() as *const _,
+            asm_str.len() - 1,
+            constraints.as_ptr() as *const _,
+            constraints.len() - 1,
+            1,
+            0,
             llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
             0,
         );
 
         let mut args = [dst_i32.as_value_ref(), src_i64.as_value_ref()];
         llvm_sys::core::LLVMBuildCall2(
-            builder_ref, fn_type, asm_val,
-            args.as_mut_ptr(), 2, b"\0".as_ptr() as *const _,
+            builder_ref,
+            fn_type,
+            asm_val,
+            args.as_mut_ptr(),
+            2,
+            b"\0".as_ptr() as *const _,
         );
     }
 }
@@ -520,30 +620,44 @@ fn build_cp_async_commit_and_wait<'ctx>(
         let constraints_empty = b"\0";
         let commit = llvm_sys::core::LLVMGetInlineAsm(
             fn_type,
-            asm_commit.as_ptr() as *const _, asm_commit.len() - 1,
-            constraints_empty.as_ptr() as *const _, constraints_empty.len() - 1,
-            1, 0,
+            asm_commit.as_ptr() as *const _,
+            asm_commit.len() - 1,
+            constraints_empty.as_ptr() as *const _,
+            constraints_empty.len() - 1,
+            1,
+            0,
             llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
             0,
         );
         llvm_sys::core::LLVMBuildCall2(
-            builder_ref, fn_type, commit,
-            std::ptr::null_mut(), 0, b"\0".as_ptr() as *const _,
+            builder_ref,
+            fn_type,
+            commit,
+            std::ptr::null_mut(),
+            0,
+            b"\0".as_ptr() as *const _,
         );
 
         // wait_group 0
         let asm_wait = b"cp.async.wait_group 0;\0";
         let wait = llvm_sys::core::LLVMGetInlineAsm(
             fn_type,
-            asm_wait.as_ptr() as *const _, asm_wait.len() - 1,
-            constraints_empty.as_ptr() as *const _, constraints_empty.len() - 1,
-            1, 0,
+            asm_wait.as_ptr() as *const _,
+            asm_wait.len() - 1,
+            constraints_empty.as_ptr() as *const _,
+            constraints_empty.len() - 1,
+            1,
+            0,
             llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
             0,
         );
         llvm_sys::core::LLVMBuildCall2(
-            builder_ref, fn_type, wait,
-            std::ptr::null_mut(), 0, b"\0".as_ptr() as *const _,
+            builder_ref,
+            fn_type,
+            wait,
+            std::ptr::null_mut(),
+            0,
+            b"\0".as_ptr() as *const _,
         );
     }
 }
@@ -565,48 +679,64 @@ fn build_mma_asm<'ctx>(
         let builder_ref = builder.as_mut_ptr();
 
         let mut ret_members = [
-            f32_ty.as_type_ref(), f32_ty.as_type_ref(),
-            f32_ty.as_type_ref(), f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
         ];
-        let ret_struct = llvm_sys::core::LLVMStructTypeInContext(
-            ctx_ref, ret_members.as_mut_ptr(), 4, 0,
-        );
+        let ret_struct =
+            llvm_sys::core::LLVMStructTypeInContext(ctx_ref, ret_members.as_mut_ptr(), 4, 0);
 
         let mut param_types = [
-            i32_ty.as_type_ref(), i32_ty.as_type_ref(),
-            i32_ty.as_type_ref(), i32_ty.as_type_ref(),
-            i32_ty.as_type_ref(), i32_ty.as_type_ref(),
-            f32_ty.as_type_ref(), f32_ty.as_type_ref(),
-            f32_ty.as_type_ref(), f32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
         ];
-        let fn_type = llvm_sys::core::LLVMFunctionType(
-            ret_struct, param_types.as_mut_ptr(), 10, 0,
-        );
+        let fn_type = llvm_sys::core::LLVMFunctionType(ret_struct, param_types.as_mut_ptr(), 10, 0);
 
         let asm_str = b"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13};\0";
         let constraints = b"=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f\0";
 
         let asm_val = llvm_sys::core::LLVMGetInlineAsm(
             fn_type,
-            asm_str.as_ptr() as *const _, asm_str.len() - 1,
-            constraints.as_ptr() as *const _, constraints.len() - 1,
-            1, 0,
+            asm_str.as_ptr() as *const _,
+            asm_str.len() - 1,
+            constraints.as_ptr() as *const _,
+            constraints.len() - 1,
+            1,
+            0,
             llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
             0,
         );
 
         let mut args = [
-            a_regs[0].as_value_ref(), a_regs[1].as_value_ref(),
-            a_regs[2].as_value_ref(), a_regs[3].as_value_ref(),
-            b_regs[0].as_value_ref(), b_regs[1].as_value_ref(),
-            c_regs[0].as_value_ref(), c_regs[1].as_value_ref(),
-            c_regs[2].as_value_ref(), c_regs[3].as_value_ref(),
+            a_regs[0].as_value_ref(),
+            a_regs[1].as_value_ref(),
+            a_regs[2].as_value_ref(),
+            a_regs[3].as_value_ref(),
+            b_regs[0].as_value_ref(),
+            b_regs[1].as_value_ref(),
+            c_regs[0].as_value_ref(),
+            c_regs[1].as_value_ref(),
+            c_regs[2].as_value_ref(),
+            c_regs[3].as_value_ref(),
         ];
 
         let name = b"\0";
         let call = llvm_sys::core::LLVMBuildCall2(
-            builder_ref, fn_type, asm_val,
-            args.as_mut_ptr(), 10, name.as_ptr() as *const _,
+            builder_ref,
+            fn_type,
+            asm_val,
+            args.as_mut_ptr(),
+            10,
+            name.as_ptr() as *const _,
         );
 
         let n = |s: &[u8]| s.as_ptr() as *const _;
@@ -615,6 +745,11 @@ fn build_mma_asm<'ctx>(
         let d2 = llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 2, n(b"\0"));
         let d3 = llvm_sys::core::LLVMBuildExtractValue(builder_ref, call, 3, n(b"\0"));
 
-        [FloatValue::new(d0), FloatValue::new(d1), FloatValue::new(d2), FloatValue::new(d3)]
+        [
+            FloatValue::new(d0),
+            FloatValue::new(d1),
+            FloatValue::new(d2),
+            FloatValue::new(d3),
+        ]
     }
 }

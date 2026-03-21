@@ -1,5 +1,5 @@
-use super::{PtxBuilder, Reg};
 use super::config::GemmConfig;
+use super::{PtxBuilder, Reg};
 
 /// Accumulator register map -- the fusion interface.
 /// After the K-loop, these hold the partial results.
@@ -32,8 +32,10 @@ pub trait TileLoader {
     fn emit_prologue_load(
         &self,
         ptx: &mut PtxBuilder,
-        smem_dst0: Reg, smem_dst1: Reg,
-        g_ptr0: Reg, g_ptr1: Reg,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         cp_size: Reg,
     );
 
@@ -42,8 +44,10 @@ pub trait TileLoader {
     fn emit_loop_load(
         &self,
         ptx: &mut PtxBuilder,
-        smem_dst0: Reg, smem_dst1: Reg,
-        g_ptr0: Reg, g_ptr1: Reg,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         cp_size: Reg,
         p_load: Reg,
     );
@@ -68,9 +72,12 @@ pub struct CpAsyncLoader;
 
 impl TileLoader for CpAsyncLoader {
     fn emit_prologue_load(
-        &self, ptx: &mut PtxBuilder,
-        smem_dst0: Reg, smem_dst1: Reg,
-        g_ptr0: Reg, g_ptr1: Reg,
+        &self,
+        ptx: &mut PtxBuilder,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         cp_size: Reg,
     ) {
         ptx.cp_async_cg(smem_dst0, 0, g_ptr0, 0, cp_size);
@@ -78,9 +85,12 @@ impl TileLoader for CpAsyncLoader {
     }
 
     fn emit_loop_load(
-        &self, ptx: &mut PtxBuilder,
-        smem_dst0: Reg, smem_dst1: Reg,
-        g_ptr0: Reg, g_ptr1: Reg,
+        &self,
+        ptx: &mut PtxBuilder,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         cp_size: Reg,
         _p_load: Reg,
     ) {
@@ -93,8 +103,12 @@ impl TileLoader for CpAsyncLoader {
         ptx.cp_async_commit();
     }
 
-    fn async_groups_per_tile(&self) -> u32 { 1 }
-    fn needs_barrier_after_load(&self) -> bool { false }
+    fn async_groups_per_tile(&self) -> u32 {
+        1
+    }
+    fn needs_barrier_after_load(&self) -> bool {
+        false
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -140,9 +154,12 @@ impl NormalizedLoader {
 
 impl TileLoader for NormalizedLoader {
     fn emit_prologue_load(
-        &self, ptx: &mut PtxBuilder,
-        smem_dst0: Reg, smem_dst1: Reg,
-        g_ptr0: Reg, g_ptr1: Reg,
+        &self,
+        ptx: &mut PtxBuilder,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         _cp_size: Reg,
     ) {
         self.emit_chunk_store(ptx, g_ptr0, smem_dst0, self.row_id_chunk0, None);
@@ -150,9 +167,12 @@ impl TileLoader for NormalizedLoader {
     }
 
     fn emit_loop_load(
-        &self, ptx: &mut PtxBuilder,
-        smem_dst0: Reg, smem_dst1: Reg,
-        g_ptr0: Reg, g_ptr1: Reg,
+        &self,
+        ptx: &mut PtxBuilder,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         _cp_size: Reg,
         p_load: Reg,
     ) {
@@ -164,8 +184,12 @@ impl TileLoader for NormalizedLoader {
         // NormalizedLoader writes directly via st.shared -- no async commit needed.
     }
 
-    fn async_groups_per_tile(&self) -> u32 { 0 }
-    fn needs_barrier_after_load(&self) -> bool { true }
+    fn async_groups_per_tile(&self) -> u32 {
+        0
+    }
+    fn needs_barrier_after_load(&self) -> bool {
+        true
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -201,12 +225,14 @@ pub fn emit_gemm_with_loaders(
     setup: &GemmSetup,
     // A tile loading
     a_loader: &dyn TileLoader,
-    ga0: Reg, ga1: Reg,          // A global ptrs for chunk 0/1
-    a_cp_off: Reg,               // A swizzled smem offset
+    ga0: Reg,
+    ga1: Reg,      // A global ptrs for chunk 0/1
+    a_cp_off: Reg, // A swizzled smem offset
     // B tile loading
     b_loader: &dyn TileLoader,
-    gb0: Reg, gb1: Reg,          // B global ptrs for chunk 0/1
-    b_cp_off: Reg,               // B swizzled smem offset
+    gb0: Reg,
+    gb1: Reg,      // B global ptrs for chunk 0/1
+    b_cp_off: Reg, // B swizzled smem offset
     // B advancement
     n_param: Reg,
     k_param: Reg,
@@ -216,8 +242,8 @@ pub fn emit_gemm_with_loaders(
     let smem_base = setup.smem_base;
     let tid = setup.tid;
 
-    let a_tile_bytes = c.smem_a_bytes();     // 4096
-    let buf_stride = a_tile_bytes;           // 4096
+    let a_tile_bytes = c.smem_a_bytes(); // 4096
+    let buf_stride = a_tile_bytes; // 4096
     let b_start = (a_tile_bytes * c.num_stages) as i32; // 8192
 
     let tid_x16 = ptx.regs.alloc_b32();
@@ -419,8 +445,10 @@ pub fn emit_gemm_with_loaders(
     let mut acc_regs: Vec<[Reg; 4]> = Vec::with_capacity(num_tiles);
     for _ in 0..num_tiles {
         let tile = [
-            ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-            ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
         ];
         for &r in &tile {
             ptx.mov_b32(r, zero);
@@ -486,22 +514,38 @@ pub fn emit_gemm_with_loaders(
     ptx.comment("ldmatrix A -- 4 loads");
     let a_addr_ki0 = ptx.regs.alloc_b32();
     ptx.add_s32(a_addr_ki0, buf_base, a_off_ki0);
-    let a_frag_ki0_rm0 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let a_frag_ki0_rm0 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki0_rm0, a_addr_ki0, None);
 
-    let a_frag_ki0_rm1 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let a_frag_ki0_rm1 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki0_rm1, a_addr_ki0, Some(2048));
 
     let a_addr_ki1 = ptx.regs.alloc_b32();
     ptx.add_s32(a_addr_ki1, buf_base, a_off_ki1);
-    let a_frag_ki1_rm0 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let a_frag_ki1_rm0 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki1_rm0, a_addr_ki1, None);
 
-    let a_frag_ki1_rm1 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let a_frag_ki1_rm1 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki1_rm1, a_addr_ki1, Some(2048));
     ptx.blank();
 
@@ -511,8 +555,12 @@ pub fn emit_gemm_with_loaders(
     for rn in 0..REG_N as usize {
         let b_addr = ptx.regs.alloc_b32();
         ptx.add_s32(b_addr, buf_base, b_off[rn]);
-        let frag = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                    ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+        let frag = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
         ptx.ldmatrix_x4_trans(frag, b_addr, Some(b_start));
         b_frags.push(frag);
     }
@@ -522,19 +570,39 @@ pub fn emit_gemm_with_loaders(
     ptx.comment("MMA -- 16 total");
     for rn in 0..REG_N as usize {
         let ai = 0 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki0_rm0, [b_frags[rn][0], b_frags[rn][1]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki0_rm0,
+            [b_frags[rn][0], b_frags[rn][1]],
+            acc.regs[ai],
+        );
     }
     for rn in 0..REG_N as usize {
         let ai = 1 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki0_rm1, [b_frags[rn][0], b_frags[rn][1]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki0_rm1,
+            [b_frags[rn][0], b_frags[rn][1]],
+            acc.regs[ai],
+        );
     }
     for rn in 0..REG_N as usize {
         let ai = 0 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki1_rm0, [b_frags[rn][2], b_frags[rn][3]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki1_rm0,
+            [b_frags[rn][2], b_frags[rn][3]],
+            acc.regs[ai],
+        );
     }
     for rn in 0..REG_N as usize {
         let ai = 1 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki1_rm1, [b_frags[rn][2], b_frags[rn][3]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki1_rm1,
+            [b_frags[rn][2], b_frags[rn][3]],
+            acc.regs[ai],
+        );
     }
     ptx.blank();
 
@@ -749,7 +817,16 @@ pub fn emit_gemm_setup(ptx: &mut PtxBuilder, c: &GemmConfig) -> GemmSetup {
     ptx.mov_b32_name(smem_base, "global_smem");
     ptx.blank();
 
-    GemmSetup { block_row, block_col, warp_id, lane, group, tg, smem_base, tid }
+    GemmSetup {
+        block_row,
+        block_col,
+        warp_id,
+        lane,
+        group,
+        tg,
+        smem_base,
+        tid,
+    }
 }
 
 /// Emit cp.async swizzle address computation for A and B.
@@ -781,7 +858,10 @@ pub fn emit_cpasync_swizzle(ptx: &mut PtxBuilder, tid: Reg) -> (Reg, Reg) {
 /// Returns (ga0, ga1, a_tid_row, a_tid_col).
 pub fn emit_a_global_addrs(
     ptx: &mut PtxBuilder,
-    block_row: Reg, k_param: Reg, a_ptr: Reg, tid: Reg,
+    block_row: Reg,
+    k_param: Reg,
+    a_ptr: Reg,
+    tid: Reg,
 ) -> (Reg, Reg, Reg, Reg) {
     ptx.comment("Global addresses for A");
     let a_tid_and3 = ptx.regs.alloc_b32();
@@ -816,7 +896,10 @@ pub fn emit_a_global_addrs(
 /// Returns (gb0, gb1).
 pub fn emit_b_global_addrs(
     ptx: &mut PtxBuilder,
-    block_col: Reg, n_param: Reg, b_ptr: Reg, tid: Reg,
+    block_col: Reg,
+    n_param: Reg,
+    b_ptr: Reg,
+    tid: Reg,
 ) -> (Reg, Reg) {
     ptx.comment("Global addresses for B");
     let b_tid_and7 = ptx.regs.alloc_b32();
@@ -883,23 +966,17 @@ pub fn build_gemm(config: &GemmConfig) -> String {
     let (a_cp_off, b_cp_off) = emit_cpasync_swizzle(&mut ptx, setup.tid);
 
     // Phase 4: Global addresses
-    let (ga0, ga1, _a_tid_row, _a_tid_col) = emit_a_global_addrs(
-        &mut ptx, setup.block_row, k_param, a_ptr, setup.tid,
-    );
-    let (gb0, gb1) = emit_b_global_addrs(
-        &mut ptx, setup.block_col, n_param, b_ptr, setup.tid,
-    );
+    let (ga0, ga1, _a_tid_row, _a_tid_col) =
+        emit_a_global_addrs(&mut ptx, setup.block_row, k_param, a_ptr, setup.tid);
+    let (gb0, gb1) = emit_b_global_addrs(&mut ptx, setup.block_col, n_param, b_ptr, setup.tid);
 
     // Phase 5-13: K-loop with CpAsyncLoader for both A and B
     let a_loader = CpAsyncLoader;
     let b_loader = CpAsyncLoader;
 
     let acc = emit_gemm_with_loaders(
-        &mut ptx, c, &setup,
-        &a_loader, ga0, ga1, a_cp_off,
-        &b_loader, gb0, gb1, b_cp_off,
-        n_param, k_param,
-        None, // no extra advance
+        &mut ptx, c, &setup, &a_loader, ga0, ga1, a_cp_off, &b_loader, gb0, gb1, b_cp_off, n_param,
+        k_param, None, // no extra advance
     );
 
     // Phase 14: Store C

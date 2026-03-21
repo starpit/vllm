@@ -5,16 +5,16 @@ use anyhow::{Context, Result, bail};
 use std::ffi::{CString, c_uint, c_void};
 use std::time::Instant;
 
-use inkwell::context::Context as LlvmContext;
 use inkwell::builder::Builder;
+use inkwell::context::Context as LlvmContext;
 use inkwell::module::Module;
-use inkwell::targets::{TargetTriple, FileType};
+use inkwell::targets::{FileType, TargetTriple};
 use inkwell::types::AsTypeRef;
-use inkwell::values::{AsValueRef, IntValue, FloatValue};
+use inkwell::values::{AsValueRef, FloatValue, IntValue};
 use inkwell::{AddressSpace, IntPredicate};
 
+use crate::{add_nvvm_kernel_metadata, call_barrier0, call_sreg, create_nvptx_target_machine};
 use cudarc::driver::result as cuda;
-use crate::{create_nvptx_target_machine, add_nvvm_kernel_metadata, call_sreg, call_barrier0};
 
 // 64×64 BK=32, 1×4 warp layout
 const BM: u32 = 64;
@@ -43,7 +43,6 @@ pub fn run(sm: &str) -> Result<()> {
 }
 
 fn run_size(sm: &str, m: u32, n: u32, k: u32) -> Result<()> {
-
     let ptx = emit_ptx(sm)?;
     println!("  [llvm] Generated {} bytes of PTX", ptx.len());
 
@@ -54,14 +53,19 @@ fn run_size(sm: &str, m: u32, n: u32, k: u32) -> Result<()> {
 
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
-    let func = unsafe {
-        cuda::module::get_function(module, CString::new("triton_style_gemm").unwrap())?
-    };
+    let func =
+        unsafe { cuda::module::get_function(module, CString::new("triton_style_gemm").unwrap())? };
     // Query actual register usage
     use cudarc::driver::sys::CUfunction_attribute as FA;
-    let nregs = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
-    let local_bytes = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)? };
-    println!("  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)", nregs, local_bytes);
+    let nregs =
+        unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let local_bytes = unsafe {
+        cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?
+    };
+    println!(
+        "  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)",
+        nregs, local_bytes
+    );
 
     let sa = (m * k) as usize;
     let sb = (k * n) as usize;
@@ -70,75 +74,134 @@ fn run_size(sm: &str, m: u32, n: u32, k: u32) -> Result<()> {
     let db = unsafe { cuda::malloc_sync(sb * 2)? };
     let dc = unsafe { cuda::malloc_sync(sc * 4)? };
 
-    let ha: Vec<half::f16> = (0..sa).map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1)).collect();
-    let hb: Vec<half::f16> = (0..sb).map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1)).collect();
+    let ha: Vec<half::f16> = (0..sa)
+        .map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1))
+        .collect();
+    let hb: Vec<half::f16> = (0..sb)
+        .map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1))
+        .collect();
     let mut hc: Vec<f32> = vec![0.0; sc];
-    unsafe { cuda::memcpy_htod_sync(da, &ha)?; cuda::memcpy_htod_sync(db, &hb)?; }
+    unsafe {
+        cuda::memcpy_htod_sync(da, &ha)?;
+        cuda::memcpy_htod_sync(db, &hb)?;
+    }
 
     let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
     let smem_bytes: c_uint = (BM * BK + BK * BN) * 2 * 2; // double-buffered
     let gx = n / BN;
     let gy = m / BM;
     let params: &mut [*mut c_void] = &mut [
-        (&da) as *const _ as *mut c_void, (&db) as *const _ as *mut c_void,
-        (&dc) as *const _ as *mut c_void, (&m) as *const _ as *mut c_void,
-        (&n) as *const _ as *mut c_void, (&k) as *const _ as *mut c_void,
+        (&da) as *const _ as *mut c_void,
+        (&db) as *const _ as *mut c_void,
+        (&dc) as *const _ as *mut c_void,
+        (&m) as *const _ as *mut c_void,
+        (&n) as *const _ as *mut c_void,
+        (&k) as *const _ as *mut c_void,
     ];
 
     for _ in 0..10 {
-        unsafe { cuda::launch_kernel(func, (gx, gy, 1), (THREADS, 1, 1), smem_bytes, stream, params)?; }
+        unsafe {
+            cuda::launch_kernel(
+                func,
+                (gx, gy, 1),
+                (THREADS, 1, 1),
+                smem_bytes,
+                stream,
+                params,
+            )?;
+        }
     }
-    unsafe { cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::stream::synchronize(stream)?;
+    }
 
     let iters = 100;
     let start = Instant::now();
     for _ in 0..iters {
-        unsafe { cuda::launch_kernel(func, (gx, gy, 1), (THREADS, 1, 1), smem_bytes, stream, params)?; }
+        unsafe {
+            cuda::launch_kernel(
+                func,
+                (gx, gy, 1),
+                (THREADS, 1, 1),
+                smem_bytes,
+                stream,
+                params,
+            )?;
+        }
     }
-    unsafe { cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::stream::synchronize(stream)?;
+    }
     let us = start.elapsed().as_micros() as f64 / iters as f64;
 
-    unsafe { cuda::memcpy_dtoh_sync(&mut hc, dc)?; }
+    unsafe {
+        cuda::memcpy_dtoh_sync(&mut hc, dc)?;
+    }
     let mut max_err: f32 = 0.0;
-    for r in [0,1,31,32,63,511,1023] {
-        for c in [0,1,31,32,63,511,1023] {
-            if r >= m as usize || c >= n as usize { continue; }
+    for r in [0, 1, 31, 32, 63, 511, 1023] {
+        for c in [0, 1, 31, 32, 63, 511, 1023] {
+            if r >= m as usize || c >= n as usize {
+                continue;
+            }
             let mut e = 0.0f32;
-            for kk in 0..k as usize { e += ha[r*k as usize+kk].to_f32() * hb[kk*n as usize+c].to_f32(); }
+            for kk in 0..k as usize {
+                e += ha[r * k as usize + kk].to_f32() * hb[kk * n as usize + c].to_f32();
+            }
             let err = (hc[r * n as usize + c] - e).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
         }
     }
 
-    if max_err < 1.0 { println!("  ✓ Correct (max err: {:.4})", max_err); }
-    else { bail!("  ✗ Max error: {:.4}", max_err); }
+    if max_err < 1.0 {
+        println!("  ✓ Correct (max err: {:.4})", max_err);
+    } else {
+        bail!("  ✗ Max error: {:.4}", max_err);
+    }
 
     let tf = 2.0 * m as f64 * n as f64 * k as f64 / (us * 1e-6) / 1e12;
-    println!("  {:.1} μs, {:.1} TFLOPS ({:.1}% of cuBLAS 162)", us, tf, tf / 162.0 * 100.0);
+    println!(
+        "  {:.1} μs, {:.1} TFLOPS ({:.1}% of cuBLAS 162)",
+        us,
+        tf,
+        tf / 162.0 * 100.0
+    );
 
     unsafe {
         cuda::stream::destroy(stream)?;
-        cuda::free_sync(da)?; cuda::free_sync(db)?; cuda::free_sync(dc)?;
+        cuda::free_sync(da)?;
+        cuda::free_sync(db)?;
+        cuda::free_sync(dc)?;
         cuda::module::unload(module)?;
     }
     Ok(())
 }
 
 // -- Swizzle (returns byte offset, no division) --
-fn swizzle_bytes<'ctx>(b: &Builder<'ctx>, ctx: &'ctx LlvmContext, elem_idx: IntValue<'ctx>) -> IntValue<'ctx> {
+fn swizzle_bytes<'ctx>(
+    b: &Builder<'ctx>,
+    ctx: &'ctx LlvmContext,
+    elem_idx: IntValue<'ctx>,
+) -> IntValue<'ctx> {
     let ci = |v: u64| ctx.i32_type().const_int(v, false);
     // elem_idx * 2 -> byte offset, apply XOR swizzle, return bytes
     let byte = b.build_left_shift(elem_idx, ci(1), "").unwrap(); // ×2 via shift
     let masked = b.build_and(byte, ci(SWIZZLE_MASK as u64), "").unwrap();
-    let shifted = b.build_right_shift(masked, ci(SWIZZLE_SHIFT as u64), false, "").unwrap();
+    let shifted = b
+        .build_right_shift(masked, ci(SWIZZLE_SHIFT as u64), false, "")
+        .unwrap();
     b.build_xor(byte, shifted, "").unwrap() // returns byte offset
 }
 
 // -- ldmatrix.sync.aligned.m8n8.x4.shared.b16 --
 // With -nvptx-short-ptr, ptrtoint on addrspace(3) gives a 32-bit %r register.
 fn ldmatrix_x4<'ctx>(
-    b: &Builder<'ctx>, ctx: &'ctx LlvmContext, module: &Module<'ctx>,
-    smem_ptr: inkwell::values::PointerValue<'ctx>, byte_offset: IntValue<'ctx>,
+    b: &Builder<'ctx>,
+    ctx: &'ctx LlvmContext,
+    module: &Module<'ctx>,
+    smem_ptr: inkwell::values::PointerValue<'ctx>,
+    byte_offset: IntValue<'ctx>,
 ) -> [IntValue<'ctx>; 4] {
     let i32_ty = ctx.i32_type();
     unsafe {
@@ -147,7 +210,9 @@ fn ldmatrix_x4<'ctx>(
         let br = b.as_mut_ptr();
 
         // GEP to the right byte, then ptrtoint -> 32-bit with short-ptr
-        let ptr = b.build_gep(ctx.i8_type(), smem_ptr, &[byte_offset], "").unwrap();
+        let ptr = b
+            .build_gep(ctx.i8_type(), smem_ptr, &[byte_offset], "")
+            .unwrap();
         let addr = b.build_ptr_to_int(ptr, i32_ty, "").unwrap();
 
         let mut rm = [i32_ty.as_type_ref(); 4];
@@ -157,35 +222,73 @@ fn ldmatrix_x4<'ctx>(
 
         let asm_str = b"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0,$1,$2,$3}, [$4];\0";
         let con = b"=r,=r,=r,=r,r\0";
-        let av = llvm_sys::core::LLVMGetInlineAsm(ft,
-            asm_str.as_ptr() as *const _, asm_str.len() - 1,
-            con.as_ptr() as *const _, con.len() - 1,
-            1, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0);
+        let av = llvm_sys::core::LLVMGetInlineAsm(
+            ft,
+            asm_str.as_ptr() as *const _,
+            asm_str.len() - 1,
+            con.as_ptr() as *const _,
+            con.len() - 1,
+            1,
+            0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
+        );
 
         let mut args = [addr.as_value_ref()];
-        let call = llvm_sys::core::LLVMBuildCall2(br, ft, av,
-            args.as_mut_ptr(), 1, b"\0".as_ptr() as *const _);
+        let call = llvm_sys::core::LLVMBuildCall2(
+            br,
+            ft,
+            av,
+            args.as_mut_ptr(),
+            1,
+            b"\0".as_ptr() as *const _,
+        );
 
         [
-            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 0, b"\0".as_ptr() as *const _)),
-            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 1, b"\0".as_ptr() as *const _)),
-            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 2, b"\0".as_ptr() as *const _)),
-            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 3, b"\0".as_ptr() as *const _)),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                br,
+                call,
+                0,
+                b"\0".as_ptr() as *const _,
+            )),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                br,
+                call,
+                1,
+                b"\0".as_ptr() as *const _,
+            )),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                br,
+                call,
+                2,
+                b"\0".as_ptr() as *const _,
+            )),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                br,
+                call,
+                3,
+                b"\0".as_ptr() as *const _,
+            )),
         ]
     }
 }
 
 // -- ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 (for B fragments) --
 fn ldmatrix_x4_trans<'ctx>(
-    b: &Builder<'ctx>, ctx: &'ctx LlvmContext, module: &Module<'ctx>,
-    smem_ptr: inkwell::values::PointerValue<'ctx>, byte_offset: IntValue<'ctx>,
+    b: &Builder<'ctx>,
+    ctx: &'ctx LlvmContext,
+    module: &Module<'ctx>,
+    smem_ptr: inkwell::values::PointerValue<'ctx>,
+    byte_offset: IntValue<'ctx>,
 ) -> [IntValue<'ctx>; 4] {
     let i32_ty = ctx.i32_type();
     unsafe {
         let mr = module.as_mut_ptr();
         let cr = llvm_sys::core::LLVMGetModuleContext(mr);
         let br = b.as_mut_ptr();
-        let ptr = b.build_gep(ctx.i8_type(), smem_ptr, &[byte_offset], "").unwrap();
+        let ptr = b
+            .build_gep(ctx.i8_type(), smem_ptr, &[byte_offset], "")
+            .unwrap();
         let addr = b.build_ptr_to_int(ptr, i32_ty, "").unwrap();
         let mut rm = [i32_ty.as_type_ref(); 4];
         let rs = llvm_sys::core::LLVMStructTypeInContext(cr, rm.as_mut_ptr(), 4, 0);
@@ -193,18 +296,51 @@ fn ldmatrix_x4_trans<'ctx>(
         let ft = llvm_sys::core::LLVMFunctionType(rs, pt.as_mut_ptr(), 1, 0);
         let asm_str = b"ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {$0,$1,$2,$3}, [$4];\0";
         let con = b"=r,=r,=r,=r,r\0";
-        let av = llvm_sys::core::LLVMGetInlineAsm(ft,
-            asm_str.as_ptr() as *const _, asm_str.len() - 1,
-            con.as_ptr() as *const _, con.len() - 1,
-            1, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0);
+        let av = llvm_sys::core::LLVMGetInlineAsm(
+            ft,
+            asm_str.as_ptr() as *const _,
+            asm_str.len() - 1,
+            con.as_ptr() as *const _,
+            con.len() - 1,
+            1,
+            0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
+        );
         let mut args = [addr.as_value_ref()];
-        let call = llvm_sys::core::LLVMBuildCall2(br, ft, av,
-            args.as_mut_ptr(), 1, b"\0".as_ptr() as *const _);
+        let call = llvm_sys::core::LLVMBuildCall2(
+            br,
+            ft,
+            av,
+            args.as_mut_ptr(),
+            1,
+            b"\0".as_ptr() as *const _,
+        );
         [
-            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 0, b"\0".as_ptr() as *const _)),
-            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 1, b"\0".as_ptr() as *const _)),
-            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 2, b"\0".as_ptr() as *const _)),
-            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(br, call, 3, b"\0".as_ptr() as *const _)),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                br,
+                call,
+                0,
+                b"\0".as_ptr() as *const _,
+            )),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                br,
+                call,
+                1,
+                b"\0".as_ptr() as *const _,
+            )),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                br,
+                call,
+                2,
+                b"\0".as_ptr() as *const _,
+            )),
+            IntValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                br,
+                call,
+                3,
+                b"\0".as_ptr() as *const _,
+            )),
         ]
     }
 }
@@ -212,8 +348,11 @@ fn ldmatrix_x4_trans<'ctx>(
 // -- cp.async with predicated src-size (4th operand) --
 // src_size = 16 to copy, 0 for noop (fills shared with zeros)
 fn cp_async_16_pred<'ctx>(
-    b: &Builder<'ctx>, ctx: &'ctx LlvmContext, module: &Module<'ctx>,
-    dst: inkwell::values::PointerValue<'ctx>, src: inkwell::values::PointerValue<'ctx>,
+    b: &Builder<'ctx>,
+    ctx: &'ctx LlvmContext,
+    module: &Module<'ctx>,
+    dst: inkwell::values::PointerValue<'ctx>,
+    src: inkwell::values::PointerValue<'ctx>,
     src_size: IntValue<'ctx>,
 ) {
     let i32_ty = ctx.i32_type();
@@ -223,17 +362,40 @@ fn cp_async_16_pred<'ctx>(
         let cr = llvm_sys::core::LLVMGetModuleContext(mr);
         let br = b.as_mut_ptr();
         let vt = llvm_sys::core::LLVMVoidTypeInContext(cr);
-        let mut pt = [i32_ty.as_type_ref(), i64_ty.as_type_ref(), i32_ty.as_type_ref()];
+        let mut pt = [
+            i32_ty.as_type_ref(),
+            i64_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+        ];
         let ft = llvm_sys::core::LLVMFunctionType(vt, pt.as_mut_ptr(), 3, 0);
         let di = b.build_ptr_to_int(dst, i32_ty, "").unwrap();
         let si = b.build_ptr_to_int(src, i64_ty, "").unwrap();
         let s = b"cp.async.cg.shared.global [$0], [$1], 16, $2;\0";
         let c = b"r,l,r\0";
-        let av = llvm_sys::core::LLVMGetInlineAsm(ft,
-            s.as_ptr() as *const _, s.len()-1, c.as_ptr() as *const _, c.len()-1,
-            1, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0);
-        let mut args = [di.as_value_ref(), si.as_value_ref(), src_size.as_value_ref()];
-        llvm_sys::core::LLVMBuildCall2(br, ft, av, args.as_mut_ptr(), 3, b"\0".as_ptr() as *const _);
+        let av = llvm_sys::core::LLVMGetInlineAsm(
+            ft,
+            s.as_ptr() as *const _,
+            s.len() - 1,
+            c.as_ptr() as *const _,
+            c.len() - 1,
+            1,
+            0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
+        );
+        let mut args = [
+            di.as_value_ref(),
+            si.as_value_ref(),
+            src_size.as_value_ref(),
+        ];
+        llvm_sys::core::LLVMBuildCall2(
+            br,
+            ft,
+            av,
+            args.as_mut_ptr(),
+            3,
+            b"\0".as_ptr() as *const _,
+        );
     }
 }
 
@@ -245,14 +407,34 @@ fn cp_async_commit<'ctx>(b: &Builder<'ctx>, _ctx: &'ctx LlvmContext, module: &Mo
         let ft = llvm_sys::core::LLVMFunctionType(vt, std::ptr::null_mut(), 0, 0);
         let s = b"cp.async.commit_group;\0";
         let e = b"\0";
-        let av = llvm_sys::core::LLVMGetInlineAsm(ft,
-            s.as_ptr() as *const _, s.len()-1, e.as_ptr() as *const _, e.len()-1,
-            1, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0);
-        llvm_sys::core::LLVMBuildCall2(br, ft, av, std::ptr::null_mut(), 0, b"\0".as_ptr() as *const _);
+        let av = llvm_sys::core::LLVMGetInlineAsm(
+            ft,
+            s.as_ptr() as *const _,
+            s.len() - 1,
+            e.as_ptr() as *const _,
+            e.len() - 1,
+            1,
+            0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
+        );
+        llvm_sys::core::LLVMBuildCall2(
+            br,
+            ft,
+            av,
+            std::ptr::null_mut(),
+            0,
+            b"\0".as_ptr() as *const _,
+        );
     }
 }
 
-fn cp_async_wait_group<'ctx>(b: &Builder<'ctx>, _ctx: &'ctx LlvmContext, module: &Module<'ctx>, n: u32) {
+fn cp_async_wait_group<'ctx>(
+    b: &Builder<'ctx>,
+    _ctx: &'ctx LlvmContext,
+    module: &Module<'ctx>,
+    n: u32,
+) {
     unsafe {
         let cr = llvm_sys::core::LLVMGetModuleContext(module.as_mut_ptr());
         let br = b.as_mut_ptr();
@@ -260,16 +442,35 @@ fn cp_async_wait_group<'ctx>(b: &Builder<'ctx>, _ctx: &'ctx LlvmContext, module:
         let ft = llvm_sys::core::LLVMFunctionType(vt, std::ptr::null_mut(), 0, 0);
         let s = format!("cp.async.wait_group {};\0", n);
         let e = b"\0";
-        let av = llvm_sys::core::LLVMGetInlineAsm(ft,
-            s.as_ptr() as *const _, s.len()-1, e.as_ptr() as *const _, e.len()-1,
-            1, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0);
-        llvm_sys::core::LLVMBuildCall2(br, ft, av, std::ptr::null_mut(), 0, b"\0".as_ptr() as *const _);
+        let av = llvm_sys::core::LLVMGetInlineAsm(
+            ft,
+            s.as_ptr() as *const _,
+            s.len() - 1,
+            e.as_ptr() as *const _,
+            e.len() - 1,
+            1,
+            0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
+        );
+        llvm_sys::core::LLVMBuildCall2(
+            br,
+            ft,
+            av,
+            std::ptr::null_mut(),
+            0,
+            b"\0".as_ptr() as *const _,
+        );
     }
 }
 
 fn mma_sync<'ctx>(
-    b: &Builder<'ctx>, ctx: &'ctx LlvmContext, module: &Module<'ctx>,
-    a: &[IntValue<'ctx>; 4], br_: &[IntValue<'ctx>; 2], c: &[FloatValue<'ctx>; 4],
+    b: &Builder<'ctx>,
+    ctx: &'ctx LlvmContext,
+    module: &Module<'ctx>,
+    a: &[IntValue<'ctx>; 4],
+    br_: &[IntValue<'ctx>; 2],
+    c: &[FloatValue<'ctx>; 4],
 ) -> [FloatValue<'ctx>; 4] {
     let i32_ty = ctx.i32_type();
     let f32_ty = ctx.f32_type();
@@ -279,24 +480,79 @@ fn mma_sync<'ctx>(
         let bref = b.as_mut_ptr();
         let mut rm = [f32_ty.as_type_ref(); 4];
         let rs = llvm_sys::core::LLVMStructTypeInContext(cr, rm.as_mut_ptr(), 4, 0);
-        let mut pt = [i32_ty.as_type_ref(),i32_ty.as_type_ref(),i32_ty.as_type_ref(),i32_ty.as_type_ref(),
-            i32_ty.as_type_ref(),i32_ty.as_type_ref(),
-            f32_ty.as_type_ref(),f32_ty.as_type_ref(),f32_ty.as_type_ref(),f32_ty.as_type_ref()];
+        let mut pt = [
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            i32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+            f32_ty.as_type_ref(),
+        ];
         let ft = llvm_sys::core::LLVMFunctionType(rs, pt.as_mut_ptr(), 10, 0);
         let s = b"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13};\0";
         let con = b"=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f\0";
-        let av = llvm_sys::core::LLVMGetInlineAsm(ft,
-            s.as_ptr() as *const _, s.len()-1, con.as_ptr() as *const _, con.len()-1,
-            1, 0, llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT, 0);
-        let mut args = [a[0].as_value_ref(),a[1].as_value_ref(),a[2].as_value_ref(),a[3].as_value_ref(),
-            br_[0].as_value_ref(),br_[1].as_value_ref(),
-            c[0].as_value_ref(),c[1].as_value_ref(),c[2].as_value_ref(),c[3].as_value_ref()];
-        let call = llvm_sys::core::LLVMBuildCall2(bref, ft, av, args.as_mut_ptr(), 10, b"\0".as_ptr() as *const _);
+        let av = llvm_sys::core::LLVMGetInlineAsm(
+            ft,
+            s.as_ptr() as *const _,
+            s.len() - 1,
+            con.as_ptr() as *const _,
+            con.len() - 1,
+            1,
+            0,
+            llvm_sys::LLVMInlineAsmDialect::LLVMInlineAsmDialectATT,
+            0,
+        );
+        let mut args = [
+            a[0].as_value_ref(),
+            a[1].as_value_ref(),
+            a[2].as_value_ref(),
+            a[3].as_value_ref(),
+            br_[0].as_value_ref(),
+            br_[1].as_value_ref(),
+            c[0].as_value_ref(),
+            c[1].as_value_ref(),
+            c[2].as_value_ref(),
+            c[3].as_value_ref(),
+        ];
+        let call = llvm_sys::core::LLVMBuildCall2(
+            bref,
+            ft,
+            av,
+            args.as_mut_ptr(),
+            10,
+            b"\0".as_ptr() as *const _,
+        );
         let n = |s: &[u8]| s.as_ptr() as *const _;
-        [FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(bref, call, 0, n(b"\0"))),
-         FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(bref, call, 1, n(b"\0"))),
-         FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(bref, call, 2, n(b"\0"))),
-         FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(bref, call, 3, n(b"\0")))]
+        [
+            FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                bref,
+                call,
+                0,
+                n(b"\0"),
+            )),
+            FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                bref,
+                call,
+                1,
+                n(b"\0"),
+            )),
+            FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                bref,
+                call,
+                2,
+                n(b"\0"),
+            )),
+            FloatValue::new(llvm_sys::core::LLVMBuildExtractValue(
+                bref,
+                call,
+                3,
+                n(b"\0"),
+            )),
+        ]
     }
 }
 
@@ -333,7 +589,8 @@ fn emit_ptx_handwritten() -> String {
     //
     // mma: 16 per K-iter (2 A-halves * 4 B-columns), 32 total for BK=32
 
-    format!(r#"
+    format!(
+        r#"
 .version 8.7
 .target sm_89
 .address_size 64
@@ -1083,5 +1340,6 @@ $L_EPILOGUE:
 
     ret;
 }}
-"#)
+"#
+    )
 }

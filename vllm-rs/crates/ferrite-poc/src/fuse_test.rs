@@ -45,12 +45,18 @@ fn test_ptx_generation() {
     let ptx = ferrite_ptx::fused::build_fused_rmsnorm_gemm_silu(&config, 4096);
 
     assert!(!ptx.is_empty(), "PTX must be non-empty");
-    assert!(ptx.contains(".visible .entry fused_rmsnorm_gemm_silu("),
-        "PTX must contain kernel entry point");
+    assert!(
+        ptx.contains(".visible .entry fused_rmsnorm_gemm_silu("),
+        "PTX must contain kernel entry point"
+    );
 
     // Verify single kernel
     let entry_count = ptx.matches(".visible .entry").count();
-    assert_eq!(entry_count, 1, "Must be exactly ONE kernel, got {}", entry_count);
+    assert_eq!(
+        entry_count, 1,
+        "Must be exactly ONE kernel, got {}",
+        entry_count
+    );
 
     // Verify all four phases are present
     assert!(ptx.contains("RMSNorm"), "Must have RMSNorm phase");
@@ -58,7 +64,11 @@ fn test_ptx_generation() {
     assert!(ptx.contains("SiLU"), "Must have SiLU phase");
     assert!(ptx.contains("st.global"), "Must have store phase");
 
-    println!("  PTX size: {} bytes, {} lines", ptx.len(), ptx.lines().count());
+    println!(
+        "  PTX size: {} bytes, {} lines",
+        ptx.len(),
+        ptx.lines().count()
+    );
     println!("  PASS: Single kernel with all four phases");
 }
 
@@ -99,11 +109,13 @@ fn test_gpu_execution() {
         let maj = cuda::device::get_attribute(
             device,
             cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-        ).unwrap_or(0);
+        )
+        .unwrap_or(0);
         let min = cuda::device::get_attribute(
             device,
             cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-        ).unwrap_or(0);
+        )
+        .unwrap_or(0);
         (maj, min)
     };
     println!("  GPU compute capability: {}.{}", major, _minor);
@@ -189,17 +201,27 @@ fn test_gpu_execution() {
             max_err = err;
         }
         if i < 4 {
-            println!("  output[{}] = {:.6} (expected ~{:.4})", i, val, expected_silu);
+            println!(
+                "  output[{}] = {:.6} (expected ~{:.4})",
+                i, val, expected_silu
+            );
         }
     }
 
-    println!("  Non-zero outputs: {}/{}", nonzero_count, host_output.len());
+    println!(
+        "  Non-zero outputs: {}/{}",
+        nonzero_count,
+        host_output.len()
+    );
     println!("  Max error: {:.6}", max_err);
 
     if max_err < tolerance {
         println!("  PASS: Results within tolerance ({:.4})", tolerance);
     } else {
-        println!("  WARNING: Max error {:.6} exceeds tolerance {:.4}", max_err, tolerance);
+        println!(
+            "  WARNING: Max error {:.6} exceeds tolerance {:.4}",
+            max_err, tolerance
+        );
         println!("  (This may be expected with f16 precision and approx math)");
     }
 

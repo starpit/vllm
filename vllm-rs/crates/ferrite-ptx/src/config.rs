@@ -16,9 +16,14 @@ pub struct GemmConfig {
 impl GemmConfig {
     pub fn default_64x64() -> Self {
         Self {
-            bm: 64, bn: 64, bk: 32,
-            wm: 64, wn: 16,
-            mma_m: 16, mma_n: 8, mma_k: 16,
+            bm: 64,
+            bn: 64,
+            bk: 32,
+            wm: 64,
+            wn: 16,
+            mma_m: 16,
+            mma_n: 8,
+            mma_k: 16,
             num_stages: 2,
             sm_arch: "sm_89".into(),
         }
@@ -26,26 +31,55 @@ impl GemmConfig {
 
     pub fn default_128x128() -> Self {
         Self {
-            bm: 128, bn: 128, bk: 32,
-            wm: 64, wn: 64,  // 2×2 warp layout
-            mma_m: 16, mma_n: 8, mma_k: 16,
+            bm: 128,
+            bn: 128,
+            bk: 32,
+            wm: 64,
+            wn: 64, // 2×2 warp layout
+            mma_m: 16,
+            mma_n: 8,
+            mma_k: 16,
             num_stages: 2,
             sm_arch: "sm_89".into(),
         }
     }
 
-    pub fn reg_m(&self) -> u32 { self.wm / self.mma_m }
-    pub fn reg_n(&self) -> u32 { self.wn / self.mma_n }
-    pub fn k_iters(&self) -> u32 { self.bk / self.mma_k }
-    pub fn warps_m(&self) -> u32 { self.bm / self.wm }
-    pub fn warps_n(&self) -> u32 { self.bn / self.wn }
-    pub fn warps(&self) -> u32 { self.warps_m() * self.warps_n() }
-    pub fn threads(&self) -> u32 { self.warps() * 32 }
-    pub fn num_acc(&self) -> u32 { self.reg_m() * self.reg_n() * 4 }
-    pub fn smem_a_bytes(&self) -> u32 { self.bm * self.bk * 2 }
-    pub fn smem_b_bytes(&self) -> u32 { self.bk * self.bn * 2 }
-    pub fn buf_stride(&self) -> u32 { self.smem_a_bytes() + self.smem_b_bytes() }
-    pub fn smem_total(&self) -> u32 { self.buf_stride() * self.num_stages }
+    pub fn reg_m(&self) -> u32 {
+        self.wm / self.mma_m
+    }
+    pub fn reg_n(&self) -> u32 {
+        self.wn / self.mma_n
+    }
+    pub fn k_iters(&self) -> u32 {
+        self.bk / self.mma_k
+    }
+    pub fn warps_m(&self) -> u32 {
+        self.bm / self.wm
+    }
+    pub fn warps_n(&self) -> u32 {
+        self.bn / self.wn
+    }
+    pub fn warps(&self) -> u32 {
+        self.warps_m() * self.warps_n()
+    }
+    pub fn threads(&self) -> u32 {
+        self.warps() * 32
+    }
+    pub fn num_acc(&self) -> u32 {
+        self.reg_m() * self.reg_n() * 4
+    }
+    pub fn smem_a_bytes(&self) -> u32 {
+        self.bm * self.bk * 2
+    }
+    pub fn smem_b_bytes(&self) -> u32 {
+        self.bk * self.bn * 2
+    }
+    pub fn buf_stride(&self) -> u32 {
+        self.smem_a_bytes() + self.smem_b_bytes()
+    }
+    pub fn smem_total(&self) -> u32 {
+        self.buf_stride() * self.num_stages
+    }
 
     /// Number of cp.async 16-byte chunks needed to load one A tile
     pub fn cp_chunks_a(&self) -> u32 {
@@ -62,7 +96,7 @@ impl GemmConfig {
     /// For BN=128 (WN=64, REG_N=8): 2 groups of 4 rn each.
     pub fn b_col_groups(&self) -> u32 {
         let rn = self.reg_n();
-        (rn + 3) / 4  // ceil(reg_n / 4)
+        (rn + 3) / 4 // ceil(reg_n / 4)
     }
 
     /// Byte stride between B column groups in ldmatrix.trans addressing.

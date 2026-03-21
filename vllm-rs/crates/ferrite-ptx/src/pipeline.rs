@@ -1,7 +1,7 @@
-use crate::{PtxBuilder, Reg};
+use crate::atoms::{CopyAtom, MmaAtom, TransformAtom};
 use crate::config::GemmConfig;
-use crate::atoms::{CopyAtom, TransformAtom, MmaAtom};
-use crate::gemm::{GemmSetup, AccumulatorMap};
+use crate::gemm::{AccumulatorMap, GemmSetup};
+use crate::{PtxBuilder, Reg};
 
 // REG_M and REG_N are now derived from the GemmConfig:
 //   REG_M = config.reg_m() = wm / mma_m
@@ -93,33 +93,45 @@ impl MainloopPipeline {
         let stages = self.stages;
 
         // kWarpGemmIterations = BK / MMA_K
-        let k_warp_iters = c.bk / c.mma_k;  // e.g. 32/16=2 or 64/16=4
+        let k_warp_iters = c.bk / c.mma_k; // e.g. 32/16=2 or 64/16=4
         assert!(k_warp_iters >= 2, "kWarpGemmIterations must be >= 2");
 
-        let a_tile_bytes = c.smem_a_bytes();     // BM*BK*2 (4096 for BK=32, 8192 for BK=64)
-        let b_tile_bytes = c.smem_b_bytes();     // BK*BN*2 (4096 for BK=32, 8192 for BK=64)
-        let b_start = (a_tile_bytes * stages) as i32;  // B region starts after all A stages
+        let a_tile_bytes = c.smem_a_bytes(); // BM*BK*2 (4096 for BK=32, 8192 for BK=64)
+        let b_tile_bytes = c.smem_b_bytes(); // BK*BN*2 (4096 for BK=32, 8192 for BK=64)
+        let b_start = (a_tile_bytes * stages) as i32; // B region starts after all A stages
         // The buffer indexing assumes a_tile_bytes == b_tile_bytes (BM == BN).
         // This is true for all our configs (BM=BN=64) but we assert it.
-        assert_eq!(a_tile_bytes, b_tile_bytes,
-            "Pipeline assumes a_tile_bytes == b_tile_bytes (BM*BK == BK*BN => BM == BN)");
+        assert_eq!(
+            a_tile_bytes, b_tile_bytes,
+            "Pipeline assumes a_tile_bytes == b_tile_bytes (BM*BK == BK*BN => BM == BN)"
+        );
 
         // Number of 2048-byte cp.async chunks per tile.
         // Each cp.async = 128 threads * 16 bytes = 2048 bytes.
-        let cp_chunks_a = a_tile_bytes / 2048;   // 2 for BK=32, 4 for BK=64
-        let cp_chunks_b = b_tile_bytes / 2048;   // 2 for BK=32, 4 for BK=64
+        let cp_chunks_a = a_tile_bytes / 2048; // 2 for BK=32, 4 for BK=64
+        let cp_chunks_b = b_tile_bytes / 2048; // 2 for BK=32, 4 for BK=64
 
         // Number of ldmatrix.x4.trans groups for B per tile.
         // Each ldmatrix.x4.trans covers 32 K-rows (giving 4 regs = 2 ki values).
-        let b_ld_groups = k_warp_iters / 2;  // 1 for BK=32, 2 for BK=64
+        let b_ld_groups = k_warp_iters / 2; // 1 for BK=32, 2 for BK=64
 
         let tid_x16 = ptx.regs.alloc_b32();
         ptx.shl_b32(tid_x16, tid, 4);
 
-        assert_eq!(ga_chunks.len(), cp_chunks_a as usize,
-            "Expected {} A global pointers, got {}", cp_chunks_a, ga_chunks.len());
-        assert_eq!(gb_chunks.len(), cp_chunks_b as usize,
-            "Expected {} B global pointers, got {}", cp_chunks_b, gb_chunks.len());
+        assert_eq!(
+            ga_chunks.len(),
+            cp_chunks_a as usize,
+            "Expected {} A global pointers, got {}",
+            cp_chunks_a,
+            ga_chunks.len()
+        );
+        assert_eq!(
+            gb_chunks.len(),
+            cp_chunks_b as usize,
+            "Expected {} B global pointers, got {}",
+            cp_chunks_b,
+            gb_chunks.len()
+        );
 
         // ═══════════════════════════════════════════════════════════════
         // A smem base addresses for cp.async (buffer 0, all chunks)
@@ -192,7 +204,9 @@ impl MainloopPipeline {
         }
 
         for stage in 0..stages - 1 {
-            ptx.comment(&format!("Pipeline prologue: load tile {stage} into buffer {stage}"));
+            ptx.comment(&format!(
+                "Pipeline prologue: load tile {stage} into buffer {stage}"
+            ));
 
             let p_tile = ptx.regs.alloc_pred();
             ptx.setp_gt_s32_imm(p_tile, k_param, (stage * c.bk) as i32);
@@ -361,7 +375,12 @@ impl MainloopPipeline {
         // ═══════════════════════════════════════════════════════════════
         // Initialize accumulators
         // ═══════════════════════════════════════════════════════════════
-        ptx.comment(&format!("Initialize accumulators to 0.0f (REG_M={}, REG_N={}, {} tiles)", reg_m, reg_n, reg_m * reg_n));
+        ptx.comment(&format!(
+            "Initialize accumulators to 0.0f (REG_M={}, REG_N={}, {} tiles)",
+            reg_m,
+            reg_n,
+            reg_m * reg_n
+        ));
         let zero = ptx.regs.alloc_b32();
         ptx.mov_b32_imm(zero, 0x00000000);
 
@@ -369,8 +388,10 @@ impl MainloopPipeline {
         let mut acc_regs: Vec<[Reg; 4]> = Vec::with_capacity(num_tiles);
         for _ in 0..num_tiles {
             let tile = [
-                ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
             ];
             for &r in &tile {
                 ptx.mov_b32(r, zero);
@@ -415,12 +436,12 @@ impl MainloopPipeline {
         // This matches the hand-written PTX pattern where a fixed set of
         // registers is reused across iterations.
         // ═══════════════════════════════════════════════════════════════
-        let buf_base = ptx.regs.alloc_b32();       // read buffer base (smem)
-        let read_off = ptx.regs.alloc_b32();        // read_stage * tile_bytes
-        let write_buf_base = ptx.regs.alloc_b32();  // write buffer base (smem)
-        let write_off = ptx.regs.alloc_b32();       // write_stage * tile_bytes
-        let b_addr = ptx.regs.alloc_b32();          // reused for each B ldmatrix address
-        let a_addr = ptx.regs.alloc_b32();          // reused for each A ldmatrix address
+        let buf_base = ptx.regs.alloc_b32(); // read buffer base (smem)
+        let read_off = ptx.regs.alloc_b32(); // read_stage * tile_bytes
+        let write_buf_base = ptx.regs.alloc_b32(); // write buffer base (smem)
+        let write_off = ptx.regs.alloc_b32(); // write_stage * tile_bytes
+        let b_addr = ptx.regs.alloc_b32(); // reused for each B ldmatrix address
+        let a_addr = ptx.regs.alloc_b32(); // reused for each A ldmatrix address
 
         // Pre-allocate cp.async destination registers (one per chunk, reused each iter)
         let mut a_dst_regs: Vec<Reg> = Vec::with_capacity(cp_chunks_a as usize);
@@ -442,8 +463,12 @@ impl MainloopPipeline {
         let p_loop = ptx.regs.alloc_pred();
 
         // Pre-allocate A fragment registers (4 regs per ldmatrix, reused each ki/rm)
-        let mut a_frag = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                          ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+        let mut a_frag = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
 
         // Pre-allocate B fragment registers.
         // Each rn needs 4*b_ld_groups registers. These are all live simultaneously
@@ -483,7 +508,10 @@ impl MainloopPipeline {
         // OPTIMIZATION: reuse single b_addr register for all rn values.
         // Each b_addr computation (buf_base + b_off[rn]) produces a value
         // that is consumed immediately by ldmatrix, then dead.
-        ptx.comment(&format!("ldmatrix.trans B -- {} loads x {} groups", reg_n, b_ld_groups));
+        ptx.comment(&format!(
+            "ldmatrix.trans B -- {} loads x {} groups",
+            reg_n, b_ld_groups
+        ));
         for rn in 0..reg_n as usize {
             for grp in 0..b_ld_groups as usize {
                 ptx.add_s32(b_addr, buf_base, b_off[rn]);
@@ -492,8 +520,12 @@ impl MainloopPipeline {
                 // Group 1 is at b_start + 32*BN*2 (rows 32-63).
                 let grp_off = b_start + (grp as i32) * (32 * c.bn as i32 * 2);
                 let frag_base = grp * 4;
-                let frag = [b_frags[rn][frag_base], b_frags[rn][frag_base + 1],
-                            b_frags[rn][frag_base + 2], b_frags[rn][frag_base + 3]];
+                let frag = [
+                    b_frags[rn][frag_base],
+                    b_frags[rn][frag_base + 1],
+                    b_frags[rn][frag_base + 2],
+                    b_frags[rn][frag_base + 3],
+                ];
                 ptx.ldmatrix_x4_trans(frag, b_addr, Some(grp_off));
             }
         }
@@ -511,7 +543,11 @@ impl MainloopPipeline {
             for rm in 0..reg_m as usize {
                 // Each rm occupies a 2048-byte chunk within the A tile.
                 // rm=0 at +0, rm=1 at +2048, rm=2 at +4096, rm=3 at +6144.
-                let a_rm_off = if rm == 0 { None } else { Some((rm as i32) * 2048_i32) };
+                let a_rm_off = if rm == 0 {
+                    None
+                } else {
+                    Some((rm as i32) * 2048_i32)
+                };
                 ptx.ldmatrix_x4(a_frag, a_addr, a_rm_off);
                 transform_a.emit_transform(ptx, &mut a_frag, ki as u32, rm as u32);
 

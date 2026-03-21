@@ -1,5 +1,5 @@
-use crate::{PtxBuilder, Reg};
 use crate::config::GemmConfig;
+use crate::{PtxBuilder, Reg};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RMSNorm phase emitter — operates on registers, writes normalized values
@@ -105,7 +105,9 @@ pub fn emit_rmsnorm_phase(
     ptx.mov_f32_imm(partial_sum, 0.0);
     for &v in &f32_vals {
         // fma: partial_sum = v * v + partial_sum
-        ptx.w(&format!("fma.rn.f32 \t{partial_sum}, {v}, {v}, {partial_sum};"));
+        ptx.w(&format!(
+            "fma.rn.f32 \t{partial_sum}, {v}, {v}, {partial_sum};"
+        ));
     }
     ptx.blank();
 
@@ -157,7 +159,9 @@ pub fn emit_rmsnorm_phase(
     ptx.add_s32(warp_scratch, scratch_addr, warp_off);
 
     // Predicated store
-    ptx.w(&format!("@{p_lane0} st.shared.b32 \t[{warp_scratch}], {sum_b32};"));
+    ptx.w(&format!(
+        "@{p_lane0} st.shared.b32 \t[{warp_scratch}], {sum_b32};"
+    ));
 
     ptx.bar_sync(0);
 
@@ -171,10 +175,15 @@ pub fn emit_rmsnorm_phase(
     // Load and sum all warp contributions (unrolled)
     for w in 0..num_warps {
         let ws = ptx.regs.alloc_b32();
-        ptx.w(&format!("@{p_tid0} ld.shared.b32 \t{ws}, [{scratch_addr}+{}];", w * 4));
+        ptx.w(&format!(
+            "@{p_tid0} ld.shared.b32 \t{ws}, [{scratch_addr}+{}];",
+            w * 4
+        ));
         let ws_f32 = ptx.regs.alloc_f32();
         ptx.mov_b32_to_f32(ws_f32, ws);
-        ptx.w(&format!("@{p_tid0} add.f32 \t{total_sum}, {total_sum}, {ws_f32};"));
+        ptx.w(&format!(
+            "@{p_tid0} add.f32 \t{total_sum}, {total_sum}, {ws_f32};"
+        ));
     }
 
     // Compute mean = total_sum / hidden_size
@@ -192,17 +201,23 @@ pub fn emit_rmsnorm_phase(
 
     // rsqrt
     let scale = ptx.regs.alloc_f32();
-    ptx.w(&format!("@{p_tid0} rsqrt.approx.f32 \t{scale}, {mean_val};"));
+    ptx.w(&format!(
+        "@{p_tid0} rsqrt.approx.f32 \t{scale}, {mean_val};"
+    ));
 
     // Broadcast scale to all threads via shared memory
     let scale_b32 = ptx.regs.alloc_b32();
     ptx.mov_f32_to_b32(scale_b32, scale);
-    ptx.w(&format!("@{p_tid0} st.shared.b32 \t[{scratch_addr}], {scale_b32};"));
+    ptx.w(&format!(
+        "@{p_tid0} st.shared.b32 \t[{scratch_addr}], {scale_b32};"
+    ));
     ptx.bar_sync(0);
 
     // All threads read the scale
     let scale_shared = ptx.regs.alloc_b32();
-    ptx.w(&format!("ld.shared.b32 \t{scale_shared}, [{scratch_addr}];"));
+    ptx.w(&format!(
+        "ld.shared.b32 \t{scale_shared}, [{scratch_addr}];"
+    ));
     let scale_all = ptx.regs.alloc_f32();
     ptx.mov_b32_to_f32(scale_all, scale_shared);
     ptx.blank();
@@ -264,7 +279,10 @@ pub fn emit_rmsnorm_phase(
         ptx.or_b32(packed, h0, h1_shifted);
 
         // Store to shared memory
-        ptx.w(&format!("st.shared.b32 \t[{smem_out_addr}+{}], {packed};", i * 4));
+        ptx.w(&format!(
+            "st.shared.b32 \t[{smem_out_addr}+{}], {packed};",
+            i * 4
+        ));
     }
     ptx.blank();
     ptx.bar_sync(0);
@@ -288,21 +306,34 @@ pub fn emit_rmsnorm_phase(
 pub fn build_rmsnorm_kernel(block_size: u32, hidden_size: u32) -> String {
     let num_warps = block_size / 32;
     let elems_per_thread = hidden_size / block_size;
-    assert!(hidden_size % block_size == 0, "hidden_size must be divisible by block_size");
-    assert!(elems_per_thread % 2 == 0, "elems_per_thread must be even for f16 pair loading");
+    assert!(
+        hidden_size % block_size == 0,
+        "hidden_size must be divisible by block_size"
+    );
+    assert!(
+        elems_per_thread % 2 == 0,
+        "elems_per_thread must be even for f16 pair loading"
+    );
 
     let config = GemmConfig {
-        bm: num_warps * 32, bn: 32, bk: 1,
-        wm: 32, wn: 32,
-        mma_m: 16, mma_n: 8, mma_k: 16,
+        bm: num_warps * 32,
+        bn: 32,
+        bk: 1,
+        wm: 32,
+        wn: 32,
+        mma_m: 16,
+        mma_n: 8,
+        mma_k: 16,
         num_stages: 1,
         sm_arch: "sm_89".into(),
     };
     let mut ptx = PtxBuilder::new(config);
 
     ptx.comment("Standalone RMSNorm kernel for benchmarking");
-    ptx.comment(&format!("block_size={}, hidden_size={}, elems_per_thread={}",
-                          block_size, hidden_size, elems_per_thread));
+    ptx.comment(&format!(
+        "block_size={}, hidden_size={}, elems_per_thread={}",
+        block_size, hidden_size, elems_per_thread
+    ));
     ptx.blank();
 
     // ── Load parameters ──
@@ -387,7 +418,9 @@ pub fn build_rmsnorm_kernel(block_size: u32, hidden_size: u32) -> String {
     let partial_sum = ptx.regs.alloc_f32();
     ptx.mov_f32_imm(partial_sum, 0.0);
     for &v in &f32_vals {
-        ptx.w(&format!("fma.rn.f32 \t{partial_sum}, {v}, {v}, {partial_sum};"));
+        ptx.w(&format!(
+            "fma.rn.f32 \t{partial_sum}, {v}, {v}, {partial_sum};"
+        ));
     }
     ptx.blank();
 
@@ -422,7 +455,9 @@ pub fn build_rmsnorm_kernel(block_size: u32, hidden_size: u32) -> String {
     ptx.shl_b32(warp_off, warp_id, 2);
     ptx.add_s32(warp_scratch, smem_base, warp_off);
 
-    ptx.w(&format!("@{p_lane0} st.shared.b32 \t[{warp_scratch}], {sum_b32};"));
+    ptx.w(&format!(
+        "@{p_lane0} st.shared.b32 \t[{warp_scratch}], {sum_b32};"
+    ));
     ptx.bar_sync(0);
 
     // All threads in the first warp read and reduce
@@ -436,10 +471,15 @@ pub fn build_rmsnorm_kernel(block_size: u32, hidden_size: u32) -> String {
 
     for w in 0..num_warps {
         let ws = ptx.regs.alloc_b32();
-        ptx.w(&format!("@{p_tid0} ld.shared.b32 \t{ws}, [{smem_base}+{}];", w * 4));
+        ptx.w(&format!(
+            "@{p_tid0} ld.shared.b32 \t{ws}, [{smem_base}+{}];",
+            w * 4
+        ));
         let ws_f32 = ptx.regs.alloc_f32();
         ptx.mov_b32_to_f32(ws_f32, ws);
-        ptx.w(&format!("@{p_tid0} add.f32 \t{total_sum}, {total_sum}, {ws_f32};"));
+        ptx.w(&format!(
+            "@{p_tid0} add.f32 \t{total_sum}, {total_sum}, {ws_f32};"
+        ));
     }
 
     // mean = total_sum / hidden_size
@@ -452,16 +492,22 @@ pub fn build_rmsnorm_kernel(block_size: u32, hidden_size: u32) -> String {
     // mean + eps
     let eps_f32 = ptx.regs.alloc_f32();
     ptx.mov_b32_to_f32(eps_f32, eps_param);
-    ptx.w(&format!("@{p_tid0} add.f32 \t{mean_val}, {mean_val}, {eps_f32};"));
+    ptx.w(&format!(
+        "@{p_tid0} add.f32 \t{mean_val}, {mean_val}, {eps_f32};"
+    ));
 
     // rsqrt
     let scale = ptx.regs.alloc_f32();
-    ptx.w(&format!("@{p_tid0} rsqrt.approx.f32 \t{scale}, {mean_val};"));
+    ptx.w(&format!(
+        "@{p_tid0} rsqrt.approx.f32 \t{scale}, {mean_val};"
+    ));
 
     // Broadcast scale via shared memory
     let scale_b32 = ptx.regs.alloc_b32();
     ptx.mov_f32_to_b32(scale_b32, scale);
-    ptx.w(&format!("@{p_tid0} st.shared.b32 \t[{smem_base}], {scale_b32};"));
+    ptx.w(&format!(
+        "@{p_tid0} st.shared.b32 \t[{smem_base}], {scale_b32};"
+    ));
     ptx.bar_sync(0);
 
     let scale_shared = ptx.regs.alloc_b32();

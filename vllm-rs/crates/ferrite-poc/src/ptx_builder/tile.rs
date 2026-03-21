@@ -1,5 +1,5 @@
-use super::{PtxBuilder, Reg};
 use super::config::GemmConfig;
+use super::{PtxBuilder, Reg};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TileProducer trait — abstracts how tiles arrive in shared memory.
@@ -80,8 +80,8 @@ pub struct NormProducerCtx {
 /// ld.global.v4.b32 for the weight to maximize throughput.
 pub fn emit_normalized_chunk_store(
     ptx: &mut PtxBuilder,
-    global_addr: Reg,      // .b64: global address for this chunk's 16 bytes
-    wnorm_addr: Reg,       // .b64: weight address for same K-range
+    global_addr: Reg,       // .b64: global address for this chunk's 16 bytes
+    wnorm_addr: Reg,        // .b64: weight address for same K-range
     smem_addr: Reg,         // .b32: swizzled smem destination
     row_id: Reg,            // .b32: global row index
     norm_factors_base: Reg, // .b32: base of norm factor array
@@ -103,13 +103,17 @@ pub fn emit_normalized_chunk_store(
     // Load 16 bytes from input using ld.global.v4.b32
     // Each b32 holds a pair of f16 values (4 pairs = 8 f16s = 16 bytes)
     let raw_in = [
-        ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-        ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
     ];
     // Load 16 bytes from weight
     let raw_wt = [
-        ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-        ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
     ];
 
     if let Some(pred) = predicate {
@@ -251,8 +255,10 @@ pub fn emit_norm_factor_computation(
     {
         for u in 0..unroll {
             let data = [
-                ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
             ];
             ptx.ld_global_v4_b32(data, cur_addr, (u * 16) as i32);
 
@@ -303,7 +309,9 @@ pub fn emit_norm_factor_computation(
     ptx.shl_b32(row_off, my_row, 2);
     let row_factor_addr = ptx.regs.alloc_b32();
     ptx.add_s32(row_factor_addr, norm_factors_base, row_off);
-    ptx.w(&format!("@{p_even} st.shared.b32 \t[{row_factor_addr}], {scale_b32};"));
+    ptx.w(&format!(
+        "@{p_even} st.shared.b32 \t[{row_factor_addr}], {scale_b32};"
+    ));
     ptx.bar_sync(0);
     ptx.blank();
 

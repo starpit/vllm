@@ -1,17 +1,22 @@
 pub mod config;
+pub mod fused;
+pub mod gemm;
+pub mod rmsnorm;
+pub mod silu;
 pub mod smem;
 pub mod tile;
-pub mod gemm;
-pub mod silu;
-pub mod rmsnorm;
-pub mod fused;
 
-use std::fmt::Write;
 use config::GemmConfig;
+use std::fmt::Write;
 
 /// Register class in PTX.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RegClass { Pred, B32, B64, F32 }
+pub enum RegClass {
+    Pred,
+    B32,
+    B64,
+    F32,
+}
 
 /// A typed register handle.
 #[derive(Clone, Copy, Debug)]
@@ -21,10 +26,30 @@ pub struct Reg {
 }
 
 impl Reg {
-    pub fn pred(i: u32) -> Self { Self { class: RegClass::Pred, index: i } }
-    pub fn r(i: u32) -> Self { Self { class: RegClass::B32, index: i } }
-    pub fn rd(i: u32) -> Self { Self { class: RegClass::B64, index: i } }
-    pub fn f(i: u32) -> Self { Self { class: RegClass::F32, index: i } }
+    pub fn pred(i: u32) -> Self {
+        Self {
+            class: RegClass::Pred,
+            index: i,
+        }
+    }
+    pub fn r(i: u32) -> Self {
+        Self {
+            class: RegClass::B32,
+            index: i,
+        }
+    }
+    pub fn rd(i: u32) -> Self {
+        Self {
+            class: RegClass::B64,
+            index: i,
+        }
+    }
+    pub fn f(i: u32) -> Self {
+        Self {
+            class: RegClass::F32,
+            index: i,
+        }
+    }
 }
 
 impl std::fmt::Display for Reg {
@@ -48,7 +73,12 @@ pub struct RegAllocator {
 
 impl RegAllocator {
     pub fn new() -> Self {
-        Self { pred_next: 1, b32_next: 1, b64_next: 1, f32_next: 1 }
+        Self {
+            pred_next: 1,
+            b32_next: 1,
+            b64_next: 1,
+            f32_next: 1,
+        }
     }
 
     pub fn alloc_pred(&mut self) -> Reg {
@@ -79,10 +109,18 @@ impl RegAllocator {
         r
     }
 
-    pub fn pred_count(&self) -> u32 { self.pred_next }
-    pub fn b32_count(&self) -> u32 { self.b32_next }
-    pub fn b64_count(&self) -> u32 { self.b64_next }
-    pub fn f32_count(&self) -> u32 { self.f32_next }
+    pub fn pred_count(&self) -> u32 {
+        self.pred_next
+    }
+    pub fn b32_count(&self) -> u32 {
+        self.b32_next
+    }
+    pub fn b64_count(&self) -> u32 {
+        self.b64_next
+    }
+    pub fn f32_count(&self) -> u32 {
+        self.f32_next
+    }
 }
 
 /// PTX code builder — emits instructions as formatted strings.
@@ -335,7 +373,9 @@ impl PtxBuilder {
         if offset == 0 {
             self.w(&format!("@{pred} st.shared.b32 \t[{addr}], {val};"));
         } else {
-            self.w(&format!("@{pred} st.shared.b32 \t[{addr}+{offset}], {val};"));
+            self.w(&format!(
+                "@{pred} st.shared.b32 \t[{addr}+{offset}], {val};"
+            ));
         }
     }
 
@@ -435,10 +475,7 @@ impl PtxBuilder {
         self.w(&format!(
             "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 \
              {{{}, {}, {}, {}}}, {{{}, {}, {}, {}}}, {{{}, {}}}, {{{}, {}, {}, {}}};",
-            d[0], d[1], d[2], d[3],
-            a[0], a[1], a[2], a[3],
-            b[0], b[1],
-            c[0], c[1], c[2], c[3]
+            d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], c[2], c[3]
         ));
     }
 
@@ -468,7 +505,7 @@ impl PtxBuilder {
 
     // ── Finalize ──
 
-    pub fn finalize(&self, kernel_name: &str, params: &[(& str, &str)]) -> String {
+    pub fn finalize(&self, kernel_name: &str, params: &[(&str, &str)]) -> String {
         let mut out = String::with_capacity(self.body.len() + 1024);
         writeln!(out, ".version 8.6").unwrap();
         writeln!(out, ".target {}", self.config.sm_arch).unwrap();

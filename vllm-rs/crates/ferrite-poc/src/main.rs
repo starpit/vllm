@@ -8,19 +8,19 @@
 //   LLVM_SYS_201_PREFIX=/usr/lib/llvm-20 cargo run -p ferrite-poc --release
 
 #[allow(unused)]
-mod mma_gemm;
-#[allow(unused)]
-mod tiled_mma;
-#[allow(unused)]
 mod cubek_gemm;
-#[allow(unused, unsafe_op_in_unsafe_fn)]
-mod sweep;
-#[allow(unused, unsafe_op_in_unsafe_fn)]
-mod triton_style;
-#[allow(unused)]
-mod ptx_builder;
 #[allow(unused)]
 mod gemm_128x128;
+#[allow(unused)]
+mod mma_gemm;
+#[allow(unused)]
+mod ptx_builder;
+#[allow(unused, unsafe_op_in_unsafe_fn)]
+mod sweep;
+#[allow(unused)]
+mod tiled_mma;
+#[allow(unused, unsafe_op_in_unsafe_fn)]
+mod triton_style;
 
 use anyhow::{Context, Result, bail};
 use std::ffi::{CString, c_uint, c_void};
@@ -29,21 +29,20 @@ use std::time::Instant;
 // ---------------------------------------------------------------------------
 // LLVM / inkwell
 // ---------------------------------------------------------------------------
+use inkwell::builder::Builder;
 use inkwell::context::Context as LlvmContext;
 use inkwell::module::Module;
-use inkwell::builder::Builder;
 use inkwell::targets::{
-    InitializationConfig, Target, TargetMachine, TargetTriple,
-    RelocMode, CodeModel, FileType,
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
 };
 use inkwell::values::{AsValueRef, BasicValueEnum, FunctionValue, IntValue};
-use inkwell::{AddressSpace, OptimizationLevel, IntPredicate};
+use inkwell::{AddressSpace, IntPredicate, OptimizationLevel};
 
 // ---------------------------------------------------------------------------
 // CUDA (cudarc raw driver API)
 // ---------------------------------------------------------------------------
-use cudarc::driver::sys as cuda_sys;
 use cudarc::driver::result as cuda;
+use cudarc::driver::sys as cuda_sys;
 
 fn main() -> Result<()> {
     println!("Ferrite Phase 0 — Proof of Concept");
@@ -64,7 +63,9 @@ fn main() -> Result<()> {
     cuda::init()?;
     let device = cuda::device::get(0)?;
     let ctx = unsafe { cuda::primary_ctx::retain(device)? };
-    unsafe { cuda::ctx::set_current(ctx)?; }
+    unsafe {
+        cuda::ctx::set_current(ctx)?;
+    }
 
     let name = cuda::device::get_name(device)?;
     let major = unsafe {
@@ -111,14 +112,19 @@ fn run_pipeline_gemm() -> Result<()> {
 
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
-    let func = unsafe {
-        cuda::module::get_function(module, CString::new("triton_style_gemm").unwrap())?
-    };
+    let func =
+        unsafe { cuda::module::get_function(module, CString::new("triton_style_gemm").unwrap())? };
 
     use cudarc::driver::sys::CUfunction_attribute as FA;
-    let nregs = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
-    let local_bytes = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)? };
-    println!("  [cuda] Pipeline GEMM -- {} regs/thread, {} bytes local", nregs, local_bytes);
+    let nregs =
+        unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let local_bytes = unsafe {
+        cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?
+    };
+    println!(
+        "  [cuda] Pipeline GEMM -- {} regs/thread, {} bytes local",
+        nregs, local_bytes
+    );
 
     let bm = config.bm;
     let bn = config.bn;
@@ -126,52 +132,104 @@ fn run_pipeline_gemm() -> Result<()> {
     let smem_bytes: c_uint = config.smem_total();
 
     for &sz in &[1024u32] {
-        let m = sz; let n = sz; let k = sz;
+        let m = sz;
+        let n = sz;
+        let k = sz;
         let sa = (m * k) as usize;
         let sb = (k * n) as usize;
         let sc = (m * n) as usize;
         let da = unsafe { cuda::malloc_sync(sa * 2)? };
         let db = unsafe { cuda::malloc_sync(sb * 2)? };
         let dc = unsafe { cuda::malloc_sync(sc * 4)? };
-        let ha: Vec<half::f16> = (0..sa).map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1)).collect();
-        let hb: Vec<half::f16> = (0..sb).map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1)).collect();
+        let ha: Vec<half::f16> = (0..sa)
+            .map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1))
+            .collect();
+        let hb: Vec<half::f16> = (0..sb)
+            .map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1))
+            .collect();
         let mut hc: Vec<f32> = vec![0.0; sc];
-        unsafe { cuda::memcpy_htod_sync(da, &ha)?; cuda::memcpy_htod_sync(db, &hb)?; }
+        unsafe {
+            cuda::memcpy_htod_sync(da, &ha)?;
+            cuda::memcpy_htod_sync(db, &hb)?;
+        }
         let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
-        let gx = n / bn; let gy = m / bm;
+        let gx = n / bn;
+        let gy = m / bm;
         let params: &mut [*mut c_void] = &mut [
-            (&da) as *const _ as *mut c_void, (&db) as *const _ as *mut c_void,
-            (&dc) as *const _ as *mut c_void, (&m) as *const _ as *mut c_void,
-            (&n) as *const _ as *mut c_void, (&k) as *const _ as *mut c_void,
+            (&da) as *const _ as *mut c_void,
+            (&db) as *const _ as *mut c_void,
+            (&dc) as *const _ as *mut c_void,
+            (&m) as *const _ as *mut c_void,
+            (&n) as *const _ as *mut c_void,
+            (&k) as *const _ as *mut c_void,
         ];
         for _ in 0..10 {
-            unsafe { cuda::launch_kernel(func, (gx, gy, 1), (threads, 1, 1), smem_bytes, stream, params)?; }
+            unsafe {
+                cuda::launch_kernel(
+                    func,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    smem_bytes,
+                    stream,
+                    params,
+                )?;
+            }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let iters = 100;
         let start = std::time::Instant::now();
         for _ in 0..iters {
-            unsafe { cuda::launch_kernel(func, (gx, gy, 1), (threads, 1, 1), smem_bytes, stream, params)?; }
+            unsafe {
+                cuda::launch_kernel(
+                    func,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    smem_bytes,
+                    stream,
+                    params,
+                )?;
+            }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let us = start.elapsed().as_micros() as f64 / iters as f64;
-        unsafe { cuda::memcpy_dtoh_sync(&mut hc, dc)?; }
+        unsafe {
+            cuda::memcpy_dtoh_sync(&mut hc, dc)?;
+        }
         let mut max_err: f32 = 0.0;
-        for r in [0,1,31,32,63] {
-            for c2 in [0,1,31,32,63] {
-                if r >= m as usize || c2 >= n as usize { continue; }
+        for r in [0, 1, 31, 32, 63] {
+            for c2 in [0, 1, 31, 32, 63] {
+                if r >= m as usize || c2 >= n as usize {
+                    continue;
+                }
                 let mut e = 0.0f32;
-                for kk in 0..k as usize { e += ha[r*k as usize+kk].to_f32() * hb[kk*n as usize+c2].to_f32(); }
+                for kk in 0..k as usize {
+                    e += ha[r * k as usize + kk].to_f32() * hb[kk * n as usize + c2].to_f32();
+                }
                 let err = (hc[r * n as usize + c2] - e).abs();
-                if err > max_err { max_err = err; }
+                if err > max_err {
+                    max_err = err;
+                }
             }
         }
         let tf = 2.0 * m as f64 * n as f64 * k as f64 / (us * 1e-6) / 1e12;
         println!("  --- {m}x{n} ---");
-        if max_err < 1.0 { println!("  Correct (max err: {max_err:.4})"); }
-        else { println!("  ERROR: max err {max_err:.4}"); }
+        if max_err < 1.0 {
+            println!("  Correct (max err: {max_err:.4})");
+        } else {
+            println!("  ERROR: max err {max_err:.4}");
+        }
         println!("  {us:.1} us, {tf:.1} TFLOPS");
-        unsafe { cuda::stream::destroy(stream)?; cuda::free_sync(da)?; cuda::free_sync(db)?; cuda::free_sync(dc)?; cuda::module::unload(module)?; }
+        unsafe {
+            cuda::stream::destroy(stream)?;
+            cuda::free_sync(da)?;
+            cuda::free_sync(db)?;
+            cuda::free_sync(dc)?;
+            cuda::module::unload(module)?;
+        }
     }
     Ok(())
 }
@@ -188,14 +246,19 @@ fn run_ptxbuilder_gemm() -> Result<()> {
 
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
-    let func = unsafe {
-        cuda::module::get_function(module, CString::new("triton_style_gemm").unwrap())?
-    };
+    let func =
+        unsafe { cuda::module::get_function(module, CString::new("triton_style_gemm").unwrap())? };
 
     use cudarc::driver::sys::CUfunction_attribute as FA;
-    let nregs = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
-    let local_bytes = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)? };
-    println!("  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)", nregs, local_bytes);
+    let nregs =
+        unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let local_bytes = unsafe {
+        cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?
+    };
+    println!(
+        "  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)",
+        nregs, local_bytes
+    );
 
     let bm = config.bm;
     let bn = config.bn;
@@ -215,58 +278,105 @@ fn run_ptxbuilder_gemm() -> Result<()> {
         let db = unsafe { cuda::malloc_sync(sb * 2)? };
         let dc = unsafe { cuda::malloc_sync(sc * 4)? };
 
-        let ha: Vec<half::f16> = (0..sa).map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1)).collect();
-        let hb: Vec<half::f16> = (0..sb).map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1)).collect();
+        let ha: Vec<half::f16> = (0..sa)
+            .map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1))
+            .collect();
+        let hb: Vec<half::f16> = (0..sb)
+            .map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1))
+            .collect();
         let mut hc: Vec<f32> = vec![0.0; sc];
-        unsafe { cuda::memcpy_htod_sync(da, &ha)?; cuda::memcpy_htod_sync(db, &hb)?; }
+        unsafe {
+            cuda::memcpy_htod_sync(da, &ha)?;
+            cuda::memcpy_htod_sync(db, &hb)?;
+        }
 
         let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
         let gx = n / bn;
         let gy = m / bm;
         let params: &mut [*mut c_void] = &mut [
-            (&da) as *const _ as *mut c_void, (&db) as *const _ as *mut c_void,
-            (&dc) as *const _ as *mut c_void, (&m) as *const _ as *mut c_void,
-            (&n) as *const _ as *mut c_void, (&k) as *const _ as *mut c_void,
+            (&da) as *const _ as *mut c_void,
+            (&db) as *const _ as *mut c_void,
+            (&dc) as *const _ as *mut c_void,
+            (&m) as *const _ as *mut c_void,
+            (&n) as *const _ as *mut c_void,
+            (&k) as *const _ as *mut c_void,
         ];
 
         for _ in 0..10 {
-            unsafe { cuda::launch_kernel(func, (gx, gy, 1), (threads, 1, 1), smem_bytes, stream, params)?; }
+            unsafe {
+                cuda::launch_kernel(
+                    func,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    smem_bytes,
+                    stream,
+                    params,
+                )?;
+            }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
 
         let iters = 100;
         let start = Instant::now();
         for _ in 0..iters {
-            unsafe { cuda::launch_kernel(func, (gx, gy, 1), (threads, 1, 1), smem_bytes, stream, params)?; }
+            unsafe {
+                cuda::launch_kernel(
+                    func,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    smem_bytes,
+                    stream,
+                    params,
+                )?;
+            }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let us = start.elapsed().as_micros() as f64 / iters as f64;
 
-        unsafe { cuda::memcpy_dtoh_sync(&mut hc, dc)?; }
+        unsafe {
+            cuda::memcpy_dtoh_sync(&mut hc, dc)?;
+        }
         let mut max_err: f32 = 0.0;
-        for r in [0,1,31,32,63,511,1023] {
-            for c in [0,1,31,32,63,511,1023] {
-                if r >= m as usize || c >= n as usize { continue; }
+        for r in [0, 1, 31, 32, 63, 511, 1023] {
+            for c in [0, 1, 31, 32, 63, 511, 1023] {
+                if r >= m as usize || c >= n as usize {
+                    continue;
+                }
                 let mut e = 0.0f32;
-                for kk in 0..k as usize { e += ha[r*k as usize+kk].to_f32() * hb[kk*n as usize+c].to_f32(); }
+                for kk in 0..k as usize {
+                    e += ha[r * k as usize + kk].to_f32() * hb[kk * n as usize + c].to_f32();
+                }
                 let err = (hc[r * n as usize + c] - e).abs();
-                if err > max_err { max_err = err; }
+                if err > max_err {
+                    max_err = err;
+                }
             }
         }
 
-        if max_err < 1.0 { println!("  Correct (max err: {:.4})", max_err); }
-        else { bail!("  Max error: {:.4}", max_err); }
+        if max_err < 1.0 {
+            println!("  Correct (max err: {:.4})", max_err);
+        } else {
+            bail!("  Max error: {:.4}", max_err);
+        }
 
         let tf = 2.0 * m as f64 * n as f64 * k as f64 / (us * 1e-6) / 1e12;
         println!("  {:.1} us, {:.1} TFLOPS", us, tf);
 
         unsafe {
             cuda::stream::destroy(stream)?;
-            cuda::free_sync(da)?; cuda::free_sync(db)?; cuda::free_sync(dc)?;
+            cuda::free_sync(da)?;
+            cuda::free_sync(db)?;
+            cuda::free_sync(dc)?;
         }
     }
 
-    unsafe { cuda::module::unload(module)?; }
+    unsafe {
+        cuda::module::unload(module)?;
+    }
     Ok(())
 }
 
@@ -283,14 +393,19 @@ fn run_gemm_128x128() -> Result<()> {
 
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
-    let func = unsafe {
-        cuda::module::get_function(module, CString::new("gemm_128x128").unwrap())?
-    };
+    let func =
+        unsafe { cuda::module::get_function(module, CString::new("gemm_128x128").unwrap())? };
 
     use cudarc::driver::sys::CUfunction_attribute as FA;
-    let nregs = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
-    let local_bytes = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)? };
-    println!("  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)", nregs, local_bytes);
+    let nregs =
+        unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let local_bytes = unsafe {
+        cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?
+    };
+    println!(
+        "  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)",
+        nregs, local_bytes
+    );
 
     let bm: u32 = 128;
     let bn: u32 = 128;
@@ -298,7 +413,9 @@ fn run_gemm_128x128() -> Result<()> {
     let smem_bytes: c_uint = 32768; // 2 stages × (8192 A + 8192 B) = 32KB
 
     for &sz in &[1024u32] {
-        let m = sz; let n = sz; let k = sz;
+        let m = sz;
+        let n = sz;
+        let k = sz;
         println!("  --- {}x{} ---", m, n);
 
         let sa = (m * k) as usize;
@@ -308,56 +425,101 @@ fn run_gemm_128x128() -> Result<()> {
         let db = unsafe { cuda::malloc_sync(sb * 2)? };
         let dc = unsafe { cuda::malloc_sync(sc * 4)? };
 
-        let ha: Vec<half::f16> = (0..sa).map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1)).collect();
-        let hb: Vec<half::f16> = (0..sb).map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1)).collect();
+        let ha: Vec<half::f16> = (0..sa)
+            .map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1))
+            .collect();
+        let hb: Vec<half::f16> = (0..sb)
+            .map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1))
+            .collect();
         let mut hc: Vec<f32> = vec![0.0; sc];
-        unsafe { cuda::memcpy_htod_sync(da, &ha)?; cuda::memcpy_htod_sync(db, &hb)?; }
+        unsafe {
+            cuda::memcpy_htod_sync(da, &ha)?;
+            cuda::memcpy_htod_sync(db, &hb)?;
+        }
 
         let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
         let gx = n / bn;
         let gy = m / bm;
         let params: &mut [*mut c_void] = &mut [
-            (&da) as *const _ as *mut c_void, (&db) as *const _ as *mut c_void,
-            (&dc) as *const _ as *mut c_void, (&m) as *const _ as *mut c_void,
-            (&n) as *const _ as *mut c_void, (&k) as *const _ as *mut c_void,
+            (&da) as *const _ as *mut c_void,
+            (&db) as *const _ as *mut c_void,
+            (&dc) as *const _ as *mut c_void,
+            (&m) as *const _ as *mut c_void,
+            (&n) as *const _ as *mut c_void,
+            (&k) as *const _ as *mut c_void,
         ];
 
         // Warmup
         for _ in 0..10 {
-            unsafe { cuda::launch_kernel(func, (gx, gy, 1), (threads, 1, 1), smem_bytes, stream, params)?; }
+            unsafe {
+                cuda::launch_kernel(
+                    func,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    smem_bytes,
+                    stream,
+                    params,
+                )?;
+            }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
 
         // Benchmark
         let iters = 100;
         let start = Instant::now();
         for _ in 0..iters {
-            unsafe { cuda::launch_kernel(func, (gx, gy, 1), (threads, 1, 1), smem_bytes, stream, params)?; }
+            unsafe {
+                cuda::launch_kernel(
+                    func,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    smem_bytes,
+                    stream,
+                    params,
+                )?;
+            }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let us = start.elapsed().as_micros() as f64 / iters as f64;
 
         // Verify
-        unsafe { cuda::memcpy_dtoh_sync(&mut hc, dc)?; }
+        unsafe {
+            cuda::memcpy_dtoh_sync(&mut hc, dc)?;
+        }
         let mut max_err: f32 = 0.0;
-        for r in [0,1,31,32,63,64,95,96,127,511,1023] {
-            for c in [0,1,31,32,63,64,95,96,127,511,1023] {
-                if r >= m as usize || c >= n as usize { continue; }
+        for r in [0, 1, 31, 32, 63, 64, 95, 96, 127, 511, 1023] {
+            for c in [0, 1, 31, 32, 63, 64, 95, 96, 127, 511, 1023] {
+                if r >= m as usize || c >= n as usize {
+                    continue;
+                }
                 let mut e = 0.0f32;
-                for kk in 0..k as usize { e += ha[r*k as usize+kk].to_f32() * hb[kk*n as usize+c].to_f32(); }
+                for kk in 0..k as usize {
+                    e += ha[r * k as usize + kk].to_f32() * hb[kk * n as usize + c].to_f32();
+                }
                 let err = (hc[r * n as usize + c] - e).abs();
-                if err > max_err { max_err = err; }
+                if err > max_err {
+                    max_err = err;
+                }
             }
         }
 
-        if max_err < 1.0 { println!("  Correct (max err: {:.4})", max_err); }
-        else {
+        if max_err < 1.0 {
+            println!("  Correct (max err: {:.4})", max_err);
+        } else {
             // Print a few sample values for debugging
             for r in [0, 1, 64, 127] {
                 for c in [0, 1, 64, 127] {
-                    if r >= m as usize || c >= n as usize { continue; }
+                    if r >= m as usize || c >= n as usize {
+                        continue;
+                    }
                     let mut e = 0.0f32;
-                    for kk in 0..k as usize { e += ha[r*k as usize+kk].to_f32() * hb[kk*n as usize+c].to_f32(); }
+                    for kk in 0..k as usize {
+                        e += ha[r * k as usize + kk].to_f32() * hb[kk * n as usize + c].to_f32();
+                    }
                     let got = hc[r * n as usize + c];
                     println!("    C[{r}][{c}]: got={got:.4} expected={e:.4}");
                 }
@@ -370,11 +532,15 @@ fn run_gemm_128x128() -> Result<()> {
 
         unsafe {
             cuda::stream::destroy(stream)?;
-            cuda::free_sync(da)?; cuda::free_sync(db)?; cuda::free_sync(dc)?;
+            cuda::free_sync(da)?;
+            cuda::free_sync(db)?;
+            cuda::free_sync(dc)?;
         }
     }
 
-    unsafe { cuda::module::unload(module)?; }
+    unsafe {
+        cuda::module::unload(module)?;
+    }
     Ok(())
 }
 
@@ -396,17 +562,22 @@ fn run_fused_128x128() -> Result<()> {
     };
 
     use cudarc::driver::sys::CUfunction_attribute as FA;
-    let nregs = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
-    let local_bytes = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)? };
-    println!("  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)", nregs, local_bytes);
+    let nregs =
+        unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let local_bytes = unsafe {
+        cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?
+    };
+    println!(
+        "  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)",
+        nregs, local_bytes
+    );
 
     // Also load standalone GEMM for unfused comparison
     let ptx_gemm = gemm_128x128::emit_ptx_128x128();
     let ptx_gemm_cstr = CString::new(ptx_gemm.as_bytes()).context("PTX null")?;
     let module_gemm = unsafe { cuda::module::load_data(ptx_gemm_cstr.as_ptr() as *const _)? };
-    let func_gemm = unsafe {
-        cuda::module::get_function(module_gemm, CString::new("gemm_128x128").unwrap())?
-    };
+    let func_gemm =
+        unsafe { cuda::module::get_function(module_gemm, CString::new("gemm_128x128").unwrap())? };
 
     let bm: u32 = 128;
     let bn: u32 = 128;
@@ -423,12 +594,22 @@ fn run_fused_128x128() -> Result<()> {
     }
 
     // CPU reference helpers
-    fn silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
+    fn silu(x: f32) -> f32 {
+        x / (1.0 + (-x).exp())
+    }
     fn rmsnorm_row(input: &[half::f16], gamma: &[half::f16], eps: f32) -> Vec<f32> {
         let n = input.len();
-        let sum_sq: f32 = input.iter().map(|x| { let xf = x.to_f32(); xf * xf }).sum();
+        let sum_sq: f32 = input
+            .iter()
+            .map(|x| {
+                let xf = x.to_f32();
+                xf * xf
+            })
+            .sum();
         let rms_inv = 1.0 / ((sum_sq / n as f32) + eps).sqrt();
-        input.iter().zip(gamma.iter())
+        input
+            .iter()
+            .zip(gamma.iter())
             .map(|(x, g)| x.to_f32() * rms_inv * g.to_f32())
             .collect()
     }
@@ -443,15 +624,21 @@ fn run_fused_128x128() -> Result<()> {
         let sb = (k * n) as usize;
         let sc = (m * n) as usize;
 
-        let d_input  = unsafe { cuda::malloc_sync(sa * 2)? };
-        let d_wnorm  = unsafe { cuda::malloc_sync(sw * 2)? };
-        let d_wgemm  = unsafe { cuda::malloc_sync(sb * 2)? };
+        let d_input = unsafe { cuda::malloc_sync(sa * 2)? };
+        let d_wnorm = unsafe { cuda::malloc_sync(sw * 2)? };
+        let d_wgemm = unsafe { cuda::malloc_sync(sb * 2)? };
         let d_output = unsafe { cuda::malloc_sync(sc * 4)? };
         let d_gemm_out = unsafe { cuda::malloc_sync(sc * 4)? };
 
-        let h_input: Vec<half::f16> = (0..sa).map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1)).collect();
-        let h_wnorm: Vec<half::f16> = (0..sw).map(|i| half::f16::from_f32(0.5 + ((i % 100) as f32) * 0.01)).collect();
-        let h_wgemm: Vec<half::f16> = (0..sb).map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1)).collect();
+        let h_input: Vec<half::f16> = (0..sa)
+            .map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1))
+            .collect();
+        let h_wnorm: Vec<half::f16> = (0..sw)
+            .map(|i| half::f16::from_f32(0.5 + ((i % 100) as f32) * 0.01))
+            .collect();
+        let h_wgemm: Vec<half::f16> = (0..sb)
+            .map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1))
+            .collect();
         let mut h_output: Vec<f32> = vec![0.0; sc];
 
         unsafe {
@@ -465,40 +652,68 @@ fn run_fused_128x128() -> Result<()> {
         let gy = m / bm;
 
         let params: &mut [*mut c_void] = &mut [
-            (&d_input)  as *const _ as *mut c_void,
-            (&d_wnorm)  as *const _ as *mut c_void,
-            (&d_wgemm)  as *const _ as *mut c_void,
+            (&d_input) as *const _ as *mut c_void,
+            (&d_wnorm) as *const _ as *mut c_void,
+            (&d_wgemm) as *const _ as *mut c_void,
             (&d_output) as *const _ as *mut c_void,
-            (&n)        as *const _ as *mut c_void,
-            (&k)        as *const _ as *mut c_void,
+            (&n) as *const _ as *mut c_void,
+            (&k) as *const _ as *mut c_void,
         ];
 
         // Warmup
         for _ in 0..10 {
-            unsafe { cuda::launch_kernel(func, (gx, gy, 1), (threads, 1, 1), smem_fused, stream, params)?; }
+            unsafe {
+                cuda::launch_kernel(
+                    func,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    smem_fused,
+                    stream,
+                    params,
+                )?;
+            }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
 
         // Benchmark fused
         let iters = 100;
         let start = Instant::now();
         for _ in 0..iters {
-            unsafe { cuda::launch_kernel(func, (gx, gy, 1), (threads, 1, 1), smem_fused, stream, params)?; }
+            unsafe {
+                cuda::launch_kernel(
+                    func,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    smem_fused,
+                    stream,
+                    params,
+                )?;
+            }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let us_fused = start.elapsed().as_micros() as f64 / iters as f64;
 
         // Verify (only for first size to save time)
         if m == 256 {
-            unsafe { cuda::memcpy_dtoh_sync(&mut h_output, d_output)?; }
+            unsafe {
+                cuda::memcpy_dtoh_sync(&mut h_output, d_output)?;
+            }
             let mut max_err: f32 = 0.0;
             for r in [0usize, 1, 31, 63, 64, 127, 128, 255] {
-                if r >= m as usize { continue; }
+                if r >= m as usize {
+                    continue;
+                }
                 let row_start = r * k as usize;
                 let row_end = row_start + k as usize;
                 let normed = rmsnorm_row(&h_input[row_start..row_end], &h_wnorm, 1e-6);
                 for c in [0usize, 1, 31, 63, 64, 127, 511, 1023, 4095] {
-                    if c >= n as usize { continue; }
+                    if c >= n as usize {
+                        continue;
+                    }
                     let mut dot = 0.0f32;
                     for kk in 0..k as usize {
                         dot += normed[kk] * h_wgemm[kk * n as usize + c].to_f32();
@@ -506,7 +721,9 @@ fn run_fused_128x128() -> Result<()> {
                     let expected = silu(dot);
                     let got = h_output[r * n as usize + c];
                     let err = (got - expected).abs();
-                    if err > max_err { max_err = err; }
+                    if err > max_err {
+                        max_err = err;
+                    }
                 }
             }
             if max_err < 2.0 {
@@ -517,7 +734,9 @@ fn run_fused_128x128() -> Result<()> {
                     let row_end = row_start + k as usize;
                     let normed = rmsnorm_row(&h_input[row_start..row_end], &h_wnorm, 1e-6);
                     for c in [0, 1, 64, 127] {
-                        if c >= n as usize { continue; }
+                        if c >= n as usize {
+                            continue;
+                        }
                         let mut dot = 0.0f32;
                         for kk in 0..k as usize {
                             dot += normed[kk] * h_wgemm[kk * n as usize + c].to_f32();
@@ -536,24 +755,46 @@ fn run_fused_128x128() -> Result<()> {
 
         // Benchmark standalone GEMM (unfused baseline)
         let params_gemm: &mut [*mut c_void] = &mut [
-            (&d_input)    as *const _ as *mut c_void,
-            (&d_wgemm)    as *const _ as *mut c_void,
+            (&d_input) as *const _ as *mut c_void,
+            (&d_wgemm) as *const _ as *mut c_void,
             (&d_gemm_out) as *const _ as *mut c_void,
-            (&m)          as *const _ as *mut c_void,
-            (&n)          as *const _ as *mut c_void,
-            (&k)          as *const _ as *mut c_void,
+            (&m) as *const _ as *mut c_void,
+            (&n) as *const _ as *mut c_void,
+            (&k) as *const _ as *mut c_void,
         ];
 
         for _ in 0..10 {
-            unsafe { cuda::launch_kernel(func_gemm, (gx, gy, 1), (threads, 1, 1), smem_gemm, stream, params_gemm)?; }
+            unsafe {
+                cuda::launch_kernel(
+                    func_gemm,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    smem_gemm,
+                    stream,
+                    params_gemm,
+                )?;
+            }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
 
         let start = Instant::now();
         for _ in 0..iters {
-            unsafe { cuda::launch_kernel(func_gemm, (gx, gy, 1), (threads, 1, 1), smem_gemm, stream, params_gemm)?; }
+            unsafe {
+                cuda::launch_kernel(
+                    func_gemm,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    smem_gemm,
+                    stream,
+                    params_gemm,
+                )?;
+            }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let us_gemm_only = start.elapsed().as_micros() as f64 / iters as f64;
 
         // Unfused estimate: GEMM + norm read/write M*K*2*2 + SiLU read/write M*N*4*2
@@ -566,14 +807,22 @@ fn run_fused_128x128() -> Result<()> {
         let us_unfused_est = us_gemm_only + us_norm_est + us_silu_est;
 
         let tf_gemm = 2.0 * m as f64 * n as f64 * k as f64 / (us_gemm_only * 1e-6) / 1e12;
-        println!("  Standalone GEMM: {:.1} us, {:.1} TFLOPS", us_gemm_only, tf_gemm);
-        println!("  Unfused estimate (GEMM+norm+SiLU): {:.1} us (norm: {:.1} us, SiLU: {:.1} us)",
-            us_unfused_est, us_norm_est, us_silu_est);
+        println!(
+            "  Standalone GEMM: {:.1} us, {:.1} TFLOPS",
+            us_gemm_only, tf_gemm
+        );
+        println!(
+            "  Unfused estimate (GEMM+norm+SiLU): {:.1} us (norm: {:.1} us, SiLU: {:.1} us)",
+            us_unfused_est, us_norm_est, us_silu_est
+        );
         let speedup = us_unfused_est / us_fused;
         if speedup >= 1.0 {
             println!("  Fused speedup vs unfused: {:.1}x FASTER", speedup);
         } else {
-            println!("  Fused vs unfused: {:.1}% overhead", (1.0/speedup - 1.0) * 100.0);
+            println!(
+                "  Fused vs unfused: {:.1}% overhead",
+                (1.0 / speedup - 1.0) * 100.0
+            );
         }
 
         unsafe {
@@ -610,12 +859,11 @@ fn run_ptxbuilder_silu() -> Result<()> {
 
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
-    let func = unsafe {
-        cuda::module::get_function(module, CString::new("silu_kernel").unwrap())?
-    };
+    let func = unsafe { cuda::module::get_function(module, CString::new("silu_kernel").unwrap())? };
 
     use cudarc::driver::sys::CUfunction_attribute as FA;
-    let nregs = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let nregs =
+        unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
     println!("  [cuda] Loaded -- {} regs/thread", nregs);
 
     // CPU reference SiLU
@@ -635,7 +883,9 @@ fn run_ptxbuilder_silu() -> Result<()> {
             .map(|i| ((i % 1000) as f32 - 500.0) * 0.01)
             .collect();
         let mut h_output: Vec<f32> = vec![0.0; n as usize];
-        unsafe { cuda::memcpy_htod_sync(d_data, &h_input)?; }
+        unsafe {
+            cuda::memcpy_htod_sync(d_data, &h_input)?;
+        }
 
         let threads_per_block = block_size;
         let elems_per_block = block_size * elems_per_thread;
@@ -649,8 +899,12 @@ fn run_ptxbuilder_silu() -> Result<()> {
         // Correctness check using default stream (synchronous)
         unsafe {
             cuda::launch_kernel(
-                func, (grid_size, 1, 1), (threads_per_block, 1, 1),
-                0, std::ptr::null_mut(), params,
+                func,
+                (grid_size, 1, 1),
+                (threads_per_block, 1, 1),
+                0,
+                std::ptr::null_mut(),
+                params,
             )?;
             cuda::ctx::synchronize()?;
             cuda::memcpy_dtoh_sync(&mut h_output, d_data)?;
@@ -661,7 +915,9 @@ fn run_ptxbuilder_silu() -> Result<()> {
         for i in (0..n as usize).step_by(997) {
             let expected = silu_ref(h_input[i]);
             let err = (h_output[i] - expected).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
         }
         if max_err < 1e-3 {
             println!("  Correct (max err: {:.6})", max_err);
@@ -673,31 +929,49 @@ fn run_ptxbuilder_silu() -> Result<()> {
         let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
 
         // Warmup
-        unsafe { cuda::memcpy_htod_sync(d_data, &h_input)?; }
+        unsafe {
+            cuda::memcpy_htod_sync(d_data, &h_input)?;
+        }
         for _ in 0..20 {
             unsafe {
                 cuda::launch_kernel(
-                    func, (grid_size, 1, 1), (threads_per_block, 1, 1),
-                    0, stream, params,
+                    func,
+                    (grid_size, 1, 1),
+                    (threads_per_block, 1, 1),
+                    0,
+                    stream,
+                    params,
                 )?;
             }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
 
         // Timed runs
         let iters = 200;
-        unsafe { cuda::memcpy_htod_sync(d_data, &h_input)?; }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::memcpy_htod_sync(d_data, &h_input)?;
+        }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let start = Instant::now();
         for _ in 0..iters {
             unsafe {
                 cuda::launch_kernel(
-                    func, (grid_size, 1, 1), (threads_per_block, 1, 1),
-                    0, stream, params,
+                    func,
+                    (grid_size, 1, 1),
+                    (threads_per_block, 1, 1),
+                    0,
+                    stream,
+                    params,
                 )?;
             }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let us = start.elapsed().as_micros() as f64 / iters as f64;
 
         // Bandwidth: read + write = 2 * N * 4 bytes
@@ -710,7 +984,9 @@ fn run_ptxbuilder_silu() -> Result<()> {
         }
     }
 
-    unsafe { cuda::module::unload(module)?; }
+    unsafe {
+        cuda::module::unload(module)?;
+    }
     Ok(())
 }
 
@@ -733,12 +1009,12 @@ fn run_ptxbuilder_rmsnorm() -> Result<()> {
 
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
-    let func = unsafe {
-        cuda::module::get_function(module, CString::new("rmsnorm_kernel").unwrap())?
-    };
+    let func =
+        unsafe { cuda::module::get_function(module, CString::new("rmsnorm_kernel").unwrap())? };
 
     use cudarc::driver::sys::CUfunction_attribute as FA;
-    let nregs = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let nregs =
+        unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
     println!("  [cuda] Loaded -- {} regs/thread", nregs);
 
     // Shared memory needed: num_warps * 4 bytes for reduction scratch
@@ -748,15 +1024,20 @@ fn run_ptxbuilder_rmsnorm() -> Result<()> {
     // CPU reference RMSNorm
     fn rmsnorm_ref(input: &[half::f16], weight: &[half::f16], eps: f32) -> Vec<half::f16> {
         let n = input.len();
-        let sum_sq: f32 = input.iter().map(|x| {
-            let xf = x.to_f32();
-            xf * xf
-        }).sum();
+        let sum_sq: f32 = input
+            .iter()
+            .map(|x| {
+                let xf = x.to_f32();
+                xf * xf
+            })
+            .sum();
         let rms = ((sum_sq / n as f32) + eps).sqrt();
         let scale = 1.0 / rms;
-        input.iter().zip(weight.iter()).map(|(x, w)| {
-            half::f16::from_f32(x.to_f32() * scale * w.to_f32())
-        }).collect()
+        input
+            .iter()
+            .zip(weight.iter())
+            .map(|(x, w)| half::f16::from_f32(x.to_f32() * scale * w.to_f32()))
+            .collect()
     }
 
     for &batch_size in &[1u32, 32, 256, 1024] {
@@ -796,8 +1077,12 @@ fn run_ptxbuilder_rmsnorm() -> Result<()> {
         // Correctness check
         unsafe {
             cuda::launch_kernel(
-                func, (grid_size, 1, 1), (block_size, 1, 1),
-                smem_bytes, std::ptr::null_mut(), params,
+                func,
+                (grid_size, 1, 1),
+                (block_size, 1, 1),
+                smem_bytes,
+                std::ptr::null_mut(),
+                params,
             )?;
             cuda::ctx::synchronize()?;
             cuda::memcpy_dtoh_sync(&mut h_output, d_output)?;
@@ -830,12 +1115,18 @@ fn run_ptxbuilder_rmsnorm() -> Result<()> {
         for _ in 0..50 {
             unsafe {
                 cuda::launch_kernel(
-                    func, (grid_size, 1, 1), (block_size, 1, 1),
-                    smem_bytes, stream, params,
+                    func,
+                    (grid_size, 1, 1),
+                    (block_size, 1, 1),
+                    smem_bytes,
+                    stream,
+                    params,
                 )?;
             }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
 
         // Timed
         let iters = 500;
@@ -843,17 +1134,23 @@ fn run_ptxbuilder_rmsnorm() -> Result<()> {
         for _ in 0..iters {
             unsafe {
                 cuda::launch_kernel(
-                    func, (grid_size, 1, 1), (block_size, 1, 1),
-                    smem_bytes, stream, params,
+                    func,
+                    (grid_size, 1, 1),
+                    (block_size, 1, 1),
+                    smem_bytes,
+                    stream,
+                    params,
                 )?;
             }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let us = start.elapsed().as_micros() as f64 / iters as f64;
 
         // Bandwidth: read input (f16) + read weight (f16) + write output (f16)
-        let bytes_total = batch_size as f64 * hidden_size as f64 * 2.0 * 2.0
-            + hidden_size as f64 * 2.0;
+        let bytes_total =
+            batch_size as f64 * hidden_size as f64 * 2.0 * 2.0 + hidden_size as f64 * 2.0;
         let bw = bytes_total / (us * 1e-6) / 1e9;
         println!("  {:.1} us, {:.1} GB/s", us, bw);
 
@@ -865,7 +1162,9 @@ fn run_ptxbuilder_rmsnorm() -> Result<()> {
         }
     }
 
-    unsafe { cuda::module::unload(module)?; }
+    unsafe {
+        cuda::module::unload(module)?;
+    }
     Ok(())
 }
 
@@ -894,9 +1193,15 @@ fn run_fused_rmsnorm_gemm_silu() -> Result<()> {
     };
 
     use cudarc::driver::sys::CUfunction_attribute as FA;
-    let nregs = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
-    let local_bytes = unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)? };
-    println!("  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)", nregs, local_bytes);
+    let nregs =
+        unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let local_bytes = unsafe {
+        cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?
+    };
+    println!(
+        "  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)",
+        nregs, local_bytes
+    );
 
     // Also load standalone kernels for unfused comparison
     let rmsnorm_ptx = ptx_builder::rmsnorm::build_rmsnorm_kernel(256, hidden_size);
@@ -916,9 +1221,8 @@ fn run_fused_rmsnorm_gemm_silu() -> Result<()> {
     let silu_ptx = ptx_builder::silu::build_silu_kernel(256, 4);
     let silu_cstr = CString::new(silu_ptx.as_bytes()).context("PTX null")?;
     let silu_module = unsafe { cuda::module::load_data(silu_cstr.as_ptr() as *const _)? };
-    let silu_func = unsafe {
-        cuda::module::get_function(silu_module, CString::new("silu_kernel").unwrap())?
-    };
+    let silu_func =
+        unsafe { cuda::module::get_function(silu_module, CString::new("silu_kernel").unwrap())? };
 
     let bm = config.bm;
     let bn = config.bn;
@@ -930,17 +1234,25 @@ fn run_fused_rmsnorm_gemm_silu() -> Result<()> {
     }
 
     fn rmsnorm_gemm_silu_ref(
-        input: &[half::f16], wnorm: &[half::f16], wgemm: &[half::f16],
-        batch: usize, hidden: usize, out: usize, eps: f32,
+        input: &[half::f16],
+        wnorm: &[half::f16],
+        wgemm: &[half::f16],
+        batch: usize,
+        hidden: usize,
+        out: usize,
+        eps: f32,
     ) -> Vec<f32> {
         let mut output = vec![0.0f32; batch * out];
         for b in 0..batch {
             // RMSNorm
             let row = &input[b * hidden..(b + 1) * hidden];
-            let sum_sq: f32 = row.iter().map(|x| {
-                let xf = x.to_f32();
-                xf * xf
-            }).sum();
+            let sum_sq: f32 = row
+                .iter()
+                .map(|x| {
+                    let xf = x.to_f32();
+                    xf * xf
+                })
+                .sum();
             let scale = 1.0 / ((sum_sq / hidden as f32) + eps).sqrt();
 
             // GEMM + SiLU
@@ -962,7 +1274,10 @@ fn run_fused_rmsnorm_gemm_silu() -> Result<()> {
     let fused_smem: c_uint = gemm_smem + 32 + bm * 4; // norm scratch + norm factors
 
     for &batch_size in &[64u32, 256, 1024] {
-        println!("  --- batch={}, hidden={}, out_features={} ---", batch_size, hidden_size, out_features);
+        println!(
+            "  --- batch={}, hidden={}, out_features={} ---",
+            batch_size, hidden_size, out_features
+        );
 
         let input_elems = (batch_size * hidden_size) as usize;
         let wnorm_elems = hidden_size as usize;
@@ -976,8 +1291,8 @@ fn run_fused_rmsnorm_gemm_silu() -> Result<()> {
         let d_output = unsafe { cuda::malloc_sync(output_elems * 4)? };
 
         // Also need intermediate buffers for unfused path
-        let d_normed = unsafe { cuda::malloc_sync(input_elems * 2)? };     // rmsnorm output (f16)
-        let d_gemm_out = unsafe { cuda::malloc_sync(output_elems * 4)? };  // gemm output (f32)
+        let d_normed = unsafe { cuda::malloc_sync(input_elems * 2)? }; // rmsnorm output (f16)
+        let d_gemm_out = unsafe { cuda::malloc_sync(output_elems * 4)? }; // gemm output (f32)
 
         // Host data
         let h_input: Vec<half::f16> = (0..input_elems)
@@ -1012,8 +1327,12 @@ fn run_fused_rmsnorm_gemm_silu() -> Result<()> {
         // Correctness check
         unsafe {
             cuda::launch_kernel(
-                func, (gx, gy, 1), (threads, 1, 1),
-                fused_smem, std::ptr::null_mut(), fused_params,
+                func,
+                (gx, gy, 1),
+                (threads, 1, 1),
+                fused_smem,
+                std::ptr::null_mut(),
+                fused_params,
             )?;
             cuda::ctx::synchronize()?;
             cuda::memcpy_dtoh_sync(&mut h_output, d_output)?;
@@ -1021,8 +1340,13 @@ fn run_fused_rmsnorm_gemm_silu() -> Result<()> {
 
         // CPU reference
         let expected = rmsnorm_gemm_silu_ref(
-            &h_input, &h_wnorm, &h_wgemm,
-            batch_size as usize, hidden_size as usize, out_features as usize, eps,
+            &h_input,
+            &h_wnorm,
+            &h_wgemm,
+            batch_size as usize,
+            hidden_size as usize,
+            out_features as usize,
+            eps,
         );
 
         let mut max_err: f32 = 0.0;
@@ -1037,8 +1361,10 @@ fn run_fused_rmsnorm_gemm_silu() -> Result<()> {
                 if err_count <= 3 {
                     let row = i / out_features as usize;
                     let col = i % out_features as usize;
-                    println!("    MISMATCH [{},{}]: got {:.6}, expected {:.6}, err {:.6}",
-                             row, col, h_output[i], expected[i], err);
+                    println!(
+                        "    MISMATCH [{},{}]: got {:.6}, expected {:.6}, err {:.6}",
+                        row, col, h_output[i], expected[i], err
+                    );
                 }
             }
         }
@@ -1046,7 +1372,10 @@ fn run_fused_rmsnorm_gemm_silu() -> Result<()> {
         if max_err < 2.0 {
             println!("  Fused correct (max err: {:.4})", max_err);
         } else {
-            println!("  WARNING: Fused max error: {:.4} (may be accumulation tolerance issue)", max_err);
+            println!(
+                "  WARNING: Fused max error: {:.4} (may be accumulation tolerance issue)",
+                max_err
+            );
         }
 
         // ── Benchmark fused ──
@@ -1056,28 +1385,40 @@ fn run_fused_rmsnorm_gemm_silu() -> Result<()> {
         for _ in 0..20 {
             unsafe {
                 cuda::launch_kernel(
-                    func, (gx, gy, 1), (threads, 1, 1),
-                    fused_smem, stream, fused_params,
+                    func,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    fused_smem,
+                    stream,
+                    fused_params,
                 )?;
             }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
 
         let iters = 100;
         let start = Instant::now();
         for _ in 0..iters {
             unsafe {
                 cuda::launch_kernel(
-                    func, (gx, gy, 1), (threads, 1, 1),
-                    fused_smem, stream, fused_params,
+                    func,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    fused_smem,
+                    stream,
+                    fused_params,
                 )?;
             }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let fused_us = start.elapsed().as_micros() as f64 / iters as f64;
 
         // ── Benchmark unfused (3 separate launches) ──
-        let rmsnorm_smem: c_uint = (256 / 32) * 4;  // 8 warps * 4 bytes
+        let rmsnorm_smem: c_uint = (256 / 32) * 4; // 8 warps * 4 bytes
         let gemm_smem: c_uint = config.smem_total();
         let m_param = batch_size;
         let k_param_val = hidden_size;
@@ -1109,41 +1450,69 @@ fn run_fused_rmsnorm_gemm_silu() -> Result<()> {
         for _ in 0..20 {
             unsafe {
                 cuda::launch_kernel(
-                    rmsnorm_func, (batch_size, 1, 1), (256, 1, 1),
-                    rmsnorm_smem, stream, rmsnorm_params,
+                    rmsnorm_func,
+                    (batch_size, 1, 1),
+                    (256, 1, 1),
+                    rmsnorm_smem,
+                    stream,
+                    rmsnorm_params,
                 )?;
                 cuda::launch_kernel(
-                    gemm_func, (gx, gy, 1), (threads, 1, 1),
-                    gemm_smem, stream, gemm_params,
+                    gemm_func,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    gemm_smem,
+                    stream,
+                    gemm_params,
                 )?;
                 let silu_grid = (silu_n + 1023) / 1024;
                 cuda::launch_kernel(
-                    silu_func, (silu_grid, 1, 1), (256, 1, 1),
-                    0, stream, silu_params,
+                    silu_func,
+                    (silu_grid, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    stream,
+                    silu_params,
                 )?;
             }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
 
         let start = Instant::now();
         for _ in 0..iters {
             unsafe {
                 cuda::launch_kernel(
-                    rmsnorm_func, (batch_size, 1, 1), (256, 1, 1),
-                    rmsnorm_smem, stream, rmsnorm_params,
+                    rmsnorm_func,
+                    (batch_size, 1, 1),
+                    (256, 1, 1),
+                    rmsnorm_smem,
+                    stream,
+                    rmsnorm_params,
                 )?;
                 cuda::launch_kernel(
-                    gemm_func, (gx, gy, 1), (threads, 1, 1),
-                    gemm_smem, stream, gemm_params,
+                    gemm_func,
+                    (gx, gy, 1),
+                    (threads, 1, 1),
+                    gemm_smem,
+                    stream,
+                    gemm_params,
                 )?;
                 let silu_grid = (silu_n + 1023) / 1024;
                 cuda::launch_kernel(
-                    silu_func, (silu_grid, 1, 1), (256, 1, 1),
-                    0, stream, silu_params,
+                    silu_func,
+                    (silu_grid, 1, 1),
+                    (256, 1, 1),
+                    0,
+                    stream,
+                    silu_params,
                 )?;
             }
         }
-        unsafe { cuda::stream::synchronize(stream)?; }
+        unsafe {
+            cuda::stream::synchronize(stream)?;
+        }
         let unfused_us = start.elapsed().as_micros() as f64 / iters as f64;
 
         let flops = 2.0 * batch_size as f64 * hidden_size as f64 * out_features as f64;
@@ -1152,7 +1521,10 @@ fn run_fused_rmsnorm_gemm_silu() -> Result<()> {
         let speedup = unfused_us / fused_us;
 
         println!("  Fused:   {:.1} us, {:.1} TFLOPS", fused_us, fused_tflops);
-        println!("  Unfused: {:.1} us, {:.1} TFLOPS (3 launches)", unfused_us, unfused_tflops);
+        println!(
+            "  Unfused: {:.1} us, {:.1} TFLOPS (3 launches)",
+            unfused_us, unfused_tflops
+        );
         println!("  Speedup: {:.2}x", speedup);
 
         unsafe {
@@ -1187,9 +1559,7 @@ fn step1_vector_add(sm: &str) -> Result<()> {
 
     // Load PTX as CUDA module
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX contains null byte")?;
-    let module = unsafe {
-        cuda::module::load_data(ptx_cstr.as_ptr() as *const _)?
-    };
+    let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
     let func_name = CString::new("vector_add").unwrap();
     let func = unsafe { cuda::module::get_function(module, func_name)? };
     println!("  [cuda] Module loaded, function resolved");
@@ -1237,7 +1607,9 @@ fn step1_vector_add(sm: &str) -> Result<()> {
             )?;
         }
     }
-    unsafe { cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::stream::synchronize(stream)?;
+    }
 
     // Benchmark
     let iters = 100;
@@ -1254,12 +1626,16 @@ fn step1_vector_add(sm: &str) -> Result<()> {
             )?;
         }
     }
-    unsafe { cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::stream::synchronize(stream)?;
+    }
     let elapsed = start.elapsed();
     let us_per_launch = elapsed.as_micros() as f64 / iters as f64;
 
     // Verify
-    unsafe { cuda::memcpy_dtoh_sync(&mut h_c, d_c)?; }
+    unsafe {
+        cuda::memcpy_dtoh_sync(&mut h_c, d_c)?;
+    }
 
     let mut correct = true;
     for i in 0..n {
@@ -1366,7 +1742,9 @@ fn step2_tiled_gemm(sm: &str) -> Result<()> {
             )?;
         }
     }
-    unsafe { cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::stream::synchronize(stream)?;
+    }
 
     // Benchmark
     let iters = 50;
@@ -1383,12 +1761,16 @@ fn step2_tiled_gemm(sm: &str) -> Result<()> {
             )?;
         }
     }
-    unsafe { cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::stream::synchronize(stream)?;
+    }
     let elapsed = start.elapsed();
     let us_per_launch = elapsed.as_micros() as f64 / iters as f64;
 
     // Verify against CPU reference
-    unsafe { cuda::memcpy_dtoh_sync(&mut h_c, d_c)?; }
+    unsafe {
+        cuda::memcpy_dtoh_sync(&mut h_c, d_c)?;
+    }
 
     let mut max_err: f32 = 0.0;
     for row in 0..m as usize {
@@ -1414,7 +1796,10 @@ fn step2_tiled_gemm(sm: &str) -> Result<()> {
     // 2*M*N*K FLOPs for matmul
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = flops / (us_per_launch * 1e-6) / 1e12;
-    println!("  {:.1} μs, {:.2} TFLOPS (naive tiled, no tensor cores)", us_per_launch, tflops);
+    println!(
+        "  {:.1} μs, {:.2} TFLOPS (naive tiled, no tensor cores)",
+        us_per_launch, tflops
+    );
 
     unsafe {
         cuda::stream::destroy(stream)?;
@@ -1433,8 +1818,8 @@ fn step2_tiled_gemm(sm: &str) -> Result<()> {
 
 pub fn create_nvptx_target_machine(sm: &str) -> Result<TargetMachine> {
     let triple = TargetTriple::create("nvptx64-nvidia-cuda");
-    let target = Target::from_triple(&triple)
-        .map_err(|e| anyhow::anyhow!("NVPTX target: {}", e))?;
+    let target =
+        Target::from_triple(&triple).map_err(|e| anyhow::anyhow!("NVPTX target: {}", e))?;
     target
         .create_target_machine(
             &triple,
@@ -1501,13 +1886,33 @@ fn emit_vector_add_ptx(sm: &str) -> Result<String> {
     let c_ptr = function.get_nth_param(2).unwrap().into_pointer_value();
     let n = function.get_nth_param(3).unwrap().into_int_value();
 
-    let tid = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.tid.x", "tid");
-    let ctaid = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.ctaid.x", "ctaid");
-    let ntid = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.ntid.x", "ntid");
+    let tid = call_sreg(
+        &context,
+        &module,
+        &builder,
+        "llvm.nvvm.read.ptx.sreg.tid.x",
+        "tid",
+    );
+    let ctaid = call_sreg(
+        &context,
+        &module,
+        &builder,
+        "llvm.nvvm.read.ptx.sreg.ctaid.x",
+        "ctaid",
+    );
+    let ntid = call_sreg(
+        &context,
+        &module,
+        &builder,
+        "llvm.nvvm.read.ptx.sreg.ntid.x",
+        "ntid",
+    );
     let offset = builder.build_int_mul(ctaid, ntid, "offset").unwrap();
     let i = builder.build_int_add(offset, tid, "i").unwrap();
 
-    let cmp = builder.build_int_compare(IntPredicate::ULT, i, n, "cmp").unwrap();
+    let cmp = builder
+        .build_int_compare(IntPredicate::ULT, i, n, "cmp")
+        .unwrap();
     builder.build_conditional_branch(cmp, body, exit).unwrap();
 
     // ── Body: c[i] = a[i] + b[i] ──
@@ -1515,8 +1920,14 @@ fn emit_vector_add_ptx(sm: &str) -> Result<String> {
     let a_i = unsafe { builder.build_gep(f32_type, a_ptr, &[i], "a_i").unwrap() };
     let b_i = unsafe { builder.build_gep(f32_type, b_ptr, &[i], "b_i").unwrap() };
     let c_i = unsafe { builder.build_gep(f32_type, c_ptr, &[i], "c_i").unwrap() };
-    let va = builder.build_load(f32_type, a_i, "va").unwrap().into_float_value();
-    let vb = builder.build_load(f32_type, b_i, "vb").unwrap().into_float_value();
+    let va = builder
+        .build_load(f32_type, a_i, "va")
+        .unwrap()
+        .into_float_value();
+    let vb = builder
+        .build_load(f32_type, b_i, "vb")
+        .unwrap()
+        .into_float_value();
     let sum = builder.build_float_add(va, vb, "sum").unwrap();
     builder.build_store(c_i, sum).unwrap();
     builder.build_unconditional_branch(exit).unwrap();
@@ -1625,35 +2036,73 @@ fn emit_tiled_gemm_ptx(sm: &str) -> Result<String> {
     let n_param = function.get_nth_param(4).unwrap().into_int_value();
     let k_param = function.get_nth_param(5).unwrap().into_int_value();
 
-    let tid_x = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.tid.x", "tid_x");
-    let tid_y = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.tid.y", "tid_y");
-    let bid_x = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.ctaid.x", "bid_x");
-    let bid_y = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.ctaid.y", "bid_y");
+    let tid_x = call_sreg(
+        &context,
+        &module,
+        &builder,
+        "llvm.nvvm.read.ptx.sreg.tid.x",
+        "tid_x",
+    );
+    let tid_y = call_sreg(
+        &context,
+        &module,
+        &builder,
+        "llvm.nvvm.read.ptx.sreg.tid.y",
+        "tid_y",
+    );
+    let bid_x = call_sreg(
+        &context,
+        &module,
+        &builder,
+        "llvm.nvvm.read.ptx.sreg.ctaid.x",
+        "bid_x",
+    );
+    let bid_y = call_sreg(
+        &context,
+        &module,
+        &builder,
+        "llvm.nvvm.read.ptx.sreg.ctaid.y",
+        "bid_y",
+    );
 
     // row = blockIdx.y * TILE + threadIdx.y
-    let row = builder.build_int_add(
-        builder.build_int_mul(bid_y, tile_const, "").unwrap(),
-        tid_y, "row",
-    ).unwrap();
+    let row = builder
+        .build_int_add(
+            builder.build_int_mul(bid_y, tile_const, "").unwrap(),
+            tid_y,
+            "row",
+        )
+        .unwrap();
     // col = blockIdx.x * TILE + threadIdx.x
-    let col = builder.build_int_add(
-        builder.build_int_mul(bid_x, tile_const, "").unwrap(),
-        tid_x, "col",
-    ).unwrap();
+    let col = builder
+        .build_int_add(
+            builder.build_int_mul(bid_x, tile_const, "").unwrap(),
+            tid_x,
+            "col",
+        )
+        .unwrap();
 
     // Shared memory pointers: As = &smem[0], Bs = &smem[TILE*TILE*4]
     let smem_ptr = smem_global.as_pointer_value();
     let tile_sq_bytes = i32_type.const_int((TILE * TILE * 4) as u64, false);
-    let as_ptr = builder.build_pointer_cast(smem_ptr, ptr_shared, "as_ptr").unwrap();
+    let as_ptr = builder
+        .build_pointer_cast(smem_ptr, ptr_shared, "as_ptr")
+        .unwrap();
     let bs_offset = unsafe {
-        builder.build_gep(context.i8_type(), smem_ptr, &[tile_sq_bytes], "bs_off").unwrap()
+        builder
+            .build_gep(context.i8_type(), smem_ptr, &[tile_sq_bytes], "bs_off")
+            .unwrap()
     };
-    let bs_ptr = builder.build_pointer_cast(bs_offset, ptr_shared, "bs_ptr").unwrap();
+    let bs_ptr = builder
+        .build_pointer_cast(bs_offset, ptr_shared, "bs_ptr")
+        .unwrap();
 
     // acc = 0.0
     let zero_f32 = f32_type.const_float(0.0);
 
-    builder.build_unconditional_branch(tile_loop_header).unwrap();
+    builder
+        .build_unconditional_branch(tile_loop_header)
+        .unwrap();
 
     // ── Tile loop: for (t = 0; t < K; t += TILE) ──
     builder.position_at_end(tile_loop_header);
@@ -1662,46 +2111,80 @@ fn emit_tiled_gemm_ptx(sm: &str) -> Result<String> {
     let t = t_phi.as_basic_value().into_int_value();
     let acc = acc_phi.as_basic_value().into_float_value();
 
-    let tile_cmp = builder.build_int_compare(IntPredicate::ULT, t, k_param, "tile_cmp").unwrap();
-    builder.build_conditional_branch(tile_cmp, tile_loop_body, tile_loop_exit).unwrap();
+    let tile_cmp = builder
+        .build_int_compare(IntPredicate::ULT, t, k_param, "tile_cmp")
+        .unwrap();
+    builder
+        .build_conditional_branch(tile_cmp, tile_loop_body, tile_loop_exit)
+        .unwrap();
 
     // ── Tile loop body: load tiles into shared memory ──
     builder.position_at_end(tile_loop_body);
 
     // As[threadIdx.y * TILE + threadIdx.x] = A[row * K + t + threadIdx.x]
-    let as_idx = builder.build_int_add(
-        builder.build_int_mul(tid_y, tile_const, "").unwrap(),
-        tid_x, "as_idx",
-    ).unwrap();
+    let as_idx = builder
+        .build_int_add(
+            builder.build_int_mul(tid_y, tile_const, "").unwrap(),
+            tid_x,
+            "as_idx",
+        )
+        .unwrap();
     let a_row_off = builder.build_int_mul(row, k_param, "").unwrap();
-    let a_idx = builder.build_int_add(
-        builder.build_int_add(a_row_off, t, "").unwrap(),
-        tid_x, "a_idx",
-    ).unwrap();
-    let a_elem_ptr = unsafe { builder.build_gep(f32_type, a_ptr, &[a_idx], "a_ep").unwrap() };
+    let a_idx = builder
+        .build_int_add(
+            builder.build_int_add(a_row_off, t, "").unwrap(),
+            tid_x,
+            "a_idx",
+        )
+        .unwrap();
+    let a_elem_ptr = unsafe {
+        builder
+            .build_gep(f32_type, a_ptr, &[a_idx], "a_ep")
+            .unwrap()
+    };
     let a_val = builder.build_load(f32_type, a_elem_ptr, "a_val").unwrap();
-    let as_elem_ptr = unsafe { builder.build_gep(f32_type, as_ptr, &[as_idx], "as_ep").unwrap() };
+    let as_elem_ptr = unsafe {
+        builder
+            .build_gep(f32_type, as_ptr, &[as_idx], "as_ep")
+            .unwrap()
+    };
     builder.build_store(as_elem_ptr, a_val).unwrap();
 
     // Bs[threadIdx.y * TILE + threadIdx.x] = B[(t + threadIdx.y) * N + col]
-    let bs_idx = builder.build_int_add(
-        builder.build_int_mul(tid_y, tile_const, "").unwrap(),
-        tid_x, "bs_idx",
-    ).unwrap();
+    let bs_idx = builder
+        .build_int_add(
+            builder.build_int_mul(tid_y, tile_const, "").unwrap(),
+            tid_x,
+            "bs_idx",
+        )
+        .unwrap();
     let b_row = builder.build_int_add(t, tid_y, "b_row").unwrap();
-    let b_idx = builder.build_int_add(
-        builder.build_int_mul(b_row, n_param, "").unwrap(),
-        col, "b_idx",
-    ).unwrap();
-    let b_elem_ptr = unsafe { builder.build_gep(f32_type, b_ptr, &[b_idx], "b_ep").unwrap() };
+    let b_idx = builder
+        .build_int_add(
+            builder.build_int_mul(b_row, n_param, "").unwrap(),
+            col,
+            "b_idx",
+        )
+        .unwrap();
+    let b_elem_ptr = unsafe {
+        builder
+            .build_gep(f32_type, b_ptr, &[b_idx], "b_ep")
+            .unwrap()
+    };
     let b_val = builder.build_load(f32_type, b_elem_ptr, "b_val").unwrap();
-    let bs_elem_ptr = unsafe { builder.build_gep(f32_type, bs_ptr, &[bs_idx], "bs_ep").unwrap() };
+    let bs_elem_ptr = unsafe {
+        builder
+            .build_gep(f32_type, bs_ptr, &[bs_idx], "bs_ep")
+            .unwrap()
+    };
     builder.build_store(bs_elem_ptr, b_val).unwrap();
 
     // __syncthreads()
     call_barrier0(&context, &module, &builder);
 
-    builder.build_unconditional_branch(inner_loop_header).unwrap();
+    builder
+        .build_unconditional_branch(inner_loop_header)
+        .unwrap();
 
     // ── Inner loop: for (i = 0; i < TILE; i++) acc += As[ty*TILE+i] * Bs[i*TILE+tx] ──
     builder.position_at_end(inner_loop_header);
@@ -1710,44 +2193,69 @@ fn emit_tiled_gemm_ptx(sm: &str) -> Result<String> {
     let i_val = i_phi.as_basic_value().into_int_value();
     let acc2 = acc2_phi.as_basic_value().into_float_value();
 
-    let inner_cmp = builder.build_int_compare(IntPredicate::ULT, i_val, tile_const, "icmp").unwrap();
-    builder.build_conditional_branch(inner_cmp, inner_loop_body, inner_loop_exit).unwrap();
+    let inner_cmp = builder
+        .build_int_compare(IntPredicate::ULT, i_val, tile_const, "icmp")
+        .unwrap();
+    builder
+        .build_conditional_branch(inner_cmp, inner_loop_body, inner_loop_exit)
+        .unwrap();
 
     // ── Inner loop body ──
     builder.position_at_end(inner_loop_body);
 
     // As[threadIdx.y * TILE + i]
-    let as_load_idx = builder.build_int_add(
-        builder.build_int_mul(tid_y, tile_const, "").unwrap(),
-        i_val, "as_li",
-    ).unwrap();
-    let as_lp = unsafe { builder.build_gep(f32_type, as_ptr, &[as_load_idx], "as_lp").unwrap() };
-    let as_v = builder.build_load(f32_type, as_lp, "as_v").unwrap().into_float_value();
+    let as_load_idx = builder
+        .build_int_add(
+            builder.build_int_mul(tid_y, tile_const, "").unwrap(),
+            i_val,
+            "as_li",
+        )
+        .unwrap();
+    let as_lp = unsafe {
+        builder
+            .build_gep(f32_type, as_ptr, &[as_load_idx], "as_lp")
+            .unwrap()
+    };
+    let as_v = builder
+        .build_load(f32_type, as_lp, "as_v")
+        .unwrap()
+        .into_float_value();
 
     // Bs[i * TILE + threadIdx.x]
-    let bs_load_idx = builder.build_int_add(
-        builder.build_int_mul(i_val, tile_const, "").unwrap(),
-        tid_x, "bs_li",
-    ).unwrap();
-    let bs_lp = unsafe { builder.build_gep(f32_type, bs_ptr, &[bs_load_idx], "bs_lp").unwrap() };
-    let bs_v = builder.build_load(f32_type, bs_lp, "bs_v").unwrap().into_float_value();
+    let bs_load_idx = builder
+        .build_int_add(
+            builder.build_int_mul(i_val, tile_const, "").unwrap(),
+            tid_x,
+            "bs_li",
+        )
+        .unwrap();
+    let bs_lp = unsafe {
+        builder
+            .build_gep(f32_type, bs_ptr, &[bs_load_idx], "bs_lp")
+            .unwrap()
+    };
+    let bs_v = builder
+        .build_load(f32_type, bs_lp, "bs_v")
+        .unwrap()
+        .into_float_value();
 
     // acc += as_v * bs_v
     let prod = builder.build_float_mul(as_v, bs_v, "prod").unwrap();
     let acc_new = builder.build_float_add(acc2, prod, "acc_new").unwrap();
 
-    let i_next = builder.build_int_add(i_val, i32_type.const_int(1, false), "i_next").unwrap();
-    builder.build_unconditional_branch(inner_loop_header).unwrap();
+    let i_next = builder
+        .build_int_add(i_val, i32_type.const_int(1, false), "i_next")
+        .unwrap();
+    builder
+        .build_unconditional_branch(inner_loop_header)
+        .unwrap();
 
     // Wire inner loop phi nodes
     i_phi.add_incoming(&[
         (&i32_type.const_int(0, false), tile_loop_body),
         (&i_next, inner_loop_body),
     ]);
-    acc2_phi.add_incoming(&[
-        (&acc, tile_loop_body),
-        (&acc_new, inner_loop_body),
-    ]);
+    acc2_phi.add_incoming(&[(&acc, tile_loop_body), (&acc_new, inner_loop_body)]);
 
     // ── Inner loop exit → second syncthreads, advance tile loop ──
     builder.position_at_end(inner_loop_exit);
@@ -1755,7 +2263,9 @@ fn emit_tiled_gemm_ptx(sm: &str) -> Result<String> {
     call_barrier0(&context, &module, &builder);
 
     let t_next = builder.build_int_add(t, tile_const, "t_next").unwrap();
-    builder.build_unconditional_branch(tile_loop_header).unwrap();
+    builder
+        .build_unconditional_branch(tile_loop_header)
+        .unwrap();
 
     // Wire tile loop phi nodes
     t_phi.add_incoming(&[
@@ -1770,11 +2280,18 @@ fn emit_tiled_gemm_ptx(sm: &str) -> Result<String> {
     // ── Tile loop exit: store C[row * N + col] = acc ──
     builder.position_at_end(tile_loop_exit);
 
-    let c_idx = builder.build_int_add(
-        builder.build_int_mul(row, n_param, "").unwrap(),
-        col, "c_idx",
-    ).unwrap();
-    let c_elem_ptr = unsafe { builder.build_gep(f32_type, c_ptr, &[c_idx], "c_ep").unwrap() };
+    let c_idx = builder
+        .build_int_add(
+            builder.build_int_mul(row, n_param, "").unwrap(),
+            col,
+            "c_idx",
+        )
+        .unwrap();
+    let c_elem_ptr = unsafe {
+        builder
+            .build_gep(f32_type, c_ptr, &[c_idx], "c_ep")
+            .unwrap()
+    };
     builder.build_store(c_elem_ptr, acc).unwrap();
     builder.build_return(None).unwrap();
 

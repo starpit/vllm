@@ -1,8 +1,8 @@
-pub mod tensor;
 pub mod kernel;
+pub mod tensor;
 
-pub use tensor::DevicePtr;
 pub use kernel::JitKernel;
+pub use tensor::DevicePtr;
 
 // Re-export cudarc driver result for use in generated code.
 pub use cudarc::driver::result as cuda;

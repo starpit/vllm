@@ -1,5 +1,5 @@
-use crate::{PtxBuilder, Reg};
 use crate::config::GemmConfig;
+use crate::{PtxBuilder, Reg};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // FragmentTransform — transforms A fragment registers between ldmatrix & MMA
@@ -46,14 +46,14 @@ impl FragmentTransform for IdentityTransform {
 /// Scratch registers for the RmsNorm transform. Pre-allocated ONCE, reused for every call.
 pub struct RmsNormScratch {
     // Norm factor lookup
-    pub nf_off: Reg,        // b32
-    pub nf_addr: Reg,       // b32
-    pub nf_b32: Reg,        // b32: raw f32 norm_factor from smem
-    pub nf_packed: Reg,     // b32: norm_factor packed as f16x2 (same value in both halves)
-    pub nf_addr2: Reg,      // b32
-    pub nf_b32_2: Reg,      // b32
-    pub nf_packed2: Reg,    // b32: second norm_factor packed as f16x2
-    pub nf_f16: Reg,        // b32: temp for f32→f16 conversion
+    pub nf_off: Reg,     // b32
+    pub nf_addr: Reg,    // b32
+    pub nf_b32: Reg,     // b32: raw f32 norm_factor from smem
+    pub nf_packed: Reg,  // b32: norm_factor packed as f16x2 (same value in both halves)
+    pub nf_addr2: Reg,   // b32
+    pub nf_b32_2: Reg,   // b32
+    pub nf_packed2: Reg, // b32: second norm_factor packed as f16x2
+    pub nf_f16: Reg,     // b32: temp for f32→f16 conversion
     // Gamma lookup
     pub gamma_k: Reg,       // b32
     pub gamma_byte: Reg,    // b32
@@ -77,8 +77,14 @@ pub struct RmsNormTransform {
 }
 
 impl RmsNormTransform {
-    pub fn new(ptx: &mut PtxBuilder, norm_factors_smem: Reg, gamma_smem: Reg,
-               group_id: Reg, tg: Reg, k_counter: Reg) -> Self {
+    pub fn new(
+        ptx: &mut PtxBuilder,
+        norm_factors_smem: Reg,
+        gamma_smem: Reg,
+        group_id: Reg,
+        tg: Reg,
+        k_counter: Reg,
+    ) -> Self {
         let scratch = RmsNormScratch {
             nf_off: ptx.regs.alloc_b32(),
             nf_addr: ptx.regs.alloc_b32(),
@@ -98,7 +104,14 @@ impl RmsNormTransform {
             tmp: ptx.regs.alloc_b32(),
         };
         ptx.shl_b32(scratch.tg2, tg, 1);
-        Self { norm_factors_smem, gamma_smem, group_id, tg, k_counter, scratch }
+        Self {
+            norm_factors_smem,
+            gamma_smem,
+            group_id,
+            tg,
+            k_counter,
+            scratch,
+        }
     }
 }
 
@@ -198,8 +211,10 @@ pub trait TileLoader {
     fn emit_prologue_load(
         &self,
         ptx: &mut PtxBuilder,
-        smem_dst0: Reg, smem_dst1: Reg,
-        g_ptr0: Reg, g_ptr1: Reg,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         cp_size: Reg,
     );
 
@@ -208,8 +223,10 @@ pub trait TileLoader {
     fn emit_loop_load(
         &self,
         ptx: &mut PtxBuilder,
-        smem_dst0: Reg, smem_dst1: Reg,
-        g_ptr0: Reg, g_ptr1: Reg,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         cp_size: Reg,
         p_load: Reg,
     );
@@ -228,7 +245,9 @@ pub trait TileLoader {
     /// Does this loader support split-phase operation?
     /// If true, `emit_issue_loads` and `emit_process_loads` can be called
     /// separately to overlap global loads with MMA compute.
-    fn supports_split_phase(&self) -> bool { false }
+    fn supports_split_phase(&self) -> bool {
+        false
+    }
 
     /// Phase 1: Issue global loads only. Returns register handles to in-flight data.
     /// Called BEFORE MMA to start loads early. The returned Vec contains
@@ -236,7 +255,8 @@ pub trait TileLoader {
     fn emit_issue_loads(
         &self,
         _ptx: &mut PtxBuilder,
-        _g_ptr0: Reg, _g_ptr1: Reg,
+        _g_ptr0: Reg,
+        _g_ptr1: Reg,
         _p_load: Reg,
     ) -> Vec<Reg> {
         Vec::new()
@@ -246,7 +266,8 @@ pub trait TileLoader {
     fn emit_issue_loads_unpredicated(
         &self,
         _ptx: &mut PtxBuilder,
-        _g_ptr0: Reg, _g_ptr1: Reg,
+        _g_ptr0: Reg,
+        _g_ptr1: Reg,
     ) -> Vec<Reg> {
         Vec::new()
     }
@@ -257,7 +278,8 @@ pub trait TileLoader {
         &self,
         _ptx: &mut PtxBuilder,
         _loaded_regs: &[Reg],
-        _smem_dst0: Reg, _smem_dst1: Reg,
+        _smem_dst0: Reg,
+        _smem_dst1: Reg,
         _predicate: Option<Reg>,
     ) {
     }
@@ -271,9 +293,12 @@ pub struct CpAsyncLoader;
 
 impl TileLoader for CpAsyncLoader {
     fn emit_prologue_load(
-        &self, ptx: &mut PtxBuilder,
-        smem_dst0: Reg, smem_dst1: Reg,
-        g_ptr0: Reg, g_ptr1: Reg,
+        &self,
+        ptx: &mut PtxBuilder,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         cp_size: Reg,
     ) {
         ptx.cp_async_cg(smem_dst0, 0, g_ptr0, 0, cp_size);
@@ -281,9 +306,12 @@ impl TileLoader for CpAsyncLoader {
     }
 
     fn emit_loop_load(
-        &self, ptx: &mut PtxBuilder,
-        smem_dst0: Reg, smem_dst1: Reg,
-        g_ptr0: Reg, g_ptr1: Reg,
+        &self,
+        ptx: &mut PtxBuilder,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         cp_size: Reg,
         _p_load: Reg,
     ) {
@@ -296,8 +324,12 @@ impl TileLoader for CpAsyncLoader {
         ptx.cp_async_commit();
     }
 
-    fn async_groups_per_tile(&self) -> u32 { 1 }
-    fn needs_barrier_after_load(&self) -> bool { false }
+    fn async_groups_per_tile(&self) -> u32 {
+        1
+    }
+    fn needs_barrier_after_load(&self) -> bool {
+        false
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -349,12 +381,16 @@ impl NormalizedLoader {
         predicate: Option<Reg>,
     ) -> [Reg; 8] {
         let raw_in = [
-            ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-            ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
         ];
         let raw_wt = [
-            ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-            ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
         ];
         if let Some(pred) = predicate {
             ptx.pred_ld_global_v4_b32(pred, raw_in, g_ptr, 0);
@@ -363,8 +399,9 @@ impl NormalizedLoader {
             ptx.ld_global_v4_b32(raw_in, g_ptr, 0);
             ptx.ld_global_v4_b32(raw_wt, wnorm_ptr, 0);
         }
-        [raw_in[0], raw_in[1], raw_in[2], raw_in[3],
-         raw_wt[0], raw_wt[1], raw_wt[2], raw_wt[3]]
+        [
+            raw_in[0], raw_in[1], raw_in[2], raw_in[3], raw_wt[0], raw_wt[1], raw_wt[2], raw_wt[3],
+        ]
     }
 
     /// Phase 2 helper: process loaded data for one chunk.
@@ -437,9 +474,12 @@ impl NormalizedLoader {
 
 impl TileLoader for NormalizedLoader {
     fn emit_prologue_load(
-        &self, ptx: &mut PtxBuilder,
-        smem_dst0: Reg, smem_dst1: Reg,
-        g_ptr0: Reg, g_ptr1: Reg,
+        &self,
+        ptx: &mut PtxBuilder,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         _cp_size: Reg,
     ) {
         self.emit_chunk_store(ptx, g_ptr0, smem_dst0, self.row_id_chunk0, None);
@@ -447,9 +487,12 @@ impl TileLoader for NormalizedLoader {
     }
 
     fn emit_loop_load(
-        &self, ptx: &mut PtxBuilder,
-        smem_dst0: Reg, smem_dst1: Reg,
-        g_ptr0: Reg, g_ptr1: Reg,
+        &self,
+        ptx: &mut PtxBuilder,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         _cp_size: Reg,
         p_load: Reg,
     ) {
@@ -461,23 +504,29 @@ impl TileLoader for NormalizedLoader {
         // NormalizedLoader writes directly via st.shared -- no async commit needed.
     }
 
-    fn async_groups_per_tile(&self) -> u32 { 0 }
-    fn needs_barrier_after_load(&self) -> bool { true }
+    fn async_groups_per_tile(&self) -> u32 {
+        0
+    }
+    fn needs_barrier_after_load(&self) -> bool {
+        true
+    }
 
-    fn supports_split_phase(&self) -> bool { true }
+    fn supports_split_phase(&self) -> bool {
+        true
+    }
 
     fn emit_issue_loads(
-        &self, ptx: &mut PtxBuilder,
-        g_ptr0: Reg, g_ptr1: Reg,
+        &self,
+        ptx: &mut PtxBuilder,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
         p_load: Reg,
     ) -> Vec<Reg> {
         ptx.comment("Split-phase: issue ld.global for NEXT A tile (early)");
-        let chunk0 = NormalizedLoader::emit_issue_chunk_loads(
-            ptx, g_ptr0, self.wnorm_ptr, Some(p_load),
-        );
-        let chunk1 = NormalizedLoader::emit_issue_chunk_loads(
-            ptx, g_ptr1, self.wnorm_ptr, Some(p_load),
-        );
+        let chunk0 =
+            NormalizedLoader::emit_issue_chunk_loads(ptx, g_ptr0, self.wnorm_ptr, Some(p_load));
+        let chunk1 =
+            NormalizedLoader::emit_issue_chunk_loads(ptx, g_ptr1, self.wnorm_ptr, Some(p_load));
         // Return 16 regs: [chunk0_in[4], chunk0_wt[4], chunk1_in[4], chunk1_wt[4]]
         let mut result = Vec::with_capacity(16);
         result.extend_from_slice(&chunk0);
@@ -486,16 +535,14 @@ impl TileLoader for NormalizedLoader {
     }
 
     fn emit_issue_loads_unpredicated(
-        &self, ptx: &mut PtxBuilder,
-        g_ptr0: Reg, g_ptr1: Reg,
+        &self,
+        ptx: &mut PtxBuilder,
+        g_ptr0: Reg,
+        g_ptr1: Reg,
     ) -> Vec<Reg> {
         ptx.comment("Split-phase: issue ld.global for A tile (prologue, unpredicated)");
-        let chunk0 = NormalizedLoader::emit_issue_chunk_loads(
-            ptx, g_ptr0, self.wnorm_ptr, None,
-        );
-        let chunk1 = NormalizedLoader::emit_issue_chunk_loads(
-            ptx, g_ptr1, self.wnorm_ptr, None,
-        );
+        let chunk0 = NormalizedLoader::emit_issue_chunk_loads(ptx, g_ptr0, self.wnorm_ptr, None);
+        let chunk1 = NormalizedLoader::emit_issue_chunk_loads(ptx, g_ptr1, self.wnorm_ptr, None);
         let mut result = Vec::with_capacity(16);
         result.extend_from_slice(&chunk0);
         result.extend_from_slice(&chunk1);
@@ -503,29 +550,51 @@ impl TileLoader for NormalizedLoader {
     }
 
     fn emit_process_loads(
-        &self, ptx: &mut PtxBuilder,
+        &self,
+        ptx: &mut PtxBuilder,
         loaded_regs: &[Reg],
-        smem_dst0: Reg, smem_dst1: Reg,
+        smem_dst0: Reg,
+        smem_dst1: Reg,
         predicate: Option<Reg>,
     ) {
         ptx.comment("Split-phase: process loaded A data (normalize + st.shared)");
         // loaded_regs layout: [chunk0_in[4], chunk0_wt[4], chunk1_in[4], chunk1_wt[4]]
         let chunk0: [Reg; 8] = [
-            loaded_regs[0], loaded_regs[1], loaded_regs[2], loaded_regs[3],
-            loaded_regs[4], loaded_regs[5], loaded_regs[6], loaded_regs[7],
+            loaded_regs[0],
+            loaded_regs[1],
+            loaded_regs[2],
+            loaded_regs[3],
+            loaded_regs[4],
+            loaded_regs[5],
+            loaded_regs[6],
+            loaded_regs[7],
         ];
         let chunk1: [Reg; 8] = [
-            loaded_regs[8], loaded_regs[9], loaded_regs[10], loaded_regs[11],
-            loaded_regs[12], loaded_regs[13], loaded_regs[14], loaded_regs[15],
+            loaded_regs[8],
+            loaded_regs[9],
+            loaded_regs[10],
+            loaded_regs[11],
+            loaded_regs[12],
+            loaded_regs[13],
+            loaded_regs[14],
+            loaded_regs[15],
         ];
         NormalizedLoader::emit_process_chunk(
-            ptx, &chunk0, smem_dst0,
-            self.row_id_chunk0, self.norm_factors_base, self.block_row,
+            ptx,
+            &chunk0,
+            smem_dst0,
+            self.row_id_chunk0,
+            self.norm_factors_base,
+            self.block_row,
             predicate,
         );
         NormalizedLoader::emit_process_chunk(
-            ptx, &chunk1, smem_dst1,
-            self.row_id_chunk1, self.norm_factors_base, self.block_row,
+            ptx,
+            &chunk1,
+            smem_dst1,
+            self.row_id_chunk1,
+            self.norm_factors_base,
+            self.block_row,
             predicate,
         );
     }
@@ -564,12 +633,14 @@ pub fn emit_gemm_with_loaders(
     setup: &GemmSetup,
     // A tile loading
     a_loader: &dyn TileLoader,
-    ga0: Reg, ga1: Reg,          // A global ptrs for chunk 0/1
-    a_cp_off: Reg,               // A swizzled smem offset
+    ga0: Reg,
+    ga1: Reg,      // A global ptrs for chunk 0/1
+    a_cp_off: Reg, // A swizzled smem offset
     // B tile loading
     b_loader: &dyn TileLoader,
-    gb0: Reg, gb1: Reg,          // B global ptrs for chunk 0/1
-    b_cp_off: Reg,               // B swizzled smem offset
+    gb0: Reg,
+    gb1: Reg,      // B global ptrs for chunk 0/1
+    b_cp_off: Reg, // B swizzled smem offset
     // B advancement
     n_param: Reg,
     k_param: Reg,
@@ -581,8 +652,8 @@ pub fn emit_gemm_with_loaders(
     let smem_base = setup.smem_base;
     let tid = setup.tid;
 
-    let a_tile_bytes = c.smem_a_bytes();     // 4096
-    let buf_stride = a_tile_bytes;           // 4096
+    let a_tile_bytes = c.smem_a_bytes(); // 4096
+    let buf_stride = a_tile_bytes; // 4096
     let b_start = (a_tile_bytes * c.num_stages) as i32; // 8192
 
     let tid_x16 = ptx.regs.alloc_b32();
@@ -784,8 +855,10 @@ pub fn emit_gemm_with_loaders(
     let mut acc_regs: Vec<[Reg; 4]> = Vec::with_capacity(num_tiles);
     for _ in 0..num_tiles {
         let tile = [
-            ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-            ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
         ];
         for &r in &tile {
             ptx.mov_b32(r, zero);
@@ -851,15 +924,23 @@ pub fn emit_gemm_with_loaders(
     ptx.comment("ldmatrix A -- 4 loads");
     let a_addr_ki0 = ptx.regs.alloc_b32();
     ptx.add_s32(a_addr_ki0, buf_base, a_off_ki0);
-    let mut a_frag_ki0_rm0 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let mut a_frag_ki0_rm0 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki0_rm0, a_addr_ki0, None);
     if let Some(transform) = a_transform {
         transform.emit_transform(ptx, &mut a_frag_ki0_rm0, 0, 0);
     }
 
-    let mut a_frag_ki0_rm1 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let mut a_frag_ki0_rm1 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki0_rm1, a_addr_ki0, Some(2048));
     if let Some(transform) = a_transform {
         transform.emit_transform(ptx, &mut a_frag_ki0_rm1, 0, 1);
@@ -867,15 +948,23 @@ pub fn emit_gemm_with_loaders(
 
     let a_addr_ki1 = ptx.regs.alloc_b32();
     ptx.add_s32(a_addr_ki1, buf_base, a_off_ki1);
-    let mut a_frag_ki1_rm0 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let mut a_frag_ki1_rm0 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki1_rm0, a_addr_ki1, None);
     if let Some(transform) = a_transform {
         transform.emit_transform(ptx, &mut a_frag_ki1_rm0, 1, 0);
     }
 
-    let mut a_frag_ki1_rm1 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let mut a_frag_ki1_rm1 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki1_rm1, a_addr_ki1, Some(2048));
     if let Some(transform) = a_transform {
         transform.emit_transform(ptx, &mut a_frag_ki1_rm1, 1, 1);
@@ -888,8 +977,12 @@ pub fn emit_gemm_with_loaders(
     for rn in 0..REG_N as usize {
         let b_addr = ptx.regs.alloc_b32();
         ptx.add_s32(b_addr, buf_base, b_off[rn]);
-        let frag = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                    ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+        let frag = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
         ptx.ldmatrix_x4_trans(frag, b_addr, Some(b_start));
         b_frags.push(frag);
     }
@@ -899,19 +992,39 @@ pub fn emit_gemm_with_loaders(
     ptx.comment("MMA -- 16 total");
     for rn in 0..REG_N as usize {
         let ai = 0 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki0_rm0, [b_frags[rn][0], b_frags[rn][1]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki0_rm0,
+            [b_frags[rn][0], b_frags[rn][1]],
+            acc.regs[ai],
+        );
     }
     for rn in 0..REG_N as usize {
         let ai = 1 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki0_rm1, [b_frags[rn][0], b_frags[rn][1]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki0_rm1,
+            [b_frags[rn][0], b_frags[rn][1]],
+            acc.regs[ai],
+        );
     }
     for rn in 0..REG_N as usize {
         let ai = 0 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki1_rm0, [b_frags[rn][2], b_frags[rn][3]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki1_rm0,
+            [b_frags[rn][2], b_frags[rn][3]],
+            acc.regs[ai],
+        );
     }
     for rn in 0..REG_N as usize {
         let ai = 1 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki1_rm1, [b_frags[rn][2], b_frags[rn][3]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki1_rm1,
+            [b_frags[rn][2], b_frags[rn][3]],
+            acc.regs[ai],
+        );
     }
     ptx.blank();
 
@@ -1025,23 +1138,27 @@ pub fn emit_gemm_register_transform_a(
     c: &GemmConfig,
     setup: &GemmSetup,
     a_loader: &dyn TileLoader,
-    ga0: Reg, ga1: Reg,
+    ga0: Reg,
+    ga1: Reg,
     a_cp_off: Reg,
     b_loader: &dyn TileLoader,
-    gb0: Reg, gb1: Reg,
+    gb0: Reg,
+    gb1: Reg,
     b_cp_off: Reg,
     n_param: Reg,
     k_param: Reg,
     extra_advance: Option<&dyn Fn(&mut PtxBuilder)>,
 ) -> AccumulatorMap {
-    assert!(a_loader.supports_split_phase(),
-        "RegisterTransformA requires a split-phase A loader");
+    assert!(
+        a_loader.supports_split_phase(),
+        "RegisterTransformA requires a split-phase A loader"
+    );
 
     let smem_base = setup.smem_base;
     let tid = setup.tid;
 
-    let a_tile_bytes = c.smem_a_bytes();     // 4096
-    let buf_stride = a_tile_bytes;           // 4096
+    let a_tile_bytes = c.smem_a_bytes(); // 4096
+    let buf_stride = a_tile_bytes; // 4096
     let b_start = (a_tile_bytes * c.num_stages) as i32; // 8192
 
     let tid_x16 = ptx.regs.alloc_b32();
@@ -1233,8 +1350,10 @@ pub fn emit_gemm_register_transform_a(
     let mut acc_regs: Vec<[Reg; 4]> = Vec::with_capacity(num_tiles);
     for _ in 0..num_tiles {
         let tile = [
-            ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-            ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
         ];
         for &r in &tile {
             ptx.mov_b32(r, zero);
@@ -1301,22 +1420,38 @@ pub fn emit_gemm_register_transform_a(
     // ldmatrix A
     let a_addr_ki0 = ptx.regs.alloc_b32();
     ptx.add_s32(a_addr_ki0, buf_base, a_off_ki0);
-    let a_frag_ki0_rm0 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let a_frag_ki0_rm0 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki0_rm0, a_addr_ki0, None);
 
-    let a_frag_ki0_rm1 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let a_frag_ki0_rm1 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki0_rm1, a_addr_ki0, Some(2048));
 
     let a_addr_ki1 = ptx.regs.alloc_b32();
     ptx.add_s32(a_addr_ki1, buf_base, a_off_ki1);
-    let a_frag_ki1_rm0 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let a_frag_ki1_rm0 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki1_rm0, a_addr_ki1, None);
 
-    let a_frag_ki1_rm1 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let a_frag_ki1_rm1 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki1_rm1, a_addr_ki1, Some(2048));
     ptx.blank();
 
@@ -1326,8 +1461,12 @@ pub fn emit_gemm_register_transform_a(
     for rn in 0..REG_N as usize {
         let b_addr = ptx.regs.alloc_b32();
         ptx.add_s32(b_addr, buf_base, b_off[rn]);
-        let frag = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                    ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+        let frag = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
         ptx.ldmatrix_x4_trans(frag, b_addr, Some(b_start));
         b_frags.push(frag);
     }
@@ -1337,19 +1476,39 @@ pub fn emit_gemm_register_transform_a(
     ptx.comment("MMA -- 16 total (hides ld.global latency from step 2)");
     for rn in 0..REG_N as usize {
         let ai = 0 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki0_rm0, [b_frags[rn][0], b_frags[rn][1]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki0_rm0,
+            [b_frags[rn][0], b_frags[rn][1]],
+            acc.regs[ai],
+        );
     }
     for rn in 0..REG_N as usize {
         let ai = 1 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki0_rm1, [b_frags[rn][0], b_frags[rn][1]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki0_rm1,
+            [b_frags[rn][0], b_frags[rn][1]],
+            acc.regs[ai],
+        );
     }
     for rn in 0..REG_N as usize {
         let ai = 0 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki1_rm0, [b_frags[rn][2], b_frags[rn][3]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki1_rm0,
+            [b_frags[rn][2], b_frags[rn][3]],
+            acc.regs[ai],
+        );
     }
     for rn in 0..REG_N as usize {
         let ai = 1 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki1_rm1, [b_frags[rn][2], b_frags[rn][3]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki1_rm1,
+            [b_frags[rn][2], b_frags[rn][3]],
+            acc.regs[ai],
+        );
     }
     ptx.blank();
 
@@ -1472,7 +1631,7 @@ pub struct TransformScratch {
     pub tid_row: Reg,
     pub tid_col: Reg,
     pub tid_and3: Reg,
-    pub row_in_tile: [Reg; 2],  // one per chunk
+    pub row_in_tile: [Reg; 2], // one per chunk
     pub temp_addr: [Reg; 2],
     pub dest_addr: [Reg; 2],
     pub raw: [Reg; 4],
@@ -1484,8 +1643,8 @@ pub struct TransformScratch {
     pub norm_factor: Reg,
     pub w_elem_off: Reg,
     pub w_byte_off: Reg,
-    pub w_addr: Reg,    // reused as b64 for global weight address
-    pub w_addr64: Reg,   // b64 for global weight address
+    pub w_addr: Reg,   // reused as b64 for global weight address
+    pub w_addr64: Reg, // b64 for global weight address
     // ALU scratch for each pair
     pub x_lo: Reg,
     pub w_lo: Reg,
@@ -1512,9 +1671,24 @@ impl TransformScratch {
             row_in_tile: [ptx.regs.alloc_b32(), ptx.regs.alloc_b32()],
             temp_addr: [ptx.regs.alloc_b32(), ptx.regs.alloc_b32()],
             dest_addr: [ptx.regs.alloc_b32(), ptx.regs.alloc_b32()],
-            raw: [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(), ptx.regs.alloc_b32(), ptx.regs.alloc_b32()],
-            wgt: [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(), ptx.regs.alloc_b32(), ptx.regs.alloc_b32()],
-            result: [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(), ptx.regs.alloc_b32(), ptx.regs.alloc_b32()],
+            raw: [
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+            ],
+            wgt: [
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+            ],
+            result: [
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+            ],
             factor_off: ptx.regs.alloc_b32(),
             factor_addr: ptx.regs.alloc_b32(),
             norm_factor_b32: ptx.regs.alloc_b32(),
@@ -1549,13 +1723,13 @@ impl TransformScratch {
 fn emit_smem_transform_dynamic(
     ptx: &mut PtxBuilder,
     _smem_base: Reg,
-    a_cp_off: Reg,           // swizzled cp.async offset for this thread
-    a_buf_base: Reg,         // .b32: smem_base + read_buf_off (A tile base)
-    a_temp_buf_base: Reg,    // .b32: smem_base + read_buf_off + a_temp_start (A_temp base)
-    norm_factors_base: Reg,  // .b32: smem base of norm factors
-    wnorm_ptr: Reg,          // .b64: global pointer to norm weights
+    a_cp_off: Reg,          // swizzled cp.async offset for this thread
+    a_buf_base: Reg,        // .b32: smem_base + read_buf_off (A tile base)
+    a_temp_buf_base: Reg,   // .b32: smem_base + read_buf_off + a_temp_start (A_temp base)
+    norm_factors_base: Reg, // .b32: smem base of norm factors
+    wnorm_ptr: Reg,         // .b64: global pointer to norm weights
     tid: Reg,
-    k_offset: Reg,           // current K offset (in elements) for norm weight lookup
+    k_offset: Reg, // current K offset (in elements) for norm weight lookup
     scratch: &TransformScratch,
 ) {
     ptx.comment("Transform: smem_A_temp -> normalize -> smem_A");
@@ -1569,18 +1743,30 @@ fn emit_smem_transform_dynamic(
 
     // Process chunk 0 (rows 0..31) and chunk 1 (rows 32..63)
     for chunk in 0..2u32 {
-        ptx.add_s32_imm(s.row_in_tile[chunk as usize], s.tid_row, (chunk * 32) as i32);
+        ptx.add_s32_imm(
+            s.row_in_tile[chunk as usize],
+            s.tid_row,
+            (chunk * 32) as i32,
+        );
 
         // smem_A_temp source address
         ptx.add_s32(s.temp_addr[chunk as usize], a_temp_buf_base, a_cp_off);
         if chunk > 0 {
-            ptx.add_s32_imm(s.temp_addr[chunk as usize], s.temp_addr[chunk as usize], (chunk * 2048) as i32);
+            ptx.add_s32_imm(
+                s.temp_addr[chunk as usize],
+                s.temp_addr[chunk as usize],
+                (chunk * 2048) as i32,
+            );
         }
 
         // smem_A destination address
         ptx.add_s32(s.dest_addr[chunk as usize], a_buf_base, a_cp_off);
         if chunk > 0 {
-            ptx.add_s32_imm(s.dest_addr[chunk as usize], s.dest_addr[chunk as usize], (chunk * 2048) as i32);
+            ptx.add_s32_imm(
+                s.dest_addr[chunk as usize],
+                s.dest_addr[chunk as usize],
+                (chunk * 2048) as i32,
+            );
         }
 
         // Load 16 bytes from temp
@@ -1649,9 +1835,11 @@ pub fn emit_gemm_cpasync_transform_a(
     ptx: &mut PtxBuilder,
     c: &GemmConfig,
     setup: &GemmSetup,
-    ga0: Reg, ga1: Reg,
+    ga0: Reg,
+    ga1: Reg,
     a_cp_off: Reg,
-    gb0: Reg, gb1: Reg,
+    gb0: Reg,
+    gb1: Reg,
     b_cp_off: Reg,
     n_param: Reg,
     k_param: Reg,
@@ -1660,8 +1848,8 @@ pub fn emit_gemm_cpasync_transform_a(
     let smem_base = setup.smem_base;
     let tid = setup.tid;
 
-    let a_tile_bytes = c.smem_a_bytes();     // 4096
-    let buf_stride = a_tile_bytes;           // 4096
+    let a_tile_bytes = c.smem_a_bytes(); // 4096
+    let buf_stride = a_tile_bytes; // 4096
     let b_start = (a_tile_bytes * c.num_stages) as i32; // 8192
     let a_temp_start = transform_ctx.a_temp_offset; // 16384
 
@@ -1718,11 +1906,15 @@ pub fn emit_gemm_cpasync_transform_a(
         let a_temp_buf0 = ptx.regs.alloc_b32();
         ptx.add_s32_imm(a_temp_buf0, smem_base, a_temp_start as i32);
         emit_smem_transform_dynamic(
-            ptx, smem_base, a_cp_off,
-            a_buf0, a_temp_buf0,
+            ptx,
+            smem_base,
+            a_cp_off,
+            a_buf0,
+            a_temp_buf0,
             transform_ctx.norm_factors_base,
             transform_ctx.wnorm_ptr,
-            tid, k_elem_offset,
+            tid,
+            k_elem_offset,
             &transform_scratch,
         );
     }
@@ -1787,11 +1979,15 @@ pub fn emit_gemm_cpasync_transform_a(
         let a_temp_buf1 = ptx.regs.alloc_b32();
         ptx.add_s32_imm(a_temp_buf1, smem_base, (a_temp_start + buf_stride) as i32);
         emit_smem_transform_dynamic(
-            ptx, smem_base, a_cp_off,
-            a_buf1, a_temp_buf1,
+            ptx,
+            smem_base,
+            a_cp_off,
+            a_buf1,
+            a_temp_buf1,
             transform_ctx.norm_factors_base,
             transform_ctx.wnorm_ptr,
-            tid, k_elem_offset,
+            tid,
+            k_elem_offset,
             &transform_scratch,
         );
     }
@@ -1890,8 +2086,10 @@ pub fn emit_gemm_cpasync_transform_a(
     let mut acc_regs: Vec<[Reg; 4]> = Vec::with_capacity(num_tiles);
     for _ in 0..num_tiles {
         let tile = [
-            ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-            ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
         ];
         for &r in &tile {
             ptx.mov_b32(r, zero);
@@ -1954,22 +2152,38 @@ pub fn emit_gemm_cpasync_transform_a(
     // ldmatrix A
     let a_addr_ki0 = ptx.regs.alloc_b32();
     ptx.add_s32(a_addr_ki0, buf_base, a_off_ki0);
-    let a_frag_ki0_rm0 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let a_frag_ki0_rm0 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki0_rm0, a_addr_ki0, None);
 
-    let a_frag_ki0_rm1 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let a_frag_ki0_rm1 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki0_rm1, a_addr_ki0, Some(2048));
 
     let a_addr_ki1 = ptx.regs.alloc_b32();
     ptx.add_s32(a_addr_ki1, buf_base, a_off_ki1);
-    let a_frag_ki1_rm0 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let a_frag_ki1_rm0 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki1_rm0, a_addr_ki1, None);
 
-    let a_frag_ki1_rm1 = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                           ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+    let a_frag_ki1_rm1 = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
     ptx.ldmatrix_x4(a_frag_ki1_rm1, a_addr_ki1, Some(2048));
     ptx.blank();
 
@@ -1979,8 +2193,12 @@ pub fn emit_gemm_cpasync_transform_a(
     for rn in 0..REG_N as usize {
         let b_addr = ptx.regs.alloc_b32();
         ptx.add_s32(b_addr, buf_base, b_off[rn]);
-        let frag = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32(),
-                    ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+        let frag = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
         ptx.ldmatrix_x4_trans(frag, b_addr, Some(b_start));
         b_frags.push(frag);
     }
@@ -1990,19 +2208,39 @@ pub fn emit_gemm_cpasync_transform_a(
     ptx.comment("MMA -- 16 total");
     for rn in 0..REG_N as usize {
         let ai = 0 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki0_rm0, [b_frags[rn][0], b_frags[rn][1]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki0_rm0,
+            [b_frags[rn][0], b_frags[rn][1]],
+            acc.regs[ai],
+        );
     }
     for rn in 0..REG_N as usize {
         let ai = 1 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki0_rm1, [b_frags[rn][0], b_frags[rn][1]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki0_rm1,
+            [b_frags[rn][0], b_frags[rn][1]],
+            acc.regs[ai],
+        );
     }
     for rn in 0..REG_N as usize {
         let ai = 0 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki1_rm0, [b_frags[rn][2], b_frags[rn][3]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki1_rm0,
+            [b_frags[rn][2], b_frags[rn][3]],
+            acc.regs[ai],
+        );
     }
     for rn in 0..REG_N as usize {
         let ai = 1 * REG_N as usize + rn;
-        ptx.mma_m16n8k16(acc.regs[ai], a_frag_ki1_rm1, [b_frags[rn][2], b_frags[rn][3]], acc.regs[ai]);
+        ptx.mma_m16n8k16(
+            acc.regs[ai],
+            a_frag_ki1_rm1,
+            [b_frags[rn][2], b_frags[rn][3]],
+            acc.regs[ai],
+        );
     }
     ptx.blank();
 
@@ -2060,11 +2298,15 @@ pub fn emit_gemm_cpasync_transform_a(
         ptx.add_s32(write_a_temp_base, smem_base, write_buf_off);
         ptx.add_s32_imm(write_a_temp_base, write_a_temp_base, a_temp_start as i32);
         emit_smem_transform_dynamic(
-            ptx, smem_base, a_cp_off,
-            write_a_base, write_a_temp_base,
+            ptx,
+            smem_base,
+            a_cp_off,
+            write_a_base,
+            write_a_temp_base,
             transform_ctx.norm_factors_base,
             transform_ctx.wnorm_ptr,
-            tid, k_elem_offset,
+            tid,
+            k_elem_offset,
             &transform_scratch,
         );
     }
@@ -2267,7 +2509,16 @@ pub fn emit_gemm_setup(ptx: &mut PtxBuilder, c: &GemmConfig) -> GemmSetup {
     ptx.mov_b32_name(smem_base, "global_smem");
     ptx.blank();
 
-    GemmSetup { block_row, block_col, warp_id, lane, group, tg, smem_base, tid }
+    GemmSetup {
+        block_row,
+        block_col,
+        warp_id,
+        lane,
+        group,
+        tg,
+        smem_base,
+        tid,
+    }
 }
 
 /// Emit cp.async swizzle address computation for A and B.
@@ -2299,7 +2550,10 @@ pub fn emit_cpasync_swizzle(ptx: &mut PtxBuilder, tid: Reg) -> (Reg, Reg) {
 /// Returns (ga0, ga1, a_tid_row, a_tid_col).
 pub fn emit_a_global_addrs(
     ptx: &mut PtxBuilder,
-    block_row: Reg, k_param: Reg, a_ptr: Reg, tid: Reg,
+    block_row: Reg,
+    k_param: Reg,
+    a_ptr: Reg,
+    tid: Reg,
 ) -> (Reg, Reg, Reg, Reg) {
     ptx.comment("Global addresses for A");
     let a_tid_and3 = ptx.regs.alloc_b32();
@@ -2334,7 +2588,10 @@ pub fn emit_a_global_addrs(
 /// Returns (gb0, gb1).
 pub fn emit_b_global_addrs(
     ptx: &mut PtxBuilder,
-    block_col: Reg, n_param: Reg, b_ptr: Reg, tid: Reg,
+    block_col: Reg,
+    n_param: Reg,
+    b_ptr: Reg,
+    tid: Reg,
 ) -> (Reg, Reg) {
     ptx.comment("Global addresses for B");
     let b_tid_and7 = ptx.regs.alloc_b32();
@@ -2418,9 +2675,17 @@ pub fn emit_cpasync_swizzle_cfg(ptx: &mut PtxBuilder, c: &GemmConfig, tid: Reg) 
 pub fn emit_a_global_addrs_cfg(
     ptx: &mut PtxBuilder,
     c: &GemmConfig,
-    block_row: Reg, k_param: Reg, a_ptr: Reg, tid: Reg,
+    block_row: Reg,
+    k_param: Reg,
+    a_ptr: Reg,
+    tid: Reg,
 ) -> Vec<Reg> {
-    ptx.comment(&format!("Global addresses for A ({}x{}, {} chunks)", c.bm, c.bk, c.cp_chunks_a()));
+    ptx.comment(&format!(
+        "Global addresses for A ({}x{}, {} chunks)",
+        c.bm,
+        c.bk,
+        c.cp_chunks_a()
+    ));
     let a_tid_and3 = ptx.regs.alloc_b32();
     ptx.and_b32(a_tid_and3, tid, 3);
     let a_tid_col = ptx.regs.alloc_b32();
@@ -2428,8 +2693,8 @@ pub fn emit_a_global_addrs_cfg(
     let a_tid_row = ptx.regs.alloc_b32();
     ptx.shr_u32(a_tid_row, tid, 2);
 
-    let row_chunks = c.bm / 32;   // 2 for BM=64, 4 for BM=128
-    let kcol_chunks = c.bk / 32;   // 1 for BK=32, 2 for BK=64
+    let row_chunks = c.bm / 32; // 2 for BM=64, 4 for BM=128
+    let kcol_chunks = c.bk / 32; // 1 for BK=32, 2 for BK=64
 
     // First chunk: grow = block_row + a_tid_row, gidx = grow * K + a_tid_col
     let grow_base = ptx.regs.alloc_b32();
@@ -2481,14 +2746,20 @@ pub fn emit_a_global_addrs_cfg(
 pub fn emit_b_global_addrs_cfg(
     ptx: &mut PtxBuilder,
     c: &GemmConfig,
-    block_col: Reg, n_param: Reg, b_ptr: Reg, tid: Reg,
+    block_col: Reg,
+    n_param: Reg,
+    b_ptr: Reg,
+    tid: Reg,
 ) -> Vec<Reg> {
     let threads = c.threads();
-    let b_threads_per_row = c.bn / 8;  // 8 for BN=64, 16 for BN=128
-    let b_rows_per_chunk = threads / b_threads_per_row;  // 16 for BN=64, 8 for BN=128
+    let b_threads_per_row = c.bn / 8; // 8 for BN=64, 16 for BN=128
+    let b_rows_per_chunk = threads / b_threads_per_row; // 16 for BN=64, 8 for BN=128
     let cp_chunks = c.cp_chunks_b();
 
-    ptx.comment(&format!("Global addresses for B ({} rows/chunk, {} chunks)", b_rows_per_chunk, cp_chunks));
+    ptx.comment(&format!(
+        "Global addresses for B ({} rows/chunk, {} chunks)",
+        b_rows_per_chunk, cp_chunks
+    ));
 
     let b_tid_col_idx = ptx.regs.alloc_b32();
     ptx.and_b32(b_tid_col_idx, tid, b_threads_per_row - 1);
@@ -2554,23 +2825,17 @@ pub fn build_gemm(config: &GemmConfig) -> String {
     let (a_cp_off, b_cp_off) = emit_cpasync_swizzle(&mut ptx, setup.tid);
 
     // Phase 4: Global addresses
-    let (ga0, ga1, _a_tid_row, _a_tid_col) = emit_a_global_addrs(
-        &mut ptx, setup.block_row, k_param, a_ptr, setup.tid,
-    );
-    let (gb0, gb1) = emit_b_global_addrs(
-        &mut ptx, setup.block_col, n_param, b_ptr, setup.tid,
-    );
+    let (ga0, ga1, _a_tid_row, _a_tid_col) =
+        emit_a_global_addrs(&mut ptx, setup.block_row, k_param, a_ptr, setup.tid);
+    let (gb0, gb1) = emit_b_global_addrs(&mut ptx, setup.block_col, n_param, b_ptr, setup.tid);
 
     // Phase 5-13: K-loop with CpAsyncLoader for both A and B
     let a_loader = CpAsyncLoader;
     let b_loader = CpAsyncLoader;
 
     let acc = emit_gemm_with_loaders(
-        &mut ptx, c, &setup,
-        &a_loader, ga0, ga1, a_cp_off,
-        &b_loader, gb0, gb1, b_cp_off,
-        n_param, k_param,
-        None, // no extra advance
+        &mut ptx, c, &setup, &a_loader, ga0, ga1, a_cp_off, &b_loader, gb0, gb1, b_cp_off, n_param,
+        k_param, None, // no extra advance
         None, // no fragment transform — standalone GEMM
     );
 
@@ -2603,7 +2868,7 @@ fn gemm_params() -> Vec<(&'static str, &'static str)> {
 /// This produces identical behavior to build_gemm() but uses the
 /// pluggable atom architecture. Supports any config (64×64, 128×128, etc).
 pub fn build_gemm_pipeline(config: &GemmConfig) -> String {
-    use crate::atoms::{CpAsyncCopy, IdentityTransform, Mma16816, IdentityEpilogue, EpilogueAtom};
+    use crate::atoms::{CpAsyncCopy, EpilogueAtom, IdentityEpilogue, IdentityTransform, Mma16816};
     use crate::pipeline::MainloopPipeline;
 
     let mut ptx = PtxBuilder::new(config.clone());
@@ -2632,25 +2897,28 @@ pub fn build_gemm_pipeline(config: &GemmConfig) -> String {
     let (a_cp_off, b_cp_off) = emit_cpasync_swizzle_cfg(&mut ptx, c, setup.tid);
 
     // Phase 4: Global addresses (config-aware, returns Vec)
-    let ga_chunks = emit_a_global_addrs_cfg(
-        &mut ptx, c, setup.block_row, k_param, a_ptr, setup.tid,
-    );
-    let gb_chunks = emit_b_global_addrs_cfg(
-        &mut ptx, c, setup.block_col, n_param, b_ptr, setup.tid,
-    );
+    let ga_chunks =
+        emit_a_global_addrs_cfg(&mut ptx, c, setup.block_row, k_param, a_ptr, setup.tid);
+    let gb_chunks =
+        emit_b_global_addrs_cfg(&mut ptx, c, setup.block_col, n_param, b_ptr, setup.tid);
 
     // Phase 5: Pipeline with Identity atoms (standalone GEMM)
     let pipeline = MainloopPipeline::new(c.num_stages);
     let result = pipeline.emit(
-        &mut ptx, c, &setup,
-        &CpAsyncCopy,          // copy_a
-        &CpAsyncCopy,          // copy_b
-        &IdentityTransform,    // no transform
-        &Mma16816,             // tensor core MMA
-        ga_chunks, a_cp_off,
-        gb_chunks, b_cp_off,
-        n_param, k_param,
-        None,                  // no extra advance
+        &mut ptx,
+        c,
+        &setup,
+        &CpAsyncCopy,       // copy_a
+        &CpAsyncCopy,       // copy_b
+        &IdentityTransform, // no transform
+        &Mma16816,          // tensor core MMA
+        ga_chunks,
+        a_cp_off,
+        gb_chunks,
+        b_cp_off,
+        n_param,
+        k_param,
+        None, // no extra advance
     );
 
     // Phase 6: Identity epilogue + store

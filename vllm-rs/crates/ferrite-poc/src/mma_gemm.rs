@@ -13,18 +13,18 @@ use anyhow::{Context, Result, bail};
 use std::ffi::{CString, c_uint, c_void};
 use std::time::Instant;
 
+use inkwell::builder::Builder;
 use inkwell::context::Context as LlvmContext;
 use inkwell::module::Module;
-use inkwell::builder::Builder;
-use inkwell::targets::{TargetMachine, TargetTriple, FileType};
+use inkwell::targets::{FileType, TargetMachine, TargetTriple};
 use inkwell::types::AsTypeRef;
-use inkwell::values::{AsValueRef, BasicValueEnum, FunctionValue, IntValue, FloatValue};
+use inkwell::values::{AsValueRef, BasicValueEnum, FloatValue, FunctionValue, IntValue};
 use inkwell::{AddressSpace, IntPredicate};
 
-use cudarc::driver::sys as cuda_sys;
 use cudarc::driver::result as cuda;
+use cudarc::driver::sys as cuda_sys;
 
-use crate::{create_nvptx_target_machine, add_nvvm_kernel_metadata, call_sreg, call_barrier0};
+use crate::{add_nvvm_kernel_metadata, call_barrier0, call_sreg, create_nvptx_target_machine};
 
 pub fn step3_mma_gemm(sm: &str) -> Result<()> {
     let m: u32 = 1024;
@@ -42,9 +42,7 @@ pub fn step3_mma_gemm(sm: &str) -> Result<()> {
 
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null byte")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
-    let func = unsafe {
-        cuda::module::get_function(module, CString::new("mma_gemm").unwrap())?
-    };
+    let func = unsafe { cuda::module::get_function(module, CString::new("mma_gemm").unwrap())? };
     println!("  [cuda] Module loaded, function resolved");
 
     // Allocate — A,B are f16 (2 bytes), C is f32 (4 bytes)
@@ -88,35 +86,58 @@ pub fn step3_mma_gemm(sm: &str) -> Result<()> {
     // Warmup
     for _ in 0..5 {
         unsafe {
-            cuda::launch_kernel(func, (grid_x, grid_y, 1), (32, 1, 1), smem_bytes, stream, params)?;
+            cuda::launch_kernel(
+                func,
+                (grid_x, grid_y, 1),
+                (32, 1, 1),
+                smem_bytes,
+                stream,
+                params,
+            )?;
         }
     }
-    unsafe { cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::stream::synchronize(stream)?;
+    }
 
     // Benchmark
     let iters = 100;
     let start = Instant::now();
     for _ in 0..iters {
         unsafe {
-            cuda::launch_kernel(func, (grid_x, grid_y, 1), (32, 1, 1), smem_bytes, stream, params)?;
+            cuda::launch_kernel(
+                func,
+                (grid_x, grid_y, 1),
+                (32, 1, 1),
+                smem_bytes,
+                stream,
+                params,
+            )?;
         }
     }
-    unsafe { cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::stream::synchronize(stream)?;
+    }
     let elapsed = start.elapsed();
     let us_per_launch = elapsed.as_micros() as f64 / iters as f64;
 
     // Verify
-    unsafe { cuda::memcpy_dtoh_sync(&mut h_c, d_c)?; }
+    unsafe {
+        cuda::memcpy_dtoh_sync(&mut h_c, d_c)?;
+    }
 
     let mut max_err: f32 = 0.0;
     for row in 0..m as usize {
         for col in 0..n as usize {
             let mut expected: f32 = 0.0;
             for kk in 0..k as usize {
-                expected += h_a[row * k as usize + kk].to_f32() * h_b[kk * n as usize + col].to_f32();
+                expected +=
+                    h_a[row * k as usize + kk].to_f32() * h_b[kk * n as usize + col].to_f32();
             }
             let err = (h_c[row * n as usize + col] - expected).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
         }
     }
 
@@ -130,7 +151,10 @@ pub fn step3_mma_gemm(sm: &str) -> Result<()> {
 
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     let tflops = flops / (us_per_launch * 1e-6) / 1e12;
-    println!("  {:.1} μs, {:.2} TFLOPS (mma.sync tensor cores)", us_per_launch, tflops);
+    println!(
+        "  {:.1} μs, {:.2} TFLOPS (mma.sync tensor cores)",
+        us_per_launch, tflops
+    );
 
     unsafe {
         cuda::stream::destroy(stream)?;
@@ -180,8 +204,12 @@ fn emit_mma_gemm_ptx(sm: &str) -> Result<String> {
     // Kernel: void mma_gemm(f16* A, f16* B, f32* C, u32 M, u32 N, u32 K)
     let fn_type = void_type.fn_type(
         &[
-            ptr_global.into(), ptr_global.into(), ptr_global.into(),
-            i32_type.into(), i32_type.into(), i32_type.into(),
+            ptr_global.into(),
+            ptr_global.into(),
+            ptr_global.into(),
+            i32_type.into(),
+            i32_type.into(),
+            i32_type.into(),
         ],
         false,
     );
@@ -214,9 +242,27 @@ fn emit_mma_gemm_ptx(sm: &str) -> Result<String> {
     let n_param = function.get_nth_param(4).unwrap().into_int_value();
     let k_param = function.get_nth_param(5).unwrap().into_int_value();
 
-    let lane = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.tid.x", "lane");
-    let bid_x = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.ctaid.x", "bid_x");
-    let bid_y = call_sreg(&context, &module, &builder, "llvm.nvvm.read.ptx.sreg.ctaid.y", "bid_y");
+    let lane = call_sreg(
+        &context,
+        &module,
+        &builder,
+        "llvm.nvvm.read.ptx.sreg.tid.x",
+        "lane",
+    );
+    let bid_x = call_sreg(
+        &context,
+        &module,
+        &builder,
+        "llvm.nvvm.read.ptx.sreg.ctaid.x",
+        "bid_x",
+    );
+    let bid_y = call_sreg(
+        &context,
+        &module,
+        &builder,
+        "llvm.nvvm.read.ptx.sreg.ctaid.y",
+        "bid_y",
+    );
 
     // block_row = bid_y * 16, block_col = bid_x * 8
     let block_row = builder.build_int_mul(bid_y, c16, "block_row").unwrap();
@@ -230,12 +276,22 @@ fn emit_mma_gemm_ptx(sm: &str) -> Result<String> {
     let smem_base = smem_global.as_pointer_value();
     // smem_a: [16×16 f16] at offset 0 (512 bytes)
     // smem_bt: [8×16 f16] at offset 512 (256 bytes) — B transposed
-    let smem_a_base = builder.build_pointer_cast(smem_base, ptr_shared, "smem_a").unwrap();
+    let smem_a_base = builder
+        .build_pointer_cast(smem_base, ptr_shared, "smem_a")
+        .unwrap();
     let smem_bt_off = unsafe {
-        builder.build_gep(context.i8_type(), smem_base,
-            &[i32_type.const_int(512, false)], "bt_off").unwrap()
+        builder
+            .build_gep(
+                context.i8_type(),
+                smem_base,
+                &[i32_type.const_int(512, false)],
+                "bt_off",
+            )
+            .unwrap()
     };
-    let smem_bt_base = builder.build_pointer_cast(smem_bt_off, ptr_shared, "smem_bt").unwrap();
+    let smem_bt_base = builder
+        .build_pointer_cast(smem_bt_off, ptr_shared, "smem_bt")
+        .unwrap();
 
     builder.build_unconditional_branch(tile_header).unwrap();
 
@@ -248,8 +304,12 @@ fn emit_mma_gemm_ptx(sm: &str) -> Result<String> {
     let acc3_phi = builder.build_phi(f32_type, "acc3").unwrap();
     let t = t_phi.as_basic_value().into_int_value();
 
-    let tile_cmp = builder.build_int_compare(IntPredicate::ULT, t, k_param, "tile_cmp").unwrap();
-    builder.build_conditional_branch(tile_cmp, tile_body, tile_exit).unwrap();
+    let tile_cmp = builder
+        .build_int_compare(IntPredicate::ULT, t, k_param, "tile_cmp")
+        .unwrap();
+    builder
+        .build_conditional_branch(tile_cmp, tile_body, tile_exit)
+        .unwrap();
 
     // ── Tile body ──
     builder.position_at_end(tile_body);
@@ -267,14 +327,21 @@ fn emit_mma_gemm_ptx(sm: &str) -> Result<String> {
         // Global: A[(block_row + row_t) * K + (t + col_t)]
         let a_row = builder.build_int_add(block_row, row_t, "").unwrap();
         let a_col = builder.build_int_add(t, col_t, "").unwrap();
-        let a_idx = builder.build_int_add(
-            builder.build_int_mul(a_row, k_param, "").unwrap(),
-            a_col, "",
-        ).unwrap();
+        let a_idx = builder
+            .build_int_add(
+                builder.build_int_mul(a_row, k_param, "").unwrap(),
+                a_col,
+                "",
+            )
+            .unwrap();
         let a_gep = unsafe { builder.build_gep(f16_type, a_ptr, &[a_idx], "").unwrap() };
         let a_val = builder.build_load(f16_type, a_gep, "").unwrap();
         // Store to smem_a[lin]
-        let sa_gep = unsafe { builder.build_gep(f16_type, smem_a_base, &[lin], "").unwrap() };
+        let sa_gep = unsafe {
+            builder
+                .build_gep(f16_type, smem_a_base, &[lin], "")
+                .unwrap()
+        };
         builder.build_store(sa_gep, a_val).unwrap();
     }
 
@@ -290,18 +357,24 @@ fn emit_mma_gemm_ptx(sm: &str) -> Result<String> {
         // Global: B[(t + row_b) * N + (block_col + col_b)]
         let b_row = builder.build_int_add(t, row_b, "").unwrap();
         let b_col = builder.build_int_add(block_col, col_b, "").unwrap();
-        let b_idx = builder.build_int_add(
-            builder.build_int_mul(b_row, n_param, "").unwrap(),
-            b_col, "",
-        ).unwrap();
+        let b_idx = builder
+            .build_int_add(
+                builder.build_int_mul(b_row, n_param, "").unwrap(),
+                b_col,
+                "",
+            )
+            .unwrap();
         let b_gep = unsafe { builder.build_gep(f16_type, b_ptr, &[b_idx], "").unwrap() };
         let b_val = builder.build_load(f16_type, b_gep, "").unwrap();
         // Transposed store: smem_bt[col_b * 16 + row_b]
-        let bt_idx = builder.build_int_add(
-            builder.build_int_mul(col_b, c16, "").unwrap(),
-            row_b, "",
-        ).unwrap();
-        let sbt_gep = unsafe { builder.build_gep(f16_type, smem_bt_base, &[bt_idx], "").unwrap() };
+        let bt_idx = builder
+            .build_int_add(builder.build_int_mul(col_b, c16, "").unwrap(), row_b, "")
+            .unwrap();
+        let sbt_gep = unsafe {
+            builder
+                .build_gep(f16_type, smem_bt_base, &[bt_idx], "")
+                .unwrap()
+        };
         builder.build_store(sbt_gep, b_val).unwrap();
     }
 
@@ -316,33 +389,41 @@ fn emit_mma_gemm_ptx(sm: &str) -> Result<String> {
     // a[3]: smem_a[(group + 8) * 16 + tg * 2 + 8]
     let tg_x2 = builder.build_int_mul(tg, c2, "tg_x2").unwrap();
     let group_x16 = builder.build_int_mul(group, c16, "g_x16").unwrap();
-    let group8_x16 = builder.build_int_mul(
-        builder.build_int_add(group, c8, "").unwrap(),
-        c16, "g8_x16",
-    ).unwrap();
+    let group8_x16 = builder
+        .build_int_mul(builder.build_int_add(group, c8, "").unwrap(), c16, "g8_x16")
+        .unwrap();
 
     let a_frag_indices = [
         builder.build_int_add(group_x16, tg_x2, "af0").unwrap(),
         builder.build_int_add(group8_x16, tg_x2, "af1").unwrap(),
-        builder.build_int_add(
-            group_x16,
-            builder.build_int_add(tg_x2, c8, "").unwrap(),
-            "af2",
-        ).unwrap(),
-        builder.build_int_add(
-            group8_x16,
-            builder.build_int_add(tg_x2, c8, "").unwrap(),
-            "af3",
-        ).unwrap(),
+        builder
+            .build_int_add(
+                group_x16,
+                builder.build_int_add(tg_x2, c8, "").unwrap(),
+                "af2",
+            )
+            .unwrap(),
+        builder
+            .build_int_add(
+                group8_x16,
+                builder.build_int_add(tg_x2, c8, "").unwrap(),
+                "af3",
+            )
+            .unwrap(),
     ];
 
     let mut a_regs = Vec::new();
     for (i, idx) in a_frag_indices.iter().enumerate() {
         let ptr = unsafe {
-            builder.build_gep(f16_type, smem_a_base, &[*idx], &format!("a_fp{i}")).unwrap()
+            builder
+                .build_gep(f16_type, smem_a_base, &[*idx], &format!("a_fp{i}"))
+                .unwrap()
         };
         // Load i32 (2 packed f16) from this address
-        let val = builder.build_load(i32_type, ptr, &format!("a{i}")).unwrap().into_int_value();
+        let val = builder
+            .build_load(i32_type, ptr, &format!("a{i}"))
+            .unwrap()
+            .into_int_value();
         a_regs.push(val);
     }
 
@@ -358,9 +439,14 @@ fn emit_mma_gemm_ptx(sm: &str) -> Result<String> {
     let mut b_regs = Vec::new();
     for (i, idx) in b_frag_indices.iter().enumerate() {
         let ptr = unsafe {
-            builder.build_gep(f16_type, smem_bt_base, &[*idx], &format!("b_fp{i}")).unwrap()
+            builder
+                .build_gep(f16_type, smem_bt_base, &[*idx], &format!("b_fp{i}"))
+                .unwrap()
         };
-        let val = builder.build_load(i32_type, ptr, &format!("b{i}")).unwrap().into_int_value();
+        let val = builder
+            .build_load(i32_type, ptr, &format!("b{i}"))
+            .unwrap()
+            .into_int_value();
         b_regs.push(val);
     }
 
@@ -372,10 +458,8 @@ fn emit_mma_gemm_ptx(sm: &str) -> Result<String> {
         acc3_phi.as_basic_value().into_float_value(),
     ];
 
-    let [d0, d1, d2, d3] = build_mma_sync_asm(
-        &builder, &context, &module,
-        &a_regs, &b_regs, &acc_in,
-    );
+    let [d0, d1, d2, d3] =
+        build_mma_sync_asm(&builder, &context, &module, &a_regs, &b_regs, &acc_in);
 
     call_barrier0(&context, &module, &builder);
 
@@ -403,16 +487,20 @@ fn emit_mma_gemm_ptx(sm: &str) -> Result<String> {
     let c_rows = [
         builder.build_int_add(block_row, group, "cr0").unwrap(),
         builder.build_int_add(block_row, group, "cr1").unwrap(),
-        builder.build_int_add(
-            block_row,
-            builder.build_int_add(group, c8, "").unwrap(),
-            "cr2",
-        ).unwrap(),
-        builder.build_int_add(
-            block_row,
-            builder.build_int_add(group, c8, "").unwrap(),
-            "cr3",
-        ).unwrap(),
+        builder
+            .build_int_add(
+                block_row,
+                builder.build_int_add(group, c8, "").unwrap(),
+                "cr2",
+            )
+            .unwrap(),
+        builder
+            .build_int_add(
+                block_row,
+                builder.build_int_add(group, c8, "").unwrap(),
+                "cr3",
+            )
+            .unwrap(),
     ];
     let c_cols = [
         out_col_base,
@@ -428,12 +516,17 @@ fn emit_mma_gemm_ptx(sm: &str) -> Result<String> {
     ];
 
     for i in 0..4 {
-        let idx = builder.build_int_add(
-            builder.build_int_mul(c_rows[i], n_param, "").unwrap(),
-            c_cols[i], &format!("ci{i}"),
-        ).unwrap();
+        let idx = builder
+            .build_int_add(
+                builder.build_int_mul(c_rows[i], n_param, "").unwrap(),
+                c_cols[i],
+                &format!("ci{i}"),
+            )
+            .unwrap();
         let gep = unsafe {
-            builder.build_gep(f32_type, c_ptr, &[idx], &format!("cep{i}")).unwrap()
+            builder
+                .build_gep(f32_type, c_ptr, &[idx], &format!("cep{i}"))
+                .unwrap()
         };
         builder.build_store(gep, accs[i]).unwrap();
     }
@@ -503,12 +596,7 @@ fn build_mma_sync_asm<'ctx>(
             f32_type.as_type_ref(), // c2
             f32_type.as_type_ref(), // c3
         ];
-        let fn_type = llvm_sys::core::LLVMFunctionType(
-            ret_struct,
-            param_types.as_mut_ptr(),
-            10,
-            0,
-        );
+        let fn_type = llvm_sys::core::LLVMFunctionType(ret_struct, param_types.as_mut_ptr(), 10, 0);
 
         // PTX inline asm string
         let asm_str = "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 \
@@ -558,16 +646,28 @@ fn build_mma_sync_asm<'ctx>(
         let d3_name = b"d3\0";
 
         let d0_raw = llvm_sys::core::LLVMBuildExtractValue(
-            builder_ref, call, 0, d0_name.as_ptr() as *const _,
+            builder_ref,
+            call,
+            0,
+            d0_name.as_ptr() as *const _,
         );
         let d1_raw = llvm_sys::core::LLVMBuildExtractValue(
-            builder_ref, call, 1, d1_name.as_ptr() as *const _,
+            builder_ref,
+            call,
+            1,
+            d1_name.as_ptr() as *const _,
         );
         let d2_raw = llvm_sys::core::LLVMBuildExtractValue(
-            builder_ref, call, 2, d2_name.as_ptr() as *const _,
+            builder_ref,
+            call,
+            2,
+            d2_name.as_ptr() as *const _,
         );
         let d3_raw = llvm_sys::core::LLVMBuildExtractValue(
-            builder_ref, call, 3, d3_name.as_ptr() as *const _,
+            builder_ref,
+            call,
+            3,
+            d3_name.as_ptr() as *const _,
         );
 
         [

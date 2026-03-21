@@ -1,7 +1,7 @@
-use std::ffi::CString;
-use std::sync::OnceLock;
 use cudarc::driver::result as cuda;
 use cudarc::driver::sys::{CUfunction, CUmodule};
+use std::ffi::CString;
+use std::sync::OnceLock;
 
 /// A JIT-compiled CUDA kernel backed by a PTX string.
 ///
@@ -71,13 +71,15 @@ impl JitKernel {
     ) -> Result<(), cudarc::driver::DriverError> {
         let f = self.get_function();
         let mut args_mut: Vec<*mut std::ffi::c_void> = args.to_vec();
-        unsafe { cuda::launch_kernel(
-            f,
-            grid,
-            block,
-            shared_mem_bytes,
-            cuda::stream::null(),
-            &mut args_mut,
-        ) }
+        unsafe {
+            cuda::launch_kernel(
+                f,
+                grid,
+                block,
+                shared_mem_bytes,
+                cuda::stream::null(),
+                &mut args_mut,
+            )
+        }
     }
 }

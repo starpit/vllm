@@ -1,19 +1,24 @@
+pub mod atoms;
 pub mod config;
+pub mod fused;
+pub mod gemm;
+pub mod pipeline;
+pub mod rmsnorm;
+pub mod silu;
 pub mod smem;
 pub mod tile;
-pub mod gemm;
-pub mod silu;
-pub mod rmsnorm;
-pub mod fused;
-pub mod atoms;
-pub mod pipeline;
 
-use std::fmt::Write;
 use config::GemmConfig;
+use std::fmt::Write;
 
 /// Register class in PTX.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RegClass { Pred, B32, B64, F32 }
+pub enum RegClass {
+    Pred,
+    B32,
+    B64,
+    F32,
+}
 
 /// Register prefix letters per scope depth.
 /// Outer (0): %r, %rd, %f, %p
@@ -23,22 +28,26 @@ pub enum RegClass { Pred, B32, B64, F32 }
 /// Scope 4+:  %w, %wd, %wf, %wp (etc.)
 const SCOPE_PREFIXES: &[&[&str]] = &[
     // [pred, b32, b64, f32]
-    &["p",  "r",  "rd",  "f"],    // scope 0 (outer)
-    &["tp", "t",  "td",  "tf"],   // scope 1
-    &["up", "u",  "ud",  "uf"],   // scope 2
-    &["vp", "v",  "vd",  "vf"],   // scope 3
-    &["wp", "w",  "wd",  "wf"],   // scope 4
-    &["xp", "x",  "xd",  "xf"],   // scope 5
+    &["p", "r", "rd", "f"],   // scope 0 (outer)
+    &["tp", "t", "td", "tf"], // scope 1
+    &["up", "u", "ud", "uf"], // scope 2
+    &["vp", "v", "vd", "vf"], // scope 3
+    &["wp", "w", "wd", "wf"], // scope 4
+    &["xp", "x", "xd", "xf"], // scope 5
 ];
 
 fn scope_prefix(scope_id: u16, class: RegClass) -> &'static str {
     let idx = scope_id as usize;
-    assert!(idx < SCOPE_PREFIXES.len(), "Too many nested scopes (max {})", SCOPE_PREFIXES.len());
+    assert!(
+        idx < SCOPE_PREFIXES.len(),
+        "Too many nested scopes (max {})",
+        SCOPE_PREFIXES.len()
+    );
     match class {
         RegClass::Pred => SCOPE_PREFIXES[idx][0],
-        RegClass::B32  => SCOPE_PREFIXES[idx][1],
-        RegClass::B64  => SCOPE_PREFIXES[idx][2],
-        RegClass::F32  => SCOPE_PREFIXES[idx][3],
+        RegClass::B32 => SCOPE_PREFIXES[idx][1],
+        RegClass::B64 => SCOPE_PREFIXES[idx][2],
+        RegClass::F32 => SCOPE_PREFIXES[idx][3],
     }
 }
 
@@ -52,13 +61,41 @@ pub struct Reg {
 }
 
 impl Reg {
-    pub fn pred(i: u32) -> Self { Self { class: RegClass::Pred, index: i, scope_id: 0 } }
-    pub fn r(i: u32) -> Self { Self { class: RegClass::B32, index: i, scope_id: 0 } }
-    pub fn rd(i: u32) -> Self { Self { class: RegClass::B64, index: i, scope_id: 0 } }
-    pub fn f(i: u32) -> Self { Self { class: RegClass::F32, index: i, scope_id: 0 } }
+    pub fn pred(i: u32) -> Self {
+        Self {
+            class: RegClass::Pred,
+            index: i,
+            scope_id: 0,
+        }
+    }
+    pub fn r(i: u32) -> Self {
+        Self {
+            class: RegClass::B32,
+            index: i,
+            scope_id: 0,
+        }
+    }
+    pub fn rd(i: u32) -> Self {
+        Self {
+            class: RegClass::B64,
+            index: i,
+            scope_id: 0,
+        }
+    }
+    pub fn f(i: u32) -> Self {
+        Self {
+            class: RegClass::F32,
+            index: i,
+            scope_id: 0,
+        }
+    }
 
     fn with_scope(class: RegClass, index: u32, scope_id: u16) -> Self {
-        Self { class, index, scope_id }
+        Self {
+            class,
+            index,
+            scope_id,
+        }
     }
 }
 
@@ -107,8 +144,14 @@ pub struct RegAllocator {
 impl RegAllocator {
     pub fn new() -> Self {
         Self {
-            pred_next: 1, b32_next: 1, b64_next: 1, f32_next: 1,
-            pred_hwm: 1, b32_hwm: 1, b64_hwm: 1, f32_hwm: 1,
+            pred_next: 1,
+            b32_next: 1,
+            b64_next: 1,
+            f32_next: 1,
+            pred_hwm: 1,
+            b32_hwm: 1,
+            b64_hwm: 1,
+            f32_hwm: 1,
             scope_stack: Vec::new(),
             block_scope_depth: 0,
         }
@@ -136,7 +179,9 @@ impl RegAllocator {
         self.b32_hwm = self.b32_hwm.max(self.b32_next);
         self.b64_hwm = self.b64_hwm.max(self.b64_next);
         self.f32_hwm = self.f32_hwm.max(self.f32_next);
-        let state = self.scope_stack.pop()
+        let state = self
+            .scope_stack
+            .pop()
             .expect("pop_scope() called without matching push_scope()");
         self.pred_next = state.pred_next;
         self.b32_next = state.b32_next;
@@ -196,10 +241,18 @@ impl RegAllocator {
         r
     }
 
-    pub fn pred_count(&self) -> u32 { self.pred_hwm.max(self.pred_next) }
-    pub fn b32_count(&self) -> u32 { self.b32_hwm.max(self.b32_next) }
-    pub fn b64_count(&self) -> u32 { self.b64_hwm.max(self.b64_next) }
-    pub fn f32_count(&self) -> u32 { self.f32_hwm.max(self.f32_next) }
+    pub fn pred_count(&self) -> u32 {
+        self.pred_hwm.max(self.pred_next)
+    }
+    pub fn b32_count(&self) -> u32 {
+        self.b32_hwm.max(self.b32_next)
+    }
+    pub fn b64_count(&self) -> u32 {
+        self.b64_hwm.max(self.b64_next)
+    }
+    pub fn f32_count(&self) -> u32 {
+        self.f32_hwm.max(self.f32_next)
+    }
 }
 
 /// Saved state for a native PTX block scope.
@@ -286,7 +339,9 @@ impl PtxBuilder {
     /// Inserts `.reg` declarations for block-local registers at the start
     /// of the block and emits `}`. All block-local registers die here.
     pub fn end_scope(&mut self) {
-        let state = self.block_scope_stack.pop()
+        let state = self
+            .block_scope_stack
+            .pop()
             .expect("end_scope() called without matching begin_scope()");
         let scope_id = state.scope_id;
 
@@ -527,7 +582,9 @@ impl PtxBuilder {
         } else {
             format!("[{addr}+{offset}]")
         };
-        self.w(&format!("st.global.v2.b32 \t{addr_str}, {{{val0}, {val1}}};"));
+        self.w(&format!(
+            "st.global.v2.b32 \t{addr_str}, {{{val0}, {val1}}};"
+        ));
     }
 
     // -- Vectorized loads --
@@ -582,7 +639,9 @@ impl PtxBuilder {
         if offset == 0 {
             self.w(&format!("@{pred} st.shared.b32 \t[{addr}], {val};"));
         } else {
-            self.w(&format!("@{pred} st.shared.b32 \t[{addr}+{offset}], {val};"));
+            self.w(&format!(
+                "@{pred} st.shared.b32 \t[{addr}+{offset}], {val};"
+            ));
         }
     }
 
@@ -700,10 +759,7 @@ impl PtxBuilder {
         self.w(&format!(
             "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 \
              {{{}, {}, {}, {}}}, {{{}, {}, {}, {}}}, {{{}, {}}}, {{{}, {}, {}, {}}};",
-            d[0], d[1], d[2], d[3],
-            a[0], a[1], a[2], a[3],
-            b[0], b[1],
-            c[0], c[1], c[2], c[3]
+            d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], c[2], c[3]
         ));
     }
 
@@ -800,15 +856,32 @@ mod tests {
         let body = &ptx.body;
         assert!(body.contains("{"), "Body should contain opening brace");
         assert!(body.contains("}"), "Body should contain closing brace");
-        assert!(body.contains(".reg .b32 \t%t<2>;"), "Body should contain block-local b32 .reg decl, got: {}", body);
-        assert!(body.contains(".reg .f32 \t%tf<2>;"), "Body should contain block-local f32 .reg decl, got: {}", body);
+        assert!(
+            body.contains(".reg .b32 \t%t<2>;"),
+            "Body should contain block-local b32 .reg decl, got: {}",
+            body
+        );
+        assert!(
+            body.contains(".reg .f32 \t%tf<2>;"),
+            "Body should contain block-local f32 .reg decl, got: {}",
+            body
+        );
 
         // Verify inner register names use scope prefix
-        assert!(body.contains("%t1"), "Body should reference %t1 (scope 1 b32)");
-        assert!(body.contains("%tf1"), "Body should reference %tf1 (scope 1 f32)");
+        assert!(
+            body.contains("%t1"),
+            "Body should reference %t1 (scope 1 b32)"
+        );
+        assert!(
+            body.contains("%tf1"),
+            "Body should reference %tf1 (scope 1 f32)"
+        );
 
         // Verify outer registers use standard prefix
-        assert!(body.contains("%r1"), "Body should reference %r1 (outer b32)");
+        assert!(
+            body.contains("%r1"),
+            "Body should reference %r1 (outer b32)"
+        );
     }
 
     #[test]
@@ -846,11 +919,15 @@ mod tests {
         let mut ptx = PtxBuilder::new(config);
 
         // Allocate 5 outer regs
-        for _ in 0..5 { ptx.regs.alloc_b32(); }
+        for _ in 0..5 {
+            ptx.regs.alloc_b32();
+        }
 
         // Block scope with 100 inner regs
         ptx.begin_scope();
-        for _ in 0..100 { ptx.regs.alloc_b32(); }
+        for _ in 0..100 {
+            ptx.regs.alloc_b32();
+        }
         ptx.end_scope();
 
         // Outer scope should still report 5 (well, 6 because count is next index)

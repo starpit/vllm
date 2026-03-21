@@ -1,11 +1,10 @@
-use super::{PtxBuilder, Reg};
 use super::config::GemmConfig;
 use super::gemm::{
-    AccumulatorMap, NormalizedLoader, CpAsyncLoader,
-    emit_gemm_setup, emit_cpasync_swizzle, emit_a_global_addrs,
-    emit_b_global_addrs, emit_gemm_with_loaders, emit_store_c,
+    AccumulatorMap, CpAsyncLoader, NormalizedLoader, emit_a_global_addrs, emit_b_global_addrs,
+    emit_cpasync_swizzle, emit_gemm_setup, emit_gemm_with_loaders, emit_store_c,
 };
 use super::tile::emit_norm_factor_computation;
+use super::{PtxBuilder, Reg};
 
 // ===========================================================================
 // Fused RMSNorm -> GEMM -> SiLU megakernel
@@ -31,13 +30,16 @@ pub fn build_fused_rmsnorm_gemm_silu(config: &GemmConfig, hidden_size: u32) -> S
     let threads = c.threads();
 
     // Shared memory layout
-    let gemm_smem = c.smem_total();          // 16384
+    let gemm_smem = c.smem_total(); // 16384
     let norm_scratch_off = gemm_smem;
     let norm_factors_off = norm_scratch_off + 32;
     let _total_smem = norm_factors_off + bm * 4;
 
     ptx.comment("=== Fused RMSNorm -> GEMM -> SiLU megakernel ===");
-    ptx.comment(&format!("BM={}, BN={}, BK={}, threads={}", bm, c.bn, bk, threads));
+    ptx.comment(&format!(
+        "BM={}, BN={}, BK={}, threads={}",
+        bm, c.bn, bk, threads
+    ));
     ptx.comment(&format!("hidden_size={}", hidden_size));
     ptx.blank();
 
@@ -88,14 +90,11 @@ pub fn build_fused_rmsnorm_gemm_silu(config: &GemmConfig, hidden_size: u32) -> S
     let (a_cp_off, b_cp_off) = emit_cpasync_swizzle(&mut ptx, setup.tid);
 
     // A global addresses (pointing to input, not a pre-normalized buffer)
-    let (ga0, ga1, a_tid_row, a_tid_col) = emit_a_global_addrs(
-        &mut ptx, setup.block_row, k_param, input_ptr, setup.tid,
-    );
+    let (ga0, ga1, a_tid_row, a_tid_col) =
+        emit_a_global_addrs(&mut ptx, setup.block_row, k_param, input_ptr, setup.tid);
 
     // B global addresses
-    let (gb0, gb1) = emit_b_global_addrs(
-        &mut ptx, setup.block_col, n_param, wgemm_ptr, setup.tid,
-    );
+    let (gb0, gb1) = emit_b_global_addrs(&mut ptx, setup.block_col, n_param, wgemm_ptr, setup.tid);
 
     // RMSNorm weight pointer for this thread's K column
     let wnorm_thread = ptx.regs.alloc_b64();
@@ -131,10 +130,19 @@ pub fn build_fused_rmsnorm_gemm_silu(config: &GemmConfig, hidden_size: u32) -> S
     };
 
     let mut acc = emit_gemm_with_loaders(
-        &mut ptx, c, &setup,
-        &a_loader, ga0, ga1, a_cp_off,
-        &b_loader, gb0, gb1, b_cp_off,
-        n_param, k_param,
+        &mut ptx,
+        c,
+        &setup,
+        &a_loader,
+        ga0,
+        ga1,
+        a_cp_off,
+        &b_loader,
+        gb0,
+        gb1,
+        b_cp_off,
+        n_param,
+        k_param,
         Some(&advance_wnorm),
     );
 

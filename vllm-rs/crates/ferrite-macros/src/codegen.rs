@@ -29,41 +29,45 @@ pub fn generate(
                  The entire point of Ferrite is the megakernel — ONE kernel, ONE launch. \
                  Found: {:?}",
                 plan.kernels.len(),
-                plan.kernels.iter().map(|k| match k {
-                    KernelKind::RmsNorm { .. } => "RmsNorm",
-                    KernelKind::Gemm { .. } => "Gemm",
-                    KernelKind::Silu { .. } => "Silu",
-                    KernelKind::GemmSilu { .. } => "GemmSilu",
-                    KernelKind::RmsNormGemmSilu { .. } => "RmsNormGemmSilu",
-                    KernelKind::RmsNormGemm { .. } => "RmsNormGemm",
-                }).collect::<Vec<_>>(),
+                plan.kernels
+                    .iter()
+                    .map(|k| match k {
+                        KernelKind::RmsNorm { .. } => "RmsNorm",
+                        KernelKind::Gemm { .. } => "Gemm",
+                        KernelKind::Silu { .. } => "Silu",
+                        KernelKind::GemmSilu { .. } => "GemmSilu",
+                        KernelKind::RmsNormGemmSilu { .. } => "RmsNormGemmSilu",
+                        KernelKind::RmsNormGemm { .. } => "RmsNormGemm",
+                    })
+                    .collect::<Vec<_>>(),
             ),
         ));
     }
 
     match &plan.kernels[0] {
-        KernelKind::RmsNormGemmSilu { norm_idx, gemm_idx, silu_idx } => {
-            generate_rmsnorm_gemm_silu(attr, input_fn, graph, *norm_idx, *gemm_idx, *silu_idx)
-        }
+        KernelKind::RmsNormGemmSilu {
+            norm_idx,
+            gemm_idx,
+            silu_idx,
+        } => generate_rmsnorm_gemm_silu(attr, input_fn, graph, *norm_idx, *gemm_idx, *silu_idx),
         KernelKind::RmsNormGemm { norm_idx, gemm_idx } => {
             generate_rmsnorm_gemm(attr, input_fn, graph, *norm_idx, *gemm_idx)
         }
         KernelKind::GemmSilu { gemm_idx, silu_idx } => {
             generate_gemm_silu(attr, input_fn, graph, *gemm_idx, *silu_idx)
         }
-        KernelKind::Gemm { node_idx } => {
-            generate_standalone_gemm(attr, input_fn, graph, *node_idx)
-        }
-        other => {
-            Err(syn::Error::new_spanned(
-                &input_fn.sig.ident,
-                format!("Unsupported standalone kernel kind: {:?}", match other {
+        KernelKind::Gemm { node_idx } => generate_standalone_gemm(attr, input_fn, graph, *node_idx),
+        other => Err(syn::Error::new_spanned(
+            &input_fn.sig.ident,
+            format!(
+                "Unsupported standalone kernel kind: {:?}",
+                match other {
                     KernelKind::RmsNorm { .. } => "RmsNorm",
                     KernelKind::Silu { .. } => "Silu",
                     _ => "Unknown",
-                }),
-            ))
-        }
+                }
+            ),
+        )),
     }
 }
 
@@ -87,9 +91,14 @@ fn generate_rmsnorm_gemm_silu(
 
     // Generate PTX at compile time using 128×128 tiles for the fused megakernel.
     let config = ferrite_ptx::config::GemmConfig {
-        bm: 128, bn: 128, bk: 32,
-        wm: 64, wn: 64,
-        mma_m: 16, mma_n: 8, mma_k: 16,
+        bm: 128,
+        bn: 128,
+        bk: 32,
+        wm: 64,
+        wn: 64,
+        mma_m: 16,
+        mma_n: 8,
+        mma_k: 16,
         num_stages: 2,
         sm_arch: arch.clone(),
     };
@@ -110,7 +119,8 @@ fn generate_rmsnorm_gemm_silu(
     // 2. Creates a static JitKernel
     // 3. Wraps the original function to launch it
     let kernel_name_str = "fused_rmsnorm_gemm_silu";
-    let static_name = quote::format_ident!("__FERRITE_KERNEL_{}", fn_name.to_string().to_uppercase());
+    let static_name =
+        quote::format_ident!("__FERRITE_KERNEL_{}", fn_name.to_string().to_uppercase());
 
     Ok(quote! {
         // The compile-time-generated PTX for the fused megakernel.

@@ -10,10 +10,10 @@
 //! Usage:
 //!   cargo run --release --bin ferrite-fuse-bench
 
-use std::ffi::{CString, c_void};
-use std::time::Instant;
 use cudarc::driver::result as cuda;
 use cudarc::driver::sys as cuda_sys;
+use std::ffi::{CString, c_void};
+use std::time::Instant;
 
 type DevicePtr = u64;
 
@@ -62,7 +62,8 @@ fn launch_standalone_rmsnorm(
             512,
             cuda::stream::null(),
             &mut args,
-        ).unwrap();
+        )
+        .unwrap();
     }
 }
 
@@ -101,16 +102,13 @@ fn launch_standalone_gemm(
             smem,
             cuda::stream::null(),
             &mut args,
-        ).unwrap();
+        )
+        .unwrap();
     }
 }
 
 /// Launch a standalone SiLU kernel.
-fn launch_standalone_silu(
-    f: cuda_sys::CUfunction,
-    d_data: cuda_sys::CUdeviceptr,
-    n: u32,
-) {
+fn launch_standalone_silu(f: cuda_sys::CUfunction, d_data: cuda_sys::CUdeviceptr, n: u32) {
     let mut p_data = d_data;
     let mut p_n = n;
 
@@ -132,21 +130,23 @@ fn launch_standalone_silu(
             0,
             cuda::stream::null(),
             &mut args,
-        ).unwrap();
+        )
+        .unwrap();
     }
 }
 
 fn load_kernel(ptx: &str, name: &str) -> cuda_sys::CUfunction {
     let ptx_cstr = CString::new(ptx).unwrap();
-    let module = unsafe {
-        cuda::module::load_data(ptx_cstr.as_ptr() as *const _).unwrap()
-    };
+    let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _).unwrap() };
     let name_cstr = CString::new(name).unwrap();
     unsafe { cuda::module::get_function(module, name_cstr).unwrap() }
 }
 
 fn bench_fused_vs_unfused(batch: u32, hidden: u32, out_feat: u32, warmup: u32, iters: u32) {
-    println!("\n  Benchmark: batch={}, hidden={}, out_feat={}", batch, hidden, out_feat);
+    println!(
+        "\n  Benchmark: batch={}, hidden={}, out_feat={}",
+        batch, hidden, out_feat
+    );
 
     let stream = cuda::stream::null();
 
@@ -188,13 +188,29 @@ fn bench_fused_vs_unfused(batch: u32, hidden: u32, out_feat: u32, warmup: u32, i
     // ── Warmup + benchmark: FUSED ──
     println!("  Benchmarking fused kernel (ONE launch)...");
     for _ in 0..warmup {
-        mlp_fwd_fused(d_input, d_wnorm, d_wgemm, d_output_fused, batch, hidden, out_feat);
+        mlp_fwd_fused(
+            d_input,
+            d_wnorm,
+            d_wgemm,
+            d_output_fused,
+            batch,
+            hidden,
+            out_feat,
+        );
     }
     unsafe { cuda::stream::synchronize(stream).unwrap() };
 
     let t0 = Instant::now();
     for _ in 0..iters {
-        mlp_fwd_fused(d_input, d_wnorm, d_wgemm, d_output_fused, batch, hidden, out_feat);
+        mlp_fwd_fused(
+            d_input,
+            d_wnorm,
+            d_wgemm,
+            d_output_fused,
+            batch,
+            hidden,
+            out_feat,
+        );
     }
     unsafe { cuda::stream::synchronize(stream).unwrap() };
     let fused_us = t0.elapsed().as_micros() as f64 / iters as f64;
@@ -203,7 +219,16 @@ fn bench_fused_vs_unfused(batch: u32, hidden: u32, out_feat: u32, warmup: u32, i
     println!("  Benchmarking unfused (3 separate launches)...");
     for _ in 0..warmup {
         launch_standalone_rmsnorm(rmsnorm_f, d_norm_out, d_input, d_wnorm, batch);
-        launch_standalone_gemm(gemm_f, d_norm_out, d_wgemm, d_output_unfused, batch, out_feat, hidden, smem);
+        launch_standalone_gemm(
+            gemm_f,
+            d_norm_out,
+            d_wgemm,
+            d_output_unfused,
+            batch,
+            out_feat,
+            hidden,
+            smem,
+        );
         launch_standalone_silu(silu_f, d_output_unfused, batch * out_feat);
     }
     unsafe { cuda::stream::synchronize(stream).unwrap() };
@@ -211,7 +236,16 @@ fn bench_fused_vs_unfused(batch: u32, hidden: u32, out_feat: u32, warmup: u32, i
     let t0 = Instant::now();
     for _ in 0..iters {
         launch_standalone_rmsnorm(rmsnorm_f, d_norm_out, d_input, d_wnorm, batch);
-        launch_standalone_gemm(gemm_f, d_norm_out, d_wgemm, d_output_unfused, batch, out_feat, hidden, smem);
+        launch_standalone_gemm(
+            gemm_f,
+            d_norm_out,
+            d_wgemm,
+            d_output_unfused,
+            batch,
+            out_feat,
+            hidden,
+            smem,
+        );
         launch_standalone_silu(silu_f, d_output_unfused, batch * out_feat);
     }
     unsafe { cuda::stream::synchronize(stream).unwrap() };
@@ -225,9 +259,15 @@ fn bench_fused_vs_unfused(batch: u32, hidden: u32, out_feat: u32, warmup: u32, i
     println!("    Speedup: {:.2}x", speedup);
 
     if speedup > 1.0 {
-        println!("    PASS: Fused kernel is {:.1}% faster", (speedup - 1.0) * 100.0);
+        println!(
+            "    PASS: Fused kernel is {:.1}% faster",
+            (speedup - 1.0) * 100.0
+        );
     } else {
-        println!("    FAIL: Fused kernel is SLOWER by {:.1}%", (1.0 - speedup) * 100.0);
+        println!(
+            "    FAIL: Fused kernel is SLOWER by {:.1}%",
+            (1.0 - speedup) * 100.0
+        );
         println!("    The NormalizedLoader needs further optimization.");
     }
 
@@ -256,11 +296,13 @@ fn main() {
         let maj = cuda::device::get_attribute(
             device,
             cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-        ).unwrap_or(0);
+        )
+        .unwrap_or(0);
         let min = cuda::device::get_attribute(
             device,
             cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-        ).unwrap_or(0);
+        )
+        .unwrap_or(0);
         (maj, min)
     };
     println!("GPU: compute capability {}.{}", major, minor);

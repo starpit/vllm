@@ -603,6 +603,63 @@ studied them in detail BEFORE attempting our own fusion, not AFTER failing
 five times. The pipeline-with-atoms architecture was right there in CUTLASS
 the whole time.
 
+**Mistake 7: Using 64×64 tiles when CUTLASS uses 128×128**
+
+Five iterations of fusion at 64×64 tiles (0.48x–0.69x of unfused) before
+discovering CUTLASS uses 128×128 tiles with 162 registers. The larger tile
+amortizes the transform cost: 64 MMA per K-iter (128×128) vs 16 MMA (64×64)
+means the 2× `mul.rn.f16x2` per fragment register is <3% of compute instead
+of ~10%. Once we matched CUTLASS's tile size, the fusion worked (1.1x faster
+than unfused at batch=1024).
+
+**Lesson:** Always check the reference implementation's EXACT configuration
+before designing. Tile size, warp layout, register budget, pipeline stages —
+copy all of it, not just the algorithm.
+
+**Mistake 8: Comparing against own unfused baseline instead of production**
+
+We spent iterations trying to beat our own 3-kernel unfused baseline. The real
+comparison is against PyTorch (the production baseline). Even at 0.88× our
+unfused, the fused kernel was already 1.4-2.1× faster than PyTorch. The
+obsession with beating our own optimized unfused baseline obscured the real win.
+
+---
+
+### Phase 0 Results Summary (March 21, 2026)
+
+**Validated against real-world baselines:**
+
+| Benchmark (batch=1024) | Time | vs PyTorch |
+|------------------------|------|-----------|
+| PyTorch unfused (RMSNorm+GEMM+SiLU) | 1151 μs | 1.0× |
+| Ferrite hand-written fused 128×128 | 703 μs | **1.6× faster** |
+| Ferrite proc macro fused (pipeline) | ~660 μs | **~1.7× faster** |
+
+| Benchmark (batch=4096) | Time | vs PyTorch |
+|------------------------|------|-----------|
+| PyTorch unfused | 7015 μs | 1.0× |
+| Ferrite hand-written fused | 2926 μs | **2.4× faster** |
+
+**Standalone building blocks (L4 GPU):**
+
+| Kernel | Performance |
+|--------|------------|
+| GEMM 64×64 (hand-written PTX) | 55 TFLOPS (matches Triton) |
+| GEMM 128×128 (hand-written PTX) | 48 TFLOPS (matches Triton) |
+| SiLU standalone | 238 GB/s (matches Triton) |
+| RMSNorm standalone | 5.9× faster than Triton at batch=1 |
+| CUTLASS fused GEMM→LayerNorm→GEMM | 74.6 TFLOPS (reference) |
+
+**Architecture validated:**
+- Direct PTX generation beats LLVM IR path by 1.77×
+- Pipeline + atoms abstraction: zero overhead for standalone GEMM (55 TFLOPS)
+- 128×128 tiles + CUTLASS composition pattern: fusion overhead <3% at scale
+- `fma.rn.f16x2` / `mul.rn.f16x2` in-place transforms: zero extra registers
+- Proc macro generates PTX at compile time, embeds as const string
+- One kernel, one launch, intermediates in registers
+
+---
+
 ### Layer 2: Operation Library (`libops`)
 
 Individual operations built on Layer 1, each as a Rust trait.

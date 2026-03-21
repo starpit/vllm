@@ -1,9 +1,9 @@
 extern crate proc_macro;
 
-mod parse;
-mod ops;
-mod strategy;
 mod codegen;
+mod ops;
+mod parse;
+mod strategy;
 
 use proc_macro::TokenStream;
 use syn::parse_macro_input;
@@ -40,10 +40,7 @@ pub fn fuse(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
-fn fuse_impl(
-    attr: parse::FuseAttr,
-    input_fn: syn::ItemFn,
-) -> syn::Result<TokenStream> {
+fn fuse_impl(attr: parse::FuseAttr, input_fn: syn::ItemFn) -> syn::Result<TokenStream> {
     // Step 1: Parse function body into OpGraph
     let graph = parse::parse_fn_body(&input_fn)?;
 

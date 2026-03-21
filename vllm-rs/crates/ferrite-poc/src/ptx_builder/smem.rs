@@ -1,11 +1,11 @@
-use super::{PtxBuilder, Reg};
 use super::config::GemmConfig;
+use super::{PtxBuilder, Reg};
 
 /// Shared memory layout for double-buffered GEMM.
 pub struct SmemLayout {
-    pub a_offset: [u32; 2],  // byte offset of A in each buffer
-    pub b_offset: [u32; 2],  // byte offset of B in each buffer
-    pub buf_stride: u32,     // bytes per buffer
+    pub a_offset: [u32; 2], // byte offset of A in each buffer
+    pub b_offset: [u32; 2], // byte offset of B in each buffer
+    pub buf_stride: u32,    // bytes per buffer
     pub total: u32,
 }
 
@@ -60,7 +60,10 @@ pub fn emit_cpasync_swizzle(ptx: &mut PtxBuilder, _c: &GemmConfig, tid: Reg) -> 
         b_offsets.push(emit_swizzle_bytes(ptx, base));
     }
 
-    CpAsyncAddrs { a_offsets, b_offsets }
+    CpAsyncAddrs {
+        a_offsets,
+        b_offsets,
+    }
 }
 
 /// Registers holding ldmatrix source addresses (relative to buffer A/B start).
@@ -73,8 +76,10 @@ pub struct LdmatrixAddrs {
 
 /// Emits ldmatrix address precomputation.
 pub fn emit_ldmatrix_addrs(
-    ptx: &mut PtxBuilder, c: &GemmConfig,
-    lane: Reg, warp_id: Reg,
+    ptx: &mut PtxBuilder,
+    c: &GemmConfig,
+    lane: Reg,
+    warp_id: Reg,
 ) -> LdmatrixAddrs {
     // A ldmatrix (non-transposed): row = rm*MMA_M + lane%16, col = ki*MMA_K
     let lane_mod16 = ptx.regs.alloc_b32();
@@ -121,7 +126,10 @@ pub fn emit_ldmatrix_addrs(
         b_offsets.push(addr);
     }
 
-    LdmatrixAddrs { a_offsets, b_offsets }
+    LdmatrixAddrs {
+        a_offsets,
+        b_offsets,
+    }
 }
 
 /// Computes swizzled byte offset from element index.

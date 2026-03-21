@@ -800,6 +800,7 @@ unsafe extern "C" {
         out_features: c_int,
         top_k: c_int,
         apply_weights: c_int,
+        block_m: c_int,
         stream: CUstream,
     );
 
@@ -5297,7 +5298,7 @@ pub unsafe fn fused_moe_fp8_gemm(
     num_tokens_post_padded: GpuTensor,
     num_tokens: usize,
     top_k: usize,
-    _block_size: usize,
+    block_m: usize,
     apply_weights: bool,
     sm_version: u32,
     alloc: &mut CachingAllocator,
@@ -5330,6 +5331,7 @@ pub unsafe fn fused_moe_fp8_gemm(
         out_features as c_int,
         top_k as c_int,
         apply_weights as c_int,
+        block_m as c_int,
         stream,
     );
     out

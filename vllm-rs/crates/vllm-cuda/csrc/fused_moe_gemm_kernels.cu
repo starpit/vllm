@@ -35,10 +35,15 @@
 
 using namespace nvcuda;
 
-// Fixed tile sizes
-#define BLOCK_M 128  // default / used by FP8 kernels (not yet templated)
+// Fixed tile sizes (BLOCK_M only used by FP8 SM89 PTX kernel, which is not yet templated)
+#define BLOCK_M 128
 #define BLOCK_N 128
 #define BLOCK_K 32
+
+// GROUP_SIZE_M: L2 cache locality optimization from Python vLLM's Triton kernel.
+// Groups GROUP_SIZE_M consecutive M-blocks with the same N-block before advancing N,
+// so B-tile loads hit L2 cache. Python vLLM default = 8.
+#define GROUP_SIZE_M 8
 
 // WMMA fragment size (used by BF16, F16, and FP8 dequant kernels)
 #define WMMA_M 16
@@ -93,8 +98,15 @@ fused_moe_gemm_bf16_wmma(
 
     const int32_t total_padded = *num_tokens_post_padded;
     const int32_t num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
-    const int32_t pid_m = blockIdx.x / num_n_blocks;
-    const int32_t pid_n = blockIdx.x % num_n_blocks;
+
+    // GROUP_SIZE_M swizzle: group M-blocks for L2 locality on B tiles.
+    const int32_t num_m_blocks = gridDim.x / num_n_blocks;
+    const int32_t num_pid_in_group = GROUP_SIZE_M * num_n_blocks;
+    const int32_t group_id = blockIdx.x / num_pid_in_group;
+    const int32_t first_pid_m = group_id * GROUP_SIZE_M;
+    const int32_t group_size_m = min(num_m_blocks - first_pid_m, GROUP_SIZE_M);
+    const int32_t pid_m = first_pid_m + (blockIdx.x % group_size_m);
+    const int32_t pid_n = (blockIdx.x % num_pid_in_group) / group_size_m;
 
     if (pid_m * BLOCK_M_T >= total_padded) return;
 
@@ -227,8 +239,15 @@ fused_moe_gemm_f16_wmma(
 
     const int32_t total_padded = *num_tokens_post_padded;
     const int32_t num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
-    const int32_t pid_m = blockIdx.x / num_n_blocks;
-    const int32_t pid_n = blockIdx.x % num_n_blocks;
+
+    // GROUP_SIZE_M swizzle
+    const int32_t num_m_blocks = gridDim.x / num_n_blocks;
+    const int32_t num_pid_in_group = GROUP_SIZE_M * num_n_blocks;
+    const int32_t group_id = blockIdx.x / num_pid_in_group;
+    const int32_t first_pid_m = group_id * GROUP_SIZE_M;
+    const int32_t group_size_m = min(num_m_blocks - first_pid_m, GROUP_SIZE_M);
+    const int32_t pid_m = first_pid_m + (blockIdx.x % group_size_m);
+    const int32_t pid_n = (blockIdx.x % num_pid_in_group) / group_size_m;
 
     if (pid_m * BLOCK_M_T >= total_padded) return;
 
@@ -548,8 +567,10 @@ fused_moe_gemm_fp8_sm89(
 
 // SM80+ fallback: load FP8 from global, dequant to BF16 in shared memory, BF16 WMMA compute.
 // Same interface as SM89 kernel. Still gets 2x bandwidth savings from FP8 storage.
+// Templated on BLOCK_M_T with warp redistribution + GROUP_SIZE_M swizzle.
+template <int BLOCK_M_T>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK)
-fused_moe_gemm_fp8_dequant(
+fused_moe_gemm_fp8_dequant_wmma(
     __nv_bfloat16* __restrict__ output,
     const uint8_t* __restrict__ input,    // FP8 E4M3 [M, K]
     const uint8_t* __restrict__ weights,  // FP8 E4M3 [E, N, K]
@@ -565,12 +586,23 @@ fused_moe_gemm_fp8_dequant(
     int32_t top_k,
     int32_t apply_weights)
 {
+    constexpr int WARPS_PER_M = BLOCK_M_T / WMMA_M;
+    constexpr int WARPS_PER_N = WARPS_PER_BLOCK / WARPS_PER_M;
+    constexpr int N_TILES_PER_WARP = WARP_TILES_N / WARPS_PER_N;
+
     const int32_t total_padded = *num_tokens_post_padded;
     const int32_t num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
-    const int32_t pid_m = blockIdx.x / num_n_blocks;
-    const int32_t pid_n = blockIdx.x % num_n_blocks;
 
-    if (pid_m * BLOCK_M >= total_padded) return;
+    // GROUP_SIZE_M swizzle
+    const int32_t num_m_blocks = gridDim.x / num_n_blocks;
+    const int32_t num_pid_in_group = GROUP_SIZE_M * num_n_blocks;
+    const int32_t group_id = blockIdx.x / num_pid_in_group;
+    const int32_t first_pid_m = group_id * GROUP_SIZE_M;
+    const int32_t group_size_m = min(num_m_blocks - first_pid_m, GROUP_SIZE_M);
+    const int32_t pid_m = first_pid_m + (blockIdx.x % group_size_m);
+    const int32_t pid_n = (blockIdx.x % num_pid_in_group) / group_size_m;
+
+    if (pid_m * BLOCK_M_T >= total_padded) return;
 
     const int32_t expert_id = expert_ids[pid_m];
     if (expert_id < 0) return;
@@ -580,24 +612,25 @@ fused_moe_gemm_fp8_dequant(
 
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
-    const int warp_m = warp_id;
+    const int warp_m = warp_id / WARPS_PER_N;
+    const int warp_n_start = (warp_id % WARPS_PER_N) * N_TILES_PER_WARP;
 
     // Dequantized BF16 tiles in shared memory (same layout as BF16 kernel).
-    __shared__ __nv_bfloat16 smem_a[BLOCK_M][BLOCK_K];
+    __shared__ __nv_bfloat16 smem_a[BLOCK_M_T][BLOCK_K];
     __shared__ __nv_bfloat16 smem_b[BLOCK_K][BLOCK_N];
 
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[WARP_TILES_N];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[N_TILES_PER_WARP];
     #pragma unroll
-    for (int wn = 0; wn < WARP_TILES_N; ++wn) {
+    for (int wn = 0; wn < N_TILES_PER_WARP; ++wn) {
         wmma::fill_fragment(acc[wn], 0.0f);
     }
 
     for (int32_t k_start = 0; k_start < K; k_start += BLOCK_K) {
         // Load A: FP8 → BF16 dequant in smem. No scale applied here (scale in epilogue).
-        for (int32_t idx = threadIdx.x; idx < BLOCK_M * BLOCK_K; idx += THREADS_PER_BLOCK) {
+        for (int32_t idx = threadIdx.x; idx < BLOCK_M_T * BLOCK_K; idx += THREADS_PER_BLOCK) {
             int32_t m_local = idx / BLOCK_K;
             int32_t k_local = idx % BLOCK_K;
-            int32_t global_m = pid_m * BLOCK_M + m_local;
+            int32_t global_m = pid_m * BLOCK_M_T + m_local;
             int32_t global_k = k_start + k_local;
 
             __nv_bfloat16 val = __float2bfloat16(0.0f);
@@ -626,16 +659,16 @@ fused_moe_gemm_fp8_dequant(
 
         __syncthreads();
 
-        // Standard BF16 WMMA compute.
+        // Standard BF16 WMMA compute with warp redistribution.
         #pragma unroll
         for (int32_t ki = 0; ki < BLOCK_K; ki += WMMA_K) {
             wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
             wmma::load_matrix_sync(a_frag, &smem_a[warp_m * WMMA_M][ki], BLOCK_K);
 
             #pragma unroll
-            for (int wn = 0; wn < WARP_TILES_N; ++wn) {
+            for (int wn = 0; wn < N_TILES_PER_WARP; ++wn) {
                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
-                wmma::load_matrix_sync(b_frag, &smem_b[ki][wn * WMMA_N], BLOCK_N);
+                wmma::load_matrix_sync(b_frag, &smem_b[ki][(warp_n_start + wn) * WMMA_N], BLOCK_N);
                 wmma::mma_sync(acc[wn], a_frag, b_frag, acc[wn]);
             }
         }
@@ -647,15 +680,15 @@ fused_moe_gemm_fp8_dequant(
     __shared__ float warp_staging[WARPS_PER_BLOCK][WMMA_M * WMMA_N];
 
     #pragma unroll
-    for (int wn = 0; wn < WARP_TILES_N; ++wn) {
+    for (int wn = 0; wn < N_TILES_PER_WARP; ++wn) {
         wmma::store_matrix_sync(
             &warp_staging[warp_id][0], acc[wn], WMMA_N, wmma::mem_row_major);
         __syncwarp();
 
         for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
             int32_t m_local = warp_m * WMMA_M + i / WMMA_N;
-            int32_t n_local = wn * WMMA_N + i % WMMA_N;
-            int32_t global_m = pid_m * BLOCK_M + m_local;
+            int32_t n_local = (warp_n_start + wn) * WMMA_N + i % WMMA_N;
+            int32_t global_m = pid_m * BLOCK_M_T + m_local;
             int32_t global_n = pid_n * BLOCK_N + n_local;
 
             if (global_m >= total_padded || global_n >= N) continue;
@@ -815,20 +848,31 @@ extern "C" void fused_moe_fp8_gemm_dequant(
     int out_features,
     int top_k,
     int apply_weights,
+    int block_m,
     cudaStream_t stream)
 {
-    int max_m_blocks = CEILDIV(num_valid_tokens * top_k, BLOCK_M) + 64;
+    int max_m_blocks = CEILDIV(num_valid_tokens * top_k, block_m) + 64;
     int num_n_blocks = CEILDIV(out_features, BLOCK_N);
     int grid = max_m_blocks * num_n_blocks;
 
-    vllm::moe::fused_moe_gemm_fp8_dequant
-        <<<grid, THREADS_PER_BLOCK, 0, stream>>>(
-            reinterpret_cast<__nv_bfloat16*>(output),
-            reinterpret_cast<const uint8_t*>(input),
-            reinterpret_cast<const uint8_t*>(weights),
-            a_scales, w_scales, topk_weights,
-            sorted_token_ids, expert_ids, num_tokens_post_padded,
-            num_valid_tokens, in_features, out_features, top_k, apply_weights);
+    #define LAUNCH_FP8_DEQUANT(BM) \
+        vllm::moe::fused_moe_gemm_fp8_dequant_wmma<BM> \
+            <<<grid, THREADS_PER_BLOCK, 0, stream>>>( \
+                reinterpret_cast<__nv_bfloat16*>(output), \
+                reinterpret_cast<const uint8_t*>(input), \
+                reinterpret_cast<const uint8_t*>(weights), \
+                a_scales, w_scales, topk_weights, \
+                sorted_token_ids, expert_ids, num_tokens_post_padded, \
+                num_valid_tokens, in_features, out_features, top_k, apply_weights)
+
+    switch (block_m) {
+        case 16:  LAUNCH_FP8_DEQUANT(16);  break;
+        case 32:  LAUNCH_FP8_DEQUANT(32);  break;
+        case 64:  LAUNCH_FP8_DEQUANT(64);  break;
+        case 128: LAUNCH_FP8_DEQUANT(128); break;
+        default:  LAUNCH_FP8_DEQUANT(128); break;
+    }
+    #undef LAUNCH_FP8_DEQUANT
 }
 
 // =====================================================================

@@ -413,14 +413,7 @@ impl MlxQwen3NextAttention {
         } else {
             None
         };
-        let attn_out = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            self.scale,
-            mask,
-            None::<&Array>,
-        )?;
+        let attn_out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
 
         // Reshape: [1, heads, seq, head_dim] -> [seq, heads, head_dim].
         let attn_out = attn_out.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;
@@ -1271,14 +1264,7 @@ impl MlxQuantizedQwen3NextAttention {
         } else {
             None
         };
-        let attn_out = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            self.scale,
-            mask,
-            None::<&Array>,
-        )?;
+        let attn_out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
 
         // Reshape: [1, heads, seq, head_dim] -> [seq, heads, head_dim].
         let attn_out = attn_out.squeeze_axes(&[0])?.transpose_axes(&[1, 0, 2])?;

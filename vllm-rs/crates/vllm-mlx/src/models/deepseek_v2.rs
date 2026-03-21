@@ -532,14 +532,7 @@ impl MlxDeepSeekV2Attention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v_sdpa,
-            self.scale,
-            mask,
-            None::<&Array>,
-        )?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v_sdpa, self.scale, mask)?;
 
         // --- Slice V back from padded dim ---
         // out: [1, heads, seq, qk_head_dim] -> slice -> [1, heads, seq, v_head_dim]
@@ -699,12 +692,7 @@ impl MlxDeepSeekV2Attention {
             let v_stacked = mlx_rs::ops::concatenate_axis(&per_req_v, 0)?;
 
             let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked,
-                &k_stacked,
-                &v_stacked,
-                self.scale,
-                None,
-                None::<&Array>,
+                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
             )?;
 
             // Slice V back from padded dim.
@@ -736,7 +724,6 @@ impl MlxDeepSeekV2Attention {
                     &per_req_v[i],
                     self.scale,
                     mask,
-                    None::<&Array>,
                 )?;
 
                 // Slice V back from padded dim.
@@ -1360,14 +1347,7 @@ impl MlxQuantizedDeepSeekV2Attention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v_sdpa,
-            self.scale,
-            mask,
-            None::<&Array>,
-        )?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v_sdpa, self.scale, mask)?;
 
         // --- Slice V back from padded dim ---
         let out = if self.v_head_dim < self.qk_head_dim {
@@ -1526,12 +1506,7 @@ impl MlxQuantizedDeepSeekV2Attention {
             let v_stacked = mlx_rs::ops::concatenate_axis(&per_req_v, 0)?;
 
             let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked,
-                &k_stacked,
-                &v_stacked,
-                self.scale,
-                None,
-                None::<&Array>,
+                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
             )?;
 
             // Slice V back from padded dim.
@@ -1563,7 +1538,6 @@ impl MlxQuantizedDeepSeekV2Attention {
                     &per_req_v[i],
                     self.scale,
                     mask,
-                    None::<&Array>,
                 )?;
 
                 // Slice V back from padded dim.

@@ -288,14 +288,7 @@ impl MlxCommandRAttention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            self.scale,
-            mask,
-            None::<&Array>,
-        )?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
 
         // out: [1, heads, seq, head_dim] -> [seq, hidden]
         let hidden = (self.num_heads * self.head_dim) as i32;
@@ -390,12 +383,7 @@ impl MlxCommandRAttention {
 
             // Single SDPA: q_len=1 decode → no mask needed.
             let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked,
-                &k_stacked,
-                &v_stacked,
-                self.scale,
-                None,
-                None::<&Array>,
+                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
             )?;
 
             // out: [batch, heads, 1, head_dim] -> [batch, heads*head_dim]
@@ -421,7 +409,6 @@ impl MlxCommandRAttention {
                     &v,
                     self.scale,
                     mask,
-                    None::<&Array>,
                 )?;
 
                 let hidden = (self.num_heads * self.head_dim) as i32;
@@ -855,14 +842,7 @@ impl MlxQuantizedCommandRAttention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            self.scale,
-            mask,
-            None::<&Array>,
-        )?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
 
         let hidden = (self.num_heads * self.head_dim) as i32;
         let out = out
@@ -956,12 +936,7 @@ impl MlxQuantizedCommandRAttention {
 
             // Single SDPA: q_len=1 decode → no mask needed.
             let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked,
-                &k_stacked,
-                &v_stacked,
-                self.scale,
-                None,
-                None::<&Array>,
+                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
             )?;
 
             // out: [batch, heads, 1, head_dim] -> [batch, heads*head_dim]
@@ -987,7 +962,6 @@ impl MlxQuantizedCommandRAttention {
                     &v,
                     self.scale,
                     mask,
-                    None::<&Array>,
                 )?;
 
                 let hidden = (self.num_heads * self.head_dim) as i32;

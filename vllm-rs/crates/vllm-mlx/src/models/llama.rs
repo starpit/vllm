@@ -50,34 +50,19 @@ pub(crate) fn apply_rope_to_cached_k(
     rope: &nn::Rope,
     start_pos: i32,
 ) -> Result<Array, mlx_rs::error::Exception> {
-    let batch = k.dim(0);
-    let heads = k.dim(1);
     let kv_len = k.dim(2);
-    let dim = k.dim(3);
 
-    // [batch, heads, kv_len, dim] → [batch, kv_len, heads, dim] → [batch*kv_len, heads, 1, dim]
-    let k_t = k.transpose_axes(&[0, 2, 1, 3])?;
-    let k_flat = k_t.reshape(&[batch * kv_len, heads, 1, dim])?;
-
-    // Offsets: [start_pos, start_pos+1, ..., start_pos+kv_len-1] repeated per batch
-    let offsets: Vec<i32> = (0..batch)
-        .flat_map(|_| (0..kv_len).map(|i| start_pos + i))
-        .collect();
-    let offsets_arr = Array::from_iter(offsets.iter().copied(), &[batch * kv_len]);
-
-    let k_roped = mlx_rs::fast::rope_dynamic(
-        &k_flat,
-        rope.dimensions,
-        rope.traditional,
-        rope.base,
-        rope.scale,
-        &offsets_arr,
-        None::<&Array>,
-    )?;
-
-    // [batch*kv_len, heads, 1, dim] → [batch, kv_len, heads, dim] → [batch, heads, kv_len, dim]
-    let k_roped = k_roped.reshape(&[batch, kv_len, heads, dim])?;
-    k_roped.transpose_axes(&[0, 2, 1, 3])
+    // Per-position RoPE on each kv_len slice (rope_dynamic not in mlx-rs 0.25).
+    // k: [batch, heads, kv_len, dim]
+    let mut k_parts = Vec::with_capacity(kv_len as usize);
+    for pos in 0..kv_len {
+        let offset = start_pos + pos;
+        // [batch, heads, 1, dim]
+        let k_slice = k.try_index((.., .., pos..pos + 1, ..))?;
+        k_parts.push(mlx_rs::fast::rope(&k_slice, rope.dimensions, rope.traditional, rope.base, rope.scale, offset, None)?);
+    }
+    let k_refs: Vec<&Array> = k_parts.iter().collect();
+    mlx_rs::ops::concatenate_axis(&k_refs, 2)
 }
 
 /// Like `apply_rope_to_cached_k` but with per-batch start positions.
@@ -93,31 +78,26 @@ pub(crate) fn apply_rope_to_cached_k_batched(
     start_positions: &[i32],
 ) -> Result<Array, mlx_rs::error::Exception> {
     let batch = k.dim(0);
-    let heads = k.dim(1);
     let kv_len = k.dim(2);
-    let dim = k.dim(3);
 
-    let k_t = k.transpose_axes(&[0, 2, 1, 3])?;
-    let k_flat = k_t.reshape(&[batch * kv_len, heads, 1, dim])?;
-
-    // Per-batch × per-position offsets
-    let offsets: Vec<i32> = (0..batch as usize)
-        .flat_map(|b| (0..kv_len).map(move |i| start_positions[b] + i))
-        .collect();
-    let offsets_arr = Array::from_iter(offsets.iter().copied(), &[batch * kv_len]);
-
-    let k_roped = mlx_rs::fast::rope_dynamic(
-        &k_flat,
-        rope.dimensions,
-        rope.traditional,
-        rope.base,
-        rope.scale,
-        &offsets_arr,
-        None::<&Array>,
-    )?;
-
-    let k_roped = k_roped.reshape(&[batch, kv_len, heads, dim])?;
-    k_roped.transpose_axes(&[0, 2, 1, 3])
+    // Per-batch, per-position RoPE (rope_dynamic not in mlx-rs 0.25).
+    // k: [B, heads, kv_len, dim]
+    // Process each batch element separately since start_positions differ.
+    let mut batch_parts = Vec::with_capacity(batch as usize);
+    for b in 0..batch as usize {
+        let bb = b as i32;
+        let k_b = k.try_index((bb..bb + 1, .., .., ..))?; // [1, heads, kv_len, dim]
+        let mut pos_parts = Vec::with_capacity(kv_len as usize);
+        for pos in 0..kv_len {
+            let offset = start_positions[b] + pos;
+            let k_slice = k_b.try_index((.., .., pos..pos + 1, ..))?;
+            pos_parts.push(mlx_rs::fast::rope(&k_slice, rope.dimensions, rope.traditional, rope.base, rope.scale, offset, None)?);
+        }
+        let pos_refs: Vec<&Array> = pos_parts.iter().collect();
+        batch_parts.push(mlx_rs::ops::concatenate_axis(&pos_refs, 2)?);
+    }
+    let batch_refs: Vec<&Array> = batch_parts.iter().collect();
+    mlx_rs::ops::concatenate_axis(&batch_refs, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -546,14 +526,7 @@ impl MlxLlamaAttention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            self.scale,
-            mask,
-            None::<&Array>,
-        )?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
 
         // out: [1, heads, seq, head_dim] -> [seq, hidden]
         let hidden = (self.num_heads * self.head_dim) as i32;
@@ -612,35 +585,20 @@ impl MlxLlamaAttention {
                 k = norm.forward(&k.squeeze_axes(&[2])?)?.expand_dims(2)?;
             }
 
-            // Single batched RoPE via rope_dynamic (array offset).
-            let offsets_arr = Array::from_iter(batch_info.rope_offsets.iter().copied(), &[n]);
-            q = mlx_rs::fast::rope_dynamic(
-                &q,
-                self.rope.dimensions,
-                self.rope.traditional,
-                self.rope.base,
-                self.rope.scale,
-                &offsets_arr,
-                None::<&Array>,
-            )?;
-            if !self.fuse_rope {
-                k = mlx_rs::fast::rope_dynamic(
-                    &k,
-                    self.rope.dimensions,
-                    self.rope.traditional,
-                    self.rope.base,
-                    self.rope.scale,
-                    &offsets_arr,
-                    None::<&Array>,
-                )?;
-            }
-
-            // Per-request KV cache update (loop, but only slice + cache ops).
+            // Per-request RoPE + KV cache update.
             for (i, cache) in caches.iter_mut().enumerate().take(batch_info.num_reqs) {
                 let ii = i as i32;
+                let offset = batch_info.rope_offsets[i];
                 let qi = q.try_index((ii..ii + 1, .., .., ..))?;
                 let ki = k.try_index((ii..ii + 1, .., .., ..))?;
                 let vi = v.try_index((ii..ii + 1, .., .., ..))?;
+
+                let qi = self.rope.forward((&qi, offset))?;
+                let ki = if self.fuse_rope {
+                    ki
+                } else {
+                    self.rope.forward((&ki, offset))?
+                };
 
                 let (ki, vi) = crate::cache::kv_cache_update(cache, &ki, &vi)?;
                 let ki = if self.fuse_rope {
@@ -718,12 +676,7 @@ impl MlxLlamaAttention {
 
             // Single SDPA: q_len=1 decode → no mask needed.
             let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked,
-                &k_stacked,
-                &v_stacked,
-                self.scale,
-                None,
-                None::<&Array>,
+                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
             )?;
 
             // out: [batch, heads, 1, head_dim] -> [batch, heads*head_dim]
@@ -759,7 +712,6 @@ impl MlxLlamaAttention {
                     &v,
                     self.scale,
                     mask,
-                    None::<&Array>,
                 )?;
 
                 let hidden = (self.num_heads * self.head_dim) as i32;
@@ -794,7 +746,7 @@ impl MlxLlamaAttention {
         batch_info: &MlxBatchInfo,
         batch_cache: &mut BatchMlxLayerKvCache,
         mask: &Option<Array>,
-        offsets_arr: &Array,
+        _offsets_arr: &Array,
         left_pads: &[usize],
     ) -> Result<Array, Exception> {
         let n = batch_info.num_reqs as i32;
@@ -820,26 +772,26 @@ impl MlxLlamaAttention {
             k = norm.forward(&k.squeeze_axes(&[2])?)?.expand_dims(2)?;
         }
 
-        // Batched RoPE via rope_dynamic (offsets_arr built once, shared across layers).
-        q = mlx_rs::fast::rope_dynamic(
-            &q,
-            self.rope.dimensions,
-            self.rope.traditional,
-            self.rope.base,
-            self.rope.scale,
-            offsets_arr,
-            None::<&Array>,
-        )?;
-        if !self.fuse_rope {
-            k = mlx_rs::fast::rope_dynamic(
-                &k,
-                self.rope.dimensions,
-                self.rope.traditional,
-                self.rope.base,
-                self.rope.scale,
-                offsets_arr,
-                None::<&Array>,
-            )?;
+        // Per-request RoPE (rope_dynamic not available in mlx-rs 0.25).
+        {
+            let mut q_parts = Vec::with_capacity(batch_info.num_reqs);
+            let mut k_parts = Vec::with_capacity(batch_info.num_reqs);
+            for i in 0..batch_info.num_reqs {
+                let ii = i as i32;
+                let offset = batch_info.rope_offsets[i];
+                let qi = q.try_index((ii..ii + 1, .., .., ..))?;
+                let ki = k.try_index((ii..ii + 1, .., .., ..))?;
+                q_parts.push(self.rope.forward((&qi, offset))?);
+                if self.fuse_rope {
+                    k_parts.push(ki);
+                } else {
+                    k_parts.push(self.rope.forward((&ki, offset))?);
+                }
+            }
+            let q_refs: Vec<&Array> = q_parts.iter().collect();
+            let k_refs: Vec<&Array> = k_parts.iter().collect();
+            q = mlx_rs::ops::concatenate_axis(&q_refs, 0)?;
+            k = mlx_rs::ops::concatenate_axis(&k_refs, 0)?;
         }
 
         // Single batched KV cache update for all B sequences.
@@ -861,12 +813,7 @@ impl MlxLlamaAttention {
             .as_ref()
             .map(mlx_rs::fast::ScaledDotProductAttentionMask::Array);
         let out = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &k_cached,
-            &v_cached,
-            self.scale,
-            sdpa_mask,
-            None::<&Array>,
+            &q, &k_cached, &v_cached, self.scale, sdpa_mask,
         )?;
 
         // out: [B, heads, 1, hd] -> [B, hidden]

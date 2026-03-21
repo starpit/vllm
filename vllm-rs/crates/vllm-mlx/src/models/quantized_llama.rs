@@ -457,14 +457,7 @@ impl MlxQuantizedLlamaAttention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            self.scale,
-            mask,
-            None::<&Array>,
-        )?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
 
         // out: [1, heads, seq, head_dim] -> [seq, hidden]
         let hidden = (self.num_heads * self.head_dim) as i32;
@@ -516,33 +509,20 @@ impl MlxQuantizedLlamaAttention {
                 k = norm.forward(&k.squeeze_axes(&[2])?)?.expand_dims(2)?;
             }
 
-            let offsets_arr = Array::from_iter(batch_info.rope_offsets.iter().copied(), &[n]);
-            q = mlx_rs::fast::rope_dynamic(
-                &q,
-                self.rope.dimensions,
-                self.rope.traditional,
-                self.rope.base,
-                self.rope.scale,
-                &offsets_arr,
-                None::<&Array>,
-            )?;
-            if !self.fuse_rope {
-                k = mlx_rs::fast::rope_dynamic(
-                    &k,
-                    self.rope.dimensions,
-                    self.rope.traditional,
-                    self.rope.base,
-                    self.rope.scale,
-                    &offsets_arr,
-                    None::<&Array>,
-                )?;
-            }
-
+            // Per-request RoPE + KV cache update.
             for (i, cache) in caches.iter_mut().enumerate().take(batch_info.num_reqs) {
                 let ii = i as i32;
+                let offset = batch_info.rope_offsets[i];
                 let qi = q.try_index((ii..ii + 1, .., .., ..))?;
                 let ki = k.try_index((ii..ii + 1, .., .., ..))?;
                 let vi = v.try_index((ii..ii + 1, .., .., ..))?;
+
+                let qi = self.rope.forward((&qi, offset))?;
+                let ki = if self.fuse_rope {
+                    ki
+                } else {
+                    self.rope.forward((&ki, offset))?
+                };
 
                 let (ki, vi) = crate::cache::kv_cache_update(cache, &ki, &vi)?;
                 let ki = if self.fuse_rope {
@@ -615,12 +595,7 @@ impl MlxQuantizedLlamaAttention {
             let v_stacked = mlx_rs::ops::concatenate_axis(&per_req_v, 0)?;
 
             let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked,
-                &k_stacked,
-                &v_stacked,
-                self.scale,
-                None,
-                None::<&Array>,
+                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
             )?;
 
             let hidden = (self.num_heads * self.head_dim) as i32;
@@ -654,7 +629,6 @@ impl MlxQuantizedLlamaAttention {
                     &v,
                     self.scale,
                     mask,
-                    None::<&Array>,
                 )?;
 
                 let hidden = (self.num_heads * self.head_dim) as i32;
@@ -689,7 +663,7 @@ impl MlxQuantizedLlamaAttention {
         batch_info: &MlxBatchInfo,
         batch_cache: &mut BatchMlxLayerKvCache,
         mask: &Option<Array>,
-        offsets_arr: &Array,
+        _offsets_arr: &Array,
         left_pads: &[usize],
     ) -> Result<Array, Exception> {
         let n = batch_info.num_reqs as i32;
@@ -715,26 +689,26 @@ impl MlxQuantizedLlamaAttention {
             k = norm.forward(&k.squeeze_axes(&[2])?)?.expand_dims(2)?;
         }
 
-        // Batched RoPE via rope_dynamic (offsets_arr built once, shared across layers).
-        q = mlx_rs::fast::rope_dynamic(
-            &q,
-            self.rope.dimensions,
-            self.rope.traditional,
-            self.rope.base,
-            self.rope.scale,
-            offsets_arr,
-            None::<&Array>,
-        )?;
-        if !self.fuse_rope {
-            k = mlx_rs::fast::rope_dynamic(
-                &k,
-                self.rope.dimensions,
-                self.rope.traditional,
-                self.rope.base,
-                self.rope.scale,
-                offsets_arr,
-                None::<&Array>,
-            )?;
+        // Per-request RoPE (rope_dynamic not available in mlx-rs 0.25).
+        {
+            let mut q_parts = Vec::with_capacity(batch_info.num_reqs);
+            let mut k_parts = Vec::with_capacity(batch_info.num_reqs);
+            for i in 0..batch_info.num_reqs {
+                let ii = i as i32;
+                let offset = batch_info.rope_offsets[i];
+                let qi = q.try_index((ii..ii + 1, .., .., ..))?;
+                let ki = k.try_index((ii..ii + 1, .., .., ..))?;
+                q_parts.push(self.rope.forward((&qi, offset))?);
+                if self.fuse_rope {
+                    k_parts.push(ki);
+                } else {
+                    k_parts.push(self.rope.forward((&ki, offset))?);
+                }
+            }
+            let q_refs: Vec<&Array> = q_parts.iter().collect();
+            let k_refs: Vec<&Array> = k_parts.iter().collect();
+            q = mlx_rs::ops::concatenate_axis(&q_refs, 0)?;
+            k = mlx_rs::ops::concatenate_axis(&k_refs, 0)?;
         }
 
         // Single batched KV cache update for all B sequences.
@@ -759,12 +733,7 @@ impl MlxQuantizedLlamaAttention {
             .as_ref()
             .map(mlx_rs::fast::ScaledDotProductAttentionMask::Array);
         let out = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &k_cached,
-            &v_cached,
-            self.scale,
-            sdpa_mask,
-            None::<&Array>,
+            &q, &k_cached, &v_cached, self.scale, sdpa_mask,
         )?;
 
         // out: [B, heads, 1, hd] -> [B, hidden]
@@ -1434,5 +1403,177 @@ mod tests {
         .unwrap();
         logits2.eval().unwrap();
         assert_eq!(logits2.shape(), &[1, config.vocab_size as i32]);
+    }
+
+    /// Verify that quantized_matmul produces results consistent with dequantize + matmul.
+    ///
+    /// This catches ABI mismatches in the mlx-rs bindings where quantized_matmul
+    /// compiles but produces wrong results (e.g. wrong group_size/bits passed through
+    /// the C API, or mode parameter corruption).
+    #[test]
+    fn test_quantized_matmul_consistency() {
+        use mlx_rs::ops;
+
+        // Create a known weight matrix and quantize it.
+        mlx_rs::random::seed(42).unwrap();
+        let w_float = mlx_rs::random::normal::<f32>(&[64, 32], None, None, None).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[1, 32], None, None, None).unwrap();
+
+        let (w_q, scales, biases) = ops::quantize(&w_float, 32, 4).unwrap();
+
+        // Path A: quantized_matmul (the fast path used during inference)
+        let result_qmm = ops::quantized_matmul(&x, &w_q, &scales, &biases, true, 32, 4).unwrap();
+        result_qmm.eval().unwrap();
+
+        // Path B: dequantize then regular matmul (reference)
+        let w_deq = ops::dequantize(&w_q, &scales, &biases, 32, 4).unwrap();
+        let result_ref = ops::matmul(&x, &w_deq.transpose_axes(&[1, 0]).unwrap()).unwrap();
+        result_ref.eval().unwrap();
+
+        // They should match closely (both use the same dequantized values).
+        let diff = result_qmm.subtract(&result_ref).unwrap();
+        let max_err = diff.abs().unwrap().max(None).unwrap().item::<f32>();
+        assert!(
+            max_err < 0.1,
+            "quantized_matmul vs dequantize+matmul max error: {max_err} (expected < 0.1)"
+        );
+    }
+
+    /// Verify that greedy decode is deterministic and logits are not degenerate.
+    ///
+    /// Catches regressions where the forward pass produces garbage logits due to
+    /// broken mlx-rs bindings, incorrect SDPA calls, or corrupted KV cache.
+    /// The vendored mlx-rs incident (b15ab6845) produced degenerate output that
+    /// this test would have caught.
+    #[test]
+    fn test_greedy_decode_deterministic() {
+        use mlx_rs::ops::indexing::IndexOp;
+        let config = test_config();
+        let qc = test_quant_config();
+        mlx_rs::random::seed(123).unwrap();
+        let mut model = build_test_model(&config, &qc).unwrap();
+        let mut kv_cache = crate::cache::empty_kv_cache(config.num_hidden_layers);
+
+        // Prefill
+        let prompt = Array::from_iter(vec![1i32, 5, 10, 20, 30], &[5]);
+        let positions = Array::from_iter(0..5i32, &[5]);
+        let logits = <MlxQuantizedLlamaForCausalLM as crate::models::MlxModel>::forward(
+            &mut model,
+            &prompt,
+            &positions,
+            &mut kv_cache,
+            None,
+        )
+        .unwrap();
+        logits.eval().unwrap();
+
+        // Greedy decode 10 tokens
+        let mut generated = Vec::new();
+        let mut next_pos = 5i32;
+        let vocab = config.vocab_size as i32;
+
+        for _ in 0..10 {
+            let last_logits = logits.index((-1, ..));
+            let last_logits = if generated.is_empty() {
+                last_logits
+            } else {
+                let tok = Array::from_iter(vec![*generated.last().unwrap()], &[1]);
+                let pos = Array::from_iter(vec![next_pos - 1], &[1]);
+                let l = <MlxQuantizedLlamaForCausalLM as crate::models::MlxModel>::forward(
+                    &mut model,
+                    &tok,
+                    &pos,
+                    &mut kv_cache,
+                    Some(next_pos - 1),
+                )
+                .unwrap();
+                l.eval().unwrap();
+                l.index((0, ..))
+            };
+
+            let flat = last_logits.as_slice::<f32>();
+
+            // Sanity: logits should not be NaN or all identical.
+            assert!(
+                !flat.iter().any(|v| v.is_nan()),
+                "NaN in logits at decode step {}",
+                generated.len()
+            );
+            let min = flat.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = flat.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                (max - min) > 1e-3,
+                "Logits are flat (max-min={}) at step {} — model likely broken",
+                max - min,
+                generated.len()
+            );
+
+            // Greedy pick
+            let token_id = flat
+                .iter()
+                .enumerate()
+                .max_by(|(_, a): &(usize, &f32), (_, b): &(usize, &f32)| a.partial_cmp(b).unwrap())
+                .map(|(idx, _)| idx as i32)
+                .unwrap();
+            assert!(token_id >= 0 && token_id < vocab);
+            generated.push(token_id);
+            next_pos += 1;
+        }
+
+        // Run the same thing again with a fresh model + same seed — must match.
+        mlx_rs::random::seed(123).unwrap();
+        let mut model2 = build_test_model(&config, &qc).unwrap();
+        let mut kv_cache2 = crate::cache::empty_kv_cache(config.num_hidden_layers);
+
+        let logits2 = <MlxQuantizedLlamaForCausalLM as crate::models::MlxModel>::forward(
+            &mut model2,
+            &prompt,
+            &positions,
+            &mut kv_cache2,
+            None,
+        )
+        .unwrap();
+        logits2.eval().unwrap();
+
+        let mut generated2 = Vec::new();
+        let mut next_pos2 = 5i32;
+        for _ in 0..10 {
+            let last_logits = if generated2.is_empty() {
+                logits2.index((-1, ..))
+            } else {
+                let tok = Array::from_iter(vec![*generated2.last().unwrap()], &[1]);
+                let pos = Array::from_iter(vec![next_pos2 - 1], &[1]);
+                let l = <MlxQuantizedLlamaForCausalLM as crate::models::MlxModel>::forward(
+                    &mut model2,
+                    &tok,
+                    &pos,
+                    &mut kv_cache2,
+                    Some(next_pos2 - 1),
+                )
+                .unwrap();
+                l.eval().unwrap();
+                l.index((0, ..))
+            };
+
+            let flat = last_logits.as_slice::<f32>();
+            let token_id = flat
+                .iter()
+                .enumerate()
+                .max_by(|(_, a): &(usize, &f32), (_, b): &(usize, &f32)| a.partial_cmp(b).unwrap())
+                .map(|(idx, _)| idx as i32)
+                .unwrap();
+            generated2.push(token_id);
+            next_pos2 += 1;
+        }
+
+        assert_eq!(
+            generated, generated2,
+            "Greedy decode not deterministic with same seed"
+        );
+
+        // Note: with random weights, the model may legitimately repeat tokens.
+        // The key assertions above (no NaN, non-flat logits, determinism) are
+        // what catch broken inference. A real model test would also check
+        // semantic quality, but that requires loading actual weights.
     }
 }

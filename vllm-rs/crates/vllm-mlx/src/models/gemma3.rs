@@ -379,14 +379,7 @@ impl MlxGemma3Attention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            self.scale,
-            mask,
-            None::<&Array>,
-        )?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
 
         // [1, heads, seq, head_dim] -> [seq, hidden]
         let hidden = (self.num_heads * self.head_dim) as i32;
@@ -869,14 +862,7 @@ impl MlxQuantizedGemma3Attention {
         } else {
             None
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(
-            &q,
-            &k,
-            &v,
-            self.scale,
-            mask,
-            None::<&Array>,
-        )?;
+        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
 
         let hidden = (self.num_heads * self.head_dim) as i32;
         let out = out

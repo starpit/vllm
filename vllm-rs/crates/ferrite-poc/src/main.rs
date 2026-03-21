@@ -95,6 +95,10 @@ fn main() -> Result<()> {
     println!("\nFused RmsNorm→GEMM→SiLU 128x128");
     run_fused_128x128()?;
 
+    // MLP Block: RmsNorm→GEMM→SiLU→GEMM (full down-projection)
+    println!("\nMLP Block: RmsNorm→GEMM→SiLU→GEMM 128x128");
+    run_mlp_block_128x128(device)?;
+
     println!("\n═══════════════════════════════════");
     println!("Phase 0 complete.");
     Ok(())
@@ -837,6 +841,425 @@ fn run_fused_128x128() -> Result<()> {
 
     unsafe {
         cuda::module::unload(module)?;
+        cuda::module::unload(module_gemm)?;
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// MLP Block benchmark: RmsNorm → GEMM → SiLU → GEMM (down-projection)
+// ===========================================================================
+
+fn run_mlp_block_128x128(_device: cuda_sys::CUdevice) -> Result<()> {
+    let (ptx_g1, ptx_cvt, ptx_g2) = gemm_128x128::emit_mlp_block_128x128();
+    println!("  Generated GEMM1: {} bytes, CVT: {} bytes, GEMM2: {} bytes", ptx_g1.len(), ptx_cvt.len(), ptx_g2.len());
+
+    std::fs::write("/tmp/ferrite_mlp_gemm1.ptx", &ptx_g1).ok();
+    std::fs::write("/tmp/ferrite_mlp_gemm2.ptx", &ptx_g2).ok();
+
+    let ptx_g1_cstr = CString::new(ptx_g1.as_bytes()).context("PTX null")?;
+    let module_g1 = unsafe { cuda::module::load_data(ptx_g1_cstr.as_ptr() as *const _)? };
+    let func_g1 = unsafe {
+        cuda::module::get_function(module_g1, CString::new("mlp_gemm1_silu").unwrap())?
+    };
+
+    let ptx_cvt_cstr = CString::new(ptx_cvt.as_bytes()).context("PTX null")?;
+    let module_cvt = unsafe { cuda::module::load_data(ptx_cvt_cstr.as_ptr() as *const _)? };
+    let func_cvt = unsafe {
+        cuda::module::get_function(module_cvt, CString::new("cvt_f32_to_f16").unwrap())?
+    };
+
+    let ptx_g2_cstr = CString::new(ptx_g2.as_bytes()).context("PTX null")?;
+    let module_g2 = unsafe { cuda::module::load_data(ptx_g2_cstr.as_ptr() as *const _)? };
+    let func_g2 = unsafe {
+        cuda::module::get_function(module_g2, CString::new("mlp_gemm2").unwrap())?
+    };
+
+    use cudarc::driver::sys::CUfunction_attribute as FA;
+    let nregs_g1 =
+        unsafe { cuda::function::get_function_attribute(func_g1, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let nregs_g2 =
+        unsafe { cuda::function::get_function_attribute(func_g2, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    println!(
+        "  [cuda] GEMM1: {} regs, GEMM2: {} regs",
+        nregs_g1, nregs_g2
+    );
+
+    // Also load standalone GEMM for unfused comparison
+    let ptx_gemm = gemm_128x128::emit_ptx_128x128();
+    let ptx_gemm_cstr = CString::new(ptx_gemm.as_bytes()).context("PTX null")?;
+    let module_gemm = unsafe { cuda::module::load_data(ptx_gemm_cstr.as_ptr() as *const _)? };
+    let func_gemm =
+        unsafe { cuda::module::get_function(module_gemm, CString::new("gemm_128x128").unwrap())? };
+
+    let bm: u32 = 128;
+    let bn: u32 = 128;
+    let threads: u32 = 128;
+    let smem_fused: c_uint = 41504;
+    let smem_gemm: c_uint = 32768;
+
+    unsafe {
+        cuda_sys::cuFuncSetAttribute(
+            func_g1,
+            cuda_sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem_fused as i32,
+        );
+        cuda_sys::cuFuncSetAttribute(
+            func_g2,
+            cuda_sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem_gemm as i32,
+        );
+    }
+
+    // CPU reference helpers
+    fn silu(x: f32) -> f32 {
+        x / (1.0 + (-x).exp())
+    }
+    fn rmsnorm_row(input: &[half::f16], gamma: &[half::f16], eps: f32) -> Vec<f32> {
+        let n = input.len();
+        let sum_sq: f32 = input
+            .iter()
+            .map(|x| {
+                let xf = x.to_f32();
+                xf * xf
+            })
+            .sum();
+        let rms_inv = 1.0 / ((sum_sq / n as f32) + eps).sqrt();
+        input
+            .iter()
+            .zip(gamma.iter())
+            .map(|(x, g)| x.to_f32() * rms_inv * g.to_f32())
+            .collect()
+    }
+
+    for &m in &[256u32, 1024, 4096] {
+        let k1: u32 = 4096; // hidden dim (must be >= 1024 for gamma preload)
+        let n1: u32 = 4096; // intermediate dim
+        let n2: u32 = 4096; // output dim (must equal n1 for this kernel)
+        println!(
+            "  --- batch={}, hidden={}, inter={}, out={} ---",
+            m, k1, n1, n2
+        );
+
+        let sa = (m * k1) as usize; // input [M, K1]
+        let sw = k1 as usize; // gamma [K1]
+        let sb1 = (k1 * n1) as usize; // w_gate [K1, N1]
+        let sb2 = (n1 * n2) as usize; // w_down [N1, N2]
+        let si = (m * n1) as usize; // intermediate [M, N1] f16
+        let sc = (m * n2) as usize; // output [M, N2] f32
+
+        let d_input = unsafe { cuda::malloc_sync(sa * 2)? };
+        let d_wnorm = unsafe { cuda::malloc_sync(sw * 2)? };
+        let d_wgate = unsafe { cuda::malloc_sync(sb1 * 2)? };
+        let d_wdown = unsafe { cuda::malloc_sync(sb2 * 2)? };
+        let d_inter_f32 = unsafe { cuda::malloc_sync(si * 4)? }; // GEMM1 output f32
+        let d_inter = unsafe { cuda::malloc_sync(si * 2)? }; // converted f16
+        let d_output = unsafe { cuda::malloc_sync(sc * 4)? };
+        let d_barrier = unsafe { cuda::malloc_sync(4)? }; // u32 barrier counter
+        let d_gemm_out = unsafe { cuda::malloc_sync(sc * 4)? };
+
+        let h_input: Vec<half::f16> = (0..sa)
+            .map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1))
+            .collect();
+        let h_wnorm: Vec<half::f16> = (0..sw)
+            .map(|i| half::f16::from_f32(0.5 + ((i % 100) as f32) * 0.01))
+            .collect();
+        let h_wgate: Vec<half::f16> = (0..sb1)
+            .map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1))
+            .collect();
+        let h_wdown: Vec<half::f16> = (0..sb2)
+            .map(|i| half::f16::from_f32(((i % 11) as f32 - 5.0) * 0.05))
+            .collect();
+        let mut h_output: Vec<f32> = vec![0.0; sc];
+
+        unsafe {
+            cuda::memcpy_htod_sync(d_input, &h_input)?;
+            cuda::memcpy_htod_sync(d_wnorm, &h_wnorm)?;
+            cuda::memcpy_htod_sync(d_wgate, &h_wgate)?;
+            cuda::memcpy_htod_sync(d_wdown, &h_wdown)?;
+        }
+
+        let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
+        let gx1 = n1 / bn; // GEMM1 grid x
+        let gy = m / bm; // grid y (shared)
+        let gx2 = n2 / bn; // GEMM2 grid x
+        let cvt_n = m * n1; // elements to convert
+        let cvt_grid = (cvt_n + 1023) / 1024; // 256 threads * 4 elems = 1024 per block
+
+        // GEMM1 params: input, wnorm, wgate, inter_f32, N1, K1
+        let params_g1: &mut [*mut c_void] = &mut [
+            (&d_input) as *const _ as *mut c_void,
+            (&d_wnorm) as *const _ as *mut c_void,
+            (&d_wgate) as *const _ as *mut c_void,
+            (&d_inter_f32) as *const _ as *mut c_void,
+            (&n1) as *const _ as *mut c_void,
+            (&k1) as *const _ as *mut c_void,
+        ];
+
+        // CVT params: inter_f32, inter_f16, count
+        let params_cvt: &mut [*mut c_void] = &mut [
+            (&d_inter_f32) as *const _ as *mut c_void,
+            (&d_inter) as *const _ as *mut c_void,
+            (&cvt_n) as *const _ as *mut c_void,
+        ];
+
+        // GEMM2 params: inter_f16, wdown, output, M, N2, N1(=K2)
+        let params_g2: &mut [*mut c_void] = &mut [
+            (&d_inter) as *const _ as *mut c_void,
+            (&d_wdown) as *const _ as *mut c_void,
+            (&d_output) as *const _ as *mut c_void,
+            (&m) as *const _ as *mut c_void,
+            (&n2) as *const _ as *mut c_void,
+            (&n1) as *const _ as *mut c_void,
+        ];
+
+        // Helper to launch the 3-kernel MLP block
+        let launch_mlp = |stream: cuda_sys::CUstream,
+                          p_g1: &mut [*mut c_void],
+                          p_cvt: &mut [*mut c_void],
+                          p_g2: &mut [*mut c_void]|
+         -> anyhow::Result<()> {
+            unsafe {
+                // GEMM1: RmsNorm → GEMM → SiLU → f32
+                cuda::launch_kernel(func_g1, (gx1, gy, 1), (threads, 1, 1), smem_fused, stream, p_g1)?;
+                // CVT: f32 → f16
+                cuda::launch_kernel(func_cvt, (cvt_grid, 1, 1), (256, 1, 1), 0, stream, p_cvt)?;
+                // GEMM2: f16 → f32
+                cuda::launch_kernel(func_g2, (gx2, gy, 1), (threads, 1, 1), smem_gemm, stream, p_g2)?;
+            }
+            Ok(())
+        };
+
+        // Warmup
+        for _ in 0..10 {
+            launch_mlp(stream, params_g1, params_cvt, params_g2)?;
+            unsafe { cuda::stream::synchronize(stream)?; }
+        }
+
+        // Benchmark MLP block
+        let iters = 100;
+        let start = Instant::now();
+        for _ in 0..iters {
+            launch_mlp(stream, params_g1, params_cvt, params_g2)?;
+            unsafe { cuda::stream::synchronize(stream)?; }
+        }
+        let us_mlp = start.elapsed().as_micros() as f64 / iters as f64;
+
+        // Verify (only for first size)
+        if m == 256 {
+            launch_mlp(stream, params_g1, params_cvt, params_g2)?;
+            unsafe {
+                cuda::stream::synchronize(stream)?;
+                cuda::memcpy_dtoh_sync(&mut h_output, d_output)?;
+            }
+
+            // CPU reference: RmsNorm → GEMM1 → SiLU → GEMM2
+            let mut max_err: f32 = 0.0;
+            for r in [0usize, 1, 31, 63, 64, 127, 128, 255] {
+                if r >= m as usize {
+                    continue;
+                }
+                let row_start = r * k1 as usize;
+                let row_end = row_start + k1 as usize;
+                let normed = rmsnorm_row(&h_input[row_start..row_end], &h_wnorm, 1e-6);
+
+                // GEMM1: normed × w_gate → intermediate
+                let mut inter_row = vec![0.0f32; n1 as usize];
+                for c in 0..n1 as usize {
+                    let mut dot = 0.0f32;
+                    for kk in 0..k1 as usize {
+                        dot += normed[kk] * h_wgate[kk * n1 as usize + c].to_f32();
+                    }
+                    inter_row[c] = silu(dot);
+                }
+
+                // GEMM2: inter × w_down → output
+                for c in [0usize, 1, 31, 63, 64, 127, 511, 1023, 4095] {
+                    if c >= n2 as usize {
+                        continue;
+                    }
+                    let mut dot = 0.0f32;
+                    for kk in 0..n1 as usize {
+                        // inter_row is f32, but GPU stores as f16 then reads back
+                        // Use f16 conversion to match GPU precision
+                        let inter_f16 = half::f16::from_f32(inter_row[kk]);
+                        dot += inter_f16.to_f32() * h_wdown[kk * n2 as usize + c].to_f32();
+                    }
+                    let expected = dot;
+                    let got = h_output[r * n2 as usize + c];
+                    let err = (got - expected).abs();
+                    if err > max_err {
+                        max_err = err;
+                    }
+                }
+            }
+            if max_err < 5.0 {
+                println!("  Correct (max err: {:.4})", max_err);
+            } else {
+                for r in [0, 1] {
+                    let row_start = r * k1 as usize;
+                    let row_end = row_start + k1 as usize;
+                    let normed = rmsnorm_row(&h_input[row_start..row_end], &h_wnorm, 1e-6);
+                    let mut inter_row = vec![0.0f32; n1 as usize];
+                    for c in 0..n1 as usize {
+                        let mut dot = 0.0f32;
+                        for kk in 0..k1 as usize {
+                            dot += normed[kk] * h_wgate[kk * n1 as usize + c].to_f32();
+                        }
+                        inter_row[c] = silu(dot);
+                    }
+                    for c in [0, 1, 64, 127] {
+                        if c >= n2 as usize {
+                            continue;
+                        }
+                        let mut dot = 0.0f32;
+                        for kk in 0..n1 as usize {
+                            let inter_f16 = half::f16::from_f32(inter_row[kk]);
+                            dot += inter_f16.to_f32() * h_wdown[kk * n2 as usize + c].to_f32();
+                        }
+                        let got = h_output[r * n2 as usize + c];
+                        println!("    C[{r}][{c}]: got={got:.4} expected={dot:.4}");
+                    }
+                }
+                bail!("  MLP block max error: {:.4}", max_err);
+            }
+        }
+
+        // Total FLOPS: GEMM1 (2*M*N1*K1) + GEMM2 (2*M*N2*N1)
+        let flops_gemm1 = 2.0 * m as f64 * n1 as f64 * k1 as f64;
+        let flops_gemm2 = 2.0 * m as f64 * n2 as f64 * n1 as f64;
+        let total_flops = flops_gemm1 + flops_gemm2;
+        let tf = total_flops / (us_mlp * 1e-6) / 1e12;
+        println!("  MLP fused: {:.1} us, {:.1} TFLOPS (both GEMMs)", us_mlp, tf);
+
+        // Benchmark unfused: 2x standalone GEMM + norm + SiLU memory traffic
+        let params_gemm1: &mut [*mut c_void] = &mut [
+            (&d_input) as *const _ as *mut c_void,
+            (&d_wgate) as *const _ as *mut c_void,
+            (&d_gemm_out) as *const _ as *mut c_void,
+            (&m) as *const _ as *mut c_void,
+            (&n1) as *const _ as *mut c_void,
+            (&k1) as *const _ as *mut c_void,
+        ];
+
+        // Warmup GEMM1
+        for _ in 0..10 {
+            unsafe {
+                cuda::launch_kernel(
+                    func_gemm,
+                    (gx1, gy, 1),
+                    (threads, 1, 1),
+                    smem_gemm,
+                    stream,
+                    params_gemm1,
+                )?;
+            }
+        }
+        unsafe { cuda::stream::synchronize(stream)?; }
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            unsafe {
+                cuda::launch_kernel(
+                    func_gemm,
+                    (gx1, gy, 1),
+                    (threads, 1, 1),
+                    smem_gemm,
+                    stream,
+                    params_gemm1,
+                )?;
+            }
+        }
+        unsafe { cuda::stream::synchronize(stream)?; }
+        let us_gemm1 = start.elapsed().as_micros() as f64 / iters as f64;
+
+        // GEMM2 timing (same dimensions for square case)
+        let params_gemm2: &mut [*mut c_void] = &mut [
+            (&d_inter) as *const _ as *mut c_void,  // A = intermediate
+            (&d_wdown) as *const _ as *mut c_void,   // B = w_down
+            (&d_gemm_out) as *const _ as *mut c_void,
+            (&m) as *const _ as *mut c_void,
+            (&n2) as *const _ as *mut c_void,
+            (&n1) as *const _ as *mut c_void,
+        ];
+
+        for _ in 0..10 {
+            unsafe {
+                cuda::launch_kernel(
+                    func_gemm,
+                    (n2 / bn, gy, 1),
+                    (threads, 1, 1),
+                    smem_gemm,
+                    stream,
+                    params_gemm2,
+                )?;
+            }
+        }
+        unsafe { cuda::stream::synchronize(stream)?; }
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            unsafe {
+                cuda::launch_kernel(
+                    func_gemm,
+                    (n2 / bn, gy, 1),
+                    (threads, 1, 1),
+                    smem_gemm,
+                    stream,
+                    params_gemm2,
+                )?;
+            }
+        }
+        unsafe { cuda::stream::synchronize(stream)?; }
+        let us_gemm2 = start.elapsed().as_micros() as f64 / iters as f64;
+
+        // Unfused estimate: 2 GEMMs + norm + SiLU + intermediate store/load
+        let bw_gbs = 300.0; // L4 ~300 GB/s
+        let norm_bytes = m as f64 * k1 as f64 * 2.0 * 2.0;
+        let silu_bytes = m as f64 * n1 as f64 * 4.0 * 2.0; // f32 read+write
+        let inter_bytes = m as f64 * n1 as f64 * 2.0 * 2.0; // f16 write+read
+        let us_norm_est = norm_bytes / (bw_gbs * 1e3);
+        let us_silu_est = silu_bytes / (bw_gbs * 1e3);
+        let us_inter_est = inter_bytes / (bw_gbs * 1e3);
+        let us_unfused_est = us_gemm1 + us_gemm2 + us_norm_est + us_silu_est + us_inter_est;
+
+        let tf_gemm1 = flops_gemm1 / (us_gemm1 * 1e-6) / 1e12;
+        let tf_gemm2 = flops_gemm2 / (us_gemm2 * 1e-6) / 1e12;
+        println!(
+            "  Standalone GEMM1: {:.1} us ({:.1} TFLOPS), GEMM2: {:.1} us ({:.1} TFLOPS)",
+            us_gemm1, tf_gemm1, us_gemm2, tf_gemm2
+        );
+        println!(
+            "  Unfused estimate: {:.1} us (norm: {:.1}, SiLU: {:.1}, inter: {:.1})",
+            us_unfused_est, us_norm_est, us_silu_est, us_inter_est
+        );
+        let speedup = us_unfused_est / us_mlp;
+        if speedup >= 1.0 {
+            println!("  Fused speedup vs unfused: {:.2}x FASTER", speedup);
+        } else {
+            println!(
+                "  Fused vs unfused: {:.1}% overhead",
+                (1.0 / speedup - 1.0) * 100.0
+            );
+        }
+
+        unsafe {
+            cuda::stream::destroy(stream)?;
+            cuda::free_sync(d_input)?;
+            cuda::free_sync(d_wnorm)?;
+            cuda::free_sync(d_wgate)?;
+            cuda::free_sync(d_wdown)?;
+            cuda::free_sync(d_inter_f32)?;
+            cuda::free_sync(d_inter)?;
+            cuda::free_sync(d_output)?;
+            cuda::free_sync(d_gemm_out)?;
+        }
+    }
+
+    unsafe {
+        cuda::module::unload(module_g1)?;
+        cuda::module::unload(module_cvt)?;
+        cuda::module::unload(module_g2)?;
         cuda::module::unload(module_gemm)?;
     }
     Ok(())

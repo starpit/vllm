@@ -3004,7 +3004,7 @@ fn run_flash_attn_fwd() -> Result<()> {
 
     let grid_x = (seq_len + 127) / 128; // ceil(seq_len / BLOCK_M)
     let grid_y = batch * heads;
-    let threads: u32 = 256;
+    let threads: u32 = 128;
 
     let params: &mut [*mut c_void] = &mut [
         (&d_q) as *const _ as *mut c_void,

@@ -3707,6 +3707,7 @@ fn run_flash_attn_fwd_hdim128() -> Result<()> {
 fn run_silu_mul() -> Result<()> {
     let ptx = silu_mul::emit_silu_mul_kernel();
     println!("  Generated {} bytes of PTX", ptx.len());
+    std::fs::write("/tmp/ferrite_silu_mul.ptx", &ptx).ok();
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
     let func = unsafe { cuda::module::get_function(module, CString::new("silu_mul_kernel").unwrap())? };

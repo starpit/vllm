@@ -899,18 +899,6 @@ fn emit_kernel_causal(s: &mut String) {
     w(s, "shl.b32 \t%r40, %r35, 4;");
     blank(s);
 
-    // Precompute causal mask row positions for this thread
-    // For MMA C fragment: row0 = lane/4 (within 16-row m-tile), row1 = row0 + 8
-    // Global query row for m-tile mt:
-    //   q_row_0 = block_m_start + warp_id*32 + mt*16 + lane/4
-    //   q_row_1 = q_row_0 + 8
-    w(s, "shr.u32 \t%r17, %r31, 2;"); // lane/4 = mma_row_0 within m-tile
-    w(s, "add.s32 \t%r18, %r17, 8;"); // mma_row_1 = mma_row_0 + 8
-    // For the causal mask column:
-    //   k_col for n-tile n, regs d0/d2: n*8 + (lane%4)*2
-    //   k_col for n-tile n, regs d1/d3: n*8 + (lane%4)*2 + 1
-    w(s, "and.b32 \t%r19, %r31, 3;"); // lane%4
-    w(s, "shl.b32 \t%r20, %r19, 1;"); // (lane%4)*2 = col offset within n-tile
     blank(s);
 
     // ─── Load Q fragments ───
@@ -1070,71 +1058,69 @@ fn emit_kernel_causal(s: &mut String) {
     }
     blank(s);
 
-    // ─── Causal mask ───
-    // For each S element: if kv_start + k_col > block_m_start + q_row, set to -inf
-    // Compute per-thread q_row values (absolute):
-    //   For m-tile mt: q_row_0 = block_m_start + warp_id*32 + mt*16 + lane/4
-    //                  q_row_1 = q_row_0 + 8
-    // k_col (absolute) for n-tile n: kv_start + n*8 + (lane%4)*2 + {0 or 1}
-    //
-    // d[0], d[2]: col_offset = n*8 + (lane%4)*2
-    // d[1], d[3]: col_offset = n*8 + (lane%4)*2 + 1
+    // ─── Causal mask (reusing dead K-frag registers %r300-308) ───
+    // K frags are dead after Q@K^T MMA. Reusing them avoids register pressure.
+    // %r300 = -inf constant
+    // %r302 = lane/4, %r304 = (lane%4)*2
+    // %r305 = q_row_0, %r306 = q_row_1
+    // %r307 = k_col_even, %r308 = k_col_odd
+    w(s, "mov.b32 \t%r300, 0xFF800000;"); // -inf
+    w(s, "shr.u32 \t%r302, %r31, 2;"); // lane/4
+    w(s, "and.b32 \t%r303, %r31, 3;"); // lane%4
+    w(s, "shl.b32 \t%r304, %r303, 1;"); // (lane%4)*2
     for mt in 0..2u32 {
         let s_start = if mt == 0 { 370 } else { 600 };
         let mt_off = mt * 16;
-        // Absolute query row for this m-tile: block_m_start + warp_id*32 + mt*16 + mma_row
-        // %r17 = lane/4 (mma_row_0), %r18 = lane/4 + 8 (mma_row_1)
-        // q_row_0 = %r7 + %r36 + mt_off + %r17
-        w(s, "add.s32 \t%r750, %r7, %r36;"); // block_m_start + warp_id*32
-        w(s, &format!("add.s32 \t%r751, %r750, {};", mt_off)); // + mt*16
-        w(s, "add.s32 \t%r752, %r751, %r17;"); // q_row_0 (abs)
-        w(s, "add.s32 \t%r753, %r751, %r18;"); // q_row_1 (abs)
+        w(s, "add.s32 \t%r305, %r7, %r36;"); // block_m_start + warp*32
+        w(s, &format!("add.s32 \t%r305, %r305, {};", mt_off));
+        w(s, "add.s32 \t%r305, %r305, %r302;"); // q_row_0
+        w(s, "add.s32 \t%r306, %r305, 8;"); // q_row_1
 
         for n in 0..8u32 {
             let base = s_start + n * 4;
-            let n_col_base = n * 8; // n-tile col offset
+            let n_col_base = n * 8;
+            w(s, &format!("add.s32 \t%r307, %r236, {};", n_col_base));
+            w(s, "add.s32 \t%r307, %r307, %r304;"); // col_even
+            w(s, "add.s32 \t%r308, %r307, 1;"); // col_odd
 
-            // k_col_even = kv_start + n*8 + (lane%4)*2
-            w(s, &format!("add.s32 \t%r754, %r236, {};", n_col_base));
-            w(s, "add.s32 \t%r755, %r754, %r20;"); // + (lane%4)*2 = col for d[0]/d[2]
-            w(s, "add.s32 \t%r756, %r755, 1;"); // col for d[1]/d[3]
+            // Multiply S by 0 or 1 to apply mask, then add -inf * mask
+            // masked = S * (1 - mask) + (-inf) * mask
+            // Using min: if mask, S = min(S, -inf) = -inf. Else S unchanged.
+            // Actually: just use min.f32 with a threshold:
+            // Compute threshold_even = (float)(col_even > q_row_0) → 1.0 or 0.0
+            // Then: S = S * (1 - thresh) + (-inf) * thresh
+            // Simpler: if col > row, multiply S by 0 then add -inf
+            // Simplest: use a conditional branch per n-tile (but that's divergent)
 
-            // d[0]: row=q_row_0, col=%r755. Mask if col > row.
-            w(s, &format!("setp.gt.s32 \t%p30, %r755, %r752;"));
-            w(
-                s,
-                &format!(
-                    "@%p30 mov.b32 \t%r{}, 0xFF800000;",
-                    base
-                ),
-            );
-            // d[1]: row=q_row_0, col=%r756
-            w(s, &format!("setp.gt.s32 \t%p31, %r756, %r752;"));
-            w(
-                s,
-                &format!(
-                    "@%p31 mov.b32 \t%r{}, 0xFF800000;",
-                    base + 1
-                ),
-            );
-            // d[2]: row=q_row_1, col=%r755
-            w(s, &format!("setp.gt.s32 \t%p32, %r755, %r753;"));
-            w(
-                s,
-                &format!(
-                    "@%p32 mov.b32 \t%r{}, 0xFF800000;",
-                    base + 2
-                ),
-            );
-            // d[3]: row=q_row_1, col=%r756
-            w(s, &format!("setp.gt.s32 \t%p33, %r756, %r753;"));
-            w(
-                s,
-                &format!(
-                    "@%p33 mov.b32 \t%r{}, 0xFF800000;",
-                    base + 3
-                ),
-            );
+            // Actually let's try: unconditionally compute mask_val = (col > row) ? -inf : S
+            // as: mask_val = S + (col > row ? (-inf - S) : 0)
+            // = S + delta, where delta = (col > row) ? (-inf - S) : 0
+            // sub.f32 delta, -inf, S; selp delta, delta, 0, pred; add.f32 S, S, delta
+            // This has RAW on S and forces the value through arithmetic
+
+            // d[0]: sub %r309, %r300, %r{base}  → delta = -inf - S
+            //       setp %p25, col_even > row0
+            //       selp %r309, %r309, %r199, %p25  → delta or 0
+            //       add.f32 %r{base}, %r{base}, %r309
+            w(s, "setp.gt.s32 \t%p25, %r307, %r305;");
+            w(s, &format!("sub.f32 \t%r309, %r300, %r{};", base));
+            w(s, "selp.f32 \t%r309, %r309, %r199, %p25;");
+            w(s, &format!("add.f32 \t%r{}, %r{}, %r309;", base, base));
+
+            w(s, "setp.gt.s32 \t%p25, %r308, %r305;");
+            w(s, &format!("sub.f32 \t%r309, %r300, %r{};", base + 1));
+            w(s, "selp.f32 \t%r309, %r309, %r199, %p25;");
+            w(s, &format!("add.f32 \t%r{}, %r{}, %r309;", base + 1, base + 1));
+
+            w(s, "setp.gt.s32 \t%p25, %r307, %r306;");
+            w(s, &format!("sub.f32 \t%r309, %r300, %r{};", base + 2));
+            w(s, "selp.f32 \t%r309, %r309, %r199, %p25;");
+            w(s, &format!("add.f32 \t%r{}, %r{}, %r309;", base + 2, base + 2));
+
+            w(s, "setp.gt.s32 \t%p25, %r308, %r306;");
+            w(s, &format!("sub.f32 \t%r309, %r300, %r{};", base + 3));
+            w(s, "selp.f32 \t%r309, %r309, %r199, %p25;");
+            w(s, &format!("add.f32 \t%r{}, %r{}, %r309;", base + 3, base + 3));
         }
     }
     blank(s);

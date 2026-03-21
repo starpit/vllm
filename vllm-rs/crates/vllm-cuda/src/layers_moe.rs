@@ -21,8 +21,23 @@ use crate::layers::Linear;
 use crate::nccl::NcclGroup;
 use crate::tensor::{GpuTensor, TensorView};
 
-/// Block size for MoE GEMM tiling. Must match BLOCK_M in fused_moe_gemm_kernels.cu.
-const MOE_BLOCK_SIZE: usize = 128;
+/// Dynamic BLOCK_M selection for fused MoE GEMM tiling.
+///
+/// Matches Python vLLM's `get_default_config` heuristic: select the smallest
+/// tile size that covers the expected tokens-per-expert, reducing wasted
+/// compute on zero-padded rows during decode.
+fn select_moe_block_m(num_tokens: usize, top_k: usize, num_experts: usize) -> usize {
+    let tokens_per_expert = (num_tokens * top_k) / num_experts;
+    if tokens_per_expert <= 16 {
+        16
+    } else if tokens_per_expert <= 32 {
+        32
+    } else if tokens_per_expert <= 64 {
+        64
+    } else {
+        128
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FusedMoELayer
@@ -80,6 +95,8 @@ impl FusedMoELayer {
         let num_tokens = hidden_states.dim(0);
         let stream = device.compute_stream;
 
+        let block_m = select_moe_block_m(num_tokens, self.top_k, self.num_experts);
+
         let router_logits =
             self.gate
                 .forward(hidden_states, &mut device.cublas, &mut device.caching);
@@ -96,7 +113,7 @@ impl FusedMoELayer {
         let (sorted_token_ids, expert_ids, num_tokens_post_padded) = kernels::moe_align_block_size(
             topk_ids.as_gpu_tensor(),
             self.num_experts,
-            MOE_BLOCK_SIZE,
+            block_m,
             &mut device.caching,
             stream,
         );
@@ -111,6 +128,7 @@ impl FusedMoELayer {
             num_tokens_post_padded.as_gpu_tensor(),
             num_tokens,
             self.top_k,
+            block_m,
             false,
             &mut device.caching,
             stream,
@@ -133,6 +151,7 @@ impl FusedMoELayer {
             num_tokens_post_padded.as_gpu_tensor(),
             num_tokens * self.top_k,
             1,
+            block_m,
             true,
             &mut device.caching,
             stream,
@@ -293,6 +312,8 @@ impl Fp8FusedMoELayer {
         let stream = device.compute_stream;
         let sm_version = device.sm_version;
 
+        let block_m = select_moe_block_m(num_tokens, self.top_k, self.num_experts);
+
         // 1. Gate: router_logits = hidden_states @ gate_weight^T
         let router_logits =
             self.gate
@@ -316,7 +337,7 @@ impl Fp8FusedMoELayer {
         let (sorted_token_ids, expert_ids, num_tokens_post_padded) = kernels::moe_align_block_size(
             topk_ids.as_gpu_tensor(),
             self.num_experts,
-            MOE_BLOCK_SIZE,
+            block_m,
             &mut device.caching,
             stream,
         );
@@ -334,7 +355,7 @@ impl Fp8FusedMoELayer {
             num_tokens_post_padded.as_gpu_tensor(),
             num_tokens,
             self.top_k,
-            MOE_BLOCK_SIZE,
+            block_m,
             false, // don't apply routing weights on first GEMM
             sm_version,
             &mut device.caching,
@@ -373,7 +394,7 @@ impl Fp8FusedMoELayer {
             num_tokens_post_padded.as_gpu_tensor(),
             num_tokens * self.top_k,
             1, // top_k=1: index directly into expanded input
-            MOE_BLOCK_SIZE,
+            block_m,
             true, // apply routing weights
             sm_version,
             &mut device.caching,

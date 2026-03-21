@@ -17,7 +17,14 @@
  *    - SM80-SM88: FP8 storage + dequant-to-BF16 in shared memory + BF16 WMMA compute
  *    Both paths get the 2x memory bandwidth win from FP8 storage.
  *
- * Tile sizes: BLOCK_M=128, BLOCK_N=128, BLOCK_K=32
+ * Tile sizes: BLOCK_M=variable (16/32/64/128), BLOCK_N=128, BLOCK_K=32
+ *
+ * Variable BLOCK_M: BF16/F16 kernels are templated on BLOCK_M_T to reduce
+ * wasted compute during decode (few tokens per expert). Warps are
+ * redistributed across M and N dimensions to keep all 8 warps active:
+ *   warps_per_m = BLOCK_M_T / WMMA_M
+ *   warps_per_n = 8 / warps_per_m
+ *   n_tiles_per_warp = 8 / warps_per_n
  */
 
 #include <cuda_bf16.h>
@@ -28,8 +35,8 @@
 
 using namespace nvcuda;
 
-// Tile sizes
-#define BLOCK_M 128
+// Fixed tile sizes
+#define BLOCK_M 128  // default / used by FP8 kernels (not yet templated)
 #define BLOCK_N 128
 #define BLOCK_K 32
 
@@ -42,8 +49,7 @@ using namespace nvcuda;
 #define THREADS_PER_BLOCK 256
 #define WARPS_PER_BLOCK (THREADS_PER_BLOCK / 32)
 
-#define WARP_TILES_M (BLOCK_M / WMMA_M)  // 8
-#define WARP_TILES_N (BLOCK_N / WMMA_N)  // 8
+#define WARP_TILES_N (BLOCK_N / WMMA_N)  // 8 (total N-tiles, always fixed)
 
 // FP8 PTX MMA tile sizes: m16n8k32
 #define FP8_WMMA_M 16
@@ -58,12 +64,15 @@ namespace moe {
 // BF16 WMMA GEMM kernel — tensor core compute via WMMA API (SM80+)
 //
 // Faithful port of Python vLLM's Triton fused_moe_kernel.
-// 8 warps, each handles one 16-row M-stripe, iterating over N tiles.
-// Shared memory: smem_a[128][32] + smem_b[32][128] + warp_staging = 24 KB.
+// Templated on BLOCK_M_T (16/32/64/128) for variable tile height.
+// 8 warps redistributed across M and N dimensions:
+//   warps_per_m = BLOCK_M_T / 16, warps_per_n = 8 / warps_per_m
+// Shared memory: smem_a[BLOCK_M_T][32] + smem_b[32][128] + staging.
 // =========================================================================
 
+template <int BLOCK_M_T>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK)
-fused_moe_gemm_bf16_tiled(
+fused_moe_gemm_bf16_wmma(
     __nv_bfloat16* __restrict__ output,
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ weights,
@@ -77,12 +86,17 @@ fused_moe_gemm_bf16_tiled(
     int32_t top_k,
     int32_t apply_weights)
 {
+    // Warp-to-tile mapping: redistribute 8 warps across M and N
+    constexpr int WARPS_PER_M = BLOCK_M_T / WMMA_M;  // M-stripes available
+    constexpr int WARPS_PER_N = WARPS_PER_BLOCK / WARPS_PER_M;  // warps sharing each M-stripe
+    constexpr int N_TILES_PER_WARP = WARP_TILES_N / WARPS_PER_N;  // N-tiles each warp handles
+
     const int32_t total_padded = *num_tokens_post_padded;
     const int32_t num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
     const int32_t pid_m = blockIdx.x / num_n_blocks;
     const int32_t pid_n = blockIdx.x % num_n_blocks;
 
-    if (pid_m * BLOCK_M >= total_padded) return;
+    if (pid_m * BLOCK_M_T >= total_padded) return;
 
     const int32_t expert_id = expert_ids[pid_m];
     if (expert_id < 0) return;
@@ -91,24 +105,25 @@ fused_moe_gemm_bf16_tiled(
 
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
-    const int warp_m = warp_id;  // Each of 8 warps owns one 16-row M-stripe
+    const int warp_m = warp_id / WARPS_PER_N;
+    const int warp_n_start = (warp_id % WARPS_PER_N) * N_TILES_PER_WARP;
 
-    __shared__ __nv_bfloat16 smem_a[BLOCK_M][BLOCK_K];   // 8 KB
-    __shared__ __nv_bfloat16 smem_b[BLOCK_K][BLOCK_N];   // 8 KB
+    __shared__ __nv_bfloat16 smem_a[BLOCK_M_T][BLOCK_K];
+    __shared__ __nv_bfloat16 smem_b[BLOCK_K][BLOCK_N];
 
-    // WMMA accumulators: one per N-tile
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[WARP_TILES_N];
+    // WMMA accumulators: one per N-tile this warp handles
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[N_TILES_PER_WARP];
     #pragma unroll
-    for (int wn = 0; wn < WARP_TILES_N; ++wn) {
+    for (int wn = 0; wn < N_TILES_PER_WARP; ++wn) {
         wmma::fill_fragment(acc[wn], 0.0f);
     }
 
     for (int32_t k_start = 0; k_start < K; k_start += BLOCK_K) {
-        // Cooperative load A tile [BLOCK_M × BLOCK_K]
-        for (int32_t idx = threadIdx.x; idx < BLOCK_M * BLOCK_K; idx += THREADS_PER_BLOCK) {
+        // Cooperative load A tile [BLOCK_M_T × BLOCK_K]
+        for (int32_t idx = threadIdx.x; idx < BLOCK_M_T * BLOCK_K; idx += THREADS_PER_BLOCK) {
             int32_t m_local = idx / BLOCK_K;
             int32_t k_local = idx % BLOCK_K;
-            int32_t global_m = pid_m * BLOCK_M + m_local;
+            int32_t global_m = pid_m * BLOCK_M_T + m_local;
             int32_t global_k = k_start + k_local;
 
             __nv_bfloat16 val = __float2bfloat16(0.0f);
@@ -137,16 +152,16 @@ fused_moe_gemm_bf16_tiled(
 
         __syncthreads();
 
-        // WMMA compute: each warp processes its 16-row M-stripe across all N-tiles
+        // WMMA compute: each warp processes its M-stripe across its assigned N-tiles
         #pragma unroll
         for (int32_t ki = 0; ki < BLOCK_K; ki += WMMA_K) {
             wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
             wmma::load_matrix_sync(a_frag, &smem_a[warp_m * WMMA_M][ki], BLOCK_K);
 
             #pragma unroll
-            for (int wn = 0; wn < WARP_TILES_N; ++wn) {
+            for (int wn = 0; wn < N_TILES_PER_WARP; ++wn) {
                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
-                wmma::load_matrix_sync(b_frag, &smem_b[ki][wn * WMMA_N], BLOCK_N);
+                wmma::load_matrix_sync(b_frag, &smem_b[ki][(warp_n_start + wn) * WMMA_N], BLOCK_N);
                 wmma::mma_sync(acc[wn], a_frag, b_frag, acc[wn]);
             }
         }
@@ -155,18 +170,18 @@ fused_moe_gemm_bf16_tiled(
     }
 
     // Epilogue: store WMMA fragments to staging, apply routing weight, write output
-    __shared__ float warp_staging[WARPS_PER_BLOCK][WMMA_M * WMMA_N];  // 8 KB
+    __shared__ float warp_staging[WARPS_PER_BLOCK][WMMA_M * WMMA_N];
 
     #pragma unroll
-    for (int wn = 0; wn < WARP_TILES_N; ++wn) {
+    for (int wn = 0; wn < N_TILES_PER_WARP; ++wn) {
         wmma::store_matrix_sync(
             &warp_staging[warp_id][0], acc[wn], WMMA_N, wmma::mem_row_major);
         __syncwarp();
 
         for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
             int32_t m_local = warp_m * WMMA_M + i / WMMA_N;
-            int32_t n_local = wn * WMMA_N + i % WMMA_N;
-            int32_t global_m = pid_m * BLOCK_M + m_local;
+            int32_t n_local = (warp_n_start + wn) * WMMA_N + i % WMMA_N;
+            int32_t global_m = pid_m * BLOCK_M_T + m_local;
             int32_t global_n = pid_n * BLOCK_N + n_local;
 
             if (global_m >= total_padded || global_n >= N) continue;
@@ -187,10 +202,12 @@ fused_moe_gemm_bf16_tiled(
 // F16 WMMA GEMM kernel — tensor core compute via WMMA API (SM70+)
 //
 // Same structure as BF16 WMMA kernel above, with __half types.
+// Templated on BLOCK_M_T with redistributed warp-to-tile mapping.
 // =========================================================================
 
+template <int BLOCK_M_T>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK)
-fused_moe_gemm_f16_tiled(
+fused_moe_gemm_f16_wmma(
     __half* __restrict__ output,
     const __half* __restrict__ input,
     const __half* __restrict__ weights,
@@ -204,12 +221,16 @@ fused_moe_gemm_f16_tiled(
     int32_t top_k,
     int32_t apply_weights)
 {
+    constexpr int WARPS_PER_M = BLOCK_M_T / WMMA_M;
+    constexpr int WARPS_PER_N = WARPS_PER_BLOCK / WARPS_PER_M;
+    constexpr int N_TILES_PER_WARP = WARP_TILES_N / WARPS_PER_N;
+
     const int32_t total_padded = *num_tokens_post_padded;
     const int32_t num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
     const int32_t pid_m = blockIdx.x / num_n_blocks;
     const int32_t pid_n = blockIdx.x % num_n_blocks;
 
-    if (pid_m * BLOCK_M >= total_padded) return;
+    if (pid_m * BLOCK_M_T >= total_padded) return;
 
     const int32_t expert_id = expert_ids[pid_m];
     if (expert_id < 0) return;
@@ -218,22 +239,23 @@ fused_moe_gemm_f16_tiled(
 
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
-    const int warp_m = warp_id;
+    const int warp_m = warp_id / WARPS_PER_N;
+    const int warp_n_start = (warp_id % WARPS_PER_N) * N_TILES_PER_WARP;
 
-    __shared__ __half smem_a[BLOCK_M][BLOCK_K];   // 8 KB
-    __shared__ __half smem_b[BLOCK_K][BLOCK_N];   // 8 KB
+    __shared__ __half smem_a[BLOCK_M_T][BLOCK_K];
+    __shared__ __half smem_b[BLOCK_K][BLOCK_N];
 
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[WARP_TILES_N];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[N_TILES_PER_WARP];
     #pragma unroll
-    for (int wn = 0; wn < WARP_TILES_N; ++wn) {
+    for (int wn = 0; wn < N_TILES_PER_WARP; ++wn) {
         wmma::fill_fragment(acc[wn], 0.0f);
     }
 
     for (int32_t k_start = 0; k_start < K; k_start += BLOCK_K) {
-        for (int32_t idx = threadIdx.x; idx < BLOCK_M * BLOCK_K; idx += THREADS_PER_BLOCK) {
+        for (int32_t idx = threadIdx.x; idx < BLOCK_M_T * BLOCK_K; idx += THREADS_PER_BLOCK) {
             int32_t m_local = idx / BLOCK_K;
             int32_t k_local = idx % BLOCK_K;
-            int32_t global_m = pid_m * BLOCK_M + m_local;
+            int32_t global_m = pid_m * BLOCK_M_T + m_local;
             int32_t global_k = k_start + k_local;
 
             __half val = __float2half(0.0f);
@@ -267,9 +289,9 @@ fused_moe_gemm_f16_tiled(
             wmma::load_matrix_sync(a_frag, &smem_a[warp_m * WMMA_M][ki], BLOCK_K);
 
             #pragma unroll
-            for (int wn = 0; wn < WARP_TILES_N; ++wn) {
+            for (int wn = 0; wn < N_TILES_PER_WARP; ++wn) {
                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> b_frag;
-                wmma::load_matrix_sync(b_frag, &smem_b[ki][wn * WMMA_N], BLOCK_N);
+                wmma::load_matrix_sync(b_frag, &smem_b[ki][(warp_n_start + wn) * WMMA_N], BLOCK_N);
                 wmma::mma_sync(acc[wn], a_frag, b_frag, acc[wn]);
             }
         }
@@ -277,18 +299,18 @@ fused_moe_gemm_f16_tiled(
         __syncthreads();
     }
 
-    __shared__ float warp_staging[WARPS_PER_BLOCK][WMMA_M * WMMA_N];  // 8 KB
+    __shared__ float warp_staging[WARPS_PER_BLOCK][WMMA_M * WMMA_N];
 
     #pragma unroll
-    for (int wn = 0; wn < WARP_TILES_N; ++wn) {
+    for (int wn = 0; wn < N_TILES_PER_WARP; ++wn) {
         wmma::store_matrix_sync(
             &warp_staging[warp_id][0], acc[wn], WMMA_N, wmma::mem_row_major);
         __syncwarp();
 
         for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
             int32_t m_local = warp_m * WMMA_M + i / WMMA_N;
-            int32_t n_local = wn * WMMA_N + i % WMMA_N;
-            int32_t global_m = pid_m * BLOCK_M + m_local;
+            int32_t n_local = (warp_n_start + wn) * WMMA_N + i % WMMA_N;
+            int32_t global_m = pid_m * BLOCK_M_T + m_local;
             int32_t global_n = pid_n * BLOCK_N + n_local;
 
             if (global_m >= total_padded || global_n >= N) continue;
@@ -675,19 +697,30 @@ extern "C" void fused_moe_gemm_bf16(
     int top_k,
     int num_tokens_padded_total,
     int apply_weights,
+    int block_m,
     cudaStream_t stream)
 {
-    int max_m_blocks = CEILDIV(num_tokens_padded_total, BLOCK_M);
+    int max_m_blocks = CEILDIV(num_tokens_padded_total, block_m);
     int num_n_blocks = CEILDIV(out_features, BLOCK_N);
     int grid = max_m_blocks * num_n_blocks;
 
-    vllm::moe::fused_moe_gemm_bf16_tiled
-        <<<grid, THREADS_PER_BLOCK, 0, stream>>>(
-            reinterpret_cast<__nv_bfloat16*>(output),
-            reinterpret_cast<const __nv_bfloat16*>(input),
-            reinterpret_cast<const __nv_bfloat16*>(weights),
-            topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded,
-            num_valid_tokens, in_features, out_features, top_k, apply_weights);
+    #define LAUNCH_BF16(BM) \
+        vllm::moe::fused_moe_gemm_bf16_wmma<BM> \
+            <<<grid, THREADS_PER_BLOCK, 0, stream>>>( \
+                reinterpret_cast<__nv_bfloat16*>(output), \
+                reinterpret_cast<const __nv_bfloat16*>(input), \
+                reinterpret_cast<const __nv_bfloat16*>(weights), \
+                topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, \
+                num_valid_tokens, in_features, out_features, top_k, apply_weights)
+
+    switch (block_m) {
+        case 16:  LAUNCH_BF16(16);  break;
+        case 32:  LAUNCH_BF16(32);  break;
+        case 64:  LAUNCH_BF16(64);  break;
+        case 128: LAUNCH_BF16(128); break;
+        default:  LAUNCH_BF16(128); break;
+    }
+    #undef LAUNCH_BF16
 }
 
 extern "C" void fused_moe_gemm_f16(
@@ -704,19 +737,30 @@ extern "C" void fused_moe_gemm_f16(
     int top_k,
     int num_tokens_padded_total,
     int apply_weights,
+    int block_m,
     cudaStream_t stream)
 {
-    int max_m_blocks = CEILDIV(num_tokens_padded_total, BLOCK_M);
+    int max_m_blocks = CEILDIV(num_tokens_padded_total, block_m);
     int num_n_blocks = CEILDIV(out_features, BLOCK_N);
     int grid = max_m_blocks * num_n_blocks;
 
-    vllm::moe::fused_moe_gemm_f16_tiled
-        <<<grid, THREADS_PER_BLOCK, 0, stream>>>(
-            reinterpret_cast<__half*>(output),
-            reinterpret_cast<const __half*>(input),
-            reinterpret_cast<const __half*>(weights),
-            topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded,
-            num_valid_tokens, in_features, out_features, top_k, apply_weights);
+    #define LAUNCH_F16(BM) \
+        vllm::moe::fused_moe_gemm_f16_wmma<BM> \
+            <<<grid, THREADS_PER_BLOCK, 0, stream>>>( \
+                reinterpret_cast<__half*>(output), \
+                reinterpret_cast<const __half*>(input), \
+                reinterpret_cast<const __half*>(weights), \
+                topk_weights, sorted_token_ids, expert_ids, num_tokens_post_padded, \
+                num_valid_tokens, in_features, out_features, top_k, apply_weights)
+
+    switch (block_m) {
+        case 16:  LAUNCH_F16(16);  break;
+        case 32:  LAUNCH_F16(32);  break;
+        case 64:  LAUNCH_F16(64);  break;
+        case 128: LAUNCH_F16(128); break;
+        default:  LAUNCH_F16(128); break;
+    }
+    #undef LAUNCH_F16
 }
 
 // FP8 E4M3 fused MoE GEMM — SM89+ path (true FP8 tensor cores).

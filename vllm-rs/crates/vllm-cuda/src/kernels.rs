@@ -720,6 +720,7 @@ unsafe extern "C" {
         top_k: c_int,
         num_tokens_padded_total: c_int,
         apply_weights: c_int,
+        block_m: c_int,
         stream: CUstream,
     );
     fn fused_moe_gemm_f16(
@@ -736,6 +737,7 @@ unsafe extern "C" {
         top_k: c_int,
         num_tokens_padded_total: c_int,
         apply_weights: c_int,
+        block_m: c_int,
         stream: CUstream,
     );
 
@@ -5131,6 +5133,7 @@ pub unsafe fn moe_align_block_size(
 /// * `sorted_token_ids`: from `moe_align_block_size`
 /// * `expert_ids`: from `moe_align_block_size`
 /// * `num_tokens_post_padded`: from `moe_align_block_size`
+/// * `block_m`: GEMM M-tile size (16/32/64/128) — must match the block_size used in `moe_align_block_size`
 /// * `apply_weights`: if true, multiply output by routing weight
 ///
 /// Returns `[num_tokens * top_k, out_features]`.
@@ -5144,6 +5147,7 @@ pub unsafe fn fused_moe_gemm(
     num_tokens_post_padded: GpuTensor,
     num_tokens: usize,
     top_k: usize,
+    block_m: usize,
     apply_weights: bool,
     alloc: &mut CachingAllocator,
     stream: CUstream,
@@ -5170,6 +5174,7 @@ pub unsafe fn fused_moe_gemm(
             top_k as c_int,
             num_tokens_padded_total as c_int,
             apply_weights as c_int,
+            block_m as c_int,
             stream,
         ),
         DType::F16 => fused_moe_gemm_f16(
@@ -5186,6 +5191,7 @@ pub unsafe fn fused_moe_gemm(
             top_k as c_int,
             num_tokens_padded_total as c_int,
             apply_weights as c_int,
+            block_m as c_int,
             stream,
         ),
         _ => panic!("fused_moe_gemm: unsupported dtype {:?}", input.dtype()),

@@ -25,6 +25,10 @@ mod sweep;
 mod tiled_mma;
 #[allow(unused, unsafe_op_in_unsafe_fn)]
 mod triton_style;
+#[allow(unused)]
+mod rotary;
+#[allow(unused)]
+mod silu_mul;
 
 use anyhow::{Context, Result, bail};
 use std::ffi::{CString, c_uint, c_void};
@@ -191,6 +195,14 @@ fn main() -> Result<()> {
     // Flash Attention forward d=128
     println!("\nFlash Attention Forward (BLOCK_M=128, BLOCK_N=32, HD=128)");
     run_flash_attn_fwd_hdim128()?;
+
+    // SiLU × Up elementwise kernel
+    println!("\nSiLU × Up Elementwise");
+    run_silu_mul()?;
+
+    // Rotary embeddings kernel
+    println!("\nRotary Embeddings (RoPE)");
+    run_rotary()?;
 
     println!("\n═══════════════════════════════════");
     println!("Phase 0 complete.");
@@ -3689,5 +3701,96 @@ fn run_flash_attn_fwd_hdim128() -> Result<()> {
         cuda::module::unload(module)?;
     }
 
+    Ok(())
+}
+
+fn run_silu_mul() -> Result<()> {
+    let ptx = silu_mul::emit_silu_mul_kernel();
+    println!("  Generated {} bytes of PTX", ptx.len());
+    let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
+    let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
+    let func = unsafe { cuda::module::get_function(module, CString::new("silu_mul_kernel").unwrap())? };
+    let n: u32 = 4096 * 128;
+    let d_gate = unsafe { cuda::malloc_sync(n as usize * 2)? };
+    let d_up = unsafe { cuda::malloc_sync(n as usize * 2)? };
+    let d_out = unsafe { cuda::malloc_sync(n as usize * 2)? };
+    let h_gate: Vec<half::f16> = (0..n as usize).map(|i| half::f16::from_f32(((i % 17) as f32 - 8.0) * 0.1)).collect();
+    let h_up: Vec<half::f16> = (0..n as usize).map(|i| half::f16::from_f32(((i % 13) as f32 - 6.0) * 0.1)).collect();
+    unsafe { cuda::memcpy_htod_sync(d_gate, &h_gate)?; cuda::memcpy_htod_sync(d_up, &h_up)?; cuda::memset_d8_sync(d_out, 0, n as usize * 2)?; }
+    let grid_x = (n + 1023) / 1024;
+    let params: &mut [*mut c_void] = &mut [(&d_out) as *const _ as *mut c_void, (&d_gate) as *const _ as *mut c_void, (&d_up) as *const _ as *mut c_void, (&n) as *const _ as *mut c_void];
+    let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
+    unsafe { cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?; cuda::stream::synchronize(stream)?; }
+    let mut h_out: Vec<half::f16> = vec![half::f16::ZERO; n as usize];
+    unsafe { cuda::memcpy_dtoh_sync(&mut h_out, d_out)?; }
+    let mut max_err: f32 = 0.0;
+    for i in (0..n as usize).step_by(1000) {
+        let g = h_gate[i].to_f32(); let u = h_up[i].to_f32();
+        let expected = g / (1.0 + (-g).exp()) * u;
+        let err = (h_out[i].to_f32() - expected).abs();
+        if err > max_err { max_err = err; }
+    }
+    if max_err < 0.05 { println!("  Correct (max err: {:.6})", max_err); } else { println!("  FAIL (max err: {:.6})", max_err); }
+    for _ in 0..10 { unsafe { cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?; } }
+    unsafe { cuda::stream::synchronize(stream)?; }
+    let iters = 100;
+    let start = Instant::now();
+    for _ in 0..iters { unsafe { cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?; } }
+    unsafe { cuda::stream::synchronize(stream)?; }
+    let us = start.elapsed().as_micros() as f64 / iters as f64;
+    let gb_s = 3.0 * n as f64 * 2.0 / (us * 1e-6) / 1e9;
+    println!("  n={}: {:.1} us, {:.1} GB/s", n, us, gb_s);
+    unsafe { cuda::stream::destroy(stream)?; cuda::free_sync(d_gate)?; cuda::free_sync(d_up)?; cuda::free_sync(d_out)?; cuda::module::unload(module)?; }
+    Ok(())
+}
+
+fn run_rotary() -> Result<()> {
+    let ptx = rotary::emit_rotary_kernel();
+    println!("  Generated {} bytes of PTX", ptx.len());
+    let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
+    let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
+    let func = unsafe { cuda::module::get_function(module, CString::new("rotary_kernel").unwrap())? };
+    let seqlen: u32 = 128; let nheads: u32 = 32; let headdim: u32 = 128; let half_dim: u32 = 64;
+    let n_x = (seqlen * nheads * headdim) as usize; let n_cs = (seqlen * half_dim) as usize;
+    let d_x = unsafe { cuda::malloc_sync(n_x * 2)? }; let d_out = unsafe { cuda::malloc_sync(n_x * 2)? };
+    let d_cos = unsafe { cuda::malloc_sync(n_cs * 4)? }; let d_sin = unsafe { cuda::malloc_sync(n_cs * 4)? };
+    let h_x: Vec<half::f16> = (0..n_x).map(|i| half::f16::from_f32(((i % 17) as f32 - 8.0) * 0.05)).collect();
+    let h_cos: Vec<f32> = (0..n_cs).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
+    let h_sin: Vec<f32> = (0..n_cs).map(|i| ((i % 23) as f32 - 11.0) * 0.1).collect();
+    unsafe { cuda::memcpy_htod_sync(d_x, &h_x)?; cuda::memcpy_htod_sync(d_cos, &h_cos)?; cuda::memcpy_htod_sync(d_sin, &h_sin)?; cuda::memset_d8_sync(d_out, 0, n_x * 2)?; }
+    let total_half: u32 = seqlen * nheads * half_dim; let nheads_x_half_dim: u32 = nheads * half_dim;
+    let grid_x = (total_half + 511) / 512;
+    let params: &mut [*mut c_void] = &mut [(&d_out) as *const _ as *mut c_void, (&d_x) as *const _ as *mut c_void, (&d_cos) as *const _ as *mut c_void, (&d_sin) as *const _ as *mut c_void, (&total_half) as *const _ as *mut c_void, (&half_dim) as *const _ as *mut c_void, (&headdim) as *const _ as *mut c_void, (&nheads_x_half_dim) as *const _ as *mut c_void];
+    let stream = cuda::stream::create(cuda::stream::StreamKind::NonBlocking)?;
+    unsafe { cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?; cuda::stream::synchronize(stream)?; }
+    let mut h_out: Vec<half::f16> = vec![half::f16::ZERO; n_x];
+    unsafe { cuda::memcpy_dtoh_sync(&mut h_out, d_out)?; }
+    let hd = headdim as usize; let hh = half_dim as usize; let nh = nheads as usize; let sl = seqlen as usize;
+    let mut max_err: f32 = 0.0;
+    for s in [0usize, 1, 63, 127] { for h in [0, 1, 31] { for k in [0, 1, 31, 63] {
+        if s >= sl || h >= nh || k >= hh { continue; }
+        let flat = s * nh * hd + h * hd;
+        let x1 = h_x[flat + k].to_f32(); let x2 = h_x[flat + hh + k].to_f32();
+        let c = h_cos[s * hh + k]; let sn = h_sin[s * hh + k];
+        let err1 = (h_out[flat + k].to_f32() - (x1 * c - x2 * sn)).abs();
+        let err2 = (h_out[flat + hh + k].to_f32() - (x2 * c + x1 * sn)).abs();
+        if err1 > max_err { max_err = err1; } if err2 > max_err { max_err = err2; }
+    }}}
+    if max_err < 0.05 { println!("  Correct (max err: {:.6})", max_err); }
+    else {
+        for k in 0..4 { let x1 = h_x[k].to_f32(); let x2 = h_x[hh + k].to_f32();
+            println!("    out[0][0][{}]: got={:.6} exp={:.6}", k, h_out[k].to_f32(), x1 * h_cos[k] - x2 * h_sin[k]); }
+        println!("  FAIL (max err: {:.6})", max_err);
+    }
+    for _ in 0..10 { unsafe { cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?; } }
+    unsafe { cuda::stream::synchronize(stream)?; }
+    let iters = 100; let start = Instant::now();
+    for _ in 0..iters { unsafe { cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?; } }
+    unsafe { cuda::stream::synchronize(stream)?; }
+    let us = start.elapsed().as_micros() as f64 / iters as f64;
+    let bytes = 2.0 * n_x as f64 * 2.0 + 2.0 * n_cs as f64 * 4.0;
+    let gb_s = bytes / (us * 1e-6) / 1e9;
+    println!("  S={} H={} D={}: {:.1} us, {:.1} GB/s", seqlen, nheads, headdim, us, gb_s);
+    unsafe { cuda::stream::destroy(stream)?; cuda::free_sync(d_x)?; cuda::free_sync(d_out)?; cuda::free_sync(d_cos)?; cuda::free_sync(d_sin)?; cuda::module::unload(module)?; }
     Ok(())
 }

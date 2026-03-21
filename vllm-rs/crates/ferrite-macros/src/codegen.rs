@@ -2,72 +2,111 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::ItemFn;
 
-use crate::ops::OpGraph;
+use crate::ops::{OpGraph, OpKind};
 use crate::parse::FuseAttr;
-use crate::strategy::{FusionPlan, KernelKind};
+use crate::strategy::{FusionPlan, Stage};
 
 /// Generate the complete output TokenStream for a `#[fuse]` function.
 ///
-/// For the megakernel case (RmsNormGemmSilu), this:
-/// 1. Calls `ferrite_ptx::fused::build_fused_rmsnorm_gemm_silu()` at compile time
-/// 2. Embeds the PTX as a `const &str`
-/// 3. Emits a `ferrite_runtime::JitKernel` with lazy compilation
-/// 4. Wraps the original function signature to launch the kernel
+/// Dispatches based on the number of stages and the composition of each stage.
+/// Single-stage plans produce one kernel launch; multi-stage plans produce
+/// multiple launches with intermediates through global memory.
 pub fn generate(
     attr: &FuseAttr,
     input_fn: &ItemFn,
     graph: &OpGraph,
     plan: &FusionPlan,
 ) -> syn::Result<TokenStream> {
-    // Validate: we expect exactly ONE kernel in the plan for the megakernel case.
-    // If we get multiple, that's a strategy failure — we refuse to emit separate launches.
-    if plan.kernels.len() != 1 {
+    if plan.stages.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &input_fn.sig.ident,
+            "Ferrite fusion strategy produced no stages. \
+             The function body must contain at least one GEMM operation.",
+        ));
+    }
+
+    // For now, we only support single-stage plans at the codegen level.
+    // Multi-stage support (multiple kernel launches) is the next step.
+    if plan.stages.len() != 1 {
         return Err(syn::Error::new_spanned(
             &input_fn.sig.ident,
             format!(
-                "Ferrite fusion strategy produced {} kernels instead of 1. \
-                 The entire point of Ferrite is the megakernel — ONE kernel, ONE launch. \
-                 Found: {:?}",
-                plan.kernels.len(),
-                plan.kernels
+                "Ferrite fusion strategy produced {} stages. \
+                 Multi-stage codegen (multiple kernel launches) is not yet implemented. \
+                 Stages: {:?}",
+                plan.stages.len(),
+                plan.stages
                     .iter()
-                    .map(|k| match k {
-                        KernelKind::RmsNorm { .. } => "RmsNorm",
-                        KernelKind::Gemm { .. } => "Gemm",
-                        KernelKind::Silu { .. } => "Silu",
-                        KernelKind::GemmSilu { .. } => "GemmSilu",
-                        KernelKind::RmsNormGemmSilu { .. } => "RmsNormGemmSilu",
-                        KernelKind::RmsNormGemm { .. } => "RmsNormGemm",
-                    })
+                    .map(|s| describe_stage(s, graph))
                     .collect::<Vec<_>>(),
             ),
         ));
     }
 
-    match &plan.kernels[0] {
-        KernelKind::RmsNormGemmSilu {
-            norm_idx,
-            gemm_idx,
-            silu_idx,
-        } => generate_rmsnorm_gemm_silu(attr, input_fn, graph, *norm_idx, *gemm_idx, *silu_idx),
-        KernelKind::RmsNormGemm { norm_idx, gemm_idx } => {
-            generate_rmsnorm_gemm(attr, input_fn, graph, *norm_idx, *gemm_idx)
+    generate_single_stage(attr, input_fn, graph, &plan.stages[0])
+}
+
+/// Generate code for a single-stage fusion plan.
+fn generate_single_stage(
+    attr: &FuseAttr,
+    input_fn: &ItemFn,
+    graph: &OpGraph,
+    stage: &Stage,
+) -> syn::Result<TokenStream> {
+    // Classify by prologue/epilogue combination
+    let prologue_kind = stage.prologue_transform.map(|id| graph.nodes[id].kind);
+    let epilogue_kind = stage.epilogue_transform.map(|id| graph.nodes[id].kind);
+
+    match (prologue_kind, epilogue_kind) {
+        (Some(OpKind::RmsNorm), Some(OpKind::Silu)) => {
+            // Transform(RmsNorm) + GEMM + Epilogue(SiLU) — the full megakernel
+            generate_rmsnorm_gemm_silu(
+                attr,
+                input_fn,
+                graph,
+                stage.prologue_transform.unwrap(),
+                stage.gemm,
+                stage.epilogue_transform.unwrap(),
+            )
         }
-        KernelKind::GemmSilu { gemm_idx, silu_idx } => {
-            generate_gemm_silu(attr, input_fn, graph, *gemm_idx, *silu_idx)
+        (Some(OpKind::RmsNorm), None) => {
+            // Transform(RmsNorm) + GEMM — no epilogue
+            generate_rmsnorm_gemm(
+                attr,
+                input_fn,
+                graph,
+                stage.prologue_transform.unwrap(),
+                stage.gemm,
+            )
         }
-        KernelKind::Gemm { node_idx } => generate_standalone_gemm(attr, input_fn, graph, *node_idx),
-        other => Err(syn::Error::new_spanned(
-            &input_fn.sig.ident,
-            format!(
-                "Unsupported standalone kernel kind: {:?}",
-                match other {
-                    KernelKind::RmsNorm { .. } => "RmsNorm",
-                    KernelKind::Silu { .. } => "Silu",
-                    _ => "Unknown",
-                }
-            ),
-        )),
+        (None, Some(OpKind::Silu)) => {
+            // GEMM + Epilogue(SiLU)
+            generate_gemm_silu(
+                attr,
+                input_fn,
+                graph,
+                stage.gemm,
+                stage.epilogue_transform.unwrap(),
+            )
+        }
+        (None, None) => {
+            // Standalone GEMM
+            generate_standalone_gemm(attr, input_fn, graph, stage.gemm)
+        }
+        (prologue, epilogue) => {
+            // Future: when new OpKinds are added, they get routed here until
+            // their codegen is implemented. The strategy engine already handles
+            // them — only codegen needs updating.
+            Err(syn::Error::new_spanned(
+                &input_fn.sig.ident,
+                format!(
+                    "Unsupported stage composition: prologue={:?}, epilogue={:?}. \
+                     Add codegen support for this combination.",
+                    prologue.map(|k| k.name()),
+                    epilogue.map(|k| k.name()),
+                ),
+            ))
+        }
     }
 }
 
@@ -78,18 +117,17 @@ fn generate_rmsnorm_gemm_silu(
     attr: &FuseAttr,
     input_fn: &ItemFn,
     _graph: &OpGraph,
-    norm_idx: usize,
-    gemm_idx: usize,
-    silu_idx: usize,
+    _norm_id: usize,
+    _gemm_id: usize,
+    _silu_id: usize,
 ) -> syn::Result<TokenStream> {
     let arch = &attr.arch;
     let fn_name = &input_fn.sig.ident;
     let fn_vis = &input_fn.vis;
     let fn_args = &input_fn.sig.inputs;
     let fn_attrs = &input_fn.attrs;
-    let _ = (norm_idx, gemm_idx, silu_idx); // used for graph analysis
 
-    // Generate PTX at compile time using 128×128 tiles for the fused megakernel.
+    // Generate PTX at compile time using 128x128 tiles for the fused megakernel.
     let config = ferrite_ptx::config::GemmConfig {
         bm: 128,
         bn: 128,
@@ -114,10 +152,6 @@ fn generate_rmsnorm_gemm_silu(
     let smem_bytes = (config.smem_total() + 32 + config.bm * 4 + hidden_size * 2) as u32;
     let threads = config.threads() as u32;
 
-    // Emit Rust code that:
-    // 1. Stores the PTX as a const string
-    // 2. Creates a static JitKernel
-    // 3. Wraps the original function to launch it
     let kernel_name_str = "fused_rmsnorm_gemm_silu";
     let static_name =
         quote::format_ident!("__FERRITE_KERNEL_{}", fn_name.to_string().to_uppercase());
@@ -134,16 +168,6 @@ fn generate_rmsnorm_gemm_silu(
 
         #(#fn_attrs)*
         #fn_vis fn #fn_name(#fn_args) {
-            // Grid: (out_features / BN, batch / BM, 1)
-            // The caller must pass correctly-sized tensors.
-            //
-            // Parameters to the PTX kernel:
-            //   param_input:  ptr to input tensor (batch x hidden_size, f16)
-            //   param_wnorm:  ptr to RMSNorm weight (hidden_size, f16)
-            //   param_wgemm:  ptr to GEMM weight matrix (hidden_size x out_features, f16)
-            //   param_output: ptr to output tensor (batch x out_features, f32)
-            //   param_N:      out_features (u32)
-            //   param_K:      hidden_size (u32)
             let grid_x = (out_feat + 127) / 128;
             let grid_y = (batch + 127) / 128;
             let grid = (grid_x, grid_y, 1u32);
@@ -179,8 +203,8 @@ fn generate_rmsnorm_gemm(
     _attr: &FuseAttr,
     input_fn: &syn::ItemFn,
     _graph: &OpGraph,
-    _norm_idx: usize,
-    _gemm_idx: usize,
+    _norm_id: usize,
+    _gemm_id: usize,
 ) -> syn::Result<TokenStream> {
     Err(syn::Error::new_spanned(
         &input_fn.sig.ident,
@@ -193,8 +217,8 @@ fn generate_gemm_silu(
     _attr: &FuseAttr,
     input_fn: &syn::ItemFn,
     _graph: &OpGraph,
-    _gemm_idx: usize,
-    _silu_idx: usize,
+    _gemm_id: usize,
+    _silu_id: usize,
 ) -> syn::Result<TokenStream> {
     Err(syn::Error::new_spanned(
         &input_fn.sig.ident,
@@ -207,10 +231,23 @@ fn generate_standalone_gemm(
     _attr: &FuseAttr,
     input_fn: &syn::ItemFn,
     _graph: &OpGraph,
-    _node_idx: usize,
+    _gemm_id: usize,
 ) -> syn::Result<TokenStream> {
     Err(syn::Error::new_spanned(
         &input_fn.sig.ident,
         "Standalone GEMM not yet implemented via proc macro. Use ferrite_ptx::gemm::build_gemm() directly.",
     ))
+}
+
+/// Human-readable description of a stage for error messages.
+fn describe_stage(stage: &Stage, graph: &OpGraph) -> String {
+    let mut parts = Vec::new();
+    if let Some(p) = stage.prologue_transform {
+        parts.push(format!("Transform({})", graph.nodes[p].kind.name()));
+    }
+    parts.push("GEMM".to_string());
+    if let Some(e) = stage.epilogue_transform {
+        parts.push(format!("Epilogue({})", graph.nodes[e].kind.name()));
+    }
+    parts.join(" -> ")
 }

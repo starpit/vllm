@@ -1,300 +1,442 @@
-use crate::ops::{Op, OpGraph};
+use crate::ops::{InputPort, NodeId, OpClass, OpGraph};
 
-/// A kernel in the fusion plan.
-#[derive(Debug, Clone)]
-pub enum KernelKind {
-    /// Standalone RMSNorm kernel.
-    RmsNorm {
-        /// OpGraph node index.
-        node_idx: usize,
-    },
-    /// Standalone GEMM kernel.
-    Gemm {
-        /// OpGraph node index.
-        node_idx: usize,
-    },
-    /// Standalone SiLU kernel.
-    Silu {
-        /// OpGraph node index.
-        node_idx: usize,
-    },
-    /// Fused GEMM + SiLU epilogue (SiLU applied to accumulators before store).
-    GemmSilu {
-        /// OpGraph node index for the GEMM.
-        gemm_idx: usize,
-        /// OpGraph node index for the SiLU.
-        silu_idx: usize,
-    },
-    /// Fused RMSNorm -> GEMM -> SiLU megakernel.
-    /// ONE kernel, ONE launch. Norm factors computed in phase 1, GEMM K-loop
-    /// uses NormalizedLoader for A tiles, SiLU applied as epilogue on accumulators.
-    RmsNormGemmSilu {
-        /// OpGraph node index for the RMSNorm.
-        norm_idx: usize,
-        /// OpGraph node index for the GEMM.
-        gemm_idx: usize,
-        /// OpGraph node index for the SiLU.
-        silu_idx: usize,
-    },
-    /// Fused RMSNorm -> GEMM megakernel (no SiLU).
-    RmsNormGemm {
-        /// OpGraph node index for the RMSNorm.
-        norm_idx: usize,
-        /// OpGraph node index for the GEMM.
-        gemm_idx: usize,
-    },
+/// A single stage in the fusion plan — one GEMM with optional prologue/epilogue transforms.
+///
+/// Each stage maps to one pipeline invocation:
+/// ```text
+/// Pipeline<CpAsyncCopy, CpAsyncCopy, transform_atom, MMA, epilogue_atom>
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stage {
+    /// The GEMM node for this stage.
+    pub gemm: NodeId,
+    /// Optional elementwise op on the A input (e.g., RmsNorm normalizes fragments
+    /// between ldmatrix and MMA).
+    pub prologue_transform: Option<NodeId>,
+    /// Optional elementwise op on the output (e.g., SiLU applied to accumulators
+    /// before store).
+    pub epilogue_transform: Option<NodeId>,
 }
 
-/// The fusion plan: a sequence of kernels to launch.
+/// The fusion plan: a sequence of stages to execute.
+///
+/// Single-stage plans produce one kernel launch.
+/// Multi-stage plans produce multiple kernel launches with intermediates through
+/// global memory (L2 cache locality).
 #[derive(Debug, Clone)]
 pub struct FusionPlan {
-    pub kernels: Vec<KernelKind>,
+    pub stages: Vec<Stage>,
 }
 
-/// Evaluate which operations can be fused based on the megakernel strategy.
+/// Evaluate the fusion strategy by walking edges in the operation DAG.
 ///
-/// The key insight: Ferrite's whole purpose is the megakernel. We fuse
-/// as aggressively as possible into ONE kernel, ONE launch.
+/// For each GEMM node, this classifies its input and output edges:
 ///
-/// Fusion rules (in priority order):
-/// 1. RmsNorm -> GEMM -> SiLU = single fused megakernel (RmsNormGemmSilu)
-/// 2. RmsNorm -> GEMM = fused megakernel (RmsNormGemm)
-/// 3. GEMM -> SiLU = fused epilogue (GemmSilu)
-/// 4. Anything left = standalone kernel
+/// 1. **Prologue transform**: If the GEMM's Primary (A) input comes from an
+///    Elementwise op, that op becomes a prologue transform (TransformAtom).
+///
+/// 2. **Epilogue transform**: If the GEMM's output feeds into an Elementwise op
+///    (and that op has no other Matmul consumer), that op becomes an epilogue
+///    transform (EpilogueAtom).
+///
+/// 3. **GEMM chain**: If the GEMM's output feeds into another GEMM, the
+///    intermediate goes through global memory, creating a new stage.
+///
+/// This is fully general — any new OpKind just needs its OpClass, and the
+/// strategy engine handles it automatically.
 pub fn evaluate_strategy(graph: &OpGraph) -> FusionPlan {
-    let mut kernels = Vec::new();
+    let mut stages = Vec::new();
     let mut consumed = vec![false; graph.nodes.len()];
 
-    // Pass 1: Look for RmsNorm -> GEMM -> SiLU triple fusion
-    for i in 0..graph.nodes.len() {
-        if consumed[i] {
+    // Process nodes in topological order. For each GEMM, build a Stage.
+    for node in &graph.nodes {
+        if consumed[node.id] {
             continue;
         }
-        if let Op::RmsNorm { .. } = &graph.nodes[i].op {
-            if let Some(ref norm_result) = graph.nodes[i].result_name {
-                // Find GEMM consuming this norm output as its A input
-                for j in (i + 1)..graph.nodes.len() {
-                    if consumed[j] {
-                        continue;
-                    }
-                    if let Op::Gemm { a, .. } = &graph.nodes[j].op {
-                        if a == norm_result {
-                            // Found RmsNorm -> GEMM. Now look for SiLU after GEMM.
-                            if let Some(ref gemm_result) = graph.nodes[j].result_name {
-                                let mut found_silu = false;
-                                for k in (j + 1)..graph.nodes.len() {
-                                    if consumed[k] {
-                                        continue;
-                                    }
-                                    if let Op::Silu { input } = &graph.nodes[k].op {
-                                        if input == gemm_result {
-                                            // Triple fusion!
-                                            kernels.push(KernelKind::RmsNormGemmSilu {
-                                                norm_idx: i,
-                                                gemm_idx: j,
-                                                silu_idx: k,
-                                            });
-                                            consumed[i] = true;
-                                            consumed[j] = true;
-                                            consumed[k] = true;
-                                            found_silu = true;
-                                            break;
-                                        }
-                                    }
-                                    break; // only check immediately following node
-                                }
-                                if !found_silu && !consumed[i] {
-                                    // RmsNorm -> GEMM without SiLU
-                                    kernels.push(KernelKind::RmsNormGemm {
-                                        norm_idx: i,
-                                        gemm_idx: j,
-                                    });
-                                    consumed[i] = true;
-                                    consumed[j] = true;
-                                }
-                            } else if !consumed[i] {
-                                // GEMM has no result name (terminal), fuse norm->gemm
-                                kernels.push(KernelKind::RmsNormGemm {
-                                    norm_idx: i,
-                                    gemm_idx: j,
-                                });
-                                consumed[i] = true;
-                                consumed[j] = true;
-                            }
-                            break;
-                        }
-                    }
-                    break; // only check immediately following node
-                }
-            }
-        }
-    }
 
-    // Pass 2: Look for GEMM -> SiLU pairs (without preceding RmsNorm)
-    for i in 0..graph.nodes.len() {
-        if consumed[i] {
+        if node.class != OpClass::Matmul {
             continue;
         }
-        if let Op::Gemm { .. } = &graph.nodes[i].op {
-            if let Some(ref gemm_result) = graph.nodes[i].result_name {
-                for j in (i + 1)..graph.nodes.len() {
-                    if consumed[j] {
-                        continue;
-                    }
-                    if let Op::Silu { input } = &graph.nodes[j].op {
-                        if input == gemm_result {
-                            kernels.push(KernelKind::GemmSilu {
-                                gemm_idx: i,
-                                silu_idx: j,
-                            });
-                            consumed[i] = true;
-                            consumed[j] = true;
-                            break;
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-    }
 
-    // Pass 3: Emit remaining ops as standalone kernels
-    for i in 0..graph.nodes.len() {
-        if consumed[i] {
-            continue;
-        }
-        let kind = match &graph.nodes[i].op {
-            Op::RmsNorm { .. } => KernelKind::RmsNorm { node_idx: i },
-            Op::Gemm { .. } => KernelKind::Gemm { node_idx: i },
-            Op::Silu { .. } => KernelKind::Silu { node_idx: i },
+        // This is a GEMM node. Build a stage around it.
+        let gemm_id = node.id;
+
+        // --- Check for prologue transform ---
+        // If the GEMM's Primary input comes from an Elementwise op, fuse it.
+        let prologue = graph
+            .input_node(gemm_id, InputPort::Primary)
+            .filter(|&src_id| {
+                !consumed[src_id]
+                    && graph.nodes[src_id].class == OpClass::Elementwise
+                    // Only fuse if this elementwise op's sole consumer is this GEMM.
+                    // If it feeds multiple consumers, it must remain standalone.
+                    && graph.consumers_of(src_id).len() == 1
+            });
+
+        // --- Check for epilogue transform ---
+        // If this GEMM has exactly one consumer and it's an Elementwise op, fuse it.
+        let consumers = graph.consumers_of(gemm_id);
+        let epilogue = if consumers.len() == 1 {
+            let consumer_id = consumers[0];
+            if !consumed[consumer_id] && graph.nodes[consumer_id].class == OpClass::Elementwise {
+                Some(consumer_id)
+            } else {
+                None
+            }
+        } else {
+            None
         };
-        kernels.push(kind);
+
+        // Mark consumed
+        consumed[gemm_id] = true;
+        if let Some(p) = prologue {
+            consumed[p] = true;
+        }
+        if let Some(e) = epilogue {
+            consumed[e] = true;
+        }
+
+        stages.push(Stage {
+            gemm: gemm_id,
+            prologue_transform: prologue,
+            epilogue_transform: epilogue,
+        });
     }
 
-    FusionPlan { kernels }
+    // Any remaining unconsumed nodes that are standalone (no GEMM absorbed them)
+    // get their own degenerate stages. For now, we only handle the case where
+    // all ops are part of GEMM stages — standalone elementwise-only kernels
+    // are not yet supported at the codegen level.
+    //
+    // In practice, every meaningful Ferrite pipeline has at least one GEMM,
+    // so this path is for future extensibility.
+
+    FusionPlan { stages }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::{OpGraph, OpNode};
+    use crate::ops::{Edge, InputPort, OpGraph, OpKind, OpNode, PARAM, ParamInfo};
 
-    fn make_graph(nodes: Vec<(Option<&str>, Op)>) -> OpGraph {
+    /// Helper to build an OpGraph from a sequence of node descriptors.
+    fn build_graph(descriptors: Vec<NodeDesc>) -> OpGraph {
         let mut graph = OpGraph::new();
-        for (i, (name, op)) in nodes.into_iter().enumerate() {
+        // Add dummy params for anything sourced from PARAM
+        graph.params.push(ParamInfo {
+            name: "x".to_string(),
+            ty: "DevicePtr".to_string(),
+        });
+        graph.params.push(ParamInfo {
+            name: "w".to_string(),
+            ty: "DevicePtr".to_string(),
+        });
+        graph.params.push(ParamInfo {
+            name: "w2".to_string(),
+            ty: "DevicePtr".to_string(),
+        });
+        graph.params.push(ParamInfo {
+            name: "w3".to_string(),
+            ty: "DevicePtr".to_string(),
+        });
+
+        for (idx, desc) in descriptors.iter().enumerate() {
+            let kind = desc.kind;
+            let class = kind.class();
+            let inputs = desc
+                .inputs
+                .iter()
+                .map(|(src, port, name)| Edge {
+                    src: *src,
+                    port: *port,
+                    src_name: name.to_string(),
+                })
+                .collect();
             graph.nodes.push(OpNode {
-                result_name: name.map(|s| s.to_string()),
-                op,
-                index: i,
+                id: idx,
+                kind,
+                class,
+                inputs,
+                result_name: desc.result_name.map(|s| s.to_string()),
             });
         }
+
+        if !graph.nodes.is_empty() {
+            graph.output = graph.nodes.len() - 1;
+        }
+
         graph
     }
 
+    struct NodeDesc {
+        kind: OpKind,
+        result_name: Option<&'static str>,
+        inputs: Vec<(NodeId, InputPort, &'static str)>,
+    }
+
+    // ── Existing tests (must still pass) ──
+
     #[test]
-    fn test_rmsnorm_gemm_silu_fuses_into_one_kernel() {
-        let graph = make_graph(vec![
-            (
-                Some("n"),
-                Op::RmsNorm {
-                    input: "x".into(),
-                    weight: "w".into(),
-                },
-            ),
-            (
-                Some("g"),
-                Op::Gemm {
-                    a: "n".into(),
-                    b: "w2".into(),
-                },
-            ),
-            (None, Op::Silu { input: "g".into() }),
+    fn test_rmsnorm_gemm_silu_fuses_into_one_stage() {
+        // let n = rmsnorm(x, w);
+        // let g = gemm(n, w2);
+        // silu(g)
+        let graph = build_graph(vec![
+            NodeDesc {
+                kind: OpKind::RmsNorm,
+                result_name: Some("n"),
+                inputs: vec![
+                    (PARAM, InputPort::Primary, "x"),
+                    (PARAM, InputPort::Weight, "w"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: Some("g"),
+                inputs: vec![
+                    (0, InputPort::Primary, "n"),
+                    (PARAM, InputPort::Weight, "w2"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Silu,
+                result_name: None,
+                inputs: vec![(1, InputPort::Primary, "g")],
+            },
         ]);
 
         let plan = evaluate_strategy(&graph);
 
-        assert_eq!(plan.kernels.len(), 1, "Must produce exactly ONE kernel");
-        match &plan.kernels[0] {
-            KernelKind::RmsNormGemmSilu {
-                norm_idx,
-                gemm_idx,
-                silu_idx,
-            } => {
-                assert_eq!(*norm_idx, 0);
-                assert_eq!(*gemm_idx, 1);
-                assert_eq!(*silu_idx, 2);
-            }
-            other => panic!(
-                "Expected RmsNormGemmSilu, got {:?}",
-                match other {
-                    KernelKind::RmsNorm { .. } => "RmsNorm",
-                    KernelKind::Gemm { .. } => "Gemm",
-                    KernelKind::Silu { .. } => "Silu",
-                    KernelKind::GemmSilu { .. } => "GemmSilu",
-                    KernelKind::RmsNormGemm { .. } => "RmsNormGemm",
-                    _ => "Unknown",
-                }
-            ),
-        }
+        assert_eq!(plan.stages.len(), 1, "Must produce exactly ONE stage");
+        let stage = &plan.stages[0];
+        assert_eq!(stage.gemm, 1);
+        assert_eq!(
+            stage.prologue_transform,
+            Some(0),
+            "RmsNorm should be prologue"
+        );
+        assert_eq!(stage.epilogue_transform, Some(2), "SiLU should be epilogue");
     }
 
     #[test]
     fn test_gemm_silu_fuses_without_norm() {
-        let graph = make_graph(vec![
-            (
-                Some("g"),
-                Op::Gemm {
-                    a: "x".into(),
-                    b: "w".into(),
-                },
-            ),
-            (None, Op::Silu { input: "g".into() }),
+        // let g = gemm(x, w);
+        // silu(g)
+        let graph = build_graph(vec![
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: Some("g"),
+                inputs: vec![
+                    (PARAM, InputPort::Primary, "x"),
+                    (PARAM, InputPort::Weight, "w"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Silu,
+                result_name: None,
+                inputs: vec![(0, InputPort::Primary, "g")],
+            },
         ]);
 
         let plan = evaluate_strategy(&graph);
 
-        assert_eq!(plan.kernels.len(), 1);
-        assert!(matches!(&plan.kernels[0], KernelKind::GemmSilu { .. }));
+        assert_eq!(plan.stages.len(), 1);
+        let stage = &plan.stages[0];
+        assert_eq!(stage.gemm, 0);
+        assert_eq!(stage.prologue_transform, None);
+        assert_eq!(stage.epilogue_transform, Some(1));
     }
 
     #[test]
     fn test_rmsnorm_gemm_fuses_without_silu() {
-        let graph = make_graph(vec![
-            (
-                Some("n"),
-                Op::RmsNorm {
-                    input: "x".into(),
-                    weight: "w".into(),
-                },
-            ),
-            (
-                None,
-                Op::Gemm {
-                    a: "n".into(),
-                    b: "w2".into(),
-                },
-            ),
+        // let n = rmsnorm(x, w);
+        // gemm(n, w2)
+        let graph = build_graph(vec![
+            NodeDesc {
+                kind: OpKind::RmsNorm,
+                result_name: Some("n"),
+                inputs: vec![
+                    (PARAM, InputPort::Primary, "x"),
+                    (PARAM, InputPort::Weight, "w"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: None,
+                inputs: vec![
+                    (0, InputPort::Primary, "n"),
+                    (PARAM, InputPort::Weight, "w2"),
+                ],
+            },
         ]);
 
         let plan = evaluate_strategy(&graph);
 
-        assert_eq!(plan.kernels.len(), 1);
-        assert!(matches!(&plan.kernels[0], KernelKind::RmsNormGemm { .. }));
+        assert_eq!(plan.stages.len(), 1);
+        let stage = &plan.stages[0];
+        assert_eq!(stage.gemm, 1);
+        assert_eq!(stage.prologue_transform, Some(0));
+        assert_eq!(stage.epilogue_transform, None);
     }
 
     #[test]
-    fn test_standalone_ops_not_fused() {
-        let graph = make_graph(vec![(
-            None,
-            Op::Gemm {
-                a: "x".into(),
-                b: "w".into(),
-            },
-        )]);
+    fn test_standalone_gemm() {
+        // gemm(x, w)
+        let graph = build_graph(vec![NodeDesc {
+            kind: OpKind::Gemm,
+            result_name: None,
+            inputs: vec![
+                (PARAM, InputPort::Primary, "x"),
+                (PARAM, InputPort::Weight, "w"),
+            ],
+        }]);
 
         let plan = evaluate_strategy(&graph);
 
-        assert_eq!(plan.kernels.len(), 1);
-        assert!(matches!(&plan.kernels[0], KernelKind::Gemm { .. }));
+        assert_eq!(plan.stages.len(), 1);
+        let stage = &plan.stages[0];
+        assert_eq!(stage.gemm, 0);
+        assert_eq!(stage.prologue_transform, None);
+        assert_eq!(stage.epilogue_transform, None);
+    }
+
+    // ── New tests for new patterns ──
+
+    #[test]
+    fn test_rmsnorm_gemm_silu_gemm_two_stages() {
+        // MLP block: rmsnorm → gemm → silu → gemm
+        // let n = rmsnorm(x, w);
+        // let g = gemm(n, w2);
+        // let h = silu(g);
+        // gemm(h, w3)
+        let graph = build_graph(vec![
+            NodeDesc {
+                kind: OpKind::RmsNorm,
+                result_name: Some("n"),
+                inputs: vec![
+                    (PARAM, InputPort::Primary, "x"),
+                    (PARAM, InputPort::Weight, "w"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: Some("g"),
+                inputs: vec![
+                    (0, InputPort::Primary, "n"),
+                    (PARAM, InputPort::Weight, "w2"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Silu,
+                result_name: Some("h"),
+                inputs: vec![(1, InputPort::Primary, "g")],
+            },
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: None,
+                inputs: vec![
+                    (2, InputPort::Primary, "h"),
+                    (PARAM, InputPort::Weight, "w3"),
+                ],
+            },
+        ]);
+
+        let plan = evaluate_strategy(&graph);
+
+        assert_eq!(plan.stages.len(), 2, "MLP block should produce two stages");
+
+        // Stage 0: Transform(RmsNorm) + GEMM + Epilogue(SiLU)
+        assert_eq!(plan.stages[0].gemm, 1);
+        assert_eq!(plan.stages[0].prologue_transform, Some(0));
+        assert_eq!(plan.stages[0].epilogue_transform, Some(2));
+
+        // Stage 1: standalone GEMM (h is intermediate through global memory)
+        assert_eq!(plan.stages[1].gemm, 3);
+        assert_eq!(plan.stages[1].prologue_transform, None);
+        assert_eq!(plan.stages[1].epilogue_transform, None);
+    }
+
+    #[test]
+    fn test_gemm_gemm_chain() {
+        // gemm → gemm chain (intermediate through global/L2)
+        // let g = gemm(x, w);
+        // gemm(g, w2)
+        let graph = build_graph(vec![
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: Some("g"),
+                inputs: vec![
+                    (PARAM, InputPort::Primary, "x"),
+                    (PARAM, InputPort::Weight, "w"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: None,
+                inputs: vec![
+                    (0, InputPort::Primary, "g"),
+                    (PARAM, InputPort::Weight, "w2"),
+                ],
+            },
+        ]);
+
+        let plan = evaluate_strategy(&graph);
+
+        assert_eq!(plan.stages.len(), 2, "GEMM chain should produce two stages");
+
+        // Stage 0: standalone GEMM
+        assert_eq!(plan.stages[0].gemm, 0);
+        assert_eq!(plan.stages[0].prologue_transform, None);
+        assert_eq!(plan.stages[0].epilogue_transform, None);
+
+        // Stage 1: standalone GEMM (consumes output of stage 0 through global memory)
+        assert_eq!(plan.stages[1].gemm, 1);
+        assert_eq!(plan.stages[1].prologue_transform, None);
+        assert_eq!(plan.stages[1].epilogue_transform, None);
+    }
+
+    #[test]
+    fn test_gemm_silu_gemm_two_stages() {
+        // gemm → silu → gemm (epilogue fuses with first GEMM)
+        // let g = gemm(x, w);
+        // let h = silu(g);
+        // gemm(h, w2)
+        let graph = build_graph(vec![
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: Some("g"),
+                inputs: vec![
+                    (PARAM, InputPort::Primary, "x"),
+                    (PARAM, InputPort::Weight, "w"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Silu,
+                result_name: Some("h"),
+                inputs: vec![(0, InputPort::Primary, "g")],
+            },
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: None,
+                inputs: vec![
+                    (1, InputPort::Primary, "h"),
+                    (PARAM, InputPort::Weight, "w2"),
+                ],
+            },
+        ]);
+
+        let plan = evaluate_strategy(&graph);
+
+        assert_eq!(plan.stages.len(), 2);
+
+        // Stage 0: GEMM + Epilogue(SiLU)
+        assert_eq!(plan.stages[0].gemm, 0);
+        assert_eq!(plan.stages[0].prologue_transform, None);
+        assert_eq!(plan.stages[0].epilogue_transform, Some(1));
+
+        // Stage 1: standalone GEMM
+        assert_eq!(plan.stages[1].gemm, 2);
+        assert_eq!(plan.stages[1].prologue_transform, None);
+        assert_eq!(plan.stages[1].epilogue_transform, None);
     }
 }

@@ -1,4 +1,4 @@
-use crate::ops::{Op, OpGraph, OpNode};
+use crate::ops::{Edge, InputPort, OpGraph, OpKind, OpNode, PARAM, ParamInfo};
 use syn::{self, Expr, ItemFn, Stmt, spanned::Spanned};
 
 /// Parsed `#[fuse(arch = "sm_89")]` attribute.
@@ -20,7 +20,15 @@ impl syn::parse::Parse for FuseAttr {
     }
 }
 
-/// Parse a function body into an OpGraph.
+/// Intermediate parsed call before DAG construction.
+struct ParsedCall {
+    func_name: String,
+    args: Vec<String>,
+    result_name: Option<String>,
+    span: proc_macro2::Span,
+}
+
+/// Parse a function body into an OpGraph (real DAG with edges).
 ///
 /// Supported patterns:
 /// - `let x = op(args...);`
@@ -34,7 +42,7 @@ pub fn parse_fn_body(func: &ItemFn) -> syn::Result<OpGraph> {
             syn::FnArg::Typed(pat_ty) => {
                 let name = pat_to_string(&pat_ty.pat)?;
                 let ty = type_to_string(&pat_ty.ty);
-                graph.params.push((name, ty));
+                graph.params.push(ParamInfo { name, ty });
             }
             syn::FnArg::Receiver(_) => {
                 return Err(syn::Error::new(arg.span(), "self parameters not supported"));
@@ -42,33 +50,31 @@ pub fn parse_fn_body(func: &ItemFn) -> syn::Result<OpGraph> {
         }
     }
 
+    // First pass: collect all calls
+    let mut calls = Vec::new();
     let block = &func.block;
-    for (i, stmt) in block.stmts.iter().enumerate() {
-        let is_last = i == block.stmts.len() - 1;
-
+    for stmt in block.stmts.iter() {
         match stmt {
             Stmt::Local(local) => {
-                // `let x = op(args...);`
                 let result_name = pat_to_string(&local.pat)?;
                 let init = local.init.as_ref().ok_or_else(|| {
                     syn::Error::new(local.span(), "let binding must have initializer")
                 })?;
-                let op = parse_call_expr(&init.expr)?;
-                let index = graph.nodes.len();
-                graph.nodes.push(OpNode {
+                let (func_name, args) = parse_call_expr(&init.expr)?;
+                calls.push(ParsedCall {
+                    func_name,
+                    args,
                     result_name: Some(result_name),
-                    op,
-                    index,
+                    span: init.expr.span(),
                 });
             }
             Stmt::Expr(expr, _semi) => {
-                // Trailing expression or expression statement
-                let op = parse_call_expr(expr)?;
-                let index = graph.nodes.len();
-                graph.nodes.push(OpNode {
-                    result_name: if is_last { None } else { None },
-                    op,
-                    index,
+                let (func_name, args) = parse_call_expr(expr)?;
+                calls.push(ParsedCall {
+                    func_name,
+                    args,
+                    result_name: None,
+                    span: expr.span(),
                 });
             }
             _ => {
@@ -80,11 +86,97 @@ pub fn parse_fn_body(func: &ItemFn) -> syn::Result<OpGraph> {
         }
     }
 
+    // Second pass: build DAG nodes with edges
+    for (idx, call) in calls.iter().enumerate() {
+        let (kind, inputs) = match call.func_name.as_str() {
+            "rmsnorm" => {
+                if call.args.len() != 2 {
+                    return Err(syn::Error::new(call.span, "rmsnorm expects 2 arguments"));
+                }
+                let inputs = vec![
+                    resolve_edge(&graph, &call.args[0], InputPort::Primary, call.span)?,
+                    resolve_edge(&graph, &call.args[1], InputPort::Weight, call.span)?,
+                ];
+                (OpKind::RmsNorm, inputs)
+            }
+            "gemm" => {
+                if call.args.len() != 2 {
+                    return Err(syn::Error::new(call.span, "gemm expects 2 arguments"));
+                }
+                let inputs = vec![
+                    resolve_edge(&graph, &call.args[0], InputPort::Primary, call.span)?,
+                    resolve_edge(&graph, &call.args[1], InputPort::Weight, call.span)?,
+                ];
+                (OpKind::Gemm, inputs)
+            }
+            "silu" => {
+                if call.args.len() != 1 {
+                    return Err(syn::Error::new(call.span, "silu expects 1 argument"));
+                }
+                let inputs = vec![resolve_edge(
+                    &graph,
+                    &call.args[0],
+                    InputPort::Primary,
+                    call.span,
+                )?];
+                (OpKind::Silu, inputs)
+            }
+            other => {
+                return Err(syn::Error::new(call.span, format!("unknown op: {other}")));
+            }
+        };
+
+        let class = kind.class();
+        graph.nodes.push(OpNode {
+            id: idx,
+            kind,
+            class,
+            inputs,
+            result_name: call.result_name.clone(),
+        });
+    }
+
+    // Set output to the last node
+    if !graph.nodes.is_empty() {
+        graph.output = graph.nodes.len() - 1;
+    }
+
     Ok(graph)
 }
 
-/// Parse a function call expression like `gemm(a, b)` into an Op.
-fn parse_call_expr(expr: &Expr) -> syn::Result<Op> {
+/// Resolve a variable name to an Edge: either from a producer node or a function parameter.
+fn resolve_edge(
+    graph: &OpGraph,
+    name: &str,
+    port: InputPort,
+    span: proc_macro2::Span,
+) -> syn::Result<Edge> {
+    // Check if it's produced by an earlier node
+    if let Some(src) = graph.producer_of(name) {
+        return Ok(Edge {
+            src,
+            port,
+            src_name: name.to_string(),
+        });
+    }
+
+    // Check if it's a function parameter
+    if graph.is_param(name) {
+        return Ok(Edge {
+            src: PARAM,
+            port,
+            src_name: name.to_string(),
+        });
+    }
+
+    Err(syn::Error::new(
+        span,
+        format!("undefined variable: `{name}` — not a function parameter or previous result"),
+    ))
+}
+
+/// Parse a function call expression like `gemm(a, b)` into (func_name, args).
+fn parse_call_expr(expr: &Expr) -> syn::Result<(String, Vec<String>)> {
     match expr {
         Expr::Call(call) => {
             let func_name = expr_to_ident(&call.func)?;
@@ -93,36 +185,7 @@ fn parse_call_expr(expr: &Expr) -> syn::Result<Op> {
                 .iter()
                 .map(|a| expr_to_string(a))
                 .collect::<syn::Result<_>>()?;
-
-            match func_name.as_str() {
-                "rmsnorm" => {
-                    if args.len() != 2 {
-                        return Err(syn::Error::new(call.span(), "rmsnorm expects 2 arguments"));
-                    }
-                    Ok(Op::RmsNorm {
-                        input: args[0].clone(),
-                        weight: args[1].clone(),
-                    })
-                }
-                "gemm" => {
-                    if args.len() != 2 {
-                        return Err(syn::Error::new(call.span(), "gemm expects 2 arguments"));
-                    }
-                    Ok(Op::Gemm {
-                        a: args[0].clone(),
-                        b: args[1].clone(),
-                    })
-                }
-                "silu" => {
-                    if args.len() != 1 {
-                        return Err(syn::Error::new(call.span(), "silu expects 1 argument"));
-                    }
-                    Ok(Op::Silu {
-                        input: args[0].clone(),
-                    })
-                }
-                other => Err(syn::Error::new(call.span(), format!("unknown op: {other}"))),
-            }
+            Ok((func_name, args))
         }
         _ => Err(syn::Error::new(
             expr.span(),

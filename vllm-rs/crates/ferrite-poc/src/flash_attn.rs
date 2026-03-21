@@ -786,9 +786,12 @@ fn emit_cp_async_kv_swizzled_dynamic(s: &mut String, smem_off_reg: &str, base_pt
 }
 
 /// Emit causal flash attention kernel (d=64).
-/// Same as non-causal but with:
-/// 1. KV loop bounded by block_m_start + BLOCK_M
-/// 2. Causal mask applied to S after scaling on diagonal blocks
+/// FA2-style structure:
+///   1. Reverse KV iteration (last block first, nearest diagonal)
+///   2. Peeled masked iterations (first 1-2 near diagonal with causal mask)
+///   3. Unmasked fast loop for remaining blocks
+///   4. Causal mask via selp to NEW registers (prevents ptxas reordering)
+///   5. Separate K (smem 16384) and V (smem 24576) regions (software pipelined)
 fn emit_kernel_causal(s: &mut String) {
     // ─── Header ───
     s.push_str(
@@ -822,42 +825,50 @@ fn emit_kernel_causal(s: &mut String) {
     w(s, "ld.param.b64 \t%rd3, [param_V];");
     w(s, "ld.param.b64 \t%rd4, [param_O];");
     w(s, "ld.param.b32 \t%r1, [param_seq_len];");
-    w(s, "ld.param.b32 \t%r2, [param_scale];");
+    w(s, "ld.param.b32 \t%r2, [param_scale];"); // qk_scale (includes log2e)
     w(s, "ld.param.b32 \t%r3, [param_stride_batch];");
     blank(s);
 
     // ─── Indexing ───
-    w(s, "mov.u32 \t%r4, %ctaid.x;");
-    w(s, "mov.u32 \t%r5, %ctaid.y;");
-    w(s, "mov.u32 \t%r6, %tid.x;");
-    w(s, "shl.b32 \t%r7, %r4, 7;"); // block_m_start
+    w(s, "mov.u32 \t%r4, %ctaid.x;"); // block_m index
+    w(s, "mov.u32 \t%r5, %ctaid.y;"); // batch_head index
+    w(s, "mov.u32 \t%r6, %tid.x;"); // thread id (0..127)
+    w(s, "shl.b32 \t%r7, %r4, 7;"); // block_m_start = block_m * 128
     blank(s);
 
-    // Compute KV loop upper bound for causal: min(seq_len, block_m_start + 128)
-    // Round up to multiple of BLOCK_N=64: ((val + 63) / 64) * 64
-    w(s, "add.s32 \t%r13, %r7, 128;"); // block_m_start + BLOCK_M
-    w(s, "add.s32 \t%r14, %r13, 63;"); // + 63 for rounding
-    w(s, "and.b32 \t%r15, %r14, -64;"); // round up to multiple of 64
-    w(s, "min.s32 \t%r16, %r15, %r1;"); // min(rounded, seq_len)
-    // %r16 = kv_end (causal upper bound)
+    // ─── Causal n_blocks computation (FA2-style) ───
+    // n_blocks_total = ceil(seq_len / 64)
+    w(s, "add.s32 \t%r13, %r1, 63;");
+    w(s, "shr.s32 \t%r14, %r13, 6;"); // n_blocks_total
+    // n_blocks_causal = ceil((block_m_start + 128 + 63) / 64)
+    //                 = ceil((block_m_start + 191) / 64)
+    w(s, "add.s32 \t%r15, %r7, 191;");
+    w(s, "shr.s32 \t%r16, %r15, 6;"); // n_blocks_causal
+    // n_blocks = min(causal, total)
+    w(s, "min.s32 \t%r17, %r16, %r14;"); // %r17 = n_blocks
     blank(s);
 
     // Base pointers adjusted for batch/head
     w(s, "mul.lo.s32 \t%r8, %r5, %r3;");
-    w(s, "mad.wide.s32 \t%rd10, %r8, 2, %rd1;");
-    w(s, "mad.wide.s32 \t%rd11, %r8, 2, %rd2;");
-    w(s, "mad.wide.s32 \t%rd12, %r8, 2, %rd3;");
-    w(s, "mad.wide.s32 \t%rd13, %r8, 2, %rd4;");
+    w(s, "mad.wide.s32 \t%rd10, %r8, 2, %rd1;"); // Q_base
+    w(s, "mad.wide.s32 \t%rd11, %r8, 2, %rd2;"); // K_base
+    w(s, "mad.wide.s32 \t%rd12, %r8, 2, %rd3;"); // V_base
+    w(s, "mad.wide.s32 \t%rd13, %r8, 2, %rd4;"); // O_base
+    blank(s);
+
+    // Early exit if n_blocks < 1
+    w(s, "setp.lt.s32 \t%p1, %r17, 1;");
+    w(s, "@%p1 bra \t$L_EPILOGUE;");
     blank(s);
 
     // cp.async thread decomposition
-    w(s, "shr.u32 \t%r9, %r6, 3;");
-    w(s, "and.b32 \t%r10, %r6, 7;");
-    w(s, "shl.b32 \t%r11, %r10, 4;");
+    w(s, "shr.u32 \t%r9, %r6, 3;"); // cp_row_in_chunk = tid/8
+    w(s, "and.b32 \t%r10, %r6, 7;"); // cp_col_idx = tid%8
+    w(s, "shl.b32 \t%r11, %r10, 4;"); // col_bytes = cp_col_idx * 16
     w(s, "mov.b32 \t%r12, global_smem;");
     blank(s);
 
-    // ─── Load Q → smem ───
+    // ─── Load Q → smem (offset 0) ───
     for round in 0..8u32 {
         let row_base = round * 16;
         w(s, "add.s32 \t%r60, %r7, %r9;");
@@ -888,20 +899,18 @@ fn emit_kernel_causal(s: &mut String) {
     blank(s);
 
     // ─── Warp/lane decomposition ───
-    w(s, "shr.u32 \t%r30, %r6, 5;");
-    w(s, "and.b32 \t%r31, %r6, 31;");
-    w(s, "and.b32 \t%r32, %r31, 7;");
-    w(s, "shr.u32 \t%r33, %r31, 3;");
-    w(s, "shr.u32 \t%r34, %r33, 1;");
-    w(s, "and.b32 \t%r35, %r33, 1;");
-    w(s, "shl.b32 \t%r36, %r30, 5;");
-    w(s, "shl.b32 \t%r37, %r34, 3;");
-    w(s, "shl.b32 \t%r40, %r35, 4;");
+    w(s, "shr.u32 \t%r30, %r6, 5;"); // warp_id (0..3)
+    w(s, "and.b32 \t%r31, %r6, 31;"); // lane_id (0..31)
+    w(s, "and.b32 \t%r32, %r31, 7;"); // row_in_frag = lane % 8
+    w(s, "shr.u32 \t%r33, %r31, 3;"); // frag_id = lane / 8
+    w(s, "shr.u32 \t%r34, %r33, 1;"); // row_half (0 or 1)
+    w(s, "and.b32 \t%r35, %r33, 1;"); // col_half (0 or 1)
+    w(s, "shl.b32 \t%r36, %r30, 5;"); // warp_id * 32
+    w(s, "shl.b32 \t%r37, %r34, 3;"); // row_half * 8
+    w(s, "shl.b32 \t%r40, %r35, 4;"); // col_half * 16 bytes
     blank(s);
 
-    blank(s);
-
-    // ─── Load Q fragments ───
+    // ─── Load Q fragments (stay live for entire KV-loop) ───
     for mt in 0..2u32 {
         let mt_row_off = mt * 16;
         w(s, "add.s32 \t%r38, %r36, %r37;");
@@ -928,9 +937,9 @@ fn emit_kernel_causal(s: &mut String) {
     blank(s);
 
     // K/V ldmatrix addressing
-    w(s, "shl.b32 \t%r44, %r33, 4;");
-    w(s, "shl.b32 \t%r45, %r32, 7;");
-    w(s, "add.s32 \t%r46, %r45, %r44;");
+    w(s, "shl.b32 \t%r44, %r33, 4;"); // frag_id * 16
+    w(s, "shl.b32 \t%r45, %r32, 7;"); // (lane%8) * 128
+    w(s, "add.s32 \t%r46, %r45, %r44;"); // base linear byte within KV tile
     blank(s);
 
     // ─── Initialize accumulators ───
@@ -941,55 +950,323 @@ fn emit_kernel_causal(s: &mut String) {
     for i in 560..592u32 {
         s.push_str(&format!("\tmov.b32 \t%r{i}, %r199;\n"));
     }
-    w(s, "mov.b32 \t%r232, 0xFF800000;");
+    w(s, "mov.b32 \t%r232, 0xFF800000;"); // m_i = -inf
     w(s, "mov.b32 \t%r233, 0xFF800000;");
     w(s, "mov.b32 \t%r592, 0xFF800000;");
     w(s, "mov.b32 \t%r593, 0xFF800000;");
-    w(s, "mov.b32 \t%r234, 0x00000000;");
+    w(s, "mov.b32 \t%r234, 0x00000000;"); // l_i = 0
     w(s, "mov.b32 \t%r235, 0x00000000;");
     w(s, "mov.b32 \t%r594, 0x00000000;");
     w(s, "mov.b32 \t%r595, 0x00000000;");
     blank(s);
 
-    // ─── KV-loop (causal: use %r16 as upper bound instead of %r1) ───
-    w(s, "mov.b32 \t%r236, 0;");
-    w(s, "setp.lt.s32 \t%p1, %r236, %r16;"); // use kv_end
-    w(s, "@!%p1 bra \t$L_EPILOGUE;");
+    // ─── Causal bounds computation (FA2-style per-row-group bounds) ───
+    // For causal mask, bound for a row is q_row + 1 (attend to positions < bound).
+    // 4 row groups per thread:
+    //   rg0: q_row = block_m_start + warp_id*32 + 0  + lane/4
+    //   rg1: q_row = block_m_start + warp_id*32 + 8  + lane/4
+    //   rg2: q_row = block_m_start + warp_id*32 + 16 + lane/4
+    //   rg3: q_row = block_m_start + warp_id*32 + 24 + lane/4
+    // bound_i = q_row_i + 1
+    // For mask comparison: col < bound_i means attend.
+    w(s, "shr.u32 \t%r47, %r31, 2;"); // lane/4
+    w(s, "add.s32 \t%r48, %r7, %r36;"); // block_m_start + warp_id*32
+    w(s, "add.s32 \t%r48, %r48, %r47;"); // + lane/4
+    w(s, "add.s32 \t%r48, %r48, 1;"); // + 1 (bound_0 = q_row_0 + 1)
+    // %r48 = bound_0 (for m-tile 0, row-group 0, rows [warp_base..+8))
+    // %r49 = bound_1 (for m-tile 0, row-group 1, rows [warp_base+8..+16))
+    w(s, "add.s32 \t%r49, %r48, 8;");
+    // %r50 = bound_2 (for m-tile 1, row-group 0, rows [warp_base+16..+24))
+    w(s, "add.s32 \t%r50, %r48, 16;");
+    // %r51 = bound_3 (for m-tile 1, row-group 1, rows [warp_base+24..+32))
+    w(s, "add.s32 \t%r51, %r48, 24;");
     blank(s);
 
-    // Load K[0] into KV buf 0
-    emit_cp_async_kv_swizzled(s, 16384, "%rd11", false);
+    // Column offset within KV block for causal mask comparisons
+    // col_base_in_block = (lane%4)*2
+    w(s, "and.b32 \t%r52, %r31, 3;"); // lane%4
+    w(s, "shl.b32 \t%r53, %r52, 1;"); // (lane%4)*2
+    blank(s);
+
+    // ─── Reverse iteration: start from last KV block ───
+    // %r236 = kv_block_idx (current block, starts at n_blocks-1, decrements)
+    w(s, "add.s32 \t%r236, %r17, -1;"); // kv_block_idx = n_blocks - 1
+    blank(s);
+
+    // ═══════════════════════════════════════════════════════════════
+    // PEELED MASKED ITERATION (block nearest diagonal)
+    // ═══════════════════════════════════════════════════════════════
+
+    // Load K[kv_block_idx] to smem offset 16384
+    emit_cp_async_kv_block(s, 16384, "%rd11");
     w(s, "cp.async.commit_group;");
     w(s, "cp.async.wait_group \t0;");
     w(s, "bar.sync \t0;");
     blank(s);
 
-    s.push_str("$L_KV_LOOP:\n");
+    // ldmatrix K from smem 16384
+    emit_ldmatrix_kv(s, 16384, 300);
     blank(s);
 
-    // Issue cp.async for NEXT K block into alternate buffer
-    w(s, "add.s32 \t%r237, %r236, 64;");
-    w(s, "setp.lt.s32 \t%p2, %r237, %r16;"); // use kv_end
-    w(s, "shr.u32 \t%r238, %r236, 6;");
-    w(s, "and.b32 \t%r239, %r238, 1;");
-    w(s, "shl.b32 \t%r240, %r239, 13;");
-    w(s, "add.s32 \t%r241, %r240, 16384;");
-    w(s, "xor.b32 \t%r242, %r239, 1;");
-    w(s, "shl.b32 \t%r243, %r242, 13;");
-    w(s, "add.s32 \t%r244, %r243, 16384;");
-    w(s, "@!%p2 bra \t$L_SKIP_NEXT_K;");
-    w(s, "mov.b32 \t%r250, %r236;");
-    w(s, "mov.b32 \t%r236, %r237;");
-    emit_cp_async_kv_swizzled_dynamic(s, "%r244", "%rd11");
+    // MMA: S = Q @ K^T
+    emit_qkt_mma(s);
+    blank(s);
+
+    // Scale S by qk_scale
+    emit_scale_s(s);
+    blank(s);
+
+    // Causal mask (selp to NEW registers %r700-763)
+    emit_causal_mask(s);
+    blank(s);
+
+    // Online softmax on masked S
+    emit_softmax_masked(s);
+    blank(s);
+
+    // P -> f16x2 conversion (from masked registers %r700-763)
+    emit_p_convert_masked(s);
+    blank(s);
+
+    // Load V[kv_block_idx] to smem offset 24576
+    emit_cp_async_kv_block(s, 24576, "%rd12");
     w(s, "cp.async.commit_group;");
-    w(s, "mov.b32 \t%r236, %r250;");
-    s.push_str("$L_SKIP_NEXT_K:\n");
+    w(s, "cp.async.wait_group \t0;");
+    w(s, "bar.sync \t0;");
     blank(s);
 
-    // ─── ldmatrix K from current buffer ───
+    // ldmatrix V from smem 24576
+    emit_ldmatrix_kv(s, 24576, 480);
+    blank(s);
+
+    // MMA: O += P @ V
+    emit_pv_mma(s);
+    blank(s);
+
+    // Decrement kv_block_idx
+    w(s, "add.s32 \t%r236, %r236, -1;");
+    // If no more blocks, go to epilogue
+    w(s, "setp.lt.s32 \t%p2, %r236, 0;");
+    w(s, "@%p2 bra \t$L_EPILOGUE;");
+    blank(s);
+
+    // ═══════════════════════════════════════════════════════════════
+    // SECOND PEELED MASKED ITERATION (may also need mask)
+    // ═══════════════════════════════════════════════════════════════
+
+    // Load K[kv_block_idx] to smem 16384
+    emit_cp_async_kv_block(s, 16384, "%rd11");
+    w(s, "cp.async.commit_group;");
+    w(s, "cp.async.wait_group \t0;");
+    w(s, "bar.sync \t0;");
+    blank(s);
+
+    emit_ldmatrix_kv(s, 16384, 300);
+    blank(s);
+
+    emit_qkt_mma(s);
+    blank(s);
+
+    emit_scale_s(s);
+    blank(s);
+
+    // Causal mask on second block too
+    emit_causal_mask(s);
+    blank(s);
+
+    emit_softmax_masked(s);
+    blank(s);
+
+    emit_p_convert_masked(s);
+    blank(s);
+
+    emit_cp_async_kv_block(s, 24576, "%rd12");
+    w(s, "cp.async.commit_group;");
+    w(s, "cp.async.wait_group \t0;");
+    w(s, "bar.sync \t0;");
+    blank(s);
+
+    emit_ldmatrix_kv(s, 24576, 480);
+    blank(s);
+
+    emit_pv_mma(s);
+    blank(s);
+
+    // Decrement and check
+    w(s, "add.s32 \t%r236, %r236, -1;");
+    w(s, "setp.lt.s32 \t%p2, %r236, 0;");
+    w(s, "@%p2 bra \t$L_EPILOGUE;");
+    blank(s);
+
+    // ═══════════════════════════════════════════════════════════════
+    // UNMASKED LOOP (remaining blocks, fully below diagonal)
+    // ═══════════════════════════════════════════════════════════════
+    s.push_str("$L_UNMASKED_LOOP:\n");
+    blank(s);
+
+    // Load K[kv_block_idx] to smem 16384
+    emit_cp_async_kv_block(s, 16384, "%rd11");
+    w(s, "cp.async.commit_group;");
+    w(s, "cp.async.wait_group \t0;");
+    w(s, "bar.sync \t0;");
+    blank(s);
+
+    emit_ldmatrix_kv(s, 16384, 300);
+    blank(s);
+
+    emit_qkt_mma(s);
+    blank(s);
+
+    emit_scale_s(s);
+    blank(s);
+
+    // NO causal mask — softmax reads directly from S accumulators
+    emit_softmax_unmasked(s);
+    blank(s);
+
+    emit_p_convert_unmasked(s);
+    blank(s);
+
+    emit_cp_async_kv_block(s, 24576, "%rd12");
+    w(s, "cp.async.commit_group;");
+    w(s, "cp.async.wait_group \t0;");
+    w(s, "bar.sync \t0;");
+    blank(s);
+
+    emit_ldmatrix_kv(s, 24576, 480);
+    blank(s);
+
+    emit_pv_mma(s);
+    blank(s);
+
+    // Decrement and loop
+    w(s, "add.s32 \t%r236, %r236, -1;");
+    w(s, "setp.ge.s32 \t%p2, %r236, 0;");
+    w(s, "@%p2 bra \t$L_UNMASKED_LOOP;");
+    blank(s);
+
+    // ═══════════════════════════════════════════════════════════════
+    // EPILOGUE: O = O / l_i, convert to f16, store
+    // ═══════════════════════════════════════════════════════════════
+    s.push_str("$L_EPILOGUE:\n");
+    w(s, "shr.u32 \t%r420, %r31, 2;");
+    w(s, "and.b32 \t%r423, %r31, 3;");
+    w(s, "shl.b32 \t%r424, %r423, 2;");
+    blank(s);
+
+    for mt in 0..2u32 {
+        let mt_row_off = mt * 16;
+        let o_base_start = if mt == 0 { 200 } else { 560 };
+        let l_i_0 = if mt == 0 { 234 } else { 594 };
+        let l_i_1 = if mt == 0 { 235 } else { 595 };
+
+        w(s, "add.s32 \t%r421, %r420, %r36;");
+        if mt_row_off > 0 {
+            w(s, &format!("add.s32 \t%r421, %r421, {};", mt_row_off));
+        }
+        w(s, "add.s32 \t%r422, %r421, 8;");
+
+        for n in 0..8u32 {
+            let base = o_base_start + n * 4;
+            s.push_str(&format!(
+                "\tdiv.full.f32 \t%r{b}, %r{b}, %r{l};\n",
+                b = base, l = l_i_0
+            ));
+            s.push_str(&format!(
+                "\tdiv.full.f32 \t%r{b}, %r{b}, %r{l};\n",
+                b = base + 1, l = l_i_0
+            ));
+            s.push_str(&format!(
+                "\tdiv.full.f32 \t%r{b}, %r{b}, %r{l};\n",
+                b = base + 2, l = l_i_1
+            ));
+            s.push_str(&format!(
+                "\tdiv.full.f32 \t%r{b}, %r{b}, %r{l};\n",
+                b = base + 3, l = l_i_1
+            ));
+        }
+        blank(s);
+
+        w(s, "add.s32 \t%r550, %r7, %r421;");
+        w(s, "add.s32 \t%r551, %r7, %r422;");
+        w(s, "setp.lt.s32 \t%p10, %r550, %r1;");
+        w(s, "setp.lt.s32 \t%p11, %r551, %r1;");
+        w(s, "shl.b32 \t%r552, %r550, 7;");
+        w(s, "add.s32 \t%r553, %r552, %r424;");
+        w(s, "cvt.u64.u32 \t%rd50, %r553;");
+        w(s, "add.s64 \t%rd51, %rd13, %rd50;");
+        w(s, "shl.b32 \t%r554, %r551, 7;");
+        w(s, "add.s32 \t%r555, %r554, %r424;");
+        w(s, "cvt.u64.u32 \t%rd52, %r555;");
+        w(s, "add.s64 \t%rd53, %rd13, %rd52;");
+        blank(s);
+
+        for n in 0..8u32 {
+            let base = o_base_start + n * 4;
+            let h0 = 670 + mt * 20 + n * 2;
+            let h1 = h0 + 1;
+            s.push_str(&format!(
+                "\tcvt.rn.f16x2.f32 \t%r{h0}, %r{}, %r{};\n",
+                base + 1, base
+            ));
+            s.push_str(&format!(
+                "\tcvt.rn.f16x2.f32 \t%r{h1}, %r{}, %r{};\n",
+                base + 3, base + 2
+            ));
+            let n_off = n * 16;
+            s.push_str(&format!(
+                "\t@%p10 st.global.b32 [ %rd51 + {n_off} ], %r{h0};\n"
+            ));
+            s.push_str(&format!(
+                "\t@%p11 st.global.b32 [ %rd53 + {n_off} ], %r{h1};\n"
+            ));
+        }
+        blank(s);
+    }
+
+    w(s, "ret;");
+    s.push_str("}\n");
+}
+
+/// Load a KV block at kv_block_idx (%r236) to smem at fixed offset.
+/// Global addr = base_ptr + kv_block_idx * 64 * 128 (64 rows, each 128 bytes).
+fn emit_cp_async_kv_block(s: &mut String, smem_offset: u32, base_ptr: &str) {
+    // kv_start = kv_block_idx * 64
+    w(s, "shl.b32 \t%r60, %r236, 6;"); // kv_block_idx * 64
+    for round in 0..4u32 {
+        let row_off = round * 16;
+        w(s, "add.s32 \t%r61, %r60, %r9;"); // kv_start + cp_row_in_chunk
+        if row_off > 0 {
+            w(s, &format!("add.s32 \t%r61, %r61, {};", row_off));
+        }
+        w(s, "setp.lt.s32 \t%p20, %r61, %r1;");
+        w(s, "selp.b32 \t%r72, 16, 0, %p20;");
+        // Global byte offset
+        w(s, "shl.b32 \t%r62, %r61, 7;"); // row * 128
+        w(s, "add.s32 \t%r63, %r62, %r11;"); // + col_bytes
+        w(s, "cvt.u64.u32 \t%rd20, %r63;");
+        w(s, &format!("add.s64 \t%rd21, {base_ptr}, %rd20;"));
+        // Smem with swizzle
+        let smem_row_off = row_off * 128;
+        w(s, "shl.b32 \t%r64, %r9, 7;"); // cp_row * 128
+        w(s, "add.s32 \t%r65, %r64, %r11;"); // + col_bytes
+        if smem_row_off > 0 {
+            w(s, &format!("add.s32 \t%r65, %r65, {};", smem_row_off));
+        }
+        w(s, "and.b32 \t%r66, %r65, 896;"); // 0x380
+        w(s, "shr.u32 \t%r67, %r66, 3;");
+        w(s, "xor.b32 \t%r68, %r65, %r67;");
+        w(s, &format!("add.s32 \t%r69, %r68, {};", smem_offset));
+        w(s, "add.s32 \t%r69, %r69, %r12;");
+        s.push_str("\tcp.async.cg.shared.global [ %r69 + 0 ], [ %rd21 + 0 ], 0x10, %r72;\n");
+    }
+}
+
+/// Emit ldmatrix for K or V tile from smem at given offset into given register base.
+fn emit_ldmatrix_kv(s: &mut String, smem_offset: u32, reg_base: u32) {
     for n in 0..8u32 {
         for kp in 0..2u32 {
-            let base = 300 + (n * 2 + kp) * 4;
+            let base = reg_base + (n * 2 + kp) * 4;
             let n_off = n * 1024;
             let kp_off = kp * 64;
             let total_off = n_off + kp_off;
@@ -997,17 +1274,21 @@ fn emit_kernel_causal(s: &mut String) {
             w(s, "and.b32 \t%r71, %r70, 896;");
             w(s, "shr.u32 \t%r72, %r71, 3;");
             w(s, "xor.b32 \t%r73, %r70, %r72;");
-            w(s, "add.s32 \t%r74, %r73, %r241;");
-            w(s, "add.s32 \t%r74, %r74, %r12;");
+            w(s, &format!("add.s32 \t%r74, %r73, {};", smem_offset));
+            w(s, "add.s32 \t%r74, %r74, %r12;"); // + smem base
             s.push_str(&format!(
                 "\tldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {{%r{}, %r{}, %r{}, %r{}}}, [%r74];\n",
                 base, base + 1, base + 2, base + 3
             ));
         }
     }
-    blank(s);
+}
 
-    // ─── MMA: S = Q @ K^T ───
+/// Emit Q @ K^T MMA: S[128x64] = Q[128x64] @ K^T[64x64].
+/// K frags at %r300-363, Q frags at %r100-131.
+/// S accum: m-tile 0 at %r370-401, m-tile 1 at %r600-631.
+fn emit_qkt_mma(s: &mut String) {
+    // Zero S accumulators
     w(s, "mov.b32 \t%r369, 0;");
     for i in 370..402u32 {
         s.push_str(&format!("\tmov.b32 \t%r{i}, %r369;\n"));
@@ -1015,7 +1296,6 @@ fn emit_kernel_causal(s: &mut String) {
     for i in 600..632u32 {
         s.push_str(&format!("\tmov.b32 \t%r{i}, %r369;\n"));
     }
-    blank(s);
 
     for mt in 0..2u32 {
         let q_base_start = 100 + mt * 16;
@@ -1043,94 +1323,89 @@ fn emit_kernel_causal(s: &mut String) {
             }
         }
     }
-    blank(s);
+}
 
-    w(s, "cp.async.wait_group \t0;");
-    w(s, "bar.sync \t0;");
-    blank(s);
-
-    // ─── Scale S ───
+/// Scale S by qk_scale (%r2).
+fn emit_scale_s(s: &mut String) {
     for i in 370..402u32 {
         s.push_str(&format!("\tmul.f32 \t%r{i}, %r{i}, %r2;\n"));
     }
     for i in 600..632u32 {
         s.push_str(&format!("\tmul.f32 \t%r{i}, %r{i}, %r2;\n"));
     }
-    blank(s);
+}
 
-    // ─── Causal mask (reusing dead K-frag registers %r300-308) ───
-    // K frags are dead after Q@K^T MMA. Reusing them avoids register pressure.
-    // %r300 = -inf constant
-    // %r302 = lane/4, %r304 = (lane%4)*2
-    // %r305 = q_row_0, %r306 = q_row_1
-    // %r307 = k_col_even, %r308 = k_col_odd
-    w(s, "mov.b32 \t%r300, 0xFF800000;"); // -inf
-    w(s, "shr.u32 \t%r302, %r31, 2;"); // lane/4
-    w(s, "and.b32 \t%r303, %r31, 3;"); // lane%4
-    w(s, "shl.b32 \t%r304, %r303, 1;"); // (lane%4)*2
+/// Emit causal mask: selp from S accum (%r370-401, %r600-631) to NEW
+/// registers (%r700-731, %r732-763).
+/// Uses per-row-group bounds: %r48 (rg0), %r49 (rg1), %r50 (rg2), %r51 (rg3).
+/// kv_block_idx in %r236, col offset in %r53.
+fn emit_causal_mask(s: &mut String) {
+    // kv_block_start = kv_block_idx * 64
+    w(s, "shl.b32 \t%r54, %r236, 6;"); // kv_block_start
+
     for mt in 0..2u32 {
-        let s_start = if mt == 0 { 370 } else { 600 };
-        let mt_off = mt * 16;
-        w(s, "add.s32 \t%r305, %r7, %r36;"); // block_m_start + warp*32
-        w(s, &format!("add.s32 \t%r305, %r305, {};", mt_off));
-        w(s, "add.s32 \t%r305, %r305, %r302;"); // q_row_0
-        w(s, "add.s32 \t%r306, %r305, 8;"); // q_row_1
+        let s_src = if mt == 0 { 370 } else { 600 };
+        let s_dst = if mt == 0 { 700 } else { 732 };
+        let bound_0 = if mt == 0 { 48 } else { 50 }; // row-group 0 bound
+        let bound_1 = if mt == 0 { 49 } else { 51 }; // row-group 1 bound
 
         for n in 0..8u32 {
-            let base = s_start + n * 4;
+            let src = s_src + n * 4;
+            let dst = s_dst + n * 4;
             let n_col_base = n * 8;
-            w(s, &format!("add.s32 \t%r307, %r236, {};", n_col_base));
-            w(s, "add.s32 \t%r307, %r307, %r304;"); // col_even
-            w(s, "add.s32 \t%r308, %r307, 1;"); // col_odd
 
-            // Multiply S by 0 or 1 to apply mask, then add -inf * mask
-            // masked = S * (1 - mask) + (-inf) * mask
-            // Using min: if mask, S = min(S, -inf) = -inf. Else S unchanged.
-            // Actually: just use min.f32 with a threshold:
-            // Compute threshold_even = (float)(col_even > q_row_0) → 1.0 or 0.0
-            // Then: S = S * (1 - thresh) + (-inf) * thresh
-            // Simpler: if col > row, multiply S by 0 then add -inf
-            // Simplest: use a conditional branch per n-tile (but that's divergent)
+            // col_even = kv_block_start + n*8 + (lane%4)*2
+            w(s, &format!("add.s32 \t%r55, %r54, {};", n_col_base));
+            w(s, "add.s32 \t%r55, %r55, %r53;"); // + (lane%4)*2
+            w(s, "add.s32 \t%r56, %r55, 1;"); // col_odd
 
-            // Actually let's try: unconditionally compute mask_val = (col > row) ? -inf : S
-            // as: mask_val = S + (col > row ? (-inf - S) : 0)
-            // = S + delta, where delta = (col > row) ? (-inf - S) : 0
-            // sub.f32 delta, -inf, S; selp delta, delta, 0, pred; add.f32 S, S, delta
-            // This has RAW on S and forces the value through arithmetic
-
-            // d[0]: sub %r309, %r300, %r{base}  → delta = -inf - S
-            //       setp %p25, col_even > row0
-            //       selp %r309, %r309, %r199, %p25  → delta or 0
-            //       add.f32 %r{base}, %r{base}, %r309
-            w(s, "setp.gt.s32 \t%p25, %r307, %r305;");
-            w(s, &format!("sub.f32 \t%r309, %r300, %r{};", base));
-            w(s, "selp.f32 \t%r309, %r309, %r199, %p25;");
-            w(s, &format!("add.f32 \t%r{}, %r{}, %r309;", base, base));
-
-            w(s, "setp.gt.s32 \t%p25, %r308, %r305;");
-            w(s, &format!("sub.f32 \t%r309, %r300, %r{};", base + 1));
-            w(s, "selp.f32 \t%r309, %r309, %r199, %p25;");
-            w(s, &format!("add.f32 \t%r{}, %r{}, %r309;", base + 1, base + 1));
-
-            w(s, "setp.gt.s32 \t%p25, %r307, %r306;");
-            w(s, &format!("sub.f32 \t%r309, %r300, %r{};", base + 2));
-            w(s, "selp.f32 \t%r309, %r309, %r199, %p25;");
-            w(s, &format!("add.f32 \t%r{}, %r{}, %r309;", base + 2, base + 2));
-
-            w(s, "setp.gt.s32 \t%p25, %r308, %r306;");
-            w(s, &format!("sub.f32 \t%r309, %r300, %r{};", base + 3));
-            w(s, "selp.f32 \t%r309, %r309, %r199, %p25;");
-            w(s, &format!("add.f32 \t%r{}, %r{}, %r309;", base + 3, base + 3));
+            // FA2 pattern: setp.lt col < bound; selp dst, src, -inf, pred
+            // Row-group 0 (accum [0],[1])
+            w(s, &format!("setp.lt.s32 \t%p25, %r55, %r{};", bound_0));
+            w(s, &format!(
+                "selp.f32 \t%r{}, %r{}, 0fFF800000, %p25;",
+                dst, src
+            ));
+            w(s, &format!("setp.lt.s32 \t%p26, %r56, %r{};", bound_0));
+            w(s, &format!(
+                "selp.f32 \t%r{}, %r{}, 0fFF800000, %p26;",
+                dst + 1, src + 1
+            ));
+            // Row-group 1 (accum [2],[3])
+            w(s, &format!("setp.lt.s32 \t%p27, %r55, %r{};", bound_1));
+            w(s, &format!(
+                "selp.f32 \t%r{}, %r{}, 0fFF800000, %p27;",
+                dst + 2, src + 2
+            ));
+            w(s, &format!("setp.lt.s32 \t%p28, %r56, %r{};", bound_1));
+            w(s, &format!(
+                "selp.f32 \t%r{}, %r{}, 0fFF800000, %p28;",
+                dst + 3, src + 3
+            ));
         }
     }
-    blank(s);
+}
 
-    // ─── Online softmax (identical to non-causal from here) ───
-    // Step 2: Row max
+/// Online softmax reading from MASKED registers (%r700-731, %r732-763).
+fn emit_softmax_masked(s: &mut String) {
+    emit_softmax_from(s, 700, 732);
+}
+
+/// Online softmax reading from S accumulators directly (%r370-401, %r600-631).
+fn emit_softmax_unmasked(s: &mut String) {
+    emit_softmax_from(s, 370, 600);
+}
+
+/// Online softmax reading from specified register ranges.
+/// mt0_base: start of 32 regs for m-tile 0
+/// mt1_base: start of 32 regs for m-tile 1
+fn emit_softmax_from(s: &mut String, mt0_base: u32, mt1_base: u32) {
+    // Step 1: Row max
+    // m-tile 0: row_max in %r402, %r403
     w(s, "mov.b32 \t%r402, 0xFF800000;");
     w(s, "mov.b32 \t%r403, 0xFF800000;");
     for n in 0..8u32 {
-        let base = 370 + n * 4;
+        let base = mt0_base + n * 4;
         s.push_str(&format!("\tmax.f32 \t%r402, %r402, %r{};\n", base));
         s.push_str(&format!("\tmax.f32 \t%r402, %r402, %r{};\n", base + 1));
         s.push_str(&format!("\tmax.f32 \t%r403, %r403, %r{};\n", base + 2));
@@ -1146,10 +1421,11 @@ fn emit_kernel_causal(s: &mut String) {
     w(s, "max.f32 \t%r403, %r403, %r407;");
     blank(s);
 
+    // m-tile 1: row_max in %r632, %r633
     w(s, "mov.b32 \t%r632, 0xFF800000;");
     w(s, "mov.b32 \t%r633, 0xFF800000;");
     for n in 0..8u32 {
-        let base = 600 + n * 4;
+        let base = mt1_base + n * 4;
         s.push_str(&format!("\tmax.f32 \t%r632, %r632, %r{};\n", base));
         s.push_str(&format!("\tmax.f32 \t%r632, %r632, %r{};\n", base + 1));
         s.push_str(&format!("\tmax.f32 \t%r633, %r633, %r{};\n", base + 2));
@@ -1183,9 +1459,9 @@ fn emit_kernel_causal(s: &mut String) {
     w(s, "ex2.approx.ftz.f32 \t%r643, %r641;");
     blank(s);
 
-    // P = exp2(S - m_new)
+    // P = exp2(S_src - m_new) — overwrites source registers in-place
     for n in 0..8u32 {
-        let base = 370 + n * 4;
+        let base = mt0_base + n * 4;
         s.push_str(&format!("\tsub.f32 \t%r{b}, %r{b}, %r408;\n", b = base));
         s.push_str(&format!("\tex2.approx.ftz.f32 \t%r{b}, %r{b};\n", b = base));
         s.push_str(&format!("\tsub.f32 \t%r{b}, %r{b}, %r408;\n", b = base + 1));
@@ -1196,7 +1472,7 @@ fn emit_kernel_causal(s: &mut String) {
         s.push_str(&format!("\tex2.approx.ftz.f32 \t%r{b}, %r{b};\n", b = base + 3));
     }
     for n in 0..8u32 {
-        let base = 600 + n * 4;
+        let base = mt1_base + n * 4;
         s.push_str(&format!("\tsub.f32 \t%r{b}, %r{b}, %r638;\n", b = base));
         s.push_str(&format!("\tex2.approx.ftz.f32 \t%r{b}, %r{b};\n", b = base));
         s.push_str(&format!("\tsub.f32 \t%r{b}, %r{b}, %r638;\n", b = base + 1));
@@ -1208,11 +1484,11 @@ fn emit_kernel_causal(s: &mut String) {
     }
     blank(s);
 
-    // Row sum
+    // Row sum of P
     w(s, "mov.b32 \t%r414, 0x00000000;");
     w(s, "mov.b32 \t%r415, 0x00000000;");
     for n in 0..8u32 {
-        let base = 370 + n * 4;
+        let base = mt0_base + n * 4;
         s.push_str(&format!("\tadd.f32 \t%r414, %r414, %r{};\n", base));
         s.push_str(&format!("\tadd.f32 \t%r414, %r414, %r{};\n", base + 1));
         s.push_str(&format!("\tadd.f32 \t%r415, %r415, %r{};\n", base + 2));
@@ -1229,7 +1505,7 @@ fn emit_kernel_causal(s: &mut String) {
     w(s, "mov.b32 \t%r644, 0x00000000;");
     w(s, "mov.b32 \t%r645, 0x00000000;");
     for n in 0..8u32 {
-        let base = 600 + n * 4;
+        let base = mt1_base + n * 4;
         s.push_str(&format!("\tadd.f32 \t%r644, %r644, %r{};\n", base));
         s.push_str(&format!("\tadd.f32 \t%r644, %r644, %r{};\n", base + 1));
         s.push_str(&format!("\tadd.f32 \t%r645, %r645, %r{};\n", base + 2));
@@ -1245,7 +1521,7 @@ fn emit_kernel_causal(s: &mut String) {
     w(s, "add.f32 \t%r645, %r645, %r649;");
     blank(s);
 
-    // O rescaling
+    // O rescaling: O *= alpha
     for n in 0..8u32 {
         let base = 200 + n * 4;
         s.push_str(&format!("\tmul.f32 \t%r{b}, %r{b}, %r412;\n", b = base));
@@ -1271,62 +1547,77 @@ fn emit_kernel_causal(s: &mut String) {
     w(s, "fma.rn.f32 \t%r595, %r595, %r643, %r645;");
     w(s, "mov.b32 \t%r592, %r638;");
     w(s, "mov.b32 \t%r593, %r639;");
-    blank(s);
+}
 
-    // P → f16x2 conversion
+/// Convert P from f32 to f16x2 for P@V MMA, reading from MASKED registers
+/// (%r700-731 for m-tile 0, %r732-763 for m-tile 1).
+fn emit_p_convert_masked(s: &mut String) {
+    emit_p_convert_from(s, 700, 732);
+}
+
+/// Convert P from f32 to f16x2 for P@V MMA, reading from S accum registers
+/// (%r370-401 for m-tile 0, %r600-631 for m-tile 1).
+fn emit_p_convert_unmasked(s: &mut String) {
+    emit_p_convert_from(s, 370, 600);
+}
+
+/// Convert P from f32 to f16x2 for P@V MMA from given register bases.
+fn emit_p_convert_from(s: &mut String, mt0_base: u32, mt1_base: u32) {
+    // m-tile 0: P_frag %r460..%r475
     for ki in 0..4u32 {
         let n_lo = ki * 2;
         let n_hi = n_lo + 1;
         let p_base = 460 + ki * 4;
-        let s_lo = 370 + n_lo * 4;
-        let s_hi = 370 + n_hi * 4;
-        s.push_str(&format!("\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n", p_base, s_lo + 1, s_lo));
-        s.push_str(&format!("\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n", p_base + 1, s_hi + 1, s_hi));
-        s.push_str(&format!("\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n", p_base + 2, s_lo + 3, s_lo + 2));
-        s.push_str(&format!("\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n", p_base + 3, s_hi + 3, s_hi + 2));
+        let s_lo = mt0_base + n_lo * 4;
+        let s_hi = mt0_base + n_hi * 4;
+        s.push_str(&format!(
+            "\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n",
+            p_base, s_lo + 1, s_lo
+        ));
+        s.push_str(&format!(
+            "\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n",
+            p_base + 1, s_hi + 1, s_hi
+        ));
+        s.push_str(&format!(
+            "\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n",
+            p_base + 2, s_lo + 3, s_lo + 2
+        ));
+        s.push_str(&format!(
+            "\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n",
+            p_base + 3, s_hi + 3, s_hi + 2
+        ));
     }
+    // m-tile 1: P_frag %r650..%r665
     for ki in 0..4u32 {
         let n_lo = ki * 2;
         let n_hi = n_lo + 1;
         let p_base = 650 + ki * 4;
-        let s_lo = 600 + n_lo * 4;
-        let s_hi = 600 + n_hi * 4;
-        s.push_str(&format!("\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n", p_base, s_lo + 1, s_lo));
-        s.push_str(&format!("\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n", p_base + 1, s_hi + 1, s_hi));
-        s.push_str(&format!("\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n", p_base + 2, s_lo + 3, s_lo + 2));
-        s.push_str(&format!("\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n", p_base + 3, s_hi + 3, s_hi + 2));
+        let s_lo = mt1_base + n_lo * 4;
+        let s_hi = mt1_base + n_hi * 4;
+        s.push_str(&format!(
+            "\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n",
+            p_base, s_lo + 1, s_lo
+        ));
+        s.push_str(&format!(
+            "\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n",
+            p_base + 1, s_hi + 1, s_hi
+        ));
+        s.push_str(&format!(
+            "\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n",
+            p_base + 2, s_lo + 3, s_lo + 2
+        ));
+        s.push_str(&format!(
+            "\tcvt.rn.f16x2.f32 \t%r{}, %r{}, %r{};\n",
+            p_base + 3, s_hi + 3, s_hi + 2
+        ));
     }
-    blank(s);
+}
 
-    // V load
-    emit_cp_async_kv_swizzled_dynamic(s, "%r241", "%rd12");
-    w(s, "cp.async.commit_group;");
-    w(s, "cp.async.wait_group \t0;");
-    w(s, "bar.sync \t0;");
-    blank(s);
-
-    // V ldmatrix
-    for n in 0..8u32 {
-        for kp in 0..2u32 {
-            let base = 480 + (n * 2 + kp) * 4;
-            let n_off = n * 1024;
-            let kp_off = kp * 64;
-            let total_off = n_off + kp_off;
-            w(s, &format!("add.s32 \t%r70, %r46, {};", total_off));
-            w(s, "and.b32 \t%r71, %r70, 896;");
-            w(s, "shr.u32 \t%r72, %r71, 3;");
-            w(s, "xor.b32 \t%r73, %r70, %r72;");
-            w(s, "add.s32 \t%r74, %r73, %r241;");
-            w(s, "add.s32 \t%r74, %r74, %r12;");
-            s.push_str(&format!(
-                "\tldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {{%r{}, %r{}, %r{}, %r{}}}, [%r74];\n",
-                base, base + 1, base + 2, base + 3
-            ));
-        }
-    }
-    blank(s);
-
-    // MMA: O += P @ V
+/// Emit P @ V MMA: O[128x64] += P[128x64] @ V[64x64].
+/// P frags at %r460-475 (m-tile 0), %r650-665 (m-tile 1).
+/// V frags at %r480-543.
+/// O accum: %r200-231 (m-tile 0), %r560-591 (m-tile 1).
+fn emit_pv_mma(s: &mut String) {
     for mt in 0..2u32 {
         let p_base_start = if mt == 0 { 460 } else { 650 };
         let o_base_start = if mt == 0 { 200 } else { 560 };
@@ -1353,71 +1644,6 @@ fn emit_kernel_causal(s: &mut String) {
             }
         }
     }
-    blank(s);
-
-    // Loop advance (uses kv_end = %r16 for causal)
-    w(s, "add.s32 \t%r236, %r236, 64;");
-    w(s, "setp.lt.s32 \t%p1, %r236, %r16;");
-    w(s, "@%p1 bra \t$L_KV_LOOP;");
-    blank(s);
-
-    // ═══ EPILOGUE ═══
-    s.push_str("$L_EPILOGUE:\n");
-    w(s, "shr.u32 \t%r420, %r31, 2;");
-    w(s, "and.b32 \t%r423, %r31, 3;");
-    w(s, "shl.b32 \t%r424, %r423, 2;");
-    blank(s);
-
-    for mt in 0..2u32 {
-        let mt_row_off = mt * 16;
-        let o_base_start = if mt == 0 { 200 } else { 560 };
-        let l_i_0 = if mt == 0 { 234 } else { 594 };
-        let l_i_1 = if mt == 0 { 235 } else { 595 };
-
-        w(s, "add.s32 \t%r421, %r420, %r36;");
-        if mt_row_off > 0 {
-            w(s, &format!("add.s32 \t%r421, %r421, {};", mt_row_off));
-        }
-        w(s, "add.s32 \t%r422, %r421, 8;");
-
-        for n in 0..8u32 {
-            let base = o_base_start + n * 4;
-            s.push_str(&format!("\tdiv.full.f32 \t%r{b}, %r{b}, %r{l};\n", b = base, l = l_i_0));
-            s.push_str(&format!("\tdiv.full.f32 \t%r{b}, %r{b}, %r{l};\n", b = base + 1, l = l_i_0));
-            s.push_str(&format!("\tdiv.full.f32 \t%r{b}, %r{b}, %r{l};\n", b = base + 2, l = l_i_1));
-            s.push_str(&format!("\tdiv.full.f32 \t%r{b}, %r{b}, %r{l};\n", b = base + 3, l = l_i_1));
-        }
-        blank(s);
-
-        w(s, "add.s32 \t%r550, %r7, %r421;");
-        w(s, "add.s32 \t%r551, %r7, %r422;");
-        w(s, "setp.lt.s32 \t%p10, %r550, %r1;");
-        w(s, "setp.lt.s32 \t%p11, %r551, %r1;");
-        w(s, "shl.b32 \t%r552, %r550, 7;");
-        w(s, "add.s32 \t%r553, %r552, %r424;");
-        w(s, "cvt.u64.u32 \t%rd50, %r553;");
-        w(s, "add.s64 \t%rd51, %rd13, %rd50;");
-        w(s, "shl.b32 \t%r554, %r551, 7;");
-        w(s, "add.s32 \t%r555, %r554, %r424;");
-        w(s, "cvt.u64.u32 \t%rd52, %r555;");
-        w(s, "add.s64 \t%rd53, %rd13, %rd52;");
-        blank(s);
-
-        for n in 0..8u32 {
-            let base = o_base_start + n * 4;
-            let h0 = 670 + mt * 20 + n * 2;
-            let h1 = h0 + 1;
-            s.push_str(&format!("\tcvt.rn.f16x2.f32 \t%r{h0}, %r{}, %r{};\n", base + 1, base));
-            s.push_str(&format!("\tcvt.rn.f16x2.f32 \t%r{h1}, %r{}, %r{};\n", base + 3, base + 2));
-            let n_off = n * 16;
-            s.push_str(&format!("\t@%p10 st.global.b32 [ %rd51 + {n_off} ], %r{h0};\n"));
-            s.push_str(&format!("\t@%p11 st.global.b32 [ %rd53 + {n_off} ], %r{h1};\n"));
-        }
-        blank(s);
-    }
-
-    w(s, "ret;");
-    s.push_str("}\n");
 }
 
 fn w(s: &mut String, line: &str) {

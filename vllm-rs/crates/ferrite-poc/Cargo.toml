@@ -17,6 +17,10 @@ path = "src/fuse_test.rs"
 name = "ferrite-fuse-bench"
 path = "src/fuse_bench.rs"
 
+[[bin]]
+name = "ferrite-mlp-bench"
+path = "src/mlp_bench.rs"
+
 [dependencies]
 # LLVM bindings — pick the feature matching your installed LLVM version.
 # On Ubuntu: `apt install llvm-21-dev` then use llvm21-1.

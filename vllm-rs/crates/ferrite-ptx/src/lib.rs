@@ -1,5 +1,6 @@
 pub mod atoms;
 pub mod config;
+pub mod convert;
 pub mod fused;
 pub mod gemm;
 pub mod pipeline;

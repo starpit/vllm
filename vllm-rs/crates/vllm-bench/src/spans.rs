@@ -45,6 +45,7 @@ fn render_perm(perm: &[usize], _doc_blocks: usize) -> String {
         let color = DOC_COLORS[doc_idx % DOC_COLORS.len()];
         s.push_str(color);
         s.push(BLOCK_CHAR);
+        s.push(BLOCK_CHAR);
     }
     s.push_str(RST);
     s
@@ -376,7 +377,7 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
 
     let p50 = |v: &[f64]| {
         let mid = v.len() / 2;
-        if v.len() % 2 == 0 && v.len() > 1 {
+        if v.len().is_multiple_of(2) && v.len() > 1 {
             (v[mid - 1] + v[mid]) / 2.0
         } else {
             v[mid]

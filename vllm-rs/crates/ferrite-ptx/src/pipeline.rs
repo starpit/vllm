@@ -413,7 +413,8 @@ impl MainloopPipeline {
         // Start: read from stage 0, write to stage (stages-1)
         // The prologue loaded stages 0..stages-2. The first loop iteration
         // reads stage 0 and writes the next tile into stage (stages-1).
-        ptx.mov_b32_imm(read_stage, 0);
+        // Initialize to stages-1 so first iteration's advance wraps to 0
+        ptx.mov_b32_imm(read_stage, stages - 1);
         ptx.mov_b32_imm(write_stage, stages - 1);
 
         let k_counter = ptx.regs.alloc_b32();
@@ -486,18 +487,29 @@ impl MainloopPipeline {
         }
 
         // ═══════════════════════════════════════════════════════════════
-        // K-LOOP
+        // K-LOOP (instruction order matches hand-written PTX)
         // ═══════════════════════════════════════════════════════════════
         ptx.label("$L_KLOOP");
 
-        // Wait for the oldest async group + barrier
+        // 1. Advance read stage BEFORE wait (hand-written does toggle first)
+        {
+            ptx.add_s32_imm(next_read, read_stage, 1);
+            ptx.setp_gt_s32_imm(p_wrap_r, next_read, stages as i32 - 1);
+            ptx.selp_b32_imm_reg(read_stage, 0, next_read, p_wrap_r);
+        }
+
+        // 2. Wait + barrier
         ptx.cp_async_wait_group(wait_count);
         ptx.bar_sync(0);
 
-        // Compute read buffer base: smem_base + read_stage * a_tile_bytes
-        // (OPTIMIZATION: reuses pre-allocated buf_base and read_off)
+        // 3. Compute read buffer base
         ptx.shl_b32(read_off, read_stage, a_tile_bytes.trailing_zeros());
         ptx.add_s32(buf_base, smem_base, read_off);
+
+        // 4. Load gamma BEFORE B (hand-written loads gamma first)
+        for ki in 0..k_warp_iters as usize {
+            transform_a.emit_k_setup(ptx, ki as u32);
+        }
         ptx.blank();
 
         // ── ldmatrix.trans B ──
@@ -536,7 +548,7 @@ impl MainloopPipeline {
         // a_frag values are consumed by MMA before the next ldmatrix overwrites them.
         for ki in 0..k_warp_iters as usize {
             ptx.comment(&format!("ki={ki}: ldmatrix A + transform + MMA"));
-            transform_a.emit_k_setup(ptx, ki as u32);
+            // gamma already loaded above (before B loads)
             ptx.add_s32(a_addr, buf_base, a_off[ki]);
 
             // A fragments for each rm, immediately consumed by MMA
@@ -601,11 +613,8 @@ impl MainloopPipeline {
         ptx.blank();
 
         // ── Advance circular buffer stage indices ──
-        ptx.comment("Advance circular buffer stage indices");
-        ptx.add_s32_imm(next_read, read_stage, 1);
-        ptx.setp_gt_s32_imm(p_wrap_r, next_read, stages as i32 - 1);
-        ptx.selp_b32_imm_reg(read_stage, 0, next_read, p_wrap_r);
-
+        // (read_stage already advanced at loop top, matching hand-written pattern)
+        ptx.comment("Advance write buffer stage index");
         ptx.add_s32_imm(next_write, write_stage, 1);
         ptx.setp_gt_s32_imm(p_wrap_w, next_write, stages as i32 - 1);
         ptx.selp_b32_imm_reg(write_stage, 0, next_write, p_wrap_w);

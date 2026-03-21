@@ -26,7 +26,7 @@ use crate::tensor::{GpuTensor, TensorView};
 /// Matches Python vLLM's `get_default_config` heuristic: select the smallest
 /// tile size that covers the expected tokens-per-expert, reducing wasted
 /// compute on zero-padded rows during decode.
-fn select_moe_block_m(num_tokens: usize, top_k: usize, num_experts: usize) -> usize {
+pub fn select_moe_block_m(num_tokens: usize, top_k: usize, num_experts: usize) -> usize {
     let tokens_per_expert = (num_tokens * top_k) / num_experts;
     if tokens_per_expert <= 16 {
         16

@@ -9778,6 +9778,281 @@ mod tests_fp8_moe_gemm {
 }
 
 // ---------------------------------------------------------------------------
+// Tests: BF16 fused MoE GEMM (variable BLOCK_M + GROUP_SIZE_M)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod tests_fused_moe_gemm_bf16 {
+    use super::*;
+    use crate::driver;
+
+    type CUstream = cudarc::driver::sys::CUstream;
+
+    unsafe fn test_init() -> (CachingAllocator, CUstream) {
+        driver::init().expect("CUDA init");
+        let dev = driver::device_get(0).expect("device 0");
+        let _ctx = driver::ctx_create(dev).expect("ctx_create");
+        let stream = driver::stream_create().expect("stream_create");
+        (CachingAllocator::new(), stream)
+    }
+
+    unsafe fn upload_bf16_const(val: f32, count: usize, stream: CUstream) -> *mut u8 {
+        let data: Vec<u16> = vec![half::bf16::from_f32(val).to_bits(); count];
+        let bytes = count * 2;
+        let ptr = driver::mem_alloc(bytes).expect("alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("h2d");
+        driver::stream_synchronize(stream).expect("sync");
+        ptr
+    }
+
+    unsafe fn upload_i32(data: &[i32], stream: CUstream) -> *mut u8 {
+        let bytes = data.len() * 4;
+        let ptr = driver::mem_alloc(bytes).expect("alloc");
+        driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("h2d");
+        driver::stream_synchronize(stream).expect("sync");
+        ptr
+    }
+
+    unsafe fn download_bf16(tensor: GpuTensor, stream: CUstream) -> Vec<half::bf16> {
+        let count = tensor.numel();
+        let bytes = count * 2;
+        let mut host = vec![half::bf16::ZERO; count];
+        driver::memcpy_dtoh_async(host.as_mut_ptr() as *mut u8, tensor.as_ptr(), bytes, stream)
+            .expect("d2h");
+        driver::stream_synchronize(stream).expect("sync");
+        host
+    }
+
+    /// Core test: all-ones input × all-0.5 weights, verifying output = K * 0.5.
+    ///
+    /// Tests a specific block_m size with given num_tokens and num_experts.
+    /// Each token is assigned to expert 0 (top_k=1).
+    unsafe fn run_bf16_gemm_test(
+        num_tokens: usize,
+        num_experts: usize,
+        top_k: usize,
+        k: usize,
+        n: usize,
+        block_m: usize,
+    ) {
+        let (mut alloc, stream) = test_init();
+
+        // Input: all 1.0 BF16
+        let input_ptr = upload_bf16_const(1.0, num_tokens * k, stream);
+        let input = GpuTensor::new(input_ptr, &[num_tokens, k], DType::BF16);
+
+        // Weights: all 0.5 BF16, [num_experts, N, K]
+        let weight_ptr = upload_bf16_const(0.5, num_experts * n * k, stream);
+        let weights = GpuTensor::new(weight_ptr, &[num_experts, n, k], DType::BF16);
+
+        // Topk weights: all 1.0
+        let tw_ptr = upload_bf16_const(1.0, num_tokens * top_k, stream);
+        // topk_weights is F32, not BF16 — re-upload as f32
+        driver::mem_free(tw_ptr).ok();
+        let tw_data: Vec<f32> = vec![1.0; num_tokens * top_k];
+        let tw_bytes = tw_data.len() * 4;
+        let tw_ptr = driver::mem_alloc(tw_bytes).expect("alloc");
+        driver::memcpy_htod_async(tw_ptr, tw_data.as_ptr() as *const u8, tw_bytes, stream)
+            .expect("h2d");
+        let topk_weights = GpuTensor::new(tw_ptr, &[num_tokens, top_k], DType::F32);
+
+        // Topk IDs: assign each token to experts round-robin
+        let topk_ids_data: Vec<i32> = (0..num_tokens * top_k)
+            .map(|i| (i % num_experts) as i32)
+            .collect();
+        let topk_ids_ptr = upload_i32(&topk_ids_data, stream);
+        let topk_ids = GpuTensor::new(topk_ids_ptr, &[num_tokens, top_k], DType::I32);
+
+        // moe_align_block_size
+        let (sorted, experts, ntpp) =
+            moe_align_block_size(topk_ids, num_experts, block_m, &mut alloc, stream);
+
+        // fused_moe_gemm (BF16)
+        let output = fused_moe_gemm(
+            input,
+            weights,
+            topk_weights,
+            sorted.as_gpu_tensor(),
+            experts.as_gpu_tensor(),
+            ntpp.as_gpu_tensor(),
+            num_tokens,
+            top_k,
+            block_m,
+            false, // don't apply routing weights
+            &mut alloc,
+            stream,
+        );
+
+        assert_eq!(
+            output.as_gpu_tensor().shape(),
+            &[num_tokens as u32 * top_k as u32, n as u32]
+        );
+
+        let result = download_bf16(output.as_gpu_tensor(), stream);
+        // Expected: each element = sum(1.0 * 0.5, K times) = K * 0.5
+        let expected = k as f32 * 0.5;
+        for (i, &val) in result.iter().enumerate() {
+            let v = val.to_f32();
+            assert!(
+                (v - expected).abs() < 2.0,
+                "block_m={block_m}, tokens={num_tokens}, experts={num_experts}: \
+                 element {i}: got {v}, expected {expected}"
+            );
+        }
+
+        driver::stream_destroy(stream).expect("destroy");
+    }
+
+    // --- BLOCK_M=128 (original tile size) ---
+
+    #[test]
+    #[ignore]
+    fn test_bf16_moe_gemm_block_m_128() {
+        // 8 tokens, 2 experts, top_k=1 → tokens_per_expert=4 → block_m=128 forced
+        unsafe { run_bf16_gemm_test(8, 2, 1, 128, 128, 128) }
+    }
+
+    // --- BLOCK_M=64 ---
+
+    #[test]
+    #[ignore]
+    fn test_bf16_moe_gemm_block_m_64() {
+        unsafe { run_bf16_gemm_test(8, 2, 1, 128, 128, 64) }
+    }
+
+    // --- BLOCK_M=32 ---
+
+    #[test]
+    #[ignore]
+    fn test_bf16_moe_gemm_block_m_32() {
+        unsafe { run_bf16_gemm_test(8, 2, 1, 128, 128, 32) }
+    }
+
+    // --- BLOCK_M=16 (decode-critical, 8 warps × 1 N-tile each) ---
+
+    #[test]
+    #[ignore]
+    fn test_bf16_moe_gemm_block_m_16() {
+        unsafe { run_bf16_gemm_test(8, 2, 1, 128, 128, 16) }
+    }
+
+    // --- Single token (decode) at each block_m ---
+
+    #[test]
+    #[ignore]
+    fn test_bf16_moe_gemm_single_token_block_m_16() {
+        unsafe { run_bf16_gemm_test(1, 2, 1, 128, 128, 16) }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_bf16_moe_gemm_single_token_block_m_128() {
+        unsafe { run_bf16_gemm_test(1, 2, 1, 128, 128, 128) }
+    }
+
+    // --- Multi-expert top_k > 1 ---
+
+    #[test]
+    #[ignore]
+    fn test_bf16_moe_gemm_topk_2_block_m_16() {
+        unsafe { run_bf16_gemm_test(4, 4, 2, 128, 128, 16) }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_bf16_moe_gemm_topk_2_block_m_128() {
+        unsafe { run_bf16_gemm_test(4, 4, 2, 128, 128, 128) }
+    }
+
+    // --- Routing weight application ---
+
+    #[test]
+    #[ignore]
+    fn test_bf16_moe_gemm_apply_weights() {
+        unsafe {
+            let (mut alloc, stream) = test_init();
+            let num_tokens: usize = 4;
+            let num_experts: usize = 2;
+            let top_k: usize = 1;
+            let k: usize = 128;
+            let n: usize = 128;
+            let block_m: usize = 16;
+
+            let input_ptr = upload_bf16_const(1.0, num_tokens * k, stream);
+            let input = GpuTensor::new(input_ptr, &[num_tokens, k], DType::BF16);
+
+            let weight_ptr = upload_bf16_const(0.5, num_experts * n * k, stream);
+            let weights = GpuTensor::new(weight_ptr, &[num_experts, n, k], DType::BF16);
+
+            // Routing weights: 0.25 for all tokens
+            let tw_data: Vec<f32> = vec![0.25; num_tokens * top_k];
+            let tw_bytes = tw_data.len() * 4;
+            let tw_ptr = driver::mem_alloc(tw_bytes).expect("alloc");
+            driver::memcpy_htod_async(tw_ptr, tw_data.as_ptr() as *const u8, tw_bytes, stream)
+                .expect("h2d");
+            let topk_weights = GpuTensor::new(tw_ptr, &[num_tokens, top_k], DType::F32);
+
+            let topk_ids_data: Vec<i32> = vec![0, 0, 1, 1];
+            let topk_ids_ptr = upload_i32(&topk_ids_data, stream);
+            let topk_ids = GpuTensor::new(topk_ids_ptr, &[num_tokens, top_k], DType::I32);
+
+            let (sorted, experts, ntpp) =
+                moe_align_block_size(topk_ids, num_experts, block_m, &mut alloc, stream);
+
+            let output = fused_moe_gemm(
+                input,
+                weights,
+                topk_weights,
+                sorted.as_gpu_tensor(),
+                experts.as_gpu_tensor(),
+                ntpp.as_gpu_tensor(),
+                num_tokens,
+                top_k,
+                block_m,
+                true, // apply routing weights
+                &mut alloc,
+                stream,
+            );
+
+            let result = download_bf16(output.as_gpu_tensor(), stream);
+            // Expected: K * 0.5 * 0.25 = 128 * 0.5 * 0.25 = 16.0
+            let expected = 16.0f32;
+            for (i, &val) in result.iter().enumerate() {
+                let v = val.to_f32();
+                assert!(
+                    (v - expected).abs() < 1.0,
+                    "apply_weights element {i}: got {v}, expected {expected}"
+                );
+            }
+
+            driver::stream_destroy(stream).expect("destroy");
+        }
+    }
+
+    // --- select_moe_block_m heuristic ---
+
+    #[test]
+    fn test_select_moe_block_m_heuristic() {
+        use crate::layers_moe::select_moe_block_m;
+        // 1 token, 64 experts, top_k=8 → tpe=0 → 16
+        assert_eq!(select_moe_block_m(1, 8, 64), 16);
+        // 10 tokens, 8 experts, top_k=2 → tpe=2 → 16
+        assert_eq!(select_moe_block_m(10, 2, 8), 16);
+        // 100 tokens, 8 experts, top_k=2 → tpe=25 → 32
+        assert_eq!(select_moe_block_m(100, 2, 8), 32);
+        // 500 tokens, 8 experts, top_k=2 → tpe=125 → 128
+        assert_eq!(select_moe_block_m(500, 2, 8), 128);
+        // Boundary: tpe=16 → 16, tpe=17 → 32
+        assert_eq!(select_moe_block_m(16, 1, 1), 16);
+        assert_eq!(select_moe_block_m(17, 1, 1), 32);
+        // Boundary: tpe=64 → 64, tpe=65 → 128
+        assert_eq!(select_moe_block_m(64, 1, 1), 64);
+        assert_eq!(select_moe_block_m(65, 1, 1), 128);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests: fused_qkv_rope_cache (NeoX + interleaved)
 // ---------------------------------------------------------------------------
 

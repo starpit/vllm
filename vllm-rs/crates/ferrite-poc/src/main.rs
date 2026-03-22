@@ -192,6 +192,10 @@ fn main() -> Result<()> {
     println!("\nFlash Attention Forward CAUSAL (BLOCK_M=128, BLOCK_N=64, HD=64)");
     run_flash_attn_fwd_causal()?;
 
+    // Flash Attention forward paged KV
+    println!("\nFlash Attention Forward PAGED (BLOCK_M=128, BLOCK_N=64, HD=64)");
+    run_flash_attn_fwd_paged()?;
+
     // Flash Attention forward d=128
     println!("\nFlash Attention Forward (BLOCK_M=128, BLOCK_N=32, HD=128)");
     run_flash_attn_fwd_hdim128()?;
@@ -3408,6 +3412,271 @@ fn run_flash_attn_fwd_causal() -> Result<()> {
         cuda::free_sync(d_k)?;
         cuda::free_sync(d_v)?;
         cuda::free_sync(d_o)?;
+        cuda::module::unload(module)?;
+    }
+
+    Ok(())
+}
+
+fn run_flash_attn_fwd_paged() -> Result<()> {
+    let ptx = flash_attn::emit_flash_attn_fwd_paged();
+    println!("  Generated {} bytes of PTX", ptx.len());
+
+    std::fs::write("/tmp/ferrite_flash_attn_paged.ptx", &ptx).ok();
+    println!("  [debug] PTX dumped to /tmp/ferrite_flash_attn_paged.ptx");
+
+    let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
+    let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
+    let func = unsafe {
+        cuda::module::get_function(module, CString::new("flash_attn_fwd_paged").unwrap())?
+    };
+
+    use cudarc::driver::sys::CUfunction_attribute as FA;
+    let nregs =
+        unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let local_bytes = unsafe {
+        cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?
+    };
+    println!(
+        "  [cuda] Loaded -- {} regs/thread, {} bytes local (spills)",
+        nregs, local_bytes
+    );
+
+    // Test parameters
+    let batch: u32 = 1;
+    let heads: u32 = 1;
+    let seq_len: u32 = 128;
+    let head_dim: u32 = 64;
+    let page_block_size: u32 = 64; // tokens per page (== BLOCK_N)
+    let num_pages = (seq_len + page_block_size - 1) / page_block_size;
+    let max_blocks_per_seq: u32 = num_pages;
+
+    let n_q = (batch * heads * seq_len * head_dim) as usize;
+    let n_o = n_q;
+    let page_stride: u32 = page_block_size * head_dim; // elements per page
+
+    // Allocate physical pages (shuffled order to test paging)
+    let total_pages = (batch * num_pages) as usize;
+
+    // Create a shuffled physical page mapping
+    // Logical pages: [0, 1, 2, ...] -> Physical pages: [shuffled order]
+    let mut physical_pages: Vec<u32> = (0..total_pages as u32).collect();
+    // Simple shuffle: reverse order
+    physical_pages.reverse();
+
+    // Build block_table: block_table[batch_idx * max_blocks + page_idx] = physical_page
+    let mut h_block_table: Vec<i32> = vec![0i32; (batch as usize) * (max_blocks_per_seq as usize)];
+    for b in 0..batch as usize {
+        for p in 0..num_pages as usize {
+            h_block_table[b * max_blocks_per_seq as usize + p] =
+                physical_pages[b * num_pages as usize + p] as i32;
+        }
+    }
+
+    // Create KV cache: fill physical pages with test data that corresponds to
+    // the logical token order when accessed through the block_table
+    let cache_elems = total_pages * page_stride as usize;
+    let mut h_k_cache: Vec<half::f16> = vec![half::f16::ZERO; cache_elems];
+    let mut h_v_cache: Vec<half::f16> = vec![half::f16::ZERO; cache_elems];
+
+    // Also create contiguous reference K, V for CPU verification
+    let mut h_k_ref: Vec<half::f16> = vec![half::f16::ZERO; n_q];
+    let mut h_v_ref: Vec<half::f16> = vec![half::f16::ZERO; n_q];
+
+    // Fill: for each batch, for each logical token t:
+    //   - Compute the physical page and offset
+    //   - Write the test pattern to the paged cache
+    //   - Also write the same pattern to the contiguous reference
+    for b in 0..batch as usize {
+        for t in 0..seq_len as usize {
+            let page_idx = t / page_block_size as usize;
+            let offset_in_page = t % page_block_size as usize;
+            let phys_page = h_block_table[b * max_blocks_per_seq as usize + page_idx] as usize;
+
+            for d in 0..head_dim as usize {
+                let k_val =
+                    half::f16::from_f32(((t * head_dim as usize + d) % 13) as f32 * 0.05 - 0.3);
+                let v_val =
+                    half::f16::from_f32(((t * head_dim as usize + d) % 11) as f32 * 0.05 - 0.25);
+
+                // Paged cache address
+                let cache_idx = phys_page * page_stride as usize + offset_in_page * head_dim as usize + d;
+                h_k_cache[cache_idx] = k_val;
+                h_v_cache[cache_idx] = v_val;
+
+                // Contiguous reference
+                let ref_idx = b * (seq_len as usize * head_dim as usize) + t * head_dim as usize + d;
+                h_k_ref[ref_idx] = k_val;
+                h_v_ref[ref_idx] = v_val;
+            }
+        }
+    }
+
+    // Q data
+    let h_q: Vec<half::f16> = (0..n_q)
+        .map(|i| half::f16::from_f32(((i % 17) as f32 - 8.0) * 0.05))
+        .collect();
+
+    // Allocate GPU memory
+    let d_q = unsafe { cuda::malloc_sync(n_q * 2)? };
+    let d_k_cache = unsafe { cuda::malloc_sync(cache_elems * 2)? };
+    let d_v_cache = unsafe { cuda::malloc_sync(cache_elems * 2)? };
+    let d_o = unsafe { cuda::malloc_sync(n_o * 2)? };
+    let d_block_table = unsafe { cuda::malloc_sync(h_block_table.len() * 4)? };
+
+    unsafe {
+        cuda::memcpy_htod_sync(d_q, &h_q)?;
+        cuda::memcpy_htod_sync(d_k_cache, &h_k_cache)?;
+        cuda::memcpy_htod_sync(d_v_cache, &h_v_cache)?;
+        cuda::memset_d8_sync(d_o, 0, n_o * 2)?;
+        cuda::memcpy_htod_sync(d_block_table, &h_block_table)?;
+    }
+
+    let scale: f32 = 1.0 / (head_dim as f32).sqrt() * 1.44269504;
+    let stride_q_batch: u32 = seq_len * head_dim;
+
+    let smem_bytes: c_uint = flash_attn::SMEM_BYTES;
+
+    unsafe {
+        cuda::function::set_function_attribute(
+            func,
+            FA::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem_bytes as i32,
+        )?;
+    }
+
+    let grid_x = (seq_len + 127) / 128;
+    let grid_y = batch * heads;
+    let threads: u32 = 128;
+
+    let params: &mut [*mut c_void] = &mut [
+        (&d_q) as *const _ as *mut c_void,
+        (&d_k_cache) as *const _ as *mut c_void,
+        (&d_v_cache) as *const _ as *mut c_void,
+        (&d_o) as *const _ as *mut c_void,
+        (&d_block_table) as *const _ as *mut c_void,
+        (&seq_len) as *const _ as *mut c_void,
+        (&scale) as *const _ as *mut c_void,
+        (&stride_q_batch) as *const _ as *mut c_void,
+        (&page_stride) as *const _ as *mut c_void,
+        (&page_block_size) as *const _ as *mut c_void,
+        (&max_blocks_per_seq) as *const _ as *mut c_void,
+    ];
+
+    // Use null stream for correctness
+    let stream: cudarc::driver::sys::CUstream = std::ptr::null_mut();
+
+    // Launch
+    unsafe {
+        cuda::launch_kernel(
+            func,
+            (grid_x, grid_y, 1),
+            (threads, 1, 1),
+            smem_bytes,
+            stream,
+            params,
+        )?;
+        cuda::stream::synchronize(stream)?;
+    }
+
+    // Read output
+    let mut h_o: Vec<half::f16> = vec![half::f16::ZERO; n_o];
+    unsafe {
+        cuda::memcpy_dtoh_sync(&mut h_o, d_o)?;
+    }
+
+    // CPU reference using contiguous K, V (reconstructed from block_table)
+    let sd = seq_len as usize;
+    let dd = head_dim as usize;
+    let mut max_err: f32 = 0.0;
+    let sm_scale = 1.0 / (dd as f32).sqrt();
+
+    for row in [0usize, 1, 31, 32, 63, 64, 95, 127] {
+        if row >= sd {
+            continue;
+        }
+
+        let mut scores = vec![0.0f32; sd];
+        for col in 0..sd {
+            let mut dot = 0.0f32;
+            for k in 0..dd {
+                dot += h_q[row * dd + k].to_f32() * h_k_ref[col * dd + k].to_f32();
+            }
+            scores[col] = dot * sm_scale;
+        }
+
+        let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut exp_sum = 0.0f32;
+        for s in &mut scores {
+            *s = (*s - max_s).exp();
+            exp_sum += *s;
+        }
+        for s in &mut scores {
+            *s /= exp_sum;
+        }
+
+        for d in [0usize, 1, 31, 32, 63] {
+            if d >= dd {
+                continue;
+            }
+            let mut o_val = 0.0f32;
+            for col in 0..sd {
+                o_val += scores[col] * h_v_ref[col * dd + d].to_f32();
+            }
+            let got = h_o[row * dd + d].to_f32();
+            let err = (got - o_val).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+    }
+
+    if max_err < 0.1 {
+        println!("  Correct (max err: {:.6})", max_err);
+    } else {
+        // Print diagnostic values
+        for row in [0, 1, 63] {
+            for d in [0, 1, 63] {
+                if row >= sd || d >= dd {
+                    continue;
+                }
+                let mut scores = vec![0.0f32; sd];
+                for col in 0..sd {
+                    let mut dot = 0.0f32;
+                    for k in 0..dd {
+                        dot += h_q[row * dd + k].to_f32() * h_k_ref[col * dd + k].to_f32();
+                    }
+                    scores[col] = dot * sm_scale;
+                }
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut exp_sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - max_s).exp();
+                    exp_sum += *s;
+                }
+                for s in &mut scores {
+                    *s /= exp_sum;
+                }
+                let mut o_val = 0.0f32;
+                for col in 0..sd {
+                    o_val += scores[col] * h_v_ref[col * dd + d].to_f32();
+                }
+                let got = h_o[row * dd + d].to_f32();
+                println!(
+                    "    O[{row}][{d}]: got={got:.6} expected={o_val:.6} err={:.6}",
+                    (got - o_val).abs()
+                );
+            }
+        }
+        println!("  Max error: {:.6} (FAIL)", max_err);
+    }
+
+    unsafe {
+        cuda::free_sync(d_q)?;
+        cuda::free_sync(d_k_cache)?;
+        cuda::free_sync(d_v_cache)?;
+        cuda::free_sync(d_o)?;
+        cuda::free_sync(d_block_table)?;
         cuda::module::unload(module)?;
     }
 

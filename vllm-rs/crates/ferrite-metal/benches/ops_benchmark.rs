@@ -69,8 +69,8 @@ fn bench_gpu<F: Fn(&CommandBufferRef)>(queue: &CommandQueue, warmup: u32, iters:
 // GEMM benchmarks
 // ═══════════════════════════════════════════════════════════════════
 
-fn bench_gemm(device: &Device, queue: &CommandQueue, m: u32, n: u32, k: u32) -> f64 {
-    let config = MetalGemmConfig::default_apple9_f16();
+fn bench_gemm_config(device: &Device, queue: &CommandQueue, m: u32, n: u32, k: u32, config: &MetalGemmConfig) -> f64 {
+    let config = config.clone();
     let msl = build_standalone_gemm(&config);
     let pipeline = compile(device, &msl, "gemm");
 
@@ -220,27 +220,34 @@ fn main() {
     eprintln!("Warmup: {}, Iterations: {}", WARMUP, ITERS);
     eprintln!();
 
-    // GEMM benchmarks
-    eprintln!("=== GEMM (f16 input, f32 accumulator) ===");
-    for &(m, n, k) in &[
-        (32, 32, 32),
+    // GEMM benchmarks — compare tile configs
+    let gemm_sizes: Vec<(u32, u32, u32)> = vec![
         (128, 128, 128),
         (512, 512, 512),
         (1024, 1024, 1024),
         (4096, 4096, 4096),
-        // Decode: M=1, large N×K
         (1, 4096, 4096),
-        (1, 11008, 4096),
-        // Prefill: seq_len=512
         (512, 4096, 4096),
-    ] {
-        let t = bench_gemm(&device, &queue, m, n, k);
-        let flops = 2.0 * m as f64 * n as f64 * k as f64;
-        let tflops = flops / t / 1e12;
-        eprintln!(
-            "  {:>5}×{:<5} K={:<5}  {:.3} ms  ({:.1} TFLOPS)",
-            m, n, k, t * 1e3, tflops
-        );
+    ];
+
+    let apple9 = MetalGemmConfig::default_apple9_f16(); // 32×32×8
+    let apple8 = MetalGemmConfig::default_apple8_f16();  // 48×48×32
+    let mut custom = MetalGemmConfig::default_apple9_f16();
+    custom.block_k = 32; // same output tile, deeper K
+    custom.leading_block_dims = None; // auto-compute
+
+    for (label, cfg) in [("apple9 32×32×8", &apple9), ("apple8 48×48×32", &apple8), ("custom 32×32×32", &custom)] {
+        eprintln!("=== GEMM {} ===", label);
+        for &(m, n, k) in &gemm_sizes {
+            let t = bench_gemm_config(&device, &queue, m, n, k, cfg);
+            let flops = 2.0 * m as f64 * n as f64 * k as f64;
+            let tflops = flops / t / 1e12;
+            eprintln!(
+                "  {:>5}×{:<5} K={:<5}  {:.3} ms  ({:.1} TFLOPS)",
+                m, n, k, t * 1e3, tflops
+            );
+        }
+        eprintln!();
     }
     eprintln!();
 

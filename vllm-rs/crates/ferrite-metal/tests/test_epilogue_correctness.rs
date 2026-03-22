@@ -13,6 +13,12 @@
 /// Additionally, ResidualAdd and ElementMul reference `sid_m`/`sid_n` which are
 /// not defined by the emitter. We inject aliases (sid_m = M_offset, sid_n =
 /// N_offset) to match the emitter's variable names.
+///
+/// BUG NOTED: The atom code declares `simdgroup_matrix<{{C_TYPE}}, 8, 8>` for
+/// the extra tile (where C_TYPE = register precision = float), but the docstrings
+/// say `device half *`. Metal's simdgroup_load requires the pointer type and tile
+/// type to match. We work around this in tests by using float buffers. The atom
+/// docstrings should be updated, or the atoms should cast/convert types.
 use ferrite_metal::atoms::*;
 use ferrite_metal::config::MetalGemmConfig;
 use ferrite_metal::emitter::build_gemm_msl;
@@ -21,7 +27,7 @@ use metal::*;
 use std::ffi::c_void;
 
 // ═══════════════════════════════════════════════════════════════════
-// Helpers (shared with test_gemm_correctness)
+// Helpers
 // ═══════════════════════════════════════════════════════════════════
 
 fn cpu_gemm(m: u32, n: u32, k: u32, a: &[f16], b: &[f16]) -> Vec<f32> {
@@ -67,6 +73,12 @@ fn lcg_f16(rng: &mut u64) -> f16 {
     f16::from_f32(val)
 }
 
+/// Deterministic LCG pseudo-random f32 in [-1, 1].
+fn lcg_f32(rng: &mut u64) -> f32 {
+    *rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+    ((*rng >> 33) as f32) / (u32::MAX as f32 / 2.0) - 1.0
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Test harness with extra buffer support
 // ═══════════════════════════════════════════════════════════════════
@@ -88,7 +100,10 @@ impl EpilogueTest {
             .new_library_with_source(msl, &options)
             .unwrap_or_else(|e| {
                 // Print MSL for debugging on failure
-                eprintln!("=== MSL compilation failed ===\n{}\n=== error ===\n{}", msl, e);
+                eprintln!(
+                    "=== MSL compilation failed ===\n{}\n=== error ===\n{}",
+                    msl, e
+                );
                 panic!("MSL compilation failed: {}", e);
             });
         let func = library
@@ -107,7 +122,11 @@ impl EpilogueTest {
         }
     }
 
-    /// Run C = GEMM(A, B^T) + epilogue, with an optional extra f16 buffer at index 3.
+    /// Run C = GEMM(A, B^T) + epilogue, with an optional extra f32 buffer at index 3.
+    ///
+    /// The extra buffer is float because the atom epilogues use
+    /// `simdgroup_matrix<{{C_TYPE}}, 8, 8>` (C_TYPE = float for register precision)
+    /// and Metal's simdgroup_load requires pointer type to match tile type.
     fn run_with_extra(
         &self,
         m: u32,
@@ -115,7 +134,7 @@ impl EpilogueTest {
         k: u32,
         a: &[f16],
         b: &[f16],
-        extra: Option<&[f16]>,
+        extra: Option<&[f32]>,
     ) -> Vec<f32> {
         assert_eq!(a.len(), (m * k) as usize);
         assert_eq!(b.len(), (n * k) as usize);
@@ -152,7 +171,7 @@ impl EpilogueTest {
         if let Some(extra_data) = extra {
             let extra_buf = self.device.new_buffer_with_data(
                 extra_data.as_ptr() as *const c_void,
-                (extra_data.len() * 2) as u64,
+                (extra_data.len() * 4) as u64,
                 MTLResourceOptions::StorageModeShared,
             );
             enc.set_buffer(3, Some(&extra_buf), 0);
@@ -187,12 +206,9 @@ impl EpilogueTest {
 ///
 /// NOTE: The atom code declares `simdgroup_matrix<{{C_TYPE}}, 8, 8>` for the
 /// extra tile, where C_TYPE = register precision (float). So the buffer must
-/// also be float to satisfy Metal's simdgroup_load type constraint. The atom
-/// docstrings say `device half *` but that's a bug — the tile type and pointer
-/// type must agree.
+/// also be float to satisfy Metal's simdgroup_load type constraint.
 fn patch_msl_extra_buffer(msl: &str, param_name: &str) -> String {
     // Add the extra buffer parameter to the kernel signature.
-    // Insert before `constant uint4 *matrix_offsets`.
     let patched = msl.replace(
         "constant uint4 *matrix_offsets [[buffer(10)]]",
         &format!(
@@ -200,8 +216,7 @@ fn patch_msl_extra_buffer(msl: &str, param_name: &str) -> String {
         ),
     );
 
-    // Define sid_m and sid_n right after the M_offset/N_offset definitions,
-    // before the bounds check.
+    // Define sid_m and sid_n aliases for M_offset/N_offset.
     let patched = patched.replace(
         "if (M_offset >= M || N_offset >= N) return;",
         "uint sid_m = M_offset;\nuint sid_n = N_offset;\nif (M_offset >= M || N_offset >= N) return;",
@@ -210,21 +225,15 @@ fn patch_msl_extra_buffer(msl: &str, param_name: &str) -> String {
     patched
 }
 
-/// Patch the kernel signature to add RoPE scalar parameters.
-/// Injects position, d_head, and rope_base as constants/params.
+/// Patch the kernel to inject RoPE scalar parameters as local constants.
 fn patch_msl_rope_params(msl: &str, position: u32, d_head: u32) -> String {
-    // Add constant parameters after the matrix_offsets line.
-    // We use constants embedded in the MSL rather than buffer parameters
-    // for simplicity in testing.
-    let patched = msl.replace(
+    msl.replace(
         "if (M_offset >= M || N_offset >= N) return;",
         &format!(
-            "constant uint position = {};\nconstant uint d_head = {};\nconstant float rope_base = 10000.0f;\nif (M_offset >= M || N_offset >= N) return;",
+            "uint position = {};\nuint d_head = {};\nfloat rope_base = 10000.0f;\nif (M_offset >= M || N_offset >= N) return;",
             position, d_head
         ),
-    );
-
-    patched
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -247,7 +256,6 @@ fn build_residual_add_msl(config: &MetalGemmConfig) -> String {
 fn test_residual_add_compiles() {
     let config = MetalGemmConfig::default_apple9_f16();
     let msl = build_residual_add_msl(&config);
-    // If this doesn't panic, compilation succeeded.
     let _harness = EpilogueTest::from_msl(&msl, config);
 }
 
@@ -261,22 +269,15 @@ fn test_residual_add_ones_32x32() {
     let n = 32;
     let k = 32;
 
-    // A, B all ones => GEMM = 32.0 everywhere
     let a = vec![f16::from_f32(1.0); (m * k) as usize];
     let b = vec![f16::from_f32(1.0); (n * k) as usize];
-
     // Residual = 5.0 everywhere => result = 32 + 5 = 37
-    let residual = vec![f16::from_f32(5.0); (m * n) as usize];
+    let residual = vec![5.0f32; (m * n) as usize];
 
     let gpu_c = harness.run_with_extra(m, n, k, &a, &b, Some(&residual));
 
-    // CPU reference: GEMM then add residual
     let gemm_c = cpu_gemm(m, n, k, &a, &b);
-    let cpu_c: Vec<f32> = gemm_c
-        .iter()
-        .enumerate()
-        .map(|(idx, &g)| g + residual[idx].to_f32())
-        .collect();
+    let cpu_c: Vec<f32> = gemm_c.iter().enumerate().map(|(i, &g)| g + residual[i]).collect();
 
     let err = max_abs_error(&gpu_c, &cpu_c);
     assert!(
@@ -300,16 +301,12 @@ fn test_residual_add_random_32x32() {
     let mut rng = 42u64;
     let a: Vec<f16> = (0..m * k).map(|_| lcg_f16(&mut rng)).collect();
     let b: Vec<f16> = (0..n * k).map(|_| lcg_f16(&mut rng)).collect();
-    let residual: Vec<f16> = (0..m * n).map(|_| lcg_f16(&mut rng)).collect();
+    let residual: Vec<f32> = (0..m * n).map(|_| lcg_f32(&mut rng)).collect();
 
     let gpu_c = harness.run_with_extra(m, n, k, &a, &b, Some(&residual));
 
     let gemm_c = cpu_gemm(m, n, k, &a, &b);
-    let cpu_c: Vec<f32> = gemm_c
-        .iter()
-        .enumerate()
-        .map(|(idx, &g)| g + residual[idx].to_f32())
-        .collect();
+    let cpu_c: Vec<f32> = gemm_c.iter().enumerate().map(|(i, &g)| g + residual[i]).collect();
 
     let rel_err = max_rel_error(&gpu_c, &cpu_c);
     let abs_err = max_abs_error(&gpu_c, &cpu_c);
@@ -323,7 +320,6 @@ fn test_residual_add_random_32x32() {
 
 #[test]
 fn test_residual_add_zero_residual() {
-    // With zero residual, output should equal plain GEMM.
     let config = MetalGemmConfig::default_apple9_f16();
     let msl = build_residual_add_msl(&config);
     let harness = EpilogueTest::from_msl(&msl, config);
@@ -333,7 +329,7 @@ fn test_residual_add_zero_residual() {
     let k = 8;
     let a = vec![f16::from_f32(0.5); (m * k) as usize];
     let b = vec![f16::from_f32(0.25); (n * k) as usize];
-    let residual = vec![f16::from_f32(0.0); (m * n) as usize];
+    let residual = vec![0.0f32; (m * n) as usize];
 
     let gpu_c = harness.run_with_extra(m, n, k, &a, &b, Some(&residual));
     let cpu_c = cpu_gemm(m, n, k, &a, &b);
@@ -371,7 +367,6 @@ fn test_element_mul_compiles() {
 
 #[test]
 fn test_element_mul_ones_32x32() {
-    // gate = 1.0 => output should equal plain GEMM
     let config = MetalGemmConfig::default_apple9_f16();
     let msl = build_element_mul_msl(&config);
     let harness = EpilogueTest::from_msl(&msl, config);
@@ -381,7 +376,7 @@ fn test_element_mul_ones_32x32() {
     let k = 32;
     let a = vec![f16::from_f32(1.0); (m * k) as usize];
     let b = vec![f16::from_f32(1.0); (n * k) as usize];
-    let gate = vec![f16::from_f32(1.0); (m * n) as usize];
+    let gate = vec![1.0f32; (m * n) as usize];
 
     let gpu_c = harness.run_with_extra(m, n, k, &a, &b, Some(&gate));
     let cpu_c = cpu_gemm(m, n, k, &a, &b);
@@ -396,7 +391,6 @@ fn test_element_mul_ones_32x32() {
 
 #[test]
 fn test_element_mul_scale_32x32() {
-    // gate = 0.5 => output = GEMM * 0.5
     let config = MetalGemmConfig::default_apple9_f16();
     let msl = build_element_mul_msl(&config);
     let harness = EpilogueTest::from_msl(&msl, config);
@@ -406,16 +400,12 @@ fn test_element_mul_scale_32x32() {
     let k = 8;
     let a = vec![f16::from_f32(0.5); (m * k) as usize];
     let b = vec![f16::from_f32(0.25); (n * k) as usize];
-    let gate = vec![f16::from_f32(0.5); (m * n) as usize];
+    let gate = vec![0.5f32; (m * n) as usize];
 
     let gpu_c = harness.run_with_extra(m, n, k, &a, &b, Some(&gate));
 
     let gemm_c = cpu_gemm(m, n, k, &a, &b);
-    let cpu_c: Vec<f32> = gemm_c
-        .iter()
-        .enumerate()
-        .map(|(idx, &g)| g * gate[idx].to_f32())
-        .collect();
+    let cpu_c: Vec<f32> = gemm_c.iter().enumerate().map(|(i, &g)| g * gate[i]).collect();
 
     let err = max_abs_error(&gpu_c, &cpu_c);
     assert!(
@@ -429,7 +419,6 @@ fn test_element_mul_scale_32x32() {
 
 #[test]
 fn test_element_mul_zero_gate() {
-    // gate = 0 => output should be all zeros
     let config = MetalGemmConfig::default_apple9_f16();
     let msl = build_element_mul_msl(&config);
     let harness = EpilogueTest::from_msl(&msl, config);
@@ -439,7 +428,7 @@ fn test_element_mul_zero_gate() {
     let k = 8;
     let a = vec![f16::from_f32(1.0); (m * k) as usize];
     let b = vec![f16::from_f32(1.0); (n * k) as usize];
-    let gate = vec![f16::from_f32(0.0); (m * n) as usize];
+    let gate = vec![0.0f32; (m * n) as usize];
 
     let gpu_c = harness.run_with_extra(m, n, k, &a, &b, Some(&gate));
 
@@ -464,16 +453,12 @@ fn test_element_mul_random_32x32() {
     let mut rng = 99u64;
     let a: Vec<f16> = (0..m * k).map(|_| lcg_f16(&mut rng)).collect();
     let b: Vec<f16> = (0..n * k).map(|_| lcg_f16(&mut rng)).collect();
-    let gate: Vec<f16> = (0..m * n).map(|_| lcg_f16(&mut rng)).collect();
+    let gate: Vec<f32> = (0..m * n).map(|_| lcg_f32(&mut rng)).collect();
 
     let gpu_c = harness.run_with_extra(m, n, k, &a, &b, Some(&gate));
 
     let gemm_c = cpu_gemm(m, n, k, &a, &b);
-    let cpu_c: Vec<f32> = gemm_c
-        .iter()
-        .enumerate()
-        .map(|(idx, &g)| g * gate[idx].to_f32())
-        .collect();
+    let cpu_c: Vec<f32> = gemm_c.iter().enumerate().map(|(i, &g)| g * gate[i]).collect();
 
     let rel_err = max_rel_error(&gpu_c, &cpu_c);
     let abs_err = max_abs_error(&gpu_c, &cpu_c);
@@ -501,39 +486,6 @@ fn build_rope_msl(config: &MetalGemmConfig, position: u32, d_head: u32) -> Strin
     patch_msl_rope_params(&msl, position, d_head)
 }
 
-/// CPU reference for RoPE applied to a flat [M, N] matrix (row-major f32).
-/// position, d_head, rope_base=10000.
-///
-/// The GPU RoPE atom iterates C_sram[tm][tn].thread_elements()[i] with pairs
-/// (i, i+1) for i in 0..64 step 2. The dimension index is:
-///   dim_idx = (tn * 64 + i) / 2
-///
-/// In the context of the full store, element at row r, col c maps to:
-///   tn = c / 8  (which 8-wide tile)
-///   but within a simdgroup_matrix<float,8,8>, thread_elements() gives 64
-///   elements in row-major order of the 8x8 tile. So element index within
-///   tile = local_row * 8 + local_col. The pairs are (0,1), (2,3), ...
-///   meaning columns within the tile are paired.
-///
-/// For the CPU reference, we need to replicate this pairing. Column c in the
-/// output maps to:
-///   tn = c / 8
-///   local_col = c % 8
-///   i = local_row * 8 + local_col  (the thread_elements index)
-///
-/// But actually, thread_elements() for a simdgroup_matrix is NOT simple
-/// row-major — it's implementation-defined per lane. We cannot replicate
-/// the exact lane mapping from the CPU side.
-///
-/// Instead, we use a simpler approach: test with position=0 where all
-/// rotations are identity (cos=1, sin=0), so output = GEMM unchanged.
-/// And test compilation for non-zero positions.
-fn cpu_rope_position_zero(gemm_output: &[f32]) -> Vec<f32> {
-    // At position=0, theta=0 for all dims, cos(0)=1, sin(0)=0.
-    // So the rotation is identity: out = x*1 - y*0, y*0 + x*1 = (x, y).
-    gemm_output.to_vec()
-}
-
 #[test]
 fn test_rope_compiles() {
     let config = MetalGemmConfig::default_apple9_f16();
@@ -543,8 +495,7 @@ fn test_rope_compiles() {
 
 #[test]
 fn test_rope_position_zero_is_identity() {
-    // At position=0, cos(theta)=1, sin(theta)=0 for all dims.
-    // So RoPE should be a no-op: output = plain GEMM.
+    // At position=0, theta=0 for all dims => cos=1, sin=0 => identity rotation.
     let config = MetalGemmConfig::default_apple9_f16();
     let msl = build_rope_msl(&config, 0, 32);
     let harness = EpilogueTest::from_msl(&msl, config);
@@ -561,7 +512,7 @@ fn test_rope_position_zero_is_identity() {
     let err = max_abs_error(&gpu_c, &cpu_c);
     assert!(
         err < 0.01,
-        "RoPE position=0: max abs error {}, expected identity (plain GEMM), first gpu={}, first cpu={}",
+        "RoPE position=0: max abs error {}, expected identity, first gpu={}, first cpu={}",
         err,
         gpu_c[0],
         cpu_c[0]
@@ -570,7 +521,6 @@ fn test_rope_position_zero_is_identity() {
 
 #[test]
 fn test_rope_position_zero_random() {
-    // Random inputs, position=0 => output should equal plain GEMM.
     let config = MetalGemmConfig::default_apple9_f16();
     let msl = build_rope_msl(&config, 0, 32);
     let harness = EpilogueTest::from_msl(&msl, config);
@@ -599,12 +549,10 @@ fn test_rope_position_zero_random() {
 #[test]
 fn test_rope_nonzero_position_changes_output() {
     // With position > 0, RoPE should produce different output than plain GEMM.
-    // This is a structural test — we can't easily compute the exact CPU reference
-    // because thread_elements() layout is implementation-defined, but we can
-    // verify the output actually changes.
+    // We cannot compute exact CPU reference because thread_elements() layout
+    // is implementation-defined, but we can verify the output actually changes.
     let config = MetalGemmConfig::default_apple9_f16();
 
-    // Build two kernels: one with position=0 (identity) and one with position=5
     let msl_zero = build_rope_msl(&config, 0, 32);
     let msl_five = build_rope_msl(&config, 5, 32);
     let harness_zero = EpilogueTest::from_msl(&msl_zero, config.clone());
@@ -619,7 +567,6 @@ fn test_rope_nonzero_position_changes_output() {
     let gpu_zero = harness_zero.run_with_extra(m, n, k, &a, &b, None);
     let gpu_five = harness_five.run_with_extra(m, n, k, &a, &b, None);
 
-    // The two outputs should differ (RoPE with position=5 rotates elements).
     let diff = max_abs_error(&gpu_zero, &gpu_five);
     assert!(
         diff > 0.001,
@@ -630,9 +577,8 @@ fn test_rope_nonzero_position_changes_output() {
 
 #[test]
 fn test_rope_preserves_norm() {
-    // RoPE is a rotation, so it should preserve the L2 norm of each pair.
-    // We can verify that the sum of squares doesn't change much.
-    // (Not exact due to f16 precision, but should be close.)
+    // RoPE is a rotation, so it preserves the L2 norm of each pair.
+    // Total sum-of-squares should be approximately preserved.
     let config = MetalGemmConfig::default_apple9_f16();
     let msl_zero = build_rope_msl(&config, 0, 32);
     let msl_pos = build_rope_msl(&config, 3, 32);
@@ -648,7 +594,6 @@ fn test_rope_preserves_norm() {
     let gpu_zero = harness_zero.run_with_extra(m, n, k, &a, &b, None);
     let gpu_pos = harness_pos.run_with_extra(m, n, k, &a, &b, None);
 
-    // Sum of squares for both should be similar (rotation preserves norm).
     let norm_zero: f32 = gpu_zero.iter().map(|x| x * x).sum();
     let norm_pos: f32 = gpu_pos.iter().map(|x| x * x).sum();
 

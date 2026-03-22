@@ -9,7 +9,7 @@
 /// On such systems, we fall back to the polyfill path which uses loop-based
 /// copies instead of hardware DMA. The tile sizes remain the same.
 use ferrite_metal::config::MetalGemmConfig;
-use ferrite_metal::gemm::build_standalone_gemm;
+use ferrite_metal::emitter::build_standalone_gemm;
 use metal::{CompileOptions, Device, MTLLanguageVersion};
 
 fn get_device() -> metal::Device {

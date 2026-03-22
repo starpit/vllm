@@ -2,7 +2,7 @@
 /// verify output against CPU reference.
 use ferrite_metal::atoms::*;
 use ferrite_metal::config::MetalGemmConfig;
-use ferrite_metal::gemm::{build_gemm_msl, build_standalone_gemm};
+use ferrite_metal::emitter::{build_gemm_msl, build_standalone_gemm};
 use half::f16;
 use metal::*;
 use std::ffi::c_void;

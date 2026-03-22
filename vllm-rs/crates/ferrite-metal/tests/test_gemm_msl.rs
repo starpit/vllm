@@ -1,5 +1,5 @@
 use ferrite_metal::config::{GpuGeneration, MetalGemmConfig, Precision};
-use ferrite_metal::gemm::build_standalone_gemm;
+use ferrite_metal::emitter::build_standalone_gemm;
 
 // ═══════════════════════════════════════════════════════════════════
 // Config validation

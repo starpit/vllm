@@ -912,8 +912,11 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
     // ── Circular buffer state ──
     let read_stage = ptx.regs.alloc_b32();
     let write_stage = ptx.regs.alloc_b32();
+    // Buffer cycling: read starts at stages-1 (wraps to 0 on first advance).
+    // Write starts at stages-2 (wraps to stages-1 on first advance = the empty slot).
+    // For 2-stage: read=1→0, write=0→1. For 3-stage: read=2→0, write=1→2.
     ptx.mov_b32_imm(read_stage, stages - 1);
-    ptx.mov_b32_imm(write_stage, stages - 1);
+    ptx.mov_b32_imm(write_stage, if stages >= 3 { stages - 2 } else { stages - 1 });
 
     let k_counter = ptx.regs.alloc_b32();
     ptx.mov_b32_imm(k_counter, 0);
@@ -1020,9 +1023,20 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
     ptx.cp_async_wait_group(wait_count);
     ptx.bar_sync(0);
 
-    // 3. Compute read buffer base
+    // 3. Compute read buffer bases (A, B0, B1 have different stage strides)
+    // A: stage s at smem_base + s * a_tile_bytes
     ptx.shl_b32(read_off, read_stage, a_tile_bytes.trailing_zeros());
     ptx.add_s32(buf_base, smem_base, read_off);
+    // B0: stage s at smem_base + a_smem_total + s * b_tile_bytes
+    let b_read_off = ptx.regs.alloc_b32();
+    ptx.shl_b32(b_read_off, read_stage, b_tile_bytes.trailing_zeros());
+    let b0_buf_base = ptx.regs.alloc_b32();
+    ptx.add_s32(b0_buf_base, smem_base, b_read_off);
+    ptx.add_s32_imm(b0_buf_base, b0_buf_base, a_smem_total as i32);
+    // B1: stage s at smem_base + a_smem_total + b_smem_total + s * b_tile_bytes
+    let b1_buf_base = ptx.regs.alloc_b32();
+    ptx.add_s32(b1_buf_base, smem_base, b_read_off);
+    ptx.add_s32_imm(b1_buf_base, b1_buf_base, (a_smem_total + b_smem_total) as i32);
 
     // 4. Transform k-setup (load gamma for this K-tile)
     for ki in 0..k_warp_iters as usize {

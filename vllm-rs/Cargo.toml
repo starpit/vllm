@@ -23,6 +23,7 @@ members = [
     "crates/ferrite-ptx",
     "crates/ferrite-runtime",
     "crates/ferrite-macros",
+    "crates/ferrite-metal",
 ]
 exclude = []
 

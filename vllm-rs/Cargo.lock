@@ -1545,6 +1545,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-metal"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "metal",
+ "objc",
+]
+
+[[package]]
 name = "ferrite-poc"
 version = "0.1.0"
 dependencies = [

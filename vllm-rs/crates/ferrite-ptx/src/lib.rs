@@ -1,6 +1,7 @@
 pub mod atoms;
 pub mod config;
 pub mod convert;
+pub mod dual_gemm;
 pub mod fused;
 pub mod gelu;
 pub mod gemm;

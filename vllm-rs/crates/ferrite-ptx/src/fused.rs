@@ -485,12 +485,12 @@ pub fn build_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
 
 /// Build a fused dual GEMM(gate,up) -> SiLuMul kernel.
 ///
-/// Delegates to `build_cutlass_dual_gemm()` which returns the literal CUTLASS
-/// dual_gemm PTX copy — the reference implementation that achieves 59.8 TFLOPS.
+/// Delegates to `dual_gemm::emit_dual_gemm_kernel()` which emits the CUTLASS
+/// dual_gemm PTX from Rust — the reference implementation that achieves 59.8 TFLOPS.
 /// The kernel takes a 720-byte DualGemmParams struct.
 #[allow(unused_variables)]
 pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
-    build_cutlass_dual_gemm()
+    crate::dual_gemm::emit_dual_gemm_kernel()
 }
 
 

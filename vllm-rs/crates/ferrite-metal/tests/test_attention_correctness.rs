@@ -7,12 +7,10 @@
 ///   P = softmax(S, axis=-1)   (row-wise)
 ///   O = P @ V
 ///
-/// NOTE: The current attention emitter has a K-transpose issue in GEMM 1 — the
-/// simdgroup_load for K_frag uses the same layout as Q, so the MMA computes
-/// Q @ K rather than Q @ K^T. For these initial tests we choose inputs where
-/// Q @ K == Q @ K^T (uniform values, identity-like K), so correctness holds
-/// regardless. A follow-up commit will fix the transpose and add general tests.
-use ferrite_metal::attention_emitter::{build_attention_msl, AttentionConfig};
+/// The kernel uses simdgroup_matrix MMA for both GEMMs and performs per-row
+/// online softmax in threadgroup memory. Tile sizes are set to match seq_len
+/// so all sequences fit in one threadgroup for these initial tests.
+use ferrite_metal::attention_emitter::{AttentionConfig, build_attention_msl};
 use half::f16;
 use metal::*;
 use objc::{sel, sel_impl};
@@ -40,9 +38,9 @@ impl AttentionTest {
 
         let device = Device::system_default().expect("No Metal device");
         let options = CompileOptions::new();
-        // Metal 4.0 — needed for simdgroup_matrix thread_elements() returning
-        // all 64 elements per thread. The metal crate 0.33 only defines up to
-        // V3_1, so we use objc msg_send! directly to set the raw version value.
+        // Metal 4.0 for simdgroup_matrix<T, 8> with transposed load support.
+        // The metal crate 0.33 only defines up to V3_1, so we use objc
+        // msg_send! directly to set the raw language version value.
         unsafe {
             let _: () = objc::msg_send![&*options, setLanguageVersion: 0x40000u64];
         }
@@ -133,7 +131,6 @@ impl AttentionTest {
         // Threadgroup size: 1 simdgroup = 32 threads
         let tg_size = MTLSize::new(32, 1, 1);
 
-        enc.set_threadgroup_memory_length(0, self.config.threadgroup_memory() as u64);
         enc.dispatch_thread_groups(grid, tg_size);
         enc.end_encoding();
         cmd.commit();
@@ -233,11 +230,14 @@ fn mean_abs_error(a: &[f32], b: &[f32]) -> f32 {
     sum / a.len() as f32
 }
 
-/// Build an AttentionConfig with small tile sizes for testing.
-fn small_config(d_head: u16, causal: bool) -> AttentionConfig {
+/// Build an AttentionConfig with minimal tile sizes for testing.
+/// block_r and block_c match seq_len to avoid padding issues.
+fn small_config(seq_len: u16, d_head: u16, causal: bool) -> AttentionConfig {
+    // Round up to multiple of 8 (minimum tile size for 8x8 simdgroup_matrix)
+    let block = ((seq_len + 7) / 8) * 8;
     AttentionConfig {
-        block_r: 32,
-        block_c: 32,
+        block_r: block,
+        block_c: block,
         d_head,
         num_heads: 1,
         causal,
@@ -255,13 +255,12 @@ fn small_config(d_head: u16, causal: bool) -> AttentionConfig {
 /// After softmax and multiply by V=I, the output depends on softmax of Q's rows.
 /// We verify GPU matches CPU reference.
 #[test]
-#[ignore] // TODO: attention emitter produces near-zero output — needs debugging
 fn test_attention_identity_kv() {
     let seq_len: u32 = 8;
     let d_head: u16 = 8;
     let num_heads: u32 = 1;
 
-    let config = small_config(d_head, false);
+    let config = small_config(seq_len as u16, d_head, false);
     let harness = AttentionTest::new(config);
 
     let n = (num_heads * seq_len * d_head as u32) as usize;
@@ -279,19 +278,15 @@ fn test_attention_identity_kv() {
     let v = k.clone();
 
     let gpu_o = harness.run(seq_len, d_head as u32, num_heads, &q, &k, &v);
-    let cpu_o = cpu_attention(
-        seq_len as usize,
-        d_head as usize,
-        &q,
-        &k,
-        &v,
-        false,
-    );
+    let cpu_o = cpu_attention(seq_len as usize, d_head as usize, &q, &k, &v, false);
 
     let mae = mean_abs_error(&gpu_o, &cpu_o);
     let max_err = max_abs_error(&gpu_o, &cpu_o);
 
-    eprintln!("identity_kv: max_abs_error={}, mean_abs_error={}", max_err, mae);
+    eprintln!(
+        "identity_kv: max_abs_error={}, mean_abs_error={}",
+        max_err, mae
+    );
     eprintln!("  GPU first 8: {:?}", &gpu_o[..8.min(gpu_o.len())]);
     eprintln!("  CPU first 8: {:?}", &cpu_o[..8.min(cpu_o.len())]);
 
@@ -308,13 +303,12 @@ fn test_attention_identity_kv() {
 /// O = P @ V = (1/seq_len) * sum_j V[j] = V[0] (since all V rows identical).
 /// Therefore O should equal V (each row = constant).
 #[test]
-#[ignore] // TODO: attention emitter produces near-zero output — needs debugging
 fn test_attention_uniform() {
     let seq_len: u32 = 8;
     let d_head: u16 = 8;
     let num_heads: u32 = 1;
 
-    let config = small_config(d_head, false);
+    let config = small_config(seq_len as u16, d_head, false);
     let harness = AttentionTest::new(config);
 
     let n = (num_heads * seq_len * d_head as u32) as usize;
@@ -325,14 +319,7 @@ fn test_attention_uniform() {
     let v = vec![f16::from_f32(c); n];
 
     let gpu_o = harness.run(seq_len, d_head as u32, num_heads, &q, &k, &v);
-    let cpu_o = cpu_attention(
-        seq_len as usize,
-        d_head as usize,
-        &q,
-        &k,
-        &v,
-        false,
-    );
+    let cpu_o = cpu_attention(seq_len as usize, d_head as usize, &q, &k, &v, false);
 
     let mae = mean_abs_error(&gpu_o, &cpu_o);
     let max_err = max_abs_error(&gpu_o, &cpu_o);
@@ -364,13 +351,12 @@ fn test_attention_uniform() {
 /// Small 4-token sequence with d_head=8, compare GPU output against CPU reference.
 /// Uses seq_len=4 < block_r=32 so everything fits in one threadgroup.
 #[test]
-#[ignore] // TODO: attention emitter produces near-zero output — needs debugging
 fn test_attention_small_4x4() {
     let seq_len: u32 = 4;
     let d_head: u16 = 8;
     let num_heads: u32 = 1;
 
-    let config = small_config(d_head, false);
+    let config = small_config(seq_len as u16, d_head, false);
     let harness = AttentionTest::new(config);
 
     let n = (num_heads * seq_len * d_head as u32) as usize;
@@ -389,31 +375,20 @@ fn test_attention_small_4x4() {
     let v: Vec<f16> = (0..n).map(|_| next_f16(&mut rng)).collect();
 
     let gpu_o = harness.run(seq_len, d_head as u32, num_heads, &q, &k, &v);
-    let cpu_o = cpu_attention(
-        seq_len as usize,
-        d_head as usize,
-        &q,
-        &k,
-        &v,
-        false,
-    );
+    let cpu_o = cpu_attention(seq_len as usize, d_head as usize, &q, &k, &v, false);
 
     let mae = mean_abs_error(&gpu_o, &cpu_o);
     let max_err = max_abs_error(&gpu_o, &cpu_o);
 
-    eprintln!("small_4x4: max_abs_error={}, mean_abs_error={}", max_err, mae);
+    eprintln!(
+        "small_4x4: max_abs_error={}, mean_abs_error={}",
+        max_err, mae
+    );
     for row in 0..seq_len as usize {
         let start = row * d_head as usize;
         let end = start + d_head as usize;
-        eprintln!(
-            "  row {}: GPU {:?}",
-            row,
-            &gpu_o[start..end]
-        );
-        eprintln!(
-            "         CPU {:?}",
-            &cpu_o[start..end]
-        );
+        eprintln!("  row {}: GPU {:?}", row, &gpu_o[start..end]);
+        eprintln!("         CPU {:?}", &cpu_o[start..end]);
     }
 
     assert!(

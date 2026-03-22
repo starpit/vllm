@@ -277,7 +277,11 @@ fn test_residual_add_ones_32x32() {
     let gpu_c = harness.run_with_extra(m, n, k, &a, &b, Some(&residual));
 
     let gemm_c = cpu_gemm(m, n, k, &a, &b);
-    let cpu_c: Vec<f32> = gemm_c.iter().enumerate().map(|(i, &g)| g + residual[i]).collect();
+    let cpu_c: Vec<f32> = gemm_c
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| g + residual[i])
+        .collect();
 
     let err = max_abs_error(&gpu_c, &cpu_c);
     assert!(
@@ -306,7 +310,11 @@ fn test_residual_add_random_32x32() {
     let gpu_c = harness.run_with_extra(m, n, k, &a, &b, Some(&residual));
 
     let gemm_c = cpu_gemm(m, n, k, &a, &b);
-    let cpu_c: Vec<f32> = gemm_c.iter().enumerate().map(|(i, &g)| g + residual[i]).collect();
+    let cpu_c: Vec<f32> = gemm_c
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| g + residual[i])
+        .collect();
 
     let rel_err = max_rel_error(&gpu_c, &cpu_c);
     let abs_err = max_abs_error(&gpu_c, &cpu_c);
@@ -405,7 +413,11 @@ fn test_element_mul_scale_32x32() {
     let gpu_c = harness.run_with_extra(m, n, k, &a, &b, Some(&gate));
 
     let gemm_c = cpu_gemm(m, n, k, &a, &b);
-    let cpu_c: Vec<f32> = gemm_c.iter().enumerate().map(|(i, &g)| g * gate[i]).collect();
+    let cpu_c: Vec<f32> = gemm_c
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| g * gate[i])
+        .collect();
 
     let err = max_abs_error(&gpu_c, &cpu_c);
     assert!(
@@ -458,7 +470,11 @@ fn test_element_mul_random_32x32() {
     let gpu_c = harness.run_with_extra(m, n, k, &a, &b, Some(&gate));
 
     let gemm_c = cpu_gemm(m, n, k, &a, &b);
-    let cpu_c: Vec<f32> = gemm_c.iter().enumerate().map(|(i, &g)| g * gate[i]).collect();
+    let cpu_c: Vec<f32> = gemm_c
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| g * gate[i])
+        .collect();
 
     let rel_err = max_rel_error(&gpu_c, &cpu_c);
     let abs_err = max_abs_error(&gpu_c, &cpu_c);

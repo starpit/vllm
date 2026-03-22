@@ -106,13 +106,7 @@ impl RmsNormTest {
     }
 
     /// Run RmsNorm on GPU with f16 input/gamma, read back as f16 then convert to f32.
-    fn run_f16(
-        &self,
-        num_rows: u32,
-        hidden_size: u32,
-        input: &[f16],
-        gamma: &[f16],
-    ) -> Vec<f32> {
+    fn run_f16(&self, num_rows: u32, hidden_size: u32, input: &[f16], gamma: &[f16]) -> Vec<f32> {
         assert_eq!(input.len(), (num_rows * hidden_size) as usize);
         assert_eq!(gamma.len(), hidden_size as usize);
 

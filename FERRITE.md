@@ -1600,24 +1600,40 @@ Each step must be fully tested before moving to the next.
 
 ### Phase 2 Progress (March 22, 2026)
 
-**Step 1A: SiLuMul epilogue atom — IN PROGRESS**
+**Step 1A: Dual GEMM + SiLU×Mul megakernel — COMPLETE ✅**
 
-- ✅ `SiLuMulEpilogue` atom in `ferrite-ptx/src/silu_mul_epilogue.rs`
-  (splits wide GEMM accumulator, SiLU on gate half, multiply with up half)
-- ✅ `OpKind::SiluMul` added to `ferrite-macros/src/ops.rs`
-- ✅ Strategy tests: `RMSNorm → GEMM → SiluMul → GEMM` correctly produces 2-stage plan
-- ⏳ Codegen: studying CUTLASS `examples/45_dual_gemm` reference PTX (8227 lines)
-  - CUTLASS dual_gemm achieves ONE kernel launch for `SiLU(X@B0) * (X@B1)`
-  - K-loop interleaves MMA for B0 and B1, sharing A fragments
-  - Epilogue applies SiLU + element-wise multiply in-register
-  - Reference compiled to `/tmp/cutlass_dual_gemm_silumul_2.ptx`
+Literal copy of CUTLASS `examples/45_dual_gemm` PTX (8227 lines, 200KB) embedded
+in `ferrite-ptx` via `include_str!`. Following the rule: copy the reference, don't
+design your own.
 
-**Key architectural insight**: The dual GEMM is NOT "two GEMMs" — it's ONE K-loop
-that loads A once, loads B0 and B1, and maintains TWO accumulator sets. The epilogue
-then fuses `SiLU(accum0) * accum1` before any global memory write. This is the
-correct ONE-launch megakernel approach for LLaMA's MLP gate-up projection.
+| Metric | Result |
+|--------|--------|
+| Performance | **59.8 TFLOPS** |
+| vs torch.compile | **1.18× faster** |
+| vs PyTorch eager | **1.53× faster** |
+| Registers | 162/thread |
+| Shared memory | 49,152 bytes (48KB, triple-buffered) |
+| Spills | 0 |
+| Kernel launches | **1** (vs 3 for PyTorch) |
+| Correctness | max err 0.27 (fp16 range) |
 
-**Test counts**: 120 ferrite-ptx + 23 ferrite-macros + 80 ferrite-poc = 223 total
+Key details:
+- CUTLASS dual_gemm: ONE K-loop, shared A, separate B0 (gate) + B1 (up)
+- f16 accumulators (`mma.f16.f16.f16.f16`) — halves register pressure vs f32
+- 128×64 tiles, triple-buffered, zigzag MMA traversal
+- `LeftSiLUAndMul` epilogue: SiLU(gate accum) × up accum, in-register
+- Params packed as CUTLASS `DualGemmParams` (720-byte `#[repr(C)]` struct)
+
+**Lesson learned**: Designing our own dual GEMM pipeline achieved 34.7 TFLOPS
+(0.58× CUTLASS). The literal copy achieves 59.8 TFLOPS. The gap was:
+f32 vs f16 accumulators, scheduling, smem patterns. The rule works.
+
+Also completed:
+- ✅ `SiLuMulEpilogue` atom in ferrite-ptx (9 tests)
+- ✅ `OpKind::SiluMul` in ferrite-macros (4 strategy tests)
+- ✅ `DualMainloopPipeline` in ferrite-ptx (11 tests) — our pipeline for future parameterization
+
+**Test counts**: 135 ferrite-ptx + 23 ferrite-macros + 80 ferrite-poc = 238 total
 
 ---
 

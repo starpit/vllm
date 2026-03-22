@@ -42,7 +42,7 @@ impl GemmConfig {
             mma_m: 16,
             mma_n: 8,
             mma_k: 16,
-            num_stages: 2, // 3-stage has correctness bug, needs investigation
+            num_stages: 2, // 3-stage buffer cycling bug still present
             sm_arch: "sm_89".into(),
         }
     }

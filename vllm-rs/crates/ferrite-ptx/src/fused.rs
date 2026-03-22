@@ -833,20 +833,19 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
             ptx.add_s32_imm(a_dst, a_st[i], (stage * a_tile_bytes) as i32);
             ptx.cp_async_cg(a_dst, 0, ga_loop[i], 0, sz);
         }
-        ptx.cp_async_commit();
 
         for i in 0..cp_chunks_b as usize {
             let b0_dst = ptx.regs.alloc_b32();
             ptx.add_s32_imm(b0_dst, b0_cp[i], (stage * b_tile_bytes) as i32);
             ptx.cp_async_cg(b0_dst, 0, gb0_loop[i], 0, sz);
         }
-        ptx.cp_async_commit();
 
         for i in 0..cp_chunks_b as usize {
             let b1_dst = ptx.regs.alloc_b32();
             ptx.add_s32_imm(b1_dst, b1_cp[i], (stage * b_tile_bytes) as i32);
             ptx.cp_async_cg(b1_dst, 0, gb1_loop[i], 0, sz);
         }
+        // ONE commit for all A+B0+B1 (matching CUTLASS)
         ptx.cp_async_commit();
         ptx.blank();
 
@@ -921,7 +920,9 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
 
     // Wait count: 3 commits per stage (A + B0 + B1), wait for stages-2 worth
     let total_async_per_tile = 3u32; // A commit + B0 commit + B1 commit
-    let wait_count = total_async_per_tile * (stages - 2);
+    // With single commit group per tile (A+B0+B1 together),
+    // wait_count = stages - 2 (matching CUTLASS)
+    let wait_count = stages - 2;
 
     // Pre-allocate K-loop temporary registers
     let buf_base = ptx.regs.alloc_b32();
@@ -1123,7 +1124,6 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
         ptx.add_s32_imm(a_dst_regs[i], a_dst_regs[0], (i * 2048) as i32);
         ptx.cp_async_cg(a_dst_regs[i], 0, ga_loop[i], 0, cp_size);
     }
-    ptx.cp_async_commit();
 
     // B0 next tile
     ptx.add_s32(b0_dst_regs[0], write_buf_base, b_cp_off);
@@ -1133,7 +1133,6 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
         ptx.add_s32_imm(b0_dst_regs[i], b0_dst_regs[0], i as i32 * 2048);
         ptx.cp_async_cg(b0_dst_regs[i], 0, gb0_loop[i], 0, cp_size);
     }
-    ptx.cp_async_commit();
 
     // B1 next tile
     ptx.add_s32(b1_dst_regs[0], write_buf_base, b_cp_off);
@@ -1143,6 +1142,7 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
         ptx.add_s32_imm(b1_dst_regs[i], b1_dst_regs[0], i as i32 * 2048);
         ptx.cp_async_cg(b1_dst_regs[i], 0, gb1_loop[i], 0, cp_size);
     }
+    // ONE commit for all A+B0+B1 (matching CUTLASS)
     ptx.cp_async_commit();
     ptx.blank();
 

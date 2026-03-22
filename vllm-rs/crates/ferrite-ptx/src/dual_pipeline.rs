@@ -225,7 +225,6 @@ impl DualMainloopPipeline {
                 ptx.add_s32_imm(a_dst, a_st[i], (stage * a_tile_bytes) as i32);
                 copy_a.emit_async_copy(ptx, a_dst, ga_loop[i], sz);
             }
-            copy_a.emit_commit(ptx);
 
             // B0 tile into buffer `stage`
             for i in 0..cp_chunks_b as usize {
@@ -233,7 +232,6 @@ impl DualMainloopPipeline {
                 ptx.add_s32_imm(b0_dst, b0_cp[i], (stage * b_tile_bytes) as i32);
                 copy_b0.emit_async_copy(ptx, b0_dst, gb0_loop[i], sz);
             }
-            copy_b0.emit_commit(ptx);
 
             // B1 tile into buffer `stage`
             for i in 0..cp_chunks_b as usize {
@@ -241,7 +239,8 @@ impl DualMainloopPipeline {
                 ptx.add_s32_imm(b1_dst, b1_cp[i], (stage * b_tile_bytes) as i32);
                 copy_b1.emit_async_copy(ptx, b1_dst, gb1_loop[i], sz);
             }
-            copy_b1.emit_commit(ptx);
+            // ONE commit for all A+B0+B1 loads (matching CUTLASS)
+            copy_a.emit_commit(ptx);
             ptx.blank();
 
             // Advance global pointers to next tile
@@ -437,7 +436,9 @@ impl DualMainloopPipeline {
         let b0_async = copy_b0.async_groups_per_tile();
         let b1_async = copy_b1.async_groups_per_tile();
         let total_async_per_tile = a_async + b0_async + b1_async;
-        let wait_count = total_async_per_tile * (stages - 2);
+        // With single commit group per tile (A+B0+B1 together),
+        // wait_count = stages - 2 (matching CUTLASS's cp.async.wait_group 1 for 3-stage)
+        let wait_count = stages - 2;
 
         // ═══════════════════════════════════════════════════════════════
         // Pre-allocate K-loop temporary registers
@@ -660,7 +661,6 @@ impl DualMainloopPipeline {
             ptx.add_s32_imm(a_dst_regs[i], a_dst_regs[0], (i * 2048) as i32);
             copy_a.emit_async_copy(ptx, a_dst_regs[i], ga_loop[i], cp_size);
         }
-        copy_a.emit_commit(ptx);
 
         // B0 next tile
         ptx.add_s32(b0_dst_regs[0], write_buf_base, b0_cp_off);
@@ -670,7 +670,6 @@ impl DualMainloopPipeline {
             ptx.add_s32_imm(b0_dst_regs[i], b0_dst_regs[0], i as i32 * 2048);
             copy_b0.emit_async_copy(ptx, b0_dst_regs[i], gb0_loop[i], cp_size);
         }
-        copy_b0.emit_commit(ptx);
 
         // B1 next tile
         ptx.add_s32(b1_dst_regs[0], write_buf_base, b1_cp_off);
@@ -680,7 +679,8 @@ impl DualMainloopPipeline {
             ptx.add_s32_imm(b1_dst_regs[i], b1_dst_regs[0], i as i32 * 2048);
             copy_b1.emit_async_copy(ptx, b1_dst_regs[i], gb1_loop[i], cp_size);
         }
-        copy_b1.emit_commit(ptx);
+        // ONE commit for all A+B0+B1 loads (matching CUTLASS)
+        copy_a.emit_commit(ptx);
         ptx.blank();
 
         // Advance write buffer stage index
@@ -1071,10 +1071,10 @@ mod tests {
         };
         let ptx = build_dual_pipeline_ptx(&config);
 
-        // With 3 stages and 3 async groups per tile (A=1, B0=1, B1=1):
-        // wait_count = 3 * (3 - 2) = 3
+        // With 3 stages and single commit group per tile (A+B0+B1 together):
+        // wait_count = stages - 2 = 1 (matching CUTLASS)
         assert!(
-            ptx.contains("cp.async.wait_group \t3"),
+            ptx.contains("cp.async.wait_group \t1"),
             "3-stage dual pipeline must wait for group 3 in K-loop"
         );
     }

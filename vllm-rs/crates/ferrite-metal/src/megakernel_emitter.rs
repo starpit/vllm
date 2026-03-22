@@ -62,6 +62,18 @@ pub fn build_megakernel_msl(config: &MegakernelConfig) -> String {
     msl.set("NUM_TG", config.num_threadgroups.to_string());
     msl.set("THREADS_PER_TG", config.threads_per_tg.to_string());
 
+    // Compute threadgroup memory: max across all phases
+    let mem_prec = config.precision.bytes() as u32;
+    let gemm_smem = 2 * 64 * mem_prec; // A_tile + B_tile, 8×8 each
+    let rmsnorm_smem = 4u32; // one float for reduction
+    // Attention: Q_tile[8×d_head] + K_tile[8×d_head] + S_scratch[8×8×4] + O_scratch[8×8×4]
+    let attn_smem = 8 * config.d_head * mem_prec  // Q tile
+        + 8 * config.d_head * mem_prec             // K tile (reused for V)
+        + 8 * config.seq_len * 4                   // S scratch (f32, one row group × seq_len)
+        + 64 * 4; // O scratch (f32, 8×8)
+    let smem_size = gemm_smem.max(rmsnorm_smem).max(attn_smem);
+    msl.set("SMEM_SIZE", smem_size.to_string());
+
     msl.raw("#include <metal_stdlib>");
     msl.raw("using namespace metal;");
     msl.blank();
@@ -129,9 +141,9 @@ uint total_elems = seq_len * d_model;
 uint ffn_elems = seq_len * d_ffn;
 uint num_tg = {{NUM_TG}};
 
-// Shared threadgroup memory for tiled GEMM (8×8 tiles)
-threadgroup {{MEM_TYPE}} gemm_A_smem[64];
-threadgroup {{MEM_TYPE}} gemm_B_smem[64];
+// Shared threadgroup memory pool — sized to max phase requirement.
+// Each phase casts to what it needs. Reused across phases since they're sequential.
+threadgroup uchar smem_pool[{{SMEM_SIZE}}];
 "#,
     );
 
@@ -167,8 +179,8 @@ auto sync_phase = [&](uint expected_count) {
         }
         // Reduce within simdgroup
         sum_sq = simd_sum(sum_sq);
-        // Cross-simdgroup reduce via shared memory
-        threadgroup float shared_sum[1];
+        // Cross-simdgroup reduce via shared memory pool
+        threadgroup float *shared_sum = (threadgroup float *)smem_pool;
         if (sidx == 0 && lane_id == 0) shared_sum[0] = sum_sq;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float total = shared_sum[0];
@@ -250,49 +262,7 @@ auto sync_phase = [&](uint expected_count) {
     // ═══════════════════════════════════════════════════════════════
     // Phase 5: Attention
     // ═══════════════════════════════════════════════════════════════
-    msl.comment("Phase 5: Attention (naive for single-TG)");
-    msl.block(
-        r#"
-{
-    device {{MEM_TYPE}} *Q = qkv_f16;
-    device {{MEM_TYPE}} *K = qkv_f16 + total_elems;
-    device {{MEM_TYPE}} *V = qkv_f16 + 2 * total_elems;
-    float attn_scale = rsqrt(float(d_head));
-
-    for (uint row = gid; row < seq_len; row += num_tg) {
-        // S[row, :] = Q[row] dot K[:] * scale
-        // Only one thread per row for simplicity
-        if (tid_in_tg == 0) {
-            float s[{{SEQ_LEN}}];
-            float max_s = -INFINITY;
-            for (uint j = 0; j < seq_len; j++) {
-                float dot = 0.0;
-                for (uint d = 0; d < d_head; d++) {
-                    dot += float(Q[row * d_model + d]) * float(K[j * d_model + d]);
-                }
-                s[j] = dot * attn_scale;
-                max_s = max(max_s, s[j]);
-            }
-            // Softmax
-            float sum_exp = 0.0;
-            for (uint j = 0; j < seq_len; j++) {
-                s[j] = exp(s[j] - max_s);
-                sum_exp += s[j];
-            }
-            float inv_sum = 1.0 / sum_exp;
-            // O = P @ V
-            for (uint d = 0; d < d_head; d++) {
-                float val = 0.0;
-                for (uint j = 0; j < seq_len; j++) {
-                    val += s[j] * inv_sum * float(V[j * d_model + d]);
-                }
-                attn_out[row * d_model + d] = val;
-            }
-        }
-    }
-}
-"#,
-    );
+    emit_flash_attention(&mut msl, config);
 
     emit_phase_sync(&mut msl, config, 5);
 
@@ -354,7 +324,7 @@ auto sync_phase = [&](uint expected_count) {
             sum_sq += val * val;
         }
         sum_sq = simd_sum(sum_sq);
-        threadgroup float shared_sum_ffn[1];
+        threadgroup float *shared_sum_ffn = (threadgroup float *)smem_pool;
         if (sidx == 0 && lane_id == 0) shared_sum_ffn[0] = sum_sq;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float total_sq = shared_sum_ffn[0];
@@ -454,6 +424,139 @@ threadgroup_barrier(mem_flags::mem_device);
     msl.finish()
 }
 
+/// Emit FlashAttention using simdgroup MMA.
+/// Uses smem_pool for Q/K tiles, S scratch, and O scratch.
+/// Per-row online softmax through threadgroup memory.
+fn emit_flash_attention(msl: &mut MslBuilder, _config: &MegakernelConfig) {
+    msl.comment("Phase 5: FlashAttention (simdgroup MMA + online softmax)");
+    msl.block(
+        r#"
+{
+    device {{MEM_TYPE}} *Q_ptr = qkv_f16;
+    device {{MEM_TYPE}} *K_ptr = qkv_f16 + total_elems;
+    device {{MEM_TYPE}} *V_ptr = qkv_f16 + 2 * total_elems;
+    float attn_scale = rsqrt(float(d_head));
+
+    // Carve smem_pool: Q_tile[8×d_head] | K_tile[8×d_head] | S_scratch[8×seq_len] | O_scratch[64]
+    threadgroup {{MEM_TYPE}} *Q_tile = (threadgroup {{MEM_TYPE}} *)smem_pool;
+    threadgroup {{MEM_TYPE}} *K_tile = Q_tile + 8 * d_head;
+    uint kv_smem_offset = 2 * 8 * d_head * sizeof({{MEM_TYPE}});
+    threadgroup float *S_scratch = (threadgroup float *)(smem_pool + kv_smem_offset);
+    threadgroup float *O_scratch = S_scratch + 8 * seq_len;
+
+    // Process rows in groups of 8 (one simdgroup tile row)
+    for (uint row_base = gid * 8; row_base < seq_len; row_base += num_tg * 8) {
+        // Load Q tile [8 × d_head]
+        for (ushort i = tid_in_tg; i < 8 * d_head; i += {{THREADS_PER_TG}}) {
+            ushort r = i / d_head, c = i % d_head;
+            uint gr = row_base + r;
+            Q_tile[i] = (gr < seq_len) ? Q_ptr[gr * d_model + c] : {{MEM_TYPE}}(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Initialize O_smem for this row group to zero (reuse attn_out device mem directly)
+        // Init per-row softmax state
+        float m_row[8];
+        float l_row[8];
+        for (ushort i = 0; i < 8; i++) { m_row[i] = -INFINITY; l_row[i] = 0.0; }
+
+        // Zero O for this row group in device memory
+        for (ushort i = tid_in_tg; i < 8 * d_head; i += {{THREADS_PER_TG}}) {
+            ushort r = i / d_head, c = i % d_head;
+            uint gr = row_base + r;
+            if (gr < seq_len) attn_out[gr * d_model + c] = 0.0;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        // KV loop: iterate over key/value sequence in tiles of 8
+        for (uint c = 0; c < seq_len; c += 8) {
+            // Load K tile [8 × d_head]
+            for (ushort i = tid_in_tg; i < 8 * d_head; i += {{THREADS_PER_TG}}) {
+                ushort r = i / d_head, col = i % d_head;
+                uint gr = c + r;
+                K_tile[i] = (gr < seq_len) ? K_ptr[gr * d_model + col] : {{MEM_TYPE}}(0);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // GEMM 1: S_tile = Q_tile × K_tile^T  [8×d_head] × [d_head×8] → [8×8]
+            // Accumulate over d_head in steps of 8
+            simdgroup_matrix<float, 8> S_acc = make_filled_simdgroup_matrix<float, 8>(0);
+            for (ushort dk = 0; dk < d_head; dk += 8) {
+                simdgroup_matrix<{{MEM_TYPE}}, 8> Q_frag, KT_frag;
+                simdgroup_load(Q_frag, Q_tile, d_head, ulong2(dk, 0));
+                simdgroup_load(KT_frag, K_tile, d_head, ulong2(dk, 0), true);
+                simdgroup_multiply_accumulate(S_acc, Q_frag, KT_frag, S_acc);
+            }
+
+            // Store S_acc to S_scratch [8 × 8] within S_scratch[8 × seq_len]
+            simdgroup_store(S_acc, S_scratch, seq_len, ulong2(c, 0));
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Scale S_scratch column range [c..c+8]
+            for (ushort i = tid_in_tg; i < 64; i += {{THREADS_PER_TG}}) {
+                ushort r = i / 8, col = i % 8;
+                S_scratch[r * seq_len + c + col] *= attn_scale;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        // End of KV accumulation loop — S_scratch now has full [8 × seq_len]
+
+        // Per-row online softmax on S_scratch
+        for (ushort row = tid_in_tg; row < 8; row += {{THREADS_PER_TG}}) {
+            if (row_base + row >= seq_len) continue;
+            float row_max = -INFINITY;
+            for (uint j = 0; j < seq_len; j++)
+                row_max = max(row_max, S_scratch[row * seq_len + j]);
+            float row_sum = 0.0;
+            for (uint j = 0; j < seq_len; j++) {
+                S_scratch[row * seq_len + j] = exp(S_scratch[row * seq_len + j] - row_max);
+                row_sum += S_scratch[row * seq_len + j];
+            }
+            float inv_l = (row_sum > 0) ? (1.0 / row_sum) : 0.0;
+            for (uint j = 0; j < seq_len; j++)
+                S_scratch[row * seq_len + j] *= inv_l;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // GEMM 2: O = P × V  where P = S_scratch[8 × seq_len], V = [seq_len × d_head]
+        // Tile over V columns (d_head) and P columns (seq_len) in steps of 8
+        for (uint vc = 0; vc < seq_len; vc += 8) {
+            // Load V tile [8 × d_head]
+            for (ushort i = tid_in_tg; i < 8 * d_head; i += {{THREADS_PER_TG}}) {
+                ushort r = i / d_head, col = i % d_head;
+                uint gr = vc + r;
+                K_tile[i] = (gr < seq_len) ? V_ptr[gr * d_model + col] : {{MEM_TYPE}}(0);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (ushort td = 0; td < d_head; td += 8) {
+                simdgroup_matrix<float, 8> P_frag;
+                simdgroup_load(P_frag, S_scratch, seq_len, ulong2(vc, 0));
+
+                simdgroup_matrix<{{MEM_TYPE}}, 8> V_frag;
+                simdgroup_load(V_frag, K_tile, d_head, ulong2(td, 0));
+
+                simdgroup_matrix<float, 8> O_acc = make_filled_simdgroup_matrix<float, 8>(0);
+                simdgroup_multiply_accumulate(O_acc, P_frag, V_frag, O_acc);
+
+                // Add to O in device memory via scratch
+                simdgroup_store(O_acc, O_scratch, 8, ulong2(0, 0));
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (ushort i = tid_in_tg; i < 64; i += {{THREADS_PER_TG}}) {
+                    ushort r = i / 8, d = i % 8;
+                    uint gr = row_base + r;
+                    if (gr < seq_len)
+                        attn_out[gr * d_model + td + d] += O_scratch[i];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+}
+"#,
+    );
+}
+
 /// Emit an inline tiled GEMM: C[M,N] = A[M,K] @ W[N,K]^T
 /// Uses simdgroup MMA with 8×8 tiles. A_smem/B_smem are threadgroup memory
 /// declared in the kernel. Iterates over output tiles sequentially (for single-TG).
@@ -468,6 +571,8 @@ fn emit_tiled_gemm(
 ) {
     msl.raw("{");
     msl.indent();
+    msl.raw("threadgroup half *gemm_A_smem = (threadgroup half *)smem_pool;");
+    msl.raw("threadgroup half *gemm_B_smem = (threadgroup half *)(smem_pool + 128);");
     msl.raw(&format!("uint _gm_tiles_m = ({m} + 7) / 8;", m = m_dim));
     msl.raw(&format!("uint _gm_tiles_n = ({n} + 7) / 8;", n = n_dim));
     msl.raw("uint _gm_total_tiles = _gm_tiles_m * _gm_tiles_n;");
@@ -561,7 +666,7 @@ mod tests {
         let msl = build_megakernel_msl(&MegakernelConfig::test_config());
         assert!(msl.contains("kernel void transformer_block("));
         assert!(msl.contains("Phase 1: RmsNorm"));
-        assert!(msl.contains("Phase 5: Attention"));
+        assert!(msl.contains("Phase 5: FlashAttention"));
         assert!(msl.contains("Phase 11: SiLU"));
         assert!(msl.contains("Phase 13: Residual add"));
     }

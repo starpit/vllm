@@ -2488,4 +2488,120 @@ mod tests {
             single_mma, dual_mma
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Tests for the embedded CUTLASS dual_gemm PTX (build_cutlass_dual_gemm)
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_cutlass_dual_gemm_returns_nonempty_ptx() {
+        let ptx = build_cutlass_dual_gemm();
+        assert!(ptx.len() > 100_000, "Expected >100KB PTX, got {} bytes", ptx.len());
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_has_entry_point() {
+        let ptx = build_cutlass_dual_gemm();
+        assert!(ptx.contains(".visible .entry ferrite_dual_gemm_silu_mul("),
+            "Must have our renamed entry point");
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_has_smem_declaration() {
+        let ptx = build_cutlass_dual_gemm();
+        assert!(ptx.contains("_ZN7cutlass17SharedStorageBaseE[49152]"),
+            "Must declare 48KB shared memory for triple-buffered A+B0+B1");
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_uses_f16_accumulators() {
+        let ptx = build_cutlass_dual_gemm();
+        assert!(ptx.contains("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16"),
+            "Must use f16 accumulators (not f32) for register efficiency");
+        assert!(!ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
+            "Must NOT use f32 accumulators");
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_has_64_mma_instructions() {
+        let ptx = build_cutlass_dual_gemm();
+        let mma_count = ptx.lines().filter(|l| l.contains("mma.sync.aligned")).count();
+        assert_eq!(mma_count, 64,
+            "CUTLASS dual GEMM should have 64 MMA instructions (32 per GEMM), got {}", mma_count);
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_has_ldmatrix() {
+        let ptx = build_cutlass_dual_gemm();
+        let ldm_count = ptx.lines().filter(|l| l.contains("ldmatrix.sync.aligned")).count();
+        assert!(ldm_count >= 16,
+            "Need ldmatrix for A + B0 + B1, got {}", ldm_count);
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_has_cp_async() {
+        let ptx = build_cutlass_dual_gemm();
+        let cp_count = ptx.lines().filter(|l| l.contains("cp.async.cg.shared.global")).count();
+        assert!(cp_count >= 16,
+            "Need cp.async for A + B0 + B1 tile loads, got {}", cp_count);
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_has_silu_ops() {
+        let ptx = build_cutlass_dual_gemm();
+        let ex2_count = ptx.lines().filter(|l| l.contains("ex2.approx")).count();
+        let rcp_count = ptx.lines().filter(|l| l.contains("rcp.approx")).count();
+        assert!(ex2_count >= 32, "Need ex2 for sigmoid in SiLU, got {}", ex2_count);
+        assert!(rcp_count >= 32, "Need rcp for 1/(1+exp) in SiLU, got {}", rcp_count);
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_has_global_stores() {
+        let ptx = build_cutlass_dual_gemm();
+        let st_count = ptx.lines().filter(|l| l.contains("st.global")).count();
+        assert!(st_count >= 8, "Need global stores for output, got {}", st_count);
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_ptx_version_and_target() {
+        let ptx = build_cutlass_dual_gemm();
+        assert!(ptx.contains(".version 8.0"), "Must target PTX 8.0");
+        assert!(ptx.contains(".target sm_89"), "Must target sm_89");
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_has_triple_buffer_cycling() {
+        let ptx = build_cutlass_dual_gemm();
+        // Triple buffer cycling uses commit_group and wait_group patterns
+        let commit_count = ptx.lines().filter(|l| l.contains("cp.async.commit_group")).count();
+        let wait_count = ptx.lines().filter(|l| l.contains("cp.async.wait_group")).count();
+        assert!(commit_count >= 2, "Need commit_group for pipeline, got {}", commit_count);
+        assert!(wait_count >= 2, "Need wait_group for pipeline, got {}", wait_count);
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_has_bar_sync() {
+        let ptx = build_cutlass_dual_gemm();
+        let bar_count = ptx.lines().filter(|l| l.contains("bar.sync")).count();
+        assert!(bar_count >= 4, "Need barriers for smem sync, got {}", bar_count);
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_param_struct_720_bytes() {
+        let ptx = build_cutlass_dual_gemm();
+        // CUTLASS DualGemm::Params is 720 bytes, passed as .param .b8[720]
+        // (or similar alignment block)
+        assert!(ptx.contains("param_0[7") || ptx.contains("param_0[720]"),
+            "Param block should be ~720 bytes");
+    }
+
+    #[test]
+    fn test_cutlass_dual_gemm_no_local_memory() {
+        let ptx = build_cutlass_dual_gemm();
+        let local_count = ptx.lines()
+            .filter(|l| l.contains("st.local") || l.contains("ld.local"))
+            .count();
+        assert_eq!(local_count, 0,
+            "CUTLASS dual GEMM should have no local memory spills in PTX, found {}", local_count);
+    }
 }

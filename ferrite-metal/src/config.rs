@@ -182,8 +182,20 @@ impl MetalGemmConfig {
         } else {
             // Auto-compute: leading dimension = the non-K dimension
             match operand {
-                'A' => if self.transpose[0] { self.block_m } else { self.block_k },
-                'B' => if self.transpose[1] { self.block_k } else { self.block_n },
+                'A' => {
+                    if self.transpose[0] {
+                        self.block_m
+                    } else {
+                        self.block_k
+                    }
+                }
+                'B' => {
+                    if self.transpose[1] {
+                        self.block_k
+                    } else {
+                        self.block_n
+                    }
+                }
                 'C' => self.block_n,
                 _ => 0,
             }
@@ -194,8 +206,20 @@ impl MetalGemmConfig {
     pub fn block_bytes(&self, operand: char) -> u32 {
         let lead = self.leading_block_dim(operand) as u32;
         let trail = match operand {
-            'A' => if self.transpose[0] { self.block_k } else { self.block_m },
-            'B' => if self.transpose[1] { self.block_n } else { self.block_k },
+            'A' => {
+                if self.transpose[0] {
+                    self.block_k
+                } else {
+                    self.block_m
+                }
+            }
+            'B' => {
+                if self.transpose[1] {
+                    self.block_n
+                } else {
+                    self.block_k
+                }
+            }
             'C' => self.block_m,
             _ => 0,
         } as u32;

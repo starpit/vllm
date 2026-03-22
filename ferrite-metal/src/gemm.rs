@@ -6,7 +6,6 @@
 /// The emitter composes atoms (CopyAtom, MmaAtom, TransformAtom, EpilogueAtom)
 /// into a single MSL kernel function. The atoms determine what the kernel does;
 /// the emitter determines the structure (K-loop, barriers, tile addressing).
-
 use crate::atoms::*;
 use crate::config::MetalGemmConfig;
 use crate::msl_builder::MslBuilder;
@@ -99,11 +98,13 @@ fn emit_constants(msl: &mut MslBuilder, config: &MetalGemmConfig) {
     msl.set("REGISTER_NAME_B", config.register_precisions.b.msl_name());
     msl.set("REGISTER_NAME_C", config.register_precisions.c.msl_name());
 
-    msl.block(r#"
+    msl.block(
+        r#"
 constant uint M_group = {{BLOCK_M}};
 constant uint N_group = {{BLOCK_N}};
 constant uint K_group = {{BLOCK_K}};
-"#);
+"#,
+    );
 }
 
 fn emit_utilities(msl: &mut MslBuilder, config: &MetalGemmConfig) {
@@ -111,7 +112,8 @@ fn emit_utilities(msl: &mut MslBuilder, config: &MetalGemmConfig) {
     msl.set("REGISTER_N", config.register_n().to_string());
 
     // Morton order helper (2D simdgroup thread layout)
-    msl.block(r#"
+    msl.block(
+        r#"
 METAL_FUNC ushort2 morton_order(ushort thread_index_in_simdgroup) {
     ushort lane_id = thread_index_in_simdgroup;
     ushort quad_id = lane_id / 4;
@@ -120,10 +122,12 @@ METAL_FUNC ushort2 morton_order(ushort thread_index_in_simdgroup) {
     result.y = extract_bits(quad_id, 1, 2);
     return result * 8;
 }
-"#);
+"#,
+    );
 
     // get_sram helper (index into simdgroup_matrix_storage array)
-    msl.block(r#"
+    msl.block(
+        r#"
 template <typename T>
 METAL_FUNC thread simdgroup_matrix_storage<T>* get_sram(
     thread simdgroup_matrix_storage<T> *sram,
@@ -132,7 +136,8 @@ METAL_FUNC thread simdgroup_matrix_storage<T>* get_sram(
 ) {
     return sram + (matrix_origin.y / 8) * (sram_leading_dim / 8) + (matrix_origin.x / 8);
 }
-"#);
+"#,
+    );
 }
 
 fn emit_kernel_signature(msl: &mut MslBuilder, config: &MetalGemmConfig) {
@@ -140,9 +145,13 @@ fn emit_kernel_signature(msl: &mut MslBuilder, config: &MetalGemmConfig) {
     msl.set("MEMORY_NAME_B", config.memory_precisions.b.msl_name());
     msl.set("MEMORY_NAME_C", config.memory_precisions.c.msl_name());
     msl.set("THREADGROUP_SIZE", config.threadgroup_size().to_string());
-    msl.set("THREADGROUP_MEMORY", config.threadgroup_memory().to_string());
+    msl.set(
+        "THREADGROUP_MEMORY",
+        config.threadgroup_memory().to_string(),
+    );
 
-    msl.block(r#"
+    msl.block(
+        r#"
 kernel void gemm(
     device {{MEMORY_NAME_A}} *A [[buffer(0)]],
     device {{MEMORY_NAME_B}} *B [[buffer(1)]],
@@ -152,18 +161,29 @@ kernel void gemm(
     ushort sidx [[simdgroup_index_in_threadgroup]],
     ushort lane_id [[thread_index_in_simdgroup]]
 )
-"#);
+"#,
+    );
 }
 
 fn emit_thread_setup(msl: &mut MslBuilder, config: &MetalGemmConfig) {
     msl.set("REGISTER_M", config.register_m().to_string());
     msl.set("REGISTER_N", config.register_n().to_string());
     msl.set("SPLITS_N", config.splits[0].to_string());
-    msl.set("THREADGROUP_MEMORY", config.threadgroup_memory().to_string());
-    msl.set("A_TRANS", if config.transpose[0] { "true" } else { "false" });
-    msl.set("B_TRANS", if config.transpose[1] { "true" } else { "false" });
+    msl.set(
+        "THREADGROUP_MEMORY",
+        config.threadgroup_memory().to_string(),
+    );
+    msl.set(
+        "A_TRANS",
+        if config.transpose[0] { "true" } else { "false" },
+    );
+    msl.set(
+        "B_TRANS",
+        if config.transpose[1] { "true" } else { "false" },
+    );
 
-    msl.block(r#"
+    msl.block(
+        r#"
 // Unpack matrix dimensions from constants buffer.
 uint M = matrix_offsets[0][0];
 uint N = matrix_offsets[0][1];
@@ -197,12 +217,11 @@ if ((N_shift != 0) && (gid.x * N_group >= N_edge)) {
     N_offset -= N_shift;
 }
 
-// Transpose flags and leading dimensions.
-constant bool A_trans = {{A_TRANS}};
-constant bool B_trans = {{B_TRANS}};
-uint A_leading_dimension = A_trans ? M : K;
-uint B_leading_dimension = B_trans ? K : N;
-"#);
+// Transpose flags.
+bool A_trans = {{A_TRANS}};
+bool B_trans = {{B_TRANS}};
+"#,
+    );
 }
 
 fn emit_accumulator_init(msl: &mut MslBuilder, config: &MetalGemmConfig) {
@@ -210,7 +229,8 @@ fn emit_accumulator_init(msl: &mut MslBuilder, config: &MetalGemmConfig) {
     msl.set("REGISTER_N", config.register_n().to_string());
     msl.set("REGISTER_NAME_C", config.register_precisions.c.msl_name());
 
-    msl.block(r#"
+    msl.block(
+        r#"
 // Initialize accumulators to zero.
 simdgroup_matrix_storage<{{REGISTER_NAME_C}}> C_sram[
     ({{REGISTER_M}} / 8) * ({{REGISTER_N}} / 8)];
@@ -219,10 +239,11 @@ for (ushort m = 0; m < {{REGISTER_M}}; m += 8) {
 #pragma clang loop unroll(full)
     for (ushort n = 0; n < {{REGISTER_N}}; n += 8) {
         auto C = get_sram(C_sram, {{REGISTER_N}}, ushort2(n, m));
-        *C = simdgroup_matrix_storage<{{REGISTER_NAME_C}}>(0);
+        *C = simdgroup_matrix_storage<{{REGISTER_NAME_C}}>(vec<{{REGISTER_NAME_C}}, 2>(0));
     }
 }
-"#);
+"#,
+    );
 }
 
 fn emit_k_loop(
@@ -251,36 +272,42 @@ fn emit_k_loop(
     msl.set("LEADING_BLOCK_DIM_B", leading_b.clone());
 
     // Declare fragment arrays before the loop
-    msl.block(r#"
+    msl.block(
+        r#"
 simdgroup_matrix_storage<{{REGISTER_NAME_A}}> A_sram[
     ({{REGISTER_M}} / 8) * (K_group / 8)];
 simdgroup_matrix_storage<{{REGISTER_NAME_B}}> B_sram[
     (K_group / 8) * ({{REGISTER_N}} / 8)];
-"#);
+"#,
+    );
 
     msl.comment("K-loop: iterate over the K dimension in tiles of K_group");
     msl.raw("for (uint k = 0; k < K; k += K_group) {");
     msl.indent();
     {
         // Tile pointers for threadgroup memory
-        msl.block(r#"
+        msl.block(
+            r#"
 auto A_block = (threadgroup {{MEMORY_NAME_A}}*)(threadgroup_block);
 auto B_block = (threadgroup {{MEMORY_NAME_B}}*)(threadgroup_block + {{BLOCK_BYTES_A}});
-"#);
+"#,
+        );
 
         // Phase 0: Tile copy (device → threadgroup)
         tile_copy.emit_tile_load(msl, config);
         tile_copy.emit_tile_sync(msl, config);
 
         // Compute threadgroup source pointers for fragment loads
-        msl.block(r#"
+        msl.block(
+            r#"
 ushort2 A_block_offset(morton_offset.x, offset_in_group.y);
 ushort2 B_block_offset(offset_in_group.x, morton_offset.y);
 auto A_block_src = simdgroup_matrix_storage<{{MEMORY_NAME_A}}>::apply_offset(
     A_block, {{LEADING_BLOCK_DIM_A}}, A_block_offset, A_trans);
 auto B_block_src = simdgroup_matrix_storage<{{MEMORY_NAME_B}}>::apply_offset(
     B_block, {{LEADING_BLOCK_DIM_B}}, B_block_offset, B_trans);
-"#);
+"#,
+        );
 
         // Inner K-step loop (8 elements per step within K_group)
         msl.raw("#pragma clang loop unroll(full)");
@@ -288,10 +315,7 @@ auto B_block_src = simdgroup_matrix_storage<{{MEMORY_NAME_B}}>::apply_offset(
         msl.indent();
         {
             // Phase 1: Load A fragments
-            frag_load.emit_load_a(
-                msl, config, "k_inner", "A_block_src",
-                &leading_a, a_trans,
-            );
+            frag_load.emit_load_a(msl, config, "k_inner", "A_block_src", &leading_a, a_trans);
 
             // Phase 1.5: Transform A fragments (FUSION SLOT)
             if !transform.is_identity() {
@@ -300,10 +324,7 @@ auto B_block_src = simdgroup_matrix_storage<{{MEMORY_NAME_B}}>::apply_offset(
             }
 
             // Phase 2: Load B fragments
-            frag_load.emit_load_b(
-                msl, config, "k_inner", "B_block_src",
-                &leading_b, b_trans,
-            );
+            frag_load.emit_load_b(msl, config, "k_inner", "B_block_src", &leading_b, b_trans);
 
             // Phase 3: Multiply C += A × B
             mma.emit_multiply(msl, config);
@@ -318,7 +339,6 @@ auto B_block_src = simdgroup_matrix_storage<{{MEMORY_NAME_B}}>::apply_offset(
     msl.raw("}");
 }
 
-
 fn emit_store_c(msl: &mut MslBuilder, config: &MetalGemmConfig) {
     msl.set("REGISTER_M", config.register_m().to_string());
     msl.set("REGISTER_N", config.register_n().to_string());
@@ -327,7 +347,8 @@ fn emit_store_c(msl: &mut MslBuilder, config: &MetalGemmConfig) {
 
     // Fast path: direct store from registers to device memory.
     // MFA's createStoreC uses this when the tile is fully within bounds.
-    msl.block(r#"
+    msl.block(
+        r#"
 // Store accumulators to device memory (fast path).
 {
     uint2 C_offset(N_offset + offset_in_group.x,
@@ -345,5 +366,6 @@ fn emit_store_c(msl: &mut MslBuilder, config: &MetalGemmConfig) {
         }
     }
 }
-"#);
+"#,
+    );
 }

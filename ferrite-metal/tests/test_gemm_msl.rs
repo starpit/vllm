@@ -1,4 +1,4 @@
-use ferrite_metal::config::{MetalGemmConfig, Precision, GpuGeneration};
+use ferrite_metal::config::{GpuGeneration, MetalGemmConfig, Precision};
 use ferrite_metal::gemm::build_standalone_gemm;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -58,7 +58,10 @@ fn test_block_bytes_f16() {
 
     // B: transposed, leading=32, trailing=blockN=32 (transposed flips), f16=2 → 32*32*2 = 2048
     let b_bytes = c.block_bytes('B');
-    assert_eq!(b_bytes, 2048, "B block bytes for transposed 32×32 f16 with leading=32");
+    assert_eq!(
+        b_bytes, 2048,
+        "B block bytes for transposed 32×32 f16 with leading=32"
+    );
 }
 
 #[test]
@@ -73,7 +76,10 @@ fn test_block_bytes_f16_apple8() {
     // B: transposed, leading = blockK = 32, trailing = blockN = 48
     let b_bytes = c.block_bytes('B');
     // 32 * 48 * 2 = 3072
-    assert_eq!(b_bytes, 3072, "B block bytes for 48×32 f16 transposed auto-leading");
+    assert_eq!(
+        b_bytes, 3072,
+        "B block bytes for 48×32 f16 transposed auto-leading"
+    );
 }
 
 #[test]
@@ -136,11 +142,17 @@ fn test_generates_valid_msl_structure() {
     let msl = build_standalone_gemm(&config);
 
     // Must have include and namespace
-    assert!(msl.contains("#include <metal_stdlib>"), "Missing metal include");
+    assert!(
+        msl.contains("#include <metal_stdlib>"),
+        "Missing metal include"
+    );
     assert!(msl.contains("using namespace metal;"), "Missing namespace");
 
     // Must have kernel declaration
-    assert!(msl.contains("kernel void gemm("), "Missing kernel declaration");
+    assert!(
+        msl.contains("kernel void gemm("),
+        "Missing kernel declaration"
+    );
 
     // Must have buffer bindings
     assert!(msl.contains("[[buffer(0)]]"), "Missing buffer binding 0");
@@ -148,15 +160,24 @@ fn test_generates_valid_msl_structure() {
     assert!(msl.contains("[[buffer(2)]]"), "Missing buffer binding 2");
 
     // Must have simdgroup intrinsics
-    assert!(msl.contains("simdgroup_matrix_storage"), "Missing simdgroup_matrix_storage");
+    assert!(
+        msl.contains("simdgroup_matrix_storage"),
+        "Missing simdgroup_matrix_storage"
+    );
     assert!(msl.contains("morton_order"), "Missing morton_order helper");
     assert!(msl.contains("get_sram"), "Missing get_sram helper");
 
     // Must have K-loop
-    assert!(msl.contains("for (uint k = 0; k < K; k += K_group)"), "Missing K-loop");
+    assert!(
+        msl.contains("for (uint k = 0; k < K; k += K_group)"),
+        "Missing K-loop"
+    );
 
     // Must have threadgroup memory
-    assert!(msl.contains("threadgroup_block"), "Missing threadgroup allocation");
+    assert!(
+        msl.contains("threadgroup_block"),
+        "Missing threadgroup allocation"
+    );
     assert!(msl.contains("threadgroup_barrier"), "Missing barrier");
 
     // Must have accumulator init and store
@@ -168,7 +189,10 @@ fn test_generates_valid_msl_structure() {
 fn test_apple9_uses_async_copy() {
     let config = MetalGemmConfig::default_apple9_f16();
     let msl = build_standalone_gemm(&config);
-    assert!(msl.contains("simdgroup_event"), "apple9 should use async copy");
+    assert!(
+        msl.contains("simdgroup_event"),
+        "apple9 should use async copy"
+    );
     assert!(msl.contains("async_copy"), "apple9 should use async_copy");
 }
 
@@ -177,10 +201,15 @@ fn test_apple8_uses_polyfill_not_hardware_async() {
     let config = MetalGemmConfig::default_apple8_f16();
     let msl = build_standalone_gemm(&config);
     // apple8: polyfill simdgroup_event (loop-based, no AIR intrinsics)
-    assert!(!msl.contains("__asm(\"air.simdgroup_async_copy"),
-        "apple8 should NOT use hardware AIR async copy intrinsics");
+    assert!(
+        !msl.contains("__asm(\"air.simdgroup_async_copy"),
+        "apple8 should NOT use hardware AIR async copy intrinsics"
+    );
     // The polyfill struct `simdgroup_event` is still present but with no-op wait
-    assert!(msl.contains("simdgroup_event"), "Polyfill struct should still be defined");
+    assert!(
+        msl.contains("simdgroup_event"),
+        "Polyfill struct should still be defined"
+    );
 }
 
 #[test]
@@ -188,16 +217,28 @@ fn test_correct_precision_types_in_msl() {
     let config = MetalGemmConfig::default_apple9_f16();
     let msl = build_standalone_gemm(&config);
     assert!(msl.contains("half"), "Should use half for f16 operands");
-    assert!(msl.contains("float"), "Should use float for f32 accumulator");
+    assert!(
+        msl.contains("float"),
+        "Should use float for f32 accumulator"
+    );
 }
 
 #[test]
 fn test_constants_match_config() {
     let config = MetalGemmConfig::default_apple9_f16();
     let msl = build_standalone_gemm(&config);
-    assert!(msl.contains("M_group = 32"), "M_group should be 32 for apple9");
-    assert!(msl.contains("N_group = 32"), "N_group should be 32 for apple9");
-    assert!(msl.contains("K_group = 8"), "K_group should be 8 for apple9");
+    assert!(
+        msl.contains("M_group = 32"),
+        "M_group should be 32 for apple9"
+    );
+    assert!(
+        msl.contains("N_group = 32"),
+        "N_group should be 32 for apple9"
+    );
+    assert!(
+        msl.contains("K_group = 8"),
+        "K_group should be 8 for apple9"
+    );
 }
 
 #[test]
@@ -207,7 +248,11 @@ fn test_msl_output_not_empty() {
         MetalGemmConfig::default_apple9_f16(),
     ] {
         let msl = build_standalone_gemm(&config);
-        assert!(msl.len() > 500, "Generated MSL should be substantial, got {} bytes", msl.len());
+        assert!(
+            msl.len() > 500,
+            "Generated MSL should be substantial, got {} bytes",
+            msl.len()
+        );
     }
 }
 
@@ -217,7 +262,11 @@ fn test_msl_balanced_braces() {
     let msl = build_standalone_gemm(&config);
     let opens = msl.chars().filter(|c| *c == '{').count();
     let closes = msl.chars().filter(|c| *c == '}').count();
-    assert_eq!(opens, closes, "Unbalanced braces: {} opens vs {} closes", opens, closes);
+    assert_eq!(
+        opens, closes,
+        "Unbalanced braces: {} opens vs {} closes",
+        opens, closes
+    );
 }
 
 #[test]
@@ -227,9 +276,16 @@ fn test_no_template_variables_remain() {
         MetalGemmConfig::default_apple8_f16(),
     ] {
         let msl = build_standalone_gemm(&config);
-        assert!(!msl.contains("{{"), "Unreplaced template variable in {} config: {}",
-            if config.prefer_async_load { "apple9" } else { "apple8" },
-            msl.lines().find(|l| l.contains("{{")).unwrap_or("???"));
+        assert!(
+            !msl.contains("{{"),
+            "Unreplaced template variable in {} config: {}",
+            if config.prefer_async_load {
+                "apple9"
+            } else {
+                "apple8"
+            },
+            msl.lines().find(|l| l.contains("{{")).unwrap_or("???")
+        );
     }
 }
 
@@ -297,11 +353,26 @@ fn test_k_loop_has_correct_inner_structure() {
     let kloop_start = msl.find("for (uint k = 0; k < K; k += K_group)").unwrap();
     let kloop_body = &msl[kloop_start..];
 
-    assert!(kloop_body.contains("A_block"), "K-loop must have A_block pointer");
-    assert!(kloop_body.contains("B_block"), "K-loop must have B_block pointer");
-    assert!(kloop_body.contains("apply_offset"), "K-loop must compute block src offsets");
-    assert!(kloop_body.contains("for (ushort k_inner"), "K-loop must have inner k_inner loop");
-    assert!(kloop_body.contains("#pragma clang loop unroll(full)"), "Inner loop must be unrolled");
+    assert!(
+        kloop_body.contains("A_block"),
+        "K-loop must have A_block pointer"
+    );
+    assert!(
+        kloop_body.contains("B_block"),
+        "K-loop must have B_block pointer"
+    );
+    assert!(
+        kloop_body.contains("apply_offset"),
+        "K-loop must compute block src offsets"
+    );
+    assert!(
+        kloop_body.contains("for (ushort k_inner"),
+        "K-loop must have inner k_inner loop"
+    );
+    assert!(
+        kloop_body.contains("#pragma clang loop unroll(full)"),
+        "Inner loop must be unrolled"
+    );
 
     // Fragment loads in correct order within inner loop
     let inner_start = kloop_body.find("for (ushort k_inner").unwrap();
@@ -314,6 +385,56 @@ fn test_k_loop_has_correct_inner_structure() {
 }
 
 #[test]
+fn test_dump_full_msl_apple9() {
+    let config = MetalGemmConfig::default_apple9_f16();
+    let msl = build_standalone_gemm(&config);
+    // Print for manual inspection — run with: cargo test test_dump -- --nocapture
+    eprintln!(
+        "\n=== Generated MSL (apple9 f16, {} bytes) ===\n{}\n=== END ===",
+        msl.len(),
+        msl
+    );
+}
+
+#[test]
+fn test_dump_full_msl_apple8() {
+    let config = MetalGemmConfig::default_apple8_f16();
+    let msl = build_standalone_gemm(&config);
+    eprintln!(
+        "\n=== Generated MSL (apple8 f16, {} bytes) ===\n{}\n=== END ===",
+        msl.len(),
+        msl
+    );
+}
+
+#[test]
+fn test_apple8_msl_compiles_with_xcrun_metal() {
+    // Apple8 (polyfill) path uses no AIR intrinsics and can be validated
+    // by the offline Metal compiler. Apple9 (hardware async) requires runtime
+    // compilation via MTLDevice.makeLibrary() due to __asm declarations.
+    let config = MetalGemmConfig::default_apple8_f16();
+    let msl = build_standalone_gemm(&config);
+
+    let tmp = std::env::temp_dir().join("ferrite_test_apple8.metal");
+    std::fs::write(&tmp, &msl).expect("write temp MSL");
+
+    let output = std::process::Command::new("xcrun")
+        .args(["metal", "-std=metal3.0", "-Werror", "-c"])
+        .arg(&tmp)
+        .arg("-o")
+        .arg("/dev/null")
+        .output()
+        .expect("xcrun metal must be available on macOS");
+
+    std::fs::remove_file(&tmp).ok();
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("Metal shader compilation failed:\n{}", stderr);
+    }
+}
+
+#[test]
 fn test_store_phase_uses_apply_offset() {
     let config = MetalGemmConfig::default_apple9_f16();
     let msl = build_standalone_gemm(&config);
@@ -321,6 +442,12 @@ fn test_store_phase_uses_apply_offset() {
     // Store phase should compute C_dst via apply_offset
     let store_section = msl.rfind("Store accumulators").unwrap();
     let store_body = &msl[store_section..];
-    assert!(store_body.contains("apply_offset"), "Store must use apply_offset for C address");
-    assert!(store_body.contains("C_acc->store"), "Store must call store on accumulators");
+    assert!(
+        store_body.contains("apply_offset"),
+        "Store must use apply_offset for C address"
+    );
+    assert!(
+        store_body.contains("C_acc->store"),
+        "Store must call store on accumulators"
+    );
 }

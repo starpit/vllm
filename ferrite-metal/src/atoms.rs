@@ -15,7 +15,6 @@
 /// For fused norm→GEMM: RmsNormTransform (multiply A by norm_factor × gamma).
 ///
 /// Used at COMPILE TIME by the proc macro. Emits MSL code strings.
-
 use crate::config::MetalGemmConfig;
 use crate::msl_builder::MslBuilder;
 
@@ -30,18 +29,10 @@ use crate::msl_builder::MslBuilder;
 /// apple8: loop-based copy (polyfill)
 pub trait TileCopyAtom {
     /// Emit code to load one A tile and one B tile from device to threadgroup memory.
-    fn emit_tile_load(
-        &self,
-        msl: &mut MslBuilder,
-        config: &MetalGemmConfig,
-    );
+    fn emit_tile_load(&self, msl: &mut MslBuilder, config: &MetalGemmConfig);
 
     /// Emit synchronization after tile loads.
-    fn emit_tile_sync(
-        &self,
-        msl: &mut MslBuilder,
-        config: &MetalGemmConfig,
-    );
+    fn emit_tile_sync(&self, msl: &mut MslBuilder, config: &MetalGemmConfig);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -66,9 +57,9 @@ pub trait FragmentLoadAtom {
         msl: &mut MslBuilder,
         config: &MetalGemmConfig,
         k_var: &str,       // K-step variable name (e.g., "k")
-        src_var: &str,      // Source pointer variable name
-        leading_dim: &str,  // Leading dimension expression
-        trans: bool,        // Whether A is transposed
+        src_var: &str,     // Source pointer variable name
+        leading_dim: &str, // Leading dimension expression
+        trans: bool,       // Whether A is transposed
     );
 
     /// Emit code to load B fragments into B_sram registers.
@@ -106,33 +97,22 @@ pub trait FragmentLoadAtom {
 pub trait TransformAtom {
     /// One-time setup before the K-loop.
     /// Load norm factors, gamma weights, etc. into registers or threadgroup memory.
-    fn emit_prologue(
-        &self,
-        _msl: &mut MslBuilder,
-        _config: &MetalGemmConfig,
-    ) {}
+    fn emit_prologue(&self, _msl: &mut MslBuilder, _config: &MetalGemmConfig) {}
 
     /// Per-K-iteration setup.
     /// Load the gamma slice for this K chunk from threadgroup memory.
-    fn emit_k_setup(
-        &self,
-        _msl: &mut MslBuilder,
-        _config: &MetalGemmConfig,
-        _k_var: &str,
-    ) {}
+    fn emit_k_setup(&self, _msl: &mut MslBuilder, _config: &MetalGemmConfig, _k_var: &str) {}
 
     /// Transform A_sram fragments in-place.
     /// Called once per K-step, AFTER load_a and BEFORE multiply.
     /// `register_m` iterations of 8×8 fragments are in A_sram.
-    fn emit_transform(
-        &self,
-        _msl: &mut MslBuilder,
-        _config: &MetalGemmConfig,
-    ) {}
+    fn emit_transform(&self, _msl: &mut MslBuilder, _config: &MetalGemmConfig) {}
 
     /// Whether this transform is a no-op.
     /// The pipeline can skip emitting the transform call if true.
-    fn is_identity(&self) -> bool { false }
+    fn is_identity(&self) -> bool {
+        false
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -145,11 +125,7 @@ pub trait TransformAtom {
 /// This is the pure compute step — no memory access.
 pub trait MmaAtom {
     /// Emit the multiply loop: for each (m, n) tile pair, C += A × B.
-    fn emit_multiply(
-        &self,
-        msl: &mut MslBuilder,
-        config: &MetalGemmConfig,
-    );
+    fn emit_multiply(&self, msl: &mut MslBuilder, config: &MetalGemmConfig);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -169,14 +145,12 @@ pub trait MmaAtom {
 /// - ResidualAdd: load residual from device, add to accumulators
 pub trait EpilogueAtom {
     /// Transform C_sram accumulators in-place before store.
-    fn emit_epilogue(
-        &self,
-        _msl: &mut MslBuilder,
-        _config: &MetalGemmConfig,
-    ) {}
+    fn emit_epilogue(&self, _msl: &mut MslBuilder, _config: &MetalGemmConfig) {}
 
     /// Whether this epilogue is a no-op (just store).
-    fn is_identity(&self) -> bool { false }
+    fn is_identity(&self) -> bool {
+        false
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -187,14 +161,18 @@ pub trait EpilogueAtom {
 pub struct IdentityTransform;
 
 impl TransformAtom for IdentityTransform {
-    fn is_identity(&self) -> bool { true }
+    fn is_identity(&self) -> bool {
+        true
+    }
 }
 
 /// Identity epilogue — store accumulators directly.
 pub struct IdentityEpilogue;
 
 impl EpilogueAtom for IdentityEpilogue {
-    fn is_identity(&self) -> bool { true }
+    fn is_identity(&self) -> bool {
+        true
+    }
 }
 
 /// Standard simdgroup fragment load from threadgroup memory.
@@ -223,14 +201,16 @@ impl FragmentLoadAtom for ThreadgroupFragmentLoad {
         msl.set("A_LEADING_DIM", leading_dim);
         msl.set("A_TRANS", trans_str);
 
-        msl.block(r#"
+        msl.block(
+            r#"
 #pragma clang loop unroll(full)
 for (ushort m = 0; m < {{REGISTER_M}}; m += 8) {
     ushort2 origin(0, m);
     auto A = get_sram(A_sram, 8, origin);
     A->load({{A_SRC}}, {{A_LEADING_DIM}}, ushort2({{K_VAR}}, m), {{A_TRANS}});
 }
-"#);
+"#,
+        );
     }
 
     fn emit_load_b(
@@ -251,14 +231,16 @@ for (ushort m = 0; m < {{REGISTER_M}}; m += 8) {
         msl.set("B_LEADING_DIM", leading_dim);
         msl.set("B_TRANS", trans_str);
 
-        msl.block(r#"
+        msl.block(
+            r#"
 #pragma clang loop unroll(full)
 for (ushort n = 0; n < {{REGISTER_N}}; n += 8) {
     ushort2 origin(n, 0);
     auto B = get_sram(B_sram, {{REGISTER_N}}, origin);
     B->load({{B_SRC}}, {{B_LEADING_DIM}}, ushort2(n, {{K_VAR}}), {{B_TRANS}});
 }
-"#);
+"#,
+        );
     }
 }
 
@@ -266,18 +248,15 @@ for (ushort n = 0; n < {{REGISTER_N}}; n += 8) {
 pub struct SimdgroupMma;
 
 impl MmaAtom for SimdgroupMma {
-    fn emit_multiply(
-        &self,
-        msl: &mut MslBuilder,
-        config: &MetalGemmConfig,
-    ) {
+    fn emit_multiply(&self, msl: &mut MslBuilder, config: &MetalGemmConfig) {
         let reg_m = config.register_m();
         let reg_n = config.register_n();
 
         msl.set("REGISTER_M", reg_m.to_string());
         msl.set("REGISTER_N", reg_n.to_string());
 
-        msl.block(r#"
+        msl.block(
+            r#"
 #pragma clang loop unroll(full)
 for (ushort m = 0; m < {{REGISTER_M}}; m += 8) {
 #pragma clang loop unroll(full)
@@ -288,7 +267,8 @@ for (ushort m = 0; m < {{REGISTER_M}}; m += 8) {
         C->multiply(*A, *B);
     }
 }
-"#);
+"#,
+        );
     }
 }
 
@@ -299,24 +279,35 @@ for (ushort m = 0; m < {{REGISTER_M}}; m += 8) {
 pub struct AsyncTileCopy;
 
 impl TileCopyAtom for AsyncTileCopy {
-    fn emit_tile_load(
-        &self,
-        msl: &mut MslBuilder,
-        config: &MetalGemmConfig,
-    ) {
+    fn emit_tile_load(&self, msl: &mut MslBuilder, config: &MetalGemmConfig) {
         msl.set("BLOCK_BYTES_A", config.block_bytes('A').to_string());
-        msl.set("LEADING_BLOCK_DIM_A", config.leading_block_dim('A').to_string());
-        msl.set("LEADING_BLOCK_DIM_B", config.leading_block_dim('B').to_string());
+        msl.set(
+            "LEADING_BLOCK_DIM_A",
+            config.leading_block_dim('A').to_string(),
+        );
+        msl.set(
+            "LEADING_BLOCK_DIM_B",
+            config.leading_block_dim('B').to_string(),
+        );
         msl.set("MEMORY_NAME_A", config.memory_precisions.a.msl_name());
         msl.set("MEMORY_NAME_B", config.memory_precisions.b.msl_name());
-        let a_trans = if config.transpose[0] { "A_trans" } else { "false" };
-        let b_trans = if config.transpose[1] { "B_trans" } else { "false" };
+        let a_trans = if config.transpose[0] {
+            "A_trans"
+        } else {
+            "false"
+        };
+        let b_trans = if config.transpose[1] {
+            "B_trans"
+        } else {
+            "false"
+        };
         msl.set("A_TRANS_EXPR", a_trans);
         msl.set("B_TRANS_EXPR", b_trans);
 
-        msl.block(r#"
-auto A_block = (threadgroup {{MEMORY_NAME_A}}*)(threadgroup_block);
-auto B_block = (threadgroup {{MEMORY_NAME_B}}*)(threadgroup_block + {{BLOCK_BYTES_A}});
+        msl.block(
+            r#"
+uint A_leading_dimension = A_trans ? M : K;
+uint B_leading_dimension = B_trans ? K : N;
 
 if (sidx == 0) {
     uint2 A_offset(k, M_offset);
@@ -340,14 +331,11 @@ if (sidx == 0) {
         B_block, B_tile_src, B_src, B_leading_dimension, B_tile_src, {{B_TRANS_EXPR}});
     simdgroup_event::wait(2, events);
 }
-"#);
+"#,
+        );
     }
 
-    fn emit_tile_sync(
-        &self,
-        msl: &mut MslBuilder,
-        _config: &MetalGemmConfig,
-    ) {
+    fn emit_tile_sync(&self, msl: &mut MslBuilder, _config: &MetalGemmConfig) {
         msl.raw("threadgroup_barrier(mem_flags::mem_threadgroup);");
     }
 }
@@ -359,19 +347,11 @@ if (sidx == 0) {
 pub struct DirectTileAccess;
 
 impl TileCopyAtom for DirectTileAccess {
-    fn emit_tile_load(
-        &self,
-        _msl: &mut MslBuilder,
-        _config: &MetalGemmConfig,
-    ) {
+    fn emit_tile_load(&self, _msl: &mut MslBuilder, _config: &MetalGemmConfig) {
         // No-op: data accessed directly from device memory during fragment load.
     }
 
-    fn emit_tile_sync(
-        &self,
-        _msl: &mut MslBuilder,
-        _config: &MetalGemmConfig,
-    ) {
+    fn emit_tile_sync(&self, _msl: &mut MslBuilder, _config: &MetalGemmConfig) {
         // No barrier needed — no threadgroup memory involved.
     }
 }
@@ -398,12 +378,12 @@ mod tests {
     fn test_fragment_load_a_emits_unrolled_loop() {
         let config = MetalGemmConfig::default_apple9_f16();
         let mut msl = MslBuilder::new();
-        ThreadgroupFragmentLoad.emit_load_a(
-            &mut msl, &config, "k", "A_block_src",
-            "32", false,
-        );
+        ThreadgroupFragmentLoad.emit_load_a(&mut msl, &config, "k", "A_block_src", "32", false);
         let s = msl.finish();
-        assert!(s.contains("#pragma clang loop unroll(full)"), "Must unroll A load loop");
+        assert!(
+            s.contains("#pragma clang loop unroll(full)"),
+            "Must unroll A load loop"
+        );
         assert!(s.contains("A->load(A_block_src"), "Must load from A source");
         assert!(s.contains("get_sram(A_sram"), "Must use get_sram helper");
     }
@@ -412,12 +392,12 @@ mod tests {
     fn test_fragment_load_b_emits_unrolled_loop() {
         let config = MetalGemmConfig::default_apple9_f16();
         let mut msl = MslBuilder::new();
-        ThreadgroupFragmentLoad.emit_load_b(
-            &mut msl, &config, "k", "B_block_src",
-            "32", true,
-        );
+        ThreadgroupFragmentLoad.emit_load_b(&mut msl, &config, "k", "B_block_src", "32", true);
         let s = msl.finish();
-        assert!(s.contains("#pragma clang loop unroll(full)"), "Must unroll B load loop");
+        assert!(
+            s.contains("#pragma clang loop unroll(full)"),
+            "Must unroll B load loop"
+        );
         assert!(s.contains("B->load(B_block_src"), "Must load from B source");
         assert!(s.contains("true"), "Must pass transpose flag");
     }
@@ -432,7 +412,10 @@ mod tests {
         assert!(s.contains("get_sram(C_sram"), "Must access C accumulators");
         // Nested unrolled loops
         let unroll_count = s.matches("#pragma clang loop unroll(full)").count();
-        assert_eq!(unroll_count, 2, "Must have 2 unroll pragmas (m and n loops)");
+        assert_eq!(
+            unroll_count, 2,
+            "Must have 2 unroll pragmas (m and n loops)"
+        );
     }
 
     #[test]
@@ -441,9 +424,15 @@ mod tests {
         let mut msl = MslBuilder::new();
         AsyncTileCopy.emit_tile_load(&mut msl, &config);
         let s = msl.finish();
-        assert!(s.contains("simdgroup_event events[2]"), "Must declare 2 events");
+        assert!(
+            s.contains("simdgroup_event events[2]"),
+            "Must declare 2 events"
+        );
         assert!(s.contains("async_copy<"), "Must call async_copy");
-        assert!(s.contains("simdgroup_event::wait(2, events)"), "Must wait for both events");
+        assert!(
+            s.contains("simdgroup_event::wait(2, events)"),
+            "Must wait for both events"
+        );
         assert!(s.contains("if (sidx == 0)"), "Only simdgroup 0 copies");
     }
 
@@ -463,7 +452,11 @@ mod tests {
         DirectTileAccess.emit_tile_load(&mut msl, &config);
         DirectTileAccess.emit_tile_sync(&mut msl, &config);
         let s = msl.finish();
-        assert!(s.trim().is_empty(), "Direct access should emit nothing: '{}'", s);
+        assert!(
+            s.trim().is_empty(),
+            "Direct access should emit nothing: '{}'",
+            s
+        );
     }
 
     #[test]
@@ -471,9 +464,7 @@ mod tests {
         // apple9: register_m = 32, register_n = 32
         let config = MetalGemmConfig::default_apple9_f16();
         let mut msl = MslBuilder::new();
-        ThreadgroupFragmentLoad.emit_load_a(
-            &mut msl, &config, "k", "src", "32", false,
-        );
+        ThreadgroupFragmentLoad.emit_load_a(&mut msl, &config, "k", "src", "32", false);
         let s = msl.finish();
         assert!(s.contains("m < 32"), "Should iterate to register_m=32");
 
@@ -481,11 +472,12 @@ mod tests {
         let mut split_config = config.clone();
         split_config.splits = [2, 2]; // register_m = 16, register_n = 16
         let mut msl2 = MslBuilder::new();
-        ThreadgroupFragmentLoad.emit_load_a(
-            &mut msl2, &split_config, "k", "src", "16", false,
-        );
+        ThreadgroupFragmentLoad.emit_load_a(&mut msl2, &split_config, "k", "src", "16", false);
         let s2 = msl2.finish();
-        assert!(s2.contains("m < 16"), "Should iterate to register_m=16 with splits");
+        assert!(
+            s2.contains("m < 16"),
+            "Should iterate to register_m=16 with splits"
+        );
     }
 
     #[test]
@@ -495,14 +487,10 @@ mod tests {
         let config = MetalGemmConfig::default_apple9_f16();
         let mut msl = MslBuilder::new();
 
-        ThreadgroupFragmentLoad.emit_load_a(
-            &mut msl, &config, "0", "A_src", "32", false,
-        );
+        ThreadgroupFragmentLoad.emit_load_a(&mut msl, &config, "0", "A_src", "32", false);
         // Transform slot (identity = nothing)
         IdentityTransform.emit_transform(&mut msl, &config);
-        ThreadgroupFragmentLoad.emit_load_b(
-            &mut msl, &config, "0", "B_src", "32", true,
-        );
+        ThreadgroupFragmentLoad.emit_load_b(&mut msl, &config, "0", "B_src", "32", true);
         SimdgroupMma.emit_multiply(&mut msl, &config);
 
         let s = msl.finish();

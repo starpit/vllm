@@ -316,10 +316,10 @@ namespace metal
         a.t, b.t, t, typename simdgroup_matrix_storage<T>::storage_type());
     }
 
-    // Apply offset to a pointer.
+    // Apply offset to device pointer.
     template <typename U>
-    METAL_FUNC static U* apply_offset(
-      U *src, uint elements_per_row,
+    METAL_FUNC static device U* apply_offset(
+      device U *src, uint elements_per_row,
       uint2 matrix_origin, bool transpose_matrix = false
     ) {
       if (transpose_matrix) {
@@ -329,6 +329,7 @@ namespace metal
       }
     }
 
+    // Apply offset to threadgroup pointer.
     template <typename U>
     METAL_FUNC static threadgroup U* apply_offset(
       threadgroup U *src, ushort elements_per_row,
@@ -357,17 +358,32 @@ mod tests {
     #[test]
     fn test_hardware_event_header_has_asm_intrinsics() {
         let h = simdgroup_event_header(true);
-        assert!(h.contains("__asm(\"air.simdgroup_async_copy"), "Missing AIR intrinsic");
-        assert!(h.contains("__metal_simdgroup_async_copy_2d"), "Missing 2D copy fn");
-        assert!(h.contains("__metal_wait_simdgroup_events"), "Missing wait fn");
+        assert!(
+            h.contains("__asm(\"air.simdgroup_async_copy"),
+            "Missing AIR intrinsic"
+        );
+        assert!(
+            h.contains("__metal_simdgroup_async_copy_2d"),
+            "Missing 2D copy fn"
+        );
+        assert!(
+            h.contains("__metal_wait_simdgroup_events"),
+            "Missing wait fn"
+        );
         assert!(h.contains("async_copy"), "Missing async_copy method");
     }
 
     #[test]
     fn test_polyfill_event_header_no_asm() {
         let h = simdgroup_event_header(false);
-        assert!(!h.contains("__asm("), "Polyfill should NOT have __asm intrinsics");
-        assert!(h.contains("for (ushort i = tid"), "Polyfill should use loop-based copy");
+        assert!(
+            !h.contains("__asm("),
+            "Polyfill should NOT have __asm intrinsics"
+        );
+        assert!(
+            h.contains("for (ushort i = tid"),
+            "Polyfill should use loop-based copy"
+        );
     }
 
     #[test]
@@ -375,22 +391,42 @@ mod tests {
         let h = simdgroup_matrix_storage_header(false);
         assert!(h.contains("METAL_FUNC void load"), "Missing load method");
         assert!(h.contains("METAL_FUNC void store"), "Missing store method");
-        assert!(h.contains("METAL_FUNC void multiply"), "Missing multiply method");
-        assert!(h.contains("__metal_simdgroup_matrix_8x8_multiply_accumulate"),
-            "Missing actual Metal intrinsic for MMA");
-        assert!(h.contains("thread_elements()"), "Missing thread_elements accessor");
-        assert!(h.contains("apply_offset"), "Missing apply_offset static method");
+        assert!(
+            h.contains("METAL_FUNC void multiply"),
+            "Missing multiply method"
+        );
+        assert!(
+            h.contains("__metal_simdgroup_matrix_8x8_multiply_accumulate"),
+            "Missing actual Metal intrinsic for MMA"
+        );
+        assert!(
+            h.contains("thread_elements()"),
+            "Missing thread_elements accessor"
+        );
+        assert!(
+            h.contains("apply_offset"),
+            "Missing apply_offset static method"
+        );
         assert!(h.contains("vec<T, 64>"), "Storage must be vec<T, 64>");
-        assert!(h.contains("vec<T, 2>*"), "thread_elements must return vec<T, 2>*");
+        assert!(
+            h.contains("vec<T, 2>*"),
+            "thread_elements must return vec<T, 2>*"
+        );
     }
 
     #[test]
     fn test_matrix_storage_handles_transpose() {
         let h = simdgroup_matrix_storage_header(false);
-        assert!(h.contains("transpose_matrix"), "Must handle transpose parameter");
+        assert!(
+            h.contains("transpose_matrix"),
+            "Must handle transpose parameter"
+        );
         // Both device and threadgroup variants
         assert!(h.contains("const device"), "Missing device load variant");
-        assert!(h.contains("const threadgroup"), "Missing threadgroup load variant");
+        assert!(
+            h.contains("const threadgroup"),
+            "Missing threadgroup load variant"
+        );
     }
 
     #[test]
@@ -418,8 +454,17 @@ mod tests {
     #[test]
     fn test_matrix_storage_has_correct_template_types() {
         let h = simdgroup_matrix_storage_header(false);
-        assert!(h.contains("template <typename T>"), "Missing T template parameter");
-        assert!(h.contains("template <typename U>"), "Missing U template parameter for load/store");
-        assert!(h.contains("vec<T, 2>"), "Missing vec<T,2> for thread elements");
+        assert!(
+            h.contains("template <typename T>"),
+            "Missing T template parameter"
+        );
+        assert!(
+            h.contains("template <typename U>"),
+            "Missing U template parameter for load/store"
+        );
+        assert!(
+            h.contains("vec<T, 2>"),
+            "Missing vec<T,2> for thread elements"
+        );
     }
 }

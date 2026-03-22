@@ -146,11 +146,13 @@ for (ushort kt = 0; kt < K_group / 8; kt++) {
     // Epilogue (e.g., SiLU on accumulators)
     epilogue.emit_epilogue(&mut msl, config);
 
-    // Store accumulators to device memory
+    // Store accumulators to device memory (only tiles within bounds)
     msl.block(
         r#"
 for (ushort tm = 0; tm < {{TILES_M}}; tm++) {
+    if (M_offset + tm * 8 >= M) continue;
     for (ushort tn = 0; tn < {{TILES_N}}; tn++) {
+        if (N_offset + tn * 8 >= N) continue;
         simdgroup_store(C_sram[tm][tn], C + (M_offset + tm * 8) * N,
             N, ulong2(N_offset + tn * 8, 0));
     }

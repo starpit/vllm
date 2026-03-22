@@ -66,9 +66,13 @@ impl GemmTest {
             (b.len() * 2) as u64,
             MTLResourceOptions::StorageModeShared,
         );
+        // Buffer must be at least tile-sized: the kernel writes full tiles
+        // even when M < block_m or N < block_n.
+        let c_rows = (m as u64).max(self.config.block_m as u64);
+        let c_cols = (n as u64).max(self.config.block_n as u64);
         let c_buf = self
             .device
-            .new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+            .new_buffer(c_rows * c_cols * 4, MTLResourceOptions::StorageModeShared);
 
         // matrix_offsets: uint4 with (M, N, K, 0)
         let offsets: [u32; 4] = [m, n, k, 0];
@@ -285,6 +289,74 @@ fn test_apple8_config_32x32() {
         err,
         k as f32
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Sub-tile GEMM tests (M or N smaller than one 8×8 simdgroup tile)
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_gemm_4x8_k8() {
+    // M=4 < 8 (one simdgroup tile row)
+    let mut config = MetalGemmConfig::default_apple9_f16();
+    config.prefer_async_load = false;
+    let harness = GemmTest::new(config);
+
+    let m = 4u32;
+    let n = 8;
+    let k = 8;
+    let a = vec![f16::from_f32(1.0); (m * k) as usize];
+    let b = vec![f16::from_f32(1.0); (n * k) as usize];
+
+    let gpu_c = harness.run(m, n, k, &a, &b);
+    let cpu_c = cpu_gemm(m, n, k, &a, &b);
+
+    let err = max_abs_error(&gpu_c, &cpu_c);
+    assert!(
+        err < 0.01,
+        "4×8 k=8: max abs error {}, expected all {}, got row0={:?} row1={:?}",
+        err, k as f32, &gpu_c[..n as usize], &gpu_c[n as usize..2 * n as usize]
+    );
+}
+
+#[test]
+fn test_gemm_8x8_k8() {
+    // Exactly one 8×8 tile
+    let mut config = MetalGemmConfig::default_apple9_f16();
+    config.prefer_async_load = false;
+    let harness = GemmTest::new(config);
+
+    let m = 8u32;
+    let n = 8;
+    let k = 8;
+    let a = vec![f16::from_f32(0.5); (m * k) as usize];
+    let b = vec![f16::from_f32(0.5); (n * k) as usize];
+
+    let gpu_c = harness.run(m, n, k, &a, &b);
+    let cpu_c = cpu_gemm(m, n, k, &a, &b);
+
+    let err = max_abs_error(&gpu_c, &cpu_c);
+    assert!(err < 0.01, "8×8 k=8: max abs error {}", err);
+}
+
+#[test]
+fn test_gemm_16x8_k8() {
+    // M=16, two 8×8 tile rows
+    let mut config = MetalGemmConfig::default_apple9_f16();
+    config.prefer_async_load = false;
+    let harness = GemmTest::new(config);
+
+    let m = 16u32;
+    let n = 8;
+    let k = 8;
+    let a = vec![f16::from_f32(1.0); (m * k) as usize];
+    let b = vec![f16::from_f32(1.0); (n * k) as usize];
+
+    let gpu_c = harness.run(m, n, k, &a, &b);
+    let cpu_c = cpu_gemm(m, n, k, &a, &b);
+
+    let err = max_abs_error(&gpu_c, &cpu_c);
+    assert!(err < 0.01, "16×8 k=8: max abs error {}", err);
 }
 
 // ═══════════════════════════════════════════════════════════════════

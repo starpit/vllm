@@ -1,0 +1,9 @@
+[package]
+name = "ferrite-metal"
+version = "0.1.0"
+edition = "2024"
+description = "Ferrite Metal: megakernel fusion on Apple Silicon via MSL codegen"
+
+[dependencies]
+
+[dev-dependencies]

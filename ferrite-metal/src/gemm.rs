@@ -7,9 +7,9 @@
 /// into a single MSL kernel function. The atoms determine what the kernel does;
 /// the emitter determines the structure (K-loop, barriers, tile addressing).
 
+use crate::atoms::*;
 use crate::config::MetalGemmConfig;
 use crate::msl_builder::MslBuilder;
-use crate::atoms::*;
 
 /// Build a complete GEMM kernel MSL source string.
 ///
@@ -17,10 +17,11 @@ use crate::atoms::*;
 /// atom configuration and gets back an MSL string to embed.
 pub fn build_gemm_msl(
     config: &MetalGemmConfig,
-    copy: &dyn MetalCopyAtom,
-    transform: &dyn MetalTransformAtom,
-    mma: &dyn MetalMmaAtom,
-    epilogue: &dyn MetalEpilogueAtom,
+    tile_copy: &dyn TileCopyAtom,
+    frag_load: &dyn FragmentLoadAtom,
+    transform: &dyn TransformAtom,
+    mma: &dyn MmaAtom,
+    epilogue: &dyn EpilogueAtom,
 ) -> String {
     let mut msl = MslBuilder::new();
 
@@ -33,7 +34,7 @@ pub fn build_gemm_msl(
         emit_thread_setup(&mut msl, config);
         emit_accumulator_init(&mut msl, config);
         transform.emit_prologue(&mut msl, config);
-        emit_k_loop(&mut msl, config, copy, transform, mma);
+        emit_k_loop(&mut msl, config, tile_copy, frag_load, transform, mma);
         epilogue.emit_epilogue(&mut msl, config);
         emit_store_c(&mut msl, config);
     }
@@ -44,18 +45,19 @@ pub fn build_gemm_msl(
 
 /// Convenience: build a standalone GEMM (identity transform, direct store).
 pub fn build_standalone_gemm(config: &MetalGemmConfig) -> String {
-    let copy: Box<dyn MetalCopyAtom> = if config.prefer_async_load {
-        Box::new(AsyncCopyLoader)
+    let copy: Box<dyn TileCopyAtom> = if config.prefer_async_load {
+        Box::new(AsyncTileCopy)
     } else {
-        Box::new(DirectLoader)
+        Box::new(DirectTileAccess)
     };
 
     build_gemm_msl(
         config,
         copy.as_ref(),
+        &ThreadgroupFragmentLoad,
         &IdentityTransform,
         &SimdgroupMma,
-        &StoreEpilogue,
+        &IdentityEpilogue,
     )
 }
 
@@ -158,6 +160,8 @@ fn emit_thread_setup(msl: &mut MslBuilder, config: &MetalGemmConfig) {
     msl.set("REGISTER_N", config.register_n().to_string());
     msl.set("SPLITS_N", config.splits[0].to_string());
     msl.set("THREADGROUP_MEMORY", config.threadgroup_memory().to_string());
+    msl.set("A_TRANS", if config.transpose[0] { "true" } else { "false" });
+    msl.set("B_TRANS", if config.transpose[1] { "true" } else { "false" });
 
     msl.block(r#"
 // Unpack matrix dimensions from constants buffer.
@@ -192,6 +196,12 @@ uint N_edge = N - (N % N_group);
 if ((N_shift != 0) && (gid.x * N_group >= N_edge)) {
     N_offset -= N_shift;
 }
+
+// Transpose flags and leading dimensions.
+constant bool A_trans = {{A_TRANS}};
+constant bool B_trans = {{B_TRANS}};
+uint A_leading_dimension = A_trans ? M : K;
+uint B_leading_dimension = B_trans ? K : N;
 "#);
 }
 
@@ -218,45 +228,96 @@ for (ushort m = 0; m < {{REGISTER_M}}; m += 8) {
 fn emit_k_loop(
     msl: &mut MslBuilder,
     config: &MetalGemmConfig,
-    copy: &dyn MetalCopyAtom,
-    transform: &dyn MetalTransformAtom,
-    mma: &dyn MetalMmaAtom,
+    tile_copy: &dyn TileCopyAtom,
+    frag_load: &dyn FragmentLoadAtom,
+    transform: &dyn TransformAtom,
+    mma: &dyn MmaAtom,
 ) {
-    msl.set("BLOCK_BYTES_A", config.block_bytes('A').to_string());
+    let block_bytes_a = config.block_bytes('A');
+    let leading_a = config.leading_block_dim('A').to_string();
+    let leading_b = config.leading_block_dim('B').to_string();
+    let a_trans = config.transpose[0];
+    let b_trans = config.transpose[1];
+
+    msl.set("BLOCK_BYTES_A", block_bytes_a.to_string());
     msl.set("MEMORY_NAME_A", config.memory_precisions.a.msl_name());
     msl.set("MEMORY_NAME_B", config.memory_precisions.b.msl_name());
+    msl.set("REGISTER_NAME_A", config.register_precisions.a.msl_name());
+    msl.set("REGISTER_NAME_B", config.register_precisions.b.msl_name());
+    msl.set("REGISTER_NAME_C", config.register_precisions.c.msl_name());
+    msl.set("REGISTER_M", config.register_m().to_string());
+    msl.set("REGISTER_N", config.register_n().to_string());
+    msl.set("LEADING_BLOCK_DIM_A", leading_a.clone());
+    msl.set("LEADING_BLOCK_DIM_B", leading_b.clone());
+
+    // Declare fragment arrays before the loop
+    msl.block(r#"
+simdgroup_matrix_storage<{{REGISTER_NAME_A}}> A_sram[
+    ({{REGISTER_M}} / 8) * (K_group / 8)];
+simdgroup_matrix_storage<{{REGISTER_NAME_B}}> B_sram[
+    (K_group / 8) * ({{REGISTER_N}} / 8)];
+"#);
 
     msl.comment("K-loop: iterate over the K dimension in tiles of K_group");
     msl.raw("for (uint k = 0; k < K; k += K_group) {");
     msl.indent();
     {
-        // Tile pointers
+        // Tile pointers for threadgroup memory
         msl.block(r#"
 auto A_block = (threadgroup {{MEMORY_NAME_A}}*)(threadgroup_block);
 auto B_block = (threadgroup {{MEMORY_NAME_B}}*)(threadgroup_block + {{BLOCK_BYTES_A}});
 "#);
 
-        // Load tiles (CopyAtom)
-        copy.emit_tile_load(msl, config);
+        // Phase 0: Tile copy (device → threadgroup)
+        tile_copy.emit_tile_load(msl, config);
+        tile_copy.emit_tile_sync(msl, config);
 
-        // Barrier
-        copy.emit_sync(msl, config);
+        // Compute threadgroup source pointers for fragment loads
+        msl.block(r#"
+ushort2 A_block_offset(morton_offset.x, offset_in_group.y);
+ushort2 B_block_offset(offset_in_group.x, morton_offset.y);
+auto A_block_src = simdgroup_matrix_storage<{{MEMORY_NAME_A}}>::apply_offset(
+    A_block, {{LEADING_BLOCK_DIM_A}}, A_block_offset, A_trans);
+auto B_block_src = simdgroup_matrix_storage<{{MEMORY_NAME_B}}>::apply_offset(
+    B_block, {{LEADING_BLOCK_DIM_B}}, B_block_offset, B_trans);
+"#);
 
-        // Per-K-step transform setup
-        transform.emit_k_setup(msl, config, 0);
+        // Inner K-step loop (8 elements per step within K_group)
+        msl.raw("#pragma clang loop unroll(full)");
+        msl.raw("for (ushort k_inner = 0; k_inner < K_group; k_inner += 8) {");
+        msl.indent();
+        {
+            // Phase 1: Load A fragments
+            frag_load.emit_load_a(
+                msl, config, "k_inner", "A_block_src",
+                &leading_a, a_trans,
+            );
 
-        // Transform A fragments (TransformAtom slot — WHERE FUSION HAPPENS)
-        transform.emit_transform(msl, config);
+            // Phase 1.5: Transform A fragments (FUSION SLOT)
+            if !transform.is_identity() {
+                transform.emit_k_setup(msl, config, "k_inner");
+                transform.emit_transform(msl, config);
+            }
 
-        // Multiply-accumulate (MmaAtom)
-        mma.emit_multiply_accumulate(msl, config);
+            // Phase 2: Load B fragments
+            frag_load.emit_load_b(
+                msl, config, "k_inner", "B_block_src",
+                &leading_b, b_trans,
+            );
 
-        // Final barrier before next iteration
+            // Phase 3: Multiply C += A × B
+            mma.emit_multiply(msl, config);
+        }
+        msl.dedent();
+        msl.raw("}");
+
+        // Barrier before next K-tile load
         msl.raw("threadgroup_barrier(mem_flags::mem_threadgroup);");
     }
     msl.dedent();
     msl.raw("}");
 }
+
 
 fn emit_store_c(msl: &mut MslBuilder, config: &MetalGemmConfig) {
     msl.set("REGISTER_M", config.register_m().to_string());

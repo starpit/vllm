@@ -7,9 +7,16 @@ use crate::{PtxBuilder, Reg};
 // DualMainloopPipeline — dual GEMM K-loop following CUTLASS dual_gemm
 //
 // Shared A fragments, separate B0 (gate) and B1 (up) fragments.
-// Triple-buffered smem: A + B0 + B1 in separate regions.
-// K-loop: load A+B0+B1 → ALL GEMM0 MMAs → ALL GEMM1 MMAs → cp.async → cycle
+// Multi-stage smem: A + B0 + B1 in separate regions.
+// CUTLASS-style instruction interleaving (1 tile per iteration):
+//   Phase 1: ldmatrix B0, B1, A (from current read buffer)
+//   Phase 2: GEMM0 MMA (uses A_saved, B0 fragments)
+//   Phase 3: cp.async next tile + barrier + wait + buffer cycle
+//   Phase 4: GEMM1 MMA (uses A_saved, B1 fragments)
+//   Phase 5: advance global pointers, loop
 // Two accumulator sets: acc0 (gate) and acc1 (up).
+// cp.async is sandwiched between GEMM0 and GEMM1 to overlap
+// memory latency with GEMM1 compute.
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub struct DualMainloopPipeline {
@@ -465,6 +472,15 @@ impl DualMainloopPipeline {
         let p_wrap_w = ptx.regs.alloc_pred();
         let p_loop = ptx.regs.alloc_pred();
 
+        // ═══════════════════════════════════════════════════════════════
+        // Fragment registers: single set with A_saved for reuse
+        //
+        // CUTLASS interleaving: cp.async is placed between GEMM0 and
+        // GEMM1, so that GEMM0 MMA overlaps with the async copy latency.
+        // The a_saved registers hold A fragments for reuse in GEMM1.
+        // B0 and B1 fragments remain live through both GEMMs.
+        // ═══════════════════════════════════════════════════════════════
+
         // Pre-allocate A fragment registers (shared between GEMM0 and GEMM1)
         let mut a_frag = [
             ptx.regs.alloc_b32(),
@@ -498,7 +514,6 @@ impl DualMainloopPipeline {
         }
 
         // Pre-allocate A fragment storage for reuse in GEMM1
-        // After loading A for each (ki, rm), we store the fragments so GEMM1 can reuse them.
         // a_saved[ki][rm] = [Reg; 4]
         let mut a_saved: Vec<Vec<[Reg; 4]>> = Vec::new();
         for _ki in 0..k_warp_iters as usize {
@@ -515,26 +530,29 @@ impl DualMainloopPipeline {
         }
 
         // ═══════════════════════════════════════════════════════════════
-        // K-LOOP
+        // K-LOOP (CUTLASS interleaved pattern)
+        //
+        // Phase 1: advance read stage, wait, ldmatrix B0+B1+A, transform
+        // Phase 2: GEMM0 MMA (A_saved, B0) — 16 MMA
+        // Phase 3: cp.async next tile + advance write + barrier
+        // Phase 4: GEMM1 MMA (A_saved, B1) — 16 MMA
+        // Phase 5: advance global pointers, k_counter, loop
         // ═══════════════════════════════════════════════════════════════
         ptx.label("$L_DUAL_KLOOP");
 
-        // 1. Advance read stage BEFORE wait
+        // Phase 1: advance read stage, wait for tile, ldmatrix
         {
             ptx.add_s32_imm(next_read, read_stage, 1);
             ptx.setp_gt_s32_imm(p_wrap_r, next_read, stages as i32 - 1);
             ptx.selp_b32_imm_reg(read_stage, 0, next_read, p_wrap_r);
         }
 
-        // 2. Wait + barrier
         ptx.cp_async_wait_group(wait_count);
         ptx.bar_sync(0);
 
-        // 3. Compute read buffer base for A region
         ptx.shl_b32(read_off, read_stage, a_tile_bytes.trailing_zeros());
         ptx.add_s32(buf_base, smem_base, read_off);
 
-        // 4. Load gamma BEFORE B (transform k-setup)
         for ki in 0..k_warp_iters as usize {
             transform.emit_k_setup(ptx, ki as u32);
         }
@@ -582,7 +600,7 @@ impl DualMainloopPipeline {
         }
         ptx.blank();
 
-        // ── Phase 2: Load A fragments, transform, save for reuse ──
+        // ── ldmatrix A + transform + save for reuse ──
         for ki in 0..k_warp_iters as usize {
             ptx.comment(&format!("ki={ki}: ldmatrix A + transform"));
             ptx.add_s32(a_addr, buf_base, a_off[ki]);
@@ -596,7 +614,6 @@ impl DualMainloopPipeline {
                 ptx.ldmatrix_x4(a_frag, a_addr, a_rm_off);
                 transform.emit_transform(ptx, &mut a_frag, ki as u32, rm as u32);
 
-                // Save A fragments for reuse in GEMM0 zigzag and GEMM1
                 for j in 0..4 {
                     ptx.mov_b32(a_saved[ki][rm][j], a_frag[j]);
                 }
@@ -604,20 +621,18 @@ impl DualMainloopPipeline {
             ptx.blank();
         }
 
-        // ── GEMM0 MMAs: zigzag traversal over B0 columns (CUTLASS pattern) ──
+        // ── Phase 2: GEMM0 MMAs (zigzag traversal) ──
         ptx.comment("GEMM0 MMAs with zigzag B-column traversal");
         for ki in 0..k_warp_iters as usize {
             for rn in 0..reg_n as usize {
                 let b_sel = [b0_frags[rn][ki * 2], b0_frags[rn][ki * 2 + 1]];
                 if rn % 2 == 0 {
-                    // Forward: rows 0,1,2,...
                     for rm in 0..reg_m as usize {
                         let ai = rm * reg_n as usize + rn;
                         let mut acc_tile = acc0.regs[ai];
                         mma.emit_mma(ptx, a_saved[ki][rm], b_sel, &mut acc_tile);
                     }
                 } else {
-                    // Reverse: rows reg_m-1,...,1,0
                     for rm in (0..reg_m as usize).rev() {
                         let ai = rm * reg_n as usize + rn;
                         let mut acc_tile = acc0.regs[ai];
@@ -628,37 +643,11 @@ impl DualMainloopPipeline {
         }
         ptx.blank();
 
-        // ── GEMM1 MMAs: zigzag traversal over B1 columns, reusing saved A ──
-        ptx.comment("GEMM1 MMAs using saved A fragments");
-        for ki in 0..k_warp_iters as usize {
-            for rn in 0..reg_n as usize {
-                let b_sel = [b1_frags[rn][ki * 2], b1_frags[rn][ki * 2 + 1]];
-                if rn % 2 == 0 {
-                    // Forward: rows 0,1,2,...
-                    for rm in 0..reg_m as usize {
-                        let ai = rm * reg_n as usize + rn;
-                        let mut acc_tile = acc1.regs[ai];
-                        mma.emit_mma(ptx, a_saved[ki][rm], b_sel, &mut acc_tile);
-                    }
-                } else {
-                    // Reverse: rows reg_m-1,...,1,0
-                    for rm in (0..reg_m as usize).rev() {
-                        let ai = rm * reg_n as usize + rn;
-                        let mut acc_tile = acc1.regs[ai];
-                        mma.emit_mma(ptx, a_saved[ki][rm], b_sel, &mut acc_tile);
-                    }
-                }
-            }
-        }
-        ptx.blank();
-
-        // ── Predicated loads for next tile ──
+        // ── Phase 3: cp.async next tile (between GEMM0 and GEMM1) ──
+        ptx.comment("cp.async next tile (interleaved between GEMM0 and GEMM1)");
         ptx.setp_lt_s32(p_load, k_counter, k_minus_stages_bk);
-
-        ptx.comment("Predicated loads for next tile (A + B0 + B1)");
         ptx.selp_b32(cp_size, 16, 0, p_load);
 
-        // Compute write buffer base
         ptx.shl_b32(write_off, write_stage, a_tile_bytes.trailing_zeros());
         ptx.add_s32(write_buf_base, smem_base, write_off);
 
@@ -694,13 +683,35 @@ impl DualMainloopPipeline {
         copy_b1.emit_commit(ptx);
         ptx.blank();
 
-        // ── Advance circular buffer stage indices ──
+        // Advance write buffer stage index
         ptx.comment("Advance write buffer stage index");
         ptx.add_s32_imm(next_write, write_stage, 1);
         ptx.setp_gt_s32_imm(p_wrap_w, next_write, stages as i32 - 1);
         ptx.selp_b32_imm_reg(write_stage, 0, next_write, p_wrap_w);
 
-        // ── Advance loop state ──
+        // ── Phase 4: GEMM1 MMAs (zigzag, reusing saved A) ──
+        ptx.comment("GEMM1 MMAs using saved A fragments");
+        for ki in 0..k_warp_iters as usize {
+            for rn in 0..reg_n as usize {
+                let b_sel = [b1_frags[rn][ki * 2], b1_frags[rn][ki * 2 + 1]];
+                if rn % 2 == 0 {
+                    for rm in 0..reg_m as usize {
+                        let ai = rm * reg_n as usize + rn;
+                        let mut acc_tile = acc1.regs[ai];
+                        mma.emit_mma(ptx, a_saved[ki][rm], b_sel, &mut acc_tile);
+                    }
+                } else {
+                    for rm in (0..reg_m as usize).rev() {
+                        let ai = rm * reg_n as usize + rn;
+                        let mut acc_tile = acc1.regs[ai];
+                        mma.emit_mma(ptx, a_saved[ki][rm], b_sel, &mut acc_tile);
+                    }
+                }
+            }
+        }
+        ptx.blank();
+
+        // ── Phase 5: Advance loop state ──
         ptx.comment("Advance loop state");
         ptx.add_s32_imm(k_counter, k_counter, c.bk as i32);
         for g in &ga_loop {
@@ -974,15 +985,9 @@ mod tests {
         //   B0 ldmatrix.trans: REG_N=2 * b_ld_groups=1 = 2
         //   B1 ldmatrix.trans: REG_N=2 * b_ld_groups=1 = 2
         //   Total ldmatrix: 8 + 2 + 2 = 12
-        let ldm_count = kloop
-            .matches("ldmatrix.sync.aligned.m8n8.x4")
-            .count();
-
-        // A: non-transposed ldmatrix
         let ldm_a = kloop
             .matches("ldmatrix.sync.aligned.m8n8.x4.shared.b16")
             .count();
-        // B: transposed ldmatrix
         let ldm_b = kloop
             .matches("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16")
             .count();
@@ -999,15 +1004,6 @@ mod tests {
             ldm_b, expected_b,
             "Expected {} B ldmatrix.trans calls (B0+B1), got {}",
             expected_b, ldm_b
-        );
-        assert_eq!(
-            ldm_count,
-            expected_a + expected_b,
-            "Total ldmatrix must be {} (A={} + B0+B1={}), got {}",
-            expected_a + expected_b,
-            expected_a,
-            expected_b,
-            ldm_count
         );
     }
 
@@ -1095,17 +1091,27 @@ mod tests {
             .expect("K0 fallthrough");
         let kloop = &ptx[kloop_start..kloop_end];
 
-        // The "GEMM1 MMAs using saved A fragments" comment should appear AFTER ldmatrix A
-        let gemm1_comment = kloop
+        // GEMM0 comment should appear before GEMM1 comment
+        let gemm0_pos = kloop
+            .find("GEMM0 MMAs with zigzag B-column traversal")
+            .expect("GEMM0 comment");
+        let gemm1_pos = kloop
             .find("GEMM1 MMAs using saved A fragments")
             .expect("GEMM1 comment");
-        let first_ldmatrix_a = kloop
-            .find("ldmatrix.sync.aligned.m8n8.x4.shared.b16")
-            .expect("first ldmatrix A");
 
         assert!(
-            gemm1_comment > first_ldmatrix_a,
-            "GEMM1 MMAs must come after A fragment loads (GEMM0 MMAs)"
+            gemm0_pos < gemm1_pos,
+            "GEMM0 MMAs must come before GEMM1 MMAs in the K-loop"
+        );
+
+        // cp.async should be between GEMM0 and GEMM1
+        let cpasync_pos = kloop
+            .find("cp.async next tile (interleaved between GEMM0 and GEMM1)")
+            .expect("cp.async interleaved comment");
+
+        assert!(
+            cpasync_pos > gemm0_pos && cpasync_pos < gemm1_pos,
+            "cp.async must be interleaved between GEMM0 and GEMM1"
         );
     }
 

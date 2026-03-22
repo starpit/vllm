@@ -1105,23 +1105,9 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
         ptx.blank();
     }
 
-    // ── GEMM1 MMAs using saved A fragments (zigzag) ──
-    ptx.comment("GEMM1 MMAs using saved A fragments (zigzag)");
-    for ki in 0..k_warp_iters as usize {
-        for rm in 0..reg_m as usize {
-            let saved = a_saved[ki][rm];
-            for rn in 0..reg_n as usize {
-                let ai = rm * reg_n as usize + rn;
-                let b_sel = [b1_frags[rn][ki * 2], b1_frags[rn][ki * 2 + 1]];
-                ptx.mma_m16n8k16_f16(acc1_regs[ai], saved, b_sel, acc1_regs[ai]);
-            }
-        }
-    }
-    ptx.blank();
-
-    // ── Predicated loads for next tile ──
+    // ── cp.async for next tile (interleaved between GEMM0 and GEMM1) ──
     ptx.setp_lt_s32(p_load, k_counter, k_minus_stages_bk);
-    ptx.comment("Predicated loads for next tile (A + B0 + B1)");
+    ptx.comment("cp.async next tile (interleaved between GEMM0 and GEMM1)");
     ptx.selp_b32(cp_size, 16, 0, p_load);
 
     // Compute write buffer base
@@ -1158,6 +1144,20 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
         ptx.cp_async_cg(b1_dst_regs[i], 0, gb1_loop[i], 0, cp_size);
     }
     ptx.cp_async_commit();
+    ptx.blank();
+
+    // ── GEMM1 MMAs using saved A fragments (zigzag) ──
+    ptx.comment("GEMM1 MMAs using saved A fragments (zigzag)");
+    for ki in 0..k_warp_iters as usize {
+        for rm in 0..reg_m as usize {
+            let saved = a_saved[ki][rm];
+            for rn in 0..reg_n as usize {
+                let ai = rm * reg_n as usize + rn;
+                let b_sel = [b1_frags[rn][ki * 2], b1_frags[rn][ki * 2 + 1]];
+                ptx.mma_m16n8k16_f16(acc1_regs[ai], saved, b_sel, acc1_regs[ai]);
+            }
+        }
+    }
     ptx.blank();
 
     // ── Advance buffer indices ──

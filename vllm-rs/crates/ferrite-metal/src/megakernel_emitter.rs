@@ -128,6 +128,10 @@ uint d_ffn = {{D_FFN}};
 uint total_elems = seq_len * d_model;
 uint ffn_elems = seq_len * d_ffn;
 uint num_tg = {{NUM_TG}};
+
+// Shared threadgroup memory for tiled GEMM (8×8 tiles)
+threadgroup {{MEM_TYPE}} gemm_A_smem[64];
+threadgroup {{MEM_TYPE}} gemm_B_smem[64];
 "#,
     );
 
@@ -199,29 +203,29 @@ auto sync_phase = [&](uint expected_count) {
     // ═══════════════════════════════════════════════════════════════
     // Phase 3: GEMM Q,K,V = h_f16 @ W{q,k,v}
     // ═══════════════════════════════════════════════════════════════
-    // For simplicity with single threadgroup: naive GEMM per element
-    msl.comment("Phase 3: GEMM Q, K, V (naive for single-TG)");
-    msl.block(
-        r#"
-{
-    device {{MEM_TYPE}} *weights[3] = {Wq, Wk, Wv};
-    for (uint w = 0; w < 3; w++) {
-        device float *dst = qkv + w * total_elems;
-        device {{MEM_TYPE}} *W = weights[w];
-        // C = A @ B^T where A=[seq_len, d_model], B=[d_model, d_model]
-        for (uint idx = gid * {{THREADS_PER_TG}} + tid_in_tg; idx < total_elems;
-             idx += num_tg * {{THREADS_PER_TG}}) {
-            uint row = idx / d_model;
-            uint col = idx % d_model;
-            float sum = 0.0;
-            for (uint k = 0; k < d_model; k++) {
-                sum += float(h_f16[row * d_model + k]) * float(W[col * d_model + k]);
-            }
-            dst[idx] = sum;
-        }
-    }
-}
-"#,
+    msl.comment("Phase 3: GEMM Q, K, V (tiled simdgroup MMA)");
+    emit_tiled_gemm(
+        &mut msl, "h_f16", "Wq", "qkv", "seq_len", "d_model", "d_model",
+    );
+    msl.raw("threadgroup_barrier(mem_flags::mem_device);");
+    emit_tiled_gemm(
+        &mut msl,
+        "h_f16",
+        "Wk",
+        "qkv + total_elems",
+        "seq_len",
+        "d_model",
+        "d_model",
+    );
+    msl.raw("threadgroup_barrier(mem_flags::mem_device);");
+    emit_tiled_gemm(
+        &mut msl,
+        "h_f16",
+        "Wv",
+        "qkv + 2 * total_elems",
+        "seq_len",
+        "d_model",
+        "d_model",
     );
 
     emit_phase_sync(&mut msl, config, 3);
@@ -312,22 +316,9 @@ auto sync_phase = [&](uint expected_count) {
     // ═══════════════════════════════════════════════════════════════
     // Phase 7: GEMM O = attn_f16 @ Wo
     // ═══════════════════════════════════════════════════════════════
-    msl.comment("Phase 7: GEMM output projection (naive)");
-    msl.block(
-        r#"
-{
-    for (uint idx = gid * {{THREADS_PER_TG}} + tid_in_tg; idx < total_elems;
-         idx += num_tg * {{THREADS_PER_TG}}) {
-        uint row = idx / d_model;
-        uint col = idx % d_model;
-        float sum = 0.0;
-        for (uint k = 0; k < d_model; k++) {
-            sum += float(attn_f16[row * d_model + k]) * float(Wo[col * d_model + k]);
-        }
-        o[idx] = sum;
-    }
-}
-"#,
+    msl.comment("Phase 7: GEMM output projection (tiled simdgroup MMA)");
+    emit_tiled_gemm(
+        &mut msl, "attn_f16", "Wo", "o", "seq_len", "d_model", "d_model",
     );
 
     emit_phase_sync(&mut msl, config, 7);
@@ -381,43 +372,36 @@ auto sync_phase = [&](uint expected_count) {
     // ═══════════════════════════════════════════════════════════════
     // Phase 10: Convert h_ffn f32 → f16, then GEMM gate and up
     // ═══════════════════════════════════════════════════════════════
-    msl.comment("Phase 10: Convert + GEMM gate, up");
+    msl.comment("Phase 10: Convert + GEMM gate, up (tiled simdgroup MMA)");
     msl.block(
         r#"
 {
-    // Convert h_ffn to f16
     for (uint i = gid * {{THREADS_PER_TG}} + tid_in_tg; i < total_elems;
          i += num_tg * {{THREADS_PER_TG}}) {
         h_ffn_f16[i] = {{MEM_TYPE}}(h_ffn[i]);
     }
-    threadgroup_barrier(mem_flags::mem_device);
-
-    // GEMM gate = h_ffn_f16 @ W_gate^T  [seq_len, d_model] × [d_ffn, d_model]^T → [seq_len, d_ffn]
-    for (uint idx = gid * {{THREADS_PER_TG}} + tid_in_tg; idx < ffn_elems;
-         idx += num_tg * {{THREADS_PER_TG}}) {
-        uint row = idx / d_ffn;
-        uint col = idx % d_ffn;
-        float sum = 0.0;
-        for (uint k = 0; k < d_model; k++) {
-            sum += float(h_ffn_f16[row * d_model + k]) * float(W_gate[col * d_model + k]);
-        }
-        gate_out[idx] = sum;
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-
-    // GEMM up = h_ffn_f16 @ W_up^T  [seq_len, d_model] × [d_ffn, d_model]^T → [seq_len, d_ffn]
-    for (uint idx = gid * {{THREADS_PER_TG}} + tid_in_tg; idx < ffn_elems;
-         idx += num_tg * {{THREADS_PER_TG}}) {
-        uint row = idx / d_ffn;
-        uint col = idx % d_ffn;
-        float sum = 0.0;
-        for (uint k = 0; k < d_model; k++) {
-            sum += float(h_ffn_f16[row * d_model + k]) * float(W_up[col * d_model + k]);
-        }
-        up_out[idx] = sum;
-    }
 }
+threadgroup_barrier(mem_flags::mem_device);
 "#,
+    );
+    emit_tiled_gemm(
+        &mut msl,
+        "h_ffn_f16",
+        "W_gate",
+        "gate_out",
+        "seq_len",
+        "d_ffn",
+        "d_model",
+    );
+    msl.raw("threadgroup_barrier(mem_flags::mem_device);");
+    emit_tiled_gemm(
+        &mut msl,
+        "h_ffn_f16",
+        "W_up",
+        "up_out",
+        "seq_len",
+        "d_ffn",
+        "d_model",
     );
 
     emit_phase_sync(&mut msl, config, 10);
@@ -444,22 +428,9 @@ auto sync_phase = [&](uint expected_count) {
     // ═══════════════════════════════════════════════════════════════
     // Phase 12: GEMM down = ffn_act @ W_down^T  [seq_len, d_ffn] × [d_model, d_ffn]^T → [seq_len, d_model]
     // ═══════════════════════════════════════════════════════════════
-    msl.comment("Phase 12: GEMM down projection");
-    msl.block(
-        r#"
-{
-    for (uint idx = gid * {{THREADS_PER_TG}} + tid_in_tg; idx < total_elems;
-         idx += num_tg * {{THREADS_PER_TG}}) {
-        uint row = idx / d_model;
-        uint col = idx % d_model;
-        float sum = 0.0;
-        for (uint k = 0; k < d_ffn; k++) {
-            sum += float(ffn_act[row * d_ffn + k]) * float(W_down[col * d_ffn + k]);
-        }
-        down_out[idx] = sum;
-    }
-}
-"#,
+    msl.comment("Phase 12: GEMM down projection (tiled simdgroup MMA)");
+    emit_tiled_gemm(
+        &mut msl, "ffn_act", "W_down", "down_out", "seq_len", "d_model", "d_ffn",
     );
 
     emit_phase_sync(&mut msl, config, 12);
@@ -481,6 +452,93 @@ auto sync_phase = [&](uint expected_count) {
 
     msl.close_brace();
     msl.finish()
+}
+
+/// Emit an inline tiled GEMM: C[M,N] = A[M,K] @ W[N,K]^T
+/// Uses simdgroup MMA with 8×8 tiles. A_smem/B_smem are threadgroup memory
+/// declared in the kernel. Iterates over output tiles sequentially (for single-TG).
+fn emit_tiled_gemm(
+    msl: &mut MslBuilder,
+    a_ptr: &str,
+    w_ptr: &str,
+    c_ptr: &str,
+    m_dim: &str,
+    n_dim: &str,
+    k_dim: &str,
+) {
+    msl.raw("{");
+    msl.indent();
+    msl.raw(&format!("uint _gm_tiles_m = ({m} + 7) / 8;", m = m_dim));
+    msl.raw(&format!("uint _gm_tiles_n = ({n} + 7) / 8;", n = n_dim));
+    msl.raw("uint _gm_total_tiles = _gm_tiles_m * _gm_tiles_n;");
+    msl.raw("for (uint _gm_tid = gid; _gm_tid < _gm_total_tiles; _gm_tid += num_tg) {");
+    msl.indent();
+    msl.raw("uint _gm_tm = _gm_tid / _gm_tiles_n;");
+    msl.raw("uint _gm_tn = _gm_tid % _gm_tiles_n;");
+    msl.raw("uint _gm_M_off = _gm_tm * 8;");
+    msl.raw("uint _gm_N_off = _gm_tn * 8;");
+    msl.raw("simdgroup_matrix<float, 8> _gm_C_acc = make_filled_simdgroup_matrix<float, 8>(0);");
+    msl.raw(&format!(
+        "for (uint _gm_k = 0; _gm_k < {k}; _gm_k += 8) {{",
+        k = k_dim
+    ));
+    msl.indent();
+    // Load A tile
+    msl.raw("for (ushort _i = tid_in_tg; _i < 64; _i += 32) {");
+    msl.indent();
+    msl.raw("ushort _r = _i / 8, _c = _i % 8;");
+    msl.raw(&format!(
+        "bool _v = (_gm_M_off + _r < {m}) && (_gm_k + _c < {k});",
+        m = m_dim,
+        k = k_dim
+    ));
+    msl.raw(&format!(
+        "gemm_A_smem[_i] = _v ? {a}[(_gm_M_off + _r) * {k} + (_gm_k + _c)] : half(0);",
+        a = a_ptr,
+        k = k_dim
+    ));
+    msl.dedent();
+    msl.raw("}");
+    // Load B tile (W^T: B[k,n] = W[n,k])
+    msl.raw("for (ushort _i = tid_in_tg; _i < 64; _i += 32) {");
+    msl.indent();
+    msl.raw("ushort _r = _i / 8, _c = _i % 8;");
+    msl.raw(&format!(
+        "bool _v = (_gm_k + _r < {k}) && (_gm_N_off + _c < {n});",
+        k = k_dim,
+        n = n_dim
+    ));
+    msl.raw(&format!(
+        "gemm_B_smem[_i] = _v ? {w}[(_gm_N_off + _c) * {k} + (_gm_k + _r)] : half(0);",
+        w = w_ptr,
+        k = k_dim
+    ));
+    msl.dedent();
+    msl.raw("}");
+    msl.raw("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    // MMA
+    msl.raw("simdgroup_matrix<half, 8> _gm_A, _gm_B;");
+    msl.raw("simdgroup_load(_gm_A, gemm_A_smem, 8, ulong2(0, 0));");
+    msl.raw("simdgroup_load(_gm_B, gemm_B_smem, 8, ulong2(0, 0));");
+    msl.raw("simdgroup_multiply_accumulate(_gm_C_acc, _gm_A, _gm_B, _gm_C_acc);");
+    msl.raw("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    msl.dedent();
+    msl.raw("}"); // K loop
+    // Store with bounds check
+    msl.raw(&format!(
+        "if (_gm_M_off < {m} && _gm_N_off < {n})",
+        m = m_dim,
+        n = n_dim
+    ));
+    msl.raw(&format!(
+        "    simdgroup_store(_gm_C_acc, {c} + _gm_M_off * {n}, {n}, ulong2(_gm_N_off, 0));",
+        c = c_ptr,
+        n = n_dim
+    ));
+    msl.dedent();
+    msl.raw("}"); // tile loop
+    msl.dedent();
+    msl.raw("}");
 }
 
 fn emit_phase_sync(msl: &mut MslBuilder, config: &MegakernelConfig, phase: u32) {

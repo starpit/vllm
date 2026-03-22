@@ -43,21 +43,222 @@ pub fn build_gemm_msl(
 }
 
 /// Convenience: build a standalone GEMM (identity transform, direct store).
+///
+/// Uses Metal 4 native simdgroup_matrix API (simdgroup_load/store/multiply_accumulate).
+/// No custom headers needed — just #include <metal_stdlib>.
 pub fn build_standalone_gemm(config: &MetalGemmConfig) -> String {
-    let copy: Box<dyn TileCopyAtom> = if config.prefer_async_load {
-        Box::new(AsyncTileCopy)
-    } else {
-        Box::new(DirectTileAccess)
-    };
+    let mut msl = MslBuilder::new();
 
-    build_gemm_msl(
-        config,
-        copy.as_ref(),
-        &ThreadgroupFragmentLoad,
-        &IdentityTransform,
-        &SimdgroupMma,
-        &IdentityEpilogue,
-    )
+    msl.raw("#include <metal_stdlib>");
+    msl.raw("using namespace metal;");
+    msl.blank();
+
+    // Constants
+    msl.set("BLOCK_M", config.block_m.to_string());
+    msl.set("BLOCK_N", config.block_n.to_string());
+    msl.set("BLOCK_K", config.block_k.to_string());
+    msl.set("REGISTER_M", config.register_m().to_string());
+    msl.set("REGISTER_N", config.register_n().to_string());
+    msl.set("MEMORY_NAME_A", config.memory_precisions.a.msl_name());
+    msl.set("MEMORY_NAME_B", config.memory_precisions.b.msl_name());
+    msl.set("MEMORY_NAME_C", config.memory_precisions.c.msl_name());
+    msl.set("REGISTER_NAME_C", config.register_precisions.c.msl_name());
+    msl.set("THREADGROUP_SIZE", config.threadgroup_size().to_string());
+    msl.set(
+        "THREADGROUP_MEMORY",
+        config.threadgroup_memory().to_string(),
+    );
+    msl.set("BLOCK_BYTES_A", config.block_bytes('A').to_string());
+    msl.set(
+        "A_TRANS",
+        if config.transpose[0] { "true" } else { "false" },
+    );
+    msl.set(
+        "B_TRANS",
+        if config.transpose[1] { "true" } else { "false" },
+    );
+
+    msl.block(
+        r#"
+constant uint M_group = {{BLOCK_M}};
+constant uint N_group = {{BLOCK_N}};
+constant uint K_group = {{BLOCK_K}};
+"#,
+    );
+
+    // Kernel signature
+    msl.block(
+        r#"
+kernel void gemm(
+    device {{MEMORY_NAME_A}} *A [[buffer(0)]],
+    device {{MEMORY_NAME_B}} *B [[buffer(1)]],
+    device {{MEMORY_NAME_C}} *C [[buffer(2)]],
+    constant uint4 *matrix_offsets [[buffer(10)]],
+    uint3 gid [[threadgroup_position_in_grid]],
+    ushort sidx [[simdgroup_index_in_threadgroup]],
+    ushort lane_id [[thread_index_in_simdgroup]]
+)
+"#,
+    );
+    msl.open_brace();
+
+    // Thread setup
+    msl.block(
+        r#"
+uint M = matrix_offsets[0][0];
+uint N = matrix_offsets[0][1];
+uint K = matrix_offsets[0][2];
+
+threadgroup uchar threadgroup_block[{{THREADGROUP_MEMORY}}];
+
+uint M_offset = gid.y * M_group;
+uint N_offset = gid.x * N_group;
+if (M_offset >= M || N_offset >= N) return;
+
+bool A_trans = {{A_TRANS}};
+bool B_trans = {{B_TRANS}};
+"#,
+    );
+
+    // Accumulators — native simdgroup_matrix types
+    let tiles_m = config.register_m() / 8;
+    let tiles_n = config.register_n() / 8;
+    msl.set("TILES_M", tiles_m.to_string());
+    msl.set("TILES_N", tiles_n.to_string());
+    let k_tiles = config.block_k / 8;
+    msl.set("K_TILES", k_tiles.to_string());
+
+    msl.block(
+        r#"
+// Accumulators: TILES_M × TILES_N output tiles of 8×8 each.
+simdgroup_matrix<{{REGISTER_NAME_C}}, 8> C_sram[{{TILES_M}}][{{TILES_N}}];
+for (ushort tm = 0; tm < {{TILES_M}}; tm++) {
+    for (ushort tn = 0; tn < {{TILES_N}}; tn++) {
+        C_sram[tm][tn] = make_filled_simdgroup_matrix<{{REGISTER_NAME_C}}, 8>(0);
+    }
+}
+"#,
+    );
+
+    // K-loop
+    msl.block(
+        r#"
+for (uint k = 0; k < K; k += K_group) {
+    // Copy tiles: device → threadgroup (all threads cooperate)
+    auto A_block = (threadgroup {{MEMORY_NAME_A}}*)(threadgroup_block);
+    auto B_block = (threadgroup {{MEMORY_NAME_B}}*)(threadgroup_block + {{BLOCK_BYTES_A}});
+"#,
+    );
+    msl.indent();
+
+    // Tile copy (loop-based, zero-fill padding)
+    let a_lead = config.leading_block_dim('A');
+    let b_lead = config.leading_block_dim('B');
+    let a_rows = if config.transpose[0] {
+        config.block_k
+    } else {
+        config.block_m
+    };
+    let b_rows = if config.transpose[1] {
+        config.block_k
+    } else {
+        config.block_n
+    };
+    msl.set("A_LEAD", a_lead.to_string());
+    msl.set("B_LEAD", b_lead.to_string());
+    msl.set("A_TG_TOTAL", (a_rows as u32 * a_lead as u32).to_string());
+    msl.set("A_TG_COLS", a_lead.to_string());
+    msl.set("B_TG_TOTAL", (b_rows as u32 * b_lead as u32).to_string());
+    msl.set("B_TG_COLS", b_lead.to_string());
+
+    msl.block(r#"
+{
+    ushort tid = sidx * 32 + lane_id;
+    uint A_lead_dim = A_trans ? M : K;
+    uint B_lead_dim = B_trans ? K : N;
+    ushort M_tile = min(uint(M_group), M - M_offset);
+    ushort N_tile = min(uint(N_group), N - N_offset);
+    ushort K_tile = min(uint(K_group), K - k);
+
+    for (ushort i = tid; i < {{A_TG_TOTAL}}; i += {{THREADGROUP_SIZE}}) {
+        ushort row = i / {{A_TG_COLS}};
+        ushort col = i % {{A_TG_COLS}};
+        bool valid = A_trans ? (row < K_tile && col < M_tile) : (row < M_tile && col < K_tile);
+        if (valid) {
+            // A_trans: tg[k_local, m_local], device A[m, k] → A[(M_offset+col)*A_lead_dim + (k+row)]
+            // !A_trans: tg[m_local, k_local], device A[m, k] → A[(M_offset+row)*A_lead_dim + (k+col)]
+            uint idx = A_trans
+                ? (M_offset + col) * A_lead_dim + (k + row)
+                : (M_offset + row) * A_lead_dim + (k + col);
+            A_block[i] = A[idx];
+        } else {
+            A_block[i] = 0;
+        }
+    }
+
+    for (ushort i = tid; i < {{B_TG_TOTAL}}; i += {{THREADGROUP_SIZE}}) {
+        ushort row = i / {{B_TG_COLS}};
+        ushort col = i % {{B_TG_COLS}};
+        bool valid = B_trans ? (row < K_tile && col < N_tile) : (row < N_tile && col < K_tile);
+        if (valid) {
+            // B_trans: tg[k_local, n_local], device B[n, k] → B[(N_offset+col)*B_lead_dim + (k+row)]
+            // !B_trans: tg[n_local, k_local], device B[n, k] → B[(N_offset+row)*B_lead_dim + (k+col)]
+            uint idx = B_trans
+                ? (N_offset + col) * B_lead_dim + (k + row)
+                : (N_offset + row) * B_lead_dim + (k + col);
+            B_block[i] = B[idx];
+        } else {
+            B_block[i] = 0;
+        }
+    }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+"#);
+
+    // Fragment load + multiply (using native simdgroup_load)
+    msl.block(
+        r#"
+// Inner K-step loop: load fragments and multiply-accumulate.
+for (ushort kt = 0; kt < K_group / 8; kt++) {
+    for (ushort tm = 0; tm < {{TILES_M}}; tm++) {
+        for (ushort tn = 0; tn < {{TILES_N}}; tn++) {
+            simdgroup_matrix<{{MEMORY_NAME_A}}, 8> A_mat;
+            simdgroup_matrix<{{MEMORY_NAME_B}}, 8> B_mat;
+
+            // Tile copy already arranged data in threadgroup memory
+            // with the correct layout (transposed if needed).
+            // Load without additional transposition.
+            simdgroup_load(A_mat, A_block, {{A_LEAD}},
+                ulong2(kt * 8, tm * 8));
+            simdgroup_load(B_mat, B_block, {{B_LEAD}},
+                ulong2(tn * 8, kt * 8));
+
+            simdgroup_multiply_accumulate(C_sram[tm][tn], A_mat, B_mat, C_sram[tm][tn]);
+        }
+    }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+"#,
+    );
+
+    msl.dedent();
+    msl.raw("}"); // end K-loop
+
+    // Store accumulators to device memory
+    msl.block(
+        r#"
+// Store accumulators to device memory.
+for (ushort tm = 0; tm < {{TILES_M}}; tm++) {
+    for (ushort tn = 0; tn < {{TILES_N}}; tn++) {
+        simdgroup_store(C_sram[tm][tn], C + (M_offset + tm * 8) * N,
+            N, ulong2(N_offset + tn * 8, 0));
+    }
+}
+"#,
+    );
+
+    msl.close_brace(); // end kernel
+    msl.finish()
 }
 
 // ═══════════════════════════════════════════════════════════════════

@@ -9,3 +9,4 @@ description = "Ferrite Metal: megakernel fusion on Apple Silicon via MSL codegen
 [dev-dependencies]
 metal = "0.33"
 objc = "0.2"
+half = "2.4"

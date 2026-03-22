@@ -340,19 +340,109 @@ if (sidx == 0) {
     }
 }
 
-/// Direct tile access (apple8 / M1/M2).
+/// Loop-based tile copy (universal fallback).
 ///
-/// No threadgroup copy — fragments loaded directly from device memory.
-/// The multiply_accumulate reads from device pointers instead of threadgroup.
-pub struct DirectTileAccess;
+/// All threads in the threadgroup cooperate to copy tiles from device
+/// to threadgroup memory using a simple strided loop. No simdgroup_event,
+/// no hardware DMA — works on all GPU generations and Metal versions.
+///
+/// This replaces DirectTileAccess (which was incorrect — it emitted no copy
+/// but the K-loop still loaded from threadgroup memory).
+pub struct LoopTileCopy;
 
-impl TileCopyAtom for DirectTileAccess {
-    fn emit_tile_load(&self, _msl: &mut MslBuilder, _config: &MetalGemmConfig) {
-        // No-op: data accessed directly from device memory during fragment load.
+impl TileCopyAtom for LoopTileCopy {
+    fn emit_tile_load(&self, msl: &mut MslBuilder, config: &MetalGemmConfig) {
+        msl.set("BLOCK_BYTES_A", config.block_bytes('A').to_string());
+        msl.set(
+            "LEADING_BLOCK_DIM_A",
+            config.leading_block_dim('A').to_string(),
+        );
+        msl.set(
+            "LEADING_BLOCK_DIM_B",
+            config.leading_block_dim('B').to_string(),
+        );
+        msl.set("MEMORY_NAME_A", config.memory_precisions.a.msl_name());
+        msl.set("MEMORY_NAME_B", config.memory_precisions.b.msl_name());
+        msl.set("THREADGROUP_SIZE", config.threadgroup_size().to_string());
+
+        // For A tile: the threadgroup tile has dimensions
+        //   rows = M_group (or block_m), cols = LEADING_BLOCK_DIM_A
+        // But only K_tile valid columns per row. Must zero-fill padding
+        // because fragment loads via morton pattern read into padding columns.
+        // (MFA's async_copy uses clamp_to_zero mode for this.)
+        let a_rows = if config.transpose[0] {
+            config.block_k
+        } else {
+            config.block_m
+        };
+        let a_cols = config.leading_block_dim('A');
+        let b_rows = if config.transpose[1] {
+            config.block_k
+        } else {
+            config.block_n
+        };
+        let b_cols = config.leading_block_dim('B');
+
+        msl.set("A_TG_ROWS", a_rows.to_string());
+        msl.set("A_TG_COLS", a_cols.to_string());
+        msl.set("B_TG_ROWS", b_rows.to_string());
+        msl.set("B_TG_COLS", b_cols.to_string());
+
+        msl.block(
+            r#"
+{
+    uint A_leading_dimension = A_trans ? M : K;
+    uint B_leading_dimension = B_trans ? K : N;
+    ushort tid = sidx * 32 + lane_id;
+
+    // Tile dimensions (clamped at matrix edges)
+    ushort M_tile = min(uint(M_group), M - M_offset);
+    ushort N_tile = min(uint(N_group), N - N_offset);
+    ushort K_tile = min(uint(K_group), K - k);
+
+    // Copy A tile with zero-fill padding.
+    // Full threadgroup tile = A_TG_ROWS × A_TG_COLS, valid region is smaller.
+    ushort a_total = {{A_TG_ROWS}} * {{A_TG_COLS}};
+    for (ushort i = tid; i < a_total; i += {{THREADGROUP_SIZE}}) {
+        ushort row = i / {{A_TG_COLS}};
+        ushort col = i % {{A_TG_COLS}};
+        bool a_valid = A_trans
+            ? (row < K_tile && col < M_tile)
+            : (row < M_tile && col < K_tile);
+        if (a_valid) {
+            uint dev_idx = A_trans
+                ? (k + row) * A_leading_dimension + (M_offset + col)
+                : (M_offset + row) * A_leading_dimension + (k + col);
+            A_block[i] = A[dev_idx];
+        } else {
+            A_block[i] = 0;
+        }
     }
 
-    fn emit_tile_sync(&self, _msl: &mut MslBuilder, _config: &MetalGemmConfig) {
-        // No barrier needed — no threadgroup memory involved.
+    // Copy B tile with zero-fill padding.
+    ushort b_total = {{B_TG_ROWS}} * {{B_TG_COLS}};
+    for (ushort i = tid; i < b_total; i += {{THREADGROUP_SIZE}}) {
+        ushort row = i / {{B_TG_COLS}};
+        ushort col = i % {{B_TG_COLS}};
+        bool b_valid = B_trans
+            ? (row < K_tile && col < N_tile)
+            : (row < N_tile && col < K_tile);
+        if (b_valid) {
+            uint dev_idx = B_trans
+                ? (k + row) * B_leading_dimension + (N_offset + col)
+                : (N_offset + row) * B_leading_dimension + (k + col);
+            B_block[i] = B[dev_idx];
+        } else {
+            B_block[i] = 0;
+        }
+    }
+}
+"#,
+        );
+    }
+
+    fn emit_tile_sync(&self, msl: &mut MslBuilder, _config: &MetalGemmConfig) {
+        msl.raw("threadgroup_barrier(mem_flags::mem_threadgroup);");
     }
 }
 
@@ -446,17 +536,26 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_tile_access_is_noop() {
+    fn test_loop_tile_copy_emits_cooperative_loop() {
         let config = MetalGemmConfig::default_apple8_f16();
         let mut msl = MslBuilder::new();
-        DirectTileAccess.emit_tile_load(&mut msl, &config);
-        DirectTileAccess.emit_tile_sync(&mut msl, &config);
+        LoopTileCopy.emit_tile_load(&mut msl, &config);
         let s = msl.finish();
         assert!(
-            s.trim().is_empty(),
-            "Direct access should emit nothing: '{}'",
-            s
+            s.contains("for (ushort i = tid"),
+            "Must have cooperative loop"
         );
+        assert!(s.contains("A_block["), "Must write to A_block");
+        assert!(s.contains("B_block["), "Must write to B_block");
+    }
+
+    #[test]
+    fn test_loop_tile_copy_sync_emits_barrier() {
+        let config = MetalGemmConfig::default_apple8_f16();
+        let mut msl = MslBuilder::new();
+        LoopTileCopy.emit_tile_sync(&mut msl, &config);
+        let s = msl.finish();
+        assert!(s.contains("threadgroup_barrier(mem_flags::mem_threadgroup)"));
     }
 
     #[test]

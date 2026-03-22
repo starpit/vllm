@@ -180,7 +180,11 @@ impl MetalGemmConfig {
                 _ => 0,
             }
         } else {
-            // Auto-compute: leading dimension = the non-K dimension
+            // Auto-compute: leading dimension = number of columns in threadgroup tile.
+            // For non-transposed A [M_rows × K_cols]: leading = K (stride between rows)
+            // For transposed A [K_rows × M_cols]: leading = M
+            // For non-transposed B [N_rows × K_cols]: leading = K
+            // For transposed B [K_rows × N_cols]: leading = N
             match operand {
                 'A' => {
                     if self.transpose[0] {
@@ -191,9 +195,9 @@ impl MetalGemmConfig {
                 }
                 'B' => {
                     if self.transpose[1] {
-                        self.block_k
-                    } else {
                         self.block_n
+                    } else {
+                        self.block_k
                     }
                 }
                 'C' => self.block_n,
@@ -213,11 +217,14 @@ impl MetalGemmConfig {
                     self.block_m
                 }
             }
+            // Trailing = number of rows in threadgroup tile.
+            // B not transposed: [N_rows × K_cols] → trailing = N
+            // B transposed: [K_rows × N_cols] → trailing = K
             'B' => {
                 if self.transpose[1] {
-                    self.block_n
-                } else {
                     self.block_k
+                } else {
+                    self.block_n
                 }
             }
             'C' => self.block_m,

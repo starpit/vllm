@@ -7,6 +7,7 @@ pub mod gemm;
 pub mod pipeline;
 pub mod rmsnorm;
 pub mod silu;
+pub mod silu_mul_epilogue;
 pub mod smem;
 pub mod tile;
 

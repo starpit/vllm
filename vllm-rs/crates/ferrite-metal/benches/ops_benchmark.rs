@@ -10,7 +10,7 @@
 ///
 /// Each benchmark: compile once, warm up, then measure N iterations.
 use ferrite_metal::atoms::*;
-use ferrite_metal::attention_emitter::{build_attention_msl, AttentionConfig};
+use ferrite_metal::attention_emitter::{AttentionConfig, build_attention_msl};
 use ferrite_metal::config::{MetalGemmConfig, Precision};
 use ferrite_metal::emitter::{build_gemm_msl, build_standalone_gemm};
 use half::f16;
@@ -33,8 +33,12 @@ fn compile(device: &Device, msl: &str, name: &str) -> ComputePipelineState {
     let lib = device
         .new_library_with_source(msl, &opts)
         .unwrap_or_else(|e| panic!("Compile {}: {}", name, e));
-    let func = lib.get_function(name, None).unwrap_or_else(|e| panic!("{}: {}", name, e));
-    device.new_compute_pipeline_state_with_function(&func).expect("pipeline")
+    let func = lib
+        .get_function(name, None)
+        .unwrap_or_else(|e| panic!("{}: {}", name, e));
+    device
+        .new_compute_pipeline_state_with_function(&func)
+        .expect("pipeline")
 }
 
 fn empty_f16(d: &Device, n: usize) -> Buffer {
@@ -69,7 +73,14 @@ fn bench_gpu<F: Fn(&CommandBufferRef)>(queue: &CommandQueue, warmup: u32, iters:
 // GEMM benchmarks
 // ═══════════════════════════════════════════════════════════════════
 
-fn bench_gemm_config(device: &Device, queue: &CommandQueue, m: u32, n: u32, k: u32, config: &MetalGemmConfig) -> f64 {
+fn bench_gemm_config(
+    device: &Device,
+    queue: &CommandQueue,
+    m: u32,
+    n: u32,
+    k: u32,
+    config: &MetalGemmConfig,
+) -> f64 {
     let config = config.clone();
     let msl = build_standalone_gemm(&config);
     let pipeline = compile(device, &msl, "gemm");
@@ -81,7 +92,9 @@ fn bench_gemm_config(device: &Device, queue: &CommandQueue, m: u32, n: u32, k: u
     let c_buf = device.new_buffer(c_rows * c_cols * 4, MTLResourceOptions::StorageModeShared);
     let offsets: [u32; 4] = [m, n, k, 0];
     let offsets_buf = device.new_buffer_with_data(
-        offsets.as_ptr() as *const c_void, 16, MTLResourceOptions::StorageModeShared,
+        offsets.as_ptr() as *const c_void,
+        16,
+        MTLResourceOptions::StorageModeShared,
     );
 
     let m_group = config.block_m as u64;
@@ -130,7 +143,9 @@ fn bench_attention(device: &Device, queue: &CommandQueue, seq_len: u32, d_head: 
     let o_buf = empty_f32(device, n);
     let params: [u32; 4] = [seq_len, d_head as u32, 1, 0];
     let params_buf = device.new_buffer_with_data(
-        params.as_ptr() as *const c_void, 16, MTLResourceOptions::StorageModeShared,
+        params.as_ptr() as *const c_void,
+        16,
+        MTLResourceOptions::StorageModeShared,
     );
 
     let grid_y = (seq_len as u64 + config.block_r as u64 - 1) / config.block_r as u64;
@@ -163,7 +178,9 @@ fn bench_rmsnorm(device: &Device, queue: &CommandQueue, rows: u32, hidden: u32) 
     let gamma_buf = empty_f32(device, hidden as usize);
     let output_buf = empty_f32(device, (rows * hidden) as usize);
     let hs_buf = device.new_buffer_with_data(
-        &hidden as *const u32 as *const c_void, 4, MTLResourceOptions::StorageModeShared,
+        &hidden as *const u32 as *const c_void,
+        4,
+        MTLResourceOptions::StorageModeShared,
     );
 
     let grid = MTLSize::new(rows as u64, 1, 1);
@@ -192,7 +209,9 @@ fn bench_convert(device: &Device, queue: &CommandQueue, count: u32) -> f64 {
     let input_buf = empty_f32(device, count as usize);
     let output_buf = empty_f16(device, count as usize);
     let count_buf = device.new_buffer_with_data(
-        &count as *const u32 as *const c_void, 4, MTLResourceOptions::StorageModeShared,
+        &count as *const u32 as *const c_void,
+        4,
+        MTLResourceOptions::StorageModeShared,
     );
 
     let tg_size = 256u64;
@@ -231,12 +250,33 @@ fn main() {
     ];
 
     let apple9 = MetalGemmConfig::default_apple9_f16(); // 32×32×8
-    let apple8 = MetalGemmConfig::default_apple8_f16();  // 48×48×32
-    let mut custom = MetalGemmConfig::default_apple9_f16();
-    custom.block_k = 32; // same output tile, deeper K
-    custom.leading_block_dims = None; // auto-compute
+    let apple8 = MetalGemmConfig::default_apple8_f16(); // 48×48×32
+    let mut k32 = MetalGemmConfig::default_apple9_f16();
+    k32.block_k = 32;
+    k32.leading_block_dims = None;
 
-    for (label, cfg) in [("apple9 32×32×8", &apple9), ("apple8 48×48×32", &apple8), ("custom 32×32×32", &custom)] {
+    // 4 simdgroups: 64×64 output tile, K=32, each simdgroup does 32×32
+    let mut multi_sg = MetalGemmConfig::default_apple9_f16();
+    multi_sg.block_m = 64;
+    multi_sg.block_n = 64;
+    multi_sg.block_k = 32;
+    multi_sg.splits = [2, 2]; // 4 simdgroups
+    multi_sg.leading_block_dims = None;
+
+    // 16 simdgroups: 128×128 output tile, K=32
+    let mut big = MetalGemmConfig::default_apple9_f16();
+    big.block_m = 128;
+    big.block_n = 128;
+    big.block_k = 32;
+    big.splits = [4, 4]; // 16 simdgroups
+    big.leading_block_dims = None;
+
+    for (label, cfg) in [
+        ("32×32×8  1sg", &apple9),
+        ("32×32×32 1sg", &k32),
+        ("64×64×32 4sg", &multi_sg),
+        ("128×128×32 16sg", &big),
+    ] {
         eprintln!("=== GEMM {} ===", label);
         for &(m, n, k) in &gemm_sizes {
             let t = bench_gemm_config(&device, &queue, m, n, k, cfg);
@@ -244,7 +284,11 @@ fn main() {
             let tflops = flops / t / 1e12;
             eprintln!(
                 "  {:>5}×{:<5} K={:<5}  {:.3} ms  ({:.1} TFLOPS)",
-                m, n, k, t * 1e3, tflops
+                m,
+                n,
+                k,
+                t * 1e3,
+                tflops
             );
         }
         eprintln!();
@@ -253,32 +297,24 @@ fn main() {
 
     // Attention benchmarks (d_head=64 to fit threadgroup memory)
     eprintln!("=== FlashAttention (f16, 1 head) ===");
-    for &(seq, dh) in &[
-        (32, 64),
-        (128, 64),
-        (512, 64),
-    ] {
+    for &(seq, dh) in &[(32, 64), (128, 64), (512, 64)] {
         let t = bench_attention(&device, &queue, seq, dh);
-        eprintln!(
-            "  seq={:<5} d_head={:<4}  {:.3} ms",
-            seq, dh, t * 1e3
-        );
+        eprintln!("  seq={:<5} d_head={:<4}  {:.3} ms", seq, dh, t * 1e3);
     }
     eprintln!();
 
     // RmsNorm benchmarks
     eprintln!("=== RmsNorm (f32) ===");
-    for &(rows, hidden) in &[
-        (1, 4096),
-        (32, 4096),
-        (512, 4096),
-    ] {
+    for &(rows, hidden) in &[(1, 4096), (32, 4096), (512, 4096)] {
         let t = bench_rmsnorm(&device, &queue, rows, hidden);
         let gb = rows as f64 * hidden as f64 * 4.0 * 2.0 / 1e9; // read + write
         let bw = gb / t;
         eprintln!(
             "  {:>4} rows × {:<5}  {:.3} ms  ({:.1} GB/s)",
-            rows, hidden, t * 1e3, bw
+            rows,
+            hidden,
+            t * 1e3,
+            bw
         );
     }
     eprintln!();
@@ -289,9 +325,6 @@ fn main() {
         let t = bench_convert(&device, &queue, count);
         let gb = count as f64 * 6.0 / 1e9; // 4 bytes read + 2 bytes write
         let bw = gb / t;
-        eprintln!(
-            "  {:>10} elems  {:.3} ms  ({:.1} GB/s)",
-            count, t * 1e3, bw
-        );
+        eprintln!("  {:>10} elems  {:.3} ms  ({:.1} GB/s)", count, t * 1e3, bw);
     }
 }

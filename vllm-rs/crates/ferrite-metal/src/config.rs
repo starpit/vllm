@@ -244,7 +244,8 @@ impl MetalGemmConfig {
     pub fn threadgroup_memory(&self) -> u32 {
         let ab = self.block_bytes('A') + self.block_bytes('B');
         let c = self.block_bytes('C');
-        ab.max(c)
+        // Only A+B tiles in threadgroup. C stays in registers (simdgroup_matrix).
+        ab
     }
 
     /// Number of threads per threadgroup.

@@ -69,16 +69,16 @@ fn test_block_bytes_f16_apple8() {
 fn test_threadgroup_memory_apple9() {
     let c = MetalGemmConfig::default_apple9_f16();
     let mem = c.threadgroup_memory();
-    // A=2048 + B=512 = 2560, C=32*32*4=4096 → max(2560, 4096) = 4096
-    assert_eq!(mem, 4096, "max(A+B=2560, C=4096)");
+    // A=2048 + B=512 = 2560 (C stays in registers)
+    assert_eq!(mem, 2560);
 }
 
 #[test]
 fn test_threadgroup_memory_apple8() {
     let c = MetalGemmConfig::default_apple8_f16();
     let mem = c.threadgroup_memory();
-    // A=3072 + B=3072 = 6144, C=48*48*4=9216 → max(6144, 9216) = 9216
-    assert_eq!(mem, 9216);
+    // A=3072 + B=3072 = 6144
+    assert_eq!(mem, 6144);
 }
 
 #[test]

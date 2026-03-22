@@ -22,7 +22,7 @@ impl EpilogueAtom for ElementMulEpilogue {
 for (ushort tm = 0; tm < {{TILES_M}}; tm++) {
     for (ushort tn = 0; tn < {{TILES_N}}; tn++) {
         simdgroup_matrix<{{C_TYPE}}, 8, 8> G_tile;
-        simdgroup_load(G_tile, gate + (sid_m + tm * 8) * N + (sid_n + tn * 8), N);
+        simdgroup_load(G_tile, gate + (sid_M_offset + tm * 8) * N + (sid_N_offset + tn * 8), N);
         thread auto &c_elems = C_sram[tm][tn].thread_elements();
         thread auto &g_elems = G_tile.thread_elements();
         for (int i = 0; i < 64; i++) {

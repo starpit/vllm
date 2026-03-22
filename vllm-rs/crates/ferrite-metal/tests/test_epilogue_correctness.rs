@@ -216,12 +216,7 @@ fn patch_msl_extra_buffer(msl: &str, param_name: &str) -> String {
         ),
     );
 
-    // Define sid_m and sid_n aliases for M_offset/N_offset.
-    let patched = patched.replace(
-        "if (M_offset >= M || N_offset >= N) return;",
-        "uint sid_m = M_offset;\nuint sid_n = N_offset;\nif (M_offset >= M || N_offset >= N) return;",
-    );
-
+    // sid_m, sid_n, sid_M_offset, sid_N_offset are now provided by the emitter.
     patched
 }
 

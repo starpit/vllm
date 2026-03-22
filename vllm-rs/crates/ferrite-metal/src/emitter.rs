@@ -68,12 +68,19 @@ uint M_offset = gid.y * M_group;
 uint N_offset = gid.x * N_group;
 if (M_offset >= M || N_offset >= N) return;
 
+// Multi-simdgroup: each simdgroup handles a sub-tile within the block.
+// sid_m, sid_n = simdgroup position within the splits grid.
+ushort sid_n = sidx % {{SPLITS_N}};
+ushort sid_m = sidx / {{SPLITS_N}};
+uint sid_M_offset = M_offset + sid_m * {{REGISTER_M}};
+uint sid_N_offset = N_offset + sid_n * {{REGISTER_N}};
+
 bool A_trans = {{A_TRANS}};
 bool B_trans = {{B_TRANS}};
 "#,
     );
 
-    // Accumulators
+    // Accumulators — per simdgroup sub-tile
     msl.block(
         r#"
 simdgroup_matrix<{{REGISTER_NAME_C}}, 8> C_sram[{{TILES_M}}][{{TILES_N}}];
@@ -150,11 +157,11 @@ for (ushort kt = 0; kt < K_group / 8; kt++) {
     msl.block(
         r#"
 for (ushort tm = 0; tm < {{TILES_M}}; tm++) {
-    if (M_offset + tm * 8 >= M) continue;
+    if (sid_M_offset + tm * 8 >= M) continue;
     for (ushort tn = 0; tn < {{TILES_N}}; tn++) {
-        if (N_offset + tn * 8 >= N) continue;
-        simdgroup_store(C_sram[tm][tn], C + (M_offset + tm * 8) * N,
-            N, ulong2(N_offset + tn * 8, 0));
+        if (sid_N_offset + tn * 8 >= N) continue;
+        simdgroup_store(C_sram[tm][tn], C + (sid_M_offset + tm * 8) * N,
+            N, ulong2(sid_N_offset + tn * 8, 0));
     }
 }
 "#,
@@ -185,6 +192,8 @@ fn set_config_vars(msl: &mut MslBuilder, config: &MetalGemmConfig) {
     msl.set("REGISTER_N", config.register_n().to_string());
     msl.set("TILES_M", (config.register_m() / 8).to_string());
     msl.set("TILES_N", (config.register_n() / 8).to_string());
+    msl.set("SPLITS_N", config.splits[0].to_string());
+    msl.set("SPLITS_M", config.splits[1].to_string());
     msl.set("MEMORY_NAME_A", config.memory_precisions.a.msl_name());
     msl.set("MEMORY_NAME_B", config.memory_precisions.b.msl_name());
     msl.set("MEMORY_NAME_C", config.memory_precisions.c.msl_name());

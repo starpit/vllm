@@ -3978,7 +3978,8 @@ fn run_flash_attn_fwd_hdim128() -> Result<()> {
 }
 
 fn run_dual_fused() -> Result<()> {
-    let config = ferrite_ptx::config::GemmConfig::default_128x128();
+    // Test 128×64 with 2-stage (double buffer) to isolate 3-stage bug
+    let config = ferrite_ptx::config::GemmConfig::default_128x64();
     let ptx = ferrite_ptx::fused::build_dual_fused_pipeline(&config, 4096);
     println!("  Generated {} bytes of PTX", ptx.len());
 

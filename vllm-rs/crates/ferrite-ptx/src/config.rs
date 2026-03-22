@@ -29,6 +29,24 @@ impl GemmConfig {
         }
     }
 
+    /// 128×64 tile — used for dual GEMM (matches CUTLASS examples/45_dual_gemm).
+    /// Halved N-dimension reduces accumulator pressure for dual accumulators.
+    /// 4 warps (2×2 layout), 128 threads.
+    pub fn default_128x64() -> Self {
+        Self {
+            bm: 128,
+            bn: 64,
+            bk: 32,
+            wm: 64,
+            wn: 32, // 2×2 warp layout: warps_m=2, warps_n=2
+            mma_m: 16,
+            mma_n: 8,
+            mma_k: 16,
+            num_stages: 2, // start with double-buffer, optimize to 3 later
+            sm_arch: "sm_89".into(),
+        }
+    }
+
     pub fn default_128x128() -> Self {
         Self {
             bm: 128,

@@ -470,6 +470,265 @@ pub fn build_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
     ptx.finalize("fused_rmsnorm_gemm_silu", &fused_params())
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Dual Fused Pipeline — RMSNorm -> dual GEMM(gate,up) -> SiLuMul -> store
+//
+// This is the MLP megakernel: one kernel does the full LLaMA MLP layer.
+//   1. RMSNorm the input rows
+//   2. Preload gamma weights into smem
+//   3. Dual GEMM: shared A (input) with B0 (gate) and B1 (up) weights
+//   4. SiLuMul: silu(gate) * up
+//   5. Store half-width output
+//
+// Uses DualMainloopPipeline for the K-loop.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Build a fused RMSNorm -> dual GEMM(gate,up) -> SiLuMul kernel using DualMainloopPipeline.
+///
+/// Grid: (out_features / BN, batch / BM, 1)
+/// Block: 128 threads (4 warps)
+///
+/// Output width = BN (same as single GEMM), because SiLuMul halves the 2× accumulators.
+pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
+    use crate::atoms::{CpAsyncCopy, Mma16816, RmsNormAtom};
+    use crate::gemm::{
+        emit_a_global_addrs_cfg, emit_b_global_addrs_cfg, emit_cpasync_swizzle_cfg,
+        emit_gemm_setup, emit_store_c,
+    };
+    use crate::dual_pipeline::DualMainloopPipeline;
+    use crate::silu_mul_epilogue::SiLuMulEpilogue;
+    use crate::atoms::EpilogueAtom;
+
+    let mut ptx = PtxBuilder::new(config.clone());
+    let c = &ptx.config.clone();
+
+    let bm = c.bm;
+    let bk = c.bk;
+    let threads = c.threads();
+
+    // Shared memory layout for dual GEMM:
+    //   A:  offset 0,                                  size = smem_a_bytes * stages
+    //   B0: offset smem_a_bytes * stages,              size = smem_b_bytes * stages
+    //   B1: offset (smem_a_bytes + smem_b_bytes) * stages, size = smem_b_bytes * stages
+    //   norm_scratch, norm_factors, gamma after the GEMM regions
+    let a_smem_total = c.smem_a_bytes() * c.num_stages;
+    let b_smem_total = c.smem_b_bytes() * c.num_stages;
+    let dual_gemm_smem = a_smem_total + 2 * b_smem_total;
+    let norm_scratch_off = dual_gemm_smem;
+    let norm_factors_off = norm_scratch_off + 32;
+    let gamma_smem_off = norm_factors_off + bm * 4;
+    let _gamma_smem_bytes = hidden_size * 2;
+
+    ptx.comment("=== Fused RMSNorm -> dual GEMM(gate,up) -> SiLuMul (DualMainloopPipeline) ===");
+    ptx.comment(&format!(
+        "BM={}, BN={}, BK={}, threads={}",
+        bm, c.bn, bk, threads
+    ));
+    ptx.comment(&format!(
+        "hidden_size={}, REG_M={}, REG_N={}",
+        hidden_size,
+        c.reg_m(),
+        c.reg_n()
+    ));
+    ptx.blank();
+
+    // Phase 1: Load parameters
+    let input_ptr = ptx.regs.alloc_b64();
+    let wnorm_ptr = ptx.regs.alloc_b64();
+    let wgate_ptr = ptx.regs.alloc_b64();
+    let wup_ptr = ptx.regs.alloc_b64();
+    let output_ptr = ptx.regs.alloc_b64();
+    let n_param = ptx.regs.alloc_b32();
+    let k_param = ptx.regs.alloc_b32();
+    ptx.ld_param_b64(input_ptr, "param_input");
+    ptx.ld_param_b64(wnorm_ptr, "param_wnorm");
+    ptx.ld_param_b64(wgate_ptr, "param_wgate");
+    ptx.ld_param_b64(wup_ptr, "param_wup");
+    ptx.ld_param_b64(output_ptr, "param_output");
+    ptx.ld_param_b32(n_param, "param_N");
+    ptx.ld_param_b32(k_param, "param_K");
+    ptx.blank();
+
+    // Phase 2: Thread/block setup
+    let setup = emit_gemm_setup(&mut ptx, c);
+
+    // Phase A: RMSNorm — compute norm factors for all BM rows
+    let threads_per_row = if bm <= 64 { 2u32 } else { 1u32 };
+    let norm_factors_base = ptx.regs.alloc_b32();
+    ptx.begin_scope();
+    let eps: f32 = 1e-6;
+    crate::tile::emit_norm_factor_computation_cfg(
+        &mut ptx,
+        input_ptr,
+        setup.block_row,
+        setup.tid,
+        setup.smem_base,
+        norm_factors_off,
+        hidden_size,
+        eps,
+        Some(norm_factors_base),
+        threads_per_row,
+    );
+    ptx.end_scope();
+
+    // Phase 1.5: Preload ALL gamma weights into shared memory
+    let gamma_smem_base = ptx.regs.alloc_b32();
+    ptx.add_s32_imm(gamma_smem_base, setup.smem_base, gamma_smem_off as i32);
+
+    ptx.begin_scope();
+    ptx.comment("=== Phase 1.5: Preload gamma weights into smem ===");
+    ptx.blank();
+
+    let bytes_per_thread = (hidden_size * 2) / threads;
+    let v4_loads_per_thread = bytes_per_thread / 16;
+
+    let gamma_global_addr = ptx.regs.alloc_b64();
+    {
+        let bytes_per_t = ptx.regs.alloc_b32();
+        ptx.mov_b32_imm(bytes_per_t, bytes_per_thread);
+        ptx.mad_wide_s32(gamma_global_addr, setup.tid, bytes_per_t, wnorm_ptr);
+    }
+
+    let gamma_smem_dst = ptx.regs.alloc_b32();
+    {
+        let tid_byte_off = ptx.regs.alloc_b32();
+        ptx.mov_b32_imm(tid_byte_off, bytes_per_thread);
+        ptx.mul_lo_s32(tid_byte_off, setup.tid, tid_byte_off);
+        ptx.add_s32(gamma_smem_dst, gamma_smem_base, tid_byte_off);
+    }
+
+    for v in 0..v4_loads_per_thread {
+        let data = [
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+            ptx.regs.alloc_b32(),
+        ];
+        ptx.ld_global_v4_b32(data, gamma_global_addr, (v * 16) as i32);
+        ptx.st_shared_v4_b32(gamma_smem_dst, (v * 16) as i32, data);
+    }
+    ptx.bar_sync(0);
+    ptx.blank();
+    ptx.end_scope();
+
+    // Phase B: Dual GEMM with RmsNormAtom via DualMainloopPipeline
+    ptx.comment("=== Phase B: Dual GEMM with RmsNormAtom via DualMainloopPipeline ===");
+    ptx.blank();
+
+    let (a_cp_off, b0_cp_off) = emit_cpasync_swizzle_cfg(&mut ptx, c, setup.tid);
+    // B1 uses the same swizzle pattern as B0
+    let b1_cp_off = ptx.regs.alloc_b32();
+    ptx.mov_b32(b1_cp_off, b0_cp_off);
+
+    let ga_chunks =
+        emit_a_global_addrs_cfg(&mut ptx, c, setup.block_row, k_param, input_ptr, setup.tid);
+    let gb0_chunks =
+        emit_b_global_addrs_cfg(&mut ptx, c, setup.block_col, n_param, wgate_ptr, setup.tid);
+    let gb1_chunks =
+        emit_b_global_addrs_cfg(&mut ptx, c, setup.block_col, n_param, wup_ptr, setup.tid);
+
+    // Compute warp_m_offset for the RmsNormAtom
+    let warps_n = c.warps_n();
+    let warp_m = ptx.regs.alloc_b32();
+    ptx.shr_u32(warp_m, setup.warp_id, warps_n.trailing_zeros());
+    let warp_m_offset = ptx.regs.alloc_b32();
+    ptx.shl_b32(warp_m_offset, warp_m, c.wm.trailing_zeros());
+
+    // Create the RmsNormAtom
+    let k_offset_reg = ptx.regs.alloc_b32();
+    ptx.mov_b32_imm(k_offset_reg, 0);
+
+    let k_warp_iters = c.bk / c.mma_k;
+    let transform = RmsNormAtom::new(
+        &mut ptx,
+        norm_factors_base,
+        gamma_smem_base,
+        setup.group,
+        setup.tg,
+        k_offset_reg,
+        c.reg_m(),
+        k_warp_iters,
+        warp_m_offset,
+    );
+
+    // Extra advance: bump k_offset_reg by BK each iteration
+    let bk_val = c.bk;
+    let advance_fn = move |ptx_ref: &mut PtxBuilder| {
+        ptx_ref.add_s32_imm(k_offset_reg, k_offset_reg, bk_val as i32);
+    };
+
+    let pipeline = DualMainloopPipeline::new(c.num_stages);
+    let result = pipeline.emit(
+        &mut ptx,
+        c,
+        &setup,
+        &CpAsyncCopy,
+        &CpAsyncCopy,
+        &CpAsyncCopy,
+        &transform,
+        &Mma16816,
+        ga_chunks,
+        a_cp_off,
+        gb0_chunks,
+        b0_cp_off,
+        gb1_chunks,
+        b1_cp_off,
+        n_param,
+        k_param,
+        Some(&advance_fn),
+    );
+
+    // Phase C: SiLuMul epilogue — merge acc0 and acc1 into a wide accumulator
+    ptx.comment("=== Phase C: SiLuMul epilogue on dual accumulators ===");
+
+    // Merge acc0 (gate) and acc1 (up) into one wide AccumulatorMap.
+    // For each rm row: first acc0's rn tiles, then acc1's rn tiles.
+    let reg_m = c.reg_m();
+    let reg_n = c.reg_n();
+    let wide_reg_n = reg_n * 2;
+    let mut wide_regs = Vec::new();
+    for rm in 0..reg_m {
+        // acc0 tiles for this row (gate)
+        for rn in 0..reg_n {
+            let idx = (rm * reg_n + rn) as usize;
+            wide_regs.push(result.acc0.regs[idx]);
+        }
+        // acc1 tiles for this row (up)
+        for rn in 0..reg_n {
+            let idx = (rm * reg_n + rn) as usize;
+            wide_regs.push(result.acc1.regs[idx]);
+        }
+    }
+    let mut wide_acc = crate::gemm::AccumulatorMap {
+        regs: wide_regs,
+        reg_m,
+        reg_n: wide_reg_n,
+    };
+
+    SiLuMulEpilogue.emit_epilogue(&mut ptx, &mut wide_acc);
+    ptx.blank();
+
+    // Phase D: Store output (half-width after SiLuMul)
+    ptx.comment("=== Phase D: Store output ===");
+    emit_store_c(&mut ptx, c, &wide_acc, &setup, output_ptr, n_param);
+    ptx.blank();
+    ptx.ret();
+
+    ptx.finalize("fused_rmsnorm_dual_gemm_silu_mul", &dual_fused_params())
+}
+
+fn dual_fused_params() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (".u64 .ptr .global .align 16", "param_input"),
+        (".u64 .ptr .global .align 16", "param_wnorm"),
+        (".u64 .ptr .global .align 16", "param_wgate"),
+        (".u64 .ptr .global .align 16", "param_wup"),
+        (".u64 .ptr .global .align 16", "param_output"),
+        (".u32", "param_N"),
+        (".u32", "param_K"),
+    ]
+}
+
 fn fused_params() -> Vec<(&'static str, &'static str)> {
     vec![
         (".u64 .ptr .global .align 16", "param_input"),
@@ -1343,6 +1602,156 @@ mod tests {
             "128x128 Pipeline fused PTX: {} bytes, {} lines",
             ptx.len(),
             ptx.lines().count()
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Tests for the DUAL FUSED pipeline (build_dual_fused_pipeline)
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_dual_fused_pipeline_generates_valid_ptx() {
+        let config = GemmConfig::default_128x128();
+        let ptx = build_dual_fused_pipeline(&config, 4096);
+
+        assert!(
+            ptx.contains(".visible .entry fused_rmsnorm_dual_gemm_silu_mul("),
+            "PTX must contain dual fused kernel entry point"
+        );
+
+        // All phases present
+        assert!(
+            ptx.contains("RMSNorm norm factor computation"),
+            "Must contain norm factor computation"
+        );
+        assert!(
+            ptx.contains("Preload gamma weights"),
+            "Must contain gamma preload"
+        );
+        assert!(
+            ptx.contains("DualMainloopPipeline"),
+            "Must use DualMainloopPipeline"
+        );
+        assert!(
+            ptx.contains("SiLuMul epilogue"),
+            "Must contain SiLuMul epilogue"
+        );
+        assert!(ptx.contains("Store"), "Must contain store phase");
+
+        // Key instructions
+        assert!(ptx.contains("mma.sync.aligned.m16n8k16"));
+        assert!(ptx.contains("rsqrt.approx.f32"));
+        assert!(ptx.contains("ex2.approx.f32"));
+        assert!(ptx.contains("cp.async.cg.shared.global"));
+
+        // Must have all dual fused parameters
+        assert!(ptx.contains("param_input"));
+        assert!(ptx.contains("param_wnorm"));
+        assert!(ptx.contains("param_wgate"));
+        assert!(ptx.contains("param_wup"));
+        assert!(ptx.contains("param_output"));
+        assert!(ptx.contains("param_N"));
+        assert!(ptx.contains("param_K"));
+
+        // Single kernel
+        let entry_count = ptx.matches(".visible .entry").count();
+        assert_eq!(entry_count, 1, "Must be exactly one kernel");
+
+        println!(
+            "Dual fused pipeline PTX: {} bytes, {} lines",
+            ptx.len(),
+            ptx.lines().count()
+        );
+    }
+
+    #[test]
+    fn test_dual_fused_has_dual_gemm_entry() {
+        let config = GemmConfig::default_128x128();
+        let ptx = build_dual_fused_pipeline(&config, 4096);
+
+        assert!(
+            ptx.contains(".visible .entry fused_rmsnorm_dual_gemm_silu_mul("),
+            "Entry point must be fused_rmsnorm_dual_gemm_silu_mul"
+        );
+
+        // Must have dual K-loop structure
+        assert!(
+            ptx.contains("$L_DUAL_KLOOP:"),
+            "Must have dual K-loop label"
+        );
+        assert!(
+            ptx.contains("$L_DUAL_EPILOGUE:"),
+            "Must have dual epilogue label"
+        );
+        assert!(
+            ptx.contains("$L_DUAL_K0_FALLTHROUGH:"),
+            "Must have dual K0 fallthrough"
+        );
+    }
+
+    #[test]
+    fn test_dual_fused_has_silu_ops() {
+        let config = GemmConfig::default_128x128();
+        let ptx = build_dual_fused_pipeline(&config, 4096);
+
+        // SiLuMul epilogue requires these instructions
+        assert!(
+            ptx.contains("neg.f32"),
+            "Must have neg.f32 for sigmoid(-x)"
+        );
+        assert!(
+            ptx.contains("ex2.approx.f32"),
+            "Must have ex2 for exp in sigmoid"
+        );
+        assert!(
+            ptx.contains("rcp.approx.f32"),
+            "Must have rcp for 1/(1+exp)"
+        );
+
+        // SiLuMul also does gate * up multiplication
+        // The mul.f32 should appear in the epilogue section
+        let epilogue_start = ptx.find("SiLuMul epilogue").expect("SiLuMul epilogue comment");
+        let epilogue_region = &ptx[epilogue_start..];
+        assert!(
+            epilogue_region.contains("mul.f32"),
+            "SiLuMul epilogue must multiply silu(gate) * up"
+        );
+    }
+
+    #[test]
+    fn test_dual_fused_mma_count() {
+        // Dual fused should have 2× the MMA count of a single fused pipeline
+        let config = GemmConfig::default_128x128();
+        let ptx_single = build_fused_pipeline(&config, 4096);
+        let ptx_dual = build_dual_fused_pipeline(&config, 4096);
+
+        // Count MMAs in K-loop for single pipeline
+        let single_kloop_start = ptx_single.find("$L_KLOOP:").expect("K-loop label");
+        let single_kloop_end = ptx_single
+            .find("$L_K0_FALLTHROUGH:")
+            .expect("K0 fallthrough");
+        let single_kloop = &ptx_single[single_kloop_start..single_kloop_end];
+        let single_mma = single_kloop.matches("mma.sync.aligned.m16n8k16").count();
+
+        // Count MMAs in dual K-loop
+        let dual_kloop_start = ptx_dual.find("$L_DUAL_KLOOP:").expect("Dual K-loop label");
+        let dual_kloop_end = ptx_dual
+            .find("$L_DUAL_K0_FALLTHROUGH:")
+            .expect("Dual K0 fallthrough");
+        let dual_kloop = &ptx_dual[dual_kloop_start..dual_kloop_end];
+        let dual_mma = dual_kloop.matches("mma.sync.aligned.m16n8k16").count();
+
+        assert_eq!(
+            dual_mma,
+            single_mma * 2,
+            "Dual fused must have 2× MMAs of single fused ({} vs {} expected)",
+            dual_mma,
+            single_mma * 2
+        );
+
+        println!(
+            "MMA count: single={}, dual={} (2× verified)",
+            single_mma, dual_mma
         );
     }
 }

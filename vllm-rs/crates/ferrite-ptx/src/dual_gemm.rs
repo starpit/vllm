@@ -638,6 +638,38 @@ pub(crate) fn emit_prologue(s: &mut String) {
     blank(s);
 }
 
+/// Emit 16 MMA instructions in zigzag pattern (matching CUTLASS dual_gemm).
+/// Each MMA is wrapped in `// begin inline asm` / `// end inline asm` comments
+/// with a blank line after the instruction.
+///
+/// Zigzag: b_col 0 → a_row 0,1,2,3; b_col 1 → a_row 3,2,1,0; etc.
+fn emit_mma_zigzag_16(
+    s: &mut String,
+    a_bases: &[[u32; 4]; 4],  // 4 A row groups, each 4 regs
+    b_bases: &[[u32; 2]; 4],  // 4 B col groups, each 2 regs
+    d_pairs: &[[u32; 2]; 16], // 16 D output pairs
+    c_pairs: &[[u32; 2]; 16], // 16 C accumulator pairs
+) {
+    let zigzag_a: [usize; 16] = [0,1,2,3, 3,2,1,0, 0,1,2,3, 3,2,1,0];
+    let zigzag_b: [usize; 16] = [0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3];
+
+    for i in 0..16 {
+        let ai = zigzag_a[i];
+        let bi = zigzag_b[i];
+        let [a0, a1, a2, a3] = a_bases[ai];
+        let [b0, b1] = b_bases[bi];
+        let [d0, d1] = d_pairs[i];
+        let [c0, c1] = c_pairs[i];
+
+        w(s, "// begin inline asm");
+        w(s, &format!(
+            "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {{%r{d0},%r{d1}}}, {{%r{a0},%r{a1},%r{a2},%r{a3}}}, {{%r{b0},%r{b1}}}, {{%r{c0},%r{c1}}};"
+        ));
+        blank(s);
+        w(s, "// end inline asm");
+    }
+}
+
 /// Emit the K-loop: fragment loads, MMA (GEMM0 + GEMM1), cp.async next tile, buffer cycling.
 pub(crate) fn emit_kloop(s: &mut String) {
     s.push_str("$L__BB1_7:\n");
@@ -678,134 +710,20 @@ pub(crate) fn emit_kloop(s: &mut String) {
     w(s, "// begin inline asm");
     w(s, "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%r1151, %r1152, %r1153, %r1154}, [%r1155];");
     w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1156,%r1157}, {%r3284,%r3285,%r3286,%r3287}, {%r3212,%r3213}, {%r3342,%r3341};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1166,%r1167}, {%r3288,%r3289,%r3290,%r3291}, {%r3212,%r3213}, {%r3340,%r3339};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1176,%r1177}, {%r3292,%r3293,%r3294,%r3295}, {%r3212,%r3213}, {%r3338,%r3337};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1186,%r1187}, {%r3296,%r3297,%r3298,%r3299}, {%r3212,%r3213}, {%r3336,%r3335};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1196,%r1197}, {%r3296,%r3297,%r3298,%r3299}, {%r3214,%r3215}, {%r3328,%r3327};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1206,%r1207}, {%r3292,%r3293,%r3294,%r3295}, {%r3214,%r3215}, {%r3330,%r3329};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1216,%r1217}, {%r3288,%r3289,%r3290,%r3291}, {%r3214,%r3215}, {%r3332,%r3331};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1226,%r1227}, {%r3284,%r3285,%r3286,%r3287}, {%r3214,%r3215}, {%r3334,%r3333};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1236,%r1237}, {%r3284,%r3285,%r3286,%r3287}, {%r3280,%r3281}, {%r3326,%r3325};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1246,%r1247}, {%r3288,%r3289,%r3290,%r3291}, {%r3280,%r3281}, {%r3324,%r3323};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1256,%r1257}, {%r3292,%r3293,%r3294,%r3295}, {%r3280,%r3281}, {%r3322,%r3321};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1266,%r1267}, {%r3296,%r3297,%r3298,%r3299}, {%r3280,%r3281}, {%r3320,%r3319};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1276,%r1277}, {%r3296,%r3297,%r3298,%r3299}, {%r3282,%r3283}, {%r3312,%r3311};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1286,%r1287}, {%r3292,%r3293,%r3294,%r3295}, {%r3282,%r3283}, {%r3314,%r3313};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1296,%r1297}, {%r3288,%r3289,%r3290,%r3291}, {%r3282,%r3283}, {%r3316,%r3315};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1306,%r1307}, {%r3284,%r3285,%r3286,%r3287}, {%r3282,%r3283}, {%r3318,%r3317};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1316,%r1317}, {%r3284,%r3285,%r3286,%r3287}, {%r3204,%r3205}, {%r3374,%r3373};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1326,%r1327}, {%r3288,%r3289,%r3290,%r3291}, {%r3204,%r3205}, {%r3372,%r3371};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1336,%r1337}, {%r3292,%r3293,%r3294,%r3295}, {%r3204,%r3205}, {%r3370,%r3369};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1346,%r1347}, {%r3296,%r3297,%r3298,%r3299}, {%r3204,%r3205}, {%r3368,%r3367};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1356,%r1357}, {%r3296,%r3297,%r3298,%r3299}, {%r3206,%r3207}, {%r3360,%r3359};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1366,%r1367}, {%r3292,%r3293,%r3294,%r3295}, {%r3206,%r3207}, {%r3362,%r3361};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1376,%r1377}, {%r3288,%r3289,%r3290,%r3291}, {%r3206,%r3207}, {%r3364,%r3363};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1386,%r1387}, {%r3284,%r3285,%r3286,%r3287}, {%r3206,%r3207}, {%r3366,%r3365};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1396,%r1397}, {%r3284,%r3285,%r3286,%r3287}, {%r3208,%r3209}, {%r3358,%r3357};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1406,%r1407}, {%r3288,%r3289,%r3290,%r3291}, {%r3208,%r3209}, {%r3356,%r3355};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1416,%r1417}, {%r3292,%r3293,%r3294,%r3295}, {%r3208,%r3209}, {%r3354,%r3353};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1426,%r1427}, {%r3296,%r3297,%r3298,%r3299}, {%r3208,%r3209}, {%r3352,%r3351};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1436,%r1437}, {%r3296,%r3297,%r3298,%r3299}, {%r3210,%r3211}, {%r3344,%r3343};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1446,%r1447}, {%r3292,%r3293,%r3294,%r3295}, {%r3210,%r3211}, {%r3346,%r3345};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1456,%r1457}, {%r3288,%r3289,%r3290,%r3291}, {%r3210,%r3211}, {%r3348,%r3347};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r1466,%r1467}, {%r3284,%r3285,%r3286,%r3287}, {%r3210,%r3211}, {%r3350,%r3349};");
-    blank(s);
-    w(s, "// end inline asm");
+    // GEMM0_prev: 16 MMA instructions (zigzag pattern)
+    emit_mma_zigzag_16(s,
+        &[[3284,3285,3286,3287],[3288,3289,3290,3291],[3292,3293,3294,3295],[3296,3297,3298,3299]],
+        &[[3212,3213],[3214,3215],[3280,3281],[3282,3283]],
+        &[[1156,1157],[1166,1167],[1176,1177],[1186,1187],[1196,1197],[1206,1207],[1216,1217],[1226,1227],[1236,1237],[1246,1247],[1256,1257],[1266,1267],[1276,1277],[1286,1287],[1296,1297],[1306,1307]],
+        &[[3342,3341],[3340,3339],[3338,3337],[3336,3335],[3328,3327],[3330,3329],[3332,3331],[3334,3333],[3326,3325],[3324,3323],[3322,3321],[3320,3319],[3312,3311],[3314,3313],[3316,3315],[3318,3317]],
+    );
+    // GEMM1_prev: 16 MMA instructions (zigzag pattern)
+    emit_mma_zigzag_16(s,
+        &[[3284,3285,3286,3287],[3288,3289,3290,3291],[3292,3293,3294,3295],[3296,3297,3298,3299]],
+        &[[3204,3205],[3206,3207],[3208,3209],[3210,3211]],
+        &[[1316,1317],[1326,1327],[1336,1337],[1346,1347],[1356,1357],[1366,1367],[1376,1377],[1386,1387],[1396,1397],[1406,1407],[1416,1417],[1426,1427],[1436,1437],[1446,1447],[1456,1457],[1466,1467]],
+        &[[3374,3373],[3372,3371],[3370,3369],[3368,3367],[3360,3359],[3362,3361],[3364,3363],[3366,3365],[3358,3357],[3356,3355],[3354,3353],[3352,3351],[3344,3343],[3346,3345],[3348,3347],[3350,3349]],
+    );
     w(s, "add.s32 \t%r1477, %r696, %r3203;");
     w(s, "and.b32  \t%r1476, %r3195, 1;");
     w(s, "// begin inline asm");
@@ -981,134 +899,20 @@ pub(crate) fn emit_kloop(s: &mut String) {
     w(s, "// begin inline asm");
     w(s, "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%r3208, %r3209, %r3210, %r3211}, [%r1572];");
     w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3342,%r3341}, {%r1116,%r1117,%r1118,%r1119}, {%r1136,%r1137}, {%r1156,%r1157};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3340,%r3339}, {%r1121,%r1122,%r1123,%r1124}, {%r1136,%r1137}, {%r1166,%r1167};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3338,%r3337}, {%r1126,%r1127,%r1128,%r1129}, {%r1136,%r1137}, {%r1176,%r1177};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3336,%r3335}, {%r1131,%r1132,%r1133,%r1134}, {%r1136,%r1137}, {%r1186,%r1187};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3328,%r3327}, {%r1131,%r1132,%r1133,%r1134}, {%r1138,%r1139}, {%r1196,%r1197};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3330,%r3329}, {%r1126,%r1127,%r1128,%r1129}, {%r1138,%r1139}, {%r1206,%r1207};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3332,%r3331}, {%r1121,%r1122,%r1123,%r1124}, {%r1138,%r1139}, {%r1216,%r1217};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3334,%r3333}, {%r1116,%r1117,%r1118,%r1119}, {%r1138,%r1139}, {%r1226,%r1227};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3326,%r3325}, {%r1116,%r1117,%r1118,%r1119}, {%r1141,%r1142}, {%r1236,%r1237};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3324,%r3323}, {%r1121,%r1122,%r1123,%r1124}, {%r1141,%r1142}, {%r1246,%r1247};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3322,%r3321}, {%r1126,%r1127,%r1128,%r1129}, {%r1141,%r1142}, {%r1256,%r1257};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3320,%r3319}, {%r1131,%r1132,%r1133,%r1134}, {%r1141,%r1142}, {%r1266,%r1267};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3312,%r3311}, {%r1131,%r1132,%r1133,%r1134}, {%r1143,%r1144}, {%r1276,%r1277};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3314,%r3313}, {%r1126,%r1127,%r1128,%r1129}, {%r1143,%r1144}, {%r1286,%r1287};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3316,%r3315}, {%r1121,%r1122,%r1123,%r1124}, {%r1143,%r1144}, {%r1296,%r1297};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3318,%r3317}, {%r1116,%r1117,%r1118,%r1119}, {%r1143,%r1144}, {%r1306,%r1307};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3374,%r3373}, {%r1116,%r1117,%r1118,%r1119}, {%r1146,%r1147}, {%r1316,%r1317};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3372,%r3371}, {%r1121,%r1122,%r1123,%r1124}, {%r1146,%r1147}, {%r1326,%r1327};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3370,%r3369}, {%r1126,%r1127,%r1128,%r1129}, {%r1146,%r1147}, {%r1336,%r1337};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3368,%r3367}, {%r1131,%r1132,%r1133,%r1134}, {%r1146,%r1147}, {%r1346,%r1347};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3360,%r3359}, {%r1131,%r1132,%r1133,%r1134}, {%r1148,%r1149}, {%r1356,%r1357};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3362,%r3361}, {%r1126,%r1127,%r1128,%r1129}, {%r1148,%r1149}, {%r1366,%r1367};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3364,%r3363}, {%r1121,%r1122,%r1123,%r1124}, {%r1148,%r1149}, {%r1376,%r1377};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3366,%r3365}, {%r1116,%r1117,%r1118,%r1119}, {%r1148,%r1149}, {%r1386,%r1387};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3358,%r3357}, {%r1116,%r1117,%r1118,%r1119}, {%r1151,%r1152}, {%r1396,%r1397};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3356,%r3355}, {%r1121,%r1122,%r1123,%r1124}, {%r1151,%r1152}, {%r1406,%r1407};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3354,%r3353}, {%r1126,%r1127,%r1128,%r1129}, {%r1151,%r1152}, {%r1416,%r1417};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3352,%r3351}, {%r1131,%r1132,%r1133,%r1134}, {%r1151,%r1152}, {%r1426,%r1427};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3344,%r3343}, {%r1131,%r1132,%r1133,%r1134}, {%r1153,%r1154}, {%r1436,%r1437};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3346,%r3345}, {%r1126,%r1127,%r1128,%r1129}, {%r1153,%r1154}, {%r1446,%r1447};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3348,%r3347}, {%r1121,%r1122,%r1123,%r1124}, {%r1153,%r1154}, {%r1456,%r1457};");
-    blank(s);
-    w(s, "// end inline asm");
-    w(s, "// begin inline asm");
-    w(s, "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%r3350,%r3349}, {%r1116,%r1117,%r1118,%r1119}, {%r1153,%r1154}, {%r1466,%r1467};");
-    blank(s);
-    w(s, "// end inline asm");
+    // GEMM0_curr: 16 MMA instructions (zigzag pattern)
+    emit_mma_zigzag_16(s,
+        &[[1116,1117,1118,1119],[1121,1122,1123,1124],[1126,1127,1128,1129],[1131,1132,1133,1134]],
+        &[[1136,1137],[1138,1139],[1141,1142],[1143,1144]],
+        &[[3342,3341],[3340,3339],[3338,3337],[3336,3335],[3328,3327],[3330,3329],[3332,3331],[3334,3333],[3326,3325],[3324,3323],[3322,3321],[3320,3319],[3312,3311],[3314,3313],[3316,3315],[3318,3317]],
+        &[[1156,1157],[1166,1167],[1176,1177],[1186,1187],[1196,1197],[1206,1207],[1216,1217],[1226,1227],[1236,1237],[1246,1247],[1256,1257],[1266,1267],[1276,1277],[1286,1287],[1296,1297],[1306,1307]],
+    );
+    // GEMM1_curr: 16 MMA instructions (zigzag pattern)
+    emit_mma_zigzag_16(s,
+        &[[1116,1117,1118,1119],[1121,1122,1123,1124],[1126,1127,1128,1129],[1131,1132,1133,1134]],
+        &[[1146,1147],[1148,1149],[1151,1152],[1153,1154]],
+        &[[3374,3373],[3372,3371],[3370,3369],[3368,3367],[3360,3359],[3362,3361],[3364,3363],[3366,3365],[3358,3357],[3356,3355],[3354,3353],[3352,3351],[3344,3343],[3346,3345],[3348,3347],[3350,3349]],
+        &[[1316,1317],[1326,1327],[1336,1337],[1346,1347],[1356,1357],[1366,1367],[1376,1377],[1386,1387],[1396,1397],[1406,1407],[1416,1417],[1426,1427],[1436,1437],[1446,1447],[1456,1457],[1466,1467]],
+    );
     w(s, "setp.gt.s32 \t%p34, %r3300, -1;");
     w(s, "mov.u32 \t%r3300, %r322;");
     w(s, "@%p34 bra \t$L__BB1_7;");

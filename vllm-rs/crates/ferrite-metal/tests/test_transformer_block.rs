@@ -214,6 +214,9 @@ fn test_transformer_block_e2e() {
     let rmsnorm_msl = rmsnorm_atom.emit_kernel(ferrite_metal::msl_builder::MslBuilder::new());
     let rmsnorm_pipeline = compile_kernel(&device, &rmsnorm_msl, "rmsnorm");
 
+    let convert_msl = ConvertAtom::emit_kernel("float", "half");
+    let convert_pipeline = compile_kernel(&device, &convert_msl, "convert");
+
     let gemm_config = MetalGemmConfig::default_apple9_f16();
     let gemm_msl = build_gemm_msl(
         &gemm_config,
@@ -282,11 +285,27 @@ fn test_transformer_block_e2e() {
         enc.end_encoding();
     }
 
-    // Step 2: GEMM for Q, K, V
-    // Note: GEMM expects f16 input but RmsNorm outputs f32.
-    // In a real pipeline, we'd convert. For this test, we'll
-    // use the CPU RmsNorm output (f16) and verify the pipeline logic.
-    // TODO: Add f16 output option to RmsNorm, or f32 input to GEMM.
+    // Step 1b: Convert h from f32 → f16 for GEMM input (GPU-resident)
+    let h_f16_buf = make_empty_f16(&device, seq_len as usize * d_model);
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&convert_pipeline);
+        enc.set_buffer(0, Some(&h_buf), 0);
+        enc.set_buffer(1, Some(&h_f16_buf), 0);
+        let count_val = (seq_len as u32) * (d_model as u32);
+        let count_buf = device.new_buffer_with_data(
+            &count_val as *const u32 as *const c_void,
+            4,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_buffer(2, Some(&count_buf), 0);
+        let tg = 256u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new((count_val as u64 + tg - 1) / tg, 1, 1),
+            MTLSize::new(tg, 1, 1),
+        );
+        enc.end_encoding();
+    }
 
     cmd.commit();
     cmd.wait_until_completed();
@@ -305,19 +324,12 @@ fn test_transformer_block_e2e() {
         rmsnorm_err
     );
 
-    // For the remaining steps, use CPU intermediate values
-    // (since we haven't built the precision conversion pipeline yet).
-    // This still validates that each kernel individually produces
-    // correct output — the e2e data flow test needs the type
-    // conversion atoms.
-
-    // Step 2 GPU: Q = h_f16 @ Wq (using CPU's h output converted to f16)
-    let h_for_gemm = make_buffer(&device, &h_f16);
+    // Step 2 GPU: Q = h_f16 @ Wq (fully GPU-resident — no CPU round-trip)
     let cmd2 = queue.new_command_buffer();
     {
         let enc = cmd2.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&gemm_pipeline);
-        enc.set_buffer(0, Some(&h_for_gemm), 0);
+        enc.set_buffer(0, Some(&h_f16_buf), 0);
         enc.set_buffer(1, Some(&wq_buf), 0);
         enc.set_buffer(2, Some(&q_buf), 0);
         let offsets: [u32; 4] = [seq_len, d_model as u32, d_model as u32, 0];
@@ -354,10 +366,16 @@ fn test_transformer_block_e2e() {
     for r in 0..seq_len as usize {
         let gpu_row = &q_gpu[r * d_model..(r + 1) * d_model];
         let cpu_row = &q_cpu[r * d_model..(r + 1) * d_model];
-        let row_err: f32 = gpu_row.iter().zip(cpu_row.iter())
-            .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let row_err: f32 = gpu_row
+            .iter()
+            .zip(cpu_row.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         if row_err > 0.01 {
-            eprintln!("  row {}: err={:.4} GPU={:?} CPU={:?}", r, row_err, gpu_row, cpu_row);
+            eprintln!(
+                "  row {}: err={:.4} GPU={:?} CPU={:?}",
+                r, row_err, gpu_row, cpu_row
+            );
         }
     }
     assert!(gemm_err < 0.1, "GEMM Q error too high: {}", gemm_err);
@@ -368,7 +386,7 @@ fn test_transformer_block_e2e() {
     for (w_buf, out_buf) in [(&wk_buf, &k_buf), (&wv_buf, &v_buf)] {
         let enc = cmd3.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&gemm_pipeline);
-        enc.set_buffer(0, Some(&h_for_gemm), 0);
+        enc.set_buffer(0, Some(&h_f16_buf), 0);
         enc.set_buffer(1, Some(w_buf), 0);
         enc.set_buffer(2, Some(out_buf), 0);
         let offsets: [u32; 4] = [seq_len, d_model as u32, d_model as u32, 0];
@@ -409,22 +427,46 @@ fn test_transformer_block_e2e() {
     eprintln!("GEMM K max error: {}", k_err);
     eprintln!("GEMM V max error: {}", v_err);
 
-    // Run attention: Q, K, V (f32) → attn_out (f32)
-    // Attention kernel expects f16 inputs. Convert GPU GEMM output to f16.
-    let q_f16: Vec<f16> = q_gpu.iter().map(|v| f16::from_f32(*v)).collect();
-    let k_f16_gpu: Vec<f16> = k_gpu.iter().map(|v| f16::from_f32(*v)).collect();
-    let v_f16_gpu: Vec<f16> = v_gpu.iter().map(|v| f16::from_f32(*v)).collect();
-    let q_attn_buf = make_buffer(&device, &q_f16);
-    let k_attn_buf = make_buffer(&device, &k_f16_gpu);
-    let v_attn_buf = make_buffer(&device, &v_f16_gpu);
+    // Convert Q, K, V from f32 → f16 on GPU for attention input
+    let elem_count = (seq_len as u32) * (d_model as u32);
+    let q_f16_buf = make_empty_f16(&device, elem_count as usize);
+    let k_f16_buf = make_empty_f16(&device, elem_count as usize);
+    let v_f16_buf = make_empty_f16(&device, elem_count as usize);
+    {
+        let cmd_conv = queue.new_command_buffer();
+        for (src, dst) in [
+            (&q_buf, &q_f16_buf),
+            (&k_buf, &k_f16_buf),
+            (&v_buf, &v_f16_buf),
+        ] {
+            let enc = cmd_conv.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&convert_pipeline);
+            enc.set_buffer(0, Some(src), 0);
+            enc.set_buffer(1, Some(dst), 0);
+            let count_buf = device.new_buffer_with_data(
+                &elem_count as *const u32 as *const c_void,
+                4,
+                MTLResourceOptions::StorageModeShared,
+            );
+            enc.set_buffer(2, Some(&count_buf), 0);
+            let tg = 256u64;
+            enc.dispatch_thread_groups(
+                MTLSize::new((elem_count as u64 + tg - 1) / tg, 1, 1),
+                MTLSize::new(tg, 1, 1),
+            );
+            enc.end_encoding();
+        }
+        cmd_conv.commit();
+        cmd_conv.wait_until_completed();
+    }
 
     let cmd4 = queue.new_command_buffer();
     {
         let enc = cmd4.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&attn_pipeline);
-        enc.set_buffer(0, Some(&q_attn_buf), 0);
-        enc.set_buffer(1, Some(&k_attn_buf), 0);
-        enc.set_buffer(2, Some(&v_attn_buf), 0);
+        enc.set_buffer(0, Some(&q_f16_buf), 0);
+        enc.set_buffer(1, Some(&k_f16_buf), 0);
+        enc.set_buffer(2, Some(&v_f16_buf), 0);
         enc.set_buffer(3, Some(&attn_buf), 0);
         let attn_params: [u32; 4] = [seq_len, d_head as u32, 1, 0];
         let attn_params_buf = device.new_buffer_with_data(
@@ -450,14 +492,36 @@ fn test_transformer_block_e2e() {
         .fold(0.0f32, f32::max);
     eprintln!("Attention max error: {}", attn_err);
 
+    // Convert attention output f32 → f16 on GPU
+    let attn_f16_buf = make_empty_f16(&device, elem_count as usize);
+    {
+        let cmd_conv = queue.new_command_buffer();
+        let enc = cmd_conv.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&convert_pipeline);
+        enc.set_buffer(0, Some(&attn_buf), 0);
+        enc.set_buffer(1, Some(&attn_f16_buf), 0);
+        let count_buf = device.new_buffer_with_data(
+            &elem_count as *const u32 as *const c_void,
+            4,
+            MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_buffer(2, Some(&count_buf), 0);
+        let tg = 256u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new((elem_count as u64 + tg - 1) / tg, 1, 1),
+            MTLSize::new(tg, 1, 1),
+        );
+        enc.end_encoding();
+        cmd_conv.commit();
+        cmd_conv.wait_until_completed();
+    }
+
     // Output projection: attn @ Wo
-    let attn_f16_gpu: Vec<f16> = attn_gpu.iter().map(|v| f16::from_f32(*v)).collect();
-    let attn_gemm_buf = make_buffer(&device, &attn_f16_gpu);
     let cmd5 = queue.new_command_buffer();
     {
         let enc = cmd5.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&gemm_pipeline);
-        enc.set_buffer(0, Some(&attn_gemm_buf), 0);
+        enc.set_buffer(0, Some(&attn_f16_buf), 0);
         enc.set_buffer(1, Some(&wo_buf), 0);
         enc.set_buffer(2, Some(&o_buf), 0);
         let offsets: [u32; 4] = [seq_len, d_model as u32, d_model as u32, 0];

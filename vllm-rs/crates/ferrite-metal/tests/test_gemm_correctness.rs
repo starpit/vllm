@@ -315,7 +315,10 @@ fn test_gemm_4x8_k8() {
     assert!(
         err < 0.01,
         "4×8 k=8: max abs error {}, expected all {}, got row0={:?} row1={:?}",
-        err, k as f32, &gpu_c[..n as usize], &gpu_c[n as usize..2 * n as usize]
+        err,
+        k as f32,
+        &gpu_c[..n as usize],
+        &gpu_c[n as usize..2 * n as usize]
     );
 }
 

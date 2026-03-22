@@ -16,6 +16,7 @@
 /// - `A_mat`, `B_mat`: simdgroup_matrix locals
 /// - `C_sram[tm][tn]`: accumulator array
 /// - `kt`, `tm`, `tn`: tile loop indices
+pub mod convert;
 mod element_mul;
 mod epilogue;
 mod fragment_load;
@@ -26,6 +27,7 @@ pub mod rope;
 mod tile_copy;
 mod transform;
 
+pub use convert::*;
 pub use element_mul::*;
 pub use epilogue::*;
 pub use fragment_load::*;

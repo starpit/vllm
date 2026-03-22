@@ -15,8 +15,9 @@ pub struct MegakernelConfig {
     pub seq_len: u32,
     pub d_model: u32,
     pub d_head: u32,
-    pub d_ffn: u32, // FFN intermediate dimension (typically 4 * d_model or 8/3 * d_model)
+    pub d_ffn: u32,
     pub num_heads: u32,
+    pub num_layers: u32,
     pub num_threadgroups: u32,
     pub threads_per_tg: u32,
     pub eps: f32,
@@ -25,20 +26,27 @@ pub struct MegakernelConfig {
 }
 
 impl MegakernelConfig {
-    /// Small config for testing.
     pub fn test_config() -> Self {
         Self {
             seq_len: 4,
             d_model: 8,
             d_head: 8,
-            d_ffn: 16, // 2x d_model for testing
+            d_ffn: 16,
             num_heads: 1,
+            num_layers: 1,
             num_threadgroups: 1,
             threads_per_tg: 32,
             eps: 1e-5,
             causal: false,
             precision: Precision::FP16,
         }
+    }
+
+    /// Multi-layer config for testing.
+    pub fn test_config_multi_layer(num_layers: u32) -> Self {
+        let mut c = Self::test_config();
+        c.num_layers = num_layers;
+        c
     }
 }
 
@@ -73,6 +81,23 @@ pub fn build_megakernel_msl(config: &MegakernelConfig) -> String {
         + 64 * 4; // O scratch (f32, 8×8)
     let smem_size = gemm_smem.max(rmsnorm_smem).max(attn_smem);
     msl.set("SMEM_SIZE", smem_size.to_string());
+    msl.set("NUM_LAYERS", config.num_layers.to_string());
+
+    // Per-layer weight sizes (in elements, for stride computation)
+    let attn_weight_size = config.d_model * config.d_model; // Wq, Wk, Wv, Wo each
+    let gamma_size = config.d_model;
+    let ffn_gate_size = config.d_ffn * config.d_model; // W_gate, W_up each
+    let ffn_down_size = config.d_model * config.d_ffn; // W_down
+    // Total per-layer weight stride (in f16 elements for weight matrices, f32 for gamma)
+    // Pack order: gamma_attn, Wq, Wk, Wv, Wo, gamma_ffn, W_gate, W_up, W_down
+    let layer_gamma_stride = gamma_size * 2; // two gamma vectors per layer (attn + ffn)
+    let layer_weight_stride = attn_weight_size * 4 + ffn_gate_size * 2 + ffn_down_size;
+    msl.set("LAYER_GAMMA_STRIDE", layer_gamma_stride.to_string());
+    msl.set("LAYER_WEIGHT_STRIDE", layer_weight_stride.to_string());
+    msl.set("ATTN_WEIGHT_SIZE", attn_weight_size.to_string());
+    msl.set("FFN_GATE_SIZE", ffn_gate_size.to_string());
+    msl.set("FFN_DOWN_SIZE", ffn_down_size.to_string());
+    msl.set("GAMMA_SIZE", gamma_size.to_string());
 
     msl.raw("#include <metal_stdlib>");
     msl.raw("using namespace metal;");
@@ -83,41 +108,30 @@ pub fn build_megakernel_msl(config: &MegakernelConfig) -> String {
         r#"
 kernel void transformer_block(
     // Input / output
-    device float *x [[buffer(0)]],           // [seq_len, d_model] f32 input
-    device float *out [[buffer(1)]],         // [seq_len, d_model] f32 output
+    device float *x [[buffer(0)]],           // [seq_len, d_model] f32 (modified in-place across layers)
+    device float *out [[buffer(1)]],         // [seq_len, d_model] f32 final output
 
-    // Weights
-    device float *gamma [[buffer(2)]],       // [d_model] RmsNorm weights
-    device {{MEM_TYPE}} *Wq [[buffer(3)]],   // [d_model, d_model] query
-    device {{MEM_TYPE}} *Wk [[buffer(4)]],   // [d_model, d_model] key
-    device {{MEM_TYPE}} *Wv [[buffer(5)]],   // [d_model, d_model] value
-    device {{MEM_TYPE}} *Wo [[buffer(6)]],   // [d_model, d_model] output proj
+    // Packed weights: all layers concatenated
+    device float *all_gamma [[buffer(2)]],   // [num_layers, 2, d_model] gamma_attn + gamma_ffn per layer
+    device {{MEM_TYPE}} *all_weights [[buffer(3)]], // packed: [num_layers × (Wq+Wk+Wv+Wo+Wgate+Wup+Wdown)]
 
-    // Intermediates (pre-allocated by host)
-    device float *h [[buffer(7)]],           // [seq_len, d_model] RmsNorm output
-    device {{MEM_TYPE}} *h_f16 [[buffer(8)]],// [seq_len, d_model] converted
-    device float *qkv [[buffer(9)]],         // [3, seq_len, d_model] Q,K,V f32
-    device {{MEM_TYPE}} *qkv_f16 [[buffer(10)]], // [3, seq_len, d_model] Q,K,V f16
-    device float *attn_out [[buffer(11)]],   // [seq_len, d_model] attention output
-    device {{MEM_TYPE}} *attn_f16 [[buffer(12)]], // converted
-    device float *o [[buffer(13)]],          // [seq_len, d_model] output projection
+    // Intermediates (reused each layer)
+    device float *h [[buffer(4)]],
+    device {{MEM_TYPE}} *h_f16 [[buffer(5)]],
+    device float *qkv [[buffer(6)]],
+    device {{MEM_TYPE}} *qkv_f16 [[buffer(7)]],
+    device float *attn_out [[buffer(8)]],
+    device {{MEM_TYPE}} *attn_f16 [[buffer(9)]],
+    device float *o [[buffer(10)]],
+    device float *h_ffn [[buffer(11)]],
+    device {{MEM_TYPE}} *h_ffn_f16 [[buffer(12)]],
+    device float *gate_out [[buffer(13)]],
+    device float *up_out [[buffer(14)]],
+    device {{MEM_TYPE}} *ffn_act [[buffer(15)]],
+    device float *down_out [[buffer(16)]],
 
-    // FFN weights
-    device float *gamma_ffn [[buffer(14)]],  // [d_model] FFN RmsNorm weights
-    device {{MEM_TYPE}} *W_gate [[buffer(15)]], // [d_ffn, d_model] gate projection
-    device {{MEM_TYPE}} *W_up [[buffer(16)]],   // [d_ffn, d_model] up projection
-    device {{MEM_TYPE}} *W_down [[buffer(17)]], // [d_model, d_ffn] down projection
-
-    // FFN intermediates
-    device float *h_ffn [[buffer(18)]],      // [seq_len, d_model] FFN RmsNorm output
-    device {{MEM_TYPE}} *h_ffn_f16 [[buffer(19)]], // converted
-    device float *gate_out [[buffer(20)]],   // [seq_len, d_ffn] gate projection
-    device float *up_out [[buffer(21)]],     // [seq_len, d_ffn] up projection
-    device {{MEM_TYPE}} *ffn_act [[buffer(22)]], // [seq_len, d_ffn] silu(gate)*up as f16
-    device float *down_out [[buffer(23)]],   // [seq_len, d_model] down projection
-
-    // Sync (for multi-threadgroup)
-    device atomic_uint *phase_counter [[buffer(24)]],
+    // Sync
+    device atomic_uint *phase_counter [[buffer(17)]],
 
     // Thread info
     uint gid [[threadgroup_position_in_grid]],
@@ -162,6 +176,28 @@ auto sync_phase = [&](uint expected_count) {
 "#,
         );
     }
+
+    // Layer loop
+    msl.comment("Layer loop");
+    msl.line("for (uint layer = 0; layer < {{NUM_LAYERS}}; layer++) {");
+    msl.indent();
+
+    // Unpack per-layer weight pointers from packed buffers
+    msl.block(
+        r#"
+// Per-layer weight pointers (packed contiguously)
+device float *gamma = all_gamma + layer * {{LAYER_GAMMA_STRIDE}};
+device float *gamma_ffn = gamma + {{GAMMA_SIZE}};
+device {{MEM_TYPE}} *layer_w = all_weights + layer * {{LAYER_WEIGHT_STRIDE}};
+device {{MEM_TYPE}} *Wq = layer_w;
+device {{MEM_TYPE}} *Wk = Wq + {{ATTN_WEIGHT_SIZE}};
+device {{MEM_TYPE}} *Wv = Wk + {{ATTN_WEIGHT_SIZE}};
+device {{MEM_TYPE}} *Wo = Wv + {{ATTN_WEIGHT_SIZE}};
+device {{MEM_TYPE}} *W_gate = Wo + {{ATTN_WEIGHT_SIZE}};
+device {{MEM_TYPE}} *W_up = W_gate + {{FFN_GATE_SIZE}};
+device {{MEM_TYPE}} *W_down = W_up + {{FFN_GATE_SIZE}};
+"#,
+    );
 
     // ═══════════════════════════════════════════════════════════════
     // Phase 1: RmsNorm(x) → h
@@ -408,17 +444,24 @@ threadgroup_barrier(mem_flags::mem_device);
     // ═══════════════════════════════════════════════════════════════
     // Phase 13: Final residual add: out = x + down_out
     // ═══════════════════════════════════════════════════════════════
-    msl.comment("Phase 13: Residual add (FFN)");
+    msl.comment("Phase 13: Residual add (FFN) — write to x for next layer, or out on last");
     msl.block(
         r#"
 {
+    bool last_layer = (layer == {{NUM_LAYERS}} - 1);
     for (uint i = gid * {{THREADS_PER_TG}} + tid_in_tg; i < total_elems;
          i += num_tg * {{THREADS_PER_TG}}) {
-        out[i] = x[i] + down_out[i];
+        float val = x[i] + down_out[i];
+        x[i] = val;
+        if (last_layer) out[i] = val;
     }
 }
 "#,
     );
+
+    // Close layer loop
+    msl.dedent();
+    msl.raw("}"); // end layer loop
 
     msl.close_brace();
     msl.finish()

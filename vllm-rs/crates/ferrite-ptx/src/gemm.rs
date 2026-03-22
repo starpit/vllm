@@ -2847,7 +2847,7 @@ pub fn build_gemm(config: &GemmConfig) -> String {
     ptx.finalize("triton_style_gemm", &gemm_params())
 }
 
-fn gemm_params() -> Vec<(&'static str, &'static str)> {
+pub(crate) fn gemm_params() -> Vec<(&'static str, &'static str)> {
     vec![
         (".u64 .ptr .global .align 16", "param_A"),
         (".u64 .ptr .global .align 16", "param_B"),

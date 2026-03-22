@@ -1418,50 +1418,185 @@ rust-cuda (`rustc_codegen_nvvm`) which compiles Rust through libnvvm — NVIDIA'
 own optimizer, the same backend as nvcc. This gives nvcc-quality register allocation
 and instruction scheduling while keeping everything in Rust.
 
-## Phase 1: rust-cuda Megakernel Prototype
+## Phase 1 Results: Kernel Library (March 22, 2026)
 
-### Goal
+Phase 1 built the individual kernel building blocks needed for a full LLaMA
+megakernel. All kernels are hand-written PTX emitted from Rust, following the
+process: dump reference PTX → study line by line → replicate exactly → verify.
 
-Write a fused RMSNorm → GEMM → SiLU kernel in Rust using rust-cuda, compiled
-through libnvvm. Benchmark the GEMM alone for parity with cuBLAS, then benchmark
-the fused kernel against unfused cuBLAS + separate norm/activation.
+### New Kernels Built
 
-### Steps
+| Kernel | Config | Performance | vs Reference |
+|--------|--------|-------------|-------------|
+| Flash Attention d=128 | BLOCK_M=128, BLOCK_N=32, 4 warps | **52.8 TFLOPS** | 0.75× FA2 |
+| Flash Attention d=64 causal | FA2-style mask, reverse iteration | **Correct** | FA2 pattern |
+| Flash Attention d=64 paged KV | block_table indirect addressing | **Correct** | FA2 C++ reference |
+| SiLU × Up | Literal Triton PTX copy | **0.000086 err** | 669 GB/s |
+| Rotary Embeddings (RoPE) | Triton PTX copy + smem transpose | **0.000244 err** | 600 GB/s |
 
-1. **Set up rust-cuda compilation for vllm-rs**
-   - Add rust-cuda as a build dependency
-   - Write a standalone GEMM kernel in Rust GPU code with `asm!()` for mma.sync
-   - Port CubeK's tile config (128×128, partition 4×4×2, B128 swizzle)
-   - Benchmark: target ≥85% of cuBLAS (libnvvm should handle register allocation)
+**Total: 80 unit tests, all passing.**
 
-2. **Add MMA wrapper library**
-   - Safe Rust wrappers around `asm!()` for mma.sync, ldmatrix, cp.async
-   - Swizzle helpers matching CubeK's patterns
-   - Shared memory tile abstractions
+### Key Technical Discoveries
 
-3. **Write the first fused kernel**
-   - RMSNorm → GEMM → SiLU in one `#[kernel]` function
-   - Norm output stays in shared memory, feeds directly into GEMM tiles
-   - SiLU applied in registers before writing to global memory
-   - Benchmark against: cuBLAS GEMM + separate norm kernel + separate SiLU kernel
+1. **ptxas reorders predicated writes to MMA accumulators.** The causal mask bug:
+   writing -inf back to MMA output registers via `selp.f32` was reordered BEFORE
+   the MMA by ptxas. Fix: write to NEW registers (FA2's exact pattern). Verified
+   via cuobjdump SASS inspection.
 
-4. **Wire into vllm-rs**
-   - `#[cfg(feature = "ferrite")]` in model/llama.rs
-   - Replace one MLP block with the fused kernel
-   - End-to-end inference benchmark
+2. **NonBlocking CUDA streams don't sync with stream-0 memcpy.** Caused silent
+   data races in benchmark harness. Fix: use null stream for correctness tests.
 
-5. **Build the proc macro**
-   - Analyze Rust function body → dataflow graph
-   - Identify fusible operation sequences
-   - Generate fused `#[kernel]` Rust GPU code
-   - cuda_builder compiles at build time, cubin embedded in binary
+3. **FA2 causal kernel iterates KV blocks in REVERSE order** (last to first),
+   with 2 peeled masked iterations + unmasked fast loop. This is structurally
+   different from non-causal — not just "add a mask."
 
-### What Phase 1 proves
+4. **d=128 flash attention uses BLOCK_N=32** (not 64) on SM89 for 48KB smem →
+   2 CTAs per SM. V must be physically transposed in smem (128×32 → 32×128).
 
-- rust-cuda/libnvvm achieves cuBLAS-parity GEMM from Rust code
-- Cross-operation fusion (norm → GEMM → activation) works in one kernel
-- The fused kernel beats unfused cuBLAS + separate kernels
-- The proc macro can automatically generate fused kernels
+### What's Still Missing for Megakernel LLaMA
+
+The proc macro (`ferrite-macros`) can fuse `RMSNorm → GEMM → SiLU → GEMM` today
+(1.21× vs torch.compile). But a full LLaMA transformer layer needs more ops:
+
+| Op | Status | Needed For |
+|----|--------|-----------|
+| RmsNorm | ✅ Proc macro | Attention pre-norm, MLP pre-norm |
+| GEMM | ✅ Proc macro | QKV proj, O proj, gate/up/down proj |
+| SiLU | ✅ Proc macro | MLP activation |
+| GELU | ✅ Proc macro | Alternative activation |
+| ResidualAdd | ✅ Proc macro | Post-attention, post-MLP |
+| **Mul** | ❌ Missing | SiLU(gate) × up (elementwise multiply) |
+| **Parallel GEMM** | ❌ Missing | gate_proj ∥ up_proj (shared input) |
+| **RotaryEmbed** | ❌ Missing | RoPE on Q, K |
+| **Attention** | ❌ Missing | Opaque megakernel op in DAG |
+| **PagedAttention** | ❌ Missing | Decode-time attention with paged KV |
+
+---
+
+## Phase 2 Plan: Megakernel LLaMA
+
+### The Vision
+
+Today, `llama.rs` is 3,443 lines of kernel orchestration code shared by
+multiple model variants (LLaMA, Mistral, CodeLlama, etc.), with complex
+conditional logic for RoPE variants, GQA, sliding window, etc.
+
+In the megakernel world, each model architecture is a clean ~50 line proc macro
+invocation:
+
+```rust
+// llamaf.rs — the ENTIRE model architecture
+#[ferrite::fuse(arch = "sm_89")]
+fn llama_layer(
+    x: Tensor, residual: Tensor,
+    qkv_weight: Tensor, o_weight: Tensor,
+    gate_weight: Tensor, up_weight: Tensor, down_weight: Tensor,
+    attn_norm_w: Tensor, mlp_norm_w: Tensor,
+    cos: Tensor, sin: Tensor,
+    kv_cache: PagedCache,
+) -> (Tensor, Tensor) {
+    // Attention block
+    let normed = rmsnorm(x, attn_norm_w);
+    let qkv = gemm(normed, qkv_weight);
+    let (q, k, v) = split_heads(qkv);
+    let (q, k) = rotary(q, k, cos, sin);
+    let attn_out = attention(q, k, v, kv_cache, causal=true);
+    let o = gemm(attn_out, o_weight);
+    let (x, residual) = residual_add(o, residual);
+
+    // MLP block
+    let normed = rmsnorm(x, mlp_norm_w);
+    let gate = gemm(normed, gate_weight);
+    let up = gemm(normed, up_weight);       // parallel with gate
+    let hidden = silu(gate) * up;
+    let down = gemm(hidden, down_weight);
+    let (x, residual) = residual_add(down, residual);
+
+    (x, residual)
+}
+```
+
+The proc macro generates fused megakernels:
+- **MLP megakernel**: RMSNorm → parallel GEMM(gate,up) → SiLU×Up → GEMM(down)
+  → 1 kernel launch instead of 6+
+- **Attention pre-processing**: RMSNorm → GEMM(QKV) → RoPE → split heads
+  → 1 kernel launch instead of 4+
+- **Flash attention**: already a megakernel (Q@K^T + softmax + P@V)
+- **Post-processing**: GEMM(O) → ResidualAdd → 1 launch
+
+Different architectures become trivial variants:
+
+```rust
+// mistral.rs — just LLaMA with sliding window attention
+fn mistral_layer(...) -> ... {
+    // Same as llama_layer but:
+    let attn_out = attention(q, k, v, kv_cache, causal=true, window=4096);
+    // ... rest identical
+}
+
+// gemma.rs — different norm, different activation
+fn gemma_layer(...) -> ... {
+    let normed = rmsnorm_with_offset(x, norm_w, 1.0);  // +1 offset
+    // ... uses GELU instead of SiLU
+    let hidden = gelu(gate) * up;
+    // ...
+}
+```
+
+### Implementation Steps (Layer by Layer)
+
+Each step must be fully tested before moving to the next.
+
+**Step 1: Add `Mul` op to proc macro**
+- Add `OpKind::Mul` (elementwise multiply of two tensors)
+- `OpClass::Elementwise`, uses `mul.rn.f16x2` atom
+- Needed for: `silu(gate) * up`
+- Test: fuse `GEMM → SiLU → Mul` and verify correctness
+- Reference: study Triton's SiLU×up PTX for the mul pattern
+
+**Step 2: Add parallel GEMM support**
+- Two GEMMs sharing the same input: `gate = gemm(x, w_gate)`, `up = gemm(x, w_up)`
+- Strategy: the fusion engine recognizes shared-input GEMMs and either:
+  (a) concatenates weights and does one wide GEMM + split, or
+  (b) emits two GEMM kernel calls with shared input tile in smem
+- Test: verify `parallel_gemm(x, w_gate, w_up)` matches separate GEMMs
+
+**Step 3: Full MLP megakernel**
+- `RMSNorm → parallel GEMM(gate, up) → SiLU × Up → GEMM(down)`
+- This is the proc macro's primary target: one kernel launch for the MLP
+- Benchmark vs torch.compile and vs our current 2-GEMM fused kernel
+- This should exceed the 1.21× speedup (current MLP uses 2 GEMM launches)
+
+**Step 4: Add `RotaryEmbed` op to proc macro**
+- `OpKind::RotaryEmbed` with cos/sin inputs
+- `OpClass::Elementwise` — applied as epilogue after QKV GEMM
+- Reference: our standalone rotary kernel PTX
+- Test: fuse `GEMM(QKV) → RotaryEmbed` and verify
+
+**Step 5: Add `Attention` as opaque op**
+- `OpKind::Attention` — not fusible internally (already a megakernel)
+- The proc macro treats it as a "barrier" — flush intermediates to global,
+  call flash attention, load results back
+- Variants: causal, non-causal, paged KV
+- Test: verify attention output through the DAG matches standalone kernel
+
+**Step 6: Wire into vllm-rs**
+- Create `llamaf.rs` using `#[ferrite::fuse]` with all ops
+- Map `GpuTensor` ↔ `DevicePtr` at the boundary
+- Feature flag: `#[cfg(feature = "ferrite")]`
+- Test: end-to-end inference matches existing llama.rs output
+
+**Step 7: Additional architectures**
+- `mistralf.rs`, `gemmaf.rs`, `qwen2f.rs` — trivial variants
+- Each is ~50 lines instead of ~1000-3000 lines
+- Test: output parity with existing model implementations
+
+### Success Criteria
+
+1. LLaMA-7B inference produces identical output via `llamaf.rs` and `llama.rs`
+2. `llamaf.rs` is < 100 lines (vs 3,443 for `llama.rs`)
+3. MLP megakernel: > 1.3× faster than torch.compile
+4. End-to-end: measurable latency reduction on LLaMA-7B generation
 
 ---
 

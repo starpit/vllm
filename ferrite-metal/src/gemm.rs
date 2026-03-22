@@ -323,17 +323,26 @@ fn emit_store_c(msl: &mut MslBuilder, config: &MetalGemmConfig) {
     msl.set("REGISTER_M", config.register_m().to_string());
     msl.set("REGISTER_N", config.register_n().to_string());
     msl.set("REGISTER_NAME_C", config.register_precisions.c.msl_name());
+    msl.set("MEMORY_NAME_C", config.memory_precisions.c.msl_name());
 
+    // Fast path: direct store from registers to device memory.
+    // MFA's createStoreC uses this when the tile is fully within bounds.
     msl.block(r#"
-// Store accumulators to device memory.
+// Store accumulators to device memory (fast path).
+{
+    uint2 C_offset(N_offset + offset_in_group.x,
+                   M_offset + offset_in_group.y);
+    auto C_dst = simdgroup_matrix_storage<{{MEMORY_NAME_C}}>::apply_offset(
+        C, N, C_offset);
+
 #pragma clang loop unroll(full)
-for (ushort m = 0; m < {{REGISTER_M}}; m += 8) {
+    for (ushort m = 0; m < {{REGISTER_M}}; m += 8) {
 #pragma clang loop unroll(full)
-    for (ushort n = 0; n < {{REGISTER_N}}; n += 8) {
-        auto C = get_sram(C_sram, {{REGISTER_N}}, ushort2(n, m));
-        uint2 C_offset(N_offset + offset_in_group.x + n,
-                       M_offset + offset_in_group.y + m);
-        C->store(C, N, C_offset, false);
+        for (ushort n = 0; n < {{REGISTER_N}}; n += 8) {
+            ushort2 origin(n, m);
+            auto C_acc = get_sram(C_sram, {{REGISTER_N}}, origin);
+            C_acc->store(C_dst, N, origin);
+        }
     }
 }
 "#);

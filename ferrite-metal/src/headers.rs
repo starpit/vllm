@@ -234,8 +234,8 @@ namespace metal
 
     METAL_FUNC simdgroup_matrix_storage() thread = default;
 
-    METAL_FUNC simdgroup_matrix_storage(T value) thread {
-      *(thread T*)(&t) = value;
+    METAL_FUNC simdgroup_matrix_storage(vec<T, 2> thread_elements) thread {
+      *(this->thread_elements()) = thread_elements;
     }
 
     METAL_FUNC thread vec<T, 2>* thread_elements() thread {
@@ -302,12 +302,17 @@ namespace metal
       }
     }
 
-    // Multiply-accumulate.
+    // Multiply-accumulate: C += A × B (or C = A × B if !accumulate).
+    template <typename U, typename V>
     METAL_FUNC void multiply(
-      simdgroup_matrix_storage<T> a,
-      simdgroup_matrix_storage<T> b
+      simdgroup_matrix_storage<U> a,
+      simdgroup_matrix_storage<V> b,
+      bool accumulate = true
     ) {
-      t = __metal_simdgroup_matrix_multiply_accumulate(
+      if (!accumulate) {
+        *(thread_elements()) = vec<T, 2>(0);
+      }
+      t = __metal_simdgroup_matrix_8x8_multiply_accumulate(
         a.t, b.t, t, typename simdgroup_matrix_storage<T>::storage_type());
     }
 
@@ -371,8 +376,12 @@ mod tests {
         assert!(h.contains("METAL_FUNC void load"), "Missing load method");
         assert!(h.contains("METAL_FUNC void store"), "Missing store method");
         assert!(h.contains("METAL_FUNC void multiply"), "Missing multiply method");
+        assert!(h.contains("__metal_simdgroup_matrix_8x8_multiply_accumulate"),
+            "Missing actual Metal intrinsic for MMA");
         assert!(h.contains("thread_elements()"), "Missing thread_elements accessor");
         assert!(h.contains("apply_offset"), "Missing apply_offset static method");
+        assert!(h.contains("vec<T, 64>"), "Storage must be vec<T, 64>");
+        assert!(h.contains("vec<T, 2>*"), "thread_elements must return vec<T, 2>*");
     }
 
     #[test]

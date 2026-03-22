@@ -222,8 +222,105 @@ fn test_msl_balanced_braces() {
 
 #[test]
 fn test_no_template_variables_remain() {
+    for config in [
+        MetalGemmConfig::default_apple9_f16(),
+        MetalGemmConfig::default_apple8_f16(),
+    ] {
+        let msl = build_standalone_gemm(&config);
+        assert!(!msl.contains("{{"), "Unreplaced template variable in {} config: {}",
+            if config.prefer_async_load { "apple9" } else { "apple8" },
+            msl.lines().find(|l| l.contains("{{")).unwrap_or("???"));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Full MSL structure — validate the complete kernel looks right
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_full_kernel_has_complete_pipeline() {
     let config = MetalGemmConfig::default_apple9_f16();
     let msl = build_standalone_gemm(&config);
-    assert!(!msl.contains("{{"), "Unreplaced template variable found in output: {}",
-        msl.lines().find(|l| l.contains("{{")).unwrap_or("???"));
+
+    // The kernel should have all pipeline stages in order:
+    // 1. Headers (simdgroup_event, simdgroup_matrix_storage)
+    // 2. Constants (M_group, N_group, K_group)
+    // 3. Utilities (morton_order, get_sram)
+    // 4. Kernel signature
+    // 5. Thread setup (M_offset, N_offset, morton_offset)
+    // 6. Accumulator init (C_sram)
+    // 7. K-loop with:
+    //    a. Tile copy (async_copy or direct)
+    //    b. threadgroup_barrier
+    //    c. Fragment loads (A->load, B->load)
+    //    d. Multiply (C->multiply)
+    //    e. Final barrier
+    // 8. Store (C_acc->store)
+
+    let header_pos = msl.find("__METAL_SIMDGROUP_EVENT").unwrap();
+    let matrix_pos = msl.find("__METAL_SIMDGROUP_MATRIX_STORAGE").unwrap();
+    let const_pos = msl.find("M_group").unwrap();
+    let morton_pos = msl.find("morton_order").unwrap();
+    let kernel_pos = msl.find("kernel void gemm").unwrap();
+    let setup_pos = msl.find("M_offset").unwrap();
+    let acc_pos = msl.find("C_sram").unwrap();
+    let kloop_pos = msl.find("for (uint k = 0").unwrap();
+    let store_pos = msl.find("C_acc->store").unwrap();
+
+    assert!(header_pos < matrix_pos, "Event header before matrix header");
+    assert!(matrix_pos < const_pos, "Headers before constants");
+    assert!(const_pos < morton_pos, "Constants before utilities");
+    assert!(morton_pos < kernel_pos, "Utilities before kernel");
+    assert!(kernel_pos < setup_pos, "Kernel before setup");
+    assert!(setup_pos < acc_pos, "Setup before accumulators");
+    assert!(acc_pos < kloop_pos, "Accumulators before K-loop");
+    assert!(kloop_pos < store_pos, "K-loop before store");
+}
+
+#[test]
+fn test_k_loop_has_correct_inner_structure() {
+    let config = MetalGemmConfig::default_apple9_f16();
+    let msl = build_standalone_gemm(&config);
+
+    // Within the K-loop, the inner structure should be:
+    // 1. Tile copy setup (A_block, B_block pointers)
+    // 2. async_copy (apple9) or nothing (apple8)
+    // 3. threadgroup_barrier
+    // 4. apply_offset for A_block_src, B_block_src
+    // 5. Inner k_inner loop (unrolled):
+    //    a. A->load (fragment load)
+    //    b. B->load (fragment load)
+    //    c. C->multiply
+    // 6. Final threadgroup_barrier
+
+    // Find the K-loop body
+    let kloop_start = msl.find("for (uint k = 0; k < K; k += K_group)").unwrap();
+    let kloop_body = &msl[kloop_start..];
+
+    assert!(kloop_body.contains("A_block"), "K-loop must have A_block pointer");
+    assert!(kloop_body.contains("B_block"), "K-loop must have B_block pointer");
+    assert!(kloop_body.contains("apply_offset"), "K-loop must compute block src offsets");
+    assert!(kloop_body.contains("for (ushort k_inner"), "K-loop must have inner k_inner loop");
+    assert!(kloop_body.contains("#pragma clang loop unroll(full)"), "Inner loop must be unrolled");
+
+    // Fragment loads in correct order within inner loop
+    let inner_start = kloop_body.find("for (ushort k_inner").unwrap();
+    let inner_body = &kloop_body[inner_start..];
+    let a_load = inner_body.find("A->load").unwrap();
+    let b_load = inner_body.find("B->load").unwrap();
+    let multiply = inner_body.find("C->multiply").unwrap();
+    assert!(a_load < b_load, "A load before B load in inner loop");
+    assert!(b_load < multiply, "B load before multiply in inner loop");
+}
+
+#[test]
+fn test_store_phase_uses_apply_offset() {
+    let config = MetalGemmConfig::default_apple9_f16();
+    let msl = build_standalone_gemm(&config);
+
+    // Store phase should compute C_dst via apply_offset
+    let store_section = msl.rfind("Store accumulators").unwrap();
+    let store_body = &msl[store_section..];
+    assert!(store_body.contains("apply_offset"), "Store must use apply_offset for C address");
+    assert!(store_body.contains("C_acc->store"), "Store must call store on accumulators");
 }

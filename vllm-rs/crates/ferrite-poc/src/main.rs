@@ -3778,50 +3778,127 @@ fn run_silu_mul() -> Result<()> {
 fn run_rotary() -> Result<()> {
     let ptx = rotary::emit_rotary_kernel();
     println!("  Generated {} bytes of PTX", ptx.len());
+    std::fs::write("/tmp/ferrite_rotary.ptx", &ptx).ok();
     let ptx_cstr = CString::new(ptx.as_bytes()).context("PTX null")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
     let func = unsafe { cuda::module::get_function(module, CString::new("rotary_kernel").unwrap())? };
-    let seqlen: u32 = 128; let nheads: u32 = 32; let headdim: u32 = 128; let half_dim: u32 = 64;
-    let n_x = (seqlen * nheads * headdim) as usize; let n_cs = (seqlen * half_dim) as usize;
-    let d_x = unsafe { cuda::malloc_sync(n_x * 2)? }; let d_out = unsafe { cuda::malloc_sync(n_x * 2)? };
-    let d_cos = unsafe { cuda::malloc_sync(n_cs * 4)? }; let d_sin = unsafe { cuda::malloc_sync(n_cs * 4)? };
+
+    let batch: u32 = 1;
+    let seqlen: u32 = 128;
+    let nheads: u32 = 32;
+    let headdim: u32 = 128;
+    let half_dim: u32 = headdim / 2;
+
+    // Contiguous [batch, seqlen, nheads, headdim] layout
+    let stride_out_seqlen: u32 = nheads * headdim;
+    let stride_out_nheads: u32 = headdim;
+    let stride_out_headdim: u32 = 1;
+    let stride_x_seqlen: u32 = nheads * headdim; // same as out
+
+    let n_x = (batch * seqlen * nheads * headdim) as usize;
+    let n_cs = (seqlen * half_dim) as usize;
+    let d_x = unsafe { cuda::malloc_sync(n_x * 2)? };
+    let d_out = unsafe { cuda::malloc_sync(n_x * 2)? };
+    let d_cos = unsafe { cuda::malloc_sync(n_cs * 4)? };
+    let d_sin = unsafe { cuda::malloc_sync(n_cs * 4)? };
+
     let h_x: Vec<half::f16> = (0..n_x).map(|i| half::f16::from_f32(((i % 17) as f32 - 8.0) * 0.05)).collect();
     let h_cos: Vec<f32> = (0..n_cs).map(|i| ((i % 31) as f32 - 15.0) * 0.1).collect();
     let h_sin: Vec<f32> = (0..n_cs).map(|i| ((i % 23) as f32 - 11.0) * 0.1).collect();
-    unsafe { cuda::memcpy_htod_sync(d_x, &h_x)?; cuda::memcpy_htod_sync(d_cos, &h_cos)?; cuda::memcpy_htod_sync(d_sin, &h_sin)?; cuda::memset_d8_sync(d_out, 0, n_x * 2)?; }
-    let total_half: u32 = seqlen * nheads * half_dim; let nheads_x_half_dim: u32 = nheads * half_dim;
-    let grid_x = (total_half + 511) / 512;
-    let params: &mut [*mut c_void] = &mut [(&d_out) as *const _ as *mut c_void, (&d_x) as *const _ as *mut c_void, (&d_cos) as *const _ as *mut c_void, (&d_sin) as *const _ as *mut c_void, (&total_half) as *const _ as *mut c_void, (&half_dim) as *const _ as *mut c_void, (&headdim) as *const _ as *mut c_void, (&nheads_x_half_dim) as *const _ as *mut c_void];
-    let stream = std::ptr::null_mut(); // use default stream for sync with memcpy
-    unsafe { cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?; cuda::stream::synchronize(stream)?; }
+    unsafe {
+        cuda::memcpy_htod_sync(d_x, &h_x)?;
+        cuda::memcpy_htod_sync(d_cos, &h_cos)?;
+        cuda::memcpy_htod_sync(d_sin, &h_sin)?;
+        cuda::memset_d8_sync(d_out, 0, n_x * 2)?;
+    }
+
+    // Grid: (ceil(nheads/4), ceil(seqlen/8), batch)
+    let grid = ((nheads + 3) / 4, (seqlen + 7) / 8, batch);
+
+    // 10 params: out, x, cos, sin, seqlen, nheads, stride_out_seqlen, stride_out_nheads, stride_out_headdim, stride_x_seqlen
+    let params: &mut [*mut c_void] = &mut [
+        (&d_out) as *const _ as *mut c_void,
+        (&d_x) as *const _ as *mut c_void,
+        (&d_cos) as *const _ as *mut c_void,
+        (&d_sin) as *const _ as *mut c_void,
+        (&seqlen) as *const _ as *mut c_void,
+        (&nheads) as *const _ as *mut c_void,
+        (&stride_out_seqlen) as *const _ as *mut c_void,
+        (&stride_out_nheads) as *const _ as *mut c_void,
+        (&stride_out_headdim) as *const _ as *mut c_void,
+        (&stride_x_seqlen) as *const _ as *mut c_void,
+    ];
+
+    // Shared memory: 2048 bytes for cos/sin transpose (128 threads * 16 bytes each)
+    let smem_bytes: u32 = 2048;
+    let stream = std::ptr::null_mut(); // null stream for sync with memcpy
+    unsafe {
+        cuda::launch_kernel(func, grid, (128, 1, 1), smem_bytes, stream, params)?;
+        cuda::stream::synchronize(stream)?;
+    }
+
     let mut h_out: Vec<half::f16> = vec![half::f16::ZERO; n_x];
     unsafe { cuda::memcpy_dtoh_sync(&mut h_out, d_out)?; }
-    let hd = headdim as usize; let hh = half_dim as usize; let nh = nheads as usize; let sl = seqlen as usize;
+
+    let hd = headdim as usize;
+    let hh = half_dim as usize;
+    let nh = nheads as usize;
+    let sl = seqlen as usize;
     let mut max_err: f32 = 0.0;
-    for s in [0usize, 1, 63, 127] { for h in [0, 1, 31] { for k in [0, 1, 31, 63] {
-        if s >= sl || h >= nh || k >= hh { continue; }
-        let flat = s * nh * hd + h * hd;
-        let x1 = h_x[flat + k].to_f32(); let x2 = h_x[flat + hh + k].to_f32();
-        let c = h_cos[s * hh + k]; let sn = h_sin[s * hh + k];
-        let err1 = (h_out[flat + k].to_f32() - (x1 * c - x2 * sn)).abs();
-        let err2 = (h_out[flat + hh + k].to_f32() - (x2 * c + x1 * sn)).abs();
-        if err1 > max_err { max_err = err1; } if err2 > max_err { max_err = err2; }
-    }}}
-    if max_err < 0.05 { println!("  Correct (max err: {:.6})", max_err); }
-    else {
-        for k in 0..4 { let x1 = h_x[k].to_f32(); let x2 = h_x[hh + k].to_f32();
-            println!("    out[0][0][{}]: got={:.6} exp={:.6}", k, h_out[k].to_f32(), x1 * h_cos[k] - x2 * h_sin[k]); }
+    let mut checked = 0usize;
+    for s in [0usize, 1, 63, 127] {
+        for h in [0, 1, 31] {
+            for k in [0, 1, 31, 63] {
+                if s >= sl || h >= nh || k >= hh { continue; }
+                let flat = s * nh * hd + h * hd;
+                let x1 = h_x[flat + k].to_f32();
+                let x2 = h_x[flat + hh + k].to_f32();
+                let c = h_cos[s * hh + k];
+                let sn = h_sin[s * hh + k];
+                let err1 = (h_out[flat + k].to_f32() - (x1 * c - x2 * sn)).abs();
+                let err2 = (h_out[flat + hh + k].to_f32() - (x2 * c + x1 * sn)).abs();
+                if err1 > max_err { max_err = err1; }
+                if err2 > max_err { max_err = err2; }
+                checked += 1;
+            }
+        }
+    }
+    if max_err < 0.05 {
+        println!("  Correct (max err: {:.6}, checked {} points)", max_err, checked);
+    } else {
+        for k in 0..8 {
+            let x1 = h_x[k].to_f32();
+            let x2 = h_x[hh + k].to_f32();
+            println!("    out[0][0][{}]: got={:.6} exp={:.6}", k, h_out[k].to_f32(), x1 * h_cos[k] - x2 * h_sin[k]);
+            println!("    out[0][0][{}+hh]: got={:.6} exp={:.6}", k, h_out[hh + k].to_f32(), x2 * h_cos[k] + x1 * h_sin[k]);
+        }
         println!("  FAIL (max err: {:.6})", max_err);
     }
-    for _ in 0..10 { unsafe { cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?; } }
+
+    // Warmup
+    for _ in 0..10 {
+        unsafe { cuda::launch_kernel(func, grid, (128, 1, 1), smem_bytes, stream, params)?; }
+    }
     unsafe { cuda::stream::synchronize(stream)?; }
-    let iters = 100; let start = Instant::now();
-    for _ in 0..iters { unsafe { cuda::launch_kernel(func, (grid_x, 1, 1), (128, 1, 1), 0, stream, params)?; } }
+
+    // Benchmark
+    let iters = 100;
+    let start = Instant::now();
+    for _ in 0..iters {
+        unsafe { cuda::launch_kernel(func, grid, (128, 1, 1), smem_bytes, stream, params)?; }
+    }
     unsafe { cuda::stream::synchronize(stream)?; }
     let us = start.elapsed().as_micros() as f64 / iters as f64;
     let bytes = 2.0 * n_x as f64 * 2.0 + 2.0 * n_cs as f64 * 4.0;
     let gb_s = bytes / (us * 1e-6) / 1e9;
     println!("  S={} H={} D={}: {:.1} us, {:.1} GB/s", seqlen, nheads, headdim, us, gb_s);
-    unsafe { cuda::free_sync(d_x)?; cuda::free_sync(d_out)?; cuda::free_sync(d_cos)?; cuda::free_sync(d_sin)?; cuda::module::unload(module)?; }
+
+    unsafe {
+        cuda::free_sync(d_x)?;
+        cuda::free_sync(d_out)?;
+        cuda::free_sync(d_cos)?;
+        cuda::free_sync(d_sin)?;
+        cuda::module::unload(module)?;
+    }
     Ok(())
 }

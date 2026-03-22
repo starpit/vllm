@@ -1431,6 +1431,21 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
     ptx.finalize("fused_rmsnorm_dual_gemm_silu_mul", &dual_fused_params())
 }
 
+/// Return the CUTLASS dual_gemm + SiLUAndMul PTX — literal copy of the
+/// reference implementation (CUTLASS examples/45_dual_gemm, compiled for sm_89).
+///
+/// This is a 128×64 tile, triple-buffered, f16 accumulator dual GEMM kernel
+/// that achieves 59.9 TFLOPS on L4. The PTX is embedded as a static string
+/// and returned verbatim. The entry point is `ferrite_dual_gemm_silu_mul`.
+///
+/// The kernel takes a 720-byte `DualGemmParams` struct — use the struct
+/// definition in `cutlass_dual_gemm_params` (ferrite-poc) to pack it.
+///
+/// This follows the Ferrite rule: copy the reference PTX, don't design your own.
+pub fn build_cutlass_dual_gemm() -> String {
+    include_str!("cutlass_dual_gemm.ptx").to_string()
+}
+
 fn dual_fused_params() -> Vec<(&'static str, &'static str)> {
     vec![
         (".u64 .ptr .global .align 16", "param_input"),

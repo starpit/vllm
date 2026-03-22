@@ -4472,15 +4472,9 @@ mod cutlass_dual_gemm_params {
 fn run_cutlass_dual_gemm() -> Result<()> {
     use cutlass_dual_gemm_params::DualGemmParams;
 
-    // Read the CUTLASS PTX from disk
-    let ptx_bytes = std::fs::read("/tmp/cutlass_dual_gemm_silumul_2.ptx")
-        .context("Failed to read /tmp/cutlass_dual_gemm_silumul_2.ptx")?;
-    println!("  Loaded {} bytes of PTX", ptx_bytes.len());
-
-    // The PTX references a shared memory symbol _ZN7cutlass17SharedStorageBaseE
-    // that CUTLASS normally provides via the CUDA compiler's device linking.
-    // We need to add the extern shared declaration before the .entry directive.
-    let ptx_str = String::from_utf8(ptx_bytes).context("PTX is not valid UTF-8")?;
+    // Use the CUTLASS dual_gemm PTX embedded in the ferrite-ptx crate
+    let ptx_str = ferrite_ptx::fused::build_cutlass_dual_gemm();
+    println!("  Loaded {} bytes of embedded PTX", ptx_str.len());
 
     // Calculate shared memory needed: A tile (3 stages) + B0 tile (3 stages) + B1 tile (3 stages)
     // ThreadblockShape 128x64x32, half_t:
@@ -4490,17 +4484,12 @@ fn run_cutlass_dual_gemm() -> Result<()> {
     //   Total: 49152 = 48KB
     // Using extern shared (dynamic) instead to let the kernel manage it:
     // Use static shared memory allocation (49152 = 48KB for 3-stage A+B0+B1 tiles)
-    let smem_decl = ".shared .align 16 .b8 _ZN7cutlass17SharedStorageBaseE[49152];\n\n";
-    let patched_ptx = ptx_str.replacen(".entry", &format!("{}.entry", smem_decl), 1);
-
-    // Load as CUDA module
-    let ptx_cstr = CString::new(patched_ptx).context("PTX contains null byte")?;
+        // Embedded PTX already has smem declaration and renamed entry point
+    let ptx_cstr = CString::new(ptx_str).context("PTX contains null byte")?;
     let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
 
-    // Find the DualGemm kernel entry point (the mangled name from the PTX)
-    let kernel_name = CString::new(
-        "_ZN7cutlass6KernelINS_4gemm6kernel8DualGemmINS1_11threadblock17DualMmaMultistageINS1_9GemmShapeILi128ELi64ELi32EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi32EEENS_6half_tENS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi32ELi128EEELi128ENSH_ILi4ELi8EEELi8EEENS_5ArrayISD_Li8ELb0EEELb0ENSE_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_SD_NSE_37RowMajorTensorOpMultiplicandCrosswiseILi16ELi32EEELi0ESK_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi32ELi64EEESD_NSE_11ColumnMajorELi0ENSG_INSH_ILi32ELi64EEELi128ESJ_Li8EEESM_Lb0ESN_EENSP_ISW_SD_NSE_40ColumnMajorTensorOpMultiplicandCrosswiseILi16ELi32EEELi1ESZ_Li16EEELSV_1ES10_S13_SD_SF_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi32ELi32EEESD_SR_SD_S12_SD_SF_NS15_17MmaTensorOpPolicyINST_3MmaINS6_ILi16ELi8ELi16EEELi32ESD_SF_SD_SX_SD_SF_NST_13OpMultiplyAddEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1G_Li1EEES1H_Li3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1F_Li1ENS1L_22PredicatedTileIteratorINS1L_26OutputTileOptimalThreadMapINS1L_15OutputTileShapeILi64ELi8ELi2ELi1ELi1EEENS1P_ILi1ELi8ELi1ELi1ELi8EEELi128ELi8ELi16EEESD_Lb0ESN_Lb0EEENS1K_4warp24FragmentIteratorTensorOpIS17_S1A_SD_NSL_ISD_Li4ELb0EEESF_EENS1U_20TileIteratorTensorOpIS17_S1A_SD_SF_EENS1L_18SharedLoadIteratorINS1S_18CompactedThreadMapESD_Li16EEENS1K_6thread17LinearCombinationISD_Li8ESD_SD_LNS23_9ScaleType4KindE1ELNS_15FloatRoundStyleE2ESD_EENSB_ILi0ELi16EEELi1ELi1EEES2A_NS23_14LeftSiLUAndMulISD_Li8ESD_SD_LS27_2EEENS4_30GemmIdentityThreadblockSwizzleILi1EEELb0ELb1ELb1EEEEEvNT_6ParamsE"
-    ).unwrap();
+    // Use our renamed entry point from the embedded PTX
+    let kernel_name = CString::new("ferrite_dual_gemm_silu_mul").unwrap();
     let func = unsafe { cuda::module::get_function(module, kernel_name)? };
     println!("  [cuda] Loaded DualGemm kernel");
 

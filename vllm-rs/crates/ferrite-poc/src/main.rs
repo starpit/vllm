@@ -91,6 +91,10 @@ fn main() -> Result<()> {
     let sm = format!("sm_{}{}", major, minor);
     println!("[cuda] GPU: {} ({})", name, sm);
 
+    // CUTLASS Dual GEMM (reference) - run first before other kernels
+    println!("\nCUTLASS Dual GEMM (reference): SiLU(A×B0) × (A×B1)");
+    run_cutlass_dual_gemm()?;
+
     // GEMM validation gate (55 TFLOPS)
     println!("\nGEMM 64x64 (validation gate)");
     run_ptxbuilder_gemm()?;
@@ -4226,6 +4230,476 @@ fn run_dual_fused() -> Result<()> {
         cuda::free_sync(d_wgate)?;
         cuda::free_sync(d_wup)?;
         cuda::free_sync(d_output)?;
+        cuda::module::unload(module)?;
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// CUTLASS DualGemm + SiLUAndMul reference benchmark
+// ===========================================================================
+
+/// Params struct types matching the CUTLASS DualGemm kernel's 720-byte param block.
+/// See /tmp/cutlass_dual_gemm_params.rs for full documentation.
+mod cutlass_dual_gemm_params {
+    #[derive(Clone, Copy, Debug, Default)]
+    #[repr(C)]
+    pub struct TileAccessIteratorParams {
+        pub stride: i64,
+        pub inc_strided: i64,
+        pub inc_next: i64,
+        pub inc_advance: i64,
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    #[repr(C)]
+    pub struct TensorRef {
+        pub ptr: u64,
+        pub stride: i64,
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    #[repr(C)]
+    pub struct TileIteratorParams {
+        pub stride: i64,
+        pub increment_row: i64,
+        pub increment_group: i64,
+        pub increment_cluster: i64,
+        pub advance_row: i64,
+        pub advance_group: i64,
+        pub advance_cluster: i64,
+        pub advance_tile: i64,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    #[repr(C)]
+    pub struct LinearCombinationParams {
+        pub alpha: u16,
+        pub beta: u16,
+        pub _pad0: u32,
+        pub alpha_ptr: u64,
+        pub beta_ptr: u64,
+        pub alpha_ptr_array: u64,
+        pub beta_ptr_array: u64,
+    }
+
+    impl Default for LinearCombinationParams {
+        fn default() -> Self {
+            Self {
+                alpha: half::f16::from_f32(1.0).to_bits(),
+                beta: half::f16::from_f32(0.0).to_bits(),
+                _pad0: 0,
+                alpha_ptr: 0,
+                beta_ptr: 0,
+                alpha_ptr_array: 0,
+                beta_ptr_array: 0,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    #[repr(C)]
+    pub struct LeftSiLUAndMulParams {
+        pub _empty: u8,
+        pub _pad: [u8; 7],
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    #[repr(u32)]
+    pub enum DualGemmMode {
+        #[default]
+        Gemm = 0,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    #[repr(C)]
+    pub struct DualGemmParams {
+        pub mode: DualGemmMode,
+        pub problem_size_m: i32,
+        pub problem_size_n: i32,
+        pub problem_size_k: i32,
+        pub grid_tiled_shape_m: i32,
+        pub grid_tiled_shape_n: i32,
+        pub grid_tiled_shape_k: i32,
+        pub swizzle_log_tile: i32,
+
+        pub params_a0: TileAccessIteratorParams,
+        pub ref_a0: TensorRef,
+        pub params_b0: TileAccessIteratorParams,
+        pub ref_b0: TensorRef,
+        pub params_c0: TileIteratorParams,
+        pub ref_c0: TensorRef,
+        pub params_d0: TileIteratorParams,
+        pub ref_d0: TensorRef,
+        pub output_op_0: LinearCombinationParams,
+
+        pub params_b1: TileAccessIteratorParams,
+        pub ref_b1: TensorRef,
+        pub params_c1: TileIteratorParams,
+        pub ref_c1: TensorRef,
+        pub params_d1: TileIteratorParams,
+        pub ref_d1: TensorRef,
+        pub output_op_1: LinearCombinationParams,
+
+        pub params_d2: TileIteratorParams,
+        pub ref_d2: TensorRef,
+        pub output_op_2: LeftSiLUAndMulParams,
+
+        pub semaphore: u64,
+        pub gemm_k_size: i32,
+        pub _pad_gemm_k: i32,
+        pub batch_stride_a: i64,
+        pub batch_stride_b0: i64,
+        pub batch_stride_b1: i64,
+        pub batch_stride_c: i64,
+        pub batch_stride_d: i64,
+    }
+
+    // Static size assertion
+    const _: () = {
+        assert!(core::mem::size_of::<DualGemmParams>() == 720);
+    };
+
+    impl DualGemmParams {
+        /// Compute PredicatedTileAccessIteratorParams for IteratorA (RowMajor, half_t).
+        /// Shape=128x32, AdvanceRank=1 -> PitchLinear AdvanceRank=0 (advance along contiguous=K).
+        /// ThreadMap: PitchLinearWarpRakedThreadMap<{32,128}, 128, {4,8}, 8>
+        ///   delta = {contiguous=4, strided=8}, iterations = {contiguous=1, strided=16}
+        pub fn compute_params_a(stride: i64) -> TileAccessIteratorParams {
+            let elem_bytes = 2i64;
+            let inc_strided = stride * 8 * elem_bytes;
+            let inc_advance = 32 * elem_bytes;
+            let inc_next = inc_advance - 15 * 8 * stride * elem_bytes;
+            TileAccessIteratorParams { stride, inc_strided, inc_next, inc_advance }
+        }
+
+        /// Compute PredicatedTileAccessIteratorParams for IteratorB0/B1 (ColumnMajor, half_t).
+        /// Shape=32x64, AdvanceRank=0 -> PitchLinear AdvanceRank=0 (advance along contiguous=K).
+        /// ThreadMap: PitchLinearWarpRakedThreadMap<{32,64}, 128, {4,8}, 8>
+        ///   delta = {contiguous=4, strided=8}, iterations = {contiguous=1, strided=8}
+        pub fn compute_params_b(stride: i64) -> TileAccessIteratorParams {
+            let elem_bytes = 2i64;
+            let inc_advance = 32 * elem_bytes;
+            let inc_strided = stride * 8 * elem_bytes;
+            let inc_next = inc_advance - 7 * 8 * stride * elem_bytes;
+            TileAccessIteratorParams { stride, inc_strided, inc_next, inc_advance }
+        }
+
+        /// Compute PredicatedTileIteratorParams for epilogue output (RowMajor, half_t).
+        /// OutputTileOptimalThreadMap: 128 threads, 8 elements/access, half_t, 128x64 tile.
+        /// delta.row = Threads / (Shape.column / ElementsPerAccess) = 128 / 8 = 16.
+        /// PTX only reads stride and advance_row from this struct.
+        pub fn compute_epilogue_params(n: i32) -> TileIteratorParams {
+            let stride = n as i64 * 2; // row stride in bytes
+            let delta_row: i64 = 16;
+            let increment_row = stride * delta_row;
+            let advance_row = increment_row;
+            let advance_tile = stride * 128; // full tile height
+            TileIteratorParams {
+                stride, increment_row,
+                increment_group: 0, increment_cluster: 0,
+                advance_row, advance_group: 0, advance_cluster: 0, advance_tile,
+            }
+        }
+
+        pub fn new(
+            m: i32, n: i32, k: i32,
+            ptr_a: u64, lda: i64,
+            ptr_b0: u64, ldb0: i64,
+            ptr_b1: u64, ldb1: i64,
+            ptr_c0: u64, ptr_c1: u64,
+            ptr_d0: u64, ptr_d1: u64, ptr_d2: u64,
+            ldd: i64,
+        ) -> Self {
+            let grid_m = (m + 127) / 128;
+            let grid_n = (n + 63) / 64;
+            let gemm_k_size = ((k + 31) / 32) * 32;
+            let epilogue = Self::compute_epilogue_params(n);
+            let alpha1 = half::f16::from_f32(1.0).to_bits();
+            let beta0 = half::f16::from_f32(0.0).to_bits();
+
+            Self {
+                mode: DualGemmMode::Gemm,
+                problem_size_m: m,
+                problem_size_n: n,
+                problem_size_k: k,
+                grid_tiled_shape_m: grid_m,
+                grid_tiled_shape_n: grid_n,
+                grid_tiled_shape_k: 1,
+                swizzle_log_tile: 0,
+
+                params_a0: Self::compute_params_a(lda),
+                ref_a0: TensorRef { ptr: ptr_a, stride: lda },
+                params_b0: Self::compute_params_b(ldb0),
+                ref_b0: TensorRef { ptr: ptr_b0, stride: ldb0 },
+                params_c0: epilogue,
+                ref_c0: TensorRef { ptr: ptr_c0, stride: ldd },
+                params_d0: epilogue,
+                ref_d0: TensorRef { ptr: ptr_d0, stride: ldd },
+                output_op_0: LinearCombinationParams {
+                    alpha: alpha1, beta: beta0, _pad0: 0,
+                    alpha_ptr: 0, beta_ptr: 0, alpha_ptr_array: 0, beta_ptr_array: 0,
+                },
+
+                params_b1: Self::compute_params_b(ldb1),
+                ref_b1: TensorRef { ptr: ptr_b1, stride: ldb1 },
+                params_c1: epilogue,
+                ref_c1: TensorRef { ptr: ptr_c1, stride: ldd },
+                params_d1: epilogue,
+                ref_d1: TensorRef { ptr: ptr_d1, stride: ldd },
+                output_op_1: LinearCombinationParams {
+                    alpha: alpha1, beta: beta0, _pad0: 0,
+                    alpha_ptr: 0, beta_ptr: 0, alpha_ptr_array: 0, beta_ptr_array: 0,
+                },
+
+                params_d2: epilogue,
+                ref_d2: TensorRef { ptr: ptr_d2, stride: ldd },
+                output_op_2: LeftSiLUAndMulParams { _empty: 0, _pad: [0; 7] },
+
+                semaphore: 0,
+                gemm_k_size,
+                _pad_gemm_k: 0,
+                batch_stride_a: 0,
+                batch_stride_b0: 0,
+                batch_stride_b1: 0,
+                batch_stride_c: 0,
+                batch_stride_d: 0,
+            }
+        }
+    }
+}
+
+fn run_cutlass_dual_gemm() -> Result<()> {
+    use cutlass_dual_gemm_params::DualGemmParams;
+
+    // Read the CUTLASS PTX from disk
+    let ptx_bytes = std::fs::read("/tmp/cutlass_dual_gemm_silumul_2.ptx")
+        .context("Failed to read /tmp/cutlass_dual_gemm_silumul_2.ptx")?;
+    println!("  Loaded {} bytes of PTX", ptx_bytes.len());
+
+    // The PTX references a shared memory symbol _ZN7cutlass17SharedStorageBaseE
+    // that CUTLASS normally provides via the CUDA compiler's device linking.
+    // We need to add the extern shared declaration before the .entry directive.
+    let ptx_str = String::from_utf8(ptx_bytes).context("PTX is not valid UTF-8")?;
+
+    // Calculate shared memory needed: A tile (3 stages) + B0 tile (3 stages) + B1 tile (3 stages)
+    // ThreadblockShape 128x64x32, half_t:
+    //   A tile per stage: 128 * 32 * 2 = 8192 bytes
+    //   B tile per stage: 32 * 64 * 2 = 4096 bytes
+    //   3 stages of A: 24576, 3 stages of B0: 12288, 3 stages of B1: 12288
+    //   Total: 49152 = 48KB
+    // Using extern shared (dynamic) instead to let the kernel manage it:
+    // Use static shared memory allocation (49152 = 48KB for 3-stage A+B0+B1 tiles)
+    let smem_decl = ".shared .align 16 .b8 _ZN7cutlass17SharedStorageBaseE[49152];\n\n";
+    let patched_ptx = ptx_str.replacen(".entry", &format!("{}.entry", smem_decl), 1);
+
+    // Load as CUDA module
+    let ptx_cstr = CString::new(patched_ptx).context("PTX contains null byte")?;
+    let module = unsafe { cuda::module::load_data(ptx_cstr.as_ptr() as *const _)? };
+
+    // Find the DualGemm kernel entry point (the mangled name from the PTX)
+    let kernel_name = CString::new(
+        "_ZN7cutlass6KernelINS_4gemm6kernel8DualGemmINS1_11threadblock17DualMmaMultistageINS1_9GemmShapeILi128ELi64ELi32EEENS_9transform11threadblock28PredicatedTileAccessIteratorINS_11MatrixShapeILi128ELi32EEENS_6half_tENS_6layout8RowMajorELi1ENS8_29PitchLinearWarpRakedThreadMapINS_16PitchLinearShapeILi32ELi128EEELi128ENSH_ILi4ELi8EEELi8EEENS_5ArrayISD_Li8ELb0EEELb0ENSE_9NoPermuteEEENS9_25RegularTileAccessIteratorISC_SD_NSE_37RowMajorTensorOpMultiplicandCrosswiseILi16ELi32EEELi0ESK_Li16EEELNS_4arch14CacheOperation4KindE1ENSA_INSB_ILi32ELi64EEESD_NSE_11ColumnMajorELi0ENSG_INSH_ILi32ELi64EEELi128ESJ_Li8EEESM_Lb0ESN_EENSP_ISW_SD_NSE_40ColumnMajorTensorOpMultiplicandCrosswiseILi16ELi32EEELi1ESZ_Li16EEELSV_1ES10_S13_SD_SF_NS4_9MmaPolicyINS1_4warp11MmaTensorOpINS6_ILi64ELi32ELi32EEESD_SR_SD_S12_SD_SF_NS15_17MmaTensorOpPolicyINST_3MmaINS6_ILi16ELi8ELi16EEELi32ESD_SF_SD_SX_SD_SF_NST_13OpMultiplyAddEEENSB_ILi1ELi1EEEEELi1ELb0EbEENSB_ILi0ELi0EEES1G_Li1EEES1H_Li3ELNS1_23SharedMemoryClearOptionE0EbEENS_8epilogue11threadblock8EpilogueIS7_S1F_Li1ENS1L_22PredicatedTileIteratorINS1L_26OutputTileOptimalThreadMapINS1L_15OutputTileShapeILi64ELi8ELi2ELi1ELi1EEENS1P_ILi1ELi8ELi1ELi1ELi8EEELi128ELi8ELi16EEESD_Lb0ESN_Lb0EEENS1K_4warp24FragmentIteratorTensorOpIS17_S1A_SD_NSL_ISD_Li4ELb0EEESF_EENS1U_20TileIteratorTensorOpIS17_S1A_SD_SF_EENS1L_18SharedLoadIteratorINS1S_18CompactedThreadMapESD_Li16EEENS1K_6thread17LinearCombinationISD_Li8ESD_SD_LNS23_9ScaleType4KindE1ELNS_15FloatRoundStyleE2ESD_EENSB_ILi0ELi16EEELi1ELi1EEES2A_NS23_14LeftSiLUAndMulISD_Li8ESD_SD_LS27_2EEENS4_30GemmIdentityThreadblockSwizzleILi1EEELb0ELb1ELb1EEEEEvNT_6ParamsE"
+    ).unwrap();
+    let func = unsafe { cuda::module::get_function(module, kernel_name)? };
+    println!("  [cuda] Loaded DualGemm kernel");
+
+    use cudarc::driver::sys::CUfunction_attribute as FA;
+    let nregs =
+        unsafe { cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_NUM_REGS)? };
+    let smem_static = unsafe {
+        cuda::function::get_function_attribute(func, FA::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?
+    };
+    println!("  [cuda] {} regs/thread, {} bytes static smem", nregs, smem_static);
+
+    // Set dynamic shared memory. The CUTLASS kernel needs:
+    // A: 3 stages * 128*32*2 = 24576, B0: 3*32*64*2 = 12288, B1: 3*32*64*2 = 12288
+    // Total mainloop: 49152 (48KB). Epilogue also uses shared memory.
+    let smem_bytes: c_uint = 0; // static smem already allocated in PTX
+    unsafe {
+        cuda_sys::cuFuncSetAttribute(
+            func,
+            cuda_sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem_bytes as i32,
+        );
+    }
+
+    // Test configuration
+    // Use M=256, N=1024, K=4096 which gives good TFLOPS.
+    // Note: larger N with large K can trigger ILLEGAL_ADDRESS in this PTX
+    // (likely a PTX JIT issue with combined A/B buffer sizes).
+    let m: i32 = 256;
+    let n: i32 = 1024;
+    let k: i32 = 4096;
+
+    let sa = (m * k) as usize;    // A: [M, K]
+    let sb = (k * n) as usize;    // B0, B1: [K, N] ColumnMajor
+    let sc = (m * n) as usize;    // D0, D1, D2: [M, N]
+
+    // Allocate device memory (include C0/C1 buffers even though beta=0,
+    // some thread map configurations may still compute addresses)
+    let d_a = unsafe { cuda::malloc_sync(sa * 2)? };
+    let d_b0 = unsafe { cuda::malloc_sync(sb * 2)? };
+    let d_b1 = unsafe { cuda::malloc_sync(sb * 2)? };
+    let d_c0 = unsafe { cuda::malloc_sync(sc * 2)? }; // bias0 (zeros)
+    let d_c1 = unsafe { cuda::malloc_sync(sc * 2)? }; // bias1 (zeros)
+    let d_d0 = unsafe { cuda::malloc_sync(sc * 2)? };
+    let d_d1 = unsafe { cuda::malloc_sync(sc * 2)? };
+    let d_d2 = unsafe { cuda::malloc_sync(sc * 2)? };
+
+    // Initialize test data
+    let h_a: Vec<half::f16> = (0..sa)
+        .map(|i| half::f16::from_f32(((i % 7) as f32 - 3.0) * 0.1))
+        .collect();
+    // B0, B1 are ColumnMajor: B[k_idx, n_idx] stored at [k_idx + n_idx * K]
+    let h_b0: Vec<half::f16> = (0..sb)
+        .map(|i| half::f16::from_f32(((i % 5) as f32 - 2.0) * 0.1))
+        .collect();
+    let h_b1: Vec<half::f16> = (0..sb)
+        .map(|i| half::f16::from_f32(((i % 11) as f32 - 5.0) * 0.05))
+        .collect();
+
+    unsafe {
+        cuda::memcpy_htod_sync(d_a, &h_a)?;
+        cuda::memcpy_htod_sync(d_b0, &h_b0)?;
+        cuda::memcpy_htod_sync(d_b1, &h_b1)?;
+        cuda::memset_d8_sync(d_c0, 0, sc * 2)?;
+        cuda::memset_d8_sync(d_c1, 0, sc * 2)?;
+        cuda::memset_d8_sync(d_d0, 0, sc * 2)?;
+        cuda::memset_d8_sync(d_d1, 0, sc * 2)?;
+        cuda::memset_d8_sync(d_d2, 0, sc * 2)?;
+    }
+
+    // Pack the 720-byte params struct
+    let params = DualGemmParams::new(
+        m, n, k,
+        d_a as u64, k as i64,        // A: RowMajor, stride = K
+        d_b0 as u64, k as i64,       // B0: ColumnMajor, stride = K
+        d_b1 as u64, k as i64,       // B1: ColumnMajor, stride = K
+        d_c0 as u64,                  // C0 bias (zeros)
+        d_c1 as u64,                  // C1 bias (zeros)
+        d_d0 as u64,                  // D0 intermediate output
+        d_d1 as u64,                  // D1 intermediate output
+        d_d2 as u64,                  // D2 final output = SiLU(A@B0) * (A@B1)
+        n as i64,                     // output RowMajor stride = N
+    );
+
+    // Verify struct size
+    assert_eq!(std::mem::size_of_val(&params), 720);
+
+    // Grid and block dimensions
+    let grid_m = ((m + 127) / 128) as c_uint;
+    let grid_n = ((n + 63) / 64) as c_uint;
+    let grid = (grid_m, grid_n, 1u32);
+    let block = (128u32, 1u32, 1u32);
+
+    println!("  M={}, N={}, K={}, grid=({}, {}, 1), block=128", m, n, k, grid_m, grid_n);
+
+    let stream = std::ptr::null_mut();
+
+    // Launch using kernelParams (single struct parameter)
+    unsafe {
+        let mut kernel_params: [*mut c_void; 1] = [
+            &params as *const _ as *mut c_void,
+        ];
+
+        let result = cuda_sys::cuLaunchKernel(
+            func,
+            grid.0, grid.1, grid.2,
+            block.0, block.1, block.2,
+            smem_bytes,
+            stream,
+            kernel_params.as_mut_ptr(),
+            std::ptr::null_mut(),   // extra = null (using kernelParams)
+        );
+        if result != cuda_sys::CUresult::CUDA_SUCCESS {
+            bail!("cuLaunchKernel failed: {:?}", result);
+        }
+        cuda::stream::synchronize(stream)?;
+    }
+
+    // Read back results
+    let mut h_d2: Vec<half::f16> = vec![half::f16::ZERO; sc];
+    unsafe {
+        cuda::memcpy_dtoh_sync(&mut h_d2, d_d2)?;
+    }
+
+    // CPU reference: D2 = SiLU(A @ B0) * (A @ B1)
+    fn silu(x: f32) -> f32 {
+        x / (1.0 + (-x).exp())
+    }
+
+    let mut max_err: f32 = 0.0;
+    let mut checked = 0usize;
+    for r in [0usize, 1, 31, 63, 127, 255] {
+        if r >= m as usize { continue; }
+        for c in [0usize, 1, 31, 63, 127, 511, 1023, 2047, 4095] {
+            if c >= n as usize { continue; }
+            // gate = A[r,:] @ B0[:,c]  where B0 is ColumnMajor: B0[k_idx, c] = h_b0[k_idx + c * K]
+            let mut gate_dot = 0.0f64;
+            let mut up_dot = 0.0f64;
+            for kk in 0..k as usize {
+                let a_val = h_a[r * k as usize + kk].to_f64();
+                gate_dot += a_val * h_b0[kk + c * k as usize].to_f64();
+                up_dot += a_val * h_b1[kk + c * k as usize].to_f64();
+            }
+            let gate_f32 = gate_dot as f32;
+            let up_f32 = up_dot as f32;
+            let expected = silu(gate_f32) * up_f32;
+            let got = h_d2[r * n as usize + c].to_f32();
+            let err = (got - expected).abs();
+            if err > max_err { max_err = err; }
+            checked += 1;
+        }
+    }
+
+    if max_err < 5.0 {
+        println!("  Correct (max err: {:.4}, checked {} points)", max_err, checked);
+    } else {
+        bail!("  CUTLASS DualGemm max error: {:.4} (expected < 5.0)", max_err);
+    }
+
+    // Warmup
+    for _ in 0..10 {
+        unsafe {
+            let mut kp: [*mut c_void; 1] = [&params as *const _ as *mut c_void];
+            cuda_sys::cuLaunchKernel(
+                func, grid.0, grid.1, grid.2, block.0, block.1, block.2,
+                smem_bytes, stream, kp.as_mut_ptr(), std::ptr::null_mut(),
+            );
+        }
+    }
+    unsafe { cuda::stream::synchronize(stream)?; }
+
+    // Benchmark
+    let iters = 100;
+    let start = Instant::now();
+    for _ in 0..iters {
+        unsafe {
+            let mut kp: [*mut c_void; 1] = [&params as *const _ as *mut c_void];
+            cuda_sys::cuLaunchKernel(
+                func, grid.0, grid.1, grid.2, block.0, block.1, block.2,
+                smem_bytes, stream, kp.as_mut_ptr(), std::ptr::null_mut(),
+            );
+        }
+    }
+    unsafe { cuda::stream::synchronize(stream)?; }
+    let us = start.elapsed().as_micros() as f64 / iters as f64;
+
+    // TFLOPS: dual GEMM = 2 * (2*M*N*K) FLOPs (two matmuls)
+    let flops = 2.0 * 2.0 * m as f64 * n as f64 * k as f64;
+    let tflops = flops / (us * 1e-6) / 1e12;
+    println!("  {:.1} us, {:.1} TFLOPS (dual GEMM + SiLU*Mul fused)", us, tflops);
+
+    unsafe {
+        cuda::free_sync(d_a)?;
+        cuda::free_sync(d_b0)?;
+        cuda::free_sync(d_b1)?;
+        cuda::free_sync(d_c0)?;
+        cuda::free_sync(d_c1)?;
+        cuda::free_sync(d_d0)?;
+        cuda::free_sync(d_d1)?;
+        cuda::free_sync(d_d2)?;
         cuda::module::unload(module)?;
     }
     Ok(())

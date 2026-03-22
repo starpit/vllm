@@ -1,6 +1,6 @@
-use crate::atoms::{CopyAtom, MmaAtom, TransformAtom};
+use crate::atoms::{CopyAtom, MmaAtomF16, TransformAtom};
 use crate::config::GemmConfig;
-use crate::gemm::{AccumulatorMap, GemmSetup};
+use crate::gemm::{AccumulatorMapF16, GemmSetup};
 use crate::{PtxBuilder, Reg};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -18,8 +18,8 @@ pub struct DualMainloopPipeline {
 
 /// Result of dual pipeline emission: two accumulator maps + k_counter register
 pub struct DualPipelineResult {
-    pub acc0: AccumulatorMap, // gate GEMM result
-    pub acc1: AccumulatorMap, // up GEMM result
+    pub acc0: AccumulatorMapF16, // gate GEMM result
+    pub acc1: AccumulatorMapF16, // up GEMM result
     pub k_counter: Reg,
 }
 
@@ -56,7 +56,7 @@ impl DualMainloopPipeline {
         copy_b0: &dyn CopyAtom,
         copy_b1: &dyn CopyAtom,
         transform: &dyn TransformAtom,
-        mma: &dyn MmaAtom,
+        mma: &dyn MmaAtomF16,
         // Memory addresses
         ga_chunks: Vec<Reg>,
         a_cp_off: Reg,
@@ -382,41 +382,31 @@ impl DualMainloopPipeline {
 
         let num_tiles = (reg_m * reg_n) as usize;
 
-        // Accumulator 0 (gate GEMM)
-        let mut acc0_regs: Vec<[Reg; 4]> = Vec::with_capacity(num_tiles);
+        // Accumulator 0 (gate GEMM) — f16: 2 regs per tile
+        let mut acc0_regs: Vec<[Reg; 2]> = Vec::with_capacity(num_tiles);
         for _ in 0..num_tiles {
-            let tile = [
-                ptx.regs.alloc_b32(),
-                ptx.regs.alloc_b32(),
-                ptx.regs.alloc_b32(),
-                ptx.regs.alloc_b32(),
-            ];
+            let tile = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
             for &r in &tile {
                 ptx.mov_b32(r, zero);
             }
             acc0_regs.push(tile);
         }
-        let acc0 = AccumulatorMap {
+        let acc0 = AccumulatorMapF16 {
             regs: acc0_regs,
             reg_m,
             reg_n,
         };
 
-        // Accumulator 1 (up GEMM)
-        let mut acc1_regs: Vec<[Reg; 4]> = Vec::with_capacity(num_tiles);
+        // Accumulator 1 (up GEMM) — f16: 2 regs per tile
+        let mut acc1_regs: Vec<[Reg; 2]> = Vec::with_capacity(num_tiles);
         for _ in 0..num_tiles {
-            let tile = [
-                ptx.regs.alloc_b32(),
-                ptx.regs.alloc_b32(),
-                ptx.regs.alloc_b32(),
-                ptx.regs.alloc_b32(),
-            ];
+            let tile = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
             for &r in &tile {
                 ptx.mov_b32(r, zero);
             }
             acc1_regs.push(tile);
         }
-        let acc1 = AccumulatorMap {
+        let acc1 = AccumulatorMapF16 {
             regs: acc1_regs,
             reg_m,
             reg_n,
@@ -592,8 +582,7 @@ impl DualMainloopPipeline {
         }
         ptx.blank();
 
-        // ── Phase 2: Load A fragments, transform, execute ALL GEMM0 MMAs, then ALL GEMM1 MMAs ──
-        // First: load and transform A fragments for all ki/rm, save them
+        // ── Phase 2: Load A fragments, transform, save for reuse ──
         for ki in 0..k_warp_iters as usize {
             ptx.comment(&format!("ki={ki}: ldmatrix A + transform"));
             ptx.add_s32(a_addr, buf_base, a_off[ki]);
@@ -607,32 +596,57 @@ impl DualMainloopPipeline {
                 ptx.ldmatrix_x4(a_frag, a_addr, a_rm_off);
                 transform.emit_transform(ptx, &mut a_frag, ki as u32, rm as u32);
 
-                // Save A fragments for reuse in GEMM1
+                // Save A fragments for reuse in GEMM0 zigzag and GEMM1
                 for j in 0..4 {
                     ptx.mov_b32(a_saved[ki][rm][j], a_frag[j]);
-                }
-
-                // GEMM0 MMA: use saved A with B0 for this (ki, rm)
-                for rn in 0..reg_n as usize {
-                    let ai = rm * reg_n as usize + rn;
-                    let mut acc_tile = acc0.regs[ai];
-                    let b_sel = [b0_frags[rn][ki * 2], b0_frags[rn][ki * 2 + 1]];
-                    mma.emit_mma(ptx, a_frag, b_sel, &mut acc_tile);
                 }
             }
             ptx.blank();
         }
 
-        // GEMM1 MMAs: reuse saved A fragments with B1
+        // ── GEMM0 MMAs: zigzag traversal over B0 columns (CUTLASS pattern) ──
+        ptx.comment("GEMM0 MMAs with zigzag B-column traversal");
+        for ki in 0..k_warp_iters as usize {
+            for rn in 0..reg_n as usize {
+                let b_sel = [b0_frags[rn][ki * 2], b0_frags[rn][ki * 2 + 1]];
+                if rn % 2 == 0 {
+                    // Forward: rows 0,1,2,...
+                    for rm in 0..reg_m as usize {
+                        let ai = rm * reg_n as usize + rn;
+                        let mut acc_tile = acc0.regs[ai];
+                        mma.emit_mma(ptx, a_saved[ki][rm], b_sel, &mut acc_tile);
+                    }
+                } else {
+                    // Reverse: rows reg_m-1,...,1,0
+                    for rm in (0..reg_m as usize).rev() {
+                        let ai = rm * reg_n as usize + rn;
+                        let mut acc_tile = acc0.regs[ai];
+                        mma.emit_mma(ptx, a_saved[ki][rm], b_sel, &mut acc_tile);
+                    }
+                }
+            }
+        }
+        ptx.blank();
+
+        // ── GEMM1 MMAs: zigzag traversal over B1 columns, reusing saved A ──
         ptx.comment("GEMM1 MMAs using saved A fragments");
         for ki in 0..k_warp_iters as usize {
-            for rm in 0..reg_m as usize {
-                let saved = a_saved[ki][rm];
-                for rn in 0..reg_n as usize {
-                    let ai = rm * reg_n as usize + rn;
-                    let mut acc_tile = acc1.regs[ai];
-                    let b_sel = [b1_frags[rn][ki * 2], b1_frags[rn][ki * 2 + 1]];
-                    mma.emit_mma(ptx, saved, b_sel, &mut acc_tile);
+            for rn in 0..reg_n as usize {
+                let b_sel = [b1_frags[rn][ki * 2], b1_frags[rn][ki * 2 + 1]];
+                if rn % 2 == 0 {
+                    // Forward: rows 0,1,2,...
+                    for rm in 0..reg_m as usize {
+                        let ai = rm * reg_n as usize + rn;
+                        let mut acc_tile = acc1.regs[ai];
+                        mma.emit_mma(ptx, a_saved[ki][rm], b_sel, &mut acc_tile);
+                    }
+                } else {
+                    // Reverse: rows reg_m-1,...,1,0
+                    for rm in (0..reg_m as usize).rev() {
+                        let ai = rm * reg_n as usize + rn;
+                        let mut acc_tile = acc1.regs[ai];
+                        mma.emit_mma(ptx, a_saved[ki][rm], b_sel, &mut acc_tile);
+                    }
                 }
             }
         }
@@ -748,7 +762,7 @@ impl DualMainloopPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atoms::{CpAsyncCopy, IdentityTransform, Mma16816};
+    use crate::atoms::{CpAsyncCopy, IdentityTransform, Mma16816F16};
     use crate::config::GemmConfig;
     use crate::gemm::{
         emit_a_global_addrs_cfg, emit_b_global_addrs_cfg, emit_cpasync_swizzle_cfg,
@@ -805,7 +819,7 @@ mod tests {
             &CpAsyncCopy,
             &CpAsyncCopy,
             &IdentityTransform,
-            &Mma16816,
+            &Mma16816F16,
             ga_chunks,
             a_cp_off,
             gb0_chunks,
@@ -920,7 +934,7 @@ mod tests {
             &CpAsyncCopy,
             &CpAsyncCopy,
             &IdentityTransform,
-            &Mma16816,
+            &Mma16816F16,
             ga_chunks,
             a_cp_off,
             gb0_chunks,
@@ -1093,5 +1107,93 @@ mod tests {
             gemm1_comment > first_ldmatrix_a,
             "GEMM1 MMAs must come after A fragment loads (GEMM0 MMAs)"
         );
+    }
+
+    #[test]
+    fn test_dual_pipeline_uses_f16_accumulators() {
+        let config = GemmConfig::default_64x64();
+        let ptx = build_dual_pipeline_ptx(&config);
+
+        let kloop_start = ptx.find("$L_DUAL_KLOOP:").expect("K-loop label");
+        let kloop_end = ptx
+            .find("$L_DUAL_K0_FALLTHROUGH:")
+            .expect("K0 fallthrough");
+        let kloop = &ptx[kloop_start..kloop_end];
+
+        // All MMAs should be f16.f16.f16.f16, not f32.f16.f16.f32
+        let f16_mma_count = kloop
+            .matches("f16.f16.f16.f16")
+            .count();
+        let f32_mma_count = kloop
+            .matches("f32.f16.f16.f32")
+            .count();
+        assert!(
+            f16_mma_count > 0,
+            "Dual pipeline must use f16 accumulator MMAs"
+        );
+        assert_eq!(
+            f32_mma_count, 0,
+            "Dual pipeline must NOT use f32 accumulator MMAs, found {}",
+            f32_mma_count
+        );
+    }
+
+    #[test]
+    fn test_dual_pipeline_f16_accumulators_have_2_regs() {
+        let config = GemmConfig::default_64x64();
+        let mut ptx = PtxBuilder::new(config.clone());
+        let c = &ptx.config.clone();
+
+        let a_ptr = ptx.regs.alloc_b64();
+        let b0_ptr = ptx.regs.alloc_b64();
+        let b1_ptr = ptx.regs.alloc_b64();
+        ptx.ld_param_b64(a_ptr, "param_A");
+        ptx.ld_param_b64(b0_ptr, "param_B0");
+        ptx.ld_param_b64(b1_ptr, "param_B1");
+        let n_param = ptx.regs.alloc_b32();
+        let k_param = ptx.regs.alloc_b32();
+        ptx.ld_param_b32(n_param, "param_N");
+        ptx.ld_param_b32(k_param, "param_K");
+
+        let setup = emit_gemm_setup(&mut ptx, c);
+        let (a_cp_off, b0_cp_off) = emit_cpasync_swizzle_cfg(&mut ptx, c, setup.tid);
+        let b1_cp_off = ptx.regs.alloc_b32();
+        ptx.mov_b32(b1_cp_off, b0_cp_off);
+
+        let ga_chunks =
+            emit_a_global_addrs_cfg(&mut ptx, c, setup.block_row, k_param, a_ptr, setup.tid);
+        let gb0_chunks =
+            emit_b_global_addrs_cfg(&mut ptx, c, setup.block_col, n_param, b0_ptr, setup.tid);
+        let gb1_chunks =
+            emit_b_global_addrs_cfg(&mut ptx, c, setup.block_col, n_param, b1_ptr, setup.tid);
+
+        let pipeline = DualMainloopPipeline::new(c.num_stages);
+        let result = pipeline.emit(
+            &mut ptx,
+            c,
+            &setup,
+            &CpAsyncCopy,
+            &CpAsyncCopy,
+            &CpAsyncCopy,
+            &IdentityTransform,
+            &Mma16816F16,
+            ga_chunks,
+            a_cp_off,
+            gb0_chunks,
+            b0_cp_off,
+            gb1_chunks,
+            b1_cp_off,
+            n_param,
+            k_param,
+            None,
+        );
+
+        // Each accumulator tile should have exactly 2 registers (f16), not 4 (f32)
+        for tile in &result.acc0.regs {
+            assert_eq!(tile.len(), 2, "f16 accumulator tiles must have 2 registers");
+        }
+        for tile in &result.acc1.regs {
+            assert_eq!(tile.len(), 2, "f16 accumulator tiles must have 2 registers");
+        }
     }
 }

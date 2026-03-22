@@ -1210,18 +1210,11 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
     ptx.bar_sync(0);
     ptx.blank();
 
-    ptx.comment("=== Phase C: SiLuMul epilogue on f16 dual accumulators (CUTLASS exp2 style) ===");
+    ptx.comment("=== Phase C: SiLuMul epilogue on f16 dual accumulators ===");
+    ptx.comment("Unpack f16x2 -> f32, apply SiLU in f32 (neg, mul log2e, ex2, add 1, rcp, mul), repack");
 
-    // f16 accumulators: acc0_regs[tile] = [hi, lo] packed f16x2
-    // For each tile: gate = acc0_regs[tile], up = acc1_regs[tile]
-    // SiLU(gate) * up = gate * sigmoid(gate) * up
-    // All done in f16x2 to match CUTLASS.
-    //
-    // The CUTLASS epilogue has a smem shuffle step, but since our accumulator
-    // layout already has the right thread mapping, we can do the SiLU in-place
-    // and then store directly. The smem shuffle is needed in CUTLASS because
-    // the output tile iterator has a different thread mapping than the MMA
-    // accumulator layout. We match this by using f16x2 ops directly on accumulators.
+    // LOG2E constant for sigmoid: sigmoid(x) = 1/(1+exp(-x)) = 1/(1+2^(-x*log2(e)))
+    let log2e: f32 = std::f32::consts::LOG2_E; // 1.4426950..
 
     for rm in 0..reg_m as usize {
         for rn in 0..reg_n as usize {
@@ -1234,105 +1227,69 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
                 let gate_reg = gate[i];
                 let up_reg = up[i];
 
-                // Allocate result registers
-                let neg_r = ptx.regs.alloc_b32();
-                let exp_r = ptx.regs.alloc_b32();
-                let one_plus_exp = ptx.regs.alloc_b32();
-                let silu_r = ptx.regs.alloc_b32();
+                // Allocate f32 working registers
+                let g_lo = ptx.regs.alloc_f32();
+                let g_hi = ptx.regs.alloc_f32();
+                let u_lo = ptx.regs.alloc_f32();
+                let u_hi = ptx.regs.alloc_f32();
+
+                // Unpack gate f16x2 -> two f32 via block-local .b16 regs
+                ptx.w(&format!(
+                    "{{ .reg .b16 __gl, __gh;\n\
+                     \tmov.b32 \t{{__gl, __gh}}, {gate_reg};\n\
+                     \tcvt.f32.f16 \t{g_lo}, __gl;\n\
+                     \tcvt.f32.f16 \t{g_hi}, __gh; }}"
+                ));
+
+                // Unpack up f16x2 -> two f32
+                ptx.w(&format!(
+                    "{{ .reg .b16 __ul, __uh;\n\
+                     \tmov.b32 \t{{__ul, __uh}}, {up_reg};\n\
+                     \tcvt.f32.f16 \t{u_lo}, __ul;\n\
+                     \tcvt.f32.f16 \t{u_hi}, __uh; }}"
+                ));
+
+                // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                // sigmoid(x) = 1 / (1 + 2^(-x * log2(e)))
+                // Compute for lo lane:
+                let neg_lo = ptx.regs.alloc_f32();
+                let scaled_lo = ptx.regs.alloc_f32();
+                let exp_lo = ptx.regs.alloc_f32();
+                let denom_lo = ptx.regs.alloc_f32();
+                let sig_lo = ptx.regs.alloc_f32();
+                let silu_lo = ptx.regs.alloc_f32();
+                let res_lo = ptx.regs.alloc_f32();
+
+                ptx.neg_f32(neg_lo, g_lo);
+                ptx.mul_f32_imm(scaled_lo, neg_lo, log2e);
+                ptx.ex2_approx_f32(exp_lo, scaled_lo);
+                ptx.add_f32_imm(denom_lo, exp_lo, 1.0);
+                ptx.rcp_approx_f32(sig_lo, denom_lo);
+                ptx.mul_f32(silu_lo, g_lo, sig_lo);
+                ptx.mul_f32(res_lo, silu_lo, u_lo);
+
+                // Compute for hi lane:
+                let neg_hi = ptx.regs.alloc_f32();
+                let scaled_hi = ptx.regs.alloc_f32();
+                let exp_hi = ptx.regs.alloc_f32();
+                let denom_hi = ptx.regs.alloc_f32();
+                let sig_hi = ptx.regs.alloc_f32();
+                let silu_hi = ptx.regs.alloc_f32();
+                let res_hi = ptx.regs.alloc_f32();
+
+                ptx.neg_f32(neg_hi, g_hi);
+                ptx.mul_f32_imm(scaled_hi, neg_hi, log2e);
+                ptx.ex2_approx_f32(exp_hi, scaled_hi);
+                ptx.add_f32_imm(denom_hi, exp_hi, 1.0);
+                ptx.rcp_approx_f32(sig_hi, denom_hi);
+                ptx.mul_f32(silu_hi, g_hi, sig_hi);
+                ptx.mul_f32(res_hi, silu_hi, u_hi);
+
+                // Pack result back to f16x2
                 let result_r = ptx.regs.alloc_b32();
-
-                // neg.f16x2 for sigmoid
-                ptx.w(&format!("{{neg.f16x2 {neg_r},{gate_reg};}}"));
-
-                // exp2 inline asm block matching CUTLASS:
-                // exp(-x) = 2^(-x * log2(e))
-                ptx.raw(&format!(
-                    "\t{{.reg.b16         hl, hu;\n\
-                     \t .reg.b32         h,r,fl,fu,C,nZ;\n\
-                     \t  mov.b32         {{hl, hu}}, {neg_r};\n\
-                     \t  mov.b32         h, {neg_r};\n\
-                     \t  cvt.f32.f16     fl, hl;\n\
-                     \t  cvt.f32.f16     fu, hu;\n\
-                     \t  mov.b32         C, 0x3fb8aa3bU;\n\
-                     \t  mov.b32         nZ, 0x80000000U;\n\
-                     \t  fma.rn.f32      fl,fl,C,nZ;\n\
-                     \t  fma.rn.f32      fu,fu,C,nZ;\n\
-                     \t  ex2.approx.ftz.f32  fl, fl;\n\
-                     \t  ex2.approx.ftz.f32  fu, fu;\n\
-                     \t  cvt.rn.f16.f32      hl, fl;\n\
-                     \t  cvt.rn.f16.f32      hu, fu;\n\
-                     \t  mov.b32         r, {{hl, hu}};\n\
-                     \t{{.reg.b32 spc, ulp, p;\n\
-                     \t  mov.b32 spc,0X1F791F79U;\n\
-                     \t  mov.b32 ulp,0x94009400U;\n\
-                     \t  set.eq.f16x2.f16x2 p,h, spc;\n\
-                     \t  fma.rn.f16x2 r,p,ulp,r;}}\n\
-                     \t{{.reg.b32 spc, ulp, p;\n\
-                     \t  mov.b32 spc,0X25CF25CFU;\n\
-                     \t  mov.b32 ulp,0x94009400U;\n\
-                     \t  set.eq.f16x2.f16x2 p,h, spc;\n\
-                     \t  fma.rn.f16x2 r,p,ulp,r;}}\n\
-                     \t{{.reg.b32 spc, ulp, p;\n\
-                     \t  mov.b32 spc,0XC13BC13BU;\n\
-                     \t  mov.b32 ulp,0x04000400U;\n\
-                     \t  set.eq.f16x2.f16x2 p,h, spc;\n\
-                     \t  fma.rn.f16x2 r,p,ulp,r;}}\n\
-                     \t{{.reg.b32 spc, ulp, p;\n\
-                     \t  mov.b32 spc,0XC1EFC1EFU;\n\
-                     \t  mov.b32 ulp,0x02000200U;\n\
-                     \t  set.eq.f16x2.f16x2 p,h, spc;\n\
-                     \t  fma.rn.f16x2 r,p,ulp,r;}}\n\
-                     \t  mov.b32         {exp_r}, r;\n\
-                     \t}}"
-                ));
-
-                // 1 + exp(-x)
                 ptx.w(&format!(
-                    "{{mov.b32 {one_plus_exp}, {{15360, 15360}};}}"
+                    "cvt.rn.f16x2.f32 \t{result_r}, {res_hi}, {res_lo};"
                 ));
-                ptx.w(&format!(
-                    "{{add.f16x2 {one_plus_exp},{one_plus_exp},{exp_r};}}"
-                ));
-
-                // sigmoid = 1.0 / (1 + exp(-x)) via scalar rcp
-                // Unpack, divide, repack
-                let sig_lo = ptx.regs.alloc_b32(); // b16 stored in b32
-                let sig_hi = ptx.regs.alloc_b32();
-                let f_num = ptx.regs.alloc_f32();
-                let f_den = ptx.regs.alloc_f32();
-                let f_rcp = ptx.regs.alloc_f32();
-                let f_result = ptx.regs.alloc_f32();
-
-                // Low half: sigmoid_lo = 1.0 / (1 + exp(-gate_lo))
-                ptx.w(&format!(
-                    "{{.reg .f16 low,high; mov.b32 {{low,high}}, {one_plus_exp}; mov.b16 {sig_lo}, low;}}"
-                ));
-                ptx.w(&format!("{{  cvt.f32.f16 {f_num}, 15360;}}"));  // 1.0 in f16 = 15360
-                ptx.w(&format!("{{  cvt.f32.f16 {f_den}, {sig_lo};}}"));
-                ptx.w(&format!("{{rcp.approx.ftz.f32 {f_rcp}, {f_den};}}"));
-                ptx.w(&format!("mul.f32 \t{f_result}, {f_num}, {f_rcp};"));
-                ptx.w(&format!("{{  cvt.rn.f16.f32 {sig_lo}, {f_result};}}"));
-
-                // High half
-                ptx.w(&format!(
-                    "{{.reg .f16 low,high; mov.b32 {{low,high}}, {one_plus_exp}; mov.b16 {sig_hi}, high;}}"
-                ));
-                ptx.w(&format!("{{  cvt.f32.f16 {f_den}, {sig_hi};}}"));
-                ptx.w(&format!("{{rcp.approx.ftz.f32 {f_rcp}, {f_den};}}"));
-                ptx.w(&format!("mul.f32 \t{f_result}, {f_num}, {f_rcp};"));
-                ptx.w(&format!("{{  cvt.rn.f16.f32 {sig_hi}, {f_result};}}"));
-
-                // Pack sigmoid back to f16x2
-                let sigmoid_packed = ptx.regs.alloc_b32();
-                ptx.w(&format!(
-                    "{{  mov.b32 {sigmoid_packed}, {{{sig_lo},{sig_hi}}};}}"
-                ));
-
-                // SiLU(gate) = gate * sigmoid(gate)
-                ptx.w(&format!("{{mul.f16x2 {silu_r},{gate_reg},{sigmoid_packed};}}"));
-
-                // Final: SiLU(gate) * up
-                ptx.w(&format!("{{mul.f16x2 {result_r},{silu_r},{up_reg};}}"));
 
                 // Store result back to gate accumulator
                 ptx.mov_b32(gate[i], result_r);
@@ -2374,8 +2331,8 @@ mod tests {
         );
         assert!(ptx.contains("rsqrt.approx.f32"));
         assert!(
-            ptx.contains("ex2.approx.ftz.f32"),
-            "Must use CUTLASS-style exp2 for SiLU"
+            ptx.contains("ex2.approx.f32"),
+            "Must use exp2 for SiLU sigmoid"
         );
         assert!(ptx.contains("cp.async.cg.shared.global"));
 
@@ -2429,26 +2386,30 @@ mod tests {
         let config = GemmConfig::default_128x128();
         let ptx = build_dual_fused_pipeline(&config, 4096);
 
-        // CUTLASS-style SiLuMul epilogue with f16x2 ops
+        // SiLuMul epilogue uses f32 SiLU: neg, mul log2e, ex2, add 1, rcp, mul
         assert!(
-            ptx.contains("neg.f16x2"),
-            "Must have neg.f16x2 for sigmoid(-x)"
+            ptx.contains("neg.f32"),
+            "Must have neg.f32 for -x in sigmoid"
         );
         assert!(
-            ptx.contains("ex2.approx.ftz.f32"),
-            "Must have ex2 for exp in sigmoid (CUTLASS inline asm)"
+            ptx.contains("ex2.approx.f32"),
+            "Must have ex2.approx.f32 for exp in sigmoid"
         );
         assert!(
-            ptx.contains("rcp.approx.ftz.f32"),
-            "Must have rcp for scalar sigmoid division"
+            ptx.contains("rcp.approx.f32"),
+            "Must have rcp.approx.f32 for 1/(1+exp(-x))"
         );
 
-        // SiLuMul also does gate * up multiplication via f16x2
+        // Unpack/repack via cvt instructions
         let epilogue_start = ptx.find("SiLuMul epilogue").expect("SiLuMul epilogue comment");
         let epilogue_region = &ptx[epilogue_start..];
         assert!(
-            epilogue_region.contains("mul.f16x2"),
-            "SiLuMul epilogue must use mul.f16x2 for silu(gate) * up"
+            epilogue_region.contains("cvt.f32.f16"),
+            "SiLuMul epilogue must unpack f16 to f32"
+        );
+        assert!(
+            epilogue_region.contains("cvt.rn.f16x2.f32"),
+            "SiLuMul epilogue must repack f32 to f16x2"
         );
     }
 

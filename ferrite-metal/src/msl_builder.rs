@@ -140,7 +140,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_template_substitution() {
+    fn test_template_substitution_basic() {
         let mut b = MslBuilder::new();
         b.set("TYPE", "half");
         b.set("SIZE", "32");
@@ -149,14 +149,156 @@ mod tests {
     }
 
     #[test]
-    fn test_indentation() {
+    fn test_template_multiple_same_key() {
         let mut b = MslBuilder::new();
-        b.raw("kernel void test() {");
-        b.indent();
-        b.raw("int x = 0;");
-        b.dedent();
-        b.raw("}");
+        b.set("T", "float");
+        b.line("{{T}} a; {{T}} b;");
+        assert_eq!(b.finish().trim(), "float a; float b;");
+    }
+
+    #[test]
+    fn test_template_no_substitution() {
+        let mut b = MslBuilder::new();
+        b.line("int x = 42;");
+        assert_eq!(b.finish().trim(), "int x = 42;");
+    }
+
+    #[test]
+    #[should_panic(expected = "undefined template variable")]
+    fn test_template_undefined_key_panics() {
+        let mut b = MslBuilder::new();
+        b.line("{{UNDEFINED_KEY}}");
+    }
+
+    #[test]
+    fn test_template_overwrite() {
+        let mut b = MslBuilder::new();
+        b.set("X", "1");
+        b.line("int a = {{X}};");
+        b.set("X", "2");
+        b.line("int b = {{X}};");
         let s = b.finish();
-        assert!(s.contains("    int x = 0;"));
+        assert!(s.contains("int a = 1;"));
+        assert!(s.contains("int b = 2;"));
+    }
+
+    #[test]
+    fn test_indentation_levels() {
+        let mut b = MslBuilder::new();
+        b.raw("level0");
+        b.indent();
+        b.raw("level1");
+        b.indent();
+        b.raw("level2");
+        b.dedent();
+        b.raw("level1again");
+        b.dedent();
+        b.raw("level0again");
+        let s = b.finish();
+        assert!(s.contains("level0\n"));
+        assert!(s.contains("    level1\n"));
+        assert!(s.contains("        level2\n"));
+        assert!(s.contains("    level1again\n"));
+        assert!(s.contains("level0again\n"));
+    }
+
+    #[test]
+    fn test_dedent_does_not_go_negative() {
+        let mut b = MslBuilder::new();
+        b.dedent(); // should not panic
+        b.dedent(); // should not panic
+        b.raw("still at level 0");
+        assert!(b.finish().starts_with("still at level 0"));
+    }
+
+    #[test]
+    fn test_open_close_brace() {
+        let mut b = MslBuilder::new();
+        b.raw("if (true)");
+        b.open_brace();
+        b.raw("do_something();");
+        b.close_brace();
+        let s = b.finish();
+        assert!(s.contains("if (true)\n"));
+        assert!(s.contains("{\n"));
+        assert!(s.contains("    do_something();\n"));
+        assert!(s.contains("}\n"));
+    }
+
+    #[test]
+    fn test_comment() {
+        let mut b = MslBuilder::new();
+        b.indent();
+        b.comment("this is a comment");
+        let s = b.finish();
+        assert!(s.contains("    // this is a comment\n"));
+    }
+
+    #[test]
+    fn test_blank_line() {
+        let mut b = MslBuilder::new();
+        b.raw("line1");
+        b.blank();
+        b.raw("line2");
+        let s = b.finish();
+        assert!(s.contains("line1\n\nline2\n"));
+    }
+
+    #[test]
+    fn test_block_multiline() {
+        let mut b = MslBuilder::new();
+        b.set("N", "8");
+        b.indent();
+        b.block("for (int i = 0; i < {{N}}; i++) {\n    x += i;\n}");
+        let s = b.finish();
+        assert!(s.contains("    for (int i = 0; i < 8; i++) {"));
+        assert!(s.contains("    x += i;"));
+        assert!(s.contains("    }"));
+    }
+
+    #[test]
+    fn test_append_no_newline() {
+        let mut b = MslBuilder::new();
+        b.append("no_newline");
+        b.append("_continued");
+        let s = b.finish();
+        assert_eq!(s, "no_newline_continued");
+    }
+
+    #[test]
+    fn test_realistic_kernel_structure() {
+        let mut b = MslBuilder::new();
+        b.set("TYPE", "half");
+        b.set("BLOCK_M", "32");
+        b.set("BLOCK_N", "32");
+
+        b.raw("#include <metal_stdlib>");
+        b.raw("using namespace metal;");
+        b.blank();
+        b.line("constant uint M_group = {{BLOCK_M}};");
+        b.line("constant uint N_group = {{BLOCK_N}};");
+        b.blank();
+        b.raw("kernel void gemm(");
+        b.indent();
+        b.line("device {{TYPE}} *A [[buffer(0)]],");
+        b.line("device {{TYPE}} *B [[buffer(1)]],");
+        b.raw("device float *C [[buffer(2)]]");
+        b.dedent();
+        b.raw(")");
+        b.open_brace();
+        b.comment("K-loop");
+        b.raw("for (uint k = 0; k < K; k += K_group)");
+        b.open_brace();
+        b.raw("// body");
+        b.close_brace();
+        b.close_brace();
+
+        let s = b.finish();
+        assert!(s.contains("#include <metal_stdlib>"));
+        assert!(s.contains("constant uint M_group = 32;"));
+        assert!(s.contains("device half *A [[buffer(0)]],"));
+        assert!(s.contains("    // K-loop"));
+        assert!(s.contains("    for (uint k = 0; k < K; k += K_group)"));
+        assert!(s.contains("        // body"));
     }
 }

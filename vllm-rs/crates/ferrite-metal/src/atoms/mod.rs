@@ -16,15 +16,23 @@
 /// - `A_mat`, `B_mat`: simdgroup_matrix locals
 /// - `C_sram[tm][tn]`: accumulator array
 /// - `kt`, `tm`, `tn`: tile loop indices
+mod element_mul;
 mod epilogue;
 mod fragment_load;
 mod mma;
+mod residual_add;
+pub mod rmsnorm;
+pub mod rope;
 mod tile_copy;
 mod transform;
 
+pub use element_mul::*;
 pub use epilogue::*;
 pub use fragment_load::*;
 pub use mma::*;
+pub use residual_add::*;
+pub use rmsnorm::*;
+pub use rope::*;
 pub use tile_copy::*;
 pub use transform::*;
 

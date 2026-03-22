@@ -407,32 +407,7 @@ fn test_dump_full_msl_apple8() {
     );
 }
 
-#[test]
-fn test_apple8_msl_compiles_with_xcrun_metal() {
-    // Apple8 (polyfill) path uses no AIR intrinsics and can be validated
-    // by the offline Metal compiler. Apple9 (hardware async) requires runtime
-    // compilation via MTLDevice.makeLibrary() due to __asm declarations.
-    let config = MetalGemmConfig::default_apple8_f16();
-    let msl = build_standalone_gemm(&config);
-
-    let tmp = std::env::temp_dir().join("ferrite_test_apple8.metal");
-    std::fs::write(&tmp, &msl).expect("write temp MSL");
-
-    let output = std::process::Command::new("xcrun")
-        .args(["metal", "-std=metal3.0", "-Werror", "-c"])
-        .arg(&tmp)
-        .arg("-o")
-        .arg("/dev/null")
-        .output()
-        .expect("xcrun metal must be available on macOS");
-
-    std::fs::remove_file(&tmp).ok();
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!("Metal shader compilation failed:\n{}", stderr);
-    }
-}
+// NOTE: xcrun metal and runtime GPU compilation tests are in test_metal_compile.rs
 
 #[test]
 fn test_store_phase_uses_apply_offset() {

@@ -40,10 +40,22 @@ pub trait TransformAtom {
     fn emit_transform(&self, ptx: &mut PtxBuilder, frag: &mut [Reg; 4], ki: u32, rm: u32);
 }
 
-/// How tensor cores consume fragments.
+/// How tensor cores consume fragments (f32 accumulators, 4 output regs).
 /// SM89: mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
 pub trait MmaAtom {
     fn emit_mma(&self, ptx: &mut PtxBuilder, a: [Reg; 4], b: [Reg; 2], acc: &mut [Reg; 4]);
+}
+
+/// How tensor cores consume fragments (f16 accumulators, 2 output regs).
+/// SM89: mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16
+/// Halves register pressure vs f32 — critical for dual GEMM.
+pub trait MmaAtomF16 {
+    fn emit_mma(&self, ptx: &mut PtxBuilder, a: [Reg; 4], b: [Reg; 2], acc: &mut [Reg; 2]);
+}
+
+/// How f16 accumulators are post-processed before store.
+pub trait EpilogueAtomF16 {
+    fn emit_epilogue(&self, ptx: &mut PtxBuilder, acc: &mut crate::gemm::AccumulatorMapF16);
 }
 
 /// How accumulators are post-processed before store.
@@ -93,9 +105,17 @@ pub struct Mma16816;
 impl MmaAtom for Mma16816 {
     fn emit_mma(&self, ptx: &mut PtxBuilder, a: [Reg; 4], b: [Reg; 2], acc: &mut [Reg; 4]) {
         ptx.mma_m16n8k16(*acc, a, b, *acc);
-        // mma_m16n8k16 writes to `d` which is the first arg. We update acc in place.
-        // Note: PtxBuilder::mma_m16n8k16(d, a, b, c) emits d = mma(a, b, c).
-        // Since we passed *acc as both d and c, acc is updated.
+    }
+}
+
+/// f16-accumulator MMA — halves register pressure (2 output regs vs 4).
+/// Used by dual GEMM to fit two accumulator sets in the register budget.
+/// Matches CUTLASS dual_gemm: mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16
+pub struct Mma16816F16;
+
+impl MmaAtomF16 for Mma16816F16 {
+    fn emit_mma(&self, ptx: &mut PtxBuilder, a: [Reg; 4], b: [Reg; 2], acc: &mut [Reg; 2]) {
+        ptx.mma_m16n8k16_f16(*acc, a, b, *acc);
     }
 }
 

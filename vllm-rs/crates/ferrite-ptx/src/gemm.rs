@@ -171,8 +171,17 @@ impl FragmentTransform for RmsNormTransform {
 /// After the K-loop, these hold the partial results.
 /// An activation can transform them in-place before the store.
 pub struct AccumulatorMap {
-    /// regs[rm * reg_n + rn] = [d0, d1, d2, d3]
+    /// regs[rm * reg_n + rn] = [d0, d1, d2, d3] (f32 accum) or [d0, d1] (f16 accum)
     pub regs: Vec<[Reg; 4]>,
+    pub reg_m: u32,
+    pub reg_n: u32,
+}
+
+/// Accumulator map for f16 accumulators (2 regs per MMA output tile).
+/// Used by the dual GEMM pipeline to halve register pressure.
+pub struct AccumulatorMapF16 {
+    /// regs[rm * reg_n + rn] = [d0, d1] (packed f16x2 pairs)
+    pub regs: Vec<[Reg; 2]>,
     pub reg_m: u32,
     pub reg_n: u32,
 }

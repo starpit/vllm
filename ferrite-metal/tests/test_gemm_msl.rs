@@ -173,11 +173,14 @@ fn test_apple9_uses_async_copy() {
 }
 
 #[test]
-fn test_apple8_uses_direct_load() {
+fn test_apple8_uses_polyfill_not_hardware_async() {
     let config = MetalGemmConfig::default_apple8_f16();
     let msl = build_standalone_gemm(&config);
-    // apple8 path: no async copy, direct load from device memory
-    assert!(!msl.contains("simdgroup_event"), "apple8 should NOT use async copy");
+    // apple8: polyfill simdgroup_event (loop-based, no AIR intrinsics)
+    assert!(!msl.contains("__asm(\"air.simdgroup_async_copy"),
+        "apple8 should NOT use hardware AIR async copy intrinsics");
+    // The polyfill struct `simdgroup_event` is still present but with no-op wait
+    assert!(msl.contains("simdgroup_event"), "Polyfill struct should still be defined");
 }
 
 #[test]

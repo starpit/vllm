@@ -63,12 +63,21 @@ pub fn build_standalone_gemm(config: &MetalGemmConfig) -> String {
 // MSL emission helpers
 // ═══════════════════════════════════════════════════════════════════
 
-fn emit_headers(msl: &mut MslBuilder, _config: &MetalGemmConfig) {
+fn emit_headers(msl: &mut MslBuilder, config: &MetalGemmConfig) {
+    // Inline the simdgroup event header (async copy support)
+    let event_header = crate::headers::simdgroup_event_header(config.prefer_async_load);
+    msl.append(event_header);
+    msl.blank();
+
+    // Inline the simdgroup_matrix_storage header (load/store/multiply)
+    let needs_bf16 = config.memory_precisions.a == crate::config::Precision::BF16
+        || config.memory_precisions.b == crate::config::Precision::BF16;
+    let matrix_header = crate::headers::simdgroup_matrix_storage_header(needs_bf16);
+    msl.append(matrix_header);
+    msl.blank();
+
     msl.raw("#include <metal_stdlib>");
     msl.raw("using namespace metal;");
-    msl.blank();
-    msl.comment("MFA-compatible simdgroup_matrix_storage and async_copy headers");
-    msl.comment("TODO: inline the necessary simdgroup helpers here");
     msl.blank();
 }
 

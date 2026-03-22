@@ -26,15 +26,16 @@ fn blank(s: &mut String) {
 }
 
 fn emit_kernel(s: &mut String) {
-    emit_prologue_and_kloop(s);
+    emit_header(s);
+    emit_prologue(s);
+    emit_kloop(s);
     emit_epilogue(s);
-
-    // Closing brace
     s.push_str("\n}\n");
 }
 
-fn emit_prologue_and_kloop(s: &mut String) {
-    // Header: PTX version, target, shared memory, entry point, register declarations
+/// Emit the PTX header: version, target, smem, entry, registers.
+/// Also the param base pointer setup (first 2 instructions).
+pub(crate) fn emit_header(s: &mut String) {
     s.push_str(concat!(
         ".version 8.0\n",
         ".target sm_89\n",
@@ -54,8 +55,11 @@ fn emit_prologue_and_kloop(s: &mut String) {
         "\n",
         "\n",
     ));
+}
 
-    // Prologue: lines 1-576 of the original body, emitted instruction-by-instruction.
+/// Emit the prologue: param loads, thread decomposition, address computation,
+/// first tile loads (cp.async), barrier, first fragment loads (ldmatrix).
+pub(crate) fn emit_prologue(s: &mut String) {
     w(s, "mov.b64 	%rd90, ferrite_dual_gemm_silu_mul_param_0;");
     w(s, "mov.u64 	%rd1, %rd90;");
     w(s, "mov.u32 	%r1, %ctaid.z;");
@@ -632,8 +636,10 @@ fn emit_prologue_and_kloop(s: &mut String) {
     w(s, "mov.u32 	%r3203, %r3200;");
     w(s, "mov.u32 	%r3301, %r3311;");
     blank(s);
+}
 
-    // K-loop: lines 1-472 of the original kloop_epilogue, emitted instruction-by-instruction.
+/// Emit the K-loop: fragment loads, MMA (GEMM0 + GEMM1), cp.async next tile, buffer cycling.
+pub(crate) fn emit_kloop(s: &mut String) {
     s.push_str("$L__BB1_7:\n");
     w(s, ".pragma \"nounroll\";");
     w(s, "shl.b32 \t%r1513, %r895, 4;");
@@ -8305,5 +8311,181 @@ mod tests {
         let ptx = emit_dual_gemm_kernel();
         let mma_count = ptx.lines().filter(|l| l.contains("mma.sync.aligned")).count();
         assert_eq!(mma_count, 64);
+    }
+
+    // ── Per-section tests ──
+
+    fn get_prologue() -> String {
+        let mut s = String::new();
+        emit_header(&mut s);
+        emit_prologue(&mut s);
+        s
+    }
+
+    fn get_kloop() -> String {
+        let mut s = String::new();
+        emit_kloop(&mut s);
+        s
+    }
+
+    fn get_epilogue() -> String {
+        let mut s = String::new();
+        emit_epilogue(&mut s);
+        s
+    }
+
+    // Prologue tests
+    #[test]
+    fn test_prologue_has_param_loads() {
+        let p = get_prologue();
+        assert!(p.contains("ld.param.u32"), "Must load u32 params");
+        assert!(p.contains("ld.param.u64"), "Must load u64 params");
+        assert!(p.contains("ld.param.v2.u32"), "Must load v2 params (grid shape)");
+    }
+
+    #[test]
+    fn test_prologue_has_thread_decomposition() {
+        let p = get_prologue();
+        assert!(p.contains("%tid.x"), "Must read tid.x");
+        assert!(p.contains("%ctaid.x"), "Must read ctaid.x");
+        assert!(p.contains("%ctaid.y"), "Must read ctaid.y");
+    }
+
+    #[test]
+    fn test_prologue_has_smem_base() {
+        let p = get_prologue();
+        assert!(p.contains("_ZN7cutlass17SharedStorageBaseE"), "Must reference smem symbol");
+    }
+
+    #[test]
+    fn test_prologue_cp_async_count() {
+        let p = get_prologue();
+        let cp = p.lines().filter(|l| l.contains("cp.async.cg")).count();
+        // 2 stages × 8 loads per stage = 16 cp.async in prologue
+        assert_eq!(cp, 16, "Prologue needs 16 cp.async (2 stages × (4A + 2B0 + 2B1))");
+    }
+
+    #[test]
+    fn test_prologue_commit_count() {
+        let p = get_prologue();
+        let commits = p.lines().filter(|l| l.contains("cp.async.commit_group")).count();
+        // 2 commits (1 per stage)
+        assert_eq!(commits, 2, "Prologue needs 2 commit_group (1 per stage)");
+    }
+
+    #[test]
+    fn test_prologue_has_barrier() {
+        let p = get_prologue();
+        assert!(p.contains("bar.sync"), "Prologue must have barrier after tile loads");
+    }
+
+    #[test]
+    fn test_prologue_has_ldmatrix() {
+        let p = get_prologue();
+        let ldm = p.lines().filter(|l| l.contains("ldmatrix.sync")).count();
+        // 8 ldmatrix in prologue (4A + 2B0 + 2B1)
+        assert_eq!(ldm, 8, "Prologue needs 8 ldmatrix (4A + 2B0 + 2B1)");
+    }
+
+    // K-loop tests
+    #[test]
+    fn test_kloop_has_64_mma() {
+        let k = get_kloop();
+        let mma = k.lines().filter(|l| l.contains("mma.sync.aligned")).count();
+        assert_eq!(mma, 64, "K-loop needs 64 MMA (32 GEMM0 + 32 GEMM1)");
+    }
+
+    #[test]
+    fn test_kloop_uses_f16_accumulators() {
+        let k = get_kloop();
+        assert!(k.contains("f16.f16.f16.f16"), "Must use f16 accumulators");
+        assert!(!k.contains("f32.f16.f16.f32"), "Must NOT use f32 accumulators");
+    }
+
+    #[test]
+    fn test_kloop_has_8_cp_async() {
+        let k = get_kloop();
+        let cp = k.lines().filter(|l| l.contains("cp.async.cg")).count();
+        assert_eq!(cp, 8, "K-loop needs 8 cp.async per iteration (4A + 2B0 + 2B1)");
+    }
+
+    #[test]
+    fn test_kloop_has_commit_and_wait() {
+        let k = get_kloop();
+        assert!(k.contains("cp.async.commit_group"), "Must commit async group");
+        assert!(k.contains("cp.async.wait_group"), "Must wait for async group");
+    }
+
+    #[test]
+    fn test_kloop_has_8_ldmatrix() {
+        let k = get_kloop();
+        let ldm = k.lines().filter(|l| l.contains("ldmatrix.sync")).count();
+        // 16: double-buffered fragments (8 for current iteration + 8 for next)
+        assert_eq!(ldm, 16, "K-loop needs 16 ldmatrix (2 × (4A + 2B0 + 2B1))");
+    }
+
+    #[test]
+    fn test_kloop_has_buffer_cycling() {
+        let k = get_kloop();
+        // Buffer cycling adds 128 or subtracts 256
+        assert!(k.contains("add.s32 \t%r3203, %r3203, 128"), "Must advance smem +128");
+        assert!(k.contains("add.s32 \t%r3203, %r3203, -256"), "Must wrap smem -256");
+    }
+
+    #[test]
+    fn test_kloop_has_loop_branch() {
+        let k = get_kloop();
+        assert!(k.contains("@%p34 bra \t$L__BB1_7"), "Must branch back to K-loop start");
+    }
+
+    #[test]
+    fn test_kloop_has_nounroll_pragma() {
+        let k = get_kloop();
+        assert!(k.contains(".pragma \"nounroll\""), "Must have nounroll pragma");
+    }
+
+    // Epilogue tests
+    #[test]
+    fn test_epilogue_has_silu_ops() {
+        let e = get_epilogue();
+        let ex2 = e.lines().filter(|l| l.contains("ex2.approx")).count();
+        let rcp = e.lines().filter(|l| l.contains("rcp.approx")).count();
+        assert!(ex2 >= 32, "Epilogue needs ex2 for sigmoid, got {}", ex2);
+        assert!(rcp >= 32, "Epilogue needs rcp for 1/(1+exp), got {}", rcp);
+    }
+
+    #[test]
+    fn test_epilogue_has_smem_shuffle() {
+        let e = get_epilogue();
+        let st_shared = e.lines().filter(|l| l.contains("st.shared.u32")).count();
+        let ld_shared = e.lines().filter(|l| l.contains("ld.shared.v4.u32")).count();
+        assert!(st_shared >= 16, "Epilogue needs smem stores for shuffle, got {}", st_shared);
+        assert!(ld_shared >= 8, "Epilogue needs smem loads for shuffle, got {}", ld_shared);
+    }
+
+    #[test]
+    fn test_epilogue_has_global_stores() {
+        let e = get_epilogue();
+        let st_global = e.lines().filter(|l| l.contains("st.global")).count();
+        assert!(st_global >= 8, "Epilogue needs global stores, got {}", st_global);
+    }
+
+    #[test]
+    fn test_epilogue_has_barriers() {
+        let e = get_epilogue();
+        let bars = e.lines().filter(|l| l.contains("bar.sync")).count();
+        assert!(bars >= 8, "Epilogue needs barriers between strips, got {}", bars);
+    }
+
+    #[test]
+    fn test_epilogue_has_mul_f16x2() {
+        let e = get_epilogue();
+        assert!(e.contains("mul.f16x2"), "Epilogue must use packed f16x2 multiply for SiLU*up");
+    }
+
+    #[test]
+    fn test_epilogue_has_ret() {
+        let e = get_epilogue();
+        assert!(e.contains("ret;"), "Epilogue must end with ret");
     }
 }

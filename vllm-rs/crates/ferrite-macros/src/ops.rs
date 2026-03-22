@@ -17,6 +17,11 @@ pub enum OpKind {
     Gelu,
     /// Elementwise addition: y = x + residual
     ResidualAdd,
+    /// Fused SiLU × multiply: y = silu(gate) * up
+    /// Used with wide GEMM (pre-concatenated [w_gate; w_up] weights).
+    /// The wide GEMM output is split at midpoint, SiLU applied to first half,
+    /// then multiplied by second half.
+    SiluMul,
     // Future: RotaryEmbed, Attention, Quantize, etc.
 }
 
@@ -28,6 +33,7 @@ impl OpKind {
             OpKind::Silu => "silu",
             OpKind::Gelu => "gelu",
             OpKind::ResidualAdd => "residual_add",
+            OpKind::SiluMul => "silu_mul",
         }
     }
 }
@@ -50,6 +56,7 @@ impl OpKind {
             OpKind::Silu => OpClass::Elementwise,
             OpKind::Gelu => OpClass::Elementwise,
             OpKind::ResidualAdd => OpClass::Elementwise,
+            OpKind::SiluMul => OpClass::Elementwise,
             OpKind::Gemm => OpClass::Matmul,
         }
     }

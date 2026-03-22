@@ -588,4 +588,127 @@ mod tests {
         );
         assert_eq!(stage.epilogue_transform, Some(2), "GELU should be epilogue");
     }
+
+    // ── SiluMul strategy tests ──
+
+    #[test]
+    fn test_gemm_silu_mul_fuses_as_one_stage() {
+        // Wide GEMM with SiluMul epilogue
+        // let g = gemm(x, w_gate_up);  // wide GEMM producing [gate, up]
+        // silu_mul(g)                   // split, SiLU on gate, multiply
+        let graph = build_graph(vec![
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: Some("g"),
+                inputs: vec![
+                    (PARAM, InputPort::Primary, "x"),
+                    (PARAM, InputPort::Weight, "w"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::SiluMul,
+                result_name: None,
+                inputs: vec![(0, InputPort::Primary, "g")],
+            },
+        ]);
+
+        let plan = evaluate_strategy(&graph);
+
+        assert_eq!(plan.stages.len(), 1, "GEMM+SiluMul must fuse into one stage");
+        let stage = &plan.stages[0];
+        assert_eq!(stage.gemm, 0);
+        assert_eq!(stage.prologue_transform, None);
+        assert_eq!(stage.epilogue_transform, Some(1), "SiluMul should be epilogue");
+    }
+
+    #[test]
+    fn test_rmsnorm_gemm_silu_mul_fuses_into_one_stage() {
+        // rmsnorm → wide GEMM → SiluMul
+        let graph = build_graph(vec![
+            NodeDesc {
+                kind: OpKind::RmsNorm,
+                result_name: Some("n"),
+                inputs: vec![
+                    (PARAM, InputPort::Primary, "x"),
+                    (PARAM, InputPort::Weight, "w"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: Some("g"),
+                inputs: vec![
+                    (0, InputPort::Primary, "n"),
+                    (PARAM, InputPort::Weight, "w2"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::SiluMul,
+                result_name: None,
+                inputs: vec![(1, InputPort::Primary, "g")],
+            },
+        ]);
+
+        let plan = evaluate_strategy(&graph);
+
+        assert_eq!(plan.stages.len(), 1);
+        let stage = &plan.stages[0];
+        assert_eq!(stage.gemm, 1);
+        assert_eq!(stage.prologue_transform, Some(0), "RmsNorm should be prologue");
+        assert_eq!(stage.epilogue_transform, Some(2), "SiluMul should be epilogue");
+    }
+
+    #[test]
+    fn test_rmsnorm_gemm_silu_mul_gemm_two_stages() {
+        // Full LLaMA MLP (Step A): rmsnorm → wide GEMM → SiluMul → GEMM(down)
+        let graph = build_graph(vec![
+            NodeDesc {
+                kind: OpKind::RmsNorm,
+                result_name: Some("n"),
+                inputs: vec![
+                    (PARAM, InputPort::Primary, "x"),
+                    (PARAM, InputPort::Weight, "w"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: Some("gate_up"),
+                inputs: vec![
+                    (0, InputPort::Primary, "n"),
+                    (PARAM, InputPort::Weight, "w2"),
+                ],
+            },
+            NodeDesc {
+                kind: OpKind::SiluMul,
+                result_name: Some("hidden"),
+                inputs: vec![(1, InputPort::Primary, "gate_up")],
+            },
+            NodeDesc {
+                kind: OpKind::Gemm,
+                result_name: None,
+                inputs: vec![
+                    (2, InputPort::Primary, "hidden"),
+                    (PARAM, InputPort::Weight, "w3"),
+                ],
+            },
+        ]);
+
+        let plan = evaluate_strategy(&graph);
+
+        assert_eq!(plan.stages.len(), 2, "LLaMA MLP should produce two stages");
+
+        // Stage 0: RmsNorm prologue + wide GEMM + SiluMul epilogue
+        assert_eq!(plan.stages[0].gemm, 1);
+        assert_eq!(plan.stages[0].prologue_transform, Some(0));
+        assert_eq!(plan.stages[0].epilogue_transform, Some(2));
+
+        // Stage 1: standalone GEMM(down)
+        assert_eq!(plan.stages[1].gemm, 3);
+        assert_eq!(plan.stages[1].prologue_transform, None);
+        assert_eq!(plan.stages[1].epilogue_transform, None);
+    }
+
+    #[test]
+    fn test_silu_mul_op_class_is_elementwise() {
+        assert_eq!(OpKind::SiluMul.class(), OpClass::Elementwise);
+    }
 }

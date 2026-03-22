@@ -18,6 +18,8 @@ pub struct MegakernelConfig {
     pub d_ffn: u32,
     pub num_heads: u32,
     pub num_layers: u32,
+    pub block_size: u32, // KV cache block size (tokens per block)
+    pub max_blocks: u32, // max blocks per sequence in the cache
     pub num_threadgroups: u32,
     pub threads_per_tg: u32,
     pub eps: f32,
@@ -34,6 +36,8 @@ impl MegakernelConfig {
             d_ffn: 16,
             num_heads: 1,
             num_layers: 1,
+            block_size: 4, // small for testing
+            max_blocks: 4, // 4 blocks × 4 tokens = 16 max seq
             num_threadgroups: 1,
             threads_per_tg: 32,
             eps: 1e-5,
@@ -42,7 +46,6 @@ impl MegakernelConfig {
         }
     }
 
-    /// Multi-layer config for testing.
     pub fn test_config_multi_layer(num_layers: u32) -> Self {
         let mut c = Self::test_config();
         c.num_layers = num_layers;
@@ -75,13 +78,16 @@ pub fn build_megakernel_msl(config: &MegakernelConfig) -> String {
     let gemm_smem = 2 * 64 * mem_prec; // A_tile + B_tile, 8×8 each
     let rmsnorm_smem = 4u32; // one float for reduction
     // Attention: Q_tile[8×d_head] + K_tile[8×d_head] + S_scratch[8×8×4] + O_scratch[8×8×4]
+    let max_total_seq = config.max_blocks * config.block_size;
     let attn_smem = 8 * config.d_head * mem_prec  // Q tile
-        + 8 * config.d_head * mem_prec             // K tile (reused for V)
-        + 8 * config.seq_len * 4                   // S scratch (f32, one row group × seq_len)
+        + 8 * config.d_head * mem_prec             // KV tile
+        + 8 * max_total_seq * 4                    // S scratch (f32, 8 rows x max_total_seq)
         + 64 * 4; // O scratch (f32, 8×8)
     let smem_size = gemm_smem.max(rmsnorm_smem).max(attn_smem);
     msl.set("SMEM_SIZE", smem_size.to_string());
     msl.set("NUM_LAYERS", config.num_layers.to_string());
+    msl.set("BLOCK_SIZE", config.block_size.to_string());
+    msl.set("MAX_BLOCKS", config.max_blocks.to_string());
 
     // Per-layer weight sizes (in elements, for stride computation)
     let attn_weight_size = config.d_model * config.d_model; // Wq, Wk, Wv, Wo each
@@ -130,8 +136,13 @@ kernel void transformer_block(
     device {{MEM_TYPE}} *ffn_act [[buffer(15)]],
     device float *down_out [[buffer(16)]],
 
+    // Paged KV cache
+    device {{MEM_TYPE}} *kv_cache [[buffer(17)]],  // [num_layers, 2, max_blocks, block_size, d_head]
+    device int *block_table [[buffer(18)]],        // [max_blocks] logical→physical block mapping
+    constant uint *cache_len_ptr [[buffer(19)]],   // number of cached tokens (before this step)
+
     // Sync
-    device atomic_uint *phase_counter [[buffer(17)]],
+    device atomic_uint *phase_counter [[buffer(20)]],
 
     // Thread info
     uint gid [[threadgroup_position_in_grid]],
@@ -154,6 +165,14 @@ uint d_ffn = {{D_FFN}};
 uint total_elems = seq_len * d_model;
 uint ffn_elems = seq_len * d_ffn;
 uint num_tg = {{NUM_TG}};
+uint block_size = {{BLOCK_SIZE}};
+uint max_blocks = {{MAX_BLOCKS}};
+uint cache_len = *cache_len_ptr;
+uint total_seq = cache_len + seq_len; // total sequence length including cache
+// KV cache layout: [num_layers, 2(K/V), max_blocks, block_size, d_head]
+uint cache_block_stride = block_size * d_head;     // one block of one head
+uint cache_kv_stride = max_blocks * cache_block_stride; // K or V for one layer
+uint cache_layer_stride = 2 * cache_kv_stride;     // K+V for one layer
 
 // Shared threadgroup memory pool — sized to max phase requirement.
 // Each phase casts to what it needs. Reused across phases since they're sequential.
@@ -281,13 +300,34 @@ device {{MEM_TYPE}} *W_down = W_up + {{FFN_GATE_SIZE}};
     // ═══════════════════════════════════════════════════════════════
     // Phase 4: Convert QKV f32 → f16
     // ═══════════════════════════════════════════════════════════════
-    msl.comment("Phase 4: Convert QKV f32 → f16");
+    msl.comment("Phase 4: Convert QKV f32 → f16 + write K,V to paged cache");
     msl.block(
         r#"
 {
+    // Convert Q, K, V to f16
     for (uint i = gid * {{THREADS_PER_TG}} + tid_in_tg; i < 3 * total_elems;
          i += num_tg * {{THREADS_PER_TG}}) {
         qkv_f16[i] = {{MEM_TYPE}}(qkv[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Write new K and V tokens to the paged KV cache
+    // Cache layout: kv_cache[layer * cache_layer_stride + kv * cache_kv_stride + phys_block * cache_block_stride + pos_in_block * d_head + d]
+    // kv=0 for K, kv=1 for V
+    device {{MEM_TYPE}} *K_new = qkv_f16 + total_elems;     // new K tokens
+    device {{MEM_TYPE}} *V_new = qkv_f16 + 2 * total_elems; // new V tokens
+
+    for (uint i = gid * {{THREADS_PER_TG}} + tid_in_tg; i < seq_len * d_head;
+         i += num_tg * {{THREADS_PER_TG}}) {
+        uint tok = i / d_head;         // which new token (0..seq_len-1)
+        uint d = i % d_head;           // which head dimension
+        uint abs_pos = cache_len + tok; // absolute position in sequence
+        uint block_idx = abs_pos / block_size;
+        uint pos_in_block = abs_pos % block_size;
+        int phys_block = block_table[block_idx];
+        uint cache_offset = layer * cache_layer_stride + (uint)phys_block * cache_block_stride + pos_in_block * d_head + d;
+        kv_cache[cache_offset] = K_new[tok * d_model + d];                            // K
+        kv_cache[cache_kv_stride + cache_offset] = V_new[tok * d_model + d];          // V (offset by cache_kv_stride from K)
     }
 }
 "#,
@@ -296,9 +336,9 @@ device {{MEM_TYPE}} *W_down = W_up + {{FFN_GATE_SIZE}};
     emit_phase_sync(&mut msl, config, 4);
 
     // ═══════════════════════════════════════════════════════════════
-    // Phase 5: Attention
+    // Phase 5: Paged Attention — read K,V from cache via block table
     // ═══════════════════════════════════════════════════════════════
-    emit_flash_attention(&mut msl, config);
+    emit_paged_attention(&mut msl, config);
 
     emit_phase_sync(&mut msl, config, 5);
 
@@ -467,7 +507,143 @@ threadgroup_barrier(mem_flags::mem_device);
     msl.finish()
 }
 
-/// Emit FlashAttention using simdgroup MMA.
+/// Emit paged attention — reads K/V from paged cache via block_table.
+/// Q comes from qkv_f16 (new tokens). K/V come from cache (all tokens).
+/// Attention is over total_seq = cache_len + seq_len tokens.
+fn emit_paged_attention(msl: &mut MslBuilder, _config: &MegakernelConfig) {
+    msl.comment("Phase 5: Paged FlashAttention");
+    msl.block(
+        r#"
+{
+    device {{MEM_TYPE}} *Q_ptr = qkv_f16;  // [seq_len, d_head] new Q tokens
+    // K and V are in kv_cache, accessed via block_table
+    device {{MEM_TYPE}} *K_cache = kv_cache + layer * cache_layer_stride;
+    device {{MEM_TYPE}} *V_cache = K_cache + cache_kv_stride;
+    float attn_scale = rsqrt(float(d_head));
+
+    threadgroup {{MEM_TYPE}} *Q_tile = (threadgroup {{MEM_TYPE}} *)smem_pool;
+    threadgroup {{MEM_TYPE}} *KV_tile = Q_tile + 8 * d_head;
+    uint kv_smem_offset = 2 * 8 * d_head * sizeof({{MEM_TYPE}});
+    threadgroup float *S_scratch = (threadgroup float *)(smem_pool + kv_smem_offset);
+    threadgroup float *O_scratch = S_scratch + 8 * total_seq;
+
+    // Process query rows in groups of 8
+    for (uint row_base = gid * 8; row_base < seq_len; row_base += num_tg * 8) {
+        // Load Q tile [8 × d_head] from new tokens
+        for (ushort i = tid_in_tg; i < 8 * d_head; i += {{THREADS_PER_TG}}) {
+            ushort r = i / d_head, c = i % d_head;
+            uint gr = row_base + r;
+            Q_tile[i] = (gr < seq_len) ? Q_ptr[gr * d_model + c] : {{MEM_TYPE}}(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Zero O for this row group
+        for (ushort i = tid_in_tg; i < 8 * d_head; i += {{THREADS_PER_TG}}) {
+            ushort r = i / d_head, c = i % d_head;
+            uint gr = row_base + r;
+            if (gr < seq_len) attn_out[gr * d_model + c] = 0.0;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        // Iterate over ALL tokens (cached + new) in tiles of 8
+        for (uint c = 0; c < total_seq; c += 8) {
+            // Load K tile [8 × d_head] from paged cache via block_table
+            for (ushort i = tid_in_tg; i < 8 * d_head; i += {{THREADS_PER_TG}}) {
+                ushort r = i / d_head, col = i % d_head;
+                uint abs_pos = c + r;
+                if (abs_pos < total_seq) {
+                    uint bi = abs_pos / block_size;
+                    uint pi = abs_pos % block_size;
+                    int pb = block_table[bi];
+                    KV_tile[i] = K_cache[(uint)pb * cache_block_stride + pi * d_head + col];
+                } else {
+                    KV_tile[i] = {{MEM_TYPE}}(0);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // GEMM 1: S_tile = Q_tile × K_tile^T [8×d_head] × [d_head×8] → [8×8]
+            simdgroup_matrix<float, 8> S_acc = make_filled_simdgroup_matrix<float, 8>(0);
+            for (ushort dk = 0; dk < d_head; dk += 8) {
+                simdgroup_matrix<{{MEM_TYPE}}, 8> Q_frag, KT_frag;
+                simdgroup_load(Q_frag, Q_tile, d_head, ulong2(dk, 0));
+                simdgroup_load(KT_frag, KV_tile, d_head, ulong2(dk, 0), true);
+                simdgroup_multiply_accumulate(S_acc, Q_frag, KT_frag, S_acc);
+            }
+
+            // Store S_acc to S_scratch
+            simdgroup_store(S_acc, S_scratch, total_seq, ulong2(c, 0));
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Scale
+            for (ushort i = tid_in_tg; i < 64; i += {{THREADS_PER_TG}}) {
+                ushort r = i / 8, col = i % 8;
+                if (c + col < total_seq)
+                    S_scratch[r * total_seq + c + col] *= attn_scale;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Per-row softmax over full S_scratch [8 × total_seq]
+        for (ushort row = tid_in_tg; row < 8; row += {{THREADS_PER_TG}}) {
+            if (row_base + row >= seq_len) continue;
+            float row_max = -INFINITY;
+            for (uint j = 0; j < total_seq; j++)
+                row_max = max(row_max, S_scratch[row * total_seq + j]);
+            float row_sum = 0.0;
+            for (uint j = 0; j < total_seq; j++) {
+                S_scratch[row * total_seq + j] = exp(S_scratch[row * total_seq + j] - row_max);
+                row_sum += S_scratch[row * total_seq + j];
+            }
+            float inv_l = (row_sum > 0) ? (1.0 / row_sum) : 0.0;
+            for (uint j = 0; j < total_seq; j++)
+                S_scratch[row * total_seq + j] *= inv_l;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // GEMM 2: O = P × V — iterate over V tiles from paged cache
+        for (uint vc = 0; vc < total_seq; vc += 8) {
+            // Load V tile from paged cache
+            for (ushort i = tid_in_tg; i < 8 * d_head; i += {{THREADS_PER_TG}}) {
+                ushort r = i / d_head, col = i % d_head;
+                uint abs_pos = vc + r;
+                if (abs_pos < total_seq) {
+                    uint bi = abs_pos / block_size;
+                    uint pi = abs_pos % block_size;
+                    int pb = block_table[bi];
+                    KV_tile[i] = V_cache[(uint)pb * cache_block_stride + pi * d_head + col];
+                } else {
+                    KV_tile[i] = {{MEM_TYPE}}(0);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (ushort td = 0; td < d_head; td += 8) {
+                simdgroup_matrix<float, 8> P_frag;
+                simdgroup_load(P_frag, S_scratch, total_seq, ulong2(vc, 0));
+                simdgroup_matrix<{{MEM_TYPE}}, 8> V_frag;
+                simdgroup_load(V_frag, KV_tile, d_head, ulong2(td, 0));
+                simdgroup_matrix<float, 8> O_acc = make_filled_simdgroup_matrix<float, 8>(0);
+                simdgroup_multiply_accumulate(O_acc, P_frag, V_frag, O_acc);
+
+                simdgroup_store(O_acc, O_scratch, 8, ulong2(0, 0));
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (ushort i = tid_in_tg; i < 64; i += {{THREADS_PER_TG}}) {
+                    ushort r = i / 8, d = i % 8;
+                    uint gr = row_base + r;
+                    if (gr < seq_len)
+                        attn_out[gr * d_model + td + d] += O_scratch[i];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    }
+}
+"#,
+    );
+}
+
+/// Emit FlashAttention using simdgroup MMA (non-paged, for standalone use).
 /// Uses smem_pool for Q/K tiles, S scratch, and O scratch.
 /// Per-row online softmax through threadgroup memory.
 fn emit_flash_attention(msl: &mut MslBuilder, _config: &MegakernelConfig) {
@@ -709,7 +885,7 @@ mod tests {
         let msl = build_megakernel_msl(&MegakernelConfig::test_config());
         assert!(msl.contains("kernel void transformer_block("));
         assert!(msl.contains("Phase 1: RmsNorm"));
-        assert!(msl.contains("Phase 5: FlashAttention"));
+        assert!(msl.contains("Phase 5: Paged FlashAttention"));
         assert!(msl.contains("Phase 11: SiLU"));
         assert!(msl.contains("Phase 13: Residual add"));
     }

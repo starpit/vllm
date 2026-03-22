@@ -205,25 +205,52 @@ fn run_megakernel(config: &MegakernelConfig, x: &[f32], layers: &[LayerWeights])
     let all_gamma = pack_gammas(layers);
     let all_weights = pack_weights(layers);
 
+    let nl = config.num_layers as usize;
+    let bs = config.block_size as usize;
+    let mb = config.max_blocks as usize;
+    let dh = config.d_head as usize;
+
+    // KV cache: [num_layers, 2(K/V), max_blocks, block_size, d_head]
+    let kv_cache_size = nl * 2 * mb * bs * dh;
+
+    // Block table: identity mapping (block i → physical block i)
+    let block_table: Vec<i32> = (0..mb as i32).collect();
+    let block_table_buf = device.new_buffer_with_data(
+        block_table.as_ptr() as *const c_void,
+        (mb * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+
+    // Cache len = 0 (first forward pass, no cached tokens)
+    let cache_len: u32 = 0;
+    let cache_len_buf = device.new_buffer_with_data(
+        &cache_len as *const u32 as *const c_void,
+        4,
+        MTLResourceOptions::StorageModeShared,
+    );
+
     let bufs: Vec<Buffer> = vec![
-        make_f32(&device, x),            // 0: x
-        empty_f32(&device, tot),         // 1: out
-        make_f32(&device, &all_gamma),   // 2: all_gamma
-        make_f16(&device, &all_weights), // 3: all_weights
-        empty_f32(&device, tot),         // 4: h
-        empty_f16(&device, tot),         // 5: h_f16
-        empty_f32(&device, 3 * tot),     // 6: qkv
-        empty_f16(&device, 3 * tot),     // 7: qkv_f16
-        empty_f32(&device, tot),         // 8: attn_out
-        empty_f16(&device, tot),         // 9: attn_f16
-        empty_f32(&device, tot),         // 10: o
-        empty_f32(&device, tot),         // 11: h_ffn
-        empty_f16(&device, tot),         // 12: h_ffn_f16
-        empty_f32(&device, sl * df),     // 13: gate_out
-        empty_f32(&device, sl * df),     // 14: up_out
-        empty_f16(&device, sl * df),     // 15: ffn_act
-        empty_f32(&device, tot),         // 16: down_out
-        empty_f32(&device, 1),           // 17: phase_counter
+        make_f32(&device, x),              // 0: x
+        empty_f32(&device, tot),           // 1: out
+        make_f32(&device, &all_gamma),     // 2: all_gamma
+        make_f16(&device, &all_weights),   // 3: all_weights
+        empty_f32(&device, tot),           // 4: h
+        empty_f16(&device, tot),           // 5: h_f16
+        empty_f32(&device, 3 * tot),       // 6: qkv
+        empty_f16(&device, 3 * tot),       // 7: qkv_f16
+        empty_f32(&device, tot),           // 8: attn_out
+        empty_f16(&device, tot),           // 9: attn_f16
+        empty_f32(&device, tot),           // 10: o
+        empty_f32(&device, tot),           // 11: h_ffn
+        empty_f16(&device, tot),           // 12: h_ffn_f16
+        empty_f32(&device, sl * df),       // 13: gate_out
+        empty_f32(&device, sl * df),       // 14: up_out
+        empty_f16(&device, sl * df),       // 15: ffn_act
+        empty_f32(&device, tot),           // 16: down_out
+        empty_f16(&device, kv_cache_size), // 17: kv_cache
+        block_table_buf,                   // 18: block_table
+        cache_len_buf,                     // 19: cache_len_ptr
+        empty_f32(&device, 1),             // 20: phase_counter
     ];
 
     let cmd = queue.new_command_buffer();

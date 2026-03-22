@@ -21,6 +21,38 @@ use std::time::Instant;
 const WARMUP: u32 = 5;
 const ITERS: u32 = 50;
 
+// ═══════════════════════════════════════════════════════════════════
+// MLX benchmark
+// ═══════════════════════════════════════════════════════════════════
+
+fn bench_mlx_matmul(m: u32, n: u32, k: u32) -> f64 {
+    let stream = mlx_rs::Stream::default();
+    let a = mlx_rs::random::normal::<f32>(
+        &[m as i32, k as i32], None, None, None,
+    ).unwrap()
+    .as_dtype_device(mlx_rs::Dtype::Float16, &stream).unwrap();
+    let b = mlx_rs::random::normal::<f32>(
+        &[n as i32, k as i32], None, None, None,
+    ).unwrap()
+    .as_dtype_device(mlx_rs::Dtype::Float16, &stream).unwrap();
+    let bt = b.t();
+    a.eval().unwrap();
+    bt.eval().unwrap();
+
+    // Warmup
+    for _ in 0..WARMUP {
+        let c = a.matmul_device(&bt, &stream).unwrap();
+        c.eval().unwrap();
+    }
+
+    let start = Instant::now();
+    for _ in 0..ITERS {
+        let c = a.matmul_device(&bt, &stream).unwrap();
+        c.eval().unwrap();
+    }
+    start.elapsed().as_secs_f64() / ITERS as f64
+}
+
 fn get_device() -> (Device, CommandQueue) {
     let d = Device::system_default().expect("No Metal device");
     let q = d.new_command_queue();
@@ -292,6 +324,18 @@ fn main() {
             );
         }
         eprintln!();
+    }
+
+    // MLX matmul comparison (same sizes)
+    eprintln!("=== MLX matmul (f16) ===");
+    for &(m, n, k) in &gemm_sizes {
+        let t = bench_mlx_matmul(m, n, k);
+        let flops = 2.0 * m as f64 * n as f64 * k as f64;
+        let tflops = flops / t / 1e12;
+        eprintln!(
+            "  {:>5}×{:<5} K={:<5}  {:.3} ms  ({:.1} TFLOPS)",
+            m, n, k, t * 1e3, tflops
+        );
     }
     eprintln!();
 

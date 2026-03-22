@@ -10,6 +10,7 @@ description = "Ferrite Metal: megakernel fusion on Apple Silicon via MSL codegen
 metal = "0.33"
 objc = "0.2"
 half = "2.4"
+mlx-rs = { workspace = true }
 
 [[bench]]
 name = "ops_benchmark"

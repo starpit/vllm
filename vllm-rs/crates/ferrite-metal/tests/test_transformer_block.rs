@@ -324,6 +324,20 @@ fn test_transformer_block_e2e() {
         rmsnorm_err
     );
 
+    // Verify GPU f32→f16 conversion matches CPU conversion
+    let h_f16_gpu = read_f16(&h_f16_buf, seq_len as usize * d_model);
+    let convert_err: f32 = h_f16_gpu
+        .iter()
+        .zip(h_f16.iter())
+        .map(|(g, c)| (g.to_f32() - c.to_f32()).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("Convert f32→f16 max error: {}", convert_err);
+    assert!(
+        convert_err < 1e-3,
+        "Convert error too high: {}",
+        convert_err
+    );
+
     // Step 2 GPU: Q = h_f16 @ Wq (fully GPU-resident — no CPU round-trip)
     let cmd2 = queue.new_command_buffer();
     {

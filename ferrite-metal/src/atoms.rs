@@ -117,6 +117,33 @@ impl EpilogueAtom for IdentityEpilogue {
     }
 }
 
+/// SiLU epilogue — applies x * sigmoid(x) to each accumulator element.
+///
+/// Operates on C_sram via thread_elements() after the K-loop completes.
+/// Each thread applies SiLU to its portion of the 8×8 matrices.
+pub struct SiLuEpilogue;
+
+impl EpilogueAtom for SiLuEpilogue {
+    fn emit_epilogue(&self, msl: &mut MslBuilder, config: &MetalGemmConfig) {
+        msl.set("TILES_M", (config.register_m() / 8).to_string());
+        msl.set("TILES_N", (config.register_n() / 8).to_string());
+        msl.block(
+            r#"
+// SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+for (ushort tm = 0; tm < {{TILES_M}}; tm++) {
+    for (ushort tn = 0; tn < {{TILES_N}}; tn++) {
+        thread auto &elems = C_sram[tm][tn].thread_elements();
+        for (int i = 0; i < 64; i++) {
+            auto x = elems[i];
+            elems[i] = x / (1 + exp(-x));
+        }
+    }
+}
+"#,
+        );
+    }
+}
+
 /// Native simdgroup_load from threadgroup memory.
 ///
 /// Emits `simdgroup_load(A_mat, A_block, lead, origin)` using

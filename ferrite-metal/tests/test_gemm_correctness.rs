@@ -1,7 +1,8 @@
 /// GEMM correctness tests — dispatch the kernel on real GPU hardware and
 /// verify output against CPU reference.
+use ferrite_metal::atoms::*;
 use ferrite_metal::config::MetalGemmConfig;
-use ferrite_metal::gemm::build_standalone_gemm;
+use ferrite_metal::gemm::{build_gemm_msl, build_standalone_gemm};
 use half::f16;
 use metal::*;
 use std::ffi::c_void;
@@ -19,13 +20,17 @@ struct GemmTest {
 
 impl GemmTest {
     fn new(config: MetalGemmConfig) -> Self {
+        let msl = build_standalone_gemm(&config);
+        Self::from_msl(&msl, config)
+    }
+
+    fn from_msl(msl: &str, config: MetalGemmConfig) -> Self {
         let device = Device::system_default().expect("No Metal device");
         let options = CompileOptions::new();
         options.set_language_version(MTLLanguageVersion::V3_0);
 
-        let msl = build_standalone_gemm(&config);
         let library = device
-            .new_library_with_source(&msl, &options)
+            .new_library_with_source(msl, &options)
             .expect("MSL compilation failed");
         let func = library
             .get_function("gemm", None)
@@ -279,5 +284,85 @@ fn test_apple8_config_32x32() {
         "apple8 ones 48×48: max abs error {}, expected all {}",
         err,
         k as f32
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SiLU epilogue tests
+// ═══════════════════════════════════════════════════════════════════
+
+fn cpu_silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+#[test]
+fn test_gemm_silu_32x32() {
+    let config = MetalGemmConfig::default_apple9_f16();
+    let msl = build_gemm_msl(
+        &config,
+        &LoopTileCopy,
+        &NativeFragmentLoad,
+        &IdentityTransform,
+        &NativeMma,
+        &SiLuEpilogue,
+    );
+    let harness = GemmTest::from_msl(&msl, config);
+
+    let m = 32u32;
+    let n = 32;
+    let k = 32;
+    let a = vec![f16::from_f32(0.1); (m * k) as usize];
+    let b = vec![f16::from_f32(0.1); (n * k) as usize];
+
+    let gpu_c = harness.run(m, n, k, &a, &b);
+
+    // CPU reference: GEMM then SiLU
+    let gemm_c = cpu_gemm(m, n, k, &a, &b);
+    let cpu_c: Vec<f32> = gemm_c.iter().map(|&x| cpu_silu(x)).collect();
+
+    // GEMM result: 0.1 * 0.1 * 32 = 0.32, SiLU(0.32) ≈ 0.1715
+    let err = max_abs_error(&gpu_c, &cpu_c);
+    assert!(
+        err < 0.01,
+        "GEMM+SiLU 32×32: max abs error {}, expected ~{}, got first={}",
+        err,
+        cpu_c[0],
+        gpu_c[0]
+    );
+}
+
+#[test]
+fn test_gemm_silu_negative_values() {
+    // SiLU with negative inputs (GEMM result can be negative with mixed signs)
+    let config = MetalGemmConfig::default_apple9_f16();
+    let msl = build_gemm_msl(
+        &config,
+        &LoopTileCopy,
+        &NativeFragmentLoad,
+        &IdentityTransform,
+        &NativeMma,
+        &SiLuEpilogue,
+    );
+    let harness = GemmTest::from_msl(&msl, config);
+
+    let m = 32u32;
+    let n = 32;
+    let k = 8;
+
+    // A = -0.5 everywhere, B = 1.0 everywhere → GEMM = -4.0, SiLU(-4.0) ≈ -0.0713
+    let a = vec![f16::from_f32(-0.5); (m * k) as usize];
+    let b = vec![f16::from_f32(1.0); (n * k) as usize];
+
+    let gpu_c = harness.run(m, n, k, &a, &b);
+    let gemm_c = cpu_gemm(m, n, k, &a, &b);
+    let cpu_c: Vec<f32> = gemm_c.iter().map(|&x| cpu_silu(x)).collect();
+
+    let err = max_abs_error(&gpu_c, &cpu_c);
+    assert!(
+        err < 0.01,
+        "GEMM+SiLU negative: max abs error {}, expected ~{}, got first={}",
+        err,
+        cpu_c[0],
+        gpu_c[0]
     );
 }

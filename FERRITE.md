@@ -1598,6 +1598,27 @@ Each step must be fully tested before moving to the next.
 3. MLP megakernel: > 1.3× faster than torch.compile
 4. End-to-end: measurable latency reduction on LLaMA-7B generation
 
+### Phase 2 Progress (March 22, 2026)
+
+**Step 1A: SiLuMul epilogue atom — IN PROGRESS**
+
+- ✅ `SiLuMulEpilogue` atom in `ferrite-ptx/src/silu_mul_epilogue.rs`
+  (splits wide GEMM accumulator, SiLU on gate half, multiply with up half)
+- ✅ `OpKind::SiluMul` added to `ferrite-macros/src/ops.rs`
+- ✅ Strategy tests: `RMSNorm → GEMM → SiluMul → GEMM` correctly produces 2-stage plan
+- ⏳ Codegen: studying CUTLASS `examples/45_dual_gemm` reference PTX (8227 lines)
+  - CUTLASS dual_gemm achieves ONE kernel launch for `SiLU(X@B0) * (X@B1)`
+  - K-loop interleaves MMA for B0 and B1, sharing A fragments
+  - Epilogue applies SiLU + element-wise multiply in-register
+  - Reference compiled to `/tmp/cutlass_dual_gemm_silumul_2.ptx`
+
+**Key architectural insight**: The dual GEMM is NOT "two GEMMs" — it's ONE K-loop
+that loads A once, loads B0 and B1, and maintains TWO accumulator sets. The epilogue
+then fuses `SiLU(accum0) * accum1` before any global memory write. This is the
+correct ONE-launch megakernel approach for LLaMA's MLP gate-up projection.
+
+**Test counts**: 120 ferrite-ptx + 23 ferrite-macros + 80 ferrite-poc = 223 total
+
 ---
 
 ## Sources

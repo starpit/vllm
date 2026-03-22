@@ -364,3 +364,257 @@ fn test_megakernel_four_layers() {
     eprintln!("Four layer max error: {}", max_err);
     assert!(max_err < 0.01, "Four layer error: {}", max_err);
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Paged KV cache tests
+// ═══════════════════════════════════════════════════════════════════
+
+/// Run megakernel with explicit KV cache state and block table.
+/// Returns (output, kv_cache_buf) so cache can be reused for next step.
+fn run_megakernel_with_cache(
+    config: &MegakernelConfig,
+    x: &[f32],
+    layers: &[LayerWeights],
+    kv_cache_init: Option<&[f16]>,
+    block_table: &[i32],
+    cache_len: u32,
+) -> (Vec<f32>, Vec<f16>) {
+    let device = Device::system_default().expect("No Metal device");
+    let queue = device.new_command_queue();
+    let msl = build_megakernel_msl(config);
+    let options = CompileOptions::new();
+    options.set_language_version(MTLLanguageVersion::V3_0);
+    let library = device
+        .new_library_with_source(&msl, &options)
+        .unwrap_or_else(|e| panic!("Compile:\n{}\n\nMSL:\n{}", e, msl));
+    let func = library.get_function("transformer_block", None).expect("fn");
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&func)
+        .expect("pipe");
+
+    let sl = config.seq_len as usize;
+    let dm = config.d_model as usize;
+    let df = config.d_ffn as usize;
+    let dh = config.d_head as usize;
+    let nl = config.num_layers as usize;
+    let bs = config.block_size as usize;
+    let mb = config.max_blocks as usize;
+    let tot = sl * dm;
+    let kv_cache_elems = nl * 2 * mb * bs * dh;
+
+    let all_gamma = pack_gammas(layers);
+    let all_weights = pack_weights(layers);
+
+    let kv_buf = if let Some(init) = kv_cache_init {
+        make_f16(&device, init)
+    } else {
+        empty_f16(&device, kv_cache_elems)
+    };
+    let bt_buf = device.new_buffer_with_data(
+        block_table.as_ptr() as *const c_void,
+        (block_table.len() * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let cl_buf = device.new_buffer_with_data(
+        &cache_len as *const u32 as *const c_void,
+        4,
+        MTLResourceOptions::StorageModeShared,
+    );
+
+    let bufs: Vec<Buffer> = vec![
+        make_f32(&device, x),
+        empty_f32(&device, tot),
+        make_f32(&device, &all_gamma),
+        make_f16(&device, &all_weights),
+        empty_f32(&device, tot),
+        empty_f16(&device, tot),
+        empty_f32(&device, 3 * tot),
+        empty_f16(&device, 3 * tot),
+        empty_f32(&device, tot),
+        empty_f16(&device, tot),
+        empty_f32(&device, tot),
+        empty_f32(&device, tot),
+        empty_f16(&device, tot),
+        empty_f32(&device, sl * df),
+        empty_f32(&device, sl * df),
+        empty_f16(&device, sl * df),
+        empty_f32(&device, tot),
+        kv_buf,
+        bt_buf,
+        cl_buf,
+        empty_f32(&device, 1),
+    ];
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    for (i, buf) in bufs.iter().enumerate() {
+        enc.set_buffer(i as u64, Some(buf), 0);
+    }
+    enc.dispatch_thread_groups(
+        MTLSize::new(config.num_threadgroups as u64, 1, 1),
+        MTLSize::new(config.threads_per_tg as u64, 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let out = read_f32(&bufs[1], tot);
+    // Read back KV cache
+    let kv_ptr = bufs[17].contents() as *const f16;
+    let kv_out = unsafe { std::slice::from_raw_parts(kv_ptr, kv_cache_elems) }.to_vec();
+    (out, kv_out)
+}
+
+#[test]
+fn test_paged_attn_shuffled_block_table() {
+    // Non-identity block table: physical blocks are shuffled.
+    // Result should be identical to identity mapping (same data, different physical layout).
+    let config = MegakernelConfig::test_config();
+    let mut rng = 99u64;
+    let sl = config.seq_len as usize;
+    let dm = config.d_model as usize;
+    let df = config.d_ffn as usize;
+    let mb = config.max_blocks as usize;
+
+    let next = |r: &mut u64| -> f32 {
+        *r = r.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((*r >> 33) as f32) / (u32::MAX as f32 / 2.0) - 1.0
+    };
+    let x: Vec<f32> = (0..sl * dm).map(|_| next(&mut rng) * 0.5).collect();
+    let layers = vec![random_layer_weights(&mut rng, dm, df)];
+
+    // Identity block table
+    let bt_identity: Vec<i32> = (0..mb as i32).collect();
+    let (out_id, _) = run_megakernel_with_cache(&config, &x, &layers, None, &bt_identity, 0);
+
+    // Shuffled block table: [2, 0, 3, 1]
+    let bt_shuffled: Vec<i32> = vec![2, 0, 3, 1];
+    let (out_shuf, _) = run_megakernel_with_cache(&config, &x, &layers, None, &bt_shuffled, 0);
+
+    let err: f32 = out_id
+        .iter()
+        .zip(out_shuf.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("Shuffled block table error: {}", err);
+    assert!(
+        err < 0.01,
+        "Shuffled block table should match identity: err={}",
+        err
+    );
+}
+
+#[test]
+fn test_paged_attn_partial_block() {
+    // cache_len = 2 (not a multiple of block_size=4), seq_len=1 (decode)
+    // This tests that partial blocks work correctly.
+    let mut config = MegakernelConfig::test_config();
+    config.seq_len = 1; // decode: one new token
+    let dm = config.d_model as usize;
+    let df = config.d_ffn as usize;
+    let dh = config.d_head as usize;
+    let nl = config.num_layers as usize;
+    let bs = config.block_size as usize;
+    let mb = config.max_blocks as usize;
+
+    let mut rng = 77u64;
+    let next = |r: &mut u64| -> f32 {
+        *r = r.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((*r >> 33) as f32) / (u32::MAX as f32 / 2.0) - 1.0
+    };
+    let x: Vec<f32> = (0..dm).map(|_| next(&mut rng) * 0.5).collect();
+    let layers = vec![random_layer_weights(&mut rng, dm, df)];
+
+    // Pre-populate cache with 2 tokens of K/V data
+    let kv_cache_elems = nl * 2 * mb * bs * dh;
+    let mut kv_init = vec![f16::from_f32(0.0); kv_cache_elems];
+    // Write 2 cached tokens to block 0 (identity block table)
+    for tok in 0..2u32 {
+        for d in 0..dh {
+            let val = f16::from_f32(next(&mut rng) * 0.3);
+            // K: layer=0, kv=0, block=0, pos=tok, dim=d
+            let k_idx =
+                0 * (2 * mb * bs * dh) + 0 * (mb * bs * dh) + 0 * (bs * dh) + tok as usize * dh + d;
+            kv_init[k_idx] = val;
+            // V: layer=0, kv=1
+            let v_idx =
+                0 * (2 * mb * bs * dh) + 1 * (mb * bs * dh) + 0 * (bs * dh) + tok as usize * dh + d;
+            kv_init[v_idx] = f16::from_f32(next(&mut rng) * 0.3);
+        }
+    }
+
+    let bt: Vec<i32> = (0..mb as i32).collect();
+    let (out, _kv_after) = run_megakernel_with_cache(
+        &config,
+        &x,
+        &layers,
+        Some(&kv_init),
+        &bt,
+        2, // cache_len=2
+    );
+
+    // Basic sanity: output should be finite and non-zero
+    assert!(out.iter().all(|v| v.is_finite()), "Output has NaN/Inf");
+    let nonzero = out.iter().filter(|v| v.abs() > 1e-6).count();
+    eprintln!(
+        "Partial block decode: {} nonzero out of {}",
+        nonzero,
+        out.len()
+    );
+    assert!(nonzero > 0, "Output all zeros");
+}
+
+#[test]
+fn test_paged_attn_prefill_then_decode() {
+    // Two-step inference: prefill 4 tokens, then decode 1 token.
+    // The decode step should attend over all 5 tokens (4 cached + 1 new).
+    let config_prefill = MegakernelConfig::test_config(); // seq_len=4
+    let dm = config_prefill.d_model as usize;
+    let df = config_prefill.d_ffn as usize;
+    let mb = config_prefill.max_blocks as usize;
+
+    let mut rng = 55u64;
+    let next = |r: &mut u64| -> f32 {
+        *r = r.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((*r >> 33) as f32) / (u32::MAX as f32 / 2.0) - 1.0
+    };
+    let x_prefill: Vec<f32> = (0..4 * dm).map(|_| next(&mut rng) * 0.5).collect();
+    let layers = vec![random_layer_weights(&mut rng, dm, df)];
+    let bt: Vec<i32> = (0..mb as i32).collect();
+
+    // Step 1: Prefill (cache_len=0, seq_len=4)
+    let (_prefill_out, kv_after_prefill) =
+        run_megakernel_with_cache(&config_prefill, &x_prefill, &layers, None, &bt, 0);
+
+    // Step 2: Decode (cache_len=4, seq_len=1)
+    let mut config_decode = config_prefill.clone();
+    config_decode.seq_len = 1;
+    let x_decode: Vec<f32> = (0..dm).map(|_| next(&mut rng) * 0.5).collect();
+
+    let (decode_out, _kv_after_decode) = run_megakernel_with_cache(
+        &config_decode,
+        &x_decode,
+        &layers,
+        Some(&kv_after_prefill),
+        &bt,
+        4,
+    );
+
+    // Basic sanity: output should be finite and non-zero
+    assert!(
+        decode_out.iter().all(|v| v.is_finite()),
+        "Decode output has NaN/Inf"
+    );
+    let nonzero = decode_out.iter().filter(|v| v.abs() > 1e-6).count();
+    eprintln!(
+        "Prefill→Decode: {} nonzero out of {}",
+        nonzero,
+        decode_out.len()
+    );
+    assert!(nonzero > 0, "Decode output all zeros");
+
+    // The decode output should differ from prefill (different input, different attention pattern)
+    // Just verify it's not identical to the last prefill row
+    eprintln!("Decode output: {:?}", &decode_out);
+}

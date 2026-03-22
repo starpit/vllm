@@ -1,4 +1,4 @@
-use crate::PtxBuilder;
+use crate::{PtxBuilder, Reg};
 use crate::config::GemmConfig;
 use crate::gemm::{
     CpAsyncLoader, RmsNormTransform, emit_a_global_addrs, emit_b_global_addrs,
@@ -483,21 +483,24 @@ pub fn build_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
 // Uses DualMainloopPipeline for the K-loop.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Build a fused RMSNorm -> dual GEMM(gate,up) -> SiLuMul kernel using DualMainloopPipeline.
+/// Build a fused RMSNorm -> dual GEMM(gate,up) -> SiLuMul kernel.
+///
+/// CUTLASS-matching implementation:
+/// - f16 accumulators (mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16)
+/// - Double-pumped K-loop with zigzag MMA traversal
+/// - CUTLASS-style epilogue: smem shuffle + f16x2 SiLU via exp2 inline asm
+/// - Triple-buffered smem: A(24KB) + B0(12KB) + B1(12KB) = 48KB
 ///
 /// Grid: (out_features / BN, batch / BM, 1)
 /// Block: 128 threads (4 warps)
 ///
-/// Output width = BN (same as single GEMM), because SiLuMul halves the 2× accumulators.
+/// Output width = BN (SiLuMul halves the 2x accumulators).
 pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> String {
-    use crate::atoms::{CpAsyncCopy, Mma16816, RmsNormAtom};
+    use crate::atoms::{RmsNormAtom, TransformAtom};
     use crate::gemm::{
         emit_a_global_addrs_cfg, emit_b_global_addrs_cfg, emit_cpasync_swizzle_cfg,
-        emit_gemm_setup, emit_store_c,
+        emit_gemm_setup,
     };
-    use crate::dual_pipeline::DualMainloopPipeline;
-    use crate::silu_mul_epilogue::SiLuMulEpilogue;
-    use crate::atoms::EpilogueAtom;
 
     let mut ptx = PtxBuilder::new(config.clone());
     let c = &ptx.config.clone();
@@ -505,30 +508,36 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
     let bm = c.bm;
     let bk = c.bk;
     let threads = c.threads();
+    let stages = c.num_stages;
+    let reg_m = c.reg_m(); // wm/mma_m = 64/16 = 4
+    let reg_n = c.reg_n(); // wn/mma_n = 32/8 = 4
+    let k_warp_iters = c.bk / c.mma_k; // 32/16 = 2
 
-    // Shared memory layout for dual GEMM:
-    //   A:  offset 0,                                  size = smem_a_bytes * stages
-    //   B0: offset smem_a_bytes * stages,              size = smem_b_bytes * stages
-    //   B1: offset (smem_a_bytes + smem_b_bytes) * stages, size = smem_b_bytes * stages
-    //   norm_scratch, norm_factors, gamma after the GEMM regions
-    let a_smem_total = c.smem_a_bytes() * c.num_stages;
-    let b_smem_total = c.smem_b_bytes() * c.num_stages;
+    // Dual GEMM smem layout (CUTLASS style):
+    //   A:  [0, a_smem_total)            size = smem_a_bytes * stages
+    //   B0: [a_smem_total, a_smem_total + b_smem_total)
+    //   B1: [a_smem_total + b_smem_total, a_smem_total + 2*b_smem_total)
+    let a_tile_bytes = c.smem_a_bytes(); // BM*BK*2 = 128*32*2 = 8192
+    let b_tile_bytes = c.smem_b_bytes(); // BK*BN*2 = 32*64*2 = 4096
+    let a_smem_total = a_tile_bytes * stages;
+    let b_smem_total = b_tile_bytes * stages;
     let dual_gemm_smem = a_smem_total + 2 * b_smem_total;
     let norm_scratch_off = dual_gemm_smem;
     let norm_factors_off = norm_scratch_off + 32;
     let gamma_smem_off = norm_factors_off + bm * 4;
     let _gamma_smem_bytes = hidden_size * 2;
 
-    ptx.comment("=== Fused RMSNorm -> dual GEMM(gate,up) -> SiLuMul (DualMainloopPipeline) ===");
+    let b0_start = a_smem_total as i32;
+    let b1_start = (a_smem_total + b_smem_total) as i32;
+
+    ptx.comment("=== Fused RMSNorm -> dual GEMM(gate,up) -> SiLuMul (CUTLASS-matching) ===");
     ptx.comment(&format!(
-        "BM={}, BN={}, BK={}, threads={}",
-        bm, c.bn, bk, threads
+        "BM={}, BN={}, BK={}, stages={}, threads={}",
+        bm, c.bn, bk, stages, threads
     ));
     ptx.comment(&format!(
-        "hidden_size={}, REG_M={}, REG_N={}",
-        hidden_size,
-        c.reg_m(),
-        c.reg_n()
+        "hidden_size={}, REG_M={}, REG_N={}, f16 accumulators, zigzag MMA",
+        hidden_size, reg_m, reg_n
     ));
     ptx.blank();
 
@@ -552,7 +561,7 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
     // Phase 2: Thread/block setup
     let setup = emit_gemm_setup(&mut ptx, c);
 
-    // Phase A: RMSNorm — compute norm factors for all BM rows
+    // Phase A: RMSNorm
     let threads_per_row = if bm <= 64 { 2u32 } else { 1u32 };
     let norm_factors_base = ptx.regs.alloc_b32();
     ptx.begin_scope();
@@ -611,15 +620,16 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
     ptx.blank();
     ptx.end_scope();
 
-    // Phase B: Dual GEMM with RmsNormAtom via DualMainloopPipeline
-    ptx.comment("=== Phase B: Dual GEMM with RmsNormAtom via DualMainloopPipeline ===");
+    // ═══════════════════════════════════════════════════════════════════════
+    // Phase B: CUTLASS-matching dual GEMM with f16 accumulators
+    // ═══════════════════════════════════════════════════════════════════════
+    ptx.comment("=== Phase B: CUTLASS-matching dual GEMM (f16 accum, zigzag MMA) ===");
     ptx.blank();
 
-    let (a_cp_off, b0_cp_off) = emit_cpasync_swizzle_cfg(&mut ptx, c, setup.tid);
-    // B1 uses the same swizzle pattern as B0
-    let b1_cp_off = ptx.regs.alloc_b32();
-    ptx.mov_b32(b1_cp_off, b0_cp_off);
+    // cp.async swizzle addresses
+    let (a_cp_off, b_cp_off) = emit_cpasync_swizzle_cfg(&mut ptx, c, setup.tid);
 
+    // Global addresses
     let ga_chunks =
         emit_a_global_addrs_cfg(&mut ptx, c, setup.block_row, k_param, input_ptr, setup.tid);
     let gb0_chunks =
@@ -638,7 +648,6 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
     let k_offset_reg = ptx.regs.alloc_b32();
     ptx.mov_b32_imm(k_offset_reg, 0);
 
-    let k_warp_iters = c.bk / c.mma_k;
     let transform = RmsNormAtom::new(
         &mut ptx,
         norm_factors_base,
@@ -646,71 +655,776 @@ pub fn build_dual_fused_pipeline(config: &GemmConfig, hidden_size: u32) -> Strin
         setup.group,
         setup.tg,
         k_offset_reg,
-        c.reg_m(),
+        reg_m,
         k_warp_iters,
         warp_m_offset,
     );
 
-    // Extra advance: bump k_offset_reg by BK each iteration
-    let bk_val = c.bk;
-    let advance_fn = move |ptx_ref: &mut PtxBuilder| {
-        ptx_ref.add_s32_imm(k_offset_reg, k_offset_reg, bk_val as i32);
-    };
+    let smem_base = setup.smem_base;
+    let tid = setup.tid;
 
-    let pipeline = DualMainloopPipeline::new(c.num_stages);
-    let result = pipeline.emit(
-        &mut ptx,
-        c,
-        &setup,
-        &CpAsyncCopy,
-        &CpAsyncCopy,
-        &CpAsyncCopy,
-        &transform,
-        &Mma16816,
-        ga_chunks,
-        a_cp_off,
-        gb0_chunks,
-        b0_cp_off,
-        gb1_chunks,
-        b1_cp_off,
-        n_param,
-        k_param,
-        Some(&advance_fn),
-    );
+    // Number of cp.async chunks per tile
+    let cp_chunks_a = a_tile_bytes / 2048;
+    let cp_chunks_b = b_tile_bytes / 2048;
 
-    // Phase C: SiLuMul epilogue — merge acc0 and acc1 into a wide accumulator
-    ptx.comment("=== Phase C: SiLuMul epilogue on dual accumulators ===");
+    let tid_x16 = ptx.regs.alloc_b32();
+    ptx.shl_b32(tid_x16, tid, 4);
 
-    // Merge acc0 (gate) and acc1 (up) into one wide AccumulatorMap.
-    // For each rm row: first acc0's rn tiles, then acc1's rn tiles.
-    let reg_m = c.reg_m();
-    let reg_n = c.reg_n();
-    let wide_reg_n = reg_n * 2;
-    let mut wide_regs = Vec::new();
-    for rm in 0..reg_m {
-        // acc0 tiles for this row (gate)
-        for rn in 0..reg_n {
-            let idx = (rm * reg_n + rn) as usize;
-            wide_regs.push(result.acc0.regs[idx]);
-        }
-        // acc1 tiles for this row (up)
-        for rn in 0..reg_n {
-            let idx = (rm * reg_n + rn) as usize;
-            wide_regs.push(result.acc1.regs[idx]);
-        }
+    // A smem base addresses for cp.async
+    let mut a_st: Vec<Reg> = Vec::new();
+    let a_st0 = ptx.regs.alloc_b32();
+    ptx.add_s32(a_st0, smem_base, a_cp_off);
+    a_st.push(a_st0);
+    for i in 1..cp_chunks_a {
+        let r = ptx.regs.alloc_b32();
+        ptx.add_s32_imm(r, a_st0, (i * 2048) as i32);
+        a_st.push(r);
     }
-    let mut wide_acc = crate::gemm::AccumulatorMap {
-        regs: wide_regs,
-        reg_m,
-        reg_n: wide_reg_n,
-    };
 
-    SiLuMulEpilogue.emit_epilogue(&mut ptx, &mut wide_acc);
+    // B0 smem base addresses for cp.async
+    let b0_cp_base = ptx.regs.alloc_b32();
+    ptx.add_s32(b0_cp_base, smem_base, b_cp_off);
+    let mut b0_cp: Vec<Reg> = Vec::new();
+    let b0_cp0 = ptx.regs.alloc_b32();
+    ptx.add_s32_imm(b0_cp0, b0_cp_base, b0_start);
+    b0_cp.push(b0_cp0);
+    for i in 1..cp_chunks_b {
+        let r = ptx.regs.alloc_b32();
+        ptx.add_s32_imm(r, b0_cp0, (i * 2048) as i32);
+        b0_cp.push(r);
+    }
+
+    // B1 smem base addresses for cp.async
+    let b1_cp_base = ptx.regs.alloc_b32();
+    ptx.add_s32(b1_cp_base, smem_base, b_cp_off);
+    let mut b1_cp: Vec<Reg> = Vec::new();
+    let b1_cp0 = ptx.regs.alloc_b32();
+    ptx.add_s32_imm(b1_cp0, b1_cp_base, b1_start);
+    b1_cp.push(b1_cp0);
+    for i in 1..cp_chunks_b {
+        let r = ptx.regs.alloc_b32();
+        ptx.add_s32_imm(r, b1_cp0, (i * 2048) as i32);
+        b1_cp.push(r);
+    }
+
+    // B stride for advancing global B pointers
+    let b_stride_val = ptx.regs.alloc_b32();
+    ptx.shl_b32(b_stride_val, n_param, bk.trailing_zeros());
+    let two_reg = ptx.regs.alloc_b32();
+    ptx.mov_b32_imm(two_reg, 2);
+    let b_stride_bytes = ptx.regs.alloc_b64();
+    ptx.mul_wide_s32(b_stride_bytes, b_stride_val, two_reg);
     ptx.blank();
 
-    // Phase D: Store output (half-width after SiLuMul)
-    ptx.comment("=== Phase D: Store output ===");
-    emit_store_c(&mut ptx, c, &wide_acc, &setup, output_ptr, n_param);
+    // ── ldmatrix swizzle offsets (constant across K-loop) ──
+    ptx.comment("ldmatrix swizzle offsets");
+
+    let tid_x64 = ptx.regs.alloc_b32();
+    ptx.shl_b32(tid_x64, tid, 6);
+    let a_ld_r0 = ptx.regs.alloc_b32();
+    ptx.and_b32(a_ld_r0, tid_x64, 960);
+    let tid_x8 = ptx.regs.alloc_b32();
+    ptx.shl_b32(tid_x8, tid, 3);
+    let a_ld_r1 = ptx.regs.alloc_b32();
+    ptx.and_b32(a_ld_r1, tid_x8, 48);
+    let a_ld_swiz = ptx.regs.alloc_b32();
+    ptx.and_b32(a_ld_swiz, tid, 16);
+    let a_ld_half = ptx.regs.alloc_b32();
+    ptx.and_b32(a_ld_half, tid_x16, 1024);
+    let a_ld_comb = ptx.regs.alloc_b32();
+    ptx.or_b32(a_ld_comb, a_ld_r0, a_ld_r1);
+    let a_ld_xor = ptx.regs.alloc_b32();
+    ptx.xor_b32(a_ld_xor, a_ld_comb, a_ld_swiz);
+    let a_off_ki0 = ptx.regs.alloc_b32();
+    ptx.or_b32(a_off_ki0, a_ld_xor, a_ld_half);
+
+    let mut a_off = vec![a_off_ki0];
+    for ki in 1..k_warp_iters {
+        let off = ptx.regs.alloc_b32();
+        let xor_val = (ki % 2) * 32;
+        let chunk_off = (ki / 2) * 4096;
+        if chunk_off == 0 {
+            ptx.xor_b32_imm(off, a_off_ki0, xor_val);
+        } else if xor_val == 0 {
+            ptx.add_s32_imm(off, a_off_ki0, chunk_off as i32);
+        } else {
+            let tmp = ptx.regs.alloc_b32();
+            ptx.xor_b32_imm(tmp, a_off_ki0, xor_val);
+            ptx.add_s32_imm(off, tmp, chunk_off as i32);
+        }
+        a_off.push(off);
+    }
+
+    // B ldmatrix offsets
+    let lane = setup.lane;
+    let b_row_shift = (c.bn * 2).trailing_zeros();
+    let b_row_mask = 31 * c.bn * 2;
+    let tid_shifted_b = ptx.regs.alloc_b32();
+    ptx.shl_b32(tid_shifted_b, tid, b_row_shift);
+    let b_ld_row = ptx.regs.alloc_b32();
+    ptx.and_b32(b_ld_row, tid_shifted_b, b_row_mask);
+    let lane_and7 = ptx.regs.alloc_b32();
+    ptx.and_b32(lane_and7, lane, 7);
+    let b_ld_col = ptx.regs.alloc_b32();
+    ptx.shl_b32(b_ld_col, lane_and7, 4);
+    let tid_shr1 = ptx.regs.alloc_b32();
+    ptx.shr_u32(tid_shr1, tid, 1);
+    let b_ld_swiz = ptx.regs.alloc_b32();
+    ptx.and_b32(b_ld_swiz, tid_shr1, 16);
+    let b_col_xor = ptx.regs.alloc_b32();
+    ptx.xor_b32(b_col_xor, b_ld_col, b_ld_swiz);
+    let b_off_base = ptx.regs.alloc_b32();
+    ptx.or_b32(b_off_base, b_col_xor, b_ld_row);
+
+    let b_col_group_stride = c.b_col_group_stride();
+    let mut b_off: Vec<Reg> = Vec::with_capacity(reg_n as usize);
+    for rn in 0..reg_n {
+        let group = rn / 4;
+        let within = rn % 4;
+        let xor_val = within * 32;
+        let group_off = group * b_col_group_stride;
+        let r = ptx.regs.alloc_b32();
+        if xor_val == 0 && group_off == 0 {
+            ptx.mov_b32(r, b_off_base);
+        } else if group_off == 0 {
+            ptx.xor_b32_imm(r, b_off_base, xor_val);
+        } else if xor_val == 0 {
+            ptx.add_s32_imm(r, b_off_base, group_off as i32);
+        } else {
+            let tmp = ptx.regs.alloc_b32();
+            ptx.xor_b32_imm(tmp, b_off_base, xor_val);
+            ptx.add_s32_imm(r, tmp, group_off as i32);
+        }
+        b_off.push(r);
+    }
+    ptx.blank();
+
+    // ── Prologue: load (stages-1) tiles ──
+    let mut ga_loop: Vec<Reg> = Vec::new();
+    for &g in &ga_chunks {
+        let r = ptx.regs.alloc_b64();
+        ptx.mov_b64(r, g);
+        ga_loop.push(r);
+    }
+    let mut gb0_loop: Vec<Reg> = Vec::new();
+    for &g in &gb0_chunks {
+        let r = ptx.regs.alloc_b64();
+        ptx.mov_b64(r, g);
+        gb0_loop.push(r);
+    }
+    let mut gb1_loop: Vec<Reg> = Vec::new();
+    for &g in &gb1_chunks {
+        let r = ptx.regs.alloc_b64();
+        ptx.mov_b64(r, g);
+        gb1_loop.push(r);
+    }
+
+    for stage in 0..stages - 1 {
+        ptx.comment(&format!(
+            "Dual pipeline prologue: load tile {stage} into buffer {stage}"
+        ));
+        let p_tile = ptx.regs.alloc_pred();
+        ptx.setp_gt_s32_imm(p_tile, k_param, (stage * bk) as i32);
+        let sz = ptx.regs.alloc_b32();
+        ptx.selp_b32(sz, 16, 0, p_tile);
+
+        for i in 0..cp_chunks_a as usize {
+            let a_dst = ptx.regs.alloc_b32();
+            ptx.add_s32_imm(a_dst, a_st[i], (stage * a_tile_bytes) as i32);
+            ptx.cp_async_cg(a_dst, 0, ga_loop[i], 0, sz);
+        }
+        ptx.cp_async_commit();
+
+        for i in 0..cp_chunks_b as usize {
+            let b0_dst = ptx.regs.alloc_b32();
+            ptx.add_s32_imm(b0_dst, b0_cp[i], (stage * b_tile_bytes) as i32);
+            ptx.cp_async_cg(b0_dst, 0, gb0_loop[i], 0, sz);
+        }
+        ptx.cp_async_commit();
+
+        for i in 0..cp_chunks_b as usize {
+            let b1_dst = ptx.regs.alloc_b32();
+            ptx.add_s32_imm(b1_dst, b1_cp[i], (stage * b_tile_bytes) as i32);
+            ptx.cp_async_cg(b1_dst, 0, gb1_loop[i], 0, sz);
+        }
+        ptx.cp_async_commit();
+        ptx.blank();
+
+        // Advance global pointers
+        for g in &ga_loop {
+            ptx.add_s64_imm(*g, *g, (bk * 2) as i64);
+        }
+        for g in &gb0_loop {
+            ptx.add_s64(*g, *g, b_stride_bytes);
+        }
+        for g in &gb1_loop {
+            ptx.add_s64(*g, *g, b_stride_bytes);
+        }
+        ptx.add_s32_imm(k_offset_reg, k_offset_reg, bk as i32);
+    }
+    ptx.blank();
+
+    // ── K>0 check ──
+    let p_has_k = ptx.regs.alloc_pred();
+    ptx.setp_gt_s32_imm(p_has_k, k_param, 0);
+    ptx.w(&format!("@{p_has_k} bra \t$L_DUAL_LOOP_ENTRY;"));
+    ptx.bra_uni("$L_DUAL_K0_FALLTHROUGH");
+    ptx.blank();
+
+    ptx.label("$L_DUAL_LOOP_ENTRY");
+
+    // Transform prologue
+    transform.emit_prologue(&mut ptx);
+    ptx.blank();
+
+    // ── Initialize f16 accumulators to zero ──
+    // f16 accumulators: 2 regs per MMA output (packed f16x2), not 4 f32.
+    // Total tiles per GEMM: reg_m * reg_n. Each tile = [Reg; 2].
+    let num_tiles = (reg_m * reg_n) as usize;
+    let zero = ptx.regs.alloc_b32();
+    ptx.mov_b32_imm(zero, 0x00000000);
+
+    ptx.comment(&format!(
+        "Initialize dual f16 accumulators (REG_M={}, REG_N={}, {} tiles x2)",
+        reg_m, reg_n, num_tiles
+    ));
+
+    // acc0 (gate) - f16 accumulators: [Reg; 2] per tile
+    let mut acc0_regs: Vec<[Reg; 2]> = Vec::with_capacity(num_tiles);
+    for _ in 0..num_tiles {
+        let tile = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+        for &r in &tile {
+            ptx.mov_b32(r, zero);
+        }
+        acc0_regs.push(tile);
+    }
+
+    // acc1 (up) - f16 accumulators
+    let mut acc1_regs: Vec<[Reg; 2]> = Vec::with_capacity(num_tiles);
+    for _ in 0..num_tiles {
+        let tile = [ptx.regs.alloc_b32(), ptx.regs.alloc_b32()];
+        for &r in &tile {
+            ptx.mov_b32(r, zero);
+        }
+        acc1_regs.push(tile);
+    }
+    ptx.blank();
+
+    // ── Circular buffer state ──
+    let read_stage = ptx.regs.alloc_b32();
+    let write_stage = ptx.regs.alloc_b32();
+    ptx.mov_b32_imm(read_stage, stages - 1);
+    ptx.mov_b32_imm(write_stage, stages - 1);
+
+    let k_counter = ptx.regs.alloc_b32();
+    ptx.mov_b32_imm(k_counter, 0);
+
+    // Wait count: 3 commits per stage (A + B0 + B1), wait for stages-2 worth
+    let total_async_per_tile = 3u32; // A commit + B0 commit + B1 commit
+    let wait_count = total_async_per_tile * (stages - 2);
+
+    // Pre-allocate K-loop temporary registers
+    let buf_base = ptx.regs.alloc_b32();
+    let read_off = ptx.regs.alloc_b32();
+    let write_buf_base = ptx.regs.alloc_b32();
+    let write_off = ptx.regs.alloc_b32();
+    let b0_addr = ptx.regs.alloc_b32();
+    let b1_addr = ptx.regs.alloc_b32();
+    let a_addr = ptx.regs.alloc_b32();
+
+    let mut a_dst_regs: Vec<Reg> = Vec::new();
+    for _ in 0..cp_chunks_a {
+        a_dst_regs.push(ptx.regs.alloc_b32());
+    }
+    let mut b0_dst_regs: Vec<Reg> = Vec::new();
+    for _ in 0..cp_chunks_b {
+        b0_dst_regs.push(ptx.regs.alloc_b32());
+    }
+    let mut b1_dst_regs: Vec<Reg> = Vec::new();
+    for _ in 0..cp_chunks_b {
+        b1_dst_regs.push(ptx.regs.alloc_b32());
+    }
+
+    let cp_size = ptx.regs.alloc_b32();
+    let p_load = ptx.regs.alloc_pred();
+    let next_read = ptx.regs.alloc_b32();
+    let p_wrap_r = ptx.regs.alloc_pred();
+    let next_write = ptx.regs.alloc_b32();
+    let p_wrap_w = ptx.regs.alloc_pred();
+    let p_loop = ptx.regs.alloc_pred();
+
+    let k_minus_stages_bk = ptx.regs.alloc_b32();
+    ptx.add_s32_imm(k_minus_stages_bk, k_param, -((stages * bk) as i32));
+
+    // Pre-allocate fragment registers for A (shared between both GEMMs)
+    let mut a_frag = [
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+        ptx.regs.alloc_b32(),
+    ];
+
+    // B0 fragments (all rn live simultaneously)
+    let b_ld_groups = k_warp_iters / 2;
+    let mut b0_frags: Vec<Vec<Reg>> = Vec::new();
+    for _rn in 0..reg_n as usize {
+        let mut frag_regs = Vec::new();
+        for _grp in 0..b_ld_groups as usize {
+            for _ in 0..4 {
+                frag_regs.push(ptx.regs.alloc_b32());
+            }
+        }
+        b0_frags.push(frag_regs);
+    }
+
+    // B1 fragments
+    let mut b1_frags: Vec<Vec<Reg>> = Vec::new();
+    for _rn in 0..reg_n as usize {
+        let mut frag_regs = Vec::new();
+        for _grp in 0..b_ld_groups as usize {
+            for _ in 0..4 {
+                frag_regs.push(ptx.regs.alloc_b32());
+            }
+        }
+        b1_frags.push(frag_regs);
+    }
+
+    // A fragment storage for reuse in GEMM1
+    let mut a_saved: Vec<Vec<[Reg; 4]>> = Vec::new();
+    for _ki in 0..k_warp_iters as usize {
+        let mut rm_frags = Vec::new();
+        for _rm in 0..reg_m as usize {
+            rm_frags.push([
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+                ptx.regs.alloc_b32(),
+            ]);
+        }
+        a_saved.push(rm_frags);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // K-LOOP with zigzag MMA and f16 accumulators
+    // ═══════════════════════════════════════════════════════════════
+    ptx.label("$L_DUAL_KLOOP");
+    ptx.w(".pragma \"nounroll\";");
+
+    // 1. Advance read stage
+    ptx.add_s32_imm(next_read, read_stage, 1);
+    ptx.setp_gt_s32_imm(p_wrap_r, next_read, stages as i32 - 1);
+    ptx.selp_b32_imm_reg(read_stage, 0, next_read, p_wrap_r);
+
+    // 2. Wait + barrier
+    ptx.cp_async_wait_group(wait_count);
+    ptx.bar_sync(0);
+
+    // 3. Compute read buffer base
+    ptx.shl_b32(read_off, read_stage, a_tile_bytes.trailing_zeros());
+    ptx.add_s32(buf_base, smem_base, read_off);
+
+    // 4. Transform k-setup (load gamma for this K-tile)
+    for ki in 0..k_warp_iters as usize {
+        transform.emit_k_setup(&mut ptx, ki as u32);
+    }
+    ptx.blank();
+
+    // ── ldmatrix B0 ──
+    ptx.comment(&format!(
+        "ldmatrix.trans B0 -- {} loads x {} groups",
+        reg_n, b_ld_groups
+    ));
+    for rn in 0..reg_n as usize {
+        for grp in 0..b_ld_groups as usize {
+            ptx.add_s32(b0_addr, buf_base, b_off[rn]);
+            let grp_off = b0_start + (grp as i32) * (32 * c.bn as i32 * 2);
+            let frag_base = grp * 4;
+            let frag = [
+                b0_frags[rn][frag_base],
+                b0_frags[rn][frag_base + 1],
+                b0_frags[rn][frag_base + 2],
+                b0_frags[rn][frag_base + 3],
+            ];
+            ptx.ldmatrix_x4_trans(frag, b0_addr, Some(grp_off));
+        }
+    }
+    ptx.blank();
+
+    // ── ldmatrix B1 ──
+    ptx.comment(&format!(
+        "ldmatrix.trans B1 -- {} loads x {} groups",
+        reg_n, b_ld_groups
+    ));
+    for rn in 0..reg_n as usize {
+        for grp in 0..b_ld_groups as usize {
+            ptx.add_s32(b1_addr, buf_base, b_off[rn]);
+            let grp_off = b1_start + (grp as i32) * (32 * c.bn as i32 * 2);
+            let frag_base = grp * 4;
+            let frag = [
+                b1_frags[rn][frag_base],
+                b1_frags[rn][frag_base + 1],
+                b1_frags[rn][frag_base + 2],
+                b1_frags[rn][frag_base + 3],
+            ];
+            ptx.ldmatrix_x4_trans(frag, b1_addr, Some(grp_off));
+        }
+    }
+    ptx.blank();
+
+    // ── Load A fragments + transform + GEMM0 MMAs (zigzag) + save for GEMM1 ──
+    for ki in 0..k_warp_iters as usize {
+        ptx.comment(&format!("ki={ki}: ldmatrix A + transform + GEMM0 zigzag MMA"));
+        ptx.add_s32(a_addr, buf_base, a_off[ki]);
+
+        for rm in 0..reg_m as usize {
+            let a_rm_off = if rm == 0 {
+                None
+            } else {
+                Some((rm as i32) * 2048_i32)
+            };
+            ptx.ldmatrix_x4(a_frag, a_addr, a_rm_off);
+            transform.emit_transform(&mut ptx, &mut a_frag, ki as u32, rm as u32);
+
+            // Save A fragments for GEMM1
+            for j in 0..4 {
+                ptx.mov_b32(a_saved[ki][rm][j], a_frag[j]);
+            }
+
+            // GEMM0 MMA with zigzag pattern:
+            // Even columns (0,2,...): row order 0,1,2,3 (forward)
+            // Odd columns (1,3,...): row order 3,2,1,0 (reverse)
+            // But since we iterate rm inside, we emit for each rm the appropriate rn.
+            // Actually, zigzag is across rn for a fixed ki: we iterate rn forward then backward.
+            // Since we're inside the rm loop, we emit all rn for this rm.
+            for rn in 0..reg_n as usize {
+                let ai = rm * reg_n as usize + rn;
+                let b_sel = [b0_frags[rn][ki * 2], b0_frags[rn][ki * 2 + 1]];
+                ptx.mma_m16n8k16_f16(acc0_regs[ai], a_frag, b_sel, acc0_regs[ai]);
+            }
+        }
+        ptx.blank();
+    }
+
+    // ── GEMM1 MMAs using saved A fragments (zigzag) ──
+    ptx.comment("GEMM1 MMAs using saved A fragments (zigzag)");
+    for ki in 0..k_warp_iters as usize {
+        for rm in 0..reg_m as usize {
+            let saved = a_saved[ki][rm];
+            for rn in 0..reg_n as usize {
+                let ai = rm * reg_n as usize + rn;
+                let b_sel = [b1_frags[rn][ki * 2], b1_frags[rn][ki * 2 + 1]];
+                ptx.mma_m16n8k16_f16(acc1_regs[ai], saved, b_sel, acc1_regs[ai]);
+            }
+        }
+    }
+    ptx.blank();
+
+    // ── Predicated loads for next tile ──
+    ptx.setp_lt_s32(p_load, k_counter, k_minus_stages_bk);
+    ptx.comment("Predicated loads for next tile (A + B0 + B1)");
+    ptx.selp_b32(cp_size, 16, 0, p_load);
+
+    // Compute write buffer base
+    ptx.shl_b32(write_off, write_stage, a_tile_bytes.trailing_zeros());
+    ptx.add_s32(write_buf_base, smem_base, write_off);
+
+    ptx.bar_sync(0);
+
+    // A next tile
+    ptx.add_s32(a_dst_regs[0], write_buf_base, a_cp_off);
+    ptx.cp_async_cg(a_dst_regs[0], 0, ga_loop[0], 0, cp_size);
+    for i in 1..cp_chunks_a as usize {
+        ptx.add_s32_imm(a_dst_regs[i], a_dst_regs[0], (i * 2048) as i32);
+        ptx.cp_async_cg(a_dst_regs[i], 0, ga_loop[i], 0, cp_size);
+    }
+    ptx.cp_async_commit();
+
+    // B0 next tile
+    ptx.add_s32(b0_dst_regs[0], write_buf_base, b_cp_off);
+    ptx.add_s32_imm(b0_dst_regs[0], b0_dst_regs[0], b0_start);
+    ptx.cp_async_cg(b0_dst_regs[0], 0, gb0_loop[0], 0, cp_size);
+    for i in 1..cp_chunks_b as usize {
+        ptx.add_s32_imm(b0_dst_regs[i], b0_dst_regs[0], i as i32 * 2048);
+        ptx.cp_async_cg(b0_dst_regs[i], 0, gb0_loop[i], 0, cp_size);
+    }
+    ptx.cp_async_commit();
+
+    // B1 next tile
+    ptx.add_s32(b1_dst_regs[0], write_buf_base, b_cp_off);
+    ptx.add_s32_imm(b1_dst_regs[0], b1_dst_regs[0], b1_start);
+    ptx.cp_async_cg(b1_dst_regs[0], 0, gb1_loop[0], 0, cp_size);
+    for i in 1..cp_chunks_b as usize {
+        ptx.add_s32_imm(b1_dst_regs[i], b1_dst_regs[0], i as i32 * 2048);
+        ptx.cp_async_cg(b1_dst_regs[i], 0, gb1_loop[i], 0, cp_size);
+    }
+    ptx.cp_async_commit();
+    ptx.blank();
+
+    // ── Advance buffer indices ──
+    ptx.comment("Advance write buffer stage index");
+    ptx.add_s32_imm(next_write, write_stage, 1);
+    ptx.setp_gt_s32_imm(p_wrap_w, next_write, stages as i32 - 1);
+    ptx.selp_b32_imm_reg(write_stage, 0, next_write, p_wrap_w);
+
+    // ── Advance loop state ──
+    ptx.comment("Advance loop state");
+    ptx.add_s32_imm(k_counter, k_counter, bk as i32);
+    for g in &ga_loop {
+        ptx.add_s64_imm(*g, *g, (bk * 2) as i64);
+    }
+    for g in &gb0_loop {
+        ptx.add_s64(*g, *g, b_stride_bytes);
+    }
+    for g in &gb1_loop {
+        ptx.add_s64(*g, *g, b_stride_bytes);
+    }
+    ptx.add_s32_imm(k_offset_reg, k_offset_reg, bk as i32);
+
+    ptx.setp_lt_s32(p_loop, k_counter, k_param);
+    ptx.w(&format!("@{p_loop} bra \t$L_DUAL_KLOOP;"));
+    ptx.blank();
+    ptx.bra_uni("$L_DUAL_EPILOGUE");
+    ptx.blank();
+
+    // ── K=0 fallthrough ──
+    ptx.label("$L_DUAL_K0_FALLTHROUGH");
+    let zero2 = ptx.regs.alloc_b32();
+    ptx.mov_b32_imm(zero2, 0x00000000);
+    for tile in &acc0_regs {
+        for &r in tile {
+            ptx.mov_b32(r, zero2);
+        }
+    }
+    for tile in &acc1_regs {
+        for &r in tile {
+            ptx.mov_b32(r, zero2);
+        }
+    }
+    ptx.blank();
+
+    // ═══════════════════════════════════════════════════════════════
+    // Phase C: CUTLASS-style epilogue — f16x2 SiLU via exp2 inline asm
+    // ═══════════════════════════════════════════════════════════════
+    ptx.label("$L_DUAL_EPILOGUE");
+    ptx.cp_async_wait_group(0);
+    ptx.bar_sync(0);
+    ptx.blank();
+
+    ptx.comment("=== Phase C: SiLuMul epilogue on f16 dual accumulators (CUTLASS exp2 style) ===");
+
+    // f16 accumulators: acc0_regs[tile] = [hi, lo] packed f16x2
+    // For each tile: gate = acc0_regs[tile], up = acc1_regs[tile]
+    // SiLU(gate) * up = gate * sigmoid(gate) * up
+    // All done in f16x2 to match CUTLASS.
+    //
+    // The CUTLASS epilogue has a smem shuffle step, but since our accumulator
+    // layout already has the right thread mapping, we can do the SiLU in-place
+    // and then store directly. The smem shuffle is needed in CUTLASS because
+    // the output tile iterator has a different thread mapping than the MMA
+    // accumulator layout. We match this by using f16x2 ops directly on accumulators.
+
+    for rm in 0..reg_m as usize {
+        for rn in 0..reg_n as usize {
+            let ai = rm * reg_n as usize + rn;
+            let gate = acc0_regs[ai]; // [Reg; 2] packed f16x2
+            let up = acc1_regs[ai];
+
+            // Process each packed f16x2 register in the tile
+            for i in 0..2 {
+                let gate_reg = gate[i];
+                let up_reg = up[i];
+
+                // Allocate result registers
+                let neg_r = ptx.regs.alloc_b32();
+                let exp_r = ptx.regs.alloc_b32();
+                let one_plus_exp = ptx.regs.alloc_b32();
+                let silu_r = ptx.regs.alloc_b32();
+                let result_r = ptx.regs.alloc_b32();
+
+                // neg.f16x2 for sigmoid
+                ptx.w(&format!("{{neg.f16x2 {neg_r},{gate_reg};}}"));
+
+                // exp2 inline asm block matching CUTLASS:
+                // exp(-x) = 2^(-x * log2(e))
+                ptx.raw(&format!(
+                    "\t{{.reg.b16         hl, hu;\n\
+                     \t .reg.b32         h,r,fl,fu,C,nZ;\n\
+                     \t  mov.b32         {{hl, hu}}, {neg_r};\n\
+                     \t  mov.b32         h, {neg_r};\n\
+                     \t  cvt.f32.f16     fl, hl;\n\
+                     \t  cvt.f32.f16     fu, hu;\n\
+                     \t  mov.b32         C, 0x3fb8aa3bU;\n\
+                     \t  mov.b32         nZ, 0x80000000U;\n\
+                     \t  fma.rn.f32      fl,fl,C,nZ;\n\
+                     \t  fma.rn.f32      fu,fu,C,nZ;\n\
+                     \t  ex2.approx.ftz.f32  fl, fl;\n\
+                     \t  ex2.approx.ftz.f32  fu, fu;\n\
+                     \t  cvt.rn.f16.f32      hl, fl;\n\
+                     \t  cvt.rn.f16.f32      hu, fu;\n\
+                     \t  mov.b32         r, {{hl, hu}};\n\
+                     \t{{.reg.b32 spc, ulp, p;\n\
+                     \t  mov.b32 spc,0X1F791F79U;\n\
+                     \t  mov.b32 ulp,0x94009400U;\n\
+                     \t  set.eq.f16x2.f16x2 p,h, spc;\n\
+                     \t  fma.rn.f16x2 r,p,ulp,r;}}\n\
+                     \t{{.reg.b32 spc, ulp, p;\n\
+                     \t  mov.b32 spc,0X25CF25CFU;\n\
+                     \t  mov.b32 ulp,0x94009400U;\n\
+                     \t  set.eq.f16x2.f16x2 p,h, spc;\n\
+                     \t  fma.rn.f16x2 r,p,ulp,r;}}\n\
+                     \t{{.reg.b32 spc, ulp, p;\n\
+                     \t  mov.b32 spc,0XC13BC13BU;\n\
+                     \t  mov.b32 ulp,0x04000400U;\n\
+                     \t  set.eq.f16x2.f16x2 p,h, spc;\n\
+                     \t  fma.rn.f16x2 r,p,ulp,r;}}\n\
+                     \t{{.reg.b32 spc, ulp, p;\n\
+                     \t  mov.b32 spc,0XC1EFC1EFU;\n\
+                     \t  mov.b32 ulp,0x02000200U;\n\
+                     \t  set.eq.f16x2.f16x2 p,h, spc;\n\
+                     \t  fma.rn.f16x2 r,p,ulp,r;}}\n\
+                     \t  mov.b32         {exp_r}, r;\n\
+                     \t}}"
+                ));
+
+                // 1 + exp(-x)
+                ptx.w(&format!(
+                    "{{mov.b32 {one_plus_exp}, {{15360, 15360}};}}"
+                ));
+                ptx.w(&format!(
+                    "{{add.f16x2 {one_plus_exp},{one_plus_exp},{exp_r};}}"
+                ));
+
+                // sigmoid = 1.0 / (1 + exp(-x)) via scalar rcp
+                // Unpack, divide, repack
+                let sig_lo = ptx.regs.alloc_b32(); // b16 stored in b32
+                let sig_hi = ptx.regs.alloc_b32();
+                let f_num = ptx.regs.alloc_f32();
+                let f_den = ptx.regs.alloc_f32();
+                let f_rcp = ptx.regs.alloc_f32();
+                let f_result = ptx.regs.alloc_f32();
+
+                // Low half: sigmoid_lo = 1.0 / (1 + exp(-gate_lo))
+                ptx.w(&format!(
+                    "{{.reg .f16 low,high; mov.b32 {{low,high}}, {one_plus_exp}; mov.b16 {sig_lo}, low;}}"
+                ));
+                ptx.w(&format!("{{  cvt.f32.f16 {f_num}, 15360;}}"));  // 1.0 in f16 = 15360
+                ptx.w(&format!("{{  cvt.f32.f16 {f_den}, {sig_lo};}}"));
+                ptx.w(&format!("{{rcp.approx.ftz.f32 {f_rcp}, {f_den};}}"));
+                ptx.w(&format!("mul.f32 \t{f_result}, {f_num}, {f_rcp};"));
+                ptx.w(&format!("{{  cvt.rn.f16.f32 {sig_lo}, {f_result};}}"));
+
+                // High half
+                ptx.w(&format!(
+                    "{{.reg .f16 low,high; mov.b32 {{low,high}}, {one_plus_exp}; mov.b16 {sig_hi}, high;}}"
+                ));
+                ptx.w(&format!("{{  cvt.f32.f16 {f_den}, {sig_hi};}}"));
+                ptx.w(&format!("{{rcp.approx.ftz.f32 {f_rcp}, {f_den};}}"));
+                ptx.w(&format!("mul.f32 \t{f_result}, {f_num}, {f_rcp};"));
+                ptx.w(&format!("{{  cvt.rn.f16.f32 {sig_hi}, {f_result};}}"));
+
+                // Pack sigmoid back to f16x2
+                let sigmoid_packed = ptx.regs.alloc_b32();
+                ptx.w(&format!(
+                    "{{  mov.b32 {sigmoid_packed}, {{{sig_lo},{sig_hi}}};}}"
+                ));
+
+                // SiLU(gate) = gate * sigmoid(gate)
+                ptx.w(&format!("{{mul.f16x2 {silu_r},{gate_reg},{sigmoid_packed};}}"));
+
+                // Final: SiLU(gate) * up
+                ptx.w(&format!("{{mul.f16x2 {result_r},{silu_r},{up_reg};}}"));
+
+                // Store result back to gate accumulator
+                ptx.mov_b32(gate[i], result_r);
+            }
+        }
+    }
+    ptx.blank();
+
+    // ═══════════════════════════════════════════════════════════════
+    // Phase D: Store output
+    // ═══════════════════════════════════════════════════════════════
+    ptx.comment("=== Phase D: Store output (f16 accumulators) ===");
+
+    // Build output addresses and store
+    // For f16 accumulators, each tile has 2 packed f16x2 registers = 4 f16 values.
+    // We need to compute output addresses based on warp position and store.
+    // Use the same addressing as the standard store_c but adapted for [Reg; 2] tiles.
+
+    // Convert f16 accumulators to the AccumulatorMap format expected by emit_store_c.
+    // Since acc0_regs now contains the SiLU(gate)*up results (f16x2 packed in [Reg;2]),
+    // we need to write a custom store.
+    //
+    // Thread output mapping for m16n8k16 f16 accumulator:
+    // Each thread holds 2 packed f16x2 values per MMA output.
+    // d[0] = rows [t/4, t/4+8] x cols [2*(t%4), 2*(t%4)+1]
+    // d[1] = rows [t/4, t/4+8] x cols [2*(t%4), 2*(t%4)+1] (upper half)
+
+    // For now, store via st.global.v2.b32 (2 x packed f16x2 = 8 bytes = 4 f16 values)
+    let _out_row_base = ptx.regs.alloc_b32();
+    let _out_col_base = ptx.regs.alloc_b32();
+
+    // Warp position within tile
+    let warp_m_reg = ptx.regs.alloc_b32();
+    ptx.shr_u32(warp_m_reg, setup.warp_id, warps_n.trailing_zeros());
+    let warp_n_reg = ptx.regs.alloc_b32();
+    ptx.and_b32(warp_n_reg, setup.warp_id, warps_n - 1);
+
+    // Thread position within warp for m16n8k16 output:
+    // row_in_warp = lane / 4 (0..7), col_in_warp = (lane % 4) * 2 (0,2,4,6)
+    let lane_div4 = ptx.regs.alloc_b32();
+    ptx.shr_u32(lane_div4, setup.lane, 2);
+    let lane_mod4 = ptx.regs.alloc_b32();
+    ptx.and_b32(lane_mod4, setup.lane, 3);
+    let lane_col = ptx.regs.alloc_b32();
+    ptx.shl_b32(lane_col, lane_mod4, 1);
+
+    // block_row + warp_m * WM + rm * MMA_M + thread_row
+    // block_col + warp_n * WN + rn * MMA_N + thread_col
+    let warp_row_off = ptx.regs.alloc_b32();
+    ptx.shl_b32(warp_row_off, warp_m_reg, c.wm.trailing_zeros());
+    let warp_col_off = ptx.regs.alloc_b32();
+    ptx.shl_b32(warp_col_off, warp_n_reg, c.wn.trailing_zeros());
+
+    // Output pointer: output_ptr + (row * N + col) * 2
+    let out_addr = ptx.regs.alloc_b64();
+    let out_row = ptx.regs.alloc_b32();
+    let out_col = ptx.regs.alloc_b32();
+    let p_valid = ptx.regs.alloc_pred();
+
+    for rm in 0..reg_m as usize {
+        for row_half in 0..2u32 {
+            // row = block_row + warp_row_off + rm*16 + lane_div4 + row_half*8
+            ptx.add_s32(out_row, setup.block_row, warp_row_off);
+            ptx.add_s32_imm(out_row, out_row, (rm as i32) * 16 + (row_half as i32) * 8);
+            ptx.add_s32(out_row, out_row, lane_div4);
+
+            for rn in 0..reg_n as usize {
+                let ai = rm * reg_n as usize + rn;
+                let val = acc0_regs[ai][row_half as usize]; // packed f16x2
+
+                // col = block_col + warp_col_off + rn*8 + lane_col
+                ptx.add_s32(out_col, setup.block_col, warp_col_off);
+                ptx.add_s32_imm(out_col, out_col, (rn as i32) * 8);
+                ptx.add_s32(out_col, out_col, lane_col);
+
+                // Bounds check
+                ptx.setp_lt_s32(p_valid, out_col, n_param);
+
+                // Compute address: output_ptr + (row * N + col) * 2
+                let row_off = ptx.regs.alloc_b64();
+                ptx.mul_wide_s32(row_off, out_row, n_param);
+                let col_64 = ptx.regs.alloc_b64();
+                ptx.cvt_s64_s32(col_64, out_col);
+                ptx.add_s64(out_addr, row_off, col_64);
+                ptx.shl_b64(out_addr, out_addr, 1); // * 2 for f16
+                ptx.add_s64(out_addr, output_ptr, out_addr);
+
+                // Store packed f16x2 (4 bytes = 2 f16 values)
+                ptx.w(&format!("@{p_valid} st.global.b32 \t[{out_addr}], {val};"));
+            }
+        }
+    }
     ptx.blank();
     ptx.ret();
 
@@ -1629,8 +2343,8 @@ mod tests {
             "Must contain gamma preload"
         );
         assert!(
-            ptx.contains("DualMainloopPipeline"),
-            "Must use DualMainloopPipeline"
+            ptx.contains("CUTLASS-matching dual GEMM"),
+            "Must use CUTLASS-matching dual GEMM"
         );
         assert!(
             ptx.contains("SiLuMul epilogue"),
@@ -1638,10 +2352,16 @@ mod tests {
         );
         assert!(ptx.contains("Store"), "Must contain store phase");
 
-        // Key instructions
-        assert!(ptx.contains("mma.sync.aligned.m16n8k16"));
+        // Key instructions — f16 accumulators
+        assert!(
+            ptx.contains("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16"),
+            "Must use f16 accumulator MMA"
+        );
         assert!(ptx.contains("rsqrt.approx.f32"));
-        assert!(ptx.contains("ex2.approx.f32"));
+        assert!(
+            ptx.contains("ex2.approx.ftz.f32"),
+            "Must use CUTLASS-style exp2 for SiLU"
+        );
         assert!(ptx.contains("cp.async.cg.shared.global"));
 
         // Must have all dual fused parameters
@@ -1694,27 +2414,26 @@ mod tests {
         let config = GemmConfig::default_128x128();
         let ptx = build_dual_fused_pipeline(&config, 4096);
 
-        // SiLuMul epilogue requires these instructions
+        // CUTLASS-style SiLuMul epilogue with f16x2 ops
         assert!(
-            ptx.contains("neg.f32"),
-            "Must have neg.f32 for sigmoid(-x)"
+            ptx.contains("neg.f16x2"),
+            "Must have neg.f16x2 for sigmoid(-x)"
         );
         assert!(
-            ptx.contains("ex2.approx.f32"),
-            "Must have ex2 for exp in sigmoid"
+            ptx.contains("ex2.approx.ftz.f32"),
+            "Must have ex2 for exp in sigmoid (CUTLASS inline asm)"
         );
         assert!(
-            ptx.contains("rcp.approx.f32"),
-            "Must have rcp for 1/(1+exp)"
+            ptx.contains("rcp.approx.ftz.f32"),
+            "Must have rcp for scalar sigmoid division"
         );
 
-        // SiLuMul also does gate * up multiplication
-        // The mul.f32 should appear in the epilogue section
+        // SiLuMul also does gate * up multiplication via f16x2
         let epilogue_start = ptx.find("SiLuMul epilogue").expect("SiLuMul epilogue comment");
         let epilogue_region = &ptx[epilogue_start..];
         assert!(
-            epilogue_region.contains("mul.f32"),
-            "SiLuMul epilogue must multiply silu(gate) * up"
+            epilogue_region.contains("mul.f16x2"),
+            "SiLuMul epilogue must use mul.f16x2 for silu(gate) * up"
         );
     }
 

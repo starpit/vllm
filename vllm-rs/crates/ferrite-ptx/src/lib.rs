@@ -767,6 +767,62 @@ impl PtxBuilder {
         ));
     }
 
+    /// MMA with f16 accumulators: mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16
+    /// d and c are [Reg; 2] (2 packed f16x2 outputs, not 4 f32).
+    pub fn mma_m16n8k16_f16(&mut self, d: [Reg; 2], a: [Reg; 4], b: [Reg; 2], c: [Reg; 2]) {
+        self.w(&format!(
+            "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 \
+             {{{},{}}}, {{{},{},{},{}}}, {{{},{}}}, {{{},{}}};",
+            d[0], d[1], a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1]
+        ));
+    }
+
+    /// Emit raw inline PTX (for exp2 blocks, sigmoid, etc.)
+    pub fn raw(&mut self, s: &str) {
+        writeln!(self.body, "{}", s).unwrap();
+    }
+
+    /// st.shared.u32 [addr+offset], val;
+    pub fn st_shared_u32(&mut self, addr: Reg, offset: i32, val: Reg) {
+        if offset == 0 {
+            self.w(&format!("st.shared.u32 \t[{addr}], {val};"));
+        } else {
+            self.w(&format!("st.shared.u32 \t[{addr}+{offset}], {val};"));
+        }
+    }
+
+    /// ld.shared.v4.u32 {d0,d1,d2,d3}, [addr+offset];
+    pub fn ld_shared_v4_u32(&mut self, d: [Reg; 4], addr: Reg, offset: i32) {
+        let addr_str = if offset == 0 {
+            format!("[{addr}]")
+        } else {
+            format!("[{addr}+{offset}]")
+        };
+        self.w(&format!(
+            "ld.shared.v4.u32 \t{{{}, {}, {}, {}}}, {addr_str};",
+            d[0], d[1], d[2], d[3]
+        ));
+    }
+
+    /// Predicated st.global.v4.u32 [addr+offset], {v0,v1,v2,v3};
+    pub fn pred_st_global_v4_u32(
+        &mut self,
+        pred: Reg,
+        addr: Reg,
+        offset: i32,
+        val: [Reg; 4],
+    ) {
+        let addr_str = if offset == 0 {
+            format!("[{addr}]")
+        } else {
+            format!("[{addr}+{offset}]")
+        };
+        self.w(&format!(
+            "@{pred} st.global.v4.u32 \t{addr_str}, {{{}, {}, {}, {}}};",
+            val[0], val[1], val[2], val[3]
+        ));
+    }
+
     // -- Control flow --
 
     pub fn bar_sync(&mut self, id: u32) {

@@ -108,6 +108,13 @@ if (simd_gid == 0 && simd_lane < {{SIMDGROUPS_PER_TG}}) {
     total_sum = shared_sums[simd_lane];
 }
 total_sum = simd_sum(total_sum);
+
+// Broadcast total_sum to all simdgroups via shared memory
+if (simd_gid == 0 && simd_lane == 0) {
+    shared_sums[0] = total_sum;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+total_sum = shared_sums[0];
 "#,
         );
 

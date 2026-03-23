@@ -250,7 +250,7 @@ struct MlxQwen3NextAttention {
     head_dim: usize,
     rotary_dim: usize,
     scale: f32,
-    fuse_rope: bool,
+    block_needs_positioning: bool,
 }
 
 impl MlxQwen3NextAttention {
@@ -288,7 +288,7 @@ impl MlxQwen3NextAttention {
             head_dim: config.head_dim,
             rotary_dim,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
         })
     }
 
@@ -364,9 +364,9 @@ impl MlxQwen3NextAttention {
         // Apply partial RoPE (offset threaded from caller — no sync needed).
         let offset = rope_offset;
 
-        // RoPE + KV cache. When fuse_rope, use apply_rope_to_cached_k for consistent
+        // RoPE + KV cache. When block_needs_positioning, use apply_rope_to_cached_k for consistent
         // rope_dynamic values across Q and K.
-        let (q, k, v) = if self.fuse_rope {
+        let (q, k, v) = if self.block_needs_positioning {
             let q = if self.rotary_dim < self.head_dim {
                 let q_rot = q.try_index((.., .., .., ..self.rotary_dim as i32))?;
                 let q_pass = q.try_index((.., .., .., self.rotary_dim as i32..))?;
@@ -1117,7 +1117,7 @@ struct MlxQuantizedQwen3NextAttention {
     head_dim: usize,
     rotary_dim: usize,
     scale: f32,
-    fuse_rope: bool,
+    block_needs_positioning: bool,
 }
 
 impl MlxQuantizedQwen3NextAttention {
@@ -1170,7 +1170,7 @@ impl MlxQuantizedQwen3NextAttention {
             head_dim: config.head_dim,
             rotary_dim,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
         }
     }
 
@@ -1215,9 +1215,9 @@ impl MlxQuantizedQwen3NextAttention {
         let offset = rope_offset;
         let rd = self.rotary_dim as i32;
 
-        // RoPE + KV cache. When fuse_rope, use apply_rope_to_cached_k for consistent
+        // RoPE + KV cache. When block_needs_positioning, use apply_rope_to_cached_k for consistent
         // rope_dynamic values across Q and K.
-        let (q, k, v) = if self.fuse_rope {
+        let (q, k, v) = if self.block_needs_positioning {
             let q = if self.rotary_dim < self.head_dim {
                 let q_rot = q.try_index((.., .., .., ..rd))?;
                 let q_pass = q.try_index((.., .., .., rd..))?;

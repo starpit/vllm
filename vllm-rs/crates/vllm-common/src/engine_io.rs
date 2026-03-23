@@ -141,6 +141,19 @@ pub struct EngineCoreRequest {
     /// serialization since images are passed in-process only.
     #[serde(skip)]
     pub mm_data: Option<MultimodalData>,
+
+    /// Sparse map of block index → [`BlockKind`] for span-aware block hashing.
+    /// Produced by `/v1/query/execute`; `None` for normal requests.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_annotations: Option<crate::request::BlockAnnotations>,
+
+    /// 🦭 Pad and cache the final partial block on completion.
+    #[serde(default)]
+    pub seal: bool,
+
+    /// Deprioritize cached blocks for eviction after completion.
+    #[serde(default)]
+    pub volatile: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +391,9 @@ mod tests {
             data_parallel_rank: None,
             is_pooling: false,
             mm_data: None,
+            block_annotations: None,
+            seal: false,
+            volatile: false,
         };
         assert_eq!(req.request_id, "req-1");
         assert_eq!(req.prompt_token_ids.as_ref().unwrap().len(), 3);
@@ -400,6 +416,9 @@ mod tests {
             data_parallel_rank: Some(1),
             is_pooling: false,
             mm_data: None,
+            block_annotations: None,
+            seal: false,
+            volatile: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let req2: EngineCoreRequest = serde_json::from_str(&json).unwrap();

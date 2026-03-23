@@ -157,7 +157,7 @@ struct MlxCommandRAttention {
     num_kv_heads: usize,
     head_dim: usize,
     scale: f32,
-    fuse_rope: bool,
+    block_needs_positioning: bool,
 }
 
 impl MlxCommandRAttention {
@@ -197,7 +197,7 @@ impl MlxCommandRAttention {
             num_kv_heads: c.num_kv_heads,
             head_dim: c.head_dim,
             scale: 1.0 / (c.head_dim as f32).sqrt(),
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
         })
     }
 
@@ -270,7 +270,7 @@ impl MlxCommandRAttention {
             .expand_dims(0)?;
 
         // RoPE + KV cache
-        let (q, k, v) = if self.fuse_rope {
+        let (q, k, v) = if self.block_needs_positioning {
             let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, rope_offset)?;
             let (mut k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
             k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
@@ -353,7 +353,7 @@ impl MlxCommandRAttention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let (q, k, v) = if self.fuse_rope {
+            let (q, k, v) = if self.block_needs_positioning {
                 let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, offset)?;
                 let (mut k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
                 k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
@@ -727,7 +727,7 @@ struct MlxQuantizedCommandRAttention {
     num_kv_heads: usize,
     head_dim: usize,
     scale: f32,
-    fuse_rope: bool,
+    block_needs_positioning: bool,
 }
 
 impl MlxQuantizedCommandRAttention {
@@ -790,7 +790,7 @@ impl MlxQuantizedCommandRAttention {
             num_kv_heads: c.num_kv_heads,
             head_dim: c.head_dim,
             scale: 1.0 / (c.head_dim as f32).sqrt(),
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
         })
     }
 
@@ -825,7 +825,7 @@ impl MlxQuantizedCommandRAttention {
             .expand_dims(0)?;
 
         // RoPE + KV cache
-        let (q, k, v) = if self.fuse_rope {
+        let (q, k, v) = if self.block_needs_positioning {
             let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, rope_offset)?;
             let (mut k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
             k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
@@ -906,7 +906,7 @@ impl MlxQuantizedCommandRAttention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let (q, k, v) = if self.fuse_rope {
+            let (q, k, v) = if self.block_needs_positioning {
                 let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, offset)?;
                 let (mut k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
                 k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;

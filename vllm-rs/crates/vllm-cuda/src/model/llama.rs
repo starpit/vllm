@@ -81,8 +81,12 @@ pub struct LlamaConfig {
 
 /// Pre-computed rotary embedding cos/sin cache on GPU.
 pub struct RotaryCache {
-    /// `[max_pos, rotary_dim]` combined cos|sin cache.
+    /// `[max_pos, rotary_dim]` combined cos|sin cache (used by RoPE kernels).
     pub cos_sin_cache: GpuTensor,
+    /// `[max_pos, rotary_dim/2]` separate cos cache (used by FA2 fused RoPE).
+    pub cos_cache: GpuTensor,
+    /// `[max_pos, rotary_dim/2]` separate sin cache (used by FA2 fused RoPE).
+    pub sin_cache: GpuTensor,
     pub head_dim: usize,
 }
 
@@ -171,8 +175,16 @@ impl RotaryCache {
         }
 
         let cos_sin_cache = GpuTensor::new(gpu_ptr, &[max_pos, rotary_dim], dtype);
+
+        // Build separate cos/sin caches for FA2 fused RoPE (needs contiguous buffers).
+        let (cos_cache, sin_cache) = Self::build_separate_cos_sin(
+            &cache, max_pos, rotary_dim, dtype, device.compute_stream,
+        )?;
+
         Ok(Self {
             cos_sin_cache,
+            cos_cache,
+            sin_cache,
             head_dim,
         })
     }
@@ -260,10 +272,72 @@ impl RotaryCache {
         }
 
         let cos_sin_cache = GpuTensor::new(gpu_ptr, &[max_pos, rotary_dim], dtype);
+
+        // Build separate cos/sin caches for FA2 fused RoPE (needs contiguous buffers).
+        let (cos_cache, sin_cache) = Self::build_separate_cos_sin(
+            &cache, max_pos, rotary_dim, dtype, device.compute_stream,
+        )?;
+
         Ok(Self {
             cos_sin_cache,
+            cos_cache,
+            sin_cache,
             head_dim,
         })
+    }
+
+    unsafe fn build_separate_cos_sin(
+        cache: &[f32],
+        max_pos: usize,
+        rotary_dim: usize,
+        dtype: DType,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<(GpuTensor, GpuTensor)> {
+        let half = rotary_dim / 2;
+        let half_nbytes = max_pos * half * dtype.size_bytes();
+        let cos_data: Vec<f32> = (0..max_pos)
+            .flat_map(|p| (0..half).map(move |i| cache[p * rotary_dim + i]))
+            .collect();
+        let sin_data: Vec<f32> = (0..max_pos)
+            .flat_map(|p| (0..half).map(move |i| cache[p * rotary_dim + half + i]))
+            .collect();
+
+        let cos_gpu = crate::driver::mem_alloc(half_nbytes)?;
+        let sin_gpu = crate::driver::mem_alloc(half_nbytes)?;
+        let host = crate::driver::mem_alloc_host(half_nbytes)?;
+
+        macro_rules! upload {
+            ($data:expr, $gpu:expr, $T:ty) => {{
+                let converted: Vec<$T> = $data.iter().map(|&v| <$T>::from_f32(v)).collect();
+                std::ptr::copy_nonoverlapping(converted.as_ptr() as *const u8, host, half_nbytes);
+                crate::driver::memcpy_htod_async($gpu, host, half_nbytes, stream)?;
+            }};
+        }
+
+        match dtype {
+            DType::F16 => {
+                upload!(cos_data, cos_gpu, half::f16);
+                upload!(sin_data, sin_gpu, half::f16);
+            }
+            DType::BF16 => {
+                upload!(cos_data, cos_gpu, half::bf16);
+                upload!(sin_data, sin_gpu, half::bf16);
+            }
+            DType::F32 => {
+                std::ptr::copy_nonoverlapping(cos_data.as_ptr() as *const u8, host, half_nbytes);
+                crate::driver::memcpy_htod_async(cos_gpu, host, half_nbytes, stream)?;
+                std::ptr::copy_nonoverlapping(sin_data.as_ptr() as *const u8, host, half_nbytes);
+                crate::driver::memcpy_htod_async(sin_gpu, host, half_nbytes, stream)?;
+            }
+            _ => anyhow::bail!("unsupported dtype for RoPE cache: {:?}", dtype),
+        }
+        crate::driver::stream_synchronize(stream)?;
+        crate::driver::mem_free_host(host)?;
+
+        Ok((
+            GpuTensor::new(cos_gpu, &[max_pos, half], dtype),
+            GpuTensor::new(sin_gpu, &[max_pos, half], dtype),
+        ))
     }
 }
 
@@ -381,7 +455,7 @@ pub struct LlamaAttention {
     pub qk_norm_eps: f32,
     /// When true, K is stored unrotated in cache and FA2 applies RoPE in
     /// shared memory during attention (fused RoPE for spans).
-    pub fuse_rope: bool,
+    pub block_needs_positioning: bool,
     /// NCCL group for TP all-reduce after o_proj (row parallel).
     #[cfg(feature = "nccl")]
     pub tp_group: Option<Arc<NcclGroup>>,
@@ -518,8 +592,11 @@ impl LlamaAttention {
                     device.compute_stream,
                 );
                 (q, k, v)
-            } else if max_seqlen_q == 1 && self.fuse_rope {
+            } else if max_seqlen_q == 1 && self.block_needs_positioning {
                 // Fused RoPE decode: store K unrotated, FA2 rotates in shared mem.
+                if self.layer_idx == 0 {
+                    eprintln!("[SPANS] decode: block_needs_positioning path taken, layer 0");
+                }
                 let (q, k, v) = kernels::split_qkv(
                     qkv.as_gpu_tensor(),
                     self.q_size,
@@ -557,6 +634,10 @@ impl LlamaAttention {
                 // FA2 with fused RoPE: pass cos_sin_cache so kernel rotates
                 // cached K in shared memory during attention.
                 let rotary_dim = rotary.cos_sin_cache.dim(1);
+                if self.layer_idx == 0 {
+                    eprintln!("[SPANS] decode: rotary_dim={}, cos_sin_cache_ptr={:?}, head_dim={}",
+                        rotary_dim, rotary.cos_sin_cache.raw_ptr(), self.head_dim);
+                }
                 let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
                     q.view(),
                     cu_seqlens_q,
@@ -684,9 +765,12 @@ impl LlamaAttention {
                 }
 
                 return result;
-            } else if self.fuse_rope {
+            } else if self.block_needs_positioning {
                 // Fused RoPE prefill: split QKV, apply RoPE to Q only, store K
                 // unrotated. FA2 paged path rotates cached K in shared memory.
+                if self.layer_idx == 0 {
+                    eprintln!("[SPANS] prefill: block_needs_positioning path taken, layer 0");
+                }
                 // For fresh prefill (contiguous path), K is also passed directly
                 // to FA2 contiguous which does NOT fuse RoPE — so we apply full
                 // RoPE to both Q and K here. The unrotated K written to cache is
@@ -1302,7 +1386,7 @@ impl LlamaAttention {
             q_norm_weight: None,
             k_norm_weight: None,
             qk_norm_eps: 0.0,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -1498,7 +1582,7 @@ impl LlamaAttention {
             q_norm_weight: None,
             k_norm_weight: None,
             qk_norm_eps: 0.0,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -1561,7 +1645,7 @@ impl LlamaAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -1625,7 +1709,7 @@ impl LlamaAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -2352,7 +2436,7 @@ impl LlamaAttention {
             q_norm_weight: None,
             k_norm_weight: None,
             qk_norm_eps: 0.0,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -2645,7 +2729,7 @@ impl LlamaForCausalLM {
                 q_norm_weight,
                 k_norm_weight,
                 qk_norm_eps,
-                fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+                block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
                 #[cfg(feature = "nccl")]
                 tp_group: None,
             };
@@ -2976,7 +3060,7 @@ impl LlamaAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps: 1e-6,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         })

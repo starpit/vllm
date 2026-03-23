@@ -29,5 +29,5 @@ pub use engine_io::{
 };
 pub use error::{VllmError, VllmResult};
 pub use multimodal::MultimodalData;
-pub use request::{Request, RequestStatus};
+pub use request::{BlockAnnotations, BlockKind, Request, RequestStatus, compute_block_flags};
 pub use sampling::{LogprobsOutput, RequestOutputKind, SamplingParams, SamplingType, TokenLogprob};

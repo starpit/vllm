@@ -246,6 +246,9 @@ impl InprocClient {
         );
         request.is_pooling = ec_request.is_pooling;
         request.mm_data = ec_request.mm_data;
+        request.block_annotations = ec_request.block_annotations;
+        request.seal = ec_request.seal;
+        request.volatile = ec_request.volatile;
 
         self.engine.add_request(request);
         Ok(())
@@ -444,6 +447,9 @@ mod tests {
             data_parallel_rank: None,
             is_pooling: false,
             mm_data: None,
+            block_annotations: None,
+            seal: false,
+            volatile: false,
         }
     }
 

@@ -817,7 +817,7 @@ impl Qwen3NextFullAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps: config.rms_norm_eps,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         };

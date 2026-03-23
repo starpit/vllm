@@ -295,9 +295,9 @@ extern "C" void mha_varlen_fwd(
 
     // Spans: fused RoPE for cached K reads.
     // rotary_cos_ptr points to the combined [max_pos, rotary_dim] cos|sin cache.
-    // The kernel reads cos at [pos, 0..half] and sin at [pos, half..rotary_dim].
+    // rotate_k_smem_contiguous reads cos/sin from this combined layout directly.
     params.rotary_cos_ptr = rotary_cos_ptr;
-    params.rotary_sin_ptr = nullptr;  // unused; kernel uses single combined cache
+    params.rotary_sin_ptr = nullptr;  // unused by rotate_k_smem_contiguous
     params.rotary_dim = rotary_dim;
     params.rotate_cached_k = (rotate_cached_k != 0);
     params.is_rotary_interleaved = false;

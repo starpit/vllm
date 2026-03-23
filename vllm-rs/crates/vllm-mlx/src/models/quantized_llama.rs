@@ -315,7 +315,7 @@ pub struct MlxQuantizedLlamaAttention {
     sliding_window: Option<usize>,
     /// When true, K is stored without RoPE and RoPE is applied to the full
     /// cached K at attention time (relocatable span blocks).
-    fuse_rope: bool,
+    block_needs_positioning: bool,
 }
 
 impl MlxQuantizedLlamaAttention {
@@ -381,7 +381,7 @@ impl MlxQuantizedLlamaAttention {
             head_dim: config.head_dim,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
             sliding_window: config.sliding_window,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
         }
     }
 
@@ -425,10 +425,10 @@ impl MlxQuantizedLlamaAttention {
             .expand_dims(0)?;
 
         // RoPE + KV cache update.
-        // When fuse_rope: use rope_dynamic (via apply_rope_to_cached_k) for both Q and K
+        // When block_needs_positioning: use rope_dynamic (via apply_rope_to_cached_k) for both Q and K
         // to ensure consistency. MLX's fast::rope and fast::rope_dynamic produce
         // different values for the same position, so Q and K must use the same impl.
-        let (q, mut k, mut v) = if self.fuse_rope {
+        let (q, mut k, mut v) = if self.block_needs_positioning {
             let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, rope_offset)?;
             let (mut k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
             k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
@@ -518,14 +518,14 @@ impl MlxQuantizedLlamaAttention {
                 let vi = v.try_index((ii..ii + 1, .., .., ..))?;
 
                 let qi = self.rope.forward((&qi, offset))?;
-                let ki = if self.fuse_rope {
+                let ki = if self.block_needs_positioning {
                     ki
                 } else {
                     self.rope.forward((&ki, offset))?
                 };
 
                 let (ki, vi) = crate::cache::kv_cache_update(cache, &ki, &vi)?;
-                let ki = if self.fuse_rope {
+                let ki = if self.block_needs_positioning {
                     crate::models::llama::apply_rope_to_cached_k(&ki, &self.rope, 0)?
                 } else {
                     ki
@@ -567,7 +567,7 @@ impl MlxQuantizedLlamaAttention {
                     .transpose_axes(&[1, 0, 2])?
                     .expand_dims(0)?;
 
-                let (q, k, v) = if self.fuse_rope {
+                let (q, k, v) = if self.block_needs_positioning {
                     let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, offset)?;
                     let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
                     let k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
@@ -656,7 +656,7 @@ impl MlxQuantizedLlamaAttention {
     /// `batch_cache` holds the persistent batched [B, heads, kv_len, dim] cache for this layer.
     /// `mask` is the pre-built left-padding mask (shared across all layers).
     /// `offsets_arr` is the pre-built rope offsets array (shared across all layers).
-    /// `left_pads` — per-request left-padding counts (needed for fuse_rope negative offsets).
+    /// `left_pads` — per-request left-padding counts (needed for block_needs_positioning negative offsets).
     pub fn forward_batch_decode(
         &mut self,
         hidden_states: &Array,
@@ -699,7 +699,7 @@ impl MlxQuantizedLlamaAttention {
                 let qi = q.try_index((ii..ii + 1, .., .., ..))?;
                 let ki = k.try_index((ii..ii + 1, .., .., ..))?;
                 q_parts.push(self.rope.forward((&qi, offset))?);
-                if self.fuse_rope {
+                if self.block_needs_positioning {
                     k_parts.push(ki);
                 } else {
                     k_parts.push(self.rope.forward((&ki, offset))?);
@@ -712,12 +712,12 @@ impl MlxQuantizedLlamaAttention {
         }
 
         // Single batched KV cache update for all B sequences.
-        // When fuse_rope, K is stored unrotated (position-independent).
+        // When block_needs_positioning, K is stored unrotated (position-independent).
         let (k_cached, v_cached) = batch_cache.update_and_view(&k, &v)?;
 
-        // When fuse_rope, apply RoPE to full cached K via apply_rope_to_cached_k_batched.
+        // When block_needs_positioning, apply RoPE to full cached K via apply_rope_to_cached_k_batched.
         // The negative left_pads become start positions so real tokens get 0-based positions.
-        let k_cached = if self.fuse_rope {
+        let k_cached = if self.block_needs_positioning {
             let start_positions: Vec<i32> = left_pads.iter().map(|&p| -(p as i32)).collect();
             crate::models::llama::apply_rope_to_cached_k_batched(
                 &k_cached,
@@ -1261,7 +1261,7 @@ mod tests {
                 head_dim: config.head_dim,
                 scale: 1.0 / (config.head_dim as f32).sqrt(),
                 sliding_window: config.sliding_window,
-                fuse_rope: false,
+                block_needs_positioning: false,
             };
 
             let mlp = MlxQuantizedLlamaMLP {

@@ -162,6 +162,9 @@ mod tests {
             data_parallel_rank: None,
             is_pooling: false,
             mm_data: None,
+            block_annotations: None,
+            seal: false,
+            volatile: false,
         };
 
         let encoded = encode(&req).unwrap();
@@ -292,6 +295,9 @@ mod tests {
             data_parallel_rank: None,
             is_pooling: false,
             mm_data: None,
+            block_annotations: None,
+            seal: false,
+            volatile: false,
         };
 
         let encoded = encode(&req).unwrap();
@@ -320,6 +326,9 @@ mod tests {
             data_parallel_rank: None,
             is_pooling: false,
             mm_data: None,
+            block_annotations: None,
+            seal: false,
+            volatile: false,
         };
 
         let encoded = encode(&req).unwrap();

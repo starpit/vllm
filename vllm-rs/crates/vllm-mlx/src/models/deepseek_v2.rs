@@ -283,7 +283,7 @@ struct MlxDeepSeekV2Attention {
     v_head_dim: usize,
     kv_lora_rank: usize,
     scale: f32,
-    fuse_rope: bool,
+    block_needs_positioning: bool,
 }
 
 impl MlxDeepSeekV2Attention {
@@ -359,7 +359,7 @@ impl MlxDeepSeekV2Attention {
             v_head_dim,
             kv_lora_rank,
             scale,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
         })
     }
 
@@ -470,12 +470,12 @@ impl MlxDeepSeekV2Attention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        let q_pe = if self.fuse_rope {
+        let q_pe = if self.block_needs_positioning {
             crate::models::llama::apply_rope_to_cached_k(&q_pe, &self.rope, rope_offset)?
         } else {
             self.rope.forward((&q_pe, rope_offset))?
         };
-        let k_pe = if !self.fuse_rope {
+        let k_pe = if !self.block_needs_positioning {
             self.rope.forward((&k_pe, rope_offset))?
         } else {
             k_pe
@@ -512,11 +512,11 @@ impl MlxDeepSeekV2Attention {
         let v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
 
         // KV cache update — pre-allocated buffer with O(1) slice_update.
-        // When fuse_rope, K is stored without RoPE (position-independent).
+        // When block_needs_positioning, K is stored without RoPE (position-independent).
         let (k, v_sdpa) = crate::cache::kv_cache_update(cache, &k, &v_sdpa)?;
 
-        // When fuse_rope, apply RoPE to the PE portion of cached K with offset 0.
-        let k = if self.fuse_rope {
+        // When block_needs_positioning, apply RoPE to the PE portion of cached K with offset 0.
+        let k = if self.block_needs_positioning {
             let nope_dim = self.qk_nope_head_dim as i32;
             let k_nope = k.try_index((.., .., .., ..nope_dim))?;
             let k_pe = k.try_index((.., .., .., nope_dim..))?;
@@ -623,12 +623,12 @@ impl MlxDeepSeekV2Attention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let q_pe = if self.fuse_rope {
+            let q_pe = if self.block_needs_positioning {
                 crate::models::llama::apply_rope_to_cached_k(&q_pe, &self.rope, offset)?
             } else {
                 self.rope.forward((&q_pe, offset))?
             };
-            let k_pe = if !self.fuse_rope {
+            let k_pe = if !self.block_needs_positioning {
                 self.rope.forward((&k_pe, offset))?
             } else {
                 k_pe
@@ -662,11 +662,11 @@ impl MlxDeepSeekV2Attention {
             let v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
 
             // KV cache update.
-            // When fuse_rope, K is stored without RoPE (position-independent).
+            // When block_needs_positioning, K is stored without RoPE (position-independent).
             let (k, v_sdpa) = crate::cache::kv_cache_update(&mut caches[i], &k, &v_sdpa)?;
 
-            // When fuse_rope, apply RoPE to the PE portion of cached K with offset 0.
-            let k = if self.fuse_rope {
+            // When block_needs_positioning, apply RoPE to the PE portion of cached K with offset 0.
+            let k = if self.block_needs_positioning {
                 let nope_dim = self.qk_nope_head_dim as i32;
                 let k_nope = k.try_index((.., .., .., ..nope_dim))?;
                 let k_pe = k.try_index((.., .., .., nope_dim..))?;
@@ -1139,7 +1139,7 @@ struct MlxQuantizedDeepSeekV2Attention {
     v_head_dim: usize,
     kv_lora_rank: usize,
     scale: f32,
-    fuse_rope: bool,
+    block_needs_positioning: bool,
 }
 
 impl MlxQuantizedDeepSeekV2Attention {
@@ -1231,7 +1231,7 @@ impl MlxQuantizedDeepSeekV2Attention {
             v_head_dim,
             kv_lora_rank,
             scale,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
         })
     }
 
@@ -1287,12 +1287,12 @@ impl MlxQuantizedDeepSeekV2Attention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        let q_pe = if self.fuse_rope {
+        let q_pe = if self.block_needs_positioning {
             crate::models::llama::apply_rope_to_cached_k(&q_pe, &self.rope, rope_offset)?
         } else {
             self.rope.forward((&q_pe, rope_offset))?
         };
-        let k_pe = if !self.fuse_rope {
+        let k_pe = if !self.block_needs_positioning {
             self.rope.forward((&k_pe, rope_offset))?
         } else {
             k_pe
@@ -1327,11 +1327,11 @@ impl MlxQuantizedDeepSeekV2Attention {
         let v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
 
         // KV cache update — pre-allocated buffer with O(1) slice_update.
-        // When fuse_rope, K is stored without RoPE (position-independent).
+        // When block_needs_positioning, K is stored without RoPE (position-independent).
         let (k, v_sdpa) = crate::cache::kv_cache_update(cache, &k, &v_sdpa)?;
 
-        // When fuse_rope, apply RoPE to the PE portion of cached K with offset 0.
-        let k = if self.fuse_rope {
+        // When block_needs_positioning, apply RoPE to the PE portion of cached K with offset 0.
+        let k = if self.block_needs_positioning {
             let nope_dim = self.qk_nope_head_dim as i32;
             let k_nope = k.try_index((.., .., .., ..nope_dim))?;
             let k_pe = k.try_index((.., .., .., nope_dim..))?;
@@ -1437,12 +1437,12 @@ impl MlxQuantizedDeepSeekV2Attention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let q_pe = if self.fuse_rope {
+            let q_pe = if self.block_needs_positioning {
                 crate::models::llama::apply_rope_to_cached_k(&q_pe, &self.rope, offset)?
             } else {
                 self.rope.forward((&q_pe, offset))?
             };
-            let k_pe = if !self.fuse_rope {
+            let k_pe = if !self.block_needs_positioning {
                 self.rope.forward((&k_pe, offset))?
             } else {
                 k_pe
@@ -1476,11 +1476,11 @@ impl MlxQuantizedDeepSeekV2Attention {
             let v_sdpa = v_padded.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
 
             // KV cache update.
-            // When fuse_rope, K is stored without RoPE (position-independent).
+            // When block_needs_positioning, K is stored without RoPE (position-independent).
             let (k, v_sdpa) = crate::cache::kv_cache_update(&mut caches[i], &k, &v_sdpa)?;
 
-            // When fuse_rope, apply RoPE to the PE portion of cached K with offset 0.
-            let k = if self.fuse_rope {
+            // When block_needs_positioning, apply RoPE to the PE portion of cached K with offset 0.
+            let k = if self.block_needs_positioning {
                 let nope_dim = self.qk_nope_head_dim as i32;
                 let k_nope = k.try_index((.., .., .., ..nope_dim))?;
                 let k_pe = k.try_index((.., .., .., nope_dim..))?;
@@ -2372,7 +2372,7 @@ mod tests {
                 v_head_dim: config.v_head_dim,
                 kv_lora_rank: config.kv_lora_rank,
                 scale: 1.0 / (config.qk_head_dim() as f32).sqrt(),
-                fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+                block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
             };
 
             // Build quantized MLP (dense for this test config — no MoE).

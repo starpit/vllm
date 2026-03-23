@@ -4,12 +4,62 @@
 //! Request and request-status types, ported from `vllm/v1/request.py`.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::engine_io::FinishReason;
 use crate::multimodal::MultimodalData;
 use crate::sampling::SamplingParams;
+
+// ---------------------------------------------------------------------------
+// BlockKind — span annotation for block hashing
+// ---------------------------------------------------------------------------
+
+/// Annotation for a block's hashing behavior in the span-aware cache.
+///
+/// The `/v1/query/execute` endpoint produces a sparse map of block indices to
+/// `BlockKind` values. The block hasher reads these annotations to decide
+/// parent-hash chaining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockKind {
+    /// Position-independent block: parent hash is reset to `NONE_HASH`,
+    /// making this block cacheable regardless of where it appears in the
+    /// sequence.
+    Relocatable,
+    /// Prefix-dependent block: all preceding tokens are folded into the hash,
+    /// forcing recomputation when any prior context differs.
+    Prefixed,
+}
+
+/// Sparse map of block index to [`BlockKind`] for span-aware block hashing.
+pub type BlockAnnotations = BTreeMap<usize, BlockKind>;
+
+/// Compute per-block RoPE rotation flags for a single block.
+///
+/// Returns `(is_relocatable, is_unrotated)`:
+/// - `is_relocatable`: true if the block is annotated as [`BlockKind::Relocatable`].
+///   Post-attention un-rotation will remove RoPE from this block.
+/// - `is_unrotated`: true if the block was written in a prior step (its K is
+///   currently stored without RoPE). Pre-attention rotation will apply RoPE.
+///
+/// `block_idx`: logical block index in the sequence.
+/// `block_size`: tokens per block.
+/// `seq_len`: total sequence length.
+/// `tokens_before`: number of tokens computed before this step.
+pub fn compute_block_flags(
+    annotations: &BlockAnnotations,
+    block_idx: usize,
+    block_size: usize,
+    seq_len: usize,
+    tokens_before: usize,
+) -> (bool, bool) {
+    let is_relocatable = annotations.get(&block_idx) == Some(&BlockKind::Relocatable);
+    let block_end_pos = ((block_idx + 1) * block_size).min(seq_len);
+    let was_previously_written = block_end_pos <= tokens_before;
+    let is_unrotated = is_relocatable && was_previously_written;
+    (is_relocatable, is_unrotated)
+}
 
 // ---------------------------------------------------------------------------
 // RequestStatus
@@ -162,6 +212,23 @@ pub struct Request {
     /// Set once at request creation, consumed during the first prefill step.
     #[serde(skip)]
     pub mm_data: Option<MultimodalData>,
+
+    /// Sparse map of block index → [`BlockKind`] for span-aware block hashing.
+    /// Only blocks with non-default hashing behavior are present.
+    /// `None` means all blocks use normal parent-chained hashing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_annotations: Option<BlockAnnotations>,
+
+    /// 🦭 When true, pad and hash the final partial block on completion so
+    /// future requests can get a cache hit on this request's full output.
+    #[serde(default)]
+    pub seal: bool,
+
+    /// When true, deprioritize this request's cached blocks for eviction
+    /// after generation completes. Used for one-shot consumers like inner
+    /// generates in a nested generation pattern.
+    #[serde(default)]
+    pub volatile: bool,
 }
 
 impl Request {
@@ -203,6 +270,9 @@ impl Request {
             num_output_placeholders: 0,
             is_pooling: false,
             mm_data: None,
+            block_annotations: None,
+            seal: false,
+            volatile: false,
         }
     }
 
@@ -479,5 +549,93 @@ mod tests {
         let json = serde_json::to_string(&status).unwrap();
         let status2: RequestStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(status, status2);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_block_flags tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_block_flags_unannotated_block() {
+        // No annotations → never flagged, regardless of position or timing.
+        let ann = BTreeMap::new();
+        let (is_reloc, is_unrot) = compute_block_flags(&ann, 0, 16, 64, 32);
+        assert!(!is_reloc);
+        assert!(!is_unrot);
+    }
+
+    #[test]
+    fn test_block_flags_relocatable_freshly_written() {
+        // Relocatable block written THIS step: is_relocatable=true,
+        // is_unrotated=false (K has RoPE from QKV projection).
+        let mut ann = BTreeMap::new();
+        ann.insert(0, BlockKind::Relocatable);
+        // block 0, block_size=4, seq_len=8, tokens_before=0 (all new)
+        let (is_reloc, is_unrot) = compute_block_flags(&ann, 0, 4, 8, 0);
+        assert!(is_reloc);
+        assert!(!is_unrot); // freshly written → still has RoPE
+    }
+
+    #[test]
+    fn test_block_flags_relocatable_previously_cached() {
+        // Relocatable block from a prior step: is_relocatable=true,
+        // is_unrotated=true (post-attention un-rotated it last step).
+        let mut ann = BTreeMap::new();
+        ann.insert(0, BlockKind::Relocatable);
+        // block 0, block_size=4, seq_len=8, tokens_before=4 (block 0 fully cached)
+        let (is_reloc, is_unrot) = compute_block_flags(&ann, 0, 4, 8, 4);
+        assert!(is_reloc);
+        assert!(is_unrot); // prior step → K is unrotated
+    }
+
+    #[test]
+    fn test_block_flags_prefixed_never_flagged() {
+        // Prefixed blocks are NOT Relocatable — they should never be
+        // flagged for rotation, regardless of cache state.
+        let mut ann = BTreeMap::new();
+        ann.insert(2, BlockKind::Prefixed);
+        let (is_reloc, is_unrot) = compute_block_flags(&ann, 2, 4, 16, 12);
+        assert!(!is_reloc);
+        assert!(!is_unrot);
+    }
+
+    #[test]
+    fn test_block_flags_mixed_annotations() {
+        // Sequence: [Relocatable, Relocatable, Prefixed]
+        // All previously cached (tokens_before covers all).
+        let mut ann = BTreeMap::new();
+        ann.insert(0, BlockKind::Relocatable);
+        ann.insert(1, BlockKind::Relocatable);
+        ann.insert(2, BlockKind::Prefixed);
+
+        let block_size = 4;
+        let seq_len = 12;
+        let tokens_before = 12; // all cached
+
+        // Block 0: Relocatable, cached → unrotated
+        let (r, u) = compute_block_flags(&ann, 0, block_size, seq_len, tokens_before);
+        assert!(r);
+        assert!(u);
+
+        // Block 1: Relocatable, cached → unrotated
+        let (r, u) = compute_block_flags(&ann, 1, block_size, seq_len, tokens_before);
+        assert!(r);
+        assert!(u);
+
+        // Block 2: Prefixed → not flagged
+        let (r, u) = compute_block_flags(&ann, 2, block_size, seq_len, tokens_before);
+        assert!(!r);
+        assert!(!u);
+    }
+
+    #[test]
+    fn test_block_flags_partially_written_block() {
+        // Block is being written this step (block_end > tokens_before).
+        let mut ann = BTreeMap::new();
+        ann.insert(1, BlockKind::Relocatable);
+        // block 1 spans positions 4..8, tokens_before=6 → partially written
+        let (is_reloc, is_unrot) = compute_block_flags(&ann, 1, 4, 8, 6);
+        assert!(is_reloc);
+        assert!(!is_unrot); // not fully cached → freshly written
     }
 }

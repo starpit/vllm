@@ -246,7 +246,7 @@ struct MlxGemma2Attention {
     sliding_window: Option<usize>,
     /// When true, K is stored without RoPE and RoPE is applied to the full
     /// cached K at attention time (relocatable span blocks).
-    fuse_rope: bool,
+    block_needs_positioning: bool,
 }
 
 impl MlxGemma2Attention {
@@ -282,7 +282,7 @@ impl MlxGemma2Attention {
             scale: config.query_pre_attn_scalar.powf(-0.5),
             attn_logit_softcapping: config.attn_logit_softcapping,
             sliding_window: layer_sliding_window,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
         })
     }
 
@@ -336,7 +336,7 @@ impl MlxGemma2Attention {
             .expand_dims(0)?;
 
         // RoPE + KV cache
-        let (q, mut k, mut v) = if self.fuse_rope {
+        let (q, mut k, mut v) = if self.block_needs_positioning {
             let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, rope_offset)?;
             let (mut k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
             k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
@@ -422,7 +422,7 @@ impl MlxGemma2Attention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let (q, k, v) = if self.fuse_rope {
+            let (q, k, v) = if self.block_needs_positioning {
                 let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, offset)?;
                 let (mut k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
                 k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
@@ -885,7 +885,7 @@ struct MlxQuantizedGemma2Attention {
     sliding_window: Option<usize>,
     /// When true, K is stored without RoPE and RoPE is applied to the full
     /// cached K at attention time (relocatable span blocks).
-    fuse_rope: bool,
+    block_needs_positioning: bool,
 }
 
 impl MlxQuantizedGemma2Attention {
@@ -932,7 +932,7 @@ impl MlxQuantizedGemma2Attention {
             scale: config.query_pre_attn_scalar.powf(-0.5),
             attn_logit_softcapping: config.attn_logit_softcapping,
             sliding_window: layer_sliding_window,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
         }
     }
 
@@ -962,7 +962,7 @@ impl MlxQuantizedGemma2Attention {
             .expand_dims(0)?;
 
         // RoPE + KV cache
-        let (q, mut k, mut v) = if self.fuse_rope {
+        let (q, mut k, mut v) = if self.block_needs_positioning {
             let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, rope_offset)?;
             let (mut k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
             k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;
@@ -1045,7 +1045,7 @@ impl MlxQuantizedGemma2Attention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let (q, k, v) = if self.fuse_rope {
+            let (q, k, v) = if self.block_needs_positioning {
                 let q = crate::models::llama::apply_rope_to_cached_k(&q, &self.rope, offset)?;
                 let (mut k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
                 k = crate::models::llama::apply_rope_to_cached_k(&k, &self.rope, 0)?;

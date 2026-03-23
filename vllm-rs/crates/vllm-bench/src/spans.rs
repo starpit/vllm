@@ -132,37 +132,50 @@ fn pad_to_block(tokens: &[u32], block_size: usize, pad_token: u32) -> Vec<u32> {
     padded
 }
 
-fn make_document(
-    doc_id: u32,
-    block_size: usize,
-    doc_blocks: usize,
-    span_token: u32,
-    pad_token: u32,
-) -> Vec<u32> {
+fn make_document(doc_id: u32, block_size: usize, doc_blocks: usize, pad_token: u32) -> Vec<u32> {
     let mut tokens = Vec::with_capacity(block_size * doc_blocks);
     for b in 0..doc_blocks {
-        tokens.push(span_token);
-        for j in 1..block_size {
+        for j in 0..block_size {
             tokens.push(1000 + doc_id * 1000 + b as u32 * 100 + j as u32);
         }
     }
     pad_to_block(&tokens, block_size, pad_token)
 }
 
+/// Build a prompt from ordered documents + query.
+/// When `with_annotations` is true, each document's blocks are annotated as
+/// `Relocatable` for span-aware caching.
 fn build_prompt(
     documents: &[Vec<u32>],
     order: &[usize],
     query_base: u32,
     query_len: usize,
-) -> Vec<u32> {
-    let mut prompt = Vec::new();
+    block_size: usize,
+    with_annotations: bool,
+) -> Prompt {
+    let mut tokens = Vec::new();
+    let mut annotations = std::collections::BTreeMap::new();
+
     for &doc_idx in order {
-        prompt.extend_from_slice(&documents[doc_idx]);
+        let doc = &documents[doc_idx];
+        let start_block = tokens.len() / block_size;
+        tokens.extend_from_slice(doc);
+        if with_annotations {
+            let end_block = tokens.len() / block_size;
+            for b in start_block..end_block {
+                annotations.insert(b, vllm_common::BlockKind::Relocatable);
+            }
+        }
     }
     for j in 0..query_len {
-        prompt.push(query_base + j as u32);
+        tokens.push(query_base + j as u32);
     }
-    prompt
+
+    if with_annotations && !annotations.is_empty() {
+        Prompt::TokenIdsWithAnnotations(tokens, annotations)
+    } else {
+        Prompt::TokenIds(tokens)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -216,27 +229,23 @@ fn build_llm(args: &BenchSpansArgs, prefix_caching: bool) -> Result<LLM> {
 pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
     vllm_common::telemetry::init_tracing(&args.log_level);
 
+    if let Some(n) = args.nested {
+        return run_bench_nested(&args, n);
+    }
+
     let block_size = args.block_size;
     let num_docs = args.num_docs;
     let doc_blocks = args.doc_blocks;
     let query_len = args.query_len;
-    let span_token = args.span_token;
     let pad_token = args.pad_token;
     let doc_tokens = doc_blocks * block_size;
     let total_cached = num_docs * doc_tokens;
     let max_perms = args.max_perms;
 
-    // Documents WITH span tokens (order-independent caching).
-    let docs_with_spans: Vec<Vec<u32>> = (0..num_docs as u32)
-        .map(|i| make_document(i, block_size, doc_blocks, span_token, pad_token))
-        .collect();
-
-    // Documents WITHOUT span tokens (normal prefix caching, order-dependent).
-    // Use a regular filler token instead of the span token so block hashes
-    // chain normally — reordering breaks cache hits.
-    let no_span_filler = span_token.wrapping_add(1); // any token that isn't span_token
-    let docs_no_spans: Vec<Vec<u32>> = (0..num_docs as u32)
-        .map(|i| make_document(i, block_size, doc_blocks, no_span_filler, pad_token))
+    // All documents use the same token data — the difference is whether
+    // block annotations are provided (relocatable caching) or not.
+    let docs: Vec<Vec<u32>> = (0..num_docs as u32)
+        .map(|i| make_document(i, block_size, doc_blocks, pad_token))
         .collect();
 
     let perms = permutations(num_docs, max_perms);
@@ -281,7 +290,8 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
                      docs: &[Vec<u32>],
                      perms: &[Vec<usize>],
                      query_base_start: u32,
-                     label: &str|
+                     label: &str,
+                     with_annotations: bool|
      -> Result<(f64, Vec<f64>)> {
         // Populate cache with canonical order.
         llm.reset_prefix_cache()?;
@@ -291,9 +301,16 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
             .with_message(format!("{perm_str}  {DIM}populate ({label})...{RST}"));
         pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
-        let populate_prompt = build_prompt(docs, &canonical, query_base_start, query_len);
+        let populate_prompt = build_prompt(
+            docs,
+            &canonical,
+            query_base_start,
+            query_len,
+            block_size,
+            with_annotations,
+        );
         let pop_start = Instant::now();
-        llm.generate(&[Prompt::TokenIds(populate_prompt)], Some(sampling.clone()))?;
+        llm.generate(&[populate_prompt], Some(sampling.clone()))?;
         let populate_ms = pop_start.elapsed().as_secs_f64() * 1000.0;
 
         pb.finish_and_clear();
@@ -314,9 +331,16 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
                 ));
             pb.enable_steady_tick(std::time::Duration::from_millis(80));
 
-            let prompt = build_prompt(docs, perm, query_base, query_len);
+            let prompt = build_prompt(
+                docs,
+                perm,
+                query_base,
+                query_len,
+                block_size,
+                with_annotations,
+            );
             let start = Instant::now();
-            llm.generate(&[Prompt::TokenIds(prompt)], Some(sampling.clone()))?;
+            llm.generate(&[prompt], Some(sampling.clone()))?;
             let ms = start.elapsed().as_secs_f64() * 1000.0;
 
             pb.finish_and_clear();
@@ -327,27 +351,22 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Without spans: documents use a regular token instead of span_token.
+    // Without spans: no block annotations.
     // Normal prefix caching — block hashes chain by position, so reordering
     // documents breaks cache hits.
     // -----------------------------------------------------------------------
     eprintln!();
     eprintln!("{BOLD}Without spans{RST} {DIM}(prefix caching, order-dependent){RST}");
 
-    unsafe {
-        std::env::set_var("VLLM_V1_SPANS_ENABLED", "true");
-        std::env::set_var("VLLM_V1_SPANS_TOKEN_PLUS", span_token.to_string());
-    }
-
     let mut llm = build_llm(&args, true)?;
     // Skip perms[0] (canonical order) — it's the populate step and would
     // always cache-hit even without spans, biasing results.
     let test_perms: Vec<Vec<usize>> = perms.iter().filter(|p| *p != &canonical).cloned().collect();
     let (no_spans_populate, no_spans_latencies) =
-        run_perms(&mut llm, &docs_no_spans, &test_perms, 50000, "no spans")?;
+        run_perms(&mut llm, &docs, &test_perms, 50000, "no spans", false)?;
 
     // -----------------------------------------------------------------------
-    // With spans: documents use span_token at block boundaries.
+    // With spans: documents have Relocatable block annotations.
     // Span-aware hashing resets parent chain — blocks cache independently
     // of position, so reordering still gets full cache hits.
     // -----------------------------------------------------------------------
@@ -355,14 +374,9 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
     eprintln!("{BOLD}With spans{RST} {DIM}(prefix caching, order-independent){RST}");
 
     let (spans_populate, spans_latencies) =
-        run_perms(&mut llm, &docs_with_spans, &test_perms, 60000, "spans")?;
+        run_perms(&mut llm, &docs, &test_perms, 60000, "spans", true)?;
 
     drop(llm);
-
-    unsafe {
-        std::env::remove_var("VLLM_V1_SPANS_ENABLED");
-        std::env::remove_var("VLLM_V1_SPANS_TOKEN_PLUS");
-    }
 
     // -----------------------------------------------------------------------
     // Summary
@@ -404,6 +418,170 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
         speedups.first().unwrap_or(&0.0),
         p50(&speedups),
         speedups.last().unwrap_or(&0.0),
+    );
+    println!();
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Nested generate benchmark
+// ---------------------------------------------------------------------------
+
+fn run_bench_nested(args: &BenchSpansArgs, num_inner: usize) -> Result<()> {
+    let block_size = args.block_size;
+    let pad_token = args.pad_token;
+    let query_len = args.query_len;
+    let inner_tokens = args.inner_tokens;
+
+    let mut llm = build_llm(args, true)?;
+
+    let inner_sampling = SamplingParams {
+        max_tokens: Some(inner_tokens),
+        temperature: 0.0,
+        ignore_eos: true,
+        detokenize: false,
+        ..SamplingParams::default()
+    };
+
+    let outer_sampling = SamplingParams {
+        max_tokens: Some(1),
+        temperature: 0.0,
+        ignore_eos: true,
+        detokenize: false,
+        ..SamplingParams::default()
+    };
+
+    eprintln!();
+    eprintln!("{BOLD}vLLM Rust \u{2014} nested spans benchmark{RST}");
+    eprintln!("  {num_inner} inner generates x {inner_tokens} tokens each + {query_len} query");
+    eprintln!();
+
+    // -----------------------------------------------------------------------
+    // Step 1: Run N inner generates with seal=true.
+    // Each inner generate's output is padded and cached so the outer
+    // generate can hit it.
+    // -----------------------------------------------------------------------
+    eprintln!("{BOLD}Step 1:{RST} Run {num_inner} inner generates (seal=true)");
+
+    // Store full inner sequences (prompt + output) for the outer prompt.
+    let mut inner_sequences: Vec<Vec<u32>> = Vec::with_capacity(num_inner);
+    for i in 0..num_inner {
+        // Each inner generate has a unique synthetic prompt (one block).
+        let prompt_tokens: Vec<u32> = (0..block_size)
+            .map(|j| 2000 + i as u32 * 1000 + j as u32)
+            .collect();
+
+        let prompt = Prompt::TokenIds(prompt_tokens.clone());
+
+        let start = Instant::now();
+        let results = llm.generate_sealed(&[prompt], Some(inner_sampling.clone()), true, true)?;
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        let output_tokens = &results[0].outputs[0].token_ids;
+        eprintln!(
+            "    inner[{i}]  {BOLD}{ms:>8.1}ms{RST}  {DIM}{} prompt + {} output tokens{RST}",
+            prompt_tokens.len(),
+            output_tokens.len()
+        );
+        // Full sequence = prompt + output (matches what's in KV cache).
+        let mut full_seq = prompt_tokens;
+        full_seq.extend_from_slice(output_tokens);
+        inner_sequences.push(full_seq);
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 2: Build outer prompt from full inner sequences + query.
+    // Each inner sequence (prompt + output) is padded to a block boundary
+    // and annotated as Relocatable. The token content must match what was
+    // sealed in the KV cache for cache hits.
+    // -----------------------------------------------------------------------
+    let mut outer_tokens = Vec::new();
+    let mut annotations = std::collections::BTreeMap::new();
+
+    for seq in &inner_sequences {
+        // Pad to block boundary before each inner sequence.
+        let remainder = outer_tokens.len() % block_size;
+        if remainder > 0 {
+            let pad_count = block_size - remainder;
+            outer_tokens.extend(std::iter::repeat_n(pad_token, pad_count));
+        }
+        let start_block = outer_tokens.len() / block_size;
+        outer_tokens.extend_from_slice(seq);
+        // Pad the sequence itself to block boundary.
+        let remainder = outer_tokens.len() % block_size;
+        if remainder > 0 {
+            let pad_count = block_size - remainder;
+            outer_tokens.extend(std::iter::repeat_n(pad_token, pad_count));
+        }
+        let end_block = outer_tokens.len() / block_size;
+        for b in start_block..end_block {
+            annotations.insert(b, vllm_common::BlockKind::Relocatable);
+        }
+    }
+    let total_inner_tokens = outer_tokens.len();
+
+    // Build two outer prompts with different query suffixes.
+    let make_outer = |query_id: u32| -> Vec<u32> {
+        let mut tokens = outer_tokens.clone();
+        for j in 0..query_len {
+            tokens.push(90000 + query_id * 1000 + j as u32);
+        }
+        tokens
+    };
+
+    let outer_baseline = make_outer(0);
+    let outer_spans = make_outer(1);
+
+    eprintln!();
+    eprintln!(
+        "  Outer prompt: {} tokens ({total_inner_tokens} from inner outputs, {query_len} query)",
+        outer_baseline.len()
+    );
+
+    // -----------------------------------------------------------------------
+    // Step 2: Outer WITHOUT annotations (baseline — full recompute).
+    // -----------------------------------------------------------------------
+    eprintln!();
+    eprintln!("{BOLD}Step 2:{RST} Outer generate WITHOUT annotations (baseline)");
+
+    let start = Instant::now();
+    llm.generate(
+        &[Prompt::TokenIds(outer_baseline)],
+        Some(outer_sampling.clone()),
+    )?;
+    let baseline_ms = start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("    {BOLD}{baseline_ms:>8.1}ms{RST}  {DIM}full recompute{RST}");
+
+    // -----------------------------------------------------------------------
+    // Step 3: Outer WITH Relocatable annotations.
+    // The inner output blocks have matching content in the KV cache from
+    // step 1 (if seal worked). The scheduler should detect cache hits for
+    // those blocks and skip their recomputation.
+    // -----------------------------------------------------------------------
+    eprintln!();
+    eprintln!("{BOLD}Step 3:{RST} Outer generate WITH Relocatable annotations");
+
+    let start = Instant::now();
+    llm.generate(
+        &[Prompt::TokenIdsWithAnnotations(outer_spans, annotations)],
+        Some(outer_sampling.clone()),
+    )?;
+    let spans_ms = start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("    {BOLD}{spans_ms:>8.1}ms{RST}  {DIM}span cache hit{RST}");
+
+    drop(llm);
+
+    // -----------------------------------------------------------------------
+    // Summary
+    // -----------------------------------------------------------------------
+    eprintln!();
+    println!("{BOLD}=== Nested Spans Results ==={RST}");
+    println!();
+    println!("  Baseline (no annotations):  {BOLD}{baseline_ms:>8.1}ms{RST}");
+    println!(
+        "  With Relocatable:           {BOLD}{spans_ms:>8.1}ms{RST}  ({BOLD}{:.1}x{RST} speedup)",
+        baseline_ms / spans_ms
     );
     println!();
 

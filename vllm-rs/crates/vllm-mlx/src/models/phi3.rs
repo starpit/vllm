@@ -129,7 +129,7 @@ impl Phi3Rope {
         }
     }
 
-    /// Apply RoPE to Q only (used with fuse_rope).
+    /// Apply RoPE to Q only (used with block_needs_positioning).
     fn apply_q_only(&mut self, q: &Array, offset: i32) -> Result<Array, Exception> {
         match self {
             Self::Standard(rope) => rope.forward((q, offset)),
@@ -163,7 +163,7 @@ impl Phi3Rope {
         }
     }
 
-    /// Apply RoPE to K only (used with fuse_rope after cache update).
+    /// Apply RoPE to K only (used with block_needs_positioning after cache update).
     fn apply_k_only(&mut self, k: &Array, offset: i32) -> Result<Array, Exception> {
         match self {
             Self::Standard(rope) => rope.forward((k, offset)),
@@ -346,7 +346,7 @@ struct MlxPhi3Attention {
     q_size: usize,
     kv_size: usize,
     sliding_window: Option<usize>,
-    fuse_rope: bool,
+    block_needs_positioning: bool,
 }
 
 impl MlxPhi3Attention {
@@ -371,7 +371,7 @@ impl MlxPhi3Attention {
             q_size,
             kv_size,
             sliding_window: config.sliding_window,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
         })
     }
 
@@ -419,7 +419,7 @@ impl MlxPhi3Attention {
             .expand_dims(0)?;
 
         // RoPE (supports partial rotation + LongRoPE).
-        let (q, k) = if self.fuse_rope {
+        let (q, k) = if self.block_needs_positioning {
             let q = match &self.rope {
                 Phi3Rope::Standard(rope) => {
                     crate::models::llama::apply_rope_to_cached_k(&q, rope, rope_offset)?
@@ -432,11 +432,11 @@ impl MlxPhi3Attention {
         };
 
         // KV cache update — pre-allocated buffer with O(1) slice_update.
-        // When fuse_rope, K is stored without RoPE (position-independent).
+        // When block_needs_positioning, K is stored without RoPE (position-independent).
         let (mut k, mut v) = crate::cache::kv_cache_update(cache, &k, &v)?;
 
-        // When fuse_rope, apply RoPE to full cached K with offset 0.
-        if self.fuse_rope {
+        // When block_needs_positioning, apply RoPE to full cached K with offset 0.
+        if self.block_needs_positioning {
             k = match &self.rope {
                 Phi3Rope::Standard(rope) => {
                     crate::models::llama::apply_rope_to_cached_k(&k, rope, 0)?
@@ -528,7 +528,7 @@ impl MlxPhi3Attention {
                 .expand_dims(0)?;
 
             // RoPE (supports partial rotation + LongRoPE).
-            let (q, k) = if self.fuse_rope {
+            let (q, k) = if self.block_needs_positioning {
                 let q = match &self.rope {
                     Phi3Rope::Standard(rope) => {
                         crate::models::llama::apply_rope_to_cached_k(&q, rope, offset)?
@@ -541,11 +541,11 @@ impl MlxPhi3Attention {
             };
 
             // KV cache update.
-            // When fuse_rope, K is stored without RoPE (position-independent).
+            // When block_needs_positioning, K is stored without RoPE (position-independent).
             let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
 
-            // When fuse_rope, apply RoPE to full cached K with offset 0.
-            let k = if self.fuse_rope {
+            // When block_needs_positioning, apply RoPE to full cached K with offset 0.
+            let k = if self.block_needs_positioning {
                 match &self.rope {
                     Phi3Rope::Standard(rope) => {
                         crate::models::llama::apply_rope_to_cached_k(&k, rope, 0)?
@@ -943,7 +943,7 @@ struct MlxQuantizedPhi3Attention {
     q_size: usize,
     kv_size: usize,
     sliding_window: Option<usize>,
-    fuse_rope: bool,
+    block_needs_positioning: bool,
 }
 
 impl MlxQuantizedPhi3Attention {
@@ -974,7 +974,7 @@ impl MlxQuantizedPhi3Attention {
             q_size: config.num_attention_heads * config.head_dim,
             kv_size: config.num_kv_heads * config.head_dim,
             sliding_window: config.sliding_window,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
         }
     }
 
@@ -1005,7 +1005,7 @@ impl MlxQuantizedPhi3Attention {
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        let (q, k) = if self.fuse_rope {
+        let (q, k) = if self.block_needs_positioning {
             let q = match &self.rope {
                 Phi3Rope::Standard(rope) => {
                     crate::models::llama::apply_rope_to_cached_k(&q, rope, rope_offset)?
@@ -1018,11 +1018,11 @@ impl MlxQuantizedPhi3Attention {
         };
 
         // KV cache update — pre-allocated buffer with O(1) slice_update.
-        // When fuse_rope, K is stored without RoPE (position-independent).
+        // When block_needs_positioning, K is stored without RoPE (position-independent).
         let (mut k, mut v) = crate::cache::kv_cache_update(cache, &k, &v)?;
 
-        // When fuse_rope, apply RoPE to full cached K with offset 0.
-        if self.fuse_rope {
+        // When block_needs_positioning, apply RoPE to full cached K with offset 0.
+        if self.block_needs_positioning {
             k = match &self.rope {
                 Phi3Rope::Standard(rope) => {
                     crate::models::llama::apply_rope_to_cached_k(&k, rope, 0)?
@@ -1103,7 +1103,7 @@ impl MlxQuantizedPhi3Attention {
                 .transpose_axes(&[1, 0, 2])?
                 .expand_dims(0)?;
 
-            let (q, k) = if self.fuse_rope {
+            let (q, k) = if self.block_needs_positioning {
                 let q = match &self.rope {
                     Phi3Rope::Standard(rope) => {
                         crate::models::llama::apply_rope_to_cached_k(&q, rope, offset)?
@@ -1115,11 +1115,11 @@ impl MlxQuantizedPhi3Attention {
                 self.rope.apply(&q, &k, offset)?
             };
 
-            // When fuse_rope, K is stored without RoPE (position-independent).
+            // When block_needs_positioning, K is stored without RoPE (position-independent).
             let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
 
-            // When fuse_rope, apply RoPE to full cached K with offset 0.
-            let k = if self.fuse_rope {
+            // When block_needs_positioning, apply RoPE to full cached K with offset 0.
+            let k = if self.block_needs_positioning {
                 match &self.rope {
                     Phi3Rope::Standard(rope) => {
                         crate::models::llama::apply_rope_to_cached_k(&k, rope, 0)?

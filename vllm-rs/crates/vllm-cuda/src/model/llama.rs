@@ -1368,6 +1368,25 @@ impl LlamaAttention {
 
         let o_proj = LinearLayer::Dense(Linear::load(weights, &format!("{prefix}.o_proj"))?);
 
+        // Auto-detect QK-norm weights (Qwen3, Gemma3, etc.).
+        let q_norm_name = format!("{prefix}.q_norm.weight");
+        let k_norm_name = format!("{prefix}.k_norm.weight");
+        let q_norm_weight = if weights.contains(&q_norm_name) {
+            Some(weights.take(&q_norm_name)?)
+        } else {
+            None
+        };
+        let k_norm_weight = if weights.contains(&k_norm_name) {
+            Some(weights.take(&k_norm_name)?)
+        } else {
+            None
+        };
+        let qk_norm_eps = if q_norm_weight.is_some() {
+            config.rms_norm_eps
+        } else {
+            0.0
+        };
+
         Ok(Self {
             qkv_proj,
             k_proj: None,
@@ -1380,9 +1399,9 @@ impl LlamaAttention {
             head_dim,
             scale: 1.0 / (head_dim as f32).sqrt(),
             layer_idx,
-            q_norm_weight: None,
-            k_norm_weight: None,
-            qk_norm_eps: 0.0,
+            q_norm_weight,
+            k_norm_weight,
+            qk_norm_eps,
             block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,

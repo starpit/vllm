@@ -578,17 +578,24 @@ impl LlamaAttention {
                     device.compute_stream,
                 );
                 drop(qkv);
-                kernels::qk_norm_rope_inplace(
+                // QK-norm (no RoPE on K — FA2 handles it on read).
+                kernels::qk_norm_inplace(
                     q.as_gpu_tensor(),
                     k.as_gpu_tensor(),
                     q_norm_w,
                     k_norm_w,
-                    rotary.cos_sin_cache,
-                    *positions,
                     self.num_q_heads,
                     self.num_kv_heads,
                     self.head_dim,
                     self.qk_norm_eps,
+                    device.compute_stream,
+                );
+                kernels::rotary_embedding_q_only(
+                    q.as_gpu_tensor(),
+                    *positions,
+                    rotary.cos_sin_cache,
+                    self.num_q_heads,
+                    self.head_dim,
                     device.compute_stream,
                 );
                 (q, k, v)
@@ -740,8 +747,8 @@ impl LlamaAttention {
                             device.num_sm,
                             &mut device.caching,
                             device.compute_stream,
-                            std::ptr::null(),
-                            0,
+                            rotary.cos_sin_cache.raw_ptr() as *const u8,
+                            rotary.cos_sin_cache.dim(1),
                         )
                     },
                 );
@@ -910,8 +917,8 @@ impl LlamaAttention {
                     device.num_sm,
                     &mut device.caching,
                     device.compute_stream,
-                    std::ptr::null(),
-                    0,
+                    rotary.cos_sin_cache.raw_ptr() as *const u8,
+                    rotary.cos_sin_cache.dim(1),
                 )
             },
         );

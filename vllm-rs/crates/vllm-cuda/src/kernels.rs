@@ -3132,6 +3132,8 @@ pub unsafe fn flash_attn_contiguous(
     window_size_left: i32,
     alloc: &mut CachingAllocator,
     stream: CUstream,
+    cos_sin_cache_ptr: *const u8,
+    rotary_dim: usize,
 ) -> OwnedTensor {
     let total_q = q.dim(0);
     let num_heads = q.dim(1);
@@ -3185,10 +3187,10 @@ pub unsafe fn flash_attn_contiguous(
         std::ptr::null_mut(),
         0, // seqlenq_ngroups_swapped = false
         total_q as i32,
-        std::ptr::null(), // rotary_cos_ptr (spans)
-        std::ptr::null(), // rotary_sin_ptr (spans)
-        0,                // rotary_dim (spans)
-        0,                // rotate_cached_k (spans)
+        cos_sin_cache_ptr as *const c_void, // rotary_cos_ptr (spans)
+        std::ptr::null(),                   // rotary_sin_ptr (spans)
+        rotary_dim as i32,                  // rotary_dim (spans)
+        if cos_sin_cache_ptr.is_null() { 0 } else { 1 }, // rotate_cached_k (spans)
         stream,
     );
 

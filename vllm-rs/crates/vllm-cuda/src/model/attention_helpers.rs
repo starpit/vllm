@@ -145,7 +145,7 @@ pub unsafe fn attention_standard(
 
     if fresh_prefill {
         // Fresh prefill: use BF16 K/V from QKV projection (no cache read).
-        // No fused RoPE needed — fresh K is already rotated.
+        // Pass cos_sin_cache so FA2 can apply RoPE to contiguous K if needed.
         kernels::flash_attn_contiguous(
             *q,
             *k,
@@ -160,6 +160,8 @@ pub unsafe fn attention_standard(
             -1,
             alloc,
             stream,
+            cos_sin_cache_ptr,
+            rotary_dim,
         )
     } else if kv_cache.is_fp8() {
         // FP8 decode: dequant pages → contiguous FA2.
@@ -308,6 +310,8 @@ pub unsafe fn attention_ext(
             window_size_left,
             alloc,
             stream,
+            cos_sin_cache_ptr,
+            rotary_dim,
         )
     } else if kv_cache.is_fp8() {
         fp8_decode_attention(
@@ -438,6 +442,8 @@ unsafe fn fp8_decode_attention(
             window_size_left,
             alloc,
             stream,
+            std::ptr::null(),
+            0,
         );
     }
 
@@ -513,6 +519,8 @@ unsafe fn fp8_decode_attention(
         window_size_left,
         alloc,
         stream,
+        std::ptr::null(),
+        0,
     )
 }
 
@@ -606,6 +614,8 @@ unsafe fn fp8_decode_attention_graphed(
         window_size_left,
         alloc,
         stream,
+        std::ptr::null(),
+        0,
     )
 }
 

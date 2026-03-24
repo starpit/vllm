@@ -342,6 +342,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
 
+        // RoPE on K after loading from cache.
+        if (params.rotate_cached_k && params.rotary_dim > 0) {
+            FLASH_NAMESPACE::rotate_k_smem_contiguous(
+                sK,
+                reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                n_block, kBlockN, params.d, params.rotary_dim,
+                tidx, Kernel_traits::kNThreads);
+            __syncthreads();
+        }
+
         // Advance gV
         if (masking_step > 0) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
@@ -417,6 +427,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         clear(acc_s);
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+
+        // RoPE on K after loading from cache.
+        if (params.rotate_cached_k && params.rotary_dim > 0) {
+            FLASH_NAMESPACE::rotate_k_smem_contiguous(
+                sK,
+                reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                n_block, kBlockN, params.d, params.rotary_dim,
+                tidx, Kernel_traits::kNThreads);
+            __syncthreads();
+        }
+
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         cute::cp_async_fence();
 

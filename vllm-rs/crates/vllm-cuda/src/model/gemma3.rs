@@ -256,14 +256,14 @@ impl Gemma3Attention {
             .view()
             .reshape(&[num_tokens, self.num_kv_heads, self.head_dim]);
 
-        // RoPE (in-place on the normed q/k).
+        // RoPE on Q only — FA2 applies RoPE to K on read.
         let q_flat_rope = q_3d.reshape(&[num_tokens, self.q_size]);
         let k_flat_rope = k_3d.reshape(&[num_tokens, self.kv_size]);
-        kernels::rotary_embedding_inplace(
+        kernels::rotary_embedding_q_only(
             *q_flat_rope,
-            *k_flat_rope,
             *positions,
             rotary.cos_sin_cache,
+            self.num_q_heads,
             self.head_dim,
             device.compute_stream,
         );
@@ -300,8 +300,8 @@ impl Gemma3Attention {
             device.num_sm,
             &mut device.caching,
             device.compute_stream,
-            std::ptr::null(),
-            0,
+            rotary.cos_sin_cache.raw_ptr() as *const u8,
+            rotary.cos_sin_cache.dim(1),
         );
         drop(k_normed);
         drop(v);

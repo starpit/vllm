@@ -817,7 +817,7 @@ impl Qwen3NextFullAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps: config.rms_norm_eps,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         };
@@ -949,14 +949,13 @@ impl Qwen3NextFullAttention {
             );
         }
 
-        // 5. Apply partial RoPE to Q and K in-place.
-        kernels::apply_rope_qk_inplace(
-            *q.view(),
-            *k.view(),
-            rotary.cos_sin_cache,
+        // 5. Apply RoPE to Q only — FA2 applies RoPE to K on read.
+        let q_flat = q.view().reshape(&[num_tokens, num_q_heads * head_dim]);
+        kernels::rotary_embedding_q_only(
+            *q_flat,
             *positions,
+            rotary.cos_sin_cache,
             num_q_heads,
-            num_kv_heads,
             head_dim,
             stream,
         );
@@ -987,8 +986,8 @@ impl Qwen3NextFullAttention {
             device.num_sm,
             &mut device.caching,
             stream,
-            std::ptr::null(),
-            0,
+            rotary.cos_sin_cache.raw_ptr() as *const u8,
+            rotary.cos_sin_cache.dim(1),
         );
         drop(k);
         drop(v);

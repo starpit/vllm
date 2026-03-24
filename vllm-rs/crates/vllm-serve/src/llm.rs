@@ -86,6 +86,8 @@ pub enum Prompt {
     Text(String),
     /// Pre-tokenized prompt token IDs (skips tokenization).
     TokenIds(Vec<u32>),
+    /// Pre-tokenized with span block annotations for relocatable caching.
+    TokenIdsWithAnnotations(Vec<u32>, vllm_common::BlockAnnotations),
 }
 
 impl From<&str> for Prompt {
@@ -394,7 +396,19 @@ impl LLM {
         prompts: &[P],
         params: Option<SamplingParams>,
     ) -> Result<Vec<RequestOutput>> {
-        self.generate_impl(prompts, params, false)
+        self.generate_impl(prompts, params, false, false, false)
+    }
+
+    /// Like [`generate`](Self::generate), but with seal/volatile lifecycle flags
+    /// applied to all requests in the batch.
+    pub fn generate_sealed<P: Into<Prompt> + Clone>(
+        &mut self,
+        prompts: &[P],
+        params: Option<SamplingParams>,
+        seal: bool,
+        volatile: bool,
+    ) -> Result<Vec<RequestOutput>> {
+        self.generate_impl(prompts, params, false, seal, volatile)
     }
 
     /// Reset the prefix cache, evicting all cached KV blocks.
@@ -410,7 +424,7 @@ impl LLM {
         prompts: &[P],
         params: Option<SamplingParams>,
     ) -> Result<Vec<RequestOutput>> {
-        self.generate_impl(prompts, params, true)
+        self.generate_impl(prompts, params, true, false, false)
     }
 
     fn generate_impl<P: Into<Prompt> + Clone>(
@@ -418,6 +432,8 @@ impl LLM {
         prompts: &[P],
         params: Option<SamplingParams>,
         use_tqdm: bool,
+        seal: bool,
+        volatile: bool,
     ) -> Result<Vec<RequestOutput>> {
         let params = params.unwrap_or_default();
         params
@@ -431,13 +447,16 @@ impl LLM {
         let prompts: Vec<Prompt> = prompts.iter().map(|p| p.clone().into()).collect();
 
         // Tokenize text prompts; pass token ID prompts through directly.
-        let prompt_token_ids: Vec<Vec<u32>> = prompts
+        let prompt_data: Vec<(Vec<u32>, Option<vllm_common::BlockAnnotations>)> = prompts
             .iter()
             .map(|p| match p {
-                Prompt::Text(text) => self.tokenize_text(text),
-                Prompt::TokenIds(ids) => Ok(ids.clone()),
+                Prompt::Text(text) => Ok((self.tokenize_text(text)?, None)),
+                Prompt::TokenIds(ids) => Ok((ids.clone(), None)),
+                Prompt::TokenIdsWithAnnotations(ids, ann) => Ok((ids.clone(), Some(ann.clone()))),
             })
             .collect::<Result<Vec<_>>>()?;
+        let prompt_token_ids: Vec<Vec<u32>> =
+            prompt_data.iter().map(|(ids, _)| ids.clone()).collect();
 
         let total = prompt_token_ids.len() * n;
         let base_id = format!("llm-{}", uuid::Uuid::new_v4());
@@ -471,6 +490,9 @@ impl LLM {
                         data_parallel_rank: None,
                         is_pooling: false,
                         mm_data: None,
+                        block_annotations: prompt_data[p_idx].1.clone(),
+                        seal,
+                        volatile,
                     })
                     .map_err(|e| anyhow::anyhow!("add_request failed: {e}"))?;
 
@@ -577,7 +599,7 @@ impl LLM {
 
             let prompt_text = match &prompts[p_idx] {
                 Prompt::Text(text) => Some(text.clone()),
-                Prompt::TokenIds(_) => None,
+                Prompt::TokenIds(_) | Prompt::TokenIdsWithAnnotations(_, _) => None,
             };
 
             results.push(RequestOutput {
@@ -687,6 +709,9 @@ impl LLM {
                 data_parallel_rank: None,
                 is_pooling: false,
                 mm_data: None,
+                block_annotations: None,
+                seal: false,
+                volatile: false,
             })
             .map_err(|e| anyhow::anyhow!("add_request failed: {e}"))?;
 
@@ -779,15 +804,24 @@ mod tests {
         let prompt = if prompts.len() == 1 {
             match &prompts[0] {
                 Prompt::Text(text) => protocol::CompletionPrompt::Single(text.clone()),
-                Prompt::TokenIds(ids) => protocol::CompletionPrompt::TokenIds(ids.clone()),
+                Prompt::TokenIds(ids) | Prompt::TokenIdsWithAnnotations(ids, _) => {
+                    protocol::CompletionPrompt::TokenIds(ids.clone())
+                }
             }
         } else {
-            let all_token_ids = prompts.iter().all(|p| matches!(p, Prompt::TokenIds(_)));
+            let all_token_ids = prompts.iter().all(|p| {
+                matches!(
+                    p,
+                    Prompt::TokenIds(_) | Prompt::TokenIdsWithAnnotations(_, _)
+                )
+            });
             if all_token_ids {
                 let seqs: Vec<Vec<u32>> = prompts
                     .iter()
                     .map(|p| match p {
-                        Prompt::TokenIds(ids) => ids.clone(),
+                        Prompt::TokenIds(ids) | Prompt::TokenIdsWithAnnotations(ids, _) => {
+                            ids.clone()
+                        }
                         Prompt::Text(_) => unreachable!(),
                     })
                     .collect();
@@ -797,7 +831,9 @@ mod tests {
                     .iter()
                     .map(|p| match p {
                         Prompt::Text(text) => text.clone(),
-                        Prompt::TokenIds(ids) => format!("<token_ids:{}>", ids.len()),
+                        Prompt::TokenIds(ids) | Prompt::TokenIdsWithAnnotations(ids, _) => {
+                            format!("<token_ids:{}>", ids.len())
+                        }
                     })
                     .collect();
                 protocol::CompletionPrompt::Multiple(texts)
@@ -845,6 +881,7 @@ mod tests {
             allowed_token_ids: params.allowed_token_ids.clone(),
             bad_words: None,
             truncate_prompt_tokens: None,
+            block_annotations: None,
         }
     }
 

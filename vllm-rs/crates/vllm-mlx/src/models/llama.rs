@@ -59,7 +59,15 @@ pub(crate) fn apply_rope_to_cached_k(
         let offset = start_pos + pos;
         // [batch, heads, 1, dim]
         let k_slice = k.try_index((.., .., pos..pos + 1, ..))?;
-        k_parts.push(mlx_rs::fast::rope(&k_slice, rope.dimensions, rope.traditional, rope.base, rope.scale, offset, None)?);
+        k_parts.push(mlx_rs::fast::rope(
+            &k_slice,
+            rope.dimensions,
+            rope.traditional,
+            rope.base,
+            rope.scale,
+            offset,
+            None,
+        )?);
     }
     let k_refs: Vec<&Array> = k_parts.iter().collect();
     mlx_rs::ops::concatenate_axis(&k_refs, 2)
@@ -91,7 +99,15 @@ pub(crate) fn apply_rope_to_cached_k_batched(
         for pos in 0..kv_len {
             let offset = start_positions[b] + pos;
             let k_slice = k_b.try_index((.., .., pos..pos + 1, ..))?;
-            pos_parts.push(mlx_rs::fast::rope(&k_slice, rope.dimensions, rope.traditional, rope.base, rope.scale, offset, None)?);
+            pos_parts.push(mlx_rs::fast::rope(
+                &k_slice,
+                rope.dimensions,
+                rope.traditional,
+                rope.base,
+                rope.scale,
+                offset,
+                None,
+            )?);
         }
         let pos_refs: Vec<&Array> = pos_parts.iter().collect();
         batch_parts.push(mlx_rs::ops::concatenate_axis(&pos_refs, 2)?);
@@ -360,7 +376,7 @@ pub struct MlxLlamaAttention {
     /// When true, K is stored without RoPE and RoPE is applied to the full
     /// cached K at attention time. This makes cached K position-independent,
     /// enabling relocatable span blocks.
-    fuse_rope: bool,
+    block_needs_positioning: bool,
 }
 
 impl MlxLlamaAttention {
@@ -391,7 +407,7 @@ impl MlxLlamaAttention {
             head_dim: config.head_dim,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
             sliding_window: config.sliding_window,
-            fuse_rope: vllm_config::SpansConfig::from_env().fuse_rope(),
+            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
         })
     }
 
@@ -491,10 +507,10 @@ impl MlxLlamaAttention {
             .expand_dims(0)?;
 
         // RoPE + KV cache update.
-        // When fuse_rope: use rope_dynamic for both Q and K (via apply_rope_to_cached_k)
+        // When block_needs_positioning: use rope_dynamic for both Q and K (via apply_rope_to_cached_k)
         // to ensure consistency. MLX's fast::rope and fast::rope_dynamic produce
         // different values for the same position, so Q and K must use the same impl.
-        let (q, mut k, mut v) = if self.fuse_rope {
+        let (q, mut k, mut v) = if self.block_needs_positioning {
             let q = apply_rope_to_cached_k(&q, &self.rope, rope_offset)?;
             let (mut k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
             k = apply_rope_to_cached_k(&k, &self.rope, 0)?;
@@ -594,14 +610,14 @@ impl MlxLlamaAttention {
                 let vi = v.try_index((ii..ii + 1, .., .., ..))?;
 
                 let qi = self.rope.forward((&qi, offset))?;
-                let ki = if self.fuse_rope {
+                let ki = if self.block_needs_positioning {
                     ki
                 } else {
                     self.rope.forward((&ki, offset))?
                 };
 
                 let (ki, vi) = crate::cache::kv_cache_update(cache, &ki, &vi)?;
-                let ki = if self.fuse_rope {
+                let ki = if self.block_needs_positioning {
                     apply_rope_to_cached_k(&ki, &self.rope, 0)?
                 } else {
                     ki
@@ -645,13 +661,13 @@ impl MlxLlamaAttention {
                     .expand_dims(0)?;
 
                 let q = self.rope.forward((&q, offset))?;
-                if !self.fuse_rope {
+                if !self.block_needs_positioning {
                     k = self.rope.forward((&k, offset))?;
                 }
 
                 let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
 
-                let k = if self.fuse_rope {
+                let k = if self.block_needs_positioning {
                     apply_rope_to_cached_k(&k, &self.rope, 0)?
                 } else {
                     k
@@ -739,7 +755,7 @@ impl MlxLlamaAttention {
     /// `batch_cache` holds the persistent batched [B, heads, kv_len, dim] cache for this layer.
     /// `mask` is the pre-built left-padding mask (shared across all layers).
     /// `offsets_arr` is the pre-built rope offsets array (shared across all layers).
-    /// `left_pads` — per-request left-padding counts (needed for fuse_rope negative offsets).
+    /// `left_pads` — per-request left-padding counts (needed for block_needs_positioning negative offsets).
     pub fn forward_batch_decode(
         &mut self,
         hidden_states: &Array,
@@ -782,7 +798,7 @@ impl MlxLlamaAttention {
                 let qi = q.try_index((ii..ii + 1, .., .., ..))?;
                 let ki = k.try_index((ii..ii + 1, .., .., ..))?;
                 q_parts.push(self.rope.forward((&qi, offset))?);
-                if self.fuse_rope {
+                if self.block_needs_positioning {
                     k_parts.push(ki);
                 } else {
                     k_parts.push(self.rope.forward((&ki, offset))?);
@@ -795,13 +811,13 @@ impl MlxLlamaAttention {
         }
 
         // Single batched KV cache update for all B sequences.
-        // When fuse_rope, K is stored unrotated (position-independent).
+        // When block_needs_positioning, K is stored unrotated (position-independent).
         let (k_cached, v_cached) = batch_cache.update_and_view(&k, &v)?;
 
-        // When fuse_rope, apply RoPE to full cached K with per-batch start positions.
+        // When block_needs_positioning, apply RoPE to full cached K with per-batch start positions.
         // Left-padded batch: start at -left_pad so real tokens get 0-based positions.
         // Padding positions get negative RoPE (masked out by -inf in the SDPA mask).
-        let k_cached = if self.fuse_rope {
+        let k_cached = if self.block_needs_positioning {
             let start_positions: Vec<i32> = left_pads.iter().map(|&p| -(p as i32)).collect();
             apply_rope_to_cached_k_batched(&k_cached, &self.rope, &start_positions)?
         } else {
@@ -1571,7 +1587,7 @@ mod tests {
     /// Strategy A: RoPE → cache → read (normal)
     /// Strategy B: cache → read → RoPE (fused)
     #[test]
-    fn test_fuse_rope_cache_roundtrip() {
+    fn test_block_needs_positioning_cache_roundtrip() {
         let mut rope = nn::Rope::new(8);
         rope.base = 10000.0;
 
@@ -1639,24 +1655,24 @@ mod tests {
 
         assert!(
             max_err < 1e-6,
-            "fuse_rope decode K values differ: max_err={max_err}"
+            "block_needs_positioning decode K values differ: max_err={max_err}"
         );
     }
 
-    /// Verify fuse_rope self-consistency: running prefill+decode twice with
-    /// fuse_rope=true produces identical results (deterministic).
+    /// Verify block_needs_positioning self-consistency: running prefill+decode twice with
+    /// block_needs_positioning=true produces identical results (deterministic).
     ///
-    /// Note: fuse_rope uses rope_dynamic internally while the non-fused path uses
+    /// Note: block_needs_positioning uses rope_dynamic internally while the non-fused path uses
     /// fast::rope. MLX's two rope implementations produce different absolute values,
     /// so cross-implementation comparison is not meaningful. Instead we verify:
-    /// 1. K values are position-correct (test_fuse_rope_cache_roundtrip)
+    /// 1. K values are position-correct (test_block_needs_positioning_cache_roundtrip)
     /// 2. Output is deterministic (this test)
     /// 3. Shapes are correct
     #[test]
-    fn test_fuse_rope_self_consistency() {
+    fn test_block_needs_positioning_self_consistency() {
         let config = test_config();
         let mut attn = MlxLlamaAttention::new(&config).unwrap();
-        attn.fuse_rope = true;
+        attn.block_needs_positioning = true;
 
         let x = mlx_rs::random::normal::<f32>(&[4, 32], None, None, None).unwrap();
         x.eval().unwrap();
@@ -1688,26 +1704,26 @@ mod tests {
         let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
             .unwrap()
             .item();
-        assert_eq!(max_err, 0.0, "fuse_rope prefill non-deterministic");
+        assert_eq!(max_err, 0.0, "block_needs_positioning prefill non-deterministic");
 
         let diff_d = out1_d.subtract(&out2_d).unwrap();
         let max_err_d: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff_d).unwrap(), false)
             .unwrap()
             .item();
-        assert_eq!(max_err_d, 0.0, "fuse_rope decode non-deterministic");
+        assert_eq!(max_err_d, 0.0, "block_needs_positioning decode non-deterministic");
 
         // Shapes should be correct.
         assert_eq!(out1.shape(), &[4, 32]); // prefill: 4 tokens
         assert_eq!(out1_d.shape(), &[1, 32]); // decode: 1 token
     }
 
-    /// Verify fuse_rope model-level self-consistency: prefill + multi-step decode.
+    /// Verify block_needs_positioning model-level self-consistency: prefill + multi-step decode.
     #[test]
-    fn test_fuse_rope_model_consistency() {
+    fn test_block_needs_positioning_model_consistency() {
         let config = test_config();
         let mut model = MlxLlamaForCausalLM::new(&config).unwrap();
         for layer in &mut model.layers {
-            layer.self_attn.fuse_rope = true;
+            layer.self_attn.block_needs_positioning = true;
         }
 
         let input_ids = Array::from_iter(vec![1i32, 5, 10, 20], &[4]);
@@ -1766,7 +1782,7 @@ mod tests {
         let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
             .unwrap()
             .item();
-        assert_eq!(max_err, 0.0, "fuse_rope model prefill non-deterministic");
+        assert_eq!(max_err, 0.0, "block_needs_positioning model prefill non-deterministic");
 
         for (i, (l1, l2)) in decode_logits_1
             .iter()
@@ -1777,7 +1793,7 @@ mod tests {
             let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
                 .unwrap()
                 .item();
-            assert_eq!(max_err, 0.0, "fuse_rope decode step {i} non-deterministic");
+            assert_eq!(max_err, 0.0, "block_needs_positioning decode step {i} non-deterministic");
         }
     }
 }

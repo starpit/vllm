@@ -483,8 +483,8 @@ impl Gemma2Attention {
                 device.num_sm,
                 &mut device.caching,
                 device.compute_stream,
-                std::ptr::null(),
-                0,
+                rotary.cos_sin_cache.raw_ptr() as *const u8,
+                rotary.cos_sin_cache.dim(1),
             );
             drop(q);
 
@@ -549,8 +549,8 @@ impl Gemma2Attention {
             device.num_sm,
             &mut device.caching,
             device.compute_stream,
-            std::ptr::null(),
-            0,
+            rotary.cos_sin_cache.raw_ptr() as *const u8,
+            rotary.cos_sin_cache.dim(1),
         );
         drop(q);
         drop(k);

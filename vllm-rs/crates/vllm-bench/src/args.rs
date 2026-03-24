@@ -678,10 +678,6 @@ pub struct BenchSpansArgs {
     #[arg(long, default_value_t = 24)]
     pub max_perms: usize,
 
-    /// Token ID used as the span marker (first token of each document block).
-    #[arg(long, default_value_t = 10)]
-    pub span_token: u32,
-
     /// Token ID used for padding blocks to block_size boundaries.
     #[arg(long, default_value_t = 0)]
     pub pad_token: u32,
@@ -713,6 +709,15 @@ pub struct BenchSpansArgs {
     /// Log level.
     #[arg(long, default_value = "warn")]
     pub log_level: String,
+
+    /// Run nested generate benchmark: N inner generates followed by an outer
+    /// generate that reuses their outputs via seal + volatile.
+    #[arg(long)]
+    pub nested: Option<usize>,
+
+    /// Number of output tokens for each inner generate (nested mode).
+    #[arg(long, default_value_t = 64)]
+    pub inner_tokens: u32,
 }
 
 impl BenchSpansArgs {

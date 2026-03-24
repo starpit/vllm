@@ -954,6 +954,9 @@ impl AsyncEngine {
                     data_parallel_rank: None,
                     is_pooling: false,
                     mm_data: None,
+                    block_annotations: request.block_annotations.clone(),
+                    seal: request.seal,
+                    volatile: request.volatile,
                 };
 
                 let detokenizer = self.tokenizer.as_ref().map(|tok| {
@@ -1133,6 +1136,9 @@ impl AsyncEngine {
                     data_parallel_rank: None,
                     is_pooling: false,
                     mm_data: None,
+                    block_annotations: request.block_annotations.clone(),
+                    seal: request.seal,
+                    volatile: request.volatile,
                 };
 
                 let detokenizer = self.tokenizer.as_ref().map(|tok| {
@@ -1226,6 +1232,9 @@ impl AsyncEngine {
                     data_parallel_rank: None,
                     is_pooling: true,
                     mm_data: None,
+                    block_annotations: None,
+                    seal: false,
+                    volatile: false,
                 };
 
                 self.submit_request(
@@ -2808,6 +2817,9 @@ impl AsyncEngine {
             data_parallel_rank: None,
             is_pooling: false,
             mm_data,
+            block_annotations: None,
+            seal: false,
+            volatile: false,
         })
     }
 
@@ -2889,6 +2901,9 @@ impl AsyncEngine {
             data_parallel_rank: None,
             is_pooling: false,
             mm_data: None,
+            block_annotations: None,
+            seal: false,
+            volatile: false,
         })
     }
 
@@ -3734,6 +3749,7 @@ mod tests {
             allowed_token_ids: None,
             bad_words: None,
             truncate_prompt_tokens: None,
+            block_annotations: None,
         };
 
         let params = engine
@@ -3787,6 +3803,7 @@ mod tests {
             allowed_token_ids: None,
             bad_words: None,
             truncate_prompt_tokens: None,
+            block_annotations: None,
         };
 
         let params = engine
@@ -4019,6 +4036,7 @@ mod tests {
             allowed_token_ids: None,
             bad_words: None,
             truncate_prompt_tokens: None,
+            block_annotations: None,
         }
     }
 

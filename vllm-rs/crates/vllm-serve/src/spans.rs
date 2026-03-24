@@ -4,8 +4,8 @@
 //! `/v1/query/execute` — execute a SPNL span query.
 //!
 //! Accepts a JSON span query, tokenizes it using the server's model tokenizer,
-//! inserts span control tokens (plus/cross) at block boundaries, and submits
-//! the resulting token sequence to the engine for generation.
+//! produces block annotations for relocatable caching, and submits the
+//! resulting token sequence to the engine for generation.
 //!
 //! This is the Rust equivalent of the Python vLLM `/v1/query/execute` endpoint.
 //! The query format matches the SPNL crate's `SingleGenerateQuery` schema.
@@ -44,61 +44,79 @@ pub(crate) struct ExecuteQueryParams {
 }
 
 // ---------------------------------------------------------------------------
-// Span configuration (from environment variables)
+// Span configuration
 // ---------------------------------------------------------------------------
 
 struct SpanConfig {
     pad_token: u32,
-    plus_token: Option<u32>,
-    cross_token: Option<u32>,
     block_size: usize,
 }
 
 impl SpanConfig {
-    fn from_env(block_size: usize) -> Self {
-        let plus_token = std::env::var("VLLM_V1_SPANS_TOKEN_PLUS")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .filter(|&v| v >= 0)
-            .map(|v| v as u32);
+    #[allow(dead_code)]
+    fn with_pad_token(block_size: usize, pad_token: u32) -> Self {
+        Self {
+            pad_token,
+            block_size,
+        }
+    }
 
-        let cross_token = std::env::var("VLLM_V1_SPANS_TOKEN_CROSS")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .filter(|&v| v >= 0)
-            .map(|v| v as u32);
-
+    /// Resolve pad token from `VLLM_V1_SPANS_PAD_TOKEN` env var, falling back
+    /// to the tokenizer's encoding of `" "` (whitespace), then 0.
+    fn from_tokenizer(block_size: usize, tokenizer: &crate::tokenizer::Tokenizer) -> Self {
         let pad_token = std::env::var("VLLM_V1_SPANS_PAD_TOKEN")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(27); // default matches Python patch
+            .or_else(|| tokenizer.token_to_id(" "))
+            .unwrap_or(0);
 
         Self {
             pad_token,
-            plus_token,
-            cross_token,
             block_size,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Tokenization helpers
+// Tokenization state and helpers
 // ---------------------------------------------------------------------------
 
-/// Pad `tokens` to the next block boundary.
-fn pad_to_block(tokens: &mut Vec<u32>, block_size: usize, pad_token: u32) {
-    let remainder = tokens.len() % block_size;
-    if remainder > 0 && remainder < block_size {
-        let pad_count = block_size - remainder;
-        tokens.extend(std::iter::repeat_n(pad_token, pad_count));
-    }
+use std::collections::BTreeMap;
+use vllm_common::BlockKind;
+
+/// Accumulated state during recursive tokenization.
+struct TokenizeState {
+    tokens: Vec<u32>,
+    annotations: BTreeMap<usize, BlockKind>,
+    /// Whether we're currently inside a relocatable context.
+    in_relocatable: bool,
 }
 
-/// Pad to block boundary, then push token.
-fn pad_push(tokens: &mut Vec<u32>, token: u32, block_size: usize, pad_token: u32) {
-    pad_to_block(tokens, block_size, pad_token);
-    tokens.push(token);
+impl TokenizeState {
+    fn new() -> Self {
+        Self {
+            tokens: Vec::new(),
+            annotations: BTreeMap::new(),
+            in_relocatable: false,
+        }
+    }
+
+    /// Pad `tokens` to the next block boundary.
+    fn pad_to_block(&mut self, cfg: &SpanConfig) {
+        let remainder = self.tokens.len() % cfg.block_size;
+        if remainder > 0 && remainder < cfg.block_size {
+            let pad_count = cfg.block_size - remainder;
+            self.tokens
+                .extend(std::iter::repeat_n(cfg.pad_token, pad_count));
+        }
+    }
+
+    /// Pad to block boundary and record an annotation for the next block.
+    fn annotate_next_block(&mut self, kind: BlockKind, cfg: &SpanConfig) {
+        self.pad_to_block(cfg);
+        let block_index = self.tokens.len() / cfg.block_size;
+        self.annotations.insert(block_index, kind);
+    }
 }
 
 /// Tokenize a single message using the chat template and tokenizer.
@@ -107,7 +125,7 @@ fn tokenize_message(
     tokenizer: &Tokenizer,
     template: &crate::chat_template::ChatTemplate,
     cfg: &SpanConfig,
-    tokens: &mut Vec<u32>,
+    state: &mut TokenizeState,
 ) -> ServeResult<()> {
     let tmpl_msg = TemplateMessage {
         role: msg.role().to_string(),
@@ -120,15 +138,15 @@ fn tokenize_message(
         Message::Assistant(_) => {
             // For assistant messages, crop to block boundary (drop suffix tokens).
             // This matches spnl's extend_crop behavior.
-            let end = ids.len() + tokens.len();
+            let end = ids.len() + state.tokens.len();
             let nearest_block_boundary = end / cfg.block_size * cfg.block_size;
             let amount_to_crop =
                 std::cmp::min(ids.len(), end.saturating_sub(nearest_block_boundary));
             let extra_end = ids.len() - amount_to_crop;
-            tokens.extend_from_slice(&ids[..extra_end]);
+            state.tokens.extend_from_slice(&ids[..extra_end]);
         }
         _ => {
-            tokens.extend_from_slice(&ids);
+            state.tokens.extend_from_slice(&ids);
         }
     }
     Ok(())
@@ -140,62 +158,47 @@ fn tokenize_input(
     tokenizer: &Tokenizer,
     template: &crate::chat_template::ChatTemplate,
     cfg: &SpanConfig,
-    tokens: &mut Vec<u32>,
+    state: &mut TokenizeState,
 ) -> ServeResult<()> {
     match input {
         NonGenerateInput::Seq(v) | NonGenerateInput::Par(v) => {
             for child in v {
-                tokenize_input(child, tokenizer, template, cfg, tokens)?;
+                tokenize_input(child, tokenizer, template, cfg, state)?;
             }
         }
 
         NonGenerateInput::Cross(v) => {
-            // Add cross token prior to last entry (separates context from query).
             let (left, right) = v.split_at(v.len().saturating_sub(1));
             for child in left {
-                tokenize_input(child, tokenizer, template, cfg, tokens)?;
+                tokenize_input(child, tokenizer, template, cfg, state)?;
             }
             if !right.is_empty() {
-                if let Some(cross_token) = cfg.cross_token {
-                    pad_push(tokens, cross_token, cfg.block_size, cfg.pad_token);
-                }
+                state.in_relocatable = false;
+                state.annotate_next_block(BlockKind::Prefixed, cfg);
                 for child in right {
-                    tokenize_input(child, tokenizer, template, cfg, tokens)?;
+                    tokenize_input(child, tokenizer, template, cfg, state)?;
                 }
             }
         }
 
         NonGenerateInput::Plus(v) => {
+            let prev_in_relocatable = state.in_relocatable;
             for child in v {
-                if let Some(plus_token) = cfg.plus_token {
-                    pad_push(tokens, plus_token, cfg.block_size, cfg.pad_token);
-                }
-                tokenize_input(child, tokenizer, template, cfg, tokens)?;
+                state.annotate_next_block(BlockKind::Relocatable, cfg);
+                state.in_relocatable = true;
+                tokenize_input(child, tokenizer, template, cfg, state)?;
             }
+            state.in_relocatable = prev_in_relocatable;
         }
 
         NonGenerateInput::Message(msg) => {
-            tokenize_message(msg, tokenizer, template, cfg, tokens)?;
+            tokenize_message(msg, tokenizer, template, cfg, state)?;
         }
     }
     Ok(())
 }
 
-/// Check if we are "in a plus" — there is a plus token with no following cross token.
-fn in_plus(tokens: &[u32], cfg: &SpanConfig) -> bool {
-    if let (Some(plus_token), Some(cross_token)) = (cfg.plus_token, cfg.cross_token) {
-        for &token in tokens.iter().rev() {
-            if token == cross_token {
-                return false;
-            } else if token == plus_token {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Add the final assistant generation prompt token.
+/// Add the final assistant generation prompt.
 ///
 /// Many HuggingFace chat templates crash on an empty messages list, so we
 /// render with a dummy user message both with and without
@@ -205,12 +208,12 @@ fn add_generation_prompt(
     tokenizer: &Tokenizer,
     template: &crate::chat_template::ChatTemplate,
     cfg: &SpanConfig,
-    tokens: &mut Vec<u32>,
+    state: &mut TokenizeState,
 ) -> ServeResult<()> {
-    if in_plus(tokens, cfg)
-        && let Some(plus_token) = cfg.plus_token
-    {
-        pad_push(tokens, plus_token, cfg.block_size, cfg.pad_token);
+    // If we're inside a relocatable context, add another relocatable boundary
+    // for the generation prompt so it gets its own block.
+    if state.in_relocatable {
+        state.annotate_next_block(BlockKind::Relocatable, cfg);
     }
 
     let dummy = TemplateMessage {
@@ -224,50 +227,71 @@ fn add_generation_prompt(
     let suffix = with.strip_prefix(&without).unwrap_or(&with);
     if !suffix.is_empty() {
         let ids = tokenizer.encode(suffix, false)?;
-        tokens.extend_from_slice(&ids);
+        state.tokens.extend_from_slice(&ids);
     }
     Ok(())
 }
 
-/// Tokenize a full SingleGenerate into a token sequence.
+/// Result of tokenizing a span query: tokens + block annotations.
+struct SpanTokenized {
+    tokens: Vec<u32>,
+    annotations: Option<BTreeMap<usize, BlockKind>>,
+}
+
+/// Tokenize a full SingleGenerate into a token sequence with annotations.
 fn tokenize_span_query(
     spec: &SingleGenerate,
     tokenizer: &Tokenizer,
     template: &crate::chat_template::ChatTemplate,
     cfg: &SpanConfig,
-) -> ServeResult<Vec<u32>> {
-    let mut tokens = Vec::new();
-    tokenize_input(&spec.input, tokenizer, template, cfg, &mut tokens)?;
-    add_generation_prompt(tokenizer, template, cfg, &mut tokens)?;
-    Ok(tokens)
+) -> ServeResult<SpanTokenized> {
+    let mut state = TokenizeState::new();
+    tokenize_input(&spec.input, tokenizer, template, cfg, &mut state)?;
+    add_generation_prompt(tokenizer, template, cfg, &mut state)?;
+    let annotations = if state.annotations.is_empty() {
+        None
+    } else {
+        Some(state.annotations)
+    };
+    Ok(SpanTokenized {
+        tokens: state.tokens,
+        annotations,
+    })
 }
 
-/// Tokenize a map input (user message with plus token prefix, padded).
+/// Tokenize a map input (user message with relocatable prefix, padded).
 fn tokenize_map_input(
     text: &str,
     tokenizer: &Tokenizer,
     template: &crate::chat_template::ChatTemplate,
     cfg: &SpanConfig,
-) -> ServeResult<Vec<u32>> {
-    let mut tokens = Vec::new();
-    if let Some(plus_token) = cfg.plus_token {
-        pad_push(&mut tokens, plus_token, cfg.block_size, cfg.pad_token);
-    }
+) -> ServeResult<SpanTokenized> {
+    let mut state = TokenizeState::new();
+    state.annotate_next_block(BlockKind::Relocatable, cfg);
     tokenize_message(
         &Message::User(text.to_string()),
         tokenizer,
         template,
         cfg,
-        &mut tokens,
+        &mut state,
     )?;
-    pad_to_block(&mut tokens, cfg.block_size, cfg.pad_token);
-    Ok(tokens)
+    state.pad_to_block(cfg);
+    let annotations = if state.annotations.is_empty() {
+        None
+    } else {
+        Some(state.annotations)
+    };
+    Ok(SpanTokenized {
+        tokens: state.tokens,
+        annotations,
+    })
 }
 
 /// Build a CompletionRequest from tokenized prompt IDs and generation metadata.
 fn build_completion_request(
     model: &str,
     prompt: protocol::CompletionPrompt,
+    annotations: Option<BTreeMap<usize, BlockKind>>,
     n: u32,
     max_tokens: u32,
     temperature: f32,
@@ -308,6 +332,9 @@ fn build_completion_request(
         allowed_token_ids: None,
         bad_words: None,
         truncate_prompt_tokens: None,
+        block_annotations: annotations,
+        seal: false,
+        volatile: false,
     }
 }
 
@@ -400,7 +427,7 @@ async fn execute_query_inner(state: &AppState, body: &str, stream: bool) -> Serv
         .map(|c| c.block_size)
         .unwrap_or(16);
 
-    let cfg = SpanConfig::from_env(block_size);
+    let cfg = SpanConfig::from_tokenizer(block_size, tokenizer);
 
     let query: SingleGenerateQuery = serde_json::from_str(body)
         .map_err(|e| ServeError::Validation(format!("Invalid span query: {e}")))?;
@@ -428,7 +455,7 @@ async fn execute_single(
     template: &Arc<crate::chat_template::ChatTemplate>,
     cfg: &SpanConfig,
 ) -> ServeResult<Response> {
-    let prompt_ids = tokenize_span_query(spec, tokenizer, template, cfg)?;
+    let span_tok = tokenize_span_query(spec, tokenizer, template, cfg)?;
 
     let max_tokens = spec
         .metadata
@@ -440,7 +467,8 @@ async fn execute_single(
 
     let request = build_completion_request(
         &spec.metadata.model,
-        protocol::CompletionPrompt::TokenIds(prompt_ids),
+        protocol::CompletionPrompt::TokenIds(span_tok.tokens),
+        span_tok.annotations,
         n.max(1) as u32,
         max_tokens,
         temperature,
@@ -466,8 +494,14 @@ async fn execute_map(
     cfg: &SpanConfig,
 ) -> ServeResult<Response> {
     let mut all_ids: Vec<Vec<u32>> = Vec::with_capacity(map.inputs.len());
+    // All map inputs get the same annotation structure (single relocatable block 0).
+    let mut combined_annotations: Option<BTreeMap<usize, BlockKind>> = None;
     for input_text in &map.inputs {
-        all_ids.push(tokenize_map_input(input_text, tokenizer, template, cfg)?);
+        let span_tok = tokenize_map_input(input_text, tokenizer, template, cfg)?;
+        all_ids.push(span_tok.tokens);
+        if combined_annotations.is_none() {
+            combined_annotations = span_tok.annotations;
+        }
     }
 
     let max_tokens = map
@@ -481,6 +515,7 @@ async fn execute_map(
     let request = build_completion_request(
         &map.metadata.model,
         protocol::CompletionPrompt::MultipleTokenIds(all_ids),
+        combined_annotations,
         1,
         max_tokens,
         temperature,

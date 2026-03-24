@@ -147,20 +147,8 @@ impl KvCachePool {
             v_scale_ptrs,
             block_is_unrotated: vec![false; num_blocks],
             block_is_span: vec![false; num_blocks],
-            block_unrotated_gpu_ptr: if vllm_config::SpansConfig::from_env().fuse_rope() {
-                driver::mem_alloc(num_blocks)
-                    .ok()
-                    .map(|p| RawGpuMem::new(p, num_blocks))
-            } else {
-                None
-            },
-            block_span_gpu_ptr: if vllm_config::SpansConfig::from_env().fuse_rope() {
-                driver::mem_alloc(num_blocks)
-                    .ok()
-                    .map(|p| RawGpuMem::new(p, num_blocks))
-            } else {
-                None
-            },
+            block_unrotated_gpu_ptr: None,
+            block_span_gpu_ptr: None,
         })
     }
 
@@ -319,7 +307,20 @@ impl KvCachePool {
     ///
     /// # Safety
     /// Requires valid CUDA context and stream.
-    pub unsafe fn sync_block_flags_to_gpu(&self, stream: cudarc::driver::sys::CUstream) {
+    pub unsafe fn sync_block_flags_to_gpu(&mut self, stream: cudarc::driver::sys::CUstream) {
+        // Lazily allocate GPU flag buffers on first use.
+        let num_blocks = self.block_is_unrotated.len();
+        if self.block_unrotated_gpu_ptr.is_none() {
+            self.block_unrotated_gpu_ptr = driver::mem_alloc(num_blocks)
+                .ok()
+                .map(|p| RawGpuMem::new(p, num_blocks));
+        }
+        if self.block_span_gpu_ptr.is_none() {
+            self.block_span_gpu_ptr = driver::mem_alloc(num_blocks)
+                .ok()
+                .map(|p| RawGpuMem::new(p, num_blocks));
+        }
+
         if let Some(ref mem) = self.block_unrotated_gpu_ptr {
             let flags: Vec<u8> = self
                 .block_is_unrotated

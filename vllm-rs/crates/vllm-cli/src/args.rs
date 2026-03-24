@@ -362,6 +362,10 @@ pub struct ChatArgs {
     /// Maximum number of tokens to generate per response.
     #[arg(long)]
     pub max_tokens: Option<u32>,
+
+    /// Disable CUDA graphs (use eager mode).
+    #[arg(long)]
+    pub enforce_eager: bool,
 }
 
 impl ChatArgs {

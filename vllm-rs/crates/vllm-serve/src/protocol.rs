@@ -545,6 +545,19 @@ pub struct CompletionRequest {
     /// Truncate prompt to at most this many tokens (keeps the last N).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncate_prompt_tokens: Option<i64>,
+
+    /// Block annotations for span-aware caching (internal, not part of API).
+    /// Produced by `/v1/query/execute` and threaded through to the scheduler.
+    #[serde(skip)]
+    pub block_annotations: Option<vllm_common::BlockAnnotations>,
+
+    /// 🦭 Pad + hash the final partial block on completion (internal).
+    #[serde(skip)]
+    pub seal: bool,
+
+    /// Deprioritize cached blocks for eviction after completion (internal).
+    #[serde(skip)]
+    pub volatile: bool,
 }
 
 // ---------------------------------------------------------------------------

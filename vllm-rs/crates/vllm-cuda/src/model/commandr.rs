@@ -132,9 +132,7 @@ impl CommandRAttention {
         // Command R uses is_neox_style=False (interleaved pairs at 2i, 2i+1).
         let (q, k, v) =
             if let (Some(q_norm_w), Some(k_norm_w)) = (attn.q_norm_weight, attn.k_norm_weight) {
-                // QK-norm path: split first, then per-head norm + interleaved RoPE.
-                // Note: qk_norm_rope_inplace uses NeoX RoPE — for QK-norm + interleaved
-                // we'd need a separate kernel. For now, split + norm + interleaved rope.
+                // QK-norm path: split first, then per-head norm, then Q-only RoPE.
                 let (q, k, v) = kernels::split_qkv(
                     *qkv.view(),
                     attn.q_size,
@@ -147,28 +145,26 @@ impl CommandRAttention {
                 );
                 drop(qkv);
 
-                // Apply per-head CohereLayerNorm on Q and K.
-                // For CohereLayerNorm QK-norm: norm weight is [num_heads, head_dim],
-                // applied per-head. We use the qk_norm_rope kernel with interleaved
-                // RoPE applied separately afterward.
-                // TODO: fused QK-norm + interleaved RoPE kernel for full optimization.
-                kernels::qk_norm_rope_inplace(
+                // Apply per-head CohereLayerNorm on Q and K, then Q-only RoPE.
+                kernels::qk_norm_inplace(
                     *q.view(),
                     *k.view(),
                     q_norm_w,
                     k_norm_w,
-                    rotary.cos_sin_cache,
-                    *positions,
                     attn.num_q_heads,
                     attn.num_kv_heads,
                     attn.head_dim,
                     attn.qk_norm_eps,
                     device.compute_stream,
                 );
-                // Note: qk_norm_rope_inplace applies NeoX RoPE. For Command R with
-                // QK-norm, we need interleaved RoPE instead. However, most Command R
-                // models don't use QK-norm (use_qk_norm=false by default).
-                // TODO: implement fused interleaved QK-norm+RoPE kernel when needed.
+                kernels::rotary_embedding_q_only(
+                    *q.view(),
+                    *positions,
+                    rotary.cos_sin_cache,
+                    attn.num_q_heads,
+                    attn.head_dim,
+                    device.compute_stream,
+                );
                 (q, k, v)
             } else if max_seqlen_q == 1 {
                 // Decode path: fused interleaved QKV split + RoPE + cache write.
@@ -222,7 +218,7 @@ impl CommandRAttention {
                     device.num_sm,
                     &mut device.caching,
                     device.compute_stream,
-                    std::ptr::null(),
+                    std::ptr::null(), // TODO: CommandR interleaved RoPE not yet in FA2
                     0,
                 );
                 drop(q);
@@ -279,8 +275,8 @@ impl CommandRAttention {
             device.num_sm,
             &mut device.caching,
             device.compute_stream,
-            std::ptr::null(),
-            0,
+            rotary.cos_sin_cache.raw_ptr() as *const u8,
+            rotary.cos_sin_cache.dim(1),
         );
         drop(q);
         drop(k);

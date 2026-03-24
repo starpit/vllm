@@ -45,10 +45,15 @@ pub struct NewRequestData {
     /// Multimodal data (images) for vision-language models.
     /// Only present on the first scheduling of a request with images.
     pub mm_data: Option<MultimodalData>,
+
+    /// Sparse map of block index → [`BlockKind`] for span-aware hashing/RoPE.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_annotations: Option<vllm_common::BlockAnnotations>,
 }
 
 impl NewRequestData {
     /// Construct `NewRequestData` from the core fields of a request.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         req_id: String,
         prompt_token_ids: Option<Vec<u32>>,
@@ -56,6 +61,7 @@ impl NewRequestData {
         num_computed_tokens: u32,
         sampling_params: Option<SamplingParams>,
         mm_data: Option<MultimodalData>,
+        block_annotations: Option<vllm_common::BlockAnnotations>,
     ) -> Self {
         Self {
             req_id,
@@ -64,6 +70,7 @@ impl NewRequestData {
             num_computed_tokens,
             sampling_params,
             mm_data,
+            block_annotations,
         }
     }
 }
@@ -225,6 +232,7 @@ mod tests {
             10,
             None,
             None,
+            None,
         );
         assert_eq!(nrd.req_id, "req-1");
         assert_eq!(nrd.prompt_token_ids.as_ref().unwrap().len(), 3);
@@ -252,6 +260,7 @@ mod tests {
                 Some(vec![1, 2, 3]),
                 vec![vec![0]],
                 0,
+                None,
                 None,
                 None,
             )],

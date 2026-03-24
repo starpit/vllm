@@ -1420,6 +1420,8 @@ pub struct CudaWorker {
 
     // Per-request state.
     token_buffers: HashMap<String, Vec<u32>>,
+    /// Per-request block annotations for span-aware RoPE.
+    annotation_buffers: HashMap<String, vllm_common::BlockAnnotations>,
     sampling_params_map: HashMap<String, SamplingParams>,
     input_batch: InputBatch,
     preloaded_tokenizer: Option<tokenizers::Tokenizer>,
@@ -1467,8 +1469,6 @@ pub struct CudaWorker {
     _k_scale_constant: f32,
     /// V scale constant (from env or default 1.0).
     _v_scale_constant: f32,
-    /// Spans (relocatable KV cache blocks) configuration.
-    spans_config: vllm_config::SpansConfig,
     /// GPU weight allocations tracked for sleep/wake lifecycle.
     /// RAII: `RawGpuMem` calls `driver::mem_free` on drop.
     weight_gpu_allocs: Vec<vllm_cuda::RawGpuMem>,
@@ -1534,6 +1534,7 @@ impl CudaWorker {
             uses_ggml: false,
             host_staging: None,
             token_buffers: HashMap::new(),
+            annotation_buffers: HashMap::new(),
             sampling_params_map: HashMap::new(),
             input_batch: InputBatch::new(),
             preloaded_tokenizer: None,
@@ -1557,7 +1558,6 @@ impl CudaWorker {
             _calculate_kv_scales: calculate_kv_scales,
             _k_scale_constant: k_scale_constant,
             _v_scale_constant: v_scale_constant,
-            spans_config: vllm_config::SpansConfig::from_env(),
             weight_gpu_allocs: Vec::new(),
             num_gpu_blocks_saved: 0,
             #[cfg(feature = "nccl")]
@@ -3888,6 +3888,7 @@ impl CudaWorker {
                 // fields, but the borrow checker can't verify that, so we use a raw
                 // pointer for the shared model access.
                 let self_ptr: *const Self = self;
+
                 for &bs in capture_sizes.iter().rev() {
                     info!("Capturing piecewise graphs for batch_size={bs}...");
                     let dev = self.device.as_mut().unwrap();
@@ -3911,6 +3912,7 @@ impl CudaWorker {
                         }
                     }
                 }
+
                 if !piecewise_runner.captured_sizes().is_empty() {
                     info!(
                         "Piecewise CUDA graphs captured for batch sizes: {:?}",
@@ -5861,6 +5863,7 @@ impl Worker for CudaWorker {
 
         // Clear per-request state.
         self.token_buffers.clear();
+        self.annotation_buffers.clear();
         self.sampling_params_map.clear();
         self.input_batch = InputBatch::new();
         self.batch_changed = false;
@@ -6056,6 +6059,7 @@ impl CudaWorker {
         }
         for req_id in &scheduler_output.finished_req_ids {
             self.token_buffers.remove(req_id);
+            self.annotation_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.seeded_rngs.remove(req_id);
             #[cfg(feature = "guided-decoding")]
@@ -6104,6 +6108,10 @@ impl CudaWorker {
 
             self.token_buffers
                 .insert(new_req.req_id.clone(), prompt_ids.to_vec());
+            if let Some(ref ann) = new_req.block_annotations {
+                self.annotation_buffers
+                    .insert(new_req.req_id.clone(), ann.clone());
+            }
             if let Some(ref params) = new_req.sampling_params {
                 self.sampling_params_map
                     .insert(new_req.req_id.clone(), params.clone());
@@ -6454,25 +6462,26 @@ impl CudaWorker {
         #[cfg(not(feature = "nccl"))]
         let pp_intermediate: Option<(vllm_cuda::OwnedTensor, vllm_cuda::OwnedTensor)> = None;
 
-        // Spans: mark per-block rotation flags based on token content.
+        // Spans: mark per-block rotation flags based on BlockAnnotations.
+        //
+        // Relocatable blocks go through a rotate-attend-unrotate cycle:
+        // - K is written WITH RoPE (normal QKV projection)
+        // - Post-attention: un-rotated (inverse RoPE) → position-independent
+        // - Pre-attention (next step): rotated to current position
         //
         // `block_is_unrotated[physical_block] = true` means:
-        //   "this span block's K is CURRENTLY stored unrotated (from a prior
-        //    step's post-attention un-rotation pass)."
+        //   "this Relocatable block's K is currently stored WITHOUT RoPE
+        //    (from a prior step's post-attention un-rotation pass)."
         //
-        // Blocks being written THIS step are marked false — their K will be
-        // written rotated by fused_qkv_rope. The post-attention un-rotation
-        // pass will then flip them to unrotated.
-        //
-        // Non-span blocks are always false (rotated, never touched).
-        if self.spans_config.fuse_rope()
-            && let (Some(token_plus), Some(kv_cache)) =
-                (self.spans_config.token_plus, self.kv_cache.as_mut())
+        // Freshly written blocks are false — K has RoPE from QKV projection.
+        // Non-Relocatable blocks are always false (never touched).
+        if !self.annotation_buffers.is_empty()
+            && let Some(kv_cache) = self.kv_cache.as_mut()
         {
             let meta = &prepared.attn_meta;
             for i in 0..meta.num_reqs {
                 let req_id = &meta.req_ids[i];
-                if let Some(all_tokens) = self.token_buffers.get(req_id) {
+                if let Some(annotations) = self.annotation_buffers.get(req_id) {
                     let block_ids = &meta.block_ids[i];
                     let tokens_before = meta.tokens_before[i];
                     let seq_len = meta.seq_lens[i];
@@ -6481,17 +6490,14 @@ impl CudaWorker {
                         if block_start_pos >= seq_len {
                             break; // past the end of the sequence
                         }
-                        let is_span = block_start_pos < all_tokens.len()
-                            && all_tokens[block_start_pos] == token_plus;
-                        // Block was written in a PRIOR step if its last
-                        // token position < tokens_before (i.e., fully cached).
-                        let block_end_pos = (block_start_pos + block_size).min(seq_len);
-                        let was_previously_written = block_end_pos <= tokens_before;
-                        // is_unrotated: span blocks from prior steps have
-                        // unrotated K (from the post-attention un-rotation pass).
-                        // Freshly written blocks have rotated K.
-                        let is_unrotated = is_span && was_previously_written;
-                        kv_cache.mark_block(physical_block, is_span, is_unrotated);
+                        let (is_relocatable, is_unrotated) = vllm_common::compute_block_flags(
+                            annotations,
+                            block_idx,
+                            block_size,
+                            seq_len,
+                            tokens_before,
+                        );
+                        kv_cache.mark_block(physical_block, is_relocatable, is_unrotated);
                     }
                 }
             }

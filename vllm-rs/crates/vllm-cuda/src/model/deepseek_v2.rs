@@ -207,6 +207,8 @@ pub unsafe fn yarn_rotary_cache(
     let cos_sin_cache = GpuTensor::new(gpu_ptr, &[max_pos, rope_dim], dtype);
     Ok(RotaryCache {
         cos_sin_cache,
+        cos_cache: GpuTensor::new(std::ptr::null_mut(), &[0, 0], dtype),
+        sin_cache: GpuTensor::new(std::ptr::null_mut(), &[0, 0], dtype),
         head_dim: rope_dim,
     })
 }
@@ -560,6 +562,10 @@ impl DeepSeekV2Attention {
         let k_pe_2d = k_pe_compressed
             .view()
             .reshape(&[num_tokens, self.qk_rope_head_dim]);
+        // TODO: DeepSeek uses interleaved RoPE on partial dims. FA2's
+        // rotate_k_smem assumes NeoX layout. Until an interleaved variant
+        // is added, K is double-rotated here. Pass null to attention to
+        // disable FA2 rotation for now.
         kernels::rotary_embedding_interleaved_inplace(
             *q_pe_2d,
             *k_pe_2d,
@@ -652,7 +658,7 @@ impl DeepSeekV2Attention {
             device.num_sm,
             &mut device.caching,
             stream,
-            std::ptr::null(),
+            std::ptr::null(), // TODO: DeepSeek interleaved RoPE not yet in FA2
             0,
         );
         drop(k);

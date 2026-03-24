@@ -178,7 +178,11 @@ impl RotaryCache {
 
         // Build separate cos/sin caches for FA2 fused RoPE (needs contiguous buffers).
         let (cos_cache, sin_cache) = Self::build_separate_cos_sin(
-            &cache, max_pos, rotary_dim, dtype, device.compute_stream,
+            &cache,
+            max_pos,
+            rotary_dim,
+            dtype,
+            device.compute_stream,
         )?;
 
         Ok(Self {
@@ -275,7 +279,11 @@ impl RotaryCache {
 
         // Build separate cos/sin caches for FA2 fused RoPE (needs contiguous buffers).
         let (cos_cache, sin_cache) = Self::build_separate_cos_sin(
-            &cache, max_pos, rotary_dim, dtype, device.compute_stream,
+            &cache,
+            max_pos,
+            rotary_dim,
+            dtype,
+            device.compute_stream,
         )?;
 
         Ok(Self {
@@ -642,8 +650,12 @@ impl LlamaAttention {
                 // cached K in shared memory during attention.
                 let rotary_dim = rotary.cos_sin_cache.dim(1);
                 if self.layer_idx == 0 {
-                    eprintln!("[SPANS] decode: rotary_dim={}, cos_sin_cache_ptr={:?}, head_dim={}",
-                        rotary_dim, rotary.cos_sin_cache.raw_ptr(), self.head_dim);
+                    eprintln!(
+                        "[SPANS] decode: rotary_dim={}, cos_sin_cache_ptr={:?}, head_dim={}",
+                        rotary_dim,
+                        rotary.cos_sin_cache.raw_ptr(),
+                        self.head_dim
+                    );
                 }
                 let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
                     q.view(),
@@ -778,10 +790,9 @@ impl LlamaAttention {
                 if self.layer_idx == 0 {
                     eprintln!("[SPANS] prefill: block_needs_positioning path taken, layer 0");
                 }
-                // For fresh prefill (contiguous path), K is also passed directly
-                // to FA2 contiguous which does NOT fuse RoPE — so we apply full
-                // RoPE to both Q and K here. The unrotated K written to cache is
-                // what matters for future paged reads.
+                // K stays unrotated: written to cache without RoPE, and FA2's
+                // fused RoPE (rotate_cached_k) handles rotation in shared memory
+                // for both the fresh contiguous path and the paged path.
                 let (q, k, v) = kernels::split_qkv(
                     qkv.as_gpu_tensor(),
                     self.q_size,
@@ -794,14 +805,7 @@ impl LlamaAttention {
                 );
                 drop(qkv);
 
-                // Apply RoPE to both Q and K for correct fresh-prefill attention.
-                // K in cache will be unrotated (written before RoPE is applied
-                // in-place, since write_kv_cache happens after this block returns
-                // the (q, k, v) tuple... but wait, k is modified in-place here).
-                //
-                // We need K unrotated in cache but rotated for fresh attention.
-                // Solution: write K to cache FIRST (unrotated), then apply RoPE
-                // to both Q and K for the contiguous attention path.
+                // Write unrotated K/V to cache first.
                 crate::model::attention_helpers::write_kv_cache(
                     k.view(),
                     v.view(),
@@ -811,18 +815,18 @@ impl LlamaAttention {
                     device.compute_stream,
                 );
 
-                // Now apply RoPE to both Q and K in-place (for fresh attention).
-                kernels::rotary_embedding_inplace(
+                // Only rotate Q — FA2 fused RoPE rotates K in shared memory.
+                kernels::rotary_embedding_q_only(
                     q.as_gpu_tensor(),
-                    k.as_gpu_tensor(),
                     *positions,
                     rotary.cos_sin_cache,
+                    self.num_q_heads,
                     self.head_dim,
                     device.compute_stream,
                 );
 
-                // Attention: fresh prefill uses contiguous rotated K directly;
-                // paged path uses fused RoPE on cached (unrotated) K.
+                // FA2 with fused RoPE: rotates K in shared memory for both
+                // the contiguous (fresh prefill) and paged paths.
                 let rotary_dim = rotary.cos_sin_cache.dim(1);
                 let attn_output = crate::model::attention_helpers::attention_standard(
                     q.view(),

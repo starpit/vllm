@@ -163,7 +163,8 @@ impl ChatTemplate {
         Ok(Some(tpl))
     }
 
-    /// Apply the chat template to rich JSON messages, with optional tool definitions.
+    /// Apply the chat template to rich JSON messages, with optional tool definitions
+    /// and extra template kwargs (e.g. `enable_thinking`).
     ///
     /// Messages are `serde_json::Value` objects so templates can access any field
     /// (`tool_calls`, `tool_call_id`, `name`, etc.) without needing Rust struct changes.
@@ -174,6 +175,20 @@ impl ChatTemplate {
         messages: &[serde_json::Value],
         add_generation_prompt: bool,
         tools: Option<&serde_json::Value>,
+    ) -> Result<String, ServeError> {
+        self.apply_with_kwargs(messages, add_generation_prompt, tools, None)
+    }
+
+    /// Like [`apply`] but with additional template keyword arguments.
+    ///
+    /// `extra_kwargs` are merged into the Jinja context so the template can
+    /// access them (e.g. `enable_thinking`, `reasoning_effort`).
+    pub fn apply_with_kwargs(
+        &self,
+        messages: &[serde_json::Value],
+        add_generation_prompt: bool,
+        tools: Option<&serde_json::Value>,
+        extra_kwargs: Option<&std::collections::HashMap<String, serde_json::Value>>,
     ) -> Result<String, ServeError> {
         let tmpl = self
             .env
@@ -198,15 +213,37 @@ impl ChatTemplate {
             )
         };
 
-        // Build the context.
-        let ctx = minijinja::context! {
-            messages => messages,
-            add_generation_prompt => add_generation_prompt,
-            bos_token => self.bos_token.as_deref().unwrap_or(""),
-            eos_token => self.eos_token.as_deref().unwrap_or(""),
-            tools => tools,
-            date_string => date_string,
-        };
+        // Build the base context.
+        let mut ctx_map = std::collections::BTreeMap::<String, minijinja::Value>::new();
+        ctx_map.insert(
+            "messages".into(),
+            minijinja::Value::from_serialize(messages),
+        );
+        ctx_map.insert(
+            "add_generation_prompt".into(),
+            minijinja::Value::from(add_generation_prompt),
+        );
+        ctx_map.insert(
+            "bos_token".into(),
+            minijinja::Value::from(self.bos_token.as_deref().unwrap_or("")),
+        );
+        ctx_map.insert(
+            "eos_token".into(),
+            minijinja::Value::from(self.eos_token.as_deref().unwrap_or("")),
+        );
+        if let Some(tools) = tools {
+            ctx_map.insert("tools".into(), minijinja::Value::from_serialize(tools));
+        }
+        ctx_map.insert("date_string".into(), minijinja::Value::from(date_string));
+
+        // Merge extra kwargs (e.g. enable_thinking, reasoning_effort).
+        if let Some(kwargs) = extra_kwargs {
+            for (key, value) in kwargs {
+                ctx_map.insert(key.clone(), minijinja::Value::from_serialize(value));
+            }
+        }
+
+        let ctx = minijinja::Value::from_serialize(&ctx_map);
 
         let rendered = tmpl
             .render(ctx)
@@ -516,5 +553,101 @@ mod tests {
         // Should contain a date like "28 Feb 2026".
         assert!(result.starts_with("DATE:"));
         assert!(result.len() > 5);
+    }
+
+    #[test]
+    fn test_extra_kwargs_enable_thinking_true() {
+        // Simplified Qwen3-style template that checks enable_thinking.
+        let tpl = ChatTemplate::new(
+            "{% set enable_thinking = enable_thinking | default(true) %}{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n{% if enable_thinking %}<think>\n{% endif %}".to_string(),
+        ).unwrap();
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hi"})];
+
+        // No extra kwargs → enable_thinking defaults to true → <think> present.
+        let result = tpl.apply(&messages, true, None).unwrap();
+        assert!(
+            result.contains("<think>"),
+            "expected <think> with default enable_thinking=true, got: {result}"
+        );
+
+        // Explicit enable_thinking=true.
+        let mut kwargs = std::collections::HashMap::new();
+        kwargs.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
+        let result = tpl
+            .apply_with_kwargs(&messages, true, None, Some(&kwargs))
+            .unwrap();
+        assert!(
+            result.contains("<think>"),
+            "expected <think> with enable_thinking=true, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_extra_kwargs_enable_thinking_false() {
+        // Simplified Qwen3-style template that checks enable_thinking.
+        let tpl = ChatTemplate::new(
+            "{% set enable_thinking = enable_thinking | default(true) %}{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}<|im_start|>assistant\n{% if enable_thinking %}<think>\n{% endif %}".to_string(),
+        ).unwrap();
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hi"})];
+
+        // enable_thinking=false → no <think>.
+        let mut kwargs = std::collections::HashMap::new();
+        kwargs.insert(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        let result = tpl
+            .apply_with_kwargs(&messages, true, None, Some(&kwargs))
+            .unwrap();
+        assert!(
+            !result.contains("<think>"),
+            "expected no <think> with enable_thinking=false, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_extra_kwargs_do_not_override_builtins() {
+        // Extra kwargs should be able to add new variables but built-in context
+        // (messages, add_generation_prompt, etc.) should still work.
+        let tpl = ChatTemplate::new(
+            "{% for message in messages %}{{ message.content }}{% endfor %}{% if custom_var %}CUSTOM{% endif %}".to_string(),
+        ).unwrap();
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hello"})];
+        let mut kwargs = std::collections::HashMap::new();
+        kwargs.insert("custom_var".to_string(), serde_json::Value::Bool(true));
+        let result = tpl
+            .apply_with_kwargs(&messages, false, None, Some(&kwargs))
+            .unwrap();
+        assert!(result.contains("Hello"), "messages should still render");
+        assert!(result.contains("CUSTOM"), "custom_var should be accessible");
+    }
+
+    #[test]
+    fn test_apply_with_kwargs_none_is_same_as_apply() {
+        let tpl = ChatTemplate::new(
+            "{% for message in messages %}{{ message.content }}{% endfor %}".to_string(),
+        )
+        .unwrap();
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hi"})];
+        let a = tpl.apply(&messages, false, None).unwrap();
+        let b = tpl.apply_with_kwargs(&messages, false, None, None).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_extra_kwargs_empty_map() {
+        let tpl = ChatTemplate::new(
+            "{% for message in messages %}{{ message.content }}{% endfor %}".to_string(),
+        )
+        .unwrap();
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hi"})];
+        let kwargs = std::collections::HashMap::new();
+        let result = tpl
+            .apply_with_kwargs(&messages, false, None, Some(&kwargs))
+            .unwrap();
+        assert_eq!(result, "Hi");
     }
 }

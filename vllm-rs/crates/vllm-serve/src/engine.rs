@@ -231,6 +231,8 @@ pub struct AsyncEngine {
     tool_parser: Option<Arc<dyn ToolCallParser>>,
     /// Optional reasoning parser for extracting <think>...</think> blocks.
     reasoning_parser: Option<Arc<dyn ReasoningParser>>,
+    /// Default extra kwargs for chat template rendering (e.g. `enable_thinking`).
+    default_chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
     /// Whether async scheduling is enabled (overlap GPU execution with CPU scheduling).
     async_scheduling: bool,
     /// Set to `true` when the step loop is running; cleared on exit.
@@ -280,6 +282,7 @@ impl AsyncEngine {
             chat_template: None,
             tool_parser: None,
             reasoning_parser: None,
+            default_chat_template_kwargs: None,
             async_scheduling: false,
             step_loop_alive: Arc::new(AtomicBool::new(false)),
             image_token_id: None,
@@ -379,6 +382,11 @@ impl AsyncEngine {
         engine
     }
 
+    /// Set the chat template on this engine.
+    pub fn set_chat_template(&mut self, template: Arc<ChatTemplate>) {
+        self.chat_template = Some(template);
+    }
+
     /// Set the tool call parser on this engine.
     pub fn set_tool_parser(&mut self, parser: Arc<dyn ToolCallParser>) {
         self.tool_parser = Some(parser);
@@ -387,6 +395,14 @@ impl AsyncEngine {
     /// Set the reasoning parser on this engine.
     pub fn set_reasoning_parser(&mut self, parser: Arc<dyn ReasoningParser>) {
         self.reasoning_parser = Some(parser);
+    }
+
+    /// Set default extra kwargs for chat template rendering.
+    pub fn set_default_chat_template_kwargs(
+        &mut self,
+        kwargs: std::collections::HashMap<String, serde_json::Value>,
+    ) {
+        self.default_chat_template_kwargs = Some(kwargs);
     }
 
     /// Enable or disable async scheduling.
@@ -2763,7 +2779,18 @@ impl AsyncEngine {
                     .and_then(|t| serde_json::to_value(t).ok()),
             };
 
-            template.apply(&message_values, true, tools_value.as_ref())?
+            // Merge default + per-request chat template kwargs.
+            let merged_kwargs = merge_chat_template_kwargs(
+                self.default_chat_template_kwargs.as_ref(),
+                request.chat_template_kwargs.as_ref(),
+            );
+
+            template.apply_with_kwargs(
+                &message_values,
+                true,
+                tools_value.as_ref(),
+                merged_kwargs.as_ref(),
+            )?
         } else {
             // Fallback: concatenate messages with newlines.
             let mut text = String::new();
@@ -3528,6 +3555,24 @@ fn placeholder_text(token_ids: &[u32]) -> String {
     s
 }
 
+/// Merge default and per-request chat template kwargs.
+/// Request kwargs override defaults (like Python's `default | request`).
+fn merge_chat_template_kwargs(
+    defaults: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    request: Option<&std::collections::HashMap<String, serde_json::Value>>,
+) -> Option<std::collections::HashMap<String, serde_json::Value>> {
+    match (defaults, request) {
+        (None, None) => None,
+        (Some(d), None) => Some(d.clone()),
+        (None, Some(r)) => Some(r.clone()),
+        (Some(d), Some(r)) => {
+            let mut merged = d.clone();
+            merged.extend(r.iter().map(|(k, v)| (k.clone(), v.clone())));
+            Some(merged)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -3657,6 +3702,7 @@ mod tests {
             bad_words: None,
             truncate_prompt_tokens: None,
             include_reasoning: true,
+            chat_template_kwargs: None,
         }
     }
 
@@ -5266,5 +5312,179 @@ mod tests {
             "reasoning should be None without parser"
         );
         assert_eq!(delta.text, Some("hello".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_chat_template_kwargs tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_kwargs_both_none() {
+        assert!(merge_chat_template_kwargs(None, None).is_none());
+    }
+
+    #[test]
+    fn test_merge_kwargs_defaults_only() {
+        let mut defaults = std::collections::HashMap::new();
+        defaults.insert(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        let merged = merge_chat_template_kwargs(Some(&defaults), None).unwrap();
+        assert_eq!(
+            merged.get("enable_thinking"),
+            Some(&serde_json::Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn test_merge_kwargs_request_only() {
+        let mut request = std::collections::HashMap::new();
+        request.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
+        let merged = merge_chat_template_kwargs(None, Some(&request)).unwrap();
+        assert_eq!(
+            merged.get("enable_thinking"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn test_merge_kwargs_request_overrides_defaults() {
+        let mut defaults = std::collections::HashMap::new();
+        defaults.insert(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        defaults.insert("reasoning_effort".to_string(), serde_json::json!("medium"));
+
+        let mut request = std::collections::HashMap::new();
+        request.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
+
+        let merged = merge_chat_template_kwargs(Some(&defaults), Some(&request)).unwrap();
+        // Request overrides default.
+        assert_eq!(
+            merged.get("enable_thinking"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        // Default preserved when not overridden.
+        assert_eq!(
+            merged.get("reasoning_effort"),
+            Some(&serde_json::json!("medium"))
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // chat_template_kwargs in request serde tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chat_template_kwargs_deserialization() {
+        let json = r#"{
+            "model": "test",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}
+        }"#;
+        let req: protocol::ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        let kwargs = req.chat_template_kwargs.unwrap();
+        assert_eq!(
+            kwargs.get("enable_thinking"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            kwargs.get("reasoning_effort"),
+            Some(&serde_json::json!("low"))
+        );
+    }
+
+    #[test]
+    fn test_chat_template_kwargs_absent() {
+        let json = r#"{
+            "model": "test",
+            "messages": [{"role": "user", "content": "Hi"}]
+        }"#;
+        let req: protocol::ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.chat_template_kwargs.is_none());
+    }
+
+    #[test]
+    fn test_chat_template_kwargs_empty_object() {
+        let json = r#"{
+            "model": "test",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "chat_template_kwargs": {}
+        }"#;
+        let req: protocol::ChatCompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(req.chat_template_kwargs.unwrap().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // default_chat_template_kwargs on engine
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_chat_template_kwargs_used_in_template() {
+        // Use a template that checks enable_thinking. We test at the template
+        // level to avoid test-tokenizer limitations with special tokens.
+        let template_str = "{% set enable_thinking = enable_thinking | default(true) %}{% for message in messages %}{{ message.content }}{% endfor %}{% if enable_thinking %}THINKING{% else %}NO_THINKING{% endif %}";
+        let template = crate::chat_template::ChatTemplate::new(template_str.to_string()).unwrap();
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hi"})];
+
+        // Without kwargs: enable_thinking defaults to true.
+        let result = template.apply(&messages, true, None).unwrap();
+        assert!(
+            result.contains("THINKING"),
+            "should contain THINKING with default, got: {result}"
+        );
+        assert!(!result.contains("NO_THINKING"));
+
+        // With enable_thinking=false.
+        let mut kwargs = std::collections::HashMap::new();
+        kwargs.insert(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        let result = template
+            .apply_with_kwargs(&messages, true, None, Some(&kwargs))
+            .unwrap();
+        assert!(
+            result.contains("NO_THINKING"),
+            "should contain NO_THINKING with enable_thinking=false, got: {result}"
+        );
+        assert!(!result.contains("\nTHINKING"));
+    }
+
+    #[test]
+    fn test_default_and_request_kwargs_merge_in_engine() {
+        // Test that merge_chat_template_kwargs correctly flows through
+        // to chat_to_engine_request by testing merge logic directly.
+        let mut defaults = std::collections::HashMap::new();
+        defaults.insert(
+            "enable_thinking".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        defaults.insert("reasoning_effort".to_string(), serde_json::json!("medium"));
+
+        let mut request_kw = std::collections::HashMap::new();
+        request_kw.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
+
+        let merged = merge_chat_template_kwargs(Some(&defaults), Some(&request_kw)).unwrap();
+
+        // Request overrides default.
+        assert_eq!(merged["enable_thinking"], serde_json::Value::Bool(true));
+        // Default preserved.
+        assert_eq!(merged["reasoning_effort"], serde_json::json!("medium"));
+
+        // Verify template renders correctly with merged kwargs.
+        let template_str = "{% set enable_thinking = enable_thinking | default(true) %}{% if enable_thinking %}THINKING{% else %}NO_THINKING{% endif %}";
+        let template = crate::chat_template::ChatTemplate::new(template_str.to_string()).unwrap();
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hi"})];
+        let result = template
+            .apply_with_kwargs(&messages, true, None, Some(&merged))
+            .unwrap();
+        assert!(
+            result.contains("THINKING"),
+            "merged kwargs should have enable_thinking=true"
+        );
     }
 }

@@ -413,6 +413,7 @@ fn convert_request(req: &ResponsesRequest) -> protocol::ChatCompletionRequest {
         bad_words: None,
         truncate_prompt_tokens: None,
         include_reasoning: true,
+        chat_template_kwargs: None,
     }
 }
 

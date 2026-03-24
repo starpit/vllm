@@ -132,6 +132,12 @@ pub struct ServeArgs {
     #[arg(long)]
     pub reasoning_parser: Option<String>,
 
+    /// Default extra kwargs for the chat template, as JSON.
+    /// Merged with per-request chat_template_kwargs (request overrides).
+    /// Example: '{"enable_thinking": false}'
+    #[arg(long, value_parser = parse_json_map)]
+    pub default_chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
+
     /// Enable automatic tool choice (model decides when to call tools).
     #[arg(long)]
     pub enable_auto_tool_choice: bool,
@@ -452,6 +458,12 @@ pub struct BatchArgs {
     #[arg(long)]
     pub reasoning_parser: Option<String>,
 
+    /// Default extra kwargs for the chat template, as JSON.
+    /// Merged with per-request chat_template_kwargs (request overrides).
+    /// Example: '{"enable_thinking": false}'
+    #[arg(long, value_parser = parse_json_map)]
+    pub default_chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
+
     /// Specific GGUF filename to download from a HuggingFace repo.
     #[arg(long)]
     pub gguf_file: Option<String>,
@@ -762,6 +774,16 @@ pub struct TopArgs {
     /// Poll interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
     pub interval: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a JSON string into a `HashMap<String, serde_json::Value>`.
+/// Used as a clap `value_parser` for `--default-chat-template-kwargs`.
+fn parse_json_map(s: &str) -> Result<std::collections::HashMap<String, serde_json::Value>, String> {
+    serde_json::from_str(s).map_err(|e| format!("invalid JSON: {e}"))
 }
 
 // ---------------------------------------------------------------------------

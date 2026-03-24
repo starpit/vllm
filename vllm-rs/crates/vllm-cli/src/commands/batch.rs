@@ -52,6 +52,7 @@ pub async fn run_batch(args: BatchArgs) -> Result<()> {
         &args.output,
         args.tool_call_parser.as_deref(),
         args.reasoning_parser.as_deref(),
+        args.default_chat_template_kwargs,
     )
     .await
 }
@@ -63,6 +64,7 @@ pub async fn run_batch_from_config(
     output_path: &str,
     tool_call_parser: Option<&str>,
     reasoning_parser: Option<&str>,
+    default_chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
 ) -> Result<()> {
     let start = Instant::now();
 
@@ -106,6 +108,13 @@ pub async fn run_batch_from_config(
         Arc::get_mut(&mut stack.engine)
             .expect("engine should not be shared yet")
             .set_reasoning_parser(parser);
+    }
+
+    // 2d. Configure default chat template kwargs if specified.
+    if let Some(kwargs) = default_chat_template_kwargs {
+        Arc::get_mut(&mut stack.engine)
+            .expect("engine should not be shared yet")
+            .set_default_chat_template_kwargs(kwargs);
     }
 
     // 3. Spawn the engine step loop.

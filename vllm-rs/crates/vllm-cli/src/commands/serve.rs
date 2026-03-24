@@ -207,6 +207,14 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         info!("Reasoning parser: {}", parser_name);
     }
 
+    // 2d. Configure default chat template kwargs if specified.
+    if let Some(kwargs) = args.default_chat_template_kwargs {
+        info!("Default chat template kwargs: {:?}", kwargs);
+        Arc::get_mut(&mut stack.engine)
+            .expect("engine should not be shared yet")
+            .set_default_chat_template_kwargs(kwargs);
+    }
+
     // 3. Spawn the engine step loop.
     let _step_handle = stack.engine.spawn_step_loop();
 

@@ -383,6 +383,11 @@ pub struct ChatCompletionRequest {
     /// Whether to include reasoning content in the response (default true).
     #[serde(default = "default_true")]
     pub include_reasoning: bool,
+
+    /// Additional keyword args to pass to the chat template renderer.
+    /// Will be accessible by the chat template (e.g. `{"enable_thinking": false}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 // ---------------------------------------------------------------------------

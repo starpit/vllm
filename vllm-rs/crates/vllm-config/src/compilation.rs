@@ -10,11 +10,10 @@ pub enum CudaGraphMode {
     None,
     /// Piecewise graphs only - attention excluded from graphs.
     Piecewise,
-    /// Full monolithic graphs only - entire forward pass captured.
-    Full,
-    /// Full for uniform decode, piecewise for mixed batches (DEFAULT).
-    /// Matches Python vLLM's default behavior.
+    /// Full monolithic graphs only - entire forward pass captured (DEFAULT).
     #[default]
+    Full,
+    /// Full for uniform decode, piecewise for mixed batches.
     FullAndPiecewise,
     /// Full for uniform decode, eager for mixed batches.
     FullDecodeOnly,

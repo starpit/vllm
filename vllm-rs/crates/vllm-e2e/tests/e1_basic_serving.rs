@@ -915,10 +915,7 @@ async fn test_cuda_qwen3_completion() {
     let resp = client.completion(&request).await.unwrap();
 
     assert_valid_completion_response(&resp);
-    assert!(
-        !resp.choices[0].text.is_empty(),
-        "completion should not be empty"
-    );
+    assert_coherent_text(&resp.choices[0].text, 2);
 }
 
 #[cfg(feature = "cuda")]
@@ -936,7 +933,7 @@ async fn test_cuda_qwen3_chat() {
 
     assert_valid_chat_response(&resp);
     let text = resp.choices[0].message.content.as_deref().unwrap_or("");
-    assert!(!text.is_empty(), "response should not be empty");
+    assert_coherent_text(text, 1);
 }
 
 // ===========================================================================
@@ -1193,10 +1190,8 @@ async fn test_cuda_gguf_qwen3_0_6b_chat() {
     let resp = client.chat_completion(&request).await.unwrap();
 
     assert_valid_chat_response(&resp);
-    assert!(
-        resp.usage.completion_tokens.unwrap_or(0) > 0,
-        "should generate at least one token"
-    );
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text, 2);
 }
 
 // TODO: Qwen3Next GGUF requires Qwen3NextForCausalLM load_gguf() — not yet implemented
@@ -2756,8 +2751,6 @@ async fn test_cuda_gguf_iq4_qwen3_chat() {
     let resp = client.chat_completion(&request).await.unwrap();
 
     assert_valid_chat_response(&resp);
-    assert!(
-        resp.usage.completion_tokens.unwrap_or(0) > 0,
-        "should generate at least one token"
-    );
+    let text = resp.choices[0].message.content.as_deref().unwrap_or("");
+    assert_coherent_text(text, 2);
 }

@@ -430,6 +430,159 @@ impl Fp8FusedMoELayer {
 }
 
 // ---------------------------------------------------------------------------
+// Fp8BlockFusedMoELayer (FP8 block-quantized MoE)
+// ---------------------------------------------------------------------------
+
+/// Fused MoE layer with FP8 E4M3 block-quantized weights.
+///
+/// Same pipeline as `Fp8FusedMoELayer` but uses per-block weight scales
+/// applied during the FP8→BF16 dequant step in the CUDA kernel.
+pub struct Fp8BlockFusedMoELayer {
+    pub gate: Linear,
+    /// Stacked gate+up weights: `[E, 2*inter, hidden]` FP8 E4M3.
+    pub w1: GpuTensor,
+    /// Stacked down weights: `[E, hidden, inter]` FP8 E4M3.
+    pub w2: GpuTensor,
+    /// Block scales for w1: `[E, ceil(2*inter/bn), ceil(hidden/bk)]` f32.
+    pub w1_scale_inv: GpuTensor,
+    /// Block scales for w2: `[E, ceil(hidden/bn), ceil(inter/bk)]` f32.
+    pub w2_scale_inv: GpuTensor,
+    /// Quantization block size `[block_n, block_k]`.
+    pub block_size: [usize; 2],
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub intermediate_size: usize,
+    pub hidden_size: usize,
+    pub renormalize: bool,
+    #[cfg(feature = "nccl")]
+    pub tp_group: Option<Arc<NcclGroup>>,
+}
+
+impl Fp8BlockFusedMoELayer {
+    pub unsafe fn forward(
+        &self,
+        hidden_states: TensorView<'_>,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        let num_tokens = hidden_states.dim(0);
+        let stream = device.compute_stream;
+
+        let block_m = select_moe_block_m(num_tokens, self.top_k, self.num_experts);
+
+        // 1. Gate
+        let router_logits =
+            self.gate
+                .forward(hidden_states, &mut device.cublas, &mut device.caching);
+
+        // 2. Top-K softmax
+        let (topk_weights, topk_ids) = kernels::topk_softmax(
+            router_logits.as_gpu_tensor(),
+            self.top_k,
+            self.renormalize,
+            &mut device.caching,
+            stream,
+        );
+        drop(router_logits);
+
+        // 3. Quantize hidden states to FP8
+        let (fp8_input, a1_scales) =
+            kernels::scaled_fp8_quant_dynamic(*hidden_states, &mut device.caching, stream);
+
+        // 4. Align block size
+        let (sorted_token_ids, expert_ids, num_tokens_post_padded) = kernels::moe_align_block_size(
+            topk_ids.as_gpu_tensor(),
+            self.num_experts,
+            block_m,
+            &mut device.caching,
+            stream,
+        );
+        drop(topk_ids);
+
+        // 5. GEMM 1: block-scaled FP8
+        let intermediate1 = kernels::fused_moe_fp8_block_gemm(
+            fp8_input.as_gpu_tensor(),
+            self.w1,
+            a1_scales.as_gpu_tensor(),
+            self.w1_scale_inv,
+            topk_weights.as_gpu_tensor(),
+            sorted_token_ids.as_gpu_tensor(),
+            expert_ids.as_gpu_tensor(),
+            num_tokens_post_padded.as_gpu_tensor(),
+            num_tokens,
+            self.top_k,
+            block_m,
+            false,
+            self.block_size,
+            &mut device.caching,
+            stream,
+        );
+        drop(fp8_input);
+        drop(a1_scales);
+
+        // 6. SiLU activation
+        let activated = kernels::silu_and_mul_fused(
+            intermediate1.as_gpu_tensor(),
+            self.intermediate_size,
+            &mut device.caching,
+            stream,
+        );
+        drop(intermediate1);
+
+        // 7. Re-quantize to FP8
+        let (fp8_act, a2_scales) = kernels::scaled_fp8_quant_dynamic(
+            activated.as_gpu_tensor(),
+            &mut device.caching,
+            stream,
+        );
+        drop(activated);
+
+        // 8. GEMM 2: block-scaled FP8
+        let intermediate2 = kernels::fused_moe_fp8_block_gemm(
+            fp8_act.as_gpu_tensor(),
+            self.w2,
+            a2_scales.as_gpu_tensor(),
+            self.w2_scale_inv,
+            topk_weights.as_gpu_tensor(),
+            sorted_token_ids.as_gpu_tensor(),
+            expert_ids.as_gpu_tensor(),
+            num_tokens_post_padded.as_gpu_tensor(),
+            num_tokens * self.top_k,
+            1,
+            block_m,
+            true,
+            self.block_size,
+            &mut device.caching,
+            stream,
+        );
+        drop(fp8_act);
+        drop(a2_scales);
+        drop(topk_weights);
+        drop(sorted_token_ids);
+        drop(expert_ids);
+        drop(num_tokens_post_padded);
+
+        // 9. Reduce
+        let output = kernels::moe_sum(
+            intermediate2.as_gpu_tensor(),
+            num_tokens,
+            self.hidden_size,
+            self.top_k,
+            &mut device.caching,
+            stream,
+        );
+        drop(intermediate2);
+
+        #[cfg(feature = "nccl")]
+        if let Some(ref nccl) = self.tp_group {
+            nccl.all_reduce_inplace(output.as_gpu_tensor())
+                .expect("MoE all_reduce failed");
+        }
+
+        output
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fp8SharedFusedMoELayer (Qwen2/3 MoE with FP8 experts)
 // ---------------------------------------------------------------------------
 
@@ -1153,5 +1306,71 @@ mod tests {
         assert_eq!(layer.moe.num_experts, 4);
         assert_eq!(layer.moe.top_k, 2);
         assert_eq!(layer.moe.intermediate_size, 3072);
+    }
+
+    #[test]
+    fn test_fp8_block_fused_moe_layer_sizes() {
+        // Verify Fp8BlockFusedMoELayer struct construction with dummy tensors.
+        // Model: 128 experts, inter=768, hidden=2048, block_size=[128,128]
+        let num_experts = 128;
+        let inter = 768;
+        let hidden = 2048;
+        let block_n = 128;
+        let block_k = 128;
+
+        let gate_w =
+            unsafe { GpuTensor::new(0x1000 as *mut u8, &[num_experts, hidden], DType::BF16) };
+        let w1 = unsafe {
+            GpuTensor::new(
+                0x2000 as *mut u8,
+                &[num_experts, 2 * inter, hidden],
+                DType::Fp8E4m3,
+            )
+        };
+        let w2 = unsafe {
+            GpuTensor::new(
+                0x3000 as *mut u8,
+                &[num_experts, hidden, inter],
+                DType::Fp8E4m3,
+            )
+        };
+
+        // Scale shapes: [E, ceil(N/bn), ceil(K/bk)]
+        let w1_sr = (2 * inter + block_n - 1) / block_n; // ceil(1536/128) = 12
+        let w1_sc = (hidden + block_k - 1) / block_k; // ceil(2048/128) = 16
+        let w2_sr = (hidden + block_n - 1) / block_n; // ceil(2048/128) = 16
+        let w2_sc = (inter + block_k - 1) / block_k; // ceil(768/128) = 6
+
+        let w1_scale =
+            unsafe { GpuTensor::new(0x4000 as *mut u8, &[num_experts, w1_sr, w1_sc], DType::F32) };
+        let w2_scale =
+            unsafe { GpuTensor::new(0x5000 as *mut u8, &[num_experts, w2_sr, w2_sc], DType::F32) };
+
+        let layer = Fp8BlockFusedMoELayer {
+            gate: Linear::new(gate_w, None),
+            w1,
+            w2,
+            w1_scale_inv: w1_scale,
+            w2_scale_inv: w2_scale,
+            block_size: [block_n, block_k],
+            num_experts,
+            top_k: 8,
+            intermediate_size: inter,
+            hidden_size: hidden,
+            renormalize: true,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        };
+
+        assert_eq!(layer.num_experts, 128);
+        assert_eq!(layer.top_k, 8);
+        assert_eq!(layer.intermediate_size, 768);
+        assert_eq!(layer.hidden_size, 2048);
+        assert_eq!(layer.block_size, [128, 128]);
+        assert_eq!(layer.w1.shape(), &[128, 1536, 2048]);
+        assert_eq!(layer.w2.shape(), &[128, 2048, 768]);
+        assert_eq!(layer.w1.dtype(), DType::Fp8E4m3);
+        assert_eq!(layer.w1_scale_inv.shape(), &[128, 12, 16]);
+        assert_eq!(layer.w2_scale_inv.shape(), &[128, 16, 6]);
     }
 }

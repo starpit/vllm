@@ -19,7 +19,9 @@ use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Linear, LinearLayer, RmsNorm};
-use crate::layers_moe::{Fp8FusedMoELayer, FusedMoELayer, MarlinSharedFusedMoELayer};
+use crate::layers_moe::{
+    Fp8BlockFusedMoELayer, Fp8FusedMoELayer, FusedMoELayer, MarlinSharedFusedMoELayer,
+};
 use crate::model::llama::{LlamaAttention, LlamaMLP, RotaryCache, TpConfig};
 #[cfg(feature = "nccl")]
 use crate::nccl::NcclGroup;
@@ -49,6 +51,13 @@ pub enum Qwen3MoeMlp {
     QuantizedMoE(MarlinSharedFusedMoELayer),
     Fp8MoE {
         moe: Fp8FusedMoELayer,
+        shared_gate_up: Option<Linear>,
+        shared_down: Option<Linear>,
+        shared_expert_gate: Option<Linear>,
+        shared_intermediate_size: usize,
+    },
+    Fp8BlockMoE {
+        moe: Fp8BlockFusedMoELayer,
         shared_gate_up: Option<Linear>,
         shared_down: Option<Linear>,
         shared_expert_gate: Option<Linear>,
@@ -119,6 +128,58 @@ impl Qwen3MoeMlp {
             }
             Self::QuantizedMoE(layer) => layer.forward(hidden_states, device),
             Self::Fp8MoE {
+                moe,
+                shared_gate_up,
+                shared_down,
+                shared_expert_gate,
+                shared_intermediate_size,
+            } => {
+                let stream = device.compute_stream;
+                let moe_out = moe.forward(hidden_states, device);
+
+                if let (Some(shared_gu_w), Some(shared_down_w), Some(shared_gate_w)) =
+                    (shared_gate_up, shared_down, shared_expert_gate)
+                {
+                    let shared_gu =
+                        shared_gu_w.forward(hidden_states, &mut device.cublas, &mut device.caching);
+                    let shared_activated = kernels::silu_and_mul_fused(
+                        *shared_gu.view(),
+                        *shared_intermediate_size,
+                        &mut device.caching,
+                        stream,
+                    );
+                    drop(shared_gu);
+
+                    let shared_out = shared_down_w.forward(
+                        shared_activated.view(),
+                        &mut device.cublas,
+                        &mut device.caching,
+                    );
+                    drop(shared_activated);
+
+                    let gate_logits = shared_gate_w.forward(
+                        hidden_states,
+                        &mut device.cublas,
+                        &mut device.caching,
+                    );
+
+                    let result = kernels::sigmoid_mul_add(
+                        *moe_out.view(),
+                        *shared_out.view(),
+                        *gate_logits.view(),
+                        &mut device.caching,
+                        stream,
+                    );
+                    drop(moe_out);
+                    drop(shared_out);
+                    drop(gate_logits);
+
+                    result
+                } else {
+                    moe_out
+                }
+            }
+            Self::Fp8BlockMoE {
                 moe,
                 shared_gate_up,
                 shared_down,
@@ -558,8 +619,8 @@ impl Qwen3MoeDecoderLayer {
                 let is_block = weights.contains(&first_block_scale);
 
                 if is_block {
-                    // Block-quantized experts: dequantize to BF16 and use dense MoE path.
-                    let moe = gpu_weights::load_fp8_block_moe_experts_dequant(
+                    // Block-quantized experts: keep FP8 with 3D block scales.
+                    let moe = gpu_weights::load_fp8_block_moe_experts(
                         weights,
                         &moe_prefix,
                         config.num_experts,
@@ -606,7 +667,7 @@ impl Qwen3MoeDecoderLayer {
                         (None, None, None)
                     };
 
-                    Qwen3MoeMlp::MoE {
+                    Qwen3MoeMlp::Fp8BlockMoE {
                         moe,
                         shared_gate_up,
                         shared_down,
@@ -1396,6 +1457,9 @@ impl Qwen3MoeForCausalLM {
                     layer.moe.tp_group = Some(Arc::clone(&group));
                 }
                 Qwen3MoeMlp::Fp8MoE { moe, .. } => {
+                    moe.tp_group = Some(Arc::clone(&group));
+                }
+                Qwen3MoeMlp::Fp8BlockMoE { moe, .. } => {
                     moe.tp_group = Some(Arc::clone(&group));
                 }
             }

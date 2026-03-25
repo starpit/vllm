@@ -804,6 +804,30 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Fused MoE GEMM — FP8 block-quantized (per-block weight scales applied during dequant)
+    fn fused_moe_fp8_block_gemm_dequant(
+        output: *mut c_void,
+        input: *const c_void,
+        weights: *const c_void,
+        a_scales: *const f32,
+        w_scale_inv: *const f32,
+        topk_weights: *const f32,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        num_tokens_post_padded: *const i32,
+        num_valid_tokens: c_int,
+        in_features: c_int,
+        out_features: c_int,
+        top_k: c_int,
+        apply_weights: c_int,
+        block_m: c_int,
+        quant_block_n: c_int,
+        quant_block_k: c_int,
+        scale_stride_e: c_int,
+        scale_stride_n: c_int,
+        stream: CUstream,
+    );
+
     // Fused sigmoid_mul_add: out = a + sigmoid(gate) * b
     fn sigmoid_mul_add_bf16(
         out: *mut c_void,
@@ -2821,28 +2845,6 @@ pub unsafe fn fp8_block_dequant(
     }
 
     out
-}
-
-/// Dequantize FP8 block-quantized weight to BF16, writing into a caller-
-/// provided output buffer. Used by weight loading to dequant MoE experts
-/// directly into stacked buffers without needing a CachingAllocator.
-///
-/// * `weight_ptr`: FP8 E4M3 data, `[n, k]`
-/// * `scale_ptr`: f32 block scales, `[ceil(n/block_n), ceil(k/block_k)]`
-/// * `output_ptr`: BF16 output, `[n, k]` (must be pre-allocated)
-pub unsafe fn fp8_block_dequant_bf16_raw(
-    weight_ptr: *const u8,
-    scale_ptr: *const f32,
-    output_ptr: *mut u16,
-    n: i32,
-    k: i32,
-    block_n: i32,
-    block_k: i32,
-    stream: CUstream,
-) {
-    fp8_block_dequant_bf16(
-        weight_ptr, scale_ptr, output_ptr, n, k, block_n, block_k, stream,
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5356,6 +5358,69 @@ pub unsafe fn fused_moe_fp8_gemm(
         top_k as c_int,
         apply_weights as c_int,
         block_m as c_int,
+        stream,
+    );
+    out
+}
+
+// ---------------------------------------------------------------------------
+// FP8 Block-Quantized Fused MoE GEMM
+// ---------------------------------------------------------------------------
+
+/// FP8 block-quantized fused MoE GEMM with per-block weight scales.
+///
+/// Same as `fused_moe_fp8_gemm` but weight scales are 3D block scales
+/// `[E, ceil(N/block_n), ceil(K/block_k)]` applied during FP8→BF16 dequant.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn fused_moe_fp8_block_gemm(
+    input: GpuTensor,       // FP8 E4M3
+    weights: GpuTensor,     // FP8 E4M3
+    a_scales: GpuTensor,    // f32 per-token
+    w_scale_inv: GpuTensor, // f32 [E, ceil(N/bn), ceil(K/bk)]
+    topk_weights: GpuTensor,
+    sorted_token_ids: GpuTensor,
+    expert_ids: GpuTensor,
+    num_tokens_post_padded: GpuTensor,
+    num_tokens: usize,
+    top_k: usize,
+    block_m: usize,
+    apply_weights: bool,
+    block_size: [usize; 2], // [block_n, block_k]
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let in_features = input.dim(1);
+    let out_features = weights.dim(1);
+
+    let out = alloc.alloc_tensor(&[num_tokens * top_k, out_features], DType::BF16);
+
+    let block_n = block_size[0];
+    let block_k = block_size[1];
+    let scale_cols = (in_features + block_k - 1) / block_k;
+    let scale_rows = (out_features + block_n - 1) / block_n;
+    let scale_stride_e = scale_rows * scale_cols;
+    let scale_stride_n = scale_cols;
+
+    fused_moe_fp8_block_gemm_dequant(
+        out.as_mut_ptr() as *mut c_void,
+        input.as_ptr() as *const c_void,
+        weights.as_ptr() as *const c_void,
+        a_scales.as_ptr() as *const f32,
+        w_scale_inv.as_ptr() as *const f32,
+        topk_weights.as_ptr() as *const f32,
+        sorted_token_ids.as_ptr() as *const i32,
+        expert_ids.as_ptr() as *const i32,
+        num_tokens_post_padded.as_ptr() as *const i32,
+        num_tokens as c_int,
+        in_features as c_int,
+        out_features as c_int,
+        top_k as c_int,
+        apply_weights as c_int,
+        block_m as c_int,
+        block_n as c_int,
+        block_k as c_int,
+        scale_stride_e as c_int,
+        scale_stride_n as c_int,
         stream,
     );
     out

@@ -707,6 +707,161 @@ fused_moe_gemm_fp8_dequant_wmma(
     }
 }
 
+// SM80+ FP8 block-quantized MoE GEMM — applies per-block weight scales during
+// the FP8→BF16 dequant step in shared memory, so WMMA accumulates correctly-
+// scaled BF16 values. The epilogue only applies per-token activation scale.
+//
+// w_scale_inv: [E, ceil(N/block_n), ceil(K/block_k)] f32  (3D block scales)
+// scale_stride_e: stride to advance one expert in w_scale_inv
+// scale_stride_n: stride to advance one N-block in w_scale_inv
+template <int BLOCK_M_T>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK)
+fused_moe_gemm_fp8_block_dequant_wmma(
+    __nv_bfloat16* __restrict__ output,
+    const uint8_t* __restrict__ input,       // FP8 E4M3 [M, K]
+    const uint8_t* __restrict__ weights,     // FP8 E4M3 [E, N, K]
+    const float* __restrict__ a_scales,      // [M] per-token activation scales
+    const float* __restrict__ w_scale_inv,   // [E, ceil(N/bn), ceil(K/bk)] block scales
+    const float* __restrict__ topk_weights,
+    const int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ expert_ids,
+    const int32_t* __restrict__ num_tokens_post_padded,
+    int32_t num_valid_tokens,
+    int32_t K,
+    int32_t N,
+    int32_t top_k,
+    int32_t apply_weights,
+    int32_t block_n,           // quantization block size along N
+    int32_t block_k,           // quantization block size along K
+    int32_t scale_stride_e,    // ceil(N/block_n) * ceil(K/block_k)
+    int32_t scale_stride_n)    // ceil(K/block_k)
+{
+    constexpr int WARPS_PER_M = BLOCK_M_T / WMMA_M;
+    constexpr int WARPS_PER_N = WARPS_PER_BLOCK / WARPS_PER_M;
+    constexpr int N_TILES_PER_WARP = WARP_TILES_N / WARPS_PER_N;
+
+    const int32_t total_padded = *num_tokens_post_padded;
+    const int32_t num_n_blocks = (N + BLOCK_N - 1) / BLOCK_N;
+
+    // GROUP_SIZE_M swizzle
+    const int32_t num_m_blocks = gridDim.x / num_n_blocks;
+    const int32_t num_pid_in_group = GROUP_SIZE_M * num_n_blocks;
+    const int32_t group_id = blockIdx.x / num_pid_in_group;
+    const int32_t first_pid_m = group_id * GROUP_SIZE_M;
+    const int32_t group_size_m = min(num_m_blocks - first_pid_m, GROUP_SIZE_M);
+    const int32_t pid_m = first_pid_m + (blockIdx.x % group_size_m);
+    const int32_t pid_n = (blockIdx.x % num_pid_in_group) / group_size_m;
+
+    if (pid_m * BLOCK_M_T >= total_padded) return;
+
+    const int32_t expert_id = expert_ids[pid_m];
+    if (expert_id < 0) return;
+
+    const uint8_t* expert_w = weights + (int64_t)expert_id * N * K;
+    const float* expert_scale = w_scale_inv + expert_id * scale_stride_e;
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int warp_m = warp_id / WARPS_PER_N;
+    const int warp_n_start = (warp_id % WARPS_PER_N) * N_TILES_PER_WARP;
+
+    __shared__ __nv_bfloat16 smem_a[BLOCK_M_T][BLOCK_K];
+    __shared__ __nv_bfloat16 smem_b[BLOCK_K][BLOCK_N];
+
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[N_TILES_PER_WARP];
+    #pragma unroll
+    for (int wn = 0; wn < N_TILES_PER_WARP; ++wn) {
+        wmma::fill_fragment(acc[wn], 0.0f);
+    }
+
+    for (int32_t k_start = 0; k_start < K; k_start += BLOCK_K) {
+        // Load A: FP8 → BF16 dequant in smem. No scale applied (activation scale in epilogue).
+        for (int32_t idx = threadIdx.x; idx < BLOCK_M_T * BLOCK_K; idx += THREADS_PER_BLOCK) {
+            int32_t m_local = idx / BLOCK_K;
+            int32_t k_local = idx % BLOCK_K;
+            int32_t global_m = pid_m * BLOCK_M_T + m_local;
+            int32_t global_k = k_start + k_local;
+
+            __nv_bfloat16 val = __float2bfloat16(0.0f);
+            if (global_m < total_padded && global_k < K) {
+                int32_t token_id = sorted_token_ids[global_m];
+                if (token_id < num_valid_tokens * top_k) {
+                    val = fp8_to_bf16_raw(input[(int64_t)(token_id / top_k) * K + global_k]);
+                }
+            }
+            smem_a[m_local][k_local] = val;
+        }
+
+        // Load B: FP8 → BF16 with per-block weight scale applied during dequant.
+        for (int32_t idx = threadIdx.x; idx < BLOCK_K * BLOCK_N; idx += THREADS_PER_BLOCK) {
+            int32_t k_local = idx / BLOCK_N;
+            int32_t n_local = idx % BLOCK_N;
+            int32_t global_k = k_start + k_local;
+            int32_t global_n = pid_n * BLOCK_N + n_local;
+
+            __nv_bfloat16 val = __float2bfloat16(0.0f);
+            if (global_k < K && global_n < N) {
+                __nv_fp8_e4m3 fp8 = *reinterpret_cast<const __nv_fp8_e4m3*>(
+                    &expert_w[(int64_t)global_n * K + global_k]);
+                float raw = float(fp8);
+                int32_t sn = global_n / block_n;
+                int32_t sk = global_k / block_k;
+                float scale = expert_scale[sn * scale_stride_n + sk];
+                val = __float2bfloat16(raw * scale);
+            }
+            smem_b[k_local][n_local] = val;
+        }
+
+        __syncthreads();
+
+        // Standard BF16 WMMA compute with warp redistribution.
+        #pragma unroll
+        for (int32_t ki = 0; ki < BLOCK_K; ki += WMMA_K) {
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+            wmma::load_matrix_sync(a_frag, &smem_a[warp_m * WMMA_M][ki], BLOCK_K);
+
+            #pragma unroll
+            for (int wn = 0; wn < N_TILES_PER_WARP; ++wn) {
+                wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
+                wmma::load_matrix_sync(b_frag, &smem_b[ki][(warp_n_start + wn) * WMMA_N], BLOCK_N);
+                wmma::mma_sync(acc[wn], a_frag, b_frag, acc[wn]);
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Epilogue: apply a_scale only (w_scale already applied during B-tile load).
+    __shared__ float warp_staging[WARPS_PER_BLOCK][WMMA_M * WMMA_N];
+
+    #pragma unroll
+    for (int wn = 0; wn < N_TILES_PER_WARP; ++wn) {
+        wmma::store_matrix_sync(
+            &warp_staging[warp_id][0], acc[wn], WMMA_N, wmma::mem_row_major);
+        __syncwarp();
+
+        for (int i = lane_id; i < WMMA_M * WMMA_N; i += 32) {
+            int32_t m_local = warp_m * WMMA_M + i / WMMA_N;
+            int32_t n_local = (warp_n_start + wn) * WMMA_N + i % WMMA_N;
+            int32_t global_m = pid_m * BLOCK_M_T + m_local;
+            int32_t global_n = pid_n * BLOCK_N + n_local;
+
+            if (global_m >= total_padded || global_n >= N) continue;
+
+            int32_t token_id = sorted_token_ids[global_m];
+            if (token_id >= num_valid_tokens * top_k) continue;
+
+            float val = warp_staging[warp_id][i];
+            // Only activation scale — weight block scale was applied during load.
+            val *= a_scales[token_id / top_k];
+            if (apply_weights) {
+                val *= topk_weights[token_id];
+            }
+            output[(int64_t)token_id * N + global_n] = __float2bfloat16(val);
+        }
+    }
+}
+
 } // namespace moe
 } // namespace vllm
 
@@ -873,6 +1028,54 @@ extern "C" void fused_moe_fp8_gemm_dequant(
         default:  LAUNCH_FP8_DEQUANT(128); break;
     }
     #undef LAUNCH_FP8_DEQUANT
+}
+
+// FP8 block-quantized fused MoE GEMM — per-block weight scales applied during dequant.
+extern "C" void fused_moe_fp8_block_gemm_dequant(
+    void* output,
+    const void* input,
+    const void* weights,
+    const float* a_scales,
+    const float* w_scale_inv,
+    const float* topk_weights,
+    const int32_t* sorted_token_ids,
+    const int32_t* expert_ids,
+    const int32_t* num_tokens_post_padded,
+    int num_valid_tokens,
+    int in_features,
+    int out_features,
+    int top_k,
+    int apply_weights,
+    int block_m,
+    int quant_block_n,
+    int quant_block_k,
+    int scale_stride_e,
+    int scale_stride_n,
+    cudaStream_t stream)
+{
+    int max_m_blocks = CEILDIV(num_valid_tokens * top_k, block_m) + 64;
+    int num_n_blocks = CEILDIV(out_features, BLOCK_N);
+    int grid = max_m_blocks * num_n_blocks;
+
+    #define LAUNCH_FP8_BLOCK_DEQUANT(BM) \
+        vllm::moe::fused_moe_gemm_fp8_block_dequant_wmma<BM> \
+            <<<grid, THREADS_PER_BLOCK, 0, stream>>>( \
+                reinterpret_cast<__nv_bfloat16*>(output), \
+                reinterpret_cast<const uint8_t*>(input), \
+                reinterpret_cast<const uint8_t*>(weights), \
+                a_scales, w_scale_inv, topk_weights, \
+                sorted_token_ids, expert_ids, num_tokens_post_padded, \
+                num_valid_tokens, in_features, out_features, top_k, apply_weights, \
+                quant_block_n, quant_block_k, scale_stride_e, scale_stride_n)
+
+    switch (block_m) {
+        case 16:  LAUNCH_FP8_BLOCK_DEQUANT(16);  break;
+        case 32:  LAUNCH_FP8_BLOCK_DEQUANT(32);  break;
+        case 64:  LAUNCH_FP8_BLOCK_DEQUANT(64);  break;
+        case 128: LAUNCH_FP8_BLOCK_DEQUANT(128); break;
+        default:  LAUNCH_FP8_BLOCK_DEQUANT(128); break;
+    }
+    #undef LAUNCH_FP8_BLOCK_DEQUANT
 }
 
 // =====================================================================

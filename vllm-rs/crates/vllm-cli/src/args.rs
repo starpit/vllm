@@ -370,6 +370,10 @@ pub struct ChatArgs {
     #[arg(long)]
     pub max_tokens: Option<u32>,
 
+    /// Number of GPUs for tensor parallelism (default: 1).
+    #[arg(long, default_value_t = 1)]
+    pub tensor_parallel_size: usize,
+
     /// Disable CUDA graphs (use eager mode).
     #[arg(long)]
     pub enforce_eager: bool,

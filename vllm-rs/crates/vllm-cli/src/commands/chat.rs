@@ -116,6 +116,7 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     if let Some(len) = args.max_model_len {
         builder = builder.max_model_len(len);
     }
+    builder = builder.tensor_parallel_size(args.tensor_parallel_size);
     builder = builder.enforce_eager(args.enforce_eager);
     let mut llm = builder.build()?;
     let startup_ms = t0.elapsed().as_secs_f64() * 1000.0;

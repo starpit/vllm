@@ -2823,6 +2823,28 @@ pub unsafe fn fp8_block_dequant(
     out
 }
 
+/// Dequantize FP8 block-quantized weight to BF16, writing into a caller-
+/// provided output buffer. Used by weight loading to dequant MoE experts
+/// directly into stacked buffers without needing a CachingAllocator.
+///
+/// * `weight_ptr`: FP8 E4M3 data, `[n, k]`
+/// * `scale_ptr`: f32 block scales, `[ceil(n/block_n), ceil(k/block_k)]`
+/// * `output_ptr`: BF16 output, `[n, k]` (must be pre-allocated)
+pub unsafe fn fp8_block_dequant_bf16_raw(
+    weight_ptr: *const u8,
+    scale_ptr: *const f32,
+    output_ptr: *mut u16,
+    n: i32,
+    k: i32,
+    block_n: i32,
+    block_k: i32,
+    stream: CUstream,
+) {
+    fp8_block_dequant_bf16(
+        weight_ptr, scale_ptr, output_ptr, n, k, block_n, block_k, stream,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // CUTLASS Scaled Matmul (Fused FP8 GEMM with per-row scale epilogue)
 // ---------------------------------------------------------------------------

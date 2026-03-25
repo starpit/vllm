@@ -5042,12 +5042,25 @@ impl Worker for CudaWorker {
                         device,
                     )
                 } else if qconfig.is_fp8() {
-                    vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_fp8(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
+                    let fp8_cfg = match &qconfig {
+                        vllm_cuda::quant::QuantConfig::Fp8(c) => c,
+                        _ => unreachable!(),
+                    };
+                    if fp8_cfg.weight_block_size.is_some() {
+                        vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_fp8_block(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            device,
+                        )
+                    } else {
+                        vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_fp8(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            device,
+                        )
+                    }
                 } else if use_tp {
                     vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_tp(
                         &mut weights,

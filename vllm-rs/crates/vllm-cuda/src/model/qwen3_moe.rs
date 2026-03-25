@@ -508,6 +508,192 @@ impl Qwen3MoeDecoderLayer {
         })
     }
 
+    /// Load an FP8 block-quantized decoder layer.
+    /// Attention and dense MLP use block FP8 (weight_scale_inv with 2D scales).
+    /// MoE expert weights are dequantized to BF16 at load time because the FP8
+    /// MoE kernel only supports per-expert scalar scales, not 2D block scales.
+    pub fn load_fp8_block(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Qwen3MoeConfig,
+        layer_idx: usize,
+        dtype: DType,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let llama_cfg = config.as_llama_config();
+
+        // Load block-FP8 attention with QK-norm weights.
+        let self_attn = LlamaAttention::load_fp8_block(
+            weights,
+            &format!("{prefix}.self_attn"),
+            &llama_cfg,
+            layer_idx,
+            dtype,
+            config.rms_norm_eps,
+            stream,
+        )?;
+
+        let is_dense = config.mlp_only_layers.contains(&layer_idx);
+        let mlp = if is_dense {
+            let dense = LlamaMLP::load_fp8_block(
+                weights,
+                &format!("{prefix}.mlp"),
+                config.intermediate_size,
+                dtype,
+                stream,
+            )?;
+            Qwen3MoeMlp::Dense(dense)
+        } else {
+            let moe_prefix = format!("{prefix}.mlp");
+            let first_gate_name = format!("{moe_prefix}.experts.0.gate_proj.weight");
+            let is_fp8 = weights
+                .tensor_info(&first_gate_name)
+                .map(|(_, dt)| dt == DType::Fp8E4m3)
+                .unwrap_or(false);
+
+            if is_fp8 {
+                // Check if experts have block scales (weight_scale_inv) or per-tensor (weight_scale).
+                let first_block_scale =
+                    format!("{moe_prefix}.experts.0.gate_proj.weight_scale_inv");
+                let is_block = weights.contains(&first_block_scale);
+
+                if is_block {
+                    // Block-quantized experts: dequantize to BF16 and use dense MoE path.
+                    let moe = gpu_weights::load_fp8_block_moe_experts_dequant(
+                        weights,
+                        &moe_prefix,
+                        config.num_experts,
+                        config.moe_intermediate_size,
+                        config.hidden_size,
+                        config.num_experts_per_tok,
+                        true, // Qwen3 MoE renormalizes
+                        "gate_proj",
+                        "up_proj",
+                        "down_proj",
+                    )?;
+
+                    // Load shared expert (dense BF16).
+                    let shared_inter = config.shared_expert_intermediate_size;
+                    let (shared_gate_up, shared_down, shared_expert_gate) = if shared_inter > 0 {
+                        let gate_up = {
+                            let gate_name = format!("{moe_prefix}.shared_expert.gate_proj.weight");
+                            let up_name = format!("{moe_prefix}.shared_expert.up_proj.weight");
+                            let (_, se_dtype) = weights
+                                .tensor_info(&gate_name)
+                                .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
+                            let se_elem = se_dtype.size_bytes();
+                            let hidden = config.hidden_size;
+                            let gate_proj_bytes = shared_inter * hidden * se_elem;
+                            let total = 2 * gate_proj_bytes;
+                            let ptr = unsafe { crate::driver::mem_alloc(total)? };
+                            unsafe {
+                                weights.take_into(&gate_name, ptr, stream)?;
+                                weights.take_into(&up_name, ptr.add(gate_proj_bytes), stream)?;
+                            }
+                            let w = unsafe {
+                                GpuTensor::new(ptr, &[2 * shared_inter, hidden], se_dtype)
+                            };
+                            Linear::new(w, None)
+                        };
+                        let down = Linear::load(
+                            weights,
+                            &format!("{moe_prefix}.shared_expert.down_proj"),
+                        )?;
+                        let gate =
+                            Linear::load(weights, &format!("{moe_prefix}.shared_expert_gate"))?;
+                        (Some(gate_up), Some(down), Some(gate))
+                    } else {
+                        (None, None, None)
+                    };
+
+                    Qwen3MoeMlp::MoE {
+                        moe,
+                        shared_gate_up,
+                        shared_down,
+                        shared_expert_gate,
+                        shared_intermediate_size: shared_inter,
+                    }
+                } else {
+                    // Per-tensor FP8 experts: use existing FP8 MoE path.
+                    let fp8_moe = gpu_weights::load_fp8_moe_experts(
+                        weights,
+                        &moe_prefix,
+                        config.num_experts,
+                        config.moe_intermediate_size,
+                        config.hidden_size,
+                        config.num_experts_per_tok,
+                        true,
+                        "gate_proj",
+                        "up_proj",
+                        "down_proj",
+                    )?;
+
+                    // Load shared expert (dense BF16).
+                    let shared_inter = config.shared_expert_intermediate_size;
+                    let (shared_gate_up, shared_down, shared_expert_gate) = if shared_inter > 0 {
+                        let gate_up = {
+                            let gate_name = format!("{moe_prefix}.shared_expert.gate_proj.weight");
+                            let up_name = format!("{moe_prefix}.shared_expert.up_proj.weight");
+                            let (_, se_dtype) = weights
+                                .tensor_info(&gate_name)
+                                .ok_or_else(|| anyhow::anyhow!("weight not found: {gate_name}"))?;
+                            let se_elem = se_dtype.size_bytes();
+                            let hidden = config.hidden_size;
+                            let gate_proj_bytes = shared_inter * hidden * se_elem;
+                            let total = 2 * gate_proj_bytes;
+                            let ptr = unsafe { crate::driver::mem_alloc(total)? };
+                            unsafe {
+                                weights.take_into(&gate_name, ptr, stream)?;
+                                weights.take_into(&up_name, ptr.add(gate_proj_bytes), stream)?;
+                            }
+                            let w = unsafe {
+                                GpuTensor::new(ptr, &[2 * shared_inter, hidden], se_dtype)
+                            };
+                            Linear::new(w, None)
+                        };
+                        let down = Linear::load(
+                            weights,
+                            &format!("{moe_prefix}.shared_expert.down_proj"),
+                        )?;
+                        let gate =
+                            Linear::load(weights, &format!("{moe_prefix}.shared_expert_gate"))?;
+                        (Some(gate_up), Some(down), Some(gate))
+                    } else {
+                        (None, None, None)
+                    };
+
+                    Qwen3MoeMlp::Fp8MoE {
+                        moe: fp8_moe,
+                        shared_gate_up,
+                        shared_down,
+                        shared_expert_gate,
+                        shared_intermediate_size: shared_inter,
+                    }
+                }
+            } else {
+                Self::load_moe(weights, &moe_prefix, config, None, stream)?
+            }
+        };
+
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+        })
+    }
+
     /// Load a quantized (AWQ/GPTQ → Marlin) decoder layer.
     /// Attention uses Marlin linear layers. MoE uses MarlinFusedMoELayer.
     /// Shared experts (if any) use Marlin linear layers.
@@ -814,6 +1000,48 @@ impl Qwen3MoeModel {
         })
     }
 
+    /// Load an FP8 block-quantized Qwen3 MoE model.
+    /// Attention and dense MLP use block FP8. MoE experts are dequantized to BF16.
+    pub fn load_fp8_block(
+        weights: &mut GpuWeights,
+        config: &Qwen3MoeConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = crate::layers::Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            layers.push(Qwen3MoeDecoderLayer::load_fp8_block(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                dtype,
+                device.compute_stream,
+            )?);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+        })
+    }
+
     /// Load a quantized (AWQ/GPTQ → Marlin) Qwen3 MoE model.
     pub fn load_quantized(
         weights: &mut GpuWeights,
@@ -946,6 +1174,22 @@ impl Qwen3MoeForCausalLM {
         device: &GpuDevice,
     ) -> Result<Self> {
         let model = Qwen3MoeModel::load_fp8(weights, config, dtype, device)?;
+        let lm_head = if config.tie_word_embeddings {
+            Linear::new(model.embed_tokens.weight, None)
+        } else {
+            Linear::load(weights, "lm_head")?
+        };
+        Ok(Self { model, lm_head })
+    }
+
+    /// Load an FP8 block-quantized Qwen3 MoE model.
+    pub fn load_fp8_block(
+        weights: &mut GpuWeights,
+        config: &Qwen3MoeConfig,
+        dtype: DType,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let model = Qwen3MoeModel::load_fp8_block(weights, config, dtype, device)?;
         let lm_head = if config.tie_word_embeddings {
             Linear::new(model.embed_tokens.weight, None)
         } else {

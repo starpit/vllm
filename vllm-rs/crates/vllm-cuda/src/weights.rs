@@ -3196,6 +3196,146 @@ pub fn load_fp8_moe_experts(
     })
 }
 
+/// Load FP8 block-quantized MoE expert weights, dequantize to BF16, and
+/// return a dense `FusedMoELayer`.
+///
+/// Block-quantized FP8 experts have 2D `weight_scale_inv` tensors per weight,
+/// but the FP8 MoE kernel only supports per-expert scalar scales. We dequantize
+/// each expert's weights to BF16 at load time and use the dense MoE path.
+#[allow(clippy::too_many_arguments)]
+pub fn load_fp8_block_moe_experts_dequant(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    num_experts: usize,
+    intermediate_size: usize,
+    hidden_size: usize,
+    top_k: usize,
+    renormalize: bool,
+    gate_name: &str,
+    up_name: &str,
+    down_name: &str,
+) -> Result<crate::layers_moe::FusedMoELayer> {
+    let stream = weights.stream();
+
+    // Gate weight — always dense BF16.
+    let gate = Linear::load(weights, &format!("{prefix}.gate"))?;
+
+    let bf16_elem = DType::BF16.size_bytes(); // 2
+
+    // Allocate stacked BF16 expert weight buffers.
+    // w1: [E, 2*inter, hidden] BF16
+    // w2: [E, hidden, inter] BF16
+    let w1_bytes = num_experts * 2 * intermediate_size * hidden_size * bf16_elem;
+    let w2_bytes = num_experts * hidden_size * intermediate_size * bf16_elem;
+    let w1_ptr = unsafe { crate::driver::mem_alloc(w1_bytes)? };
+    let w2_ptr = unsafe { crate::driver::mem_alloc(w2_bytes)? };
+
+    for e in 0..num_experts {
+        let gate_pfx = format!("{prefix}.experts.{e}.{gate_name}");
+        let up_pfx = format!("{prefix}.experts.{e}.{up_name}");
+        let down_pfx = format!("{prefix}.experts.{e}.{down_name}");
+
+        // --- gate_proj: dequant FP8 block → BF16 into w1[e, 0..inter, :] ---
+        let gate_w = weights.take(&format!("{gate_pfx}.weight"))?;
+        let gate_s_raw = weights.take(&format!("{gate_pfx}.weight_scale_inv"))?;
+        let gate_s = ensure_f32_scale(gate_s_raw, stream)?;
+        let (gn, gk) = (gate_w.dim(0), gate_w.dim(1));
+        let g_block_n = gn / gate_s.dim(0);
+        let g_block_k = gk / gate_s.dim(1);
+        let w1_offset = e * 2 * intermediate_size * hidden_size * bf16_elem;
+        unsafe {
+            crate::kernels::fp8_block_dequant_bf16_raw(
+                gate_w.as_ptr(),
+                gate_s.as_ptr() as *const f32,
+                w1_ptr.add(w1_offset) as *mut u16,
+                gn as i32,
+                gk as i32,
+                g_block_n as i32,
+                g_block_k as i32,
+                stream,
+            );
+        }
+
+        // --- up_proj: dequant FP8 block → BF16 into w1[e, inter..2*inter, :] ---
+        let up_w = weights.take(&format!("{up_pfx}.weight"))?;
+        let up_s_raw = weights.take(&format!("{up_pfx}.weight_scale_inv"))?;
+        let up_s = ensure_f32_scale(up_s_raw, stream)?;
+        let (un, uk) = (up_w.dim(0), up_w.dim(1));
+        let u_block_n = un / up_s.dim(0);
+        let u_block_k = uk / up_s.dim(1);
+        let gate_bf16_bytes = intermediate_size * hidden_size * bf16_elem;
+        unsafe {
+            crate::kernels::fp8_block_dequant_bf16_raw(
+                up_w.as_ptr(),
+                up_s.as_ptr() as *const f32,
+                w1_ptr.add(w1_offset + gate_bf16_bytes) as *mut u16,
+                un as i32,
+                uk as i32,
+                u_block_n as i32,
+                u_block_k as i32,
+                stream,
+            );
+        }
+
+        // --- down_proj: dequant FP8 block → BF16 into w2[e, :, :] ---
+        let down_w = weights.take(&format!("{down_pfx}.weight"))?;
+        let down_s_raw = weights.take(&format!("{down_pfx}.weight_scale_inv"))?;
+        let down_s = ensure_f32_scale(down_s_raw, stream)?;
+        let (dn, dk) = (down_w.dim(0), down_w.dim(1));
+        let d_block_n = dn / down_s.dim(0);
+        let d_block_k = dk / down_s.dim(1);
+        let w2_offset = e * hidden_size * intermediate_size * bf16_elem;
+        unsafe {
+            crate::kernels::fp8_block_dequant_bf16_raw(
+                down_w.as_ptr(),
+                down_s.as_ptr() as *const f32,
+                w2_ptr.add(w2_offset) as *mut u16,
+                dn as i32,
+                dk as i32,
+                d_block_n as i32,
+                d_block_k as i32,
+                stream,
+            );
+        }
+
+        // Consume input_scale if present.
+        for pfx in &[&gate_pfx, &up_pfx, &down_pfx] {
+            let is_name = format!("{pfx}.input_scale");
+            if weights.contains(&is_name) {
+                let _ = weights.take(&is_name);
+            }
+        }
+    }
+
+    let w1 = unsafe {
+        GpuTensor::new(
+            w1_ptr,
+            &[num_experts, 2 * intermediate_size, hidden_size],
+            DType::BF16,
+        )
+    };
+    let w2 = unsafe {
+        GpuTensor::new(
+            w2_ptr,
+            &[num_experts, hidden_size, intermediate_size],
+            DType::BF16,
+        )
+    };
+
+    Ok(crate::layers_moe::FusedMoELayer {
+        gate,
+        w1,
+        w2,
+        num_experts,
+        top_k,
+        intermediate_size,
+        hidden_size,
+        renormalize,
+        #[cfg(feature = "nccl")]
+        tp_group: None,
+    })
+}
+
 /// Read a single f32 scalar scale from a weight tensor.
 /// Handles the case where the scale is stored as f32, BF16, or F16.
 fn read_f32_scale(weights: &mut GpuWeights, name: &str, stream: CUstream) -> Result<f32> {

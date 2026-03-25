@@ -5757,7 +5757,6 @@ mod tests_flash_attn {
             let seqused_ptr = upload(&[kv_len as i32], stream);
             let bt_ptr = upload(&[0i32], stream);
 
-            let total_q = batch * q_len;
             mha_varlen_fwd(
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,
@@ -5866,7 +5865,6 @@ mod tests_flash_attn {
             // block_table = [2, 0]: tokens 0-15 in block 2, tokens 16-31 in block 0
             let bt_ptr = upload(&[2i32, 0], stream);
 
-            let total_q = batch * q_len;
             mha_varlen_fwd(
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,
@@ -6056,7 +6054,6 @@ mod tests_flash_attn {
             let seqused_ptr = upload(&[kv_len as i32], stream);
             let bt_ptr = upload(&[0i32], stream);
 
-            let total_q = batch * q_len;
             mha_varlen_fwd(
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,
@@ -6394,7 +6391,6 @@ mod tests_flash_attn {
         let q_head_stride = head_dim as i64;
 
         let call = |k_ptr, v_ptr, bt_ptr, out_ptr, lse_ptr| {
-            let total_q = batch_size;
             mha_varlen_fwd(
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,
@@ -6607,7 +6603,6 @@ mod tests_flash_attn {
             let cu_q = upload(&[0i32, 1], stream);
             let cu_k = upload(&[0i32, kv_len as i32], stream);
 
-            let total_q = 1usize;
             mha_varlen_fwd(
                 q_ptr as *mut c_void,
                 k_ptr as *mut c_void,
@@ -9456,16 +9451,6 @@ mod tests_fp8_moe_gemm {
         let count = tensor.numel();
         let bytes = count * 2;
         let mut host = vec![half::bf16::ZERO; count];
-        driver::memcpy_dtoh_async(host.as_mut_ptr() as *mut u8, tensor.as_ptr(), bytes, stream)
-            .expect("d2h");
-        driver::stream_synchronize(stream).expect("sync");
-        host
-    }
-
-    unsafe fn download_f32(tensor: GpuTensor, stream: cudarc::driver::sys::CUstream) -> Vec<f32> {
-        let count = tensor.numel();
-        let bytes = count * 4;
-        let mut host = vec![0.0f32; count];
         driver::memcpy_dtoh_async(host.as_mut_ptr() as *mut u8, tensor.as_ptr(), bytes, stream)
             .expect("d2h");
         driver::stream_synchronize(stream).expect("sync");

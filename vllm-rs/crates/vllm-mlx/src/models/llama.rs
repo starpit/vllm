@@ -1704,13 +1704,19 @@ mod tests {
         let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
             .unwrap()
             .item();
-        assert_eq!(max_err, 0.0, "block_needs_positioning prefill non-deterministic");
+        assert_eq!(
+            max_err, 0.0,
+            "block_needs_positioning prefill non-deterministic"
+        );
 
         let diff_d = out1_d.subtract(&out2_d).unwrap();
         let max_err_d: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff_d).unwrap(), false)
             .unwrap()
             .item();
-        assert_eq!(max_err_d, 0.0, "block_needs_positioning decode non-deterministic");
+        assert_eq!(
+            max_err_d, 0.0,
+            "block_needs_positioning decode non-deterministic"
+        );
 
         // Shapes should be correct.
         assert_eq!(out1.shape(), &[4, 32]); // prefill: 4 tokens
@@ -1782,7 +1788,10 @@ mod tests {
         let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
             .unwrap()
             .item();
-        assert_eq!(max_err, 0.0, "block_needs_positioning model prefill non-deterministic");
+        assert_eq!(
+            max_err, 0.0,
+            "block_needs_positioning model prefill non-deterministic"
+        );
 
         for (i, (l1, l2)) in decode_logits_1
             .iter()
@@ -1793,7 +1802,10 @@ mod tests {
             let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
                 .unwrap()
                 .item();
-            assert_eq!(max_err, 0.0, "block_needs_positioning decode step {i} non-deterministic");
+            assert_eq!(
+                max_err, 0.0,
+                "block_needs_positioning decode step {i} non-deterministic"
+            );
         }
     }
 }

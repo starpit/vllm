@@ -3525,7 +3525,7 @@ pub unsafe fn flash_attn_paged_ext(
         eff_total_q as i32,
         // Spans: fused RoPE for cached K reads (combined cos|sin cache).
         cos_sin_cache_ptr as *const c_void,
-        std::ptr::null(),  // sin_ptr unused — rotate_k_smem_contiguous reads combined layout
+        std::ptr::null(), // sin_ptr unused — rotate_k_smem_contiguous reads combined layout
         rotary_dim as i32,
         if cos_sin_cache_ptr.is_null() || rotary_dim == 0 {
             0

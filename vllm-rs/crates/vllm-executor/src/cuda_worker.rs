@@ -6429,6 +6429,7 @@ impl CudaWorker {
             return Ok(ModelRunnerOutput::from_token_map(HashMap::new()));
         }
 
+        let total_tokens = prepared.flat_token_ids.len();
         let pp_active = self.pp_config.is_some_and(|pp| pp.pp_size > 1);
 
         // -------------------------------------------------------------------
@@ -6541,7 +6542,6 @@ impl CudaWorker {
                 }
             };
         let num_reqs = prepared.req_inputs.len();
-        let total_tokens = prepared.flat_token_ids.len();
 
         // Build batch_req_ids for this step (used by processor updates after forward).
         self.batch_req_ids.clear();

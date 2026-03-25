@@ -47,14 +47,14 @@ pub(crate) struct ExecuteQueryParams {
 // Span configuration
 // ---------------------------------------------------------------------------
 
-struct SpanConfig {
-    pad_token: u32,
-    block_size: usize,
+pub(crate) struct SpanConfig {
+    pub(crate) pad_token: u32,
+    pub(crate) block_size: usize,
 }
 
 impl SpanConfig {
     #[allow(dead_code)]
-    fn with_pad_token(block_size: usize, pad_token: u32) -> Self {
+    pub(crate) fn with_pad_token(block_size: usize, pad_token: u32) -> Self {
         Self {
             pad_token,
             block_size,
@@ -63,7 +63,10 @@ impl SpanConfig {
 
     /// Resolve pad token from `VLLM_V1_SPANS_PAD_TOKEN` env var, falling back
     /// to the tokenizer's encoding of `" "` (whitespace), then 0.
-    fn from_tokenizer(block_size: usize, tokenizer: &crate::tokenizer::Tokenizer) -> Self {
+    pub(crate) fn from_tokenizer(
+        block_size: usize,
+        tokenizer: &crate::tokenizer::Tokenizer,
+    ) -> Self {
         let pad_token = std::env::var("VLLM_V1_SPANS_PAD_TOKEN")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
@@ -90,6 +93,14 @@ struct TokenizeState {
     annotations: BTreeMap<usize, BlockKind>,
     /// Whether we're currently inside a relocatable context.
     in_relocatable: bool,
+    /// Messages rendered so far for incremental tokenization.
+    /// Each `tokenize_message` call appends to this and re-renders the full
+    /// conversation, taking only the delta tokens. This avoids spurious BOS
+    /// tokens between messages in a Seq.
+    rendered_messages: Vec<TemplateMessage>,
+    /// Number of token IDs produced by the last full render of
+    /// `rendered_messages` — the delta starts after this offset.
+    rendered_token_count: usize,
 }
 
 impl TokenizeState {
@@ -98,6 +109,8 @@ impl TokenizeState {
             tokens: Vec::new(),
             annotations: BTreeMap::new(),
             in_relocatable: false,
+            rendered_messages: Vec::new(),
+            rendered_token_count: 0,
         }
     }
 
@@ -116,10 +129,20 @@ impl TokenizeState {
         self.pad_to_block(cfg);
         let block_index = self.tokens.len() / cfg.block_size;
         self.annotations.insert(block_index, kind);
+        // Reset incremental render state — new annotation context means
+        // subsequent messages start a fresh conversation.
+        self.rendered_messages.clear();
+        self.rendered_token_count = 0;
     }
 }
 
 /// Tokenize a single message using the chat template and tokenizer.
+///
+/// Uses incremental rendering: the message is appended to the conversation
+/// accumulated in `state.rendered_messages`, the full conversation is
+/// re-rendered, and only the delta tokens (new tokens beyond the previous
+/// render) are added to `state.tokens`. This avoids spurious BOS tokens
+/// when multiple messages appear in a Seq.
 fn tokenize_message(
     msg: &Message,
     tokenizer: &Tokenizer,
@@ -131,22 +154,29 @@ fn tokenize_message(
         role: msg.role().to_string(),
         content: msg.content().to_string(),
     };
-    let rendered = template.apply_simple(&[tmpl_msg], false)?;
-    let ids = tokenizer.encode(&rendered, false)?;
+
+    // Append to the running conversation and re-render the full sequence.
+    state.rendered_messages.push(tmpl_msg);
+    let rendered = template.apply_simple(&state.rendered_messages, false)?;
+    let all_ids = tokenizer.encode(&rendered, false)?;
+
+    // Take only the delta — tokens added by this message.
+    let new_ids = &all_ids[state.rendered_token_count..];
+    state.rendered_token_count = all_ids.len();
 
     match msg {
         Message::Assistant(_) => {
             // For assistant messages, crop to block boundary (drop suffix tokens).
             // This matches spnl's extend_crop behavior.
-            let end = ids.len() + state.tokens.len();
+            let end = new_ids.len() + state.tokens.len();
             let nearest_block_boundary = end / cfg.block_size * cfg.block_size;
             let amount_to_crop =
-                std::cmp::min(ids.len(), end.saturating_sub(nearest_block_boundary));
-            let extra_end = ids.len() - amount_to_crop;
-            state.tokens.extend_from_slice(&ids[..extra_end]);
+                std::cmp::min(new_ids.len(), end.saturating_sub(nearest_block_boundary));
+            let extra_end = new_ids.len() - amount_to_crop;
+            state.tokens.extend_from_slice(&new_ids[..extra_end]);
         }
         _ => {
-            state.tokens.extend_from_slice(&ids);
+            state.tokens.extend_from_slice(new_ids);
         }
     }
     Ok(())
@@ -200,10 +230,10 @@ fn tokenize_input(
 
 /// Add the final assistant generation prompt.
 ///
-/// Many HuggingFace chat templates crash on an empty messages list, so we
-/// render with a dummy user message both with and without
-/// `add_generation_prompt`, then take the suffix that only appears in the
-/// "with" variant — that's the assistant prompt.
+/// Uses the accumulated conversation in `state.rendered_messages` to extract
+/// the generation prompt in context. If no messages have been accumulated
+/// (e.g. after an annotation boundary reset), falls back to a dummy user
+/// message to avoid template crashes on empty message lists.
 fn add_generation_prompt(
     tokenizer: &Tokenizer,
     template: &crate::chat_template::ChatTemplate,
@@ -216,30 +246,40 @@ fn add_generation_prompt(
         state.annotate_next_block(BlockKind::Relocatable, cfg);
     }
 
-    let dummy = TemplateMessage {
-        role: "user".to_string(),
-        content: "x".to_string(),
+    // Use the actual accumulated messages for correct gen prompt extraction.
+    // If empty (e.g. after annotation boundary reset), use a dummy.
+    let messages = if state.rendered_messages.is_empty() {
+        vec![TemplateMessage {
+            role: "user".to_string(),
+            content: "x".to_string(),
+        }]
+    } else {
+        state.rendered_messages.clone()
     };
-    let without = template.apply_simple(std::slice::from_ref(&dummy), false)?;
-    let with = template.apply_simple(&[dummy], true)?;
 
-    // The generation prompt is the suffix that `with` has beyond `without`.
-    let suffix = with.strip_prefix(&without).unwrap_or(&with);
-    if !suffix.is_empty() {
-        let ids = tokenizer.encode(suffix, false)?;
-        state.tokens.extend_from_slice(&ids);
+    // Render the conversation with add_generation_prompt=true and take the
+    // token delta from the current rendered_token_count. This ensures the
+    // gen prompt tokens are computed identically to how tokenize_message
+    // computes message deltas (full-string encoding, not isolated substring),
+    // avoiding BPE boundary mismatches.
+    let with = template.apply_simple(&messages, true)?;
+    let all_ids = tokenizer.encode(&with, false)?;
+    let new_ids = &all_ids[state.rendered_token_count..];
+    if !new_ids.is_empty() {
+        state.tokens.extend_from_slice(new_ids);
+        state.rendered_token_count = all_ids.len();
     }
     Ok(())
 }
 
 /// Result of tokenizing a span query: tokens + block annotations.
-struct SpanTokenized {
-    tokens: Vec<u32>,
-    annotations: Option<BTreeMap<usize, BlockKind>>,
+pub(crate) struct SpanTokenized {
+    pub(crate) tokens: Vec<u32>,
+    pub(crate) annotations: Option<BTreeMap<usize, BlockKind>>,
 }
 
 /// Tokenize a full SingleGenerate into a token sequence with annotations.
-fn tokenize_span_query(
+pub(crate) fn tokenize_span_query(
     spec: &SingleGenerate,
     tokenizer: &Tokenizer,
     template: &crate::chat_template::ChatTemplate,
@@ -260,7 +300,7 @@ fn tokenize_span_query(
 }
 
 /// Tokenize a map input (user message with relocatable prefix, padded).
-fn tokenize_map_input(
+pub(crate) fn tokenize_map_input(
     text: &str,
     tokenizer: &Tokenizer,
     template: &crate::chat_template::ChatTemplate,

@@ -173,6 +173,8 @@ pub struct InitializedSyncStack {
     pub model_name: String,
     /// Maximum model length.
     pub max_model_len: usize,
+    /// KV cache block size in tokens.
+    pub block_size: usize,
 }
 
 /// Check if the metal (MLX) feature is active and the device allows it.
@@ -551,6 +553,7 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
         chat_template,
         model_name: core.model_name,
         max_model_len: core.max_model_len,
+        block_size: config.block_size,
     })
 }
 

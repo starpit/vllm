@@ -296,6 +296,7 @@ pub struct LLM {
     chat_template: Option<ChatTemplate>,
     model_name: String,
     max_model_len: usize,
+    block_size: usize,
 }
 
 impl LLM {
@@ -324,6 +325,7 @@ impl LLM {
             chat_template: stack.chat_template,
             model_name: stack.model_name,
             max_model_len: stack.max_model_len,
+            block_size: stack.block_size,
         })
     }
 
@@ -409,6 +411,113 @@ impl LLM {
         volatile: bool,
     ) -> Result<Vec<RequestOutput>> {
         self.generate_impl(prompts, params, false, seal, volatile)
+    }
+
+    /// Execute a SPNL span query (JSON string), using the same tokenization
+    /// and annotation logic as the server's `/v1/query/execute` endpoint.
+    ///
+    /// `seal` and `volatile` control KV cache lifecycle:
+    /// - `seal=true`: seal generated blocks so they persist for reuse
+    /// - `volatile=true`: mark the request as volatile (output evictable)
+    ///
+    /// If `params` is provided, its `max_tokens` and `temperature` override
+    /// the values in the SPNL query metadata.
+    pub fn execute_query(
+        &mut self,
+        spnl_json: &str,
+        params: Option<SamplingParams>,
+        seal: bool,
+        volatile: bool,
+    ) -> Result<Vec<RequestOutput>> {
+        use spnl_core::optimizer::llo::llir::{Bulk, Repeat, SingleGenerateQuery};
+
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("execute_query requires a tokenizer"))?
+            .clone();
+        let template = self
+            .chat_template
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("execute_query requires a chat template"))?;
+
+        let cfg = crate::spans::SpanConfig::from_tokenizer(self.block_size, &tokenizer);
+
+        let query: SingleGenerateQuery = serde_json::from_str(spnl_json)
+            .map_err(|e| anyhow::anyhow!("invalid SPNL query: {e}"))?;
+
+        match query {
+            SingleGenerateQuery::SingleGenerate(spec) => {
+                let span_tok = crate::spans::tokenize_span_query(&spec, &tokenizer, template, &cfg)
+                    .map_err(|e| anyhow::anyhow!("span tokenization failed: {e}"))?;
+
+                let mut sp = Self::merge_spnl_params(&spec.metadata, params);
+                self.resolve_max_tokens(&mut sp, span_tok.tokens.len());
+
+                let prompt = Self::span_tok_to_prompt(span_tok);
+                self.generate_impl(&[prompt], Some(sp), false, seal, volatile)
+            }
+
+            SingleGenerateQuery::Bulk(Bulk::Repeat(Repeat { n, generate: spec })) => {
+                let span_tok = crate::spans::tokenize_span_query(&spec, &tokenizer, template, &cfg)
+                    .map_err(|e| anyhow::anyhow!("span tokenization failed: {e}"))?;
+
+                let mut sp = Self::merge_spnl_params(&spec.metadata, params);
+                sp.n = n as u32;
+                self.resolve_max_tokens(&mut sp, span_tok.tokens.len());
+
+                let prompt = Self::span_tok_to_prompt(span_tok);
+                self.generate_impl(&[prompt], Some(sp), false, seal, volatile)
+            }
+
+            SingleGenerateQuery::Bulk(Bulk::Map(map)) => {
+                let mut prompts = Vec::with_capacity(map.inputs.len());
+                for input_text in &map.inputs {
+                    let span_tok =
+                        crate::spans::tokenize_map_input(input_text, &tokenizer, template, &cfg)
+                            .map_err(|e| anyhow::anyhow!("span tokenization failed: {e}"))?;
+                    prompts.push(Self::span_tok_to_prompt(span_tok));
+                }
+
+                let mut sp = Self::merge_spnl_params(&map.metadata, params);
+                if let Some(first) = prompts.first() {
+                    let len = match first {
+                        Prompt::TokenIds(ids) => ids.len(),
+                        Prompt::TokenIdsWithAnnotations(ids, _) => ids.len(),
+                        Prompt::Text(_) => 0,
+                    };
+                    self.resolve_max_tokens(&mut sp, len);
+                }
+
+                self.generate_impl(&prompts, Some(sp), false, seal, volatile)
+            }
+        }
+    }
+
+    /// Convert SpanTokenized into the appropriate Prompt variant.
+    fn span_tok_to_prompt(span_tok: crate::spans::SpanTokenized) -> Prompt {
+        match span_tok.annotations {
+            Some(ann) if !ann.is_empty() => Prompt::TokenIdsWithAnnotations(span_tok.tokens, ann),
+            _ => Prompt::TokenIds(span_tok.tokens),
+        }
+    }
+
+    /// Build SamplingParams from SPNL metadata, with caller overrides.
+    fn merge_spnl_params(
+        metadata: &spnl_core::ir::GenerateMetadata,
+        caller: Option<SamplingParams>,
+    ) -> SamplingParams {
+        let mut sp = caller.unwrap_or_default();
+        // Only use SPNL metadata as defaults — caller's params take precedence.
+        if sp.max_tokens.is_none() {
+            sp.max_tokens = metadata.max_tokens.filter(|&t| t > 0).map(|t| t as u32);
+        }
+        if sp.temperature == 0.0
+            && let Some(t) = metadata.temperature
+        {
+            sp.temperature = t as f64;
+        }
+        sp
     }
 
     /// Reset the prefix cache, evicting all cached KV blocks.

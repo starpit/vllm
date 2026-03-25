@@ -2840,11 +2840,25 @@ pub fn load_fused_fp8_linear(
 // FP8 Block-quantized Weight Loading
 // ---------------------------------------------------------------------------
 
+/// Resolve the block scale tensor name for a prefix.
+///
+/// Block-quantized FP8 checkpoints use either `weight_scale_inv` (DeepSeek-V3,
+/// Qwen3-MoE) or `weight_scale` (unsloth, some compressed-tensors models).
+/// Try `weight_scale_inv` first, fall back to `weight_scale`.
+fn block_scale_name(weights: &GpuWeights, prefix: &str) -> String {
+    let inv = format!("{prefix}.weight_scale_inv");
+    if weights.contains(&inv) {
+        inv
+    } else {
+        format!("{prefix}.weight_scale")
+    }
+}
+
 /// Load a single FP8 block-quantized linear layer.
 ///
 /// Expects:
 /// - `{prefix}.weight`: FP8 E4M3 `[out_features, in_features]`
-/// - `{prefix}.weight_scale_inv`: f32 2D block scale `[ceil(N/block_n), ceil(K/block_k)]`
+/// - `{prefix}.weight_scale_inv` or `{prefix}.weight_scale`: f32 2D block scale
 /// - `{prefix}.input_scale` (optional): not used for block quant but consumed if present
 /// - `{prefix}.bias` (optional)
 ///
@@ -2855,7 +2869,7 @@ pub fn load_fp8_block_linear(
     output_dtype: DType,
 ) -> Result<crate::layers::Fp8BlockLinear> {
     let weight_name = format!("{prefix}.weight");
-    let scale_name = format!("{prefix}.weight_scale_inv");
+    let scale_name = block_scale_name(weights, prefix);
     let input_scale_name = format!("{prefix}.input_scale");
     let bias_name = format!("{prefix}.bias");
 
@@ -2935,7 +2949,7 @@ pub fn load_fused_fp8_block_linear(
     let in_features = first_shape[1];
 
     // Derive block_size from first shard's weight and scale shapes.
-    let first_scale_name = format!("{}.weight_scale_inv", prefixes[0]);
+    let first_scale_name = block_scale_name(weights, &prefixes[0]);
     let (first_scale_shape, _) = weights
         .tensor_info(&first_scale_name)
         .ok_or_else(|| anyhow::anyhow!("FP8 block: scale not found: {first_scale_name}"))?;
@@ -2961,7 +2975,7 @@ pub fn load_fused_fp8_block_linear(
         shard_sizes.push(shape[0]);
         total_out += shape[0];
 
-        let sname = format!("{prefix}.weight_scale_inv");
+        let sname = block_scale_name(weights, prefix);
         let (sshape, _) = weights
             .tensor_info(&sname)
             .ok_or_else(|| anyhow::anyhow!("FP8 block: scale not found: {sname}"))?;
@@ -2993,7 +3007,7 @@ pub fn load_fused_fp8_block_linear(
     let scale_ptr = unsafe { crate::driver::mem_alloc(total_scale_bytes)? };
     let mut scale_offset = 0usize;
     for (i, prefix) in prefixes.iter().enumerate() {
-        let sname = format!("{prefix}.weight_scale_inv");
+        let sname = block_scale_name(weights, prefix);
         let raw_scale = weights.take(&sname)?;
         let shard_scale = ensure_f32_scale(raw_scale, stream)?;
         let shard_bytes = shard_scale_rows[i] * scale_cols * 4;
@@ -3077,7 +3091,7 @@ pub fn load_fused_fp8_block_linear_tp(
     anyhow::ensure!(first_shape.len() == 2);
     let in_features = first_shape[1];
 
-    let first_scale_name = format!("{}.weight_scale_inv", prefixes[0]);
+    let first_scale_name = block_scale_name(weights, &prefixes[0]);
     let (first_scale_shape, _) = weights
         .tensor_info(&first_scale_name)
         .ok_or_else(|| anyhow::anyhow!("FP8 block: scale not found: {first_scale_name}"))?;
@@ -3099,7 +3113,7 @@ pub fn load_fused_fp8_block_linear_tp(
         shard_sizes.push(sharded_out);
         total_out += sharded_out;
 
-        let sname = format!("{prefix}.weight_scale_inv");
+        let sname = block_scale_name(weights, prefix);
         let (sshape, _) = weights
             .tensor_info(&sname)
             .ok_or_else(|| anyhow::anyhow!("FP8 block: scale not found: {sname}"))?;
@@ -3131,7 +3145,7 @@ pub fn load_fused_fp8_block_linear_tp(
     let scale_ptr = unsafe { crate::driver::mem_alloc(total_scale_bytes)? };
     let mut scale_offset = 0usize;
     for (i, prefix) in prefixes.iter().enumerate() {
-        let sname = format!("{prefix}.weight_scale_inv");
+        let sname = block_scale_name(weights, prefix);
         let raw_scale = weights.take_shard(&sname, 0, rank, world_size)?;
         let shard_scale = ensure_f32_scale(raw_scale, stream)?;
         let shard_bytes = shard_scale_rows[i] * scale_cols * 4;
@@ -3175,7 +3189,7 @@ pub fn load_fp8_block_linear_tp(
     world_size: usize,
 ) -> Result<crate::layers::Fp8BlockLinear> {
     let weight_name = format!("{prefix}.weight");
-    let scale_name = format!("{prefix}.weight_scale_inv");
+    let scale_name = block_scale_name(weights, prefix);
 
     let weight = weights.take_shard(&weight_name, 1, rank, world_size)?;
     anyhow::ensure!(weight.ndim() == 2);

@@ -1626,6 +1626,79 @@ impl LlamaAttention {
         })
     }
 
+    /// Load per-tensor FP8 attention with TP (column-parallel QKV, row-parallel O).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fp8_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        output_dtype: DType,
+        qk_norm_eps: f32,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let num_q_heads = config.num_attention_heads / tp.world_size;
+        let num_kv_heads = config.num_kv_heads / tp.world_size;
+        let head_dim = config.head_dim;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        // QKV: column parallel (shard dim=0).
+        let qkv = gpu_weights::load_fused_fp8_linear_tp(
+            weights,
+            &[
+                format!("{prefix}.q_proj"),
+                format!("{prefix}.k_proj"),
+                format!("{prefix}.v_proj"),
+            ],
+            output_dtype,
+            tp.rank,
+            tp.world_size,
+            stream,
+        )?;
+        // O: row parallel (shard dim=1).
+        let o = gpu_weights::load_fp8_linear_tp(
+            weights,
+            &format!("{prefix}.o_proj"),
+            output_dtype,
+            tp.rank,
+            tp.world_size,
+        )?;
+
+        let q_norm_name = format!("{prefix}.q_norm.weight");
+        let k_norm_name = format!("{prefix}.k_norm.weight");
+        let q_norm_weight = if weights.contains(&q_norm_name) {
+            Some(weights.take(&q_norm_name)?)
+        } else {
+            None
+        };
+        let k_norm_weight = if weights.contains(&k_norm_name) {
+            Some(weights.take(&k_norm_name)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            qkv_proj: LinearLayer::Fp8(Box::new(qkv)),
+            k_proj: None,
+            v_proj: None,
+            o_proj: LinearLayer::Fp8(Box::new(o)),
+            q_size,
+            kv_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            layer_idx,
+            q_norm_weight,
+            k_norm_weight,
+            qk_norm_eps,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+
     /// Load FP8 block-quantized attention with fused QKV.
     #[allow(clippy::too_many_arguments)]
     pub fn load_fp8_block(
@@ -1796,6 +1869,42 @@ impl LlamaMLP {
         })
     }
 
+    /// Load per-tensor FP8 MLP with TP (column-parallel gate+up, row-parallel down).
+    pub fn load_fp8_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        intermediate_size: usize,
+        output_dtype: DType,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let ipp = intermediate_size / tp.world_size;
+        let gate_up = gpu_weights::load_fused_fp8_linear_tp(
+            weights,
+            &[format!("{prefix}.gate_proj"), format!("{prefix}.up_proj")],
+            output_dtype,
+            tp.rank,
+            tp.world_size,
+            stream,
+        )?;
+        let down = gpu_weights::load_fp8_linear_tp(
+            weights,
+            &format!("{prefix}.down_proj"),
+            output_dtype,
+            tp.rank,
+            tp.world_size,
+        )?;
+
+        Ok(Self {
+            gate_up_proj: LinearLayer::Fp8(Box::new(gate_up)),
+            up_proj: None,
+            down_proj: LinearLayer::Fp8(Box::new(down)),
+            intermediate_size: ipp,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+
     /// Load FP8 block-quantized MLP with fused gate+up.
     pub fn load_fp8_block(
         weights: &mut GpuWeights,
@@ -1946,6 +2055,104 @@ impl LlamaDecoderLayer {
             &format!("{prefix}.mlp"),
             config.intermediate_size,
             output_dtype,
+            stream,
+        )?;
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            residual_multiplier: 1.0,
+        })
+    }
+
+    /// Load a per-tensor FP8 decoder layer with TP.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fp8_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        output_dtype: DType,
+        qk_norm_eps: f32,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let self_attn = LlamaAttention::load_fp8_tp(
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            output_dtype,
+            qk_norm_eps,
+            tp,
+            stream,
+        )?;
+        let mlp = LlamaMLP::load_fp8_tp(
+            weights,
+            &format!("{prefix}.mlp"),
+            config.intermediate_size,
+            output_dtype,
+            tp,
+            stream,
+        )?;
+        let input_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        let post_attention_layernorm = RmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            residual_multiplier: 1.0,
+        })
+    }
+
+    /// Load a block FP8 decoder layer with TP.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fp8_block_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        output_dtype: DType,
+        qk_norm_eps: f32,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let self_attn = LlamaAttention::load_fp8_block_tp(
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            output_dtype,
+            qk_norm_eps,
+            tp,
+            stream,
+        )?;
+        let mlp = LlamaMLP::load_fp8_block_tp(
+            weights,
+            &format!("{prefix}.mlp"),
+            config.intermediate_size,
+            output_dtype,
+            tp,
             stream,
         )?;
         let input_layernorm = RmsNorm::load(
@@ -2270,6 +2477,142 @@ impl LlamaForCausalLM {
         } else {
             Linear::load(weights, "lm_head")?
         });
+
+        Ok(Self {
+            model,
+            lm_head,
+            logits_scaling: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+            pp_config: None,
+        })
+    }
+
+    /// Load a per-tensor FP8 model with TP sharding.
+    pub fn load_fp8_tp(
+        weights: &mut GpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        qk_norm_eps: f32,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+            let layer = LlamaDecoderLayer::load_fp8_tp(
+                weights,
+                &prefix,
+                config,
+                i,
+                dtype,
+                qk_norm_eps,
+                tp,
+                device.compute_stream,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                config.llama3_rope_scaling.as_ref(),
+                dtype,
+                device,
+            )?
+        };
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
+
+        let model = LlamaModel {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embedding_multiplier: 1.0,
+        };
+
+        let lm_head = if config.tie_word_embeddings {
+            LinearLayer::Dense(Linear::new(model.embed_tokens.weight, None))
+        } else {
+            let lm_w = weights.take_shard("lm_head.weight", 0, tp.rank, tp.world_size)?;
+            LinearLayer::Dense(Linear::new(lm_w, None))
+        };
+
+        Ok(Self {
+            model,
+            lm_head,
+            logits_scaling: 1.0,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+            pp_config: None,
+        })
+    }
+
+    /// Load an FP8 block-quantized model with TP sharding.
+    pub fn load_fp8_block_tp(
+        weights: &mut GpuWeights,
+        config: &LlamaConfig,
+        dtype: DType,
+        qk_norm_eps: f32,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let prefix = format!("model.layers.{i}");
+            let layer = LlamaDecoderLayer::load_fp8_block_tp(
+                weights,
+                &prefix,
+                config,
+                i,
+                dtype,
+                qk_norm_eps,
+                tp,
+                device.compute_stream,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = RmsNorm::load(weights, "model.norm", config.rms_norm_eps)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                config.llama3_rope_scaling.as_ref(),
+                dtype,
+                device,
+            )?
+        };
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
+
+        let model = LlamaModel {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embedding_multiplier: 1.0,
+        };
+
+        let lm_head = if config.tie_word_embeddings {
+            LinearLayer::Dense(Linear::new(model.embed_tokens.weight, None))
+        } else {
+            let lm_w = weights.take_shard("lm_head.weight", 0, tp.rank, tp.world_size)?;
+            LinearLayer::Dense(Linear::new(lm_w, None))
+        };
 
         Ok(Self {
             model,

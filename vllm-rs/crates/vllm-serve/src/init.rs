@@ -788,6 +788,7 @@ fn initialize_stack_multinode(
             lora_adapter: config.lora_adapter.clone(),
             kv_cache_dtype: config.kv_cache_dtype.clone(),
             calculate_kv_scales: config.calculate_kv_scales,
+            cuda_graph_mode: config.cuda_graph_mode.parse().unwrap_or(CudaGraphMode::Auto),
         };
 
         let mut worker = CudaWorker::new(cuda_config);
@@ -1054,6 +1055,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         calculate_kv_scales: config.calculate_kv_scales,
         pp_rank: 0,
         pp_size: 1,
+        cuda_graph_mode: config.cuda_graph_mode.parse().unwrap_or(CudaGraphMode::Auto),
     };
 
     let mut worker = CudaWorker::new(cuda_config);
@@ -1199,6 +1201,7 @@ fn initialize_stack_tp_pp(
                     lora_adapter: config.lora_adapter.clone(),
                     kv_cache_dtype: config.kv_cache_dtype.clone(),
                     calculate_kv_scales: config.calculate_kv_scales,
+                    cuda_graph_mode: config.cuda_graph_mode.parse().unwrap_or(CudaGraphMode::Auto),
                 }
             })
             .collect();
@@ -1549,6 +1552,7 @@ fn initialize_stack_tp(
                 lora_adapter: config.lora_adapter.clone(),
                 kv_cache_dtype: config.kv_cache_dtype.clone(),
                 calculate_kv_scales: config.calculate_kv_scales,
+                cuda_graph_mode: config.cuda_graph_mode.parse().unwrap_or(CudaGraphMode::Auto),
             })
             .collect();
 
@@ -1936,6 +1940,7 @@ fn initialize_stack_external(
             lora_adapter: config.lora_adapter.clone(),
             kv_cache_dtype: config.kv_cache_dtype.clone(),
             calculate_kv_scales: config.calculate_kv_scales,
+            cuda_graph_mode: config.cuda_graph_mode.parse().unwrap_or(CudaGraphMode::Auto),
         };
 
         let mut worker = CudaWorker::new(cuda_config);

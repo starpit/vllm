@@ -5896,6 +5896,11 @@ impl Worker for CudaWorker {
     fn wake_up(&mut self, _tags: Option<&[String]>) -> ExecutorResult<()> {
         info!("CudaWorker: waking up — reloading model and KV cache");
 
+        // Re-bind cuBLAS workspace — sleep's release_all() freed the old one.
+        if let Some(ref mut dev) = self.device {
+            unsafe { dev.cublas.rebind_workspace(&mut dev.caching) };
+        }
+
         // Re-load model from disk (mmap'd safetensors, fast).
         self.load_model()?;
 

@@ -157,6 +157,27 @@ impl CublasHandle {
         })
     }
 
+    /// Re-allocate the cuBLAS workspace from `alloc` and rebind it.
+    ///
+    /// Must be called after `CachingAllocator::release_all()` freed the old
+    /// workspace (e.g. during sleep → wake cycle). Also clears cached plans
+    /// since they may reference the old workspace.
+    ///
+    /// # Safety
+    /// Caller must ensure no in-flight cuBLAS operations reference the old workspace.
+    pub unsafe fn rebind_workspace(&mut self, alloc: &mut CachingAllocator) {
+        self.plans.clear();
+        self.fp8_plans.clear();
+        let workspace = alloc.alloc(CUBLAS_WORKSPACE_SIZE);
+        check(sys::cublasSetWorkspace_v2(
+            self.handle,
+            workspace as *mut _,
+            CUBLAS_WORKSPACE_SIZE,
+        ))
+        .expect("rebind cuBLAS workspace");
+        self.workspace = workspace;
+    }
+
     /// Ensure a cached GEMM plan exists for the given shapes, creating it if needed.
     ///
     /// `weight_trans`: if true, weight is transposed (TRANSA=T, default for `[N,K]` weights).

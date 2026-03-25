@@ -438,7 +438,6 @@ fn run_bench_nested(args: &BenchSpansArgs, num_inner: usize) -> Result<()> {
     let inner_sampling = SamplingParams {
         max_tokens: Some(inner_tokens),
         temperature: 0.0,
-        ignore_eos: true,
         detokenize: true,
         ..SamplingParams::default()
     };
@@ -476,7 +475,7 @@ fn run_bench_nested(args: &BenchSpansArgs, num_inner: usize) -> Result<()> {
     use vllm_serve::llm::ChatMessage;
 
     let baseline_inner_start = Instant::now();
-    let mut inner_outputs: Vec<String> = Vec::with_capacity(num_inner);
+    let mut baseline_inner_tokens: Vec<Vec<u32>> = Vec::with_capacity(num_inner);
     for (i, prompt) in prompts.iter().enumerate() {
         let start = Instant::now();
         let result = llm.chat(&[ChatMessage::user(prompt)], Some(inner_sampling.clone()))?;
@@ -485,19 +484,28 @@ fn run_bench_nested(args: &BenchSpansArgs, num_inner: usize) -> Result<()> {
             "    inner[{i}]  {BOLD}{ms:>8.1}ms{RST}  {DIM}{} output tokens{RST}",
             result.outputs[0].token_ids.len()
         );
-        inner_outputs.push(result.outputs[0].text.clone());
+        let mut all_toks = result.prompt_token_ids.clone();
+        all_toks.extend_from_slice(&result.outputs[0].token_ids);
+        baseline_inner_tokens.push(all_toks);
     }
     let baseline_inner_ms = baseline_inner_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Build outer prompt: inner outputs + query. No inner prompts.
-    let mut chat_messages = Vec::new();
-    for output in &inner_outputs {
-        chat_messages.push(ChatMessage::assistant(output));
+    // Build outer prompt from raw token IDs (same as spans path for fair comparison).
+    let tokenizer = llm
+        .tokenizer()
+        .ok_or_else(|| anyhow::anyhow!("nested bench requires a tokenizer"))?;
+    let mut baseline_outer_tokens: Vec<u32> = Vec::new();
+    for inner_toks in &baseline_inner_tokens {
+        baseline_outer_tokens.extend_from_slice(inner_toks);
     }
-    chat_messages.push(ChatMessage::user("Summarize all documents."));
+    let query_ids = tokenizer.encode("Summarize all documents.", false)?;
+    baseline_outer_tokens.extend_from_slice(&query_ids);
 
     let start = Instant::now();
-    llm.chat(&chat_messages, Some(outer_sampling.clone()))?;
+    llm.generate(
+        &[Prompt::TokenIds(baseline_outer_tokens)],
+        Some(outer_sampling.clone()),
+    )?;
     let baseline_outer_ms = start.elapsed().as_secs_f64() * 1000.0;
     eprintln!("    outer     {BOLD}{baseline_outer_ms:>8.1}ms{RST}  {DIM}full prefill{RST}");
 
@@ -513,7 +521,8 @@ fn run_bench_nested(args: &BenchSpansArgs, num_inner: usize) -> Result<()> {
     eprintln!("{BOLD}--- Spans (execute_query, sealed) ---{RST}");
 
     let spans_inner_start = Instant::now();
-    let mut spans_outputs: Vec<String> = Vec::with_capacity(num_inner);
+    // Collect raw token IDs from each inner generate (prompt + output).
+    let mut inner_all_tokens: Vec<Vec<u32>> = Vec::with_capacity(num_inner);
     let mut expected_cached_tokens: usize = 0;
     for (i, prompt) in prompts.iter().enumerate() {
         let query = serde_json::json!({
@@ -541,40 +550,56 @@ fn run_bench_nested(args: &BenchSpansArgs, num_inner: usize) -> Result<()> {
         eprintln!(
             "    inner[{i}]  {BOLD}{ms:>8.1}ms{RST}  {DIM}{prompt_toks} prompt + {output_toks} output = {total_inner} ({sealed_toks} sealed){RST}",
         );
-        spans_outputs.push(results[0].outputs[0].text.clone());
+        // Collect the full token sequence: prompt + output (includes EOS + pads).
+        let mut all_toks = results[0].prompt_token_ids.clone();
+        all_toks.extend_from_slice(&results[0].outputs[0].token_ids);
+        inner_all_tokens.push(all_toks);
     }
     let spans_inner_ms = spans_inner_start.elapsed().as_secs_f64() * 1000.0;
     eprintln!("    expected cached in outer: {BOLD}{expected_cached_tokens}{RST} tokens");
 
-    // Outer with span annotations — should hit sealed blocks.
-    let mut plus_children = Vec::new();
-    for (i, prompt) in prompts.iter().enumerate() {
-        plus_children.push(serde_json::json!({
-            "seq": [{ "user": *prompt }, { "assistant": spans_outputs[i] }]
-        }));
+    // Build outer prompt from raw inner token IDs (no text re-tokenization).
+    // Layout: [Relocatable inner_0] [Relocatable inner_1] ... [Prefixed query]
+    // Each inner section is padded to block boundary. The query section is
+    // tokenized normally via the chat template.
+    let mut outer_tokens: Vec<u32> = Vec::new();
+    let mut annotations = std::collections::BTreeMap::new();
+
+    for inner_toks in &inner_all_tokens {
+        // Relocatable boundary at the start of each inner section.
+        let block_idx = outer_tokens.len() / block_size;
+        annotations.insert(block_idx, vllm_common::BlockKind::Relocatable);
+        outer_tokens.extend_from_slice(inner_toks);
+        // Pad to block boundary (inner should already be block-aligned from
+        // SealPadProcessor, but handle the case where it isn't).
+        let remainder = outer_tokens.len() % block_size;
+        if remainder != 0 {
+            let pad_count = block_size - remainder;
+            outer_tokens.extend(std::iter::repeat_n(0u32, pad_count));
+        }
     }
 
-    let spans_query = serde_json::json!({
-        "g": {
-            "model": model,
-            "max_tokens": 1,
-            "temperature": 0.0,
-            "input": {
-                "cross": [
-                    { "plus": plus_children },
-                    { "user": "Summarize all documents." }
-                ]
-            }
-        }
-    });
+    // Prefixed boundary for the outer query section.
+    let query_block_idx = outer_tokens.len() / block_size;
+    annotations.insert(query_block_idx, vllm_common::BlockKind::Prefixed);
+
+    // Tokenize the outer query section. This doesn't need cache hits — it's
+    // the unique query part. Just encode through the tokenizer.
+    let tokenizer = llm
+        .tokenizer()
+        .ok_or_else(|| anyhow::anyhow!("nested bench requires a tokenizer"))?;
+    let query_ids = tokenizer.encode("Summarize all documents.", false)?;
+    outer_tokens.extend_from_slice(&query_ids);
+
+    let outer_prompt = Prompt::TokenIdsWithAnnotations(outer_tokens.clone(), annotations);
+    eprintln!(
+        "    outer prompt: {DIM}{} tokens, {} blocks{RST}",
+        outer_tokens.len(),
+        outer_tokens.len().div_ceil(block_size),
+    );
 
     let start = Instant::now();
-    llm.execute_query(
-        &spans_query.to_string(),
-        Some(outer_sampling.clone()),
-        false,
-        false,
-    )?;
+    llm.generate(&[outer_prompt], Some(outer_sampling.clone()))?;
     let spans_outer_ms = start.elapsed().as_secs_f64() * 1000.0;
     eprintln!("    outer     {BOLD}{spans_outer_ms:>8.1}ms{RST}  {DIM}span cache hit{RST}");
 

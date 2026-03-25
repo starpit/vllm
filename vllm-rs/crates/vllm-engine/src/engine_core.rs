@@ -20,7 +20,7 @@
 //!
 //! Port of: `vllm/v1/engine/core.py::EngineCore`
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use tracing::{debug, error, info};
@@ -79,6 +79,13 @@ pub struct EngineCore {
 
     /// Whether the engine is in pooling mode (embedding-only).
     is_pooling: bool,
+
+    /// KV cache block size in tokens (for seal-pad block alignment checks).
+    block_size: usize,
+
+    /// 🦭 Sealed request IDs that have already generated an EOS/stop token.
+    /// Tracked so check_stop_criteria can defer stopping until block-aligned.
+    seal_eos_seen: HashSet<String>,
 }
 
 /// Configuration for creating an EngineCore.
@@ -164,6 +171,8 @@ impl EngineCore {
             ngram_proposer,
             eos_token_ids: config.eos_token_ids,
             is_pooling: config.is_pooling,
+            block_size: config.block_size,
+            seal_eos_seen: HashSet::new(),
         }
     }
 
@@ -187,6 +196,9 @@ impl EngineCore {
 
     /// Abort requests by ID.
     pub fn abort_requests(&mut self, request_ids: &[String]) {
+        for id in request_ids {
+            self.seal_eos_seen.remove(id);
+        }
         let id_refs: Vec<&str> = request_ids.iter().map(String::as_str).collect();
         self.scheduler
             .finish_requests(&id_refs, RequestStatus::FinishedAborted);
@@ -662,8 +674,13 @@ impl EngineCore {
     /// Check stop criteria for a request given its newly generated tokens.
     ///
     /// Returns `(finish_reason, stop_reason)`.
+    ///
+    /// 🦭 Sealed requests: EOS/stop tokens don't trigger an immediate stop.
+    /// Instead we record that EOS was seen and continue generating. The
+    /// SealPadProcessor forces pad tokens on the GPU side. Once the total
+    /// token count is block-aligned we stop here.
     fn check_stop_criteria(
-        &self,
+        &mut self,
         req_id: &str,
         new_token_ids: &[u32],
     ) -> (Option<FinishReason>, Option<StopReason>) {
@@ -673,9 +690,25 @@ impl EngineCore {
         };
 
         let num_output_tokens = request.output_token_ids.len() as u32;
+        let is_sealed = request.seal;
 
-        // 1. Check max_tokens.
+        // 1. For sealed requests in padding mode, check block alignment.
+        if is_sealed && self.seal_eos_seen.contains(req_id) {
+            let total_tokens = request.all_token_ids.len();
+            if total_tokens % self.block_size == 0 {
+                self.seal_eos_seen.remove(req_id);
+                return (Some(FinishReason::Stop), Some(StopReason::Token(0)));
+            }
+            return (None, None);
+        }
+
+        // 2. Check max_tokens. For sealed requests, defer until block-aligned.
         if num_output_tokens >= request.max_tokens {
+            if is_sealed && request.all_token_ids.len() % self.block_size != 0 {
+                self.seal_eos_seen.insert(req_id.to_string());
+                return (None, None);
+            }
+            self.seal_eos_seen.remove(req_id);
             return (Some(FinishReason::Length), None);
         }
 
@@ -688,15 +721,22 @@ impl EngineCore {
 
         // Check each new token against stop conditions.
         for &token_id in new_token_ids {
-            // 2. Check EOS tokens (unless ignore_eos is set).
-            //    Supports multiple EOS token IDs (e.g. LLaMA 3 has
-            //    <|end_of_text|>, <|eom_id|>, <|eot_id|>).
+            // 3. Check EOS tokens (unless ignore_eos is set).
             if !params.ignore_eos && self.eos_token_ids.contains(&token_id) {
+                if is_sealed {
+                    // Don't stop — record EOS and let SealPadProcessor pad.
+                    self.seal_eos_seen.insert(req_id.to_string());
+                    return (None, None);
+                }
                 return (Some(FinishReason::Stop), Some(StopReason::Token(token_id)));
             }
 
-            // 3. Check stop_token_ids.
+            // 4. Check stop_token_ids.
             if params.stop_token_ids.contains(&token_id) {
+                if is_sealed {
+                    self.seal_eos_seen.insert(req_id.to_string());
+                    return (None, None);
+                }
                 return (Some(FinishReason::Stop), Some(StopReason::Token(token_id)));
             }
         }
@@ -1664,5 +1704,258 @@ mod tests {
         assert!(!req_out.new_token_ids.is_empty());
         // No pooler output.
         assert!(req_out.pooler_output.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Seal-pad stop criteria tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sealed_request_does_not_stop_on_eos() {
+        // A sealed request hitting EOS should NOT stop immediately.
+        // It should continue generating (SealPadProcessor forces pads on GPU).
+        let mut config = make_test_config();
+        config.block_size = 4;
+        config.eos_token_ids = vec![1000]; // NoopExecutor's first token
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        let params = SamplingParams {
+            max_tokens: Some(100),
+            seal: true,
+            ..Default::default()
+        };
+        // 2-token prompt → after first decode step, total = 3 tokens (not block-aligned).
+        let mut req = Request::new(
+            "sealed-1".to_string(),
+            vec![10, 20],
+            params,
+            0.0,
+            0,
+            0,
+            None,
+        );
+        req.seal = true;
+        engine.add_request(req);
+
+        // Step 1: generates token 1000 (EOS). Sealed request should NOT finish.
+        let (outputs, _) = engine.step().unwrap();
+        let client_out = outputs.get(&0).unwrap();
+        let req_out = client_out
+            .outputs
+            .iter()
+            .find(|o| o.request_id == "sealed-1");
+        // Request should still be running (no finish_reason) or the output
+        // should show it continuing. If it's in the output, check no finish.
+        if let Some(out) = req_out {
+            assert!(
+                out.finish_reason.is_none(),
+                "sealed request should not stop on EOS: got {:?}",
+                out.finish_reason
+            );
+        }
+        // Request should still be unfinished (EOS deferred for seal padding).
+        assert_eq!(engine.num_unfinished_requests(), 1);
+    }
+
+    #[test]
+    fn test_sealed_request_stops_when_block_aligned() {
+        // A sealed request should stop when total tokens reach block alignment
+        // after EOS has been seen.
+        let mut config = make_test_config();
+        config.block_size = 4;
+        config.eos_token_ids = vec![1000];
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        let params = SamplingParams {
+            max_tokens: Some(100),
+            seal: true,
+            ..Default::default()
+        };
+        // 3-token prompt → first decode = 4 tokens (block-aligned!).
+        // EOS at position 4 means it finishes immediately after padding.
+        let mut req = Request::new(
+            "sealed-2".to_string(),
+            vec![10, 20, 30],
+            params,
+            0.0,
+            0,
+            0,
+            None,
+        );
+        req.seal = true;
+        engine.add_request(req);
+
+        // Step 1: token 1000 generated → total = 4 = block-aligned.
+        // Even though it's EOS, since it's already block-aligned, it stops.
+        let (_outputs, _) = engine.step().unwrap();
+
+        // EOS is detected in the same step but alignment is checked on the
+        // NEXT invocation of check_stop_criteria. So the request stays alive.
+        assert_eq!(
+            engine.num_unfinished_requests(),
+            1,
+            "should NOT stop on first step (EOS detected, alignment checked next step)"
+        );
+
+        // Step 2: NoopExecutor generates token 1001. Total = 5 tokens.
+        // Not block-aligned → continues.
+        let (_outputs2, _) = engine.step().unwrap();
+        // Still running (5 tokens, not aligned to 4).
+        assert_eq!(engine.num_unfinished_requests(), 1);
+
+        // Step 3: token 1002. Total = 6. Not aligned.
+        let (_outputs3, _) = engine.step().unwrap();
+        assert_eq!(engine.num_unfinished_requests(), 1);
+
+        // Step 4: token 1003. Total = 7. Not aligned.
+        let (_outputs4, _) = engine.step().unwrap();
+        assert_eq!(engine.num_unfinished_requests(), 1);
+
+        // Step 5: token 1004. Total = 8. Block-aligned! Should stop.
+        let (outputs5, _) = engine.step().unwrap();
+        let client_out5 = outputs5.get(&0).unwrap();
+        let req_out5 = client_out5
+            .outputs
+            .iter()
+            .find(|o| o.request_id == "sealed-2")
+            .expect("should have output for sealed-2");
+        assert_eq!(
+            req_out5.finish_reason,
+            Some(FinishReason::Stop),
+            "should stop at block-aligned boundary"
+        );
+        assert_eq!(engine.num_unfinished_requests(), 0);
+    }
+
+    #[test]
+    fn test_sealed_max_tokens_defers_until_block_aligned() {
+        // Sealed request hitting max_tokens defers stop until block-aligned.
+        // block_size=4, 2-token prompt, max_tokens=1.
+        // Step 1: 1 output → 3 total, max_tokens hit, not aligned → defer.
+        // Step 2: 4 total, aligned → stop.
+        let mut config = make_test_config();
+        config.block_size = 4;
+        config.eos_token_ids = vec![9999]; // won't be generated
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        let params = SamplingParams {
+            max_tokens: Some(1),
+            seal: true,
+            ..Default::default()
+        };
+        let mut req = Request::new(
+            "sealed-3".to_string(),
+            vec![10, 20],
+            params,
+            0.0,
+            0,
+            0,
+            None,
+        );
+        req.seal = true;
+        engine.add_request(req);
+
+        // Step 1: 1 output token → 3 total, not aligned → deferred.
+        let (_outputs, _) = engine.step().unwrap();
+        assert_eq!(engine.num_unfinished_requests(), 1);
+
+        // Step 2: 2 output tokens → 4 total, aligned → stop.
+        let (outputs, _) = engine.step().unwrap();
+        let client_out = outputs.get(&0).unwrap();
+        let req_out = client_out
+            .outputs
+            .iter()
+            .find(|o| o.request_id == "sealed-3")
+            .expect("should finish on block alignment");
+        assert_eq!(req_out.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(engine.num_unfinished_requests(), 0);
+    }
+
+    #[test]
+    fn test_sealed_request_output_includes_padding_tokens() {
+        // Verify that a sealed request generates MORE output tokens than a
+        // non-sealed one. Non-sealed stops at EOS (1 output token). Sealed
+        // continues until block-aligned.
+        //
+        // block_size=4, 1-token prompt, EOS=1000 (first decode token).
+        // Non-sealed: 1 prompt + 1 output (EOS) = 2 tokens → stop.
+        // Sealed: 1 prompt + 1 output (EOS) = 2 tokens. Not aligned (2%4≠0).
+        //   Step 2: 3 tokens. Not aligned.
+        //   Step 3: 4 tokens. 4%4==0 → stop. Total output = 3.
+
+        let mut config = make_test_config();
+        config.block_size = 4;
+        config.eos_token_ids = vec![1000];
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        let params = SamplingParams {
+            max_tokens: Some(100),
+            seal: true,
+            ..Default::default()
+        };
+        let mut req = Request::new("s1".to_string(), vec![10], params, 0.0, 0, 0, None);
+        req.seal = true;
+        engine.add_request(req);
+
+        let mut total_output_tokens = 0u32;
+        for _ in 0..10 {
+            let (outputs, _) = engine.step().unwrap();
+            if let Some(client_out) = outputs.get(&0) {
+                for out in &client_out.outputs {
+                    if out.request_id == "s1" {
+                        total_output_tokens += out.new_token_ids.len() as u32;
+                        if out.finish_reason.is_some() {
+                            assert_eq!(
+                                total_output_tokens, 3,
+                                "sealed: 1 prompt + 3 output = 4 (block-aligned). \
+                                 Non-sealed would stop at 1 output."
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        panic!("sealed request should have finished within 10 steps");
+    }
+
+    #[test]
+    fn test_non_sealed_request_still_stops_on_eos() {
+        // Verify we didn't break normal (non-sealed) EOS behavior.
+        let mut config = make_test_config();
+        config.block_size = 4;
+        config.eos_token_ids = vec![1000];
+        let executor = Box::new(NoopExecutor::new(1024));
+        let mut engine = EngineCore::new(config, executor);
+
+        let params = SamplingParams {
+            max_tokens: Some(100),
+            ..Default::default()
+        };
+        let req = Request::new(
+            "normal-1".to_string(),
+            vec![10, 20],
+            params,
+            0.0,
+            0,
+            0,
+            None,
+        );
+        engine.add_request(req);
+
+        let (outputs, _) = engine.step().unwrap();
+        let client_out = outputs.get(&0).unwrap();
+        let req_out = client_out
+            .outputs
+            .iter()
+            .find(|o| o.request_id == "normal-1")
+            .unwrap();
+
+        assert_eq!(req_out.finish_reason, Some(FinishReason::Stop));
+        assert_eq!(engine.num_unfinished_requests(), 0);
     }
 }

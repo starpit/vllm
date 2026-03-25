@@ -285,6 +285,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             lora_adapter: config.lora_adapter.clone(),
             kv_cache_dtype: config.kv_cache_dtype.clone(),
             calculate_kv_scales: config.calculate_kv_scales,
+            eos_token_ids: vec![],
         };
 
         let mut worker = CudaWorker::new(cuda_config);
@@ -1055,6 +1056,7 @@ fn initialize_stack_multinode(
                 .cuda_graph_mode
                 .parse()
                 .unwrap_or(CudaGraphMode::Auto),
+            eos_token_ids: vec![],
         };
 
         let mut worker = CudaWorker::new(cuda_config);
@@ -1325,6 +1327,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
             .cuda_graph_mode
             .parse()
             .unwrap_or(CudaGraphMode::Auto),
+        eos_token_ids: vec![],
     };
 
     let mut worker = CudaWorker::new(cuda_config);
@@ -1474,6 +1477,7 @@ fn initialize_stack_tp_pp(
                         .cuda_graph_mode
                         .parse()
                         .unwrap_or(CudaGraphMode::Auto),
+                    eos_token_ids: vec![],
                 }
             })
             .collect();
@@ -1828,6 +1832,7 @@ fn initialize_stack_tp(
                     .cuda_graph_mode
                     .parse()
                     .unwrap_or(CudaGraphMode::Auto),
+                eos_token_ids: vec![],
             })
             .collect();
 
@@ -2219,6 +2224,7 @@ fn initialize_stack_external(
                 .cuda_graph_mode
                 .parse()
                 .unwrap_or(CudaGraphMode::Auto),
+            eos_token_ids: vec![],
         };
 
         let mut worker = CudaWorker::new(cuda_config);

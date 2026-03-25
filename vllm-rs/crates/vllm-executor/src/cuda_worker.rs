@@ -25,7 +25,7 @@ use vllm_cuda::kv_cache::KvCachePool;
 use vllm_cuda::logits_processor::{
     AllowedTokenIdsProcessor, BadWordsProcessor, BatchUpdate, GrammarMaskProcessor,
     LogitBiasProcessor, LogitsProcessor, LogitsProcessorPipeline, MinTokensProcessor,
-    PenaltiesProcessor,
+    PenaltiesProcessor, SealPadProcessor,
 };
 use vllm_cuda::quant;
 use vllm_cuda::tensor::{GpuTensor, TensorView};
@@ -86,6 +86,8 @@ pub struct CudaWorkerConfig {
     pub kv_cache_dtype: String,
     /// Compute KV scales dynamically from the first forward pass.
     pub calculate_kv_scales: bool,
+    /// EOS token IDs for seal-pad processor (from model config).
+    pub eos_token_ids: Vec<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1449,6 +1451,8 @@ pub struct CudaWorker {
     grammar_processor: GrammarMaskProcessor,
     /// Allowed token IDs processor (separate — needs backup logits like grammar).
     allowed_token_ids_processor: AllowedTokenIdsProcessor,
+    /// 🦭 Seal-pad processor: forces pad tokens after EOS for sealed requests.
+    seal_pad_processor: SealPadProcessor,
     /// True if batch composition changed this step (triggers BatchUpdate).
     batch_changed: bool,
     /// Ordered request IDs in the current batch (for pipeline update_state).
@@ -1516,6 +1520,11 @@ impl CudaWorker {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0_f32);
+        let seal_pad_processor = SealPadProcessor::new(
+            config.eos_token_ids.clone(),
+            0, // pad_token: default 0, updated during model load from tokenizer
+            config.block_size,
+        );
         Self {
             config,
             device: None,
@@ -1549,6 +1558,7 @@ impl CudaWorker {
             logits_pipeline: None,
             grammar_processor: GrammarMaskProcessor::new(),
             allowed_token_ids_processor: AllowedTokenIdsProcessor::new(),
+            seal_pad_processor,
             batch_changed: false,
             batch_req_ids: Vec::new(),
             seeded_rngs: HashMap::new(),
@@ -2020,6 +2030,27 @@ impl CudaWorker {
             Box::new(BadWordsProcessor::new()),
         ];
         self.logits_pipeline = Some(LogitsProcessorPipeline::new(processors));
+
+        // Reinitialize SealPadProcessor with real EOS token IDs from model config.
+        if let Some(ref hf_config) = self.hf_config {
+            let eos_token_ids: Vec<u32> = hf_config
+                .extra
+                .get("eos_token_id")
+                .map(|v| {
+                    if let Some(id) = v.as_u64() {
+                        vec![id as u32]
+                    } else if let Some(arr) = v.as_array() {
+                        arr.iter()
+                            .filter_map(|v| v.as_u64().map(|id| id as u32))
+                            .collect()
+                    } else {
+                        vec![]
+                    }
+                })
+                .unwrap_or_default();
+            self.seal_pad_processor =
+                SealPadProcessor::new(eos_token_ids, 0, self.config.block_size);
+        }
 
         info!(
             "CudaWorker: GGUF model loaded in {:.2}s",
@@ -2611,6 +2642,7 @@ impl CudaWorker {
         >,
         grammar_processor: &GrammarMaskProcessor,
         allowed_token_ids_processor: &AllowedTokenIdsProcessor,
+        seal_pad_processor: &SealPadProcessor,
         logits_pipeline: Option<&LogitsProcessorPipeline>,
         seeded_rngs: &mut HashMap<String, rand::rngs::StdRng>,
         host_staging: &Option<HostStaging>,
@@ -2664,9 +2696,11 @@ impl CudaWorker {
 
         let any_grammar = grammar_processor.is_active();
         let any_allowed = allowed_token_ids_processor.is_active();
+        let any_seal_pad = seal_pad_processor.is_active();
 
         let pipeline_active = logits_pipeline.is_some_and(|p| p.any_active());
-        let needs_f32 = pipeline_active || any_grammar || any_allowed || any_logprobs;
+        let needs_f32 =
+            pipeline_active || any_grammar || any_allowed || any_seal_pad || any_logprobs;
 
         if !needs_f32 {
             // Fast path: no modifications needed, use native dtype sampling.
@@ -2845,9 +2879,10 @@ impl CudaWorker {
             None
         };
 
-        // 3. Apply grammar mask and/or allowed_token_ids on GPU (both need backup logits).
+        // 3. Apply grammar mask, allowed_token_ids, and seal-pad on GPU (all need backup logits).
         let needs_mask_backup = (any_grammar && grammar_processor.needs_backup())
-            || (any_allowed && allowed_token_ids_processor.needs_backup());
+            || (any_allowed && allowed_token_ids_processor.needs_backup())
+            || (any_seal_pad && seal_pad_processor.needs_backup());
         let _mask_backup_owned = if needs_mask_backup {
             let backup_owned = if raw_logits_for_logprobs.is_some() {
                 None
@@ -2877,6 +2912,9 @@ impl CudaWorker {
             }
             if any_allowed {
                 allowed_token_ids_processor.apply_with_backup(logits_f32, backup, device);
+            }
+            if any_seal_pad {
+                seal_pad_processor.apply_with_backup(logits_f32, backup, device);
             }
             backup_owned
         } else {
@@ -5272,6 +5310,27 @@ impl Worker for CudaWorker {
         ];
         self.logits_pipeline = Some(LogitsProcessorPipeline::new(processors));
 
+        // Reinitialize SealPadProcessor with real EOS token IDs from model config.
+        if let Some(ref hf_config) = self.hf_config {
+            let eos_token_ids: Vec<u32> = hf_config
+                .extra
+                .get("eos_token_id")
+                .map(|v| {
+                    if let Some(id) = v.as_u64() {
+                        vec![id as u32]
+                    } else if let Some(arr) = v.as_array() {
+                        arr.iter()
+                            .filter_map(|v| v.as_u64().map(|id| id as u32))
+                            .collect()
+                    } else {
+                        vec![]
+                    }
+                })
+                .unwrap_or_default();
+            self.seal_pad_processor =
+                SealPadProcessor::new(eos_token_ids, 0, self.config.block_size);
+        }
+
         info!(
             "CudaWorker: model loaded in {:.1}s",
             t0.elapsed().as_secs_f64()
@@ -6322,7 +6381,7 @@ impl CudaWorker {
             let any_needs_full = out_req_ids.iter().any(|rid| {
                 self.sampling_params_map
                     .get(rid)
-                    .is_some_and(|p| p.logprobs.is_some())
+                    .is_some_and(|p| p.logprobs.is_some() || p.seal)
                     || {
                         #[cfg(feature = "guided-decoding")]
                         {
@@ -6992,6 +7051,7 @@ impl CudaWorker {
                 &mut self.grammar_states,
                 &mut self.grammar_processor,
                 &mut self.allowed_token_ids_processor,
+                &mut self.seal_pad_processor,
                 device,
             );
 
@@ -7002,6 +7062,7 @@ impl CudaWorker {
                 &mut self.grammar_states,
                 &self.grammar_processor,
                 &self.allowed_token_ids_processor,
+                &self.seal_pad_processor,
                 self.logits_pipeline.as_ref(),
                 &mut self.seeded_rngs,
                 &self.host_staging,
@@ -7029,6 +7090,7 @@ impl CudaWorker {
                     || p.min_tokens > 0
                     || p.bad_words_token_ids.is_some()
                     || p.allowed_token_ids.is_some()
+                    || p.seal
             })
         }) || {
             #[cfg(feature = "guided-decoding")]
@@ -7792,6 +7854,7 @@ impl CudaWorker {
             &mut self.grammar_states,
             &mut self.grammar_processor,
             &mut self.allowed_token_ids_processor,
+            &mut self.seal_pad_processor,
             device,
         );
 
@@ -7803,6 +7866,7 @@ impl CudaWorker {
             &mut self.grammar_states,
             &self.grammar_processor,
             &self.allowed_token_ids_processor,
+            &self.seal_pad_processor,
             self.logits_pipeline.as_ref(),
             &mut self.seeded_rngs,
             &self.host_staging,
@@ -7828,6 +7892,7 @@ impl CudaWorker {
         >,
         grammar_processor: &mut GrammarMaskProcessor,
         allowed_token_ids_processor: &mut AllowedTokenIdsProcessor,
+        seal_pad_processor: &mut SealPadProcessor,
         device: &mut GpuDevice,
     ) {
         let batch_update = if ctx.batch_changed {
@@ -7876,6 +7941,14 @@ impl CudaWorker {
         }
 
         allowed_token_ids_processor.update_state(
+            batch_update.as_ref(),
+            ctx.sampling_params_map,
+            ctx.token_buffers,
+            ctx.batch_req_ids,
+            device,
+        );
+
+        seal_pad_processor.update_state(
             batch_update.as_ref(),
             ctx.sampling_params_map,
             ctx.token_buffers,

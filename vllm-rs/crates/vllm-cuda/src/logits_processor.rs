@@ -816,6 +816,215 @@ impl LogitsProcessor for BadWordsProcessor {
 }
 
 // ---------------------------------------------------------------------------
+// SealPadProcessor
+// ---------------------------------------------------------------------------
+
+/// 🦭 Forces pad tokens after EOS for sealed requests until block-aligned.
+///
+/// When a sealed request emits an EOS token, the engine keeps it running.
+/// This processor detects that EOS has been generated (by scanning
+/// `token_buffers`) and forces the pad token on all subsequent steps until
+/// `total_tokens % block_size == 0`. At that point the engine stops the
+/// request normally and the now-full final block is cacheable.
+///
+/// Architecture: same as `AllowedTokenIdsProcessor` — standalone (not in the
+/// pipeline), called via `apply_with_backup` from the worker, using the
+/// grammar-mask kernel with `allowed = [pad_token]`.
+pub struct SealPadProcessor {
+    /// Model's EOS token IDs (from config.json).
+    eos_token_ids: Vec<u32>,
+    /// Token to force during seal-padding (e.g. tokenizer whitespace token).
+    pad_token: u32,
+    /// KV cache block size in tokens.
+    block_size: usize,
+
+    // --- per-step GPU state ---
+    active: bool,
+    needs_backup: bool,
+    gpu_allowed: Option<OwnedTensor>,
+    gpu_offsets: Option<OwnedTensor>,
+    gpu_req_indices: Option<OwnedTensor>,
+
+    /// Tracks which sealed requests are in padding mode (EOS/stop hit or
+    /// max_tokens reached). Entries removed when request leaves the batch.
+    seen_eos: HashMap<String, ()>,
+
+    /// Prompt length per sealed request (set on first observation, used to
+    /// compute output token count for max_tokens detection).
+    prompt_lens: HashMap<String, usize>,
+}
+
+impl SealPadProcessor {
+    pub fn new(eos_token_ids: Vec<u32>, pad_token: u32, block_size: usize) -> Self {
+        Self {
+            eos_token_ids,
+            pad_token,
+            block_size,
+            active: false,
+            needs_backup: false,
+            gpu_allowed: None,
+            gpu_offsets: None,
+            gpu_req_indices: None,
+            seen_eos: HashMap::new(),
+            prompt_lens: HashMap::new(),
+        }
+    }
+
+    /// Whether this processor needs a backup of logits before masking.
+    pub fn needs_backup(&self) -> bool {
+        self.needs_backup
+    }
+
+    /// Whether the processor has work to do this step.
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Apply using a backup tensor (same kernel as grammar mask / allowed_token_ids).
+    pub fn apply_with_backup(&self, logits: GpuTensor, backup: GpuTensor, device: &mut GpuDevice) {
+        if let (Some(allowed), Some(offsets), Some(indices)) =
+            (&self.gpu_allowed, &self.gpu_offsets, &self.gpu_req_indices)
+        {
+            unsafe {
+                crate::kernels::apply_grammar_mask(
+                    logits,
+                    backup,
+                    allowed.as_gpu_tensor(),
+                    offsets.as_gpu_tensor(),
+                    indices.as_gpu_tensor(),
+                    device.compute_stream,
+                );
+            }
+        }
+    }
+
+    /// CPU-side scan: update `seen_eos` tracking and return batch indices of
+    /// requests that need padding (sealed, EOS seen, not yet block-aligned).
+    ///
+    /// Separated from `update_state` so the detection logic is testable
+    /// without a GPU device.
+    fn compute_padding_requests(
+        &mut self,
+        batch_update: Option<&BatchUpdate>,
+        sampling_params_map: &HashMap<String, SamplingParams>,
+        token_buffers: &HashMap<String, Vec<u32>>,
+        batch_req_ids: &[String],
+    ) -> Vec<usize> {
+        // Clean up tracking for requests that left the batch.
+        if batch_update.is_some() {
+            let current: std::collections::HashSet<&str> =
+                batch_req_ids.iter().map(|s| s.as_str()).collect();
+            self.seen_eos.retain(|k, _| current.contains(k.as_str()));
+            self.prompt_lens.retain(|k, _| current.contains(k.as_str()));
+        }
+
+        // Scan sealed requests for stop conditions (EOS or max_tokens).
+        for req_id in batch_req_ids {
+            if self.seen_eos.contains_key(req_id) {
+                continue;
+            }
+            let params = match sampling_params_map.get(req_id) {
+                Some(p) if p.seal => p,
+                _ => continue,
+            };
+            let buf = match token_buffers.get(req_id) {
+                Some(b) => b,
+                None => continue,
+            };
+
+            // Track prompt length on first observation.
+            let prompt_len = *self.prompt_lens.entry(req_id.clone()).or_insert(buf.len());
+
+            // Check EOS/stop tokens.
+            let has_eos = buf.iter().any(|&tok| {
+                self.eos_token_ids.contains(&tok) || params.stop_token_ids.contains(&tok)
+            });
+
+            // Check max_tokens (output count = total - prompt).
+            let output_count = buf.len().saturating_sub(prompt_len);
+            let hit_max = params
+                .max_tokens
+                .is_some_and(|max| output_count >= max as usize);
+
+            if has_eos || hit_max {
+                self.seen_eos.insert(req_id.clone(), ());
+            }
+        }
+
+        // Collect batch indices of requests needing padding.
+        let mut padding_indices = Vec::new();
+        for (req_idx, req_id) in batch_req_ids.iter().enumerate() {
+            if !self.seen_eos.contains_key(req_id) {
+                continue;
+            }
+            let buf = match token_buffers.get(req_id) {
+                Some(b) => b,
+                None => continue,
+            };
+            if buf.len() % self.block_size != 0 {
+                padding_indices.push(req_idx);
+            }
+        }
+        padding_indices
+    }
+}
+
+impl LogitsProcessor for SealPadProcessor {
+    fn update_state(
+        &mut self,
+        batch_update: Option<&BatchUpdate>,
+        sampling_params_map: &HashMap<String, SamplingParams>,
+        token_buffers: &HashMap<String, Vec<u32>>,
+        batch_req_ids: &[String],
+        device: &mut GpuDevice,
+    ) {
+        let padding_indices = self.compute_padding_requests(
+            batch_update,
+            sampling_params_map,
+            token_buffers,
+            batch_req_ids,
+        );
+
+        if padding_indices.is_empty() {
+            self.active = false;
+            self.needs_backup = false;
+            self.gpu_allowed = None;
+            self.gpu_offsets = None;
+            self.gpu_req_indices = None;
+            return;
+        }
+
+        // Build GPU state: CSR allow-list with pad_token for each request.
+        let mut allowed_ids_flat: Vec<i32> = Vec::new();
+        let mut allowed_offsets: Vec<i32> = vec![0];
+        let mut req_indices: Vec<i32> = Vec::new();
+        for req_idx in padding_indices {
+            req_indices.push(req_idx as i32);
+            allowed_ids_flat.push(self.pad_token as i32);
+            allowed_offsets.push(allowed_ids_flat.len() as i32);
+        }
+
+        self.active = true;
+        self.needs_backup = true;
+        self.gpu_allowed = Some(h2d_i32_owned(&allowed_ids_flat, device));
+        self.gpu_offsets = Some(h2d_i32_owned(&allowed_offsets, device));
+        self.gpu_req_indices = Some(h2d_i32_owned(&req_indices, device));
+    }
+
+    fn apply(&self, _logits: GpuTensor, _device: &mut GpuDevice) {
+        // apply_with_backup is used instead (needs backup logits).
+    }
+
+    fn is_argmax_invariant(&self) -> bool {
+        false
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+// ---------------------------------------------------------------------------
 // H2D helpers (allocate via caching allocator + async copy)
 // ---------------------------------------------------------------------------
 
@@ -953,5 +1162,217 @@ mod tests {
         let v1: f32 = rng.r#gen();
         let v2: f32 = rng.r#gen();
         assert_ne!(v1, v2, "successive calls should produce different values");
+    }
+
+    // -----------------------------------------------------------------------
+    // SealPadProcessor tests (CPU-side logic via compute_padding_requests)
+    // -----------------------------------------------------------------------
+
+    fn sealed_params() -> SamplingParams {
+        SamplingParams {
+            seal: true,
+            max_tokens: Some(100),
+            ..Default::default()
+        }
+    }
+
+    fn normal_params() -> SamplingParams {
+        SamplingParams {
+            max_tokens: Some(100),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_seal_pad_processor_default_inactive() {
+        let p = SealPadProcessor::new(vec![2], 0, 4);
+        assert!(!p.is_active());
+        assert!(!p.needs_backup());
+    }
+
+    #[test]
+    fn test_seal_pad_no_sealed_requests() {
+        // Non-sealed requests should never trigger padding.
+        let mut p = SealPadProcessor::new(vec![2], 0, 4);
+        let params: HashMap<String, SamplingParams> =
+            [("r1".into(), normal_params())].into_iter().collect();
+        // Buffer has EOS token 2, but request is not sealed.
+        let bufs: HashMap<String, Vec<u32>> =
+            [("r1".into(), vec![10, 20, 2])].into_iter().collect();
+        let ids = vec!["r1".into()];
+
+        let padding = p.compute_padding_requests(None, &params, &bufs, &ids);
+        assert!(padding.is_empty());
+        assert!(p.seen_eos.is_empty());
+    }
+
+    #[test]
+    fn test_seal_pad_detects_eos() {
+        // Sealed request with EOS in buffer → seen_eos tracked, padding needed.
+        let mut p = SealPadProcessor::new(vec![2], 0, 4);
+        let params: HashMap<String, SamplingParams> =
+            [("r1".into(), sealed_params())].into_iter().collect();
+        // 3 tokens including EOS — not block-aligned (block_size=4).
+        let bufs: HashMap<String, Vec<u32>> =
+            [("r1".into(), vec![10, 20, 2])].into_iter().collect();
+        let ids = vec!["r1".into()];
+
+        let padding = p.compute_padding_requests(None, &params, &bufs, &ids);
+        assert_eq!(padding, vec![0], "r1 at batch index 0 should need padding");
+        assert!(p.seen_eos.contains_key("r1"));
+    }
+
+    #[test]
+    fn test_seal_pad_block_aligned_no_padding() {
+        // Sealed request with EOS, but already block-aligned → no padding needed.
+        let mut p = SealPadProcessor::new(vec![2], 0, 4);
+        let params: HashMap<String, SamplingParams> =
+            [("r1".into(), sealed_params())].into_iter().collect();
+        // 4 tokens = block-aligned.
+        let bufs: HashMap<String, Vec<u32>> =
+            [("r1".into(), vec![10, 20, 2, 0])].into_iter().collect();
+        let ids = vec!["r1".into()];
+
+        let padding = p.compute_padding_requests(None, &params, &bufs, &ids);
+        assert!(padding.is_empty(), "block-aligned should not need padding");
+        assert!(p.seen_eos.contains_key("r1"), "EOS should still be tracked");
+    }
+
+    #[test]
+    fn test_seal_pad_no_eos_yet() {
+        // Sealed request but EOS not yet generated → no padding.
+        let mut p = SealPadProcessor::new(vec![2], 0, 4);
+        let params: HashMap<String, SamplingParams> =
+            [("r1".into(), sealed_params())].into_iter().collect();
+        let bufs: HashMap<String, Vec<u32>> =
+            [("r1".into(), vec![10, 20, 30])].into_iter().collect();
+        let ids = vec!["r1".into()];
+
+        let padding = p.compute_padding_requests(None, &params, &bufs, &ids);
+        assert!(padding.is_empty());
+        assert!(!p.seen_eos.contains_key("r1"));
+    }
+
+    #[test]
+    fn test_seal_pad_stop_token_triggers_padding() {
+        // SealPadProcessor should also detect stop_token_ids (not just EOS).
+        let mut p = SealPadProcessor::new(vec![2], 0, 4); // EOS=2
+        let mut sp = sealed_params();
+        sp.stop_token_ids = vec![99]; // custom stop token
+        let params: HashMap<String, SamplingParams> = [("r1".into(), sp)].into_iter().collect();
+        // Buffer has stop token 99 (not EOS 2).
+        let bufs: HashMap<String, Vec<u32>> =
+            [("r1".into(), vec![10, 20, 99])].into_iter().collect();
+        let ids = vec!["r1".into()];
+
+        let padding = p.compute_padding_requests(None, &params, &bufs, &ids);
+        assert_eq!(padding, vec![0]);
+    }
+
+    #[test]
+    fn test_seal_pad_mixed_batch() {
+        // Batch with sealed+EOS, sealed+no-EOS, and non-sealed requests.
+        let mut p = SealPadProcessor::new(vec![2], 0, 4);
+        let params: HashMap<String, SamplingParams> = [
+            ("sealed_eos".into(), sealed_params()),
+            ("sealed_no_eos".into(), sealed_params()),
+            ("normal".into(), normal_params()),
+        ]
+        .into_iter()
+        .collect();
+        let bufs: HashMap<String, Vec<u32>> = [
+            ("sealed_eos".into(), vec![10, 20, 2]),     // EOS, not aligned
+            ("sealed_no_eos".into(), vec![10, 20, 30]), // no EOS
+            ("normal".into(), vec![10, 20, 2]),         // EOS but not sealed
+        ]
+        .into_iter()
+        .collect();
+        let ids = vec!["sealed_eos".into(), "sealed_no_eos".into(), "normal".into()];
+
+        let padding = p.compute_padding_requests(None, &params, &bufs, &ids);
+        // Only sealed_eos (batch index 0) needs padding.
+        assert_eq!(padding, vec![0]);
+    }
+
+    #[test]
+    fn test_seal_pad_progressive_padding() {
+        // Simulate multiple steps of padding until block-aligned.
+        let mut p = SealPadProcessor::new(vec![2], 0, 4);
+        let params: HashMap<String, SamplingParams> =
+            [("r1".into(), sealed_params())].into_iter().collect();
+        let ids = vec!["r1".into()];
+
+        // Step 1: 5 tokens, EOS at position 4 → needs 3 pads to reach 8.
+        let bufs1: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 20, 30, 40, 2])]
+            .into_iter()
+            .collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs1, &ids);
+        assert_eq!(padding, vec![0]);
+
+        // Step 2: 6 tokens (one pad added) → still needs 2 more.
+        let bufs2: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 20, 30, 40, 2, 0])]
+            .into_iter()
+            .collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs2, &ids);
+        assert_eq!(padding, vec![0]);
+
+        // Step 3: 7 tokens → still needs 1 more.
+        let bufs3: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 20, 30, 40, 2, 0, 0])]
+            .into_iter()
+            .collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs3, &ids);
+        assert_eq!(padding, vec![0]);
+
+        // Step 4: 8 tokens → block-aligned, no more padding.
+        let bufs4: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 20, 30, 40, 2, 0, 0, 0])]
+            .into_iter()
+            .collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs4, &ids);
+        assert!(padding.is_empty());
+    }
+
+    #[test]
+    fn test_seal_pad_seen_eos_cleanup_on_batch_change() {
+        // When a request leaves the batch, its seen_eos entry should be cleaned up.
+        let mut p = SealPadProcessor::new(vec![2], 0, 4);
+        let params: HashMap<String, SamplingParams> =
+            [("r1".into(), sealed_params())].into_iter().collect();
+        let bufs: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 2])].into_iter().collect();
+
+        // Step 1: r1 sees EOS.
+        let ids = vec!["r1".into()];
+        p.compute_padding_requests(None, &params, &bufs, &ids);
+        assert!(p.seen_eos.contains_key("r1"));
+
+        // Step 2: r1 leaves the batch (batch_update signals change).
+        let update = BatchUpdate {
+            batch_size: 0,
+            added: vec![],
+            removed: vec![0],
+        };
+        let empty_ids: Vec<String> = vec![];
+        p.compute_padding_requests(Some(&update), &params, &bufs, &empty_ids);
+        assert!(!p.seen_eos.contains_key("r1"), "should be cleaned up");
+    }
+
+    #[test]
+    fn test_seal_pad_seen_eos_persists_without_batch_change() {
+        // Without a batch_update, seen_eos should persist across steps.
+        let mut p = SealPadProcessor::new(vec![2], 0, 4);
+        let params: HashMap<String, SamplingParams> =
+            [("r1".into(), sealed_params())].into_iter().collect();
+        let ids = vec!["r1".into()];
+
+        // Step 1: EOS detected.
+        let bufs1: HashMap<String, Vec<u32>> = [("r1".into(), vec![10, 2])].into_iter().collect();
+        p.compute_padding_requests(None, &params, &bufs1, &ids);
+        assert!(p.seen_eos.contains_key("r1"));
+
+        // Step 2: No batch_update, buffer grows but no new EOS scan needed.
+        let bufs2: HashMap<String, Vec<u32>> =
+            [("r1".into(), vec![10, 2, 0])].into_iter().collect();
+        let padding = p.compute_padding_requests(None, &params, &bufs2, &ids);
+        assert_eq!(padding, vec![0], "should still need padding");
+        assert!(p.seen_eos.contains_key("r1"), "should persist");
     }
 }

@@ -496,14 +496,15 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             return;
         }
 
+        // Register hashes for any full blocks not yet tracked.
+        // SealPadProcessor pads during generation so all_token_ids is
+        // block-aligned by the time we get here. Just catch any hashes
+        // that allocate_slots missed (additional==0 early return).
         let all_tokens = &request.all_token_ids;
-        let remainder = all_tokens.len() % self.block_size;
-        if remainder == 0 {
-            // Already block-aligned, nothing to seal.
-            return;
-        }
+        let annotations = request.block_annotations.as_ref();
+        let all_hashes = self.hash_all_blocks(all_tokens, annotations);
+        let num_full_blocks = all_tokens.len() / self.block_size;
 
-        // Get the block ID of the last (partial) block.
         let (block_ids_groups, _) = match self.allocations.get(&request.request_id) {
             Some(entry) => entry,
             None => return,
@@ -513,39 +514,26 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             _ => return,
         };
 
-        // Get the block ID of the last (partial) block.
-        let last_block_idx = block_ids.len() - 1;
-        let last_bid = block_ids[last_block_idx];
-
-        // Pad the tokens to compute the hash for the sealed block.
-        let mut padded_tokens = all_tokens.clone();
-        let pad_count = self.block_size - remainder;
-        padded_tokens.extend(std::iter::repeat_n(0u32, pad_count));
-
-        // Hash all blocks including the now-full final block.
-        let annotations = request.block_annotations.as_ref();
-        let all_hashes = self.hash_all_blocks(&padded_tokens, annotations);
-
-        if let Some(&hash) = all_hashes.last() {
-            self.block_hash_to_id.insert(hash, last_bid);
-            self.block_id_to_hash.insert(last_bid, hash);
-
-            // Update per-request hash tracking.
-            let hashes = self
-                .req_to_hashes
-                .entry(request.request_id.clone())
-                .or_default();
-            if hashes.len() <= last_block_idx {
+        let hashes = self
+            .req_to_hashes
+            .entry(request.request_id.clone())
+            .or_default();
+        for i in hashes.len()..num_full_blocks {
+            if i < all_hashes.len() && i < block_ids.len() {
+                let hash = all_hashes[i];
+                let bid = block_ids[i];
+                self.block_hash_to_id.insert(hash, bid);
+                self.block_id_to_hash.insert(bid, hash);
                 hashes.push(hash);
-            }
 
-            if self.spans_config.debug {
-                tracing::debug!(
-                    "[SPANS] Sealed block {} (bid={}) for request {}",
-                    last_block_idx,
-                    last_bid,
-                    request.request_id,
-                );
+                if self.spans_config.debug {
+                    tracing::debug!(
+                        "[SPANS] Sealed block {} (bid={}) for request {}",
+                        i,
+                        bid,
+                        request.request_id,
+                    );
+                }
             }
         }
     }
@@ -3615,18 +3603,26 @@ mod tests {
 
     #[test]
     fn test_seal_caches_partial_block() {
-        // A request with 6 tokens (block_size=4) has 1 full block + 2 partial.
-        // Without seal: the partial block is not cached.
-        // With seal: the partial block is padded, hashed, and cached.
+        // Simulates the full sealed-request lifecycle step by step, as it
+        // happens during real generation with SealPadProcessor:
+        //
+        // 1. Prefill: 6-token prompt → 2 blocks allocated, block 0 hash registered
+        // 2. Decode step 1: token 100 → 7 tokens (no new block needed)
+        // 3. Decode step 2: token 2 (EOS) → 8 tokens (block-aligned)
+        //    Engine would stop here; SealPadProcessor not needed in this case.
+        //    But allocate_slots returns early (additional=0), block 1 hash NOT registered.
+        // 4. seal() → registers block 1 hash
+        // 5. Outer request with same 8 tokens → full cache hit on both blocks
+
         let cfg = spans_config_enabled();
         let mut tracker = SimpleBlockTracker::with_spans_config(64, 4, cfg);
 
-        let tokens: Vec<u32> = vec![10, 20, 30, 40, 50, 60]; // 1.5 blocks
+        let prompt: Vec<u32> = vec![10, 20, 30, 40, 50, 60]; // 6 tokens
         let mut req = Request::new(
-            "r1".into(),
-            tokens.clone(),
+            "inner".into(),
+            prompt,
             SamplingParams {
-                max_tokens: Some(10),
+                max_tokens: Some(100),
                 ..Default::default()
             },
             1.0,
@@ -3636,20 +3632,61 @@ mod tests {
         );
         req.seal = true;
 
-        let blocks = tracker.allocate_slots(&req, req.all_token_ids.len(), 0);
+        // Step 1: Prefill — allocate 2 blocks for 6 tokens.
+        let blocks = tracker.allocate_slots(&req, 6, 0);
         assert!(blocks.is_some());
+        let block_ids = blocks.unwrap();
+        assert_eq!(block_ids[0].len(), 2, "6 tokens need 2 blocks of size 4");
 
-        // Seal pads the last block and registers its hash.
+        // Block 0 (full: [10,20,30,40]) should have its hash registered.
+        // Block 1 (partial: [50,60]) should NOT have its hash registered yet.
+        let hashes_so_far = tracker.req_to_hashes.get("inner");
+        assert_eq!(
+            hashes_so_far.map(|h| h.len()),
+            Some(1),
+            "only 1 full block hash should be registered after prefill"
+        );
+
+        // Step 2: Decode — generate token 100. Total = 7 tokens.
+        req.append_output_token_ids(&[100]);
+        req.num_computed_tokens = 6; // prefill computed 6
+        let blocks2 = tracker.allocate_slots(&req, 7, 0);
+        assert!(blocks2.is_some());
+        // Still 2 blocks (ceil(7/4) = 2), no new allocation.
+        assert_eq!(
+            tracker.req_to_hashes.get("inner").map(|h| h.len()),
+            Some(1),
+            "still only 1 hash — block 1 is still partial"
+        );
+
+        // Step 3: Decode — generate EOS token 2. Total = 8 tokens (block-aligned).
+        req.append_output_token_ids(&[2]);
+        req.num_computed_tokens = 7;
+        let blocks3 = tracker.allocate_slots(&req, 8, 0);
+        assert!(blocks3.is_some());
+        // Still 2 blocks. additional=0, early return — block 1 hash NOT registered.
+        assert_eq!(
+            tracker.req_to_hashes.get("inner").map(|h| h.len()),
+            Some(1),
+            "allocate_slots with additional=0 does NOT register new hashes"
+        );
+
+        // Step 4: seal() — this is where block 1's hash gets registered.
         tracker.seal(&req);
-        tracker.free("r1");
+        assert_eq!(
+            tracker.req_to_hashes.get("inner").map(|h| h.len()),
+            Some(2),
+            "seal() must register hash for block 1"
+        );
 
-        // Now a second request with the same 6 tokens (padded to 8) should
-        // get a cache hit on BOTH blocks — full block + sealed block.
-        let mut padded_tokens = tokens;
-        padded_tokens.extend_from_slice(&[0, 0]); // pad to block boundary
-        let req2 = Request::new(
-            "r2".into(),
-            padded_tokens,
+        // Free the request (blocks go to LRU, hashes persist).
+        tracker.free("inner");
+
+        // Step 5: Outer request with same 8 tokens → should hit both blocks.
+        let outer_tokens: Vec<u32> = vec![10, 20, 30, 40, 50, 60, 100, 2];
+        let outer = Request::new(
+            "outer".into(),
+            outer_tokens,
             SamplingParams {
                 max_tokens: Some(10),
                 ..Default::default()
@@ -3660,8 +3697,13 @@ mod tests {
             None,
         );
 
-        let (num_computed, _) = tracker.get_computed_blocks(&req2);
-        assert_eq!(num_computed, 8); // both blocks cached
+        let (num_computed, cached_blocks) = tracker.get_computed_blocks(&outer);
+        assert_eq!(num_computed, 8, "all 8 tokens should be cached");
+        assert_eq!(
+            cached_blocks[0].len(),
+            2,
+            "both blocks should be cache hits"
+        );
     }
 
     #[test]
@@ -3767,21 +3809,22 @@ mod tests {
 
     #[test]
     fn test_seal_plus_volatile_inner_generate_pattern() {
-        // Simulate the inner-outer generate pattern:
-        // 1. Inner generate: [system, user] prompt (8 tokens) + 3 generated tokens = 11
-        //    With seal+volatile: partial block is cached, blocks are front-queued.
-        // 2. Outer generate: sends the same 11 tokens padded to 12 (block boundary).
-        //    Should get a full cache hit on all 3 blocks.
+        // Full lifecycle test mimicking nested RAG: inner sealed generate,
+        // then outer query using same tokens. Step-by-step through scheduler.
+        //
+        // Inner: 8 prompt + 3 decode + EOS + 3 pads = 16 tokens (4 blocks)
+        // Outer: same 16 tokens as prefix, then more → all 4 inner blocks cached
+
         let cfg = spans_config_enabled();
         let mut tracker = SimpleBlockTracker::with_spans_config(64, 4, cfg);
 
-        // Inner generate prompt: 8 tokens = 2 full blocks.
+        // Inner: 8-token prompt = 2 full blocks.
         let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let mut req_inner = Request::new(
+        let mut inner = Request::new(
             "inner".into(),
             prompt,
             SamplingParams {
-                max_tokens: Some(10),
+                max_tokens: Some(20),
                 ..Default::default()
             },
             1.0,
@@ -3789,24 +3832,60 @@ mod tests {
             0,
             None,
         );
-        tracker.allocate_slots(&req_inner, 8, 0);
+        inner.seal = true;
+        inner.volatile = true;
 
-        // Simulate 3 generated tokens (decode appends to all_token_ids).
-        req_inner.append_output_token_ids(&[100, 101, 102]);
-        // Allocate the partial third block for the generated tokens.
-        tracker.allocate_slots(&req_inner, 11, 0);
+        // Step 1: Prefill 8 tokens → 2 blocks.
+        tracker.allocate_slots(&inner, 8, 0);
+        inner.num_computed_tokens = 8;
+        assert_eq!(tracker.req_to_hashes.get("inner").map(|h| h.len()), Some(2));
 
-        req_inner.seal = true;
-        req_inner.volatile = true;
+        // Steps 2-4: Decode tokens 100, 101, 102.
+        for &tok in &[100u32, 101, 102] {
+            inner.append_output_token_ids(&[tok]);
+            inner.num_computed_tokens += 1;
+            tracker.allocate_slots(&inner, inner.all_token_ids.len(), 0);
+        }
+        // 11 tokens → 3 blocks. Block 2 allocated at token 9 (need ceil(9/4)=3).
+        // Block 2 hash NOT registered (partial).
+        assert_eq!(inner.all_token_ids.len(), 11);
 
-        // Seal pads + hashes the partial block, then free_volatile front-queues.
-        tracker.seal(&req_inner);
-        tracker.free_volatile("inner");
+        // Step 5: EOS token (2). Total = 12, block-aligned.
+        // Engine defers stop because request is sealed.
+        inner.append_output_token_ids(&[2]);
+        inner.num_computed_tokens += 1;
+        tracker.allocate_slots(&inner, 12, 0);
+        assert_eq!(inner.all_token_ids.len(), 12);
 
-        // Outer generate sends the same tokens, padded to block boundary.
-        let mut outer_tokens = vec![1, 2, 3, 4, 5, 6, 7, 8, 100, 101, 102];
-        outer_tokens.push(0); // pad to 12 (3 full blocks)
-        let req_outer = Request::new(
+        // At this point, 12 tokens = 3 full blocks. But block 2 hash
+        // was NOT registered by allocate_slots (additional=0 when we went
+        // from 11→12 tokens, still needing 3 blocks).
+        // Only blocks 0,1 have hashes from prefill, and block 2 got its
+        // hash when it was first allocated at 9 tokens.
+        // Actually: at 9 tokens, allocate_slots allocated 1 new block,
+        // and registered hashes for num_full_blocks=9/4=2 blocks (0,1).
+        // Block 2 is still partial (only 1 token).
+        // At 10,11,12 tokens: additional=0, no hash registration.
+        // So block 2's hash is NOT registered yet.
+
+        // Step 6: seal() — registers ALL unregistered full block hashes.
+        tracker.seal(&inner);
+        let inner_hashes = tracker.req_to_hashes.get("inner").unwrap();
+        assert_eq!(
+            inner_hashes.len(),
+            3,
+            "seal must register all 3 block hashes"
+        );
+
+        // Sealed+volatile: seal wins, use normal free (back of LRU).
+        // (finish_single_request in scheduler uses free() not free_volatile()
+        // when request.seal is true.)
+        tracker.free("inner");
+
+        // Outer request with same 12 tokens as prefix (+ more for its own query).
+        let mut outer_tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 100, 101, 102, 2];
+        outer_tokens.extend_from_slice(&[200, 201, 202, 203]); // outer's own content
+        let outer = Request::new(
             "outer".into(),
             outer_tokens,
             SamplingParams {
@@ -3819,9 +3898,87 @@ mod tests {
             None,
         );
 
-        let (num_computed, cached_ids) = tracker.get_computed_blocks(&req_outer);
-        // All 3 blocks should be cache hits (2 full + 1 sealed).
-        assert_eq!(num_computed, 12);
-        assert_eq!(cached_ids[0].len(), 3);
+        let (num_computed, cached_blocks) = tracker.get_computed_blocks(&outer);
+        assert_eq!(num_computed, 12, "all 12 inner tokens should be cached");
+        assert_eq!(
+            cached_blocks[0].len(),
+            3,
+            "3 blocks from inner should be hits"
+        );
+    }
+
+    #[test]
+    fn test_seal_non_aligned_only_caches_full_blocks() {
+        // If SealPadProcessor didn't pad (e.g. request stopped before EOS),
+        // seal() only registers full blocks. The partial last block is lost.
+        let cfg = spans_config_enabled();
+        let mut tracker = SimpleBlockTracker::with_spans_config(64, 4, cfg);
+
+        // 6 tokens = 1 full block + 2 partial.
+        let prompt: Vec<u32> = vec![10, 20, 30, 40, 50, 60];
+        let mut req = Request::new(
+            "r1".into(),
+            prompt,
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+        req.seal = true;
+        tracker.allocate_slots(&req, 6, 0);
+
+        // seal() registers only the 1 full block. Partial block is not cached.
+        tracker.seal(&req);
+        let hashes = tracker.req_to_hashes.get("r1").unwrap();
+        assert_eq!(hashes.len(), 1, "only full block registered");
+
+        tracker.free("r1");
+
+        // Outer request starting with same 4 tokens → hits block 0.
+        let req2 = Request::new(
+            "r2".into(),
+            vec![10, 20, 30, 40, 50, 60, 70, 80],
+            SamplingParams {
+                max_tokens: Some(10),
+                ..Default::default()
+            },
+            1.0,
+            0,
+            0,
+            None,
+        );
+        let (num_computed, _) = tracker.get_computed_blocks(&req2);
+        assert_eq!(num_computed, 4, "only block 0 (full) cached");
+    }
+
+    #[test]
+    fn test_seal_hash_matches_across_requests() {
+        // Verify that hash_all_blocks produces identical hashes for the same
+        // token sequences, regardless of how those tokens arrived (prompt vs
+        // prompt+output). This is the fundamental invariant for cache hits.
+        let cfg = spans_config_enabled();
+        let tracker = SimpleBlockTracker::with_spans_config(64, 4, cfg);
+
+        // Inner's all_token_ids: prompt [1,2,3,4,5,6,7,8] + output [100,2,0,0]
+        let inner_tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 100, 2, 0, 0];
+        let inner_hashes = tracker.hash_all_blocks(&inner_tokens, None);
+
+        // Outer's prompt contains the same 12 tokens as a prefix.
+        let outer_tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 100, 2, 0, 0, 200, 201, 202, 203];
+        let outer_hashes = tracker.hash_all_blocks(&outer_tokens, None);
+
+        // First 3 blocks should have identical hashes.
+        assert_eq!(inner_hashes.len(), 3);
+        assert_eq!(outer_hashes.len(), 4);
+        for i in 0..3 {
+            assert_eq!(
+                inner_hashes[i], outer_hashes[i],
+                "block {i} hash must match between inner and outer"
+            );
+        }
     }
 }

@@ -163,6 +163,11 @@ pub struct SamplingParams {
     /// of a bad word, the completing token is suppressed (logit set to `-inf`).
     /// Each inner `Vec<u32>` is one bad word as a token sequence.
     pub bad_words_token_ids: Option<Vec<Vec<u32>>>,
+
+    /// 🦭 When true, the SealPadProcessor forces pad tokens after EOS until
+    /// block-aligned, so the final partial block is cacheable via prefix caching.
+    #[serde(default)]
+    pub seal: bool,
 }
 
 impl Default for SamplingParams {
@@ -192,6 +197,7 @@ impl Default for SamplingParams {
             guided_grammar: None,
             allowed_token_ids: None,
             bad_words_token_ids: None,
+            seal: false,
         }
     }
 }

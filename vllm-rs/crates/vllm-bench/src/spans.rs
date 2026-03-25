@@ -429,18 +429,17 @@ pub(crate) fn run_bench_spans(args: BenchSpansArgs) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn run_bench_nested(args: &BenchSpansArgs, num_inner: usize) -> Result<()> {
-    let block_size = args.block_size;
-    let pad_token = args.pad_token;
-    let query_len = args.query_len;
     let inner_tokens = args.inner_tokens;
+    let block_size = args.block_size;
 
     let mut llm = build_llm(args, true)?;
+    let model = llm.model_name().to_string();
 
     let inner_sampling = SamplingParams {
         max_tokens: Some(inner_tokens),
         temperature: 0.0,
         ignore_eos: true,
-        detokenize: false,
+        detokenize: true,
         ..SamplingParams::default()
     };
 
@@ -452,142 +451,158 @@ fn run_bench_nested(args: &BenchSpansArgs, num_inner: usize) -> Result<()> {
         ..SamplingParams::default()
     };
 
+    // Inner prompt texts (shared between baseline and spans paths).
+    let prompts: Vec<String> = (0..num_inner)
+        .map(|i| {
+            format!(
+                "Document {i}: This is a unique synthetic document number {i} \
+                 with enough content to fill multiple KV cache blocks for the \
+                 nested spans benchmark test. Content seed: {seed}.",
+                seed = i * 12345 + 67890
+            )
+        })
+        .collect();
+
     eprintln!();
     eprintln!("{BOLD}vLLM Rust \u{2014} nested spans benchmark{RST}");
-    eprintln!("  {num_inner} inner generates x {inner_tokens} tokens each + {query_len} query");
+    eprintln!("  {num_inner} inner generates x {inner_tokens} tokens each");
+
+    // =====================================================================
+    // Baseline: normal generate() — no spans, no SPNL, no seal
+    // =====================================================================
     eprintln!();
+    eprintln!("{BOLD}--- Baseline (normal generate) ---{RST}");
 
-    // -----------------------------------------------------------------------
-    // Step 1: Run N inner generates with seal=true.
-    // Each inner generate's output is padded and cached so the outer
-    // generate can hit it.
-    // -----------------------------------------------------------------------
-    eprintln!("{BOLD}Step 1:{RST} Run {num_inner} inner generates (seal=true)");
+    use vllm_serve::llm::ChatMessage;
 
-    // Store full inner sequences (prompt + output) for the outer prompt.
-    let mut inner_sequences: Vec<Vec<u32>> = Vec::with_capacity(num_inner);
-    for i in 0..num_inner {
-        // Each inner generate has a unique synthetic prompt (one block).
-        let prompt_tokens: Vec<u32> = (0..block_size)
-            .map(|j| 2000 + i as u32 * 1000 + j as u32)
-            .collect();
+    let baseline_inner_start = Instant::now();
+    let mut inner_outputs: Vec<String> = Vec::with_capacity(num_inner);
+    for (i, prompt) in prompts.iter().enumerate() {
+        let start = Instant::now();
+        let result = llm.chat(&[ChatMessage::user(prompt)], Some(inner_sampling.clone()))?;
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "    inner[{i}]  {BOLD}{ms:>8.1}ms{RST}  {DIM}{} output tokens{RST}",
+            result.outputs[0].token_ids.len()
+        );
+        inner_outputs.push(result.outputs[0].text.clone());
+    }
+    let baseline_inner_ms = baseline_inner_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Annotate prompt blocks as Relocatable so hashes match the outer.
-        let num_prompt_blocks = prompt_tokens.len() / block_size;
-        let mut inner_ann = std::collections::BTreeMap::new();
-        for b in 0..num_prompt_blocks {
-            inner_ann.insert(b, vllm_common::BlockKind::Relocatable);
-        }
-        let prompt = Prompt::TokenIdsWithAnnotations(prompt_tokens.clone(), inner_ann);
+    // Build outer prompt: inner outputs + query. No inner prompts.
+    let mut chat_messages = Vec::new();
+    for output in &inner_outputs {
+        chat_messages.push(ChatMessage::assistant(output));
+    }
+    chat_messages.push(ChatMessage::user("Summarize all documents."));
+
+    let start = Instant::now();
+    llm.chat(&chat_messages, Some(outer_sampling.clone()))?;
+    let baseline_outer_ms = start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("    outer     {BOLD}{baseline_outer_ms:>8.1}ms{RST}  {DIM}full prefill{RST}");
+
+    // =====================================================================
+    // Reset cache — clear everything before the spans path
+    // =====================================================================
+    llm.reset_prefix_cache()?;
+
+    // =====================================================================
+    // Spans: execute_query with seal + relocatable annotations
+    // =====================================================================
+    eprintln!();
+    eprintln!("{BOLD}--- Spans (execute_query, sealed) ---{RST}");
+
+    let spans_inner_start = Instant::now();
+    let mut spans_outputs: Vec<String> = Vec::with_capacity(num_inner);
+    let mut expected_cached_tokens: usize = 0;
+    for (i, prompt) in prompts.iter().enumerate() {
+        let query = serde_json::json!({
+            "g": {
+                "model": model,
+                "max_tokens": inner_tokens,
+                "temperature": 0.0,
+                "input": { "plus": [{ "user": *prompt }] }
+            }
+        });
 
         let start = Instant::now();
-        let results = llm.generate_sealed(&[prompt], Some(inner_sampling.clone()), true, true)?;
+        let results = llm.execute_query(
+            &query.to_string(),
+            Some(inner_sampling.clone()),
+            true, // seal
+            true, // volatile
+        )?;
         let ms = start.elapsed().as_secs_f64() * 1000.0;
-
-        let output_tokens = &results[0].outputs[0].token_ids;
+        let prompt_toks = results[0].prompt_token_ids.len();
+        let output_toks = results[0].outputs[0].token_ids.len();
+        let total_inner = prompt_toks + output_toks;
+        let sealed_toks = total_inner / block_size * block_size;
+        expected_cached_tokens += sealed_toks;
         eprintln!(
-            "    inner[{i}]  {BOLD}{ms:>8.1}ms{RST}  {DIM}{} prompt + {} output tokens{RST}",
-            prompt_tokens.len(),
-            output_tokens.len()
+            "    inner[{i}]  {BOLD}{ms:>8.1}ms{RST}  {DIM}{prompt_toks} prompt + {output_toks} output = {total_inner} ({sealed_toks} sealed){RST}",
         );
-        // Full sequence = prompt + output (matches what's in KV cache).
-        let mut full_seq = prompt_tokens;
-        full_seq.extend_from_slice(output_tokens);
-        inner_sequences.push(full_seq);
+        spans_outputs.push(results[0].outputs[0].text.clone());
+    }
+    let spans_inner_ms = spans_inner_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("    expected cached in outer: {BOLD}{expected_cached_tokens}{RST} tokens");
+
+    // Outer with span annotations — should hit sealed blocks.
+    let mut plus_children = Vec::new();
+    for (i, prompt) in prompts.iter().enumerate() {
+        plus_children.push(serde_json::json!({
+            "seq": [{ "user": *prompt }, { "assistant": spans_outputs[i] }]
+        }));
     }
 
-    // -----------------------------------------------------------------------
-    // Step 2: Build outer prompt from full inner sequences + query.
-    // Each inner sequence (prompt + output) is padded to a block boundary
-    // and annotated as Relocatable. The token content must match what was
-    // sealed in the KV cache for cache hits.
-    // -----------------------------------------------------------------------
-    let mut outer_tokens = Vec::new();
-    let mut annotations = std::collections::BTreeMap::new();
-
-    for seq in &inner_sequences {
-        // Pad to block boundary before each inner sequence.
-        let remainder = outer_tokens.len() % block_size;
-        if remainder > 0 {
-            let pad_count = block_size - remainder;
-            outer_tokens.extend(std::iter::repeat_n(pad_token, pad_count));
+    let spans_query = serde_json::json!({
+        "g": {
+            "model": model,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "input": {
+                "cross": [
+                    { "plus": plus_children },
+                    { "user": "Summarize all documents." }
+                ]
+            }
         }
-        let start_block = outer_tokens.len() / block_size;
-        outer_tokens.extend_from_slice(seq);
-        // Pad the sequence itself to block boundary.
-        let remainder = outer_tokens.len() % block_size;
-        if remainder > 0 {
-            let pad_count = block_size - remainder;
-            outer_tokens.extend(std::iter::repeat_n(pad_token, pad_count));
-        }
-        let end_block = outer_tokens.len() / block_size;
-        for b in start_block..end_block {
-            annotations.insert(b, vllm_common::BlockKind::Relocatable);
-        }
-    }
-    let total_inner_tokens = outer_tokens.len();
-
-    // Build two outer prompts with different query suffixes.
-    let make_outer = |query_id: u32| -> Vec<u32> {
-        let mut tokens = outer_tokens.clone();
-        for j in 0..query_len {
-            tokens.push(90000 + query_id * 1000 + j as u32);
-        }
-        tokens
-    };
-
-    let outer_baseline = make_outer(0);
-    let outer_spans = make_outer(1);
-
-    eprintln!();
-    eprintln!(
-        "  Outer prompt: {} tokens ({total_inner_tokens} from inner outputs, {query_len} query)",
-        outer_baseline.len()
-    );
-
-    // -----------------------------------------------------------------------
-    // Step 2: Outer WITHOUT annotations (baseline — full recompute).
-    // -----------------------------------------------------------------------
-    eprintln!();
-    eprintln!("{BOLD}Step 2:{RST} Outer generate WITHOUT annotations (baseline)");
+    });
 
     let start = Instant::now();
-    llm.generate(
-        &[Prompt::TokenIds(outer_baseline)],
+    llm.execute_query(
+        &spans_query.to_string(),
         Some(outer_sampling.clone()),
+        false,
+        false,
     )?;
-    let baseline_ms = start.elapsed().as_secs_f64() * 1000.0;
-    eprintln!("    {BOLD}{baseline_ms:>8.1}ms{RST}  {DIM}full recompute{RST}");
-
-    // -----------------------------------------------------------------------
-    // Step 3: Outer WITH Relocatable annotations.
-    // The inner output blocks have matching content in the KV cache from
-    // step 1 (if seal worked). The scheduler should detect cache hits for
-    // those blocks and skip their recomputation.
-    // -----------------------------------------------------------------------
-    eprintln!();
-    eprintln!("{BOLD}Step 3:{RST} Outer generate WITH Relocatable annotations");
-
-    let start = Instant::now();
-    llm.generate(
-        &[Prompt::TokenIdsWithAnnotations(outer_spans, annotations)],
-        Some(outer_sampling.clone()),
-    )?;
-    let spans_ms = start.elapsed().as_secs_f64() * 1000.0;
-    eprintln!("    {BOLD}{spans_ms:>8.1}ms{RST}  {DIM}span cache hit{RST}");
+    let spans_outer_ms = start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("    outer     {BOLD}{spans_outer_ms:>8.1}ms{RST}  {DIM}span cache hit{RST}");
 
     drop(llm);
 
-    // -----------------------------------------------------------------------
+    // =====================================================================
     // Summary
-    // -----------------------------------------------------------------------
+    // =====================================================================
+    let baseline_total = baseline_inner_ms + baseline_outer_ms;
+    let spans_total = spans_inner_ms + spans_outer_ms;
+
     eprintln!();
     println!("{BOLD}=== Nested Spans Results ==={RST}");
     println!();
-    println!("  Baseline (no annotations):  {BOLD}{baseline_ms:>8.1}ms{RST}");
     println!(
-        "  With Relocatable:           {BOLD}{spans_ms:>8.1}ms{RST}  ({BOLD}{:.1}x{RST} speedup)",
-        baseline_ms / spans_ms
+        "  Baseline:  inner {BOLD}{baseline_inner_ms:>8.1}ms{RST}  outer {BOLD}{baseline_outer_ms:>8.1}ms{RST}  total {BOLD}{baseline_total:>8.1}ms{RST}"
+    );
+    println!(
+        "  Spans:     inner {BOLD}{spans_inner_ms:>8.1}ms{RST}  outer {BOLD}{spans_outer_ms:>8.1}ms{RST}  total {BOLD}{spans_total:>8.1}ms{RST}"
+    );
+    println!();
+    println!(
+        "  Outer speedup: {BOLD}{:.1}x{RST}",
+        baseline_outer_ms / spans_outer_ms
+    );
+    println!(
+        "  Total speedup: {BOLD}{:.1}x{RST}",
+        baseline_total / spans_total
     );
     println!();
 

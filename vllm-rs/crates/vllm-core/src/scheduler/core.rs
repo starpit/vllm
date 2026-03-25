@@ -512,6 +512,8 @@ impl KVCacheManagerOps for SimpleBlockTracker {
             Some(ids) if !ids.is_empty() => ids,
             _ => return,
         };
+
+        // Get the block ID of the last (partial) block.
         let last_block_idx = block_ids.len() - 1;
         let last_bid = block_ids[last_block_idx];
 
@@ -598,6 +600,13 @@ impl KVCacheManagerOps for SimpleBlockTracker {
                 }
             }
 
+            tracing::info!(
+                "[CACHE] req={} prefix: {}/{} blocks hit, {} computed tokens",
+                request.request_id,
+                matched_block_ids.len(),
+                hashes.len(),
+                num_matched_tokens,
+            );
             return (num_matched_tokens, vec![matched_block_ids]);
         }
 
@@ -625,7 +634,17 @@ impl KVCacheManagerOps for SimpleBlockTracker {
 
         // Count the longest contiguous prefix of cache hits.
         let contiguous_hits = is_hit.iter().take_while(|&&hit| hit).count();
+        let total_hits = is_hit.iter().filter(|&&h| h).count();
         let contiguous_tokens = (contiguous_hits * self.block_size) as u32;
+
+        tracing::info!(
+            "[CACHE] req={} spans: {}/{} blocks hit (contiguous: {}), {} computed tokens",
+            request.request_id,
+            total_hits,
+            hashes.len(),
+            contiguous_hits,
+            contiguous_tokens,
+        );
 
         (contiguous_tokens, vec![matched_block_ids])
     }
@@ -984,8 +1003,10 @@ impl Scheduler {
             if request.seal {
                 self.kv_cache.seal(&request);
             }
-            // Volatile: push blocks to front of free queue for early eviction.
-            if request.volatile {
+            // For sealed requests, always use normal free (back of LRU queue)
+            // so the blocks persist for future cache hits. Volatile eviction
+            // (front-of-queue) happens at read time, not finish time.
+            if request.volatile && !request.seal {
                 self.kv_cache.free_volatile(&request.request_id);
             } else {
                 self.kv_cache.free(&request.request_id);

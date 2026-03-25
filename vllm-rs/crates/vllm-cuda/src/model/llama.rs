@@ -461,9 +461,6 @@ pub struct LlamaAttention {
     pub q_norm_weight: Option<GpuTensor>,
     pub k_norm_weight: Option<GpuTensor>,
     pub qk_norm_eps: f32,
-    /// When true, K is stored unrotated in cache and FA2 applies RoPE in
-    /// shared memory during attention (fused RoPE for spans).
-    pub block_needs_positioning: bool,
     /// NCCL group for TP all-reduce after o_proj (row parallel).
     #[cfg(feature = "nccl")]
     pub tp_group: Option<Arc<NcclGroup>>,
@@ -607,8 +604,8 @@ impl LlamaAttention {
                     device.compute_stream,
                 );
                 (q, k, v)
-            } else if max_seqlen_q == 1 && self.block_needs_positioning {
-                // Fused RoPE decode: store K unrotated, FA2 rotates in shared mem.
+            } else if max_seqlen_q == 1 {
+                // Decode: store K unrotated, FA2 rotates in shared mem.
                 let (q, k, v) = kernels::split_qkv(
                     qkv.as_gpu_tensor(),
                     self.q_size,
@@ -684,101 +681,9 @@ impl LlamaAttention {
                 }
 
                 return result;
-            } else if max_seqlen_q == 1 {
-                // Standard decode: fused QKV split + RoPE + cache write.
-                // K/V go directly into paged cache — no intermediate allocation.
-                let q = if kv_cache.is_fp8() {
-                    kernels::fused_qkv_rope_cache_fp8(
-                        qkv.as_gpu_tensor(),
-                        *positions,
-                        rotary.cos_sin_cache,
-                        *slot_mapping,
-                        *kv_cache.k_cache(self.layer_idx),
-                        *kv_cache.v_cache(self.layer_idx),
-                        kv_cache.k_scale_ptr(self.layer_idx),
-                        kv_cache.v_scale_ptr(self.layer_idx),
-                        self.q_size,
-                        self.kv_size,
-                        self.num_q_heads,
-                        self.head_dim,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                } else {
-                    kernels::fused_qkv_rope_cache(
-                        qkv.as_gpu_tensor(),
-                        *positions,
-                        rotary.cos_sin_cache,
-                        *slot_mapping,
-                        *kv_cache.k_cache(self.layer_idx),
-                        *kv_cache.v_cache(self.layer_idx),
-                        self.q_size,
-                        self.kv_size,
-                        self.num_q_heads,
-                        self.head_dim,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                };
-                drop(qkv);
-
-                // Decode attention with span rotation (external kernel pre/post).
-                let attn_output = crate::model::attention_helpers::with_span_rotation(
-                    kv_cache,
-                    self.layer_idx,
-                    TensorView::from_raw(rotary.cos_sin_cache),
-                    cu_seqlens_q,
-                    seqused_k,
-                    block_table,
-                    max_seqlen_k,
-                    device.compute_stream,
-                    || {
-                        crate::model::attention_helpers::attention_decode_from_cache(
-                            q.view(),
-                            cu_seqlens_q,
-                            seqused_k,
-                            block_table,
-                            max_seqlen_q,
-                            max_seqlen_k,
-                            self.scale,
-                            0.0,
-                            -1,
-                            kv_cache,
-                            self.layer_idx,
-                            device.num_sm,
-                            &mut device.caching,
-                            device.compute_stream,
-                            rotary.cos_sin_cache.raw_ptr() as *const u8,
-                            rotary.cos_sin_cache.dim(1),
-                        )
-                    },
-                );
-                drop(q);
-
-                // Reshape to [num_tokens, q_size] and output projection.
-                let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
-                let result = self.o_proj.forward(
-                    attn_flat,
-                    &mut device.cublas,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                drop(attn_output);
-
-                #[cfg(feature = "nccl")]
-                if let Some(ref group) = self.tp_group {
-                    group
-                        .all_reduce_inplace(result.as_gpu_tensor())
-                        .expect("o_proj all_reduce failed");
-                }
-
-                return result;
-            } else if self.block_needs_positioning {
-                // Fused RoPE prefill: split QKV, apply RoPE to Q only, store K
-                // unrotated. FA2 paged path rotates cached K in shared memory.
-                // K stays unrotated: written to cache without RoPE, and FA2's
-                // fused RoPE (rotate_cached_k) handles rotation in shared memory
-                // for both the fresh contiguous path and the paged path.
+            } else {
+                // Prefill: split QKV, apply RoPE to Q only, store K unrotated.
+                // FA2 rotates cached K in shared memory during attention.
                 let (q, k, v) = kernels::split_qkv(
                     qkv.as_gpu_tensor(),
                     self.q_size,
@@ -853,25 +758,9 @@ impl LlamaAttention {
                 }
 
                 return result;
-            } else {
-                // Standard prefill: fused QKV split + RoPE (rotates both Q and K).
-                let result = kernels::fused_qkv_rope(
-                    qkv.as_gpu_tensor(),
-                    *positions,
-                    rotary.cos_sin_cache,
-                    self.q_size,
-                    self.kv_size,
-                    self.num_q_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
-                drop(qkv);
-                result
             };
 
-        // Write new K/V into paged cache.
+        // QK-norm fallthrough: write K/V then run attention.
         crate::model::attention_helpers::write_kv_cache(
             k.view(),
             v.view(),
@@ -881,7 +770,7 @@ impl LlamaAttention {
             device.compute_stream,
         );
 
-        // Standard prefill attention with span rotation (external kernel pre/post).
+        // QK-norm attention with span rotation (external kernel pre/post).
         let attn_output = crate::model::attention_helpers::with_span_rotation(
             kv_cache,
             self.layer_idx,
@@ -1402,7 +1291,6 @@ impl LlamaAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps,
-            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -1598,7 +1486,6 @@ impl LlamaAttention {
             q_norm_weight: None,
             k_norm_weight: None,
             qk_norm_eps: 0.0,
-            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -1661,7 +1548,6 @@ impl LlamaAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps,
-            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -1725,7 +1611,6 @@ impl LlamaAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps,
-            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -2452,7 +2337,6 @@ impl LlamaAttention {
             q_norm_weight: None,
             k_norm_weight: None,
             qk_norm_eps: 0.0,
-            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         })
@@ -2745,7 +2629,6 @@ impl LlamaForCausalLM {
                 q_norm_weight,
                 k_norm_weight,
                 qk_norm_eps,
-                block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
                 #[cfg(feature = "nccl")]
                 tp_group: None,
             };
@@ -3076,7 +2959,6 @@ impl LlamaAttention {
             q_norm_weight,
             k_norm_weight,
             qk_norm_eps: 1e-6,
-            block_needs_positioning: true, // TODO: enable when per-block annotation-driven RoPE is implemented
             #[cfg(feature = "nccl")]
             tp_group: None,
         })

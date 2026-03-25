@@ -383,9 +383,17 @@ struct InitializedCore {
 
 /// Common initialization: worker → cache → executor → InprocClient → tokenizer.
 ///
+/// Handles both single-GPU (TP=1) and multi-GPU (TP>1) transparently.
 /// Shared by [`initialize_stack`] (async server path) and
 /// [`initialize_stack_sync`] (sync LLM path).
 fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
+    let tp_size = config.tensor_parallel_size;
+
+    // TP > 1: multi-GPU path with NCCL.
+    if tp_size > 1 {
+        return initialize_core_tp(config);
+    }
+
     let model_path = config.model.clone();
     let model_name = extract_model_name(&model_path).into_owned();
 
@@ -533,6 +541,261 @@ fn initialize_core(config: &VllmConfig) -> Result<InitializedCore> {
         model_dir,
         hf_config,
     })
+}
+
+/// TP variant of `initialize_core`: spawns one worker per GPU, sets up NCCL,
+/// profiles memory, warms up, and returns an `InitializedCore` with a
+/// `ThreadPoolExecutor`-backed `InprocClient`.
+fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
+    #[cfg(not(feature = "nccl"))]
+    {
+        let _ = config;
+        anyhow::bail!(
+            "Tensor parallelism requires the `nccl` feature; \
+             rebuild with --features nccl"
+        );
+    }
+
+    #[cfg(feature = "nccl")]
+    {
+        use vllm_executor::cuda_worker::{CudaWorker, CudaWorkerConfig};
+        use vllm_executor::parallel::ResolvedParallelConfig;
+        use vllm_executor::threadpool::ThreadPoolExecutor;
+
+        let tp_size = config.tensor_parallel_size;
+        let model_name = extract_model_name(&config.model).into_owned();
+        let is_pooling = config.runner == "pooling";
+
+        info!("Tensor parallelism: {} GPUs", tp_size);
+
+        let nccl_id = vllm_cuda::NcclId::new().context("failed to generate NCCL unique ID")?;
+
+        let worker_configs: Vec<CudaWorkerConfig> = (0..tp_size)
+            .map(|rank| CudaWorkerConfig {
+                model_path: config.model.clone(),
+                dtype: config.dtype.clone(),
+                hf_token: config.hf_token.clone(),
+                block_size: config.block_size,
+                device_id: rank as i32,
+                enforce_eager: config.enforce_eager,
+                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
+                cuda_graph_sizes: config
+                    .cuda_graph_config
+                    .as_ref()
+                    .map(|c| c.capture_sizes.clone())
+                    .unwrap_or_default(),
+                cublas_autotune: config.cublas_autotune,
+                gpu_memory_utilization: config.gpu_memory_utilization,
+                pooling_strategy: config.pooling_strategy.clone(),
+                is_pooling,
+                tp_rank: rank,
+                tp_world_size: tp_size,
+                pp_rank: 0,
+                pp_size: 1,
+                gguf_file: config.gguf_file.clone(),
+                lora_adapter: config.lora_adapter.clone(),
+                kv_cache_dtype: config.kv_cache_dtype.clone(),
+                calculate_kv_scales: config.calculate_kv_scales,
+                cuda_graph_mode: config
+                    .cuda_graph_mode
+                    .parse()
+                    .unwrap_or(CudaGraphMode::Auto),
+            })
+            .collect();
+
+        let download_barrier = std::sync::Arc::new(std::sync::Barrier::new(tp_size));
+
+        let handles: Vec<_> = worker_configs
+            .into_iter()
+            .enumerate()
+            .map(|(local_rank, cfg)| {
+                let barrier = download_barrier.clone();
+                std::thread::spawn(move || -> Result<CudaWorker> {
+                    let mut worker = CudaWorker::new(cfg);
+                    worker.init_device().context("init_device failed")?;
+                    if local_rank == 0 {
+                        worker.load_model().context("load_model failed")?;
+                        barrier.wait();
+                    } else {
+                        barrier.wait();
+                        worker.load_model().context("load_model failed")?;
+                    }
+                    Ok(worker)
+                })
+            })
+            .collect();
+
+        let mut cuda_workers: Vec<CudaWorker> = Vec::with_capacity(tp_size);
+        let mut hf_config = None;
+        let mut model_dir = None;
+        let mut dtype_elem_bytes: usize = 2;
+
+        for (rank, handle) in handles.into_iter().enumerate() {
+            let worker = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("worker thread {rank} panicked"))?
+                .with_context(|| format!("worker {rank} init failed"))?;
+            if rank == 0 {
+                hf_config = worker.hf_config().cloned();
+                model_dir = worker.model_dir().map(|p| p.to_path_buf());
+                dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
+            }
+            cuda_workers.push(worker);
+        }
+
+        let hf_config = hf_config.context("model config not available after load")?;
+        let max_model_len = config
+            .max_model_len
+            .or(hf_config.max_position_embeddings)
+            .unwrap_or(4096);
+
+        info!(
+            "Model: {}, max_model_len={}, tp={}",
+            model_name, max_model_len, tp_size
+        );
+
+        // NCCL init + memory profiling on persistent threads.
+        let init_results: Vec<Result<(usize, CudaWorker)>> = std::thread::scope(|s| {
+            let handles: Vec<_> = cuda_workers
+                .into_iter()
+                .enumerate()
+                .map(|(rank, mut worker)| {
+                    s.spawn(move || -> Result<(usize, CudaWorker)> {
+                        let device = worker.device_ref().expect("device not initialized");
+                        unsafe {
+                            vllm_cuda::driver::ctx_set_current(device.ctx).unwrap();
+                        }
+                        let nccl_group = vllm_cuda::NcclGroup::new(
+                            rank,
+                            tp_size,
+                            nccl_id,
+                            device.compute_stream,
+                        )
+                        .context("NCCL comm init failed")?;
+                        worker.set_tp_group(std::sync::Arc::new(nccl_group));
+                        let avail = worker.determine_available_memory().map_err(|e| {
+                            anyhow::anyhow!("determine_available_memory rank {rank}: {e}")
+                        })?;
+                        Ok((avail, worker))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let mut workers: Vec<Box<dyn Worker>> = Vec::with_capacity(tp_size);
+        let mut min_avail = usize::MAX;
+        for res in init_results {
+            let (avail, worker) = res?;
+            min_avail = min_avail.min(avail);
+            workers.push(Box::new(worker));
+        }
+
+        let num_gpu_blocks = compute_num_blocks(
+            min_avail,
+            config.block_size,
+            &hf_config,
+            dtype_elem_bytes,
+            config.gpu_memory_utilization,
+            &config.kv_cache_dtype,
+        );
+
+        for w in &mut workers {
+            w.initialize_cache(num_gpu_blocks, 0)
+                .context("initialize_cache")?;
+        }
+
+        info!(
+            "TP: min available memory across ranks: {:.1} GB, num_gpu_blocks={}",
+            min_avail as f64 / (1024.0 * 1024.0 * 1024.0),
+            num_gpu_blocks,
+        );
+
+        // Warm up concurrently (NCCL collectives need all ranks).
+        let warmup_results: Vec<Result<()>> = std::thread::scope(|s| {
+            let handles: Vec<_> = workers
+                .iter_mut()
+                .enumerate()
+                .map(|(rank, w)| {
+                    s.spawn(move || {
+                        w.compile_or_warm_up_model()
+                            .with_context(|| format!("compile_or_warm_up_model rank {rank}"))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for res in warmup_results {
+            res?;
+        }
+
+        let parallel_config = ResolvedParallelConfig::tensor_parallel(tp_size, 0);
+        let executor = ThreadPoolExecutor::new(workers, parallel_config);
+
+        let use_async_scheduling = !config.disable_async_scheduling;
+        let enable_prefix_caching = config.enable_prefix_caching;
+
+        let eos_token_ids: Vec<u32> = hf_config
+            .extra
+            .get("eos_token_id")
+            .map(|v| {
+                if let Some(id) = v.as_u64() {
+                    vec![id as u32]
+                } else if let Some(arr) = v.as_array() {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|id| id as u32))
+                        .collect()
+                } else {
+                    vec![]
+                }
+            })
+            .unwrap_or_default();
+
+        let engine_config = EngineCoreConfig {
+            scheduler_config: SchedulerConfig {
+                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
+                max_num_seqs: config.max_num_seqs,
+                policy: SchedulerPolicy::Fcfs,
+                enable_chunked_prefill: true,
+                async_scheduling: Some(use_async_scheduling),
+                num_lookahead_tokens: if config.speculative_model.is_some() {
+                    config.num_speculative_tokens
+                } else {
+                    0
+                },
+                ..Default::default()
+            },
+            max_model_len,
+            num_gpu_blocks,
+            block_size: config.block_size,
+            engine_index: 0,
+            async_scheduling: use_async_scheduling,
+            use_spec_decode: config.speculative_model.is_some(),
+            ngram_proposer_config: None,
+            eos_token_ids,
+            is_pooling: config.runner == "pooling",
+            enable_prefix_caching,
+        };
+
+        let client = InprocClient::new(engine_config, Box::new(executor));
+
+        let tokenizer = model_dir
+            .as_ref()
+            .and_then(|dir| try_load_tokenizer(dir).ok())
+            .map(|tok| {
+                info!("Tokenizer loaded");
+                Arc::new(tok)
+            });
+
+        Ok(InitializedCore {
+            client,
+            tokenizer,
+            model_name,
+            max_model_len,
+            model_dir,
+            hf_config,
+        })
+    }
 }
 
 /// Initialize the sync stack for offline batch inference (no async overhead).

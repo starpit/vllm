@@ -571,38 +571,63 @@ impl Qwen3MoeDecoderLayer {
 
     /// Load an FP8 block-quantized decoder layer.
     /// Attention and dense MLP use block FP8 (weight_scale_inv with 2D scales).
-    /// MoE expert weights are dequantized to BF16 at load time because the FP8
-    /// MoE kernel only supports per-expert scalar scales, not 2D block scales.
+    /// MoE experts use block-scale-aware FP8 MoE kernel.
+    /// With TP, expert intermediate dims are sharded across ranks.
     pub fn load_fp8_block(
         weights: &mut GpuWeights,
         prefix: &str,
         config: &Qwen3MoeConfig,
         layer_idx: usize,
         dtype: DType,
+        tp: Option<TpConfig>,
         stream: cudarc::driver::sys::CUstream,
     ) -> Result<Self> {
         let llama_cfg = config.as_llama_config();
 
         // Load block-FP8 attention with QK-norm weights.
-        let self_attn = LlamaAttention::load_fp8_block(
-            weights,
-            &format!("{prefix}.self_attn"),
-            &llama_cfg,
-            layer_idx,
-            dtype,
-            config.rms_norm_eps,
-            stream,
-        )?;
+        let self_attn = if let Some(tp_cfg) = tp {
+            LlamaAttention::load_fp8_block_tp(
+                weights,
+                &format!("{prefix}.self_attn"),
+                &llama_cfg,
+                layer_idx,
+                dtype,
+                config.rms_norm_eps,
+                tp_cfg,
+                stream,
+            )?
+        } else {
+            LlamaAttention::load_fp8_block(
+                weights,
+                &format!("{prefix}.self_attn"),
+                &llama_cfg,
+                layer_idx,
+                dtype,
+                config.rms_norm_eps,
+                stream,
+            )?
+        };
 
         let is_dense = config.mlp_only_layers.contains(&layer_idx);
         let mlp = if is_dense {
-            let dense = LlamaMLP::load_fp8_block(
-                weights,
-                &format!("{prefix}.mlp"),
-                config.intermediate_size,
-                dtype,
-                stream,
-            )?;
+            let dense = if let Some(tp_cfg) = tp {
+                LlamaMLP::load_fp8_block_tp(
+                    weights,
+                    &format!("{prefix}.mlp"),
+                    config.intermediate_size,
+                    dtype,
+                    tp_cfg,
+                    stream,
+                )?
+            } else {
+                LlamaMLP::load_fp8_block(
+                    weights,
+                    &format!("{prefix}.mlp"),
+                    config.intermediate_size,
+                    dtype,
+                    stream,
+                )?
+            };
             Qwen3MoeMlp::Dense(dense)
         } else {
             let moe_prefix = format!("{prefix}.mlp");
@@ -631,6 +656,7 @@ impl Qwen3MoeDecoderLayer {
                         "gate_proj",
                         "up_proj",
                         "down_proj",
+                        tp,
                     )?;
 
                     // Load shared expert (dense BF16).
@@ -1062,11 +1088,11 @@ impl Qwen3MoeModel {
     }
 
     /// Load an FP8 block-quantized Qwen3 MoE model.
-    /// Attention and dense MLP use block FP8. MoE experts are dequantized to BF16.
     pub fn load_fp8_block(
         weights: &mut GpuWeights,
         config: &Qwen3MoeConfig,
         dtype: DType,
+        tp: Option<TpConfig>,
         device: &GpuDevice,
     ) -> Result<Self> {
         let embed_tokens = crate::layers::Embedding::load(weights, "model.embed_tokens")?;
@@ -1079,6 +1105,7 @@ impl Qwen3MoeModel {
                 config,
                 i,
                 dtype,
+                tp,
                 device.compute_stream,
             )?);
         }
@@ -1248,9 +1275,10 @@ impl Qwen3MoeForCausalLM {
         weights: &mut GpuWeights,
         config: &Qwen3MoeConfig,
         dtype: DType,
+        tp: Option<TpConfig>,
         device: &GpuDevice,
     ) -> Result<Self> {
-        let model = Qwen3MoeModel::load_fp8_block(weights, config, dtype, device)?;
+        let model = Qwen3MoeModel::load_fp8_block(weights, config, dtype, tp, device)?;
         let lm_head = if config.tie_word_embeddings {
             Linear::new(model.embed_tokens.weight, None)
         } else {

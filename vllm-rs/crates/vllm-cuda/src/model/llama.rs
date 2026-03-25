@@ -1553,6 +1553,79 @@ impl LlamaAttention {
         })
     }
 
+    /// Load FP8 block-quantized attention with fused QKV, TP sharded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fp8_block_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &LlamaConfig,
+        layer_idx: usize,
+        output_dtype: DType,
+        qk_norm_eps: f32,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let num_q_heads = config.num_attention_heads / tp.world_size;
+        let num_kv_heads = config.num_kv_heads / tp.world_size;
+        let head_dim = config.head_dim;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        // QKV: column parallel (shard dim=0).
+        let qkv = gpu_weights::load_fused_fp8_block_linear_tp(
+            weights,
+            &[
+                format!("{prefix}.q_proj"),
+                format!("{prefix}.k_proj"),
+                format!("{prefix}.v_proj"),
+            ],
+            output_dtype,
+            tp.rank,
+            tp.world_size,
+            stream,
+        )?;
+        // O: row parallel (shard dim=1).
+        let o = gpu_weights::load_fp8_block_linear_tp(
+            weights,
+            &format!("{prefix}.o_proj"),
+            output_dtype,
+            tp.rank,
+            tp.world_size,
+        )?;
+
+        let q_norm_name = format!("{prefix}.q_norm.weight");
+        let k_norm_name = format!("{prefix}.k_norm.weight");
+        let q_norm_weight = if weights.contains(&q_norm_name) {
+            Some(weights.take(&q_norm_name)?)
+        } else {
+            None
+        };
+        let k_norm_weight = if weights.contains(&k_norm_name) {
+            Some(weights.take(&k_norm_name)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            qkv_proj: LinearLayer::Fp8Block(Box::new(qkv)),
+            k_proj: None,
+            v_proj: None,
+            o_proj: LinearLayer::Fp8Block(Box::new(o)),
+            q_size,
+            kv_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            layer_idx,
+            q_norm_weight,
+            k_norm_weight,
+            qk_norm_eps,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+
     /// Load FP8 block-quantized attention with fused QKV.
     #[allow(clippy::too_many_arguments)]
     pub fn load_fp8_block(
@@ -1681,6 +1754,43 @@ impl LlamaMLP {
             up_proj: None,
             down_proj: LinearLayer::Fp8(Box::new(down)),
             intermediate_size,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
+
+    /// Load FP8 block-quantized MLP with fused gate+up, TP sharded.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fp8_block_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        intermediate_size: usize,
+        output_dtype: DType,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let ipp = intermediate_size / tp.world_size;
+        let gate_up = gpu_weights::load_fused_fp8_block_linear_tp(
+            weights,
+            &[format!("{prefix}.gate_proj"), format!("{prefix}.up_proj")],
+            output_dtype,
+            tp.rank,
+            tp.world_size,
+            stream,
+        )?;
+        let down = gpu_weights::load_fp8_block_linear_tp(
+            weights,
+            &format!("{prefix}.down_proj"),
+            output_dtype,
+            tp.rank,
+            tp.world_size,
+        )?;
+
+        Ok(Self {
+            gate_up_proj: LinearLayer::Fp8Block(Box::new(gate_up)),
+            up_proj: None,
+            down_proj: LinearLayer::Fp8Block(Box::new(down)),
+            intermediate_size: ipp,
             #[cfg(feature = "nccl")]
             tp_group: None,
         })

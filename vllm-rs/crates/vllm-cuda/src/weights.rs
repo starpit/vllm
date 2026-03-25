@@ -3052,6 +3052,159 @@ pub fn load_fused_fp8_block_linear(
     })
 }
 
+/// TP variant: load fused FP8 block-quantized linear with dim=0 sharding.
+/// Each prefix's weight and scale are sharded along dim=0 (output dimension)
+/// before fusing.
+pub fn load_fused_fp8_block_linear_tp(
+    weights: &mut GpuWeights,
+    prefixes: &[String],
+    output_dtype: DType,
+    rank: usize,
+    world_size: usize,
+    stream: CUstream,
+) -> Result<crate::layers::Fp8BlockLinear> {
+    anyhow::ensure!(
+        !prefixes.is_empty(),
+        "load_fused_fp8_block_linear_tp: no prefixes"
+    );
+
+    // Get shapes and derive block size from first prefix.
+    let first_weight_name = format!("{}.weight", prefixes[0]);
+    let (first_shape, first_dtype) = weights
+        .tensor_info(&first_weight_name)
+        .ok_or_else(|| anyhow::anyhow!("FP8 block: weight not found: {first_weight_name}"))?;
+    anyhow::ensure!(first_dtype == DType::Fp8E4m3);
+    anyhow::ensure!(first_shape.len() == 2);
+    let in_features = first_shape[1];
+
+    let first_scale_name = format!("{}.weight_scale_inv", prefixes[0]);
+    let (first_scale_shape, _) = weights
+        .tensor_info(&first_scale_name)
+        .ok_or_else(|| anyhow::anyhow!("FP8 block: scale not found: {first_scale_name}"))?;
+    let block_n = first_shape[0] / first_scale_shape[0];
+    let block_k = first_shape[1] / first_scale_shape[1];
+    let scale_cols = first_scale_shape[1];
+
+    // Compute sharded output dimensions.
+    let mut total_out = 0usize;
+    let mut total_scale_rows = 0usize;
+    let mut shard_sizes = Vec::with_capacity(prefixes.len());
+    let mut shard_scale_rows = Vec::with_capacity(prefixes.len());
+    for prefix in prefixes {
+        let wname = format!("{prefix}.weight");
+        let (shape, _) = weights
+            .tensor_info(&wname)
+            .ok_or_else(|| anyhow::anyhow!("FP8 block: weight not found: {wname}"))?;
+        let sharded_out = shape[0] / world_size;
+        shard_sizes.push(sharded_out);
+        total_out += sharded_out;
+
+        let sname = format!("{prefix}.weight_scale_inv");
+        let (sshape, _) = weights
+            .tensor_info(&sname)
+            .ok_or_else(|| anyhow::anyhow!("FP8 block: scale not found: {sname}"))?;
+        let sharded_sr = sshape[0] / world_size;
+        shard_scale_rows.push(sharded_sr);
+        total_scale_rows += sharded_sr;
+    }
+
+    // Allocate fused FP8 weight buffer (sharded).
+    let elem_size = DType::Fp8E4m3.size_bytes();
+    let total_bytes = total_out * in_features * elem_size;
+    let fused_ptr = unsafe { crate::driver::mem_alloc(total_bytes)? };
+
+    let mut offset = 0usize;
+    for (i, prefix) in prefixes.iter().enumerate() {
+        let wname = format!("{prefix}.weight");
+        let shard_bytes = shard_sizes[i] * in_features * elem_size;
+        unsafe {
+            weights.take_shard_into(&wname, 0, rank, world_size, fused_ptr.add(offset), stream)?;
+        }
+        offset += shard_bytes;
+    }
+
+    let fused_weight =
+        unsafe { GpuTensor::new(fused_ptr, &[total_out, in_features], DType::Fp8E4m3) };
+
+    // Allocate fused scale buffer (sharded along dim=0).
+    let total_scale_bytes = total_scale_rows * scale_cols * 4;
+    let scale_ptr = unsafe { crate::driver::mem_alloc(total_scale_bytes)? };
+    let mut scale_offset = 0usize;
+    for (i, prefix) in prefixes.iter().enumerate() {
+        let sname = format!("{prefix}.weight_scale_inv");
+        let raw_scale = weights.take_shard(&sname, 0, rank, world_size)?;
+        let shard_scale = ensure_f32_scale(raw_scale, stream)?;
+        let shard_bytes = shard_scale_rows[i] * scale_cols * 4;
+        unsafe {
+            crate::driver::memcpy_dtod_async(
+                scale_ptr.add(scale_offset),
+                shard_scale.raw_ptr(),
+                shard_bytes,
+                stream,
+            )?;
+        }
+        scale_offset += shard_bytes;
+    }
+    let fused_scale =
+        unsafe { GpuTensor::new(scale_ptr, &[total_scale_rows, scale_cols], DType::F32) };
+
+    // Consume input_scale if present.
+    for prefix in prefixes {
+        let input_scale_name = format!("{prefix}.input_scale");
+        if weights.contains(&input_scale_name) {
+            let _ = weights.take(&input_scale_name);
+        }
+    }
+
+    Ok(crate::layers::Fp8BlockLinear {
+        weight: fused_weight,
+        weight_scale_inv: fused_scale,
+        block_size: [block_n, block_k],
+        bias: None,
+        output_dtype,
+    })
+}
+
+/// TP variant: load single FP8 block-quantized linear with dim=1 sharding
+/// (row parallel, e.g. o_proj, down_proj).
+pub fn load_fp8_block_linear_tp(
+    weights: &mut GpuWeights,
+    prefix: &str,
+    output_dtype: DType,
+    rank: usize,
+    world_size: usize,
+) -> Result<crate::layers::Fp8BlockLinear> {
+    let weight_name = format!("{prefix}.weight");
+    let scale_name = format!("{prefix}.weight_scale_inv");
+
+    let weight = weights.take_shard(&weight_name, 1, rank, world_size)?;
+    anyhow::ensure!(weight.ndim() == 2);
+    let n = weight.dim(0);
+    let k = weight.dim(1);
+
+    let stream = weights.stream();
+    let raw_scale = weights.take_shard(&scale_name, 1, rank, world_size)?;
+    let scale = ensure_f32_scale(raw_scale, stream)?;
+    let scale_rows = scale.dim(0);
+    let scale_cols = scale.dim(1);
+    let block_n = n / scale_rows;
+    let block_k = k / scale_cols;
+
+    // Consume input_scale if present.
+    let input_scale_name = format!("{prefix}.input_scale");
+    if weights.contains(&input_scale_name) {
+        let _ = weights.take(&input_scale_name);
+    }
+
+    Ok(crate::layers::Fp8BlockLinear {
+        weight,
+        weight_scale_inv: scale,
+        block_size: [block_n, block_k],
+        bias: None,
+        output_dtype,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // FP8 MoE Expert Weight Loading
 // ---------------------------------------------------------------------------
@@ -3202,6 +3355,9 @@ pub fn load_fp8_moe_experts(
 /// FP8 weights are stacked into `[E, N, K]` buffers (same as per-tensor path).
 /// Block scales are stacked into `[E, ceil(N/bn), ceil(K/bk)]` f32 tensors.
 /// For w1 (gate+up), gate and up scale rows are concatenated along dim=1.
+///
+/// With TP (`tp != None`), each expert's intermediate dimension is sharded:
+/// gate/up weights sharded along dim=0, down along dim=1, scales correspondingly.
 #[allow(clippy::too_many_arguments)]
 pub fn load_fp8_block_moe_experts(
     weights: &mut GpuWeights,
@@ -3214,10 +3370,13 @@ pub fn load_fp8_block_moe_experts(
     gate_name: &str,
     up_name: &str,
     down_name: &str,
+    tp: Option<crate::model::llama::TpConfig>,
 ) -> Result<crate::layers_moe::Fp8BlockFusedMoELayer> {
     let stream = weights.stream();
+    let (rank, world_size) = tp.map_or((0, 1), |t| (t.rank, t.world_size));
+    let ipp = intermediate_size / world_size; // per-partition intermediate size
 
-    // Gate weight — always dense BF16.
+    // Gate weight — always dense BF16 (not sharded, same on all ranks).
     let gate = Linear::load(weights, &format!("{prefix}.gate"))?;
 
     // Derive block size from first expert's scale shape.
@@ -3232,19 +3391,19 @@ pub fn load_fp8_block_moe_experts(
     let block_n = w_shape[0] / s_shape[0];
     let block_k = w_shape[1] / s_shape[1];
 
-    // Scale dimensions for stacked tensors.
-    let w1_n = 2 * intermediate_size;
+    // Scale dimensions for stacked tensors (using per-partition sizes).
+    let w1_n = 2 * ipp;
     let w1_k = hidden_size;
     let w2_n = hidden_size;
-    let w2_k = intermediate_size;
-    let w1_scale_rows = (w1_n + block_n - 1) / block_n; // ceil(2*inter/bn)
-    let w1_scale_cols = (w1_k + block_k - 1) / block_k; // ceil(hidden/bk)
-    let w2_scale_rows = (w2_n + block_n - 1) / block_n; // ceil(hidden/bn)
-    let w2_scale_cols = (w2_k + block_k - 1) / block_k; // ceil(inter/bk)
-    let gate_scale_rows = (intermediate_size + block_n - 1) / block_n;
+    let w2_k = ipp;
+    let w1_scale_rows = (w1_n + block_n - 1) / block_n;
+    let w1_scale_cols = (w1_k + block_k - 1) / block_k;
+    let w2_scale_rows = (w2_n + block_n - 1) / block_n;
+    let w2_scale_cols = (w2_k + block_k - 1) / block_k;
+    let gate_scale_rows = (ipp + block_n - 1) / block_n;
 
-    // Allocate stacked FP8 weight buffers.
-    let w1_bytes = num_experts * w1_n * w1_k; // FP8 = 1 byte/elem
+    // Allocate stacked FP8 weight buffers (per-partition sizes).
+    let w1_bytes = num_experts * w1_n * w1_k;
     let w2_bytes = num_experts * w2_n * w2_k;
     let w1_ptr = unsafe { crate::driver::mem_alloc(w1_bytes)? };
     let w2_ptr = unsafe { crate::driver::mem_alloc(w2_bytes)? };
@@ -3264,33 +3423,70 @@ pub fn load_fp8_block_moe_experts(
         let up_pfx = format!("{prefix}.experts.{e}.{up_name}");
         let down_pfx = format!("{prefix}.experts.{e}.{down_name}");
 
-        // --- FP8 weights: copy into stacked buffers ---
+        // --- FP8 weights: shard and copy into stacked buffers ---
         let expert_w1_offset = e * w1_n * w1_k;
-        let gate_proj_bytes = intermediate_size * hidden_size;
+        let gate_proj_bytes = ipp * hidden_size;
         unsafe {
-            weights.take_into(
-                &format!("{gate_pfx}.weight"),
-                w1_ptr.add(expert_w1_offset),
-                stream,
-            )?;
-            weights.take_into(
-                &format!("{up_pfx}.weight"),
-                w1_ptr.add(expert_w1_offset + gate_proj_bytes),
-                stream,
-            )?;
-            let expert_w2_offset = e * w2_n * w2_k;
-            weights.take_into(
-                &format!("{down_pfx}.weight"),
-                w2_ptr.add(expert_w2_offset),
-                stream,
-            )?;
+            if world_size > 1 {
+                // gate_proj [inter, hidden] → shard dim=0 → [ipp, hidden]
+                weights.take_shard_into(
+                    &format!("{gate_pfx}.weight"),
+                    0,
+                    rank,
+                    world_size,
+                    w1_ptr.add(expert_w1_offset),
+                    stream,
+                )?;
+                // up_proj [inter, hidden] → shard dim=0 → [ipp, hidden]
+                weights.take_shard_into(
+                    &format!("{up_pfx}.weight"),
+                    0,
+                    rank,
+                    world_size,
+                    w1_ptr.add(expert_w1_offset + gate_proj_bytes),
+                    stream,
+                )?;
+                // down_proj [hidden, inter] → shard dim=1 → [hidden, ipp]
+                let expert_w2_offset = e * w2_n * w2_k;
+                weights.take_shard_into(
+                    &format!("{down_pfx}.weight"),
+                    1,
+                    rank,
+                    world_size,
+                    w2_ptr.add(expert_w2_offset),
+                    stream,
+                )?;
+            } else {
+                weights.take_into(
+                    &format!("{gate_pfx}.weight"),
+                    w1_ptr.add(expert_w1_offset),
+                    stream,
+                )?;
+                weights.take_into(
+                    &format!("{up_pfx}.weight"),
+                    w1_ptr.add(expert_w1_offset + gate_proj_bytes),
+                    stream,
+                )?;
+                let expert_w2_offset = e * w2_n * w2_k;
+                weights.take_into(
+                    &format!("{down_pfx}.weight"),
+                    w2_ptr.add(expert_w2_offset),
+                    stream,
+                )?;
+            }
         }
 
-        // --- Block scales: stack into 3D tensors ---
-        // w1 scale: concat gate [gate_sr, sc] and up [up_sr, sc] along rows → [w1_sr, sc]
+        // --- Block scales: shard and stack into 3D tensors ---
+        // gate_proj scale: [ceil(inter/bn), ceil(hidden/bk)] → shard dim=0 → [ceil(ipp/bn), ...]
         let expert_w1_scale_offset = e * w1_scale_rows * w1_scale_cols * 4;
-        let gate_scale_raw = weights.take(&format!("{gate_pfx}.weight_scale_inv"))?;
-        let gate_scale = ensure_f32_scale(gate_scale_raw, stream)?;
+        let gate_scale = if world_size > 1 {
+            let raw =
+                weights.take_shard(&format!("{gate_pfx}.weight_scale_inv"), 0, rank, world_size)?;
+            ensure_f32_scale(raw, stream)?
+        } else {
+            let raw = weights.take(&format!("{gate_pfx}.weight_scale_inv"))?;
+            ensure_f32_scale(raw, stream)?
+        };
         let gate_scale_bytes = gate_scale_rows * w1_scale_cols * 4;
         unsafe {
             crate::driver::memcpy_dtod_async(
@@ -3301,8 +3497,15 @@ pub fn load_fp8_block_moe_experts(
             )?;
         }
 
-        let up_scale_raw = weights.take(&format!("{up_pfx}.weight_scale_inv"))?;
-        let up_scale = ensure_f32_scale(up_scale_raw, stream)?;
+        // up_proj scale: same sharding as gate
+        let up_scale = if world_size > 1 {
+            let raw =
+                weights.take_shard(&format!("{up_pfx}.weight_scale_inv"), 0, rank, world_size)?;
+            ensure_f32_scale(raw, stream)?
+        } else {
+            let raw = weights.take(&format!("{up_pfx}.weight_scale_inv"))?;
+            ensure_f32_scale(raw, stream)?
+        };
         let up_scale_rows = w1_scale_rows - gate_scale_rows;
         let up_scale_bytes = up_scale_rows * w1_scale_cols * 4;
         unsafe {
@@ -3314,10 +3517,16 @@ pub fn load_fp8_block_moe_experts(
             )?;
         }
 
-        // w2 scale: just copy down_proj scale
+        // down_proj scale: [ceil(hidden/bn), ceil(inter/bk)] → shard dim=1 → [..., ceil(ipp/bk)]
         let expert_w2_scale_offset = e * w2_scale_rows * w2_scale_cols * 4;
-        let down_scale_raw = weights.take(&format!("{down_pfx}.weight_scale_inv"))?;
-        let down_scale = ensure_f32_scale(down_scale_raw, stream)?;
+        let down_scale = if world_size > 1 {
+            let raw =
+                weights.take_shard(&format!("{down_pfx}.weight_scale_inv"), 1, rank, world_size)?;
+            ensure_f32_scale(raw, stream)?
+        } else {
+            let raw = weights.take(&format!("{down_pfx}.weight_scale_inv"))?;
+            ensure_f32_scale(raw, stream)?
+        };
         let down_scale_bytes = w2_scale_rows * w2_scale_cols * 4;
         unsafe {
             crate::driver::memcpy_dtod_async(
@@ -3363,7 +3572,7 @@ pub fn load_fp8_block_moe_experts(
         block_size: [block_n, block_k],
         num_experts,
         top_k,
-        intermediate_size,
+        intermediate_size: ipp,
         hidden_size,
         renormalize,
         #[cfg(feature = "nccl")]

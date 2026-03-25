@@ -5047,10 +5047,12 @@ impl Worker for CudaWorker {
                         _ => unreachable!(),
                     };
                     if fp8_cfg.weight_block_size.is_some() {
+                        let tp_opt = if use_tp { Some(tp) } else { None };
                         vllm_cuda::model::qwen3_moe::Qwen3MoeForCausalLM::load_fp8_block(
                             &mut weights,
                             &config,
                             dtype,
+                            tp_opt,
                             device,
                         )
                     } else {

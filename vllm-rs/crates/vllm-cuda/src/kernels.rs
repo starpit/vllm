@@ -2848,6 +2848,90 @@ pub unsafe fn fp8_block_dequant(
 }
 
 // ---------------------------------------------------------------------------
+// FP8 Block-Scaled Dense GEMM (WMMA, SM80+)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn fp8_block_scaled_gemm(
+        output: *mut c_void,
+        input: *const c_void,
+        weight: *const c_void,
+        w_scales: *const f32,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        block_m: c_int,
+        block_n: c_int,
+        block_k: c_int,
+        scale_stride_n: c_int,
+        stream: CUstream,
+    );
+}
+
+/// Dense FP8 block-scaled GEMM: output[M,N] = input[M,K] × weight[N,K]^T
+///
+/// Weight scales are applied during the FP8→BF16 dequant in shared memory,
+/// so WMMA accumulates correctly-scaled values. Single kernel, no intermediate
+/// BF16 materialization.
+///
+/// * `input`: `[M, K]` BF16 (activations)
+/// * `weight`: `[N, K]` FP8 E4M3
+/// * `w_scales`: `[ceil(N/block_n), ceil(K/block_k)]` f32
+/// * `block_size`: `[block_n, block_k]` quantization block dimensions
+/// * Returns: `[M, N]` BF16
+pub unsafe fn fp8_block_scaled_gemm_mm(
+    input: GpuTensor,
+    weight: GpuTensor,
+    w_scales: GpuTensor,
+    block_size: [usize; 2],
+    alloc: &mut crate::alloc::CachingAllocator,
+    stream: CUstream,
+) -> crate::alloc::OwnedTensor {
+    debug_assert_eq!(input.ndim(), 2);
+    debug_assert_eq!(weight.ndim(), 2);
+    debug_assert_eq!(input.dtype(), DType::BF16);
+    debug_assert_eq!(weight.dtype(), DType::Fp8E4m3);
+    let m = input.dim(0);
+    let k = input.dim(1);
+    let n = weight.dim(0);
+    debug_assert_eq!(weight.dim(1), k);
+
+    let out = alloc.alloc_tensor(&[m, n], DType::BF16);
+
+    let block_n = block_size[0];
+    let block_k = block_size[1];
+    let scale_stride_n = (k + block_k - 1) / block_k;
+
+    // Select BLOCK_M based on M (matches MoE heuristic).
+    let block_m = if m <= 16 {
+        16
+    } else if m <= 32 {
+        32
+    } else if m <= 64 {
+        64
+    } else {
+        128
+    };
+
+    fp8_block_scaled_gemm(
+        out.as_gpu_tensor().as_mut_ptr() as *mut c_void,
+        input.as_ptr() as *const c_void,
+        weight.as_ptr() as *const c_void,
+        w_scales.as_ptr() as *const f32,
+        m as c_int,
+        n as c_int,
+        k as c_int,
+        block_m as c_int,
+        block_n as c_int,
+        block_k as c_int,
+        scale_stride_n as c_int,
+        stream,
+    );
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // CUTLASS Scaled Matmul (Fused FP8 GEMM with per-row scale epilogue)
 // ---------------------------------------------------------------------------
 

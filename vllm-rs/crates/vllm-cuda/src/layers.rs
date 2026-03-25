@@ -570,14 +570,15 @@ pub struct Fp8BlockLinear {
 }
 
 impl Fp8BlockLinear {
-    /// Forward: dequant FP8 → BF16 per block, then cuBLAS GEMM.
+    /// Forward: fused FP8 block-scaled GEMM (WMMA, SM80+).
     ///
-    /// Current implementation: CPU-side dequant-then-GEMM for correctness.
-    /// TODO: CUTLASS block-scaled FP8 GEMM for perf parity.
+    /// Weight scales are applied during the FP8→BF16 dequant in shared memory,
+    /// so WMMA accumulates correctly-scaled values. Single kernel, no
+    /// intermediate BF16 weight materialization.
     pub unsafe fn forward(
         &self,
         x: TensorView<'_>,
-        cublas: &mut CublasHandle,
+        _cublas: &mut CublasHandle,
         alloc: &mut CachingAllocator,
         stream: cudarc::driver::sys::CUstream,
     ) -> OwnedTensor {
@@ -585,21 +586,14 @@ impl Fp8BlockLinear {
         let k = self.weight.dim(1);
         debug_assert_eq!(x.dim(1), k, "Fp8BlockLinear: input dim mismatch");
 
-        // Dequantize FP8 weight to BF16/F16 using per-block scales.
-        let dequant_weight = crate::kernels::fp8_block_dequant(
+        let out = crate::kernels::fp8_block_scaled_gemm_mm(
+            *x,
             self.weight,
             self.weight_scale_inv,
             self.block_size,
-            self.output_dtype,
             alloc,
             stream,
         );
-
-        // Standard GEMM: x @ dequant_weight^T
-        // Use as_gpu_tensor() to borrow — dequant_weight drops after GEMM,
-        // returning the buffer to the caching allocator.
-        let out = cublas.gemm(*x, dequant_weight.as_gpu_tensor(), alloc);
-        drop(dequant_weight);
 
         if let Some(bias) = self.bias {
             crate::kernels::bias_add_inplace(out.as_gpu_tensor(), bias, stream);

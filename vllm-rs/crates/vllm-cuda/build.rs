@@ -57,6 +57,7 @@ fn cuda_build() {
         "csrc/fp8_scale_kernels.cu",
         "csrc/fp8_quant_kernels.cu",
         "csrc/fp8_block_dequant_kernels.cu",
+        "csrc/fp8_block_gemm_kernels.cu",
         "csrc/fp8_post_scale_kernels.cu",
     ];
     let vllm_watch = ["csrc/vec_utils.cuh", "csrc/fp8_utils.cuh"];

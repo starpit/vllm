@@ -4613,11 +4613,31 @@ impl Worker for CudaWorker {
                         _ => unreachable!(),
                     };
                     if fp8_cfg.weight_block_size.is_some() {
-                        vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block(
+                        if use_tp {
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block_tp(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                config.rms_norm_eps,
+                                tp,
+                                device,
+                            )
+                        } else {
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                config.rms_norm_eps,
+                                device,
+                            )
+                        }
+                    } else if use_tp {
+                        vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_tp(
                             &mut weights,
                             &config,
                             dtype,
                             config.rms_norm_eps,
+                            tp,
                             device,
                         )
                     } else {
@@ -4690,12 +4710,43 @@ impl Worker for CudaWorker {
                         device,
                     )
                 } else if qconfig.is_fp8() {
-                    vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8(
-                        &mut weights,
-                        &qwen2_config,
-                        dtype,
-                        device,
-                    )
+                    let fp8_cfg = match &qconfig {
+                        vllm_cuda::quant::QuantConfig::Fp8(c) => c,
+                        _ => unreachable!(),
+                    };
+                    if fp8_cfg.weight_block_size.is_some() {
+                        if use_tp {
+                            vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8_block_tp(
+                                &mut weights,
+                                &qwen2_config,
+                                dtype,
+                                tp,
+                                device,
+                            )
+                        } else {
+                            vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8(
+                                &mut weights,
+                                &qwen2_config,
+                                dtype,
+                                device,
+                            )
+                        }
+                    } else if use_tp {
+                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8_tp(
+                            &mut weights,
+                            &qwen2_config,
+                            dtype,
+                            tp,
+                            device,
+                        )
+                    } else {
+                        vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_fp8(
+                            &mut weights,
+                            &qwen2_config,
+                            dtype,
+                            device,
+                        )
+                    }
                 } else if qconfig.is_quantized() {
                     vllm_cuda::model::qwen2::Qwen2ForCausalLM::load_quantized(
                         &mut weights,
@@ -4882,11 +4933,31 @@ impl Worker for CudaWorker {
                         _ => unreachable!(),
                     };
                     if fp8_cfg.weight_block_size.is_some() {
-                        vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block(
+                        if use_tp {
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block_tp(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                config.rms_norm_eps,
+                                tp,
+                                device,
+                            )
+                        } else {
+                            vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_block(
+                                &mut weights,
+                                &config,
+                                dtype,
+                                config.rms_norm_eps,
+                                device,
+                            )
+                        }
+                    } else if use_tp {
+                        vllm_cuda::model::llama::LlamaForCausalLM::load_fp8_tp(
                             &mut weights,
                             &config,
                             dtype,
                             config.rms_norm_eps,
+                            tp,
                             device,
                         )
                     } else {

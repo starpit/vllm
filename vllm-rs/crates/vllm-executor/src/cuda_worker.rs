@@ -5530,6 +5530,16 @@ impl Worker for CudaWorker {
                 _ => return Ok(()), // Not fully initialized yet.
             };
 
+        // Resolve Auto mode now that we know the SM version.
+        if matches!(self.config.cuda_graph_mode, CudaGraphMode::Auto) {
+            let resolved = self.config.cuda_graph_mode.resolve(device.sm_version);
+            info!(
+                "CudaWorker: resolved cuda_graph_mode Auto → {:?} (SM{})",
+                resolved, device.sm_version
+            );
+            self.config.cuda_graph_mode = resolved;
+        }
+
         unsafe { driver::ctx_set_current(device.ctx) }
             .map_err(|e| ExecutorError::WorkerInit(format!("ctx_set_current: {e}")))?;
 
@@ -6953,6 +6963,9 @@ impl CudaWorker {
                 // Piecewise is reserved for mixed/chunked-prefill batches (future).
                 CudaGraphMode::FullAndPiecewise => false,
                 CudaGraphMode::FullDecodeOnly => false,
+                CudaGraphMode::Auto => {
+                    unreachable!("Auto should be resolved in compile_or_warm_up_model")
+                }
             }
         } else {
             false

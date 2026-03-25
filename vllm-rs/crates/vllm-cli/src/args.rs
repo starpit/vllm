@@ -246,11 +246,12 @@ pub struct ServeArgs {
     pub distributed_executor_backend: String,
 
     /// CUDA graph mode: controls piecewise vs monolithic graph capture.
-    /// Options: "none", "full", "piecewise", "full-and-piecewise", "full-decode-only".
+    /// Options: "auto", "none", "full", "piecewise", "full-and-piecewise", "full-decode-only".
+    /// - "auto": Full for SM < 90 (Ampere/Ada), FullAndPiecewise for SM >= 90 (Hopper+)
     /// - "none": No CUDA graphs (same as --enforce-eager)
     ///
-    /// Default: "full-and-piecewise" (matches Python vLLM).
-    #[arg(long, default_value = "full-and-piecewise")]
+    /// Default: "auto".
+    #[arg(long, default_value = "auto")]
     pub cuda_graph_mode: String,
 
     /// Disable prefix caching (KV cache reuse for shared prompt prefixes).

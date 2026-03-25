@@ -10,13 +10,15 @@ pub enum CudaGraphMode {
     None,
     /// Piecewise graphs only - attention excluded from graphs.
     Piecewise,
-    /// Full monolithic graphs only - entire forward pass captured (DEFAULT).
-    #[default]
+    /// Full monolithic graphs only - entire forward pass captured.
     Full,
     /// Full for uniform decode, piecewise for mixed batches.
     FullAndPiecewise,
     /// Full for uniform decode, eager for mixed batches.
     FullDecodeOnly,
+    /// Auto: resolves to Full for SM < 90, FullAndPiecewise for SM >= 90.
+    #[default]
+    Auto,
 }
 
 impl std::str::FromStr for CudaGraphMode {
@@ -27,11 +29,30 @@ impl std::str::FromStr for CudaGraphMode {
 }
 
 impl CudaGraphMode {
+    /// Resolve Auto based on SM version. Non-Auto variants pass through unchanged.
+    ///
+    /// SM >= 90 (Hopper+): FullAndPiecewise (piecewise fallback for mixed batches).
+    /// SM < 90 (Ampere, Ada Lovelace, etc.): Full (monolithic only — piecewise
+    /// capture overhead not worth it on older architectures).
+    pub fn resolve(self, sm_version: u32) -> CudaGraphMode {
+        match self {
+            CudaGraphMode::Auto => {
+                if sm_version >= 90 {
+                    CudaGraphMode::FullAndPiecewise
+                } else {
+                    CudaGraphMode::Full
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Get the mode to use for uniform decode batches.
     pub fn decode_mode(&self) -> CudaGraphMode {
         match self {
             CudaGraphMode::FullAndPiecewise => CudaGraphMode::Full,
             CudaGraphMode::FullDecodeOnly => CudaGraphMode::Full,
+            CudaGraphMode::Auto => CudaGraphMode::Auto, // should be resolved first
             _ => *self,
         }
     }
@@ -41,13 +62,15 @@ impl CudaGraphMode {
         match self {
             CudaGraphMode::FullAndPiecewise => CudaGraphMode::Piecewise,
             CudaGraphMode::FullDecodeOnly => CudaGraphMode::None,
+            CudaGraphMode::Auto => CudaGraphMode::Auto, // should be resolved first
             _ => *self,
         }
     }
 
-    /// Parse from string (e.g., "full_and_piecewise", "full", "piecewise", "none").
+    /// Parse from string (e.g., "auto", "full_and_piecewise", "full", "piecewise", "none").
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
             "none" => Some(Self::None),
             "piecewise" => Some(Self::Piecewise),
             "full" => Some(Self::Full),
@@ -67,7 +90,7 @@ impl CudaGraphMode {
 pub struct CudaGraphConfig {
     /// Whether CUDA graphs are enabled. Default: true on CUDA.
     pub enabled: bool,
-    /// Graph capture mode. Default: FullAndPiecewise.
+    /// Graph capture mode. Default: Auto (Full for SM<90, FullAndPiecewise for SM>=90).
     pub mode: CudaGraphMode,
     /// Batch sizes to capture graphs for.
     /// Default: `[1, 2, 4, 8, 16, 32, 64, 128, 256]`.
@@ -128,7 +151,7 @@ mod tests {
     fn test_default_config() {
         let cfg = CudaGraphConfig::default();
         assert!(cfg.enabled);
-        assert_eq!(cfg.mode, CudaGraphMode::FullAndPiecewise);
+        assert_eq!(cfg.mode, CudaGraphMode::Auto);
         assert_eq!(cfg.capture_sizes, vec![1, 2, 4, 8, 16, 32, 64, 128, 256]);
         assert_eq!(cfg.num_warmups, 2);
     }
@@ -156,7 +179,31 @@ mod tests {
     }
 
     #[test]
+    fn test_auto_resolve() {
+        // SM < 90 → Full
+        assert_eq!(CudaGraphMode::Auto.resolve(80), CudaGraphMode::Full);
+        assert_eq!(CudaGraphMode::Auto.resolve(89), CudaGraphMode::Full);
+        // SM >= 90 → FullAndPiecewise
+        assert_eq!(
+            CudaGraphMode::Auto.resolve(90),
+            CudaGraphMode::FullAndPiecewise
+        );
+        assert_eq!(
+            CudaGraphMode::Auto.resolve(100),
+            CudaGraphMode::FullAndPiecewise
+        );
+        // Non-Auto passes through unchanged
+        assert_eq!(CudaGraphMode::Full.resolve(80), CudaGraphMode::Full);
+        assert_eq!(CudaGraphMode::Full.resolve(90), CudaGraphMode::Full);
+        assert_eq!(
+            CudaGraphMode::Piecewise.resolve(90),
+            CudaGraphMode::Piecewise
+        );
+    }
+
+    #[test]
     fn test_parse_mode() {
+        assert_eq!(CudaGraphMode::parse("auto"), Some(CudaGraphMode::Auto));
         assert_eq!(
             CudaGraphMode::parse("full_and_piecewise"),
             Some(CudaGraphMode::FullAndPiecewise)

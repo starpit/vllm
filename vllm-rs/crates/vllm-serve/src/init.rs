@@ -133,7 +133,7 @@ impl Default for VllmConfig {
             node_rank: 0,
             master_addr: "localhost".to_string(),
             master_port: 29500,
-            cuda_graph_mode: "full-and-piecewise".to_string(),
+            cuda_graph_mode: "auto".to_string(),
             disable_async_scheduling: false,
             runner: "generate".to_string(),
             cuda_graph_config: None,
@@ -260,7 +260,7 @@ fn create_worker(config: &VllmConfig, model_path: String) -> Result<WorkerCreati
             cuda_graph_mode: config
                 .cuda_graph_mode
                 .parse()
-                .unwrap_or(CudaGraphMode::FullAndPiecewise),
+                .unwrap_or(CudaGraphMode::Auto),
             // Default 1024 (not 8192 like Python). Our CudaWorker splits mixed
             // batches into a decode CUDA-graph pass + a prefill eager pass.
             // Smaller prefill chunks keep the eager pass fast (~25ms for 1024

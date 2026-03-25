@@ -133,8 +133,8 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         cuda_graph_config: if args.enforce_eager {
             None
         } else {
-            let parsed_mode = CudaGraphMode::parse(&args.cuda_graph_mode)
-                .unwrap_or(CudaGraphMode::FullAndPiecewise);
+            let parsed_mode =
+                CudaGraphMode::parse(&args.cuda_graph_mode).unwrap_or(CudaGraphMode::Auto);
             let sizes = CudaGraphConfig::parse_sizes(&args.cuda_graph_sizes);
             let capture_sizes = if sizes.is_empty() {
                 // "auto" → compute Python-matching sizes

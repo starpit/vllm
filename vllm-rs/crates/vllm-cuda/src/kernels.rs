@@ -3238,7 +3238,7 @@ pub unsafe fn flash_attn_contiguous(
         std::ptr::null(),                   // rotary_sin_ptr (spans)
         rotary_dim as i32,                  // rotary_dim (spans)
         if cos_sin_cache_ptr.is_null() { 0 } else { 1 }, // rotate_cached_k (spans)
-        if is_rotary_interleaved { 1 } else { 0 },     // is_rotary_interleaved
+        if is_rotary_interleaved { 1 } else { 0 }, // is_rotary_interleaved
         stream,
     );
 
@@ -3354,13 +3354,11 @@ pub unsafe fn flash_attn_paged_ext(
     };
 
     // --- seqlenq_ngroups_swapped (matching Python flash_api.cpp lines 594-601) ---
-    // Disabled during graph capture: Python vLLM doesn't use this optimization,
-    // and the extra transpose kernels + allocations cause CUDA graph failures
-    // for models where num_attention_heads > num_kv_heads (e.g. Qwen3 MoE).
-    // FA2 handles GQA natively via num_heads != num_heads_k.
+    // GQA decode optimization: reshape Q from [B, H, D] to [B*ngroups, Hk, D]
+    // so FA2 processes fewer heads with longer "sequences". The transpose
+    // kernels and caching-allocator temporaries are graph-capture-safe.
     let ngroups = num_heads_orig / num_kv_heads;
-    let do_swap = !is_graph_capture
-        && max_seqlen_q == 1
+    let do_swap = max_seqlen_q == 1
         && num_heads_orig > num_kv_heads
         && window_size_left < 0
         && window_size_right < 0
@@ -6328,7 +6326,7 @@ mod tests_flash_attn {
                     std::ptr::null(), // rotary_sin_ptr (spans)
                     0,                // rotary_dim (spans)
                     0,                // rotate_cached_k (spans)
-                0,                // is_rotary_interleaved
+                    0,                // is_rotary_interleaved
                     stream,
                 );
             };

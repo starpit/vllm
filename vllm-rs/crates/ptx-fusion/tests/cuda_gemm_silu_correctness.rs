@@ -37,11 +37,13 @@ fn ctx() -> Arc<CudaContext> {
 
 fn find_entry(ptx: &str) -> String {
     for line in ptx.lines() {
-        if line.contains(".entry") && line.contains('(')
-            && let Some(start) = line.find("_Z").or_else(|| line.find("simple_")) {
-                let end = line.find('(').unwrap_or(line.len());
-                return line[start..end].trim().to_string();
-            }
+        if line.contains(".entry")
+            && line.contains('(')
+            && let Some(start) = line.find("_Z").or_else(|| line.find("simple_"))
+        {
+            let end = line.find('(').unwrap_or(line.len());
+            return line[start..end].trim().to_string();
+        }
     }
     panic!("no entry found");
 }

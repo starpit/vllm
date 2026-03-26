@@ -4844,12 +4844,22 @@ impl Worker for CudaWorker {
                         device,
                     )
                 } else if qconfig.is_fp8() {
-                    vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_fp8(
-                        &mut weights,
-                        &config,
-                        dtype,
-                        device,
-                    )
+                    if use_tp {
+                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_fp8_tp(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            tp,
+                            device,
+                        )
+                    } else {
+                        vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_fp8(
+                            &mut weights,
+                            &config,
+                            dtype,
+                            device,
+                        )
+                    }
                 } else if qconfig.is_quantized() {
                     vllm_cuda::model::gemma2::Gemma2ForCausalLM::load_quantized(
                         &mut weights,

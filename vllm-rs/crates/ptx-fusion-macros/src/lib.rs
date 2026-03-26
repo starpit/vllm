@@ -1087,21 +1087,23 @@ pub fn inject_silu_epilogue(input: TokenStream) -> TokenStream {
     output.into()
 }
 
-/// Redirect A-matrix cp.async loads in a CUTLASS GEMM to read from a SMEM
-/// handoff buffer instead of GMEM.
+/// Delete A-matrix cp.async loads from a CUTLASS GEMM.
+///
+/// The A-matrix data is expected to already be in SMEM (written by a prologue
+/// phase). The cp.async instructions for A are deleted; B-matrix loads stay.
 ///
 /// ```rust,ignore
-/// redirect_cutlass_a_loads!(
+/// delete_cutlass_a_loads!(
 ///     "kernels/cutlass_gemm_bf16_sm89.ptx",
-///     "GemmShape",
-///     CUTLASS_GEMM_REDIRECTED_PTX
+///     "Gemm",
+///     CUTLASS_GEMM_NO_A_LOADS
 /// );
 /// ```
 #[proc_macro]
-pub fn redirect_cutlass_a_loads(input: TokenStream) -> TokenStream {
+pub fn delete_cutlass_a_loads(input: TokenStream) -> TokenStream {
     let input_str = input.to_string();
     let args = parse_extract_args(&input_str)
-        .expect("redirect_cutlass_a_loads! expects (\"path.ptx\", \"entry_substr\", CONST_NAME)");
+        .expect("delete_cutlass_a_loads! expects (\"path.ptx\", \"entry_substr\", CONST_NAME)");
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let ptx_path = PathBuf::from(&manifest_dir).join(&args.0);
@@ -1111,11 +1113,10 @@ pub fn redirect_cutlass_a_loads(input: TokenStream) -> TokenStream {
     let extracted = extract::extract_entry(&ptx_source, &args.1)
         .unwrap_or_else(|e| panic!("extract_entry failed: {e}"));
 
-    // Auto-detect A matrix param from cp.async trace analysis (no hardcoded offsets)
-    let modified = fuse_cp_async::redirect_a_matrix_loads(&extracted, "", "_ferrite_handoff")
-        .unwrap_or_else(|e| panic!("cp.async redirect failed: {e}"));
+    let result = fuse_cp_async::delete_a_matrix_loads(&extracted, "")
+        .unwrap_or_else(|e| panic!("cp.async deletion failed: {e}"));
 
-    let modified_str = modified.as_str();
+    let modified_str = result.ptx.as_str();
     let const_name = syn::Ident::new(&args.2, proc_macro2::Span::call_site());
 
     let output = quote! {

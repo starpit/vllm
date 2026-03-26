@@ -10,7 +10,7 @@
 
 #![cfg(feature = "cuda")]
 
-use ptx_fusion_macros::analyze_kernel_as;
+use ptx_fusion_macros::{analyze_kernel_as, delete_cutlass_a_loads};
 
 // ── Protocol extraction for every kernel type ──
 
@@ -25,6 +25,13 @@ analyze_kernel_as!("kernels/gemm_row_f32.ptx", GEMM_ROW);
 
 // CUTLASS bf16: cp.async + mma.sync + struct params
 analyze_kernel_as!("kernels/cutlass_gemm_bf16_sm89.ptx", CUTLASS_BF16);
+
+// CUTLASS bf16 with A-matrix cp.async deleted (prologue injection target)
+delete_cutlass_a_loads!(
+    "kernels/cutlass_gemm_bf16_sm89.ptx",
+    "Gemm",
+    CUTLASS_BF16_NO_A_LOADS
+);
 
 // CUTLASS FP8: multi-entry file — extract single entry, then analyze.
 // analyze_kernel_as! rejects multi-entry PTX (must extract first).
@@ -158,4 +165,53 @@ fn perimeter_cutlass_fp8() {
     assert!(mma_count > 0, "FP8 CUTLASS should have MMA");
 
     println!("PASS: FP8 CUTLASS extracted entry has {cp_async_count} cp.async, {mma_count} MMA");
+}
+
+#[test]
+fn delete_a_loads_passes_ptxas() {
+    let original_cp = CUTLASS_BF16.async_loads.len();
+    let remaining_cp = CUTLASS_BF16_NO_A_LOADS
+        .matches("cp.async.cg.shared.global")
+        .count();
+    let deleted = CUTLASS_BF16_NO_A_LOADS
+        .matches("FERRITE: deleted cp.async for A-matrix")
+        .count();
+
+    println!("=== CUTLASS bf16 A-load deletion ===");
+    println!("  Original cp.async: {original_cp}");
+    println!("  Remaining cp.async: {remaining_cp} (B-matrix only)");
+    println!("  Deleted (A-matrix): {deleted}");
+
+    assert!(deleted > 0, "should have deleted some cp.async");
+    assert!(remaining_cp > 0, "should preserve B-matrix cp.async");
+    assert_eq!(
+        deleted + remaining_cp,
+        original_cp,
+        "deleted + remaining should equal original"
+    );
+
+    // MMA instructions should be preserved
+    let mma_count = CUTLASS_BF16_NO_A_LOADS.matches("mma.sync").count();
+    assert!(mma_count > 0, "MMA should be preserved");
+
+    // Validate with ptxas
+    let path = "/tmp/cutlass_bf16_no_a_loads.ptx";
+    std::fs::write(path, CUTLASS_BF16_NO_A_LOADS).unwrap();
+
+    let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for line in stderr.lines().take(20) {
+            println!("ptxas: {line}");
+        }
+        panic!("ptxas FAILED on A-load-deleted CUTLASS GEMM");
+    }
+
+    println!(
+        "PASS: A-load-deleted CUTLASS bf16 passes ptxas ({deleted} deleted, {remaining_cp} preserved, {mma_count} MMA)"
+    );
 }

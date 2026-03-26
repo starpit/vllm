@@ -322,6 +322,41 @@ impl Gemma2MLP {
             tp_group: None,
         })
     }
+
+    /// Load per-tensor FP8 MLP with TP (column-parallel gate+up, row-parallel down).
+    pub fn load_fp8_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        intermediate_size: usize,
+        output_dtype: DType,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let ipp = intermediate_size / tp.world_size;
+        let gate_up = gpu_weights::load_fused_fp8_linear_tp(
+            weights,
+            &[format!("{prefix}.gate_proj"), format!("{prefix}.up_proj")],
+            output_dtype,
+            tp.rank,
+            tp.world_size,
+            stream,
+        )?;
+        let down = gpu_weights::load_fp8_linear_tp(
+            weights,
+            &format!("{prefix}.down_proj"),
+            output_dtype,
+            tp.rank,
+            tp.world_size,
+        )?;
+
+        Ok(Self {
+            gate_up_proj: LinearLayer::Fp8(Box::new(gate_up)),
+            down_proj: LinearLayer::Fp8(Box::new(down)),
+            intermediate_size: ipp,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -761,6 +796,67 @@ impl Gemma2Attention {
             tp_group: None,
         })
     }
+
+    /// Load per-tensor FP8 attention with TP (column-parallel QKV, row-parallel O).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fp8_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Gemma2Config,
+        layer_idx: usize,
+        is_sliding: bool,
+        output_dtype: DType,
+        tp: TpConfig,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> Result<Self> {
+        let num_q_heads = config.num_attention_heads / tp.world_size;
+        let num_kv_heads = config.num_kv_heads / tp.world_size;
+        let head_dim = config.head_dim;
+        let q_size = num_q_heads * head_dim;
+        let kv_size = num_kv_heads * head_dim;
+
+        let qkv = gpu_weights::load_fused_fp8_linear_tp(
+            weights,
+            &[
+                format!("{prefix}.q_proj"),
+                format!("{prefix}.k_proj"),
+                format!("{prefix}.v_proj"),
+            ],
+            output_dtype,
+            tp.rank,
+            tp.world_size,
+            stream,
+        )?;
+        let o = gpu_weights::load_fp8_linear_tp(
+            weights,
+            &format!("{prefix}.o_proj"),
+            output_dtype,
+            tp.rank,
+            tp.world_size,
+        )?;
+
+        let sliding_window = if is_sliding {
+            config.sliding_window
+        } else {
+            None
+        };
+
+        Ok(Self {
+            qkv_proj: LinearLayer::Fp8(Box::new(qkv)),
+            o_proj: LinearLayer::Fp8(Box::new(o)),
+            q_size,
+            kv_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            scale: config.query_pre_attn_scalar.powf(-0.5) as f32,
+            attn_logit_softcapping: config.attn_logit_softcapping.unwrap_or(0.0) as f32,
+            sliding_window,
+            layer_idx,
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1104,75 @@ impl Gemma2DecoderLayer {
             &format!("{prefix}.mlp"),
             config.intermediate_size,
             output_dtype,
+            device.compute_stream,
+        )?;
+        let input_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.input_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let post_attention_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let pre_feedforward_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.pre_feedforward_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        let post_feedforward_layernorm = GemmaRmsNorm::load(
+            weights,
+            &format!("{prefix}.post_feedforward_layernorm"),
+            config.rms_norm_eps,
+            dtype,
+            device,
+        )?;
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            pre_feedforward_layernorm,
+            post_feedforward_layernorm,
+        })
+    }
+
+    /// Load a per-tensor FP8 decoder layer with TP.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_fp8_tp(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        config: &Gemma2Config,
+        layer_idx: usize,
+        is_sliding: bool,
+        output_dtype: DType,
+        dtype: DType,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let self_attn = Gemma2Attention::load_fp8_tp(
+            weights,
+            &format!("{prefix}.self_attn"),
+            config,
+            layer_idx,
+            is_sliding,
+            output_dtype,
+            tp,
+            device.compute_stream,
+        )?;
+        let mlp = Gemma2MLP::load_fp8_tp(
+            weights,
+            &format!("{prefix}.mlp"),
+            config.intermediate_size,
+            output_dtype,
+            tp,
             device.compute_stream,
         )?;
         let input_layernorm = GemmaRmsNorm::load(
@@ -1518,6 +1683,70 @@ impl Gemma2ForCausalLM {
         };
 
         // Gemma2 always uses tied embeddings — lm_head is dense.
+        let lm_head = Linear::new(model.embed_tokens.weight, None);
+
+        Ok(Self {
+            model,
+            lm_head,
+            final_logit_softcapping: config.final_logit_softcapping.map(|v| v as f32),
+            #[cfg(feature = "nccl")]
+            tp_group: None,
+            pp_config: None,
+        })
+    }
+
+    /// Load a per-tensor FP8 Gemma2 model with TP sharding.
+    pub fn load_fp8_tp(
+        weights: &mut GpuWeights,
+        config: &Gemma2Config,
+        dtype: DType,
+        tp: TpConfig,
+        device: &GpuDevice,
+    ) -> Result<Self> {
+        let embed_tokens = Embedding::load(weights, "model.embed_tokens")?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for i in 0..config.num_hidden_layers {
+            let is_sliding = i < config.layer_is_sliding.len() && config.layer_is_sliding[i];
+            let layer = Gemma2DecoderLayer::load_fp8_tp(
+                weights,
+                &format!("model.layers.{i}"),
+                config,
+                i,
+                is_sliding,
+                dtype,
+                dtype,
+                tp,
+                device,
+            )?;
+            layers.push(layer);
+        }
+
+        let norm = GemmaRmsNorm::load(weights, "model.norm", config.rms_norm_eps, dtype, device)?;
+        let rotary = unsafe {
+            RotaryCache::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                None,
+                dtype,
+                device,
+            )?
+        };
+        weights.record_alloc(
+            rotary.cos_sin_cache.raw_ptr(),
+            rotary.cos_sin_cache.size_bytes(),
+        );
+
+        let model = Gemma2Model {
+            embed_tokens,
+            layers,
+            norm,
+            rotary,
+            embed_scale: (config.hidden_size as f32).sqrt(),
+        };
+
+        // Gemma2 always uses tied embeddings.
         let lm_head = Linear::new(model.embed_tokens.weight, None);
 
         Ok(Self {

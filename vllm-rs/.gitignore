@@ -5,3 +5,4 @@
 
 # Override root *.csv ignore for parity data
 !crates/vllm-parity/**/*.csv
+elf.o

@@ -507,3 +507,202 @@ fn three_phase_benchmark() {
     println!("╚════════════════════════════════════════════════════════════╝");
     println!();
 }
+
+/// Benchmark helper: run separate (3 launches) and persistent (1 launch) at given sizes.
+fn bench_3phase(rows: usize, hidden: usize, n_hidden: usize, n_out: usize, num_blocks: u32) {
+    let c = ctx();
+    let stream = c.default_stream();
+    let epsilon = 1e-5f32;
+    let warmup = 30;
+    let iters = 100;
+
+    let input: Vec<f32> = (0..rows * hidden)
+        .map(|i| ((i as f32) * 0.017 + 0.3).sin())
+        .collect();
+    let weight: Vec<f32> = (0..hidden).map(|i| 1.0 + (i as f32) * 0.002).collect();
+    let w_up: Vec<f32> = (0..n_hidden * hidden)
+        .map(|i| ((i as f32) * 0.013 + 0.7).cos() * 0.01)
+        .collect();
+    let w_down: Vec<f32> = (0..n_out * n_hidden)
+        .map(|i| ((i as f32) * 0.011 + 0.5).sin() * 0.01)
+        .collect();
+
+    let mod_rms = c.load_module(Ptx::from_src(RMS_NORM_PTX)).unwrap();
+    let f_rms = mod_rms.load_function(&find_entry(RMS_NORM_PTX)).unwrap();
+    let mod_gemm = c.load_module(Ptx::from_src(GEMM_ROW_PTX)).unwrap();
+    let f_gemm = mod_gemm.load_function(&find_entry(GEMM_ROW_PTX)).unwrap();
+    let mod_3p = c.load_module(Ptx::from_src(FUSED_MLP_PTX)).unwrap();
+    let f_3p = mod_3p.load_function(&find_entry(FUSED_MLP_PTX)).unwrap();
+
+    let inp = stream.clone_htod(&input).unwrap();
+    let wgt = stream.clone_htod(&weight).unwrap();
+    let w_up_gpu = stream.clone_htod(&w_up).unwrap();
+    let w_down_gpu = stream.clone_htod(&w_down).unwrap();
+    let mut norm_out: CudaSlice<f32> = stream.alloc_zeros(rows * hidden).unwrap();
+    let mut up_out: CudaSlice<f32> = stream.alloc_zeros(rows * n_hidden).unwrap();
+    let mut final_out: CudaSlice<f32> = stream.alloc_zeros(rows * n_out).unwrap();
+
+    let m = rows as i32;
+    let n1 = n_hidden as i32;
+    let k1 = hidden as i32;
+    let n2 = n_out as i32;
+    let k2 = n_hidden as i32;
+
+    let cfg_rows = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let cfg_pers = LaunchConfig {
+        grid_dim: (num_blocks, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // Separate
+    for _ in 0..warmup {
+        unsafe {
+            stream
+                .launch_builder(&f_rms)
+                .arg(&mut norm_out)
+                .arg(&inp)
+                .arg(&wgt)
+                .arg(&epsilon)
+                .arg(&(hidden as i32))
+                .launch(cfg_rows)
+                .unwrap();
+            stream
+                .launch_builder(&f_gemm)
+                .arg(&mut up_out)
+                .arg(&norm_out)
+                .arg(&w_up_gpu)
+                .arg(&m)
+                .arg(&n1)
+                .arg(&k1)
+                .launch(cfg_rows)
+                .unwrap();
+            stream
+                .launch_builder(&f_gemm)
+                .arg(&mut final_out)
+                .arg(&up_out)
+                .arg(&w_down_gpu)
+                .arg(&m)
+                .arg(&n2)
+                .arg(&k2)
+                .launch(cfg_rows)
+                .unwrap();
+        }
+    }
+    stream.synchronize().unwrap();
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        unsafe {
+            stream
+                .launch_builder(&f_rms)
+                .arg(&mut norm_out)
+                .arg(&inp)
+                .arg(&wgt)
+                .arg(&epsilon)
+                .arg(&(hidden as i32))
+                .launch(cfg_rows)
+                .unwrap();
+            stream
+                .launch_builder(&f_gemm)
+                .arg(&mut up_out)
+                .arg(&norm_out)
+                .arg(&w_up_gpu)
+                .arg(&m)
+                .arg(&n1)
+                .arg(&k1)
+                .launch(cfg_rows)
+                .unwrap();
+            stream
+                .launch_builder(&f_gemm)
+                .arg(&mut final_out)
+                .arg(&up_out)
+                .arg(&w_down_gpu)
+                .arg(&m)
+                .arg(&n2)
+                .arg(&k2)
+                .launch(cfg_rows)
+                .unwrap();
+        }
+    }
+    stream.synchronize().unwrap();
+    let sep_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+    // Persistent
+    let mut ctr: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
+    for _ in 0..warmup {
+        stream.memcpy_htod(&[0u32], &mut ctr).unwrap();
+        unsafe {
+            stream
+                .launch_builder(&f_3p)
+                .arg(&ctr)
+                .arg(&inp)
+                .arg(&wgt)
+                .arg(&epsilon)
+                .arg(&(hidden as i32))
+                .arg(&mut up_out)
+                .arg(&w_up_gpu)
+                .arg(&m)
+                .arg(&n1)
+                .arg(&k1)
+                .arg(&mut final_out)
+                .arg(&w_down_gpu)
+                .arg(&m)
+                .arg(&n2)
+                .arg(&k2)
+                .launch(cfg_pers)
+                .unwrap();
+        }
+    }
+    stream.synchronize().unwrap();
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        stream.memcpy_htod(&[0u32], &mut ctr).unwrap();
+        unsafe {
+            stream
+                .launch_builder(&f_3p)
+                .arg(&ctr)
+                .arg(&inp)
+                .arg(&wgt)
+                .arg(&epsilon)
+                .arg(&(hidden as i32))
+                .arg(&mut up_out)
+                .arg(&w_up_gpu)
+                .arg(&m)
+                .arg(&n1)
+                .arg(&k1)
+                .arg(&mut final_out)
+                .arg(&w_down_gpu)
+                .arg(&m)
+                .arg(&n2)
+                .arg(&k2)
+                .launch(cfg_pers)
+                .unwrap();
+        }
+    }
+    stream.synchronize().unwrap();
+    let pers_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+    let speedup = sep_us / pers_us;
+    println!(
+        "  M={rows:4}, {hidden:4}->{n_hidden:4}->{n_out:4}  |  separate: {sep_us:8.1} us  |  persistent: {pers_us:8.1} us  |  {speedup:.2}x"
+    );
+}
+
+#[test]
+fn three_phase_scaling() {
+    println!();
+    println!("3-Phase MLP Scaling (108 persistent blocks)");
+    println!("──────────────────────────────────────────────────────────────────────────────");
+    bench_3phase(256, 128, 64, 32, 108);
+    bench_3phase(256, 512, 256, 128, 108);
+    bench_3phase(256, 1024, 512, 256, 108);
+    bench_3phase(256, 2048, 1024, 512, 108);
+    bench_3phase(512, 1024, 512, 256, 108);
+    bench_3phase(1024, 1024, 512, 256, 108);
+    println!("──────────────────────────────────────────────────────────────────────────────");
+    println!();
+}

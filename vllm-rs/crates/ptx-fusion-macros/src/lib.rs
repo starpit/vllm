@@ -2,6 +2,7 @@ use proc_macro::TokenStream;
 use quote::quote;
 use std::path::PathBuf;
 
+pub(crate) mod extract;
 mod fuse;
 mod parser;
 mod regfuse;
@@ -471,6 +472,56 @@ fn parse_path_and_name(input: &str) -> Result<(String, String), String> {
         return Err("expected const name after path".to_string());
     }
     Ok((path, name))
+}
+
+/// Extract a single entry point from a multi-entry PTX file.
+///
+/// ```rust,ignore
+/// extract_entry!("kernels/vllm_rms_norm.ptx", "rms_norm_kernelIf", VLLM_RMS_NORM_F32);
+/// // expands to:
+/// // const VLLM_RMS_NORM_F32: &str = "...standalone PTX with just the float entry...";
+/// ```
+#[proc_macro]
+pub fn extract_entry(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let args = parse_extract_args(&input_str)
+        .expect("extract_entry! expects (\"path.ptx\", \"entry_substring\", CONST_NAME)");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let ptx_path = PathBuf::from(&manifest_dir).join(&args.0);
+    let ptx_source = std::fs::read_to_string(&ptx_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ptx_path.display()));
+
+    let extracted = extract::extract_entry(&ptx_source, &args.1)
+        .unwrap_or_else(|e| panic!("extract_entry failed: {e}"));
+
+    let extracted_str = extracted.as_str();
+    let const_name = syn::Ident::new(&args.2, proc_macro2::Span::call_site());
+
+    let output = quote! {
+        const #const_name: &str = #extracted_str;
+    };
+    output.into()
+}
+
+fn parse_extract_args(input: &str) -> Result<(String, String, String), String> {
+    // Parse: "path.ptx", "entry_name", CONST_NAME
+    let mut strings = Vec::new();
+    let mut rest = input.trim();
+    // Extract 2 quoted strings
+    for _ in 0..2 {
+        let q1 = rest.find('"').ok_or("expected quote")?;
+        let after = &rest[q1 + 1..];
+        let q2 = after.find('"').ok_or("unclosed quote")?;
+        strings.push(after[..q2].to_string());
+        rest = after[q2 + 1..].trim().trim_start_matches(',').trim();
+    }
+    // The remainder is the const name
+    let name = rest.trim().to_string();
+    if name.is_empty() {
+        return Err("expected CONST_NAME after entry name".to_string());
+    }
+    Ok((strings[0].clone(), strings[1].clone(), name))
 }
 
 /// Register-level fusion: fuse two elementwise kernels where the intermediate

@@ -298,13 +298,32 @@ impl PtxParser {
             }
         }
 
-        // Also trace `add.u64 %rdX, %rdY, %rdZ` to propagate pointer identity.
-        // If %rd0 = input, and `add.u64 %rd4, %rd0, %rd3` → %rd4 derives from input.
+        // Trace pointer-propagating instructions to follow address chains.
+        // Handles: add.u64, add.s64 (nvcc uses signed), cvta.to.global.u64 (address space cast).
         // Do multiple passes to propagate through chains.
         for _pass in 0..4 {
             for line in lines {
                 let trimmed = line.trim();
-                if !trimmed.starts_with("add.u64") {
+                let opcode = trimmed.split_whitespace().next().unwrap_or("");
+
+                // cvta.to.global.u64 %rd4, %rd1; — propagates pointer identity (1:1 rename)
+                if opcode == "cvta.to.global.u64" {
+                    let parts: Vec<&str> = trimmed
+                        .split([',', ' ', '\t'])
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if parts.len() >= 3 {
+                        let dst = parts[1].trim_end_matches(',').to_string();
+                        let src = parts[2].trim_end_matches(';');
+                        if let Some(param) = reg_to_param.get(src).cloned() {
+                            reg_to_param.entry(dst).or_insert(param);
+                        }
+                    }
+                    continue;
+                }
+
+                // add.u64 / add.s64 — pointer + offset propagation
+                if opcode != "add.u64" && opcode != "add.s64" {
                     continue;
                 }
 

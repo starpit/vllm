@@ -873,9 +873,15 @@ fn gemma2_config_from_hf(
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
 
-    // Gemma2 alternates sliding/full attention: even layers = sliding, odd = full.
-    // Or it may be specified via sliding_window_pattern in config.
-    let layer_is_sliding: Vec<bool> = (0..num_hidden_layers).map(|i| i % 2 == 0).collect();
+    // Read layer_types from HF config if available, otherwise fall back to
+    // Gemma2's default alternating pattern (even = sliding, odd = full).
+    let layer_is_sliding: Vec<bool> = match hf.extra.get("layer_types").and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .map(|v| v.as_str() == Some("sliding_attention"))
+            .collect(),
+        None => (0..num_hidden_layers).map(|i| i % 2 == 0).collect(),
+    };
 
     Ok(vllm_cuda::model::gemma2::Gemma2Config {
         hidden_size,

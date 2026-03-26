@@ -227,6 +227,11 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Tanh softcap inplace: x[i] = cap * tanh(x[i] / cap)
+    fn tanh_softcap_inplace_f16(x: *mut u16, cap: f32, n: c_int, stream: CUstream);
+    fn tanh_softcap_inplace_bf16(x: *mut u16, cap: f32, n: c_int, stream: CUstream);
+    fn tanh_softcap_inplace_f32(x: *mut f32, cap: f32, n: c_int, stream: CUstream);
+
     // Broadcast multiply inplace: x[row, col] *= scale[col]
     fn broadcast_mul_inplace_f16(
         x: *mut u16,
@@ -1570,6 +1575,22 @@ pub unsafe fn broadcast_mul_inplace(x: GpuTensor, scale: GpuTensor, stream: CUst
             stream,
         ),
         _ => panic!("broadcast_mul_inplace: unsupported dtype {:?}", x.dtype()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tanh Softcap (in-place)
+// ---------------------------------------------------------------------------
+
+/// Apply `x[i] = cap * tanh(x[i] / cap)` in-place.
+/// Used for Gemma 2 final logit softcapping.
+pub unsafe fn tanh_softcap_inplace(x: GpuTensor, cap: f32, stream: CUstream) {
+    let n = x.numel() as c_int;
+    match x.dtype() {
+        DType::F16 => tanh_softcap_inplace_f16(x.as_mut_ptr(), cap, n, stream),
+        DType::BF16 => tanh_softcap_inplace_bf16(x.as_mut_ptr(), cap, n, stream),
+        DType::F32 => tanh_softcap_inplace_f32(x.as_mut_ptr() as *mut f32, cap, n, stream),
+        _ => panic!("tanh_softcap_inplace: unsupported dtype {:?}", x.dtype()),
     }
 }
 

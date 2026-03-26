@@ -1806,11 +1806,9 @@ impl Gemma2ForCausalLM {
         );
 
         // Apply final logit soft capping: logits = cap * tanh(logits / cap).
-        // TODO: This requires a fused tanh-softcap kernel. For now, softcap
-        // is not applied at the GpuTensor level — it would need a small CUDA
-        // kernel. The softcap values are typically large (30.0) so this has
-        // minimal impact on correctness for greedy/top-k sampling.
-        let _ = self.final_logit_softcapping;
+        if let Some(cap) = self.final_logit_softcapping {
+            kernels::tanh_softcap_inplace(logits.as_gpu_tensor(), cap, device.compute_stream);
+        }
 
         logits
     }
@@ -2495,7 +2493,13 @@ impl Gemma2ForCausalLM {
                 drop(gathered);
                 drop(hidden_states);
 
-                let _ = self.final_logit_softcapping;
+                if let Some(cap) = self.final_logit_softcapping {
+                    kernels::tanh_softcap_inplace(
+                        logits.as_gpu_tensor(),
+                        cap,
+                        device.compute_stream,
+                    );
+                }
 
                 #[cfg(feature = "nccl")]
                 if let Some(ref group) = self.tp_group {

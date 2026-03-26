@@ -261,6 +261,60 @@ void gelu_and_mul_fused_bf16(
 } // extern "C"
 
 // ---------------------------------------------------------------------------
+// Tanh softcap inplace: x[i] = cap * tanh(x[i] / cap)
+// Used for Gemma 2 final logit softcapping.
+// x: [n] total elements, cap: scalar float.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+__global__ void tanh_softcap_inplace_kernel(
+    T* __restrict__ x,
+    float inv_cap,
+    float cap,
+    int n)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        float v = static_cast<float>(x[i]) * inv_cap;
+        x[i] = static_cast<T>(cap * tanhf(v));
+    }
+}
+
+extern "C" {
+
+void tanh_softcap_inplace_f32(
+    float* x, float cap, int n, cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
+    tanh_softcap_inplace_kernel<float><<<blocks, threads, 0, stream>>>(
+        x, 1.0f / cap, cap, n);
+}
+
+void tanh_softcap_inplace_f16(
+    __half* x, float cap, int n, cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
+    tanh_softcap_inplace_kernel<__half><<<blocks, threads, 0, stream>>>(
+        x, 1.0f / cap, cap, n);
+}
+
+void tanh_softcap_inplace_bf16(
+    __nv_bfloat16* x, float cap, int n, cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
+    tanh_softcap_inplace_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
+        x, 1.0f / cap, cap, n);
+}
+
+} // extern "C"
+
+// ---------------------------------------------------------------------------
 // Broadcast multiply inplace: x[row, col] *= scale[col]
 // x: [num_rows, d], scale: [d] — both same dtype.
 // One block per row.

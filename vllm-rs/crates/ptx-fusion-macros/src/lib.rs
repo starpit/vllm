@@ -7,6 +7,7 @@ mod fuse;
 pub(crate) mod fuse_epilogue;
 pub(crate) mod fuse_real;
 mod parser;
+pub(crate) mod persistent;
 mod regfuse;
 use parser::{KernelProtocol, PtxParser};
 
@@ -696,6 +697,130 @@ fn parse_fuse_real_args(input: &str) -> Result<FuseRealArgs, String> {
         a_output: strings[5].clone(),
         b_input: strings[6].clone(),
         smem_elements,
+        const_name,
+    })
+}
+
+/// Fuse two real nvcc-compiled kernels via SMEM handoff AND wrap in a persistent
+/// work-queue loop. The resulting kernel fills the GPU and loops, grabbing tiles
+/// from an atomic counter until all rows are processed.
+///
+/// ```rust,ignore
+/// persistent_fuse_real_kernels!(
+///     "kernels/vllm_rms_norm.ptx", "rms_norm_kernelIfE",
+///     "kernels/gemm_row_f32.ptx", "gemm_row_f32",
+///     "persistent_rms_norm_gemm",
+///     "param_0", "param_1",
+///     4096,
+///     "param_3",  // which B param holds the total row count (M)
+///     PERSISTENT_RMS_GEMM_PTX
+/// );
+/// ```
+#[proc_macro]
+pub fn persistent_fuse_real_kernels(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let args =
+        parse_persistent_fuse_args(&input_str).expect("persistent_fuse_real_kernels! parse error");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+
+    let ptx_a_full = std::fs::read_to_string(PathBuf::from(&manifest_dir).join(&args.path_a))
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", args.path_a));
+    let ptx_b_full = std::fs::read_to_string(PathBuf::from(&manifest_dir).join(&args.path_b))
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", args.path_b));
+
+    let ptx_a = extract::extract_entry(&ptx_a_full, &args.entry_a)
+        .unwrap_or_else(|e| panic!("extract A failed: {e}"));
+    let ptx_b = extract::extract_entry(&ptx_b_full, &args.entry_b)
+        .unwrap_or_else(|e| panic!("extract B failed: {e}"));
+
+    let binding = fuse_real::RealFuseBinding {
+        a_output_param: args.a_output.clone(),
+        b_input_param: args.b_input.clone(),
+    };
+
+    let fused = fuse_real::fuse_real_kernels(
+        &ptx_a,
+        &ptx_b,
+        &args.fused_name,
+        &binding,
+        args.smem_elements,
+    )
+    .unwrap_or_else(|e| panic!("real fusion failed: {e}"));
+
+    // Build the full param name: B_entry_name + "_" + total_rows_param
+    // e.g., "gemm_row_f32" + "_" + "param_3" = "gemm_row_f32_param_3"
+    let total_rows_full = format!("{}_{}", args.entry_b, args.total_rows_param);
+
+    let persistent =
+        persistent::make_persistent(&fused.ptx, &args.persistent_name, &total_rows_full)
+            .unwrap_or_else(|e| panic!("persistent wrapper failed: {e}"));
+
+    let persistent_str = persistent.as_str();
+    let const_name = syn::Ident::new(&args.const_name, proc_macro2::Span::call_site());
+
+    let output = quote! {
+        const #const_name: &str = #persistent_str;
+    };
+    output.into()
+}
+
+struct PersistentFuseArgs {
+    path_a: String,
+    entry_a: String,
+    path_b: String,
+    entry_b: String,
+    fused_name: String,
+    persistent_name: String,
+    a_output: String,
+    b_input: String,
+    smem_elements: usize,
+    total_rows_param: String,
+    const_name: String,
+}
+
+fn parse_persistent_fuse_args(input: &str) -> Result<PersistentFuseArgs, String> {
+    let mut strings = Vec::new();
+    let mut rest = input.trim();
+    while let Some(q1) = rest.find('"') {
+        let after = &rest[q1 + 1..];
+        let q2 = after.find('"').ok_or("unclosed quote")?;
+        strings.push(after[..q2].to_string());
+        rest = &after[q2 + 1..];
+    }
+
+    // 8 quoted strings: path_a, entry_a, path_b, entry_b, fused_name, a_output, b_input, total_rows_param
+    if strings.len() < 8 {
+        return Err(format!("expected 8 quoted strings, got {}", strings.len()));
+    }
+
+    let rest = rest.trim().trim_start_matches(',').trim();
+    let parts: Vec<&str> = rest.split(',').map(|s| s.trim()).collect();
+    if parts.len() < 2 {
+        return Err("expected smem_elements and CONST_NAME after quoted strings".to_string());
+    }
+
+    let smem_elements: usize = parts[0]
+        .trim()
+        .parse()
+        .map_err(|e| format!("bad smem_elements: {e}"))?;
+    let const_name = parts[1].trim().to_string();
+
+    // The persistent entry name is the fused_name prefixed with "persistent_"
+    // (but we use the fused_name for the intermediate fusion step)
+    let persistent_name = format!("persistent_{}", strings[4]);
+
+    Ok(PersistentFuseArgs {
+        path_a: strings[0].clone(),
+        entry_a: strings[1].clone(),
+        path_b: strings[2].clone(),
+        entry_b: strings[3].clone(),
+        fused_name: strings[4].clone(),
+        persistent_name,
+        a_output: strings[5].clone(),
+        b_input: strings[6].clone(),
+        smem_elements,
+        total_rows_param: strings[7].clone(),
         const_name,
     })
 }

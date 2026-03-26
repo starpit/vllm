@@ -10,7 +10,8 @@
 
 pub use ptx_fusion_macros::{
     analyze_kernel, analyze_kernel_as, extract_entry, fuse_kernels, fuse_real_kernels,
-    inject_epilogue, inject_silu_epilogue, regfuse_kernels, rewrite_kernel,
+    inject_epilogue, inject_silu_epilogue, persistent_fuse_real_kernels, regfuse_kernels,
+    rewrite_kernel,
 };
 
 /// A kernel's complete protocol — everything needed to fuse it with another kernel.

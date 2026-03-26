@@ -601,6 +601,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                     .cuda_graph_mode
                     .parse()
                     .unwrap_or(CudaGraphMode::Auto),
+                eos_token_ids: vec![],
             })
             .collect();
 

@@ -21,6 +21,10 @@ pub struct KernelProtocol {
     /// Global memory store sites — which param is written, what type.
     pub global_stores: Vec<DataPort>,
 
+    /// Async copy sites: cp.async.cg.shared.global (GMEM → SMEM).
+    /// These are the input perimeter for async-pipeline kernels (CUTLASS).
+    pub async_loads: Vec<AsyncCopyPort>,
+
     /// Count of shared memory loads (`ld.shared.*`).
     pub smem_loads: usize,
 
@@ -58,11 +62,51 @@ pub struct DataPort {
     pub line: usize,
 }
 
+/// An async copy site: cp.async.cg.shared.global copies GMEM → SMEM.
+/// This is part of the input perimeter for kernels that use async pipelines (CUTLASS).
+#[derive(Debug, Clone)]
+pub struct AsyncCopyPort {
+    /// Which param the GMEM source traces to.
+    pub param_name: String,
+    /// The SMEM destination register (e.g., "%r226").
+    pub smem_dst: String,
+    /// The GMEM source register (e.g., "%rd26").
+    pub gmem_src: String,
+    /// The predicate/mask register (e.g., "%r227").
+    pub mask: String,
+    /// Size in bytes (always 16 for cp.async.cg with L2::128B).
+    pub size_bytes: usize,
+    /// Line number in the PTX.
+    pub line: usize,
+}
+
 pub struct PtxParser;
 
 impl PtxParser {
     pub fn parse(source: &str) -> Result<KernelProtocol, String> {
         let lines: Vec<&str> = source.lines().collect();
+
+        // If multi-entry PTX, extract the first entry automatically.
+        let entry_count = lines
+            .iter()
+            .filter(|l| l.contains(".entry") && l.contains('('))
+            .count();
+        let source_owned;
+        let lines = if entry_count > 1 {
+            // Extract the first entry's name
+            let first_entry_name = Self::extract_kernel_name(&lines)?;
+            // Use a short unique substring from the entry name
+            let substr = if first_entry_name.len() > 20 {
+                &first_entry_name[..20]
+            } else {
+                &first_entry_name
+            };
+            source_owned = crate::extract::extract_entry(source, substr)
+                .map_err(|e| format!("multi-entry PTX: failed to extract first entry: {e}"))?;
+            source_owned.lines().collect::<Vec<&str>>()
+        } else {
+            lines
+        };
 
         let name = Self::extract_kernel_name(&lines)?;
         let params = Self::extract_params(&lines);
@@ -70,12 +114,11 @@ impl PtxParser {
         let smem_regions = Self::extract_smem(&lines);
         let total_smem_bytes = smem_regions.iter().map(|r| r.size_bytes).sum();
 
-        // Build a map from register names to the param they were loaded from.
-        // This lets us trace ld.global back to a specific parameter.
         let reg_to_param = Self::trace_param_registers(&lines, &params);
 
         let global_loads = Self::extract_global_loads(&lines, &reg_to_param);
         let global_stores = Self::extract_global_stores(&lines, &reg_to_param);
+        let async_loads = Self::extract_async_loads(&lines, &reg_to_param);
         let smem_loads = Self::count_pattern(&lines, "ld.shared");
         let smem_stores = Self::count_pattern(&lines, "st.shared");
         let barriers = Self::extract_barriers(&lines);
@@ -92,6 +135,7 @@ impl PtxParser {
             params,
             global_loads,
             global_stores,
+            async_loads,
             smem_loads,
             smem_stores,
             barriers,
@@ -102,8 +146,8 @@ impl PtxParser {
     fn extract_kernel_name(lines: &[&str]) -> Result<String, String> {
         for line in lines {
             let trimmed = line.trim();
-            if trimmed.starts_with(".visible") && trimmed.contains(".entry") {
-                // .visible .entry rms_norm(
+            if trimmed.contains(".entry") && trimmed.contains('(') {
+                // .visible .entry rms_norm( OR .entry _ZN7cutlass...(
                 let after_entry = trimmed
                     .split(".entry")
                     .nth(1)
@@ -113,7 +157,7 @@ impl PtxParser {
                 return Ok(after_entry[..name_end].trim().to_string());
             }
         }
-        Err("no .visible .entry found".to_string())
+        Err("no .entry found".to_string())
     }
 
     fn extract_params(lines: &[&str]) -> Vec<KernelParam> {
@@ -160,6 +204,9 @@ impl PtxParser {
                         ".u32"
                     } else if trimmed.contains(".s32") {
                         ".s32"
+                    } else if trimmed.contains(".b8") {
+                        // Struct param: .param .align N .b8 name[SIZE]
+                        ".struct"
                     } else {
                         ".unknown"
                     };
@@ -284,7 +331,9 @@ impl PtxParser {
                 continue;
             }
 
-            // ld.param.u64 %rd0, [input];
+            // Two patterns:
+            // 1. ld.param.u64 %rd0, [param_name];           (individual params)
+            // 2. ld.param.u64 %rd2, [%rd1+16];              (struct params, CUTLASS)
             let parts: Vec<&str> = trimmed
                 .split([',', ' ', '\t'])
                 .filter(|s| !s.is_empty())
@@ -292,9 +341,15 @@ impl PtxParser {
 
             if parts.len() >= 3 {
                 let reg = parts[1].trim_end_matches(',').to_string();
-                // The param name is in brackets: [input] or [epsilon]
-                let param_ref = parts[2].trim_matches(|c| c == '[' || c == ']' || c == ';');
-                reg_to_param.insert(reg, param_ref.to_string());
+                let bracket_content = parts[2].trim_matches(|c| c == '[' || c == ']' || c == ';');
+
+                if bracket_content.contains('+') {
+                    // Struct param: [%rd1+16] or [_param_0+16]
+                    // Use the full bracket content as a synthetic param name
+                    reg_to_param.insert(reg, bracket_content.to_string());
+                } else {
+                    reg_to_param.insert(reg, bracket_content.to_string());
+                }
             }
         }
 
@@ -453,6 +508,70 @@ impl PtxParser {
         }
 
         stores
+    }
+
+    fn extract_async_loads(
+        lines: &[&str],
+        reg_to_param: &BTreeMap<String, String>,
+    ) -> Vec<AsyncCopyPort> {
+        let mut ports = Vec::new();
+
+        for (line_num, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if !trimmed.contains("cp.async.cg.shared.global") {
+                continue;
+            }
+
+            // cp.async.cg.shared.global.L2::128B [%r226], [%rd26], 16, %r227;
+            // Extract: smem_dst, gmem_src, mask from bracket pairs and trailing tokens
+            let mut brackets = Vec::new();
+            let mut i = 0;
+            let bytes = trimmed.as_bytes();
+            while i < bytes.len() {
+                if bytes[i] == b'[' {
+                    let start = i + 1;
+                    while i < bytes.len() && bytes[i] != b']' {
+                        i += 1;
+                    }
+                    brackets.push(trimmed[start..i].trim().to_string());
+                }
+                i += 1;
+            }
+
+            if brackets.len() < 2 {
+                continue;
+            }
+
+            let smem_dst = brackets[0].clone();
+            let gmem_src = brackets[1].clone();
+
+            // Extract mask (last token before semicolon)
+            let parts: Vec<&str> = trimmed
+                .split([',', ' ', '\t'])
+                .filter(|s| !s.is_empty())
+                .collect();
+            let mask = parts
+                .last()
+                .map(|s| s.trim_end_matches(';').to_string())
+                .unwrap_or_default();
+
+            // Trace GMEM source to param
+            let param_name = reg_to_param
+                .get(&gmem_src)
+                .cloned()
+                .unwrap_or_else(|| format!("?{gmem_src}"));
+
+            ports.push(AsyncCopyPort {
+                param_name,
+                smem_dst,
+                gmem_src,
+                mask,
+                size_bytes: 16,
+                line: line_num + 1,
+            });
+        }
+
+        ports
     }
 
     fn extract_barriers(lines: &[&str]) -> Vec<usize> {

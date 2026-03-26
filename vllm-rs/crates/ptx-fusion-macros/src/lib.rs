@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub(crate) mod chain;
 pub(crate) mod extract;
 mod fuse;
+pub(crate) mod fuse_cp_async;
 pub(crate) mod fuse_epilogue;
 pub(crate) mod fuse_real;
 mod parser;
@@ -225,6 +226,25 @@ fn protocol_to_const_tokens(
         })
         .collect();
 
+    let async_load_lines: Vec<proc_macro2::TokenStream> = protocol
+        .async_loads
+        .iter()
+        .map(|a| {
+            let param = &a.param_name;
+            let smem_dst = &a.smem_dst;
+            let gmem_src = &a.gmem_src;
+            let mask = &a.mask;
+            let size = a.size_bytes as u32;
+            let line = a.line as u32;
+            quote! {
+                ptx_fusion::AsyncCopyPort {
+                    param_name: #param, smem_dst: #smem_dst, gmem_src: #gmem_src,
+                    mask: #mask, size_bytes: #size, line: #line
+                }
+            }
+        })
+        .collect();
+
     let smem_load_count = protocol.smem_loads as u32;
     let smem_store_count = protocol.smem_stores as u32;
     let barrier_ids: Vec<u32> = protocol.barriers.iter().map(|b| *b as u32).collect();
@@ -240,6 +260,7 @@ fn protocol_to_const_tokens(
             params: &[#(#param_lines),*],
             global_loads: &[#(#load_lines),*],
             global_stores: &[#(#store_lines),*],
+            async_loads: &[#(#async_load_lines),*],
             smem_loads: #smem_load_count,
             smem_stores: #smem_store_count,
             barriers: &[#(#barrier_ids),*],
@@ -1056,6 +1077,43 @@ pub fn inject_silu_epilogue(input: TokenStream) -> TokenStream {
     let modified = fuse_epilogue::inject_activation_into_epilogue(&extracted, act)
         .or_else(|_| fuse_epilogue::inject_activation_into_f32_stores(&extracted, act))
         .unwrap_or_else(|e| panic!("SiLU injection failed: {e}"));
+
+    let modified_str = modified.as_str();
+    let const_name = syn::Ident::new(&args.2, proc_macro2::Span::call_site());
+
+    let output = quote! {
+        const #const_name: &str = #modified_str;
+    };
+    output.into()
+}
+
+/// Redirect A-matrix cp.async loads in a CUTLASS GEMM to read from a SMEM
+/// handoff buffer instead of GMEM.
+///
+/// ```rust,ignore
+/// redirect_cutlass_a_loads!(
+///     "kernels/cutlass_gemm_bf16_sm89.ptx",
+///     "GemmShape",
+///     CUTLASS_GEMM_REDIRECTED_PTX
+/// );
+/// ```
+#[proc_macro]
+pub fn redirect_cutlass_a_loads(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let args = parse_extract_args(&input_str)
+        .expect("redirect_cutlass_a_loads! expects (\"path.ptx\", \"entry_substr\", CONST_NAME)");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let ptx_path = PathBuf::from(&manifest_dir).join(&args.0);
+    let ptx_source = std::fs::read_to_string(&ptx_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ptx_path.display()));
+
+    let extracted = extract::extract_entry(&ptx_source, &args.1)
+        .unwrap_or_else(|e| panic!("extract_entry failed: {e}"));
+
+    // Auto-detect A matrix param from cp.async trace analysis (no hardcoded offsets)
+    let modified = fuse_cp_async::redirect_a_matrix_loads(&extracted, "", "_ferrite_handoff")
+        .unwrap_or_else(|e| panic!("cp.async redirect failed: {e}"));
 
     let modified_str = modified.as_str();
     let const_name = syn::Ident::new(&args.2, proc_macro2::Span::call_site());

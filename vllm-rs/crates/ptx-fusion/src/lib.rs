@@ -24,10 +24,21 @@ pub struct KernelProtocol {
     pub params: &'static [KernelParam],
     pub global_loads: &'static [DataPort],
     pub global_stores: &'static [DataPort],
+    pub async_loads: &'static [AsyncCopyPort],
     pub smem_loads: u32,
     pub smem_stores: u32,
     pub barriers: &'static [u32],
     pub has_mma: bool,
+}
+
+#[derive(Debug)]
+pub struct AsyncCopyPort {
+    pub param_name: &'static str,
+    pub smem_dst: &'static str,
+    pub gmem_src: &'static str,
+    pub mask: &'static str,
+    pub size_bytes: u32,
+    pub line: u32,
 }
 
 #[derive(Debug)]
@@ -108,6 +119,20 @@ impl KernelProtocol {
             );
         }
         println!("║");
+
+        if !self.async_loads.is_empty() {
+            println!("║ Async Copies ({}):", self.async_loads.len());
+            // Group by param
+            let mut by_param: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for a in self.async_loads {
+                *by_param.entry(a.param_name).or_insert(0) += 1;
+            }
+            for (param, count) in &by_param {
+                println!("║   {} cp.async loads from param \"{}\"", count, param);
+            }
+            println!("║");
+        }
 
         println!(
             "║ SMEM loads: {}, SMEM stores: {}",

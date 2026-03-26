@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **54 tests** (44 CUDA GPU + 10 unit), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **57 tests** (46 CUDA GPU + 11 doc-ignored + 10 unit), all passing.
 
 ### What's Proven
 
@@ -80,6 +80,7 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **54 tests** (44 CUDA GPU + 10 unit), all p
 | GEMM epilogue GELU (GPU) | cuda_gemm_gelu_correctness | Ferrite vs nvcc: **4.77e-7 diff** |
 | GEMM prologue injection | cuda_gemm_prologue | rms_norm -> GEMM via SMEM, **0.00e0 diff** |
 | Persistent kernel | cuda_persistent | 108-block work queue, 256 rows, **0.00e0 diff** |
+| 3-phase MLP pipeline | cuda_3phase | norm->GEMM+SiLU->GEMM, persistent, **1.91e-6 diff** |
 | Stress tests | cuda_stress | n=1 to n=4096, 100-run determinism |
 
 ### Benchmarks
@@ -89,11 +90,12 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **54 tests** (44 CUDA GPU + 10 unit), all p
 | SMEM (rms_norm -> matvec) | 9.94 us | 8.49 us | **1.17x** |
 | Register (rms_norm -> scale) | 6.28 us | 2.90 us | **2.16x** |
 | Fused rms_norm -> GEMM | 29.4 us | 24.9 us | **1.18x** |
-| Persistent (108 blocks, M=256) | 29.4 us | 31.4 us | 0.94x* |
+| Persistent 2-phase (108 blocks, M=256) | 29.4 us | 31.4 us | 0.94x* |
+| 3-phase MLP (norm->GEMM+SiLU->GEMM) | 34.4 us | 43.7 us | 0.79x* |
 
-\* Persistent overhead is the host memcpy to reset the tile counter between
-invocations. The kernel itself matches fused performance. In production (single
-invocation per forward pass), this overhead disappears.
+\* Persistent overhead is host memcpy to reset tile counter + per-tile atomic/barrier
+costs. With small matrices (M=256, K=128), scheduling overhead dominates. The win
+comes with more phases and larger data where GMEM savings outweigh per-tile costs.
 
 ### The GEMM Epilogue Result
 
@@ -166,6 +168,7 @@ crates/ptx-fusion-macros/          Proc macro crate (runs at compile time)
   src/fuse.rs                      SMEM stitching fusion engine (toy kernels)
   src/fuse_real.rs                 SMEM stitching for real nvcc PTX (vectorized, multi-pass)
   src/fuse_epilogue.rs             GEMM epilogue injection (parameterized: SiLU, GELU, ReLU)
+  src/chain.rs                     Multi-phase chaining (append GMEM-handoff phases)
   src/persistent.rs                Persistent kernel wrapper (work-queue loop)
   src/regfuse.rs                   Register-level fusion engine (elementwise)
   src/extract.rs                   Single-entry extraction from multi-entry PTX
@@ -175,7 +178,7 @@ crates/ptx-fusion/                 Library + tests
   src/main.rs                      Demo: extract + rewrite + fuse + validate
   build.rs                         Compiles vllm-cuda csrc/ kernels to PTX at build time
   kernels/                         Hand-written, nvcc-compiled, and CUTLASS PTX files
-  tests/                           44 CUDA GPU tests
+  tests/                           47 CUDA GPU tests
 ```
 
 ## Proc Macros
@@ -192,6 +195,7 @@ crates/ptx-fusion/                 Library + tests
 | `inject_epilogue!("path", "entry", Gelu, NAME)` | Inject activation into GEMM epilogue (SiLU, GELU, ReLU) |
 | `inject_silu_epilogue!(...)` | Convenience wrapper: inject SiLU into GEMM epilogue |
 | `persistent_fuse_real_kernels!(...)` | Wrap fused kernel in persistent work-queue loop |
+| `fuse_3phase_mlp!(...)` | 3-phase MLP: norm->GEMM+SiLU->GEMM, persistent |
 
 ## What's Next
 
@@ -205,9 +209,10 @@ crates/ptx-fusion/                 Library + tests
 
 ### Near-term
 
-- **Multi-phase persistent pipeline**: extend the persistent wrapper to sequence 4+
-  phases (norm -> GEMM -> act -> GEMM) in a single persistent launch. The building
-  blocks are proven; need to chain multiple fuse_real + inject_epilogue passes.
+- **Scale to production sizes**: test with hidden_dim=4096, production CUTLASS GEMMs.
+  The 3-phase pipeline architecture is proven at small scale; need to validate with
+  real dimensions where GMEM savings dominate over per-tile overhead.
+- **CUTLASS prologue injection**: extend prologue to `cp.async.cg.shared.global`.
 - **FlashAttention fusion**: compile FA2/FA3 to PTX, identify escape perimeter, fuse
   RoPE into prologue and output projection into epilogue.
 

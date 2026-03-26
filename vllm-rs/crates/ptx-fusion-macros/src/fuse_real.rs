@@ -397,7 +397,7 @@ pub fn fuse_real_kernels(
 // ── Address analysis helpers ──
 
 /// Find the param name matching a substring.
-fn find_param_by_substring(params: &[KernelParam], substr: &str) -> Option<String> {
+pub(crate) fn find_param_by_substring(params: &[KernelParam], substr: &str) -> Option<String> {
     params
         .iter()
         .find(|p| p.name.contains(substr))
@@ -613,7 +613,7 @@ fn emit_smem_load_real(out: &mut String, instruction: &str, smem_name: &str) {
 
 // ── Body extraction ──
 
-fn extract_body_lines(ptx: &str) -> Result<Vec<String>, String> {
+pub(crate) fn extract_body_lines(ptx: &str) -> Result<Vec<String>, String> {
     let lines: Vec<&str> = ptx.lines().collect();
     let mut start = None;
     let mut end = None;
@@ -737,7 +737,7 @@ fn extract_decl_name(decl: &str) -> Option<String> {
     None
 }
 
-fn find_label_prefix(body_lines: &[String]) -> Option<String> {
+pub(crate) fn find_label_prefix(body_lines: &[String]) -> Option<String> {
     for line in body_lines {
         let t = line.trim();
         if let Some(pos) = t.find("$L__BB") {
@@ -756,7 +756,7 @@ fn find_label_prefix(body_lines: &[String]) -> Option<String> {
 
 // ── Register offset helpers (same as in fuse.rs) ──
 
-fn compute_register_offsets(
+pub(crate) fn compute_register_offsets(
     a_regs: &[(String, usize)],
     b_regs: &[(String, usize)],
 ) -> BTreeMap<String, usize> {
@@ -769,7 +769,7 @@ fn compute_register_offsets(
     offsets
 }
 
-fn compute_merged_reg_decls(
+pub(crate) fn compute_merged_reg_decls(
     a_regs: &[(String, usize)],
     b_regs: &[(String, usize)],
     offsets: &BTreeMap<String, usize>,
@@ -807,7 +807,7 @@ fn compute_merged_reg_decls(
     result
 }
 
-fn merge_params(
+pub(crate) fn merge_params(
     proto_a: &crate::parser::KernelProtocol,
     proto_b: &crate::parser::KernelProtocol,
     a_output_name: &str,
@@ -833,7 +833,7 @@ fn merge_params(
     params
 }
 
-fn offset_all_registers(line: &str, offsets: &BTreeMap<String, usize>) -> String {
+pub(crate) fn offset_all_registers(line: &str, offsets: &BTreeMap<String, usize>) -> String {
     // Process in order: longer prefixes first
     let prefixes = [
         (".b64", "%rd"),
@@ -897,7 +897,7 @@ fn offset_registers_in_text(text: &str, prefix: &str, offset: usize) -> String {
     result
 }
 
-fn offset_single_register(reg: &str, offsets: &BTreeMap<String, usize>) -> String {
+pub(crate) fn offset_single_register(reg: &str, offsets: &BTreeMap<String, usize>) -> String {
     let prefixes = [
         ("%rd", ".b64"),
         ("%rs", ".b16"),
@@ -921,7 +921,7 @@ fn offset_single_register(reg: &str, offsets: &BTreeMap<String, usize>) -> Strin
     reg.to_string()
 }
 
-fn offset_barriers(line: &str, b_barriers: &[usize], new_start: usize) -> String {
+pub(crate) fn offset_barriers(line: &str, b_barriers: &[usize], new_start: usize) -> String {
     let mut result = line.to_string();
     let mut sorted: Vec<usize> = b_barriers.to_vec();
     sorted.sort_unstable_by(|a, b| b.cmp(a));

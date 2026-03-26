@@ -2,6 +2,7 @@ use proc_macro::TokenStream;
 use quote::quote;
 use std::path::PathBuf;
 
+pub(crate) mod chain;
 pub(crate) mod extract;
 mod fuse;
 pub(crate) mod fuse_epilogue;
@@ -821,6 +822,159 @@ fn parse_persistent_fuse_args(input: &str) -> Result<PersistentFuseArgs, String>
         b_input: strings[6].clone(),
         smem_elements,
         total_rows_param: strings[7].clone(),
+        const_name,
+    })
+}
+
+/// Fuse a 3-phase MLP pipeline: norm -> GEMM+SiLU -> GEMM, wrapped in a persistent loop.
+///
+/// Phase 1->2: SMEM handoff (eliminates norm->GEMM GMEM round-trip).
+/// Phase 2->3: GMEM handoff (Phase 3 reads from Phase 2's output buffer).
+/// SiLU is injected into Phase 2's f32 stores.
+///
+/// ```rust,ignore
+/// fuse_3phase_mlp!(
+///     "kernels/vllm_rms_norm.ptx", "rms_norm_kernelIfE",
+///     "kernels/gemm_row_f32.ptx", "gemm_row_f32",
+///     "kernels/gemm_row_f32.ptx", "gemm_row_f32",
+///     "fused_mlp",
+///     "param_0", "param_1",  // Phase 1->2 SMEM binding
+///     "param_0", "param_1",  // Phase 2->3 GMEM binding
+///     4096,                   // SMEM elements
+///     "param_3",              // total_rows param
+///     FUSED_MLP_PTX
+/// );
+/// ```
+#[proc_macro]
+pub fn fuse_3phase_mlp(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let args = parse_3phase_args(&input_str).expect("fuse_3phase_mlp! parse error");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+
+    // Read all PTX files
+    let ptx_norm_full = std::fs::read_to_string(PathBuf::from(&manifest_dir).join(&args.path_norm))
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", args.path_norm));
+    let ptx_gemm1_full =
+        std::fs::read_to_string(PathBuf::from(&manifest_dir).join(&args.path_gemm1))
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", args.path_gemm1));
+    let ptx_gemm2_full =
+        std::fs::read_to_string(PathBuf::from(&manifest_dir).join(&args.path_gemm2))
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", args.path_gemm2));
+
+    // Extract entries
+    let ptx_norm = extract::extract_entry(&ptx_norm_full, &args.entry_norm)
+        .unwrap_or_else(|e| panic!("extract norm failed: {e}"));
+    let ptx_gemm1 = extract::extract_entry(&ptx_gemm1_full, &args.entry_gemm1)
+        .unwrap_or_else(|e| panic!("extract gemm1 failed: {e}"));
+    let ptx_gemm2 = extract::extract_entry(&ptx_gemm2_full, &args.entry_gemm2)
+        .unwrap_or_else(|e| panic!("extract gemm2 failed: {e}"));
+
+    // Step 1: fuse_real(norm, gemm1) -> fused_12
+    let binding_12 = fuse_real::RealFuseBinding {
+        a_output_param: args.smem_a_output.clone(),
+        b_input_param: args.smem_b_input.clone(),
+    };
+    let fused_12 = fuse_real::fuse_real_kernels(
+        &ptx_norm,
+        &ptx_gemm1,
+        &args.fused_name,
+        &binding_12,
+        args.smem_elements,
+    )
+    .unwrap_or_else(|e| panic!("Phase 1+2 fusion failed: {e}"));
+
+    // Step 2: inject SiLU on Phase B's f32 stores
+    let fused_12_silu = fuse_epilogue::inject_silu_into_f32_stores(&fused_12.ptx)
+        .unwrap_or_else(|e| panic!("SiLU injection failed: {e}"));
+
+    // Step 3: append Phase C (gemm2) with GMEM handoff
+    let fused_123_name = format!("{}_3phase", args.fused_name);
+    let fused_123 = chain::append_phase_gmem(
+        &fused_12_silu,
+        &ptx_gemm2,
+        &args.gmem_b_output,
+        &args.gmem_c_input,
+        &fused_123_name,
+    )
+    .unwrap_or_else(|e| panic!("Phase 3 append failed: {e}"));
+
+    // Step 4: wrap in persistent loop
+    let persistent_name = format!("persistent_{}", fused_123_name);
+    let total_rows_full = format!("{}_{}", args.entry_gemm1, args.total_rows_param);
+    let persistent = persistent::make_persistent(&fused_123, &persistent_name, &total_rows_full)
+        .unwrap_or_else(|e| panic!("persistent wrapper failed: {e}"));
+
+    let persistent_str = persistent.as_str();
+    let const_name = syn::Ident::new(&args.const_name, proc_macro2::Span::call_site());
+
+    let output = quote! {
+        const #const_name: &str = #persistent_str;
+    };
+    output.into()
+}
+
+struct ThreePhaseArgs {
+    path_norm: String,
+    entry_norm: String,
+    path_gemm1: String,
+    entry_gemm1: String,
+    path_gemm2: String,
+    entry_gemm2: String,
+    fused_name: String,
+    smem_a_output: String,
+    smem_b_input: String,
+    gmem_b_output: String,
+    gmem_c_input: String,
+    smem_elements: usize,
+    total_rows_param: String,
+    const_name: String,
+}
+
+fn parse_3phase_args(input: &str) -> Result<ThreePhaseArgs, String> {
+    let mut strings = Vec::new();
+    let mut rest = input.trim();
+    while let Some(q1) = rest.find('"') {
+        let after = &rest[q1 + 1..];
+        let q2 = after.find('"').ok_or("unclosed quote")?;
+        strings.push(after[..q2].to_string());
+        rest = &after[q2 + 1..];
+    }
+
+    // 11 quoted strings
+    if strings.len() < 11 {
+        return Err(format!("expected 11 quoted strings, got {}", strings.len()));
+    }
+
+    let rest = rest.trim().trim_start_matches(',').trim();
+    let parts: Vec<&str> = rest.split(',').map(|s| s.trim()).collect();
+    if parts.len() < 2 {
+        return Err("expected smem_elements and CONST_NAME".to_string());
+    }
+
+    let smem_elements: usize = parts[0]
+        .trim()
+        .parse()
+        .map_err(|e| format!("bad smem_elements: {e}"))?;
+    let const_name = parts[1].trim().to_string();
+
+    Ok(ThreePhaseArgs {
+        path_norm: strings[0].clone(),
+        entry_norm: strings[1].clone(),
+        path_gemm1: strings[2].clone(),
+        entry_gemm1: strings[3].clone(),
+        path_gemm2: strings[4].clone(),
+        entry_gemm2: strings[5].clone(),
+        fused_name: strings[6].clone(),
+        smem_a_output: strings[7].clone(),
+        smem_b_input: strings[8].clone(),
+        gmem_b_output: strings[9].clone(),
+        gmem_c_input: strings[10].clone(),
+        smem_elements,
+        total_rows_param: strings
+            .get(11)
+            .cloned()
+            .unwrap_or_else(|| "param_3".to_string()),
         const_name,
     })
 }

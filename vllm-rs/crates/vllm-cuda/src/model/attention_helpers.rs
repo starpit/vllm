@@ -164,8 +164,7 @@ pub unsafe fn attention_standard(
             rotary_dim,
         )
     } else if kv_cache.is_fp8() {
-        // FP8 decode: dequant pages → contiguous FA2.
-        // TODO: fused RoPE not yet supported for FP8 path.
+        // FP8 decode: dequant pages → contiguous FA2 with fused RoPE.
         fp8_decode_attention(
             *q,
             *cu_seqlens_q,
@@ -180,6 +179,8 @@ pub unsafe fn attention_standard(
             layer_idx,
             alloc,
             stream,
+            cos_sin_cache_ptr,
+            rotary_dim,
         )
     } else {
         // BF16 paged FA2 — with optional fused RoPE for spans.
@@ -244,6 +245,8 @@ pub unsafe fn attention_decode_from_cache(
             layer_idx,
             alloc,
             stream,
+            cos_sin_cache_ptr,
+            rotary_dim,
         )
     } else {
         kernels::flash_attn_paged_ext(
@@ -328,6 +331,8 @@ pub unsafe fn attention_ext(
             layer_idx,
             alloc,
             stream,
+            cos_sin_cache_ptr,
+            rotary_dim,
         )
     } else {
         kernels::flash_attn_paged_ext(
@@ -380,6 +385,8 @@ unsafe fn fp8_decode_attention(
     layer_idx: usize,
     alloc: &mut CachingAllocator,
     stream: CUstream,
+    cos_sin_cache_ptr: *const u8,
+    rotary_dim: usize,
 ) -> OwnedTensor {
     // Check for pre-allocated graph context.
     if let Some(ctx) = FP8_GRAPH_CTX.get() {
@@ -398,6 +405,8 @@ unsafe fn fp8_decode_attention(
             ctx,
             alloc,
             stream,
+            cos_sin_cache_ptr,
+            rotary_dim,
         );
     }
 
@@ -519,8 +528,8 @@ unsafe fn fp8_decode_attention(
         window_size_left,
         alloc,
         stream,
-        std::ptr::null(),
-        0,
+        cos_sin_cache_ptr,
+        rotary_dim,
     )
 }
 
@@ -546,6 +555,8 @@ unsafe fn fp8_decode_attention_graphed(
     ctx: Fp8GraphCtx,
     alloc: &mut CachingAllocator,
     stream: CUstream,
+    cos_sin_cache_ptr: *const u8,
+    rotary_dim: usize,
 ) -> OwnedTensor {
     let batch_size = cu_seqlens_q.dim(0) - 1;
 
@@ -614,8 +625,8 @@ unsafe fn fp8_decode_attention_graphed(
         window_size_left,
         alloc,
         stream,
-        std::ptr::null(),
-        0,
+        cos_sin_cache_ptr,
+        rotary_dim,
     )
 }
 

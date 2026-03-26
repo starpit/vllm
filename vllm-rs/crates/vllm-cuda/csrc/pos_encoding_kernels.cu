@@ -678,29 +678,9 @@ __global__ void fused_qkv_interleaved_rope_cache_fp8_bf16_kernel(
         const float k_inv = 1.0f / (*k_scale);
         const float v_inv = 1.0f / (*v_scale);
 
-        // K: interleaved RoPE → FP8.
-        for (int tid = threadIdx.x; tid < nkh * num_pairs; tid += blockDim.x) {
-            const int h = tid / num_pairs;
-            const int p = tid % num_pairs;
-            const int base = h * head_size + 2 * p;
-
-            float x0 = __bfloat162float(k_row[base]);
-            float x1 = __bfloat162float(k_row[base + 1]);
-            float c = __bfloat162float(cos_ptr[p]);
-            float s = __bfloat162float(sin_ptr[p]);
-
-            float r0 = x0 * c - x1 * s;
-            float r1 = x1 * c + x0 * s;
-
-            __nv_fp8_e4m3 fp8_r0(r0 * k_inv);
-            __nv_fp8_e4m3 fp8_r1(r1 * k_inv);
-            k_dst[base]     = *reinterpret_cast<uint8_t*>(&fp8_r0);
-            k_dst[base + 1] = *reinterpret_cast<uint8_t*>(&fp8_r1);
-        }
-        for (int tid = threadIdx.x; tid < nkh * non_rot; tid += blockDim.x) {
-            const int h = tid / non_rot;
-            const int i = 2 * num_pairs + tid % non_rot;
-            k_dst[h * head_size + i] = bf16_to_fp8e4m3(k_row[h * head_size + i], k_inv);
+        // K: straight copy to FP8 cache WITHOUT RoPE. FA2 applies RoPE on read.
+        for (int tid = threadIdx.x; tid < kv_size; tid += blockDim.x) {
+            k_dst[tid] = bf16_to_fp8e4m3(k_row[tid], k_inv);
         }
 
         // V: straight FP8 quantize.
@@ -993,25 +973,13 @@ __global__ void fused_qkv_interleaved_rope_cache_kernel(
 
         const T* k_row = row + q_size;
 
-        // K: interleaved RoPE → cache.
-        for (int tid = threadIdx.x; tid < nkh * num_pairs; tid += blockDim.x) {
-            const int h = tid / num_pairs;
-            const int p = tid % num_pairs;
-            const int base = h * head_size + 2 * p;
-
-            float x0 = static_cast<float>(k_row[base]);
-            float x1 = static_cast<float>(k_row[base + 1]);
-            float c = static_cast<float>(cos_ptr[p]);
-            float s = static_cast<float>(sin_ptr[p]);
-
-            k_dst[base]     = static_cast<T>(x0 * c - x1 * s);
-            k_dst[base + 1] = static_cast<T>(x1 * c + x0 * s);
+        // K: straight copy to cache WITHOUT RoPE. FA2 applies RoPE on read.
+        const int k_vecs = kv_size / VEC;
+        for (int tid = threadIdx.x; tid < k_vecs; tid += blockDim.x) {
+            vec_store(&k_dst[tid * VEC], vec_load(&k_row[tid * VEC]));
         }
-        // Copy non-rotary K elements.
-        for (int tid = threadIdx.x; tid < nkh * non_rot; tid += blockDim.x) {
-            const int h = tid / non_rot;
-            const int i = 2 * num_pairs + tid % non_rot;
-            k_dst[h * head_size + i] = k_row[h * head_size + i];
+        for (int tid = threadIdx.x; tid < kv_size - k_vecs * VEC; tid += blockDim.x) {
+            k_dst[k_vecs * VEC + tid] = k_row[k_vecs * VEC + tid];
         }
 
         // V: straight copy to cache (vectorized).

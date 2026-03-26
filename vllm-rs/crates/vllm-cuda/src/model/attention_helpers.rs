@@ -140,6 +140,7 @@ pub unsafe fn attention_standard(
     stream: CUstream,
     cos_sin_cache_ptr: *const u8,
     rotary_dim: usize,
+    is_rotary_interleaved: bool,
 ) -> OwnedTensor {
     let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
 
@@ -162,6 +163,7 @@ pub unsafe fn attention_standard(
             stream,
             cos_sin_cache_ptr,
             rotary_dim,
+            is_rotary_interleaved,
         )
     } else if kv_cache.is_fp8() {
         // FP8 decode: dequant pages → contiguous FA2 with fused RoPE.
@@ -181,6 +183,7 @@ pub unsafe fn attention_standard(
             stream,
             cos_sin_cache_ptr,
             rotary_dim,
+            is_rotary_interleaved,
         )
     } else {
         // BF16 paged FA2 — with optional fused RoPE for spans.
@@ -203,6 +206,7 @@ pub unsafe fn attention_standard(
             stream,
             cos_sin_cache_ptr,
             rotary_dim,
+            is_rotary_interleaved,
         )
     }
 }
@@ -229,6 +233,7 @@ pub unsafe fn attention_decode_from_cache(
     stream: CUstream,
     cos_sin_cache_ptr: *const u8,
     rotary_dim: usize,
+    is_rotary_interleaved: bool,
 ) -> OwnedTensor {
     if kv_cache.is_fp8() {
         fp8_decode_attention(
@@ -247,6 +252,7 @@ pub unsafe fn attention_decode_from_cache(
             stream,
             cos_sin_cache_ptr,
             rotary_dim,
+            is_rotary_interleaved,
         )
     } else {
         kernels::flash_attn_paged_ext(
@@ -268,6 +274,7 @@ pub unsafe fn attention_decode_from_cache(
             stream,
             cos_sin_cache_ptr,
             rotary_dim,
+            is_rotary_interleaved,
         )
     }
 }
@@ -295,6 +302,7 @@ pub unsafe fn attention_ext(
     stream: CUstream,
     cos_sin_cache_ptr: *const u8,
     rotary_dim: usize,
+    is_rotary_interleaved: bool,
 ) -> OwnedTensor {
     let fresh_prefill = max_seqlen_q > 1 && max_seqlen_q == max_seqlen_k;
 
@@ -315,6 +323,7 @@ pub unsafe fn attention_ext(
             stream,
             cos_sin_cache_ptr,
             rotary_dim,
+            is_rotary_interleaved,
         )
     } else if kv_cache.is_fp8() {
         fp8_decode_attention(
@@ -333,6 +342,7 @@ pub unsafe fn attention_ext(
             stream,
             cos_sin_cache_ptr,
             rotary_dim,
+            is_rotary_interleaved,
         )
     } else {
         kernels::flash_attn_paged_ext(
@@ -354,6 +364,7 @@ pub unsafe fn attention_ext(
             stream,
             cos_sin_cache_ptr,
             rotary_dim,
+            is_rotary_interleaved,
         )
     }
 }
@@ -387,6 +398,7 @@ unsafe fn fp8_decode_attention(
     stream: CUstream,
     cos_sin_cache_ptr: *const u8,
     rotary_dim: usize,
+    is_rotary_interleaved: bool,
 ) -> OwnedTensor {
     // Check for pre-allocated graph context.
     if let Some(ctx) = FP8_GRAPH_CTX.get() {
@@ -407,6 +419,7 @@ unsafe fn fp8_decode_attention(
             stream,
             cos_sin_cache_ptr,
             rotary_dim,
+            is_rotary_interleaved,
         );
     }
 
@@ -453,6 +466,7 @@ unsafe fn fp8_decode_attention(
             stream,
             std::ptr::null(),
             0,
+            false,
         );
     }
 
@@ -530,6 +544,7 @@ unsafe fn fp8_decode_attention(
         stream,
         cos_sin_cache_ptr,
         rotary_dim,
+        is_rotary_interleaved,
     )
 }
 
@@ -557,6 +572,7 @@ unsafe fn fp8_decode_attention_graphed(
     stream: CUstream,
     cos_sin_cache_ptr: *const u8,
     rotary_dim: usize,
+    is_rotary_interleaved: bool,
 ) -> OwnedTensor {
     let batch_size = cu_seqlens_q.dim(0) - 1;
 
@@ -627,6 +643,7 @@ unsafe fn fp8_decode_attention_graphed(
         stream,
         cos_sin_cache_ptr,
         rotary_dim,
+        is_rotary_interleaved,
     )
 }
 

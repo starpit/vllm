@@ -167,42 +167,43 @@ impl CommandRAttention {
                 );
                 (q, k, v)
             } else if max_seqlen_q == 1 {
-                // Decode path: fused interleaved QKV split + RoPE + cache write.
-                let q = if kv_cache.is_fp8() {
-                    kernels::fused_qkv_interleaved_rope_cache_fp8(
-                        *qkv.view(),
-                        *positions,
-                        rotary.cos_sin_cache,
-                        *slot_mapping,
-                        *kv_cache.k_cache(attn.layer_idx),
-                        *kv_cache.v_cache(attn.layer_idx),
-                        kv_cache.k_scale_ptr(attn.layer_idx),
-                        kv_cache.v_scale_ptr(attn.layer_idx),
-                        attn.q_size,
-                        attn.kv_size,
-                        attn.num_q_heads,
-                        attn.head_dim,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                } else {
-                    kernels::fused_qkv_interleaved_rope_cache(
-                        *qkv.view(),
-                        *positions,
-                        rotary.cos_sin_cache,
-                        *slot_mapping,
-                        *kv_cache.k_cache(attn.layer_idx),
-                        *kv_cache.v_cache(attn.layer_idx),
-                        attn.q_size,
-                        attn.kv_size,
-                        attn.num_q_heads,
-                        attn.head_dim,
-                        &mut device.caching,
-                        device.compute_stream,
-                    )
-                };
+                // Decode: store K unrotated, FA2 rotates with interleaved layout.
+                let (q, k, v) = kernels::split_qkv(
+                    *qkv.view(),
+                    attn.q_size,
+                    attn.kv_size,
+                    attn.num_q_heads,
+                    attn.num_kv_heads,
+                    attn.head_dim,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
                 drop(qkv);
 
+                // Apply interleaved RoPE to Q only — K stays unrotated.
+                kernels::rotary_embedding_interleaved_q_only(
+                    q.as_gpu_tensor(),
+                    *positions,
+                    rotary.cos_sin_cache,
+                    attn.num_q_heads,
+                    attn.head_dim,
+                    device.compute_stream,
+                );
+
+                // Write unrotated K and V to cache.
+                crate::model::attention_helpers::write_kv_cache(
+                    k.view(),
+                    v.view(),
+                    slot_mapping,
+                    kv_cache,
+                    attn.layer_idx,
+                    device.compute_stream,
+                );
+                drop(k);
+                drop(v);
+
+                // FA2 with fused interleaved RoPE on cached K.
+                let rotary_dim = rotary.cos_sin_cache.dim(1);
                 let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
                     q.view(),
                     cu_seqlens_q,
@@ -211,15 +212,16 @@ impl CommandRAttention {
                     max_seqlen_q,
                     max_seqlen_k,
                     attn.scale,
-                    0.0, // no softcap for Command R
-                    -1,  // no sliding window
+                    0.0,
+                    -1,
                     kv_cache,
                     attn.layer_idx,
                     device.num_sm,
                     &mut device.caching,
                     device.compute_stream,
-                    std::ptr::null(), // TODO: CommandR interleaved RoPE not yet in FA2
-                    0,
+                    rotary.cos_sin_cache.raw_ptr() as *const u8,
+                    rotary_dim,
+                    true, // interleaved RoPE
                 );
                 drop(q);
 
@@ -233,11 +235,10 @@ impl CommandRAttention {
                 drop(attn_output);
                 return result;
             } else {
-                // Prefill or FP8 path: standard fused QKV split + interleaved RoPE.
-                let result = kernels::fused_qkv_interleaved_rope(
+                // Prefill: split QKV, apply interleaved RoPE to Q only, store K
+                // unrotated. FA2 rotates cached K with interleaved layout.
+                let (q, k, v) = kernels::split_qkv(
                     *qkv.view(),
-                    *positions,
-                    rotary.cos_sin_cache,
                     attn.q_size,
                     attn.kv_size,
                     attn.num_q_heads,
@@ -247,10 +248,63 @@ impl CommandRAttention {
                     device.compute_stream,
                 );
                 drop(qkv);
-                result
+
+                // Write unrotated K/V to cache first.
+                crate::model::attention_helpers::write_kv_cache(
+                    k.view(),
+                    v.view(),
+                    slot_mapping,
+                    kv_cache,
+                    attn.layer_idx,
+                    device.compute_stream,
+                );
+
+                // Only rotate Q — FA2 fused interleaved RoPE rotates K.
+                kernels::rotary_embedding_interleaved_q_only(
+                    q.as_gpu_tensor(),
+                    *positions,
+                    rotary.cos_sin_cache,
+                    attn.num_q_heads,
+                    attn.head_dim,
+                    device.compute_stream,
+                );
+
+                let rotary_dim = rotary.cos_sin_cache.dim(1);
+                let attn_output = crate::model::attention_helpers::attention_standard(
+                    q.view(),
+                    k.view(),
+                    v.view(),
+                    cu_seqlens_q,
+                    seqused_k,
+                    block_table,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    attn.scale,
+                    kv_cache,
+                    attn.layer_idx,
+                    device.num_sm,
+                    &mut device.caching,
+                    device.compute_stream,
+                    rotary.cos_sin_cache.raw_ptr() as *const u8,
+                    rotary_dim,
+                    true, // interleaved RoPE
+                );
+                drop(q);
+                drop(k);
+                drop(v);
+
+                let attn_flat = attn_output.view().reshape(&[num_tokens, attn.q_size]);
+                let result = attn.o_proj.forward(
+                    attn_flat,
+                    &mut device.cublas,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(attn_output);
+                return result;
             };
 
-        // Write new K/V into paged cache (BF16→FP8 when FP8 cache).
+        // QK-norm fallthrough: write K/V then run attention.
         crate::model::attention_helpers::write_kv_cache(
             k.view(),
             v.view(),
@@ -260,6 +314,9 @@ impl CommandRAttention {
             device.compute_stream,
         );
 
+        // QK-norm uses NeoX Q-only RoPE (rotary_embedding_q_only), K unrotated.
+        // Note: if CommandR QK-norm models use interleaved RoPE, this needs
+        // rotary_embedding_interleaved_q_only instead.
         let attn_output = crate::model::attention_helpers::attention_standard(
             q.view(),
             k.view(),
@@ -277,12 +334,12 @@ impl CommandRAttention {
             device.compute_stream,
             rotary.cos_sin_cache.raw_ptr() as *const u8,
             rotary.cos_sin_cache.dim(1),
+            false, // QK-norm path uses NeoX RoPE
         );
         drop(q);
         drop(k);
         drop(v);
 
-        // Reshape to [num_tokens, q_size] and output projection.
         let attn_flat = attn_output.view().reshape(&[num_tokens, attn.q_size]);
         let result = attn.o_proj.forward(
             attn_flat,

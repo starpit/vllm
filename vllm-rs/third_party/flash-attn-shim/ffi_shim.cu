@@ -193,6 +193,7 @@ extern "C" void mha_varlen_fwd(
     void *rotary_sin_ptr,
     int32_t rotary_dim,
     int32_t rotate_cached_k,
+    int32_t is_rotary_interleaved,
 
     cudaStream_t stream
 ) {
@@ -300,7 +301,7 @@ extern "C" void mha_varlen_fwd(
     params.rotary_sin_ptr = nullptr;  // unused by rotate_k_smem_contiguous
     params.rotary_dim = rotary_dim;
     params.rotate_cached_k = (rotate_cached_k != 0);
-    params.is_rotary_interleaved = false;
+    params.is_rotary_interleaved = (is_rotary_interleaved != 0);
 
     // Split-K accumulators (for num_splits > 1)
     params.softmax_lseaccum_ptr = softmax_lse_accum_ptr;

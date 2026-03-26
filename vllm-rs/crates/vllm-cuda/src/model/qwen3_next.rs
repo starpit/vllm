@@ -987,6 +987,7 @@ impl Qwen3NextFullAttention {
             stream,
             rotary.cos_sin_cache.raw_ptr() as *const u8,
             rotary.cos_sin_cache.dim(1),
+            false,
         );
         drop(k);
         drop(v);

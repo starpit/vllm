@@ -3070,6 +3070,7 @@ unsafe extern "C" {
         rotary_sin_ptr: *const c_void,
         rotary_dim: i32,
         rotate_cached_k: i32,
+        is_rotary_interleaved: i32,
 
         stream: CUstream,
     );
@@ -3179,6 +3180,7 @@ pub unsafe fn flash_attn_contiguous(
     stream: CUstream,
     cos_sin_cache_ptr: *const u8,
     rotary_dim: usize,
+    is_rotary_interleaved: bool,
 ) -> OwnedTensor {
     let total_q = q.dim(0);
     let num_heads = q.dim(1);
@@ -3236,6 +3238,7 @@ pub unsafe fn flash_attn_contiguous(
         std::ptr::null(),                   // rotary_sin_ptr (spans)
         rotary_dim as i32,                  // rotary_dim (spans)
         if cos_sin_cache_ptr.is_null() { 0 } else { 1 }, // rotate_cached_k (spans)
+        if is_rotary_interleaved { 1 } else { 0 },     // is_rotary_interleaved
         stream,
     );
 
@@ -3289,6 +3292,7 @@ pub unsafe fn flash_attn_paged(
         _stream,
         std::ptr::null(),
         0,
+        false,
     )
 }
 
@@ -3319,6 +3323,7 @@ pub unsafe fn flash_attn_paged_ext(
     _stream: CUstream,
     cos_sin_cache_ptr: *const u8,
     rotary_dim: usize,
+    is_rotary_interleaved: bool,
 ) -> OwnedTensor {
     let total_q = q.dim(0);
     let num_heads_orig = q.dim(1);
@@ -3577,6 +3582,7 @@ pub unsafe fn flash_attn_paged_ext(
         } else {
             1
         }, // rotate_cached_k
+        if is_rotary_interleaved { 1 } else { 0 }, // is_rotary_interleaved
         _stream,
     );
 
@@ -3949,6 +3955,70 @@ pub unsafe fn rotary_embedding_q_only(
             stream,
         ),
         _ => panic!("rotary_embedding_q_only: unsupported dtype {:?}", q.dtype()),
+    }
+}
+
+/// Apply interleaved RoPE in-place to Q only (K is left unrotated).
+///
+/// Same as [`rotary_embedding_q_only`] but for interleaved RoPE layout
+/// (pairs at adjacent positions 2i, 2i+1 instead of NeoX d, d+half_dim).
+///
+/// * `q`: `[num_tokens, num_q_heads * head_dim]` — rotated in-place
+/// * `positions`: `[num_tokens]` u32
+/// * `cos_sin_cache`: `[max_pos, rotary_dim]`
+pub unsafe fn rotary_embedding_interleaved_q_only(
+    q: GpuTensor,
+    positions: GpuTensor,
+    cos_sin_cache: GpuTensor,
+    num_q_heads: usize,
+    head_dim: usize,
+    stream: CUstream,
+) {
+    let num_tokens = q.dim(0);
+    let total_q_dim = (num_q_heads * head_dim) as i32;
+    let rotary_dim = cos_sin_cache.dim(1) as i32;
+
+    match q.dtype() {
+        DType::F16 => rotary_embedding_interleaved_f16(
+            positions.as_ptr(),
+            q.as_mut_ptr(),
+            q.as_mut_ptr(), // dummy K ptr (not used when total_k_dim=0)
+            cos_sin_cache.as_ptr(),
+            rotary_dim,
+            total_q_dim,
+            0, // total_k_dim = 0 → skip K rotation
+            head_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        DType::BF16 => rotary_embedding_interleaved_bf16(
+            positions.as_ptr(),
+            q.as_mut_ptr(),
+            q.as_mut_ptr(),
+            cos_sin_cache.as_ptr(),
+            rotary_dim,
+            total_q_dim,
+            0,
+            head_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        DType::F32 => rotary_embedding_interleaved_f32(
+            positions.as_ptr(),
+            q.as_mut_ptr() as *mut f32,
+            q.as_mut_ptr() as *mut f32,
+            cos_sin_cache.as_ptr() as *const f32,
+            rotary_dim,
+            total_q_dim,
+            0,
+            head_dim as i32,
+            num_tokens as i32,
+            stream,
+        ),
+        _ => panic!(
+            "rotary_embedding_interleaved_q_only: unsupported dtype {:?}",
+            q.dtype()
+        ),
     }
 }
 
@@ -5737,6 +5807,7 @@ mod tests_flash_attn {
                 std::ptr::null(), // rotary_sin_ptr (spans)
                 0,                // rotary_dim (spans)
                 0,                // rotate_cached_k (spans)
+                0,                // is_rotary_interleaved
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -5818,6 +5889,7 @@ mod tests_flash_attn {
                 std::ptr::null(), // rotary_sin_ptr (spans)
                 0,                // rotary_dim (spans)
                 0,                // rotate_cached_k (spans)
+                0,                // is_rotary_interleaved
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -5926,6 +5998,7 @@ mod tests_flash_attn {
                 std::ptr::null(), // rotary_sin_ptr (spans)
                 0,                // rotary_dim (spans)
                 0,                // rotate_cached_k (spans)
+                0,                // is_rotary_interleaved
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -6022,6 +6095,7 @@ mod tests_flash_attn {
                 std::ptr::null(), // rotary_sin_ptr (spans)
                 0,                // rotary_dim (spans)
                 0,                // rotate_cached_k (spans)
+                0,                // is_rotary_interleaved
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -6115,6 +6189,7 @@ mod tests_flash_attn {
                 std::ptr::null(), // rotary_sin_ptr (spans)
                 0,                // rotary_dim (spans)
                 0,                // rotate_cached_k (spans)
+                0,                // is_rotary_interleaved
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");
@@ -6253,6 +6328,7 @@ mod tests_flash_attn {
                     std::ptr::null(), // rotary_sin_ptr (spans)
                     0,                // rotary_dim (spans)
                     0,                // rotate_cached_k (spans)
+                0,                // is_rotary_interleaved
                     stream,
                 );
             };
@@ -6452,6 +6528,7 @@ mod tests_flash_attn {
                 std::ptr::null(), // rotary_sin_ptr (spans)
                 0,                // rotary_dim (spans)
                 0,                // rotate_cached_k (spans)
+                0,                // is_rotary_interleaved
                 stream,
             );
         };
@@ -6664,6 +6741,7 @@ mod tests_flash_attn {
                 std::ptr::null(), // rotary_sin_ptr (spans)
                 0,                // rotary_dim (spans)
                 0,                // rotate_cached_k (spans)
+                0,                // is_rotary_interleaved
                 stream,
             );
             driver::stream_synchronize(stream).expect("sync");

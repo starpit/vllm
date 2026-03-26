@@ -660,6 +660,7 @@ impl DeepSeekV2Attention {
             stream,
             std::ptr::null(), // TODO: DeepSeek interleaved RoPE not yet in FA2
             0,
+            false,
         );
         drop(k);
         drop(v);

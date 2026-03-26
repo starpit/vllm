@@ -60,6 +60,34 @@ __forceinline__ __device__ void rotate_k_smem_contiguous(
     }
 }
 
+// Interleaved RoPE layout: rotation pairs at adjacent positions (2p, 2p+1).
+// Same cos_sin_cache layout as contiguous; only sK indexing differs.
+template <typename Element, typename SmemLayout>
+__forceinline__ __device__ void rotate_k_smem_interleaved(
+    cute::Tensor<cute::ViewEngine<cute::smem_ptr<Element*>>, SmemLayout> &sK,
+    const Element* __restrict__ cos_sin_cache,  // [max_pos, rotary_dim]
+    int n_block, int kBlockN, int head_dim, int rotary_dim,
+    int tidx, int num_threads)
+{
+    const int half_dim = rotary_dim / 2;
+    const int total_work = kBlockN * half_dim;
+    for (int idx = tidx; idx < total_work; idx += num_threads) {
+        const int row = idx / half_dim;
+        const int p = idx % half_dim;
+        const int pos = n_block * kBlockN + row;
+
+        const float cos_val = static_cast<float>(cos_sin_cache[pos * rotary_dim + p]);
+        const float sin_val = static_cast<float>(cos_sin_cache[pos * rotary_dim + half_dim + p]);
+
+        // Interleaved layout: pairs at [row, 2*p] and [row, 2*p + 1]
+        const float x0 = static_cast<float>(sK(row, 2 * p));
+        const float x1 = static_cast<float>(sK(row, 2 * p + 1));
+
+        sK(row, 2 * p)     = static_cast<Element>(x0 * cos_val - x1 * sin_val);
+        sK(row, 2 * p + 1) = static_cast<Element>(x1 * cos_val + x0 * sin_val);
+    }
+}
+
 using namespace cute;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -344,11 +372,19 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // RoPE on K after loading from cache.
         if (params.rotate_cached_k && params.rotary_dim > 0) {
-            FLASH_NAMESPACE::rotate_k_smem_contiguous(
-                sK,
-                reinterpret_cast<const Element *>(params.rotary_cos_ptr),
-                n_block, kBlockN, params.d, params.rotary_dim,
-                tidx, Kernel_traits::kNThreads);
+            if (params.is_rotary_interleaved) {
+                FLASH_NAMESPACE::rotate_k_smem_interleaved(
+                    sK,
+                    reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                    n_block, kBlockN, params.d, params.rotary_dim,
+                    tidx, Kernel_traits::kNThreads);
+            } else {
+                FLASH_NAMESPACE::rotate_k_smem_contiguous(
+                    sK,
+                    reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                    n_block, kBlockN, params.d, params.rotary_dim,
+                    tidx, Kernel_traits::kNThreads);
+            }
             __syncthreads();
         }
 
@@ -430,11 +466,19 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // RoPE on K after loading from cache.
         if (params.rotate_cached_k && params.rotary_dim > 0) {
-            FLASH_NAMESPACE::rotate_k_smem_contiguous(
-                sK,
-                reinterpret_cast<const Element *>(params.rotary_cos_ptr),
-                n_block, kBlockN, params.d, params.rotary_dim,
-                tidx, Kernel_traits::kNThreads);
+            if (params.is_rotary_interleaved) {
+                FLASH_NAMESPACE::rotate_k_smem_interleaved(
+                    sK,
+                    reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                    n_block, kBlockN, params.d, params.rotary_dim,
+                    tidx, Kernel_traits::kNThreads);
+            } else {
+                FLASH_NAMESPACE::rotate_k_smem_contiguous(
+                    sK,
+                    reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                    n_block, kBlockN, params.d, params.rotary_dim,
+                    tidx, Kernel_traits::kNThreads);
+            }
             __syncthreads();
         }
 
@@ -942,11 +986,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // Spans: rotate K in shared memory before Q×K^T.
         if (params.rotate_cached_k && params.rotary_dim > 0) {
-            FLASH_NAMESPACE::rotate_k_smem_contiguous(
-                sK,
-                reinterpret_cast<const Element *>(params.rotary_cos_ptr),
-                n_block, kBlockN, params.d, params.rotary_dim,
-                tidx, Kernel_traits::kNThreads);
+            if (params.is_rotary_interleaved) {
+                FLASH_NAMESPACE::rotate_k_smem_interleaved(
+                    sK,
+                    reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                    n_block, kBlockN, params.d, params.rotary_dim,
+                    tidx, Kernel_traits::kNThreads);
+            } else {
+                FLASH_NAMESPACE::rotate_k_smem_contiguous(
+                    sK,
+                    reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                    n_block, kBlockN, params.d, params.rotary_dim,
+                    tidx, Kernel_traits::kNThreads);
+            }
             __syncthreads();
         }
 
@@ -1030,11 +1082,19 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // Spans: rotate K in shared memory before Q×K^T.
         if (params.rotate_cached_k && params.rotary_dim > 0) {
-            FLASH_NAMESPACE::rotate_k_smem_contiguous(
-                sK,
-                reinterpret_cast<const Element *>(params.rotary_cos_ptr),
-                n_block, kBlockN, params.d, params.rotary_dim,
-                tidx, Kernel_traits::kNThreads);
+            if (params.is_rotary_interleaved) {
+                FLASH_NAMESPACE::rotate_k_smem_interleaved(
+                    sK,
+                    reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                    n_block, kBlockN, params.d, params.rotary_dim,
+                    tidx, Kernel_traits::kNThreads);
+            } else {
+                FLASH_NAMESPACE::rotate_k_smem_contiguous(
+                    sK,
+                    reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                    n_block, kBlockN, params.d, params.rotary_dim,
+                    tidx, Kernel_traits::kNThreads);
+            }
             __syncthreads();
         }
 

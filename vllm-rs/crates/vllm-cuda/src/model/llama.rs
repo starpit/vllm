@@ -660,6 +660,7 @@ impl LlamaAttention {
                     device.compute_stream,
                     rotary.cos_sin_cache.raw_ptr() as *const u8,
                     rotary_dim,
+                    false,
                 );
                 drop(q);
 
@@ -736,6 +737,7 @@ impl LlamaAttention {
                     device.compute_stream,
                     rotary.cos_sin_cache.raw_ptr() as *const u8,
                     rotary_dim,
+                    false,
                 );
                 drop(q);
                 drop(k);
@@ -798,6 +800,7 @@ impl LlamaAttention {
                     device.compute_stream,
                     rotary.cos_sin_cache.raw_ptr() as *const u8,
                     rotary.cos_sin_cache.dim(1),
+                    false,
                 )
             },
         );

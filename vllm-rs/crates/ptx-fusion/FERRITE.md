@@ -35,10 +35,11 @@ Runtime overhead     JIT compile overhead   Zero launch tax       Zero launch ta
 Python graph trace   Python graph trace     Python scheduler      Rust compile time
 ```
 
-## Status: All 5 Steps Complete + Real Kernel Fusion
+## Status: All 5 Steps Complete + Real Kernel Fusion + GEMM Epilogue Injection
 
 All steps from the original roadmap are implemented and tested on an L4 GPU (sm_89)
-with CUDA 12.9. **34 CUDA tests**, all passing.
+with CUDA 12.9. **36 CUDA tests**, all passing. CUTLASS GEMM epilogue modification
+proven via ptxas validation.
 
 ### Step 1: CUDA Correctness (DONE)
 
@@ -139,14 +140,37 @@ Works for any "one block per row" kernel without dissecting the address chain.
 cargo test -p ptx-fusion --features cuda --test cuda_fuse_real -- --nocapture
 ```
 
+### GEMM Epilogue Fusion (DONE)
+
+**The critical step toward full forward pass fusion**: inject an elementwise operation
+directly into a CUTLASS GEMM's epilogue, at the PTX level.
+
+`inject_silu_epilogue!` finds every `cvt.rn.bf16x2.f32` in the GEMM epilogue (where
+f32 accumulator values are converted to bf16 output) and injects SiLU computation on
+each f32 value before conversion. The activation runs entirely in registers -- zero
+extra memory traffic, zero extra kernel launches.
+
+Tested on a real CUTLASS 2.x FP8 E4M3 GEMM (sm_89):
+- 3600-line kernel with MMA instructions, tiled epilogue, inline asm
+- 12 SiLU injection sites (24 f32 accumulator values)
+- Modified PTX passes ptxas validation
+
+This proves Ferrite can modify the output path of production GEMMs. The same
+approach works for GELU, quantization, scaling, or any elementwise epilogue op.
+
+```bash
+cargo test -p ptx-fusion --features cuda --test cuda_gemm_epilogue -- --nocapture
+```
+
 ## Crate Structure
 
 ```
 crates/ptx-fusion-macros/          Proc macro crate (runs at compile time)
-  src/lib.rs                       All proc macros: analyze, rewrite, fuse, regfuse, extract
+  src/lib.rs                       All proc macros
   src/parser.rs                    PTX parser + protocol extraction + param tracing
   src/fuse.rs                      SMEM stitching fusion engine (toy kernels)
   src/fuse_real.rs                 SMEM stitching for real nvcc PTX (vectorized, multi-pass)
+  src/fuse_epilogue.rs             GEMM epilogue injection (SiLU into CUTLASS)
   src/regfuse.rs                   Register-level fusion engine (elementwise)
   src/extract.rs                   Single-entry extraction from multi-entry PTX
 
@@ -161,6 +185,7 @@ crates/ptx-fusion/                 Library + tests
   kernels/matvec_real.ptx          nvcc-compiled: matvec with dynamic SMEM
   kernels/vllm_rms_norm.ptx        nvcc-compiled: real vllm-rs rms_norm (all specializations)
   kernels/vllm_silu_mul.ptx        nvcc-compiled: real vllm-rs silu_mul (all specializations)
+  kernels/cutlass_gemm_sm89.ptx    nvcc-compiled: CUTLASS FP8 GEMM (40 tile configs)
   tests/cuda_rewrite.rs            Register renaming correctness (2 tests)
   tests/cuda_fuse.rs               SMEM fusion correctness (1 test)
   tests/cuda_bench.rs              SMEM fusion benchmark (1 test)
@@ -170,6 +195,7 @@ crates/ptx-fusion/                 Library + tests
   tests/cuda_extract.rs            Multi-entry extraction + GPU run (4 tests)
   tests/cuda_vllm_kernels.rs       Real vllm kernel protocol + correctness (4 tests)
   tests/cuda_fuse_real.rs          Real kernel fusion correctness (1 test)
+  tests/cuda_gemm_epilogue.rs      CUTLASS GEMM epilogue SiLU injection (2 tests)
 ```
 
 ## Proc Macros
@@ -183,6 +209,7 @@ crates/ptx-fusion/                 Library + tests
 | `fuse_kernels!("a.ptx", "b.ptx", "name", "a_out", "b_in")` | SMEM fusion (toy PTX) |
 | `regfuse_kernels!("a.ptx", "b.ptx", "name", "a_out", "b_in")` | Register fusion (elementwise) |
 | `fuse_real_kernels!(...)` | SMEM fusion for real nvcc PTX (vectorized, multi-pass) |
+| `inject_silu_epilogue!("path.ptx", "entry", NAME)` | Inject SiLU into CUTLASS GEMM epilogue |
 
 ## Key Design Decisions
 
@@ -209,6 +236,13 @@ register handoff). Two kernels each using 128 registers can be sequenced in a si
 kernel that only needs 128 registers -- not 256. This makes stitching far more feasible
 than people assume.
 
+**GEMM epilogue injection via bf16 conversion interception.**
+CUTLASS GEMMs compute in f32 accumulators, then convert to bf16 via `cvt.rn.bf16x2.f32`
+before writing to GMEM. By injecting elementwise ops (SiLU, GELU, quantize) on the f32
+values just before this conversion, we fuse post-GEMM ops into the GEMM itself. The
+activation runs in registers on already-computed values -- zero extra memory traffic,
+zero extra launches. This is the key to fusing across GEMM boundaries.
+
 **Address rewriting via row_global_base subtraction.**
 Rather than dissecting each kernel's address chain, compute `row_global_base` once (the
 global address of the first element of this row), then for each store/load:
@@ -217,14 +251,59 @@ global address of the first element of this row), then for each store/load:
 
 ## What's Next
 
-- **Half/bf16 fusion**: the kernels have half and bf16 specializations in the same PTX.
-  The extraction and fusion machinery works; just need to test with fp16 data paths.
-- **Three-way chains**: fuse A -> B -> C in one pass (e.g., rms_norm -> linear_proj -> silu_mul).
-  Requires chain-aware SMEM allocation.
-- **Benchmark on real inference**: wire fused kernels into vllm-rs model execution,
-  measure end-to-end latency reduction on actual token generation.
-- **Cross-GEMM fusion**: the holy grail. Fuse normalization into GEMM's epilogue or
-  activation into GEMM's prologue. Requires understanding CUTLASS/cuBLAS PTX structure.
+The path to a single-kernel forward pass:
+
+### Immediate (machinery proven, needs integration)
+
+- **GEMM epilogue correctness test**: run the SiLU-injected CUTLASS GEMM on actual
+  data and verify output matches GEMM + separate SiLU. The PTX passes ptxas; next
+  step is GPU execution with real FP8 inputs.
+- **Generalize epilogue injection**: parameterize by activation function (GELU, quantize,
+  scale, residual add) instead of hardcoding SiLU. The injection framework is generic;
+  just need to emit different instruction sequences.
+- **GEMM prologue injection**: fuse rms_norm output into GEMM input loads. Same approach
+  as epilogue but targeting `ld.global` sites that read the A matrix.
+
+### Near-term (architecture work)
+
+- **Persistent tiled kernel**: one grid (108 blocks on L4), each block grabs tiles from
+  a work queue and runs the full pipeline: norm -> GEMM -> attn -> GEMM -> norm -> GEMM
+  -> act -> GEMM. Intermediates stay in SMEM between phases. The proc macro generates
+  the phase sequence from each kernel's PTX.
+- **Multi-phase SMEM manager**: different phases need different SMEM layouts (GEMM uses
+  SMEM for A/B tiles, norm uses SMEM for reduction). Allocate per-phase, reuse across
+  non-overlapping phases.
+- **FlashAttention fusion**: compile FA2/FA3 to PTX, extract entry, fuse RoPE into
+  the attention prologue and output projection into the epilogue.
+
+### The full forward pass vision
+
+Every op in a transformer layer is compiled to PTX. Ferrite stitches them into one
+persistent kernel at `cargo build` time. One launch per layer (or per model), all
+intermediates in SMEM/registers, zero GMEM round-trips between ops.
+
+```
+Current (9 kernel launches per layer):
+  fused_add_rms_norm -> QKV GEMM -> RoPE -> FlashAttn -> O GEMM
+  -> fused_add_rms_norm -> gate_up GEMM -> silu_mul -> down GEMM
+
+Ferrite target (1 launch per layer):
+  persistent_kernel {
+    loop {
+      tile = next_tile();
+      phase_norm(tile);           // SMEM handoff
+      phase_qkv_gemm(tile);      // epilogue injects RoPE
+      phase_attention(tile);      // reads from SMEM
+      phase_o_gemm(tile);        // epilogue injects residual+norm
+      phase_gate_up_gemm(tile);  // epilogue injects SiLU
+      phase_down_gemm(tile);     // epilogue injects residual
+    }
+  }
+```
+
+We have the source to every kernel (CUTLASS, FlashAttention, vllm-cuda csrc/).
+We can compile all of them to PTX. Ferrite can now modify GEMM epilogues.
+The remaining work is the persistent kernel framework and multi-phase SMEM management.
 
 ## Comparison with Megakernels
 

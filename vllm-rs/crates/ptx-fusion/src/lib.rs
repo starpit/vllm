@@ -8,7 +8,7 @@
 //! then transform the PTX while preserving correctness. This is the foundation for
 //! proc-macro-driven kernel fusion.
 
-pub use ptx_fusion_macros::{analyze_kernel, rewrite_kernel};
+pub use ptx_fusion_macros::{analyze_kernel, fuse_kernels, regfuse_kernels, rewrite_kernel};
 
 /// A kernel's complete protocol — everything needed to fuse it with another kernel.
 #[derive(Debug)]

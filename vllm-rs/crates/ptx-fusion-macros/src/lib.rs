@@ -2,7 +2,9 @@ use proc_macro::TokenStream;
 use quote::quote;
 use std::path::PathBuf;
 
+mod fuse;
 mod parser;
+mod regfuse;
 use parser::{KernelProtocol, PtxParser};
 
 /// Analyze a PTX kernel and emit its `KernelProtocol` as a const at compile time.
@@ -342,4 +344,132 @@ fn update_reg_declarations(ptx: &str, renames: &[(String, String)]) -> String {
     }
 
     lines.join("\n")
+}
+
+/// Fuse two PTX kernels via SMEM handoff at compile time.
+///
+/// ```rust,ignore
+/// fuse_kernels!(
+///     "kernels/rms_norm.ptx",
+///     "kernels/matvec.ptx",
+///     fused_name = "fused_rms_norm_matvec",
+///     output => input: "output" => "vec_in",
+/// );
+/// // expands to:
+/// // const FUSED_RMS_NORM_MATVEC: &str = "...fused PTX...";
+/// ```
+#[proc_macro]
+pub fn fuse_kernels(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let args = parse_fuse_args(&input_str).expect("fuse_kernels! parse error");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+
+    let ptx_a = std::fs::read_to_string(PathBuf::from(&manifest_dir).join(&args.path_a))
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", args.path_a));
+    let ptx_b = std::fs::read_to_string(PathBuf::from(&manifest_dir).join(&args.path_b))
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", args.path_b));
+
+    let binding = fuse::FuseBinding {
+        a_output_param: args.a_output.clone(),
+        b_input_param: args.b_input.clone(),
+    };
+
+    let fused = fuse::fuse_kernels(&ptx_a, &ptx_b, &args.fused_name, &binding)
+        .unwrap_or_else(|e| panic!("fusion failed: {e}"));
+
+    let fused_ptx = fused.ptx.as_str();
+    let const_name = syn::Ident::new(
+        &kernel_name_to_upper(&args.fused_name),
+        proc_macro2::Span::call_site(),
+    );
+
+    let output = quote! {
+        const #const_name: &str = #fused_ptx;
+    };
+    output.into()
+}
+
+struct FuseArgs {
+    path_a: String,
+    path_b: String,
+    fused_name: String,
+    a_output: String,
+    b_input: String,
+}
+
+fn parse_fuse_args(input: &str) -> Result<FuseArgs, String> {
+    // Parse: "path_a.ptx", "path_b.ptx", fused_name = "name", "a_output" => "b_input"
+    let input = input.trim();
+
+    // Extract quoted strings in order
+    let mut strings = Vec::new();
+    let mut rest = input;
+    while let Some(q1) = rest.find('"') {
+        let after = &rest[q1 + 1..];
+        let q2 = after.find('"').ok_or("unclosed quote")?;
+        strings.push(after[..q2].to_string());
+        rest = &after[q2 + 1..];
+    }
+
+    if strings.len() < 5 {
+        return Err(format!(
+            "expected 5 quoted strings (path_a, path_b, fused_name, a_output, b_input), got {}",
+            strings.len()
+        ));
+    }
+
+    Ok(FuseArgs {
+        path_a: strings[0].clone(),
+        path_b: strings[1].clone(),
+        fused_name: strings[2].clone(),
+        a_output: strings[3].clone(),
+        b_input: strings[4].clone(),
+    })
+}
+
+/// Register-level fusion: fuse two elementwise kernels where the intermediate
+/// stays in registers — no SMEM, no GMEM, no barrier.
+///
+/// ```rust,ignore
+/// regfuse_kernels!(
+///     "kernels/rms_norm.ptx",
+///     "kernels/scale.ptx",
+///     "fused_rms_norm_scale",
+///     "output",
+///     "input"
+/// );
+/// // expands to:
+/// // const FUSED_RMS_NORM_SCALE: &str = "...fused PTX...";
+/// ```
+#[proc_macro]
+pub fn regfuse_kernels(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let args = parse_fuse_args(&input_str).expect("regfuse_kernels! parse error");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+
+    let ptx_a = std::fs::read_to_string(PathBuf::from(&manifest_dir).join(&args.path_a))
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", args.path_a));
+    let ptx_b = std::fs::read_to_string(PathBuf::from(&manifest_dir).join(&args.path_b))
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", args.path_b));
+
+    let binding = regfuse::RegFuseBinding {
+        a_output_param: args.a_output.clone(),
+        b_input_param: args.b_input.clone(),
+    };
+
+    let fused = regfuse::regfuse_kernels(&ptx_a, &ptx_b, &args.fused_name, &binding)
+        .unwrap_or_else(|e| panic!("register fusion failed: {e}"));
+
+    let fused_ptx = fused.ptx.as_str();
+    let const_name = syn::Ident::new(
+        &kernel_name_to_upper(&args.fused_name),
+        proc_macro2::Span::call_site(),
+    );
+
+    let output = quote! {
+        const #const_name: &str = #fused_ptx;
+    };
+    output.into()
 }

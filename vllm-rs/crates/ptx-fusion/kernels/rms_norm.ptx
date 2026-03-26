@@ -1,4 +1,4 @@
-// RMSNorm kernel — the "easy" kernel
+// RMSNorm kernel - the "easy" kernel
 // Reads input from GMEM, normalizes, applies weight, writes to GMEM
 // Simple elementwise + reduction pattern, no SMEM, no MMA
 

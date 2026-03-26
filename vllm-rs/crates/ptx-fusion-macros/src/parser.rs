@@ -265,6 +265,14 @@ impl PtxParser {
         regions
     }
 
+    /// Public wrapper for trace_param_registers (used by fuse module).
+    pub fn trace_param_registers_pub(
+        lines: &[&str],
+        params: &[KernelParam],
+    ) -> BTreeMap<String, String> {
+        Self::trace_param_registers(lines, params)
+    }
+
     /// Trace which registers hold pointers loaded from params.
     /// e.g., `ld.param.u64 %rd0, [input];` → %rd0 maps to "input"
     fn trace_param_registers(lines: &[&str], _params: &[KernelParam]) -> BTreeMap<String, String> {

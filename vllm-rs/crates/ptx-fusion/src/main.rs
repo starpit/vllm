@@ -1,4 +1,4 @@
-use ptx_fusion::{analyze_kernel, rewrite_kernel};
+use ptx_fusion::{analyze_kernel, fuse_kernels, regfuse_kernels, rewrite_kernel};
 
 // ── Step 1: Analyze both kernels ─────────────────────────────────────
 
@@ -28,6 +28,26 @@ rewrite_kernel!("kernels/matvec.ptx", {
     "%r5" => "%r50",
     "%rd3" => "%rd50"
 });
+
+// ── Step 4: Fuse rms_norm → matvec via SMEM handoff ─────────────────
+
+fuse_kernels!(
+    "kernels/rms_norm.ptx",
+    "kernels/matvec.ptx",
+    "fused_rms_norm_matvec",
+    "output",
+    "vec_in"
+);
+
+// ── Step 5: Register-level fusion (rms_norm → scale) ────────────────
+
+regfuse_kernels!(
+    "kernels/rms_norm.ptx",
+    "kernels/scale.ptx",
+    "regfused_rms_norm_scale",
+    "output",
+    "input"
+);
 
 fn main() {
     println!("=== PTX Fusion Protocol Extraction POC ===\n");
@@ -60,6 +80,22 @@ fn main() {
     for (i, line) in MATVEC_REWRITTEN.lines().take(30).enumerate() {
         println!("  {:3}: {}", i + 1, line);
     }
+
+    println!("\n\n=== FUSED KERNEL PTX ===\n");
+    for (i, line) in FUSED_RMS_NORM_MATVEC.lines().enumerate() {
+        println!("  {:3}: {}", i + 1, line);
+    }
+
+    // Write fused PTX to file for ptxas validation
+    std::fs::write("/tmp/fused_rms_norm_matvec.ptx", FUSED_RMS_NORM_MATVEC).unwrap();
+    println!("\n  Written to /tmp/fused_rms_norm_matvec.ptx");
+
+    println!("\n\n=== REGISTER-FUSED KERNEL PTX ===\n");
+    for (i, line) in REGFUSED_RMS_NORM_SCALE.lines().enumerate() {
+        println!("  {:3}: {}", i + 1, line);
+    }
+    std::fs::write("/tmp/regfused_rms_norm_scale.ptx", REGFUSED_RMS_NORM_SCALE).unwrap();
+    println!("\n  Written to /tmp/regfused_rms_norm_scale.ptx");
 }
 
 fn validate_protocols_match(

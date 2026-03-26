@@ -1,0 +1,44 @@
+// Scale kernel - multiply each element by a scalar
+// Pure elementwise: thread i reads input[i], writes input[i] * scale to output[i]
+
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry scale(
+    .param .u64 input,
+    .param .u64 output,
+    .param .u32 n,
+    .param .f32 scale_val
+)
+{
+    .reg .f32 %f<8>;
+    .reg .u32 %r<8>;
+    .reg .u64 %rd<8>;
+    .reg .pred %p<4>;
+
+    ld.param.u64 %rd0, [input];
+    ld.param.u64 %rd1, [output];
+    ld.param.u32 %r0, [n];
+    ld.param.f32 %f0, [scale_val];
+
+    mov.u32 %r1, %tid.x;
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mad.lo.u32 %r4, %r2, %r3, %r1;
+
+    setp.ge.u32 %p0, %r4, %r0;
+    @%p0 bra EXIT;
+
+    mul.wide.u32 %rd2, %r4, 4;
+    add.u64 %rd3, %rd0, %rd2;
+    ld.global.f32 %f1, [%rd3];
+
+    mul.f32 %f2, %f1, %f0;
+
+    add.u64 %rd4, %rd1, %rd2;
+    st.global.f32 [%rd4], %f2;
+
+EXIT:
+    ret;
+}

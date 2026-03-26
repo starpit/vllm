@@ -107,7 +107,7 @@ byteorder = "1"
 # Tensor ops
 candle-core = { version = "0.9", default-features = false }
 # CUDA (NVIDIA GPU) — must match candle-core's cudarc version
-cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "f16"] }
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "f16", "cuda-12090"] }
 safetensors = "0.7"
 half = "2.7"
 memmap2 = "0.9"

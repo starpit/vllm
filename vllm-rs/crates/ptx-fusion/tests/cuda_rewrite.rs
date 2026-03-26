@@ -1,11 +1,12 @@
 //! CUDA tests: verify that register-rewritten PTX produces identical results.
 //!
-//! Run with: cargo test -p ptx-fusion --features cuda
+//! Run with: cargo test -p ptx-fusion --features cuda -- --nocapture
 
 #![cfg(feature = "cuda")]
 
-use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
-use ptx_fusion_macros::{analyze_kernel, rewrite_kernel};
+use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::nvrtc::Ptx;
+use ptx_fusion_macros::rewrite_kernel;
 use std::sync::Arc;
 
 // ── Compile-time: extract original + rewritten PTX ──────────────────
@@ -31,8 +32,8 @@ rewrite_kernel!("kernels/matvec.ptx", {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn get_device() -> Arc<CudaDevice> {
-    CudaDevice::new(0).expect("no CUDA device available")
+fn get_ctx() -> Arc<CudaContext> {
+    CudaContext::new(0).expect("no CUDA device available")
 }
 
 fn assert_f32_eq(a: &[f32], b: &[f32], kernel_name: &str, tol: f32) {
@@ -50,7 +51,7 @@ fn assert_f32_eq(a: &[f32], b: &[f32], kernel_name: &str, tol: f32) {
 
 #[test]
 fn rms_norm_rewrite_matches() {
-    let dev = get_device();
+    let ctx = get_ctx();
     let n = 256u32;
     let epsilon = 1e-5f32;
 
@@ -59,11 +60,11 @@ fn rms_norm_rewrite_matches() {
     let weight_data: Vec<f32> = (0..n).map(|i| 1.0 + (i as f32) * 0.01).collect();
 
     // Run original kernel
-    let output_orig = run_rms_norm(&dev, RMS_NORM_PTX, &input_data, &weight_data, n, epsilon);
+    let output_orig = run_rms_norm(&ctx, RMS_NORM_PTX, &input_data, &weight_data, n, epsilon);
 
     // Run rewritten kernel
     let output_rewritten = run_rms_norm(
-        &dev,
+        &ctx,
         RMS_NORM_REWRITTEN,
         &input_data,
         &weight_data,
@@ -84,34 +85,45 @@ fn rms_norm_rewrite_matches() {
 }
 
 fn run_rms_norm(
-    dev: &Arc<CudaDevice>,
+    ctx: &Arc<CudaContext>,
     ptx: &str,
     input: &[f32],
     weight: &[f32],
     n: u32,
     epsilon: f32,
 ) -> Vec<f32> {
-    dev.load_ptx(ptx.into(), "rms_norm_mod", &["rms_norm"])
+    let stream = ctx.default_stream();
+    let module = ctx
+        .load_module(Ptx::from_src(ptx))
         .expect("failed to load PTX");
+    let func = module.load_function("rms_norm").unwrap();
 
-    let input_gpu = dev.htod_copy(input.to_vec()).unwrap();
-    let weight_gpu = dev.htod_copy(weight.to_vec()).unwrap();
-    let mut output_gpu: CudaSlice<f32> = dev.alloc_zeros(n as usize).unwrap();
+    let input_gpu = stream.clone_htod(input).unwrap();
+    let weight_gpu = stream.clone_htod(weight).unwrap();
+    let mut output_gpu: CudaSlice<f32> = stream.alloc_zeros(n as usize).unwrap();
 
-    let func = dev.get_func("rms_norm_mod", "rms_norm").unwrap();
     let cfg = LaunchConfig::for_num_elems(n);
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&input_gpu)
+            .arg(&mut output_gpu)
+            .arg(&weight_gpu)
+            .arg(&n)
+            .arg(&epsilon)
+            .launch(cfg)
+    }
+    .expect("kernel launch failed");
 
-    unsafe { func.launch(cfg, (&input_gpu, &mut output_gpu, &weight_gpu, n, epsilon)) }
-        .expect("kernel launch failed");
-
-    dev.dtoh_sync_copy(&output_gpu).unwrap()
+    stream.synchronize().unwrap();
+    stream.clone_dtoh(&output_gpu).unwrap()
 }
 
 // ── Test: Matvec original vs rewritten ──────────────────────────────
 
 #[test]
 fn matvec_rewrite_matches() {
-    let dev = get_device();
+    let ctx = get_ctx();
     let m = 64u32; // output rows
     let k = 128u32; // inner dimension
 
@@ -120,10 +132,10 @@ fn matvec_rewrite_matches() {
     let vec_data: Vec<f32> = (0..k).map(|i| (i as f32 + 1.0) * 0.1).collect();
 
     // Run original kernel
-    let output_orig = run_matvec(&dev, MATVEC_PTX, &matrix_data, &vec_data, m, k);
+    let output_orig = run_matvec(&ctx, MATVEC_PTX, &matrix_data, &vec_data, m, k);
 
     // Run rewritten kernel
-    let output_rewritten = run_matvec(&dev, MATVEC_REWRITTEN, &matrix_data, &vec_data, m, k);
+    let output_rewritten = run_matvec(&ctx, MATVEC_REWRITTEN, &matrix_data, &vec_data, m, k);
 
     // FMA ordering might differ very slightly, use small tolerance
     assert_f32_eq(&output_orig, &output_rewritten, "matvec", 0.0);
@@ -139,33 +151,44 @@ fn matvec_rewrite_matches() {
 }
 
 fn run_matvec(
-    dev: &Arc<CudaDevice>,
+    ctx: &Arc<CudaContext>,
     ptx: &str,
     matrix: &[f32],
     vec_in: &[f32],
     m: u32,
     k: u32,
 ) -> Vec<f32> {
-    dev.load_ptx(ptx.into(), "matvec_mod", &["matvec"])
+    let stream = ctx.default_stream();
+    let module = ctx
+        .load_module(Ptx::from_src(ptx))
         .expect("failed to load PTX");
+    let func = module.load_function("matvec").unwrap();
 
-    let matrix_gpu = dev.htod_copy(matrix.to_vec()).unwrap();
-    let vec_gpu = dev.htod_copy(vec_in.to_vec()).unwrap();
-    let mut output_gpu: CudaSlice<f32> = dev.alloc_zeros(m as usize).unwrap();
-
-    let func = dev.get_func("matvec_mod", "matvec").unwrap();
+    let matrix_gpu = stream.clone_htod(matrix).unwrap();
+    let vec_gpu = stream.clone_htod(vec_in).unwrap();
+    let mut output_gpu: CudaSlice<f32> = stream.alloc_zeros(m as usize).unwrap();
 
     // Need at least K threads per block for the shared memory vector load
     let block_size = k.max(64);
-    let grid_size = (m + block_size - 1) / block_size;
+    let grid_size = m.div_ceil(block_size);
     let cfg = LaunchConfig {
         grid_dim: (grid_size, 1, 1),
         block_dim: (block_size, 1, 1),
         shared_mem_bytes: 0, // statically allocated in PTX
     };
 
-    unsafe { func.launch(cfg, (&matrix_gpu, &vec_gpu, &mut output_gpu, m, k)) }
-        .expect("kernel launch failed");
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&matrix_gpu)
+            .arg(&vec_gpu)
+            .arg(&mut output_gpu)
+            .arg(&m)
+            .arg(&k)
+            .launch(cfg)
+    }
+    .expect("kernel launch failed");
 
-    dev.dtoh_sync_copy(&output_gpu).unwrap()
+    stream.synchronize().unwrap();
+    stream.clone_dtoh(&output_gpu).unwrap()
 }

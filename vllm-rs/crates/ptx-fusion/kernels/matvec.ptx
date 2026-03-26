@@ -1,4 +1,4 @@
-// Matvec kernel — the "hard" kernel
+// Matvec kernel - the "hard" kernel
 // Matrix-vector multiply with shared memory, barriers, and loop structure
 // Reads matrix + vector from GMEM, uses SMEM for vector caching, writes result to GMEM
 

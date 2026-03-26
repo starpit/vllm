@@ -21,16 +21,17 @@ pub fn inject_silu_into_epilogue(ptx: &str) -> Result<String, String> {
 
         // Match: cvt.rn.bf16x2.f32 %rN, %fA, %fB;
         if trimmed.starts_with("cvt.rn.bf16x2.f32")
-            && let Some((_dest, src_a, src_b)) = parse_bf16_cvt(trimmed) {
-                scratch_needed = true;
-                // Inject SiLU on both source f32 registers
-                result.push("\t// FERRITE: inject SiLU before bf16 conversion".to_string());
-                emit_silu_inplace(&mut result, &src_a);
-                emit_silu_inplace(&mut result, &src_b);
-                // Then the original conversion
-                result.push(format!("\t{trimmed}"));
-                continue;
-            }
+            && let Some((_dest, src_a, src_b)) = parse_bf16_cvt(trimmed)
+        {
+            scratch_needed = true;
+            // Inject SiLU on both source f32 registers
+            result.push("\t// FERRITE: inject SiLU before bf16 conversion".to_string());
+            emit_silu_inplace(&mut result, &src_a);
+            emit_silu_inplace(&mut result, &src_b);
+            // Then the original conversion
+            result.push(format!("\t{trimmed}"));
+            continue;
+        }
 
         result.push(line.to_string());
     }
@@ -74,6 +75,84 @@ pub fn inject_silu_into_epilogue(ptx: &str) -> Result<String, String> {
     }
 
     Ok(output.join("\n"))
+}
+
+/// Inject SiLU before each `st.global.f32` store in an f32 GEMM.
+///
+/// For each `st.global.f32 [addr], %fN;`, inserts SiLU(%fN) in-place before the store.
+pub fn inject_silu_into_f32_stores(ptx: &str) -> Result<String, String> {
+    let lines: Vec<&str> = ptx.lines().collect();
+    let mut result = Vec::new();
+    let mut scratch_needed = false;
+
+    for line in lines.iter() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("st.global.f32")
+            || (trimmed.starts_with("@") && trimmed.contains("st.global.f32"))
+        {
+            // Extract the value register: st.global.f32 [addr], %fN;
+            if let Some(val_reg) = extract_store_value_f32(trimmed) {
+                scratch_needed = true;
+                result.push("\t// FERRITE: inject SiLU before f32 store".to_string());
+                emit_silu_inplace(&mut result, &val_reg);
+                result.push(format!("\t{trimmed}"));
+                continue;
+            }
+        }
+
+        result.push(line.to_string());
+    }
+
+    if !scratch_needed {
+        return Err("no st.global.f32 sites found".into());
+    }
+
+    // Insert scratch register declarations
+    let mut output = Vec::new();
+    let mut in_initial_regs = false;
+    let mut inserted_scratch = false;
+
+    for line in &result {
+        let t = line.trim();
+        if t == "{" || t.ends_with('{') {
+            in_initial_regs = true;
+        }
+        if in_initial_regs
+            && !inserted_scratch
+            && !t.starts_with(".reg")
+            && !t.starts_with(".shared")
+            && !t.starts_with(".local")
+            && !t.starts_with("//")
+            && !t.is_empty()
+            && !t.starts_with("{")
+        {
+            output.push("\t// FERRITE: scratch registers for SiLU injection".to_string());
+            output.push("\t.reg .f32 \t%f_silu<4>;".to_string());
+            output.push("\t.reg .b32 \t%r_silu<2>;".to_string());
+            inserted_scratch = true;
+        }
+        output.push(line.clone());
+    }
+
+    Ok(output.join("\n"))
+}
+
+/// Extract the value register from `st.global.f32 [addr], %fN;`
+fn extract_store_value_f32(instr: &str) -> Option<String> {
+    // Might be predicated: @%p1 st.global.f32 [%rd10], %f30;
+    // The value register is the last token before the semicolon
+    let parts: Vec<&str> = instr
+        .split([',', ' ', '\t'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    if let Some(last) = parts.last() {
+        let val = last.trim_end_matches(';');
+        if val.starts_with("%f") {
+            return Some(val.to_string());
+        }
+    }
+    None
 }
 
 /// Parse `cvt.rn.bf16x2.f32 %rN, %fA, %fB;`

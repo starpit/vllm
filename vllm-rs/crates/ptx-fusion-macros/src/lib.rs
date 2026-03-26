@@ -705,7 +705,9 @@ pub fn inject_silu_epilogue(input: TokenStream) -> TokenStream {
     let extracted = extract::extract_entry(&ptx_source, &args.1)
         .unwrap_or_else(|e| panic!("extract_entry failed: {e}"));
 
+    // Try bf16x2 injection first, fall back to f32 store injection
     let modified = fuse_epilogue::inject_silu_into_epilogue(&extracted)
+        .or_else(|_| fuse_epilogue::inject_silu_into_f32_stores(&extracted))
         .unwrap_or_else(|e| panic!("SiLU injection failed: {e}"));
 
     let modified_str = modified.as_str();

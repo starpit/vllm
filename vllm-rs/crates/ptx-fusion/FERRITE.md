@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **37 CUDA tests**, all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **49 tests** (39 CUDA GPU + 10 unit), all passing.
 
 ### What's Proven
 
@@ -75,8 +75,9 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **37 CUDA tests**, all passing.
 | SMEM stitching (real) | cuda_fuse_real | vllm rms_norm -> silu_mul, zero diff |
 | Register fusion | cuda_regfuse | rms_norm -> scale, bitwise identical, 2.16x speedup |
 | Extract from multi-entry PTX | cuda_extract | Single entry from 40-entry CUTLASS PTX |
-| GEMM epilogue injection (ptxas) | cuda_gemm_epilogue | SiLU into CUTLASS FP8 GEMM, valid assembly |
-| GEMM epilogue injection (GPU) | cuda_gemm_silu_correctness | Ferrite vs nvcc: **0.00e0 diff** |
+| GEMM epilogue injection (ptxas) | cuda_gemm_epilogue | SiLU, GELU, ReLU into CUTLASS GEMM, valid assembly |
+| GEMM epilogue SiLU (GPU) | cuda_gemm_silu_correctness | Ferrite vs nvcc: **0.00e0 diff** |
+| GEMM epilogue GELU (GPU) | cuda_gemm_gelu_correctness | Ferrite vs nvcc: **4.77e-7 diff** |
 | Stress tests | cuda_stress | n=1 to n=4096, 100-run determinism |
 
 ### Benchmarks
@@ -88,10 +89,11 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **37 CUDA tests**, all passing.
 
 ### The GEMM Epilogue Result
 
-The most important proof: Ferrite-injected GEMM+SiLU produces **bitwise identical**
-output to nvcc's hand-written GEMM+SiLU. The proc macro finds `st.global.f32` sites
-in the GEMM PTX, injects SiLU on the value register before the store, and the
-modified kernel produces exactly the same bits as native code.
+Ferrite-injected GEMM+SiLU produces **bitwise identical** output to nvcc's hand-written
+GEMM+SiLU (0.00e0 diff). GEMM+GELU matches nvcc within 4.77e-7. The `inject_epilogue!`
+macro is parameterized: `inject_epilogue!("gemm.ptx", "entry", Gelu, NAME)` works for
+SiLU, GELU, and ReLU. All three pass ptxas validation on CUTLASS bf16 GEMM (12 injection
+sites each).
 
 This means we can fuse arbitrary elementwise ops into any GEMM's output path
 without writing custom CUDA code. The GEMM is a black box. We only touch the
@@ -143,7 +145,7 @@ crates/ptx-fusion-macros/          Proc macro crate (runs at compile time)
   src/parser.rs                    PTX parser + escape perimeter extraction
   src/fuse.rs                      SMEM stitching fusion engine (toy kernels)
   src/fuse_real.rs                 SMEM stitching for real nvcc PTX (vectorized, multi-pass)
-  src/fuse_epilogue.rs             GEMM epilogue injection (SiLU into CUTLASS)
+  src/fuse_epilogue.rs             GEMM epilogue injection (parameterized: SiLU, GELU, ReLU)
   src/regfuse.rs                   Register-level fusion engine (elementwise)
   src/extract.rs                   Single-entry extraction from multi-entry PTX
 
@@ -152,7 +154,7 @@ crates/ptx-fusion/                 Library + tests
   src/main.rs                      Demo: extract + rewrite + fuse + validate
   build.rs                         Compiles vllm-cuda csrc/ kernels to PTX at build time
   kernels/                         Hand-written, nvcc-compiled, and CUTLASS PTX files
-  tests/                           37 CUDA GPU tests
+  tests/                           39 CUDA GPU tests
 ```
 
 ## Proc Macros
@@ -166,17 +168,17 @@ crates/ptx-fusion/                 Library + tests
 | `fuse_kernels!(...)` | SMEM stitching (redirect output stores -> SMEM -> input loads) |
 | `regfuse_kernels!(...)` | Register fusion (output register -> input register, zero memory) |
 | `fuse_real_kernels!(...)` | SMEM stitching for real nvcc PTX (vectorized, multi-pass) |
-| `inject_silu_epilogue!(...)` | Inject SiLU into GEMM epilogue (intercept output values) |
+| `inject_epilogue!("path", "entry", Gelu, NAME)` | Inject activation into GEMM epilogue (SiLU, GELU, ReLU) |
+| `inject_silu_epilogue!(...)` | Convenience wrapper: inject SiLU into GEMM epilogue |
 
 ## What's Next
 
 ### Immediate
 
-- **Generalize epilogue injection**: parameterize by activation function (GELU, quantize,
-  scale, residual add). The injection framework is generic -- just emit different
-  instruction sequences per op.
 - **GEMM prologue injection**: fuse rms_norm output into GEMM input loads. Same escape
   analysis -- intercept `ld.global` on the A matrix and redirect from SMEM.
+- **More epilogue ops**: add quantize (f32->fp8), scale, residual add to `ActivationFn`.
+  The framework is parameterized -- just add emission functions.
 
 ### Near-term
 

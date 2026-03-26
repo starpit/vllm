@@ -506,6 +506,27 @@ pub fn extract_entry(input: TokenStream) -> TokenStream {
     output.into()
 }
 
+fn parse_epilogue_args(input: &str) -> Result<(String, String, String, String), String> {
+    // Parse: "path.ptx", "entry_name", Activation, CONST_NAME
+    let mut strings = Vec::new();
+    let mut rest = input.trim();
+    for _ in 0..2 {
+        let q1 = rest.find('"').ok_or("expected quote")?;
+        let after = &rest[q1 + 1..];
+        let q2 = after.find('"').ok_or("unclosed quote")?;
+        strings.push(after[..q2].to_string());
+        rest = after[q2 + 1..].trim().trim_start_matches(',').trim();
+    }
+    let comma_pos = rest.find(',').ok_or("expected comma after activation")?;
+    let act_str = rest[..comma_pos].trim().to_string();
+    rest = rest[comma_pos + 1..].trim();
+    let name = rest.trim().to_string();
+    if name.is_empty() {
+        return Err("expected CONST_NAME".to_string());
+    }
+    Ok((strings[0].clone(), strings[1].clone(), act_str, name))
+}
+
 fn parse_extract_args(input: &str) -> Result<(String, String, String), String> {
     // Parse: "path.ptx", "entry_name", CONST_NAME
     let mut strings = Vec::new();
@@ -679,10 +700,56 @@ fn parse_fuse_real_args(input: &str) -> Result<FuseRealArgs, String> {
     })
 }
 
+/// Inject an activation function into a GEMM epilogue at compile time.
+///
+/// Extracts a single entry from a multi-entry PTX file, then injects the
+/// specified activation on every f32 value before bf16 conversion or f32 store.
+///
+/// ```rust,ignore
+/// inject_epilogue!(
+///     "kernels/cutlass_gemm_sm89.ptx",
+///     "GemmShapeILi64ELi128ELi64",   // entry substring
+///     Gelu,                           // activation: Silu, Gelu, or Relu
+///     CUTLASS_GEMM_WITH_GELU
+/// );
+/// ```
+#[proc_macro]
+pub fn inject_epilogue(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let args = parse_epilogue_args(&input_str)
+        .expect("inject_epilogue! expects (\"path.ptx\", \"entry\", Activation, CONST_NAME)");
+
+    let act = fuse_epilogue::ActivationFn::from_str(&args.2).unwrap_or_else(|| {
+        panic!(
+            "unknown activation: '{}' (expected Silu, Gelu, or Relu)",
+            args.2
+        )
+    });
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let ptx_path = PathBuf::from(&manifest_dir).join(&args.0);
+    let ptx_source = std::fs::read_to_string(&ptx_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ptx_path.display()));
+
+    let extracted = extract::extract_entry(&ptx_source, &args.1)
+        .unwrap_or_else(|e| panic!("extract_entry failed: {e}"));
+
+    let modified = fuse_epilogue::inject_activation_into_epilogue(&extracted, act)
+        .or_else(|_| fuse_epilogue::inject_activation_into_f32_stores(&extracted, act))
+        .unwrap_or_else(|e| panic!("{} injection failed: {e}", act.name()));
+
+    let modified_str = modified.as_str();
+    let const_name = syn::Ident::new(&args.3, proc_macro2::Span::call_site());
+
+    let output = quote! {
+        const #const_name: &str = #modified_str;
+    };
+    output.into()
+}
+
 /// Inject SiLU activation into a CUTLASS GEMM epilogue at compile time.
 ///
-/// Extracts a single entry from a multi-entry PTX file, then injects SiLU
-/// on every f32 value before bf16 conversion in the epilogue.
+/// Convenience wrapper around `inject_epilogue!` with SiLU hardcoded.
 ///
 /// ```rust,ignore
 /// inject_silu_epilogue!(
@@ -705,9 +772,9 @@ pub fn inject_silu_epilogue(input: TokenStream) -> TokenStream {
     let extracted = extract::extract_entry(&ptx_source, &args.1)
         .unwrap_or_else(|e| panic!("extract_entry failed: {e}"));
 
-    // Try bf16x2 injection first, fall back to f32 store injection
-    let modified = fuse_epilogue::inject_silu_into_epilogue(&extracted)
-        .or_else(|_| fuse_epilogue::inject_silu_into_f32_stores(&extracted))
+    let act = fuse_epilogue::ActivationFn::Silu;
+    let modified = fuse_epilogue::inject_activation_into_epilogue(&extracted, act)
+        .or_else(|_| fuse_epilogue::inject_activation_into_f32_stores(&extracted, act))
         .unwrap_or_else(|e| panic!("SiLU injection failed: {e}"));
 
     let modified_str = modified.as_str();

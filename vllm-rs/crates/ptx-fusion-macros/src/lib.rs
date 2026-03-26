@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 pub(crate) mod extract;
 mod fuse;
+pub(crate) mod fuse_real;
 mod parser;
 mod regfuse;
 use parser::{KernelProtocol, PtxParser};
@@ -568,4 +569,111 @@ pub fn regfuse_kernels(input: TokenStream) -> TokenStream {
         const #const_name: &str = #fused_ptx;
     };
     output.into()
+}
+
+/// Fuse two real nvcc-compiled kernels via SMEM handoff.
+///
+/// Takes multi-entry PTX files + entry name substrings to select the right specialization.
+///
+/// ```rust,ignore
+/// fuse_real_kernels!(
+///     "kernels/vllm_rms_norm.ptx", "rms_norm_kernelIfE",
+///     "kernels/vllm_silu_mul.ptx", "act_and_mul_kernelIXadL_Z4silufEEfE",
+///     "fused_rms_silu",
+///     "param_0",  // A's output param (substring match)
+///     "param_1",  // B's input param (substring match)
+///     1024,       // SMEM handoff buffer size (elements)
+///     FUSED_RMS_SILU
+/// );
+/// ```
+#[proc_macro]
+pub fn fuse_real_kernels(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let args = parse_fuse_real_args(&input_str).expect("fuse_real_kernels! parse error");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+
+    let ptx_a_full = std::fs::read_to_string(PathBuf::from(&manifest_dir).join(&args.path_a))
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", args.path_a));
+    let ptx_b_full = std::fs::read_to_string(PathBuf::from(&manifest_dir).join(&args.path_b))
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", args.path_b));
+
+    // Extract single entries
+    let ptx_a = extract::extract_entry(&ptx_a_full, &args.entry_a)
+        .unwrap_or_else(|e| panic!("extract A failed: {e}"));
+    let ptx_b = extract::extract_entry(&ptx_b_full, &args.entry_b)
+        .unwrap_or_else(|e| panic!("extract B failed: {e}"));
+
+    let binding = fuse_real::RealFuseBinding {
+        a_output_param: args.a_output.clone(),
+        b_input_param: args.b_input.clone(),
+    };
+
+    let fused = fuse_real::fuse_real_kernels(
+        &ptx_a,
+        &ptx_b,
+        &args.fused_name,
+        &binding,
+        args.smem_elements,
+    )
+    .unwrap_or_else(|e| panic!("real fusion failed: {e}"));
+
+    let fused_ptx = fused.ptx.as_str();
+    let const_name = syn::Ident::new(&args.const_name, proc_macro2::Span::call_site());
+
+    let output = quote! {
+        const #const_name: &str = #fused_ptx;
+    };
+    output.into()
+}
+
+struct FuseRealArgs {
+    path_a: String,
+    entry_a: String,
+    path_b: String,
+    entry_b: String,
+    fused_name: String,
+    a_output: String,
+    b_input: String,
+    smem_elements: usize,
+    const_name: String,
+}
+
+fn parse_fuse_real_args(input: &str) -> Result<FuseRealArgs, String> {
+    let mut strings = Vec::new();
+    let mut rest = input.trim();
+    while let Some(q1) = rest.find('"') {
+        let after = &rest[q1 + 1..];
+        let q2 = after.find('"').ok_or("unclosed quote")?;
+        strings.push(after[..q2].to_string());
+        rest = &after[q2 + 1..];
+    }
+
+    if strings.len() < 7 {
+        return Err(format!("expected 7 quoted strings, got {}", strings.len()));
+    }
+
+    let rest = rest.trim().trim_start_matches(',').trim();
+    let parts: Vec<&str> = rest.split(',').map(|s| s.trim()).collect();
+    if parts.len() < 2 {
+        return Err("expected smem_elements and CONST_NAME after quoted strings".to_string());
+    }
+
+    let smem_elements: usize = parts[0]
+        .trim()
+        .parse()
+        .map_err(|e| format!("bad smem_elements: {e}"))?;
+    let const_name = parts[1].trim().to_string();
+
+    Ok(FuseRealArgs {
+        path_a: strings[0].clone(),
+        entry_a: strings[1].clone(),
+        path_b: strings[2].clone(),
+        entry_b: strings[3].clone(),
+        fused_name: strings[4].clone(),
+        a_output: strings[5].clone(),
+        b_input: strings[6].clone(),
+        smem_elements,
+        const_name,
+    })
 }

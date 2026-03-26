@@ -34,6 +34,36 @@ pub fn analyze_kernel(input: TokenStream) -> TokenStream {
     tokens.into()
 }
 
+/// Like `analyze_kernel!` but lets you specify the const name.
+/// Useful for nvcc-compiled PTX with mangled kernel names.
+///
+/// ```rust,ignore
+/// analyze_kernel_as!("kernels/vllm_rms_norm.ptx", VLLM_RMS_NORM);
+/// // expands to:
+/// // const VLLM_RMS_NORM: ptx_fusion::KernelProtocol = KernelProtocol { ... };
+/// ```
+#[proc_macro]
+pub fn analyze_kernel_as(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+
+    // Parse: "path.ptx", CONST_NAME
+    let (path_str, const_name_str) = parse_path_and_name(&input_str)
+        .expect("analyze_kernel_as! expects (\"path.ptx\", CONST_NAME)");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let ptx_path = PathBuf::from(&manifest_dir).join(&path_str);
+
+    let ptx_source = std::fs::read_to_string(&ptx_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ptx_path.display()));
+
+    let protocol = PtxParser::parse(&ptx_source)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {e}", ptx_path.display()));
+
+    let const_name = syn::Ident::new(&const_name_str, proc_macro2::Span::call_site());
+    let tokens = protocol_to_const_tokens(&protocol, &const_name);
+    tokens.into()
+}
+
 /// Rewrite a PTX kernel's registers according to a rename map, proving we can
 /// transform PTX programmatically. Emits the rewritten PTX as a `&str` const.
 ///
@@ -426,6 +456,21 @@ fn parse_fuse_args(input: &str) -> Result<FuseArgs, String> {
         a_output: strings[3].clone(),
         b_input: strings[4].clone(),
     })
+}
+
+fn parse_path_and_name(input: &str) -> Result<(String, String), String> {
+    // Parse: "path.ptx", CONST_NAME
+    let input = input.trim();
+    let q1 = input.find('"').ok_or("expected opening quote")?;
+    let rest = &input[q1 + 1..];
+    let q2 = rest.find('"').ok_or("expected closing quote")?;
+    let path = rest[..q2].to_string();
+    let after = rest[q2 + 1..].trim().trim_start_matches(',').trim();
+    let name = after.trim().to_string();
+    if name.is_empty() {
+        return Err("expected const name after path".to_string());
+    }
+    Ok((path, name))
 }
 
 /// Register-level fusion: fuse two elementwise kernels where the intermediate

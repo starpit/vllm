@@ -9,7 +9,7 @@ pub fn extract_entry(ptx: &str, entry_name: &str) -> Result<String, String> {
     let mut entry_start = None;
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim();
-        if t.starts_with(".visible") && t.contains(".entry") && t.contains(entry_name) {
+        if t.contains(".entry") && t.contains(entry_name) {
             entry_start = Some(i);
             break;
         }

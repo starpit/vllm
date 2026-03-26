@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 pub(crate) mod extract;
 mod fuse;
+pub(crate) mod fuse_epilogue;
 pub(crate) mod fuse_real;
 mod parser;
 mod regfuse;
@@ -676,4 +677,42 @@ fn parse_fuse_real_args(input: &str) -> Result<FuseRealArgs, String> {
         smem_elements,
         const_name,
     })
+}
+
+/// Inject SiLU activation into a CUTLASS GEMM epilogue at compile time.
+///
+/// Extracts a single entry from a multi-entry PTX file, then injects SiLU
+/// on every f32 value before bf16 conversion in the epilogue.
+///
+/// ```rust,ignore
+/// inject_silu_epilogue!(
+///     "kernels/cutlass_gemm_sm89.ptx",
+///     "GemmShapeILi64ELi128ELi64",   // entry substring
+///     CUTLASS_GEMM_WITH_SILU
+/// );
+/// ```
+#[proc_macro]
+pub fn inject_silu_epilogue(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let args = parse_extract_args(&input_str)
+        .expect("inject_silu_epilogue! expects (\"path.ptx\", \"entry_substr\", CONST_NAME)");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let ptx_path = PathBuf::from(&manifest_dir).join(&args.0);
+    let ptx_source = std::fs::read_to_string(&ptx_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ptx_path.display()));
+
+    let extracted = extract::extract_entry(&ptx_source, &args.1)
+        .unwrap_or_else(|e| panic!("extract_entry failed: {e}"));
+
+    let modified = fuse_epilogue::inject_silu_into_epilogue(&extracted)
+        .unwrap_or_else(|e| panic!("SiLU injection failed: {e}"));
+
+    let modified_str = modified.as_str();
+    let const_name = syn::Ident::new(&args.2, proc_macro2::Span::call_site());
+
+    let output = quote! {
+        const #const_name: &str = #modified_str;
+    };
+    output.into()
 }

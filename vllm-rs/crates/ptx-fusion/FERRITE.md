@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **49 tests** (39 CUDA GPU + 10 unit), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **51 tests** (41 CUDA GPU + 10 unit), all passing.
 
 ### What's Proven
 
@@ -78,6 +78,7 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **49 tests** (39 CUDA GPU + 10 unit), all p
 | GEMM epilogue injection (ptxas) | cuda_gemm_epilogue | SiLU, GELU, ReLU into CUTLASS GEMM, valid assembly |
 | GEMM epilogue SiLU (GPU) | cuda_gemm_silu_correctness | Ferrite vs nvcc: **0.00e0 diff** |
 | GEMM epilogue GELU (GPU) | cuda_gemm_gelu_correctness | Ferrite vs nvcc: **4.77e-7 diff** |
+| GEMM prologue injection | cuda_gemm_prologue | rms_norm -> GEMM via SMEM, **0.00e0 diff** |
 | Stress tests | cuda_stress | n=1 to n=4096, 100-run determinism |
 
 ### Benchmarks
@@ -98,6 +99,18 @@ sites each).
 This means we can fuse arbitrary elementwise ops into any GEMM's output path
 without writing custom CUDA code. The GEMM is a black box. We only touch the
 escape perimeter.
+
+### The GEMM Prologue Result
+
+Fused rms_norm -> row GEMM via SMEM handoff: **bitwise identical** to separate
+launches (0.00e0 diff). rms_norm writes normalized output to SMEM, barrier, then the
+GEMM reads its A matrix from SMEM instead of GMEM. The GMEM round-trip between
+normalization and GEMM is eliminated completely.
+
+This required extending the PTX param tracer to propagate through `mov.u64`/`mov.b64`
+(nvcc copies address registers into loop cursors), and extending the SMEM stitching
+engine to handle the `mul.wide.s32` address pattern that nvcc generates for GEMM
+kernels (vs the `cvt.s64.s32` pattern used by elementwise kernels).
 
 ## How the Escape Analysis Works
 
@@ -154,7 +167,7 @@ crates/ptx-fusion/                 Library + tests
   src/main.rs                      Demo: extract + rewrite + fuse + validate
   build.rs                         Compiles vllm-cuda csrc/ kernels to PTX at build time
   kernels/                         Hand-written, nvcc-compiled, and CUTLASS PTX files
-  tests/                           39 CUDA GPU tests
+  tests/                           41 CUDA GPU tests
 ```
 
 ## Proc Macros
@@ -175,8 +188,9 @@ crates/ptx-fusion/                 Library + tests
 
 ### Immediate
 
-- **GEMM prologue injection**: fuse rms_norm output into GEMM input loads. Same escape
-  analysis -- intercept `ld.global` on the A matrix and redirect from SMEM.
+- **CUTLASS prologue injection**: extend prologue fusion to CUTLASS GEMMs, which use
+  `cp.async.cg.shared.global` instead of `ld.global`. Need to intercept and redirect
+  the async copy source address.
 - **More epilogue ops**: add quantize (f32->fp8), scale, residual add to `ActivationFn`.
   The framework is parameterized -- just add emission functions.
 

@@ -322,6 +322,22 @@ impl PtxParser {
                     continue;
                 }
 
+                // mov.u64 / mov.b64 — register copy (1:1 rename)
+                if opcode == "mov.u64" || opcode == "mov.b64" {
+                    let parts: Vec<&str> = trimmed
+                        .split([',', ' ', '\t'])
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if parts.len() >= 3 {
+                        let dst = parts[1].trim_end_matches(',').to_string();
+                        let src = parts[2].trim_end_matches(';');
+                        if let Some(param) = reg_to_param.get(src).cloned() {
+                            reg_to_param.entry(dst).or_insert(param);
+                        }
+                    }
+                    continue;
+                }
+
                 // add.u64 / add.s64 — pointer + offset propagation
                 if opcode != "add.u64" && opcode != "add.s64" {
                     continue;

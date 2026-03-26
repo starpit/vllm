@@ -14,6 +14,21 @@ pub struct RealFuseBinding {
     pub b_input_param: String,
 }
 
+/// How nvcc represents the row element offset in PTX.
+#[derive(Debug, Clone)]
+enum RowOffset {
+    /// Pattern: mul.lo.s32 %r -> cvt.s64.s32 %rd
+    /// row_global_base = cvta + (%rd << 2)
+    Converted {
+        reg_64: String,
+        #[allow(dead_code)]
+        reg_32: String,
+    },
+    /// Pattern: mul.lo.s32 %r -> mul.wide.s32 %rd, %r, 4
+    /// row_global_base = cvta + %rd (already byte-scaled)
+    WideMul { reg_64: String, reg_32: String },
+}
+
 pub struct RealFusedKernel {
     pub ptx: String,
 }
@@ -80,14 +95,13 @@ pub fn fuse_real_kernels(
         .ok_or("could not find cvta register for A's output")?;
 
     // Find the row element offset register
-    // Pattern: mul.lo.s32 %rN, %ctaid.x_reg, %hidden_size_reg → cvt.s64.s32 %rdM, %rN
-    let a_row_offset_reg =
+    let a_row_offset =
         find_row_offset_register(&lines_a).ok_or("could not find row offset register in A")?;
 
     // Same for B
     let b_input_cvta_reg = find_cvta_register(&lines_b, &b_input_param_name)
         .ok_or("could not find cvta register for B's input")?;
-    let b_row_offset_reg =
+    let b_row_offset =
         find_row_offset_register(&lines_b).ok_or("could not find row offset register in B")?;
 
     // Extract bodies
@@ -103,7 +117,16 @@ pub fn fuse_real_kernels(
         .map(|r| offset_single_register(r, &reg_offsets))
         .collect();
     let b_input_cvta_renamed = offset_single_register(&b_input_cvta_reg, &reg_offsets);
-    let b_row_offset_renamed = offset_single_register(&b_row_offset_reg, &reg_offsets);
+    let b_row_offset_renamed = match &b_row_offset {
+        RowOffset::Converted { reg_64, .. } => RowOffset::Converted {
+            reg_64: offset_single_register(reg_64, &reg_offsets),
+            reg_32: String::new(),
+        },
+        RowOffset::WideMul { reg_64, reg_32 } => RowOffset::WideMul {
+            reg_64: offset_single_register(reg_64, &reg_offsets),
+            reg_32: offset_single_register(reg_32, &reg_offsets),
+        },
+    };
 
     // Merged params
     let merged_params = merge_params(
@@ -229,27 +252,40 @@ pub fn fuse_real_kernels(
             && trimmed.contains("cvta.to.global")
             && trimmed.contains(&a_output_cvta_reg)
         {
-            // Emit the cvta (it produces a meaningless value since param was zeroed,
-            // but we need it for the row_global_base calculation to reference the right register)
             out.push_str(&format!("\t{trimmed}\n"));
-            // Don't emit row_base yet — we need %rd4 (row offset) which comes later
             continue;
         }
 
-        // Detect when %rd4 (row offset) is defined, then emit row_global_base
-        if !emitted_row_base
-            && trimmed.contains("cvt.s64.s32")
-            && trimmed.contains(&a_row_offset_reg)
-        {
-            out.push_str(&format!("\t{trimmed}\n"));
-            // Now both registers are ready
-            out.push_str("\t// FERRITE: compute row_global_base for SMEM handoff\n");
-            out.push_str(&format!("\tshl.b64 \t%rd_fe0, {a_row_offset_reg}, 2;\n"));
-            out.push_str(&format!(
-                "\tadd.s64 \t%rd_fe1, {a_output_cvta_reg}, %rd_fe0;\n"
-            ));
-            emitted_row_base = true;
-            continue;
+        // Detect when the row offset register is defined, then emit row_global_base
+        if !emitted_row_base {
+            let trigger = match &a_row_offset {
+                RowOffset::Converted { reg_64, .. } => {
+                    trimmed.contains("cvt.s64.s32") && trimmed.contains(reg_64.as_str())
+                }
+                RowOffset::WideMul { reg_64, .. } => {
+                    trimmed.starts_with("mul.wide.s32") && trimmed.contains(reg_64.as_str())
+                }
+            };
+            if trigger {
+                out.push_str(&format!("\t{trimmed}\n"));
+                out.push_str("\t// FERRITE: compute row_global_base for SMEM handoff\n");
+                match &a_row_offset {
+                    RowOffset::Converted { reg_64, .. } => {
+                        out.push_str(&format!("\tshl.b64 \t%rd_fe0, {reg_64}, 2;\n"));
+                        out.push_str(&format!(
+                            "\tadd.s64 \t%rd_fe1, {a_output_cvta_reg}, %rd_fe0;\n"
+                        ));
+                    }
+                    RowOffset::WideMul { reg_64, .. } => {
+                        // mul.wide already did *4, so just add to cvta base
+                        out.push_str(&format!(
+                            "\tadd.s64 \t%rd_fe1, {a_output_cvta_reg}, {reg_64};\n"
+                        ));
+                    }
+                }
+                emitted_row_base = true;
+                continue;
+            }
         }
 
         // Rewrite st.global on the bound output → st.shared via SMEM handoff
@@ -313,21 +349,35 @@ pub fn fuse_real_kernels(
             continue;
         }
 
-        // After cvta for B's input base, and after row offset is computed, emit row_global_base
-        if !emitted_b_row_base
-            && rtrimmed.contains("cvt.s64.s32")
-            && rtrimmed.contains(&b_row_offset_renamed)
-        {
-            out.push_str(&format!("\t{rtrimmed}\n"));
-            out.push_str("\t// FERRITE: compute row_global_base for B's input\n");
-            out.push_str(&format!(
-                "\tshl.b64 \t%rd_fe2, {b_row_offset_renamed}, 2;\n"
-            ));
-            out.push_str(&format!(
-                "\tadd.s64 \t%rd_fe3, {b_input_cvta_renamed}, %rd_fe2;\n"
-            ));
-            emitted_b_row_base = true;
-            continue;
+        // After the row offset register is defined, emit row_global_base for B
+        if !emitted_b_row_base {
+            let trigger = match &b_row_offset_renamed {
+                RowOffset::Converted { reg_64, .. } => {
+                    rtrimmed.contains("cvt.s64.s32") && rtrimmed.contains(reg_64.as_str())
+                }
+                RowOffset::WideMul { reg_64, .. } => {
+                    rtrimmed.starts_with("mul.wide.s32") && rtrimmed.contains(reg_64.as_str())
+                }
+            };
+            if trigger {
+                out.push_str(&format!("\t{rtrimmed}\n"));
+                out.push_str("\t// FERRITE: compute row_global_base for B's input\n");
+                match &b_row_offset_renamed {
+                    RowOffset::Converted { reg_64, .. } => {
+                        out.push_str(&format!("\tshl.b64 \t%rd_fe2, {reg_64}, 2;\n"));
+                        out.push_str(&format!(
+                            "\tadd.s64 \t%rd_fe3, {b_input_cvta_renamed}, %rd_fe2;\n"
+                        ));
+                    }
+                    RowOffset::WideMul { reg_64, .. } => {
+                        out.push_str(&format!(
+                            "\tadd.s64 \t%rd_fe3, {b_input_cvta_renamed}, {reg_64};\n"
+                        ));
+                    }
+                }
+                emitted_b_row_base = true;
+                continue;
+            }
         }
 
         // Rewrite ld.global on the bound input → ld.shared from SMEM handoff
@@ -394,14 +444,13 @@ fn find_cvta_register(lines: &[&str], param_name: &str) -> Option<String> {
     None
 }
 
-/// Find the 64-bit register holding the row element offset.
-/// Pattern: mul.lo.s32 %rN, %ctaid_reg, %hidden_reg; cvt.s64.s32 %rdM, %rN;
-fn find_row_offset_register(lines: &[&str]) -> Option<String> {
-    // Find mul.lo.s32 that involves ctaid.x
-    // nvcc generates: mov.u32 %rX, %ctaid.x; mul.lo.s32 %rY, %rX, %rZ;
-    // Then: cvt.s64.s32 %rdN, %rY;
-
-    // First find the register holding ctaid.x
+/// Find the row element offset register.
+///
+/// Two nvcc patterns:
+/// - Pattern A: mul.lo.s32 %rN, ctaid_reg, size_reg -> cvt.s64.s32 %rdM, %rN
+/// - Pattern B: mul.lo.s32 %rN, ctaid_reg, size_reg -> mul.wide.s32 %rdM, %rN, 4
+fn find_row_offset_register(lines: &[&str]) -> Option<RowOffset> {
+    // Find the register holding ctaid.x
     let mut ctaid_reg = None;
     for line in lines {
         let t = line.trim();
@@ -435,7 +484,7 @@ fn find_row_offset_register(lines: &[&str]) -> Option<String> {
     }
     let mul_dst = mul_dst?;
 
-    // Find cvt.s64.s32 from mul_dst
+    // Pattern A: cvt.s64.s32 from mul_dst
     for line in lines {
         let t = line.trim();
         if t.contains("cvt.s64.s32") && t.contains(&mul_dst) {
@@ -446,8 +495,28 @@ fn find_row_offset_register(lines: &[&str]) -> Option<String> {
             if parts.len() >= 3 {
                 let src = parts[2].trim_end_matches(';');
                 if src == mul_dst {
-                    return Some(parts[1].trim_end_matches(',').to_string());
+                    return Some(RowOffset::Converted {
+                        reg_64: parts[1].trim_end_matches(',').to_string(),
+                        reg_32: mul_dst,
+                    });
                 }
+            }
+        }
+    }
+
+    // Pattern B: mul.wide.s32 %rdM, mul_dst, 4
+    for line in lines {
+        let t = line.trim();
+        if t.starts_with("mul.wide.s32") && t.contains(&mul_dst) && t.contains(", 4;") {
+            let parts: Vec<&str> = t
+                .split([',', ' ', '\t'])
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.len() >= 2 {
+                return Some(RowOffset::WideMul {
+                    reg_64: parts[1].trim_end_matches(',').to_string(),
+                    reg_32: mul_dst,
+                });
             }
         }
     }

@@ -16,7 +16,7 @@ pub struct RealFuseBinding {
 
 /// How nvcc represents the row element offset in PTX.
 #[derive(Debug, Clone)]
-enum RowOffset {
+pub(crate) enum RowOffset {
     /// Pattern: mul.lo.s32 %r -> cvt.s64.s32 %rd
     /// row_global_base = cvta + (%rd << 2)
     Converted {
@@ -406,7 +406,7 @@ pub(crate) fn find_param_by_substring(params: &[KernelParam], substr: &str) -> O
 
 /// Find the register assigned by `cvta.to.global.u64` for a given param.
 /// Pattern: ld.param.u64 %rdX, [param]; cvta.to.global.u64 %rdY, %rdX;
-fn find_cvta_register(lines: &[&str], param_name: &str) -> Option<String> {
+pub(crate) fn find_cvta_register(lines: &[&str], param_name: &str) -> Option<String> {
     // First find which register the param is loaded into
     let mut param_reg = None;
     for line in lines {
@@ -444,15 +444,55 @@ fn find_cvta_register(lines: &[&str], param_name: &str) -> Option<String> {
     None
 }
 
+/// Find the row element offset register, searching near a specific param's cvta.
+///
+/// When `near_param` is Some, searches for ctaid.x AFTER the cvta line for that param.
+/// This is needed for fused PTX where multiple phases each have their own ctaid.x.
+pub(crate) fn find_row_offset_near(lines: &[&str], near_param: Option<&str>) -> Option<RowOffset> {
+    // Find the starting line: either 0 or after the cvta for the target param
+    let start_line = if let Some(param_name) = near_param {
+        let mut cvta_line = 0;
+        let mut param_reg = None;
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            if t.contains("ld.param") && t.contains(param_name) {
+                let parts: Vec<&str> = t
+                    .split([',', ' ', '\t'])
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if parts.len() >= 2 {
+                    param_reg = Some(parts[1].trim_end_matches(',').to_string());
+                }
+            }
+            if let Some(ref pr) = param_reg
+                && t.starts_with("cvta.to.global")
+                && t.contains(pr.as_str())
+            {
+                cvta_line = i;
+                break;
+            }
+        }
+        cvta_line
+    } else {
+        0
+    };
+
+    find_row_offset_in_range(lines, start_line)
+}
+
 /// Find the row element offset register.
 ///
 /// Two nvcc patterns:
 /// - Pattern A: mul.lo.s32 %rN, ctaid_reg, size_reg -> cvt.s64.s32 %rdM, %rN
 /// - Pattern B: mul.lo.s32 %rN, ctaid_reg, size_reg -> mul.wide.s32 %rdM, %rN, 4
 fn find_row_offset_register(lines: &[&str]) -> Option<RowOffset> {
-    // Find the register holding ctaid.x
+    find_row_offset_in_range(lines, 0)
+}
+
+fn find_row_offset_in_range(lines: &[&str], start: usize) -> Option<RowOffset> {
+    // Find the register holding ctaid.x, starting from `start`
     let mut ctaid_reg = None;
-    for line in lines {
+    for line in lines.iter().skip(start) {
         let t = line.trim();
         if t.contains("ctaid.x") && (t.contains("mov.u32") || t.contains("mov.b32")) {
             let parts: Vec<&str> = t

@@ -222,14 +222,13 @@ fn three_phase_matches_separate() {
     let wgt = stream.clone_htod(&weight).unwrap();
     let w_up_gpu = stream.clone_htod(&w_up).unwrap();
     let w_down_gpu = stream.clone_htod(&w_down).unwrap();
-    let mut up_buf: CudaSlice<f32> = stream.alloc_zeros(rows * n_hidden).unwrap();
     let mut final_out: CudaSlice<f32> = stream.alloc_zeros(rows * n_out).unwrap();
     let mut tile_counter: CudaSlice<u32> = stream.alloc_zeros(1).unwrap();
 
-    // Persistent 3-phase params:
+    // Persistent 3-phase params (SMEM handoffs — no intermediate GMEM buffers):
     // tile_counter,
     // rms: input, weight, epsilon, hidden
-    // gemm1: C (=up_buf, shared with gemm2 A), B (=w_up), M, N, K
+    // gemm1: [C removed — SMEM handoff], B (=w_up), M, N, K
     // gemm2: C (=final_out), B (=w_down), M, N, K
     let m = rows as i32;
     let n1 = n_hidden as i32;
@@ -253,7 +252,7 @@ fn three_phase_matches_separate() {
             .arg(&wgt) // rms weight
             .arg(&epsilon) // rms epsilon
             .arg(&(hidden as i32)) // rms hidden_size
-            .arg(&mut up_buf) // gemm1 C output (shared: gemm2 A input)
+            // gemm1 C output removed — goes through SMEM handoff 2
             .arg(&w_up_gpu) // gemm1 B
             .arg(&m) // gemm1 M
             .arg(&n1) // gemm1 N
@@ -449,7 +448,6 @@ fn three_phase_benchmark() {
                 .arg(&wgt)
                 .arg(&epsilon)
                 .arg(&(hidden as i32))
-                .arg(&mut up_out)
                 .arg(&w_up_gpu)
                 .arg(&m)
                 .arg(&n1)
@@ -476,7 +474,6 @@ fn three_phase_benchmark() {
                 .arg(&wgt)
                 .arg(&epsilon)
                 .arg(&(hidden as i32))
-                .arg(&mut up_out)
                 .arg(&w_up_gpu)
                 .arg(&m)
                 .arg(&n1)
@@ -643,7 +640,6 @@ fn bench_3phase(rows: usize, hidden: usize, n_hidden: usize, n_out: usize, num_b
                 .arg(&wgt)
                 .arg(&epsilon)
                 .arg(&(hidden as i32))
-                .arg(&mut up_out)
                 .arg(&w_up_gpu)
                 .arg(&m)
                 .arg(&n1)
@@ -669,7 +665,6 @@ fn bench_3phase(rows: usize, hidden: usize, n_hidden: usize, n_out: usize, num_b
                 .arg(&wgt)
                 .arg(&epsilon)
                 .arg(&(hidden as i32))
-                .arg(&mut up_out)
                 .arg(&w_up_gpu)
                 .arg(&m)
                 .arg(&n1)

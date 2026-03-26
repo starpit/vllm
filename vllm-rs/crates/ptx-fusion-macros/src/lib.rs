@@ -888,16 +888,17 @@ pub fn fuse_3phase_mlp(input: TokenStream) -> TokenStream {
     let fused_12_silu = fuse_epilogue::inject_silu_into_f32_stores(&fused_12.ptx)
         .unwrap_or_else(|e| panic!("SiLU injection failed: {e}"));
 
-    // Step 3: append Phase C (gemm2) with GMEM handoff
+    // Step 3: append Phase C (gemm2) with SMEM handoff
     let fused_123_name = format!("{}_3phase", args.fused_name);
-    let fused_123 = chain::append_phase_gmem(
+    let fused_123 = chain::append_phase_smem(
         &fused_12_silu,
         &ptx_gemm2,
         &args.gmem_b_output,
         &args.gmem_c_input,
         &fused_123_name,
+        args.smem_elements,
     )
-    .unwrap_or_else(|e| panic!("Phase 3 append failed: {e}"));
+    .unwrap_or_else(|e| panic!("Phase 3 SMEM append failed: {e}"));
 
     // Step 4: wrap in persistent loop
     let persistent_name = format!("persistent_{}", fused_123_name);

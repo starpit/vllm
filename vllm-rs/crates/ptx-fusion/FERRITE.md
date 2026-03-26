@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **57 tests** (46 CUDA GPU + 11 doc-ignored + 10 unit), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **58 tests** (47 CUDA GPU + 11 doc-ignored + 10 unit), all passing.
 
 ### What's Proven
 
@@ -80,7 +80,7 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **57 tests** (46 CUDA GPU + 11 doc-ignored 
 | GEMM epilogue GELU (GPU) | cuda_gemm_gelu_correctness | Ferrite vs nvcc: **4.77e-7 diff** |
 | GEMM prologue injection | cuda_gemm_prologue | rms_norm -> GEMM via SMEM, **0.00e0 diff** |
 | Persistent kernel | cuda_persistent | 108-block work queue, 256 rows, **0.00e0 diff** |
-| 3-phase MLP pipeline | cuda_3phase | norm->GEMM+SiLU->GEMM, persistent, **1.91e-6 diff** |
+| 3-phase MLP (full SMEM) | cuda_3phase | norm->GEMM+SiLU->GEMM, ALL handoffs via SMEM, **1.91e-6 diff** |
 | Stress tests | cuda_stress | n=1 to n=4096, 100-run determinism |
 
 ### Benchmarks
@@ -178,7 +178,7 @@ crates/ptx-fusion/                 Library + tests
   src/main.rs                      Demo: extract + rewrite + fuse + validate
   build.rs                         Compiles vllm-cuda csrc/ kernels to PTX at build time
   kernels/                         Hand-written, nvcc-compiled, and CUTLASS PTX files
-  tests/                           47 CUDA GPU tests
+  tests/                           48 CUDA GPU tests
 ```
 
 ## Proc Macros

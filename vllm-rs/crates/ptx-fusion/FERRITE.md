@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **58 tests** (47 CUDA GPU + 11 doc-ignored + 10 unit), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **64 tests** (52 CUDA GPU + 12 doc-ignored + 10 unit), all passing.
 
 ### What's Proven
 
@@ -81,6 +81,9 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **58 tests** (47 CUDA GPU + 11 doc-ignored 
 | GEMM prologue injection | cuda_gemm_prologue | rms_norm -> GEMM via SMEM, **0.00e0 diff** |
 | Persistent kernel | cuda_persistent | 108-block work queue, 256 rows, **0.00e0 diff** |
 | 3-phase MLP (full SMEM) | cuda_3phase | norm->GEMM+SiLU->GEMM, ALL handoffs via SMEM, **1.91e-6 diff** |
+| CUTLASS bf16 perimeter | cuda_cutlass_bf16 | cp.async auto-classified: 6 A-loads, 6 B-loads, 2 param groups |
+| CUTLASS cp.async deletion | cuda_cutlass_bf16 | A-loads deleted, B preserved, MMA preserved, **ptxas valid** |
+| Perimeter: 5 kernel types | cuda_cutlass_bf16 | hand-written, nvcc, row-GEMM, CUTLASS bf16, CUTLASS FP8 |
 | Stress tests | cuda_stress | n=1 to n=4096, 100-run determinism |
 
 ### Benchmarks
@@ -168,7 +171,8 @@ crates/ptx-fusion-macros/          Proc macro crate (runs at compile time)
   src/fuse.rs                      SMEM stitching fusion engine (toy kernels)
   src/fuse_real.rs                 SMEM stitching for real nvcc PTX (vectorized, multi-pass)
   src/fuse_epilogue.rs             GEMM epilogue injection (parameterized: SiLU, GELU, ReLU)
-  src/chain.rs                     Multi-phase chaining (append GMEM-handoff phases)
+  src/fuse_cp_async.rs             CUTLASS cp.async A/B classification and deletion
+  src/chain.rs                     Multi-phase chaining (append SMEM-handoff phases)
   src/persistent.rs                Persistent kernel wrapper (work-queue loop)
   src/regfuse.rs                   Register-level fusion engine (elementwise)
   src/extract.rs                   Single-entry extraction from multi-entry PTX
@@ -178,7 +182,7 @@ crates/ptx-fusion/                 Library + tests
   src/main.rs                      Demo: extract + rewrite + fuse + validate
   build.rs                         Compiles vllm-cuda csrc/ kernels to PTX at build time
   kernels/                         Hand-written, nvcc-compiled, and CUTLASS PTX files
-  tests/                           48 CUDA GPU tests
+  tests/                           52 CUDA GPU tests
 ```
 
 ## Proc Macros
@@ -196,25 +200,61 @@ crates/ptx-fusion/                 Library + tests
 | `inject_silu_epilogue!(...)` | Convenience wrapper: inject SiLU into GEMM epilogue |
 | `persistent_fuse_real_kernels!(...)` | Wrap fused kernel in persistent work-queue loop |
 | `fuse_3phase_mlp!(...)` | 3-phase MLP: norm->GEMM+SiLU->GEMM, persistent |
+| `delete_cutlass_a_loads!(...)` | Delete A-matrix cp.async from CUTLASS GEMM (for prologue) |
 
 ## What's Next
 
-### Immediate
+### Immediate: CUTLASS prologue fusion (rms_norm -> CUTLASS bf16 GEMM)
 
-- **CUTLASS prologue injection**: extend prologue fusion to CUTLASS GEMMs, which use
-  `cp.async.cg.shared.global` instead of `ld.global`. Need to intercept and redirect
-  the async copy source address.
-- **More epilogue ops**: add quantize (f32->fp8), scale, residual add to `ActivationFn`.
-  The framework is parameterized -- just add emission functions.
+**Where we are.** The GEMM appears 4 times per LLaMA layer. CUTLASS loads matrix
+tiles via `cp.async.cg.shared.global` (async GMEM -> SMEM copy). The perimeter
+model (`AsyncCopyPort`) now identifies these as input ports. The proc macro
+auto-classifies which cp.async loads are for A vs B by tracing GMEM source
+registers back to struct-param offsets -- no hardcoded assumptions.
+
+A-matrix cp.async deletion is proven: for the bf16 64x64x32 CUTLASS GEMM,
+6 A-loads are deleted, 6 B-loads and 16 MMA ops preserved, ptxas validates.
+The SMEM destination address computation (`SharedStorageBase + f(tid)`) still
+runs -- only the cp.async instruction itself is removed.
+
+**Failed approaches (don't repeat these):**
+- Separate SMEM handoff buffer alongside CUTLASS: fails because CUTLASS uses
+  all available SMEM dynamically (extern shared). No room for a second buffer.
+- SMEM-to-SMEM copy (ld.shared handoff -> st.shared CUTLASS tile): same problem,
+  needs a separate buffer that doesn't fit.
+
+**Correct approach:** The prologue writes directly into CUTLASS's SMEM tile
+locations -- the same addresses the deleted cp.async would have written to.
+No separate buffer needed.
+
+**Remaining steps:**
+
+1. **Prologue writes to CUTLASS SMEM destinations.** Each deleted cp.async
+   had a destination like `[%r226]` where `%r226 = SharedStorageBase + f(tid)`.
+   The CUTLASS address computation code still runs after cp.async deletion.
+   The prologue uses those same address registers to write bf16 data via
+   `st.shared.v4.b32 [%r226], {data}`. The challenge: each thread must produce
+   the correct 16 bytes of bf16 A-matrix data for its SMEM slot. The GMEM
+   source register `[%rd26]` tells us which A elements that slot corresponds to.
+
+2. **GPU correctness test.** Run unmodified CUTLASS GEMM and prologue-injected
+   version with same bf16 A data. The prologue loads A from GMEM to SMEM
+   (same data cp.async would have loaded, just via ld.global + st.shared
+   instead of cp.async). Outputs must be bitwise identical.
+
+3. **Fuse with rms_norm.** rms_norm outputs f32. The handoff converts f32->bf16
+   (`cvt.rn.bf16.f32`) before writing to CUTLASS's SMEM. The rms_norm phase
+   runs with 128 threads (matching CUTLASS blockDim).
+
+**Key files:**
+- `fuse_cp_async.rs`: `delete_a_matrix_loads()` -- auto-detects and deletes A cp.async
+- `parser.rs`: `AsyncCopyPort` in `KernelProtocol`, struct-param tracing
+- `kernels/cutlass_gemm_bf16_sm89.ptx`: bf16 CUTLASS GEMM (64x64x32, 3 stages, 24KB SMEM)
 
 ### Near-term
 
-- **Scale to production sizes**: test with hidden_dim=4096, production CUTLASS GEMMs.
-  The 3-phase pipeline architecture is proven at small scale; need to validate with
-  real dimensions where GMEM savings dominate over per-tile overhead.
-- **CUTLASS prologue injection**: extend prologue to `cp.async.cg.shared.global`.
-- **FlashAttention fusion**: compile FA2/FA3 to PTX, identify escape perimeter, fuse
-  RoPE into prologue and output projection into epilogue.
+- **More epilogue ops**: quantize (f32->fp8), scale, residual add.
+- **FlashAttention**: compile FA2/FA3 to PTX, identify escape perimeter.
 
 ### The full forward pass
 

@@ -1,0 +1,93 @@
+// Matvec kernel — the "hard" kernel
+// Matrix-vector multiply with shared memory, barriers, and loop structure
+// Reads matrix + vector from GMEM, uses SMEM for vector caching, writes result to GMEM
+
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry matvec(
+    .param .u64 matrix,
+    .param .u64 vec_in,
+    .param .u64 vec_out,
+    .param .u32 M,
+    .param .u32 K
+)
+{
+    .reg .f32 %f<32>;
+    .reg .u32 %r<16>;
+    .reg .u64 %rd<16>;
+    .reg .pred %p<4>;
+    .shared .align 16 .f32 smem_vec[4096];
+
+    ld.param.u64 %rd0, [matrix];
+    ld.param.u64 %rd1, [vec_in];
+    ld.param.u64 %rd2, [vec_out];
+    ld.param.u32 %r0, [M];
+    ld.param.u32 %r1, [K];
+
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+
+    // Cooperatively load vector into shared memory
+    mov.u32 %r5, %r2;
+LOAD_VEC:
+    setp.ge.u32 %p0, %r5, %r1;
+    @%p0 bra LOAD_VEC_DONE;
+
+    mul.wide.u32 %rd3, %r5, 4;
+    add.u64 %rd4, %rd1, %rd3;
+    ld.global.f32 %f0, [%rd4];
+
+    shl.b32 %r6, %r5, 2;
+    mov.u32 %r7, smem_vec;
+    add.u32 %r8, %r7, %r6;
+    st.shared.f32 [%r8], %f0;
+
+    add.u32 %r5, %r5, %r4;
+    bra LOAD_VEC;
+LOAD_VEC_DONE:
+
+    bar.sync 0;
+
+    // Each thread computes one output element
+    mad.lo.u32 %r9, %r3, %r4, %r2;
+    setp.ge.u32 %p1, %r9, %r0;
+    @%p1 bra EXIT;
+
+    // Dot product: matrix[row, :] . vec
+    mov.f32 %f1, 0.0;
+    mov.u32 %r10, 0;
+    mul.lo.u32 %r11, %r9, %r1;
+
+DOT_LOOP:
+    setp.ge.u32 %p2, %r10, %r1;
+    @%p2 bra DOT_DONE;
+
+    // Load matrix element from global memory
+    add.u32 %r12, %r11, %r10;
+    mul.wide.u32 %rd5, %r12, 4;
+    add.u64 %rd6, %rd0, %rd5;
+    ld.global.f32 %f2, [%rd6];
+
+    // Load vector element from shared memory
+    shl.b32 %r13, %r10, 2;
+    mov.u32 %r14, smem_vec;
+    add.u32 %r15, %r14, %r13;
+    ld.shared.f32 %f3, [%r15];
+
+    fma.rn.f32 %f1, %f2, %f3, %f1;
+
+    add.u32 %r10, %r10, 1;
+    bra DOT_LOOP;
+DOT_DONE:
+
+    // Store result to global memory
+    mul.wide.u32 %rd7, %r9, 4;
+    add.u64 %rd8, %rd2, %rd7;
+    st.global.f32 [%rd8], %f1;
+
+EXIT:
+    ret;
+}

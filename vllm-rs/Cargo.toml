@@ -19,6 +19,8 @@ members = [
     "crates/vllm-examples",
     "crates/vllm-parity",
     "crates/vllm-gce",
+    "crates/ptx-fusion-macros",
+    "crates/ptx-fusion",
 ]
 exclude = []
 

@@ -1,0 +1,11 @@
+[package]
+name = "ptx-fusion"
+version.workspace = true
+edition.workspace = true
+
+[features]
+cuda = ["dep:cudarc"]
+
+[dependencies]
+ptx-fusion-macros = { path = "../ptx-fusion-macros" }
+cudarc = { workspace = true, optional = true, features = ["dynamic-linking"] }

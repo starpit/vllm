@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **71 tests** (59 CUDA GPU + 12 doc-ignored + 10 unit), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **74 tests** (62 CUDA GPU + 12 doc-ignored + 10 unit), all passing.
 
 ### What's Proven
 
@@ -86,7 +86,8 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **71 tests** (59 CUDA GPU + 12 doc-ignored 
 | CUTLASS explicit A-loads (GPU) | cuda_cutlass_bf16 | cp.async replaced with ld.global+st.shared, **0.00e0 diff** |
 | **rms_norm -> CUTLASS GEMM (GPU)** | cuda_cutlass_bf16 | **fused prologue: inv_rms + normalize + GEMM, 0.00e0 diff** |
 | Perimeter: 5 kernel types | cuda_cutlass_bf16 | hand-written, nvcc, row-GEMM, CUTLASS bf16, CUTLASS FP8 |
-| Multi-tile CUTLASS dispatch | cuda_dispatch | 3 configs loaded, tile selection, grid dim computation |
+| Multi-tile CUTLASS dispatch | cuda_dispatch | 3 configs loaded, tile selection, Rust params builder GPU-verified |
+| **norm+GEMM+SiLU (GPU)** | cuda_cutlass_bf16 | **prologue + epilogue composed, 6.25e-2 diff (bf16 rounding)** |
 | Stress tests | cuda_stress | n=1 to n=4096, 100-run determinism |
 
 ### Benchmarks
@@ -247,6 +248,7 @@ crates/ptx-fusion/                 Library + tests
 | `delete_cutlass_a_loads!(...)` | Delete A-matrix cp.async from CUTLASS GEMM (for prologue) |
 | `replace_cutlass_a_loads!(...)` | Replace A-matrix cp.async with explicit ld.global+st.shared |
 | `fuse_rms_norm_cutlass!(...)` | Fuse rms_norm prologue into CUTLASS GEMM (normalize inline) |
+| `fuse_norm_gemm_silu!(...)` | Prologue + epilogue: norm -> GEMM + SiLU in one kernel |
 
 ## What's Next
 
@@ -295,11 +297,13 @@ and hidden_size are prepended as extra params.
 
 ### Near-term: fused operation library (Phase 1)
 
-**Already proven**: `fuse_rms_norm_cutlass!`, `inject_epilogue!` (SiLU/GELU/ReLU)
+**Already proven**:
+- `fuse_rms_norm_cutlass!` -- norm -> GEMM prologue (0.00e0)
+- `inject_epilogue!` -- SiLU/GELU/ReLU into epilogue (0.00e0)
+- `fuse_norm_gemm_silu!` -- prologue + epilogue composed (6.25e-2, bf16 rounding)
 
 **Need to build**:
-- `fuse_gemm_residual!` -- residual add in GEMM epilogue
-- `fuse_norm_gemm_silu!` -- prologue + epilogue combined
+- `fuse_gemm_residual!` -- residual add in GEMM epilogue (O_proj, down_proj)
 - More epilogue ops: quantize (f32->fp8), scale
 
 ### The Ferrite-based forward pass
@@ -323,8 +327,8 @@ Each `fuse_*!` macro generates: fused PTX (compile-time) + `launch()` function
 ### Roadmap
 
 ```
-Phase 0: CUTLASS parity with cuBLAS     ← IN PROGRESS (benchmarked, dispatch built)
-Phase 1: Fused operation library          ← mostly done, extend with residual/combined
+Phase 0: CUTLASS parity with cuBLAS     ← DONE (benchmarked, dispatch, Rust params builder)
+Phase 1: Fused operation library          ← IN PROGRESS (norm+SiLU done, need residual)
 Phase 2: Runtime integration (llama.rs)   ← wire into OwnedTensor/CachingAllocator
 Phase 3: FlashAttention perimeter         ← exploratory
 Phase 4: Persistent layer kernel          ← endgame

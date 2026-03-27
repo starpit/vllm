@@ -391,10 +391,138 @@ int test_fused(const char* fused_path) {
     return 0;
 }
 
+// ── Mode 3: fused rms_norm + SiLU test ──
+
+int test_fused_silu(const char* fused_path) {
+    const int M = 64, N = 64, K = 32;
+    const int hidden = K;
+    const float epsilon = 1e-5f;
+    const int lda = K, ldb = K, ldc = N, ldd = N;
+
+    std::vector<bf16> h_input(M*hidden), h_weight(hidden), h_B(N*K), h_C(M*N);
+    for (int i = 0; i < M*hidden; i++) h_input[i] = bf16(sinf(i*0.037f-0.5f)*0.5f);
+    for (int i = 0; i < hidden; i++) h_weight[i] = bf16(1.0f + i*0.01f);
+    for (int i = 0; i < N*K; i++) h_B[i] = bf16(cosf(i*0.023f+0.3f)*0.5f);
+    for (int i = 0; i < M*N; i++) h_C[i] = bf16(0.0f);
+
+    // CPU reference: rms_norm → GEMM → SiLU
+    std::vector<bf16> h_A_norm(M*K);
+    cpu_rms_norm_bf16(h_input.data(), h_weight.data(), h_A_norm.data(), M, hidden, epsilon);
+
+    bf16 *d_input, *d_weight, *d_A_norm, *d_B, *d_C, *d_ref, *d_fused;
+    CHECK_CUDA(cudaMalloc(&d_input, M*hidden*2));
+    CHECK_CUDA(cudaMalloc(&d_weight, hidden*2));
+    CHECK_CUDA(cudaMalloc(&d_A_norm, M*K*2));
+    CHECK_CUDA(cudaMalloc(&d_B, N*K*2));
+    CHECK_CUDA(cudaMalloc(&d_C, M*N*2));
+    CHECK_CUDA(cudaMalloc(&d_ref, M*N*2));
+    CHECK_CUDA(cudaMalloc(&d_fused, M*N*2));
+    CHECK_CUDA(cudaMemcpy(d_input, h_input.data(), M*hidden*2, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_weight, h_weight.data(), hidden*2, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_A_norm, h_A_norm.data(), M*K*2, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_B, h_B.data(), N*K*2, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_C, h_C.data(), M*N*2, cudaMemcpyHostToDevice));
+
+    // Reference: CUTLASS GEMM with pre-normalized A
+    {
+        CHECK_CUDA(cudaMemset(d_ref, 0, M*N*2));
+        CutlassGemm gemm_op;
+        CutlassGemm::Arguments args({M,N,K},
+            {d_A_norm, lda}, {d_B, ldb}, {d_C, ldc}, {d_ref, ldd}, {1.0f, 0.0f});
+        gemm_op(args); CHECK_CUDA(cudaDeviceSynchronize());
+    }
+
+    // Apply SiLU to reference output on CPU
+    {
+        std::vector<bf16> ref_data(M*N);
+        CHECK_CUDA(cudaMemcpy(ref_data.data(), d_ref, M*N*2, cudaMemcpyDeviceToHost));
+        for (int i = 0; i < M*N; i++) {
+            float x = float(ref_data[i]);
+            ref_data[i] = bf16(x / (1.0f + expf(-x))); // SiLU = x * sigmoid(x)
+        }
+        CHECK_CUDA(cudaMemcpy(d_ref, ref_data.data(), M*N*2, cudaMemcpyHostToDevice));
+    }
+
+    // Fused kernel: norm + GEMM + SiLU
+    {
+        auto gemm_params = make_kernel_params(
+            reinterpret_cast<bf16*>(d_input),
+            reinterpret_cast<bf16*>(d_B),
+            reinterpret_cast<bf16*>(d_C),
+            reinterpret_cast<bf16*>(d_fused),
+            M, N, K, lda, ldb, ldc, ldd);
+
+        struct alignas(8) { uint64_t w; float e; uint32_t h; } prefix;
+        prefix.w = reinterpret_cast<uint64_t>(d_weight);
+        prefix.e = epsilon;
+        prefix.h = hidden;
+
+        std::vector<uint8_t> fused_params(16 + sizeof(gemm_params));
+        memcpy(fused_params.data(), &prefix, 16);
+        memcpy(fused_params.data() + 16, &gemm_params, sizeof(gemm_params));
+
+        std::string fused_ptx = read_file(fused_path);
+        std::string entry = find_entry(fused_ptx, "fused_");
+
+        printf("Entry: %s\n", entry.c_str());
+
+        CutlassGemm::ThreadblockSwizzle swizzle;
+        dim3 grid = swizzle.get_grid_shape(gemm_params.grid_tiled_shape);
+        dim3 block(GemmKernel::kThreadCount, 1, 1);
+        int smem = int(sizeof(GemmKernel::SharedStorage));
+
+        CHECK_CUDA(cudaMemset(d_fused, 0, M*N*2));
+        launch_ptx(fused_ptx, entry, fused_params.data(), fused_params.size(),
+                   grid, block, smem);
+    }
+
+    std::vector<bf16> out_ref(M*N), out_fused(M*N);
+    CHECK_CUDA(cudaMemcpy(out_ref.data(), d_ref, M*N*2, cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(out_fused.data(), d_fused, M*N*2, cudaMemcpyDeviceToHost));
+
+    float sum = 0;
+    for (int i = 0; i < M*N; i++) sum += fabsf(float(out_ref[i]));
+    if (sum < 0.01f) { fprintf(stderr, "FAIL: reference is zeros\n"); return 1; }
+
+    float max_diff = 0;
+    for (int i = 0; i < M*N; i++) {
+        float diff = fabsf(float(out_fused[i]) - float(out_ref[i]));
+        max_diff = fmaxf(max_diff, diff);
+    }
+
+    printf("Reference (norm+GEMM+SiLU): [%.4f, %.4f, %.4f, %.4f]\n",
+           float(out_ref[0]), float(out_ref[1]), float(out_ref[2]), float(out_ref[3]));
+    printf("Fused:                       [%.4f, %.4f, %.4f, %.4f]\n",
+           float(out_fused[0]), float(out_fused[1]), float(out_fused[2]), float(out_fused[3]));
+    printf("Max diff: %.2e\n", max_diff);
+
+    float fused_sum = 0;
+    for (int i = 0; i < M*N; i++) fused_sum += fabsf(float(out_fused[i]));
+    if (fused_sum < 0.01f) {
+        fprintf(stderr, "FAIL: fused output is zeros\n"); return 1;
+    }
+
+    cudaFree(d_input); cudaFree(d_weight); cudaFree(d_A_norm);
+    cudaFree(d_B); cudaFree(d_C); cudaFree(d_ref); cudaFree(d_fused);
+
+    // Tolerance is higher than norm-only (0.05) because:
+    // - Reference applies SiLU AFTER bf16 rounding (GEMM output → bf16 → f32 → SiLU)
+    // - Fused applies SiLU BEFORE bf16 conversion (f32 accumulator → SiLU → bf16)
+    // The fused version is more precise; the diff is from bf16 intermediate rounding.
+    if (max_diff > 0.1f) {
+        fprintf(stderr, "FAIL: norm+GEMM+SiLU diverges (%.2e)\n", max_diff);
+        return 1;
+    }
+    printf("PASS: norm+GEMM+SiLU matches reference (max_diff=%.2e)\n", max_diff);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     CHECK_CU(cuInit(0));
 
-    if (argc == 3 && std::string(argv[1]) == "--fused") {
+    if (argc == 3 && std::string(argv[1]) == "--fused-silu") {
+        return test_fused_silu(argv[2]);
+    } else if (argc == 3 && std::string(argv[1]) == "--fused") {
         return test_fused(argv[2]);
     } else if (argc == 3) {
         return test_explicit(argv[1], argv[2]);

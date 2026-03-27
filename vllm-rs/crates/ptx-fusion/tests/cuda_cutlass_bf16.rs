@@ -11,7 +11,8 @@
 #![cfg(feature = "cuda")]
 
 use ptx_fusion_macros::{
-    analyze_kernel_as, delete_cutlass_a_loads, fuse_rms_norm_cutlass, replace_cutlass_a_loads,
+    analyze_kernel_as, delete_cutlass_a_loads, fuse_norm_gemm_silu, fuse_rms_norm_cutlass,
+    replace_cutlass_a_loads,
 };
 
 // ── Protocol extraction for every kernel type ──
@@ -41,6 +42,14 @@ fuse_rms_norm_cutlass!(
     "Gemm",
     "fused_rms_norm_cutlass_gemm",
     FUSED_RMS_NORM_CUTLASS_PTX
+);
+
+// CUTLASS bf16 with rms_norm prologue + SiLU epilogue (both fused)
+fuse_norm_gemm_silu!(
+    "kernels/cutlass_gemm_bf16_sm89.ptx",
+    "Gemm",
+    "fused_norm_gemm_silu",
+    FUSED_NORM_GEMM_SILU_PTX
 );
 
 // CUTLASS bf16 with A-matrix cp.async replaced by explicit ld.global + st.shared
@@ -470,4 +479,113 @@ fn fused_rms_norm_cutlass_gpu_correctness() {
     }
 
     println!("PASS: fused rms_norm+CUTLASS GEMM GPU correctness verified");
+}
+
+#[test]
+fn fused_norm_gemm_silu_passes_ptxas() {
+    let has_entry = FUSED_NORM_GEMM_SILU_PTX.contains("fused_norm_gemm_silu");
+    let has_prologue = FUSED_NORM_GEMM_SILU_PTX.contains("FERRITE: rms_norm prologue");
+    let has_silu = FUSED_NORM_GEMM_SILU_PTX.contains("FERRITE: inject SiLU");
+    let has_normalized = FUSED_NORM_GEMM_SILU_PTX
+        .matches("FERRITE: normalized A-load")
+        .count();
+    let silu_sites = FUSED_NORM_GEMM_SILU_PTX
+        .matches("FERRITE: inject SiLU")
+        .count();
+    let remaining_cp = FUSED_NORM_GEMM_SILU_PTX
+        .matches("cp.async.cg.shared.global")
+        .count();
+    let mma_count = FUSED_NORM_GEMM_SILU_PTX.matches("mma.sync").count();
+
+    println!("=== Fused norm+GEMM+SiLU ===");
+    println!("  Entry: {has_entry}");
+    println!("  Prologue (rms_norm): {has_prologue}");
+    println!("  Epilogue (SiLU): {has_silu} ({silu_sites} sites)");
+    println!("  Normalized A-loads: {has_normalized}");
+    println!("  Remaining cp.async: {remaining_cp} (B-matrix)");
+    println!("  MMA: {mma_count}");
+
+    assert!(has_entry);
+    assert!(has_prologue);
+    assert!(has_silu);
+    assert_eq!(has_normalized, 6);
+    assert!(silu_sites > 0);
+    assert!(remaining_cp > 0);
+    assert!(mma_count > 0);
+
+    let path = "/tmp/fused_norm_gemm_silu.ptx";
+    std::fs::write(path, FUSED_NORM_GEMM_SILU_PTX).unwrap();
+
+    let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for line in stderr.lines().take(30) {
+            println!("ptxas: {line}");
+        }
+        panic!("ptxas FAILED on norm+GEMM+SiLU");
+    }
+
+    println!(
+        "PASS: norm+GEMM+SiLU passes ptxas ({has_normalized} norm, {silu_sites} SiLU, {remaining_cp} B, {mma_count} MMA)"
+    );
+}
+
+#[test]
+fn fused_norm_gemm_silu_gpu_correctness() {
+    let fused_path = "/tmp/fused_norm_gemm_silu.ptx";
+    std::fs::write(fused_path, FUSED_NORM_GEMM_SILU_PTX).unwrap();
+
+    let test_bin = "/tmp/cutlass_silu_test";
+    let test_src = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/cutlass_prologue_test.cu"
+    );
+
+    let compile = std::process::Command::new("/usr/local/cuda-12.9/bin/nvcc")
+        .args([
+            "-arch=sm_89",
+            "-O2",
+            "-std=c++17",
+            "-I/home/moosevan/.cache/cutlass/include",
+            "-o",
+            test_bin,
+            test_src,
+            "-lcuda",
+        ])
+        .output()
+        .expect("nvcc");
+
+    if !compile.status.success() {
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        if stderr.contains("error") {
+            for line in stderr.lines().filter(|l| l.contains("error")).take(10) {
+                println!("nvcc: {line}");
+            }
+            panic!("nvcc compilation FAILED");
+        }
+    }
+
+    let run = std::process::Command::new(test_bin)
+        .args(["--fused-silu", fused_path])
+        .output()
+        .expect("test binary");
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    for line in stdout.lines() {
+        println!("  {line}");
+    }
+
+    if !run.status.success() {
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        for line in stderr.lines() {
+            println!("  ERR: {line}");
+        }
+        panic!("norm+GEMM+SiLU GPU correctness FAILED");
+    }
+
+    println!("PASS: norm+GEMM+SiLU GPU correctness verified");
 }

@@ -85,7 +85,10 @@ mod tests {
     #[test]
     fn test_result_alias() {
         let ok: VllmResult<u32> = Ok(42);
-        assert_eq!(ok.unwrap(), 42);
+        #[allow(clippy::unnecessary_literal_unwrap)]
+        {
+            assert_eq!(ok.unwrap(), 42);
+        }
 
         let err: VllmResult<u32> = Err(VllmError::Internal("boom".into()));
         assert!(err.is_err());

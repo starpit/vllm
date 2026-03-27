@@ -646,7 +646,7 @@ mod tests {
     #[test]
     fn test_graph_piece_type_clone() {
         let original = GraphPieceType::LayerPreAttn(5);
-        let cloned = original.clone();
+        let cloned = original;
 
         assert!(matches!(cloned, GraphPieceType::LayerPreAttn(5)));
     }

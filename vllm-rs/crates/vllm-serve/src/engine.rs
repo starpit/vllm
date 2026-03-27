@@ -3798,6 +3798,8 @@ mod tests {
             bad_words: None,
             truncate_prompt_tokens: None,
             block_annotations: None,
+            seal: false,
+            volatile: false,
         };
 
         let params = engine
@@ -3852,6 +3854,8 @@ mod tests {
             bad_words: None,
             truncate_prompt_tokens: None,
             block_annotations: None,
+            seal: false,
+            volatile: false,
         };
 
         let params = engine
@@ -3975,7 +3979,7 @@ mod tests {
         assert_eq!(delta.finish_reason, Some(FinishReason::Length));
 
         // Finished streaming request should be removed from the map.
-        assert!(requests.get("req-1").is_none());
+        assert!(!requests.contains_key("req-1"));
     }
 
     #[test]
@@ -4085,6 +4089,8 @@ mod tests {
             bad_words: None,
             truncate_prompt_tokens: None,
             block_annotations: None,
+            seal: false,
+            volatile: false,
         }
     }
 

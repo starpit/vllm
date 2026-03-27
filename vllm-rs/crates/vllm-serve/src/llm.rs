@@ -992,6 +992,8 @@ mod tests {
             bad_words: None,
             truncate_prompt_tokens: None,
             block_annotations: None,
+            seal: false,
+            volatile: false,
         }
     }
 

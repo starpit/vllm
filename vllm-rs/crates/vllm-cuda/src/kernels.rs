@@ -5485,8 +5485,8 @@ pub unsafe fn fused_moe_fp8_block_gemm(
 
     let block_n = block_size[0];
     let block_k = block_size[1];
-    let scale_cols = (in_features + block_k - 1) / block_k;
-    let scale_rows = (out_features + block_n - 1) / block_n;
+    let scale_cols = in_features.div_ceil(block_k);
+    let scale_rows = out_features.div_ceil(block_n);
     let scale_stride_e = scale_rows * scale_cols;
     let scale_stride_n = scale_cols;
 
@@ -5722,7 +5722,7 @@ mod tests_flash_attn {
 
     /// Upload a &[T] to GPU, return raw pointer.
     unsafe fn upload<T: Copy>(data: &[T], stream: cudarc::driver::sys::CUstream) -> *mut u8 {
-        let bytes = data.len() * std::mem::size_of::<T>();
+        let bytes = std::mem::size_of_val(data);
         let ptr = driver::mem_alloc(bytes).expect("mem_alloc");
         driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream)
             .expect("memcpy_htod");
@@ -5836,7 +5836,7 @@ mod tests_flash_attn {
             let val = half::bf16::from_f32(0.1);
 
             let q_ptr = upload(&vec![val.to_bits(); q_len * heads * head_dim], stream);
-            let cache_elems = 1 * block_size * heads * head_dim;
+            let cache_elems = block_size * heads * head_dim;
             let k_ptr = upload(&vec![val.to_bits(); cache_elems], stream);
             let v_ptr = upload(&vec![val.to_bits(); cache_elems], stream);
             let out_elems = q_len * heads * head_dim;
@@ -5935,15 +5935,9 @@ mod tests_flash_attn {
             // Build cache: block 0=val_b, block 1=garbage, block 2=val_a
             let epb = block_size * heads * head_dim;
             let mut cache: Vec<u16> = vec![0u16; num_blocks * epb];
-            for i in 0..epb {
-                cache[i] = val_b.to_bits();
-            } // block 0
-            for i in 0..epb {
-                cache[epb + i] = 0xDEAD;
-            } // block 1 (garbage)
-            for i in 0..epb {
-                cache[2 * epb + i] = val_a.to_bits();
-            } // block 2
+            cache[..epb].fill(val_b.to_bits()); // block 0
+            cache[epb..2 * epb].fill(0xDEAD); // block 1 (garbage)
+            cache[2 * epb..3 * epb].fill(val_a.to_bits()); // block 2
             let k_ptr = upload(&cache, stream);
             let v_ptr = upload(&cache, stream);
 
@@ -6408,7 +6402,7 @@ mod tests_flash_attn {
     ) {
         let stream = test_init();
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let num_blocks_per_seq = (kv_len + block_size - 1) / block_size;
+        let num_blocks_per_seq = kv_len.div_ceil(block_size);
         let total_physical_blocks = num_blocks_per_seq + 1; // +1 for shuffle room
 
         let mut rng_state: u32 = 0xBEEF_u32
@@ -8652,19 +8646,15 @@ mod tests_gdn {
 
             let result = download_f32(out, stream);
             // Row 0: x=[1,1,1,1], rms = sqrt(4/4) = 1, normed = 1/1 = 1, * 0.5 = 0.5
-            for i in 0..dim {
-                assert!(
-                    (result[i] - 0.5).abs() < 0.01,
-                    "row0[{i}]={}, expected 0.5",
-                    result[i]
-                );
+            for (i, &val) in result[..dim].iter().enumerate() {
+                assert!((val - 0.5).abs() < 0.01, "row0[{i}]={val}, expected 0.5",);
             }
             // Row 1: x=[2,2,2,2], rms = sqrt(16/4) = 2, normed = 2/2 = 1, * 0.5 = 0.5
-            for i in dim..2 * dim {
+            for (i, &val) in result[dim..2 * dim].iter().enumerate() {
                 assert!(
-                    (result[i] - 0.5).abs() < 0.01,
-                    "row1[{i}]={}, expected 0.5",
-                    result[i]
+                    (val - 0.5).abs() < 0.01,
+                    "row1[{}]={val}, expected 0.5",
+                    i + dim
                 );
             }
         }
@@ -9119,10 +9109,7 @@ mod tests_fp8_kv {
             // Fill each slot with its slot index cast to FP8 (via BF16→FP8 on host)
             // For simplicity, fill the entire cache with a known byte pattern.
             // FP8 E4M3: 0x38 = 1.0, 0x3C = 1.5, 0x40 = 2.0, 0x00 = 0.0
-            let mut cache_data = vec![0u8; cache_bytes];
-            for i in 0..cache_bytes {
-                cache_data[i] = 0x38; // 1.0 in FP8 E4M3
-            }
+            let cache_data = vec![0x38u8; cache_bytes]; // 1.0 in FP8 E4M3
             driver::memcpy_htod_async(cache_ptr, cache_data.as_ptr(), cache_bytes, stream)
                 .expect("H2D cache");
             let cache = GpuTensor::new(
@@ -9168,8 +9155,8 @@ mod tests_fp8_kv {
             .expect("D2H");
             driver::stream_synchronize(stream).expect("sync");
 
-            for i in 0..out_count {
-                let val = bf16_to_f32(out_bf16[i]);
+            for (i, &raw) in out_bf16[..out_count].iter().enumerate() {
+                let val = bf16_to_f32(raw);
                 assert!(
                     (val - 1.0).abs() < 0.1,
                     "element {i}: expected ~1.0, got {val}"
@@ -9181,6 +9168,7 @@ mod tests_fp8_kv {
     /// Set K/V scale on pool and verify via D2H.
     #[test]
     #[ignore] // requires CUDA GPU
+    #[allow(clippy::approx_constant)]
     fn test_cuda_kv_pool_fp8_set_scale() {
         unsafe {
             let (_alloc, stream) = test_init();
@@ -9280,19 +9268,23 @@ mod tests_fp8_kv {
             driver::stream_synchronize(stream).expect("sync");
 
             // First 3 tokens (24 elements) should be ~1.0.
-            for i in 0..(3 * n_elems) {
-                let val = bf16_to_f32(out_bf16[i]);
+            for (i, &raw) in out_bf16[..(3 * n_elems)].iter().enumerate() {
+                let val = bf16_to_f32(raw);
                 assert!(
                     (val - 1.0).abs() < 0.1,
                     "element {i}: expected ~1.0, got {val}"
                 );
             }
             // Elements beyond actual total should remain zero (bounds check worked).
-            for i in (3 * n_elems)..(max_total * n_elems) {
-                let val = bf16_to_f32(out_bf16[i]);
+            for (i, &raw) in out_bf16[(3 * n_elems)..(max_total * n_elems)]
+                .iter()
+                .enumerate()
+            {
+                let val = bf16_to_f32(raw);
                 assert!(
                     val.abs() < 0.001,
-                    "element {i} beyond total: expected ~0.0, got {val}"
+                    "element {} beyond total: expected ~0.0, got {val}",
+                    i + 3 * n_elems
                 );
             }
 
@@ -9534,7 +9526,7 @@ mod tests_fp8_moe_gemm {
     }
 
     unsafe fn upload_slice<T: Copy>(data: &[T], stream: cudarc::driver::sys::CUstream) -> *mut u8 {
-        let bytes = data.len() * std::mem::size_of::<T>();
+        let bytes = std::mem::size_of_val(data);
         let ptr = driver::mem_alloc(bytes).expect("alloc");
         driver::memcpy_htod_async(ptr, data.as_ptr() as *const u8, bytes, stream).expect("h2d");
         driver::stream_synchronize(stream).expect("sync");
@@ -9584,7 +9576,7 @@ mod tests_fp8_moe_gemm {
             let topk_weights_ptr = upload_slice(&vec![1.0f32; num_tokens * top_k], stream);
             let topk_weights = GpuTensor::new(topk_weights_ptr, &[num_tokens, top_k], DType::F32);
 
-            let topk_ids_ptr = upload_slice(&vec![0i32, 0, 1, 1], stream);
+            let topk_ids_ptr = upload_slice(&[0i32, 0, 1, 1], stream);
             let topk_ids = GpuTensor::new(topk_ids_ptr, &[num_tokens, top_k], DType::I32);
 
             let (sorted, experts, ntpp) =
@@ -10515,11 +10507,13 @@ mod tests_fused_qkv_rope_cache {
             let kc = download_bf16_raw(kcache_ptr, cache_elems, stream);
 
             // Slot 1 region: offset = 1 * kv_size = 8 elements — should be sentinel.
-            for i in kv_size..(2 * kv_size) {
+            for (j, &val) in kc[kv_size..(2 * kv_size)].iter().enumerate() {
                 assert_eq!(
-                    kc[i], 0xBEEF,
-                    "Padding slot should be untouched, but slot 1 K[{i}] = 0x{:04X}",
-                    kc[i]
+                    val,
+                    0xBEEF,
+                    "Padding slot should be untouched, but slot 1 K[{}] = 0x{:04X}",
+                    j + kv_size,
+                    val
                 );
             }
 

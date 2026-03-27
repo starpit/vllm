@@ -752,17 +752,17 @@ mod tests {
             if !detok.stream_prefix.is_empty() && detok.stream_prefix_index > 0 {
                 let prefix_tokens =
                     &detok.stream_ids[..detok.stream_prefix_index.min(detok.stream_ids.len())];
-                if !prefix_tokens.is_empty() {
-                    if let Ok(decoded) = tok.inner().decode(prefix_tokens, false) {
-                        // The decoded prefix tokens should match or be a prefix of stream_prefix
-                        assert!(
-                            detok.stream_prefix.starts_with(&decoded)
-                                || decoded.starts_with(&detok.stream_prefix),
-                            "Prefix mismatch: decoded={:?}, stream_prefix={:?}",
-                            decoded,
-                            detok.stream_prefix
-                        );
-                    }
+                if !prefix_tokens.is_empty()
+                    && let Ok(decoded) = tok.inner().decode(prefix_tokens, false)
+                {
+                    // The decoded prefix tokens should match or be a prefix of stream_prefix
+                    assert!(
+                        detok.stream_prefix.starts_with(&decoded)
+                            || decoded.starts_with(&detok.stream_prefix),
+                        "Prefix mismatch: decoded={:?}, stream_prefix={:?}",
+                        decoded,
+                        detok.stream_prefix
+                    );
                 }
             }
         }

@@ -3758,11 +3758,11 @@ pub fn load_fp8_block_moe_experts(
     let w1_k = hidden_size;
     let w2_n = hidden_size;
     let w2_k = ipp;
-    let w1_scale_rows = (w1_n + block_n - 1) / block_n;
-    let w1_scale_cols = (w1_k + block_k - 1) / block_k;
-    let w2_scale_rows = (w2_n + block_n - 1) / block_n;
-    let w2_scale_cols = (w2_k + block_k - 1) / block_k;
-    let gate_scale_rows = (ipp + block_n - 1) / block_n;
+    let w1_scale_rows = w1_n.div_ceil(block_n);
+    let w1_scale_cols = w1_k.div_ceil(block_k);
+    let w2_scale_rows = w2_n.div_ceil(block_n);
+    let w2_scale_cols = w2_k.div_ceil(block_k);
+    let gate_scale_rows = ipp.div_ceil(block_n);
 
     // Allocate stacked FP8 weight buffers (per-partition sizes).
     let w1_bytes = num_experts * w1_n * w1_k;
@@ -5194,6 +5194,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_read_write_f32_roundtrip() {
         let original = vec![1.0f32, -2.5, 3.14, 0.0];
 

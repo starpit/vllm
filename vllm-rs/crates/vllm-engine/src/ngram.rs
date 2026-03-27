@@ -456,7 +456,7 @@ mod tests {
                         if &tokens[start..start + n] == tail {
                             let follow_start = start + n;
                             if follow_start + drafts.len() <= tokens.len()
-                                && &tokens[follow_start..follow_start + drafts.len()] == &drafts[..]
+                                && tokens[follow_start..follow_start + drafts.len()] == drafts[..]
                             {
                                 found = true;
                                 break 'outer;

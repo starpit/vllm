@@ -442,6 +442,8 @@ fn non_empty(s: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    type StreamStep<'a> = (&'a str, &'a str, &'a str, &'a [u32], &'a [u32], &'a [u32]);
+
     /// Build a minimal vocab with <think> and </think> tokens.
     fn test_vocab() -> HashMap<String, u32> {
         let mut vocab = HashMap::new();
@@ -1069,7 +1071,7 @@ mod tests {
         let parser = DeepSeekR1ReasoningParser::new(&vocab).unwrap();
         let mut state = parser.create_streaming_state();
 
-        let steps: Vec<(&str, &str, &str, &[u32], &[u32], &[u32])> = vec![
+        let steps: Vec<StreamStep<'_>> = vec![
             // (prev_text, curr_text, delta, prev_ids, curr_ids, delta_ids)
             ("", "<think>", "<think>", &[], &[100], &[100]),
             ("<think>", "<think>Let ", "Let ", &[100], &[100, 10], &[10]),
@@ -1147,7 +1149,7 @@ mod tests {
         let parser = Qwen3ReasoningParser::new(&vocab).unwrap();
         let mut state = parser.create_streaming_state();
 
-        let steps: Vec<(&str, &str, &str, &[u32], &[u32], &[u32])> = vec![
+        let steps: Vec<StreamStep<'_>> = vec![
             ("", "I need ", "I need ", &[], &[10], &[10]),
             ("I need ", "I need to ", "to ", &[10], &[10, 11], &[11]),
             (

@@ -1162,3 +1162,54 @@ pub fn replace_cutlass_a_loads(input: TokenStream) -> TokenStream {
     };
     output.into()
 }
+
+/// Fuse rms_norm into CUTLASS bf16 GEMM prologue.
+///
+/// Replaces A-matrix cp.async loads with inline rms_norm computation:
+/// each load site computes input * weight * inv_rms and writes bf16
+/// directly to CUTLASS's SMEM tile slot.
+///
+/// The host passes input_ptr in the A_ptr field of the CUTLASS params.
+///
+/// ```rust,ignore
+/// fuse_rms_norm_cutlass!(
+///     "kernels/cutlass_gemm_bf16_sm89.ptx",
+///     "Gemm",
+///     "fused_rms_norm_cutlass_gemm",
+///     FUSED_RMS_NORM_CUTLASS_PTX
+/// );
+/// ```
+#[proc_macro]
+pub fn fuse_rms_norm_cutlass(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    // Parse 4 args: (path, entry_substr, entry_name, CONST_NAME)
+    let parts: Vec<&str> = input_str.split(',').collect();
+    if parts.len() != 4 {
+        panic!(
+            "fuse_rms_norm_cutlass! expects (\"path.ptx\", \"entry_substr\", \"entry_name\", CONST_NAME)"
+        );
+    }
+    let path = parts[0].trim().trim_matches('"').trim();
+    let entry_substr = parts[1].trim().trim_matches('"').trim();
+    let entry_name = parts[2].trim().trim_matches('"').trim();
+    let const_name_str = parts[3].trim();
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let ptx_path = PathBuf::from(&manifest_dir).join(path);
+    let ptx_source = std::fs::read_to_string(&ptx_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ptx_path.display()));
+
+    let extracted = extract::extract_entry(&ptx_source, entry_substr)
+        .unwrap_or_else(|e| panic!("extract_entry failed: {e}"));
+
+    let fused = fuse_cp_async::fuse_rms_norm_into_cutlass(&extracted, "", entry_name)
+        .unwrap_or_else(|e| panic!("rms_norm fusion failed: {e}"));
+
+    let fused_str = fused.as_str();
+    let const_name = syn::Ident::new(const_name_str, proc_macro2::Span::call_site());
+
+    let output = quote! {
+        const #const_name: &str = #fused_str;
+    };
+    output.into()
+}

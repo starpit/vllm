@@ -10,7 +10,9 @@
 
 #![cfg(feature = "cuda")]
 
-use ptx_fusion_macros::{analyze_kernel_as, delete_cutlass_a_loads, replace_cutlass_a_loads};
+use ptx_fusion_macros::{
+    analyze_kernel_as, delete_cutlass_a_loads, fuse_rms_norm_cutlass, replace_cutlass_a_loads,
+};
 
 // ── Protocol extraction for every kernel type ──
 
@@ -31,6 +33,14 @@ delete_cutlass_a_loads!(
     "kernels/cutlass_gemm_bf16_sm89.ptx",
     "Gemm",
     CUTLASS_BF16_NO_A_LOADS
+);
+
+// CUTLASS bf16 with rms_norm fused into A-matrix loads
+fuse_rms_norm_cutlass!(
+    "kernels/cutlass_gemm_bf16_sm89.ptx",
+    "Gemm",
+    "fused_rms_norm_cutlass_gemm",
+    FUSED_RMS_NORM_CUTLASS_PTX
 );
 
 // CUTLASS bf16 with A-matrix cp.async replaced by explicit ld.global + st.shared
@@ -347,4 +357,117 @@ fn explicit_a_loads_gpu_correctness() {
     }
 
     println!("PASS: explicit A-loads GPU correctness verified");
+}
+
+#[test]
+fn fused_rms_norm_cutlass_passes_ptxas() {
+    // Verify the fused kernel has the right structure
+    let has_entry = FUSED_RMS_NORM_CUTLASS_PTX.contains("fused_rms_norm_cutlass_gemm");
+    let has_prologue = FUSED_RMS_NORM_CUTLASS_PTX.contains("FERRITE: rms_norm prologue");
+    let has_normalized = FUSED_RMS_NORM_CUTLASS_PTX.contains("FERRITE: normalized A-load");
+    let has_inv_rms = FUSED_RMS_NORM_CUTLASS_PTX.contains("rsqrt.approx.f32");
+    let remaining_cp = FUSED_RMS_NORM_CUTLASS_PTX
+        .matches("cp.async.cg.shared.global")
+        .count();
+    let mma_count = FUSED_RMS_NORM_CUTLASS_PTX.matches("mma.sync").count();
+    let normalized_count = FUSED_RMS_NORM_CUTLASS_PTX
+        .matches("FERRITE: normalized A-load")
+        .count();
+
+    println!("=== Fused rms_norm+CUTLASS GEMM ===");
+    println!("  Has fused entry: {has_entry}");
+    println!("  Has prologue: {has_prologue}");
+    println!("  Has normalized loads: {has_normalized}");
+    println!("  Has rsqrt: {has_inv_rms}");
+    println!("  Remaining cp.async: {remaining_cp} (B-matrix only)");
+    println!("  Normalized A-loads: {normalized_count}");
+    println!("  MMA instructions: {mma_count}");
+
+    assert!(has_entry, "should have fused entry point");
+    assert!(has_prologue, "should have rms_norm prologue");
+    assert!(has_normalized, "should have normalized A-loads");
+    assert!(has_inv_rms, "should compute inv_rms via rsqrt");
+    assert!(remaining_cp > 0, "should preserve B-matrix cp.async");
+    assert_eq!(normalized_count, 6, "should have 6 normalized A-loads");
+    assert!(mma_count > 0, "MMA should be preserved");
+
+    // Write to disk and validate with ptxas
+    let path = "/tmp/fused_rms_norm_cutlass.ptx";
+    std::fs::write(path, FUSED_RMS_NORM_CUTLASS_PTX).unwrap();
+
+    let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for line in stderr.lines().take(30) {
+            println!("ptxas: {line}");
+        }
+        panic!("ptxas FAILED on fused rms_norm+CUTLASS GEMM");
+    }
+
+    println!(
+        "PASS: fused rms_norm+CUTLASS GEMM passes ptxas ({normalized_count} normalized, {remaining_cp} B-preserved, {mma_count} MMA)"
+    );
+}
+
+#[test]
+fn fused_rms_norm_cutlass_gpu_correctness() {
+    // Write fused PTX for the C++ test harness
+    let fused_path = "/tmp/fused_rms_norm_cutlass.ptx";
+    std::fs::write(fused_path, FUSED_RMS_NORM_CUTLASS_PTX).unwrap();
+
+    // Compile the C++ test harness (separate binary to avoid race with explicit test)
+    let test_bin = "/tmp/cutlass_fused_test";
+    let test_src = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/cutlass_prologue_test.cu"
+    );
+
+    let compile = std::process::Command::new("/usr/local/cuda-12.9/bin/nvcc")
+        .args([
+            "-arch=sm_89",
+            "-O2",
+            "-std=c++17",
+            "-I/home/moosevan/.cache/cutlass/include",
+            "-o",
+            test_bin,
+            test_src,
+            "-lcuda",
+        ])
+        .output()
+        .expect("nvcc");
+
+    if !compile.status.success() {
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        if stderr.contains("error") {
+            for line in stderr.lines().filter(|l| l.contains("error")).take(10) {
+                println!("nvcc: {line}");
+            }
+            panic!("nvcc compilation FAILED");
+        }
+    }
+
+    // Run the fused test
+    let run = std::process::Command::new(test_bin)
+        .args(["--fused", fused_path])
+        .output()
+        .expect("test binary");
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    for line in stdout.lines() {
+        println!("  {line}");
+    }
+
+    if !run.status.success() {
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        for line in stderr.lines() {
+            println!("  ERR: {line}");
+        }
+        panic!("Fused rms_norm GPU correctness test FAILED");
+    }
+
+    println!("PASS: fused rms_norm+CUTLASS GEMM GPU correctness verified");
 }

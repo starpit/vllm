@@ -42,6 +42,8 @@ pub mod cublas;
 pub mod device;
 #[cfg(feature = "cuda")]
 pub mod driver;
+#[cfg(feature = "ferrite")]
+pub mod ferrite;
 #[cfg(feature = "cuda")]
 pub mod ggml;
 #[cfg(feature = "cuda")]

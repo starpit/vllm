@@ -13,6 +13,8 @@ cuda = ["dep:cudarc", "cudaforge"]
 nccl = ["cuda", "cudarc/nccl"]
 # Enable NVTX profiling annotations for nsys/Nsight traces.
 profiling = ["cuda", "cudarc/nvtx"]
+# Enable Ferrite CUTLASS GEMM fusion (compile-time PTX transformation).
+ferrite = ["cuda", "dep:ptx-fusion"]
 
 [dependencies]
 cudarc = { workspace = true, optional = true, features = ["cublas", "cublaslt", "dynamic-linking", "cuda-version-from-build-system"] }
@@ -28,6 +30,7 @@ vllm-common = { path = "../vllm-common" }
 vllm-config = { path = "../vllm-config" }
 vllm-model = { path = "../vllm-model" }
 libc = { workspace = true }
+ptx-fusion = { path = "../ptx-fusion", optional = true, features = ["cuda"] }
 
 [build-dependencies]
 cudaforge = { version = "=0.1.4", optional = true }

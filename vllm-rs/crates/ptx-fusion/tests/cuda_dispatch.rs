@@ -319,3 +319,135 @@ fn rust_params_gpu_correctness() {
 
     println!("PASS: Rust GemmParams builder produces correct output (max_diff={max_diff:.2e})");
 }
+
+#[test]
+fn gemm_residual_add_gpu() {
+    use ptx_fusion::dispatch::{GemmParams, IteratorConstants};
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    let dispatch = CutlassDispatch::new(
+        &ctx,
+        vec![CutlassConfigSpec::new(
+            "64x128x32",
+            64,
+            128,
+            32,
+            128,
+            36864,
+            CONFIG_64x128x32,
+        )],
+    )
+    .unwrap();
+
+    let config = &dispatch.configs()[0];
+    let m = 64u32;
+    let n = 128u32;
+    let k = 32u32;
+
+    fn f32_to_bf16(v: f32) -> u16 {
+        (v.to_bits() >> 16) as u16
+    }
+    fn bf16_to_f32(v: u16) -> f32 {
+        f32::from_bits((v as u32) << 16)
+    }
+
+    let h_a: Vec<u16> = (0..(m * k) as usize)
+        .map(|i| f32_to_bf16(((i as f32) * 0.037 - 0.5).sin() * 0.5))
+        .collect();
+    let h_b: Vec<u16> = (0..(n * k) as usize)
+        .map(|i| f32_to_bf16(((i as f32) * 0.023 + 0.3).cos() * 0.5))
+        .collect();
+    // Residual: non-zero values that get ADDED to GEMM output
+    let h_residual: Vec<u16> = (0..(m * n) as usize)
+        .map(|i| f32_to_bf16(((i as f32) * 0.011 + 0.1).sin() * 0.3))
+        .collect();
+
+    let d_a = stream.clone_htod(&h_a).unwrap();
+    let d_b = stream.clone_htod(&h_b).unwrap();
+    // C = residual (the beta*C term)
+    let d_c = stream.clone_htod(&h_residual).unwrap();
+    // D = output (written in-place over a copy of residual for in-place add)
+    let mut d_d = stream.clone_htod(&h_residual).unwrap();
+
+    let (a_ptr, _) = d_a.device_ptr(&stream);
+    let (b_ptr, _) = d_b.device_ptr(&stream);
+    let (c_ptr, _) = d_c.device_ptr(&stream);
+    let (d_ptr, _) = d_d.device_ptr(&stream);
+
+    // Build params with beta=1.0 (residual add!)
+    let mut params = GemmParams::new(
+        a_ptr as u64,
+        b_ptr as u64,
+        c_ptr as u64,
+        d_ptr as u64,
+        m,
+        n,
+        k,
+        k,
+        k,
+        n,
+        n,
+        config.tile_m,
+        config.tile_n,
+        &IteratorConstants::CONFIG_64X128X32,
+    );
+    params.set_epilogue(1.0, 1.0); // D = 1.0 * A*B + 1.0 * C
+
+    let (gx, gy, gz) = CutlassDispatch::grid_dim(config, m, n);
+    let launch_cfg = LaunchConfig {
+        grid_dim: (gx, gy, gz),
+        block_dim: (config.threads, 1, 1),
+        shared_mem_bytes: config.smem_bytes,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&config.func)
+            .arg(&params.bytes)
+            .launch(launch_cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+
+    let output = stream.clone_dtoh(&d_d).unwrap();
+
+    // CPU reference: output[m,n] = sum_k(A[m,k]*B[n,k]) + residual[m,n]
+    let mut expected = vec![0.0f32; (m * n) as usize];
+    for row in 0..m as usize {
+        for col in 0..n as usize {
+            let mut acc = 0.0f32;
+            for ki in 0..k as usize {
+                acc += bf16_to_f32(h_a[row * k as usize + ki])
+                    * bf16_to_f32(h_b[col * k as usize + ki]);
+            }
+            expected[row * n as usize + col] =
+                acc + bf16_to_f32(h_residual[row * n as usize + col]);
+        }
+    }
+
+    let mut max_diff = 0.0f32;
+    for i in 0..(m * n) as usize {
+        max_diff = max_diff.max((bf16_to_f32(output[i]) - expected[i]).abs());
+    }
+
+    println!(
+        "  GEMM+residual output[0..4]: [{:.4}, {:.4}, {:.4}, {:.4}]",
+        bf16_to_f32(output[0]),
+        bf16_to_f32(output[1]),
+        bf16_to_f32(output[2]),
+        bf16_to_f32(output[3])
+    );
+    println!(
+        "  Expected[0..4]: [{:.4}, {:.4}, {:.4}, {:.4}]",
+        expected[0], expected[1], expected[2], expected[3]
+    );
+    println!("  Max diff: {max_diff:.2e}");
+
+    assert!(
+        max_diff < 0.05,
+        "residual add incorrect (max_diff={max_diff:.2e})"
+    );
+    println!("PASS: GEMM + residual add via beta=1.0 (max_diff={max_diff:.2e})");
+}

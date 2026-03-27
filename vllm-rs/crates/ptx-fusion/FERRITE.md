@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **74 tests** (62 CUDA GPU + 12 doc-ignored + 10 unit), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **75 tests** (63 CUDA GPU + 12 doc-ignored + 10 unit), all passing.
 
 ### What's Proven
 
@@ -88,6 +88,7 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **74 tests** (62 CUDA GPU + 12 doc-ignored 
 | Perimeter: 5 kernel types | cuda_cutlass_bf16 | hand-written, nvcc, row-GEMM, CUTLASS bf16, CUTLASS FP8 |
 | Multi-tile CUTLASS dispatch | cuda_dispatch | 3 configs loaded, tile selection, Rust params builder GPU-verified |
 | **norm+GEMM+SiLU (GPU)** | cuda_cutlass_bf16 | **prologue + epilogue composed, 6.25e-2 diff (bf16 rounding)** |
+| GEMM + residual add (GPU) | cuda_dispatch | beta=1.0 in CUTLASS LinearCombination, 1.56e-2 diff |
 | Stress tests | cuda_stress | n=1 to n=4096, 100-run determinism |
 
 ### Benchmarks
@@ -302,8 +303,10 @@ and hidden_size are prepended as extra params.
 - `inject_epilogue!` -- SiLU/GELU/ReLU into epilogue (0.00e0)
 - `fuse_norm_gemm_silu!` -- prologue + epilogue composed (6.25e-2, bf16 rounding)
 
+**Also proven**:
+- GEMM + residual add -- just `beta=1.0` in CUTLASS LinearCombination (no PTX mod needed!)
+
 **Need to build**:
-- `fuse_gemm_residual!` -- residual add in GEMM epilogue (O_proj, down_proj)
 - More epilogue ops: quantize (f32->fp8), scale
 
 ### The Ferrite-based forward pass
@@ -328,8 +331,8 @@ Each `fuse_*!` macro generates: fused PTX (compile-time) + `launch()` function
 
 ```
 Phase 0: CUTLASS parity with cuBLAS     ← DONE (benchmarked, dispatch, Rust params builder)
-Phase 1: Fused operation library          ← IN PROGRESS (norm+SiLU done, need residual)
-Phase 2: Runtime integration (llama.rs)   ← wire into OwnedTensor/CachingAllocator
+Phase 1: Fused operation library          ← DONE (norm+GEMM, norm+GEMM+SiLU, GEMM+residual)
+Phase 2: Runtime integration (llama.rs)   ← NEXT: wire into OwnedTensor/CachingAllocator
 Phase 3: FlashAttention perimeter         ← exploratory
 Phase 4: Persistent layer kernel          ← endgame
 ```

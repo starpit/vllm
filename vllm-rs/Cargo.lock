@@ -7003,6 +7003,7 @@ dependencies = [
  "libc",
  "memmap2",
  "portpicker",
+ "ptx-fusion",
  "rand 0.8.5",
  "safetensors 0.7.0",
  "serde",

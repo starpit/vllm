@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **75 tests** (63 CUDA GPU + 12 doc-ignored + 10 unit), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **140 tests** (68 CUDA GPU + 72 unit + doc-ignored), all passing.
 
 ### What's Proven
 
@@ -90,6 +90,9 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **75 tests** (63 CUDA GPU + 12 doc-ignored 
 | **norm+GEMM+SiLU (GPU)** | cuda_cutlass_bf16 | **prologue + epilogue composed, 6.25e-2 diff (bf16 rounding)** |
 | GEMM + residual add (GPU) | cuda_dispatch | beta=1.0 in CUTLASS LinearCombination, 1.56e-2 diff |
 | Stress tests | cuda_stress | n=1 to n=4096, 100-run determinism |
+| **Def-use graph + param classification** | cuda_cutlass_bf16 | **31 fields classified: 8 Ptr, 4 Stride, 6 Dim, 2 Scalar, 11 Derived** |
+| **Perimeter replacement (ptxas)** | cuda_cutlass_bf16 | **flat-param GEMM: 33 ld.param rewritten, ptxas valid** |
+| Derivation probing (build.rs) | build.rs | 4 CUTLASS configs probed: 64x64, 64x128, 128x128, 128x128x64 |
 
 ### Benchmarks
 
@@ -213,22 +216,31 @@ as computations from raw params. The kernel's interior is untouched.
 
 ### Implementation phases
 
-**Phase 1: Def-use graph + param classification** (parser.rs)
+**Phase 1: Def-use graph + param classification** (parser.rs) — **DONE**
 
-Build a def-use graph (one pass, O(N)). Classify each `ld.param` by tracing
-forward through the graph:
-- Reaches `ld.global`/`st.global` address → **Pointer**
-- Multiplied with a pointer param → **Stride**
-- Used in `setp` comparison → **Dimension**
-- Used in scalar arithmetic (mul.f32) → **Scalar**
-- Not traceable to raw source → **Derived** (extract linear relationship)
+Def-use graph built in single O(N) pass. Param classification combines:
+- Forward tracing through def-use graph (Stride via mul, Dimension via setp)
+- Existing backward perimeter analysis (Pointer via traced memory addresses)
+- Type-based (f32 → Scalar)
+- Default (Derived for unclassified)
+Tested on CUTLASS bf16 GEMM: 8 Ptr, 4 Stride, 6 Dim, 2 Scalar, 11 Derived.
 
-**Phase 2: Perimeter replacement** (new perimeter.rs)
+**Phase 2: Perimeter replacement** (perimeter.rs) — **IN PROGRESS**
 
-Given classified params, emit a new entry point with simplified params:
-- Raw params at new offsets
-- Derived params replaced with inline computation (`mul`, `add`)
-- Result: kernel takes only (ptrs, strides, dims, scalars). No derived fields.
+build.rs compiles 4 CUTLASS configs to PTX and probes each with a generated
+C++ program that varies raw params one at a time to extract per-field linear
+formulas (slope + intercept). The probe results are stored as `.derivations.json`
+alongside each `.ptx` in `kernels/`.
+
+`replace_perimeter()` rewrites the PTX entry point:
+- New flat param: `ferrite_params[88]` = 4 ptrs + 4 strides + M/N/K + alpha/beta
+- Raw fields: `ld.param` remapped to flat offsets
+- Derived fields: replaced with inline `shl`/`mul`/`add` from raw params
+- Dimension fields: ceil-division computed inline (e.g., `grid_tiled_shape.m = ceil(M/64)`)
+- Constants: `mov` with probed value
+- Kernel interior untouched
+
+**Passes ptxas.** Next: GPU correctness test at M=1024 N=2560 K=2048 vs cuBLAS.
 
 **Phase 3: General fusion engine** (new fuse_general.rs)
 
@@ -294,7 +306,8 @@ that feeds an output store. The GEMM interior is untouched. 12 injection sites,
 ```
 crates/ptx-fusion-macros/          Proc macro crate (runs at compile time)
   src/lib.rs                       All proc macros
-  src/parser.rs                    PTX parser + escape perimeter extraction
+  src/parser.rs                    PTX parser + escape perimeter + def-use graph + param classification
+  src/perimeter.rs                 Perimeter replacement: rewrite param interface using probed derivations
   src/fuse.rs                      SMEM stitching fusion engine (toy kernels)
   src/fuse_real.rs                 SMEM stitching for real nvcc PTX (vectorized, multi-pass)
   src/fuse_epilogue.rs             GEMM epilogue injection (parameterized: SiLU, GELU, ReLU)
@@ -308,9 +321,9 @@ crates/ptx-fusion/                 Library + tests
   src/lib.rs                       KernelProtocol types + re-exports
   src/dispatch.rs                  Multi-tile CUTLASS runtime dispatcher
   src/main.rs                      Demo: extract + rewrite + fuse + validate
-  build.rs                         Compiles vllm-cuda csrc/ kernels to PTX at build time
-  kernels/                         Hand-written, nvcc-compiled, and CUTLASS PTX files
-  tests/                           59 CUDA GPU tests + 4 dispatch tests
+  build.rs                         Compiles vllm-cuda kernels + CUTLASS configs + probes derivations
+  kernels/                         PTX files + .derivations.json (probed param formulas)
+  tests/                           68 CUDA GPU tests + 4 dispatch tests
 ```
 
 ## Proc Macros
@@ -332,6 +345,7 @@ crates/ptx-fusion/                 Library + tests
 | `replace_cutlass_a_loads!(...)` | Replace A-matrix cp.async with explicit ld.global+st.shared |
 | `fuse_rms_norm_cutlass!(...)` | Fuse rms_norm prologue into CUTLASS GEMM (normalize inline) |
 | `fuse_norm_gemm_silu!(...)` | Prologue + epilogue: norm -> GEMM + SiLU in one kernel |
+| `replace_perimeter_macro!(...)` | Rewrite CUTLASS param interface: flat layout, derived fields inlined |
 
 ## What's Next
 

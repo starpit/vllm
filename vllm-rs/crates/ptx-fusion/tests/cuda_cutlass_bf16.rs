@@ -10,9 +10,10 @@
 
 #![cfg(feature = "cuda")]
 
+use ptx_fusion::ParamRole;
 use ptx_fusion_macros::{
     analyze_kernel_as, delete_cutlass_a_loads, fuse_norm_gemm_silu, fuse_rms_norm_cutlass,
-    replace_cutlass_a_loads,
+    replace_cutlass_a_loads, replace_perimeter_macro,
 };
 
 // ── Protocol extraction for every kernel type ──
@@ -588,4 +589,192 @@ fn fused_norm_gemm_silu_gpu_correctness() {
     }
 
     println!("PASS: norm+GEMM+SiLU GPU correctness verified");
+}
+
+#[test]
+fn classify_cutlass_bf16_params() {
+    println!("=== CUTLASS bf16 param classification ===");
+    CUTLASS_BF16.display();
+
+    let cp = CUTLASS_BF16.classified_params;
+    assert!(
+        !cp.is_empty(),
+        "CUTLASS bf16 should have classified param fields"
+    );
+
+    println!("\nClassified fields:");
+    for p in cp {
+        let role = match p.role {
+            ParamRole::Pointer => "Pointer",
+            ParamRole::Stride => "Stride",
+            ParamRole::Dimension => "Dimension",
+            ParamRole::Scalar => "Scalar",
+            ParamRole::Derived => "Derived",
+        };
+        println!("  offset {:4}: {} → {}", p.offset, p.ptx_type, role);
+    }
+
+    // Helper to find a field by offset
+    let role_at = |offset: i64| -> ParamRole {
+        cp.iter()
+            .find(|p| p.offset == offset)
+            .unwrap_or_else(|| panic!("no field at offset {offset}"))
+            .role
+    };
+
+    // ── Key verifications from the plan ──
+
+    // Offset 32 (ld.param.u64 %rd51, [%rd1+8]; actual=24+8=32):
+    // Used in mul.lo.s64 → Stride (leading dimension / lda)
+    assert_eq!(
+        role_at(32),
+        ParamRole::Stride,
+        "offset 32 should be Stride (lda, feeds mul.lo.s64)"
+    );
+
+    // Offset 64 (ld.param.u64 %rd7, [%rd1+40]; actual=24+40=64):
+    // Feeds add.s64 → cp.async address; the other add operand traces to mul → Pointer
+    assert_eq!(
+        role_at(64),
+        ParamRole::Pointer,
+        "offset 64 should be Pointer (A matrix base ptr)"
+    );
+
+    // Offset 40 (ld.param.u64 %rd2, [%rd1+16]; actual=24+16=40):
+    // Added to already-complete addresses — inc_strided → Derived
+    assert_eq!(
+        role_at(40),
+        ParamRole::Derived,
+        "offset 40 should be Derived (inc_strided)"
+    );
+
+    // Offset 48 (ld.param.u64 %rd3, [%rd1+24]; actual=24+24=48):
+    // inc_advance or similar → Derived
+    assert_eq!(
+        role_at(48),
+        ParamRole::Derived,
+        "offset 48 should be Derived (inc_advance)"
+    );
+
+    // Offset 56 (ld.param.u64 %rd4, [%rd1+32]; actual=24+32=56):
+    // Another increment → Derived
+    assert_eq!(
+        role_at(56),
+        ParamRole::Derived,
+        "offset 56 should be Derived"
+    );
+
+    // Offset 12 (grid_tiled_shape.n) → used in setp → Dimension
+    assert_eq!(
+        role_at(12),
+        ParamRole::Dimension,
+        "offset 12 should be Dimension (grid_tiled_shape.n)"
+    );
+
+    // Offset 16 (grid_tiled_shape.k or similar) → used in setp → Dimension
+    assert_eq!(
+        role_at(16),
+        ParamRole::Dimension,
+        "offset 16 should be Dimension (grid_tiled_shape.k)"
+    );
+
+    // f32 params should be Scalar (alpha/beta at epilogue offsets)
+    let scalar_count = cp.iter().filter(|p| p.role == ParamRole::Scalar).count();
+    assert!(
+        scalar_count >= 1,
+        "should have at least 1 Scalar field (alpha/beta)"
+    );
+
+    // Sanity: count by role
+    let pointer_count = cp.iter().filter(|p| p.role == ParamRole::Pointer).count();
+    let stride_count = cp.iter().filter(|p| p.role == ParamRole::Stride).count();
+    let dim_count = cp.iter().filter(|p| p.role == ParamRole::Dimension).count();
+    let derived_count = cp.iter().filter(|p| p.role == ParamRole::Derived).count();
+
+    println!("\nRole counts:");
+    println!("  Pointer:   {pointer_count}");
+    println!("  Stride:    {stride_count}");
+    println!("  Dimension: {dim_count}");
+    println!("  Scalar:    {scalar_count}");
+    println!("  Derived:   {derived_count}");
+
+    // A CUTLASS GEMM should have multiple pointers (A, B, C, D ptrs + epilogue ptrs)
+    assert!(
+        pointer_count >= 2,
+        "should have at least 2 Pointer fields (A and B)"
+    );
+
+    // Should have stride fields (lda, ldb, ldc, ldd)
+    assert!(stride_count >= 2, "should have at least 2 Stride fields");
+
+    println!("PASS: CUTLASS bf16 param classification verified");
+}
+
+// ── Perimeter replacement (Phase 2) ──
+
+// Rewrite the CUTLASS 64x64x32 kernel to use flat params
+replace_perimeter_macro!(
+    "kernels/cutlass_gemm_bf16_sm89.ptx",
+    "kernels/cutlass_bf16_64x64x32_sm89.derivations.json",
+    "ferrite_gemm_64x64x32",
+    FLAT_GEMM_64x64x32
+);
+
+#[test]
+fn flat_param_gemm_passes_ptxas() {
+    println!("=== Flat-param CUTLASS GEMM (perimeter replacement) ===");
+
+    // Structural sanity
+    assert!(
+        FLAT_GEMM_64x64x32.contains(".entry ferrite_gemm_64x64x32("),
+        "should have ferrite entry name"
+    );
+    assert!(
+        FLAT_GEMM_64x64x32.contains("ferrite_params[88]"),
+        "should have flat param declaration"
+    );
+    assert!(
+        !FLAT_GEMM_64x64x32
+            .lines()
+            .any(|l| l.trim().starts_with("ld.param") && l.contains("_param_0")),
+        "should have no old param references in ld.param"
+    );
+
+    // MMA preserved
+    let mma_count = FLAT_GEMM_64x64x32.matches("mma.sync").count();
+    assert!(mma_count > 0, "MMA should be preserved");
+
+    // Validate with ptxas
+    let path = "/tmp/flat_gemm_64x64x32.ptx";
+    std::fs::write(path, FLAT_GEMM_64x64x32).unwrap();
+
+    let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Print first few errors for debugging
+        for line in stderr.lines().take(20) {
+            println!("ptxas: {line}");
+        }
+
+        // Also dump the PTX around the first error for debugging
+        if let Some(err_line) = stderr.lines().find(|l| l.contains("error")) {
+            println!("\nFirst error: {err_line}");
+        }
+
+        panic!("ptxas FAILED on flat-param GEMM");
+    }
+
+    let cp_async = FLAT_GEMM_64x64x32.matches("cp.async").count();
+    let replaced = FLAT_GEMM_64x64x32
+        .lines()
+        .filter(|l| l.contains("[ferrite] replaced"))
+        .count();
+
+    println!(
+        "PASS: flat-param GEMM passes ptxas ({replaced} replaced, {mma_count} MMA, {cp_async} cp.async)"
+    );
 }

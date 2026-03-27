@@ -11,7 +11,8 @@
 pub use ptx_fusion_macros::{
     analyze_kernel, analyze_kernel_as, delete_cutlass_a_loads, extract_entry, fuse_3phase_mlp,
     fuse_kernels, fuse_real_kernels, fuse_rms_norm_cutlass, inject_epilogue, inject_silu_epilogue,
-    persistent_fuse_real_kernels, regfuse_kernels, replace_cutlass_a_loads, rewrite_kernel,
+    persistent_fuse_real_kernels, regfuse_kernels, replace_cutlass_a_loads,
+    replace_perimeter_macro, rewrite_kernel,
 };
 
 #[cfg(feature = "cuda")]
@@ -32,6 +33,26 @@ pub struct KernelProtocol {
     pub smem_stores: u32,
     pub barriers: &'static [u32],
     pub has_mma: bool,
+    pub classified_params: &'static [ClassifiedParam],
+}
+
+/// Role classification for a param struct field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamRole {
+    Pointer,
+    Stride,
+    Dimension,
+    Scalar,
+    Derived,
+}
+
+/// A classified param struct field with its byte offset and role.
+#[derive(Debug)]
+pub struct ClassifiedParam {
+    pub offset: i64,
+    pub ptx_type: &'static str,
+    pub role: ParamRole,
+    pub line: u32,
 }
 
 #[derive(Debug)]
@@ -143,6 +164,28 @@ impl KernelProtocol {
         );
         println!("║ Barriers: {:?}", self.barriers);
         println!("║ MMA instructions: {}", self.has_mma);
+
+        if !self.classified_params.is_empty() {
+            println!("║");
+            println!(
+                "║ Classified Param Fields ({}):",
+                self.classified_params.len()
+            );
+            for cp in self.classified_params {
+                let role_str = match cp.role {
+                    ParamRole::Pointer => "Pointer",
+                    ParamRole::Stride => "Stride",
+                    ParamRole::Dimension => "Dimension",
+                    ParamRole::Scalar => "Scalar",
+                    ParamRole::Derived => "Derived",
+                };
+                println!(
+                    "║   offset {:4} : {:4} → {}",
+                    cp.offset, cp.ptx_type, role_str
+                );
+            }
+        }
+
         println!("╚═══════════════════════════════════");
     }
 }

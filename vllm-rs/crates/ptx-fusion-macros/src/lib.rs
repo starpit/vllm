@@ -9,6 +9,7 @@ pub(crate) mod fuse_cp_async;
 pub(crate) mod fuse_epilogue;
 pub(crate) mod fuse_real;
 mod parser;
+pub(crate) mod perimeter;
 pub(crate) mod persistent;
 mod regfuse;
 use parser::{KernelProtocol, PtxParser};
@@ -251,6 +252,31 @@ fn protocol_to_const_tokens(
     let has_mma = protocol.has_mma;
     let total_smem = protocol.total_smem_bytes as u32;
 
+    let classified_param_lines: Vec<proc_macro2::TokenStream> = protocol
+        .classified_params
+        .iter()
+        .map(|cp| {
+            let offset = cp.offset;
+            let ptx_type = &cp.ptx_type;
+            let line = cp.line as u32;
+            let role = match cp.role {
+                parser::ParamRole::Pointer => quote! { ptx_fusion::ParamRole::Pointer },
+                parser::ParamRole::Stride => quote! { ptx_fusion::ParamRole::Stride },
+                parser::ParamRole::Dimension => quote! { ptx_fusion::ParamRole::Dimension },
+                parser::ParamRole::Scalar => quote! { ptx_fusion::ParamRole::Scalar },
+                parser::ParamRole::Derived => quote! { ptx_fusion::ParamRole::Derived },
+            };
+            quote! {
+                ptx_fusion::ClassifiedParam {
+                    offset: #offset,
+                    ptx_type: #ptx_type,
+                    role: #role,
+                    line: #line,
+                }
+            }
+        })
+        .collect();
+
     quote! {
         const #const_name: ptx_fusion::KernelProtocol = ptx_fusion::KernelProtocol {
             name: #name,
@@ -265,6 +291,7 @@ fn protocol_to_const_tokens(
             smem_stores: #smem_store_count,
             barriers: &[#(#barrier_ids),*],
             has_mma: #has_mma,
+            classified_params: &[#(#classified_param_lines),*],
         };
     }
 }
@@ -1270,4 +1297,76 @@ pub fn fuse_norm_gemm_silu(input: TokenStream) -> TokenStream {
         const #const_name: &str = #fused_str;
     };
     output.into()
+}
+
+/// Replace a CUTLASS kernel's param interface with a flat layout.
+///
+/// Reads the PTX and derivations JSON at compile time, rewrites all ld.param
+/// instructions to use the flat layout, and emits the result as a `&str` const.
+///
+/// ```rust,ignore
+/// replace_perimeter!("kernels/cutlass.ptx", "kernels/cutlass.derivations.json", "ferrite_gemm", FLAT_GEMM);
+/// // expands to:
+/// // const FLAT_GEMM: &str = "...rewritten PTX...";
+/// ```
+#[proc_macro]
+pub fn replace_perimeter_macro(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+
+    let (ptx_path, json_path, entry_name, const_name_str) = parse_perimeter_args(&input_str)
+        .expect(
+            "replace_perimeter! expects (\"ptx_path\", \"json_path\", \"entry_name\", CONST_NAME)",
+        );
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let ptx_full = PathBuf::from(&manifest_dir).join(&ptx_path);
+    let json_full = PathBuf::from(&manifest_dir).join(&json_path);
+
+    let ptx_source = std::fs::read_to_string(&ptx_full)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ptx_full.display()));
+    let json_source = std::fs::read_to_string(&json_full)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", json_full.display()));
+
+    let (rewritten, _entry) = perimeter::replace_perimeter(&ptx_source, &json_source, &entry_name)
+        .unwrap_or_else(|e| panic!("perimeter replacement failed: {e}"));
+
+    let rewritten_str = rewritten.as_str();
+    let const_name = syn::Ident::new(&const_name_str, proc_macro2::Span::call_site());
+
+    let output = quote! {
+        const #const_name: &str = #rewritten_str;
+    };
+    output.into()
+}
+
+fn parse_perimeter_args(input: &str) -> Result<(String, String, String, String), String> {
+    let input = input.trim();
+    let mut strings = Vec::new();
+    let mut rest = input;
+
+    for _ in 0..3 {
+        let start = rest.find('"').ok_or("expected opening quote")?;
+        let after = &rest[start + 1..];
+        let end = after.find('"').ok_or("expected closing quote")?;
+        strings.push(after[..end].to_string());
+        rest = &after[end + 1..];
+    }
+
+    let rest = rest.trim().trim_start_matches(',').trim();
+    let const_name = rest
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .ok_or("expected const name")?
+        .to_string();
+
+    if strings.len() != 3 || const_name.is_empty() {
+        return Err("expected 3 string args + const name".into());
+    }
+
+    Ok((
+        strings[0].clone(),
+        strings[1].clone(),
+        strings[2].clone(),
+        const_name,
+    ))
 }

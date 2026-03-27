@@ -20,4 +20,5 @@ pub mod cache;
 pub mod gptq;
 pub mod lora;
 pub mod models;
+pub mod multi_segment_sdpa;
 pub mod worker;

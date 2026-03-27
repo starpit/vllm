@@ -33,6 +33,24 @@ pub fn swiglu(gate: &Array, up: &Array) -> Result<Array, Exception> {
     sig.multiply(gate)?.multiply(up)
 }
 
+/// Compute the cos/sin cache for fused RoPE in the multi-segment SDPA kernel.
+///
+/// Layout: `[max_pos, rotary_dim]` where each row is
+/// `[cos_0, ..., cos_{half-1}, sin_0, ..., sin_{half-1}]` in f32.
+pub fn compute_cos_sin_cache(rope_theta: f32, rotary_dim: usize, max_pos: usize) -> Array {
+    let half = rotary_dim / 2;
+    let mut cache = vec![0.0f32; max_pos * rotary_dim];
+    for p in 0..max_pos {
+        for i in 0..half {
+            let freq = 1.0 / rope_theta.powf(2.0 * i as f32 / rotary_dim as f32);
+            let angle = p as f32 * freq;
+            cache[p * rotary_dim + i] = angle.cos();
+            cache[p * rotary_dim + half + i] = angle.sin();
+        }
+    }
+    Array::from_slice(&cache, &[max_pos as i32, rotary_dim as i32])
+}
+
 /// Apply RoPE to a cached K tensor using explicit per-position offsets.
 ///
 /// For fused RoPE, we need to apply position i to token i in the cached K.
@@ -373,10 +391,9 @@ pub struct MlxLlamaAttention {
     head_dim: usize,
     scale: f32,
     sliding_window: Option<usize>,
-    /// When true, K is stored without RoPE and RoPE is applied to the full
-    /// cached K at attention time. This makes cached K position-independent,
-    /// enabling relocatable span blocks.
-    block_needs_positioning: bool,
+    /// Precomputed cos/sin cache for fused RoPE in multi-segment SDPA.
+    /// Lazily initialized on first decode call.
+    cos_sin_cache: Option<Array>,
 }
 
 impl MlxLlamaAttention {
@@ -407,7 +424,7 @@ impl MlxLlamaAttention {
             head_dim: config.head_dim,
             scale: 1.0 / (config.head_dim as f32).sqrt(),
             sliding_window: config.sliding_window,
-            block_needs_positioning: false, // TODO: enable when MLX gets paged KV cache for per-block relocation
+            cos_sin_cache: None,
         })
     }
 
@@ -462,6 +479,18 @@ impl MlxLlamaAttention {
         }
     }
 
+    /// Get or lazily compute the cos/sin cache for fused RoPE.
+    fn ensure_cos_sin_cache(&mut self) -> &Array {
+        if self.cos_sin_cache.is_none() {
+            let rotary_dim = self.rope.dimensions as usize;
+            // 131072 covers common max_position_embeddings. The cache is small
+            // (max_pos * rotary_dim * 4 bytes ≈ 32 MB for 128k × 128 × f32).
+            let max_pos = 131072;
+            self.cos_sin_cache = Some(compute_cos_sin_cache(self.rope.base, rotary_dim, max_pos));
+        }
+        self.cos_sin_cache.as_ref().unwrap()
+    }
+
     /// Forward pass.
     ///
     /// * `hidden_states` — shape `[seq_len, hidden_size]`
@@ -500,49 +529,59 @@ impl MlxLlamaAttention {
 
         // [seq, heads, head_dim] -> [1, heads, seq, head_dim]
         let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-        let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+        let k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
         let v = v
             .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[1, 0, 2])?
             .expand_dims(0)?;
 
-        // RoPE + KV cache update.
-        // When block_needs_positioning: use rope_dynamic for both Q and K (via apply_rope_to_cached_k)
-        // to ensure consistency. MLX's fast::rope and fast::rope_dynamic produce
-        // different values for the same position, so Q and K must use the same impl.
-        let (q, mut k, mut v) = if self.block_needs_positioning {
-            let q = apply_rope_to_cached_k(&q, &self.rope, rope_offset)?;
-            let (mut k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
-            k = apply_rope_to_cached_k(&k, &self.rope, 0)?;
-            (q, k, v)
-        } else {
-            let q = self.rope.forward((&q, rope_offset))?;
-            k = self.rope.forward((&k, rope_offset))?;
-            let (k, v) = crate::cache::kv_cache_update(cache, &k, &v)?;
-            (q, k, v)
-        };
+        // K stored WITHOUT RoPE — position-independent for relocatable spans.
+        // RoPE on Q only; RoPE on K applied at attention time.
+        let q = self.rope.forward((&q, rope_offset))?;
+
+        // Store K (no RoPE) + V in cache.
+        let (mut k, mut v) = crate::cache::kv_cache_update(cache, &k, &v)?;
 
         // Sliding window: trim K/V to only the last `w` positions.
-        // The stored cache remains full (future tokens may still be in window),
-        // but we only attend to the windowed subset.
         if let Some(w) = self.sliding_window {
             let kv_len = k.dim(2) as usize;
             if kv_len > w {
                 let start = (kv_len - w) as i32;
                 let end = kv_len as i32;
-                // k, v shape: [1, heads, kv_len, head_dim]
                 k = k.try_index((.., .., start..end, ..))?;
                 v = v.try_index((.., .., start..end, ..))?;
             }
         }
 
-        // Fused SDPA (single Metal kernel for decode when q_len=1).
-        let mask = if seq_len > 1 {
-            Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
+        // Attention with fused RoPE on K.
+        // Multi-segment kernel supports head_dim in {64, 96, 128, 256}.
+        let use_fused_kernel = seq_len == 1 && matches!(self.head_dim, 64 | 96 | 128 | 256);
+        let out = if use_fused_kernel {
+            // Decode: multi-segment SDPA with fused RoPE (single segment).
+            let scale = self.scale;
+            let rotary_dim = self.rope.dimensions as usize;
+            let cos_sin = self.ensure_cos_sin_cache().clone();
+            let seg_offsets = Array::from_slice(&[0i32], &[1]);
+            crate::multi_segment_sdpa::multi_segment_sdpa(
+                &q,
+                &[&k],
+                &[&v],
+                &seg_offsets,
+                &[true],
+                &cos_sin,
+                scale,
+                rotary_dim,
+            )?
         } else {
-            None
+            // Prefill or small head_dim: apply RoPE to cached K, then native SDPA.
+            let k_roped = apply_rope_to_cached_k(&k, &self.rope, 0)?;
+            let mask = if seq_len > 1 {
+                Some(mlx_rs::fast::ScaledDotProductAttentionMask::Causal)
+            } else {
+                None
+            };
+            mlx_rs::fast::scaled_dot_product_attention(&q, &k_roped, &v, self.scale, mask)?
         };
-        let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, self.scale, mask)?;
 
         // out: [1, heads, seq, head_dim] -> [seq, hidden]
         let hidden = (self.num_heads * self.head_dim) as i32;
@@ -601,7 +640,11 @@ impl MlxLlamaAttention {
                 k = norm.forward(&k.squeeze_axes(&[2])?)?.expand_dims(2)?;
             }
 
-            // Per-request RoPE + KV cache update.
+            // Per-request RoPE on Q + KV cache update (K stored without RoPE).
+            // Decode: per-request multi-segment SDPA with fused RoPE.
+            let cos_sin = self.ensure_cos_sin_cache().clone();
+            let hidden = (self.num_heads * self.head_dim) as i32;
+            let mut attn_outputs = Vec::with_capacity(batch_info.num_reqs);
             for (i, cache) in caches.iter_mut().enumerate().take(batch_info.num_reqs) {
                 let ii = i as i32;
                 let offset = batch_info.rope_offsets[i];
@@ -610,23 +653,31 @@ impl MlxLlamaAttention {
                 let vi = v.try_index((ii..ii + 1, .., .., ..))?;
 
                 let qi = self.rope.forward((&qi, offset))?;
-                let ki = if self.block_needs_positioning {
-                    ki
-                } else {
-                    self.rope.forward((&ki, offset))?
-                };
-
                 let (ki, vi) = crate::cache::kv_cache_update(cache, &ki, &vi)?;
-                let ki = if self.block_needs_positioning {
-                    apply_rope_to_cached_k(&ki, &self.rope, 0)?
-                } else {
-                    ki
-                };
-                kv_lens.push(ki.dim(2) as usize);
-                per_req_q.push(qi);
-                per_req_k.push(ki);
-                per_req_v.push(vi);
+
+                let seg_offsets = Array::from_slice(&[0i32], &[1]);
+                let out = crate::multi_segment_sdpa::multi_segment_sdpa(
+                    &qi,
+                    &[&ki],
+                    &[&vi],
+                    &seg_offsets,
+                    &[true],
+                    &cos_sin,
+                    self.scale,
+                    self.rope.dimensions as usize,
+                )?;
+                let out = out
+                    .squeeze_axes(&[0])?
+                    .transpose_axes(&[1, 0, 2])?
+                    .reshape(&[1_i32, hidden])?;
+                attn_outputs.push(out);
             }
+            let concat = if attn_outputs.len() == 1 {
+                attn_outputs.into_iter().next().unwrap()
+            } else {
+                mlx_rs::ops::concatenate_axis(&attn_outputs, 0)?
+            };
+            return self.o_proj.forward(&concat);
         } else {
             // --- Per-request fallback (prefill or mixed) ---
             #[allow(clippy::needless_range_loop)]
@@ -654,24 +705,18 @@ impl MlxLlamaAttention {
                 };
 
                 let q = q.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
-                let mut k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
+                let k = k.transpose_axes(&[1, 0, 2])?.expand_dims(0)?;
                 let v = v
                     .reshape(&[seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
                     .transpose_axes(&[1, 0, 2])?
                     .expand_dims(0)?;
 
+                // RoPE on Q only; K stored without RoPE.
                 let q = self.rope.forward((&q, offset))?;
-                if !self.block_needs_positioning {
-                    k = self.rope.forward((&k, offset))?;
-                }
-
                 let (k, v) = crate::cache::kv_cache_update(&mut caches[i], &k, &v)?;
 
-                let k = if self.block_needs_positioning {
-                    apply_rope_to_cached_k(&k, &self.rope, 0)?
-                } else {
-                    k
-                };
+                // Apply RoPE to cached K for attention.
+                let k = apply_rope_to_cached_k(&k, &self.rope, 0)?;
 
                 kv_lens.push(k.dim(2) as usize);
                 per_req_q.push(q);
@@ -680,27 +725,8 @@ impl MlxLlamaAttention {
             }
         }
 
-        // Decide: batched SDPA (all decode + same KV len) or per-request.
-        let can_batch_sdpa =
-            all_decode && !kv_lens.is_empty() && kv_lens.iter().all(|&l| l == kv_lens[0]);
-
-        let concat = if can_batch_sdpa {
-            // Stack Q/K/V across batch dim: [batch, heads, seq/kv_len, head_dim]
-            let q_stacked = mlx_rs::ops::concatenate_axis(&per_req_q, 0)?;
-            let k_stacked = mlx_rs::ops::concatenate_axis(&per_req_k, 0)?;
-            let v_stacked = mlx_rs::ops::concatenate_axis(&per_req_v, 0)?;
-
-            // Single SDPA: q_len=1 decode → no mask needed.
-            let out = mlx_rs::fast::scaled_dot_product_attention(
-                &q_stacked, &k_stacked, &v_stacked, self.scale, None,
-            )?;
-
-            // out: [batch, heads, 1, head_dim] -> [batch, heads*head_dim]
-            let hidden = (self.num_heads * self.head_dim) as i32;
-            out.squeeze_axes(&[2])?
-                .reshape(&[batch_info.num_reqs as i32, hidden])?
-        } else {
-            // Per-request SDPA (prefill or mixed KV lengths).
+        // Per-request SDPA (prefill or mixed).
+        let concat = {
             let mut attn_outputs = Vec::with_capacity(batch_info.num_reqs);
             for i in 0..batch_info.num_reqs {
                 let seq_len = batch_info.q_lens[i] as i32;
@@ -788,41 +814,27 @@ impl MlxLlamaAttention {
             k = norm.forward(&k.squeeze_axes(&[2])?)?.expand_dims(2)?;
         }
 
-        // Per-request RoPE (rope_dynamic not available in mlx-rs 0.25).
+        // Per-request RoPE on Q only (K stored without RoPE).
         {
             let mut q_parts = Vec::with_capacity(batch_info.num_reqs);
-            let mut k_parts = Vec::with_capacity(batch_info.num_reqs);
             for i in 0..batch_info.num_reqs {
                 let ii = i as i32;
                 let offset = batch_info.rope_offsets[i];
                 let qi = q.try_index((ii..ii + 1, .., .., ..))?;
-                let ki = k.try_index((ii..ii + 1, .., .., ..))?;
                 q_parts.push(self.rope.forward((&qi, offset))?);
-                if self.block_needs_positioning {
-                    k_parts.push(ki);
-                } else {
-                    k_parts.push(self.rope.forward((&ki, offset))?);
-                }
             }
             let q_refs: Vec<&Array> = q_parts.iter().collect();
-            let k_refs: Vec<&Array> = k_parts.iter().collect();
             q = mlx_rs::ops::concatenate_axis(&q_refs, 0)?;
-            k = mlx_rs::ops::concatenate_axis(&k_refs, 0)?;
         }
 
-        // Single batched KV cache update for all B sequences.
-        // When block_needs_positioning, K is stored unrotated (position-independent).
+        // Single batched KV cache update (K stored without RoPE).
         let (k_cached, v_cached) = batch_cache.update_and_view(&k, &v)?;
 
-        // When block_needs_positioning, apply RoPE to full cached K with per-batch start positions.
+        // Apply RoPE to full cached K at attention time.
         // Left-padded batch: start at -left_pad so real tokens get 0-based positions.
         // Padding positions get negative RoPE (masked out by -inf in the SDPA mask).
-        let k_cached = if self.block_needs_positioning {
-            let start_positions: Vec<i32> = left_pads.iter().map(|&p| -(p as i32)).collect();
-            apply_rope_to_cached_k_batched(&k_cached, &self.rope, &start_positions)?
-        } else {
-            k_cached
-        };
+        let start_positions: Vec<i32> = left_pads.iter().map(|&p| -(p as i32)).collect();
+        let k_cached = apply_rope_to_cached_k_batched(&k_cached, &self.rope, &start_positions)?;
 
         // Single SDPA for all B sequences (mask built once, shared across layers).
         let sdpa_mask = mask
@@ -835,6 +847,102 @@ impl MlxLlamaAttention {
         // out: [B, heads, 1, hd] -> [B, hidden]
         let hidden = (self.num_heads * self.head_dim) as i32;
         let out = out.squeeze_axes(&[2])?.reshape(&[n, hidden])?;
+
+        self.o_proj.forward(&out)
+    }
+
+    /// Forward with additional span segments for decode.
+    ///
+    /// Decode-only (q_len=1). All K (active cache + spans) is stored WITHOUT
+    /// RoPE. The kernel applies RoPE on-the-fly to all segments.
+    ///
+    /// * `hidden_states` — `[1, hidden_size]`
+    /// * `cache` — current request's active KV cache (K stored WITHOUT RoPE)
+    /// * `rope_offset` — RoPE position of the current decode token
+    /// * `span_k_segments` — K segments from spans, each `[1, kv_heads, seg_len, head_dim]` (WITHOUT RoPE)
+    /// * `span_v_segments` — V segments from spans
+    /// * `span_position_offsets` — RoPE position offset per span segment
+    /// * `cos_sin_cache` — `[max_pos, rotary_dim]` precomputed cos/sin (f32)
+    pub fn forward_with_segments(
+        &mut self,
+        hidden_states: &Array,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
+        span_k_segments: &[&Array],
+        span_v_segments: &[&Array],
+        span_position_offsets: &[i32],
+        cos_sin_cache: &Array,
+    ) -> Result<Array, Exception> {
+        let nh = self.num_heads as i32;
+        let nkv = self.num_kv_heads as i32;
+        let hd = self.head_dim as i32;
+
+        // Q/K/V projections.
+        let q = self.q_proj.forward(hidden_states)?;
+        let k = self.k_proj.forward(hidden_states)?;
+        let v = self.v_proj.forward(hidden_states)?;
+
+        // Reshape to [1, heads, 1, head_dim].
+        let q = q.reshape(&[1, nh, 1, hd])?;
+        let k = k.reshape(&[1, nkv, 1, hd])?;
+        let v = v.reshape(&[1, nkv, 1, hd])?;
+
+        // Optional per-head QK norms (Qwen3).
+        let q = if let Some(ref mut norm) = self.q_norm {
+            norm.forward(&q.squeeze_axes(&[2])?)?.expand_dims(2)?
+        } else {
+            q
+        };
+        let k = if let Some(ref mut norm) = self.k_norm {
+            norm.forward(&k.squeeze_axes(&[2])?)?.expand_dims(2)?
+        } else {
+            k
+        };
+
+        // RoPE on Q only — K stored without RoPE.
+        let q = self.rope.forward((&q, rope_offset))?;
+
+        // Update cache with K (no RoPE) + V.
+        let (k_cached, v_cached) = crate::cache::kv_cache_update(cache, &k, &v)?;
+
+        // Active cache position offset.
+        let cache_len = k_cached.dim(2);
+        let active_pos_offset = rope_offset - cache_len + 1;
+
+        // Assemble all segments: spans + active cache. All need RoPE.
+        let num_segments = span_k_segments.len() + 1;
+        let mut all_k: Vec<&Array> = Vec::with_capacity(num_segments);
+        let mut all_v: Vec<&Array> = Vec::with_capacity(num_segments);
+        all_k.extend_from_slice(span_k_segments);
+        all_k.push(&k_cached);
+        all_v.extend_from_slice(span_v_segments);
+        all_v.push(&v_cached);
+
+        let mut all_offsets: Vec<i32> = Vec::with_capacity(num_segments);
+        all_offsets.extend_from_slice(span_position_offsets);
+        all_offsets.push(active_pos_offset);
+
+        let all_needs_rope: Vec<bool> = vec![true; num_segments];
+        let seg_pos_offsets = Array::from_slice(&all_offsets, &[num_segments as i32]);
+
+        let rotary_dim = self.rope.dimensions as usize;
+        let out = crate::multi_segment_sdpa::multi_segment_sdpa(
+            &q,
+            &all_k,
+            &all_v,
+            &seg_pos_offsets,
+            &all_needs_rope,
+            cos_sin_cache,
+            self.scale,
+            rotary_dim,
+        )?;
+
+        // out: [1, heads, 1, head_dim] → [1, hidden_size]
+        let hidden = (self.num_heads * self.head_dim) as i32;
+        let out = out
+            .squeeze_axes(&[0])?
+            .transpose_axes(&[1, 0, 2])?
+            .reshape(&[1_i32, hidden])?;
 
         self.o_proj.forward(&out)
     }
@@ -949,6 +1057,34 @@ impl MlxLlamaDecoderLayer {
         let mlp_output = self.mlp.forward(&normed)?;
         hidden_states.add(&mlp_output)
     }
+
+    /// Forward with multi-segment attention for span-based decode.
+    pub fn forward_with_segments(
+        &mut self,
+        hidden_states: &Array,
+        cache: &mut Option<MlxLayerKvCache>,
+        rope_offset: i32,
+        span_k_segments: &[&Array],
+        span_v_segments: &[&Array],
+        span_position_offsets: &[i32],
+        cos_sin_cache: &Array,
+    ) -> Result<Array, Exception> {
+        let normed = self.input_layernorm.forward(hidden_states)?;
+        let attn_output = self.self_attn.forward_with_segments(
+            &normed,
+            cache,
+            rope_offset,
+            span_k_segments,
+            span_v_segments,
+            span_position_offsets,
+            cos_sin_cache,
+        )?;
+        let hidden_states = hidden_states.add(&attn_output)?;
+
+        let normed = self.post_attention_layernorm.forward(&hidden_states)?;
+        let mlp_output = self.mlp.forward(&normed)?;
+        hidden_states.add(&mlp_output)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -962,7 +1098,9 @@ pub struct MlxLlamaForCausalLM {
     norm: nn::RmsNorm,
     pub(crate) lm_head: Option<nn::Linear>,
     tie_word_embeddings: bool,
-    #[allow(dead_code)]
+    /// Precomputed cos/sin cache for multi-segment SDPA fused RoPE.
+    /// Lazily initialized on first `forward_with_segments` call.
+    cos_sin_cache: Option<Array>,
     config: LlamaConfig,
 }
 
@@ -992,6 +1130,7 @@ impl MlxLlamaForCausalLM {
                 .build()?,
             lm_head,
             tie_word_embeddings: config.tie_word_embeddings,
+            cos_sin_cache: None,
             config: config.clone(),
         })
     }
@@ -1078,6 +1217,63 @@ impl MlxLlamaForCausalLM {
         mlx_rs::transforms::eval(weights.values())?;
 
         Ok(model)
+    }
+
+    /// Get or lazily compute the cos/sin cache for fused RoPE in multi-segment SDPA.
+    pub fn ensure_cos_sin_cache(&mut self) -> &Array {
+        if self.cos_sin_cache.is_none() {
+            let rotary_dim = self.config.head_dim;
+            let max_pos = self.config.max_position_embeddings;
+            self.cos_sin_cache = Some(compute_cos_sin_cache(
+                self.config.rope_theta,
+                rotary_dim,
+                max_pos,
+            ));
+        }
+        self.cos_sin_cache.as_ref().unwrap()
+    }
+
+    /// Forward with multi-segment attention for span-based decode.
+    ///
+    /// * `input_ids` — `[1]` single decode token
+    /// * `kv_cache` — per-layer active KV caches
+    /// * `rope_offset` — RoPE position of the decode token
+    /// * `per_layer_span_k` — per-layer K segments from span cache
+    /// * `per_layer_span_v` — per-layer V segments from span cache
+    /// * `span_position_offsets` — RoPE position offset per span (same for all layers)
+    pub fn forward_with_segments(
+        &mut self,
+        input_ids: &Array,
+        kv_cache: &mut MlxKvCache,
+        rope_offset: i32,
+        per_layer_span_k: &[Vec<&Array>],
+        per_layer_span_v: &[Vec<&Array>],
+        span_position_offsets: &[i32],
+    ) -> Result<Array, Exception> {
+        let cos_sin = self.ensure_cos_sin_cache().clone();
+
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            hidden_states = layer.forward_with_segments(
+                &hidden_states,
+                &mut kv_cache[i],
+                rope_offset,
+                &per_layer_span_k[i],
+                &per_layer_span_v[i],
+                span_position_offsets,
+                &cos_sin,
+            )?;
+        }
+
+        hidden_states = self.norm.forward(&hidden_states)?;
+
+        let logits = if self.tie_word_embeddings {
+            self.embed_tokens.as_linear(&hidden_states)?
+        } else {
+            self.lm_head.as_mut().unwrap().forward(&hidden_states)?
+        };
+        Ok(logits)
     }
 }
 
@@ -1672,7 +1868,6 @@ mod tests {
     fn test_block_needs_positioning_self_consistency() {
         let config = test_config();
         let mut attn = MlxLlamaAttention::new(&config).unwrap();
-        attn.block_needs_positioning = true;
 
         let x = mlx_rs::random::normal::<f32>(&[4, 32], None, None, None).unwrap();
         x.eval().unwrap();
@@ -1728,9 +1923,6 @@ mod tests {
     fn test_block_needs_positioning_model_consistency() {
         let config = test_config();
         let mut model = MlxLlamaForCausalLM::new(&config).unwrap();
-        for layer in &mut model.layers {
-            layer.self_attn.block_needs_positioning = true;
-        }
 
         let input_ids = Array::from_iter(vec![1i32, 5, 10, 20], &[4]);
         let positions = Array::from_iter(0..4i32, &[4]);
@@ -1805,6 +1997,612 @@ mod tests {
             assert_eq!(
                 max_err, 0.0,
                 "block_needs_positioning decode step {i} non-deterministic"
+            );
+        }
+    }
+
+    fn segment_test_config() -> LlamaConfig {
+        LlamaConfig {
+            hidden_size: 256,
+            num_attention_heads: 4,
+            num_kv_heads: 4,
+            num_hidden_layers: 1,
+            intermediate_size: 512,
+            vocab_size: 100,
+            max_position_embeddings: 1024,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            head_dim: 64,
+            tie_word_embeddings: false,
+            sliding_window: None,
+            partial_rotary_factor: 1.0,
+            long_rope_scaling: None,
+        }
+    }
+
+    /// Multi-segment SDPA with one segment, no RoPE, should match native SDPA exactly.
+    #[test]
+    fn test_multi_segment_sdpa_no_rope_matches_native() {
+        let num_heads: i32 = 4;
+        let head_dim: i32 = 64;
+        let kv_len: i32 = 32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q =
+            mlx_rs::random::normal::<f32>(&[1, num_heads, 1, head_dim], None, None, None).unwrap();
+        let k = mlx_rs::random::normal::<f32>(&[1, num_heads, kv_len, head_dim], None, None, None)
+            .unwrap();
+        let v = mlx_rs::random::normal::<f32>(&[1, num_heads, kv_len, head_dim], None, None, None)
+            .unwrap();
+        mlx_rs::transforms::eval([&q, &k, &v].into_iter()).unwrap();
+
+        // Reference: native SDPA (decode, no mask).
+        let ref_out = mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
+        ref_out.eval().unwrap();
+
+        // Multi-segment SDPA: 1 segment, rotary_dim=0 (no RoPE).
+        let seg_offsets = Array::from_slice(&[0i32], &[1]);
+        let cos_sin = mlx_rs::ops::zeros::<f32>(&[1, 1]).unwrap();
+        let ms_out = crate::multi_segment_sdpa::multi_segment_sdpa(
+            &q,
+            &[&k],
+            &[&v],
+            &seg_offsets,
+            &[true],
+            &cos_sin,
+            scale,
+            0,
+        )
+        .unwrap();
+        ms_out.eval().unwrap();
+
+        assert_eq!(ref_out.shape(), ms_out.shape());
+        let diff = ref_out.subtract(&ms_out).unwrap();
+        let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
+            .unwrap()
+            .item();
+        eprintln!("multi_segment_sdpa no-RoPE max_err vs native: {max_err}");
+        assert!(
+            max_err < 1e-4,
+            "multi_segment_sdpa differs from native SDPA: max_err={max_err}"
+        );
+    }
+
+    /// Multi-segment SDPA with fused RoPE should match manually-rotated K + native SDPA.
+    #[test]
+    fn test_multi_segment_sdpa_fused_rope_matches_manual() {
+        let num_heads: i32 = 4;
+        let head_dim: i32 = 64;
+        let kv_len: i32 = 16;
+        let rope_theta = 10000.0f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let rotary_dim = head_dim as usize;
+
+        let q =
+            mlx_rs::random::normal::<f32>(&[1, num_heads, 1, head_dim], None, None, None).unwrap();
+        let k = mlx_rs::random::normal::<f32>(&[1, num_heads, kv_len, head_dim], None, None, None)
+            .unwrap();
+        let v = mlx_rs::random::normal::<f32>(&[1, num_heads, kv_len, head_dim], None, None, None)
+            .unwrap();
+        mlx_rs::transforms::eval([&q, &k, &v].into_iter()).unwrap();
+
+        let mut rope = nn::Rope::new(head_dim);
+        rope.base = rope_theta;
+
+        // Q with RoPE at position (kv_len - 1) — as if decode after kv_len-1 prefill tokens.
+        let q_roped = rope.forward((&q, kv_len - 1)).unwrap();
+        q_roped.eval().unwrap();
+
+        // Reference: manually apply per-position RoPE to K, then native SDPA.
+        let k_roped = apply_rope_to_cached_k(&k, &rope, 0).unwrap();
+        k_roped.eval().unwrap();
+        let ref_out =
+            mlx_rs::fast::scaled_dot_product_attention(&q_roped, &k_roped, &v, scale, None)
+                .unwrap();
+        ref_out.eval().unwrap();
+
+        // Multi-segment SDPA: kernel applies RoPE to K on-the-fly.
+        let cos_sin = compute_cos_sin_cache(rope_theta, rotary_dim, 1024);
+        cos_sin.eval().unwrap();
+        let seg_offsets = Array::from_slice(&[0i32], &[1]);
+        let ms_out = crate::multi_segment_sdpa::multi_segment_sdpa(
+            &q_roped,
+            &[&k],
+            &[&v],
+            &seg_offsets,
+            &[true],
+            &cos_sin,
+            scale,
+            rotary_dim,
+        )
+        .unwrap();
+        ms_out.eval().unwrap();
+
+        assert_eq!(ref_out.shape(), ms_out.shape());
+        let diff = ref_out.subtract(&ms_out).unwrap();
+        let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
+            .unwrap()
+            .item();
+        eprintln!("multi_segment_sdpa fused-RoPE max_err vs manual: {max_err}");
+        assert!(
+            max_err < 1e-3,
+            "multi_segment_sdpa fused RoPE differs from manual: max_err={max_err}"
+        );
+    }
+
+    /// D=96 (Gemma): fused RoPE via shuffle path should match manual RoPE.
+    #[test]
+    fn test_multi_segment_sdpa_d96_fused_rope() {
+        let num_heads: i32 = 4;
+        let head_dim: i32 = 96;
+        let kv_len: i32 = 16;
+        let rope_theta = 10000.0f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let rotary_dim = head_dim as usize;
+
+        let q =
+            mlx_rs::random::normal::<f32>(&[1, num_heads, 1, head_dim], None, None, None).unwrap();
+        let k = mlx_rs::random::normal::<f32>(&[1, num_heads, kv_len, head_dim], None, None, None)
+            .unwrap();
+        let v = mlx_rs::random::normal::<f32>(&[1, num_heads, kv_len, head_dim], None, None, None)
+            .unwrap();
+        mlx_rs::transforms::eval([&q, &k, &v].into_iter()).unwrap();
+
+        let mut rope = nn::Rope::new(head_dim);
+        rope.base = rope_theta;
+        let q_roped = rope.forward((&q, kv_len - 1)).unwrap();
+        q_roped.eval().unwrap();
+
+        let k_roped = apply_rope_to_cached_k(&k, &rope, 0).unwrap();
+        k_roped.eval().unwrap();
+        let ref_out =
+            mlx_rs::fast::scaled_dot_product_attention(&q_roped, &k_roped, &v, scale, None)
+                .unwrap();
+        ref_out.eval().unwrap();
+
+        let cos_sin = compute_cos_sin_cache(rope_theta, rotary_dim, 1024);
+        cos_sin.eval().unwrap();
+        let seg_offsets = Array::from_slice(&[0i32], &[1]);
+        let ms_out = crate::multi_segment_sdpa::multi_segment_sdpa(
+            &q_roped,
+            &[&k],
+            &[&v],
+            &seg_offsets,
+            &[true],
+            &cos_sin,
+            scale,
+            rotary_dim,
+        )
+        .unwrap();
+        ms_out.eval().unwrap();
+
+        let diff = ref_out.subtract(&ms_out).unwrap();
+        let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
+            .unwrap()
+            .item();
+        eprintln!("D=96 fused-RoPE max_err: {max_err}");
+        assert!(max_err < 1e-3, "D=96 fused RoPE: max_err={max_err}");
+    }
+
+    /// Multi-segment SDPA with 2 segments (simulating span + active cache) should
+    /// match a single concatenated segment.
+    #[test]
+    fn test_multi_segment_sdpa_two_segments_vs_one() {
+        let num_heads: i32 = 4;
+        let head_dim: i32 = 64;
+        let seg1_len: i32 = 20;
+        let seg2_len: i32 = 12;
+        let total_len = seg1_len + seg2_len;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q =
+            mlx_rs::random::normal::<f32>(&[1, num_heads, 1, head_dim], None, None, None).unwrap();
+        // One big K/V that we'll split into two segments.
+        let k_full =
+            mlx_rs::random::normal::<f32>(&[1, num_heads, total_len, head_dim], None, None, None)
+                .unwrap();
+        let v_full =
+            mlx_rs::random::normal::<f32>(&[1, num_heads, total_len, head_dim], None, None, None)
+                .unwrap();
+        mlx_rs::transforms::eval([&q, &k_full, &v_full].into_iter()).unwrap();
+
+        // Reference: single segment (no RoPE).
+        let seg_offsets_1 = Array::from_slice(&[0i32], &[1]);
+        let cos_sin = mlx_rs::ops::zeros::<f32>(&[1, 1]).unwrap();
+        let ref_out = crate::multi_segment_sdpa::multi_segment_sdpa(
+            &q,
+            &[&k_full],
+            &[&v_full],
+            &seg_offsets_1,
+            &[true],
+            &cos_sin,
+            scale,
+            0,
+        )
+        .unwrap();
+        ref_out.eval().unwrap();
+
+        // Split into two segments.
+        let k1 = k_full.try_index((.., .., ..seg1_len, ..)).unwrap();
+        let k2 = k_full.try_index((.., .., seg1_len..total_len, ..)).unwrap();
+        let v1 = v_full.try_index((.., .., ..seg1_len, ..)).unwrap();
+        let v2 = v_full.try_index((.., .., seg1_len..total_len, ..)).unwrap();
+        mlx_rs::transforms::eval([&k1, &k2, &v1, &v2].into_iter()).unwrap();
+
+        let seg_offsets_2 = Array::from_slice(&[0i32, 0], &[2]);
+        let ms_out = crate::multi_segment_sdpa::multi_segment_sdpa(
+            &q,
+            &[&k1, &k2],
+            &[&v1, &v2],
+            &seg_offsets_2,
+            &[true, true],
+            &cos_sin,
+            scale,
+            0,
+        )
+        .unwrap();
+        ms_out.eval().unwrap();
+
+        let diff = ref_out.subtract(&ms_out).unwrap();
+        let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
+            .unwrap()
+            .item();
+        eprintln!("multi_segment_sdpa 2-seg vs 1-seg max_err: {max_err}");
+        assert!(
+            max_err < 1e-4,
+            "multi_segment_sdpa 2-seg differs from 1-seg: max_err={max_err}"
+        );
+    }
+
+    /// Test multi_segment_sdpa with a non-contiguous K/V (simulating cache view).
+    #[test]
+    fn test_multi_segment_sdpa_noncontiguous_kv() {
+        let num_heads: i32 = 4;
+        let head_dim: i32 = 64;
+        let kv_len: i32 = 8;
+        let capacity: i32 = kv_len + 256; // simulate pre-allocated cache
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let q =
+            mlx_rs::random::normal::<f32>(&[1, num_heads, 1, head_dim], None, None, None).unwrap();
+        // Create a padded buffer and take a view (non-contiguous along dim 1).
+        let k_padded =
+            mlx_rs::random::normal::<f32>(&[1, num_heads, capacity, head_dim], None, None, None)
+                .unwrap();
+        let v_padded =
+            mlx_rs::random::normal::<f32>(&[1, num_heads, capacity, head_dim], None, None, None)
+                .unwrap();
+        mlx_rs::transforms::eval([&q, &k_padded, &v_padded].into_iter()).unwrap();
+
+        // Take a view of the first kv_len tokens (non-contiguous: stride for dim 1 = capacity * D).
+        let k_view = k_padded.try_index((.., .., ..kv_len, ..)).unwrap();
+        let v_view = v_padded.try_index((.., .., ..kv_len, ..)).unwrap();
+        k_view.eval().unwrap();
+        v_view.eval().unwrap();
+
+        // Reference: native SDPA on the view (no RoPE).
+        let ref_out =
+            mlx_rs::fast::scaled_dot_product_attention(&q, &k_view, &v_view, scale, None).unwrap();
+        ref_out.eval().unwrap();
+
+        // Multi-segment SDPA on the same view.
+        let seg_offsets = Array::from_slice(&[0i32], &[1]);
+        let cos_sin = mlx_rs::ops::zeros::<f32>(&[1, 1]).unwrap();
+        let ms_out = crate::multi_segment_sdpa::multi_segment_sdpa(
+            &q,
+            &[&k_view],
+            &[&v_view],
+            &seg_offsets,
+            &[true],
+            &cos_sin,
+            scale,
+            0,
+        )
+        .unwrap();
+        ms_out.eval().unwrap();
+
+        let diff = ref_out.subtract(&ms_out).unwrap();
+        let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
+            .unwrap()
+            .item();
+        eprintln!("non-contiguous K/V max_err: {max_err}");
+        assert!(max_err < 1e-4, "non-contiguous K/V: max_err={max_err}");
+    }
+
+    /// Simplest case: empty cache, single token, compare paths.
+    #[test]
+    fn test_forward_with_segments_single_token() {
+        let config = segment_test_config();
+        let mut attn = MlxLlamaAttention::new(&config).unwrap();
+
+        let cos_sin = compute_cos_sin_cache(config.rope_theta, config.head_dim, 1024);
+        cos_sin.eval().unwrap();
+
+        let x = mlx_rs::random::normal::<f32>(&[1, config.hidden_size as i32], None, None, None)
+            .unwrap();
+        x.eval().unwrap();
+        let pos = Array::from_iter(vec![0i32], &[1]);
+
+        // Path A: normal forward.
+        let mut cache_a: Option<MlxLayerKvCache> = None;
+        let ref_out = attn.forward(&x, &pos, &mut cache_a, 0).unwrap();
+        ref_out.eval().unwrap();
+
+        // Path B: forward_with_segments (no spans, empty cache).
+        let mut cache_b: Option<MlxLayerKvCache> = None;
+        let no_spans_k: &[&Array] = &[];
+        let no_spans_v: &[&Array] = &[];
+        let no_span_offsets: &[i32] = &[];
+        let ms_out = attn
+            .forward_with_segments(
+                &x,
+                &mut cache_b,
+                0,
+                no_spans_k,
+                no_spans_v,
+                no_span_offsets,
+                &cos_sin,
+            )
+            .unwrap();
+        ms_out.eval().unwrap();
+
+        let diff = ref_out.subtract(&ms_out).unwrap();
+        let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
+            .unwrap()
+            .item();
+        eprintln!("single token max_err: {max_err}");
+        assert!(max_err < 1e-3, "single token: max_err={max_err}");
+    }
+
+    /// Attention-level: forward_with_segments (no spans) should match normal forward
+    /// for decode. Both store K WITH RoPE in active cache.
+    #[test]
+    fn test_forward_with_segments_matches_forward() {
+        let config = segment_test_config();
+        let mut attn = MlxLlamaAttention::new(&config).unwrap();
+        // K is always stored without RoPE; fused RoPE at attention time.
+
+        let cos_sin = compute_cos_sin_cache(config.rope_theta, config.head_dim, 1024);
+        cos_sin.eval().unwrap();
+
+        // Prefill 8 tokens to populate the cache.
+        let x_prefill =
+            mlx_rs::random::normal::<f32>(&[8, config.hidden_size as i32], None, None, None)
+                .unwrap();
+        x_prefill.eval().unwrap();
+        let positions = Array::from_iter(0..8i32, &[8]);
+
+        // Populate cache via normal forward (stores K with RoPE).
+        let mut cache_a = None;
+        let prefill_out = attn
+            .forward(&x_prefill, &positions, &mut cache_a, 0)
+            .unwrap();
+        prefill_out.eval().unwrap();
+
+        // Decode token.
+        let x_decode =
+            mlx_rs::random::normal::<f32>(&[1, config.hidden_size as i32], None, None, None)
+                .unwrap();
+        x_decode.eval().unwrap();
+        let pos_decode = Array::from_iter(vec![8i32], &[1]);
+
+        // Clone cache for path B.
+        let mut cache_b = cache_a.clone();
+
+        // Path B FIRST: forward_with_segments (no spans, active cache only).
+        let no_spans_k: &[&Array] = &[];
+        let no_spans_v: &[&Array] = &[];
+        let no_span_offsets: &[i32] = &[];
+        let ms_out = attn
+            .forward_with_segments(
+                &x_decode,
+                &mut cache_b,
+                8,
+                no_spans_k,
+                no_spans_v,
+                no_span_offsets,
+                &cos_sin,
+            )
+            .unwrap();
+        ms_out.eval().unwrap();
+
+        // Path A: normal forward.
+        let ref_out = attn
+            .forward(&x_decode, &pos_decode, &mut cache_a, 8)
+            .unwrap();
+        ref_out.eval().unwrap();
+
+        assert_eq!(ref_out.shape(), ms_out.shape());
+        let diff = ref_out.subtract(&ms_out).unwrap();
+        let max_err: f32 = mlx_rs::ops::max(&mlx_rs::ops::abs(&diff).unwrap(), false)
+            .unwrap()
+            .item();
+        eprintln!("forward_with_segments vs forward max_err: {max_err}");
+        assert!(
+            max_err < 1e-3,
+            "forward_with_segments differs from forward: max_err={max_err}"
+        );
+    }
+
+    /// Benchmark: multi-segment SDPA vs native SDPA at various context lengths.
+    #[test]
+    #[ignore] // Run with: cargo test --release -- --ignored bench_multi_segment_sdpa --nocapture
+    fn bench_multi_segment_sdpa() {
+        let num_heads: i32 = 32;
+        let num_kv_heads: i32 = 8;
+        let head_dim: i32 = 128;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let rope_theta = 500000.0f32;
+        let rotary_dim = head_dim as usize;
+
+        let cos_sin = compute_cos_sin_cache(rope_theta, rotary_dim, 8192);
+        cos_sin.eval().unwrap();
+
+        let warmup = 5;
+        let iters = 50;
+
+        for &kv_len in &[128i32, 512, 2048, 4096] {
+            let q = mlx_rs::random::normal::<f32>(&[1, num_heads, 1, head_dim], None, None, None)
+                .unwrap();
+            let k = mlx_rs::random::normal::<f32>(
+                &[1, num_kv_heads, kv_len, head_dim],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let v = mlx_rs::random::normal::<f32>(
+                &[1, num_kv_heads, kv_len, head_dim],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            // Native SDPA handles GQA internally (broadcasts kv_heads to num_heads).
+            mlx_rs::transforms::eval([&q, &k, &v].into_iter()).unwrap();
+
+            // --- Bench native SDPA ---
+            for _ in 0..warmup {
+                let out =
+                    mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
+                out.eval().unwrap();
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let out =
+                    mlx_rs::fast::scaled_dot_product_attention(&q, &k, &v, scale, None).unwrap();
+                out.eval().unwrap();
+            }
+            let native_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            // --- Bench multi-segment SDPA (1 segment, with RoPE) ---
+            let seg_offsets = Array::from_slice(&[0i32], &[1]);
+            for _ in 0..warmup {
+                let out = crate::multi_segment_sdpa::multi_segment_sdpa(
+                    &q,
+                    &[&k],
+                    &[&v],
+                    &seg_offsets,
+                    &[true],
+                    &cos_sin,
+                    scale,
+                    rotary_dim,
+                )
+                .unwrap();
+                out.eval().unwrap();
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let out = crate::multi_segment_sdpa::multi_segment_sdpa(
+                    &q,
+                    &[&k],
+                    &[&v],
+                    &seg_offsets,
+                    &[true],
+                    &cos_sin,
+                    scale,
+                    rotary_dim,
+                )
+                .unwrap();
+                out.eval().unwrap();
+            }
+            let ms_1seg_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            // --- Bench multi-segment SDPA (2 segments) ---
+            let split = kv_len / 2;
+            let k1 = k.try_index((.., .., ..split, ..)).unwrap();
+            let k2 = k.try_index((.., .., split..kv_len, ..)).unwrap();
+            let v1 = v.try_index((.., .., ..split, ..)).unwrap();
+            let v2 = v.try_index((.., .., split..kv_len, ..)).unwrap();
+            mlx_rs::transforms::eval([&k1, &k2, &v1, &v2].into_iter()).unwrap();
+            let seg_offsets_2 = Array::from_slice(&[0i32, split], &[2]);
+            for _ in 0..warmup {
+                let out = crate::multi_segment_sdpa::multi_segment_sdpa(
+                    &q,
+                    &[&k1, &k2],
+                    &[&v1, &v2],
+                    &seg_offsets_2,
+                    &[true, true],
+                    &cos_sin,
+                    scale,
+                    rotary_dim,
+                )
+                .unwrap();
+                out.eval().unwrap();
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let out = crate::multi_segment_sdpa::multi_segment_sdpa(
+                    &q,
+                    &[&k1, &k2],
+                    &[&v1, &v2],
+                    &seg_offsets_2,
+                    &[true, true],
+                    &cos_sin,
+                    scale,
+                    rotary_dim,
+                )
+                .unwrap();
+                out.eval().unwrap();
+            }
+            let ms_2seg_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            // --- Bench native SDPA + RoPE (fair comparison: apply_rope_to_cached_k + SDPA) ---
+            let mut rope = nn::Rope::new(head_dim);
+            rope.base = rope_theta;
+            for _ in 0..warmup {
+                let k_roped = apply_rope_to_cached_k(&k, &rope, 0).unwrap();
+                let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k_roped, &v, scale, None)
+                    .unwrap();
+                out.eval().unwrap();
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let k_roped = apply_rope_to_cached_k(&k, &rope, 0).unwrap();
+                let out = mlx_rs::fast::scaled_dot_product_attention(&q, &k_roped, &v, scale, None)
+                    .unwrap();
+                out.eval().unwrap();
+            }
+            let rope_sdpa_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            // --- Bench multi-segment SDPA (1 segment, NO RoPE) ---
+            let seg_offsets_no_rope = Array::from_slice(&[0i32], &[1]);
+            let cos_sin_dummy = mlx_rs::ops::zeros::<f32>(&[1, 1]).unwrap();
+            for _ in 0..warmup {
+                let out = crate::multi_segment_sdpa::multi_segment_sdpa(
+                    &q,
+                    &[&k],
+                    &[&v],
+                    &seg_offsets_no_rope,
+                    &[false],
+                    &cos_sin_dummy,
+                    scale,
+                    0,
+                )
+                .unwrap();
+                out.eval().unwrap();
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                let out = crate::multi_segment_sdpa::multi_segment_sdpa(
+                    &q,
+                    &[&k],
+                    &[&v],
+                    &seg_offsets_no_rope,
+                    &[false],
+                    &cos_sin_dummy,
+                    scale,
+                    0,
+                )
+                .unwrap();
+                out.eval().unwrap();
+            }
+            let ms_norope_us = t0.elapsed().as_micros() as f64 / iters as f64;
+
+            eprintln!(
+                "kv_len={kv_len:4}  native={native_us:7.1}us  rope+sdpa={rope_sdpa_us:7.1}us  ms_norope={ms_norope_us:7.1}us ({:.2}x)  ms_rope={ms_1seg_us:7.1}us ({:.2}x vs rope+sdpa)  ms_2seg={ms_2seg_us:7.1}us",
+                ms_norope_us / native_us,
+                ms_1seg_us / rope_sdpa_us,
             );
         }
     }

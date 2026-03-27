@@ -27,5 +27,8 @@ serde_json = { workspace = true }
 rand = { workspace = true }
 libc = { workspace = true }
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 tempfile = { workspace = true }

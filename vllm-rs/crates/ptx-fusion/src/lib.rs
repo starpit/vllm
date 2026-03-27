@@ -10,9 +10,12 @@
 
 pub use ptx_fusion_macros::{
     analyze_kernel, analyze_kernel_as, delete_cutlass_a_loads, extract_entry, fuse_3phase_mlp,
-    fuse_kernels, fuse_real_kernels, inject_epilogue, inject_silu_epilogue,
-    persistent_fuse_real_kernels, regfuse_kernels, rewrite_kernel,
+    fuse_kernels, fuse_real_kernels, fuse_rms_norm_cutlass, inject_epilogue, inject_silu_epilogue,
+    persistent_fuse_real_kernels, regfuse_kernels, replace_cutlass_a_loads, rewrite_kernel,
 };
+
+#[cfg(feature = "cuda")]
+pub mod dispatch;
 
 /// A kernel's complete protocol — everything needed to fuse it with another kernel.
 #[derive(Debug)]

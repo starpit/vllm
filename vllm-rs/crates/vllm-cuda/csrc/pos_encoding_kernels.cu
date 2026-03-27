@@ -222,14 +222,48 @@ __global__ void fused_qkv_rope_kernel(
         q[h * head_size + i] = row[h * head_size + i];
     }
 
-    // --- K heads: straight copy WITHOUT RoPE. FA2 applies RoPE on read. ---
+    // --- K heads: read from QKV + q_size offset, apply RoPE, write contiguous ---
     const T* k_row = row + q_size;
-    const int k_vecs = kv_size / VEC;
-    for (int tid = threadIdx.x; tid < k_vecs; tid += blockDim.x) {
-        vec_store(&k[tid * VEC], vec_load(&k_row[tid * VEC]));
+
+    for (int tid = threadIdx.x; tid < nkh * half_vecs; tid += blockDim.x) {
+        const int h = tid / half_vecs;
+        const int vi = tid % half_vecs;
+        const int b = h * head_size + vi * VEC;
+
+        float xbuf[VEC], ybuf[VEC], cbuf[VEC], sbuf[VEC];
+        unpack_vec<T>(vec_load(&k_row[b]), xbuf);
+        unpack_vec<T>(vec_load(&k_row[b + half]), ybuf);
+        unpack_vec<T>(vec_load(&cos_ptr[vi * VEC]), cbuf);
+        unpack_vec<T>(vec_load(&sin_ptr[vi * VEC]), sbuf);
+
+        float ox[VEC], oy[VEC];
+        #pragma unroll
+        for (int j = 0; j < VEC; j++) {
+            ox[j] = xbuf[j] * cbuf[j] - ybuf[j] * sbuf[j];
+            oy[j] = ybuf[j] * cbuf[j] + xbuf[j] * sbuf[j];
+        }
+        vec_store(&k[b], pack_vec<T>(ox));
+        vec_store(&k[b + half], pack_vec<T>(oy));
     }
-    for (int tid = threadIdx.x; tid < kv_size - k_vecs * VEC; tid += blockDim.x) {
-        k[k_vecs * VEC + tid] = k_row[k_vecs * VEC + tid];
+
+    for (int tid = threadIdx.x; tid < nkh * (half - half_tail); tid += blockDim.x) {
+        const int h = tid / (half - half_tail);
+        const int r = half_tail + tid % (half - half_tail);
+        const int b = h * head_size;
+
+        float x = static_cast<float>(k_row[b + r]);
+        float y = static_cast<float>(k_row[b + r + half]);
+        float c = static_cast<float>(cos_ptr[r]);
+        float s = static_cast<float>(sin_ptr[r]);
+
+        k[b + r]        = static_cast<T>(x * c - y * s);
+        k[b + r + half] = static_cast<T>(y * c + x * s);
+    }
+
+    for (int tid = threadIdx.x; tid < nkh * non_rot; tid += blockDim.x) {
+        const int h = tid / non_rot;
+        const int i = rot_dim_full + tid % non_rot;
+        k[h * head_size + i] = k_row[h * head_size + i];
     }
 
     // --- V: straight copy from QKV + q_size + kv_size offset (vectorized) ---
@@ -393,13 +427,48 @@ __global__ void fused_qkv_rope_cache_kernel(
     T* v_dst = (slot >= 0) ? (value_cache + slot * kv_size) : nullptr;
 
     if (k_dst) {
-        // K: straight copy to cache WITHOUT RoPE. FA2 applies RoPE on read.
-        const int k_vecs = kv_size / VEC;
-        for (int tid = threadIdx.x; tid < k_vecs; tid += blockDim.x) {
-            vec_store(&k_dst[tid * VEC], vec_load(&k_row[tid * VEC]));
+        // K: apply RoPE and write to cache. Normal blocks store rotated K;
+        // FA2 skips rotation for these via per-block flags.
+        // Vectorized K rotary pairs → directly to cache.
+        for (int tid = threadIdx.x; tid < nkh * half_vecs; tid += blockDim.x) {
+            const int h = tid / half_vecs;
+            const int vi = tid % half_vecs;
+            const int b = h * head_size + vi * VEC;
+
+            float xbuf[VEC], ybuf[VEC], cbuf[VEC], sbuf[VEC];
+            unpack_vec<T>(vec_load(&k_row[b]), xbuf);
+            unpack_vec<T>(vec_load(&k_row[b + half]), ybuf);
+            unpack_vec<T>(vec_load(&cos_ptr[vi * VEC]), cbuf);
+            unpack_vec<T>(vec_load(&sin_ptr[vi * VEC]), sbuf);
+
+            float ox[VEC], oy[VEC];
+            #pragma unroll
+            for (int j = 0; j < VEC; j++) {
+                ox[j] = xbuf[j] * cbuf[j] - ybuf[j] * sbuf[j];
+                oy[j] = ybuf[j] * cbuf[j] + xbuf[j] * sbuf[j];
+            }
+            vec_store(&k_dst[b], pack_vec<T>(ox));
+            vec_store(&k_dst[b + half], pack_vec<T>(oy));
         }
-        for (int tid = threadIdx.x; tid < kv_size - k_vecs * VEC; tid += blockDim.x) {
-            k_dst[k_vecs * VEC + tid] = k_row[k_vecs * VEC + tid];
+        // Scalar tail for K rotary pairs.
+        for (int tid = threadIdx.x; tid < nkh * (half - half_tail); tid += blockDim.x) {
+            const int h = tid / (half - half_tail);
+            const int r = half_tail + tid % (half - half_tail);
+            const int b = h * head_size;
+
+            float x = static_cast<float>(k_row[b + r]);
+            float y = static_cast<float>(k_row[b + r + half]);
+            float c = static_cast<float>(cos_ptr[r]);
+            float s = static_cast<float>(sin_ptr[r]);
+
+            k_dst[b + r]        = static_cast<T>(x * c - y * s);
+            k_dst[b + r + half] = static_cast<T>(y * c + x * s);
+        }
+        // Copy non-rotary K elements.
+        for (int tid = threadIdx.x; tid < nkh * non_rot; tid += blockDim.x) {
+            const int h = tid / non_rot;
+            const int i = rot_dim_full + tid % non_rot;
+            k_dst[h * head_size + i] = k_row[h * head_size + i];
         }
 
         // --- V: straight copy from QKV to cache (vectorized) ---
@@ -545,7 +614,7 @@ __global__ void fused_qkv_rope_cache_fp8_bf16_kernel(
         q[h * head_size + i] = row[h * head_size + i];
     }
 
-    // --- K heads: RoPE → FP8 quantize → cache ---
+    // --- K heads: apply RoPE + FP8 quantize → cache ---
     if (slot >= 0) {
         const __nv_bfloat16* k_row = row + q_size;
         uint8_t* k_dst = key_cache + slot * kv_size;
@@ -554,7 +623,6 @@ __global__ void fused_qkv_rope_cache_fp8_bf16_kernel(
         const float v_inv = 1.0f / (*v_scale);
 
         // K: apply RoPE then quantize to FP8.
-        // Process element-by-element (RoPE pairs are non-contiguous, FP8 is 1 byte).
         for (int tid = threadIdx.x; tid < nkh * half; tid += blockDim.x) {
             const int h = tid / half;
             const int r = tid % half;
@@ -568,7 +636,6 @@ __global__ void fused_qkv_rope_cache_fp8_bf16_kernel(
             float rx = x * c - y * s;
             float ry = y * c + x * s;
 
-            // Quantize to FP8 E4M3
             __nv_fp8_e4m3 fp8_rx(rx * k_inv);
             __nv_fp8_e4m3 fp8_ry(ry * k_inv);
             k_dst[b + r]        = *reinterpret_cast<uint8_t*>(&fp8_rx);
@@ -678,9 +745,29 @@ __global__ void fused_qkv_interleaved_rope_cache_fp8_bf16_kernel(
         const float k_inv = 1.0f / (*k_scale);
         const float v_inv = 1.0f / (*v_scale);
 
-        // K: straight copy to FP8 cache WITHOUT RoPE. FA2 applies RoPE on read.
-        for (int tid = threadIdx.x; tid < kv_size; tid += blockDim.x) {
-            k_dst[tid] = bf16_to_fp8e4m3(k_row[tid], k_inv);
+        // K: apply interleaved RoPE then quantize to FP8.
+        for (int tid = threadIdx.x; tid < nkh * num_pairs; tid += blockDim.x) {
+            const int h = tid / num_pairs;
+            const int p = tid % num_pairs;
+            const int base = h * head_size + 2 * p;
+
+            float x0 = __bfloat162float(k_row[base]);
+            float x1 = __bfloat162float(k_row[base + 1]);
+            float c = __bfloat162float(cos_ptr[p]);
+            float s = __bfloat162float(sin_ptr[p]);
+
+            float r0 = x0 * c - x1 * s;
+            float r1 = x1 * c + x0 * s;
+
+            __nv_fp8_e4m3 fp8_r0(r0 * k_inv);
+            __nv_fp8_e4m3 fp8_r1(r1 * k_inv);
+            k_dst[base]     = *reinterpret_cast<uint8_t*>(&fp8_r0);
+            k_dst[base + 1] = *reinterpret_cast<uint8_t*>(&fp8_r1);
+        }
+        for (int tid = threadIdx.x; tid < nkh * non_rot; tid += blockDim.x) {
+            const int h = tid / non_rot;
+            const int i = 2 * num_pairs + tid % non_rot;
+            k_dst[h * head_size + i] = bf16_to_fp8e4m3(k_row[h * head_size + i], k_inv);
         }
 
         // V: straight FP8 quantize.
@@ -973,13 +1060,24 @@ __global__ void fused_qkv_interleaved_rope_cache_kernel(
 
         const T* k_row = row + q_size;
 
-        // K: straight copy to cache WITHOUT RoPE. FA2 applies RoPE on read.
-        const int k_vecs = kv_size / VEC;
-        for (int tid = threadIdx.x; tid < k_vecs; tid += blockDim.x) {
-            vec_store(&k_dst[tid * VEC], vec_load(&k_row[tid * VEC]));
+        // K: apply interleaved RoPE and write to cache.
+        for (int tid = threadIdx.x; tid < nkh * num_pairs; tid += blockDim.x) {
+            const int h = tid / num_pairs;
+            const int p = tid % num_pairs;
+            const int base = h * head_size + 2 * p;
+
+            float x0 = static_cast<float>(k_row[base]);
+            float x1 = static_cast<float>(k_row[base + 1]);
+            float c = static_cast<float>(cos_ptr[p]);
+            float s = static_cast<float>(sin_ptr[p]);
+
+            k_dst[base]     = static_cast<T>(x0 * c - x1 * s);
+            k_dst[base + 1] = static_cast<T>(x1 * c + x0 * s);
         }
-        for (int tid = threadIdx.x; tid < kv_size - k_vecs * VEC; tid += blockDim.x) {
-            k_dst[k_vecs * VEC + tid] = k_row[k_vecs * VEC + tid];
+        for (int tid = threadIdx.x; tid < nkh * non_rot; tid += blockDim.x) {
+            const int h = tid / non_rot;
+            const int i = 2 * num_pairs + tid % non_rot;
+            k_dst[h * head_size + i] = k_row[h * head_size + i];
         }
 
         // V: straight copy to cache (vectorized).

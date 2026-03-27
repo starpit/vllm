@@ -137,6 +137,11 @@ struct Flash_fwd_params : public Qkv_params {
     // attention (for relocatable KV cache blocks / spans).
     bool rotate_cached_k;
 
+    // Per-physical-block flags: block_unrotated_flags[phys_block] != 0 means
+    // K in that block is stored unrotated and needs RoPE on read.
+    // When non-null, overrides rotate_cached_k with per-block decisions.
+    const uint8_t * block_unrotated_flags;
+
     int num_splits;  // For split-KV version
 
     void * __restrict__ alibi_slopes_ptr;

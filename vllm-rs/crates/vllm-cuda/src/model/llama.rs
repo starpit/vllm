@@ -605,44 +605,56 @@ impl LlamaAttention {
                 );
                 (q, k, v)
             } else if max_seqlen_q == 1 {
-                // Decode: store K unrotated, FA2 rotates in shared mem.
-                let (q, k, v) = kernels::split_qkv(
-                    qkv.as_gpu_tensor(),
-                    self.q_size,
-                    self.kv_size,
-                    self.num_q_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    &mut device.caching,
-                    device.compute_stream,
-                );
+                // Decode: fused QKV split + Q RoPE + cache write (K unrotated).
+                // FA2 rotates cached K in shared memory during attention.
+                let q = if kv_cache.is_fp8() {
+                    kernels::fused_qkv_rope_cache_fp8(
+                        qkv.as_gpu_tensor(),
+                        *positions,
+                        rotary.cos_sin_cache,
+                        *slot_mapping,
+                        *kv_cache.k_cache(self.layer_idx),
+                        *kv_cache.v_cache(self.layer_idx),
+                        kv_cache.k_scale_ptr(self.layer_idx),
+                        kv_cache.v_scale_ptr(self.layer_idx),
+                        self.q_size,
+                        self.kv_size,
+                        self.num_q_heads,
+                        self.head_dim,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                } else {
+                    kernels::fused_qkv_rope_cache(
+                        qkv.as_gpu_tensor(),
+                        *positions,
+                        rotary.cos_sin_cache,
+                        *slot_mapping,
+                        *kv_cache.k_cache(self.layer_idx),
+                        *kv_cache.v_cache(self.layer_idx),
+                        self.q_size,
+                        self.kv_size,
+                        self.num_q_heads,
+                        self.head_dim,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                };
                 drop(qkv);
 
-                // Apply RoPE to Q only — K stays unrotated for FA2 fused path.
-                kernels::rotary_embedding_q_only(
-                    q.as_gpu_tensor(),
-                    *positions,
-                    rotary.cos_sin_cache,
-                    self.num_q_heads,
-                    self.head_dim,
-                    device.compute_stream,
-                );
-
-                // Write unrotated K and V to cache.
-                crate::model::attention_helpers::write_kv_cache(
-                    k.view(),
-                    v.view(),
-                    slot_mapping,
-                    kv_cache,
-                    self.layer_idx,
-                    device.compute_stream,
-                );
-                drop(k);
-                drop(v);
-
-                // FA2 with fused RoPE: pass cos_sin_cache so kernel rotates
-                // cached K in shared memory during attention.
-                let rotary_dim = rotary.cos_sin_cache.dim(1);
+                // K is stored rotated — FA2 only needs cos_sin_cache for
+                // span blocks (identified by per-block flags). When no spans
+                // are active (flags ptr is null), pass null cos_sin_cache so
+                // rotate_cached_k stays false.
+                let has_spans = !kv_cache.block_unrotated_gpu().is_null();
+                let (cos_sin_ptr, rotary_dim) = if has_spans {
+                    (
+                        rotary.cos_sin_cache.raw_ptr() as *const u8,
+                        rotary.cos_sin_cache.dim(1),
+                    )
+                } else {
+                    (std::ptr::null(), 0)
+                };
                 let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
                     q.view(),
                     cu_seqlens_q,
@@ -658,7 +670,7 @@ impl LlamaAttention {
                     device.num_sm,
                     &mut device.caching,
                     device.compute_stream,
-                    rotary.cos_sin_cache.raw_ptr() as *const u8,
+                    cos_sin_ptr,
                     rotary_dim,
                     false,
                 );
@@ -683,8 +695,7 @@ impl LlamaAttention {
 
                 return result;
             } else {
-                // Prefill: split QKV, apply RoPE to Q only, store K unrotated.
-                // FA2 rotates cached K in shared memory during attention.
+                // Prefill: split QKV, then rotate both Q and K in-place.
                 let (q, k, v) = kernels::split_qkv(
                     qkv.as_gpu_tensor(),
                     self.q_size,
@@ -697,7 +708,18 @@ impl LlamaAttention {
                 );
                 drop(qkv);
 
-                // Write unrotated K/V to cache first.
+                // rotary_embedding_inplace expects 2D [num_tokens, total_dim].
+                let num_tokens = q.as_gpu_tensor().dim(0);
+                kernels::rotary_embedding_inplace(
+                    q.as_gpu_tensor().reshape(&[num_tokens, self.q_size]),
+                    k.as_gpu_tensor().reshape(&[num_tokens, self.kv_size]),
+                    *positions,
+                    rotary.cos_sin_cache,
+                    self.head_dim,
+                    device.compute_stream,
+                );
+
+                // Write rotated K and V to cache.
                 crate::model::attention_helpers::write_kv_cache(
                     k.view(),
                     v.view(),
@@ -707,19 +729,17 @@ impl LlamaAttention {
                     device.compute_stream,
                 );
 
-                // Only rotate Q — FA2 fused RoPE rotates K in shared memory.
-                kernels::rotary_embedding_q_only(
-                    q.as_gpu_tensor(),
-                    *positions,
-                    rotary.cos_sin_cache,
-                    self.num_q_heads,
-                    self.head_dim,
-                    device.compute_stream,
-                );
-
-                // FA2 with fused RoPE: rotates K in shared memory for both
-                // the contiguous (fresh prefill) and paged paths.
-                let rotary_dim = rotary.cos_sin_cache.dim(1);
+                // K is already rotated. Only pass cos_sin_cache when spans
+                // are active so FA2 can rotate flagged blocks.
+                let has_spans = !kv_cache.block_unrotated_gpu().is_null();
+                let (cos_sin_ptr, rot_dim) = if has_spans {
+                    (
+                        rotary.cos_sin_cache.raw_ptr() as *const u8,
+                        rotary.cos_sin_cache.dim(1),
+                    )
+                } else {
+                    (std::ptr::null(), 0)
+                };
                 let attn_output = crate::model::attention_helpers::attention_standard(
                     q.view(),
                     k.view(),
@@ -735,8 +755,8 @@ impl LlamaAttention {
                     device.num_sm,
                     &mut device.caching,
                     device.compute_stream,
-                    rotary.cos_sin_cache.raw_ptr() as *const u8,
-                    rotary_dim,
+                    cos_sin_ptr,
+                    rot_dim,
                     false,
                 );
                 drop(q);

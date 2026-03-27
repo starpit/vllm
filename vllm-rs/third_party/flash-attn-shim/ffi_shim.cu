@@ -195,6 +195,10 @@ extern "C" void mha_varlen_fwd(
     int32_t rotate_cached_k,
     int32_t is_rotary_interleaved,
 
+    // Per-block rotation flags: block_unrotated_flags[phys_block] != 0 means
+    // K is stored unrotated and needs RoPE on read. nullptr = use rotate_cached_k.
+    const uint8_t *block_unrotated_flags,
+
     cudaStream_t stream
 ) {
     // --- Parameter setup matches vllm-flash-attn flash_api.cu exactly ---
@@ -302,6 +306,7 @@ extern "C" void mha_varlen_fwd(
     params.rotary_dim = rotary_dim;
     params.rotate_cached_k = (rotate_cached_k != 0);
     params.is_rotary_interleaved = (is_rotary_interleaved != 0);
+    params.block_unrotated_flags = block_unrotated_flags;
 
     // Split-K accumulators (for num_splits > 1)
     params.softmax_lseaccum_ptr = softmax_lse_accum_ptr;

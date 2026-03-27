@@ -985,21 +985,31 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         __syncthreads();
 
         // Spans: rotate K in shared memory before Q×K^T.
-        if (params.rotate_cached_k && params.rotary_dim > 0) {
-            if (params.is_rotary_interleaved) {
-                FLASH_NAMESPACE::rotate_k_smem_interleaved(
-                    sK,
-                    reinterpret_cast<const Element *>(params.rotary_cos_ptr),
-                    n_block, kBlockN, params.d, params.rotary_dim,
-                    tidx, Kernel_traits::kNThreads);
+        // Per-block check: only rotate blocks whose K is stored unrotated.
+        {
+            bool do_rotate;
+            if (params.block_unrotated_flags != nullptr && block_table != nullptr) {
+                const int first_page = block_table[(n_block * kBlockN) / params.page_block_size];
+                do_rotate = params.block_unrotated_flags[first_page] != 0;
             } else {
-                FLASH_NAMESPACE::rotate_k_smem_contiguous(
-                    sK,
-                    reinterpret_cast<const Element *>(params.rotary_cos_ptr),
-                    n_block, kBlockN, params.d, params.rotary_dim,
-                    tidx, Kernel_traits::kNThreads);
+                do_rotate = params.rotate_cached_k;
             }
-            __syncthreads();
+            if (do_rotate && params.rotary_dim > 0) {
+                if (params.is_rotary_interleaved) {
+                    FLASH_NAMESPACE::rotate_k_smem_interleaved(
+                        sK,
+                        reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                        n_block, kBlockN, params.d, params.rotary_dim,
+                        tidx, Kernel_traits::kNThreads);
+                } else {
+                    FLASH_NAMESPACE::rotate_k_smem_contiguous(
+                        sK,
+                        reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                        n_block, kBlockN, params.d, params.rotary_dim,
+                        tidx, Kernel_traits::kNThreads);
+                }
+                __syncthreads();
+            }
         }
 
         // Advance gV
@@ -1081,21 +1091,31 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         __syncthreads();
 
         // Spans: rotate K in shared memory before Q×K^T.
-        if (params.rotate_cached_k && params.rotary_dim > 0) {
-            if (params.is_rotary_interleaved) {
-                FLASH_NAMESPACE::rotate_k_smem_interleaved(
-                    sK,
-                    reinterpret_cast<const Element *>(params.rotary_cos_ptr),
-                    n_block, kBlockN, params.d, params.rotary_dim,
-                    tidx, Kernel_traits::kNThreads);
+        // Per-block check: only rotate blocks whose K is stored unrotated.
+        {
+            bool do_rotate;
+            if (params.block_unrotated_flags != nullptr && block_table != nullptr) {
+                const int first_page = block_table[(n_block * kBlockN) / params.page_block_size];
+                do_rotate = params.block_unrotated_flags[first_page] != 0;
             } else {
-                FLASH_NAMESPACE::rotate_k_smem_contiguous(
-                    sK,
-                    reinterpret_cast<const Element *>(params.rotary_cos_ptr),
-                    n_block, kBlockN, params.d, params.rotary_dim,
-                    tidx, Kernel_traits::kNThreads);
+                do_rotate = params.rotate_cached_k;
             }
-            __syncthreads();
+            if (do_rotate && params.rotary_dim > 0) {
+                if (params.is_rotary_interleaved) {
+                    FLASH_NAMESPACE::rotate_k_smem_interleaved(
+                        sK,
+                        reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                        n_block, kBlockN, params.d, params.rotary_dim,
+                        tidx, Kernel_traits::kNThreads);
+                } else {
+                    FLASH_NAMESPACE::rotate_k_smem_contiguous(
+                        sK,
+                        reinterpret_cast<const Element *>(params.rotary_cos_ptr),
+                        n_block, kBlockN, params.d, params.rotary_dim,
+                        tidx, Kernel_traits::kNThreads);
+                }
+                __syncthreads();
+            }
         }
 
         // Advance gV

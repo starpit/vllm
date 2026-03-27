@@ -281,51 +281,70 @@ and hidden_size are prepended as extra params.
 - `kernels/cutlass_gemm_bf16_sm89.ptx`: bf16 CUTLASS GEMM (64x64x32, 3 stages, 24KB SMEM)
 - `tests/support/cutlass_prologue_test.cu`: GPU correctness harness (CUTLASS API + driver API)
 
-### In progress: CUTLASS GEMM parity with cuBLAS (Phase 0)
+### Done: CUTLASS GEMM parity with cuBLAS (Phase 0)
 
-**Status**: 3 tile configs compiled, benchmarked, runtime dispatcher built.
+3 tile configs compiled, benchmarked, Rust params builder + runtime dispatcher.
+See benchmark table above for CUTLASS vs cuBLAS numbers.
 
-**Done**:
-- Compiled 64x64x32 (24KB), 128x128x32 (48KB), 128x128x64 (96KB) to PTX
-- Benchmarked against cuBLAS at K=N=4096 (decode and prefill)
-- Built `CutlassDispatch` Rust runtime: loads configs, selects by M
-- Discovered L4 SMEM limit (99KB optin) blocks 128x256x64 with 3 stages
+### Done: fused operation library (Phase 1)
 
-**Remaining**:
-- Build Rust `GemmParams` constructor (currently C++ side only)
-- Wire into llama.rs as feature-gated alternative to cuBLAS
-- Profile-guided selection (optional: bench at model init, cache per M-bucket)
+All fusion ops needed for the llama.rs forward pass are proven:
 
-### Near-term: fused operation library (Phase 1)
+| Op | Macro/Technique | Diff | Status |
+|----|----------------|------|--------|
+| norm → GEMM | `fuse_rms_norm_cutlass!` | 0.00e0 | ✓ |
+| norm → GEMM + SiLU | `fuse_norm_gemm_silu!` | 6.25e-2 | ✓ |
+| GEMM + residual | `set_epilogue(1.0, 1.0)` | 1.56e-2 | ✓ |
+| SiLU/GELU/ReLU epilogue | `inject_epilogue!` | 0.00e0 | ✓ |
 
-**Already proven**:
-- `fuse_rms_norm_cutlass!` -- norm -> GEMM prologue (0.00e0)
-- `inject_epilogue!` -- SiLU/GELU/ReLU into epilogue (0.00e0)
-- `fuse_norm_gemm_silu!` -- prologue + epilogue composed (6.25e-2, bf16 rounding)
-
-**Also proven**:
-- GEMM + residual add -- just `beta=1.0` in CUTLASS LinearCombination (no PTX mod needed!)
-
-**Need to build**:
-- More epilogue ops: quantize (f32->fp8), scale
+Future epilogue ops (not blocking): quantize (f32->fp8), scale.
 
 ### The Ferrite-based forward pass
 
-```
-Current llama.rs (9+ kernel launches per layer):
-  norm -> QKV GEMM -> split+RoPE -> FA2 -> O GEMM -> residual
-  -> norm -> gate_up GEMM -> SiLU*mul -> down GEMM -> residual
+**Current llama.rs: 11 kernel launches per layer** (standard dense bf16)
 
-Ferrite forward (5 launches per layer):
-  fused_norm_qkv()              // norm→GEMM prologue (1 launch, was 2)
-  split_qkv_rope() + FA2()     // stays separate (FA2 already optimal)
-  fused_o_proj_residual()       // GEMM + residual epilogue (1 launch, was 2)
-  fused_norm_gate_up_silu()     // norm→GEMM + SiLU epilogue (1 launch, was 3)
-  fused_down_residual()         // GEMM + residual epilogue (1 launch, was 2)
-```
+| # | Kernel | Type |
+|---|--------|------|
+| 1 | fused_add_rms_norm_inplace | C FFI |
+| 2 | QKV GEMM (cublasLtMatmul) | cuBLAS |
+| 3 | split_qkv | C FFI |
+| 4 | rotary_embedding (Q only) | C FFI |
+| 5 | reshape_and_cache (KV write) | C FFI |
+| 6 | flash_attention (paged or contiguous) | FA2 |
+| 7 | O proj GEMM | cuBLAS |
+| 8 | fused_add_rms_norm_inplace | C FFI |
+| 9 | gate_up GEMM | cuBLAS |
+| 10 | silu_and_mul_fused | C FFI |
+| 11 | down GEMM | cuBLAS |
 
-Each `fuse_*!` macro generates: fused PTX (compile-time) + `launch()` function
-(runtime). The forward reads like normal Rust with different function names.
+All 11 are CUDA-graph-capturable. With graphs, launch overhead is amortized
+to near-zero (one graph replay). Without graphs, ~5 us per launch = ~55 us/layer.
+
+**Ferrite forward: 6 launches per layer** (11 → 6)
+
+| # | Ferrite kernel | Replaces | Technique |
+|---|---------------|----------|-----------|
+| 1 | fused_norm_qkv | #1 + #2 | `fuse_rms_norm_cutlass!` |
+| 2 | split_qkv + RoPE + KV write | #3 + #4 + #5 | unchanged (tiny kernels) |
+| 3 | flash_attention | #6 | unchanged (FA2 already optimal) |
+| 4 | O proj + residual | #7 | `beta=1.0` |
+| 5 | fused_norm_gate_up_silu | #8 + #9 + #10 | `fuse_norm_gemm_silu!` |
+| 6 | down proj + residual | #11 | `beta=1.0` |
+
+**Savings analysis:**
+
+Without CUDA graphs: 5 fewer launches × ~5 us = ~25 us/layer launch savings.
+
+With or without graphs: GMEM bandwidth savings from fusing norm into GEMM
+prologue (eliminates read+write of full hidden-dim intermediate).
+At hidden=4096, M=64: ~1 MB saved per fused norm × 2 fused norms = ~2 MB/layer.
+At L4's ~300 GB/s: ~7 us/layer bandwidth savings.
+
+**What stays unfused and why:**
+- **split_qkv + RoPE + KV cache write**: 3 tiny elementwise kernels (~2 us each).
+  Could be absorbed into QKV GEMM epilogue later but not worth the complexity yet.
+- **FlashAttention**: Already a megakernel. 10K+ lines of PTX with warp
+  specialization. The existing C kernel with fused RoPE is near-optimal.
 
 ### Roadmap
 

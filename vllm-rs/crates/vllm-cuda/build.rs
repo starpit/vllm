@@ -168,8 +168,15 @@ fn cuda_build() {
 
     // Emit rerun-if-changed for all tracked files so cargo skips the build
     // script (and all downstream recompilation) when nothing changed.
+    // Canonicalize paths so cargo can reliably track them across working
+    // directories and worktrees.
     for f in &rerun_files {
-        println!("cargo:rerun-if-changed={}", f);
+        let path = std::path::Path::new(f);
+        if let Ok(canonical) = path.canonicalize() {
+            println!("cargo:rerun-if-changed={}", canonical.display());
+        } else {
+            println!("cargo:rerun-if-changed={}", f);
+        }
     }
 }
 
@@ -248,12 +255,22 @@ fn build_flash_attention(cache_dir: &str, rerun_files: &mut Vec<String>) {
     // Our FFI shim (the only custom .cu file)
     kernel_files.push(shim_dir.join("ffi_shim.cu").to_string_lossy().into_owned());
 
-    // Header files to watch for changes
+    // Header files to watch for changes — include ALL FA2 headers so that
+    // any header modification invalidates the cached .o files.
     let watch_files: Vec<String> = vec![
         fa_src.join("flash_fwd_kernel.h"),
         fa_src.join("flash.h"),
         fa_src.join("flash_fwd_launch_template.h"),
         fa_src.join("static_switch.h"),
+        fa_src.join("utils.h"),
+        fa_src.join("kernel_traits.h"),
+        fa_src.join("softmax.h"),
+        fa_src.join("mask.h"),
+        fa_src.join("rotary.h"),
+        fa_src.join("block_info.h"),
+        fa_src.join("dropout.h"),
+        fa_src.join("namespace_config.h"),
+        fa_src.join("philox_unpack.cuh"),
         shim_dir.join("ffi_shim.cu"),
         shim_dir
             .join("compat")

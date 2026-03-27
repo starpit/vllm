@@ -221,6 +221,56 @@ multiplier constants. This is a generalization of the existing param register tr
 **Priority**: High. This is the difference between "works for CUTLASS 2.x bf16
 GemmIdentityThreadblockSwizzle<4>" and "works for any CUTLASS kernel."
 
+### Analysis roadmap: from pattern matching to dataflow
+
+The current PTX parser does single-pass pattern matching: find `ld.global`,
+trace back to `ld.param` through a chain of `add.s64`/`cvta`/`mov`. This
+works for the escape perimeter because CUDA compilers emit stereotyped
+address chains. But deriving swizzle logic and iterator strides requires
+understanding **what the code computes**, not just what instructions appear.
+
+**Level 1: Parameterized pattern matching** (current state)
+
+Hardcoded templates: "find `shr.b32 %rX, %ctaid.x, %rY` where %rY traces
+to param offset 24 → that's the swizzle shift." Works for CUTLASS 2.x but
+brittle — a different swizzle or iterator type silently breaks.
+
+**Level 2: Def-use graph + backward slicing** (recommended next step)
+
+Build a def-use graph (one pass over PTX — each `%rN` defined once, used N
+times, PTX is SSA-like). Given a register of interest (e.g., the K-loop
+cursor or the tile-offset register), backward-slice to find all contributing
+instructions. Express the result as a symbolic formula:
+
+```
+cursor = param_A_ptr + tid_offset + k_iter * param_stride
+tile_m = blockIdx.x >> param_swizzle_log
+tile_n = blockIdx.y * (1 << param_swizzle_log) + (blockIdx.x & mask)
+```
+
+The multiplier constants and swizzle formulas fall out directly. The backward
+slice is textbook (Weiser 1984) and cheap — a 1400-line CUTLASS kernel has
+~3000 def-use edges.
+
+This solves both problems:
+- **Swizzle**: backward-slice from the tile-index registers, extract the
+  formula, invert it for host-side grid computation
+- **Iterator strides**: backward-slice from the K-loop pointer increment,
+  find `mul stride, param, constant` → the constant is the slope
+
+**Level 3: Full symbolic interpreter** (only if needed)
+
+Forward-evaluate the entire kernel symbolically, tracking each register as
+an expression tree. Handles arbitrary control flow. Probably overkill unless
+we need to analyze kernels from non-CUTLASS sources (e.g., hand-written
+persistent kernels with complex scheduling).
+
+**Recommendation**: Level 2 is the sweet spot. The def-use graph is cheap,
+backward slicing is well-understood, and it generalizes to any CUTLASS
+config without per-kernel hardcoding. PTX is easier to analyze than SASS
+or LLVM IR: linear control flow, globally unique register names, small
+instruction set.
+
 ## How the Escape Analysis Works
 
 The PTX parser extracts the escape perimeter:

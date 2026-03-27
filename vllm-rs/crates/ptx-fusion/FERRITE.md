@@ -169,6 +169,58 @@ This required extending the PTX param tracer to propagate through `mov.u64`/`mov
 engine to handle the `mul.wide.s32` address pattern that nvcc generates for GEMM
 kernels (vs the `cvt.s64.s32` pattern used by elementwise kernels).
 
+## Known Gap: Host-Side Logic Not Yet Derived from PTX
+
+Ferrite's core principle is: analyze PTX, derive everything automatically, transform
+safely. The escape perimeter (input/output loads/stores), register allocation, SMEM
+layout, and MMA structure are all extracted from PTX. **But the host-side launch
+parameters are currently hardcoded**, not derived from the kernel PTX.
+
+### What's hardcoded and shouldn't be
+
+**Threadblock swizzle (`swizzle_log_tile` and grid dimensions).**
+The `GemmIdentityThreadblockSwizzle<4>` logic maps `blockIdx` to logical tile
+coordinates. The host computes `swizzle_log = f(grid_n)` and encodes it in the
+params struct. The kernel reads it and reverses the mapping. Currently the host-side
+formula is hardcoded to match CUTLASS's C++ `get_log_tile()`:
+
+```
+for s in [4, 2]: if grid_n % (s*2) == 0 → log++
+```
+
+This is fragile — a different swizzle strategy (StreamK, Grouped, etc.) would silently
+produce garbage. **This formula caused the first real integration bug**: the initial
+implementation used a wrong ratio-based formula that diverged for non-square grids
+(gate_up N=22016 → grid_n=172), producing all-"!" garbage output in chat.
+
+**Iterator params (stride multipliers).**
+The `PredicatedTileAccessIterator::Params` contains 4 precomputed stride values
+(stride, inc_strided, inc_next, inc_advance) that are linear functions of lda/ldb.
+The slope/intercept constants are extracted empirically (dump at stride=1 and stride=2,
+compute slope) and stored per tile config. A different iterator type would have
+different constants.
+
+**Epilogue iterator params.**
+Same issue — 8 precomputed values that are ldc/ldd-linear, empirically extracted.
+
+### How to fix: derive from PTX
+
+The swizzle logic is present in the kernel PTX as the `get_tile_offset()` pattern:
+the kernel reads `swizzle_log_tile` from params, shifts/masks `blockIdx.x` and
+`blockIdx.y` to recover the logical tile (m, n) coordinate. By analyzing this
+PTX pattern, Ferrite could:
+
+1. **Extract the swizzle formula** from the kernel's tile-offset computation
+2. **Invert it** to derive the host-side grid launch dimensions
+3. **Validate** that the params struct `swizzle_log_tile` field is set consistently
+
+For iterator params: the kernel's K-loop advancement pattern shows how pointer
+registers are incremented per tile. Tracing this back to the stride param gives the
+multiplier constants. This is a generalization of the existing param register tracer.
+
+**Priority**: High. This is the difference between "works for CUTLASS 2.x bf16
+GemmIdentityThreadblockSwizzle<4>" and "works for any CUTLASS kernel."
+
 ## How the Escape Analysis Works
 
 The PTX parser extracts the escape perimeter:

@@ -5483,64 +5483,40 @@ impl Worker for CudaWorker {
         let prefill_tokens = self.config.max_num_batched_tokens;
         info!("Profiling activation memory with dummy forward ({prefill_tokens} tokens)...");
 
-        // Allocate dummy inputs from caching allocator.
-        let dummy_ids = device
-            .caching
-            .alloc_gpu_tensor(&[prefill_tokens], GpuDType::U32);
-        let dummy_pos = device
-            .caching
-            .alloc_gpu_tensor(&[prefill_tokens], GpuDType::U32);
+        // Allocate dummy inputs for the profiling forward pass.
+        //
+        // IDs and positions MUST be zero-initialized — the caching allocator
+        // recycles freed blocks whose contents are undefined.  Garbage token
+        // IDs cause out-of-bounds embedding lookups; garbage positions cause
+        // out-of-bounds RoPE lookups.  Both segfault.  (Matches Python vLLM
+        // which uses torch.zeros for its profiling dummy tensors.)
+        let dummy_ids = device.alloc_gpu_tensor_zeroed(&[prefill_tokens], GpuDType::U32);
+        let dummy_pos = device.alloc_gpu_tensor_zeroed(&[prefill_tokens], GpuDType::U32);
+
         // Slot mapping: slot[i] = i (sequential)
         let slot_data: Vec<i64> = (0..prefill_tokens as i64).collect();
-        let dummy_slots = device
-            .caching
-            .alloc_gpu_tensor(&[prefill_tokens], GpuDType::I64);
-        unsafe {
-            driver::memcpy_htod_async(
-                dummy_slots.raw_ptr(),
-                slot_data.as_ptr() as *const u8,
-                prefill_tokens * 8,
-                device.compute_stream,
-            )
-            .ok();
-        }
+        let dummy_slots =
+            device.alloc_gpu_tensor_from_host(&[prefill_tokens], GpuDType::I64, unsafe {
+                std::slice::from_raw_parts(slot_data.as_ptr() as *const u8, prefill_tokens * 8)
+            });
+
         let cu_q: Vec<u32> = vec![0, prefill_tokens as u32];
-        let gpu_cu_q = device.caching.alloc_gpu_tensor(&[2], GpuDType::U32);
-        unsafe {
-            driver::memcpy_htod_async(
-                gpu_cu_q.raw_ptr(),
-                cu_q.as_ptr() as *const u8,
-                8,
-                device.compute_stream,
-            )
-            .ok();
-        }
+        let gpu_cu_q = device.alloc_gpu_tensor_from_host(&[2], GpuDType::U32, unsafe {
+            std::slice::from_raw_parts(cu_q.as_ptr() as *const u8, cu_q.len() * 4)
+        });
+
         let seqused_data: Vec<u32> = vec![prefill_tokens as u32];
-        let dummy_seqused = device.caching.alloc_gpu_tensor(&[1], GpuDType::U32);
-        unsafe {
-            driver::memcpy_htod_async(
-                dummy_seqused.raw_ptr(),
-                seqused_data.as_ptr() as *const u8,
-                4,
-                device.compute_stream,
-            )
-            .ok();
-        }
+        let dummy_seqused = device.alloc_gpu_tensor_from_host(&[1], GpuDType::U32, unsafe {
+            std::slice::from_raw_parts(seqused_data.as_ptr() as *const u8, 4)
+        });
+
         // Block table: [1, num_blocks_needed] — sequential block indices
         let num_blocks_needed = prefill_tokens.div_ceil(self.config.block_size);
         let bt_data: Vec<u32> = (0..num_blocks_needed as u32).collect();
-        let dummy_bt = device
-            .caching
-            .alloc_gpu_tensor(&[1, num_blocks_needed], GpuDType::U32);
-        unsafe {
-            driver::memcpy_htod_async(
-                dummy_bt.raw_ptr(),
-                bt_data.as_ptr() as *const u8,
-                num_blocks_needed * 4,
-                device.compute_stream,
-            )
-            .ok();
-        }
+        let dummy_bt =
+            device.alloc_gpu_tensor_from_host(&[1, num_blocks_needed], GpuDType::U32, unsafe {
+                std::slice::from_raw_parts(bt_data.as_ptr() as *const u8, num_blocks_needed * 4)
+            });
 
         // Create a KV cache large enough for the profiling tokens.
         let dummy_kv = unsafe {

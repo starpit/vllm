@@ -137,6 +137,60 @@ impl GpuDevice {
     pub unsafe fn memset_zero(&self, ptr: *mut u8, bytes: usize) -> Result<()> {
         driver::memset_d8(ptr, 0, bytes, self.compute_stream)
     }
+
+    /// Allocate a GPU tensor from the caching allocator, zero-initialized.
+    ///
+    /// Unlike [`CachingAllocator::alloc_gpu_tensor`], the returned tensor is
+    /// guaranteed to contain zeros.  Uses an async memset on the compute stream
+    /// so no synchronization is added.
+    pub fn alloc_gpu_tensor_zeroed(
+        &mut self,
+        shape: &[usize],
+        dtype: crate::dtype::DType,
+    ) -> crate::tensor::GpuTensor {
+        let tensor = self.caching.alloc_gpu_tensor(shape, dtype);
+        let numel: usize = shape.iter().product();
+        let bytes = numel * dtype.size_bytes();
+        unsafe {
+            // Cannot fail for valid allocations; ignore result like PyTorch.
+            let _ = driver::memset_d8(tensor.raw_ptr(), 0, bytes, self.compute_stream);
+        }
+        tensor
+    }
+
+    /// Allocate a GPU tensor and upload host data into it on the compute stream.
+    ///
+    /// `data` must be a contiguous host buffer whose byte length equals
+    /// `numel(shape) * dtype.size_bytes()`.  The copy is async on the compute
+    /// stream — the host buffer can be dropped after this call returns (the
+    /// driver copies from it before the memcpy_htod_async call returns for
+    /// pageable memory).
+    pub fn alloc_gpu_tensor_from_host(
+        &mut self,
+        shape: &[usize],
+        dtype: crate::dtype::DType,
+        data: &[u8],
+    ) -> crate::tensor::GpuTensor {
+        let tensor = self.caching.alloc_gpu_tensor(shape, dtype);
+        let numel: usize = shape.iter().product();
+        let bytes = numel * dtype.size_bytes();
+        debug_assert_eq!(
+            data.len(),
+            bytes,
+            "host data length ({}) != tensor size ({})",
+            data.len(),
+            bytes
+        );
+        unsafe {
+            let _ = driver::memcpy_htod_async(
+                tensor.raw_ptr(),
+                data.as_ptr(),
+                bytes,
+                self.compute_stream,
+            );
+        }
+        tensor
+    }
 }
 
 impl Drop for GpuDevice {

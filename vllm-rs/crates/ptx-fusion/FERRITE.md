@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **64 tests** (52 CUDA GPU + 12 doc-ignored + 10 unit), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **65 tests** (53 CUDA GPU + 12 doc-ignored + 10 unit), all passing.
 
 ### What's Proven
 
@@ -83,6 +83,7 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **64 tests** (52 CUDA GPU + 12 doc-ignored 
 | 3-phase MLP (full SMEM) | cuda_3phase | norm->GEMM+SiLU->GEMM, ALL handoffs via SMEM, **1.91e-6 diff** |
 | CUTLASS bf16 perimeter | cuda_cutlass_bf16 | cp.async auto-classified: 6 A-loads, 6 B-loads, 2 param groups |
 | CUTLASS cp.async deletion | cuda_cutlass_bf16 | A-loads deleted, B preserved, MMA preserved, **ptxas valid** |
+| CUTLASS explicit A-loads (GPU) | cuda_cutlass_bf16 | cp.async replaced with ld.global+st.shared, **0.00e0 diff** |
 | Perimeter: 5 kernel types | cuda_cutlass_bf16 | hand-written, nvcc, row-GEMM, CUTLASS bf16, CUTLASS FP8 |
 | Stress tests | cuda_stress | n=1 to n=4096, 100-run determinism |
 
@@ -201,6 +202,7 @@ crates/ptx-fusion/                 Library + tests
 | `persistent_fuse_real_kernels!(...)` | Wrap fused kernel in persistent work-queue loop |
 | `fuse_3phase_mlp!(...)` | 3-phase MLP: norm->GEMM+SiLU->GEMM, persistent |
 | `delete_cutlass_a_loads!(...)` | Delete A-matrix cp.async from CUTLASS GEMM (for prologue) |
+| `replace_cutlass_a_loads!(...)` | Replace A-matrix cp.async with explicit ld.global+st.shared |
 
 ## What's Next
 
@@ -212,10 +214,17 @@ model (`AsyncCopyPort`) now identifies these as input ports. The proc macro
 auto-classifies which cp.async loads are for A vs B by tracing GMEM source
 registers back to struct-param offsets -- no hardcoded assumptions.
 
-A-matrix cp.async deletion is proven: for the bf16 64x64x32 CUTLASS GEMM,
-6 A-loads are deleted, 6 B-loads and 16 MMA ops preserved, ptxas validates.
+A-matrix cp.async replacement is proven end-to-end:
+- **Deletion**: 6 A-loads deleted, 6 B-loads + 16 MMA preserved, ptxas valid
+- **Explicit replacement**: Each deleted cp.async replaced with
+  `ld.global.v4.b32 + st.shared.v4.b32` (with mask predication for boundary tiles)
+- **GPU correctness**: Explicit-load kernel vs original kernel: **0.00e0 diff**
+  (bitwise identical output, verified via CUTLASS API params + driver API launch)
+
 The SMEM destination address computation (`SharedStorageBase + f(tid)`) still
-runs -- only the cp.async instruction itself is removed.
+runs after cp.async replacement. The replacement reuses the same SMEM address
+registers and GMEM source registers — only the transfer mechanism changes
+(synchronous ld+st instead of async cp.async).
 
 **Failed approaches (don't repeat these):**
 - Separate SMEM handoff buffer alongside CUTLASS: fails because CUTLASS uses
@@ -227,29 +236,21 @@ runs -- only the cp.async instruction itself is removed.
 locations -- the same addresses the deleted cp.async would have written to.
 No separate buffer needed.
 
-**Remaining steps:**
+**Remaining step:**
 
-1. **Prologue writes to CUTLASS SMEM destinations.** Each deleted cp.async
-   had a destination like `[%r226]` where `%r226 = SharedStorageBase + f(tid)`.
-   The CUTLASS address computation code still runs after cp.async deletion.
-   The prologue uses those same address registers to write bf16 data via
-   `st.shared.v4.b32 [%r226], {data}`. The challenge: each thread must produce
-   the correct 16 bytes of bf16 A-matrix data for its SMEM slot. The GMEM
-   source register `[%rd26]` tells us which A elements that slot corresponds to.
-
-2. **GPU correctness test.** Run unmodified CUTLASS GEMM and prologue-injected
-   version with same bf16 A data. The prologue loads A from GMEM to SMEM
-   (same data cp.async would have loaded, just via ld.global + st.shared
-   instead of cp.async). Outputs must be bitwise identical.
-
-3. **Fuse with rms_norm.** rms_norm outputs f32. The handoff converts f32->bf16
-   (`cvt.rn.bf16.f32`) before writing to CUTLASS's SMEM. The rms_norm phase
-   runs with 128 threads (matching CUTLASS blockDim).
+1. **Fuse with rms_norm.** Replace the explicit GMEM loads (which currently
+   load A from GMEM just like cp.async did) with inline rms_norm computation.
+   rms_norm outputs f32; the handoff converts f32->bf16 (`cvt.rn.bf16.f32`)
+   before writing to CUTLASS's SMEM. The rms_norm phase runs with 128 threads
+   (matching CUTLASS blockDim). Each thread must produce the correct bf16 values
+   for its SMEM slot, determined by tracing the GMEM source register `[%rdN]`
+   to figure out which A-matrix elements each slot corresponds to.
 
 **Key files:**
-- `fuse_cp_async.rs`: `delete_a_matrix_loads()` -- auto-detects and deletes A cp.async
+- `fuse_cp_async.rs`: `delete_a_matrix_loads()`, `replace_a_loads_with_explicit()`
 - `parser.rs`: `AsyncCopyPort` in `KernelProtocol`, struct-param tracing
 - `kernels/cutlass_gemm_bf16_sm89.ptx`: bf16 CUTLASS GEMM (64x64x32, 3 stages, 24KB SMEM)
+- `tests/support/cutlass_prologue_test.cu`: GPU correctness harness (CUTLASS API + driver API)
 
 ### Near-term
 

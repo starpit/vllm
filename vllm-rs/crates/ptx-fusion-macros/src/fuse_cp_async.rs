@@ -65,19 +65,19 @@ pub fn delete_a_matrix_loads(ptx: &str, a_param_hint: &str) -> Result<DeleteResu
 
         if trimmed.contains("cp.async.cg.shared.global")
             && classifications.get(&i) == Some(&CpAsyncClass::AMatrix)
+            && let Some((smem_dst, gmem_src, mask)) = parse_cp_async(trimmed)
         {
-            if let Some((smem_dst, gmem_src, mask)) = parse_cp_async(trimmed) {
-                result.push(format!(
-                    "\t// FERRITE: deleted cp.async for A-matrix (data in SMEM from prologue)"
-                ));
-                deleted_loads.push(DeletedCpAsync {
-                    smem_dst,
-                    gmem_src,
-                    mask,
-                    line: i,
-                });
-                continue;
-            }
+            result.push(
+                "\t// FERRITE: deleted cp.async for A-matrix (data in SMEM from prologue)"
+                    .to_string(),
+            );
+            deleted_loads.push(DeletedCpAsync {
+                smem_dst,
+                gmem_src,
+                mask,
+                line: i,
+            });
+            continue;
         }
 
         result.push(line.to_string());
@@ -123,6 +123,133 @@ pub struct DeletedCpAsync {
     pub line: usize,
 }
 
+/// Replace A-matrix cp.async loads with explicit ld.global + st.shared.
+///
+/// This is the passthrough prologue: same data flow as cp.async, but using
+/// synchronous instructions. Each cp.async.cg.shared.global [smem], [gmem], 16, mask
+/// becomes:
+///   setp.ne.b32 %p_fe, mask, 0;
+///   @%p_fe  ld.global.v4.b32 {t0,t1,t2,t3}, [gmem];
+///   @!%p_fe mov.b32 t0, 0;  (... x4)
+///   st.shared.v4.b32 [smem], {t0,t1,t2,t3};
+///
+/// The SMEM address computation code is preserved — only the cp.async
+/// instruction is replaced. B-matrix cp.async loads are unchanged.
+pub fn replace_a_loads_with_explicit(ptx: &str, a_param_hint: &str) -> Result<String, String> {
+    let lines: Vec<&str> = ptx.lines().collect();
+    let proto = PtxParser::parse(ptx)?;
+    let reg_to_param = PtxParser::trace_param_registers_pub(&lines, &proto.params);
+
+    let a_param_name = identify_a_matrix_param(&lines, &reg_to_param, a_param_hint)?;
+
+    let a_addr_regs: Vec<String> = reg_to_param
+        .iter()
+        .filter(|(_, p)| **p == a_param_name)
+        .map(|(r, _)| r.clone())
+        .collect();
+
+    if a_addr_regs.is_empty() {
+        return Err(format!(
+            "no address registers traced to A param '{a_param_name}'"
+        ));
+    }
+
+    let classifications = classify_cp_async_loads(&lines, &a_addr_regs);
+    let a_count = classifications
+        .values()
+        .filter(|c| **c == CpAsyncClass::AMatrix)
+        .count();
+    if a_count == 0 {
+        return Err("no cp.async loads classified as A-matrix".into());
+    }
+
+    // Find existing register counts to allocate temps
+    let (pred_max, b32_max) = find_reg_counts(&lines);
+    let pred_tmp = pred_max; // one predicate register, reused
+    let b32_base = b32_max; // four b32 registers, reused
+
+    let mut result = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        // Bump register declarations
+        if trimmed.starts_with(".reg .pred") && trimmed.contains(&format!("%p<{pred_max}>")) {
+            result.push(line.replace(&format!("%p<{pred_max}>"), &format!("%p<{}>", pred_max + 1)));
+            continue;
+        }
+        if trimmed.starts_with(".reg .b32") && trimmed.contains(&format!("%r<{b32_max}>")) {
+            result.push(line.replace(&format!("%r<{b32_max}>"), &format!("%r<{}>", b32_max + 4)));
+            continue;
+        }
+
+        // Replace A-matrix cp.async with explicit ld+st
+        if trimmed.contains("cp.async.cg.shared.global")
+            && classifications.get(&i) == Some(&CpAsyncClass::AMatrix)
+            && let Some((smem_dst, gmem_src, mask)) = parse_cp_async(trimmed)
+        {
+            let t0 = format!("%r{}", b32_base);
+            let t1 = format!("%r{}", b32_base + 1);
+            let t2 = format!("%r{}", b32_base + 2);
+            let t3 = format!("%r{}", b32_base + 3);
+            let p = format!("%p{pred_tmp}");
+
+            result.push(
+                "\t// FERRITE: explicit ld+st replacing cp.async for A-matrix".to_string(),
+            );
+            result.push(format!("\tsetp.ne.b32 {p}, {mask}, 0;"));
+            result.push(format!(
+                "\t@{p} ld.global.v4.b32 {{{t0}, {t1}, {t2}, {t3}}}, [{gmem_src}];"
+            ));
+            result.push(format!("\t@!{p} mov.b32 {t0}, 0;"));
+            result.push(format!("\t@!{p} mov.b32 {t1}, 0;"));
+            result.push(format!("\t@!{p} mov.b32 {t2}, 0;"));
+            result.push(format!("\t@!{p} mov.b32 {t3}, 0;"));
+            result.push(format!(
+                "\tst.shared.v4.b32 [{smem_dst}], {{{t0}, {t1}, {t2}, {t3}}};"
+            ));
+            continue;
+        }
+
+        result.push(line.to_string());
+    }
+
+    Ok(result.join("\n"))
+}
+
+/// Parse register declaration counts from PTX.
+fn find_reg_counts(lines: &[&str]) -> (usize, usize) {
+    let mut pred_max = 0usize;
+    let mut b32_max = 0usize;
+
+    for line in lines {
+        let t = line.trim();
+        // .reg .pred %p<75>;
+        if t.starts_with(".reg .pred")
+            && let Some(start) = t.find("%p<")
+        {
+            let rest = &t[start + 3..];
+            if let Some(end) = rest.find('>')
+                && let Ok(n) = rest[..end].parse::<usize>()
+            {
+                pred_max = pred_max.max(n);
+            }
+        }
+        // .reg .b32 %r<740>;
+        if t.starts_with(".reg .b32")
+            && let Some(start) = t.find("%r<")
+        {
+            let rest = &t[start + 3..];
+            if let Some(end) = rest.find('>')
+                && let Ok(n) = rest[..end].parse::<usize>()
+            {
+                b32_max = b32_max.max(n);
+            }
+        }
+    }
+
+    (pred_max, b32_max)
+}
+
 // ── Internal helpers ──
 
 fn identify_a_matrix_param(
@@ -148,10 +275,10 @@ fn identify_a_matrix_param(
         return Err("no cp.async GMEM sources could be traced to params".into());
     }
 
-    if !hint.is_empty() {
-        if let Some(matched) = seen_params.iter().find(|p| p.contains(hint)) {
-            return Ok(matched.clone());
-        }
+    if !hint.is_empty()
+        && let Some(matched) = seen_params.iter().find(|p| p.contains(hint))
+    {
+        return Ok(matched.clone());
     }
 
     // First param seen in cp.async order is A (CUTLASS loads A before B)

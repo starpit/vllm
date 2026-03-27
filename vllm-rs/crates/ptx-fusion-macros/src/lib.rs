@@ -1124,3 +1124,41 @@ pub fn delete_cutlass_a_loads(input: TokenStream) -> TokenStream {
     };
     output.into()
 }
+
+/// Replace A-matrix cp.async loads with explicit ld.global + st.shared.
+///
+/// This is the passthrough prologue: same data, synchronous instructions.
+/// Proves that explicit loads produce the same SMEM contents as cp.async.
+///
+/// ```rust,ignore
+/// replace_cutlass_a_loads!(
+///     "kernels/cutlass_gemm_bf16_sm89.ptx",
+///     "Gemm",
+///     CUTLASS_GEMM_EXPLICIT_A
+/// );
+/// ```
+#[proc_macro]
+pub fn replace_cutlass_a_loads(input: TokenStream) -> TokenStream {
+    let input_str = input.to_string();
+    let args = parse_extract_args(&input_str)
+        .expect("replace_cutlass_a_loads! expects (\"path.ptx\", \"entry_substr\", CONST_NAME)");
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let ptx_path = PathBuf::from(&manifest_dir).join(&args.0);
+    let ptx_source = std::fs::read_to_string(&ptx_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", ptx_path.display()));
+
+    let extracted = extract::extract_entry(&ptx_source, &args.1)
+        .unwrap_or_else(|e| panic!("extract_entry failed: {e}"));
+
+    let modified = fuse_cp_async::replace_a_loads_with_explicit(&extracted, "")
+        .unwrap_or_else(|e| panic!("cp.async replacement failed: {e}"));
+
+    let modified_str = modified.as_str();
+    let const_name = syn::Ident::new(&args.2, proc_macro2::Span::call_site());
+
+    let output = quote! {
+        const #const_name: &str = #modified_str;
+    };
+    output.into()
+}

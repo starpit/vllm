@@ -10,7 +10,7 @@
 
 #![cfg(feature = "cuda")]
 
-use ptx_fusion_macros::{analyze_kernel_as, delete_cutlass_a_loads};
+use ptx_fusion_macros::{analyze_kernel_as, delete_cutlass_a_loads, replace_cutlass_a_loads};
 
 // ── Protocol extraction for every kernel type ──
 
@@ -31,6 +31,13 @@ delete_cutlass_a_loads!(
     "kernels/cutlass_gemm_bf16_sm89.ptx",
     "Gemm",
     CUTLASS_BF16_NO_A_LOADS
+);
+
+// CUTLASS bf16 with A-matrix cp.async replaced by explicit ld.global + st.shared
+replace_cutlass_a_loads!(
+    "kernels/cutlass_gemm_bf16_sm89.ptx",
+    "Gemm",
+    CUTLASS_BF16_EXPLICIT_A
 );
 
 // CUTLASS FP8: multi-entry file — extract single entry, then analyze.
@@ -214,4 +221,130 @@ fn delete_a_loads_passes_ptxas() {
     println!(
         "PASS: A-load-deleted CUTLASS bf16 passes ptxas ({deleted} deleted, {remaining_cp} preserved, {mma_count} MMA)"
     );
+}
+
+#[test]
+fn replace_a_loads_passes_ptxas() {
+    // Verify structure: no cp.async for A, but ld.global + st.shared present
+    let explicit_markers = CUTLASS_BF16_EXPLICIT_A
+        .matches("FERRITE: explicit ld+st replacing cp.async")
+        .count();
+    let remaining_cp = CUTLASS_BF16_EXPLICIT_A
+        .matches("cp.async.cg.shared.global")
+        .count();
+    let ld_globals = CUTLASS_BF16_EXPLICIT_A.matches("ld.global.v4.b32").count();
+    let st_shareds = CUTLASS_BF16_EXPLICIT_A.matches("st.shared.v4.b32").count();
+    let mma_count = CUTLASS_BF16_EXPLICIT_A.matches("mma.sync").count();
+
+    println!("=== CUTLASS bf16 A-load replacement (explicit ld+st) ===");
+    println!("  Replaced cp.async: {explicit_markers}");
+    println!("  Remaining cp.async: {remaining_cp} (B-matrix only)");
+    println!("  ld.global.v4.b32: {ld_globals}");
+    println!("  st.shared.v4.b32: {st_shareds}");
+    println!("  mma.sync: {mma_count}");
+
+    assert!(
+        explicit_markers > 0,
+        "should have replaced some cp.async with explicit ld+st"
+    );
+    assert!(remaining_cp > 0, "should preserve B-matrix cp.async");
+    assert_eq!(
+        ld_globals, explicit_markers,
+        "each replacement should have one ld.global.v4.b32"
+    );
+    assert_eq!(
+        st_shareds, explicit_markers,
+        "each replacement should have one st.shared.v4.b32"
+    );
+    assert!(mma_count > 0, "MMA should be preserved");
+
+    // Validate with ptxas
+    let path = "/tmp/cutlass_bf16_explicit_a.ptx";
+    std::fs::write(path, CUTLASS_BF16_EXPLICIT_A).unwrap();
+
+    let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for line in stderr.lines().take(30) {
+            println!("ptxas: {line}");
+        }
+        panic!("ptxas FAILED on explicit-A-load CUTLASS GEMM");
+    }
+
+    println!(
+        "PASS: explicit-A-load CUTLASS bf16 passes ptxas ({explicit_markers} replaced, {remaining_cp} B-preserved, {mma_count} MMA)"
+    );
+}
+
+#[test]
+fn explicit_a_loads_gpu_correctness() {
+    // Write both PTX files for the C++ test harness
+    let orig_path = "/tmp/cutlass_bf16_original.ptx";
+    let mod_path = "/tmp/cutlass_bf16_explicit_a.ptx";
+
+    // Extract original PTX (single entry)
+    ptx_fusion_macros::extract_entry!(
+        "kernels/cutlass_gemm_bf16_sm89.ptx",
+        "Gemm",
+        CUTLASS_BF16_ORIGINAL
+    );
+    std::fs::write(orig_path, CUTLASS_BF16_ORIGINAL).unwrap();
+    std::fs::write(mod_path, CUTLASS_BF16_EXPLICIT_A).unwrap();
+
+    // Compile the C++ test harness (if not already compiled)
+    let test_bin = "/tmp/cutlass_prologue_test";
+    let test_src = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/cutlass_prologue_test.cu"
+    );
+
+    let compile = std::process::Command::new("/usr/local/cuda-12.9/bin/nvcc")
+        .args([
+            "-arch=sm_89",
+            "-O2",
+            "-std=c++17",
+            "-I/home/moosevan/.cache/cutlass/include",
+            "-o",
+            test_bin,
+            test_src,
+            "-lcuda",
+        ])
+        .output()
+        .expect("nvcc");
+
+    if !compile.status.success() {
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        // Allow warnings, only fail on errors
+        if stderr.contains("error") {
+            for line in stderr.lines().filter(|l| l.contains("error")).take(10) {
+                println!("nvcc: {line}");
+            }
+            panic!("nvcc compilation FAILED");
+        }
+    }
+
+    // Run the test
+    let run = std::process::Command::new(test_bin)
+        .args([orig_path, mod_path])
+        .output()
+        .expect("test binary");
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    for line in stdout.lines() {
+        println!("  {line}");
+    }
+
+    if !run.status.success() {
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        for line in stderr.lines() {
+            println!("  ERR: {line}");
+        }
+        panic!("GPU correctness test FAILED");
+    }
+
+    println!("PASS: explicit A-loads GPU correctness verified");
 }

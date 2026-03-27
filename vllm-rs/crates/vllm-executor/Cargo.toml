@@ -9,6 +9,7 @@ description = "Worker/process management and distributed coordination for vLLM R
 default = []
 cuda = ["vllm-cuda/cuda", "cudarc"]
 nccl = ["cuda", "vllm-cuda/nccl"]
+ferrite = ["cuda", "vllm-cuda/ferrite"]
 guided-decoding = ["vllm-model/guided-decoding"]
 
 [dependencies]

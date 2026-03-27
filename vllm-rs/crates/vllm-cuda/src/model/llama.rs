@@ -398,6 +398,23 @@ impl LlamaMLP {
             concat
         } else {
             // Dense: single fused gate+up GEMM
+            #[cfg(feature = "ferrite")]
+            {
+                let w = match &self.gate_up_proj {
+                    crate::layers::LinearLayer::Dense(l) => l.weight,
+                    _ => panic!("ferrite: gate_up_proj must be Dense"),
+                };
+                device.ferrite.gemm(
+                    *x,
+                    w,
+                    None,
+                    1.0,
+                    0.0,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            }
+            #[cfg(not(feature = "ferrite"))]
             self.gate_up_proj.forward(
                 x,
                 &mut device.cublas,
@@ -577,6 +594,23 @@ impl LlamaAttention {
             qkv
         } else {
             // Dense: single fused QKV GEMM
+            #[cfg(feature = "ferrite")]
+            {
+                let w = match &self.qkv_proj {
+                    crate::layers::LinearLayer::Dense(l) => l.weight,
+                    _ => panic!("ferrite: qkv_proj must be Dense"),
+                };
+                device.ferrite.gemm(
+                    *hidden_states,
+                    w,
+                    None,
+                    1.0,
+                    0.0,
+                    &mut device.caching,
+                    device.compute_stream,
+                )
+            }
+            #[cfg(not(feature = "ferrite"))]
             self.qkv_proj.forward(
                 hidden_states,
                 &mut device.cublas,
@@ -695,6 +729,23 @@ impl LlamaAttention {
 
                 // Reshape to [num_tokens, q_size] and output projection.
                 let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
+                #[cfg(feature = "ferrite")]
+                let result = {
+                    let w = match &self.o_proj {
+                        crate::layers::LinearLayer::Dense(l) => l.weight,
+                        _ => panic!("ferrite: o_proj must be Dense"),
+                    };
+                    device.ferrite.gemm(
+                        *attn_flat,
+                        w,
+                        None,
+                        1.0,
+                        0.0,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                };
+                #[cfg(not(feature = "ferrite"))]
                 let result = self.o_proj.forward(
                     attn_flat,
                     &mut device.cublas,
@@ -781,6 +832,23 @@ impl LlamaAttention {
                 drop(v);
 
                 let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
+                #[cfg(feature = "ferrite")]
+                let result = {
+                    let w = match &self.o_proj {
+                        crate::layers::LinearLayer::Dense(l) => l.weight,
+                        _ => panic!("ferrite: o_proj must be Dense"),
+                    };
+                    device.ferrite.gemm(
+                        *attn_flat,
+                        w,
+                        None,
+                        1.0,
+                        0.0,
+                        &mut device.caching,
+                        device.compute_stream,
+                    )
+                };
+                #[cfg(not(feature = "ferrite"))]
                 let result = self.o_proj.forward(
                     attn_flat,
                     &mut device.cublas,

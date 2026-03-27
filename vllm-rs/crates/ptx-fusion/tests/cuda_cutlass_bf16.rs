@@ -778,3 +778,156 @@ fn flat_param_gemm_passes_ptxas() {
         "PASS: flat-param GEMM passes ptxas ({replaced} replaced, {mma_count} MMA, {cp_async} cp.async)"
     );
 }
+
+#[test]
+fn flat_param_gemm_gpu_correctness() {
+    use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, LaunchConfig, PushKernelArg};
+    use cudarc::nvrtc::Ptx;
+
+    println!("=== Flat-param GEMM GPU correctness (M=1024 N=2560 K=2048) ===");
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    // Load the flat-param rewritten PTX
+    let ptx = Ptx::from_src(FLAT_GEMM_64x64x32);
+    let module = ctx
+        .load_module(ptx)
+        .unwrap_or_else(|e| panic!("failed to load flat-param PTX: {e}"));
+    let func = module
+        .load_function("ferrite_gemm_64x64x32")
+        .unwrap_or_else(|e| panic!("failed to load entry: {e}"));
+
+    // Production dimensions
+    let m = 1024u32;
+    let n = 2560u32;
+    let k = 2048u32;
+    let lda = k; // A is row-major MxK
+    let ldb = k; // B is col-major NxK (stored as KxN transposed)
+    let ldc = n;
+    let ldd = n;
+
+    fn f32_to_bf16(v: f32) -> u16 {
+        (v.to_bits() >> 16) as u16
+    }
+    fn bf16_to_f32(v: u16) -> f32 {
+        f32::from_bits((v as u32) << 16)
+    }
+
+    // Generate test data — small values to avoid overflow in bf16
+    let h_a: Vec<u16> = (0..(m * k) as usize)
+        .map(|i| f32_to_bf16(((i as f32) * 0.00037 - 0.5).sin() * 0.1))
+        .collect();
+    let h_b: Vec<u16> = (0..(n * k) as usize)
+        .map(|i| f32_to_bf16(((i as f32) * 0.00023 + 0.3).cos() * 0.1))
+        .collect();
+
+    let d_a = stream.clone_htod(&h_a).unwrap();
+    let d_b = stream.clone_htod(&h_b).unwrap();
+    let d_c: CudaSlice<u16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let mut d_d: CudaSlice<u16> = stream.alloc_zeros((m * n) as usize).unwrap();
+
+    let (a_ptr, _) = d_a.device_ptr(&stream);
+    let (b_ptr, _) = d_b.device_ptr(&stream);
+    let (c_ptr, _) = d_c.device_ptr(&stream);
+    let (d_ptr, _) = d_d.device_ptr(&stream);
+
+    // Build the 88-byte flat param struct
+    let mut params = [0u8; 88];
+    // Pointers (u64)
+    params[0..8].copy_from_slice(&(a_ptr as u64).to_le_bytes());
+    params[8..16].copy_from_slice(&(b_ptr as u64).to_le_bytes());
+    params[16..24].copy_from_slice(&(c_ptr as u64).to_le_bytes());
+    params[24..32].copy_from_slice(&(d_ptr as u64).to_le_bytes());
+    // Strides (u64 — element strides, not byte strides)
+    params[32..40].copy_from_slice(&(lda as u64).to_le_bytes());
+    params[40..48].copy_from_slice(&(ldb as u64).to_le_bytes());
+    params[48..56].copy_from_slice(&(ldc as u64).to_le_bytes());
+    params[56..64].copy_from_slice(&(ldd as u64).to_le_bytes());
+    // Dimensions (s32)
+    params[64..68].copy_from_slice(&(m as i32).to_le_bytes());
+    params[68..72].copy_from_slice(&(n as i32).to_le_bytes());
+    params[72..76].copy_from_slice(&(k as i32).to_le_bytes());
+    // Scalars (f32)
+    params[76..80].copy_from_slice(&1.0f32.to_le_bytes()); // alpha
+    params[80..84].copy_from_slice(&0.0f32.to_le_bytes()); // beta
+
+    // Grid dimensions (same swizzle as original CUTLASS)
+    let tile_m = 64u32;
+    let tile_n = 64u32;
+    let grid_m = m.div_ceil(tile_m);
+    let grid_n = n.div_ceil(tile_n);
+    // GemmIdentityThreadblockSwizzle<4>: log_tile based on grid_n
+    let swizzle_log = if grid_n >= 3 {
+        2u32
+    } else if grid_n >= 2 {
+        1
+    } else {
+        0
+    };
+    let swizzle_tile = 1u32 << swizzle_log;
+    let grid_x = grid_m * swizzle_tile;
+    let grid_y = grid_n.div_ceil(swizzle_tile);
+
+    println!("  Grid: ({grid_x}, {grid_y}, 1), Block: (128, 1, 1)");
+    println!("  grid_m={grid_m}, grid_n={grid_n}, swizzle_log={swizzle_log}");
+
+    let smem_bytes = 24576u32; // 24KB for 64x64x32 with 3 stages
+    let launch_cfg = LaunchConfig {
+        grid_dim: (grid_x, grid_y, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: smem_bytes,
+    };
+
+    // Launch!
+    unsafe { stream.launch_builder(&func).arg(&params).launch(launch_cfg) }.unwrap();
+    stream.synchronize().unwrap();
+
+    // Read output
+    let output = stream.clone_dtoh(&d_d).unwrap();
+
+    // Sanity: non-zero output
+    let nz_count = output.iter().filter(|&&v| v != 0).count();
+    println!("  Non-zero outputs: {nz_count} / {}", m * n);
+    assert!(
+        nz_count > (m * n) as usize / 2,
+        "too many zeros in output ({nz_count} non-zero of {})",
+        m * n
+    );
+
+    // CPU reference: C[m,n] = sum_k A[m,k] * B[n,k]  (B is col-major NxK)
+    // Only check a subset (first 4 rows) — full CPU GEMM at this size is slow
+    let check_rows = 4;
+    let mut max_diff = 0.0f32;
+    for row in 0..check_rows {
+        for col in 0..n as usize {
+            let mut acc = 0.0f32;
+            for ki in 0..k as usize {
+                let a = bf16_to_f32(h_a[row * k as usize + ki]);
+                let b = bf16_to_f32(h_b[col * k as usize + ki]);
+                acc += a * b;
+            }
+            let got = bf16_to_f32(output[row * n as usize + col]);
+            let diff = (got - acc).abs();
+            max_diff = max_diff.max(diff);
+        }
+    }
+
+    println!(
+        "  Output[0..4]: [{:.6}, {:.6}, {:.6}, {:.6}]",
+        bf16_to_f32(output[0]),
+        bf16_to_f32(output[1]),
+        bf16_to_f32(output[2]),
+        bf16_to_f32(output[3])
+    );
+    println!("  Max diff (first {check_rows} rows): {max_diff:.2e}");
+
+    // bf16 GEMM at K=2048 accumulates ~2048 products of ~0.01 magnitude
+    // = ~20.0 max value. bf16 precision is ~0.01. Acceptable error: 0.1
+    assert!(
+        max_diff < 0.1,
+        "flat-param GEMM output incorrect (max_diff={max_diff:.2e})"
+    );
+
+    println!("PASS: flat-param GEMM GPU correctness verified (max_diff={max_diff:.2e})");
+}

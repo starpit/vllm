@@ -12,8 +12,8 @@ use cudarc::driver::{CudaContext, CudaSlice};
 // Extract each config from the multi-entry PTX
 ptx_fusion::extract_entry!(
     "kernels/cutlass_bf16_configs_sm89.ptx",
-    "GemmShapeILi64ELi64ELi32E",
-    CONFIG_64x64x32
+    "GemmShapeILi64ELi128ELi32E",
+    CONFIG_64x128x32
 );
 
 ptx_fusion::extract_entry!(
@@ -35,7 +35,7 @@ fn make_dispatch() -> CutlassDispatch {
     CutlassDispatch::new(
         &ctx,
         vec![
-            CutlassConfigSpec::new("64x64x32", 64, 64, 32, 128, 24576, CONFIG_64x64x32),
+            CutlassConfigSpec::new("64x128x32", 64, 128, 32, 128, 36864, CONFIG_64x128x32),
             CutlassConfigSpec::new("128x128x32", 128, 128, 32, 128, 49152, CONFIG_128x128x32),
             CutlassConfigSpec::new("128x128x64", 128, 128, 64, 128, 98304, CONFIG_128x128x64),
         ],
@@ -66,14 +66,13 @@ fn load_all_configs() {
 fn tile_selection_heuristic() {
     let dispatch = make_dispatch();
 
-    // Decode (small M) → smallest tile
-    assert_eq!(dispatch.select(1).name, "64x64x32");
-    assert_eq!(dispatch.select(8).name, "64x64x32");
-    assert_eq!(dispatch.select(32).name, "64x64x32");
-    assert_eq!(dispatch.select(64).name, "64x64x32");
+    // Decode (small M) → smallest tile (64x128x32)
+    assert_eq!(dispatch.select(1).name, "64x128x32");
+    assert_eq!(dispatch.select(8).name, "64x128x32");
+    assert_eq!(dispatch.select(32).name, "64x128x32");
+    assert_eq!(dispatch.select(64).name, "64x128x32");
 
-    // Medium/Large M → largest tile_m that fits
-    // When tile_m is the same, the last (largest K-tile) wins
+    // Prefill (large M) → largest tile_m that fits
     let s128 = dispatch.select(128).name;
     let s512 = dispatch.select(512).name;
     let s2048 = dispatch.select(2048).name;
@@ -81,7 +80,6 @@ fn tile_selection_heuristic() {
     println!("  M=512 → {s512}");
     println!("  M=2048 → {s2048}");
 
-    // All should be 128x128x* (not 64x64)
     assert!(s128.starts_with("128x128"));
     assert!(s512.starts_with("128x128"));
     assert!(s2048.starts_with("128x128"));
@@ -97,7 +95,7 @@ fn launch_all_configs_gpu() {
     let dispatch = CutlassDispatch::new(
         &ctx,
         vec![
-            CutlassConfigSpec::new("64x64x32", 64, 64, 32, 128, 24576, CONFIG_64x64x32),
+            CutlassConfigSpec::new("64x128x32", 64, 128, 32, 128, 36864, CONFIG_64x128x32),
             CutlassConfigSpec::new("128x128x32", 128, 128, 32, 128, 49152, CONFIG_128x128x32),
             CutlassConfigSpec::new("128x128x64", 128, 128, 64, 128, 98304, CONFIG_128x128x64),
         ],
@@ -161,14 +159,14 @@ fn grid_dim_computation() {
     let dispatch = make_dispatch();
     let c = dispatch.select(1);
 
-    // M=1, N=4096, tile=64x64 → grid_m=1, grid_n=64
+    // M=1, N=4096, tile=64x128 → grid_m=1, grid_n=32
     let (gx, gy, gz) = CutlassDispatch::grid_dim(c, 1, 4096);
     println!("M=1, N=4096: grid=({gx},{gy},{gz})");
     assert_eq!(gz, 1);
     assert!(gx > 0);
     assert!(gy > 0);
-    // Total tiles = ceil(1/64) * ceil(4096/64) = 1 * 64 = 64
-    assert_eq!(gx * gy, 64);
+    // Total tiles = ceil(1/64) * ceil(4096/128) = 1 * 32 = 32
+    assert_eq!(gx * gy, 32);
 
     // M=128, N=4096, tile=128x128 → grid_m=1, grid_n=32
     let c128 = dispatch.select(128);

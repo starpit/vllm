@@ -105,29 +105,43 @@ comes with more phases and larger data where GMEM savings outweigh per-tile cost
 
 ### CUTLASS vs cuBLAS (L4, bf16, K=N=4096)
 
-| Workload | cuBLAS | Best CUTLASS | Ratio |
-|----------|--------|-------------|-------|
-| **decode bs=1** | 135.5 us | **40.6 us** (64x64x32) | **3.34x** |
-| decode bs=8 | 32.1 us | 42.0 us (64x64x32) | 0.76x |
-| decode bs=32 | 38.6 us | 43.4 us (64x64x32) | 0.89x |
-| prefill 128 | 77.9 us | **74.1 us** (128x128x32) | **1.05x** |
-| prefill 512 | 226.7 us | 309.4 us (128x128x32) | 0.73x |
-| **prefill 2048** | 1165 us | **1110 us** (128x128x32) | **1.05x** |
-| gate\_up 128 | 424.8 us | **418.2 us** (64x64x32) | 1.01x |
-| down 128 | 432.1 us | **418.2 us** (64x64x32) | 1.03x |
+| Workload | cuBLAS | Best CUTLASS | Config | Ratio |
+|----------|--------|-------------|--------|-------|
+| **decode bs=1** | 135.6 us | **36.3 us** | 64x128x32 | **3.74x** |
+| decode bs=4 | 30.7 us | 37.7 us | 64x128x32 | 0.81x |
+| decode bs=8 | 32.7 us | 38.7 us | 64x128x32 | 0.84x |
+| decode bs=16 | 35.4 us | 39.7 us | 64x128x32 | 0.89x |
+| **decode bs=32** | 41.4 us | **41.1 us** | 64x128x32 | **1.01x** |
+| decode bs=64 | 41.5 us | 41.4 us | 64x128x32 | 1.00x |
+| prefill 128 | 82.5 us | **81.6 us** | 128x128x32 | **1.01x** |
+| prefill 256 | 126.4 us | 158.6 us | 64x128x32 | 0.80x |
+| prefill 512 | 238.9 us | 298.0 us | 64x128x32 | 0.80x |
+| prefill 1024 | 507.3 us | 578.3 us | 128x128x64 | 0.88x |
+| **prefill 2048** | 1209 us | **1161 us** | 128x128x64 | **1.04x** |
 
-Three tile configs compiled (24KB, 48KB, 96KB SMEM). Runtime dispatch selects
-by M: smallest tile for decode (M <= 64), largest for prefill (M > 256).
+Three tile configs: 64x128x32 (36KB), 128x128x32 (48KB), 128x128x64 (96KB).
+Runtime dispatch selects by M: 64x128 for decode, 128x128 for prefill.
 
-The bs=1 decode win (3.34x) is real — cuBLAS has large launch overhead for
-tiny M. The bs=8-32 gap (15-25% slower) is the cost of a fixed tile vs
-cuBLAS's auto-tuned selection. Ferrite fusion compensates: eliminating 2-4
-kernel launches at decode batch sizes saves 50-200 us, exceeding the
-per-GEMM penalty.
+**Where CUTLASS wins**: bs=1 (3.74x — cuBLAS launch overhead), bs=32-64
+(parity), bs=128 (1.01x), bs=2048 (1.04x).
+
+**Where cuBLAS wins**: bs=4-16 (11-19% — cuBLAS auto-selects specialized
+skinny-M kernels we don't have), bs=256-512 (20% — cuBLAS has more tile
+configs to choose from).
+
+**Why the gap is acceptable**: At decode bs=8, the 6 us per-GEMM penalty is
+~24 us across 4 GEMMs per layer. Fusion eliminates ~4 kernel launches x
+~5 us = ~20 us. Nearly a wash — and at bs=1 it's a massive net win.
 
 **SMEM limits on L4**: 128x256x64 with 3 stages needs 144KB, exceeds L4's
-99KB optin max. Fixed by using 128x128x64 (96KB, fits) or 2-stage variants.
-128x128x32 at 48KB and 64x64x32 at 24KB are the workhorses.
+99KB optin max. The 128x128x64 (96KB) fits and is the best large-prefill
+config.
+
+**Performance TODOs**:
+- Add more tile configs targeting the bs=4-16 gap (e.g., 16x256, GEMV-like)
+- Profile-guided selection: bench each config at model init, cache per M-bucket
+- StreamK scheduling for better SM utilization at medium M
+- Try CUTLASS 3.x warp-specialized kernels (sm_90+ only, not L4)
 
 ### The GEMM Epilogue Result
 

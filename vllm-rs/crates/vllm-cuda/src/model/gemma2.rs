@@ -503,6 +503,16 @@ impl Gemma2Attention {
 
             let window_left = self.sliding_window.map(|w| w as i32).unwrap_or(-1);
 
+            // K is stored rotated. Only pass cos_sin_cache when spans are active.
+            let has_spans = !kv_cache.block_unrotated_gpu().is_null();
+            let (cos_sin_ptr, rot_dim) = if has_spans {
+                (
+                    rotary.cos_sin_cache.raw_ptr() as *const u8,
+                    rotary.cos_sin_cache.dim(1),
+                )
+            } else {
+                (std::ptr::null(), 0)
+            };
             let attn_output = crate::model::attention_helpers::attention_decode_from_cache(
                 q.view(),
                 cu_seqlens_q,
@@ -518,8 +528,8 @@ impl Gemma2Attention {
                 device.num_sm,
                 &mut device.caching,
                 device.compute_stream,
-                rotary.cos_sin_cache.raw_ptr() as *const u8,
-                rotary.cos_sin_cache.dim(1),
+                cos_sin_ptr,
+                rot_dim,
                 false,
             );
             drop(q);
@@ -568,6 +578,16 @@ impl Gemma2Attention {
 
         let window_left = self.sliding_window.map(|w| w as i32).unwrap_or(-1);
 
+        // K is stored rotated. Only pass cos_sin_cache when spans are active.
+        let has_spans = !kv_cache.block_unrotated_gpu().is_null();
+        let (cos_sin_ptr, rot_dim) = if has_spans {
+            (
+                rotary.cos_sin_cache.raw_ptr() as *const u8,
+                rotary.cos_sin_cache.dim(1),
+            )
+        } else {
+            (std::ptr::null(), 0)
+        };
         let attn_output = crate::model::attention_helpers::attention_ext(
             q.view(),
             k.view(),
@@ -585,8 +605,8 @@ impl Gemma2Attention {
             device.num_sm,
             &mut device.caching,
             device.compute_stream,
-            rotary.cos_sin_cache.raw_ptr() as *const u8,
-            rotary.cos_sin_cache.dim(1),
+            cos_sin_ptr,
+            rot_dim,
             false,
         );
         drop(q);

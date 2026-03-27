@@ -207,6 +207,7 @@ pub unsafe fn attention_standard(
             cos_sin_cache_ptr,
             rotary_dim,
             is_rotary_interleaved,
+            kv_cache.block_unrotated_gpu(),
         )
     }
 }
@@ -275,6 +276,7 @@ pub unsafe fn attention_decode_from_cache(
             cos_sin_cache_ptr,
             rotary_dim,
             is_rotary_interleaved,
+            kv_cache.block_unrotated_gpu(),
         )
     }
 }
@@ -365,6 +367,7 @@ pub unsafe fn attention_ext(
             cos_sin_cache_ptr,
             rotary_dim,
             is_rotary_interleaved,
+            kv_cache.block_unrotated_gpu(),
         )
     }
 }

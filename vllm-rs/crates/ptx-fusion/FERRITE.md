@@ -169,107 +169,87 @@ This required extending the PTX param tracer to propagate through `mov.u64`/`mov
 engine to handle the `mul.wide.s32` address pattern that nvcc generates for GEMM
 kernels (vs the `cvt.s64.s32` pattern used by elementwise kernels).
 
-## Known Gap: Host-Side Logic Not Yet Derived from PTX
+## The General `ferrite::fuse!` Macro (next major milestone)
 
-Ferrite's core principle is: analyze PTX, derive everything automatically, transform
-safely. The escape perimeter (input/output loads/stores), register allocation, SMEM
-layout, and MMA structure are all extracted from PTX. **But the host-side launch
-parameters are currently hardcoded**, not derived from the kernel PTX.
+The current fusion macros (`fuse_rms_norm_cutlass!`, `fuse_norm_gemm_silu!`) are
+each hardcoded for a specific kernel pair. The CUTLASS params builder is hand-rolled
+with empirically-extracted constants, producing garbage for some configs.
 
-### What's hardcoded and shouldn't be
+The root cause: reimplementing host-side CUTLASS logic in Rust instead of deriving
+the kernel's contract from the PTX itself.
 
-**Threadblock swizzle (`swizzle_log_tile` and grid dimensions).**
-The `GemmIdentityThreadblockSwizzle<4>` logic maps `blockIdx` to logical tile
-coordinates. The host computes `swizzle_log = f(grid_n)` and encodes it in the
-params struct. The kernel reads it and reverses the mapping. Currently the host-side
-formula is hardcoded to match CUTLASS's C++ `get_log_tile()`:
+### The endgame
 
-```
-for s in [4, 2]: if grid_n % (s*2) == 0 → log++
-```
-
-This is fragile — a different swizzle strategy (StreamK, Grouped, etc.) would silently
-produce garbage. **This formula caused the first real integration bug**: the initial
-implementation used a wrong ratio-based formula that diverged for non-square grids
-(gate_up N=22016 → grid_n=172), producing all-"!" garbage output in chat.
-
-**Iterator params (stride multipliers).**
-The `PredicatedTileAccessIterator::Params` contains 4 precomputed stride values
-(stride, inc_strided, inc_next, inc_advance) that are linear functions of lda/ldb.
-The slope/intercept constants are extracted empirically (dump at stride=1 and stride=2,
-compute slope) and stored per tile config. A different iterator type would have
-different constants.
-
-**Epilogue iterator params.**
-Same issue — 8 precomputed values that are ldc/ldd-linear, empirically extracted.
-
-### How to fix: derive from PTX
-
-The swizzle logic is present in the kernel PTX as the `get_tile_offset()` pattern:
-the kernel reads `swizzle_log_tile` from params, shifts/masks `blockIdx.x` and
-`blockIdx.y` to recover the logical tile (m, n) coordinate. By analyzing this
-PTX pattern, Ferrite could:
-
-1. **Extract the swizzle formula** from the kernel's tile-offset computation
-2. **Invert it** to derive the host-side grid launch dimensions
-3. **Validate** that the params struct `swizzle_log_tile` field is set consistently
-
-For iterator params: the kernel's K-loop advancement pattern shows how pointer
-registers are incremented per tile. Tracing this back to the stride param gives the
-multiplier constants. This is a generalization of the existing param register tracer.
-
-**Priority**: High. This is the difference between "works for CUTLASS 2.x bf16
-GemmIdentityThreadblockSwizzle<4>" and "works for any CUTLASS kernel."
-
-### Analysis roadmap: from pattern matching to dataflow
-
-The current PTX parser does single-pass pattern matching: find `ld.global`,
-trace back to `ld.param` through a chain of `add.s64`/`cvta`/`mov`. This
-works for the escape perimeter because CUDA compilers emit stereotyped
-address chains. But deriving swizzle logic and iterator strides requires
-understanding **what the code computes**, not just what instructions appear.
-
-**Level 1: Parameterized pattern matching** (current state)
-
-Hardcoded templates: "find `shr.b32 %rX, %ctaid.x, %rY` where %rY traces
-to param offset 24 → that's the swizzle shift." Works for CUTLASS 2.x but
-brittle — a different swizzle or iterator type silently breaks.
-
-**Level 2: Def-use graph + backward slicing** (recommended next step)
-
-Build a def-use graph (one pass over PTX — each `%rN` defined once, used N
-times, PTX is SSA-like). Given a register of interest (e.g., the K-loop
-cursor or the tile-offset register), backward-slice to find all contributing
-instructions. Express the result as a symbolic formula:
-
-```
-cursor = param_A_ptr + tid_offset + k_iter * param_stride
-tile_m = blockIdx.x >> param_swizzle_log
-tile_n = blockIdx.y * (1 << param_swizzle_log) + (blockIdx.x & mask)
+```rust
+let llama_layer = ferrite::fuse!(
+    a = "csrc/rms_norm.ptx",
+    b = "cutlass/gemm_bf16.ptx",
+    c = "csrc/silu_mul.ptx",
+    bind = { a.output => b.input[0], b.output => c.input },
+);
+llama_layer.launch(input, weight, epsilon, gemm_weight, ...);
 ```
 
-The multiplier constants and swizzle formulas fall out directly. The backward
-slice is textbook (Weiser 1984) and cheap — a 1400-line CUTLASS kernel has
-~3000 def-use edges.
+One macro. Any kernels. No hardcoded param builders.
 
-This solves both problems:
-- **Swizzle**: backward-slice from the tile-index registers, extract the
-  formula, invert it for host-side grid computation
-- **Iterator strides**: backward-slice from the K-loop pointer increment,
-  find `mul stride, param, constant` → the constant is the slope
+### The extended perimeter model
 
-**Level 3: Full symbolic interpreter** (only if needed)
+Today's perimeter: data-in (ld.global), data-out (st.global), params (names/types).
+Missing: **param classification** (pointer vs stride vs scalar vs derived) and
+**param dependencies** (which derived params are functions of which raw params).
 
-Forward-evaluate the entire kernel symbolically, tracking each register as
-an expression tree. Handles arbitrary control flow. Probably overkill unless
-we need to analyze kernels from non-CUTLASS sources (e.g., hand-written
-persistent kernels with complex scheduling).
+A kernel's full perimeter includes params as first-class ports:
 
-**Recommendation**: Level 2 is the sweet spot. The def-use graph is cheap,
-backward slicing is well-understood, and it generalizes to any CUTLASS
-config without per-kernel hardcoding. PTX is easier to analyze than SASS
-or LLVM IR: linear control flow, globally unique register names, small
-instruction set.
+```
+Params-in:  [ptr_A, stride_A, ptr_B, stride_B, M, N, K, alpha, beta]  ← raw
+            [inc_strided, inc_next, inc_advance, swizzle_log, ...]     ← derived
+Data-in:    ld.global sites traced to ptr_A, ptr_B
+Data-out:   st.global sites traced to ptr_D
+```
+
+**Perimeter replacement**: rewrite the kernel's `ld.param` instructions to read
+from a new flat layout containing only raw params. Derived params are inlined
+as computations from raw params. The kernel's interior is untouched.
+
+### Implementation phases
+
+**Phase 1: Def-use graph + param classification** (parser.rs)
+
+Build a def-use graph (one pass, O(N)). Classify each `ld.param` by tracing
+forward through the graph:
+- Reaches `ld.global`/`st.global` address → **Pointer**
+- Multiplied with a pointer param → **Stride**
+- Used in `setp` comparison → **Dimension**
+- Used in scalar arithmetic (mul.f32) → **Scalar**
+- Not traceable to raw source → **Derived** (extract linear relationship)
+
+**Phase 2: Perimeter replacement** (new perimeter.rs)
+
+Given classified params, emit a new entry point with simplified params:
+- Raw params at new offsets
+- Derived params replaced with inline computation (`mul`, `add`)
+- Result: kernel takes only (ptrs, strides, dims, scalars). No derived fields.
+
+**Phase 3: General fusion engine** (new fuse_general.rs)
+
+Given N kernels with classified perimeters + user bindings:
+1. Match bindings to data ports
+2. Eliminate bound params (A's output ptr = B's input ptr)
+3. Choose handoff (SMEM, register, in-place)
+4. Merge remaining params
+5. Emit fused kernel
+
+**Phase 4: The `ferrite::fuse!` proc macro**
+
+Parse the DSL, call the general engine, return a `FusedKernel` value with
+the fused PTX baked in and a `launch()` method.
+
+### What this replaces
+
+All existing special-purpose macros become thin wrappers around `ferrite::fuse!`.
+The broken Rust GemmParams builder, hardcoded swizzle formula, and hardcoded
+iterator constants are all eliminated — replaced by perimeter analysis of the
+actual PTX.
 
 ## How the Escape Analysis Works
 

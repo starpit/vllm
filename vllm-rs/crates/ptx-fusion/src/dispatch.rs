@@ -145,11 +145,12 @@ impl CutlassDispatch {
         let grid_m = m.div_ceil(config.tile_m);
         let grid_n = n.div_ceil(config.tile_n);
 
-        // GemmIdentityThreadblockSwizzle<4> reorders tiles for L2 locality
+        // Must match CUTLASS get_grid_shape:
+        //   tile = 1 << get_log_tile; grid = (grid_m * tile, ceil(grid_n / tile), 1)
         let swizzle_log = compute_swizzle_log(grid_m as i32, grid_n as i32);
-        let swizzle = 1u32 << swizzle_log;
-        let grid_x = grid_m * grid_n.div_ceil(swizzle);
-        let grid_y = swizzle;
+        let tile = 1u32 << swizzle_log;
+        let grid_x = grid_m * tile;
+        let grid_y = grid_n.div_ceil(tile);
         (grid_x, grid_y, 1)
     }
 }
@@ -355,18 +356,22 @@ fn find_entry_name(ptx: &str) -> Result<String, String> {
     Err("no entry found in PTX".into())
 }
 
-/// Compute swizzle log for GemmIdentityThreadblockSwizzle<4>.
+/// Compute swizzle log for GemmIdentityThreadblockSwizzle<N>.
 ///
-/// Must match the CUTLASS C++ implementation exactly:
-///   for s in [kSwizzle..1]: if grid_n % (s*2) == 0 → log++
+/// From CUTLASS threadblock_swizzle.h get_log_tile():
+///   if N >= 8 && n >= 6 → 3
+///   if N >= 4 && n >= 3 → 2
+///   if N >= 2 && n >= 2 → 1
+///   else → 0
 fn compute_swizzle_log(_grid_m: i32, grid_n: i32) -> u32 {
-    let mut log = 0u32;
-    let mut s = 4; // kSwizzle = 4
-    while s > 1 {
-        if grid_n % (s * 2) == 0 {
-            log += 1;
-        }
-        s /= 2;
+    const SWIZZLE_N: i32 = 4;
+    if SWIZZLE_N >= 8 && grid_n >= 6 {
+        3
+    } else if SWIZZLE_N >= 4 && grid_n >= 3 {
+        2
+    } else if SWIZZLE_N >= 2 && grid_n >= 2 {
+        1
+    } else {
+        0
     }
-    log
 }

@@ -97,34 +97,11 @@ impl FerriteCutlass {
                 [0, 0, 64, 64],
                 [2, 4, -2, -2, 16, 64, 128, 32],
             ),
-            (
-                "128x128x32",
-                CONFIG_128X128X32_PTX,
-                128,
-                128,
-                32,
-                128,
-                49152,
-                [1, 16, -48, 0],
-                [0, 0, 64, 64],
-                [1, 16, -48, 0],
-                [0, 0, 64, 64],
-                [2, 4, -2, -2, 16, 128, 256, 32],
-            ),
-            (
-                "128x128x64",
-                CONFIG_128X128X64_PTX,
-                128,
-                128,
-                64,
-                128,
-                98304,
-                [1, 8, -56, 0],
-                [0, 0, 128, 128],
-                [1, 8, -56, 0],
-                [0, 0, 128, 128],
-                [2, 4, -2, -2, 16, 128, 256, 32],
-            ),
+            // NOTE: 128x128x32 and 128x128x64 removed — produce garbage.
+            // Only 64x128x32 is verified correct in model inference. — produces garbage in model inference.
+            // The iterator constants are verified correct, but something in the
+            // PTX or launch path is broken. Needs investigation.
+            // Keep only 64x128x32 and 128x128x32 for now.
         ];
 
         let mut configs = Vec::new();
@@ -188,17 +165,6 @@ impl FerriteCutlass {
         let n = b.dim(0) as u32;
         debug_assert_eq!(b.dim(1) as u32, k, "K dimension mismatch");
 
-        eprintln!(
-            "[ferrite] gemm M={} K={} N={} a_ptr=0x{:x} b_ptr=0x{:x} dtype={:?} tile={}",
-            m,
-            k,
-            n,
-            a.raw_ptr() as u64,
-            b.raw_ptr() as u64,
-            a.dtype(),
-            self.select(m).name,
-        );
-
         let out = alloc.alloc_tensor(&[m as usize, n as usize], a.dtype());
 
         let config = self.select(m);
@@ -227,13 +193,15 @@ impl FerriteCutlass {
             actual_beta,
         );
 
-        // Compute grid
+        // Compute grid — must match CUTLASS get_grid_shape exactly:
+        //   tile = 1 << get_log_tile(grid_tiled_shape)
+        //   grid = (grid_m * tile, ceil(grid_n / tile), 1)
         let grid_m = m.div_ceil(config.tile_m);
         let grid_n = n.div_ceil(config.tile_n);
         let swizzle_log = compute_swizzle_log(grid_m as i32, grid_n as i32);
-        let swizzle = 1u32 << swizzle_log;
-        let grid_x = grid_m * grid_n.div_ceil(swizzle);
-        let grid_y = swizzle;
+        let tile = 1u32 << swizzle_log;
+        let grid_x = grid_m * tile;
+        let grid_y = grid_n.div_ceil(tile);
 
         // Launch
         launch_cutlass(
@@ -426,19 +394,24 @@ unsafe fn launch_cutlass(
 
 /// Compute swizzle log for GemmIdentityThreadblockSwizzle<4>.
 ///
-/// Must match the CUTLASS implementation exactly:
-///   for s in [kSwizzle..1]: if grid_n % (s*2) == 0 → log++
+/// Compute swizzle log for GemmIdentityThreadblockSwizzle<N>.
+///
+/// From CUTLASS threadblock_swizzle.h get_log_tile():
+///   if N >= 8 && n >= 6 → 3
+///   if N >= 4 && n >= 3 → 2
+///   if N >= 2 && n >= 2 → 1
+///   else → 0
 fn compute_swizzle_log(_grid_m: i32, grid_n: i32) -> u32 {
-    // kSwizzle = 4 for GemmIdentityThreadblockSwizzle<4>
-    let mut log = 0u32;
-    let mut s = 4;
-    while s > 1 {
-        if grid_n % (s * 2) == 0 {
-            log += 1;
-        }
-        s /= 2;
+    const SWIZZLE_N: i32 = 4; // GemmIdentityThreadblockSwizzle<4>
+    if SWIZZLE_N >= 8 && grid_n >= 6 {
+        3
+    } else if SWIZZLE_N >= 4 && grid_n >= 3 {
+        2
+    } else if SWIZZLE_N >= 2 && grid_n >= 2 {
+        1
+    } else {
+        0
     }
-    log
 }
 
 fn w32(buf: &mut [u8], off: usize, v: i32) {

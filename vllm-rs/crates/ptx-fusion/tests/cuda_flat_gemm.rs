@@ -373,20 +373,27 @@ fn partial_tiles() {
     // Use 64x64x32 config with non-aligned dims
     let cfg = &CONFIGS[0]; // 64x64x32
 
-    // NOTE: N=64 cases have grid_n=1, which means swizzle_log=0.
-    // But the kernel has swizzle_log baked in as constant 2 (from probe).
-    // These cases require swizzle_log to be computed dynamically (Phase 2 TODO).
-    // For now, test only N values where grid_n >= 3 (swizzle_log=2 matches).
+    // NOTE: CUTLASS requires strides aligned to vector width (8 elements for bf16).
+    // N must be a multiple of 8 for output alignment. K must be a multiple of alignment too.
     let cases = [
-        (1, 192, 32),   // M=1, grid_n=3 (minimum for swizzle_log=2)
-        (7, 256, 32),   // M=7 (odd decode)
-        (63, 256, 32),  // M just under tile
-        (65, 256, 32),  // M just over tile, grid_n=4
-        (64, 192, 32),  // N=3 tiles (minimum for swizzle_log=2)
-        (100, 256, 64), // both non-aligned, grid_n=4
+        (1, 64, 32),    // M=1, grid_n=1, swizzle_log=0
+        (7, 64, 32),    // M=7, grid_n=1
+        (63, 64, 32),   // M just under tile
+        (65, 64, 32),   // M just over tile, grid_n=1
+        (64, 128, 32),  // N=2 tiles, grid_n=2, swizzle_log=1
+        (100, 192, 64), // both non-aligned M, grid_n=3, swizzle_log=2
+        (1, 256, 128),  // M=1, larger K, swizzle_log=2
+        (33, 320, 96),  // odd M, 5 N-tiles, larger K
     ];
 
     for (m, n, k) in cases {
+        // CUTLASS bf16 requires K and N aligned to vector width (8 elements)
+        assert!(k % 8 == 0, "K={k} must be multiple of 8 for bf16 alignment");
+        assert!(
+            n % 8 == 0,
+            "N={n} must be multiple of 8 for bf16 output alignment"
+        );
+
         let (abs_diff, _) = run_gemm_vs_cublas(cfg, m, n, k);
         println!("  M={m:4}, N={n:4}, K={k:4}: max_abs_diff={abs_diff:.2e}");
         assert!(

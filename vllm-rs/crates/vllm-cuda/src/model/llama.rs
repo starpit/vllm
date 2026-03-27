@@ -398,7 +398,7 @@ impl LlamaMLP {
             concat
         } else {
             // Dense: single fused gate+up GEMM
-            #[cfg(feature = "ferrite")]
+            #[cfg(feature = "OFF")]
             {
                 let w = match &self.gate_up_proj {
                     crate::layers::LinearLayer::Dense(l) => l.weight,
@@ -414,7 +414,7 @@ impl LlamaMLP {
                     device.compute_stream,
                 )
             }
-            #[cfg(not(feature = "ferrite"))]
+            #[cfg(not(feature = "OFF"))]
             self.gate_up_proj.forward(
                 x,
                 &mut device.cublas,
@@ -431,7 +431,7 @@ impl LlamaMLP {
         );
         drop(gate_up);
 
-        #[cfg(feature = "ferrite")]
+        #[cfg(feature = "OFF")]
         let result = {
             let w = match &self.down_proj {
                 crate::layers::LinearLayer::Dense(l) => l.weight,
@@ -594,7 +594,7 @@ impl LlamaAttention {
             qkv
         } else {
             // Dense: single fused QKV GEMM
-            #[cfg(feature = "ferrite")]
+            #[cfg(feature = "OFF")]
             {
                 let w = match &self.qkv_proj {
                     crate::layers::LinearLayer::Dense(l) => l.weight,
@@ -610,7 +610,7 @@ impl LlamaAttention {
                     device.compute_stream,
                 )
             }
-            #[cfg(not(feature = "ferrite"))]
+            #[cfg(not(feature = "OFF"))]
             self.qkv_proj.forward(
                 hidden_states,
                 &mut device.cublas,
@@ -729,7 +729,7 @@ impl LlamaAttention {
 
                 // Reshape to [num_tokens, q_size] and output projection.
                 let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
-                #[cfg(feature = "ferrite")]
+                #[cfg(feature = "OFF")]
                 let result = {
                     let w = match &self.o_proj {
                         crate::layers::LinearLayer::Dense(l) => l.weight,
@@ -745,7 +745,7 @@ impl LlamaAttention {
                         device.compute_stream,
                     )
                 };
-                #[cfg(not(feature = "ferrite"))]
+                #[cfg(not(feature = "OFF"))]
                 let result = self.o_proj.forward(
                     attn_flat,
                     &mut device.cublas,
@@ -832,7 +832,7 @@ impl LlamaAttention {
                 drop(v);
 
                 let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
-                #[cfg(feature = "ferrite")]
+                #[cfg(feature = "OFF")]
                 let result = {
                     let w = match &self.o_proj {
                         crate::layers::LinearLayer::Dense(l) => l.weight,
@@ -848,7 +848,7 @@ impl LlamaAttention {
                         device.compute_stream,
                     )
                 };
-                #[cfg(not(feature = "ferrite"))]
+                #[cfg(not(feature = "OFF"))]
                 let result = self.o_proj.forward(
                     attn_flat,
                     &mut device.cublas,
@@ -915,7 +915,7 @@ impl LlamaAttention {
 
         // Reshape to [num_tokens, q_size] and output projection.
         let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
-        #[cfg(feature = "ferrite")]
+        #[cfg(feature = "OFF")]
         let result = {
             let w = match &self.o_proj {
                 crate::layers::LinearLayer::Dense(l) => l.weight,
@@ -931,7 +931,7 @@ impl LlamaAttention {
                 device.compute_stream,
             )
         };
-        #[cfg(not(feature = "ferrite"))]
+        #[cfg(not(feature = "OFF"))]
         let result = self.o_proj.forward(
             attn_flat,
             &mut device.cublas,

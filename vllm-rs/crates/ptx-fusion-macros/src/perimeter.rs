@@ -49,6 +49,9 @@ pub enum FieldFormula {
     CeilDiv { flat_offset: usize, divisor: u32 },
     /// Float field (alpha or beta). Load f32 from flat offset.
     Float { flat_offset: usize },
+    /// Swizzle log: computed from ceil(N/tile_N) using threshold logic.
+    /// GemmIdentityThreadblockSwizzle<4>: if grid_n >= 3 → 2, elif >= 2 → 1, else 0.
+    SwizzleLog { n_flat_offset: usize, tile_n: u32 },
     /// Always zero (nullptr fields).
     Zero,
 }
@@ -340,6 +343,20 @@ pub fn build_formula_map(
             continue;
         }
 
+        // Swizzle log: offset 24 in the CUTLASS params struct.
+        // This is NOT truly constant — it depends on ceil(N/tile_N).
+        // Compute it inline instead of baking the probed value.
+        if struct_off == 24 {
+            formulas.insert(
+                struct_off,
+                FieldFormula::SwizzleLog {
+                    n_flat_offset: flat_offset_of["N"],
+                    tile_n: probe.tile.1,
+                },
+            );
+            continue;
+        }
+
         // Constant (non-zero, doesn't change between base and check)
         if let Some(pf) = probed
             && pf.base_value == pf.check_value
@@ -506,6 +523,47 @@ pub fn emit_replacement(
                 )
             }
         }
+
+        FieldFormula::SwizzleLog {
+            n_flat_offset,
+            tile_n,
+        } => {
+            // Compute: grid_n = ceil(N / tile_n)
+            // Then: if grid_n >= 3 → 2, elif grid_n >= 2 → 1, else 0
+            // (GemmIdentityThreadblockSwizzle<4>, SWIZZLE_N=4)
+            let t_n = r_tmp(tmp_counter);
+            let t_gn = r_tmp(tmp_counter);
+            let t_p1 = format!("%p_ptmp{}", *tmp_counter);
+            *tmp_counter += 1;
+            let t_p2 = format!("%p_ptmp{}", *tmp_counter);
+            *tmp_counter += 1;
+
+            let d_minus_1 = tile_n - 1;
+            let shift = tile_n.trailing_zeros();
+
+            // grid_n = ceil(N / tile_n)
+            let ceil_div = if tile_n.count_ones() == 1 {
+                format!(
+                    "\tld.param.s32 \t{t_n}, [{flat_param_name}+{n_flat_offset}];\n\
+                     \tadd.s32 \t{t_gn}, {t_n}, {d_minus_1};\n\
+                     \tshr.s32 \t{t_gn}, {t_gn}, {shift};"
+                )
+            } else {
+                format!(
+                    "\tld.param.s32 \t{t_n}, [{flat_param_name}+{n_flat_offset}];\n\
+                     \tadd.s32 \t{t_gn}, {t_n}, {d_minus_1};\n\
+                     \tdiv.s32 \t{t_gn}, {t_gn}, {tile_n};"
+                )
+            };
+            // if grid_n >= 3 → 2, elif grid_n >= 2 → 1, else 0
+            format!(
+                "{ceil_div}\n\
+                 \tsetp.ge.s32 \t{t_p1}, {t_gn}, 3;\n\
+                 \tsetp.ge.s32 \t{t_p2}, {t_gn}, 2;\n\
+                 \tselp.b32 \t{dest_reg}, 1, 0, {t_p2};\n\
+                 \tselp.b32 \t{dest_reg}, 2, {dest_reg}, {t_p1};"
+            )
+        }
     }
 }
 
@@ -619,6 +677,7 @@ pub fn replace_perimeter(
                 // Add temp register declarations
                 output.push(format!("\t.reg .b64 \t%rd_ptmp<{extra_regs}>;"));
                 output.push(format!("\t.reg .b32 \t%r_ptmp<{extra_regs}>;"));
+                output.push(format!("\t.reg .pred \t%p_ptmp<{extra_regs}>;"));
             }
             continue;
         }

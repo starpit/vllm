@@ -915,6 +915,23 @@ impl LlamaAttention {
 
         // Reshape to [num_tokens, q_size] and output projection.
         let attn_flat = attn_output.view().reshape(&[num_tokens, self.q_size]);
+        #[cfg(feature = "ferrite")]
+        let result = {
+            let w = match &self.o_proj {
+                crate::layers::LinearLayer::Dense(l) => l.weight,
+                _ => panic!("ferrite: o_proj must be Dense"),
+            };
+            device.ferrite.gemm(
+                *attn_flat,
+                w,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+        #[cfg(not(feature = "ferrite"))]
         let result = self.o_proj.forward(
             attn_flat,
             &mut device.cublas,

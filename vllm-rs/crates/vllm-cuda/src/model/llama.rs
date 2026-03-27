@@ -414,6 +414,23 @@ impl LlamaMLP {
         );
         drop(gate_up);
 
+        #[cfg(feature = "ferrite")]
+        let result = {
+            let w = match &self.down_proj {
+                crate::layers::LinearLayer::Dense(l) => l.weight,
+                _ => panic!("ferrite: down_proj must be Dense for CUTLASS path"),
+            };
+            device.ferrite.gemm(
+                activated.as_gpu_tensor(),
+                w,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                device.compute_stream,
+            )
+        };
+        #[cfg(not(feature = "ferrite"))]
         let result = self.down_proj.forward(
             activated.view(),
             &mut device.cublas,

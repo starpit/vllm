@@ -31,6 +31,9 @@ pub struct GpuDevice {
     pub num_sm: i32,
     /// SM version (compute capability): major*10 + minor. E.g. 89 for L40S, 80 for A100.
     pub sm_version: u32,
+    /// Ferrite CUTLASS GEMM dispatcher (when feature enabled).
+    #[cfg(feature = "ferrite")]
+    pub ferrite: crate::ferrite::FerriteCutlass,
 }
 
 impl GpuDevice {
@@ -60,6 +63,9 @@ impl GpuDevice {
                 sm_version,
             );
 
+            #[cfg(feature = "ferrite")]
+            let ferrite = crate::ferrite::FerriteCutlass::new()?;
+
             Ok(Self {
                 device_id,
                 ctx,
@@ -71,6 +77,8 @@ impl GpuDevice {
                 d2h_done,
                 num_sm,
                 sm_version,
+                #[cfg(feature = "ferrite")]
+                ferrite,
             })
         }
     }

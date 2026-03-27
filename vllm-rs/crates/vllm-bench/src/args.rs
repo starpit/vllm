@@ -301,11 +301,15 @@ impl BenchThroughputArgs {
 /// sending concurrent HTTP requests to a running vLLM server and measuring
 /// TTFT, TPOT, ITL, and end-to-end latency.
 #[derive(Parser, Debug)]
-#[command(override_usage = "vllm bench serve [OPTIONS]")]
+#[command(override_usage = "vllm bench serve [MODEL] [OPTIONS]")]
 pub struct BenchServeArgs {
+    /// Model name to use in API requests (positional). If not specified,
+    /// fetches the first model from the server's /v1/models endpoint.
+    pub model_tag: Option<String>,
+
     /// Model name to use in API requests. If not specified, fetches the
     /// first model from the server's /v1/models endpoint.
-    #[arg(long)]
+    #[arg(short = 'm', long, env = "VLLM_MODEL")]
     pub model: Option<String>,
 
     /// Tokenizer to use for prompt generation / length filtering.

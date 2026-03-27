@@ -65,7 +65,7 @@ pub struct ServeArgs {
 
     /// Path to a local model directory, or HuggingFace model ID.
     /// Can also be specified as a positional argument.
-    #[arg(long, env = "VLLM_MODEL")]
+    #[arg(short = 'm', long, env = "VLLM_MODEL")]
     pub model: Option<String>,
 
     /// Host address to bind.
@@ -312,7 +312,7 @@ pub struct ChatArgs {
     pub model_tag: Option<String>,
 
     /// Model: local path or HuggingFace model ID (alternative to positional arg).
-    #[arg(long, env = "VLLM_MODEL")]
+    #[arg(short = 'm', long, env = "VLLM_MODEL")]
     pub model: Option<String>,
 
     /// URL of a running OpenAI-compatible API server (remote mode).
@@ -424,7 +424,7 @@ pub struct BatchArgs {
     pub model_tag: Option<String>,
 
     /// Path to a local model directory, or HuggingFace model ID.
-    #[arg(long, env = "VLLM_MODEL")]
+    #[arg(short = 'm', long, env = "VLLM_MODEL")]
     pub model: Option<String>,
 
     /// Input JSONL file containing batch requests.

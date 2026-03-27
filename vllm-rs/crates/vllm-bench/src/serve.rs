@@ -297,7 +297,7 @@ pub(crate) async fn run_bench_serve(args: BenchServeArgs) -> Result<()> {
     };
 
     // Resolve model name.
-    let model = match &args.model {
+    let model = match args.model_tag.as_ref().or(args.model.as_ref()) {
         Some(m) => m.clone(),
         None => {
             eprintln!("No --model specified, fetching from server...");

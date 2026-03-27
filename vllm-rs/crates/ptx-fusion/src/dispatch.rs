@@ -356,15 +356,17 @@ fn find_entry_name(ptx: &str) -> Result<String, String> {
 }
 
 /// Compute swizzle log for GemmIdentityThreadblockSwizzle<4>.
-fn compute_swizzle_log(grid_m: i32, grid_n: i32) -> u32 {
-    let max_dim = grid_m.max(grid_n);
-    let min_dim = grid_m.min(grid_n).max(1);
-    let ratio = (max_dim / min_dim).min(4);
-    if ratio >= 4 {
-        2
-    } else if ratio >= 2 {
-        1
-    } else {
-        0
+///
+/// Must match the CUTLASS C++ implementation exactly:
+///   for s in [kSwizzle..1]: if grid_n % (s*2) == 0 → log++
+fn compute_swizzle_log(_grid_m: i32, grid_n: i32) -> u32 {
+    let mut log = 0u32;
+    let mut s = 4; // kSwizzle = 4
+    while s > 1 {
+        if grid_n % (s * 2) == 0 {
+            log += 1;
+        }
+        s /= 2;
     }
+    log
 }

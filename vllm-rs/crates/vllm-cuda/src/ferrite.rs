@@ -188,6 +188,17 @@ impl FerriteCutlass {
         let n = b.dim(0) as u32;
         debug_assert_eq!(b.dim(1) as u32, k, "K dimension mismatch");
 
+        eprintln!(
+            "[ferrite] gemm M={} K={} N={} a_ptr=0x{:x} b_ptr=0x{:x} dtype={:?} tile={}",
+            m,
+            k,
+            n,
+            a.raw_ptr() as u64,
+            b.raw_ptr() as u64,
+            a.dtype(),
+            self.select(m).name,
+        );
+
         let out = alloc.alloc_tensor(&[m as usize, n as usize], a.dtype());
 
         let config = self.select(m);
@@ -413,17 +424,21 @@ unsafe fn launch_cutlass(
     );
 }
 
-fn compute_swizzle_log(grid_m: i32, grid_n: i32) -> u32 {
-    let max_dim = grid_m.max(grid_n);
-    let min_dim = grid_m.min(grid_n).max(1);
-    let ratio = (max_dim / min_dim).min(4);
-    if ratio >= 4 {
-        2
-    } else if ratio >= 2 {
-        1
-    } else {
-        0
+/// Compute swizzle log for GemmIdentityThreadblockSwizzle<4>.
+///
+/// Must match the CUTLASS implementation exactly:
+///   for s in [kSwizzle..1]: if grid_n % (s*2) == 0 → log++
+fn compute_swizzle_log(_grid_m: i32, grid_n: i32) -> u32 {
+    // kSwizzle = 4 for GemmIdentityThreadblockSwizzle<4>
+    let mut log = 0u32;
+    let mut s = 4;
+    while s > 1 {
+        if grid_n % (s * 2) == 0 {
+            log += 1;
+        }
+        s /= 2;
     }
+    log
 }
 
 fn w32(buf: &mut [u8], off: usize, v: i32) {

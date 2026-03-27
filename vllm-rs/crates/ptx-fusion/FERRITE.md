@@ -236,38 +236,53 @@ and hidden_size are prepended as extra params.
 - `kernels/cutlass_gemm_bf16_sm89.ptx`: bf16 CUTLASS GEMM (64x64x32, 3 stages, 24KB SMEM)
 - `tests/support/cutlass_prologue_test.cu`: GPU correctness harness (CUTLASS API + driver API)
 
-### Near-term
+### Immediate: CUTLASS GEMM parity with cuBLAS (Phase 0)
 
-- **More epilogue ops**: quantize (f32->fp8), scale, residual add.
-- **FlashAttention**: compile FA2/FA3 to PTX, identify escape perimeter.
+**Why**: Everything depends on having fusible PTX GEMMs. cuBLAS is a black box --
+can't inject prologue/epilogue. CUTLASS compiles to PTX that Ferrite can transform.
 
-### The full forward pass
+**Work**:
+- Compile CUTLASS bf16 GEMMs for production tile sizes (128x256x64, 256x128x64)
+- Build a Rust `CutlassGemm` type: loads PTX once, caches CUfunction, constructs Params
+- Benchmark against cuBLAS at realistic sizes (batch x hidden=4096)
+- Wire into llama.rs as feature-gated alternative
 
-Every op in a transformer layer compiles to PTX. Ferrite identifies each kernel's
-escape perimeter and stitches them into one persistent kernel at `cargo build` time.
+### Near-term: fused operation library (Phase 1)
+
+**Already proven**: `fuse_rms_norm_cutlass!`, `inject_epilogue!` (SiLU/GELU/ReLU)
+
+**Need to build**:
+- `fuse_gemm_residual!` -- residual add in GEMM epilogue
+- `fuse_norm_gemm_silu!` -- prologue + epilogue combined
+- More epilogue ops: quantize (f32->fp8), scale
+
+### The Ferrite-based forward pass
 
 ```
-Current (9 kernel launches per layer):
-  fused_add_rms_norm -> QKV GEMM -> RoPE -> FlashAttn -> O GEMM
-  -> fused_add_rms_norm -> gate_up GEMM -> silu_mul -> down GEMM
+Current llama.rs (9+ kernel launches per layer):
+  norm -> QKV GEMM -> split+RoPE -> FA2 -> O GEMM -> residual
+  -> norm -> gate_up GEMM -> SiLU*mul -> down GEMM -> residual
 
-Ferrite target (1 launch per layer):
-  persistent_kernel {
-    loop {
-      tile = next_tile();
-      phase_norm(tile);           // SMEM handoff ->
-      phase_qkv_gemm(tile);      // epilogue injects RoPE ->
-      phase_attention(tile);      // reads from SMEM ->
-      phase_o_gemm(tile);        // epilogue injects residual+norm ->
-      phase_gate_up_gemm(tile);  // epilogue injects SiLU ->
-      phase_down_gemm(tile);     // epilogue injects residual
-    }
-  }
+Ferrite forward (5 launches per layer):
+  fused_norm_qkv()              // norm→GEMM prologue (1 launch, was 2)
+  split_qkv_rope() + FA2()     // stays separate (FA2 already optimal)
+  fused_o_proj_residual()       // GEMM + residual epilogue (1 launch, was 2)
+  fused_norm_gate_up_silu()     // norm→GEMM + SiLU epilogue (1 launch, was 3)
+  fused_down_residual()         // GEMM + residual epilogue (1 launch, was 2)
 ```
 
-We have the source to every kernel (CUTLASS, FlashAttention, vllm-cuda csrc/).
-We can compile all of them to PTX. Ferrite can identify escape perimeters and
-modify them. The remaining work is the persistent kernel framework.
+Each `fuse_*!` macro generates: fused PTX (compile-time) + `launch()` function
+(runtime). The forward reads like normal Rust with different function names.
+
+### Roadmap
+
+```
+Phase 0: CUTLASS parity with cuBLAS     ← BLOCKING, focus here
+Phase 1: Fused operation library          ← mostly done, extend
+Phase 2: Runtime integration (llama.rs)   ← wire into OwnedTensor/CachingAllocator
+Phase 3: FlashAttention perimeter         ← exploratory
+Phase 4: Persistent layer kernel          ← endgame
+```
 
 ## Comparison with Megakernels
 

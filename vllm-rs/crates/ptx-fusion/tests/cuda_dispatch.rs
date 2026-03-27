@@ -7,7 +7,7 @@
 
 #![cfg(feature = "cuda")]
 
-use cudarc::driver::{CudaContext, CudaSlice};
+use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, LaunchConfig, PushKernelArg};
 
 // Extract each config from the multi-entry PTX
 ptx_fusion::extract_entry!(
@@ -176,4 +176,146 @@ fn grid_dim_computation() {
     assert_eq!(gx * gy, 32); // 1 * 32 tiles
 
     println!("PASS: grid dimension computation correct");
+}
+
+#[test]
+fn rust_params_gpu_correctness() {
+    use ptx_fusion::dispatch::{GemmParams, IteratorConstants};
+
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
+    // Use the 64x128x32 config (our decode tile)
+    let dispatch = CutlassDispatch::new(
+        &ctx,
+        vec![CutlassConfigSpec::new(
+            "64x128x32",
+            64,
+            128,
+            32,
+            128,
+            36864,
+            CONFIG_64x128x32,
+        )],
+    )
+    .unwrap();
+
+    let config = &dispatch.configs()[0];
+    let m = 64u32;
+    let n = 128u32;
+    let k = 32u32;
+    let lda = k;
+    let ldb = k;
+    let ldc = n;
+    let ldd = n;
+
+    // bf16 test data
+    fn f32_to_bf16(v: f32) -> u16 {
+        (v.to_bits() >> 16) as u16
+    }
+    fn bf16_to_f32(v: u16) -> f32 {
+        f32::from_bits((v as u32) << 16)
+    }
+
+    let h_a: Vec<u16> = (0..(m * k) as usize)
+        .map(|i| f32_to_bf16(((i as f32) * 0.037 - 0.5).sin() * 0.5))
+        .collect();
+    let h_b: Vec<u16> = (0..(n * k) as usize)
+        .map(|i| f32_to_bf16(((i as f32) * 0.023 + 0.3).cos() * 0.5))
+        .collect();
+
+    let d_a = stream.clone_htod(&h_a).unwrap();
+    let d_b = stream.clone_htod(&h_b).unwrap();
+    let d_c: CudaSlice<u16> = stream.alloc_zeros((m * n) as usize).unwrap();
+    let mut d_d: CudaSlice<u16> = stream.alloc_zeros((m * n) as usize).unwrap();
+
+    // Build params from Rust
+    // cudarc 0.19: device_ptr(&stream) returns (CUdeviceptr, SyncOnDrop)
+    let (a_ptr, _) = d_a.device_ptr(&stream);
+    let (b_ptr, _) = d_b.device_ptr(&stream);
+    let (c_ptr, _) = d_c.device_ptr(&stream);
+    let (d_ptr, _) = d_d.device_ptr(&stream);
+    let params = GemmParams::new(
+        a_ptr as u64,
+        b_ptr as u64,
+        c_ptr as u64,
+        d_ptr as u64,
+        m,
+        n,
+        k,
+        lda,
+        ldb,
+        ldc,
+        ldd,
+        config.tile_m,
+        config.tile_n,
+        &IteratorConstants::CONFIG_64X128X32,
+    );
+
+    let (grid_x, grid_y, grid_z) = CutlassDispatch::grid_dim(config, m, n);
+    let launch_cfg = LaunchConfig {
+        grid_dim: (grid_x, grid_y, grid_z),
+        block_dim: (config.threads, 1, 1),
+        shared_mem_bytes: config.smem_bytes,
+    };
+
+    // Launch — pass raw bytes since GemmParams isn't DeviceRepr
+    unsafe {
+        stream
+            .launch_builder(&config.func)
+            .arg(&params.bytes)
+            .launch(launch_cfg)
+    }
+    .unwrap();
+    stream.synchronize().unwrap();
+
+    // Read output
+    let output = stream.clone_dtoh(&d_d).unwrap();
+
+    // Sanity: output should be non-zero
+    let sum: f32 = output.iter().map(|&v| bf16_to_f32(v).abs()).sum();
+    assert!(sum > 0.01, "output is all zeros (sum={sum})");
+
+    // CPU reference: C[m,n] = sum_k A[m,k] * B[n,k] (B is col-major = NxK)
+    let mut expected = vec![0.0f32; (m * n) as usize];
+    for row in 0..m as usize {
+        for col in 0..n as usize {
+            let mut acc = 0.0f32;
+            for ki in 0..k as usize {
+                let a = bf16_to_f32(h_a[row * k as usize + ki]);
+                let b = bf16_to_f32(h_b[col * k as usize + ki]);
+                acc += a * b;
+            }
+            expected[row * n as usize + col] = acc;
+        }
+    }
+
+    // Compare (bf16 precision: ~0.01 relative error)
+    let mut max_diff = 0.0f32;
+    for i in 0..(m * n) as usize {
+        let got = bf16_to_f32(output[i]);
+        let exp = expected[i];
+        let diff = (got - exp).abs();
+        max_diff = max_diff.max(diff);
+    }
+
+    println!(
+        "  Output[0..4]: [{:.4}, {:.4}, {:.4}, {:.4}]",
+        bf16_to_f32(output[0]),
+        bf16_to_f32(output[1]),
+        bf16_to_f32(output[2]),
+        bf16_to_f32(output[3])
+    );
+    println!(
+        "  Expected[0..4]: [{:.4}, {:.4}, {:.4}, {:.4}]",
+        expected[0], expected[1], expected[2], expected[3]
+    );
+    println!("  Max diff: {max_diff:.2e}");
+
+    assert!(
+        max_diff < 0.05,
+        "Rust-built params produce wrong output (max_diff={max_diff:.2e})"
+    );
+
+    println!("PASS: Rust GemmParams builder produces correct output (max_diff={max_diff:.2e})");
 }

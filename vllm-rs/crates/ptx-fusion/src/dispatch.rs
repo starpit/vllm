@@ -154,6 +154,192 @@ impl CutlassDispatch {
     }
 }
 
+// ── GemmParams builder ──
+
+/// Iterator parameter constants for a CUTLASS tile configuration.
+///
+/// Each field is `stride * slope + intercept`, derived empirically from
+/// the CUTLASS C++ API. These constants are tile-config-specific but
+/// stride-independent — compute once per config, apply for any stride.
+#[derive(Clone, Copy)]
+pub struct IteratorConstants {
+    /// params_A: [stride, inc_strided, inc_next, inc_advance]
+    /// Each: value = lda * slope + intercept
+    pub a_slope: [i64; 4],
+    pub a_intercept: [i64; 4],
+    /// params_B: same structure, using ldb
+    pub b_slope: [i64; 4],
+    pub b_intercept: [i64; 4],
+    /// params_C/D: [8 values], each = ldc * slope (no intercept)
+    pub cd_slope: [i64; 8],
+}
+
+/// Pre-computed constants for the three production configs.
+impl IteratorConstants {
+    /// 64x128x32, 3 stages
+    pub const CONFIG_64X128X32: Self = Self {
+        a_slope: [1, 16, -16, 0],
+        a_intercept: [0, 0, 64, 64],
+        b_slope: [1, 16, -48, 0],
+        b_intercept: [0, 0, 64, 64],
+        cd_slope: [2, 4, -2, -2, 16, 64, 128, 32],
+    };
+
+    /// 128x128x32, 3 stages
+    pub const CONFIG_128X128X32: Self = Self {
+        a_slope: [1, 16, -48, 0],
+        a_intercept: [0, 0, 64, 64],
+        b_slope: [1, 16, -48, 0],
+        b_intercept: [0, 0, 64, 64],
+        cd_slope: [2, 4, -2, -2, 16, 128, 256, 32],
+    };
+
+    /// 128x128x64, 3 stages
+    pub const CONFIG_128X128X64: Self = Self {
+        a_slope: [1, 8, -56, 0],
+        a_intercept: [0, 0, 128, 128],
+        b_slope: [1, 8, -56, 0],
+        b_intercept: [0, 0, 128, 128],
+        cd_slope: [2, 4, -2, -2, 16, 128, 256, 32],
+    };
+}
+
+/// CUTLASS Params struct (368 bytes).
+///
+/// Layout (validated via offsetof against CUTLASS C++ API):
+/// ```text
+/// [  0- 11] problem_size: {m, n, k} as 3x i32
+/// [ 12- 23] grid_tiled_shape: {grid_m, grid_n, 1} as 3x i32
+/// [ 24- 27] swizzle_log_tile: i32
+/// [ 28- 31] padding
+/// [ 32- 63] params_A: 4x i64 (stride-linear iterator params)
+/// [ 64- 79] ref_A: {ptr: u64, stride: i64}
+/// [ 80-111] params_B: 4x i64
+/// [112-127] ref_B: {ptr: u64, stride: i64}
+/// [128-191] params_C: 8x i64 (epilogue iterator params)
+/// [192-207] ref_C: {ptr: u64, stride: i64}
+/// [208-271] params_D: 8x i64
+/// [272-287] ref_D: {ptr: u64, stride: i64}
+/// [288-327] output_op: {alpha: f32, beta: f32, ...padding}
+/// [328-335] semaphore: ptr (null)
+/// [336-339] gemm_k_size: i32
+/// [340-343] padding
+/// [344-367] gather/scatter indices: 3x ptr (null)
+/// ```
+#[repr(C, align(8))]
+pub struct GemmParams {
+    pub bytes: [u8; 368],
+}
+
+impl GemmParams {
+    /// Build params from pointers, dimensions, and per-config constants.
+    pub fn new(
+        a_ptr: u64,
+        b_ptr: u64,
+        c_ptr: u64,
+        d_ptr: u64,
+        m: u32,
+        n: u32,
+        k: u32,
+        lda: u32,
+        ldb: u32,
+        ldc: u32,
+        ldd: u32,
+        tile_m: u32,
+        tile_n: u32,
+        consts: &IteratorConstants,
+    ) -> Self {
+        let mut p = GemmParams { bytes: [0u8; 368] };
+
+        // problem_size
+        w32(&mut p.bytes, 0, m as i32);
+        w32(&mut p.bytes, 4, n as i32);
+        w32(&mut p.bytes, 8, k as i32);
+
+        // grid_tiled_shape
+        let grid_m = m.div_ceil(tile_m) as i32;
+        let grid_n = n.div_ceil(tile_n) as i32;
+        w32(&mut p.bytes, 12, grid_m);
+        w32(&mut p.bytes, 16, grid_n);
+        w32(&mut p.bytes, 20, 1); // batch
+
+        // swizzle_log_tile
+        w32(&mut p.bytes, 24, compute_swizzle_log(grid_m, grid_n) as i32);
+
+        // params_A (4x i64)
+        let lda64 = lda as i64;
+        for i in 0..4 {
+            w64(
+                &mut p.bytes,
+                32 + i * 8,
+                lda64 * consts.a_slope[i] + consts.a_intercept[i],
+            );
+        }
+        // ref_A
+        wu64(&mut p.bytes, 64, a_ptr);
+        w64(&mut p.bytes, 72, lda64);
+
+        // params_B (4x i64)
+        let ldb64 = ldb as i64;
+        for i in 0..4 {
+            w64(
+                &mut p.bytes,
+                80 + i * 8,
+                ldb64 * consts.b_slope[i] + consts.b_intercept[i],
+            );
+        }
+        // ref_B
+        wu64(&mut p.bytes, 112, b_ptr);
+        w64(&mut p.bytes, 120, ldb64);
+
+        // params_C (8x i64)
+        let ldc64 = ldc as i64;
+        for i in 0..8 {
+            w64(&mut p.bytes, 128 + i * 8, ldc64 * consts.cd_slope[i]);
+        }
+        // ref_C
+        wu64(&mut p.bytes, 192, c_ptr);
+        w64(&mut p.bytes, 200, ldc64);
+
+        // params_D (8x i64) — same constants as C
+        let ldd64 = ldd as i64;
+        for i in 0..8 {
+            w64(&mut p.bytes, 208 + i * 8, ldd64 * consts.cd_slope[i]);
+        }
+        // ref_D
+        wu64(&mut p.bytes, 272, d_ptr);
+        w64(&mut p.bytes, 280, ldd64);
+
+        // output_op: alpha=1.0, beta=0.0
+        wf32(&mut p.bytes, 288, 1.0);
+        wf32(&mut p.bytes, 292, 0.0);
+
+        // gemm_k_size
+        w32(&mut p.bytes, 336, k as i32);
+
+        p
+    }
+
+    /// Set alpha and beta for the epilogue (default: alpha=1.0, beta=0.0).
+    pub fn set_epilogue(&mut self, alpha: f32, beta: f32) {
+        wf32(&mut self.bytes, 288, alpha);
+        wf32(&mut self.bytes, 292, beta);
+    }
+}
+
+fn w32(buf: &mut [u8], off: usize, v: i32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn w64(buf: &mut [u8], off: usize, v: i64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+fn wu64(buf: &mut [u8], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+fn wf32(buf: &mut [u8], off: usize, v: f32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+
 /// Find the CUTLASS entry name in PTX.
 fn find_entry_name(ptx: &str) -> Result<String, String> {
     for line in ptx.lines() {

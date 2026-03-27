@@ -371,9 +371,15 @@ impl KernelBuilder {
             compile_jobs.push((kernel_file.clone(), obj_file, gpu_arch));
         }
 
-        if compile_jobs.is_empty() && out_file.exists() {
-            println!("cargo:warning=All kernels up-to-date, skipping compilation");
-            return Ok(());
+        if compile_jobs.is_empty() {
+            // All .o files are up-to-date. Still need to re-link the .a
+            // because the shared cache directory may have been overwritten
+            // by a build from a different worktree/branch.
+            if self.lib_matches_objects(&out_file, &all_obj_files) {
+                println!("cargo:warning=All kernels up-to-date, skipping compilation");
+                return Ok(());
+            }
+            println!("cargo:warning=All kernels up-to-date, re-linking static library");
         }
 
         println!(
@@ -507,6 +513,10 @@ impl KernelBuilder {
                 String::from_utf8_lossy(&output.stderr)
             )));
         }
+
+        // Record which .o files are in this .a so we can detect when a
+        // different worktree/branch has overwritten it.
+        self.write_lib_manifest(&out_file, &all_obj_files);
 
         Ok(())
     }
@@ -664,6 +674,41 @@ impl KernelBuilder {
             .unwrap_or("kernel");
 
         self.out_dir.join(format!("{}-{:x}.o", stem, hash))
+    }
+
+    /// Check if a static library was linked from exactly the given object files.
+    ///
+    /// Uses a `.manifest` file alongside the `.a` that records which `.o` files
+    /// were linked. Returns false if the `.a` doesn't exist, the manifest is
+    /// missing, or the object list doesn't match.
+    fn lib_matches_objects(&self, lib_path: &Path, obj_files: &[PathBuf]) -> bool {
+        if !lib_path.exists() {
+            return false;
+        }
+        let manifest_path = lib_path.with_extension("manifest");
+        let manifest = match std::fs::read_to_string(&manifest_path) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let mut expected: Vec<String> = obj_files
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        expected.sort();
+        let mut actual: Vec<String> = manifest.lines().map(|l| l.to_string()).collect();
+        actual.sort();
+        expected == actual
+    }
+
+    /// Write a manifest recording which `.o` files were linked into a `.a`.
+    fn write_lib_manifest(&self, lib_path: &Path, obj_files: &[PathBuf]) {
+        let manifest_path = lib_path.with_extension("manifest");
+        let mut lines: Vec<String> = obj_files
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        lines.sort();
+        let _ = std::fs::write(&manifest_path, lines.join("\n"));
     }
 }
 

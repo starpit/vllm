@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **140 tests** (68 CUDA GPU + 72 unit + doc-ignored), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **150+ tests** (78 CUDA GPU + 72 unit + doc-ignored), all passing.
 
 ### What's Proven
 
@@ -93,6 +93,8 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **140 tests** (68 CUDA GPU + 72 unit + doc-
 | **Def-use graph + param classification** | cuda_cutlass_bf16 | **31 fields classified: 8 Ptr, 4 Stride, 6 Dim, 2 Scalar, 11 Derived** |
 | **Perimeter replacement (ptxas)** | cuda_cutlass_bf16 | **flat-param GEMM: 33 ld.param rewritten, ptxas valid** |
 | Derivation probing (build.rs) | build.rs | 4 CUTLASS configs probed: 64x64, 64x128, 128x128, 128x128x64 |
+| **Flat-param GEMM vs cuBLAS (GPU)** | cuda_flat_gemm | **10/10: all llama dims, partial tiles, batch sweep, 0.00e0** |
+| **End-to-end model inference** | vllm serve | **Qwen2.5-3B-Instruct: correct output ("Four", "Paris")** |
 
 ### Benchmarks
 
@@ -225,7 +227,7 @@ Def-use graph built in single O(N) pass. Param classification combines:
 - Default (Derived for unclassified)
 Tested on CUTLASS bf16 GEMM: 8 Ptr, 4 Stride, 6 Dim, 2 Scalar, 11 Derived.
 
-**Phase 2: Perimeter replacement** (perimeter.rs) — **IN PROGRESS**
+**Phase 2: Perimeter replacement** (perimeter.rs) — **DONE**
 
 build.rs compiles 4 CUTLASS configs to PTX and probes each with a generated
 C++ program that varies raw params one at a time to extract per-field linear
@@ -237,10 +239,13 @@ alongside each `.ptx` in `kernels/`.
 - Raw fields: `ld.param` remapped to flat offsets
 - Derived fields: replaced with inline `shl`/`mul`/`add` from raw params
 - Dimension fields: ceil-division computed inline (e.g., `grid_tiled_shape.m = ceil(M/64)`)
-- Constants: `mov` with probed value
+- Swizzle log: computed inline from N (not baked as constant)
 - Kernel interior untouched
 
-**Passes ptxas.** Next: GPU correctness test at M=1024 N=2560 K=2048 vs cuBLAS.
+GPU-verified at all production dimensions vs cuBLAS (10/10 tests, 0.00e0).
+Integrated into llama.rs — all 4 GEMMs per layer use flat-param CUTLASS.
+Layers with bias use ferrite GEMM + separate `bias_add_inplace` kernel.
+End-to-end correct on Qwen2.5-3B-Instruct.
 
 **Phase 3: General fusion engine** (new fuse_general.rs)
 
@@ -322,8 +327,9 @@ crates/ptx-fusion/                 Library + tests
   src/dispatch.rs                  Multi-tile CUTLASS runtime dispatcher
   src/main.rs                      Demo: extract + rewrite + fuse + validate
   build.rs                         Compiles vllm-cuda kernels + CUTLASS configs + probes derivations
-  kernels/                         PTX files + .derivations.json (probed param formulas)
-  tests/                           68 CUDA GPU tests + 4 dispatch tests
+  kernels/                         PTX files + .derivations.json (probed param formulas, git-tracked)
+  tests/cuda_flat_gemm.rs          Comprehensive flat-param GEMM vs cuBLAS (10 tests, all production dims)
+  tests/                           78 CUDA GPU tests + 4 dispatch tests
 ```
 
 ## Proc Macros
@@ -445,12 +451,24 @@ At L4's ~300 GB/s: ~7 us/layer bandwidth savings.
 ### Roadmap
 
 ```
-Phase 0: CUTLASS parity with cuBLAS     ← DONE (benchmarked, dispatch, Rust params builder)
-Phase 1: Fused operation library          ← DONE (norm+GEMM, norm+GEMM+SiLU, GEMM+residual)
-Phase 2: Runtime integration (llama.rs)   ← NEXT: wire into OwnedTensor/CachingAllocator
-Phase 3: FlashAttention perimeter         ← exploratory
-Phase 4: Persistent layer kernel          ← endgame
+Phase 0: CUTLASS parity with cuBLAS     ← DONE (benchmarked, dispatch)
+Phase 1: Def-use graph + param classify  ← DONE (parser.rs)
+Phase 2: Perimeter replacement           ← DONE (perimeter.rs, build.rs probe, llama.rs integration)
+Phase 3: General fusion engine           ← NEXT (fuse_general.rs)
+Phase 4: ferrite::fuse! proc macro       ← endgame
 ```
+
+### Current performance (no fusion yet)
+
+Ferrite replaces cuBLAS GEMMs with flat-param CUTLASS GEMMs in the llama.rs
+forward pass. **No speedup expected** — standalone CUTLASS is slower than
+cuBLAS at decode (M=1) because cuBLAS auto-selects specialized skinny-M
+kernels. Layers with bias incur an extra `bias_add_inplace` kernel launch.
+
+The win comes from Phase 3 fusion:
+- norm+GEMM fused → eliminates 2 norm launches + 2 GMEM round-trips
+- GEMM+SiLU fused → eliminates 1 silu launch + 1 GMEM round-trip
+- GEMM+bias fused → eliminates the separate bias-add launch
 
 ## Comparison with Megakernels
 

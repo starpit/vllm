@@ -79,6 +79,25 @@ impl Linear {
         }
     }
 
+    /// Forward using Ferrite CUTLASS GEMM + separate bias-add if needed.
+    #[cfg(feature = "ferrite")]
+    pub unsafe fn forward_ferrite(
+        &self,
+        x: TensorView<'_>,
+        ferrite: &crate::ferrite::FerriteCutlass,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> OwnedTensor {
+        debug_assert_eq!(x.ndim(), 2);
+        debug_assert_eq!(x.dim(1), self.weight.dim(1), "Linear: input dim mismatch");
+
+        let out = ferrite.gemm(*x, self.weight, None, 1.0, 0.0, alloc, stream);
+        if let Some(bias) = self.bias {
+            crate::kernels::bias_add_inplace(out.as_gpu_tensor(), bias, stream);
+        }
+        out
+    }
+
     pub fn out_features(&self) -> usize {
         self.weight.dim(0)
     }
@@ -483,6 +502,25 @@ impl LinearLayer {
             Self::Bnb4bit(l) => l.forward(x, cublas, alloc, stream),
             Self::Fp8(l) => l.forward(x, cublas, alloc, stream),
             Self::Fp8Block(l) => l.forward(x, cublas, alloc, stream),
+        }
+    }
+
+    /// Forward using Ferrite CUTLASS GEMM for Dense layers without bias.
+    /// Falls back to cuBLAS for biased Dense layers and all quantized layers.
+    /// Forward using Ferrite CUTLASS GEMM for Dense layers.
+    /// Quantized layers fall back to their native implementation.
+    #[cfg(feature = "ferrite")]
+    pub unsafe fn forward_ferrite(
+        &self,
+        x: TensorView<'_>,
+        cublas: &mut CublasHandle,
+        ferrite: &crate::ferrite::FerriteCutlass,
+        alloc: &mut CachingAllocator,
+        stream: cudarc::driver::sys::CUstream,
+    ) -> OwnedTensor {
+        match self {
+            Self::Dense(l) => l.forward_ferrite(x, ferrite, alloc, stream),
+            _ => self.forward(x, cublas, alloc, stream),
         }
     }
 

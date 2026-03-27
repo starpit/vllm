@@ -1050,7 +1050,7 @@ mod tests {
             draft_ids: Vec<u32>,
         }
 
-        let batch = vec![
+        let batch = [
             // Normal request (no drafts)
             ReqInput {
                 target_ids: vec![42],
@@ -1959,6 +1959,7 @@ mod tests {
     ///   1. update_blocks(req_id, new_block_ids)  ← from cached-reqs loop
     ///   2. remove_request(req_id)               ← preemption fixup
     ///   3. add_request(req_id, tokens, new_block_ids, num_computed) ← resumption
+    ///
     /// leaves the correct final state.
     #[test]
     fn test_update_blocks_then_readd_final_state() {

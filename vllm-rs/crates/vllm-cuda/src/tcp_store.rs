@@ -696,7 +696,7 @@ mod tests {
                             let (mut stream, _) = listener.accept().unwrap();
                             stream.write_all(id_as_u8).unwrap();
                         }
-                        unsafe { std::mem::transmute(test_bytes) }
+                        unsafe { std::mem::transmute::<[i8; 128], [u8; 128]>(test_bytes) }
                     } else {
                         // Worker: connect and receive.
                         let addr = format!("127.0.0.1:{port}");

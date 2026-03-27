@@ -8058,110 +8058,104 @@ mod tests {
 
         let budget = compute_available_kv_bytes(total, weights, peak, 0.9);
         assert_eq!(budget, 0, "should saturate at 0, not underflow");
+    }
 
-        // =========================================================================
-        // Piecewise CUDA Graph Tests
-        // =========================================================================
+    // =========================================================================
+    // Piecewise CUDA Graph Tests
+    // =========================================================================
 
-        #[test]
-        fn test_compute_optimal_splits_boundary_values() {
-            // Create a minimal CudaWorker for testing (we only need the method)
-            // Since compute_optimal_splits is a method on CudaWorker, we need to test
-            // it through the actual implementation. For now, test the logic directly.
+    #[test]
+    fn test_compute_optimal_splits_boundary_values() {
+        // Test boundary: 0-256 should return 1 (key optimization)
+        assert_eq!(compute_splits_logic(0), 1);
+        assert_eq!(compute_splits_logic(1), 1);
+        assert_eq!(compute_splits_logic(128), 1);
+        assert_eq!(compute_splits_logic(256), 1);
 
-            // Test boundary: 0-256 should return 1 (key optimization)
-            assert_eq!(compute_splits_logic(0), 1);
-            assert_eq!(compute_splits_logic(1), 1);
-            assert_eq!(compute_splits_logic(128), 1);
-            assert_eq!(compute_splits_logic(256), 1);
+        // Test boundary: 257-512 should return 2
+        assert_eq!(compute_splits_logic(257), 2);
+        assert_eq!(compute_splits_logic(384), 2);
+        assert_eq!(compute_splits_logic(512), 2);
 
-            // Test boundary: 257-512 should return 2
-            assert_eq!(compute_splits_logic(257), 2);
-            assert_eq!(compute_splits_logic(384), 2);
-            assert_eq!(compute_splits_logic(512), 2);
+        // Test boundary: 513-1024 should return 4
+        assert_eq!(compute_splits_logic(513), 4);
+        assert_eq!(compute_splits_logic(768), 4);
+        assert_eq!(compute_splits_logic(1024), 4);
 
-            // Test boundary: 513-1024 should return 4
-            assert_eq!(compute_splits_logic(513), 4);
-            assert_eq!(compute_splits_logic(768), 4);
-            assert_eq!(compute_splits_logic(1024), 4);
+        // Test boundary: 1025-2048 should return 8
+        assert_eq!(compute_splits_logic(1025), 8);
+        assert_eq!(compute_splits_logic(1536), 8);
+        assert_eq!(compute_splits_logic(2048), 8);
 
-            // Test boundary: 1025-2048 should return 8
-            assert_eq!(compute_splits_logic(1025), 8);
-            assert_eq!(compute_splits_logic(1536), 8);
-            assert_eq!(compute_splits_logic(2048), 8);
+        // Test boundary: >2048 should return 16
+        assert_eq!(compute_splits_logic(2049), 16);
+        assert_eq!(compute_splits_logic(4096), 16);
+        assert_eq!(compute_splits_logic(8192), 16);
+    }
 
-            // Test boundary: >2048 should return 16
-            assert_eq!(compute_splits_logic(2049), 16);
-            assert_eq!(compute_splits_logic(4096), 16);
-            assert_eq!(compute_splits_logic(8192), 16);
-        }
-
-        #[test]
-        fn test_compute_optimal_splits_key_optimization() {
-            // The key optimization: sequences ≤256 tokens use num_splits=1
-            // This eliminates 72 kernel launches (36 transpose + 36 untranspose)
-            for seqlen in [1, 64, 128, 192, 256] {
-                assert_eq!(
-                    compute_splits_logic(seqlen),
-                    1,
-                    "Sequences ≤256 should use num_splits=1 to eliminate transpose overhead"
-                );
-            }
-
-            // Verify that 257 triggers split-K
+    #[test]
+    fn test_compute_optimal_splits_key_optimization() {
+        // The key optimization: sequences ≤256 tokens use num_splits=1
+        // This eliminates 72 kernel launches (36 transpose + 36 untranspose)
+        for seqlen in [1, 64, 128, 192, 256] {
             assert_eq!(
-                compute_splits_logic(257),
-                2,
-                "Sequences >256 should use split-K"
+                compute_splits_logic(seqlen),
+                1,
+                "Sequences ≤256 should use num_splits=1 to eliminate transpose overhead"
             );
         }
 
-        #[test]
-        fn test_compute_optimal_splits_progressive_scaling() {
-            // Test that splits increase progressively with sequence length
-            let splits_256 = compute_splits_logic(256);
-            let splits_512 = compute_splits_logic(512);
-            let splits_1024 = compute_splits_logic(1024);
-            let splits_2048 = compute_splits_logic(2048);
-            let splits_4096 = compute_splits_logic(4096);
+        // Verify that 257 triggers split-K
+        assert_eq!(
+            compute_splits_logic(257),
+            2,
+            "Sequences >256 should use split-K"
+        );
+    }
 
-            assert!(splits_256 <= splits_512);
-            assert!(splits_512 <= splits_1024);
-            assert!(splits_1024 <= splits_2048);
-            assert!(splits_2048 <= splits_4096);
+    #[test]
+    fn test_compute_optimal_splits_progressive_scaling() {
+        // Test that splits increase progressively with sequence length
+        let splits_256 = compute_splits_logic(256);
+        let splits_512 = compute_splits_logic(512);
+        let splits_1024 = compute_splits_logic(1024);
+        let splits_2048 = compute_splits_logic(2048);
+        let splits_4096 = compute_splits_logic(4096);
 
-            // Verify specific values
-            assert_eq!(splits_256, 1);
-            assert_eq!(splits_512, 2);
-            assert_eq!(splits_1024, 4);
-            assert_eq!(splits_2048, 8);
-            assert_eq!(splits_4096, 16);
+        assert!(splits_256 <= splits_512);
+        assert!(splits_512 <= splits_1024);
+        assert!(splits_1024 <= splits_2048);
+        assert!(splits_2048 <= splits_4096);
+
+        // Verify specific values
+        assert_eq!(splits_256, 1);
+        assert_eq!(splits_512, 2);
+        assert_eq!(splits_1024, 4);
+        assert_eq!(splits_2048, 8);
+        assert_eq!(splits_4096, 16);
+    }
+
+    #[test]
+    fn test_compute_optimal_splits_power_of_two() {
+        // All split values should be powers of 2 (1, 2, 4, 8, 16)
+        for seqlen in [1, 100, 300, 600, 1200, 2400, 5000] {
+            let splits = compute_splits_logic(seqlen);
+            assert!(
+                splits == 1 || splits == 2 || splits == 4 || splits == 8 || splits == 16,
+                "Split value {} is not a power of 2 for seqlen {}",
+                splits,
+                seqlen
+            );
         }
+    }
 
-        #[test]
-        fn test_compute_optimal_splits_power_of_two() {
-            // All split values should be powers of 2 (1, 2, 4, 8, 16)
-            for seqlen in [1, 100, 300, 600, 1200, 2400, 5000] {
-                let splits = compute_splits_logic(seqlen);
-                assert!(
-                    splits == 1 || splits == 2 || splits == 4 || splits == 8 || splits == 16,
-                    "Split value {} is not a power of 2 for seqlen {}",
-                    splits,
-                    seqlen
-                );
-            }
-        }
-
-        // Helper function that mirrors the compute_optimal_splits logic
-        // This allows testing without needing a full CudaWorker instance
-        fn compute_splits_logic(max_seqlen_k: usize) -> usize {
-            match max_seqlen_k {
-                0..=256 => 1,
-                257..=512 => 2,
-                513..=1024 => 4,
-                1025..=2048 => 8,
-                _ => 16,
-            }
+    fn compute_splits_logic(max_seqlen_k: usize) -> usize {
+        match max_seqlen_k {
+            0..=256 => 1,
+            257..=512 => 2,
+            513..=1024 => 4,
+            1025..=2048 => 8,
+            _ => 16,
         }
     }
 }

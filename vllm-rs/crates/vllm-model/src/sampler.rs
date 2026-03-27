@@ -606,8 +606,8 @@ mod tests {
     fn test_prompt_logprobs_sequence() {
         // Simulate a 4-token prompt: [A, B, C, D]
         // logits[0] predicts B, logits[1] predicts C, logits[2] predicts D.
-        let prompt_tokens = vec![10u32, 20, 30, 40];
-        let logits_per_position = vec![
+        let prompt_tokens = [10u32, 20, 30, 40];
+        let logits_per_position = [
             vec![0.0f32; 50], // position 0 → predicts token 20
             vec![0.0f32; 50], // position 1 → predicts token 30
             vec![0.0f32; 50], // position 2 → predicts token 40
@@ -643,7 +643,7 @@ mod tests {
         // Position 0: None (no prior context)
         // Position 1+: Some(LogprobsOutput)
         let logits = vec![1.0f32, 5.0, 3.0];
-        let prompt_tokens = vec![0u32, 1, 2]; // 3-token prompt
+        let prompt_tokens = [0u32, 1, 2]; // 3-token prompt
 
         let mut result: Vec<Option<LogprobsOutput>> = Vec::new();
         result.push(None); // position 0

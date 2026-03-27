@@ -1248,7 +1248,7 @@ mod tests {
                 let mut scales_u16: Vec<u16> = Vec::with_capacity(num_groups * size_n);
                 for g in 0..num_groups {
                     let val = if g == 0 { two } else { three };
-                    scales_u16.extend(std::iter::repeat(val).take(size_n));
+                    scales_u16.extend(std::iter::repeat_n(val, size_n));
                 }
                 super::super::marlin_permute_scales(&mut scales_u16, size_k, size_n, group_size);
 

@@ -523,7 +523,7 @@ mod tests {
         let r3 = make_request("b", 0, 2.0);
         let r4 = make_request("d", -1, 10.0); // highest priority
 
-        let mut reqs = vec![r1, r2, r3, r4];
+        let mut reqs = [r1, r2, r3, r4];
         reqs.sort();
 
         let ids: Vec<&str> = reqs.iter().map(|r| r.request_id.as_str()).collect();

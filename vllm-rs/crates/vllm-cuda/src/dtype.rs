@@ -129,7 +129,7 @@ mod tests {
     fn test_copy_clone() {
         let a = DType::BF16;
         let b = a; // Copy
-        let c = a.clone(); // Clone
+        let c = a; // Clone
         assert_eq!(a, b);
         assert_eq!(a, c);
     }

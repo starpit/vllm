@@ -436,9 +436,9 @@ mod tests {
             // All should be non-null and non-overlapping.
             for (i, t) in tensors.iter().enumerate() {
                 assert!(!t.is_null(), "tensor {} is null", i);
-                for j in (i + 1)..tensors.len() {
+                for (j, tj) in tensors.iter().enumerate().skip(i + 1) {
                     let pi = t.raw_ptr() as usize;
-                    let pj = tensors[j].raw_ptr() as usize;
+                    let pj = tj.raw_ptr() as usize;
                     assert_ne!(pi, pj, "tensors {} and {} overlap", i, j);
                 }
             }

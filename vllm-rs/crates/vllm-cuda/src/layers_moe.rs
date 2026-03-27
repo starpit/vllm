@@ -1336,10 +1336,10 @@ mod tests {
         };
 
         // Scale shapes: [E, ceil(N/bn), ceil(K/bk)]
-        let w1_sr = (2 * inter + block_n - 1) / block_n; // ceil(1536/128) = 12
-        let w1_sc = (hidden + block_k - 1) / block_k; // ceil(2048/128) = 16
-        let w2_sr = (hidden + block_n - 1) / block_n; // ceil(2048/128) = 16
-        let w2_sc = (inter + block_k - 1) / block_k; // ceil(768/128) = 6
+        let w1_sr = (2 * inter).div_ceil(block_n); // ceil(1536/128) = 12
+        let w1_sc = hidden.div_ceil(block_k); // ceil(2048/128) = 16
+        let w2_sr = hidden.div_ceil(block_n); // ceil(2048/128) = 16
+        let w2_sc = inter.div_ceil(block_k); // ceil(768/128) = 6
 
         let w1_scale =
             unsafe { GpuTensor::new(0x4000 as *mut u8, &[num_experts, w1_sr, w1_sc], DType::F32) };

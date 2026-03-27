@@ -2422,23 +2422,22 @@ mod tests {
         for token in tokens {
             let prev = accumulated.clone();
             accumulated.push_str(token);
-            match state.process_delta(&prev, &accumulated, token) {
-                ToolParserDelta::ToolCalls(calls) => {
-                    for call in &calls {
-                        if call.function_name.is_some() {
-                            got_name = true;
-                            assert_eq!(call.function_name.as_ref().unwrap(), "get_weather");
-                            assert_eq!(call.index, 0);
-                            assert!(call.id.is_some());
-                        }
-                        if call.function_arguments.is_some()
-                            && !call.function_arguments.as_ref().unwrap().is_empty()
-                        {
-                            got_args = true;
-                        }
+            if let ToolParserDelta::ToolCalls(calls) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for call in &calls {
+                    if let Some(name) = &call.function_name {
+                        got_name = true;
+                        assert_eq!(name, "get_weather");
+                        assert_eq!(call.index, 0);
+                        assert!(call.id.is_some());
+                    }
+                    if let Some(args) = &call.function_arguments
+                        && !args.is_empty()
+                    {
+                        got_args = true;
                     }
                 }
-                _ => {}
             }
         }
 
@@ -2458,12 +2457,9 @@ mod tests {
         // First, some content.
         let prev = accumulated.clone();
         accumulated.push_str("Sure, ");
-        match state.process_delta(&prev, &accumulated, "Sure, ") {
-            ToolParserDelta::Content(text) => {
-                assert_eq!(text, "Sure, ");
-                got_content = true;
-            }
-            _ => {}
+        if let ToolParserDelta::Content(text) = state.process_delta(&prev, &accumulated, "Sure, ") {
+            assert_eq!(text, "Sure, ");
+            got_content = true;
         }
 
         // Then tool call.
@@ -2475,16 +2471,15 @@ mod tests {
         for token in tokens {
             let prev = accumulated.clone();
             accumulated.push_str(token);
-            match state.process_delta(&prev, &accumulated, token) {
-                ToolParserDelta::ToolCalls(calls) => {
-                    got_tool = true;
-                    for call in &calls {
-                        if let Some(name) = &call.function_name {
-                            assert_eq!(name, "f");
-                        }
+            if let ToolParserDelta::ToolCalls(calls) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                got_tool = true;
+                for call in &calls {
+                    if let Some(name) = &call.function_name {
+                        assert_eq!(name, "f");
                     }
                 }
-                _ => {}
             }
         }
 
@@ -2619,23 +2614,22 @@ mod tests {
         for token in tokens {
             let prev = accumulated.clone();
             accumulated.push_str(token);
-            match state.process_delta(&prev, &accumulated, token) {
-                ToolParserDelta::ToolCalls(calls) => {
-                    for call in &calls {
-                        if call.function_name.is_some() {
-                            got_name = true;
-                            assert_eq!(call.function_name.as_ref().unwrap(), "get_weather");
-                            assert_eq!(call.index, 0);
-                            assert!(call.id.is_some());
-                        }
-                        if call.function_arguments.is_some()
-                            && !call.function_arguments.as_ref().unwrap().is_empty()
-                        {
-                            got_args = true;
-                        }
+            if let ToolParserDelta::ToolCalls(calls) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for call in &calls {
+                    if let Some(name) = &call.function_name {
+                        got_name = true;
+                        assert_eq!(name, "get_weather");
+                        assert_eq!(call.index, 0);
+                        assert!(call.id.is_some());
+                    }
+                    if let Some(args) = &call.function_arguments
+                        && !args.is_empty()
+                    {
+                        got_args = true;
                     }
                 }
-                _ => {}
             }
         }
 
@@ -2655,12 +2649,11 @@ mod tests {
         // Content before tools.
         let prev = accumulated.clone();
         accumulated.push_str("Let me check. ");
-        match state.process_delta(&prev, &accumulated, "Let me check. ") {
-            ToolParserDelta::Content(text) => {
-                assert_eq!(text, "Let me check. ");
-                got_content = true;
-            }
-            _ => {}
+        if let ToolParserDelta::Content(text) =
+            state.process_delta(&prev, &accumulated, "Let me check. ")
+        {
+            assert_eq!(text, "Let me check. ");
+            got_content = true;
         }
 
         // Tool section.
@@ -2676,16 +2669,15 @@ mod tests {
         for token in tokens {
             let prev = accumulated.clone();
             accumulated.push_str(token);
-            match state.process_delta(&prev, &accumulated, token) {
-                ToolParserDelta::ToolCalls(calls) => {
-                    got_tool = true;
-                    for call in &calls {
-                        if let Some(name) = &call.function_name {
-                            assert_eq!(name, "f");
-                        }
+            if let ToolParserDelta::ToolCalls(calls) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                got_tool = true;
+                for call in &calls {
+                    if let Some(name) = &call.function_name {
+                        assert_eq!(name, "f");
                     }
                 }
-                _ => {}
             }
         }
 
@@ -2844,21 +2836,20 @@ mod tests {
         for token in tokens {
             let prev = accumulated.clone();
             accumulated.push_str(token);
-            match state.process_delta(&prev, &accumulated, token) {
-                ToolParserDelta::ToolCalls(calls) => {
-                    for call in &calls {
-                        if let Some(name) = &call.function_name {
-                            got_name = true;
-                            assert_eq!(name, "get_weather");
-                            assert_eq!(call.index, 0);
-                            assert!(call.id.is_some());
-                        }
-                        if let Some(a) = &call.function_arguments {
-                            args.push_str(a);
-                        }
+            if let ToolParserDelta::ToolCalls(calls) =
+                state.process_delta(&prev, &accumulated, token)
+            {
+                for call in &calls {
+                    if let Some(name) = &call.function_name {
+                        got_name = true;
+                        assert_eq!(name, "get_weather");
+                        assert_eq!(call.index, 0);
+                        assert!(call.id.is_some());
+                    }
+                    if let Some(a) = &call.function_arguments {
+                        args.push_str(a);
                     }
                 }
-                _ => {}
             }
         }
 
@@ -3292,10 +3283,10 @@ mod tests {
                         assert_eq!(name, "get_weather");
                         got_name = true;
                     }
-                    if let Some(args) = &call.function_arguments {
-                        if !args.is_empty() {
-                            got_args = true;
-                        }
+                    if let Some(args) = &call.function_arguments
+                        && !args.is_empty()
+                    {
+                        got_args = true;
                     }
                 }
             }

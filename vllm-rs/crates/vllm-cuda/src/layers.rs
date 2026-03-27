@@ -1156,7 +1156,7 @@ mod tests {
 
                 // absmax: 1 block covering 64 elements, scale = 2.0
                 let absmax_val = 2.0f32;
-                let absmax_f32 = vec![absmax_val];
+                let absmax_f32 = [absmax_val];
 
                 // Compute expected dequantized weight on CPU.
                 let mut expected_weight = vec![0.0f32; num_elements];
@@ -1444,12 +1444,11 @@ mod tests {
                 );
 
                 // Check Q region.
-                for i in 0..q_out {
-                    let diff = (actual[i] - q_out_val).abs();
+                for (i, &val) in actual[..q_out].iter().enumerate() {
+                    let diff = (val - q_out_val).abs();
                     assert!(
                         diff < 1.0,
-                        "Q[{i}]: expected {q_out_val}, got {}, diff {diff}",
-                        actual[i]
+                        "Q[{i}]: expected {q_out_val}, got {val}, diff {diff}",
                     );
                 }
                 // Check K region.

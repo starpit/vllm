@@ -581,7 +581,7 @@ mod tests {
         let blocks_g0 = pool.get_new_blocks(1);
 
         let hash: BlockHash = vec![0xAA; 32];
-        pool.cache_full_blocks(&[hash.clone()], &blocks_g0, 0, 1, 16, 0);
+        pool.cache_full_blocks(std::slice::from_ref(&hash), &blocks_g0, 0, 1, 16, 0);
 
         // group 0 hit, group 1 miss => None.
         let found = pool.get_cached_block(&hash, &[0, 1]);

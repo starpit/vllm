@@ -62,7 +62,7 @@ is fundamentally tighter -- zero memory traffic, zero latency for the intermedia
 
 ## Status
 
-Tested on L4 GPU (sm_89), CUDA 12.9. **160+ tests** (88 CUDA GPU + 76 unit + doc-ignored), all passing.
+Tested on L4 GPU (sm_89), CUDA 12.9. **170+ tests** (93 CUDA GPU + 80 unit + doc-ignored), all passing.
 
 ### What's Proven
 
@@ -96,7 +96,8 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **160+ tests** (88 CUDA GPU + 76 unit + doc
 | **Flat-param GEMM vs cuBLAS (GPU)** | cuda_flat_gemm | **10/10: all llama dims, partial tiles, batch sweep, 0.00e0** |
 | **End-to-end model inference** | vllm serve | **Qwen2.5-3B-Instruct: correct output ("Four", "Paris")** |
 | **General `fuse!` macro (ptxas)** | cuda_fuse_general | **kernel-agnostic SMEM stitching, ptxas valid** |
-| **General `fuse!` macro (GPU)** | cuda_fuse_general | **rms_norm→silu_mul: 10/10 sizes, 0.00e0 diff, deterministic** |
+| **General `fuse!` macro (GPU, SMEM)** | cuda_fuse_general | **rms_norm→silu_mul: 10/10 sizes, 0.00e0 diff, deterministic** |
+| **General `fuse!` macro (GPU, register)** | cuda_fuse_general | **rms_norm→scale: 5/5, 0.00e0, bitwise = special-purpose regfuse** |
 
 ### Benchmarks
 
@@ -264,17 +265,14 @@ The `fuse!` macro takes any two kernels + bindings and produces a fused kernel.
 Kernel-agnostic: only looks at escape perimeters. SMEM handoff path working,
 register handoff stubbed (requires thread-mapping analysis).
 
-GPU-verified: rms_norm→silu_mul, 10/10 tests, 0.00e0 diff at production dims.
+GPU-verified: 15/15 tests, all 0.00e0 diff.
+- SMEM path: rms_norm→silu_mul at production dims (hidden up to 3456, batch 1-256)
+- Register path: rms_norm→scale, bitwise identical to special-purpose `regfuse_kernels!`
 
-**Phase 4: Register handoff optimization**
+`choose_handoff()` auto-selects: both elementwise with scalar store/load → register,
+otherwise → SMEM. No manual strategy specification needed.
 
-Analyze thread-to-element mappings from the address computation chains in the
-perimeter. When both kernels are elementwise with identical mappings
-(blockIdx.x * blockDim.x + threadIdx.x), use register handoff instead of SMEM
-for zero memory traffic. The `choose_handoff()` function in `fuse_general.rs`
-currently defaults to SMEM (always correct); this phase makes it smart.
-
-**Phase 5: llama.rs integration**
+**Phase 4: llama.rs integration**
 
 Wire `fuse!` into the forward pass to go from 11 launches to 6 per layer.
 
@@ -347,7 +345,7 @@ crates/ptx-fusion/                 Library + tests
   build.rs                         Compiles vllm-cuda kernels + CUTLASS configs + probes derivations
   kernels/                         PTX files + .derivations.json (probed param formulas, git-tracked)
   tests/cuda_flat_gemm.rs          Comprehensive flat-param GEMM vs cuBLAS (10 tests, all production dims)
-  tests/cuda_fuse_general.rs       General fuse! macro GPU tests (10 tests, production dims, 0.00e0)
+  tests/cuda_fuse_general.rs       General fuse! macro GPU tests (15 tests: 10 SMEM + 5 register, 0.00e0)
   tests/                           88 CUDA GPU tests + 4 dispatch tests
 ```
 
@@ -474,8 +472,8 @@ At L4's ~300 GB/s: ~7 us/layer bandwidth savings.
 Phase 0: CUTLASS parity with cuBLAS     ← DONE (benchmarked, dispatch)
 Phase 1: Def-use graph + param classify  ← DONE (parser.rs)
 Phase 2: Perimeter replacement           ← DONE (perimeter.rs, build.rs probe, llama.rs integration)
-Phase 3: General fuse! proc macro        ← DONE (fuse_general.rs, SMEM path, 10/10 GPU tests 0.00e0)
-Phase 4: Register handoff optimization   ← NEXT (thread-mapping analysis for register vs SMEM)
+Phase 3: General fuse! proc macro        ← DONE (fuse_general.rs, SMEM + register, 15/15 GPU tests 0.00e0)
+Phase 4: llama.rs integration            ← NEXT (wire fuse! into forward pass, 11→6 launches)
 Phase 5: llama.rs integration            ← wire fuse! into forward pass (11→6 launches)
 ```
 

@@ -8,7 +8,7 @@
 
 #![cfg(feature = "cuda")]
 
-use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ptx_fusion_macros::extract_entry;
 use std::sync::Arc;
@@ -384,5 +384,288 @@ fn near_zero_input() {
     let diff = max_abs_diff(&separate, &fused);
     println!("  near-zero: max_abs_diff = {diff:.2e}");
     assert!(diff < 1e-5, "near-zero: diff too large: {diff:.2e}");
+    println!("PASS");
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Register handoff tests: hand-written elementwise kernels (rms_norm + scale)
+// The fuse! macro should auto-detect both are elementwise and use register
+// handoff instead of SMEM — zero memory traffic for the intermediate.
+// ══════════════════════════════════════════════════════════════════════
+
+const RMS_NORM_HAND_PTX: &str = include_str!("../kernels/rms_norm.ptx");
+const SCALE_HAND_PTX: &str = include_str!("../kernels/scale.ptx");
+
+// General fuse! on hand-written elementwise kernels → should select register handoff
+ptx_fusion::fuse!(
+    a = "kernels/rms_norm.ptx",
+    b = "kernels/scale.ptx",
+    bind = { a.output => b.input },
+    name = "general_regfused_norm_scale",
+    const = REGFUSED_PTX,
+);
+
+/// Run rms_norm then scale as two separate launches.
+fn run_separate_reg(
+    ctx: &Arc<CudaContext>,
+    input: &[f32],
+    weight: &[f32],
+    n: u32,
+    epsilon: f32,
+    scale_val: f32,
+) -> Vec<f32> {
+    let stream = ctx.default_stream();
+
+    let mod_rms = ctx.load_module(Ptx::from_src(RMS_NORM_HAND_PTX)).unwrap();
+    let mod_scale = ctx.load_module(Ptx::from_src(SCALE_HAND_PTX)).unwrap();
+    let f_rms = mod_rms.load_function("rms_norm").unwrap();
+    let f_scale = mod_scale.load_function("scale").unwrap();
+
+    let inp = stream.clone_htod(input).unwrap();
+    let wgt = stream.clone_htod(weight).unwrap();
+    let mut rms_out: CudaSlice<f32> = stream.alloc_zeros(n as usize).unwrap();
+    let mut scale_out: CudaSlice<f32> = stream.alloc_zeros(n as usize).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (n, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // rms_norm params: input, output, weight, n, epsilon
+    unsafe {
+        stream
+            .launch_builder(&f_rms)
+            .arg(&inp)
+            .arg(&mut rms_out)
+            .arg(&wgt)
+            .arg(&n)
+            .arg(&epsilon)
+            .launch(cfg)
+            .unwrap();
+    }
+
+    // scale params: input, output, n, scale_val
+    unsafe {
+        stream
+            .launch_builder(&f_scale)
+            .arg(&rms_out)
+            .arg(&mut scale_out)
+            .arg(&n)
+            .arg(&scale_val)
+            .launch(cfg)
+            .unwrap();
+    }
+
+    stream.synchronize().unwrap();
+    stream.clone_dtoh(&scale_out).unwrap()
+}
+
+/// Run the general-fused kernel (register handoff).
+fn run_fused_reg(
+    ctx: &Arc<CudaContext>,
+    input: &[f32],
+    weight: &[f32],
+    n: u32,
+    epsilon: f32,
+    scale_val: f32,
+) -> Vec<f32> {
+    let stream = ctx.default_stream();
+
+    let module = ctx.load_module(Ptx::from_src(REGFUSED_PTX)).unwrap();
+    let func = module.load_function("general_regfused_norm_scale").unwrap();
+
+    let inp = stream.clone_htod(input).unwrap();
+    let wgt = stream.clone_htod(weight).unwrap();
+    let mut out: CudaSlice<f32> = stream.alloc_zeros(n as usize).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (n, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // Merged params (bound pair eliminated):
+    // A = rms_norm: [input, output(bound), weight, n, epsilon]
+    // B = scale:    [input(bound), output, n, scale_val]
+    // After removing A.output and B.input:
+    // → [A.input, A.weight, A.n, A.epsilon, B.output, B.scale_val]
+    // Note: B.n is deduped (same name as A.n)
+    unsafe {
+        stream
+            .launch_builder(&func)
+            .arg(&inp) // A.input
+            .arg(&wgt) // A.weight
+            .arg(&n) // A.n (shared with B.n)
+            .arg(&epsilon) // A.epsilon
+            .arg(&mut out) // B.output
+            .arg(&scale_val) // B.scale_val
+            .launch(cfg)
+            .unwrap();
+    }
+
+    stream.synchronize().unwrap();
+    stream.clone_dtoh(&out).unwrap()
+}
+
+#[test]
+fn regfuse_ptxas_valid() {
+    println!("=== Register handoff: ptxas validation ===");
+
+    // Verify it's actually using register handoff (not SMEM)
+    assert!(
+        REGFUSED_PTX.contains("register handoff"),
+        "should use register handoff for elementwise pair"
+    );
+    assert!(
+        !REGFUSED_PTX.contains("st.shared"),
+        "should NOT use SMEM for elementwise pair"
+    );
+
+    let path = "/tmp/general_regfused_norm_scale.ptx";
+    std::fs::write(path, REGFUSED_PTX).unwrap();
+
+    let out = std::process::Command::new("/usr/local/cuda-12.9/bin/ptxas")
+        .args(["-arch=sm_89", path])
+        .output()
+        .expect("ptxas");
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        for line in stderr.lines().take(20) {
+            println!("  ptxas: {line}");
+        }
+        for (i, line) in REGFUSED_PTX.lines().enumerate() {
+            println!("{:4}: {line}", i + 1);
+        }
+        panic!("ptxas FAILED on register-fused PTX");
+    }
+    println!("PASS: register-fused PTX passes ptxas");
+}
+
+#[test]
+fn regfuse_basic() {
+    println!("=== Register handoff: basic correctness ===");
+    let ctx = ctx();
+    let n = 128u32;
+    let epsilon = 1e-5f32;
+    let scale_val = 2.5f32;
+    let input: Vec<f32> = (0..n as usize)
+        .map(|i| ((i as f32) * 0.017 + 0.3).sin())
+        .collect();
+    let weight: Vec<f32> = (0..n as usize).map(|i| 1.0 + (i as f32) * 0.002).collect();
+
+    let separate = run_separate_reg(&ctx, &input, &weight, n, epsilon, scale_val);
+    let fused = run_fused_reg(&ctx, &input, &weight, n, epsilon, scale_val);
+    let diff = max_abs_diff(&separate, &fused);
+    println!("  n={n}, scale={scale_val}: max_abs_diff = {diff:.2e}");
+    assert!(diff < 1e-5, "regfuse diff too large: {diff:.2e}");
+    println!("PASS");
+}
+
+#[test]
+fn regfuse_sizes() {
+    println!("=== Register handoff: size sweep ===");
+    let ctx = ctx();
+    let epsilon = 1e-5f32;
+    let scale_val = 0.7f32;
+
+    for n in [32u32, 64, 128, 256, 512, 1024] {
+        let input: Vec<f32> = (0..n as usize)
+            .map(|i| ((i as f32) * 0.013 + 0.5).sin())
+            .collect();
+        let weight: Vec<f32> = (0..n as usize)
+            .map(|i| ((i as f32) * 0.007 + 0.1).cos())
+            .collect();
+
+        let separate = run_separate_reg(&ctx, &input, &weight, n, epsilon, scale_val);
+        let fused = run_fused_reg(&ctx, &input, &weight, n, epsilon, scale_val);
+        let diff = max_abs_diff(&separate, &fused);
+        println!("  n={n}: max_abs_diff = {diff:.2e}");
+        assert!(diff < 1e-5, "n={n}: regfuse diff too large: {diff:.2e}");
+    }
+    println!("PASS");
+}
+
+#[test]
+fn regfuse_determinism() {
+    println!("=== Register handoff: determinism ===");
+    let ctx = ctx();
+    let n = 256u32;
+    let input: Vec<f32> = (0..n as usize)
+        .map(|i| ((i as f32) * 0.017 + 0.3).sin())
+        .collect();
+    let weight: Vec<f32> = (0..n as usize).map(|i| 1.0 + (i as f32) * 0.002).collect();
+
+    let reference = run_fused_reg(&ctx, &input, &weight, n, 1e-5, 1.5);
+    for run in 0..10 {
+        let result = run_fused_reg(&ctx, &input, &weight, n, 1e-5, 1.5);
+        let diff = max_abs_diff(&reference, &result);
+        assert!(diff == 0.0, "run {run}: not deterministic, diff={diff:.2e}");
+    }
+    println!("  10 runs: all bitwise identical");
+    println!("PASS");
+}
+
+#[test]
+fn regfuse_matches_special_purpose() {
+    println!("=== Register handoff: general fuse! vs special-purpose regfuse_kernels! ===");
+    // Compare our general fuse! output against the proven regfuse_kernels! macro
+    ptx_fusion_macros::regfuse_kernels!(
+        "kernels/rms_norm.ptx",
+        "kernels/scale.ptx",
+        "special_regfused",
+        "output",
+        "input"
+    );
+
+    let ctx = ctx();
+    let n = 256u32;
+    let input: Vec<f32> = (0..n as usize)
+        .map(|i| ((i as f32) * 0.017 + 0.3).sin())
+        .collect();
+    let weight: Vec<f32> = (0..n as usize).map(|i| 1.0 + (i as f32) * 0.002).collect();
+    let epsilon = 1e-5f32;
+    let scale_val = 2.0f32;
+
+    let stream = ctx.default_stream();
+    let inp = stream.clone_htod(&input).unwrap();
+    let wgt = stream.clone_htod(&weight).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (n, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // Run the special-purpose regfused kernel
+    let mod_special = ctx.load_module(Ptx::from_src(SPECIAL_REGFUSED)).unwrap();
+    let f_special = mod_special.load_function("special_regfused").unwrap();
+    let mut out_special: CudaSlice<f32> = stream.alloc_zeros(n as usize).unwrap();
+    // Special-purpose params: input, weight, n, epsilon, output, scale_val
+    unsafe {
+        stream
+            .launch_builder(&f_special)
+            .arg(&inp)
+            .arg(&wgt)
+            .arg(&n)
+            .arg(&epsilon)
+            .arg(&mut out_special)
+            .arg(&scale_val)
+            .launch(cfg)
+            .unwrap();
+    }
+    stream.synchronize().unwrap();
+    let result_special = stream.clone_dtoh(&out_special).unwrap();
+
+    // Run the general fuse! kernel
+    let result_general = run_fused_reg(&ctx, &input, &weight, n, epsilon, scale_val);
+
+    let diff = max_abs_diff(&result_special, &result_general);
+    println!("  general vs special-purpose: max_abs_diff = {diff:.2e}");
+    assert!(
+        diff == 0.0,
+        "general and special-purpose should be bitwise identical, got {diff:.2e}"
+    );
     println!("PASS");
 }

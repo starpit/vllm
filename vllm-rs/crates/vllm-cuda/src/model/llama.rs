@@ -26,6 +26,15 @@ use crate::nccl::NcclGroup;
 #[cfg(feature = "nccl")]
 use std::sync::Arc;
 
+// ── Fused norm+GEMM kernels (compile-time PTX fusion) ──
+#[cfg(feature = "ferrite")]
+const FUSED_NORM_GEMM: ptx_fusion::FeriteKernel = ptx_fusion::compile!(
+    a = intrinsic(rms_norm),
+    b = gemm_64x128x32,
+    bind = { a.output => b.param_0 },
+    name = "ferrite_fused_norm_gemm",
+);
+
 // ---------------------------------------------------------------------------
 // ForwardOutput — PP-aware return type
 // ---------------------------------------------------------------------------
@@ -359,11 +368,11 @@ impl RotaryCache {
 /// Quantized: gate_proj(x), up_proj(x) → SiLU(gate) * up → down_proj  (separate GEMMs)
 pub struct LlamaMLP {
     /// Fused gate+up for dense, or gate-only for quantized.
-    gate_up_proj: LinearLayer,
+    pub(crate) gate_up_proj: LinearLayer,
     /// Separate up projection — only used for quantized (None for dense).
     up_proj: Option<LinearLayer>,
-    down_proj: LinearLayer,
-    intermediate_size: usize,
+    pub(crate) down_proj: LinearLayer,
+    pub(crate) intermediate_size: usize,
     /// NCCL group for TP all-reduce after down_proj (row parallel).
     #[cfg(feature = "nccl")]
     pub tp_group: Option<Arc<NcclGroup>>,
@@ -536,8 +545,6 @@ impl LlamaAttention {
         rotary: &RotaryCache,
         device: &mut GpuDevice,
     ) -> OwnedTensor {
-        let num_tokens = hidden_states.dim(0);
-
         // QKV projection → owned.
         let qkv = if let (Some(k_proj), Some(v_proj)) = (self.k_proj.as_ref(), self.v_proj.as_ref())
         {
@@ -598,6 +605,40 @@ impl LlamaAttention {
                 device.compute_stream,
             )
         };
+
+        self.forward_from_qkv(
+            qkv,
+            positions,
+            slot_mapping,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            kv_cache,
+            rotary,
+            device,
+        )
+    }
+
+    /// Forward pass starting from pre-projected QKV tensor.
+    /// Used by the fused norm+QKV path in the decoder layer.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn forward_from_qkv(
+        &self,
+        qkv: OwnedTensor,
+        positions: TensorView<'_>,
+        slot_mapping: TensorView<'_>,
+        cu_seqlens_q: TensorView<'_>,
+        seqused_k: TensorView<'_>,
+        block_table: TensorView<'_>,
+        max_seqlen_q: usize,
+        max_seqlen_k: usize,
+        kv_cache: &KvCachePool,
+        rotary: &RotaryCache,
+        device: &mut GpuDevice,
+    ) -> OwnedTensor {
+        let num_tokens = qkv.as_gpu_tensor().dim(0);
 
         // Split QKV and apply RoPE (with optional per-head QK-norm for Qwen3/Gemma3).
         let (q, k, v) =
@@ -957,15 +998,122 @@ impl LlamaDecoderLayer {
         rotary: &RotaryCache,
         device: &mut GpuDevice,
     ) -> (OwnedTensor, OwnedTensor) {
-        // Pre-attention norm with fused residual add (in-place).
+        // ── Fused norm+QKV path (ferrite, Dense layers only) ──
+        #[cfg(feature = "ferrite")]
+        if let crate::layers::LinearLayer::Dense(ref qkv_linear) = self.self_attn.qkv_proj {
+            // Pre-attention: residual add + fused norm+QKV GEMM
+            let residual = if let Some(residual) = residual {
+                // residual += hidden_states
+                kernels::add_inplace(*residual, *hidden_states, device.compute_stream);
+                drop(hidden_states);
+                residual
+            } else {
+                // First layer: hidden_states IS the residual
+                hidden_states
+            };
+
+            // Fused norm+QKV: reads residual, normalizes inline, projects
+            let hidden = residual.as_gpu_tensor().dim(1) as u32;
+            let qkv = crate::ferrite::launch_fused_norm_gemm(
+                &FUSED_NORM_GEMM,
+                *residual,         // input (un-normalized)
+                qkv_linear.weight, // B weight
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+                hidden,
+                None,
+                1.0,
+                0.0,
+                &mut device.caching,
+                device.compute_stream,
+            );
+
+            // Attention from pre-projected QKV
+            let attn_output = self.self_attn.forward_from_qkv(
+                qkv,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_seqlen_q,
+                max_seqlen_k,
+                kv_cache,
+                rotary,
+                device,
+            );
+
+            // Granite: scale attention output
+            if self.residual_multiplier != 1.0 {
+                kernels::scale_inplace(*attn_output, self.residual_multiplier, &device.cublas);
+            }
+
+            // Post-attention: residual += attn_output, then fused norm+gate_up
+            kernels::add_inplace(*residual, *attn_output, device.compute_stream);
+            drop(attn_output);
+
+            if let crate::layers::LinearLayer::Dense(ref gate_up_linear) = self.mlp.gate_up_proj {
+                let gate_up = crate::ferrite::launch_fused_norm_gemm(
+                    &FUSED_NORM_GEMM,
+                    *residual,
+                    gate_up_linear.weight,
+                    self.post_attention_layernorm.weight,
+                    self.post_attention_layernorm.eps,
+                    hidden,
+                    None,
+                    1.0,
+                    0.0,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+
+                let activated = kernels::silu_and_mul_fused(
+                    gate_up.as_gpu_tensor(),
+                    self.mlp.intermediate_size,
+                    &mut device.caching,
+                    device.compute_stream,
+                );
+                drop(gate_up);
+
+                // down_proj: accumulate into residual (D = A@B^T + residual)
+                if let crate::layers::LinearLayer::Dense(ref down_linear) = self.mlp.down_proj {
+                    crate::ferrite::launch_gemm_accumulate(
+                        &FUSED_NORM_GEMM, // uses same tile config for grid/launch
+                        *activated,
+                        down_linear.weight,
+                        *residual,
+                        self.residual_multiplier, // alpha (1.0 for non-Granite)
+                        1.0,                      // beta
+                        device.compute_stream,
+                    );
+                    drop(activated);
+                    // residual now contains: old_residual + attn + down_proj(silu_mul(gate_up(norm(residual))))
+                    // Return residual as both outputs (next layer reads residual directly)
+                    // The "hidden_states" slot is a dummy clone of residual for the non-ferrite
+                    // final norm path. TODO: clean up return type.
+                    let dummy = device.caching.alloc_tensor(
+                        &[
+                            residual.as_gpu_tensor().dim(0),
+                            residual.as_gpu_tensor().dim(1),
+                        ],
+                        residual.as_gpu_tensor().dtype(),
+                    );
+                    return (dummy, residual);
+                }
+            }
+
+            // Fallback: if gate_up or down isn't Dense, use standard MLP path
+            let mlp_output = self.mlp.forward(residual.view(), device);
+            if self.residual_multiplier != 1.0 {
+                kernels::scale_inplace(*mlp_output, self.residual_multiplier, &device.cublas);
+            }
+            return (mlp_output, residual);
+        }
+
+        // ── Standard path (non-ferrite or quantized) ──
         let (normed, residual) = if let Some(residual) = residual {
-            // fused_add_rms_norm_inplace mutates both in-place:
-            //   hidden_states buffer → normed values
-            //   residual buffer → residual += old_hidden_states
-            // After this, hidden_states OwnedTensor still owns its buffer (now normed).
-            // residual OwnedTensor still owns its buffer (updated).
-            let hs_gpu = *hidden_states; // GpuTensor copy via deref
-            let res_gpu = *residual; // GpuTensor copy via deref
+            let hs_gpu = *hidden_states;
+            let res_gpu = *residual;
             kernels::fused_add_rms_norm_inplace(
                 hs_gpu,
                 res_gpu,
@@ -973,11 +1121,8 @@ impl LlamaDecoderLayer {
                 self.input_layernorm.eps,
                 device.compute_stream,
             );
-            // hidden_states buffer now contains normed values.
-            // residual buffer is updated. Both OwnedTensors keep ownership.
             (hidden_states, residual)
         } else {
-            // First layer: allocate NEW buffer for normed. hidden_states becomes residual.
             let normed = kernels::rms_norm(
                 *hidden_states,
                 self.input_layernorm.weight,
@@ -985,12 +1130,11 @@ impl LlamaDecoderLayer {
                 &mut device.caching,
                 device.compute_stream,
             );
-            (normed, hidden_states) // hidden_states ownership transfers to residual
+            (normed, hidden_states)
         };
 
-        // Attention reads normed values from hidden_states buffer.
         let attn_output = self.self_attn.forward(
-            normed.view(), // TensorView — kernel reads from this buffer
+            normed.view(),
             positions,
             slot_mapping,
             cu_seqlens_q,
@@ -1002,16 +1146,12 @@ impl LlamaDecoderLayer {
             rotary,
             device,
         );
-        // normed (= hidden_states buffer) consumed by QKV projection — free it.
         drop(normed);
 
-        // Granite: scale attention output.
         if self.residual_multiplier != 1.0 {
             kernels::scale_inplace(*attn_output, self.residual_multiplier, &device.cublas);
         }
 
-        // Post-attention norm: mutates attn_output buffer → post-normed,
-        // updates residual buffer.
         let res_gpu = *residual;
         kernels::fused_add_rms_norm_inplace(
             *attn_output,
@@ -1020,14 +1160,10 @@ impl LlamaDecoderLayer {
             self.post_attention_layernorm.eps,
             device.compute_stream,
         );
-        // attn_output buffer now contains post-normed values.
 
-        // MLP reads post-normed from attn_output buffer.
         let mlp_output = self.mlp.forward(attn_output.view(), device);
-        // attn_output consumed by MLP — free it.
         drop(attn_output);
 
-        // Granite: scale MLP output.
         if self.residual_multiplier != 1.0 {
             kernels::scale_inplace(*mlp_output, self.residual_multiplier, &device.cublas);
         }

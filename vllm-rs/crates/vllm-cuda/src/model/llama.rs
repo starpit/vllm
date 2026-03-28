@@ -998,19 +998,33 @@ impl LlamaDecoderLayer {
         rotary: &RotaryCache,
         device: &mut GpuDevice,
     ) -> (OwnedTensor, OwnedTensor) {
-        // ── Fused norm+QKV path (ferrite, Dense layers only) ──
+        // ── Fused norm+QKV path (ferrite, Dense layers only, not first layer) ──
+        // First layer falls through to standard path (no residual to add into).
         #[cfg(feature = "ferrite")]
-        if let crate::layers::LinearLayer::Dense(ref qkv_linear) = self.self_attn.qkv_proj {
-            // Pre-attention: residual add + fused norm+QKV GEMM
-            let residual = if let Some(residual) = residual {
-                // residual += hidden_states
-                kernels::add_inplace(*residual, *hidden_states, device.compute_stream);
-                drop(hidden_states);
-                residual
-            } else {
-                // First layer: hidden_states IS the residual
-                hidden_states
+        if residual.is_some()
+            && matches!(
+                self.self_attn.qkv_proj,
+                crate::layers::LinearLayer::Dense(_)
+            )
+        {
+            let residual = residual.unwrap();
+            let qkv_linear = match &self.self_attn.qkv_proj {
+                crate::layers::LinearLayer::Dense(l) => l,
+                _ => unreachable!(),
             };
+
+            // residual += hidden_states, then zero hidden_states for reuse as return value
+            kernels::add_inplace(*residual, *hidden_states, device.compute_stream);
+            let nbytes = hidden_states.as_gpu_tensor().dim(0)
+                * hidden_states.as_gpu_tensor().dim(1)
+                * hidden_states.as_gpu_tensor().dtype().size_bytes();
+            cudarc::driver::sys::cuMemsetD8Async(
+                hidden_states.as_gpu_tensor().raw_ptr() as u64,
+                0,
+                nbytes,
+                device.compute_stream,
+            );
+            let hidden_states_buf = hidden_states; // zeroed, for return
 
             // Fused norm+QKV: reads residual, normalizes inline, projects
             let hidden = residual.as_gpu_tensor().dim(1) as u32;
@@ -1077,8 +1091,7 @@ impl LlamaDecoderLayer {
 
                 // down_proj: accumulate into residual (D = A@B^T + residual)
                 if let crate::layers::LinearLayer::Dense(ref down_linear) = self.mlp.down_proj {
-                    crate::ferrite::launch_gemm_accumulate(
-                        &FUSED_NORM_GEMM, // uses same tile config for grid/launch
+                    device.ferrite.gemm_accumulate(
                         *activated,
                         down_linear.weight,
                         *residual,
@@ -1087,18 +1100,10 @@ impl LlamaDecoderLayer {
                         device.compute_stream,
                     );
                     drop(activated);
-                    // residual now contains: old_residual + attn + down_proj(silu_mul(gate_up(norm(residual))))
-                    // Return residual as both outputs (next layer reads residual directly)
-                    // The "hidden_states" slot is a dummy clone of residual for the non-ferrite
-                    // final norm path. TODO: clean up return type.
-                    let dummy = device.caching.alloc_tensor(
-                        &[
-                            residual.as_gpu_tensor().dim(0),
-                            residual.as_gpu_tensor().dim(1),
-                        ],
-                        residual.as_gpu_tensor().dtype(),
-                    );
-                    return (dummy, residual);
+                    // residual now has everything accumulated.
+                    // Return zeroed hidden_states_buf so next layer's
+                    // add_inplace(residual, hidden_states) is a no-op.
+                    return (hidden_states_buf, residual);
                 }
             }
 

@@ -174,6 +174,57 @@ impl FerriteCutlass {
 
         out
     }
+
+    /// D = alpha * A @ B^T + beta * D (accumulate in-place, no allocation).
+    pub unsafe fn gemm_accumulate(
+        &self,
+        a: GpuTensor,
+        b: GpuTensor,
+        d: GpuTensor, // both C and D
+        alpha: f32,
+        beta: f32,
+        stream: CUstream,
+    ) {
+        let m = a.dim(0) as u32;
+        let k = a.dim(1) as u32;
+        let n = b.dim(0) as u32;
+        debug_assert_eq!(b.dim(1) as u32, k, "K dimension mismatch");
+
+        let config = self.select(m);
+
+        let grid_m = m.div_ceil(config.tile_m);
+        let grid_n = n.div_ceil(config.tile_n);
+        let swizzle_log = compute_swizzle_log(grid_n);
+        let tile = 1u32 << swizzle_log;
+        let grid_x = grid_m * tile;
+        let grid_y = grid_n.div_ceil(tile);
+
+        let params = build_flat_params(
+            a.raw_ptr() as u64,
+            b.raw_ptr() as u64,
+            d.raw_ptr() as u64, // C = D
+            d.raw_ptr() as u64,
+            m,
+            n,
+            k,
+            k,
+            k,
+            n,
+            n,
+            alpha,
+            beta,
+        );
+
+        launch_kernel(
+            config.func,
+            stream,
+            grid_x,
+            grid_y,
+            config.threads,
+            config.smem_bytes,
+            &params,
+        );
+    }
 }
 
 // ── Flat param builder (88 bytes) ──

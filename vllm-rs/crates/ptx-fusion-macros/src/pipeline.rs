@@ -57,6 +57,32 @@ pub struct FinalizationBlock {
     pub consumed_carries: Vec<String>,
 }
 
+/// Decomposition of a Reduction stage into three phases.
+///
+/// A reduction like rms_norm decomposes into:
+/// 1. **Accumulate**: loops that accumulate a scalar (e.g., sum-of-squares)
+/// 2. **Finalize**: post-accumulate code (warp shuffle, SMEM reduce, rsqrt → inv_rms)
+/// 3. **Emit**: loops that produce per-element output using the finalized scalar
+///
+/// For fusion with a downstream GEMM:
+/// - Accumulate + Finalize become the GEMM prologue
+/// - Emit's per-element formula becomes a PointwiseComputation injected at cp.async sites
+#[derive(Debug, Clone)]
+pub struct ReductionDecomposition {
+    /// Loops that perform accumulation (carry = accumulator register).
+    pub accumulate_loops: Vec<LoopDescriptor>,
+    /// Line range of the finalization code (shuffle, reduce, rsqrt).
+    pub finalize_range: (usize, usize),
+    /// Loops that emit per-element output using the finalized value.
+    pub emit_loops: Vec<LoopDescriptor>,
+    /// The finalized value register (e.g., "%f12" for inv_rms).
+    /// Detected as the register loaded from SMEM after the reduction barrier.
+    pub finalized_value_reg: String,
+    /// The per-element formula extracted from the emit loop.
+    /// Each entry is a PTX instruction from the emit loop body.
+    pub emit_body_lines: Vec<String>,
+}
+
 /// A single stage in a fused pipeline, extracted entirely from PTX analysis.
 #[derive(Debug, Clone)]
 pub struct PipelineStage {
@@ -135,9 +161,122 @@ impl PipelineStage {
             carries: all_carries,
             finalization,
             protocol,
-            source_lines: source.lines().map(|l| l.to_string()).collect(),
+            source_lines: lines.iter().map(|l| l.to_string()).collect(),
         })
     }
+
+    /// Decompose a Reduction stage into accumulate / finalize / emit phases.
+    ///
+    /// Returns `None` if the stage is not a Reduction.
+    pub fn decompose_reduction(&self) -> Option<ReductionDecomposition> {
+        match &self.pattern {
+            StagePattern::Reduction { accumulators, .. } => decompose_reduction_impl(
+                &self.source_lines,
+                &self.loops,
+                accumulators,
+                &self.protocol,
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// Decompose a reduction kernel into its three phases.
+fn decompose_reduction_impl(
+    source_lines: &[String],
+    loops: &[LoopDescriptor],
+    accumulators: &[String],
+    protocol: &KernelProtocol,
+) -> Option<ReductionDecomposition> {
+    let lines: Vec<&str> = source_lines.iter().map(|s| s.as_str()).collect();
+
+    // Classify loops as accumulate vs emit:
+    // - Accumulate loops: contain accumulator carries (fma/add.f32 self-modifying)
+    // - Emit loops: contain st.global (output stores)
+    let mut accumulate_loops = Vec::new();
+    let mut emit_loops = Vec::new();
+
+    for lp in loops {
+        let body_has_accumulator = {
+            let carries = analyze_carries(&lines, lp);
+            carries.iter().any(|c| accumulators.contains(&c.register))
+        };
+        let body_has_store = (lp.body_range.0..=lp.body_range.1)
+            .any(|i| i < lines.len() && lines[i].contains("st.global"));
+
+        if body_has_accumulator {
+            accumulate_loops.push(lp.clone());
+        } else if body_has_store {
+            emit_loops.push(lp.clone());
+        }
+    }
+
+    if accumulate_loops.is_empty() {
+        return None;
+    }
+
+    // Finalize range: between last accumulate loop back-edge and first emit loop header
+    // (or end of kernel if no emit loops)
+    let last_accum_end = accumulate_loops
+        .iter()
+        .map(|l| l.backedge_line)
+        .max()
+        .unwrap_or(0);
+    let first_emit_start = emit_loops.iter().map(|l| l.header_line).min();
+
+    let finalize_start = last_accum_end + 1;
+    let finalize_end = match first_emit_start {
+        Some(emit_line) => emit_line.saturating_sub(1),
+        None => lines.len().saturating_sub(1),
+    };
+
+    // Detect the finalized value register: look for ld.shared.f32 in the finalize block,
+    // which loads the broadcast result of the reduction.
+    let mut finalized_value_reg = String::new();
+    for i in finalize_start..=finalize_end.min(lines.len() - 1) {
+        let trimmed = lines[i].trim();
+        if trimmed.contains("ld.shared.f32") || trimmed.contains("ld.shared.b32") {
+            // Extract dest register
+            let parts: Vec<&str> = trimmed
+                .split([',', ' ', '\t'])
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.len() >= 2 {
+                let reg = parts[1].trim_end_matches(',');
+                if reg.starts_with('%') {
+                    finalized_value_reg = reg.to_string();
+                    // Take the LAST ld.shared (the one after the barrier)
+                }
+            }
+        }
+    }
+
+    // Extract emit loop body lines (the per-element computation)
+    let mut emit_body_lines = Vec::new();
+    if let Some(emit_lp) = emit_loops.first() {
+        for i in emit_lp.header_line..=emit_lp.backedge_line {
+            if i < lines.len() {
+                let trimmed = lines[i].trim();
+                // Skip labels, loop control (setp for loop condition, bra)
+                if trimmed.is_empty()
+                    || trimmed.starts_with('$')
+                    || trimmed.starts_with("//")
+                    || (trimmed.contains("bra") && trimmed.contains(&emit_lp.header_label))
+                {
+                    continue;
+                }
+                emit_body_lines.push(trimmed.to_string());
+            }
+        }
+    }
+
+    Some(ReductionDecomposition {
+        accumulate_loops,
+        finalize_range: (finalize_start, finalize_end),
+        emit_loops,
+        finalized_value_reg,
+        emit_body_lines,
+    })
 }
 
 /// Classify the kernel's computational pattern from its extracted metadata.
@@ -370,5 +509,87 @@ mod tests {
             StagePattern::Pointwise => {} // correct
             other => panic!("scale should be Pointwise, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn decompose_rms_norm_reduction() {
+        let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let stage = PipelineStage::from_ptx("rms_norm", ptx).expect("extraction failed");
+
+        let decomp = stage
+            .decompose_reduction()
+            .expect("rms_norm should decompose as a reduction");
+
+        // Should have accumulate loops (sum-of-squares)
+        assert!(
+            !decomp.accumulate_loops.is_empty(),
+            "should have accumulate loops"
+        );
+
+        // Should have emit loops (output = input * inv_rms * weight)
+        assert!(!decomp.emit_loops.is_empty(), "should have emit loops");
+
+        // Finalize range should be between accumulate and emit
+        assert!(
+            decomp.finalize_range.0 < decomp.finalize_range.1,
+            "finalize range should be non-empty: {:?}",
+            decomp.finalize_range
+        );
+        let last_accum = decomp.accumulate_loops.last().unwrap().backedge_line;
+        let first_emit = decomp.emit_loops.first().unwrap().header_line;
+        assert!(
+            decomp.finalize_range.0 > last_accum,
+            "finalize should start after last accumulate loop"
+        );
+        assert!(
+            decomp.finalize_range.1 < first_emit,
+            "finalize should end before first emit loop"
+        );
+
+        // Should have detected the finalized value register (inv_rms loaded from SMEM)
+        assert!(
+            decomp.finalized_value_reg.starts_with('%'),
+            "should detect finalized value register, got: {:?}",
+            decomp.finalized_value_reg
+        );
+
+        // Emit body should contain mul.f32 instructions (input * inv_rms, result * weight)
+        let has_mul = decomp.emit_body_lines.iter().any(|l| l.contains("mul.f32"));
+        assert!(
+            has_mul,
+            "emit body should contain mul.f32 for normalization"
+        );
+
+        // Emit body should contain st.global (output stores)
+        let has_store = decomp
+            .emit_body_lines
+            .iter()
+            .any(|l| l.contains("st.global"));
+        assert!(
+            has_store,
+            "emit body should contain st.global output stores"
+        );
+
+        // Emit body should contain ld.global (input + weight loads)
+        let ld_count = decomp
+            .emit_body_lines
+            .iter()
+            .filter(|l| l.contains("ld.global"))
+            .count();
+        assert!(
+            ld_count >= 2,
+            "emit body should load input and weight from GMEM, got {} loads",
+            ld_count
+        );
+    }
+
+    #[test]
+    fn decompose_pointwise_returns_none() {
+        let ptx = include_str!("../../ptx-fusion/kernels/scale.ptx");
+        let stage = PipelineStage::from_ptx("scale", ptx).expect("extraction failed");
+        assert!(
+            stage.decompose_reduction().is_none(),
+            "pointwise stage should not decompose as reduction"
+        );
     }
 }

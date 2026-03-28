@@ -15,6 +15,7 @@ mod parser;
 pub(crate) mod perimeter;
 pub(crate) mod persistent;
 mod pipeline;
+mod pipeline_compile;
 mod regfuse;
 use parser::{KernelProtocol, PtxParser};
 

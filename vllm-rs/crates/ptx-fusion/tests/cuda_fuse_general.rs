@@ -1007,6 +1007,38 @@ const FUSED_RMS_NORM_GEMM_PTX: &str = ptx_fusion::fuse!(
     name = "fused_rms_norm_gemm",
 );
 
+// Same kernel via compile! — resolves gemm_64x128x32 from ferrite.toml
+const COMPILED_NORM_GEMM: ptx_fusion::FeriteKernel = ptx_fusion::compile!(
+    a = intrinsic(rms_norm),
+    b = gemm_64x128x32,
+    bind = { a.output => b.param_0 },
+    name = "compiled_norm_gemm",
+);
+
+#[test]
+fn compile_macro_metadata() {
+    assert_eq!(COMPILED_NORM_GEMM.tile_m, 64);
+    assert_eq!(COMPILED_NORM_GEMM.tile_n, 128);
+    assert_eq!(COMPILED_NORM_GEMM.threads, 128);
+    assert_eq!(COMPILED_NORM_GEMM.smem_bytes, 36864);
+    assert_eq!(COMPILED_NORM_GEMM.extra_param_bytes, 32); // rms_norm prefix
+    assert!(
+        COMPILED_NORM_GEMM
+            .ptx
+            .contains("FERRITE: rms_norm prologue")
+    );
+    assert!(COMPILED_NORM_GEMM.ptx.contains("ferrite_params[88]"));
+    assert!(COMPILED_NORM_GEMM.ptx.contains("compiled_norm_gemm"));
+    println!(
+        "compile! metadata: tile={}x{}, threads={}, smem={}, extra_params={}B",
+        COMPILED_NORM_GEMM.tile_m,
+        COMPILED_NORM_GEMM.tile_n,
+        COMPILED_NORM_GEMM.threads,
+        COMPILED_NORM_GEMM.smem_bytes,
+        COMPILED_NORM_GEMM.extra_param_bytes
+    );
+}
+
 /// CPU rms_norm reference: normalize each row of A by its RMS.
 fn cpu_rms_norm(
     input: &[half::bf16],

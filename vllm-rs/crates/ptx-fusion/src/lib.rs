@@ -9,7 +9,7 @@
 //! proc-macro-driven kernel fusion.
 
 pub use ptx_fusion_macros::{
-    analyze_kernel, analyze_kernel_as, delete_cutlass_a_loads, extract_entry, fuse,
+    analyze_kernel, analyze_kernel_as, compile, delete_cutlass_a_loads, extract_entry, fuse,
     fuse_3phase_mlp, fuse_kernels, fuse_real_kernels, fuse_rms_norm_gemm_flat, inject_epilogue,
     inject_silu_epilogue, persistent_fuse_real_kernels, prologue_identity, prologue_identity_flat,
     prologue_scale2_flat, regfuse_kernels, replace_cutlass_a_loads, replace_perimeter_macro,
@@ -18,6 +18,28 @@ pub use ptx_fusion_macros::{
 
 #[cfg(feature = "cuda")]
 pub mod dispatch;
+
+/// A compiled ferrite kernel — PTX + launch metadata.
+///
+/// Produced by `compile!`. Call `.launch()` to execute on GPU.
+/// The kernel module is loaded lazily on first launch and cached.
+#[derive(Debug)]
+pub struct FeriteKernel {
+    /// Fused PTX source (embedded in the binary at compile time).
+    pub ptx: &'static str,
+    /// Entry point name in the PTX.
+    pub entry: &'static str,
+    /// Tile dimensions (M, N, K) from the GEMM config.
+    pub tile_m: u32,
+    pub tile_n: u32,
+    /// Thread block size.
+    pub threads: u32,
+    /// Shared memory bytes.
+    pub smem_bytes: u32,
+    /// Number of extra params prepended before the flat GEMM params.
+    /// Each extra param's size/type is encoded in the PTX .param declarations.
+    pub extra_param_bytes: u32,
+}
 
 /// A kernel's complete protocol — everything needed to fuse it with another kernel.
 #[derive(Debug)]

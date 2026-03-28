@@ -1228,6 +1228,318 @@ fn resolve_param_name_to_offset(name: &str, base_offsets: &BTreeMap<String, i64>
     }
 }
 
+// ===== Loop Detection =====
+
+/// A detected loop in PTX, identified by a back-edge branch.
+#[derive(Debug, Clone)]
+pub struct LoopDescriptor {
+    /// Label of the loop header (e.g., "$L__BB0_3").
+    pub header_label: String,
+    /// Line number of the header label in the source.
+    pub header_line: usize,
+    /// Line number of the back-edge branch instruction.
+    pub backedge_line: usize,
+    /// The predicate register controlling the back-edge (e.g., "%p24").
+    /// Empty string for unconditional branches.
+    pub backedge_predicate: String,
+    /// Line range of the loop body: (header_line, backedge_line) inclusive.
+    pub body_range: (usize, usize),
+    /// Nesting depth (0 = outermost).
+    pub depth: usize,
+}
+
+/// Detect loops in PTX by finding back-edge branches (branches to earlier labels).
+///
+/// Algorithm (two passes, O(N)):
+/// 1. Collect all labels and their line numbers.
+/// 2. For each `bra` instruction, check if its target is at an earlier line (back-edge).
+/// 3. Compute nesting depth via interval containment.
+pub fn detect_loops(lines: &[&str]) -> Vec<LoopDescriptor> {
+    // Pass 1: collect labels → line numbers
+    let mut labels: BTreeMap<String, usize> = BTreeMap::new();
+    for (line_idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.ends_with(':') && trimmed.starts_with('$') {
+            let label = trimmed.trim_end_matches(':').to_string();
+            labels.insert(label, line_idx);
+        }
+    }
+
+    // Pass 2: find back-edges
+    let mut loops = Vec::new();
+    for (line_idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        // Match: "bra $label;" or "@%pN bra $label;"
+        let (predicate, bra_part) = if trimmed.starts_with('@') {
+            // Predicated branch
+            let space = match trimmed.find(|c: char| c.is_whitespace()) {
+                Some(i) => i,
+                None => continue,
+            };
+            let pred = trimmed[1..space].trim_start_matches('!').to_string();
+            (pred, trimmed[space..].trim())
+        } else {
+            (String::new(), trimmed)
+        };
+
+        if !bra_part.starts_with("bra") {
+            continue;
+        }
+
+        // Extract target label
+        let target = bra_part
+            .strip_prefix("bra")
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+
+        if let Some(&header_line) = labels.get(target) {
+            if header_line < line_idx {
+                // Back-edge: this is a loop
+                loops.push(LoopDescriptor {
+                    header_label: target.to_string(),
+                    header_line,
+                    backedge_line: line_idx,
+                    backedge_predicate: predicate,
+                    body_range: (header_line, line_idx),
+                    depth: 0, // computed below
+                });
+            }
+        }
+    }
+
+    // Compute nesting depth via interval containment
+    // Sort by range size (largest first) for stable depth assignment
+    let ranges: Vec<(usize, usize)> = loops.iter().map(|l| l.body_range).collect();
+    for i in 0..loops.len() {
+        let (start_i, end_i) = ranges[i];
+        let mut depth = 0usize;
+        for (j, &(start_j, end_j)) in ranges.iter().enumerate() {
+            if i != j
+                && start_j <= start_i
+                && end_j >= end_i
+                && (start_j, end_j) != (start_i, end_i)
+            {
+                depth += 1;
+            }
+        }
+        loops[i].depth = depth;
+    }
+
+    // Sort by header line for stable ordering
+    loops.sort_by_key(|l| l.header_line);
+    loops
+}
+
+// ===== Carry Analysis =====
+
+/// A register that carries state across loop iterations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarryRegister {
+    /// The register name (e.g., "%f83", "%r716").
+    pub register: String,
+    /// The role of this carry.
+    pub role: CarryRole,
+}
+
+/// Classification of a carry register's role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CarryRole {
+    /// Loop induction variable: `add.s32 %rN, %rN, step`
+    InductionVar,
+    /// Floating-point accumulator: `fma.rn.f32 %fN, ..., %fN` or `add.f32 %fN, %fN, ...`
+    Accumulator,
+    /// SMEM buffer rotation state: `selp` near loop end
+    BufferState,
+    /// GMEM pointer advancing per tile: `add.s64 %rdN, %rdN, stride`
+    TilePointer,
+    /// MMA accumulator: dest of `mma.sync` instructions
+    MmaAccumulator,
+}
+
+/// Analyze a loop body to find registers that carry state across iterations.
+///
+/// A register is a carry if it is both defined (written) and used (read) in the
+/// loop body — either in the same instruction (e.g., `add.s32 %r0, %r0, 1`) or
+/// across different instructions (e.g., `fma %f25, ..., %f83` then `fma %f83, ..., %f27`).
+pub fn analyze_carries(lines: &[&str], loop_desc: &LoopDescriptor) -> Vec<CarryRegister> {
+    let (start, end) = loop_desc.body_range;
+
+    // Collect all defs and uses within the loop body, plus per-instruction info for role classification
+    let mut defs_in_loop: BTreeSet<String> = BTreeSet::new();
+    let mut uses_in_loop: BTreeSet<String> = BTreeSet::new();
+    let mut self_modify: BTreeMap<String, CarryRole> = BTreeMap::new();
+
+    for line_idx in start..=end {
+        if line_idx >= lines.len() {
+            break;
+        }
+        let trimmed = lines[line_idx].trim();
+
+        let work = if trimmed.starts_with('@') {
+            match trimmed.find(|c: char| c.is_whitespace()) {
+                Some(i) => trimmed[i..].trim(),
+                None => continue,
+            }
+        } else {
+            trimmed
+        };
+
+        if let Some(node) = DefUseGraph::parse_instruction(work, line_idx) {
+            for dest in &node.dests {
+                defs_in_loop.insert(dest.clone());
+
+                // Check for same-instruction self-modification (most precise role signal)
+                if node.sources.contains(dest) {
+                    let role = classify_carry_role(&node.opcode, dest);
+                    insert_carry_role(&mut self_modify, dest.clone(), role);
+                }
+            }
+
+            for src in &node.sources {
+                uses_in_loop.insert(src.clone());
+            }
+
+            // MMA accumulators: dest registers of mma.sync instructions
+            if node.opcode.starts_with("mma.sync") || node.opcode.starts_with("wmma.mma") {
+                for dest in &node.dests {
+                    insert_carry_role(&mut self_modify, dest.clone(), CarryRole::MmaAccumulator);
+                }
+            }
+        }
+    }
+
+    // A register is a carry if it's both def'd and used in the loop body
+    let carry_regs: BTreeSet<String> = defs_in_loop.intersection(&uses_in_loop).cloned().collect();
+
+    let mut result: Vec<CarryRegister> = carry_regs
+        .into_iter()
+        .filter(|r| r.starts_with('%')) // only real registers
+        .map(|reg| {
+            let role = if let Some(role) = self_modify.get(&reg) {
+                role.clone()
+            } else {
+                // Def'd and used but not self-modifying on any single instruction.
+                // Classify by register type: float = accumulator, rd = pointer, r = induction
+                if reg.starts_with("%f") {
+                    CarryRole::Accumulator
+                } else if reg.starts_with("%rd") {
+                    CarryRole::TilePointer
+                } else {
+                    CarryRole::InductionVar
+                }
+            };
+            CarryRegister {
+                register: reg,
+                role,
+            }
+        })
+        .collect();
+    result.sort_by(|a, b| a.register.cmp(&b.register));
+    result
+}
+
+fn insert_carry_role(map: &mut BTreeMap<String, CarryRole>, reg: String, role: CarryRole) {
+    match map.entry(reg) {
+        std::collections::btree_map::Entry::Vacant(e) => {
+            e.insert(role);
+        }
+        std::collections::btree_map::Entry::Occupied(mut e) => {
+            if carry_role_priority(&role) > carry_role_priority(e.get()) {
+                e.insert(role);
+            }
+        }
+    }
+}
+
+/// Higher-priority roles override lower when the same register is classified multiple times.
+fn carry_role_priority(role: &CarryRole) -> u8 {
+    match role {
+        CarryRole::MmaAccumulator => 5,
+        CarryRole::BufferState => 4,
+        CarryRole::Accumulator => 3,
+        CarryRole::TilePointer => 2,
+        CarryRole::InductionVar => 1,
+    }
+}
+
+/// Classify a self-modifying register based on the instruction opcode and register type.
+fn classify_carry_role(opcode: &str, reg: &str) -> CarryRole {
+    // fma.rn.f32 / add.f32 / add.rn.f32 with float reg -> Accumulator
+    if (opcode.starts_with("fma.") || opcode.starts_with("add.f") || opcode.starts_with("add.rn.f"))
+        && reg.starts_with("%f")
+    {
+        return CarryRole::Accumulator;
+    }
+
+    // add.s32 / add.u32 with integer reg -> InductionVar
+    if (opcode.starts_with("add.s32") || opcode.starts_with("add.u32")) && reg.starts_with("%r") {
+        return CarryRole::InductionVar;
+    }
+
+    // add.s64 with 64-bit reg -> TilePointer
+    if opcode.starts_with("add.s64") && reg.starts_with("%rd") {
+        return CarryRole::TilePointer;
+    }
+
+    // selp -> BufferState
+    if opcode.starts_with("selp") {
+        return CarryRole::BufferState;
+    }
+
+    // Default: if it's float, call it accumulator; otherwise induction var
+    if reg.starts_with("%f") {
+        CarryRole::Accumulator
+    } else if reg.starts_with("%rd") {
+        CarryRole::TilePointer
+    } else {
+        CarryRole::InductionVar
+    }
+}
+
+// ===== Backward Tracing =====
+
+impl DefUseGraph {
+    /// Trace backward from a register to find what defines it.
+    ///
+    /// Returns (depth, node_index) pairs. At depth 0: instructions that define
+    /// `start_reg`. At depth 1: instructions that define the sources of those
+    /// instructions. And so on up to `max_depth`.
+    ///
+    /// This is the mirror of `trace_forward`: follows def→source edges instead
+    /// of use→dest edges.
+    pub fn trace_backward(&self, start_reg: &str, max_depth: usize) -> Vec<(usize, usize)> {
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        let mut results = Vec::new();
+
+        queue.push_back((start_reg.to_string(), 0usize));
+
+        while let Some((reg, depth)) = queue.pop_front() {
+            if depth > max_depth || !visited.insert(reg.clone()) {
+                continue;
+            }
+
+            if let Some(indices) = self.defs.get(&reg) {
+                for &idx in indices {
+                    results.push((depth, idx));
+
+                    // Continue BFS through this instruction's sources
+                    if depth < max_depth {
+                        for s in &self.nodes[idx].sources {
+                            queue.push_back((s.clone(), depth + 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        results
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2050,5 +2362,291 @@ mod tests {
         let mut bases = BTreeMap::new();
         bases.insert("%rd1".to_string(), 24);
         assert_eq!(resolve_param_name_to_offset("%rd1", &bases), Some(24));
+    }
+
+    // ── Loop detection tests ──
+
+    #[test]
+    fn loop_detect_simple_backedge() {
+        let ptx = "\
+            .entry test() {\n\
+            mov.u32 %r0, 0;\n\
+            $L__BB0_1:\n\
+            add.u32 %r0, %r0, 1;\n\
+            setp.lt.u32 %p1, %r0, 100;\n\
+            @%p1 bra $L__BB0_1;\n\
+            ret;\n\
+            }\n\
+        ";
+        let lines: Vec<&str> = ptx.lines().collect();
+        let loops = detect_loops(&lines);
+        assert_eq!(loops.len(), 1, "should detect exactly one loop");
+        assert_eq!(loops[0].header_label, "$L__BB0_1");
+        assert_eq!(loops[0].backedge_predicate, "%p1");
+        assert!(loops[0].body_range.0 < loops[0].body_range.1);
+        assert_eq!(loops[0].depth, 0);
+    }
+
+    #[test]
+    fn loop_detect_forward_branch_not_loop() {
+        let ptx = "\
+            .entry test() {\n\
+            setp.eq.u32 %p1, %r0, 0;\n\
+            @%p1 bra $L__BB0_2;\n\
+            add.u32 %r0, %r0, 1;\n\
+            $L__BB0_2:\n\
+            ret;\n\
+            }\n\
+        ";
+        let lines: Vec<&str> = ptx.lines().collect();
+        let loops = detect_loops(&lines);
+        assert_eq!(loops.len(), 0, "forward branch should not be a loop");
+    }
+
+    #[test]
+    fn loop_detect_nested() {
+        let ptx = "\
+            .entry test() {\n\
+            $L_OUTER:\n\
+            mov.u32 %r1, 0;\n\
+            $L_INNER:\n\
+            add.u32 %r1, %r1, 1;\n\
+            setp.lt.u32 %p1, %r1, 10;\n\
+            @%p1 bra $L_INNER;\n\
+            add.u32 %r0, %r0, 1;\n\
+            setp.lt.u32 %p2, %r0, 5;\n\
+            @%p2 bra $L_OUTER;\n\
+            ret;\n\
+            }\n\
+        ";
+        let lines: Vec<&str> = ptx.lines().collect();
+        let loops = detect_loops(&lines);
+        assert_eq!(loops.len(), 2, "should detect outer and inner loops");
+
+        let outer = loops.iter().find(|l| l.header_label == "$L_OUTER").unwrap();
+        let inner = loops.iter().find(|l| l.header_label == "$L_INNER").unwrap();
+        assert_eq!(outer.depth, 0, "outer loop at depth 0");
+        assert_eq!(inner.depth, 1, "inner loop at depth 1");
+    }
+
+    #[test]
+    fn loop_detect_unconditional_backedge() {
+        let ptx = "\
+            .entry test() {\n\
+            $L_LOOP:\n\
+            add.u32 %r0, %r0, 1;\n\
+            bra $L_LOOP;\n\
+            }\n\
+        ";
+        let lines: Vec<&str> = ptx.lines().collect();
+        let loops = detect_loops(&lines);
+        assert_eq!(loops.len(), 1, "unconditional back-edge is also a loop");
+        assert_eq!(loops[0].backedge_predicate, "");
+    }
+
+    // ── Carry analysis tests ──
+
+    #[test]
+    fn carry_detect_accumulator() {
+        let ptx = "\
+            $L_LOOP:\n\
+            ld.global.f32 %f1, [%rd0];\n\
+            fma.rn.f32 %f10, %f1, %f1, %f10;\n\
+            add.s32 %r0, %r0, 1;\n\
+            setp.lt.s32 %p1, %r0, 100;\n\
+            @%p1 bra $L_LOOP;\n\
+        ";
+        let lines: Vec<&str> = ptx.lines().collect();
+        let loops = detect_loops(&lines);
+        assert_eq!(loops.len(), 1);
+        let carries = analyze_carries(&lines, &loops[0]);
+
+        let acc = carries.iter().find(|c| c.register == "%f10").unwrap();
+        assert_eq!(acc.role, CarryRole::Accumulator);
+
+        let ind = carries.iter().find(|c| c.register == "%r0").unwrap();
+        assert_eq!(ind.role, CarryRole::InductionVar);
+    }
+
+    #[test]
+    fn carry_detect_tile_pointer() {
+        let ptx = "\
+            $L_LOOP:\n\
+            ld.global.f32 %f1, [%rd5];\n\
+            add.s64 %rd5, %rd5, %rd2;\n\
+            add.s32 %r0, %r0, 1;\n\
+            setp.lt.s32 %p1, %r0, 100;\n\
+            @%p1 bra $L_LOOP;\n\
+        ";
+        let lines: Vec<&str> = ptx.lines().collect();
+        let loops = detect_loops(&lines);
+        let carries = analyze_carries(&lines, &loops[0]);
+
+        let ptr = carries.iter().find(|c| c.register == "%rd5").unwrap();
+        assert_eq!(ptr.role, CarryRole::TilePointer);
+    }
+
+    #[test]
+    fn carry_detect_buffer_state() {
+        let ptx = "\
+            $L_LOOP:\n\
+            add.s32 %r10, %r10, 1;\n\
+            setp.eq.s32 %p5, %r10, 3;\n\
+            selp.b32 %r10, 0, %r10, %p5;\n\
+            @%p1 bra $L_LOOP;\n\
+        ";
+        let lines: Vec<&str> = ptx.lines().collect();
+        let loops = detect_loops(&lines);
+        let carries = analyze_carries(&lines, &loops[0]);
+
+        let buf = carries.iter().find(|c| c.register == "%r10").unwrap();
+        assert_eq!(buf.role, CarryRole::BufferState);
+    }
+
+    // ── Backward tracing tests ──
+
+    #[test]
+    fn trace_backward_simple_chain() {
+        let ptx = "\
+            ld.param.u64 %rd0, [input];\n\
+            cvta.to.global.u64 %rd1, %rd0;\n\
+            add.s64 %rd2, %rd1, 16;\n\
+            ld.global.f32 %f1, [%rd2];\n\
+        ";
+        let lines: Vec<&str> = ptx.lines().collect();
+        let graph = DefUseGraph::build(&lines);
+
+        // Trace backward from %f1: should find ld.global defining it
+        let trace = graph.trace_backward("%f1", 3);
+        assert!(!trace.is_empty(), "should find at least one definition");
+
+        // At depth 0: the ld.global.f32 that defines %f1
+        let depth0: Vec<_> = trace.iter().filter(|(d, _)| *d == 0).collect();
+        assert_eq!(depth0.len(), 1);
+        assert_eq!(graph.nodes[depth0[0].1].opcode, "ld.global.f32");
+
+        // At depth 1: the add.s64 that defines %rd2 (the source of ld.global)
+        let depth1: Vec<_> = trace.iter().filter(|(d, _)| *d == 1).collect();
+        let depth1_opcodes: Vec<&str> = depth1
+            .iter()
+            .map(|(_, idx)| graph.nodes[*idx].opcode.as_str())
+            .collect();
+        assert!(
+            depth1_opcodes.contains(&"add.s64"),
+            "should trace back through add.s64"
+        );
+    }
+
+    // ── Real PTX validation tests ──
+
+    #[test]
+    fn loop_detect_real_rms_norm() {
+        // Parse the real vllm rms_norm kernel (first entry = f32 variant)
+        let ptx = include_str!("../../ptx-fusion/kernels/vllm_rms_norm.ptx");
+        let protocol = PtxParser::parse(ptx).expect("parse failed");
+        // Re-parse the extracted first entry to get its lines
+        // The parser extracts the first entry, so let's detect loops on the full PTX
+        // but only count BB0 loops (first entry)
+        let lines: Vec<&str> = ptx.lines().collect();
+        let all_loops = detect_loops(&lines);
+        let bb0_loops: Vec<&LoopDescriptor> = all_loops
+            .iter()
+            .filter(|l| l.header_label.contains("BB0_"))
+            .collect();
+
+        // The first entry (f32 rms_norm) has 4 loops:
+        // 1. $L__BB0_2: vectorized sum-of-squares (fma.rn.f32)
+        // 2. $L__BB0_5: scalar tail sum-of-squares
+        // 3. $L__BB0_16: vectorized output (mul by inv_rms and weight)
+        // 4. $L__BB0_19: scalar output tail
+        assert_eq!(
+            bb0_loops.len(),
+            4,
+            "f32 rms_norm should have 4 loops, got {}: {:?}",
+            bb0_loops.len(),
+            bb0_loops
+                .iter()
+                .map(|l| &l.header_label)
+                .collect::<Vec<_>>()
+        );
+
+        // Verify the sum-of-squares loop has an accumulator carry
+        let sos_loop = bb0_loops
+            .iter()
+            .find(|l| l.header_label == "$L__BB0_2")
+            .unwrap();
+        let carries = analyze_carries(&lines, sos_loop);
+        let has_accumulator = carries.iter().any(|c| c.role == CarryRole::Accumulator);
+        assert!(
+            has_accumulator,
+            "sum-of-squares loop should have an accumulator carry, got: {:?}",
+            carries
+        );
+
+        // The kernel has MMA = false (it's not a GEMM)
+        assert!(
+            !protocol.has_mma,
+            "rms_norm should not have MMA instructions"
+        );
+    }
+
+    #[test]
+    fn loop_detect_real_cutlass_gemm() {
+        let ptx = include_str!("../../ptx-fusion/kernels/cutlass_bf16_64x64x32_sm89.ptx");
+        let lines: Vec<&str> = ptx.lines().collect();
+        let loops = detect_loops(&lines);
+
+        // CUTLASS bf16 64x64x32 has 1 main K-tile loop ($L__BB0_3)
+        assert!(
+            !loops.is_empty(),
+            "CUTLASS GEMM should have at least one loop"
+        );
+        let main_loop = loops
+            .iter()
+            .find(|l| l.header_label == "$L__BB0_3")
+            .unwrap();
+
+        // The main loop should have carry registers
+        let carries = analyze_carries(&lines, main_loop);
+
+        // Should have induction variable(s) and tile pointers
+        let has_induction = carries.iter().any(|c| c.role == CarryRole::InductionVar);
+        assert!(has_induction, "K-loop should have an induction variable");
+
+        let has_tile_ptr = carries.iter().any(|c| c.role == CarryRole::TilePointer);
+        assert!(
+            has_tile_ptr,
+            "K-loop should have tile pointers (GMEM advancing)"
+        );
+
+        // Should have buffer state (triple-buffered SMEM rotation via selp)
+        let has_buffer_state = carries.iter().any(|c| c.role == CarryRole::BufferState);
+        assert!(
+            has_buffer_state,
+            "K-loop should have buffer state (selp rotation)"
+        );
+
+        // Should have MMA accumulators
+        let has_mma = carries.iter().any(|c| c.role == CarryRole::MmaAccumulator);
+        assert!(has_mma, "K-loop should have MMA accumulator registers");
+    }
+
+    #[test]
+    fn trace_backward_respects_depth() {
+        let ptx = "\
+            mov.u32 %r0, 42;\n\
+            add.u32 %r1, %r0, 1;\n\
+            add.u32 %r2, %r1, 2;\n\
+            add.u32 %r3, %r2, 3;\n\
+        ";
+        let lines: Vec<&str> = ptx.lines().collect();
+        let graph = DefUseGraph::build(&lines);
+
+        let trace_d1 = graph.trace_backward("%r3", 1);
+        let trace_d3 = graph.trace_backward("%r3", 3);
+        assert!(
+            trace_d3.len() > trace_d1.len(),
+            "deeper trace should find more nodes"
+        );
     }
 }

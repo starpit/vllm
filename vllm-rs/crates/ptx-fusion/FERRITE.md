@@ -102,6 +102,8 @@ Tested on L4 GPU (sm_89), CUDA 12.9. **185+ tests** (97 CUDA GPU + 80 unit + doc
 | **GEMM prologue scale*2 (GPU)** | cuda_fuse_general | **pointwise fn at A-loads: GEMM(A*2,B) = 2*GEMM(A,B), 0.00e0** |
 | **GEMM prologue infrastructure** | fuse_general.rs | **PointwiseComputation with prologue + extra_reg_decls fields** |
 | **rms_norm + GEMM intrinsic (GPU)** | cuda_fuse_general | **fuse_rms_norm_gemm_flat: 0.00e0 vs separate norm+GEMM** |
+| **Loop detection + carry analysis** | parser unit tests | **rms_norm: 4 loops, accumulator %f83; CUTLASS: 1 K-loop, MMA accumulators, buffer state** |
+| **Backward tracing** | parser unit tests | **DefUseGraph::trace_backward: BFS through def chains** |
 
 ### Benchmarks
 
@@ -349,7 +351,7 @@ that feeds an output store. The GEMM interior is untouched. 12 injection sites,
 ```
 crates/ptx-fusion-macros/          Proc macro crate (runs at compile time)
   src/lib.rs                       All proc macros
-  src/parser.rs                    PTX parser + escape perimeter + def-use graph + param classification
+  src/parser.rs                    PTX parser + escape perimeter + def-use graph + param classification + loop detection + carry analysis
   src/perimeter.rs                 Perimeter replacement: rewrite param interface using probed derivations
   src/fuse.rs                      SMEM stitching fusion engine (toy kernels)
   src/fuse_real.rs                 SMEM stitching for real nvcc PTX (vectorized, multi-pass)
@@ -497,9 +499,13 @@ At L4's ~300 GB/s: ~7 us/layer bandwidth savings.
 Phase 0: CUTLASS parity with cuBLAS     ← DONE (benchmarked, dispatch)
 Phase 1: Def-use graph + param classify  ← DONE (parser.rs)
 Phase 2: Perimeter replacement           ← DONE (perimeter.rs, build.rs probe, llama.rs integration)
-Phase 3: General fuse! + GEMM fusion      ← DONE (5 handoff paths, intrinsics, 19/19 GPU tests 0.00e0)
-Phase 4: llama.rs integration            ← NEXT (wire fused kernels into forward pass, 11→6 launches)
-Phase 5: llama.rs integration            ← wire fuse! into forward pass (11→6 launches)
+Phase 3: General fuse! + GEMM fusion     ← DONE (5 handoff paths, 19/19 GPU tests 0.00e0)
+--- Architecture pivot: pairwise fusion → tiled pipeline model ---
+Phase 5A: Loop detection + carry analysis ← DONE (parser.rs: detect_loops, analyze_carries, trace_backward)
+Phase 5B: Stage descriptors + extraction  ← NEXT (pipeline.rs: PipelineStage::from_ptx)
+Phase 5C: Reduction decomposition         ← extract accumulate/finalize/emit from rms_norm PTX
+Phase 5D: Pipeline compiler MVP           ← pipeline! macro: rms_norm→GEMM derived from PTX
+Phase 5E: Multi-GEMM pipeline + driver    ← full MLP block: norm→GEMM→SiLU→GEMM→residual
 ```
 
 ### Current performance (no fusion yet)

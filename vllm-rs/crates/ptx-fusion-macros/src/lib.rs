@@ -1593,6 +1593,8 @@ pub fn prologue_identity_flat(input: TokenStream) -> TokenStream {
     let identity = fuse_general::PointwiseComputation {
         instructions: vec![],
         param_loads: vec![],
+        prologue: vec![],
+        extra_reg_decls: vec![],
         scratch_f32_count: 0,
         scratch_b32_count: 0,
     };
@@ -1634,6 +1636,8 @@ pub fn prologue_scale2_flat(input: TokenStream) -> TokenStream {
     let scale2 = fuse_general::PointwiseComputation {
         instructions: vec!["mul.f32 {INPUT}, {INPUT}, 0f40000000;".to_string()],
         param_loads: vec![],
+        prologue: vec![],
+        extra_reg_decls: vec![],
         scratch_f32_count: 0,
         scratch_b32_count: 0,
     };
@@ -1673,6 +1677,8 @@ pub fn prologue_identity(input: TokenStream) -> TokenStream {
     let identity = fuse_general::PointwiseComputation {
         instructions: vec![],
         param_loads: vec![],
+        prologue: vec![],
+        extra_reg_decls: vec![],
         scratch_f32_count: 0,
         scratch_b32_count: 0,
     };

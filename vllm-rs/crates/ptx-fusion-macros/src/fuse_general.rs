@@ -409,6 +409,12 @@ pub struct PointwiseComputation {
     /// ld.param instructions for the consumer's non-bound params (using renamed regs).
     /// These must be emitted once at the top of the fused kernel body.
     pub param_loads: Vec<String>,
+    /// Pre-loop prologue instructions (emitted once before the first A-load site).
+    /// Used for reductions (e.g., computing inv_rms before per-element normalization).
+    /// Empty for purely pointwise functions.
+    pub prologue: Vec<String>,
+    /// Extra register declarations needed by the prologue and/or computation.
+    pub extra_reg_decls: Vec<String>,
     /// Number of scratch .f32 registers needed.
     pub scratch_f32_count: usize,
     /// Number of scratch .b32 registers needed.
@@ -592,6 +598,8 @@ fn extract_pointwise_computation(
     Ok(PointwiseComputation {
         instructions,
         param_loads,
+        prologue: vec![],
+        extra_reg_decls: vec![],
         scratch_f32_count: used_f32_scratch,
         scratch_b32_count: used_b32_scratch,
     })
@@ -689,6 +697,7 @@ pub fn replace_a_loads_with_inline_fn(
     let f_v = |i: usize| format!("%f{}", f_base + i); // f_v(0), f_v(1) for unpacked values
 
     let mut result = Vec::new();
+    let mut prologue_emitted = computation.prologue.is_empty(); // skip if no prologue
 
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
@@ -729,6 +738,10 @@ pub fn replace_a_loads_with_inline_fn(
                     computation.scratch_b32_count
                 ));
             }
+            // Extra register declarations from the computation
+            for decl in &computation.extra_reg_decls {
+                result.push(format!("\t{decl}"));
+            }
             // Emit param loads for the computation
             if !computation.param_loads.is_empty() {
                 result.push("\t// FERRITE: load prologue params".to_string());
@@ -737,6 +750,19 @@ pub fn replace_a_loads_with_inline_fn(
                 }
             }
             continue;
+        }
+
+        // Emit pre-loop prologue once, right before the first A-matrix cp.async
+        if !prologue_emitted
+            && trimmed.contains("cp.async.cg.shared.global")
+            && classifications.get(&i) == Some(&CpAsyncClass::AMatrix)
+            && !computation.prologue.is_empty()
+        {
+            result.push("\t// FERRITE: pre-loop prologue (reduction)".to_string());
+            for instr in &computation.prologue {
+                result.push(format!("\t{instr}"));
+            }
+            prologue_emitted = true;
         }
 
         // Replace A-matrix cp.async with inline load+transform+store
@@ -1681,6 +1707,8 @@ mod tests {
         let identity = PointwiseComputation {
             instructions: vec![],
             param_loads: vec![],
+            prologue: vec![],
+            extra_reg_decls: vec![],
             scratch_f32_count: 0,
             scratch_b32_count: 0,
         };
@@ -1736,10 +1764,10 @@ mod tests {
         let scale_comp = PointwiseComputation {
             instructions: vec!["mul.f32 {INPUT}, {INPUT}, %f_epi0;".to_string()],
             param_loads: vec![
-                // Load scale_val (would be from an extra param in the real fuse! case)
-                // For this test, just mov a constant
                 "mov.f32 %f_epi0, 0f40000000;".to_string(), // 2.0 in IEEE 754
             ],
+            prologue: vec![],
+            extra_reg_decls: vec![],
             scratch_f32_count: 1,
             scratch_b32_count: 0,
         };
